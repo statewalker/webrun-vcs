@@ -12,10 +12,10 @@ catalog:
   "@statewalker/webrun-streams": ^0.1.1
   "@biomejs/biome": ^2.5.8
   "@observablehq/framework": ^1.13.4
-  "@statewalker/webrun-files": ^0.7.0
-  "@statewalker/webrun-files-browser": ^0.7.2
-  "@statewalker/webrun-files-mem": ^0.7.2
-  "@statewalker/webrun-files-node": "^0.7.0"
+  "@statewalker/webrun-files": ^0.9.0
+  "@statewalker/webrun-files-browser": ^0.9.0
+  "@statewalker/webrun-files-mem": ^0.9.0
+  "@statewalker/webrun-files-node": "^0.9.0"
   "@types/node": ^26.2.0
   "@types/pako": ^2.0.4
   "@types/sql.js": ^1.4.11
