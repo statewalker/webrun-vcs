@@ -48,10 +48,10 @@
   },
   "dependencies": {
     "@statewalker/storage": "catalog:",
-    "@statewalker/vcs-utils": "workspace:*"
+    "@statewalker/vcs-utils": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-utils-node": "workspace:*",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
     "rolldown": "catalog:",
     "typescript": "catalog:",

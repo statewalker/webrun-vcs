@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-utils": "workspace:*"
+    "@statewalker/vcs-utils": "workspace:^"
   },
   "devDependencies": {
     "@types/node": "catalog:",

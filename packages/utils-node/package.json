@@ -45,7 +45,7 @@
     "vitest": "catalog:"
   },
   "dependencies": {
-    "@statewalker/vcs-utils": "workspace:*",
+    "@statewalker/vcs-utils": "workspace:^",
     "@statewalker/webrun-files-node": "catalog:"
   }
 }

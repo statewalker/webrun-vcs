@@ -43,18 +43,18 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-store-files": "workspace:*",
-    "@statewalker/vcs-store-mem": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-files": "workspace:^",
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-transport-adapters": "workspace:*",
-    "@statewalker/vcs-utils-node": "workspace:*",
+    "@statewalker/vcs-transport-adapters": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
-    "@statewalker/vcs-store-sql": "workspace:*",
+    "@statewalker/vcs-store-sql": "workspace:^",
     "rolldown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"

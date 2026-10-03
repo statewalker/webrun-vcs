@@ -12,12 +12,12 @@
   },
   "dependencies": {
     "@hono/node-server": "catalog:",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-store-files": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/vcs-transport-adapters": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
-    "@statewalker/vcs-utils-node": "workspace:*",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-files": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-transport-adapters": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "hono": "catalog:"
   },
   "devDependencies": {

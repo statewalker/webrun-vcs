@@ -37,9 +37,9 @@
   },
   "dependencies": {
     "@statewalker/files-sync": "catalog:",
-    "@statewalker/vcs-working-tree": "workspace:*",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
+    "@statewalker/vcs-working-tree": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
     "@statewalker/content-store": "catalog:",
     "@statewalker/webrun-files": "catalog:"
   },

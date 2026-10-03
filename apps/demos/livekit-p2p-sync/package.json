@@ -11,11 +11,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-commands": "workspace:*",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/vcs-transport-adapters": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*",
+    "@statewalker/vcs-commands": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-transport-adapters": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^",
     "@statewalker/webrun-streams": "catalog:",
     "@statewalker/webrun-streams-livekit": "catalog:",
     "livekit-client": "catalog:"

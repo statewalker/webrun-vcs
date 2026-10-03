@@ -32,12 +32,12 @@
   },
   "dependencies": {
     "@statewalker/storage": "catalog:",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-store-mem": "workspace:*",
+    "@statewalker/vcs-store-mem": "workspace:^",
     "@statewalker/webrun-files-mem": "catalog:",
     "rolldown": "catalog:",
     "vitest": "catalog:",

@@ -19,8 +19,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
   },
   "peerDependencies": {
     "vitest": "catalog:peers"

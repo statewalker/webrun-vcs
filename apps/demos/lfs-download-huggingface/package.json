@@ -11,7 +11,7 @@
   "dependencies": {
     "@statewalker/content-store": "catalog:",
     "@statewalker/storage": "catalog:",
-    "@statewalker/vcs-transport-lfs": "workspace:*"
+    "@statewalker/vcs-transport-lfs": "workspace:^"
   },
   "devDependencies": {
     "@types/node": "catalog:",

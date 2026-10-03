@@ -38,7 +38,7 @@
   "dependencies": {
     "@statewalker/content-store": "catalog:",
     "@statewalker/content-transfer": "catalog:",
-    "@statewalker/vcs-transport-lfs": "workspace:*",
+    "@statewalker/vcs-transport-lfs": "workspace:^",
     "@statewalker/webrun-http-streams": "catalog:"
   },
   "devDependencies": {

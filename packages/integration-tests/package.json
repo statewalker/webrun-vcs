@@ -11,14 +11,14 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@statewalker/vcs-commands": "workspace:*",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-store-mem": "workspace:*",
-    "@statewalker/vcs-store-sql": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
-    "@statewalker/vcs-utils-node": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*",
+    "@statewalker/vcs-commands": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-store-sql": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^",
     "@types/node": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"

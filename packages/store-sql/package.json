@@ -35,12 +35,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-testing": "workspace:*",
+    "@statewalker/vcs-testing": "workspace:^",
     "sql.js": "catalog:",
     "@types/sql.js": "catalog:",
     "rolldown": "catalog:",

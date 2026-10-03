@@ -12,14 +12,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-commands": "workspace:*",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-store-files": "workspace:*",
-    "@statewalker/vcs-store-mem": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/vcs-transport-adapters": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*",
+    "@statewalker/vcs-commands": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-files": "workspace:^",
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-transport-adapters": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^",
     "@statewalker/webrun-files": "catalog:",
     "@statewalker/webrun-files-browser": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
@@ -27,7 +27,7 @@
     "qrcode": "catalog:"
   },
   "devDependencies": {
-    "@statewalker/vcs-utils-node": "workspace:*",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
     "@types/qrcode": "catalog:",
     "typescript": "catalog:",
