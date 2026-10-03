@@ -47,7 +47,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/storage": "workspace:*",
+    "@statewalker/storage": "catalog:",
     "@statewalker/vcs-utils": "workspace:*"
   },
   "devDependencies": {

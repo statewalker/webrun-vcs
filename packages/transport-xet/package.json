@@ -36,13 +36,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/content-store": "workspace:*",
-    "@statewalker/content-transfer": "workspace:*",
+    "@statewalker/content-store": "catalog:",
+    "@statewalker/content-transfer": "catalog:",
     "@statewalker/vcs-transport-lfs": "workspace:*",
     "@statewalker/webrun-http-streams": "catalog:"
   },
   "devDependencies": {
-    "@statewalker/storage": "workspace:*",
+    "@statewalker/storage": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
     "@statewalker/webrun-streams": "catalog:",
     "rolldown": "catalog:",

@@ -6,6 +6,11 @@ packages:
   - "docs"
 
 catalog:
+  "@statewalker/storage": ^0.1.1
+  "@statewalker/content-store": ^0.1.1
+  "@statewalker/content-transfer": ^0.1.1
+  "@statewalker/merge-core": ^0.1.1
+  "@statewalker/files-sync": ^0.1.1
   "@statewalker/webrun-http-streams": ^0.2.1
   "@statewalker/webrun-streams-signaling": ^0.1.1
   "@statewalker/webrun-streams-livekit": ^0.1.1
