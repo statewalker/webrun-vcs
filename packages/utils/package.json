@@ -94,7 +94,6 @@
   },
   "devDependencies": {
     "@types/node": "catalog:",
-    "@types/pako": "catalog:",
     "@vitest/browser": "catalog:",
     "playwright": "catalog:",
     "rolldown": "catalog:",

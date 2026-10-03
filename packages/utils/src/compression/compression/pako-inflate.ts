@@ -10,16 +10,21 @@
  * detection vs O(log n) decompression attempts with the Web Streams API.
  */
 
-import { constants } from "pako";
-import * as zlib from "pako/lib/zlib/inflate.js";
+import {
+  Z_BUF_ERROR,
+  Z_FINISH,
+  Z_OK,
+  Z_STREAM_END,
+  ZStream,
+  zlibInflate,
+  zlibInflateEnd,
+  zlibInflateInit2,
+} from "pako";
 import type { PartialDecompressionResult, StreamingCompressionOptions } from "./types.js";
 import { CompressionError } from "./types.js";
 
 // Initial output buffer size (64KB, will grow if needed)
 const INITIAL_OUTPUT_SIZE = 65536;
-
-// Re-export ZStream type from the module declaration
-type ZStream = Parameters<typeof zlib.inflateInit2>[0];
 
 /**
  * Decompress a data block and return how many bytes were consumed.
@@ -35,28 +40,15 @@ export function decompressBlockPartialPako(
   data: Uint8Array,
   options?: StreamingCompressionOptions,
 ): PartialDecompressionResult {
-  // Create z_stream structure
-  const strm: ZStream = {
-    input: null,
-    next_in: 0,
-    avail_in: 0,
-    total_in: 0,
-    output: null,
-    next_out: 0,
-    avail_out: 0,
-    total_out: 0,
-    msg: "",
-    state: null,
-    data_type: 0,
-    adler: 0,
-  };
+  // Create z_stream structure (pako 3 exports the low-level zlib API)
+  const strm = new ZStream();
 
   try {
     // Initialize inflator
     // windowBits: 15 for zlib format, -15 for raw deflate
     const windowBits = options?.raw ? -15 : 15;
-    let ret = zlib.inflateInit2(strm, windowBits);
-    if (ret !== constants.Z_OK) {
+    let ret = zlibInflateInit2(strm, windowBits);
+    if (ret !== Z_OK) {
       throw new CompressionError(`Pako inflateInit2 failed: ${strm.msg || `error code ${ret}`}`);
     }
 
@@ -75,12 +67,12 @@ export function decompressBlockPartialPako(
       strm.next_out = 0;
       strm.avail_out = outputBuffer.length;
 
-      ret = zlib.inflate(strm, constants.Z_FINISH);
+      ret = zlibInflate(strm, Z_FINISH);
 
       if (
-        ret !== constants.Z_OK &&
-        ret !== constants.Z_STREAM_END &&
-        ret !== constants.Z_BUF_ERROR
+        ret !== Z_OK &&
+        ret !== Z_STREAM_END &&
+        ret !== Z_BUF_ERROR
       ) {
         throw new CompressionError(`Pako decompression failed: ${strm.msg || `error code ${ret}`}`);
       }
@@ -92,10 +84,10 @@ export function decompressBlockPartialPako(
       }
 
       // If buffer was full and we're not done, we need more space
-      if (ret === constants.Z_BUF_ERROR && strm.avail_out === 0) {
+      if (ret === Z_BUF_ERROR && strm.avail_out === 0) {
         outputBuffer = new Uint8Array(INITIAL_OUTPUT_SIZE);
       }
-    } while (ret !== constants.Z_STREAM_END && strm.avail_in > 0);
+    } while (ret !== Z_STREAM_END && strm.avail_in > 0);
 
     // Get bytes consumed from input
     const bytesRead = strm.total_in;
@@ -128,6 +120,6 @@ export function decompressBlockPartialPako(
     throw new CompressionError(`Pako partial decompression failed: ${err.message}`, err);
   } finally {
     // Clean up zlib state
-    zlib.inflateEnd(strm);
+    zlibInflateEnd(strm);
   }
 }

@@ -5,7 +5,7 @@
  */
 
 import { BufferedByteReader } from "@statewalker/vcs-utils/streams";
-import pako from "pako";
+import * as pako from "pako";
 import { describe, expect, it } from "vitest";
 
 function toIterator(chunks: Uint8Array[]): AsyncIterator<Uint8Array> {

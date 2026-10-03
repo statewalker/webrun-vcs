@@ -23,6 +23,8 @@
     "@types/node": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
-    "vite-plugin-pwa": "catalog:"
+    "vite-plugin-pwa": "catalog:",
+    "workbox-build": "catalog:",
+    "workbox-window": "catalog:"
   }
 }

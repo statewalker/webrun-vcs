@@ -5,7 +5,7 @@
  * This is a universal implementation that works in both Node.js and browsers.
  */
 
-import pako from "pako";
+import * as pako from "pako";
 import { decompressBlockPartialPako } from "./pako-inflate.js";
 import type {
   ByteStream,
