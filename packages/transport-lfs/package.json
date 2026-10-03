@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport-lfs",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Standard Git LFS batch protocol + basic whole-object transfer over content-store",
   "license": "MIT",
   "repository": {

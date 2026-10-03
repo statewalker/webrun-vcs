@@ -1,10 +1,6 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 
-// vcs-core is source-only in this umbrella (dist is not built), and so are the
-// sibling workspace packages its tests touch — resolve them to their TypeScript
-// entrypoints, mirroring how the sibling packages' vitest configs alias to src.
-const webrunFiles = path.resolve(import.meta.dirname, "../../../webrun-files/packages");
 
 export default defineConfig({
   test: {
@@ -48,18 +44,6 @@ export default defineConfig({
         // runs on a clean checkout without vcs-working-tree's dist built.
         find: "@statewalker/vcs-working-tree",
         replacement: path.resolve(import.meta.dirname, "../working-tree/src/index.ts"),
-      },
-      {
-        find: "@statewalker/storage",
-        replacement: path.resolve(import.meta.dirname, "../storage/src/index.ts"),
-      },
-      {
-        find: "@statewalker/webrun-files-mem",
-        replacement: path.join(webrunFiles, "webrun-files-mem/src/index.ts"),
-      },
-      {
-        find: "@statewalker/webrun-files",
-        replacement: path.join(webrunFiles, "webrun-files/src/index.ts"),
       },
     ],
   },

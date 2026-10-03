@@ -6,32 +6,39 @@ packages:
   - "docs"
 
 catalog:
-  "@statewalker/storage": ^0.1.1
-  "@statewalker/content-store": ^0.1.1
-  "@statewalker/content-transfer": ^0.1.1
-  "@statewalker/merge-core": ^0.1.1
-  "@statewalker/files-sync": ^0.1.1
+  "@changesets/cli": "^2.29.8"
+  "@hono/node-server": "^1.14.0"
+  "@playwright/test": "^1.57.0"
+  "@statewalker/utils": "^0.4.2"
+  "@types/qrcode": "^1.5.5"
+  "hono": "^4.7.9"
+  "jszip": "^3.10.1"
+  "qrcode": "^1.5.4"
+  "vite": "^6.0.0"
+  "vite-plugin-pwa": "^0.21.0"
+  "@statewalker/storage": "^0.2.0"
+  "@statewalker/content-store": "^0.2.0"
+  "@statewalker/content-transfer": "^0.2.0"
+  "@statewalker/files-sync": "^0.2.0"
   "@statewalker/webrun-http-streams": ^0.2.1
   "@statewalker/webrun-streams-signaling": ^0.1.1
-  "@statewalker/webrun-streams-livekit": ^0.1.1
-  "@statewalker/webrun-streams": ^0.1.1
+  "@statewalker/webrun-streams-livekit": "^0.2.0"
+  "@statewalker/webrun-streams": "^0.2.0"
   "@biomejs/biome": ^2.5.8
   "@observablehq/framework": ^1.13.4
-  "@statewalker/webrun-files": ^0.7.0
-  "@statewalker/webrun-files-browser": ^0.7.2
-  "@statewalker/webrun-files-mem": ^0.7.2
-  "@statewalker/webrun-files-node": "^0.7.0"
+  "@statewalker/webrun-files": "^0.10.0"
+  "@statewalker/webrun-files-browser": "^0.10.0"
+  "@statewalker/webrun-files-mem": "^0.10.0"
+  "@statewalker/webrun-files-node": "^0.10.0"
   "@types/node": ^26.2.0
   "@types/pako": ^2.0.4
   "@types/sql.js": ^1.4.11
   "@vitest/browser": ^4.1.10
-  "@vitest/browser-playwright": ^4.1.10
   "@vitest/coverage-v8": ^4.1.10
   livekit-client: ^2.21.0
   pako: ^2.1.0
   peerjs: ^1.5.5
   playwright: ^1.62.1
-  pnpm: ^11.21.0
   rimraf: ^6.1.3
   rolldown: ^1.2.4
   sql.js: 1.14.1
@@ -39,3 +46,8 @@ catalog:
   turbo: ^2.10.9
   typescript: ^7.0.2
   vitest: ^4.1.10
+
+catalogs:
+  peers:
+    "sql.js": ">=1.14.1"
+    "vitest": "^4.1.4"

@@ -1,9 +1,6 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 
-// Source-only umbrella: sibling workspace packages are not built (no dist), so
-// resolve them to their TypeScript entrypoints, mirroring packages/core/vitest.config.ts.
-const webrunFiles = path.resolve(import.meta.dirname, "../../../webrun-files/packages");
 
 export default defineConfig({
   test: {
@@ -43,18 +40,6 @@ export default defineConfig({
       {
         find: "@statewalker/vcs-testing",
         replacement: path.resolve(import.meta.dirname, "../testing/src/index.ts"),
-      },
-      {
-        find: "@statewalker/storage",
-        replacement: path.resolve(import.meta.dirname, "../storage/src/index.ts"),
-      },
-      {
-        find: "@statewalker/webrun-files-mem",
-        replacement: path.join(webrunFiles, "webrun-files-mem/src/index.ts"),
-      },
-      {
-        find: "@statewalker/webrun-files",
-        replacement: path.join(webrunFiles, "webrun-files/src/index.ts"),
       },
     ],
   },

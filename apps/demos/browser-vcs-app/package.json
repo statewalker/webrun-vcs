@@ -23,9 +23,9 @@
     "@statewalker/webrun-files-mem": "catalog:"
   },
   "devDependencies": {
-    "@playwright/test": "^1.57.0",
+    "@playwright/test": "catalog:",
     "@types/node": "catalog:",
     "typescript": "catalog:",
-    "vite": "^6.0.0"
+    "vite": "catalog:"
   }
 }

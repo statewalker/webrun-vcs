@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-utils-node",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Node.js-specific VCS utilities: native compression, file system adapters",
   "license": "MIT",
   "repository": {

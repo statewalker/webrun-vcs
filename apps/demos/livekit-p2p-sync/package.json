@@ -18,11 +18,11 @@
     "@statewalker/vcs-working-tree": "workspace:*",
     "@statewalker/webrun-streams": "catalog:",
     "@statewalker/webrun-streams-livekit": "catalog:",
-    "livekit-client": "^2.9.7"
+    "livekit-client": "catalog:"
   },
   "devDependencies": {
     "@types/node": "catalog:",
     "typescript": "catalog:",
-    "vite": "^6.0.0"
+    "vite": "catalog:"
   }
 }

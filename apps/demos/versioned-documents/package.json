@@ -18,11 +18,11 @@
     "@statewalker/webrun-files": "catalog:",
     "@statewalker/webrun-files-browser": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
-    "jszip": "^3.10.1"
+    "jszip": "catalog:"
   },
   "devDependencies": {
     "@types/node": "catalog:",
     "typescript": "catalog:",
-    "vite": "^6.0.0"
+    "vite": "catalog:"
   }
 }

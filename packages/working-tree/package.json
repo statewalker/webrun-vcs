@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-working-tree",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Git working-tree layer — index/staging, status, checkout, ignore, worktree, and merge/rebase operation state, over vcs-core",
   "license": "MIT",
   "repository": {

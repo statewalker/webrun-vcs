@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-sql",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "SQL-based storage backend for StateWalker VCS",
   "license": "MIT",
   "repository": {
@@ -49,7 +49,7 @@
     "@types/node": "catalog:"
   },
   "peerDependencies": {
-    "sql.js": ">=1.14.1"
+    "sql.js": "catalog:peers"
   },
   "peerDependenciesMeta": {
     "sql.js": {
