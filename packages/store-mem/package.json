@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-mem",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "In-memory storage backend for StateWalker VCS",
   "license": "MIT",
   "repository": {
