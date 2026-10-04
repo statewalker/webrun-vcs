@@ -2,14 +2,14 @@
  * chunk-identity hasher, a mem LFS resolver, a putChunk spy, and stream utils. */
 
 import { createHash } from "node:crypto";
+import type { LfsPointer, LfsResolver } from "@statewalker/vcs-transport-lfs";
 import {
   type ByteStream,
   type ChunkId,
   type ContentStore,
   createContentStore,
-} from "@statewalker/content-store";
-import { memBlobStore } from "@statewalker/storage";
-import type { LfsPointer, LfsResolver } from "@statewalker/vcs-transport-lfs";
+} from "@statewalker/webrun-content-store";
+import { memBlobStore } from "@statewalker/webrun-storage";
 
 /**
  * The content-store's injected identity. Both peers share it so chunk ids line

@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-core",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Core VCS interfaces, storage abstractions, and history management",
   "license": "MIT",
   "repository": {
@@ -53,7 +53,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/storage": "catalog:",
+    "@statewalker/webrun-storage": "catalog:",
     "@statewalker/vcs-utils": "workspace:^"
   },
   "devDependencies": {

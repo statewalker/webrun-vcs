@@ -27,8 +27,8 @@ describe("the hard cross-axis ban holds", () => {
   it("workspace/src composes BOTH axes — file axis directly, history axis only structurally", () => {
     const imports = importsOf(srcDir);
     // Axis A (files) + large-object store are imported for real calls.
-    expect(imports.has("@statewalker/files-sync")).toBe(true);
-    expect(imports.has("@statewalker/content-store")).toBe(true);
+    expect(imports.has("@statewalker/webrun-files-sync")).toBe(true);
+    expect(imports.has("@statewalker/webrun-content-store")).toBe(true);
     // The git engine is NOT imported: the history axis is reached only through the
     // structural Repository / GitRemote interfaces, so workspace cannot link the
     // two engines together.
@@ -42,7 +42,7 @@ describe("the hard cross-axis ban holds", () => {
     // in this repo. Its published manifest is what links it to anything: no vcs-* in it.
     const manifest = JSON.parse(
       readFileSync(
-        path.resolve(here, "../node_modules/@statewalker/files-sync/package.json"),
+        path.resolve(here, "../node_modules/@statewalker/webrun-files-sync/package.json"),
         "utf8",
       ),
     ) as Record<string, Record<string, string> | undefined>;
@@ -53,6 +53,6 @@ describe("the hard cross-axis ban holds", () => {
 
     // vcs-core's facade dir must not reach into files-sync.
     const vcsCore = importsOf(path.join(packagesDir, "core", "src", "vcs-core"));
-    expect(vcsCore.has("@statewalker/files-sync")).toBe(false);
+    expect(vcsCore.has("@statewalker/webrun-files-sync")).toBe(false);
   });
 });

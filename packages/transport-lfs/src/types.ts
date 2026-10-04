@@ -4,13 +4,13 @@
  * This package speaks the STANDARD Git LFS batch protocol + basic (whole-object)
  * transfer, client and server, so it interoperates with real Git LFS hosts. The
  * LFS object id (`oid`) is the whole-file SHA-256 (bare lowercase hex) — the
- * authoritative LFS identity. Bytes live in a `@statewalker/content-store`,
+ * authoritative LFS identity. Bytes live in a `@statewalker/webrun-content-store`,
  * whose object ids are OPAQUE and unrelated to the LFS oid; an injected
  * {@link LfsResolver} maps between the two. This module knows nothing of git
  * objects, chunk-aware dedup, pointers, or sync.
  */
 
-import type { ObjectId } from "@statewalker/content-store";
+import type { ObjectId } from "@statewalker/webrun-content-store";
 
 /** A Git LFS pointer: `oid` is the whole-object SHA-256 (bare hex), `size` in bytes. */
 export interface LfsPointer {

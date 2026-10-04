@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-workspace",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Thin cross-axis orchestration (publish/update/checkpoint/restore) composing files-sync + vcs-working-tree + vcs-transport",
   "license": "MIT",
   "repository": {
@@ -38,16 +38,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/files-sync": "catalog:",
+    "@statewalker/webrun-files-sync": "catalog:",
     "@statewalker/vcs-working-tree": "workspace:^",
     "@statewalker/vcs-core": "workspace:^",
     "@statewalker/vcs-transport": "workspace:^",
-    "@statewalker/content-store": "catalog:",
+    "@statewalker/webrun-content-store": "catalog:",
     "@statewalker/webrun-files": "catalog:"
   },
   "devDependencies": {
     "@statewalker/webrun-files-mem": "catalog:",
-    "@statewalker/storage": "catalog:",
+    "@statewalker/webrun-storage": "catalog:",
     "rolldown": "catalog:",
     "vitest": "catalog:",
     "typescript": "catalog:",

@@ -1,4 +1,4 @@
-import type { ContentStore } from "@statewalker/content-store";
+import type { ContentStore } from "@statewalker/webrun-content-store";
 import type { HttpHandler } from "@statewalker/webrun-http-streams";
 import type { BatchObjectResponse, BatchRequest, BatchResponse } from "./batch.js";
 import { BASIC_TRANSFER, LFS_CONTENT_TYPE } from "./batch.js";

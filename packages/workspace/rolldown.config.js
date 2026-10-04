@@ -9,9 +9,9 @@ export default defineConfig({
     chunkFileNames: "[name]-[hash].js",
   },
   external: [
-    "@statewalker/files-sync",
+    "@statewalker/webrun-files-sync",
     /^@statewalker\/files-sync\//,
-    "@statewalker/content-store",
+    "@statewalker/webrun-content-store",
     "@statewalker/webrun-files",
     /^@statewalker\/webrun-files\//,
   ],

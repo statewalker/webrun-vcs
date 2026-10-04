@@ -14,14 +14,14 @@
  */
 
 import { createHash } from "node:crypto";
-import { type ByteStream, createContentStore } from "@statewalker/content-store";
-import { memBlobStore } from "@statewalker/storage";
 import {
   type LfsPointer,
   type LfsResolver,
   lfsDownload,
   sha256Hex,
 } from "@statewalker/vcs-transport-lfs";
+import { type ByteStream, createContentStore } from "@statewalker/webrun-content-store";
+import { memBlobStore } from "@statewalker/webrun-storage";
 
 /** The public test model + file used by this demo. */
 const MODEL = "hf-internal-testing/tiny-random-gpt2";

@@ -1,6 +1,6 @@
 /**
  * createStorageRepositoryFacade — build the transport's {@link RepositoryFacade}
- * plus its {@link RefStore} over the `@statewalker/storage` byte seam.
+ * plus its {@link RefStore} over the `@statewalker/webrun-storage` byte seam.
  *
  * It mirrors `createVcsCore`'s internal wiring
  * (packages/core/src/vcs-core/index.ts): object bytes ride
@@ -13,10 +13,9 @@
  *
  * With this, the transport's object-exchange (`exportPack`/`importPack`/
  * `walkAncestors`, which need server-side reachability) runs against a History
- * backed by `@statewalker/storage` instead of the old mem/git backend.
+ * backed by `@statewalker/webrun-storage` instead of the old mem/git backend.
  */
 
-import type { BlobStore, KvStore } from "@statewalker/storage";
 import {
   blobStoreToRawStorage,
   createBlobs,
@@ -32,6 +31,7 @@ import {
   type SerializationApi,
 } from "@statewalker/vcs-core";
 import type { RefStore, RepositoryFacade } from "@statewalker/vcs-transport";
+import type { BlobStore, KvStore } from "@statewalker/webrun-storage";
 import { createVcsRepositoryFacade } from "./vcs-repository-facade.js";
 
 /** Byte-seam stores backing a storage-backed transport RepositoryFacade. */
@@ -52,7 +52,7 @@ export interface StorageRepositoryFacade {
 
 /**
  * Build a transport {@link RepositoryFacade} + {@link RefStore} over the
- * `@statewalker/storage` byte seam.
+ * `@statewalker/webrun-storage` byte seam.
  *
  * @param deps - Byte-seam stores (git objects + refs).
  * @returns The transport facade and a RefStore over the same refs.

@@ -1,6 +1,6 @@
 /**
  * B1 SPIKE — prove the existing vcs-core git engine runs unchanged over the new
- * `@statewalker/storage` byte seam.
+ * `@statewalker/webrun-storage` byte seam.
  *
  * The bytes and oids produced through a storage-backed {@link RawStorage} (built
  * from `memBlobStore()` via the {@link blobStoreToRawStorage} adapter)
@@ -9,7 +9,7 @@
  * Any divergence is a real seam bug (most likely a range/size mismatch).
  */
 
-import { memBlobStore } from "@statewalker/storage";
+import { memBlobStore } from "@statewalker/webrun-storage";
 import { describe, expect, it } from "vitest";
 
 import type { PersonIdent } from "../src/history/index.js";
@@ -51,7 +51,7 @@ async function collect(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   return out;
 }
 
-describe("B1 spike: vcs-core git engine over the @statewalker/storage seam", () => {
+describe("B1 spike: vcs-core git engine over the @statewalker/webrun-storage seam", () => {
   it("blob write→read roundtrip returns identical bytes", async () => {
     const { history } = seamHistory();
     await history.initialize();

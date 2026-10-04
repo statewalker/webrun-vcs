@@ -16,8 +16,8 @@
  * directly so a test can pass a `serveXet` handler as the client `fetchImpl`.
  */
 
-import type { ByteStream } from "@statewalker/content-store";
 import type { FetchLike } from "@statewalker/vcs-transport-lfs";
+import type { ByteStream } from "@statewalker/webrun-content-store";
 import type { Duplex } from "@statewalker/webrun-streams";
 
 /** Collect a byte stream into one contiguous `ArrayBuffer`-backed buffer (a

@@ -1,8 +1,13 @@
-import type { ByteStream, ChunkId, ContentStore, ObjectId } from "@statewalker/content-store";
-import { createContentStore } from "@statewalker/content-store";
-import { memBlobStore } from "@statewalker/storage";
 import type { LfsPointer, LfsResolver } from "@statewalker/vcs-transport-lfs";
 import { sha256Hex } from "@statewalker/vcs-transport-lfs";
+import type {
+  ByteStream,
+  ChunkId,
+  ContentStore,
+  ObjectId,
+} from "@statewalker/webrun-content-store";
+import { createContentStore } from "@statewalker/webrun-content-store";
+import { memBlobStore } from "@statewalker/webrun-storage";
 import type { XetTransportEvent } from "../src/index.js";
 
 /**

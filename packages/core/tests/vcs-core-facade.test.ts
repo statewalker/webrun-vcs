@@ -1,11 +1,11 @@
 /**
- * B2 — the normalized {@link VcsCore} facade over the `@statewalker/storage`
+ * B2 — the normalized {@link VcsCore} facade over the `@statewalker/webrun-storage`
  * seam. Builds a facade over `memBlobStore()` + `memKvStore()` and asserts the
  * delegated + normalized behaviour: array trees, first merge base, hydrated log,
  * unified `has`, storage-shaped refs, pack roundtrip, gc pruning, sha256 gate.
  */
 
-import { memBlobStore, memKvStore } from "@statewalker/storage";
+import { memBlobStore, memKvStore } from "@statewalker/webrun-storage";
 import { describe, expect, it } from "vitest";
 
 import type { PersonIdent } from "../src/history/index.js";

@@ -2,14 +2,14 @@
  * Pure helpers shared by the workflows.
  *
  * {@link buildSyncOptions} constructs the {@link SyncOptions} the orchestrator
- * hands to `@statewalker/files-sync`. It encodes the BASELINE RULE: the file
+ * hands to `@statewalker/webrun-files-sync`. It encodes the BASELINE RULE: the file
  * sync is anchored ONLY by the file axis' own state — it NEVER carries a commit
  * id. It sets no `anchorStore` and no commit-derived `pairKey`; change detection
  * is against the destination's current state, not any git commit.
  */
 
-import type { ByteStream, SyncOptions } from "@statewalker/files-sync";
-import { buildAnchor } from "@statewalker/files-sync";
+import type { ByteStream, SyncOptions } from "@statewalker/webrun-files-sync";
+import { buildAnchor } from "@statewalker/webrun-files-sync";
 import type { FilesApi, SyncVersioningPolicy, WorkflowOptions } from "./types.js";
 
 /** file-sync options for a workflow — no commit id ever leaks in as a baseline. */

@@ -8,5 +8,5 @@ export * from "./gc/index.js";
 export * from "./history/index.js";
 // Storage layer (binary, delta)
 export * from "./storage/index.js";
-// VcsCore facade (normalized git API over the @statewalker/storage seam)
+// VcsCore facade (normalized git API over the @statewalker/webrun-storage seam)
 export * from "./vcs-core/index.js";

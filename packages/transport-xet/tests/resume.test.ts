@@ -1,4 +1,4 @@
-import type { TransferCheckpoint } from "@statewalker/content-transfer";
+import type { TransferCheckpoint } from "@statewalker/webrun-content-transfer";
 import { describe, expect, it } from "vitest";
 import { serveXet, xetUpload } from "../src/index.js";
 import {

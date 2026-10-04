@@ -6,7 +6,7 @@ The git working-tree layer — index/staging, status, checkout, ignore, worktree
 
 `vcs-working-tree` is the git working-tree / versioning surface of Axis B: the mutable local state that sits over the immutable objects in `@statewalker/vcs-core`. It owns the **index/staging** area (git-compatible three-state semantics), **status** calculation (working ↔ index ↔ HEAD), **checkout**, **`.gitignore`** handling, the **worktree** filesystem view, and the **transformation** state for merge / rebase / cherry-pick / revert. It was extracted from `vcs-core` so the pure object model and the mutable working-tree logic live in separate packages.
 
-It depends on `@statewalker/vcs-core` (objects/refs/index primitives) and `@statewalker/vcs-utils`, and — by design — **never** depends on `@statewalker/files-sync` (the hard Axis A ✗↔ Axis B ban). Memory implementations ship here; file-backed implementations live in `@statewalker/vcs-store-files`.
+It depends on `@statewalker/vcs-core` (objects/refs/index primitives) and `@statewalker/vcs-utils`, and — by design — **never** depends on `@statewalker/webrun-files-sync` (the hard Axis A ✗↔ Axis B ban). Memory implementations ship here; file-backed implementations live in `@statewalker/vcs-store-files`.
 
 ## Installation
 

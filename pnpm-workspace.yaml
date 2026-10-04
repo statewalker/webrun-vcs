@@ -19,10 +19,10 @@ catalog:
   # Peers of vite-plugin-pwa 2, declared by the demo that uses it.
   "workbox-build": "^7.4.1"
   "workbox-window": "^7.4.1"
-  "@statewalker/storage": "^0.2.0"
-  "@statewalker/content-store": "^0.2.0"
-  "@statewalker/content-transfer": "^0.2.0"
-  "@statewalker/files-sync": "^0.2.0"
+  "@statewalker/webrun-storage": "^0.2.0"
+  "@statewalker/webrun-content-store": "^0.2.0"
+  "@statewalker/webrun-content-transfer": "^0.2.0"
+  "@statewalker/webrun-files-sync": "^0.2.0"
   "@statewalker/webrun-http-streams": ^0.2.1
   "@statewalker/webrun-streams-signaling": ^0.1.1
   "@statewalker/webrun-streams-livekit": "^0.2.0"

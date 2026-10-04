@@ -2,7 +2,7 @@
  * Public contract for the thin cross-axis orchestrator.
  *
  * `@statewalker/vcs-workspace` is the ONLY layer that composes Axis A
- * (`@statewalker/files-sync`) with Axis B (`@statewalker/vcs-working-tree` +
+ * (`@statewalker/webrun-files-sync`) with Axis B (`@statewalker/vcs-working-tree` +
  * `@statewalker/vcs-core` + `@statewalker/vcs-transport`). It keeps the HARD BAN
  * intact — files-sync must never import vcs-core and vice-versa — by depending
  * on the file axis directly (real `plan`/`execute` calls) and on the history
@@ -16,8 +16,8 @@
  * good step (best-effort sequential + resumable, no distributed transaction).
  */
 
-import type { ContentStore } from "@statewalker/content-store";
-import type { FilesApi, PathFilter, VerificationMode } from "@statewalker/files-sync";
+import type { ContentStore } from "@statewalker/webrun-content-store";
+import type { FilesApi, PathFilter, VerificationMode } from "@statewalker/webrun-files-sync";
 
 export type { ContentStore, FilesApi, PathFilter, VerificationMode };
 

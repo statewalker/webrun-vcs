@@ -8,10 +8,10 @@
  * in content-transfer; the LFS batch/basic internals all live in vcs-transport-lfs.
  */
 
-import type { ContentStore, ObjectDescriptor } from "@statewalker/content-store";
-import { serveStore } from "@statewalker/content-transfer";
 import type { BatchRequest, LfsResolver } from "@statewalker/vcs-transport-lfs";
 import { serveLfs } from "@statewalker/vcs-transport-lfs";
+import type { ContentStore, ObjectDescriptor } from "@statewalker/webrun-content-store";
+import { serveStore } from "@statewalker/webrun-content-transfer";
 import type { HttpHandler } from "@statewalker/webrun-http-streams";
 import { XET_TRANSFER, type XetBatchObjectResponse, type XetBatchResponse } from "./batch.js";
 import { serveChunkChannel } from "./chunk-channel.js";
