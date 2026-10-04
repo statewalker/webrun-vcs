@@ -228,7 +228,9 @@ describe("Merge History: Low-level isolation", () => {
     } catch {
       // Ignore chmod errors
     }
-    await fs.rm(tempDir, { recursive: true, force: true });
+    // Writes started by the controllers can still land while the directory is removed
+    // (ENOTEMPTY on a busy runner): let fs.rm retry.
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("should walk all 79 commits via walkAncestry", async () => {
@@ -424,7 +426,9 @@ describe("Merge History: Full P2P sync", () => {
     } catch {
       // Ignore
     }
-    await fs.rm(tempDir, { recursive: true, force: true });
+    // Writes started by the controllers can still land while the directory is removed
+    // (ENOTEMPTY on a busy runner): let fs.rm retry.
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("should sync all 79 commits from file-backed repo to in-memory client", {
