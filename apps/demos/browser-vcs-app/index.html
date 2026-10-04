@@ -17,10 +17,10 @@
         <section id="storage-section">
           <h2>Storage Backend</h2>
           <div class="storage-controls">
-            <button id="btn-memory" class="storage-btn active">
+            <button type="button" id="btn-memory" class="storage-btn active">
               In-Memory
             </button>
-            <button id="btn-browser-fs" class="storage-btn">
+            <button type="button" id="btn-browser-fs" class="storage-btn">
               Browser Filesystem
             </button>
           </div>
@@ -30,7 +30,7 @@
         <section id="repo-section">
           <h2>Repository</h2>
           <div class="repo-controls">
-            <button id="btn-init">Initialize Repository</button>
+            <button type="button" id="btn-init">Initialize Repository</button>
             <span id="repo-status" class="status">No repository</span>
           </div>
         </section>
@@ -39,7 +39,7 @@
           <section id="working-dir-section">
             <h2>
               Working Directory
-              <button id="btn-refresh" class="btn-small">Refresh</button>
+              <button type="button" id="btn-refresh" class="btn-small">Refresh</button>
             </h2>
             <div id="working-dir-tree" class="file-tree">
               <p class="empty-state">No files in working directory</p>
@@ -59,7 +59,7 @@
           <div class="file-controls">
             <input type="text" id="file-name" placeholder="filename.txt" />
             <textarea id="file-content" placeholder="File content..."></textarea>
-            <button id="btn-add-file">Add File</button>
+            <button type="button" id="btn-add-file">Add File</button>
           </div>
         </section>
 
@@ -67,7 +67,7 @@
           <h2>Commits</h2>
           <div class="commit-controls">
             <input type="text" id="commit-message" placeholder="Commit message..." />
-            <button id="btn-commit">Create Commit</button>
+            <button type="button" id="btn-commit">Create Commit</button>
           </div>
           <div id="commit-history" class="commit-history">
             <p class="empty-state">No commits yet</p>

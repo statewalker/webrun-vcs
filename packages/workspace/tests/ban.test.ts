@@ -37,10 +37,19 @@ describe("the hard cross-axis ban holds", () => {
     expect(imports.has("@statewalker/vcs-transport")).toBe(false);
   });
 
-  it("files-sync/src never imports vcs-core, and vcs-core never imports files-sync", () => {
-    const filesSync = importsOf(path.join(packagesDir, "files-sync", "src"));
-    expect(filesSync.has("@statewalker/vcs-core")).toBe(false);
-    expect([...filesSync].some((s) => s.startsWith("@statewalker/vcs-"))).toBe(false);
+  it("files-sync never depends on vcs-*, and vcs-core never imports files-sync", () => {
+    // files-sync now lives in webrun-sync and arrives here from npm, so its source is not
+    // in this repo. Its published manifest is what links it to anything: no vcs-* in it.
+    const manifest = JSON.parse(
+      readFileSync(
+        path.resolve(here, "../node_modules/@statewalker/files-sync/package.json"),
+        "utf8",
+      ),
+    ) as Record<string, Record<string, string> | undefined>;
+    const deps = ["dependencies", "peerDependencies", "optionalDependencies"].flatMap((k) =>
+      Object.keys(manifest[k] ?? {}),
+    );
+    expect(deps.filter((d) => d.startsWith("@statewalker/vcs-"))).toEqual([]);
 
     // vcs-core's facade dir must not reach into files-sync.
     const vcsCore = importsOf(path.join(packagesDir, "core", "src", "vcs-core"));

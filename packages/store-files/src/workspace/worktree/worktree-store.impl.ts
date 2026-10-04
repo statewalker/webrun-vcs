@@ -12,11 +12,6 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
-import type {
-  IgnoreManager,
-  WorktreeEntry,
-  WorktreeStoreOptions,
-} from "@statewalker/vcs-working-tree";
 import {
   basename,
   type FileInfo,
@@ -25,9 +20,14 @@ import {
   joinPath,
   readFile,
 } from "@statewalker/vcs-core";
-import { createIgnoreManager } from "@statewalker/vcs-working-tree";
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import type {
+  IgnoreManager,
+  WorktreeEntry,
+  WorktreeStoreOptions,
+} from "@statewalker/vcs-working-tree";
+import { createIgnoreManager } from "@statewalker/vcs-working-tree";
 
 /**
  * Simplified file entry information for mode determination.

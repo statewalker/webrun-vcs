@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-working-tree",
-  "version": "0.1.1",
+  "version": "0.3.1",
   "description": "Git working-tree layer — index/staging, status, checkout, ignore, worktree, and merge/rebase operation state, over vcs-core",
   "license": "MIT",
   "repository": {
@@ -17,20 +17,24 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./staging": {
+      "source": "./src/staging/index.ts",
       "types": "./dist/staging/index.d.ts",
       "import": "./dist/staging/index.js"
     },
     "./transformation": {
+      "source": "./src/transformation/index.ts",
       "types": "./dist/transformation/index.d.ts",
       "import": "./dist/transformation/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
@@ -39,11 +43,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-utils-node": "workspace:*",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
     "rolldown": "catalog:",
     "typescript": "catalog:",

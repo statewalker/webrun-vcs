@@ -7,7 +7,7 @@
     "url": "https://github.com/statewalker/webrun-vcs.git"
   },
   "type": "module",
-  "packageManager": "pnpm@9.15.0",
+  "packageManager": "pnpm@10.16.1",
   "scripts": {
     "build": "pnpm -r run build",
     "test": "pnpm -r run test",
@@ -31,7 +31,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
-    "@changesets/cli": "^2.29.8",
+    "@changesets/cli": "catalog:",
     "@types/node": "catalog:",
     "@vitest/coverage-v8": "catalog:",
     "tsx": "catalog:",
@@ -43,6 +43,6 @@
     "extends": []
   },
   "dependencies": {
-    "@statewalker/utils": "^0.4.2"
+    "@statewalker/utils": "catalog:"
   }
 }

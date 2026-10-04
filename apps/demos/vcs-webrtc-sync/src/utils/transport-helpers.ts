@@ -20,8 +20,8 @@ import {
   pushOverDuplex,
   type RepositoryFacade,
   serveRepoOverWebrun,
-  webrunClientDuplex,
   type RefStore as TransportRefStore,
+  webrunClientDuplex,
 } from "@statewalker/vcs-transport";
 import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
 import { emulateMux } from "@statewalker/webrun-streams";
@@ -41,10 +41,7 @@ export type PeerMux = ReturnType<typeof emulateMux>;
  * @param side - `"initiator"` for the offering peer, `"responder"` for the
  *   answering peer (matches the WebRTC signaling role).
  */
-export function createPeerMux(
-  channel: RTCDataChannel,
-  side: "initiator" | "responder",
-): PeerMux {
+export function createPeerMux(channel: RTCDataChannel, side: "initiator" | "responder"): PeerMux {
   return emulateMux(byteChannelFromDataChannel(channel), { side });
 }
 

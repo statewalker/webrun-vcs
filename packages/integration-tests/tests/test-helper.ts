@@ -18,8 +18,8 @@ import type {
   Tags,
   Trees,
 } from "@statewalker/vcs-core";
-import type { Staging, WorkingCopy } from "@statewalker/vcs-working-tree";
 import { FileMode } from "@statewalker/vcs-core";
+import type { Staging, WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import {
   backends,

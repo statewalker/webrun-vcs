@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport",
-  "version": "0.1.1",
+  "version": "0.3.1",
   "description": "Git transport protocol implementation (fetch, push, clone over HTTP/WebSocket/WebRTC)",
   "license": "MIT",
   "repository": {
@@ -17,20 +17,24 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./protocol": {
+      "source": "./src/protocol/index.ts",
       "types": "./dist/protocol/index.d.ts",
       "import": "./dist/protocol/index.js"
     },
     "./operations": {
+      "source": "./src/operations/index.ts",
       "types": "./dist/operations/index.d.ts",
       "import": "./dist/operations/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
@@ -40,8 +44,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
     "@statewalker/webrun-http-streams": "catalog:",
     "@statewalker/webrun-streams": "catalog:"
   },

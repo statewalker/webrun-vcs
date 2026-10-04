@@ -9,14 +9,14 @@
  */
 
 import { FileMode, type History, type ObjectId } from "@statewalker/vcs-core";
-import {
-  type WorkingCopy,
-  type Worktree,
-  type WorktreeCheckoutOptions,
-  type WorktreeCheckoutResult,
-  type WorktreeEntry,
-  type WorktreeWalkOptions,
-  type WorktreeWriteOptions,
+import type {
+  WorkingCopy,
+  Worktree,
+  WorktreeCheckoutOptions,
+  WorktreeCheckoutResult,
+  WorktreeEntry,
+  WorktreeWalkOptions,
+  WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 

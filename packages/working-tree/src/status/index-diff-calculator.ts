@@ -14,9 +14,8 @@
  * - conflicting: multi-stage entries in index
  */
 
+import type { ObjectId, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
 import type { MergeStageValue, StagingEntry } from "../staging/index.js";
 import type { Staging } from "../staging/staging.js";
 import type { WorktreeEntry } from "../worktree/index.js";

@@ -279,10 +279,7 @@ describe("Client Push FSM", () => {
       context.config.pushRefspecs = ["refs/heads/main:refs/heads/main"];
 
       // Simulate a fast-forward: the remote OID is an ancestor of the local OID.
-      repository = createMockRepository(
-        new Set([remoteOid]),
-        new Map([[localOid, [remoteOid]]]),
-      );
+      repository = createMockRepository(new Set([remoteOid]), new Map([[localOid, [remoteOid]]]));
       context.repository = repository;
 
       const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
@@ -464,10 +461,7 @@ describe("Server Push FSM", () => {
 
       context.state.refs.set("refs/heads/main", oldOid);
       // Fast-forward: oldOid is an ancestor of newOid.
-      repository = createMockRepository(
-        new Set([oldOid, newOid]),
-        new Map([[newOid, [oldOid]]]),
-      );
+      repository = createMockRepository(new Set([oldOid, newOid]), new Map([[newOid, [oldOid]]]));
       context.repository = repository;
 
       (context.state as { pushCommands?: PushCommand[] }).pushCommands = [

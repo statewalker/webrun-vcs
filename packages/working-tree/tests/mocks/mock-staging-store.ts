@@ -11,11 +11,7 @@ import type {
   IndexEditor,
   Staging,
 } from "../../src/staging/staging.js";
-import {
-  MergeStage,
-  type MergeStageValue,
-  type StagingEntry,
-} from "../../src/staging/types.js";
+import { MergeStage, type MergeStageValue, type StagingEntry } from "../../src/staging/types.js";
 
 /**
  * Create a staging entry for tests.

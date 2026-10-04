@@ -7,8 +7,6 @@
  * @see WorkingCopy for the primary architecture
  */
 
-import type { WorkingCopy } from "@statewalker/vcs-working-tree";
-import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import {
   createMemoryObjectStores,
   MemoryRefStore,
@@ -23,6 +21,8 @@ import {
 import { SqlJsAdapter } from "@statewalker/vcs-store-sql/adapters/sql-js";
 import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
+import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { createMockWorktree } from "./helpers/mock-worktree.js";
 import { createSimpleHistory, type SimpleHistory } from "./helpers/simple-history.js";

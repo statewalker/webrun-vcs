@@ -1,9 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import type { Commits, Refs, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
-import type { Commits } from "@statewalker/vcs-core";
-import type { Refs } from "@statewalker/vcs-core";
-import type { TreeEntry } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
+import { describe, expect, it, vi } from "vitest";
 import type { MergeStageValue, StagingEntry } from "../../src/staging/index.js";
 import type { Staging } from "../../src/staging/staging.js";
 import {

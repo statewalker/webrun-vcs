@@ -7,6 +7,7 @@ import {
   type TreeEntry,
   type Trees,
 } from "@statewalker/vcs-core";
+import { GitWorkingCopy, type WorkingCopyFilesApi } from "@statewalker/vcs-store-files";
 import {
   type Checkout,
   FileStatus,
@@ -16,7 +17,6 @@ import {
   type Worktree,
   type WorktreeEntry,
 } from "@statewalker/vcs-working-tree";
-import { GitWorkingCopy, type WorkingCopyFilesApi } from "@statewalker/vcs-store-files";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**

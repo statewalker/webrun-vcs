@@ -19,7 +19,9 @@ export type { FetchLike, LfsPointer, TransportEvent };
 
 /** A chunk-level integrity hasher — the SAME function the content stores use.
  * Forwarded to `content-transfer` so every received chunk is re-hash verified. */
-export type HashContent = (bytes: import("@statewalker/content-store").ByteStream) => Promise<string>;
+export type HashContent = (
+  bytes: import("@statewalker/content-store").ByteStream,
+) => Promise<string>;
 
 /**
  * Options for {@link import("./client.js").xetUpload}/`xetDownload`. All optional

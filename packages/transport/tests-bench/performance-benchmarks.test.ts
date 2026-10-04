@@ -602,63 +602,61 @@ describe("Performance Benchmarks", () => {
       await source.close();
     });
 
-    it(
-      "concurrent MessagePort duplex transfers complete correctly",
-      { timeout: 30000 },
-      async () => {
-        const { createMessagePortDuplex } = await import(
-          "../src/adapters/messageport/messageport-duplex.js"
-        );
+    it("concurrent MessagePort duplex transfers complete correctly", {
+      timeout: 30000,
+    }, async () => {
+      const { createMessagePortDuplex } = await import(
+        "../src/adapters/messageport/messageport-duplex.js"
+      );
 
-        const concurrentCount = 10;
-        const chunkSize = 16 * 1024; // 16KB chunks
-        const chunkCount = 8; // 8 × 16KB = 128KB per transfer
-        const dataSize = chunkSize * chunkCount;
+      const concurrentCount = 10;
+      const chunkSize = 16 * 1024; // 16KB chunks
+      const chunkCount = 8; // 8 × 16KB = 128KB per transfer
+      const dataSize = chunkSize * chunkCount;
 
-        const start = performance.now();
+      const start = performance.now();
 
-        const results = await Promise.all(
-          Array.from({ length: concurrentCount }, async () => {
-            const channel = new MessageChannel();
-            const duplex1 = createMessagePortDuplex(channel.port1);
-            const duplex2 = createMessagePortDuplex(channel.port2);
+      const results = await Promise.all(
+        Array.from({ length: concurrentCount }, async () => {
+          const channel = new MessageChannel();
+          const duplex1 = createMessagePortDuplex(channel.port1);
+          const duplex2 = createMessagePortDuplex(channel.port2);
 
-            const receivedChunks: Uint8Array[] = [];
-            const receivePromise = (async () => {
-              for await (const chunk of duplex2) {
-                receivedChunks.push(chunk);
-                if (receivedChunks.length >= chunkCount) break;
-              }
-            })();
-
-            for (let i = 0; i < chunkCount; i++) {
-              duplex1.write(createRandomContent(chunkSize));
+          const receivedChunks: Uint8Array[] = [];
+          const receivePromise = (async () => {
+            for await (const chunk of duplex2) {
+              receivedChunks.push(chunk);
+              if (receivedChunks.length >= chunkCount) break;
             }
+          })();
 
-            await receivePromise;
-            await duplex1.close();
-            channel.port1.close();
-            channel.port2.close();
+          for (let i = 0; i < chunkCount; i++) {
+            duplex1.write(createRandomContent(chunkSize));
+          }
 
-            return receivedChunks.reduce((sum, c) => sum + c.length, 0);
-          }),
-        );
+          await receivePromise;
+          await duplex1.close();
+          channel.port1.close();
+          channel.port2.close();
 
-        const duration = performance.now() - start;
-        const totalTransferred = results.reduce((sum, r) => sum + r, 0);
+          return receivedChunks.reduce((sum, c) => sum + c.length, 0);
+        }),
+      );
 
-        console.log(`\n[CONCURRENCY] Concurrent MessagePort transfers:`);
-        console.log(`  Transfers: ${concurrentCount}`);
-        console.log(`  Total data: ${formatBytes(totalTransferred)}`);
-        console.log(`  Duration: ${duration.toFixed(2)}ms`);
-        console.log(`  Throughput: ${formatRate((totalTransferred / duration) * 1000)}`);
+      const duration = performance.now() - start;
+      const totalTransferred = results.reduce((sum, r) => sum + r, 0);
 
-        // All transfers should complete with correct data size
-        for (const received of results) {
-          expect(received).toBe(dataSize);
-        }
-      },
-    );
+      console.log(`\n[CONCURRENCY] Concurrent MessagePort transfers:`);
+      console.log(`  Transfers: ${concurrentCount}`);
+      console.log(`  Total data: ${formatBytes(totalTransferred)}`);
+      console.log(`  Duration: ${duration.toFixed(2)}ms`);
+      console.log(`  Throughput: ${formatRate((totalTransferred / duration) * 1000)}`);
+
+      // All transfers should complete with correct data size
+      for (const received of results) {
+        expect(received).toBe(dataSize);
+      }
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -666,60 +664,58 @@ describe("Performance Benchmarks", () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("5. Incremental sync", () => {
-    it(
-      "incremental pack is proportionally smaller than full pack",
-      { timeout: 30000 },
-      async () => {
-        const history = createMemoryHistoryWithOperations();
-        await history.initialize();
+    it("incremental pack is proportionally smaller than full pack", {
+      timeout: 30000,
+    }, async () => {
+      const history = createMemoryHistoryWithOperations();
+      await history.initialize();
 
-        // Create base chain of 20 commits with 100KB blobs
-        let baseId: string | undefined;
-        for (let i = 0; i < 20; i++) {
-          baseId = await createCommitWithBlob(history, 100 * 1024, i, baseId);
-        }
+      // Create base chain of 20 commits with 100KB blobs
+      let baseId: string | undefined;
+      for (let i = 0; i < 20; i++) {
+        baseId = await createCommitWithBlob(history, 100 * 1024, i, baseId);
+      }
 
-        // Full pack
-        const fullPackStart = performance.now();
-        const fullPack = await collectBytes(
-          history.serialization.createPack(
-            history.collectReachableObjects(new Set([baseId!]), new Set()),
-          ),
-        );
-        const fullPackDuration = performance.now() - fullPackStart;
+      // Full pack
+      const fullPackStart = performance.now();
+      const fullPack = await collectBytes(
+        history.serialization.createPack(
+          history.collectReachableObjects(new Set([baseId!]), new Set()),
+        ),
+      );
+      const fullPackDuration = performance.now() - fullPackStart;
 
-        // Add 5 more commits
-        let tipId = baseId!;
-        for (let i = 20; i < 25; i++) {
-          tipId = await createCommitWithBlob(history, 100 * 1024, i, tipId);
-        }
+      // Add 5 more commits
+      let tipId = baseId!;
+      for (let i = 20; i < 25; i++) {
+        tipId = await createCommitWithBlob(history, 100 * 1024, i, tipId);
+      }
 
-        // Incremental pack (only new objects)
-        const incrPackStart = performance.now();
-        const incrPack = await collectBytes(
-          history.serialization.createPack(
-            history.collectReachableObjects(new Set([tipId]), new Set([baseId!])),
-          ),
-        );
-        const incrPackDuration = performance.now() - incrPackStart;
+      // Incremental pack (only new objects)
+      const incrPackStart = performance.now();
+      const incrPack = await collectBytes(
+        history.serialization.createPack(
+          history.collectReachableObjects(new Set([tipId]), new Set([baseId!])),
+        ),
+      );
+      const incrPackDuration = performance.now() - incrPackStart;
 
-        const ratio = incrPack.length / fullPack.length;
+      const ratio = incrPack.length / fullPack.length;
 
-        console.log(`\n[INCREMENTAL] Pack size comparison:`);
-        console.log(
-          `  Full pack: ${formatBytes(fullPack.length)} in ${fullPackDuration.toFixed(2)}ms`,
-        );
-        console.log(
-          `  Incremental pack: ${formatBytes(incrPack.length)} in ${incrPackDuration.toFixed(2)}ms`,
-        );
-        console.log(`  Size ratio: ${(ratio * 100).toFixed(1)}%`);
+      console.log(`\n[INCREMENTAL] Pack size comparison:`);
+      console.log(
+        `  Full pack: ${formatBytes(fullPack.length)} in ${fullPackDuration.toFixed(2)}ms`,
+      );
+      console.log(
+        `  Incremental pack: ${formatBytes(incrPack.length)} in ${incrPackDuration.toFixed(2)}ms`,
+      );
+      console.log(`  Size ratio: ${(ratio * 100).toFixed(1)}%`);
 
-        // Incremental pack should be roughly proportional (5/25 = 20% ± overhead)
-        expect(ratio).toBeLessThan(0.5); // Less than 50% of full pack
-        expect(incrPackDuration).toBeLessThan(fullPackDuration); // Faster too
+      // Incremental pack should be roughly proportional (5/25 = 20% ± overhead)
+      expect(ratio).toBeLessThan(0.5); // Less than 50% of full pack
+      expect(incrPackDuration).toBeLessThan(fullPackDuration); // Faster too
 
-        await history.close();
-      },
-    );
+      await history.close();
+    });
   });
 });

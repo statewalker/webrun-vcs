@@ -380,13 +380,13 @@ async function collectBytes(iterable: AsyncIterable<Uint8Array>): Promise<Uint8A
 }
 
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
-import {
-  type Worktree,
-  type WorktreeCheckoutOptions,
-  type WorktreeCheckoutResult,
-  type WorktreeEntry,
-  type WorktreeWalkOptions,
-  type WorktreeWriteOptions,
+import type {
+  Worktree,
+  WorktreeCheckoutOptions,
+  WorktreeCheckoutResult,
+  WorktreeEntry,
+  WorktreeWalkOptions,
+  WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
 
 /**

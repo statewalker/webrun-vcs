@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-commands",
-  "version": "0.1.1",
+  "version": "0.3.1",
   "description": "Git-like VCS commands (commit, checkout, merge, diff, log)",
   "license": "MIT",
   "repository": {
@@ -17,24 +17,29 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./commands": {
+      "source": "./src/commands/index.ts",
       "types": "./dist/commands/index.d.ts",
       "import": "./dist/commands/index.js"
     },
     "./errors": {
+      "source": "./src/errors/index.ts",
       "types": "./dist/errors/index.d.ts",
       "import": "./dist/errors/index.js"
     },
     "./results": {
+      "source": "./src/results/index.ts",
       "types": "./dist/results/index.d.ts",
       "import": "./dist/results/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
@@ -43,18 +48,18 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-store-files": "workspace:*",
-    "@statewalker/vcs-store-mem": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-files": "workspace:^",
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-transport-adapters": "workspace:*",
-    "@statewalker/vcs-utils-node": "workspace:*",
+    "@statewalker/vcs-transport-adapters": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
-    "@statewalker/vcs-store-sql": "workspace:*",
+    "@statewalker/vcs-store-sql": "workspace:^",
     "rolldown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"

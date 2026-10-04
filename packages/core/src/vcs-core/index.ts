@@ -17,8 +17,7 @@
 import type { BlobStore, ByteStream, KvStore, RefStore } from "@statewalker/storage";
 import { refStore } from "@statewalker/storage";
 import type { ObjectId } from "../common/id/index.js";
-import { GcOrchestrator } from "../gc/index.js";
-import { MemoryGcStrategy } from "../gc/index.js";
+import { GcOrchestrator, MemoryGcStrategy } from "../gc/index.js";
 import type { Commit } from "../history/commits/commits.js";
 import {
   createBlobs,

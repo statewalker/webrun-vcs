@@ -6,7 +6,7 @@
 
 import { Git } from "@statewalker/vcs-commands";
 import { FileMode, type History } from "@statewalker/vcs-core";
-import { type WorkingCopy } from "@statewalker/vcs-working-tree";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import {
   createMemoryStorage,
   createPersistentStorage,

@@ -8,8 +8,8 @@
  */
 
 import { joinPath, readText, tryReadText } from "@statewalker/vcs-core";
-import type { RevertState } from "@statewalker/vcs-working-tree/transformation";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
+import type { RevertState } from "@statewalker/vcs-working-tree/transformation";
 
 /**
  * Store for revert operation state

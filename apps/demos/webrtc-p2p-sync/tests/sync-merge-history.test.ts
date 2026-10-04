@@ -17,18 +17,15 @@ import { fileURLToPath } from "node:url";
 
 import { Git } from "@statewalker/vcs-commands";
 import type { History, SerializationApi } from "@statewalker/vcs-core";
-import {
-	createMemoryHistory,
-	DefaultSerializationApi,
-} from "@statewalker/vcs-core";
-import {
-	createMemoryGitStaging,
-	MemoryCheckout,
-	MemoryWorkingCopy,
-	MemoryWorktree,
-} from "@statewalker/vcs-working-tree";
+import { createMemoryHistory, DefaultSerializationApi } from "@statewalker/vcs-core";
 import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import {
+  createMemoryGitStaging,
+  MemoryCheckout,
+  MemoryWorkingCopy,
+  MemoryWorktree,
+} from "@statewalker/vcs-working-tree";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -231,7 +228,9 @@ describe("Merge History: Low-level isolation", () => {
     } catch {
       // Ignore chmod errors
     }
-    await fs.rm(tempDir, { recursive: true, force: true });
+    // Writes started by the controllers can still land while the directory is removed
+    // (ENOTEMPTY on a busy runner): let fs.rm retry.
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("should walk all 79 commits via walkAncestry", async () => {
@@ -427,102 +426,103 @@ describe("Merge History: Full P2P sync", () => {
     } catch {
       // Ignore
     }
-    await fs.rm(tempDir, { recursive: true, force: true });
+    // Writes started by the controllers can still land while the directory is removed
+    // (ENOTEMPTY on a busy runner): let fs.rm retry.
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  it(
-    "should sync all 79 commits from file-backed repo to in-memory client",
-    { timeout: 30000 },
-    async () => {
-      const actionsModel1 = getUserActionsModel(ctx1);
-      const actionsModel2 = getUserActionsModel(ctx2);
-      const repoModel1 = getRepositoryModel(ctx1);
-      const _repoModel2 = getRepositoryModel(ctx2);
-      const sessionModel1 = getSessionModel(ctx1);
-      const peersModel1 = getPeersModel(ctx1);
-      const peersModel2 = getPeersModel(ctx2);
-      const syncModel2 = getSyncModel(ctx2);
-      const logModel2 = getActivityLogModel(ctx2);
+  it("should sync all 79 commits from file-backed repo to in-memory client", {
+    timeout: 30000,
+  }, async () => {
+    const actionsModel1 = getUserActionsModel(ctx1);
+    const actionsModel2 = getUserActionsModel(ctx2);
+    const repoModel1 = getRepositoryModel(ctx1);
+    const _repoModel2 = getRepositoryModel(ctx2);
+    const sessionModel1 = getSessionModel(ctx1);
+    const peersModel1 = getPeersModel(ctx1);
+    const peersModel2 = getPeersModel(ctx2);
+    const syncModel2 = getSyncModel(ctx2);
+    const logModel2 = getActivityLogModel(ctx2);
 
-      // Step 1: App 1 refreshes to read the existing repo
-      enqueueRefreshRepoAction(actionsModel1);
-      await waitModel(repoModel1, (m) => m.getState().initialized, 10000);
+    // Step 1: App 1 refreshes to read the existing repo
+    enqueueRefreshRepoAction(actionsModel1);
+    await waitModel(repoModel1, (m) => m.getState().initialized, 10000);
 
-      // Verify App 1 sees all 79 commits
-      expect(repoModel1.getState().commitCount).toBe(EXPECTED_COMMIT_COUNT);
+    // Verify App 1 sees all 79 commits
+    expect(repoModel1.getState().commitCount).toBe(EXPECTED_COMMIT_COUNT);
 
-      // Step 2: App 1 shares
-      enqueueShareAction(actionsModel1);
-      await waitModel(sessionModel1, (m) => m.getState().mode === "hosting");
+    // Step 2: App 1 shares
+    enqueueShareAction(actionsModel1);
+    await waitModel(sessionModel1, (m) => m.getState().mode === "hosting");
 
-      const sessionId = sessionModel1.getState().sessionId;
-      expect(sessionId).toBeTruthy();
-      if (!sessionId) throw new Error("Session ID not set");
+    const sessionId = sessionModel1.getState().sessionId;
+    expect(sessionId).toBeTruthy();
+    if (!sessionId) throw new Error("Session ID not set");
 
-      // Step 3: App 2 joins
-      enqueueJoinAction(actionsModel2, { sessionId });
-      await flushPromises(50);
-      await waitModel(
-        peersModel2,
-        (m) => m.count > 0 && m.getAll()[0]?.status === "connected",
-        10000,
+    // Step 3: App 2 joins
+    enqueueJoinAction(actionsModel2, { sessionId });
+    await flushPromises(50);
+    await waitModel(
+      peersModel2,
+      (m) => m.count > 0 && m.getAll()[0]?.status === "connected",
+      10000,
+    );
+    await waitModel(
+      peersModel1,
+      (m) => m.count > 0 && m.getAll()[0]?.status === "connected",
+      10000,
+    );
+
+    // Step 4: App 2 syncs with App 1
+    const hostPeerId = peersModel2.getAll()[0].id;
+    enqueueStartSyncAction(actionsModel2, { peerId: hostPeerId });
+
+    await waitModel(
+      syncModel2,
+      (m) => m.getState().phase === "complete" || m.getState().phase === "error",
+      15000,
+    );
+
+    // Debug: log errors if sync failed
+    if (syncModel2.getState().phase === "error") {
+      const errorLogs = logModel2.getEntries().filter((e) => e.level === "error");
+      console.error(
+        "Sync error logs:",
+        errorLogs.map((e) => e.message),
       );
-      await waitModel(
-        peersModel1,
-        (m) => m.count > 0 && m.getAll()[0]?.status === "connected",
-        10000,
-      );
+    }
+    expect(syncModel2.getState().phase).toBe("complete");
 
-      // Step 4: App 2 syncs with App 1
-      const hostPeerId = peersModel2.getAll()[0].id;
-      enqueueStartSyncAction(actionsModel2, { peerId: hostPeerId });
+    // Step 5: Advance timer to reset sync, wait for checkout/refresh
+    const _timerApi2 = new MockTimerApi();
+    // The timer is already set in the context, advance the one from ctx2
+    const ctxTimerApi = ctx2;
+    const syncTimerApi = ctxTimerApi as { _timerApi?: MockTimerApi };
+    // Use the injected timer API
+    const _injectedTimer = syncTimerApi._timerApi;
 
-      await waitModel(
-        syncModel2,
-        (m) => m.getState().phase === "complete" || m.getState().phase === "error",
-        15000,
-      );
+    // Wait for checkout and refresh to complete
+    await flushPromises(50);
 
-      // Debug: log errors if sync failed
-      if (syncModel2.getState().phase === "error") {
-        const errorLogs = logModel2.getEntries().filter((e) => e.level === "error");
-        console.error(
-          "Sync error logs:",
-          errorLogs.map((e) => e.message),
-        );
-      }
-      expect(syncModel2.getState().phase).toBe("complete");
+    // Step 6: Verify App 2 received all 79 commits
+    // First, check via direct history walk (most reliable)
+    const history2 = getHistory(ctx2);
+    expect(history2).not.toBeNull();
 
-      // Step 5: Advance timer to reset sync, wait for checkout/refresh
-      const _timerApi2 = new MockTimerApi();
-      // The timer is already set in the context, advance the one from ctx2
-      const ctxTimerApi = ctx2;
-      const syncTimerApi = ctxTimerApi as { _timerApi?: MockTimerApi };
-      // Use the injected timer API
-      const _injectedTimer = syncTimerApi._timerApi;
+    const headRef2 = await history2?.refs.resolve("HEAD");
+    expect(headRef2?.objectId).toBeTruthy();
 
-      // Wait for checkout and refresh to complete
-      await flushPromises(50);
+    if (!history2 || !headRef2) throw new Error("client history has no HEAD");
+    const clientCommitIds: string[] = [];
+    for await (const id of history2.commits.walkAncestry(headRef2.objectId)) {
+      clientCommitIds.push(id);
+    }
 
-      // Step 6: Verify App 2 received all 79 commits
-      // First, check via direct history walk (most reliable)
-      const history2 = getHistory(ctx2);
-      expect(history2).not.toBeNull();
+    // This is the key assertion — should be 79, not 27
+    expect(clientCommitIds.length).toBe(EXPECTED_COMMIT_COUNT);
 
-      const headRef2 = await history2?.refs.resolve("HEAD");
-      expect(headRef2?.objectId).toBeTruthy();
-
-      const clientCommitIds: string[] = [];
-      for await (const id of history2?.commits.walkAncestry(headRef2?.objectId)) {
-        clientCommitIds.push(id);
-      }
-
-      // This is the key assertion — should be 79, not 27
-      expect(clientCommitIds.length).toBe(EXPECTED_COMMIT_COUNT);
-
-      // Also verify HEAD matches
-      const headRef1 = await getHistory(ctx1)?.refs.resolve("HEAD");
-      expect(headRef2?.objectId).toBe(headRef1?.objectId);
-    },
-  );
+    // Also verify HEAD matches
+    const headRef1 = await getHistory(ctx1)?.refs.resolve("HEAD");
+    expect(headRef2?.objectId).toBe(headRef1?.objectId);
+  });
 });

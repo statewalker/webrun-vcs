@@ -10,12 +10,12 @@
  */
 
 import { joinPath, tryReadText } from "@statewalker/vcs-core";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type {
   SequencerOptions,
   SequencerState,
   SequencerTodoItem,
 } from "@statewalker/vcs-working-tree/transformation";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
 
 /**
  * Store for sequencer state (multi-commit cherry-pick/revert)

@@ -9,8 +9,8 @@
  */
 
 import { joinPath, readText, tryReadText } from "@statewalker/vcs-core";
-import type { MergeState } from "@statewalker/vcs-working-tree/transformation";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
+import type { MergeState } from "@statewalker/vcs-working-tree/transformation";
 
 /**
  * Store for merge operation state

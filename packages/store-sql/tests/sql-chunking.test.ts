@@ -77,41 +77,39 @@ describe("T4.6: SQL Chunking Integration", () => {
       expect(sqlId2).toBe(sqlId);
     });
 
-    it(
-      "round-trips produce identical content regardless of internal chunking",
-      { timeout: 60000 },
-      async () => {
-        // ChunkedRawStorage with MemoryChunkAccess uses the same chunking concept
-        // as SQL blob store, just with different storage backends
-        const memoryAccess = new MemoryChunkAccess();
-        expect(memoryAccess).toBeDefined();
+    it("round-trips produce identical content regardless of internal chunking", {
+      timeout: 60000,
+    }, async () => {
+      // ChunkedRawStorage with MemoryChunkAccess uses the same chunking concept
+      // as SQL blob store, just with different storage backends
+      const memoryAccess = new MemoryChunkAccess();
+      expect(memoryAccess).toBeDefined();
 
-        // Test various sizes around chunk boundaries
-        const testSizes = [
-          SQL_CHUNK_THRESHOLD - 1, // Just under threshold (inline)
-          SQL_CHUNK_THRESHOLD, // At threshold (inline)
-          SQL_CHUNK_THRESHOLD + 1, // Just over threshold (chunked)
-          SQL_CHUNK_SIZE * 2, // Two full chunks
-          SQL_CHUNK_SIZE * 2 + 100, // Two full chunks + partial
-          SQL_CHUNK_SIZE * 3 - 1, // Three chunks - 1 byte
-        ];
+      // Test various sizes around chunk boundaries
+      const testSizes = [
+        SQL_CHUNK_THRESHOLD - 1, // Just under threshold (inline)
+        SQL_CHUNK_THRESHOLD, // At threshold (inline)
+        SQL_CHUNK_THRESHOLD + 1, // Just over threshold (chunked)
+        SQL_CHUNK_SIZE * 2, // Two full chunks
+        SQL_CHUNK_SIZE * 2 + 100, // Two full chunks + partial
+        SQL_CHUNK_SIZE * 3 - 1, // Three chunks - 1 byte
+      ];
 
-        for (const size of testSizes) {
-          const content = new Uint8Array(size);
-          for (let i = 0; i < size; i++) {
-            content[i] = (i * 7 + 13) % 256; // Pseudo-random pattern
-          }
-
-          // Store and load from SQL
-          const id = await store.store(toStream(content));
-          const loaded = await collectBytes(store.load(id));
-
-          // Verify round-trip integrity
-          expect(loaded.length).toBe(content.length);
-          expect(loaded).toEqual(content);
+      for (const size of testSizes) {
+        const content = new Uint8Array(size);
+        for (let i = 0; i < size; i++) {
+          content[i] = (i * 7 + 13) % 256; // Pseudo-random pattern
         }
-      },
-    );
+
+        // Store and load from SQL
+        const id = await store.store(toStream(content));
+        const loaded = await collectBytes(store.load(id));
+
+        // Verify round-trip integrity
+        expect(loaded.length).toBe(content.length);
+        expect(loaded).toEqual(content);
+      }
+    });
 
     it("handles same content in different chunk configurations", { timeout: 30000 }, async () => {
       // Store content that's exactly at various chunk boundaries

@@ -20,8 +20,8 @@ import {
   decodeSignal,
   encodeSignal,
   generateSessionId,
-  parseCompressedSignal,
   PeerConnection,
+  parseCompressedSignal,
   type SignalingMessage,
 } from "@statewalker/webrun-streams-signaling";
 import { getActivityLogModel, getConnectionModel, getSharingFormModel } from "../models/index.js";
@@ -33,10 +33,7 @@ export const [getPeerManager, setPeerManager] = newAdapter<PeerConnection | null
   () => null,
 );
 
-export const [getSessionId, setSessionId] = newAdapter<string | null>(
-  "qr-session-id",
-  () => null,
-);
+export const [getSessionId, setSessionId] = newAdapter<string | null>("qr-session-id", () => null);
 
 export const [getMux, setMux] = newAdapter<PeerMux | null>("peer-mux", () => null);
 

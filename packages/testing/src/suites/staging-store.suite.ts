@@ -6,8 +6,8 @@
  */
 
 import type { Trees } from "@statewalker/vcs-core";
-import type { Staging, StagingEntry, StagingEntryOptions } from "@statewalker/vcs-working-tree";
 import { FileMode } from "@statewalker/vcs-core";
+import type { Staging, StagingEntry, StagingEntryOptions } from "@statewalker/vcs-working-tree";
 import { MergeStage } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 

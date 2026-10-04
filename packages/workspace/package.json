@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-workspace",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "description": "Thin cross-axis orchestration (publish/update/checkpoint/restore) composing files-sync + vcs-working-tree + vcs-transport",
   "license": "MIT",
   "repository": {
@@ -17,12 +17,14 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
@@ -36,16 +38,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/files-sync": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-transport": "workspace:*",
-    "@statewalker/content-store": "workspace:*",
+    "@statewalker/files-sync": "catalog:",
+    "@statewalker/vcs-working-tree": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/content-store": "catalog:",
     "@statewalker/webrun-files": "catalog:"
   },
   "devDependencies": {
     "@statewalker/webrun-files-mem": "catalog:",
-    "@statewalker/storage": "workspace:*",
+    "@statewalker/storage": "catalog:",
     "rolldown": "catalog:",
     "vitest": "catalog:",
     "typescript": "catalog:",

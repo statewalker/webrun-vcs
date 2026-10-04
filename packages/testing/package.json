@@ -19,11 +19,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
   },
   "peerDependencies": {
-    "vitest": "^4.1.4"
+    "vitest": "catalog:peers"
   },
   "devDependencies": {
     "rolldown": "catalog:",

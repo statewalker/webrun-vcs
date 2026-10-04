@@ -8,13 +8,13 @@
  */
 
 import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-core";
-import { MemoryWorkingCopy, type WorkingCopy, type Worktree } from "@statewalker/vcs-working-tree";
 import { createFileWorktree } from "@statewalker/vcs-store-files";
 import {
   createMemoryObjectStores,
   MemoryRefStore,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
+import { MemoryWorkingCopy, type WorkingCopy, type Worktree } from "@statewalker/vcs-working-tree";
 import { describe, expect, it } from "vitest";
 
 import { CheckoutStatus } from "../src/commands/checkout-command.js";

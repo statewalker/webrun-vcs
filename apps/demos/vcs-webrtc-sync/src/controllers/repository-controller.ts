@@ -7,8 +7,8 @@
 
 import { Git } from "@statewalker/vcs-commands";
 import { FileMode, type History } from "@statewalker/vcs-core";
-import { type WorkingCopy } from "@statewalker/vcs-working-tree";
 import { FileStagingStore } from "@statewalker/vcs-store-files";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import {
   type CommitEntry,
   type FileEntry,

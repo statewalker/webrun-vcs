@@ -21,11 +21,7 @@ import type {
   ServiceType,
   WebrunDuplex,
 } from "@statewalker/vcs-transport";
-import {
-  type RefStore,
-  serveRepoOverWebrun,
-  webrunClientDuplex,
-} from "@statewalker/vcs-transport";
+import { type RefStore, serveRepoOverWebrun, webrunClientDuplex } from "@statewalker/vcs-transport";
 
 const SERVICE_UPLOAD_PACK = 0x01;
 const SERVICE_RECEIVE_PACK = 0x02;

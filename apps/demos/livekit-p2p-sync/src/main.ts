@@ -21,16 +21,12 @@
 
 import { Git } from "@statewalker/vcs-commands";
 import type { History, SerializationApi } from "@statewalker/vcs-core";
+import { createMemoryHistory, DefaultSerializationApi, FileMode } from "@statewalker/vcs-core";
 import {
-	createMemoryHistory,
-	DefaultSerializationApi,
-	FileMode,
-} from "@statewalker/vcs-core";
-import {
-	createMemoryGitStaging,
-	MemoryCheckout,
-	MemoryWorkingCopy,
-	MemoryWorktree,
+  createMemoryGitStaging,
+  MemoryCheckout,
+  MemoryWorkingCopy,
+  MemoryWorktree,
 } from "@statewalker/vcs-working-tree";
 import { emulateMux } from "@statewalker/webrun-streams";
 import { byteChannelFromLiveKit } from "@statewalker/webrun-streams-livekit";
@@ -406,11 +402,7 @@ async function handleSync(identity: string): Promise<void> {
 /**
  * Check if `ancestor` is an ancestor of `descendant` by walking parents.
  */
-async function isAncestorOf(
-  h: History,
-  ancestor: string,
-  descendant: string,
-): Promise<boolean> {
+async function isAncestorOf(h: History, ancestor: string, descendant: string): Promise<boolean> {
   const visited = new Set<string>();
   const queue = [descendant];
 
@@ -578,12 +570,18 @@ async function refreshUI(): Promise<void> {
   try {
     await updateFileList();
   } catch (error) {
-    log(`File list update error: ${error instanceof Error ? error.message : String(error)}`, "error");
+    log(
+      `File list update error: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
   }
   try {
     await updateCommitList();
   } catch (error) {
-    log(`Commit list update error: ${error instanceof Error ? error.message : String(error)}`, "error");
+    log(
+      `Commit list update error: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
   }
 }
 

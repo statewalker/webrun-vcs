@@ -7,9 +7,9 @@ import {
 } from "@statewalker/vcs-transport";
 
 import { InvalidRemoteError, NonFastForwardError, PushRejectedException } from "../errors/index.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
-import { RemoteConfigStore } from "../remote-config/index.js";
 
 /** All-zero object id — Git's "no object", used to express a ref delete. */
 const ZERO_OBJECT_ID = "0".repeat(40);

@@ -11,8 +11,7 @@
  * - Worktree: Filesystem access
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { History } from "@statewalker/vcs-core";
+import type { History, ObjectId } from "@statewalker/vcs-core";
 import type { Checkout } from "../checkout/checkout.js";
 import type { RepositoryStatus, StatusOptions } from "../status/index.js";
 import type {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { BASIC_TRANSFER, LFS_CONTENT_TYPE, serveLfs } from "../src/index.js";
 import type { BatchResponse } from "../src/index.js";
+import { BASIC_TRANSFER, LFS_CONTENT_TYPE, serveLfs } from "../src/index.js";
 import { makeStore, memResolver, prng, seedObject } from "./helpers.js";
 
 const URL = "http://lfs.test";

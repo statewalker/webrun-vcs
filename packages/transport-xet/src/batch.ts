@@ -9,7 +9,11 @@
  * needs to drive the chunk-level {@link import("@statewalker/content-transfer").transfer}.
  */
 
-import type { BatchAction, BatchObjectResponse, BatchResponse } from "@statewalker/vcs-transport-lfs";
+import type {
+  BatchAction,
+  BatchObjectResponse,
+  BatchResponse,
+} from "@statewalker/vcs-transport-lfs";
 import { BASIC_TRANSFER } from "@statewalker/vcs-transport-lfs";
 
 export { BASIC_TRANSFER };

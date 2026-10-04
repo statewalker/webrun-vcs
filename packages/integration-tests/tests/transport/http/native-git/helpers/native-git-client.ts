@@ -49,7 +49,8 @@ export function createNativeGitClient(): NativeGitClient {
     git,
 
     async clone(url: string) {
-      await execAsync(`git clone "${url}" "${workDir}"`);
+      // An empty repository clones onto the local default branch: pin it to main.
+      await execAsync(`git -c init.defaultBranch=main clone "${url}" "${workDir}"`);
     },
 
     async commitFile(filename: string, content: string, message: string) {

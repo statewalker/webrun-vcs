@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FileMode } from "@statewalker/vcs-core";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { IndexEntry, Staging } from "../../../src/staging/staging.js";
 
 // This file exports a conformance test factory, not direct tests.

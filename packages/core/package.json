@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-core",
-  "version": "0.1.1",
+  "version": "0.3.1",
   "description": "Core VCS interfaces, storage abstractions, and history management",
   "license": "MIT",
   "repository": {
@@ -17,28 +17,34 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./history": {
+      "source": "./src/history/index.ts",
       "types": "./dist/history/index.d.ts",
       "import": "./dist/history/index.js"
     },
     "./storage": {
+      "source": "./src/storage/index.ts",
       "types": "./dist/storage/index.d.ts",
       "import": "./dist/storage/index.js"
     },
     "./backend": {
+      "source": "./src/backend/index.ts",
       "types": "./dist/backend/index.d.ts",
       "import": "./dist/backend/index.js"
     },
     "./serialization": {
+      "source": "./src/serialization/index.ts",
       "types": "./dist/serialization/index.d.ts",
       "import": "./dist/serialization/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
@@ -47,11 +53,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/storage": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*"
+    "@statewalker/storage": "catalog:",
+    "@statewalker/vcs-utils": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-utils-node": "workspace:*",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
     "rolldown": "catalog:",
     "typescript": "catalog:",

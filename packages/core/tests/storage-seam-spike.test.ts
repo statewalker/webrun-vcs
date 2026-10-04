@@ -128,7 +128,10 @@ describe("B1 spike: vcs-core git engine over the @statewalker/storage seam", () 
 
     // Every reachable object, collected over the source seam.
     const reachable: string[] = [];
-    for await (const oid of source.history.collectReachableObjects(new Set([commitId]), new Set())) {
+    for await (const oid of source.history.collectReachableObjects(
+      new Set([commitId]),
+      new Set(),
+    )) {
       reachable.push(oid);
     }
     expect(reachable).toEqual(expect.arrayContaining([blobId, treeId, commitId]));

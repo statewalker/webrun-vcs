@@ -197,8 +197,7 @@ export async function getPackFileStats(): Promise<
   return stats;
 }
 
-// Re-export fs and path for cleanup step
-export { fs, path };
-
 // Re-export types
 export type { Git } from "@statewalker/vcs-commands";
+// Re-export fs and path for cleanup step
+export { fs, path };

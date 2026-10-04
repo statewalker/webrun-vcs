@@ -11,10 +11,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-commands": "workspace:*",
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-store-mem": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*",
+    "@statewalker/vcs-commands": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^",
     "@statewalker/webrun-files": "catalog:",
     "@statewalker/webrun-files-browser": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:"
@@ -22,7 +22,9 @@
   "devDependencies": {
     "@types/node": "catalog:",
     "typescript": "catalog:",
-    "vite": "^6.0.0",
-    "vite-plugin-pwa": "^0.21.0"
+    "vite": "catalog:",
+    "vite-plugin-pwa": "catalog:",
+    "workbox-build": "catalog:",
+    "workbox-window": "catalog:"
   }
 }

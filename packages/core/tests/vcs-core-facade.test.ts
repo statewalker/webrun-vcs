@@ -49,17 +49,21 @@ describe("VcsCore facade over the storage seam", () => {
     it("blob write→read roundtrip returns identical bytes", async () => {
       const vcs = newVcsCore();
       const payload = new TextEncoder().encode("Hello, facade!");
-      const id = await vcs.writeBlob((async function* () {
-        yield payload;
-      })());
+      const id = await vcs.writeBlob(
+        (async function* () {
+          yield payload;
+        })(),
+      );
       expect(await collect(vcs.readBlob(id))).toEqual(payload);
     });
 
     it("readTree returns an array (not an iterable) tiling a real tree", async () => {
       const vcs = newVcsCore();
-      const blobId = await vcs.writeBlob((async function* () {
-        yield new Uint8Array([1, 2, 3]);
-      })());
+      const blobId = await vcs.writeBlob(
+        (async function* () {
+          yield new Uint8Array([1, 2, 3]);
+        })(),
+      );
       const treeId = await vcs.writeTree([{ name: "file.txt", mode: 0o100644, id: blobId }]);
       const entries = await vcs.readTree(treeId);
       expect(Array.isArray(entries)).toBe(true);
@@ -97,9 +101,11 @@ describe("VcsCore facade over the storage seam", () => {
 
     it("has() unifies existence across object types; readCommit throws on a missing id", async () => {
       const vcs = newVcsCore();
-      const blobId = await vcs.writeBlob((async function* () {
-        yield new Uint8Array([9]);
-      })());
+      const blobId = await vcs.writeBlob(
+        (async function* () {
+          yield new Uint8Array([9]);
+        })(),
+      );
       expect(await vcs.has(blobId)).toBe(true);
       expect(await vcs.has(ABSENT_OID)).toBe(false);
       await expect(vcs.readCommit(ABSENT_OID)).rejects.toThrow();
@@ -164,9 +170,11 @@ describe("VcsCore facade over the storage seam", () => {
       const source = newVcsCore();
       const target = newVcsCore();
 
-      const blobId = await source.writeBlob((async function* () {
-        yield new TextEncoder().encode("packed content");
-      })());
+      const blobId = await source.writeBlob(
+        (async function* () {
+          yield new TextEncoder().encode("packed content");
+        })(),
+      );
       const treeId = await source.writeTree([{ name: "a.txt", mode: 0o100644, id: blobId }]);
       const commitId = await source.writeCommit({
         tree: treeId,
@@ -191,9 +199,11 @@ describe("VcsCore facade over the storage seam", () => {
   describe("gc", () => {
     it("prunes unreferenced objects and keeps ref-reachable ones", async () => {
       const vcs = newVcsCore();
-      const blobId = await vcs.writeBlob((async function* () {
-        yield new TextEncoder().encode("kept");
-      })());
+      const blobId = await vcs.writeBlob(
+        (async function* () {
+          yield new TextEncoder().encode("kept");
+        })(),
+      );
       const treeId = await vcs.writeTree([{ name: "keep.txt", mode: 0o100644, id: blobId }]);
       const head = await vcs.writeCommit({
         tree: treeId,
@@ -202,9 +212,11 @@ describe("VcsCore facade over the storage seam", () => {
         committer: person(),
         message: "head",
       });
-      const dangling = await vcs.writeBlob((async function* () {
-        yield new TextEncoder().encode("garbage");
-      })());
+      const dangling = await vcs.writeBlob(
+        (async function* () {
+          yield new TextEncoder().encode("garbage");
+        })(),
+      );
 
       // Root the reachability at head.
       await vcs.refs.compareAndSet("refs/heads/main", undefined, head);

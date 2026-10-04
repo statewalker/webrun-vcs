@@ -9,10 +9,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/content-store": "workspace:*",
-    "@statewalker/storage": "workspace:*",
-    "@statewalker/vcs-transport-lfs": "workspace:*",
-    "@statewalker/vcs-transport-xet": "workspace:*"
+    "@statewalker/content-store": "catalog:",
+    "@statewalker/storage": "catalog:",
+    "@statewalker/vcs-transport-lfs": "workspace:^",
+    "@statewalker/vcs-transport-xet": "workspace:^"
   },
   "devDependencies": {
     "@types/node": "catalog:",

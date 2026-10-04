@@ -137,7 +137,7 @@ export async function startGitHttpBackendServer(): Promise<GitHttpBackendServer>
 
     async createBareRepo(name: string): Promise<string> {
       const repoPath = join(reposDir, name);
-      execSync(`git init --bare "${repoPath}"`, { stdio: "pipe" });
+      execSync(`git init --bare --initial-branch=main "${repoPath}"`, { stdio: "pipe" });
       execSync(`git -C "${repoPath}" config http.receivepack true`, {
         stdio: "pipe",
       });

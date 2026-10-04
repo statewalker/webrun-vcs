@@ -30,6 +30,12 @@ export interface ReadOptions {
 export interface ListOptions {
   /** If true, lists all descendants recursively. Defaults to false. */
   recursive?: boolean;
+  /**
+   * Yield only entries whose path sorts strictly after this one (webrun-files
+   * 0.10 `ListOptions.after`). The implementations come from webrun-files,
+   * which honour it; this declaration only keeps the key sets in step.
+   */
+  after?: string;
 }
 
 /**

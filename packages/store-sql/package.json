@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-sql",
-  "version": "0.1.1",
+  "version": "0.3.1",
   "description": "SQL-based storage backend for StateWalker VCS",
   "license": "MIT",
   "repository": {
@@ -17,16 +17,19 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./adapters/sql-js": {
+      "source": "./src/adapters/sql-js-adapter.ts",
       "types": "./dist/adapters/sql-js-adapter.d.ts",
       "import": "./dist/adapters/sql-js-adapter.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
@@ -35,12 +38,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/vcs-core": "workspace:*",
-    "@statewalker/vcs-utils": "workspace:*",
-    "@statewalker/vcs-working-tree": "workspace:*"
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
   },
   "devDependencies": {
-    "@statewalker/vcs-testing": "workspace:*",
+    "@statewalker/vcs-testing": "workspace:^",
     "sql.js": "catalog:",
     "@types/sql.js": "catalog:",
     "rolldown": "catalog:",
@@ -49,7 +52,7 @@
     "@types/node": "catalog:"
   },
   "peerDependencies": {
-    "sql.js": ">=1.14.1"
+    "sql.js": "catalog:peers"
   },
   "peerDependenciesMeta": {
     "sql.js": {
