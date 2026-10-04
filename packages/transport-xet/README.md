@@ -4,7 +4,7 @@ A Git LFS custom transfer agent: chunk-dedup large-file transfer that stays LFS-
 
 ## Overview
 
-`vcs-transport-xet` is the chunk-aware, resumable, deduplicated large-file transfer path of Axis B — exposed as a Git LFS **custom transfer agent** (the "Xet" model). It is a **thin adapter** over two existing pieces: `@statewalker/vcs-transport-lfs` for batch negotiation and the basic whole-object fallback, and `@statewalker/content-transfer` for the chunk-dedup engine. It negotiates over the standard LFS batch API advertising a `xet` custom transfer alongside `basic`; when the peer agrees it moves only the missing chunks, otherwise it falls back to whole-object basic LFS.
+`vcs-transport-xet` is the chunk-aware, resumable, deduplicated large-file transfer path of Axis B — exposed as a Git LFS **custom transfer agent** (the "Xet" model). It is a **thin adapter** over two existing pieces: `@statewalker/vcs-transport-lfs` for batch negotiation and the basic whole-object fallback, and `@statewalker/webrun-content-transfer` for the chunk-dedup engine. It negotiates over the standard LFS batch API advertising a `xet` custom transfer alongside `basic`; when the peer agrees it moves only the missing chunks, otherwise it falls back to whole-object basic LFS.
 
 The whole-file SHA-256 (the LFS oid) remains the interop identity either way. It owns no chunking/CDC (`content-store`), no batch/basic internals (`vcs-transport-lfs`), no chunk protocol (`content-transfer`), and no pointers.
 

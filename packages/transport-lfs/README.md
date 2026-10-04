@@ -4,7 +4,7 @@ The standard Git LFS batch protocol plus basic (whole-object) transfer, client a
 
 ## Overview
 
-`vcs-transport-lfs` speaks the **standard Git LFS batch protocol** (`POST /objects/batch`) plus basic whole-object transfer, both client and server, so the system interoperates on the wire with real Git LFS hosts. The LFS object id (`oid`) is the whole-file **SHA-256** (bare lowercase hex — the authoritative LFS identity); bytes live in a `@statewalker/content-store`, whose object ids are opaque and unrelated, and an injected `LfsResolver` maps between the two.
+`vcs-transport-lfs` speaks the **standard Git LFS batch protocol** (`POST /objects/batch`) plus basic whole-object transfer, both client and server, so the system interoperates on the wire with real Git LFS hosts. The LFS object id (`oid`) is the whole-file **SHA-256** (bare lowercase hex — the authoritative LFS identity); bytes live in a `@statewalker/webrun-content-store`, whose object ids are opaque and unrelated, and an injected `LfsResolver` maps between the two.
 
 It is the LFS skin of Axis B. Its job is *standard* whole-object transfer; chunk-aware dedup transfer is `@statewalker/vcs-transport-xet`, and pointer clean/smudge is the working-tree LFS filter. This module knows nothing of git objects, chunks, pointers, or sync.
 

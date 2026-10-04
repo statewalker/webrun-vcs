@@ -13,7 +13,7 @@
  * skips the steps it already records — no duplicate commit, no duplicate push.
  */
 
-import { execute, plan } from "@statewalker/files-sync";
+import { execute, plan } from "@statewalker/webrun-files-sync";
 import { makeCheckpoint } from "./checkpoint.js";
 import { buildSyncOptions, manifestOf } from "./sync-options.js";
 import type {

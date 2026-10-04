@@ -7,10 +7,10 @@
  * oid) is verified on a completed xet download — the interop guarantee.
  */
 
-import type { ByteStream, ContentStore } from "@statewalker/content-store";
-import { remoteStore, transfer } from "@statewalker/content-transfer";
 import type { BatchRequest, LfsPointer, LfsResolver } from "@statewalker/vcs-transport-lfs";
 import { lfsDownload, lfsUpload, sha256Hex } from "@statewalker/vcs-transport-lfs";
+import type { ByteStream, ContentStore } from "@statewalker/webrun-content-store";
+import { remoteStore, transfer } from "@statewalker/webrun-content-transfer";
 import {
   XET_TRANSFER,
   XET_TRANSFERS,

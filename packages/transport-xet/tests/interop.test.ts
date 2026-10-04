@@ -1,5 +1,5 @@
-import type { ContentStore } from "@statewalker/content-store";
 import { sha256Hex } from "@statewalker/vcs-transport-lfs";
+import type { ContentStore } from "@statewalker/webrun-content-store";
 import { describe, expect, it } from "vitest";
 import { serveXet, xetDownload } from "../src/index.js";
 import {

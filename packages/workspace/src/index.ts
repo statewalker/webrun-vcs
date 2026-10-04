@@ -2,7 +2,7 @@
  * @statewalker/vcs-workspace
  *
  * The thin cross-axis orchestration layer of the VCS two-axis architecture — the
- * ONLY package that composes Axis A (`@statewalker/files-sync`) with Axis B
+ * ONLY package that composes Axis A (`@statewalker/webrun-files-sync`) with Axis B
  * (`@statewalker/vcs-working-tree` + `@statewalker/vcs-core` +
  * `@statewalker/vcs-transport`). It keeps the HARD BAN intact: files-sync and
  * vcs-core never import each other; this layer depends on the file axis directly

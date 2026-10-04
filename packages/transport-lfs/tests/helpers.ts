@@ -1,6 +1,6 @@
-import type { ByteStream, ContentStore, ObjectId } from "@statewalker/content-store";
-import { createContentStore } from "@statewalker/content-store";
-import { memBlobStore } from "@statewalker/storage";
+import type { ByteStream, ContentStore, ObjectId } from "@statewalker/webrun-content-store";
+import { createContentStore } from "@statewalker/webrun-content-store";
+import { memBlobStore } from "@statewalker/webrun-storage";
 import type { LfsPointer, LfsResolver, TransportEvent } from "../src/index.js";
 import { sha256Hex } from "../src/index.js";
 

@@ -6,7 +6,7 @@
  * only when the server agreed; otherwise it is `"basic"` and the client falls
  * back to `@statewalker/vcs-transport-lfs`. A xet action extends the LFS
  * `{href}` action with the peer's content-store object id, which the client
- * needs to drive the chunk-level {@link import("@statewalker/content-transfer").transfer}.
+ * needs to drive the chunk-level {@link import("@statewalker/webrun-content-transfer").transfer}.
  */
 
 import type {

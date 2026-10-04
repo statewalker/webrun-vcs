@@ -4,7 +4,7 @@ File-backed storage backend for StateWalker VCS — reads and writes a standard 
 
 ## Overview
 
-`@statewalker/vcs-store-files` implements the vcs-core storage seam against a filesystem (or any `FilesApi`), so a StateWalker repository is a real, native-git-compatible `.git` directory. It provides file-backed raw/pack object storage, refs, GC/repack, and a working-tree staging + worktree, plus convenience factories that assemble a `History` over a `.git` dir. It is a storage adapter over the `@statewalker/storage` seam — see [ADR-0001](../../docs/adr/0001-two-axis-architecture.md).
+`@statewalker/vcs-store-files` implements the vcs-core storage seam against a filesystem (or any `FilesApi`), so a StateWalker repository is a real, native-git-compatible `.git` directory. It provides file-backed raw/pack object storage, refs, GC/repack, and a working-tree staging + worktree, plus convenience factories that assemble a `History` over a `.git` dir. It is a storage adapter over the `@statewalker/webrun-storage` seam — see [ADR-0001](../../docs/adr/0001-two-axis-architecture.md).
 
 ## Installation
 

@@ -1,6 +1,6 @@
 /**
  * Prove the git transport's object-exchange rides the
- * `@statewalker/storage`-backed core built by {@link createStorageRepositoryFacade}.
+ * `@statewalker/webrun-storage`-backed core built by {@link createStorageRepositoryFacade}.
  *
  * A source repo (facade + refStore over mem storage) is populated with two
  * commits and `refs/heads/main`. A real git v1 fetch then runs over an
@@ -8,13 +8,12 @@
  * carries `serveOverDuplex` on the server side) into a fresh, empty
  * storage-backed destination. The assertions are concrete: the destination
  * imports objects under IDENTICAL git oids and its `refs/heads/main` matches the
- * source tip — object-exchange is byte-faithful over `@statewalker/storage`.
+ * source tip — object-exchange is byte-faithful over `@statewalker/webrun-storage`.
  *
  * A second check exercises the facade's `exportPack`/`importPack`/reachability
  * directly at the storage-backend level.
  */
 
-import { memBlobStore, memKvStore } from "@statewalker/storage";
 import {
   blobStoreToRawStorage,
   createBlobs,
@@ -31,6 +30,7 @@ import {
   serveRepoOverWebrun,
   webrunClientDuplex,
 } from "@statewalker/vcs-transport";
+import { memBlobStore, memKvStore } from "@statewalker/webrun-storage";
 import { describe, expect, it } from "vitest";
 import { createStorageRepositoryFacade } from "../src/index.js";
 
@@ -91,7 +91,7 @@ async function commitInRepo(
   });
 }
 
-describe("createStorageRepositoryFacade transport object-exchange over @statewalker/storage", () => {
+describe("createStorageRepositoryFacade transport object-exchange over @statewalker/webrun-storage", () => {
   it("fetches refs and objects byte-faithfully into a fresh storage-backed repo", async () => {
     // Source: two commits on main, all objects in mem storage.
     const source = buildRepo();

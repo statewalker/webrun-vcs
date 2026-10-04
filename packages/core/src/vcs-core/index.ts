@@ -1,6 +1,6 @@
 /**
  * VcsCore — a thin, normalized facade over the existing vcs-core git engine,
- * wired to run over the `@statewalker/storage` byte seam.
+ * wired to run over the `@statewalker/webrun-storage` byte seam.
  *
  * It builds the existing {@link History} (objects over
  * {@link blobStoreToRawStorage}, refs over {@link kvStoreRefs}), a
@@ -14,8 +14,8 @@
  * `opts.hash === "sha256"` throws rather than silently accepting.
  */
 
-import type { BlobStore, ByteStream, KvStore, RefStore } from "@statewalker/storage";
-import { refStore } from "@statewalker/storage";
+import type { BlobStore, ByteStream, KvStore, RefStore } from "@statewalker/webrun-storage";
+import { refStore } from "@statewalker/webrun-storage";
 import type { ObjectId } from "../common/id/index.js";
 import { GcOrchestrator, MemoryGcStrategy } from "../gc/index.js";
 import type { Commit } from "../history/commits/commits.js";

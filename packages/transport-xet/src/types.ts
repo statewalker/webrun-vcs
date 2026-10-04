@@ -4,23 +4,23 @@
  * This package is a THIN ADAPTER: it negotiates over the STANDARD Git LFS batch
  * API (reusing `@statewalker/vcs-transport-lfs`), advertising a `xet` custom
  * transfer alongside `basic`. When the peer agrees to `xet` it routes bytes
- * through `@statewalker/content-transfer` (chunk dedup, resumable) over a chunk
+ * through `@statewalker/webrun-content-transfer` (chunk dedup, resumable) over a chunk
  * channel bridged onto the HTTP surface; when the peer is basic-only it falls
  * back to the reused whole-object LFS transfer. Either way the whole-file
  * SHA-256 (the LFS oid) is the interop identity. It knows nothing of git
  * objects, chunking/CDC, the LFS batch/basic internals, or pointers.
  */
 
-import type { ChunkId, ObjectId } from "@statewalker/content-store";
-import type { TransferCheckpoint, TransferLimits } from "@statewalker/content-transfer";
 import type { FetchLike, LfsPointer, TransportEvent } from "@statewalker/vcs-transport-lfs";
+import type { ChunkId, ObjectId } from "@statewalker/webrun-content-store";
+import type { TransferCheckpoint, TransferLimits } from "@statewalker/webrun-content-transfer";
 
 export type { FetchLike, LfsPointer, TransportEvent };
 
 /** A chunk-level integrity hasher — the SAME function the content stores use.
  * Forwarded to `content-transfer` so every received chunk is re-hash verified. */
 export type HashContent = (
-  bytes: import("@statewalker/content-store").ByteStream,
+  bytes: import("@statewalker/webrun-content-store").ByteStream,
 ) => Promise<string>;
 
 /**

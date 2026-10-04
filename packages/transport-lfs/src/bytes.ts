@@ -1,4 +1,4 @@
-import type { ByteStream } from "@statewalker/content-store";
+import type { ByteStream } from "@statewalker/webrun-content-store";
 
 /** Collect a byte stream into one contiguous buffer (whole-object transfer).
  * The buffer is a plain `ArrayBuffer`-backed `Uint8Array` so it is a valid

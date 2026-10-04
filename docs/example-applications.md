@@ -265,7 +265,7 @@ pnpm --filter @statewalker/vcs-demo-lfs-huggingface start
 
 **Location:** [apps/demos/xet-transfer-huggingface](../apps/demos/xet-transfer-huggingface) — **node**
 
-Demonstrates the **Xet custom transfer agent** (`@statewalker/vcs-transport-xet`), which negotiates a `xet` transfer in the standard LFS batch and moves only the missing CDC chunks via `@statewalker/content-transfer`. Because HuggingFace's production Xet uses a different wire protocol, this demo fetches real HF model bytes once (standard LFS) and then transfers them between two local content-stores over an in-process **loopback** (`serveXet` ↔ `xetDownload`), proving via a `putChunk` spy that only the missing chunks move and re-verifying the reconstructed object's SHA-256. Also shows the basic-LFS fallback path.
+Demonstrates the **Xet custom transfer agent** (`@statewalker/vcs-transport-xet`), which negotiates a `xet` transfer in the standard LFS batch and moves only the missing CDC chunks via `@statewalker/webrun-content-transfer`. Because HuggingFace's production Xet uses a different wire protocol, this demo fetches real HF model bytes once (standard LFS) and then transfers them between two local content-stores over an in-process **loopback** (`serveXet` ↔ `xetDownload`), proving via a `putChunk` spy that only the missing chunks move and re-verifying the reconstructed object's SHA-256. Also shows the basic-LFS fallback path.
 
 ```bash
 pnpm --filter @statewalker/vcs-demo-xet-huggingface start

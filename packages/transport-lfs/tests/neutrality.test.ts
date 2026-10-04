@@ -11,7 +11,10 @@ import { describe, expect, it } from "vitest";
  */
 describe("neutrality (dep-lint)", () => {
   const srcDir = path.resolve(import.meta.dirname, "../src");
-  const allowed = new Set(["@statewalker/content-store", "@statewalker/webrun-http-streams"]);
+  const allowed = new Set([
+    "@statewalker/webrun-content-store",
+    "@statewalker/webrun-http-streams",
+  ]);
   const forbidden = ["vcs-core", "transport-git", "transport-xet", "files-sync", "working-tree"];
 
   function importsOf(file: string): string[] {

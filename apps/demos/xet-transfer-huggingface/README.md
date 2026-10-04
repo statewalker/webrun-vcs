@@ -8,7 +8,7 @@ plus the **basic-LFS fallback** path.
 
 `@statewalker/vcs-transport-xet` is a Git-LFS **custom transfer agent** using
 **our** protocol: it negotiates a `xet` transfer inside the standard LFS batch,
-then moves only the **missing chunks** through `@statewalker/content-transfer`
+then moves only the **missing chunks** through `@statewalker/webrun-content-transfer`
 (content-defined chunk dedup). If the peer does not speak our `xet`, it falls
 back to whole-object basic LFS.
 

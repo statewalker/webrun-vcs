@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport-xet",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Git LFS custom transfer agent (Xet) — chunk-dedup transfer via content-transfer, falls back to basic LFS",
   "license": "MIT",
   "repository": {
@@ -38,14 +38,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/content-store": "catalog:",
-    "@statewalker/content-transfer": "catalog:",
+    "@statewalker/webrun-content-store": "catalog:",
+    "@statewalker/webrun-content-transfer": "catalog:",
     "@statewalker/vcs-transport-lfs": "workspace:^",
     "@statewalker/webrun-http-streams": "catalog:",
     "@statewalker/webrun-streams": "catalog:"
   },
   "devDependencies": {
-    "@statewalker/storage": "catalog:",
+    "@statewalker/webrun-storage": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
     "rolldown": "catalog:",
     "vitest": "catalog:",

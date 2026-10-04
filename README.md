@@ -34,16 +34,16 @@ Domain-neutral building blocks, reusable outside VCS.
 
 | Package | Directory | Role |
 |---------|-----------|------|
-| `@statewalker/merge-core` | [packages/merge-core](packages/merge-core) | Three-way merge/diff engine over the `webrun-files` FilesApi |
-| `@statewalker/storage` | [packages/storage](packages/storage) | Byte-persistence seam (`BlobStore` + `KvStore` with CAS) |
-| `@statewalker/content-store` | [packages/content-store](packages/content-store) | Content-addressed large-object store with content-defined chunking |
-| `@statewalker/content-transfer` | [packages/content-transfer](packages/content-transfer) | Resumable, chunk-aware content transfer over `webrun-streams` |
+| `@statewalker/webrun-merge` | [packages/webrun-merge](packages/webrun-merge) | Three-way merge/diff engine over the `webrun-files` FilesApi |
+| `@statewalker/webrun-storage` | [packages/webrun-storage](packages/webrun-storage) | Byte-persistence seam (`BlobStore` + `KvStore` with CAS) |
+| `@statewalker/webrun-content-store` | [packages/webrun-content-store](packages/webrun-content-store) | Content-addressed large-object store with content-defined chunking |
+| `@statewalker/webrun-content-transfer` | [packages/webrun-content-transfer](packages/webrun-content-transfer) | Resumable, chunk-aware content transfer over `webrun-streams` |
 
 ### Axis A — working-copy plane
 
 | Package | Directory | Role |
 |---------|-----------|------|
-| `@statewalker/files-sync` | [packages/files-sync](packages/files-sync) | rclone-like file-synchronisation engine (copy/sync/bisync/move/check) |
+| `@statewalker/webrun-files-sync` | [packages/webrun-files-sync](packages/webrun-files-sync) | rclone-like file-synchronisation engine (copy/sync/bisync/move/check) |
 
 ### Axis B — history plane
 

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import type { ContentStore } from "@statewalker/content-store";
-import { createContentStore } from "@statewalker/content-store";
-import { memBlobStore } from "@statewalker/storage";
+import type { ContentStore } from "@statewalker/webrun-content-store";
+import { createContentStore } from "@statewalker/webrun-content-store";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
+import { memBlobStore } from "@statewalker/webrun-storage";
 import type { ByteStream, FilesApi, GitRemote, Repository, WorkspaceEvent } from "../src/index.js";
 
 /** SHA-256 hex over a byte stream — a plausible injected `hashContent`. */

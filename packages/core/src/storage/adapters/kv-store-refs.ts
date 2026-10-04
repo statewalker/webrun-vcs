@@ -1,5 +1,5 @@
 /**
- * Adapter: `@statewalker/storage` {@link KvStore} → vcs-core {@link Refs}.
+ * Adapter: `@statewalker/webrun-storage` {@link KvStore} → vcs-core {@link Refs}.
  *
  * Stores each ref as `name → utf8(objectId)` — the SAME encoding the storage
  * `refStore` facade uses — so a ref written through the external `RefStore`
@@ -10,7 +10,7 @@
  * Direct refs only. Symbolic refs and reflogs are deferred (see below).
  */
 
-import type { KvStore } from "@statewalker/storage";
+import type { KvStore } from "@statewalker/webrun-storage";
 import type { ObjectId } from "../../common/id/index.js";
 import type { Ref } from "../../history/refs/ref-types.js";
 import { RefStorage } from "../../history/refs/ref-types.js";

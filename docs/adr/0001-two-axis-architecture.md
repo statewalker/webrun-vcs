@@ -242,7 +242,7 @@ independently-contractable slice to build against a stable boundary.
   storage-seam facade (`createStorageRepositoryFacade`) — **even though its migration-table
   disposition is `retire`.** Honestly: its old Duplex-adapter role is retired (superseded by
   `webrun-streams`); the package name lives on as the storage-seam facade host.
-- **`vcs-core` kept its existing 176-file git engine**, re-based onto the `@statewalker/storage`
+- **`vcs-core` kept its existing 176-file git engine**, re-based onto the `@statewalker/webrun-storage`
   seam via adapters plus a normalized `VcsCore` facade. **sha256 is deferred** — SHA-1 only for
   now; `VcsCore.hash` returns `"sha1"`.
 - **`content-store` uses an injected `hashContent`** (opaque ids), not intrinsic BLAKE3 (see

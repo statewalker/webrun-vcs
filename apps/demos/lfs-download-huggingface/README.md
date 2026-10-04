@@ -16,7 +16,7 @@ This demo runs **live against `huggingface.co`** — no mocks, no fixtures.
      (`…/info/lfs/objects/batch`, `transfers: ["basic"]`) to HF's real LFS
      endpoint,
    - follows the returned per-object `download` action `href`,
-   - streams the bytes into a `@statewalker/content-store`, and
+   - streams the bytes into a `@statewalker/webrun-content-store`, and
    - **verifies the whole-object SHA-256 == oid** before storing (as the LFS
      spec requires).
    The injected `fetchImpl` defaults to the global `fetch`, so this is real HTTP

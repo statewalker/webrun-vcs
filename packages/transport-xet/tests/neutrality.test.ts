@@ -12,8 +12,8 @@ import { describe, expect, it } from "vitest";
 describe("neutrality (dep-lint)", () => {
   const srcDir = path.resolve(import.meta.dirname, "../src");
   const allowed = new Set([
-    "@statewalker/content-store",
-    "@statewalker/content-transfer",
+    "@statewalker/webrun-content-store",
+    "@statewalker/webrun-content-transfer",
     "@statewalker/vcs-transport-lfs",
     "@statewalker/webrun-http-streams",
     "@statewalker/webrun-streams",

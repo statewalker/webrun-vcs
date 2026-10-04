@@ -5,7 +5,7 @@
  * deduplicated large-file transfer that stays LFS-interoperable. It is a THIN
  * ADAPTER over two existing pieces — `@statewalker/vcs-transport-lfs` for batch
  * negotiation + the basic (whole-object) fallback, and
- * `@statewalker/content-transfer` for the chunk-dedup engine. It negotiates via
+ * `@statewalker/webrun-content-transfer` for the chunk-dedup engine. It negotiates via
  * the standard LFS batch API advertising a `xet` custom transfer; when the peer
  * agrees it moves only the missing chunks, otherwise it falls back to whole-object
  * basic LFS. The whole-file SHA-256 (the LFS oid) is the interop identity. It

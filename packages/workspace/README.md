@@ -4,7 +4,7 @@ Thin cross-axis orchestrator (publish / update / checkpoint / restore) composing
 
 ## Overview
 
-`vcs-workspace` is the **only** layer that composes Axis A (`@statewalker/files-sync`) with Axis B (`@statewalker/vcs-working-tree` + `@statewalker/vcs-core` + `@statewalker/vcs-transport`). It offers composite workflows — `publish`, `update`, `checkpoint`, `restore` — and holds only cross-axis **policy** (`SyncVersioningPolicy`) and **correspondence** state (`WorkspaceCheckpoint`), never any engine internals. Each workflow is a sequence of independent, idempotent engine calls: a partial run is a valid recorded state, and a re-run resumes from the last good step.
+`vcs-workspace` is the **only** layer that composes Axis A (`@statewalker/webrun-files-sync`) with Axis B (`@statewalker/vcs-working-tree` + `@statewalker/vcs-core` + `@statewalker/vcs-transport`). It offers composite workflows — `publish`, `update`, `checkpoint`, `restore` — and holds only cross-axis **policy** (`SyncVersioningPolicy`) and **correspondence** state (`WorkspaceCheckpoint`), never any engine internals. Each workflow is a sequence of independent, idempotent engine calls: a partial run is a valid recorded state, and a re-run resumes from the last good step.
 
 It keeps the **hard `files-sync ✗↔ vcs-core` ban** intact by depending on the file axis directly but on the history axis only through minimal *structural* `Repository` / `GitRemote` interfaces — it never imports the git engine, so it can never link the two engines together.
 

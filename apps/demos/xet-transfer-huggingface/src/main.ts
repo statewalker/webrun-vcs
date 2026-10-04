@@ -6,7 +6,7 @@
  * IMPORTANT — what "xet" means here. `@statewalker/vcs-transport-xet` is a Git
  * LFS *custom transfer agent* using OUR protocol: it negotiates a `xet` transfer
  * in the standard LFS batch, then moves only the MISSING chunks through
- * `@statewalker/content-transfer` (CDC chunk dedup). HuggingFace's production
+ * `@statewalker/webrun-content-transfer` (CDC chunk dedup). HuggingFace's production
  * Xet uses a DIFFERENT CAS protocol on the wire, so we cannot negotiate `xet`
  * against HF. This demo therefore uses REAL HF model bytes (fetched once via the
  * standard LFS basic transfer) but transfers them between two local

@@ -21,21 +21,15 @@ catalogs:
     '@playwright/test':
       specifier: ^1.63.0
       version: 1.63.0
-    '@statewalker/content-store':
-      specifier: ^0.2.0
-      version: 0.2.2
-    '@statewalker/content-transfer':
-      specifier: ^0.2.0
-      version: 0.2.2
-    '@statewalker/files-sync':
-      specifier: ^0.2.0
-      version: 0.2.2
-    '@statewalker/storage':
-      specifier: ^0.2.0
-      version: 0.2.1
     '@statewalker/utils':
       specifier: ^0.4.2
       version: 0.4.2
+    '@statewalker/webrun-content-store':
+      specifier: ^0.2.0
+      version: 0.2.2
+    '@statewalker/webrun-content-transfer':
+      specifier: ^0.2.0
+      version: 0.2.2
     '@statewalker/webrun-files':
       specifier: ^0.10.0
       version: 0.10.1
@@ -48,9 +42,15 @@ catalogs:
     '@statewalker/webrun-files-node':
       specifier: ^0.10.0
       version: 0.10.2
+    '@statewalker/webrun-files-sync':
+      specifier: ^0.2.0
+      version: 0.2.2
     '@statewalker/webrun-http-streams':
       specifier: ^0.2.1
       version: 0.2.4
+    '@statewalker/webrun-storage':
+      specifier: ^0.2.0
+      version: 0.2.1
     '@statewalker/webrun-streams':
       specifier: ^0.2.0
       version: 0.2.1
@@ -361,15 +361,15 @@ importers:
 
   apps/demos/lfs-download-huggingface:
     dependencies:
-      '@statewalker/content-store':
-        specifier: 'catalog:'
-        version: 0.2.2
-      '@statewalker/storage':
-        specifier: 'catalog:'
-        version: 0.2.1
       '@statewalker/vcs-transport-lfs':
         specifier: workspace:^
         version: link:../../../packages/transport-lfs
+      '@statewalker/webrun-content-store':
+        specifier: 'catalog:'
+        version: 0.2.2
+      '@statewalker/webrun-storage':
+        specifier: 'catalog:'
+        version: 0.2.1
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -610,18 +610,18 @@ importers:
 
   apps/demos/xet-transfer-huggingface:
     dependencies:
-      '@statewalker/content-store':
-        specifier: 'catalog:'
-        version: 0.2.2
-      '@statewalker/storage':
-        specifier: 'catalog:'
-        version: 0.2.1
       '@statewalker/vcs-transport-lfs':
         specifier: workspace:^
         version: link:../../../packages/transport-lfs
       '@statewalker/vcs-transport-xet':
         specifier: workspace:^
         version: link:../../../packages/transport-xet
+      '@statewalker/webrun-content-store':
+        specifier: 'catalog:'
+        version: 0.2.2
+      '@statewalker/webrun-storage':
+        specifier: 'catalog:'
+        version: 0.2.1
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -930,12 +930,12 @@ importers:
 
   packages/core:
     dependencies:
-      '@statewalker/storage':
-        specifier: 'catalog:'
-        version: 0.2.1
       '@statewalker/vcs-utils':
         specifier: workspace:^
         version: link:../utils
+      '@statewalker/webrun-storage':
+        specifier: 'catalog:'
+        version: 0.2.1
     devDependencies:
       '@statewalker/vcs-utils-node':
         specifier: workspace:^
@@ -1159,9 +1159,6 @@ importers:
 
   packages/transport-adapters:
     dependencies:
-      '@statewalker/storage':
-        specifier: 'catalog:'
-        version: 0.2.1
       '@statewalker/vcs-core':
         specifier: workspace:^
         version: link:../core
@@ -1171,6 +1168,9 @@ importers:
       '@statewalker/vcs-utils':
         specifier: workspace:^
         version: link:../utils
+      '@statewalker/webrun-storage':
+        specifier: 'catalog:'
+        version: 0.2.1
     devDependencies:
       '@statewalker/vcs-store-mem':
         specifier: workspace:^
@@ -1193,19 +1193,19 @@ importers:
 
   packages/transport-lfs:
     dependencies:
-      '@statewalker/content-store':
+      '@statewalker/webrun-content-store':
         specifier: 'catalog:'
         version: 0.2.2
       '@statewalker/webrun-http-streams':
         specifier: 'catalog:'
         version: 0.2.4
     devDependencies:
-      '@statewalker/storage':
-        specifier: 'catalog:'
-        version: 0.2.1
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.10.2
+      '@statewalker/webrun-storage':
+        specifier: 'catalog:'
+        version: 0.2.1
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4
@@ -1221,15 +1221,15 @@ importers:
 
   packages/transport-xet:
     dependencies:
-      '@statewalker/content-store':
-        specifier: 'catalog:'
-        version: 0.2.2
-      '@statewalker/content-transfer':
-        specifier: 'catalog:'
-        version: 0.2.2
       '@statewalker/vcs-transport-lfs':
         specifier: workspace:^
         version: link:../transport-lfs
+      '@statewalker/webrun-content-store':
+        specifier: 'catalog:'
+        version: 0.2.2
+      '@statewalker/webrun-content-transfer':
+        specifier: 'catalog:'
+        version: 0.2.2
       '@statewalker/webrun-http-streams':
         specifier: 'catalog:'
         version: 0.2.4
@@ -1237,12 +1237,12 @@ importers:
         specifier: 'catalog:'
         version: 0.2.1
     devDependencies:
-      '@statewalker/storage':
-        specifier: 'catalog:'
-        version: 0.2.1
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.10.2
+      '@statewalker/webrun-storage':
+        specifier: 'catalog:'
+        version: 0.2.1
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4
@@ -1336,12 +1336,6 @@ importers:
 
   packages/workspace:
     dependencies:
-      '@statewalker/content-store':
-        specifier: 'catalog:'
-        version: 0.2.2
-      '@statewalker/files-sync':
-        specifier: 'catalog:'
-        version: 0.2.2
       '@statewalker/vcs-core':
         specifier: workspace:^
         version: link:../core
@@ -1351,16 +1345,22 @@ importers:
       '@statewalker/vcs-working-tree':
         specifier: workspace:^
         version: link:../working-tree
+      '@statewalker/webrun-content-store':
+        specifier: 'catalog:'
+        version: 0.2.2
       '@statewalker/webrun-files':
         specifier: 'catalog:'
         version: 0.10.1
-    devDependencies:
-      '@statewalker/storage':
+      '@statewalker/webrun-files-sync':
         specifier: 'catalog:'
-        version: 0.2.1
+        version: 0.2.2
+    devDependencies:
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.10.2
+      '@statewalker/webrun-storage':
+        specifier: 'catalog:'
+        version: 0.2.1
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4
@@ -2779,23 +2779,14 @@ packages:
     resolution: {integrity: sha512-doH1gimEu3A46VX6aVxpHTeHrytJAG6HgdxntYnCFiIFHEM/ZGpG8KiZGBChchjQmG0XFIBL552kBTjVcMZXwQ==}
     engines: {node: '>=12'}
 
-  '@statewalker/content-store@0.2.2':
-    resolution: {integrity: sha512-9WtfmtEGUsmrAWqlf3b0xhYBOZS/ngPyvzyeNjOzl4eXdPriLBUzuU5Sv8SnJJ4N2CAE+44VerkLiPuZ+dZsgA==}
-
-  '@statewalker/content-transfer@0.2.2':
-    resolution: {integrity: sha512-slH4MHGDRABOlAZH2+4X+3QboH0JL5erG/3hYKMYctJXtpTWKNB3yVlaL4xwD0T8k3kkvs71F/T6lIcT8VOX2g==}
-
-  '@statewalker/files-sync@0.2.2':
-    resolution: {integrity: sha512-LdmWpz+fRb1jwRMfDI06poYKsejZah58KzThFtxUxn6NgmFJWPq2fm4PNO/hgLPcMO3SnsP2QjD4Xy5nSx8tMg==}
-
-  '@statewalker/merge-core@0.2.1':
-    resolution: {integrity: sha512-iya+teTIE4GWUWDiihpqEFnXunAxJqPspxKLso5ICsUux3hQAEL23OvJWlLmyNDyz34mCIBVM3n5D5YEIm+FEA==}
-
-  '@statewalker/storage@0.2.1':
-    resolution: {integrity: sha512-CJN5bd0aLStnK3W7rw+CQa9zW8GyDM/BaH34JW2rXrJGnAcj+JgltnJ/yA4ZUS7N5BF1vueBk/BWw+cWvI4svQ==}
-
   '@statewalker/utils@0.4.2':
     resolution: {integrity: sha512-5qf1NTYmEPfXLXdHJ3NKr83aCtQYxRQIVGFsqP0hOUVyBjXWxzzcjTCg3HMk05NHdznWFNDs5A97WySayt9bwA==}
+
+  '@statewalker/webrun-content-store@0.2.2':
+    resolution: {integrity: sha512-6k4DwxqWOZIaALoMePUv7H4YdjiKnwIstI9qFhhkSGVcnwa/Gb/3ehPTYXbZ7zxi/Kxcl4eW3fEwpAheHgzDYw==}
+
+  '@statewalker/webrun-content-transfer@0.2.2':
+    resolution: {integrity: sha512-kjD67hwaX8vu8RbXeaIdAyZiyo99C6E8HRWOuxq59VJVXc2Ta+Z66orG3bpQe4vlBnIh5gKgNZA9/mM6ZIiljg==}
 
   '@statewalker/webrun-files-browser@0.10.1':
     resolution: {integrity: sha512-yG00c1/ByOha5KrM/NmxrnfqqiQHv7BJrppAnqd19Dx8CCHBkpWFTCrC7qdJZxfSKC8lqY3TgvEnqeiiPz/4Tg==}
@@ -2806,11 +2797,20 @@ packages:
   '@statewalker/webrun-files-node@0.10.2':
     resolution: {integrity: sha512-fqK98opEB8Y9PJJNXl3A66oWt8OWCB/0vzxYT9iFYLU16zqWt8+dUZAqIvGj5hb+kADWR+io5cwnH8XwQ/VwKg==}
 
+  '@statewalker/webrun-files-sync@0.2.2':
+    resolution: {integrity: sha512-dXpLnsnPDKYxPeZqaMOQqLQbwH5RSBfkbS3NVeWOunOp+EDmH0ilfNVXE+EuT9onMrD0lC0zA5H7wPAVC0pj/g==}
+
   '@statewalker/webrun-files@0.10.1':
     resolution: {integrity: sha512-E2tQbiMHhGzRBHp3BK5zqsNSo7kUeg+kCUF2rZCxlWwFZrKorMAe5CEecWUqmyQffG7fWJgfNjyU9oEre2sKMA==}
 
   '@statewalker/webrun-http-streams@0.2.4':
     resolution: {integrity: sha512-GnWD2PflO1b33y2NCwqoqUThB7vzbMTlFSWs+cBGfkcYycws3JlQ6INaxpHrriYuXGB3a/Flq69XVdHlyJwLaw==}
+
+  '@statewalker/webrun-merge@0.2.1':
+    resolution: {integrity: sha512-emku84katOPEilwkJc6XEV+WZ4wUssNLVAgIHcvTjl1an1iYurLqDGn3WVSBM59RX4OCakn8ZL7CiZYyRhZo4g==}
+
+  '@statewalker/webrun-storage@0.2.1':
+    resolution: {integrity: sha512-cejUqcY6f8EoC0WGFrKmfEePPK/0CC7Mks4WOROxYMP1OuieliHCZQVcQrq2LpT8pkt33R2e8d8Ys8UNqWtbCA==}
 
   '@statewalker/webrun-streams-livekit@0.2.2':
     resolution: {integrity: sha512-RH2/oYaBWhxkxzoIvZL6HLlUN50rR2FuM1n8pT9BdWgHvpGGJ5SUhShxGtbAXo+ouCSIQv8L///ecatMZGnRsw==}
@@ -6467,31 +6467,18 @@ snapshots:
     dependencies:
       escape-string-regexp: 5.0.0
 
-  '@statewalker/content-store@0.2.2':
-    dependencies:
-      '@statewalker/storage': 0.2.1
-      '@statewalker/webrun-files': 0.10.1
+  '@statewalker/utils@0.4.2': {}
 
-  '@statewalker/content-transfer@0.2.2':
+  '@statewalker/webrun-content-store@0.2.2':
     dependencies:
-      '@statewalker/content-store': 0.2.2
+      '@statewalker/webrun-files': 0.10.1
+      '@statewalker/webrun-storage': 0.2.1
+
+  '@statewalker/webrun-content-transfer@0.2.2':
+    dependencies:
+      '@statewalker/webrun-content-store': 0.2.2
       '@statewalker/webrun-files': 0.10.1
       '@statewalker/webrun-streams': 0.2.1
-
-  '@statewalker/files-sync@0.2.2':
-    dependencies:
-      '@statewalker/merge-core': 0.2.1
-      '@statewalker/webrun-files': 0.10.1
-
-  '@statewalker/merge-core@0.2.1':
-    dependencies:
-      '@statewalker/webrun-files': 0.10.1
-
-  '@statewalker/storage@0.2.1':
-    dependencies:
-      '@statewalker/webrun-files': 0.10.1
-
-  '@statewalker/utils@0.4.2': {}
 
   '@statewalker/webrun-files-browser@0.10.1':
     dependencies:
@@ -6505,11 +6492,24 @@ snapshots:
     dependencies:
       '@statewalker/webrun-files': 0.10.1
 
+  '@statewalker/webrun-files-sync@0.2.2':
+    dependencies:
+      '@statewalker/webrun-files': 0.10.1
+      '@statewalker/webrun-merge': 0.2.1
+
   '@statewalker/webrun-files@0.10.1': {}
 
   '@statewalker/webrun-http-streams@0.2.4':
     dependencies:
       '@statewalker/webrun-streams': 0.2.1
+
+  '@statewalker/webrun-merge@0.2.1':
+    dependencies:
+      '@statewalker/webrun-files': 0.10.1
+
+  '@statewalker/webrun-storage@0.2.1':
+    dependencies:
+      '@statewalker/webrun-files': 0.10.1
 
   '@statewalker/webrun-streams-livekit@0.2.2(livekit-client@2.22.3(@types/dom-mediacapture-record@1.0.22))':
     dependencies:

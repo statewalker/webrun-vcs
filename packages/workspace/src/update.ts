@@ -9,7 +9,7 @@
  * {@link WorkspaceCheckpoint} of the resulting file-state correspondence.
  */
 
-import { execute, plan } from "@statewalker/files-sync";
+import { execute, plan } from "@statewalker/webrun-files-sync";
 import { makeCheckpoint } from "./checkpoint.js";
 import { buildSyncOptions, manifestOf } from "./sync-options.js";
 import type {

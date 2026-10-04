@@ -1,4 +1,4 @@
-import type { ContentStore } from "@statewalker/content-store";
+import type { ContentStore } from "@statewalker/webrun-content-store";
 import { describe, expect, it } from "vitest";
 import { serveXet, xetDownload, xetUpload } from "../src/index.js";
 import {

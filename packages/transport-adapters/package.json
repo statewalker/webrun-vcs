@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport-adapters",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Transport adapters bridging VCS core interfaces to transport layer",
   "license": "MIT",
   "repository": {
@@ -33,7 +33,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@statewalker/storage": "catalog:",
+    "@statewalker/webrun-storage": "catalog:",
     "@statewalker/vcs-core": "workspace:^",
     "@statewalker/vcs-transport": "workspace:^",
     "@statewalker/vcs-utils": "workspace:^"
