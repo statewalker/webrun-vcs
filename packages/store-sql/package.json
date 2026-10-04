@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-sql",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "SQL-based storage backend for StateWalker VCS",
   "license": "MIT",
   "repository": {

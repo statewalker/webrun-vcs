@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-kv",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Key-value storage backend for StateWalker VCS",
   "license": "MIT",
   "repository": {
