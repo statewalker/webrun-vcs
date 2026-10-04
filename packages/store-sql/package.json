@@ -17,16 +17,19 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./adapters/sql-js": {
+      "source": "./src/adapters/sql-js-adapter.ts",
       "types": "./dist/adapters/sql-js-adapter.d.ts",
       "import": "./dist/adapters/sql-js-adapter.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",

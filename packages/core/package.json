@@ -17,28 +17,34 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./history": {
+      "source": "./src/history/index.ts",
       "types": "./dist/history/index.d.ts",
       "import": "./dist/history/index.js"
     },
     "./storage": {
+      "source": "./src/storage/index.ts",
       "types": "./dist/storage/index.d.ts",
       "import": "./dist/storage/index.js"
     },
     "./backend": {
+      "source": "./src/backend/index.ts",
       "types": "./dist/backend/index.d.ts",
       "import": "./dist/backend/index.js"
     },
     "./serialization": {
+      "source": "./src/serialization/index.ts",
       "types": "./dist/serialization/index.d.ts",
       "import": "./dist/serialization/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",

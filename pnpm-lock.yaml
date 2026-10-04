@@ -1233,6 +1233,9 @@ importers:
       '@statewalker/webrun-http-streams':
         specifier: 'catalog:'
         version: 0.2.1
+      '@statewalker/webrun-streams':
+        specifier: 'catalog:'
+        version: 0.2.0
     devDependencies:
       '@statewalker/storage':
         specifier: 'catalog:'
@@ -1240,9 +1243,6 @@ importers:
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.10.0
-      '@statewalker/webrun-streams':
-        specifier: 'catalog:'
-        version: 0.2.0
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4

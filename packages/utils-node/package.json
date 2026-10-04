@@ -17,20 +17,24 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./compression": {
+      "source": "./src/compression/index.ts",
       "types": "./dist/compression/index.d.ts",
       "import": "./dist/compression/index.js"
     },
     "./files": {
+      "source": "./src/files/index.ts",
       "types": "./dist/files/index.d.ts",
       "import": "./dist/files/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",

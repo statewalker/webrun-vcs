@@ -17,20 +17,24 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./protocol": {
+      "source": "./src/protocol/index.ts",
       "types": "./dist/protocol/index.d.ts",
       "import": "./dist/protocol/index.js"
     },
     "./operations": {
+      "source": "./src/operations/index.ts",
       "types": "./dist/operations/index.d.ts",
       "import": "./dist/operations/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",

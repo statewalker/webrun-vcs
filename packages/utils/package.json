@@ -17,72 +17,89 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./compression": {
+      "source": "./src/compression/index.ts",
       "types": "./dist/compression/index.d.ts",
       "import": "./dist/compression/index.js"
     },
     "./hash": {
+      "source": "./src/hash/index.ts",
       "types": "./dist/hash/index.d.ts",
       "import": "./dist/hash/index.js"
     },
     "./hash/crc32": {
+      "source": "./src/hash/crc32/index.ts",
       "types": "./dist/hash/crc32/index.d.ts",
       "import": "./dist/hash/crc32/index.js"
     },
     "./hash/sha1": {
+      "source": "./src/hash/sha1/index.ts",
       "types": "./dist/hash/sha1/index.d.ts",
       "import": "./dist/hash/sha1/index.js"
     },
     "./hash/utils": {
+      "source": "./src/hash/utils/index.ts",
       "types": "./dist/hash/utils/index.d.ts",
       "import": "./dist/hash/utils/index.js"
     },
     "./hash/fossil-checksum": {
+      "source": "./src/hash/fossil-checksum/index.ts",
       "types": "./dist/hash/fossil-checksum/index.d.ts",
       "import": "./dist/hash/fossil-checksum/index.js"
     },
     "./hash/rolling-checksum": {
+      "source": "./src/hash/rolling-checksum/index.ts",
       "types": "./dist/hash/rolling-checksum/index.d.ts",
       "import": "./dist/hash/rolling-checksum/index.js"
     },
     "./hash/strong-checksum": {
+      "source": "./src/hash/strong-checksum/index.ts",
       "types": "./dist/hash/strong-checksum/index.d.ts",
       "import": "./dist/hash/strong-checksum/index.js"
     },
     "./diff": {
+      "source": "./src/diff/index.ts",
       "types": "./dist/diff/index.d.ts",
       "import": "./dist/diff/index.js"
     },
     "./encoding": {
+      "source": "./src/encoding/index.ts",
       "types": "./dist/encoding/index.d.ts",
       "import": "./dist/encoding/index.js"
     },
     "./streams": {
+      "source": "./src/streams/index.ts",
       "types": "./dist/streams/index.d.ts",
       "import": "./dist/streams/index.js"
     },
     "./ports": {
+      "source": "./src/ports/index.ts",
       "types": "./dist/ports/index.d.ts",
       "import": "./dist/ports/index.js"
     },
     "./cache": {
+      "source": "./src/cache/index.ts",
       "types": "./dist/cache/index.d.ts",
       "import": "./dist/cache/index.js"
     },
     "./files": {
+      "source": "./src/files/index.ts",
       "types": "./dist/files/index.d.ts",
       "import": "./dist/files/index.js"
     },
     "./pack": {
+      "source": "./src/pack/index.ts",
       "types": "./dist/pack/index.d.ts",
       "import": "./dist/pack/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
