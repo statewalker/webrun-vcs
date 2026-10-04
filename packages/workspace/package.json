@@ -2,10 +2,14 @@
   "name": "@statewalker/vcs-workspace",
   "version": "0.3.1",
   "description": "Thin cross-axis orchestration (publish/update/checkpoint/restore) composing files-sync + vcs-working-tree + vcs-transport",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/workspace#readme",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/statewalker/webrun-vcs.git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
     "directory": "packages/workspace"
   },
   "private": false,

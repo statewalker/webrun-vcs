@@ -7,6 +7,7 @@
 
 import { createFetchHandler, httpPush } from "@statewalker/vcs-transport";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { defined } from "../../test-helper.js";
 import {
   createInitializedTestRepository,
   createRepositoryFacade,
@@ -185,7 +186,7 @@ describe("HTTP Push - Authentication", () => {
     try {
       await createTestCommit(clientCtx.repository, "Commit", { "file.txt": "content" });
 
-      let capturedAuthHeader: string | null = null;
+      let capturedAuthHeader = null as string | null;
 
       const clientFacade = createRepositoryFacade(clientCtx.repository);
       const clientRefs = createTransportRefStore(clientCtx.repository.refs);
@@ -203,7 +204,7 @@ describe("HTTP Push - Authentication", () => {
       expect(capturedAuthHeader).toMatch(/^Basic /);
 
       // Decode and verify credentials
-      const encoded = capturedAuthHeader?.slice(6);
+      const encoded = defined(capturedAuthHeader, "Authorization header").slice(6);
       const decoded = atob(encoded);
       expect(decoded).toBe("testuser:testpass");
     } finally {

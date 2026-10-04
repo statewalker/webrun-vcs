@@ -2,10 +2,14 @@
   "name": "@statewalker/vcs-store-files",
   "version": "0.3.1",
   "description": "File-backed storage backend for StateWalker VCS",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/store-files#readme",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/statewalker/webrun-vcs.git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
     "directory": "packages/store-files"
   },
   "private": false,

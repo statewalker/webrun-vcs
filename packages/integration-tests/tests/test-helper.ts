@@ -335,3 +335,13 @@ export async function toArray<T>(
 export function shortId(id: string): string {
   return id.slice(0, 7);
 }
+
+/**
+ * The value, or a test failure naming what was missing. For lookups the test has just arranged
+ * to succeed (a commit it created, a ref it set): narrowing them keeps a broken arrangement from
+ * surfacing as a TypeError several lines later.
+ */
+export function defined<T>(value: T | null | undefined, what = "value"): T {
+  if (value === null || value === undefined) throw new Error(`expected ${what} to be defined`);
+  return value;
+}

@@ -1,10 +1,14 @@
 {
   "name": "@statewalker/vcs-monorepo",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs#readme",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/statewalker/webrun-vcs.git"
+    "url": "git+https://github.com/statewalker/webrun-vcs.git"
   },
   "type": "module",
   "packageManager": "pnpm@10.16.1",

@@ -15,7 +15,13 @@ import { ResetMode } from "@statewalker/vcs-commands";
 import { FileMode } from "@statewalker/vcs-core";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { addFile, backends, createInitializedGitFromFactory, toArray } from "./test-helper.js";
+import {
+  addFile,
+  backends,
+  createInitializedGitFromFactory,
+  defined,
+  toArray,
+} from "./test-helper.js";
 
 describe.each(backends)("Staging and Checkout ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -181,7 +187,7 @@ describe.each(backends)("Staging and Checkout ($name backend)", ({ factory }) =>
       await git.commit().setMessage("v2").call();
 
       // Get blob from commit1
-      const commit1Data = await store.commits.load(commit1Id);
+      const commit1Data = defined(await store.commits.load(commit1Id), "first commit");
       const entry = await store.trees.getEntry(commit1Data.tree, "config.json");
       expect(entry).toBeDefined();
 
@@ -192,7 +198,7 @@ describe.each(backends)("Staging and Checkout ($name backend)", ({ factory }) =>
         apply: () => ({
           path: "config.json",
           mode: FileMode.REGULAR_FILE,
-          objectId: entry?.id,
+          objectId: defined(entry, "config.json entry").id,
           stage: 0,
           size: 0,
           mtime: Date.now(),

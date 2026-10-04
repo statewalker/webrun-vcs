@@ -2,10 +2,14 @@
   "name": "@statewalker/vcs-utils-node",
   "version": "0.3.1",
   "description": "Node.js-specific VCS utilities: native compression, file system adapters",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/utils-node#readme",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/statewalker/webrun-vcs.git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
     "directory": "packages/utils-node"
   },
   "private": false,

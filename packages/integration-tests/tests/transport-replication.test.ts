@@ -10,7 +10,7 @@ import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { memoryFactory } from "./backend-factories.js";
 import type { SimpleHistory } from "./helpers/simple-history.js";
-import { createCommit, createInitializedGitFromFactory, toArray } from "./test-helper.js";
+import { createCommit, createInitializedGitFromFactory, defined, toArray } from "./test-helper.js";
 
 /**
  * Test transport endpoint wrapping a MessagePort Duplex.
@@ -256,7 +256,7 @@ describe("Transport Replication", () => {
       throw new Error("HEAD ref not found");
     }
 
-    const commit = await remoteRepository.commits.load(headRef.objectId);
+    const commit = await remoteRepository.commits.load(defined(headRef.objectId, "remote HEAD"));
     if (!commit) throw new Error("Commit not found");
     const tree = await toArray(remoteRepository.trees.load(commit.tree));
 
