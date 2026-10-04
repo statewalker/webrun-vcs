@@ -6,14 +6,12 @@
  */
 
 import { Git } from "@statewalker/vcs-commands";
+import { createMemoryHistory } from "@statewalker/vcs-core";
 import {
-	createMemoryHistory,
-} from "@statewalker/vcs-core";
-import {
-	createMemoryGitStaging,
-	MemoryCheckout,
-	MemoryWorkingCopy,
-	MemoryWorktree,
+  createMemoryGitStaging,
+  MemoryCheckout,
+  MemoryWorkingCopy,
+  MemoryWorktree,
 } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {

@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { History } from "@statewalker/vcs-core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Checkout } from "../../src/checkout/checkout.js";
 import type { Staging } from "../../src/staging/staging.js";
 import { MemoryStashStore } from "../../src/working-copy/stash-store.memory.js";

@@ -10,9 +10,7 @@
  * Reference: JGit's CheckoutConflictException and TreeWalk
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { TreeEntry } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
+import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 
 /**
  * Represents a single entry in a three-way comparison.

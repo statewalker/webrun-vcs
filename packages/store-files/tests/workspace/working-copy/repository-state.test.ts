@@ -1,9 +1,9 @@
-import { getStateCapabilities, RepositoryState } from "@statewalker/vcs-working-tree";
 import {
   detectRepositoryState,
   readCherryPickState,
   readRevertState,
 } from "@statewalker/vcs-store-files";
+import { getStateCapabilities, RepositoryState } from "@statewalker/vcs-working-tree";
 import { describe, expect, it, vi } from "vitest";
 
 describe("RepositoryState", () => {

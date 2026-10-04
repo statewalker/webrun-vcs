@@ -21,7 +21,7 @@ import {
   type TreeEntry,
   type Trees,
 } from "@statewalker/vcs-core";
-import { type Staging } from "@statewalker/vcs-working-tree";
+import type { Staging } from "@statewalker/vcs-working-tree";
 import type { Checkout, CheckoutOptions, CheckoutResult } from "./checkout.command.js";
 
 /**

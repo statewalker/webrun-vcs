@@ -19,8 +19,8 @@ import {
   type FilesApi,
   type History,
 } from "@statewalker/vcs-core";
-import type { TransformationStore } from "@statewalker/vcs-working-tree/transformation";
 import { GitTransformationStore } from "@statewalker/vcs-store-files";
+import type { TransformationStore } from "@statewalker/vcs-working-tree/transformation";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 // Helper types

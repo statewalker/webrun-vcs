@@ -5,6 +5,7 @@
  */
 
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
+import { FileMode } from "@statewalker/vcs-core";
 import type {
   IndexBuilder,
   IndexEdit,
@@ -15,7 +16,6 @@ import type {
   StagingEntry,
   StagingEntryOptions,
 } from "@statewalker/vcs-working-tree";
-import { FileMode } from "@statewalker/vcs-core";
 import { MergeStage } from "@statewalker/vcs-working-tree";
 import type { DatabaseClient } from "./database-client.js";
 

@@ -1,10 +1,10 @@
 import type { History } from "@statewalker/vcs-core";
-import type { Checkout, Staging, Worktree } from "@statewalker/vcs-working-tree";
 import {
   type GitWorkingCopyContext,
   GitWorkingCopyFactory,
   type WorkingCopyFactoryFilesApi,
 } from "@statewalker/vcs-store-files";
+import type { Checkout, Staging, Worktree } from "@statewalker/vcs-working-tree";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**

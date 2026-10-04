@@ -1,7 +1,6 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 
-
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
@@ -35,7 +34,10 @@ export default defineConfig({
       },
       {
         find: /^@statewalker\/vcs-working-tree\/transformation$/,
-        replacement: path.resolve(import.meta.dirname, "../working-tree/src/transformation/index.ts"),
+        replacement: path.resolve(
+          import.meta.dirname,
+          "../working-tree/src/transformation/index.ts",
+        ),
       },
       {
         find: /^@statewalker\/vcs-working-tree$/,

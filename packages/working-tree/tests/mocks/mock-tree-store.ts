@@ -4,10 +4,8 @@
  * Implements both old TreeStore and new Trees interfaces for backward compatibility.
  */
 
+import type { TreeEntry, Trees } from "@statewalker/vcs-core";
 import { vi } from "vitest";
-
-import type { TreeEntry } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
 
 /**
  * Create a mock Trees for testing.

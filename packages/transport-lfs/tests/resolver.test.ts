@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { lfsDownload, serveLfs } from "../src/index.js";
 import type { BatchResponse } from "../src/index.js";
+import { lfsDownload, serveLfs } from "../src/index.js";
 import { drain, makeStore, memResolver } from "./helpers.js";
 
 const URL = "http://lfs.test";

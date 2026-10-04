@@ -10,6 +10,16 @@
  */
 
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
+import {
+  basename,
+  type FileInfo,
+  FileMode,
+  type FilesApi,
+  joinPath,
+  readFile,
+} from "@statewalker/vcs-core";
+import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
+import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type {
   IgnoreManager,
   Worktree,
@@ -19,17 +29,7 @@ import type {
   WorktreeWalkOptions,
   WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
-import {
-  basename,
-  type FileInfo,
-  FileMode,
-  type FilesApi,
-  joinPath,
-  readFile,
-} from "@statewalker/vcs-core";
 import { createIgnoreManager } from "@statewalker/vcs-working-tree";
-import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 /**
  * Extended FilesApi with additional operations for worktree

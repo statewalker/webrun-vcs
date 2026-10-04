@@ -1,6 +1,6 @@
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
-import type { IndexBuilder, IndexEditor, Staging } from "@statewalker/vcs-working-tree";
 import { FileMode, type FilesApi, readFile } from "@statewalker/vcs-core";
+import type { IndexBuilder, IndexEditor, Staging } from "@statewalker/vcs-working-tree";
 import {
   INDEX_VERSION_2,
   type IndexVersion,

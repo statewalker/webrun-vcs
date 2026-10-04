@@ -19,7 +19,6 @@ import {
   type Tags,
   type Trees,
 } from "@statewalker/vcs-core";
-import { type Staging, type WorkingCopy, type Worktree } from "@statewalker/vcs-working-tree";
 import {
   createMemoryObjectStores,
   MemoryRefStore,
@@ -31,6 +30,7 @@ import {
   createRepositoryFacade,
   type RefStore,
 } from "@statewalker/vcs-transport";
+import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
 import { Git } from "../src/index.js";
 import { testAuthor } from "./test-helper.js";

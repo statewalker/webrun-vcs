@@ -1,5 +1,4 @@
-import type { FileModeValue } from "@statewalker/vcs-core";
-import type { ObjectId } from "@statewalker/vcs-core";
+import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
 import type { MergeStageValue, StagingEdit, StagingEntry } from "./types.js";
 import { MergeStage } from "./types.js";
 

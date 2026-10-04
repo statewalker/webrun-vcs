@@ -9,12 +9,10 @@
  * This implementation stores all files in memory.
  */
 
+import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
+import { FileMode } from "@statewalker/vcs-core";
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { FileMode } from "@statewalker/vcs-core";
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { Blobs } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
 import type {
   Worktree,
   WorktreeCheckoutOptions,

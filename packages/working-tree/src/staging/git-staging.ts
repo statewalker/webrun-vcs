@@ -7,15 +7,8 @@
  * All entries are kept sorted by (path, stage) for binary search.
  */
 
-import {
-  createInMemoryFilesApi,
-  FileMode,
-  type FilesApi,
-  readFile,
-} from "@statewalker/vcs-core";
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { TreeEntry } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
+import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
+import { createInMemoryFilesApi, FileMode, type FilesApi, readFile } from "@statewalker/vcs-core";
 import {
   INDEX_VERSION_2,
   type IndexVersion,

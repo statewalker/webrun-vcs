@@ -26,7 +26,7 @@ export interface RefUpdateResult {
 }
 
 // Re-export types from existing modules for convenience
-export type { Ref, SymbolicRef, ReflogEntry, ReflogReader };
+export type { Ref, ReflogEntry, ReflogReader, SymbolicRef };
 
 /**
  * Reference value - either a direct reference or symbolic reference

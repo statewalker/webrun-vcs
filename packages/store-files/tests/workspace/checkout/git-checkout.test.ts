@@ -4,11 +4,11 @@
  * Runs conformance tests against the Git file-based Checkout implementation.
  */
 
-import type { Checkout, Staging } from "@statewalker/vcs-working-tree";
 import { MemoryRefs } from "@statewalker/vcs-core";
-import { createMemoryGitStaging } from "@statewalker/vcs-working-tree";
 import { GitCheckout, type GitCheckoutFilesApi } from "@statewalker/vcs-store-files";
 import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
+import type { Checkout, Staging } from "@statewalker/vcs-working-tree";
+import { createMemoryGitStaging } from "@statewalker/vcs-working-tree";
 import { checkoutConformanceTests } from "./checkout.conformance.test.js";
 
 let checkout: GitCheckout;

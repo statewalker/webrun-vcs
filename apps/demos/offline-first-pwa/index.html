@@ -27,11 +27,11 @@
         <section class="panel storage-panel">
           <h2>Storage</h2>
           <div class="storage-options">
-            <button id="btn-memory" class="storage-btn active">
+            <button type="button" id="btn-memory" class="storage-btn active">
               <span class="icon">💾</span>
               <span>In-Memory</span>
             </button>
-            <button id="btn-persistent" class="storage-btn">
+            <button type="button" id="btn-persistent" class="storage-btn">
               <span class="icon">📁</span>
               <span>Persistent</span>
             </button>
@@ -41,7 +41,7 @@
 
         <section class="panel repo-panel">
           <h2>Repository</h2>
-          <button id="btn-init" class="btn-primary">Initialize Repository</button>
+          <button type="button" id="btn-init" class="btn-primary">Initialize Repository</button>
           <div id="repo-status" class="repo-status">No repository</div>
         </section>
 
@@ -50,7 +50,7 @@
           <div class="file-form">
             <input type="text" id="file-name" placeholder="filename.txt" />
             <textarea id="file-content" placeholder="File content..."></textarea>
-            <button id="btn-add-file" class="btn-primary">Add File</button>
+            <button type="button" id="btn-add-file" class="btn-primary">Add File</button>
           </div>
           <div id="staged-files" class="file-list">
             <h3>Staged Files</h3>
@@ -62,7 +62,7 @@
           <h2>Commit</h2>
           <div class="commit-form">
             <input type="text" id="commit-message" placeholder="Commit message" />
-            <button id="btn-commit" class="btn-primary">Create Commit</button>
+            <button type="button" id="btn-commit" class="btn-primary">Create Commit</button>
           </div>
         </section>
 
@@ -77,9 +77,9 @@
       <footer class="app-footer">
         <div class="pwa-info">
           <span id="pwa-status">Not installed</span>
-          <button id="btn-install" class="btn-secondary" style="display: none;">Install App</button>
+          <button type="button" id="btn-install" class="btn-secondary" style="display: none;">Install App</button>
         </div>
-        <p>Powered by <a href="#">StateWalker VCS</a></p>
+        <p>Powered by <a href="https://github.com/statewalker/webrun-vcs">StateWalker VCS</a></p>
       </footer>
     </div>
 

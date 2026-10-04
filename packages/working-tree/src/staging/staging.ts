@@ -7,8 +7,7 @@
  * - createMemoryGitStaging() for in-memory/testing
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
+import type { ObjectId, Trees } from "@statewalker/vcs-core";
 import type { MergeStageValue, StagingEntry, StagingEntryOptions } from "./types.js";
 
 // Re-export types for consumers

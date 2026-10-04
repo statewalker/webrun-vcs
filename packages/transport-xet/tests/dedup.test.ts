@@ -21,11 +21,7 @@ async function manifestChunks(store: ContentStore, id: string) {
 }
 
 /** Copy a set of chunks from one store to another (pre-seed the far side). */
-async function seedChunks(
-  from: ContentStore,
-  to: ContentStore,
-  ids: string[],
-): Promise<void> {
+async function seedChunks(from: ContentStore, to: ContentStore, ids: string[]): Promise<void> {
   for (const id of ids) await to.putChunk(id, from.getChunk(id));
 }
 
@@ -48,7 +44,10 @@ describe("xet chunk dedup (loopback)", () => {
     const handler = serveXet(spiedServer, serverResolver);
 
     const events = await drain(
-      xetUpload(clientStore, clientResolver, URL, [ptr], { fetchImpl: handler, hashContent: csHash }),
+      xetUpload(clientStore, clientResolver, URL, [ptr], {
+        fetchImpl: handler,
+        hashContent: csHash,
+      }),
     );
 
     expect(events).toContainEqual({ type: "object-uploaded", oid: ptr.oid });
@@ -79,7 +78,10 @@ describe("xet chunk dedup (loopback)", () => {
     const handler = serveXet(spiedServer, serverResolver);
 
     await drain(
-      xetUpload(clientStore, clientResolver, URL, [ptr], { fetchImpl: handler, hashContent: csHash }),
+      xetUpload(clientStore, clientResolver, URL, [ptr], {
+        fetchImpl: handler,
+        hashContent: csHash,
+      }),
     );
 
     expect(spy.putChunkIds).toHaveLength(1);

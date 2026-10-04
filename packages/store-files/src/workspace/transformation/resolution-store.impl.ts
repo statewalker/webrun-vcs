@@ -8,6 +8,9 @@
  */
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
+import { sha1 } from "@statewalker/vcs-utils";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
+import { joinPath, tryReadFile } from "@statewalker/vcs-utils/files";
 import type { IndexEntry, Staging } from "@statewalker/vcs-working-tree";
 import { MergeStage } from "@statewalker/vcs-working-tree";
 import type {
@@ -19,9 +22,6 @@ import type {
   Resolution,
   ResolutionStore,
 } from "@statewalker/vcs-working-tree/transformation";
-import { sha1 } from "@statewalker/vcs-utils";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
-import { joinPath, tryReadFile } from "@statewalker/vcs-utils/files";
 
 /**
  * Git file-based ResolutionStore implementation.

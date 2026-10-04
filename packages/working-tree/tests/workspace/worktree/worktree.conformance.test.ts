@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FileMode } from "@statewalker/vcs-core";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Worktree, WorktreeEntry } from "../../../src/worktree/worktree.js";
 
 // This file exports a conformance test factory, not direct tests.

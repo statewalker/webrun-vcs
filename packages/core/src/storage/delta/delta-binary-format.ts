@@ -22,21 +22,19 @@ import {
 } from "@statewalker/vcs-utils";
 
 // Re-export with original names
+// Export with original names
+// Convenience aliases for the common operations
 export {
-  deltaToGitFormat,
+  _deserializeDeltaFromGit as deserializeDeltaFromGit,
+  _deserializeDeltaFromGit as parseBinaryDelta,
+  _serializeDeltaToGit as serializeDeltaToGit,
+  _serializeDeltaToGit as serializeDelta,
   deltaRangesToGitFormat,
-  parseGitDelta,
+  deltaToGitFormat,
   formatGitDelta,
-  gitFormatToDeltaRanges,
+  type GitDeltaInstruction,
   getGitDeltaBaseSize,
   getGitDeltaResultSize,
-  type GitDeltaInstruction,
+  gitFormatToDeltaRanges,
+  parseGitDelta,
 };
-
-// Export with original names
-export { _serializeDeltaToGit as serializeDeltaToGit };
-export { _deserializeDeltaFromGit as deserializeDeltaFromGit };
-
-// Convenience aliases for the common operations
-export { _serializeDeltaToGit as serializeDelta };
-export { _deserializeDeltaFromGit as parseBinaryDelta };

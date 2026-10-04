@@ -69,11 +69,7 @@ export function decompressBlockPartialPako(
 
       ret = zlibInflate(strm, Z_FINISH);
 
-      if (
-        ret !== Z_OK &&
-        ret !== Z_STREAM_END &&
-        ret !== Z_BUF_ERROR
-      ) {
+      if (ret !== Z_OK && ret !== Z_STREAM_END && ret !== Z_BUF_ERROR) {
         throw new CompressionError(`Pako decompression failed: ${strm.msg || `error code ${ret}`}`);
       }
 

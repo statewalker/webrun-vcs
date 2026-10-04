@@ -3,18 +3,14 @@
  */
 
 import { Git } from "@statewalker/vcs-commands";
+import { createMemoryHistory, FileMode, type History } from "@statewalker/vcs-core";
 import {
-	createMemoryHistory,
-	FileMode,
-	type History,
-} from "@statewalker/vcs-core";
-import {
-	createMemoryCheckout,
-	createMemoryGitStaging,
-	createMemoryWorkingCopy,
-	createMemoryWorktree,
-	MergeStage,
-	type WorkingCopy,
+  createMemoryCheckout,
+  createMemoryGitStaging,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+  MergeStage,
+  type WorkingCopy,
 } from "@statewalker/vcs-working-tree";
 
 // Shared state
@@ -135,7 +131,7 @@ export function formatMode(mode: number): string {
 }
 
 export type { Git } from "@statewalker/vcs-commands";
-export type { WorkingCopy } from "@statewalker/vcs-working-tree";
 // Re-export types
 export { FileMode } from "@statewalker/vcs-core";
+export type { WorkingCopy } from "@statewalker/vcs-working-tree";
 export { MergeStage } from "@statewalker/vcs-working-tree";

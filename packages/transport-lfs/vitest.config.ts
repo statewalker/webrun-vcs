@@ -1,7 +1,6 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 
-
 export default defineConfig({
   test: {
     globals: true,
@@ -9,7 +8,6 @@ export default defineConfig({
     include: ["tests/**/*.test.ts"],
   },
   resolve: {
-    alias: [
-    ],
+    alias: [],
   },
 });

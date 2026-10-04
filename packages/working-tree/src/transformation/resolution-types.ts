@@ -5,8 +5,7 @@
  * including rerere (reuse recorded resolution) functionality.
  */
 
-import type { FileModeValue } from "@statewalker/vcs-core";
-import type { ObjectId } from "@statewalker/vcs-core";
+import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
 
 // === Conflict Types ===
 

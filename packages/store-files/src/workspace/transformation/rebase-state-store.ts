@@ -7,12 +7,12 @@
  */
 
 import { joinPath, tryReadText } from "@statewalker/vcs-core";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type {
   RebaseState,
   RebaseTodoAction,
   RebaseTodoItem,
 } from "@statewalker/vcs-working-tree/transformation";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
 
 /**
  * Store for rebase operation state

@@ -5,8 +5,8 @@
  * using the new MessagePort adapter APIs.
  */
 
-import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { createMessagePortDuplex, type Duplex } from "@statewalker/vcs-transport";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { memoryFactory } from "./backend-factories.js";
 import type { SimpleHistory } from "./helpers/simple-history.js";

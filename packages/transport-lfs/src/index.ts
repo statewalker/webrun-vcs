@@ -10,12 +10,12 @@
  */
 
 export {
+  BASIC_TRANSFER,
   type BatchAction,
   type BatchObjectRequest,
   type BatchObjectResponse,
   type BatchRequest,
   type BatchResponse,
-  BASIC_TRANSFER,
   LFS_CONTENT_TYPE,
 } from "./batch.js";
 export { lfsDownload, lfsUpload } from "./client.js";

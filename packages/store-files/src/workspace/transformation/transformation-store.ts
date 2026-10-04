@@ -6,13 +6,13 @@
  */
 
 import type { Blobs } from "@statewalker/vcs-core";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { Staging } from "@statewalker/vcs-working-tree";
 import type {
   ResolutionStore,
   TransformationCapabilities,
   TransformationState,
 } from "@statewalker/vcs-working-tree/transformation";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { CherryPickStateStore } from "./cherry-pick-state-store.js";
 import { GitCherryPickStateStore } from "./cherry-pick-state-store.js";
 import type { MergeStateStore } from "./merge-state-store.js";

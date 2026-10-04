@@ -1,12 +1,12 @@
 import { createInMemoryFilesApi, createMemoryHistory, type FilesApi } from "@statewalker/vcs-core";
+import { createFileWorktree } from "@statewalker/vcs-store-files";
+import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import {
   createMemoryCheckout,
   type Staging,
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-import { createFileWorktree } from "@statewalker/vcs-store-files";
-import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 
 import { Git } from "../git.js";
 import type { InitResult } from "../results/init-result.js";

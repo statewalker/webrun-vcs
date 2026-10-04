@@ -7,19 +7,19 @@ import * as path from "node:path";
 import { Git } from "@statewalker/vcs-commands";
 import type { FilesApi, GitObjectStore, History } from "@statewalker/vcs-core";
 import {
-	createFileWorktree,
-	createGitFilesBackend,
-	FileStagingStore,
+  createFileWorktree,
+  createGitFilesBackend,
+  FileStagingStore,
 } from "@statewalker/vcs-store-files";
-import {
-	createMemoryCheckout,
-	createMemoryWorkingCopy,
-	createMemoryWorktree,
-	type WorkingCopy,
-} from "@statewalker/vcs-working-tree";
 import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import {
+  createMemoryCheckout,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+  type WorkingCopy,
+} from "@statewalker/vcs-working-tree";
 
 // Initialize compression for pack operations
 setCompressionUtils(createNodeCompression());

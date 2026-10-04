@@ -1175,195 +1175,196 @@ describe.each(backends)("MergeCommand - JGit fast-forward tests ($name backend)"
   });
 });
 
-describe.each(backends)("MergeCommand - JGit content merge tests ($name backend)", ({
-  factory,
-}) => {
-  let cleanup: (() => Promise<void>) | undefined;
+describe.each(backends)(
+  "MergeCommand - JGit content merge tests ($name backend)",
+  ({ factory }) => {
+    let cleanup: (() => Promise<void>) | undefined;
 
-  afterEach(async () => {
-    if (cleanup) {
-      await cleanup();
-      cleanup = undefined;
+    afterEach(async () => {
+      if (cleanup) {
+        await cleanup();
+        cleanup = undefined;
+      }
+    });
+
+    async function createInitializedGit() {
+      const result = await createInitializedGitFromFactory(factory);
+      cleanup = result.cleanup;
+      return result;
     }
-  });
 
-  async function createInitializedGit() {
-    const result = await createInitializedGitFromFactory(factory);
-    cleanup = result.cleanup;
-    return result;
-  }
+    /**
+     * JGit: testSuccessfulContentMerge (adapted)
+     *
+     * Note: The current implementation does FILE-LEVEL merge only,
+     * not content-level (line-by-line) merge. When both sides modify
+     * the same file differently, it's marked as conflict even if the
+     * changes are in different parts of the file.
+     *
+     * This test is adapted to verify file-level merge behavior:
+     * - Each side modifies DIFFERENT files
+     * - Same-file modifications result in conflict
+     */
+    it("should merge when each side modifies different files", async () => {
+      const { git, workingCopy, repository } = await createInitializedGit();
 
-  /**
-   * JGit: testSuccessfulContentMerge (adapted)
-   *
-   * Note: The current implementation does FILE-LEVEL merge only,
-   * not content-level (line-by-line) merge. When both sides modify
-   * the same file differently, it's marked as conflict even if the
-   * changes are in different parts of the file.
-   *
-   * This test is adapted to verify file-level merge behavior:
-   * - Each side modifies DIFFERENT files
-   * - Same-file modifications result in conflict
-   */
-  it("should merge when each side modifies different files", async () => {
-    const { git, workingCopy, repository } = await createInitializedGit();
+      // Setup initial files
+      await addFile(workingCopy, "a", "1\na\n3\n");
+      await addFile(workingCopy, "b", "1\nb\n3\n");
+      await addFile(workingCopy, "c/c/c", "1\nc\n3\n");
+      await git.commit().setMessage("initial").call();
 
-    // Setup initial files
-    await addFile(workingCopy, "a", "1\na\n3\n");
-    await addFile(workingCopy, "b", "1\nb\n3\n");
-    await addFile(workingCopy, "c/c/c", "1\nc\n3\n");
-    await git.commit().setMessage("initial").call();
+      // Create side branch
+      await git.branchCreate().setName("side").call();
+      await repository.refs.setSymbolic("HEAD", "refs/heads/side");
 
-    // Create side branch
-    await git.branchCreate().setName("side").call();
-    await repository.refs.setSymbolic("HEAD", "refs/heads/side");
+      const sideRef = await repository.refs.resolve("refs/heads/side");
+      const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
-    const sideRef = await repository.refs.resolve("refs/heads/side");
-    const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
-    await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
+      // Modify only b on side (not a)
+      await addFile(workingCopy, "b", "1\nb(side)\n3\n");
+      await git.commit().setMessage("side changes").call();
 
-    // Modify only b on side (not a)
-    await addFile(workingCopy, "b", "1\nb(side)\n3\n");
-    await git.commit().setMessage("side changes").call();
+      // Switch to main
+      await repository.refs.setSymbolic("HEAD", "refs/heads/main");
+      const mainRef = await repository.refs.resolve("refs/heads/main");
+      const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
-    // Switch to main
-    await repository.refs.setSymbolic("HEAD", "refs/heads/main");
-    const mainRef = await repository.refs.resolve("refs/heads/main");
-    const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
-    await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
+      // Modify only a and c on main (not b)
+      await addFile(workingCopy, "a", "1\na\n3(main)\n");
+      await addFile(workingCopy, "c/c/c", "1\nc(main)\n3\n");
+      await git.commit().setMessage("main changes").call();
 
-    // Modify only a and c on main (not b)
-    await addFile(workingCopy, "a", "1\na\n3(main)\n");
-    await addFile(workingCopy, "c/c/c", "1\nc(main)\n3\n");
-    await git.commit().setMessage("main changes").call();
+      // Merge - should succeed (no file modified by both sides)
+      const result = await git.merge().include("refs/heads/side").call();
 
-    // Merge - should succeed (no file modified by both sides)
-    const result = await git.merge().include("refs/heads/side").call();
+      expect(result.status).toBe(MergeStatus.MERGED);
+      expect(result.conflicts).toBeUndefined();
 
-    expect(result.status).toBe(MergeStatus.MERGED);
-    expect(result.conflicts).toBeUndefined();
+      // Verify merge commit has 2 parents
+      const mergeCommit = await repository.commits.load(result.newHead ?? "");
+      expect(mergeCommit.parents.length).toBe(2);
+    });
 
-    // Verify merge commit has 2 parents
-    const mergeCommit = await repository.commits.load(result.newHead ?? "");
-    expect(mergeCommit.parents.length).toBe(2);
-  });
+    /**
+     * Content-level merge limitation test.
+     *
+     * When both sides modify the same file (even in different parts),
+     * the current file-level merge marks it as conflict.
+     */
+    it("should conflict when both sides modify same file (file-level merge)", async () => {
+      const { git, workingCopy, repository } = await createInitializedGit();
 
-  /**
-   * Content-level merge limitation test.
-   *
-   * When both sides modify the same file (even in different parts),
-   * the current file-level merge marks it as conflict.
-   */
-  it("should conflict when both sides modify same file (file-level merge)", async () => {
-    const { git, workingCopy, repository } = await createInitializedGit();
+      // Setup initial file
+      await addFile(workingCopy, "a", "1\na\n3\n");
+      await git.commit().setMessage("initial").call();
 
-    // Setup initial file
-    await addFile(workingCopy, "a", "1\na\n3\n");
-    await git.commit().setMessage("initial").call();
+      // Create side branch
+      await git.branchCreate().setName("side").call();
+      await repository.refs.setSymbolic("HEAD", "refs/heads/side");
 
-    // Create side branch
-    await git.branchCreate().setName("side").call();
-    await repository.refs.setSymbolic("HEAD", "refs/heads/side");
+      const sideRef = await repository.refs.resolve("refs/heads/side");
+      const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
-    const sideRef = await repository.refs.resolve("refs/heads/side");
-    const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
-    await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
+      // Modify file a on side (first line)
+      await addFile(workingCopy, "a", "1(side)\na\n3\n");
+      await git.commit().setMessage("side changes").call();
 
-    // Modify file a on side (first line)
-    await addFile(workingCopy, "a", "1(side)\na\n3\n");
-    await git.commit().setMessage("side changes").call();
+      // Switch to main
+      await repository.refs.setSymbolic("HEAD", "refs/heads/main");
+      const mainRef = await repository.refs.resolve("refs/heads/main");
+      const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
-    // Switch to main
-    await repository.refs.setSymbolic("HEAD", "refs/heads/main");
-    const mainRef = await repository.refs.resolve("refs/heads/main");
-    const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
-    await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
+      // Modify file a on main (last line)
+      await addFile(workingCopy, "a", "1\na\n3(main)\n");
+      await git.commit().setMessage("main changes").call();
 
-    // Modify file a on main (last line)
-    await addFile(workingCopy, "a", "1\na\n3(main)\n");
-    await git.commit().setMessage("main changes").call();
+      // Merge - conflicts because same file modified by both (file-level merge)
+      const result = await git.merge().include("refs/heads/side").call();
 
-    // Merge - conflicts because same file modified by both (file-level merge)
-    const result = await git.merge().include("refs/heads/side").call();
+      expect(result.status).toBe(MergeStatus.CONFLICTING);
+      expect(result.conflicts).toContain("a");
+    });
 
-    expect(result.status).toBe(MergeStatus.CONFLICTING);
-    expect(result.conflicts).toContain("a");
-  });
+    /**
+     * JGit: testSuccessfulContentMergeNoCommit
+     * Non-overlapping merge with setCommit(false).
+     */
+    it("should merge non-overlapping changes without commit when setCommit(false)", async () => {
+      const { git, workingCopy, repository } = await createInitializedGit();
 
-  /**
-   * JGit: testSuccessfulContentMergeNoCommit
-   * Non-overlapping merge with setCommit(false).
-   */
-  it("should merge non-overlapping changes without commit when setCommit(false)", async () => {
-    const { git, workingCopy, repository } = await createInitializedGit();
+      // Setup
+      await addFile(workingCopy, "a", "1\na\n3\n");
+      await addFile(workingCopy, "b", "1\nb\n3\n");
+      await git.commit().setMessage("initial").call();
 
-    // Setup
-    await addFile(workingCopy, "a", "1\na\n3\n");
-    await addFile(workingCopy, "b", "1\nb\n3\n");
-    await git.commit().setMessage("initial").call();
+      // Create side branch
+      await git.branchCreate().setName("side").call();
+      await repository.refs.setSymbolic("HEAD", "refs/heads/side");
 
-    // Create side branch
-    await git.branchCreate().setName("side").call();
-    await repository.refs.setSymbolic("HEAD", "refs/heads/side");
+      const sideRef = await repository.refs.resolve("refs/heads/side");
+      const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
-    const sideRef = await repository.refs.resolve("refs/heads/side");
-    const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
-    await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
+      // Modify b on side
+      await addFile(workingCopy, "b", "1\nb(side)\n3\n");
+      await git.commit().setMessage("side changes").call();
 
-    // Modify b on side
-    await addFile(workingCopy, "b", "1\nb(side)\n3\n");
-    await git.commit().setMessage("side changes").call();
+      // Switch to main
+      await repository.refs.setSymbolic("HEAD", "refs/heads/main");
+      const mainRef = await repository.refs.resolve("refs/heads/main");
+      const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
-    // Switch to main
-    await repository.refs.setSymbolic("HEAD", "refs/heads/main");
-    const mainRef = await repository.refs.resolve("refs/heads/main");
-    const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
-    await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
+      // Modify a on main
+      await addFile(workingCopy, "a", "1\na(main)\n3\n");
+      await git.commit().setMessage("main changes").call();
+      const mainHeadBefore = await repository.refs.resolve("refs/heads/main");
 
-    // Modify a on main
-    await addFile(workingCopy, "a", "1\na(main)\n3\n");
-    await git.commit().setMessage("main changes").call();
-    const mainHeadBefore = await repository.refs.resolve("refs/heads/main");
+      // Merge with no-commit
+      const result = await git.merge().include("refs/heads/side").setCommit(false).call();
 
-    // Merge with no-commit
-    const result = await git.merge().include("refs/heads/side").setCommit(false).call();
+      expect(result.status).toBe(MergeStatus.MERGED_NOT_COMMITTED);
 
-    expect(result.status).toBe(MergeStatus.MERGED_NOT_COMMITTED);
+      // HEAD should not have moved
+      const mainHeadAfter = await repository.refs.resolve("refs/heads/main");
+      expect(mainHeadAfter?.objectId).toBe(mainHeadBefore?.objectId);
+    });
 
-    // HEAD should not have moved
-    const mainHeadAfter = await repository.refs.resolve("refs/heads/main");
-    expect(mainHeadAfter?.objectId).toBe(mainHeadBefore?.objectId);
-  });
+    /**
+     * JGit: testMergeTag
+     * Merge using a tag reference.
+     */
+    it("should resolve and merge a tag", async () => {
+      const { git, workingCopy, repository, initialCommitId } = await createInitializedGit();
 
-  /**
-   * JGit: testMergeTag
-   * Merge using a tag reference.
-   */
-  it("should resolve and merge a tag", async () => {
-    const { git, workingCopy, repository, initialCommitId } = await createInitializedGit();
+      // Create a commit on main
+      await git.commit().setMessage("second commit").setAllowEmpty(true).call();
+      const mainHead = await repository.refs.resolve("refs/heads/main");
 
-    // Create a commit on main
-    await git.commit().setMessage("second commit").setAllowEmpty(true).call();
-    const mainHead = await repository.refs.resolve("refs/heads/main");
+      // Create a tag pointing to main
+      await repository.refs.set("refs/tags/v1.0", mainHead?.objectId ?? "");
 
-    // Create a tag pointing to main
-    await repository.refs.set("refs/tags/v1.0", mainHead?.objectId ?? "");
+      // Create branch1 at initial commit
+      await git.branchCreate().setName("branch1").setStartPoint(initialCommitId).call();
+      await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
+      await workingCopy.checkout.staging.readTree(
+        repository.trees,
+        (await repository.commits.load(initialCommitId)).tree,
+      );
 
-    // Create branch1 at initial commit
-    await git.branchCreate().setName("branch1").setStartPoint(initialCommitId).call();
-    await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
-    await workingCopy.checkout.staging.readTree(
-      repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
-    );
+      // Merge the tag
+      const result = await git.merge().include("refs/tags/v1.0").call();
 
-    // Merge the tag
-    const result = await git.merge().include("refs/tags/v1.0").call();
-
-    expect(result.status).toBe(MergeStatus.FAST_FORWARD);
-    expect(result.newHead).toBe(mainHead?.objectId);
-  });
-});
+      expect(result.status).toBe(MergeStatus.FAST_FORWARD);
+      expect(result.newHead).toBe(mainHead?.objectId);
+    });
+  },
+);
 
 describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;

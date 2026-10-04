@@ -2,8 +2,7 @@
  * Staging types - Shared types for staging/index operations
  */
 
-import type { FileModeValue } from "@statewalker/vcs-core";
-import type { ObjectId } from "@statewalker/vcs-core";
+import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
 
 /**
  * Merge stage for index entries.

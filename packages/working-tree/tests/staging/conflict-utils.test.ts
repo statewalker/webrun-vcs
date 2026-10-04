@@ -2,9 +2,9 @@
  * Tests for conflict detection and resolution utilities
  */
 
-import { describe, expect, it } from "vitest";
-import { FileMode } from "@statewalker/vcs-core";
 import type { ObjectId } from "@statewalker/vcs-core";
+import { FileMode } from "@statewalker/vcs-core";
+import { describe, expect, it } from "vitest";
 import {
   type ConflictInfo,
   ConflictType,

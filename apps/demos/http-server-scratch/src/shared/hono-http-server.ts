@@ -184,7 +184,6 @@ export async function createHonoHttpServer(
   return server;
 }
 
-// Re-export the old interface names for backwards compatibility
-export { HonoHttpServer as VcsHttpServer };
 export type { HonoHttpServerOptions as VcsHttpServerOptions };
-export { createHonoHttpServer as createVcsHttpServer };
+// Re-export the old interface names for backwards compatibility
+export { createHonoHttpServer as createVcsHttpServer, HonoHttpServer as VcsHttpServer };

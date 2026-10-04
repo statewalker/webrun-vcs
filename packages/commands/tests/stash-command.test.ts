@@ -668,95 +668,96 @@ describe.each(backends)("StashDropCommand ($name backend)", ({ factory }) => {
   });
 });
 
-describe.each(backends)("StashCreateCommand - JGit compatibility tests ($name backend)", ({
-  factory,
-}) => {
-  let cleanup: (() => Promise<void>) | undefined;
+describe.each(backends)(
+  "StashCreateCommand - JGit compatibility tests ($name backend)",
+  ({ factory }) => {
+    let cleanup: (() => Promise<void>) | undefined;
 
-  afterEach(async () => {
-    if (cleanup) {
-      await cleanup();
-      cleanup = undefined;
+    afterEach(async () => {
+      if (cleanup) {
+        await cleanup();
+        cleanup = undefined;
+      }
+    });
+
+    async function createInitializedGit() {
+      const result = await createInitializedGitFromFactory(factory);
+      cleanup = result.cleanup;
+      return result;
     }
-  });
 
-  async function createInitializedGit() {
-    const result = await createInitializedGitFromFactory(factory);
-    cleanup = result.cleanup;
-    return result;
-  }
+    /**
+     * Test stash creation with working tree provider providing no changes.
+     *
+     * Based on JGit's noLocalChanges test.
+     */
+    it("should create stash even without explicit working tree changes", async () => {
+      const { git, workingCopy, repository } = await createInitializedGit();
 
-  /**
-   * Test stash creation with working tree provider providing no changes.
-   *
-   * Based on JGit's noLocalChanges test.
-   */
-  it("should create stash even without explicit working tree changes", async () => {
-    const { git, workingCopy, repository } = await createInitializedGit();
+      await addFile(workingCopy, "file.txt", "content");
+      await git.commit().setMessage("initial").call();
 
-    await addFile(workingCopy, "file.txt", "content");
-    await git.commit().setMessage("initial").call();
+      // Create stash without provider - still creates commit structure
+      const stashCommit = await git.stashCreate().call();
 
-    // Create stash without provider - still creates commit structure
-    const stashCommit = await git.stashCreate().call();
+      expect(stashCommit).toBeDefined();
+      if (!stashCommit) return;
 
-    expect(stashCommit).toBeDefined();
-    if (!stashCommit) return;
+      // Verify stash commit structure
+      const commit = await repository.commits.load(stashCommit);
+      expect(commit.parents.length).toBeGreaterThanOrEqual(2);
+    });
 
-    // Verify stash commit structure
-    const commit = await repository.commits.load(stashCommit);
-    expect(commit.parents.length).toBeGreaterThanOrEqual(2);
-  });
+    /**
+     * Test that multiple stashes replace refs/stash.
+     *
+     * Note: Without reflog, only the latest stash is accessible.
+     */
+    it("should replace refs/stash on subsequent stash creates", async () => {
+      const { git, workingCopy, repository } = await createInitializedGit();
 
-  /**
-   * Test that multiple stashes replace refs/stash.
-   *
-   * Note: Without reflog, only the latest stash is accessible.
-   */
-  it("should replace refs/stash on subsequent stash creates", async () => {
-    const { git, workingCopy, repository } = await createInitializedGit();
+      await addFile(workingCopy, "file.txt", "content");
+      await git.commit().setMessage("initial").call();
 
-    await addFile(workingCopy, "file.txt", "content");
-    await git.commit().setMessage("initial").call();
+      const stash1 = await git.stashCreate().setMessage("stash 1").call();
+      const stash2 = await git.stashCreate().setMessage("stash 2").call();
 
-    const stash1 = await git.stashCreate().setMessage("stash 1").call();
-    const stash2 = await git.stashCreate().setMessage("stash 2").call();
+      // refs/stash should point to stash2
+      const stashRef = await repository.refs.resolve("refs/stash");
+      expect(stashRef?.objectId).toBe(stash2);
+      expect(stash1).not.toBe(stash2);
+    });
 
-    // refs/stash should point to stash2
-    const stashRef = await repository.refs.resolve("refs/stash");
-    expect(stashRef?.objectId).toBe(stash2);
-    expect(stash1).not.toBe(stash2);
-  });
+    /**
+     * Test custom index message.
+     */
+    it("should support custom index message", async () => {
+      const { git } = await createInitializedGit();
 
-  /**
-   * Test custom index message.
-   */
-  it("should support custom index message", async () => {
-    const { git } = await createInitializedGit();
+      const command = git.stashCreate();
+      command.setIndexMessage("Custom index message");
 
-    const command = git.stashCreate();
-    command.setIndexMessage("Custom index message");
+      // API should work (actual message depends on implementation)
+      expect(command).toBeDefined();
+    });
 
-    // API should work (actual message depends on implementation)
-    expect(command).toBeDefined();
-  });
+    /**
+     * Test command cannot be reused.
+     */
+    it("should not allow command reuse after call", async () => {
+      const { git, workingCopy } = await createInitializedGit();
 
-  /**
-   * Test command cannot be reused.
-   */
-  it("should not allow command reuse after call", async () => {
-    const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "file.txt", "content");
+      await git.commit().setMessage("initial").call();
 
-    await addFile(workingCopy, "file.txt", "content");
-    await git.commit().setMessage("initial").call();
+      const command = git.stashCreate();
+      await command.call();
 
-    const command = git.stashCreate();
-    await command.call();
-
-    // Attempting to call again should throw
-    await expect(command.call()).rejects.toThrow();
-  });
-});
+      // Attempting to call again should throw
+      await expect(command.call()).rejects.toThrow();
+    });
+  },
+);
 
 describe.each(backends)("StashListCommand - additional tests ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;

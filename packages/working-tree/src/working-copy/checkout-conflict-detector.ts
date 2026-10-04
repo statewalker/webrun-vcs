@@ -9,9 +9,7 @@
  * Uses three-way comparison between HEAD, index, and target tree.
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { TreeEntry } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
+import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import type { Staging } from "../staging/staging.js";
 import type { Worktree } from "../worktree/worktree.js";
 

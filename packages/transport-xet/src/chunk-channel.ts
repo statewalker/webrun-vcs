@@ -17,8 +17,8 @@
  */
 
 import type { ByteStream } from "@statewalker/content-store";
-import type { Duplex } from "@statewalker/webrun-streams";
 import type { FetchLike } from "@statewalker/vcs-transport-lfs";
+import type { Duplex } from "@statewalker/webrun-streams";
 
 /** Collect a byte stream into one contiguous `ArrayBuffer`-backed buffer (a
  * valid `BodyInit`) — one small protocol frame per call. */

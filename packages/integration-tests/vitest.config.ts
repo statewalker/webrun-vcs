@@ -1,7 +1,6 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 
-
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
@@ -51,7 +50,10 @@ export default defineConfig({
       },
       {
         find: "@statewalker/vcs-store-sql/adapters/sql-js",
-        replacement: path.resolve(import.meta.dirname, "../store-sql/src/adapters/sql-js-adapter.ts"),
+        replacement: path.resolve(
+          import.meta.dirname,
+          "../store-sql/src/adapters/sql-js-adapter.ts",
+        ),
       },
       {
         find: "@statewalker/vcs-store-sql",

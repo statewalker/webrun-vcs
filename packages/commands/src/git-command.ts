@@ -12,8 +12,8 @@ import type {
   TreeEntry,
   Trees,
 } from "@statewalker/vcs-core";
-import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 import { isSymbolicRef } from "@statewalker/vcs-core";
+import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
 import { NoHeadError, RefNotFoundError } from "./errors/index.js";
 

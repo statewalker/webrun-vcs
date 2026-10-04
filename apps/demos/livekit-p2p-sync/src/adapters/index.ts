@@ -1,6 +1,6 @@
 export { createRefStoreAdapter } from "./ref-store-adapter.js";
 export {
   gitClientDuplex,
-  serveGitDispatch,
   type ServeGitDispatchOptions,
+  serveGitDispatch,
 } from "./webrun-git.js";

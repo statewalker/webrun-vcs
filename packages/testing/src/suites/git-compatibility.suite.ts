@@ -87,14 +87,14 @@ export function createGitCompatibilityTests(name: string, factory: GitCompatibil
        * Verify blob hashing produces Git-compatible SHA-1.
        * Git blob format: "blob {size}\0{content}"
        */
-      it.each(KNOWN_BLOB_HASHES)("should hash '$content' to $expected", async ({
-        content,
-        expected,
-      }) => {
-        const data = encoder.encode(content);
-        const id = await ctx.stores.blobs.store(toStream(data));
-        expect(id).toBe(expected);
-      });
+      it.each(KNOWN_BLOB_HASHES)(
+        "should hash '$content' to $expected",
+        async ({ content, expected }) => {
+          const data = encoder.encode(content);
+          const id = await ctx.stores.blobs.store(toStream(data));
+          expect(id).toBe(expected);
+        },
+      );
 
       it("should handle binary content correctly", async () => {
         // Binary content with null bytes

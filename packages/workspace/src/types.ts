@@ -19,7 +19,7 @@
 import type { ContentStore } from "@statewalker/content-store";
 import type { FilesApi, PathFilter, VerificationMode } from "@statewalker/files-sync";
 
-export type { FilesApi, PathFilter, VerificationMode, ContentStore };
+export type { ContentStore, FilesApi, PathFilter, VerificationMode };
 
 /** A stream of bytes. */
 export type ByteStream = AsyncIterable<Uint8Array>;

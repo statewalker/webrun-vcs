@@ -8,14 +8,14 @@
  */
 
 import type { History, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { FileMode } from "@statewalker/vcs-core";
-import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import {
   createMemoryObjectStores,
   MemoryRefStore,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
+import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { Git } from "../src/index.js";
 import {

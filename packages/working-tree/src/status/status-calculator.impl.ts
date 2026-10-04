@@ -17,13 +17,8 @@
  * Reference: jgit/org.eclipse.jgit/src/org/eclipse/jgit/api/StatusCommand.java
  */
 
-import { FileMode } from "@statewalker/vcs-core";
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { Blobs } from "@statewalker/vcs-core";
-import type { Commits } from "@statewalker/vcs-core";
-import { isSymbolicRef } from "@statewalker/vcs-core";
-import type { Refs } from "@statewalker/vcs-core";
-import type { Trees } from "@statewalker/vcs-core";
+import type { Blobs, Commits, ObjectId, Refs, Trees } from "@statewalker/vcs-core";
+import { FileMode, isSymbolicRef } from "@statewalker/vcs-core";
 import type { Staging } from "../staging/staging.js";
 import type { Worktree } from "../worktree/worktree.js";
 import type { IndexDiff } from "./index-diff.js";

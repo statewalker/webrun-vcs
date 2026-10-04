@@ -5,17 +5,13 @@
  */
 
 import { Git } from "@statewalker/vcs-commands";
+import { createMemoryHistory, FileMode, type History } from "@statewalker/vcs-core";
 import {
-	createMemoryHistory,
-	FileMode,
-	type History,
-} from "@statewalker/vcs-core";
-import {
-	createMemoryCheckout,
-	createMemoryGitStaging,
-	createMemoryWorkingCopy,
-	createMemoryWorktree,
-	type WorkingCopy,
+  createMemoryCheckout,
+  createMemoryGitStaging,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+  type WorkingCopy,
 } from "@statewalker/vcs-working-tree";
 
 /**

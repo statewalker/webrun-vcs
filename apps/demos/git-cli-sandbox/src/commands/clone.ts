@@ -85,11 +85,7 @@ const GITLINK = 0o160000;
 /**
  * Extract a tree to a directory
  */
-async function extractTree(
-  repository: History,
-  treeId: string,
-  dirPath: string,
-): Promise<void> {
+async function extractTree(repository: History, treeId: string, dirPath: string): Promise<void> {
   const tree = await repository.trees.load(treeId);
   if (!tree) return;
 
