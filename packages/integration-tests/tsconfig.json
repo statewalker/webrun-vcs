@@ -4,7 +4,8 @@
     "rootDir": "tests",
     "outDir": "dist",
     "declaration": false,
-    "declarationMap": false
+    "declarationMap": false,
+    "types": ["node"]
   },
   "include": ["tests/**/*.ts"]
 }

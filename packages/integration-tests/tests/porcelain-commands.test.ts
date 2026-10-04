@@ -15,7 +15,13 @@
 import { ChangeType, FastForwardMode, MergeStatus, MergeStrategy } from "@statewalker/vcs-commands";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { addFile, backends, createInitializedGitFromFactory, toArray } from "./test-helper.js";
+import {
+  addFile,
+  backends,
+  createInitializedGitFromFactory,
+  defined,
+  toArray,
+} from "./test-helper.js";
 
 describe.each(backends)("Porcelain Commands ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -172,7 +178,10 @@ describe.each(backends)("Porcelain Commands ($name backend)", ({ factory }) => {
       // Switch to feature and add commit
       await store.refs.setSymbolic("HEAD", "refs/heads/feature");
       const featureRef = await store.refs.resolve("refs/heads/feature");
-      const featureCommit = await store.commits.load(featureRef?.objectId ?? "");
+      const featureCommit = defined(
+        await store.commits.load(featureRef?.objectId ?? ""),
+        "feature commit",
+      );
       await store.staging.readTree(store.trees, featureCommit.tree);
 
       await addFile(store, "feature.txt", "feature content");

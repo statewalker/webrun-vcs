@@ -16,7 +16,7 @@
 import { FileMode } from "@statewalker/vcs-core";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { backends, testAuthor, toArray } from "./test-helper.js";
+import { backends, defined, testAuthor, toArray } from "./test-helper.js";
 
 describe.each(backends)("Internal Storage ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -261,7 +261,9 @@ describe.each(backends)("Internal Storage ($name backend)", ({ factory }) => {
       expect(subdirEntry).toBeDefined();
       expect(subdirEntry?.mode).toBe(FileMode.TREE);
 
-      const subEntries = await toArray(repository.trees.load(subdirEntry?.id));
+      const subEntries = await toArray(
+        repository.trees.load(defined(subdirEntry, "subdirectory entry").id),
+      );
       expect(subEntries.length).toBe(2);
     });
   });

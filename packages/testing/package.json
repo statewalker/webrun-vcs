@@ -2,6 +2,15 @@
   "name": "@statewalker/vcs-testing",
   "version": "0.1.1",
   "description": "Test utilities for StateWalker VCS",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "packages/testing"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/testing#readme",
   "private": true,
   "type": "module",
   "module": "./dist/index.js",

@@ -19,7 +19,7 @@ import {
 } from "@statewalker/vcs-commands";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
+import { addFile, backends, createInitializedGitFromFactory, defined } from "./test-helper.js";
 
 describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -157,7 +157,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await store.refs.resolve("refs/heads/main");
       if (mainRef?.objectId) {
-        const commit = await store.commits.load(mainRef.objectId);
+        const commit = defined(await store.commits.load(mainRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
 
@@ -211,7 +211,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/feature");
       const featureRef = await store.refs.resolve("refs/heads/feature");
       if (featureRef?.objectId) {
-        const commit = await store.commits.load(featureRef.objectId);
+        const commit = defined(await store.commits.load(featureRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
 
@@ -224,7 +224,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await store.refs.resolve("refs/heads/main");
       if (mainRef?.objectId) {
-        const commit = await store.commits.load(mainRef.objectId);
+        const commit = defined(await store.commits.load(mainRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
 
@@ -238,7 +238,10 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
 
       // Verify merge commit has two parents
       const headRef = await store.refs.resolve("HEAD");
-      const mergeCommit = await store.commits.load(headRef?.objectId ?? "");
+      const mergeCommit = defined(
+        await store.commits.load(headRef?.objectId ?? ""),
+        "merge commit",
+      );
       expect(mergeCommit.parents.length).toBe(2);
     });
   });
@@ -284,7 +287,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/their-branch");
       const theirRef = await store.refs.resolve("refs/heads/their-branch");
       if (theirRef?.objectId) {
-        const commit = await store.commits.load(theirRef.objectId);
+        const commit = defined(await store.commits.load(theirRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
       await addFile(store, "config.json", '{"theirs": true}');
@@ -295,7 +298,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await store.refs.resolve("refs/heads/main");
       if (mainRef?.objectId) {
-        const commit = await store.commits.load(mainRef.objectId);
+        const commit = defined(await store.commits.load(mainRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
 
@@ -322,7 +325,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/branch");
       const branchRef = await store.refs.resolve("refs/heads/branch");
       if (branchRef?.objectId) {
-        const commit = await store.commits.load(branchRef.objectId);
+        const commit = defined(await store.commits.load(branchRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
       await addFile(store, "file.txt", "theirs");
@@ -332,7 +335,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await store.refs.resolve("refs/heads/main");
       if (mainRef?.objectId) {
-        const commit = await store.commits.load(mainRef.objectId);
+        const commit = defined(await store.commits.load(mainRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
 
@@ -342,7 +345,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
         .setContentMergeStrategy(ContentMergeStrategy.OURS)
         .call();
 
-      expect([MergeStatus.MERGED, MergeStatus.CONFLICTED]).toContain(mergeResult.status);
+      expect([MergeStatus.MERGED, MergeStatus.CONFLICTING]).toContain(mergeResult.status);
     });
   });
 
@@ -369,7 +372,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/conflict-branch");
       const branchRef = await store.refs.resolve("refs/heads/conflict-branch");
       if (branchRef?.objectId) {
-        const commit = await store.commits.load(branchRef.objectId);
+        const commit = defined(await store.commits.load(branchRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
       await addFile(store, "conflict.txt", "their version of the file");
@@ -380,7 +383,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await store.refs.resolve("refs/heads/main");
       if (mainRef?.objectId) {
-        const commit = await store.commits.load(mainRef.objectId);
+        const commit = defined(await store.commits.load(mainRef.objectId), "commit");
         await store.staging.readTree(store.trees, commit.tree);
       }
 
@@ -443,7 +446,7 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       expect(rebasedCommit).not.toBe(branchCommit);
 
       // Verify it's based on main now
-      const rebased = await store.commits.load(rebasedCommit);
+      const rebased = defined(await store.commits.load(rebasedCommit), "rebased commit");
       expect(rebased.parents[0]).toBe(mainCommit);
     });
   });
