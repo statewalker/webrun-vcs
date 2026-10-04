@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-workspace",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Thin cross-axis orchestration (publish/update/checkpoint/restore) composing files-sync + vcs-working-tree + vcs-transport",
   "license": "MIT",
   "repository": {

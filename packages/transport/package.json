@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Git transport protocol implementation (fetch, push, clone over HTTP/WebSocket/WebRTC)",
   "license": "MIT",
   "repository": {

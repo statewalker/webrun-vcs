@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Core VCS interfaces, storage abstractions, and history management",
   "license": "MIT",
   "repository": {
