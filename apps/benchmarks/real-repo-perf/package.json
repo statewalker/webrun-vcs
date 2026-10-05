@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Real repository performance benchmarks - simulates realistic Git workflows",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/benchmarks/real-repo-perf"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/benchmarks/real-repo-perf#readme",
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit"

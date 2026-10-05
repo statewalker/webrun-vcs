@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Chunk-dedup transfer of real HuggingFace model bytes over our xet custom-transfer agent (loopback), plus the basic-LFS fallback",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/demos/xet-transfer-huggingface"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/demos/xet-transfer-huggingface#readme",
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit"

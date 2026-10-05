@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Git CLI sandbox using VCS porcelain API - clone, commit, branch, merge, push via HTTP",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/demos/git-cli-sandbox"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/demos/git-cli-sandbox#readme",
   "bin": {
     "vcs-git": "./dist/main.js"
   },

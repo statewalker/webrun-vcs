@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Delta compression algorithm benchmarks - measuring encoding/decoding performance",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/benchmarks/delta-compression"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/benchmarks/delta-compression#readme",
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit"

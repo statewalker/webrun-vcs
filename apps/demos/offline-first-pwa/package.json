@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Offline-first PWA with Git operations in the browser",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/demos/offline-first-pwa"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/demos/offline-first-pwa#readme",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

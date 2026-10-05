@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Download a real HuggingFace model's large object via the standard Git-LFS batch + basic transfer, verified by whole-file SHA-256",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/demos/lfs-download-huggingface"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/demos/lfs-download-huggingface#readme",
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit"

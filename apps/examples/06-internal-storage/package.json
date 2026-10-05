@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Low-level object and pack operations for application integration",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/examples/06-internal-storage"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/examples/06-internal-storage#readme",
   "scripts": {
     "start": "tsx src/main.ts",
     "step:01": "tsx src/main.ts --step=01",
