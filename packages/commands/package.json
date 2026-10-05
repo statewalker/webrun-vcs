@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-commands",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Git-like VCS commands (commit, checkout, merge, diff, log)",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

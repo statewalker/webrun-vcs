@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-workspace",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Thin cross-axis orchestration (publish/update/checkpoint/restore) composing files-sync + vcs-working-tree + vcs-transport",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

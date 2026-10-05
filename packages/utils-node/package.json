@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-utils-node",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Node.js-specific VCS utilities: native compression, file system adapters",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

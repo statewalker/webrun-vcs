@@ -1,5 +1,15 @@
 # @statewalker/vcs-transport-xet
 
+## 0.2.4
+
+### Patch Changes
+
+- Release of the changes since the last published version:
+  
+  - files changed: README.md
+- Updated dependencies
+  - @statewalker/vcs-transport-lfs@0.2.3
+
 ## 0.1.1
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-working-tree",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Git working-tree layer — index/staging, status, checkout, ignore, worktree, and merge/rebase operation state, over vcs-core",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
