@@ -251,12 +251,12 @@ Excerpt from a real `start` run. Blob and tree ids are stable across runs; commi
 
 | What | Where |
 | ---- | ----- |
-| `History` | [packages/core/src/history/history.ts](../../../packages/core/src/history/history.ts) |
-| `Blobs` | [packages/core/src/history/blobs/](../../../packages/core/src/history/blobs/) |
-| `Trees`, `TreeEntry` | [packages/core/src/history/trees/](../../../packages/core/src/history/trees/) |
-| `Commits`, `Commit` | [packages/core/src/history/commits/](../../../packages/core/src/history/commits/) |
-| `Tags`, `AnnotatedTag` | [packages/core/src/history/tags/](../../../packages/core/src/history/tags/) |
-| `Refs` | [packages/core/src/history/refs/](../../../packages/core/src/history/refs/) |
-| `ObjectType` | [packages/core/src/history/objects/object-types.ts](../../../packages/core/src/history/objects/object-types.ts) |
+| `History` | [packages/vcs-core/src/history/history.ts](../../../packages/vcs-core/src/history/history.ts) |
+| `Blobs` | [packages/vcs-core/src/history/blobs/](../../../packages/vcs-core/src/history/blobs/) |
+| `Trees`, `TreeEntry` | [packages/vcs-core/src/history/trees/](../../../packages/vcs-core/src/history/trees/) |
+| `Commits`, `Commit` | [packages/vcs-core/src/history/commits/](../../../packages/vcs-core/src/history/commits/) |
+| `Tags`, `AnnotatedTag` | [packages/vcs-core/src/history/tags/](../../../packages/vcs-core/src/history/tags/) |
+| `Refs` | [packages/vcs-core/src/history/refs/](../../../packages/vcs-core/src/history/refs/) |
+| `ObjectType` | [packages/vcs-core/src/history/objects/object-types.ts](../../../packages/vcs-core/src/history/objects/object-types.ts) |
 
 Previous: [01-quick-start](../01-quick-start/). Next: [04-branching-merging](../04-branching-merging/).

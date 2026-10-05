@@ -155,11 +155,11 @@ Quick Start completed successfully!
 
 | What | Where |
 | ---- | ----- |
-| `History` interface | [packages/core/src/history/history.ts](../../../packages/core/src/history/history.ts) |
-| `createMemoryHistory()` | [packages/core/src/history/create-history.ts](../../../packages/core/src/history/create-history.ts) |
-| `Blobs` | [packages/core/src/history/blobs/](../../../packages/core/src/history/blobs/) |
-| `Trees` | [packages/core/src/history/trees/](../../../packages/core/src/history/trees/) |
-| `Commits` | [packages/core/src/history/commits/](../../../packages/core/src/history/commits/) |
-| `Refs` | [packages/core/src/history/refs/](../../../packages/core/src/history/refs/) |
+| `History` interface | [packages/vcs-core/src/history/history.ts](../../../packages/vcs-core/src/history/history.ts) |
+| `createMemoryHistory()` | [packages/vcs-core/src/history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) |
+| `Blobs` | [packages/vcs-core/src/history/blobs/](../../../packages/vcs-core/src/history/blobs/) |
+| `Trees` | [packages/vcs-core/src/history/trees/](../../../packages/vcs-core/src/history/trees/) |
+| `Commits` | [packages/vcs-core/src/history/commits/](../../../packages/vcs-core/src/history/commits/) |
+| `Refs` | [packages/vcs-core/src/history/refs/](../../../packages/vcs-core/src/history/refs/) |
 
 Next: [02-porcelain-commands](../02-porcelain-commands/) for the high-level commands API, [03-object-model](../03-object-model/) for a closer look at each object type.

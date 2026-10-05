@@ -2,49 +2,49 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "paths": {
-      "@statewalker/vcs-commands": ["packages/commands/src"],
-      "@statewalker/vcs-commands/*": ["packages/commands/src/*"],
-      "@statewalker/vcs-core": ["packages/core/src"],
-      "@statewalker/vcs-core/*": ["packages/core/src/*"],
-      "@statewalker/vcs-store-kv": ["packages/store-kv/src"],
-      "@statewalker/vcs-store-kv/*": ["packages/store-kv/src/*"],
-      "@statewalker/vcs-store-mem": ["packages/store-mem/src"],
-      "@statewalker/vcs-store-mem/*": ["packages/store-mem/src/*"],
-      "@statewalker/vcs-store-sql": ["packages/store-sql/src"],
-      "@statewalker/vcs-store-sql/*": ["packages/store-sql/src/*"],
-      "@statewalker/vcs-testing": ["packages/testing/src"],
-      "@statewalker/vcs-testing/*": ["packages/testing/src/*"],
-      "@statewalker/vcs-transport": ["packages/transport/src"],
-      "@statewalker/vcs-transport/*": ["packages/transport/src/*"],
-      "@statewalker/vcs-utils": ["packages/utils/src"],
-      "@statewalker/vcs-utils/*": ["packages/utils/src/*"]
+      "@statewalker/vcs-commands": ["packages/vcs-commands/src"],
+      "@statewalker/vcs-commands/*": ["packages/vcs-commands/src/*"],
+      "@statewalker/vcs-core": ["packages/vcs-core/src"],
+      "@statewalker/vcs-core/*": ["packages/vcs-core/src/*"],
+      "@statewalker/vcs-store-kv": ["packages/vcs-store-kv/src"],
+      "@statewalker/vcs-store-kv/*": ["packages/vcs-store-kv/src/*"],
+      "@statewalker/vcs-store-mem": ["packages/vcs-store-mem/src"],
+      "@statewalker/vcs-store-mem/*": ["packages/vcs-store-mem/src/*"],
+      "@statewalker/vcs-store-sql": ["packages/vcs-store-sql/src"],
+      "@statewalker/vcs-store-sql/*": ["packages/vcs-store-sql/src/*"],
+      "@statewalker/vcs-testing": ["packages/vcs-testing/src"],
+      "@statewalker/vcs-testing/*": ["packages/vcs-testing/src/*"],
+      "@statewalker/vcs-transport": ["packages/vcs-transport/src"],
+      "@statewalker/vcs-transport/*": ["packages/vcs-transport/src/*"],
+      "@statewalker/vcs-utils": ["packages/vcs-utils/src"],
+      "@statewalker/vcs-utils/*": ["packages/vcs-utils/src/*"]
     }
   },
   "include": [],
   "references": [
     {
-      "path": "packages/utils"
+      "path": "packages/vcs-utils"
     },
     {
-      "path": "packages/core"
+      "path": "packages/vcs-core"
     },
     {
-      "path": "packages/transport"
+      "path": "packages/vcs-transport"
     },
     {
-      "path": "packages/testing"
+      "path": "packages/vcs-testing"
     },
     {
-      "path": "packages/store-kv"
+      "path": "packages/vcs-store-kv"
     },
     {
-      "path": "packages/store-mem"
+      "path": "packages/vcs-store-mem"
     },
     {
-      "path": "packages/store-sql"
+      "path": "packages/vcs-store-sql"
     },
     {
-      "path": "packages/commands"
+      "path": "packages/vcs-commands"
     }
   ]
 }

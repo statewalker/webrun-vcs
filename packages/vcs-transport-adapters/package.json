@@ -1,0 +1,53 @@
+{
+  "name": "@statewalker/vcs-transport-adapters",
+  "version": "0.3.3",
+  "description": "Transport adapters bridging VCS core interfaces to transport layer",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/vcs-transport-adapters#readme",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "packages/vcs-transport-adapters"
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
+    "test": "vitest run",
+    "lint": "biome lint src tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@statewalker/webrun-storage": "catalog:",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^"
+  },
+  "devDependencies": {
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/webrun-files-mem": "catalog:",
+    "rolldown": "catalog:",
+    "vitest": "catalog:",
+    "typescript": "catalog:",
+    "@types/node": "catalog:"
+  }
+}

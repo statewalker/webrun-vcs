@@ -1,0 +1,66 @@
+{
+  "name": "@statewalker/vcs-store-sql",
+  "version": "0.3.2",
+  "description": "SQL-based storage backend for StateWalker VCS",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/vcs-store-sql#readme",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "packages/vcs-store-sql"
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapters/sql-js": {
+      "source": "./src/adapters/sql-js-adapter.ts",
+      "types": "./dist/adapters/sql-js-adapter.d.ts",
+      "import": "./dist/adapters/sql-js-adapter.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
+    "test": "vitest run",
+    "lint": "biome lint src tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
+  },
+  "devDependencies": {
+    "@statewalker/vcs-testing": "workspace:^",
+    "sql.js": "catalog:",
+    "@types/sql.js": "catalog:",
+    "rolldown": "catalog:",
+    "vitest": "catalog:",
+    "typescript": "catalog:",
+    "@types/node": "catalog:"
+  },
+  "peerDependencies": {
+    "sql.js": "catalog:peers"
+  },
+  "peerDependenciesMeta": {
+    "sql.js": {
+      "optional": true
+    }
+  }
+}

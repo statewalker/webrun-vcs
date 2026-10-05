@@ -1,0 +1,62 @@
+{
+  "name": "@statewalker/vcs-transport",
+  "version": "0.3.2",
+  "description": "Git transport protocol implementation (fetch, push, clone over HTTP/WebSocket/WebRTC)",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/vcs-transport#readme",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "packages/vcs-transport"
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./protocol": {
+      "source": "./src/protocol/index.ts",
+      "types": "./dist/protocol/index.d.ts",
+      "import": "./dist/protocol/index.js"
+    },
+    "./operations": {
+      "source": "./src/operations/index.ts",
+      "types": "./dist/operations/index.d.ts",
+      "import": "./dist/operations/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
+    "test": "vitest run",
+    "test:bench": "vitest run --config vitest.bench.config.ts",
+    "lint": "biome lint src tests tests-bench",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/webrun-http-streams": "catalog:",
+    "@statewalker/webrun-streams": "catalog:"
+  },
+  "devDependencies": {
+    "rolldown": "catalog:",
+    "vitest": "catalog:",
+    "typescript": "catalog:",
+    "@types/node": "catalog:"
+  }
+}

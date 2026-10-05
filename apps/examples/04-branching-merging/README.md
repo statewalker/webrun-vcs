@@ -280,13 +280,13 @@ Excerpt from a real `start` run (ids differ on every run):
 
 | What | Where |
 | ---- | ----- |
-| `Git` facade | [packages/commands/src/git.ts](../../../packages/commands/src/git.ts) |
-| Branch commands | [packages/commands/src/commands/branch-command.ts](../../../packages/commands/src/commands/branch-command.ts) |
-| `MergeCommand` | [packages/commands/src/commands/merge-command.ts](../../../packages/commands/src/commands/merge-command.ts) |
-| `RebaseCommand` | [packages/commands/src/commands/rebase-command.ts](../../../packages/commands/src/commands/rebase-command.ts) |
-| `MergeResult`, `MergeStatus`, `MergeStrategy`, `ContentMergeStrategy`, `FastForwardMode` | [packages/commands/src/results/merge-result.ts](../../../packages/commands/src/results/merge-result.ts) |
-| `Refs`, `isSymbolicRef` | [packages/core/src/history/refs/](../../../packages/core/src/history/refs/) |
-| `WorkingCopy` | [packages/working-tree/src/working-copy.ts](../../../packages/working-tree/src/working-copy.ts) |
-| Staging | [packages/working-tree/src/staging/](../../../packages/working-tree/src/staging/) |
+| `Git` facade | [packages/vcs-commands/src/git.ts](../../../packages/vcs-commands/src/git.ts) |
+| Branch commands | [packages/vcs-commands/src/commands/branch-command.ts](../../../packages/vcs-commands/src/commands/branch-command.ts) |
+| `MergeCommand` | [packages/vcs-commands/src/commands/merge-command.ts](../../../packages/vcs-commands/src/commands/merge-command.ts) |
+| `RebaseCommand` | [packages/vcs-commands/src/commands/rebase-command.ts](../../../packages/vcs-commands/src/commands/rebase-command.ts) |
+| `MergeResult`, `MergeStatus`, `MergeStrategy`, `ContentMergeStrategy`, `FastForwardMode` | [packages/vcs-commands/src/results/merge-result.ts](../../../packages/vcs-commands/src/results/merge-result.ts) |
+| `Refs`, `isSymbolicRef` | [packages/vcs-core/src/history/refs/](../../../packages/vcs-core/src/history/refs/) |
+| `WorkingCopy` | [packages/vcs-working-tree/src/working-copy.ts](../../../packages/vcs-working-tree/src/working-copy.ts) |
+| Staging | [packages/vcs-working-tree/src/staging/](../../../packages/vcs-working-tree/src/staging/) |
 
 Previous: [03-object-model](../03-object-model/). Next: [05-history-operations](../05-history-operations/), [07-staging-checkout](../07-staging-checkout/).

@@ -247,19 +247,19 @@ Refs are passed in independently of the object store. That is what makes pattern
 
 | Function / class | Location | Purpose |
 |------------------|----------|---------|
-| `createMemoryHistory()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | Zero-config in-memory `History` |
-| `createMemoryHistoryWithOperations()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | In-memory `HistoryWithOperations` |
-| `createHistoryFromComponents()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | `History` from a `GitObjectStore` and refs config |
-| `createHistoryFromStores()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | `History` from explicit stores |
-| `createGitFilesHistory()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | `HistoryWithOperations` over Git-files stores |
-| `History`, `HistoryWithOperations` | [history/history.ts](../../../packages/core/src/history/history.ts) | The interfaces |
-| `createGitObjectStore()` | [history/objects/object-store.impl.ts](../../../packages/core/src/history/objects/object-store.impl.ts) | Wrap a `RawStorage` as a Git object store |
-| `MemoryRawStorage` | [storage/raw/memory-raw-storage.ts](../../../packages/core/src/storage/raw/memory-raw-storage.ts) | In-memory `RawStorage` |
-| `createBlobs()` | [history/blobs/blobs.impl.ts](../../../packages/core/src/history/blobs/blobs.impl.ts) | Blob store factory |
-| `createTrees()` | [history/trees/trees.impl.ts](../../../packages/core/src/history/trees/trees.impl.ts) | Tree store factory |
-| `createCommits()` | [history/commits/commits.impl.ts](../../../packages/core/src/history/commits/commits.impl.ts) | Commit store factory |
-| `createTags()` | [history/tags/tags.impl.ts](../../../packages/core/src/history/tags/tags.impl.ts) | Tag store factory |
-| `createMemoryRefs()` | [history/refs/refs.impl.ts](../../../packages/core/src/history/refs/refs.impl.ts) | In-memory ref store |
+| `createMemoryHistory()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | Zero-config in-memory `History` |
+| `createMemoryHistoryWithOperations()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | In-memory `HistoryWithOperations` |
+| `createHistoryFromComponents()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | `History` from a `GitObjectStore` and refs config |
+| `createHistoryFromStores()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | `History` from explicit stores |
+| `createGitFilesHistory()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | `HistoryWithOperations` over Git-files stores |
+| `History`, `HistoryWithOperations` | [history/history.ts](../../../packages/vcs-core/src/history/history.ts) | The interfaces |
+| `createGitObjectStore()` | [history/objects/object-store.impl.ts](../../../packages/vcs-core/src/history/objects/object-store.impl.ts) | Wrap a `RawStorage` as a Git object store |
+| `MemoryRawStorage` | [storage/raw/memory-raw-storage.ts](../../../packages/vcs-core/src/storage/raw/memory-raw-storage.ts) | In-memory `RawStorage` |
+| `createBlobs()` | [history/blobs/blobs.impl.ts](../../../packages/vcs-core/src/history/blobs/blobs.impl.ts) | Blob store factory |
+| `createTrees()` | [history/trees/trees.impl.ts](../../../packages/vcs-core/src/history/trees/trees.impl.ts) | Tree store factory |
+| `createCommits()` | [history/commits/commits.impl.ts](../../../packages/vcs-core/src/history/commits/commits.impl.ts) | Commit store factory |
+| `createTags()` | [history/tags/tags.impl.ts](../../../packages/vcs-core/src/history/tags/tags.impl.ts) | Tag store factory |
+| `createMemoryRefs()` | [history/refs/refs.impl.ts](../../../packages/vcs-core/src/history/refs/refs.impl.ts) | In-memory ref store |
 
 ### Related examples
 

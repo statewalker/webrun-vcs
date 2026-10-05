@@ -100,5 +100,5 @@ Edit the constants in `src/main.ts`: `sizes` (bytes) and `mutationRates` (0 to 1
 ### Files
 
 - `src/main.ts`: content generation, benchmark loop, table and summary
-- [packages/utils/src/diff/delta/](../../../packages/utils/src/diff/delta/): the delta algorithm and formats being measured
-- [packages/utils/tests/diff/performance/](../../../packages/utils/tests/diff/performance/): performance tests for the same functions
+- [packages/vcs-utils/src/diff/delta/](../../../packages/vcs-utils/src/diff/delta/): the delta algorithm and formats being measured
+- [packages/vcs-utils/tests/diff/performance/](../../../packages/vcs-utils/tests/diff/performance/): performance tests for the same functions
