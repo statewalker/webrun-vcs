@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport-adapters",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Transport adapters bridging VCS core interfaces to transport layer",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

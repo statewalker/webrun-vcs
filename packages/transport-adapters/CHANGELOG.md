@@ -1,5 +1,19 @@
 # @statewalker/vcs-transport-adapters
 
+## 0.3.3
+
+### Patch Changes
+
+- Release of the changes since the last published version:
+  
+  - files changed: README.md
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+  - @statewalker/vcs-core@0.3.3
+  - @statewalker/vcs-transport@0.3.2
+  - @statewalker/vcs-utils@0.3.2
+
 ## 0.1.1
 
 ### Patch Changes
