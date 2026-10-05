@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-sql",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "SQL-based storage backend for StateWalker VCS",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

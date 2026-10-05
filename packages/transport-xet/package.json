@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport-xet",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Git LFS custom transfer agent (Xet) — chunk-dedup transfer via content-transfer, falls back to basic LFS",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-core",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Core VCS interfaces, storage abstractions, and history management",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
