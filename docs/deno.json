@@ -1,7 +1,0 @@
-{
-  "tasks": {
-    "dev": "deno run -A npm:@observablehq/framework preview",
-    "build": "deno run -A npm:@observablehq/framework build",
-    "start": "deno run build && deno run --allow-net --allow-read --allow-sys jsr:@std/http/file-server ./dist"
-  }
-}
