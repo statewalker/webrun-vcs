@@ -5,6 +5,7 @@
  */
 
 import type { Credentials } from "../api/credentials.js";
+import { parseBufferedAdvertisement } from "../protocol/advertisement-parser.js";
 
 /**
  * Options for ls-remote operation.
@@ -97,8 +98,9 @@ export async function lsRemote(
     // Read response body
     const data = new Uint8Array(await response.arrayBuffer());
 
-    // Parse ref advertisement
-    return parseRefAdvertisement(data);
+    // Parse the pkt-line advertisement. Splitting on newlines does not work: a flush packet
+    // (0000) carries none, so it would be read as part of the next ref's line.
+    return (await parseBufferedAdvertisement(data)).refs;
   } catch (error) {
     if (timeoutId) clearTimeout(timeoutId);
 
@@ -110,58 +112,4 @@ export async function lsRemote(
     }
     throw new Error(String(error));
   }
-}
-
-/**
- * Parse ref advertisement from HTTP response.
- *
- * Handles Git smart HTTP protocol format:
- * - Service announcement line
- * - Pkt-line formatted refs (4-byte hex length prefix)
- * - First ref includes capabilities after null byte
- */
-function parseRefAdvertisement(data: Uint8Array): Map<string, string> {
-  const refs = new Map<string, string>();
-  const textDecoder = new TextDecoder();
-  const text = textDecoder.decode(data);
-  const lines = text.split("\n");
-
-  for (const line of lines) {
-    // Skip empty lines
-    if (!line.trim()) continue;
-
-    // Skip flush packets (0000) and delim packets (0001)
-    if (line.trim() === "0000" || line.trim() === "0001") {
-      continue;
-    }
-
-    // Skip service announcement
-    if (line.includes("# service=")) {
-      continue;
-    }
-
-    // Extract content (remove pkt-line length prefix if present)
-    let content = line;
-    if (/^[0-9a-f]{4}/.test(content)) {
-      content = content.slice(4);
-    }
-
-    // Parse ref line: "OID refname\0capabilities" or "OID refname"
-    const nullIndex = content.indexOf("\0");
-    const refPart = nullIndex >= 0 ? content.slice(0, nullIndex) : content;
-
-    // Parse ref: "OID refname"
-    const spaceIndex = refPart.indexOf(" ");
-    if (spaceIndex > 0) {
-      const oid = refPart.slice(0, spaceIndex);
-      const refName = refPart.slice(spaceIndex + 1).trim();
-
-      // Skip capabilities^{} pseudo-ref and peeled refs
-      if (!refName.endsWith("^{}") && !refName.startsWith("capabilities") && refName.length > 0) {
-        refs.set(refName, oid);
-      }
-    }
-  }
-
-  return refs;
 }

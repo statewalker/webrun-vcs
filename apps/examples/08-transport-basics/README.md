@@ -57,7 +57,7 @@ for (const [name, id] of refs) {
 Output of the run (GitHub advertises every pull request as `refs/pull/<n>/head` and `refs/pull/<n>/merge`, so the list is long):
 
 ```
-Found 3732 refs:
+Found 3734 refs:
 
 Branches:
   master                         7fd1a60b
@@ -65,7 +65,7 @@ Branches:
   test                           b3cbd5bb
 
 Other:
-  HEAD                           015b7fd1
+  HEAD                           7fd1a60b
   refs/pull/1/head               7044a8a0
   ...
 ```
@@ -132,9 +132,9 @@ Output of the run:
 ```
 Clone complete:
   Default branch: refs/heads/master
-  Refs fetched: 3732
-  Pack size: 0 B
-  Bytes received: 8 B
+  Refs fetched: 3734
+  Pack size: 20.08 MB
+  Bytes received: 20.09 MB
   Empty: false
 ```
 
@@ -186,11 +186,9 @@ The client speaks the Git smart-HTTP protocol to the server's upload-pack servic
 
 - **No network, no results.** Offline, every operation prints `[!] <name> failed: <message>` followed by `(This may be a network or transport layer issue)`, the run ends with `Example finished with 0/5 operations successful.`, and the exit code is still 0. Behind a proxy, `globalThis.fetch` must be able to reach github.com.
 - **A missing repository looks like an auth failure.** GitHub answers 401 for repositories that do not exist, so `lsRemote()` throws `HTTP error 401: Unauthorized`, not 404. Other HTTP failures throw `HTTP error <status>: <statusText>`; a `timeout` throws `Request timeout`.
-- **The output is about 15,000 lines.** The 3732 refs (mostly `refs/pull/*`) are printed four times: grouped, in full, after clone and after fetch.
-- **`lsRemote()` reports a wrong id for `HEAD`.** The run prints `HEAD 015b7fd1` while `refs/heads/master` is `7fd1a60b`, and `clone()` reports `HEAD 7fd1a60b`. The advertisement parser misreads the first ref line when the flush packet after the service line is not followed by a newline: it strips the `0000` and keeps the next pkt-line's length prefix (`015b`) as the start of the id.
-- **Clone and fetch report success with an empty pack.** Against GitHub both return `Pack size: 0 B` and `Bytes received: 8 B`, while the run ends with `Example complete! All transport operations succeeded.` Check `packData.length`, not only the absence of an exception.
+- **The output is about 15,000 lines, and the pack is about 20 MB.** The 3734 refs (mostly `refs/pull/*`) are printed four times: grouped, in full, after clone and after fetch. `clone()` and `fetch()` want every advertised ref, pull-request refs included, so each downloads the objects of all of them.
 - **The progress callbacks never fire.** The client sends the `no-progress` capability in its first `want` line, so the server sends no progress messages and `onProgress` / `onProgressMessage` print nothing.
-- **Refspecs do not filter the returned refs.** With refspecs for `refs/heads/*` and `refs/tags/*`, `fetch()` still returns all 3732 refs under their remote names (`refs/heads/master`, `refs/pull/...`), not mapped to `refs/remotes/origin/*`.
+- **Refspecs do not filter the returned refs.** With refspecs for `refs/heads/*` and `refs/tags/*`, `fetch()` still returns all 3734 refs under their remote names (`refs/heads/master`, `refs/pull/...`), not mapped to `refs/remotes/origin/*`.
 - **The banner mentions push.** The banner reads "Clone, fetch, and push operations", but the example does not push.
 
 ## Reference
