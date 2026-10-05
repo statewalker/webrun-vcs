@@ -31,22 +31,22 @@ demos and benchmarks under `apps/`, and a documentation site under `docs/`.
 
 | Package | What it does | npm |
 | --- | --- | --- |
-| [`@statewalker/vcs-core`](packages/core) | Git object model (blobs, trees, commits, tags), refs, pack files, `History`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-core) |
-| [`@statewalker/vcs-working-tree`](packages/working-tree) | Index/staging, checkout, worktree, status, ignore rules, merge/rebase state, `WorkingCopy`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-working-tree) |
-| [`@statewalker/vcs-commands`](packages/commands) | Porcelain `Git` API: add, commit, branch, merge, rebase, stash, fetch, push, clone, ... | [npm](https://www.npmjs.com/package/@statewalker/vcs-commands) |
-| [`@statewalker/vcs-transport`](packages/transport) | Git protocol client and server over a duplex stream or HTTP. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport) |
-| [`@statewalker/vcs-transport-adapters`](packages/transport-adapters) | Connects `History` and storage to the transport's repository interfaces. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-adapters) |
-| [`@statewalker/vcs-transport-lfs`](packages/transport-lfs) | Git LFS batch protocol with `basic` whole-object transfer. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-lfs) |
-| [`@statewalker/vcs-transport-xet`](packages/transport-xet) | Git LFS `xet` transfer: sends only missing chunks, falls back to `basic`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-xet) |
-| [`@statewalker/vcs-store-files`](packages/store-files) | Git `.git` layout over a `FilesApi`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-files) |
-| [`@statewalker/vcs-store-mem`](packages/store-mem) | In-memory storage. | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-mem) |
-| [`@statewalker/vcs-store-sql`](packages/store-sql) | SQL storage; sql.js adapter included (peer: `sql.js`). | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-sql) |
-| [`@statewalker/vcs-store-kv`](packages/store-kv) | Storage over a key-value store (IndexedDB, LocalStorage and similar). | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-kv) |
-| [`@statewalker/vcs-workspace`](packages/workspace) | Publish, update, checkpoint and restore: file sync combined with Git history. | [npm](https://www.npmjs.com/package/@statewalker/vcs-workspace) |
-| [`@statewalker/vcs-utils`](packages/utils) | SHA-1, CRC32, compression, text/binary diff, delta encoding, streams. | [npm](https://www.npmjs.com/package/@statewalker/vcs-utils) |
-| [`@statewalker/vcs-utils-node`](packages/utils-node) | Node.js native compression and file adapters. | [npm](https://www.npmjs.com/package/@statewalker/vcs-utils-node) |
-| [`@statewalker/vcs-testing`](packages/testing) | Shared test suites for storage backends. Private. | |
-| [`@statewalker/vcs-integration-tests`](packages/integration-tests) | Cross-package tests built from the example apps. Private. | |
+| [`@statewalker/vcs-core`](packages/vcs-core) | Git object model (blobs, trees, commits, tags), refs, pack files, `History`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-core) |
+| [`@statewalker/vcs-working-tree`](packages/vcs-working-tree) | Index/staging, checkout, worktree, status, ignore rules, merge/rebase state, `WorkingCopy`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-working-tree) |
+| [`@statewalker/vcs-commands`](packages/vcs-commands) | Porcelain `Git` API: add, commit, branch, merge, rebase, stash, fetch, push, clone, ... | [npm](https://www.npmjs.com/package/@statewalker/vcs-commands) |
+| [`@statewalker/vcs-transport`](packages/vcs-transport) | Git protocol client and server over a duplex stream or HTTP. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport) |
+| [`@statewalker/vcs-transport-adapters`](packages/vcs-transport-adapters) | Connects `History` and storage to the transport's repository interfaces. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-adapters) |
+| [`@statewalker/vcs-transport-lfs`](packages/vcs-transport-lfs) | Git LFS batch protocol with `basic` whole-object transfer. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-lfs) |
+| [`@statewalker/vcs-transport-xet`](packages/vcs-transport-xet) | Git LFS `xet` transfer: sends only missing chunks, falls back to `basic`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-xet) |
+| [`@statewalker/vcs-store-files`](packages/vcs-store-files) | Git `.git` layout over a `FilesApi`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-files) |
+| [`@statewalker/vcs-store-mem`](packages/vcs-store-mem) | In-memory storage. | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-mem) |
+| [`@statewalker/vcs-store-sql`](packages/vcs-store-sql) | SQL storage; sql.js adapter included (peer: `sql.js`). | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-sql) |
+| [`@statewalker/vcs-store-kv`](packages/vcs-store-kv) | Storage over a key-value store (IndexedDB, LocalStorage and similar). | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-kv) |
+| [`@statewalker/vcs-workspace`](packages/vcs-workspace) | Publish, update, checkpoint and restore: file sync combined with Git history. | [npm](https://www.npmjs.com/package/@statewalker/vcs-workspace) |
+| [`@statewalker/vcs-utils`](packages/vcs-utils) | SHA-1, CRC32, compression, text/binary diff, delta encoding, streams. | [npm](https://www.npmjs.com/package/@statewalker/vcs-utils) |
+| [`@statewalker/vcs-utils-node`](packages/vcs-utils-node) | Node.js native compression and file adapters. | [npm](https://www.npmjs.com/package/@statewalker/vcs-utils-node) |
+| [`@statewalker/vcs-testing`](packages/vcs-testing) | Shared test suites for storage backends. Private. | |
+| [`@statewalker/vcs-integration-tests`](packages/vcs-integration-tests) | Cross-package tests built from the example apps. Private. | |
 
 Public packages ship built ESM and `.d.ts` files in `dist/` (what `exports` points at) and their
 TypeScript sources in `src/`. Other `@statewalker/*` dependencies (`webrun-files*`,

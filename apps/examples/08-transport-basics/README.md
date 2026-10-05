@@ -213,14 +213,14 @@ The client speaks the Git smart-HTTP protocol to the server's upload-pack servic
 
 | API | Location |
 |-----|----------|
-| `lsRemote`, `LsRemoteOptions` | [packages/transport/src/operations/ls-remote.ts](../../../packages/transport/src/operations/ls-remote.ts) |
-| `clone`, `CloneOptions`, `CloneResult` | [packages/transport/src/operations/clone.ts](../../../packages/transport/src/operations/clone.ts) |
-| `fetch`, `FetchOptions` | [packages/transport/src/operations/fetch.ts](../../../packages/transport/src/operations/fetch.ts) |
-| `BaseHttpOptions`, `BaseFetchOptions` | [packages/transport/src/api/options.ts](../../../packages/transport/src/api/options.ts) |
-| `RawFetchResult` | [packages/transport/src/api/fetch-result.ts](../../../packages/transport/src/api/fetch-result.ts) |
-| `ProgressInfo`, `RefSpec` | [packages/transport/src/protocol/types.ts](../../../packages/transport/src/protocol/types.ts) |
-| Refspec parsing | [packages/transport/src/utils/refspec.ts](../../../packages/transport/src/utils/refspec.ts) |
-| `bytesToHex` | [packages/utils/src/hash/utils/index.ts](../../../packages/utils/src/hash/utils/index.ts) |
+| `lsRemote`, `LsRemoteOptions` | [packages/vcs-transport/src/operations/ls-remote.ts](../../../packages/vcs-transport/src/operations/ls-remote.ts) |
+| `clone`, `CloneOptions`, `CloneResult` | [packages/vcs-transport/src/operations/clone.ts](../../../packages/vcs-transport/src/operations/clone.ts) |
+| `fetch`, `FetchOptions` | [packages/vcs-transport/src/operations/fetch.ts](../../../packages/vcs-transport/src/operations/fetch.ts) |
+| `BaseHttpOptions`, `BaseFetchOptions` | [packages/vcs-transport/src/api/options.ts](../../../packages/vcs-transport/src/api/options.ts) |
+| `RawFetchResult` | [packages/vcs-transport/src/api/fetch-result.ts](../../../packages/vcs-transport/src/api/fetch-result.ts) |
+| `ProgressInfo`, `RefSpec` | [packages/vcs-transport/src/protocol/types.ts](../../../packages/vcs-transport/src/protocol/types.ts) |
+| Refspec parsing | [packages/vcs-transport/src/utils/refspec.ts](../../../packages/vcs-transport/src/utils/refspec.ts) |
+| `bytesToHex` | [packages/vcs-utils/src/hash/utils/index.ts](../../../packages/vcs-utils/src/hash/utils/index.ts) |
 
 ### Related examples
 

@@ -263,15 +263,15 @@ The walk goes newest to oldest, so this loop records the newest commit of each r
 
 | API | Location |
 |-----|----------|
-| `Git` | [packages/commands/src/git.ts](../../../packages/commands/src/git.ts) |
-| `LogCommand` | [packages/commands/src/commands/log-command.ts](../../../packages/commands/src/commands/log-command.ts) |
-| `DiffCommand`, `formatDiffEntry` | [packages/commands/src/commands/diff-command.ts](../../../packages/commands/src/commands/diff-command.ts) |
-| `BlameCommand`, `BlameResult` | [packages/commands/src/commands/blame-command.ts](../../../packages/commands/src/commands/blame-command.ts) |
-| `DiffEntry`, `ChangeType` | [packages/commands/src/results/diff-entry.ts](../../../packages/commands/src/results/diff-entry.ts) |
-| `Commits` (ancestry, merge base) | [packages/core/src/history/commits/](../../../packages/core/src/history/commits/) |
-| `Trees` | [packages/core/src/history/trees/](../../../packages/core/src/history/trees/) |
-| `Blobs` | [packages/core/src/history/blobs/](../../../packages/core/src/history/blobs/) |
-| `Refs` | [packages/core/src/history/refs/](../../../packages/core/src/history/refs/) |
+| `Git` | [packages/vcs-commands/src/git.ts](../../../packages/vcs-commands/src/git.ts) |
+| `LogCommand` | [packages/vcs-commands/src/commands/log-command.ts](../../../packages/vcs-commands/src/commands/log-command.ts) |
+| `DiffCommand`, `formatDiffEntry` | [packages/vcs-commands/src/commands/diff-command.ts](../../../packages/vcs-commands/src/commands/diff-command.ts) |
+| `BlameCommand`, `BlameResult` | [packages/vcs-commands/src/commands/blame-command.ts](../../../packages/vcs-commands/src/commands/blame-command.ts) |
+| `DiffEntry`, `ChangeType` | [packages/vcs-commands/src/results/diff-entry.ts](../../../packages/vcs-commands/src/results/diff-entry.ts) |
+| `Commits` (ancestry, merge base) | [packages/vcs-core/src/history/commits/](../../../packages/vcs-core/src/history/commits/) |
+| `Trees` | [packages/vcs-core/src/history/trees/](../../../packages/vcs-core/src/history/trees/) |
+| `Blobs` | [packages/vcs-core/src/history/blobs/](../../../packages/vcs-core/src/history/blobs/) |
+| `Refs` | [packages/vcs-core/src/history/refs/](../../../packages/vcs-core/src/history/refs/) |
 
 ### Related examples
 

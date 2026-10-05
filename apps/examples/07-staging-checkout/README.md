@@ -331,18 +331,18 @@ During a merge conflict one path can have up to three entries at different stage
 
 | API | Location |
 |-----|----------|
-| `Staging`, `IndexEditor`, `IndexBuilder` | [packages/working-tree/src/staging/staging.ts](../../../packages/working-tree/src/staging/staging.ts) |
-| `StagingEntry`, `MergeStage` | [packages/working-tree/src/staging/types.ts](../../../packages/working-tree/src/staging/types.ts) |
-| `Checkout` | [packages/working-tree/src/checkout/checkout.ts](../../../packages/working-tree/src/checkout/checkout.ts) |
-| `WorkingCopy` | [packages/working-tree/src/working-copy.ts](../../../packages/working-tree/src/working-copy.ts) |
-| `Refs` | [packages/core/src/history/refs/refs.ts](../../../packages/core/src/history/refs/refs.ts) |
-| `AddCommand` | [packages/commands/src/commands/add-command.ts](../../../packages/commands/src/commands/add-command.ts) |
-| `StatusCommand` | [packages/commands/src/commands/status-command.ts](../../../packages/commands/src/commands/status-command.ts) |
-| `Status` | [packages/commands/src/results/status-result.ts](../../../packages/commands/src/results/status-result.ts) |
-| `CheckoutCommand` | [packages/commands/src/commands/checkout-command.ts](../../../packages/commands/src/commands/checkout-command.ts) |
-| `ResetCommand` | [packages/commands/src/commands/reset-command.ts](../../../packages/commands/src/commands/reset-command.ts) |
-| `ResetMode` | [packages/commands/src/types.ts](../../../packages/commands/src/types.ts) |
-| `CleanCommand` | [packages/commands/src/commands/clean-command.ts](../../../packages/commands/src/commands/clean-command.ts) |
+| `Staging`, `IndexEditor`, `IndexBuilder` | [packages/vcs-working-tree/src/staging/staging.ts](../../../packages/vcs-working-tree/src/staging/staging.ts) |
+| `StagingEntry`, `MergeStage` | [packages/vcs-working-tree/src/staging/types.ts](../../../packages/vcs-working-tree/src/staging/types.ts) |
+| `Checkout` | [packages/vcs-working-tree/src/checkout/checkout.ts](../../../packages/vcs-working-tree/src/checkout/checkout.ts) |
+| `WorkingCopy` | [packages/vcs-working-tree/src/working-copy.ts](../../../packages/vcs-working-tree/src/working-copy.ts) |
+| `Refs` | [packages/vcs-core/src/history/refs/refs.ts](../../../packages/vcs-core/src/history/refs/refs.ts) |
+| `AddCommand` | [packages/vcs-commands/src/commands/add-command.ts](../../../packages/vcs-commands/src/commands/add-command.ts) |
+| `StatusCommand` | [packages/vcs-commands/src/commands/status-command.ts](../../../packages/vcs-commands/src/commands/status-command.ts) |
+| `Status` | [packages/vcs-commands/src/results/status-result.ts](../../../packages/vcs-commands/src/results/status-result.ts) |
+| `CheckoutCommand` | [packages/vcs-commands/src/commands/checkout-command.ts](../../../packages/vcs-commands/src/commands/checkout-command.ts) |
+| `ResetCommand` | [packages/vcs-commands/src/commands/reset-command.ts](../../../packages/vcs-commands/src/commands/reset-command.ts) |
+| `ResetMode` | [packages/vcs-commands/src/types.ts](../../../packages/vcs-commands/src/types.ts) |
+| `CleanCommand` | [packages/vcs-commands/src/commands/clean-command.ts](../../../packages/vcs-commands/src/commands/clean-command.ts) |
 
 ### Related examples
 

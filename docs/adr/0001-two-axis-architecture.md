@@ -232,7 +232,7 @@ independently-contractable slice to build against a stable boundary.
 
 ### As implemented — divergences from the plan
 
-- **`vcs-transport-git` is the restructured `@statewalker/vcs-transport`** (`packages/transport`),
+- **`vcs-transport-git` is the restructured `@statewalker/vcs-transport`** (`packages/vcs-transport`),
   not a brand-new package: the existing v1 git protocol engine, now also running over a
   webrun-streams `Duplex` (`adapters/webrun/`) and over `webrun-http-streams`
   (`adapters/webrun-http/`), with **git protocol v2 wired** (client + server, validated against

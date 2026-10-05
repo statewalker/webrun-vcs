@@ -268,18 +268,18 @@ The delta algorithm in `@statewalker/vcs-utils/diff` has no knowledge of storage
 
 | Interface / function | Location | Purpose |
 |----------------------|----------|---------|
-| `DeltaApi` | [storage/delta/delta-api.ts](../../../packages/core/src/storage/delta/delta-api.ts) | Delta operations and batches |
-| `BlobDeltaApi` | [storage/delta/blob-delta-api.ts](../../../packages/core/src/storage/delta/blob-delta-api.ts) | Blob delta operations |
-| `DeltaEngine` | [storage/delta/delta-engine.ts](../../../packages/core/src/storage/delta/delta-engine.ts) | Delta computation engine |
-| `DeltaStore` | [storage/delta/delta-store.ts](../../../packages/core/src/storage/delta/delta-store.ts) | Delta relationship storage |
-| `DeltaIndex` | [storage/delta/delta-index.ts](../../../packages/core/src/storage/delta/delta-index.ts) | Delta lookup index |
-| `MemoryDeltaApi` | [backend/memory-storage-backend.ts](../../../packages/core/src/backend/memory-storage-backend.ts) | The memory backend's `DeltaApi` |
-| `Blobs` | [history/blobs/](../../../packages/core/src/history/blobs/) | Blob storage |
-| `Commits` | [history/commits/](../../../packages/core/src/history/commits/) | Commit storage |
-| `createDeltaRanges` | [diff/delta/create-delta-ranges.ts](../../../packages/utils/src/diff/delta/create-delta-ranges.ts) | Copy/insert ranges between buffers |
-| `createDelta` | [diff/delta/create-delta.ts](../../../packages/utils/src/diff/delta/create-delta.ts) | Delta instructions from ranges |
-| `applyDelta` | [diff/delta/apply-delta.ts](../../../packages/utils/src/diff/delta/apply-delta.ts) | Rebuild the target from base and instructions |
-| `Delta`, `DeltaRange` | [diff/delta/types.ts](../../../packages/utils/src/diff/delta/types.ts) | Instruction and range types |
+| `DeltaApi` | [storage/delta/delta-api.ts](../../../packages/vcs-core/src/storage/delta/delta-api.ts) | Delta operations and batches |
+| `BlobDeltaApi` | [storage/delta/blob-delta-api.ts](../../../packages/vcs-core/src/storage/delta/blob-delta-api.ts) | Blob delta operations |
+| `DeltaEngine` | [storage/delta/delta-engine.ts](../../../packages/vcs-core/src/storage/delta/delta-engine.ts) | Delta computation engine |
+| `DeltaStore` | [storage/delta/delta-store.ts](../../../packages/vcs-core/src/storage/delta/delta-store.ts) | Delta relationship storage |
+| `DeltaIndex` | [storage/delta/delta-index.ts](../../../packages/vcs-core/src/storage/delta/delta-index.ts) | Delta lookup index |
+| `MemoryDeltaApi` | [backend/memory-storage-backend.ts](../../../packages/vcs-core/src/backend/memory-storage-backend.ts) | The memory backend's `DeltaApi` |
+| `Blobs` | [history/blobs/](../../../packages/vcs-core/src/history/blobs/) | Blob storage |
+| `Commits` | [history/commits/](../../../packages/vcs-core/src/history/commits/) | Commit storage |
+| `createDeltaRanges` | [diff/delta/create-delta-ranges.ts](../../../packages/vcs-utils/src/diff/delta/create-delta-ranges.ts) | Copy/insert ranges between buffers |
+| `createDelta` | [diff/delta/create-delta.ts](../../../packages/vcs-utils/src/diff/delta/create-delta.ts) | Delta instructions from ranges |
+| `applyDelta` | [diff/delta/apply-delta.ts](../../../packages/vcs-utils/src/diff/delta/apply-delta.ts) | Rebuild the target from base and instructions |
+| `Delta`, `DeltaRange` | [diff/delta/types.ts](../../../packages/vcs-utils/src/diff/delta/types.ts) | Instruction and range types |
 
 ### Related examples
 

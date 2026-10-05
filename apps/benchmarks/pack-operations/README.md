@@ -104,8 +104,8 @@ Edit `configurations` in `src/main.ts` (name and list of object sizes). There ar
 ### Files and APIs
 
 - `src/main.ts`: object generation, benchmark loop, table and summary
-- `writePack`, `PackWriterObject`, `PackObjectType`: [packages/core/src/pack/pack-writer.ts](../../../packages/core/src/pack/pack-writer.ts), [types.ts](../../../packages/core/src/pack/types.ts)
-- `writePackIndex`: [packages/core/src/pack/pack-index-writer.ts](../../../packages/core/src/pack/pack-index-writer.ts)
-- `readPackIndex`: [packages/core/src/pack/pack-index-reader.ts](../../../packages/core/src/pack/pack-index-reader.ts)
+- `writePack`, `PackWriterObject`, `PackObjectType`: [packages/vcs-core/src/pack/pack-writer.ts](../../../packages/vcs-core/src/pack/pack-writer.ts), [types.ts](../../../packages/vcs-core/src/pack/types.ts)
+- `writePackIndex`: [packages/vcs-core/src/pack/pack-index-writer.ts](../../../packages/vcs-core/src/pack/pack-index-writer.ts)
+- `readPackIndex`: [packages/vcs-core/src/pack/pack-index-reader.ts](../../../packages/vcs-core/src/pack/pack-index-reader.ts)
 - `sha1`, `bytesToHex`: `@statewalker/vcs-utils/hash/sha1`, `@statewalker/vcs-utils/hash/utils`
 - [../delta-compression/](../delta-compression/): delta algorithm benchmark

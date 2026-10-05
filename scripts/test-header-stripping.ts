@@ -2,9 +2,9 @@
  * Test script to compare header stripping methods
  */
 
-import { createNodeCompression } from "../packages/utils/src/compression/compression-node/index.js";
-import { collect, setCompressionUtils } from "../packages/utils/src/index.js";
-import { newByteSplitter, readHeader } from "../packages/utils/src/streams/index.js";
+import { createNodeCompression } from "../packages/vcs-utils/src/compression/compression-node/index.js";
+import { collect, setCompressionUtils } from "../packages/vcs-utils/src/index.js";
+import { newByteSplitter, readHeader } from "../packages/vcs-utils/src/streams/index.js";
 
 // Initialize compression
 setCompressionUtils(createNodeCompression());

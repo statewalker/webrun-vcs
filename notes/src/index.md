@@ -51,7 +51,7 @@ Documentation and analysis for the WebRun VCS project.
 
 ### Non-backlog ready work:
 - `webrun-vcs-cpxdn` (P3, bug) - Fix typecheck failures in vcs-webrtc-sync demo
-- `webrun-vcs-mppz1` (P2, feature) - Create packages/store-files package (blocks 3 dependent tasks)
+- `webrun-vcs-mppz1` (P2, feature) - Create packages/vcs-store-files package (blocks 3 dependent tasks)
 - `webrun-vcs-s7fz2` (P3, task) - Evaluate alternative API design with lifecycle callbacks
 - `webrun-vcs-gvjs` (P3, task) - Deploy to production and monitor (requires human action)
 

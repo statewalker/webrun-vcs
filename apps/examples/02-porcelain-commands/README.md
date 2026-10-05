@@ -286,12 +286,12 @@ Merging 'branch-a' into 'main' (three-way)...
 
 | What | Where |
 | ---- | ----- |
-| `Git` facade | [packages/commands/src/git.ts](../../../packages/commands/src/git.ts) |
-| Command classes | [packages/commands/src/commands/](../../../packages/commands/src/commands/) |
-| `MergeStrategy`, `MergeStatus` | [packages/commands/src/results/merge-result.ts](../../../packages/commands/src/results/merge-result.ts) |
-| `DiffEntry`, `ChangeType` | [packages/commands/src/results/diff-entry.ts](../../../packages/commands/src/results/diff-entry.ts) |
-| Staging | [packages/working-tree/src/staging/](../../../packages/working-tree/src/staging/) |
-| Memory working copy | [packages/working-tree/src/working-copy/](../../../packages/working-tree/src/working-copy/) |
-| `History` | [packages/core/src/history/history.ts](../../../packages/core/src/history/history.ts) |
+| `Git` facade | [packages/vcs-commands/src/git.ts](../../../packages/vcs-commands/src/git.ts) |
+| Command classes | [packages/vcs-commands/src/commands/](../../../packages/vcs-commands/src/commands/) |
+| `MergeStrategy`, `MergeStatus` | [packages/vcs-commands/src/results/merge-result.ts](../../../packages/vcs-commands/src/results/merge-result.ts) |
+| `DiffEntry`, `ChangeType` | [packages/vcs-commands/src/results/diff-entry.ts](../../../packages/vcs-commands/src/results/diff-entry.ts) |
+| Staging | [packages/vcs-working-tree/src/staging/](../../../packages/vcs-working-tree/src/staging/) |
+| Memory working copy | [packages/vcs-working-tree/src/working-copy/](../../../packages/vcs-working-tree/src/working-copy/) |
+| `History` | [packages/vcs-core/src/history/history.ts](../../../packages/vcs-core/src/history/history.ts) |
 
 Previous: [01-quick-start](../01-quick-start/). Next: [03-object-model](../03-object-model/), [04-branching-merging](../04-branching-merging/).

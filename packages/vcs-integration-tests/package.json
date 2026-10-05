@@ -1,0 +1,35 @@
+{
+  "name": "@statewalker/vcs-integration-tests",
+  "version": "0.1.0",
+  "description": "Integration tests for StateWalker VCS - example apps as use-case tests",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "packages/vcs-integration-tests"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/vcs-integration-tests#readme",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome lint tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@statewalker/vcs-commands": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-store-sql": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

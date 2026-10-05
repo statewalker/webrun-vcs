@@ -1,0 +1,71 @@
+{
+  "name": "@statewalker/vcs-commands",
+  "version": "0.3.2",
+  "description": "Git-like VCS commands (commit, checkout, merge, diff, log)",
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/vcs-commands#readme",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "packages/vcs-commands"
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./commands": {
+      "source": "./src/commands/index.ts",
+      "types": "./dist/commands/index.d.ts",
+      "import": "./dist/commands/index.js"
+    },
+    "./errors": {
+      "source": "./src/errors/index.ts",
+      "types": "./dist/errors/index.d.ts",
+      "import": "./dist/errors/index.js"
+    },
+    "./results": {
+      "source": "./src/results/index.ts",
+      "types": "./dist/results/index.d.ts",
+      "import": "./dist/results/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
+    "test": "vitest run",
+    "lint": "biome lint src tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-files": "workspace:^",
+    "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^"
+  },
+  "devDependencies": {
+    "@statewalker/vcs-transport-adapters": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
+    "@types/node": "catalog:",
+    "@statewalker/vcs-store-sql": "workspace:^",
+    "rolldown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

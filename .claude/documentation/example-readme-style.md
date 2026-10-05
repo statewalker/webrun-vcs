@@ -243,7 +243,7 @@ Keep them brief - just method name and one-line description:
 Use relative links to source files from the README location:
 
 - Within the example: `[file.ts](src/file.ts)`
-- To packages: `[file.ts](../../../packages/core/src/file.ts)`
+- To packages: `[file.ts](../../../packages/vcs-core/src/file.ts)`
 
 ### Narrative vs Lists
 

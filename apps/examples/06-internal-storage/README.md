@@ -271,16 +271,16 @@ The step then deltas a 271-byte document against a 362-byte revision and prints 
 
 | API | Location |
 |-----|----------|
-| `createHistoryFromComponents` | [packages/core/src/history/create-history.ts](../../../packages/core/src/history/create-history.ts) |
-| `createGitObjectStore`, `GitObjectStore` | [packages/core/src/history/objects/](../../../packages/core/src/history/objects/) |
-| `PackWriterStream` | [packages/core/src/pack/pack-writer.ts](../../../packages/core/src/pack/pack-writer.ts) |
-| `writePackIndexV2` | [packages/core/src/pack/pack-index-writer.ts](../../../packages/core/src/pack/pack-index-writer.ts) |
-| `FileRawStorage` | [packages/store-files/src/storage/raw/file-raw-storage.ts](../../../packages/store-files/src/storage/raw/file-raw-storage.ts) |
-| `createFileRefStore` | [packages/store-files/src/refs/ref-store.files.ts](../../../packages/store-files/src/refs/ref-store.files.ts) |
-| `createDeltaRanges` | [packages/utils/src/diff/delta/create-delta-ranges.ts](../../../packages/utils/src/diff/delta/create-delta-ranges.ts) |
-| `createDelta` | [packages/utils/src/diff/delta/create-delta.ts](../../../packages/utils/src/diff/delta/create-delta.ts) |
-| `applyDelta` | [packages/utils/src/diff/delta/apply-delta.ts](../../../packages/utils/src/diff/delta/apply-delta.ts) |
-| `decompressBlock`, `setCompressionUtils` | [packages/utils/src/compression/compression/index.ts](../../../packages/utils/src/compression/compression/index.ts) |
+| `createHistoryFromComponents` | [packages/vcs-core/src/history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) |
+| `createGitObjectStore`, `GitObjectStore` | [packages/vcs-core/src/history/objects/](../../../packages/vcs-core/src/history/objects/) |
+| `PackWriterStream` | [packages/vcs-core/src/pack/pack-writer.ts](../../../packages/vcs-core/src/pack/pack-writer.ts) |
+| `writePackIndexV2` | [packages/vcs-core/src/pack/pack-index-writer.ts](../../../packages/vcs-core/src/pack/pack-index-writer.ts) |
+| `FileRawStorage` | [packages/vcs-store-files/src/storage/raw/file-raw-storage.ts](../../../packages/vcs-store-files/src/storage/raw/file-raw-storage.ts) |
+| `createFileRefStore` | [packages/vcs-store-files/src/refs/ref-store.files.ts](../../../packages/vcs-store-files/src/refs/ref-store.files.ts) |
+| `createDeltaRanges` | [packages/vcs-utils/src/diff/delta/create-delta-ranges.ts](../../../packages/vcs-utils/src/diff/delta/create-delta-ranges.ts) |
+| `createDelta` | [packages/vcs-utils/src/diff/delta/create-delta.ts](../../../packages/vcs-utils/src/diff/delta/create-delta.ts) |
+| `applyDelta` | [packages/vcs-utils/src/diff/delta/apply-delta.ts](../../../packages/vcs-utils/src/diff/delta/apply-delta.ts) |
+| `decompressBlock`, `setCompressionUtils` | [packages/vcs-utils/src/compression/compression/index.ts](../../../packages/vcs-utils/src/compression/compression/index.ts) |
 
 ### Related examples
 

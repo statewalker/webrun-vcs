@@ -2,16 +2,16 @@
  * Debug script to trace delta computation sizes
  */
 
-import { createNodeCompression } from "../packages/utils/src/compression/compression-node/index.js";
+import { createNodeCompression } from "../packages/vcs-utils/src/compression/compression-node/index.js";
 import {
   parseGitDelta,
   serializeDeltaToGit,
-} from "../packages/utils/src/diff/delta/git-delta-format.js";
+} from "../packages/vcs-utils/src/diff/delta/git-delta-format.js";
 import {
   createDelta,
   createDeltaRanges,
   setCompressionUtils,
-} from "../packages/utils/src/index.js";
+} from "../packages/vcs-utils/src/index.js";
 
 // Initialize compression
 setCompressionUtils(createNodeCompression());

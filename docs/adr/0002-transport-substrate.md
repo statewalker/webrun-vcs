@@ -44,7 +44,7 @@ rather than shipping its own:
 
 ### As implemented
 
-`vcs-transport-git` is the restructured `@statewalker/vcs-transport` (`packages/transport`):
+`vcs-transport-git` is the restructured `@statewalker/vcs-transport` (`packages/vcs-transport`):
 the git protocol engine now runs over a webrun-streams `Duplex` (`adapters/webrun/`) and over
 `webrun-http-streams` (`adapters/webrun-http/`), with **git protocol v2 wired** (client +
 server, validated against real git). The `vcs-transport-adapters` package's old Duplex-adapter

@@ -9,9 +9,9 @@ import * as path from "node:path";
 import {
   createNodeCompression,
   decompressBlock,
-} from "../packages/utils/src/compression/compression-node/index.js";
-import { collect, setCompressionUtils } from "../packages/utils/src/index.js";
-import { newByteSplitter, readHeader } from "../packages/utils/src/streams/index.js";
+} from "../packages/vcs-utils/src/compression/compression-node/index.js";
+import { collect, setCompressionUtils } from "../packages/vcs-utils/src/index.js";
+import { newByteSplitter, readHeader } from "../packages/vcs-utils/src/streams/index.js";
 
 // Initialize compression
 setCompressionUtils(createNodeCompression());

@@ -277,16 +277,16 @@ The transport layer depends on a minimal `RefStore` (`get`, `update`, `listAll`,
 
 | Interface / function | Location | Purpose |
 |----------------------|----------|---------|
-| `RepositoryFacade` | [api/repository-facade.ts](../../../packages/transport/src/api/repository-facade.ts) | Pack-level import/export interface |
-| `RepositoryAccess` | [api/repository-access.ts](../../../packages/transport/src/api/repository-access.ts) | Object-level protocol operations |
-| `RefStore` | [context/process-context.ts](../../../packages/transport/src/context/process-context.ts) | Transport ref storage contract |
-| `serveOverDuplex` | [operations/serve-over-duplex.ts](../../../packages/transport/src/operations/serve-over-duplex.ts) | Serve Git requests over a duplex |
-| `fetchOverDuplex` | [operations/fetch-over-duplex.ts](../../../packages/transport/src/operations/fetch-over-duplex.ts) | Fetch from a served repository |
-| `createMessagePortDuplex` | [adapters/messageport/messageport-duplex.ts](../../../packages/transport/src/adapters/messageport/messageport-duplex.ts) | `MessagePort` as a `Duplex` |
-| `createVcsRepositoryAccess` | [vcs-repository-access.ts](../../../packages/transport-adapters/src/vcs-repository-access.ts) | `RepositoryAccess` from a `History` |
-| `createVcsRepositoryFacade` | [vcs-repository-facade.ts](../../../packages/transport-adapters/src/vcs-repository-facade.ts) | `RepositoryFacade` from a `History` |
-| `Refs` | [history/refs/](../../../packages/core/src/history/refs/) | Core ref storage |
-| `History` | [history/](../../../packages/core/src/history/) | Repository interface |
+| `RepositoryFacade` | [api/repository-facade.ts](../../../packages/vcs-transport/src/api/repository-facade.ts) | Pack-level import/export interface |
+| `RepositoryAccess` | [api/repository-access.ts](../../../packages/vcs-transport/src/api/repository-access.ts) | Object-level protocol operations |
+| `RefStore` | [context/process-context.ts](../../../packages/vcs-transport/src/context/process-context.ts) | Transport ref storage contract |
+| `serveOverDuplex` | [operations/serve-over-duplex.ts](../../../packages/vcs-transport/src/operations/serve-over-duplex.ts) | Serve Git requests over a duplex |
+| `fetchOverDuplex` | [operations/fetch-over-duplex.ts](../../../packages/vcs-transport/src/operations/fetch-over-duplex.ts) | Fetch from a served repository |
+| `createMessagePortDuplex` | [adapters/messageport/messageport-duplex.ts](../../../packages/vcs-transport/src/adapters/messageport/messageport-duplex.ts) | `MessagePort` as a `Duplex` |
+| `createVcsRepositoryAccess` | [vcs-repository-access.ts](../../../packages/vcs-transport-adapters/src/vcs-repository-access.ts) | `RepositoryAccess` from a `History` |
+| `createVcsRepositoryFacade` | [vcs-repository-facade.ts](../../../packages/vcs-transport-adapters/src/vcs-repository-facade.ts) | `RepositoryFacade` from a `History` |
+| `Refs` | [history/refs/](../../../packages/vcs-core/src/history/refs/) | Core ref storage |
+| `History` | [history/](../../../packages/vcs-core/src/history/) | Repository interface |
 
 ### Related examples
 
