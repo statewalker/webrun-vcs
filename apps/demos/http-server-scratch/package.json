@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Build HTTP Git server from scratch, demonstrate full clone/push cycle",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/demos/http-server-scratch"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/demos/http-server-scratch#readme",
   "scripts": {
     "start": "tsx src/main.ts",
     "server": "tsx src/server-only.ts",

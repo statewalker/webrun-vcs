@@ -1,6 +1,15 @@
 {
   "name": "@statewalker/vcs-docs",
   "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "docs"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/docs#readme",
   "type": "module",
   "private": true,
   "scripts": {

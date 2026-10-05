@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Browser VCS with WebRTC peer-to-peer synchronization",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/demos/vcs-webrtc-sync"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/demos/vcs-webrtc-sync#readme",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

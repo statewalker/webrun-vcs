@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "WebRTC peer-to-peer Git synchronization demo with QR code signaling",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/demos/webrtc-p2p-sync"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/demos/webrtc-p2p-sync#readme",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
