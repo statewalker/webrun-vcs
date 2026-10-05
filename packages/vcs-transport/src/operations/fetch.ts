@@ -146,6 +146,7 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
     requestChunks.push(encodeFlush());
 
     // Send haves if localHas is provided
+    let haveCount = 0;
     if (options.localHas && options.localCommits) {
       for await (const oid of options.localCommits()) {
         const hasObject = await options.localHas(oid);
@@ -154,10 +155,13 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
             .map((b) => b.toString(16).padStart(2, "0"))
             .join("");
           requestChunks.push(encodePacketLine(`have ${oidHex}`));
+          haveCount++;
         }
       }
     }
-    requestChunks.push(encodeFlush());
+    // A flush ends a block of haves. Without haves a second flush would end the negotiation
+    // before `done`: the server answers NAK and sends no pack.
+    if (haveCount > 0) requestChunks.push(encodeFlush());
 
     // Send done
     requestChunks.push(encodePacketLine("done"));
