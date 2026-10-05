@@ -29,9 +29,7 @@
     "deps:update": "./scripts/update-deps.sh",
     "deps:update:safe": "./scripts/update-deps.sh --test --build",
     "deps:update:interactive": "./scripts/update-deps.sh --interactive",
-    "changeset": "changeset",
-    "version": "changeset version",
-    "release": "pnpm build && changeset publish"
+    "changeset": "changeset"
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
