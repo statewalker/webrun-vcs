@@ -15,14 +15,14 @@ The utils package serves as the foundational layer with zero VCS-specific depend
        ↓
 @statewalker/vcs-utils  ← You are here
        ↓
-   pako (only external dependency)
+   pako, @statewalker/webrun-files-mem (external dependencies)
 ```
 
 This separation ensures utils can be used independently for general-purpose hashing, compression, and diffing without pulling in VCS-specific code.
 
 ### Browser-First Compatibility
 
-All implementations work in browser environments without Node.js APIs. Platform-specific optimizations (like Node.js zlib) are optional and injected via `setCompressionUtilsUtils()`. This enables:
+All implementations work in browser environments without Node.js APIs. Platform-specific optimizations (like Node.js zlib) are optional and injected via `setCompressionUtils()`. This enables:
 
 - Same code running in browsers, edge functions, and Node.js
 - Optional native acceleration when available
@@ -34,7 +34,7 @@ Most APIs use generators and async iterables to handle arbitrarily large data wi
 
 ```typescript
 async function* deflate(stream: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array>
-function* createDelta(source: Uint8Array, target: Uint8Array): Generator<Delta>
+function* createDelta(source: Uint8Array, target: Uint8Array, ranges: Iterable<DeltaRange>): Generator<Delta>
 ```
 
 This design enables processing multi-gigabyte files without loading everything into memory.
@@ -49,16 +49,22 @@ This design enables processing multi-gigabyte files without loading everything i
 │   ├── rolling-checksum/ - Rabin-Karp rolling hash (delta matching)
 │   ├── strong-checksum/ - FNV-1a hash (match confirmation)
 │   ├── fossil-checksum/ - Fossil format integrity
+│   ├── fnv1a/           - FNV-1a string hash
 │   └── utils/           - Hex/byte conversions
 ├── compression/          - DEFLATE/INFLATE streaming
-│   ├── compression/     - Core API and pako wrapper
-│   └── // Node.js compression: use @statewalker/vcs-utils-node - Optional Node.js zlib binding
+│   └── compression/     - Core API (Web Compression Streams default), pako helpers
+│       (Node.js zlib: @statewalker/vcs-utils-node, registered via setCompressionUtils)
 ├── diff/                 - Diff and patch algorithms
-│   ├── delta/           - Binary delta encoding (Fossil format)
+│   ├── delta/           - Binary delta encoding (Git and Fossil formats)
 │   ├── patch/           - Git patch parsing/application
-│   └── text-diff/       - Myers line-based diff
+│   └── text-diff/       - Myers and Histogram line-based diff, 3-way merge
+├── encoding/            - Git varints and pack object headers
 ├── cache/               - LRU caching utilities
-└── streams/             - Async stream operations
+├── collections/         - Sorted insertion helpers
+├── streams/             - Async stream operations, MessagePort byte streams
+├── files/               - FilesApi interface, in-memory FilesApi, path helpers (subpath only)
+├── ports/               - Request/response RPC over MessagePort (subpath only)
+└── pack/                - Pack header, object id, pack object cache (subpath only)
 ```
 
 ## Hash Module Deep Dive
@@ -106,8 +112,8 @@ The rolling checksum enables O(1) sliding window updates for efficient block mat
 ```typescript
 import { RollingChecksum } from "@statewalker/vcs-utils/hash/rolling-checksum";
 
-const rc = new RollingChecksum(16); // 16-byte window
-rc.init(data, 0, 16);
+const rc = new RollingChecksum();
+rc.init(data, 0, 16); // 16-byte window
 
 // Slide window by 1 byte
 const newChecksum = rc.update(oldByte, newByte);
@@ -151,7 +157,7 @@ The compression module provides streaming DEFLATE/INFLATE with pluggable impleme
 ### Core API
 
 ```typescript
-import { deflate, inflate, setCompressionUtils } from "@statewalker/vcs-utils/compression";
+import { compressBlock, decompressBlock, deflate, inflate } from "@statewalker/vcs-utils/compression";
 
 // Streaming compression
 async function* compress(input: AsyncIterable<Uint8Array>) {
@@ -167,7 +173,7 @@ const decompressed = await decompressBlock(compressed);
 
 ### Pluggable Implementations
 
-The default implementation uses pako (pure JavaScript). For better performance in Node.js:
+The default streaming implementation uses the Web `CompressionStream` / `DecompressionStream` API; partial decompression uses pako. To use Node.js zlib instead:
 
 ```typescript
 import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
@@ -186,7 +192,7 @@ const { data, bytesRead } = await decompressBlockPartial(compressedData);
 // bytesRead tells us where the next object starts
 ```
 
-The Node.js implementation handles this with binary search to find the exact zlib stream boundary.
+The default implementation uses pako's low-level inflate, which reports the consumed byte count (`total_in`) after one pass. The Node.js implementation in `@statewalker/vcs-utils-node` finds the boundary by binary search over the input length.
 
 ## Diff Module Deep Dive
 
@@ -197,11 +203,11 @@ The diff module provides three complementary diffing approaches:
 Line-based diffing for human-readable output:
 
 ```typescript
-import { MyersDiff, RawText, RawTextComparator } from "@statewalker/vcs-utils/diff/text-diff";
+import { MyersDiff, RawText, RawTextComparator } from "@statewalker/vcs-utils/diff";
 
 const a = new RawText(oldContent);
 const b = new RawText(newContent);
-const edits = MyersDiff.diff(new RawTextComparator(), a, b);
+const edits = MyersDiff.diff(RawTextComparator.DEFAULT, a, b);
 
 for (const edit of edits) {
   console.log(`${edit.getType()}: lines ${edit.beginA}-${edit.endA} → ${edit.beginB}-${edit.endB}`);
@@ -257,7 +263,7 @@ type DeltaRange =
 
 ```typescript
 type Delta =
-  | { type: "start"; targetLen: number }      // Header with expected output size
+  | { type: "start"; sourceLen?: number; targetLen: number } // Header with sizes
   | { type: "copy"; start: number; len: number } // Copy from source
   | { type: "insert"; data: Uint8Array }      // Insert literal bytes
   | { type: "finish"; checksum: number }      // Trailer with Fossil checksum
@@ -268,7 +274,7 @@ type Delta =
 Parsing and applying Git unified/binary patches:
 
 ```typescript
-import { Patch } from "@statewalker/vcs-utils/diff/patch";
+import { Patch } from "@statewalker/vcs-utils/diff";
 
 const patch = new Patch();
 patch.parse(patchContent);
@@ -357,12 +363,12 @@ for await (const segment of splitStream(input, newByteSplitter(0x0A))) {
   // Each segment is a stream until newline
 }
 
-// Concatenate streams
-concatStreams(stream1, stream2, stream3)
+// Concatenate two byte arrays
+concat(bytes1, bytes2)
 
-// Slice operations
-takeBytes(stream, 100)  // First 100 bytes
-skipBytes(stream, 50)   // Skip first 50 bytes
+// Byte range of a stream
+slice(stream, 0, 100)   // First 100 bytes
+slice(stream, 50)       // Skip first 50 bytes
 ```
 
 ### Delimiter Matching

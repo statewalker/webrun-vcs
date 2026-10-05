@@ -108,11 +108,10 @@ Storage backends implement core interfaces for different systems:
 
 | Package | Storage Target | Use Case |
 |---------|---------------|----------|
-| `@statewalker/vcs-core` | Git `.git/` directory | Native Git compatibility |
+| `@statewalker/vcs-store-files` | Git `.git/` directory over a FilesApi | Native Git compatibility |
 | `@statewalker/vcs-store-mem` | Memory | Testing, ephemeral repos |
-| `@statewalker/vcs-store-sql` | SQLite | Server deployments |
+| `@statewalker/vcs-store-sql` | SQL (sql.js adapter included) | Server deployments |
 | `@statewalker/vcs-store-kv` | Key-value stores | Custom backends |
-| `@statewalker/vcs-sandbox` | Isolated storage | Safe experimentation |
 
 ### Protocol Layer
 
@@ -436,24 +435,27 @@ The compression layer supports pluggable implementations:
 
 ```typescript
 import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
-import { createNodeCompression } from "@statewalker/vcs-utils/compression-node";
+import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 
 setCompressionUtils(createNodeCompression()); // Use native zlib
 ```
 
-### Custom Authentication
+### Repository Resolution
 
-The HTTP server supports flexible authentication:
+The HTTP server has no built-in authentication hooks. It resolves each request's repository
+through `resolveRepository`; returning `null` answers `404 Repository not found`. Put authentication in front of
+`handleRequest`:
 
 ```typescript
+import { createGitHttpServer } from "@statewalker/vcs-transport";
+
 const server = createGitHttpServer({
-  authenticate: async (request) => {
-    // Validate credentials
-  },
-  authorize: async (request, repo, operation) => {
-    // Check permissions for "fetch" or "push"
+  resolveRepository: async (repoPath) => {
+    // Return { repository, refStore } for a known repository, or null.
+    return null;
   },
 });
+// server.handleRequest(request) -> Promise<HttpResponse>
 ```
 
 ## Browser Compatibility
@@ -464,8 +466,8 @@ The core packages work in browsers without polyfills:
 - **@statewalker/vcs-transport**: Web Standard APIs (fetch, Request/Response)
 
 Storage backends may have platform requirements:
-- **core (Git storage)**: Requires FilesApi implementation
-- **store-sql**: Requires SQLite (Node.js only)
+- **store-files (Git storage)**: Requires a FilesApi implementation
+- **store-sql**: Needs a SQL database client; the bundled sql.js adapter runs in browsers and Node.js
 - **store-mem**: Works everywhere
 - **store-kv**: Works with any key-value backend (IndexedDB, LocalStorage, etc.)
 

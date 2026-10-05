@@ -283,7 +283,11 @@ cleanup();  // Removes all subscriptions
 |---------|---------|
 | `@statewalker/vcs-core` | Git primitives (blobs, trees, commits) |
 | `@statewalker/vcs-commands` | High-level Git operations |
-| `@statewalker/vcs-transport-webrtc` | WebRTC peer management |
+| `@statewalker/vcs-transport` | Git fetch/push over a duplex |
+| `@statewalker/vcs-transport-adapters` | History to transport adapters |
+| `@statewalker/vcs-working-tree` | Staging, checkout, worktree |
+| `@statewalker/vcs-store-files` | Git layout over a FilesApi |
+| `@statewalker/webrun-streams`, `@statewalker/webrun-streams-signaling` | WebRTC duplex streams and signaling |
 | `@statewalker/webrun-files` | Filesystem abstraction |
 | `@statewalker/webrun-files-browser` | File System Access API backend |
 | `@statewalker/webrun-files-mem` | In-memory filesystem |

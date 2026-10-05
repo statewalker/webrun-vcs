@@ -1,50 +1,61 @@
 # 05-history-operations
 
-Working with repository history using the statewalker-vcs Commands API. This example walks through log traversal, commit ancestry, diffing between commits, blame attribution, and file history tracking.
+A runnable tutorial that reads repository history with the `@statewalker/vcs-commands` porcelain and the `history.commits` API from `@statewalker/vcs-core`. Five steps cover log traversal, commit ancestry and merge bases, diffs between commits, blame, and tracking one file across commits. Everything runs in memory: nothing is written to disk and no network is used.
 
-## Quick Start
+## Each step is one file that builds its own history
 
-```bash
-# From the monorepo root
-pnpm install
-pnpm --filter @statewalker/vcs-example-05-history-operations start
+```
+apps/examples/05-history-operations/
+├── package.json
+├── tsconfig.json
+└── src/
+    ├── main.ts                       # Runs steps 1-5 in order
+    ├── shared.ts                     # In-memory History + WorkingCopy + Git setup, helpers
+    └── steps/
+        ├── 01-log-traversal.ts       # git.log(), walkAncestry()
+        ├── 02-commit-ancestry.ts     # ancestor checks, findMergeBase()
+        ├── 03-diff-commits.ts        # git.diff() between commits
+        ├── 04-blame.ts               # git.blame() and BlameResult
+        └── 05-file-history.ts        # manual per-file history walk
 ```
 
-## Running Individual Steps
+`shared.ts` composes an in-memory repository from `createMemoryHistory()` (vcs-core) and `createMemoryGitStaging()`, `createMemoryCheckout()`, `createMemoryWorktree()`, `createMemoryWorkingCopy()` (vcs-working-tree), then wraps it with `Git.fromWorkingCopy()`. Each step calls `resetState()` first and creates the commits it needs, so steps are independent of each other.
 
-Each step can be run independently:
+## How to run it
 
-```bash
-pnpm --filter @statewalker/vcs-example-05-history-operations step:01  # Log traversal
-pnpm --filter @statewalker/vcs-example-05-history-operations step:02  # Commit ancestry
-pnpm --filter @statewalker/vcs-example-05-history-operations step:03  # Diff commits
-pnpm --filter @statewalker/vcs-example-05-history-operations step:04  # Blame
-pnpm --filter @statewalker/vcs-example-05-history-operations step:05  # File history
-```
+Requires Node 24 and pnpm. From the repository root:
 
-## What You'll Learn
+1. Install the workspace:
 
-- How to traverse commit history with `git.log()` and low-level `walkAncestry()`
-- How to check ancestor relationships between commits and find merge bases
-- How to compare commits and interpret change types (ADD, DELETE, MODIFY, RENAME)
-- How to attribute individual lines to their originating commits with blame
-- How to track the history of a specific file across commits
+   ```bash
+   pnpm install
+   ```
 
-## Prerequisites
+2. Run all five steps:
 
-- Node.js 18+
-- pnpm
-- Completed [02-porcelain-commands](../02-porcelain-commands/)
+   ```bash
+   pnpm --filter @statewalker/vcs-example-05-history-operations start
+   ```
 
----
+3. Or run a single step:
 
-## Step-by-Step Guide
+   ```bash
+   pnpm --filter @statewalker/vcs-example-05-history-operations step:01  # Log traversal
+   pnpm --filter @statewalker/vcs-example-05-history-operations step:02  # Commit ancestry
+   pnpm --filter @statewalker/vcs-example-05-history-operations step:03  # Diff commits
+   pnpm --filter @statewalker/vcs-example-05-history-operations step:04  # Blame
+   pnpm --filter @statewalker/vcs-example-05-history-operations step:05  # File history
+   ```
 
-### Step 1: Log Traversal
+Commits are staged with a helper, `addFileToStaging()`, that stores a blob and writes a staging entry directly. Example [02-porcelain-commands](../02-porcelain-commands/) covers the porcelain basics this tutorial assumes.
+
+## The walk-through
+
+### Step 1: `git.log()` yields commits newest first
 
 **File:** [src/steps/01-log-traversal.ts](src/steps/01-log-traversal.ts)
 
-Walking through commit history using the porcelain log command and the low-level ancestry walker. The log command returns an async iterable of commit objects, ordered from newest to oldest.
+The step makes five commits, then reads them back. `git.log().call()` resolves to an async iterable of commit objects (`LogResult`), ordered from newest to oldest. The commit objects do not carry their id; the step gets it by hashing the commit again with `history.commits.store(commit)`, which returns the same id for the same content.
 
 ```typescript
 // Basic log - iterate all commits
@@ -60,41 +71,52 @@ for await (const commit of await git.log().setMaxCount(3).call()) {
 
 // Low-level ancestry walk
 const head = await history.refs.resolve("HEAD");
-for await (const id of history.commits.walkAncestry(head.objectId, { limit: 3 })) {
-  const commit = await history.commits.load(id);
-  console.log(`${shortId(id)} ${commit.message}`);
+if (head?.objectId) {
+  for await (const id of history.commits.walkAncestry(head.objectId, { limit: 3 })) {
+    const commit = await history.commits.load(id);
+    console.log(`${shortId(id)} ${commit?.message}`);
+  }
 }
 ```
 
 **Key APIs:**
-- `git.log().call()` - Returns async iterable of commit objects
-- `git.log().setMaxCount(n)` - Limit results to the most recent N commits
-- `git.log().setStartCommit(id)` - Start traversal from a specific commit
-- `history.commits.walkAncestry(startId, { limit })` - Low-level commit walker
+- `git.log().call()` - async iterable of commits, starting at HEAD
+- `git.log().setMaxCount(n)` - stop after n commits
+- `git.log().add(commitId)` - start from a given commit instead of HEAD (can be called several times)
+- `git.log().addPath(path)` - keep only commits that change `path`
+- `history.commits.walkAncestry(startId, { limit, stopAt, firstParentOnly })` - low-level walker that yields commit ids
 
----
-
-### Step 2: Commit Ancestry
+### Step 2: The merge base of two branches is their newest common ancestor
 
 **File:** [src/steps/02-commit-ancestry.ts](src/steps/02-commit-ancestry.ts)
 
-Checking relationships between commits is essential for merges, fast-forward detection, and branch analysis. The merge base (common ancestor) determines how three-way merges work.
+The step builds this graph, switching to `feature` by pointing HEAD at the branch and reading its tree into the staging area:
+
+```
+A---B---C  (main)
+     \
+      D  (feature)
+```
+
+It then checks ancestry with a breadth-first walk over `commit.parents`, and asks for the merge base. The merge base is the input to a three-way merge; fast-forward detection is an ancestry check.
 
 ```typescript
 // Find merge base (common ancestor of two branches)
 const mergeBases = await history.commits.findMergeBase(commitC, commitD);
-const commonAncestor = mergeBases[0];
+const commonAncestor = mergeBases[0]; // B
 
 // Manual ancestry check by walking the commit graph
-async function isAncestor(ancestorId, descendantId) {
-  const visited = new Set();
+async function isAncestor(ancestorId: string, descendantId: string): Promise<boolean> {
+  if (ancestorId === descendantId) return true;
+  const visited = new Set<string>();
   const queue = [descendantId];
   while (queue.length > 0) {
-    const current = queue.shift();
-    if (current === ancestorId) return true;
+    const current = queue.shift() as string;
+    if (visited.has(current)) continue;
     visited.add(current);
+    if (current === ancestorId) return true;
     const commit = await history.commits.load(current);
-    for (const parent of commit.parents) {
+    for (const parent of commit?.parents ?? []) {
       if (!visited.has(parent)) queue.push(parent);
     }
   }
@@ -102,79 +124,93 @@ async function isAncestor(ancestorId, descendantId) {
 }
 ```
 
+The manual walk is there to show the mechanism. `history.commits.isAncestor(ancestor, descendant)` does the same check in one call.
+
 **Key APIs:**
-- `history.commits.findMergeBase(commitA, commitB)` - Find common ancestor(s)
-- `history.commits.walkAncestry(startId)` - Walk commit parents in topological order
-- `history.commits.load(commitId)` - Load a commit object by ID
+- `history.commits.findMergeBase(a, b)` - common ancestor(s), as an array of ids
+- `history.commits.isAncestor(ancestor, descendant)` - ancestry check
+- `history.commits.load(commitId)` - load a commit object by id
 
----
-
-### Step 3: Diff Between Commits
+### Step 3: A diff is a list of `DiffEntry` change records
 
 **File:** [src/steps/03-diff-commits.ts](src/steps/03-diff-commits.ts)
 
-Comparing two commits produces a list of `DiffEntry` objects describing what changed between the snapshots. Each entry carries a change type, the affected paths, and the old/new blob IDs.
+Comparing two commits produces `DiffEntry` objects. Each one has a change type, the old and new paths, and the old and new blob ids. A diff compares two snapshots, so the diff from commit 1 to commit 3 lists every path that differs between them, whichever commit changed it.
 
 ```typescript
-// Diff between two commits
-const diff = await git.diff()
-  .setOldTree(commit1)
-  .setNewTree(commit2)
-  .call();
+import { formatDiffEntry } from "@statewalker/vcs-commands";
+
+const diff = await git.diff().setOldTree(commit1).setNewTree(commit2).call();
 
 for (const entry of diff) {
   console.log(`${entry.changeType}: ${entry.newPath || entry.oldPath}`);
+  console.log(formatDiffEntry(entry)); // e.g. "M\tsrc/index.ts"
 }
+```
 
-// Change types: ADD, DELETE, MODIFY, RENAME, COPY
+Output of the run:
+
+```
+--- Diff between commit 1 and commit 2 ---
+
+  Changes (2 entries):
+    MODIFY: src/index.ts
+    ADD: src/utils.ts
 ```
 
 **Key APIs:**
-- `git.diff().setOldTree(commitId).setNewTree(commitId).call()` - Compare two commits
-- `DiffEntry.changeType` - One of ADD, DELETE, MODIFY, RENAME, or COPY
-- `DiffEntry.oldPath` / `DiffEntry.newPath` - File paths in old and new trees
-- `formatDiffEntry(entry)` - Format a diff entry for display
+- `git.diff().setOldTree(refOrId).setNewTree(refOrId).call()` - compare two commits
+- `DiffEntry.changeType` - `ChangeType.ADD`, `DELETE`, `MODIFY`, `RENAME` or `COPY`
+- `DiffEntry.oldPath` / `newPath`, `oldId` / `newId` - unset on the missing side for ADD and DELETE
+- `formatDiffEntry(entry)` - one-line, name-status style formatting
 
----
-
-### Step 4: Blame
+### Step 4: Blame attributes every line to the commit that introduced it
 
 **File:** [src/steps/04-blame.ts](src/steps/04-blame.ts)
 
-Blame traces each line in a file back to the commit that introduced it. The result includes the author, commit message, and original line number for every line in the file.
+The step commits three versions of `src/config.ts` and blames the result. `BlameResult.entries` is a list of runs of consecutive lines that come from the same commit. A commit that touched lines in several places shows up in several entries: the 8-line file in this step produces 7 entries from 3 commits.
 
 ```typescript
-// Blame a file
-const result = await git.blame()
-  .setFilePath("src/config.ts")
-  .call();
+const result = await git.blame().setFilePath("src/config.ts").call();
 
-// Get author of a specific line
+// Author of one line (1-based)
 const author = result.getSourceAuthor(5);
 console.log(`Line 5 by: ${author?.name}`);
 
-// Iterate blame entries (grouped by commit)
+// Runs of consecutive lines from the same commit
 for (const entry of result.entries) {
   console.log(`Lines ${entry.resultStart}-${entry.resultStart + entry.lineCount - 1}`);
-  console.log(`  By: ${entry.commit.author.name}`);
-  console.log(`  Message: ${entry.commit.message}`);
+  console.log(`  Commit: ${entry.commit.message}`);
 }
 ```
 
+Output of the run (ids differ on each run because commit timestamps are the current time):
+
+```
+  Line | Commit  | Author        | Content
+  ------------------------------------------------------------
+     1 | 47d828a | Unknown      | // Configuration file
+     2 | f0983de | Unknown      | // Updated for v2
+     3 | 47d828a | Unknown      | export const config = {
+     4 | 47d828a | Unknown      |   name: "MyApp",
+     5 | f0983de | Unknown      |   version: "2.0.0",
+     6 | 1667756 | Unknown      |   debug: false,
+     7 | f0983de | Unknown      |   features: ["auth", "api"],
+     8 | 47d828a | Unknown      | };
+```
+
 **Key APIs:**
-- `git.blame().setFilePath(path).call()` - Run blame on a file (path is required)
-- `BlameResult.entries` - Array of `BlameEntry` grouped by originating commit
-- `BlameResult.getSourceAuthor(line)` - Get author of a specific line (1-based)
-- `BlameResult.getSourceCommit(line)` - Get commit that introduced a line
-- `BlameResult.getLineTracking()` - Detailed per-line tracking information
+- `git.blame().setFilePath(path).call()` - blame a file at HEAD (path is required)
+- `.setStartCommit(id)`, `.setFollowRenames(bool)` - blame from another commit, follow renames
+- `BlameResult.entries` - `BlameEntry[]` with `commitId`, `commit`, `resultStart`, `sourceStart`, `lineCount`
+- `BlameResult.getEntry(line)`, `getSourceCommit(line)`, `getSourceAuthor(line)`, `getSourceLine(line)` - per-line lookups, 1-based
+- `BlameResult.getLineTracking()` - one `LineTracking` record per line
 
----
-
-### Step 5: File History
+### Step 5: File history by comparing blob ids along the ancestry walk
 
 **File:** [src/steps/05-file-history.ts](src/steps/05-file-history.ts)
 
-Tracking changes to a specific file by walking the commit graph and comparing blob IDs. Commits where the file's blob ID changes are the ones that modified it.
+The step makes five commits, three of which change `src/main.ts`, then walks the ancestry from HEAD and resolves the file's blob id in each commit's tree with `history.trees.getEntry()`. A change in blob id between neighbouring commits marks a change to the file. It then prints the earliest and latest content, loaded with `history.blobs.load()`.
 
 ```typescript
 const fileHistory = [];
@@ -182,173 +218,62 @@ let previousBlobId;
 
 for await (const commitId of history.commits.walkAncestry(headId)) {
   const commit = await history.commits.load(commitId);
+  if (!commit) continue;
   const blobId = await getFileBlobId(history, commit.tree, "src/main.ts");
 
   if (blobId && blobId !== previousBlobId) {
-    fileHistory.push({ commitId, commit, blobId });
+    fileHistory.push({ commitId, blobId });
     previousBlobId = blobId;
   }
 }
-
-console.log(`Found ${fileHistory.length} commits affecting src/main.ts`);
 ```
+
+The walk goes newest to oldest, so this loop records the newest commit of each run of identical versions, not the commit that introduced the version. See "What will surprise you". `git.log().addPath("src/main.ts")` performs a path filter inside the log command.
 
 **Key APIs:**
-- `history.commits.walkAncestry(startId)` - Walk all ancestor commits
-- `history.trees.getEntry(treeId, name)` - Look up a file entry in a tree
-- `history.blobs.load(blobId)` - Load file content by blob ID
+- `history.commits.walkAncestry(startId)` - walk all ancestor commits
+- `history.trees.getEntry(treeId, name)` - look up one name in a tree; nested paths are resolved one segment at a time
+- `history.blobs.load(blobId)` - file content as an async iterable of chunks
 
----
+## Why it is the way it is
 
-## Key Concepts
+- **In-memory repository.** The steps use the in-memory History and WorkingCopy so the tutorial needs no setup, leaves no files behind, and runs the same way every time.
+- **Staging is written directly.** `addFileToStaging()` stores a blob and edits the staging area through `checkout.staging.createEditor()` instead of writing files and calling `git.add()`. This keeps the focus on history rather than on the worktree.
+- **Low-level and porcelain side by side.** Each step shows the `git.*` command next to the `history.*` call it rests on (`walkAncestry`, `findMergeBase`, `trees.getEntry`), so you can drop down a level when the porcelain does not fit.
 
-### Log Traversal
+## What will surprise you
 
-The `git.log()` command walks backward through the commit graph starting from HEAD (or a specified commit). Each commit points to its parent(s), forming a directed acyclic graph. The `setMaxCount()` option limits how many commits to return, which is useful for pagination or displaying recent activity. For more control, `history.commits.walkAncestry()` gives direct access to the low-level walker with a `limit` option.
+- **Commit ids and dates change on every run.** Commits have no author set, so `CommitCommand` uses `Unknown <unknown@example.com>` and the current time. Ids in your output will not match the ones shown here.
+- **Step 5 lists the wrong commits for `src/main.ts`.** Because of the newest-to-oldest walk described in Step 5, the run prints `Add config import to main.ts`, `Add README` and `Add utils.ts`. The commits that changed the file are `Create main.ts`, `Update main.ts with import` and `Add config import to main.ts`. The blob contents it prints as earliest and latest are correct.
+- **The app's printed API summaries are partly stale.** Step 1 prints `.addPath(path) - Filter by path (not yet implemented)` and `.setStartCommit(id)`. `addPath()` is implemented, and `LogCommand` has no `setStartCommit()`; use `add(commitId)`.
+- **Blame entries are not one per commit.** Expect more entries than commits whenever a commit's lines are not contiguous.
+- **A failing step exits with code 1.** `main.ts` and each standalone step print `Error:` followed by the error and call `process.exit(1)`.
 
-### Ancestry and Merge Bases
+## Reference
 
-Two commits share a common ancestor when their parent chains eventually converge. The `findMergeBase()` method finds this convergence point, which is the input to three-way merge. Fast-forward detection relies on ancestry: if the current HEAD is an ancestor of the merge source, the branch pointer can move forward without creating a merge commit.
+### Commands
 
-### Diff Change Types
+| Command | What it runs |
+|---------|--------------|
+| `pnpm --filter @statewalker/vcs-example-05-history-operations start` | `tsx src/main.ts` (all steps) |
+| `pnpm --filter @statewalker/vcs-example-05-history-operations step:01` ... `step:05` | `tsx src/steps/0N-*.ts` (one step) |
+| `pnpm --filter @statewalker/vcs-example-05-history-operations typecheck` | `tsc --noEmit` |
 
-When comparing two tree snapshots, each file can appear as one of five change types. ADD means the file exists only in the new tree. DELETE means it exists only in the old tree. MODIFY means the path is the same but the content (blob ID) differs. RENAME and COPY are detected by content similarity when a file disappears from one path and appears at another.
+### Source of the APIs used
 
-### Blame Attribution
+| API | Location |
+|-----|----------|
+| `Git` | [packages/commands/src/git.ts](../../../packages/commands/src/git.ts) |
+| `LogCommand` | [packages/commands/src/commands/log-command.ts](../../../packages/commands/src/commands/log-command.ts) |
+| `DiffCommand`, `formatDiffEntry` | [packages/commands/src/commands/diff-command.ts](../../../packages/commands/src/commands/diff-command.ts) |
+| `BlameCommand`, `BlameResult` | [packages/commands/src/commands/blame-command.ts](../../../packages/commands/src/commands/blame-command.ts) |
+| `DiffEntry`, `ChangeType` | [packages/commands/src/results/diff-entry.ts](../../../packages/commands/src/results/diff-entry.ts) |
+| `Commits` (ancestry, merge base) | [packages/core/src/history/commits/](../../../packages/core/src/history/commits/) |
+| `Trees` | [packages/core/src/history/trees/](../../../packages/core/src/history/trees/) |
+| `Blobs` | [packages/core/src/history/blobs/](../../../packages/core/src/history/blobs/) |
+| `Refs` | [packages/core/src/history/refs/](../../../packages/core/src/history/refs/) |
 
-Blame works backward from the current version of a file, assigning each line to the commit that last modified it. The result groups consecutive lines that share the same originating commit into `BlameEntry` objects. You can query individual lines by number (1-based) to get the author, commit, or original line number in the source commit.
+### Related examples
 
----
-
-## Project Structure
-
-```
-apps/examples/05-history-operations/
-├── package.json
-├── tsconfig.json
-├── README.md
-└── src/
-    ├── main.ts                       # Main entry point (runs all steps)
-    ├── shared.ts                     # Shared utilities and Git setup
-    └── steps/
-        ├── 01-log-traversal.ts       # Log traversal demonstration
-        ├── 02-commit-ancestry.ts     # Commit ancestry demonstration
-        ├── 03-diff-commits.ts        # Diff between commits demonstration
-        ├── 04-blame.ts               # Blame demonstration
-        └── 05-file-history.ts        # File history demonstration
-```
-
----
-
-## Output Example
-
-```
-============================================================
-  Step 1: Log Traversal
-============================================================
-
---- Step 1: Log Traversal ---
-
---- Setting up commit history ---
-  Created: Initial commit
-  Created: Add src/index.ts
-  Created: Add src/utils.ts
-  Created: Add documentation
-  Created: Update version to 2
-
---- Basic log traversal ---
-
-Using git.log().call():
-  a3f21bc Update version to 2
-  e8d0c14 Add documentation
-  9b7a3e5 Add src/utils.ts
-  5c1d8f2 Add src/index.ts
-  1a0b3c4 Initial commit
-
-  Total commits: 5
-
---- Limited log (maxCount) ---
-
-Using git.log().setMaxCount(3).call():
-  a3f21bc Update version to 2
-  e8d0c14 Add documentation
-  9b7a3e5 Add src/utils.ts
-
---- Detailed commit information ---
-
-Showing full commit details:
-
-  Commit 1:
-    ID:        a3f21bc4e8d0c149b7a3e55c1d8f21a0b3c4...
-    Message:   Update version to 2
-    Author:    Author <author@example.com>
-    Date:      2025-01-15
-    Tree:      b2c3d4e
-    Parents:   e8d0c14
-
---- Low-level: Walking ancestry ---
-
-Using history.commits.walkAncestry():
-  a3f21bc Update version to 2
-  e8d0c14 Add documentation
-  9b7a3e5 Add src/utils.ts
-
-Step 1 completed!
-
-============================================================
-  Step 4: Blame
-============================================================
-
---- Step 4: Blame ---
---- Running git blame ---
-
-  File: src/config.ts
-  Lines: 8
-  Entries: 3
-
---- Blame output ---
-
-  Line | Commit  | Author        | Content
-  ------------------------------------------------------------
-     1 | 1a0b3c4 | Author       | // Configuration file
-     2 | 7d8e9f0 | Author       | // Updated for v2
-     3 | 1a0b3c4 | Author       | export const config = {
-     4 | 1a0b3c4 | Author       |   name: "MyApp",
-     5 | 7d8e9f0 | Author       |   version: "2.0.0",
-     6 | 4b5c6d7 | Author       |   debug: false,
-     7 | 7d8e9f0 | Author       |   features: ["auth", "api"],
-     8 | 1a0b3c4 | Author       | };
-
-Step 4 completed!
-...
-```
-
----
-
-## API Reference Links
-
-### Commands Package (packages/commands)
-
-| Interface | Location | Purpose |
-|-----------|----------|---------|
-| `Git` | [src/git.ts](../../../packages/commands/src/git.ts) | Main porcelain facade |
-| `LogCommand` | [src/commands/log-command.ts](../../../packages/commands/src/commands/log-command.ts) | Log traversal command |
-| `DiffCommand` | [src/commands/diff-command.ts](../../../packages/commands/src/commands/diff-command.ts) | Diff between commits |
-| `BlameCommand` | [src/commands/blame-command.ts](../../../packages/commands/src/commands/blame-command.ts) | Line-by-line blame |
-| `DiffEntry` | [src/results/diff-entry.ts](../../../packages/commands/src/results/diff-entry.ts) | Diff result structure |
-
-### Core Package (packages/core)
-
-| Interface | Location | Purpose |
-|-----------|----------|---------|
-| `CommitStore` | [src/history/commits/](../../../packages/core/src/history/commits/) | Commit storage and ancestry |
-| `TreeStore` | [src/history/trees/](../../../packages/core/src/history/trees/) | Tree entry lookups |
-| `BlobStore` | [src/history/blobs/](../../../packages/core/src/history/blobs/) | Blob content storage |
-| `RefStore` | [src/history/refs/](../../../packages/core/src/history/refs/) | Reference resolution |
-
----
-
-## Next Steps
-
-- [04-branching-merging](../04-branching-merging/) - Branch operations and merge strategies
-- [07-staging-checkout](../07-staging-checkout/) - Working tree and staging area operations
+- [04-branching-merging](../04-branching-merging/) - branch operations and merge strategies
+- [07-staging-checkout](../07-staging-checkout/) - working tree and staging area operations

@@ -1,55 +1,87 @@
-# @statewalker/vcs-demo-xet-huggingface
+# Xet Chunk-Dedup Transfer over HuggingFace Bytes
 
-Chunk-dedup transfer of **real HuggingFace model bytes** over our `xet`
-custom-transfer agent (`@statewalker/vcs-transport-xet`), run as a **loopback**,
-plus the **basic-LFS fallback** path.
+## What it is
 
-## Our xet vs. HuggingFace Xet — read this first
+A Node script that shows chunk-level deduplicated transfer with `@statewalker/vcs-transport-xet`, using a real HuggingFace model file as the payload. It fetches `pytorch_model.bin` once from `huggingface.co` over standard Git-LFS, then moves it between two in-memory content stores over the `xet` transfer in loopback (`serveXet` server, `xetDownload` client), proving that only the missing chunks travel. It finishes with the fallback path: the same client against a plain LFS server moves the whole object.
 
-`@statewalker/vcs-transport-xet` is a Git-LFS **custom transfer agent** using
-**our** protocol: it negotiates a `xet` transfer inside the standard LFS batch,
-then moves only the **missing chunks** through `@statewalker/webrun-content-transfer`
-(content-defined chunk dedup). If the peer does not speak our `xet`, it falls
-back to whole-object basic LFS.
+## Layout
 
-HuggingFace's production **Xet** uses a **different CAS protocol** on the wire —
-we cannot negotiate our `xet` against `huggingface.co`. So this demo:
-
-- fetches the **real** `pytorch_model.bin` bytes from HF **once** using the
-  standard LFS basic transfer (same path as the `lfs-download-huggingface`
-  demo), then
-- transfers those real bytes between **two local content-stores** over **our**
-  xet **loopback** (`serveXet` server <-> `xetDownload` client).
-
-The chunk dedup is genuine; only the transport peers are local. No live Xet
-server is needed to run this.
-
-## What it shows
-
-1. **Real HF bytes** — download `pytorch_model.bin` via standard LFS, SHA-256
-   verified.
-2. **CDC chunking** — put the bytes into a source content-store; the ~3.5 MB
-   object splits into hundreds of content-defined chunks.
-3. **Dedup** — pre-seed the destination store with ~60% of the object's chunks,
-   then `xetDownload` from `serveXet(source)`. A `putChunk` spy on the
-   destination proves **only the missing chunks moved** (transferred ==
-   total − pre-seeded), yet the destination reconstructs the exact object
-   (whole-file SHA-256 == the HF oid).
-4. **Fallback** — the same `xetDownload` against a non-xet `serveLfs` server
-   transparently moves the whole object and verifies SHA-256.
-
-## Model used
-
-`hf-internal-testing/tiny-random-gpt2`, `pytorch_model.bin`
-(`oid = sha256:4fab47c129967e0db58e8faf8494e4bd04f2ea79bbe287ac2f90c4183c0194be`,
-`size = 3561811`).
-
-## Run
-
-```bash
-pnpm --filter @statewalker/vcs-demo-xet-huggingface start
+```
+src/
+  main.ts   the four steps
+  lib.ts    makeStore() (mem content store), csHash, memResolver(), seedChunks(), spyStore(), stream helpers
 ```
 
-Exits `0` after printing the chunk-dedup stats (total vs. transferred) and both
-verifications. It fetches the real HF object once (needs network for step 1);
-the xet transfer and fallback run entirely loopback.
+```
+[1] huggingface.co --standard LFS (lfsDownload)--> bytes, SHA-256 == oid
+[2] bytes --store.put--> source store  (content-defined chunks, manifest)
+[3] dest store pre-seeded with 60% of the unique chunks
+    xetDownload(dest, ..., { fetchImpl: serveXet(source, resolver) })
+      LFS batch negotiates "xet" -> only missing chunks -> dest.putChunk (spied)
+[4] xetDownload(fallback, ..., { fetchImpl: serveLfs(source, resolver) })
+      no "xet" offered -> basic transfer -> whole object via store.put
+```
+
+The loopback URL is `http://xet.loopback`; no request leaves the process because `fetchImpl` is the server handler itself.
+
+## How to run it
+
+1. `pnpm install && pnpm build` at the repository root (Node 24); the `@statewalker/vcs-transport-*` packages resolve to their built `dist/`.
+2. With internet access to `huggingface.co` (needed for step 1 only):
+
+   ```bash
+   pnpm --filter @statewalker/vcs-demo-xet-huggingface start
+   ```
+
+It prints chunk counts for step 2, the dedup numbers for step 3 (`unique chunks`, `already present`, `chunks transferred`), the fallback result, and ends with `=== SUCCESS ===` and exit code 0.
+
+## The code that matters
+
+```typescript
+import { serveLfs } from "@statewalker/vcs-transport-lfs";
+import { serveXet, xetDownload } from "@statewalker/vcs-transport-xet";
+
+// Chunked transfer: the destination already holds some chunks.
+for await (const event of xetDownload(destStore, destResolver, "http://xet.loopback", [pointer], {
+  fetchImpl: serveXet(sourceStore, sourceResolver),
+  hashContent: csHash,
+})) {
+  if (event.type === "error") throw new Error(event.reason);
+}
+
+// Fallback: a server that does not offer xet.
+for await (const event of xetDownload(fbStore, fbResolver, "http://xet.loopback", [pointer], {
+  fetchImpl: serveLfs(sourceStore, sourceResolver),
+  hashContent: csHash,
+})) { /* ... */ }
+```
+
+## Why it is the way it is
+
+- **This `xet` is not HuggingFace's Xet.** `@statewalker/vcs-transport-xet` is a Git-LFS custom transfer agent with its own protocol: it negotiates `xet` inside the standard LFS batch, then exchanges only missing chunks through `@statewalker/webrun-content-transfer`. HuggingFace's production Xet uses a different CAS protocol on the wire, so it cannot be negotiated against `huggingface.co`. The demo therefore uses real HF bytes but runs the transfer between two local peers. The deduplication is real; only the peers are local.
+- **Both peers share one chunk hash.** `csHash` is injected into every store and into `xetDownload` so chunk ids match on both sides; without that, no chunk would ever be "already present". Ids are prefixed `cs-sha256:` so they never collide with a bare LFS oid, and the resolver translates between the two.
+- **Dedup is counted over unique chunks.** A content-defined manifest can reference the same chunk more than once, so the demo compares against the set of unique chunk ids. A spy on the destination's `putChunk` records exactly which chunks arrived.
+- **The checks are strict.** The run fails unless transferred == unique − pre-seeded, no pre-seeded chunk is sent again, the reconstructed object's SHA-256 equals the oid, and the fallback path made zero `putChunk` calls.
+
+## What will surprise you
+
+- **Step 1 needs the network.** Offline, the script prints `=== FAILED ===` and the fetch error (for example `fetch failed`), exits 1, and never reaches the loopback part. An HTTP error on the pointer prints `failed to read pointer: HTTP <status> (HF unreachable?)`.
+- **Failure messages name the broken property:** `object did not chunk — dedup would be trivial`, `dedup mismatch: moved <n>, expected <m>`, `a pre-seeded chunk was re-transferred`, `xet reconstruction failed verification`, `basic fallback unexpectedly used chunk-level transfer`.
+- **Everything is in memory.** All stores are `memBlobStore()` and all resolvers are `Map`s; nothing is written to disk.
+
+## Reference
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `pnpm --filter @statewalker/vcs-demo-xet-huggingface start` | Run the demo (`tsx src/main.ts`) |
+| `pnpm --filter @statewalker/vcs-demo-xet-huggingface typecheck` | `tsc --noEmit` |
+
+### Payload
+
+`hf-internal-testing/tiny-random-gpt2`, `pytorch_model.bin`: `oid = sha256:4fab47c129967e0db58e8faf8494e4bd04f2ea79bbe287ac2f90c4183c0194be`, `size = 3561811`.
+
+### Dependencies
+
+`@statewalker/vcs-transport-xet` (`serveXet`, `xetDownload`), `@statewalker/vcs-transport-lfs` (`lfsDownload`, `serveLfs`, `sha256Hex`), `@statewalker/webrun-content-store` (content store), `@statewalker/webrun-storage` (`memBlobStore`).

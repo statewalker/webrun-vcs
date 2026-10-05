@@ -1,166 +1,111 @@
 # Versioned Documents Demo
 
-Document versioning in the browser using Git-like storage. Upload DOCX or ODF files and track changes over time.
+## What it is
 
-## Features
+A Vite single-page app that keeps versions of an office document in an in-memory Git repository. You drop in a `.docx` or `.odt` file; the app unpacks the ZIP archive into its internal files (XML parts, media), commits them as one version, and lets you save more versions, list them, restore one into the view, download any version as a rebuilt document, and compare two versions file by file.
 
-- Upload DOCX/ODF documents via drag-and-drop or file picker
-- View internal document structure (XML components, media files)
-- Save versions with descriptive messages
-- View version history with timestamps
-- Restore previous versions
-- Download any version as a reconstructed document
-- Compare versions to see what changed
+## Layout
 
-## Quick Start
-
-```bash
-# Install dependencies
-pnpm install
-
-# Run development server
-pnpm dev
+```
+index.html                 drop zone, document panel (file tree, save form), history and compare panels
+src/
+  main.ts                  UI wiring; creates one VersionTracker on page load
+  document-decomposer.ts   decomposeDocument(), reconstructDocument() with JSZip
+  version-tracker.ts       VersionTracker: in-memory repository, one commit per version
+  styles.css
 ```
 
-Then open http://localhost:5173 in your browser.
+```
+.docx / .odt ──JSZip──> Map<path, bytes> ──blobs.store + staging editor──> commit (= version)
+                                                                              │
+download <──JSZip.generateAsync── Map<path, bytes> <──trees.load + blobs.load──┘
+compare: git.diff().setOldTree(a).setNewTree(b)
+```
 
-## How It Works
+## How to run it
 
-### Document Decomposition
+1. `pnpm install && pnpm build` at the repository root (Node 24); the `@statewalker/vcs-*` packages resolve to their built `dist/`.
+2. Start the dev server:
 
-DOCX and ODF files are ZIP archives containing:
-- XML files (content, styles, metadata)
-- Media files (images, embedded objects)
-- Relationship files
+   ```bash
+   pnpm --filter @statewalker/vcs-demo-versioned-documents dev
+   ```
 
-This demo uses JSZip to decompose documents into their component files.
+3. Open the URL Vite prints (`http://localhost:5173` by default) and drop a `.docx` or `.odt` file on the page. The upload is saved at once as version `Initial upload`.
+
+## How it works
+
+### Taking a document apart
 
 ```typescript
 const components = await decomposeDocument(file);
-// components.files is Map<string, Uint8Array>
-// components.metadata has type, fileName, fileCount
+// components.files: Map<string, Uint8Array>, one entry per file in the ZIP
+// components.metadata: { type: "docx" | "odf" | "unknown", fileName, fileCount }
 ```
 
-### Version Storage
+The type is detected from the contents: `[Content_Types].xml` means DOCX, a `mimetype` entry means ODF.
 
-Each version is stored as a Git commit:
-1. Component files become blobs (content-addressable)
-2. Blobs are organized into a tree
-3. Tree is referenced by a commit
-4. Commit contains message, author, timestamp
+### Storing a version
+
+`VersionTracker.initialize()` builds a working copy from in-memory parts and wraps it in a `Git` facade:
 
 ```typescript
-const tracker = await createVersionTracker();
-const versionId = await tracker.saveVersion(components, "Updated chapter 3");
+import { Git } from "@statewalker/vcs-commands";
+import { createMemoryHistory } from "@statewalker/vcs-core";
+import {
+  createMemoryCheckout,
+  createMemoryGitStaging,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+} from "@statewalker/vcs-working-tree";
+
+const history = createMemoryHistory();
+await history.initialize();
+const checkout = createMemoryCheckout({ staging: createMemoryGitStaging() });
+const worktree = createMemoryWorktree({ blobs: history.blobs, trees: history.trees });
+const git = Git.fromWorkingCopy(createMemoryWorkingCopy({ history, checkout, worktree }));
 ```
 
-### Document Reconstruction
+`saveVersion(files, message)` stores each part as a blob, adds an index entry for it through `workingCopy.checkout.staging.createEditor()`, and commits with `git.commit().setMessage(message).call()`. The version id is the commit id.
 
-To restore a version:
-1. Load the commit's tree
-2. Collect all blob contents
-3. Reassemble into a ZIP archive
+### Reading versions back
 
-```typescript
-const components = await tracker.getVersion(versionId);
-const blob = await reconstructDocument(components, "document.docx");
-```
+| Method | What it returns |
+|---|---|
+| `getVersion(id)` | `Map<path, Uint8Array>` from the commit's tree |
+| `listVersions()` | `{ id, message, date, author }[]`, newest first, walking ancestry from HEAD |
+| `compareVersions(fromId, toId)` | `{ path, type: "added" \| "removed" \| "modified" }[]` from `git.diff()` |
+| `getLatestVersionId()`, `getVersionCount()` | HEAD commit id, number of versions |
 
-## Architecture
+`reconstructDocument(files, fileName)` zips a version back into a `Blob` with the MIME type for `.docx` or `.odt`.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   Browser Application                            │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌───────────────┐    ┌───────────────┐                        │
-│  │   Document    │───▶│   Decomposer  │                        │
-│  │   (DOCX)      │    │   (JSZip)     │                        │
-│  └───────────────┘    └───────┬───────┘                        │
-│                               │                                 │
-│                               ▼                                 │
-│                    ┌─────────────────────┐                      │
-│                    │   VCS Repository    │                      │
-│                    │   (In-Memory)       │                      │
-│                    │                     │                      │
-│                    │   /word/document.xml│                      │
-│                    │   /word/styles.xml  │                      │
-│                    │   /word/media/...   │                      │
-│                    └─────────────────────┘                      │
-│                               │                                 │
-│                               ▼                                 │
-│                    ┌─────────────────────┐                      │
-│                    │   History View      │                      │
-│                    │   Version Compare   │                      │
-│                    │   Restore Version   │                      │
-│                    └─────────────────────┘                      │
-└─────────────────────────────────────────────────────────────────┘
-```
+## Why it is the way it is
 
-## API Reference
+- **Parts, not whole files.** Storing each internal file as its own blob means an edit that touches only `word/document.xml` adds one new blob; styles, media and the rest are shared with earlier versions by content address. It also makes the comparison meaningful at the part level.
+- **A flat tree.** Paths are stored with `/` replaced by `__` (`word/document.xml` becomes `word__document.xml`), so every part is a top-level entry and no subtrees need to be built. Paths are turned back on read and in diff output.
+- **No working tree.** Parts go straight into the object store and the index with a staging editor; nothing needs a file system, so the app runs in any browser.
 
-### DocumentComponents
+## What will surprise you
 
-```typescript
-interface DocumentComponents {
-  files: Map<string, Uint8Array>;
-  metadata: {
-    type: "docx" | "odf" | "unknown";
-    fileName: string;
-    fileCount: number;
-  };
-}
-```
+- **Everything is in memory.** One repository is created per page load; reloading the page loses all versions.
+- **Parts removed in a later version stay in the commit.** Staging is never cleared between saves, so each version contains every part ever added; a part deleted from the document is still there, and a comparison never reports `removed` for it.
+- **Only `.docx` and `.odt` are accepted.** Any other extension shows `Please upload a DOCX or ODT file`. Other ODF types (`.ods`, `.odp`) are rejected even though the decomposer would handle them.
+- **A part name containing `__` comes back with `/`** in its place, because of the flat-tree encoding.
+- **Rebuilt ODF files may not open everywhere.** The archive is rebuilt in tree order, so `mimetype` is not guaranteed to be the first entry, which ODF readers expect.
+- **"Restore" only changes the view.** It loads the version's parts into the page; nothing is committed until you save a version again.
+- **Errors appear in the status line** under the drop zone, as `Error processing file: <reason>`, `Error restoring version: <reason>`, `Error downloading version: <reason>` or `Error comparing versions: <reason>`.
 
-### VersionTracker
+## Reference
 
-```typescript
-class VersionTracker {
-  // Initialize repository
-  async initialize(): Promise<void>;
+### Commands
 
-  // Save a new version
-  async saveVersion(
-    components: Map<string, Uint8Array>,
-    message: string
-  ): Promise<string>;
+| Command | What it does |
+|---|---|
+| `pnpm --filter @statewalker/vcs-demo-versioned-documents dev` | Vite dev server |
+| `pnpm --filter @statewalker/vcs-demo-versioned-documents build` | Production build to `dist/` |
+| `pnpm --filter @statewalker/vcs-demo-versioned-documents preview` | Serve the production build |
+| `pnpm --filter @statewalker/vcs-demo-versioned-documents typecheck` | `tsc --noEmit` |
 
-  // Get version contents
-  async getVersion(versionId: string): Promise<Map<string, Uint8Array>>;
+### Dependencies
 
-  // List all versions
-  async listVersions(): Promise<VersionInfo[]>;
-
-  // Compare two versions
-  async compareVersions(
-    fromId: string,
-    toId: string
-  ): Promise<Array<{ path: string; type: "added" | "removed" | "modified" }>>;
-}
-```
-
-## Use Cases
-
-1. **Document Collaboration**: Track who changed what and when
-2. **Backup and Recovery**: Never lose previous versions
-3. **Audit Trail**: Required for compliance in some industries
-4. **Experimentation**: Try changes without fear of losing work
-
-## Browser Support
-
-- Chrome 86+ (full support)
-- Firefox 90+ (full support)
-- Safari 15+ (full support)
-- Edge 86+ (full support)
-
-## Limitations
-
-- Storage is in-memory only (lost on page refresh)
-- Large documents may impact performance
-- No real-time collaboration (single user)
-
-## Future Enhancements
-
-- Persistent storage using IndexedDB or File System Access API
-- Content-level diff (show actual text changes)
-- Branch support for parallel edits
-- Export version history
+`@statewalker/vcs-commands` (`Git`), `@statewalker/vcs-core` (`createMemoryHistory`, `FileMode`), `@statewalker/vcs-working-tree` (in-memory staging, checkout, worktree, working copy), `jszip` (archive read/write). `@statewalker/vcs-store-mem`, `@statewalker/webrun-files`, `@statewalker/webrun-files-browser` and `@statewalker/webrun-files-mem` are declared but not imported.

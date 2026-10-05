@@ -1,196 +1,104 @@
 # @statewalker/vcs-testing
 
-Parametrized test suites for validating storage backend implementations.
+Shared, parametrized Vitest suites that check a storage backend against the `@statewalker/vcs-core` and `@statewalker/vcs-working-tree` interfaces (blobs, trees, commits, tags, refs, staging, stash, worktree, raw storage, deltas), plus small byte helpers for writing such tests. Private to this workspace; not published.
 
-## Overview
+## Why one set of suites for every backend
 
-This internal package provides test suites that validate storage implementations against interface contracts. When you build a new storage backend, run these suites against it to ensure your implementation behaves correctly. The same tests run against store-mem, store-kv, store-sql, and store-files, guaranteeing consistent behavior across all backends.
+`@statewalker/vcs-store-mem`, `@statewalker/vcs-store-kv`, `@statewalker/vcs-store-sql` and `@statewalker/vcs-store-files` implement the same interfaces. Commands and the transport only see those interfaces, so every backend must behave the same way: same object ids for the same content, same errors for missing objects, same ref and index semantics. Each backend calls these suites from its own tests instead of keeping its own copy of the checks. The suites test behavior through the public interface only.
 
-The suites test interface compliance, not implementation details. They verify that storing an object and retrieving it returns identical content, that references update atomically, that staging entries persist correctly, and dozens of other behavioral requirements. If your implementation passes all suites, it will work correctly with the rest of the StateWalker VCS ecosystem.
+## How to use it
 
-This is a private package, intended only for development within the StateWalker VCS monorepo. It's not published to npm.
-
-## Installation
-
-This package is private and available only within the StateWalker VCS monorepo:
+Add it as a dev dependency of a workspace package:
 
 ```json
 {
   "devDependencies": {
-    "@statewalker/vcs-testing": "workspace:*"
+    "@statewalker/vcs-testing": "workspace:^"
   }
 }
 ```
 
-## Public API
-
-### Test Suites
-
-| Suite | Tests |
-|-------|-------|
-| `objectStorageSuite` | ObjectStore interface compliance |
-| `deltaObjectStorageSuite` | DeltaObjectStore interface |
-| `objectRepositorySuite` | ObjectRepository interface |
-| `deltaRepositorySuite` | DeltaRepository interface |
-| `metadataRepositorySuite` | MetadataRepository interface |
-| `commitStoreSuite` | CommitStore interface |
-| `refStoreSuite` | RefStore interface |
-| `stagingStoreSuite` | StagingStore interface |
-| `tagStoreSuite` | TagStore interface |
-| `treeStoreSuite` | TreeStore interface |
-
-### Test Utilities
+`vitest` is a peer dependency. The `exports` entry points at `dist/`, so either build the package first (`pnpm --filter @statewalker/vcs-testing build`) or alias it to source in your `vitest.config.ts`, as the store packages do:
 
 ```typescript
-import { createTestContent, collectAsync, toAsyncIterable } from "@statewalker/vcs-testing";
+{ find: "@statewalker/vcs-testing", replacement: path.resolve(import.meta.dirname, "../testing/src/index.ts") }
 ```
 
-## Usage Examples
+Every suite has the same shape: `createXxxTests(name, factory)`, where `factory` is `async () => context` and runs before each test. If the context has `cleanup`, it runs after each test.
 
-### Running Suites Against Your Implementation
+| Suite | Context fields |
+|-------|----------------|
+| `createBlobStoreTests` | `blobStore: Blobs` |
+| `createTreeStoreTests` | `treeStore: Trees` |
+| `createCommitStoreTests` | `commitStore: Commits` |
+| `createTagStoreTests` | `tagStore: Tags` |
+| `createRefStoreTests` | `refStore: Refs` |
+| `createGitObjectStoreTests` | `objectStore: GitObjectStore` |
+| `createStagingStoreTests` | `stagingStore: Staging`, `trees?: Trees` |
+| `createStashStoreTests` | `stashStore: StashStore`, `setupStagedChanges?` |
+| `createWorktreeStoreTests` | `worktreeStore: Worktree`, `setupFiles?` |
+| `createRawStorageTests` | `rawStorage: RawStorage` |
+| `createVolatileStoreTests` | `volatileStore: VolatileStore` |
+| `createDeltaApiTests` | `deltaApi: DeltaApi`, `createTestBlobs?` |
+| `createStreamingStoresTests` | `stores: History` |
+| `createGitCompatibilityTests` | `stores: History` |
+| `createCrossBackendTests(backends)` | `[{ name, factory }]` of streaming-store factories; round-trips objects between every pair |
 
-Each suite accepts a factory function that creates a fresh instance:
+Helpers: `encode`, `decode`, `toAsyncIterable`, `toAsyncIterableMulti`, `collectContent`, `concatArrays`, `randomContent(size, seed?)`, `patternContent(size, pattern?)`, `allBytesContent()`.
+
+## Examples
+
+Run suites against a backend (modeled on `packages/store-mem/tests/memory-stores.test.ts`):
 
 ```typescript
-import { describe } from "vitest";
-import { objectStorageSuite } from "@statewalker/vcs-testing";
-import { MyCustomObjectStore } from "./my-store";
-
-describe("MyCustomObjectStore", () => {
-  objectStorageSuite({
-    createStore: () => new MyCustomObjectStore(),
-    // Optional cleanup
-    cleanup: async (store) => {
-      await store.close();
-    },
-  });
-});
-```
-
-### Testing Multiple Interfaces
-
-Most backends implement multiple interfaces. Test each one:
-
-```typescript
-import { describe } from "vitest";
 import {
-  objectStorageSuite,
-  refStoreSuite,
-  commitStoreSuite,
+  createBlobStoreTests,
+  createRefStoreTests,
+  createStagingStoreTests,
 } from "@statewalker/vcs-testing";
-import { createMyStorage } from "./my-storage";
+import {
+  createMemoryObjectStores,
+  MemoryRefStore,
+  MemoryStagingStore,
+  MemoryTreeStore,
+} from "@statewalker/vcs-store-mem";
 
-describe("MyStorage", () => {
-  let storage;
-
-  beforeEach(() => {
-    storage = createMyStorage();
-  });
-
-  afterEach(async () => {
-    await storage.close();
-  });
-
-  describe("ObjectStore", () => {
-    objectStorageSuite({
-      createStore: () => storage.objectStore,
-    });
-  });
-
-  describe("RefStore", () => {
-    refStoreSuite({
-      createStore: () => storage.refStore,
-    });
-  });
-
-  describe("CommitStore", () => {
-    commitStoreSuite({
-      createStore: () => storage.commitStore,
-    });
-  });
-});
+createBlobStoreTests("Memory", async () => ({ blobStore: createMemoryObjectStores().blobs }));
+createRefStoreTests("Memory", async () => ({ refStore: new MemoryRefStore() }));
+createStagingStoreTests("Memory", async () => ({
+  stagingStore: new MemoryStagingStore(),
+  trees: new MemoryTreeStore(),
+}));
 ```
 
-### Using Test Utilities
-
-Helper functions simplify test data creation:
+Use the helpers in your own tests:
 
 ```typescript
-import { createTestContent, collectAsync, toAsyncIterable } from "@statewalker/vcs-testing";
+import { collectContent, randomContent, toAsyncIterable } from "@statewalker/vcs-testing";
 
-// Create test content of specific size
-const content = createTestContent(1024); // 1KB of deterministic content
-
-// Convert sync iterable to async
-async function* chunks() {
-  yield new Uint8Array([1, 2, 3]);
-}
-const hash = await store.store(chunks());
-
-// Collect async iterable into single Uint8Array
-const retrieved = await collectAsync(store.load(hash));
+const data = randomContent(1024); // deterministic for a given seed
+const id = await blobs.store(toAsyncIterable(data));
+const stream = await blobs.load(id); // undefined if missing
+const back = stream ? await collectContent(stream) : undefined;
 ```
 
-### What the Suites Test
+## Internals
 
-The `objectStorageSuite` verifies behaviors like:
+### What will surprise you
 
-```typescript
-// Store and retrieve returns identical content
-const hash = await store.store(content);
-const retrieved = await store.load(hash);
-expect(retrieved).toEqual(content);
+- Optional context fields gate tests silently. `createStagingStoreTests` skips its tree tests (`writeTree`, `readTree`) when `trees` is missing; they pass without running. The field is `trees`, not `treeStore`.
+- `createCheckoutStoreTests` is not exported; its suite file is disabled in `src/suites/index.ts`.
+- The package has no tests of its own; `pnpm --filter @statewalker/vcs-testing test` passes with `--passWithNoTests`.
 
-// Same content produces same hash
-const hash1 = await store.store(content);
-const hash2 = await store.store(content);
-expect(hash1).toBe(hash2);
+### Dependencies and why
 
-// Non-existent objects throw or return undefined appropriately
-await expect(store.load("nonexistent")).rejects.toThrow();
+- `@statewalker/vcs-core`, `@statewalker/vcs-working-tree`: the interfaces and helper types the suites test.
+- `vitest` (peer): the suites call `describe`, `it`, `beforeEach`, `expect` directly, so they must share the consumer's Vitest instance.
 
-// exists() returns correct values
-expect(await store.exists(hash)).toBe(true);
-expect(await store.exists("nonexistent")).toBe(false);
-```
+### Commands
 
-## Architecture
-
-### Design Decisions
-
-Parametrized testing ensures all backends share the same behavioral contract. Rather than copy-paste tests across packages, each backend imports and runs the same suites. This approach catches inconsistencies early and documents expected behavior through executable specifications.
-
-The suites test observable behavior, not internal implementation. They don't care whether your backend uses SQLite, files, or carrier pigeons—only that it stores and retrieves data correctly.
-
-### Implementation Details
-
-Each suite uses Vitest's `describe` and `it` blocks, organized by operation type. Setup and teardown hooks call the provided factory and cleanup functions, ensuring test isolation.
-
-The suites avoid implementation-specific assertions. Instead of checking internal data structures, they verify through the public interface: store content, retrieve it, compare results.
-
-## JGit References
-
-While JGit doesn't have an exact equivalent, the concept maps to:
-
-| StateWalker VCS | JGit Equivalent |
-|-----------------|-----------------|
-| Interface test suites | JGit's test infrastructure for storage implementations |
-| Parametrized testing | Tests run against FileRepository, DfsRepository, etc. |
-
-The approach mirrors how JGit tests its DFS implementations, ensuring all backends (in-memory, cloud storage) behave identically.
-
-## Dependencies
-
-**Runtime:**
-- `@statewalker/vcs-core` - Interface definitions
-
-**Peer Dependencies:**
-- `vitest` - Test framework
-
-**Development:**
-- `rolldown` - Bundling
-- `typescript` - Type definitions
-
-## License
-
-MIT
+| Command | What it does |
+|---------|--------------|
+| `pnpm --filter @statewalker/vcs-testing build` | Bundle to `dist/` with rolldown and emit `.d.ts` |
+| `pnpm --filter @statewalker/vcs-testing typecheck` | `tsc --noEmit` |
+| `pnpm --filter @statewalker/vcs-testing lint` | `biome lint src` |

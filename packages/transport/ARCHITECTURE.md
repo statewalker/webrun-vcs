@@ -21,7 +21,7 @@ Duplex Operations (fetchOverDuplex, pushOverDuplex, serveOverDuplex)
     ↓ uses
 FSM Engine (Fsm + transitions + handlers)
     ↓ uses
-TransportApi (pkt-line reader/writer, sideband demux/mux, pack streaming)
+TransportApi (pkt-line reader/writer, sideband read/write, pack streaming)
     ↓ uses
 Duplex (bidirectional async byte stream)
 ```
@@ -73,7 +73,8 @@ packages/transport/src/
 │   │   ├── server-v2-fsm.ts     # V2 server fetch
 │   │   └── types.ts             # FetchV2Request, FetchV2ResponseSection
 │   └── error-recovery/     #   Error handling FSM
-│       └── error-recovery-fsm.ts # Classify, retry, escalate
+│       ├── error-classifier.ts   # classifyError
+│       └── error-recovery-fsm.ts # Retry, reconnect, escalate
 │
 ├── operations/             # High-level operations
 │   ├── fetch.ts            #   HTTP fetch
@@ -81,37 +82,43 @@ packages/transport/src/
 │   ├── clone.ts            #   HTTP clone
 │   ├── ls-remote.ts        #   HTTP ls-remote
 │   ├── fetch-over-duplex.ts    # Duplex fetch
+│   ├── fetch-v2-over-duplex.ts # Duplex fetch (protocol v2)
 │   ├── push-over-duplex.ts     # Duplex push
 │   ├── serve-over-duplex.ts    # Duplex server
 │   └── p2p-sync.ts             # Bidirectional P2P sync
 │
 ├── protocol/               # Git wire format
 │   ├── constants.ts        #   Protocol constants (pkt markers, capabilities, etc.)
-│   ├── pkt-line.ts         #   Pkt-line encode/decode
-│   ├── sideband.ts         #   Sideband multiplex/demultiplex
+│   ├── pkt-line-codec.ts   #   Pkt-line encode/decode
+│   ├── sideband.ts         #   Sideband encode/demultiplex
 │   ├── capabilities.ts     #   Capability parsing and negotiation
-│   ├── acknowledgments.ts  #   ACK/NAK parsing and formatting
-│   ├── advertisement.ts    #   Ref advertisement parsing
+│   ├── ack-nak.ts          #   ACK/NAK parsing and formatting
+│   ├── advertisement-parser.ts # Ref advertisement parsing (internal)
 │   ├── report-status.ts    #   Push report-status parsing
 │   ├── errors.ts           #   Transport error classes
-│   ├── pack-utils.ts       #   Pack utilities (empty pack creation)
+│   ├── pack-utils.ts       #   Pack utilities (empty pack creation, internal)
 │   ├── git-request-parser.ts   # Git protocol request parsing
 │   └── types.ts            #   Packet, RefAdvertisement, ProgressInfo, etc.
 │
 ├── adapters/               # Transport adapters
-│   ├── http/               #   HTTP client adapter
+│   ├── http/               #   Smart-HTTP client and server handlers
 │   ├── messageport/        #   MessagePort ↔ Duplex
-│   └── socket/             #   WebSocket/WebRTC socket adapter
+│   ├── webrun/             #   webrun-streams Duplex ↔ transport Duplex
+│   ├── webrun-http/        #   Smart-HTTP over a webrun-streams Duplex
+│   └── socket/             #   Socket adapter (not exported from the package index)
 │
 ├── context/                # FSM execution context
 │   ├── context-adapters.ts #   Typed getters/setters for ProcessContext
-│   └── process-*.ts        #   ProcessConfiguration, ProtocolState, HandlerOutput
+│   ├── handler-output.ts   #   HandlerOutput
+│   ├── protocol-state.ts   #   ProtocolState
+│   └── process-*.ts        #   ProcessConfiguration, ProcessContext, RefStore
 │
 ├── factories/              # Factory functions
 │   ├── repository-facade-factory.ts  # RepositoryFacade from History
 │   └── transport-api-factory.ts      # TransportApi from Duplex
 │
 └── utils/                  # Utilities
+    ├── pack-stream-reader.ts #  Pack stream reading
     ├── refspec.ts           #   RefSpec parsing and matching
     └── uri.ts               #   Git URL parsing and formatting
 ```
@@ -170,13 +177,13 @@ The `Duplex` interface abstracts any bidirectional byte stream:
 
 ```typescript
 interface Duplex {
-  reader: AsyncIterable<Uint8Array>;
-  writer: WritableStreamDefaultWriter<Uint8Array>;
-  close(): Promise<void>;
+  [Symbol.asyncIterator](): AsyncIterator<Uint8Array>;
+  write(data: Uint8Array): void;
+  close?(): Promise<void>;
 }
 ```
 
-HTTP, MessagePort, WebSocket, and WebRTC connections are all adapted to this interface. Operations like `fetchOverDuplex` work with any `Duplex`, making the protocol transport-agnostic.
+HTTP, MessagePort, and webrun-streams channels are all adapted to this interface. Operations like `fetchOverDuplex` work with any `Duplex`, making the protocol transport-agnostic.
 
 ### TransportApi
 
@@ -185,13 +192,18 @@ The `TransportApi` wraps a `Duplex` with Git protocol-aware I/O:
 ```typescript
 interface TransportApi {
   readPktLine(): Promise<PktLineResult>;
-  writePktLine(data: Uint8Array): Promise<void>;
+  writePktLine(data: string | Uint8Array): Promise<void>;
   writeFlush(): Promise<void>;
+  writeDelimiter(): Promise<void>;
+  readLine(): Promise<string | null>;
+  writeLine(line: string): Promise<void>;
   readSideband(): Promise<SidebandResult>;
-  writeSidebandData(data: Uint8Array): Promise<void>;
-  readPack(): AsyncIterable<Uint8Array>;
-  writePack(pack: AsyncIterable<Uint8Array>): Promise<void>;
-  close(): Promise<void>;
+  writeSideband(channel: 1 | 2 | 3, data: Uint8Array): Promise<void>;
+  readPack(): AsyncGenerator<Uint8Array>;
+  readRawPack(): AsyncGenerator<Uint8Array>;
+  writePack(data: AsyncIterable<Uint8Array>): Promise<void>;
+  writeRawPack(data: AsyncIterable<Uint8Array>): Promise<void>;
+  close?(): Promise<void>;
 }
 ```
 
@@ -210,7 +222,7 @@ const refs = getRefStore(ctx);
 
 Two interfaces bridge transport and storage:
 
-- **`RepositoryFacade`** — Optimized for pack-based protocol operations. Exposes pack export/import, ancestry walking, reachability checking. Used by FSM handlers. Created via `createVcsRepositoryFacade()`.
+- **`RepositoryFacade`** — Optimized for pack-based protocol operations. Exposes pack export/import, ancestry walking, reachability checking. Used by FSM handlers. Created via `createVcsRepositoryFacade()` or `createStorageRepositoryFacade()` (in `@statewalker/vcs-transport-adapters`), or `createRepositoryFacade()` (in this package).
 
 - **`RepositoryAccess`** — Optimized for object-level server operations. Exposes object/ref CRUD, HEAD resolution, graph walking. Used by HTTP server routing. Created via `createVcsRepositoryAccess()`.
 

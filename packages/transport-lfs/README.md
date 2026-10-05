@@ -1,55 +1,122 @@
 # @statewalker/vcs-transport-lfs
 
-The standard Git LFS batch protocol plus basic (whole-object) transfer, client and server, over a content-store.
+## What it is
 
-## Overview
+A client and server for the standard Git LFS batch protocol (`POST /objects/batch`) with the `basic` whole-object transfer. Object bytes live in a `@statewalker/webrun-content-store` `ContentStore`. The LFS object id (`oid`) is the whole-file SHA-256 as bare lowercase hex. An injected `LfsResolver` maps LFS oids to content-store object ids.
 
-`vcs-transport-lfs` speaks the **standard Git LFS batch protocol** (`POST /objects/batch`) plus basic whole-object transfer, both client and server, so the system interoperates on the wire with real Git LFS hosts. The LFS object id (`oid`) is the whole-file **SHA-256** (bare lowercase hex — the authoritative LFS identity); bytes live in a `@statewalker/webrun-content-store`, whose object ids are opaque and unrelated, and an injected `LfsResolver` maps between the two.
+## Why it exists: talk to real LFS hosts from any runtime
 
-It is the LFS skin of Axis B. Its job is *standard* whole-object transfer; chunk-aware dedup transfer is `@statewalker/vcs-transport-xet`, and pointer clean/smudge is the working-tree LFS filter. This module knows nothing of git objects, chunks, pointers, or sync.
+Large files are exchanged with Git LFS hosts through the batch API. This package implements that wire protocol on top of the content-store, using only `Request`/`Response` and Web Crypto, so the same code runs in browsers, workers, Node and Deno. It does whole-object transfer only; chunk-level dedup is `@statewalker/vcs-transport-xet`, which falls back to this package. It knows nothing about git objects, LFS pointer files or sync.
 
-## Installation
+## How to use: a server handler and two client generators
 
 ```bash
 pnpm add @statewalker/vcs-transport-lfs
 ```
 
-## Quick Start
+No peer dependencies. One entry point, `@statewalker/vcs-transport-lfs` (ESM, with type declarations).
+
+| Export | Description |
+|--------|-------------|
+| `serveLfs(store, resolver)` | Server: a `(Request) => Promise<Response>` handler for `POST {base}/objects/batch`, `PUT {base}/objects/<oid>` and `GET {base}/objects/<oid>` |
+| `lfsUpload(store, resolver, url, pointers, fetchImpl?)` | Client: batch `upload`, then `PUT` each object the server asks for. Yields `TransportEvent`s |
+| `lfsDownload(store, resolver, url, pointers, fetchImpl?)` | Client: batch `download`, then `GET`, verify and store each object. Yields `TransportEvent`s |
+| `sha256Hex(bytes)` | `Promise<string>`: whole-object SHA-256 as bare hex (the LFS oid) |
+| `BASIC_TRANSFER`, `LFS_CONTENT_TYPE` | `"basic"` and `"application/vnd.git-lfs+json"` |
+| `BatchRequest`, `BatchResponse`, `BatchObjectRequest`, `BatchObjectResponse`, `BatchAction` | Batch API JSON shapes |
+| `LfsPointer`, `LfsResolver`, `FetchLike`, `TransportEvent` | Injected and emitted types |
+
+- `LfsPointer` is `{ oid, size }`.
+- `LfsResolver` is `{ toObject(lfsOid), record(lfsOid, objectId) }`. The package never persists this map; the caller owns it.
+- `FetchLike` is `(request: Request) => Response | Promise<Response>`. It defaults to the global `fetch`. A `serveLfs` handler has the same shape, so it can be passed directly for an in-process loopback.
+- `TransportEvent` is one of `{ type: "batch", operation, count }`, `{ type: "object-uploaded", oid }`, `{ type: "object-downloaded", oid }`, `{ type: "error", oid, reason }`.
+
+## Examples
+
+### Set up a store and a resolver
+
+```typescript
+import { createContentStore, type ObjectId } from "@statewalker/webrun-content-store";
+import { memBlobStore } from "@statewalker/webrun-storage";
+import type { LfsResolver } from "@statewalker/vcs-transport-lfs";
+
+const store = createContentStore({
+  chunks: memBlobStore(),
+  manifests: memBlobStore(),
+  hashContent, // your (stream) => Promise<string> content hash
+});
+
+const map = new Map<string, ObjectId>();
+const resolver: LfsResolver = {
+  toObject: async (oid) => map.get(oid),
+  record: async (oid, id) => void map.set(oid, id),
+};
+```
+
+### Serve, upload and download
 
 ```typescript
 import { lfsDownload, lfsUpload, serveLfs, sha256Hex } from "@statewalker/vcs-transport-lfs";
 
-// Server side: a content-store + resolver, exposed as a fetch-like LFS handler.
-const handler = serveLfs(serverStore, serverResolver); // (request: Request) => Response
+// Server side.
+const handler = serveLfs(serverStore, serverResolver);
 
-// Client side: object present locally, its sha256 oid known via the resolver.
-const ptr = { oid: sha256Hex(bytes), size: bytes.length };
+// Client side: the object is already in clientStore and recorded in clientResolver.
+const pointer = { oid: await sha256Hex(bytes), size: bytes.length };
 
-for await (const event of lfsUpload(clientStore, clientResolver, "http://lfs.host", [ptr], handler)) {
-  if (event.type === "object-uploaded") console.log("uploaded", event.oid);
+for await (const e of lfsUpload(clientStore, clientResolver, "http://lfs.host", [pointer], handler)) {
+  if (e.type === "error") console.error(e.oid, e.reason);
 }
 
-// Download by sha256 oid into the local content-store; bytes are verified to hash to the oid.
-for await (const event of lfsDownload(localStore, localResolver, "http://lfs.host", [ptr], handler)) {
-  if (event.type === "object-downloaded") console.log("downloaded", event.oid);
+for await (const e of lfsDownload(otherStore, otherResolver, "http://lfs.host", [pointer], handler)) {
+  if (e.type === "object-downloaded") console.log("downloaded", e.oid);
 }
 ```
 
-The `fetchImpl` argument defaults to global `fetch`; passing a `serveLfs` handler gives an in-process loopback (as the tests do).
+Against a real host, omit the last argument to use the global `fetch`, and pass the LFS endpoint URL (the client appends `/objects/batch`).
 
-## API
+## Internals
 
-- **`serveLfs(store, resolver): HttpHandler`** — server: a fetch-like handler answering the batch API + basic PUT/GET over a `ContentStore`.
-- **`lfsUpload(store, resolver, url, oids, fetchImpl?): AsyncIterable<TransportEvent>`** — client upload of whole objects.
-- **`lfsDownload(store, resolver, url, oids, fetchImpl?): AsyncIterable<TransportEvent>`** — client download; reassembled bytes are verified against the LFS oid.
-- **`sha256Hex(bytes): string`** — the whole-object SHA-256 (bare hex) LFS oid.
-- Batch protocol constants + shapes: `BASIC_TRANSFER`, `LFS_CONTENT_TYPE`, `BatchRequest` / `BatchResponse` / `BatchObjectRequest` / `BatchObjectResponse` / `BatchAction`.
+### Why the oid and the store id are separate
 
-Injected types: `LfsResolver` (`toObject(oid)` / `record(oid, objId)` — the package never persists the map), `LfsPointer` (`{ oid, size }`), `FetchLike`, `TransportEvent`.
+The LFS oid is fixed by the LFS spec: SHA-256 of the whole file. The content-store computes its own ids with whatever `hashContent` it was given, and those ids are opaque. The resolver maps between the two, so the content-store does not have to use SHA-256 and the package stores no state of its own.
 
-## Notes
+### Why every transfer is hash-checked
 
-- **Wire-standard interop.** On the wire it moves whole objects with SHA-256 oids, so it talks to real Git LFS hosts; locally the content-store assembles the whole object on read and stores it on write.
-- **Whole-object SHA-256 is verified** on transfer, as the LFS spec requires.
-- **Injected resolver.** The oid ↔ content-store-id map is injected, not owned here (the working-tree LFS skin owns persistence); tests use a `Map`-backed resolver.
-- No chunk dedup (see `@statewalker/vcs-transport-xet`), no pointer clean/smudge (working-tree filter). Built red/green TDD.
+The LFS spec requires the receiver to verify the whole-object SHA-256. Both sides do it before storing: the client in `lfsDownload`, the server on `PUT`. Bytes that do not match are never stored.
+
+### Constraints
+
+- Whole objects are buffered in memory on both sides (read fully, hashed, then stored).
+- `sha256Hex` uses `crypto.subtle`, which is async, so it returns a Promise.
+- The server always offers an upload action for every object in an `upload` batch, even one it already has.
+- The server ignores the request's `transfers` list and always answers with `basic`.
+- No authentication is built in. Pass a `fetchImpl` that adds headers if the host needs them; batch actions' `header` values are forwarded on `PUT`/`GET`.
+- The client does not check the HTTP status of the batch `POST`; it parses the body as a `BatchResponse`.
+
+### What failures look like
+
+Client generators do not throw for per-object failures. They yield `{ type: "error", oid, reason }` with one of:
+
+- the server's batch error message, for example `Object does not exist` (download of an unknown oid)
+- `no local object for oid` (upload: resolver has no mapping)
+- `no download action`
+- `upload failed: <status>` / `download failed: <status>`
+- `sha256 mismatch` (downloaded bytes do not hash to the oid)
+
+Server responses: `422 {"message":"oid does not match content"}` on a `PUT` whose bytes do not hash to the path oid; `404 {"message":"Object does not exist"}` on a `GET` for an unknown oid; `404 {"message":"Not found"}` for any other route.
+
+### Dependencies
+
+- `@statewalker/webrun-content-store`: the `ContentStore` that holds object bytes.
+- `@statewalker/webrun-http-streams`: the `HttpHandler` type returned by `serveLfs`.
+
+### Commands
+
+```bash
+pnpm --filter @statewalker/vcs-transport-lfs test
+```
+
+## License
+
+MIT

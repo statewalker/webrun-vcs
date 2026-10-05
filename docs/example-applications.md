@@ -19,12 +19,12 @@ Package names follow `@statewalker/vcs-example-<name>`, `@statewalker/vcs-demo-<
 | [05-history-operations](#05-history-operations) | example | Log, diff, blame, ancestry |
 | [06-internal-storage](#06-internal-storage) | example | Loose objects, packs, GC, deltas |
 | [07-staging-checkout](#07-staging-checkout) | example | Working directory and staging area |
-| [08-transport-basics](#08-transport-basics) | example | Clone, fetch, push over HTTP |
+| [08-transport-basics](#08-transport-basics) | example | List refs, clone, fetch over HTTP |
 | [09-repository-access](#09-repository-access) | example | Serving repositories over transport |
 | [10-custom-storage](#10-custom-storage) | example | Building storage backends from components |
 | [11-delta-strategies](#11-delta-strategies) | example | Storage optimization with the DeltaApi |
 | [browser-vcs-app](#browser-vcs-app) | demo | Browser VCS with swappable storage |
-| [git-cli-sandbox](#git-cli-sandbox) | demo | Git CLI over the porcelain API (WIP) |
+| [git-cli-sandbox](#git-cli-sandbox) | demo | Git CLI over the porcelain API |
 | [git-workflow-complete](#git-workflow-complete) | demo | End-to-end porcelain workflow |
 | [http-server-scratch](#http-server-scratch) | demo | Git HTTP server from scratch |
 | [livekit-p2p-sync](#livekit-p2p-sync) | demo | LiveKit peer-to-peer sync |
@@ -175,7 +175,7 @@ pnpm --filter @statewalker/vcs-demo-browser-app dev
 
 **Location:** [apps/demos/git-cli-sandbox](../apps/demos/git-cli-sandbox) — **node**
 
-A Git CLI sandbox (clone, commit, branch, merge, push over HTTP) built on the VCS porcelain API. Work in progress — depends on a file-system store.
+A Git CLI sandbox (init, clone, add, rm, status, commit, branch, checkout, merge, log, diff, remote, and fetch/pull/push over HTTP) built on the VCS porcelain API over a file-backed store (`@statewalker/vcs-store-files`).
 
 ```bash
 pnpm --filter @statewalker/vcs-demo-git-cli-sandbox start
@@ -195,7 +195,7 @@ pnpm --filter @statewalker/vcs-demo-git-workflow-complete start
 
 **Location:** [apps/demos/http-server-scratch](../apps/demos/http-server-scratch) — **node**
 
-Builds a Git HTTP server from scratch (no `git http-backend`) and drives a full roundtrip: create a remote with VCS, serve it, clone with VCS transport, verify with native git, commit + branch, push, and verify again.
+Builds a Git HTTP server from scratch (no `git http-backend`) and drives a full roundtrip: create a remote with VCS, serve it, clone with VCS transport, verify with native git, commit + branch, push, and verify again. Listens on port 8080 by default (`start -- --port 9000` to change it) and needs native `git` on `PATH` for the verification steps.
 
 ```bash
 pnpm --filter @statewalker/vcs-demo-http-server-scratch start

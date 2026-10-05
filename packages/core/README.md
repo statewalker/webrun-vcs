@@ -1,628 +1,218 @@
 # @statewalker/vcs-core
 
-Core Git-compatible VCS types, interfaces, and operations for building version control systems.
+## What it is
 
-## Overview
+The Git object engine: types and stores for blobs, trees, commits, annotated tags and refs, ancestry walks and merge-base search, Git pack reading and writing, delta compression and garbage collection. Objects are byte-compatible with Git (same SHA-1 ids, same serialization). Storage is pluggable; the package ships in-memory storage and an adapter onto the `@statewalker/webrun-storage` byte seam.
 
-This package provides the foundational layer for building Git-compatible version control systems. It defines the core object model (blobs, trees, commits, tags), storage interfaces, and high-level operations that power the entire StateWalker VCS ecosystem. Think of it as the engine that drives all VCS functionality while remaining agnostic to how and where data is actually stored.
+## Why it exists
 
-The design follows a clear separation between interfaces and implementations. The package defines what operations are possible (storing commits, managing references, tracking staged files) without dictating how storage backends implement them. This architecture enables the same VCS logic to work across diverse environments: browser-based IndexedDB storage, Node.js filesystem access, or cloud-based solutions.
+Versioning needs one engine that knows Git's object model and nothing else. This package does not touch a working directory, a staging index or a network connection, and it does not know where bytes are stored. Those concerns sit in other packages that build on it:
 
-All interfaces use streaming patterns with `AsyncIterable<Uint8Array>` to handle large files and repositories efficiently. Memory consumption stays bounded regardless of file sizes, making the library suitable for constrained environments like web browsers or edge deployments.
+- `@statewalker/vcs-working-tree`: staging, checkout, worktree, status, stash
+- `@statewalker/vcs-commands`: porcelain commands (`add`, `commit`, `merge`, ...)
+- `@statewalker/vcs-store-*`: storage backends (Git files on disk, SQL, key-value, memory)
+- `@statewalker/vcs-transport*`: Git wire protocol and large-object transfer
 
-## Installation
+Because the engine only reads and writes through interfaces, the same commit, tree and ref logic runs in a browser over IndexedDB, in Node.js over a `.git` directory, or in tests over memory.
+
+## How to use it
 
 ```bash
 pnpm add @statewalker/vcs-core
 ```
 
-**Peer Dependencies:**
-- `@statewalker/vcs-utils` - Required for compression, hashing, and delta algorithms
+`@statewalker/vcs-utils` (hashing, compression, deltas) and `@statewalker/webrun-storage` (the byte seam) are regular dependencies and are installed with it. No peer dependencies. Runs in browsers, workers and Node.js.
 
-## Core Concepts
+| Import path | Contents |
+|-------------|----------|
+| `@statewalker/vcs-core` | Everything from `history`, `storage` and `backend`, plus `createVcsCore`, GC (`GcOrchestrator`, `MemoryGcStrategy`), `FileMode`, `ObjectId`, `PersonIdent` and the file helpers re-exported from `@statewalker/vcs-utils/files` |
+| `@statewalker/vcs-core/history` | `History`, `HistoryWithOperations`, typed stores (`Blobs`, `Trees`, `Commits`, `Tags`, `Refs`), factories (`createMemoryHistory`, `createMemoryHistoryWithOperations`, `createGitFilesHistory`, `createHistoryFromStores`, `createHistoryFromComponents`), object/commit/tree/tag formats, ref constants (`HEAD`, `R_HEADS`, ...) |
+| `@statewalker/vcs-core/storage` | Raw storage (`MemoryRawStorage`, `CompressedRawStorage`, `ChunkedRawStorage`, ...), delta engine and strategies, webrun-storage adapters (`blobStoreToRawStorage`, `kvStoreRefs`) |
+| `@statewalker/vcs-core/backend` | Backend registry (`createHistory`, `registerHistoryBackendFactory`), `BackendCapabilities`, `StorageOperations`, pack files (`writePack`, `indexPack`, `readPackIndex`, `parsePackEntries`, ...) |
+| `@statewalker/vcs-core/serialization` | `SerializationApi`, `DefaultSerializationApi`, `createSerializationApi(history)` (not in the root export) |
 
-### Git Object Model
-
-Git stores all content as four object types, each identified by a SHA-1 hash of its contents:
-
-| Type | Description | Example |
-|------|-------------|---------|
-| **Blob** | Raw file content | Source code, images, binaries |
-| **Tree** | Directory listing | Maps names to blobs/trees with file modes |
-| **Commit** | Snapshot with metadata | Points to tree, parents, author, message |
-| **Tag** | Annotated reference | Named pointer with tagger info and message |
-
-This content-addressable design means identical content always produces identical IDs, enabling deduplication and integrity verification.
-
-### Store Hierarchy
-
-The package organizes storage in layers, from raw bytes to semantic objects:
-
-```
-History (unified entry point for immutable objects)
-├── Blobs (file contents, streaming)
-├── Trees (directory snapshots)
-├── Commits (history with ancestry traversal)
-├── Tags (annotated tags)
-└── Refs (branches, tags, HEAD)
-```
-
-Lower layers (RawStorage, ChunkAccess) handle raw storage and compression, while higher layers provide semantic operations like commit ancestry traversal or reference resolution.
-
-### History vs WorkingCopy
-
-The package separates immutable history from mutable local state:
-
-| Concept | Purpose | Examples |
-|---------|---------|----------|
-| **History** | Immutable content-addressed objects | Commits, trees, blobs, tags, refs |
-| **WorkingCopy** | Mutable local state | Staging area, HEAD, merge state, stash |
-
-Multiple WorkingCopies can share a single History, similar to `git worktree`. This separation enables:
-
-- Clean architectural boundaries
-- Multiple parallel checkouts
-- Clear ownership of state
-
-```
-WorkingCopy (mutable local state)
-├── checkout (HEAD, staging, operation state)
-├── worktreeInterface (filesystem access)
-├── stash
-├── config (per-worktree settings)
-└── history (shared immutable objects)
-        ├── blobs, trees, commits, tags
-        └── refs (branches, tags, remotes)
-```
-
-**Note:** `HistoryStore` is the deprecated legacy interface. Use `History` for new code.
-
-## Public API
-
-### Main Export
+The happy path is an in-memory `History`:
 
 ```typescript
-import {
-  // New interfaces (recommended)
-  type History,
-  type HistoryWithOperations,
-  type Blobs,
-  type Trees,
-  type Commits,
-  type Tags,
-  type Refs,
-  type ObjectStorage,
-  type Staging,
-  type Checkout,
-  type Worktree,
-  type WorkingCopy,
+import { createMemoryHistory } from "@statewalker/vcs-core";
 
-  // Factory functions
-  createHistoryWithOperations,
-  createHistoryFromStores,
-  createMemoryHistory,
-
-  // Core types
-  type ObjectId,
-  type ObjectType,
-  type TreeEntry,
-  type Commit,
-  type AnnotatedTag,
-  type PersonIdent,
-  type Ref,
-  type SymbolicRef,
-
-  // File modes
-  FileMode,
-
-  // Storage abstractions
-  type RawStorage,
-  type StorageOperations,
-  type BackendCapabilities,
-
-  // Deprecated stores (for migration)
-  type HistoryStore,  // Use History instead
-  type BlobStore,     // Use Blobs instead
-  type TreeStore,     // Use Trees instead
-  type CommitStore,   // Use Commits instead
-  type TagStore,      // Use Tags instead
-  type RefStore,      // Use Refs instead
-  type StagingStore,  // Use Staging instead
-} from "@statewalker/vcs-core";
-```
-
-### Sub-exports
-
-| Export Path | Description |
-|-------------|-------------|
-| `@statewalker/vcs-core/types` | All type definitions |
-| `@statewalker/vcs-core/stores` | Store interfaces |
-| `@statewalker/vcs-core/staging` | Staging area types |
-| `@statewalker/vcs-core/format` | Serialization utilities |
-
-### Key Interfaces
-
-**New Interfaces (Recommended):**
-
-| Interface | Purpose |
-|-----------|---------|
-| `History` | Immutable object storage (blobs, trees, commits, tags, refs) |
-| `HistoryWithOperations` | History with delta/serialization APIs |
-| `ObjectStorage<V>` | Base interface for content-addressed stores |
-| `Blobs` | File content (streaming I/O) |
-| `Trees` | Directory snapshots with entry lookup |
-| `Commits` | Commits with ancestry traversal and merge base detection |
-| `Tags` | Annotated tags with target resolution |
-| `Refs` | Branches, tags, HEAD management |
-| `Staging` | Index with conflict resolution |
-| `Checkout` | HEAD management and operation state |
-| `Worktree` | Working directory filesystem access |
-| `WorkingCopy` | Links History + Checkout + Worktree |
-| `TransformationStore` | Merge, rebase, cherry-pick, revert state |
-| `ResolutionStore` | Conflict detection and rerere |
-
-**Deprecated Interfaces:**
-
-| Interface | Replacement |
-|-----------|-------------|
-| `HistoryStore` | Use `History` |
-| `BlobStore` | Use `Blobs` |
-| `TreeStore` | Use `Trees` |
-| `CommitStore` | Use `Commits` |
-| `TagStore` | Use `Tags` |
-| `RefStore` | Use `Refs` |
-| `StagingStore` | Use `Staging` |
-| `WorktreeStore` | Use `Worktree` |
-
-## Usage Examples
-
-### Working with the History Interface (Recommended)
-
-The `History` interface provides unified access to all immutable objects:
-
-```typescript
-import type { History, Commit } from "@statewalker/vcs-core";
-import { createMemoryHistory, FileMode } from "@statewalker/vcs-core";
-
-// Create in-memory history for testing
 const history = createMemoryHistory();
 await history.initialize();
-
-// Store a blob
-const content = new TextEncoder().encode("Hello, World!");
-const blobId = await history.blobs.store([content]);
-
-// Create a tree
-const treeId = await history.trees.store([
-  { mode: FileMode.REGULAR_FILE, name: "README.md", id: blobId }
-]);
-
-// Create a commit
-const commit: Commit = {
-  tree: treeId,
-  parents: [],
-  author: {
-    name: "Developer",
-    email: "dev@example.com",
-    timestamp: Math.floor(Date.now() / 1000),
-    tzOffset: "+0000",
-  },
-  committer: {
-    name: "Developer",
-    email: "dev@example.com",
-    timestamp: Math.floor(Date.now() / 1000),
-    tzOffset: "+0000",
-  },
-  message: "Initial commit",
-};
-
-const commitId = await history.commits.store(commit);
-await history.refs.set("refs/heads/main", commitId);
-
+// history.blobs, history.trees, history.commits, history.tags, history.refs
 await history.close();
 ```
 
-### Using Legacy HistoryStore Interface
+## Examples
 
-For backward compatibility, the deprecated `HistoryStore` interface still works:
-
-```typescript
-import type { HistoryStore, Commit } from "@statewalker/vcs-core";
-
-async function createCommit(repo: HistoryStore, message: string): Promise<ObjectId> {
-  // Get current HEAD
-  const headRef = await repo.refs.resolve("HEAD");
-  const parentId = headRef?.objectId;
-
-  // Build tree from staging area
-  const treeId = await repo.staging.writeTree(repo.trees);
-
-  // Create commit object
-  const commit: Commit = {
-    tree: treeId,
-    parents: parentId ? [parentId] : [],
-    author: {
-      name: "Developer",
-      email: "dev@example.com",
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: "+0000",
-    },
-    committer: {
-      name: "Developer",
-      email: "dev@example.com",
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: "+0000",
-    },
-    message,
-  };
-
-  // Store and update HEAD (legacy method names)
-  const commitId = await repo.commits.storeCommit(commit);
-  await repo.refs.set("refs/heads/main", commitId);
-
-  return commitId;
-}
-```
-
-### Working with WorkingCopy
-
-The `WorkingCopy` interface provides access to local checkout state:
+### Store a blob, a tree and a commit
 
 ```typescript
-import type { WorkingCopy } from "@statewalker/vcs-core";
+import { createMemoryHistory, FileMode, type PersonIdent } from "@statewalker/vcs-core";
 
-async function checkWorkingCopyStatus(wc: WorkingCopy): Promise<void> {
-  // Get current branch
-  const branch = await wc.getCurrentBranch();
-  console.log(`On branch: ${branch ?? "detached HEAD"}`);
+const history = createMemoryHistory();
+await history.initialize();
 
-  // Check for in-progress operations
-  if (await wc.hasOperationInProgress()) {
-    const mergeState = await wc.getMergeState();
-    if (mergeState) {
-      console.log(`Merge in progress: ${mergeState.mergeHead}`);
-    }
+const blobId = await history.blobs.store([new TextEncoder().encode("Hello, World!\n")]);
 
-    const rebaseState = await wc.getRebaseState();
-    if (rebaseState) {
-      console.log(`Rebase: step ${rebaseState.current}/${rebaseState.total}`);
-    }
-  }
+// Entries can be in any order; they are sorted the way Git sorts them
+const treeId = await history.trees.store([
+  { mode: FileMode.REGULAR_FILE, name: "README.md", id: blobId },
+]);
 
-  // Get status
-  const status = await wc.getStatus();
-  if (!status.isClean) {
-    console.log("Working tree has uncommitted changes");
-  }
-}
+const me: PersonIdent = {
+  name: "Developer",
+  email: "dev@example.com",
+  timestamp: Math.floor(Date.now() / 1000), // Unix seconds
+  tzOffset: "+0000",
+};
+const commitId = await history.commits.store({
+  tree: treeId,
+  parents: [],
+  author: me,
+  committer: me,
+  message: "Initial commit\n",
+});
 
-// Using stash
-async function stashChanges(wc: WorkingCopy, message: string): Promise<void> {
-  const stashId = await wc.stash.push(message);
-  console.log(`Created stash: ${stashId}`);
-
-  // List stashes
-  for await (const entry of wc.stash.list()) {
-    console.log(`stash@{${entry.index}}: ${entry.message}`);
-  }
-
-  // Pop most recent
-  await wc.stash.pop();
-}
+await history.refs.set("refs/heads/main", commitId);
+await history.refs.setSymbolic("HEAD", "refs/heads/main");
 ```
 
-### Storing and Loading Blobs
+### Read content back
 
 ```typescript
-import type { BlobStore } from "@statewalker/vcs-core";
-
-async function storeFile(blobs: BlobStore, content: string): Promise<ObjectId> {
-  const encoder = new TextEncoder();
-  const bytes = encoder.encode(content);
-
-  // Store returns the content-addressed ID
-  const id = await blobs.store([bytes]);
-  console.log(`Stored blob: ${id}`);
-
-  return id;
+const content = await history.blobs.load(blobId); // AsyncIterable<Uint8Array> | undefined
+if (content) {
+  for await (const chunk of content) process(chunk);
 }
 
-async function loadFile(blobs: BlobStore, id: ObjectId): Promise<string> {
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of blobs.load(id)) {
-    chunks.push(chunk);
-  }
+const tree = await history.trees.load(treeId); // AsyncIterable<TreeEntry> | undefined
+const readme = await history.trees.getEntry(treeId, "README.md");
 
-  const decoder = new TextDecoder();
-  return decoder.decode(concat(chunks));
-}
+const commit = await history.commits.load(commitId); // Commit | undefined
 ```
 
-### Building Trees
+### Walk history and refs
 
 ```typescript
-import type { TreeStore, TreeEntry } from "@statewalker/vcs-core";
-import { FileMode } from "@statewalker/vcs-core";
+const head = await history.refs.resolve("HEAD"); // follows symbolic refs: { name, objectId, ... }
 
-async function buildTree(trees: TreeStore, blobs: BlobStore): Promise<ObjectId> {
-  // Store file contents first
-  const readmeId = await blobs.store([new TextEncoder().encode("# My Project")]);
-  const srcIndexId = await blobs.store([new TextEncoder().encode("export {};\n")]);
-
-  // Create src/ subtree
-  const srcTreeId = await trees.storeTree([
-    { mode: FileMode.REGULAR_FILE, name: "index.ts", id: srcIndexId },
-  ]);
-
-  // Create root tree
-  const rootTreeId = await trees.storeTree([
-    { mode: FileMode.REGULAR_FILE, name: "README.md", id: readmeId },
-    { mode: FileMode.TREE, name: "src", id: srcTreeId },
-  ]);
-
-  return rootTreeId;
+for await (const id of history.commits.walkAncestry(head!.objectId, { limit: 20 })) {
+  const c = await history.commits.load(id);
+  console.log(id.slice(0, 7), c?.message.split("\n")[0]);
 }
+
+const bases = await history.commits.findMergeBase(commitA, commitB); // ObjectId[]
+const isAnc = await history.commits.isAncestor(commitA, commitB);
+
+for await (const ref of history.refs.list("refs/heads/")) {
+  console.log(ref.name);
+}
+
+// Atomic update: succeeds only if the ref still points at expectedOldId
+const result = await history.refs.compareAndSwap("refs/heads/main", expectedOldId, newId);
 ```
 
-### Traversing Commit History
+`walkAncestry` accepts one id or an array, and the options `limit`, `stopAt` and `firstParentOnly`.
+
+### Build and import a pack
 
 ```typescript
-import type { CommitStore } from "@statewalker/vcs-core";
+import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
+import { createSerializationApi } from "@statewalker/vcs-core/serialization";
 
-async function* getHistory(
-  commits: CommitStore,
-  startId: ObjectId,
-  limit = 100
-): AsyncIterable<{ id: ObjectId; commit: Commit }> {
-  for await (const id of commits.walkAncestry([startId], { limit })) {
-    const commit = await commits.loadCommit(id);
-    yield { id, commit };
-  }
+async function* wanted() {
+  yield commitId;
+  yield treeId;
+  yield blobId;
 }
 
-// Usage
-for await (const { id, commit } of getHistory(repo.commits, headId)) {
-  console.log(`${id.slice(0, 7)} ${commit.message.split("\n")[0]}`);
-}
+// Pack from any History
+const pack = createSerializationApi(history).createPack(wanted());
+
+// HistoryWithOperations already carries a serialization API
+const target = createMemoryHistoryWithOperations();
+await target.initialize();
+const stats = await target.serialization.importPack(pack);
+// { objectsImported: 3, treesImported: 1, commitsImported: 1, ... }
 ```
 
-### Managing References
+### The `VcsCore` facade over `@statewalker/webrun-storage`
+
+`createVcsCore()` builds the same engine over a `BlobStore` (object bytes) and a `KvStore` (refs) and returns a smaller API: arrays instead of async iterables where that is simpler, one merge base, hydrated log entries, and refs with `read` / `compareAndSet` / `list`.
 
 ```typescript
-import type { RefStore } from "@statewalker/vcs-core";
+import { createVcsCore, FileMode } from "@statewalker/vcs-core";
+import { memBlobStore, memKvStore } from "@statewalker/webrun-storage";
 
-async function createBranch(refs: RefStore, name: string, commitId: ObjectId): Promise<void> {
-  const refName = `refs/heads/${name}`;
-  await refs.set(refName, commitId);
-}
+const vcs = createVcsCore({ objects: memBlobStore(), refs: memKvStore() });
 
-async function getCurrentBranch(refs: RefStore): Promise<string | undefined> {
-  const head = await refs.get("HEAD");
-  if (head && "target" in head) {
-    // HEAD is a symbolic ref pointing to a branch
-    return head.target.replace("refs/heads/", "");
-  }
-  return undefined; // Detached HEAD
-}
+const blob = await vcs.writeBlob(
+  (async function* () {
+    yield new TextEncoder().encode("hi\n");
+  })(),
+);
+const tree = await vcs.writeTree([{ mode: FileMode.REGULAR_FILE, name: "a.txt", id: blob }]);
+const commit = await vcs.writeCommit({ tree, parents: [], author: me, committer: me, message: "first\n" });
 
-async function listBranches(refs: RefStore): Promise<string[]> {
-  const branches: string[] = [];
-  for await (const ref of refs.list("refs/heads/")) {
-    branches.push(ref.name.replace("refs/heads/", ""));
-  }
-  return branches;
-}
+await vcs.refs.compareAndSet("refs/heads/main", undefined, commit);
+for await (const entry of vcs.log(commit)) console.log(entry.id, entry.message);
+
+const { pruned } = await vcs.gc();
 ```
 
-### Working with the Staging Area
+`filesBlobStore()` from `@statewalker/webrun-storage` stores the same objects in any `FilesApi` instead of memory.
 
-```typescript
-import type { StagingStore, StagingEntry } from "@statewalker/vcs-core";
-import { FileMode } from "@statewalker/vcs-core";
+### Git repositories on disk
 
-async function stageFile(
-  staging: StagingStore,
-  path: string,
-  objectId: ObjectId
-): Promise<void> {
-  const editor = staging.editor();
-  editor.add({
-    path,
-    apply: () => ({
-      path,
-      mode: FileMode.REGULAR_FILE,
-      objectId,
-      stage: 0, // MERGED (no conflict)
-      size: 0,
-      mtime: Date.now(),
-    }),
-  });
-  await editor.finish();
-}
+`createGitFilesHistory(config)` assembles a `HistoryWithOperations` from already-built Git-file stores (blobs, trees, commits, tags, refs and a pack delta store). The package that builds those stores from a `FilesApi` is `@statewalker/vcs-store-files` (`createGitFilesBackend({ files, gitDir })`).
 
-async function listStagedFiles(staging: StagingStore): Promise<string[]> {
-  const paths: string[] = [];
-  for await (const entry of staging.listEntries()) {
-    paths.push(entry.path);
-  }
-  return paths;
-}
+## Internals
+
+### How the layers stack
+
+```
+History / HistoryWithOperations        createMemoryHistory(), createGitFilesHistory(), createVcsCore()
+  ├─ blobs, trees, commits, tags      typed, parsed objects (Blobs, Trees, Commits, Tags)
+  └─ refs                             Refs: get/resolve/set/setSymbolic/compareAndSwap/list
+        │
+GitObjectStore                         "<type> <size>\0<content>", SHA-1 over the whole thing
+        │
+RawStorage                             bytes by key: MemoryRawStorage, CompressedRawStorage,
+                                       ChunkedRawStorage, blobStoreToRawStorage(BlobStore), ...
 ```
 
-### Calculating Repository Status
+Every typed store delegates to one `GitObjectStore`, which adds the Git header, computes the id and reads the type back. Below it, a `RawStorage` stores bytes by key and knows nothing about Git. A new backend can stop at that level: `createHistoryFromComponents({ objects: createGitObjectStore(rawStorage), refs: { type: "memory" } })` gives a full `History` (use `{ type: "adapter", refStore }` for persistent refs). `HistoryWithOperations` adds `delta` (deltify objects for storage), `serialization` (loose objects and packs) and `capabilities` (what the backend does natively), which GC and transport use.
 
-```typescript
-import type { StatusCalculator, FileStatus } from "@statewalker/vcs-core";
+### Why everything streams
 
-async function showStatus(calculator: StatusCalculator): Promise<void> {
-  const status = await calculator.calculateStatus({
-    includeUntracked: true,
-  });
+Blob content is `AsyncIterable<Uint8Array>` on the way in and out, and trees load as async iterables of entries. A large file passes through with bounded memory, which matters in browsers. `VcsCore` collects trees into arrays because trees are small and arrays are easier to use.
 
-  console.log(`On branch: ${status.branch ?? "detached HEAD"}`);
+### Only SHA-1 is implemented
 
-  if (status.isClean) {
-    console.log("Nothing to commit, working tree clean");
-    return;
-  }
+Only SHA-1 is implemented. `createVcsCore(deps, { hash: "sha256" })` throws `sha256 not yet supported (requested hash: "sha256")` instead of silently writing SHA-1 ids.
 
-  for (const file of status.files) {
-    const staged = file.indexStatus !== FileStatus.UNMODIFIED ? "S" : " ";
-    const worktree = file.workTreeStatus !== FileStatus.UNMODIFIED ? "W" : " ";
-    console.log(`${staged}${worktree} ${file.path}`);
-  }
-}
-```
+### What breaks, and the error you see
 
-### Repository State Detection
+- `blobs.load`, `trees.load`, `commits.load` and `tags.load` return `undefined` for a missing id. `trees`, `commits` and `tags` also return `undefined` when the id exists but is a different object type or does not parse. A wrong id and a corrupt object look the same; check `history.blobs.has(id)` or the object header if you need to tell them apart.
+- `VcsCore.readCommit`, `readTree` and `readTag` throw `Commit not found: <id>`, `Tree not found: <id>`, `Tag not found: <id>` in the same cases.
+- `createHistory(type, config)` throws `Unknown history backend type: <type>. Available types: ...` unless a backend registered that type first with `registerHistoryBackendFactory()`. This package registers none; `@statewalker/vcs-store-sql` registers `"sql"`. For memory or Git files, call `createMemoryHistoryWithOperations()` or `createGitFilesHistory()` directly.
+- Refs: resolving a symbolic ref chain deeper than the limit throws `Symbolic ref chain too deep (> N)`.
+- Malformed objects: `Invalid object header: ...`, `Invalid commit: missing tree|author|committer`, `Invalid tag: missing object|type|tag name`, `Tree entry name cannot be empty`.
 
-The `WorkingCopy` interface provides state detection for in-progress operations. This helps UIs show appropriate status messages and prevent conflicting operations.
+### Where the model follows JGit
 
-```typescript
-import { RepositoryState } from "@statewalker/vcs-core";
-import type { WorkingCopy } from "@statewalker/vcs-core";
+Object type codes, the commit model, reflog types and the delta index (16-byte block hash table) follow Eclipse JGit, so edge cases are decided the way JGit decides them.
 
-async function checkRepositoryState(wc: WorkingCopy): Promise<void> {
-  const state = await wc.getState();
-  const capabilities = await wc.getStateCapabilities();
+### Delta compression and GC are pluggable
 
-  // Show current operation status
-  switch (state) {
-    case RepositoryState.SAFE:
-      console.log("Repository is ready for any operation");
-      break;
-    case RepositoryState.MERGING:
-      console.log("Merge in progress - resolve conflicts then commit");
-      break;
-    case RepositoryState.REBASING:
-    case RepositoryState.REBASING_MERGE:
-    case RepositoryState.REBASING_INTERACTIVE:
-      console.log("Rebase in progress - continue, skip, or abort");
-      break;
-    case RepositoryState.CHERRY_PICKING:
-      console.log("Cherry-pick in progress - resolve conflicts");
-      break;
-    case RepositoryState.REVERTING:
-      console.log("Revert in progress - resolve conflicts");
-      break;
-    case RepositoryState.BISECTING:
-      console.log("Bisect in progress");
-      break;
-  }
+`storage` holds a delta engine split into three replaceable parts: a `CandidateFinder` (which objects might be good bases), a `DeltaCompressor` (compute and apply a delta) and a `DeltaDecisionStrategy` (whether a delta is worth keeping, maximum chain depth). Ready-made strategies: `createGitNativeStrategy()`, `createBlobOnlyStrategy()`, `createPackStrategy()`, `createNetworkStrategy()`. `GcOrchestrator` with a `GcStrategy` (`MemoryGcStrategy` for raw storage) prunes unreachable objects.
 
-  // Check what operations are allowed
-  if (!capabilities.canCheckout) {
-    console.log("Cannot checkout - finish current operation first");
-  }
-  if (!capabilities.canCommit) {
-    console.log("Cannot commit in current state");
-  }
-}
-```
+### Dependencies
 
-Available states mirror Git's internal states:
+- `@statewalker/vcs-utils`: SHA-1, zlib, delta formats, varints, the `FilesApi` type and file helpers.
+- `@statewalker/webrun-storage`: `BlobStore` / `KvStore` / `RefStore` types and the `refStore` facade used by `createVcsCore` and the `blobStoreToRawStorage` / `kvStoreRefs` adapters.
 
-| State | Description |
-|-------|-------------|
-| `BARE` | Bare repository, no working tree |
-| `SAFE` | Normal state, all operations allowed |
-| `MERGING` | Merge with unresolved conflicts |
-| `MERGING_RESOLVED` | Merge resolved, ready to commit |
-| `CHERRY_PICKING` | Cherry-pick with conflicts |
-| `CHERRY_PICKING_RESOLVED` | Cherry-pick resolved |
-| `REVERTING` | Revert with conflicts |
-| `REVERTING_RESOLVED` | Revert resolved |
-| `REBASING` / `REBASING_MERGE` / `REBASING_INTERACTIVE` | Rebase in progress |
-| `APPLY` | Git am (mailbox apply) in progress |
-| `BISECTING` | Bisect in progress |
-
-### Stash Operations
-
-```typescript
-import type { WorkingCopy } from "@statewalker/vcs-core";
-
-async function useStash(wc: WorkingCopy): Promise<void> {
-  // Save current work with a message
-  const stashId = await wc.stash.push("WIP: fixing authentication");
-
-  // Include untracked files (like git stash -u)
-  await wc.stash.push({ message: "WIP with new files", includeUntracked: true });
-
-  // List all stashes
-  for await (const entry of wc.stash.list()) {
-    console.log(`stash@{${entry.index}}: ${entry.message}`);
-  }
-
-  // Apply most recent stash
-  await wc.stash.apply(0);
-
-  // Pop (apply and remove)
-  await wc.stash.pop();
-
-  // Drop specific stash
-  await wc.stash.drop(1);
-
-  // Clear all stashes
-  await wc.stash.clear();
-}
-```
-
-Stash commits follow Git's structure with 2-3 parents:
-- Parent 1: HEAD at time of stash
-- Parent 2: Index state commit
-- Parent 3 (optional): Untracked files commit (when `includeUntracked: true`)
-
-## File Modes
-
-The package exports standard Git file mode constants:
-
-```typescript
-import { FileMode } from "@statewalker/vcs-core";
-
-FileMode.TREE           // 0o040000 - Directory
-FileMode.REGULAR_FILE   // 0o100644 - Normal file
-FileMode.EXECUTABLE_FILE // 0o100755 - Executable
-FileMode.SYMLINK        // 0o120000 - Symbolic link
-FileMode.GITLINK        // 0o160000 - Submodule reference
-```
-
-## Architecture Notes
-
-### Streaming by Default
-
-All interfaces use `AsyncIterable<Uint8Array>` for content to handle arbitrarily large files:
-
-```typescript
-interface BlobStore {
-  store(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<ObjectId>;
-  load(id: ObjectId): AsyncIterable<Uint8Array>;
-}
-```
-
-### Interface/Implementation Separation
-
-The package defines interfaces with concrete implementations for Git-compatible file storage. Additional storage backends (like `@statewalker/vcs-store-sql` or `@statewalker/vcs-store-mem`) provide alternative implementations for SQL databases or in-memory testing.
-
-### JGit Compatibility
-
-Type definitions and constants align with Eclipse JGit for proven Git compatibility. This includes object type codes, reference storage types, and staging entry structures.
-
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `@statewalker/vcs-utils` | Compression, SHA-1 hashing, delta algorithms, file system abstraction |
-
-## Related Packages
-
-| Package | Description |
-|---------|-------------|
-| `@statewalker/vcs-store-sql` | SQLite-based storage backend |
-| `@statewalker/vcs-store-mem` | In-memory storage for testing |
-| `@statewalker/vcs-store-kv` | Key-value storage abstraction |
-| `@statewalker/vcs-transport` | Git protocol and HTTP transport |
-| `@statewalker/vcs-commands` | High-level Git commands |
-| `@statewalker/vcs-testing` | Test utilities and fixtures |
+Tests: `pnpm --filter @statewalker/vcs-core test`.
 
 ## License
 

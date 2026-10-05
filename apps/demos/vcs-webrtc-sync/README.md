@@ -1,148 +1,118 @@
 # VCS WebRTC Sync Demo
 
-Sync Git repositories directly between browser tabs using WebRTC. No server required - changes flow peer-to-peer through encrypted data channels.
+## What it is
 
-Open this app in two browser windows, create some files, and watch commits travel between them. The entire Git history lives in your browser's storage.
+A Vite single-page app for syncing a Git repository between two browser windows over a WebRTC data channel, with signaling done by copy-paste. Each window keeps a repository over a folder picked with the File System Access API or over in-memory storage, and can stage, commit, restore, and push to or fetch from the connected peer using the Git wire protocol from `@statewalker/vcs-transport`. No application server is involved; the connection uses public STUN servers for address discovery.
 
-## Getting Started
-
-You'll need a modern browser with File System Access API support. Chrome and Edge work best. Firefox users can still experiment with the in-memory storage option.
-
-Start the development server:
-
-```bash
-pnpm install
-pnpm dev
-```
-
-Navigate to the URL shown in the terminal (typically `http://localhost:5173`).
-
-## Storage Options
-
-When the app loads, you'll choose where to store your repository.
-
-Click **Open Folder** to select a directory from your local filesystem. The app creates a `.git` folder there and tracks real files. Changes you make in your text editor appear automatically after a few seconds - the app polls for changes every 3 seconds.
-
-For quick experiments, click **Memory Storage**. The app creates a virtual filesystem that vanishes when you close the tab. This works in all browsers and is great for testing the P2P sync flow.
-
-## Working with Files
-
-Once you've initialized a repository, the **Working Directory** panel shows your files with status indicators. Untracked files appear in yellow. Modified files show in orange. Staged files turn green.
-
-Click the **+** button next to any file to stage it for commit. Click **-** to unstage. The **Staging Area** shows what will be included in your next commit.
-
-Type a commit message and click **Commit**. Your commit appears immediately in the **Commit History** panel below.
-
-## Creating Sample Content
-
-New repositories start empty. Click **Create Sample Files** to populate your repo with some markdown documents - a main index page and a few docs in a nested folder. This gives you something to experiment with during sync testing.
-
-## Viewing History
-
-The **Commit History** panel shows your recent commits with shortened IDs and messages. Each commit has a **Restore** button that resets your working directory to that point in history.
-
-The restore button stays disabled when you have uncommitted changes. Commit or discard your work first to time-travel safely.
-
-## Connecting Two Peers
-
-P2P synchronization requires a signaling step where two peers exchange connection information. This happens through manual copy-paste.
-
-**In the first browser window (initiator):**
-
-1. Click **Share** - this generates an offer signal
-2. Copy the signal text to your clipboard
-3. Send it to the other peer (paste into the second browser window)
-
-**In the second browser window (responder):**
-
-1. Click **Connect**
-2. Paste the offer signal you received
-3. Click **Accept Offer** - this generates an answer signal
-4. Copy the answer and send it back to the first window
-
-**Back in the first window:**
-
-1. Paste the answer signal
-2. Click **Accept Answer**
-
-The connection indicator turns green when the WebRTC data channel is established.
-
-## Syncing Changes
-
-Once connected, the **Push** and **Fetch** buttons appear.
-
-**Push** sends your local commits to the connected peer. The other browser receives the commits and updates its remote tracking reference. They can then integrate those changes into their working directory.
-
-**Fetch** requests commits from the peer. Your browser receives their objects and stores them locally. A remote tracking ref (`refs/remotes/peer/main`) points to their latest commit.
-
-The current implementation transfers commits one-way per operation. For bidirectional sync, both peers should push and fetch.
-
-## Conflict Detection
-
-When both peers modify the same file independently, the app detects conflicting changes. The **Activity Log** reports which files differ between local and remote versions.
-
-The demo provides basic conflict detection but not automatic merging. You'll need to manually coordinate which version to keep. A full implementation would offer three-way merge or explicit conflict resolution UI.
-
-## Architecture
-
-The application follows an MVC pattern where data flows through distinct layers:
+## Layout
 
 ```
-User ←→ Views ←→ Models ←→ Controllers ←→ External World
+index.html
+src/
+  main.ts                    creates the context, models, controllers and views
+  models/                    observable state (RepositoryModel, FileListModel, StagingModel,
+                             CommitHistoryModel, CommitFormModel, ConnectionModel,
+                             SharingFormModel, ActivityLogModel, UserActionsModel)
+  controllers/
+    storage-controller.ts    folder (BrowserFilesApi) or memory (MemFilesApi)
+    repository-controller.ts Git.init(), status, stage/unstage, commit, history, restore, sample files
+    webrtc-controller.ts     PeerConnection, offer/answer, compressed signal strings
+    sync-controller.ts       push / fetch over the peer connection
+    main-controller.ts       dispatches UserActionsModel actions to controllers
+  views/                     DOM rendering per panel
+  utils/                     adapter/registry helpers, BaseClass, transport-helpers.ts
+tests/models.test.ts         Vitest tests for the models
+docs/ARCHITECTURE.md         the MVC structure in detail
 ```
 
-**Models** hold observable state. Each model extends `BaseClass` with an `onUpdate(listener)` method that views use to subscribe to changes. When a model calls `notify()`, all subscribed views re-render.
+```
+View ──action──> UserActionsModel ──> main-controller ──> controllers ──> FilesApi / Git / WebRTC
+  ^                                                            |
+  └───────────── onUpdate() ◄─────── models ◄──── update ──────┘
 
-**Controllers** interact with external systems - the filesystem, Git storage, and WebRTC connections. They read and update models but never render UI directly.
+RTCDataChannel ─ byteChannelFromDataChannel ─ emulateMux ─ webrunClientDuplex ─ fetchOverDuplex / pushOverDuplex
+```
 
-**Views** render HTML based on model state and dispatch user actions to controllers. Each view subscribes to the models it needs and returns a cleanup function for proper teardown.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the patterns (context adapters, registries, user actions).
 
-### Key Models
+## How to run it
 
-The `RepositoryModel` tracks whether storage is selected, whether a Git repository exists, and the current branch and HEAD commit.
+1. `pnpm install && pnpm build` at the repository root (Node 24); the `@statewalker/vcs-*` packages resolve to their built `dist/`.
+2. Start the dev server and open its URL (`http://localhost:5173` by default) in two windows:
 
-The `FileListModel` maintains the working directory tree with status for each file - untracked, modified, staged, or unchanged.
+   ```bash
+   pnpm --filter @statewalker/vcs-demo-webrtc-sync dev
+   ```
 
-The `ConnectionModel` manages WebRTC state: new, connecting, connected, disconnected, or failed. Views use this to show connection indicators and enable sync buttons.
+3. In each window choose **Open Folder** (Chrome, Edge) or **Memory Storage** (any browser), then **Initialize Repository**. **Create Sample Files** adds a few markdown files.
+4. Stage files with **+** (unstage with **-**), type a message and **Commit**.
+5. Connect the windows:
+   1. Window A: **Share**, then **Copy to Clipboard** and paste the offer into window B.
+   2. Window B: **Connect**, paste the offer, **Accept Offer**, copy the answer back to window A.
+   3. Window A: paste the answer, **Accept Answer**. The indicator changes from **Not Connected** when the data channel opens.
+6. Use **Push** and **Fetch**.
 
-The `SharingFormModel` handles the signaling workflow with slots for local and remote signals during offer/answer exchange.
+## How syncing works
 
-### Key Controllers
+```typescript
+// sync-controller.ts / utils/transport-helpers.ts
+const mux = emulateMux(byteChannelFromDataChannel(channel), { side }); // "initiator" | "responder"
 
-The `StorageController` interfaces with the File System Access API or creates an in-memory filesystem.
+// Fetch: peer branches land in refs/remotes/peer/*
+await fetchOverDuplex({
+  duplex: webrunClientDuplex(mux.call),
+  repository: createVcsRepositoryFacade({ history, serialization: new DefaultSerializationApi({ history }) }),
+  refStore,                       // adapter over history.refs
+  refspecs: ["+refs/heads/*:refs/remotes/peer/*"],
+});
 
-The `RepositoryController` performs Git operations using the `vcs-commands` package - staging files, creating commits, walking history.
+// Push: local main overwrites the peer's main
+await pushOverDuplex({ duplex: webrunClientDuplex(mux.call), repository, refStore,
+  refspecs: ["refs/heads/main:refs/heads/main"] });
+```
 
-The `WebRtcController` manages `PeerManager` from `vcs-transport-webrtc` to establish data channels.
+The two sides take opposite `side` values so multiplexed stream ids do not collide. `servePeer(mux, history)` in `transport-helpers.ts` registers a side as a Git server with `serveRepoOverWebrun()`.
 
-The `SyncController` serializes Git objects and sends them over the WebRTC connection.
+## Why it is the way it is
 
-## Dependencies
+- **Views talk only to models.** Views enqueue actions on `UserActionsModel` and re-render on model updates; only controllers touch the file system, Git and WebRTC. This keeps the views free of side effects and lets the models be unit-tested without a browser (`tests/models.test.ts`).
+- **Real Git protocol over the data channel.** The data channel is wrapped as a byte channel and multiplexed, and each push or fetch is a normal upload-pack/receive-pack exchange, so the same transport code would work over HTTP.
+- **Manual signaling.** Offers and answers are compressed, encoded strings that the user copies between windows, so no signaling server is needed.
+- **Polling the folder.** With a real folder the app re-reads the working directory every 3 seconds, so edits made in an editor show up without a file-watcher API.
 
-This demo integrates several packages from the VCS ecosystem:
+## What will surprise you
 
-The `@statewalker/vcs-core` package provides low-level Git primitives - blob storage, tree structures, commit objects.
+- **Nothing serves the Git requests.** `servePeer()` is defined but never called, so neither window answers the other's push or fetch over the data channel. The receiving multiplexer answers every call with `emulateMux: no handler registered`, and the activity log shows `Push failed: <reason>` or `Fetch failed: <reason>`. `serveRepoOverWebrun()` also serves only `git-upload-pack` by default, so even once registered it answers fetches, not pushes.
+- **Commits are not written to the folder.** `Git.init()` always creates an in-memory history; with **Open Folder** your files and `.git/index` are on disk, but objects and refs are not. After a reload the folder's `.git` is detected (`Opened existing repository`) but the history starts empty.
+- **Restore moves `main`.** **Restore** writes the commit's tree into the working directory and sets `refs/heads/main` to that commit, so later commits drop out of the history list. It is refused with `Cannot restore: uncommitted changes exist` while there are changes.
+- **Push overwrites the peer's `main`**, not a remote-tracking ref. Fetch writes `refs/remotes/peer/*` and leaves your branch alone.
+- **No conflict handling in the UI.** `detectConflicts()` and `resolveConflict()` exist in the sync controller but nothing calls them; `resolveConflict()` only logs.
+- **Open Folder needs the File System Access API** (Chrome, Edge). Elsewhere use **Memory Storage**.
+- **NAT traversal uses STUN only** (`stun.l.google.com`). Without a TURN server, peers behind restrictive NATs may not connect; two windows on one machine work.
 
-The `@statewalker/vcs-commands` package offers a fluent API for Git operations like `git.add()` and `git.commit()`.
+## Reference
 
-The `@statewalker/vcs-transport-webrtc` package handles WebRTC peer connections with `PeerManager` and signaling helpers.
+### Commands
 
-The `@statewalker/webrun-files` packages provide filesystem abstractions for both browser and in-memory storage.
+| Command | What it does |
+|---|---|
+| `pnpm --filter @statewalker/vcs-demo-webrtc-sync dev` | Vite dev server |
+| `pnpm --filter @statewalker/vcs-demo-webrtc-sync build` | Production build to `dist/` |
+| `pnpm --filter @statewalker/vcs-demo-webrtc-sync preview` | Serve the production build |
+| `pnpm --filter @statewalker/vcs-demo-webrtc-sync test` | Vitest model tests |
+| `pnpm --filter @statewalker/vcs-demo-webrtc-sync test:watch` | Vitest in watch mode |
+| `pnpm --filter @statewalker/vcs-demo-webrtc-sync typecheck` | `tsc --noEmit` |
 
-## Limitations
+### Dependencies
 
-**Browser support**: The File System Access API works in Chrome and Edge. Firefox and Safari users can only use memory storage.
-
-**NAT traversal**: Without a TURN server, connections between peers behind restrictive NATs may fail. The demo works reliably when both browsers are on the same network or have permissive NAT settings.
-
-**No automatic merge**: Conflicting changes require manual resolution. The app detects conflicts but doesn't perform three-way merges.
-
-**Manual signaling**: Connection setup requires copy-pasting signals between browser windows. A real application would use a signaling server or QR codes for easier exchange.
-
-## Development
-
-The source lives in `src/` with separate directories for models, controllers, views, and utilities.
-
-Run the development server with `pnpm dev`. The app hot-reloads on file changes.
-
-Build for production with `pnpm build`. Output goes to `dist/` as static files you can serve from any web server.
+| Package | Used for |
+|---|---|
+| `@statewalker/vcs-commands` | `Git.init()`, add, commit |
+| `@statewalker/vcs-core` | History types, `DefaultSerializationApi` |
+| `@statewalker/vcs-store-files` | `FileStagingStore` for `.git/index` in a real folder |
+| `@statewalker/vcs-working-tree` | `WorkingCopy` type |
+| `@statewalker/vcs-transport` | `fetchOverDuplex`, `pushOverDuplex`, `webrunClientDuplex`, `serveRepoOverWebrun` |
+| `@statewalker/vcs-transport-adapters` | `createVcsRepositoryFacade` |
+| `@statewalker/webrun-streams` | `emulateMux` |
+| `@statewalker/webrun-streams-signaling` | `PeerConnection`, signal encoding, `byteChannelFromDataChannel` |
+| `@statewalker/webrun-files`, `-files-browser`, `-files-mem` | `FilesApi`, `BrowserFilesApi`, `MemFilesApi` |

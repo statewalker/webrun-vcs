@@ -1,129 +1,98 @@
 # @statewalker/vcs-utils-node
 
-Node.js-specific optimizations for `@statewalker/vcs-utils`.
+## What it is
 
-## Overview
+Node.js implementations for `@statewalker/vcs-utils`: compression on `node:zlib` and a `FilesApi` backed by the local filesystem. It does nothing until you register it.
 
-This package provides Node.js-optimized implementations that can optionally replace the portable defaults in `@statewalker/vcs-utils`. All optimizations are **opt-in** and must be explicitly registered.
+## Why it exists
 
-### What This Package Provides
+`@statewalker/vcs-utils` uses only Web Platform APIs, so it runs in browsers, workers and Node.js alike. Its default compression goes through the Web `CompressionStream` API, and it has no way to touch a disk. In Node.js you usually want both: zlib directly, and a repository on the local filesystem. Keeping these here means the portable package never imports `node:*` modules, and browser bundles never pull them in.
 
-| Module | Description | Performance Benefit |
-|--------|-------------|---------------------|
-| `compression` | Node.js native zlib compression | 2-5x faster than pako for large files |
-| `files` | Node.js filesystem adapter | Direct filesystem access for repositories |
-
-## Installation
+## How to use it
 
 ```bash
-pnpm add @statewalker/vcs-utils-node @statewalker/vcs-utils
+pnpm add @statewalker/vcs-utils-node
 ```
 
-Note: This package has a peer dependency on `@statewalker/vcs-utils`.
+`@statewalker/vcs-utils` and `@statewalker/webrun-files-node` come with it as regular dependencies. Node.js only.
 
-## Usage
+| Import path | Contents |
+|-------------|----------|
+| `@statewalker/vcs-utils-node` | Everything below |
+| `@statewalker/vcs-utils-node/compression` | `createNodeCompression()`, `deflateNode`, `inflateNode`, `compressBlockNode`, `decompressBlockNode`, `decompressBlockPartialNode` |
+| `@statewalker/vcs-utils-node/files` | `createNodeFilesApi()`, `NodeFilesApi` |
 
-### Compression Optimization
-
-Register Node.js native zlib at application startup:
+The happy path is two lines at application startup:
 
 ```typescript
 import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
 import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 
-// Register once at application startup
 setCompressionUtils(createNodeCompression());
-
-// Now all compression operations use native zlib
-import { deflate, inflate } from "@statewalker/vcs-utils/compression";
-const compressed = await deflate(data);
 ```
 
-### Node.js Filesystem
+## Examples
 
-Create a filesystem adapter for local repositories:
+### Switch all compression to zlib
 
-```typescript
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { createGitRepository } from "@statewalker/vcs-core";
-
-const files = createNodeFilesApi({ rootDir: "/path/to/repo" });
-const repo = await createGitRepository(files, ".git");
-```
-
-## API Reference
-
-### `@statewalker/vcs-utils-node/compression`
+After `setCompressionUtils()`, every compression call in `@statewalker/vcs-utils`, and in the packages built on it, goes through `node:zlib`.
 
 ```typescript
+import { compressBlock, decompressBlock, setCompressionUtils } from "@statewalker/vcs-utils/compression";
 import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 
-const compression = createNodeCompression();
-// Returns CompressionUtils with:
-// - deflate: Async compression using zlib
-// - inflate: Async decompression using zlib
-// - compressBlock: Sync block compression
-// - decompressBlock: Sync block decompression
-// - decompressBlockPartial: Partial decompression for pack files
+setCompressionUtils(createNodeCompression());
+
+const packed = await compressBlock(new TextEncoder().encode("hello"));
+const unpacked = await decompressBlock(packed);
 ```
 
-### `@statewalker/vcs-utils-node/files`
+`options` for every function is `{ raw?: boolean; level?: number }`. `raw: true` selects raw DEFLATE without the zlib header; `level` defaults to 6.
+
+### Read files from disk
 
 ```typescript
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { readText } from "@statewalker/vcs-utils/files";
 
-interface NodeFilesApiOptions {
-  rootDir: string;  // Root directory for all file operations
-}
-
-const files = createNodeFilesApi({ rootDir: "/path/to/root" });
-// Returns FilesApi implementing the standard interface
+const files = createNodeFilesApi({ rootDir: "/path/to/project" });
+const head = await readText(files, ".git/HEAD"); // "ref: refs/heads/main\n"
 ```
 
-## Design Principles
+Paths are resolved against `rootDir`. To open a Git repository on disk, pass this `FilesApi` to a storage backend such as `createGitFilesBackend()` from `@statewalker/vcs-store-files`.
 
-### No Auto-Registration
+## Internals
 
-This package **never** registers itself automatically. You must explicitly call the appropriate setter function to use the optimized implementations:
+### Why registration is explicit
+
+Importing `@statewalker/vcs-utils-node/compression` has no side effect. A library that registered itself on import would change the behaviour of every other module in the process, and the result would depend on import order. Register once, in the application entry point, never inside library code.
 
 ```typescript
-// WRONG - imports alone don't do anything
+// Does nothing: the module does not register itself
 import "@statewalker/vcs-utils-node/compression";
-
-// CORRECT - explicitly register the optimization
-import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-setCompressionUtils(createNodeCompression());
 ```
 
-### Optional by Design
+### How partial decompression finds the end of a zlib stream
 
-All functionality in `@statewalker/vcs-utils` works without this package. The portable implementations (pako, Web Crypto) provide correct behavior across all runtimes. This package only adds performance benefits for Node.js environments.
+Pack files store objects back to back. Each entry header gives the uncompressed size but not the compressed size, so a reader must learn how many input bytes one zlib stream used. `decompressBlockPartialNode()` returns `{ data, bytesRead }` for that.
 
-### Single Application Entry Point
+Node's one-shot zlib functions do not report bytes consumed, so the function binary-searches the input length: a too-short prefix fails, the exact length succeeds. It first inflates the full buffer; if that fails with any error other than `ERR_TRAILING_JUNK_AFTER_STREAM_END` (which Node 24 raises when bytes follow the stream), the input is invalid and the zlib error is thrown as is. The search runs one synchronous inflate per step, so its cost grows with log2 of the buffer size times the object size. The portable default in `@statewalker/vcs-utils` reads the consumed byte count directly from pako's low-level inflate state and needs a single pass. `createNodeCompression()` still overrides it, so pack parsing with many small objects can be slower after registration; to keep the default for this one function, register the other four only:
 
-Register optimizations once at your application's entry point, not in library code. This ensures consistent behavior and avoids initialization order issues.
+```typescript
+const { decompressBlockPartial, ...rest } = createNodeCompression();
+setCompressionUtils(rest);
+```
 
-## When to Use This Package
+### What breaks, and the error you see
 
-**Use it when:**
-- Running in Node.js
-- Processing large files where compression performance matters
-- Building CLI tools or server-side applications
-- Working with local filesystem repositories
+- Streaming `deflateNode` / `inflateNode` throw `CompressionError` with the message `Compression failed: <zlib message>` or `Decompression failed: <zlib message>`.
+- The block functions throw the raw zlib error. When they are called through `@statewalker/vcs-utils` (`compressBlock`, `decompressBlock`, `decompressBlockPartial`), that layer wraps it into `CompressionError` with `Compression failed: ...`, `Decompression failed: ...` or `Partial decompression failed: ...`.
 
-**Don't use it when:**
-- Building browser applications
-- Creating isomorphic libraries that must work everywhere
-- Bundle size is critical (the portable implementations are smaller)
+### Dependencies
 
-## Dependencies
-
-**Runtime:**
-- `@statewalker/vcs-utils` (peer dependency)
-- `@statewalker/webrun-files-node` - Node.js filesystem adapter
-
-**Note:** This package uses Node.js built-in `zlib` module, which is available in all Node.js versions.
+- `@statewalker/vcs-utils` for the `CompressionUtils`, `FilesApi` and `CompressionError` types.
+- `@statewalker/webrun-files-node`, which provides `NodeFilesApi`. `createNodeFilesApi()` is a thin factory over it.
+- `node:zlib` and `node:util` from the Node.js runtime.
 
 ## License
 

@@ -4,9 +4,9 @@
 
 **webrun-vcs** is a pure-TypeScript Git implementation (read/write) organized as a pnpm monorepo.
 
-Key packages: `vcs-core` (objects, refs, packfiles), `vcs-commands` (porcelain API), `vcs-transport` (fetch/push protocols), `vcs-store-*` (storage backends).
+Key packages: `vcs-core` (objects, refs, packfiles), `vcs-working-tree` (index, checkout, worktree), `vcs-commands` (porcelain API), `vcs-transport` (fetch/push protocols), `vcs-transport-lfs`/`vcs-transport-xet` (large objects), `vcs-store-*` (storage backends), `vcs-workspace` (file sync plus versioning).
 
-Tech stack: TypeScript, pnpm workspaces, Vitest (testing), Biome (lint + format), Rolldown (bundling).
+Tech stack: TypeScript, Node.js 24, pnpm 10 workspaces (via corepack), Vitest (testing), Biome 2 (lint + format), Rolldown (bundling). Internal dependencies use `workspace:^`; external ones use the pnpm catalog (`catalog:`) in `pnpm-workspace.yaml`.
 
 ## General Behavior
 

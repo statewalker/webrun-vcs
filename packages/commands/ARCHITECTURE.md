@@ -20,7 +20,7 @@ Commands use method chaining for configuration:
 ```typescript
 await git.commit()
   .setMessage("feat: add login")
-  .setAuthor({ name: "Dev", email: "dev@example.com" })
+  .setAuthor("Dev", "dev@example.com")
   .setAmend(true)
   .call();
 ```
@@ -29,14 +29,16 @@ Each setter returns `this`, enabling fluent chains. The final `call()` executes 
 
 ### WorkingCopy Abstraction
 
-Commands work with the `WorkingCopy` interface from `@statewalker/vcs-core`, which provides unified access to repository components:
+Commands work with the `WorkingCopy` interface from `@statewalker/vcs-working-tree`, which provides unified access to repository components:
 
 ```typescript
 interface WorkingCopy {
-  repository: HistoryStore;  // blobs, trees, commits, refs, tags
-  staging: Staging;          // index/staging area
-  worktree?: Worktree;       // optional filesystem access
-  // ... state methods
+  readonly history: History;     // blobs, trees, commits, refs, tags
+  readonly checkout: Checkout;   // HEAD, staging (index), operation state
+  readonly worktree: Worktree;   // filesystem access
+  readonly stash: StashStore;
+  readonly config: WorkingCopyConfig;
+  // ... HEAD and state methods
 }
 ```
 
@@ -68,14 +70,18 @@ GitCommand<T> (abstract base)
 │   ├── StashApplyCommand
 │   ├── StashDropCommand
 │   ├── StashListCommand
+│   ├── BlameCommand, CleanCommand, DescribeCommand, ReflogCommand
+│   ├── GarbageCollectCommand, PackRefsCommand
+│   ├── RemoteAddCommand, RemoteRemoveCommand, RemoteListCommand, RemoteSetUrlCommand
 │   └── ...
 └── TransportCommand<T> (extends GitCommand)
     ├── FetchCommand
     ├── PushCommand
     ├── PullCommand
     ├── CloneCommand
-    ├── LsRemoteCommand
-    └── ...
+    └── LsRemoteCommand
+
+InitCommand (standalone: creates a new repository, no WorkingCopy needed)
 ```
 
 ### GitCommand Base Class
@@ -84,37 +90,34 @@ All commands extend `GitCommand<T>` where `T` is the return type:
 
 ```typescript
 abstract class GitCommand<T> {
-  protected workingCopy: WorkingCopy;
-  private called: boolean = false;
+  protected readonly _workingCopy: WorkingCopy;
+  private callable = true;
 
-  constructor(workingCopy: WorkingCopy) {
-    this.workingCopy = workingCopy;
-  }
+  constructor(workingCopy: WorkingCopy) { ... }
 
-  async call(): Promise<T> {
-    this.checkCallable();
-    this.called = true;
-    return this.execute();
-  }
-
-  protected abstract execute(): Promise<T>;
+  // Each command implements call(); it starts with
+  //   this.checkCallable(); this.setCallable(false);
+  abstract call(): Promise<T>;
 
   protected checkCallable(): void {
-    if (this.called) {
-      throw new Error("Command already called");
+    if (!this.callable) {
+      throw new Error(`Command ${this.constructor.name} has already been called`);
     }
   }
+  protected setCallable(value: boolean): void { ... }
 }
 ```
 
 The base class provides common utilities:
 
-| Method | Purpose |
+| Member | Purpose |
 |--------|---------|
-| `resolveHead()` | Get commit ID that HEAD points to |
-| `resolveRef(name)` | Resolve any ref to ObjectId |
-| `getCurrentBranch()` | Get current branch name |
-| `getRef(name)` | Get raw Ref object |
+| `blobs`, `trees`, `commits`, `tagsStore`, `refsStore` | Stores from `workingCopy.history` |
+| `staging` | `workingCopy.checkout.staging` |
+| `worktreeAccess` | `workingCopy.worktree` (may be undefined) |
+| `resolveHead()` | Get commit ID that HEAD points to (`NoHeadError` if none) |
+| `resolveRef(name)` | Resolve any ref to ObjectId (`RefNotFoundError` if none) |
+| `getCurrentBranch()` | Full name of the current branch, or undefined when detached |
 
 ### Ref Resolution
 
@@ -133,9 +136,11 @@ The base class handles Git's flexible ref syntax:
 "HEAD~3" → 3rd ancestor of HEAD
 "HEAD^2" → second parent (for merge commits)
 
-// Abbreviated commits
-"abc1234" → full commit ID lookup
+// Full commit IDs (abbreviated IDs are not resolved)
+"<40-hex id>" → commits.has(id)
 ```
+
+Annotated tags are peeled to the commit they point at.
 
 ### TransportCommand Extension
 
@@ -147,13 +152,14 @@ abstract class TransportCommand<T> extends GitCommand<T> {
   protected headers?: Record<string, string>;
   protected timeout?: number;
   protected progressCallback?: ProgressCallback;
-  protected messageCallback?: MessageCallback;
+  protected progressMessageCallback?: (message: string) => void;
 
-  setCredentials(creds: Credentials): this { ... }
+  setCredentials(credentials: Credentials): this { ... }
+  setCredentialsProvider(username: string, password: string): this { ... }
   setHeaders(headers: Record<string, string>): this { ... }
-  setTimeout(ms: number): this { ... }
-  setProgressCallback(cb: ProgressCallback): this { ... }
-  setMessageCallback(cb: MessageCallback): this { ... }
+  setTimeout(timeout: number): this { ... }
+  setProgressMonitor(callback: ProgressCallback): this { ... }
+  setProgressMessageCallback(callback: (message: string) => void): this { ... }
 }
 ```
 
@@ -165,23 +171,28 @@ packages/commands/src/
 ├── git.ts                # Git facade class
 ├── git-command.ts        # Base command class
 ├── transport-command.ts  # Transport command base
-├── types.ts              # Core interfaces
+├── types.ts              # ResetMode, ListBranchMode, re-exported core types
 ├── commands/             # Command implementations
 │   ├── index.ts          # Re-exports all commands
-│   ├── add.command.ts
-│   ├── commit.command.ts
-│   ├── checkout.command.ts
-│   ├── merge.command.ts
-│   ├── fetch.command.ts
-│   ├── push.command.ts
-│   └── ... (26 total)
+│   ├── add-command.ts
+│   ├── commit-command.ts
+│   ├── checkout-command.ts
+│   ├── merge-command.ts
+│   ├── fetch-command.ts
+│   ├── push-command.ts
+│   └── ... (31 command modules)
+├── core-commands/        # Add/Checkout interfaces + impls (not exported)
+├── pack-import/          # Import received packs into History
+├── remote-config/        # [remote "<name>"] config read/write (internal)
+├── rename/               # Similarity index for rename detection
+├── tree-merge/           # Shared three-way tree merge
 ├── errors/               # Error types
 │   ├── index.ts
-│   ├── base-error.ts
+│   ├── git-api-error.ts
 │   ├── command-errors.ts
 │   ├── ref-errors.ts
 │   ├── merge-errors.ts
-│   └── ... (13 modules)
+│   └── ... (12 modules)
 └── results/              # Result types
     ├── index.ts
     ├── merge-result.ts
@@ -192,20 +203,20 @@ packages/commands/src/
 
 ### commands/
 
-Each command lives in its own file following the pattern `<name>.command.ts`:
+Each command lives in its own file following the pattern `<name>-command.ts`:
 
 | File | Command | Purpose |
 |------|---------|---------|
-| `add.command.ts` | AddCommand | Stage files for commit |
-| `commit.command.ts` | CommitCommand | Create commits |
-| `checkout.command.ts` | CheckoutCommand | Switch branches/restore files |
-| `merge.command.ts` | MergeCommand | Merge branches |
-| `rebase.command.ts` | RebaseCommand | Rebase commits |
-| `reset.command.ts` | ResetCommand | Reset HEAD position |
-| `fetch.command.ts` | FetchCommand | Fetch from remote |
-| `push.command.ts` | PushCommand | Push to remote |
-| `pull.command.ts` | PullCommand | Fetch and merge/rebase |
-| `clone.command.ts` | CloneCommand | Clone repository |
+| `add-command.ts` | AddCommand | Stage files for commit |
+| `commit-command.ts` | CommitCommand | Create commits |
+| `checkout-command.ts` | CheckoutCommand | Switch branches/restore files |
+| `merge-command.ts` | MergeCommand | Merge branches |
+| `rebase-command.ts` | RebaseCommand | Rebase commits |
+| `reset-command.ts` | ResetCommand | Reset HEAD position |
+| `fetch-command.ts` | FetchCommand | Fetch from remote |
+| `push-command.ts` | PushCommand | Push to remote |
+| `pull-command.ts` | PullCommand | Fetch and merge/rebase |
+| `clone-command.ts` | CloneCommand | Clone repository |
 
 ### errors/
 
@@ -213,14 +224,14 @@ Error types organized by domain:
 
 | Module | Errors |
 |--------|--------|
-| `base-error.ts` | `GitApiError` base class |
-| `command-errors.ts` | `MissingArgumentError`, `InvalidArgumentError` |
+| `git-api-error.ts` | `GitApiError` base class |
+| `command-errors.ts` | `MissingArgumentError`, `InvalidArgumentError`, `NotImplementedError` |
 | `ref-errors.ts` | `RefNotFoundError`, `RefAlreadyExistsError` |
 | `commit-errors.ts` | `NoMessageError`, `EmptyCommitError` |
 | `merge-errors.ts` | `MergeConflictError`, `NotFastForwardError` |
-| `checkout-errors.ts` | `CheckoutConflictError` |
+| `checkout-errors.ts` | `PathNotInIndexError`, `PathNotFoundInTreeError`, `NotADirectoryError` |
 | `rebase-errors.ts` | `NoRebaseInProgressError` |
-| `stash-errors.ts` | `NoStashError`, `StashDropError` |
+| `stash-errors.ts` | `InvalidStashIndexError`, `StashNotFoundError`, `StashApplyFailedError` |
 | `transport-errors.ts` | `AuthenticationError`, `PushRejectedException` |
 
 ### results/
@@ -235,7 +246,7 @@ Result types with status enums:
 | `rebase-result.ts` | `RebaseResult`, `RebaseStatus` |
 | `cherry-pick-result.ts` | `CherryPickResult` |
 | `clone-result.ts` | `CloneResult` |
-| `stash-result.ts` | `StashResult` |
+| `stash-result.ts` | `StashEntry`, `StashApplyResult`, `StashApplyStatus` |
 | `diff-entry.ts` | `DiffEntry`, file change info |
 
 ## Git Facade Class
@@ -244,19 +255,27 @@ The `Git` class acts as the entry point and command factory:
 
 ```typescript
 class Git implements Disposable {
-  private workingCopy: WorkingCopy;
+  private readonly _workingCopy: WorkingCopy;
 
   // Factory methods
   static fromWorkingCopy(workingCopy: WorkingCopy): Git { ... }
+  static init(): InitCommand { ... }
 
-  // Command factories (40+)
-  add(): AddCommand { return new AddCommand(this.workingCopy); }
-  commit(): CommitCommand { return new CommitCommand(this.workingCopy); }
-  checkout(): CheckoutCommand { return new CheckoutCommand(this.workingCopy); }
+  // Command factories (~40)
+  add(): AddCommand { return new AddCommand(this._workingCopy); }
+  commit(): CommitCommand { return new CommitCommand(this._workingCopy); }
+  checkout(): CheckoutCommand { return new CheckoutCommand(this._workingCopy); }
   // ...
 
-  // Lifecycle
-  dispose(): void { ... }
+  // Component access
+  get workingCopy(): WorkingCopy { ... }
+  get history(): History | undefined { ... }
+  get checkoutState(): Checkout | undefined { ... }
+  get worktree(): Worktree | undefined { ... }
+
+  // Lifecycle: after close(), factory methods throw "Git instance is closed"
+  close(): void { ... }
+  [Symbol.dispose](): void { this.close(); }
 }
 ```
 
@@ -276,13 +295,15 @@ Creating commands through the facade:
 Commands validate configuration in `call()` before execution:
 
 ```typescript
-class CommitCommand extends GitCommand<ObjectId> {
+class CommitCommand extends GitCommand<CommitResult> {
   private message?: string;
-  private amend: boolean = false;
+  private amend = false;
 
-  async execute(): Promise<ObjectId> {
+  async call(): Promise<CommitResult> {
+    this.checkCallable();
+    this.setCallable(false);
     if (!this.message && !this.amend) {
-      throw new NoMessageError();
+      throw new NoMessageError(); // "Commit message is required"
     }
     // ... rest of implementation
   }
@@ -294,14 +315,14 @@ class CommitCommand extends GitCommand<ObjectId> {
 Complex operations compose multiple store operations:
 
 ```typescript
-class CommitCommand extends GitCommand<ObjectId> {
-  async execute(): Promise<ObjectId> {
+class CommitCommand extends GitCommand<CommitResult> {
+  async call(): Promise<CommitResult> {
     // 1. Resolve current HEAD
-    const headRef = await this.store.refs.resolve("HEAD");
+    const headRef = await this.refsStore.resolve("HEAD");
     const parentId = headRef?.objectId;
 
     // 2. Build tree from staging
-    const treeId = await this.store.staging.writeTree(this.store.trees);
+    const treeId = await this.staging.writeTree(this.trees);
 
     // 3. Create commit object
     const commit: Commit = {
@@ -311,40 +332,38 @@ class CommitCommand extends GitCommand<ObjectId> {
       committer: this.committer,
       message: this.message,
     };
-    const commitId = await this.store.commits.storeCommit(commit);
+    const id = await this.commits.store(commit);
 
-    // 4. Update refs
-    await this.store.refs.set("refs/heads/main", commitId);
+    // 4. Update the branch HEAD points to (or HEAD itself when detached)
+    await this.refsStore.set(currentBranchOrHead, id);
 
-    return commitId;
+    return { ...commit, id };
   }
 }
 ```
 
 ### Progress Reporting
 
-Transport commands report progress through callbacks:
+Transport commands pass their callbacks to the `@statewalker/vcs-transport` operations:
 
 ```typescript
 class FetchCommand extends TransportCommand<FetchResult> {
-  async execute(): Promise<FetchResult> {
-    return await fetch({
-      connection: this.getConnection(),
-      storage: this.store,
-      wants: this.refSpecs,
-      haves: await this.getLocalRefs(),
-      onProgress: (phase, completed, total) => {
-        this.progressCallback?.({
-          phase,
-          completed,
-          total,
-          percent: total > 0 ? (completed / total) * 100 : 0,
-        });
-      },
+  async call(): Promise<FetchResult> {
+    // ...
+    const transportResult = await transportFetch({
+      url: remoteUrl,
+      auth: this.credentials,
+      headers: this.headers,
+      timeout: this.timeout,
+      depth: this.depth,
+      onProgressMessage: this.progressMessageCallback,
     });
+    // ... map refs through refspecs, import the pack into history
   }
 }
 ```
+
+`CloneCommand` also passes `onProgress: this.progressCallback` (structured `ProgressInfo`: `stage`, `current`, `total`, `percent`). `FetchCommand` and `PushCommand` pass only the raw message callback.
 
 ### Result Objects
 
@@ -352,11 +371,13 @@ Commands return structured results, not just success/failure:
 
 ```typescript
 interface MergeResult {
-  status: MergeStatus;
-  mergeBase?: ObjectId;
-  newHead?: ObjectId;
-  conflicts?: string[];
-  failedReason?: MergeFailureReason;
+  readonly status: MergeStatus;
+  readonly newHead?: ObjectId;
+  readonly mergeBase?: ObjectId;
+  readonly mergedCommits: ObjectId[];
+  readonly conflicts?: string[];
+  readonly failingPaths?: Map<string, MergeFailureReason>;
+  readonly message?: string;
 }
 
 // Usage
@@ -372,32 +393,32 @@ if (result.status === MergeStatus.CONFLICTING) {
 
 ### Core Store Integration
 
-Commands depend on store interfaces from `@statewalker/vcs-core`:
+Commands depend on the interfaces from `@statewalker/vcs-core` (history) and `@statewalker/vcs-working-tree` (staging, worktree):
 
 ```
 AddCommand
     ↓ uses
-StagingStore.editor()     → Stage file changes
-BlobStore.store()         → Store file contents
-WorktreeStore.walk()      → Read filesystem
-IgnoreManager.isIgnored() → Check ignore patterns
+Staging.createEditor()    → Stage file changes
+Blobs.store()             → Store file contents
+Worktree.walk()           → Read filesystem
+WorktreeEntry.isIgnored   → Skip ignored files
 ```
 
 ```
 CommitCommand
     ↓ uses
-StagingStore.writeTree()  → Build tree from index
-CommitStore.storeCommit() → Store commit object
-RefStore.set()            → Update branch ref
+Staging.writeTree()       → Build tree from index
+Commits.store()           → Store commit object
+Refs.set()                → Update branch ref
 ```
 
 ```
 MergeCommand
     ↓ uses
-CommitStore.findMergeBase() → Find common ancestor
-TreeStore.loadTree()        → Load trees to merge
-CommitStore.storeCommit()   → Create merge commit
-StagingStore.builder()      → Build merged index
+Commits.findMergeBase()   → Find common ancestor
+Trees.loadTree()          → Load trees to merge
+Commits.store()           → Create merge commit
+Staging.createBuilder()   → Build merged index
 ```
 
 ### Transport Integration
@@ -408,23 +429,25 @@ Remote commands delegate to `@statewalker/vcs-transport`:
 FetchCommand
     ↓ calls
 transport.fetch({
-  connection,    → HTTPConnection to remote
-  storage,       → Local object storage
-  wants,         → Refs to fetch
-  haves,         → Local refs (for negotiation)
-  onProgress,    → Progress callback
+  url,               → Remote URL (from setRemote / [remote] config)
+  auth, headers,     → Credentials and custom headers
+  timeout, depth,
+  onProgressMessage, → Raw progress messages
 })
+    ↓ then
+importPackIntoHistory(history, packData)
 ```
 
 ```
 PushCommand
     ↓ calls
 transport.push({
-  connection,    → HTTPConnection to remote
-  storage,       → Local object storage
-  refs,          → Refs to push
-  force,         → Force push flag
-  onProgress,    → Progress callback
+  url, refspecs,
+  auth, headers, timeout,
+  force, atomic,
+  exportPack,        → Builds the pack from local history
+  getLocalRef,       → Resolves source refs
+  onProgressMessage,
 })
 ```
 
@@ -434,14 +457,26 @@ Use `Git.fromWorkingCopy()` to bridge between repositories and the commands pack
 
 ```typescript
 import { Git } from "@statewalker/vcs-commands";
-import { createWorkingCopy } from "@statewalker/vcs-core";
+import { createMemoryHistory } from "@statewalker/vcs-core";
+import {
+  createMemoryCheckout,
+  createMemoryGitStaging,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+} from "@statewalker/vcs-working-tree";
 
-// Create a working copy from @statewalker/vcs-core
-const workingCopy = await createWorkingCopy();
+const history = createMemoryHistory();
+await history.initialize();
+const workingCopy = createMemoryWorkingCopy({
+  history,
+  checkout: createMemoryCheckout({ staging: createMemoryGitStaging() }),
+  worktree: createMemoryWorktree({ blobs: history.blobs, trees: history.trees }),
+});
 
-// Create Git command interface
 const git = Git.fromWorkingCopy(workingCopy);
 ```
+
+File-backed working copies (`GitWorkingCopy`) live in `@statewalker/vcs-store-files`.
 
 ## Error Handling Strategy
 
@@ -451,15 +486,18 @@ All errors extend `GitApiError`:
 
 ```typescript
 class GitApiError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = this.constructor.name;
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "GitApiError";
   }
 }
 
 class RefNotFoundError extends GitApiError {
-  constructor(public readonly refName: string) {
-    super(`Ref not found: ${refName}`);
+  readonly refName: string;
+  constructor(refName: string, message?: string) {
+    super(message ?? `Ref not found: ${refName}`);
+    this.name = "RefNotFoundError";
+    this.refName = refName;
   }
 }
 ```
@@ -470,24 +508,20 @@ Errors carry context for debugging:
 
 ```typescript
 class MergeConflictError extends GitApiError {
-  constructor(
-    public readonly conflicts: string[],
-    public readonly mergeBase?: ObjectId
-  ) {
-    super(`Merge conflict in: ${conflicts.join(", ")}`);
+  readonly conflicts: string[];
+  constructor(conflicts: string[] = [], message?: string) {
+    super(message ?? `Merge conflicts in ${conflicts.length} file(s)`);
+    this.conflicts = conflicts;
   }
 }
 
-// Usage
-try {
-  await git.merge().include("feature").call();
-} catch (e) {
-  if (e instanceof MergeConflictError) {
-    console.log("Conflicts:", e.conflicts);
-    console.log("Merge base:", e.mergeBase);
-  }
+class PushRejectedException extends TransportError {
+  readonly refName: string;
+  readonly reason: string;
 }
 ```
+
+`MergeCommand` reports conflicts through `MergeResult.status === MergeStatus.CONFLICTING` rather than throwing. `PushCommand.call()` returns per-ref statuses; `callOrThrow()` throws `NonFastForwardError` / `PushRejectedException`.
 
 ### Error Categories
 
@@ -502,25 +536,29 @@ try {
 
 ### Adding New Commands
 
-Create a new command by extending `GitCommand`:
+Create a new command by extending `GitCommand` (`ShowCommand` here is a hypothetical example):
 
 ```typescript
-// commands/blame.command.ts
-export class BlameCommand extends GitCommand<BlameResult> {
+// commands/show-command.ts
+export class ShowCommand extends GitCommand<ShowResult> {
   private path?: string;
   private rev?: string;
 
   setPath(path: string): this {
+    this.checkCallable();
     this.path = path;
     return this;
   }
 
   setRev(rev: string): this {
+    this.checkCallable();
     this.rev = rev;
     return this;
   }
 
-  protected async execute(): Promise<BlameResult> {
+  async call(): Promise<ShowResult> {
+    this.checkCallable();
+    this.setCallable(false);
     if (!this.path) {
       throw new MissingArgumentError("path");
     }
@@ -531,12 +569,13 @@ export class BlameCommand extends GitCommand<BlameResult> {
 }
 ```
 
-Add to Git facade:
+Export it from `commands/index.ts` and add it to the Git facade:
 
 ```typescript
 class Git {
-  blame(): BlameCommand {
-    return new BlameCommand(this.store);
+  show(): ShowCommand {
+    this.checkClosed();
+    return new ShowCommand(this._workingCopy);
   }
 }
 ```
@@ -546,17 +585,11 @@ class Git {
 Define structured results for new commands:
 
 ```typescript
-// results/blame-result.ts
-export interface BlameLine {
-  lineNumber: number;
-  commitId: ObjectId;
-  author: PersonIdent;
-  content: string;
-}
-
-export interface BlameResult {
+// results/show-result.ts
+export interface ShowResult {
   path: string;
-  lines: BlameLine[];
+  commitId: ObjectId;
+  content: Uint8Array;
 }
 ```
 
@@ -565,7 +598,7 @@ export interface BlameResult {
 Add domain-specific errors:
 
 ```typescript
-// errors/blame-errors.ts
+// errors/show-errors.ts
 export class FileNotInCommitError extends GitApiError {
   constructor(
     public readonly path: string,
@@ -580,24 +613,23 @@ export class FileNotInCommitError extends GitApiError {
 
 ### In-Memory Testing
 
-Use memory storage for fast tests:
+Use memory storage for fast tests. The package tests use helpers in `tests/test-helper.ts` (`createTestWorkingCopy()`, and `backends` to run one suite over memory and SQL backends):
 
 ```typescript
 import { Git } from "@statewalker/vcs-commands";
-import { createWorkingCopy } from "@statewalker/vcs-core";
+import { createTestWorkingCopy } from "./test-helper.js";
 
 describe("CommitCommand", () => {
   let git: Git;
 
-  beforeEach(async () => {
-    const workingCopy = await createWorkingCopy(); // In-memory by default
+  beforeEach(() => {
+    const { workingCopy } = createTestWorkingCopy();
     git = Git.fromWorkingCopy(workingCopy);
   });
 
   it("creates commit with message", async () => {
-    await git.add().addFilepattern(".").call();
-    const id = await git.commit().setMessage("test").call();
-    expect(id).toBeDefined();
+    const commit = await git.commit().setMessage("test").setAllowEmpty(true).call();
+    expect(commit.id).toBeDefined();
   });
 });
 ```
@@ -607,21 +639,20 @@ describe("CommitCommand", () => {
 Test transport commands without network:
 
 ```typescript
-vi.mock("@statewalker/vcs-transport", () => ({
-  fetch: vi.fn().mockResolvedValue({
-    objectCount: 10,
-    bytesReceived: 1024,
-    trackingRefUpdates: [],
-  }),
+vi.mock("@statewalker/vcs-transport", async (importOriginal) => ({
+  ...(await importOriginal()),
+  fetch: vi.fn().mockResolvedValue({ refs: new Map(), bytesReceived: 0 /* ... */ }),
 }));
 
 it("fetches from remote", async () => {
-  await git.fetch().setRemote("origin").call();
+  await git.fetch().setRemote("https://example.com/repo.git").call();
   expect(transport.fetch).toHaveBeenCalledWith(
-    expect.objectContaining({ wants: ["refs/heads/main"] })
+    expect.objectContaining({ url: "https://example.com/repo.git" })
   );
 });
 ```
+
+The package's own transport tests (`tests/transport-test-helper.ts`) run against an in-memory Git HTTP server instead of mocks.
 
 ### Error Testing
 
@@ -648,7 +679,7 @@ Commands are single-use to prevent state leakage:
 ```typescript
 const commit = git.commit().setMessage("test");
 await commit.call();
-await commit.call(); // Throws: Command already called
+await commit.call(); // Throws: Command CommitCommand has already been called
 ```
 
 Create new instances for repeated operations.
@@ -658,8 +689,8 @@ Create new instances for repeated operations.
 Some commands return async iterables for large results:
 
 ```typescript
-// LogCommand returns AsyncIterable<Commit>
-for await (const commit of git.log().setMaxCount(100).call()) {
+// LogCommand.call() resolves to AsyncIterable<LogResult>
+for await (const commit of await git.log().setMaxCount(100).call()) {
   // Process one at a time, not all in memory
 }
 ```

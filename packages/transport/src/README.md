@@ -1,4 +1,4 @@
-# Transport v2 - FSM-based Git Protocol Implementation
+# FSM-based Git Protocol Implementation
 
 This module provides a finite state machine (FSM) based implementation of the Git transport protocol, enabling cleaner separation of concerns and easier testing.
 
@@ -34,7 +34,7 @@ This module provides a finite state machine (FSM) based implementation of the Gi
 The FSM executes state handlers and follows transitions based on events:
 
 ```typescript
-import { Fsm } from "@statewalker/vcs-transport/v2";
+import { Fsm } from "@statewalker/vcs-transport";
 
 // Define transitions
 const transitions: FsmTransition[] = [
@@ -169,7 +169,7 @@ import {
   clientPushHandlers,
   serverPushTransitions,
   serverPushHandlers,
-} from "@statewalker/vcs-transport/v2";
+} from "@statewalker/vcs-transport";
 
 // Client push
 const clientFsm = new Fsm(clientPushTransitions, clientPushHandlers);
@@ -202,7 +202,7 @@ import {
   clientFetchHandlers,
   serverFetchTransitions,
   serverFetchHandlers,
-} from "@statewalker/vcs-transport/v2";
+} from "@statewalker/vcs-transport";
 
 // Client fetch
 const clientFsm = new Fsm(clientFetchTransitions, clientFetchHandlers);
@@ -244,7 +244,7 @@ import {
   clientV2Handlers,
   serverV2Transitions,
   serverV2Handlers,
-} from "@statewalker/vcs-transport/v2";
+} from "@statewalker/vcs-transport";
 ```
 
 **Protocol V2 Commands:**
@@ -263,7 +263,7 @@ import {
   classifyError,
   errorRecoveryTransitions,
   errorRecoveryHandlers,
-} from "@statewalker/vcs-transport/v2";
+} from "@statewalker/vcs-transport";
 
 // Merge with protocol transitions
 const transitions = withErrorRecovery(clientV2Transitions);
@@ -303,15 +303,27 @@ if (context.state.restoreCheckpoint()) {
 ### Fetch with Error Recovery
 
 ```typescript
-import { Fsm, ProcessContext, ProtocolState, HandlerOutput, ProcessConfiguration } from "@statewalker/vcs-transport/v2";
-import { withErrorRecovery, withErrorRecoveryHandlers, clientV2Transitions, clientV2Handlers } from "@statewalker/vcs-transport/v2";
+import {
+  Fsm,
+  type ProcessContext,
+  ProtocolState,
+  HandlerOutput,
+  ProcessConfiguration,
+  createTransportApi,
+  createRepositoryFacade,
+  withErrorRecovery,
+  withErrorRecoveryHandlers,
+  clientV2Transitions,
+  clientV2Handlers,
+} from "@statewalker/vcs-transport";
 
 // Create context
+const state = new ProtocolState();
 const context: ProcessContext = {
-  transport: createTransportApi(socket),
-  repository: createRepositoryFacade(historyStore),
-  refStore: historyStore.refStore,
-  state: new ProtocolState(),
+  transport: createTransportApi(duplex, state),
+  repository: createRepositoryFacade({ history }),
+  refStore,
+  state,
   output: new HandlerOutput(),
   config: new ProcessConfiguration(),
 };
@@ -364,10 +376,10 @@ const myHandlers = new Map([
 
 ## Testing
 
-Each FSM module includes comprehensive unit tests:
+Each FSM module has unit tests:
 
 ```
-packages/transport/src/v2/tests/unit/
+packages/transport/src/tests/unit/
 ├── fsm.test.ts                  # Core FSM tests (12 tests)
 ├── push-fsm.test.ts             # Push FSM tests (21 tests)
 ├── fetch-fsm.test.ts            # Fetch FSM tests (45 tests)
@@ -375,15 +387,14 @@ packages/transport/src/v2/tests/unit/
 └── error-recovery-fsm.test.ts   # Error recovery tests (36 tests)
 ```
 
-Run tests:
-```bash
-pnpm vitest run packages/transport/src/v2/tests/unit/
-```
+Note: the package's `vitest.config.ts` only includes `tests/**/*.test.ts`, so
+`pnpm --filter @statewalker/vcs-transport test` does not currently run these
+files. The package-level tests live in `packages/transport/tests/`.
 
 ## Module Structure
 
 ```
-packages/transport/src/v2/
+packages/transport/src/
 ├── api/
 │   ├── duplex.ts            # Duplex stream interface
 │   ├── repository-facade.ts # Repository operations facade
@@ -406,6 +417,5 @@ packages/transport/src/v2/
 
 ## Related Documentation
 
-- [Transport Package README](../README.md) - HTTP transport and legacy handlers
+- [Transport Package README](../README.md) - Package overview and public API
 - [Transport Architecture](../ARCHITECTURE.md) - Overall architecture
-- [Design Notes](../../../../notes/src/2026-01-23/01-transport-fsm-design.md) - Detailed design rationale

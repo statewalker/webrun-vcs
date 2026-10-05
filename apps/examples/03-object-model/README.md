@@ -1,448 +1,262 @@
 # 03-object-model
 
-Deep dive into Git's internal object model. This example demonstrates how Git stores data using four object types: blobs (file content), trees (directories), commits (snapshots), and tags (labels). Understanding these fundamentals is essential for working with Git at a low level.
+## What it is
 
-## Quick Start
+A step-by-step look at the four Git object types (blobs, trees, commits, annotated tags) and at refs, using the low-level `History` API of `@statewalker/vcs-core`. Five step scripts store objects in an in-memory history, read them back and print what they contain. Nothing is written to disk and nothing goes over the network.
+
+## Layout
+
+```
+apps/examples/03-object-model/
+├── package.json                # name: @statewalker/vcs-example-03-object-model
+└── src/
+    ├── main.ts                 # runs steps 1-5 in order on one shared history
+    ├── shared.ts               # getHistory(), storeBlob(), readBlob(), mode helpers
+    └── steps/
+        ├── 01-blob-storage.ts
+        ├── 02-tree-structure.ts
+        ├── 03-commit-anatomy.ts
+        ├── 04-tags.ts
+        └── 05-deduplication.ts
+```
+
+The only runtime dependency is `@statewalker/vcs-core`.
+
+## How to run it
+
+Requires Node 24 and pnpm.
 
 ```bash
-# From the monorepo root
+# from the repository root
 pnpm install
-pnpm --filter @statewalker/vcs-examples-03-object-model start
+pnpm --filter @statewalker/vcs-example-03-object-model start
 ```
 
-## Running Individual Steps
-
-Each step can be run independently:
+Each step also runs on its own:
 
 ```bash
-pnpm --filter @statewalker/vcs-examples-03-object-model step:01  # Blob storage
-pnpm --filter @statewalker/vcs-examples-03-object-model step:02  # Tree structure
-pnpm --filter @statewalker/vcs-examples-03-object-model step:03  # Commit anatomy
-pnpm --filter @statewalker/vcs-examples-03-object-model step:04  # Tags
-pnpm --filter @statewalker/vcs-examples-03-object-model step:05  # Deduplication
+pnpm --filter @statewalker/vcs-example-03-object-model step:01  # blob storage
+pnpm --filter @statewalker/vcs-example-03-object-model step:02  # tree structure
+pnpm --filter @statewalker/vcs-example-03-object-model step:03  # commit anatomy
+pnpm --filter @statewalker/vcs-example-03-object-model step:04  # tags
+pnpm --filter @statewalker/vcs-example-03-object-model step:05  # deduplication
 ```
 
-## What You'll Learn
+## The walk-through
 
-- How Git stores file content (blobs)
-- How Git represents directories (trees)
-- The anatomy of a commit object
-- Difference between lightweight and annotated tags
-- Content-addressable storage and automatic deduplication
-
-## Prerequisites
-
-- Node.js 18+
-- pnpm
-- Completed [01-quick-start](../01-quick-start/)
-
----
-
-## Step-by-Step Guide
-
-### Step 1: Blob Storage
-
-**File:** [src/steps/01-blob-storage.ts](src/steps/01-blob-storage.ts)
-
-Blobs store file content. The SHA-1 hash of the content becomes the object ID.
+[src/shared.ts](src/shared.ts) creates the history once and gives two helpers used throughout:
 
 ```typescript
-import { createGitRepository, createInMemoryFilesApi } from "@statewalker/vcs-core";
+import { createMemoryHistory, type History, type ObjectId } from "@statewalker/vcs-core";
 
-// Create repository
-const files = createInMemoryFilesApi();
-const repository = await createGitRepository(files, ".git", { create: true });
+const history = createMemoryHistory();
+await history.initialize();
 
-// Store content as a blob
-const content = new TextEncoder().encode("Hello, World!");
-const blobId = await repository.blobs.store([content]);
-
-console.log(`Blob ID: ${blobId}`);  // SHA-1 hash
-
-// Read content back
-const chunks: Uint8Array[] = [];
-for await (const chunk of repository.blobs.load(blobId)) {
-  chunks.push(chunk);
+async function storeBlob(history: History, content: string): Promise<ObjectId> {
+  return history.blobs.store([new TextEncoder().encode(content)]);
 }
-const text = new TextDecoder().decode(chunks[0]);
 
-// Get object metadata
-const header = await repository.objects.getHeader(blobId);
-console.log(`Type: ${header.type}`);   // "blob"
-console.log(`Size: ${header.size}`);   // content length
+async function readBlob(history: History, id: ObjectId): Promise<string> {
+  const stream = await history.blobs.load(id);
+  if (!stream) throw new Error(`Blob not found: ${id}`);
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  // concatenate chunks, then decode
+  ...
+}
 ```
 
-**Key APIs:**
-- `BlobStore.store()` - Store content, returns ObjectId (SHA-1 hash)
-- `BlobStore.load()` - Load content as async iterable
-- `ObjectStore.getHeader()` - Get object type and size
+### Step 1: a blob is raw bytes, named by their hash
 
-**Key Concepts:**
-- The blob ID is the SHA-1 hash of `"blob {size}\0{content}"`
-- Identical content always produces the same ID
-- Blobs contain only raw bytes, no filename or metadata
+[src/steps/01-blob-storage.ts](src/steps/01-blob-storage.ts):
 
----
+```typescript
+const blobId = await storeBlob(history, "Hello, World! This is my first blob.");
+const retrieved = await readBlob(history, blobId);
+const size = await history.blobs.size(blobId); // 36
+```
 
-### Step 2: Tree Structure
+The id is the SHA-1 of `"blob <size>\0"` followed by the content, so it matches what `git hash-object` gives for the same bytes. A blob has no filename or mode; those live in the tree that points at it. `blobs.load()` returns the content as chunks, which `readBlob()` joins before decoding, because content may arrive in more than one chunk.
 
-**File:** [src/steps/02-tree-structure.ts](src/steps/02-tree-structure.ts)
+### Step 2: a tree is a list of (mode, name, id) entries
 
-Trees represent directories. Each entry has a mode, name, and object ID.
+[src/steps/02-tree-structure.ts](src/steps/02-tree-structure.ts):
 
 ```typescript
 import { FileMode } from "@statewalker/vcs-core";
 
-// Create blobs for files
-const readmeId = await repository.blobs.store([encode("# Project")]);
-const indexId = await repository.blobs.store([encode('console.log("Hi")')]);
-
-// Create a tree (directory)
-const treeId = await repository.trees.storeTree([
+const treeId = await history.trees.store([
   { mode: FileMode.REGULAR_FILE, name: "README.md", id: readmeId },
   { mode: FileMode.REGULAR_FILE, name: "index.js", id: indexId },
+  { mode: FileMode.REGULAR_FILE, name: "package.json", id: packageId },
 ]);
 
-// Read tree entries (like `git ls-tree`)
-for await (const entry of repository.trees.loadTree(treeId)) {
-  console.log(`${entry.mode} ${entry.name} ${entry.id}`);
+const entries = await history.trees.load(treeId); // AsyncIterable<TreeEntry> | undefined
+if (entries) {
+  for await (const entry of entries) console.log(entry.mode, entry.name, entry.id);
 }
 
-// Nested directories: trees can contain other trees
-const srcTreeId = await repository.trees.storeTree([
-  { mode: FileMode.REGULAR_FILE, name: "app.js", id: indexId },
+// A subdirectory is an entry with FileMode.TREE pointing at another tree
+const srcTreeId = await history.trees.store([
+  { mode: FileMode.REGULAR_FILE, name: "index.js", id: indexId },
+  { mode: FileMode.REGULAR_FILE, name: "utils.js", id: utilsId },
 ]);
-
-const rootTreeId = await repository.trees.storeTree([
+const rootTreeId = await history.trees.store([
   { mode: FileMode.REGULAR_FILE, name: "README.md", id: readmeId },
-  { mode: FileMode.TREE, name: "src", id: srcTreeId },  // Subdirectory!
+  { mode: FileMode.REGULAR_FILE, name: "package.json", id: packageId },
+  { mode: FileMode.TREE, name: "src", id: srcTreeId },
 ]);
 
-// Look up specific entry
-const entry = await repository.trees.getEntry(rootTreeId, "README.md");
+const entry = await history.trees.getEntry(rootTreeId, "README.md");
 ```
 
-**Key APIs:**
-- `TreeStore.storeTree()` - Create tree from entries
-- `TreeStore.loadTree()` - Stream tree entries
-- `TreeStore.getEntry()` - Get single entry by name
+| Mode     | Constant                   | Meaning          |
+| -------- | -------------------------- | ---------------- |
+| `040000` | `FileMode.TREE`            | Directory        |
+| `100644` | `FileMode.REGULAR_FILE`    | Regular file     |
+| `100755` | `FileMode.EXECUTABLE_FILE` | Executable file  |
+| `120000` | `FileMode.SYMLINK`         | Symbolic link    |
+| `160000` | `FileMode.GITLINK`         | Submodule        |
 
-**File Modes:**
-| Mode | Constant | Description |
-|------|----------|-------------|
-| `040000` | `FileMode.TREE` | Directory |
-| `100644` | `FileMode.REGULAR_FILE` | Regular file |
-| `100755` | `FileMode.EXECUTABLE_FILE` | Executable file |
-| `120000` | `FileMode.SYMLINK` | Symbolic link |
-| `160000` | `FileMode.GITLINK` | Submodule reference |
+```
+root tree 9366c3f
+├── 100644 blob 17ca765  README.md
+├── 100644 blob f455ce3  package.json
+└── 040000 tree e84889e  src
+                ├── 100644 blob db98c02  index.js
+                └── 100644 blob ...      utils.js
+```
 
----
+### Step 3: a commit is a tree plus parents plus who and why
 
-### Step 3: Commit Anatomy
-
-**File:** [src/steps/03-commit-anatomy.ts](src/steps/03-commit-anatomy.ts)
-
-Commits link a tree snapshot to the history chain.
+[src/steps/03-commit-anatomy.ts](src/steps/03-commit-anatomy.ts):
 
 ```typescript
-// Create the commit
 const now = Date.now() / 1000;
-const commitId = await repository.commits.storeCommit({
+const author = { name: "Alice Developer", email: "alice@example.com", timestamp: now, tzOffset: "-0500" };
+
+const commitId = await history.commits.store({
   tree: treeId,
-  parents: [],  // Empty for initial commit
-  author: {
-    name: "Alice Developer",
-    email: "alice@example.com",
-    timestamp: now,
-    tzOffset: "-0500",
-  },
-  committer: {
-    name: "Alice Developer",
-    email: "alice@example.com",
-    timestamp: now,
-    tzOffset: "-0500",
-  },
-  message: "Initial commit\n\nThis is the first commit.",
+  parents: [], // initial commit
+  author,
+  committer: author,
+  message: "Initial commit\n\nThis is the first commit in the repository.",
 });
 
-// Load and inspect the commit
-const commit = await repository.commits.loadCommit(commitId);
+const commit = await history.commits.load(commitId);
+if (!commit) throw new Error(`Commit not found: ${commitId}`);
 
-console.log(`tree:      ${commit.tree}`);
-console.log(`parents:   ${commit.parents.join(", ") || "(none)"}`);
-console.log(`author:    ${commit.author.name} <${commit.author.email}>`);
-console.log(`timestamp: ${new Date(commit.author.timestamp * 1000).toISOString()}`);
-console.log(`message:   ${commit.message}`);
-
-// Second commit with parent reference
-const commit2Id = await repository.commits.storeCommit({
-  tree: newTreeId,
-  parents: [commitId],  // Link to first commit
-  author: { ... },
-  committer: { ... },
-  message: "Update README",
+const commit2Id = await history.commits.store({
+  tree: treeV2Id,
+  parents: [commitId], // links the second commit to the first
+  author: { name: "Bob Developer", email: "bob@example.com", timestamp: now + 3600, tzOffset: "-0500" },
+  committer: { name: "Bob Developer", email: "bob@example.com", timestamp: now + 3600, tzOffset: "-0500" },
+  message: "Update README with version 2",
 });
+
+await history.refs.set("refs/heads/main", commit2Id);
 ```
 
-**Key APIs:**
-- `CommitStore.storeCommit()` - Create commit object
-- `CommitStore.loadCommit()` - Load commit by ID
-- `CommitStore.walkAncestry()` - Traverse commit history
+A `Commit` has `tree`, `parents` (none for the first commit, one for a normal commit, two or more for a merge), `author`, `committer` and `message`, plus optional `encoding` and `gpgSignature`. `timestamp` is in seconds; `tzOffset` is a `"+HHMM"`/`"-HHMM"` string.
 
-**Commit Structure:**
-```
-commit {
-  tree: ObjectId           // Root tree snapshot
-  parents: ObjectId[]      // Parent commits (0 for initial, 1 for normal, 2+ for merge)
-  author: PersonIdent      // Who wrote the changes
-  committer: PersonIdent   // Who applied the commit
-  message: string          // Commit message
-}
-```
+### Step 4: a lightweight tag is a ref; an annotated tag is an object
 
----
-
-### Step 4: Tags
-
-**File:** [src/steps/04-tags.ts](src/steps/04-tags.ts)
-
-Tags mark specific commits. Lightweight tags are just refs; annotated tags are objects.
+[src/steps/04-tags.ts](src/steps/04-tags.ts):
 
 ```typescript
 import { ObjectType } from "@statewalker/vcs-core";
 
-// Lightweight tag: just a ref pointing to a commit
-await repository.refs.set("refs/tags/v1.0.0", commitId);
+// Lightweight: a ref that points straight at the commit
+await history.refs.set("refs/tags/v1.0.0", commitId);
 
-// Annotated tag: a tag object with metadata
-const tagId = await repository.tags.storeTag({
+// Annotated: a tag object, then a ref that points at the tag object
+const tagId = await history.tags.store({
   object: commitId,
   objectType: ObjectType.COMMIT,
   tag: "v2.0.0",
-  tagger: {
-    name: "Release Manager",
-    email: "release@example.com",
-    timestamp: Date.now() / 1000,
-    tzOffset: "+0000",
-  },
-  message: "Version 2.0.0 release\n\nMajor version with breaking changes.",
+  tagger: { name: "Release Manager", email: "release@example.com", timestamp: now, tzOffset: "+0000" },
+  message: "Version 2.0.0 release\n\nThis is a major version with breaking changes.",
 });
+await history.refs.set("refs/tags/v2.0.0", tagId);
 
-// Create ref pointing to tag object
-await repository.refs.set("refs/tags/v2.0.0", tagId);
-
-// Load and inspect tag
-const tag = await repository.tags.loadTag(tagId);
-console.log(`object:     ${tag.object}`);
-console.log(`objectType: ${tag.objectType}`);  // 1 = commit
-console.log(`tag:        ${tag.tag}`);
-console.log(`tagger:     ${tag.tagger?.name}`);
-console.log(`message:    ${tag.message}`);
+const tag = await history.tags.load(tagId); // { object, objectType, tag, tagger, message }
 ```
 
-**Key APIs:**
-- `TagStore.storeTag()` - Create annotated tag object
-- `TagStore.loadTag()` - Load tag object
-- `RefStore.set()` - Create lightweight tag (or ref to annotated tag)
+`ObjectType` codes are `COMMIT = 1`, `TREE = 2`, `BLOB = 3`, `TAG = 4`.
 
-**Lightweight vs Annotated:**
-| Feature | Lightweight | Annotated |
-|---------|-------------|-----------|
-| Stored as | Ref only | Tag object + ref |
-| Tagger info | No | Yes |
-| Message | No | Yes |
-| GPG signature | No | Optional |
-| Use case | Quick bookmarks | Releases |
+|             | Lightweight     | Annotated           |
+| ----------- | --------------- | ------------------- |
+| Stored as   | Ref only        | Tag object + ref    |
+| Tagger      | No              | Yes                 |
+| Message     | No              | Yes                 |
+| Signature   | No              | Optional (`gpgSignature`) |
 
----
+### Step 5: storing the same content twice stores it once
 
-### Step 5: Deduplication
-
-**File:** [src/steps/05-deduplication.ts](src/steps/05-deduplication.ts)
-
-Content-addressable storage means identical content is stored only once.
+[src/steps/05-deduplication.ts](src/steps/05-deduplication.ts) stores one string three times and gets the same id each time, then stores five files of which three share content and counts three unique blobs:
 
 ```typescript
-const content = "Hello, World!";
-
-// Store the same content multiple times
-const id1 = await storeBlob(repository, content);
-const id2 = await storeBlob(repository, content);
-const id3 = await storeBlob(repository, content);
-
-// All IDs are identical!
-console.log(id1 === id2);  // true
-console.log(id2 === id3);  // true
-
-// Content is stored only ONCE, regardless of how many times we store it
-
-// Example: storing files with duplicate content
-const files = [
-  { name: "file1.txt", content: "Shared content" },
-  { name: "file2.txt", content: "Shared content" },  // Duplicate!
-  { name: "file3.txt", content: "Unique content" },
-  { name: "file4.txt", content: "Shared content" },  // Duplicate!
-];
-
-const uniqueIds = new Set<string>();
-for (const file of files) {
-  const id = await storeBlob(repository, file.content);
-  uniqueIds.add(id);
-}
-
-console.log(`Total files: ${files.length}`);      // 4
-console.log(`Unique blobs: ${uniqueIds.size}`);  // 2
+const id1 = await storeBlob(history, "Hello, World! This is some content.");
+const id2 = await storeBlob(history, "Hello, World! This is some content.");
+console.log(id1 === id2); // true
 ```
 
-**Benefits of Content-Addressable Storage:**
-1. **Automatic deduplication** - Same content stored once
-2. **Efficient storage** - Similar files share blobs
-3. **Fast comparison** - Same ID = same content
-4. **Integrity verification** - Hash as checksum
-5. **Efficient network transfer** - Send only unique objects
+### What the output looks like
 
----
-
-## Key Concepts
-
-### Content-Addressable Storage
-
-Git uses SHA-1 hashes to identify objects. The hash is computed from the content:
-- Identical content always produces the same hash
-- The hash serves as both identifier and integrity check
-- Storage automatically deduplicates identical content
-
-### Object Types
-
-| Type | Description | Contains |
-|------|-------------|----------|
-| **blob** | File content | Raw bytes |
-| **tree** | Directory | List of (mode, name, id) entries |
-| **commit** | Snapshot | tree, parents, author, committer, message |
-| **tag** | Annotated tag | object, objectType, tag, tagger, message |
-
-### Object Storage Path
-
-In Git's loose object storage, objects are stored at:
-```
-.git/objects/{first 2 chars}/{remaining 38 chars}
-```
-
-For example, blob `a1b2c3d4e5...` is stored at:
-```
-.git/objects/a1/b2c3d4e5...
-```
-
----
-
-## Project Structure
+Excerpt from a real `start` run. Blob and tree ids are stable across runs; commit and tag ids are not.
 
 ```
-apps/examples/03-object-model/
-├── package.json
-├── tsconfig.json
-├── README.md
-└── src/
-    ├── main.ts                     # Main entry point (runs all steps)
-    ├── shared.ts                   # Shared utilities
-    └── steps/
-        ├── 01-blob-storage.ts      # Blob storage demonstration
-        ├── 02-tree-structure.ts    # Tree structure demonstration
-        ├── 03-commit-anatomy.ts    # Commit anatomy demonstration
-        ├── 04-tags.ts              # Tags demonstration
-        └── 05-deduplication.ts     # Deduplication demonstration
-```
-
----
-
-## API Reference Links
-
-### Core Package (packages/core)
-
-| Interface/Class | Location | Purpose |
-|-----------------|----------|---------|
-| `HistoryStore` | [history/history-store.ts](../../../packages/core/src/history/history-store.ts) | Main repository interface |
-| `BlobStore` | [history/blobs/](../../../packages/core/src/history/blobs/) | Blob storage |
-| `TreeStore` | [history/trees/](../../../packages/core/src/history/trees/) | Tree storage |
-| `CommitStore` | [history/commits/](../../../packages/core/src/history/commits/) | Commit storage |
-| `TagStore` | [history/tags/](../../../packages/core/src/history/tags/) | Tag storage |
-| `RefStore` | [history/refs/](../../../packages/core/src/history/refs/) | Reference storage |
-| `ObjectStore` | [history/objects/](../../../packages/core/src/history/objects/) | Low-level object storage |
-
-### Types
-
-| Type | Description |
-|------|-------------|
-| `ObjectId` | SHA-1 hash as string (40 hex chars) |
-| `PersonIdent` | Author/committer identity (name, email, timestamp, tzOffset) |
-| `FileMode` | File type constants (TREE, REGULAR_FILE, etc.) |
-| `TreeEntry` | Tree entry (mode, name, id) |
-| `Commit` | Commit object structure |
-| `AnnotatedTag` | Tag object structure |
-| `ObjectType` | Object type codes (COMMIT=1, TREE=2, BLOB=3, TAG=4) |
-
----
-
-## Output Example
-
-```
-============================================================
-  Object Model Example
-============================================================
-
 --- Step 1: Blob Storage ---
-
-  >> Storing content as a blob
-
   Content: "Hello, World! This is my first blob."
-  Blob ID: 7b541fb8e12f8a65c0d8b9b0e0f0a1b2c3d4e5f6
-  Short ID: 7b541fb
-
-  >> Understanding the ID
-
-  The blob ID is a SHA-1 hash of the content.
-  Git prefixes the content with "blob {size}\0" before hashing.
-  This creates a unique identifier based on content.
-
-  >> Reading blob content back
-
-  Retrieved content: "Hello, World! This is my first blob."
-  Content matches: true
-
-  >> Getting object metadata
-
-  Object type: blob
-  Object size: 37 bytes
-
-Step 1 completed!
+  Blob ID: 84a0f9880351631dfc38c6ec19bc36504342a3fe
+  Object size: 36 bytes
 
 --- Step 2: Tree Structure ---
-
-  >> Creating files for the tree
-
-  Created blobs:
-    README.md:     a1b2c3d
-    index.js:      e4f5g6h
-    package.json:  i7j8k9l
-
-  >> Creating a tree
-
-  Tree ID: m0n1o2p
-
-  >> Reading tree entries
-
   Tree entries (like 'git ls-tree'):
-    100644 blob a1b2c3d  README.md
-    100644 blob e4f5g6h  index.js
-    100644 blob i7j8k9l  package.json
+    100644 blob 17ca765  README.md
+    100644 blob db98c02  index.js
+    100644 blob f455ce3  package.json
 
-Step 2 completed!
-...
+--- Step 4: Tags ---
+    v1.0.0 (lightweight): fabff1a
+    v2.0.0 (annotated tag object): 7fc9bb8
+    v2.0.0 (target commit): fabff1a
+
+--- Step 5: Deduplication ---
+  First store:  b603bc276cf5686b24ec3cc4073c0f9236282406
+  Second store: b603bc276cf5686b24ec3cc4073c0f9236282406
+  Third store:  b603bc276cf5686b24ec3cc4073c0f9236282406
 ```
 
----
+## Why it is the way it is
 
-## Next Steps
+- **The objects are built by hand.** No commands layer is involved, so every field that ends up in a blob, tree, commit or tag is visible in the code. For the same operations through `git.commit()` and `git.tag()`, see [02-porcelain-commands](../02-porcelain-commands/).
+- **One history for `start`, a fresh one per `step:NN`.** `getHistory()` caches the history, so step 4 tags the commit that step 3 put on `refs/heads/main`. Run alone, step 4 finds no `main` and creates a "Release v1.0" commit first, so each step script also works by itself.
+- **Ids are Git-compatible.** Objects are hashed with the same header and serialization as Git, so the same content gives the same SHA-1 here and in Git.
 
-- [04-branching-merging](../04-branching-merging/) - Advanced branching and merging
-- [06-internal-storage](../06-internal-storage/) - Storage internals (loose objects, pack files)
+## What will surprise you
+
+- **The printed `.git/objects/...` and `.git/refs/tags/...` paths do not exist.** Steps 1 and 4 print where Git would put these objects on disk, but this example uses an in-memory history and writes no files.
+- **Resolving an annotated tag ref gives the tag object, not the commit.** `refs.resolve("refs/tags/v2.0.0")` returns the tag object id (`7fc9bb8` above); you reach the commit through `tags.load(tagId).object`. The step 4 heading "Both types of tags resolve to the same commit" refers to that second hop.
+- **`load()` returns `undefined` for unknown ids** rather than throwing. The scripts turn that into `Blob not found: <id>`, `Commit not found: <id>` or `Tag not found: <id>`, print `Error:` and exit with code 1.
+- **Commit and tag ids change on every run**, because they include the current time.
+
+## Reference
+
+| Script          | Runs                               |
+| --------------- | ---------------------------------- |
+| `start`         | `tsx src/main.ts` (all steps)      |
+| `step:01`-`05`  | `tsx src/steps/NN-*.ts`            |
+| `typecheck`     | `tsc --noEmit`                     |
+
+| What | Where |
+| ---- | ----- |
+| `History` | [packages/core/src/history/history.ts](../../../packages/core/src/history/history.ts) |
+| `Blobs` | [packages/core/src/history/blobs/](../../../packages/core/src/history/blobs/) |
+| `Trees`, `TreeEntry` | [packages/core/src/history/trees/](../../../packages/core/src/history/trees/) |
+| `Commits`, `Commit` | [packages/core/src/history/commits/](../../../packages/core/src/history/commits/) |
+| `Tags`, `AnnotatedTag` | [packages/core/src/history/tags/](../../../packages/core/src/history/tags/) |
+| `Refs` | [packages/core/src/history/refs/](../../../packages/core/src/history/refs/) |
+| `ObjectType` | [packages/core/src/history/objects/object-types.ts](../../../packages/core/src/history/objects/object-types.ts) |
+
+Previous: [01-quick-start](../01-quick-start/). Next: [04-branching-merging](../04-branching-merging/).

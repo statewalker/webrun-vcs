@@ -1,208 +1,265 @@
 # @statewalker/vcs-store-kv
 
-Key-value storage abstraction with adapters for various backends.
+StateWalker VCS stores (Git objects, refs, staging area, raw and delta binary storage) on top of
+any key-value store. You supply a small `KVStore` adapter for your backend; this package does the
+key layout and serialization. A `Map`-backed `MemoryKVAdapter` is included.
 
-## Overview
+## Why it exists
 
-This package bridges StateWalker VCS storage interfaces to key-value stores. Whether you're targeting IndexedDB in browsers, LocalStorage for simple persistence, or LevelDB for Node.js applications, the KV abstraction lets you use the same VCS code across all these backends.
+Many places where a repository has to live offer only a key-value API: IndexedDB in the browser,
+LevelDB or Redis on a server, an embedded KV in a worker. Writing a full set of VCS stores for each
+of them would repeat the same Git logic many times. Here the Git side is written once against an
+eight-method `KVStore` interface, and each backend only has to implement that interface.
 
-The adapter pattern separates VCS logic from storage mechanics. You implement a simple `KVStore` interface for your target backend, then the provided store classes handle Git-specific concerns like serialization, key namespacing, and data organization. This separation keeps adapters small and focused.
-
-The package includes a `MemoryAdapter` for testing, demonstrating the minimal interface adapters must implement. Use it as a reference when building adapters for IndexedDB, LocalStorage, or other key-value systems.
-
-## Installation
+## How to use
 
 ```bash
 pnpm add @statewalker/vcs-store-kv
 ```
 
-## Public API
+No peer dependencies. Runs in the browser, Node and workers; the environment is whatever your
+adapter needs.
 
-### KV Store Interface
+| Entry point | Gives |
+| --- | --- |
+| `@statewalker/vcs-store-kv` | Everything listed below |
 
-The foundation that all adapters implement:
+| Export | What it is |
+| --- | --- |
+| `KVStore` (type) | The adapter contract: `get`, `set`, `delete`, `has`, `list(prefix)`, `getMany`, `setMany`, `compareAndSwap`, optional `close`. |
+| `MemoryKVAdapter` | `Map`-backed `KVStore`. Copies values in and out. `close()` clears it. |
+| `createKvObjectStores({ kv, prefix? })` | `{ objects, blobs, trees, commits, tags }` with **Git-compatible SHA-1 ids**, stored through a `KvRawStore`. |
+| `KVRefStore` | `Refs` on a `KVStore`: direct and symbolic refs, compare-and-swap. |
+| `KVStaging` | `Staging` (the index) on a `KVStore`. |
+| `KVCommitStore`, `KVTreeStore`, `KVTagStore` | JSON-serialized `Commits` / `Trees` / `Tags` with scan-based queries. **Ids are not Git ids** (see Internals). |
+| `KvRawStore`, `createKvRawStore(kv, prefix?)` | `RawStorage` (key to bytes) on a `KVStore`. |
+| `KvDeltaStore`, `createKvDeltaStore(kv, prefix?)` | `DeltaStore` on a `KVStore`. |
+| `KvBinStore`, `createKvBinStore(kv, rawPrefix?, deltaPrefix?)` | `BinStore` combining the two above. |
+| `uint8ArrayEquals(a, b)` | Byte comparison helper for adapters implementing `compareAndSwap`. |
+| `createGitObjectStore`, `createBlobs`, `createTrees`, `createCommits`, `createTags` | Re-exported from `@statewalker/vcs-core`. |
 
-```typescript
-import type { KVStore } from "@statewalker/vcs-store-kv";
+## Examples
 
-interface KVStore {
-  get(key: string): Promise<Uint8Array | undefined>;
-  set(key: string, value: Uint8Array): Promise<void>;
-  delete(key: string): Promise<void>;
-  has(key: string): Promise<boolean>;
-  keys(prefix?: string): AsyncIterable<string>;
-}
-```
+### A repository in a key-value store
 
-### Exports
-
-| Export | Description |
-|--------|-------------|
-| `KVStore` | Key-value store interface |
-| `MemoryAdapter` | In-memory KV adapter (for testing) |
-| `KVCommitStore` | Commit store using KV backend |
-| `KVRefStore` | Reference store using KV backend |
-| `KVStagingStore` | Staging store using KV backend |
-| `KVTagStore` | Tag store using KV backend |
-| `KVTreeStore` | Tree store using KV backend |
-
-## Usage Examples
-
-### Using the Memory Adapter
-
-For testing and development:
-
-```typescript
-import { MemoryAdapter, KVCommitStore, KVRefStore } from "@statewalker/vcs-store-kv";
-
-const kv = new MemoryAdapter();
-const commitStore = new KVCommitStore(kv);
-const refStore = new KVRefStore(kv);
-
-// Use stores normally
-await refStore.setRef("refs/heads/main", commitHash);
-```
-
-### Creating an IndexedDB Adapter
-
-Here's how to implement a browser-compatible adapter:
-
-```typescript
-import type { KVStore } from "@statewalker/vcs-store-kv";
-
-class IndexedDBAdapter implements KVStore {
-  private db: IDBDatabase;
-  private storeName: string;
-
-  constructor(db: IDBDatabase, storeName = "vcs-objects") {
-    this.db = db;
-    this.storeName = storeName;
-  }
-
-  async get(key: string): Promise<Uint8Array | undefined> {
-    return new Promise((resolve, reject) => {
-      const tx = this.db.transaction(this.storeName, "readonly");
-      const store = tx.objectStore(this.storeName);
-      const request = store.get(key);
-
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  async set(key: string, value: Uint8Array): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const tx = this.db.transaction(this.storeName, "readwrite");
-      const store = tx.objectStore(this.storeName);
-      const request = store.put(value, key);
-
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  async delete(key: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const tx = this.db.transaction(this.storeName, "readwrite");
-      const store = tx.objectStore(this.storeName);
-      const request = store.delete(key);
-
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  async has(key: string): Promise<boolean> {
-    const value = await this.get(key);
-    return value !== undefined;
-  }
-
-  async *keys(prefix?: string): AsyncIterable<string> {
-    // Implementation depends on IndexedDB cursor usage
-    const allKeys = await this.getAllKeys();
-    for (const key of allKeys) {
-      if (!prefix || key.startsWith(prefix)) {
-        yield key;
-      }
-    }
-  }
-
-  private getAllKeys(): Promise<string[]> {
-    return new Promise((resolve, reject) => {
-      const tx = this.db.transaction(this.storeName, "readonly");
-      const store = tx.objectStore(this.storeName);
-      const request = store.getAllKeys();
-
-      request.onsuccess = () => resolve(request.result as string[]);
-      request.onerror = () => reject(request.error);
-    });
-  }
-}
-```
-
-### Wiring Up a Complete Repository
-
-```typescript
+```ts
+import { FileMode } from "@statewalker/vcs-core";
 import {
-  MemoryAdapter,
-  KVCommitStore,
+  createKvObjectStores,
   KVRefStore,
-  KVStagingStore,
-  KVTagStore,
-  KVTreeStore,
+  KVStaging,
+  MemoryKVAdapter,
 } from "@statewalker/vcs-store-kv";
 
-function createKVStorage(adapter: KVStore) {
-  return {
-    commitStore: new KVCommitStore(adapter),
-    refStore: new KVRefStore(adapter),
-    stagingStore: new KVStagingStore(adapter),
-    tagStore: new KVTagStore(adapter),
-    treeStore: new KVTreeStore(adapter),
-  };
-}
+const kv = new MemoryKVAdapter();
+const stores = createKvObjectStores({ kv });
+const staging = new KVStaging(kv);
+const refs = new KVRefStore(kv);
 
-// Usage
-const adapter = new MemoryAdapter();
-const storage = createKVStorage(adapter);
+const blobId = await stores.blobs.store([new TextEncoder().encode("hello\n")]);
+await staging.setEntry({ path: "README.md", mode: FileMode.REGULAR_FILE, objectId: blobId });
+const treeId = await staging.writeTree(stores.trees);
+
+const who = { name: "Ada", email: "ada@example.com", timestamp: 1700000000, tzOffset: "+0000" };
+const commitId = await stores.commits.store({
+  tree: treeId,
+  parents: [],
+  author: who,
+  committer: who,
+  message: "init\n",
+});
+
+await refs.set("refs/heads/main", commitId);
+await refs.setSymbolic("HEAD", "refs/heads/main");
+await refs.resolve("HEAD"); // { name: "refs/heads/main", objectId: commitId, ... }
+
+// Optimistic update of a branch
+const result = await refs.compareAndSwap("refs/heads/main", commitId, commitId);
+// { success: true, previousValue: commitId }
 ```
 
-## Architecture
+After this the adapter holds keys like:
 
-### Design Decisions
+```
+objects::raw:ce013625...      objects::size:ce013625...   (blob)
+objects::raw:853694aa...      objects::size:853694aa...   (tree)
+objects::raw:8b459a2e...      objects::size:8b459a2e...   (commit)
+staging:README.md<NUL>0
+ref:refs/heads/main
+ref:HEAD
+```
 
-The adapter pattern was chosen for maximum flexibility. Key-value stores vary significantly in their APIs (sync vs async, transaction support, iteration methods), but they share the same fundamental operations. The `KVStore` interface captures this common ground.
+### Writing an adapter
 
-Stores use prefix-based namespacing to isolate different data types within a single KV backend. Commits might use `commits/` prefix, refs use `refs/`, and so on. This approach works well with KV stores that support prefix scanning.
+Implement `KVStore`. `compareAndSwap` must be atomic in your backend; `KVRefStore` relies on it.
+A sketch for IndexedDB, with one object store whose keys are the strings above:
 
-### Implementation Details
+```ts
+import { type KVStore, uint8ArrayEquals } from "@statewalker/vcs-store-kv";
 
-All KV stores serialize data to `Uint8Array` for storage. This binary format avoids encoding issues and works consistently across all adapter implementations. The stores handle serialization of higher-level structures (commits, trees, refs) internally.
+const req = <T>(r: IDBRequest<T>) =>
+  new Promise<T>((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
 
-The async-first API accommodates both synchronous backends (like in-memory Maps) and inherently asynchronous ones (like IndexedDB). Synchronous adapters simply return resolved promises.
+export class IdbKVAdapter implements KVStore {
+  constructor(private db: IDBDatabase, private name = "vcs") {}
 
-## JGit References
+  private os(mode: IDBTransactionMode) {
+    return this.db.transaction(this.name, mode).objectStore(this.name);
+  }
+  async get(key: string) {
+    return (await req(this.os("readonly").get(key))) as Uint8Array | undefined;
+  }
+  async set(key: string, value: Uint8Array) {
+    await req(this.os("readwrite").put(value, key));
+  }
+  async delete(key: string) {
+    const os = this.os("readwrite");
+    const existed = (await req(os.count(key))) > 0;
+    await req(os.delete(key));
+    return existed;
+  }
+  async has(key: string) {
+    return (await req(this.os("readonly").count(key))) > 0;
+  }
+  async *list(prefix: string) {
+    const range = IDBKeyRange.bound(prefix, `${prefix}￿`);
+    for (const key of await req(this.os("readonly").getAllKeys(range))) yield key as string;
+  }
+  async getMany(keys: string[]) {
+    const out = new Map<string, Uint8Array>();
+    for (const k of keys) {
+      const v = await this.get(k);
+      if (v) out.set(k, v);
+    }
+    return out;
+  }
+  async setMany(entries: Map<string, Uint8Array>) {
+    const os = this.os("readwrite");
+    await Promise.all([...entries].map(([k, v]) => req(os.put(v, k))));
+  }
+  async compareAndSwap(key: string, expected: Uint8Array | undefined, next: Uint8Array) {
+    const os = this.os("readwrite"); // get + put in one transaction
+    const current = (await req(os.get(key))) as Uint8Array | undefined;
+    if (!uint8ArrayEquals(current, expected)) return false;
+    await req(os.put(next, key));
+    return true;
+  }
+}
+```
 
-JGit doesn't have a direct equivalent to key-value storage abstraction. The closest comparison is the DFS (Distributed File System) layer:
+### Scan-based queries on the JSON stores
 
-| StateWalker VCS | JGit Equivalent |
-|-----------------|-----------------|
-| `KVStore` interface | `org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase` |
-| Adapter pattern | DFS backend implementations |
+```ts
+import { KVCommitStore, MemoryKVAdapter } from "@statewalker/vcs-store-kv";
 
-The DFS layer in JGit abstracts storage backends for distributed systems like cloud storage, while KV abstraction targets simpler key-value stores commonly used in browsers and embedded scenarios.
+const commits = new KVCommitStore(new MemoryKVAdapter());
+const who = { name: "Ada", email: "ada@example.com", timestamp: 1700000000, tzOffset: "+0000" };
+await commits.store({
+  tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+  parents: [],
+  author: who,
+  committer: who,
+  message: "fix: bug",
+});
 
-## Dependencies
+for await (const id of commits.findByAuthor("ada@example.com")) console.log(id);
+for await (const id of commits.searchMessage("fix")) console.log(id); // case-insensitive substring
+await commits.count(); // 1
+```
 
-**Runtime:**
-- `@statewalker/vcs-core` - Interface definitions
-- `@statewalker/vcs-utils` - Utilities
+`KVTreeStore` has `findTreesWithBlob(blobId)` and `findByNamePattern("*.ts")` (`*` and `?`
+wildcards, case-insensitive). `KVTagStore` has `findByNamePattern`, `findByTagger(email)` and
+`findByTargetType(type)`. Every one of them loads every object of its kind: cost is O(n) in the
+number of stored objects.
 
-**Development:**
-- `@statewalker/vcs-testing` - Test suites for validation
-- `vitest` - Testing
-- `rolldown` - Bundling
-- `typescript` - Type definitions
+### Binary storage with deltas
+
+```ts
+import { createKvBinStore, MemoryKVAdapter } from "@statewalker/vcs-store-kv";
+
+const bin = createKvBinStore(new MemoryKVAdapter());
+await bin.raw.store("base", (async function* () {
+  yield new TextEncoder().encode("hello world");
+})());
+await bin.raw.size("base"); // 11
+
+const update = bin.delta.startUpdate();
+await update.storeDelta({ baseKey: "base", targetKey: "target" }, [
+  { type: "start", targetLen: 5 },
+  { type: "copy", start: 0, len: 5 },
+  { type: "finish", checksum: 0 },
+]);
+await update.close();
+await bin.delta.isDelta("target"); // true
+```
+
+## Internals
+
+### Why the adapter contract has eight methods
+
+`get`/`set`/`delete`/`has`/`list(prefix)` are the minimum to store and enumerate objects.
+`getMany`/`setMany` let `KvRawStore` write an object's bytes and its size record in one call, so
+a backend with batch writes can make that a single operation. `compareAndSwap` is what makes
+`KVRefStore.compareAndSwap` safe when two writers move the same branch. Every method is async so
+synchronous backends (a `Map`) and asynchronous ones (IndexedDB) fit the same interface.
+
+### Key layout
+
+All stores can share one `KVStore` because each writes under its own prefix:
+
+| Store | Keys |
+| --- | --- |
+| `createKvObjectStores` (prefix `objects:`) / `KvRawStore` (prefix `raw`) | `<prefix>:raw:<key>` (bytes), `<prefix>:size:<key>` (4-byte little-endian length) |
+| `KvDeltaStore` (prefix `delta`) | `<prefix>:delta:<targetKey>` (JSON) |
+| `KVRefStore` | `ref:<name>`: `{"oid":…}` or `{"t":<target>}` |
+| `KVStaging` | `staging:<path><NUL><stage>`, plus `staging:__meta__` |
+| `KVCommitStore` / `KVTreeStore` / `KVTagStore` | `commit:<id>`, `tree:<id>`, `tag:<id>` (compact JSON) |
+
+The default `objects:` prefix plus the `:` separator yields a double colon (`objects::raw:…`).
+`list(prefix)` must be a real prefix scan; `KVRefStore.list()` and the query methods depend on it.
+
+### Two kinds of object stores, and why their ids differ
+
+`createKvObjectStores` serializes objects in Git format and hashes them with SHA-1 through the
+same `@statewalker/vcs-core` codecs as the other backends. Its ids match native Git. Use it when
+ids must interoperate (transport, packs, comparing with `git`).
+
+`KVCommitStore`, `KVTreeStore` and `KVTagStore` store compact JSON (`{"t":…,"p":[…],"an":…}`) and
+take ids from `computeCommitHash` / `computeTreeHash` / `computeTagHash`: a 32-bit FNV-1a hash
+with a type prefix, zero-padded to 40 characters (`commitd0ac0057000…`). Ids are stable but are
+not Git ids. The empty tree is always Git's `4b825dc642cb6eb9a060e54bf8d69288fbee4904`. These
+stores add the scan-based query methods shown above.
+
+### Raw storage holds whole values
+
+`KvRawStore.store()` collects the whole stream into one value before writing, and `load()` reads
+the whole value before slicing a range. Object size is bounded by what the backend accepts as a
+single value and by memory.
+
+### What breaks
+
+| Situation | Symptom |
+| --- | --- |
+| `KvRawStore.load()` of a missing key | throws `Key not found: <key>` |
+| `KvRawStore.size()` of a missing key | returns `-1` |
+| A symbolic ref chain deeper than 100 | `Symbolic ref chain too deep (> 100)` |
+| A nested annotated tag chain deeper than 100 with `getTarget(id, true)` | `Tag chain too deep (> 100)` |
+| `refs.compareAndSwap(name, expected, next)` where `name` is a symbolic ref (for example `HEAD`) | always `{ success: false, errorMessage: "Concurrent modification detected" }`. The stored value is `{"t":…}`, not the `{"oid":…}` the swap compares against. Update the target branch instead. |
+| `refs.compareAndSwap` with a stale `expected` | `{ success: false, errorMessage: "Expected <old>, found <current>" }` |
+| `KVStaging.writeTree()` with conflict stages | `Cannot write tree with unresolved conflicts` |
+| `KVStaging.resolveConflict()` with no entry at the chosen stage | `No entry at stage <n> for path: <path>` |
+| Index builder `add()` without a mode / duplicate entry / stage 0 next to stages 1-3 | `FileMode not set for path <path>` / `Duplicate entry: <path> stage <n>` / `Invalid stages for <path>: stage 0 cannot coexist with other stages` |
+| `storeDelta()` on an update after its `close()` | `Update already closed` |
+
+### Dependencies
+
+- `@statewalker/vcs-core`: store interfaces, Git object codecs, id hash functions, and the
+  ancestry algorithms (`walkAncestry`, `findMergeBase`, `isAncestor`) `KVCommitStore` delegates to.
+- `@statewalker/vcs-working-tree`: the `Staging` interface and merge-stage constants.
+- `@statewalker/vcs-utils`: the `Delta` type.
 
 ## License
 
