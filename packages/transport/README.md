@@ -1,194 +1,288 @@
 # @statewalker/vcs-transport
 
-Git transport protocol implementation using finite state machines. Supports fetch, push, clone, and P2P sync over HTTP, WebSocket, WebRTC, and MessagePort.
+## What it is
 
-## Overview
+Git transport protocol (wire protocol v1 and v2) built on finite state machines. It provides fetch, push, clone and ls-remote over smart HTTP, and fetch/push/serve over any bidirectional byte stream (MessagePort, `@statewalker/webrun-streams` channels, or your own). It uses Web platform APIs only (`fetch`, `Request`/`Response`, `MessagePort`, async iterables), so it runs in browsers, workers and Node.
 
-This package implements the Git wire protocol (v1 and v2) with an FSM-based architecture. Each protocol operation (fetch, push) is modeled as a state machine with explicit transitions and handlers, making the protocol flow easy to follow and test.
+## Why it exists: Git sync without a git binary or a socket
 
-Three levels of abstraction are provided:
+Browser and worker code cannot spawn `git` or open raw TCP sockets, yet repositories built with `@statewalker/vcs-core` still need to exchange objects with real Git servers and with each other. This package speaks the Git wire protocol directly over whatever channel is available: an HTTP `fetch`, a `MessagePort` between tabs or workers, or an in-process webrun-streams channel. The same client and server state machines serve every channel, so a peer-to-peer sync between two browser tabs uses exactly the code path that talks to a Git HTTP server.
 
-1. **Operations** — High-level functions for common tasks (`fetch`, `push`, `clone`, `lsRemote`, `p2pSync`)
-2. **Duplex operations** — Transport-agnostic operations over any bidirectional stream (`fetchOverDuplex`, `pushOverDuplex`, `serveOverDuplex`)
-3. **FSM primitives** — Raw state machines for custom protocol implementations
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the design and [src/README.md](./src/README.md) for the FSM internals.
 
-## Installation
+## How to use: pick a layer
+
+The package has three layers:
+
+1. **HTTP operations**: `fetch`, `push`, `clone`, `lsRemote` (smart-HTTP client).
+2. **Duplex operations**: `fetchOverDuplex`, `fetchV2OverDuplex`, `pushOverDuplex`, `serveOverDuplex`, `p2pSync` (any `Duplex`).
+3. **FSM primitives**: the `Fsm` engine and the client/server transition and handler tables.
+
+### Install
 
 ```bash
 pnpm add @statewalker/vcs-transport
 ```
 
-## Quick Start
+No peer dependencies.
 
-### Fetch from a Remote (HTTP)
+To get a `RepositoryFacade` and `RefStore` for a VCS store, use [`@statewalker/vcs-transport-adapters`](../transport-adapters/README.md), or `createRepositoryFacade()` from this package.
+
+### Entry points
+
+| Import path | Contents |
+|-------------|----------|
+| `@statewalker/vcs-transport` | Everything: operations, adapters, API interfaces, context, factories, FSMs, protocol, utils |
+| `@statewalker/vcs-transport/protocol` | Wire format only: pkt-line codec, sideband, capabilities, ACK/NAK, report-status, request parser, constants, errors, protocol types |
+| `@statewalker/vcs-transport/operations` | Operations only: `fetch`, `push`, `clone`, `lsRemote`, `fetchOverDuplex`, `fetchV2OverDuplex`, `pushOverDuplex`, `serveOverDuplex`, `p2pSync` |
+
+All entry points are ESM with type declarations.
+
+### API overview
+
+#### Operations
+
+| Function | Transport | Result |
+|----------|-----------|--------|
+| `fetch(options)` | HTTP | `HttpFetchResult`: `refs`, `packData`, `defaultBranch`, `bytesReceived`, `isEmpty` |
+| `clone(options)` | HTTP | `CloneResult` (same shape as `HttpFetchResult`) |
+| `push(options)` | HTTP | `HttpPushResult`: `ok`, `updates`, `unpackStatus`, `bytesSent`, `objectCount` |
+| `lsRemote(url, options?)` | HTTP | `Map<refName, oidHex>` |
+| `fetchOverDuplex(options)` | Duplex | `FetchResult` |
+| `fetchV2OverDuplex(options)` | Duplex | `FetchResult` (protocol v2; adds `refPrefixes`, `peel`, `symrefs`) |
+| `pushOverDuplex(options)` | Duplex | `PushResult` |
+| `serveOverDuplex(options)` | Duplex | `ServeResult` |
+| `p2pSync(options)` | Duplex | `P2PSyncResult` |
+
+#### Core interfaces
+
+| Interface | Description |
+|-----------|-------------|
+| `Duplex` | Async-iterable byte stream with `write(data)` and optional `close()` |
+| `RepositoryFacade` | `importPack`, `exportPack`, `has`, `walkAncestors`, optional reachability helpers |
+| `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip` |
+| `RepositoryAccess` | Object/ref access: `hasObject`, `getObjectInfo`, `loadObject`, `storeObject`, `listRefs`, `getHead`, `updateRef`, `walkObjects` |
+| `TransportApi` | Pkt-line, sideband and pack I/O over a `Duplex` |
+| `Credentials` | `{ username?, password?, token? }`. The HTTP operations use `username`/`password` only. |
+
+#### Adapters
+
+| Export | Description |
+|--------|-------------|
+| `createMessagePortDuplex`, `messagePortFetch`, `messagePortServe` | MessagePort transport |
+| `webrunClientDuplex`, `serveRepoOverWebrun` | Git protocol over a webrun-streams `Duplex` |
+| `serveGitOverWebrunHttp`, `webrunHttpFetch` | Smart HTTP over a webrun-streams `Duplex` |
+| `httpFetch`, `httpPush`, `createHttpClientDuplex`, `createSimpleDuplex` | Low-level HTTP client helpers |
+| `createFetchHandler`, `createHttpHandler`, `createGitHttpServer` | Smart-HTTP server |
+
+#### Factories
+
+| Function | Description |
+|----------|-------------|
+| `createRepositoryFacade({ history })` | `RepositoryFacade` from a `HistoryWithOperations` (`@statewalker/vcs-core`) |
+| `createTransportApi(duplex, state)` | `TransportApi` from a `Duplex` and a `ProtocolState` |
+
+#### FSM
+
+| Export | Description |
+|--------|-------------|
+| `Fsm`, `FsmError` | Engine: `new Fsm(transitions, handlers)`, `fsm.run(context, ...stopStates)` |
+| `clientFetchTransitions` / `clientFetchHandlers` | Client fetch (v1) |
+| `serverFetchTransitions` / `serverFetchHandlers` | Server upload-pack (v1) |
+| `clientPushTransitions` / `clientPushHandlers` | Client push |
+| `serverPushTransitions` / `serverPushHandlers` | Server receive-pack |
+| `clientV2Transitions` / `clientV2Handlers` | Protocol v2 client |
+| `serverV2Transitions` / `serverV2Handlers` | Protocol v2 server |
+| `errorRecoveryTransitions` / `errorRecoveryHandlers`, `withErrorRecovery`, `withErrorRecoveryHandlers`, `classifyError` | Error recovery |
+| `ProtocolState`, `HandlerOutput`, `ProcessConfiguration`, `ProcessContext` | FSM context |
+
+#### Protocol utilities
+
+| Category | Exports |
+|----------|---------|
+| Pkt-line | `encodePacket`, `encodePacketLine`, `encodeFlush`, `encodeDelim`, `encodeEnd`, `parsePacket`, `pktLineReader`, `pktLineWriter`, `collectPackets` |
+| Sideband | `demuxSideband`, `extractPackData`, `encodeSidebandPacket`, `SideBandOutputStream`, `SideBandProgressParser` |
+| Capabilities | `parseCapabilities`, `formatCapabilities`, `negotiateCapabilities`, `hasMultiAck`, `hasSideband`, `hasThinPack`, `hasOfsDelta` |
+| ACK/NAK | `parseAckNak`, `parseAckNakV2`, `formatAck`, `formatNak` |
+| Report status | `parseReportStatus`, `parseReportStatusV2`, `parseReportStatusLines`, `formatPushResult`, `assertPushSuccess` |
+| Requests | `parseGitProtocolRequest`, `readGitProtocolRequest`, `encodeGitProtocolRequest` |
+| Errors | `TransportError`, `PackProtocolError`, `PacketLineError`, `ServerError`, `ConnectionError`, `AuthenticationError`, `RepositoryNotFoundError` |
+| RefSpec | `parseRefSpec`, `formatRefSpec`, `matchSource`, `matchDestination`, `expandFromSource`, `expandFromDestination`, `isWildcard`, `defaultFetchRefSpec`, `defaultPushRefSpec` |
+| URL | `parseGitUrl`, `formatGitUrl`, `toHttpUrl`, `resolveUrl`, `isRemote`, `getRepositoryName`, `getDefaultPort`, `getEffectivePort` |
+
+Protocol constants (`PKT_FLUSH`, `CAPABILITY_*`, `ZERO_OID`, `SERVICE_UPLOAD_PACK`, and others) are exported too.
+
+## Examples
+
+### HTTP: list refs, fetch, clone
+
+The HTTP operations do not write to a repository. `fetch` and `clone` return the remote refs (binary OIDs) and the raw pack bytes. Importing the pack is up to you, for example with `RepositoryFacade.importPack`.
 
 ```typescript
-import { fetch } from "@statewalker/vcs-transport";
-import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
+import { clone, fetch, lsRemote } from "@statewalker/vcs-transport";
 
-const facade = createVcsRepositoryFacade({ history });
+const refs = await lsRemote("https://example.com/user/repo.git");
+for (const [name, oid] of refs) console.log(name, oid);
 
-const result = await fetch({
-  url: "https://github.com/user/repo.git",
-  repository: facade,
-  refSpecs: ["+refs/heads/*:refs/remotes/origin/*"],
+const fetched = await fetch({
+  url: "https://example.com/user/repo.git",
+  refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+  auth: { username: "user", password: "secret" },
 });
+console.log(fetched.defaultBranch, fetched.bytesReceived, fetched.packData.length);
 
-console.log("Fetched refs:", result.refs);
+const cloned = await clone({ url: "https://example.com/user/repo.git", depth: 1 });
 ```
 
-### Push to a Remote (HTTP)
+Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }`), `headers`, `timeout` (ms), and `fetchImpl` (a `(Request) => Promise<Response>` used instead of `globalThis.fetch`). `fetch` also accepts `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage`. `clone` accepts `branch`, `depth`, `onProgress`, `onProgressMessage`.
+
+### HTTP: push
 
 ```typescript
 import { push } from "@statewalker/vcs-transport";
-import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
-
-const facade = createVcsRepositoryFacade({ history });
 
 const result = await push({
-  url: "https://github.com/user/repo.git",
-  repository: facade,
-  refSpecs: ["refs/heads/main:refs/heads/main"],
-  credentials: { username: "user", password: "token" },
+  url: "https://example.com/user/repo.git",
+  refspecs: ["refs/heads/main:refs/heads/main"],
+  auth: { username: "user", password: "token" },
+  getLocalRef: (ref) => refStore.get(ref),
+  exportPack: (wants, exclude) => repository.exportPack(wants, exclude),
 });
 
-console.log("Push result:", result);
+for (const [ref, status] of result.updates) {
+  console.log(ref, status.ok ? "ok" : status.message);
+}
 ```
 
-### Clone a Repository
+`push` produces pack data with `exportPack` (preferred) or `getObjectsToPush`. It also accepts `force` and `atomic`.
+
+### Smart-HTTP server
+
+`createFetchHandler` returns a `(Request) => Promise<Response>` that serves `/info/refs`, `/git-upload-pack` and `/git-receive-pack`. It works with any Fetch-API server.
 
 ```typescript
-import { clone } from "@statewalker/vcs-transport";
-import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
+import { createFetchHandler } from "@statewalker/vcs-transport";
 
-const facade = createVcsRepositoryFacade({ history });
+const handleGit = createFetchHandler({
+  async resolveRepository(repoPath) {
+    // return null for unknown paths
+    return { repository, refStore };
+  },
+});
 
-const result = await clone({
-  url: "https://github.com/user/repo.git",
-  repository: facade,
+// e.g. Deno.serve(handleGit) or Bun.serve({ fetch: handleGit })
+```
+
+Lower-level pieces are also exported: `createHttpHandler`, `createGitHttpServer`, `handleInfoRefs`, `handleUploadPack`, `handleReceivePackInfoRefs`, `handleReceivePack`, `parseGitRequest`, `fetchRequestToHttpRequest`, `httpResponseToFetchResponse`.
+
+### Smart-HTTP without a network port
+
+`serveGitOverWebrunHttp` wraps the server handler as a webrun-streams `Duplex`. `webrunHttpFetch` turns a webrun `Duplex` into a `fetchImpl`. For an in-process loopback, pass one to the other:
+
+```typescript
+import { lsRemote, serveGitOverWebrunHttp, webrunHttpFetch } from "@statewalker/vcs-transport";
+
+const server = serveGitOverWebrunHttp({
+  resolveRepository: async () => ({ repository, refStore }),
+});
+const refs = await lsRemote("http://localhost/repo.git", {
+  fetchImpl: webrunHttpFetch(server),
 });
 ```
 
-### P2P Sync over WebRTC/MessagePort
+### Fetch over a Duplex
+
+`serveRepoOverWebrun` builds a webrun-streams handler that runs `serveOverDuplex`. `webrunClientDuplex` wraps a webrun caller as a transport `Duplex`. In-process:
 
 ```typescript
-import { fetchOverDuplex, serveOverDuplex } from "@statewalker/vcs-transport";
-import { createMessagePortDuplex } from "@statewalker/vcs-transport";
+import { fetchOverDuplex, serveRepoOverWebrun, webrunClientDuplex } from "@statewalker/vcs-transport";
 
-// Create a Duplex from MessagePort
-const duplex = createMessagePortDuplex(messagePort);
+const handler = serveRepoOverWebrun({
+  repository: sourceFacade,
+  refStore: sourceRefStore,
+  service: "git-upload-pack",
+});
 
-// Client side: fetch objects
 const result = await fetchOverDuplex({
-  duplex,
-  repository: clientFacade,
-  refStore: clientRefs,
+  duplex: webrunClientDuplex(handler),
+  repository: destFacade,
+  refStore: destRefStore,
 });
-
-// Server side: serve requests
-await serveOverDuplex({
-  duplex,
-  repository: serverFacade,
-  serviceType: "upload-pack",
-});
+if (!result.success) throw new Error(result.error);
+console.log(result.updatedRefs, result.objectsImported);
 ```
 
-### Bidirectional P2P Sync
+Over a `MessagePort`, wrap each end with `createMessagePortDuplex(port)`. Call `fetchOverDuplex` or `pushOverDuplex` on one side and `serveOverDuplex` on the other. `messagePortFetch(port, repository, refStore, options)` and `messagePortServe(port, repository, refStore, options)` do this in one call.
+
+`serveOverDuplex` options: `duplex`, `repository`, `refStore`, `service` (`"git-upload-pack"` by default, or `"git-receive-pack"`), `allowDeletes`, `allowNonFastForward`, `denyCurrentBranch`, `currentBranch`, `capabilities`, `protocolVersion` (`"1"` or `"2"`; v2 applies to upload-pack only).
+
+### Peer-to-peer sync
 
 ```typescript
 import { p2pSync } from "@statewalker/vcs-transport";
 
 const result = await p2pSync({
-  duplex,
-  localRepository: localFacade,
-  localRefStore: localRefs,
-  remoteRepository: remoteFacade,
-  direction: "both",
+  localRepository: facade,
+  localRefStore: refStore,
+  remoteDuplex: duplex,
+  direction: "bidirectional", // or "pull" / "push"
 });
+if (result.success) console.log(`Synced ${result.refsSynced} refs`);
 ```
 
-## Public API
+## Internals
 
-### Operations (High-Level)
+### Why every operation is a state machine
 
-| Function | Transport | Description |
-|----------|-----------|-------------|
-| `fetch()` | HTTP | Fetch objects from a remote repository |
-| `push()` | HTTP | Push objects to a remote repository |
-| `clone()` | HTTP | Clone a remote repository |
-| `lsRemote()` | HTTP | List remote references |
-| `fetchOverDuplex()` | Duplex | Fetch over any bidirectional stream |
-| `pushOverDuplex()` | Duplex | Push over any bidirectional stream |
-| `serveOverDuplex()` | Duplex | Serve fetch/push requests over duplex |
-| `p2pSync()` | Duplex | Bidirectional peer-to-peer sync |
+Each protocol role (client fetch, server upload-pack, client push, server receive-pack, v2 client and server) is a table of `[source, event, target]` transitions plus a map of state handlers. Handlers do one protocol step through `TransportApi` and return the next event. This keeps the protocol flow readable as data and lets tests drive single states. It also enables stop states: `fsm.run(context, "SOME_STATE")` pauses the machine, which is how the stateless smart-HTTP request/response pair maps onto one continuous protocol conversation. Error recovery is a separate transition table merged in with `withErrorRecovery`.
 
-### Core Interfaces
+```
+HTTP operations / Duplex operations
+        |
+        v
+  Fsm (transitions + handlers)  <-- ProcessContext: transport, repository, refStore, state, output, config
+        |
+        v
+  TransportApi (pkt-line, sideband, pack streams)
+        |
+        v
+  Duplex (async-iterable bytes + write)
+```
 
-| Interface | Description |
-|-----------|-------------|
-| `Duplex` | Bidirectional async byte stream (reader + writer + close) |
-| `RepositoryFacade` | Transport-layer repository operations (pack I/O, ancestry, reachability) |
-| `RepositoryAccess` | Server-side repository operations (object/ref CRUD) |
-| `TransportApi` | Low-level Git wire protocol I/O (pkt-line, sideband, pack) |
-| `RefStore` | Reference read/write operations for transport |
+### Why storage stays outside
 
-### Adapters
+The transport never touches storage directly. It needs only a `RepositoryFacade` (pack import/export, `has`, ancestry walks) and a `RefStore`. That keeps the package independent of any backend; `@statewalker/vcs-transport-adapters` builds these from `@statewalker/vcs-core` stores.
 
-| Function | Description |
-|----------|-------------|
-| `createMessagePortDuplex()` | Create Duplex from MessagePort |
-| `createGitSocketClient()` | Create Git client from socket I/O handles |
-| `handleGitSocketConnection()` | Handle Git server connection over socket |
+### Constraints
 
-### FSM Components
+- HTTP `fetch` and `clone` return raw pack bytes and binary OIDs; they do not import anything. The duplex operations do import into the given `RepositoryFacade` and update the `RefStore`.
+- HTTP authentication is Basic auth from `auth.username` and `auth.password`. `Credentials.token` is accepted by the type but not sent by `fetch`, `push`, `clone` or `lsRemote`; pass a token as `password` or as an `Authorization` header in `headers`.
+- `clone` accepts `bare` and `remoteName` in its options type but does not use them.
+- `fetchOverDuplex` resolves `localHead` (default `refs/heads/main`) to pick negotiation haves and sends at most `maxHaves` (default 256).
+- Pkt-lines are limited to 65520 bytes (`MAX_PACKET_SIZE`). Larger packets fail with `Packet too large: <n> bytes (max 65520)`.
+- Protocol v2 is fetch-only. `serveOverDuplex` with `protocolVersion: "2"` and `service: "git-receive-pack"` runs the v1 push machine.
 
-| Export | Description |
-|--------|-------------|
-| `Fsm` | Finite state machine engine |
-| `clientFetchTransitions/Handlers` | Client-side fetch protocol |
-| `serverFetchTransitions/Handlers` | Server-side fetch protocol |
-| `clientPushTransitions/Handlers` | Client-side push protocol |
-| `serverPushTransitions/Handlers` | Server-side push protocol |
-| `clientV2Transitions/Handlers` | Protocol V2 client |
-| `serverV2Transitions/Handlers` | Protocol V2 server |
-| `errorRecoveryTransitions/Handlers` | Error recovery FSM |
+### What failures look like
 
-### Factories
+- HTTP operations throw: `Failed to get refs: <status> <statusText>`, `Failed to upload-pack: ...`, `Failed to receive-pack: ...`, `Empty response from /info/refs`, `Request timeout` (when `timeout` elapses), `Server error: <message>` (an `ERR` packet or sideband error), and for `push`, `Local ref not found: <ref>`.
+- Duplex operations do not throw on protocol failure. They return `{ success: false, error }`, with `error` set by the failing handler or `FSM did not complete successfully` (`V2 FSM did not complete successfully` for v2). `p2pSync` prefixes `Fetch failed:` or `Push failed:`.
+- A broken custom transition table throws `FsmError`: `No handler for state: "<state>"` or `No transition for event "<event>" from state "<state>"`.
 
-| Function | Description |
-|----------|-------------|
-| `createRepositoryFacade()` | Create RepositoryFacade from HistoryWithOperations |
-| `createTransportApi()` | Create TransportApi from Duplex |
+### Dependencies
 
-### Protocol Utilities
+- `@statewalker/vcs-core`: object, ref and history types; `createRepositoryFacade` builds on its `HistoryWithOperations`.
+- `@statewalker/vcs-utils`: hashing and compression for pack handling.
+- `@statewalker/webrun-streams`: the functional `Duplex` type used by the webrun adapters.
+- `@statewalker/webrun-http-streams`: runs Fetch `Request`/`Response` over a webrun `Duplex` for the smart-HTTP-without-a-port adapter.
 
-| Category | Exports |
-|----------|---------|
-| Pkt-line | `encodePacket`, `parsePacket`, `encodeFlush`, `encodeDelim` |
-| Sideband | `demuxSideband`, `muxSideband`, `encodeSidebandPacket` |
-| Capabilities | `parseCapabilities`, `negotiateCapabilities` |
-| Acknowledgments | `parseAckNak`, `formatAck`, `formatNak` |
-| Advertisement | `parseAdvertisement`, `parseBufferedAdvertisement` |
-| Report Status | `parseReportStatus`, `parseReportStatusLines` |
-| Errors | `TransportError`, `PackProtocolError`, `ServerError`, `AuthenticationError` |
-| RefSpec | `parseRefSpec`, `formatRefSpec`, `matchSource`, `matchDestination` |
-| URL | `parseGitUrl`, `formatGitUrl`, `toHttpUrl`, `resolveUrl` |
+### Commands
 
-### Sub-Exports
+```bash
+pnpm --filter @statewalker/vcs-transport test        # tests in tests/
+pnpm --filter @statewalker/vcs-transport test:bench  # performance benchmarks
+```
 
-| Export Path | Description |
-|-------------|-------------|
-| `@statewalker/vcs-transport/protocol` | Wire format: pkt-line, sideband, capabilities, constants |
-| `@statewalker/vcs-transport/operations` | High-level operations: fetch, push, clone, lsRemote, p2pSync |
-
-## Dependencies
-
-**Runtime:**
-- `@statewalker/vcs-core` — Store interfaces and types
-- `@statewalker/vcs-utils` — Hashing, compression, pack utilities
-
-**Adapters (separate package):**
-- `@statewalker/vcs-transport-adapters` — Bridge VCS stores to RepositoryFacade/RepositoryAccess
+Benchmark results: [tests-bench/performance-results.md](./tests-bench/performance-results.md).
 
 ## License
 

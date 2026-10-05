@@ -2,6 +2,8 @@
 
 This document explains the internal architecture of the core package, covering design decisions, module organization, and extension points.
 
+> **Names in this document.** The public facade is `History` with the typed stores `Blobs`, `Trees`, `Commits`, `Tags` and `Refs` (`src/history/history.ts`). Where the text below says `HistoryStore`, `BlobStore`, `TreeStore`, `CommitStore` or `TagStore`, read the corresponding current interface; the method names are `store()` / `load()` on every typed store. The low-level byte interface is `RawStorage` (`src/storage/raw/raw-storage.ts`). Working-directory state (staging, status, checkout, worktree, working copy, ignore rules) lives in `@statewalker/vcs-working-tree`, and high-level commands in `@statewalker/vcs-commands`; the sections describing them are kept for orientation.
+
 ## Design Philosophy
 
 ### Separation of Interfaces from Implementations
@@ -12,7 +14,7 @@ The core package defines contracts, not concrete implementations. Each store int
 - **Testing flexibility**: In-memory implementations enable fast unit tests
 - **Gradual migration**: Applications can switch backends without changing business logic
 
-When you see a file like `commit-store.ts` alongside `commit-store.impl.ts`, the former defines the interface while the latter provides a reference implementation that delegates to lower-level stores.
+When you see a file like `commits.ts` alongside `commits.impl.ts`, the former defines the interface while the latter provides a reference implementation that delegates to lower-level stores.
 
 ### Storage-Agnostic Design
 
@@ -133,16 +135,16 @@ The HistoryStore exposes both `GitObjectStore` and typed stores (`blobs`, `trees
 
 Both layers are necessary. Transport code needs raw bytes with headers to build pack files. Application code needs parsed commits to display history. The architecture exposes both rather than forcing one abstraction for all use cases.
 
-### RawStore - Foundation Layer
+### RawStorage - Foundation Layer
 
 The lowest layer stores raw bytes by string key:
 
 ```typescript
-interface RawStore {
+interface RawStorage {
   store(key: string, content: AsyncIterable<Uint8Array>): Promise<void>;
-  load(key: string, options?: { offset?: number; length?: number }): AsyncIterable<Uint8Array>;
+  load(key: string, options?: { start?: number; end?: number }): AsyncIterable<Uint8Array>;
   has(key: string): Promise<boolean>;
-  delete(key: string): Promise<boolean>;
+  remove(key: string): Promise<boolean>;
   keys(): AsyncIterable<string>;
   size(key: string): Promise<number>;
 }
@@ -196,21 +198,16 @@ Built on GitObjectStore, these provide domain-specific operations:
 
 ### Why `objects` is Exposed in the Public API
 
-The `HistoryStore` and `GitStores` interfaces expose `objects: GitObjectStore` alongside the typed stores. This design choice enables several important use cases:
+The current `History` interface does not carry an `objects` property: the `GitObjectStore` is created with `createGitObjectStore(rawStorage)` and passed to the typed-store factories and history factories, and callers that need raw access keep a reference to it (for example `createGitFilesBackend()` in `@statewalker/vcs-store-files` returns `{ history, objects, ... }`). This design choice enables several important use cases:
 
 **Transport and Protocol Operations**
 
-Git's HTTP and SSH protocols transfer objects in pack files, which contain raw objects with their Git headers. The transport layer needs direct access to `objects` for building pack files during push and receiving objects during fetch. The `@statewalker/vcs-transport` package's `createVcsRepositoryAdapter()` requires `objects` to implement protocol handlers:
+Git's HTTP and SSH protocols transfer objects in pack files, which contain raw objects with their Git headers. The transport layer needs direct access to `objects` for building pack files during push and receiving objects during fetch. `createCoreRepositoryAccess()` in `@statewalker/vcs-transport-adapters` builds protocol access directly from an object store and a ref store:
 
 ```typescript
-// From transport package - needs objects for protocol handling
-const repositoryAccess = createVcsRepositoryAdapter({
-  objects: store.objects,  // Required for loadObject, storeObject, hasObject
-  refs: store.refs,
-  commits: store.commits,
-  trees: store.trees,
-  tags: store.tags,
-});
+import { createCoreRepositoryAccess } from "@statewalker/vcs-transport-adapters";
+
+const repositoryAccess = createCoreRepositoryAccess({ objectStore, refStore });
 ```
 
 **Object Introspection**
@@ -257,14 +254,17 @@ The package is organized into four logical layers, plus transversal modules:
 
 ```
 src/
-├── common/           # Shared types: id, person, format, files
-├── storage/          # Binary storage: binary, pack, delta
-├── history/          # Version control objects: objects, commits, trees, blobs, tags, refs
-├── workspace/        # Working directory state: worktree, staging, status, checkout, working-copy, ignore
-├── commands/         # High-level operations: add, checkout
-├── repository-access/# Repository serialization and Git-native access
-└── stores/           # Repository factory functions
+├── common/           # Shared types: id, person, files (re-exported from @statewalker/vcs-utils/files)
+├── history/          # Version control objects: objects, commits, trees, blobs, tags, refs, format, hash
+├── storage/          # Byte storage: raw, binary, chunked, delta, adapters (webrun-storage seam)
+├── pack/             # Pack files: reader/parser, writer, indexer, index reader/writer
+├── serialization/    # SerializationApi: loose objects and packs over a History
+├── backend/          # Backend registry, capabilities, memory and git-files backends
+├── gc/               # GC orchestration and strategies
+└── vcs-core/         # VcsCore facade over @statewalker/webrun-storage
 ```
+
+Working-directory modules (`worktree`, `staging`, `status`, `checkout`, `working-copy`, `ignore`) are in `@statewalker/vcs-working-tree`; `add` and `checkout` commands are in `@statewalker/vcs-commands`.
 
 ### common/ - Shared Types
 
@@ -338,36 +338,38 @@ FileMode.GITLINK        // 0o160000
 
 Low-level storage abstractions for bytes, packs, and deltas.
 
-#### storage/binary/
+#### storage/raw/ and storage/binary/
 
 | File | Purpose |
 |------|---------|
-| `raw-store.ts` | `RawStore` interface for key-value byte storage |
-| `raw-store.files.ts` | File-based RawStore implementation |
-| `raw-store.memory.ts` | In-memory RawStore implementation |
-| `raw-store.compressed.ts` | Zlib-compressed RawStore wrapper |
-| `volatile-store.ts` | `VolatileStore` interface for transient data |
-| `volatile-store.files.ts` | File-based VolatileStore implementation |
-| `volatile-store.memory.ts` | In-memory VolatileStore implementation |
+| `raw/raw-storage.ts` | `RawStorage` interface for key-value byte storage |
+| `raw/memory-raw-storage.ts` | In-memory RawStorage implementation |
+| `raw/compressed-raw-storage.ts` | Zlib-compressed RawStorage wrapper |
+| `raw/combined-raw-storage.ts`, `raw/composite-raw-storage.ts` | RawStorage composed from several storages |
+| `binary/bin-store.ts` | `BinStore`: raw storage plus delta storage |
+| `binary/volatile-store.ts` | `VolatileStore` interface for transient data |
+| `binary/volatile-store.memory.ts` | In-memory VolatileStore implementation |
 
-The `RawStore` interface is implemented by each storage backend. All higher layers build on this abstraction.
+File-based RawStorage lives in `@statewalker/vcs-store-files`; the webrun-storage adapter `blobStoreToRawStorage()` is in `storage/adapters/`. The `RawStorage` interface is implemented by each storage backend. All higher layers build on this abstraction.
 
-#### storage/pack/
+#### pack/ (`src/pack`, exported through `backend`)
 
 | File | Purpose |
 |------|---------|
-| `pack-consolidator.ts` | Merge multiple packs |
-| `pack-delta-store.ts` | Pack-file based delta storage |
-| `pack-directory.ts` | Pack directory management |
 | `pack-entries-parser.ts` | Parse pack entries |
 | `pack-indexer.ts` | Build .idx files |
 | `pack-index-reader.ts` | Read .idx files |
 | `pack-index-writer.ts` | Write .idx files |
-| `pack-reader.ts` | Read .pack files |
 | `pack-writer.ts` | Write .pack files |
-| `pending-pack.ts` | In-progress pack tracking |
+| `streaming-pack-writer.ts` | Streaming pack writer |
+| `pending-pack.ts` | In-progress pack buffer |
+| `git-pack-store.ts` | Pack-based object storage with the RawStorage interface |
 | `delta-reverse-index.ts` | Reverse index for delta lookups |
+| `delta-instruction-analyzer.ts`, `random-access-delta.ts` | Random access into delta-reconstructed content |
+| `varint.ts` | Pack varint encoding |
 | `types.ts` | Pack-related types |
+
+Pack directory management and pack-based delta storage for Git repositories on disk are in `@statewalker/vcs-store-files`.
 
 Pack files bundle multiple objects efficiently for storage and transfer. The .idx file provides random access by object ID.
 
@@ -497,7 +499,7 @@ Main entry point combining all history stores (HistoryStore interface).
 
 ### workspace/ - Working Directory State
 
-Working tree, staging, status, checkout, and working copy management.
+Working tree, staging, status, checkout, and working copy management. These modules are in `@statewalker/vcs-working-tree` (`src/worktree`, `src/staging`, `src/status`, `src/checkout`, `src/working-copy`, `src/ignore`), not in this package.
 
 #### workspace/worktree/
 
@@ -613,6 +615,8 @@ Main `WorkingCopy` interface definition.
 
 ### commands/ - High-Level Operations
 
+These are in `@statewalker/vcs-commands`, not in this package.
+
 | File | Purpose |
 |------|---------|
 | `add.command.ts` | `Add` interface for staging files |
@@ -638,35 +642,32 @@ These provide byte-level access to Git objects in wire format for transport oper
 ```typescript
 import { createVcsRepositoryAccess } from "@statewalker/vcs-transport-adapters";
 
-const repositoryAccess = createVcsRepositoryAccess({
-  blobs: store.blobs,
-  trees: store.trees,
-  commits: store.commits,
-  tags: store.tags,
-  refs: store.refs,
-});
+const repositoryAccess = createVcsRepositoryAccess({ history });
 ```
 
-### stores/
+### History factories
 
-Repository factory functions.
+Factory functions live in `history/create-history.ts`:
 
-| File | Purpose |
-|------|---------|
-| `create-repository.ts` | Factory for creating Git-compatible repositories |
-
-The `createGitRepository()` function creates a fully configured repository with all stores:
+| Function | Result |
+|----------|--------|
+| `createMemoryHistory()` | In-memory `History` |
+| `createMemoryHistoryWithOperations()` | In-memory `HistoryWithOperations` (delta + serialization) |
+| `createGitFilesHistory(config)` | `HistoryWithOperations` over pre-built Git-file stores |
+| `createHistoryFromStores(config)` / `createHistoryFromComponents(config)` | `History` from your own stores |
 
 ```typescript
-import { createGitRepository } from "@statewalker/vcs-core";
+import { createMemoryHistory } from "@statewalker/vcs-core";
 
-// In-memory repository (default)
-const memRepo = await createGitRepository();
+// In-memory repository
+const memHistory = createMemoryHistory();
+await memHistory.initialize();
 
-// File-based repository
+// File-based repository: the stores are built by @statewalker/vcs-store-files
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-const files = createNodeFilesApi({ fs, rootDir: "/path/to/project" });
-const fileRepo = await createGitRepository(files, ".git");
+import { createGitFilesBackend } from "@statewalker/vcs-store-files";
+const files = createNodeFilesApi({ rootDir: "/path/to/project" });
+const { history } = await createGitFilesBackend({ files, gitDir: ".git" });
 ```
 
 ## Key Algorithms
@@ -867,7 +868,7 @@ interface GCResult {
 Create implementations of the core interfaces:
 
 ```typescript
-class MyRawStore implements RawStore {
+class MyRawStorage implements RawStorage {
   async store(key: string, content: AsyncIterable<Uint8Array>): Promise<void> {
     // Your storage logic
   }
@@ -878,31 +879,26 @@ class MyRawStore implements RawStore {
 Then compose higher-level stores using the provided implementations:
 
 ```typescript
-const rawStore = new MyRawStore();
-const objectStore = new GitObjectStoreImpl(rawStore);
-const commitStore = new CommitStoreImpl(objectStore);
+const rawStorage = new MyRawStorage();
+const objects = createGitObjectStore(rawStorage);
+const commits = createCommits(objects);
 ```
 
 ### Custom Delta Strategies
 
-Implement `DeltaCandidateStrategy` for domain-specific delta selection:
+Implement `CandidateFinder` for domain-specific delta base selection:
 
 ```typescript
-interface DeltaCandidateStrategy {
-  findCandidates(
-    targetId: ObjectId,
-    storage: StorageAnalyzer
-  ): AsyncIterable<ObjectId>;
+interface CandidateFinder {
+  findCandidates(target: DeltaTarget): AsyncIterable<DeltaCandidate>;
 }
 ```
 
-Built-in strategies:
-- `CommitWindowCandidateStrategy`: Sliding window through recent commits
-- `SimilarSizeCandidateStrategy`: Objects of similar size
+Built-in finders: `SizeSimilarityCandidateFinder`, `PathBasedCandidateFinder`, `CommitTreeCandidateFinder`, `WindowCandidateFinder`, `CompositeCandidateFinder` (combine with `combineFinders()`), `EmptyCandidateFinder`.
 
 ### Custom Ignore Rules
 
-The `IgnoreManager` interface allows custom ignore logic beyond `.gitignore`:
+The `IgnoreManager` interface (in `@statewalker/vcs-working-tree`) allows custom ignore logic beyond `.gitignore`:
 
 ```typescript
 interface IgnoreManager {
@@ -943,13 +939,13 @@ Call `refs.optimize?.()` periodically to pack loose refs. Many loose ref files s
 
 ### In-Memory Backend
 
-Use `createGitRepository()` without arguments for in-memory tests:
+Use `createMemoryHistory()` for in-memory tests:
 
 ```typescript
-import { createGitRepository } from "@statewalker/vcs-core";
+import { createMemoryHistory } from "@statewalker/vcs-core";
 
-// Creates an in-memory repository (uses MemFilesApi by default)
-const repo = await createGitRepository();
+const history = createMemoryHistory();
+await history.initialize();
 // Tests run fast with no filesystem I/O
 ```
 
@@ -958,29 +954,22 @@ const repo = await createGitRepository();
 Since everything is interface-based, create focused mocks:
 
 ```typescript
-const mockCommitStore: CommitStore = {
-  storeCommit: vi.fn().mockResolvedValue("abc123"),
-  loadCommit: vi.fn().mockResolvedValue(testCommit),
+const mockCommits: Commits = {
+  store: vi.fn().mockResolvedValue("abc123"),
+  load: vi.fn().mockResolvedValue(testCommit),
   // ...
 };
 ```
 
 ### Parametrized Tests
 
-The `@statewalker/vcs-testing` package provides test suites that verify any backend:
+The workspace-private `@statewalker/vcs-testing` package (`packages/testing`) provides test suites that verify any backend:
 
 ```typescript
-import { describe } from "vitest";
-import { objectStorageSuite, commitStoreSuite, refStoreSuite } from "@statewalker/vcs-testing";
+import { createCommitStoreTests } from "@statewalker/vcs-testing";
 
-describe("MyCustomStorage", () => {
-  objectStorageSuite({
-    createStore: () => new MyCustomObjectStore(),
-    cleanup: async (store) => await store.close(),
-  });
-
-  commitStoreSuite({
-    createStore: () => new MyCustomCommitStore(),
-  });
-});
+createCommitStoreTests("MyCustomStorage", async () => ({
+  commitStore: createCommits(createGitObjectStore(new MyRawStorage())),
+  cleanup: async () => {},
+}));
 ```

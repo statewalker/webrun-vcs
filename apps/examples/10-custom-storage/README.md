@@ -1,38 +1,65 @@
 # 10-custom-storage
 
-Build History instances using different factory patterns, from zero-config convenience functions to fully custom store composition. This example walks through each creation pattern so you can pick the right one for your storage needs.
+## What it is
 
-## Quick Start
+A runnable example that builds `History` instances five ways, from the zero-config `createMemoryHistory()` to composing every store by hand with `createHistoryFromStores()`, and ends with two `History` instances that share one object store but keep separate refs. Each pattern writes a blob, a tree and a commit, so you can see that all of them behave the same from the outside. Everything is in memory.
+
+What you will learn:
+
+- Which factory function fits which use case
+- Building a `History` from a `GitObjectStore` with `createHistoryFromComponents()`
+- Composing a `History` from explicit store instances with `createHistoryFromStores()`
+- Sharing object storage between `History` instances while keeping refs independent
+- The difference between `History` and `HistoryWithOperations`
+
+It assumes you have seen [01-quick-start](../01-quick-start/).
+
+## Layout
+
+```
+apps/examples/10-custom-storage/
+├── package.json
+├── tsconfig.json
+├── README.md
+└── src/
+    └── main.ts           # All five factory patterns in one file
+```
+
+How the layers stack, from bytes up:
+
+```
+ RawStorage (MemoryRawStorage, or your own)
+      │  createGitObjectStore(storage)
+      v
+ GitObjectStore  ── one store for blobs, trees, commits and tags
+      │  createBlobs / createTrees / createCommits / createTags
+      v
+ Blobs, Trees, Commits, Tags  +  Refs (createMemoryRefs, or an adapter)
+      │  createHistoryFromStores({ blobs, trees, commits, tags, refs })
+      v
+ History
+```
+
+`createHistoryFromComponents()` does the middle two steps for you; `createMemoryHistory()` does all of them.
+
+## How to run it
+
+Requires Node 24 and pnpm. From the repository root:
 
 ```bash
-# From the monorepo root
 pnpm install
 pnpm --filter @statewalker/vcs-example-10-custom-storage start
 ```
 
-## What You'll Learn
+`start` runs `tsx src/main.ts`. `typecheck` runs `tsc --noEmit`.
 
-- Choose the right factory function for each use case
-- Build a History from raw storage components
-- Compose a History from explicit store instances
-- Share underlying storage between multiple History instances
-- Understand the difference between History and HistoryWithOperations
+## The walk-through: five ways to get a History
 
-## Prerequisites
+All snippets import from `@statewalker/vcs-core`.
 
-- Node.js 18+
-- pnpm
-- Completed [01-quick-start](../01-quick-start/)
+### Pattern 1: createMemoryHistory() wires everything for you
 
----
-
-## Step-by-Step Guide
-
-**File:** [src/main.ts](src/main.ts)
-
-### Pattern 1: Quick In-Memory History
-
-The fastest way to get a working repository. `createMemoryHistory()` wires up all stores internally and returns a basic `History` interface -- ideal for unit tests and quick prototypes.
+The fastest way to a working repository. It allocates a `MemoryRawStorage`, wraps it in a `GitObjectStore`, and uses in-memory refs. It returns the basic `History` interface.
 
 ```typescript
 import { createMemoryHistory, type History } from "@statewalker/vcs-core";
@@ -44,15 +71,9 @@ await history.refs.setSymbolic("HEAD", "refs/heads/main");
 // Use history.blobs, .trees, .commits, .tags, .refs
 ```
 
-**Key APIs:**
-- `createMemoryHistory()` - Zero-config in-memory History factory
-- `History` - Base interface exposing blobs, trees, commits, tags, refs
+### Pattern 2: createMemoryHistoryWithOperations() adds delta and serialization
 
----
-
-### Pattern 2: In-Memory History with Operations
-
-When you need delta compression, serialization, or transport capabilities on top of the basic stores, use `createMemoryHistoryWithOperations()`. It returns the extended `HistoryWithOperations` interface.
+When you need delta compression, pack serialization or transport, use `createMemoryHistoryWithOperations()`. It returns `HistoryWithOperations`, which adds `delta`, `serialization` and `capabilities`.
 
 ```typescript
 import {
@@ -63,61 +84,58 @@ import {
 const history: HistoryWithOperations = createMemoryHistoryWithOperations();
 await history.initialize();
 
-// Additional APIs: history.delta, history.serialization, history.capabilities
-const reachable = history.collectReachableObjects(new Set([commitId]), new Set());
+console.log(JSON.stringify(history.capabilities));
+
+const objectIds: string[] = [];
+for await (const oid of history.collectReachableObjects(new Set([commitId]), new Set())) {
+  objectIds.push(oid);
+}
 ```
 
-**Key APIs:**
-- `createMemoryHistoryWithOperations()` - In-memory factory with delta/serialization support
-- `HistoryWithOperations` - Extended interface adding `delta`, `serialization`, `capabilities`
-- `collectReachableObjects()` - Walk the object graph from a set of commit roots
+`collectReachableObjects(wants, exclude)` is part of the base `History` interface; it returns an async iterable of object ids reachable from `wants` and not from `exclude`.
 
----
+### Pattern 3: createHistoryFromComponents() builds the typed stores from one object store
 
-### Pattern 3: History from Raw Components
-
-`createHistoryFromComponents()` lets you supply your own raw storage layers. Blobs go into one `RawStorage` instance while trees, commits, and tags go through a `GitObjectStore`. This separation enables different storage strategies for content vs. metadata.
+You supply a `GitObjectStore` and a refs choice; the factory creates the blob, tree, commit and tag stores over that one object store.
 
 ```typescript
 import {
-  createHistoryFromComponents,
   createGitObjectStore,
+  createHistoryFromComponents,
   MemoryRawStorage,
 } from "@statewalker/vcs-core";
 
-const blobStorage = new MemoryRawStorage();
 const objects = createGitObjectStore(new MemoryRawStorage());
 
 const history = createHistoryFromComponents({
-  blobStorage,
   objects,
   refs: { type: "memory" },
 });
 await history.initialize();
 ```
 
-**Key APIs:**
-- `createHistoryFromComponents()` - Build History from raw storage + object store
-- `MemoryRawStorage` - In-memory implementation of `RawStorage`
-- `createGitObjectStore()` - Wrap a `RawStorage` as a typed Git object store
+`refs` is either `{ type: "memory" }` or `{ type: "adapter", refStore }`, where `refStore` is an implementation of the core `RefStore` interface.
 
----
+### Pattern 4: createHistoryFromStores() takes every store explicitly
 
-### Pattern 4: History from Explicit Stores
-
-For maximum flexibility, construct each store yourself and hand them to `createHistoryFromStores()`. This is the pattern you would use when wrapping external databases (SQL, IndexedDB, or a cloud backend) behind the store interfaces.
+For full control, build each store yourself. This is where you plug in a store that wraps an external database.
 
 ```typescript
 import {
+  createBlobs,
+  createCommits,
+  createGitObjectStore,
   createHistoryFromStores,
-  createBlobs, createTrees, createCommits, createTags,
-  createMemoryRefs, createGitObjectStore, MemoryRawStorage,
+  createMemoryRefs,
+  createTags,
+  createTrees,
+  MemoryRawStorage,
 } from "@statewalker/vcs-core";
 
 const objects = createGitObjectStore(new MemoryRawStorage());
 
 const history = createHistoryFromStores({
-  blobs: createBlobs(new MemoryRawStorage()),
+  blobs: createBlobs(objects),
   trees: createTrees(objects),
   commits: createCommits(objects),
   tags: createTags(objects),
@@ -126,163 +144,125 @@ const history = createHistoryFromStores({
 await history.initialize();
 ```
 
-**Key APIs:**
-- `createHistoryFromStores()` - Compose History from fully-constructed store instances
-- `createBlobs()`, `createTrees()`, `createCommits()`, `createTags()` - Individual store factories
-- `createMemoryRefs()` - In-memory ref store factory
+The store factories all take a `GitObjectStore`. Any object that implements `Blobs`, `Trees`, `Commits`, `Tags` or `Refs` can replace the matching one.
 
----
+### Pattern 5: two Histories over one object store
 
-### Pattern 5: Shared Storage Between Instances
-
-Multiple History instances can share the same underlying blob and object storage while maintaining independent refs. Objects written by one workspace are immediately visible to the other, but each workspace tracks its own branches.
+Two instances built from the same `GitObjectStore` see each other's objects immediately. Each `{ type: "memory" }` refs config creates its own ref store, so branches stay separate.
 
 ```typescript
-const sharedBlobStorage = new MemoryRawStorage();
 const sharedObjects = createGitObjectStore(new MemoryRawStorage());
 
-const workspaceA = createHistoryFromComponents({
-  blobStorage: sharedBlobStorage,
-  objects: sharedObjects,
-  refs: { type: "memory" }, // separate refs
-});
+const historyA = createHistoryFromComponents({ objects: sharedObjects, refs: { type: "memory" } });
+const historyB = createHistoryFromComponents({ objects: sharedObjects, refs: { type: "memory" } });
 
-const workspaceB = createHistoryFromComponents({
-  blobStorage: sharedBlobStorage,
-  objects: sharedObjects,
-  refs: { type: "memory" }, // separate refs
-});
+// A writes a commit; B can load it
+const commitFromB = await historyB.commits.load(sharedCommit);
 
-// Objects written by A are visible to B
-// Refs are independent per workspace
+// B sets a branch; A does not see it
+await historyB.refs.set("refs/heads/feature", sharedCommit);
+await historyA.refs.resolve("refs/heads/feature"); // undefined
 ```
 
-**Key APIs:**
-- `createHistoryFromComponents()` - Accepts shared storage instances
-- `MemoryRawStorage` - Shared across History instances for object deduplication
+### What the run prints
 
----
-
-## Key Concepts
-
-### Factory Function Decision Guide
-
-Each factory targets a different level of customization. `createMemoryHistory()` is the quickest path to a working repository -- it allocates all storage internally and returns a basic `History`. When your tests need pack generation or delta compression, switch to `createMemoryHistoryWithOperations()` for the extended `HistoryWithOperations` interface.
-
-For custom backends, `createHistoryFromComponents()` lets you supply raw storage layers (a `RawStorage` for blobs and a `GitObjectStore` for structured objects) while the factory wires up the typed stores. If you need full control -- say, wrapping IndexedDB or a SQL database -- use `createHistoryFromStores()` and construct each store yourself.
-
-For production Git-compatible filesystem storage, `createGitFilesHistory()` (from `@statewalker/vcs-store-fs`) provides pre-built stores backed by the real filesystem.
-
-### Shared Storage
-
-Sharing the same `MemoryRawStorage` and `GitObjectStore` across multiple History instances gives you a lightweight multi-workspace model. All object data is deduplicated in one place, while each workspace maintains its own ref namespace. This pattern is useful for multi-workspace setups, testing isolation scenarios, and read-replica architectures where several consumers need to read the same objects independently.
-
----
-
-## Project Structure
-
-```
-apps/examples/10-custom-storage/
-├── package.json
-├── tsconfig.json
-├── README.md
-└── src/
-    └── main.ts           # All five factory patterns in one file
-```
-
----
-
-## Output Example
+Commit ids differ on every run because the timestamp is `Date.now() / 1000`. A real run:
 
 ```
 === Pattern 1: createMemoryHistory() ===
-
-  Best for: unit tests, quick prototypes, in-memory operations
-  Returns: History (basic interface)
-
-  Commit: a1b2c3d
+  ...
+  Commit: 1e5b4e1
   Available APIs: blobs, trees, commits, tags, refs
 
 === Pattern 2: createMemoryHistoryWithOperations() ===
-
-  Best for: tests needing delta/serialization, transport testing
-  Returns: HistoryWithOperations (extended interface)
-
-  Commit: e4f5a6b
+  ...
+  Commit: f613970
   Additional APIs: delta, serialization, capabilities
-  Capabilities: {"ofs_delta":true,"side_band_64k":true}
+  Capabilities: {"nativeBlobDeltas":false,"nativeTreeDeltas":true,"nativeCommitDeltas":false,"randomAccess":true,"atomicBatch":false,"nativeGitFormat":false}
   Reachable objects from commit: 3
 
 === Pattern 3: createHistoryFromComponents() ===
-
-  Best for: custom storage layers, shared storage between instances
-  Returns: History (basic interface)
-
-  Commit: c7d8e9f
-  blobStorage and objectStorage are separate MemoryRawStorage instances
-  This separation enables different storage strategies for blobs vs metadata
+  ...
+  Commit: 67e24c5
+  All Git objects share a single MemoryRawStorage via GitObjectStore
+  createHistoryFromComponents auto-builds typed stores (blobs, trees, commits, tags)
 
 === Pattern 4: createHistoryFromStores() ===
-
-  Best for: fully custom stores, wrapping external databases
-  Returns: History (basic interface)
-
-  Commit: f0a1b2c
-  Each store (blobs, trees, commits, tags, refs) is independently constructed
-  Store instances can wrap any backing storage (memory, SQL, IndexedDB, etc.)
+  ...
+  Commit: 65c570d
 
 === Pattern 5: Shared Storage ===
-
-  Best for: multi-workspace, testing isolation, read replicas
-  Pattern: Multiple History instances sharing the same raw storage
-
-  Workspace A wrote commit: d3e4f5a
+  ...
+  Workspace A wrote commit: 5052234
   Workspace B can read it: "Shared commit"
   Workspace A refs/heads/feature: not set
-  Workspace B refs/heads/feature: d3e4f5a
+  Workspace B refs/heads/feature: 5052234
 
 === Decision Guide ===
-
-  createMemoryHistory()
-    -> Quick testing, no delta/serialization needed
-
-  createMemoryHistoryWithOperations()
-    -> Testing with transport/pack/delta operations
-
-  createHistoryFromComponents({ blobStorage, objects, refs })
-    -> Custom storage layer, shared storage between instances
-
-  createHistoryFromStores({ blobs, trees, commits, tags, refs })
-    -> Fully custom store implementations (SQL, IndexedDB, etc.)
-
-  createGitFilesHistory(config)
-    -> Production Git-compatible filesystem storage
-
+  ...
 Example completed successfully!
 ```
 
----
+## Why it is the way it is
 
-## API Reference Links
+### Which factory to pick
 
-| Function / Class | Location | Purpose |
+| Need | Factory |
+|------|---------|
+| Quick tests, no delta or serialization | `createMemoryHistory()` |
+| Tests with transport, packs or deltas | `createMemoryHistoryWithOperations()` |
+| Your own `RawStorage`, or object storage shared between instances | `createHistoryFromComponents({ objects, refs })` |
+| Your own store implementations (SQL, IndexedDB, ...) | `createHistoryFromStores({ blobs, trees, commits, tags, refs })` |
+| Git-compatible files | `createGitFilesHistory(config)` from `@statewalker/vcs-core` (takes prebuilt stores plus a `packDeltaStore`), or `createGitFilesHistoryFromFiles(options)` from `@statewalker/vcs-store-files` |
+
+Only the memory-with-operations and Git-files factories return `HistoryWithOperations`; the other three return plain `History`. Code that needs `delta` or `serialization` must be given one of those two.
+
+### All object types share one GitObjectStore
+
+Blobs, trees, commits and tags are stored as Git objects, with Git headers, in a single `GitObjectStore`. Object ids are then real Git SHA-1s and objects can go into a pack without conversion, which is what the transport layer needs. Swapping the backend means swapping the `RawStorage` underneath, not reimplementing four stores.
+
+### Refs are separate from objects
+
+Refs are passed in independently of the object store. That is what makes pattern 5 possible: object data is written once, while each instance keeps its own branch namespace (multiple workspaces, test isolation, read replicas).
+
+## What will surprise you
+
+- **Ref changes do not cross instances.** In pattern 5, `historyA.refs.resolve("refs/heads/feature")` returns `undefined` after B set it; the output says `not set`. Share a `Refs` instance (pass the same one to `createHistoryFromStores`) if you need shared branches.
+- **Plain `History` has no `delta` or `serialization`.** Patterns 1, 3 and 4 return `History`, so there is no `history.serialization` to hand to APIs that need one, such as `createVcsRepositoryFacade({ history, serialization })`.
+- **Store factories take a `GitObjectStore`, not a `RawStorage`.** `createBlobs(new MemoryRawStorage())` is a type error; wrap the storage with `createGitObjectStore()` first.
+- **Commit ids change between runs**, because commit timestamps are taken from the clock.
+- **Nothing persists.** Every pattern uses `MemoryRawStorage`; the data is gone when the process exits.
+- **Pattern 4 allocates an unused `_customBlobStorage`.** It is leftover in `main.ts`; blobs go into the shared object store like everything else.
+
+## Reference
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `pnpm --filter @statewalker/vcs-example-10-custom-storage start` | Runs `tsx src/main.ts` |
+| `pnpm --filter @statewalker/vcs-example-10-custom-storage typecheck` | Runs `tsc --noEmit` |
+
+### API locations
+
+| Function / class | Location | Purpose |
 |------------------|----------|---------|
-| `createMemoryHistory()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | Zero-config in-memory History |
-| `createMemoryHistoryWithOperations()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | In-memory History with delta/serialization |
-| `createHistoryFromComponents()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | Build History from raw storage layers |
-| `createHistoryFromStores()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | Build History from explicit store instances |
-| `createGitObjectStore()` | [history/objects/index.ts](../../../packages/core/src/history/objects/index.ts) | Wrap RawStorage as Git object store |
-| `MemoryRawStorage` | [storage/raw/memory-raw-storage.ts](../../../packages/core/src/storage/raw/memory-raw-storage.ts) | In-memory RawStorage implementation |
+| `createMemoryHistory()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | Zero-config in-memory `History` |
+| `createMemoryHistoryWithOperations()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | In-memory `HistoryWithOperations` |
+| `createHistoryFromComponents()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | `History` from a `GitObjectStore` and refs config |
+| `createHistoryFromStores()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | `History` from explicit stores |
+| `createGitFilesHistory()` | [history/create-history.ts](../../../packages/core/src/history/create-history.ts) | `HistoryWithOperations` over Git-files stores |
+| `History`, `HistoryWithOperations` | [history/history.ts](../../../packages/core/src/history/history.ts) | The interfaces |
+| `createGitObjectStore()` | [history/objects/object-store.impl.ts](../../../packages/core/src/history/objects/object-store.impl.ts) | Wrap a `RawStorage` as a Git object store |
+| `MemoryRawStorage` | [storage/raw/memory-raw-storage.ts](../../../packages/core/src/storage/raw/memory-raw-storage.ts) | In-memory `RawStorage` |
 | `createBlobs()` | [history/blobs/blobs.impl.ts](../../../packages/core/src/history/blobs/blobs.impl.ts) | Blob store factory |
 | `createTrees()` | [history/trees/trees.impl.ts](../../../packages/core/src/history/trees/trees.impl.ts) | Tree store factory |
 | `createCommits()` | [history/commits/commits.impl.ts](../../../packages/core/src/history/commits/commits.impl.ts) | Commit store factory |
 | `createTags()` | [history/tags/tags.impl.ts](../../../packages/core/src/history/tags/tags.impl.ts) | Tag store factory |
-| `createMemoryRefs()` | [history/refs/refs.impl.ts](../../../packages/core/src/history/refs/refs.impl.ts) | In-memory ref store factory |
+| `createMemoryRefs()` | [history/refs/refs.impl.ts](../../../packages/core/src/history/refs/refs.impl.ts) | In-memory ref store |
 
----
+### Related examples
 
-## Next Steps
-
-- [01-quick-start](../01-quick-start/) - Fundamental Git workflow with the low-level API
-- [06-internal-storage](../06-internal-storage/) - Deep dive into the storage layer internals
-- [11-delta-strategies](../11-delta-strategies/) - Storage optimization with delta compression
+- [01-quick-start](../01-quick-start/): the basic Git workflow
+- [06-internal-storage](../06-internal-storage/): storage layer internals
+- [11-delta-strategies](../11-delta-strategies/): storage optimization with deltas

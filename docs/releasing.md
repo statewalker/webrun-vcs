@@ -1,61 +1,32 @@
 # Releasing Packages
 
-This guide covers how to version and publish packages in the StateWalker VCS monorepo using [Changesets](https://github.com/changesets/changesets).
+Public packages in this repository are versioned with [Changesets](https://github.com/changesets/changesets)
+and published to npm from CI. Nobody needs to version or publish by hand.
 
-## Overview
+## How a release happens
 
-The release workflow follows three phases:
+1. A pull request is merged to `main` and CI passes.
+2. A CI job compares each public package's packed contents with the version on npm. For every
+   package that differs and has no changeset yet, it writes one: a patch bump, or a minor bump on
+   a `0.x` package when one of its dependencies moved past a breaking version.
+3. The job opens (or updates) a pull request titled `chore: version packages` with the version
+   bumps and `CHANGELOG.md` entries.
+4. Merging that pull request publishes the changed packages to npm, with provenance.
 
-1. **Document changes** - Create changesets as you develop
-2. **Version packages** - Bump versions and generate changelogs
-3. **Publish to npm** - Build and publish updated packages
+Private packages (`@statewalker/vcs-testing`, `@statewalker/vcs-integration-tests`, the docs site
+and everything in `apps/`) are never published.
 
-## For Contributors
+## Choosing the bump or the changelog text yourself
 
-### Creating a Changeset
-
-After making changes that should be released, create a changeset:
+The automatic changeset is a patch with a generic summary. To choose the bump type or write the
+changelog entry, add a changeset to your pull request:
 
 ```bash
 pnpm changeset
 ```
 
-The interactive prompt asks:
-
-1. **Which packages changed?** - Select affected packages with spacebar
-2. **What type of change?** - Choose major/minor/patch for each
-3. **Summary** - Describe what changed and why
-
-This creates a markdown file in `.changeset/` that gets committed with your code.
-
-### Version Bump Guidelines
-
-Choose the version type based on what changed:
-
-| Type | When to use | Example |
-|------|-------------|---------|
-| **patch** | Bug fixes, docs, internal refactoring | Fix delta calculation edge case |
-| **minor** | New features, backwards-compatible changes | Add streaming support for large files |
-| **major** | Breaking changes to public API | Remove deprecated `oldMethod()` |
-
-### Example Workflow
-
-```bash
-# 1. Make your code changes
-git checkout -b feature/streaming-blobs
-
-# 2. Before committing, create a changeset
-pnpm changeset
-
-# 3. Commit both code and changeset
-git add .
-git commit -m "Add streaming blob support"
-
-# 4. Push and open PR
-git push -u origin feature/streaming-blobs
-```
-
-The changeset file looks like:
+The prompt asks which packages changed, the bump type for each, and a summary. It writes a
+markdown file in `.changeset/`; commit it with your change:
 
 ```markdown
 ---
@@ -63,158 +34,38 @@ The changeset file looks like:
 "@statewalker/vcs-utils": patch
 ---
 
-Add streaming support for large blob operations. The utils package
-receives internal optimizations to support the new streaming API.
+Add streaming support for large blob operations.
 ```
 
-## For Maintainers
+| Type | When to use |
+|------|-------------|
+| **patch** | Bug fixes, docs, internal refactoring |
+| **minor** | New features; on `0.x` packages, also breaking changes |
+| **major** | Breaking changes to the public API of a `1.x`+ package |
 
-### Manual Release Process
+One changeset per logical change. The summary becomes the `CHANGELOG.md` entry, so write it for
+users of the package.
 
-When ready to release accumulated changesets:
+## Dependency updates
 
-```bash
-# 1. Update versions and changelogs
-pnpm version
+Dependency updates arrive as pull requests from Renovate. They go through the same CI and release
+flow as any other change.
 
-# 2. Review the changes
-git diff
-
-# 3. Commit version updates
-git add .
-git commit -m "chore: version packages"
-
-# 4. Build and publish
-pnpm release
-
-# 5. Push commits and tags
-git push --follow-tags
-```
-
-The `pnpm version` command:
-
-- Consumes all `.changeset/*.md` files
-- Updates `package.json` versions across affected packages
-- Creates or updates `CHANGELOG.md` in each package
-- Handles dependency version updates automatically
-
-The `pnpm release` command:
-
-- Runs `pnpm build` to build all packages
-- Runs `changeset publish` to publish to npm
-
-### Automated Releases (CI/CD)
-
-GitHub Actions automates the release process:
-
-1. When changesets are merged to `main`, CI creates a "Version Packages" PR
-2. The PR accumulates multiple changesets into a single version bump
-3. When the version PR is merged, CI publishes to npm automatically
-
-The workflow is defined in `.github/workflows/release.yml`.
-
-### Pre-release Versions
-
-For alpha/beta releases:
-
-```bash
-# Enter pre-release mode
-pnpm changeset pre enter alpha
-
-# Create changesets as normal
-pnpm changeset
-
-# Version (creates 0.2.0-alpha.0)
-pnpm version
-
-# Exit pre-release mode when ready
-pnpm changeset pre exit
-```
-
-## Package Publishing Status
-
-### Published Packages
-
-These packages are public on npm:
+## Published packages
 
 | Package | Description |
 |---------|-------------|
-| `@statewalker/vcs-core` | Repository, stores, staging, pack files |
-| `@statewalker/vcs-utils` | Hashing, compression, diff algorithms |
+| `@statewalker/vcs-core` | Git object model, refs, packs, history |
+| `@statewalker/vcs-utils` | Hashing, compression, diff, streams |
+| `@statewalker/vcs-utils-node` | Node.js compression and file adapters |
+| `@statewalker/vcs-working-tree` | Index, checkout, worktree, status |
 | `@statewalker/vcs-commands` | High-level Git operations |
-| `@statewalker/vcs-transport` | Git protocols (HTTP smart protocol) |
-| `@statewalker/vcs-sandbox` | Isolated storage utilities |
+| `@statewalker/vcs-transport` | Git protocols (fetch, push, clone) |
+| `@statewalker/vcs-transport-adapters` | Core to transport adapters |
+| `@statewalker/vcs-transport-lfs` | Git LFS batch protocol, basic transfer |
+| `@statewalker/vcs-transport-xet` | Git LFS xet chunk transfer |
+| `@statewalker/vcs-store-files` | File-backed storage backend |
 | `@statewalker/vcs-store-mem` | In-memory storage backend |
 | `@statewalker/vcs-store-kv` | Key-value storage backend |
 | `@statewalker/vcs-store-sql` | SQL storage backend |
-
-### Private Packages
-
-These packages are internal and not published:
-
-- `@statewalker/vcs-testing` - Test utilities
-- `@statewalker/vcs-storage-tests` - Storage backend tests
-- All apps in `apps/` directory
-
-## npm Configuration
-
-### Required Setup
-
-To publish, you need:
-
-1. **npm account** with access to the `@statewalker` scope
-2. **NPM_TOKEN** secret configured in GitHub repository settings
-
-### Local Publishing
-
-For one-time local publishing:
-
-```bash
-# Login to npm
-npm login
-
-# Verify access
-npm whoami
-
-# Publish (after versioning)
-pnpm release
-```
-
-## Troubleshooting
-
-### "No changesets found"
-
-If `pnpm version` reports no changesets:
-
-- Verify `.changeset/` contains markdown files (not just config)
-- Check that changesets reference valid package names
-
-### "Package not found in registry"
-
-For first-time publishing of a new package:
-
-```bash
-# Publish with public access (required for scoped packages)
-npm publish --access public
-```
-
-### Version Conflicts
-
-If versions get out of sync:
-
-```bash
-# Check current versions
-pnpm -r exec -- npm pkg get name version
-
-# Manually fix package.json versions if needed
-```
-
-## Best Practices
-
-**One changeset per logical change.** Don't create a changeset per commit. Group related changes into a single changeset that describes the feature or fix.
-
-**Write meaningful summaries.** The changeset description appears in CHANGELOG.md. Write for users who want to understand what changed.
-
-**Don't skip changesets for user-facing changes.** Internal refactoring might not need a changeset, but any change to public APIs, behavior, or bug fixes should have one.
-
-**Review the version PR.** Before merging the automated version PR, review the changelog entries and version bumps to ensure they make sense.
+| `@statewalker/vcs-workspace` | File sync and versioning orchestration |

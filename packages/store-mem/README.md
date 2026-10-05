@@ -1,174 +1,191 @@
 # @statewalker/vcs-store-mem
 
-In-memory storage implementation for testing and development scenarios.
+In-memory implementations of the StateWalker VCS store interfaces: Git objects (blobs, trees,
+commits, tags), refs, the staging area (index), and raw/delta binary storage. Everything lives in
+JavaScript `Map`s and arrays and disappears with the instance.
 
-## Overview
+## Why it exists
 
-This package provides a complete in-memory implementation of all StateWalker VCS storage interfaces. Every object, commit, tree, tag, reference, and staging entry lives in JavaScript Maps and Arrays, making this backend perfect for unit tests, development environments, and scenarios where persistence isn't needed.
+Code built on `@statewalker/vcs-core` and `@statewalker/vcs-working-tree` takes stores as
+interfaces. Tests, examples and short-lived operations need an implementation of those interfaces
+with no disk, no database and no setup. This package is that implementation. It is also the
+reference behavior: the shared conformance suites in `@statewalker/vcs-testing` run against it
+and against the persistent backends, so a difference between them points to a bug.
 
-The in-memory backend is intentionally simple. It focuses on correctness over optimization, serving as a reference implementation that other backends can compare against. The `@statewalker/vcs-testing` package validates all storage backends against the same test suites, ensuring consistent behavior regardless of which backend you choose.
-
-Because everything stays in memory, this backend offers the fastest read and write performance of any storage option. Use it when you need to run thousands of operations in tests without disk I/O overhead.
-
-## Installation
+## How to use
 
 ```bash
 pnpm add @statewalker/vcs-store-mem
 ```
 
-## Public API
+No peer dependencies. Runs anywhere modern JavaScript runs (browser, Node, workers).
 
-### Factory Function
+| Entry point | Gives |
+| --- | --- |
+| `@statewalker/vcs-store-mem` | Everything listed below |
 
-The simplest way to create a complete storage setup:
+| Export | What it is |
+| --- | --- |
+| `createMemoryObjectStores(options?)` | `{ objects, blobs, trees, commits, tags }` with **Git-compatible SHA-1 ids**, backed by a `MemoryRawStorage`. Pass `{ storage }` to reuse an existing one. |
+| `MemoryStagingStore` | In-memory `Staging` (the index): entries, conflict stages, builder/editor, `readTree`/`writeTree`. |
+| `MemoryRefStore` | In-memory `Refs` (re-exported from `@statewalker/vcs-core`). |
+| `MemoryRawStorage` | In-memory `RawStorage` key/bytes map (re-exported from `@statewalker/vcs-core`). |
+| `MemoryCommitStore`, `MemoryTreeStore`, `MemoryTagStore` | Object-map `Commits` / `Trees` / `Tags`. **Ids are not Git ids** (see Internals). |
+| `MemBinStore`, `createMemBinStore()` | `BinStore` combining a `MemoryRawStorage` and a `MemDeltaStore`. |
+| `MemDeltaStore` | `DeltaStore` that records base/target delta relationships. |
 
-```typescript
-import { createMemoryStorage } from "@statewalker/vcs-store-mem";
+Use `createMemoryObjectStores()` when ids must match what `git` produces (interop, transport,
+pack tests). Use the `Memory*Store` classes only where any stable, content-derived id is enough.
 
-const storage = createMemoryStorage();
-// Returns all stores ready to use
+## Examples
+
+### Git-compatible object stores, refs and staging
+
+```ts
+import { FileMode } from "@statewalker/vcs-core";
+import {
+  createMemoryObjectStores,
+  MemoryRefStore,
+  MemoryStagingStore,
+} from "@statewalker/vcs-store-mem";
+
+const stores = createMemoryObjectStores();
+const refs = new MemoryRefStore();
+const staging = new MemoryStagingStore();
+
+// The real Git SHA-1 of "hello\n"
+const blobId = await stores.blobs.store([new TextEncoder().encode("hello\n")]);
+// -> "ce013625030ba8dba906f756967f9e9ca394464a"
+
+await staging.setEntry({ path: "README.md", mode: FileMode.REGULAR_FILE, objectId: blobId });
+const treeId = await staging.writeTree(stores.trees);
+
+const who = { name: "Ada", email: "ada@example.com", timestamp: 1700000000, tzOffset: "+0000" };
+const commitId = await stores.commits.store({
+  tree: treeId,
+  parents: [],
+  author: who,
+  committer: who,
+  message: "init\n",
+});
+
+await refs.set("refs/heads/main", commitId);
+await refs.setSymbolic("HEAD", "refs/heads/main");
+const head = await refs.resolve("HEAD"); // { name: "refs/heads/main", objectId: commitId, ... }
 ```
 
-### Individual Store Classes
+### Fresh, isolated stores per test
 
-For more control, instantiate stores individually:
+```ts
+import { beforeEach, expect, it } from "vitest";
+import { createMemoryObjectStores, type MemoryObjectStores } from "@statewalker/vcs-store-mem";
 
-| Export | Description |
-|--------|-------------|
-| `createMemoryStorage()` | Factory creating complete in-memory repository |
-| `InMemoryObjectRepository` | Raw object storage |
-| `InMemoryDeltaRepository` | Delta chain storage |
-| `InMemoryMetadataRepository` | Object metadata storage |
-| `InMemoryCommitStore` | Commit operations |
-| `InMemoryRefStore` | Reference operations |
-| `InMemoryStagingStore` | Staging area |
-| `InMemoryTagStore` | Tag operations |
-| `InMemoryTreeStore` | Tree operations |
+let stores: MemoryObjectStores;
+beforeEach(() => {
+  stores = createMemoryObjectStores(); // nothing is shared between instances
+});
 
-## Usage Examples
-
-### Quick Setup for Testing
-
-The factory function creates everything you need:
-
-```typescript
-import { createMemoryStorage } from "@statewalker/vcs-store-mem";
-
-const {
-  objectStore,
-  commitStore,
-  treeStore,
-  tagStore,
-  refStore,
-  stagingStore,
-} = createMemoryStorage();
-
-// Now use the stores
-const hash = await objectStore.store(async function* () {
-  yield new TextEncoder().encode("file content");
-}());
-```
-
-### Using with @statewalker/vcs-commands
-
-The memory backend integrates seamlessly with high-level commands:
-
-```typescript
-import { Git, createGitStore } from "@statewalker/vcs-commands";
-import { createGitRepository } from "@statewalker/vcs-core";
-import { createMemoryStorage } from "@statewalker/vcs-store-mem";
-
-const { stagingStore } = createMemoryStorage();
-const repository = await createGitRepository(); // In-memory by default
-const store = createGitStore({ repository, staging: stagingStore });
-const git = Git.wrap(store);
-
-// Stage and commit
-await git.add().addFilepattern(".").call();
-await git.commit().setMessage("Initial commit").call();
-```
-
-### Writing Tests
-
-The memory backend makes tests fast and isolated:
-
-```typescript
-import { describe, it, expect, beforeEach } from "vitest";
-import { createMemoryStorage } from "@statewalker/vcs-store-mem";
-
-describe("MyFeature", () => {
-  let storage;
-
-  beforeEach(() => {
-    // Fresh storage for each test
-    storage = createMemoryStorage();
-  });
-
-  it("should store and retrieve objects", async () => {
-    const content = new TextEncoder().encode("test");
-    const hash = await storage.objectStore.store(toAsyncIterable(content));
-
-    const retrieved = await collectAsync(storage.objectStore.load(hash));
-    expect(retrieved).toEqual(content);
-  });
+it("stores a blob", async () => {
+  const id = await stores.blobs.store([new TextEncoder().encode("test")]);
+  expect(await stores.blobs.has(id)).toBe(true);
 });
 ```
 
-### Individual Store Usage
+### Object-map stores (fast, non-Git ids)
 
-When you need fine-grained control:
+```ts
+import { MemoryCommitStore, MemoryTreeStore } from "@statewalker/vcs-store-mem";
 
-```typescript
-import {
-  InMemoryObjectRepository,
-  InMemoryRefStore,
-} from "@statewalker/vcs-store-mem";
+const trees = new MemoryTreeStore();
+const commits = new MemoryCommitStore();
 
-const objectRepo = new InMemoryObjectRepository();
-const refStore = new InMemoryRefStore();
+const treeId = await trees.store([]); // empty tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+const who = { name: "Ada", email: "ada@example.com", timestamp: 1700000000, tzOffset: "+0000" };
+const c1 = await commits.store({ tree: treeId, parents: [], author: who, committer: who, message: "a" });
+const c2 = await commits.store({ tree: treeId, parents: [c1], author: who, committer: who, message: "b" });
 
-// Use directly
-await refStore.setRef("refs/heads/main", "abc123");
-const mainRef = await refStore.getRef("refs/heads/main");
+await commits.isAncestor(c1, c2); // true
+for await (const id of commits.walkAncestry(c2)) console.log(id); // c2, then c1
 ```
 
-## Architecture
+### Binary storage with deltas
 
-### Design Decisions
+```ts
+import { createMemBinStore } from "@statewalker/vcs-store-mem";
 
-Simplicity drives every design choice. Each store uses straightforward Map or Set data structures with no optimization layers. This transparency helps developers understand exactly what happens during each operation.
+const bin = createMemBinStore();
+await bin.raw.store("base", (async function* () {
+  yield new TextEncoder().encode("hello world");
+})());
 
-The stores share no state between instances. Creating a new storage with `createMemoryStorage()` gives you a completely isolated repository. This isolation is crucial for test reliability.
+const update = bin.delta.startUpdate();
+await update.storeDelta({ baseKey: "base", targetKey: "target" }, [
+  { type: "start", targetLen: 5 },
+  { type: "copy", start: 0, len: 5 },
+  { type: "finish", checksum: 0 },
+]);
+await update.close(); // deltas become visible only after close()
 
-### Implementation Details
+await bin.delta.isDelta("target"); // true
+bin.clear();
+```
 
-Object storage uses a `Map<string, Uint8Array>` keyed by SHA-1 hash. References use `Map<string, string>` mapping ref names to object hashes. Staging entries track file paths to their staged content and metadata.
+## Internals
 
-The implementation passes all test suites from `@statewalker/vcs-testing`, guaranteeing interface compliance. Any behavior difference between memory and other backends indicates a bug in one of the implementations.
+### Two kinds of object stores, and why their ids differ
 
-## JGit References
+`createMemoryObjectStores()` serializes every object in Git format into a `MemoryRawStorage` and
+hashes it with SHA-1. It uses the same `createGitObjectStore` / `createBlobs` / `createTrees` /
+`createCommits` / `createTags` code as the persistent backends, so its ids match native Git.
 
-While JGit doesn't ship an in-memory backend in its public API, the concept maps to:
+`MemoryCommitStore`, `MemoryTreeStore` and `MemoryTagStore` keep plain JavaScript objects and skip
+serialization. Their ids come from `computeCommitHash` / `computeTreeHash` / `computeTagHash` in
+`@statewalker/vcs-core`: a 32-bit FNV-1a hash with a type prefix, zero-padded to 40 characters
+(`commit2814e9b0000…`, `tree84b15896000…`, `tag…`). They are deterministic and content-derived,
+but they are not Git ids. Do not mix them with ids from a Git-format store. The one exception is
+the empty tree, which `MemoryTreeStore` always reports as Git's
+`4b825dc642cb6eb9a060e54bf8d69288fbee4904`. `gpgSignature` is stored but not hashed.
 
-| StateWalker VCS | JGit Equivalent |
-|-----------------|-----------------|
-| In-memory storage | `org.eclipse.jgit.internal.storage.dfs.InMemoryRepository` |
-| DFS abstractions | `org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase` |
+### Copies in, copies out
 
-The DFS (Distributed File System) layer in JGit provides similar abstraction, though it targets distributed storage rather than in-memory testing.
+The object-map stores deep-copy on `store` and on `load`, so mutating a returned commit, tree
+entry or tag never changes stored state. Tree entries are sorted in Git canonical order
+(directories compare as `name/`) before hashing.
 
-## Dependencies
+### Staging keeps entries sorted
 
-**Runtime:**
-- `@statewalker/vcs-core` - Interface definitions
-- `@statewalker/vcs-utils` - Utilities
-- `@statewalker/vcs-sandbox` - Sandbox utilities
+`MemoryStagingStore` keeps entries in one array sorted by `(path, stage)` and looks them up by
+binary search. `read()`, `write()` and `isOutdated()` exist for interface compatibility; nothing
+is persisted.
 
-**Development:**
-- `@statewalker/vcs-testing` - Test suites for validation
-- `vitest` - Testing
-- `rolldown` - Bundling
-- `typescript` - Type definitions
+### What breaks
+
+| Situation | Error |
+| --- | --- |
+| `staging.writeTree()` with conflict stages present | `Cannot write tree with unresolved conflicts` |
+| Builder `add()` without a mode | `FileMode not set for path <path>` |
+| Builder `finish()` with the same path and stage twice | `Duplicate entry: <path> stage <n>` |
+| Builder `finish()` with stage 0 next to stages 1-3 | `Invalid stages for <path>: stage 0 cannot coexist with other stages` |
+| `resolveConflict()` with an unknown resolution | `Invalid resolution: <value>` |
+| `MemoryCommitStore.getParents()` on a missing id | `Commit <id> not found` |
+| `MemoryTagStore.getTarget(id, true)` over more than 100 nested tags | `Tag chain too deep (> 100)` |
+| `storeDelta()` on an update after its `close()` | `Update already closed` |
+
+### Delta store limits
+
+`MemDeltaStore` records which key is a delta of which base and keeps the delta instructions. The
+update's `storeObject()` does nothing: full objects belong in the raw store. Chain walks stop at
+depth 50. `getDeltaChainInfo()` always reports `originalSize: 0`, `compressedSize` is an estimate
+from the instruction list, and the stored `ratio` is `1` or `0`. Do not use these numbers for
+packing decisions.
+
+### Dependencies
+
+- `@statewalker/vcs-core`: store interfaces, Git object codecs, `MemoryRefStore`,
+  `MemoryRawStorage`, and the ancestry algorithms (`walkAncestry`, `findMergeBase`,
+  `isAncestor`) that `MemoryCommitStore` delegates to.
+- `@statewalker/vcs-working-tree`: the `Staging` interface and merge-stage constants.
+- `@statewalker/vcs-utils`: the `Delta` type.
 
 ## License
 

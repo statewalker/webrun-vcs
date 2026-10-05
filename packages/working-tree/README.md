@@ -1,63 +1,174 @@
 # @statewalker/vcs-working-tree
 
-The git working-tree layer — index/staging, status, checkout, ignore, worktree, and merge/transformation state — over `@statewalker/vcs-core`.
+The mutable side of a Git repository: the index (staging area), working-tree status, `.gitignore` matching, the worktree file view, checkout state (HEAD, in-progress merge/rebase/cherry-pick/revert), stash, and the `WorkingCopy` interface that ties them to a history from `@statewalker/vcs-core`. It ships the interfaces plus in-memory implementations and a Git-compatible index (`.git/index`) reader/writer.
 
-## Overview
+## Why the working tree is its own package
 
-`vcs-working-tree` is the git working-tree / versioning surface of Axis B: the mutable local state that sits over the immutable objects in `@statewalker/vcs-core`. It owns the **index/staging** area (git-compatible three-state semantics), **status** calculation (working ↔ index ↔ HEAD), **checkout**, **`.gitignore`** handling, the **worktree** filesystem view, and the **transformation** state for merge / rebase / cherry-pick / revert. It was extracted from `vcs-core` so the pure object model and the mutable working-tree logic live in separate packages.
+`@statewalker/vcs-core` holds content-addressed objects and refs: data that never changes once written. The index, the worktree and operation state change on every command, depend on a filesystem, and have Git-specific rules (three merge stages, racily-clean detection, ignore precedence). Keeping them here lets code that only reads or syncs history depend on `vcs-core` alone.
 
-It depends on `@statewalker/vcs-core` (objects/refs/index primitives) and `@statewalker/vcs-utils`, and — by design — **never** depends on `@statewalker/webrun-files-sync` (the hard Axis A ✗↔ Axis B ban). Memory implementations ship here; file-backed implementations live in `@statewalker/vcs-store-files`.
+The package deliberately does not depend on `@statewalker/webrun-files-sync`. Combining file sync with Git working-tree state happens only in `@statewalker/vcs-workspace`.
 
-## Installation
+## How to use it
 
 ```bash
 pnpm add @statewalker/vcs-working-tree
 ```
 
-## Quick Start
+No peer dependencies. Works in browsers, Node and workers.
+
+| Entry point | Contents |
+|-------------|----------|
+| `@statewalker/vcs-working-tree` | Staging, status, ignore, checkout, worktree and working-copy APIs (everything except `/transformation`) |
+| `@statewalker/vcs-working-tree/staging` | Only the staging part: `Staging` interface, `GitStaging`, `createGitStaging`, `createMemoryGitStaging`, staging edits, conflict helpers, DIRC `parseIndexFile` / `serializeIndexFile` |
+| `@statewalker/vcs-working-tree/transformation` | Types only: `MergeState`, `RebaseState`, `CherryPickState`, `RevertState`, `SequencerState`, `ResolutionStore`, `ConflictInfo`, `Resolution`, ... |
+
+Main exports of the root entry:
+
+- **Staging**: `createMemoryGitStaging()`, `createGitStaging(files, indexPath)`, `Staging` (`setEntry`, `getEntry`, `entries`, `createEditor`, `createBuilder`, `writeTree`, `readTree`, `hasConflicts`, `resolveConflict`, `read`, `write`, ...), conflict helpers (`getAllConflicts`, `generateConflictMarkers`, `parseConflictMarkers`, ...).
+- **Status**: `createStatusCalculator(options)`, `FileStatus`, `RepositoryStatus`, `createIndexDiffCalculator(...)`.
+- **Ignore**: `createIgnoreManager(options?)`, `createIgnoreNode()`, `createIgnoreRule(pattern)`.
+- **Checkout**: `Checkout` interface, `createMemoryCheckout(options)`.
+- **Worktree**: `Worktree` interface, `createMemoryWorktree(options)`.
+- **Working copy**: `WorkingCopy` interface, `createMemoryWorkingCopy(options)`, `createMemoryStashStore()`, `RepositoryState` / `getStateCapabilities()`, checkout conflict detection (`detectCheckoutConflicts`, `createCheckoutConflictDetector`) and three-way tree helpers (`compareThreeWayTrees`, `mergeTreesThreeWay`, ...).
+
+File-backed `Worktree`, `Checkout` and `WorkingCopy` implementations (`createFileWorktree`, `GitWorkingCopy`) are in `@statewalker/vcs-store-files`.
+
+## Examples
+
+### Compose an in-memory working copy
 
 ```typescript
-import { createMemoryGitStaging } from "@statewalker/vcs-working-tree/staging";
-import { createIgnoreManager, createStatusCalculator } from "@statewalker/vcs-working-tree";
+import { createMemoryHistory } from "@statewalker/vcs-core";
+import {
+  createMemoryCheckout,
+  createMemoryGitStaging,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+} from "@statewalker/vcs-working-tree";
 
-// The git index as a staging area (in-memory).
+const history = createMemoryHistory();
+await history.initialize();
+await history.refs.setSymbolic("HEAD", "refs/heads/main");
+
 const staging = createMemoryGitStaging();
-await staging.setEntry({ path: "src/index.ts", mode: 0o100644, objectId, stage: 0 });
-console.log(await staging.getEntryCount(), await staging.hasConflicts());
-
-// .gitignore matching.
-const ignore = createIgnoreManager();
-ignore.addIgnoreFile("/", "node_modules/\n*.log\n");
-ignore.isIgnored("node_modules/x", true); // true
-
-// Status = 3-way diff of working ↔ index ↔ HEAD.
-const status = createStatusCalculator({ staging, worktree, head });
-const result = await status.calculateStatus({ includeUntracked: true });
+const workingCopy = createMemoryWorkingCopy({
+  history,
+  checkout: createMemoryCheckout({ staging }),
+  worktree: createMemoryWorktree({ blobs: history.blobs, trees: history.trees }),
+});
 ```
 
-## API
+Pass it to `Git.fromWorkingCopy()` from `@statewalker/vcs-commands` to run Git commands.
 
-The package barrel re-exports the working-tree building blocks:
+### Stage entries and write a tree
 
-- **Staging / index** — `createGitStaging(files, indexPath)`, `createMemoryGitStaging()`, the `Staging` interface (`setEntry` / `getEntry` / `entries` / `writeTree` / `readTree` / `hasConflicts` / `resolveConflict` …), plus the DIRC `index-format` parser/serializer.
-- **Status** — `createStatusCalculator(options)`, `StatusCalculator.calculateStatus(...)`, `FileStatus`, index-diff calculators.
-- **Ignore** — `createIgnoreManager(options?)`, `createIgnoreNode`, `createIgnoreRule`.
-- **Checkout** — `createMemoryCheckout(options)`, the `Checkout` interface.
-- **Worktree** — `createMemoryWorktree(options)`, the `Worktree` interface.
-- **Working copy** — `createMemoryWorkingCopy(options)` (links history + checkout + worktree + staging), `createMemoryStashStore()`, repository-state helpers.
+```typescript
+import { FileMode } from "@statewalker/vcs-core";
 
-### Sub-path exports
+const content = new TextEncoder().encode("hello\n");
+const objectId = await history.blobs.store([content]);
 
-| Path | Contents |
-|------|----------|
-| `@statewalker/vcs-working-tree/staging` | Staging interface, git-index implementation, DIRC format |
-| `@statewalker/vcs-working-tree/transformation` | merge / rebase / cherry-pick / revert state + `ResolutionStore` |
+await staging.setEntry({
+  path: "src/index.ts",
+  mode: FileMode.REGULAR_FILE,
+  objectId,
+  stage: 0,
+  size: content.length,
+});
+console.log(await staging.getEntryCount(), await staging.hasConflicts()); // 1 false
 
-The `transformation` types are **not** re-exported from the root barrel (their names — `MergeState`, `RebaseState`, `ConflictInfo`, `ResolutionStrategy`, … — collide with staging and working-copy types); import them from the `/transformation` sub-path.
+const treeId = await staging.writeTree(history.trees);
+```
 
-## Notes
+### Read and write a Git index file
 
-- **Extracted from `vcs-core`.** Immutable object model stays in `vcs-core`; this package is the mutable working-tree half.
-- **Index as a tree.** `status` is a 3-way diff (`staged` = index vs HEAD, `unstaged` = working vs index); merge applies a `merge-core` result into the index and surfaces conflicts.
-- **Axis ban.** It never imports `files-sync`; cross-axis composition happens only in `@statewalker/vcs-workspace`.
-- Memory-only implementations here; file-backed ones in `@statewalker/vcs-store-files`. Built red/green TDD.
+```typescript
+import { createInMemoryFilesApi, FileMode } from "@statewalker/vcs-core";
+import { createGitStaging } from "@statewalker/vcs-working-tree";
+
+const files = createInMemoryFilesApi(); // any FilesApi, e.g. a Node or browser one
+const index = createGitStaging(files, ".git/index");
+await index.read();   // load .git/index if present
+await index.setEntry({ path: "a.txt", mode: FileMode.REGULAR_FILE, objectId, stage: 0 });
+await index.write();  // write DIRC format
+```
+
+### Compute status
+
+```typescript
+import { createStatusCalculator, FileStatus } from "@statewalker/vcs-working-tree";
+
+const status = createStatusCalculator({
+  worktree: workingCopy.worktree,
+  staging,
+  trees: history.trees,
+  commits: history.commits,
+  refs: history.refs,
+});
+
+const result = await status.calculateStatus({ includeUntracked: true });
+for (const file of result.files) {
+  console.log(file.path, file.indexStatus, file.workTreeStatus); // e.g. "notes.txt unmodified untracked"
+}
+console.log(result.isClean, result.hasStaged, result.hasUntracked);
+```
+
+### Match `.gitignore` rules
+
+```typescript
+import { createIgnoreManager } from "@statewalker/vcs-working-tree";
+
+const ignore = createIgnoreManager({ globalPatterns: [".DS_Store"] });
+ignore.addIgnoreFile("", "node_modules/\n*.log\n"); // "" = repository root
+ignore.isIgnored("node_modules", true);  // true
+ignore.isIgnored("debug.log", false);    // true
+ignore.isIgnored("src/a.ts", false);     // false
+```
+
+## Internals
+
+### How the pieces fit
+
+```
+                 WorkingCopy
+   +-------------+-----------+-------------+
+   |             |           |             |
+ history      checkout     worktree      stash, config
+ (vcs-core)      |         (files)
+            staging (index)
+            HEAD, merge/rebase/
+            cherry-pick/revert state
+```
+
+`WorkingCopy` adds HEAD helpers (`getHead`, `setHead`, `getCurrentBranch`, `isDetachedHead`), operation state (`getMergeState`, `getRebaseState`, ..., `getState`, `getStateCapabilities`) and `getStatus()` / `refresh()`.
+
+### Why the index keeps stages
+
+An index entry is keyed by path and stage. Stage 0 is a normal entry. Stages 1, 2 and 3 hold base, ours and theirs during a conflict, as in Git. This lets a merge write all sides into the index and lets `resolveConflict(path, "ours" | "theirs" | "base" | entry)` collapse them back to stage 0.
+
+### How status decides a file changed
+
+Status is a three-way diff: HEAD tree vs index (`indexStatus`) and index vs worktree (`workTreeStatus`). For index vs worktree it compares sizes first. If sizes match and the file's mtime is more than 3 seconds older than the index update time, the file is treated as unchanged. Otherwise it hashes the content. This mirrors Git's "racily clean" handling and avoids hashing every file.
+
+### What breaks, and how it looks
+
+- An index entry written without `size` (defaults to 0) makes the matching worktree file show as `modified`, because the size check fails before any hashing.
+- `writeTree()` with unresolved conflicts throws `Cannot write tree with unresolved conflicts`.
+- An index that mixes stage 0 with stages 1-3 for one path throws `Invalid stages for <path>: stage 0 cannot coexist with other stages`.
+- Reading a bad `.git/index` throws `Invalid index file signature: expected DIRC, got ...`, `Unsupported index version: <n>` or `Index file checksum mismatch`.
+- Index paths are validated: `Invalid path: <path> (starts with /)`, `(contains //)`, `(contains .git)`, ...
+- The memory worktree throws `File not found: <path>` on reads of missing files.
+- `MemoryWorkingCopy.getStatus()` is a stub: it always returns `isClean: true` and no files. Use `createStatusCalculator` for real status.
+
+### Why `/transformation` is a separate entry point
+
+Its type names (`MergeState`, `RebaseState`, `ConflictInfo`, `ConflictType`, `ResolutionStrategy`) collide with names exported from the staging and working-copy modules. The root entry does not re-export them; import them from `@statewalker/vcs-working-tree/transformation`. That entry contains types only; there is no runtime code.
+
+### Dependencies and why
+
+- `@statewalker/vcs-core`: `History`, `Blobs`, `Trees`, `Commits`, `Refs`, `FileMode`, `FilesApi`.
+- `@statewalker/vcs-utils`: SHA-1 for the index checksum and worktree content hashes, hex helpers.
+
+## License
+
+MIT

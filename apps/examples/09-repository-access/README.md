@@ -1,39 +1,58 @@
 # 09-repository-access
 
-Exposes a repository for transport operations using RepositoryAccess, RepositoryFacade, and RefStore. This example creates a server repository, demonstrates low-level and pack-level access patterns, then serves and fetches content over a MessagePort duplex stream.
+## What it is
 
-## Quick Start
+A runnable example that exposes an in-memory repository to the transport layer and fetches from it. It builds a server repository, inspects it through `RepositoryAccess` (object level) and `RepositoryFacade` (pack level), adapts its core `Refs` to the transport `RefStore` contract, then serves it with `serveOverDuplex` and fetches it into a second repository with `fetchOverDuplex` over a Node `MessageChannel`. Everything runs in one process; nothing touches disk or the network.
+
+What you will learn:
+
+- Creating `RepositoryAccess` from a `History` for object-level protocol operations
+- Creating `RepositoryFacade` for pack import and export
+- Adapting core `Refs` to the transport `RefStore` interface
+- Serving with `serveOverDuplex` and fetching with `fetchOverDuplex`
+- Wrapping a `MessagePort` as a transport `Duplex` with `createMessagePortDuplex`
+
+It builds on [08-transport-basics](../08-transport-basics/).
+
+## Layout
+
+```
+apps/examples/09-repository-access/
+├── package.json
+├── tsconfig.json
+├── README.md
+└── src/
+    └── main.ts          # All four steps in one file, plus the RefStore adapter
+```
+
+Data flow of step 4:
+
+```
+ server History ──> createVcsRepositoryFacade ──┐
+ server Refs    ──> createRefStoreAdapter     ──┤ serveOverDuplex
+                                                │      │ port1
+                                     MessageChannel    │
+                                                │      │ port2
+ client History ──> createVcsRepositoryFacade ──┤ fetchOverDuplex
+ client Refs    ──> createRefStoreAdapter     ──┘
+```
+
+## How to run it
+
+Requires Node 24 and pnpm. From the repository root:
 
 ```bash
-# From the monorepo root
 pnpm install
 pnpm --filter @statewalker/vcs-example-09-repository-access start
 ```
 
-## What You'll Learn
+`start` runs `tsx src/main.ts`. `typecheck` runs `tsc --noEmit`.
 
-- Creating RepositoryAccess from a History instance for byte-level protocol operations
-- Creating RepositoryFacade for pack-level import/export
-- Adapting core Refs to the transport RefStore interface
-- Using serveOverDuplex to serve Git requests over any duplex stream
-- Using fetchOverDuplex to fetch from a served repository
-- Building a MessagePort-based duplex adapter with close markers
+## The walk-through: four steps from a repository to a fetch
 
-## Prerequisites
+### Step 1: a server repository with one commit
 
-- Node.js 18+
-- pnpm
-- Completed [08-transport-basics](../08-transport-basics/)
-
----
-
-## Step-by-Step Guide
-
-### Creating and Populating a Server Repository
-
-**File:** [src/main.ts](src/main.ts)
-
-The example starts by setting up a memory-backed repository with a blob, tree, and commit, then pointing `refs/heads/main` at the commit.
+The example sets up a memory-backed repository with a blob, a tree and a commit, then points `refs/heads/main` at the commit. `HEAD` is a symbolic ref to `refs/heads/main`.
 
 ```typescript
 const serverHistory = createMemoryHistoryWithOperations();
@@ -56,18 +75,14 @@ const commitId = await serverHistory.commits.store({
 await serverHistory.refs.set("refs/heads/main", commitId);
 ```
 
-**Key APIs:**
-- `createMemoryHistoryWithOperations()` - In-memory History with full operations support
-- `History.blobs.store()` / `History.trees.store()` / `History.commits.store()` - Object creation
-- `History.refs.setSymbolic()` - Create symbolic ref (HEAD -> refs/heads/main)
+Key APIs:
+- `createMemoryHistoryWithOperations()`: in-memory `History` that also carries `serialization` and `delta`
+- `history.blobs.store()`, `history.trees.store()`, `history.commits.store()`: object creation
+- `history.refs.setSymbolic()`: symbolic ref (`HEAD` -> `refs/heads/main`)
 
----
+### Step 2: RepositoryAccess answers per-object questions
 
-### RepositoryAccess: Byte-Level Operations
-
-**File:** [src/main.ts](src/main.ts)
-
-RepositoryAccess provides low-level, byte-oriented operations that protocol handlers use to inspect and traverse objects.
+`RepositoryAccess` is the object-level view protocol handlers use: existence, type and size, ref listing, and graph walks that yield raw content.
 
 ```typescript
 const repoAccess = createVcsRepositoryAccess({ history: serverHistory });
@@ -80,35 +95,31 @@ for await (const ref of repoAccess.listRefs()) {
   console.log(`${ref.name} -> ${ref.objectId.slice(0, 7)}`);
 }
 
+const typeNames = ["", "commit", "tree", "blob", "tag"];
 for await (const obj of repoAccess.walkObjects([commitId], [])) {
   console.log(`${typeNames[obj.type]}: ${obj.id.slice(0, 7)} (${obj.content.length} bytes)`);
 }
 ```
 
-**Key APIs:**
-- `createVcsRepositoryAccess({ history })` - Create access adapter from a History instance
-- `RepositoryAccess.hasObject(id)` - Check if an object exists
-- `RepositoryAccess.getObjectInfo(id)` - Get object type and size
-- `RepositoryAccess.getHead()` - Get HEAD target info
-- `RepositoryAccess.listRefs()` - Enumerate all refs
-- `RepositoryAccess.walkObjects(wants, haves)` - Traverse the object graph
+Key APIs:
+- `createVcsRepositoryAccess({ history })`: adapter from a `History`
+- `hasObject(id)`, `getObjectInfo(id)`: existence, and `{ type, size }` where `type` is a numeric `ObjectTypeCode`
+- `getHead()`: `{ target }` of `HEAD`
+- `listRefs()`: all refs, including `HEAD`
+- `walkObjects(wants, haves)`: object graph traversal
 
----
+### Step 3: RepositoryFacade works in packs, RefStore in plain strings
 
-### RepositoryFacade and RefStore Adapter
-
-**File:** [src/main.ts](src/main.ts)
-
-RepositoryFacade works at the pack level, handling import and export of pack streams. The RefStore adapter bridges the core Refs interface to the simpler transport RefStore contract.
+`RepositoryFacade` operates on pack streams, which is what the transport state machine produces and consumes. It needs the `History` and its `SerializationApi`.
 
 ```typescript
 const serverFacade: RepositoryFacade = createVcsRepositoryFacade({
   history: serverHistory,
   serialization: serverHistory.serialization,
 });
-
 const serverRefStore: RefStore = createRefStoreAdapter(serverHistory.refs);
 
+let packSize = 0;
 for await (const chunk of serverFacade.exportPack(new Set([commitId]), new Set())) {
   packSize += chunk.length;
 }
@@ -116,21 +127,14 @@ for await (const chunk of serverFacade.exportPack(new Set([commitId]), new Set()
 const allRefs = await serverRefStore.listAll();
 ```
 
-**Key APIs:**
-- `createVcsRepositoryFacade({ history, serialization })` - Create facade for pack operations
-- `RepositoryFacade.exportPack(wants, exclude)` - Generate a pack stream
-- `RepositoryFacade.importPack(stream)` - Import a pack stream
-- `RepositoryFacade.has(oid)` - Check object existence
-- `RefStore.listAll()` - List all refs as `[name, oid]` pairs
-- `RefStore.get(name)` / `RefStore.update(name, oid)` - Read and write individual refs
+Key APIs:
+- `createVcsRepositoryFacade({ history, serialization })`
+- `facade.exportPack(wants, exclude)`: pack as an async stream of chunks
+- `facade.importPack(stream)`: the reverse, used by the client during fetch
+- `facade.has(oid)`
+- `RefStore.listAll()`: `[name, oid]` pairs; `RefStore.get(name)` and `RefStore.update(name, oid)`
 
----
-
-### The RefStore Adapter Pattern
-
-**File:** [src/main.ts](src/main.ts)
-
-The transport layer uses a simpler ref interface than core. This adapter bridges the gap:
+The adapter is defined at the bottom of `main.ts`:
 
 ```typescript
 function createRefStoreAdapter(refs: Refs): RefStore {
@@ -155,23 +159,21 @@ function createRefStoreAdapter(refs: Refs): RefStore {
 }
 ```
 
-**Key APIs:**
-- `Refs.resolve(name)` - Core interface: resolves refs including symbolic refs
-- `RefStore.get(name)` - Transport interface: returns `string | undefined` directly
-- `RefStore.update(name, oid)` - Transport interface: simplified set
+`get` resolves symbolic refs through `refs.resolve()`; `listAll` keeps only entries that carry an `objectId`, so symbolic refs such as `HEAD` are left out.
 
----
+### Step 4: serve and fetch over a MessageChannel
 
-### Serving and Fetching Over a Duplex Stream
-
-**File:** [src/main.ts](src/main.ts)
-
-With the facade and ref store ready, you can serve the repository over any bidirectional stream. This example uses Node's MessageChannel to create a duplex pair, then runs the server and client concurrently.
+`createMessagePortDuplex` turns each end of a `MessageChannel` into a `Duplex`. The server and client run concurrently under `Promise.all`; the client gets its own empty memory repository, facade and ref store.
 
 ```typescript
+const { MessageChannel } = await import("node:worker_threads");
+const { serveOverDuplex, fetchOverDuplex, createMessagePortDuplex } = await import(
+  "@statewalker/vcs-transport"
+);
+
 const channel = new MessageChannel();
-const serverDuplex = createMessagePortDuplex(channel.port1);
-const clientDuplex = createMessagePortDuplex(channel.port2);
+const serverDuplex = createMessagePortDuplex(channel.port1 as any);
+const clientDuplex = createMessagePortDuplex(channel.port2 as any);
 
 const [serveResult, fetchResult] = await Promise.all([
   serveOverDuplex({
@@ -188,127 +190,106 @@ const [serveResult, fetchResult] = await Promise.all([
 ]);
 ```
 
-**Key APIs:**
-- `serveOverDuplex({ duplex, repository, refStore, service })` - Serve Git requests over a duplex stream
-- `fetchOverDuplex({ duplex, repository, refStore })` - Fetch from a served repository
-- `MessageChannel` - Node.js built-in for creating paired message ports
+Afterwards the example resolves `refs/heads/main` in the client repository, loads the commit and prints its message, then closes both ports.
 
----
+Key APIs:
+- `serveOverDuplex({ duplex, repository, refStore, service })`: returns a `ServeResult` with `success`
+- `fetchOverDuplex({ duplex, repository, refStore })`: returns a `FetchResult` with `success` and `updatedRefs` (a `Map`)
 
-## Key Concepts
+### What the run prints
 
-### RepositoryAccess vs RepositoryFacade
-
-Two interfaces bridge History to the transport layer at different abstraction levels. RepositoryAccess is byte-oriented, giving protocol handlers direct access to individual objects by ID: check existence, read type and size, load raw content, and walk the object graph. RepositoryFacade is pack-oriented, operating at the level of pack streams that the transport FSM produces and consumes. When building a transport server, you typically use both: the facade for pack negotiation and the access layer for ref advertisement and object inspection.
-
-### RefStore Adapter
-
-The core `Refs` interface supports symbolic refs, resolution chains, and async iteration over entries. The transport layer needs something simpler: `get(name)` returning a plain object ID string, `update(name, oid)` for writes, and `listAll()` returning flat `[name, oid]` pairs. The adapter pattern shown in this example bridges that gap by resolving symbolic refs and filtering entries down to concrete object IDs.
-
-### Serving Over Duplex
-
-Any bidirectional stream (MessagePort, WebSocket, WebRTC DataChannel) can serve as a transport channel. The `serveOverDuplex` function handles the server side of the Git smart protocol, advertising refs and sending pack data. On the client side, `fetchOverDuplex` performs the negotiation and receives objects. Running both sides through `Promise.all` lets you test the full round-trip in a single process, which is the pattern this example demonstrates with `MessageChannel`.
-
----
-
-## Project Structure
-
-```
-apps/examples/09-repository-access/
-├── package.json
-├── tsconfig.json
-├── README.md
-└── src/
-    └── main.ts          # All steps in a single file
-```
-
----
-
-## Output Example
+Commit ids differ on every run (see below). A real run:
 
 ```
 === Step 1: Create Server Repository ===
 
-  Server commit: a3f1e2b
-  Server blob:   8c4d7a1
-  Server tree:   5e9b0c3
+  Server commit: ad3fb07
+  Server blob:   d632b85
+  Server tree:   303b6d0
 
 === Step 2: Create RepositoryAccess ===
 
-  hasObject(a3f1e2b): true
-  getObjectInfo: type=commit size=198
+  hasObject(ad3fb07): true
+  getObjectInfo: type=1 size=180
   getHead: target=refs/heads/main
   listRefs:
-    refs/heads/main -> a3f1e2b
+    HEAD -> ad3fb07
+    refs/heads/main -> ad3fb07
   walkObjects (from commit, no exclusions):
-    commit: a3f1e2b (198 bytes)
-    tree: 5e9b0c3 (37 bytes)
-    blob: 8c4d7a1 (55 bytes)
+    commit: ad3fb07 (180 bytes)
+    tree: 303b6d0 (37 bytes)
+    blob: d632b85 (56 bytes)
   Total objects walked: 3
 
 === Step 3: Create RepositoryFacade & RefStore ===
 
-  facade.has(a3f1e2b): true
+  facade.has(ad3fb07): true
   Exporting pack (wants=[commit], haves=[]):
-    Pack size: 312 bytes
+    Pack size: 270 bytes
   RefStore.listAll():
-    refs/heads/main -> a3f1e2b
+    refs/heads/main -> ad3fb07
 
 === Step 4: Serve Over Duplex (MessagePort) ===
 
   Server result: success=true
-  Client result: refs fetched=1
+  Client result: refs updated=1
   Client received commit: "Initial commit from server"
 
 === Summary ===
-
-Key interfaces demonstrated:
-  - RepositoryAccess: Low-level byte-level protocol operations
-  - RepositoryFacade: Pack-level import/export operations
-  - RefStore: Transport-compatible ref storage adapter
-  - serveOverDuplex: Serve Git requests over any duplex stream
-  - fetchOverDuplex: Fetch from a served repository
-
-Adapter functions:
-  - createVcsRepositoryAccess({ history })
-  - createVcsRepositoryFacade({ history, serialization })
-  - createRefStoreAdapter(refs)  (see code in this example)
-
+...
 Example completed successfully!
 ```
 
----
+## Why it is the way it is
 
-## API Reference Links
+### Two adapters, because the protocol works at two levels
 
-### Transport Package (packages/transport)
+`RepositoryAccess` is object-oriented: it answers "do you have X, what type is it, give me its bytes, walk from here". `RepositoryFacade` is pack-oriented: it exports and imports whole pack streams, which is the unit the transport state machine negotiates. A server uses the facade for pack transfer; the object-level view serves ref advertisement and inspection. Both are built from the same `History`, so they always agree.
 
-| Interface / Function | Location | Purpose |
+### The RefStore adapter is inline
+
+The transport layer depends on a minimal `RefStore` (`get`, `update`, `listAll`, plus optional `getSymrefTarget` and `isRefTip`) rather than on the core `Refs` with its symbolic refs and resolution chains. That keeps the transport package usable with any ref backend. `@statewalker/vcs-transport-adapters` does not export a `Refs`-to-`RefStore` adapter for a `History`, so the example writes the adapter itself; copy it.
+
+### Any duplex works
+
+`serveOverDuplex` and `fetchOverDuplex` only see a `Duplex`: an async iterable of `Uint8Array` with `write()` and an optional `close()`. A `MessageChannel` makes the full round trip testable in one process; the same calls work over a WebSocket or a WebRTC data channel.
+
+## What will surprise you
+
+- **Commit ids change every run.** The commit timestamp is `Date.now() / 1000`, so the commit id differs between runs; the blob and tree ids are stable.
+- **`getObjectInfo` prints `type=1`, not `type=commit`.** `ObjectInfo.type` is a numeric `ObjectTypeCode` (1 commit, 2 tree, 3 blob, 4 tag). The walk output maps codes to names with a local `typeNames` array.
+- **`listRefs()` shows `HEAD`, `RefStore.listAll()` does not.** The access layer resolves `HEAD`; the inline adapter drops entries without an `objectId`.
+- **`as any` on the ports.** Node's `worker_threads` `MessagePort` is not the DOM `MessagePort` type that `createMessagePortDuplex` declares; the cast is needed to typecheck.
+- **The process does not exit if ports stay open.** Setting `onmessage` keeps a Node `MessagePort` alive; the example calls `channel.port1.close()` and `channel.port2.close()` before finishing.
+- **Fetch assumes `refs/heads/main` locally.** `fetchOverDuplex` resolves `options.localHead ?? "refs/heads/main"` in the client `RefStore` to choose haves. Here the client is empty, so it sends none.
+- **Missing objects throw.** Loading an id that is not in the repository through the access adapter throws `Object not found: <id>`. Port errors are logged as `MessagePort error:`.
+
+## Reference
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `pnpm --filter @statewalker/vcs-example-09-repository-access start` | Runs `tsx src/main.ts` |
+| `pnpm --filter @statewalker/vcs-example-09-repository-access typecheck` | Runs `tsc --noEmit` |
+
+### API locations
+
+| Interface / function | Location | Purpose |
 |----------------------|----------|---------|
 | `RepositoryFacade` | [api/repository-facade.ts](../../../packages/transport/src/api/repository-facade.ts) | Pack-level import/export interface |
-| `RepositoryAccess` | [api/repository-access.ts](../../../packages/transport/src/api/repository-access.ts) | Byte-level protocol operations |
-| `RefStore` | [api/options.ts](../../../packages/transport/src/api/options.ts) | Transport-compatible ref storage |
-| `serveOverDuplex` | [operations/serve-over-duplex.ts](../../../packages/transport/src/operations/serve-over-duplex.ts) | Serve Git requests over duplex |
+| `RepositoryAccess` | [api/repository-access.ts](../../../packages/transport/src/api/repository-access.ts) | Object-level protocol operations |
+| `RefStore` | [context/process-context.ts](../../../packages/transport/src/context/process-context.ts) | Transport ref storage contract |
+| `serveOverDuplex` | [operations/serve-over-duplex.ts](../../../packages/transport/src/operations/serve-over-duplex.ts) | Serve Git requests over a duplex |
 | `fetchOverDuplex` | [operations/fetch-over-duplex.ts](../../../packages/transport/src/operations/fetch-over-duplex.ts) | Fetch from a served repository |
+| `createMessagePortDuplex` | [adapters/messageport/messageport-duplex.ts](../../../packages/transport/src/adapters/messageport/messageport-duplex.ts) | `MessagePort` as a `Duplex` |
+| `createVcsRepositoryAccess` | [vcs-repository-access.ts](../../../packages/transport-adapters/src/vcs-repository-access.ts) | `RepositoryAccess` from a `History` |
+| `createVcsRepositoryFacade` | [vcs-repository-facade.ts](../../../packages/transport-adapters/src/vcs-repository-facade.ts) | `RepositoryFacade` from a `History` |
+| `Refs` | [history/refs/](../../../packages/core/src/history/refs/) | Core ref storage |
+| `History` | [history/](../../../packages/core/src/history/) | Repository interface |
 
-### Transport Adapters Package (packages/transport-adapters)
+### Related examples
 
-| Interface / Function | Location | Purpose |
-|----------------------|----------|---------|
-| `createVcsRepositoryAccess` | [vcs-repository-access.ts](../../../packages/transport-adapters/src/vcs-repository-access.ts) | Create RepositoryAccess from History |
-| `createVcsRepositoryFacade` | [vcs-repository-facade.ts](../../../packages/transport-adapters/src/vcs-repository-facade.ts) | Create RepositoryFacade from History |
-
-### Core Package (packages/core)
-
-| Interface / Function | Location | Purpose |
-|----------------------|----------|---------|
-| `Refs` | [history/refs/](../../../packages/core/src/history/refs/) | Core ref storage interface |
-| `History` | [history/](../../../packages/core/src/history/) | Main repository interface |
-
----
-
-## Next Steps
-
-- [08-transport-basics](../08-transport-basics/) - HTTP transport operations (ls-remote, clone, fetch)
-- [10-custom-storage](../10-custom-storage/) - Building custom storage backends
-- [WebRTC P2P Sync Demo](../../demos/webrtc-p2p-sync/) - Real-world peer-to-peer synchronization
+- [08-transport-basics](../08-transport-basics/): HTTP transport (ls-remote, clone, fetch)
+- [10-custom-storage](../10-custom-storage/): building storage backends
+- [WebRTC P2P sync demo](../../demos/webrtc-p2p-sync/): peer-to-peer synchronization

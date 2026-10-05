@@ -1,54 +1,131 @@
 # @statewalker/vcs-transport-xet
 
-A Git LFS custom transfer agent: chunk-dedup large-file transfer that stays LFS-interoperable, with a basic-LFS fallback.
+## What it is
 
-## Overview
+A Git LFS custom transfer agent named `xet`. It negotiates over the standard LFS batch API, offering `["xet", "basic"]`. When the server agrees to `xet`, objects move chunk by chunk through `@statewalker/webrun-content-transfer`, so only chunks the receiver is missing are sent. When the server answers `basic`, the whole call falls back to whole-object transfer from `@statewalker/vcs-transport-lfs`. The LFS oid (whole-file SHA-256) is the shared identity on both paths.
 
-`vcs-transport-xet` is the chunk-aware, resumable, deduplicated large-file transfer path of Axis B — exposed as a Git LFS **custom transfer agent** (the "Xet" model). It is a **thin adapter** over two existing pieces: `@statewalker/vcs-transport-lfs` for batch negotiation and the basic whole-object fallback, and `@statewalker/webrun-content-transfer` for the chunk-dedup engine. It negotiates over the standard LFS batch API advertising a `xet` custom transfer alongside `basic`; when the peer agrees it moves only the missing chunks, otherwise it falls back to whole-object basic LFS.
+## Why it exists: dedup without giving up LFS interop
 
-The whole-file SHA-256 (the LFS oid) remains the interop identity either way. It owns no chunking/CDC (`content-store`), no batch/basic internals (`vcs-transport-lfs`), no chunk protocol (`content-transfer`), and no pointers.
+Large files change in small parts, and re-sending whole objects wastes bandwidth. The content-store already splits objects into chunks, and content-transfer already knows how to send only missing chunks and resume. This package wires those two into the LFS batch flow so that a xet-capable peer gets chunk-level dedup and resume, while a plain LFS host still works through the `basic` fallback. It is an adapter: it has no chunking, no batch/basic logic and no chunk protocol of its own.
 
-## Installation
+## How to use: same shape as the LFS client, plus options
 
 ```bash
 pnpm add @statewalker/vcs-transport-xet
 ```
 
-## Quick Start
+No peer dependencies. One entry point, `@statewalker/vcs-transport-xet` (ESM, with type declarations).
+
+| Export | Description |
+|--------|-------------|
+| `serveXet(store, resolver)` | Server `(Request) => Promise<Response>`: answers the batch with `xet` when offered, serves chunk channels at `POST {base}/xet-chunks/<oid>`, and hands all other requests to `serveLfs` |
+| `xetUpload(store, resolver, url, pointers, options?)` | Client upload. Yields `XetTransportEvent`s |
+| `xetDownload(store, resolver, url, pointers, options?)` | Client download. Yields `XetTransportEvent`s |
+| `XET_TRANSFER`, `BASIC_TRANSFER`, `XET_TRANSFERS` | `"xet"`, `"basic"`, and `["xet", "basic"]` |
+| `XetBatchResponse`, `XetBatchObjectResponse`, `XetBatchAction` | Batch shapes; a xet action adds `objectId` (the server's content-store id) to the LFS `{ href, header? }` |
+| `XetOptions`, `XetTransportEvent`, `HashContent`, `LfsPointer`, `TransportEvent`, `FetchLike` | Types |
+
+`store` is a `ContentStore` from `@statewalker/webrun-content-store`. `resolver` is an `LfsResolver` from `@statewalker/vcs-transport-lfs` (import that type from there; it is not re-exported here).
+
+`XetOptions` (all optional):
+
+- `fetchImpl`: `(Request) => Response | Promise<Response>`, default global `fetch`. A `serveXet` handler can be passed directly for an in-process loopback.
+- `hashContent`: chunk-integrity hasher passed to content-transfer.
+- `checkpoint`: a `TransferCheckpoint` to resume from.
+- `limits`: `TransferLimits` for the transfer pipeline.
+
+The last three apply on the xet path only.
+
+`XetTransportEvent` is the LFS `TransportEvent` (`batch`, `object-uploaded`, `object-downloaded`, `error`) plus `{ type: "chunk-sent", oid, chunkId, size }`.
+
+## Examples
+
+### Upload and download with chunk dedup
 
 ```typescript
 import { serveXet, xetDownload, xetUpload } from "@statewalker/vcs-transport-xet";
 
-// Server advertises `xet` (and `basic`) in the LFS batch, and serves chunk negotiation.
 const handler = serveXet(serverStore, serverResolver);
+const pointer = { oid, size }; // oid = whole-file SHA-256 hex
 
-const ptr = { oid: /* whole-file sha256 hex */ oid, size: bytes.length };
-
-// Upload against a xet-capable server sends only the chunks the server is missing.
-for await (const event of xetUpload(clientStore, clientResolver, "http://xet.host", [ptr], {
+for await (const e of xetUpload(clientStore, clientResolver, "http://xet.host", [pointer], {
   fetchImpl: handler,
-  hashContent: csHash, // chunk-integrity hasher, forwarded to content-transfer
+  hashContent,
 })) {
-  if (event.type === "chunk-sent") console.log("chunk", event.chunkId);
-  if (event.type === "object-uploaded") console.log("uploaded", event.oid);
+  if (e.type === "chunk-sent") console.log("chunk", e.chunkId, e.size);
+  if (e.type === "error") console.error(e.oid, e.reason);
 }
 
-// Against a basic-only peer, the same call transparently falls back to whole-object LFS.
-await drain(xetDownload(localStore, localResolver, "http://xet.host", [ptr], { fetchImpl: handler }));
+for await (const e of xetDownload(otherStore, otherResolver, "http://xet.host", [pointer], {
+  fetchImpl: handler,
+  hashContent,
+})) {
+  if (e.type === "object-downloaded") console.log("downloaded", e.oid);
+}
 ```
 
-## API
+Store and resolver setup is the same as for `@statewalker/vcs-transport-lfs`.
 
-- **`serveXet(store, resolver): HttpHandler`** — server: advertises `xet` in the LFS batch and serves the chunk-dedup negotiation, reusing `serveLfs` for basic.
-- **`xetUpload(store, resolver, url, oids, opts?): AsyncIterable<XetTransportEvent>`** — upload via chunk dedup when the peer speaks `xet`, else basic LFS.
-- **`xetDownload(store, resolver, url, oids, opts?): AsyncIterable<XetTransportEvent>`** — the download counterpart.
-- Transfer constants + shapes: `XET_TRANSFER`, `BASIC_TRANSFER`, `XET_TRANSFERS`, `XetBatchResponse` / `XetBatchObjectResponse` / `XetBatchAction`.
+### Fallback to a basic-only host
 
-`XetOptions` (all optional, forwarded to `content-transfer` on the xet path, ignored on the basic path): `fetchImpl` (defaults to global `fetch`), `hashContent`, `checkpoint` (`TransferCheckpoint`), `limits` (`TransferLimits`). Re-exports `LfsPointer`, `LfsResolver`-facing types, `TransportEvent`, `XetTransportEvent`, `ChunkId`, `ObjectId`.
+No code change. If the server's batch response has `transfer: "basic"`, `xetUpload` and `xetDownload` delegate to `lfsUpload` and `lfsDownload` and yield their events.
 
-## Notes
+## Internals
 
-- **Thin adapter.** It composes `vcs-transport-lfs` (batch + basic) with `content-transfer` (chunks); it holds no engine of its own.
-- **Negotiate then route.** When `transfer: xet` is agreed, bytes go through `content-transfer` over a chunk channel bridged onto the HTTP surface (dedup + resumable); otherwise it defers to basic LFS. The `chunk-sent` events let a caller build a resume checkpoint.
-- **LFS-interoperable.** The whole-file SHA-256 oid is the shared identity, so a xet client and a basic host still exchange the right object.
-- Built red/green TDD (dedup / fallback / interop / resume suites).
+### How one object moves on the xet path
+
+```
+client                                   server (serveXet)
+  POST /objects/batch {transfers:[xet,basic]}  -->  {transfer:"xet", actions:{download:{href, objectId}}}
+  transfer([objectId], remote, local)
+    each request frame = one POST /xet-chunks/<oid>  -->  content-transfer serveStore(store)
+  read whole object, check sha256 == oid
+  resolver.record(oid, objectId)
+```
+
+Each content-transfer call is one complete request followed by one reply, so the chunk channel maps each call to a single HTTP `POST`: the request body is the outgoing frame, the response body is the reply. Frames are buffered per call (at most one chunk), so no streaming request body is needed.
+
+### Why the content-store id travels in the batch
+
+content-transfer addresses objects by content-store id, not by LFS oid. On download the server puts its content-store id in the action's `objectId`, and the client transfers that id. The downloaded object is stored under the same id, so both sides must use the same content-store hashing for the ids to agree.
+
+### Why the whole object is hashed after a chunk download
+
+Chunks are verified one by one by content-transfer, but the LFS oid covers the whole file. After a xet download the client reads the assembled object, checks its SHA-256 against the oid, and removes it from the store on mismatch. Only then does it record the oid mapping.
+
+### Constraints
+
+- On a xet upload the server records `oid -> content-store id` when the object is assembled. It does not re-check the whole-file SHA-256 against the oid, unlike the basic `PUT` path.
+- The server always offers an upload action for every object in an upload batch.
+- As in `@statewalker/vcs-transport-lfs`, the client does not check the batch `POST` status before parsing the body.
+- `checkpoint` object ids are content-store ids, not LFS oids.
+
+### What failures look like
+
+Per-object failures are yielded as `{ type: "error", oid, reason }`, never thrown:
+
+- `no local object for oid` (upload: resolver has no mapping)
+- `no download action` (download: the action or its `objectId` is missing)
+- `Object does not exist` (download batch for an oid the server does not know)
+- `sha256 mismatch` (assembled object does not hash to the oid; the object is removed)
+- any error message thrown by content-transfer during the chunk exchange
+
+On the basic fallback path the reasons are those of `@statewalker/vcs-transport-lfs`.
+
+### Dependencies
+
+- `@statewalker/vcs-transport-lfs`: batch types, `serveLfs`, the basic fallback client, `sha256Hex`.
+- `@statewalker/webrun-content-transfer`: `transfer`, `remoteStore`, `serveStore` (chunk dedup and resume).
+- `@statewalker/webrun-content-store`: the `ContentStore` and id types.
+- `@statewalker/webrun-streams`: the `Duplex` type of the chunk channel.
+- `@statewalker/webrun-http-streams`: the `HttpHandler` type returned by `serveXet`.
+
+### Commands
+
+```bash
+pnpm --filter @statewalker/vcs-transport-xet test
+```
+
+## License
+
+MIT

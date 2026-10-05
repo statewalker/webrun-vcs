@@ -72,8 +72,8 @@ List the learning outcomes or goals as bullet points.
 ```markdown
 ## Prerequisites
 
-- Node.js 18+
-- pnpm
+- Node.js 24
+- pnpm (via corepack)
 - [Any prior examples that should be completed first]
 ```
 

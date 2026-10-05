@@ -19,12 +19,22 @@ interface MessagePortLike {
   /** Start receiving messages (required by MessagePort spec) */
   start(): void;
 
-  /** Add event listener for message events */
-  addEventListener(type: "message", listener: (event: MessageEvent<ArrayBuffer>) => void): void;
+  /** Add event listener ("message", "close" or "error") */
+  addEventListener<T extends MessagePortEventType>(
+    type: T,
+    listener: MessagePortEventListener<T>,
+  ): void;
 
   /** Remove event listener */
-  removeEventListener(type: "message", listener: (event: MessageEvent<ArrayBuffer>) => void): void;
+  removeEventListener<T extends MessagePortEventType>(
+    type: T,
+    listener: MessagePortEventListener<T>,
+  ): void;
 }
+
+type MessagePortEventType = "message" | "close" | "error";
+// "message" listeners receive MessageEvent<ArrayBuffer>, "error" listeners an Error,
+// "close" listeners no arguments.
 ```
 
 ### writeStream / readStream
@@ -38,13 +48,15 @@ async function writeStream(
   options?: PortStreamOptions
 ): Promise<void>;
 
-function readStream(port: MessagePortLike): AsyncIterable<Uint8Array>;
+function readStream(port: MessagePortLike): AsyncGenerator<Uint8Array>;
 
 interface PortStreamOptions {
   /** Byte threshold for sub-stream splitting (default: 64KB) */
   chunkSize?: number;
   /** Timeout for ACK response in milliseconds (default: 5000) */
   ackTimeout?: number;
+  /** Abort signal to cancel ACK waits during graceful close */
+  signal?: AbortSignal;
 }
 ```
 
@@ -77,9 +89,11 @@ Factory for creating ACK wait functions:
 ```typescript
 function createAwaitAckFunction(
   port: MessagePortLike,
-  options?: { ackTimeout?: number }
+  options?: { ackTimeout?: number; signal?: AbortSignal }
 ): () => Promise<void>;
 ```
+
+If no ACK arrives within `ackTimeout`, the returned promise rejects with `Timeout waiting for acknowledgement`. A "close" event on the port, or an aborted `signal`, resolves the pending wait instead.
 
 ### sendWithAcknowledgement
 
@@ -168,16 +182,12 @@ Sender                                    Receiver
   │  │ DATA [id=N+1] [payload]│─────────────►│
   │  └────────────────────────┘             │
   │              ...                         │
-  │  ┌────────────────────────┐             │
-  │  │ REQUEST_ACK [id=K]     │─────────────►│  (final ACK)
-  │  └────────────────────────┘             │
-  │             ┌──────────────────┐        │
-  │◄────────────│ ACKNOWLEDGE [id=K]│        │
-  │             └──────────────────┘        │
   │  ┌──────────────┐                       │
   │  │ END [id=M]   │───────────────────────►│
   │  └──────────────┘                       │
 ```
+
+There is no ACK after the last sub-stream: END follows the last DATA message directly, and the receiver processes all queued DATA before it sees END.
 
 ### Key Properties
 
@@ -193,7 +203,7 @@ Sender                                    Receiver
 ### Basic Send/Receive
 
 ```typescript
-import { writeStream, readStream, wrapNativePort } from "@statewalker/vcs-utils";
+import { writeStream, readStream, wrapNativePort } from "@statewalker/vcs-utils/streams";
 
 // Create channel
 const channel = new MessageChannel();
@@ -219,7 +229,7 @@ await sendPromise;
 ### Using PortStream Interface
 
 ```typescript
-import { createPortStream, wrapNativePort } from "@statewalker/vcs-utils";
+import { createPortStream, wrapNativePort } from "@statewalker/vcs-utils/streams";
 
 const channel = new MessageChannel();
 const stream1 = createPortStream(wrapNativePort(channel.port1));
@@ -256,7 +266,7 @@ await stream.send(generateLargeData());
 import {
   createAwaitAckFunction,
   sendWithAcknowledgement
-} from "@statewalker/vcs-utils";
+} from "@statewalker/vcs-utils/streams";
 
 // Create ACK function
 const awaitAck = createAwaitAckFunction(port, { ackTimeout: 5000 });

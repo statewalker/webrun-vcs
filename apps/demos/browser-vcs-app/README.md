@@ -1,137 +1,116 @@
 # Browser VCS App
 
-A browser-based Git application demonstrating WebRun VCS with swappable storage backends.
+## What it is
 
-## Quick Start
+A single-page Vite app that runs Git operations in the browser with `@statewalker/vcs-commands`, over one of two file backends: an in-memory `FilesApi` or a folder the user picks through the File System Access API. It can initialize a repository, write files, stage them, commit, and show the last ten commits. There is no backend server.
 
-```bash
-pnpm dev
-```
-
-Then open http://localhost:5173 in your browser.
-
-## Features
-
-### Storage Backends
-
-Toggle between two storage options:
-
-1. **In-Memory** - Fast, ephemeral storage that resets on page refresh
-2. **Browser Filesystem** - Persistent storage using the File System Access API
-
-### Git Operations
-
-- Initialize a new repository
-- Add files to staging
-- Create commits
-- View commit history
-
-## Browser Compatibility
-
-### File System Access API Support
-
-| Browser | Supported |
-|---------|-----------|
-| Chrome 86+ | Yes |
-| Edge 86+ | Yes |
-| Opera 72+ | Yes |
-| Firefox | No (uses in-memory fallback) |
-| Safari | No (uses in-memory fallback) |
-
-### Fallback Behavior
-
-In browsers without File System Access API support:
-- The "Browser Filesystem" button is disabled
-- Only in-memory storage is available
-- All functionality works, but data is lost on refresh
-
-## Architecture
+## Layout
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Browser VCS Application                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                    @statewalker/vcs-core                    │ │
-│  │                    @statewalker/vcs-commands                │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│                              ↓                                   │
-│                    FilesApi Interface                            │
-│                    (@statewalker/webrun-files)                   │
-│                              ↓                                   │
-│  ┌──────────────────────┬──────────────────────────────────────┐│
-│  │                      │                                       ││
-│  │  webrun-files-mem    │     File System Access API            ││
-│  │  (In-Memory)         │     (Browser Native)                  ││
-│  │                      │                                       ││
-│  │  - Quick testing     │     - Persistent storage              ││
-│  │  - No permission     │     - User picks directory            ││
-│  │  - Lost on refresh   │     - Survives refresh                ││
-│  │                      │     - Works with local files          ││
-│  └──────────────────────┴──────────────────────────────────────┘│
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+index.html               page markup (storage buttons, file form, trees, history, log)
+src/
+  main.ts                checks File System Access API support, calls createApp()
+  app.ts                 UI wiring and all Git calls
+  storage.ts             createMemoryStorage(), createBrowserFsStorage(), listAllFiles(), hasGitDirectory()
+  styles.css
+tests/
+  browser-vcs-app.spec.ts  Playwright tests (in-memory, and browser FS with a mocked directory handle)
 ```
 
-## Key Concepts Demonstrated
+```
+            app.ts  ── Git.init().setFilesApi(files).setWorktree(true) ──> git, workingCopy, repository
+               │
+          FilesApi (@statewalker/webrun-files)
+       ┌───────┴─────────────────────────┐
+  MemFilesApi                       BrowserFilesApi({ rootHandle })
+  (@statewalker/webrun-files-mem)   (@statewalker/webrun-files-browser, showDirectoryPicker())
+```
 
-### Storage Abstraction
+## How to run it
+
+1. `pnpm install && pnpm build` at the repository root (Node 24); the `@statewalker/vcs-*` packages resolve to their built `dist/`.
+2. Start the dev server:
+
+   ```bash
+   pnpm --filter @statewalker/vcs-demo-browser-app dev
+   ```
+
+3. Open the URL Vite prints (`http://localhost:5173` by default).
+4. Choose **In-Memory** or **Browser Filesystem**, click **Initialize Repository**, add a file (name and content), enter a commit message, and commit.
+
+## How the app uses the library
+
+### Choosing a file backend
 
 ```typescript
-import type { FilesApi } from "@statewalker/webrun-files";
-import { createFilesApi as createMemoryFiles } from "@statewalker/webrun-files-mem";
+import { BrowserFilesApi } from "@statewalker/webrun-files-browser";
+import { MemFilesApi } from "@statewalker/webrun-files-mem";
 
-// In-memory storage
-const memoryFiles = createMemoryFiles();
+const memoryFiles = new MemFilesApi();
 
-// Browser filesystem (File System Access API)
-const dirHandle = await window.showDirectoryPicker();
-const browserFiles = await createBrowserFilesApi(dirHandle);
+const rootHandle = await window.showDirectoryPicker();
+const browserFiles = new BrowserFilesApi({ rootHandle });
 ```
 
-### Repository Creation
+### Creating the repository
 
 ```typescript
-import { createGitRepository } from "@statewalker/vcs-core";
-import { createGitStore, Git } from "@statewalker/vcs-commands";
+import { Git } from "@statewalker/vcs-commands";
+import { FileStagingStore } from "@statewalker/vcs-store-files";
 
-const repository = await createGitRepository(files, ".git", {
-  create: true,
-  defaultBranch: "main",
-});
+const init = Git.init()
+  .setFilesApi(files)
+  .setGitDir(".git")
+  .setInitialBranch("main")
+  .setWorktree(true);
 
-const store = createGitStore({ repository, staging });
-const git = Git.wrap(store);
+// Browser folder only: keep the index in .git/index in Git's binary format.
+const staging = new FileStagingStore(files, ".git/index");
+init.setStagingStore(staging);
+
+const { git, workingCopy, repository } = await init.call();
 ```
 
-### Git Operations
+### Adding and committing
 
 ```typescript
-// Add file
-const objectId = await store.blobs.store([data]);
-const editor = store.staging.editor();
-editor.add({ path, apply: () => ({ path, mode, objectId, stage, size, mtime }) });
-await editor.finish();
+await files.write(fileName, [new TextEncoder().encode(content)]);
+await git.add().addFilepattern(fileName).call();
+await staging.write(); // browser folder only
 
-// Commit
-const commit = await git.commit().setMessage("Add files").call();
-const commitId = await store.commits.storeCommit(commit);
+const commit = await git.commit().setMessage(message).call();
+console.log(commit.id);
 ```
 
-## Development
+History is read with `repository.commits.walkAncestry(headId, { limit: 10 })` and `repository.commits.load(id)`.
 
-```bash
-# Start development server
-pnpm dev
+## Why it is the way it is
 
-# Build for production
-pnpm build
+- **One `FilesApi`, two backends.** All file access goes through the `FilesApi` interface, so switching between memory and a real folder changes one constructor call and nothing in the Git code.
+- **`FileStagingStore` only for the folder backend.** In a real folder the index is written to `.git/index` after each add and commit (re-read from the committed tree), so the staging state survives a reload and is visible to tools that read the index. In memory the default staging store is enough.
+- **Porcelain commands.** Add and commit go through `git.add()` and `git.commit()` rather than editing the index and storing objects by hand.
 
-# Preview production build
-pnpm preview
-```
+## What will surprise you
 
-## No Server Required
+- **Commits are not saved to the chosen folder.** `Git.init()` always creates an in-memory history; `setFilesApi()` only backs the working tree. Your files and `.git/index` land on disk, but objects and refs do not. After a reload, **Open Repository** on a folder with `.git` starts an empty history again (the button label changes, the log says `Opened existing repository`, and the history shows `No commits yet`).
+- **Browser Filesystem needs the File System Access API.** Chrome, Edge and Opera have it. In Firefox and Safari the page shows `Not Supported (in-memory only)` and the button is disabled. Calling it anyway fails with `File System Access API is not supported in this browser`.
+- **In-memory data is gone on reload or when switching backends.** Switching storage closes the current history.
+- **Errors appear in the activity log, not as exceptions,** for example `No repository initialized`, `Please enter a file name`, `Please enter a commit message`, `No files staged for commit`, `Failed to create commit: <reason>`.
+- **`test:app` starts its own dev server** on port 5173 (`pnpm dev`) and reuses one already running there outside CI. The browser-filesystem tests run against a mocked `showDirectoryPicker()`, not a real folder.
 
-This application runs entirely in the browser. No backend server is needed. Git operations are performed locally using the VCS library compiled to JavaScript.
+## Reference
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `pnpm --filter @statewalker/vcs-demo-browser-app dev` | Vite dev server |
+| `pnpm --filter @statewalker/vcs-demo-browser-app build` | Production build to `dist/` |
+| `pnpm --filter @statewalker/vcs-demo-browser-app preview` | Serve the production build |
+| `pnpm --filter @statewalker/vcs-demo-browser-app test:app` | Playwright tests (Chromium) |
+| `pnpm --filter @statewalker/vcs-demo-browser-app test:ui` | Playwright UI mode |
+| `pnpm --filter @statewalker/vcs-demo-browser-app typecheck` | `tsc --noEmit` |
+
+### Dependencies
+
+`@statewalker/vcs-commands` (`Git`), `@statewalker/vcs-core` (types, `FileMode`), `@statewalker/vcs-store-files` (`FileStagingStore`), `@statewalker/vcs-working-tree` (types), `@statewalker/webrun-files`, `@statewalker/webrun-files-mem`, `@statewalker/webrun-files-browser`. `@statewalker/vcs-store-mem` is declared but not imported.

@@ -282,7 +282,7 @@ controller.handleAddFile("test.txt", "content");
 The application uses the Git porcelain API from `@statewalker/vcs-commands`:
 
 ```typescript
-const git = Git.wrap(store);
+// git: a Git built by Git.fromWorkingCopy(workingCopy), see below
 
 // Repository operations
 await git.add().addFilepattern("file.txt").call();
@@ -292,30 +292,17 @@ await git.log().call();  // Returns commit history
 await git.status().call();  // Returns staged/unstaged/untracked
 ```
 
-### Git Store Initialization
+### Git Initialization
 
-```typescript
-// 1. Virtual filesystem
-const files = createInMemoryFilesApi();
+`src/controllers/git-infrastructure.ts` builds the repository in one of two ways:
 
-// 2. Git repository (object store)
-const repository = await createGitRepository(files, ".git", {
-  create: true,
-  defaultBranch: "main",
-});
+- `initializeGitInMemory(ctx)`: `createMemoryHistory()`, `createMemoryGitStaging()` and an
+  in-memory checkout and worktree, combined into a `WorkingCopy`.
+- `initializeGitFromFiles(ctx, files)`: a Git `.git` layout over a `FilesApi`, using
+  `createGitObjectStore` over `FileRawStorage`, `createFileRefStore`, `createHistoryFromComponents`,
+  `createGitStaging` and `FileWorktree` from `@statewalker/vcs-store-files`.
 
-// 3. Staging area (index)
-const staging = new FileStagingStore(files, ".git/index");
-
-// 4. Working tree iterator
-const worktree = createFileTreeIterator({ files, rootPath: "", gitDir: ".git" });
-
-// 5. Combined Git store
-const store = createGitStore({ repository, staging, worktree, files });
-
-// 6. Porcelain API
-const git = Git.wrap(store);
-```
+Both end with `Git.fromWorkingCopy(workingCopy)` from `@statewalker/vcs-commands`.
 
 ### P2P Transport
 

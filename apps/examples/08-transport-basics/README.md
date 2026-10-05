@@ -1,39 +1,45 @@
 # 08-transport-basics
 
-This example demonstrates Git HTTP smart protocol transport operations -- listing remote refs, verifying repository access, cloning, and fetching incremental updates from a remote server like GitHub.
+A runnable example of the Git smart-HTTP client in `@statewalker/vcs-transport`. It lists the refs of a public GitHub repository, checks whether a repository is reachable, and calls `clone()` and `fetch()` against it. It needs network access: every operation talks to `https://github.com/octocat/Hello-World.git`, and one deliberately asks for a repository that does not exist. Results are printed only; nothing is written to disk.
 
-## Quick Start
+## One file, five operations against one remote
+
+```
+apps/examples/08-transport-basics/
+├── package.json
+├── tsconfig.json
+└── src/
+    └── main.ts      # checkRemote, ls-remote, ref listing, clone, fetch
+```
+
+```
+  main.ts ── HTTPS ──▶ github.com/octocat/Hello-World.git
+     │                   GET  /info/refs?service=git-upload-pack   (lsRemote, clone, fetch)
+     │                   POST /git-upload-pack                      (clone, fetch)
+     ▼
+  stdout (ref lists, pack size, byte counts)
+```
+
+Each operation runs inside `runStep()`, which catches its error, prints it, and moves on to the next.
+
+## How to run it
+
+Requires Node 24, pnpm, and outbound HTTPS to github.com. From the repository root:
 
 ```bash
-# From the monorepo root
 pnpm install
 pnpm --filter @statewalker/vcs-example-08-transport-basics start
 ```
 
-## What You'll Learn
+There are no `step:NN` scripts; `start` runs all five operations in order.
 
-- List remote refs without downloading objects (`lsRemote`)
-- Verify whether a remote repository is accessible (`checkRemote`)
-- Retrieve the full ref advertisement including capabilities and symbolic refs (`fetchRefs`)
-- Clone a complete repository with progress reporting (`clone`)
-- Fetch incremental updates using refspecs (`fetch`)
+## The walk-through
 
-## Prerequisites
+All code is in [src/main.ts](src/main.ts).
 
-- Node.js 18+
-- pnpm
-- Network access (the example connects to GitHub)
-- Completed [01-quick-start](../01-quick-start/) for foundational concepts
+### `lsRemote()` returns ref names and ids without downloading objects
 
----
-
-## Step-by-Step Guide
-
-**File:** [src/main.ts](src/main.ts)
-
-### Listing Remote Refs
-
-The `lsRemote` function connects to a remote and retrieves all refs without downloading any objects. This is useful for checking which branches and tags exist before deciding what to fetch.
+`lsRemote()` requests the ref advertisement (`/info/refs?service=git-upload-pack`) and returns a `Map` from ref name to hex object id. The example uses it three times: to check access, to print refs grouped into branches, tags and other refs, and to print the full list.
 
 ```typescript
 import { lsRemote } from "@statewalker/vcs-transport";
@@ -48,223 +54,175 @@ for (const [name, id] of refs) {
 }
 ```
 
-The returned `Map<string, string>` maps ref names (like `refs/heads/master`) to their object ID hex strings.
+Output of the run (GitHub advertises every pull request as `refs/pull/<n>/head` and `refs/pull/<n>/merge`, so the list is long):
 
-**Key APIs:**
-- `lsRemote(url, options?)` - Returns a map of ref names to object IDs
-- `LsRemoteOptions` - Authentication, headers, and timeout settings
+```
+Found 3732 refs:
 
----
+Branches:
+  master                         7fd1a60b
+  octocat-patch-1                b1b3f972
+  test                           b3cbd5bb
 
-### Checking Remote Accessibility
-
-Before performing expensive operations, `checkRemote` verifies whether a repository exists and is reachable. It also reports whether the repository is empty and what the default branch is.
-
-```typescript
-import { checkRemote } from "@statewalker/vcs-transport";
-
-const publicResult = await checkRemote(REPO_URL);
-console.log(`Exists: ${publicResult.exists}`);
-console.log(`Empty: ${publicResult.isEmpty}`);
-console.log(`Default branch: ${publicResult.defaultBranch || "unknown"}`);
-
-const notFoundResult = await checkRemote(
-  "https://github.com/nonexistent-user-12345/nonexistent-repo.git",
-);
-console.log(`Exists: ${notFoundResult.exists}`);
-console.log(`Error: ${notFoundResult.error || "none"}`);
+Other:
+  HEAD                           015b7fd1
+  refs/pull/1/head               7044a8a0
+  ...
 ```
 
+The `HEAD` id in this output is wrong; see "What will surprise you".
+
 **Key APIs:**
-- `checkRemote(url)` - Returns existence, emptiness, and default branch info
+- `lsRemote(url, options?)` - `Promise<Map<string, string>>`
+- `LsRemoteOptions` - `auth` (`{ username, password }`, sent as Basic auth), `headers`, `timeout` (ms), `fetchImpl`
 
----
+### Checking access is `lsRemote()` in a `try`
 
-### Fetching the Full Ref Advertisement
-
-Where `lsRemote` returns only ref names and IDs, `fetchRefs` gives you the complete ref advertisement -- including server capabilities, agent string, and symbolic ref mappings (like `HEAD -> refs/heads/master`).
+There is no separate check call: a successful `lsRemote()` means the remote exists and is readable, and an empty map means it has no refs. The example also asks for a repository that does not exist, to show the failure.
 
 ```typescript
-import { fetchRefs } from "@statewalker/vcs-transport";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-
-const advertisement = await fetchRefs(REPO_URL);
-
-console.log(`Capabilities: ${[...advertisement.capabilities].join(", ")}`);
-console.log(`Agent: ${advertisement.agent || "unknown"}`);
-
-for (const [name, target] of advertisement.symrefs) {
-  console.log(`  ${name} -> ${target}`);
-}
-
-for (const [name, id] of advertisement.refs) {
-  console.log(`  ${name.padEnd(40)} ${bytesToHex(id).slice(0, 8)}`);
+try {
+  const refs = await lsRemote(REPO_URL);
+  console.log(`Accessible: true, empty: ${refs.size === 0}`);
+} catch (error) {
+  console.log(`Accessible: false`);
+  console.log(`Error: ${error instanceof Error ? error.message : error}`);
 }
 ```
 
-**Key APIs:**
-- `fetchRefs(url)` - Returns capabilities, symbolic refs, agent, and full ref map
+Output of the run:
 
----
+```
+Checking: https://github.com/nonexistent-user-12345/nonexistent-repo.git
+  Accessible: false
+  Error: HTTP error 401: Unauthorized
+```
 
-### Cloning a Repository
+### `clone()` asks for every advertised ref with no local objects
 
-Clone fetches all objects and refs from a remote repository. The `onProgress` callback reports counting and compression stages, while `onProgressMessage` passes through raw server messages.
+`clone()` is a fetch with nothing to negotiate: no `localHas`, no `localCommits`, and all refs unless `branch` is set. It returns the raw pack and the refs; it does not store anything. Importing the pack into an object store is up to the caller.
 
 ```typescript
 import { clone } from "@statewalker/vcs-transport";
+import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 const result = await clone({
   url: REPO_URL,
   onProgress: (info) => {
-    const percent = info.total
-      ? Math.round((info.current / info.total) * 100)
-      : undefined;
-    const percentStr = percent !== undefined ? ` (${percent}%)` : "";
-    console.log(
-      `  ${info.stage}: ${info.current}${info.total ? `/${info.total}` : ""}${percentStr}`,
-    );
+    const percent = info.total ? Math.round((info.current / info.total) * 100) : undefined;
+    console.log(`  ${info.stage}: ${info.current}${info.total ? `/${info.total}` : ""}`
+      + (percent !== undefined ? ` (${percent}%)` : ""));
   },
   onProgressMessage: (message) => {
-    const trimmed = message.trim();
-    if (trimmed) console.log(`  Server: ${trimmed}`);
+    if (message.trim()) console.log(`  Server: ${message.trim()}`);
   },
 });
 
 console.log(`Default branch: ${result.defaultBranch}`);
 console.log(`Refs fetched: ${result.refs.size}`);
-console.log(`Pack size: ${formatBytes(result.packData.length)}`);
-console.log(`Bytes received: ${formatBytes(result.bytesReceived)}`);
+console.log(`Pack size: ${result.packData.length} bytes`);
+console.log(`Bytes received: ${result.bytesReceived}`);
+for (const [name, id] of result.refs) {
+  console.log(`  ${name} ${bytesToHex(id).slice(0, 8)}`);
+}
 ```
 
-The result contains the raw pack data, all fetched refs, the default branch name, and transfer statistics. You can then feed the pack data into a pack parser to import objects into a local store.
+Output of the run:
+
+```
+Clone complete:
+  Default branch: refs/heads/master
+  Refs fetched: 3732
+  Pack size: 0 B
+  Bytes received: 8 B
+  Empty: false
+```
 
 **Key APIs:**
-- `clone(options)` - Full repository download with progress reporting
-- `CloneOptions` - URL, branch, depth, progress callbacks
-- `CloneResult` - Pack data, refs, default branch, byte counts
+- `clone(options)` - `Promise<CloneResult>`
+- `CloneOptions` - `url`, `auth`, `headers`, `timeout`, `fetchImpl`, `branch`, `depth`, `onProgress`, `onProgressMessage` (`bare` and `remoteName` are declared but `clone()` does not use them)
+- `CloneResult` - `refs` (`Map<string, Uint8Array>`), `packData`, `defaultBranch`, `bytesReceived`, `isEmpty`
 
----
+### `fetch()` takes refspecs and negotiation callbacks
 
-### Fetching Incremental Updates
-
-Once you have an initial clone, `fetch` downloads only new objects. Refspecs control which remote refs map to which local refs. The `localHas` callback lets the server know which objects to skip.
+`fetch()` adds refspecs and two callbacks for negotiation: `localHas(id)` and `localCommits()`, which let the client tell the server what it already has. The example passes no callbacks, so the request is the same as a clone.
 
 ```typescript
 import { fetch } from "@statewalker/vcs-transport";
 
 const result = await fetch({
   url: REPO_URL,
-  refspecs: [
-    "+refs/heads/*:refs/remotes/origin/*",
-    "+refs/tags/*:refs/tags/*",
-  ],
-  onProgress: (info) => {
-    const percent = info.total
-      ? Math.round((info.current / info.total) * 100)
-      : undefined;
-    const percentStr = percent !== undefined ? ` (${percent}%)` : "";
-    console.log(
-      `  ${info.stage}: ${info.current}${info.total ? `/${info.total}` : ""}${percentStr}`,
-    );
-  },
+  refspecs: ["+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"],
+  onProgress: (info) => console.log(`  ${info.stage}: ${info.current}`),
 });
 
-console.log(`Default branch: ${result.defaultBranch || "unknown"}`);
 console.log(`Refs updated: ${result.refs.size}`);
-console.log(`Pack size: ${formatBytes(result.packData.length)}`);
+console.log(`Pack size: ${result.packData.length} bytes`);
 ```
+
+Note that `fetch` here is the transport function, not the global `fetch`; importing it shadows the global in this module.
 
 **Key APIs:**
-- `fetch(options)` - Incremental update with negotiation
-- `FetchOptions` - Refspecs, `localHas`, `localCommits` for negotiation
-- `RawFetchResult` - Pack data, refs, default branch, transfer stats
+- `fetch(options)` - `Promise<HttpFetchResult>`, same fields as `CloneResult`
+- `FetchOptions` - `url`, `auth`, `headers`, `timeout`, `fetchImpl`, `refspecs`, `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage`
+- Refspec format: `[+]<src>:<dst>`, `+` allows non-fast-forward updates
 
----
+## How the smart-HTTP exchange works
 
-## Key Concepts
+The client speaks the Git smart-HTTP protocol to the server's upload-pack service:
 
-### Git HTTP Smart Protocol
+1. `GET <url>/info/refs?service=git-upload-pack` returns the ref advertisement: a `# service=` line, then one pkt-line per ref (`<oid> <name>`), with the server capabilities after a NUL byte on the first ref line. Every pkt-line starts with a 4-character hex length; `0000` is a flush packet.
+2. `POST <url>/git-upload-pack` sends `want` lines for the refs to fetch and `have` lines for objects the client has, and receives a pack, multiplexed with progress messages on side-band channels.
 
-The transport layer implements the Git HTTP smart protocol for communicating with remote Git servers like GitHub, GitLab, and self-hosted instances. Two services are available: **upload-pack** for fetch and clone operations (downloading from remote), and **receive-pack** for push operations (uploading to remote). The protocol uses pkt-line framing -- each line is prefixed with a 4-character hex length -- and a special flush packet (`0000`) to mark boundaries.
+`lsRemote()` performs only step 1. `clone()` and `fetch()` perform both.
 
-### Ref Advertisement
+## Why it is the way it is
 
-When connecting to a remote, the server sends a "ref advertisement" containing all refs (branches, tags) and their commit IDs, the server's capabilities (features it supports), and symbolic refs (like HEAD pointing to the default branch). This advertisement is the starting point for every transport operation -- `lsRemote` parses the refs, `fetchRefs` extracts the full advertisement, and `clone`/`fetch` use it to negotiate which objects need transferring.
+- **A real public repository.** `octocat/Hello-World` is small, public and stable, so the example needs no credentials and no local server.
+- **Failures do not stop the run.** Each operation is wrapped in `runStep()`, and the process exits 0 even when operations fail, so an offline run still shows how far each operation gets.
+- **No local storage.** The example stops at the transport boundary: refs and raw pack bytes. Storing them is a separate concern, handled by the object stores in other packages.
 
-### Pack Files
+## What will surprise you
 
-Git transfers objects in pack format, a highly compressed binary format that groups related objects together, uses delta compression to reduce size, and includes a SHA-1 checksum for integrity. When cloning or fetching, the server sends a single pack file containing all requested objects. The `packData` field in clone and fetch results contains this raw pack data for import into your local object store.
+- **No network, no results.** Offline, every operation prints `[!] <name> failed: <message>` followed by `(This may be a network or transport layer issue)`, the run ends with `Example finished with 0/5 operations successful.`, and the exit code is still 0. Behind a proxy, `globalThis.fetch` must be able to reach github.com.
+- **A missing repository looks like an auth failure.** GitHub answers 401 for repositories that do not exist, so `lsRemote()` throws `HTTP error 401: Unauthorized`, not 404. Other HTTP failures throw `HTTP error <status>: <statusText>`; a `timeout` throws `Request timeout`.
+- **The output is about 15,000 lines.** The 3732 refs (mostly `refs/pull/*`) are printed four times: grouped, in full, after clone and after fetch.
+- **`lsRemote()` reports a wrong id for `HEAD`.** The run prints `HEAD 015b7fd1` while `refs/heads/master` is `7fd1a60b`, and `clone()` reports `HEAD 7fd1a60b`. The advertisement parser misreads the first ref line when the flush packet after the service line is not followed by a newline: it strips the `0000` and keeps the next pkt-line's length prefix (`015b`) as the start of the id.
+- **Clone and fetch report success with an empty pack.** Against GitHub both return `Pack size: 0 B` and `Bytes received: 8 B`, while the run ends with `Example complete! All transport operations succeeded.` Check `packData.length`, not only the absence of an exception.
+- **The progress callbacks never fire.** The client sends the `no-progress` capability in its first `want` line, so the server sends no progress messages and `onProgress` / `onProgressMessage` print nothing.
+- **Refspecs do not filter the returned refs.** With refspecs for `refs/heads/*` and `refs/tags/*`, `fetch()` still returns all 3732 refs under their remote names (`refs/heads/master`, `refs/pull/...`), not mapped to `refs/remotes/origin/*`.
+- **The banner mentions push.** The banner reads "Clone, fetch, and push operations", but the example does not push.
 
-### Refspecs
+## Reference
 
-Refspecs define how remote refs map to local refs. The format is `[+]<src>:<dst>` where `+` means force update (allow non-fast-forward). Common patterns include `+refs/heads/*:refs/remotes/origin/*` to track remote branches under a remote prefix, `+refs/tags/*:refs/tags/*` to mirror tags locally, and `refs/heads/main:refs/heads/main` for single-branch mapping.
+### Commands
 
----
+| Command | What it runs |
+|---------|--------------|
+| `pnpm --filter @statewalker/vcs-example-08-transport-basics start` | `tsx src/main.ts` |
+| `pnpm --filter @statewalker/vcs-example-08-transport-basics typecheck` | `tsc --noEmit` |
 
-## Project Structure
+### Network
 
-```
-apps/examples/08-transport-basics/
-├── package.json
-├── tsconfig.json
-├── README.md
-└── src/
-    └── main.ts           # All transport operations in one file
-```
+| Request | Purpose |
+|---------|---------|
+| `https://github.com/octocat/Hello-World.git` | target of every operation |
+| `https://github.com/nonexistent-user-12345/nonexistent-repo.git` | the failing access check |
 
----
+### Source of the APIs used
 
-## Output Example
+| API | Location |
+|-----|----------|
+| `lsRemote`, `LsRemoteOptions` | [packages/transport/src/operations/ls-remote.ts](../../../packages/transport/src/operations/ls-remote.ts) |
+| `clone`, `CloneOptions`, `CloneResult` | [packages/transport/src/operations/clone.ts](../../../packages/transport/src/operations/clone.ts) |
+| `fetch`, `FetchOptions` | [packages/transport/src/operations/fetch.ts](../../../packages/transport/src/operations/fetch.ts) |
+| `BaseHttpOptions`, `BaseFetchOptions` | [packages/transport/src/api/options.ts](../../../packages/transport/src/api/options.ts) |
+| `RawFetchResult` | [packages/transport/src/api/fetch-result.ts](../../../packages/transport/src/api/fetch-result.ts) |
+| `ProgressInfo`, `RefSpec` | [packages/transport/src/protocol/types.ts](../../../packages/transport/src/protocol/types.ts) |
+| Refspec parsing | [packages/transport/src/utils/refspec.ts](../../../packages/transport/src/utils/refspec.ts) |
+| `bytesToHex` | [packages/utils/src/hash/utils/index.ts](../../../packages/utils/src/hash/utils/index.ts) |
 
-```
-=== ls-remote: List Remote Refs ===
+### Related examples
 
-Repository: https://github.com/octocat/Hello-World.git
-Found 4 refs:
-
-Branches:
-  master                         7fd1a60b
-
-Tags:
-  v1.0                          ef4acfb3
-
-Other:
-  HEAD                          7fd1a60b
-
-=== clone: Download Repository ===
-
-Cloning: https://github.com/octocat/Hello-World.git
-
-  Counting objects: 7/7 (100%)
-  Compressing objects: 3/3 (100%)
-
-Clone complete:
-  Default branch: master
-  Refs fetched: 2
-  Pack size: 1.2 KB
-  Bytes received: 1.5 KB
-```
-
----
-
-## API Reference Links
-
-### Transport Package (packages/transport)
-
-| Function / Type | Location | Purpose |
-|-----------------|----------|---------|
-| `lsRemote()` | [operations/ls-remote.ts](../../../packages/transport/src/operations/ls-remote.ts) | List remote refs without downloading objects |
-| `clone()` | [operations/clone.ts](../../../packages/transport/src/operations/clone.ts) | Full repository download |
-| `fetch()` | [operations/fetch.ts](../../../packages/transport/src/operations/fetch.ts) | Incremental fetch with negotiation |
-| `BaseHttpOptions` | [api/options.ts](../../../packages/transport/src/api/options.ts) | Shared HTTP transport options |
-| `RawFetchResult` | [api/fetch-result.ts](../../../packages/transport/src/api/fetch-result.ts) | Common fetch/clone result type |
-| `RefSpec` | [utils/refspec.ts](../../../packages/transport/src/utils/refspec.ts) | Refspec parsing and matching |
-| `AdvertisementParser` | [protocol/advertisement-parser.ts](../../../packages/transport/src/protocol/advertisement-parser.ts) | Ref advertisement parsing |
-
----
-
-## Next Steps
-
-- [09-repository-access](../09-repository-access/) - Server-side repository access for transport handlers
-- [WebRTC P2P Sync Demo](../../demos/webrtc-p2p-sync/) - Peer-to-peer sync without a central server
+- [09-repository-access](../09-repository-access/) - server-side repository access for transport handlers
+- [webrtc-p2p-sync](../../demos/webrtc-p2p-sync/) - peer-to-peer sync without a central server

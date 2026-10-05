@@ -1,120 +1,138 @@
 # @statewalker/vcs-transport-adapters
 
-Storage adapters that bridge VCS store interfaces to Git transport protocol interfaces.
+## What it is
 
-## Overview
+Adapters that turn `@statewalker/vcs-core` stores into the interfaces `@statewalker/vcs-transport` runs on: `RepositoryFacade` (pack import/export, ancestry, reachability), the transport `RefStore`, and `RepositoryAccess` (object and ref level access). It also has helpers for the Git object wire format (`"<type> <size>\0<content>"`) and an object graph walker.
 
-This package provides adapters that convert VCS storage interfaces to the `RepositoryFacade` and `RepositoryAccess` interfaces used by Git protocol operations. It enables transport operations (fetch, push, clone, P2P sync) to work with any storage backend that implements the VCS store interfaces.
+## Why it exists: the transport knows nothing about storage
 
-Two adapter types serve different use cases:
+`@statewalker/vcs-transport` speaks the Git protocol but never touches storage. It asks for a `RepositoryFacade` and a `RefStore`. This package is the bridge between those small interfaces and the `History`, `GitObjectStore` and `@statewalker/webrun-storage` stores of `@statewalker/vcs-core`. Keeping the bridge separate keeps the transport free of any storage dependency.
 
-- **`createVcsRepositoryFacade()`** — Creates a `RepositoryFacade` for pack-level operations. Use this with `fetchOverDuplex`, `pushOverDuplex`, `serveOverDuplex`, and HTTP operations.
-- **`createVcsRepositoryAccess()`** — Creates a `RepositoryAccess` for object-level server operations. Use this for HTTP server request routing and ref management.
-
-## Installation
+## How to use: choose an adapter by what you have
 
 ```bash
 pnpm add @statewalker/vcs-transport-adapters
 ```
 
-## Usage
+No peer dependencies. One entry point, `@statewalker/vcs-transport-adapters` (ESM, with type declarations).
 
-### RepositoryFacade (Recommended for Transport Operations)
+| You have | Use | You get |
+|----------|-----|---------|
+| `BlobStore` + `KvStore` from `@statewalker/webrun-storage` | `createStorageRepositoryFacade({ objects, refs })` | `{ facade, refStore }` ready for fetch/push/serve |
+| A `History` and a `SerializationApi` | `createVcsRepositoryFacade({ history, serialization })` | `RepositoryFacade` |
+| A `History` | `createVcsRepositoryAccess({ history })` | `RepositoryAccess` |
+| A `GitObjectStore` and a core `RefStore` | `createCoreRepositoryAccess({ objectStore, refStore })` | `RepositoryAccess` |
+| A `GitObjectStore` only | `new GitNativeRepositoryAccess(objectStore)` | object-only access (no refs) |
+| A store matching `MinimalStorage` | `createStorageAdapter(storage)` | `RepositoryAccess` |
 
-Use `createVcsRepositoryFacade` when performing fetch, push, clone, or P2P sync:
+Other exports:
+
+| Export | Description |
+|--------|-------------|
+| `VcsRepositoryFacade`, `VcsRepositoryAccess` | The classes behind the two `createVcs*` factories |
+| `DeltaAwareGitNativeRepositoryAccess` | `GitNativeRepositoryAccess` plus `isDelta`, `getDeltaBase`, `getChainDepth` from a `DeltaAwareStore` |
+| `createObjectGraphWalker(objectStore)` | `walk(wants, haves)` yields every object reachable from `wants` and not from `haves`, once each |
+| `createGitWireFormat`, `parseGitWireFormat` | Build and parse `"<type> <size>\0<content>"` bytes |
+| `stringToObjectType`, `objectTypeToString` | Convert between `"commit"`/`"tree"`/`"blob"`/`"tag"` and type codes |
+
+## Examples
+
+### Storage-backed repository for fetch and serve
 
 ```typescript
-import { fetch, clone, push } from "@statewalker/vcs-transport";
-import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
+import { fetchOverDuplex, serveRepoOverWebrun, webrunClientDuplex } from "@statewalker/vcs-transport";
+import { createStorageRepositoryFacade } from "@statewalker/vcs-transport-adapters";
+import { memBlobStore, memKvStore } from "@statewalker/webrun-storage";
 
-const facade = createVcsRepositoryFacade({ history });
+const source = createStorageRepositoryFacade({ objects: memBlobStore(), refs: memKvStore() });
+const dest = createStorageRepositoryFacade({ objects: memBlobStore(), refs: memKvStore() });
 
-// Clone
-const result = await clone({
-  url: "https://github.com/user/repo.git",
-  repository: facade,
+const handler = serveRepoOverWebrun({
+  repository: source.facade,
+  refStore: source.refStore,
+  service: "git-upload-pack",
 });
 
-// Fetch
-await fetch({
-  url: "https://github.com/user/repo.git",
-  repository: facade,
-  refSpecs: ["+refs/heads/*:refs/remotes/origin/*"],
-});
-
-// Push
-await push({
-  url: "https://github.com/user/repo.git",
-  repository: facade,
-  refSpecs: ["refs/heads/main:refs/heads/main"],
+const result = await fetchOverDuplex({
+  duplex: webrunClientDuplex(handler),
+  repository: dest.facade,
+  refStore: dest.refStore,
 });
 ```
 
-### RepositoryAccess (For Server-Side Operations)
+### RepositoryFacade from a History
 
-Use `createVcsRepositoryAccess` when building Git HTTP servers or when you need direct object/ref access:
+```typescript
+import { DefaultSerializationApi } from "@statewalker/vcs-core";
+import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
+
+const serialization = new DefaultSerializationApi({ history });
+const facade = createVcsRepositoryFacade({ history, serialization });
+
+const exists = await facade.has(oid);
+for await (const chunk of facade.exportPack(new Set([tipOid]), new Set())) {
+  // pack bytes
+}
+```
+
+### RepositoryAccess for server code
 
 ```typescript
 import { createVcsRepositoryAccess } from "@statewalker/vcs-transport-adapters";
 
-const access = createVcsRepositoryAccess({
-  blobs: myBlobStore,
-  trees: myTreeStore,
-  commits: myCommitStore,
-  tags: myTagStore,
-  refs: myRefStore,
-});
+const access = createVcsRepositoryAccess({ history });
 
-// List refs
-for await (const ref of access.listRefs()) {
-  console.log(ref.name, ref.oid);
-}
-
-// Check object existence
-const exists = await access.hasObject(objectId);
+for await (const ref of access.listRefs()) console.log(ref.name, ref.objectId);
+const head = await access.getHead();
+const ok = await access.updateRef("refs/heads/main", oldOid, newOid);
 ```
 
-### Git-Native Object Store
-
-For backends that store objects in Git wire format (no serialization needed):
+### Wire format
 
 ```typescript
-import { GitNativeRepositoryAccess } from "@statewalker/vcs-transport-adapters";
+import { createGitWireFormat, parseGitWireFormat } from "@statewalker/vcs-transport-adapters";
 
-const access = new GitNativeRepositoryAccess(gitObjectStore);
+const bytes = createGitWireFormat("blob", new TextEncoder().encode("hello\n"));
+const { type, body } = parseGitWireFormat(bytes); // type is the blob type code
 ```
 
-## Public API
+## Internals
 
-| Export | Description |
-|--------|-------------|
-| `createVcsRepositoryFacade()` | Create RepositoryFacade from History/HistoryWithOperations |
-| `VcsRepositoryFacade` | Class implementing RepositoryFacade |
-| `VcsRepositoryFacadeConfig` | Configuration interface |
-| `createVcsRepositoryAccess()` | Create RepositoryAccess from individual stores |
-| `VcsRepositoryAccess` | Class implementing RepositoryAccess |
-| `VcsRepositoryAccessConfig` | Configuration interface |
-| `createGitNativeRepositoryAccess()` | Create RepositoryAccess from GitObjectStore |
-| `GitNativeRepositoryAccess` | Direct passthrough to GitObjectStore |
-| `ObjectGraphWalker` | Walk object graph for pack generation |
+### Why there are two interfaces
 
-## When to Use Which
+`RepositoryFacade` works at the pack level: the protocol state machines only need to import a pack, export a pack for `wants`/`exclude`, test `has`, walk ancestors and answer reachability and shallow-boundary questions. `RepositoryAccess` works at the object and ref level (`loadObject`, `storeObject`, `listRefs`, `updateRef`) for server code that handles objects one by one. Most transport use needs only the facade.
 
-| Scenario | Use |
-|----------|-----|
-| HTTP fetch/push/clone | `createVcsRepositoryFacade()` |
-| Duplex fetch/push/serve | `createVcsRepositoryFacade()` |
-| P2P sync | `createVcsRepositoryFacade()` |
-| Git HTTP server | `createVcsRepositoryAccess()` |
-| Custom server with ref management | `createVcsRepositoryAccess()` |
-| Git-format object store (no VCS stores) | `GitNativeRepositoryAccess` |
+### How the facades map onto vcs-core
 
-## Dependencies
+- `VcsRepositoryFacade.exportPack` collects objects with `history.collectReachableObjects(wants, exclude)` and encodes them with `serialization.createPack`. Pack import goes through the `SerializationApi` too.
+- `createStorageRepositoryFacade` builds the full stack from two byte stores: `blobStoreToRawStorage(objects)` feeds `createGitObjectStore`, `kvStoreRefs(refs)` provides refs, `createHistoryFromStores` composes a `History`, and `DefaultSerializationApi` handles packs. It returns the facade plus a transport `RefStore` over the same refs.
+- `VcsRepositoryAccess.updateRef` uses the refs store's `compareAndSwap` when an old id is given, so concurrent updates fail instead of overwriting.
+- `GitNativeRepositoryAccess` reads straight from a `GitObjectStore`, which already stores objects in wire format, so no re-serialization is needed.
 
-**Runtime:**
-- `@statewalker/vcs-core` — VCS store interfaces and types
-- `@statewalker/vcs-transport` — Transport API interfaces
-- `@statewalker/vcs-utils` — Hashing and serialization utilities
+### Constraints
+
+- `createVcsRepositoryFacade` returns only a `RepositoryFacade`. This package exports no standalone adapter from a core `Refs` to the transport `RefStore`; `createStorageRepositoryFacade` is the only factory that returns one.
+- `VcsRepositoryFacade.exportPack` ignores its `ExportPackOptions` (`thin`, `includeTag`, `filterSpec`, `shallow`), so packs are always full packs of the reachable set.
+- `GitNativeRepositoryAccess` has no refs. Use `createCoreRepositoryAccess` when ref operations are needed.
+
+### What failures look like
+
+- Loading a missing object throws `Object not found: <id>`.
+- Malformed wire-format bytes throw `Invalid Git object: no header null byte found`, `Invalid Git object header: no space separator`, or `Unknown object type: <type>`.
+- An invalid type code throws `Unknown type code: <code>`.
+
+### Dependencies
+
+- `@statewalker/vcs-core`: `History`, object stores, refs, serialization and pack encoding.
+- `@statewalker/vcs-transport`: the `RepositoryFacade`, `RefStore` and `RepositoryAccess` interfaces being implemented.
+- `@statewalker/vcs-utils`: stream helpers (`collect`, `toArray`, `concat`).
+- `@statewalker/webrun-storage`: the `BlobStore` and `KvStore` types used by `createStorageRepositoryFacade`.
+
+### Commands
+
+```bash
+pnpm --filter @statewalker/vcs-transport-adapters test
+```
 
 ## License
 

@@ -132,9 +132,9 @@ Larger blobs would require chunking at the transport layer.
 
 ## Test Configuration
 
-Benchmark file: `packages/transport/tests/performance-benchmarks.test.ts`
+Benchmark file: `packages/transport/tests-bench/performance-benchmarks.test.ts`
 
 Run with:
 ```bash
-npx vitest run packages/transport/tests/performance-benchmarks.test.ts --reporter=verbose
+pnpm --filter @statewalker/vcs-transport test:bench
 ```

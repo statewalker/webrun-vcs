@@ -1,96 +1,139 @@
 # Complete Git Workflow Demo
 
-Comprehensive demonstration of Git operations using WebRun VCS, showcasing the full lifecycle from repository creation through branching, merging, and garbage collection.
+## What it is
 
-## Quick Start
+A Node script that walks one repository through a full Git lifecycle using only the porcelain commands of `@statewalker/vcs-commands`: init, add, commit, branch, checkout, merge, log, diff, gc and status. It runs nine steps in one process and prints what each step did. No native `git` binary is called.
 
-```bash
-pnpm start
-```
-
-## What This Demo Shows
+## Layout
 
 ```
-Step 01: Initialize repository with FilesApi
-Step 02: Create project structure with multiple files
-Step 03: Generate commits with incremental changes
-Step 04: Create and manage branches (feature, bugfix)
-Step 05: Perform merge operations (fast-forward, three-way)
-Step 06: View diffs between commits
-Step 07: Run garbage collection and create pack files
-Step 08: Checkout first version using native git
-Step 09: Verify checkout matches original content
+src/
+  main.ts                  runs all steps, or one with --step=NN
+  shared/index.ts          REPO_DIR, shared state between steps, logging, file helpers
+  steps/
+    01-init-repo.ts        Git.init() with a Node FilesApi and a FileStagingStore
+    02-create-files.ts     writes 8 project files, git.add("."), first commit
+    03-generate-commits.ts 9 more commits (add file / modify / update README / add test)
+    04-branching.ts        branches "feature" and "bugfix", one commit on each
+    05-merging.ts          fast-forward merge of bugfix, three-way merge of feature
+    06-diff-viewer.ts      git.log() + git.diff() between commits
+    07-gc-packing.ts       git.gc().setPackRefs(true)
+    08-checkout.ts         detached checkout of the first commit
+    09-verification.ts     compares staged blobs with the original file contents
 ```
 
-## Running Individual Steps
+The script writes into `test-workflow-repo/` under the current working directory (ignored by `.gitignore`).
 
-```bash
-pnpm step:01  # Initialize Repository
-pnpm step:02  # Create Initial Files
-pnpm step:03  # Generate Commits
-pnpm step:04  # Branch Operations
-pnpm step:05  # Merge Operations
-pnpm step:06  # Diff Viewer
-pnpm step:07  # Garbage Collection & Packing
-pnpm step:08  # Checkout First Version
-pnpm step:09  # Verify Checkout
+## How to run it
+
+The `@statewalker/vcs-*` workspace packages resolve to their built `dist/`, so build once first.
+
+1. `pnpm install && pnpm build` at the repository root (Node 24).
+2. Run all steps:
+
+   ```bash
+   pnpm --filter @statewalker/vcs-demo-git-workflow-complete start
+   ```
+
+The run ends with a summary of the nine steps and the total time, and exits 0. Abridged output:
+
+```
+  Step 05: Merge Operations
+Merging 'bugfix' into 'main' (fast-forward)...
+  Merge status: fast-forward
+Merging 'feature' into 'main' (three-way merge)...
+  Merge status: merged
+...
+  Step 09: Verify Checkout
+  ✓ Staging area is clean (no uncommitted changes)
+  ✓ Verification complete! All files match original content.
 ```
 
-## Key Concepts Demonstrated
+## What the steps do
 
-### Branching and Merging
+### One repository, built up across steps
+
+Step 01 creates the repository:
 
 ```typescript
-import { Git, MergeStrategy } from "@statewalker/vcs-commands";
+import { Git } from "@statewalker/vcs-commands";
+import { FileStagingStore } from "@statewalker/vcs-store-files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
-// Create branches
+const files = createNodeFilesApi({ rootDir: REPO_DIR });
+const staging = new FileStagingStore(files, ".git/index");
+
+const { git, repository, initialBranch } = await Git.init()
+  .setFilesApi(files)
+  .setDirectory("")
+  .setGitDir(".git")
+  .setInitialBranch("main")
+  .setStagingStore(staging)
+  .setWorktree(true)
+  .call();
+```
+
+Steps 02 and 03 write files through the `FilesApi` and commit them with `git.add().addFilepattern(".").call()` and `git.commit().setMessage(...).call()`, giving 10 commits on `main`.
+
+### Branching and merging
+
+```typescript
+import { MergeStrategy } from "@statewalker/vcs-commands";
+
 await git.branchCreate().setName("feature").call();
 await git.branchCreate().setName("bugfix").call();
+await git.checkout().setName("feature").call();
+// ... commit on feature, then on bugfix ...
+await git.checkout().setName("main").call();
 
-// Merge with strategy
-const result = await git
-  .merge()
-  .include("feature")
-  .setStrategy(MergeStrategy.RECURSIVE)
-  .call();
+await git.merge().include("bugfix").call(); // fast-forward
+await git.merge().include("feature").setStrategy(MergeStrategy.RECURSIVE).call(); // three-way
+
+await git.branchDelete().setBranchNames("bugfix", "feature").call();
 ```
 
-### Viewing Diffs
+### Viewing diffs
+
+Step 06 reads the last five commits with `git.log().setMaxCount(5)` and diffs HEAD against HEAD~1, then the oldest of those five against HEAD:
 
 ```typescript
-// Compare two commits
-const diff = await git
-  .diff()
-  .setOldTree(previousCommitId)
-  .setNewTree(latestCommitId)
-  .call();
-
+const diff = await git.diff().setOldTree(previousCommit).setNewTree(latestCommit).call();
 for (const entry of diff) {
   console.log(`${entry.changeType}: ${entry.newPath}`);
 }
 ```
 
-### Garbage Collection
+### Maintenance, checkout and verification
 
-```typescript
-import { PackWriterStream, writePackIndexV2 } from "@statewalker/vcs-core";
+Step 07 runs `git.gc().setPackRefs(true).call()` and prints loose-object and pack-file counts before and after. Step 08 checks out the first commit by id (`git.checkout().setName(firstCommit.id)`) and lists the staging entries. Step 09 loads each staged blob, compares it with the content written in step 02, calls `git.status()`, and checks out `main` again.
 
-// Pack loose objects
-const packWriter = new PackWriterStream();
-await packWriter.addObject(objectId, type, content);
-const result = await packWriter.finalize();
+## Why it is the way it is
 
-// Write pack and index files
-await fs.writeFile("pack.pack", result.packData);
-const indexData = await writePackIndexV2(result.indexEntries, result.packChecksum);
-await fs.writeFile("pack.idx", indexData);
-```
+- **Porcelain only.** The demo exists to show the command builder API (`git.<command>().setX().call()`) end to end, so it uses no low-level store calls and no native git.
+- **Steps share in-process state.** Each step reads `git`, `files` and the recorded commits from the `state` object in `shared/index.ts`. That keeps every step file short, at the cost that steps cannot run on their own (see below).
+- **`FileStagingStore` for the index.** The index is written to `.git/index` in Git's binary format rather than held in memory.
 
-## Requirements
+## What will surprise you
 
-- Node.js 18+
-- Git (for checkout and verification steps)
+- **`test-workflow-repo/` is not a Git repository on disk.** `Git.init()` always creates an in-memory history; `setFilesApi()` only backs the working tree. After a run the directory contains the working files and `.git/index`, nothing else. `git log` inside it fails with `fatal: not a git repository`.
+- **Step 07 finds nothing to pack.** Because objects never reach disk, it prints `Loose objects: 0`, `Pack files: 0` and `Refs packed: no`, then a note that full object packing is not done by `git.gc()`.
+- **Step 08 does not rewrite the files on disk.** The checkout reports `Files updated: 0`; it changes HEAD and the staging area. Step 09 verifies staged blobs, not files on disk.
+- **`step:NN` scripts other than `step:01` fail on their own.** Each runs in a fresh process with empty state, so step 02 and later throw `Repository not initialized. Run step 01 first.` and the script prints `✗ Step NN failed:` and exits 1. Use `start` to run the full sequence.
+- **Each run deletes `test-workflow-repo/` first.** Step 01 removes the directory recursively before re-creating it.
+- **Run through `pnpm --filter`, the directory lands in the app folder.** pnpm runs the script with the package directory as the working directory, so the output is `apps/demos/git-workflow-complete/test-workflow-repo/`.
 
-## Output
+## Reference
 
-The demo creates a `test-workflow-repo/` directory with a fully functional Git repository that can be inspected with native git tools.
+### Commands
+
+Run from the repository root:
+
+| Command | What it does |
+|---|---|
+| `pnpm --filter @statewalker/vcs-demo-git-workflow-complete start` | Run all nine steps |
+| `pnpm --filter @statewalker/vcs-demo-git-workflow-complete step:01` | Run one step (`step:01` to `step:09`; only `step:01` works alone) |
+| `pnpm --filter @statewalker/vcs-demo-git-workflow-complete typecheck` | `tsc --noEmit` |
+
+### Dependencies
+
+`@statewalker/vcs-commands` (porcelain API), `@statewalker/vcs-core` (types), `@statewalker/vcs-store-files` (`FileStagingStore`), `@statewalker/vcs-utils` and `@statewalker/vcs-utils-node` (Node compression and `FilesApi`). `@statewalker/vcs-store-mem` is declared but not imported by the source.

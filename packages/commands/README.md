@@ -1,590 +1,304 @@
 # @statewalker/vcs-commands
 
-High-level Git command API for building version control applications.
+High-level Git commands (add, commit, checkout, merge, rebase, stash, fetch, push, clone, ...) over a `WorkingCopy`. A `Git` facade wraps a `WorkingCopy` from `@statewalker/vcs-working-tree` and creates command objects. You configure a command with chainable setters and run it once with `call()`.
 
-## Overview
+## Why a command layer sits on top of the working copy
 
-This package provides a Git-like command interface for VCS operations. Rather than working directly with low-level stores, you interact through familiar commands like `add`, `commit`, `push`, and `merge`. Each command encapsulates the complex multi-step workflows into a simple, type-safe API.
+`@statewalker/vcs-core` and `@statewalker/vcs-working-tree` give you objects, refs, an index and a worktree. A Git operation such as "commit" or "merge" touches all of them in a fixed order: resolve HEAD, write a tree from the index, store a commit, move a branch, update the index and the files. This package holds those multi-step workflows so applications do not re-implement them.
 
-The design follows the command pattern with a fluent builder interface. You create commands through a `Git` factory, configure them with chainable methods, and execute with a single `call()`. This approach mirrors how developers interact with Git while providing the type safety and error handling expected from a library.
+Commands talk only to the `WorkingCopy` interfaces (history, checkout/staging, worktree). The same command code runs over memory, file, or SQL storage, in the browser, Node or a worker. The API copies JGit's command pattern, so names and option sets map to Git and JGit concepts you already know.
 
-Commands work with any storage backend that implements the required store interfaces. Whether your repository lives in the filesystem, SQLite, IndexedDB, or memory, the same commands work identically. For remote operations like fetch and push, the package integrates with the transport layer to handle protocol negotiation and data transfer.
-
-## Installation
+## How to use it: build a `WorkingCopy`, wrap it in `Git`
 
 ```bash
 pnpm add @statewalker/vcs-commands
 ```
 
-**Dependencies:**
-- `@statewalker/vcs-core` - Core types, store interfaces, and repository factories
-- `@statewalker/vcs-transport` - Remote protocol implementation
-- `@statewalker/vcs-utils` - Utility functions
+No peer dependencies.
 
-## Quick Start
+| Entry point | Contents |
+|-------------|----------|
+| `@statewalker/vcs-commands` | Everything below, plus `Git`, `GitCommand`, `TransportCommand`, `ResetMode`, `ListBranchMode`, and re-exported types (`WorkingCopy`, `History`, `Checkout`, `Staging`, `Worktree`, `Blobs`, `Trees`, `Commits`, `Refs`, `Tags`) |
+| `@statewalker/vcs-commands/commands` | Command classes (`AddCommand`, `CommitCommand`, `MergeCommand`, ..., `InitCommand`) and their enums (`CheckoutStatus`, `RebaseOperation`, `TagOption`, `RevFilter`, ...) |
+| `@statewalker/vcs-commands/errors` | Error classes, all extending `GitApiError` |
+| `@statewalker/vcs-commands/results` | Result types, status enums and helpers (`MergeStatus`, `PushStatus`, `isMergeSuccessful`, `isPushSuccessful`, ...) |
+
+An in-memory repository:
 
 ```typescript
 import { Git } from "@statewalker/vcs-commands";
-import { createWorkingCopy } from "@statewalker/vcs-core";
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import * as fs from "node:fs/promises";
+import { createMemoryHistory } from "@statewalker/vcs-core";
+import {
+  createMemoryCheckout,
+  createMemoryGitStaging,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+} from "@statewalker/vcs-working-tree";
 
-// Create a Git-compatible working copy
-const files = createNodeFilesApi({ fs, rootDir: "/path/to/repo" });
-const workingCopy = await createWorkingCopy(files, ".git");
+const history = createMemoryHistory();
+await history.initialize();
+await history.refs.setSymbolic("HEAD", "refs/heads/main");
 
-// Create the Git command interface
+const staging = createMemoryGitStaging();
+const checkout = createMemoryCheckout({ staging });
+const worktree = createMemoryWorktree({ blobs: history.blobs, trees: history.trees });
+const workingCopy = createMemoryWorkingCopy({ history, checkout, worktree });
+
 const git = Git.fromWorkingCopy(workingCopy);
 
-// Stage and commit changes
+await worktree.writeContent("README.md", new TextEncoder().encode("# Hello\n"));
 await git.add().addFilepattern(".").call();
-await git.commit().setMessage("Initial commit").call();
+const commit = await git.commit().setMessage("Initial commit").call();
+console.log(commit.id);
 
-// Check status
-const status = await git.status().call();
-console.log("Clean:", status.isClean());
+console.log("Clean:", (await git.status().call()).isClean());
 
-// Clean up
-git.dispose();
+git.close(); // or `using git = ...`: Git implements Disposable
 ```
 
-## Public API
+For a Git-compatible on-disk repository, build the `WorkingCopy` from the file-backed classes in `@statewalker/vcs-store-files` (for example `GitWorkingCopy`).
 
-### Main Export
+`Git` methods:
+
+| Area | Methods |
+|------|---------|
+| Staging | `add()`, `rm()`, `status()`, `clean()` |
+| Commits | `commit()`, `log()`, `reflog()`, `blame()` |
+| Branches | `branchCreate()`, `branchDelete()`, `branchList()`, `branchRename()`, `checkout()` |
+| Tags | `tag()`, `tagDelete()`, `tagList()` |
+| History | `reset()`, `merge()`, `rebase()`, `cherryPick()`, `revert()` |
+| Inspection | `diff()`, `describe()` |
+| Remotes | `fetch()`, `push()`, `pull()`, `clone()`, `lsRemote()`, `remoteAdd()`, `remoteRemove()`, `remoteList()`, `remoteSetUrl()` |
+| Stash | `stashCreate()`, `stashApply()`, `stashDrop()`, `stashList()` |
+| Maintenance | `gc()`, `packRefs()` |
+| Static | `Git.fromWorkingCopy(wc)`, `Git.init()` |
+| Components | `workingCopy`, `history`, `checkoutState`, `worktree` |
+
+## Examples
+
+### Staging and committing
 
 ```typescript
-import {
-  // Main entry point
-  Git,
-  GitCommand,
-  TransportCommand,
+await git.add().addFilepattern("src/").addFilepattern("package.json").call();
 
-  // Re-exported core types
-  type WorkingCopy,
-  type History,
-  type Checkout,
-  type Worktree,
-  type Staging,
+// Stage modifications and deletions of tracked files only (git add -u)
+await git.add().addFilepattern(".").setUpdate(true).call();
 
-  // Enums
-  ResetMode,
-  ListBranchMode,
-} from "@statewalker/vcs-commands";
+const commit = await git
+  .commit()
+  .setMessage("Add feature")
+  .setAuthor("Developer", "dev@example.com")
+  .call(); // CommitResult: the Commit fields plus `id`
+
+await git.commit().setMessage("Add feature (fixed)").setAmend(true).call();
 ```
 
-### Sub-exports
-
-| Export Path | Description |
-|-------------|-------------|
-| `@statewalker/vcs-commands/commands` | Individual command classes |
-| `@statewalker/vcs-commands/errors` | Error types |
-| `@statewalker/vcs-commands/results` | Result types and enums |
-
-### Git Class Methods
-
-The `Git` class provides factory methods for all commands:
-
-| Category | Methods |
-|----------|---------|
-| **Staging** | `add()`, `rm()`, `status()` |
-| **Committing** | `commit()`, `log()` |
-| **Branches** | `branchCreate()`, `branchDelete()`, `branchList()`, `branchRename()`, `checkout()` |
-| **Tags** | `tag()`, `tagDelete()`, `tagList()` |
-| **History** | `reset()`, `rebase()`, `merge()`, `cherryPick()`, `revert()` |
-| **Inspection** | `diff()`, `describe()` |
-| **Remote** | `fetch()`, `push()`, `pull()`, `clone()`, `lsRemote()` |
-| **Remotes** | `remoteAdd()`, `remoteRemove()`, `remoteList()`, `remoteSetUrl()` |
-| **Stash** | `stashCreate()`, `stashApply()`, `stashDrop()`, `stashList()` |
-
-## Usage Examples
-
-### Staging and Committing
+### Branches and checkout
 
 ```typescript
-import { Git } from "@statewalker/vcs-commands";
+import { ListBranchMode } from "@statewalker/vcs-commands";
 
-// Stage specific files
-await git.add()
-  .addFilepattern("src/")
-  .addFilepattern("package.json")
-  .call();
+await git.branchCreate().setName("feature/login").setStartPoint("main").call();
+await git.checkout().setName("feature/login").call();
 
-// Stage all changes including deletions
-await git.add()
-  .addFilepattern(".")
-  .setUpdate(true)
-  .call();
+// Create and switch in one step (git checkout -b)
+await git.checkout().setName("feature/new").setCreateBranch(true).call();
 
-// Create a commit
-const commitId = await git.commit()
-  .setMessage("Add new feature")
-  .setAuthor({ name: "Developer", email: "dev@example.com" })
-  .call();
+const branches = await git.branchList().setListMode(ListBranchMode.ALL).call();
+for (const ref of branches) console.log(ref.name); // "refs/heads/main", ...
 
-// Amend the previous commit
-await git.commit()
-  .setMessage("Add new feature (fixed)")
-  .setAmend(true)
-  .call();
+await git.branchDelete().setBranchNames("feature/old").call();
+await git.branchDelete().setBranchNames("feature/abandoned").setForce(true).call();
 ```
 
-### Branch Operations
+`checkout()` returns a `CheckoutResult` with `status` (`CheckoutStatus.OK`, `CONFLICTS`, ...), `updated`, `removed` and `conflicts`. Use `addPath()` to restore single files and `setForced(true)` to discard local changes.
+
+### Log and reset
 
 ```typescript
-// Create a new branch
-await git.branchCreate()
-  .setName("feature/login")
-  .call();
+import { ResetMode } from "@statewalker/vcs-commands";
 
-// Create and switch to a new branch
-await git.branchCreate()
-  .setName("feature/login")
-  .setStartPoint("main")
-  .call();
-await git.checkout()
-  .setName("feature/login")
-  .call();
-
-// List all branches
-const branches = await git.branchList()
-  .setListMode(ListBranchMode.ALL)
-  .call();
-for (const branch of branches) {
-  console.log(branch.name, branch.objectId);
+for await (const entry of await git.log().setMaxCount(10).call()) {
+  console.log(entry.id.slice(0, 7), entry.message.split("\n")[0]);
 }
+// More filters: addPath(), setSkip(), setSince(), setUntil(),
+// setAuthorFilter(), setCommitterFilter(), setFirstParent(), addRange()
 
-// Delete a merged branch
-await git.branchDelete()
-  .setBranchNames("feature/old")
-  .call();
-
-// Force delete unmerged branch
-await git.branchDelete()
-  .setBranchNames("feature/abandoned")
-  .setForce(true)
-  .call();
+await git.reset().setRef("HEAD~1").setMode(ResetMode.MIXED).call();
+await git.reset().setRef("main").setMode(ResetMode.HARD).call();
 ```
 
-### Working with History
+### Merge, rebase, cherry-pick, revert
 
 ```typescript
-// View commit log
-for await (const commit of git.log().setMaxCount(10).call()) {
-  console.log(`${commit.id.slice(0, 7)} ${commit.message.split("\n")[0]}`);
-}
+import { RebaseOperation } from "@statewalker/vcs-commands";
+import { FastForwardMode, MergeStatus } from "@statewalker/vcs-commands/results";
 
-// Log with filters
-const commits = git.log()
-  .setMaxCount(50)
-  .setAuthor("developer@example.com")
-  .addPath("src/")
-  .call();
-
-// Reset to previous commit (mixed mode - keeps changes unstaged)
-await git.reset()
-  .setRef("HEAD~1")
-  .setMode(ResetMode.MIXED)
-  .call();
-
-// Hard reset (discards all changes)
-await git.reset()
-  .setRef("main")
-  .setMode(ResetMode.HARD)
-  .call();
-```
-
-### Merging and Rebasing
-
-```typescript
-import { MergeStatus, FastForwardMode } from "@statewalker/vcs-commands/results";
-
-// Merge a branch
-const result = await git.merge()
-  .include("feature/login")
-  .call();
-
+const result = await git.merge().include("feature/login").call();
 if (result.status === MergeStatus.CONFLICTING) {
   console.log("Conflicts in:", result.conflicts);
-  // Resolve conflicts, then commit
 }
 
-// Merge with no fast-forward (always create merge commit)
-await git.merge()
+await git
+  .merge()
   .include("feature/login")
-  .setFastForward(FastForwardMode.NO_FF)
+  .setFastForwardMode(FastForwardMode.NO_FF)
   .setMessage("Merge feature/login")
   .call();
 
-// Rebase onto main
-const rebaseResult = await git.rebase()
-  .setUpstream("main")
-  .call();
+// setUpstream() takes a commit id; setUpstreamBranch() resolves a name and is async
+const rebase = await (await git.rebase().setUpstreamBranch("main")).call();
+await git.rebase().setOperation(RebaseOperation.CONTINUE).call();
+await git.rebase().setOperation(RebaseOperation.ABORT).call();
 
-// Continue after resolving conflicts
-await git.rebase()
-  .setOperation("continue")
-  .call();
-
-// Abort rebase
-await git.rebase()
-  .setOperation("abort")
-  .call();
+await git.cherryPick().include(commitId).call();
+await git.revert().include(commitId).setNoCommit(true).call();
 ```
 
-### Cherry-Pick and Revert
+### Remotes
 
 ```typescript
-// Cherry-pick a specific commit
-const cherryResult = await git.cherryPick()
-  .include("abc1234")
-  .call();
+import { isPushSuccessful } from "@statewalker/vcs-commands/results";
 
-// Revert a commit
-const revertResult = await git.revert()
-  .include("def5678")
-  .call();
+await git.remoteAdd().setName("origin").setUri("https://github.com/user/repo.git").call();
 
-// Revert without committing (stage only)
-await git.revert()
-  .include("def5678")
-  .setNoCommit(true)
-  .call();
-```
-
-### Remote Operations
-
-```typescript
-// Configure a remote
-await git.remoteAdd()
-  .setName("origin")
-  .setUri("https://github.com/user/repo.git")
-  .call();
-
-// Fetch from remote
-const fetchResult = await git.fetch()
+const fetched = await git
+  .fetch()
   .setRemote("origin")
   .setCredentials({ username: "user", password: "token" })
-  .setProgressCallback((progress) => {
-    console.log(`${progress.phase}: ${progress.completed}/${progress.total}`);
-  })
   .call();
+console.log(fetched.trackingRefUpdates.length, "refs updated");
 
-console.log(`Fetched ${fetchResult.trackingRefUpdates.length} refs`);
+const pushed = await git.push().setRemote("origin").add("refs/heads/main").call();
+if (!isPushSuccessful(pushed)) console.log(pushed.messages);
 
-// Push to remote
-const pushResult = await git.push()
-  .setRemote("origin")
-  .add("refs/heads/main")
-  .setCredentials({ username: "user", password: "token" })
-  .call();
-
-if (!pushResult.isSuccessful()) {
-  console.log("Push failed:", pushResult.messages);
-}
-
-// Pull (fetch + merge)
-await git.pull()
-  .setRemote("origin")
-  .setRemoteBranchName("main")
-  .call();
+await git.pull().setRemote("origin").setRemoteBranchName("main").call();
 ```
 
-### Cloning Repositories
+`setRemote()` takes a configured remote name or a URL. Clone writes into the `WorkingCopy` that the `Git` instance wraps, so start from an empty one:
 
 ```typescript
-import { Git } from "@statewalker/vcs-commands";
-import { createWorkingCopy } from "@statewalker/vcs-core";
-
-// Create an in-memory working copy for the clone
-const workingCopy = await createWorkingCopy();
-
-// Clone a repository
-const result = await Git.clone()
-  .setUri("https://github.com/user/repo.git")
-  .setWorkingCopy(workingCopy)
+const cloned = await Git.fromWorkingCopy(emptyWorkingCopy)
+  .clone()
+  .setURI("https://github.com/user/repo.git")
   .setCredentials({ token: "github_pat_xxx" })
-  .setProgressCallback((progress) => {
-    console.log(`${progress.phase}: ${progress.message}`);
-  })
+  .setProgressMonitor((p) => console.log(p.stage, p.current, p.total))
   .call();
-
-console.log(`Cloned to branch: ${result.defaultBranch}`);
+console.log(cloned.defaultBranch, cloned.headCommit);
 ```
 
-### Stash Operations
+All transport commands share `setCredentials({ username?, password?, token? })`, `setCredentialsProvider(username, password)`, `setHeaders()`, `setTimeout(ms)`, `setProgressMonitor(cb)` and `setProgressMessageCallback(cb)`.
+
+### Stash
 
 ```typescript
-// Create a stash with a message
-const stashResult = await git.stashCreate()
-  .setMessage("WIP: feature work")
-  .call();
+const stashId = await git.stashCreate().setMessage("WIP").call(); // ObjectId | undefined
 
-console.log(`Created stash: ${stashResult.stashRef}`);
-
-// Include untracked files (like git stash -u)
-await git.stashCreate()
-  .setMessage("WIP with new files")
-  .setIncludeUntracked(true)
-  .call();
-
-// List stashes
-const stashes = await git.stashList().call();
-for (const stash of stashes) {
-  console.log(`stash@{${stash.index}}: ${stash.message}`);
+for (const entry of await git.stashList().call()) {
+  console.log(`stash@{${entry.index}}: ${entry.message}`);
 }
 
-// Apply latest stash (keeps stash in list)
-await git.stashApply()
-  .setStashRef("stash@{0}")
-  .call();
-
-// Pop stash (apply and remove)
-await git.stashPop()
-  .setStashRef("stash@{0}")
-  .call();
-
-// Drop a specific stash
-await git.stashDrop()
-  .setStashRef("stash@{1}")
-  .call();
-
-// Clear all stashes
-await git.stashClear().call();
+await git.stashApply().setStashRef("stash@{0}").call(); // StashApplyResult
+await git.stashDrop().setStashRef(0).call(); // a 0-based index, not a ref string
+await git.stashDrop().setAll(true).call();
 ```
 
-Stash commits follow Git's structure with 2-3 parents:
-- Parent 1: HEAD at time of stash
-- Parent 2: Index state commit
-- Parent 3 (optional): Untracked files commit (when `includeUntracked: true`)
-
-### Checkout Operations
-
-```typescript
-// Switch to a branch
-await git.checkout()
-  .setName("feature/login")
-  .call();
-
-// Create and switch to new branch (like git checkout -b)
-await git.checkout()
-  .setName("feature/new")
-  .setCreateBranch(true)
-  .call();
-
-// Checkout specific commit (detached HEAD)
-await git.checkout()
-  .setName("abc1234")
-  .call();
-
-// Checkout specific files from another branch
-await git.checkout()
-  .setName("main")
-  .addPath("src/config.ts")
-  .addPath("package.json")
-  .call();
-
-// Force checkout (discard local changes)
-await git.checkout()
-  .setName("main")
-  .setForce(true)
-  .call();
-```
-
-Checkout performs three-way conflict detection before switching branches:
-
-```typescript
-import { CheckoutConflictError } from "@statewalker/vcs-commands/errors";
-
-try {
-  await git.checkout().setName("main").call();
-} catch (error) {
-  if (error instanceof CheckoutConflictError) {
-    // Local modifications would be overwritten
-    console.log("Conflicting paths:");
-    for (const conflict of error.conflicts) {
-      console.log(`  ${conflict.path}: ${conflict.message}`);
-    }
-
-    // Options: stash changes, force checkout, or abort
-  }
-}
-```
-
-Conflict types detected:
-- **DIRTY_WORKTREE**: Modified file would be overwritten
-- **DIRTY_INDEX**: Staged changes would be lost
-- **UNTRACKED_FILE**: New file would be overwritten
+There is no `stashPop()`: call `stashApply()`, then `stashDrop()`.
 
 ### Tags
 
 ```typescript
-// Create annotated tag
-await git.tag()
+await git
+  .tag()
   .setName("v1.0.0")
-  .setMessage("Release version 1.0.0")
-  .setTagger({ name: "Developer", email: "dev@example.com" })
+  .setMessage("Release 1.0.0")
+  .setTagger("Developer", "dev@example.com")
   .call();
+await git.tag().setName("v0.9.0").setObjectId(commitId).call();
 
-// Create tag at specific commit
-await git.tag()
-  .setName("v0.9.0")
-  .setObjectId("abc1234")
-  .call();
-
-// List tags
-const tags = await git.tagList().call();
-for (const tag of tags) {
-  console.log(tag.name);
-}
-
-// Delete tag
-await git.tagDelete()
-  .setTags("v0.9.0")
-  .call();
+const tags = await git.tagList().call(); // Ref[]
+await git.tagDelete().setTags("v0.9.0").call();
 ```
 
-## Error Handling
-
-Commands throw specific error types for different failure modes:
+### Errors
 
 ```typescript
-import {
-  RefNotFoundError,
-  MergeConflictError,
-  AuthenticationError,
-  PushRejectedException,
-} from "@statewalker/vcs-commands/errors";
+import { RefNotFoundError } from "@statewalker/vcs-commands/errors";
 
 try {
   await git.checkout().setName("nonexistent").call();
 } catch (error) {
-  if (error instanceof RefNotFoundError) {
-    console.log(`Branch not found: ${error.refName}`);
-  }
-}
-
-try {
-  await git.merge().include("feature").call();
-} catch (error) {
-  if (error instanceof MergeConflictError) {
-    console.log("Conflicts:", error.conflicts);
-  }
-}
-
-try {
-  await git.push().setRemote("origin").call();
-} catch (error) {
-  if (error instanceof AuthenticationError) {
-    console.log("Authentication failed");
-  } else if (error instanceof PushRejectedException) {
-    console.log("Push rejected:", error.message);
-  }
+  if (error instanceof RefNotFoundError) console.log(error.message); // "Ref not found: nonexistent"
 }
 ```
 
-### Error Categories
+| Area | Errors |
+|------|--------|
+| Command | `MissingArgumentError`, `InvalidArgumentError`, `IncompatibleOptionsError`, `NotImplementedError`, `StoreNotAvailableError` |
+| Refs | `RefNotFoundError`, `RefAlreadyExistsError`, `InvalidRefNameError`, `CannotDeleteCurrentBranchError`, `DetachedHeadError`, `NoHeadError`, `NotMergedError` |
+| Add / checkout | `NoFilepatternError`, `PathNotInIndexError`, `PathNotFoundInTreeError`, `NotADirectoryError` |
+| Commit | `NoMessageError`, `EmptyCommitError`, `UnmergedPathsError` |
+| Merge | `MergeConflictError`, `InvalidMergeHeadsError`, `NotFastForwardError`, `MultipleParentsNotAllowedError`, `NoMergeBaseError`, `InvalidMainlineParentError` |
+| Rebase | `NoRebaseInProgressError`, `UpstreamRequiredError`, `CommitNotFoundError` |
+| Remotes / transport | `RemoteAlreadyExistsError`, `RemoteNotFoundError`, `InvalidRemoteError`, `TransportError`, `AuthenticationError`, `PushRejectedException`, `NonFastForwardError` |
+| Stash / tag | `InvalidStashIndexError`, `StashNotFoundError`, `StashApplyFailedError`, `InvalidTagNameError` |
 
-| Category | Errors |
-|----------|--------|
-| **Command** | `MissingArgumentError`, `InvalidArgumentError`, `NotImplementedError` |
-| **Reference** | `RefNotFoundError`, `RefAlreadyExistsError`, `CannotDeleteCurrentBranchError` |
-| **Commit** | `NoMessageError`, `EmptyCommitError`, `UnmergedPathsError` |
-| **Merge** | `MergeConflictError`, `NotFastForwardError`, `NoMergeBaseError` |
-| **Transport** | `AuthenticationError`, `PushRejectedException`, `NonFastForwardError` |
-| **Checkout** | `CheckoutConflictError`, `DirCacheCheckoutError` |
-| **Stash** | `NoStashError`, `StashDropError` |
+## Internals
 
-## Result Types
+### How a command runs
 
-Commands return rich result objects with status information:
-
-```typescript
-import {
-  MergeStatus,
-  PushStatus,
-  RebaseStatus,
-} from "@statewalker/vcs-commands/results";
-
-// Check merge result
-const mergeResult = await git.merge().include("feature").call();
-switch (mergeResult.status) {
-  case MergeStatus.FAST_FORWARD:
-    console.log("Fast-forwarded");
-    break;
-  case MergeStatus.MERGED:
-    console.log("Created merge commit");
-    break;
-  case MergeStatus.CONFLICTING:
-    console.log("Conflicts need resolution");
-    break;
-}
-
-// Check push result
-const pushResult = await git.push().call();
-for (const update of pushResult.remoteUpdates) {
-  if (update.status === PushStatus.OK) {
-    console.log(`Updated: ${update.remoteName}`);
-  } else if (update.status === PushStatus.REJECTED_NONFASTFORWARD) {
-    console.log(`Rejected: ${update.remoteName} (non-fast-forward)`);
-  }
-}
+```
+Git.fromWorkingCopy(wc)
+   |
+   +-- git.commit()            new CommitCommand(wc)
+         .setMessage(...)      setters only record options
+         .call()               checks "callable", then:
+             wc.checkout.staging  -> writeTree()
+             wc.history.commits   -> store()
+             wc.history.refs      -> set(branch)
 ```
 
-## Configuration
+Every command extends `GitCommand<T>`. Remote commands extend `TransportCommand<T>`, which adds credentials, headers, timeout and progress callbacks. `Git` holds no state besides the `WorkingCopy` and a closed flag.
 
-### Transport Options
+### Why commands are single-use
 
-Remote commands support authentication and progress tracking:
+A command records options in fields and `call()` acts on them. Running it twice would reuse half-consumed state (a resolved upstream, a parsed refspec list), so `call()` marks it spent. A second call throws `Command CommitCommand has already been called`. After `git.close()`, every factory method throws `Git instance is closed`. Closing `Git` does not close the underlying stores.
 
-```typescript
-// Username/password authentication
-await git.fetch()
-  .setRemote("origin")
-  .setCredentials({
-    username: "user",
-    password: "password",
-  })
-  .call();
+### How refs are resolved
 
-// Token authentication
-await git.push()
-  .setRemote("origin")
-  .setCredentials({
-    token: "github_pat_xxxx",
-  })
-  .call();
+`resolveRef()` tries, in order: the name as given (`refs/heads/main`, `HEAD`), `refs/heads/<name>`, `refs/tags/<name>`, then a full commit id. Names containing `~` or `^` are walked through parents (`HEAD~2`, `HEAD^2`). Annotated tags are peeled to commits. Abbreviated commit ids are not resolved; they fail with `Ref not found: <name>`.
 
-// Custom headers
-await git.fetch()
-  .setRemote("origin")
-  .setHeaders({
-    "X-Custom-Header": "value",
-  })
-  .call();
+### Remote commands use smart HTTP only
 
-// Progress tracking
-await git.clone()
-  .setUri("https://github.com/user/repo.git")
-  .setProgressCallback((progress) => {
-    // Structured progress
-    console.log(progress.phase, progress.completed, progress.total);
-  })
-  .setMessageCallback((message) => {
-    // Raw server messages
-    console.log("Server:", message);
-  })
-  .call();
-```
+`fetch`, `push`, `pull`, `clone` and `lsRemote` call the Git smart HTTP client in `@statewalker/vcs-transport`, which uses the global `fetch`. Received packs are imported into `workingCopy.history`. Remotes are stored as `[remote "<name>"]` entries in `WorkingCopy.config` (`.git/config` for a file-backed working copy), so `remoteAdd()` must run on the same `WorkingCopy` before `setRemote("origin")` can resolve. A name that is not configured is passed to the transport as if it were a URL, so a typo shows up as a network error, not as `Invalid remote: <name>`.
 
-## Related Packages
+### What breaks, and how it looks
 
-| Package | Description |
-|---------|-------------|
-| `@statewalker/vcs-core` | Core types, store interfaces, and repository factories |
-| `@statewalker/vcs-transport` | Git protocol implementation |
-| `@statewalker/vcs-store-sql` | SQLite storage backend |
-| `@statewalker/vcs-store-mem` | In-memory storage for testing |
-| `@statewalker/vcs-store-kv` | Key-value storage abstraction |
+- `push().call()` does not throw on rejection. Check `isPushSuccessful(result)` or each `remoteUpdates[i].status`. `push().callOrThrow()` throws `NonFastForwardError` or `PushRejectedException` instead.
+- Merge conflicts are not thrown: `merge()` returns `status: MergeStatus.CONFLICTING` with `conflicts`. Only some merges throw, for example `Cannot fast-forward merge; branches have diverged` with `FastForwardMode.FF_ONLY`, or `No merge base found`.
+- A `WorkingCopy` without history or staging fails at first use with `WorkingCopy.history is required for commands` or `WorkingCopy.checkout.staging is required for commands`.
+- Writing files with no worktree fails with `Worktree not available for file writes`.
+- Commands that need a commit in an empty repository fail with `HEAD cannot be resolved` (`NoHeadError`).
+- `commit()` without a message fails with `Commit message is required`; with unresolved conflicts, `Cannot commit with unresolved conflicts`.
+
+### Constraints
+
+- `status()` compares HEAD with the index only (`added`, `changed`, `removed`, `conflicting`). It does not look at the worktree. For a working-tree status use `createStatusCalculator` from `@statewalker/vcs-working-tree`.
+- `stashCreate()` captures the working state only through `setWorkingTreeProvider(provider)`. Without a provider it stores a stash whose trees are the HEAD tree, even when nothing changed. The package ships no provider implementation.
+- `merge()` supports a single merge head (`Only single-head merges are currently supported`).
+- `fetch()` passes only `setProgressMessageCallback()` to the transport; `setProgressMonitor()` has effect on `clone()` only.
+- `Git.init()` (an `InitCommand`) always creates an in-memory history. `setFilesApi()` only backs the worktree when `setWorktree(true)` is set. Its `InitResult` has `git`, `workingCopy`, `repository`, `initialBranch`, `bare` and `gitDir`.
+- `stashDrop().setStashRef(n)` takes an index; without reflog support only index 0 is valid.
+
+### Dependencies and why
+
+- `@statewalker/vcs-core`: object stores, refs, commit/tree serialization.
+- `@statewalker/vcs-working-tree`: `WorkingCopy`, `Checkout`, `Staging`, `Worktree` interfaces and memory implementations.
+- `@statewalker/vcs-transport`: smart HTTP fetch, push, clone, ls-remote.
+- `@statewalker/vcs-store-files`, `@statewalker/vcs-store-mem`: used by `InitCommand` to build a default worktree and staging.
+- `@statewalker/vcs-utils`: hashing and byte helpers.
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the class hierarchy and extension points.
 
 ## License
 
