@@ -1,44 +1,62 @@
-name: Deploy Docs
+name: Docs
+
+# Builds the documentation site (docs/, Observable Framework) on pull requests that touch it, and
+# publishes it to GitHub Pages from main.
 
 on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yml"
   pull_request:
-    branches: [main]
     paths:
-      - 'docs/**'
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yml"
   workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
 
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: docs
     steps:
-      - name: Clone repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Deno
-        uses: denoland/setup-deno@v2
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
         with:
-          deno-version: v2.x
+          node-version: "24"
+          cache: pnpm
 
-      - name: Install dependencies
-        run: deno install
+      # docs/ is a workspace package: its dependencies come from the pnpm catalog.
+      - name: Install
+        run: pnpm install --frozen-lockfile --filter @statewalker/vcs-docs...
 
-      - name: Build docs
-        run: deno run build
+      - name: Build
+        run: pnpm --filter @statewalker/vcs-docs build
 
-      - name: Upload to Deno Deploy
-        uses: denoland/deployctl@v1
+      - uses: actions/upload-pages-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
-          project: "statewalker-vcs-docs"
-          entrypoint: "jsr:@std/http/file-server"
-          root: "./docs/dist"
+          path: docs/dist
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
