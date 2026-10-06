@@ -1,17 +1,11 @@
 # Changesets
 
-This folder holds pending [Changesets](https://github.com/changesets/changesets) for the public
-`@statewalker/vcs-*` packages.
+A changeset records a package release: which packages, which bump, and the changelog text.
 
-Changesets are optional for contributors. After CI passes on `main`, a CI job writes a patch
-changeset for every public package whose packed contents differ from npm, opens a
-`chore: version packages` pull request, and publishes when that pull request is merged.
-
-Add your own changeset when you want to choose the bump type or the changelog text:
-
-```bash
-pnpm changeset
-```
-
-Commit the generated markdown file with your change. See [docs/releasing.md](../docs/releasing.md)
-for bump guidelines and the list of published packages.
+- `pnpm changeset` writes one; commit it with the change it describes. It decides the bump and the
+  changelog text of the next release.
+- Without one, the release planner writes a patch changeset for every package whose published
+  contents changed since npm's `latest` (a minor, on 0.x, when a dependency moved to another
+  breaking line).
+- Releases are made by a maintainer from a local checkout: the changesets are applied (versions,
+  `CHANGELOG.md`), the packages published to npm, and the version commit pushed to `main`.
