@@ -79,18 +79,6 @@ Approved plans: `planning/YYYY-MM-DD/CC-[project]-subject.md`
 
 **[Full Guide](.claude/workflows/planning-organization.md)**
 
-### Issue Tracking (Beads)
-Use `bd` for AI-native issue tracking:
-
-```bash
-bd ready                                  # Find available work
-bd update <id> --status in_progress       # Claim issue
-bd close <id>                             # Complete work
-bd create --title="..." --type=task --priority=2
-```
-
-**[Full Guide](.claude/workflows/beads-integration.md)**
-
 ### Pull Requests
 Branch from `main`, use descriptive branch names (`feat/X`, `fix/Y`). PR titles under 70 chars. Include a test plan in the description.
 
@@ -99,7 +87,6 @@ Before ending any session:
 
 ```bash
 pnpm test && pnpm lint:fix && pnpm format:fix  # Quality gates
-bd sync                                         # Sync beads
 git add . && git commit -m "..."               # Commit
 git push                                        # MANDATORY
 ```
@@ -124,4 +111,4 @@ Trigger examples:
 
 ## Project-Specific Tools
 
-Beads CLI is installed via the project's own install script, not npm/pip. For Jira URLs, use the format: `https://<domain>/browse/<ISSUE-KEY>`
+For Jira URLs, use the format: `https://<domain>/browse/<ISSUE-KEY>`

@@ -18,11 +18,7 @@ Do not commit code that fails tests or has linting/formatting issues. If any com
 
 When ending a work session, complete ALL steps below:
 
-### 1. File Issues for Remaining Work
-
-Create issues for anything that needs follow-up using `bd create`.
-
-### 2. Run Quality Gates
+### 1. Run Quality Gates
 
 If code changed, run tests, linters, and builds:
 
@@ -32,40 +28,30 @@ pnpm lint:fix
 pnpm format:fix
 ```
 
-### 3. Update Issue Status
-
-Close finished work and update in-progress items:
-
-```bash
-bd close <completed-issue-ids>
-bd update <partial-work-id> --status in_progress
-```
-
-### 4. Push to Remote
+### 2. Push to Remote
 
 This is **MANDATORY**:
 
 ```bash
 git pull --rebase
-bd sync
 git add .
 git commit -m "Your commit message"
 git push
 git status  # MUST show "up to date with origin"
 ```
 
-### 5. Clean Up
+### 3. Clean Up
 
 - Clear any stashes
 - Prune remote branches if needed
 
-### 6. Verify
+### 4. Verify
 
 - All changes committed AND pushed
 - `git status` shows clean working tree
 - Remote is up to date
 
-### 7. Hand Off
+### 5. Hand Off
 
 Provide context for the next session about:
 - What was completed
@@ -88,9 +74,7 @@ The PostToolUse hook runs `tsc --noEmit` after each edit for fast type-checking.
 ```bash
 # Complete session workflow
 pnpm test && pnpm lint:fix && pnpm format:fix  # Quality gates
-bd close <ids>                                  # Close issues
 git pull --rebase                               # Get latest
-bd sync                                         # Sync beads
 git add . && git commit -m "..."               # Commit
 git push                                        # Push (MANDATORY)
 git status                                      # Verify
