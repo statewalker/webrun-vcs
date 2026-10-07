@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fetch as fetchPack } from "../../src/operations/fetch.js";
 import { lsRemote } from "../../src/operations/ls-remote.js";
+import { push } from "../../src/operations/push.js";
 
 const enc = new TextEncoder();
 const pkt = (line: string) =>
@@ -49,5 +50,49 @@ describe("smart-HTTP operations against a real-format advertisement", () => {
     // A second flush before `done` ends the negotiation: the server answers NAK and sends no pack.
     expect(body).not.toContain("00000000");
     expect(body.endsWith(`0000${pkt("done\n")}`)).toBe(true);
+  });
+});
+
+describe("smart-HTTP operations with a token", () => {
+  const url = "https://example.test/repo.git";
+  const auth = { token: "ghp_secret" };
+
+  /** A fake server that records the Authorization header of every request. */
+  function recordingServer(service: string) {
+    const authorizations: (string | null)[] = [];
+    const fetchImpl = async (request: Request): Promise<Response> => {
+      authorizations.push(request.headers.get("Authorization"));
+      if (request.url.endsWith(`/info/refs?service=${service}`))
+        return new Response(advertisement.replace("git-upload-pack", service));
+      return new Response("0000");
+    };
+    return { fetchImpl, authorizations };
+  }
+
+  it("push sends the token as a Bearer Authorization header", async () => {
+    const { fetchImpl, authorizations } = recordingServer("git-receive-pack");
+    await push({
+      url,
+      auth,
+      fetchImpl,
+      refspecs: ["refs/heads/master:refs/heads/master"],
+      getLocalRef: async () => TEST,
+      getObjectsToPush: async function* () {},
+    }).catch(() => {});
+    // GET /info/refs, then POST /git-receive-pack
+    expect(authorizations).toEqual(["Bearer ghp_secret", "Bearer ghp_secret"]);
+  });
+
+  it("fetch and lsRemote send the token as a Bearer Authorization header", async () => {
+    const { fetchImpl, authorizations } = recordingServer("git-upload-pack");
+    await lsRemote(url, { auth, fetchImpl });
+    await fetchPack({ url, auth, fetchImpl }).catch(() => {});
+    expect(authorizations).toEqual(["Bearer ghp_secret", "Bearer ghp_secret", "Bearer ghp_secret"]);
+  });
+
+  it("username and password still go as Basic auth", async () => {
+    const { fetchImpl, authorizations } = recordingServer("git-upload-pack");
+    await lsRemote(url, { auth: { username: "user", password: "secret" }, fetchImpl });
+    expect(authorizations).toEqual([`Basic ${btoa("user:secret")}`]);
   });
 });

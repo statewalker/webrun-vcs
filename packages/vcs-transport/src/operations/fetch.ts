@@ -8,6 +8,7 @@
 import type { ProgressInfo } from "../api/credentials.js";
 import type { RawFetchResult } from "../api/fetch-result.js";
 import type { BaseFetchOptions, BaseHttpOptions } from "../api/options.js";
+import { authorizationHeader } from "./http-auth.js";
 
 /**
  * @deprecated Use {@link RawFetchResult} from `api/fetch-result.js` instead.
@@ -56,9 +57,7 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
 
   // Add authentication if provided
   if (options.auth) {
-    const { username, password } = options.auth;
-    const credentials = btoa(`${username}:${password}`);
-    headers.Authorization = `Basic ${credentials}`;
+    headers.Authorization = authorizationHeader(options.auth);
   }
 
   // Setup timeout handling
