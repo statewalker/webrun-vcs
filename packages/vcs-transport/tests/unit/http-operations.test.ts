@@ -56,6 +56,7 @@ describe("smart-HTTP operations against a real-format advertisement", () => {
 describe("smart-HTTP operations with a token", () => {
   const url = "https://example.test/repo.git";
   const auth = { token: "ghp_secret" };
+  const tokenBasic = `Basic ${btoa("x-access-token:ghp_secret")}`;
 
   /** A fake server that records the Authorization header of every request. */
   function recordingServer(service: string) {
@@ -69,7 +70,7 @@ describe("smart-HTTP operations with a token", () => {
     return { fetchImpl, authorizations };
   }
 
-  it("push sends the token as a Bearer Authorization header", async () => {
+  it("push sends the token as the Basic auth password", async () => {
     const { fetchImpl, authorizations } = recordingServer("git-receive-pack");
     await push({
       url,
@@ -80,14 +81,14 @@ describe("smart-HTTP operations with a token", () => {
       getObjectsToPush: async function* () {},
     }).catch(() => {});
     // GET /info/refs, then POST /git-receive-pack
-    expect(authorizations).toEqual(["Bearer ghp_secret", "Bearer ghp_secret"]);
+    expect(authorizations).toEqual([tokenBasic, tokenBasic]);
   });
 
-  it("fetch and lsRemote send the token as a Bearer Authorization header", async () => {
+  it("fetch and lsRemote send the token as the Basic auth password", async () => {
     const { fetchImpl, authorizations } = recordingServer("git-upload-pack");
     await lsRemote(url, { auth, fetchImpl });
     await fetchPack({ url, auth, fetchImpl }).catch(() => {});
-    expect(authorizations).toEqual(["Bearer ghp_secret", "Bearer ghp_secret", "Bearer ghp_secret"]);
+    expect(authorizations).toEqual([tokenBasic, tokenBasic, tokenBasic]);
   });
 
   it("username and password still go as Basic auth", async () => {

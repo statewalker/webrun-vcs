@@ -63,7 +63,7 @@ All entry points are ESM with type declarations.
 | `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip` |
 | `RepositoryAccess` | Object/ref access: `hasObject`, `getObjectInfo`, `loadObject`, `storeObject`, `listRefs`, `getHead`, `updateRef`, `walkObjects` |
 | `TransportApi` | Pkt-line, sideband and pack I/O over a `Duplex` |
-| `Credentials` | `{ username?, password?, token? }`. The HTTP operations send `token` as a Bearer token, otherwise `username`/`password` as Basic auth. |
+| `Credentials` | `{ username?, password?, token? }`. The HTTP operations send Basic auth: `token` as the password (username defaults to `x-access-token`), otherwise `username`/`password`. |
 
 #### Adapters
 
@@ -256,7 +256,7 @@ The transport never touches storage directly. It needs only a `RepositoryFacade`
 ### Constraints
 
 - HTTP `fetch` and `clone` return raw pack bytes and binary OIDs; they do not import anything. The duplex operations do import into the given `RepositoryFacade` and update the `RefStore`.
-- HTTP `fetch`, `push`, `clone` and `lsRemote` send `auth.token` as `Authorization: Bearer <token>`; without a token they send Basic auth from `auth.username` and `auth.password`. A server that takes a token only as a Basic password answers a Bearer token with `401`; pass the token as `password` for such a server.
+- HTTP `fetch`, `push`, `clone` and `lsRemote` send Basic auth. With `auth.token`, the token is the password and the username is `auth.username`, defaulting to `x-access-token` (GitHub and GitLab accept any username with a token; Bitbucket expects `x-token-auth`, passed as `username`). Without a token they use `auth.username` and `auth.password`.
 - `clone` accepts `bare` and `remoteName` in its options type but does not use them.
 - `fetchOverDuplex` resolves `localHead` (default `refs/heads/main`) to pick negotiation haves and sends at most `maxHaves` (default 256).
 - Pkt-lines are limited to 65520 bytes (`MAX_PACKET_SIZE`). Larger packets fail with `Packet too large: <n> bytes (max 65520)`.
