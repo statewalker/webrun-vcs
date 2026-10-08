@@ -53,3 +53,9 @@ catalogs:
   peers:
     "sql.js": ">=1.14.1"
     "vitest": "^4.1.4 || ^5.0.3"
+
+# Security fixes for transitive dependencies whose parents pin a vulnerable version.
+# Remove an entry once its parent ships a release with the fixed version.
+overrides:
+  # @observablehq/framework requires esbuild ^0.27.3
+  "esbuild@>=0.27.3 <0.28.1": ^0.28.1
