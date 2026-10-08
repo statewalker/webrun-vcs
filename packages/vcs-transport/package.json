@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Git transport protocol implementation (fetch, push, clone over HTTP/WebSocket/WebRTC)",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

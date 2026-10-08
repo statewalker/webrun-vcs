@@ -1,5 +1,15 @@
 # @statewalker/vcs-core
 
+## 0.3.4
+
+### Patch Changes
+
+- Release of the changes since the last published version:
+  
+  - files changed: dist/index.js
+- Updated dependencies
+  - @statewalker/vcs-utils@0.3.3
+
 ## 0.3.3
 
 ### Patch Changes
