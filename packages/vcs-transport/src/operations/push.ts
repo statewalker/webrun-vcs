@@ -11,6 +11,7 @@ import { sha1 } from "@statewalker/vcs-utils/hash";
 import type { BaseHttpOptions, BasePushOptions } from "../api/options.js";
 import { ZERO_OID } from "../protocol/constants.js";
 import { createEmptyPack } from "../protocol/pack-utils.js";
+import { authorizationHeader } from "./http-auth.js";
 
 /**
  * An object to push to the remote.
@@ -108,9 +109,7 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
 
   // Add authentication if provided
   if (options.auth) {
-    const { username, password } = options.auth;
-    const credentials = btoa(`${username}:${password}`);
-    headers.Authorization = `Basic ${credentials}`;
+    headers.Authorization = authorizationHeader(options.auth);
   }
 
   // Setup timeout handling

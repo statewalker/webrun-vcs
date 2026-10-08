@@ -6,6 +6,7 @@
 
 import type { Credentials } from "../api/credentials.js";
 import { parseBufferedAdvertisement } from "../protocol/advertisement-parser.js";
+import { authorizationHeader } from "./http-auth.js";
 
 /**
  * Options for ls-remote operation.
@@ -61,9 +62,7 @@ export async function lsRemote(
 
   // Add authentication if provided
   if (options?.auth) {
-    const { username, password } = options.auth;
-    const credentials = btoa(`${username}:${password}`);
-    headers.Authorization = `Basic ${credentials}`;
+    headers.Authorization = authorizationHeader(options.auth);
   }
 
   // Perform the HTTP request

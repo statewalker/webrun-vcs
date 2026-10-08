@@ -63,7 +63,7 @@ All entry points are ESM with type declarations.
 | `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip` |
 | `RepositoryAccess` | Object/ref access: `hasObject`, `getObjectInfo`, `loadObject`, `storeObject`, `listRefs`, `getHead`, `updateRef`, `walkObjects` |
 | `TransportApi` | Pkt-line, sideband and pack I/O over a `Duplex` |
-| `Credentials` | `{ username?, password?, token? }`. The HTTP operations use `username`/`password` only. |
+| `Credentials` | `{ username?, password?, token? }`. The HTTP operations send Basic auth: `token` as the password (username defaults to `x-access-token`), otherwise `username`/`password`. |
 
 #### Adapters
 
@@ -134,7 +134,7 @@ console.log(fetched.defaultBranch, fetched.bytesReceived, fetched.packData.lengt
 const cloned = await clone({ url: "https://example.com/user/repo.git", depth: 1 });
 ```
 
-Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }`), `headers`, `timeout` (ms), and `fetchImpl` (a `(Request) => Promise<Response>` used instead of `globalThis.fetch`). `fetch` also accepts `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage`. `clone` accepts `branch`, `depth`, `onProgress`, `onProgressMessage`.
+Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }` or `{ token }`), `headers`, `timeout` (ms), and `fetchImpl` (a `(Request) => Promise<Response>` used instead of `globalThis.fetch`). `fetch` also accepts `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage`. `clone` accepts `branch`, `depth`, `onProgress`, `onProgressMessage`.
 
 ### HTTP: push
 
@@ -256,7 +256,7 @@ The transport never touches storage directly. It needs only a `RepositoryFacade`
 ### Constraints
 
 - HTTP `fetch` and `clone` return raw pack bytes and binary OIDs; they do not import anything. The duplex operations do import into the given `RepositoryFacade` and update the `RefStore`.
-- HTTP authentication is Basic auth from `auth.username` and `auth.password`. `Credentials.token` is accepted by the type but not sent by `fetch`, `push`, `clone` or `lsRemote`; pass a token as `password` or as an `Authorization` header in `headers`.
+- HTTP `fetch`, `push`, `clone` and `lsRemote` send Basic auth. With `auth.token`, the token is the password and the username is `auth.username`, defaulting to `x-access-token` (GitHub and GitLab accept any username with a token; Bitbucket expects `x-token-auth`, passed as `username`). Without a token they use `auth.username` and `auth.password`.
 - `clone` accepts `bare` and `remoteName` in its options type but does not use them.
 - `fetchOverDuplex` resolves `localHead` (default `refs/heads/main`) to pick negotiation haves and sends at most `maxHaves` (default 256).
 - Pkt-lines are limited to 65520 bytes (`MAX_PACKET_SIZE`). Larger packets fail with `Packet too large: <n> bytes (max 65520)`.

@@ -12,7 +12,7 @@ export interface Credentials {
   username?: string;
   /** Password for HTTP Basic authentication */
   password?: string;
-  /** Bearer token for token-based authentication */
+  /** Access token, sent as the HTTP Basic password (username defaults to `x-access-token`) */
   token?: string;
 }
 
