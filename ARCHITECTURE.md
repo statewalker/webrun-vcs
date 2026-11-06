@@ -2,10 +2,10 @@
 
 > **Superseded.** This document describes the original single-core design and is no longer
 > authoritative. The current architecture is the **two-axis** design pinned in the Architecture
-> Decision Records under [`docs/adr/`](docs/adr/) — [ADR-0001 (two-axis
-> spine)](docs/adr/0001-two-axis-architecture.md), [ADR-0002 (transport
-> substrate)](docs/adr/0002-transport-substrate.md), and [ADR-0003 (large-object
-> plane)](docs/adr/0003-large-object-plane.md). Read ADR-0001..0003 for the authoritative,
+> Decision Records under [`docs/adr/`](https://github.com/statewalker/webrun-vcs/tree/4c61bd89dd7be3bca68442f4c3efbff25a9a36d1/docs/adr) — [ADR-0001 (two-axis
+> spine)](https://github.com/statewalker/webrun-vcs/blob/4c61bd89dd7be3bca68442f4c3efbff25a9a36d1/docs/adr/0001-two-axis-architecture.md), [ADR-0002 (transport
+> substrate)](https://github.com/statewalker/webrun-vcs/blob/4c61bd89dd7be3bca68442f4c3efbff25a9a36d1/docs/adr/0002-transport-substrate.md), and [ADR-0003 (large-object
+> plane)](https://github.com/statewalker/webrun-vcs/blob/4c61bd89dd7be3bca68442f4c3efbff25a9a36d1/docs/adr/0003-large-object-plane.md). Read ADR-0001..0003 for the authoritative,
 > as-implemented architecture; the sections below are retained for historical context only.
 
 This document explains the overall architecture of the StateWalker VCS monorepo, covering design philosophy, package organization, and how the components work together.
