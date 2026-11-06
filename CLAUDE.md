@@ -75,9 +75,9 @@ Exploration notes: `notes/src/YYYY-MM-DD/CC-[project]-subject.md`
 **[Full Guide](.claude/workflows/note-organization.md)**
 
 ### Planning
-Approved plans: `planning/YYYY-MM-DD/CC-[project]-subject.md`
-
-**[Full Guide](.claude/workflows/planning-organization.md)**
+Approved plans, specs and decision records are not kept in this repo. They live in the
+notes archive, in the project folder `$NOTES_DIR/docs/repositories-and-workspace/vcs-refactor/`
+(`plans/YYYY-MM-DD-<slug>.md`, `adr/YYYY-MM-DD-<slug>.md`); see `$NOTES_DIR/docs/CLAUDE.md`.
 
 ### Pull Requests
 Branch from `main`, use descriptive branch names (`feat/X`, `fix/Y`). PR titles under 70 chars. Include a test plan in the description.

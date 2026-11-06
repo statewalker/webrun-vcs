@@ -311,9 +311,9 @@ pnpm --filter @statewalker/vcs-benchmark-real-repo-perf start
 
 ## Related Documentation
 
-- [ADR-0001 — Two-Axis Architecture](adr/0001-two-axis-architecture.md) — the authoritative design
-- [ADR-0002 — Transport Substrate](adr/0002-transport-substrate.md)
-- [ADR-0003 — Large-Object Plane](adr/0003-large-object-plane.md) — LFS/Xet
+- [ADR-0001 — Two-Axis Architecture](https://github.com/statewalker/webrun-vcs/blob/4c61bd89dd7be3bca68442f4c3efbff25a9a36d1/docs/adr/0001-two-axis-architecture.md) — the authoritative design
+- [ADR-0002 — Transport Substrate](https://github.com/statewalker/webrun-vcs/blob/4c61bd89dd7be3bca68442f4c3efbff25a9a36d1/docs/adr/0002-transport-substrate.md)
+- [ADR-0003 — Large-Object Plane](https://github.com/statewalker/webrun-vcs/blob/4c61bd89dd7be3bca68442f4c3efbff25a9a36d1/docs/adr/0003-large-object-plane.md) — LFS/Xet
 - [Package Dependencies](package-dependencies.md) — package relationship diagram
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — system architecture overview
 - [README.md](../README.md) — getting started guide
