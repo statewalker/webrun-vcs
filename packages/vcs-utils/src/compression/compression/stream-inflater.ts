@@ -12,6 +12,7 @@
  */
 import {
   Z_BUF_ERROR,
+  Z_NEED_DICT,
   Z_NO_FLUSH,
   Z_OK,
   Z_STREAM_END,
@@ -51,12 +52,20 @@ export interface InflatePush {
 
 /**
  * Inflates one stream from chunks pushed in order. After `done`, the bytes past
- * `consumed` belong to whatever follows the stream. Call `end()` when the input
- * is over: it throws `TruncatedStreamError` if the stream did not finish.
+ * `consumed` belong to whatever follows the stream.
+ *
+ * - `end()`: the input is over. Throws `TruncatedStreamError` if the stream did
+ *   not finish; does nothing after `done` or after a failed push.
+ * - `abort()`: give the stream up without an error (for example when the
+ *   caller's own code failed between pushes). Never throws.
+ *
+ * After `done`, a failed push, `end()` or `abort()`, the inflater is closed and
+ * `push` throws a `CompressionError`; its state is already back in the pool.
  */
 export interface StreamInflater {
   push(chunk: Uint8Array): InflatePush;
   end(): void;
+  abort(): void;
 }
 
 export interface InflaterOptions {
@@ -67,9 +76,9 @@ export interface InflaterOptions {
 /** A cache of inflate states. `createInflater` uses a shared one. */
 export interface InflaterPool {
   acquire(options?: InflaterOptions): StreamInflater;
-  /** States allocated so far. */
+  /** Diagnostics: states allocated so far. */
   readonly allocated: number;
-  /** Idle states held for reuse (at most 4 per format). */
+  /** Diagnostics: idle states held for reuse (at most 4 per format). */
   readonly idle: number;
 }
 
@@ -103,6 +112,9 @@ function pushInto(strm: ZStream, buf: Uint8Array<ArrayBuffer>, chunk: Uint8Array
     const produced = buf.length - strm.avail_out;
     if (produced > 0) out.push(buf.slice(0, produced));
     if (ret === Z_STREAM_END) return { out, done: true, consumed: strm.next_in };
+    if (ret === Z_NEED_DICT) {
+      throw new InflateError("inflate failed: the stream needs a preset dictionary");
+    }
     if (ret !== Z_OK && ret !== Z_BUF_ERROR) {
       throw new InflateError(`inflate failed: ${strm.msg || `code ${ret}`}`);
     }
@@ -165,7 +177,11 @@ export function createInflaterPool(): InflaterPool {
       };
       return {
         push(chunk) {
-          if (!owned) throw new Error("inflater used after its stream ended");
+          if (!owned) {
+            throw new CompressionError(
+              "inflater is closed: its stream finished, failed, was ended or was aborted",
+            );
+          }
           if (chunk.length === 0) return { out: [], done: false, consumed: 0 };
           let r: InflatePush;
           try {
@@ -186,6 +202,9 @@ export function createInflaterPool(): InflaterPool {
             giveBack();
             throw new TruncatedStreamError();
           }
+        },
+        abort() {
+          giveBack();
         },
       };
     },

@@ -236,11 +236,11 @@ describe("createInflaterPool: state reuse (JGit InflaterCache)", () => {
     const a = pool.acquire();
     a.push(streams[1] ?? new Uint8Array());
     a.end();
-    expect(() => a.push(Uint8Array.of(1))).toThrow(/after its stream ended/);
+    expect(() => a.push(Uint8Array.of(1))).toThrow(/inflater is closed/);
     const b = pool.acquire(); // reuses a's state
     const parts = [...chunked(good, 5)];
     const out: Uint8Array[] = [...b.push(parts[0] ?? new Uint8Array()).out];
-    expect(() => a.push(Uint8Array.of(0x78, 0x9c))).toThrow(/after its stream ended/);
+    expect(() => a.push(Uint8Array.of(0x78, 0x9c))).toThrow(/inflater is closed/);
     for (const p of parts.slice(1)) out.push(...b.push(p).out);
     b.end();
     expect(eq(concat(out), goodInput)).toBe(true);
@@ -263,6 +263,79 @@ describe("createInflaterPool: state reuse (JGit InflaterCache)", () => {
       gc();
     }
     expect(ref.deref()).toBeUndefined();
+  });
+});
+
+describe("createInflater: closing and edge cases", () => {
+  const z = new Uint8Array(deflateSync(enc.encode("edge ".repeat(500))));
+
+  it("detects truncation of a raw stream", () => {
+    const raw = new Uint8Array(deflateRawSync(enc.encode("raw ".repeat(500))));
+    const inf = createInflater({ raw: true });
+    expect(inf.push(raw.subarray(0, raw.length - 1)).done).toBe(false);
+    expect(() => inf.end()).toThrow(TruncatedStreamError);
+  });
+
+  it("treats an empty chunk as a no-op", () => {
+    const inf = createInflater();
+    expect(inf.push(new Uint8Array(0))).toEqual({ out: [], done: false, consumed: 0 });
+    const r = inf.push(z);
+    expect(r.done).toBe(true);
+    expect(r.consumed).toBe(z.length);
+  });
+
+  it("is closed after a failed push: end() is quiet, push() throws a CompressionError", () => {
+    const pool = createInflaterPool();
+    const inf = pool.acquire();
+    const bad = z.slice();
+    bad[0] = 0;
+    expect(() => inf.push(bad)).toThrow(InflateError);
+    expect(() => inf.end()).not.toThrow();
+    const err = (() => {
+      try {
+        inf.push(z);
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(err).toBeInstanceOf(CompressionError);
+    expect(err).not.toBeInstanceOf(InflateError);
+    expect(String(err)).toMatch(/inflater is closed/);
+    expect(pool.idle).toBe(1);
+  });
+
+  it("abort() returns the state without an error, and closes the inflater", () => {
+    const pool = createInflaterPool();
+    const inf = pool.acquire();
+    inf.push(z.subarray(0, 10));
+    expect(() => inf.abort()).not.toThrow();
+    expect(() => inf.abort()).not.toThrow();
+    expect(() => inf.push(z)).toThrow(/inflater is closed/);
+    const [r] = inflateAll(() => pool.acquire(), [z], 1);
+    expect(r?.compressedLength).toBe(z.length);
+    expect(pool.allocated).toBe(1);
+  });
+
+  it("caps idle states per format: 4 zlib and 4 raw", () => {
+    const pool = createInflaterPool();
+    const raw = new Uint8Array(deflateRawSync(enc.encode("r")));
+    const held = [
+      ...Array.from({ length: 5 }, () => [pool.acquire(), z] as const),
+      ...Array.from({ length: 5 }, () => [pool.acquire({ raw: true }), raw] as const),
+    ];
+    for (const [inf, bytes] of held) {
+      inf.push(bytes);
+      inf.end();
+    }
+    expect(pool.idle).toBe(8);
+  });
+
+  it("names a stream that needs a preset dictionary", () => {
+    // zlib header with FDICT set (0x78 0xbb) followed by a dictionary id.
+    const inf = createInflater();
+    expect(() => inf.push(Uint8Array.of(0x78, 0xbb, 0, 0, 0, 1, 3, 0))).toThrow(
+      /preset dictionary/,
+    );
   });
 });
 

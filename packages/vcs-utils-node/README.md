@@ -35,7 +35,7 @@ setCompressionUtils(createNodeCompression());
 
 ### Switch all compression to zlib
 
-After `setCompressionUtils()`, every compression call in `@statewalker/vcs-utils`, and in the packages built on it, goes through `node:zlib`.
+After `setCompressionUtils()`, `deflate`, `inflate`, `compressBlock` and `decompressBlock` in `@statewalker/vcs-utils`, and in the packages built on it, go through `node:zlib`. Finding where a compressed stream ends (`decompressBlockPartial`, `createInflater`, `BufferedByteReader`) stays on the portable push inflater, because `node:zlib` cannot report it.
 
 ```typescript
 import { compressBlock, decompressBlock, setCompressionUtils } from "@statewalker/vcs-utils/compression";

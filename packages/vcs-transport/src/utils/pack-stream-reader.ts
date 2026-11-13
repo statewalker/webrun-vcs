@@ -4,9 +4,8 @@
  * Reads exactly one Git pack from a byte stream by parsing the pack header
  * and object boundaries. Stops after the checksum without consuming more data.
  *
- * Uses `decompressBlockPartial` from vcs-utils to detect compressed data
- * boundaries for each object — the only reliable way to find where one object's
- * compressed data ends and the next begins.
+ * Uses `BufferedByteReader` from vcs-utils, whose push inflater finds exactly
+ * where each object's compressed data ends and the next begins.
  */
 
 import { BufferedByteReader } from "@statewalker/vcs-utils/streams";

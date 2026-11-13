@@ -193,7 +193,7 @@ const { out, done, consumed } = inf.push(chunk); // repeat per chunk
 inf.end(); // TruncatedStreamError if the stream never finished
 ```
 
-The inflater runs on pako's low-level inflate with `Z_NO_FLUSH`. Chunks may split anywhere, the end is exact (pako's input position at `Z_STREAM_END`), and a stream counts as finished only after its Adler-32 trailer is verified. So truncated input is an error (`TruncatedStreamError`), never short data, and corruption is `InflateError`. States are pooled after JGit's `InflaterCache` (4 idle per format, reset on release). `@statewalker/vcs-utils-node` no longer replaces partial decompression: its binary search cost log2(n) inflates per object.
+The inflater runs on pako's low-level inflate with `Z_NO_FLUSH`. Chunks may split anywhere, the end is exact (pako's input position at `Z_STREAM_END`), and a stream counts as finished only after its Adler-32 trailer is verified. So truncated input is an error (`TruncatedStreamError`), never short data, and corruption is `InflateError`. States are pooled after JGit's `InflaterCache` (4 idle per format, reset on release). `@statewalker/vcs-utils-node` no longer replaces partial decompression: its binary search cost log2(n) inflates per object. The push inflater and `BufferedByteReader` sit below the `setCompressionUtils` seam on purpose: only pako exposes the end of a stream. A `decompressBlockPartial` registered through `setCompressionUtils` replaces the default, and with it these guarantees.
 
 ## Diff Module Deep Dive
 

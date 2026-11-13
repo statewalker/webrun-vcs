@@ -16,6 +16,8 @@ export class BufferedByteReader {
   private buffer: Uint8Array = new Uint8Array(0);
   private iterator: AsyncIterator<Uint8Array>;
   private done = false;
+  /** An error found while skipping the rest of a block the consumer abandoned. */
+  private failure: unknown;
 
   constructor(iterator: AsyncIterator<Uint8Array>) {
     this.iterator = iterator;
@@ -44,6 +46,7 @@ export class BufferedByteReader {
 
   /** Read exactly `n` bytes. Throws if stream ends prematurely. */
   async readExact(n: number): Promise<Uint8Array> {
+    this.checkFailure();
     await this.ensureBytes(n);
     if (this.buffer.length < n) {
       throw new Error(`Unexpected end of stream: wanted ${n} bytes, have ${this.buffer.length}`);
@@ -77,7 +80,10 @@ export class BufferedByteReader {
    * Read one zlib-compressed block from the stream and yield its content in
    * pieces as it inflates, so a large object is never held whole.
    *
-   * Same guarantees as `readCompressedObject()`.
+   * Same guarantees as `readCompressedObject()`. Stopping early (`break`) is
+   * safe: the rest of the block is read and discarded, so the reader is left on
+   * the first byte after it. If that rest turns out truncated or corrupt, the
+   * next read throws the error.
    *
    * @param expectedSize - Expected decompressed size (for validation)
    */
@@ -102,41 +108,53 @@ export class BufferedByteReader {
    * each push; collects the stream's compressed bytes if asked.
    */
   private async *inflateBlock(compressed?: Uint8Array[]): AsyncGenerator<Uint8Array[]> {
+    this.checkFailure();
     const inf = createInflater();
     let finished = false;
-    try {
-      for (;;) {
-        if (this.buffer.length === 0) {
-          const { value, done } = this.done
-            ? { value: undefined, done: true }
-            : await this.iterator.next();
-          if (done || !value) {
-            this.done = true;
-            throw new TruncatedStreamError(
-              "Incomplete compressed data in stream: it ended before the end of the zlib stream",
-            );
-          }
-          this.buffer = value;
-          continue;
+    let failed = false;
+    /** Pull the next chunk if needed and push it; returns the push result. */
+    const step = async () => {
+      while (this.buffer.length === 0) {
+        const { value, done } = this.done
+          ? { value: undefined, done: true }
+          : await this.iterator.next();
+        if (done || !value) {
+          this.done = true;
+          throw new TruncatedStreamError(
+            "Incomplete compressed data in stream: it ended before the end of the zlib stream",
+          );
         }
-        const r = inf.push(this.buffer);
-        compressed?.push(this.buffer.subarray(0, r.consumed));
-        this.buffer = this.buffer.subarray(r.consumed);
-        yield r.out;
-        if (r.done) {
-          finished = true;
-          return;
-        }
+        this.buffer = value;
       }
+      const r = inf.push(this.buffer);
+      compressed?.push(this.buffer.subarray(0, r.consumed));
+      this.buffer = this.buffer.subarray(r.consumed);
+      finished = r.done;
+      return r;
+    };
+    try {
+      while (!finished) yield (await step()).out;
+    } catch (e) {
+      failed = true;
+      inf.abort();
+      throw e;
     } finally {
-      if (!finished) {
+      // The consumer stopped early: read the rest of the block, discarding its
+      // output, so the reader still ends up on the first byte after it.
+      if (!finished && !failed) {
         try {
-          inf.end();
-        } catch {
-          // The stream is abandoned; end() only returns its state to the pool.
+          while (!finished) await step();
+        } catch (e) {
+          // No throw from `finally`: the next read reports it instead.
+          inf.abort();
+          this.failure = e;
         }
       }
     }
+  }
+
+  private checkFailure(): void {
+    if (this.failure !== undefined) throw this.failure;
   }
 
   /** Returns any unread buffered bytes. */
