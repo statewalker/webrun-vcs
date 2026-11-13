@@ -6,7 +6,7 @@
  */
 
 import { encodeObjectHeader, type ObjectId } from "@statewalker/vcs-core";
-import { bytesToHex, compressBlock, decompressBlock, Sha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, compressBlock, createSha1, decompressBlock } from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 import type { SqlNativeBlobStore } from "./types.js";
 
@@ -124,14 +124,14 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
     }
 
     // Compute Git hash: "blob <size>\0<content>"
-    const sha1 = new Sha1();
+    const sha1 = createSha1();
     sha1.update(encodeObjectHeader("blob", totalSize));
     for (const chunk of chunks) {
       sha1.update(chunk);
     }
 
     return {
-      hash: bytesToHex(sha1.finalize()),
+      hash: bytesToHex(sha1.digest()),
       chunks,
       totalSize,
     };

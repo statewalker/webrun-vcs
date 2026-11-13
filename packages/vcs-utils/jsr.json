@@ -7,6 +7,7 @@
     "./hash": "./src/hash/index.ts",
     "./hash/crc32": "./src/hash/crc32/index.ts",
     "./hash/sha1": "./src/hash/sha1/index.ts",
+    "./hash/hasher": "./src/hash/hasher/index.ts",
     "./hash/utils": "./src/hash/utils/index.ts",
     "./hash/fossil-checksum": "./src/hash/fossil-checksum/index.ts",
     "./hash/rolling-checksum": "./src/hash/rolling-checksum/index.ts",
@@ -16,6 +17,7 @@
     "./streams": "./src/streams/index.ts",
     "./ports": "./src/ports/index.ts",
     "./cache": "./src/cache/index.ts",
-    "./files": "./src/files/index.ts"
+    "./files": "./src/files/index.ts",
+    "./pack": "./src/pack/index.ts"
   }
 }

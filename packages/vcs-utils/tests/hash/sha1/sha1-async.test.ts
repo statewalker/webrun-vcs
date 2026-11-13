@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sha1, sha1Sync } from "../../../src/hash/sha1/sha1-async.js";
+import { sha1 } from "../../../src/hash/sha1/sha1-async.js";
 import { bytesToHex } from "../../../src/hash/utils/index.js";
 
 describe("sha1 (async)", () => {
@@ -29,17 +29,25 @@ describe("sha1 (async)", () => {
   });
 });
 
-describe("sha1Sync", () => {
-  it("matches async sha1 result", async () => {
-    const data = new TextEncoder().encode("hello");
-    const asyncResult = await sha1(data);
-    const syncResult = sha1Sync(data);
-    expect(bytesToHex(syncResult)).toBe(bytesToHex(asyncResult));
+describe("sha1 of a view", () => {
+  it("hashes only the bytes of a subarray at a non-zero offset", async () => {
+    const whole = new TextEncoder().encode("xxhelloyy");
+    expect(bytesToHex(await sha1(whole.subarray(2, 7)))).toBe(
+      "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+    );
   });
+});
 
-  it("returns Uint8Array", () => {
-    const data = new TextEncoder().encode("test");
-    const result = sha1Sync(data);
-    expect(result).toBeInstanceOf(Uint8Array);
+describe("sha1 without Web Crypto", () => {
+  it("falls back to the portable hasher with the same result", async () => {
+    const data = new TextEncoder().encode("hello");
+    const native = await sha1(data);
+    const saved = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+    Object.defineProperty(globalThis, "crypto", { value: undefined, configurable: true });
+    try {
+      expect(bytesToHex(await sha1(data))).toBe(bytesToHex(native));
+    } finally {
+      if (saved) Object.defineProperty(globalThis, "crypto", saved);
+    }
   });
 });

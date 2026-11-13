@@ -38,6 +38,7 @@ catalog:
   "@vitest/browser": ^5.0.3
   "@vitest/coverage-v8": ^5.0.3
   livekit-client: ^2.22.3
+  "@noble/hashes": ^2.0.1
   pako: ^3.0.2
   peerjs: ^1.5.5
   playwright: ^1.63.0

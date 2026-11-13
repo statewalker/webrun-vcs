@@ -15,7 +15,7 @@ import {
   type Tree,
   type TreeEntry,
 } from "@statewalker/vcs-core";
-import { bytesToHex, Sha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 import type { SqlNativeTreeStore } from "./types.js";
 
@@ -46,14 +46,14 @@ async function computeGitTreeId(entries: TreeEntry[]): Promise<ObjectId> {
 
   const size = await computeTreeSize(sorted);
 
-  const sha1 = new Sha1();
+  const sha1 = createSha1();
   sha1.update(encodeObjectHeader("tree", size));
 
   for await (const chunk of encodeTreeEntries(sorted)) {
     sha1.update(chunk);
   }
 
-  return bytesToHex(sha1.finalize());
+  return bytesToHex(sha1.digest());
 }
 
 /**

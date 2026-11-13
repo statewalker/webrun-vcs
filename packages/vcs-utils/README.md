@@ -16,14 +16,15 @@ The output is byte-compatible with Git: object hashes, zlib streams and pack del
 pnpm add @statewalker/vcs-utils
 ```
 
-No peer dependencies.
+No peer dependencies. Hashing uses `@noble/hashes`.
 
 | Import path | Contents |
 |-------------|----------|
 | `@statewalker/vcs-utils` | Re-exports `cache`, `compression`, `diff`, `encoding`, `hash`, `streams`, plus `insertSorted` / `insertByTimestamp`. Does not include `files`, `ports` or `pack`. |
 | `@statewalker/vcs-utils/compression` | `deflate`, `inflate` (streams), `compressBlock`, `decompressBlock`, `decompressBlockPartial`, `setCompressionUtils`, `CompressionError`, pako and stream helpers |
 | `@statewalker/vcs-utils/hash` | All of the `hash/*` entries below, plus `fnv1aHash` |
-| `@statewalker/vcs-utils/hash/sha1` | `sha1` (async), `sha1Sync`, `Sha1`, `newSha1` |
+| `@statewalker/vcs-utils/hash/hasher` | `Hasher`, `createSha1` |
+| `@statewalker/vcs-utils/hash/sha1` | `sha1` (async one-shot) |
 | `@statewalker/vcs-utils/hash/crc32` | `crc32`, `CRC32` |
 | `@statewalker/vcs-utils/hash/fossil-checksum` | `FossilChecksum` |
 | `@statewalker/vcs-utils/hash/rolling-checksum` | `RollingChecksum`, `JgitRollingHash` and related helpers |
@@ -35,22 +36,41 @@ No peer dependencies.
 | `@statewalker/vcs-utils/cache` | `LRUCache`, `IntermediateCache` |
 | `@statewalker/vcs-utils/files` | `FilesApi` type, `createInMemoryFilesApi`, `readFile`, `readText`, `tryReadText`, `readAt`, `readRange`, path helpers, `FileMode` |
 | `@statewalker/vcs-utils/ports` | Request/response over `MessagePort`: `callPort`, `listenPort`, `callBidi`, `listenBidi`, `send`, `receive`, ... |
-| `@statewalker/vcs-utils/pack` | Pack helpers: `parsePackHeader`, `computeObjectId`, `packTypeToString`, `MemoryPackObjectCache`, async varint readers |
+| `@statewalker/vcs-utils/pack` | Pack helpers: `parsePackHeader`, `computeObjectId`, `computeObjectIdFromStream`, `SizeMismatchError`, `packTypeToString`, `MemoryPackObjectCache`, async varint readers |
 
 ## Examples
 
 ### Hash a Git object
 
 ```typescript
-import { sha1, sha1Sync } from "@statewalker/vcs-utils/hash/sha1";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { computeObjectId, computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 
-const data = new TextEncoder().encode("Hello, World!");
-const id = bytesToHex(await sha1(data)); // Web Crypto when available
-const same = bytesToHex(sha1Sync(data)); // pure TypeScript, synchronous
+const content = new TextEncoder().encode("hello\n");
+await computeObjectId("blob", content);
+// "ce013625030ba8dba906f756967f9e9ca394464a", the id `git hash-object` prints
+
+// A file too large to hold: hash it as it streams, in one pass.
+const size = (await files.stats(path))?.size;
+if (size === undefined) throw new Error(`no such file: ${path}`);
+const id = await computeObjectIdFromStream("blob", size, files.read(path));
 ```
 
-For a Git object id, hash the header and content together: `computeObjectId("blob", content)` from `@statewalker/vcs-utils/pack` does that and returns the hex id.
+A git object id is the SHA-1 of `"<type> <size>\0"` followed by the content, so the stream form needs the size before the first byte. If the stream ends early, or runs past the declared size, it rejects with `SizeMismatchError` (`declared`, `actual`). An overrun is caught at the first chunk that crosses the size, nothing after it is pulled, and `actual` (above `declared`) counts up to that chunk.
+
+`computeObjectId` hashes small objects with the portable hasher and objects of 64 KiB and more with Web Crypto, where the runtime has it: each is the faster path for its size.
+
+### Incremental SHA-1
+
+```typescript
+import { bytesToHex, createSha1 } from "@statewalker/vcs-utils/hash";
+
+const h = createSha1().update(part1);
+const forked = h.clone().update(otherTail); // the shared prefix is hashed once
+h.update(part2);
+bytesToHex(h.digest());
+```
+
+`createSha1()` returns a `Hasher`: `update(bytes)` (chainable), `digest()` and `clone()`. Read `digest()` once; the hasher is spent after it and every later call throws, so `clone()` first if the state is still needed. For a buffer already in memory, `await sha1(bytes)` from `@statewalker/vcs-utils/hash/sha1` uses Web Crypto where the runtime has it and the portable hasher elsewhere.
 
 ### Compress and decompress
 
@@ -205,6 +225,7 @@ The text diff (`MyersDiff`, `HistogramDiff`, `RawText`, `RawTextComparator`, `Ed
 
 ### Dependencies
 
+- `@noble/hashes`: incremental SHA-1 (audited, dependency-free, runs in every JavaScript runtime). The `Hasher` interface keeps it replaceable by a native or WASM implementation.
 - `pako`: partial zlib decompression with byte accounting (see above), and an alternative pure-JS compression set (`createPakoCompression`).
 - `@statewalker/webrun-files-mem`: backs `createInMemoryFilesApi`. The `FilesApi` interface itself is declared in this package (`src/files/files-api.ts`) and matches the one implemented by the `@statewalker/webrun-files*` packages.
 - `@statewalker/webrun-files` is listed in `package.json`, but no source file imports it.

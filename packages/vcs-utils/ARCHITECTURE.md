@@ -44,7 +44,8 @@ This design enables processing multi-gigabyte files without loading everything i
 ```
 @statewalker/vcs-utils
 ├── hash/                 - Cryptographic and checksum algorithms
-│   ├── sha1/            - SHA-1 hash (Git object IDs)
+│   ├── hasher/          - Incremental hashes (Hasher, SHA-1)
+│   ├── sha1/            - One-shot SHA-1 (Git object IDs)
 │   ├── crc32/           - CRC32 checksums (pack files)
 │   ├── rolling-checksum/ - Rabin-Karp rolling hash (delta matching)
 │   ├── strong-checksum/ - FNV-1a hash (match confirmation)
@@ -75,35 +76,27 @@ The hash module provides multiple algorithms optimized for different use cases i
 
 | Algorithm | Output | Speed | Use Case |
 |-----------|--------|-------|----------|
-| SHA-1 | 20 bytes | Slow | Object IDs, content verification |
+| SHA-1 | 20 bytes | Moderate | Git object IDs, pack and index checksums |
 | CRC32 | 4 bytes | Fast | Pack file checksums |
 | RollingChecksum | 4 bytes | O(1) update | Delta block matching |
 | StrongChecksum | 4 bytes | Fast | Match confirmation |
 | FossilChecksum | 4 bytes | Fast | Delta reconstruction integrity |
 
-### SHA-1 Implementation
+### Cryptographic hashes
 
-The SHA-1 implementation provides both sync and async APIs:
+Incremental hashing goes through one interface, `Hasher`:
 
 ```typescript
-// Sync - pure TypeScript
-import { Sha1 } from "@statewalker/vcs-utils/hash/sha1";
-const hash = new Sha1().update(data).finalize();
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+const id = createSha1().update(header).update(content).digest();
 
-// Async - Web Crypto when available
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
-const hash = await sha1(data);
+const hash = await sha1(data); // one-shot, Web Crypto when available
 ```
 
-**Key Features:**
+`Hasher` is `update` / `digest` / `clone`, and a hasher is spent after `digest`. SHA-1 comes from `@noble/hashes`, which runs unchanged in browsers, workers, Node and Durable Objects; it replaced a vendored SHA-1 class that was 3.5× slower. SHA-256 (Git LFS) and BLAKE3 (Xet) will be added behind the same interface with the packages that need them, and so can a native (`node:crypto`) or WASM tier, without touching callers.
 
-- **Incremental hashing**: Update with chunks, finalize when ready
-- **State cloning**: Fork hash state for parallel computations
-- **Idempotent finalize**: Safe to call multiple times
-
-**Implementation Details:**
-
-The pure TypeScript implementation processes data in 64-byte blocks. For incremental updates, partial blocks are buffered until complete. The async variant uses Web Crypto SubtleCrypto when available for native acceleration.
+Which implementation is fastest depends on size. Web Crypto's digest is native but asynchronous: on Node 24 it hashes 64 MiB in 93 ms against noble's 349 ms, yet 100,000 small objects take 3.7 s against noble's 443 ms. `computeObjectId` therefore hashes objects under 64 KiB with noble and larger ones with Web Crypto. `computeObjectIdFromStream` always uses noble, because Web Crypto has no incremental API; in return the content is hashed in one pass and never held whole.
 
 ### Rolling Checksum (Rabin-Karp)
 
@@ -474,7 +467,7 @@ const knownVectors = [
 ];
 
 for (const { input, sha1 } of knownVectors) {
-  const result = bytesToHex(new Sha1().update(encode(input)).finalize());
+  const result = bytesToHex(createSha1().update(encode(input)).digest());
   expect(result).toBe(sha1);
 }
 ```

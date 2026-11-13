@@ -1,4 +1,4 @@
-import { Sha1 } from "@statewalker/vcs-utils/hash/sha1";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../../common/id/index.js";
 import type { VolatileContent, VolatileStore } from "../../storage/binary/volatile-store.js";
@@ -51,9 +51,9 @@ export async function handleTypedContent<T = ObjectId>({
 }
 
 async function getContentId(content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>) {
-  const hasher = new Sha1();
+  const hasher = createSha1();
   for await (const chunk of content) {
     hasher.update(chunk);
   }
-  return bytesToHex(hasher.finalize());
+  return bytesToHex(hasher.digest());
 }
