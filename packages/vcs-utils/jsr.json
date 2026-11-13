@@ -17,6 +17,7 @@
     "./streams": "./src/streams/index.ts",
     "./ports": "./src/ports/index.ts",
     "./cache": "./src/cache/index.ts",
-    "./files": "./src/files/index.ts"
+    "./files": "./src/files/index.ts",
+    "./pack": "./src/pack/index.ts"
   }
 }

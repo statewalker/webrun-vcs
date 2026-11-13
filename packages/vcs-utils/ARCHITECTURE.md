@@ -44,7 +44,7 @@ This design enables processing multi-gigabyte files without loading everything i
 ```
 @statewalker/vcs-utils
 ├── hash/                 - Cryptographic and checksum algorithms
-│   ├── hasher/          - Incremental SHA-1, SHA-256, BLAKE3
+│   ├── hasher/          - Incremental hashes (Hasher, SHA-1)
 │   ├── sha1/            - One-shot SHA-1 (Git object IDs)
 │   ├── crc32/           - CRC32 checksums (pack files)
 │   ├── rolling-checksum/ - Rabin-Karp rolling hash (delta matching)
@@ -77,8 +77,6 @@ The hash module provides multiple algorithms optimized for different use cases i
 | Algorithm | Output | Speed | Use Case |
 |-----------|--------|-------|----------|
 | SHA-1 | 20 bytes | Moderate | Git object IDs, pack and index checksums |
-| SHA-256 | 32 bytes | Moderate | Git LFS object IDs |
-| BLAKE3 | 32 bytes (or more) | Moderate | Xet chunk and Merkle hashes (keyed) |
 | CRC32 | 4 bytes | Fast | Pack file checksums |
 | RollingChecksum | 4 bytes | O(1) update | Delta block matching |
 | StrongChecksum | 4 bytes | Fast | Match confirmation |
@@ -86,7 +84,7 @@ The hash module provides multiple algorithms optimized for different use cases i
 
 ### Cryptographic hashes
 
-SHA-1 (git object ids), SHA-256 (Git LFS) and BLAKE3 (Hugging Face Xet) share one incremental interface:
+Incremental hashing goes through one interface, `Hasher`:
 
 ```typescript
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
@@ -96,9 +94,9 @@ import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 const hash = await sha1(data); // one-shot, Web Crypto when available
 ```
 
-`Hasher` is `update` / `digest` / `clone`. The implementations come from `@noble/hashes`, which runs unchanged in browsers, workers, Node and Durable Objects. The earlier vendored SHA-1 class is gone: noble is faster and maintained. Because callers see only `Hasher`, a native (`node:crypto`) or WASM tier can be put behind the same factories without touching them.
+`Hasher` is `update` / `digest` / `clone`, and a hasher is spent after `digest`. SHA-1 comes from `@noble/hashes`, which runs unchanged in browsers, workers, Node and Durable Objects; it replaced a vendored SHA-1 class that was 3.5× slower. SHA-256 (Git LFS) and BLAKE3 (Xet) will be added behind the same interface with the packages that need them, and so can a native (`node:crypto`) or WASM tier, without touching callers.
 
-`computeObjectId` and `computeObjectIdFromStream` (in `pack/`) build git ids on top of it; the stream form hashes content in one pass from a declared size, so large blobs are never read twice or held whole.
+Which implementation is fastest depends on size. Web Crypto's digest is native but asynchronous: on Node 24 it hashes 64 MiB in 93 ms against noble's 349 ms, yet 100,000 small objects take 3.7 s against noble's 443 ms. `computeObjectId` therefore hashes objects under 64 KiB with noble and larger ones with Web Crypto. `computeObjectIdFromStream` always uses noble, because Web Crypto has no incremental API; in return the content is hashed in one pass and never held whole.
 
 ### Rolling Checksum (Rabin-Karp)
 
@@ -469,7 +467,7 @@ const knownVectors = [
 ];
 
 for (const { input, sha1 } of knownVectors) {
-  const result = bytesToHex(new Sha1().update(encode(input)).finalize());
+  const result = bytesToHex(createSha1().update(encode(input)).digest());
   expect(result).toBe(sha1);
 }
 ```

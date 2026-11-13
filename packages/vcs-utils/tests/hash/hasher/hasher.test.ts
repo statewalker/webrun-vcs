@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   bytesToHex,
@@ -15,17 +14,7 @@ import {
 
 const enc = new TextEncoder();
 
-interface VectorCase {
-  input_len: number;
-  hash: string;
-  keyed_hash: string;
-  derive_key: string;
-}
-const vectors = JSON.parse(
-  readFileSync(new URL("./fixtures/blake3-test-vectors.json", import.meta.url), "utf8"),
-) as { key: string; context_string: string; cases: VectorCase[] };
-
-/** The official vectors' input: 0, 1, …, 250, 0, 1, … */
+/** Deterministic test input: 0, 1, …, 250, 0, 1, … */
 function vectorInput(len: number): Uint8Array {
   const out = new Uint8Array(len);
   for (let i = 0; i < len; i++) out[i] = i % 251;
@@ -53,6 +42,30 @@ describe("createSha1", () => {
     }
   });
 
+  it("matches the FIPS 180 long-message vectors", () => {
+    expect(
+      bytesToHex(
+        createSha1()
+          .update(enc.encode("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
+          .digest(),
+      ),
+    ).toBe("84983e441c3bd26ebaae4aa1f95129e5e54670f1");
+    const h = createSha1();
+    const block = new Uint8Array(1000).fill(0x61);
+    for (let i = 0; i < 1000; i++) h.update(block);
+    expect(bytesToHex(h.digest())).toBe("34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+  });
+
+  it("is spent after digest: digest, update and clone then throw", () => {
+    const h = createSha1().update(enc.encode("abc"));
+    const kept = h.clone();
+    h.digest();
+    expect(() => h.digest()).toThrow(/already digested/);
+    expect(() => h.update(enc.encode("x"))).toThrow(/already digested/);
+    expect(() => h.clone()).toThrow(/already digested/);
+    expect(bytesToHex(kept.digest())).toBe("a9993e364706816aba3e25717850c26c9cd0d89d");
+  });
+
   it("clones an intermediate state without disturbing the original", () => {
     const h = createSha1().update(enc.encode("Hello"));
     const branch = h.clone().update(enc.encode(" Universe"));
@@ -63,47 +76,6 @@ describe("createSha1", () => {
     expect(bytesToHex(branch.digest())).toBe(
       bytesToHex(createSha1().update(enc.encode("Hello Universe")).digest()),
     );
-  });
-});
-
-describe("createSha256", () => {
-  it("matches FIPS 180 vectors", () => {
-    expect(bytesToHex(createSha256().update(enc.encode("abc")).digest())).toBe(
-      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-    );
-  });
-});
-
-describe("createBlake3", () => {
-  const key = enc.encode(vectors.key);
-  const context = enc.encode(vectors.context_string);
-
-  it("matches every official vector in hash, keyed and derive-key modes", () => {
-    for (const c of vectors.cases) {
-      const input = vectorInput(c.input_len);
-      expect(bytesToHex(createBlake3().update(input).digest()), `hash ${c.input_len}`).toBe(
-        c.hash.slice(0, 64),
-      );
-      expect(bytesToHex(createBlake3({ key }).update(input).digest()), `keyed ${c.input_len}`).toBe(
-        c.keyed_hash.slice(0, 64),
-      );
-      expect(
-        bytesToHex(createBlake3({ context }).update(input).digest()),
-        `derive ${c.input_len}`,
-      ).toBe(c.derive_key.slice(0, 64));
-    }
-  });
-
-  it("produces extended output with dkLen", () => {
-    const c = vectors.cases[3];
-    const out = createBlake3({ dkLen: c.hash.length / 2 })
-      .update(vectorInput(c.input_len))
-      .digest();
-    expect(bytesToHex(out)).toBe(c.hash);
-  });
-
-  it("refuses a key that is not 32 bytes", () => {
-    expect(() => createBlake3({ key: new Uint8Array(31) })).toThrow();
   });
 });
 
@@ -118,6 +90,17 @@ describe("computeObjectId", () => {
     expect(await computeObjectId("tree", new Uint8Array(0))).toBe(
       "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
     );
+  });
+});
+
+describe("computeObjectId on large content", () => {
+  it("gives the same id on the native path (64 KiB and up) as the stream", async () => {
+    for (const len of [64 * 1024 - 1, 64 * 1024, 300_000]) {
+      const content = vectorInput(len);
+      expect(await computeObjectId("blob", content), `len ${len}`).toBe(
+        await computeObjectIdFromStream("blob", len, [content]),
+      );
+    }
   });
 });
 
@@ -157,7 +140,7 @@ describe("computeObjectIdFromStream", () => {
     }
     const err = await computeObjectIdFromStream("blob", 3, endless()).catch((e) => e);
     expect(err).toBeInstanceOf(SizeMismatchError);
-    expect(err).toMatchObject({ declared: 3 });
+    expect(err).toMatchObject({ declared: 3, actual: 4 });
     expect(pulled).toBe(4);
   });
 

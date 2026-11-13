@@ -1,15 +1,15 @@
 /**
- * Incremental hashers on @noble/hashes: SHA-1 for git object ids, SHA-256 for
- * Git LFS, BLAKE3 for Hugging Face Xet. No `node:` imports, so the same module
- * runs in browsers, workers, Node and Durable Objects.
+ * Incremental SHA-1 on @noble/hashes. No `node:` imports, so the same module
+ * runs in browsers, workers, Node and Durable Objects. SHA-256 (Git LFS) and
+ * BLAKE3 (Xet) join this module, behind the same `Hasher`, with the packages
+ * that use them.
  */
-import { blake3 } from "@noble/hashes/blake3.js";
 import { sha1 } from "@noble/hashes/legacy.js";
-import { sha256 } from "@noble/hashes/sha2.js";
 
 /**
  * An incremental hash. Feed bytes with `update`, read the result once with
  * `digest`. `clone` copies the current state, so a common prefix is hashed once.
+ * A hasher is spent after `digest`: every later call throws.
  */
 export interface Hasher {
   update(data: Uint8Array): Hasher;
@@ -17,15 +17,7 @@ export interface Hasher {
   clone(): Hasher;
 }
 
-export interface Blake3Options {
-  /** 32-byte key: keyed-hash mode (what Xet uses for chunk and Merkle hashes). */
-  key?: Uint8Array;
-  /** Context bytes: derive-key mode. */
-  context?: Uint8Array;
-  /** Output length in bytes (extendable output); 32 by default. */
-  dkLen?: number;
-}
-
+/** The part of a noble hash this module relies on. */
 interface NobleHash {
   update(data: Uint8Array): unknown;
   digest(): Uint8Array;
@@ -33,28 +25,32 @@ interface NobleHash {
 }
 
 function wrap(h: NobleHash): Hasher {
+  let spent = false;
+  const live = () => {
+    if (spent)
+      throw new Error("Hasher already digested; clone() before digest() to keep the state");
+  };
   const self: Hasher = {
     update(data) {
+      live();
       h.update(data);
       return self;
     },
-    digest: () => h.digest(),
-    clone: () => wrap(h.clone()),
+    digest() {
+      live();
+      spent = true;
+      return h.digest();
+    },
+    clone() {
+      live();
+      return wrap(h.clone());
+    },
   };
   return self;
 }
 
 /** SHA-1, 20-byte digest. */
 export function createSha1(): Hasher {
-  return wrap(sha1.create() as unknown as NobleHash);
-}
-
-/** SHA-256, 32-byte digest. */
-export function createSha256(): Hasher {
-  return wrap(sha256.create() as unknown as NobleHash);
-}
-
-/** BLAKE3: plain, keyed (`key`) or derive-key (`context`). */
-export function createBlake3(options: Blake3Options = {}): Hasher {
-  return wrap(blake3.create(options) as unknown as NobleHash);
+  const h: NobleHash = sha1.create();
+  return wrap(h);
 }

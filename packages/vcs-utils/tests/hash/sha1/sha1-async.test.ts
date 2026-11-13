@@ -29,6 +29,15 @@ describe("sha1 (async)", () => {
   });
 });
 
+describe("sha1 of a view", () => {
+  it("hashes only the bytes of a subarray at a non-zero offset", async () => {
+    const whole = new TextEncoder().encode("xxhelloyy");
+    expect(bytesToHex(await sha1(whole.subarray(2, 7)))).toBe(
+      "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+    );
+  });
+});
+
 describe("sha1 without Web Crypto", () => {
   it("falls back to the portable hasher with the same result", async () => {
     const data = new TextEncoder().encode("hello");
