@@ -19,7 +19,7 @@ import {
   type PersonIdent,
   walkAncestry as walkAncestryShared,
 } from "@statewalker/vcs-core";
-import { bytesToHex, Sha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
 
 import type { DatabaseClient } from "../database-client.js";
 import type { SqlNativeCommitStore } from "./types.js";
@@ -54,14 +54,14 @@ async function computeGitCommitId(commit: Commit): Promise<ObjectId> {
   const entries = Array.from(commitToEntries(commit));
   const size = await computeCommitSize(entries);
 
-  const sha1 = new Sha1();
+  const sha1 = createSha1();
   sha1.update(encodeObjectHeader("commit", size));
 
   for await (const chunk of encodeCommitEntries(entries)) {
     sha1.update(chunk);
   }
 
-  return bytesToHex(sha1.finalize());
+  return bytesToHex(sha1.digest());
 }
 
 /**

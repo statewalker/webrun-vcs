@@ -15,6 +15,9 @@ catalogs:
     '@hono/node-server':
       specifier: ^2.1.3
       version: 2.1.3
+    '@noble/hashes':
+      specifier: ^2.0.1
+      version: 2.4.0
     '@observablehq/framework':
       specifier: ^1.13.4
       version: 1.13.4
@@ -1261,6 +1264,9 @@ importers:
 
   packages/vcs-utils:
     dependencies:
+      '@noble/hashes':
+        specifier: 'catalog:'
+        version: 2.4.0
       '@statewalker/webrun-files':
         specifier: 'catalog:'
         version: 0.10.2
@@ -2280,6 +2286,10 @@ packages:
     engines: {node: ^22.20 || ^24.12 || >=25}
     cpu: [x64]
     os: [linux]
+
+  '@noble/hashes@2.4.0':
+    resolution: {integrity: sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==}
+    engines: {node: '>= 20.19.0'}
 
   '@observablehq/framework@1.13.4':
     resolution: {integrity: sha512-/qSEsd1R0n7wgVQHBpF8slShQhB2TDAWma1AllddYb3e1T72mm6dMSL3PaVUNx3Tx2lM3wXjPxcAH431yvdTHw==}
@@ -5945,6 +5955,8 @@ snapshots:
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     optional: true
+
+  '@noble/hashes@2.4.0': {}
 
   '@observablehq/framework@1.13.4(@types/markdown-it@14.2.0)':
     dependencies:

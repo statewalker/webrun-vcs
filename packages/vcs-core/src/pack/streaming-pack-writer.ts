@@ -10,7 +10,7 @@
 
 import { compressBlock } from "@statewalker/vcs-utils";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
-import { Sha1 } from "@statewalker/vcs-utils/hash/sha1";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { PackIndexWriterEntry } from "./pack-index-writer.js";
 import { PackObjectType } from "./types.js";
@@ -51,7 +51,7 @@ function encodeUInt32(value: number): Uint8Array {
  * `finalize()` yields the 20-byte SHA-1 checksum.
  */
 export class StreamingPackWriter {
-  private readonly sha1 = new Sha1();
+  private readonly sha1 = createSha1();
   private objectCount = 0;
   private headerSent = false;
   private finalized = false;
@@ -146,7 +146,7 @@ export class StreamingPackWriter {
     }
 
     this.finalized = true;
-    const checksum = this.sha1.finalize();
+    const checksum = this.sha1.digest();
     yield checksum;
   }
 

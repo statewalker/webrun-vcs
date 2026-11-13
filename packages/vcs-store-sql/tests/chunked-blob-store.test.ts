@@ -6,7 +6,7 @@
  */
 
 import { encodeObjectHeader } from "@statewalker/vcs-core";
-import { bytesToHex, collect, Sha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, collect, createSha1 } from "@statewalker/vcs-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SqlJsAdapter } from "../src/adapters/sql-js-adapter.js";
 import { SqlNativeBlobStoreImpl } from "../src/native/sql-native-blob-store.js";
@@ -48,10 +48,10 @@ describe("SqlNativeBlobStore chunked storage", () => {
 
   /** Compute expected Git blob hash */
   function computeGitBlobId(content: Uint8Array): string {
-    const sha1 = new Sha1();
+    const sha1 = createSha1();
     sha1.update(encodeObjectHeader("blob", content.length));
     sha1.update(content);
-    return bytesToHex(sha1.finalize());
+    return bytesToHex(sha1.digest());
   }
 
   describe("storage type selection", () => {

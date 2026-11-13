@@ -16,7 +16,7 @@ import {
   type ObjectTypeCode,
   tagToEntries,
 } from "@statewalker/vcs-core";
-import { bytesToHex, Sha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 import type { SqlNativeTagStore } from "./types.js";
 
@@ -50,14 +50,14 @@ async function computeGitTagId(tag: AnnotatedTag): Promise<ObjectId> {
   const entries = Array.from(tagToEntries(tag));
   const size = await computeTagSize(entries);
 
-  const sha1 = new Sha1();
+  const sha1 = createSha1();
   sha1.update(encodeObjectHeader("tag", size));
 
   for await (const chunk of encodeTagEntries(entries)) {
     sha1.update(chunk);
   }
 
-  return bytesToHex(sha1.finalize());
+  return bytesToHex(sha1.digest());
 }
 
 /**

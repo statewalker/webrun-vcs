@@ -45,6 +45,11 @@
       "types": "./dist/hash/sha1/index.d.ts",
       "import": "./dist/hash/sha1/index.js"
     },
+    "./hash/hasher": {
+      "source": "./src/hash/hasher/index.ts",
+      "types": "./dist/hash/hasher/index.d.ts",
+      "import": "./dist/hash/hasher/index.js"
+    },
     "./hash/utils": {
       "source": "./src/hash/utils/index.ts",
       "types": "./dist/hash/utils/index.d.ts",
@@ -122,6 +127,7 @@
     "vitest": "catalog:"
   },
   "dependencies": {
+    "@noble/hashes": "catalog:",
     "@statewalker/webrun-files": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
     "pako": "catalog:"

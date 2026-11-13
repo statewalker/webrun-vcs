@@ -7,6 +7,7 @@ export default defineConfig({
     "hash/index": "src/hash/index.ts",
     "hash/crc32/index": "src/hash/crc32/index.ts",
     "hash/sha1/index": "src/hash/sha1/index.ts",
+    "hash/hasher/index": "src/hash/hasher/index.ts",
     "hash/utils/index": "src/hash/utils/index.ts",
     "hash/fossil-checksum/index": "src/hash/fossil-checksum/index.ts",
     "hash/rolling-checksum/index": "src/hash/rolling-checksum/index.ts",
