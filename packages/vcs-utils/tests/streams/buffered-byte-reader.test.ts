@@ -1,9 +1,11 @@
 /**
  * Tests for BufferedByteReader
  *
- * Uses the default pako-based decompressBlockPartial (no setup needed).
+ * Compressed reads use the portable push inflater (no setup needed).
  */
 
+import { randomBytes } from "node:crypto";
+import { InflateError, TruncatedStreamError } from "@statewalker/vcs-utils/compression";
 import { BufferedByteReader } from "@statewalker/vcs-utils/streams";
 import * as pako from "pako";
 import { describe, expect, it } from "vitest";
@@ -211,8 +213,7 @@ describe("BufferedByteReader", () => {
       const reader = new BufferedByteReader(toIterator([truncated]));
 
       const gen = reader.readDecompressed(5);
-      // Either "Incomplete compressed data" or "Decompression size mismatch"
-      await expect(gen.next()).rejects.toThrow(/compressed data|size mismatch/i);
+      await expect(gen.next()).rejects.toThrow(TruncatedStreamError);
     });
 
     it("consumes only compressed bytes, leaving trailing data", async () => {
@@ -232,6 +233,97 @@ describe("BufferedByteReader", () => {
 
       const leftover = reader.getLeftover();
       expect(Array.from(leftover)).toEqual([99, 98]);
+    });
+  });
+
+  describe("compressed reads on the push inflater", () => {
+    function chunksOf(bytes: Uint8Array, size: number): Uint8Array[] {
+      const out: Uint8Array[] = [];
+      for (let i = 0; i < bytes.length; i += size) out.push(bytes.subarray(i, i + size));
+      return out;
+    }
+    function countingIterator(chunks: Uint8Array[]) {
+      const it = { pulls: 0, ...toIterator(chunks) };
+      const next = it.next.bind(it);
+      it.next = () => {
+        it.pulls++;
+        return next();
+      };
+      return it;
+    }
+
+    it("pulls each chunk once and never past the object's last chunk", async () => {
+      const original = new Uint8Array(1 << 20);
+      for (let i = 0; i < original.length; i++) original[i] = (i * 7919) % 251;
+      const compressed = pako.deflate(original);
+      const parts = chunksOf(compressed, 1024);
+      const iterator = countingIterator([...parts, new Uint8Array([42])]);
+      const reader = new BufferedByteReader(iterator);
+
+      const bytes = await reader.readCompressedObject(original.length);
+
+      expect(Array.from(bytes)).toEqual(Array.from(compressed));
+      expect(iterator.pulls).toBe(parts.length);
+      expect(await reader.readExact(1)).toEqual(new Uint8Array([42]));
+    });
+
+    it("streams a large object in pieces instead of one buffer", async () => {
+      const original = new Uint8Array(1 << 20).fill(7);
+      const reader = new BufferedByteReader(toIterator(chunksOf(pako.deflate(original), 512)));
+      let pieces = 0;
+      let total = 0;
+      for await (const piece of reader.readDecompressed(original.length)) {
+        pieces++;
+        total += piece.length;
+      }
+      expect(total).toBe(original.length);
+      expect(pieces).toBeGreaterThan(1);
+    });
+
+    it("reports corruption as corruption, not as missing data", async () => {
+      const compressed = pako.deflate(new TextEncoder().encode("payload ".repeat(500)));
+      compressed[compressed.length - 1] ^= 0xff;
+      const reader = new BufferedByteReader(toIterator([compressed, new Uint8Array(64)]));
+      await expect(reader.readCompressedObject(4000)).rejects.toThrow(
+        /inflate failed|Adler|check/i,
+      );
+    });
+
+    it("reports a stream that ends inside the object as truncated", async () => {
+      const compressed = pako.deflate(new TextEncoder().encode("payload ".repeat(500)));
+      const reader = new BufferedByteReader(toIterator([compressed.subarray(0, 20)]));
+      await expect(reader.readCompressedObject(4000)).rejects.toThrow(TruncatedStreamError);
+    });
+
+    it("stays on the object boundary when the consumer stops early", async () => {
+      // Incompressible, so the object spans many chunks and pushes.
+      const original = new Uint8Array(randomBytes(300_000));
+      const next = pako.deflate(new TextEncoder().encode("next object"));
+      const all = new Uint8Array([...pako.deflate(original), ...next]);
+      const reader = new BufferedByteReader(toIterator(chunksOf(all, 10_000)));
+
+      for await (const _piece of reader.readDecompressed(original.length)) break;
+
+      const second = await reader.readCompressedObject(11);
+      expect(Array.from(second)).toEqual(Array.from(next));
+    });
+
+    it("reports a bad rest of an abandoned block on the next read", async () => {
+      const original = new Uint8Array(randomBytes(100_000));
+      const compressed = pako.deflate(original);
+      const truncated = compressed.subarray(0, compressed.length - 10);
+      const reader = new BufferedByteReader(toIterator(chunksOf(truncated, 10_000)));
+      for await (const _piece of reader.readDecompressed(original.length)) break;
+      await expect(reader.readExact(1)).rejects.toThrow(TruncatedStreamError);
+    });
+
+    it("reads an empty object: no pieces, and the reader moves past it", async () => {
+      const empty = pako.deflate(new Uint8Array(0));
+      const reader = new BufferedByteReader(toIterator([new Uint8Array([...empty, 5])]));
+      const pieces: Uint8Array[] = [];
+      for await (const piece of reader.readDecompressed(0)) pieces.push(piece);
+      expect(pieces.reduce((n, p) => n + p.length, 0)).toBe(0);
+      expect(await reader.readExact(1)).toEqual(new Uint8Array([5]));
     });
   });
 });

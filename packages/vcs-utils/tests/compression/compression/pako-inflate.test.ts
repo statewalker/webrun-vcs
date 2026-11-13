@@ -121,7 +121,9 @@ describe("decompressBlockPartialPako", () => {
   it("should throw CompressionError with descriptive message for invalid data", () => {
     const invalidData = new Uint8Array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
 
-    expect(() => decompressBlockPartialPako(invalidData)).toThrow("Pako");
+    expect(() => decompressBlockPartialPako(invalidData)).toThrow(
+      /inflate failed: incorrect header check/,
+    );
   });
 
   it("should handle empty content", async () => {

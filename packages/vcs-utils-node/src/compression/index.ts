@@ -197,73 +197,6 @@ export async function decompressBlockNode(
 }
 
 /**
- * Decompress a data block and return how many bytes were consumed.
- *
- * This is essential for pack file parsing where multiple compressed
- * objects are concatenated without explicit length prefixes.
- *
- * Uses binary search to find the exact zlib stream boundary.
- */
-export async function decompressBlockPartialNode(
-  data: Uint8Array,
-  options?: StreamingCompressionOptions,
-): Promise<{ data: Uint8Array; bytesRead: number }> {
-  const raw = options?.raw ?? false;
-  const buffer = Buffer.from(data);
-
-  // Binary search to find minimum input size that produces valid decompression
-  // This works because:
-  // - Too few bytes -> Z_BUF_ERROR (incomplete input)
-  // - Exact bytes -> success
-  // - Too many bytes -> success (in older Node) or ERR_TRAILING_JUNK_AFTER_STREAM_END (Node 24+)
-  const minSize = raw ? 1 : 6;
-  let low = minSize;
-  let high = buffer.length;
-
-  // First, check if we can decompress with full buffer
-  // If it fails, return the error (invalid data)
-  // If it succeeds, use binary search to find minimal size
-  try {
-    if (raw) {
-      zlib.inflateRawSync(buffer);
-    } else {
-      zlib.inflateSync(buffer);
-    }
-    // No error - either no trailing data, or older Node that ignores it
-    // Use binary search to find the exact boundary
-  } catch (err: unknown) {
-    const error = err as NodeJS.ErrnoException;
-    // ERR_TRAILING_JUNK_AFTER_STREAM_END means there IS trailing data
-    // We'll use binary search to find boundary
-    if (error.code !== "ERR_TRAILING_JUNK_AFTER_STREAM_END") {
-      // Real error - propagate it
-      throw err;
-    }
-  }
-
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2);
-    try {
-      const slice = buffer.subarray(0, mid);
-      if (raw) {
-        zlib.inflateRawSync(slice);
-      } else {
-        zlib.inflateSync(slice);
-      }
-      // Success - try smaller input
-      high = mid;
-    } catch {
-      // Need more bytes
-      low = mid + 1;
-    }
-  }
-
-  const slice = buffer.subarray(0, low);
-  const result = raw ? zlib.inflateRawSync(slice) : zlib.inflateSync(slice);
-  return { data: new Uint8Array(result), bytesRead: low };
-}
-
-/**
  * Create a Node.js compression implementation
  *
  * @returns CompressionUtils configured for Node.js
@@ -282,6 +215,5 @@ export function createNodeCompression(): CompressionUtils {
     inflate: inflateNode,
     compressBlock: compressBlockNode,
     decompressBlock: decompressBlockNode,
-    decompressBlockPartial: decompressBlockPartialNode,
   };
 }

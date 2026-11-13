@@ -1,7 +1,9 @@
+import { deflateSync } from "node:zlib";
 import {
   collect,
   compressBlock,
   decompressBlock,
+  decompressBlockPartial,
   deflate,
   inflate,
   setCompressionUtils,
@@ -21,7 +23,18 @@ describe("Node.js Compression", () => {
       expect(compression.inflate).toBeDefined();
       expect(compression.compressBlock).toBeDefined();
       expect(compression.decompressBlock).toBeDefined();
-      expect(compression.decompressBlockPartial).toBeDefined();
+      // Partial decompression stays on the portable one-pass inflater.
+      expect(compression.decompressBlockPartial).toBeUndefined();
+    });
+
+    it("keeps exact partial decompression after registration", async () => {
+      setCompressionUtils(createNodeCompression());
+      const data = new TextEncoder().encode("hello ".repeat(100));
+      const z = new Uint8Array(deflateSync(data));
+      const withNext = new Uint8Array([...z, 1, 2, 3]);
+      const r = await decompressBlockPartial(withNext);
+      expect(r.bytesRead).toBe(z.length);
+      expect(new TextDecoder().decode(r.data)).toBe("hello ".repeat(100));
     });
   });
 
