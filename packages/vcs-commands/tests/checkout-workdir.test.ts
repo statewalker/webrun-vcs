@@ -11,7 +11,7 @@ import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-core";
 import { createFileWorktree } from "@statewalker/vcs-store-files";
 import {
   createMemoryObjectStores,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
 import { MemoryWorkingCopy, type WorkingCopy, type Worktree } from "@statewalker/vcs-working-tree";
@@ -30,7 +30,7 @@ interface TestStores {
   trees: ReturnType<typeof createMemoryObjectStores>["trees"];
   commits: ReturnType<typeof createMemoryObjectStores>["commits"];
   tags: ReturnType<typeof createMemoryObjectStores>["tags"];
-  refs: MemoryRefStore;
+  refs: MemoryRefs;
   staging: MemoryStagingStore;
   worktree?: Worktree;
 }
@@ -135,7 +135,7 @@ function createStoresWithFiles(
     blobs: objectStores.blobs,
     trees: objectStores.trees,
     commits: objectStores.commits,
-    refs: new MemoryRefStore(),
+    refs: new MemoryRefs(),
     staging,
     tags: objectStores.tags,
     worktree,
@@ -154,7 +154,7 @@ function createBareStores(): { stores: TestStores; workingCopy: WorkingCopy } {
     blobs: objectStores.blobs,
     trees: objectStores.trees,
     commits: objectStores.commits,
-    refs: new MemoryRefStore(),
+    refs: new MemoryRefs(),
     staging: new MemoryStagingStore(),
     tags: objectStores.tags,
   };

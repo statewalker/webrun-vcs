@@ -9,7 +9,7 @@
 
 import {
   createMemoryObjectStores,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
 import {
@@ -56,7 +56,7 @@ export type WorkingCopyFactory = () => Promise<WorkingCopyTestContext>;
  */
 export const memoryFactory: WorkingCopyFactory = async () => {
   const stores = createMemoryObjectStores();
-  const refs = new MemoryRefStore();
+  const refs = new MemoryRefs();
   const staging = new MemoryStagingStore();
 
   // Create History wrapper

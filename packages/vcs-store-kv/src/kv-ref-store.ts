@@ -4,8 +4,17 @@
  * Stores Git references using a key-value backend with JSON serialization.
  */
 
-import type { ObjectId, Ref, Refs, RefUpdateResult, SymbolicRef } from "@statewalker/vcs-core";
-import { RefStorage } from "@statewalker/vcs-core";
+import type {
+  BatchOptions,
+  BatchResult,
+  ObjectId,
+  Ref,
+  RefCommand,
+  Refs,
+  RefUpdateResult,
+  SymbolicRef,
+} from "@statewalker/vcs-core";
+import { batchBySingleRef, RefStorage } from "@statewalker/vcs-core";
 import type { KVStore } from "./kv-store.js";
 
 /**
@@ -40,6 +49,14 @@ const decoder = new TextDecoder();
  */
 export class KVRefStore implements Refs {
   constructor(private kv: KVStore) {}
+
+  /**
+   * Interim: a single command through {@link compareAndSwap}; several commands
+   * are refused as "not-atomic" until this store applies batches atomically.
+   */
+  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+    return batchBySingleRef(this, commands);
+  }
 
   /**
    * Read a ref by exact name.

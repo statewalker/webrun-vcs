@@ -9,6 +9,13 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
+import {
+  type BatchOptions,
+  type BatchResult,
+  batchBySingleRef,
+  planRefBatch,
+  type RefCommand,
+} from "./ref-batch.js";
 import type { RefStore } from "./ref-store.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import { RefStorage } from "./ref-types.js";
@@ -56,6 +63,10 @@ export class RefsAdapter implements Refs {
   // Adapt delete() to remove()
   remove(name: string): Promise<boolean> {
     return this.refStore.delete(name);
+  }
+
+  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+    return batchBySingleRef(this, commands);
   }
 
   compareAndSwap(
@@ -110,6 +121,29 @@ type InternalRefEntry =
  */
 export class MemoryRefs implements Refs {
   private refs = new Map<string, InternalRefEntry>();
+  /** Serializes writes, so a batch applies exactly the plan it checked. */
+  private tail: Promise<unknown> = Promise.resolve();
+
+  private exclusive<T>(fn: () => Promise<T> | T): Promise<T> {
+    const run = this.tail.then(fn, fn);
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+
+  private entryToRef(name: string): Ref | SymbolicRef | undefined {
+    const entry = this.refs.get(name);
+    if (!entry) return undefined;
+    if (entry.type === "symbolic") {
+      return { name, target: entry.target, storage: RefStorage.LOOSE } as SymbolicRef;
+    }
+    return {
+      name,
+      objectId: entry.objectId,
+      storage: RefStorage.LOOSE,
+      peeled: entry.peeledObjectId !== undefined,
+      peeledObjectId: entry.peeledObjectId,
+    } as Ref;
+  }
 
   /**
    * Get a reference value
@@ -205,22 +239,49 @@ export class MemoryRefs implements Refs {
   /**
    * Set a direct reference
    */
-  async set(name: string, objectId: ObjectId): Promise<void> {
-    this.refs.set(name, { type: "direct", objectId });
+  set(name: string, objectId: ObjectId): Promise<void> {
+    return this.exclusive(() => {
+      this.refs.set(name, { type: "direct", objectId });
+    });
   }
 
   /**
    * Set a symbolic reference
    */
-  async setSymbolic(name: string, target: string): Promise<void> {
-    this.refs.set(name, { type: "symbolic", target });
+  setSymbolic(name: string, target: string): Promise<void> {
+    return this.exclusive(() => {
+      this.refs.set(name, { type: "symbolic", target });
+    });
   }
 
   /**
    * Remove a reference
    */
-  async remove(name: string): Promise<boolean> {
-    return this.refs.delete(name);
+  remove(name: string): Promise<boolean> {
+    return this.exclusive(() => this.refs.delete(name));
+  }
+
+  /**
+   * Apply all commands atomically, or none (see {@link Refs.batch}). The memory
+   * store keeps no reflog, so `options` is ignored.
+   */
+  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+    return this.exclusive(async () => {
+      const plan = await planRefBatch(commands, {
+        read: (name) => this.entryToRef(name),
+        hasChildren: (name) => {
+          const prefix = `${name}/`;
+          for (const key of this.refs.keys()) if (key.startsWith(prefix)) return true;
+          return false;
+        },
+      });
+      if (!plan.ok) return { ok: false, rejected: plan.rejected };
+      for (const u of plan.updates) {
+        if (u.newValue === null) this.refs.delete(u.name);
+        else this.refs.set(u.name, { type: "direct", objectId: u.newValue });
+      }
+      return { ok: true, rejected: [] };
+    });
   }
 
   /**
@@ -231,23 +292,12 @@ export class MemoryRefs implements Refs {
     expected: ObjectId | undefined,
     newValue: ObjectId,
   ): Promise<RefUpdateResult> {
-    const resolved = await this.resolve(name);
-    const currentValue = resolved?.objectId;
-
-    if (currentValue !== expected) {
-      return {
-        success: false,
-        previousValue: currentValue,
-        errorMessage: expected
-          ? `Expected ${expected}, found ${currentValue ?? "nothing"}`
-          : `Ref already exists with value ${currentValue}`,
-      };
-    }
-
-    await this.set(name, newValue);
+    const r = await this.batch([{ name, old: expected ?? null, new: newValue }]);
+    if (r.ok) return { success: true, previousValue: expected };
     return {
-      success: true,
-      previousValue: expected,
+      success: false,
+      previousValue: (await this.resolve(name))?.objectId,
+      errorMessage: r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", "),
     };
   }
 

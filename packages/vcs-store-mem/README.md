@@ -28,7 +28,7 @@ No peer dependencies. Runs anywhere modern JavaScript runs (browser, Node, worke
 | --- | --- |
 | `createMemoryObjectStores(options?)` | `{ objects, blobs, trees, commits, tags }` with **Git-compatible SHA-1 ids**, backed by a `MemoryRawStorage`. Pass `{ storage }` to reuse an existing one. |
 | `MemoryStagingStore` | In-memory `Staging` (the index): entries, conflict stages, builder/editor, `readTree`/`writeTree`. |
-| `MemoryRefStore` | In-memory `Refs` (re-exported from `@statewalker/vcs-core`). |
+| `MemoryRefs` | In-memory `Refs` (re-exported from `@statewalker/vcs-core`). |
 | `MemoryRawStorage` | In-memory `RawStorage` key/bytes map (re-exported from `@statewalker/vcs-core`). |
 | `MemoryCommitStore`, `MemoryTreeStore`, `MemoryTagStore` | Object-map `Commits` / `Trees` / `Tags`. **Ids are not Git ids** (see Internals). |
 | `MemBinStore`, `createMemBinStore()` | `BinStore` combining a `MemoryRawStorage` and a `MemDeltaStore`. |
@@ -45,12 +45,12 @@ pack tests). Use the `Memory*Store` classes only where any stable, content-deriv
 import { FileMode } from "@statewalker/vcs-core";
 import {
   createMemoryObjectStores,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
 
 const stores = createMemoryObjectStores();
-const refs = new MemoryRefStore();
+const refs = new MemoryRefs();
 const staging = new MemoryStagingStore();
 
 // The real Git SHA-1 of "hello\n"
@@ -181,7 +181,7 @@ packing decisions.
 
 ### Dependencies
 
-- `@statewalker/vcs-core`: store interfaces, Git object codecs, `MemoryRefStore`,
+- `@statewalker/vcs-core`: store interfaces, Git object codecs, `MemoryRefs`,
   `MemoryRawStorage`, and the ancestry algorithms (`walkAncestry`, `findMergeBase`,
   `isAncestor`) that `MemoryCommitStore` delegates to.
 - `@statewalker/vcs-working-tree`: the `Staging` interface and merge-stage constants.

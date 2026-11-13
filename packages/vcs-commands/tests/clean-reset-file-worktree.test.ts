@@ -12,7 +12,7 @@ import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-core";
 import { createFileWorktree } from "@statewalker/vcs-store-files";
 import {
   createMemoryObjectStores,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
 import { MemoryCheckout, MemoryWorkingCopy, type WorkingCopy } from "@statewalker/vcs-working-tree";
@@ -28,7 +28,7 @@ const ROOT = "/repo";
 /** Build a WorkingCopy whose worktree is a real FileWorktree over `files`. */
 function createFileBackedWorkingCopy(files: FilesApi): WorkingCopy {
   const stores = createMemoryObjectStores();
-  const refs = new MemoryRefStore();
+  const refs = new MemoryRefs();
   const staging = new MemoryStagingStore();
 
   const repository = createSimpleHistory({

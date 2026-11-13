@@ -5,8 +5,12 @@
  */
 
 import {
+  type BatchOptions,
+  type BatchResult,
+  batchBySingleRef,
   type ObjectId,
   type Ref,
+  type RefCommand,
   RefStorage,
   type Refs,
   type RefUpdateResult,
@@ -35,6 +39,14 @@ interface RefRow {
  */
 export class SQLRefStore implements Refs {
   constructor(private db: DatabaseClient) {}
+
+  /**
+   * Interim: a single command through {@link compareAndSwap}; several commands
+   * are refused as "not-atomic" until this store applies batches atomically.
+   */
+  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+    return batchBySingleRef(this, commands);
+  }
 
   /**
    * Read a ref by exact name.

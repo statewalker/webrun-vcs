@@ -64,6 +64,7 @@
  * - `createTreeStoreTests` - TreeStore interface
  * - `createTagStoreTests` - TagStore interface
  * - `createRefStoreTests` - RefStore interface
+ * - `createRefBatchTests` - atomic ref batches (`Refs.batch`)
  *
  * ### Workspace Store Suites
  * - `createStagingStoreTests` - StagingStore interface
@@ -89,6 +90,7 @@ export * from "./delta-api.suite.js";
 export * from "./git-compatibility.suite.js";
 export * from "./git-object-store.suite.js";
 export * from "./raw-store.suite.js";
+export * from "./ref-batch.suite.js";
 export * from "./ref-store.suite.js";
 export * from "./staging-store.suite.js";
 export * from "./stash-store.suite.js";
