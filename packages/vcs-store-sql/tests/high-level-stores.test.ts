@@ -9,6 +9,7 @@ import {
   createBlobStoreTests,
   createCommitStoreTests,
   createGitObjectStoreTests,
+  createRefBatchTests,
   createRefStoreTests,
   createStagingStoreTests,
   createTagStoreTests,
@@ -75,6 +76,16 @@ createRefStoreTests("SQL", async () => {
     },
   };
 });
+
+// Ref batch tests (interim single-command batch)
+createRefBatchTests(
+  "SQL",
+  async () => {
+    const db = await createTestDb();
+    return { refs: new SQLRefStore(db), cleanup: () => db.close() };
+  },
+  { multiRef: false },
+);
 
 // StagingStore tests
 createStagingStoreTests("SQL", async () => {

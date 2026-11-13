@@ -15,7 +15,7 @@ import type {
   SymbolicRef,
 } from "@statewalker/vcs-core";
 
-import { packRefs } from "./packed-refs-writer.js";
+import { packRefs, removePackedRef } from "./packed-refs-writer.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
 import {
   createRefsStructure,
@@ -92,7 +92,10 @@ export class FileRefStore implements RefStore {
    * Delete a ref
    */
   async delete(refName: string): Promise<boolean> {
-    return deleteRef(this.files, this.gitDir, refName);
+    // A ref may be loose, packed, or both (a loose ref shadows its packed copy).
+    const loose = await deleteRef(this.files, this.gitDir, refName);
+    const packed = await removePackedRef(this.files, this.gitDir, refName);
+    return loose || packed;
   }
 
   /**
@@ -116,11 +119,11 @@ export class FileRefStore implements RefStore {
       };
     }
 
-    const success = await updateRef(this.files, this.gitDir, refName, expectedOld, newValue);
-    return {
-      success,
-      previousValue: expectedOld,
-    };
+    // The value was checked above, packed refs included; write the ref the name
+    // resolved to (through a symbolic ref), as a loose ref that shadows any packed copy.
+    // Not atomic: the files store gets lock-file batches of its own.
+    await updateRef(this.files, this.gitDir, resolved?.name ?? refName, undefined, newValue);
+    return { success: true, previousValue: expectedOld };
   }
 
   /**

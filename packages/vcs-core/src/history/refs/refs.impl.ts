@@ -149,26 +149,7 @@ export class MemoryRefs implements Refs {
    * Get a reference value
    */
   async get(name: string): Promise<RefValue | undefined> {
-    const entry = this.refs.get(name);
-    if (!entry) {
-      return undefined;
-    }
-
-    if (entry.type === "symbolic") {
-      return {
-        name,
-        target: entry.target,
-        storage: RefStorage.LOOSE,
-      } as SymbolicRef;
-    }
-
-    return {
-      name,
-      objectId: entry.objectId,
-      storage: RefStorage.LOOSE,
-      peeled: entry.peeledObjectId !== undefined,
-      peeledObjectId: entry.peeledObjectId,
-    } as Ref;
+    return this.entryToRef(name);
   }
 
   /**
@@ -213,27 +194,10 @@ export class MemoryRefs implements Refs {
    * List references
    */
   async *list(prefix?: string): AsyncIterable<RefEntry> {
-    for (const [name, entry] of this.refs) {
-      if (prefix && !name.startsWith(prefix)) {
-        continue;
-      }
-
-      if (entry.type === "symbolic") {
-        yield {
-          name,
-          target: entry.target,
-          storage: RefStorage.LOOSE,
-        } as SymbolicRef;
-      } else {
-        yield {
-          name,
-          objectId: entry.objectId,
-          storage: RefStorage.LOOSE,
-          peeled: entry.peeledObjectId !== undefined,
-          peeledObjectId: entry.peeledObjectId,
-        } as Ref;
-      }
-    }
+    // Snapshot first, so a batch landing between yields is never half seen.
+    const names = [...this.refs.keys()].filter((name) => !prefix || name.startsWith(prefix));
+    const snapshot = names.map((name) => this.entryToRef(name));
+    for (const ref of snapshot) if (ref) yield ref;
   }
 
   /**
@@ -266,39 +230,44 @@ export class MemoryRefs implements Refs {
    * store keeps no reflog, so `options` is ignored.
    */
   batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
-    return this.exclusive(async () => {
-      const plan = await planRefBatch(commands, {
-        read: (name) => this.entryToRef(name),
-        hasChildren: (name) => {
-          const prefix = `${name}/`;
-          for (const key of this.refs.keys()) if (key.startsWith(prefix)) return true;
-          return false;
-        },
-      });
-      if (!plan.ok) return { ok: false, rejected: plan.rejected };
-      for (const u of plan.updates) {
-        if (u.newValue === null) this.refs.delete(u.name);
-        else this.refs.set(u.name, { type: "direct", objectId: u.newValue });
-      }
-      return { ok: true, rejected: [] };
+    return this.exclusive(() => this.applyBatch(commands));
+  }
+
+  /** Plan and apply a batch; call only while holding the write lock. */
+  private async applyBatch(commands: RefCommand[]): Promise<BatchResult> {
+    const plan = await planRefBatch(commands, {
+      read: (name) => this.entryToRef(name),
+      hasChildren: (name) => {
+        const prefix = `${name}/`;
+        for (const key of this.refs.keys()) if (key.startsWith(prefix)) return true;
+        return false;
+      },
     });
+    if (!plan.ok) return { ok: false, rejected: plan.rejected };
+    for (const u of plan.updates) {
+      if (u.newValue === null) this.refs.delete(u.name);
+      else this.refs.set(u.name, { type: "direct", objectId: u.newValue });
+    }
+    return { ok: true, rejected: [] };
   }
 
   /**
    * Atomic compare-and-swap update
    */
-  async compareAndSwap(
+  compareAndSwap(
     name: string,
     expected: ObjectId | undefined,
     newValue: ObjectId,
   ): Promise<RefUpdateResult> {
-    const r = await this.batch([{ name, old: expected ?? null, new: newValue }]);
-    if (r.ok) return { success: true, previousValue: expected };
-    return {
-      success: false,
-      previousValue: (await this.resolve(name))?.objectId,
-      errorMessage: r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", "),
-    };
+    return this.exclusive(async () => {
+      const r = await this.applyBatch([{ name, old: expected ?? null, new: newValue }]);
+      if (r.ok) return { success: true, previousValue: expected };
+      return {
+        success: false,
+        previousValue: (await this.resolve(name))?.objectId,
+        errorMessage: r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", "),
+      };
+    });
   }
 
   /**

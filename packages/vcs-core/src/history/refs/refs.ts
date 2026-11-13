@@ -122,8 +122,9 @@ export interface Refs {
    * Commands naming a symbolic ref apply to its target unless `noDeref` is set.
    * The batch is checked as `git update-ref --stdin` checks it: valid names
    * (`HEAD` or under `refs/`), no duplicates, no directory/file conflicts, and
-   * each `old` value as expected. On refusal, `rejected` says which commands
-   * failed and why, and no ref changed.
+   * each `old` value as expected. Beyond git, a detached HEAD cannot join a
+   * multi-ref batch (`not-atomic`, a project policy). On refusal, `rejected`
+   * says which commands failed and why, and no ref changed.
    *
    * @example
    * ```typescript

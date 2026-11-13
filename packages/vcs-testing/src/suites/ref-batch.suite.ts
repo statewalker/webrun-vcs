@@ -17,6 +17,17 @@ export interface RefBatchTestContext {
 
 export type RefBatchFactory = () => Promise<RefBatchTestContext>;
 
+export interface RefBatchSuiteOptions {
+  /**
+   * Whether the store applies multi-command batches. Stores on the interim
+   * single-command batch pass `false`: multi-command cases then only check that
+   * nothing is applied.
+   */
+  multiRef?: boolean;
+  /** Whether the store keeps symbolic refs (some KV adapters do not). */
+  symbolicRefs?: boolean;
+}
+
 /** Deterministic fake object ids; object existence is not checked by ref stores. */
 const oid = (n: number): ObjectId => n.toString(16).padStart(40, "a");
 
@@ -40,10 +51,25 @@ const reasons = (r: BatchResult): string =>
  * @param name Name of the implementation (e.g. "Memory", "SQL")
  * @param factory Creates an empty store per test
  */
-export function createRefBatchTests(name: string, factory: RefBatchFactory): void {
+export function createRefBatchTests(
+  name: string,
+  factory: RefBatchFactory,
+  options: RefBatchSuiteOptions = {},
+): void {
+  const multi = options.multiRef !== false;
+  const itMulti = multi ? it : it.skip;
+  const itSym = options.symbolicRefs === false ? it.skip : it;
+  const itMultiSym = multi && options.symbolicRefs !== false ? it : it.skip;
   describe(`Refs.batch [${name}]`, () => {
     let ctx: RefBatchTestContext;
     let refs: Refs;
+    /** Set up refs one command at a time (works on every store). */
+    const seed = async (...pairs: [string, ObjectId][]) => {
+      for (const [ref, id] of pairs) {
+        const r = await refs.batch([{ name: ref, new: id }]);
+        expect(r, `seed ${ref}`).toEqual({ ok: true, rejected: [] });
+      }
+    };
 
     beforeEach(async () => {
       ctx = await factory();
@@ -55,7 +81,7 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       await ctx.cleanup?.();
     });
 
-    it("applies a batch of creates; get, resolve and list agree", async () => {
+    itMulti("applies a batch of creates; get, resolve and list agree", async () => {
       const r = await refs.batch([
         { name: "refs/heads/main", old: null, new: oid(1) },
         { name: "refs/tags/v1", old: null, new: oid(2) },
@@ -74,11 +100,8 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect(await snapshot(refs)).toBe("");
     });
 
-    it("one mismatching old value rejects the whole batch", async () => {
-      await refs.batch([
-        { name: "refs/heads/a", new: oid(1) },
-        { name: "refs/heads/b", new: oid(2) },
-      ]);
+    itMulti("one mismatching old value rejects the whole batch", async () => {
+      await seed(["refs/heads/a", oid(1)], ["refs/heads/b", oid(2)]);
       const r = await refs.batch([
         { name: "refs/heads/a", old: oid(1), new: oid(10) },
         { name: "refs/heads/b", old: oid(99), new: oid(20) },
@@ -89,8 +112,8 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect(await snapshot(refs)).toBe("refs/heads/a=aaa1,refs/heads/b=aaa2");
     });
 
-    it("'must not exist' on an existing ref is a mismatch", async () => {
-      await refs.batch([{ name: "refs/heads/a", new: oid(1) }]);
+    itMulti("'must not exist' on an existing ref is a mismatch", async () => {
+      await seed(["refs/heads/a", oid(1)]);
       const r = await refs.batch([
         { name: "refs/heads/a", old: null, new: oid(2) },
         { name: "refs/heads/z", old: null, new: oid(3) },
@@ -99,11 +122,8 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect(await snapshot(refs)).toBe("refs/heads/a=aaa1");
     });
 
-    it("creates, updates and deletes in one batch apply together", async () => {
-      await refs.batch([
-        { name: "refs/heads/a", new: oid(1) },
-        { name: "refs/heads/b", new: oid(2) },
-      ]);
+    itMulti("creates, updates and deletes in one batch apply together", async () => {
+      await seed(["refs/heads/a", oid(1)], ["refs/heads/b", oid(2)]);
       const r = await refs.batch([
         { name: "refs/heads/a", old: oid(1), new: oid(0x11) },
         { name: "refs/heads/b", old: oid(2), new: null },
@@ -114,7 +134,7 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect(await refs.has("refs/heads/b")).toBe(false);
     });
 
-    it("an invalid name rejects the whole batch", async () => {
+    itMulti("an invalid name rejects the whole batch", async () => {
       for (const bad of [
         "refs/heads/a..b",
         "refs/heads/x.lock",
@@ -133,7 +153,7 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect(await snapshot(refs)).toBe("");
     });
 
-    it("refuses a name twice in one batch, and a delete that must not exist", async () => {
+    itMulti("refuses a name twice in one batch, and a delete that must not exist", async () => {
       const dup = await refs.batch([
         { name: "refs/heads/a", new: oid(1) },
         { name: "refs/heads/a", new: oid(2) },
@@ -144,11 +164,8 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect(await snapshot(refs)).toBe("");
     });
 
-    it("refuses directory/file conflicts as git does", async () => {
-      await refs.batch([
-        { name: "refs/x", new: oid(1) },
-        { name: "refs/p/q", new: oid(2) },
-      ]);
+    itMulti("refuses directory/file conflicts as git does", async () => {
+      await seed(["refs/x", oid(1)], ["refs/p/q", oid(2)]);
       // git refuses a create below an existing ref even when the same batch deletes it.
       const below = await refs.batch([
         { name: "refs/x", old: oid(1), new: null },
@@ -166,8 +183,8 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect(await snapshot(refs)).toBe("refs/p/q=aaa2,refs/x=aaa1");
     });
 
-    it("updates through a symbolic HEAD, and keeps HEAD symbolic", async () => {
-      await refs.batch([{ name: "refs/heads/main", new: oid(1) }]);
+    itSym("updates through a symbolic HEAD, and keeps HEAD symbolic", async () => {
+      await seed(["refs/heads/main", oid(1)]);
       await refs.setSymbolic("HEAD", "refs/heads/main");
       const r = await refs.batch([{ name: "HEAD", old: oid(1), new: oid(2) }]);
       expect(r.ok).toBe(true);
@@ -176,8 +193,20 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect((await refs.resolve("refs/heads/main"))?.objectId).toBe(oid(2));
     });
 
-    it("noDeref updates HEAD itself (detaches it)", async () => {
-      await refs.batch([{ name: "refs/heads/main", new: oid(1) }]);
+    itMultiSym("noDeref compares old with the value HEAD resolves to, as git does", async () => {
+      await seed(["refs/heads/main", oid(1)]);
+      await refs.setSymbolic("HEAD", "refs/heads/main");
+      const exists = await refs.batch([{ name: "HEAD", old: null, new: oid(2), noDeref: true }]);
+      expect(exists.rejected).toEqual([{ name: "HEAD", reason: "mismatch" }]);
+      const r = await refs.batch([{ name: "HEAD", old: oid(1), new: oid(2), noDeref: true }]);
+      expect(r.ok).toBe(true);
+      const head = await refs.get("HEAD");
+      expect(head && isSymbolicRef(head)).toBe(false);
+      expect((await refs.resolve("refs/heads/main"))?.objectId).toBe(oid(1));
+    });
+
+    itMultiSym("noDeref updates HEAD itself (detaches it)", async () => {
+      await seed(["refs/heads/main", oid(1)]);
       await refs.setSymbolic("HEAD", "refs/heads/main");
       const r = await refs.batch([{ name: "HEAD", new: oid(7), noDeref: true }]);
       expect(r.ok).toBe(true);
@@ -187,7 +216,7 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect((await refs.resolve("refs/heads/main"))?.objectId).toBe(oid(1));
     });
 
-    it("a detached HEAD cannot join a multi-ref batch (not atomic on git files)", async () => {
+    itMultiSym("a detached HEAD cannot join a multi-ref batch (a project policy)", async () => {
       const r = await refs.batch([
         { name: "HEAD", new: oid(1), noDeref: true },
         { name: "refs/heads/a", new: oid(2) },
@@ -204,12 +233,111 @@ export function createRefBatchTests(name: string, factory: RefBatchFactory): voi
       expect((await refs.resolve("refs/heads/m"))?.objectId).toBe(oid(2));
     });
 
-    it("20 concurrent two-ref batches with retry: both refs count every success", async () => {
-      const count = (n: number): ObjectId => n.toString(16).padStart(40, "0");
-      await refs.batch([
-        { name: "refs/heads/left", new: count(0) },
-        { name: "refs/heads/right", new: count(0) },
+    it("checks one command's name, old value and D/F conflicts", async () => {
+      await seed(["refs/heads/a", oid(1)], ["refs/p/q", oid(2)]);
+      expect(
+        (await refs.batch([{ name: "refs/heads/a", old: oid(9), new: oid(3) }])).rejected,
+      ).toEqual([{ name: "refs/heads/a", reason: "mismatch" }]);
+      expect(
+        (await refs.batch([{ name: "refs/heads/a", old: null, new: oid(3) }])).rejected,
+      ).toEqual([{ name: "refs/heads/a", reason: "mismatch" }]);
+      expect((await refs.batch([{ name: "refs/heads/a..b", new: oid(3) }])).rejected).toEqual([
+        { name: "refs/heads/a..b", reason: "invalid-name" },
       ]);
+      expect((await refs.batch([{ name: "refs/p", new: oid(3) }])).rejected).toEqual([
+        { name: "refs/p", reason: "df-conflict" },
+      ]);
+      expect((await refs.batch([{ name: "refs/heads/a/b", new: oid(3) }])).rejected).toEqual([
+        { name: "refs/heads/a/b", reason: "df-conflict" },
+      ]);
+      expect((await refs.batch([{ name: "refs/heads/a", old: oid(1), new: oid(4) }])).ok).toBe(
+        true,
+      );
+      expect(await snapshot(refs)).toBe("refs/heads/a=aaa4,refs/p/q=aaa2");
+    });
+
+    it("deletes with a matching old value; deleting a missing ref is a no-op", async () => {
+      await seed(["refs/heads/a", oid(1)]);
+      expect(await refs.batch([{ name: "refs/heads/gone", new: null }])).toEqual({
+        ok: true,
+        rejected: [],
+      });
+      expect((await refs.batch([{ name: "refs/heads/a", old: oid(2), new: null }])).ok).toBe(false);
+      expect(await refs.batch([{ name: "refs/heads/a", old: oid(1), new: null }])).toEqual({
+        ok: true,
+        rejected: [],
+      });
+      expect(await refs.has("refs/heads/a")).toBe(false);
+    });
+
+    itSym(
+      "a delete through a symbolic ref deletes its target and keeps the symbolic ref",
+      async () => {
+        await seed(["refs/heads/main", oid(1)]);
+        await refs.setSymbolic("refs/heads/alias", "refs/heads/main");
+        expect((await refs.batch([{ name: "refs/heads/alias", old: oid(1), new: null }])).ok).toBe(
+          true,
+        );
+        expect(await refs.has("refs/heads/main")).toBe(false);
+        const alias = await refs.get("refs/heads/alias");
+        expect(alias && isSymbolicRef(alias)).toBe(true);
+      },
+    );
+
+    itSym("an update through a dangling symbolic ref creates its target", async () => {
+      await refs.setSymbolic("HEAD", "refs/heads/unborn");
+      expect((await refs.batch([{ name: "HEAD", old: null, new: oid(1) }])).ok).toBe(true);
+      expect((await refs.resolve("refs/heads/unborn"))?.objectId).toBe(oid(1));
+    });
+
+    itMultiSym("HEAD and its target in one batch are the same ref twice", async () => {
+      await seed(["refs/heads/main", oid(1)]);
+      await refs.setSymbolic("HEAD", "refs/heads/main");
+      const r = await refs.batch([
+        { name: "HEAD", new: oid(2) },
+        { name: "refs/heads/main", new: oid(3) },
+      ]);
+      expect(r.ok).toBe(false);
+      expect(r.rejected.some((x) => x.reason === "duplicate")).toBe(true);
+      expect((await refs.resolve("refs/heads/main"))?.objectId).toBe(oid(1));
+    });
+
+    it("refuses a multi-command batch whole, or applies it whole", async () => {
+      const r = await refs.batch([
+        { name: "refs/heads/m1", new: oid(1) },
+        { name: "refs/heads/m2", new: oid(2) },
+      ]);
+      if (multi) {
+        expect(r.ok).toBe(true);
+        expect(await snapshot(refs)).toBe("refs/heads/m1=aaa1,refs/heads/m2=aaa2");
+      } else {
+        expect(r.ok).toBe(false);
+        expect(r.rejected.every((x) => x.reason === "unsupported")).toBe(true);
+        expect(await snapshot(refs)).toBe("");
+      }
+    });
+
+    itMulti("a listing never shows half of a batch", async () => {
+      await seed(["refs/heads/a", oid(1)], ["refs/heads/b", oid(1)]);
+      const it = refs.list("refs/heads/")[Symbol.asyncIterator]();
+      const seen: string[] = [];
+      const first = await it.next();
+      if (!first.done && !isSymbolicRef(first.value))
+        seen.push((first.value as Ref).objectId ?? "");
+      await refs.batch([
+        { name: "refs/heads/a", old: oid(1), new: oid(2) },
+        { name: "refs/heads/b", old: oid(1), new: oid(2) },
+      ]);
+      for (let r = await it.next(); !r.done; r = await it.next()) {
+        if (!isSymbolicRef(r.value)) seen.push((r.value as Ref).objectId ?? "");
+      }
+      expect(seen).toHaveLength(2);
+      expect(new Set(seen).size).toBe(1);
+    });
+
+    itMulti("20 concurrent two-ref batches with retry: both refs count every success", async () => {
+      const count = (n: number): ObjectId => n.toString(16).padStart(40, "0");
+      await seed(["refs/heads/left", count(0)], ["refs/heads/right", count(0)]);
       const bump = async () => {
         for (let attempt = 0; attempt < 500; attempt++) {
           const n = Number.parseInt((await refs.resolve("refs/heads/left"))?.objectId ?? "0", 16);
