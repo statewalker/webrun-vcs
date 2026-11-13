@@ -50,12 +50,18 @@ const NATIVE_THRESHOLD = 64 * 1024;
  * ```
  */
 export async function computeObjectId(typeStr: string, content: Uint8Array): Promise<string> {
-  return bytesToHex(
-    createSha1()
-      .update(encoder.encode(`${typeStr} ${content.length}\0`))
-      .update(content)
-      .digest(),
-  );
+  const header = encoder.encode(`${typeStr} ${content.length}\0`);
+  if (content.length >= NATIVE_THRESHOLD && hasWebCrypto()) {
+    const full = new Uint8Array(header.length + content.length);
+    full.set(header, 0);
+    full.set(content, header.length);
+    return bytesToHex(await sha1(full));
+  }
+  return bytesToHex(createSha1().update(header).update(content).digest());
+}
+
+function hasWebCrypto(): boolean {
+  return typeof globalThis.crypto?.subtle?.digest === "function";
 }
 
 /**

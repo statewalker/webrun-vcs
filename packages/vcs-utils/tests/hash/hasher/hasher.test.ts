@@ -1,11 +1,5 @@
-import { describe, expect, it } from "vitest";
-import {
-  bytesToHex,
-  createBlake3,
-  createSha1,
-  createSha256,
-  type Hasher,
-} from "../../../src/hash/index.js";
+import { describe, expect, it, vi } from "vitest";
+import { bytesToHex, createSha1, type Hasher } from "../../../src/hash/index.js";
 import {
   computeObjectId,
   computeObjectIdFromStream,
@@ -100,6 +94,20 @@ describe("computeObjectId on large content", () => {
       expect(await computeObjectId("blob", content), `len ${len}`).toBe(
         await computeObjectIdFromStream("blob", len, [content]),
       );
+    }
+  });
+});
+
+describe("computeObjectId path choice", () => {
+  it("uses Web Crypto from 64 KiB and the portable hasher below", async () => {
+    const digest = vi.spyOn(globalThis.crypto.subtle, "digest");
+    try {
+      await computeObjectId("blob", vectorInput(64 * 1024 - 1));
+      expect(digest).not.toHaveBeenCalled();
+      await computeObjectId("blob", vectorInput(64 * 1024));
+      expect(digest).toHaveBeenCalledTimes(1);
+    } finally {
+      digest.mockRestore();
     }
   });
 });
