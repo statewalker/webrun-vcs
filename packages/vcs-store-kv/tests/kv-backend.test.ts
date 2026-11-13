@@ -112,57 +112,43 @@ describe("T4.8: KV Backend", () => {
         refStore = new KVRefStore(kv);
       });
 
-      it("uses correct key prefix for refs", async () => {
+      /** The root value holding all refs, decoded. */
+      async function root(): Promise<Record<string, string>> {
+        const data = await kv.get("ref:root");
+        return data ? JSON.parse(new TextDecoder().decode(data)) : {};
+      }
+
+      it("keeps every ref in one root value (one compare-and-swap per batch)", async () => {
         const objectId = "a".repeat(40);
         await refStore.set("refs/heads/main", objectId);
+        await refStore.set("refs/remotes/origin/main", objectId);
 
         const keys: string[] = [];
         for await (const key of kv.list("ref:")) {
           keys.push(key);
         }
 
-        expect(keys.length).toBe(1);
-        expect(keys[0]).toBe("ref:refs/heads/main");
+        expect(keys).toEqual(["ref:root"]);
+        expect(Object.keys(await root())).toEqual(["refs/heads/main", "refs/remotes/origin/main"]);
       });
 
-      it("handles nested ref paths correctly", async () => {
+      it("writes names in git's order", async () => {
         const objectId = "b".repeat(40);
-        await refStore.set("refs/remotes/origin/main", objectId);
-        await refStore.set("refs/remotes/origin/feature", objectId);
-
-        const keys: string[] = [];
-        for await (const key of kv.list("ref:refs/remotes/origin/")) {
-          keys.push(key);
-        }
-
-        expect(keys.length).toBe(2);
-        expect(keys).toContain("ref:refs/remotes/origin/main");
-        expect(keys).toContain("ref:refs/remotes/origin/feature");
+        await refStore.set("refs/heads/b", objectId);
+        await refStore.set("refs/heads/B", objectId);
+        await refStore.set("refs/heads/a", objectId);
+        expect(Object.keys(await root())).toEqual(["refs/heads/B", "refs/heads/a", "refs/heads/b"]);
       });
 
-      it("stores symbolic refs with different format", async () => {
+      it("stores symbolic refs as 'ref: <target>', as git's loose ref files", async () => {
         await refStore.setSymbolic("HEAD", "refs/heads/main");
-
-        const data = await kv.get("ref:HEAD");
-        expect(data).toBeDefined();
-
-        if (data) {
-          const decoded = JSON.parse(new TextDecoder().decode(data));
-          expect(decoded.t).toBe("refs/heads/main"); // 't' is for target
-        }
+        expect((await root()).HEAD).toBe("ref: refs/heads/main");
       });
 
-      it("stores direct refs with objectId", async () => {
+      it("stores direct refs as their object id", async () => {
         const objectId = "c".repeat(40);
         await refStore.set("refs/heads/main", objectId);
-
-        const data = await kv.get("ref:refs/heads/main");
-        expect(data).toBeDefined();
-
-        if (data) {
-          const decoded = JSON.parse(new TextDecoder().decode(data));
-          expect(decoded.oid).toBe(objectId); // 'oid' is for objectId
-        }
+        expect((await root())["refs/heads/main"]).toBe(objectId);
       });
     });
 
@@ -396,7 +382,8 @@ describe("T4.8: KV Backend", () => {
         const result = await refStore.compareAndSwap("refs/heads/main", wrongOldId, newId);
 
         expect(result.success).toBe(false);
-        expect(result.errorMessage).toContain("Expected");
+        expect(result.errorMessage).toContain("mismatch");
+        expect(result.previousValue).toBe(oldId);
 
         // Value should be unchanged
         const ref = await refStore.resolve("refs/heads/main");

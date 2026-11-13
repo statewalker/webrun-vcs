@@ -7,8 +7,8 @@
 import {
   type BatchOptions,
   type BatchResult,
-  batchBySingleRef,
   type ObjectId,
+  planRefBatch,
   type Ref,
   type RefCommand,
   RefStorage,
@@ -37,6 +37,20 @@ interface RefRow {
 /**
  * SQL-based RefStore implementation.
  */
+function rowToRef(row: RefRow): Ref | SymbolicRef {
+  const storage = (row.storage as RefStorage) || RefStorage.LOOSE;
+  if (row.target != null) {
+    return { name: row.name, target: row.target, storage } as SymbolicRef;
+  }
+  return {
+    name: row.name,
+    objectId: row.object_id || undefined,
+    storage,
+    peeled: row.peeled_object_id != null,
+    peeledObjectId: row.peeled_object_id || undefined,
+  } as Ref;
+}
+
 export class SQLRefStore implements Refs {
   constructor(private db: DatabaseClient) {}
 
@@ -44,8 +58,47 @@ export class SQLRefStore implements Refs {
    * Interim: a single command through {@link compareAndSwap}; several commands
    * are refused as "not-atomic" until this store applies batches atomically.
    */
+  /**
+   * Apply all commands atomically, or none (see {@link Refs.batch}): the batch is
+   * planned and written inside one transaction. Reflogs are not kept yet, so
+   * `options` is ignored.
+   */
   batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
-    return batchBySingleRef(this, commands);
+    return this.db.transaction(async (tx) => {
+      const plan = await planRefBatch(commands, {
+        read: async (name) => {
+          const rows = await tx.query<RefRow>("SELECT * FROM vcs_ref WHERE name = ?", [name]);
+          return rows[0] ? rowToRef(rows[0]) : undefined;
+        },
+        hasChildren: async (name) => {
+          // Names below `name/` sort in [name/, name0): "0" follows "/" in byte order.
+          const rows = await tx.query<{ name: string }>(
+            "SELECT name FROM vcs_ref WHERE name >= ? AND name < ? LIMIT 1",
+            [`${name}/`, `${name}0`],
+          );
+          return rows.length > 0;
+        },
+      });
+      if (!plan.ok) return { ok: false, rejected: plan.rejected };
+      const now = Date.now();
+      for (const u of plan.updates) {
+        if (u.newValue === null) {
+          await tx.execute("DELETE FROM vcs_ref WHERE name = ?", [u.name]);
+        } else {
+          await tx.execute(
+            `INSERT INTO vcs_ref (name, object_id, target, storage, updated_at)
+             VALUES (?, ?, NULL, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+               object_id = excluded.object_id,
+               target = NULL,
+               peeled_object_id = NULL,
+               updated_at = excluded.updated_at`,
+            [u.name, u.newValue, RefStorage.LOOSE, now],
+          );
+        }
+      }
+      return { ok: true, rejected: [] };
+    });
   }
 
   /**
@@ -53,29 +106,7 @@ export class SQLRefStore implements Refs {
    */
   async get(refName: string): Promise<Ref | SymbolicRef | undefined> {
     const refs = await this.db.query<RefRow>("SELECT * FROM vcs_ref WHERE name = ?", [refName]);
-
-    if (refs.length === 0) {
-      return undefined;
-    }
-
-    const row = refs[0];
-    const storage = (row.storage as RefStorage) || RefStorage.LOOSE;
-
-    if (row.target != null) {
-      return {
-        name: row.name,
-        target: row.target,
-        storage,
-      } as SymbolicRef;
-    }
-
-    return {
-      name: row.name,
-      objectId: row.object_id || undefined,
-      storage,
-      peeled: row.peeled_object_id != null,
-      peeledObjectId: row.peeled_object_id || undefined,
-    } as Ref;
+    return refs[0] ? rowToRef(refs[0]) : undefined;
   }
 
   /**
@@ -207,23 +238,12 @@ export class SQLRefStore implements Refs {
     expectedOld: ObjectId | undefined,
     newValue: ObjectId,
   ): Promise<RefUpdateResult> {
-    const resolved = await this.resolve(refName);
-    const currentValue = resolved?.objectId;
-
-    if (currentValue !== expectedOld) {
-      return {
-        success: false,
-        previousValue: currentValue,
-        errorMessage: expectedOld
-          ? `Expected ${expectedOld}, found ${currentValue ?? "nothing"}`
-          : `Ref already exists with value ${currentValue}`,
-      };
-    }
-
-    await this.set(refName, newValue);
+    const r = await this.batch([{ name: refName, old: expectedOld ?? null, new: newValue }]);
+    if (r.ok) return { success: true, previousValue: expectedOld };
     return {
-      success: true,
-      previousValue: expectedOld,
+      success: false,
+      previousValue: (await this.resolve(refName))?.objectId,
+      errorMessage: r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", "),
     };
   }
 

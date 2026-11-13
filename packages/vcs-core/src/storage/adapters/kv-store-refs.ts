@@ -7,6 +7,11 @@
  * atomic {@link KvStore.cas}. This is the refs seam that lets ancestry/gc
  * reachability read the refs a caller sets.
  *
+ * Because each ref is its own key and a {@link KvStore} has compare-and-set on
+ * one key only, `batch` applies a single command and refuses larger batches as
+ * `unsupported`. An atomic multi-ref layout would have to change the shared
+ * `refStore` facade too.
+ *
  * Direct refs only. Symbolic refs and reflogs are deferred (see below).
  */
 

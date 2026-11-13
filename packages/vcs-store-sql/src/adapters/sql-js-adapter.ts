@@ -25,7 +25,8 @@ export interface SqlJsAdapterOptions {
  * Suitable for browser and Node.js environments.
  */
 export class SqlJsAdapter implements DatabaseClient {
-  private inTransaction = false;
+  /** Settles when the transaction in flight (if any) has finished. */
+  private txTail: Promise<void> = Promise.resolve();
 
   private constructor(private db: Database) {}
 
@@ -114,22 +115,31 @@ export class SqlJsAdapter implements DatabaseClient {
    * Execute operations within a transaction
    */
   async transaction<T>(fn: (client: DatabaseClient) => Promise<T>): Promise<T> {
-    if (this.inTransaction) {
-      // Already in a transaction, just run the function
-      return fn(this);
-    }
-
-    this.inTransaction = true;
+    // One connection runs one transaction at a time: wait for the one in flight,
+    // so concurrent callers are isolated from each other instead of merged.
+    const previous = this.txTail;
+    let release = () => {};
+    this.txTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    // Nested transactions through the client handed to `fn` join this one.
+    const tx: DatabaseClient = {
+      query: (sql, params) => this.query(sql, params),
+      execute: (sql, params) => this.execute(sql, params),
+      transaction: (inner) => inner(tx),
+      close: () => this.close(),
+    };
     try {
       this.db.run("BEGIN TRANSACTION");
-      const result = await fn(this);
+      const result = await fn(tx);
       this.db.run("COMMIT");
       return result;
     } catch (error) {
       this.db.run("ROLLBACK");
       throw error;
     } finally {
-      this.inTransaction = false;
+      release();
     }
   }
 
