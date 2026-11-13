@@ -33,10 +33,11 @@
  * ```
  */
 
-import { FileMode, type ObjectId, type Ref } from "@statewalker/vcs-core";
+import { FileMode, isValidBranchName, type ObjectId, type Ref } from "@statewalker/vcs-core";
 import { UpdateStagingEntry } from "@statewalker/vcs-working-tree";
 
 import {
+  InvalidRefNameError,
   MissingArgumentError,
   NotADirectoryError,
   PathNotFoundInTreeError,
@@ -370,6 +371,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
 
     // Create branch if requested
     if (this.createBranch) {
+      if (!isValidBranchName(this.name)) {
+        throw new InvalidRefNameError(this.name);
+      }
       const startPointId = this.startPoint
         ? await this.resolveCommitId(this.startPoint)
         : await this.resolveCommitId("HEAD");

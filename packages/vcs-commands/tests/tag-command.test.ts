@@ -94,6 +94,33 @@ describe.each(backends)("TagCommand ($name backend)", ({ factory }) => {
       await expect(git.tag().setName("v1.0.lock").call()).rejects.toThrow(InvalidTagNameError);
     });
 
+    it("should apply git's ref-name rules to the full refs/tags/ name", async () => {
+      const { git } = await createInitializedGit();
+      // HEAD as in git 2.48 and later (refs.c check_tag_ref); 2.43–2.47 accepted it.
+      for (const name of ["v1/.x", "v1.lock/a", "v1.", "a@{x", "HEAD"]) {
+        await expect(git.tag().setName(name).call(), name).rejects.toThrow(InvalidTagNameError);
+      }
+      // git tag accepts these.
+      for (const name of ["release/v1.0", "@"]) {
+        const ref = await git.tag().setName(name).call();
+        expect(ref.name).toBe(`refs/tags/${name}`);
+      }
+    });
+
+    it("should list tags in git's order (byte order, uppercase first)", async () => {
+      const { git } = await createInitializedGit();
+      for (const name of ["v2", "b1", "B1", "a1", "v1/a"]) await git.tag().setName(name).call();
+      const names = (await git.tagList().call()).map((t) => t.name);
+      // localeCompare would give a1, b1, B1, …; git sorts bytes: B1 first.
+      expect(names).toEqual([
+        "refs/tags/B1",
+        "refs/tags/a1",
+        "refs/tags/b1",
+        "refs/tags/v1/a",
+        "refs/tags/v2",
+      ]);
+    });
+
     it("should reject duplicate tag without force", async () => {
       const { git } = await createInitializedGit();
 

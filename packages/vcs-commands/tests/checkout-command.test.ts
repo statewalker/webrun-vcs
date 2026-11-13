@@ -11,7 +11,7 @@
 import { DeleteStagingEntry } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 import { CheckoutStatus } from "../src/commands/checkout-command.js";
-import { RefNotFoundError } from "../src/errors/index.js";
+import { InvalidRefNameError, RefNotFoundError } from "../src/errors/index.js";
 import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
 
 /**
@@ -208,6 +208,22 @@ describe.each(backends)("CheckoutCommand ($name backend)", ({ factory }) => {
       // Verify branch points to first commit
       const branch = await repository.refs.resolve("refs/heads/from-first");
       expect(branch?.objectId).toBe(commit1.id);
+    });
+
+    it("should refuse a branch name git refuses, before changing anything", async () => {
+      const { git, workingCopy, repository } = await createInitializedGit();
+      await addFile(workingCopy, "Test.txt", "v1");
+      await git.commit().setMessage("First").call();
+      const headBefore = await repository.refs.get("HEAD");
+
+      for (const name of ["a/.hidden", "HEAD", "-x", "x.lock/y"]) {
+        await expect(
+          git.checkout().setCreateBranch(true).setName(name).call(),
+          name,
+        ).rejects.toThrow(InvalidRefNameError);
+        expect(await repository.refs.has(`refs/heads/${name}`)).toBe(false);
+      }
+      expect(await repository.refs.get("HEAD")).toEqual(headBefore);
     });
   });
 

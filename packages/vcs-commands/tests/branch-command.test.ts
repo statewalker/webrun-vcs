@@ -103,6 +103,36 @@ describe.each(backends)("BranchCommand ($name backend)", ({ factory }) => {
 
       await expect(git.branchCreate().call()).rejects.toThrow(InvalidRefNameError);
     });
+
+    it("should apply git's ref-name rules to the full refs/heads/ name", async () => {
+      const { git } = await createInitializedGit();
+      // Accepted by the earlier partial check, refused by git branch.
+      for (const name of ["a/.hidden", "x.lock/y", "trailing.", "a/./b", "HEAD", "-x", "a@{x"]) {
+        await expect(git.branchCreate().setName(name).call(), name).rejects.toThrow(
+          InvalidRefNameError,
+        );
+      }
+      // git branch accepts these (checked with git 2.43), "@" included.
+      for (const name of ["naïve", "a.b", "feature/x", "a@b", "@"]) {
+        const ref = await git.branchCreate().setName(name).call();
+        expect(ref.name).toBe(`refs/heads/${name}`);
+      }
+    });
+
+    it("should list branches in git's order (byte order, uppercase first)", async () => {
+      const { git } = await createInitializedGit();
+      for (const name of ["beta", "Alpha", "a-b", "a/b"]) {
+        await git.branchCreate().setName(name).call();
+      }
+      const names = (await git.branchList().call()).map((b) => b.name);
+      expect(names).toEqual([
+        "refs/heads/Alpha",
+        "refs/heads/a-b",
+        "refs/heads/a/b",
+        "refs/heads/beta",
+        "refs/heads/main",
+      ]);
+    });
   });
 
   describe("DeleteBranchCommand", () => {
@@ -274,6 +304,18 @@ describe.each(backends)("BranchCommand ($name backend)", ({ factory }) => {
   });
 
   describe("RenameBranchCommand", () => {
+    it("should refuse a new name git refuses", async () => {
+      const { git, repository } = await createInitializedGit();
+      await git.branchCreate().setName("old-name").call();
+      for (const name of ["a/.hidden", "HEAD", "trailing."]) {
+        await expect(
+          git.branchRename().setOldName("old-name").setNewName(name).call(),
+          name,
+        ).rejects.toThrow(InvalidRefNameError);
+      }
+      expect(await repository.refs.has("refs/heads/old-name")).toBe(true);
+    });
+
     it("should rename branch", async () => {
       const { git, repository } = await createInitializedGit();
 

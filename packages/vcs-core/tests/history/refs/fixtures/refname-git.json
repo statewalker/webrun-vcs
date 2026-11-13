@@ -1,0 +1,7835 @@
+{
+  "source": "git version 2.43.0 check-ref-format",
+  "cases": [
+    {
+      "name": "refs/heads/main",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/feature/x",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/tags/v1.0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/a-b_c",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/UPPER",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/naïve",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/emoji-😀",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/a.b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/.hidden",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/a/.b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/a..b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/x.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/x.lock/y",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/x.locked",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/x.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/end/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/refs/heads/a",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//heads",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/sp ace",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/tab\there",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/col:on",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/q?",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/br[acket",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/back\\slash",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/car^et",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/til~de",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/st*r",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/@{x}",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/a@b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/@",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "@",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "HEAD",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "main",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/-dash",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/a/-b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/\u0001ctl",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/del",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/a/b/c/d/e",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/..",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/a/./b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/a/../b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/{brace}",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/at@{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/dot.lock.x",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/remotes/origin/HEAD",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/notes/commits",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/trailing.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".refs/heads/a",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/a.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/@{-1}",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/heads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/end",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/😀/🚀",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/ nbsp",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/ ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/￿",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "@@",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/a/@",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/@/a",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/@a",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ -aZ-{0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.0{c*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".écZc.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[b\u00019}é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é@{._",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ab0~0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Z0_\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_90.lock-9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c_/\\c~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?_é9c:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b-_a*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a~^Z.9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0bé?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/a:-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ _@b.é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.b-0c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}bc*}b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a*c~0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/._a{?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[/\u000190.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/a-_/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/@_ -",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c0/@{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^.lockéé.b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock.locké/@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs///éb-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9^b _",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Zc\\@b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z:é9é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "ab_--0",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": ".~c9é9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cb0Za/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " b[9-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//éé{lock9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c-?*-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?_-/-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0baZéé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}9a/lock*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/é-\u0001.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a*c_é{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0Za/00",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": ".:0.lock@",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockb0:09",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-\\a/é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_/aZrefs/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-_a\\aheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a:_9refs/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é*}/aZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z*-b@9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}:é}-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZab-Z",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[9/é0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0/ éa~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Za/aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a9é/}_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/_0lockba_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs//aZ[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/Zc/\u0001",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//_?Z0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c.^-Z.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ[*.*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a-a_0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "éblock-~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}_0{09",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-b-.-{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.heads/-.lock?/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a0-heads/-b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/aheads/c{0heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9c00heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}/0_\u0001/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.9refs/9-~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}*a9é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c~0Zc/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éba_refs/.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@b-9/\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ Z\u0001:é.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/é._c0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ab@/ /",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZ\u0001\\a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éb-ba*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_/.\\cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ-.ab",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/cZlockZa-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/lock_ *cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a~a/c.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éé//a.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é_0_0heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock:ébrefs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-9-0^\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_\u0001-[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a__.lockZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c{.9-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".9lockb[*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9ZZ_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ablock_}:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs//[:é.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001b -c-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cheads/lockZa_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.9cZ.:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a~lock/.9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_lock/-heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@_?:c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é.-:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_aheads/a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "0.a9c*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0Z 0}9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}/0é[",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZc9c\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/a9?.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9-/.é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[/0/é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^/[heads/^:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^éé*[{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001Zc/aé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/-0@0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/refs/-a9a{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "\u0001block9-é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_-90_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-/?:0-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a\\ .locké\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/00b__",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_-//c0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ZZ@Z0heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/abc.lockcé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "?/aheads/\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001b}*a_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "ZbZ0aé",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-/^0--",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?\\é/c.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é\\_[Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0b_Z\u0001/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_--/-:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é-0_.é",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": " *0b\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZcZé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?Z[b[Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c0refs/9aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.9^/é:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?b[b^/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-:[\\lock/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c~.*refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-9\u0001\\c_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0\\a9/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@b^0.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "//aéé/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a{c_Zb",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "Zheads/ .\u0001_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-.lockc{c",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é.locka-00",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0/-éc_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0b /[Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0.cZ-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c-Zc.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cb\u0001.-.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0heads/aheads/-~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cbc-c\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[é Zcb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0{\u0001/^/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001-ébc-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}/0cheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ .aé0\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éa.-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/Z-_ab",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é/@90/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ /0{^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/-heads/c~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//b-_@~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/céa\\^~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[Z /-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ab heads/09",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/./0.lock_heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^_-heads/[\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Zrefs/9Zb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "a9a/cheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_Z_/é",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/cZé\\a.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0*//é~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a*}heads/@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@-/~locké",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_c\\a9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "ZZ@--\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0/0baZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "a0c9-_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "a~a9cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZ0*cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a*0ZéZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éba.éZ",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0:@heads/ /",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs//0.éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZaZZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock\\cba_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é{-.lock@0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éba_c9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éZ[Z@_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ 9éZ_0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//_?_0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0-lock9refs/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c{refs/Z0_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éheads/-_cZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é-00{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/00..c.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[{^b\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ b-heads///",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ0-Zé",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "lock/-9ZZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/\u00019^.locké/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c.lock0Z0*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^_a.lockc:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é~a.lock09",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@Zrefs/_/9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "__éheads/lockZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "^~refs//}é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0\\0b@0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c.lock 9\u0001~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?_@ZcZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@/^a_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZ}b/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "}_éb.9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "^9 90b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0bZ0.b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs//_é_0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/09a:?9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock\\-_0é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éZc}",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/_@/@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ /a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^b}Z._",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a-0b-Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[/0brefs/Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0bc_/{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "}bé_ .",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a0_éZb",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/Zéab}{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "..09-{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZ.\\Z_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//Z0/@-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?_-9_{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c9cheads/?/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.0cb\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_0abc.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".Zc:c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZ}bZ:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cb/b._",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0[\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/9__@.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aheads/_-a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "a0c/c0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": ".b-9-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^-refs//refs/_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é-_cheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cb//?.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é/a.lockc\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cba0é~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_--_/Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}/\u0001b_b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/__aZ[_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?ZZ-}Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0heads/c/\u0001-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//\\}ZZ_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0{lockb.*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aheads/__a\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/refs/-09",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0/é9a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0*-9c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a\\//^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_/?/a",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/9c:é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a~?heads/-heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c{é9?Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}Z-/a0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0_lock/a*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^_-.lock-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_-\\c{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?9cb?:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z/-bc/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0Za/}\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-éc0aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "a/é9?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ZZ Z\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//{_9}~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock0/a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_[_cheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-é?9.Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/9a/a*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "Zb-ééb",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a\\acZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0a9lockb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001_0*é.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock/.Zlockb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".\\a/0*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}.lock09?~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/b[9lock/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock9ZZ0.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_Z-b\u0001",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0.}/}Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c{@-aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "[bé/éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/-_./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a90-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_9-_c9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "\u0001~aZab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_-:--",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é.a.lockrefs/~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a:0/c-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0.@/_-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é:\u00019-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a_0_é~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0{lockblock9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?_\u0001~[.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-bé-\u0001.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a\\Z~c.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Za9/~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ _[{lock.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-ab 9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a//Za{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/_:a9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0. 9c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@/é\\refs/Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[-é{0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[.c/ b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-0\\^-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0brefs//é{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a9Z* 0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZé:/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-*a9^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-bc*a.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".é-lock0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-*cb}_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZa.-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^0c/éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0\\ébc\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?-refs/-.Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z-refs/.éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_ZZ _",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^Z_9\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "\u0001b bZ-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_b0/}-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "cheads/lock:c{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}é9?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".ba/_9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a.lock?~éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001b._?/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Zcéa0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": " _@/-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_/é9a*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}bZ_é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "09}bé_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "c~ 9[\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é0/_0\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éZ.éc9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?/\u0001bcb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/90Z é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[:0/-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^b[Zcb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^.lockc9éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//9é*?9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-{-béb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "0/é.locka~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lockrefs/_0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "@{Zheads/^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/./@~^\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_bc-cé",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ab0:0heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/Z.0~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@\\}.09",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c9refs/_ /",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ -_/\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ?heads/aZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockb?.lock@9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éb}/refs/Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": " ./_-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@_-9\u00019",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a0_ba*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}b}bab",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a_cZ-.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZa90heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cZa.lock/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_c.cZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c:\u0001b/.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0/lockZlockb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0b\u0001/?9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Z Z\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_lock/-.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_0\\c",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_[bé*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock///é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_refs/*lock9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/-._0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a/c~c_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockb-9a9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/lockZ^/0*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cb0*}/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éheads/éZ//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0/refs/.lock-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[Za~-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/?/aZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Z-Zlock~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}9@\\c.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^_\u0001/^é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cé\u0001/[.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aélockéc\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c~ 9\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z_-Z-{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[-09_Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}:lock/._",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-9ab@_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ b-Z-*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001_\u0001b_.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " :a/-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}.lockc-/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/\u0001~0_refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Z/~ b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//\\Z:[_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?9\u0001\\}.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockb-c~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0{c:/\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_~_.lock0*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/ab0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/b /\u00010",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éb-Z@0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "Z/Z0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9[0[.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0*[b__",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?élock/\u00019",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/é/-_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éZ@*a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-heads/refs/.lock//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_/a_aé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0{.[\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ ~lock_}heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Za0_-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/lockb-\\-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-b[Zé~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs///^ba/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-9 _a_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/bé*lockZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/é{éé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/@.lock0//0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/@0-_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ca.lockc9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_Z__b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c_c/aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/cheads/@heads/_/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^-éZc9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//9^Z?/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é_aéc9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "Zheads/c.lockcb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c.lockc_lock\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/-/0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ab.b-\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?~é\\\u00010",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z/a/?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cheads/refs//a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " :-béb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_?bc",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/Z~lock0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_^/?0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é.lock[\\éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/baélockb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a{cZcé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}_?_refs/.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a\\@heads/c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "\u0001:-9c:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c:?.0heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é/ 0@Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b_//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/céaéa_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/refs/{c[heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/00_b0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c~0\\é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c_^block/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZa9a0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-9?~.heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}9[b^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9//é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/-lockc_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/abcheads/0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "c.é90b",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[*_9_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0b/*\u0001/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?Z09refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "\u0001:-:-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0/a_a.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a90[-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_blockZ0Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/lockZlockb/_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/refs/9.\\éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}9é\u0001-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9_/.b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0é0\\refs/{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_é0\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_@:-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "00}9cZ",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0block:-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?Zé:^.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éZ_ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock/ab_b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c_@_.-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}Zrefs/_0:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a9Z9Z9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}9a:[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/Za-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/__é0-9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/Z.lock-~Z/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0~a*ZZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a{\u0001.lock.heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[.[/0-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_Z}_/9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é/a9refs/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "00Zheads/\u0001-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Zc__b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/cZa9é9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éZé/\u0001_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockZc_refs/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é{aZa_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/^ZZ-^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z9-9?-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^heads/\u0001_@.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "ZZ--refs/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/Z\\ébaZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_a.lockaZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "éZ./ b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^Zé.lock00",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é90_00",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/\u0001.}-cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^_\u0001Zrefs/b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//heads/c_a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a* ?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock.0/-9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-/0_ Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b/brefs/:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a--_-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é//9refs/b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?9--c*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cb-Z^.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z_^/a{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " bablock\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[Za{-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^90b\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éé-b\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a0é. _",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0bc\\0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é:a.refs/\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock~lock_a",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ-bcZ",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/lock_aéa9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ab-:\u0001-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z:--c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/\u0001*éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-.locka.-_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é__-Z_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "/\\Z_c_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[Za:[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?-refs/{?.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lock^/ 9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é_ {-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[/éheads/\u0001{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^{?90é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/Z-09",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/09a.lockZb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": " cb/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_Zb^b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Z\u0001/refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9c__b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?/a:?heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/-9@b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é/aheads/-_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "a/-_éheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éé :0-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cbc9Z.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_-.0Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é/é0c:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c[*a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c.-brefs/-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/\u0001Z0{-.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é/refs/9a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "}0ZZ\u00019",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?_-9-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c:é*}_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock.aZ?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0:[.c-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a/@9ZZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.Za{é9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " b?9[*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u00019Z_a",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockb09a0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é9-bcb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?.cZ@_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}~a/@0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "Z/[b-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}-é_[.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c--/@~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?bééc-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lockéba9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a/0/}b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-Z0bé_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c/é.aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-/refs/Zé/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZé_a0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/--?/^Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u00019refs/Z-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Z\u0001b[0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@_é:?:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs///Zb[\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock\\?~\u0001.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0Z/.lockc.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "alockéé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é../Z_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b-bc*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9a._/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Z-/c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Zlockbcheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c.Z-éZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "\u0001~_-é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ c9cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/@b@~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[_090Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-0abc/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u000100Z0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[b0{0*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-bé9@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aheads/^/@~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ /\u0001{[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a-}*.heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/céb Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-cZ//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[b--éheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@.lock b0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_b}/a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é_ {lock\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a.lock-0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZcZ@b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0heads/a/Z_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "}9a{0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^/0:Z-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockheads/-/[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b\u0001~c_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-b/9ZZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c_aZ-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "Z/ {\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a\\c{}b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_\\0b./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é~-.lockZ9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c~a/heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZ-/}é",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "Z900éheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z~@0lock.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Z?{c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_0\\/.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZZblock\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/ba/-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/0-0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "cb@{\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0/Z90é",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0_.9._",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.bZZé9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.-b 9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}\\@.lock\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b09Z9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0.a/c9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?Z[9lock/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@b0c\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[_a. _",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "09c/^",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9lockZZZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ab\u0001-c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/0/Z9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[.}bc0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/--_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001/c/c*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c~é/-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs//^{0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a*é_Z:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock9-b._",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é9?_[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?~}heads/a9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^Z0Z-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@b?:\u0001.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_~a\\a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_refs//0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//.ab\u0001:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a.é.aZ",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "0b0Z.9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[/é/éé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[ba-}_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a--/Z:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c\u0001{lock9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}:.heads/0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockb-.lockcb",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-.lock^/-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cb^heads/^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@Z0\\[Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".9-*/Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.*0{/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-heads/-{_{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0block9-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_Za/0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_/a.lock0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[/c_lock_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}-abé9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.{-90*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9é\\?-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-./é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Z@9-.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}9cbé:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZrefs/\\éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ab[é-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_c/}",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a0é0a.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?~/éa9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c_éheads/^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0é}Zrefs/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/_9}9-Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/^-_Za/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c0}{/.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éZ[-/Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a\u00019éZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c9a_éZ",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éb-_-é",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-9éZlock{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?é-~a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?:}_?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-heads/c/refs/heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^-?~-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c~[aé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^bZ/?Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "\u0001/ _^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cb^_lock/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock{é~aZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001b/9-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ bZ/-0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a90.lock-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "09é__*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_b-éa.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9@:c_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_@9c{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "[~}9[{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c_lock[_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-bc/é*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZéZ-b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?Z09[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c\\-/[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z_ééZ_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/aba9[é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@Z0:refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@0a/a{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a9 :refs/:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^.-bé\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é-Z~0.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_a.lock-Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c{refs/Z@9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": " 9..cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cbc.lock[.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ _[ba/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Zc_0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9/:-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001Z-Z@.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@block/0.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_Z-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^b/ZZ-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//a/refs//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.ZZheads/?/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é90.}",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0/c-cb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0Z//a{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-~é.aé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.heads/\u0001.lock-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c//9c_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?heads/0/}/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZrefs/\\-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0{refs/?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock -\u0001-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZrefs/9ab",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "lock:0:c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é/}\\\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[b_b?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockb-/@.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^b}./heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/locké-/_b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é9é_cZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c{@.lock}:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZc0é:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/^Zéb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_cbcZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é/-/é9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c/abaé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a/\u000100b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é* 9--",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_{0__-",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "[_ /-:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a_é.lockc_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c:\u0001Z-.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é{__a9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "céa0\u0001/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/a~a-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9@{0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.a0?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?90.lock@b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//\\.9\u0001_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZ-/a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@.lock.lock^Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/9c/-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9ab[~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/_block:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0éZ\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/00é9//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/é_cb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ 90:a\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/_/-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "Z{aZa_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-Z?b^é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.é.lock?\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001Z0heads/refs/Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0-[/.b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@9-*/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?/0b^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[~é/?9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?:-a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/^/^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9^0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_cZ0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}/lock/^b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ^909",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ \\-/./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[Z^-éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z/a~0-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@../lock*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@~^_é9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_?heads/09",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é*é~?/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c90/_.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//{[Zc_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/ba_?é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é:a-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}*?\\-\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^é?é@~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a90bZé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é9-:-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_-9ab",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a9aé?Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}ba9a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a9cZrefs/:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZa9é_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "[0--refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".b/.lock[.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9abaZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "ébc_ ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é.locké_/9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "c9abc9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/000:}_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^/ZZéZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_[~-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001éa/a.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ 0a\\a9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/-/.c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockbZé _",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/0~lockZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock/-_é.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " _^{lockZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/ _-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001/?0-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é~-{ZZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock9.Z[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//*0heads/-\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?Zéheads/a{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cbab_Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-/-{cb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a\\ 9^",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[b0éZ~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.Zé9cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cérefs/éa{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/\u0001_^Z/~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZé/refs/_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a9@.lock^/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ 90b_/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockZc9._",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c_é.locka9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/refs/_0*0.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.9a9c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs// 0a\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0b}0-Z",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "./-ba~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z/@.c_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a.cb é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^Zc_a_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éheads/lock:c:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[b?ba/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[*refs/heads/éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-\\[/[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockbc/?\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZc*cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/-Z__",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/@b-/[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-\u0001bab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[.lock[~c{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_heads/_:é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[Za0{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0ba/a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_a{?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Z^/éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c.lock-/^/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@.lockab/9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/refs/Z-0?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lockaZc/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éba{a.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éheads/aZ?Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ .lockc~é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-0ZZc*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9.bcb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?_?/refs/-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é*\u0001_0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/éc9a.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éheads/.b._",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a?9-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-.[_é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0b-_}Z",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-_lockb--",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs//9/-c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9[bc.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock0?9é:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock/a_b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0~c9_b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0bc__Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é_refs/0./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0.lockcb0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/refs/{}_\u0001{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-aheads/a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/a9a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}~@bé/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}9éZc",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@-^.locka9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/abcé-Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/^{0érefs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock:a.locka\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éb0b\u0001_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock/0~a0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001Z@9/Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c9?\\^",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^: b-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0/00é*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c*[9./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lockab}",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a0-_-b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0ba\\a",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^Z?b heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.-?~/_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/abZ-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_0. 9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éé^~a\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0é^Zé_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^/?.?",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0\\é:c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[_0b-*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/{@.lock-_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "0heads/_/éZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/cZlock.lock/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "\u0001b/heads/ ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cé-9é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c{c_}b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "0{aZ/~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "ab[9a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@bé_[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a_0Za.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[.-ba\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}9@.Z/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_/a-a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éheads/@/aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ {?b Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ é-heads/é{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Z_bcZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ /-a_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0c/\u0001heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZ[b[b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a{Z. :",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.9cé\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a_éb0.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs///?brefs/_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-*Z/-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZlockb[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-b}heads/ 9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/00\u0001/c{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_~abab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aé\u0001_a\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001:/Zcb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0/éé?-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-.0*cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_a\\é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@:-_\u0001.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_//0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0:cheads/lock/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001/ éc~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é0[/é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?0éZc.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é.cbé9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0Z0/éZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs//éa/éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[.Z_^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?{^heads/cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éZ-\\-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c: _Z_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a.lock090_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "^Z}-c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cb?/0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é.locké_cb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é.@bc-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "@\\-Z[_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é.?9}~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^0cb0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Zbrefs/~refs/é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a\\?_refs/{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a_\u0001__-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/\u0001.lock-0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock0ZZ@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "__c9c:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".bc\\-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock/\u0001/é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZaZ0{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/--//0*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockZ\u00019c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c~é/-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock9-90b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "a9aheads/é_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-/a9a9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.élock0c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_//-*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}:-Z@9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_heads/é_.heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_refs/:09",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001:-Zé9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001_a/.-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9\u00019\u0001/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/Zéé9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ heads/-.-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c:c9ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZabZ/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/c-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cbé0_:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a-é9_{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0.é_-*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é{cZ@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0:-Za9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[.}90\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[/_:[0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/ heads/ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/_c~/b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "./locké\u00019",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock*refs/9cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.Za*.b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ Zcb^b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a:0ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c90:?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a0[_\u0001*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ.b[Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_\u0001.@b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^/?/c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a.lockrefs/bZb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/Zrefs//lockZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001a..0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_-/0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "éheads/  {",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//c/0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@/Zb@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/é{?Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éblockZé.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-heads//9Z{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lock[/a0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é@ba_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/./-0éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_/brefs/é",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "lock0abc0",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a.lock\u0001b@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Z 9.Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^.lock?béb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lock-_}b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é{a0a9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "@{cZ?é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a-\u0001_/0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0Zrefs/-a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-~a{a9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c*0.lock_~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^{}bc~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-ZaZ /",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cbébéb",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?ZcZ@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9c*\u00010",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " b0Zab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_/refs/-aheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_\u00019.b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//.locké_0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZ0/_/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/-a/[heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éc9__",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9cé _",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_refs/.cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9éZab",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs//-_0Z.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/.éab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs///a/ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ 0a/*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/abé/-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".élock9^.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-ba*[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[b0\\0é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/09a9-{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éheads/é/a\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b béZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/éZé{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_ab/é",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c.lock\u0001heads/refs/{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/--00",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": " //*0.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c*0*.b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@-cb./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/.0*0-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ b0\\c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c0Z_c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@b0_a_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "?bé-é~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é00b\u0001/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/09Z00/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a.\u0001/ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/*0Zé.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0.lock/éa_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é/}9[*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "Zheads/.Za:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs///^:-\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a*}/éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é*cheads/-~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/a0-_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/lock: _a{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.9Z_}Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z/a{.b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "ab0b//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/c*0heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/:Z.lock@_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/\u0001/ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^ba/é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockb_Z-b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/cé-:éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/Z0.locka_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/09-b0b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0\\refs/b\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "090*ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_9é:refs/~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".9c/refs/é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9a:c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^béba~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9/.^b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/\u0001/0é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c{0__9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/\u0001_abcheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b?Z-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-bé.0:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é-090_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/lock/ébc",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/._c/0{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001b//@\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-9a{@",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_9Z9cb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/Z/0_.b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "@Z^Z-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ /0_a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é:lock-a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^/a_é0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_0.lockZZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9cb[/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/Z/.Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[9}_-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/~-/_.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "Zbrefs/?é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a:lock/}_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lock\u0001Z-heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?~0Z--",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éZZ/^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "\u0001.lock}9//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/abaZ__",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/._a*é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/ 90{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a_Z0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é.a_c0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ 9?_0é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a/lockZ/b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "cbc_a\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^9-b0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9c9a9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "\u0001^é?heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//é Z..lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock:\u0001_Zb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/.b.-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-90/}/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/0__cb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/refs/b0/?{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?~_9_0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0Z-bc9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0bc/0Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-0-~a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0Z?heads/^.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_Zé^0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[_^9cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.b-_00",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//.lock^9[{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001_a*c",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " Z@9-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0.lock0*^_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[.lock_^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//.lock/_\u0001/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Za_é.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockZ?b_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?\\a{éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_b?/c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?0-Z^/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z9\u0001Z[/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " 9@b}.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_?_/_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?/0{}/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0.lockrefs/b09",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "[b--.:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cheads/0/a9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "lock{0-Zé",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "}Zc/.9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éba/é.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}b\u0001:locké",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-*c_ ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[_0\\0:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^b-.lock\u0001Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001_\u0001^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^-c*cheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-é0béb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs//b/90Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é~a{c",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éheads/c9c9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "\u0001bc/?_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éb\u0001/lock9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//Z/_é9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0/-90/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_-ba9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é.cZ0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@_?{\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é_}é09",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0.lockcb\u0001.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ébaZa/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "ab-*0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001~[é/Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c{-*.é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001/Zheads/a~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^Zcb_Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0ba/refs/-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/ablock9\u0001-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a\\cc0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.Zab *",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0bc*c9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0.-b-_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "é_éa/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aé/_ /",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9a-a0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/./a9[_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^~?*-.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0ZlockbZ{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/?é?Zaé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@/lock{ _",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Z-\\éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_9abZ.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001{-Zc_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ab-_lock\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[-\u0001éa_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/--a{[é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9a9[0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c909refs//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?Zc_é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c.lockcZZ.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a/[9[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}9Z.lock-Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.///[/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//*}_Z.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": ".é-_Z9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZ.{}9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/é.@_^Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@Zé{-b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs//_Z0a-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0{cb_Z",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/Zheads/é_c9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}.éérefs//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cbc_\u0001{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_\u0001{[-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9ab@~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[_\u0001ba_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZé_Z/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "Z0aZ@/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock.locka/lock9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/\u0001.locké9éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cb-.a_",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "@Z[9-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é_b-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9.é :",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é/lock/}9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "c~-ZZ9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_/c-[:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c\\\u0001* b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/.lock_refs/b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ZZa/é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/bc\\lockZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "[heads/^*0Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_a9-Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0{ZZc_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/00Z-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/9-9aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": " b?heads/}~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^_?Z.Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Zaheads/a.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//Zc{@*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lock/lock/ :",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}b_}/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0b-Zé_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "_/-/c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[b\u0001.lock-\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c9Zb heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9@/Z_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/c0ébé9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "[-_.lockrefs//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^a{\u0001_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-bZ90_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é9Zab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-_-.locka*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cZa{lock~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/\u0001Zc:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^../.heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ébé_cb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/}/refs//-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_/éZrefs/0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a_é:[_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.éa{}9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "ééaéé.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_/c9c.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c_[/0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ZZa\\/_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/090.aé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "}9-/\u0001b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éZ0Zlock_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/^9c/é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z.locké~^9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0_/heads/0Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/a/a//_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "cZ@9é9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "aé*a:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ZZaheads/lock9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "^Zc?9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lockrefs/b[.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0_-b@heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001/c/é/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ .a_é.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0/refs/9 b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c:/-c-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?/^/0\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ _a0}\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é_c0lock9",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-0[.locka/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é{\u0001_-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z érefs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//0c9c.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " -?_[:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?.locka/a9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_b.-9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0*éé-\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[/aZ}Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-\\/é0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0_[-é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/ é?{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_}9é:",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@.lock[bab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cZ-heads/\u00019",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//_-b0é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "éa*cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z.0_@*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0-[*0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/?/\u0001/c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cheads/-heads/-*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^Za{0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockZ[9lock_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c_-9c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/.0heads/éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a\\0é0{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@éabcheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZlock_09",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é9a*?\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c/_:_é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c~0-.{",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-/é9.b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "abab__",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[.lock0éé9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//-~éb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é.locklockb/-",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/_/c\u0001*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0_ab[_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c*0__/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-*refs/-Z/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^{Zb-heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9?heads/@b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}.lock[é heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lock/lock/Z.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z:^_-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c0[_[Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c\\/_?-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "/-_{refs/.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//.:-.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001bc/\u0001_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-.locklocka",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0é\u00019-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/_ba.lock?.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/refs/:a*cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_}bé/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/Z/refs/bc/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}{c.lock-/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}heads/-heads/a_",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/aheads/ /refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " heads/c9?/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/lockba_0Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/[9.-refs/_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-* -0_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@élockc9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/-*Zheads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é/0éaZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-0?/lock\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c-é~@_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/éb-*-_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u00019lockZ-b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0~-b./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "09a.^Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é9éheads/aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/@_c9._",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-_ ba9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@_\u0001/c-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs// :Z*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-Za.lock}9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "@~a/c",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a9-é_{",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/@/-.locka/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9\u0001_refs//",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "c..bc~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockZé:c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}.09?.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a0Zé0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.Z-/cZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//~--a/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "^/Z9é9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cblock_0/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cheads/Z/^/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs//Z@*cb",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0*0bc.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a*a/a.",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/}Zlock/ 9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c.c9^b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c/ b-Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@Z bé",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "é~0~é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0:c/?",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/-bc.aé",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "?.locké/Z9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c9cb0\\",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " heads/ :0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cheads/c/}Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "^/lock9ab",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "@/a:__",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/cheads/refs/é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}9abéé",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "0heads/^bc~",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_bc90/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/^_a/}/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/@_?-ZZ",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/aZ-/ab",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "?.lock0:?é",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "0ZaZrefs/9",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "é909 b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/abé{aZ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/0é\u0001/a-",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/c\\}Zé.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0/refs//refs/9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": " /refs//^b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/[Zrefs/.0b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lockaZcb",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "aZ\u0001Z._",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "lockZ-9é0",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "cZa*/heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/00c9-Z",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/éé.9?Z",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "aZ[_[9",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/é-__c0",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/-_?\u0001heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/.Z09a.lock",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "?-\u00010./",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/ b_0é_",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/\u0001*a\\c/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/0Za_c",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "_9-_?heads/",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "a_é/_b",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/.béZ *",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/..0/a0",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a.lock_0?b",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "}bZ/c*",
+      "valid": false,
+      "validOneLevel": false
+    },
+    {
+      "name": "refs/a_refs/Za-",
+      "valid": true,
+      "validOneLevel": true
+    }
+  ]
+}

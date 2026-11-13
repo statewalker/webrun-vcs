@@ -1,5 +1,5 @@
 import type { AnnotatedTag, ObjectId, PersonIdent, Ref } from "@statewalker/vcs-core";
-import { ObjectType } from "@statewalker/vcs-core";
+import { compareRefNames, isValidTagName, ObjectType } from "@statewalker/vcs-core";
 
 import {
   InvalidTagNameError,
@@ -21,57 +21,6 @@ function getTimezoneOffset(): string {
     .padStart(2, "0");
   const minutes = (absOffset % 60).toString().padStart(2, "0");
   return `${sign}${hours}${minutes}`;
-}
-
-/**
- * Validate a tag name according to Git rules.
- *
- * @param name Tag name to validate
- * @returns true if valid
- */
-function isValidTagName(name: string): boolean {
-  // Cannot be empty
-  if (!name || name.length === 0) {
-    return false;
-  }
-
-  // Cannot start or end with /
-  if (name.startsWith("/") || name.endsWith("/")) {
-    return false;
-  }
-
-  // Cannot contain ..
-  if (name.includes("..")) {
-    return false;
-  }
-
-  // Cannot contain special characters (control chars, space, ~^:?*[\)
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: Git ref validation requires checking for control characters
-  if (/[\x00-\x1f\x7f ~^:?*[\\]/.test(name)) {
-    return false;
-  }
-
-  // Cannot end with .lock
-  if (name.endsWith(".lock")) {
-    return false;
-  }
-
-  // Cannot start with -
-  if (name.startsWith("-")) {
-    return false;
-  }
-
-  // Cannot be @
-  if (name === "@") {
-    return false;
-  }
-
-  // Cannot contain @{
-  if (name.includes("@{")) {
-    return false;
-  }
-
-  return true;
 }
 
 /**
@@ -371,7 +320,7 @@ export class ListTagCommand extends GitCommand<Ref[]> {
     }
 
     // Sort by name
-    tags.sort((a, b) => a.name.localeCompare(b.name));
+    tags.sort((a, b) => compareRefNames(a.name, b.name));
 
     return tags;
   }
