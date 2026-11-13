@@ -1,5 +1,5 @@
 import type { AnnotatedTag, ObjectId, PersonIdent, Ref } from "@statewalker/vcs-core";
-import { compareRefNames, isValidRefName, ObjectType } from "@statewalker/vcs-core";
+import { compareRefNames, isValidTagName, ObjectType } from "@statewalker/vcs-core";
 
 import {
   InvalidTagNameError,
@@ -21,16 +21,6 @@ function getTimezoneOffset(): string {
     .padStart(2, "0");
   const minutes = (absOffset % 60).toString().padStart(2, "0");
   return `${sign}${hours}${minutes}`;
-}
-
-/**
- * Whether `name` is a valid tag name.
- *
- * `git tag` refuses names that start with "-", then checks `refs/tags/<name>` with
- * git's ref-name rules (refs.c check_tag_ref).
- */
-function isValidTagName(name: string): boolean {
-  return name.length > 0 && !name.startsWith("-") && isValidRefName(`refs/tags/${name}`);
 }
 
 /**

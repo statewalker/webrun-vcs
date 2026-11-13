@@ -60,6 +60,18 @@ const table = [
   "refs/heads/a.",
   "refs/heads/@{-1}",
   "",
+  // Long names, astral and non-ASCII control-like characters, "@" variants.
+  `refs/heads/${"a".repeat(300)}`,
+  `refs/${"x/".repeat(60)}end`,
+  "refs/heads/😀/🚀",
+  "refs/heads/\u0085",
+  "refs/heads/\u00a0nbsp",
+  "refs/heads/\u2028",
+  "refs/heads/\uffff",
+  "@@",
+  "refs/heads/a/@",
+  "refs/@/a",
+  "refs/heads/@a",
 ];
 
 // Deterministic fuzz: names built from an alphabet rich in the characters the rules care about.
@@ -123,6 +135,6 @@ const cases = [...table, ...fuzz].map((name) => ({
 const gitVersion = spawnSync("git", ["--version"], { encoding: "utf8" }).stdout.trim();
 writeFileSync(
   new URL("../tests/history/refs/fixtures/refname-git.json", import.meta.url),
-  `${JSON.stringify({ source: `${gitVersion} check-ref-format`, cases }, null, 1)}\n`,
+  `${JSON.stringify({ source: `${gitVersion} check-ref-format`, cases }, null, 2)}\n`,
 );
 console.log(cases.length, "cases;", cases.filter((c) => c.valid).length, "valid");

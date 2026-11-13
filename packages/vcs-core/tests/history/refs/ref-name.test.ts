@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { compareRefNames, isValidRefName } from "../../../src/history/refs/index.js";
+import {
+  compareRefNames,
+  isValidBranchName,
+  isValidRefName,
+  isValidTagName,
+} from "../../../src/history/refs/index.js";
 
 interface Case {
   name: string;
@@ -34,6 +39,9 @@ describe("isValidRefName follows git check-ref-format", () => {
     ]) {
       expect(isValidRefName(name), name).toBe(false);
     }
+    // Not UTF-8 encodable, so git could never be given this name.
+    expect(isValidRefName("refs/heads/\ud800")).toBe(false);
+    expect(isValidRefName("refs/heads/a\udc00b")).toBe(false);
     expect(isValidRefName("main")).toBe(false);
     expect(isValidRefName("main", { allowOneLevel: true })).toBe(true);
   });
@@ -62,5 +70,36 @@ describe("compareRefNames sorts as git does (byte order of UTF-8)", () => {
     expect(compareRefNames("refs/\u{ff5e}", "refs/\u{1f600}")).toBeLessThan(0);
     expect(compareRefNames("refs/a", "refs/a")).toBe(0);
     expect(compareRefNames("refs/a", "refs/ab")).toBeLessThan(0);
+  });
+});
+
+describe("isValidBranchName and isValidTagName", () => {
+  it("apply git branch's and git tag's extra rules on top of the ref-name rules", () => {
+    for (const name of ["-x", "HEAD", "a/.hidden", "a@{x", ""]) {
+      expect(isValidBranchName(name), name).toBe(false);
+      expect(isValidTagName(name), name).toBe(false);
+    }
+    for (const name of ["@", "feature/x", "naïve", "refs/heads/x"]) {
+      expect(isValidBranchName(name), name).toBe(true);
+      expect(isValidTagName(name), name).toBe(true);
+    }
+  });
+});
+
+describe("compareRefNames agrees with UTF-8 byte order", () => {
+  it("on random pairs drawn from ASCII, BMP above the surrogates, and astral characters", () => {
+    const pool = ["a", "B", "-", "/", "é", "\ue000", "\uff5e", "\uffff", "😀", "\u{10ffff}", "𐀀"];
+    let seed = 7;
+    const pick = () => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+      return pool[seed % pool.length] as string;
+    };
+    const enc = new TextEncoder();
+    const byteOrder = (a: string, b: string) => Buffer.compare(enc.encode(a), enc.encode(b));
+    for (let i = 0; i < 5000; i++) {
+      const a = `refs/${pick()}${pick()}${pick()}`;
+      const b = `refs/${pick()}${pick()}${pick()}`;
+      expect(Math.sign(compareRefNames(a, b)), `${a} ${b}`).toBe(Math.sign(byteOrder(a, b)));
+    }
   });
 });

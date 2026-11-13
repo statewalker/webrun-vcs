@@ -277,6 +277,61 @@
       "validOneLevel": false
     },
     {
+      "name": "refs/heads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/end",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/😀/🚀",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/ nbsp",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/ ",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/￿",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "@@",
+      "valid": false,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/a/@",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/@/a",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
+      "name": "refs/heads/@a",
+      "valid": true,
+      "validOneLevel": true
+    },
+    {
       "name": "_",
       "valid": false,
       "validOneLevel": true

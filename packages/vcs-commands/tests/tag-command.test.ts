@@ -96,11 +96,12 @@ describe.each(backends)("TagCommand ($name backend)", ({ factory }) => {
 
     it("should apply git's ref-name rules to the full refs/tags/ name", async () => {
       const { git } = await createInitializedGit();
-      for (const name of ["v1/.x", "v1.lock/a", "v1.", "a@{x"]) {
+      // HEAD as in git 2.48 and later (refs.c check_tag_ref); 2.43–2.47 accepted it.
+      for (const name of ["v1/.x", "v1.lock/a", "v1.", "a@{x", "HEAD"]) {
         await expect(git.tag().setName(name).call(), name).rejects.toThrow(InvalidTagNameError);
       }
-      // git tag accepts these (checked with git 2.43).
-      for (const name of ["release/v1.0", "@", "HEAD"]) {
+      // git tag accepts these.
+      for (const name of ["release/v1.0", "@"]) {
         const ref = await git.tag().setName(name).call();
         expect(ref.name).toBe(`refs/tags/${name}`);
       }

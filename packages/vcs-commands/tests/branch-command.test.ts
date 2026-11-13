@@ -304,6 +304,18 @@ describe.each(backends)("BranchCommand ($name backend)", ({ factory }) => {
   });
 
   describe("RenameBranchCommand", () => {
+    it("should refuse a new name git refuses", async () => {
+      const { git, repository } = await createInitializedGit();
+      await git.branchCreate().setName("old-name").call();
+      for (const name of ["a/.hidden", "HEAD", "trailing."]) {
+        await expect(
+          git.branchRename().setOldName("old-name").setNewName(name).call(),
+          name,
+        ).rejects.toThrow(InvalidRefNameError);
+      }
+      expect(await repository.refs.has("refs/heads/old-name")).toBe(true);
+    });
+
     it("should rename branch", async () => {
       const { git, repository } = await createInitializedGit();
 

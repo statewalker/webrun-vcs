@@ -15,6 +15,7 @@ import {
   type Commits,
   FileMode,
   type FilesApi,
+  isValidBranchName,
   joinPath,
   type ObjectId,
   type RefStore,
@@ -22,6 +23,7 @@ import {
   type Trees,
 } from "@statewalker/vcs-core";
 import type { Staging } from "@statewalker/vcs-working-tree";
+import { InvalidRefNameError } from "../errors/index.js";
 import type { Checkout, CheckoutOptions, CheckoutResult } from "./checkout.command.js";
 
 /**
@@ -84,6 +86,9 @@ export class CheckoutCommand implements Checkout {
    * Checkout a branch, tag, or commit.
    */
   async checkout(target: string, options: CheckoutOptions = {}): Promise<CheckoutResult> {
+    if (options.createBranch !== undefined && !isValidBranchName(options.createBranch)) {
+      throw new InvalidRefNameError(options.createBranch);
+    }
     // Resolve target to commit
     const commitId = await this.resolveTarget(target);
     if (!commitId) {

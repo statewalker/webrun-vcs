@@ -1,5 +1,5 @@
 import type { ObjectId, Ref } from "@statewalker/vcs-core";
-import { compareRefNames, isSymbolicRef, isValidRefName } from "@statewalker/vcs-core";
+import { compareRefNames, isSymbolicRef, isValidBranchName } from "@statewalker/vcs-core";
 
 import {
   CannotDeleteCurrentBranchError,
@@ -10,21 +10,6 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { ListBranchMode } from "../types.js";
-
-/**
- * Whether `name` is a valid branch name.
- *
- * `git branch` refuses names that start with "-" and the name "HEAD", then checks
- * `refs/heads/<name>` with git's ref-name rules (sha1-name.c strbuf_check_branch_ref).
- */
-function isValidBranchName(name: string): boolean {
-  return (
-    name.length > 0 &&
-    !name.startsWith("-") &&
-    name !== "HEAD" &&
-    isValidRefName(`refs/heads/${name}`)
-  );
-}
 
 /**
  * Create a new branch.
