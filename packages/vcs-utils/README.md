@@ -21,7 +21,7 @@ No peer dependencies. Hashing uses `@noble/hashes`.
 | Import path | Contents |
 |-------------|----------|
 | `@statewalker/vcs-utils` | Re-exports `cache`, `compression`, `diff`, `encoding`, `hash`, `streams`, plus `insertSorted` / `insertByTimestamp`. Does not include `files`, `ports` or `pack`. |
-| `@statewalker/vcs-utils/compression` | `deflate`, `inflate` (streams), `compressBlock`, `decompressBlock`, `decompressBlockPartial`, `setCompressionUtils`, `CompressionError`, pako and stream helpers |
+| `@statewalker/vcs-utils/compression` | `deflate`, `inflate` (streams), `compressBlock`, `decompressBlock`, `decompressBlockPartial`, `createInflater`, `createInflaterPool`, `TruncatedStreamError`, `InflateError`, `setCompressionUtils`, `CompressionError`, pako and stream helpers |
 | `@statewalker/vcs-utils/hash` | All of the `hash/*` entries below, plus `fnv1aHash` |
 | `@statewalker/vcs-utils/hash/hasher` | `Hasher`, `createSha1` |
 | `@statewalker/vcs-utils/hash/sha1` | `sha1` (async one-shot) |
@@ -88,6 +88,30 @@ const restored = await decompressBlock(packed);
 const packedStream = deflate([input]);
 const restored2 = await collect(inflate(packedStream));
 ```
+
+### Find where each compressed stream ends
+
+```typescript
+import { createInflater } from "@statewalker/vcs-utils/compression";
+
+// A pack: zlib streams back to back, no lengths. Inflate one and keep the rest.
+const inf = createInflater();
+let rest = new Uint8Array(0);
+const output: Uint8Array[] = [];
+for (const chunk of chunks) {
+  const { out, done, consumed } = inf.push(chunk);
+  output.push(...out);
+  if (done) {
+    rest = chunk.subarray(consumed); // the next object starts here
+    break;
+  }
+}
+inf.end(); // throws TruncatedStreamError if the input ran out first
+```
+
+Chunks can be split anywhere, even inside the zlib header or the Adler-32 trailer, and each byte is inflated once. A stream is `done` only after its checksum is read and verified. Input that runs out first makes `end()` throw `TruncatedStreamError`, and a corrupt stream makes `push` throw `InflateError`; both extend `CompressionError`. Pass `{ raw: true }` for raw DEFLATE.
+
+`decompressBlockPartial(buffer)` is the same thing for a buffer in memory: it returns `{ data, bytesRead }` and ignores what follows the stream.
 
 ### Create and apply a binary delta
 
@@ -201,7 +225,9 @@ Byte streams with backpressure over a port (`writeStream`, `readStream`, `create
 
 ### Why partial decompression uses pako
 
-Git pack files concatenate zlib streams, and an entry header gives only the uncompressed size. The reader has to know how many compressed bytes each object used. `DecompressionStream` does not report that. The default `decompressBlockPartial` therefore uses pako's low-level inflate, which exposes the number of input bytes consumed (`total_in`) after one pass. This is the only reason pako is a dependency.
+Git pack files concatenate zlib streams, and an entry header gives only the uncompressed size, so the reader has to know how many compressed bytes each object used. Neither `DecompressionStream` nor Node's zlib reports that. pako's low-level inflate does: when it reaches the end of a stream, its input position is exactly the first byte after it. The push inflater (`createInflater`) and `decompressBlockPartial` are built on that; it is the only reason pako is a dependency.
+
+Inflate states are pooled, as in JGit's `InflaterCache`. When a stream ends, fails or is found truncated, its state is reset and kept for the next one (at most 4 idle per format), and its reference to the caller's input is dropped. Reusing state makes small objects about 3× faster to inflate. Output is copied out of one shared 64 KiB buffer rather than returned as views of it, so kept output never pins a large buffer. `createInflaterPool()` gives a private pool, for tests or isolation.
 
 ### Why `files`, `ports` and `pack` are not in the root export
 

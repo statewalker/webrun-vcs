@@ -19,7 +19,7 @@ pnpm add @statewalker/vcs-utils-node
 | Import path | Contents |
 |-------------|----------|
 | `@statewalker/vcs-utils-node` | Everything below |
-| `@statewalker/vcs-utils-node/compression` | `createNodeCompression()`, `deflateNode`, `inflateNode`, `compressBlockNode`, `decompressBlockNode`, `decompressBlockPartialNode` |
+| `@statewalker/vcs-utils-node/compression` | `createNodeCompression()`, `deflateNode`, `inflateNode`, `compressBlockNode`, `decompressBlockNode` |
 | `@statewalker/vcs-utils-node/files` | `createNodeFilesApi()`, `NodeFilesApi` |
 
 The happy path is two lines at application startup:
@@ -72,21 +72,14 @@ Importing `@statewalker/vcs-utils-node/compression` has no side effect. A librar
 import "@statewalker/vcs-utils-node/compression";
 ```
 
-### How partial decompression finds the end of a zlib stream
+### Partial decompression stays portable
 
-Pack files store objects back to back. Each entry header gives the uncompressed size but not the compressed size, so a reader must learn how many input bytes one zlib stream used. `decompressBlockPartialNode()` returns `{ data, bytesRead }` for that.
-
-Node's one-shot zlib functions do not report bytes consumed, so the function binary-searches the input length: a too-short prefix fails, the exact length succeeds. It first inflates the full buffer; if that fails with any error other than `ERR_TRAILING_JUNK_AFTER_STREAM_END` (which Node 24 raises when bytes follow the stream), the input is invalid and the zlib error is thrown as is. The search runs one synchronous inflate per step, so its cost grows with log2 of the buffer size times the object size. The portable default in `@statewalker/vcs-utils` reads the consumed byte count directly from pako's low-level inflate state and needs a single pass. `createNodeCompression()` still overrides it, so pack parsing with many small objects can be slower after registration; to keep the default for this one function, register the other four only:
-
-```typescript
-const { decompressBlockPartial, ...rest } = createNodeCompression();
-setCompressionUtils(rest);
-```
+Pack files store objects back to back, so a reader must learn how many input bytes one zlib stream used. Node's one-shot zlib functions do not report that, and the binary search this package used to do cost log2(n) full inflates per object. `createNodeCompression()` therefore leaves `decompressBlockPartial` alone: the portable implementation in `@statewalker/vcs-utils` reads the exact end from pako's inflate state in one pass, with pooled state.
 
 ### What breaks, and the error you see
 
 - Streaming `deflateNode` / `inflateNode` throw `CompressionError` with the message `Compression failed: <zlib message>` or `Decompression failed: <zlib message>`.
-- The block functions throw the raw zlib error. When they are called through `@statewalker/vcs-utils` (`compressBlock`, `decompressBlock`, `decompressBlockPartial`), that layer wraps it into `CompressionError` with `Compression failed: ...`, `Decompression failed: ...` or `Partial decompression failed: ...`.
+- The block functions throw the raw zlib error. When they are called through `@statewalker/vcs-utils` (`compressBlock`, `decompressBlock`), that layer wraps it into `CompressionError` with `Compression failed: ...` or `Decompression failed: ...`.
 
 ### Dependencies
 
