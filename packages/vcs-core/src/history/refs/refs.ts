@@ -13,6 +13,7 @@
  */
 
 import type { ObjectId } from "../../common/index.js";
+import type { BatchOptions, BatchResult, RefCommand } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import type { ReflogEntry, ReflogReader } from "./reflog-types.js";
 
@@ -114,6 +115,27 @@ export interface Refs {
    * @returns True if removed, false if didn't exist
    */
   remove(name: string): Promise<boolean>;
+
+  /**
+   * Apply all `commands` atomically, or none of them.
+   *
+   * Commands naming a symbolic ref apply to its target unless `noDeref` is set.
+   * The batch is checked as `git update-ref --stdin` checks it: valid names
+   * (`HEAD` or under `refs/`), no duplicates, no directory/file conflicts, and
+   * each `old` value as expected. Beyond git, a detached HEAD cannot join a
+   * multi-ref batch (`not-atomic`, a project policy). On refusal, `rejected`
+   * says which commands failed and why, and no ref changed.
+   *
+   * @example
+   * ```typescript
+   * const r = await refs.batch([
+   *   { name: "refs/heads/main", old: oldId, new: newId },
+   *   { name: "refs/tags/v1", old: null, new: tagId },
+   * ]);
+   * if (!r.ok) console.log(r.rejected); // [{ name, reason: "mismatch" }, ...]
+   * ```
+   */
+  batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult>;
 
   /**
    * Atomic compare-and-swap update

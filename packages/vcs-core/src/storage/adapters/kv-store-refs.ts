@@ -12,6 +12,11 @@
 
 import type { KvStore } from "@statewalker/webrun-storage";
 import type { ObjectId } from "../../common/id/index.js";
+import {
+  type BatchResult,
+  batchBySingleRef,
+  type RefCommand,
+} from "../../history/refs/ref-batch.js";
 import type { Ref } from "../../history/refs/ref-types.js";
 import { RefStorage } from "../../history/refs/ref-types.js";
 import type { ReflogReader } from "../../history/refs/reflog-types.js";
@@ -37,7 +42,7 @@ export function kvStoreRefs(kv: KvStore): Refs {
     return value === undefined ? undefined : decoder.decode(value);
   };
 
-  return {
+  const refs: Refs = {
     async get(name: string): Promise<RefValue | undefined> {
       const id = await readId(name);
       return id === undefined ? undefined : directRef(name, id);
@@ -92,5 +97,9 @@ export function kvStoreRefs(kv: KvStore): Refs {
     getReflog(): Promise<ReflogReader | undefined> {
       return Promise.resolve(undefined);
     },
+    batch(commands: RefCommand[]): Promise<BatchResult> {
+      return batchBySingleRef(refs, commands);
+    },
   };
+  return refs;
 }

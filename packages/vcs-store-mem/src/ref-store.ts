@@ -1,7 +1,7 @@
 /**
- * In-memory RefStore implementation
+ * In-memory Refs implementation
  *
  * Re-exports from @statewalker/vcs-core for backward compatibility.
  */
 
-export { MemoryRefStore } from "@statewalker/vcs-core";
+export { MemoryRefs } from "@statewalker/vcs-core";

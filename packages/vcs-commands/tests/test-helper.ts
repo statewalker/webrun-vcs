@@ -11,7 +11,7 @@ import type { History, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
 import {
   createMemoryObjectStores,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
@@ -41,7 +41,7 @@ export { backends, defaultFactory, memoryFactory, sqlFactory };
  */
 export function createTestWorkingCopy(): { workingCopy: WorkingCopy; repository: History } {
   const stores = createMemoryObjectStores();
-  const refs = new MemoryRefStore();
+  const refs = new MemoryRefs();
   const staging = new MemoryStagingStore();
 
   // Create History wrapper using new store interfaces

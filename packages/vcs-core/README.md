@@ -112,6 +112,21 @@ for await (const ref of history.refs.list("refs/heads/")) {
 const result = await history.refs.compareAndSwap("refs/heads/main", expectedOldId, newId);
 ```
 
+### Update several refs at once
+
+```typescript
+const r = await history.refs.batch([
+  { name: "refs/heads/main", old: oldMain, new: newMain }, // must still be oldMain
+  { name: "refs/tags/v1", old: null, new: tagId }, // must not exist yet
+  { name: "refs/heads/tmp", new: null }, // delete, whatever it holds
+]);
+if (!r.ok) console.log(r.rejected); // e.g. [{ name: "refs/heads/main", reason: "mismatch" }]
+```
+
+A batch applies every command or none. It is checked as `git update-ref --stdin` checks it: names must be `HEAD` or valid names under `refs/`, a ref may appear once, a ref and a ref below it (`refs/a`, `refs/a/b`) cannot both exist, and each `old` must match. A command naming a symbolic ref (such as `HEAD`) updates its target, unless `noDeref: true` asks to update the name itself. `rejected` tells which commands failed and why (`mismatch`, `invalid-name`, `duplicate`, `df-conflict`, `invalid-command`, `not-atomic`, `locked`, `unsupported`). Two rules go beyond git, on purpose: a detached HEAD cannot join a multi-ref batch (`not-atomic`; git files could not commit it atomically with packed refs), and symbolic-ref chains are followed for at most 5 refs, git's limit for reading refs. `compareAndSwap` is a one-command batch.
+
+Every `Refs` has `batch`. The in-memory store applies batches atomically. Until their own atomic batches land, the SQL, KV and git-files stores accept a batch of one command (only as atomic as their `compareAndSwap`) and refuse larger ones, and `noDeref` on a symbolic ref, as `unsupported` rather than applying them partway.
+
 `walkAncestry` accepts one id or an array, and the options `limit`, `stopAt` and `firstParentOnly`.
 
 ### Check and sort ref names as git does
@@ -190,7 +205,7 @@ const { pruned } = await vcs.gc();
 ```
 History / HistoryWithOperations        createMemoryHistory(), createGitFilesHistory(), createVcsCore()
   ├─ blobs, trees, commits, tags      typed, parsed objects (Blobs, Trees, Commits, Tags)
-  └─ refs                             Refs: get/resolve/set/setSymbolic/compareAndSwap/list
+  └─ refs                             Refs: get/resolve/set/setSymbolic/batch/compareAndSwap/list
         │
 GitObjectStore                         "<type> <size>\0<content>", SHA-1 over the whole thing
         │

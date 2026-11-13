@@ -9,6 +9,7 @@ import {
   createBlobStoreTests,
   createCommitStoreTests,
   createGitObjectStoreTests,
+  createRefBatchTests,
   createRefStoreTests,
   createStagingStoreTests,
   createTagStoreTests,
@@ -17,7 +18,7 @@ import {
 import {
   createMemoryObjectStores,
   MemoryCommitStore,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
   MemoryTagStore,
   MemoryTreeStore,
@@ -40,8 +41,11 @@ createTagStoreTests("Memory", async () => ({
 
 // RefStore tests
 createRefStoreTests("Memory", async () => ({
-  refStore: new MemoryRefStore(),
+  refStore: new MemoryRefs(),
 }));
+
+// Ref batch tests
+createRefBatchTests("Memory", async () => ({ refs: new MemoryRefs() }));
 
 // StagingStore tests
 createStagingStoreTests("Memory", async () => ({

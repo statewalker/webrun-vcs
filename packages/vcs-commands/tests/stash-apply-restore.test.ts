@@ -30,7 +30,7 @@ import { createInMemoryFilesApi, FileMode } from "@statewalker/vcs-core";
 import { createFileWorktree } from "@statewalker/vcs-store-files";
 import {
   createMemoryObjectStores,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
 } from "@statewalker/vcs-store-mem";
 import type { WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
@@ -596,7 +596,7 @@ describe("StashApplyCommand restore on a real FileWorktree", () => {
   it("writes, nests, deletes and restores untracked files on the filesystem", async () => {
     const files = createInMemoryFilesApi();
     const stores = createMemoryObjectStores();
-    const refs = new MemoryRefStore();
+    const refs = new MemoryRefs();
     const staging = new MemoryStagingStore();
     const repository = createSimpleHistory({
       blobs: stores.blobs,

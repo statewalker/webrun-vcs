@@ -21,7 +21,7 @@ import {
 } from "@statewalker/vcs-core";
 import {
   createMemoryObjectStores,
-  MemoryRefStore,
+  MemoryRefs,
   MemoryStagingStore,
   MemoryTagStore,
 } from "@statewalker/vcs-store-mem";
@@ -68,7 +68,7 @@ export function createTransportTestStores(): TransportTestStores {
     blobs: objectStores.blobs,
     trees: objectStores.trees,
     commits: objectStores.commits,
-    refs: new MemoryRefStore(),
+    refs: new MemoryRefs(),
     staging: new MemoryStagingStore(),
     tags: new MemoryTagStore(),
   };

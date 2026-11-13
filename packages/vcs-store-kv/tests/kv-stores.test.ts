@@ -9,6 +9,7 @@ import {
   createBlobStoreTests,
   createCommitStoreTests,
   createGitObjectStoreTests,
+  createRefBatchTests,
   createRefStoreTests,
   createStagingStoreTests,
   createTagStoreTests,
@@ -65,6 +66,16 @@ createRefStoreTests("KV", async () => {
     },
   };
 });
+
+// Ref batch tests (interim single-command batch)
+createRefBatchTests(
+  "KV",
+  async () => {
+    const kv = new MemoryKVAdapter();
+    return { refs: new KVRefStore(kv), cleanup: () => kv.close() };
+  },
+  { multiRef: false },
+);
 
 // StagingStore tests
 createStagingStoreTests("KV", async () => {
