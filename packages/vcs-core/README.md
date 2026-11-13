@@ -114,6 +114,22 @@ const result = await history.refs.compareAndSwap("refs/heads/main", expectedOldI
 
 `walkAncestry` accepts one id or an array, and the options `limit`, `stopAt` and `firstParentOnly`.
 
+### Check and sort ref names as git does
+
+```typescript
+import { compareRefNames, isValidRefName } from "@statewalker/vcs-core";
+
+isValidRefName("refs/heads/feature/x"); // true
+isValidRefName("refs/heads/.hidden"); // false: a component starts with "."
+isValidRefName("refs/heads/x.lock/y"); // false: a component ends with ".lock"
+isValidRefName("main"); // false: one level
+isValidRefName("main", { allowOneLevel: true }); // true
+
+["refs/heads/a", "refs/heads/B"].sort(compareRefNames); // ["refs/heads/B", "refs/heads/a"]
+```
+
+`isValidRefName` gives the same verdict as `git check-ref-format` (with `--allow-onelevel` when `allowOneLevel` is set); a test compares it with git on 1,555 names. `compareRefNames` is git's order, the byte order of the UTF-8 names, which neither `localeCompare` nor `<` gives. Branch and tag commands, branch and tag lists, and the packed-refs writer use both.
+
 ### Build and import a pack
 
 ```typescript

@@ -9,6 +9,7 @@
  */
 
 import {
+  compareRefNames,
   type FilesApi,
   isSymbolicRef,
   joinPath,
@@ -26,7 +27,7 @@ import { deleteRef } from "./ref-writer.js";
  *
  * @param files File system API
  * @param gitDir Path to .git directory
- * @param refs Refs to write (should be sorted by name)
+ * @param refs Refs to write (sorted here in git's order)
  * @param peeled Whether to include peeled data
  */
 export async function writePackedRefs(
@@ -37,8 +38,8 @@ export async function writePackedRefs(
 ): Promise<void> {
   const packedRefsPath = joinPath(gitDir, PACKED_REFS);
 
-  // Sort refs by name
-  const sortedRefs = [...refs].sort((a, b) => a.name.localeCompare(b.name));
+  // git's order: byte order of the names
+  const sortedRefs = [...refs].sort((a, b) => compareRefNames(a.name, b.name));
 
   // Build content
   const content = formatPackedRefs(sortedRefs, peeled);

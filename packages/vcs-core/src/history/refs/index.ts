@@ -12,6 +12,7 @@ export { RefStoreLocation } from "./ref-store.js";
 export * from "./ref-store.memory.js";
 export * from "./ref-types.js";
 export * from "./reflog-types.js";
+export * from "./refname.js";
 // New implementations (Phase C2)
 export * from "./refs.impl.js";
 // New interfaces (Phase C) - primary source for RefUpdateResult, Refs

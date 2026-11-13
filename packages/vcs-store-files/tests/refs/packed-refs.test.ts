@@ -4,8 +4,11 @@
  * Moved from core/tests/refs/refs.test.ts since parsePackedRefs is now in store-files.
  */
 
+import { createInMemoryFilesApi, createRef, RefStorage } from "@statewalker/vcs-core";
+import { readText } from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
 import { parsePackedRefs } from "../../src/refs/packed-refs-reader.js";
+import { writePackedRefs } from "../../src/refs/packed-refs-writer.js";
 
 describe("parsePackedRefs", () => {
   it("parses empty content", () => {
@@ -172,5 +175,36 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/feature
     expect(result.peeled).toBe(false);
     // Without peeled header, refs are not marked as peeled
     expect(result.refs[0].peeled).toBe(false);
+  });
+});
+
+describe("writePackedRefs", () => {
+  it("writes refs in git's order (byte order, uppercase first)", async () => {
+    const files = createInMemoryFilesApi();
+    const id = "a".repeat(40);
+    const names = [
+      "refs/heads/b",
+      "refs/heads/B",
+      "refs/heads/a/b",
+      "refs/heads/a-b",
+      "refs/tags/é",
+    ];
+    await writePackedRefs(
+      files,
+      ".git",
+      names.map((name) => createRef(name, id, RefStorage.PACKED)),
+    );
+    const text = await readText(files, ".git/packed-refs");
+    const written = text
+      .split("\n")
+      .filter((l) => l && !l.startsWith("#"))
+      .map((l) => l.slice(41));
+    expect(written).toEqual([
+      "refs/heads/B",
+      "refs/heads/a-b",
+      "refs/heads/a/b",
+      "refs/heads/b",
+      "refs/tags/é",
+    ]);
   });
 });

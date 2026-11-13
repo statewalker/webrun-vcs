@@ -1,5 +1,5 @@
 import type { ObjectId, Ref } from "@statewalker/vcs-core";
-import { isSymbolicRef } from "@statewalker/vcs-core";
+import { compareRefNames, isSymbolicRef, isValidRefName } from "@statewalker/vcs-core";
 
 import {
   CannotDeleteCurrentBranchError,
@@ -12,54 +12,18 @@ import { GitCommand } from "../git-command.js";
 import { ListBranchMode } from "../types.js";
 
 /**
- * Validate a branch name according to Git rules.
+ * Whether `name` is a valid branch name.
  *
- * @param name Branch name to validate
- * @returns true if valid
+ * `git branch` refuses names that start with "-" and the name "HEAD", then checks
+ * `refs/heads/<name>` with git's ref-name rules (sha1-name.c strbuf_check_branch_ref).
  */
 function isValidBranchName(name: string): boolean {
-  // Cannot be empty
-  if (!name || name.length === 0) {
-    return false;
-  }
-
-  // Cannot start or end with /
-  if (name.startsWith("/") || name.endsWith("/")) {
-    return false;
-  }
-
-  // Cannot contain ..
-  if (name.includes("..")) {
-    return false;
-  }
-
-  // Cannot contain special characters (control chars, space, ~^:?*[\)
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: Git ref validation requires checking for control characters
-  if (/[\x00-\x1f\x7f ~^:?*[\\]/.test(name)) {
-    return false;
-  }
-
-  // Cannot end with .lock
-  if (name.endsWith(".lock")) {
-    return false;
-  }
-
-  // Cannot start with -
-  if (name.startsWith("-")) {
-    return false;
-  }
-
-  // Cannot be @
-  if (name === "@") {
-    return false;
-  }
-
-  // Cannot contain @{
-  if (name.includes("@{")) {
-    return false;
-  }
-
-  return true;
+  return (
+    name.length > 0 &&
+    !name.startsWith("-") &&
+    name !== "HEAD" &&
+    isValidRefName(`refs/heads/${name}`)
+  );
 }
 
 /**
@@ -372,7 +336,7 @@ export class ListBranchCommand extends GitCommand<Ref[]> {
     }
 
     // Sort by name
-    branches.sort((a, b) => a.name.localeCompare(b.name));
+    branches.sort((a, b) => compareRefNames(a.name, b.name));
 
     return branches;
   }
