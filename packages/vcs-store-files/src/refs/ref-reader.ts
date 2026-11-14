@@ -29,6 +29,19 @@ import { findPackedRef, readPackedRefs } from "./packed-refs-reader.js";
 /** Maximum depth for resolving symbolic refs */
 const MAX_SYMBOLIC_REF_DEPTH = 5;
 
+const OID = /^[0-9a-f]{40}$/;
+
+/** How refs are listed. */
+export interface ReadRefsOptions {
+  /**
+   * Throw on a ref that cannot be read or is malformed (an empty file, content that is not an
+   * object id or `ref: <target>`, a broken packed-refs), instead of skipping it. repack and gc
+   * list refs this way: a ref they skipped would stop being a root, and its objects would be
+   * deleted, so they abort as `git gc` does.
+   */
+  strict?: boolean;
+}
+
 /**
  * Read a single ref by name
  *
@@ -64,10 +77,22 @@ export async function readLooseRef(
   files: FilesApi,
   gitDir: string,
   refName: string,
+  options: ReadRefsOptions = {},
 ): Promise<Ref | SymbolicRef | undefined> {
   const refPath = joinPath(gitDir, refName);
 
   let content: Uint8Array;
+  if (options.strict) {
+    // Only a missing file is no ref; a failed read or a broken ref is an error
+    if ((await files.stats(refPath))?.kind !== "file") return undefined;
+    content = await readFile(files, refPath);
+    if (content.length === 0) throw new Error(`Invalid ref ${refName}: empty file`);
+    const ref = parseRefContent(refName, content);
+    if (!isSymbolicRef(ref) && !OID.test(ref.objectId ?? "")) {
+      throw new Error(`Invalid ref content in ${refName}: not an object id`);
+    }
+    return ref;
+  }
   try {
     content = await readFile(files, refPath);
   } catch {
@@ -170,12 +195,15 @@ export async function readAllRefs(
   files: FilesApi,
   gitDir: string,
   prefix: string = R_REFS,
+  options: ReadRefsOptions = {},
 ): Promise<(Ref | SymbolicRef)[]> {
   const refs: (Ref | SymbolicRef)[] = [];
 
   // Read HEAD if no prefix or prefix matches
   if (prefix === "" || HEAD.startsWith(prefix)) {
-    const headRef = await readRef(files, gitDir, HEAD);
+    const headRef = options.strict
+      ? await readLooseRef(files, gitDir, HEAD, options)
+      : await readRef(files, gitDir, HEAD);
     if (headRef !== undefined) {
       refs.push(headRef);
     }
@@ -191,10 +219,10 @@ export async function readAllRefs(
     a.length === b.length && a.every((r, i) => JSON.stringify(r) === JSON.stringify(b[i]));
   for (let attempt = 0; attempt < 20; attempt++) {
     const loose: (Ref | SymbolicRef)[] = [];
-    await readLooseRefsRecursive(files, gitDir, refsPrefix, loose);
-    const { refs: packedRefs } = await readPackedRefs(files, gitDir);
+    await readLooseRefsRecursive(files, gitDir, refsPrefix, loose, options);
+    const { refs: packedRefs } = await readPackedRefs(files, gitDir, options);
     const again: (Ref | SymbolicRef)[] = [];
-    await readLooseRefsRecursive(files, gitDir, refsPrefix, again);
+    await readLooseRefsRecursive(files, gitDir, refsPrefix, again, options);
     if (!sameLoose(loose, again)) continue;
     const looseNames = new Set(loose.map((r) => r.name));
     refs.push(...loose);
@@ -216,8 +244,24 @@ async function readLooseRefsRecursive(
   gitDir: string,
   prefix: string,
   refs: (Ref | SymbolicRef)[],
+  options: ReadRefsOptions = {},
 ): Promise<void> {
   const dirPath = joinPath(gitDir, prefix);
+
+  if (options.strict) {
+    // Every failure propagates: a ref that is skipped stops being a root
+    if ((await files.stats(dirPath))?.kind !== "directory") return;
+    for await (const entry of files.list(dirPath)) {
+      const entryPath = prefix.endsWith("/") ? `${prefix}${entry.name}` : `${prefix}/${entry.name}`;
+      if (entry.kind === "directory") {
+        await readLooseRefsRecursive(files, gitDir, entryPath, refs, options);
+      } else if (!entry.name.endsWith(".lock") && !entry.name.startsWith(".")) {
+        const ref = await readLooseRef(files, gitDir, entryPath, options);
+        if (ref !== undefined) refs.push(ref);
+      }
+    }
+    return;
+  }
 
   try {
     for await (const entry of files.list(dirPath)) {

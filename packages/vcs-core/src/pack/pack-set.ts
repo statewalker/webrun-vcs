@@ -44,6 +44,14 @@ export interface OpenPackSetOptions {
   rescanIntervalMs?: number;
   /** Objects outside the set (loose objects), for REF_DELTA bases no pack holds. */
   externalBase?: (id: ObjectId) => Promise<GitObject | undefined>;
+  /**
+   * `freshen` is false for a pack whose `.pack` file was last modified longer ago than this, so
+   * the object is written loose again. git freshens such a pack by touching its mtime, which
+   * keeps a gc running at the same time from expiring the object; FilesApi cannot set mtimes,
+   * so the fresh loose copy plays that part. Default one hour (git's freshen window). A pack
+   * whose mtime is unknown is trusted: gc keeps the unreachable objects of such packs loose.
+   */
+  freshenMaxAgeMs?: number;
 }
 
 /** The packs of one directory, read as one object store. */
@@ -56,7 +64,9 @@ export interface PackSet {
    * dropped. A pack whose file was seen less than `rescanIntervalMs` ago (at most 1 s) is trusted
    * without another check (git checks once per pack per process): a write made in that window
    * after the pack was deleted is skipped and not retried. No rescan: a miss only means the
-   * object is written loose.
+   * object is written loose. False also when the holding pack's file is older than
+   * `freshenMaxAgeMs` (default one hour): the object is then written loose again, with the
+   * current time, so a concurrent gc does not expire it with its old pack.
    */
   freshen(id: ObjectId): Promise<boolean>;
   /**
@@ -115,6 +125,7 @@ export async function openPackSet(
   const rescanInterval = options.rescanIntervalMs ?? 1000;
   /** how long freshen trusts a pack it saw: capped, as a write it skips is never retried */
   const freshenTrust = Math.min(rescanInterval, 1000);
+  const freshenMaxAge = options.freshenMaxAgeMs ?? 60 * 60 * 1000;
   const baseCache = new DeltaBaseCache(options.baseCacheBytes ?? 16 * 2 ** 20);
   let packs: PackFile[] = [];
   const byName = new Map<string, PackFile>();
@@ -128,8 +139,10 @@ export async function openPackSet(
   const removedAt = new Map<string, number>();
   /** packs whose files remove() is deleting: scans skip them until the files are gone */
   const removing = new Set<string>();
-  /** when freshen last saw each pack's file */
-  const seenAt = new WeakMap<PackFile, number>();
+  /** when freshen last saw each pack's file, and that file's mtime (if the FilesApi gives one) */
+  const seenAt = new WeakMap<PackFile, { at: number; modified?: number }>();
+  const young = (modified: number | undefined, now: number) =>
+    modified === undefined || now - modified <= freshenMaxAge;
   /** copies found corrupt, per pack */
   const bad = new WeakMap<PackFile, Set<ObjectId>>();
   const isBad = (p: PackFile, id: ObjectId) => bad.get(p)?.has(id) ?? false;
@@ -361,7 +374,8 @@ export async function openPackSet(
    * The first sound copy of `id`. A copy that fails before `get` returns (a corrupt header, a
    * bad delta, a missing base, a broken first chunk) is marked bad and the next pack is tried;
    * the first error is raised only when no copy remains. A pack whose file disappeared is
-   * dropped.
+   * dropped, and the miss then rescans whatever the rate limit: the pack was removed by a
+   * repack, which installed its replacement first.
    */
   async function lookup(
     id: ObjectId,
@@ -370,6 +384,7 @@ export async function openPackSet(
   ): Promise<GitObject | undefined> {
     if (!isId(id)) return undefined;
     let failed: unknown;
+    let vanished = false;
     for (const p of [...packs]) {
       if (!p.has(id)) continue;
       if (isBad(p, id)) {
@@ -382,6 +397,7 @@ export async function openPackSet(
       } catch (e) {
         if (!(await files.exists(p.packPath))) {
           drop(p);
+          vanished = true;
           continue;
         }
         if (!(e instanceof CorruptObjectError)) throw e;
@@ -390,12 +406,13 @@ export async function openPackSet(
       }
     }
     if (failed) throw failed;
-    if (rescan && (await rescanOnMiss())) return lookup(id, o, false);
+    if (rescan && (await (vanished ? refresh() : rescanOnMiss()))) return lookup(id, o, false);
     return undefined;
   }
 
   async function findEntry(id: ObjectId, rescan: boolean): Promise<PackedEntry | undefined> {
     if (!isId(id)) return undefined;
+    let vanished = false;
     for (const p of [...packs]) {
       if (!holds(p, id)) continue;
       let stored: PackedEntry | undefined;
@@ -404,6 +421,7 @@ export async function openPackSet(
       } catch (e) {
         if (!(await files.exists(p.packPath))) {
           drop(p);
+          vanished = true;
           continue;
         }
         if (!(e instanceof PackError)) throw e;
@@ -424,7 +442,7 @@ export async function openPackSet(
         },
       };
     }
-    if (rescan && (await rescanOnMiss())) return findEntry(id, false);
+    if (rescan && (await (vanished ? refresh() : rescanOnMiss()))) return findEntry(id, false);
     return undefined;
   }
 
@@ -442,11 +460,17 @@ export async function openPackSet(
       if (!isId(id)) return false;
       for (const p of [...packs]) {
         if (!holds(p, id)) continue;
+        const now = Date.now();
         const seen = seenAt.get(p);
-        if (seen !== undefined && Date.now() - seen < freshenTrust) return true;
-        if (await files.exists(p.packPath)) {
-          seenAt.set(p, Date.now());
-          return true;
+        if (seen !== undefined && now - seen.at < freshenTrust) {
+          if (young(seen.modified, now)) return true;
+          continue; // too old to rely on: written loose again, as git touches the pack
+        }
+        const stats = await files.stats(p.packPath);
+        if (stats?.kind === "file") {
+          seenAt.set(p, { at: now, modified: stats.lastModified });
+          if (young(stats.lastModified, now)) return true;
+          continue;
         }
         drop(p); // deleted behind our back (git repack -a -d, gc): the object must be written
       }

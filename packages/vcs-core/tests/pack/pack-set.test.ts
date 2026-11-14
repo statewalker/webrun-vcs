@@ -1122,10 +1122,10 @@ describe("re-review of P2.3: scans", () => {
     const r = await install(files, [{ kind: 3, data: A }]);
     const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
     let checks = 0;
-    const exists = files.exists.bind(files);
-    files.exists = async (path) => {
+    const stats = files.stats.bind(files);
+    files.stats = async (path) => {
       if (path === paths(r.packId).pack) checks++;
-      return exists(path);
+      return stats(path);
     };
     for (let i = 0; i < 100; i++) expect(await set.freshen(Aid)).toBe(true);
     expect(checks).toBe(1);
@@ -1292,5 +1292,66 @@ describe("re-review 2 of P2.3: freshen expiry and stale skips", () => {
     await files.remove(paths(r.packId).pack);
     await set.refresh();
     expect(set.skipped).toEqual([]);
+  });
+});
+
+describe("P2.6: a reader whose pack was removed by a repack", () => {
+  it("rescans at once, whatever the rate limit, and finds the replacement pack", async () => {
+    const files = createInMemoryFilesApi();
+    const old = await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 60_000 });
+    expect(await set.has(Aid)).toBe(true);
+    expect(await set.has(fakeId(1))).toBe(false); // spends the free rescan
+    // another process repacks: installs a pack holding A and B, then removes the old one
+    await installPack(
+      files,
+      PACK_DIR,
+      chunks(
+        pack([
+          { kind: 3, data: A },
+          { kind: 3, data: B },
+        ]),
+      ),
+    );
+    for (const ext of [".idx", ".pack"]) await files.remove(`${PACK_DIR}/pack-${old.packId}${ext}`);
+    expect(await content(await set.get(Aid))).toEqual(A);
+    expect((await set.entry(Bid))?.kind).toBe(3);
+  });
+});
+
+describe("P2.6 review: freshen and old packs", () => {
+  it("is false for a pack older than freshenMaxAgeMs (one hour by default), so the object is written loose again", async () => {
+    const files = createInMemoryFilesApi();
+    await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
+    expect(await set.freshen(Aid)).toBe(true);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 61 * 60 * 1000);
+    try {
+      expect(await set.freshen(Aid)).toBe(false);
+      // the pack stays in the set: the object is only written again, not missing
+      expect(await set.has(Aid)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+    const short = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0, freshenMaxAgeMs: 0 });
+    const later = vi.spyOn(Date, "now").mockReturnValue(now + 10);
+    try {
+      expect(await short.freshen(Aid)).toBe(false);
+    } finally {
+      later.mockRestore();
+    }
+  });
+
+  it("trusts a pack whose mtime the FilesApi does not give", async () => {
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0, freshenMaxAgeMs: 0 });
+    const stats = files.stats.bind(files);
+    files.stats = async (path) => {
+      const s = await stats(path);
+      return path === paths(r.packId).pack && s ? { ...s, lastModified: undefined } : s;
+    };
+    expect(await set.freshen(Aid)).toBe(true);
   });
 });

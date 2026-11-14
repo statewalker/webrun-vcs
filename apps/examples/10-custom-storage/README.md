@@ -215,7 +215,7 @@ Example completed successfully!
 | Tests with transport, packs or deltas | `createMemoryHistoryWithOperations()` |
 | Your own `RawStorage`, or object storage shared between instances | `createHistoryFromComponents({ objects, refs })` |
 | Your own store implementations (SQL, IndexedDB, ...) | `createHistoryFromStores({ blobs, trees, commits, tags, refs })` |
-| Git-compatible files | `createGitFilesHistory(config)` from `@statewalker/vcs-core` (takes prebuilt stores plus a `packDeltaStore`), or `createGitFilesHistoryFromFiles(options)` from `@statewalker/vcs-store-files` |
+| Git-compatible files | `createGitFilesHistory(config)` from `@statewalker/vcs-core` (takes prebuilt stores plus the `PackSet`), or `createGitFilesHistoryFromFiles(options)` from `@statewalker/vcs-store-files` |
 
 Only the memory-with-operations and Git-files factories return `HistoryWithOperations`; the other three return plain `History`. Code that needs `delta` or `serialization` must be given one of those two.
 

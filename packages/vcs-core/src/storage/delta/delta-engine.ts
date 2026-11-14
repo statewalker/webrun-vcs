@@ -106,6 +106,6 @@ export interface DeltaEngineConfig {
   windowSize?: number;
   /** Maximum candidates to evaluate per target (default: 10) */
   maxCandidatesPerTarget?: number;
-  /** Skip targets larger than this size (default: 16MB) */
+  /** Skip targets, and candidate bases, larger than this size (default: 16MB) */
   maxTargetSize?: number;
 }

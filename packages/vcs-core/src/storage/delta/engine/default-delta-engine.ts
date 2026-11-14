@@ -88,6 +88,11 @@ export class DefaultDeltaEngine implements DeltaEngine {
       }
       candidatesEvaluated++;
 
+      // A base over the size cap is never loaded (it would be held whole, as the target is)
+      if (candidate.size > this.config.maxTargetSize) {
+        continue;
+      }
+
       // Check chain depth limit
       const chainDepth = await this.objectLoader.getChainDepth(candidate.id);
       if (chainDepth >= this.strategy.maxChainDepth) {

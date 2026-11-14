@@ -12,8 +12,8 @@
  */
 
 import {
-  GitFilesDeltaApi,
   type GitFilesStorageBackendConfig,
+  PackSetDeltaApi,
 } from "../backend/git-files-storage-backend.js";
 import type {
   GitFilesBackendConfig,
@@ -272,9 +272,10 @@ export function createMemoryHistoryWithOperations(
  * GitFilesStorageBackend configuration. This is the recommended way
  * to create production Git-compatible storage.
  *
- * Note: This requires the stores (blobs, trees, commits, tags, refs, packDeltaStore)
- * to be provided. For file-system-based stores, use @statewalker/vcs-store-fs
- * which provides createGitFilesBackend() that sets up all components.
+ * Note: This requires the stores (blobs, trees, commits, tags, refs) and the installed packs
+ * to be provided. For file-system-based stores, use @statewalker/vcs-store-files,
+ * whose createGitFilesBackend() sets up all components. The delta API is a read-only view of
+ * the packs (`PackSetDeltaApi`): git writes deltas only when it writes a pack (`repack()`).
  *
  * @param config GitFilesStorageBackend configuration with all stores
  * @returns HistoryWithOperations instance
@@ -288,24 +289,22 @@ export function createMemoryHistoryWithOperations(
  *   commits: myCommitStore,
  *   tags: myTagStore,
  *   refs: myRefStore,
- *   packDeltaStore: myDeltaStore,
+ *   packs: myPackSet,
  * });
  * await history.initialize();
  *
  * // Use history for normal operations
  * const commit = await history.commits.load(commitId);
  *
- * // Use delta API for GC
- * history.delta.startBatch();
- * await history.delta.blobs.deltifyBlob(blobId, baseId, delta);
- * await history.delta.endBatch();
+ * // Inspect how packed objects are stored
+ * const chain = await history.delta.getDeltaChain(blobId);
  * ```
  */
 export function createGitFilesHistory(config: GitFilesStorageBackendConfig): HistoryWithOperations {
-  const { blobs, trees, commits, tags, refs, packDeltaStore, objects, packs } = config;
+  const { blobs, trees, commits, tags, refs, objects, packs } = config;
 
-  // Create delta API directly (with tree and commit delta support)
-  const delta = new GitFilesDeltaApi(packDeltaStore, blobs, trees, { enableCommitDeltas: true });
+  // The delta view of the installed packs (deltas are written by repack)
+  const delta = new PackSetDeltaApi(packs);
 
   // Create base History for serialization API
   const history = new HistoryImpl(blobs, trees, commits, tags, refs, { objects, packs });
@@ -321,8 +320,6 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
     nativeGitFormat: true,
   };
 
-  let initialized = false;
-
   return new HistoryWithOperationsImpl(
     blobs,
     trees,
@@ -333,16 +330,10 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
     serialization,
     capabilities,
     async () => {
-      if (!initialized) {
-        await packDeltaStore.initialize?.();
-        initialized = true;
-      }
+      // the pack set is opened when it is created
     },
     async () => {
-      if (initialized) {
-        await packDeltaStore.close?.();
-        initialized = false;
-      }
+      // nothing to release: pack reads close when their streams end
     },
     { objects, packs },
   );

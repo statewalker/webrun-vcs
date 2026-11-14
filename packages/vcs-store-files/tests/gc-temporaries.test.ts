@@ -20,10 +20,7 @@ describe("gc and repack skip temporaries in fan-out directories", () => {
     await gc({ history: backend.history, files });
     expect(await files.exists(tmp)).toBe(true);
 
-    const result = await repack({
-      looseStorage: backend.looseStorage,
-      packDirectory: backend.packDirectory,
-    });
+    const result = await repack(backend);
     expect(result?.objectCount ?? 0).toBeLessThanOrEqual(1);
     expect(await files.exists(tmp)).toBe(true);
   });

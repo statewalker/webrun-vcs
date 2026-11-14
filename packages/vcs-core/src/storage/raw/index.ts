@@ -1,4 +1,3 @@
-export { CombinedRawStorage } from "./combined-raw-storage.js";
 export { CompositeRawStorage } from "./composite-raw-storage.js";
 export {
   CompressedRawStorage,

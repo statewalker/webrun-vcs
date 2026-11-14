@@ -16,7 +16,6 @@ import {
   openPackSet,
 } from "@statewalker/vcs-core";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
-import { PackDirectory } from "./pack/pack-directory.js";
 import { skipPacked, withPacks } from "./pack/with-packs.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
@@ -44,6 +43,12 @@ export interface GitFilesBackendOptions {
   refLockTimeoutMs?: number;
   /** Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms). */
   packedLockTimeoutMs?: number;
+  /**
+   * git's freshen window (default one hour): writing an object whose pack or loose file was
+   * last modified longer ago writes it loose again or renews the loose file's mtime, so a
+   * concurrent gc keeps it. Passed to `openPackSet` and `filesStagingStore`.
+   */
+  freshenMaxAgeMs?: number;
 }
 
 /**
@@ -54,15 +59,14 @@ export interface GitFilesBackendResult {
   history: History;
   /** The object kernel: packs first, then loose objects (`withPacks`). */
   objects: GitObjects;
-  /** The installed packs, read by `objects`; installs and removes packs. */
+  /** The installed packs, read by `objects`; `repack()` installs and removes packs here. */
   packs: PackSet;
-  /**
-   * Pack directory for repack and gc (the previous pack reader). Kept until those
-   * move to `packs`; packs it adds or removes refresh `packs` at once.
-   */
-  packDirectory: PackDirectory;
   /** Loose object storage (for repack/GC operations) */
   looseStorage: FileRawStorage;
+  /** The FilesApi the repository lives in (for `repack()` and `gc()`). */
+  files: FilesApi;
+  /** Path of the `.git` directory within `files`. */
+  gitDir: string;
 }
 
 /**
@@ -107,18 +111,13 @@ export async function createGitFilesBackend(
   // other packs, then the loose objects. FileRawStorage reads and writes the same
   // zlib files for gc and repack.
   const looseStorage = new FileRawStorage(files, objectsDir);
-  const staging = filesStagingStore(files, objectsDir);
+  const { freshenMaxAgeMs } = options;
+  const staging = filesStagingStore(files, objectsDir, { freshenMaxAgeMs });
   const looseOnly = createGitObjects(staging);
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
+    freshenMaxAgeMs,
   });
-  // packs repack and gc write or remove through PackDirectory are seen by `packs` at once
-  const packDirectory = new PackDirectory({
-    files,
-    basePath: packDir,
-    onChange: () => packs.refresh(),
-  });
-  await packDirectory.scan();
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);
   const refStore = createFileRefStore(files, gitDir, {
@@ -133,7 +132,7 @@ export async function createGitFilesBackend(
     packs,
   });
 
-  return { history, objects, packs, packDirectory, looseStorage };
+  return { history, objects, packs, looseStorage, files, gitDir };
 }
 
 /**

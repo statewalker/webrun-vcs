@@ -3,6 +3,10 @@
  *
  * Garbage collection controller that uses HistoryWithOperations.
  * Focuses on blob-only delta compression as per the unified architecture.
+ *
+ * It maintains the delta stores of the memory, KV and SQL backends, whose `history.delta`
+ * writes deltas. Git file repositories keep deltas only in packs: use `repack()` and `gc()`
+ * from `@statewalker/vcs-store-files` there (their delta API does not write deltas).
  */
 
 import { FileMode } from "../../common/files/index.js";
@@ -28,6 +32,14 @@ export interface GCScheduleOptions {
   minInterval?: number;
   /** Number of pending blobs before quick pack */
   quickPackThreshold?: number;
+  /**
+   * Blobs larger than this are never deltified, and a delta whose base is larger than this is
+   * not stored: computing a delta holds the target and its base whole. Default 16 MiB
+   * (writePack's limit for its delta window). The controller can only refuse a delta the engine
+   * returns; `DefaultDeltaEngine` skips such bases before loading them (its `maxTargetSize`,
+   * also 16 MiB by default, caps bases as well as targets).
+   */
+  maxDeltaBlobSize?: number;
 }
 
 /**
@@ -58,6 +70,7 @@ const DEFAULT_GC_OPTIONS: ResolvedGCOptions = {
   maxChainDepth: 50,
   minInterval: 60000, // 1 minute
   quickPackThreshold: 5,
+  maxDeltaBlobSize: 16 * 1024 * 1024,
 };
 
 /**
@@ -134,6 +147,7 @@ export class GCController {
     try {
       for (const blobId of this.pendingBlobs) {
         const size = await this.history.blobs.size(blobId);
+        if (size > this.options.maxDeltaBlobSize) continue;
 
         const target: DeltaTarget = {
           id: blobId,
@@ -142,7 +156,7 @@ export class GCController {
         };
 
         const result = await deltaEngine.findBestDelta(target);
-        if (result) {
+        if (result && (await this.baseWithinCap(result))) {
           await this.storeDeltaResult(blobId, result);
           total++;
         }
@@ -305,6 +319,7 @@ export class GCController {
 
         try {
           const sizeBefore = await blobs.size(id);
+          if (sizeBefore > this.options.maxDeltaBlobSize) continue;
 
           const target: DeltaTarget = {
             id,
@@ -313,7 +328,7 @@ export class GCController {
           };
 
           const result = await deltaEngine.findBestDelta(target);
-          if (result) {
+          if (result && (await this.baseWithinCap(result))) {
             await this.storeDeltaResult(id, result);
             deltasCreated++;
             spaceSaved += result.savings;
@@ -348,6 +363,11 @@ export class GCController {
       packsConsolidated: 0,
       duration: 0,
     };
+  }
+
+  /** Whether the delta's base is within `maxDeltaBlobSize` (bases over the cap are skipped). */
+  private async baseWithinCap(result: BestDeltaResult): Promise<boolean> {
+    return (await this.history.blobs.size(result.baseId)) <= this.options.maxDeltaBlobSize;
   }
 
   /**

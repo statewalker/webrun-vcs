@@ -2,13 +2,7 @@
  * Clone command - Clone a repository via HTTP
  */
 
-import {
-  FileMode,
-  type FilesApi,
-  type History,
-  indexPack,
-  writePackIndex,
-} from "@statewalker/vcs-core";
+import { FileMode, type FilesApi, type History, installPack } from "@statewalker/vcs-core";
 import { createGitFilesBackend, FileStagingStore } from "@statewalker/vcs-store-files";
 import { clone as transportClone } from "@statewalker/vcs-transport";
 import { joinPath } from "@statewalker/vcs-utils/files";
@@ -182,24 +176,11 @@ export async function runClone(args: string[]): Promise<void> {
     if (cloneResult.packData.length > 0) {
       console.log(info(`Receiving objects: 100%`));
 
-      const indexResult = await indexPack(cloneResult.packData);
-      console.log(info(`Resolving deltas: ${indexResult.objectCount} objects`));
-
-      // Write pack and index files
-      const packChecksum = bytesToHex(indexResult.packChecksum);
       const packDir = `${gitDir}/objects/pack`;
       await files.mkdir(packDir);
-
-      const packFileName = `pack-${packChecksum}.pack`;
-      const idxFileName = `pack-${packChecksum}.idx`;
-      const packPath = `${packDir}/${packFileName}`;
-      const idxPath = `${packDir}/${idxFileName}`;
-
-      // Write pack and index files (directly without temp files since atomic write isn't strictly required here)
-      await files.write(packPath, toAsyncIterable(cloneResult.packData));
-
-      const indexData = await writePackIndex(indexResult.entries, indexResult.packChecksum);
-      await files.write(idxPath, toAsyncIterable(indexData));
+      // index-pack: checks the pack, writes pack-<id>.pack, then its .idx
+      const installed = await installPack(files, packDir, toAsyncIterable(cloneResult.packData));
+      console.log(info(`Resolving deltas: ${installed.count} objects`));
     }
 
     // Set up refs

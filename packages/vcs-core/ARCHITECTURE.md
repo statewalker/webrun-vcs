@@ -352,7 +352,7 @@ Low-level storage abstractions for bytes, packs, and deltas.
 | `raw/raw-storage.ts` | `RawStorage` interface for key-value byte storage |
 | `raw/memory-raw-storage.ts` | In-memory RawStorage implementation |
 | `raw/compressed-raw-storage.ts` | Zlib-compressed RawStorage wrapper |
-| `raw/combined-raw-storage.ts`, `raw/composite-raw-storage.ts` | RawStorage composed from several storages |
+| `raw/composite-raw-storage.ts` | RawStorage composed from several storages |
 | `binary/bin-store.ts` | `BinStore`: raw storage plus delta storage |
 
 File-based RawStorage lives in `@statewalker/vcs-store-files`; the webrun-storage adapter `blobStoreToRawStorage()` is in `storage/adapters/`, next to `rawStorageStaging()`, which turns any `RawStorage` into the `StagingBlobStore` that `createGitObjects()` takes. The `RawStorage` interface is implemented by each storage backend. All higher layers build on this abstraction.
@@ -361,20 +361,20 @@ File-based RawStorage lives in `@statewalker/vcs-store-files`; the webrun-storag
 
 | File | Purpose |
 |------|---------|
-| `pack-entries-parser.ts` | Parse pack entries |
-| `pack-indexer.ts` | Build .idx files |
+| `pack-set.ts` | `openPackSet`: every pack of a directory read as one store; `install`, `remove`, `refresh` |
+| `pack-file.ts` | `openPack`: one validated `.pack` + `.idx` |
+| `index-pack.ts` | `installPack` (index-pack, streaming), `sweepPackTemporaries` |
+| `list-objects.ts` | `listObjects`: the objects reachable from wants and not from haves |
+| `write-pack.ts` | `writePack`: streams a pack, with entry reuse and delta search |
+| `import-pack.ts`, `unpack-objects.ts` | Received packs: kept as packs or unpacked into loose objects |
 | `pack-index-reader.ts` | Read .idx files |
 | `pack-index-writer.ts` | Write .idx files |
-| `pack-writer.ts` | Write .pack files |
-| `streaming-pack-writer.ts` | Streaming pack writer |
-| `pending-pack.ts` | In-progress pack buffer |
-| `git-pack-store.ts` | Pack-based object storage with the RawStorage interface |
 | `delta-reverse-index.ts` | Reverse index for delta lookups |
 | `delta-instruction-analyzer.ts`, `random-access-delta.ts` | Random access into delta-reconstructed content |
 | `varint.ts` | Pack varint encoding |
 | `types.ts` | Pack-related types |
 
-Pack directory management and pack-based delta storage for Git repositories on disk are in `@statewalker/vcs-store-files`.
+Repack and gc of a Git repository on disk (`repack()`, `gc()`) are in `@statewalker/vcs-store-files`; they stream `listObjects` into `writePack` into `PackSet.install`.
 
 Pack files bundle multiple objects efficiently for storage and transfer. The .idx file provides random access by object ID.
 
@@ -384,7 +384,7 @@ Pack files bundle multiple objects efficiently for storage and transfer. The .id
 |------|---------|
 | `delta-store.ts` | `DeltaStore` interface |
 | `delta-binary-format.ts` | Delta instruction encoding |
-| `gc-controller.ts` | Garbage collection coordination |
+| `gc-controller.ts` | Delta maintenance of the memory, KV and SQL backends (not used for Git files) |
 | `packing-orchestrator.ts` | Batch delta computation |
 | `raw-store-with-delta.ts` | Raw store with delta resolution |
 | `storage-analyzer.ts` | Analyze storage for optimization |
@@ -795,7 +795,7 @@ interface BlobDeltaApi {
 
 ## Garbage Collection
 
-The `GCController` manages storage optimization through delta compression and unreachable object removal.
+The `GCController` manages storage optimization through delta compression and unreachable object removal, for the backends whose `history.delta` writes deltas (memory, KV, SQL). A Git file repository keeps deltas only in packs; its maintenance is `repack()` and `gc()` in `@statewalker/vcs-store-files`, and its `history.delta` (`PackSetDeltaApi`) only reports how packed objects are stored.
 
 ### GCController
 
@@ -830,6 +830,7 @@ interface GCScheduleOptions {
   maxChainDepth?: number;       // Default: 50
   minInterval?: number;         // Default: 60000ms
   quickPackThreshold?: number;  // Default: 5
+  maxDeltaBlobSize?: number;    // Default: 16 MiB; larger blobs are never deltified, nor used as bases
 }
 ```
 

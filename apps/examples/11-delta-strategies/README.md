@@ -233,7 +233,7 @@ Example completed successfully!
 
 ### Blob deltas are always available; tree and commit deltas depend on the backend
 
-`DeltaApi.blobs` is required; `trees` and `commits` are optional. Blobs are most of a repository's bytes and successive versions of a file delta well. Trees and commits are small and read often, so whether storing them as deltas pays off depends on the backend: the Git-files backend uses binary deltas for trees and commits, the memory backend provides structural tree deltas (`nativeTreeDeltas: true`, see example 10's output) and no commit deltas. Pack serialization for the wire can use deltas for every type regardless.
+`DeltaApi.blobs` is required; `trees` and `commits` are optional. Blobs are most of a repository's bytes and successive versions of a file delta well. Trees and commits are small and read often, so whether storing them as deltas pays off depends on the backend: the Git-files backend stores deltas of every type only inside packs, written by `repack()`, the memory backend provides structural tree deltas (`nativeTreeDeltas: true`, see example 10's output) and no commit deltas. Pack serialization for the wire can use deltas for every type regardless.
 
 ### Batches exist for GC and repacking
 
@@ -249,7 +249,7 @@ The delta algorithm in `@statewalker/vcs-utils/diff` has no knowledge of storage
 
 ## What will surprise you
 
-- **On the memory backend, the `DeltaApi` is a no-op for blobs.** `createMemoryHistoryWithOperations()` has no blob delta tracker: `findBlobDelta` always returns `null`, `deltifyBlob` and `undeltifyBlob` silently do nothing, `listDeltas` and `getDependents` yield nothing, and batches only count nesting. That is why every blob prints `isDelta: false` and `stored as full object`, and why the example cancels its batch. Use a Git-files history to see blob deltas take effect.
+- **On the memory backend, the `DeltaApi` is a no-op for blobs.** `createMemoryHistoryWithOperations()` has no blob delta tracker: `findBlobDelta` always returns `null`, `deltifyBlob` and `undeltifyBlob` silently do nothing, `listDeltas` and `getDependents` yield nothing, and batches only count nesting. That is why every blob prints `isDelta: false` and `stored as full object`, and why the example cancels its batch. A Git-files history does not help either: its `DeltaApi` is read-only (`deltifyBlob` throws), because git stores deltas only in packs. There, run `repack()` from `@statewalker/vcs-store-files` and read the result through `history.delta.isDelta()` and `listDeltas()`.
 - **`endBatch()` without `startBatch()` throws** `No batch in progress`. `cancelBatch()` with no open batch does nothing.
 - **"Savings: 0 bytes" is a measuring error in the example, not a property of the delta.** Step 5 counts a copy instruction as `len` bytes, so "Delta data size" always equals the target size. A copy instruction costs a few bytes when encoded; measure the real size with `deltaToGitFormat(baseContent.length, deltaInstructions).length` from the same subpath. For the version 1 to version 2 delta that is 92 bytes for a 238-byte target.
 - **`createDeltaRanges` throws `blockSize must be >= 1`** for a non-positive block size. If the base is empty it emits a single insert of the whole target (nothing for an empty target).

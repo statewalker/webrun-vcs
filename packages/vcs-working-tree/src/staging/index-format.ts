@@ -80,6 +80,11 @@ export type IndexVersion = typeof INDEX_VERSION_2 | typeof INDEX_VERSION_3 | typ
 export interface ParsedIndex {
   version: IndexVersion;
   entries: StagingEntry[];
+  /**
+   * The signatures of the extensions after the entries, in file order (`TREE`, `REUC`, `link`
+   * for a split index, ...). Their contents are not parsed.
+   */
+  extensions: string[];
 }
 
 /**
@@ -138,7 +143,18 @@ export async function parseIndexFile(data: Uint8Array): Promise<ParsedIndex> {
     offset = nextOffset;
   }
 
-  return { version, entries };
+  // Extensions: a 4-byte signature and a 4-byte size, then the data, up to the checksum
+  const extensions: string[] = [];
+  const end = data.length - CHECKSUM_SIZE;
+  while (offset + 8 <= end) {
+    const size = view.getUint32(offset + 4);
+    // a size past the checksum: not an extension git wrote; stop (the entries are complete)
+    if (offset + 8 + size > end) break;
+    extensions.push(String.fromCharCode(...data.subarray(offset, offset + 4)));
+    offset += 8 + size;
+  }
+
+  return { version, entries, extensions };
 }
 
 /**

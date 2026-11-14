@@ -14,19 +14,12 @@
  * - Pushing changes back to the server
  */
 
-import {
-  FileMode,
-  type FilesApi,
-  indexPack,
-  joinPath,
-  writePackIndex,
-} from "@statewalker/vcs-core";
+import { FileMode, type FilesApi, installPack, joinPath } from "@statewalker/vcs-core";
 import { clone, push } from "@statewalker/vcs-transport";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
-  atomicWriteFile,
   concatBytes,
   createAuthor,
   createFileHistory,
@@ -165,19 +158,18 @@ async function cloneRepository(
   if (cloneResult.packData.length > 0) {
     printInfo("Processing pack data...");
 
-    const indexResult = await indexPack(cloneResult.packData);
-    printInfo(`Pack contains ${indexResult.objectCount} objects`);
-
-    const packChecksum = bytesToHex(indexResult.packChecksum);
     const packDir = ".git/objects/pack";
     await ensureDirFiles(files, packDir);
-
-    const packPath = `${packDir}/pack-${packChecksum}.pack`;
-    const idxPath = `${packDir}/pack-${packChecksum}.idx`;
-
-    await atomicWriteFile(files, packPath, cloneResult.packData);
-    const indexData = await writePackIndex(indexResult.entries, indexResult.packChecksum);
-    await atomicWriteFile(files, idxPath, indexData);
+    // index-pack: checks the pack, writes pack-<id>.pack, then its .idx
+    const packData = cloneResult.packData;
+    const installed = await installPack(
+      files,
+      packDir,
+      (async function* () {
+        yield packData;
+      })(),
+    );
+    printInfo(`Pack contains ${installed.count} objects`);
   }
 
   // Set up refs
