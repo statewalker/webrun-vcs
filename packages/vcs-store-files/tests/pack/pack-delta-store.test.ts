@@ -13,15 +13,8 @@ import {
   writePackIndexV2,
 } from "@statewalker/vcs-core";
 import type { Delta } from "@statewalker/vcs-utils";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { PackDeltaStore, PackDirectory } from "../../src/pack/index.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {
-  setCompressionUtils(createNodeCompression());
-});
 
 /**
  * Create a simple delta for testing

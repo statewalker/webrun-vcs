@@ -4,10 +4,8 @@
  * Validates streaming equivalence: parsePackEntries(data) ≡ collect(parsePackEntriesFromStream(toStream(data)))
  */
 
-import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { MemoryPackObjectCache } from "@statewalker/vcs-utils/pack";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   type PackEntry,
   PackObjectType,
@@ -16,10 +14,6 @@ import {
   parsePackEntriesFromStream,
   writePack,
 } from "../../src/pack/index.js";
-
-beforeAll(() => {
-  setCompressionUtils(createNodeCompression());
-});
 
 function toChunkedStream(data: Uint8Array, chunkSize: number): AsyncIterable<Uint8Array> {
   return (async function* () {

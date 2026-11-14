@@ -83,11 +83,7 @@ The History is assembled from parts in `shared/index.ts`, because the example ne
 ```typescript
 import { createGitObjects, createHistoryFromComponents, FileMode } from "@statewalker/vcs-core";
 import { createFileRefStore, filesStagingStore } from "@statewalker/vcs-store-files";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-
-setCompressionUtils(createNodeCompression());
 
 const files = createNodeFilesApi({ rootDir: "test-repo" });
 const objects = createGitObjects(filesStagingStore(files, ".git/objects"));
@@ -247,7 +243,7 @@ The step then deltas a 271-byte document against a 362-byte revision and prints 
 
 - **A real directory, not memory.** Loose objects and packs are files; the point of the example is to look at them. Writing a standard `.git` layout means `git` can verify the result.
 - **The History is built from parts.** `createHistoryFromComponents()` with `createGitObjects(filesStagingStore(...))` keeps a handle on the `GitObjects` kernel, which step 04 needs for `get()`. The kernel stores every object as a zlib stream named by its SHA-1, which is what makes the files valid loose objects.
-- **Compression is installed first.** `shared/index.ts` calls `setCompressionUtils(createNodeCompression())` at import time, before any storage call, so compression and decompression (including `decompressBlock()` in steps 01-02) use the Node implementation from `@statewalker/vcs-utils-node`.
+- **Portable compression.** Compression and decompression (including `decompressBlock()` in steps 01-02) use the Web `CompressionStream` API, the same code as in a browser.
 - **Steps run cumulatively.** Steps 02-04 operate on the repository step 01 created, so `--step=NN` runs the earlier steps first instead of failing.
 
 ## What will surprise you

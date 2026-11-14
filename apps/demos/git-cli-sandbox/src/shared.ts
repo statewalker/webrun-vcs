@@ -11,8 +11,6 @@ import {
   createGitFilesBackend,
   FileStagingStore,
 } from "@statewalker/vcs-store-files";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import {
   createMemoryCheckout,
@@ -22,7 +20,6 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 // Initialize compression for pack operations
-setCompressionUtils(createNodeCompression());
 
 /**
  * Context for CLI operations

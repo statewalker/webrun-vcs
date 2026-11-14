@@ -144,16 +144,14 @@ await refs.resolve("HEAD"); // follows HEAD to refs/heads/main, loose or packed
 for (const ref of await readAllRefs(files, ".git")) console.log(ref.name); // refs/ by default
 ```
 
-### Update several refs at once, safely next to native git
+### Update several refs at once
 
 ```ts
 import { createFileRefStore } from "@statewalker/vcs-store-files";
-import { createNodeAtomicFiles, createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 const files = createNodeFilesApi({ rootDir: "/path/to/repo" });
-const refs = createFileRefStore(files, ".git", {
-  atomicFiles: createNodeAtomicFiles("/path/to/repo/.git"),
-});
+const refs = createFileRefStore(files, ".git");
 const r = await refs.batch(
   [
     { name: "refs/heads/main", old: oldMain, new: newMain },
@@ -169,15 +167,17 @@ the lock, write the new id into the lock and rename it over the ref. Several ref
 then `packed-refs.lock`, and commit as JGit's `PackedBatchRefUpdate` does, first moving the
 involved loose refs into `packed-refs` and then landing the whole batch in `packed-refs` with one
 rename. A crash at any file operation leaves every ref at its old or its new value once stale
-locks are removed; native `git` reads the result, honours our locks and makes us report `locked`
-while it holds its own. Reflog lines are written to `logs/` in git's format (HEAD's too when it
+locks are removed; native `git` reads the result, refuses to update a ref we hold locked, and makes
+us report `locked` while it holds its own (a lock created in the same instant by both is not
+excluded: FilesApi has no exclusive create). Reflog lines are written to `logs/` in git's format (HEAD's too when it
 points at an updated branch). `compareAndSwap` is a one-command batch.
 
 The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`, which is
 atomic only among users of the same FilesApi instance: two FilesApi instances over one directory,
-even in one process, do not exclude each other. On disk, pass `createNodeAtomicFiles` (O_CREAT|O_EXCL,
-rename, O_APPEND) wherever another FilesApi or process, native `git` included, may write the same
-repository. `createGitFilesBackend` takes the same `atomicFiles` option, and the lock timeouts.
+even in one process, do not exclude each other, nor does another process such as native `git`.
+Share one FilesApi per repository. Excluding other processes needs an exclusive create in FilesApi
+(O_CREAT|O_EXCL), which belongs upstream in `@statewalker/webrun-files`. `createGitFilesBackend`
+takes the same `atomicFiles` option, and the lock timeouts.
 
 Reflogs follow git with `core.logAllRefUpdates=true` in a non-bare repository: a log is created
 for `HEAD`, `refs/heads/`, `refs/remotes/` and `refs/notes/` (and appended to wherever one exists),
@@ -234,8 +234,8 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
 - `.git/config` is read and written by `GitWorkingCopyConfig` as one file: `[include]` /
   `[includeIf]` are not followed, a malformed section header is kept but ignored where `git`
   would reject the file, and `save()` rewrites the whole file without a `config.lock`.
-- Ref batches and `compareAndSwap` use `.lock` files and rename (with native `AtomicFiles`, safe
-  next to a running `git`). `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
+- Ref batches and `compareAndSwap` use `.lock` files and rename, exclusive among writers sharing
+  one FilesApi; another process such as a running `git` is not excluded. `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
   `packed-refs` without `packed-refs.lock` and can lose a concurrent batch), loose objects and the
   index are still written directly, without locks: do not run them next to a batch or a `git`
   process writing the same repository.

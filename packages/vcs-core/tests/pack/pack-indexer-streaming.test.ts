@@ -4,21 +4,15 @@
  * Verifies streaming indexer produces identical results to block-based indexPack.
  */
 
-import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   indexPack,
   indexPackFromStream,
   PackObjectType,
   PackWriterStream,
 } from "../../src/pack/index.js";
-
-beforeAll(() => {
-  setCompressionUtils(createNodeCompression());
-});
 
 /** Compute git object ID */
 async function computeObjectId(type: string, content: Uint8Array): Promise<string> {

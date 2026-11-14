@@ -1,7 +1,6 @@
 ---
 "@statewalker/vcs-store-files": minor
 "@statewalker/vcs-utils": minor
-"@statewalker/vcs-utils-node": minor
 "@statewalker/vcs-core": minor
 "@statewalker/vcs-testing": minor
 ---
@@ -24,7 +23,7 @@
 - `AtomicFiles`: exclusive create, replace by rename, append, remove-if-empty, plus read, write and list.
 - `atomicFilesOver(files, root)`: an implementation over any FilesApi. It is atomic only among users of the same FilesApi instance (not across instances or processes).
 
-**New (vcs-utils-node):** `createNodeAtomicFiles(root)`, built on O_CREAT|O_EXCL, rename(2) and O_APPEND. Like git, it retries when another writer prunes a parent directory mid-create. Use it wherever another process, native git included, may write the same repository.
+Lock files go through `AtomicFiles`; the portable `atomicFilesOver(files, gitDir)` excludes writers sharing one FilesApi.
 
 **vcs-core:** `RefStore` gains an optional `batch`; `RefsAdapter` uses it when present.
 

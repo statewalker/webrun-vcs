@@ -270,7 +270,7 @@ export function createBlobStoreTests(name: string, factory: BlobStoreFactory): v
         expect(decoder.decode(combined)).toBe("streamable content");
       });
 
-      it.skipIf(process.env.CI)("handles large blobs via streaming", async () => {
+      it.skipIf(globalThis.process?.env?.CI)("handles large blobs via streaming", async () => {
         // 100KB blob
         const largeContent = new Uint8Array(100 * 1024);
         for (let i = 0; i < largeContent.length; i++) {

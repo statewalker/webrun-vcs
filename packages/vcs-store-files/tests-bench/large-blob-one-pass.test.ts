@@ -3,12 +3,17 @@
  * the source is read once, live memory stays under 64 MB whatever the size,
  * and native git reads the result. Run with `pnpm test:bench`
  * (BIG_BLOB_MB sets the size, default 200).
+ *
+ * The NodeFilesApi of webrun-files-node 0.10 collects a file before writing it,
+ * so this benchmark brings its own streaming FilesApi (test code only); the
+ * library side, up to FilesApi.write, is what is measured.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import { mkdir, open, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { dirname, join } from "node:path";
+import { NodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend } from "../src/index.js";
 
@@ -49,6 +54,28 @@ function randomSource(mb: number, counters: { passes: number; pulled: number }) 
   };
 }
 
+/** NodeFilesApi whose write streams chunk by chunk (to a temporary, then renamed). */
+class StreamingFilesApi extends NodeFilesApi {
+  constructor(private readonly root: string) {
+    super({ rootDir: root });
+  }
+  override async write(
+    path: string,
+    content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+  ): Promise<void> {
+    const real = join(this.root, path);
+    await mkdir(dirname(real), { recursive: true });
+    const tmp = `${real}.bench-tmp`;
+    const fh = await open(tmp, "w");
+    try {
+      for await (const chunk of content) await fh.write(chunk);
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, real);
+  }
+}
+
 const dirs: string[] = [];
 afterAll(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
@@ -61,7 +88,7 @@ describe("one pass over a large blob", () => {
     dirs.push(dir);
     execFileSync("git", ["init", "-q", dir]);
     const { history } = await createGitFilesBackend({
-      files: createNodeFilesApi({ rootDir: dir }),
+      files: new StreamingFilesApi(dir),
     });
     const counters = { passes: 0, pulled: 0 };
 

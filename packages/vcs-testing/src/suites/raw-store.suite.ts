@@ -219,7 +219,7 @@ export function createRawStorageTests(name: string, factory: RawStorageFactory):
         expect(decoder.decode(loaded)).toBe("chunk1chunk2chunk3");
       });
 
-      it.skipIf(process.env.CI)("handles large content via streaming", async () => {
+      it.skipIf(globalThis.process?.env?.CI)("handles large content via streaming", async () => {
         // 100KB content
         const largeContent = new Uint8Array(100 * 1024);
         for (let i = 0; i < largeContent.length; i++) {

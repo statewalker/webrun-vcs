@@ -9,9 +9,21 @@ import {
   rawStorageStaging,
 } from "@statewalker/vcs-core";
 import { createRefsStructure, FileRefStore } from "@statewalker/vcs-store-files";
-import { createNodeAtomicFiles, createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createCoreRepositoryAccess } from "../src/index.js";
+
+/** One FilesApi per repository: atomicFilesOver excludes writers sharing an instance. */
+const sharedFiles = new Map<string, ReturnType<typeof createNodeFilesApi>>();
+function atomicFor(root: string) {
+  let files = sharedFiles.get(root);
+  if (!files) {
+    files = createNodeFilesApi({ rootDir: root });
+    sharedFiles.set(root, files);
+  }
+  return atomicFilesOver(files, ".git");
+}
 
 const A = "a".repeat(40);
 const B = "b".repeat(40);
@@ -32,7 +44,7 @@ const backends: Array<[string, () => Promise<Refs>]> = [
       await files.mkdir(".git");
       await createRefsStructure(files, ".git");
       return new FileRefStore(files, ".git", {
-        atomicFiles: createNodeAtomicFiles(join(dir, ".git")),
+        atomicFiles: atomicFor(dir),
       });
     },
   ],

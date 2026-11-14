@@ -4,15 +4,8 @@
  * Tests object buffering, threshold detection, and pack generation.
  */
 
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { PackObjectType, PendingPack, readPackIndex } from "../../src/pack/index.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {
-  setCompressionUtils(createNodeCompression());
-});
 
 describe("PendingPack", () => {
   describe("basic operations", () => {

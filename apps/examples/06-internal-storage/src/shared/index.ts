@@ -8,12 +8,9 @@ import * as path from "node:path";
 import type { FilesApi, GitObjects, History, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { createGitObjects, createHistoryFromComponents, joinPath } from "@statewalker/vcs-core";
 import { createFileRefStore, filesStagingStore } from "@statewalker/vcs-store-files";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 // Initialize compression (required before any storage operations)
-setCompressionUtils(createNodeCompression());
 
 // ============================================================================
 // Configuration

@@ -1,6 +1,6 @@
 /**
  * Atomic ref batches on a real .git directory: native git reads what the batch
- * writes, locks interoperate both ways, and a crash at any file operation
+ * writes, it and our batches respect each other's locks, and a crash at any file operation
  * leaves every ref at its old or new value. Needs native git.
  */
 import { execFileSync, spawnSync } from "node:child_process";
@@ -9,9 +9,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
-import { createNodeAtomicFiles } from "@statewalker/vcs-utils-node/files";
+import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createFilesRefBatch } from "../../src/refs/index.js";
+
+/** One FilesApi per repository: atomicFilesOver excludes writers sharing an instance. */
+const sharedFiles = new Map<string, ReturnType<typeof createNodeFilesApi>>();
+function atomicFor(root: string) {
+  let files = sharedFiles.get(root);
+  if (!files) {
+    files = createNodeFilesApi({ rootDir: root });
+    sharedFiles.set(root, files);
+  }
+  return atomicFilesOver(files, ".git");
+}
 
 const IDENT = "A U Thor <author@example.com> 1700000000 +0000";
 const roots: string[] = [];
@@ -55,7 +67,7 @@ describe("git files interop", () => {
   it("native git reads refs, packed-refs, symbolic HEAD and reflogs written by batches", async () => {
     const repo = newRepo();
     const [c0, c1, c2] = commits(repo, 3) as [string, string, string];
-    const batch = createFilesRefBatch(createNodeAtomicFiles(join(repo, ".git")));
+    const batch = createFilesRefBatch(atomicFor(repo));
     expect(
       await batch([{ name: "refs/heads/main", old: null, new: c0 }], {
         ident: IDENT,
@@ -96,7 +108,7 @@ describe("git files interop", () => {
     git(repo, ["pack-refs", "--all"]);
     git(repo, ["update-ref", "refs/heads/loose", c2]);
     const tagObj = git(repo, ["rev-parse", "refs/tags/v1"]);
-    const batch = createFilesRefBatch(createNodeAtomicFiles(join(repo, ".git")));
+    const batch = createFilesRefBatch(atomicFor(repo));
     const r = await batch([
       { name: "refs/heads/old", old: c1, new: null }, // packed delete
       { name: "refs/heads/loose", old: c2, new: c1 }, // loose update
@@ -116,7 +128,7 @@ describe("git files interop", () => {
     const repo = newRepo();
     const [c0, c1] = commits(repo, 2) as [string, string];
     git(repo, ["update-ref", "refs/heads/main", c0]);
-    const files = createNodeAtomicFiles(join(repo, ".git"));
+    const files = atomicFor(repo);
     expect(
       await files.createExclusive("refs/heads/main.lock", new TextEncoder().encode(`${c1}\n`)),
     ).toBe(true);
@@ -201,7 +213,7 @@ describe("crash at every file operation", () => {
       // a packed; b packed at cs1 and loose at cs2 (a stale packed value would be visible);
       // c absent; d loose only
       const repo = newRepo();
-      const files = createNodeAtomicFiles(join(repo, ".git"));
+      const files = atomicFor(repo);
       const setup = createFilesRefBatch(files);
       await setup([
         { name: "refs/heads/a", new: cs[0] as string },
@@ -241,7 +253,7 @@ describe("crash at every file operation", () => {
       let completed = false;
       for (let k = 1; k <= 200 && !completed; k++) {
         const repo = newRepo();
-        const files = createNodeAtomicFiles(join(repo, ".git"));
+        const files = atomicFor(repo);
         const setup = createFilesRefBatch(files);
         await setup([
           { name: "refs/heads/m", new: c0 },

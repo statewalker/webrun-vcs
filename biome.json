@@ -40,5 +40,17 @@
       "indentStyle": "space",
       "indentWidth": 2
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": ["packages/*/src/**", "!packages/*/src/**/__tests__/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noNodejsModules": "error"
+          }
+        }
+      }
+    }
+  ]
 }

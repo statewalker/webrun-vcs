@@ -18,8 +18,6 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
@@ -35,7 +33,6 @@ import {
 } from "./shared/index.js";
 
 // Initialize compression
-setCompressionUtils(createNodeCompression());
 
 // Parse command line arguments
 function parseArgs(): { port: number; reposDir: string } {

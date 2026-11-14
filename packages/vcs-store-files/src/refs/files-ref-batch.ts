@@ -96,7 +96,7 @@ const fail = (rejected: RefRejection[]): BatchResult => ({ ok: false, rejected }
  *
  * @example
  * ```typescript
- * const batch = createFilesRefBatch(createNodeAtomicFiles("/repo/.git"));
+ * const batch = createFilesRefBatch(atomicFilesOver(files, ".git"));
  * await batch([{ name: "refs/heads/main", old: oldId, new: newId }], { message: "commit: x" });
  * ```
  */
@@ -185,10 +185,25 @@ export function createFilesRefBatch(
     }
   }
   const unlock = (path: string) => removeAndPrune(`${path}.lock`).catch(() => {});
-  /** Commit a lock over its target; an empty directory left at the target is removed first. */
-  async function commit(path: string): Promise<void> {
-    await files.removeEmptyDir(path);
-    await files.replace(`${path}.lock`, path);
+  /**
+   * Commit a lock over its target; an empty directory left at the target is removed
+   * first. A directory still holding another writer's lock (a batch on `<path>/…`
+   * that lost to ours and is unlocking) is waited for, up to the ref lock timeout.
+   * False if the target stays a non-empty directory: a D/F conflict.
+   */
+  async function commit(path: string): Promise<boolean> {
+    const until = Date.now() + refLockTimeout;
+    for (let wait = 1; ; wait = Math.min(wait * 2, 20)) {
+      await files.removeEmptyDir(path);
+      try {
+        await files.replace(`${path}.lock`, path);
+        return true;
+      } catch (e) {
+        if (await files.exists(path)) throw e; // a file is there: not a directory in the way
+        if (Date.now() >= until) return false;
+        await sleep(wait);
+      }
+    }
   }
   /**
    * Reflog lines in git's format, after the decision (best effort, as git and JGit).
@@ -321,7 +336,7 @@ export function createFilesRefBatch(
         await writeLogs([u], () => curId, o);
       } else {
         await writeLogs([u], () => curId, o); // under the ref lock, before the rename (as git)
-        await commit(u.name);
+        if (!(await commit(u.name))) return fail([{ name: u.requested, reason: "df-conflict" }]);
         ours = false;
       }
       return { ok: true, rejected: [] };

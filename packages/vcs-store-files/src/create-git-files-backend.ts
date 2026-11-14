@@ -32,9 +32,7 @@ export interface GitFilesBackendOptions {
   /**
    * Lock-file primitives rooted at the `.git` directory, for atomic ref batches.
    * Defaults to a FilesApi-based implementation that is atomic only among users of
-   * the same FilesApi instance;
-   * pass `createNodeAtomicFiles(gitDirOnDisk)` from `@statewalker/vcs-utils-node`
-   * to interoperate safely with native git.
+   * the same FilesApi instance (another process, such as native git, is not excluded).
    */
   atomicFiles?: AtomicFiles;
   /** Retry a held ref lock for this long (git: core.filesRefLockTimeout, 100 ms). */
