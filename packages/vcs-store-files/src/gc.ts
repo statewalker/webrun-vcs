@@ -26,6 +26,8 @@ const OBJECT_ID = /^[0-9a-f]{40}$/;
 const PACK_FILE = /^pack-[0-9a-f]{40}\.pack$/;
 /** git ignores a `gc.pid` older than this (a gc that crashed). */
 const GC_LOCK_STALE_MS = 12 * 60 * 60 * 1000;
+/** The least age of a `.pack` without an `.idx` that gc removes (one may be being installed). */
+const ORPHAN_PACK_MIN_AGE_MS = 60 * 60 * 1000;
 /**
  * Options for garbage collection.
  */
@@ -53,10 +55,18 @@ export interface GcOptions {
   pruneExpireMs?: number;
   /**
    * Remove `tmp_obj_*` and `objects/pack/tmp_*` temporaries (left by a crashed write), and
-   * `.pack` files whose `.idx` is gone (a crash while a pack was removed), older than this, as
-   * `git prune` does (default: two weeks). Not done in a dry run.
+   * `.pack` files whose `.idx` is gone (a crash while a pack was removed; see
+   * `orphanPackExpiryMs`), older than this, as `git prune` does (default: two weeks). Not done in
+   * a dry run.
    */
   tmpExpiryMs?: number;
+  /**
+   * Remove `.pack` files whose `.idx` is gone once older than this. Default: `tmpExpiryMs`, but
+   * never less than one hour: a pack being installed is moved into place before its `.idx` and
+   * keeps its temporary's mtime, so a young orphan may be a pack still being installed. git
+   * never removes such files; set this only to clean up after a crash sooner.
+   */
+  orphanPackExpiryMs?: number;
   /** Pack loose refs into packed-refs, as `git gc` (`git pack-refs --all`). Default true. */
   packRefs?: boolean;
   /** Repack reachable objects into one pack (`git repack -A -d`). Default true. */
@@ -81,7 +91,8 @@ export interface GcResult {
   removedOrphanPacks: number;
   /**
    * True if another gc holds `gc.pid` (git's "gc is already running"): nothing was done. A lock
-   * older than 12 hours is taken over, as git does.
+   * older than 12 hours is taken over, as git does; without `lastModified` from the FilesApi a
+   * lock's age is unknown and it is never taken over (remove `gc.pid` by hand after a crash).
    */
   skipped: boolean;
   /** Whether loose refs were packed */
@@ -181,6 +192,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
 
   // Step 4: repack -A -d
   let repackResult: RepackResult | null = null;
+  // the unreachable objects the repack left loose: the prune below keeps them
+  const loosened = new Set<string>();
   if (repacking && packs && snapshot) {
     repackResult = await repackListed(
       {
@@ -195,6 +208,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
       },
       listed,
       snapshot,
+      loosened,
     );
   }
 
@@ -204,6 +218,11 @@ async function collect(options: GcOptions): Promise<GcResult> {
   let keptRecentObjects = 0;
   for await (const key of looseStorage.keys()) {
     if (!OBJECT_ID.test(key) || reachable.has(key)) continue;
+    // written, renewed or found fresh by the unpack step: its pack was young
+    if (loosened.has(key)) {
+      keptRecentObjects++;
+      continue;
+    }
     const path = joinPath(objectsDir, key.slice(0, 2), key.slice(2));
     const modified = (await files.stats(path))?.lastModified;
     // An unknown age is never expired, unless every unreachable object goes (--prune=now)
@@ -222,7 +241,9 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const packDir = joinPath(objectsDir, "pack");
     removedTemporaries += await filesStagingStore(files, objectsDir).sweepStaged(tmpExpiryMs);
     removedTemporaries += (await sweepPackTemporaries(files, packDir, tmpExpiryMs)).length;
-    removedOrphanPacks = await sweepOrphanPacks(files, packDir, tmpExpiryMs);
+    const orphanExpiry =
+      options.orphanPackExpiryMs ?? Math.max(tmpExpiryMs, ORPHAN_PACK_MIN_AGE_MS);
+    removedOrphanPacks = await sweepOrphanPacks(files, packDir, orphanExpiry);
   }
 
   return {
@@ -259,25 +280,55 @@ async function sweepOrphanPacks(files: FilesApi, packDir: string, expiryMs: numb
 }
 
 /**
- * Takes `gc.pid` with an exclusive create (git's gc lock). Undefined if another gc holds it; a
- * lock older than 12 hours is left by a gc that crashed and is taken over, as git does.
+ * Takes `gc.pid` with an exclusive create (git's gc lock), writing a random token into it.
+ * Undefined if another gc holds it. A lock older than 12 hours is left by a gc that crashed and
+ * is taken over, as git does: under `gc.pid.takeover` (one takeover at a time), the lock is
+ * removed if it is still stale and created again exclusively, then read back to check that it
+ * holds our token. Without `lastModified` a lock's age is unknown and it is never taken over.
+ * `release` removes the lock only while it still holds our token.
  */
 async function acquireGcLock(files: FilesApi, gitDir: string) {
   const atomic = atomicFilesOver(files, gitDir);
   const name = "gc.pid";
-  const content = new TextEncoder().encode(`0 webrun-vcs ${Date.now()}\n`);
+  const guard = "gc.pid.takeover";
+  const token = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  const content = new TextEncoder().encode(`0 webrun-vcs ${token} ${Date.now()}\n`);
+  const isStale = async (path: string) => {
+    const modified = (await files.stats(joinPath(gitDir, path)))?.lastModified;
+    return modified !== undefined && Date.now() - modified > GC_LOCK_STALE_MS;
+  };
+  const holdsToken = async () => {
+    const dec = new TextDecoder();
+    let text = "";
+    for await (const c of atomic.read(name)) text += dec.decode(c, { stream: true });
+    return (text + dec.decode()).includes(token);
+  };
+
   let taken = await atomic.createExclusive(name, content);
-  if (!taken) {
-    const modified = (await files.stats(joinPath(gitDir, name)))?.lastModified;
-    if (modified !== undefined && Date.now() - modified > GC_LOCK_STALE_MS) {
-      await atomic.remove(name);
-      taken = await atomic.createExclusive(name, content);
+  if (!taken && (await isStale(name))) {
+    // Two gcs that both found the lock stale would each remove it, the second removing the
+    // lock the first had just taken: the takeover itself is exclusive.
+    if (await isStale(guard)) await atomic.remove(guard); // a takeover that crashed
+    if (await atomic.createExclusive(guard, content)) {
+      try {
+        // Still stale: not a lock a takeover that finished meanwhile has just written
+        if (await isStale(name)) {
+          await atomic.remove(name);
+          taken = await atomic.createExclusive(name, content);
+        }
+      } finally {
+        await atomic.remove(guard);
+      }
     }
   }
+  if (taken && !(await holdsToken())) taken = false;
   if (!taken) return undefined;
   return {
     release: async () => {
-      await atomic.remove(name);
+      // Another gc may have taken the lock over (it found ours stale): leave its lock alone
+      if (await holdsToken()) await atomic.remove(name);
     },
   };
 }

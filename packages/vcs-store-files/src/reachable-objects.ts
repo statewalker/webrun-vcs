@@ -3,9 +3,16 @@
  * and every linked worktree (its HEAD, index and reflogs), as `git repack -a` (`--all --reflog
  * --indexed-objects`) and `git prune` walk them.
  *
- * Not read: the trees of the index's cache-tree (TREE) extension, which git also counts as
- * roots. The index parser does not expose that extension; a tree only it names may be pruned,
- * and git then rebuilds that part of the cache-tree (it checks each tree exists before use).
+ * Not read: the trees of the index's cache-tree (TREE) extension and the blobs of its
+ * resolve-undo (REUC) extension, which git also counts as roots. The index parser does not
+ * parse extensions. A tree only the cache-tree names may be pruned, and git then rebuilds that
+ * part of the cache-tree (it checks each tree exists before use). A blob only resolve-undo names
+ * (the stages of a conflict resolved since) may be pruned too, and `git checkout -m` can then
+ * not recreate that conflict.
+ *
+ * A split index (a `link` extension) is refused: its entries live partly in a shared index
+ * file, so the blobs staged there would silently stop being roots. gc and repack throw before
+ * changing anything; `git update-index --no-split-index` turns it back into one file.
  */
 
 import type { FilesApi, GitObjects, ListedObject, ObjectId, Refs } from "@statewalker/vcs-core";
@@ -168,5 +175,11 @@ async function indexIds(files: FilesApi, indexPath: string): Promise<ObjectId[]>
     at += p.length;
   }
   const parsed = await parseIndexFile(data);
+  if (parsed.extensions.includes("link")) {
+    throw new Error(
+      `${indexPath} is a split index (link extension), which gc and repack do not read: ` +
+        "run `git update-index --no-split-index` first",
+    );
+  }
   return parsed.entries.filter((e) => e.mode !== GITLINK).map((e) => e.objectId);
 }

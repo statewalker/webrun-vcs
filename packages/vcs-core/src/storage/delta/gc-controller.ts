@@ -365,17 +365,17 @@ export class GCController {
     };
   }
 
+  /** Whether the delta's base is within `maxDeltaBlobSize` (bases over the cap are skipped). */
+  private async baseWithinCap(result: BestDeltaResult): Promise<boolean> {
+    return (await this.history.blobs.size(result.baseId)) <= this.options.maxDeltaBlobSize;
+  }
+
   /**
    * Store a delta result using the new API
    *
    * Converts BestDeltaResult.delta (Uint8Array) to AsyncIterable
    * as expected by BlobDeltaApi.deltifyBlob.
    */
-  /** Whether the delta's base is within `maxDeltaBlobSize` (bases over the cap are skipped). */
-  private async baseWithinCap(result: BestDeltaResult): Promise<boolean> {
-    return (await this.history.blobs.size(result.baseId)) <= this.options.maxDeltaBlobSize;
-  }
-
   private async storeDeltaResult(targetId: ObjectId, result: BestDeltaResult): Promise<void> {
     const deltaStream = toAsyncIterable(result.delta);
     await this.history.delta.blobs.deltifyBlob(targetId, result.baseId, deltaStream);

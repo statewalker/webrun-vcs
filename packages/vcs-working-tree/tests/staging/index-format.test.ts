@@ -529,3 +529,39 @@ describe("Index Format", () => {
     });
   });
 });
+
+describe("index extensions", () => {
+  it("lists the extension signatures after the entries", async () => {
+    const base = await serializeIndexFile([
+      {
+        path: "a.txt",
+        mode: 0o100644,
+        objectId: "a".repeat(40),
+        stage: 0,
+        size: 1,
+        mtime: 0,
+      },
+    ]);
+    expect((await parseIndexFile(base)).extensions).toEqual([]);
+    const body = base.subarray(0, base.length - 20);
+    const ext = (sig: string, size: number) => {
+      const out = new Uint8Array(8 + size);
+      out.set(new TextEncoder().encode(sig), 0);
+      new DataView(out.buffer).setUint32(4, size);
+      return out;
+    };
+    const parts = [body, ext("TREE", 6), ext("link", 20)];
+    const content = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      content.set(p, at);
+      at += p.length;
+    }
+    const file = new Uint8Array(content.length + 20);
+    file.set(content, 0);
+    file.set(await sha1(content), content.length);
+    const parsed = await parseIndexFile(file);
+    expect(parsed.extensions).toEqual(["TREE", "link"]);
+    expect(parsed.entries.map((e) => e.path)).toEqual(["a.txt"]);
+  });
+});

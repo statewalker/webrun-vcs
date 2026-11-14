@@ -43,6 +43,12 @@ export interface GitFilesBackendOptions {
   refLockTimeoutMs?: number;
   /** Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms). */
   packedLockTimeoutMs?: number;
+  /**
+   * git's freshen window (default one hour): writing an object whose pack or loose file was
+   * last modified longer ago writes it loose again or renews the loose file's mtime, so a
+   * concurrent gc keeps it. Passed to `openPackSet` and `filesStagingStore`.
+   */
+  freshenMaxAgeMs?: number;
 }
 
 /**
@@ -105,10 +111,12 @@ export async function createGitFilesBackend(
   // other packs, then the loose objects. FileRawStorage reads and writes the same
   // zlib files for gc and repack.
   const looseStorage = new FileRawStorage(files, objectsDir);
-  const staging = filesStagingStore(files, objectsDir);
+  const { freshenMaxAgeMs } = options;
+  const staging = filesStagingStore(files, objectsDir, { freshenMaxAgeMs });
   const looseOnly = createGitObjects(staging);
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
+    freshenMaxAgeMs,
   });
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);

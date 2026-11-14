@@ -73,7 +73,9 @@ export interface RepackOptions extends RepackTarget {
    * written loose, unless the pack was last modified more than `unpackUnreachableExpireMs` ago
    * (git's `--unpack-unreachable=<expire>`). A pack whose mtime is unknown is loosened. The loose
    * copies get the current time (FilesApi cannot set mtimes), so they live up to the expiry
-   * longer than with git, then go through gc's loose prune. Default false: unreachable objects of
+   * longer than with git, then go through gc's loose prune. An object already loose is rewritten
+   * if its loose file is older than an hour (the freshen window), so an old loose copy does not
+   * expire once its young pack is gone; `unpackedObjects` counts these too. Default false: unreachable objects of
    * replaced packs are dropped, as `git repack -a -d` drops them. `gc()` sets it.
    */
   unpackUnreachable?: boolean;
@@ -95,7 +97,7 @@ export interface RepackResult {
   packsRemoved: string[];
   /** Packs kept because they have a `.keep` file (`pack-<id>`) */
   keptPacks: string[];
-  /** Unreachable objects of the removed packs written loose (`unpackUnreachable`) */
+  /** Unreachable objects of the removed packs written loose or renewed (`unpackUnreachable`) */
   unpackedObjects: number;
 }
 
@@ -167,13 +169,16 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
 
 /**
  * Repack with the reachable objects already listed (gc lists them once for repack and prune),
- * replacing only packs of `snapshot`, taken before the listing.
+ * replacing only packs of `snapshot`, taken before the listing. With `unpackUnreachable`, the
+ * ids of the removed packs' unreachable objects left loose (written, renewed, or already loose
+ * and fresh) are added to `loosened`: gc's loose prune skips them.
  * @internal
  */
 export async function repackListed(
   options: RepackOptions,
   reachable: readonly ListedObject[],
   snapshot: PackSnapshot,
+  loosened?: Set<ObjectId>,
 ): Promise<RepackResult | null> {
   const { files, packs, looseStorage, objects, all = true, dryRun = false } = options;
   const gitDir = options.gitDir ?? ".git";
@@ -234,13 +239,13 @@ export async function repackListed(
       files,
       gitDir,
       objects,
-      looseStorage,
       removable,
       // the new pack holds only reachable objects; .keep packs stay
       keep: kept,
       reachable: new Set(reachable.map((o) => o.id)),
       cutoff:
         snapshot.walkStartedAt - (options.unpackUnreachableExpireMs ?? DEFAULT_PRUNE_EXPIRE_MS),
+      loosened: loosened ?? new Set(),
     });
   }
 
@@ -263,27 +268,34 @@ export async function repackListed(
  * `--unpack-unreachable`: writes loose the objects of the packs about to be removed that are
  * not reachable and not held by a pack that stays, unless their pack was modified before
  * `cutoff`. Each object is streamed from its pack into a staged loose file (temporary file and
- * rename); none is collected. Returns how many were written.
+ * rename); none is collected. An object already loose is rewritten when its loose file is older
+ * than the freshen window (one hour), which renews its mtime: git gives it the pack's mtime, and
+ * an old loose copy of an object of a young pack must not expire with the pack gone. Every id
+ * left loose goes into `loosened`. Returns how many were written or renewed.
  */
 async function unpackUnreachable(o: {
   files: FilesApi;
   gitDir: string;
   objects: GitObjects;
-  looseStorage: FileRawStorage;
   removable: readonly { pack: Pack; modified?: number }[];
   keep: readonly Pack[];
   reachable: ReadonlySet<ObjectId>;
   cutoff: number;
+  loosened: Set<ObjectId>;
 }): Promise<number> {
   // Straight into the loose store: the object kernel would skip an object it finds packed
-  const loose = createGitObjects(filesStagingStore(o.files, joinPath(o.gitDir, "objects")));
+  const staging = filesStagingStore(o.files, joinPath(o.gitDir, "objects"));
+  const loose = createGitObjects(staging);
   let written = 0;
   for (const { pack, modified } of o.removable) {
     // An expired pack's unreachable objects are dropped; an unknown age is never expired
     if (modified !== undefined && modified < o.cutoff) continue;
     for (const id of pack.ids()) {
       if (o.reachable.has(id) || o.keep.some((p) => p.has(id))) continue;
-      if (await o.looseStorage.has(id)) continue;
+      if (o.loosened.has(id)) continue;
+      o.loosened.add(id);
+      // Young (or of unknown age) loose copy: kept as it is; an old one is renewed
+      if (await staging.isFresh(id)) continue;
       await loose.putRaw(id, o.objects.getRaw(id));
       written++;
     }

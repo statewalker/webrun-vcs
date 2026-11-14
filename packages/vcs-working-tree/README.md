@@ -93,6 +93,10 @@ await index.setEntry({ path: "a.txt", mode: FileMode.REGULAR_FILE, objectId, sta
 await index.write();  // write DIRC format
 ```
 
+`parseIndexFile(bytes)` returns the version, the entries and `extensions`: the signatures of the
+extensions after the entries (`TREE`, `REUC`, `link` for a split index, ...), in file order.
+Their contents are not parsed, and an index is always written without extensions.
+
 ### Compute status
 
 ```typescript

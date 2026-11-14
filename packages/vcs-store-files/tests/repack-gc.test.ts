@@ -3,7 +3,8 @@
  * reachable, `.keep` packs honoured, loose-only mode, the prune grace period, install before
  * remove, and bounded memory for a large blob.
  */
-import { mkdtempSync, rmSync, utimesSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -17,7 +18,13 @@ import {
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { serializeIndexFile } from "@statewalker/vcs-working-tree";
 import { afterAll, describe, expect, it } from "vitest";
-import { createGitFilesBackend, gc, listReachableObjects, repack } from "../src/index.js";
+import {
+  createGitFilesBackend,
+  filesStagingStore,
+  gc,
+  listReachableObjects,
+  repack,
+} from "../src/index.js";
 
 const enc = new TextEncoder();
 const PACK_DIR = joinPath(".git", "objects", "pack");
@@ -588,5 +595,306 @@ describe("P2.6 review: orphaned packs and the gc lock", () => {
     ]);
     expect([one.skipped, two.skipped].sort()).toEqual([false, true]);
     expect(await b.files.exists(".git/gc.pid")).toBe(false);
+  });
+});
+
+describe("P2.6 second review: writes freshen old loose objects (git's freshen_loose_object)", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+  const HOUR = 3600_000;
+
+  async function looseBlob(content: string) {
+    const dir = mkdtempSync(join(tmpdir(), "gc-freshen-loose-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const b = await open(files);
+    await commit(b, "main", "a.txt", "main\n");
+    const blob = await b.history.blobs.store([enc.encode(content)]);
+    const path = join(dir, ".git/objects", blob.slice(0, 2), blob.slice(2));
+    const age = (ms: number) => {
+      const t = new Date(Date.now() - ms);
+      utimesSync(path, t, t);
+      return t.getTime();
+    };
+    return { dir, files, b, blob, path, age };
+  }
+
+  it("a write of an object whose loose copy is older than an hour renews its mtime, and gc keeps it", async () => {
+    const { files, b, blob, path, age } = await looseBlob("written again\n");
+    age(21 * 24 * HOUR);
+    await b.history.blobs.store([enc.encode("written again\n")]);
+    expect(statSync(path).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
+    const result = await gc({ history: b.history, files });
+    expect(await b.looseStorage.has(blob)).toBe(true);
+    expect(result.keptRecentObjects).toBe(1);
+  });
+
+  it("a younger loose copy is kept as it is, and so is one whose mtime is unknown", async () => {
+    const young = await looseBlob("young copy\n");
+    const set = young.age(30 * 60_000);
+    await young.b.history.blobs.store([enc.encode("young copy\n")]);
+    expect(Math.abs(statSync(young.path).mtimeMs - set)).toBeLessThan(1000);
+
+    const unknown = await looseBlob("unknown age\n");
+    const old = unknown.age(21 * 24 * HOUR);
+    const stats = unknown.files.stats.bind(unknown.files);
+    unknown.files.stats = async (p) => {
+      const s = await stats(p);
+      return s && p.includes(unknown.blob.slice(2)) ? { ...s, lastModified: undefined } : s;
+    };
+    await unknown.b.history.blobs.store([enc.encode("unknown age\n")]);
+    unknown.files.stats = stats;
+    expect(Math.abs(statSync(unknown.path).mtimeMs - old)).toBeLessThan(1000);
+  });
+
+  it("the freshen window is an option", async () => {
+    const { files, blob, path, age } = await looseBlob("short window\n");
+    age(30 * 60_000);
+    const store = filesStagingStore(files, ".git/objects", { freshenMaxAgeMs: 60_000 });
+    const bytes = (await files.stats(join(".git/objects", blob.slice(0, 2), blob.slice(2))))?.size;
+    expect(bytes).toBeGreaterThan(0);
+    const parts: Uint8Array[] = [];
+    for await (const c of store.get(blob)) parts.push(c);
+    await store.putStaged(
+      (async function* () {
+        yield* parts;
+      })(),
+      () => blob,
+    );
+    expect(statSync(path).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it("gc keeps an old loose copy of an unreachable object whose young pack it removes", async () => {
+    const { files, b, blob, path, age } = await looseBlob("pushed, ref not updated yet\n");
+    age(21 * 24 * HOUR);
+    // a push installs a pack holding the object before gc starts; its ref arrives later
+    const other = await open(files, false);
+    const pushed = await other.packs.install(
+      writePack(other.objects, [{ id: blob, type: "blob" }]),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    const result = await gc({ history: b.history, files });
+    expect(result.repack?.packsRemoved).toContain(`pack-${pushed.packId}`);
+    const fresh = await open(files, false);
+    expect(await fresh.objects.has(blob)).toBe(true);
+    expect(statSync(path).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it("gc's loose prune skips what the unpack step kept loose, even with a short grace period", async () => {
+    const { files, b, blob, age } = await looseBlob("young loose, younger pack\n");
+    age(30 * 60_000); // within the freshen window: not rewritten, but older than the grace period
+    const other = await open(files, false);
+    const pushed = await other.packs.install(
+      writePack(other.objects, [{ id: blob, type: "blob" }]),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    const result = await gc({ history: b.history, files, pruneExpireMs: 10 * 60_000 });
+    expect(result.repack?.packsRemoved).toContain(`pack-${pushed.packId}`);
+    const fresh = await open(files, false);
+    expect(await fresh.objects.has(blob)).toBe(true);
+  });
+});
+
+describe("P2.6 second review: orphan packs younger than an hour stay", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("keeps a .pack without an .idx younger than an hour whatever tmpExpiryMs says", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gc-orphan-floor-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const b = await open(files);
+    await commit(b, "main", "a.txt", "main\n");
+    const installing = joinPath(PACK_DIR, `pack-${"c".repeat(40)}.pack`);
+    const crashed = joinPath(PACK_DIR, `pack-${"d".repeat(40)}.pack`);
+    await files.write(installing, [enc.encode("PACK moved, idx not yet")]);
+    await files.write(crashed, [enc.encode("PACK half removed")]);
+    const tenMinutes = new Date(Date.now() - 10 * 60_000);
+    utimesSync(join(dir, installing), tenMinutes, tenMinutes);
+    const twoHours = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(join(dir, crashed), twoHours, twoHours);
+
+    const result = await gc({ history: b.history, files, tmpExpiryMs: 1000 });
+
+    expect(await files.exists(installing)).toBe(true);
+    expect(await files.exists(crashed)).toBe(false);
+    expect(result.removedOrphanPacks).toBe(1);
+    // its own option
+    await gc({ history: b.history, files, tmpExpiryMs: 1000, orphanPackExpiryMs: 60_000 });
+    expect(await files.exists(installing)).toBe(false);
+  });
+});
+
+describe("P2.6 second review: the gc lock holds a token", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  async function staleLock() {
+    const dir = mkdtempSync(join(tmpdir(), "gc-lock-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const b = await open(files);
+    await commit(b, "main", "a.txt", "main\n");
+    await files.write(".git/gc.pid", [enc.encode("4242 crashed-host\n")]);
+    const t = new Date(Date.now() - 13 * 3600_000);
+    utimesSync(join(dir, ".git/gc.pid"), t, t);
+    return { files, b };
+  }
+
+  it("takes over a lock older than 12 hours and releases it", async () => {
+    const { files, b } = await staleLock();
+    const result = await gc({ history: b.history, files });
+    expect(result.skipped).toBe(false);
+    expect(await files.exists(".git/gc.pid")).toBe(false);
+  });
+
+  it("only one of two gcs takes over a stale lock", async () => {
+    const { files, b } = await staleLock();
+    const results = await Promise.all([
+      gc({ history: b.history, files }),
+      gc({ history: b.history, files }),
+      gc({ history: b.history, files }),
+    ]);
+    expect(results.filter((r) => !r.skipped).length).toBe(1);
+    expect(await files.exists(".git/gc.pid")).toBe(false);
+  });
+
+  it("does not remove a lock that is no longer its own", async () => {
+    const b = await open();
+    await commit(b, "main", "a.txt", "main\n");
+    const refs = b.history.refs;
+    const list = async function* (prefix?: string) {
+      for await (const r of refs.list(prefix)) yield r;
+      // another gc took the lock over meanwhile (it judged ours stale)
+      await b.files.write(".git/gc.pid", [enc.encode("0 webrun-vcs foreign-token\n")]);
+    };
+    const history = overlay(b.history, { refs: overlay(refs, { list }) });
+    const result = await gc({ history, files: b.files, packs: b.packs });
+    expect(result.skipped).toBe(false);
+    expect(await b.files.exists(".git/gc.pid")).toBe(true);
+    const parts: Uint8Array[] = [];
+    for await (const c of b.files.read(".git/gc.pid")) parts.push(c);
+    expect(Buffer.concat(parts).toString()).toContain("foreign-token");
+  });
+});
+
+describe("P2.6 second review: a split index is refused", () => {
+  /** An index with a `link` extension (split index): its entries live in a shared index too. */
+  async function splitIndex(objectId: ObjectId) {
+    const base = await serializeIndexFile([
+      { path: "s.txt", mode: 0o100644, objectId, stage: 0, size: 6, mtime: 0 },
+    ]);
+    const body = base.subarray(0, base.length - 20);
+    const ext = new Uint8Array(8 + 20);
+    ext.set(enc.encode("link"), 0);
+    new DataView(ext.buffer).setUint32(4, 20);
+    const content = Buffer.concat([body, ext]);
+    return Buffer.concat([content, createHash("sha1").update(content).digest()]);
+  }
+
+  it("gc and repack throw before changing anything", async () => {
+    const b = await open();
+    await commit(b, "main", "a.txt", "main\n");
+    await repack({ ...b, all: false });
+    await commit(b, "main", "b.txt", "loose\n");
+    const staged = await b.history.blobs.store([enc.encode("staged\n")]);
+    await b.files.write(".git/index", [await splitIndex(staged)]);
+    const before = {
+      packs: await packNames(b.files, ".pack"),
+      loose: await b.looseStorage.has(staged),
+    };
+
+    await expect(gc({ history: b.history, files: b.files, pruneExpireMs: 0 })).rejects.toThrow(
+      /split index/,
+    );
+    await expect(repack(b)).rejects.toThrow(/split index/);
+
+    expect(await packNames(b.files, ".pack")).toEqual(before.packs);
+    expect(await b.looseStorage.has(staged)).toBe(before.loose);
+    expect(await b.files.exists(".git/gc.pid")).toBe(false);
+  });
+});
+
+describe("P2.6 second review: repack and the guards against removing a new pack", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("a repack with no change rebuilds the same pack id and keeps it", async () => {
+    const b = await open();
+    await commit(b, "main", "a.txt", "one\n");
+    await commit(b, "main", "b.txt", "two\n");
+    const first = await repack(b);
+    const ids = await reachableIds(b);
+    const second = await repack(b);
+    expect(second?.packName).toBe(first?.packName);
+    expect(second?.packsRemoved).toEqual([]);
+    expect(await packNames(b.files, ".pack")).toEqual([`${first?.packName}.pack`]);
+    expect(await packNames(b.files, ".idx")).toEqual([`${first?.packName}.idx`]);
+    const fresh = await open(b.files, false);
+    for (const id of ids) expect(await fresh.objects.has(id)).toBe(true);
+  });
+
+  it("the snapshot alone keeps a pack installed during the walk (no mtimes)", async () => {
+    const files = createInMemoryFilesApi();
+    const stats = files.stats.bind(files);
+    files.stats = async (p) => {
+      const s = await stats(p);
+      return s ? { ...s, lastModified: undefined } : s;
+    };
+    const b = await open(files);
+    await commit(b, "main", "a.txt", "one\n");
+    await repack({ ...b, all: false });
+    await commit(b, "main", "b.txt", "two\n");
+    const pushed: { blob?: ObjectId; packId?: string } = {};
+    const refs = b.history.refs;
+    const list = async function* (prefix?: string) {
+      for await (const r of refs.list(prefix)) yield r;
+      if (pushed.blob) return;
+      const other = await open(files, false);
+      const blob = await other.history.blobs.store([enc.encode("pushed meanwhile\n")]);
+      const installed = await other.packs.install(
+        writePack(other.objects, [{ id: blob, type: "blob" }]),
+      );
+      await other.looseStorage.remove(blob);
+      pushed.blob = blob;
+      pushed.packId = installed.packId;
+    };
+    const history = overlay(b.history, { refs: overlay(refs, { list }) });
+    const result = await repack({ ...b, history });
+    expect(pushed.blob).toBeDefined();
+    expect(result?.packsRemoved.length).toBe(1);
+    expect(result?.packsRemoved).not.toContain(`pack-${pushed.packId}`);
+    const fresh = await open(files, false);
+    expect(await fresh.objects.has(pushed.blob as ObjectId)).toBe(true);
+  });
+
+  it("the mtime check alone keeps a snapshot pack modified during the walk", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "repack-mtime-guard-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const b = await open(files);
+    await commit(b, "main", "a.txt", "one\n");
+    const first = await repack({ ...b, all: false });
+    await commit(b, "main", "b.txt", "two\n");
+    const touched = join(dir, PACK_DIR, `${first?.packName}.pack`);
+    const refs = b.history.refs;
+    const list = async function* (prefix?: string) {
+      for await (const r of refs.list(prefix)) yield r;
+      // the pack is in the snapshot, then a writer freshens it (git touches its mtime)
+      const t = new Date(Date.now() + 5_000);
+      utimesSync(touched, t, t);
+    };
+    const history = overlay(b.history, { refs: overlay(refs, { list }) });
+    const result = await repack({ ...b, history });
+    expect(result?.packsRemoved).toEqual([]);
+    expect(await files.exists(joinPath(PACK_DIR, `${first?.packName}.pack`))).toBe(true);
   });
 });

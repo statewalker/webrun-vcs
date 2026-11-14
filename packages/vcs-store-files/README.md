@@ -36,7 +36,7 @@ Main exports:
 | `createGitFilesHistoryFromFiles(options)` | Same options, returns a `HistoryWithOperations` (adds `serialization`, and `delta`: a read-only view of which packed objects are deltas). |
 | `FileStagingStore(files, indexPath)` | `Staging` stored in Git's binary index format (`.git/index`). |
 | `createFileWorktree({ files, rootPath, blobs, trees, gitDir? })` / `FileWorktree` | `Worktree` over the working directory, with `.gitignore` support and `checkoutTree`. |
-| `gc({ history, files, gitDir?, dryRun?, pruneExpireMs?, tmpExpiryMs?, packRefs?, repack? })` | `git gc`: under a `gc.pid` lock, repacks everything reachable into one pack (`repack -A -d`: unreachable packed objects younger than two weeks are loosened), packs refs, prunes unreachable loose objects older than two weeks, sweeps stale temporaries and orphaned `.pack` files. |
+| `gc({ history, files, gitDir?, dryRun?, pruneExpireMs?, tmpExpiryMs?, orphanPackExpiryMs?, packRefs?, repack? })` | `git gc`: under a `gc.pid` lock, repacks everything reachable into one pack (`repack -A -d`: unreachable packed objects younger than two weeks are loosened), packs refs, prunes unreachable loose objects older than two weeks, sweeps stale temporaries and orphaned `.pack` files. |
 | `repack({ ...backend, all?, unpackUnreachable?, deltaSearch?, dryRun? })` | `git repack -a -d` (default), `git repack -A -d` with `unpackUnreachable: true`, or, with `all: false`, `git repack -d`: one streamed pack, `.keep` packs honoured, replaced packs and loose copies removed after the install; only packs present before the walk are replaced. |
 | `FileGcStrategy(backend)` | `GcStrategy` for `@statewalker/vcs-core`: `prune`, `compact` (= `repack` with `all: false`), `getStats`. |
 | `listReachableObjects` / `collectReachabilityRoots` | What repack and gc keep: objects reachable from every ref, HEAD, the reflogs, the index and every linked worktree's HEAD, index and reflogs. Refs are read strictly: an unreadable or malformed ref throws. |
@@ -45,7 +45,7 @@ Lower-level building blocks, also exported:
 
 | Area | Exports |
 | --- | --- |
-| Object kernel store | `filesStagingStore(files, objectsDir)`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packs)`: a `GitObjects` that reads the packs of a `PackSet` (`openPackSet` from `@statewalker/vcs-core`) first, then loose objects; `skipPacked(store, packs)`: a staging store that does not write objects already packed (in a pack still on storage, in a copy not found corrupt) |
+| Object kernel store | `filesStagingStore(files, objectsDir, { freshenMaxAgeMs? })`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename (a write over a loose file older than an hour renews it); `isFresh(id)` says whether a loose object exists and needs no freshening; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packs)`: a `GitObjects` that reads the packs of a `PackSet` (`openPackSet` from `@statewalker/vcs-core`) first, then loose objects; `skipPacked(store, packs)`: a staging store that does not write objects already packed (in a pack still on storage, in a copy not found corrupt) |
 | Loose objects | `FileRawStorage` (`compress` option, default `true`); `prunePacked(looseStorage, packs)` removes loose copies of packed objects (`git prune-packed`) |
 | Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs? })` with atomic `batch`; `createFilesRefBatch(atomicFiles)`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
 | Working copy | `GitWorkingCopy`, `GitWorkingCopyFactory` / `createGitWorkingCopyFactory`, `GitWorkingCopyConfig` / `createWorkingCopyConfig` (reads and writes `.git/config`), `GitCheckout` / `createGitCheckout`, `GitStashStore` / `createGitStashStore` (`refs/stash`) |
@@ -243,6 +243,13 @@ loose again: git would touch the pack's mtime so a concurrent gc does not expire
 it, FilesApi cannot set mtimes, and the fresh loose copy does that job instead. An object
 skipped because its pack is younger is safe too: gc loosens the unreachable objects of young
 packs instead of dropping them.
+
+Writing an object that is already loose keeps the existing file, unless it was last modified
+more than an hour ago (`freshenMaxAgeMs` of `filesStagingStore` and `createGitFilesBackend`):
+then the new temporary is moved over it, so the rename renews its mtime at once and a concurrent
+gc keeps the object for its grace period, as git's `freshen_loose_object` does by touching the
+file. A loose file whose mtime the FilesApi does not report is kept as it is, as `PackSet`
+trusts a pack of unknown age.
 `gc()` and `repack()` work on the `packs` and `looseStorage` the backend returns, and ignore
 files in `objects/` that are not objects (such as git's `objects/ab/tmp_obj_*` while it writes).
 
@@ -272,7 +279,9 @@ replaced packs are dropped, exactly as `git repack -a -d` drops them, unless
 `unpackUnreachable` is set (`git repack -A -d`, what `gc()` uses): each of them is then streamed
 from its pack into a loose object (temporary file and rename) before the pack is removed, unless
 the pack was last modified more than `unpackUnreachableExpireMs` ago (two weeks); a pack whose
-mtime is unknown is always loosened.
+mtime is unknown is always loosened. An object that is already loose is rewritten if its loose
+file is older than an hour, which renews its mtime: an old loose copy of an object that a push
+also brought in a young pack would otherwise expire once that pack is gone.
 
 Only packs that were installed before the walk started are replaced: the pack set is refreshed
 and snapshotted first, then the reachable objects are listed. A pack installed by someone else
@@ -289,26 +298,38 @@ packed: they stay loose for `gc()` to prune when they are old enough.
 `gc()` treats as reachable every object reachable from a ref, HEAD, any reflog entry (old and new
 ids, `logs/HEAD` and `logs/refs/**`), an index entry, and, for each linked worktree
 (`.git/worktrees/<name>/`), its HEAD (detached or symbolic), its index and its reflogs, as
-`git gc` does. The trees of the index's cache-tree extension are not read (git counts them too);
-a tree only the cache-tree names can be pruned, and git then rebuilds that part of the
-cache-tree. Refs are listed strictly: a ref file that cannot be read, an empty or malformed ref
+`git gc` does. The trees of the index's cache-tree (TREE) extension and the blobs of its
+resolve-undo (REUC) extension are not read (git counts them too): a tree only the cache-tree
+names can be pruned, and git then rebuilds that part of the cache-tree; a blob only resolve-undo
+names (a conflict resolved since) can be pruned, and `git checkout -m` then cannot recreate that
+conflict. A split index (a `link` extension) makes gc and repack throw before anything is
+changed: its entries live partly in a shared index file, which is not read, so the blobs staged
+there would silently stop being roots (`git update-index --no-split-index` undoes it). Refs are listed strictly: a ref file that cannot be read, an empty or malformed ref
 or a broken `packed-refs` makes gc throw before anything is changed, as `git gc` refuses to run.
 
 gc repacks with `repack -A -d`: unreachable objects of the replaced packs are written loose,
 unless their pack is older than `pruneExpireMs`, so a branch deleted with its reflog
 (`git branch -D`) keeps its packed commits for the grace period. FilesApi cannot set mtimes, so
 these loose copies get the current time and live up to `pruneExpireMs` longer than under git.
-Then gc removes each remaining loose object that is unreachable and was last modified more than
+Then gc removes, except the objects the repack just left loose, each remaining loose object that is unreachable and was last modified more than
 `pruneExpireMs` ago (git's `gc.pruneExpire`, two weeks). Younger unreachable objects are kept,
 because another process may be writing a commit that will reference them; an object whose age is
 unknown is kept too unless `pruneExpireMs` is 0 (`--prune=now`).
 
-Temporaries left by a crashed write (`objects/**/tmp_obj_*` and `objects/pack/tmp_*`), and
-`.pack` files whose `.idx` is gone (a crash while a pack was removed), are removed once older
-than `tmpExpiryMs` (two weeks). gc takes `.git/gc.pid` with an exclusive create first; while
-another gc holds it, gc returns `skipped: true` and does nothing (a `gc.pid` older than 12 hours
-is taken over, as git does). The lock excludes gcs over the same FilesApi instance, not native
-git. A dry run takes no lock and changes nothing: it does not pack refs, repack or sweep, and
+Temporaries left by a crashed write (`objects/**/tmp_obj_*` and `objects/pack/tmp_*`) are
+removed once older than `tmpExpiryMs` (two weeks). `.pack` files whose `.idx` is gone (a crash
+while a pack was removed) are removed once older than `orphanPackExpiryMs`, which defaults to
+`tmpExpiryMs` but never less than an hour: a pack being installed is moved into place before its
+`.idx`, with its temporary's mtime, so a young one may still be arriving. git never removes such
+files.
+
+gc takes `.git/gc.pid` with an exclusive create first, writing a random token into it; while
+another gc holds it, gc returns `skipped: true` and does nothing. A `gc.pid` older than 12 hours
+is taken over, as git does: one takeover at a time (under `gc.pid.takeover`), the stale lock is
+removed and created again exclusively, then read back to check it holds our token. Without
+`lastModified` from the FilesApi a lock's age is unknown and it is never taken over: remove
+`gc.pid` by hand after a crash. gc releases the lock only while it still holds its token. The
+lock excludes gcs over the same FilesApi instance, not native git. A dry run takes no lock and changes nothing: it does not pack refs, repack or sweep, and
 reports what it would prune.
 
 ### Compatibility limits
