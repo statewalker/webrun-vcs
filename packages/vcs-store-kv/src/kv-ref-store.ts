@@ -37,15 +37,45 @@ type Snapshot = Map<string, string>;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** Thrown when the root value is not a JSON object of strings; it is never overwritten. */
+export class CorruptRefRootError extends Error {
+  constructor(detail: string) {
+    super(`corrupt ref root (${ROOT_KEY}): ${detail}`);
+    this.name = "CorruptRefRootError";
+  }
+}
+
 function decode(bytes: Uint8Array | undefined): Snapshot {
   if (!bytes) return new Map();
-  return new Map(Object.entries(JSON.parse(decoder.decode(bytes)) as Record<string, string>));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoder.decode(bytes));
+  } catch (e) {
+    throw new CorruptRefRootError(e instanceof Error ? e.message : String(e));
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new CorruptRefRootError("not a JSON object");
+  }
+  const refs: Snapshot = new Map();
+  for (const [name, value] of Object.entries(parsed)) {
+    if (typeof value !== "string")
+      throw new CorruptRefRootError(`value of ${name} is not a string`);
+    refs.set(name, value);
+  }
+  return refs;
 }
 
 function encode(refs: Snapshot): Uint8Array {
-  const out: Record<string, string> = {};
-  for (const name of [...refs.keys()].sort(compareRefNames)) out[name] = refs.get(name) as string;
-  return encoder.encode(JSON.stringify(out));
+  // fromEntries defines own properties, so even a name like "__proto__" survives.
+  const sorted = [...refs.keys()].sort(compareRefNames);
+  return encoder.encode(JSON.stringify(Object.fromEntries(sorted.map((n) => [n, refs.get(n)]))));
+}
+
+function sameBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function toRef(name: string, value: string | undefined): Ref | SymbolicRef | undefined {
@@ -69,11 +99,36 @@ function toRef(name: string, value: string | undefined): Ref | SymbolicRef | und
  * ```
  */
 export class KVRefStore implements Refs {
+  /** The last root read and its decoded refs: reused while the bytes are unchanged. */
+  private cache: { bytes: Uint8Array; refs: Snapshot } | undefined;
+
   constructor(private kv: KVStore) {}
 
+  /** Read the root. The returned map is a private copy the caller may change. */
   private async read(): Promise<{ bytes: Uint8Array | undefined; refs: Snapshot }> {
     const bytes = await this.kv.get(ROOT_KEY);
-    return { bytes, refs: decode(bytes) };
+    if (!bytes) {
+      await this.checkNoOldLayout();
+      return { bytes, refs: new Map() };
+    }
+    if (!this.cache || !sameBytes(this.cache.bytes, bytes)) {
+      this.cache = { bytes: new Uint8Array(bytes), refs: decode(bytes) };
+    }
+    return { bytes, refs: new Map(this.cache.refs) };
+  }
+
+  /**
+   * Stores written before the root layout kept one `ref:<name>` key per ref.
+   * Refuse them rather than show an empty store that writes would fork.
+   */
+  private async checkNoOldLayout(): Promise<void> {
+    for await (const key of this.kv.list("ref:")) {
+      if (key !== ROOT_KEY) {
+        throw new Error(
+          `KVRefStore: found ${key} in the old one-key-per-ref layout; this store keeps all refs in ${ROOT_KEY}`,
+        );
+      }
+    }
   }
 
   /**

@@ -47,8 +47,14 @@ export interface DatabaseClient {
    * Execute multiple statements within a transaction
    *
    * Automatically commits on success, rolls back on error.
-   * The provided client should be used for all operations within
-   * the transaction function.
+   *
+   * Implementations must isolate concurrent callers: on a single connection a
+   * transaction waits for the one in flight, and plain `query` / `execute` calls
+   * wait too, so nothing runs inside someone else's transaction.
+   *
+   * Use the client handed to `fn` for every statement inside it, nested
+   * transactions included (they join). Calling the outer client from inside
+   * `fn` waits for the transaction to end, so it never runs (a hang).
    *
    * @param fn Function that performs database operations
    * @returns Result of the transaction function

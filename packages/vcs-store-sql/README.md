@@ -177,8 +177,9 @@ class MyClient implements DatabaseClient {
 ```
 
 `transaction` must isolate concurrent callers: on a single connection, queue a transaction behind
-the one in flight rather than running it inside it (`SqlJsAdapter` does this). Atomic ref batches
-depend on it.
+the one in flight rather than running it inside it, and make plain `query` / `execute` wait for it
+too (`SqlJsAdapter` does both). Atomic ref batches depend on it. Inside `fn`, use only the client
+it is given: calling the outer client from there waits for the transaction to end, and hangs.
 
 The SQL the stores issue is SQLite dialect (`INSERT OR REPLACE`, `AUTOINCREMENT`, recursive CTEs
 for ancestry), so a client for another engine has to accept it.

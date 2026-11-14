@@ -35,8 +35,17 @@ interface RefRow {
 }
 
 /**
- * SQL-based RefStore implementation.
+ * Upper bound (exclusive) of the names starting with `prefix`: the prefix with
+ * its last code point incremented. BINARY collation compares UTF-8 bytes, which
+ * is code-point order, so `name >= prefix AND name < upper` is an exact,
+ * case-sensitive prefix match with no LIKE wildcards.
  */
+function prefixUpperBound(prefix: string): string {
+  const chars = [...prefix];
+  const last = chars.pop() ?? "";
+  return chars.join("") + String.fromCodePoint((last.codePointAt(0) ?? 0) + 1);
+}
+
 function rowToRef(row: RefRow): Ref | SymbolicRef {
   const storage = (row.storage as RefStorage) || RefStorage.LOOSE;
   if (row.target != null) {
@@ -51,19 +60,19 @@ function rowToRef(row: RefRow): Ref | SymbolicRef {
   } as Ref;
 }
 
+/**
+ * SQL-based Refs: table `vcs_ref`, batches in one transaction.
+ */
 export class SQLRefStore implements Refs {
   constructor(private db: DatabaseClient) {}
 
-  /**
-   * Interim: a single command through {@link compareAndSwap}; several commands
-   * are refused as "not-atomic" until this store applies batches atomically.
-   */
   /**
    * Apply all commands atomically, or none (see {@link Refs.batch}): the batch is
    * planned and written inside one transaction. Reflogs are not kept yet, so
    * `options` is ignored.
    */
-  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+  async batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+    if (commands.length === 0) return { ok: true, rejected: [] };
     return this.db.transaction(async (tx) => {
       const plan = await planRefBatch(commands, {
         read: async (name) => {
@@ -71,10 +80,9 @@ export class SQLRefStore implements Refs {
           return rows[0] ? rowToRef(rows[0]) : undefined;
         },
         hasChildren: async (name) => {
-          // Names below `name/` sort in [name/, name0): "0" follows "/" in byte order.
           const rows = await tx.query<{ name: string }>(
             "SELECT name FROM vcs_ref WHERE name >= ? AND name < ? LIMIT 1",
-            [`${name}/`, `${name}0`],
+            [`${name}/`, prefixUpperBound(`${name}/`)],
           );
           return rows.length > 0;
         },
@@ -92,6 +100,7 @@ export class SQLRefStore implements Refs {
                object_id = excluded.object_id,
                target = NULL,
                peeled_object_id = NULL,
+               storage = excluded.storage,
                updated_at = excluded.updated_at`,
             [u.name, u.newValue, RefStorage.LOOSE, now],
           );
@@ -159,35 +168,13 @@ export class SQLRefStore implements Refs {
    * List all refs matching a prefix.
    */
   async *list(prefix?: string): AsyncIterable<Ref | SymbolicRef> {
-    let rows: RefRow[];
-
-    if (prefix) {
-      rows = await this.db.query<RefRow>("SELECT * FROM vcs_ref WHERE name LIKE ? ORDER BY name", [
-        `${prefix}%`,
-      ]);
-    } else {
-      rows = await this.db.query<RefRow>("SELECT * FROM vcs_ref ORDER BY name", []);
-    }
-
-    for (const row of rows) {
-      const storage = (row.storage as RefStorage) || RefStorage.LOOSE;
-
-      if (row.target != null) {
-        yield {
-          name: row.name,
-          target: row.target,
-          storage,
-        } as SymbolicRef;
-      } else {
-        yield {
-          name: row.name,
-          objectId: row.object_id || undefined,
-          storage,
-          peeled: row.peeled_object_id != null,
-          peeledObjectId: row.peeled_object_id || undefined,
-        } as Ref;
-      }
-    }
+    const rows = prefix
+      ? await this.db.query<RefRow>(
+          "SELECT * FROM vcs_ref WHERE name >= ? AND name < ? ORDER BY name",
+          [prefix, prefixUpperBound(prefix)],
+        )
+      : await this.db.query<RefRow>("SELECT * FROM vcs_ref ORDER BY name", []);
+    for (const row of rows) yield rowToRef(row);
   }
 
   /**
@@ -201,6 +188,8 @@ export class SQLRefStore implements Refs {
        ON CONFLICT(name) DO UPDATE SET
          object_id = excluded.object_id,
          target = NULL,
+         peeled_object_id = NULL,
+         storage = excluded.storage,
          updated_at = excluded.updated_at`,
       [refName, objectId, RefStorage.LOOSE, now],
     );
