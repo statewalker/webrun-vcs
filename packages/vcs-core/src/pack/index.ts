@@ -9,6 +9,7 @@
 export * from "./delta-instruction-analyzer.js";
 export * from "./delta-reverse-index.js";
 export * from "./git-pack-store.js";
+export * from "./index-pack.js";
 export * from "./pack-entries-parser.js";
 export * from "./pack-index-reader.js";
 export * from "./pack-index-writer.js";
