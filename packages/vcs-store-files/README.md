@@ -181,15 +181,17 @@ then `packed-refs.lock`, and commit as JGit's `PackedBatchRefUpdate` does, first
 involved loose refs into `packed-refs` and then landing the whole batch in `packed-refs` with one
 rename. A crash at any file operation leaves every ref at its old or its new value once stale
 locks are removed; native `git` reads the result, refuses to update a ref we hold locked, and makes
-us report `locked` while it holds its own (a lock created in the same instant by both is not
-excluded: FilesApi has no exclusive create). Reflog lines are written to `logs/` in git's format (HEAD's too when it
+us report `locked` while it holds its own (a lock created in the same instant by both is
+excluded only when the FilesApi has `createExclusive`, see below). Reflog lines are written to `logs/` in git's format (HEAD's too when it
 points at an updated branch). `compareAndSwap` is a one-command batch.
 
-The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`, which is
-atomic only among users of the same FilesApi instance: two FilesApi instances over one directory,
-even in one process, do not exclude each other, nor does another process such as native `git`.
-Share one FilesApi per repository. Excluding other processes needs an exclusive create in FilesApi
-(O_CREAT|O_EXCL), which belongs upstream in `@statewalker/webrun-files`. `createGitFilesBackend`
+The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`. When the
+FilesApi has `createExclusive` (an O_CREAT|O_EXCL create: `open "wx"` in `@statewalker/webrun-files-node`
+0.11, Web Locks in the browser, a transaction in sqlite, a synchronous reservation in memory), every lock is created with
+it, and the exclusion is cross-process: other processes such as native `git`, other tabs and other
+FilesApi instances are excluded. Without it, a lock is atomic only among users of the same FilesApi
+instance: two FilesApi instances over one directory, even in one process, do not exclude each
+other, nor does another process; share one FilesApi per repository then. `createGitFilesBackend`
 takes the same `atomicFiles` option, and the lock timeouts.
 
 Reflogs follow git with `core.logAllRefUpdates=true` in a non-bare repository: a log is created
@@ -329,7 +331,8 @@ is taken over, as git does: one takeover at a time (under `gc.pid.takeover`), th
 removed and created again exclusively, then read back to check it holds our token. Without
 `lastModified` from the FilesApi a lock's age is unknown and it is never taken over: remove
 `gc.pid` by hand after a crash. gc releases the lock only while it still holds its token. The
-lock excludes gcs over the same FilesApi instance, not native git. A dry run takes no lock and changes nothing: it does not pack refs, repack or sweep, and
+lock excludes gcs in other processes when the FilesApi has `createExclusive`, and otherwise
+only gcs over the same FilesApi instance. A dry run takes no lock and changes nothing: it does not pack refs, repack or sweep, and
 reports what it would prune.
 
 ### Compatibility limits
@@ -338,8 +341,8 @@ reports what it would prune.
 - `.git/config` is read and written by `GitWorkingCopyConfig` as one file: `[include]` /
   `[includeIf]` are not followed, a malformed section header is kept but ignored where `git`
   would reject the file, and `save()` rewrites the whole file without a `config.lock`.
-- Ref batches and `compareAndSwap` use `.lock` files and rename, exclusive among writers sharing
-  one FilesApi; another process such as a running `git` is not excluded. `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
+- Ref batches and `compareAndSwap` use `.lock` files and rename, exclusive across processes when
+  the FilesApi has `createExclusive`, and otherwise only among writers sharing one FilesApi. `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
   `packed-refs` without `packed-refs.lock` and can lose a concurrent batch), loose objects and the
   index are still written directly, without locks: do not run them next to a batch or a `git`
   process writing the same repository.

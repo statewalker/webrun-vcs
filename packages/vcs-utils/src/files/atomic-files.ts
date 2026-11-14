@@ -21,9 +21,10 @@ export interface AtomicFiles {
   list(dir: string): AsyncIterable<string>;
   /**
    * Create `path` with `content` only if nothing exists there, creating
-   * directories. Not a real O_CREAT|O_EXCL: a check then a write, exclusive
-   * only among adapters over one FilesApi (see `atomicFilesOver`);
-   * `false` if it already exists. Throws an error with
+   * directories; `false` if it already exists. With a FilesApi that has
+   * `createExclusive` this is a real exclusive create, excluding other
+   * processes and tabs; without it, a check then a write, exclusive only among
+   * adapters over one FilesApi (see `atomicFilesOver`). Throws an error with
    * `code` "ENOTDIR" (or "EEXIST") when a parent is a file, so `refs/x/y.lock`
    * cannot be created while `refs/x` is a ref.
    */
@@ -34,6 +35,33 @@ export interface AtomicFiles {
   append(path: string, content: Uint8Array): Promise<void>;
   /** Remove `dir` if it is an empty directory; `false` otherwise. */
   removeEmptyDir(dir: string): Promise<boolean>;
+}
+
+/**
+ * How many times a delegated `createExclusive` is retried after ENOENT. webrun-files-node
+ * runs `mkdir -p` and then `open "wx"`; another process (native git pruning empty ref
+ * directories) can remove the directory in between. Git's `raceproof_create_file` retries
+ * the same way.
+ */
+const ENOENT_RETRIES = 3;
+
+const isEnoent = (error: unknown) =>
+  typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT";
+
+/** `createExclusive` of the FilesApi, retried while its directory vanishes underneath it. */
+async function createExclusiveRaceproof(
+  fs: FilesApi,
+  exclusive: NonNullable<FilesApi["createExclusive"]>,
+  path: string,
+  content: Uint8Array,
+): Promise<boolean> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await exclusive.call(fs, path, [content]);
+    } catch (error) {
+      if (!isEnoent(error) || attempt >= ENOENT_RETRIES) throw error;
+    }
+  }
 }
 
 /** Paths held by an in-flight `createExclusive`, per FilesApi, shared by every adapter over it. */
@@ -48,13 +76,23 @@ const structural = new WeakMap<FilesApi, Promise<unknown>>();
 /**
  * `AtomicFiles` over any FilesApi, rooted at `root`.
  *
- * Exclusive creation is guaranteed only among adapters over the same FilesApi
- * instance: exclusive creates and empty-directory removals on one FilesApi run
- * one at a time, so each one's checks and its change happen as one step. Two FilesApi instances over one directory, even in one
- * process, and other processes such as native git are not excluded: use one
- * FilesApi instance per repository, and do not run another writer on the same
- * directory. (Cross-process exclusion needs an exclusive create in FilesApi.)
- * `replace` is FilesApi's `move`, which is atomic only where the backend's is.
+ * When the FilesApi has `createExclusive` (every webrun-files FilesApi from 0.11:
+ * node, browser, mem, sqlite), `createExclusive` delegates to it, and a lock
+ * excludes every writer the backend excludes: other processes such as native git,
+ * other tabs, other FilesApi instances. A delegated call that fails with ENOENT
+ * (its directory pruned by another process between `mkdir` and `open`) is retried.
+ *
+ * Without it, exclusive creation is guaranteed only among adapters over the same
+ * FilesApi instance: exclusive creates and empty-directory removals on one
+ * FilesApi run one at a time, so each one's checks and its change happen as one
+ * step. Two FilesApi instances over one directory, even in one process, and other
+ * processes are not excluded then: use one FilesApi instance per repository, and
+ * do not run another writer on the same directory.
+ *
+ * In both cases exclusive creates and empty-directory removals through one
+ * FilesApi run one at a time, so `removeEmptyDir` never removes a lock created
+ * meanwhile in-process. `replace` is FilesApi's `move`, which is atomic only
+ * where the backend's is.
  *
  * @example
  * ```typescript
@@ -111,18 +149,20 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
     },
     createExclusive: (path, content) =>
       serial(async () => {
+        // A file where a directory is needed: refuse, as open(2) does with ENOTDIR.
+        const parts = path.split("/").filter(Boolean);
+        for (let i = 1; i < parts.length; i++) {
+          const parent = parts.slice(0, i).join("/");
+          if ((await fs.stats(abs(parent)))?.kind === "file") {
+            throw Object.assign(new Error(`ENOTDIR: ${parent} is a file`), { code: "ENOTDIR" });
+          }
+        }
         const key = abs(path);
+        const exclusive = fs.createExclusive;
+        if (exclusive) return createExclusiveRaceproof(fs, exclusive, key, content);
         if (claims.has(key)) return false;
         claims.add(key);
         try {
-          // A file where a directory is needed: refuse, as open(2) does with ENOTDIR.
-          const parts = path.split("/").filter(Boolean);
-          for (let i = 1; i < parts.length; i++) {
-            const parent = parts.slice(0, i).join("/");
-            if ((await fs.stats(abs(parent)))?.kind === "file") {
-              throw Object.assign(new Error(`ENOTDIR: ${parent} is a file`), { code: "ENOTDIR" });
-            }
-          }
           if (await fs.exists(key)) return false;
           await ensureDir(path);
           await fs.write(key, [content]);

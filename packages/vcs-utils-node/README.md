@@ -31,10 +31,11 @@ Paths are resolved against `rootDir`; a path whose `..` would leave it is refuse
 
 ## Internals
 
-### What NodeFilesApi does not do yet
+### Writes and lock files
 
-- `write` collects every chunk before writing the file (webrun-files-node 0.10), so storing a large object holds it in memory once. A streaming `write` belongs upstream in `@statewalker/webrun-files-node`; the object kernel already streams up to the `FilesApi`.
-- There is no exclusive create (O_EXCL). Ref batches use `atomicFilesOver(files, gitDir)` from `@statewalker/vcs-utils/files`, which excludes concurrent writers sharing one `FilesApi` instance, but not other processes such as a running `git`. Exclusive create also belongs upstream, in `FilesApi`.
+- `write` streams (webrun-files-node 0.11): the chunks go to a temporary file beside the target as they arrive, and the temporary is renamed over the target once complete. Storing a large object does not hold it in memory, and readers see the old file or the new one, never a partial one; a source that fails leaves the old file in place. `list` hides the temporaries.
+- `createExclusive` is `open(path, "wx")` (`O_CREAT | O_EXCL`), after creating the parent directories, so the operating system decides who takes a lock. Lock files (`<ref>.lock`, `packed-refs.lock`, `index.lock`, `gc.pid`) go through `atomicFilesOver(files, gitDir)` from `@statewalker/vcs-utils/files`, which uses it: a lock excludes every other process on the machine, a running `git` included, and every other `FilesApi` instance over the same directory. If another process removes the lock's (empty) directory between the `mkdir` and the `open`, `atomicFilesOver` retries, as git's `raceproof_create_file` does.
+- `move` is a `rename(2)`, atomic on one filesystem, and a `FilesApi` rooted at `/` accepts absolute paths.
 
 ### Dependencies
 
