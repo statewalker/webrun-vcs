@@ -30,7 +30,7 @@ No peer dependencies. Hashing uses `@noble/hashes`.
 | `@statewalker/vcs-utils/hash/rolling-checksum` | `RollingChecksum`, `JgitRollingHash` and related helpers |
 | `@statewalker/vcs-utils/hash/strong-checksum` | `StrongChecksum` |
 | `@statewalker/vcs-utils/hash/utils` | `bytesToHex`, `hexToBytes` |
-| `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `parseGitDelta`, ...), text diff (`RawText`, `RawTextComparator`, `MyersDiff`, `HistogramDiff`, `getAlgorithm`, `MergeAlgorithm`, `merge3Way`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
+| `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `DeltaError`, `createGitDeltaIndex`, `encodeGitDelta`, `parseGitDelta`, ...), text diff (`RawText`, `RawTextComparator`, `MyersDiff`, `HistogramDiff`, `getAlgorithm`, `MergeAlgorithm`, `merge3Way`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
 | `@statewalker/vcs-utils/encoding` | Git varints: `readVarint`, `writeVarint`, `readOfsVarint`, `writeOfsVarint`, `readPackHeader`, `writePackHeader` |
 | `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader`, `BufferedByteReader`, port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
 | `@statewalker/vcs-utils/cache` | `LRUCache`, `IntermediateCache` |
@@ -138,6 +138,18 @@ const rebuilt = mergeChunks(applyDelta(base, delta));
 const gitDelta = deltaToGitFormat(base.length, delta);
 const rebuilt2 = applyGitDelta(base, gitDelta);
 ```
+
+### Encode and apply git pack deltas
+
+```typescript
+import { applyGitDelta, createGitDeltaIndex, encodeGitDelta } from "@statewalker/vcs-utils/diff";
+
+const index = createGitDeltaIndex(base); // index a base once, try many targets against it
+const delta = encodeGitDelta(index, target, target.length / 2); // undefined if not worth it
+const rebuilt = applyGitDelta(base, delta!); // equals target
+```
+
+`encodeGitDelta` writes git's own delta format (diff-delta.c): native `git index-pack` accepts packs carrying these deltas. `applyGitDelta` checks every instruction before it allocates, as git's patch-delta.c does: a copy past the end of the base, a truncated operand, the reserved instruction 0, or sizes that do not match throw `DeltaError`, and `maxSize` bounds what a hostile header can make it allocate.
 
 ### Diff two texts line by line
 
