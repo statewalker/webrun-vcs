@@ -25,7 +25,8 @@ export interface SqlJsAdapterOptions {
  * Suitable for browser and Node.js environments.
  */
 export class SqlJsAdapter implements DatabaseClient {
-  private inTransaction = false;
+  /** Settles when the transaction in flight (if any) has finished. */
+  private txTail: Promise<void> = Promise.resolve();
 
   private constructor(private db: Database) {}
 
@@ -75,9 +76,32 @@ export class SqlJsAdapter implements DatabaseClient {
   }
 
   /**
-   * Execute a query that returns rows
+   * Execute a query that returns rows. Waits for a transaction in flight to
+   * finish, so it never reads or writes inside someone else's transaction.
    */
   async query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
+    await this.idle();
+    return this.runQuery<T>(sql, params);
+  }
+
+  /**
+   * Execute a statement that doesn't return rows. Waits for a transaction in
+   * flight to finish, like {@link query}.
+   */
+  async execute(sql: string, params?: unknown[]): Promise<ExecuteResult> {
+    await this.idle();
+    return this.runExecute(sql, params);
+  }
+
+  /** Resolves once no transaction is in flight (sql.js calls are synchronous after that). */
+  private async idle(): Promise<void> {
+    for (let tail = this.txTail; ; tail = this.txTail) {
+      await tail;
+      if (tail === this.txTail) return;
+    }
+  }
+
+  private runQuery<T>(sql: string, params?: unknown[]): T[] {
     const stmt = this.db.prepare(sql);
     if (params && params.length > 0) {
       stmt.bind(this.convertParams(params));
@@ -93,10 +117,7 @@ export class SqlJsAdapter implements DatabaseClient {
     return results;
   }
 
-  /**
-   * Execute a statement that doesn't return rows
-   */
-  async execute(sql: string, params?: unknown[]): Promise<ExecuteResult> {
+  private runExecute(sql: string, params?: unknown[]): ExecuteResult {
     if (params && params.length > 0) {
       this.db.run(sql, this.convertParams(params));
     } else {
@@ -114,22 +135,42 @@ export class SqlJsAdapter implements DatabaseClient {
    * Execute operations within a transaction
    */
   async transaction<T>(fn: (client: DatabaseClient) => Promise<T>): Promise<T> {
-    if (this.inTransaction) {
-      // Already in a transaction, just run the function
-      return fn(this);
-    }
-
-    this.inTransaction = true;
+    // One connection runs one transaction at a time: wait for the one in flight,
+    // so concurrent callers are isolated from each other instead of merged.
+    const previous = this.txTail;
+    let release = () => {};
+    this.txTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    // Statements and nested transactions go through the client handed to `fn`.
+    // (Calling the outer client's `transaction` from inside `fn` would wait for
+    // this transaction to end, and so never run.)
+    const tx: DatabaseClient = {
+      query: async (sql, params) => this.runQuery(sql, params),
+      execute: async (sql, params) => this.runExecute(sql, params),
+      transaction: (inner) => inner(tx),
+      close: async () => {},
+    };
     try {
       this.db.run("BEGIN TRANSACTION");
-      const result = await fn(this);
+    } catch (error) {
+      release();
+      throw error;
+    }
+    try {
+      const result = await fn(tx);
       this.db.run("COMMIT");
       return result;
     } catch (error) {
-      this.db.run("ROLLBACK");
+      try {
+        this.db.run("ROLLBACK");
+      } catch {
+        // Keep the original error; the transaction is gone either way.
+      }
       throw error;
     } finally {
-      this.inTransaction = false;
+      release();
     }
   }
 

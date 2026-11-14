@@ -29,7 +29,8 @@ adapter needs.
 | `KVStore` (type) | The adapter contract: `get`, `set`, `delete`, `has`, `list(prefix)`, `getMany`, `setMany`, `compareAndSwap`, optional `close`. |
 | `MemoryKVAdapter` | `Map`-backed `KVStore`. Copies values in and out. `close()` clears it. |
 | `createKvObjectStores({ kv, prefix? })` | `{ objects, blobs, trees, commits, tags }` with **Git-compatible SHA-1 ids**, stored through a `KvRawStore`. |
-| `KVRefStore` | `Refs` on a `KVStore`: direct and symbolic refs, compare-and-swap. |
+| `KVRefStore` | `Refs` on a `KVStore`: direct and symbolic refs, atomic batches. All refs live in one root value, so every write is one `compareAndSwap`. |
+| `CorruptRefRootError` | Thrown when the refs root is not a JSON object of strings. |
 | `KVStaging` | `Staging` (the index) on a `KVStore`. |
 | `KVCommitStore`, `KVTreeStore`, `KVTagStore` | JSON-serialized `Commits` / `Trees` / `Tags` with scan-based queries. **Ids are not Git ids** (see Internals). |
 | `KvRawStore`, `createKvRawStore(kv, prefix?)` | `RawStorage` (key to bytes) on a `KVStore`. |
@@ -85,13 +86,14 @@ objects::raw:ce013625...      objects::size:ce013625...   (blob)
 objects::raw:853694aa...      objects::size:853694aa...   (tree)
 objects::raw:8b459a2e...      objects::size:8b459a2e...   (commit)
 staging:README.md<NUL>0
-ref:refs/heads/main
-ref:HEAD
+ref:root
 ```
+
+`ref:root` holds every ref as one JSON object in git's name order, `{ "HEAD": "ref: refs/heads/main", "refs/heads/main": "<id>" }`. A KV store offers compare-and-swap on one key only, so this is how a batch of ref updates (`refs.batch([...])`) applies all-or-nothing: the store reads the root, checks the batch against it, and writes it back only if the root still holds the bytes it read, re-reading and re-checking after a lost race. The cost is one rewrite of the root per write, and one parse of it per read when it has changed since the last read (the decoded root is cached while its bytes stay the same): 10,000 refs take about 760 KB, about 18 ms per write and 8 ms per read after a change. A root that is not a JSON object of strings is refused with `CorruptRefRootError` and never overwritten. A store written in the earlier layout (one `ref:<name>` key per ref) is refused with an error rather than shown empty.
 
 ### Writing an adapter
 
-Implement `KVStore`. `compareAndSwap` must be atomic in your backend; `KVRefStore` relies on it.
+Implement `KVStore`. `compareAndSwap` must be atomic in your backend; `KVRefStore` relies on it for every ref write.
 A sketch for IndexedDB, with one object store whose keys are the strings above:
 
 ```ts

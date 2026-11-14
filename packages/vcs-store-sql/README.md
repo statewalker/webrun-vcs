@@ -40,7 +40,7 @@ Typical setup:
 | `initializeSchema(db)`, `getSchemaVersion(db)`, `rollbackMigration(db, version)`, `migrations` | Versioned schema (currently version 4). |
 | `createSqlNativeStores(db)` | `{ commits, trees, blobs, tags }` in normalized tables with **Git-compatible SHA-1 ids** and query methods. |
 | `SqlNativeCommitStoreImpl`, `SqlNativeTreeStoreImpl`, `SqlNativeBlobStoreImpl`, `SqlNativeTagStoreImpl` | The classes behind `createSqlNativeStores`. |
-| `SQLRefStore` | `Refs` in table `vcs_ref`. |
+| `SQLRefStore` | `Refs` in table `vcs_ref`; a batch of ref updates is planned and written in one transaction. |
 | `SQLStaging` | `Staging` (the index) in table `staging_entry`. |
 | `SQLCommitStore`, `SQLTreeStore`, `SQLTagStore` | Same tables as the native stores, but ids from FNV-1a, **not Git ids** (see Internals). |
 | `createSqlObjectStores({ db, tableName? })` | `{ objects, blobs, trees, commits, tags }`: Git-format bytes in one key/value table (default `raw_objects`), Git ids, no query methods. |
@@ -169,11 +169,17 @@ class MyClient implements DatabaseClient {
     return { lastInsertRowId: 0, changes: 0 };
   }
   async transaction<T>(fn: (client: DatabaseClient) => Promise<T>): Promise<T> {
-    /* BEGIN; const r = await fn(this); COMMIT; return r  (ROLLBACK on throw) */
+    /* wait for the transaction in flight; BEGIN; const r = await fn(tx); COMMIT; return r
+       (ROLLBACK on throw); tx.transaction(inner) joins this transaction */
   }
   async close() {}
 }
 ```
+
+`transaction` must isolate concurrent callers: on a single connection, queue a transaction behind
+the one in flight rather than running it inside it, and make plain `query` / `execute` wait for it
+too (`SqlJsAdapter` does both). Atomic ref batches depend on it. Inside `fn`, use only the client
+it is given: calling the outer client from there waits for the transaction to end, and hangs.
 
 The SQL the stores issue is SQLite dialect (`INSERT OR REPLACE`, `AUTOINCREMENT`, recursive CTEs
 for ancestry), so a client for another engine has to accept it.

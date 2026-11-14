@@ -1,7 +1,12 @@
 /**
- * KV-based Refs implementation
+ * KV-based Refs implementation.
  *
- * Stores Git references using a key-value backend with JSON serialization.
+ * A KV store offers compare-and-swap on one key only, so every ref lives in one
+ * root value (JSON `{ name: id | "ref: target" }`, sorted in git's order) and
+ * every write, a whole batch included, is one compare-and-swap of that value:
+ * read the snapshot, plan against it, write it back only if the root still holds
+ * the bytes read. On a lost race the write re-reads and re-plans, since other
+ * refs may have moved without touching this batch's.
  */
 
 import type {
@@ -10,219 +15,254 @@ import type {
   ObjectId,
   Ref,
   RefCommand,
+  RefEntry,
   Refs,
   RefUpdateResult,
   SymbolicRef,
 } from "@statewalker/vcs-core";
-import { batchBySingleRef, RefStorage } from "@statewalker/vcs-core";
+import { compareRefNames, planRefBatch, RefStorage } from "@statewalker/vcs-core";
 import type { KVStore } from "./kv-store.js";
 
-/**
- * Key prefix for ref data
- */
-const REF_PREFIX = "ref:";
+/** The key holding all refs. */
+const ROOT_KEY = "ref:root";
+/** Symbolic refs are stored as "ref: <target>", as in git's loose ref files. */
+const SYMREF_PREFIX = "ref: ";
+/** Follow at most this many refs along a symbolic chain (git's read limit). */
+const MAX_SYMREF_READS = 5;
+/** Give up after this many lost races and report the batch as locked. */
+const MAX_ATTEMPTS = 100;
 
-/**
- * Maximum depth for following symbolic refs to prevent infinite loops.
- */
-const MAX_SYMBOLIC_REF_DEPTH = 100;
+type Snapshot = Map<string, string>;
 
-/**
- * Serialized ref format
- */
-interface SerializedRef {
-  // Direct ref
-  oid?: string; // objectId
-  p?: string; // peeled
-  // Symbolic ref
-  t?: string; // target
-}
-
-/**
- * Text encoder/decoder for JSON serialization
- */
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** Thrown when the root value is not a JSON object of strings; it is never overwritten. */
+export class CorruptRefRootError extends Error {
+  constructor(detail: string) {
+    super(`corrupt ref root (${ROOT_KEY}): ${detail}`);
+    this.name = "CorruptRefRootError";
+  }
+}
+
+function decode(bytes: Uint8Array | undefined): Snapshot {
+  if (!bytes) return new Map();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoder.decode(bytes));
+  } catch (e) {
+    throw new CorruptRefRootError(e instanceof Error ? e.message : String(e));
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new CorruptRefRootError("not a JSON object");
+  }
+  const refs: Snapshot = new Map();
+  for (const [name, value] of Object.entries(parsed)) {
+    if (typeof value !== "string")
+      throw new CorruptRefRootError(`value of ${name} is not a string`);
+    refs.set(name, value);
+  }
+  return refs;
+}
+
+function encode(refs: Snapshot): Uint8Array {
+  // fromEntries defines own properties, so even a name like "__proto__" survives.
+  const sorted = [...refs.keys()].sort(compareRefNames);
+  return encoder.encode(JSON.stringify(Object.fromEntries(sorted.map((n) => [n, refs.get(n)]))));
+}
+
+function sameBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function toRef(name: string, value: string | undefined): Ref | SymbolicRef | undefined {
+  if (value === undefined) return undefined;
+  if (value.startsWith(SYMREF_PREFIX)) {
+    return { name, target: value.slice(SYMREF_PREFIX.length), storage: RefStorage.LOOSE };
+  }
+  return { name, objectId: value, storage: RefStorage.LOOSE, peeled: false };
+}
+
 /**
- * KV-based Refs implementation.
+ * KV-based Refs: all refs in one root value, every write one compare-and-swap.
+ *
+ * @example
+ * ```typescript
+ * const refs = new KVRefStore(new MemoryKVAdapter());
+ * await refs.batch([
+ *   { name: "refs/heads/main", old: null, new: commitId },
+ *   { name: "refs/tags/v1", old: null, new: tagId },
+ * ]);
+ * ```
  */
 export class KVRefStore implements Refs {
+  /** The last root read and its decoded refs: reused while the bytes are unchanged. */
+  private cache: { bytes: Uint8Array; refs: Snapshot } | undefined;
+
   constructor(private kv: KVStore) {}
 
+  /** Read the root. The returned map is a private copy the caller may change. */
+  private async read(): Promise<{ bytes: Uint8Array | undefined; refs: Snapshot }> {
+    const bytes = await this.kv.get(ROOT_KEY);
+    if (!bytes) {
+      await this.checkNoOldLayout();
+      return { bytes, refs: new Map() };
+    }
+    if (!this.cache || !sameBytes(this.cache.bytes, bytes)) {
+      this.cache = { bytes: new Uint8Array(bytes), refs: decode(bytes) };
+    }
+    return { bytes, refs: new Map(this.cache.refs) };
+  }
+
   /**
-   * Interim: a single command through {@link compareAndSwap}; several commands
-   * are refused as "not-atomic" until this store applies batches atomically.
+   * Stores written before the root layout kept one `ref:<name>` key per ref.
+   * Refuse them rather than show an empty store that writes would fork.
+   */
+  private async checkNoOldLayout(): Promise<void> {
+    for await (const key of this.kv.list("ref:")) {
+      if (key !== ROOT_KEY) {
+        throw new Error(
+          `KVRefStore: found ${key} in the old one-key-per-ref layout; this store keeps all refs in ${ROOT_KEY}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Apply `change` to the snapshot and write it with one compare-and-swap,
+   * retrying on a lost race. `change` returns the result, or `undefined` to
+   * write nothing.
+   */
+  private async update<T>(
+    change: (refs: Snapshot) => Promise<{ result: T; write: boolean }>,
+    locked: () => T,
+  ): Promise<T> {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const { bytes, refs } = await this.read();
+      const { result, write } = await change(refs);
+      if (!write) return result;
+      if (await this.kv.compareAndSwap(ROOT_KEY, bytes, encode(refs))) return result;
+      // Lost the race: back off briefly, re-read and re-check.
+      await new Promise((r) => setTimeout(r, Math.random() * Math.min(2 ** attempt, 20)));
+    }
+    return locked();
+  }
+
+  async get(refName: string): Promise<Ref | SymbolicRef | undefined> {
+    return toRef(refName, (await this.read()).refs.get(refName));
+  }
+
+  async resolve(refName: string): Promise<Ref | undefined> {
+    const { refs } = await this.read();
+    let name = refName;
+    for (let i = 0; i < MAX_SYMREF_READS; i++) {
+      const ref = toRef(name, refs.get(name));
+      if (!ref) return undefined;
+      if (!("target" in ref)) return ref;
+      name = ref.target;
+    }
+    throw new Error(`Symbolic ref chain too deep (more than ${MAX_SYMREF_READS} refs)`);
+  }
+
+  async has(refName: string): Promise<boolean> {
+    return (await this.read()).refs.has(refName);
+  }
+
+  async *list(prefix?: string): AsyncIterable<RefEntry> {
+    const { refs } = await this.read();
+    for (const name of [...refs.keys()].sort(compareRefNames)) {
+      if (prefix && !name.startsWith(prefix)) continue;
+      const ref = toRef(name, refs.get(name));
+      if (ref) yield ref;
+    }
+  }
+
+  async set(refName: string, objectId: ObjectId): Promise<void> {
+    await this.update(
+      async (refs) => {
+        refs.set(refName, objectId);
+        return { result: undefined, write: true };
+      },
+      () => {
+        throw new Error(`Could not update ${refName}: too many concurrent writers`);
+      },
+    );
+  }
+
+  async setSymbolic(refName: string, target: string): Promise<void> {
+    await this.update(
+      async (refs) => {
+        refs.set(refName, `${SYMREF_PREFIX}${target}`);
+        return { result: undefined, write: true };
+      },
+      () => {
+        throw new Error(`Could not update ${refName}: too many concurrent writers`);
+      },
+    );
+  }
+
+  async remove(refName: string): Promise<boolean> {
+    return this.update(
+      async (refs) => {
+        const existed = refs.delete(refName);
+        return { result: existed, write: existed };
+      },
+      () => {
+        throw new Error(`Could not remove ${refName}: too many concurrent writers`);
+      },
+    );
+  }
+
+  /**
+   * Apply all commands atomically, or none (see {@link Refs.batch}): one
+   * compare-and-swap of the root value. Reflogs are not kept yet, so `options`
+   * is ignored.
    */
   batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
-    return batchBySingleRef(this, commands);
+    return this.update<BatchResult>(
+      async (refs) => {
+        const plan = await planRefBatch(commands, {
+          read: (name) => toRef(name, refs.get(name)),
+          hasChildren: (name) => {
+            const prefix = `${name}/`;
+            for (const key of refs.keys()) if (key.startsWith(prefix)) return true;
+            return false;
+          },
+        });
+        if (!plan.ok) return { result: { ok: false, rejected: plan.rejected }, write: false };
+        for (const u of plan.updates) {
+          if (u.newValue === null) refs.delete(u.name);
+          else refs.set(u.name, u.newValue);
+        }
+        return { result: { ok: true, rejected: [] }, write: plan.updates.length > 0 };
+      },
+      () => ({
+        ok: false,
+        rejected: commands.map((c) => ({ name: c.name, reason: "locked" as const })),
+      }),
+    );
   }
 
-  /**
-   * Read a ref by exact name.
-   */
-  async get(refName: string): Promise<Ref | SymbolicRef | undefined> {
-    const data = await this.kv.get(`${REF_PREFIX}${refName}`);
-    if (!data) {
-      return undefined;
-    }
-
-    const s: SerializedRef = JSON.parse(decoder.decode(data));
-
-    if (s.t != null) {
-      return {
-        name: refName,
-        target: s.t,
-        storage: RefStorage.LOOSE,
-      } as SymbolicRef;
-    }
-
-    return {
-      name: refName,
-      objectId: s.oid,
-      storage: RefStorage.LOOSE,
-      peeled: s.p != null,
-      peeledObjectId: s.p,
-    } as Ref;
-  }
-
-  /**
-   * Resolve a ref to its final object ID (follows symbolic refs).
-   */
-  async resolve(refName: string): Promise<Ref | undefined> {
-    let current = refName;
-    let depth = 0;
-
-    while (depth < MAX_SYMBOLIC_REF_DEPTH) {
-      const data = await this.kv.get(`${REF_PREFIX}${current}`);
-      if (!data) {
-        return undefined;
-      }
-
-      const s: SerializedRef = JSON.parse(decoder.decode(data));
-
-      if (s.t == null) {
-        // Direct ref
-        return {
-          name: current,
-          objectId: s.oid,
-          storage: RefStorage.LOOSE,
-          peeled: s.p != null,
-          peeledObjectId: s.p,
-        } as Ref;
-      }
-
-      // Follow symbolic ref
-      current = s.t;
-      depth++;
-    }
-
-    throw new Error(`Symbolic ref chain too deep (> ${MAX_SYMBOLIC_REF_DEPTH})`);
-  }
-
-  /**
-   * Check if a ref exists.
-   */
-  async has(refName: string): Promise<boolean> {
-    return this.kv.has(`${REF_PREFIX}${refName}`);
-  }
-
-  /**
-   * List all refs matching a prefix.
-   */
-  async *list(prefix?: string): AsyncIterable<Ref | SymbolicRef> {
-    const fullPrefix = `${REF_PREFIX}${prefix || ""}`;
-
-    for await (const key of this.kv.list(REF_PREFIX)) {
-      if (prefix && !key.startsWith(fullPrefix)) {
-        continue;
-      }
-
-      const refName = key.slice(REF_PREFIX.length);
-      const ref = await this.get(refName);
-      if (ref) {
-        yield ref;
-      }
-    }
-  }
-
-  /**
-   * Set a ref to point to an object ID.
-   */
-  async set(refName: string, objectId: ObjectId): Promise<void> {
-    const serialized: SerializedRef = { oid: objectId };
-    await this.kv.set(`${REF_PREFIX}${refName}`, encoder.encode(JSON.stringify(serialized)));
-  }
-
-  /**
-   * Set a symbolic ref.
-   */
-  async setSymbolic(refName: string, target: string): Promise<void> {
-    const serialized: SerializedRef = { t: target };
-    await this.kv.set(`${REF_PREFIX}${refName}`, encoder.encode(JSON.stringify(serialized)));
-  }
-
-  /**
-   * Remove a ref.
-   */
-  async remove(refName: string): Promise<boolean> {
-    return this.kv.delete(`${REF_PREFIX}${refName}`);
-  }
-
-  /**
-   * Compare-and-swap update (for concurrent safety).
-   */
   async compareAndSwap(
     refName: string,
     expectedOld: ObjectId | undefined,
     newValue: ObjectId,
   ): Promise<RefUpdateResult> {
-    const resolved = await this.resolve(refName);
-    const currentValue = resolved?.objectId;
-
-    if (currentValue !== expectedOld) {
-      return {
-        success: false,
-        previousValue: currentValue,
-        errorMessage: expectedOld
-          ? `Expected ${expectedOld}, found ${currentValue ?? "nothing"}`
-          : `Ref already exists with value ${currentValue}`,
-      };
-    }
-
-    // Use KV compare-and-swap for atomicity
-    const expected = expectedOld ? encoder.encode(JSON.stringify({ oid: expectedOld })) : undefined;
-    const newData = encoder.encode(JSON.stringify({ oid: newValue }));
-
-    const success = await this.kv.compareAndSwap(`${REF_PREFIX}${refName}`, expected, newData);
-
-    if (success) {
-      return {
-        success: true,
-        previousValue: expectedOld,
-      };
-    }
-
-    // CAS failed, get current value for error message
-    const current = await this.resolve(refName);
+    const r = await this.batch([{ name: refName, old: expectedOld ?? null, new: newValue }]);
+    if (r.ok) return { success: true, previousValue: expectedOld };
     return {
       success: false,
-      previousValue: current?.objectId,
-      errorMessage: "Concurrent modification detected",
+      previousValue: (await this.resolve(refName))?.objectId,
+      errorMessage: r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", "),
     };
   }
 
-  /**
-   * Initialize storage structure (no-op for KV).
-   */
-  async initialize(): Promise<void> {
-    // No initialization needed
-  }
+  /** Initialize storage structure (no-op for KV). */
+  async initialize(): Promise<void> {}
 
-  /**
-   * Perform implementation-specific optimizations (no-op for KV).
-   */
-  async optimize(): Promise<void> {
-    // No optimization needed
-  }
+  /** Perform implementation-specific optimizations (no-op for KV). */
+  async optimize(): Promise<void> {}
 }
