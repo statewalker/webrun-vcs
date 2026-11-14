@@ -10,6 +10,7 @@ import { joinPath, sweepPackTemporaries } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 
 import { listReachableObjects } from "./reachable-objects.js";
+import { createFilesRefOps } from "./refs/index.js";
 import {
   DEFAULT_PRUNE_EXPIRE_MS,
   type PackSnapshot,
@@ -55,6 +56,7 @@ export interface GcOptions {
   pruneExpireMs?: number;
   /**
    * Remove `tmp_obj_*` and `objects/pack/tmp_*` temporaries (left by a crashed write), and
+   * (whatever its age, when `packed-refs.lock` is free) a `packed-refs.new`, and
    * `.pack` files whose `.idx` is gone (a crash while a pack was removed; see
    * `orphanPackExpiryMs`), older than this, as `git prune` does (default: two weeks). Not done in
    * a dry run.
@@ -114,7 +116,7 @@ export interface GcResult {
  *    Unreachable objects of the deleted packs are written loose first, unless their pack is
  *    older than `pruneExpireMs` (`git repack -A -d --unpack-unreachable`).
  * 5. Prunes the unreachable loose objects older than `pruneExpireMs`.
- * 6. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`) and `.pack` files without
+ * 6. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`, `packed-refs.new`) and `.pack` files without
  *    an `.idx`.
  *
  * The lock excludes gcs in other processes when the FilesApi has `createExclusive`, and
@@ -241,6 +243,10 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const packDir = joinPath(objectsDir, "pack");
     removedTemporaries += await filesStagingStore(files, objectsDir).sweepStaged(tmpExpiryMs);
     removedTemporaries += (await sweepPackTemporaries(files, packDir, tmpExpiryMs)).length;
+    // packed-refs.new is written only under packed-refs.lock: stale whenever the lock is free
+    removedTemporaries += await createFilesRefOps(
+      atomicFilesOver(files, gitDir),
+    ).sweepTemporaries();
     const orphanExpiry =
       options.orphanPackExpiryMs ?? Math.max(tmpExpiryMs, ORPHAN_PACK_MIN_AGE_MS);
     removedOrphanPacks = await sweepOrphanPacks(files, packDir, orphanExpiry);

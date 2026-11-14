@@ -56,3 +56,21 @@ describe("gc removes stale temporaries, as git prune does", () => {
     }
   });
 });
+
+describe("gc removes a stale packed-refs.new", () => {
+  it("removes packed-refs.new under packed-refs.lock, and leaves it while the lock is held", async () => {
+    const files = createInMemoryFilesApi();
+    const backend = await createGitFilesBackend({ files, create: true });
+    const tmp = ".git/packed-refs.new";
+    await files.write(tmp, [new TextEncoder().encode("partial")]);
+    await files.write(".git/packed-refs.lock", [new Uint8Array(0)]);
+    await gc({ history: backend.history, files, packRefs: false, repack: false });
+    expect(await files.exists(tmp)).toBe(true); // another writer's, in flight
+
+    await files.remove(".git/packed-refs.lock");
+    const result = await gc({ history: backend.history, files, packRefs: false, repack: false });
+    expect(result.removedTemporaries).toBe(1);
+    expect(await files.exists(tmp)).toBe(false);
+    expect(await files.exists(".git/packed-refs.lock")).toBe(false);
+  });
+});

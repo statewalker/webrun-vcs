@@ -155,3 +155,54 @@ describe("packRefs next to native git", () => {
     expect(gitTry(dir, ["fsck", "--strict", "--no-dangling"]).status).toBe(0);
   });
 });
+
+describe("a delete keeps packed-refs.lock until its loose file is gone", () => {
+  it("native git sees our packed-refs.lock between the packed-refs rename and the loose removal", async () => {
+    const dir = newRepo();
+    git(dir, ["update-ref", "refs/heads/packed", "HEAD"]); // loose over its packed copy
+    const head = git(dir, ["rev-parse", "HEAD"]);
+    const base = createNodeFilesApi({ rootDir: dir });
+    let release: () => void = () => {};
+    const released = new Promise<void>((r) => {
+      release = r;
+    });
+    let paused: () => void = () => {};
+    const reached = new Promise<void>((r) => {
+      paused = r;
+    });
+    let armed = true;
+    // pause once, right after packed-refs is renamed into place
+    const files = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "move") {
+          return async (source: string, dest: string) => {
+            const r = await target.move(source, dest);
+            if (armed && dest.endsWith("packed-refs")) {
+              armed = false;
+              paused();
+              await released;
+            }
+            return r;
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as FilesApi;
+    const del = storeFor(dir, files).batch([{ name: "refs/heads/packed", old: head, new: null }]);
+    await reached;
+    expect(existsSync(join(dir, ".git/packed-refs.lock"))).toBe(true);
+    expect(readFileSync(join(dir, ".git/packed-refs"), "utf8")).not.toContain("refs/heads/packed");
+    // the loose file still shadows nothing stale: git reads the ref's loose value
+    expect(git(dir, ["rev-parse", "refs/heads/packed"])).toBe(head);
+    const pack = gitTry(dir, ["-c", "core.packedRefsTimeout=0", "pack-refs", "--all"]);
+    expect(pack.status).not.toBe(0);
+    expect(pack.stderr).toContain("packed-refs.lock");
+    release();
+    expect(await del).toEqual({ ok: true, rejected: [] });
+    expect(existsSync(join(dir, ".git/packed-refs.lock"))).toBe(false);
+    expect(existsSync(join(dir, ".git/packed-refs.new"))).toBe(false);
+    expect(gitTry(dir, ["rev-parse", "--verify", "-q", "refs/heads/packed"]).status).not.toBe(0);
+    expect(gitTry(dir, ["fsck", "--strict", "--no-dangling"]).status).toBe(0);
+  });
+});

@@ -15,11 +15,12 @@ import {
   joinPath,
   openPackSet,
 } from "@statewalker/vcs-core";
-import type { AtomicFiles } from "@statewalker/vcs-utils/files";
+import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
 import { skipPacked, withPacks } from "./pack/with-packs.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
+import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
 
 /**
  * Options for creating a file-backed Git storage backend.
@@ -50,6 +51,14 @@ export interface GitFilesBackendOptions {
    * concurrent gc keeps it. Passed to `openPackSet` and `filesStagingStore`.
    */
   freshenMaxAgeMs?: number;
+  /**
+   * Which refs get a new reflog (git: core.logAllRefUpdates). Read from the repository's
+   * config when omitted: `core.logAllRefUpdates`, else `true` for a non-bare repository
+   * and `false` for a bare one (`core.bare`), as git.
+   */
+  logAllRefUpdates?: boolean | "always";
+  /** Reflog name and email; read from `user.name` / `user.email` in the config when omitted. */
+  reflogIdentity?: { name: string; email: string };
 }
 
 /**
@@ -121,10 +130,13 @@ export async function createGitFilesBackend(
   });
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);
+  const reflog = await readReflogConfig(files, gitDir);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
     refLockTimeoutMs: options.refLockTimeoutMs,
     packedLockTimeoutMs: options.packedLockTimeoutMs,
+    logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
+    reflogIdentity: options.reflogIdentity ?? reflog.identity,
   });
 
   const history = createHistoryFromComponents({
@@ -134,6 +146,47 @@ export async function createGitFilesBackend(
   });
 
   return { history, objects, packs, looseStorage, files, gitDir };
+}
+
+/** A git boolean as the config parser returns it (`""` and `0` are false); else undefined. */
+function gitBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (value === "") return false;
+  return undefined;
+}
+
+/**
+ * The reflog settings of the repository's config, as git reads them: core.logAllRefUpdates
+ * (a boolean or "always"), defaulting to true unless core.bare is true; user.name and
+ * user.email for the reflog identity (each defaulting to webrun-vcs <vcs@localhost>).
+ */
+async function readReflogConfig(
+  files: FilesApi,
+  gitDir: string,
+): Promise<{
+  logAllRefUpdates: boolean | "always";
+  identity?: { name: string; email: string };
+}> {
+  const config = await createWorkingCopyConfig(
+    {
+      read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
+      write: (path, content) => files.write(path, [content]),
+    },
+    gitDir,
+  );
+  const setting = config.get("core.logAllRefUpdates");
+  const logAllRefUpdates =
+    typeof setting === "string" && setting.toLowerCase() === "always"
+      ? "always"
+      : (gitBoolean(setting) ?? !(gitBoolean(config.get("core.bare")) ?? false));
+  const name = config.get("user.name");
+  const email = config.get("user.email");
+  const identity =
+    name !== undefined || email !== undefined
+      ? { name: String(name ?? "webrun-vcs"), email: String(email ?? "vcs@localhost") }
+      : undefined;
+  return { logAllRefUpdates, identity };
 }
 
 /**

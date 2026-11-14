@@ -384,3 +384,194 @@ describe("packed-refs rewrites keep peel lines under a sorted-only header", () =
     });
   });
 });
+
+/** Counts the packed-refs.lock files `base` creates, and runs `onRemove` before each remove. */
+function watched(
+  base: FilesApi,
+  hooks: {
+    onLock?: () => void;
+    onRemove?: (path: string) => Promise<void>;
+    afterMove?: (source: string, dest: string) => Promise<void>;
+  },
+): FilesApi {
+  return new Proxy(base, {
+    get(target, prop) {
+      if (prop === "createExclusive" && target.createExclusive) {
+        return async (path: string, ...rest: unknown[]) => {
+          // biome-ignore lint/suspicious/noExplicitAny: forwarding the FilesApi call
+          const r = await (target.createExclusive as any).call(target, path, ...rest);
+          if (r && path === LOCK) hooks.onLock?.();
+          return r;
+        };
+      }
+      if (prop === "write") {
+        return async (path: string, ...rest: unknown[]) => {
+          if (path === LOCK && !(await target.exists(path))) hooks.onLock?.();
+          // biome-ignore lint/suspicious/noExplicitAny: forwarding the FilesApi call
+          return (target.write as any).call(target, path, ...rest);
+        };
+      }
+      if (prop === "remove") {
+        return async (path: string) => {
+          await hooks.onRemove?.(path);
+          return target.remove(path);
+        };
+      }
+      if (prop === "move") {
+        return async (source: string, dest: string) => {
+          const r = await target.move(source, dest);
+          await hooks.afterMove?.(source, dest);
+          return r;
+        };
+      }
+      const v = Reflect.get(target, prop);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+}
+
+describe("a packed-refs commit keeps packed-refs.lock until the caller is done", () => {
+  it("a delete that races packRefs takes packed-refs.lock once and removes the loose file under it", async () => {
+    const base = await repo();
+    const writer = new FileRefStore(base, "/.git");
+    await writer.batch([{ name: "refs/heads/x", new: oid(1) }]);
+    await writer.batch([
+      { name: "refs/heads/p", new: oid(2) },
+      { name: "refs/heads/q", new: oid(3) },
+    ]);
+    let locks = 0;
+    let lockHeldAtLooseRemoval: boolean | undefined;
+    const deleter = new FileRefStore(
+      watched(base, {
+        onLock: () => locks++,
+        onRemove: async (path) => {
+          if (path === "/.git/refs/heads/x") lockHeldAtLooseRemoval = await base.exists(LOCK);
+        },
+      }),
+      "/.git",
+    );
+    const g = gate();
+    const packer = gated(base, g, { readPath: "/.git/refs/heads/x" });
+
+    const pack = packRefs(packer, "/.git", ["refs/heads/x"], false);
+    await g.hit; // packRefs holds packed-refs.lock and is about to pack x
+    const del = deleter.batch([{ name: "refs/heads/x", old: oid(1), new: null }]);
+    await new Promise((r) => setTimeout(r, 30));
+    g.open();
+    await pack;
+    expect(await del).toEqual({ ok: true, rejected: [] });
+
+    expect(locks).toBe(1); // one pass: no re-take after the packed-refs rewrite
+    expect(lockHeldAtLooseRemoval).toBe(true);
+    expect(await writer.has("refs/heads/x")).toBe(false);
+    expect(await text(base, PACKED)).not.toContain("refs/heads/x");
+    expect(await base.exists(LOCK)).toBe(false);
+  });
+
+  it("renames a complete temporary over packed-refs while packed-refs.lock is still held", async () => {
+    const base = await repo();
+    const writer = new FileRefStore(base, "/.git");
+    await writer.batch([
+      { name: "refs/heads/p", new: oid(1) },
+      { name: "refs/heads/q", new: oid(2) },
+    ]);
+    const renames: { source: string; lockHeld: boolean; content?: string }[] = [];
+    const refs = new FileRefStore(
+      watched(base, {
+        afterMove: async (source, dest) => {
+          if (dest === PACKED) {
+            renames.push({
+              source,
+              lockHeld: await base.exists(LOCK),
+              content: await text(base, PACKED),
+            });
+          }
+        },
+      }),
+      "/.git",
+    );
+    expect(await refs.batch([{ name: "refs/heads/p", old: oid(1), new: null }])).toEqual({
+      ok: true,
+      rejected: [],
+    });
+    await refs.remove("refs/heads/q");
+    expect(renames.length).toBeGreaterThan(0);
+    for (const r of renames) {
+      expect(r.source).toBe("/.git/packed-refs.new");
+      expect(r.lockHeld).toBe(true);
+      expect(r.content?.startsWith("# pack-refs with:")).toBe(true);
+    }
+    expect(await base.exists(LOCK)).toBe(false);
+    expect(await base.exists("/.git/packed-refs.new")).toBe(false);
+  });
+
+  it("a multi-ref batch keeps packed-refs.lock across both phases", async () => {
+    const base = await repo();
+    const writer = new FileRefStore(base, "/.git");
+    await writer.batch([{ name: "refs/heads/a", new: oid(1) }]);
+    let locks = 0;
+    const refs = new FileRefStore(watched(base, { onLock: () => locks++ }), "/.git");
+    expect(
+      await refs.batch([
+        { name: "refs/heads/a", old: oid(1), new: oid(5) },
+        { name: "refs/heads/b", old: null, new: oid(6) },
+      ]),
+    ).toEqual({ ok: true, rejected: [] });
+    expect(locks).toBe(1);
+    expect((await writer.resolve("refs/heads/a"))?.objectId).toBe(oid(5));
+    expect((await writer.resolve("refs/heads/b"))?.objectId).toBe(oid(6));
+    expect(await base.exists("/.git/refs/heads/a")).toBe(false);
+  });
+
+  it("a stale packed-refs.new left by a crash neither confuses readers nor blocks a rewrite", async () => {
+    const files = await repo();
+    const refs = new FileRefStore(files, "/.git");
+    await refs.batch([
+      { name: "refs/heads/p", new: oid(1) },
+      { name: "refs/heads/q", new: oid(2) },
+    ]);
+    await files.write("/.git/packed-refs.new", [new TextEncoder().encode("garbage\n")]);
+    expect((await refs.resolve("refs/heads/p"))?.objectId).toBe(oid(1));
+    expect(await refs.remove("refs/heads/p")).toBe(true);
+    expect((await refs.resolve("refs/heads/q"))?.objectId).toBe(oid(2));
+    expect(await refs.has("refs/heads/p")).toBe(false);
+    expect(await files.exists("/.git/packed-refs.new")).toBe(false);
+  });
+});
+
+describe("a failed write of packed-refs.new", () => {
+  /** A view of `base` whose write of `path` lands half the bytes, then fails (ENOSPC). */
+  function failingWrite(base: FilesApi, path: string): FilesApi {
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === "write") {
+          return async (p: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>) => {
+            if (p !== path) return target.write(p, content);
+            const chunks: Uint8Array[] = [];
+            for await (const c of content) chunks.push(c);
+            const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+            let at = 0;
+            for (const c of chunks) {
+              all.set(c, at);
+              at += c.length;
+            }
+            await target.write(p, [all.subarray(0, Math.floor(all.length / 2))]);
+            throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  }
+
+  it("leaves no partial packed-refs.new behind", async () => {
+    const files = await repo();
+    await new FileRefStore(files, "/.git").batch([{ name: "refs/heads/a", new: oid(1) }]);
+    const refs = new FileRefStore(failingWrite(files, "/.git/packed-refs.new"), "/.git");
+    await expect(refs.packRefs([], { all: true })).rejects.toThrow(/ENOSPC/);
+    expect(await files.exists("/.git/packed-refs.new")).toBe(false);
+    expect(await files.exists(LOCK)).toBe(false);
+    expect(await text(files, "/.git/refs/heads/a")).toBe(`${oid(1)}\n`);
+  });
+});
