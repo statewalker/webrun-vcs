@@ -28,6 +28,7 @@ import {
 import {
   createFetchHandler,
   createRepositoryFacade,
+  createTransportRefStore,
   type RefStore,
 } from "@statewalker/vcs-transport";
 import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
@@ -204,43 +205,7 @@ function createMockFetch(
  * Create a transport RefStore adapter from a vcs-core Refs.
  */
 function createTransportRefStoreAdapter(refs: Refs): RefStore {
-  return {
-    async get(name: string): Promise<string | undefined> {
-      const ref = await refs.resolve(name);
-      return ref?.objectId;
-    },
-
-    async update(name: string, oid: string): Promise<void> {
-      await refs.set(name, oid);
-    },
-
-    async listAll(): Promise<Iterable<[string, string]>> {
-      const result: Array<[string, string]> = [];
-      for await (const ref of refs.list()) {
-        if (!isSymbolicRef(ref) && ref.objectId) {
-          result.push([ref.name, ref.objectId]);
-        }
-      }
-      return result;
-    },
-
-    async getSymrefTarget(name: string): Promise<string | undefined> {
-      const ref = await refs.get(name);
-      if (ref && isSymbolicRef(ref)) {
-        return ref.target;
-      }
-      return undefined;
-    },
-
-    async isRefTip(oid: string): Promise<boolean> {
-      for await (const ref of refs.list()) {
-        if (!isSymbolicRef(ref) && ref.objectId === oid) {
-          return true;
-        }
-      }
-      return false;
-    },
-  };
+  return createTransportRefStore(refs);
 }
 
 /**

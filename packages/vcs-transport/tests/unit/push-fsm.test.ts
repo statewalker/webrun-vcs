@@ -1,3 +1,4 @@
+import { MemoryRefs } from "@statewalker/vcs-core";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { PackImportResult, RepositoryFacade } from "../../src/api/repository-facade.js";
 import type { PktLineResult, SidebandResult, TransportApi } from "../../src/api/transport-api.js";
@@ -686,5 +687,101 @@ describe("Server Push FSM", () => {
       expect(transport.written).toContain("unpack ok");
       expect(transport.written).toContain("ng refs/heads/main non-fast-forward");
     });
+  });
+});
+
+describe("Server Push FSM: APPLY_UPDATES through an atomic ref batch", () => {
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  const C = "c".repeat(40);
+
+  /** A transport RefStore over vcs-core's MemoryRefs, with batch. */
+  async function batchingStore(seed: Record<string, string>) {
+    const core = new MemoryRefs();
+    for (const [name, oid] of Object.entries(seed)) await core.set(name, oid);
+    const store: RefStore = {
+      async get(name) {
+        return (await core.resolve(name))?.objectId;
+      },
+      async update() {
+        throw new Error("update must not be used when batch is available");
+      },
+      async listAll() {
+        const out: [string, string][] = [];
+        for await (const ref of core.list())
+          if ("objectId" in ref && ref.objectId) out.push([ref.name, ref.objectId]);
+        return out;
+      },
+      batch: (commands) => core.batch(commands),
+    };
+    return { core, store };
+  }
+
+  function contextWith(store: RefStore, commands: PushCommand[], atomic: boolean): ProcessContext {
+    const state = new ProtocolState();
+    if (atomic) state.capabilities.add("atomic");
+    (state as { pushCommands?: PushCommand[] }).pushCommands = commands;
+    return {
+      transport: createMockTransport(),
+      repository: createMockRepository(),
+      refStore: store,
+      state,
+      output: new HandlerOutput(),
+      config: new ProcessConfiguration(),
+    };
+  }
+
+  const cmd = (refName: string, oldOid: string, newOid: string): PushCommand => ({
+    refName,
+    oldOid,
+    newOid,
+    type: oldOid === ZERO_OID ? "CREATE" : newOid === ZERO_OID ? "DELETE" : "UPDATE",
+    result: "NOT_ATTEMPTED",
+  });
+
+  async function apply(context: ProcessContext): Promise<string> {
+    const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+    fsm.setState("APPLY_UPDATES");
+    await fsm.run(context, "RUN_POST_RECEIVE_HOOK", "SEND_STATUS");
+    return fsm.getState();
+  }
+
+  it("applies an atomic push as one batch: update, create and delete together", async () => {
+    const { core, store } = await batchingStore({ "refs/heads/main": A, "refs/heads/old": A });
+    const commands = [
+      cmd("refs/heads/main", A, B),
+      cmd("refs/heads/new", ZERO_OID, C),
+      cmd("refs/heads/old", A, ZERO_OID),
+    ];
+    expect(await apply(contextWith(store, commands, true))).toBe("RUN_POST_RECEIVE_HOOK");
+    expect(commands.map((c) => c.result)).toEqual(["OK", "OK", "OK"]);
+    expect((await core.resolve("refs/heads/main"))?.objectId).toBe(B);
+    expect((await core.resolve("refs/heads/new"))?.objectId).toBe(C);
+    expect(await core.has("refs/heads/old")).toBe(false);
+  });
+
+  it("rejects a whole atomic push when one ref moved since the client read it", async () => {
+    const { core, store } = await batchingStore({ "refs/heads/main": A, "refs/heads/dev": C });
+    const commands = [cmd("refs/heads/main", A, B), cmd("refs/heads/dev", A, B)]; // dev is at C now
+    expect(await apply(contextWith(store, commands, true))).toBe("SEND_STATUS");
+    expect(commands.map((c) => c.result)).toEqual(["ATOMIC_REJECTED", "LOCK_FAILURE"]);
+    expect((await core.resolve("refs/heads/main"))?.objectId).toBe(A);
+    expect((await core.resolve("refs/heads/dev"))?.objectId).toBe(C);
+  });
+
+  it("applies a non-atomic push per ref, checking each old value as git does", async () => {
+    const { core, store } = await batchingStore({ "refs/heads/main": A, "refs/heads/dev": C });
+    const commands = [cmd("refs/heads/main", A, B), cmd("refs/heads/dev", A, B)];
+    expect(await apply(contextWith(store, commands, false))).toBe("RUN_POST_RECEIVE_HOOK");
+    expect(commands.map((c) => c.result)).toEqual(["OK", "LOCK_FAILURE"]);
+    expect((await core.resolve("refs/heads/main"))?.objectId).toBe(B);
+    expect((await core.resolve("refs/heads/dev"))?.objectId).toBe(C);
+  });
+
+  it("refuses to create a ref that appeared meanwhile", async () => {
+    const { store } = await batchingStore({ "refs/heads/new": C });
+    const commands = [cmd("refs/heads/new", ZERO_OID, B)];
+    await apply(contextWith(store, commands, false));
+    expect(commands[0]?.result).toBe("LOCK_FAILURE");
   });
 });

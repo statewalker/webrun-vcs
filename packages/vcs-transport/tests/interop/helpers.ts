@@ -23,6 +23,7 @@ import {
   type SymbolicRef,
 } from "@statewalker/vcs-core";
 import {
+  createTransportRefStore as createCoreTransportRefStore,
   createRepositoryFacade,
   type Duplex,
   type PackImportResult,
@@ -324,42 +325,7 @@ export async function commitInRepo(
   });
 }
 
-function isSymbolicRef(ref: Ref | SymbolicRef): ref is SymbolicRef {
-  return "target" in ref;
-}
-
 /** Adapt a core `Refs` into the transport-layer `RefStore` interface. */
 export function createTransportRefStore(coreRefs: Refs): TransportRefStore {
-  return {
-    async get(name: string): Promise<string | undefined> {
-      const ref = await coreRefs.resolve(name);
-      return ref?.objectId;
-    },
-    async update(name: string, oid: string): Promise<void> {
-      await coreRefs.set(name, oid);
-    },
-    async listAll(): Promise<Iterable<[string, string]>> {
-      const refs: Array<[string, string]> = [];
-      for await (const ref of coreRefs.list()) {
-        if (isSymbolicRef(ref)) {
-          const resolved = await coreRefs.resolve(ref.name);
-          if (resolved?.objectId) refs.push([ref.name, resolved.objectId]);
-        } else if (ref.objectId) {
-          refs.push([ref.name, ref.objectId]);
-        }
-      }
-      return refs;
-    },
-    async getSymrefTarget(name: string): Promise<string | undefined> {
-      const ref = await coreRefs.get(name);
-      if (ref && isSymbolicRef(ref)) return ref.target;
-      return undefined;
-    },
-    async isRefTip(oid: string): Promise<boolean> {
-      for await (const ref of coreRefs.list()) {
-        if (!isSymbolicRef(ref) && ref.objectId === oid) return true;
-      }
-      return false;
-    },
-  };
+  return createCoreTransportRefStore(coreRefs);
 }

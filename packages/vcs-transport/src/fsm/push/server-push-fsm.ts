@@ -11,6 +11,7 @@
  * 7. Send status report
  */
 
+import type { RefCommand } from "@statewalker/vcs-core";
 import {
   getConfig,
   getOutput,
@@ -20,6 +21,7 @@ import {
   getTransport,
   type ProcessContext,
 } from "../../context/context-adapters.js";
+import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
@@ -520,6 +522,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const output = getOutput(ctx);
       try {
         const atomic = state.capabilities.has("atomic");
+        if (refStore.batch) return await applyByBatch(state, refStore.batch.bind(refStore), atomic);
 
         let failedCount = 0;
         const appliedCommands: PushCommand[] = [];
@@ -546,7 +549,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
             // If atomic, abort all
             if (atomic) {
-              // Rollback applied updates (best effort)
+              // Rollback applied updates (best effort; stores with `batch` need none)
               for (const applied of appliedCommands) {
                 try {
                   await refStore.update(applied.refName, applied.oldOid);
@@ -679,4 +682,66 @@ interface ContextWithHooks extends ProcessContext {
     }>;
     postReceive?: (commands: PushCommand[], options?: string[]) => Promise<void>;
   };
+}
+
+/** The batch command for a push command; git's zero id means "absent" on both sides. */
+function toRefCommand(cmd: PushCommand): RefCommand {
+  return {
+    name: cmd.refName,
+    old: cmd.oldOid === ZERO_OID ? null : cmd.oldOid,
+    new: cmd.newOid === ZERO_OID ? null : cmd.newOid,
+  };
+}
+
+/** git's report-status text for a refused ref update. */
+function rejectionMessage(reason: string): string {
+  return reason === "mismatch"
+    ? "failed to update ref (stale info)"
+    : `failed to update ref (${reason})`;
+}
+
+/**
+ * Apply push commands through `refStore.batch`, as git's receive-pack applies
+ * them in a ref transaction: an atomic push is one batch (all refs or none), a
+ * plain push one batch per ref. Each update checks the old value the client
+ * sent, so a ref moved since the advertisement is refused instead of overwritten.
+ */
+async function applyByBatch(
+  state: ServerPushState,
+  batch: NonNullable<RefStore["batch"]>,
+  atomic: boolean,
+): Promise<"UPDATES_APPLIED" | "PARTIAL_APPLIED" | "ATOMIC_FAILED"> {
+  const all = state.pushCommands ?? [];
+  const pending = all.filter((c) => c.result === "NOT_ATTEMPTED");
+  const options = { message: "push" };
+  const applied: PushCommand[] = [];
+  if (atomic) {
+    if (pending.length) {
+      const r = await batch(pending.map(toRefCommand), options);
+      if (!r.ok) {
+        const reasons = new Map(r.rejected.map((x) => [x.name, x.reason]));
+        for (const c of pending) {
+          const reason = reasons.get(c.refName);
+          c.result = reason ? "LOCK_FAILURE" : "ATOMIC_REJECTED";
+          c.message = reason ? rejectionMessage(reason) : "atomic push failed";
+        }
+        return "ATOMIC_FAILED";
+      }
+    }
+    for (const c of pending) c.result = "OK";
+    applied.push(...pending);
+  } else {
+    for (const c of pending) {
+      const r = await batch([toRefCommand(c)], options);
+      if (r.ok) {
+        c.result = "OK";
+        applied.push(c);
+      } else {
+        c.result = "LOCK_FAILURE";
+        c.message = rejectionMessage(r.rejected[0]?.reason ?? "locked");
+      }
+    }
+  }
+  state.appliedCommands = applied;
+  return applied.length === all.length ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
 }

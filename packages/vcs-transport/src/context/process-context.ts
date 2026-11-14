@@ -1,3 +1,4 @@
+import type { BatchOptions, BatchResult, RefCommand } from "@statewalker/vcs-core";
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import type { TransportApi } from "../api/transport-api.js";
 import type { HandlerOutput } from "./handler-output.js";
@@ -11,6 +12,13 @@ import type { ProtocolState } from "./protocol-state.js";
  * Should be implemented by the core RefStore.
  */
 export interface RefStore {
+  /**
+   * Apply ref updates all-or-nothing (vcs-core `Refs.batch`). When present,
+   * receive-pack applies pushes through it: an atomic push is one batch, a
+   * plain push one batch per ref, and every update checks the ref's old value.
+   */
+  batch?(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult>;
+
   /**
    * Gets the object ID for a ref.
    * @param name - Ref name (e.g., "refs/heads/main")
