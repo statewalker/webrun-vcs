@@ -1,8 +1,7 @@
 /** Shared helpers for the xet transfer demo: a mem content-store with a shared
  * chunk-identity hasher, a mem LFS resolver, a putChunk spy, and stream utils. */
 
-import { createHash } from "node:crypto";
-import type { LfsPointer, LfsResolver } from "@statewalker/vcs-transport-lfs";
+import { type LfsPointer, type LfsResolver, sha256Hex } from "@statewalker/vcs-transport-lfs";
 import {
   type ByteStream,
   type ChunkId,
@@ -17,9 +16,8 @@ import { memBlobStore } from "@statewalker/webrun-storage";
  * a bare LFS oid — the resolver genuinely translates between the two id spaces.
  */
 export async function csHash(input: ByteStream): Promise<string> {
-  const h = createHash("sha256");
-  for await (const chunk of input) h.update(chunk);
-  return `cs-sha256:${h.digest("hex")}`;
+  // Web Crypto (portable) has no streaming digest: collect the chunks, hash once.
+  return `cs-sha256:${await sha256Hex(await collect(input))}`;
 }
 
 export function makeStore(): ContentStore {

@@ -5,10 +5,9 @@
  * and FilesAPI for all operations. No low-level API or native git calls.
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type { Git } from "@statewalker/vcs-commands";
 import type { FilesApi, History, ObjectId } from "@statewalker/vcs-core";
+import { joinPath } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 // Initialize compression (required before any storage operations)
@@ -17,10 +16,14 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 // Configuration
 // ============================================================================
 
-export const REPO_DIR = path.join(process.cwd(), "test-workflow-repo");
+/** Name of the demo repository folder, relative to the current directory */
+export const REPO_NAME = "test-workflow-repo";
+/** Absolute path of the demo repository (for display) */
+export const REPO_DIR = joinPath(process.cwd(), REPO_NAME);
 export const GIT_DIR = ".git";
-export const OBJECTS_DIR = path.join(REPO_DIR, GIT_DIR, "objects");
-export const PACK_DIR = path.join(OBJECTS_DIR, "pack");
+/** Paths inside the repository FilesApi (rooted at REPO_DIR) */
+export const OBJECTS_DIR = joinPath(GIT_DIR, "objects");
+export const PACK_DIR = joinPath(OBJECTS_DIR, "pack");
 
 // ============================================================================
 // Shared state between steps
@@ -77,6 +80,12 @@ export function logError(message: string): void {
 // File utilities
 // ============================================================================
 
+/** FilesApi rooted at the current working directory (parent of the repository) */
+export function createWorkspaceFilesApi(): FilesApi {
+  return createNodeFilesApi({ rootDir: process.cwd() });
+}
+
+/** FilesApi rooted at the demo repository */
 export function createFilesApi(): FilesApi {
   return createNodeFilesApi({ rootDir: REPO_DIR });
 }
@@ -116,37 +125,27 @@ export function shortId(id: ObjectId): string {
 // ============================================================================
 
 export async function cleanupRepo(): Promise<void> {
-  try {
-    await fs.rm(REPO_DIR, { recursive: true, force: true });
-  } catch {
-    // Directory doesn't exist
-  }
+  await createWorkspaceFilesApi().remove(REPO_NAME);
+}
+
+/** Create the (empty) repository directory */
+export async function createRepoDir(): Promise<void> {
+  await createWorkspaceFilesApi().mkdir(REPO_NAME);
 }
 
 export async function countLooseObjects(): Promise<{ count: number; objects: string[] }> {
+  const files = createFilesApi();
   const objects: string[] = [];
 
-  try {
-    const fanoutDirs = await fs.readdir(OBJECTS_DIR);
+  for await (const dir of files.list(OBJECTS_DIR)) {
+    if (dir.kind !== "directory") continue;
+    if (!/^[0-9a-f]{2}$/i.test(dir.name)) continue;
 
-    for (const dir of fanoutDirs) {
-      if (dir === "pack" || dir === "info" || dir.length !== 2) continue;
-      if (!/^[0-9a-f]{2}$/i.test(dir)) continue;
-
-      const subdir = path.join(OBJECTS_DIR, dir);
-      try {
-        const files = await fs.readdir(subdir);
-        for (const file of files) {
-          if (file.length === 38 && /^[0-9a-f]{38}$/i.test(file)) {
-            objects.push(dir + file);
-          }
-        }
-      } catch {
-        // Directory doesn't exist
+    for await (const file of files.list(dir.path)) {
+      if (file.kind === "file" && /^[0-9a-f]{38}$/i.test(file.name)) {
+        objects.push(dir.name + file.name);
       }
     }
-  } catch {
-    // Objects directory doesn't exist
   }
 
   return { count: objects.length, objects };
@@ -154,41 +153,29 @@ export async function countLooseObjects(): Promise<{ count: number; objects: str
 
 export async function listPackFiles(): Promise<string[]> {
   const packs: string[] = [];
-
-  try {
-    const files = await fs.readdir(PACK_DIR);
-    for (const file of files) {
-      if (file.endsWith(".pack")) {
-        packs.push(file);
-      }
+  for await (const entry of createFilesApi().list(PACK_DIR)) {
+    if (entry.kind === "file" && entry.name.endsWith(".pack")) {
+      packs.push(entry.name);
     }
-  } catch {
-    // Pack directory doesn't exist
   }
-
   return packs;
 }
 
 export async function getPackFileStats(): Promise<
   { name: string; size: number; sizeFormatted: string }[]
 > {
+  const files = createFilesApi();
   const stats: { name: string; size: number; sizeFormatted: string }[] = [];
 
-  try {
-    const files = await fs.readdir(PACK_DIR);
-    for (const file of files) {
-      if (file.endsWith(".pack")) {
-        const packPath = path.join(PACK_DIR, file);
-        const stat = await fs.stat(packPath);
-        stats.push({
-          name: file,
-          size: stat.size,
-          sizeFormatted: formatBytes(stat.size),
-        });
-      }
+  for await (const entry of files.list(PACK_DIR)) {
+    if (entry.kind === "file" && entry.name.endsWith(".pack")) {
+      const size = entry.size ?? (await files.stats(entry.path))?.size ?? 0;
+      stats.push({
+        name: entry.name,
+        size,
+        sizeFormatted: formatBytes(size),
+      });
     }
-  } catch {
-    // Pack directory doesn't exist
   }
 
   return stats;
@@ -196,5 +183,3 @@ export async function getPackFileStats(): Promise<
 
 // Re-export types
 export type { Git } from "@statewalker/vcs-commands";
-// Re-export fs and path for cleanup step
-export { fs, path };

@@ -166,7 +166,7 @@ function createRefStoreAdapter(refs: Refs): RefStore {
 `createMessagePortDuplex` turns each end of a `MessageChannel` into a `Duplex`. The server and client run concurrently under `Promise.all`; the client gets its own empty memory repository, facade and ref store.
 
 ```typescript
-const { MessageChannel } = await import("node:worker_threads");
+// MessageChannel is the standard global (browsers, workers, Node); no node: import.
 const { serveOverDuplex, fetchOverDuplex, createMessagePortDuplex } = await import(
   "@statewalker/vcs-transport"
 );
@@ -259,7 +259,7 @@ The transport layer depends on a minimal `RefStore` (`get`, `update`, `listAll`,
 - **Commit ids change every run.** The commit timestamp is `Date.now() / 1000`, so the commit id differs between runs; the blob and tree ids are stable.
 - **`getObjectInfo` prints `type=1`, not `type=commit`.** `ObjectInfo.type` is a numeric `ObjectTypeCode` (1 commit, 2 tree, 3 blob, 4 tag). The walk output maps codes to names with a local `typeNames` array.
 - **`listRefs()` shows `HEAD`, `RefStore.listAll()` does not.** The access layer resolves `HEAD`; the inline adapter drops entries without an `objectId`.
-- **`as any` on the ports.** Node's `worker_threads` `MessagePort` is not the DOM `MessagePort` type that `createMessagePortDuplex` declares; the cast is needed to typecheck.
+- **`as any` on the ports.** Under Node's type definitions the global `MessageChannel` is the `worker_threads` one, whose `MessagePort` is not the DOM `MessagePort` type that `createMessagePortDuplex` declares; the cast is needed to typecheck.
 - **The process does not exit if ports stay open.** Setting `onmessage` keeps a Node `MessagePort` alive; the example calls `channel.port1.close()` and `channel.port2.close()` before finishing.
 - **Fetch assumes `refs/heads/main` locally.** `fetchOverDuplex` resolves `options.localHead ?? "refs/heads/main"` in the client `RefStore` to choose haves. Here the client is empty, so it sends none.
 - **Missing objects throw.** Loading an id that is not in the repository through the access adapter throws `Object not found: <id>`. Port errors are logged as `MessagePort error:`.

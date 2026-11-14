@@ -10,7 +10,7 @@ import { FileStagingStore } from "@statewalker/vcs-store-files";
 import {
   cleanupRepo,
   createFilesApi,
-  fs,
+  createRepoDir,
   GIT_DIR,
   log,
   logInfo,
@@ -26,7 +26,7 @@ export async function run(): Promise<void> {
   await cleanupRepo();
 
   log("Creating repository directory...");
-  await fs.mkdir(REPO_DIR, { recursive: true });
+  await createRepoDir();
 
   log("Initializing Git repository with Git.init()...");
   const files = createFilesApi();

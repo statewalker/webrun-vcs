@@ -6,47 +6,53 @@
  * 1. Create a remote repository using VCS (blob, tree, commit, refs)
  * 2. Start a VCS-based HTTP server (no git http-backend)
  * 3. Clone the repository using VCS transport
- * 4. Verify the clone with native git
+ * 4. Verify the clone through the VCS library
  * 5. Modify content and create a commit using VCS
  * 6. Create a new branch with the changes
  * 7. Push the branch using VCS transport
- * 8. Verify the push with native git
+ * 8. Verify the push through the VCS library
  *
  * Run: pnpm start
  *      pnpm start -- --port 9000   # Custom port
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { DefaultSerializationApi, FileMode } from "@statewalker/vcs-core";
+import { DefaultSerializationApi, FileMode, type FilesApi, joinPath } from "@statewalker/vcs-core";
 import { clone, type PushObject, push } from "@statewalker/vcs-transport";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
-  BASE_DIR,
+  BASE_PATH,
+  checkIntegrity,
   concatBytes,
   createAuthor,
   createFileHistory,
   createVcsHttpServer,
   DEFAULT_BRANCH,
+  describeCommit,
   ensureDirectory,
   type FileHistory,
+  formatIntegrityReport,
   getHead,
   HTTP_PORT,
+  isIntact,
   LOCAL_REPO_DIR,
+  LOCAL_REPO_PATH,
+  listBranches,
+  listTreeNames,
+  openRepositoryForVerification,
   printError,
   printInfo,
   printSection,
   printStep,
   printSuccess,
   REMOTE_REPO_DIR,
+  REMOTE_REPO_PATH,
   removeDirectory,
-  runGitAsync,
-  runGitSafeAsync,
   shortId,
   TEST_BRANCH,
   type VcsHttpServer,
+  worktreeStatus,
 } from "./shared/index.js";
 
 // Parse command line arguments
@@ -72,13 +78,16 @@ const REMOTE_URL = `http://localhost:${httpPort}/remote.git`;
 
 const textEncoder = new TextEncoder();
 
+/** FilesApi rooted at the current working directory; holds the repos folder */
+const workspaceFiles = createNodeFilesApi({ rootDir: process.cwd() });
+
 /**
  * Main entry point.
  */
 async function main(): Promise<void> {
   printSection("HTTP Git Server Demo - Full Roundtrip");
   console.log("Building a Git HTTP server from scratch using VCS.");
-  console.log("Native git is only used for verification.\n");
+  console.log("No native git is used; verification also goes through the VCS library.\n");
 
   let server: VcsHttpServer | null = null;
   let remoteHistory: FileHistory | null = null;
@@ -97,9 +106,9 @@ async function main(): Promise<void> {
     printStep(3, "Cloning repository using VCS transport");
     await cloneWithVcs();
 
-    // Step 4: Verify clone with native git
-    printStep(4, "Verifying clone with native git");
-    await verifyCloneWithNativeGit();
+    // Step 4: Verify clone through the library
+    printStep(4, "Verifying clone through the VCS library");
+    await verifyClone();
 
     // Step 5: Open local repository with VCS and modify content
     printStep(5, "Modifying content with VCS");
@@ -114,9 +123,9 @@ async function main(): Promise<void> {
     printStep(7, "Pushing changes using VCS transport");
     await pushChanges(localHistory, commitId);
 
-    // Step 8: Verify push with native git
-    printStep(8, "Verifying push with native git");
-    await verifyPushWithNativeGit(commitId);
+    // Step 8: Verify push through the library
+    printStep(8, "Verifying push through the VCS library");
+    await verifyPush(commitId);
 
     // Success!
     printSection("SUCCESS!");
@@ -126,7 +135,7 @@ async function main(): Promise<void> {
     console.log("- Cloned using VCS transport (no native git clone)");
     console.log("- Modified content and committed with VCS");
     console.log("- Pushed using VCS transport");
-    console.log("- All verified with native git");
+    console.log("- All verified by reading the repositories back with the VCS library");
   } catch (error) {
     printError(`Error: ${error instanceof Error ? error.message : error}`);
     if (error instanceof Error && error.stack) {
@@ -151,9 +160,9 @@ async function main(): Promise<void> {
  * Step 1: Create remote repository entirely with VCS.
  */
 async function setupRemoteRepository(): Promise<FileHistory> {
-  await removeDirectory(BASE_DIR);
-  await ensureDirectory(BASE_DIR);
-  await ensureDirectory(REMOTE_REPO_DIR);
+  await removeDirectory(workspaceFiles, BASE_PATH);
+  await ensureDirectory(workspaceFiles, BASE_PATH);
+  await ensureDirectory(workspaceFiles, REMOTE_REPO_PATH);
 
   printInfo(`Creating bare repository at ${REMOTE_REPO_DIR}`);
 
@@ -240,9 +249,7 @@ async function cloneWithVcs(): Promise<void> {
   printInfo(`Default branch: ${cloneResult.defaultBranch}`);
   printInfo(`Refs received: ${cloneResult.refs.size}`);
 
-  await ensureDirectory(LOCAL_REPO_DIR);
-  const gitDir = path.join(LOCAL_REPO_DIR, ".git");
-  await ensureDirectory(gitDir);
+  await ensureDirectory(workspaceFiles, joinPath(LOCAL_REPO_PATH, ".git"));
 
   const files = createNodeFilesApi({ rootDir: LOCAL_REPO_DIR });
 
@@ -268,7 +275,7 @@ async function cloneWithVcs(): Promise<void> {
     // The file-backed object store (filesStagingStore) reads loose objects only,
     // not packfiles, so we explode the pack via the serialization pipeline.
     // The resulting loose objects are Git-compatible and readable both by the
-    // VCS History API and by native git (used for verification in step 4).
+    // VCS History API and by native git.
     const serialization = new DefaultSerializationApi({ history });
     const importResult = await serialization.importPack(
       (async function* () {
@@ -293,7 +300,7 @@ async function cloneWithVcs(): Promise<void> {
 
   await history.refs.setSymbolic("HEAD", `refs/heads/${defaultBranchName}`);
 
-  await checkoutHead(history);
+  await checkoutHead(history, files);
   await history.close();
 
   printSuccess(`Repository cloned to ${LOCAL_REPO_DIR}`);
@@ -302,7 +309,7 @@ async function cloneWithVcs(): Promise<void> {
 /**
  * Checkout HEAD to working tree.
  */
-async function checkoutHead(history: FileHistory): Promise<void> {
+async function checkoutHead(history: FileHistory, files: FilesApi): Promise<void> {
   const headCommit = await getHead(history);
   if (!headCommit) {
     throw new Error("No HEAD commit found");
@@ -312,24 +319,29 @@ async function checkoutHead(history: FileHistory): Promise<void> {
   if (!commit) {
     throw new Error(`Commit ${headCommit} not found`);
   }
-  await extractTree(history, commit.tree, LOCAL_REPO_DIR);
+  await extractTree(history, files, commit.tree, "/");
 }
 
 /**
  * Extract a tree to a directory.
  */
-async function extractTree(history: FileHistory, treeId: string, dirPath: string): Promise<void> {
+async function extractTree(
+  history: FileHistory,
+  files: FilesApi,
+  treeId: string,
+  dirPath: string,
+): Promise<void> {
   const entries = await history.trees.load(treeId);
   if (!entries) {
     throw new Error(`Tree ${treeId} not found`);
   }
 
   for await (const entry of entries) {
-    const entryPath = path.join(dirPath, entry.name);
+    const entryPath = joinPath(dirPath, entry.name);
 
     if (entry.mode === FileMode.TREE) {
-      await ensureDirectory(entryPath);
-      await extractTree(history, entry.id, entryPath);
+      await ensureDirectory(files, entryPath);
+      await extractTree(history, files, entry.id, entryPath);
     } else {
       const content = await history.blobs.load(entry.id);
       if (!content) {
@@ -342,37 +354,49 @@ async function extractTree(history: FileHistory, treeId: string, dirPath: string
       }
       const data = concatBytes(...chunks);
 
-      await fs.writeFile(entryPath, data);
+      await files.write(entryPath, [data]);
     }
   }
 }
 
 /**
- * Step 4: Verify clone with native git.
+ * Step 4: Verify clone through the library.
+ *
+ * Opens the cloned repository with the git-compatible file backend and reads
+ * it back: object integrity (like `git fsck --full`), working tree status
+ * (like `git status --short`) and the latest commit (like `git log -1`).
  */
-async function verifyCloneWithNativeGit(): Promise<void> {
-  printInfo("Checking cloned repository with native git...");
+async function verifyClone(): Promise<void> {
+  printInfo("Checking cloned repository through the VCS library...");
 
-  const fsckResult = await runGitSafeAsync(["fsck", "--full"], LOCAL_REPO_DIR);
-  if (fsckResult.ok) {
-    printSuccess("Repository integrity check passed (git fsck)");
-  } else {
-    printError(`Repository integrity check failed: ${fsckResult.output}`);
-  }
-
-  const status = await runGitAsync(["status", "--short"], LOCAL_REPO_DIR);
-  printInfo(`Git status: ${status || "(clean)"}`);
-
-  const log = await runGitSafeAsync(["log", "--oneline", "-1"], LOCAL_REPO_DIR);
-  if (log.ok) {
-    printSuccess(`Latest commit: ${log.output}`);
-  }
-
-  const readmePath = path.join(LOCAL_REPO_DIR, "README.md");
+  const files = createNodeFilesApi({ rootDir: LOCAL_REPO_DIR });
+  const repo = await openRepositoryForVerification(files, ".git");
   try {
-    await fs.access(readmePath);
+    const integrity = await checkIntegrity(repo);
+    if (isIntact(integrity)) {
+      printSuccess(`Repository integrity check passed: ${formatIntegrityReport(integrity)}`);
+    } else {
+      printError(
+        `Repository integrity check failed: missing [${integrity.missing.join(", ")}], ` +
+          `corrupt [${integrity.corrupt.map((c) => `${c.id}: ${c.error}`).join(", ")}]`,
+      );
+    }
+
+    const status = await worktreeStatus(repo.history, files, ".git");
+    printInfo(`Working tree status: ${status.length > 0 ? status.join(", ") : "(clean)"}`);
+
+    const latest = await describeCommit(repo.history, "HEAD");
+    if (latest) {
+      printSuccess(`Latest commit: ${shortId(latest.id)} ${latest.subject}`);
+    }
+  } finally {
+    await repo.close();
+  }
+
+  const readme = await files.stats("README.md");
+  if (readme?.kind === "file") {
     printSuccess("README.md file exists");
-  } catch {
+  } else {
     printError("README.md file not found!");
   }
 }
@@ -447,8 +471,8 @@ Timestamp: ${new Date().toISOString()}
   const newTreeId = await history.trees.store(newEntries);
   printInfo(`Created tree: ${shortId(newTreeId)}`);
 
-  const filePath = path.join(LOCAL_REPO_DIR, "DEMO.md");
-  await fs.writeFile(filePath, newFileContent);
+  const files = createNodeFilesApi({ rootDir: LOCAL_REPO_DIR });
+  await files.write("DEMO.md", [textEncoder.encode(newFileContent)]);
   printInfo(`Created file: DEMO.md`);
 
   return { newBlobId, newTreeId };
@@ -595,55 +619,56 @@ async function collectObjectsForPush(
 }
 
 /**
- * Step 8: Verify push with native git.
+ * Step 8: Verify push through the library.
+ *
+ * Opens the remote (bare) repository with the git-compatible file backend and
+ * checks the pushed branch, its commit and tree, and object integrity.
  */
-async function verifyPushWithNativeGit(expectedCommitId: string): Promise<void> {
-  printInfo("Checking remote repository with native git...");
+async function verifyPush(expectedCommitId: string): Promise<void> {
+  printInfo("Checking remote repository through the VCS library...");
 
-  const branches = await runGitAsync(["branch", "-a"], REMOTE_REPO_DIR);
-  if (!branches.includes(TEST_BRANCH)) {
-    printError(`Branch '${TEST_BRANCH}' not found in remote!`);
-    printInfo(`Available branches: ${branches}`);
-    throw new Error("Branch verification failed");
-  }
-  printSuccess(`Branch '${TEST_BRANCH}' exists in remote`);
+  const files = createNodeFilesApi({ rootDir: REMOTE_REPO_DIR });
+  const repo = await openRepositoryForVerification(files, ".");
+  try {
+    const branches = await listBranches(repo.history);
+    if (!branches.includes(TEST_BRANCH)) {
+      printError(`Branch '${TEST_BRANCH}' not found in remote!`);
+      printInfo(`Available branches: ${branches.join(", ")}`);
+      throw new Error("Branch verification failed");
+    }
+    printSuccess(`Branch '${TEST_BRANCH}' exists in remote`);
 
-  const remoteCommitId = await runGitAsync(
-    ["rev-parse", `refs/heads/${TEST_BRANCH}`],
-    REMOTE_REPO_DIR,
-  );
+    const commit = await describeCommit(repo.history, `refs/heads/${TEST_BRANCH}`);
+    const remoteCommitId = commit?.id;
+    if (remoteCommitId === expectedCommitId) {
+      printSuccess(`Commit ID matches: ${shortId(remoteCommitId)}`);
+    } else {
+      printError(`Commit ID mismatch!`);
+      printError(`  Expected: ${expectedCommitId}`);
+      printError(`  Got: ${remoteCommitId ?? "(none)"}`);
+      throw new Error("Commit verification failed");
+    }
+    printInfo(`Commit: ${commit?.id} ${commit?.subject}`);
 
-  if (remoteCommitId === expectedCommitId) {
-    printSuccess(`Commit ID matches: ${shortId(remoteCommitId)}`);
-  } else {
-    printError(`Commit ID mismatch!`);
-    printError(`  Expected: ${expectedCommitId}`);
-    printError(`  Got: ${remoteCommitId}`);
-    throw new Error("Commit verification failed");
-  }
+    const treeFiles = await listTreeNames(repo.history, `refs/heads/${TEST_BRANCH}`);
+    if (treeFiles.includes("DEMO.md")) {
+      printSuccess("DEMO.md file found in commit");
+    } else {
+      printError("DEMO.md file not found!");
+      throw new Error("File verification failed");
+    }
 
-  const commitInfo = await runGitAsync(
-    ["log", "-1", "--format=%H %s", `refs/heads/${TEST_BRANCH}`],
-    REMOTE_REPO_DIR,
-  );
-  printInfo(`Commit: ${commitInfo}`);
-
-  const treeFiles = await runGitAsync(
-    ["ls-tree", "--name-only", `refs/heads/${TEST_BRANCH}`],
-    REMOTE_REPO_DIR,
-  );
-  if (treeFiles.includes("DEMO.md")) {
-    printSuccess("DEMO.md file found in commit");
-  } else {
-    printError("DEMO.md file not found!");
-    throw new Error("File verification failed");
-  }
-
-  const fsckResult = await runGitSafeAsync(["fsck", "--full"], REMOTE_REPO_DIR);
-  if (fsckResult.ok) {
-    printSuccess("Repository integrity check passed (git fsck)");
-  } else {
-    printError(`Repository integrity check warning: ${fsckResult.output}`);
+    const integrity = await checkIntegrity(repo);
+    if (isIntact(integrity)) {
+      printSuccess(`Repository integrity check passed: ${formatIntegrityReport(integrity)}`);
+    } else {
+      printError(
+        `Repository integrity check warning: missing [${integrity.missing.join(", ")}], ` +
+          `corrupt [${integrity.corrupt.map((c) => `${c.id}: ${c.error}`).join(", ")}]`,
+      );
+    }
+  } finally {
+    await repo.close();
   }
 }
 

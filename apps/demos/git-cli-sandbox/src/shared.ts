@@ -2,8 +2,6 @@
  * Shared utilities for the Git CLI sandbox
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { Git } from "@statewalker/vcs-commands";
 import type { FilesApi, GitObjects, History } from "@statewalker/vcs-core";
 import {
@@ -11,6 +9,7 @@ import {
   createGitFilesBackend,
   FileStagingStore,
 } from "@statewalker/vcs-store-files";
+import { dirname } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import {
   createMemoryCheckout,
@@ -34,25 +33,41 @@ export interface CliContext {
 }
 
 /**
+ * Resolve a path against a base directory (like `path.resolve`, POSIX style).
+ * Absolute paths are returned normalized; `.` and `..` segments are resolved.
+ */
+export function resolvePath(base: string, target: string): string {
+  const combined = target.startsWith("/") ? target : `${base}/${target}`;
+  const segments: string[] = [];
+  for (const segment of combined.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") segments.pop();
+    else segments.push(segment);
+  }
+  return `/${segments.join("/")}`;
+}
+
+/**
+ * FilesApi rooted at an absolute directory, used for operations outside a
+ * repository (finding the repository root, creating or removing directories).
+ * Its root "/" is the directory itself; `mkdir("/")` creates it.
+ */
+export function createDirFilesApi(dir: string): FilesApi {
+  return createNodeFilesApi({ rootDir: dir });
+}
+
+/**
  * Find the repository root from the current directory
  */
 export async function findRepoRoot(startDir: string): Promise<string | null> {
-  let dir = path.resolve(startDir);
-  const root = path.parse(dir).root;
+  let dir = resolvePath(process.cwd(), startDir);
 
-  while (dir !== root) {
-    const gitDir = path.join(dir, ".git");
-
-    try {
-      const stat = await fs.stat(gitDir);
-      if (stat.isDirectory()) {
-        return dir;
-      }
-    } catch {
-      // Not found, continue up
+  while (dir !== "/") {
+    const stat = await createDirFilesApi(dir).stats(".git");
+    if (stat?.kind === "directory") {
+      return dir;
     }
-
-    dir = path.dirname(dir);
+    dir = dirname(dir);
   }
 
   return null;

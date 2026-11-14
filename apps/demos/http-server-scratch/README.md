@@ -2,7 +2,7 @@
 
 ## What it is
 
-A Node demo of a Git smart-HTTP server built on `@statewalker/vcs-transport`, served with Hono, with no `git http-backend` behind it. The main script creates a bare repository with the VCS object API, serves it, clones it with the VCS transport, commits a new file on a new branch, pushes the branch back, and checks the result with native `git`. Two more scripts run the server alone and a VCS-transport client alone.
+A Node demo of a Git smart-HTTP server built on `@statewalker/vcs-transport`, served with Hono, with no `git http-backend` behind it. The main script creates a bare repository with the VCS object API, serves it, clones it with the VCS transport, commits a new file on a new branch, pushes the branch back, and checks the result by reading both repositories back through the library (`createGitFilesBackend`), with no native `git`. Two more scripts run the server alone and a VCS-transport client alone.
 
 ## Layout
 
@@ -15,8 +15,9 @@ src/
     config.ts              repos/ paths, HTTP_PORT = 8080, branch names
     hono-http-server.ts    createVcsHttpServer(): Hono + createFetchHandler()
     file-history.ts        createFileHistory(): History over loose objects in .git/objects
-    helpers.ts             runGit*, directory helpers, console output
-    vcs-http-server.ts     hand-written protocol server; not exported or used
+    helpers.ts             FilesApi directory helpers, resolvePath, console output
+    verify-repository.ts   library-based verification (integrity walk, status, log, branches)
+    vcs-http-server.ts     hand-written protocol server as a fetch(Request) handler; not exported or used
 ```
 
 ```
@@ -39,7 +40,7 @@ src/
 
 ## How to run it
 
-The `@statewalker/vcs-*` workspace packages resolve to their built `dist/`, so build once first. Native `git` must be on `PATH` for the round trip (it verifies steps 4 and 8).
+The `@statewalker/vcs-*` workspace packages resolve to their built `dist/`, so build once first. Native `git` is not needed: steps 4 and 8 verify through the library.
 
 1. `pnpm install && pnpm build` at the repository root (Node 24).
 2. Run the round trip:
@@ -54,11 +55,11 @@ The `@statewalker/vcs-*` workspace packages resolve to their built `dist/`, so b
    1. Create `repos/remote.git` and store a blob, tree and commit with `history.blobs/trees/commits.store()`.
    2. Start the server on the port.
    3. `clone()` from `http://localhost:<port>/remote.git`, import the pack as loose objects with `DefaultSerializationApi.importPack()`, set refs, write the files.
-   4. `git fsck --full`, `git status`, `git log` in the clone.
+   4. Open the clone with `createGitFilesBackend()` and verify it through the library: walk and re-hash every reachable object (the counterpart of `git fsck --full`), compare the working tree with the HEAD tree (`git status`), print the latest commit (`git log -1`).
    5. Write `DEMO.md` as a new blob and tree.
    6. Commit it on `feature-branch`.
    7. `push()` `refs/heads/feature-branch` back to the server.
-   8. Check the branch, commit id and `DEMO.md` in `repos/remote.git` with native git, then `git fsck`.
+   8. Open `repos/remote.git` the same way and check the branch, commit id and `DEMO.md` through the library, then run the same integrity walk.
 
 ### Standalone server
 
@@ -145,7 +146,7 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 - **Loose objects only.** `createFileHistory()` stores every object through `createGitObjects(filesStagingStore(...))` in `.git/objects/xx/...`, which native git reads directly. That store does not read packfiles, so the round trip explodes the received pack into loose objects with `importPack()` instead of writing a `.pack`/`.idx` pair.
 - **The transport package owns the protocol.** The server is a thin Hono route around `createFetchHandler()`; ref advertisement, upload-pack and receive-pack all come from `@statewalker/vcs-transport`. The app's only adapters are the repository facade and a ref store over `history.refs`.
 - **`FileHistory` is the History instance itself with `objects` attached,** not a spread copy. `History` methods live on the prototype, and a spread would drop them; upload-pack would then fail with `history.collectReachableObjects is not a function`.
-- **Native git only verifies.** It is never used to create, serve, clone or push; it checks that what VCS wrote is valid Git.
+- **No native git, not even for verification.** Steps 4 and 8 reopen the repositories with the library's git-compatible file backend (`src/shared/verify-repository.ts`) and read refs, commits, trees and objects back, re-hashing each object with `objects.get(id, { verify: true })`. The app uses only portable APIs (FilesApi, Fetch API, Web Crypto); `@hono/node-server` is the only Node-specific piece, and it just serves the portable `fetch` handler. The repositories stay valid Git, so `git fsck` in `repos/` still passes if you want to check by hand.
 
 ## What will surprise you
 
@@ -158,7 +159,7 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
   Pass `--port <n>`. The default comes from `HTTP_PORT = 8080` in `src/shared/config.ts` (and a literal `8080` in `server-only.ts`).
 - **`start` deletes `repos/` first.** Step 1 removes the whole `repos/` directory under the working directory, including anything you put there for `server` mode.
 - **Run through `pnpm --filter`, the working directory is the app folder,** so `repos/` and `cloned-repo/` are created in `apps/demos/http-server-scratch/` (`repos/` is in `.gitignore`).
-- **`git status` in the clone shows `D  README.md` and `?? README.md`.** The demo writes the files and objects but no index, so native git sees the file as deleted from the index and untracked on disk. This is expected output of step 4, not a failure.
+- **Step 4 reports the working tree as `(clean)`, but native `git status` in the clone shows `D  README.md` and `?? README.md`.** The library check compares the files with the HEAD tree. The demo writes no index, so native git sees the file as deleted from the index and untracked on disk.
 - **Repositories served by `server` must hold loose objects.** A repository whose objects are packed (for example after `git gc`) cannot be read by its loose-only store (`createGitFilesBackend` reads packs through `withPacks`).
 - **`client` does not produce a usable clone.** It treats `defaultBranch` as a short name, so it writes `HEAD` as `ref: refs/heads/refs/heads/main`, finds no HEAD commit, prints `Empty repository - no checkout needed` and still reports `SUCCESS!`. It writes the received pack as `.pack`/`.idx`, which the loose-object store cannot read. With `--push` it fails with `Error: Cannot push to empty repository`. Native `git clone` against `server` works.
 

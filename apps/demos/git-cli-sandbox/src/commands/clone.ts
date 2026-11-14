@@ -2,14 +2,19 @@
  * Clone command - Clone a repository via HTTP
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { FileMode, type History, indexPack, writePackIndex } from "@statewalker/vcs-core";
+import {
+  FileMode,
+  type FilesApi,
+  type History,
+  indexPack,
+  writePackIndex,
+} from "@statewalker/vcs-core";
 import { createGitFilesBackend, FileStagingStore } from "@statewalker/vcs-store-files";
 import { clone as transportClone } from "@statewalker/vcs-transport";
+import { basename, dirname, joinPath } from "@statewalker/vcs-utils/files";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { dim, fatal, info, success } from "../shared.js";
+import { createDirFilesApi, dim, fatal, info, resolvePath, success } from "../shared.js";
 
 /**
  * Parse clone command arguments
@@ -85,16 +90,21 @@ const GITLINK = 0o160000;
 /**
  * Extract a tree to a directory
  */
-async function extractTree(repository: History, treeId: string, dirPath: string): Promise<void> {
+async function extractTree(
+  repository: History,
+  files: FilesApi,
+  treeId: string,
+  dirPath: string,
+): Promise<void> {
   const tree = await repository.trees.load(treeId);
   if (!tree) return;
 
   for await (const entry of tree) {
-    const entryPath = path.join(dirPath, entry.name);
+    const entryPath = joinPath(dirPath, entry.name);
 
     if (entry.mode === FileMode.TREE) {
-      await fs.mkdir(entryPath, { recursive: true });
-      await extractTree(repository, entry.id, entryPath);
+      await files.mkdir(entryPath);
+      await extractTree(repository, files, entry.id, entryPath);
     } else if (entry.mode === GITLINK) {
     } else {
       const chunks: Uint8Array[] = [];
@@ -105,7 +115,7 @@ async function extractTree(repository: History, treeId: string, dirPath: string)
         }
       }
       const content = concatBytes(...chunks);
-      await fs.writeFile(entryPath, content);
+      await files.write(entryPath, [content]);
     }
   }
 }
@@ -122,22 +132,18 @@ export async function runClone(args: string[]): Promise<void> {
 
   // Determine target directory
   const targetDir = directory || extractRepoName(url);
-  const absDir = path.resolve(process.cwd(), targetDir);
+  const absDir = resolvePath(process.cwd(), targetDir);
+  const dirFiles = createDirFilesApi(absDir);
 
   // Check if directory exists and is not empty
-  try {
-    const entries = await fs.readdir(absDir);
-    if (entries.length > 0) {
-      fatal(`destination path '${targetDir}' already exists and is not an empty directory.`);
-    }
-  } catch {
-    // Directory doesn't exist - good
+  for await (const _entry of dirFiles.list("/")) {
+    fatal(`destination path '${targetDir}' already exists and is not an empty directory.`);
   }
 
   console.log(info(`Cloning into '${targetDir}'...`));
 
   // Create target directory
-  await fs.mkdir(absDir, { recursive: true });
+  await dirFiles.mkdir("/");
 
   try {
     // Execute transport clone
@@ -236,7 +242,7 @@ export async function runClone(args: string[]): Promise<void> {
       if (headCommit) {
         const commit = await repository.commits.load(headCommit);
         if (commit) {
-          await extractTree(repository, commit.tree, absDir);
+          await extractTree(repository, files, commit.tree, "/");
 
           // Initialize index from HEAD tree
           const staging = new FileStagingStore(files, `${gitDir}/index`);
@@ -256,7 +262,7 @@ export async function runClone(args: string[]): Promise<void> {
   } catch (err) {
     // Clean up on failure
     try {
-      await fs.rm(absDir, { recursive: true, force: true });
+      await createDirFilesApi(dirname(absDir)).remove(basename(absDir));
     } catch {
       // Ignore cleanup errors
     }

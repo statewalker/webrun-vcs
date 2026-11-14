@@ -14,9 +14,15 @@
  * - Pushing changes back to the server
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { FileMode, indexPack, writePackIndex } from "@statewalker/vcs-core";
+import {
+  basename,
+  dirname,
+  FileMode,
+  type FilesApi,
+  indexPack,
+  joinPath,
+  writePackIndex,
+} from "@statewalker/vcs-core";
 import { clone, type PushObject, push } from "@statewalker/vcs-transport";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -36,6 +42,7 @@ import {
   printStep,
   printSuccess,
   removeDirectory,
+  resolvePath,
   shortId,
 } from "./shared/index.js";
 
@@ -48,13 +55,13 @@ function parseArgs(): { url: string; shouldPush: boolean; localDir: string } {
   const args = process.argv.slice(2);
   let url = "";
   let shouldPush = false;
-  let localDir = path.join(process.cwd(), "cloned-repo");
+  let localDir = resolvePath(process.cwd(), "cloned-repo");
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--push") {
       shouldPush = true;
     } else if (args[i] === "--dir" && args[i + 1]) {
-      localDir = path.resolve(args[i + 1]);
+      localDir = resolvePath(process.cwd(), args[i + 1]);
       i++;
     } else if (!args[i].startsWith("--")) {
       url = args[i];
@@ -88,12 +95,13 @@ async function main(): Promise<void> {
   try {
     // Step 1: Clone
     printStep(1, "Cloning repository");
-    history = await cloneRepository(url, localDir);
+    const files = createNodeFilesApi({ rootDir: localDir });
+    history = await cloneRepository(url, localDir, files);
 
     if (shouldPush) {
       // Step 2: Make changes
       printStep(2, "Creating changes");
-      const { commitId } = await makeChanges(history, localDir);
+      const { commitId } = await makeChanges(history, files);
 
       // Step 3: Push
       printStep(3, "Pushing changes");
@@ -121,15 +129,18 @@ async function main(): Promise<void> {
 /**
  * Clone a repository using VCS transport.
  */
-async function cloneRepository(url: string, localDir: string): Promise<FileHistory> {
+async function cloneRepository(
+  url: string,
+  localDir: string,
+  files: FilesApi,
+): Promise<FileHistory> {
   printInfo(`Cloning from: ${url}`);
   printInfo(`Destination: ${localDir}`);
 
   // Clean up and create directory
-  await removeDirectory(localDir);
-  await ensureDirectory(localDir);
-  const gitDir = path.join(localDir, ".git");
-  await ensureDirectory(gitDir);
+  const parentFiles = createNodeFilesApi({ rootDir: dirname(localDir) });
+  await removeDirectory(parentFiles, basename(localDir));
+  await ensureDirectory(files, ".git");
 
   // Perform clone
   const cloneResult = await clone({
@@ -146,7 +157,6 @@ async function cloneRepository(url: string, localDir: string): Promise<FileHisto
   printInfo(`Refs received: ${cloneResult.refs.size}`);
 
   // Create local repository
-  const files = createNodeFilesApi({ rootDir: localDir });
   const history = await createFileHistory({
     files,
     gitDir: ".git",
@@ -187,7 +197,7 @@ async function cloneRepository(url: string, localDir: string): Promise<FileHisto
   await history.refs.setSymbolic("HEAD", `refs/heads/${cloneResult.defaultBranch}`);
 
   // Checkout working tree
-  await checkoutHead(history, localDir);
+  await checkoutHead(history, files);
 
   printSuccess(`Repository cloned successfully`);
 
@@ -197,7 +207,7 @@ async function cloneRepository(url: string, localDir: string): Promise<FileHisto
 /**
  * Checkout HEAD to working tree.
  */
-async function checkoutHead(history: FileHistory, localDir: string): Promise<void> {
+async function checkoutHead(history: FileHistory, files: FilesApi): Promise<void> {
   const headCommit = await getHead(history);
   if (!headCommit) {
     printInfo("Empty repository - no checkout needed");
@@ -208,24 +218,29 @@ async function checkoutHead(history: FileHistory, localDir: string): Promise<voi
   if (!commit) {
     throw new Error(`Commit ${headCommit} not found`);
   }
-  await extractTree(history, commit.tree, localDir);
+  await extractTree(history, files, commit.tree, "/");
 }
 
 /**
  * Extract a tree to a directory.
  */
-async function extractTree(history: FileHistory, treeId: string, dirPath: string): Promise<void> {
+async function extractTree(
+  history: FileHistory,
+  files: FilesApi,
+  treeId: string,
+  dirPath: string,
+): Promise<void> {
   const entries = await history.trees.load(treeId);
   if (!entries) {
     throw new Error(`Tree ${treeId} not found`);
   }
 
   for await (const entry of entries) {
-    const entryPath = path.join(dirPath, entry.name);
+    const entryPath = joinPath(dirPath, entry.name);
 
     if (entry.mode === FileMode.TREE) {
-      await ensureDirectory(entryPath);
-      await extractTree(history, entry.id, entryPath);
+      await ensureDirectory(files, entryPath);
+      await extractTree(history, files, entry.id, entryPath);
     } else {
       const content = await history.blobs.load(entry.id);
       if (!content) {
@@ -237,7 +252,7 @@ async function extractTree(history: FileHistory, treeId: string, dirPath: string
         chunks.push(chunk);
       }
       const data = concatBytes(...chunks);
-      await fs.writeFile(entryPath, data);
+      await files.write(entryPath, [data]);
     }
   }
 }
@@ -247,7 +262,7 @@ async function extractTree(history: FileHistory, treeId: string, dirPath: string
  */
 async function makeChanges(
   history: FileHistory,
-  localDir: string,
+  files: FilesApi,
 ): Promise<{ newTreeId: string; commitId: string }> {
   const headCommit = await getHead(history);
   if (!headCommit) {
@@ -293,7 +308,7 @@ Timestamp: ${new Date().toISOString()}
   printInfo(`Created tree: ${shortId(newTreeId)}`);
 
   // Write file to working directory
-  await fs.writeFile(path.join(localDir, "CLIENT-DEMO.md"), newFileContent);
+  await files.write("CLIENT-DEMO.md", [textEncoder.encode(newFileContent)]);
 
   // Create commit
   const author = createAuthor();

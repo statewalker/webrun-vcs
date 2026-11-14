@@ -2,60 +2,30 @@
  * Helper functions for the HTTP server demo.
  */
 
-import { execFile, execFileSync } from "node:child_process";
-import * as fs from "node:fs/promises";
-import { promisify } from "node:util";
 import { basename, dirname, type FilesApi, joinPath } from "@statewalker/vcs-core";
 
-const execFileAsync = promisify(execFile);
-
 /**
- * Run a git command synchronously.
+ * Resolve a path against a base directory (like `path.resolve`, POSIX style).
+ * Absolute paths are returned normalized; `.` and `..` segments are resolved.
  */
-export function runGit(args: string[], cwd: string): string {
-  const result = execFileSync("git", args, {
-    cwd,
-    encoding: "utf8",
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-  });
-  return result.trim();
-}
-
-/**
- * Run a git command asynchronously.
- */
-export async function runGitAsync(args: string[], cwd: string): Promise<string> {
-  const result = await execFileAsync("git", args, {
-    cwd,
-    encoding: "utf8",
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-  });
-  return result.stdout.trim();
-}
-
-/**
- * Run a git command asynchronously and return success/failure.
- */
-export async function runGitSafeAsync(
-  args: string[],
-  cwd: string,
-): Promise<{ ok: boolean; output: string }> {
-  try {
-    const output = await runGitAsync(args, cwd);
-    return { ok: true, output };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, output: message };
+export function resolvePath(base: string, target: string): string {
+  const combined = target.startsWith("/") ? target : `${base}/${target}`;
+  const segments: string[] = [];
+  for (const segment of combined.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") segments.pop();
+    else segments.push(segment);
   }
+  return `/${segments.join("/")}`;
 }
 
 /**
  * Check if a directory exists.
  */
-export async function directoryExists(dirPath: string): Promise<boolean> {
+export async function directoryExists(files: FilesApi, dirPath: string): Promise<boolean> {
   try {
-    const stat = await fs.stat(dirPath);
-    return stat.isDirectory();
+    const stat = await files.stats(dirPath);
+    return stat?.kind === "directory";
   } catch {
     return false;
   }
@@ -64,9 +34,9 @@ export async function directoryExists(dirPath: string): Promise<boolean> {
 /**
  * Remove a directory recursively.
  */
-export async function removeDirectory(dirPath: string): Promise<void> {
+export async function removeDirectory(files: FilesApi, dirPath: string): Promise<void> {
   try {
-    await fs.rm(dirPath, { recursive: true, force: true });
+    await files.remove(dirPath);
   } catch {
     // Ignore errors
   }
@@ -75,8 +45,8 @@ export async function removeDirectory(dirPath: string): Promise<void> {
 /**
  * Ensure a directory exists.
  */
-export async function ensureDirectory(dirPath: string): Promise<void> {
-  await fs.mkdir(dirPath, { recursive: true });
+export async function ensureDirectory(files: FilesApi, dirPath: string): Promise<void> {
+  await files.mkdir(dirPath);
 }
 
 /**
