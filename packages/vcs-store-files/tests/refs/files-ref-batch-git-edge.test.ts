@@ -10,7 +10,8 @@ import { join } from "node:path";
 import type { FilesApi } from "@statewalker/vcs-core";
 import { createRefBatchTests } from "@statewalker/vcs-testing";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
-import { createNodeAtomicFiles, createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   createFilesRefBatch,
@@ -18,6 +19,17 @@ import {
   FileRefStore,
   readAllRefs,
 } from "../../src/refs/index.js";
+
+/** One FilesApi per repository: atomicFilesOver excludes writers sharing an instance. */
+const sharedFiles = new Map<string, ReturnType<typeof createNodeFilesApi>>();
+function atomicFor(root: string) {
+  let files = sharedFiles.get(root);
+  if (!files) {
+    files = createNodeFilesApi({ rootDir: root });
+    sharedFiles.set(root, files);
+  }
+  return atomicFilesOver(files, ".git");
+}
 
 const IDENT = "A U Thor <author@example.com> 1700000000 +0000";
 const GIT_ENV = {
@@ -65,8 +77,7 @@ function twins(n: number): { ours: string; theirs: string; cs: string[] } {
   commits(theirs, n);
   return { ours, theirs, cs };
 }
-const batchFor = (repo: string, options = {}) =>
-  createFilesRefBatch(createNodeAtomicFiles(join(repo, ".git")), options);
+const batchFor = (repo: string, options = {}) => createFilesRefBatch(atomicFor(repo), options);
 const updateRef = (repo: string, stdin: string, extra: string[] = []) =>
   git(repo, ["update-ref", ...extra, "-m", "msg", "--stdin"], stdin);
 
@@ -81,7 +92,7 @@ createRefBatchTests(
     await createRefsStructure(files, ".git");
     return {
       refs: new FileRefStore(files, ".git", {
-        atomicFiles: createNodeAtomicFiles(join(dir, ".git")),
+        atomicFiles: atomicFor(dir),
       }),
     };
   },
@@ -151,7 +162,7 @@ describe("reflogs as git writes them", () => {
     const [c0, c1] = commits(repo, 2) as [string, string];
     const files = createNodeFilesApi({ rootDir: repo });
     const store = new FileRefStore(files, ".git", {
-      atomicFiles: createNodeAtomicFiles(join(repo, ".git")),
+      atomicFiles: atomicFor(repo),
     });
     expect((await store.compareAndSwap("refs/heads/main", undefined, c0)).success).toBe(true);
     expect((await store.compareAndSwap("refs/heads/main", c0, c1)).success).toBe(true);
@@ -172,7 +183,7 @@ describe("lock files are not refs", () => {
     const lock = join(repo, ".git", "refs", "heads", "main.lock");
     writeFileSync(lock, `${c1}\n`); // git (or another batch) is mid-update
     const store = new FileRefStore(createNodeFilesApi({ rootDir: repo }), ".git", {
-      atomicFiles: createNodeAtomicFiles(join(repo, ".git")),
+      atomicFiles: atomicFor(repo),
     });
     const names: string[] = [];
     for await (const ref of store.list("refs/")) names.push(ref.name);
@@ -189,7 +200,7 @@ describe("races with other writers", () => {
     const [c0, c1] = commits(repo, 2) as [string, string];
     git(repo, ["update-ref", "refs/heads/main", c0]);
     git(repo, ["update-ref", "--no-deref", "HEAD", c0]); // detached
-    const native = createNodeAtomicFiles(join(repo, ".git"));
+    const native = atomicFor(repo);
     let reattached = false;
     const racing: AtomicFiles = {
       ...native,

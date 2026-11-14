@@ -166,14 +166,7 @@ const decompressed = await decompressBlock(compressed);
 
 ### Pluggable Implementations
 
-The default streaming implementation uses the Web `CompressionStream` / `DecompressionStream` API; partial decompression uses pako. To use Node.js zlib instead:
-
-```typescript
-import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-
-setCompressionUtils(createNodeCompression());
-```
+The default streaming implementation uses the Web `CompressionStream` / `DecompressionStream` API, which browsers, Node.js and workers all have; partial decompression uses pako. `setCompressionUtils(partial)` swaps in another implementation of the same contract (a test double, say). No package ships a platform-specific one: the VCS packages use only portable APIs.
 
 ### Partial Decompression
 

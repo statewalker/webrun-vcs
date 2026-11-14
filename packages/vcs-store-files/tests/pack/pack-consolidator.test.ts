@@ -11,15 +11,11 @@ import {
   PackWriterStream,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PackConsolidator, PackDirectory } from "../../src/pack/index.js";
 
 // Set up Node.js compression before tests
-beforeAll(() => {
-  setCompressionUtils(createNodeCompression());
-});
+beforeAll(() => {});
 
 describe("PackConsolidator", () => {
   let files: FilesApi;

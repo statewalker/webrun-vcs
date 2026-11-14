@@ -45,15 +45,14 @@ let _decompressBlockPartial: DecompressBlockPartialFunction | null = null;
 /**
  * Set custom compression utilities
  *
- * This allows overriding the default web-based compression with
- * platform-specific implementations (e.g., Node.js zlib for better performance).
+ * This replaces the default Web-streams compression, which every runtime has,
+ * with another implementation of the same contract (for example in a test).
  *
  * @example
  * ```ts
  * import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
- * import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
  *
- * setCompressionUtils(createNodeCompression());
+ * setCompressionUtils({ deflate: myDeflate });
  * ```
  */
 export function setCompressionUtils(impl: Partial<CompressionUtils>): void {

@@ -29,9 +29,8 @@ import { hasReflog } from "./reflog-writer.js";
 export interface FileRefStoreOptions extends FilesRefBatchOptions {
   /**
    * Lock-file primitives rooted at `gitDir`. Defaults to `atomicFilesOver(files, gitDir)`,
-   * which is atomic only among users of the same FilesApi instance; pass a native implementation
-   * (`createNodeAtomicFiles` from `@statewalker/vcs-utils-node`) to interoperate
-   * safely with other processes, native git included.
+   * which is atomic only among users of the same FilesApi instance: share one FilesApi per
+   * repository, and do not let another process (native git included) write it at the same time.
    */
   atomicFiles?: AtomicFiles;
 }

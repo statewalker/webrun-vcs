@@ -20,9 +20,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DefaultSerializationApi, FileMode } from "@statewalker/vcs-core";
 import { clone, type PushObject, push } from "@statewalker/vcs-transport";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
@@ -71,7 +69,6 @@ const { port: httpPort } = parseArgs();
 const REMOTE_URL = `http://localhost:${httpPort}/remote.git`;
 
 // Initialize compression
-setCompressionUtils(createNodeCompression());
 
 const textEncoder = new TextEncoder();
 

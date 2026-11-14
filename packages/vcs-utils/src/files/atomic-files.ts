@@ -43,9 +43,9 @@ const pending = new WeakMap<FilesApi, Set<string>>();
  * Exclusive creation is guaranteed only among adapters over the same FilesApi
  * instance (a per-instance registry closes the gap between the existence check
  * and the write). Two FilesApi instances over one directory, even in one
- * process, and other processes such as native git are not excluded: give
- * those setups a native implementation (`createNodeAtomicFiles` in
- * `@statewalker/vcs-utils-node`).
+ * process, and other processes such as native git are not excluded: use one
+ * FilesApi instance per repository, and do not run another writer on the same
+ * directory. (Cross-process exclusion needs an exclusive create in FilesApi.)
  * `replace` is FilesApi's `move`, which is atomic only where the backend's is.
  *
  * @example

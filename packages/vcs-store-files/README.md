@@ -144,16 +144,14 @@ await refs.resolve("HEAD"); // follows HEAD to refs/heads/main, loose or packed
 for (const ref of await readAllRefs(files, ".git")) console.log(ref.name); // refs/ by default
 ```
 
-### Update several refs at once, safely next to native git
+### Update several refs at once
 
 ```ts
 import { createFileRefStore } from "@statewalker/vcs-store-files";
-import { createNodeAtomicFiles, createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 const files = createNodeFilesApi({ rootDir: "/path/to/repo" });
-const refs = createFileRefStore(files, ".git", {
-  atomicFiles: createNodeAtomicFiles("/path/to/repo/.git"),
-});
+const refs = createFileRefStore(files, ".git");
 const r = await refs.batch(
   [
     { name: "refs/heads/main", old: oldMain, new: newMain },
@@ -175,9 +173,10 @@ points at an updated branch). `compareAndSwap` is a one-command batch.
 
 The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`, which is
 atomic only among users of the same FilesApi instance: two FilesApi instances over one directory,
-even in one process, do not exclude each other. On disk, pass `createNodeAtomicFiles` (O_CREAT|O_EXCL,
-rename, O_APPEND) wherever another FilesApi or process, native `git` included, may write the same
-repository. `createGitFilesBackend` takes the same `atomicFiles` option, and the lock timeouts.
+even in one process, do not exclude each other, nor does another process such as native `git`.
+Share one FilesApi per repository. Excluding other processes needs an exclusive create in FilesApi
+(O_CREAT|O_EXCL), which belongs upstream in `@statewalker/webrun-files`. `createGitFilesBackend`
+takes the same `atomicFiles` option, and the lock timeouts.
 
 Reflogs follow git with `core.logAllRefUpdates=true` in a non-bare repository: a log is created
 for `HEAD`, `refs/heads/`, `refs/remotes/` and `refs/notes/` (and appended to wherever one exists),

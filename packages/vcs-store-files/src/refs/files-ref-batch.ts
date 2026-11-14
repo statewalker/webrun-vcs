@@ -96,7 +96,7 @@ const fail = (rejected: RefRejection[]): BatchResult => ({ ok: false, rejected }
  *
  * @example
  * ```typescript
- * const batch = createFilesRefBatch(createNodeAtomicFiles("/repo/.git"));
+ * const batch = createFilesRefBatch(atomicFilesOver(files, ".git"));
  * await batch([{ name: "refs/heads/main", old: oldId, new: newId }], { message: "commit: x" });
  * ```
  */

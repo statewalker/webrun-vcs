@@ -12,14 +12,10 @@ import {
   GitFilesCommitDeltaApi,
   parseBinaryDelta,
 } from "@statewalker/vcs-core";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PackDeltaStore } from "../../src/pack/index.js";
 
-beforeAll(() => {
-  setCompressionUtils(createNodeCompression());
-});
+beforeAll(() => {});
 
 function oid(seed: string): string {
   return seed.padStart(40, "0");

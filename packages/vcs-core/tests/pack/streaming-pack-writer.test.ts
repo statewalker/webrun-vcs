@@ -5,10 +5,8 @@
  * by both parsePackEntries and parsePackEntriesFromStream.
  */
 
-import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   PackObjectType,
@@ -18,9 +16,7 @@ import {
   StreamingPackWriter,
 } from "../../src/pack/index.js";
 
-beforeAll(() => {
-  setCompressionUtils(createNodeCompression());
-});
+beforeAll(() => {});
 
 /** Collect all chunks from an async generator into a single Uint8Array */
 async function collect(gen: AsyncIterable<Uint8Array>): Promise<Uint8Array> {

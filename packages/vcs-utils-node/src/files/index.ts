@@ -1,13 +1,11 @@
 /**
- * Node.js filesystem-backed FilesApi implementation
- *
- * Provides a FilesApi backed by the Node.js filesystem.
- * Uses the @statewalker/webrun-files-node package directly.
+ * The Node.js FilesApi: `NodeFilesApi` from `@statewalker/webrun-files-node`.
+ * Library code reads and writes files only through FilesApi; this module just
+ * picks the Node implementation for apps and tests that run on Node.
  */
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
-import { StreamingNodeFilesApi } from "./streaming-node-files.js";
 
 /**
  * Create a Node.js filesystem-backed FilesApi instance.
@@ -25,10 +23,7 @@ import { StreamingNodeFilesApi } from "./streaming-node-files.js";
  * ```
  */
 export function createNodeFilesApi(options: { rootDir: string }): FilesApi {
-  // Streams writes chunk by chunk (NodeFilesApi 0.10 collects them first).
-  return new StreamingNodeFilesApi(options);
+  return new NodeFilesApi(options);
 }
 
-export { createNodeAtomicFiles } from "./node-atomic-files.js";
-// Re-export for direct access if needed
-export { NodeFilesApi, StreamingNodeFilesApi };
+export { NodeFilesApi };

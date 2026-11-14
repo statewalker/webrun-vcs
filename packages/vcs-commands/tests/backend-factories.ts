@@ -20,8 +20,6 @@ import {
   SQLStaging,
 } from "@statewalker/vcs-store-sql";
 import { SqlJsAdapter } from "@statewalker/vcs-store-sql/adapters/sql-js";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import type { WorkingCopy, WorkingCopyConfig } from "@statewalker/vcs-working-tree";
 import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 
@@ -29,7 +27,6 @@ import { createMockWorktree } from "./mock-worktree-store.js";
 import { createSimpleHistory } from "./simple-history-store.js";
 
 // Enable Node.js compression for SQL backend
-setCompressionUtils(createNodeCompression());
 
 /**
  * Test context for WorkingCopy tests

@@ -221,7 +221,7 @@ Byte streams with backpressure over a port (`writeStream`, `readStream`, `create
 
 ### Why compression is replaceable
 
-`deflate` and `inflate` default to the Web `CompressionStream` / `DecompressionStream` API, which every current runtime has. `compressBlock` and `decompressBlock` run the same streams over one buffer. `deflate` pulls its input as the compressor takes it; a consumer that stops early closes the source (without waiting for one that is stalled), and an error from the source comes out unchanged, compressor errors as `CompressionError`. The `node:zlib` set from `@statewalker/vcs-utils-node` keeps the same contract. `setCompressionUtils(partial)` replaces any subset of the five functions process-wide; `@statewalker/vcs-utils-node` provides a `node:zlib` set. Nothing registers itself on import.
+`deflate` and `inflate` default to the Web `CompressionStream` / `DecompressionStream` API, which every current runtime has. `compressBlock` and `decompressBlock` run the same streams over one buffer. `deflate` pulls its input as the compressor takes it; a consumer that stops early closes the source (without waiting for one that is stalled), and an error from the source comes out unchanged, compressor errors as `CompressionError`. `setCompressionUtils(partial)` replaces any subset of the five functions process-wide (for example in a test). Nothing registers itself on import, and no package ships a non-portable set.
 
 ### Why partial decompression uses pako
 
