@@ -366,6 +366,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       timeout: this.timeout,
       depth: this.depth,
       onProgressMessage: this.progressMessageCallback,
+      // the pack flows from the response into the object store as it arrives
+      onPack: (pack) => (this.dryRun ? drain(pack) : this.storePack(pack)),
     });
 
     // Convert refs from Uint8Array to hex strings
@@ -409,11 +411,6 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     if (!this.dryRun && this.removeDeletedRefs) {
       const pruned = await this.pruneDeletedRefs(transportResult.refs);
       trackingUpdates.push(...pruned);
-    }
-
-    // Store pack data
-    if (transportResult.packData.length > 0 && !this.dryRun) {
-      await this.storePack(transportResult.packData);
     }
 
     return {
@@ -602,14 +599,21 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Store received pack data.
+   * Store the received pack as it arrives.
    *
-   * Unpacks the pack into the working copy's history, so the objects the
-   * freshly written tracking refs point at are actually available locally.
-   * Import is idempotent: the stores are content-addressed, so re-importing
-   * a pack rewrites the same object IDs.
+   * Imports it into the working copy's history (kept as a pack when large and
+   * the history has packs, else unpacked), before the tracking refs are
+   * written, so they point at objects that are there. Import is idempotent:
+   * the stores are content-addressed.
    */
-  private async storePack(packData: Uint8Array): Promise<void> {
-    await importPackIntoHistory(this._workingCopy.history, packData);
+  private async storePack(pack: AsyncIterable<Uint8Array>): Promise<void> {
+    await importPackIntoHistory(this._workingCopy.history, pack);
+  }
+}
+
+/** Reads a stream to its end, keeping nothing. */
+async function drain(stream: AsyncIterable<Uint8Array>): Promise<void> {
+  for await (const _ of stream) {
+    // discarded
   }
 }

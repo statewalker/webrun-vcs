@@ -13,9 +13,11 @@ import { ProtocolState } from "../../context/protocol-state.js";
 import type { PushResult, RefPushStatus } from "../../operations/push-over-duplex.js";
 import { parseBufferedAdvertisement } from "../../protocol/advertisement-parser.js";
 import { ZERO_OID } from "../../protocol/constants.js";
+import { ServerError } from "../../protocol/errors.js";
 import { createEmptyPack } from "../../protocol/pack-utils.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { parseReportStatusLines } from "../../protocol/report-status.js";
+import { sidebandPackStream } from "../../protocol/sideband-pack-stream.js";
 import {
   collectChunks,
   decodeSidebandResponse,
@@ -187,31 +189,19 @@ export async function httpFetch(
       };
     }
 
-    // Process response - skip ACK/NAK, import pack
-    const responseData = await collectChunks(
-      readableStreamToAsyncIterable(uploadPackResponse.body),
-    );
-
-    // Decode sideband-encoded response
-    const sidebandResult = decodeSidebandResponse(responseData);
-
-    // Check for server error
-    if (sidebandResult.error) {
-      return {
-        success: false,
-        error: sidebandResult.error,
-      };
-    }
-
-    // Import pack data if we got any
+    // Stream the response: skip ACK/NAK, demultiplex the sideband, import the pack as it
+    // arrives (never held whole). A server error (channel 3) rejects the import.
     let objectsImported = 0;
-    if (sidebandResult.packData.length > 0) {
-      const packData = sidebandResult.packData;
-      const packStream = (async function* () {
-        yield packData;
-      })();
-      const importResult = await repository.importPack(packStream);
+    try {
+      const pack = sidebandPackStream(readableStreamToAsyncIterable(uploadPackResponse.body));
+      const importResult = await repository.importPack(pack);
+      for await (const _ of pack) {
+        // the rest of the response after the pack
+      }
       objectsImported = importResult.objectsImported;
+    } catch (error) {
+      if (error instanceof ServerError) return { success: false, error: error.message };
+      throw error;
     }
 
     // Build updated refs map (apply refspec mapping if provided)

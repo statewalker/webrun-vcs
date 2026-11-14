@@ -6,4 +6,5 @@ export * from "./git-request-parser.js";
 export * from "./pkt-line-codec.js";
 export * from "./report-status.js";
 export * from "./sideband.js";
+export * from "./sideband-pack-stream.js";
 export * from "./types.js";

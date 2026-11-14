@@ -346,14 +346,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       timeout: this.timeout,
       onProgress: this.progressCallback,
       onProgressMessage: this.progressMessageCallback,
+      // the pack flows from the response into the object store as it arrives
+      onPack: (pack) => this.storePack(pack),
     };
 
     const transportResult = await transportClone(options);
-
-    // Store pack data
-    if (transportResult.packData.length > 0) {
-      await this.storePack(transportResult.packData);
-    }
 
     // Update refs based on clone mode
     const trackingUpdates: TrackingRefUpdate[] = [];
@@ -491,13 +488,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
-   * Store received pack data.
+   * Store the received pack as it arrives.
    *
-   * Unpacks the pack into the working copy's history, so the objects the
-   * cloned refs point at are actually available locally.
+   * Imports it into the working copy's history (kept as a pack when large and
+   * the history has packs, else unpacked), so the objects the cloned refs
+   * point at are available locally.
    */
-  private async storePack(packData: Uint8Array): Promise<void> {
-    await importPackIntoHistory(this._workingCopy.history, packData);
+  private async storePack(pack: AsyncIterable<Uint8Array>): Promise<void> {
+    await importPackIntoHistory(this._workingCopy.history, pack);
   }
 
   /**

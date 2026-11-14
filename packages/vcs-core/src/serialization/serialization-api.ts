@@ -15,24 +15,15 @@ import type { ObjectId } from "../common/id/index.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 
 /**
- * Object metadata returned when parsing
- */
-export interface ParsedObjectMeta {
-  /** Object ID (SHA-1 hash) */
-  id: ObjectId;
-  /** Object type */
-  type: ObjectTypeString;
-  /** Content size in bytes */
-  size: number;
-}
-
-/**
  * Result of importing a pack file
  */
 export interface PackImportResult {
   /** Total objects imported */
   objectsImported: number;
-  /** Blobs stored with delta preservation */
+  /**
+   * Always 0: received objects are stored byte for byte (loose, or inside a kept pack), never
+   * re-encoded as backend deltas.
+   */
   blobsWithDelta: number;
   /** Trees imported */
   treesImported: number;
@@ -40,6 +31,8 @@ export interface PackImportResult {
   commitsImported: number;
   /** Tags imported */
   tagsImported: number;
+  /** The kept pack's id, when the pack was installed instead of unpacked */
+  packId?: string;
 }
 
 /**
@@ -68,40 +61,6 @@ export interface PackOptions {
   maxChainDepth?: number;
   /** Progress callback */
   onProgress?: (stats: PackBuildStats) => void;
-}
-
-/**
- * Pack file header information
- */
-export interface PackHeader {
-  /** Pack version (usually 2) */
-  version: number;
-  /** Number of objects in the pack */
-  objectCount: number;
-}
-
-/**
- * Entry from reading a pack file
- */
-export interface PackEntry {
-  /** Object ID */
-  id: ObjectId;
-  /** Object type (resolved for deltas) */
-  type: ObjectTypeString;
-  /** Whether stored as delta in the pack */
-  isDelta: boolean;
-  /** Base object reference (for delta entries) */
-  baseRef?: ObjectId | number;
-  /** Raw content as stored in pack (may be delta) */
-  rawContent: AsyncIterable<Uint8Array>;
-  /** Resolved content (delta applied if needed) */
-  resolvedContent: AsyncIterable<Uint8Array>;
-  /** Uncompressed size */
-  size: number;
-  /** Delta chain depth (0 for non-deltas) */
-  chainDepth: number;
-  /** Compression ratio for deltas */
-  ratio?: number;
 }
 
 /**
@@ -157,36 +116,6 @@ export interface PackBuilder {
 }
 
 /**
- * PackReader - Streaming pack file parser
- *
- * Parse pack files entry by entry with automatic delta resolution.
- *
- * @example
- * ```typescript
- * const reader = serialization.createPackReader(packStream);
- *
- * const header = await reader.getHeader();
- * console.log(`Pack has ${header.objectCount} objects`);
- *
- * for await (const entry of reader.entries()) {
- *   // Use entry.resolvedContent for the actual content
- *   // Use entry.rawContent for delta-as-stored
- * }
- * ```
- */
-export interface PackReaderApi {
-  /**
-   * Iterate entries in pack order
-   */
-  entries(): AsyncIterable<PackEntry>;
-
-  /**
-   * Get pack header info
-   */
-  getHeader(): Promise<PackHeader>;
-}
-
-/**
  * SerializationApi - Git-compatible serialization interface
  *
  * Provides methods for:
@@ -201,9 +130,6 @@ export interface PackReaderApi {
  * for await (const chunk of stream) {
  *   // Write to .git/objects/XX/YYYY...
  * }
- *
- * // Parse a loose object
- * const { id, type } = await serialization.parseLooseObject(compressedStream);
  *
  * // Create a pack file
  * const packStream = serialization.createPack(objectIds);
@@ -224,16 +150,6 @@ export interface SerializationApi {
   serializeLooseObject(id: ObjectId): AsyncIterable<Uint8Array>;
 
   /**
-   * Parse Git loose format into internal representation
-   *
-   * Also stores the object in the backend.
-   *
-   * @param compressed Compressed object stream
-   * @returns Parsed object metadata
-   */
-  parseLooseObject(compressed: AsyncIterable<Uint8Array>): Promise<ParsedObjectMeta>;
-
-  /**
    * Create a pack file from objects
    *
    * @param objects Object IDs to pack
@@ -243,10 +159,10 @@ export interface SerializationApi {
   createPack(objects: AsyncIterable<ObjectId>, options?: PackOptions): AsyncIterable<Uint8Array>;
 
   /**
-   * Import objects from a pack file
-   *
-   * - Blob deltas: preserve if beneficial
-   * - Tree/commit deltas: resolve to full content on import
+   * Import objects from a received pack stream, byte for byte (see `importPack` in the pack
+   * module): a pack of at least `unpackLimit` objects is kept as a pack where the backend has
+   * packs (thin packs completed from the local objects), any other is unpacked into loose
+   * objects. The stream is never buffered whole. Refuses a corrupt pack with `PackError`.
    *
    * @param pack Pack file stream
    * @returns Import statistics
@@ -259,13 +175,6 @@ export interface SerializationApi {
    * @param options Pack builder options
    */
   createPackBuilder(options?: PackOptions): PackBuilder;
-
-  /**
-   * Create pack file reader
-   *
-   * @param pack Pack file stream
-   */
-  createPackReader(pack: AsyncIterable<Uint8Array>): PackReaderApi;
 
   /**
    * Export single object in Git format

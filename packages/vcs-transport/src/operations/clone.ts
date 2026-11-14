@@ -31,6 +31,8 @@ export interface CloneOptions extends BaseHttpOptions {
   onProgress?: (info: ProgressInfo) => void;
   /** Progress message callback */
   onProgressMessage?: (message: string) => void;
+  /** Receives the pack as it arrives; `packData` is then empty (see `FetchOptions.onPack`). */
+  onPack?: (pack: AsyncIterable<Uint8Array>) => Promise<void>;
 }
 
 /**
@@ -63,6 +65,7 @@ export async function clone(options: CloneOptions): Promise<CloneResult> {
     depth: options.depth,
     onProgress: options.onProgress,
     onProgressMessage: options.onProgressMessage,
+    onPack: options.onPack,
     // No local objects for clone
     localHas: undefined,
     localCommits: undefined,

@@ -95,7 +95,12 @@ describe("installPack: complete packs", () => {
     const files = createInMemoryFilesApi();
     const r = await installPack(files, PACK_DIR, chunks(built.bytes, 7));
     const packId = sha1hex(built.bytes.subarray(0, built.bytes.length - 20));
-    expect(r).toEqual({ packId, count: 3, appended: 0 });
+    expect(r).toEqual({
+      packId,
+      count: 3,
+      appended: 0,
+      types: { commit: 1, tree: 1, blob: 1, tag: 0 },
+    });
     expect(await listed(files)).toEqual([`pack-${packId}.idx`, `pack-${packId}.pack`]);
     expect(await collect(files.read(`${PACK_DIR}/pack-${packId}.pack`))).toEqual(built.bytes);
     const ids = [oidOf("blob", A), oidOf("tree", tree), oidOf("commit", commit)];
@@ -415,7 +420,12 @@ describe("installPack: thin packs completed through externalBase (--fix-thin)", 
     // installed again without externalBase, the completed pack gives the same id and idx
     const again = createInMemoryFilesApi();
     const r2 = await installPack(again, PACK_DIR, chunks(completed));
-    expect(r2).toEqual({ packId: r.packId, count: 4, appended: 0 });
+    expect(r2).toEqual({
+      packId: r.packId,
+      count: 4,
+      appended: 0,
+      types: { commit: 0, tree: 0, blob: 4, tag: 0 },
+    });
     expect(await readIdx(again, r.packId)).toEqual(idx);
   });
 

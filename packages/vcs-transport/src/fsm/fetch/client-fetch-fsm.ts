@@ -515,40 +515,39 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       try {
         // Handle sideband multiplexing
         if (state.capabilities.has("side-band-64k")) {
-          const packChunks: Uint8Array[] = [];
-
-          // Read pkt-lines and demux sideband channels until flush/eof.
-          // Uses readPktLine() directly because readSideband() throws on
-          // flush packets which are the normal termination signal.
-          while (true) {
-            const pkt = await transport.readPktLine();
-            if (pkt.type === "flush" || pkt.type === "eof") break;
-            if (pkt.type !== "data" || pkt.payload.length < 1) continue;
-
-            const channel = pkt.payload[0];
-            const data = pkt.payload.slice(1);
-
-            if (channel === 1) {
-              // Pack data channel
-              packChunks.push(data);
-            } else if (channel === 2) {
-              // Progress message channel
-              if (!config.noProgress) {
-                output.progress = new TextDecoder().decode(data);
+          // Demultiplex pkt-lines as the importer pulls them: the pack flows straight into
+          // importPack, never collected. readPktLine() is used directly because
+          // readSideband() throws on the flush that ends the pack.
+          let sidebandError: string | undefined;
+          const decoder = new TextDecoder();
+          const pack = (async function* () {
+            while (true) {
+              const pkt = await transport.readPktLine();
+              if (pkt.type === "flush" || pkt.type === "eof") return;
+              if (pkt.type !== "data" || pkt.payload.length < 1) continue;
+              const channel = pkt.payload[0];
+              const data = pkt.payload.subarray(1);
+              if (channel === 1) {
+                yield data;
+              } else if (channel === 2) {
+                if (!config.noProgress) output.progress = decoder.decode(data);
+              } else if (channel === 3) {
+                sidebandError = decoder.decode(data);
+                throw new Error(`Server error: ${sidebandError}`);
               }
-            } else if (channel === 3) {
-              // Error message from server
-              output.error = new TextDecoder().decode(data);
-              return "SIDEBAND_ERROR";
             }
-          }
-
-          // Import collected pack data
-          const packIterable = (async function* () {
-            for (const chunk of packChunks) yield chunk;
           })();
-          const importResult = await repository.importPack(packIterable);
-          output.objectCount = importResult.objectsImported;
+          try {
+            const importResult = await repository.importPack(pack);
+            for await (const _ of pack) {
+              // the rest of the response up to its flush (and any error after the pack)
+            }
+            output.objectCount = importResult.objectsImported;
+          } catch (e) {
+            if (sidebandError === undefined) throw e;
+            output.error = sidebandError;
+            return "SIDEBAND_ERROR";
+          }
         } else {
           // Raw pack data (no sideband)
           const importResult = await repository.importPack(transport.readPack());

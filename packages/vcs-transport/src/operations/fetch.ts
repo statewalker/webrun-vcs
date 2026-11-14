@@ -5,9 +5,11 @@
  * over HTTP/HTTPS.
  */
 
+import { readableStreamToAsyncIterable } from "../adapters/http/http-duplex.js";
 import type { ProgressInfo } from "../api/credentials.js";
 import type { RawFetchResult } from "../api/fetch-result.js";
 import type { BaseFetchOptions, BaseHttpOptions } from "../api/options.js";
+import { sidebandPackStream } from "../protocol/sideband-pack-stream.js";
 import { authorizationHeader } from "./http-auth.js";
 
 /**
@@ -27,6 +29,12 @@ export interface FetchOptions extends BaseHttpOptions, BaseFetchOptions {
   localHas?: (objectId: Uint8Array) => Promise<boolean>;
   /** Get local commit objects for negotiation */
   localCommits?: () => AsyncIterable<Uint8Array>;
+  /**
+   * Receives the pack as it arrives (demultiplexed from the response body), for example to
+   * pass it to vcs-core's `importPack`; `fetch` resolves once it has. With it the pack is never
+   * held whole and `packData` is empty; without it the pack is collected into `packData`.
+   */
+  onPack?: (pack: AsyncIterable<Uint8Array>) => Promise<void>;
 }
 
 /**
@@ -199,11 +207,29 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
       throw new Error("Empty response from /git-upload-pack");
     }
 
-    // Read response data
-    const responseData = new Uint8Array(await uploadPackResponse.arrayBuffer());
-
-    // Decode sideband response to extract pack data
-    const packData = decodeSidebandResponse(responseData, options.onProgressMessage);
+    // Demultiplex the response as it arrives: the pack flows to onPack (or is collected)
+    let bytesReceived = 0;
+    const body = (async function* () {
+      for await (const chunk of readableStreamToAsyncIterable(
+        uploadPackResponse.body as ReadableStream<Uint8Array>,
+      )) {
+        bytesReceived += chunk.length;
+        yield chunk;
+      }
+    })();
+    const onProgress = options.onProgressMessage;
+    const pack = sidebandPackStream(body, {
+      onProgress: onProgress && ((message) => onProgress(message.trim())),
+    });
+    let packData: Uint8Array = new Uint8Array(0);
+    if (options.onPack) {
+      await options.onPack(pack);
+      for await (const _ of pack) {
+        // the rest of the response, after the pack (and any error the server sent)
+      }
+    } else {
+      packData = await collectBytes(pack);
+    }
 
     if (timeoutId) clearTimeout(timeoutId);
 
@@ -211,7 +237,7 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
       refs,
       packData,
       defaultBranch,
-      bytesReceived: responseData.length,
+      bytesReceived,
       isEmpty: false,
     };
   } catch (error) {
@@ -307,76 +333,19 @@ function parseRefAdvertisementForFetch(data: Uint8Array): {
   return { refs, defaultBranch, isEmpty };
 }
 
-/**
- * Decode sideband response to extract pack data.
- *
- * Git uses sideband multiplexing:
- * - Channel 1: Pack data
- * - Channel 2: Progress messages
- * - Channel 3: Error messages
- */
-function decodeSidebandResponse(
-  data: Uint8Array,
-  onProgress?: (message: string) => void,
-): Uint8Array {
-  const packChunks: Uint8Array[] = [];
-  const textDecoder = new TextDecoder();
+/** All chunks of `stream`, joined. */
+async function collectBytes(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+    total += chunk.length;
+  }
+  const out = new Uint8Array(total);
   let offset = 0;
-
-  while (offset < data.length) {
-    // Read pkt-line length
-    if (offset + 4 > data.length) break;
-
-    const lengthHex = textDecoder.decode(data.slice(offset, offset + 4));
-    if (lengthHex === "0000") {
-      // Flush packet - end of section
-      offset += 4;
-      continue;
-    }
-
-    const length = parseInt(lengthHex, 16);
-    if (Number.isNaN(length) || length < 4) {
-      throw new Error(`Invalid packet length: ${lengthHex}`);
-    }
-
-    if (offset + length > data.length) {
-      throw new Error("Incomplete packet");
-    }
-
-    // Read packet payload (excluding length prefix)
-    const payload = data.slice(offset + 4, offset + length);
-
-    if (payload.length > 0) {
-      const channel = payload[0];
-      const content = payload.slice(1);
-
-      if (channel === 1) {
-        // Pack data
-        packChunks.push(content);
-      } else if (channel === 2) {
-        // Progress message
-        if (onProgress) {
-          const message = textDecoder.decode(content).trim();
-          onProgress(message);
-        }
-      } else if (channel === 3) {
-        // Error message
-        const errorMessage = textDecoder.decode(content).trim();
-        throw new Error(`Server error: ${errorMessage}`);
-      }
-    }
-
-    offset += length;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
   }
-
-  // Concatenate all pack data chunks
-  const totalLength = packChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const packData = new Uint8Array(totalLength);
-  let packOffset = 0;
-  for (const chunk of packChunks) {
-    packData.set(chunk, packOffset);
-    packOffset += chunk.length;
-  }
-
-  return packData;
+  return out;
 }

@@ -1,20 +1,40 @@
 /**
  * Tests for StreamingPackWriter
  *
- * Verifies that packs built with StreamingPackWriter are byte-parseable
- * by both parsePackEntries and parsePackEntriesFromStream.
+ * Verifies that packs built with StreamingPackWriter are read back by
+ * unpackObjects (git's unpack-objects).
  */
 
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { describe, expect, it } from "vitest";
+import { createGitObjects } from "../../src/history/objects/git-objects.impl.js";
 import {
   PackObjectType,
   PackWriterStream,
-  parsePackEntries,
-  parsePackEntriesFromStream,
   StreamingPackWriter,
+  unpackObjects,
 } from "../../src/pack/index.js";
+import { rawStorageStaging } from "../../src/storage/adapters/staging-blob-store.js";
+import { MemoryRawStorage } from "../../src/storage/raw/memory-raw-storage.js";
+
+/** The objects of a pack, in pack order, as unpackObjects stores them. */
+async function* parsePackEntriesFromStream(
+  pack: AsyncIterable<Uint8Array>,
+): AsyncGenerator<{ id: string; objectType: string }> {
+  const entries: { id: string; objectType: string }[] = [];
+  const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+  await unpackObjects(objects, pack, {
+    onObject: (id, objectType) => entries.push({ id, objectType }),
+  });
+  yield* entries;
+}
+
+async function parsePackEntries(packData: Uint8Array) {
+  const entries: { id: string; objectType: string }[] = [];
+  for await (const e of parsePackEntriesFromStream(toAsyncIterable([packData]))) entries.push(e);
+  return { entries };
+}
 
 /** Collect all chunks from an async generator into a single Uint8Array */
 async function collect(gen: AsyncIterable<Uint8Array>): Promise<Uint8Array> {

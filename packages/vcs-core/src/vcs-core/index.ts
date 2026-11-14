@@ -30,6 +30,7 @@ import {
 } from "../history/index.js";
 import type { Tag } from "../history/tags/tags.js";
 import type { TreeEntry } from "../history/trees/tree-entry.js";
+import { unpackObjects } from "../pack/index.js";
 import { DefaultSerializationApi } from "../serialization/serialization-api.impl.js";
 import type { SerializationApi } from "../serialization/serialization-api.js";
 import { blobStoreToRawStorage } from "../storage/adapters/blob-store-raw-storage.js";
@@ -103,7 +104,7 @@ export interface VcsCore {
   /** Garbage-collect unreachable objects; returns the pruned count. */
   gc(): Promise<{ pruned: number }>;
 
-  /** Import a pack, storing its objects and yielding their ids. */
+  /** Import a pack byte for byte (`unpackObjects`), yielding the ids of its objects. */
   readPack(pack: ByteStream): AsyncIterable<Oid>;
   /** Build a pack over the given object ids. */
   writePack(ids: Oid[]): ByteStream;
@@ -131,6 +132,7 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
     commits: createCommits(objects),
     tags: createTags(objects),
     refs: kvStoreRefs(deps.refs),
+    objects,
   });
   const serialization: SerializationApi = new DefaultSerializationApi({ history });
 
@@ -219,10 +221,10 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
 
     readPack(pack: ByteStream): AsyncIterable<Oid> {
       return (async function* () {
-        const reader = serialization.createPackReader(pack);
-        for await (const entry of reader.entries()) {
-          yield await serialization.importObject(entry.type, entry.resolvedContent);
-        }
+        // byte-exact, streamed: only the ids are kept to be yielded
+        const ids: Oid[] = [];
+        await unpackObjects(objects, pack, { onObject: (id) => ids.push(id) });
+        yield* ids;
       })();
     },
 

@@ -684,3 +684,49 @@ describe("Client-Server Integration", () => {
     expect(serverFetchHandlers.has("")).toBe(true);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RECEIVE_PACK streams the sideband pack into importPack
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("RECEIVE_PACK with side-band-64k", () => {
+  const band = (channel: number, bytes: number[]) =>
+    ({ type: "data", payload: Uint8Array.from([channel, ...bytes]) }) as unknown as PktLineResult;
+
+  it("hands importPack a stream, read only as the importer pulls it", async () => {
+    const transport = createMockTransport();
+    transport._setPackets([band(1, [1, 2]), band(2, [65]), band(1, [3]), { type: "flush" }]);
+    const repository = createMockRepository();
+    let readsBeforeImport = -1;
+    let received: number[] = [];
+    (repository.importPack as ReturnType<typeof vi.fn>).mockImplementation(
+      async (pack: AsyncIterable<Uint8Array>) => {
+        readsBeforeImport = (transport.readPktLine as ReturnType<typeof vi.fn>).mock.calls.length;
+        for await (const c of pack) received = [...received, ...c];
+        return {
+          objectsImported: 1,
+          blobsWithDelta: 0,
+          treesImported: 0,
+          commitsImported: 0,
+          tagsImported: 0,
+        };
+      },
+    );
+    const ctx = createContext({ transport, repository });
+    ctx.state.capabilities.add("side-band-64k");
+    const event = await clientFetchHandlers.get("RECEIVE_PACK")?.(ctx);
+    expect(event).toBe("PACK_RECEIVED");
+    expect(readsBeforeImport).toBe(0);
+    expect(received).toEqual([1, 2, 3]);
+  });
+
+  it("a server error after the pack is reported even if the importer stopped reading", async () => {
+    const transport = createMockTransport();
+    transport._setPackets([band(1, [1]), band(3, [98, 111, 111, 109]), { type: "flush" }]);
+    const ctx = createContext({ transport });
+    ctx.state.capabilities.add("side-band-64k");
+    const event = await clientFetchHandlers.get("RECEIVE_PACK")?.(ctx);
+    expect(event).toBe("SIDEBAND_ERROR");
+    expect(ctx.output.error).toBe("boom");
+  });
+});

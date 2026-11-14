@@ -4,21 +4,20 @@ import type { History, HistoryWithOperations } from "@statewalker/vcs-core";
 import { DefaultSerializationApi } from "@statewalker/vcs-core";
 
 /**
- * Unpack pack data into a history's object stores.
+ * Import a received pack stream into a history, byte for byte.
  *
  * Uses the history's own {@link SerializationApi} when it exposes one
- * (a `HistoryWithOperations`), otherwise builds a default one over its
- * object stores — `WorkingCopy.history` is typed as a plain `History`,
- * so `serialization` is not statically available.
+ * (a `HistoryWithOperations`), otherwise one over its object kernel
+ * (`history.objects`, `history.packs`). Either way the pack goes through
+ * vcs-core's `importPack`: kept as a pack when it is large and the history
+ * has packs, unpacked into loose objects otherwise, never buffered whole.
  */
-export async function importPackIntoHistory(history: History, packData: Uint8Array): Promise<void> {
+export async function importPackIntoHistory(
+  history: History,
+  pack: AsyncIterable<Uint8Array>,
+): Promise<void> {
   const serialization =
     (history as Partial<HistoryWithOperations>).serialization ??
     new DefaultSerializationApi({ history });
-
-  const packStream = (async function* () {
-    yield packData;
-  })();
-
-  await serialization.importPack(packStream);
+  await serialization.importPack(pack);
 }

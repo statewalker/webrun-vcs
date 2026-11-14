@@ -130,6 +130,7 @@ export async function createGitFilesBackend(
   const history = createHistoryFromComponents({
     objects,
     refs: refStore,
+    packs,
   });
 
   return { history, objects, packs, packDirectory, looseStorage };
