@@ -185,10 +185,9 @@ describe("GitFilesTreeDeltaApi (real PackDeltaStore)", () => {
 });
 
 describe("GitFilesDeltaApi tree integration", () => {
-  it("is covered by pack-delta-export tests (real end-to-end via createPackBuilder)", () => {
-    // The GitFilesDeltaApi wiring (trees?, commits?) is tested through
-    // pack-delta-export.test.ts which uses real DefaultSerializationApi
-    // + GitDeltaCompressor + createMemoryHistoryWithOperations
+  it("is covered by the writePack delta search tests (vcs-core tests/pack/write-pack.test.ts)", () => {
+    // Pack export deltas are searched by writePack (git's window search), end to end in
+    // vcs-core's write-pack tests and the native git interop tests of this package.
     expect(true).toBe(true);
   });
 });

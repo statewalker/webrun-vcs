@@ -5,25 +5,11 @@
  * over HTTP/HTTPS.
  */
 
-import { compressBlock } from "@statewalker/vcs-utils";
-import { sha1 } from "@statewalker/vcs-utils/hash";
-
 import type { BaseHttpOptions, BasePushOptions } from "../api/options.js";
 import { ZERO_OID } from "../protocol/constants.js";
 import { createEmptyPack } from "../protocol/pack-utils.js";
+import { requestBody, supportsRequestStreams } from "../utils/request-stream.js";
 import { authorizationHeader } from "./http-auth.js";
-
-/**
- * An object to push to the remote.
- */
-export interface PushObject {
-  /** Object ID (hex string) */
-  id: string;
-  /** Object type code (1=commit, 2=tree, 3=blob, 4=tag) */
-  type: number;
-  /** Object content */
-  content: Uint8Array;
-}
 
 /**
  * Options for the push operation.
@@ -35,10 +21,17 @@ export interface PushOptions extends BaseHttpOptions, BasePushOptions {
   onProgressMessage?: (message: string) => void;
   /** Get the object ID for a local ref */
   getLocalRef?: (refName: string) => Promise<string | undefined>;
-  /** Get objects to push for given new/old object IDs */
-  getObjectsToPush?: (newIds: string[], oldIds: string[]) => AsyncIterable<PushObject>;
-  /** Export a valid pack stream for the given wants/exclude sets (preferred over getObjectsToPush) */
+  /**
+   * The pack of the objects reachable from `wants` and not from `exclude` (the remote's refs),
+   * streamed (`SerializationApi.exportPack`, or `listObjects` + `writePack`). Required when the
+   * push sends objects.
+   */
   exportPack?: (wants: Set<string>, exclude: Set<string>) => AsyncIterable<Uint8Array>;
+  /**
+   * Stream the request body (fetch `duplex: "half"`). Default: where the runtime supports it
+   * (`supportsRequestStreams()`); Firefox and Safari collect the body first.
+   */
+  streamRequestBody?: boolean;
 }
 
 /**
@@ -88,9 +81,7 @@ export interface HttpPushResult {
  *   refspecs: ["refs/heads/main:refs/heads/main"],
  *   auth: { token: "ghp_xxx" },
  *   getLocalRef: async (ref) => store.refs.get(ref)?.objectId,
- *   getObjectsToPush: async function* (newIds, oldIds) {
- *     // yield objects reachable from newIds but not oldIds
- *   },
+ *   exportPack: (wants, exclude) => history.serialization.exportPack(wants, exclude),
  * });
  *
  * for (const [ref, status] of result.updates) {
@@ -206,8 +197,8 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
       };
     }
 
-    // Phase 3: Build push request
-    const requestChunks: Uint8Array[] = [];
+    // Phase 3: Build push request: the commands, then the pack, streamed as it is written
+    const commandChunks: Uint8Array[] = [];
 
     // Send ref update commands
     let firstUpdate = true;
@@ -228,44 +219,41 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
         : "";
 
       const line = `${update.oldOid} ${update.newOid} ${update.refName}${caps}`;
-      requestChunks.push(encodePacketLine(line));
+      commandChunks.push(encodePacketLine(line));
       firstUpdate = false;
     }
 
-    requestChunks.push(encodeFlush());
+    commandChunks.push(encodeFlush());
 
-    // Generate pack data
-    let objectCount = 0;
-    if (newOids.length > 0 && options.exportPack) {
-      // Preferred: use RepositoryFacade.exportPack for proper pack encoding
-      const wantsSet = new Set(newOids);
-      const excludeSet = new Set(oldOids);
-      for await (const chunk of options.exportPack(wantsSet, excludeSet)) {
-        requestChunks.push(chunk);
-      }
-      objectCount = newOids.length; // Approximate
-    } else if (newOids.length > 0 && options.getObjectsToPush) {
-      const packWriter = new PackWriter();
-
-      for await (const obj of options.getObjectsToPush(newOids, oldOids)) {
-        packWriter.addObject(obj);
-        objectCount++;
-      }
-
-      const packData = await packWriter.finish();
-      requestChunks.push(packData);
-    } else {
-      // Empty pack for delete-only operations
-      requestChunks.push(createEmptyPack());
+    const exportPack = options.exportPack;
+    if (newOids.length > 0 && !exportPack) {
+      throw new Error("push sends objects: exportPack is required");
     }
 
-    // Concatenate request body
-    const requestBodyLength = requestChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const requestBody = new Uint8Array(requestBodyLength);
-    let offset = 0;
-    for (const chunk of requestChunks) {
-      requestBody.set(chunk, offset);
-      offset += chunk.length;
+    // Counted as the request reads them: the bytes sent and the pack's object count
+    let bytesSent = 0;
+    let objectCount = 0;
+    const pack =
+      newOids.length > 0 && exportPack
+        ? exportPack(new Set(newOids), new Set(oldOids))
+        : [createEmptyPack()];
+    async function* body(): AsyncGenerator<Uint8Array> {
+      let head = new Uint8Array(0);
+      for (const chunk of commandChunks) {
+        bytesSent += chunk.length;
+        yield chunk;
+      }
+      for await (const chunk of pack) {
+        if (head.length < 12) {
+          const joined = new Uint8Array(head.length + chunk.length);
+          joined.set(head);
+          joined.set(chunk, head.length);
+          head = joined;
+          if (head.length >= 12) objectCount = new DataView(head.buffer).getUint32(8);
+        }
+        bytesSent += chunk.length;
+        yield chunk;
+      }
     }
 
     // Phase 4: POST /git-receive-pack
@@ -278,9 +266,9 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
           "Content-Type": "application/x-git-receive-pack-request",
           Accept: "application/x-git-receive-pack-result",
         },
-        body: requestBody,
+        ...(await requestBody(body(), options.streamRequestBody ?? supportsRequestStreams())),
         signal: controller?.signal,
-      }),
+      } as RequestInit),
     );
 
     if (!receivePackResponse.ok) {
@@ -309,7 +297,7 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
       ok: allOk,
       unpackStatus,
       updates,
-      bytesSent: requestBodyLength,
+      bytesSent,
       objectCount,
     };
   } catch (error) {
@@ -509,93 +497,4 @@ function parseReportStatus(
   }
 
   return { updates, unpackStatus };
-}
-
-/**
- * Simple pack writer for sending objects.
- */
-class PackWriter {
-  private objects: PushObject[] = [];
-
-  addObject(obj: PushObject): void {
-    this.objects.push(obj);
-  }
-
-  async finish(): Promise<Uint8Array> {
-    if (this.objects.length === 0) {
-      return createEmptyPack();
-    }
-
-    const textEncoder = new TextEncoder();
-    const chunks: Uint8Array[] = [];
-
-    // Pack header: "PACK" + version (2) + object count
-    const header = new Uint8Array(12);
-    header.set(textEncoder.encode("PACK"), 0);
-    header[4] = 0;
-    header[5] = 0;
-    header[6] = 0;
-    header[7] = 2;
-    const count = this.objects.length;
-    header[8] = (count >> 24) & 0xff;
-    header[9] = (count >> 16) & 0xff;
-    header[10] = (count >> 8) & 0xff;
-    header[11] = count & 0xff;
-    chunks.push(header);
-
-    // Pack objects (with zlib compression)
-    for (const obj of this.objects) {
-      chunks.push(await encodePackObject(obj));
-    }
-
-    // Concatenate all chunks
-    const dataLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const packContent = new Uint8Array(dataLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      packContent.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    // Compute SHA-1 checksum of pack content
-    const checksum = await sha1(packContent);
-
-    // Append checksum
-    const packData = new Uint8Array(dataLength + 20);
-    packData.set(packContent, 0);
-    packData.set(checksum, dataLength);
-
-    return packData;
-  }
-}
-
-/**
- * Encode a single pack object with zlib compression.
- */
-async function encodePackObject(obj: PushObject): Promise<Uint8Array> {
-  const header: number[] = [];
-  let size = obj.content.length;
-  const typeBits = obj.type & 0x7;
-
-  // First byte: type and size bits
-  let byte = (typeBits << 4) | (size & 0x0f);
-  size >>= 4;
-
-  while (size > 0) {
-    byte |= 0x80; // MSB continuation bit
-    header.push(byte);
-    byte = size & 0x7f;
-    size >>= 7;
-  }
-  header.push(byte);
-
-  // Zlib-compress the content (Git pack format requires this)
-  const compressed = await compressBlock(obj.content);
-
-  // Concatenate header and compressed content
-  const result = new Uint8Array(header.length + compressed.length);
-  result.set(new Uint8Array(header), 0);
-  result.set(compressed, header.length);
-
-  return result;
 }

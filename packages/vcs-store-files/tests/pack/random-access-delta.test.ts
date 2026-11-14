@@ -11,10 +11,10 @@ import {
   type FilesApi,
   findInstructionsForRange,
   PackObjectType,
-  PackWriterStream,
   readPackIndex,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
+import { CraftPackWriter } from "@statewalker/vcs-testing";
 import { beforeEach, describe, expect, it } from "vitest";
 import { PackReader } from "../../src/pack/index.js";
 
@@ -163,7 +163,7 @@ describe("random access delta reader", () => {
       }
       const id = fakeId(1000);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(id, PackObjectType.BLOB, content);
 
       const result = await writer.finalize();
@@ -210,7 +210,7 @@ describe("random access delta reader", () => {
       const deltaId = fakeId(2001);
       const delta = createFirstByteChangeDelta(baseContent.length, 0x01);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(deltaId, baseId, delta);
 
@@ -251,7 +251,7 @@ describe("random access delta reader", () => {
       const deltaId = fakeId(3001);
       const delta = createFirstByteChangeDelta(baseContent.length, 0x02);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(deltaId, baseId, delta);
 
@@ -287,7 +287,7 @@ describe("random access delta reader", () => {
       const deltaId = fakeId(4001);
       const delta = createFirstByteChangeDelta(baseContent.length, 0xbb);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(deltaId, baseId, delta);
 
@@ -334,7 +334,7 @@ describe("random access delta reader", () => {
       const id3 = fakeId(5003);
       const delta3 = createFirstByteChangeDelta(data2.length, 0x13);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addOfsDelta(id1, baseId, delta1);
       await writer.addOfsDelta(id2, id1, delta2);
@@ -385,7 +385,7 @@ describe("random access delta reader", () => {
       const deltaId = fakeId(6001);
       const delta = createFirstByteChangeDelta(baseContent.length, 0xff);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(deltaId, baseId, delta);
 
@@ -429,7 +429,7 @@ describe("random access delta reader", () => {
       const content = new Uint8Array(100).fill(0x55);
       const id = fakeId(7000);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(id, PackObjectType.BLOB, content);
 
       const result = await writer.finalize();
@@ -464,7 +464,7 @@ describe("random access delta reader", () => {
       const content = new Uint8Array(100).fill(0x66);
       const id = fakeId(8000);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(id, PackObjectType.BLOB, content);
 
       const result = await writer.finalize();
@@ -493,7 +493,7 @@ describe("random access delta reader", () => {
       const content = new Uint8Array(100).fill(0x77);
       const id = fakeId(9000);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(id, PackObjectType.BLOB, content);
 
       const result = await writer.finalize();

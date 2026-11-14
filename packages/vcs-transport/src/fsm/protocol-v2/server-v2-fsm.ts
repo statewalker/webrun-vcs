@@ -539,6 +539,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           ctx.state.commonBase ?? new Set(),
           {
             thin,
+            ofsDelta: req?.ofsDeltas ?? false,
             includeTag: req?.includeTags,
             filterSpec: req?.filter ?? undefined,
           },

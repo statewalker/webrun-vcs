@@ -45,6 +45,8 @@ export interface ExportPackOptions {
   filterSpec?: string;
   /** Shallow boundaries (objects that should not include parents) */
   shallow?: Set<string>;
+  /** Write deltas on a base in the pack as OFS deltas (the client's `ofs-delta`; default true) */
+  ofsDelta?: boolean;
 }
 
 export interface RepositoryFacade {
@@ -63,7 +65,7 @@ export interface RepositoryFacade {
    * Exports objects as a pack stream.
    * Collects reachable objects and serializes to pack format.
    *
-   * Delegates to: ObjectStore.collectReachable + SerializationApi.createPack
+   * Delegates to: SerializationApi.exportPack (listObjects + writePack)
    *
    * @param wants - Object IDs to include (with all reachable objects)
    * @param exclude - Object IDs to exclude (client already has these)

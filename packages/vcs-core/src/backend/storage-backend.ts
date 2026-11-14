@@ -34,8 +34,7 @@ import type { DeltaApi } from "../storage/delta/delta-api.js";
 
 // Re-export SerializationApi types for convenience
 export type {
-  PackBuilder,
-  PackBuildStats,
+  ExportOptions,
   PackImportResult,
   PackOptions,
   SerializationApi,

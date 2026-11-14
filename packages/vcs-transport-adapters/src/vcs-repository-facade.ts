@@ -2,8 +2,7 @@
  * VcsRepositoryFacade
  *
  * Implements RepositoryFacade using the History facade for object access.
- * Delegates to History.collectReachableObjects() for pack export and
- * SerializationApi for pack import/creation.
+ * Delegates pack export and import to SerializationApi (exportPack: listObjects + writePack).
  */
 
 import type { History, SerializationApi } from "@statewalker/vcs-core";
@@ -50,16 +49,19 @@ export class VcsRepositoryFacade implements RepositoryFacade {
 
   /**
    * Export objects as a pack stream.
-   * Collects reachable objects from wants, excluding those in exclude set.
-   * Delegates to History.collectReachableObjects().
+   * The objects reachable from wants and not from exclude, streamed.
+   * Delegates to SerializationApi.exportPack.
    */
-  async *exportPack(
+  exportPack(
     wants: Set<string>,
     exclude: Set<string>,
-    _options?: ExportPackOptions,
+    options?: ExportPackOptions,
   ): AsyncIterable<Uint8Array> {
-    const objectIds = this.history.collectReachableObjects(wants, exclude);
-    yield* this.serialization.createPack(objectIds);
+    return this.serialization.exportPack(wants, exclude, {
+      thinPack: options?.thin,
+      shallow: options?.shallow,
+      ofsDelta: options?.ofsDelta,
+    });
   }
 
   /**

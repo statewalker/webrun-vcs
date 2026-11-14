@@ -230,11 +230,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             const parts = line.split(" ");
             const oid = parts[1];
             state.wants.add(oid);
-            // Parse capabilities from first want
+            // The first want carries the client's capabilities: from here on they are what
+            // the pack is written for (thin-pack, ofs-delta, side-band), not the advertised ones
             if (parts.length > 2) {
-              for (const c of parts.slice(2)) {
-                state.capabilities.add(c);
-              }
+              state.capabilities = new Set(parts.slice(2));
             }
           } else if (line.startsWith("shallow ")) {
             hasShallow = true;
@@ -673,6 +672,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         // Export pack with options
         const packStream = repository.exportPack(state.wants, state.commonBase, {
           thin,
+          ofsDelta: state.capabilities.has("ofs-delta"),
           includeTag,
           filterSpec,
           shallow: state.serverShallow,

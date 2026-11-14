@@ -36,10 +36,12 @@ export interface Duplex {
   [Symbol.asyncIterator](): AsyncIterator<Uint8Array>;
 
   /**
-   * Writes data to the transport.
+   * Writes data to the transport. A returned Promise is backpressure: the writer waits for it
+   * before writing more (a stream whose reader lags, a socket whose buffer is full). A transport
+   * without flow control returns nothing.
    * @param data - The bytes to send
    */
-  write(data: Uint8Array): void;
+  write(data: Uint8Array): void | Promise<void>;
 
   /**
    * Closes the transport connection.

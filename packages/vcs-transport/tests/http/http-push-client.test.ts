@@ -164,7 +164,8 @@ describe("httpPush", () => {
           }
           // receive-pack - capture the body
           if (init?.body) {
-            const bodyArray = init.body as Uint8Array;
+            // the body streams (a ReadableStream) where the runtime supports it
+            const bodyArray = new Uint8Array(await new Response(init.body).arrayBuffer());
             const bodyText = new TextDecoder().decode(bodyArray);
             // Extract ref name from update line
             const match = bodyText.match(/refs\/heads\/\w+/);
@@ -196,7 +197,8 @@ describe("httpPush", () => {
           }
           // receive-pack
           if (init?.body) {
-            const bodyArray = init.body as Uint8Array;
+            // the body streams (a ReadableStream) where the runtime supports it
+            const bodyArray = new Uint8Array(await new Response(init.body).arrayBuffer());
             const bodyText = new TextDecoder().decode(bodyArray);
             // The remote ref should be main
             if (bodyText.includes("refs/heads/main")) {

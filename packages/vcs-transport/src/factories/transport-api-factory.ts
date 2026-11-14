@@ -179,38 +179,38 @@ class PktLineWriter {
   constructor(private duplex: Duplex) {}
 
   /**
-   * Writes a pkt-line with proper framing.
+   * Writes a pkt-line with proper framing. Each write waits for the duplex (backpressure).
    */
-  write(data: string | Uint8Array): void {
+  async write(data: string | Uint8Array): Promise<void> {
     const encoded = typeof data === "string" ? encodePacketLine(data) : encodePacket(data);
-    this.duplex.write(encoded);
+    await this.duplex.write(encoded);
   }
 
   /**
    * Writes a flush packet (0000).
    */
-  flush(): void {
-    this.duplex.write(encodeFlush());
+  async flush(): Promise<void> {
+    await this.duplex.write(encodeFlush());
   }
 
   /**
    * Writes a delimiter packet (0001).
    */
-  delimiter(): void {
-    this.duplex.write(encodeDelim());
+  async delimiter(): Promise<void> {
+    await this.duplex.write(encodeDelim());
   }
 
   /**
    * Writes data on a sideband channel.
    * Automatically chunks data that exceeds the pkt-line size limit.
    */
-  writeSideband(channel: 1 | 2 | 3, data: Uint8Array): void {
+  async writeSideband(channel: 1 | 2 | 3, data: Uint8Array): Promise<void> {
     const maxPayload = SIDEBAND_MAX_BUF - SIDEBAND_HDR_SIZE;
     let offset = 0;
     while (offset < data.length) {
       const end = Math.min(offset + maxPayload, data.length);
       const chunk = data.subarray(offset, end);
-      this.duplex.write(encodeSidebandPacket(channel, chunk));
+      await this.duplex.write(encodeSidebandPacket(channel, chunk));
       offset = end;
     }
   }
@@ -249,35 +249,20 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
   return {
     // Pkt-line level
     readPktLine: () => reader.read(),
-    writePktLine: (data) => {
-      writer.write(data);
-      return Promise.resolve();
-    },
-    writeFlush: () => {
-      writer.flush();
-      return Promise.resolve();
-    },
-    writeDelimiter: () => {
-      writer.delimiter();
-      return Promise.resolve();
-    },
+    writePktLine: (data) => writer.write(data),
+    writeFlush: () => writer.flush(),
+    writeDelimiter: () => writer.delimiter(),
 
     // Line level convenience
     readLine: async () => {
       const pkt = await reader.read();
       return pkt.type === "data" ? pkt.text : null;
     },
-    writeLine: (line) => {
-      writer.write(line.endsWith("\n") ? line : `${line}\n`);
-      return Promise.resolve();
-    },
+    writeLine: (line) => writer.write(line.endsWith("\n") ? line : `${line}\n`),
 
     // Sideband I/O
     readSideband: () => reader.readSideband(),
-    writeSideband: (channel, data) => {
-      writer.writeSideband(channel, data);
-      return Promise.resolve();
-    },
+    writeSideband: (channel, data) => writer.writeSideband(channel, data),
 
     // Pack streaming
     async *readPack(): AsyncGenerator<Uint8Array> {
@@ -333,13 +318,13 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
       if (state.hasCapability("side-band-64k")) {
         // Write pack data on sideband channel 1
         for await (const chunk of packStream) {
-          writer.writeSideband(1, chunk);
+          await writer.writeSideband(1, chunk);
         }
-        writer.flush();
+        await writer.flush();
       } else {
         // Write raw pack data
         for await (const chunk of packStream) {
-          duplex.write(chunk);
+          await duplex.write(chunk);
         }
       }
     },
@@ -348,7 +333,7 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
       // Write raw pack data bypassing sideband.
       // Used by push clients where sideband is server→client only.
       for await (const chunk of packStream) {
-        duplex.write(chunk);
+        await duplex.write(chunk);
       }
     },
 

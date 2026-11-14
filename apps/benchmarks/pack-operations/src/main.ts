@@ -7,9 +7,9 @@
  */
 
 import {
-  PackObjectType,
-  type PackWriterObject,
+  type GitObject,
   readPackIndex,
+  type WrittenPackEntry,
   writePack,
   writePackIndex,
 } from "@statewalker/vcs-core";
@@ -38,7 +38,12 @@ function createRandomContent(size: number, seed: number): Uint8Array {
 /**
  * Create a blob object for packing
  */
-async function createBlobObject(content: Uint8Array): Promise<PackWriterObject> {
+interface BlobObject {
+  id: string;
+  content: Uint8Array;
+}
+
+async function createBlobObject(content: Uint8Array): Promise<BlobObject> {
   // Git blob format: "blob <size>\0<content>"
   const header = new TextEncoder().encode(`blob ${content.length}\0`);
   const fullContent = new Uint8Array(header.length + content.length);
@@ -47,11 +52,7 @@ async function createBlobObject(content: Uint8Array): Promise<PackWriterObject> 
 
   const hashBytes = await sha1(fullContent);
   const id = bytesToHex(hashBytes);
-  return {
-    id,
-    type: PackObjectType.BLOB,
-    content,
-  };
+  return { id, content };
 }
 
 // ============================================================================
@@ -72,7 +73,7 @@ interface PackBenchmarkResult {
 
 async function runPackBenchmark(objectSizes: number[], seed: number): Promise<PackBenchmarkResult> {
   // Generate objects
-  const objects: PackWriterObject[] = [];
+  const objects: BlobObject[] = [];
   let totalContentSize = 0;
 
   for (let i = 0; i < objectSizes.length; i++) {
@@ -82,14 +83,41 @@ async function runPackBenchmark(objectSizes: number[], seed: number): Promise<Pa
     totalContentSize += content.length;
   }
 
-  // Write pack
+  // Write pack (streamed by writePack; collected here to measure its size)
+  const byId = new Map(objects.map((o) => [o.id, o.content]));
+  const source = {
+    async get(id: string): Promise<GitObject | undefined> {
+      const content = byId.get(id);
+      if (!content) return undefined;
+      return {
+        type: "blob",
+        size: content.length,
+        content: (async function* () {
+          yield content;
+        })(),
+      };
+    },
+  };
   const writeStart = performance.now();
-  const packResult = await writePack(objects);
+  const written: WrittenPackEntry[] = [];
+  let packSize = 0;
+  let packChecksum: Uint8Array = new Uint8Array(0);
+  for await (const chunk of writePack(
+    source,
+    objects.map((o) => o.id),
+    { onEntry: (e) => written.push(e) },
+  )) {
+    packSize += chunk.length;
+    packChecksum = chunk; // the last chunk is the SHA-1 trailer
+  }
   const writeTimeMs = performance.now() - writeStart;
 
   // Write index
   const indexWriteStart = performance.now();
-  const indexData = await writePackIndex(packResult.indexEntries, packResult.packChecksum);
+  const indexEntries = written
+    .map(({ id, offset, crc32 }) => ({ id, offset, crc32 }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const indexData = await writePackIndex(indexEntries, packChecksum);
   const indexWriteTimeMs = performance.now() - indexWriteStart;
 
   // Read and verify index
@@ -106,9 +134,9 @@ async function runPackBenchmark(objectSizes: number[], seed: number): Promise<Pa
   return {
     objectCount: objects.length,
     totalContentSize,
-    packSize: packResult.packData.length,
+    packSize,
     indexSize: indexData.length,
-    compressionRatio: packResult.packData.length / totalContentSize,
+    compressionRatio: packSize / totalContentSize,
     writeTimeMs,
     indexWriteTimeMs,
     readAllTimeMs: indexReadTimeMs, // Use index read time as proxy for "read" time

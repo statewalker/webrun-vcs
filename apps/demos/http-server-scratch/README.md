@@ -134,9 +134,8 @@ const result = await push({
   refspecs: ["refs/heads/feature-branch:refs/heads/feature-branch"],
   force: true,
   getLocalRef: async (refName) => (await history.refs.resolve(refName))?.objectId,
-  getObjectsToPush: async function* () {
-    yield* objectsToPush; // { id, type, content } for the commit, its trees and blobs
-  },
+  // listObjects + writePack (src/shared/export-pack.ts): the pack streams in the POST body
+  exportPack: (wants, exclude) => exportPack(history.objects, wants, exclude),
 });
 if (!result.ok) console.error(result.unpackStatus, result.updates);
 ```

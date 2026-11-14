@@ -5,7 +5,7 @@
  * repository operations needed during Git protocol negotiation.
  *
  * Uses HistoryWithOperations for all operations:
- * - collectReachableObjects() for efficient object graph traversal
+ * - SerializationApi.exportPack() (listObjects + writePack) for pack export
  * - SerializationApi for pack import/export
  * - Typed stores (Blobs, Trees, Commits, Tags, Refs) for object access
  */
@@ -28,8 +28,7 @@ export interface HistoryFacadeConfig {
 /**
  * Creates a RepositoryFacade from History facade with backend.
  *
- * Uses History.collectReachableObjects() for efficient object graph traversal
- * during pack export.
+ * Pack export goes through SerializationApi.exportPack (listObjects + writePack).
  *
  * @param config - History facade configuration
  * @returns RepositoryFacade implementation
@@ -64,14 +63,17 @@ function createRepositoryFacadeFromHistory(history: HistoryWithOperations): Repo
       return serialization.importPack(packStream);
     },
 
-    async *exportPack(
+    exportPack(
       wants: Set<string>,
       exclude: Set<string>,
-      _options?: ExportPackOptions,
+      options?: ExportPackOptions,
     ): AsyncIterable<Uint8Array> {
-      // Use History.collectReachableObjects for efficient traversal
-      const objectIds = history.collectReachableObjects(wants, exclude);
-      yield* serialization.createPack(objectIds);
+      // listObjects + writePack: streamed, stored entries reused, deltas searched
+      return serialization.exportPack(wants, exclude, {
+        thinPack: options?.thin,
+        shallow: options?.shallow,
+        ofsDelta: options?.ofsDelta,
+      });
     },
 
     // ─────────────────────────────────────────────────────────────────

@@ -18,6 +18,7 @@ import { createEmptyPack } from "../../protocol/pack-utils.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { parseReportStatusLines } from "../../protocol/report-status.js";
 import { sidebandPackStream } from "../../protocol/sideband-pack-stream.js";
+import { requestBody } from "../../utils/request-stream.js";
 import {
   collectChunks,
   decodeSidebandResponse,
@@ -462,30 +463,18 @@ export async function httpPush(
       requestChunks.push(encodeFlush());
     }
 
-    // Generate and append pack data if we have objects to send
-    if (wantedOids.size > 0) {
-      // Determine what objects the server already has
-      const excludeOids = new Set<string>();
-      for (const oid of state.refs.values()) {
-        excludeOids.add(oid);
+    // The pack follows the commands, streamed as it is written where the runtime streams
+    // request bodies (otherwise collected first: Firefox, Safari)
+    const excludeOids = new Set<string>(state.refs.values());
+    async function* body(): AsyncGenerator<Uint8Array> {
+      yield* requestChunks;
+      if (wantedOids.size > 0) {
+        // the objects the server does not have
+        yield* repository.exportPack(wantedOids, excludeOids);
+      } else {
+        // an empty pack for delete-only operations
+        yield createEmptyPack();
       }
-
-      // Export pack with objects the server doesn't have
-      for await (const chunk of repository.exportPack(wantedOids, excludeOids)) {
-        requestChunks.push(chunk);
-      }
-    } else {
-      // Send empty pack for delete-only operations
-      requestChunks.push(createEmptyPack());
-    }
-
-    // Concatenate request body
-    const requestBodyLength = requestChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const requestBody = new Uint8Array(requestBodyLength);
-    let offset = 0;
-    for (const chunk of requestChunks) {
-      requestBody.set(chunk, offset);
-      offset += chunk.length;
     }
 
     // Send POST request
@@ -496,8 +485,8 @@ export async function httpPush(
         "Content-Type": "application/x-git-receive-pack-request",
         Accept: "application/x-git-receive-pack-result",
       },
-      body: requestBody,
-    });
+      ...(await requestBody(body())),
+    } as RequestInit);
 
     if (!receivePackResponse.ok) {
       return {

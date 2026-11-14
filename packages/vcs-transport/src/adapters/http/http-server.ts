@@ -53,8 +53,11 @@ export interface HttpResponse {
   status: number;
   /** Response headers */
   headers: Record<string, string>;
-  /** Response body as Uint8Array */
-  body: Uint8Array;
+  /**
+   * Response body: bytes, or a stream (`handleUploadPack` streams the pack as it is written,
+   * pulled by the reader: a slow client slows the pack writer down).
+   */
+  body: Uint8Array | ReadableStream<Uint8Array>;
 }
 
 /**
@@ -194,9 +197,22 @@ export async function handleUploadPack(
   state.capabilities.add("shallow");
   state.capabilities.add("no-done");
 
-  // Collect response data
-  const responseChunks: Uint8Array[] = [];
-  const writer = (data: Uint8Array) => responseChunks.push(data);
+  // The response streams as the FSM writes it: each write waits until the reader pulled the
+  // previous chunk (an identity TransformStream with no readable buffer).
+  const pipe = new TransformStream<Uint8Array, Uint8Array>(
+    undefined,
+    { highWaterMark: 1 },
+    { highWaterMark: 0 },
+  );
+  const out = pipe.writable.getWriter();
+  let started: (() => void) | undefined;
+  const firstWrite = new Promise<"started">((resolve) => {
+    started = () => resolve("started");
+  });
+  const writer = (data: Uint8Array) => {
+    started?.();
+    return out.write(data);
+  };
 
   // Create duplex from request body and response writer
   const input = readableStreamToAsyncIterable(request.body);
@@ -222,41 +238,41 @@ export async function handleUploadPack(
   const fsm = new Fsm(serverFetchTransitions, serverFetchHandlers);
   fsm.setState("READ_WANTS");
 
-  try {
-    await fsm.run(ctx);
-
-    if (ctx.output.error) {
+  // a protocol error (output.error) was reported in band (sideband 3) once writing started;
+  // a thrown one breaks the stream
+  const run = fsm.run(ctx).then(
+    () => (ctx.output.error ? { error: new Error(ctx.output.error), thrown: false } : undefined),
+    (error: unknown) => ({
+      error: error instanceof Error ? error : new Error(String(error)),
+      thrown: true,
+    }),
+  );
+  // Until the FSM writes, a failure can still be a 500; after that the status is sent
+  const first = await Promise.race([run.then(() => "finished" as const), firstWrite]);
+  if (first === "finished") {
+    const failure = await run;
+    if (failure) {
+      await out.abort(failure.error).catch(() => {});
       return {
         status: 500,
         headers: { "Content-Type": "text/plain" },
-        body: textEncoder.encode(ctx.output.error),
+        body: textEncoder.encode(failure.error.message),
       };
     }
-
-    // Concatenate response chunks
-    const totalLength = responseChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const body = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of responseChunks) {
-      body.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    return {
-      status: 200,
-      headers: {
-        "Content-Type": "application/x-git-upload-pack-result",
-        "Cache-Control": "no-cache",
-      },
-      body,
-    };
-  } catch (error) {
-    return {
-      status: 500,
-      headers: { "Content-Type": "text/plain" },
-      body: textEncoder.encode(error instanceof Error ? error.message : String(error)),
-    };
   }
+  void run.then(async (failure) => {
+    if (failure?.thrown) await out.abort(failure.error).catch(() => {});
+    else await out.close().catch(() => {});
+  });
+
+  return {
+    status: 200,
+    headers: {
+      "Content-Type": "application/x-git-upload-pack-result",
+      "Cache-Control": "no-cache",
+    },
+    body: pipe.readable,
+  };
 }
 
 /**
@@ -375,7 +391,9 @@ export async function handleReceivePack(
 
   // Collect response data
   const responseChunks: Uint8Array[] = [];
-  const writer = (data: Uint8Array) => responseChunks.push(data);
+  const writer = (data: Uint8Array) => {
+    responseChunks.push(data);
+  };
 
   // Create duplex from request body and response writer
   const input = readableStreamToAsyncIterable(request.body);
@@ -745,6 +763,9 @@ export function fetchRequestToHttpRequest(request: Request): HttpRequest {
  * @returns Fetch API Response object
  */
 export function httpResponseToFetchResponse(response: HttpResponse): Response {
+  if (response.body instanceof ReadableStream) {
+    return new Response(response.body, { status: response.status, headers: response.headers });
+  }
   // Create a new ArrayBuffer from the Uint8Array for Response constructor compatibility
   const buffer = new ArrayBuffer(response.body.length);
   const view = new Uint8Array(buffer);

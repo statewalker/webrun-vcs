@@ -8,9 +8,9 @@ import {
   createInMemoryFilesApi,
   type FilesApi,
   PackObjectType,
-  PackWriterStream,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
+import { CraftPackWriter } from "@statewalker/vcs-testing";
 import { beforeEach, describe, expect, it } from "vitest";
 import { PackConsolidator, PackDirectory } from "../../src/pack/index.js";
 
@@ -24,12 +24,12 @@ describe("PackConsolidator", () => {
 
   /**
    * Helper to create a pack with specified objects
-   * Uses PackWriterStream directly (same approach as pack-directory tests)
+   * Uses CraftPackWriter directly (same approach as pack-directory tests)
    */
   async function createPack(
     objects: Array<{ id: string; content: Uint8Array }>,
   ): Promise<{ name: string; packData: Uint8Array; indexData: Uint8Array }> {
-    const writer = new PackWriterStream();
+    const writer = new CraftPackWriter();
 
     for (const obj of objects) {
       await writer.addObject(obj.id, PackObjectType.BLOB, obj.content);

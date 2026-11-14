@@ -11,7 +11,13 @@
  * - Pack format: PACK header + version + object count + entries + checksum
  */
 
-import { ObjectType, PackWriterStream, writePackIndexV2 } from "@statewalker/vcs-core";
+import {
+  type GitObject,
+  ObjectType,
+  type WrittenPackEntry,
+  writePack,
+  writePackIndexV2,
+} from "@statewalker/vcs-core";
 import { bytesToHex, decompressBlock } from "@statewalker/vcs-utils";
 import { joinPath, readFile } from "@statewalker/vcs-utils/files";
 import {
@@ -111,39 +117,57 @@ export async function run(): Promise<void> {
 
   log("\n--- Creating Pack File ---\n");
 
-  // Create pack using PackWriterStream
-  const packWriter = new PackWriterStream();
-  let objectsWritten = 0;
-
-  for (const objectId of looseObjectIds) {
-    const obj = await readLooseObject(objectId);
-    if (obj) {
-      await packWriter.addObject(objectId, obj.type, obj.content);
-      objectsWritten++;
-
-      const typeName = ["", "commit", "tree", "blob", "tag"][obj.type] || "unknown";
+  // Create the pack with writePack: it streams the header, each entry and the SHA-1 trailer,
+  // reading each object only when it writes it
+  const TYPE_NAMES = ["", "commit", "tree", "blob", "tag"] as const;
+  const source = {
+    async get(objectId: string): Promise<GitObject | undefined> {
+      const obj = await readLooseObject(objectId);
+      if (!obj) return undefined;
+      const typeName = TYPE_NAMES[obj.type] || "unknown";
       log(`  Added ${typeName}: ${shortId(objectId)} (${obj.content.length} bytes)`);
-    }
+      return {
+        type: TYPE_NAMES[obj.type] as GitObject["type"],
+        size: obj.content.length,
+        content: (async function* () {
+          yield obj.content;
+        })(),
+      };
+    },
+  };
+  const written: WrittenPackEntry[] = [];
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of writePack(source, looseObjectIds, {
+    onEntry: (e) => written.push(e),
+  })) {
+    chunks.push(chunk);
   }
+  const packData = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let at = 0;
+  for (const c of chunks) {
+    packData.set(c, at);
+    at += c.length;
+  }
+  const packChecksum = packData.subarray(packData.length - 20);
 
-  // Finalize pack
-  const result = await packWriter.finalize();
-
-  log(`\nPack created with ${objectsWritten} objects`);
-  logInfo("  Pack data size", `${result.packData.length} bytes`);
+  log(`\nPack created with ${written.length} objects`);
+  logInfo("  Pack data size", `${packData.length} bytes`);
 
   // Write pack file
-  const packName = `pack-${bytesToHex(result.packChecksum)}`;
+  const packName = `pack-${bytesToHex(packChecksum)}`;
 
   const files = createFilesApi();
   await files.mkdir(PACK_DIR);
 
   const packPath = joinPath(PACK_DIR, `${packName}.pack`);
-  await files.write(packPath, [result.packData]);
+  await files.write(packPath, [packData]);
   log(`\n  Written: ${packName}.pack`);
 
   // Write pack index
-  const indexData = await writePackIndexV2(result.indexEntries, result.packChecksum);
+  const indexEntries = written
+    .map(({ id, offset, crc32 }) => ({ id, offset, crc32 }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const indexData = await writePackIndexV2(indexEntries, packChecksum);
   const indexPath = joinPath(PACK_DIR, `${packName}.idx`);
   await files.write(indexPath, [indexData]);
   log(`  Written: ${packName}.idx`);
@@ -164,7 +188,7 @@ export async function run(): Promise<void> {
 
   // Show pack header
   log("\n--- Pack Header Analysis ---\n");
-  const packData = result.packData;
+  // packData is the pack written above
   const signature = new TextDecoder().decode(packData.subarray(0, 4));
   const version = (packData[4] << 24) | (packData[5] << 16) | (packData[6] << 8) | packData[7];
   const objectCount =

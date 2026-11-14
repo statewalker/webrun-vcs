@@ -116,3 +116,139 @@ export function buildPack(
   out.set(trailer, body.length);
   return out;
 }
+
+/** An entry of an idx: object id, entry offset and CRC-32 of the entry. */
+export interface CraftedIndexEntry {
+  id: string;
+  offset: number;
+  crc32: number;
+}
+
+/** A crafted pack held in memory, with the entries an idx needs (sorted by id). */
+export interface CraftedPack {
+  packData: Uint8Array;
+  packChecksum: Uint8Array;
+  indexEntries: CraftedIndexEntry[];
+}
+
+/**
+ * Lays out a pack entry by entry, deltas as given (REF or OFS), for tests of pack readers and
+ * stores that need a chosen layout. Not for production: `writePack` in vcs-core streams packs
+ * and finds deltas itself.
+ *
+ * @example
+ * ```typescript
+ * const w = new CraftPackWriter();
+ * await w.addObject(baseId, 3, base);
+ * await w.addOfsDelta(targetId, baseId, delta);
+ * const { packData, packChecksum, indexEntries } = await w.finalize();
+ * ```
+ */
+export class CraftPackWriter {
+  private readonly entries: CraftEntry[] = [];
+  private readonly ids: string[] = [];
+  private readonly index = new Map<string, number>();
+  private finalized = false;
+
+  /** A whole object (kind 1 commit, 2 tree, 3 blob, 4 tag). */
+  async addObject(id: string, type: number, content: Uint8Array): Promise<void> {
+    this.add(id, { kind: type, data: content });
+  }
+
+  /** A REF_DELTA on `baseId`. */
+  async addRefDelta(id: string, baseId: string, delta: Uint8Array): Promise<void> {
+    this.add(id, { kind: 7, data: delta, baseOid: baseId });
+  }
+
+  /** An OFS_DELTA on `baseId`, which must be an earlier entry. */
+  async addOfsDelta(id: string, baseId: string, delta: Uint8Array): Promise<void> {
+    const baseIdx = this.index.get(baseId);
+    if (baseIdx === undefined) throw new Error(`Base object ${baseId} not found in pack`);
+    this.add(id, { kind: 6, data: delta, baseIdx });
+  }
+
+  /** Whether `id` was added. */
+  getObjectOffset(id: string): number | undefined {
+    return this.index.get(id);
+  }
+
+  async finalize(): Promise<CraftedPack> {
+    if (this.finalized) throw new Error("Pack has already been finalized");
+    this.finalized = true;
+    return craftPackWithIndex(this.entries, this.ids);
+  }
+
+  private add(id: string, entry: CraftEntry) {
+    if (this.finalized) throw new Error("Pack has been finalized");
+    this.index.set(id, this.entries.length);
+    this.entries.push(entry);
+    this.ids.push(id);
+  }
+}
+
+/** A pack of whole objects (and REF deltas when `deltaBaseId`/`deltaData` are given), in memory. */
+export async function craftPackFile(
+  objects: readonly {
+    id: string;
+    type: number;
+    content: Uint8Array;
+    deltaBaseId?: string;
+    deltaData?: Uint8Array;
+  }[],
+): Promise<CraftedPack> {
+  const w = new CraftPackWriter();
+  for (const o of objects) {
+    if (o.deltaBaseId && o.deltaData) await w.addRefDelta(o.id, o.deltaBaseId, o.deltaData);
+    else await w.addObject(o.id, o.type, o.content);
+  }
+  return w.finalize();
+}
+
+/** `buildPack` of `entries`, with the offset and CRC-32 of each entry named by `ids`. */
+function craftPackWithIndex(entries: CraftEntry[], ids: string[]): CraftedPack {
+  const packData = buildPack(entries);
+  // walk the entries again to find where each starts (buildPack lays them out in order)
+  const indexEntries: CraftedIndexEntry[] = [];
+  let at = 12;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i] as CraftEntry;
+    const start = at;
+    let size = e.data.length;
+    at++;
+    size = Math.floor(size / 16);
+    while (size) {
+      at++;
+      size = Math.floor(size / 128);
+    }
+    if (e.kind === 6) {
+      while ((packData[at] as number) & 0x80) at++;
+      at++;
+    }
+    if (e.kind === 7) at += 20;
+    at += compressBlockPako(e.data).length;
+    indexEntries.push({
+      id: ids[i] as string,
+      offset: start,
+      crc32: crc32Of(packData.subarray(start, at)),
+    });
+  }
+  indexEntries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return { packData, packChecksum: packData.slice(packData.length - 20), indexEntries };
+}
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32Of(data: Uint8Array): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < data.length; i++)
+    c = (CRC_TABLE[(c ^ (data[i] as number)) & 0xff] as number) ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}

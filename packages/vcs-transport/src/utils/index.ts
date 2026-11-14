@@ -11,6 +11,7 @@ export {
   matchSource,
   parseRefSpec,
 } from "./refspec.js";
+export { requestBody, supportsRequestStreams, toReadableStream } from "./request-stream.js";
 export {
   formatGitUrl,
   getDefaultPort,

@@ -145,7 +145,7 @@ Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }`
 
 `fetch` sends wants, so it fails unless a pack comes back (git sends an empty pack, 32 bytes, when every wanted object is already present): a caller never writes refs to objects it did not receive. `httpFetch` and the fetch state machine refuse a missing pack the same way. When the import (or anything after the request) fails, the response body is cancelled. `timeout` bounds each wait for the server, a response or the next chunk of a body, not the whole fetch: the time `onPack` spends storing a large pack does not count, while a server that stops sending is still cut off.
 
-The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3 and on an `ERR <message>` line. `httpFetch` and the fetch state machine import the pack this way too. The request bodies (wants and haves) are still built in memory: they are small, and a streamed request body needs `duplex: "half"`, which not every browser supports.
+The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3 and on an `ERR <message>` line. `httpFetch` and the fetch state machine import the pack this way too. The fetch request bodies (wants and haves) are still built in memory: they are small. A push streams its body (see below).
 
 ### HTTP: push
 
@@ -165,7 +165,9 @@ for (const [ref, status] of result.updates) {
 }
 ```
 
-`push` produces pack data with `exportPack` (preferred) or `getObjectsToPush`. It also accepts `force` and `atomic`.
+`exportPack` produces the pack: the objects reachable from the pushed tips and not from the remote's refs, as `history.serialization.exportPack` (vcs-core's `listObjects` and `writePack`) streams it. It is required whenever the push sends objects; a delete-only push sends git's empty pack. `push` also accepts `force` and `atomic`, and reports `bytesSent` and `objectCount` (read from the pack header as it goes by).
+
+The pack is not collected. The commands and the pack go out in the POST body as a `ReadableStream` with `duplex: "half"`, pulled as the connection takes it, so the pack writer runs no further ahead than the network. `supportsRequestStreams()` makes the usual check (a `Request` built with a stream body must read its `duplex` option and add no `Content-Type`): Chromium, Node, Deno and Bun pass. Firefox and Safari do not support streaming request bodies; there the body is collected and sent whole, which holds the pack in memory. `streamRequestBody: false` forces that, `true` forces streaming. `httpPush` sends its body the same way, and `requestBody(chunks)` is the helper both use.
 
 ### Smart-HTTP server
 
@@ -185,6 +187,10 @@ const handleGit = createFetchHandler({
 ```
 
 Lower-level pieces are also exported: `createHttpHandler`, `createGitHttpServer`, `handleInfoRefs`, `handleUploadPack`, `handleReceivePackInfoRefs`, `handleReceivePack`, `parseGitRequest`, `fetchRequestToHttpRequest`, `httpResponseToFetchResponse`.
+
+`handleUploadPack` streams its response: `HttpResponse.body` is then a `ReadableStream`, returned as soon as the negotiation starts writing, and each pack chunk waits until the reader took the previous one. A failure before the first byte is still a 500; after it, the error travels in band (sideband channel 3) and a thrown one breaks the stream. `httpResponseToFetchResponse` passes a stream body through; a Node server should write it chunk by chunk and wait for `drain`. The pack follows the capabilities the client asked for in its first `want` line: a thin pack only with `thin-pack`, OFS deltas only with `ofs-delta`. Received packs (`handleReceivePack`, the push state machine) go through vcs-core's `importPack` as before.
+
+Every writer in the transport awaits `Duplex.write`: a duplex may return a Promise to apply backpressure (the upload-pack response and `createGitSocketClient` do), or nothing when it has no flow control (the MessagePort and webrun adapters queue).
 
 ### Smart-HTTP without a network port
 

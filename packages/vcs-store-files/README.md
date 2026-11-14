@@ -231,7 +231,9 @@ New objects are always written loose. Packs are only read, until `repack()` turn
 into a pack. This keeps writes simple (one file per object, no pack index to rewrite) and matches
 how `git` itself behaves between `git gc` runs. A pack `repack()` writes through `PackDirectory`
 is read by `packs` at once (the backend refreshes the set after each `addPack` and `removePack`;
-a failed refresh does not fail them, and the next miss rescans).
+a failed refresh does not fail them, and the next miss rescans). `repack()` writes its pack with
+vcs-core's `writePack`, reading each loose object only as it is written; the pack is then held
+whole once, because `PackDirectory.addPack` takes it as bytes.
 
 ### Reachability is computed from refs only
 
@@ -291,7 +293,7 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
 ### Dependencies
 
 - `@statewalker/vcs-core`: the store interfaces, `FilesApi`, `GitObjects`,
-  `CompositeRawStorage`, pack reading/writing (`StreamingPackWriter`, `writePackIndexV2`), and
+  `CompositeRawStorage`, pack reading/writing (`writePack`, `writePackIndexV2`), and
   `createHistoryFromComponents` / `createGitFilesHistory`.
 - `@statewalker/vcs-utils`: zlib `deflate`/`inflate`, SHA-1.
 - `@statewalker/vcs-working-tree`: the `Staging`, `Worktree`, `Checkout`, `WorkingCopy`

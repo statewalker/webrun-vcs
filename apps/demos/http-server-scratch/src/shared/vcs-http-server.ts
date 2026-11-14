@@ -18,10 +18,11 @@
 
 import { type ServerType, serve } from "@hono/node-server";
 import {
+  type ListedObject,
+  listObjects,
   type ObjectTypeCode,
-  PackWriterStream,
   typeCodeToString,
-  typeStringToCode,
+  writePack,
 } from "@statewalker/vcs-core";
 import {
   CAPABILITY_DELETE_REFS,
@@ -391,53 +392,14 @@ export class VcsHttpServer {
     wants: string[],
     haves: string[],
   ): Promise<{ packData: Uint8Array }> {
-    const haveSet = new Set(haves);
-    const seen = new Set<string>();
-    const objectsToSend: Array<{ id: string; type: number; content: Uint8Array }> = [];
-
-    const collectObject = async (id: string): Promise<void> => {
-      if (seen.has(id) || haveSet.has(id)) return;
-      seen.add(id);
-
-      const header = await storage.objects.get(id);
-      if (!header) throw new Error(`Object not found: ${id}`);
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of header.content) {
-        chunks.push(chunk);
-      }
-      const content = this.concatBytes(chunks);
-
-      objectsToSend.push({ id, type: typeStringToCode(header.type), content });
-
-      if (header.type === "commit") {
-        const commit = await storage.commits.load(id);
-        if (commit) {
-          await collectObject(commit.tree);
-          for (const parent of commit.parents) {
-            await collectObject(parent);
-          }
-        }
-      } else if (header.type === "tree") {
-        const entries = await storage.trees.load(id);
-        if (entries) {
-          for await (const entry of entries) {
-            await collectObject(entry.id);
-          }
-        }
-      }
-    };
-
-    for (const wantId of wants) {
-      await collectObject(wantId);
+    // git rev-list --objects, then git pack-objects (whole objects and found deltas)
+    const listed: ListedObject[] = [];
+    for await (const o of listObjects(storage.objects, { wants, haves })) listed.push(o);
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of writePack(storage.objects, listed, { deltaSearch: true })) {
+      chunks.push(chunk);
     }
-
-    const packWriter = new PackWriterStream();
-    for (const obj of objectsToSend) {
-      await packWriter.addObject(obj.id, obj.type, obj.content);
-    }
-    const result = await packWriter.finalize();
-
-    return { packData: result.packData };
+    return { packData: this.concatBytes(chunks) };
   }
 
   /**

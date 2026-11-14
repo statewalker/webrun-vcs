@@ -1,8 +1,7 @@
-import { serializeCommit, serializeTree, type TreeEntry } from "@statewalker/vcs-core";
+import { DefaultSerializationApi, type HistoryWithOperations } from "@statewalker/vcs-core";
 import {
   mapRejectReason,
   type PushCommandResult,
-  type PushObject,
   push as transportPush,
 } from "@statewalker/vcs-transport";
 
@@ -358,19 +357,15 @@ export class PushCommand extends TransportCommand<PushResult> {
       };
     }
 
-    // Build exportPack if history supports serialization (HistoryWithOperations)
+    // The pack of what the remote lacks, streamed (listObjects + writePack): through the
+    // history's serialization where it has one (its packs reused), else through one over its
+    // stores (the object kernel, or the typed stores of a history that keeps parsed objects)
     const history = this._workingCopy.history;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const serialization = (history as any).serialization as
-      | { createPack(objectIds: AsyncIterable<string>): AsyncIterable<Uint8Array> }
-      | undefined;
-
-    const exportPack = serialization
-      ? async function* (wants: Set<string>, exclude: Set<string>): AsyncIterable<Uint8Array> {
-          const objectIds = history.collectReachableObjects(wants, exclude);
-          yield* serialization.createPack(objectIds);
-        }
-      : undefined;
+    const serialization =
+      (history as Partial<HistoryWithOperations>).serialization ??
+      new DefaultSerializationApi({ history });
+    const exportPack = (wants: Set<string>, exclude: Set<string>) =>
+      serialization.exportPack(wants, exclude);
 
     // Object ids resolved for each source ref, captured as the transport asks
     // for them, so we report the value that was really sent on the wire.
@@ -402,8 +397,6 @@ export class PushCommand extends TransportCommand<PushResult> {
         }
         return ref?.objectId;
       },
-      getObjectsToPush: (newIds: string[], oldIds: string[]) =>
-        this.getObjectsToPush(newIds, oldIds),
     });
 
     // Convert to PushResult.
@@ -518,165 +511,5 @@ export class PushCommand extends TransportCommand<PushResult> {
     }
 
     return specs;
-  }
-
-  /**
-   * Get objects to push.
-   *
-   * Returns objects reachable from newIds but not from oldIds.
-   */
-  private async *getObjectsToPush(newIds: string[], oldIds: string[]): AsyncIterable<PushObject> {
-    // Build set of commits to exclude (already on remote)
-    const excludeCommits = new Set<string>();
-    for (const oldId of oldIds) {
-      if (oldId !== "0".repeat(40)) {
-        await this.collectReachableCommits(oldId, excludeCommits);
-      }
-    }
-
-    // Walk from new commits and yield objects not in exclude set
-    const visitedObjects = new Set<string>();
-    const commitQueue: string[] = [...newIds.filter((id) => id !== "0".repeat(40))];
-
-    while (commitQueue.length > 0) {
-      const commitId = commitQueue.shift();
-      if (commitId === undefined) break;
-
-      if (excludeCommits.has(commitId) || visitedObjects.has(commitId)) {
-        continue;
-      }
-      visitedObjects.add(commitId);
-
-      try {
-        const commit = await this.commits.load(commitId);
-        if (!commit) continue;
-
-        // Yield commit object
-        yield await this.loadObjectForPush(commitId, 1);
-
-        // Yield tree and its contents
-        yield* this.yieldTreeObjects(commit.tree, visitedObjects);
-
-        // Queue parent commits
-        for (const parent of commit.parents) {
-          if (!excludeCommits.has(parent) && !visitedObjects.has(parent)) {
-            commitQueue.push(parent);
-          }
-        }
-      } catch {
-        // Commit not found, skip
-      }
-    }
-  }
-
-  /**
-   * Collect all commits reachable from a given commit.
-   */
-  private async collectReachableCommits(
-    commitId: string,
-    result: Set<string>,
-    maxDepth = 1000,
-  ): Promise<void> {
-    const queue: string[] = [commitId];
-    let depth = 0;
-
-    while (queue.length > 0 && depth < maxDepth) {
-      const id = queue.shift();
-      if (id === undefined) break;
-      if (result.has(id)) {
-        continue;
-      }
-      result.add(id);
-      depth++;
-
-      try {
-        const commit = await this.commits.load(id);
-        if (commit) queue.push(...commit.parents);
-      } catch {
-        // Commit not found, skip
-      }
-    }
-  }
-
-  /**
-   * Yield tree and blob objects recursively.
-   */
-  private async *yieldTreeObjects(
-    treeId: string,
-    visited: Set<string>,
-  ): AsyncGenerator<PushObject> {
-    if (visited.has(treeId)) {
-      return;
-    }
-    visited.add(treeId);
-
-    // Yield tree object
-    yield await this.loadObjectForPush(treeId, 2);
-
-    // Recursively process tree entries
-    for await (const entry of this.trees.loadTree(treeId)) {
-      if (visited.has(entry.id)) {
-        continue;
-      }
-
-      const isTree = (entry.mode & 0o170000) === 0o040000;
-      if (isTree) {
-        yield* this.yieldTreeObjects(entry.id, visited);
-      } else {
-        // Blob
-        visited.add(entry.id);
-        yield await this.loadObjectForPush(entry.id, 3);
-      }
-    }
-  }
-
-  /**
-   * Load an object for pushing.
-   *
-   * Serializes objects to raw Git format based on type:
-   * - type 1 (commit): serialize via serializeCommit()
-   * - type 2 (tree): serialize via serializeTree()
-   * - type 3 (blob): load raw content from blob store
-   */
-  private async loadObjectForPush(objectId: string, type: number): Promise<PushObject> {
-    let content: Uint8Array;
-
-    if (type === 1) {
-      // Commit
-      const commit = await this.commits.load(objectId);
-      if (!commit) {
-        throw new Error(`Commit not found: ${objectId}`);
-      }
-      content = serializeCommit(commit);
-    } else if (type === 2) {
-      // Tree
-      const entries: TreeEntry[] = [];
-      for await (const entry of this.trees.loadTree(objectId)) {
-        entries.push(entry);
-      }
-      content = serializeTree(entries);
-    } else {
-      // Blob (type 3) or other
-      const chunks: Uint8Array[] = [];
-      const blobContent = await this.blobs.load(objectId);
-      if (blobContent) {
-        for await (const chunk of blobContent) {
-          chunks.push(chunk);
-        }
-      }
-      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      content = new Uint8Array(totalLength);
-      let offset = 0;
-      for (const chunk of chunks) {
-        content.set(chunk, offset);
-        offset += chunk.length;
-      }
-    }
-
-    return {
-      id: objectId,
-      type,
-      content,
-    };
   }
 }

@@ -82,6 +82,8 @@ async function runPush(options: {
     url: "http://example.test/repo.git",
     refspecs: options.refspecs,
     getLocalRef: async () => LOCAL_OID,
+    // the stub server reads only the commands
+    exportPack: async function* () {},
     fetchImpl: async (request: Request) => {
       if (request.url.includes("/info/refs")) {
         return new Response(advertisement(options.advertisedRefs), { status: 200 });
@@ -145,6 +147,7 @@ describe("push() — ref advertisement", () => {
       url: "http://example.test/repo.git",
       refspecs: ["refs/tags/v1:refs/tags/v1"],
       getLocalRef: async () => LOCAL_OID,
+      exportPack: async function* () {},
       fetchImpl: async (request: Request) => {
         if (request.url.includes("/info/refs")) {
           return new Response(advertised, { status: 200 });
