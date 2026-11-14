@@ -531,7 +531,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
 
       // If using OURS/THEIRS/UNION, conflicts are auto-resolved
       // Store the merged content
-      const mergedBlobId = await this.blobs.store([mergeResult.content]);
+      const mergedBlobId = await this.blobs.store(
+        [mergeResult.content],
+        mergeResult.content.length,
+      );
 
       return {
         name: ours.name,

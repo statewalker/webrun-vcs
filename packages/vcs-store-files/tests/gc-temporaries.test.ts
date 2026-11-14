@@ -28,3 +28,34 @@ describe("gc and repack skip temporaries in fan-out directories", () => {
     expect(await files.exists(tmp)).toBe(true);
   });
 });
+
+describe("gc removes stale temporaries, as git prune does", () => {
+  it("removes tmp_obj_* older than the expiry, keeps fresh ones, none in a dry run", async () => {
+    const { mkdtempSync, rmSync, utimesSync, writeFileSync, existsSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { createNodeFilesApi } = await import("@statewalker/vcs-utils-node/files");
+    const dir = mkdtempSync(join(tmpdir(), "gc-tmp-"));
+    try {
+      const files = createNodeFilesApi({ rootDir: dir });
+      const backend = await createGitFilesBackend({ files, create: true });
+      const stale = join(dir, ".git/objects/tmp_obj_crashed");
+      const fresh = join(dir, ".git/objects/tmp_obj_writing");
+      writeFileSync(stale, "partial");
+      writeFileSync(fresh, "partial");
+      const old = new Date(Date.now() - 15 * 24 * 3600_000);
+      utimesSync(stale, old, old);
+
+      const dry = await gc({ history: backend.history, files, dryRun: true });
+      expect(dry.removedTemporaries).toBe(0);
+      expect(existsSync(stale)).toBe(true);
+
+      const result = await gc({ history: backend.history, files });
+      expect(result.removedTemporaries).toBe(1);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(fresh)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

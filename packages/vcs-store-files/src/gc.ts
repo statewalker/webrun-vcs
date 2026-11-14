@@ -8,7 +8,11 @@
 import type { FilesApi, History } from "@statewalker/vcs-core";
 import { joinPath } from "@statewalker/vcs-core";
 
+import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
+
+/** git prune's default expiry (gc.pruneExpire = 2.weeks.ago), also used for temporaries. */
+const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** A loose object file name, fan-out directory included. */
 const OBJECT_ID = /^[0-9a-f]{40}$/;
@@ -25,6 +29,11 @@ export interface GcOptions {
   gitDir?: string;
   /** If true, report what would be removed without actually removing (default: false) */
   dryRun?: boolean;
+  /**
+   * Remove `tmp_obj_*` temporaries (left by a crashed write) older than this,
+   * as `git prune` does (default: two weeks). Not done in a dry run.
+   */
+  tmpExpiryMs?: number;
 }
 
 /**
@@ -37,6 +46,8 @@ export interface GcResult {
   reachableObjects: number;
   /** Total number of loose objects scanned */
   totalLooseObjects: number;
+  /** Stale temporaries removed (always 0 in a dry run) */
+  removedTemporaries: number;
 }
 
 /**
@@ -59,7 +70,7 @@ export interface GcResult {
  * ```
  */
 export async function gc(options: GcOptions): Promise<GcResult> {
-  const { history, files, gitDir = ".git", dryRun = false } = options;
+  const { history, files, gitDir = ".git", dryRun = false, tmpExpiryMs = TWO_WEEKS_MS } = options;
 
   // Step 1: Collect all ref tips
   const refTips = new Set<string>();
@@ -95,9 +106,14 @@ export async function gc(options: GcOptions): Promise<GcResult> {
     }
   }
 
+  const removedTemporaries = dryRun
+    ? 0
+    : await filesStagingStore(files, objectsDir).sweepStaged(tmpExpiryMs);
+
   return {
     removedObjects,
     reachableObjects: reachable.size,
     totalLooseObjects,
+    removedTemporaries,
   };
 }

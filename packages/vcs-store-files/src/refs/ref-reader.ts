@@ -229,8 +229,9 @@ async function readLooseRefsRecursive(
         if (entry.kind === "directory") {
           // Recurse into subdirectory
           await readLooseRefsRecursive(files, gitDir, entryPath, refs);
-        } else if (!entry.name.endsWith(".lock")) {
-          // A ref file (`<ref>.lock` is another writer's pending update, not a ref, as for git)
+        } else if (!entry.name.endsWith(".lock") && !entry.name.startsWith(".")) {
+          // A ref file. `<ref>.lock` is another writer's pending update, and no ref
+          // name starts with "." (git's loose-ref scan skips such names too).
           const ref = await readLooseRef(files, gitDir, entryPath);
           if (ref !== undefined) {
             refs.push(ref);

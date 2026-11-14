@@ -36,7 +36,7 @@ Main exports:
 | `createGitFilesHistoryFromFiles(options)` | Same options, returns a `HistoryWithOperations` (adds `delta` and `serialization` backed by the pack directory). |
 | `FileStagingStore(files, indexPath)` | `Staging` stored in Git's binary index format (`.git/index`). |
 | `createFileWorktree({ files, rootPath, blobs, trees, gitDir? })` / `FileWorktree` | `Worktree` over the working directory, with `.gitignore` support and `checkoutTree`. |
-| `gc({ history, files, gitDir?, dryRun? })` | Deletes loose objects not reachable from any ref. |
+| `gc({ history, files, gitDir?, dryRun?, tmpExpiryMs? })` | Deletes loose objects not reachable from any ref, and `tmp_obj_*` temporaries older than two weeks. |
 | `repack({ looseStorage, packDirectory, dryRun? })` | Moves all loose objects into one new pack. |
 | `FileGcStrategy({ looseStorage, packDirectory })` | `GcStrategy` for `@statewalker/vcs-core`: `prune`, `compact` (= `repack`), `getStats`. |
 
@@ -122,7 +122,7 @@ import { createGitFilesBackend, FileGcStrategy, gc, repack } from "@statewalker/
 
 const { history, looseStorage, packDirectory } = await createGitFilesBackend({ files });
 
-await gc({ history, files, dryRun: true }); // { removedObjects, reachableObjects, totalLooseObjects }
+await gc({ history, files, dryRun: true }); // { removedObjects, reachableObjects, totalLooseObjects, removedTemporaries }
 await gc({ history, files }); // deletes unreachable loose objects
 
 const packed = await repack({ looseStorage, packDirectory });
@@ -217,8 +217,9 @@ its cache by default (`maxCachedPacks`).
 object outside that set. It only looks at refs: objects held only by the index, older stash entries
 (kept only in the `refs/stash` reflog), and objects another process is writing right now are not
 protected.
-There is no grace period like `git gc`'s two weeks. Run `dryRun: true` first if in doubt. Packed
-objects are never deleted.
+There is no grace period like `git gc`'s two weeks for objects. Run `dryRun: true` first if in
+doubt. Packed objects are never deleted. Temporaries left by a crashed write (`tmp_obj_*`) are
+removed once older than `tmpExpiryMs` (two weeks, git prune's default); a dry run removes none.
 
 ### What `repack` does and does not do
 

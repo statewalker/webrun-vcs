@@ -222,7 +222,7 @@ export class DefaultSerializationApi implements SerializationApi {
             blobsWithDelta++;
           } else {
             // Store as full blob
-            await this._blobs.store([entry.content]);
+            await this._blobs.store([entry.content], entry.content.length);
           }
           break;
 

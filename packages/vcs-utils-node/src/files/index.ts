@@ -7,6 +7,7 @@
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
+import { StreamingNodeFilesApi } from "./streaming-node-files.js";
 
 /**
  * Create a Node.js filesystem-backed FilesApi instance.
@@ -24,9 +25,10 @@ import { NodeFilesApi } from "@statewalker/webrun-files-node";
  * ```
  */
 export function createNodeFilesApi(options: { rootDir: string }): FilesApi {
-  return new NodeFilesApi(options);
+  // Streams writes chunk by chunk (NodeFilesApi 0.10 collects them first).
+  return new StreamingNodeFilesApi(options);
 }
 
 export { createNodeAtomicFiles } from "./node-atomic-files.js";
 // Re-export for direct access if needed
-export { NodeFilesApi };
+export { NodeFilesApi, StreamingNodeFilesApi };

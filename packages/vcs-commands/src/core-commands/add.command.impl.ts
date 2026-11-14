@@ -17,6 +17,7 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import type { Add, AddOptions, AddResult } from "./add.command.js";
+import { storeWorktreeFile } from "./store-worktree-file.js";
 
 /**
  * Options for creating an AddCommand.
@@ -222,7 +223,7 @@ export class AddCommand implements Add {
       }
 
       // Hash and store content
-      const objectId = await this.storeFileContent(file.path);
+      const objectId = await storeWorktreeFile(this.blobs, this.worktree, file.path, worktreeEntry);
 
       // Add to staging
       editor.add(
@@ -250,16 +251,6 @@ export class AddCommand implements Add {
    */
   async addAll(options: AddOptions = {}): Promise<AddResult> {
     return this.add(["**/*"], { ...options, all: true });
-  }
-
-  /**
-   * Store file content as blob and return object ID.
-   */
-  private async storeFileContent(path: string): Promise<string> {
-    // Read content from working tree
-    const content = this.worktree.readContent(path);
-    // Store using BlobStore which handles Git header automatically
-    return await this.blobs.store(content);
   }
 }
 

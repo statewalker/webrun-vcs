@@ -166,7 +166,7 @@ export class GitResolutionStore implements ResolutionStore {
         // Get content from working tree and stage it
         const content = await this.readWorktreeFile(conflict.path);
         if (content) {
-          const objectId = await this.blobs.store([content]);
+          const objectId = await this.blobs.store([content], content.length);
           await this.markResolved(conflict.path, {
             strategy: "manual",
             objectId,
