@@ -655,3 +655,28 @@ describe("SqlNativeBlobStore early stops and leftovers", () => {
     expect(await strategy.sweepStale(1000)).toBe(1);
   });
 });
+
+describe("SqlNativeBlobStore publish without its placeholder", () => {
+  let db: SqlJsAdapter;
+  beforeEach(async () => {
+    db = await SqlJsAdapter.create();
+  });
+  afterEach(async () => {
+    await db.close();
+  });
+
+  it("fails rather than report a blob that is not stored", async () => {
+    const store = new SqlNativeBlobStoreImpl(db);
+    await store.store([new Uint8Array(10)]); // create the tables
+    const transaction = db.transaction.bind(db);
+    // another process sweeps the placeholder (no age guard) just before it is published
+    db.transaction = (async (fn: Parameters<typeof db.transaction>[0]) => {
+      await db.execute("DELETE FROM vcs_blob WHERE blob_id LIKE 'tmp:%'", []);
+      return transaction(fn);
+    }) as typeof db.transaction;
+    const big = new Uint8Array(600 * 1024).fill(3);
+    await expect(store.store([big], big.length)).rejects.toThrow(/disappeared/);
+    db.transaction = transaction;
+    expect(await store.count()).toBe(1);
+  });
+});

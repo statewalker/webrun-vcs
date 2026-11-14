@@ -291,3 +291,43 @@ describe("rawStorageStaging.sweepStale", () => {
     expect(await objects.sweepStale?.({ olderThanMs: 1000 })).toBe(1);
   });
 });
+
+describe("rawStorageStaging threshold boundary and early failures", () => {
+  const sized = (n: number) =>
+    (async function* () {
+      yield new Uint8Array(n);
+    })();
+
+  it("keeps exactly the threshold in memory and streams one byte more", async () => {
+    const small = new MemoryRawStorage();
+    const smallOps: string[] = [];
+    const move = small.move?.bind(small);
+    small.move = async (a, b) => {
+      smallOps.push("move");
+      return (await move?.(a, b)) ?? false;
+    };
+    const store = rawStorageStaging(small, { inlineThreshold: 1024 });
+    await store.putStaged(sized(1024), () => "at");
+    expect(smallOps).toEqual([]);
+    await store.putStaged(sized(1025), () => "over");
+    expect(smallOps).toEqual(["move"]);
+  });
+
+  it("releases the source when the raw store fails before reading", async () => {
+    const raw = new MemoryRawStorage();
+    raw.store = async () => {
+      throw new Error("not initialized");
+    };
+    const store = rawStorageStaging(raw, { inlineThreshold: 1024 });
+    let released = false;
+    const source = (async function* () {
+      try {
+        for (let i = 0; i < 8; i++) yield new Uint8Array(1024);
+      } finally {
+        released = true;
+      }
+    })();
+    await expect(store.putStaged(source, () => "x")).rejects.toThrow("not initialized");
+    expect(released).toBe(true);
+  });
+});

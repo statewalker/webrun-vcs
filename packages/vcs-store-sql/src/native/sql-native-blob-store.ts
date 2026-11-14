@@ -163,12 +163,19 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
     onBytes?: (chunk: Uint8Array) => void,
   ): Promise<{ blobFk: number; tmpId: string; totalSize: number }> {
     const tmpId = `${TMP_PREFIX}${randomHexId()}`;
-    const inserted = await this.db.execute(
-      `INSERT INTO ${BLOB_TABLE} (blob_id, content, size, storage_type, created_at) VALUES (?, NULL, 0, 'chunked', ?)`,
-      [tmpId, Date.now()],
-    );
-    const blobFk = inserted.lastInsertRowId;
+    // In flight before the row exists: a sweep in this process never sees it unprotected.
     inFlight.add(tmpId);
+    let blobFk: number;
+    try {
+      const inserted = await this.db.execute(
+        `INSERT INTO ${BLOB_TABLE} (blob_id, content, size, storage_type, created_at) VALUES (?, NULL, 0, 'chunked', ?)`,
+        [tmpId, Date.now()],
+      );
+      blobFk = inserted.lastInsertRowId;
+    } catch (e) {
+      inFlight.delete(tmpId);
+      throw e;
+    }
     let position = 0;
     let totalSize = 0;
     try {
@@ -204,11 +211,14 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
         [blobId],
       );
       if (existing.length > 0) return false;
-      await tx.execute(`UPDATE ${BLOB_TABLE} SET blob_id = ?, size = ? WHERE id = ?`, [
-        blobId,
-        totalSize,
-        blobFk,
-      ]);
+      const updated = await tx.execute(
+        `UPDATE ${BLOB_TABLE} SET blob_id = ?, size = ? WHERE id = ?`,
+        [blobId, totalSize, blobFk],
+      );
+      // The placeholder is gone (swept by another process with no age guard): the blob is
+      // not stored, so say so rather than return an id with nothing behind it.
+      if (updated.changes === 0)
+        throw new Error(`Placeholder for ${blobId} disappeared before it was published`);
       return true;
     });
     if (!kept) await this.dropRow(blobFk);

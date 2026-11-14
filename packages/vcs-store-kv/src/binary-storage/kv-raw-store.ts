@@ -33,6 +33,8 @@ interface Manifest {
  */
 const inFlight = new Set<string>();
 let activeWrites = 0;
+/** Bumped when a store or move starts: a sweep with no age guard aborts if it changed. */
+let generation = 0;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -156,6 +158,7 @@ export class KvRawStore implements RawStorage {
     let published = false;
     inFlight.add(token);
     activeWrites++;
+    generation++;
     try {
       const put = async (chunk: Uint8Array) => {
         await this.kv.set(this.chunkKey(token, count++), chunk);
@@ -233,6 +236,7 @@ export class KvRawStore implements RawStorage {
   async move(from: string, to: string): Promise<boolean> {
     if (from === to) return this.has(from);
     activeWrites++;
+    generation++;
     let token: string | undefined;
     try {
       const m = await this.manifest(from);
@@ -300,6 +304,7 @@ export class KvRawStore implements RawStorage {
    */
   async sweepStale({ olderThanMs }: SweepStaleOptions): Promise<number> {
     if (olderThanMs <= 0 && activeWrites > 0) return 0;
+    const startGeneration = generation;
     const cutoff = Date.now() - olderThanMs;
     // Chunks first, manifests second: a write published in between is then seen.
     const chunkPrefix = `${this.prefix}:chunk:`;
@@ -328,6 +333,10 @@ export class KvRawStore implements RawStorage {
         return 0;
       }
     }
+    // Without an age guard, a store or move that ran during the scans could have published a
+    // candidate after its manifest was passed: remove nothing then (checked synchronously, just
+    // before deleting; a candidate with no manifest and nothing in flight cannot be moved later).
+    if (olderThanMs <= 0 && (activeWrites > 0 || generation !== startGeneration)) return 0;
     let removed = 0;
     for (const [token, keys] of candidates) {
       if (inFlight.has(token)) continue;

@@ -199,3 +199,37 @@ describe("KvRawStore holding git objects (same id twice)", () => {
     expect(writes).toBe(0);
   });
 });
+
+describe("KvRawStore.sweepStale racing a move", () => {
+  it("with olderThanMs 0 removes nothing when a move runs during its manifest scan", async () => {
+    const kv = new MemoryKVAdapter();
+    const store = new KvRawStore(kv, "test", { chunkSize: 1024 });
+    const big = (fill: number) =>
+      (async function* () {
+        yield new Uint8Array(3000).fill(fill);
+      })();
+    await store.store("id", big(1)); // manifest:id first in the listing
+    await store.store("tmp2", big(2)); // a staged write, not in flight any more
+    const list = kv.list.bind(kv);
+    let moved = false;
+    kv.list = (prefix: string) =>
+      (async function* () {
+        for await (const key of list(prefix)) {
+          yield key;
+          if (!moved && prefix.includes("manifest")) {
+            moved = true; // the staged value is published while the scan is past manifest:id
+            await store.move("tmp2", "id");
+          }
+        }
+      })();
+    await store.sweepStale({ olderThanMs: 0 });
+    let n = 0;
+    let last = 0;
+    for await (const c of store.load("id")) {
+      n += c.length;
+      last = c[c.length - 1] as number;
+    }
+    expect(n).toBe(3000);
+    expect(last).toBe(2);
+  });
+});

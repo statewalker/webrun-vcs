@@ -187,6 +187,7 @@ export function rawStorageStaging(
         size += r.value.length;
       }
       if (ended) return putCollected(head, idOf);
+      let settled = false;
       async function* rest() {
         let done = false;
         try {
@@ -194,14 +195,24 @@ export function rawStorageStaging(
           for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
           done = true;
         } finally {
+          settled = true;
           // stopped early (a failing store): release the source
           if (!done) await it.return?.();
         }
       }
-      if (raw.move) return putMoving(raw.move, rest(), idOf);
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of rest()) chunks.push(chunk);
-      return putCollected(chunks, idOf);
+      const remaining = rest();
+      try {
+        if (raw.move) return await putMoving(raw.move, remaining, idOf);
+        const chunks: Uint8Array[] = [];
+        for await (const chunk of remaining) chunks.push(chunk);
+        return await putCollected(chunks, idOf);
+      } catch (error) {
+        // A store that failed before reading never started `rest`, whose finally would release
+        // the source: release it here (a suspended `rest` is closed, which runs its finally).
+        await remaining.return(undefined).catch(() => {});
+        if (!settled) await Promise.resolve(it.return?.()).catch(() => {});
+        throw error;
+      }
     },
     async spool(content) {
       const key = tmpKey();
