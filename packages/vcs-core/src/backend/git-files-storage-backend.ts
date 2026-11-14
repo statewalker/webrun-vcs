@@ -15,9 +15,11 @@
 import type { ObjectId } from "../common/id/object-id.js";
 import type { Blobs } from "../history/blobs/blobs.js";
 import type { Commits } from "../history/commits/commits.js";
+import type { GitObjects } from "../history/objects/git-objects.js";
 import type { Refs } from "../history/refs/refs.js";
 import type { Tags } from "../history/tags/tags.js";
 import type { Trees } from "../history/trees/trees.js";
+import type { PackSet } from "../pack/pack-set.js";
 import type {
   BlobDeltaApi,
   BlobDeltaChainInfo,
@@ -51,6 +53,10 @@ export interface GitFilesStorageBackendConfig extends BaseBackendConfig {
   refs: Refs;
   /** Pack-based delta store for native Git delta operations */
   packDeltaStore: DeltaStore;
+  /** The object kernel under the stores; received packs are written through it */
+  objects?: GitObjects;
+  /** The installed packs; large received packs are kept here */
+  packs?: PackSet;
 }
 
 /**

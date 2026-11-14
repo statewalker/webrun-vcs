@@ -40,25 +40,34 @@ export function createSimpleDuplex(
 /**
  * HTTP request body adapter.
  *
- * Wraps a ReadableStream (from fetch Response) as an async iterable.
+ * Wraps a ReadableStream (from fetch Response) as an async iterable. When iteration stops before
+ * the end of the stream (the consumer throws, breaks or returns), the stream is cancelled, so a
+ * response body is not left open.
  */
 export async function* readableStreamToAsyncIterable(
   stream: ReadableStream<Uint8Array>,
 ): AsyncIterable<Uint8Array> {
   const reader = stream.getReader();
+  let ended = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        ended = true;
+        break;
+      }
       if (value) yield value;
     }
   } finally {
+    // stopped early (the consumer threw or returned): the rest of the body is not wanted
+    if (!ended) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }
 
 /**
- * Collects all chunks from an async iterable into a single Uint8Array.
+ * Collects all chunks from an async iterable into a single Uint8Array. For small bodies only
+ * (ref advertisements, push report-status); packs are streamed with `sidebandPackStream`.
  */
 export async function collectChunks(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   const parts: Uint8Array[] = [];
@@ -80,43 +89,6 @@ export async function collectChunks(chunks: AsyncIterable<Uint8Array>): Promise<
 }
 
 /**
- * Buffer writer that collects all writes into an array.
- *
- * Used for HTTP client to collect response data.
- */
-export class BufferWriter {
-  private chunks: Uint8Array[] = [];
-
-  write(data: Uint8Array): void {
-    this.chunks.push(data);
-  }
-
-  getChunks(): Uint8Array[] {
-    return this.chunks;
-  }
-
-  async toUint8Array(): Promise<Uint8Array> {
-    return collectChunks(this.iterate());
-  }
-
-  async *iterate(): AsyncIterable<Uint8Array> {
-    for (const chunk of this.chunks) {
-      yield chunk;
-    }
-  }
-}
-
-/**
- * Creates a Duplex for an HTTP client request.
- *
- * The client writes request body data, then reads response body data.
- * Since HTTP is half-duplex, we collect all writes first, send the request,
- * then return the response as the readable side.
- *
- * @param sendRequest - Function that sends HTTP request and returns response body
- * @returns Object with duplex for writing and getResponse for reading after send
- */
-/**
  * Result of decoding a sideband-encoded HTTP response.
  */
 export interface SidebandDecodedResponse {
@@ -131,7 +103,8 @@ export interface SidebandDecodedResponse {
 const textDecoder = new TextDecoder();
 
 /**
- * Decodes a sideband-encoded HTTP response buffer.
+ * Decodes a sideband-encoded HTTP response buffer: for small responses such as push
+ * report-status. Fetched packs are demultiplexed as they arrive by `sidebandPackStream`.
  *
  * Parses pkt-lines from a buffered response, separating sideband channels:
  * - Channel 1: pack data
@@ -195,22 +168,4 @@ export function decodeSidebandResponse(data: Uint8Array): SidebandDecodedRespons
   }
 
   return { packData, progressMessages, error };
-}
-
-export function createHttpClientDuplex(
-  sendRequest: (body: Uint8Array) => Promise<ReadableStream<Uint8Array>>,
-): {
-  writer: BufferWriter;
-  sendAndGetReadable: () => Promise<AsyncIterable<Uint8Array>>;
-} {
-  const writer = new BufferWriter();
-
-  return {
-    writer,
-    async sendAndGetReadable(): Promise<AsyncIterable<Uint8Array>> {
-      const body = await writer.toUint8Array();
-      const responseStream = await sendRequest(body);
-      return readableStreamToAsyncIterable(responseStream);
-    },
-  };
 }

@@ -121,10 +121,6 @@ export function createMockSerializationApi(): SerializationApi {
       })();
     },
 
-    async parseLooseObject(_compressed) {
-      return { id: "0".repeat(40), type: "blob" as const, size: 0 };
-    },
-
     createPack(objects, _options) {
       return (async function* () {
         const objectIds: string[] = [];
@@ -188,19 +184,6 @@ export function createMockSerializationApi(): SerializationApi {
             totalSize: 0,
             deltaSavings: 0,
           };
-        },
-      };
-    },
-
-    createPackReader(_pack) {
-      return {
-        entries() {
-          return (async function* () {
-            // Empty iterator
-          })();
-        },
-        async getHeader() {
-          return { version: 2, objectCount: 0 };
         },
       };
     },

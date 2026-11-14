@@ -37,7 +37,7 @@ export interface ServeResult {
 export interface RawFetchResult {
   /** Map of ref names to object IDs */
   refs: Map<string, Uint8Array>;
-  /** Pack data received */
+  /** Pack data received; empty when an `onPack` callback consumed the pack as it arrived */
   packData: Uint8Array;
   /** Default branch name */
   defaultBranch?: string;

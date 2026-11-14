@@ -65,6 +65,8 @@ export interface InstalledPack {
   count: number;
   /** bases appended to complete a thin pack */
   appended: number;
+  /** objects per type */
+  types: Record<ObjectTypeString, number>;
 }
 
 /** One `.idx` entry. */
@@ -1057,7 +1059,9 @@ export async function installPack(
     }
     const packId = hex(packChecksum);
     const idx = writeIdxFrom(t, packChecksum);
-    const result: InstalledPack = { packId, count: t.n, appended: appendedCount };
+    const types: Record<ObjectTypeString, number> = { commit: 0, tree: 0, blob: 0, tag: 0 };
+    for (let i = 0; i < t.n; i++) types[TYPE_NAMES[t.type[i] as number] as ObjectTypeString]++;
+    const result: InstalledPack = { packId, count: t.n, appended: appendedCount, types };
     const name = `${dir}/pack-${packId}`;
     if ((await files.exists(`${name}.pack`)) && (await files.exists(`${name}.idx`))) {
       // the same pack is already installed (a repeated fetch): keep it, as git does

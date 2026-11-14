@@ -105,7 +105,7 @@ const { type, body } = parseGitWireFormat(bytes); // type is the blob type code
 ### How the facades map onto vcs-core
 
 - `VcsRepositoryFacade.exportPack` collects objects with `history.collectReachableObjects(wants, exclude)` and encodes them with `serialization.createPack`. Pack import goes through the `SerializationApi` too.
-- `createStorageRepositoryFacade` builds the full stack from two byte stores: `blobStoreToRawStorage(objects)` feeds `createGitObjects(rawStorageStaging(...))`, `kvStoreRefs(refs)` provides refs, `createHistoryFromStores` composes a `History`, and `DefaultSerializationApi` handles packs. It returns the facade plus a transport `RefStore` over the same refs.
+- `createStorageRepositoryFacade` builds the full stack from two byte stores: `blobStoreToRawStorage(objects)` feeds `createGitObjects(rawStorageStaging(...))`, `kvStoreRefs(refs)` provides refs, `createHistoryFromStores` composes a `History` (with the object kernel as its `objects`), and `DefaultSerializationApi` handles packs. Received packs (a push, a fetch) are written through that kernel byte for byte, so a commit with a header the commit parser does not model, such as `mergetag`, keeps its id. It returns the facade plus a transport `RefStore` over the same refs.
 - `VcsRepositoryAccess.updateRef` uses the refs store's `compareAndSwap` when an old id is given, so concurrent updates fail instead of overwriting.
 - `GitNativeRepositoryAccess` reads straight from a `GitObjects` (`getRaw` returns the object in wire format), so no re-serialization is needed.
 

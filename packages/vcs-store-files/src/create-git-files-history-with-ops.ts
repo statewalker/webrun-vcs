@@ -56,7 +56,7 @@ export async function createGitFilesHistoryFromFiles(
   const gitDir = backendOptions.gitDir ?? ".git";
 
   // Create the base backend (loose objects, refs)
-  const { history, objects: _objects } = await createGitFilesBackend(backendOptions);
+  const { history, objects, packs } = await createGitFilesBackend(backendOptions);
 
   // Create PackDeltaStore for delta compression
   const packDir = joinPath(gitDir, "objects", "pack");
@@ -74,5 +74,7 @@ export async function createGitFilesHistoryFromFiles(
     tags: history.tags,
     refs: history.refs,
     packDeltaStore,
+    objects,
+    packs,
   });
 }

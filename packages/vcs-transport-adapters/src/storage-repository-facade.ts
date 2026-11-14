@@ -72,6 +72,8 @@ export function createStorageRepositoryFacade(
     commits: createCommits(objectStore),
     tags: createTags(objectStore),
     refs: coreRefs,
+    // received packs go through the kernel byte for byte, not through the typed stores
+    objects: objectStore,
   });
   const serialization: SerializationApi = new DefaultSerializationApi({ history });
   const facade = createVcsRepositoryFacade({ history, serialization });

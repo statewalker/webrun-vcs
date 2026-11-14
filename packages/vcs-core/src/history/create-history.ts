@@ -21,6 +21,7 @@ import type {
 } from "../backend/history-backend-factory.js";
 import { MemoryDeltaApi } from "../backend/memory-storage-backend.js";
 import type { BackendCapabilities } from "../backend/storage-backend.js";
+import type { PackSet } from "../pack/pack-set.js";
 import { DefaultSerializationApi } from "../serialization/serialization-api.impl.js";
 import { rawStorageStaging } from "../storage/adapters/staging-blob-store.js";
 import { MemoryRawStorage } from "../storage/raw/memory-raw-storage.js";
@@ -53,6 +54,10 @@ export interface HistoryStoresConfig {
   tags: Tags;
   /** Reference (branch/tag pointer) storage */
   refs: Refs;
+  /** The object kernel the stores sit on (received packs are written through it) */
+  objects?: GitObjects;
+  /** The installed packs, for backends that keep packs */
+  packs?: PackSet;
 }
 
 /**
@@ -72,6 +77,9 @@ export interface HistoryComponentsConfig {
    * `{ type: "memory" }` for in-memory refs.
    */
   refs: { type: "memory" } | Refs;
+
+  /** The installed packs `objects` reads, for backends that keep packs (the files backend). */
+  packs?: PackSet;
 }
 
 /**
@@ -95,7 +103,10 @@ export interface HistoryComponentsConfig {
  * ```
  */
 export function createHistoryFromStores(config: HistoryStoresConfig): History {
-  return new HistoryImpl(config.blobs, config.trees, config.commits, config.tags, config.refs);
+  return new HistoryImpl(config.blobs, config.trees, config.commits, config.tags, config.refs, {
+    objects: config.objects,
+    packs: config.packs,
+  });
 }
 
 /**
@@ -138,6 +149,8 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
     commits,
     tags,
     refs,
+    objects: config.objects,
+    packs: config.packs,
   });
 }
 
@@ -214,16 +227,13 @@ export function createMemoryHistoryWithOperations(
   const refs = createMemoryRefs();
 
   // Create base History for serialization API
-  const history = new HistoryImpl(blobs, trees, commits, tags, refs);
+  const history = new HistoryImpl(blobs, trees, commits, tags, refs, { objects });
 
   // Create delta API (memory backend doesn't track blob deltas, but supports tree deltas)
   const delta = new MemoryDeltaApi(blobs, undefined, trees);
 
   // Create serialization API using the History interface
-  const serialization = new DefaultSerializationApi({
-    history,
-    treeDeltaApi: delta.trees,
-  });
+  const serialization = new DefaultSerializationApi({ history });
 
   // Memory backend capabilities
   const capabilities: BackendCapabilities = {
@@ -251,6 +261,7 @@ export function createMemoryHistoryWithOperations(
     async () => {
       // No cleanup needed for memory storage
     },
+    { objects },
   );
 }
 
@@ -291,19 +302,14 @@ export function createMemoryHistoryWithOperations(
  * ```
  */
 export function createGitFilesHistory(config: GitFilesStorageBackendConfig): HistoryWithOperations {
-  const { blobs, trees, commits, tags, refs, packDeltaStore } = config;
+  const { blobs, trees, commits, tags, refs, packDeltaStore, objects, packs } = config;
 
   // Create delta API directly (with tree and commit delta support)
   const delta = new GitFilesDeltaApi(packDeltaStore, blobs, trees, { enableCommitDeltas: true });
 
   // Create base History for serialization API
-  const history = new HistoryImpl(blobs, trees, commits, tags, refs);
-  const serialization = new DefaultSerializationApi({
-    history,
-    blobDeltaApi: delta.blobs,
-    treeDeltaApi: delta.trees,
-    commitDeltaApi: delta.commits,
-  });
+  const history = new HistoryImpl(blobs, trees, commits, tags, refs, { objects, packs });
+  const serialization = new DefaultSerializationApi({ history });
 
   // Git-files backend capabilities
   const capabilities: BackendCapabilities = {
@@ -338,6 +344,7 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
         initialized = false;
       }
     },
+    { objects, packs },
   );
 }
 

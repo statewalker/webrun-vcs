@@ -28,7 +28,7 @@ pnpm add @statewalker/vcs-core
 | `@statewalker/vcs-core` | Everything from `history`, `storage` and `backend`, plus `createVcsCore`, GC (`GcOrchestrator`, `MemoryGcStrategy`), `FileMode`, `ObjectId`, `PersonIdent` and the file helpers re-exported from `@statewalker/vcs-utils/files` |
 | `@statewalker/vcs-core/history` | `History`, `HistoryWithOperations`, typed stores (`Blobs`, `Trees`, `Commits`, `Tags`, `Refs`), factories (`createMemoryHistory`, `createMemoryHistoryWithOperations`, `createGitFilesHistory`, `createHistoryFromStores`, `createHistoryFromComponents`), object/commit/tree/tag formats, ref constants (`HEAD`, `R_HEADS`, ...) |
 | `@statewalker/vcs-core/storage` | Raw storage (`MemoryRawStorage`, `CompressedRawStorage`, `ChunkedRawStorage`, ...), delta engine and strategies, webrun-storage adapters (`blobStoreToRawStorage`, `kvStoreRefs`) |
-| `@statewalker/vcs-core/backend` | Backend registry (`createHistory`, `registerHistoryBackendFactory`), `BackendCapabilities`, `StorageOperations`, pack files (`writePack`, `indexPack`, `readPackIndex`, `parsePackEntries`, ...) |
+| `@statewalker/vcs-core/backend` | Backend registry (`createHistory`, `registerHistoryBackendFactory`), `BackendCapabilities`, `StorageOperations`, pack files (`writePack`, `indexPack`, `readPackIndex`, `installPack`, `importPack`, `unpackObjects`, ...) |
 | `@statewalker/vcs-core/serialization` | `SerializationApi`, `DefaultSerializationApi`, `createSerializationApi(history)` (not in the root export) |
 
 The happy path is an in-memory `History`:
@@ -181,6 +181,30 @@ const stats = await target.serialization.importPack(pack);
 // { objectsImported: 3, treesImported: 1, commitsImported: 1, ... }
 ```
 
+### Receiving a pack
+
+```typescript
+import { importPack, PackError, unpackObjects } from "@statewalker/vcs-core";
+import { createGitFilesBackend } from "@statewalker/vcs-store-files";
+
+const { objects, packs } = await createGitFilesBackend({ files });
+
+// `received` is the pack as it arrives, an AsyncIterable<Uint8Array> (a fetch response, a push)
+const result = await importPack(objects, received, { packs });
+// 100 objects or more: kept as a pack (result.kept), otherwise loose objects (result.unpacked)
+
+// the memory, KV and SQL stores have no packs: everything is unpacked
+const { count, written, existing } = await unpackObjects(memoryObjects, received);
+```
+
+This is what git does with a pack it receives. `importPack` reads the pack header, and only the header, to count the objects: with at least `unpackLimit` of them (default 100, git's `transfer.unpackLimit`) and a pack set to keep them in, the stream goes to `packs.install`, which is `installPack` with thin packs completed from `objects`. Any other pack goes to `unpackObjects`. An empty stream, as after a push that only deletes refs, imports nothing. `SerializationApi.importPack`, the transport's `RepositoryFacade.importPack`, `VcsCore.readPack` and the commands' clone and fetch all come here, over the history's `objects` and `packs`.
+
+`unpackObjects` is `git unpack-objects`. It reads the stream once and never stores or collects it. Every whole object is written as a loose object through `putRaw`, framed exactly as git frames it, so a commit with a header the commit parser does not model keeps its id. Deltas are resolved as they arrive: an OFS_DELTA base is always an earlier entry, already written; a REF_DELTA base is an earlier entry, an object the store has (a thin pack, as every fetch receives), or a later entry, in which case the delta waits for it. Bases come from a byte-bounded cache of recent objects (`baseCacheBytes`, default 16 MiB) or are read back from the store. Whole objects over `bigObjectThreshold` (default 16 MiB) stream straight into the store through `put`, hashed on the way, and the id `put` returns must be that hash or the pack is refused with `ObjectIdMismatchError`; anything smaller is held while it is hashed. Memory is therefore the cache, one object or one delta with its base and result, 29 bytes of state per entry (up to about 58 allocated, since the arrays grow by doubling), and the deltas waiting for a base: REF_DELTAs whose base comes later in the pack, which `git pack-objects` never writes, and the deltas built on them. When such a base arrives, every delta waiting on it is resolved while it is held, so sibling deltas on one base are all in memory with it, as in git. A base streamed through `put` is not kept: OFS and waiting deltas against it read it back from the store, unless it fits the cache once read.
+
+When an incoming object's id is already stored, the two are compared byte for byte, as git's `check_collision` does, and a mismatch is refused with `ObjectCollisionError` (a `PackError`). Objects streamed through `put` skip the comparison, as git's large blobs do; the store keeps the object it has, so one is never replaced. For the same reason `written` counts every streamed object, already stored or not, while `existing` counts only the smaller objects found already stored. A corrupt pack is refused with `PackError`: a bad signature or version, broken zlib, an entry that inflates past or short of its declared size, a bad delta, an object over `maxObjectSize`, a REF_DELTA base nobody has, a bad trailer, truncation, or bytes after the trailer. Objects are written before the trailer is read, as git does: each one is named by the hash of its own bytes, so a pack refused at its end leaves only sound objects behind.
+
+A history without an object kernel (the SQL native stores, which keep parsed rows) is written through its typed stores. They re-encode what they store, so each object is first parsed and encoded again, and one whose bytes would change (a commit with a `mergetag` header, say) is refused with `ObjectIdMismatchError` before anything is stored. Wherever a kernel exists, pass it as `objects` to `createHistoryFromStores` (or `DefaultSerializationApi`) so received packs are written byte for byte; the transport's `createStorageRepositoryFacade` does.
+
 ### Installing packs
 
 ```typescript
@@ -206,7 +230,7 @@ A thin pack, the kind every `git fetch` receives, has REF_DELTA entries whose ba
 
 A corrupt or hostile pack is refused with `PackError` (a `CorruptObjectError`) and leaves nothing in the pack directory: a bad trailer, truncation, trailing bytes, broken zlib, an entry that inflates past its declared size (inflation stops at the first extra byte), a delta cycle, a missing base, or an object over `maxObjectSize` (default 1 GiB; delta results are checked before they are allocated). `maxPackSize` bounds the stream while it is stored, and a stream that does not start with `PACK` is refused at its first chunk.
 
-Resolving deltas holds the delta chain being resolved, not the pack: entries are kept in typed arrays (about 80 bytes each), resolved bases are cached up to `baseCacheBytes` (default 32 MiB) and re-derived when evicted, and entries are re-read through one window of `windowBytes` (default 1 MiB) over the stored pack. Storing the incoming pack is up to the FilesApi: the Node and in-memory ones collect a file before writing it, so there the pack is held once while it is stored (set `maxPackSize` for untrusted sources). A storage failure (EIO and the like) comes through unchanged; only a malformed pack raises `PackError`. The pack is moved into place before its idx, and a leftover pack from a crash between the two is replaced by the next install of that pack (FilesApi `move` overwrites). Not yet checked: an incoming object whose id the repository already has with other bytes (git's collision check); the pack importer adds that. An install interrupted by a crash leaves `tmp_*` files; `sweepPackTemporaries(files, packDir, olderThanMs)` removes those older than the threshold, as `git prune` does, and keeps younger ones that may belong to an install in progress.
+Resolving deltas holds the delta chain being resolved, not the pack: entries are kept in typed arrays (about 80 bytes each), resolved bases are cached up to `baseCacheBytes` (default 32 MiB) and re-derived when evicted, and entries are re-read through one window of `windowBytes` (default 1 MiB) over the stored pack. Storing the incoming pack is up to the FilesApi: the Node and in-memory ones collect a file before writing it, so there the pack is held once while it is stored (set `maxPackSize` for untrusted sources). A storage failure (EIO and the like) comes through unchanged; only a malformed pack raises `PackError`. The pack is moved into place before its idx, and a leftover pack from a crash between the two is replaced by the next install of that pack (FilesApi `move` overwrites). An install interrupted by a crash leaves `tmp_*` files; `sweepPackTemporaries(files, packDir, olderThanMs)` removes those older than the threshold, as `git prune` does, and keeps younger ones that may belong to an install in progress.
 
 `writePackIdx(entries, packChecksum)` writes the same `.idx` v2 from a list of `{ id, offset, crc32 }`.
 

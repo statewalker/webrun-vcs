@@ -73,7 +73,7 @@ All entry points are ESM with type declarations.
 | `createMessagePortDuplex`, `messagePortFetch`, `messagePortServe` | MessagePort transport |
 | `webrunClientDuplex`, `serveRepoOverWebrun` | Git protocol over a webrun-streams `Duplex` |
 | `serveGitOverWebrunHttp`, `webrunHttpFetch` | Smart HTTP over a webrun-streams `Duplex` |
-| `httpFetch`, `httpPush`, `createHttpClientDuplex`, `createSimpleDuplex` | Low-level HTTP client helpers |
+| `httpFetch`, `httpPush`, `createSimpleDuplex` | Low-level HTTP client helpers |
 | `createFetchHandler`, `createHttpHandler`, `createGitHttpServer` | Smart-HTTP server |
 
 #### Factories
@@ -117,7 +117,7 @@ Protocol constants (`PKT_FLUSH`, `CAPABILITY_*`, `ZERO_OID`, `SERVICE_UPLOAD_PAC
 
 ### HTTP: list refs, fetch, clone
 
-The HTTP operations do not write to a repository. `fetch` and `clone` return the remote refs (binary OIDs) and the raw pack bytes. Importing the pack is up to you, for example with `RepositoryFacade.importPack`.
+The HTTP operations do not write to a repository. `fetch` and `clone` return the remote refs (binary OIDs). Give them `onPack` and the pack is handed to you as it arrives, demultiplexed from the response body, so it can flow straight into vcs-core's `importPack` without ever being held whole; without `onPack` it is collected into `packData`.
 
 ```typescript
 import { clone, fetch, lsRemote } from "@statewalker/vcs-transport";
@@ -132,10 +132,20 @@ const fetched = await fetch({
 });
 console.log(fetched.defaultBranch, fetched.bytesReceived, fetched.packData.length);
 
+// stream the pack into a repository instead of collecting it
+await fetch({
+  url: "https://example.com/user/repo.git",
+  onPack: (pack) => history.serialization.importPack(pack).then(() => {}),
+});
+
 const cloned = await clone({ url: "https://example.com/user/repo.git", depth: 1 });
 ```
 
-Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }` or `{ token }`), `headers`, `timeout` (ms), and `fetchImpl` (a `(Request) => Promise<Response>` used instead of `globalThis.fetch`). `fetch` also accepts `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage`. `clone` accepts `branch`, `depth`, `onProgress`, `onProgressMessage`.
+Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }` or `{ token }`), `headers`, `timeout` (ms), and `fetchImpl` (a `(Request) => Promise<Response>` used instead of `globalThis.fetch`). `fetch` also accepts `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage` and `onPack`. `clone` accepts `branch`, `depth`, `onProgress`, `onProgressMessage` and `onPack`.
+
+`fetch` sends wants, so it fails unless a pack comes back (git sends an empty pack, 32 bytes, when every wanted object is already present): a caller never writes refs to objects it did not receive. `httpFetch` and the fetch state machine refuse a missing pack the same way. When the import (or anything after the request) fails, the response body is cancelled. `timeout` bounds each wait for the server, a response or the next chunk of a body, not the whole fetch: the time `onPack` spends storing a large pack does not count, while a server that stops sending is still cut off.
+
+The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3 and on an `ERR <message>` line. `httpFetch` and the fetch state machine import the pack this way too. The request bodies (wants and haves) are still built in memory: they are small, and a streamed request body needs `duplex: "half"`, which not every browser supports.
 
 ### HTTP: push
 

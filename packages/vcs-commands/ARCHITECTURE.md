@@ -433,9 +433,10 @@ transport.fetch({
   auth, headers,     → Credentials and custom headers
   timeout, depth,
   onProgressMessage, → Raw progress messages
+  onPack,            → The pack as it arrives
 })
-    ↓ then
-importPackIntoHistory(history, packData)
+    ↓ onPack
+importPackIntoHistory(history, pack)  → vcs-core importPack: kept as a pack or unpacked, streamed
 ```
 
 ```

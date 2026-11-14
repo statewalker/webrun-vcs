@@ -202,3 +202,48 @@ describe("createStorageRepositoryFacade receiving an atomic push", () => {
     expect(await refStore.get("refs/heads/dev")).toBe(B);
   });
 });
+
+describe("createStorageRepositoryFacade receiving a pack", () => {
+  it("imports a pushed commit with a mergetag header byte for byte", async () => {
+    const { compressBlockPako } = await import("@statewalker/vcs-utils/compression");
+    const { createSha1 } = await import("@statewalker/vcs-utils/hash/hasher");
+    const { bytesToHex } = await import("@statewalker/vcs-utils/hash/utils");
+    const enc = new TextEncoder();
+    // a header the typed commit store does not model: re-encoding it would change the id
+    const commit = enc.encode(
+      "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\nmergetag object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n type commit\n\nmsg\n",
+    );
+    const raw = new Uint8Array([...enc.encode(`commit ${commit.length}\0`), ...commit]);
+    const id = bytesToHex(createSha1().update(raw).digest());
+    // a one-entry pack: header, entry (type 1, size varint), zlib data, SHA-1 trailer
+    const head = new Uint8Array(12);
+    head.set(enc.encode("PACK"));
+    new DataView(head.buffer).setUint32(4, 2);
+    new DataView(head.buffer).setUint32(8, 1);
+    const sizeBytes: number[] = [];
+    let size = commit.length;
+    let b = (1 << 4) | (size & 15);
+    size = Math.floor(size / 16);
+    while (size) {
+      sizeBytes.push(b | 0x80);
+      b = size & 127;
+      size = Math.floor(size / 128);
+    }
+    sizeBytes.push(b);
+    const body = new Uint8Array([...head, ...sizeBytes, ...compressBlockPako(commit)]);
+    const packBytes = new Uint8Array([...body, ...createSha1().update(body).digest()]);
+
+    const objects = memBlobStore();
+    const { facade } = createStorageRepositoryFacade({ objects, refs: memKvStore() });
+    await facade.importPack(
+      (async function* () {
+        yield packBytes;
+      })(),
+    );
+    expect(await facade.has(id)).toBe(true);
+    const kernel = createGitObjects(rawStorageStaging(blobStoreToRawStorage(objects)));
+    const stored: number[] = [];
+    for await (const c of kernel.getRaw(id)) stored.push(...c);
+    expect(new Uint8Array(stored)).toEqual(raw);
+  });
+});

@@ -512,47 +512,66 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const output = getOutput(ctx);
       const repository = getRepository(ctx);
 
+      // Wants were sent, so a pack must follow (an empty one when every wanted object is here):
+      // without one, UPDATE_REFS would point refs at objects that are not there.
+      let packBytes = 0;
+      const counted = async function* (source: AsyncIterable<Uint8Array>) {
+        for await (const chunk of source) {
+          packBytes += chunk.length;
+          yield chunk;
+        }
+      };
       try {
         // Handle sideband multiplexing
         if (state.capabilities.has("side-band-64k")) {
-          const packChunks: Uint8Array[] = [];
-
-          // Read pkt-lines and demux sideband channels until flush/eof.
-          // Uses readPktLine() directly because readSideband() throws on
-          // flush packets which are the normal termination signal.
-          while (true) {
-            const pkt = await transport.readPktLine();
-            if (pkt.type === "flush" || pkt.type === "eof") break;
-            if (pkt.type !== "data" || pkt.payload.length < 1) continue;
-
-            const channel = pkt.payload[0];
-            const data = pkt.payload.slice(1);
-
-            if (channel === 1) {
-              // Pack data channel
-              packChunks.push(data);
-            } else if (channel === 2) {
-              // Progress message channel
-              if (!config.noProgress) {
-                output.progress = new TextDecoder().decode(data);
+          // Demultiplex pkt-lines as the importer pulls them: the pack flows straight into
+          // importPack, never collected. readPktLine() is used directly because
+          // readSideband() throws on the flush that ends the pack.
+          let sidebandError: string | undefined;
+          const decoder = new TextDecoder();
+          const demuxed = (async function* () {
+            while (true) {
+              const pkt = await transport.readPktLine();
+              if (pkt.type === "flush" || pkt.type === "eof") return;
+              if (pkt.type !== "data" || pkt.payload.length < 1) continue;
+              // "ERR <message>" comes as a plain pkt-line, not on a sideband channel
+              const text = decoder.decode(pkt.payload.subarray(0, 4));
+              if (text === "ERR ") {
+                sidebandError = decoder.decode(pkt.payload.subarray(4)).trimEnd();
+                throw new Error(`Server error: ${sidebandError}`);
               }
-            } else if (channel === 3) {
-              // Error message from server
-              output.error = new TextDecoder().decode(data);
-              return "SIDEBAND_ERROR";
+              const channel = pkt.payload[0];
+              const data = pkt.payload.subarray(1);
+              if (channel === 1) {
+                yield data;
+              } else if (channel === 2) {
+                if (!config.noProgress) output.progress = decoder.decode(data);
+              } else if (channel === 3) {
+                sidebandError = decoder.decode(data);
+                throw new Error(`Server error: ${sidebandError}`);
+              }
             }
-          }
-
-          // Import collected pack data
-          const packIterable = (async function* () {
-            for (const chunk of packChunks) yield chunk;
           })();
-          const importResult = await repository.importPack(packIterable);
-          output.objectCount = importResult.objectsImported;
+          const pack = counted(demuxed);
+          try {
+            const importResult = await repository.importPack(pack);
+            for await (const _ of pack) {
+              // the rest of the response up to its flush (and any error after the pack)
+            }
+            output.objectCount = importResult.objectsImported;
+          } catch (e) {
+            if (sidebandError === undefined) throw e;
+            output.error = sidebandError;
+            return "SIDEBAND_ERROR";
+          }
         } else {
           // Raw pack data (no sideband)
-          const importResult = await repository.importPack(transport.readPack());
+          const importResult = await repository.importPack(counted(transport.readPack()));
           output.objectCount = importResult.objectsImported;
+        }
+        if (packBytes === 0) {
+          output.error = "upload-pack sent no pack for the wanted objects";
+          return "ERROR";
         }
 
         return "PACK_RECEIVED";

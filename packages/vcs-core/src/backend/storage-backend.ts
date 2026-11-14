@@ -33,18 +33,11 @@ import type { SerializationApi } from "../serialization/serialization-api.js";
 import type { DeltaApi } from "../storage/delta/delta-api.js";
 
 // Re-export SerializationApi types for convenience
-// Note: PackEntry and PackHeader are not re-exported to avoid conflicts
-// with backend/git/pack types. Import from serialization-api directly if needed.
-// Re-export serialization-specific types with qualified names to avoid ambiguity
 export type {
   PackBuilder,
   PackBuildStats,
-  PackEntry as SerializationPackEntry,
-  PackHeader as SerializationPackHeader,
   PackImportResult,
   PackOptions,
-  PackReaderApi,
-  ParsedObjectMeta,
   SerializationApi,
 } from "../serialization/serialization-api.js";
 

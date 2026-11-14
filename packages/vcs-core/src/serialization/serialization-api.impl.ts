@@ -5,9 +5,7 @@
  * Uses the History interface for accessing typed object stores.
  */
 
-import { deflate, inflate } from "@statewalker/vcs-utils";
-import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { deflate } from "@statewalker/vcs-utils";
 import { collect } from "@statewalker/vcs-utils/streams";
 import type { ObjectId } from "../common/id/index.js";
 import type { Blobs } from "../history/blobs/blobs.js";
@@ -17,15 +15,18 @@ import {
   decodeCommitEntries,
   encodeCommitEntries,
   entriesToCommit,
+  parseCommitFromBytes,
 } from "../history/commits/commit-format.js";
 import type { Commits } from "../history/commits/commits.js";
 import type { History } from "../history/history.js";
+import type { GitObjects } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import {
   collectTagBytes,
   decodeTagEntries,
   encodeTagEntries,
   entriesToTag,
+  parseTagFromBytes,
   tagToEntries,
 } from "../history/tags/tag-format.js";
 import type { Tags } from "../history/tags/tags.js";
@@ -33,30 +34,25 @@ import {
   collectTreeBytes,
   decodeTreeEntries,
   encodeTreeEntries,
+  parseTreeFromBytes,
 } from "../history/trees/tree-format.js";
 import type { Trees } from "../history/trees/trees.js";
 import {
+  importPack,
   PackObjectType,
-  parsePackEntries,
-  parsePackEntriesFromStream,
+  type PackSet,
   StreamingPackWriter,
+  type UnpackTarget,
 } from "../pack/index.js";
-import type { BlobDeltaApi } from "../storage/delta/blob-delta-api.js";
-import type { CommitDeltaApi } from "../storage/delta/commit-delta-api.js";
-import { serializeDeltaToGit } from "../storage/delta/delta-binary-format.js";
 import type { DeltaCompressor } from "../storage/delta/delta-compressor.js";
-import type { TreeDeltaApi } from "../storage/delta/tree-delta-api.js";
 import type {
   PackBuilder,
   PackBuildStats,
-  PackEntry,
-  PackHeader,
   PackImportResult,
   PackOptions,
-  PackReaderApi,
-  ParsedObjectMeta,
   SerializationApi,
 } from "./serialization-api.js";
+import { typedStoreObjects } from "./typed-store-objects.js";
 
 /**
  * Configuration for DefaultSerializationApi
@@ -68,16 +64,21 @@ export interface SerializationApiConfig {
    * Only requires the object stores (blobs, trees, commits, tags).
    * Accepts a full History instance or just the required stores.
    */
-  history: Pick<History, "blobs" | "trees" | "commits" | "tags">;
+  history: Pick<History, "blobs" | "trees" | "commits" | "tags"> &
+    Partial<Pick<History, "objects" | "packs">>;
 
-  /** Blob delta API for delta-aware import */
-  blobDeltaApi?: BlobDeltaApi;
+  /**
+   * The object kernel received packs are written through. Defaults to `history.objects`; a
+   * history without one (stores of parsed objects) is written through its typed stores, which
+   * refuse objects they cannot store under their own id.
+   */
+  objects?: GitObjects;
 
-  /** Tree delta API for delta-aware import (optional, backend-dependent) */
-  treeDeltaApi?: TreeDeltaApi;
+  /** Where large received packs are kept. Defaults to `history.packs`; without it packs are unpacked. */
+  packs?: PackSet;
 
-  /** Commit delta API for delta-aware import (optional, backend-dependent) */
-  commitDeltaApi?: CommitDeltaApi;
+  /** Packs with at least this many objects are kept when there are `packs` (git's transfer.unpackLimit, 100). */
+  unpackLimit?: number;
 
   /** Delta compressor for computing deltas during pack export */
   deltaCompressor?: DeltaCompressor;
@@ -97,12 +98,11 @@ export class DefaultSerializationApi implements SerializationApi {
   private readonly _commits: Commits;
   /** Tag storage interface (new interface) */
   private readonly _tags: Tags;
-  /** Optional blob delta API for delta-aware import */
-  private readonly blobDeltaApi?: BlobDeltaApi;
-  /** Optional tree delta API for delta-aware import */
-  private readonly treeDeltaApi?: TreeDeltaApi;
-  /** Optional commit delta API for delta-aware import */
-  private readonly commitDeltaApi?: CommitDeltaApi;
+  /** The object kernel received packs are written through */
+  private readonly objects: UnpackTarget;
+  /** Where large received packs are kept, if anywhere */
+  private readonly packs?: PackSet;
+  private readonly unpackLimit?: number;
   /** Optional delta compressor for pack export */
   private readonly deltaCompressor?: DeltaCompressor;
 
@@ -111,9 +111,21 @@ export class DefaultSerializationApi implements SerializationApi {
     this._trees = config.history.trees;
     this._commits = config.history.commits;
     this._tags = config.history.tags;
-    this.blobDeltaApi = config.blobDeltaApi;
-    this.treeDeltaApi = config.treeDeltaApi;
-    this.commitDeltaApi = config.commitDeltaApi;
+    this.objects =
+      config.objects ??
+      config.history.objects ??
+      typedStoreObjects({
+        has: async (id) =>
+          (await this._commits.has(id)) ||
+          (await this._trees.has(id)) ||
+          (await this._tags.has(id)) ||
+          (await this._blobs.has(id)),
+        exportObject: (id) => this.exportObject(id),
+        importObject: (type, content) => this.importObject(type, content),
+        reencode: (type, data) => reencode(type, data),
+      });
+    this.packs = config.packs ?? config.history.packs;
+    this.unpackLimit = config.unpackLimit;
     this.deltaCompressor = config.deltaCompressor;
   }
 
@@ -141,47 +153,6 @@ export class DefaultSerializationApi implements SerializationApi {
   }
 
   /**
-   * Parse Git loose format and store
-   */
-  async parseLooseObject(compressed: AsyncIterable<Uint8Array>): Promise<ParsedObjectMeta> {
-    // Decompress
-    const decompressedChunks: Uint8Array[] = [];
-    for await (const chunk of inflate(compressed, { raw: false })) {
-      decompressedChunks.push(chunk);
-    }
-    const data = concatBytes(decompressedChunks);
-
-    // Parse header: "type size\0content"
-    const nullIndex = data.indexOf(0);
-    if (nullIndex === -1) {
-      throw new Error("Invalid loose object: no null byte found");
-    }
-
-    const headerStr = new TextDecoder().decode(data.subarray(0, nullIndex));
-    const spaceIndex = headerStr.indexOf(" ");
-    if (spaceIndex === -1) {
-      throw new Error("Invalid loose object header: no space found");
-    }
-
-    const type = headerStr.substring(0, spaceIndex) as ObjectTypeString;
-    const size = parseInt(headerStr.substring(spaceIndex + 1), 10);
-    const content = data.subarray(nullIndex + 1);
-
-    if (content.length !== size) {
-      throw new Error(`Size mismatch: header says ${size}, content is ${content.length}`);
-    }
-
-    // Compute ID (SHA-1 of header + content)
-    const hash = await sha1(data);
-    const id = bytesToHex(hash);
-
-    // Store the object
-    await this.importObject(type, toAsyncIterable(content));
-
-    return { id, type, size };
-  }
-
-  /**
    * Create a pack file from objects
    */
   async *createPack(
@@ -202,69 +173,20 @@ export class DefaultSerializationApi implements SerializationApi {
   }
 
   /**
-   * Import objects from a pack file
+   * Import objects from a pack stream, byte for byte, through `importPack`.
    */
   async importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult> {
-    let objectsImported = 0;
-    let blobsWithDelta = 0;
-    let treesImported = 0;
-    let commitsImported = 0;
-    let tagsImported = 0;
-
-    // Stream entries one at a time — no full-pack accumulation
-    for await (const entry of parsePackEntriesFromStream(pack)) {
-      switch (entry.objectType) {
-        case "blob":
-          if (entry.type === "delta" && this.blobDeltaApi) {
-            // Preserve blob delta if we have delta API
-            const deltaBytes = serializeDeltaToGit(entry.delta);
-            await this.blobDeltaApi.deltifyBlob(entry.id, entry.baseId, [deltaBytes]);
-            blobsWithDelta++;
-          } else {
-            // Store as full blob
-            await this._blobs.store([entry.content], entry.content.length);
-          }
-          break;
-
-        case "tree":
-          if (entry.type === "delta" && this.treeDeltaApi) {
-            // Preserve tree delta if we have tree delta API
-            const treeDeltaBytes = serializeDeltaToGit(entry.delta);
-            await this.treeDeltaApi.deltifyTree(entry.id, entry.baseId, [treeDeltaBytes]);
-          } else {
-            // Store as full tree
-            await this.storeTreeFromStream([entry.content]);
-          }
-          treesImported++;
-          break;
-
-        case "commit":
-          if (entry.type === "delta" && this.commitDeltaApi) {
-            // Preserve commit delta if we have commit delta API
-            const commitDeltaBytes = serializeDeltaToGit(entry.delta);
-            await this.commitDeltaApi.deltifyCommit(entry.id, entry.baseId, [commitDeltaBytes]);
-          } else {
-            // Store as full commit
-            await this.storeCommitFromStream([entry.content]);
-          }
-          commitsImported++;
-          break;
-
-        case "tag":
-          // Tags are always stored fully resolved
-          await this.storeTagFromStream([entry.content]);
-          tagsImported++;
-          break;
-      }
-      objectsImported++;
-    }
-
+    const r = await importPack(this.objects, pack, {
+      packs: this.packs,
+      unpackLimit: this.unpackLimit,
+    });
     return {
-      objectsImported,
-      blobsWithDelta,
-      treesImported,
-      commitsImported,
-      tagsImported,
+      objectsImported: r.count,
+      blobsWithDelta: 0,
+      treesImported: r.types.tree,
+      commitsImported: r.types.commit,
+      tagsImported: r.types.tag,
+      packId: r.kept?.packId,
     };
   }
 
@@ -280,13 +202,6 @@ export class DefaultSerializationApi implements SerializationApi {
       options,
       this.deltaCompressor,
     );
-  }
-
-  /**
-   * Create pack file reader
-   */
-  createPackReader(pack: AsyncIterable<Uint8Array>): PackReaderApi {
-    return new StreamingPackReader(pack);
   }
 
   /**
@@ -383,6 +298,20 @@ export class DefaultSerializationApi implements SerializationApi {
   ): Promise<ObjectId> {
     const tag = await entriesToTag(decodeTagEntries(content));
     return this._tags.store(tag);
+  }
+}
+
+/** The content typed stores keep for `data`: parsed, then encoded again (blobs as they are). */
+async function reencode(type: ObjectTypeString, data: Uint8Array): Promise<Uint8Array> {
+  switch (type) {
+    case "blob":
+      return data;
+    case "tree":
+      return collectTreeBytes(await parseTreeFromBytes(data));
+    case "commit":
+      return collectCommitBytes(await parseCommitFromBytes(data));
+    case "tag":
+      return collectTagBytes(await parseTagFromBytes(data));
   }
 }
 
@@ -583,74 +512,6 @@ class DefaultPackBuilder implements PackBuilder {
     }
 
     throw new Error(`Object not found: ${id}`);
-  }
-}
-
-/**
- * Streaming pack reader implementation
- */
-class StreamingPackReader implements PackReaderApi {
-  private packData: Uint8Array | null = null;
-  private header: PackHeader | null = null;
-
-  constructor(private readonly pack: AsyncIterable<Uint8Array>) {}
-
-  async *entries(): AsyncIterable<PackEntry> {
-    await this.ensureLoaded();
-    if (!this.packData) {
-      throw new Error("Pack data not loaded");
-    }
-    const result = await parsePackEntries(this.packData);
-
-    for (const entry of result.entries) {
-      const packEntry: PackEntry = {
-        id: entry.id,
-        type: entry.objectType,
-        isDelta: entry.type === "delta",
-        baseRef: entry.type === "delta" ? entry.baseId : undefined,
-        rawContent: toAsyncIterable(entry.type === "delta" ? new Uint8Array(0) : entry.content),
-        resolvedContent: toAsyncIterable(entry.content),
-        size: entry.content.length,
-        chainDepth: entry.type === "delta" ? 1 : 0, // Simplified
-        ratio: entry.type === "delta" ? 0.5 : undefined, // Simplified
-      };
-      yield packEntry;
-    }
-  }
-
-  async getHeader(): Promise<PackHeader> {
-    await this.ensureLoaded();
-    if (!this.header) {
-      throw new Error("Pack header not loaded");
-    }
-    return this.header;
-  }
-
-  private async ensureLoaded(): Promise<void> {
-    if (this.packData) return;
-
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of this.pack) {
-      chunks.push(chunk);
-    }
-    this.packData = concatBytes(chunks);
-
-    // Parse header
-    if (this.packData.length < 12) {
-      throw new Error("Pack data too short");
-    }
-
-    const view = new DataView(this.packData.buffer, this.packData.byteOffset);
-    const signature = view.getUint32(0, false);
-    if (signature !== 0x5041434b) {
-      // "PACK"
-      throw new Error("Invalid pack signature");
-    }
-
-    this.header = {
-      version: view.getUint32(4, false),
-      objectCount: view.getUint32(8, false),
-    };
   }
 }
 
