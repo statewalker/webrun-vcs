@@ -99,6 +99,8 @@ git push                                        # MANDATORY
 - **`git-cli-sandbox`**: `apps/demos/git-cli-sandbox/` is stale — ignore its test failures
 - **`split()` limit**: `"a b".split(" ", 2)` gives `["a","b"]` not `["a","b c"]` — use `indexOf` + `slice`
 - **Refs vs Checkout**: `CommitCommand` uses `history.refs`, not `checkout.head`
+- **Workspace cycles**: `vcs-core` depends on `vcs-utils-node`, and `vcs-testing` on `vcs-core`, so `vcs-utils`/`vcs-utils-node` must not depend on `vcs-testing` (not even as a devDependency): pnpm then builds in the wrong order and CI fails on missing declarations. Put such tests in a store package.
+- **Native git in tests**: CI has no `user.name`/`user.email`; pass `GIT_AUTHOR_*`/`GIT_COMMITTER_*` in the env of every git call
 
 ## Self-Maintenance
 

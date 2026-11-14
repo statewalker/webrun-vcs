@@ -48,9 +48,10 @@
   },
   "devDependencies": {
     "@statewalker/vcs-testing": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
+    "@types/node": "catalog:",
     "rolldown": "catalog:",
-    "vitest": "catalog:",
     "typescript": "catalog:",
-    "@types/node": "catalog:"
+    "vitest": "catalog:"
   }
 }

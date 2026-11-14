@@ -65,7 +65,8 @@ export class RefsAdapter implements Refs {
     return this.refStore.delete(name);
   }
 
-  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+  batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    if (this.refStore.batch) return this.refStore.batch(commands, options);
     return batchBySingleRef(this, commands);
   }
 

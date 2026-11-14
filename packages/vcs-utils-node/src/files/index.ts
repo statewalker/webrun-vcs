@@ -27,5 +27,6 @@ export function createNodeFilesApi(options: { rootDir: string }): FilesApi {
   return new NodeFilesApi(options);
 }
 
+export { createNodeAtomicFiles } from "./node-atomic-files.js";
 // Re-export for direct access if needed
 export { NodeFilesApi };

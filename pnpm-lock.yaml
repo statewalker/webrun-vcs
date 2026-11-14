@@ -1010,6 +1010,9 @@ importers:
       '@statewalker/vcs-testing':
         specifier: workspace:^
         version: link:../vcs-testing
+      '@statewalker/vcs-utils-node':
+        specifier: workspace:^
+        version: link:../vcs-utils-node
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4
@@ -1118,6 +1121,9 @@ importers:
       '@statewalker/vcs-core':
         specifier: workspace:^
         version: link:../vcs-core
+      '@statewalker/vcs-utils':
+        specifier: workspace:^
+        version: link:../vcs-utils
       '@statewalker/vcs-working-tree':
         specifier: workspace:^
         version: link:../vcs-working-tree

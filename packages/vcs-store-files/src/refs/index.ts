@@ -5,6 +5,7 @@
  * moved from vcs-core for package boundary cleanup.
  */
 
+export * from "./files-ref-batch.js";
 export * from "./packed-refs-reader.js";
 export * from "./packed-refs-writer.js";
 export * from "./ref-reader.js";

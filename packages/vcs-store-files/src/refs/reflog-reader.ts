@@ -93,12 +93,10 @@ class ReflogReaderImpl implements ReflogReader {
  * @returns Parsed ReflogEntry or undefined if invalid
  */
 export function parseReflogLine(line: string): ReflogEntry | undefined {
-  // Find tab separator between header and message
+  // Header and message are separated by a tab; git writes no tab when the message is empty.
   const tabIndex = line.indexOf("\t");
-  if (tabIndex < 0) return undefined;
-
-  const header = line.slice(0, tabIndex);
-  const comment = line.slice(tabIndex + 1);
+  const header = tabIndex < 0 ? line : line.slice(0, tabIndex);
+  const comment = tabIndex < 0 ? "" : line.slice(tabIndex + 1);
 
   // Parse header: <old> <new> <ident>
   // The ident includes name, email, timestamp, and timezone

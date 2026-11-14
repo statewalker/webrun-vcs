@@ -20,7 +20,7 @@ pnpm add @statewalker/vcs-utils-node
 |-------------|----------|
 | `@statewalker/vcs-utils-node` | Everything below |
 | `@statewalker/vcs-utils-node/compression` | `createNodeCompression()`, `deflateNode`, `inflateNode`, `compressBlockNode`, `decompressBlockNode` |
-| `@statewalker/vcs-utils-node/files` | `createNodeFilesApi()`, `NodeFilesApi` |
+| `@statewalker/vcs-utils-node/files` | `createNodeFilesApi()`, `NodeFilesApi`, `createNodeAtomicFiles(root)` |
 
 The happy path is two lines at application startup:
 
@@ -62,6 +62,22 @@ const head = await readText(files, ".git/HEAD"); // "ref: refs/heads/main\n"
 Paths are resolved against `rootDir`. To open a Git repository on disk, pass this `FilesApi` to a storage backend such as `createGitFilesBackend()` from `@statewalker/vcs-store-files`.
 
 ## Internals
+
+### Lock files that native git respects
+
+```typescript
+import { createNodeAtomicFiles } from "@statewalker/vcs-utils-node/files";
+
+const files = createNodeAtomicFiles("/path/to/repo/.git");
+if (await files.createExclusive("refs/heads/main.lock", bytes)) {
+  await files.replace("refs/heads/main.lock", "refs/heads/main"); // rename(2)
+}
+```
+
+`createExclusive` opens with `"wx"` (O_CREAT|O_EXCL), the call git and JGit use for lock files, so
+exactly one process wins; a half-written lock is removed. `replace` is `rename`, `append` is
+O_APPEND (git's reflog writes) and `removeEmptyDir` is `rmdir`. `@statewalker/vcs-store-files`
+takes it as `atomicFiles` for ref batches next to a running `git`.
 
 ### Why registration is explicit
 

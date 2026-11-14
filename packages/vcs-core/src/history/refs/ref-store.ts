@@ -6,6 +6,7 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
+import type { BatchOptions, BatchResult, RefCommand } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import type { ReflogReader } from "./reflog-types.js";
 
@@ -82,6 +83,9 @@ export interface RefStore {
     expectedOld: ObjectId | undefined,
     newValue: ObjectId,
   ): Promise<RefUpdateResult>;
+
+  /** Atomic batch (see `Refs.batch`); without it, `RefsAdapter` accepts one command at a time. */
+  batch?(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult>;
 
   /**
    * Initialize storage structure (if needed)
