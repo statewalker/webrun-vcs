@@ -11,7 +11,7 @@ import { Git } from "@statewalker/vcs-commands";
 import type {
   Blobs,
   Commits,
-  GitObjectStore,
+  GitObjects,
   ObjectId,
   PersonIdent,
   Refs,
@@ -43,7 +43,7 @@ export { backends, defaultFactory, memoryFactory, sqlFactory };
  */
 export interface TestStore {
   /** Object store for raw Git objects */
-  objects: GitObjectStore;
+  objects: GitObjects;
   /** Blob storage */
   blobs: Blobs;
   /** Tree storage */

@@ -1,5 +1,5 @@
 /**
- * GitNativeRepositoryAccess - Direct passthrough to GitObjectStore
+ * GitNativeRepositoryAccess - Direct passthrough to GitObjects
  *
  * For Git-native storage backends that already store objects in wire format.
  * No serialization overhead - just delegates to the underlying store.
@@ -9,7 +9,7 @@
  */
 
 import {
-  type GitObjectStore,
+  type GitObjects,
   isSymbolicRef,
   type ObjectId,
   ObjectType,
@@ -22,6 +22,7 @@ import {
 } from "@statewalker/vcs-core";
 import type { HeadInfo, ObjectInfo, RefInfo, RepositoryAccess } from "@statewalker/vcs-transport";
 import { collect } from "@statewalker/vcs-utils/streams";
+import { headerOf, loadObject } from "./object-access.js";
 
 /**
  * Information about a stored object with type
@@ -91,11 +92,11 @@ export interface DeltaAwareRepositoryAccess extends ObjectStoreAccess {
 /**
  * GitNativeRepositoryAccess implementation
  *
- * Direct passthrough to GitObjectStore - no serialization overhead.
- * Uses the existing GitObjectStore for all operations.
+ * Direct passthrough to GitObjects - no serialization overhead.
+ * Uses the existing GitObjects for all operations.
  */
 export class GitNativeRepositoryAccess implements ObjectStoreAccess {
-  constructor(protected readonly objectStore: GitObjectStore) {}
+  constructor(protected readonly objectStore: GitObjects) {}
 
   async has(id: ObjectId): Promise<boolean> {
     return this.objectStore.has(id);
@@ -103,7 +104,8 @@ export class GitNativeRepositoryAccess implements ObjectStoreAccess {
 
   async getInfo(id: ObjectId): Promise<RepositoryObjectInfo | null> {
     try {
-      const header = await this.objectStore.getHeader(id);
+      const header = await headerOf(this.objectStore, id);
+      if (!header) return null;
       return {
         id,
         type: TYPE_STRING_TO_CODE[header.type],
@@ -116,8 +118,7 @@ export class GitNativeRepositoryAccess implements ObjectStoreAccess {
 
   async load(id: ObjectId): Promise<ObjectData | null> {
     try {
-      const [header, contentStream] = await this.objectStore.loadWithHeader(id);
-      const content = await collect(contentStream);
+      const { header, content } = await loadObject(this.objectStore, id);
       return {
         type: TYPE_STRING_TO_CODE[header.type],
         content,
@@ -129,7 +130,7 @@ export class GitNativeRepositoryAccess implements ObjectStoreAccess {
 
   async store(type: ObjectTypeCode, content: Uint8Array): Promise<ObjectId> {
     const typeString = TYPE_CODE_TO_STRING[type];
-    return this.objectStore.store(typeString, [content]);
+    return this.objectStore.put(typeString, content.length, [content]);
   }
 
   async *enumerate(): AsyncIterable<ObjectId> {
@@ -147,7 +148,8 @@ export class GitNativeRepositoryAccess implements ObjectStoreAccess {
 
   async loadWireFormat(id: ObjectId): Promise<Uint8Array | null> {
     try {
-      return await collect(this.objectStore.loadRaw(id));
+      const raw = await collect(this.objectStore.getRaw(id));
+      return raw.length > 0 ? raw : null;
     } catch {
       return null;
     }
@@ -173,7 +175,7 @@ export class DeltaAwareGitNativeRepositoryAccess
   implements DeltaAwareRepositoryAccess
 {
   constructor(
-    objectStore: GitObjectStore,
+    objectStore: GitObjects,
     private readonly deltaStore: DeltaAwareStore,
   ) {
     super(objectStore);
@@ -197,7 +199,7 @@ export class DeltaAwareGitNativeRepositoryAccess
  */
 export interface CoreRepositoryAccessOptions {
   /** Object store for Git objects */
-  objectStore: GitObjectStore;
+  objectStore: GitObjects;
   /** Refs (any vcs-core `Refs` implementation) */
   refStore: Refs;
 }
@@ -205,7 +207,7 @@ export interface CoreRepositoryAccessOptions {
 /**
  * Create a RepositoryAccess adapter from core storage.
  *
- * Adapts GitObjectStore and Refs to the RepositoryAccess interface
+ * Adapts GitObjects and Refs to the RepositoryAccess interface
  * used by protocol handlers (upload-pack, receive-pack).
  *
  * @param options - Object store and ref store
@@ -267,7 +269,8 @@ export function createCoreRepositoryAccess(options: CoreRepositoryAccessOptions)
 
     async getObjectInfo(id: ObjectId): Promise<ObjectInfo | null> {
       try {
-        const header = await objectStore.getHeader(id);
+        const header = await headerOf(objectStore, id);
+        if (!header) return null;
         const typeCode = TYPE_STRING_TO_CODE[header.type];
         if (typeCode === undefined) {
           return null;
@@ -282,7 +285,9 @@ export function createCoreRepositoryAccess(options: CoreRepositoryAccessOptions)
     },
 
     async *loadObject(id: ObjectId): AsyncIterable<Uint8Array> {
-      yield* objectStore.load(id);
+      const obj = await objectStore.get(id);
+      if (!obj) throw new Error(`Object not found: ${id}`);
+      yield* obj.content;
     },
 
     async storeObject(type: ObjectTypeCode, content: Uint8Array): Promise<ObjectId> {
@@ -290,7 +295,7 @@ export function createCoreRepositoryAccess(options: CoreRepositoryAccessOptions)
       if (!typeString) {
         throw new Error(`Unknown type code: ${type}`);
       }
-      return objectStore.store(typeString, [content]);
+      return objectStore.put(typeString, content.length, [content]);
     },
 
     async updateRef(
@@ -329,7 +334,7 @@ export function createCoreRepositoryAccess(options: CoreRepositoryAccessOptions)
  */
 async function* walkObject(
   id: ObjectId,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {
@@ -346,8 +351,7 @@ async function* walkObject(
   }
 
   // Load object with header
-  const [header, contentStream] = await objectStore.loadWithHeader(id);
-  const content = await collect(contentStream);
+  const { header, content } = await loadObject(objectStore, id);
   const typeCode = TYPE_STRING_TO_CODE[header.type];
 
   if (typeCode === undefined) {
@@ -380,7 +384,7 @@ async function* walkObject(
  */
 async function* walkCommit(
   content: Uint8Array,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {
@@ -404,7 +408,7 @@ async function* walkCommit(
  */
 async function* walkTree(
   content: Uint8Array,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {
@@ -422,7 +426,7 @@ async function* walkTree(
  */
 async function* walkTag(
   content: Uint8Array,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {

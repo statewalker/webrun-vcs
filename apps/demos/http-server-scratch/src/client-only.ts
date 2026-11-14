@@ -391,11 +391,12 @@ async function collectObjectsForPush(
     if (seen.has(id)) return;
     seen.add(id);
 
-    const header = await history.objects.getHeader(id);
-    const typeCode = typeStringToCode[header.type];
+    const obj = await history.objects.get(id);
+    if (!obj) throw new Error(`Object not found: ${id}`);
+    const typeCode = typeStringToCode[obj.type];
 
     const chunks: Uint8Array[] = [];
-    for await (const chunk of history.objects.load(id)) {
+    for await (const chunk of obj.content) {
       chunks.push(chunk);
     }
     const content = concatBytes(...chunks);

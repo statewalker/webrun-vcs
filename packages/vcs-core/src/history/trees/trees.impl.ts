@@ -1,11 +1,12 @@
 /**
  * Git tree store implementation
  *
- * Wraps GitObjectStore with tree serialization/deserialization.
+ * Wraps GitObjects with tree serialization/deserialization.
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjectStore } from "../objects/object-store.js";
+import type { GitObjects } from "../objects/git-objects.js";
+import { loadTypedObject, objectHeader, storeObject } from "../objects/typed-object-access.js";
 import type { TreeEntry } from "./tree-entry.js";
 import { decodeTreeEntries, EMPTY_TREE_ID, encodeTreeEntries } from "./tree-format.js";
 import type { Trees } from "./trees.js";
@@ -14,10 +15,10 @@ import type { Trees } from "./trees.js";
  * Git tree store implementation
  *
  * Handles tree entry serialization (sorting, binary format)
- * and delegates storage to GitObjectStore.
+ * and delegates storage to GitObjects.
  */
 class GitTreeStore implements Trees {
-  constructor(private readonly objects: GitObjectStore) {}
+  constructor(private readonly objects: GitObjects) {}
 
   // ============ New Trees Interface ============
 
@@ -25,7 +26,7 @@ class GitTreeStore implements Trees {
    * Store tree entries (new interface)
    */
   async store(entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>): Promise<ObjectId> {
-    return this.objects.store("tree", encodeTreeEntries(entries));
+    return storeObject(this.objects, "tree", encodeTreeEntries(entries));
   }
 
   /**
@@ -71,14 +72,11 @@ class GitTreeStore implements Trees {
       return;
     }
 
-    const [header, content] = await this.objects.loadWithHeader(id);
+    const { content, release } = await loadTypedObject(this.objects, id, "tree");
     try {
-      if (header.type !== "tree") {
-        throw new Error(`Object ${id} is not a tree (found type: ${header.type})`);
-      }
       yield* decodeTreeEntries(content);
     } catch (err) {
-      content?.return?.(void 0);
+      await release();
       throw err;
     }
   }
@@ -112,8 +110,8 @@ class GitTreeStore implements Trees {
       return false;
     }
     try {
-      const header = await this.objects.getHeader(id);
-      return header.type === "tree";
+      const header = await objectHeader(this.objects, id);
+      return header?.type === "tree";
     } catch {
       return false;
     }
@@ -125,8 +123,8 @@ class GitTreeStore implements Trees {
   async *keys(): AsyncIterable<ObjectId> {
     for await (const id of this.objects.list()) {
       try {
-        const header = await this.objects.getHeader(id);
-        if (header.type === "tree") {
+        const header = await objectHeader(this.objects, id);
+        if (header?.type === "tree") {
           yield id;
         }
       } catch {
@@ -154,11 +152,11 @@ async function* emptyTreeEntries(): AsyncGenerator<TreeEntry> {
 }
 
 /**
- * Create a Trees instance backed by GitObjectStore
+ * Create a Trees instance backed by GitObjects
  *
- * @param objects GitObjectStore implementation to use for persistence
+ * @param objects GitObjects implementation to use for persistence
  * @returns Trees instance
  */
-export function createTrees(objects: GitObjectStore): Trees {
+export function createTrees(objects: GitObjects): Trees {
   return new GitTreeStore(objects);
 }

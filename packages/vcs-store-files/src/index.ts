@@ -2,7 +2,8 @@
  * File-backed storage backend for StateWalker VCS
  *
  * Provides file-dependent implementations of storage interfaces:
- * - Storage: FileRawStorage, PackDirectoryAdapter, FileVolatileStore
+ * - Storage: filesStagingStore (object kernel), FileRawStorage, PackDirectoryAdapter
+ * - Objects: withPacks (loose objects, then packs)
  * - Pack: PackDirectory, PackReader, PackDeltaStore, GitPackStoreImpl
  * - Factories: createGitFilesBackend(), createGitFilesHistoryFromFiles()
  * - GC: gc(), FileGcStrategy, repack()

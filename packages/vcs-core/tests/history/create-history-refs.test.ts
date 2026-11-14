@@ -1,17 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromComponents,
   MemoryRawStorage,
   MemoryRefs,
 } from "../../src/index.js";
+import { rawStorageStaging } from "../../src/storage/adapters/staging-blob-store.js";
 
 describe("createHistoryFromComponents refs", () => {
   it("uses a given Refs implementation as is", async () => {
     const refs = new MemoryRefs();
     await refs.set("refs/heads/main", "a".repeat(40));
     const history = createHistoryFromComponents({
-      objects: createGitObjectStore(new MemoryRawStorage()),
+      objects: createGitObjects(rawStorageStaging(new MemoryRawStorage())),
       refs,
     });
     expect(history.refs).toBe(refs);
@@ -20,7 +21,7 @@ describe("createHistoryFromComponents refs", () => {
 
   it("creates in-memory refs for { type: 'memory' }", async () => {
     const history = createHistoryFromComponents({
-      objects: createGitObjectStore(new MemoryRawStorage()),
+      objects: createGitObjects(rawStorageStaging(new MemoryRawStorage())),
       refs: { type: "memory" },
     });
     expect(await history.refs.batch([{ name: "refs/heads/x", new: "b".repeat(40) }])).toEqual({
@@ -32,7 +33,7 @@ describe("createHistoryFromComponents refs", () => {
   it('refuses { type: "adapter" } and other non-Refs values', () => {
     expect(() =>
       createHistoryFromComponents({
-        objects: createGitObjectStore(new MemoryRawStorage()),
+        objects: createGitObjects(rawStorageStaging(new MemoryRawStorage())),
         refs: { type: "adapter", refStore: {} } as never,
       }),
     ).toThrow(/refs must be a Refs implementation or \{ type: "memory" \}, got "adapter"/);

@@ -8,18 +8,14 @@
  * - All objects (including blobs) stored with Git headers for format compatibility
  */
 
-import type { FilesApi, GitObjectStore, History } from "@statewalker/vcs-core";
-import {
-  CompositeRawStorage,
-  createGitObjectStore,
-  createHistoryFromComponents,
-  joinPath,
-} from "@statewalker/vcs-core";
+import type { FilesApi, GitObjects, History } from "@statewalker/vcs-core";
+import { createGitObjects, createHistoryFromComponents, joinPath } from "@statewalker/vcs-core";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import { PackDirectory } from "./pack/pack-directory.js";
+import { withPacks } from "./pack/with-packs.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
+import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
-import { PackDirectoryAdapter } from "./storage/raw/pack-directory-adapter.js";
 
 /**
  * Options for creating a file-backed Git storage backend.
@@ -53,8 +49,8 @@ export interface GitFilesBackendOptions {
 export interface GitFilesBackendResult {
   /** History instance providing typed store access (blobs, trees, commits, tags, refs) */
   history: History;
-  /** Low-level GitObjectStore for raw object access (headers, type codes) */
-  objects: GitObjectStore;
+  /** The object kernel: loose objects first, then packs (`withPacks`). */
+  objects: GitObjects;
   /** Pack directory for pack file management (repack, GC) */
   packDirectory: PackDirectory;
   /** Loose object storage (for repack/GC operations) */
@@ -98,17 +94,13 @@ export async function createGitFilesBackend(
     await createGitDirectoryStructure(files, gitDir, objectsDir, defaultBranch);
   }
 
-  // Build storage layers.
-  // FileRawStorage handles zlib compression/decompression (compress: true by default).
-  // PackDirectoryAdapter provides read-only access to pack files.
-  // CompositeRawStorage combines loose (read/write) with packs (read-only fallback).
-  // GitObjectStore adds Git headers ("type size\0content").
+  // Objects: the kernel over git's loose layout (tmp_obj_* and a rename), reading
+  // packs as a fallback. FileRawStorage reads and writes the same zlib files for
+  // gc and repack.
   const looseStorage = new FileRawStorage(files, objectsDir);
   const packDirectory = new PackDirectory({ files, basePath: packDir });
   await packDirectory.scan();
-  const packAdapter = new PackDirectoryAdapter(packDirectory);
-  const compositeStorage = new CompositeRawStorage(looseStorage, [packAdapter]);
-  const objects = createGitObjectStore(compositeStorage);
+  const objects = withPacks(createGitObjects(filesStagingStore(files, objectsDir)), packDirectory);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
     refLockTimeoutMs: options.refLockTimeoutMs,

@@ -1,22 +1,23 @@
 /**
  * Git tag store implementation
  *
- * Wraps GitObjectStore with tag serialization/deserialization.
+ * Wraps GitObjects with tag serialization/deserialization.
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjectStore } from "../objects/object-store.js";
+import type { GitObjects } from "../objects/git-objects.js";
 import { ObjectType } from "../objects/object-types.js";
+import { loadTypedObject, objectHeader, storeObject } from "../objects/typed-object-access.js";
 import { decodeTagEntries, encodeTagEntries, entriesToTag, tagToEntries } from "./tag-format.js";
 import type { AnnotatedTag, Tags } from "./tags.js";
 
 /**
  * Git tag store implementation
  *
- * Handles tag serialization and delegates storage to GitObjectStore.
+ * Handles tag serialization and delegates storage to GitObjects.
  */
 class GitTagStore implements Tags {
-  constructor(private readonly objects: GitObjectStore) {}
+  constructor(private readonly objects: GitObjects) {}
 
   // ============ New Tags Interface ============
 
@@ -25,7 +26,7 @@ class GitTagStore implements Tags {
    */
   async store(tag: AnnotatedTag): Promise<ObjectId> {
     const entries = tagToEntries(tag);
-    return this.objects.store("tag", encodeTagEntries(entries));
+    return storeObject(this.objects, "tag", encodeTagEntries(entries));
   }
 
   /**
@@ -50,15 +51,12 @@ class GitTagStore implements Tags {
    * Load an annotated tag by ID (internal implementation)
    */
   private async loadTagInternal(id: ObjectId): Promise<AnnotatedTag> {
-    const [header, content] = await this.objects.loadWithHeader(id);
+    const { content, release } = await loadTypedObject(this.objects, id, "tag");
     try {
-      if (header.type !== "tag") {
-        throw new Error(`Object ${id} is not a tag (found type: ${header.type})`);
-      }
       const entries = decodeTagEntries(content);
       return entriesToTag(entries);
     } catch (err) {
-      content?.return?.(void 0);
+      await release();
       throw err;
     }
   }
@@ -88,8 +86,8 @@ class GitTagStore implements Tags {
       if (!(await this.objects.has(currentId))) {
         return currentId;
       }
-      const header = await this.objects.getHeader(currentId);
-      if (header.type !== "tag") {
+      const header = await objectHeader(this.objects, currentId);
+      if (header?.type !== "tag") {
         return currentId;
       }
       const nextTag = await this.loadTagInternal(currentId);
@@ -105,8 +103,8 @@ class GitTagStore implements Tags {
       return false;
     }
     try {
-      const header = await this.objects.getHeader(id);
-      return header.type === "tag";
+      const header = await objectHeader(this.objects, id);
+      return header?.type === "tag";
     } catch {
       return false;
     }
@@ -118,8 +116,8 @@ class GitTagStore implements Tags {
   async *keys(): AsyncIterable<ObjectId> {
     for await (const id of this.objects.list()) {
       try {
-        const header = await this.objects.getHeader(id);
-        if (header.type === "tag") {
+        const header = await objectHeader(this.objects, id);
+        if (header?.type === "tag") {
           yield id;
         }
       } catch {
@@ -130,11 +128,11 @@ class GitTagStore implements Tags {
 }
 
 /**
- * Create a Tags instance backed by GitObjectStore
+ * Create a Tags instance backed by GitObjects
  *
- * @param objects GitObjectStore implementation to use for persistence
+ * @param objects GitObjects implementation to use for persistence
  * @returns Tags instance
  */
-export function createTags(objects: GitObjectStore): Tags {
+export function createTags(objects: GitObjects): Tags {
   return new GitTagStore(objects);
 }

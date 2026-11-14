@@ -1,12 +1,13 @@
 /**
  * Git commit store implementation
  *
- * Wraps GitObjectStore with commit serialization/deserialization.
+ * Wraps GitObjects with commit serialization/deserialization.
  * Provides graph traversal operations for commit history.
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjectStore } from "../objects/object-store.js";
+import type { GitObjects } from "../objects/git-objects.js";
+import { loadTypedObject, objectHeader, storeObject } from "../objects/typed-object-access.js";
 import {
   commitToEntries,
   decodeCommitEntries,
@@ -21,7 +22,7 @@ import type { AncestryOptions, Commit, Commits } from "./commits.js";
  * Handles commit serialization and provides graph traversal.
  */
 class GitCommitStore implements Commits {
-  constructor(private readonly objects: GitObjectStore) {}
+  constructor(private readonly objects: GitObjects) {}
 
   // ============ New Commits Interface ============
 
@@ -30,7 +31,7 @@ class GitCommitStore implements Commits {
    */
   async store(commit: Commit): Promise<ObjectId> {
     const entries = commitToEntries(commit);
-    return this.objects.store("commit", encodeCommitEntries(entries));
+    return storeObject(this.objects, "commit", encodeCommitEntries(entries));
   }
 
   /**
@@ -59,15 +60,12 @@ class GitCommitStore implements Commits {
    * Load a commit object by ID (internal implementation)
    */
   private async loadCommitInternal(id: ObjectId): Promise<Commit> {
-    const [header, content] = await this.objects.loadWithHeader(id);
+    const { content, release } = await loadTypedObject(this.objects, id, "commit");
     try {
-      if (header.type !== "commit") {
-        throw new Error(`Object ${id} is not a commit (found type: ${header.type})`);
-      }
       const entries = decodeCommitEntries(content);
       return entriesToCommit(entries);
     } catch (err) {
-      content?.return?.(void 0);
+      await release();
       throw err;
     }
   }
@@ -155,8 +153,8 @@ class GitCommitStore implements Commits {
       return false;
     }
     try {
-      const header = await this.objects.getHeader(id);
-      return header.type === "commit";
+      const header = await objectHeader(this.objects, id);
+      return header?.type === "commit";
     } catch {
       return false;
     }
@@ -168,8 +166,8 @@ class GitCommitStore implements Commits {
   async *keys(): AsyncIterable<ObjectId> {
     for await (const id of this.objects.list()) {
       try {
-        const header = await this.objects.getHeader(id);
-        if (header.type === "commit") {
+        const header = await objectHeader(this.objects, id);
+        if (header?.type === "commit") {
           yield id;
         }
       } catch {
@@ -193,11 +191,11 @@ class GitCommitStore implements Commits {
 }
 
 /**
- * Create a Commits instance backed by GitObjectStore
+ * Create a Commits instance backed by GitObjects
  *
- * @param objects GitObjectStore implementation to use for persistence
+ * @param objects GitObjects implementation to use for persistence
  * @returns Commits instance
  */
-export function createCommits(objects: GitObjectStore): Commits {
+export function createCommits(objects: GitObjects): Commits {
   return new GitCommitStore(objects);
 }

@@ -9,7 +9,6 @@ import { createGitObjects, MemoryRawStorage, rawStorageStaging } from "@statewal
 import {
   createBlobStoreTests,
   createCommitStoreTests,
-  createGitObjectStoreTests,
   createGitObjectsTests,
   createRefBatchTests,
   createRefStoreTests,
@@ -52,12 +51,6 @@ createStagingStoreTests("Memory", async () => ({
 createBlobStoreTests("Memory", async () => {
   const stores = createMemoryObjectStores();
   return { blobStore: stores.blobs };
-});
-
-// GitObjectStore tests
-createGitObjectStoreTests("Memory", async () => {
-  const stores = createMemoryObjectStores();
-  return { objectStore: stores.objects };
 });
 
 // Object kernel tests

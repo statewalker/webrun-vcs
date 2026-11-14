@@ -1,27 +1,32 @@
 /**
  * Git blob store implementation
  *
- * Thin wrapper over GitObjectStore for blob operations.
+ * Thin wrapper over GitObjects for blob operations.
  * Blobs are the simplest object type - just raw binary content.
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjectStore } from "../objects/object-store.js";
+import type { GitObjects } from "../objects/git-objects.js";
+import { loadTypedObject, objectHeader, storeObject } from "../objects/typed-object-access.js";
 import type { Blobs } from "./blobs.js";
 
 /**
  * Git blob store implementation
  *
- * Delegates all operations to GitObjectStore with "blob" type.
+ * Delegates all operations to GitObjects with "blob" type.
  */
 class GitBlobStore implements Blobs {
-  constructor(private readonly objects: GitObjectStore) {}
+  constructor(private readonly objects: GitObjects) {}
 
   /**
    * Store blob with unknown size
    */
-  store(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<ObjectId> {
-    return this.objects.store("blob", content);
+  store(
+    content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    size?: number,
+  ): Promise<ObjectId> {
+    if (size !== undefined) return this.objects.put("blob", size, content);
+    return storeObject(this.objects, "blob", content);
   }
 
   /**
@@ -42,14 +47,11 @@ class GitBlobStore implements Blobs {
    * Load blob content (internal implementation)
    */
   private async *loadContent(id: ObjectId): AsyncGenerator<Uint8Array> {
-    const [header, content] = await this.objects.loadWithHeader(id);
+    const { content, release } = await loadTypedObject(this.objects, id, "blob");
     try {
-      if (header.type !== "blob") {
-        throw new Error(`Object ${id} is not a blob (found type: ${header.type})`);
-      }
       yield* content;
     } catch (err) {
-      content?.return?.(void 0);
+      await release();
       throw err;
     }
   }
@@ -69,8 +71,8 @@ class GitBlobStore implements Blobs {
       return false;
     }
     try {
-      const header = await this.objects.getHeader(id);
-      return header.type === "blob";
+      const header = await objectHeader(this.objects, id);
+      return header?.type === "blob";
     } catch {
       return false;
     }
@@ -85,8 +87,8 @@ class GitBlobStore implements Blobs {
   async *keys(): AsyncGenerator<ObjectId> {
     for await (const id of this.objects.list()) {
       try {
-        const header = await this.objects.getHeader(id);
-        if (header.type === "blob") {
+        const header = await objectHeader(this.objects, id);
+        if (header?.type === "blob") {
           yield id;
         }
       } catch {
@@ -102,14 +104,14 @@ class GitBlobStore implements Blobs {
     if (!(await this.objects.has(id))) {
       return -1;
     }
-    const header = await this.objects.getHeader(id);
-    if (header.type !== "blob") {
+    const header = await objectHeader(this.objects, id);
+    if (header?.type !== "blob") {
       return -1;
     }
     return header.size;
   }
 }
 
-export function createBlobs(objects: GitObjectStore): Blobs {
+export function createBlobs(objects: GitObjects): Blobs {
   return new GitBlobStore(objects);
 }

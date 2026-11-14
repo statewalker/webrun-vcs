@@ -11,7 +11,7 @@
 import type {
   Blobs,
   Commits,
-  GitObjectStore,
+  GitObjects,
   ObjectId,
   Refs,
   SerializationApi,
@@ -25,7 +25,7 @@ import { DefaultSerializationApi } from "@statewalker/vcs-core";
  */
 export interface SimpleHistoryOptions {
   /** Object store for raw Git objects */
-  objects: GitObjectStore;
+  objects: GitObjects;
   /** Blob storage */
   blobs: Blobs;
   /** Tree storage */
@@ -45,7 +45,7 @@ export interface SimpleHistoryOptions {
  * It should be cast to History when used with MemoryWorkingCopy.
  */
 export class SimpleHistory {
-  readonly objects: GitObjectStore;
+  readonly objects: GitObjects;
   readonly blobs: Blobs;
   readonly trees: Trees;
   readonly commits: Commits;

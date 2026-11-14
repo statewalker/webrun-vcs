@@ -381,9 +381,10 @@ export class VcsHttpServer {
       if (seen.has(id) || haveSet.has(id)) return;
       seen.add(id);
 
-      const [header, contentStream] = await storage.objects.loadWithHeader(id);
+      const header = await storage.objects.get(id);
+      if (!header) throw new Error(`Object not found: ${id}`);
       const chunks: Uint8Array[] = [];
-      for await (const chunk of contentStream) {
+      for await (const chunk of header.content) {
         chunks.push(chunk);
       }
       const content = this.concatBytes(chunks);
@@ -591,7 +592,7 @@ export class VcsHttpServer {
 
     for (const [_id, obj] of objectById) {
       const typeString = typeCodeToString(obj.type as ObjectTypeCode);
-      await storage.objects.store(typeString, [obj.content]);
+      await storage.objects.put(typeString, obj.content.length, [obj.content]);
     }
   }
 

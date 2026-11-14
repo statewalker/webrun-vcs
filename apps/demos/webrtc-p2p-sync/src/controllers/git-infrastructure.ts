@@ -9,13 +9,13 @@
 import { Git } from "@statewalker/vcs-commands";
 import type { FilesApi, History, SerializationApi } from "@statewalker/vcs-core";
 import {
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromComponents,
   createMemoryHistory,
   DefaultSerializationApi,
   joinPath,
 } from "@statewalker/vcs-core";
-import { createFileRefStore, FileRawStorage, FileWorktree } from "@statewalker/vcs-store-files";
+import { createFileRefStore, FileWorktree, filesStagingStore } from "@statewalker/vcs-store-files";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 import {
   createGitStaging,
@@ -70,7 +70,7 @@ export async function initializeGitInMemory(ctx: AppContext): Promise<void> {
 /**
  * Initialize Git infrastructure from a FilesApi (file-backed storage).
  *
- * All objects (including blobs) go through a single GitObjectStore, matching
+ * All objects (including blobs) go through a single GitObjects, matching
  * real Git's on-disk format where every object has a "type size\0" header.
  *
  * @param ctx Application context to populate
@@ -102,10 +102,9 @@ export async function initializeGitFromFiles(ctx: AppContext, files: FilesApi): 
 
   // Build History from file components.
   // FileRawStorage handles zlib compression/decompression by default.
-  // GitObjectStore adds Git headers ("type size\0content")
+  // GitObjects adds Git headers ("type size\0content")
   // — matching real Git's on-disk format.
-  const looseStorage = new FileRawStorage(files, objectsDir);
-  const objects = createGitObjectStore(looseStorage);
+  const objects = createGitObjects(filesStagingStore(files, objectsDir));
   const refStore = createFileRefStore(files, gitDir);
 
   const history = createHistoryFromComponents({

@@ -83,6 +83,22 @@ export function createBlobStoreTests(name: string, factory: BlobStoreFactory): v
     });
 
     describe("Basic Operations", () => {
+      it("stores with a known size in one pass, under the same id", async () => {
+        const content = new TextEncoder().encode("sized content\n");
+        const sized = await ctx.blobStore.store(toStream(content), content.length);
+        expect(sized).toBe(await ctx.blobStore.store(toStream(content)));
+        expect(await ctx.blobStore.size(sized)).toBe(content.length);
+      });
+
+      it("rejects a size that does not match the content and keeps nothing", async () => {
+        const content = new TextEncoder().encode("mismatch\n");
+        await expect(ctx.blobStore.store(toStream(content), content.length + 1)).rejects.toThrow();
+        await expect(ctx.blobStore.store(toStream(content), content.length - 1)).rejects.toThrow();
+        const keys: string[] = [];
+        for await (const k of ctx.blobStore.keys()) keys.push(k);
+        expect(keys).toEqual([]);
+      });
+
       it("stores and loads blob content", async () => {
         const content = encoder.encode("Hello, World!");
         const id = await ctx.blobStore.store(toStream(content));

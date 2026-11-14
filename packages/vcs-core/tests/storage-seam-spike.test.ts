@@ -11,21 +11,21 @@
 
 import { memBlobStore } from "@statewalker/webrun-storage";
 import { describe, expect, it } from "vitest";
-
 import type { PersonIdent } from "../src/history/index.js";
 import {
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromComponents,
   type History,
 } from "../src/history/index.js";
 import { DefaultSerializationApi } from "../src/serialization/serialization-api.impl.js";
 import type { SerializationApi } from "../src/serialization/serialization-api.js";
 import { blobStoreToRawStorage } from "../src/storage/adapters/blob-store-raw-storage.js";
+import { rawStorageStaging } from "../src/storage/adapters/staging-blob-store.js";
 
 /** Build a History + SerializationApi over the storage seam (memBlobStore). */
 function seamHistory(): { history: History; serialization: SerializationApi } {
   const raw = blobStoreToRawStorage(memBlobStore());
-  const objects = createGitObjectStore(raw);
+  const objects = createGitObjects(rawStorageStaging(raw));
   const history = createHistoryFromComponents({ objects, refs: { type: "memory" } });
   const serialization = new DefaultSerializationApi({ history });
   return { history, serialization };

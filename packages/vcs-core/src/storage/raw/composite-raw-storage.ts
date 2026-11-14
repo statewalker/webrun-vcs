@@ -18,7 +18,7 @@ import type { RawStorage } from "./raw-storage.js";
  * const loose = new FileRawStorage(files, objectsDir, { compress: true });
  * const packAdapter = new PackDirectoryAdapter(packDir);
  * const composite = new CompositeRawStorage(loose, [packAdapter]);
- * const objects = createGitObjectStore(composite);
+ * const objects = createGitObjects(rawStorageStaging(composite));
  * ```
  */
 export class CompositeRawStorage implements RawStorage {

@@ -9,7 +9,7 @@ import {
   type Blobs,
   type Commits,
   DefaultSerializationApi,
-  type GitObjectStore,
+  type GitObjects,
   type History,
   type HistoryWithOperations,
   type ObjectId,
@@ -39,7 +39,7 @@ import { testAuthor } from "./test-helper.js";
  */
 export interface TransportTestStores {
   /** Low-level Git object store for pack operations */
-  objects: GitObjectStore;
+  objects: GitObjects;
   /** Blob storage */
   blobs: Blobs;
   /** Tree storage */

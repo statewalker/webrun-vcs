@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createPersonIdent,
   createRef,
   createSymbolicRef,
@@ -142,9 +142,11 @@ describe("Core exports", () => {
       expect(typeof createTags).toBe("function");
     });
 
-    it("exports createGitObjectStore factory", () => {
-      expect(createGitObjectStore).toBeDefined();
-      expect(typeof createGitObjectStore).toBe("function");
+    it("exports the object kernel (createGitObjects), not the old GitObjectStore", async () => {
+      expect(typeof createGitObjects).toBe("function");
+      const core = await import("../src/index.js");
+      expect("createGitObjectStore" in core).toBe(false);
+      expect("MemoryVolatileStore" in core).toBe(false);
     });
   });
 });
