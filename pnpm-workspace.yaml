@@ -29,10 +29,10 @@ catalog:
   "@statewalker/webrun-streams": "^0.2.0"
   "@biomejs/biome": ^2.5.15
   "@observablehq/framework": ^1.13.4
-  "@statewalker/webrun-files": "^0.10.0"
-  "@statewalker/webrun-files-browser": "^0.10.0"
-  "@statewalker/webrun-files-mem": "^0.10.0"
-  "@statewalker/webrun-files-node": "^0.10.0"
+  "@statewalker/webrun-files": "^0.11.0"
+  "@statewalker/webrun-files-browser": "^0.11.0"
+  "@statewalker/webrun-files-mem": "^0.11.0"
+  "@statewalker/webrun-files-node": "^0.11.0"
   "@types/node": ^26.6.4
   "@types/sql.js": ^1.4.11
   "@vitest/browser": ^5.0.3

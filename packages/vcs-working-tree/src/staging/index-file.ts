@@ -8,11 +8,13 @@
  * fails halfway removes its lock, so the old index stays in place and nothing is
  * left behind.
  *
- * The lock is not an `O_EXCL` create: FilesApi has none, so `createExclusive`
- * checks for the file and then writes it. That excludes every writer sharing one
- * FilesApi instance (their creates run one at a time) and any lock file already
- * on disk, such as native git's, but not another process that creates the lock
- * in the same instant.
+ * The lock is created with `atomicFilesOver(...).createExclusive`. When the
+ * FilesApi has `createExclusive` (an `O_EXCL` create), that is used, and the lock
+ * excludes other processes and tabs. Without it, `createExclusive` checks for the
+ * file and then writes it: that excludes every writer sharing one FilesApi
+ * instance (their creates run one at a time) and any lock file already on disk,
+ * such as native git's, but not another process that creates the lock in the
+ * same instant.
  *
  * Once it holds the lock, a write by `IndexFile` also checks that the index is
  * still the one it read (by its trailing checksum), so a change made by native

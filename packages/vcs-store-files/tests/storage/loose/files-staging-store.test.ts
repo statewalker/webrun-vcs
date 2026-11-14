@@ -4,9 +4,8 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { mkdir, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createGitObjects } from "@statewalker/vcs-core";
 import { createGitObjectsTests } from "@statewalker/vcs-testing";
 import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
@@ -70,27 +69,25 @@ createGitObjectsTests("Files (Node)", async () => {
 });
 
 /**
- * `NodeFilesApi.write` in webrun-files-node 0.10 collects a file before writing it, so the
- * bounded-memory test runs on a Node FilesApi whose `write` appends each chunk to the file
- * as it arrives, counting the bytes on disk.
+ * The bounded-memory test on the real Node FilesApi: `NodeFilesApi.write` streams from
+ * webrun-files-node 0.11 (a temporary file, then a rename), so counting the chunks it
+ * pulls counts the bytes it has written.
  */
 createGitObjectsTests("Files (Node, streaming write)", async () => {
   const dir = tempDir("loose-node-stream-");
   const files = createNodeFilesApi({ rootDir: dir });
   let persisted = 0;
-  files.write = async (path, content) => {
-    const real = join(dir, path);
-    await mkdir(dirname(real), { recursive: true });
-    const handle = await open(real, "w");
-    try {
-      for await (const c of content) {
-        await handle.write(c);
-        persisted += c.length;
-      }
-    } finally {
-      await handle.close();
-    }
-  };
+  const write = files.write.bind(files);
+  files.write = (path, content) =>
+    write(
+      path,
+      (async function* () {
+        for await (const c of content) {
+          persisted += c.length;
+          yield c;
+        }
+      })(),
+    );
   const store = filesStagingStore(files, ".git/objects");
   return { objects: createGitObjects(store), store, persistedBytes: () => persisted };
 });

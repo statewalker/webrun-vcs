@@ -94,6 +94,17 @@ export interface FilesApi {
 
   /** Copy file or directory */
   copy(source: string, target: string): Promise<boolean>;
+
+  /**
+   * Create `path` with `content` only if nothing exists there (creating parent
+   * directories); `false` if it already exists. Optional, as in webrun-files: a real
+   * exclusive create (`open "wx"` on Node, Web Locks in the browser, a transaction in
+   * sqlite, a synchronous reservation in memory) where the backend has one.
+   */
+  createExclusive?(
+    path: string,
+    content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+  ): Promise<boolean>;
 }
 
 /**

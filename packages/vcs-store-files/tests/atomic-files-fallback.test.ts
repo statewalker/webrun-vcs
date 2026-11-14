@@ -1,6 +1,27 @@
 import { createAtomicFilesTests } from "@statewalker/vcs-testing";
-import { atomicFilesOver, createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
+import {
+  atomicFilesOver,
+  createInMemoryFilesApi as createMemFilesApi,
+  type FilesApi,
+} from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
+
+/**
+ * An in-memory FilesApi without `createExclusive`, so these suites exercise the
+ * in-process fallback (webrun-files-mem 0.11 has its own `createExclusive`).
+ */
+function createInMemoryFilesApi(): FilesApi {
+  return new Proxy(createMemFilesApi(), {
+    has(target, prop) {
+      return prop !== "createExclusive" && Reflect.has(target, prop);
+    },
+    get(target, prop) {
+      if (prop === "createExclusive") return undefined;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
 
 createAtomicFilesTests("FilesApi fallback (in memory)", async () => ({
   files: atomicFilesOver(createInMemoryFilesApi(), "/repo/.git"),
@@ -38,5 +59,55 @@ describe("atomicFilesOver: removeEmptyDir against a concurrent createExclusive",
     ]);
     expect(created).toBe(true);
     expect(await files.exists("refs/heads/x/y.lock")).toBe(true);
+  });
+});
+
+describe("replace after a half-done move (MoveIncompleteError)", () => {
+  /** A FilesApi whose `move` writes the target, then fails to remove the source, as
+   * webrun-files' copy-then-delete backends report with MoveIncompleteError. */
+  function halfMovingFiles(removeWorks: { value: boolean }): FilesApi {
+    const base = createInMemoryFilesApi();
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === "move") {
+          return async (from: string, to: string) => {
+            const chunks: Uint8Array[] = [];
+            for await (const c of target.read(from)) chunks.push(c);
+            await target.write(to, chunks);
+            const error = new Error(
+              `move ${from} -> ${to}: the target was replaced, but the source could not be removed`,
+            );
+            error.name = "MoveIncompleteError";
+            throw error;
+          };
+        }
+        if (prop === "remove") {
+          return async (path: string) => (removeWorks.value ? target.remove(path) : false);
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+  const enc = new TextEncoder();
+
+  it("counts the move as done once the source is removed", async () => {
+    const files = halfMovingFiles({ value: true });
+    const atomic = atomicFilesOver(files, "/repo/.git");
+    await files.write("/repo/.git/index.lock", [enc.encode("new")]);
+    await atomic.replace("index.lock", "index");
+    expect(await files.exists("/repo/.git/index.lock")).toBe(false);
+    const parts: Uint8Array[] = [];
+    for await (const c of files.read("/repo/.git/index")) parts.push(c);
+    expect(new TextDecoder().decode(parts[0])).toBe("new");
+  });
+
+  it("still fails when the source cannot be removed (a lock would stay behind)", async () => {
+    const files = halfMovingFiles({ value: false });
+    const atomic = atomicFilesOver(files, "/repo/.git");
+    await files.write("/repo/.git/index.lock", [enc.encode("new")]);
+    await expect(atomic.replace("index.lock", "index")).rejects.toMatchObject({
+      name: "MoveIncompleteError",
+    });
   });
 });
