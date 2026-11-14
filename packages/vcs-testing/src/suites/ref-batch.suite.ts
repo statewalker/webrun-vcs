@@ -26,6 +26,8 @@ export interface RefBatchSuiteOptions {
   multiRef?: boolean;
   /** Whether the store keeps symbolic refs (some KV adapters do not). */
   symbolicRefs?: boolean;
+  /** Whether the store keeps reflogs (written by `batch`, read by `getReflog`). */
+  reflog?: boolean;
 }
 
 /** Deterministic fake object ids; object existence is not checked by ref stores. */
@@ -60,9 +62,18 @@ export function createRefBatchTests(
   const itMulti = multi ? it : it.skip;
   const itSym = options.symbolicRefs === false ? it.skip : it;
   const itMultiSym = multi && options.symbolicRefs !== false ? it : it.skip;
+  const itLog = options.reflog ? it : it.skip;
+  const IDENT = "A U Thor <author@example.com> 1700000000 +0000";
+  const Z = "0".repeat(40);
   describe(`Refs.batch [${name}]`, () => {
     let ctx: RefBatchTestContext;
     let refs: Refs;
+    /** Reflog lines, oldest first, as "old>new:message" with ids shortened to their last 4 chars. */
+    const logOf = async (name: string): Promise<string[]> => {
+      const log = await refs.getReflog?.(name);
+      const entries = (await log?.getReverseEntries()) ?? [];
+      return entries.reverse().map((e) => `${e.oldId.slice(-4)}>${e.newId.slice(-4)}:${e.comment}`);
+    };
     /** Set up refs one command at a time (works on every store). */
     const seed = async (...pairs: [string, ObjectId][]) => {
       for (const [ref, id] of pairs) {
@@ -333,6 +344,75 @@ export function createRefBatchTests(
       }
       expect(seen).toHaveLength(2);
       expect(new Set(seen).size).toBe(1);
+    });
+
+    itLog("writes reflog lines with old and new ids, identity and message", async () => {
+      await refs.batch([{ name: "refs/heads/a", old: null, new: oid(1) }], {
+        ident: IDENT,
+        message: "create",
+      });
+      await refs.batch([{ name: "refs/heads/a", old: oid(1), new: oid(2) }], {
+        ident: IDENT,
+        message: "move   it",
+      });
+      expect(await logOf("refs/heads/a")).toEqual([
+        `${Z.slice(-4)}>aaa1:create`,
+        "aaa1>aaa2:move it", // whitespace runs collapsed, as git
+      ]);
+      const last = await (await refs.getReflog?.("refs/heads/a"))?.getLastEntry();
+      expect(last?.who).toMatchObject({ name: "A U Thor", email: "author@example.com" });
+    });
+
+    itLog("logs HEAD too when its branch moves, even when named directly", async () => {
+      await refs.batch([{ name: "refs/heads/main", new: oid(1) }], {
+        ident: IDENT,
+        message: "init",
+      });
+      await refs.setSymbolic("HEAD", "refs/heads/main");
+      await refs.batch([{ name: "HEAD", old: oid(1), new: oid(2) }], {
+        ident: IDENT,
+        message: "via HEAD",
+      });
+      await refs.batch([{ name: "refs/heads/main", old: oid(2), new: oid(3) }], {
+        ident: IDENT,
+        message: "direct",
+      });
+      expect(await logOf("refs/heads/main")).toEqual([
+        `${Z.slice(-4)}>aaa1:init`,
+        "aaa1>aaa2:via HEAD",
+        "aaa2>aaa3:direct",
+      ]);
+      expect(await logOf("HEAD")).toEqual(["aaa1>aaa2:via HEAD", "aaa2>aaa3:direct"]);
+    });
+
+    itLog(
+      "a no-op update logs HEAD but not the branch; a delete drops the branch log",
+      async () => {
+        await refs.batch([{ name: "refs/heads/main", new: oid(1) }], {
+          ident: IDENT,
+          message: "init",
+        });
+        await refs.setSymbolic("HEAD", "refs/heads/main");
+        await refs.batch([{ name: "refs/heads/main", old: oid(1), new: oid(1) }], {
+          ident: IDENT,
+          message: "noop",
+        });
+        expect(await logOf("refs/heads/main")).toEqual([`${Z.slice(-4)}>aaa1:init`]);
+        expect(await logOf("HEAD")).toEqual(["aaa1>aaa1:noop"]);
+        await refs.batch([{ name: "refs/heads/main", old: oid(1), new: null }], {
+          ident: IDENT,
+          message: "delete",
+        });
+        expect(await logOf("refs/heads/main")).toEqual([]);
+        expect((await logOf("HEAD")).at(-1)).toBe(`aaa1>${Z.slice(-4)}:delete`);
+      },
+    );
+
+    itLog("creates logs for branches, not for tags (git's logAllRefUpdates)", async () => {
+      await refs.batch([{ name: "refs/heads/b", new: oid(1) }], { ident: IDENT, message: "b" });
+      await refs.batch([{ name: "refs/tags/t", new: oid(1) }], { ident: IDENT, message: "t" });
+      expect(await logOf("refs/heads/b")).toEqual([`${Z.slice(-4)}>aaa1:b`]);
+      expect(await logOf("refs/tags/t")).toEqual([]);
     });
 
     itMulti("20 concurrent two-ref batches with retry: both refs count every success", async () => {

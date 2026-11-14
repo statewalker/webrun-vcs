@@ -8,10 +8,13 @@ import {
   type BatchResult,
   batchBySingleRef,
   planRefBatch,
+  planReflog,
   type RefCommand,
+  type ReflogLine,
 } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import { RefStorage } from "./ref-types.js";
+import { createReflogReaderOf } from "./reflog-lines.js";
 import type { ReflogReader } from "./reflog-types.js";
 import type { RefEntry, Refs, RefUpdateResult, RefValue } from "./refs.js";
 
@@ -32,6 +35,8 @@ type InternalRefEntry =
  */
 export class MemoryRefs implements Refs {
   private refs = new Map<string, InternalRefEntry>();
+  /** Reflogs by ref name, oldest line first. */
+  private logs = new Map<string, ReflogLine[]>();
   /** Serializes writes, so a batch applies exactly the plan it checked. */
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -140,12 +145,16 @@ export class MemoryRefs implements Refs {
    * Apply all commands atomically, or none (see {@link Refs.batch}). The memory
    * store keeps no reflog, so `options` is ignored.
    */
-  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
-    return this.exclusive(() => this.applyBatch(commands));
+  /**
+   * Apply all commands atomically, or none (see {@link Refs.batch}), writing
+   * reflog lines as git does (`options.ident`, `options.message`).
+   */
+  batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    return this.exclusive(() => this.applyBatch(commands, options));
   }
 
   /** Plan and apply a batch; call only while holding the write lock. */
-  private async applyBatch(commands: RefCommand[]): Promise<BatchResult> {
+  private async applyBatch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
     const plan = await planRefBatch(commands, {
       read: (name) => this.entryToRef(name),
       hasChildren: (name) => {
@@ -158,6 +167,13 @@ export class MemoryRefs implements Refs {
     for (const u of plan.updates) {
       if (u.newValue === null) this.refs.delete(u.name);
       else this.refs.set(u.name, { type: "direct", objectId: u.newValue });
+    }
+    const logs = planReflog(plan.updates, options);
+    for (const name of logs.drop) this.logs.delete(name);
+    for (const { name, line, create } of logs.append) {
+      const log = this.logs.get(name);
+      if (log) log.push(line);
+      else if (create) this.logs.set(name, [line]);
     }
     return { ok: true, rejected: [] };
   }
@@ -184,6 +200,12 @@ export class MemoryRefs implements Refs {
   /**
    * Initialize storage structure (no-op for in-memory)
    */
+  /** The reflog of `name` (written by `batch`), or undefined if it has none. */
+  async getReflog(name: string): Promise<ReflogReader | undefined> {
+    const log = this.logs.get(name);
+    return log ? createReflogReaderOf(log) : undefined;
+  }
+
   async initialize(): Promise<void> {
     // No initialization needed for in-memory store
   }

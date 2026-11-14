@@ -13,7 +13,9 @@ async function gitFilesRefs(): Promise<{
   return { files, refs: new FileRefStore(files, "/.git") };
 }
 
-createRefBatchTests("Git files", async () => ({ refs: (await gitFilesRefs()).refs }));
+createRefBatchTests("Git files", async () => ({ refs: (await gitFilesRefs()).refs }), {
+  reflog: true,
+});
 
 describe("Refs.batch on packed refs [Git files]", () => {
   const oid = (n: number): ObjectId => n.toString(16).padStart(40, "a");

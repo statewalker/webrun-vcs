@@ -125,6 +125,19 @@ if (!r.ok) console.log(r.rejected); // e.g. [{ name: "refs/heads/main", reason: 
 
 A batch applies every command or none. It is checked as `git update-ref --stdin` checks it: names must be `HEAD` or valid names under `refs/`, a ref may appear once, a ref and a ref below it (`refs/a`, `refs/a/b`) cannot both exist, and each `old` must match. A command naming a symbolic ref (such as `HEAD`) updates its target, unless `noDeref: true` asks to update the name itself. `rejected` tells which commands failed and why (`mismatch`, `invalid-name`, `duplicate`, `df-conflict`, `invalid-command`, `not-atomic`, `locked`, `unsupported`). Two rules go beyond git, on purpose: a detached HEAD cannot join a multi-ref batch (`not-atomic`; git files could not commit it atomically with packed refs), and symbolic-ref chains are followed for at most 5 refs, git's limit for reading refs. `compareAndSwap` is a one-command batch.
 
+```typescript
+await refs.batch([{ name: "refs/heads/main", old: c1, new: c2 }], {
+  ident: "Ada <ada@example.com> 1700000000 +0000",
+  message: "commit: second",
+});
+const log = await refs.getReflog?.("HEAD");
+for (const e of (await log?.getReverseEntries()) ?? []) {
+  console.log(e.oldId, e.newId, e.comment);
+}
+```
+
+Batches also keep reflogs, as git does with `core.logAllRefUpdates=true`: a ref that changes gets a line (`ident` and `message` from the options, the message on one line), and `HEAD` gets one too when the branch it points at moves, by name or through `HEAD`. Logs start for `HEAD`, `refs/heads/`, `refs/remotes/` and `refs/notes/`; other refs, such as tags, are logged only if they already have a log. Deleting a ref deletes its log. `planReflog(updates, options)` decides the lines for any store, and `createReflogReaderOf(lines)` reads them back.
+
 Every `Refs` has `batch`. The in-memory (`MemoryRefs`), SQL (`SQLRefStore`, one transaction), KV (`KVRefStore`, one compare-and-swap of a root value) and git-files (`FileRefStore`, git's lock files and a two-phase packed-refs commit) stores apply batches atomically. `kvStoreRefs` accepts only a batch of one command and refuses larger ones, and `noDeref` on a symbolic ref, as `unsupported`: its one-key-per-ref layout is shared with `@statewalker/webrun-storage`'s `refStore` facade.
 
 `walkAncestry` accepts one id or an array, and the options `limit`, `stopAt` and `firstParentOnly`.

@@ -40,7 +40,7 @@ Typical setup:
 | `initializeSchema(db)`, `getSchemaVersion(db)`, `rollbackMigration(db, version)`, `migrations` | Versioned schema (currently version 4). |
 | `createSqlNativeStores(db)` | `{ commits, trees, blobs, tags }` in normalized tables with **Git-compatible SHA-1 ids** and query methods. |
 | `SqlNativeCommitStoreImpl`, `SqlNativeTreeStoreImpl`, `SqlNativeBlobStoreImpl`, `SqlNativeTagStoreImpl` | The classes behind `createSqlNativeStores`. |
-| `SQLRefStore` | `Refs` in table `vcs_ref`; a batch of ref updates is planned and written in one transaction. |
+| `SQLRefStore` | `Refs` in table `vcs_ref`; a batch of ref updates is planned and written in one transaction, with its reflog lines (table `vcs_reflog`, migration 5). |
 | `SQLStaging` | `Staging` (the index) in table `staging_entry`. |
 | `SQLCommitStore`, `SQLTreeStore`, `SQLTagStore` | Same tables as the native stores, but ids from FNV-1a, **not Git ids** (see Internals). |
 | `createSqlObjectStores({ db, tableName? })` | `{ objects, blobs, trees, commits, tags }`: Git-format bytes in one key/value table (default `raw_objects`), Git ids, no query methods. |

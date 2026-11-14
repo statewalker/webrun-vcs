@@ -299,3 +299,53 @@ export async function batchBySingleRef(
     rejected: [{ name: u.requested, reason: nowValue === u.oldValue ? "locked" : "mismatch" }],
   };
 }
+
+/** One reflog line, as git writes it: `<old> <new> <ident>\t<message>`. */
+export interface ReflogLine {
+  oldId: ObjectId;
+  newId: ObjectId;
+  /** git identity with time: "Name <email> 1700000000 +0000". */
+  ident: string;
+  message: string;
+}
+
+/** The reflog writes a batch makes. */
+export interface ReflogPlan {
+  /** Lines to append; `create` says whether the log may be created if it does not exist. */
+  append: { name: string; line: ReflogLine; create: boolean }[];
+  /** Logs to remove (refs the batch deleted). */
+  drop: string[];
+}
+
+const ZERO_ID = "0".repeat(40);
+/** Refs git logs even without an existing reflog (core.logAllRefUpdates=true, non-bare). */
+const LOGGED_BY_DEFAULT = ["refs/heads/", "refs/remotes/", "refs/notes/"];
+
+/**
+ * The reflog writes for a planned batch, as git writes them with
+ * core.logAllRefUpdates=true: a log is created for HEAD, refs/heads/,
+ * refs/remotes/ and refs/notes/ (and appended to wherever one exists); the
+ * updated ref gets no line for a no-op and loses its log on delete; the refs
+ * that record the update too (`reflogAlso`, HEAD among them) always get a line.
+ */
+export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = {}): ReflogPlan {
+  const ident =
+    options.ident ?? `webrun-vcs <vcs@localhost> ${Math.floor(Date.now() / 1000)} +0000`;
+  const message = (options.message ?? "").replace(/\s+/g, " ").trim();
+  const plan: ReflogPlan = { append: [], drop: [] };
+  const create = (name: string) =>
+    name === "HEAD" || LOGGED_BY_DEFAULT.some((prefix) => name.startsWith(prefix));
+  for (const u of updates) {
+    const line: ReflogLine = {
+      oldId: u.oldValue ?? ZERO_ID,
+      newId: u.newValue ?? ZERO_ID,
+      ident,
+      message,
+    };
+    if (u.newValue === null) plan.drop.push(u.name);
+    else if (line.oldId !== u.newValue)
+      plan.append.push({ name: u.name, line, create: create(u.name) });
+    for (const name of u.reflogAlso) plan.append.push({ name, line, create: create(name) });
+  }
+  return plan;
+}

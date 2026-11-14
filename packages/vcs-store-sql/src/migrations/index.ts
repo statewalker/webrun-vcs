@@ -229,6 +229,26 @@ export const migrations: Migration[] = [
       DROP INDEX IF EXISTS commit_author_email_idx;
     `,
   },
+  {
+    version: 5,
+    name: "reflog",
+    up: `
+      -- Reflog lines, oldest first by id (git's logs/<ref> files)
+      CREATE TABLE IF NOT EXISTS vcs_reflog (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        old_id TEXT NOT NULL,
+        new_id TEXT NOT NULL,
+        ident TEXT NOT NULL,
+        message TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS reflog_name_idx ON vcs_reflog(name, id);
+    `,
+    down: `
+      DROP INDEX IF EXISTS reflog_name_idx;
+      DROP TABLE IF EXISTS vcs_reflog;
+    `,
+  },
 ];
 
 /**

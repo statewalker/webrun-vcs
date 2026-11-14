@@ -68,10 +68,14 @@ createRefStoreTests("KV", async () => {
 });
 
 // Ref batch tests
-createRefBatchTests("KV", async () => {
-  const kv = new MemoryKVAdapter();
-  return { refs: new KVRefStore(kv), cleanup: () => kv.close() };
-});
+createRefBatchTests(
+  "KV",
+  async () => {
+    const kv = new MemoryKVAdapter();
+    return { refs: new KVRefStore(kv), cleanup: () => kv.close() };
+  },
+  { reflog: true },
+);
 
 // StagingStore tests
 createStagingStoreTests("KV", async () => {

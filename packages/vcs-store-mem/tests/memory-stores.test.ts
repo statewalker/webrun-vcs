@@ -45,7 +45,7 @@ createRefStoreTests("Memory", async () => ({
 }));
 
 // Ref batch tests
-createRefBatchTests("Memory", async () => ({ refs: new MemoryRefs() }));
+createRefBatchTests("Memory", async () => ({ refs: new MemoryRefs() }), { reflog: true });
 
 // StagingStore tests
 createStagingStoreTests("Memory", async () => ({

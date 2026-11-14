@@ -9,6 +9,7 @@ export * from "./ref-batch.js";
 export * from "./ref-directory.js";
 export * from "./ref-name.js";
 export * from "./ref-types.js";
+export * from "./reflog-lines.js";
 export * from "./reflog-types.js";
 // New implementations (Phase C2)
 export * from "./refs.impl.js";

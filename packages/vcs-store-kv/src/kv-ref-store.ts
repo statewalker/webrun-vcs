@@ -13,18 +13,29 @@ import type {
   BatchOptions,
   BatchResult,
   ObjectId,
+  PlannedRefUpdate,
   Ref,
   RefCommand,
   RefEntry,
+  ReflogLine,
+  ReflogReader,
   Refs,
   RefUpdateResult,
   SymbolicRef,
 } from "@statewalker/vcs-core";
-import { compareRefNames, planRefBatch, RefStorage } from "@statewalker/vcs-core";
+import {
+  compareRefNames,
+  createReflogReaderOf,
+  planRefBatch,
+  planReflog,
+  RefStorage,
+} from "@statewalker/vcs-core";
 import type { KVStore } from "./kv-store.js";
 
 /** The key holding all refs. */
 const ROOT_KEY = "ref:root";
+/** Reflogs, one key per ref, outside the `ref:` keys the root layout owns. */
+const REFLOG_PREFIX = "reflog:";
 /** Symbolic refs are stored as "ref: <target>", as in git's loose ref files. */
 const SYMREF_PREFIX = "ref: ";
 /** Follow at most this many refs along a symbolic chain (git's read limit). */
@@ -221,8 +232,9 @@ export class KVRefStore implements Refs {
    * compare-and-swap of the root value. Reflogs are not kept yet, so `options`
    * is ignored.
    */
-  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
-    return this.update<BatchResult>(
+  async batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    let applied: PlannedRefUpdate[] = [];
+    const result = await this.update<BatchResult>(
       async (refs) => {
         const plan = await planRefBatch(commands, {
           read: (name) => toRef(name, refs.get(name)),
@@ -237,6 +249,7 @@ export class KVRefStore implements Refs {
           if (u.newValue === null) refs.delete(u.name);
           else refs.set(u.name, u.newValue);
         }
+        applied = plan.updates;
         return { result: { ok: true, rejected: [] }, write: plan.updates.length > 0 };
       },
       () => ({
@@ -244,6 +257,38 @@ export class KVRefStore implements Refs {
         rejected: commands.map((c) => ({ name: c.name, reason: "locked" as const })),
       }),
     );
+    if (result.ok) await this.writeReflogs(applied, options);
+    return result;
+  }
+
+  /**
+   * Reflog lines after the batch committed, one key per ref (`reflog:<name>`).
+   * Best effort, as in git: a failure never fails a committed batch.
+   */
+  private async writeReflogs(updates: PlannedRefUpdate[], options?: BatchOptions): Promise<void> {
+    const plan = planReflog(updates, options);
+    try {
+      for (const name of plan.drop) await this.kv.delete(`${REFLOG_PREFIX}${name}`);
+      for (const { name, line, create } of plan.append) {
+        const key = `${REFLOG_PREFIX}${name}`;
+        for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+          const bytes = await this.kv.get(key);
+          if (!bytes && !create) break;
+          const lines: ReflogLine[] = bytes ? JSON.parse(decoder.decode(bytes)) : [];
+          lines.push(line);
+          if (await this.kv.compareAndSwap(key, bytes, encoder.encode(JSON.stringify(lines))))
+            break;
+        }
+      }
+    } catch {
+      // the refs changed; their log lines are best effort
+    }
+  }
+
+  /** The reflog of `name` (written by `batch`), or undefined if it has none. */
+  async getReflog(refName: string): Promise<ReflogReader | undefined> {
+    const bytes = await this.kv.get(`${REFLOG_PREFIX}${refName}`);
+    return bytes ? createReflogReaderOf(JSON.parse(decoder.decode(bytes))) : undefined;
   }
 
   async compareAndSwap(
