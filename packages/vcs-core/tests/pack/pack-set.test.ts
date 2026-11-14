@@ -764,7 +764,8 @@ describe("review of P2.3: copies that cannot serve a read", () => {
   it("freshen is false for a pack deleted behind the set's back, and drops it", async () => {
     const files = createInMemoryFilesApi();
     const r = await install(files, [{ kind: 3, data: A }]);
-    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    // freshen trusts a pack it checked within the rescan interval: 0 makes it check each time
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
     expect(await set.freshen(Aid)).toBe(true);
     await files.remove(paths(r.packId).idx);
     await files.remove(paths(r.packId).pack);
@@ -976,6 +977,281 @@ describe("review of P2.3: concurrent scans, installs and removals", () => {
     await new Promise((res) => setTimeout(res, 50)); // the install reaches its open meanwhile
     g.open();
     await Promise.all([scan, installed]);
+    expect((await set.packs()).map((p) => p.packId)).toEqual([r.packId]);
+  });
+});
+
+/** A promise with its resolver, for gating steps of a race deterministically. */
+function deferred<T = void>() {
+  let resolve: (v: T) => void = () => {};
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+/** Counts the reads `files` has open (started and neither finished, failed nor returned). */
+function countOpenReads(files: FilesApi) {
+  let open = 0;
+  const read = files.read.bind(files);
+  files.read = (path, o) => ({
+    [Symbol.asyncIterator]() {
+      const it = read(path, o)[Symbol.asyncIterator]();
+      open++;
+      let closed = false;
+      const close = () => {
+        if (!closed) {
+          closed = true;
+          open--;
+        }
+      };
+      return {
+        async next() {
+          try {
+            const r = await it.next();
+            if (r.done) close();
+            return r;
+          } catch (e) {
+            close();
+            throw e;
+          }
+        },
+        async return(v?: unknown) {
+          close();
+          await it.return?.(v);
+          return { done: true as const, value: undefined };
+        },
+      };
+    },
+  });
+  return () => open;
+}
+
+describe("re-review of P2.3: reads are released", () => {
+  async function bigPack() {
+    const files = createInMemoryFilesApi();
+    const big = noise(MiB, 21);
+    await install(files, [{ kind: 3, data: big }]);
+    const set = await openPackSet(files, PACK_DIR);
+    return { files, set, id: oidOf("blob", big) };
+  }
+
+  it("get then return without iterating closes the pack read", async () => {
+    const { files, set, id } = await bigPack();
+    const open = countOpenReads(files);
+    const o = await set.get(id);
+    expect(open()).toBe(1); // the first chunk was read: the stream is open
+    await o?.content[Symbol.asyncIterator]().return?.();
+    expect(open()).toBe(0);
+  });
+
+  it("reading only the first chunk, then return, closes the pack read", async () => {
+    const { files, set, id } = await bigPack();
+    const open = countOpenReads(files);
+    const o = await set.get(id);
+    const it = o?.content[Symbol.asyncIterator]();
+    const first = await it?.next();
+    expect(first?.done).toBe(false);
+    await it?.return?.();
+    expect(open()).toBe(0);
+  });
+
+  it("a whole read leaves nothing open", async () => {
+    const { files, set, id } = await bigPack();
+    const open = countOpenReads(files);
+    expect((await content(await set.get(id, { verify: true }))).length).toBe(MiB);
+    expect(open()).toBe(0);
+  });
+});
+
+describe("re-review of P2.3: scans", () => {
+  it("a storage error while scanning one pack does not hide the others", async () => {
+    const files = createInMemoryFilesApi();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    await install(files, [{ kind: 3, data: A }]);
+    await new Promise((r) => setTimeout(r, 5));
+    await install(files, [{ kind: 3, data: B }]);
+    // the second pack the scan checks fails once with EIO
+    let checked = 0;
+    let failed = false;
+    const exists = files.exists.bind(files);
+    files.exists = async (path) => {
+      if (path.endsWith(".pack") && ++checked === 2 && !failed) {
+        failed = true;
+        throw new Error("EIO");
+      }
+      return exists(path);
+    };
+    await set.refresh().catch(() => {});
+    await set.refresh();
+    expect((await set.packs()).length).toBe(2);
+    expect(await content(await set.get(Aid))).toEqual(A);
+    expect(await content(await set.get(Bid))).toEqual(B);
+  });
+
+  it("an idx completed right after a failed read is found by the next refresh", async () => {
+    const files = createInMemoryFilesApi();
+    const built = buildPack([{ kind: 3, data: A }]);
+    const checksum = built.bytes.subarray(built.bytes.length - 20);
+    const packId = bytesToHex(checksum);
+    const idx = writePackIdx(
+      [{ id: Aid, offset: 12, crc32: crc32(built.bytes.subarray(12, built.ends[0])) }],
+      checksum,
+    );
+    await files.write(paths(packId).pack, [built.bytes]);
+    await files.write(paths(packId).idx, [idx.subarray(0, 600)]);
+    // the writer finishes the idx just after the scan read the partial one
+    const read = files.read.bind(files);
+    let completed = false;
+    files.read = (path, o) =>
+      (async function* () {
+        yield* read(path, o);
+        if (path === paths(packId).idx && !completed) {
+          completed = true;
+          await files.write(paths(packId).idx, [idx]);
+        }
+      })();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    expect(set.skipped.length).toBe(1);
+    await set.refresh();
+    expect(set.skipped).toEqual([]);
+    expect(await content(await set.get(Aid))).toEqual(A);
+  });
+
+  it("freshen checks the pack file at most once per rescan interval", async () => {
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    let checks = 0;
+    const exists = files.exists.bind(files);
+    files.exists = async (path) => {
+      if (path === paths(r.packId).pack) checks++;
+      return exists(path);
+    };
+    for (let i = 0; i < 100; i++) expect(await set.freshen(Aid)).toBe(true);
+    expect(checks).toBe(1);
+  });
+});
+
+describe("re-review of P2.3: a REF_DELTA base whose packed copies are all bad", () => {
+  it("falls back to externalBase (a repaired loose base)", async () => {
+    const files = createInMemoryFilesApi();
+    // the only packed copy of A is broken; B is a REF_DELTA on A in another pack
+    await writeRaw(files, [{ kind: 7, data: dAB, baseOid: fakeId(0xee) }], [Aid]);
+    await writeRaw(files, [{ kind: 7, data: dAB, baseOid: Aid }], [Bid]);
+    const set = await openPackSet(files, PACK_DIR, {
+      externalBase: async (id) =>
+        id === Aid
+          ? {
+              type: "blob",
+              size: A.length,
+              content: (async function* () {
+                yield A;
+              })(),
+            }
+          : undefined,
+    });
+    await expect(set.get(Aid)).rejects.toBeInstanceOf(PackError); // the bad copy is marked
+    expect(await content(await set.get(Bid, { verify: true }))).toEqual(B);
+  });
+});
+
+describe("re-review of P2.3: removals and installs racing scans", () => {
+  /** Holds the first call matching `match` until `release()`; `reached` resolves when it arrives. */
+  function holdFirst(match: (path: string) => boolean) {
+    const reached = deferred();
+    const released = deferred();
+    let used = false;
+    return {
+      reached: reached.promise,
+      release: () => released.resolve(),
+      async maybeHold(path: string) {
+        if (used || !match(path)) return;
+        used = true;
+        reached.resolve();
+        await released.promise;
+      },
+    };
+  }
+
+  it("a scan that starts while remove() deletes the files does not re-add the pack", async () => {
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const hold = holdFirst((p) => p === paths(r.packId).idx);
+    const remove = files.remove.bind(files);
+    files.remove = async (path) => {
+      await hold.maybeHold(path);
+      return remove(path);
+    };
+    const removing = set.remove([r.packId]);
+    await hold.reached; // remove() is about to delete the idx
+    await set.refresh(); // a scan starting now still sees the files
+    hold.release();
+    await removing;
+    expect(await set.packs()).toEqual([]);
+    expect(await set.has(Aid)).toBe(false);
+  });
+
+  it("remove() wins over a scan whose open succeeds while the removal is in progress", async () => {
+    const files = createInMemoryFilesApi();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const r = await install(files, [{ kind: 3, data: A }]);
+    // the scan is held inside its open; remove() is held before it deletes anything, so the
+    // open succeeds and only the check after it can drop the pack
+    const opening = holdFirst((p) => p === paths(r.packId).pack);
+    const stats = files.stats.bind(files);
+    files.stats = async (path) => {
+      await opening.maybeHold(path);
+      return stats(path);
+    };
+    const deleting = holdFirst((p) => p === paths(r.packId).idx);
+    const remove = files.remove.bind(files);
+    files.remove = async (path) => {
+      await deleting.maybeHold(path);
+      return remove(path);
+    };
+    const scan = set.refresh();
+    await opening.reached;
+    const removing = set.remove([r.packId]);
+    await deleting.reached;
+    opening.release();
+    await scan;
+    deleting.release();
+    await removing;
+    expect(await set.packs()).toEqual([]);
+    expect(set.skipped).toEqual([]);
+  });
+
+  it("a scan that joins an install's open adds the pack once", async () => {
+    const files = createInMemoryFilesApi();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const bytes = pack([{ kind: 3, data: A }]);
+    const r = await installPack(files, PACK_DIR, chunks(bytes));
+    // install's open is held; the scan then joins the same open; install resumes first
+    const opening = holdFirst((p) => p === paths(r.packId).pack);
+    const stats = files.stats.bind(files);
+    files.stats = async (path) => {
+      await opening.maybeHold(path);
+      return stats(path);
+    };
+    const installed = set.install(chunks(bytes));
+    await opening.reached;
+    const scanChecked = deferred();
+    let watch = true;
+    const exists = files.exists.bind(files);
+    files.exists = async (path) => {
+      const found = await exists(path);
+      if (watch && path === paths(r.packId).pack) {
+        watch = false;
+        scanChecked.resolve();
+      }
+      return found;
+    };
+    const scan = set.refresh();
+    await scanChecked.promise;
+    await new Promise((res) => setTimeout(res, 0)); // the scan's continuation joins the open
+    opening.release();
+    await Promise.all([installed, scan]);
     expect((await set.packs()).map((p) => p.packId)).toEqual([r.packId]);
   });
 });

@@ -114,8 +114,18 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
     async *getRaw(id) {
       const obj = await lookup(id);
       if (!obj) return;
-      yield new TextEncoder().encode(`${obj.type} ${obj.size}\0`);
-      yield* obj.content;
+      const it = obj.content[Symbol.asyncIterator]();
+      try {
+        yield new TextEncoder().encode(`${obj.type} ${obj.size}\0`);
+        for (;;) {
+          const r = await it.next();
+          if (r.done) return;
+          yield r.value;
+        }
+      } finally {
+        // also when the caller stops after the header: the packed read is released
+        await it.return?.();
+      }
     },
 
     get: lookup,
@@ -126,9 +136,10 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
     },
 
     async *list() {
-      // no set of every id: loose ids already in a pack's idx are skipped
-      yield* packs.list();
+      // one snapshot of the packs, for the packed ids and to skip loose ids already in a pack's
+      // idx (no set of every id)
       const held = await packs.packs();
+      yield* packs.list({ packs: held });
       for await (const id of loose.list()) if (!held.some((p) => p.has(id))) yield id;
     },
 

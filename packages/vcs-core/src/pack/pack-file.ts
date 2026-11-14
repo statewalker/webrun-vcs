@@ -50,6 +50,7 @@ export interface PackedEntry {
    * The entry's compressed data (its zlib stream, without the entry header). The CRC of the
    * whole entry is checked in a first pass, before any byte is yielded (a mismatch throws
    * `PackError` from the first `next()`), and again while streaming, in case the file changed.
+   * This reads the entry twice, which doubles the I/O for large reused entries.
    */
   raw(): AsyncIterable<Uint8Array>;
 }

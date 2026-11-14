@@ -4,16 +4,25 @@
  * list the pack directory each time.
  */
 import {
+  createGitObjects,
   createInMemoryFilesApi,
   type FilesApi,
   installPack,
   joinPath,
+  openPackSet,
   writePackIdx,
 } from "@statewalker/vcs-core";
 import { buildPack, copyAll, craftDelta, oidOf } from "@statewalker/vcs-testing";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import { describe, expect, it } from "vitest";
-import { createGitFilesBackend, repack } from "../../src/index.js";
+import {
+  createGitFilesBackend,
+  filesStagingStore,
+  PackDirectory,
+  repack,
+  skipPacked,
+  withPacks,
+} from "../../src/index.js";
 
 const enc = new TextEncoder();
 const PACK_DIR = joinPath(".git", "objects", "pack");
@@ -109,7 +118,16 @@ describe("a corrupt packed whole object gives way to a good loose copy", () => {
 describe("misses are rate-limited", () => {
   it("100 misses list the pack directory at most twice", async () => {
     const files = createInMemoryFilesApi();
-    const { objects } = await createGitFilesBackend({ files, create: true });
+    await createGitFilesBackend({ files, create: true });
+    // independent of the wall clock: no interval can elapse during the test
+    const packs = await openPackSet(files, PACK_DIR, {
+      rescanIntervalMs: Number.POSITIVE_INFINITY,
+    });
+    const objectsDir = joinPath(".git", "objects");
+    const objects = withPacks(
+      createGitObjects(skipPacked(filesStagingStore(files, objectsDir), packs)),
+      packs,
+    );
     let lists = 0;
     const list = files.list.bind(files);
     files.list = (path, o) => {
@@ -135,5 +153,123 @@ describe("misses are rate-limited", () => {
     await repack({ looseStorage, packDirectory, files });
     expect(await looseStorage.has(id)).toBe(false);
     expect(await text((await objects.get(id))?.content)).toBe("pack me");
+  });
+});
+
+/** Counts the reads `files` has open (started and neither finished, failed nor returned). */
+function countOpenReads(files: FilesApi) {
+  let open = 0;
+  const read = files.read.bind(files);
+  files.read = (path, o) => ({
+    [Symbol.asyncIterator]() {
+      const it = read(path, o)[Symbol.asyncIterator]();
+      open++;
+      let closed = false;
+      const close = () => {
+        if (!closed) {
+          closed = true;
+          open--;
+        }
+      };
+      return {
+        async next() {
+          try {
+            const r = await it.next();
+            if (r.done) close();
+            return r;
+          } catch (e) {
+            close();
+            throw e;
+          }
+        },
+        async return(v?: unknown) {
+          close();
+          await it.return?.(v);
+          return { done: true as const, value: undefined };
+        },
+      };
+    },
+  });
+  return () => open;
+}
+
+describe("re-review of P2.3: packed reads are released", () => {
+  /** xorshift bytes: deterministic and incompressible */
+  function noise(n: number, seed: number): Uint8Array {
+    const out = new Uint8Array(n);
+    let x = seed >>> 0 || 1;
+    for (let i = 0; i < n; i++) {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      out[i] = x & 255;
+    }
+    return out;
+  }
+  async function packedBig() {
+    const { files, history, objects, packs } = await backend();
+    const big = noise(2 ** 20, 3);
+    await packs.install(chunks(buildPack([{ kind: 3, data: big }])));
+    return { files, history, objects, id: oidOf("blob", big) };
+  }
+
+  it("objectHeader (blobs.size, blobs.has) leaves no pack read open", async () => {
+    const { files, history, id } = await packedBig();
+    const open = countOpenReads(files);
+    for (let i = 0; i < 20; i++) {
+      expect(await history.blobs.size(id)).toBe(2 ** 20);
+      expect(await history.blobs.has(id)).toBe(true);
+    }
+    expect(open()).toBe(0);
+  });
+
+  it("getRaw stopped after the header leaves no pack read open", async () => {
+    const { files, objects, id } = await packedBig();
+    const open = countOpenReads(files);
+    const it = objects.getRaw(id)[Symbol.asyncIterator]();
+    const header = await it.next();
+    expect(new TextDecoder().decode(header.value)).toBe(`blob ${2 ** 20}\0`);
+    await it.return?.();
+    expect(open()).toBe(0);
+  });
+});
+
+describe("re-review of P2.3: list and PackDirectory.onChange", () => {
+  it("list uses one pack snapshot: a pack installed while listing hides no loose object", async () => {
+    const { objects, packs } = await backend();
+    const Y = enc.encode("packed Y\n");
+    await packs.install(chunks(buildPack([{ kind: 3, data: Y }])));
+    await objects.put("blob", X.length, [X]); // loose
+    const listed: string[] = [];
+    let installed = false;
+    for await (const id of objects.list()) {
+      listed.push(id);
+      if (!installed) {
+        installed = true;
+        // X gets packed while the listing is under way (its loose copy stays)
+        await packs.install(chunks(buildPack([{ kind: 3, data: X }])));
+      }
+    }
+    expect(listed.sort()).toEqual([Xid, oidOf("blob", Y)].sort());
+  });
+
+  it("an onChange failure does not fail addPack or removePack", async () => {
+    const files = createInMemoryFilesApi();
+    const dir = new PackDirectory({
+      files,
+      basePath: PACK_DIR,
+      onChange: () => {
+        throw new Error("refresh failed");
+      },
+    });
+    const bytes = buildPack([{ kind: 3, data: X }]);
+    const idx = writePackIdx(
+      [{ id: Xid, offset: 12, crc32: 0 }],
+      bytes.subarray(bytes.length - 20),
+    );
+    await dir.addPack("pack-test", bytes, idx);
+    expect(await files.exists(joinPath(PACK_DIR, "pack-test.idx"))).toBe(true);
+    await dir.removePack("pack-test");
+    expect(await files.exists(joinPath(PACK_DIR, "pack-test.idx"))).toBe(false);
   });
 });

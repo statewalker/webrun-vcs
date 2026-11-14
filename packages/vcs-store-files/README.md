@@ -203,10 +203,12 @@ History (blobs / trees / commits / tags / refs)
 
 Reads try the packs first, then the loose objects, as git and JGit do: a packed object is
 streamed from its pack (a large blob arrives in many chunks), and `getRaw` is its header followed
-by that stream. A pack miss rescans the pack directory at most once per second (git's
-`reprepare_packed_git`, rate-limited; the first miss after open always rescans), so a pack native
+by that stream; a caller that stops after the header releases the pack read. A pack miss, and
+every `list()`, rescans the pack directory at most once per second (git's
+`reprepare_packed_git`, rate-limited; the first rescan after open always runs), so a pack native
 git writes meanwhile is found within that interval, and a run of misses (fetch negotiation probing
-absent ids) does not list the directory each time. Packs that `repack()` and gc add or remove
+absent ids) does not list the directory each time. `list()` takes one snapshot of the packs for
+both the packed ids and for skipping loose ids that are already packed. Packs that `repack()` and gc add or remove
 through the returned `packDirectory` refresh `packs` at once.
 
 A packed copy that fails before `get` returns (a corrupt entry header, a missing delta base, a
@@ -218,8 +220,9 @@ says which and why) and the rest of the repository stays readable.
 
 Writing an object that is already packed (`put` or `putRaw`) writes nothing, as git and JGit do,
 unless its pack file has been deleted behind the backend's back (by `git repack -a -d` or gc) or
-its packed copy was found corrupt: then it is written loose, so the object is never lost and a
-repairing write lands.
+its packed copy was found corrupt: then it is written loose, so a repairing write lands. A pack
+whose file was checked less than a second ago is trusted without another check, so a pack
+deleted within that second can still cause one skipped write.
 `gc()` and `repack()` still work on `FileRawStorage` (the `looseStorage` the backend returns) and
 `PackDirectory` (also returned, until they move to `packs`), and ignore files in `objects/` that are not objects (such as git's
 `objects/ab/tmp_obj_*` while it writes).
@@ -227,7 +230,8 @@ repairing write lands.
 New objects are always written loose. Packs are only read, until `repack()` turns loose objects
 into a pack. This keeps writes simple (one file per object, no pack index to rewrite) and matches
 how `git` itself behaves between `git gc` runs. A pack `repack()` writes through `PackDirectory`
-is read by `packs` at once (the backend refreshes the set after each `addPack` and `removePack`).
+is read by `packs` at once (the backend refreshes the set after each `addPack` and `removePack`;
+a failed refresh does not fail them, and the next miss rescans).
 
 ### Reachability is computed from refs only
 

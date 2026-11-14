@@ -53,7 +53,9 @@ export interface PackSet {
   /**
    * Whether a pack still on storage holds a copy not found corrupt: the check before skipping a
    * write of an object already packed (git's freshen_packed_object). A pack whose file is gone is
-   * dropped. No rescan: a miss only means the object is written loose.
+   * dropped. A pack whose file was seen less than `rescanIntervalMs` ago is trusted without
+   * another check (git checks once per pack per process). No rescan: a miss only means the
+   * object is written loose.
    */
   freshen(id: ObjectId): Promise<boolean>;
   /**
@@ -65,9 +67,13 @@ export interface PackSet {
   get(id: ObjectId, options?: { verify?: boolean }): Promise<GitObject | undefined>;
   /** The object's entry as stored in the first pack holding a sound copy (for reuse). */
   entry(id: ObjectId): Promise<PackedEntry | undefined>;
-  /** Every packed id, once. */
-  list(): AsyncIterable<ObjectId>;
-  /** The packs, in lookup order (newest first). */
+  /**
+   * Every packed id, once (an id is yielded by the first pack holding it). Without `packs`, the
+   * directory is rescanned first (within the rate limit) and the current packs are listed; with
+   * `packs` (a snapshot from `packs()`), exactly those are.
+   */
+  list(options?: { packs?: readonly Pack[] }): AsyncIterable<ObjectId>;
+  /** The packs, in lookup order (newest first), after a rescan within the rate limit. */
   packs(): Promise<readonly Pack[]>;
   /** Installs a pack with `installPack` into the directory and adds it to the set. */
   install(source: AsyncIterable<Uint8Array>, options?: InstallPackOptions): Promise<InstalledPack>;
@@ -117,6 +123,10 @@ export async function openPackSet(
   /** removals: a scan does not add a pack removed after it started */
   let removals = 0;
   const removedAt = new Map<string, number>();
+  /** packs whose files remove() is deleting: scans skip them until the files are gone */
+  const removing = new Set<string>();
+  /** when freshen last saw each pack's file */
+  const seenAt = new WeakMap<PackFile, number>();
   /** copies found corrupt, per pack */
   const bad = new WeakMap<PackFile, Set<ObjectId>>();
   const isBad = (p: PackFile, id: ObjectId) => bad.get(p)?.has(id) ?? false;
@@ -145,7 +155,11 @@ export async function openPackSet(
     const i = skipped.findIndex((s) => s.pack === pack);
     if (i >= 0) skipped.splice(i, 1);
   };
-  /** size and mtime of a pack's files: a refused pack is retried once they change */
+  /**
+   * Size and mtime of a pack's files: a refused pack is retried once they change. Taken before
+   * the open, so a file completed during the open is retried. Without `lastModified` from the
+   * FilesApi the signature is size-only: a rewrite to the same size is not retried.
+   */
   const signature = async (name: string) => {
     const [i, p] = await Promise.all([
       files.stats(`${dir}/${name}.idx`),
@@ -159,8 +173,20 @@ export async function openPackSet(
     id: ObjectId,
     visiting: ReadonlySet<ObjectId>,
   ): Promise<ResolvedObject | undefined> => {
-    const o = (await lookup(id, { visiting }, false)) ?? (await options.externalBase?.(id));
-    if (!o) return undefined;
+    let o: GitObject | undefined;
+    let failed: unknown;
+    try {
+      o = await lookup(id, { visiting }, false);
+    } catch (e) {
+      // every packed copy is bad: a loose copy (a repaired base) may still serve
+      if (!(e instanceof CorruptObjectError)) throw e;
+      failed = e;
+    }
+    o ??= await options.externalBase?.(id);
+    if (!o) {
+      if (failed) throw failed;
+      return undefined;
+    }
     // checked before buffering: a loose zlib bomb of a few KB can declare gigabytes
     if (o.size > maxObjectSize) {
       const it = o.content[Symbol.asyncIterator]();
@@ -218,26 +244,29 @@ export async function openPackSet(
     // newest first, as git's and JGit's pack lists
     found.sort((a, b) => b.lastModified - a.lastModified || (a.name < b.name ? -1 : 1));
     const added: PackFile[] = [];
+    const skip = (name: string) => removedSince(name) || removing.has(name);
     for (const { name } of found) {
-      if (byName.has(name) || removedSince(name)) continue;
-      const refusedAs = refused.get(name);
-      if (refusedAs !== undefined && refusedAs === (await signature(name))) continue;
-      // an idx without its pack is ignored (a pack being removed, or not fully installed)
-      if (!(await files.exists(`${dir}/${name}.pack`))) continue;
+      if (byName.has(name) || skip(name)) continue;
+      let sig: string | undefined;
       try {
+        sig = await signature(name);
+        const refusedAs = refused.get(name);
+        if (refusedAs !== undefined && refusedAs === sig) continue;
+        // an idx without its pack is ignored (a pack being removed, or not fully installed)
+        if (!(await files.exists(`${dir}/${name}.pack`))) continue;
         const p = await open(name);
-        if (removedSince(name) || byName.has(name)) continue; // removed, or added by install
+        if (skip(name) || byName.has(name)) continue; // removed, or added by install
         byName.set(name, p);
         added.push(p);
         refused.delete(name);
         unrecord(name);
       } catch (e) {
-        if (removedSince(name)) continue;
-        // git warns and skips a pack it cannot use. A corrupt one is retried only once its files
-        // change (an idx seen while it was written in place); a storage failure is retried by
-        // the next scan.
+        if (skip(name)) continue;
+        // git warns and skips a pack it cannot use. A corrupt one is retried only once its
+        // files change (an idx seen while it was written in place); a storage failure is
+        // retried by the next scan. One pack's failure does not stop the scan.
         record(name, e);
-        if (e instanceof PackError) refused.set(name, await signature(name));
+        if (e instanceof PackError && sig !== undefined) refused.set(name, sig);
         else refused.delete(name);
       }
     }
@@ -287,24 +316,39 @@ export async function openPackSet(
    */
   const guarded = async (p: PackFile, id: ObjectId, obj: GitObject): Promise<GitObject> => {
     const it = obj.content[Symbol.asyncIterator]();
-    const first = await it.next();
-    async function* content(): AsyncGenerator<Uint8Array> {
-      try {
-        if (first.done) return;
-        yield first.value;
-        for (;;) {
-          const r = await it.next();
-          if (r.done) return;
-          yield r.value;
+    let pending: IteratorResult<Uint8Array> | undefined = await it.next();
+    let finished = pending.done === true;
+    // A custom iterator, not a generator: `return()` must close the inner read (the pack file
+    // and the pooled inflater) even before the first `next()`, which a generator's `finally`
+    // would not run.
+    const iterator: AsyncIterator<Uint8Array> = {
+      async next() {
+        if (pending) {
+          const r = pending;
+          pending = undefined;
+          return r;
         }
-      } catch (e) {
-        if (e instanceof CorruptObjectError) markBad(p, id);
-        throw e;
-      } finally {
-        await it.return?.();
-      }
-    }
-    return { ...obj, content: content() };
+        if (finished) return { done: true, value: undefined };
+        try {
+          const r = await it.next();
+          if (r.done) finished = true;
+          return r;
+        } catch (e) {
+          finished = true;
+          if (e instanceof CorruptObjectError) markBad(p, id);
+          throw e;
+        }
+      },
+      async return() {
+        pending = undefined;
+        if (!finished) {
+          finished = true;
+          await it.return?.();
+        }
+        return { done: true, value: undefined };
+      },
+    };
+    return { ...obj, content: { [Symbol.asyncIterator]: () => iterator } };
   };
 
   /**
@@ -392,27 +436,36 @@ export async function openPackSet(
       if (!isId(id)) return false;
       for (const p of [...packs]) {
         if (!holds(p, id)) continue;
-        if (await files.exists(p.packPath)) return true;
+        const seen = seenAt.get(p);
+        if (seen !== undefined && Date.now() - seen < rescanInterval) return true;
+        if (await files.exists(p.packPath)) {
+          seenAt.set(p, Date.now());
+          return true;
+        }
         drop(p); // deleted behind our back (git repack -a -d, gc): the object must be written
       }
       return false;
     },
     get: (id, o) => lookup(id, { verify: o?.verify }, true),
     entry: (id) => findEntry(id, true),
-    async *list() {
-      await rescanOnMiss();
+    async *list(o) {
       // an id is yielded by the first pack holding it: no set of every id
-      const snapshot = [...packs];
+      let snapshot = o?.packs;
+      if (!snapshot) {
+        await rescanOnMiss();
+        snapshot = [...packs];
+      }
       for (let k = 0; k < snapshot.length; k++) {
-        const p = snapshot[k] as PackFile;
+        const p = snapshot[k] as Pack;
         for (const id of p.ids()) {
           let earlier = false;
-          for (let j = 0; j < k && !earlier; j++) earlier = (snapshot[j] as PackFile).has(id);
+          for (let j = 0; j < k && !earlier; j++) earlier = (snapshot[j] as Pack).has(id);
           if (!earlier) yield id;
         }
       }
     },
     async packs() {
+      await rescanOnMiss();
       return [...packs];
     },
     async install(source, o) {
@@ -433,14 +486,19 @@ export async function openPackSet(
       for (const packId of packIds) {
         const name = `pack-${packId}`;
         removedAt.set(name, ++removals);
+        removing.add(name);
         const p = byName.get(name);
         if (p) drop(p);
         refused.delete(name);
         unrecord(name);
-        // the idx goes first: a pack without its idx is invisible to every reader
-        for (const ext of EXTENSIONS) {
-          const path = `${dir}/${name}${ext}`;
-          if (await files.exists(path)) await files.remove(path);
+        try {
+          // the idx goes first: a pack without its idx is invisible to every reader
+          for (const ext of EXTENSIONS) {
+            const path = `${dir}/${name}${ext}`;
+            if (await files.exists(path)) await files.remove(path);
+          }
+        } finally {
+          removing.delete(name);
         }
       }
     },

@@ -36,7 +36,8 @@ export interface PackDirectoryOptions {
   maxCachedPacks?: number;
   /**
    * Called after `addPack` or `removePack` changed the directory, e.g. to refresh a `PackSet`
-   * reading the same directory, so it sees the change without waiting for its next rescan.
+   * reading the same directory, so it sees the change without waiting for its next rescan. Its
+   * failures are ignored: the files are already written, and the next miss rescans anyway.
    */
   onChange?: () => unknown;
 }
@@ -238,7 +239,7 @@ export class PackDirectory {
 
     // Invalidate pack name cache
     this.packNames = null;
-    await this.onChange?.();
+    await this.notifyChange();
   }
 
   /**
@@ -263,7 +264,16 @@ export class PackDirectory {
 
     // Invalidate pack name cache
     this.packNames = null;
-    await this.onChange?.();
+    await this.notifyChange();
+  }
+
+  /** Calls `onChange`, ignoring its failures (the directory change itself succeeded). */
+  private async notifyChange(): Promise<void> {
+    try {
+      await this.onChange?.();
+    } catch {
+      // the next lookup miss rescans
+    }
   }
 
   /**
