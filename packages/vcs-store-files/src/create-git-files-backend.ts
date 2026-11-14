@@ -35,11 +35,16 @@ export interface GitFilesBackendOptions {
   defaultBranch?: string;
   /**
    * Lock-file primitives rooted at the `.git` directory, for atomic ref batches.
-   * Defaults to a FilesApi-based implementation that is atomic within one process;
+   * Defaults to a FilesApi-based implementation that is atomic only among users of
+   * the same FilesApi instance;
    * pass `createNodeAtomicFiles(gitDirOnDisk)` from `@statewalker/vcs-utils-node`
    * to interoperate safely with native git.
    */
   atomicFiles?: AtomicFiles;
+  /** Retry a held ref lock for this long (git: core.filesRefLockTimeout, 100 ms). */
+  refLockTimeoutMs?: number;
+  /** Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms). */
+  packedLockTimeoutMs?: number;
 }
 
 /**
@@ -104,7 +109,11 @@ export async function createGitFilesBackend(
   const packAdapter = new PackDirectoryAdapter(packDirectory);
   const compositeStorage = new CompositeRawStorage(looseStorage, [packAdapter]);
   const objects = createGitObjectStore(compositeStorage);
-  const refStore = createFileRefStore(files, gitDir, { atomicFiles: options.atomicFiles });
+  const refStore = createFileRefStore(files, gitDir, {
+    atomicFiles: options.atomicFiles,
+    refLockTimeoutMs: options.refLockTimeoutMs,
+    packedLockTimeoutMs: options.packedLockTimeoutMs,
+  });
 
   const history = createHistoryFromComponents({
     objects,

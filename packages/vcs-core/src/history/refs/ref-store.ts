@@ -84,12 +84,12 @@ export interface RefStore {
     newValue: ObjectId,
   ): Promise<RefUpdateResult>;
 
-  /**
-   * Initialize storage structure (if needed)
-   */
   /** Atomic batch (see `Refs.batch`); without it, `RefsAdapter` accepts one command at a time. */
   batch?(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult>;
 
+  /**
+   * Initialize storage structure (if needed)
+   */
   initialize?(): Promise<void>;
 
   /**

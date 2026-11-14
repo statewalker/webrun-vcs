@@ -22,15 +22,19 @@ import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files"
 import { createFilesRefBatch, type FilesRefBatchOptions } from "./files-ref-batch.js";
 import { packRefs, removePackedRef } from "./packed-refs-writer.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
-import {
-  createRefsStructure,
-  deleteRef,
-  updateRef,
-  writeObjectRef,
-  writeSymbolicRef,
-} from "./ref-writer.js";
+import { createRefsStructure, deleteRef, writeObjectRef, writeSymbolicRef } from "./ref-writer.js";
 import { createReflogReader } from "./reflog-reader.js";
 import { hasReflog } from "./reflog-writer.js";
+
+export interface FileRefStoreOptions extends FilesRefBatchOptions {
+  /**
+   * Lock-file primitives rooted at `gitDir`. Defaults to `atomicFilesOver(files, gitDir)`,
+   * which is atomic only among users of the same FilesApi instance; pass a native implementation
+   * (`createNodeAtomicFiles` from `@statewalker/vcs-utils-node`) to interoperate
+   * safely with other processes, native git included.
+   */
+  atomicFiles?: AtomicFiles;
+}
 
 /**
  * File-based RefStore implementation
@@ -41,16 +45,6 @@ import { hasReflog } from "./reflog-writer.js";
  * - .git/refs/remotes/* for remote tracking branches
  * - .git/packed-refs for packed refs
  */
-export interface FileRefStoreOptions extends FilesRefBatchOptions {
-  /**
-   * Lock-file primitives rooted at `gitDir`. Defaults to `atomicFilesOver(files, gitDir)`,
-   * which is atomic only within one process; pass a native implementation
-   * (`createNodeAtomicFiles` from `@statewalker/vcs-utils-node`) to interoperate
-   * safely with other processes, native git included.
-   */
-  atomicFiles?: AtomicFiles;
-}
-
 export class FileRefStore implements RefStore {
   private readonly applyBatch: (
     commands: RefCommand[],

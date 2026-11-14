@@ -46,8 +46,15 @@ interface PackedEntry {
 
 type Loose = { id: string } | { target: string };
 
-/** A planned update with the command's expected old value. */
-type Update = PlannedRefUpdate & { old: ObjectId | null | undefined };
+/** A planned update with the command's expected old value and its noDeref flag. */
+type Update = PlannedRefUpdate & { old: ObjectId | null | undefined; noDeref: boolean };
+
+/** Refs git logs even without an existing reflog (core.logAllRefUpdates=true, non-bare). */
+const LOGGED_BY_DEFAULT = ["refs/heads/", "refs/remotes/", "refs/notes/"];
+
+/** Errors meaning "a file is where a directory must be" (refs/x is a ref, so refs/x/y.lock cannot exist). */
+const isPathConflict = (e: unknown) =>
+  ["ENOTDIR", "EISDIR", "EEXIST"].includes((e as { code?: string })?.code ?? "");
 
 function parsePacked(text: string | undefined): Map<string, PackedEntry> {
   const out = new Map<string, PackedEntry>();
@@ -144,13 +151,16 @@ export function createFilesRefBatch(
     }
     throw new Error(`symbolic ref ${name} nests too deeply`);
   }
-  /** Remove `path`, then its empty parent directories up to (not including) refs/ or logs/. */
+  /**
+   * Remove `path`, then its empty parent directories, keeping the category
+   * directories git keeps (`refs/heads`, `refs/tags`, …, and `logs/refs/heads`, …).
+   */
   async function removeAndPrune(path: string): Promise<void> {
     await files.remove(path);
-    const stop = path.startsWith("logs/") ? "logs" : "refs";
+    const keep = path.startsWith("logs/") ? 3 : 2; // components of the shortest kept directory
     for (
       let d = path.slice(0, path.lastIndexOf("/"));
-      d.includes("/") && d !== stop;
+      d.split("/").length > keep;
       d = d.slice(0, d.lastIndexOf("/"))
     ) {
       if (!(await files.removeEmptyDir(d))) break;
@@ -166,8 +176,9 @@ export function createFilesRefBatch(
     for (let wait = 1; ; wait = Math.min(wait * 2, 20)) {
       try {
         if (await files.createExclusive(`${path}.lock`, content)) return "ok";
-      } catch {
-        return "conflict"; // e.g. ENOTDIR: refs/x is a file, so refs/x/y.lock cannot exist
+      } catch (e) {
+        if (isPathConflict(e)) return "conflict";
+        throw e; // EACCES, ENOSPC, EIO…: a real failure, not a D/F conflict
       }
       if (Date.now() >= until) return "held";
       await sleep(wait);
@@ -179,6 +190,13 @@ export function createFilesRefBatch(
     await files.removeEmptyDir(path);
     await files.replace(`${path}.lock`, path);
   }
+  /**
+   * Reflog lines in git's format, after the decision (best effort, as git and JGit).
+   * As git with core.logAllRefUpdates=true: a log is created for HEAD,
+   * refs/heads/, refs/remotes/ and refs/notes/, and appended to when it exists.
+   * The updated ref gets no line for a no-op and loses its log on delete; the
+   * refs that record the update too (`reflogAlso`, HEAD among them) always get one.
+   */
   async function writeLogs(
     updates: Update[],
     current: (u: Update) => ObjectId | undefined,
@@ -186,19 +204,24 @@ export function createFilesRefBatch(
   ): Promise<void> {
     const ident = o.ident ?? defaultIdent();
     const message = normalizeMessage(o.message);
+    const append = async (name: string, line: Uint8Array) => {
+      const path = `logs/${name}`;
+      const create = name === "HEAD" || LOGGED_BY_DEFAULT.some((p) => name.startsWith(p));
+      if (!create && !(await files.exists(path))) return;
+      await files.removeEmptyDir(path);
+      await files.append(path, line);
+    };
     for (const u of updates) {
       try {
+        const old = current(u) ?? ZERO_ID;
+        const next = u.newValue ?? ZERO_ID;
+        const line = enc.encode(`${old} ${next} ${ident}${message ? `\t${message}` : ""}\n`);
         if (u.newValue === null) {
           if (await files.exists(`logs/${u.name}`)) await removeAndPrune(`logs/${u.name}`);
-          continue;
+        } else if (old !== u.newValue) {
+          await append(u.name, line);
         }
-        const old = current(u) ?? ZERO_ID;
-        if (old === u.newValue) continue; // git logs no no-op updates
-        const line = enc.encode(`${old} ${u.newValue} ${ident}${message ? `\t${message}` : ""}\n`);
-        for (const n of [u.name, ...u.reflogAlso]) {
-          await files.removeEmptyDir(`logs/${n}`);
-          await files.append(`logs/${n}`, line);
-        }
+        for (const n of u.reflogAlso) await append(n, line);
       } catch {
         // as git and JGit: the ref update stands without its reflog line
       }
@@ -234,11 +257,15 @@ export function createFilesRefBatch(
     const byName = new Map(updates.map((u) => [u.name, u.requested]));
     return plan.rejected.map((r) => ({ name: byName.get(r.name) ?? r.name, reason: r.reason }));
   }
-  /** Under the locks: every command still names the same target as when it was planned. */
+  /**
+   * Under the locks: every command still names the same target as when it was
+   * planned. A name that became a symbolic ref meanwhile (say HEAD re-attached by
+   * a checkout) now dereferences elsewhere, and is refused unless noDeref is set.
+   */
   async function sameTargets(updates: Update[]): Promise<RefRejection[]> {
     const out: RefRejection[] = [];
     for (const u of updates) {
-      if (u.requested !== u.name && (await deref(u.requested)) !== u.name) {
+      if (!u.noDeref && (await deref(u.requested)) !== u.name) {
         out.push({ name: u.requested, reason: "mismatch" });
       }
     }
@@ -255,7 +282,10 @@ export function createFilesRefBatch(
     try {
       for (const n of [...extra, u.name]) {
         const r = await lock(n, refLockTimeout, n === u.name ? content : new Uint8Array(0));
-        if (r !== "ok") return fail([{ name: n, reason: r === "held" ? "locked" : "df-conflict" }]);
+        if (r !== "ok") {
+          const name = n === u.name ? u.requested : n;
+          return fail([{ name, reason: r === "held" ? "locked" : "df-conflict" }]);
+        }
         held.push(n);
       }
       const moved = await sameTargets([u]);
@@ -264,8 +294,10 @@ export function createFilesRefBatch(
       const df = await conflicts([u], packed, new Set(held));
       if (df.length) return fail(df);
       const cur = await readRef(u.name, packed);
-      const curId = cur && "objectId" in cur ? cur.objectId : undefined;
-      if (mismatch(u.old, cur && "target" in cur ? await resolveId(u.name) : curId)) {
+      // With noDeref on a symbolic ref, `old` (and the log line) use the value it resolves to, as git.
+      const curId =
+        cur && "target" in cur ? await resolveId(u.name) : cur ? cur.objectId : undefined;
+      if (mismatch(u.old, curId)) {
         return fail([{ name: u.requested, reason: "mismatch" }]);
       }
       if (u.newValue === null) {
@@ -306,7 +338,10 @@ export function createFilesRefBatch(
     try {
       for (const n of names) {
         const r = await lock(n, refLockTimeout);
-        if (r !== "ok") return fail([{ name: n, reason: r === "held" ? "locked" : "df-conflict" }]);
+        if (r !== "ok") {
+          const name = updates.find((u) => u.name === n)?.requested ?? n;
+          return fail([{ name, reason: r === "held" ? "locked" : "df-conflict" }]);
+        }
         held.push(n);
       }
       if ((await lock(PACKED, packedLockTimeout)) !== "ok") {
@@ -383,7 +418,19 @@ export function createFilesRefBatch(
       },
     });
     if (!plan.ok) return fail(plan.rejected);
-    const updates: Update[] = plan.updates.map((u, i) => ({ ...u, old: commands[i]?.old }));
+    const updates: Update[] = plan.updates.map((u, i) => ({
+      ...u,
+      old: commands[i]?.old,
+      noDeref: commands[i]?.noDeref === true,
+    }));
+    if (updates.length > 1) {
+      // Replacing a symbolic ref (noDeref) cannot join the packed-refs commit: its loose
+      // file would shadow the packed value. git can; this store refuses it as a whole.
+      const symrefs = updates.filter((u) => u.current && "target" in u.current);
+      if (symrefs.length) {
+        return fail(updates.map((u) => ({ name: u.requested, reason: "unsupported" as const })));
+      }
+    }
     return updates.length === 1
       ? single(updates[0] as Update, batchOptions)
       : multi(updates, batchOptions);

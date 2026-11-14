@@ -184,20 +184,28 @@ export async function readAllRefs(
   // When prefix is empty, read from refs/ to avoid reading the entire git directory
   const refsPrefix = prefix === "" ? R_REFS : prefix;
 
-  // Read loose refs from directory tree
-  await readLooseRefsRecursive(files, gitDir, refsPrefix, refs);
-
-  // Read packed refs and add any not already found as loose
-  const { refs: packedRefs } = await readPackedRefs(files, gitDir);
-  const looseNames = new Set(refs.map((r) => r.name));
-
-  for (const packedRef of packedRefs) {
-    if (!looseNames.has(packedRef.name) && packedRef.name.startsWith(prefix)) {
-      refs.push(packedRef);
+  // Loose refs, then packed-refs, then loose refs again: a batch that commits in
+  // between (moving loose refs into packed-refs) changes the loose set, and the
+  // read is retried, so a listing never combines old and new states.
+  const sameLoose = (a: (Ref | SymbolicRef)[], b: (Ref | SymbolicRef)[]) =>
+    a.length === b.length && a.every((r, i) => JSON.stringify(r) === JSON.stringify(b[i]));
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const loose: (Ref | SymbolicRef)[] = [];
+    await readLooseRefsRecursive(files, gitDir, refsPrefix, loose);
+    const { refs: packedRefs } = await readPackedRefs(files, gitDir);
+    const again: (Ref | SymbolicRef)[] = [];
+    await readLooseRefsRecursive(files, gitDir, refsPrefix, again);
+    if (!sameLoose(loose, again)) continue;
+    const looseNames = new Set(loose.map((r) => r.name));
+    refs.push(...loose);
+    for (const packedRef of packedRefs) {
+      if (!looseNames.has(packedRef.name) && packedRef.name.startsWith(prefix)) {
+        refs.push(packedRef);
+      }
     }
+    return refs;
   }
-
-  return refs;
+  throw new Error("refs kept changing while listing them");
 }
 
 /**
@@ -221,8 +229,8 @@ async function readLooseRefsRecursive(
         if (entry.kind === "directory") {
           // Recurse into subdirectory
           await readLooseRefsRecursive(files, gitDir, entryPath, refs);
-        } else {
-          // Read ref file
+        } else if (!entry.name.endsWith(".lock")) {
+          // A ref file (`<ref>.lock` is another writer's pending update, not a ref, as for git)
           const ref = await readLooseRef(files, gitDir, entryPath);
           if (ref !== undefined) {
             refs.push(ref);

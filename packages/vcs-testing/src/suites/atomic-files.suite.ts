@@ -30,7 +30,6 @@ async function paths(files: AtomicFiles, dir: string): Promise<string[]> {
 /**
  * @param name Implementation name (e.g. "FilesApi fallback", "Node")
  * @param factory Creates an empty root per test
- * @param options `crossProcess`: whether exclusivity holds across processes (documented, not tested here)
  */
 export function createAtomicFilesTests(
   name: string,
@@ -94,6 +93,24 @@ export function createAtomicFilesTests(
       await files.write("refs/tags/t", enc.encode("x"));
       expect(await paths(files, "refs/heads")).toEqual(["refs/heads/a/c", "refs/heads/b"]);
       expect(await paths(files, "refs/missing")).toEqual([]);
+    });
+
+    it("refuses createExclusive below a file (ENOTDIR or EEXIST)", async () => {
+      await files.write("refs/heads/c", enc.encode("x"));
+      const err = await files
+        .createExclusive("refs/heads/c/d.lock", enc.encode("y"))
+        .catch((e) => e);
+      expect(["ENOTDIR", "EEXIST"]).toContain((err as { code?: string })?.code);
+      expect(await files.exists("refs/heads/c/d.lock")).toBe(false);
+    });
+
+    it("treats directories as absent files: exists, read, remove, list", async () => {
+      await files.write("refs/heads/a/b", enc.encode("x"));
+      expect(await files.exists("refs/heads/a")).toBe(false);
+      expect(await text(files, "refs/heads/a")).toBeUndefined();
+      expect(await files.remove("refs/heads/a")).toBe(false);
+      expect(await files.exists("refs/heads/a/b")).toBe(true);
+      expect(await paths(files, "refs/heads/a/b")).toEqual([]);
     });
 
     it("reads nothing and reports absence for a missing file; remove says whether it removed", async () => {

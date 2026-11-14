@@ -6,6 +6,7 @@
  */
 import {
   appendFile,
+  lstat,
   mkdir,
   open,
   readdir,
@@ -56,7 +57,11 @@ export function createNodeAtomicFiles(root: string): AtomicFiles {
         await unlink(abs(path));
         return true;
       } catch (e) {
-        if (["ENOENT", "EISDIR", "EPERM", "ENOTDIR"].includes(code(e) ?? "")) return false;
+        if (code(e) === "ENOENT" || code(e) === "ENOTDIR" || code(e) === "EISDIR") return false;
+        // unlink of a directory is EPERM on some systems; any other EPERM is a real failure.
+        if (code(e) === "EPERM" && (await lstat(abs(path)).catch(() => undefined))?.isDirectory()) {
+          return false;
+        }
         throw e;
       }
     },
@@ -83,13 +88,17 @@ export function createNodeAtomicFiles(root: string): AtomicFiles {
       yield* out.sort();
     },
     async createExclusive(path, content) {
-      await mkdir(dirname(abs(path)), { recursive: true });
-      let handle: Awaited<ReturnType<typeof open>>;
-      try {
-        handle = await open(abs(path), "wx");
-      } catch (e) {
-        if (code(e) === "EEXIST") return false;
-        throw e;
+      let handle: Awaited<ReturnType<typeof open>> | undefined;
+      // As git's raceproof_create_file: another writer may prune an empty parent
+      // directory between our mkdir and open; create it again and retry.
+      for (let attempt = 0; !handle; attempt++) {
+        await mkdir(dirname(abs(path)), { recursive: true });
+        try {
+          handle = await open(abs(path), "wx");
+        } catch (e) {
+          if (code(e) === "EEXIST") return false;
+          if (code(e) !== "ENOENT" || attempt >= 10) throw e;
+        }
       }
       try {
         await handle.writeFile(content);

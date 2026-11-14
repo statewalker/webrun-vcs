@@ -173,9 +173,18 @@ while it holds its own. Reflog lines are written to `logs/` in git's format (HEA
 points at an updated branch). `compareAndSwap` is a one-command batch.
 
 The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`, which is
-atomic only within one JavaScript process. Pass `createNodeAtomicFiles` (O_CREAT|O_EXCL, rename,
-O_APPEND) wherever another process, native `git` included, may write the same repository.
-`createGitFilesBackend` takes the same `atomicFiles` option.
+atomic only among users of the same FilesApi instance: two FilesApi instances over one directory,
+even in one process, do not exclude each other. On disk, pass `createNodeAtomicFiles` (O_CREAT|O_EXCL,
+rename, O_APPEND) wherever another FilesApi or process, native `git` included, may write the same
+repository. `createGitFilesBackend` takes the same `atomicFiles` option, and the lock timeouts.
+
+Reflogs follow git with `core.logAllRefUpdates=true` in a non-bare repository: a log is created
+for `HEAD`, `refs/heads/`, `refs/remotes/` and `refs/notes/` (and appended to wherever one exists),
+a no-op update logs HEAD but not the branch, and deleting a branch removes its log while HEAD's log
+records the delete. Two differences from git remain: a multi-ref batch that replaces a symbolic ref
+(`noDeref`) is refused as `unsupported` (its loose file would shadow the packed commit), and bare
+repositories are logged like non-bare ones. Readers skip `*.lock` files and re-read loose refs
+around `packed-refs`, so a listing never combines states of a batch committing meanwhile.
 
 ## Internals
 
@@ -218,9 +227,10 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
   `[includeIf]` are not followed, a malformed section header is kept but ignored where `git`
   would reject the file, and `save()` rewrites the whole file without a `config.lock`.
 - Ref batches and `compareAndSwap` use `.lock` files and rename (with native `AtomicFiles`, safe
-  next to a running `git`). `set`, `setSymbolic` and `delete`, loose objects and the index are
-  still written directly, without locks: do not run a `git` process that writes them at the same
-  time.
+  next to a running `git`). `set`, `setSymbolic`, `delete`, `packRefs` / `optimize` (which rewrite
+  `packed-refs` without `packed-refs.lock` and can lose a concurrent batch), loose objects and the
+  index are still written directly, without locks: do not run them next to a batch or a `git`
+  process writing the same repository.
 
 ### What will surprise you
 

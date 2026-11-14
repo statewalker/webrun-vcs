@@ -4,3 +4,7 @@ import { atomicFilesOver, createInMemoryFilesApi } from "@statewalker/vcs-utils/
 createAtomicFilesTests("FilesApi fallback (in memory)", async () => ({
   files: atomicFilesOver(createInMemoryFilesApi(), "/repo/.git"),
 }));
+
+createAtomicFilesTests("FilesApi fallback (relative root)", async () => ({
+  files: atomicFilesOver(createInMemoryFilesApi(), ".git"),
+}));

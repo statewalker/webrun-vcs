@@ -21,7 +21,9 @@ export interface AtomicFiles {
   list(dir: string): AsyncIterable<string>;
   /**
    * Create `path` with `content` only if nothing exists there (O_CREAT|O_EXCL),
-   * creating directories. `false` if it already exists.
+   * creating directories. `false` if it already exists. Throws an error with
+   * `code` "ENOTDIR" (or "EEXIST") when a parent is a file, so `refs/x/y.lock`
+   * cannot be created while `refs/x` is a ref.
    */
   createExclusive(path: string, content: Uint8Array): Promise<boolean>;
   /** Move `source` over `target` (rename, replacing it), creating directories. */
@@ -38,11 +40,12 @@ const pending = new WeakMap<FilesApi, Set<string>>();
 /**
  * `AtomicFiles` over any FilesApi, rooted at `root`.
  *
- * Exclusive creation is guaranteed only among users of this adapter in the
- * same JavaScript realm (a per-FilesApi registry closes the gap between the
- * existence check and the write). It does not exclude other processes, such
- * as native git working on the same directory: give those setups a native
- * implementation (`createNodeAtomicFiles` in `@statewalker/vcs-utils-node`).
+ * Exclusive creation is guaranteed only among adapters over the same FilesApi
+ * instance (a per-instance registry closes the gap between the existence check
+ * and the write). Two FilesApi instances over one directory, even in one
+ * process, and other processes such as native git are not excluded: give
+ * those setups a native implementation (`createNodeAtomicFiles` in
+ * `@statewalker/vcs-utils-node`).
  * `replace` is FilesApi's `move`, which is atomic only where the backend's is.
  *
  * @example
@@ -95,6 +98,14 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
       if (claims.has(key)) return false;
       claims.add(key);
       try {
+        // A file where a directory is needed: refuse, as open(2) does with ENOTDIR.
+        const parts = path.split("/").filter(Boolean);
+        for (let i = 1; i < parts.length; i++) {
+          const parent = parts.slice(0, i).join("/");
+          if ((await fs.stats(abs(parent)))?.kind === "file") {
+            throw Object.assign(new Error(`ENOTDIR: ${parent} is a file`), { code: "ENOTDIR" });
+          }
+        }
         if (await fs.exists(key)) return false;
         await ensureDir(path);
         await fs.write(key, [content]);
