@@ -19,7 +19,6 @@ export type {
 export { p2pSync } from "./p2p-sync.js";
 export type {
   HttpPushResult,
-  PushObject,
   PushOptions,
   RefUpdateResult,
 } from "./push.js";

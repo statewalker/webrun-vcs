@@ -5,13 +5,8 @@
  * with an index, then removes the loose files.
  */
 
-import type { FilesApi } from "@statewalker/vcs-core";
-import {
-  parseHeader,
-  StreamingPackWriter,
-  typeStringToCode,
-  writePackIndexV2,
-} from "@statewalker/vcs-core";
+import type { FilesApi, GitObject, ObjectTypeString } from "@statewalker/vcs-core";
+import { type WrittenPackEntry, writePack, writePackIndexV2 } from "@statewalker/vcs-core";
 
 import type { PackDirectory } from "./pack/pack-directory.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
@@ -88,39 +83,21 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     };
   }
 
-  // Create a pack with all loose objects
-  const writer = new StreamingPackWriter(objectIds.length);
+  // Stream a pack of the loose objects: each is read as it is written
+  const written: WrittenPackEntry[] = [];
+  const source = { get: (id: string) => looseObject(looseStorage, id) };
   const packChunks: Uint8Array[] = [];
-
-  for (const id of objectIds) {
-    // Load raw content from loose storage (decompressed "type size\0content")
-    const rawChunks: Uint8Array[] = [];
-    for await (const chunk of looseStorage.load(id)) {
-      rawChunks.push(chunk);
-    }
-    const rawData = concatBytes(rawChunks);
-
-    // Parse the Git header to get type and content
-    const header = parseHeader(rawData);
-    const typeCode = typeStringToCode(header.type);
-    const content = rawData.subarray(header.contentOffset);
-
-    // Add to pack writer
-    for await (const chunk of writer.addObject(id, typeCode, content)) {
-      packChunks.push(chunk);
-    }
-  }
-
-  // Finalize the pack
-  for await (const chunk of writer.finalize()) {
+  for await (const chunk of writePack(source, objectIds, { onEntry: (e) => written.push(e) })) {
     packChunks.push(chunk);
   }
-
+  // PackDirectory.addPack takes the pack whole
   const packData = concatBytes(packChunks);
 
   // Build the pack index (entries must be sorted by ID for binary search)
   const packChecksum = packData.subarray(packData.length - 20);
-  const indexEntries = writer.getIndexEntries().sort((a, b) => a.id.localeCompare(b.id));
+  const indexEntries = written
+    .map(({ id, offset, crc32 }) => ({ id, offset, crc32 }))
+    .sort((a, b) => a.id.localeCompare(b.id));
   const indexData = await writePackIndexV2(indexEntries, packChecksum);
 
   // Generate pack name from checksum
@@ -159,4 +136,38 @@ function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+const TYPES = new Set(["commit", "tree", "blob", "tag"]);
+
+/** A loose object read as a stream: its header parsed, its content passed on. */
+async function looseObject(storage: FileRawStorage, id: string): Promise<GitObject | undefined> {
+  if (!(await storage.has(id))) return undefined;
+  const it = storage.load(id)[Symbol.asyncIterator]();
+  let head = new Uint8Array(0);
+  let nul = -1;
+  while (nul < 0) {
+    const r = await it.next();
+    if (r.done) throw new Error(`loose object ${id} has no header`);
+    const joined = new Uint8Array(head.length + r.value.length);
+    joined.set(head);
+    joined.set(r.value, head.length);
+    head = joined;
+    nul = head.indexOf(0);
+  }
+  const m = /^(\w+) (\d+)$/.exec(new TextDecoder().decode(head.subarray(0, nul)));
+  if (!m || !TYPES.has(m[1] as string)) throw new Error(`loose object ${id} has a bad header`);
+  const rest = head.subarray(nul + 1);
+  return {
+    type: m[1] as ObjectTypeString,
+    size: Number(m[2]),
+    content: (async function* () {
+      try {
+        if (rest.length) yield rest;
+        for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+      } finally {
+        await it.return?.();
+      }
+    })(),
+  };
 }

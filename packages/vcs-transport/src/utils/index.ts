@@ -12,6 +12,14 @@ export {
   parseRefSpec,
 } from "./refspec.js";
 export {
+  fetchWithRequestBody,
+  isBrowserContext,
+  requestBody,
+  shouldStreamRequestBody,
+  supportsRequestStreams,
+  toReadableStream,
+} from "./request-stream.js";
+export {
   formatGitUrl,
   getDefaultPort,
   getEffectivePort,

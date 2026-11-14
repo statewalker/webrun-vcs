@@ -24,12 +24,12 @@ export interface SimpleDuplexOptions {
  * - Output goes to response body (server) or is collected (client)
  *
  * @param input - Async iterable of incoming chunks
- * @param writer - Function to write outgoing chunks
+ * @param writer - Function to write outgoing chunks (a returned Promise is backpressure)
  * @returns Duplex interface
  */
 export function createSimpleDuplex(
   input: AsyncIterable<Uint8Array>,
-  writer: (data: Uint8Array) => void,
+  writer: (data: Uint8Array) => void | Promise<void>,
 ): Duplex {
   return {
     [Symbol.asyncIterator]: () => input[Symbol.asyncIterator](),

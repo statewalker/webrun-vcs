@@ -178,12 +178,12 @@ The `Duplex` interface abstracts any bidirectional byte stream:
 ```typescript
 interface Duplex {
   [Symbol.asyncIterator](): AsyncIterator<Uint8Array>;
-  write(data: Uint8Array): void;
+  write(data: Uint8Array): void | Promise<void>; // a Promise is backpressure
   close?(): Promise<void>;
 }
 ```
 
-HTTP, MessagePort, and webrun-streams channels are all adapted to this interface. Operations like `fetchOverDuplex` work with any `Duplex`, making the protocol transport-agnostic.
+The transport awaits every `write`: a duplex with flow control returns a Promise that settles when it can take more (the upload-pack HTTP response, sockets); one without returns nothing. HTTP, MessagePort, and webrun-streams channels are all adapted to this interface. Operations like `fetchOverDuplex` work with any `Duplex`, making the protocol transport-agnostic.
 
 ### TransportApi
 

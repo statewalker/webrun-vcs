@@ -78,7 +78,7 @@ describe("smart-HTTP operations with a token", () => {
       fetchImpl,
       refspecs: ["refs/heads/master:refs/heads/master"],
       getLocalRef: async () => TEST,
-      getObjectsToPush: async function* () {},
+      exportPack: async function* () {},
     }).catch(() => {});
     // GET /info/refs, then POST /git-receive-pack
     expect(authorizations).toEqual([tokenBasic, tokenBasic]);

@@ -145,7 +145,7 @@ Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }`
 
 `fetch` sends wants, so it fails unless a pack comes back (git sends an empty pack, 32 bytes, when every wanted object is already present): a caller never writes refs to objects it did not receive. `httpFetch` and the fetch state machine refuse a missing pack the same way. When the import (or anything after the request) fails, the response body is cancelled. `timeout` bounds each wait for the server, a response or the next chunk of a body, not the whole fetch: the time `onPack` spends storing a large pack does not count, while a server that stops sending is still cut off.
 
-The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3 and on an `ERR <message>` line. `httpFetch` and the fetch state machine import the pack this way too. The request bodies (wants and haves) are still built in memory: they are small, and a streamed request body needs `duplex: "half"`, which not every browser supports.
+The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3 and on an `ERR <message>` line. `httpFetch` and the fetch state machine import the pack this way too. The fetch request bodies (wants and haves) are still built in memory: they are small. A push streams its body (see below).
 
 ### HTTP: push
 
@@ -165,7 +165,9 @@ for (const [ref, status] of result.updates) {
 }
 ```
 
-`push` produces pack data with `exportPack` (preferred) or `getObjectsToPush`. It also accepts `force` and `atomic`.
+`exportPack` produces the pack: the objects reachable from the pushed tips and not from the remote's refs, as `history.serialization.exportPack` (vcs-core's `listObjects` and `writePack`) streams it. It is required whenever the push sends objects; a delete-only push sends git's empty pack. `push` also accepts `force` and `atomic`, and reports `bytesSent` and `objectCount` (read from the pack header as it goes by).
+
+The commands and the pack go out in the POST body. Outside browsers (Node, Deno, Bun) the body is a `ReadableStream` with `duplex: "half"`, pulled as the connection takes it, so the pack writer runs no further ahead than the network and the pack is never collected. In browsers the body is collected and sent whole by default, which holds the pack in memory: Firefox and Safari do not stream request bodies, and Chromium passes the usual feature test (`supportsRequestStreams()`: a `Request` built with a stream body reads its `duplex` option and adds no `Content-Type`) yet rejects a streamed body with a `TypeError` over HTTP/1.1, which a page cannot know in advance. `shouldStreamRequestBody(streamRequestBody)` makes the choice: the option when it is set, otherwise stream only where `isBrowserContext()` is false (no `document` and no `WorkerGlobalScope` instance as the global) and streams are supported. `streamRequestBody: true` opts a browser in (for an HTTP/2 server); `false` always collects. When a streamed request is rejected with a `TypeError` before any response, `fetchWithRequestBody` sends it once more with a collected body, calling `exportPack` again (so it may run twice); an error from the pack itself is thrown as it is. `httpPush` sends its body the same way and takes the same `streamRequestBody` option. Both pass `{ ofsDelta }` to `exportPack`: true only when the receive-pack advertisement lists `ofs-delta` (the push then requests it, as git's send-pack does), so a server without it gets REF deltas; the push state machine does the same.
 
 ### Smart-HTTP server
 
@@ -186,6 +188,10 @@ const handleGit = createFetchHandler({
 
 Lower-level pieces are also exported: `createHttpHandler`, `createGitHttpServer`, `handleInfoRefs`, `handleUploadPack`, `handleReceivePackInfoRefs`, `handleReceivePack`, `parseGitRequest`, `fetchRequestToHttpRequest`, `httpResponseToFetchResponse`.
 
+`handleUploadPack` streams its response: `HttpResponse.body` is then a `ReadableStream`, returned as soon as the negotiation starts writing, and each pack chunk waits until the reader took the previous one. A failure before the first byte is still a 500; after it, the error travels in band as `ERR <message>` on sideband channel 3 (protocol v0/v1 and the v2 `packfile` section), and without side-band, where raw pack bytes may be out, the response stream is aborted so the client sees a failure rather than a truncated pack that looks complete (as with a thrown error). While the pack is prepared (listing objects, reading headers, the delta search) and side-band is on, upload-pack sends git's keep-alive, an empty band-1 packet `0005\x01`, every `keepAliveMs` (default 5000, as git's `uploadpack.keepAlive`; 0 turns it off; `HttpServerOptions.keepAliveMs`, `ProcessConfiguration.keepAliveMs`) until the first pack byte, so proxies do not time the connection out; the fetch client skips these packets. `httpResponseToFetchResponse` passes a stream body through; a Node server should write it chunk by chunk and wait for `drain`. The pack follows the capabilities the client asked for in its first `want` line, and only those (possibly none), limited to the advertised ones: a thin pack only with `thin-pack`, OFS deltas only with `ofs-delta`, side-band only with `side-band-64k`. Capabilities on later `want` lines are ignored, and the advertised set is kept apart (`ProtocolState.advertisedCapabilities`). In protocol v2 these are arguments of the `fetch` command (`thin-pack`, `ofs-delta`, `no-progress`), and the packfile section is always side-band. Received packs (`handleReceivePack`, the push state machine) go through vcs-core's `importPack` as before.
+
+Every writer in the transport awaits `Duplex.write`: a duplex may return a Promise to apply backpressure (the upload-pack response and `createGitSocketClient` do), or nothing when it has no flow control (the MessagePort and webrun adapters queue).
+
 ### Smart-HTTP without a network port
 
 `serveGitOverWebrunHttp` wraps the server handler as a webrun-streams `Duplex`. `webrunHttpFetch` turns a webrun `Duplex` into a `fetchImpl`. For an in-process loopback, pass one to the other:
@@ -202,6 +208,8 @@ const refs = await lsRemote("http://localhost/repo.git", {
 ```
 
 ### Fetch over a Duplex
+
+`serveOverDuplex` returns `success: false` when a pack failed part way. With side-band the client was told in band (`ERR` on band 3); without it, a `Duplex` has no abort, so the caller should close the duplex with an error rather than end it normally (the pack's trailer checksum still catches a truncated pack on the client).
 
 `serveRepoOverWebrun` builds a webrun-streams handler that runs `serveOverDuplex`. `webrunClientDuplex` wraps a webrun caller as a transport `Duplex`. In-process:
 

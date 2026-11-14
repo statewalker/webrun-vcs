@@ -18,10 +18,11 @@
 
 import { type ServerType, serve } from "@hono/node-server";
 import {
+  type ListedObject,
+  listObjects,
   type ObjectTypeCode,
-  PackWriterStream,
   typeCodeToString,
-  typeStringToCode,
+  writePack,
 } from "@statewalker/vcs-core";
 import {
   CAPABILITY_DELETE_REFS,
@@ -225,7 +226,8 @@ export class VcsHttpServer {
     const wants: string[] = [];
     const haves: string[] = [];
     let _done = false;
-    let useSideband = false;
+    // The client's capabilities are on its first want line only (possibly none)
+    let clientCaps: Set<string> | undefined;
 
     for await (const packet of packets) {
       if (packet.type === "flush") {
@@ -238,11 +240,9 @@ export class VcsHttpServer {
       const line = packetDataToString(packet);
 
       if (line.startsWith("want ")) {
-        const parts = line.slice(5).split(" ");
+        const parts = line.slice(5).trim().split(" ");
         wants.push(parts[0]);
-        if (line.includes(CAPABILITY_SIDE_BAND_64K)) {
-          useSideband = true;
-        }
+        clientCaps ??= new Set(parts.slice(1));
       } else if (line.startsWith("have ")) {
         haves.push(line.slice(5).trim());
       } else if (line === "done") {
@@ -252,15 +252,18 @@ export class VcsHttpServer {
     }
 
     const res = new ResponseBodyWriter();
+    const useSideband = clientCaps?.has(CAPABILITY_SIDE_BAND_64K) ?? false;
 
     // Send NAK (we don't implement multi-ack negotiation)
     res.write(this.pktLine("NAK\n"));
 
-    // Build pack file
-    const packResult = await this.buildPackForWants(storage, wants, haves);
+    // Build pack file: OFS deltas only when the client asked for ofs-delta
+    const packResult = await this.buildPackForWants(storage, wants, haves, {
+      ofsDelta: clientCaps?.has(CAPABILITY_OFS_DELTA) ?? false,
+    });
 
     if (useSideband) {
-      await this.sendSidebandPack(res, packResult.packData);
+      await this.sendSidebandPack(res, packResult.packData, !clientCaps?.has("no-progress"));
     } else {
       res.write(packResult.packData);
     }
@@ -390,62 +393,33 @@ export class VcsHttpServer {
     storage: FileHistory,
     wants: string[],
     haves: string[],
+    options: { ofsDelta: boolean },
   ): Promise<{ packData: Uint8Array }> {
-    const haveSet = new Set(haves);
-    const seen = new Set<string>();
-    const objectsToSend: Array<{ id: string; type: number; content: Uint8Array }> = [];
-
-    const collectObject = async (id: string): Promise<void> => {
-      if (seen.has(id) || haveSet.has(id)) return;
-      seen.add(id);
-
-      const header = await storage.objects.get(id);
-      if (!header) throw new Error(`Object not found: ${id}`);
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of header.content) {
-        chunks.push(chunk);
-      }
-      const content = this.concatBytes(chunks);
-
-      objectsToSend.push({ id, type: typeStringToCode(header.type), content });
-
-      if (header.type === "commit") {
-        const commit = await storage.commits.load(id);
-        if (commit) {
-          await collectObject(commit.tree);
-          for (const parent of commit.parents) {
-            await collectObject(parent);
-          }
-        }
-      } else if (header.type === "tree") {
-        const entries = await storage.trees.load(id);
-        if (entries) {
-          for await (const entry of entries) {
-            await collectObject(entry.id);
-          }
-        }
-      }
-    };
-
-    for (const wantId of wants) {
-      await collectObject(wantId);
+    // git rev-list --objects, then git pack-objects (whole objects and found deltas)
+    const listed: ListedObject[] = [];
+    for await (const o of listObjects(storage.objects, { wants, haves })) listed.push(o);
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of writePack(storage.objects, listed, {
+      deltaSearch: true,
+      ofsDelta: options.ofsDelta,
+    })) {
+      chunks.push(chunk);
     }
-
-    const packWriter = new PackWriterStream();
-    for (const obj of objectsToSend) {
-      await packWriter.addObject(obj.id, obj.type, obj.content);
-    }
-    const result = await packWriter.finalize();
-
-    return { packData: result.packData };
+    return { packData: this.concatBytes(chunks) };
   }
 
   /**
    * Send pack data via sideband.
    */
-  private async sendSidebandPack(res: ResponseBodyWriter, packData: Uint8Array): Promise<void> {
-    const progressMsg = textEncoder.encode("Counting objects...\n");
-    res.write(this.encodeSidebandPacket(SIDEBAND_PROGRESS, progressMsg));
+  private async sendSidebandPack(
+    res: ResponseBodyWriter,
+    packData: Uint8Array,
+    progress: boolean,
+  ): Promise<void> {
+    if (progress) {
+      const progressMsg = textEncoder.encode("Counting objects...\n");
+      res.write(this.encodeSidebandPacket(SIDEBAND_PROGRESS, progressMsg));
+    }
 
     const chunkSize = 65515;
     for (let i = 0; i < packData.length; i += chunkSize) {

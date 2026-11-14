@@ -21,6 +21,7 @@ import {
 } from "../../context/context-adapters.js";
 import { ZERO_OID } from "../../protocol/constants.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
+import { sendPackStream } from "./send-pack-stream.js";
 
 /**
  * Server fetch FSM transitions.
@@ -132,6 +133,20 @@ async function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
 }
 
 /**
+ * The capabilities a client's first `want` line requests, limited to the advertised ones when
+ * the server knows them (a client may not turn on what the server did not offer).
+ */
+export function requestedCapabilities(
+  requested: string[],
+  advertised: ReadonlySet<string>,
+): Set<string> {
+  const names = requested.filter((c) => c.length > 0);
+  if (advertised.size === 0) return new Set(names);
+  const offered = new Set([...advertised].map((c) => c.split("=")[0]));
+  return new Set(names.filter((c) => offered.has(c.split("=")[0]) || c.startsWith("agent=")));
+}
+
+/**
  * Server fetch FSM handlers.
  */
 export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContext>>([
@@ -174,7 +189,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         if (refsArray.length === 0) {
           await transport.writeLine(`${ZERO_OID} capabilities^{}\0${capabilities.join(" ")}`);
           await transport.writeFlush();
-          state.capabilities = new Set(capabilities);
+          state.advertisedCapabilities = new Set(capabilities);
           return "EMPTY_REPO";
         }
 
@@ -185,7 +200,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           first = false;
         }
         await transport.writeFlush();
-        state.capabilities = new Set(capabilities);
+        state.advertisedCapabilities = new Set(capabilities);
         return "REFS_SENT";
       } catch (e) {
         output.error = String(e);
@@ -227,15 +242,18 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           const line = pkt.text;
 
           if (line.startsWith("want ")) {
-            const parts = line.split(" ");
+            const parts = line.trim().split(" ");
             const oid = parts[1];
-            state.wants.add(oid);
-            // Parse capabilities from first want
-            if (parts.length > 2) {
-              for (const c of parts.slice(2)) {
-                state.capabilities.add(c);
-              }
+            // The first want carries the client's capabilities, possibly none: from here on
+            // they are what the pack is written for (thin-pack, ofs-delta, side-band), never
+            // the advertised ones. Capabilities on later wants are ignored.
+            if (state.wants.size === 0) {
+              state.capabilities = requestedCapabilities(
+                parts.slice(2),
+                state.advertisedCapabilities,
+              );
             }
+            state.wants.add(oid);
           } else if (line.startsWith("shallow ")) {
             hasShallow = true;
             const oid = line.slice(8);
@@ -657,6 +675,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
     "SEND_PACK",
     async (ctx) => {
       const transport = getTransport(ctx);
+      const config = getConfig(ctx);
       const state = getState(ctx);
       const output = getOutput(ctx);
       const repository = getRepository(ctx);
@@ -667,47 +686,30 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         const includeTag = state.capabilities.has("include-tag");
         const noProgress = state.capabilities.has("no-progress");
 
-        // Apply filter if partial clone requested
-        const filterSpec = state.filterSpec;
-
-        // Export pack with options
+        // Export pack with options (partial clone filter, shallow boundaries)
         const packStream = repository.exportPack(state.wants, state.commonBase, {
           thin,
+          ofsDelta: state.capabilities.has("ofs-delta"),
           includeTag,
-          filterSpec,
+          filterSpec: state.filterSpec,
           shallow: state.serverShallow,
         });
 
-        if (useSideband) {
-          // Progress callback
-          const sendProgress = noProgress
-            ? null
-            : async (msg: string) => {
-                await transport.writeSideband(2, new TextEncoder().encode(msg));
-              };
-
-          try {
-            for await (const chunk of packStream) {
-              await transport.writeSideband(1, chunk);
-              if (sendProgress) {
-                await sendProgress(`Sending objects: ${output.sentBytes ?? 0}\r`);
-              }
-              output.sentBytes = (output.sentBytes ?? 0) + chunk.length;
-            }
-            await transport.writeFlush();
-            return "PACK_SENT";
-          } catch (packError) {
-            // Send error on sideband channel 3
-            await transport.writeSideband(3, new TextEncoder().encode(`ERR ${packError}`));
-            await transport.writeFlush();
-            output.error = String(packError);
-            return "SIDEBAND_ERROR";
-          }
-        } else {
-          // No sideband: raw pack bytes
-          await transport.writePack(packStream);
+        // Band 1 with keep-alives until the first byte and errors on band 3; raw otherwise
+        const sent = await sendPackStream(transport, packStream, {
+          sideband: useSideband,
+          progress: !noProgress,
+          keepAliveMs: config.keepAliveMs,
+        });
+        if (sent.ok) {
+          output.sentBytes = (output.sentBytes ?? 0) + sent.bytes;
           return "PACK_SENT";
         }
+        output.error = sent.error;
+        if (sent.inBand) return "SIDEBAND_ERROR";
+        // raw pack bytes may be out: the client must see a broken stream, not a short pack
+        output.streamBroken = true;
+        return "ERROR";
       } catch (e) {
         output.error = String(e);
         return "ERROR";

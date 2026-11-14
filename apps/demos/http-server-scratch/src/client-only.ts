@@ -21,7 +21,7 @@ import {
   joinPath,
   writePackIndex,
 } from "@statewalker/vcs-core";
-import { clone, type PushObject, push } from "@statewalker/vcs-transport";
+import { clone, push } from "@statewalker/vcs-transport";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
@@ -32,6 +32,7 @@ import {
   createFileHistory,
   ensureDirectory,
   ensureDirFiles,
+  exportPack,
   type FileHistory,
   getHead,
   printError,
@@ -98,11 +99,11 @@ async function main(): Promise<void> {
     if (shouldPush) {
       // Step 2: Make changes
       printStep(2, "Creating changes");
-      const { commitId } = await makeChanges(history, files);
+      await makeChanges(history, files);
 
       // Step 3: Push
       printStep(3, "Pushing changes");
-      await pushChanges(history, url, commitId);
+      await pushChanges(history, url);
     }
 
     printSection("SUCCESS!");
@@ -331,7 +332,7 @@ Timestamp: ${new Date().toISOString()}
 /**
  * Push changes to remote.
  */
-async function pushChanges(history: FileHistory, url: string, commitId: string): Promise<void> {
+async function pushChanges(history: FileHistory, url: string): Promise<void> {
   printInfo(`Pushing to: ${url}`);
 
   // Get current branch
@@ -345,10 +346,6 @@ async function pushChanges(history: FileHistory, url: string, commitId: string):
 
   printInfo(`Pushing branch: ${branchName}`);
 
-  // Collect objects to push
-  const objects = await collectObjectsForPush(history, commitId);
-  printInfo(`Objects to push: ${objects.length}`);
-
   // Push
   const result = await push({
     url,
@@ -358,11 +355,8 @@ async function pushChanges(history: FileHistory, url: string, commitId: string):
       const ref = await history.refs.resolve(refName);
       return ref?.objectId;
     },
-    getObjectsToPush: async function* () {
-      for (const obj of objects) {
-        yield obj;
-      }
-    },
+    // the objects the remote lacks, streamed as a pack (listObjects + writePack)
+    exportPack: (wants, exclude, options) => exportPack(history.objects, wants, exclude, options),
     onProgressMessage: (msg) => {
       if (msg.trim()) {
         printInfo(`  ${msg.trim()}`);
@@ -373,68 +367,10 @@ async function pushChanges(history: FileHistory, url: string, commitId: string):
   if (result.ok) {
     printSuccess("Push successful!");
     printInfo(`Bytes sent: ${result.bytesSent}`);
+    printInfo(`Objects sent: ${result.objectCount}`);
   } else {
     throw new Error(`Push failed: ${result.unpackStatus}`);
   }
-}
-
-/**
- * Collect objects needed for push.
- */
-async function collectObjectsForPush(
-  history: FileHistory,
-  commitId: string,
-): Promise<PushObject[]> {
-  const objects: PushObject[] = [];
-  const seen = new Set<string>();
-
-  const typeStringToCode: Record<string, number> = {
-    commit: 1,
-    tree: 2,
-    blob: 3,
-    tag: 4,
-  };
-
-  async function collectObject(id: string): Promise<void> {
-    if (seen.has(id)) return;
-    seen.add(id);
-
-    const obj = await history.objects.get(id);
-    if (!obj) throw new Error(`Object not found: ${id}`);
-    const typeCode = typeStringToCode[obj.type];
-
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of obj.content) {
-      chunks.push(chunk);
-    }
-    const content = concatBytes(...chunks);
-
-    objects.push({ id, type: typeCode, content });
-  }
-
-  async function collectTree(treeId: string): Promise<void> {
-    await collectObject(treeId);
-
-    const entries = await history.trees.load(treeId);
-    if (entries) {
-      for await (const entry of entries) {
-        if (entry.mode === FileMode.TREE) {
-          await collectTree(entry.id);
-        } else {
-          await collectObject(entry.id);
-        }
-      }
-    }
-  }
-
-  await collectObject(commitId);
-
-  const commit = await history.commits.load(commitId);
-  if (commit) {
-    await collectTree(commit.tree);
-  }
-
-  return objects;
 }
 
 // Run main

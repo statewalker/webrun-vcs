@@ -11,10 +11,10 @@ import {
   createInMemoryFilesApi,
   type FilesApi,
   PackObjectType,
-  PackWriterStream,
   readPackIndex,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
+import { CraftPackWriter } from "@statewalker/vcs-testing";
 import { applyGitDelta } from "@statewalker/vcs-utils";
 import { beforeEach, describe, expect, it } from "vitest";
 import { PackDirectory, PackReader } from "../../src/pack/index.js";
@@ -181,7 +181,7 @@ describe("delta chain resolution", () => {
       expect(applyGitDelta(data2, delta3)).toEqual(data3);
 
       // Build pack with REF_DELTA chain
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
 
       // Write base object
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
@@ -241,7 +241,7 @@ describe("delta chain resolution", () => {
 
       const delta = createFirstByteChangeDelta(baseContent.length, 0xbb);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(targetId, baseId, delta);
 
@@ -297,7 +297,7 @@ describe("delta chain resolution", () => {
       const delta3 = createFirstByteChangeDelta(data2.length, 0x33);
 
       // Build pack with OFS_DELTA chain
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
 
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addOfsDelta(id1, baseId, delta1);
@@ -353,7 +353,7 @@ describe("delta chain resolution", () => {
       const targetId = fakeId(203);
       const delta = createFirstByteChangeDelta(baseContent.length, 0xff);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
 
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addObject(filler1Id, PackObjectType.BLOB, filler1);
@@ -398,7 +398,7 @@ describe("delta chain resolution", () => {
       const delta2 = createFirstByteChangeDelta(data1.length, 0x99);
 
       // Build pack with mixed delta types
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
 
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addOfsDelta(id1, baseId, delta1); // OFS_DELTA
@@ -441,7 +441,7 @@ describe("delta chain resolution", () => {
       const targetId = fakeId(401);
       const delta = createFirstByteChangeDelta(baseContent.length, 0x66);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(targetId, baseId, delta);
 
@@ -483,7 +483,7 @@ describe("delta chain resolution", () => {
         baseContent.length, // size
       ]);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(targetId, baseId, delta);
 
@@ -524,7 +524,7 @@ describe("delta chain resolution", () => {
         ...newContent,
       ]);
 
-      const writer = new PackWriterStream();
+      const writer = new CraftPackWriter();
       await writer.addObject(baseId, PackObjectType.BLOB, baseContent);
       await writer.addRefDelta(targetId, baseId, delta);
 
@@ -563,13 +563,13 @@ describe("delta chain resolution", () => {
       const delta = createFirstByteChangeDelta(baseContent.length, 0x42);
 
       // Pack 1: contains only the base (full object)
-      const writer1 = new PackWriterStream();
+      const writer1 = new CraftPackWriter();
       await writer1.addObject(baseId, PackObjectType.BLOB, baseContent);
       const result1 = await writer1.finalize();
       const index1 = await writePackIndexV2(result1.indexEntries, result1.packChecksum);
 
       // Pack 2: contains only the delta (REF_DELTA pointing to base in pack 1)
-      const writer2 = new PackWriterStream();
+      const writer2 = new CraftPackWriter();
       await writer2.addRefDelta(targetId, baseId, delta);
       const result2 = await writer2.finalize();
       const index2 = await writePackIndexV2(result2.indexEntries, result2.packChecksum);
@@ -599,13 +599,13 @@ describe("delta chain resolution", () => {
       const targetId = fakeId(201);
 
       // Pack 1: base object
-      const writer1 = new PackWriterStream();
+      const writer1 = new CraftPackWriter();
       await writer1.addObject(baseId, PackObjectType.BLOB, baseContent);
       const result1 = await writer1.finalize();
       const index1 = await writePackIndexV2(result1.indexEntries, result1.packChecksum);
 
       // Pack 2: delta only
-      const writer2 = new PackWriterStream();
+      const writer2 = new CraftPackWriter();
       await writer2.addRefDelta(targetId, baseId, delta);
       const result2 = await writer2.finalize();
       const index2 = await writePackIndexV2(result2.indexEntries, result2.packChecksum);

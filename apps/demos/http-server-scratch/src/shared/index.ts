@@ -3,6 +3,7 @@
  */
 
 export * from "./config.js";
+export * from "./export-pack.js";
 export * from "./file-history.js";
 export * from "./helpers.js";
 // Use new Hono-based server with transport API

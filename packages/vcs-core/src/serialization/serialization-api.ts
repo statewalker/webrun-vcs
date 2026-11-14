@@ -36,83 +36,27 @@ export interface PackImportResult {
 }
 
 /**
- * Statistics from pack building
- */
-export interface PackBuildStats {
-  /** Total objects added */
-  totalObjects: number;
-  /** Objects stored as deltas */
-  deltifiedObjects: number;
-  /** Total uncompressed size */
-  totalSize: number;
-  /** Bytes saved by delta compression */
-  deltaSavings: number;
-}
-
-/**
  * Options for creating a pack file
  */
 export interface PackOptions {
-  /** Enable delta compression (default: true) */
+  /** Search deltas between the objects, git's windowed search (default: true) */
   useDelta?: boolean;
-  /** Create thin pack with external base references (default: false) */
-  thinPack?: boolean;
-  /** Maximum delta chain depth (default: 50) */
+  /** Longest delta chain the search builds (default: 50, git's pack.depth) */
   maxChainDepth?: number;
-  /** Progress callback */
-  onProgress?: (stats: PackBuildStats) => void;
+  /** Write deltas on a base in the pack as OFS deltas (default: true, git's ofs-delta) */
+  ofsDelta?: boolean;
+  /** Reuse entries stored in the backend's packs as they are (default: true) */
+  reuse?: boolean;
 }
 
 /**
- * PackBuilder - Incremental pack file builder
- *
- * Build pack files one object at a time with optional delta compression.
- *
- * @example
- * ```typescript
- * const builder = serialization.createPackBuilder();
- *
- * await builder.addObject(commitId);
- * await builder.addObject(treeId);
- * await builder.addObjectWithDelta(blobId, baseBlobId);
- *
- * const packStream = builder.finalize();
- * for await (const chunk of packStream) {
- *   // Write to transport or file
- * }
- * ```
+ * Options for exporting the objects between wants and haves
  */
-export interface PackBuilder {
-  /**
-   * Add object (engine decides full vs delta)
-   *
-   * @param id Object ID to add
-   */
-  addObject(id: ObjectId): Promise<void>;
-
-  /**
-   * Add object with explicit delta preference
-   *
-   * If preferredBaseId is provided and suitable, the object
-   * will be stored as a delta against that base.
-   *
-   * @param id Object ID to add
-   * @param preferredBaseId Optional preferred base for delta
-   */
-  addObjectWithDelta(id: ObjectId, preferredBaseId?: ObjectId): Promise<void>;
-
-  /**
-   * Finalize and get pack stream
-   *
-   * Returns the complete pack file as a byte stream.
-   * After calling this, no more objects can be added.
-   */
-  finalize(): AsyncIterable<Uint8Array>;
-
-  /**
-   * Get current pack statistics
-   */
-  getStats(): PackBuildStats;
+export interface ExportOptions extends PackOptions {
+  /** A thin pack: deltas against objects the receiver has, not sent (default: false) */
+  thinPack?: boolean;
+  /** The receiver's shallow commits: their parents are not walked */
+  shallow?: Iterable<ObjectId>;
 }
 
 /**
@@ -131,8 +75,9 @@ export interface PackBuilder {
  *   // Write to .git/objects/XX/YYYY...
  * }
  *
- * // Create a pack file
+ * // Create a pack file of given objects, or of what a receiver lacks
  * const packStream = serialization.createPack(objectIds);
+ * const forPush = serialization.exportPack([localTip], [remoteTip]);
  *
  * // Import a pack file
  * const result = await serialization.importPack(packStream);
@@ -140,7 +85,7 @@ export interface PackBuilder {
  */
 export interface SerializationApi {
   /**
-   * Serialize an object to Git loose format
+   * Serialize an object to Git loose format, streamed
    *
    * Produces: zlib(type + " " + size + "\0" + content)
    *
@@ -150,13 +95,30 @@ export interface SerializationApi {
   serializeLooseObject(id: ObjectId): AsyncIterable<Uint8Array>;
 
   /**
-   * Create a pack file from objects
+   * Create a pack file from objects, streamed through `writePack`. The ids are collected
+   * first (a pack header carries the count); objects are read one at a time as they are
+   * written, and entries the backend's packs hold are copied as stored.
    *
    * @param objects Object IDs to pack
    * @param options Pack creation options
    * @returns Pack file stream
    */
   createPack(objects: AsyncIterable<ObjectId>, options?: PackOptions): AsyncIterable<Uint8Array>;
+
+  /**
+   * The pack of objects reachable from `wants` and not from `haves` (`git pack-objects --revs`):
+   * `listObjects`, then `writePack` with the paths for the delta search.
+   *
+   * @param wants Tips to send
+   * @param haves Tips the receiver has
+   * @param options Export options
+   * @returns Pack file stream
+   */
+  exportPack(
+    wants: Iterable<ObjectId>,
+    haves: Iterable<ObjectId>,
+    options?: ExportOptions,
+  ): AsyncIterable<Uint8Array>;
 
   /**
    * Import objects from a received pack stream, byte for byte (see `importPack` in the pack
@@ -168,13 +130,6 @@ export interface SerializationApi {
    * @returns Import statistics
    */
   importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
-
-  /**
-   * Create incremental pack builder
-   *
-   * @param options Pack builder options
-   */
-  createPackBuilder(options?: PackOptions): PackBuilder;
 
   /**
    * Export single object in Git format

@@ -48,6 +48,14 @@ export class ProcessConfiguration {
   sideBand?: boolean;
 
   /**
+   * Server side: the side-band keep-alive interval in milliseconds while a pack is prepared,
+   * until its first byte (an empty band-1 packet, as git's `uploadpack.keepAlive`); 0 turns
+   * keep-alives off.
+   * @default 5000
+   */
+  keepAliveMs?: number;
+
+  /**
    * Progress callback for reporting transfer status.
    * @param message - Progress message to display
    */

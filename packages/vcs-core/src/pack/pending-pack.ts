@@ -7,10 +7,15 @@
  * Based on jgit/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/file/GC.java
  */
 
+import { deflate } from "@statewalker/vcs-utils/compression";
 import type { ObjectId } from "../common/id/index.js";
+import type { GitObject } from "../history/objects/git-objects.js";
+import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { writePackIndexV2 } from "./pack-index-writer.js";
-import { StreamingPackWriter } from "./streaming-pack-writer.js";
 import type { PackObjectType } from "./types.js";
+import { type ReusableEntry, type WrittenPackEntry, writePack } from "./write-pack.js";
+
+const TYPE_NAME: Record<number, ObjectTypeString> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
 
 /** Default maximum number of objects before auto-flush */
 const DEFAULT_MAX_OBJECTS = 100;
@@ -168,41 +173,50 @@ export class PendingPack {
    * @returns Flush result with pack data and index
    */
   async flush(): Promise<PendingPackFlushData> {
-    // Separate full objects and deltas
+    // Full objects first (they may be bases for deltas); writePack also writes a base before
+    // its deltas, as OFS deltas, and keeps a delta on an object outside the pack as a REF delta.
     const fullObjects = this.entries.filter((e) => e.type === "full");
     const deltaObjects = this.entries.filter((e) => e.type === "delta");
-
-    const writer = new StreamingPackWriter(this.entries.length);
+    const full = new Map(fullObjects.map((e) => [e.id, e]));
+    const deltas = new Map(deltaObjects.map((e) => [e.id, e]));
+    const source = {
+      async get(id: ObjectId): Promise<GitObject | undefined> {
+        const e = full.get(id);
+        if (e?.type !== "full") return undefined;
+        return {
+          type: TYPE_NAME[e.objectType] as ObjectTypeString,
+          size: e.content.length,
+          content: once(e.content),
+        };
+      },
+    };
+    const reuse = {
+      async entry(id: ObjectId): Promise<ReusableEntry | undefined> {
+        const e = deltas.get(id);
+        if (e?.type !== "delta") return undefined;
+        return {
+          kind: 7,
+          size: e.delta.length,
+          baseId: e.baseId,
+          raw: () => deflate(once(e.delta)),
+        };
+      },
+    };
+    const external = deltaObjects.flatMap((e) =>
+      e.type === "delta" && !full.has(e.baseId) && !deltas.has(e.baseId) ? [e.baseId] : [],
+    );
+    const written: WrittenPackEntry[] = [];
     const chunks: Uint8Array[] = [];
-
-    // Write full objects first (they may be bases for deltas)
-    for (const entry of fullObjects) {
-      if (entry.type === "full") {
-        for await (const chunk of writer.addObject(entry.id, entry.objectType, entry.content)) {
-          chunks.push(chunk);
-        }
-      }
-    }
-
-    // Write delta objects
-    // Try to use OFS_DELTA if base is in this pack, otherwise use REF_DELTA
-    for (const entry of deltaObjects) {
-      if (entry.type === "delta") {
-        const baseOffset = writer.getObjectOffset(entry.baseId);
-        if (baseOffset !== undefined) {
-          for await (const chunk of writer.addOfsDelta(entry.id, entry.baseId, entry.delta)) {
-            chunks.push(chunk);
-          }
-        } else {
-          for await (const chunk of writer.addRefDelta(entry.id, entry.baseId, entry.delta)) {
-            chunks.push(chunk);
-          }
-        }
-      }
-    }
-
-    // Finalize: yields the 20-byte checksum
-    for await (const chunk of writer.finalize()) {
+    for await (const chunk of writePack(
+      source,
+      [...fullObjects, ...deltaObjects].map((e) => e.id),
+      {
+        packs: reuse,
+        thin: true,
+        haves: external,
+        onEntry: (e) => written.push(e),
+      },
+    )) {
       chunks.push(chunk);
     }
 
@@ -215,10 +229,11 @@ export class PendingPack {
       offset += c.length;
     }
 
-    // Build index from writer's tracked entries
+    // Build index from the written entries
     const packChecksum = packData.subarray(packData.length - 20);
-    const indexEntries = writer.getIndexEntries();
-    const sortedEntries = [...indexEntries].sort((a, b) => a.id.localeCompare(b.id));
+    const sortedEntries = written
+      .map(({ id, offset, crc32 }) => ({ id, offset, crc32 }))
+      .sort((a, b) => a.id.localeCompare(b.id));
     const indexData = await writePackIndexV2(sortedEntries, packChecksum);
 
     // Clear entries after flush
@@ -279,4 +294,8 @@ export class PendingPack {
     }
     return undefined;
   }
+}
+
+async function* once(data: Uint8Array): AsyncGenerator<Uint8Array> {
+  yield data;
 }

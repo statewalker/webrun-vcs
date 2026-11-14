@@ -3,8 +3,8 @@
  */
 
 import { MergeStatus } from "@statewalker/vcs-commands";
-import { FileMode } from "@statewalker/vcs-core";
-import { type PushObject, push as transportPush } from "@statewalker/vcs-transport";
+import { type ListedObject, listObjects, writePack } from "@statewalker/vcs-core";
+import { push as transportPush } from "@statewalker/vcs-transport";
 import {
   type CliContext,
   dim,
@@ -205,66 +205,16 @@ export async function runPull(args: string[]): Promise<void> {
 }
 
 /**
- * Collect objects needed for push
+ * The pack a push sends: what `wants` reach and the remote's refs do not, streamed
  */
-async function collectObjectsForPush(ctx: CliContext, commitId: string): Promise<PushObject[]> {
-  const objects: PushObject[] = [];
-  const seen = new Set<string>();
-
-  const typeStringToCode: Record<string, number> = {
-    commit: 1,
-    tree: 2,
-    blob: 3,
-    tag: 4,
-  };
-
-  async function collectObject(id: string): Promise<void> {
-    if (seen.has(id)) return;
-    seen.add(id);
-
-    const obj = await ctx.objects.get(id);
-    if (!obj) throw new Error(`Object not found: ${id}`);
-    const typeCode = typeStringToCode[obj.type];
-
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of obj.content) {
-      chunks.push(chunk);
-    }
-
-    const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-    const content = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      content.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    objects.push({ id, type: typeCode, content });
-  }
-
-  async function collectTree(treeId: string): Promise<void> {
-    await collectObject(treeId);
-
-    const tree = await ctx.history.trees.load(treeId);
-    if (!tree) return;
-
-    for await (const entry of tree) {
-      if (entry.mode === FileMode.TREE) {
-        await collectTree(entry.id);
-      } else {
-        await collectObject(entry.id);
-      }
-    }
-  }
-
-  await collectObject(commitId);
-
-  const commit = await ctx.history.commits.load(commitId);
-  if (commit) {
-    await collectTree(commit.tree);
-  }
-
-  return objects;
+async function* exportPack(
+  ctx: CliContext,
+  wants: Iterable<string>,
+  exclude: Iterable<string>,
+): AsyncGenerator<Uint8Array> {
+  const listed: ListedObject[] = [];
+  for await (const o of listObjects(ctx.objects, { wants, haves: exclude })) listed.push(o);
+  yield* writePack(ctx.objects, listed, { deltaSearch: true });
 }
 
 /**
@@ -324,10 +274,6 @@ export async function runPush(args: string[]): Promise<void> {
     const commitId = localRefValue.objectId;
     console.log(dim(`  Commit: ${shortId(commitId)}`));
 
-    // Collect objects to push
-    const objectsToPush = await collectObjectsForPush(ctx, commitId);
-    console.log(dim(`  Objects: ${objectsToPush.length}`));
-
     // Execute push
     const result = await transportPush({
       url: remoteUrl,
@@ -337,11 +283,7 @@ export async function runPush(args: string[]): Promise<void> {
         const ref = await ctx.history.refs.resolve(refName);
         return ref?.objectId;
       },
-      getObjectsToPush: async function* () {
-        for (const obj of objectsToPush) {
-          yield obj;
-        }
-      },
+      exportPack: (wants, exclude) => exportPack(ctx, wants, exclude),
       onProgressMessage: (msg) => {
         const trimmed = msg.trim();
         if (trimmed) {

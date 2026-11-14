@@ -37,6 +37,13 @@ export class ProtocolState {
    */
   capabilities = new Set<string>();
 
+  /**
+   * Capabilities the server advertised (server side). Kept apart from `capabilities`: an
+   * upload-pack server replaces `capabilities` with what the client's first `want` line
+   * requests (possibly nothing), limited to this set when it is not empty.
+   */
+  advertisedCapabilities = new Set<string>();
+
   // Protocol V2 specific state
 
   /**
@@ -179,6 +186,7 @@ export class ProtocolState {
       haves: new Set(this.haves),
       commonBase: new Set(this.commonBase),
       capabilities: new Set(this.capabilities),
+      advertisedCapabilities: new Set(this.advertisedCapabilities),
       protocolVersion: this.protocolVersion,
       capabilityValues: this.capabilityValues ? new Map(this.capabilityValues) : undefined,
       symrefs: this.symrefs ? new Map(this.symrefs) : undefined,
@@ -214,6 +222,9 @@ export class ProtocolState {
     this.haves = cp.haves ? new Set(cp.haves) : new Set();
     this.commonBase = cp.commonBase ? new Set(cp.commonBase) : new Set();
     this.capabilities = cp.capabilities ? new Set(cp.capabilities) : new Set();
+    this.advertisedCapabilities = cp.advertisedCapabilities
+      ? new Set(cp.advertisedCapabilities)
+      : new Set();
     this.protocolVersion = cp.protocolVersion;
     this.capabilityValues = cp.capabilityValues ? new Map(cp.capabilityValues) : undefined;
     this.symrefs = cp.symrefs ? new Map(cp.symrefs) : undefined;
@@ -247,6 +258,7 @@ export class ProtocolState {
     this.haves.clear();
     this.commonBase.clear();
     this.capabilities.clear();
+    this.advertisedCapabilities.clear();
     this.protocolVersion = undefined;
     this.capabilityValues = undefined;
     this.symrefs = undefined;

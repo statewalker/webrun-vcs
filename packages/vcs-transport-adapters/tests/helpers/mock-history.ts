@@ -162,30 +162,15 @@ export function createMockSerializationApi(): SerializationApi {
       return result;
     },
 
-    createPackBuilder(_options) {
-      const objects: string[] = [];
-      return {
-        async addObject(id) {
-          objects.push(id);
-        },
-        async addObjectWithDelta(id, _preferredBaseId) {
-          objects.push(id);
-        },
-        finalize() {
-          return (async function* () {
-            yield new Uint8Array(12); // Header
-            yield new Uint8Array(20); // Checksum
-          })();
-        },
-        getStats() {
-          return {
-            totalObjects: objects.length,
-            deltifiedObjects: 0,
-            totalSize: 0,
-            deltaSavings: 0,
-          };
-        },
-      };
+    exportPack(_wants, _haves, _options) {
+      return (async function* () {
+        // an empty pack: header and checksum
+        const header = new Uint8Array(12);
+        header.set([0x50, 0x41, 0x43, 0x4b]); // "PACK"
+        header[7] = 0x02; // Version 2
+        yield header;
+        yield new Uint8Array(20);
+      })();
     },
 
     async exportObject(_id) {

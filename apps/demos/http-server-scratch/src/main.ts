@@ -17,7 +17,7 @@
  */
 
 import { DefaultSerializationApi, FileMode, type FilesApi, joinPath } from "@statewalker/vcs-core";
-import { clone, type PushObject, push } from "@statewalker/vcs-transport";
+import { clone, push } from "@statewalker/vcs-transport";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
@@ -31,6 +31,7 @@ import {
   DEFAULT_BRANCH,
   describeCommit,
   ensureDirectory,
+  exportPack,
   type FileHistory,
   formatIntegrityReport,
   getHead,
@@ -121,7 +122,7 @@ async function main(): Promise<void> {
 
     // Step 7: Push using VCS transport
     printStep(7, "Pushing changes using VCS transport");
-    await pushChanges(localHistory, commitId);
+    await pushChanges(localHistory);
 
     // Step 8: Verify push through the library
     printStep(8, "Verifying push through the VCS library");
@@ -517,12 +518,8 @@ HTTP Git server demo. It demonstrates the ability to:
 /**
  * Step 7: Push changes using VCS transport.
  */
-async function pushChanges(history: FileHistory, commitId: string): Promise<void> {
+async function pushChanges(history: FileHistory): Promise<void> {
   printInfo(`Pushing ${TEST_BRANCH} to remote...`);
-
-  const objectsToPush = await collectObjectsForPush(history, commitId);
-
-  printInfo(`Collected ${objectsToPush.length} objects to push`);
 
   const result = await push({
     url: REMOTE_URL,
@@ -532,11 +529,8 @@ async function pushChanges(history: FileHistory, commitId: string): Promise<void
       const ref = await history.refs.resolve(refName);
       return ref?.objectId;
     },
-    getObjectsToPush: async function* () {
-      for (const obj of objectsToPush) {
-        yield obj;
-      }
-    },
+    // the objects the remote lacks, streamed as a pack (listObjects + writePack)
+    exportPack: (wants, exclude, options) => exportPack(history.objects, wants, exclude, options),
     onProgressMessage: (msg) => {
       if (msg.trim()) {
         printInfo(`  ${msg.trim()}`);
@@ -557,65 +551,6 @@ async function pushChanges(history: FileHistory, commitId: string): Promise<void
     }
     throw new Error("Push failed");
   }
-}
-
-/**
- * Collect objects needed for push.
- */
-async function collectObjectsForPush(
-  history: FileHistory,
-  commitId: string,
-): Promise<PushObject[]> {
-  const objects: PushObject[] = [];
-  const seen = new Set<string>();
-
-  const typeStringToCode: Record<string, number> = {
-    commit: 1,
-    tree: 2,
-    blob: 3,
-    tag: 4,
-  };
-
-  async function collectObject(id: string): Promise<void> {
-    if (seen.has(id)) return;
-    seen.add(id);
-
-    const obj = await history.objects.get(id);
-    if (!obj) throw new Error(`Object not found: ${id}`);
-    const typeCode = typeStringToCode[obj.type];
-
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of obj.content) {
-      chunks.push(chunk);
-    }
-    const content = concatBytes(...chunks);
-
-    objects.push({ id, type: typeCode, content });
-  }
-
-  async function collectTree(treeId: string): Promise<void> {
-    await collectObject(treeId);
-
-    const entries = await history.trees.load(treeId);
-    if (entries) {
-      for await (const entry of entries) {
-        if (entry.mode === FileMode.TREE) {
-          await collectTree(entry.id);
-        } else {
-          await collectObject(entry.id);
-        }
-      }
-    }
-  }
-
-  await collectObject(commitId);
-
-  const commit = await history.commits.load(commitId);
-  if (commit) {
-    await collectTree(commit.tree);
-  }
-
-  return objects;
 }
 
 /**

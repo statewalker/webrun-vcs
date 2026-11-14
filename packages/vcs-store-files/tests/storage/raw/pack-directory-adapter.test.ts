@@ -2,8 +2,8 @@ import {
   createGitObject,
   createInMemoryFilesApi,
   type FilesApi,
-  PackObjectType,
-  StreamingPackWriter,
+  type WrittenPackEntry,
+  writePack,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -47,24 +47,26 @@ describe("PackDirectoryAdapter", () => {
     blobId = bytesToHex(await sha1(gitObject));
 
     // Create a pack with this blob
-    const writer = new StreamingPackWriter(1);
-    const packChunks: Uint8Array[] = [];
-    for await (const chunk of writer.addObject(blobId, PackObjectType.BLOB, blobContent)) {
-      packChunks.push(chunk);
-    }
-    for await (const chunk of writer.finalize()) {
-      packChunks.push(chunk);
-    }
-
+    const written: WrittenPackEntry[] = [];
+    const source = {
+      async get(id: string) {
+        if (id !== blobId) return undefined;
+        return {
+          type: "blob" as const,
+          size: blobContent.length,
+          content: (async function* () {
+            yield blobContent;
+          })(),
+        };
+      },
+    };
     const packData = await collectBytes(
-      (async function* () {
-        for (const c of packChunks) yield c;
-      })(),
+      writePack(source, [blobId], { onEntry: (e) => written.push(e) }),
     );
 
     // Build index
     const packChecksum = packData.subarray(packData.length - 20);
-    const indexData = await writePackIndexV2(writer.getIndexEntries(), packChecksum);
+    const indexData = await writePackIndexV2(written, packChecksum);
 
     // Add pack to pack directory
     packDir = new PackDirectory({ files, basePath: "/objects/pack" });

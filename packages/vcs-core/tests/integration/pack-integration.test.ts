@@ -340,56 +340,48 @@ describe("Pack Import/Export Integration", () => {
     });
   });
 
-  describe("PackBuilder API", () => {
-    it("builds pack with addObject", async () => {
-      const blobId = await source.blobs.store([new TextEncoder().encode("Builder test")]);
-      const treeId = await source.trees.store([{ mode: 0o100644, name: "test.txt", id: blobId }]);
-      const commitId = await source.commits.store({
-        tree: treeId,
-        parents: [],
-        author: createTestPerson(),
-        committer: createTestPerson(),
-        message: "Builder test",
-      });
+  describe("exportPack (listObjects + writePack)", () => {
+    it("sends what the wants reach and the haves do not", async () => {
+      const first = await createSimpleCommit(source, "First", []);
+      const second = await createSimpleCommit(source, "Second", [first]);
 
-      const builder = sourceSerialization.createPackBuilder();
-      await builder.addObject(blobId);
-      await builder.addObject(treeId);
-      await builder.addObject(commitId);
-
-      const packBytes = await collectPackBytes(builder.finalize());
-
-      // Verify pack is valid
+      await targetSerialization.importPack(
+        sourceSerialization.exportPack([first], [], { useDelta: false }),
+      );
+      const packBytes = await collectPackBytes(sourceSerialization.exportPack([second], [first]));
       const view = new DataView(packBytes.buffer, packBytes.byteOffset);
+      // the second commit, its tree and its blob: the first commit's objects are excluded
       expect(view.getUint32(8, false)).toBe(3);
 
-      // Verify it can be imported
       const result = await targetSerialization.importPack(toAsyncIterable(packBytes));
-      expect(result.objectsImported).toBe(3);
+      expect(result.commitsImported).toBe(1);
+      expect(await target.commits.load(second)).toBeDefined();
     });
 
-    it("tracks stats", async () => {
-      const blobId = await source.blobs.store([new TextEncoder().encode("Stats test")]);
-
-      const builder = sourceSerialization.createPackBuilder();
-      await builder.addObject(blobId);
-
-      const stats = builder.getStats();
-      expect(stats.totalObjects).toBe(1);
-      expect(stats.totalSize).toBeGreaterThan(0);
-    });
-
-    it("rejects objects after finalization", async () => {
-      const blobId = await source.blobs.store([new TextEncoder().encode("Finalized test")]);
-
-      const builder = sourceSerialization.createPackBuilder();
-      await builder.addObject(blobId);
-
-      // Consume the finalize iterator
-      await collectPackBytes(builder.finalize());
-
-      // Should throw when adding after finalize
-      await expect(builder.addObject(blobId)).rejects.toThrow();
+    it("searches deltas by default, and not with useDelta: false", async () => {
+      const lines = Array.from({ length: 300 }, (_, i) => `line ${i} of a file that changes`);
+      let parent: string[] = [];
+      let tip = "";
+      for (let v = 0; v < 6; v++) {
+        lines[v * 13] = `changed in version ${v}`;
+        const blobId = await source.blobs.store([new TextEncoder().encode(lines.join("\n"))]);
+        const treeId = await source.trees.store([{ mode: 0o100644, name: "f.txt", id: blobId }]);
+        tip = await source.commits.store({
+          tree: treeId,
+          parents: parent,
+          author: createTestPerson(),
+          committer: createTestPerson(),
+          message: `v${v}`,
+        });
+        parent = [tip];
+      }
+      const searched = await collectPackBytes(sourceSerialization.exportPack([tip], []));
+      const plain = await collectPackBytes(
+        sourceSerialization.exportPack([tip], [], { useDelta: false }),
+      );
+      expect(searched.length).toBeLessThan(plain.length / 2);
+      const result = await targetSerialization.importPack(toAsyncIterable(searched));
+      expect(result.objectsImported).toBe(18);
     });
   });
 

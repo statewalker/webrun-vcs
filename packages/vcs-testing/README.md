@@ -80,6 +80,24 @@ const stream = await blobs.load(id); // undefined if missing
 const back = stream ? await collectContent(stream) : undefined;
 ```
 
+Lay out a pack entry by entry, with the deltas you choose, for tests of pack readers and stores:
+
+```typescript
+import { CraftPackWriter, craftPackFile } from "@statewalker/vcs-testing";
+
+const w = new CraftPackWriter();
+await w.addObject(baseId, 3, base); // 3: blob
+await w.addOfsDelta(targetId, baseId, delta); // or addRefDelta
+const { packData, packChecksum, indexEntries } = await w.finalize();
+const idx = await writePackIndexV2(indexEntries, packChecksum);
+
+const whole = await craftPackFile([{ id, type: 3, content }]); // whole objects only
+```
+
+These build the pack in memory with the layout given. Production code writes packs with
+vcs-core's `writePack`, which streams and finds its own deltas; `buildPack` crafts the packs git
+never writes (cycles, forward references, wrong counts).
+
 ## Internals
 
 ### What will surprise you

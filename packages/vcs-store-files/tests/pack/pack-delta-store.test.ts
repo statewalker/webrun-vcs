@@ -9,9 +9,9 @@ import {
   createInMemoryFilesApi,
   type FilesApi,
   PackObjectType,
-  writePack,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
+import { craftPackFile } from "@statewalker/vcs-testing";
 import type { Delta } from "@statewalker/vcs-utils";
 import { beforeEach, describe, expect, it } from "vitest";
 import { PackDeltaStore, PackDirectory } from "../../src/pack/index.js";
@@ -510,5 +510,5 @@ async function createTestPack(objects: Array<{ id: string; content: Uint8Array }
     type: PackObjectType.BLOB,
     content: obj.content,
   }));
-  return await writePack(packObjects);
+  return await craftPackFile(packObjects);
 }
