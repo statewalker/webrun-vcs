@@ -18,9 +18,7 @@ import { join } from "node:path";
 import {
   createMemoryHistoryWithOperations,
   type HistoryWithOperations,
-  type Ref,
   type Refs,
-  type SymbolicRef,
 } from "@statewalker/vcs-core";
 import {
   createTransportRefStore as createCoreTransportRefStore,

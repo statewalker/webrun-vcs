@@ -12,7 +12,6 @@ import {
   type GitObjectStore,
   type History,
   type HistoryWithOperations,
-  isSymbolicRef,
   type ObjectId,
   type Refs,
   type SerializationApi,
@@ -29,7 +28,6 @@ import {
   createFetchHandler,
   createRepositoryFacade,
   createTransportRefStore,
-  type RefStore,
 } from "@statewalker/vcs-transport";
 import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
@@ -202,13 +200,6 @@ function createMockFetch(
 }
 
 /**
- * Create a transport RefStore adapter from a vcs-core Refs.
- */
-function createTransportRefStoreAdapter(refs: Refs): RefStore {
-  return createTransportRefStore(refs);
-}
-
-/**
  * Create a mock HistoryWithOperations for transport tests.
  *
  * Wraps stores to provide the interface expected by createRepositoryFacade.
@@ -360,7 +351,7 @@ export function createTestServer(serverStores?: TransportTestStores): TestServer
   });
 
   // Create transport ref store adapter
-  const refStore = createTransportRefStoreAdapter(stores.refs);
+  const refStore = createTransportRefStore(stores.refs);
 
   const serverFetch = createFetchHandler({
     async resolveRepository(repoPath) {
@@ -433,7 +424,7 @@ export async function createInitializedTestServer(): Promise<
   });
 
   // Create transport ref store adapter
-  const refStore = createTransportRefStoreAdapter(stores.refs);
+  const refStore = createTransportRefStore(stores.refs);
 
   const serverFetch = createFetchHandler({
     async resolveRepository(repoPath) {

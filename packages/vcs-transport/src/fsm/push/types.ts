@@ -56,7 +56,7 @@ export function mapRejectReason(reason: string): PushCommandResult {
   if (reason.includes("deny creating")) return "REJECTED_NOCREATE";
   if (reason.includes("missing")) return "REJECTED_MISSING_OBJECT";
   if (reason.includes("atomic")) return "ATOMIC_REJECTED";
-  if (reason.includes("lock")) return "LOCK_FAILURE";
+  if (reason.includes("lock") || reason.includes("failed to update ref")) return "LOCK_FAILURE";
   return "REJECTED_OTHER_REASON";
 }
 

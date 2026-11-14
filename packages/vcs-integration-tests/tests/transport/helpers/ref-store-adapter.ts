@@ -5,7 +5,7 @@
  * RefStore interface used by fetch/push operations.
  */
 
-import type { Ref, Refs, SymbolicRef } from "@statewalker/vcs-core";
+import type { Refs } from "@statewalker/vcs-core";
 import {
   createTransportRefStore as createCoreTransportRefStore,
   type RefStore as TransportRefStore,

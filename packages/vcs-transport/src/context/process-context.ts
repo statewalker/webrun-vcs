@@ -16,6 +16,8 @@ export interface RefStore {
    * Apply ref updates all-or-nothing (vcs-core `Refs.batch`). When present,
    * receive-pack applies pushes through it: an atomic push is one batch, a
    * plain push one batch per ref, and every update checks the ref's old value.
+   * A store that answers `unsupported` for several refs (not atomic for them)
+   * gets one-by-one writes through `update` instead.
    */
   batch?(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult>;
 

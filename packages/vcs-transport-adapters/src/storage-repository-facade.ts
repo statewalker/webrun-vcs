@@ -25,9 +25,7 @@ import {
   createTags,
   createTrees,
   DefaultSerializationApi,
-  isSymbolicRef,
   kvStoreRefs,
-  type Refs,
   type SerializationApi,
 } from "@statewalker/vcs-core";
 import {
