@@ -36,10 +36,10 @@ Main exports:
 | `createGitFilesHistoryFromFiles(options)` | Same options, returns a `HistoryWithOperations` (adds `serialization`, and `delta`: a read-only view of which packed objects are deltas). |
 | `FileStagingStore(files, indexPath)` | `Staging` stored in Git's binary index format (`.git/index`). |
 | `createFileWorktree({ files, rootPath, blobs, trees, gitDir? })` / `FileWorktree` | `Worktree` over the working directory, with `.gitignore` support and `checkoutTree`. |
-| `gc({ history, files, gitDir?, dryRun?, pruneExpireMs?, tmpExpiryMs?, packRefs?, repack? })` | `git gc`: packs refs, repacks everything reachable into one pack, prunes unreachable loose objects older than two weeks, sweeps stale temporaries. |
-| `repack({ ...backend, all?, deltaSearch?, dryRun? })` | `git repack -a -d` (default) or, with `all: false`, `git repack -d`: one streamed pack, `.keep` packs honoured, replaced packs and loose copies removed after the install. |
+| `gc({ history, files, gitDir?, dryRun?, pruneExpireMs?, tmpExpiryMs?, packRefs?, repack? })` | `git gc`: under a `gc.pid` lock, repacks everything reachable into one pack (`repack -A -d`: unreachable packed objects younger than two weeks are loosened), packs refs, prunes unreachable loose objects older than two weeks, sweeps stale temporaries and orphaned `.pack` files. |
+| `repack({ ...backend, all?, unpackUnreachable?, deltaSearch?, dryRun? })` | `git repack -a -d` (default), `git repack -A -d` with `unpackUnreachable: true`, or, with `all: false`, `git repack -d`: one streamed pack, `.keep` packs honoured, replaced packs and loose copies removed after the install; only packs present before the walk are replaced. |
 | `FileGcStrategy(backend)` | `GcStrategy` for `@statewalker/vcs-core`: `prune`, `compact` (= `repack` with `all: false`), `getStats`. |
-| `listReachableObjects` / `collectReachabilityRoots` | What repack and gc keep: objects reachable from every ref, HEAD, the reflogs and the index. |
+| `listReachableObjects` / `collectReachabilityRoots` | What repack and gc keep: objects reachable from every ref, HEAD, the reflogs, the index and every linked worktree's HEAD, index and reflogs. Refs are read strictly: an unreadable or malformed ref throws. |
 
 Lower-level building blocks, also exported:
 
@@ -124,16 +124,18 @@ const backend = await createGitFilesBackend({ files });
 
 const packed = await repack(backend); // git repack -a -d
 // { packName: "pack-<sha1>", objectCount: 42, looseObjectsRemoved: 3,
-//   packsRemoved: ["pack-<old>"], keptPacks: [] }, or null if nothing is reachable
+//   packsRemoved: ["pack-<old>"], keptPacks: [], unpackedObjects: 0 }, or null if nothing is reachable
 
 await repack({ ...backend, all: false }); // git repack -d: only the reachable loose objects
+await repack({ ...backend, unpackUnreachable: true }); // git repack -A -d
 
 const { history } = backend;
 await gc({ history, files, dryRun: true }); // what would be pruned; nothing changes
 await gc({ history, files });
-// { removedObjects, keptRecentObjects, reachableObjects, totalLooseObjects,
-//   removedTemporaries, refsPacked: true, repack: { packName, ... } }
+// { removedObjects, keptRecentObjects, reachableObjects, totalLooseObjects, removedTemporaries,
+//   removedOrphanPacks, refsPacked: true, repack: { packName, ... }, skipped: false }
 await gc({ history, files, pruneExpireMs: 0 }); // git gc --prune=now
+// another gc holding .git/gc.pid: { skipped: true, ... } and nothing is done
 
 await new FileGcStrategy(backend).getStats();
 // { looseObjectCount: 0, packedObjectCount: 42, totalSize: 0, packCount: 1 }
@@ -235,7 +237,12 @@ Writing an object that is already packed (`put` or `putRaw`) writes nothing, as 
 unless its pack file has been deleted behind the backend's back (by `git repack -a -d` or gc) or
 its packed copy was found corrupt: then it is written loose, so a repairing write lands. A pack
 whose file was checked less than a second ago is trusted without another check, so writes made
-within that second after the pack was deleted are skipped and not retried.
+within that second after the pack was deleted are skipped and not retried. An object whose pack
+file is older than an hour (`freshenMaxAgeMs` of `openPackSet`, git's freshen window) is written
+loose again: git would touch the pack's mtime so a concurrent gc does not expire the object with
+it, FilesApi cannot set mtimes, and the fresh loose copy does that job instead. An object
+skipped because its pack is younger is safe too: gc loosens the unreachable objects of young
+packs instead of dropping them.
 `gc()` and `repack()` work on the `packs` and `looseStorage` the backend returns, and ignore
 files in `objects/` that are not objects (such as git's `objects/ab/tmp_obj_*` while it writes).
 
@@ -248,7 +255,7 @@ pack. This keeps writes simple (one file per object, no pack index to rewrite) a
 `repack()` is one stream from end to end:
 
 ```
-listObjects (refs, HEAD, reflogs, index) ─► writePack (reuse + delta search) ─► PackSet.install
+snapshot packs ─► listObjects (refs, HEAD, reflogs, index, worktrees) ─► writePack (reuse + delta search) ─► PackSet.install
 ```
 
 `listObjects` keeps only ids, types and paths; `writePack` reads one object at a time, copies
@@ -261,8 +268,17 @@ Only then are things deleted, so a concurrent reader always finds each object so
 packs the new one replaces go first (`.idx` before `.pack`), then the loose objects a pack now
 holds (`git prune-packed`). Packs with a `.keep` file are never removed, and their objects are
 not copied into the new pack (git's `--honor-pack-keep`). Unreachable objects inside the
-replaced packs are dropped, exactly as `git repack -a -d` drops them. A pack installed by
-someone else while the repack ran is left alone.
+replaced packs are dropped, exactly as `git repack -a -d` drops them, unless
+`unpackUnreachable` is set (`git repack -A -d`, what `gc()` uses): each of them is then streamed
+from its pack into a loose object (temporary file and rename) before the pack is removed, unless
+the pack was last modified more than `unpackUnreachableExpireMs` ago (two weeks); a pack whose
+mtime is unknown is always loosened.
+
+Only packs that were installed before the walk started are replaced: the pack set is refreshed
+and snapshotted first, then the reachable objects are listed. A pack installed by someone else
+during the walk or the write (a push whose ref is not yet updated) is left alone, and so is any
+snapshot pack whose file was modified after the walk started. A ref that cannot be read or is
+malformed makes the repack throw before it writes or deletes anything.
 
 With `all: false` (`git repack -d`), the reachable objects no pack holds go into a new pack and
 their loose copies are removed; existing packs are untouched. Unreachable loose objects are never
@@ -271,18 +287,29 @@ packed: they stay loose for `gc()` to prune when they are old enough.
 ### What `gc` keeps
 
 `gc()` treats as reachable every object reachable from a ref, HEAD, any reflog entry (old and new
-ids, `logs/HEAD` and `logs/refs/**`) or an index entry, as `git gc` does. It repacks them
-(`repack -a -d`), then removes each remaining loose object that is unreachable and was last
-modified more than `pruneExpireMs` ago (git's `gc.pruneExpire`, two weeks). Younger unreachable
-objects are kept, because another process may be writing a commit that will reference them; an
-object whose age is unknown is kept too unless `pruneExpireMs` is 0 (`--prune=now`).
+ids, `logs/HEAD` and `logs/refs/**`), an index entry, and, for each linked worktree
+(`.git/worktrees/<name>/`), its HEAD (detached or symbolic), its index and its reflogs, as
+`git gc` does. The trees of the index's cache-tree extension are not read (git counts them too);
+a tree only the cache-tree names can be pruned, and git then rebuilds that part of the
+cache-tree. Refs are listed strictly: a ref file that cannot be read, an empty or malformed ref
+or a broken `packed-refs` makes gc throw before anything is changed, as `git gc` refuses to run.
 
-Unreachable objects that are already inside packs are not loosened or moved to a cruft pack (as
-`git gc` with `--unpack-unreachable` or `--cruft` would): the repack drops them. That is
-`git repack -a -d` behaviour, simpler, and only differs for objects packed and abandoned within
-the grace period. Temporaries left by a crashed write (`objects/**/tmp_obj_*` and
-`objects/pack/tmp_*`) are removed once older than `tmpExpiryMs` (two weeks). A dry run changes
-nothing: it does not pack refs, repack or sweep, and reports what it would prune.
+gc repacks with `repack -A -d`: unreachable objects of the replaced packs are written loose,
+unless their pack is older than `pruneExpireMs`, so a branch deleted with its reflog
+(`git branch -D`) keeps its packed commits for the grace period. FilesApi cannot set mtimes, so
+these loose copies get the current time and live up to `pruneExpireMs` longer than under git.
+Then gc removes each remaining loose object that is unreachable and was last modified more than
+`pruneExpireMs` ago (git's `gc.pruneExpire`, two weeks). Younger unreachable objects are kept,
+because another process may be writing a commit that will reference them; an object whose age is
+unknown is kept too unless `pruneExpireMs` is 0 (`--prune=now`).
+
+Temporaries left by a crashed write (`objects/**/tmp_obj_*` and `objects/pack/tmp_*`), and
+`.pack` files whose `.idx` is gone (a crash while a pack was removed), are removed once older
+than `tmpExpiryMs` (two weeks). gc takes `.git/gc.pid` with an exclusive create first; while
+another gc holds it, gc returns `skipped: true` and does nothing (a `gc.pid` older than 12 hours
+is taken over, as git does). The lock excludes gcs over the same FilesApi instance, not native
+git. A dry run takes no lock and changes nothing: it does not pack refs, repack or sweep, and
+reports what it would prune.
 
 ### Compatibility limits
 
@@ -317,6 +344,7 @@ nothing: it does not pack refs, repack or sweep, and reports what it would prune
 | `objects.get()` of a packed object whose only copy is corrupt (bad zlib, a delta cycle, a missing base) | `PackError` (a `CorruptObjectError`); with `verify`, content hashing to another id raises `ObjectIdMismatchError` |
 | A broken `packed-refs` file | `Invalid packed-refs line: <line>`, `Peeled line before ref in packed-refs` |
 | A truncated ref file | `Invalid ref content in <name>: too short` |
+| `repack()` or `gc()` when a ref cannot be read, is empty or is not an object id | the read error, `Invalid ref <name>: empty file` or `Invalid ref content in <name>: not an object id`; nothing is deleted |
 | A symbolic ref loop | `Symbolic ref depth exceeded for <name>` |
 | `staging.writeTree()` with conflict stages | `Cannot write tree with unresolved conflicts` |
 | Index builder: duplicate entry / stage 0 next to stages 1-3 | `Duplicate entry: <path> stage <n>` / `Invalid stages for <path>: stage 0 cannot coexist with other stages` |

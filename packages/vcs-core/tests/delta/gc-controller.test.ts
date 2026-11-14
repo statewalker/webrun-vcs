@@ -317,3 +317,55 @@ describe("GCController size cap (P2.6)", () => {
     expect(ctx.gc.getOptions().maxDeltaBlobSize).toBe(100);
   });
 });
+
+describe("GCController size cap on bases (P2.6 review)", () => {
+  it("does not store a delta whose base is larger than maxDeltaBlobSize", async () => {
+    let base = "";
+    const deltaEngine = {
+      async findBestDelta() {
+        return { baseId: base, delta: new Uint8Array([1]), ratio: 0.5, savings: 1, chainDepth: 1 };
+      },
+    } as unknown as NonNullable<Parameters<typeof createTestRepository>[0]>["deltaEngine"];
+    const ctx = await createTestRepository({ deltaEngine, maxDeltaBlobSize: 100 });
+    base = await ctx.blob("y".repeat(101));
+    const small = await ctx.blob("small target\n");
+    const stored: string[] = [];
+    ctx.history.delta.blobs.deltifyBlob = async (target: string) => {
+      stored.push(target);
+    };
+
+    await ctx.gc.onBlob(small);
+    await ctx.gc.quickPack();
+    await ctx.gc.runGC();
+    expect(stored).toEqual([]);
+  });
+
+  it("DefaultDeltaEngine never loads a candidate base larger than maxTargetSize", async () => {
+    const { DefaultDeltaEngine } = await import(
+      "../../src/storage/delta/engine/default-delta-engine.js"
+    );
+    const loaded: string[] = [];
+    const engine = new DefaultDeltaEngine(
+      {
+        estimateDeltaQuality: () => ({ worthTrying: true }),
+        computeDelta: () => null,
+      } as never,
+      {
+        async *findCandidates() {
+          yield { id: "big", size: 101 };
+          yield { id: "small", size: 10 };
+        },
+      } as never,
+      { shouldAttemptDelta: () => true, shouldUseDelta: () => true, maxChainDepth: 50 } as never,
+      {
+        async load(id: string) {
+          loaded.push(id);
+          return new Uint8Array(1);
+        },
+        getChainDepth: async () => 0,
+      },
+    ).withConfig({ maxTargetSize: 100 });
+    await engine.findBestDelta({ id: "target", type: 3, size: 10 } as never);
+    expect(loaded).toEqual(["target", "small"]);
+  });
+});

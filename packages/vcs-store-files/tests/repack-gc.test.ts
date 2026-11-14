@@ -12,8 +12,10 @@ import {
   type GitObjects,
   joinPath,
   type ObjectId,
+  writePack,
 } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { serializeIndexFile } from "@statewalker/vcs-working-tree";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, gc, listReachableObjects, repack } from "../src/index.js";
 
@@ -188,15 +190,28 @@ describe("gc", () => {
 
   it("keeps objects reachable only from a reflog or the index", async () => {
     const b = await open();
-    const { commit: dropped } = await commit(b, "main", "a.txt", "in the reflog\n");
+    const { commit: dropped, tree, blob } = await commit(b, "main", "a.txt", "in the reflog\n");
     await b.files.mkdir(".git/logs/refs/heads");
     await b.files.write(".git/logs/refs/heads/main", [
       enc.encode(`${"0".repeat(40)} ${dropped} T <t@t> 1700000000 +0000\tcommit: a\n`),
     ]);
+    // a blob only the index records
+    const staged = await b.history.blobs.store([enc.encode("only in the index\n")]);
+    const index = await serializeIndexFile([
+      { path: "staged.txt", mode: 0o100644, objectId: staged, stage: 0, size: 18, mtime: 0 },
+    ]);
+    await b.files.write(".git/index", [index]);
+    // both packed: a repack that ignored the reflog or the index would not keep them
+    await repack(b);
+    expect(await b.looseStorage.has(dropped)).toBe(false);
+    expect(await b.looseStorage.has(staged)).toBe(false);
     await b.history.refs.remove("refs/heads/main");
     const result = await gc({ history: b.history, files: b.files, pruneExpireMs: 0 });
     expect(result.removedObjects).toBe(0);
-    expect(await b.objects.has(dropped)).toBe(true);
+    for (const id of [dropped, tree, blob, staged]) expect(await b.objects.has(id)).toBe(true);
+    // in the new pack, not loosened as unreachable
+    const [pack] = await b.packs.packs();
+    for (const id of [dropped, tree, blob, staged]) expect(pack?.has(id)).toBe(true);
   });
 });
 
@@ -296,4 +311,282 @@ describe("repack memory is bounded", () => {
     expect(largest).toBeLessThan(4 * 2 ** 20);
     expect((await bytes(b.objects, blob))?.data.length).toBe(SIZE * 2);
   }, 120_000);
+});
+
+/** `target` with `override` in place of some of its properties (methods bound to `target`). */
+function overlay<T extends object>(target: T, override: Partial<T>): T {
+  return new Proxy(target, {
+    get(t, k) {
+      if (k in override) return (override as Record<PropertyKey, unknown>)[k];
+      const v = Reflect.get(t, k);
+      return typeof v === "function" ? v.bind(t) : v;
+    },
+  });
+}
+
+describe("P2.6 review: a pack installed during the reachability walk", () => {
+  /**
+   * The backend's history, with refs whose listing installs a pack (a push from another
+   * process: the pack lands first, its ref later) once the refs are read.
+   */
+  async function pushDuringWalk(b: Backend) {
+    const pushed: { blob?: ObjectId; packId?: string } = {};
+    const refs = b.history.refs;
+    const list = async function* (prefix?: string) {
+      for await (const r of refs.list(prefix)) yield r;
+      if (pushed.blob) return;
+      const other = await open(b.files, false);
+      const blob = await other.history.blobs.store([enc.encode("pushed meanwhile\n")]);
+      const installed = await other.packs.install(
+        writePack(other.objects, [{ id: blob, type: "blob" }]),
+      );
+      await other.looseStorage.remove(blob);
+      pushed.blob = blob;
+      pushed.packId = installed.packId;
+    };
+    const history = overlay(b.history, { refs: overlay(refs, { list }) });
+    return { history, pushed };
+  }
+
+  async function setUp() {
+    const b = await open();
+    await commit(b, "main", "a.txt", "one\n");
+    await repack({ ...b, all: false });
+    await commit(b, "main", "b.txt", "two\n");
+    return b;
+  }
+
+  it("repack keeps that pack and its objects", async () => {
+    const b = await setUp();
+    const { history, pushed } = await pushDuringWalk(b);
+    const result = await repack({ ...b, history });
+    expect(pushed.blob).toBeDefined();
+    expect(result?.packsRemoved).not.toContain(`pack-${pushed.packId}`);
+    expect(await b.files.exists(joinPath(PACK_DIR, `pack-${pushed.packId}.pack`))).toBe(true);
+    const fresh = await open(b.files, false);
+    expect(await fresh.objects.has(pushed.blob as ObjectId)).toBe(true);
+  });
+
+  it("gc keeps that pack and its objects, even with --prune=now", async () => {
+    const b = await setUp();
+    const { history, pushed } = await pushDuringWalk(b);
+    const result = await gc({ history, files: b.files, packs: b.packs, pruneExpireMs: 0 });
+    expect(pushed.blob).toBeDefined();
+    expect(result.repack?.packsRemoved).not.toContain(`pack-${pushed.packId}`);
+    const fresh = await open(b.files, false);
+    expect(await fresh.objects.has(pushed.blob as ObjectId)).toBe(true);
+  });
+});
+
+describe("P2.6 review: unreachable packed objects get the grace period (repack -A)", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  /** main and topic packed together, then topic deleted with its reflog (`git branch -D`). */
+  async function deletedBranch(files: FilesApi = createInMemoryFilesApi()) {
+    const b = await open(files);
+    const main = await commit(b, "main", "a.txt", "main\n");
+    const topic = await commit(b, "topic", "t.txt", "topic only\n");
+    await repack(b);
+    await b.history.refs.remove("refs/heads/topic");
+    if (await files.exists(".git/logs/refs/heads/topic"))
+      await files.remove(".git/logs/refs/heads/topic");
+    return { b, main, topic };
+  }
+
+  it("gc after branch -D keeps the branch's packed commits as loose objects", async () => {
+    const { b, main, topic } = await deletedBranch();
+    const result = await gc({ history: b.history, files: b.files });
+    expect(result.repack?.unpackedObjects).toBe(3);
+    for (const id of [topic.commit, topic.tree, topic.blob]) {
+      expect(await b.looseStorage.has(id)).toBe(true);
+      expect(await b.objects.has(id)).toBe(true);
+    }
+    // young loose objects: the loose prune keeps them for the grace period
+    expect(result.keptRecentObjects).toBe(3);
+    expect(await b.objects.has(main.commit)).toBe(true);
+    // the new pack holds only what is reachable
+    const [pack] = await b.packs.packs();
+    expect(pack?.has(topic.commit)).toBe(false);
+  });
+
+  it("repack drops them by default (git repack -a -d) and loosens them with unpackUnreachable", async () => {
+    const dropped = await deletedBranch();
+    await repack(dropped.b);
+    expect(await dropped.b.objects.has(dropped.topic.commit)).toBe(false);
+
+    const kept = await deletedBranch();
+    const result = await repack({ ...kept.b, unpackUnreachable: true });
+    expect(result?.unpackedObjects).toBe(3);
+    expect(await kept.b.looseStorage.has(kept.topic.commit)).toBe(true);
+  });
+
+  it("drops an unreachable object whose pack is older than the expiry", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gc-unpack-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const { b, main, topic } = await deletedBranch(files);
+    const t = new Date(Date.now() - 15 * 24 * 3600_000);
+    for (const name of await packNames(files, ".pack")) utimesSync(join(dir, PACK_DIR, name), t, t);
+    const result = await gc({ history: b.history, files });
+    expect(result.repack?.unpackedObjects).toBe(0);
+    for (const id of [topic.commit, topic.tree, topic.blob]) {
+      expect(await b.objects.has(id)).toBe(false);
+    }
+    expect(await b.objects.has(main.commit)).toBe(true);
+  });
+
+  it("loosens the unreachable objects of a pack whose mtime is unknown", async () => {
+    const { b, topic } = await deletedBranch();
+    const stats = b.files.stats.bind(b.files);
+    b.files.stats = async (path) => {
+      const s = await stats(path);
+      return s && path.endsWith(".pack") ? { ...s, lastModified: undefined } : s;
+    };
+    await gc({ history: b.history, files: b.files, pruneExpireMs: 1 });
+    b.files.stats = stats;
+    expect(await b.looseStorage.has(topic.commit)).toBe(true);
+  });
+
+  it("an object of a pack older than the freshen window is written loose again", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gc-freshen-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const b = await open(files);
+    const { blob } = await commit(b, "main", "a.txt", "old content\n");
+    await repack(b);
+    const fresh = await open(files, false);
+    // in a young pack: the write is skipped (git's freshen_packed_object)
+    await fresh.history.blobs.store([enc.encode("old content\n")]);
+    expect(await fresh.looseStorage.has(blob)).toBe(false);
+    // in a pack older than an hour: written loose, so a gc keeps it as a young object
+    const t = new Date(Date.now() - 2 * 3600_000);
+    for (const name of await packNames(files, ".pack")) utimesSync(join(dir, PACK_DIR, name), t, t);
+    const later = await open(files, false);
+    await later.history.blobs.store([enc.encode("old content\n")]);
+    expect(await later.looseStorage.has(blob)).toBe(true);
+  });
+});
+
+describe("P2.6 review: linked worktrees are roots", () => {
+  it("keeps a worktree's detached HEAD commits, its reflog's and its index's objects", async () => {
+    const b = await open();
+    await commit(b, "main", "a.txt", "main\n");
+    // commits no ref holds: one on a worktree's detached HEAD, one in a worktree's reflog
+    const detached = await commit(b, "tmp1", "d.txt", "detached head\n");
+    const logged = await commit(b, "tmp2", "l.txt", "worktree reflog\n");
+    for (const n of ["tmp1", "tmp2"]) await b.history.refs.remove(`refs/heads/${n}`);
+    const staged = await b.history.blobs.store([enc.encode("staged in a worktree\n")]);
+    await b.files.mkdir(".git/worktrees/wt/logs");
+    await b.files.write(".git/worktrees/wt/HEAD", [enc.encode(`${detached.commit}\n`)]);
+    await b.files.write(".git/worktrees/wt/index", [
+      await serializeIndexFile([
+        { path: "s.txt", mode: 0o100644, objectId: staged, stage: 0, size: 21, mtime: 0 },
+      ]),
+    ]);
+    await b.files.mkdir(".git/worktrees/other/logs");
+    await b.files.write(".git/worktrees/other/HEAD", [enc.encode("ref: refs/heads/main\n")]);
+    await b.files.write(".git/worktrees/other/logs/HEAD", [
+      enc.encode(`${"0".repeat(40)} ${logged.commit} T <t@t> 1700000000 +0000\tcheckout\n`),
+    ]);
+
+    await gc({ history: b.history, files: b.files, pruneExpireMs: 0 });
+
+    const keep = [
+      detached.commit,
+      detached.tree,
+      detached.blob,
+      logged.commit,
+      logged.blob,
+      staged,
+    ];
+    for (const id of keep) expect(await b.objects.has(id)).toBe(true);
+  });
+});
+
+describe("P2.6 review: an unreadable ref aborts gc and repack", () => {
+  async function withBrokenRef() {
+    const b = await open();
+    await commit(b, "main", "a.txt", "main\n");
+    await repack({ ...b, all: false });
+    const other = await commit(b, "broken", "x.txt", "only the broken ref holds this\n");
+    await repack({ ...b, all: false });
+    const state = async () => ({
+      packs: await packNames(b.files, ".pack"),
+      has: await Promise.all([other.commit, other.tree, other.blob].map((id) => b.objects.has(id))),
+    });
+    return { b, other, before: await state(), state };
+  }
+
+  it("a read failure on one ref makes gc fail before anything is removed", async () => {
+    const { b, before, state } = await withBrokenRef();
+    const read = b.files.read.bind(b.files);
+    b.files.read = (path, options) => {
+      if (path.endsWith("refs/heads/broken")) throw new Error("EIO: refs/heads/broken");
+      return read(path, options);
+    };
+    await expect(gc({ history: b.history, files: b.files, pruneExpireMs: 0 })).rejects.toThrow(
+      /broken/,
+    );
+    await expect(repack(b)).rejects.toThrow(/broken/);
+    b.files.read = read;
+    expect(await state()).toEqual(before);
+    expect(before.has).toEqual([true, true, true]);
+  });
+
+  it("a malformed ref makes gc fail before anything is removed", async () => {
+    const { b, before, state } = await withBrokenRef();
+    await b.files.write(".git/refs/heads/bad", [enc.encode("not an id\n")]);
+    await expect(gc({ history: b.history, files: b.files, pruneExpireMs: 0 })).rejects.toThrow(
+      /bad/,
+    );
+    expect(await state()).toEqual(before);
+  });
+});
+
+describe("P2.6 review: orphaned packs and the gc lock", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("removes a .pack whose .idx is gone once it is older than the grace period", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gc-orphan-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const b = await open(files);
+    await commit(b, "main", "a.txt", "main\n");
+    const oldOrphan = joinPath(PACK_DIR, `pack-${"a".repeat(40)}.pack`);
+    const youngOrphan = joinPath(PACK_DIR, `pack-${"b".repeat(40)}.pack`);
+    await files.mkdir(PACK_DIR);
+    await files.write(oldOrphan, [enc.encode("PACK half removed")]);
+    await files.write(youngOrphan, [enc.encode("PACK being installed")]);
+    const t = new Date(Date.now() - 15 * 24 * 3600_000);
+    utimesSync(join(dir, oldOrphan), t, t);
+
+    await gc({ history: b.history, files });
+
+    expect(await files.exists(oldOrphan)).toBe(false);
+    expect(await files.exists(youngOrphan)).toBe(true);
+  });
+
+  it("a second gc is skipped while one holds gc.pid, and the lock is released", async () => {
+    const b = await open();
+    await commit(b, "main", "a.txt", "main\n");
+    await b.files.write(".git/gc.pid", [enc.encode("12345 elsewhere\n")]);
+    const skipped = await gc({ history: b.history, files: b.files });
+    expect(skipped.skipped).toBe(true);
+    expect(skipped.repack).toBeNull();
+    expect(await packNames(b.files, ".pack")).toEqual([]);
+    await b.files.remove(".git/gc.pid");
+
+    const [one, two] = await Promise.all([
+      gc({ history: b.history, files: b.files }),
+      gc({ history: b.history, files: b.files }),
+    ]);
+    expect([one.skipped, two.skipped].sort()).toEqual([false, true]);
+    expect(await b.files.exists(".git/gc.pid")).toBe(false);
+  });
 });

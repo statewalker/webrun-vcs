@@ -830,7 +830,7 @@ interface GCScheduleOptions {
   maxChainDepth?: number;       // Default: 50
   minInterval?: number;         // Default: 60000ms
   quickPackThreshold?: number;  // Default: 5
-  maxDeltaBlobSize?: number;    // Default: 16 MiB; larger blobs are never deltified
+  maxDeltaBlobSize?: number;    // Default: 16 MiB; larger blobs are never deltified, nor used as bases
 }
 ```
 

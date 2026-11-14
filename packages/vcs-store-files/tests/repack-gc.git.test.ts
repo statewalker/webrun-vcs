@@ -162,3 +162,33 @@ describe("repack and gc against native git", () => {
     expect(allObjects(dir)).toEqual(objects);
   });
 });
+
+describe("P2.6 review: linked worktrees against native git", () => {
+  it("keeps commits on a worktree's detached HEAD and blobs staged only in its index", async () => {
+    const dir = repo(2);
+    const wt = mkdtempSync(join(tmpdir(), "repack-gc-wt-"));
+    dirs.push(wt);
+    git(dir, ["worktree", "add", "-q", "--detach", wt]);
+    writeFileSync(join(wt, "detached.txt"), "on a detached HEAD\n");
+    git(wt, ["add", "detached.txt"]);
+    git(wt, ["commit", "-q", "-m", "detached"]);
+    const detached = git(wt, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(wt, "staged.txt"), "staged in the worktree only\n");
+    git(wt, ["add", "staged.txt"]);
+    const staged = git(wt, ["rev-parse", ":staged.txt"]).trim();
+    // the worktree's reflog names the commit too: drop it, so its HEAD alone keeps it
+    const admin = git(wt, ["rev-parse", "--git-dir"]).trim();
+    rmSync(join(admin, "logs"), { recursive: true, force: true });
+    // packed first: gc then decides whether to keep it in the new pack
+    const b = await backend(dir);
+    await repack({ ...b, unpackUnreachable: false });
+
+    await gc({ history: b.history, files: b.files, pruneExpireMs: 0 });
+
+    git(wt, ["cat-file", "-e", detached]);
+    git(wt, ["cat-file", "-e", staged]);
+    git(wt, ["cat-file", "-e", `${detached}^{tree}`]);
+    expectValid(dir);
+    git(wt, ["fsck", "--full", "--strict", "--no-progress"]);
+  });
+});

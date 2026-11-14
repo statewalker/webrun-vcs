@@ -33,8 +33,11 @@ export interface GCScheduleOptions {
   /** Number of pending blobs before quick pack */
   quickPackThreshold?: number;
   /**
-   * Blobs larger than this are never deltified: computing a delta holds the target and its
-   * candidates whole. Default 16 MiB (writePack's limit for its delta window).
+   * Blobs larger than this are never deltified, and a delta whose base is larger than this is
+   * not stored: computing a delta holds the target and its base whole. Default 16 MiB
+   * (writePack's limit for its delta window). The controller can only refuse a delta the engine
+   * returns; `DefaultDeltaEngine` skips such bases before loading them (its `maxTargetSize`,
+   * also 16 MiB by default, caps bases as well as targets).
    */
   maxDeltaBlobSize?: number;
 }
@@ -153,7 +156,7 @@ export class GCController {
         };
 
         const result = await deltaEngine.findBestDelta(target);
-        if (result) {
+        if (result && (await this.baseWithinCap(result))) {
           await this.storeDeltaResult(blobId, result);
           total++;
         }
@@ -325,7 +328,7 @@ export class GCController {
           };
 
           const result = await deltaEngine.findBestDelta(target);
-          if (result) {
+          if (result && (await this.baseWithinCap(result))) {
             await this.storeDeltaResult(id, result);
             deltasCreated++;
             spaceSaved += result.savings;
@@ -368,6 +371,11 @@ export class GCController {
    * Converts BestDeltaResult.delta (Uint8Array) to AsyncIterable
    * as expected by BlobDeltaApi.deltifyBlob.
    */
+  /** Whether the delta's base is within `maxDeltaBlobSize` (bases over the cap are skipped). */
+  private async baseWithinCap(result: BestDeltaResult): Promise<boolean> {
+    return (await this.history.blobs.size(result.baseId)) <= this.options.maxDeltaBlobSize;
+  }
+
   private async storeDeltaResult(targetId: ObjectId, result: BestDeltaResult): Promise<void> {
     const deltaStream = toAsyncIterable(result.delta);
     await this.history.delta.blobs.deltifyBlob(targetId, result.baseId, deltaStream);

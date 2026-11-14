@@ -1,11 +1,18 @@
 /**
- * What repack and gc keep: the objects reachable from every ref, HEAD, the reflogs and the
- * index, as `git repack -a` (`--all --reflog --indexed-objects`) and `git prune` walk them.
+ * What repack and gc keep: the objects reachable from every ref, HEAD, the reflogs, the index
+ * and every linked worktree (its HEAD, index and reflogs), as `git repack -a` (`--all --reflog
+ * --indexed-objects`) and `git prune` walk them.
+ *
+ * Not read: the trees of the index's cache-tree (TREE) extension, which git also counts as
+ * roots. The index parser does not expose that extension; a tree only it names may be pruned,
+ * and git then rebuilds that part of the cache-tree (it checks each tree exists before use).
  */
 
 import type { FilesApi, GitObjects, ListedObject, ObjectId, Refs } from "@statewalker/vcs-core";
-import { joinPath, listObjects } from "@statewalker/vcs-core";
+import { isSymbolicRef, joinPath, listObjects } from "@statewalker/vcs-core";
 import { parseIndexFile } from "@statewalker/vcs-working-tree";
+
+import { readAllRefs } from "./refs/index.js";
 
 const OID = /^[0-9a-f]{40}$/;
 const ZERO = "0".repeat(40);
@@ -25,8 +32,14 @@ export interface ReachabilityRoots {
 
 /**
  * The roots of reachability: every ref, HEAD, the old and new ids of every reflog entry
- * (`logs/HEAD`, `logs/refs/...`) and the entries of the index (gitlinks excepted). Roots the
- * store does not have are left out (a reflog may name objects pruned long ago).
+ * (`logs/HEAD`, `logs/refs/...`), the entries of the index (gitlinks excepted), and for each
+ * linked worktree (`worktrees/<name>/`) its HEAD (detached or symbolic), index and reflogs, as
+ * git's `other_head_refs` and its worktree index and reflog walks. Roots the store does not
+ * have are left out (a reflog may name objects pruned long ago).
+ *
+ * Refs are listed strictly from the files: a ref that cannot be read or is malformed throws,
+ * as does an unreadable reflog, index or worktree HEAD. A root skipped silently would let gc
+ * and repack delete what it holds, so they abort instead, as `git gc` does.
  *
  * @example
  * ```typescript
@@ -38,6 +51,20 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
   const gitDir = roots.gitDir ?? ".git";
   const tips = new Set<ObjectId>();
 
+  // The refs on storage, strictly: a ref that cannot be read throws instead of being skipped
+  const stored = await readAllRefs(files, gitDir, "", { strict: true });
+  const byName = new Map(stored.map((r) => [r.name, r]));
+  const resolveStored = (name: string): ObjectId | undefined => {
+    let ref = byName.get(name);
+    for (let depth = 0; ref && isSymbolicRef(ref) && depth < 5; depth++)
+      ref = byName.get(ref.target);
+    return ref && !isSymbolicRef(ref) ? ref.objectId : undefined;
+  };
+  for (const ref of stored) {
+    const id = resolveStored(ref.name);
+    if (id) tips.add(id);
+  }
+  // and through the Refs API too (a store that keeps refs elsewhere)
   for await (const ref of refs.list()) {
     const resolved = await refs.resolve(ref.name);
     if (resolved?.objectId) tips.add(resolved.objectId);
@@ -48,9 +75,37 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
   for (const id of await reflogIds(files, joinPath(gitDir, "logs"))) tips.add(id);
   for (const id of await indexIds(files, joinPath(gitDir, "index"))) tips.add(id);
 
+  // Linked worktrees: their HEAD, index and reflogs live under worktrees/<name>/
+  const worktrees = joinPath(gitDir, "worktrees");
+  if ((await files.stats(worktrees))?.kind === "directory") {
+    for await (const wt of files.list(worktrees)) {
+      if (wt.kind !== "directory") continue;
+      const id = await worktreeHead(files, joinPath(wt.path, "HEAD"), async (target) => {
+        return resolveStored(target) ?? (await refs.resolve(target))?.objectId;
+      });
+      if (id) tips.add(id);
+      for (const id of await reflogIds(files, joinPath(wt.path, "logs"))) tips.add(id);
+      for (const id of await indexIds(files, joinPath(wt.path, "index"))) tips.add(id);
+    }
+  }
+
   const present: ObjectId[] = [];
   for (const id of tips) if (await objects.has(id)) present.push(id);
   return present;
+}
+
+/** A worktree's HEAD: a detached object id, or `ref: <name>` resolved through `resolve`. */
+async function worktreeHead(
+  files: FilesApi,
+  path: string,
+  resolve: (name: string) => Promise<ObjectId | undefined>,
+): Promise<ObjectId | undefined> {
+  const text = (await readText(files, path))?.trim();
+  if (!text) return undefined;
+  if (text.startsWith("ref:")) return resolve(text.slice(4).trim());
+  const id = text.slice(0, 40).toLowerCase();
+  if (!OID.test(id)) throw new Error(`Invalid worktree HEAD ${path}: ${text.slice(0, 60)}`);
+  return id;
 }
 
 /**
