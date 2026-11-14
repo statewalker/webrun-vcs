@@ -47,7 +47,7 @@ Lower-level building blocks, also exported:
 | --- | --- |
 | Object kernel store | `filesStagingStore(files, objectsDir, { freshenMaxAgeMs? })`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename (a write over a loose file older than an hour renews it); `spool(content)` writes content of unknown size to a `tmp_obj_*` file so `putUnsized` can hash it in a second pass without holding it; `isFresh(id)` says whether a loose object exists and needs no freshening; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packs)`: a `GitObjects` that reads the packs of a `PackSet` (`openPackSet` from `@statewalker/vcs-core`) first, then loose objects; `skipPacked(store, packs)`: a staging store that does not write objects already packed (in a pack still on storage, in a copy not found corrupt) |
 | Loose objects | `FileRawStorage` (`compress` option, default `true`); `prunePacked(looseStorage, packs)` removes loose copies of packed objects (`git prune-packed`) |
-| Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs? })` with atomic `batch`; `createFilesRefBatch(atomicFiles)`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
+| Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs? })` with atomic `batch` and locked `packRefs`; `createFilesRefBatch(atomicFiles)`, `createFilesRefOps(atomicFiles)` (`batch`, `packRefs`, `updatePackedRefs`), `PackedRefsLockedError`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
 | Working copy | `GitWorkingCopy`, `GitWorkingCopyFactory` / `createGitWorkingCopyFactory`, `GitWorkingCopyConfig` / `createWorkingCopyConfig` (reads and writes `.git/config`), `GitCheckout` / `createGitCheckout`, `GitStashStore` / `createGitStashStore` (`refs/stash`) |
 | Operation state | `GitTransformationStore` / `createTransformationStore(files, gitDir)`, the merge/rebase/cherry-pick/revert/sequencer stores, `GitResolutionStore`, `detectRepositoryState(files, gitDir, hasConflicts)` and `readMergeState` / `readRebaseState` / `readCherryPickState` / `readRevertState` |
 
@@ -202,6 +202,24 @@ records the delete. Two differences from git remain: a multi-ref batch that repl
 repositories are logged like non-bare ones. Readers skip `*.lock` files and re-read loose refs
 around `packed-refs`, so a listing never combines states of a batch committing meanwhile.
 
+Every other rewrite of `packed-refs` follows the same protocol. `packRefs` (and `optimize`, and
+gc, which calls it) works as git's `pack-refs` and JGit's `RefDirectory.pack`:
+
+```typescript
+await refs.packRefs([], { all: true }); // git pack-refs --all
+```
+
+It takes `packed-refs.lock` (retrying for `packedLockTimeoutMs`, git's `core.packedRefsTimeout`,
+1000 ms, then throwing `PackedRefsLockedError` without changing anything), re-reads `packed-refs`
+and the loose refs under the lock, writes the new content into the lock and renames it over
+`packed-refs`. Only then does it remove the loose refs it packed, each under its own `.lock` and
+only if it still holds the packed value: a ref updated in between stays loose with its new value.
+Symbolic and broken loose refs are left alone. `writePackedRefs`, `addPackedRef`, `removePackedRef`
+and `FileRefStore.remove` rewrite `packed-refs` under the same lock (`createFilesRefOps` exposes it
+as `updatePackedRefs`), so they never write back content read before a concurrent batch, or a
+native `git pack-refs` / `git update-ref -d`, committed. Native `git` sees the lock and waits or
+fails in turn.
+
 ## Internals
 
 ### The storage stack
@@ -342,10 +360,13 @@ reports what it would prune.
   `[includeIf]` are not followed, a malformed section header is kept but ignored where `git`
   would reject the file, and `save()` rewrites the whole file without a `config.lock`.
 - Ref batches and `compareAndSwap` use `.lock` files and rename, exclusive across processes when
-  the FilesApi has `createExclusive`, and otherwise only among writers sharing one FilesApi. `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
-  `packed-refs` without `packed-refs.lock` and can lose a concurrent batch), loose objects and the
-  index are still written directly, without locks: do not run them next to a batch or a `git`
-  process writing the same repository.
+  the FilesApi has `createExclusive`, and otherwise only among writers sharing one FilesApi.
+  Every rewrite of `packed-refs` (batches, `packRefs` / `optimize` and so gc, `remove`, and the
+  functions `writePackedRefs`, `addPackedRef`, `removePackedRef`, `packRefs`) takes
+  `packed-refs.lock` the same way, so none of them loses a concurrent batch or a native
+  `git pack-refs` / `git update-ref -d`. `set`, `setSymbolic`, the loose file `remove` deletes,
+  loose objects and the index are still written directly, without locks: do not run them next to
+  a batch or a `git` process writing the same repository.
 
 ### What will surprise you
 
