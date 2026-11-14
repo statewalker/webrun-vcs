@@ -17,17 +17,17 @@ import type {
   RefUpdateResult,
   SymbolicRef,
 } from "@statewalker/vcs-core";
+import { isUpdatableRefName, SYMREF_PREFIX } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 
 import {
   createFilesRefOps,
   type FilesRefBatchOptions,
   type FilesRefOps,
+  RefUpdateRejectedError,
 } from "./files-ref-batch.js";
-import { parsePackedRefs } from "./packed-refs-reader.js";
-import { formatPackedRefs } from "./packed-refs-writer.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
-import { createRefsStructure, deleteRef, writeObjectRef, writeSymbolicRef } from "./ref-writer.js";
+import { createRefsStructure } from "./ref-writer.js";
 import { createReflogReader } from "./reflog-reader.js";
 import { hasReflog } from "./reflog-writer.js";
 
@@ -103,38 +103,36 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Set a ref to point to an object ID
+   * Set a ref to point to an object ID, replacing a symbolic ref of that name (git
+   * `update-ref --no-deref`). A one-command batch without an old-value check: under
+   * `<ref>.lock`, with D/F checks and reflog lines. Names outside `refs/` other than HEAD
+   * (`ORIG_HEAD`) are written under their lock without a reflog. Throws
+   * `RefUpdateRejectedError` (`code` "ELOCKED" when the lock stays held past
+   * `refLockTimeoutMs`) with the ref unchanged.
    */
   async set(refName: string, objectId: ObjectId): Promise<void> {
-    await writeObjectRef(this.files, this.gitDir, refName, objectId);
+    if (!isUpdatableRefName(refName)) return this.ops.writeLoose(refName, `${objectId}\n`);
+    const r = await this.ops.batch([{ name: refName, new: objectId, noDeref: true }]);
+    if (!r.ok) throw new RefUpdateRejectedError(r.rejected);
   }
 
   /**
-   * Set a symbolic ref
+   * Set a symbolic ref: `ref: <target>` written into `<ref>.lock` and renamed over the
+   * ref. Throws `RefUpdateRejectedError` with the ref unchanged when the lock stays held
+   * or on a D/F conflict.
    */
   async setSymbolic(refName: string, target: string): Promise<void> {
-    await writeSymbolicRef(this.files, this.gitDir, refName, target);
+    await this.ops.writeLoose(refName, `${SYMREF_PREFIX}${target}\n`);
   }
 
   /**
-   * Remove a ref (loose and packed). packed-refs is rewritten first, under its lock
-   * (throwing `PackedRefsLockedError` with nothing changed if it stays held), then the
-   * loose file is removed, as git does; the loose file is removed without a ref lock
-   * (prefer `batch` next to other writers).
+   * Remove a ref (loose and packed) and its reflog, as a batch delete does: under
+   * `<ref>.lock`, then in one pass under `packed-refs.lock`, packed-refs is rewritten and
+   * the loose file removed before the lock is released. Throws `RefUpdateRejectedError`
+   * or `PackedRefsLockedError` with nothing changed when a lock stays held.
    */
   async remove(refName: string): Promise<boolean> {
-    // A ref may be loose, packed, or both (a loose ref shadows its packed copy).
-    let packed = false;
-    await this.ops.updatePackedRefs((text) => {
-      if (text === undefined) return undefined;
-      const { refs, peeled } = parsePackedRefs(text);
-      const rest = refs.filter((r) => r.name !== refName);
-      if (rest.length === refs.length) return undefined;
-      packed = true;
-      return rest.length ? new TextEncoder().encode(formatPackedRefs(rest, peeled)) : null;
-    });
-    const loose = await deleteRef(this.files, this.gitDir, refName);
-    return loose || packed;
+    return this.ops.removeRef(refName);
   }
 
   /**
