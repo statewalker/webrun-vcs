@@ -538,3 +538,40 @@ describe("a packed-refs commit keeps packed-refs.lock until the caller is done",
     expect(await files.exists("/.git/packed-refs.new")).toBe(false);
   });
 });
+
+describe("a failed write of packed-refs.new", () => {
+  /** A view of `base` whose write of `path` lands half the bytes, then fails (ENOSPC). */
+  function failingWrite(base: FilesApi, path: string): FilesApi {
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === "write") {
+          return async (p: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>) => {
+            if (p !== path) return target.write(p, content);
+            const chunks: Uint8Array[] = [];
+            for await (const c of content) chunks.push(c);
+            const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+            let at = 0;
+            for (const c of chunks) {
+              all.set(c, at);
+              at += c.length;
+            }
+            await target.write(p, [all.subarray(0, Math.floor(all.length / 2))]);
+            throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  }
+
+  it("leaves no partial packed-refs.new behind", async () => {
+    const files = await repo();
+    await new FileRefStore(files, "/.git").batch([{ name: "refs/heads/a", new: oid(1) }]);
+    const refs = new FileRefStore(failingWrite(files, "/.git/packed-refs.new"), "/.git");
+    await expect(refs.packRefs([], { all: true })).rejects.toThrow(/ENOSPC/);
+    expect(await files.exists("/.git/packed-refs.new")).toBe(false);
+    expect(await files.exists(LOCK)).toBe(false);
+    expect(await text(files, "/.git/refs/heads/a")).toBe(`${oid(1)}\n`);
+  });
+});

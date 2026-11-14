@@ -53,6 +53,19 @@ export interface FilesRefBatchOptions {
   refLockTimeoutMs?: number;
   /** Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms). */
   packedLockTimeoutMs?: number;
+  /**
+   * Which refs get a new reflog (git: core.logAllRefUpdates). `true` (the default here,
+   * and git's for a non-bare repository): HEAD, refs/heads/, refs/remotes/ and refs/notes/;
+   * `"always"`: every ref; `false` (git's default for a bare repository): none. An
+   * existing reflog is appended to whatever the setting. `createGitFilesBackend` reads
+   * it from the repository's config.
+   */
+  logAllRefUpdates?: boolean | "always";
+  /**
+   * The name and email of reflog lines when a batch passes no `ident` (git: user.name,
+   * user.email). Defaults to `webrun-vcs <vcs@localhost>`.
+   */
+  reflogIdentity?: { name: string; email: string };
 }
 
 interface PackedEntry {
@@ -65,7 +78,7 @@ type Loose = { id: string } | { target: string };
 /** A planned update with the command's expected old value and its noDeref flag. */
 type Update = PlannedRefUpdate & { old: ObjectId | null | undefined; noDeref: boolean };
 
-/** Refs git logs even without an existing reflog (core.logAllRefUpdates=true, non-bare). */
+/** Refs git logs even without an existing reflog with core.logAllRefUpdates=true. */
 const LOGGED_BY_DEFAULT = ["refs/heads/", "refs/remotes/", "refs/notes/"];
 
 /** Errors meaning "a file is where a directory must be" (refs/x is a ref, so refs/x/y.lock cannot exist). */
@@ -177,7 +190,7 @@ export interface FilesRefOps {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const defaultIdent = () => `webrun-vcs <vcs@localhost> ${Math.floor(Date.now() / 1000)} +0000`;
+const DEFAULT_IDENTITY = { name: "webrun-vcs", email: "vcs@localhost" };
 /** git's reflog message: whitespace runs collapsed to one space, trimmed (refs.c copy_reflog_msg). */
 const normalizeMessage = (m: string | undefined) => (m ?? "").replace(/\s+/g, " ").trim();
 const fail = (rejected: RefRejection[]): BatchResult => ({ ok: false, rejected });
@@ -215,6 +228,12 @@ export function createFilesRefOps(
 ): FilesRefOps {
   const refLockTimeout = options.refLockTimeoutMs ?? 100;
   const packedLockTimeout = options.packedLockTimeoutMs ?? 1000;
+  const logAll = options.logAllRefUpdates ?? true;
+  const identity = options.reflogIdentity ?? DEFAULT_IDENTITY;
+  /** git's should_autocreate_reflog (refs/files-backend.c). */
+  const autocreateReflog = (name: string) =>
+    logAll === "always" ||
+    (logAll === true && (name === "HEAD" || LOGGED_BY_DEFAULT.some((p) => name.startsWith(p))));
 
   /** File text, or undefined if absent (also when it vanishes between the check and the read). */
   async function readText(path: string): Promise<string | undefined> {
@@ -304,8 +323,9 @@ export function createFilesRefOps(
       await files.remove(PACKED);
       return;
     }
-    await files.write(PACKED_NEW, content); // overwrites a stale one: we hold the lock
     try {
+      // Inside the try: a write that fails partway leaves no partial packed-refs.new.
+      await files.write(PACKED_NEW, content); // overwrites a stale one: we hold the lock
       await files.replace(PACKED_NEW, PACKED);
     } catch (e) {
       await files.remove(PACKED_NEW).catch(() => false);
@@ -350,8 +370,8 @@ export function createFilesRefOps(
   }
   /**
    * Reflog lines in git's format, after the decision (best effort, as git and JGit).
-   * As git with core.logAllRefUpdates=true: a log is created for HEAD,
-   * refs/heads/, refs/remotes/ and refs/notes/, and appended to when it exists.
+   * As git: a log is created as `logAllRefUpdates` says (`autocreateReflog`), and
+   * appended to whenever it exists.
    * The updated ref gets no line for a no-op and loses its log on delete; the
    * refs that record the update too (`reflogAlso`, HEAD among them) always get one.
    */
@@ -360,12 +380,12 @@ export function createFilesRefOps(
     current: (u: Update) => ObjectId | undefined,
     o: BatchOptions,
   ): Promise<void> {
-    const ident = o.ident ?? defaultIdent();
+    const ident =
+      o.ident ?? `${identity.name} <${identity.email}> ${Math.floor(Date.now() / 1000)} +0000`;
     const message = normalizeMessage(o.message);
     const append = async (name: string, line: Uint8Array) => {
       const path = `logs/${name}`;
-      const create = name === "HEAD" || LOGGED_BY_DEFAULT.some((p) => name.startsWith(p));
-      if (!create && !(await files.exists(path))) return;
+      if (!autocreateReflog(name) && !(await files.exists(path))) return;
       await files.removeEmptyDir(path);
       await files.append(path, line);
     };
