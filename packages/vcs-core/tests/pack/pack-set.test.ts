@@ -8,7 +8,7 @@ import { compressBlockPako } from "@statewalker/vcs-utils/compression";
 import { crc32 } from "@statewalker/vcs-utils/hash/crc32";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createInMemoryFilesApi, type FilesApi } from "../../src/common/files/index.js";
 import { ObjectIdMismatchError } from "../../src/history/objects/git-objects.js";
 import {
@@ -1196,14 +1196,16 @@ describe("re-review of P2.3: removals and installs racing scans", () => {
     const files = createInMemoryFilesApi();
     const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
     const r = await install(files, [{ kind: 3, data: A }]);
-    // the scan is held inside its open; remove() is held before it deletes anything, so the
-    // open succeeds and only the check after it can drop the pack
-    const opening = holdFirst((p) => p === paths(r.packId).pack);
-    const stats = files.stats.bind(files);
-    files.stats = async (path) => {
-      await opening.maybeHold(path);
-      return stats(path);
-    };
+    // the scan is held inside openPack, reading the idx (after the signature); remove() is held
+    // before it deletes anything, so the open succeeds and only the check after it can drop the
+    // pack (the scan began before remove(), so this is the removed-since-scan check)
+    const opening = holdFirst((p) => p === paths(r.packId).idx);
+    const read = files.read.bind(files);
+    files.read = (path, o) =>
+      (async function* () {
+        await opening.maybeHold(path);
+        yield* read(path, o);
+      })();
     const deleting = holdFirst((p) => p === paths(r.packId).idx);
     const remove = files.remove.bind(files);
     files.remove = async (path) => {
@@ -1253,5 +1255,42 @@ describe("re-review of P2.3: removals and installs racing scans", () => {
     opening.release();
     await Promise.all([installed, scan]);
     expect((await set.packs()).map((p) => p.packId)).toEqual([r.packId]);
+  });
+});
+
+describe("re-review 2 of P2.3: freshen expiry and stale skips", () => {
+  it("freshen re-checks a pack after at most a second, even with rescans turned off", async () => {
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    expect(await set.freshen(Aid)).toBe(true);
+    await files.remove(paths(r.packId).idx);
+    await files.remove(paths(r.packId).pack);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 1001);
+    try {
+      expect(await set.freshen(Aid)).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("drops a skipped entry once its pack is gone from the directory", async () => {
+    const files = createInMemoryFilesApi();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const exists = files.exists.bind(files);
+    let fail = true;
+    files.exists = async (path) => {
+      if (fail && path === paths(r.packId).pack) throw new Error("EIO");
+      return exists(path);
+    };
+    await set.refresh();
+    expect(set.skipped.map((s) => s.pack)).toEqual([`pack-${r.packId}`]);
+    fail = false;
+    await files.remove(paths(r.packId).idx);
+    await files.remove(paths(r.packId).pack);
+    await set.refresh();
+    expect(set.skipped).toEqual([]);
   });
 });

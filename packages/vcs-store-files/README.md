@@ -221,8 +221,8 @@ says which and why) and the rest of the repository stays readable.
 Writing an object that is already packed (`put` or `putRaw`) writes nothing, as git and JGit do,
 unless its pack file has been deleted behind the backend's back (by `git repack -a -d` or gc) or
 its packed copy was found corrupt: then it is written loose, so a repairing write lands. A pack
-whose file was checked less than a second ago is trusted without another check, so a pack
-deleted within that second can still cause one skipped write.
+whose file was checked less than a second ago is trusted without another check, so writes made
+within that second after the pack was deleted are skipped and not retried.
 `gc()` and `repack()` still work on `FileRawStorage` (the `looseStorage` the backend returns) and
 `PackDirectory` (also returned, until they move to `packs`), and ignore files in `objects/` that are not objects (such as git's
 `objects/ab/tmp_obj_*` while it writes).

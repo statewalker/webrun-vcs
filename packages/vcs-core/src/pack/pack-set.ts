@@ -53,8 +53,9 @@ export interface PackSet {
   /**
    * Whether a pack still on storage holds a copy not found corrupt: the check before skipping a
    * write of an object already packed (git's freshen_packed_object). A pack whose file is gone is
-   * dropped. A pack whose file was seen less than `rescanIntervalMs` ago is trusted without
-   * another check (git checks once per pack per process). No rescan: a miss only means the
+   * dropped. A pack whose file was seen less than `rescanIntervalMs` ago (at most 1 s) is trusted
+   * without another check (git checks once per pack per process): a write made in that window
+   * after the pack was deleted is skipped and not retried. No rescan: a miss only means the
    * object is written loose.
    */
   freshen(id: ObjectId): Promise<boolean>;
@@ -112,6 +113,8 @@ export async function openPackSet(
   const dir = packDir.replace(/\/+$/, "");
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
   const rescanInterval = options.rescanIntervalMs ?? 1000;
+  /** how long freshen trusts a pack it saw: capped, as a write it skips is never retried */
+  const freshenTrust = Math.min(rescanInterval, 1000);
   const baseCache = new DeltaBaseCache(options.baseCacheBytes ?? 16 * 2 ** 20);
   let packs: PackFile[] = [];
   const byName = new Map<string, PackFile>();
@@ -234,6 +237,9 @@ export async function openPackSet(
     }
     let changed = false;
     const present = new Set(found.map((f) => f.name));
+    // a skipped or refused pack whose idx is gone (removed by a concurrent gc) is forgotten
+    for (const name of refused.keys()) if (!present.has(name)) refused.delete(name);
+    for (const s of [...skipped]) if (!present.has(s.pack)) unrecord(s.pack);
     // only packs known before the listing: one installed meanwhile is not in it
     for (const p of before) {
       if (!present.has(nameOf(p)) && packs.includes(p)) {
@@ -437,7 +443,7 @@ export async function openPackSet(
       for (const p of [...packs]) {
         if (!holds(p, id)) continue;
         const seen = seenAt.get(p);
-        if (seen !== undefined && Date.now() - seen < rescanInterval) return true;
+        if (seen !== undefined && Date.now() - seen < freshenTrust) return true;
         if (await files.exists(p.packPath)) {
           seenAt.set(p, Date.now());
           return true;
