@@ -194,6 +194,14 @@ This is git's `rev-list --objects` piped into `pack-objects`. Pushes (`push`, `h
 
 A base is always written before its deltas, whatever the order of `ids`. A pack consumer that stops pulling stops the writer: memory stays at one chunk plus the delta window, which a test checks by streaming a lazily generated 60 MiB blob to a slow reader.
 
+`DEFAULT_BIG_FILE_THRESHOLD` (from `@statewalker/vcs-core/history`) holds that default. `probeBlob(blobs, id, { bigFileThreshold })` answers what diff, merge and blame ask before they load a blob: its size (from `Blobs.size`, an object header) and whether it is binary. A blob over the threshold is binary and is not read at all; otherwise only its first 8000 bytes are read and checked for a NUL byte, as git does.
+
+```typescript
+import { probeBlob } from "@statewalker/vcs-core";
+
+const { size, binary, big } = await probeBlob(history.blobs, id);
+```
+
 ### Receiving a pack
 
 ```typescript

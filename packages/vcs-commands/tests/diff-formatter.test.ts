@@ -3,9 +3,15 @@
  * Tests run against all storage backends (Memory, SQL).
  */
 
+import type { Blobs } from "@statewalker/vcs-core";
 import { afterEach, describe, expect, it } from "vitest";
-
-import { ChangeType, createAddEntry, createDeleteEntry, DiffFormatter } from "../src/index.js";
+import {
+  ChangeType,
+  createAddEntry,
+  createDeleteEntry,
+  createModifyEntry,
+  DiffFormatter,
+} from "../src/index.js";
 import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
 
 describe.each(backends)("DiffFormatter ($name backend)", ({ factory }) => {
@@ -311,3 +317,101 @@ describe.each(backends)("DiffFormatter with binary files ($name backend)", ({ fa
     expect(output).toContain("differ");
   });
 });
+
+/** Blobs whose `load` streams in 1 KiB pieces and counts the bytes pulled. */
+function countingBlobs(blobs: Blobs) {
+  const state = { pulled: 0 };
+  const wrapped: Blobs = Object.create(blobs);
+  wrapped.load = async (id) => {
+    const content = await blobs.load(id);
+    if (!content) return undefined;
+    return (async function* () {
+      for await (const chunk of content) {
+        for (let i = 0; i < chunk.length; i += 1024) {
+          const piece = chunk.subarray(i, i + 1024);
+          state.pulled += piece.length;
+          yield piece;
+        }
+      }
+    })();
+  };
+  return { blobs: wrapped, state };
+}
+
+describe.each(backends)(
+  "DiffFormatter big files and binary probe ($name backend)",
+  ({ factory }) => {
+    let cleanup: (() => Promise<void>) | undefined;
+
+    afterEach(async () => {
+      if (cleanup) {
+        await cleanup();
+        cleanup = undefined;
+      }
+    });
+
+    async function repo() {
+      const result = await createInitializedGitFromFactory(factory);
+      cleanup = result.cleanup;
+      return result.repository;
+    }
+
+    it("treats files over bigFileThreshold as binary and never loads them", async () => {
+      const repository = await repo();
+      const oldText = new TextEncoder().encode("old line\n".repeat(500));
+      const newText = new TextEncoder().encode("new line\n".repeat(500));
+      const oldId = await repository.blobs.store([oldText], oldText.length);
+      const newId = await repository.blobs.store([newText], newText.length);
+      const { blobs, state } = countingBlobs(repository.blobs);
+
+      const formatter = new DiffFormatter(blobs, { bigFileThreshold: 1024 });
+      const diff = await formatter.format(
+        createModifyEntry("big.txt", oldId, newId, 0o100644, 0o100644),
+      );
+
+      expect(diff.isBinary).toBe(true);
+      expect(diff.hunks).toEqual([]);
+      expect(diff.oldContent).toBeUndefined();
+      expect(diff.newContent).toBeUndefined();
+      expect(state.pulled).toBe(0);
+      expect(formatter.toString(diff)).toContain("Binary files a/big.txt and b/big.txt differ");
+    });
+
+    it("still diffs text under the threshold", async () => {
+      const repository = await repo();
+      const a = new TextEncoder().encode("one\ntwo\n");
+      const b = new TextEncoder().encode("one\nthree\n");
+      const oldId = await repository.blobs.store([a], a.length);
+      const newId = await repository.blobs.store([b], b.length);
+      const formatter = new DiffFormatter(repository.blobs, { bigFileThreshold: 1024 });
+      const diff = await formatter.format(
+        createModifyEntry("t.txt", oldId, newId, 0o100644, 0o100644),
+      );
+      expect(diff.isBinary).toBe(false);
+      expect(diff.hunks[0]?.lines).toEqual([" one", "-two", "+three"]);
+    });
+
+    it("detects binary from the first 8000 bytes without loading the rest", async () => {
+      const repository = await repo();
+      const data = new Uint8Array(200_000).fill(0x61);
+      data[10] = 0;
+      const id = await repository.blobs.store([data], data.length);
+      const { blobs, state } = countingBlobs(repository.blobs);
+      const formatter = new DiffFormatter(blobs);
+      const diff = await formatter.format(createAddEntry("blob.bin", id, 0o100644));
+      expect(diff.isBinary).toBe(true);
+      expect(state.pulled).toBeLessThanOrEqual(8192);
+    });
+
+    it("calls text with a NUL only past the first 8000 bytes text, as git does", async () => {
+      const repository = await repo();
+      const data = new TextEncoder().encode("line\n".repeat(4000));
+      data[19_000] = 0;
+      const id = await repository.blobs.store([data], data.length);
+      const diff = await new DiffFormatter(repository.blobs).format(
+        createAddEntry("late-nul.txt", id, 0o100644),
+      );
+      expect(diff.isBinary).toBe(false);
+    });
+  },
+);

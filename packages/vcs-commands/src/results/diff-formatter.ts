@@ -4,7 +4,12 @@
  * Based on JGit's DiffFormatter class.
  */
 
-import type { Blobs, ObjectId } from "@statewalker/vcs-core";
+import {
+  type Blobs,
+  DEFAULT_BIG_FILE_THRESHOLD,
+  type ObjectId,
+  probeBlob,
+} from "@statewalker/vcs-core";
 import {
   DEFAULT_ALGORITHM,
   type DiffAlgorithm,
@@ -31,6 +36,11 @@ export interface DiffFormatterOptions {
   abbreviationLength?: number;
   /** Diff algorithm to use (default: histogram) */
   algorithm?: SupportedAlgorithm;
+  /**
+   * Files larger than this are binary: they show as "Binary files differ" and are
+   * never loaded (git's `core.bigFileThreshold`). Default 50 MiB.
+   */
+  bigFileThreshold?: number;
 }
 
 /**
@@ -67,9 +77,9 @@ export interface FileContentDiff {
   indexLine?: string;
   /** Hunks of changes */
   hunks: DiffHunk[];
-  /** Raw old content (for binary display or further processing) */
+  /** Raw old content of a text file (binary files are not loaded) */
   oldContent?: Uint8Array;
-  /** Raw new content (for binary display or further processing) */
+  /** Raw new content of a text file (binary files are not loaded) */
   newContent?: Uint8Array;
 }
 
@@ -96,6 +106,7 @@ export class DiffFormatter {
   private abbreviateIds: boolean;
   private abbreviationLength: number;
   private diffAlgorithm: DiffAlgorithm;
+  private bigFileThreshold: number;
 
   constructor(
     private readonly blobs: Blobs,
@@ -106,23 +117,30 @@ export class DiffFormatter {
     this.abbreviateIds = options.abbreviateIds ?? true;
     this.abbreviationLength = options.abbreviationLength ?? 7;
     this.diffAlgorithm = getAlgorithm(options.algorithm ?? DEFAULT_ALGORITHM);
+    this.bigFileThreshold = options.bigFileThreshold ?? DEFAULT_BIG_FILE_THRESHOLD;
   }
 
   /**
    * Format a DiffEntry into a content diff.
    *
+   * Each side is probed first (its size, and a NUL byte in its first 8000
+   * bytes, as git checks). A side over `bigFileThreshold` or binary makes the
+   * entry binary, and then neither side is loaded. Text sides are loaded whole,
+   * as the diff algorithms need them.
+   *
    * @param entry The diff entry to format
    * @returns Content diff with hunks
    */
   async format(entry: DiffEntry): Promise<FileContentDiff> {
-    // Load content for old and new
-    const oldContent = entry.oldId ? await this.loadContent(entry.oldId) : null;
-    const newContent = entry.newId ? await this.loadContent(entry.newId) : null;
+    const options = { bigFileThreshold: this.bigFileThreshold };
+    const oldProbe = entry.oldId ? await probeBlob(this.blobs, entry.oldId, options) : null;
+    const newProbe =
+      !oldProbe?.binary && entry.newId ? await probeBlob(this.blobs, entry.newId, options) : null;
+    const isBinary = (oldProbe?.binary ?? false) || (newProbe?.binary ?? false);
 
-    // Check for binary content
-    const isBinary =
-      (oldContent !== null && RawText.isBinary(oldContent)) ||
-      (newContent !== null && RawText.isBinary(newContent));
+    // Text only: binary and big files are never loaded
+    const oldContent = !isBinary && entry.oldId ? await this.loadContent(entry.oldId) : null;
+    const newContent = !isBinary && entry.newId ? await this.loadContent(entry.newId) : null;
 
     // Build headers
     const result: FileContentDiff = {
@@ -180,9 +198,13 @@ export class DiffFormatter {
     }
 
     if (diff.isBinary) {
-      lines.push(
-        `Binary files ${diff.entry.oldPath ?? "/dev/null"} and ${diff.entry.newPath ?? "/dev/null"} differ`,
-      );
+      // git's wording: a/ and b/ prefixes, /dev/null for a side that does not exist
+      const e = diff.entry;
+      const oldName =
+        e.changeType === ChangeType.ADD || !e.oldPath ? "/dev/null" : `a/${e.oldPath}`;
+      const newName =
+        e.changeType === ChangeType.DELETE || !e.newPath ? "/dev/null" : `b/${e.newPath}`;
+      lines.push(`Binary files ${oldName} and ${newName} differ`);
       return lines.join("\n");
     }
 

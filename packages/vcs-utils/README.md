@@ -32,8 +32,8 @@ No peer dependencies. Hashing uses `@noble/hashes`.
 | `@statewalker/vcs-utils/hash/utils` | `bytesToHex`, `hexToBytes` |
 | `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `DeltaError`, `createGitDeltaIndex`, `encodeGitDelta`, `parseGitDelta`, ...), text diff (`RawText`, `RawTextComparator`, `MyersDiff`, `HistogramDiff`, `getAlgorithm`, `MergeAlgorithm`, `merge3Way`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
 | `@statewalker/vcs-utils/encoding` | Git varints: `readVarint`, `writeVarint`, `readOfsVarint`, `writeOfsVarint`, `readPackHeader`, `writePackHeader` |
-| `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader`, `BufferedByteReader`, streaming request bodies (`requestBody`, `fetchWithRequestBody`, `shouldStreamRequestBody`, `toReadableStream`, ...), port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
-| `@statewalker/vcs-utils/cache` | `LRUCache`, `IntermediateCache` |
+| `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader` (with a required `maxLength`), `readPrefix`, `BufferedByteReader`, streaming request bodies (`requestBody`, `fetchWithRequestBody`, `shouldStreamRequestBody`, `toReadableStream`, ...), port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
+| `@statewalker/vcs-utils/cache` | `LRUCache` |
 | `@statewalker/vcs-utils/files` | `FilesApi` type, `createInMemoryFilesApi`, `AtomicFiles` and `atomicFilesOver` (lock-file primitives), `readFile`, `readText`, `tryReadText`, `readAt`, `readRange`, path helpers, `FileMode` |
 | `@statewalker/vcs-utils/ports` | Request/response over `MessagePort`: `callPort`, `listenPort`, `callBidi`, `listenBidi`, `send`, `receive`, ... |
 | `@statewalker/vcs-utils/pack` | Pack helpers: `parsePackHeader`, `computeObjectId`, `computeObjectIdFromStream`, `SizeMismatchError`, `packTypeToString`, async varint readers |
@@ -187,6 +187,16 @@ for (const edit of MyersDiff.diff(RawTextComparator.DEFAULT, a, b)) {
 
 `getAlgorithm(SupportedAlgorithm.HISTOGRAM)` returns `HistogramDiff.diff` with the same signature. Histogram is `DEFAULT_ALGORITHM`.
 
+Before diffing, check whether the content is binary. Git calls content binary when a NUL byte appears in its first 8000 bytes, and `RawText.isBinary` looks at those bytes only (`RawText.BINARY_PROBE_LENGTH`), so a prefix is enough:
+
+```typescript
+import { RawText } from "@statewalker/vcs-utils/diff";
+import { readPrefix } from "@statewalker/vcs-utils/streams";
+
+const head = await readPrefix(content, RawText.BINARY_PROBE_LENGTH); // stops pulling after 8000 bytes
+if (RawText.isBinary(head)) console.log("Binary files differ");
+```
+
 ### CRC32
 
 ```typescript
@@ -310,7 +320,7 @@ The text diff (`MyersDiff`, `HistogramDiff`, `RawText`, `RawTextComparator`, `Ed
 ### Dependencies
 
 - `@noble/hashes`: incremental SHA-1 and SHA-256 (audited, dependency-free, runs in every JavaScript runtime). The `Hasher` interface keeps it replaceable by a native or WASM implementation.
-- `pako`: partial zlib decompression with byte accounting (see above), and an alternative pure-JS compression set (`createPakoCompression`).
+- `pako`: partial zlib decompression with byte accounting (see above), and an alternative pure-JS compression set (`createPakoCompression`, whose `deflate` and `inflate` push each chunk through pako's `Deflate` / `Inflate` and yield its output as it comes, never holding a whole stream).
 - `@statewalker/webrun-files-mem`: backs `createInMemoryFilesApi`. The `FilesApi` interface itself is declared in this package (`src/files/files-api.ts`) and matches the one implemented by the `@statewalker/webrun-files*` packages.
 - `@statewalker/webrun-files` is listed in `package.json`, but no source file imports it.
 

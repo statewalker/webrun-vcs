@@ -406,3 +406,74 @@ describe("chunked input", () => {
     expect(packetDataToString(packets[0])).toBe("a");
   });
 });
+
+describe("pktLineReader: many small packets in odd-sized chunks", () => {
+  function encodeAll(lines: string[]): Uint8Array {
+    const parts = lines.map((l, i) => (i % 97 === 96 ? encodeFlush() : encodePacket(l)));
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
+    return out;
+  }
+
+  function* oddChunks(data: Uint8Array, sizes: number[]): Generator<Uint8Array> {
+    let at = 0;
+    for (let i = 0; at < data.length; i++) {
+      const size = sizes[i % sizes.length] as number;
+      yield data.subarray(at, at + size);
+      at += size;
+    }
+  }
+
+  async function* from(chunks: Iterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+    yield* chunks;
+  }
+
+  const lines = Array.from({ length: 5000 }, (_, i) => `line ${i} ${"x".repeat(i % 23)}\n`);
+  const wire = encodeAll(lines);
+
+  it("decodes every packet under every chunking", async () => {
+    for (const sizes of [[1], [3], [7, 1, 13], [4093], [wire.length]]) {
+      const packets = await collectPackets(pktLineReader(from(oddChunks(wire, sizes))));
+      expect(packets).toHaveLength(lines.length);
+      packets.forEach((p, i) => {
+        if (i % 97 === 96) expect(p.type).toBe("flush");
+        else expect(packetDataToStringRaw(p)).toBe(lines[i]);
+      });
+    }
+  });
+
+  it("splits a large packet arriving in small chunks", async () => {
+    const big = "y".repeat(65000);
+    const data = encodeAll([big, "tail\n"]);
+    const packets = await collectPackets(pktLineReader(from(oddChunks(data, [5, 11, 2]))));
+    expect(packets.map(packetDataToStringRaw)).toEqual([big, "tail\n"]);
+  });
+
+  it("decodes in time linear in the input (no copy of the buffer per packet)", async () => {
+    // Compare 4x the packets with 1x rather than a wall-clock bound, which a loaded machine
+    // can miss: linear decoding takes about 4x as long, copying the buffer per packet ~16x.
+    const timeFor = async (count: number) => {
+      const data = encodeAll(Array.from({ length: count }, (_, i) => `${i}\n`));
+      const started = performance.now();
+      let n = 0;
+      for await (const _ of pktLineReader(from([data]))) n++;
+      expect(n).toBe(count);
+      return performance.now() - started;
+    };
+    await timeFor(5_000); // warm up
+    const small = Math.max(await timeFor(25_000), 1);
+    const large = await timeFor(100_000);
+    expect(large / small).toBeLessThan(9);
+  }, 60_000);
+
+  it("still reports a packet cut short at the end", async () => {
+    const data = encodeAll(["abc\n", "defgh\n"]);
+    await expect(
+      collectPackets(pktLineReader(from(oddChunks(data.subarray(0, data.length - 2), [3])))),
+    ).rejects.toThrow(PacketLineError);
+  });
+});

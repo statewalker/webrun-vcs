@@ -1,4 +1,4 @@
-import { bytesToHex, hexToBytes, sha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, createSha1, hexToBytes, sha1 } from "@statewalker/vcs-utils";
 import type { MergeStageValue, StagingEntry } from "./types.js";
 
 /**
@@ -295,56 +295,93 @@ function parseEntry(
   return { entry, nextOffset: offset };
 }
 
+/** Entries are gathered into chunks of about this many bytes before they are yielded. */
+const INDEX_CHUNK_SIZE = 64 * 1024;
+
 /**
- * Serialize entries to Git index format.
+ * Encode entries in Git index format, as chunks.
  *
- * Entries are validated and sorted by (path, stage) before serialization.
+ * Entries are validated and sorted by (path, stage) before anything is yielded,
+ * so an invalid path throws here and not halfway through a write. The chunks
+ * (the header, entries gathered into about 64 KiB pieces, then the trailing
+ * SHA-1, computed as they go) are produced as they are pulled, so an index is
+ * never built as one buffer.
+ *
+ * @example
+ * ```typescript
+ * await files.write(".git/index", encodeIndexFile(entries));
+ * ```
+ *
+ * @param entries Entries to encode (sorted here; the array is not changed)
+ * @param version Index version (default: 2)
+ * @returns The index file's bytes, chunk by chunk; the last chunk is the 20-byte checksum
+ * @throws Error when a path is invalid
+ */
+export function encodeIndexFile(
+  entries: readonly StagingEntry[],
+  version: IndexVersion = INDEX_VERSION_2,
+): Iterable<Uint8Array> {
+  for (const entry of entries) {
+    validatePath(entry.path);
+  }
+  const sortedEntries = [...entries].sort((a, b) => {
+    const pathCmp = comparePaths(a.path, b.path);
+    if (pathCmp !== 0) return pathCmp;
+    return a.stage - b.stage;
+  });
+  return encodeSorted(sortedEntries, version);
+}
+
+function* encodeSorted(
+  sortedEntries: StagingEntry[],
+  version: IndexVersion,
+): Generator<Uint8Array> {
+  const hasher = createSha1();
+
+  const header = new Uint8Array(HEADER_SIZE);
+  const headerView = new DataView(header.buffer);
+  headerView.setUint32(0, INDEX_SIGNATURE);
+  headerView.setUint32(4, version);
+  headerView.setUint32(8, sortedEntries.length);
+
+  let pending: Uint8Array[] = [header];
+  let pendingLength = header.length;
+  const take = (): Uint8Array => {
+    const chunk = pending.length === 1 ? (pending[0] as Uint8Array) : concatBytes(pending);
+    pending = [];
+    pendingLength = 0;
+    hasher.update(chunk);
+    return chunk;
+  };
+
+  let previousPath = "";
+  for (const entry of sortedEntries) {
+    const entryBytes = serializeEntry(entry, version, previousPath);
+    pending.push(entryBytes);
+    pendingLength += entryBytes.length;
+    previousPath = entry.path;
+    if (pendingLength >= INDEX_CHUNK_SIZE) yield take();
+  }
+  if (pendingLength > 0) yield take();
+
+  yield hasher.digest();
+}
+
+/**
+ * Serialize entries to Git index format, as one buffer.
+ *
+ * The bytes `encodeIndexFile` yields, joined. To write an index, pass
+ * `encodeIndexFile` to `FilesApi.write` instead.
  *
  * @param entries Entries to serialize (will be sorted)
  * @param version Index version (default: 2)
  * @returns Serialized index file bytes
  */
 export async function serializeIndexFile(
-  entries: StagingEntry[],
+  entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
 ): Promise<Uint8Array> {
-  // Validate all paths first
-  for (const entry of entries) {
-    validatePath(entry.path);
-  }
-
-  // Sort entries by (path, stage)
-  const sortedEntries = [...entries].sort((a, b) => {
-    const pathCmp = comparePaths(a.path, b.path);
-    if (pathCmp !== 0) return pathCmp;
-    return a.stage - b.stage;
-  });
-
-  const chunks: Uint8Array[] = [];
-
-  // Header
-  const header = new Uint8Array(HEADER_SIZE);
-  const headerView = new DataView(header.buffer);
-  headerView.setUint32(0, INDEX_SIGNATURE);
-  headerView.setUint32(4, version);
-  headerView.setUint32(8, sortedEntries.length);
-  chunks.push(header);
-
-  // Entries
-  let previousPath = "";
-  for (const entry of sortedEntries) {
-    const entryBytes = serializeEntry(entry, version, previousPath);
-    chunks.push(entryBytes);
-    previousPath = entry.path;
-  }
-
-  // Combine without checksum
-  const withoutChecksum = concatBytes(chunks);
-
-  // Compute and append checksum
-  const checksum = await sha1(withoutChecksum);
-
-  return concatBytes([withoutChecksum, checksum]);
+  return concatBytes([...encodeIndexFile(entries, version)]);
 }
 
 /**

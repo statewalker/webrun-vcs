@@ -20,6 +20,13 @@ const concat = (parts: Uint8Array[]) => {
 async function* split(bytes: Uint8Array, size: number) {
   for (let i = 0; i < bytes.length; i += size) yield bytes.subarray(i, i + size);
 }
+/** Direct comparison: `toEqual` on 200 KB takes seconds (and timed out under load). */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 async function collect(s: AsyncIterable<Uint8Array>) {
   const parts: Uint8Array[] = [];
   for await (const c of s) parts.push(c);
@@ -48,7 +55,7 @@ describe("sidebandPackStream", () => {
       const got = await collect(
         sidebandPackStream(split(response(), size), { onProgress: (m) => progress.push(m) }),
       );
-      expect(got).toEqual(pack);
+      expect(sameBytes(got, pack)).toBe(true);
       expect(progress).toEqual(["Counting objects\n"]);
     }
   });

@@ -1213,3 +1213,49 @@ describe.each(backends)("BlameCommand ($name backend)", ({ factory }) => {
     });
   });
 });
+
+describe.each(backends)("BlameCommand big files ($name backend)", ({ factory }) => {
+  let cleanup: (() => Promise<void>) | undefined;
+
+  afterEach(async () => {
+    if (cleanup) {
+      await cleanup();
+      cleanup = undefined;
+    }
+  });
+
+  async function createInitializedGit() {
+    const result = await createInitializedGitFromFactory(factory);
+    cleanup = result.cleanup;
+    return result;
+  }
+
+  it("refuses a file over bigFileThreshold instead of loading it", async () => {
+    const { git, workingCopy } = await createInitializedGit();
+    await addFile(workingCopy, "big.txt", "a line of text\n".repeat(200));
+    await git.commit().setMessage("big").call();
+    await expect(
+      git.blame().setFilePath("big.txt").setBigFileThreshold(1024).call(),
+    ).rejects.toThrow(/bigFileThreshold/);
+  });
+
+  it("does not diff against a parent version over the threshold", async () => {
+    const { git, workingCopy, repository } = await createInitializedGit();
+    await addFile(workingCopy, "file.txt", `line 1\nline 2\n${"padding\n".repeat(300)}`);
+    await git.commit().setMessage("big version").call();
+    await addFile(workingCopy, "file.txt", "line 1\nline 2\n");
+    const second = await git.commit().setMessage("small version").call();
+    const head = await repository.refs.resolve("HEAD");
+
+    const result = await git.blame().setFilePath("file.txt").setBigFileThreshold(1024).call();
+    expect(result.lineCount).toBe(2);
+    // the big parent is never compared, so both lines belong to the small version
+    expect(result.getEntry(1)?.commitId).toBe(head?.objectId);
+    expect(result.getEntry(2)?.commitId).toBe(head?.objectId);
+    expect(second).toBeDefined();
+
+    // under the default threshold the lines go back to the first commit
+    const full = await git.blame().setFilePath("file.txt").call();
+    expect(full.getEntry(1)?.commitId).not.toBe(head?.objectId);
+  });
+});

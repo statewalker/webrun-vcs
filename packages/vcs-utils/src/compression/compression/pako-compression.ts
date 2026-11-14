@@ -58,87 +58,83 @@ export function decompressBlockPako(
   }
 }
 
+type PakoStream = {
+  push(data: Uint8Array, flush: boolean): boolean;
+  onData(chunk: Uint8Array): void;
+  onEnd(status: number): void;
+  err: number;
+  msg: string;
+  ended?: boolean;
+};
+
+/**
+ * Drive a push-based pako stream from an async source: each input chunk is pushed
+ * as it arrives and the chunks pako emits (`onData`) are yielded right away, so
+ * neither the input nor the output is ever held whole.
+ */
+async function* pump(
+  stream: ByteStream,
+  engine: PakoStream,
+  what: "compression" | "decompression",
+): ByteStream {
+  let out: Uint8Array[] = [];
+  engine.onData = (chunk) => {
+    out.push(chunk);
+  };
+  // pako's default onEnd glues the chunks together; nothing is collected here
+  engine.onEnd = () => {};
+  const fail = (): never => {
+    throw new CompressionError(`Pako ${what} failed: ${engine.msg || `error ${engine.err}`}`);
+  };
+
+  for await (const chunk of stream) {
+    if (chunk.length === 0) continue;
+    if (!engine.push(chunk, false)) fail();
+    if (out.length > 0) {
+      const ready = out;
+      out = [];
+      yield* ready;
+    }
+    // A zlib stream ends before trailing bytes; inflate stops reading there
+    if (engine.ended) break;
+  }
+  if (!engine.ended && !engine.push(new Uint8Array(0), true)) fail();
+  if (engine.err !== 0) fail();
+  yield* out;
+}
+
 /**
  * Compress a stream using pako
  *
- * Collects all input, compresses as a block, then yields the result.
- * For true streaming compression, consider using web streams or node zlib.
+ * Push-based: each input chunk goes to a pako `Deflate` as it arrives and the
+ * compressed chunks it emits are yielded at once (about 16 KiB each), so the
+ * input and the output are never concatenated.
  */
-export async function* deflatePako(
-  stream: ByteStream,
-  options?: StreamingCompressionOptions,
-): ByteStream {
-  // Collect all input
-  const chunks: Uint8Array[] = [];
-  let totalLength = 0;
-
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-    totalLength += chunk.length;
-  }
-
-  // Combine chunks
-  let input: Uint8Array;
-  if (chunks.length === 0) {
-    input = new Uint8Array(0);
-  } else if (chunks.length === 1) {
-    input = chunks[0];
-  } else {
-    input = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      input.set(chunk, offset);
-      offset += chunk.length;
-    }
-  }
-
-  // Compress and yield
-  yield compressBlockPako(input, options);
+export function deflatePako(stream: ByteStream, options?: StreamingCompressionOptions): ByteStream {
+  const level = (options?.level ?? 6) as PakoLevel;
+  const engine = new pako.Deflate({ level, raw: options?.raw ?? false });
+  return pump(stream, engine as unknown as PakoStream, "compression");
 }
 
 /**
  * Decompress a stream using pako
  *
- * Collects all input, decompresses as a block, then yields the result.
- * For true streaming decompression, consider using web streams or node zlib.
+ * Push-based: each input chunk goes to a pako `Inflate` as it arrives and the
+ * decompressed chunks it emits are yielded at once (about 64 KiB each). Input
+ * after the end of the zlib stream is not read. A stream cut short rejects with
+ * `CompressionError`.
  */
-export async function* inflatePako(
-  stream: ByteStream,
-  options?: StreamingCompressionOptions,
-): ByteStream {
-  // Collect all input
-  const chunks: Uint8Array[] = [];
-  let totalLength = 0;
-
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-    totalLength += chunk.length;
-  }
-
-  // Combine chunks
-  let input: Uint8Array;
-  if (chunks.length === 0) {
-    input = new Uint8Array(0);
-  } else if (chunks.length === 1) {
-    input = chunks[0];
-  } else {
-    input = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      input.set(chunk, offset);
-      offset += chunk.length;
-    }
-  }
-
-  // Decompress and yield
-  yield decompressBlockPako(input, options);
+export function inflatePako(stream: ByteStream, options?: StreamingCompressionOptions): ByteStream {
+  const engine = new pako.Inflate({ raw: options?.raw ?? false });
+  return pump(stream, engine as unknown as PakoStream, "decompression");
 }
 
 /**
  * Create a pako-based compression implementation
  *
  * This implementation works universally in Node.js and browsers.
- * It uses block-based compression/decompression (collects all data first).
+ * Streams are compressed and decompressed chunk by chunk (push-based pako);
+ * the block functions work on whole buffers.
  *
  * @returns CompressionUtils configured for pako
  *

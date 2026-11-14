@@ -1,4 +1,5 @@
 import type { Commit, ObjectId, PersonIdent, TreeEntry } from "@statewalker/vcs-core";
+import { DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
 import type { Edit } from "@statewalker/vcs-utils";
 import {
   DEFAULT_ALGORITHM,
@@ -197,6 +198,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private followRenames = false;
   private renameScore = DEFAULT_RENAME_SCORE;
   private diffAlgorithm: DiffAlgorithm = getAlgorithm(DEFAULT_ALGORITHM);
+  private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
 
   /**
    * Set the file path to blame.
@@ -259,6 +261,22 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   /**
+   * Set the size above which a file is never loaded (git's
+   * `core.bigFileThreshold`, default 50 MiB).
+   *
+   * Blaming a file over it rejects. A parent version over it is not compared:
+   * the lines it would have taken stay with the child commit, and it is not a
+   * rename candidate.
+   *
+   * @param threshold Size in bytes
+   */
+  setBigFileThreshold(threshold: number): this {
+    this.checkCallable();
+    this.bigFileThreshold = threshold;
+    return this;
+  }
+
+  /**
    * Execute the blame command.
    *
    * Uses a queue-based algorithm similar to JGit's BlameGenerator.
@@ -296,6 +314,13 @@ export class BlameCommand extends GitCommand<BlameResult> {
 
     if (!blobId) {
       throw new Error(`File not found: ${resultPath}`);
+    }
+
+    const size = await this.blobs.size(blobId);
+    if (size > this.bigFileThreshold) {
+      throw new Error(
+        `${resultPath} is ${size} bytes, larger than bigFileThreshold (${this.bigFileThreshold})`,
+      );
     }
 
     // Get file content and count lines
@@ -401,6 +426,11 @@ export class BlameCommand extends GitCommand<BlameResult> {
       }
     }
 
+    // A parent version over the threshold is never loaded: treat it as unrelated
+    if (parentBlobId && parentBlobId !== candidate.blobId && (await this.isBig(parentBlobId))) {
+      parentBlobId = undefined;
+    }
+
     if (!parentBlobId) {
       // File was introduced in this commit - blame all regions
       this.blameRegions(entries, candidate);
@@ -498,6 +528,10 @@ export class BlameCommand extends GitCommand<BlameResult> {
           parentBlobId = rename.oldBlobId;
           parentPath = rename.oldPath;
         }
+      }
+
+      if (parentBlobId && parentBlobId !== candidate.blobId && (await this.isBig(parentBlobId))) {
+        parentBlobId = undefined;
       }
 
       if (parentBlobId) {
@@ -983,6 +1017,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
     let bestMatch: { path: string; blobId: ObjectId; score: number } | undefined;
 
     for (const { path: oldPath, entry } of deletedFiles) {
+      if (await this.isBig(entry.id)) continue;
+
       // Load the old file content
       const oldContent = await this.collectBlob(entry.id);
 
@@ -1037,6 +1073,11 @@ export class BlameCommand extends GitCommand<BlameResult> {
         entries.set(path, entry);
       }
     }
+  }
+
+  /** Whether a blob is over the threshold (from its size, without reading it). */
+  private async isBig(blobId: ObjectId): Promise<boolean> {
+    return (await this.blobs.size(blobId)) > this.bigFileThreshold;
   }
 
   /**
