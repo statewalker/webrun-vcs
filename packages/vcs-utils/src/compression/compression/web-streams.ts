@@ -16,12 +16,33 @@ function getFormat(raw?: boolean): CompressionFormat {
   return raw ? ("deflate-raw" as CompressionFormat) : "deflate";
 }
 
+/** The stream's iterator; plain arrays and other sync iterables are accepted too. */
+function iteratorOf(stream: ByteStream): AsyncIterator<Uint8Array> {
+  if (Symbol.asyncIterator in Object(stream)) return stream[Symbol.asyncIterator]();
+  return (async function* () {
+    yield* stream as unknown as Iterable<Uint8Array>;
+  })();
+}
+
+/**
+ * Close an iterator without waiting: a source parked in `next()` (a stalled
+ * network body, say) must not hold up the consumer that stopped reading it.
+ */
+function closeIterator(it: AsyncIterator<unknown>): void {
+  try {
+    const r = it.return?.();
+    if (r && typeof r.then === "function") r.then(undefined, () => {});
+  } catch {
+    // the source failed to close; nothing more to do
+  }
+}
+
 /**
  * Compress a stream using DEFLATE (Web implementation).
  *
  * Input is pulled as the compressor accepts it. When the consumer stops early
- * or fails, the compression stream is cancelled and the source closed (its
- * `return()` runs), so no pump or zlib state is left behind. An error from the
+ * or fails, the source is closed (its `return()` is called, without waiting for
+ * a source that is stalled) and the compressor cancelled. An error from the
  * source is rethrown unchanged; compressor errors become `CompressionError`.
  */
 export async function* deflateWeb(
@@ -31,14 +52,27 @@ export async function* deflateWeb(
   const cs = new CompressionStream(getFormat(options?.raw));
   const writer = cs.writable.getWriter();
   const reader = cs.readable.getReader();
-  let sourceError: { error: unknown } | undefined;
+  const it = iteratorOf(stream);
+  let stopped = false;
+  let failure: { error: unknown; fromSource: boolean } | undefined;
   const pump = (async () => {
+    let fromSource = true;
     try {
-      for await (const chunk of stream) await writer.write(chunk as unknown as BufferSource);
+      for (;;) {
+        fromSource = true;
+        const r = await it.next();
+        if (stopped) return;
+        if (r.done) break;
+        fromSource = false;
+        await writer.write(r.value as unknown as BufferSource);
+      }
       await writer.close();
     } catch (error) {
-      // a failed write after a cancel lands here too; only the source's own error matters
-      sourceError ??= { error };
+      if (stopped) return;
+      failure = { error, fromSource };
+      if (!fromSource) closeIterator(it);
+      // End the reader directly: after a failed write some runtimes never error it.
+      await reader.cancel(error).catch(() => {});
       await writer.abort(error).catch(() => {});
     }
   })();
@@ -50,21 +84,25 @@ export async function* deflateWeb(
         r = await reader.read();
       } catch (error) {
         await pump;
-        if (sourceError) throw sourceError.error;
-        throw new CompressionError(`Web compression failed: ${error}`, error);
+        failure ??= { error, fromSource: false };
+        break;
       }
       if (r.done) break;
       yield r.value;
     }
     await pump;
-    if (sourceError) throw sourceError.error;
+    if (failure) {
+      if (failure.fromSource) throw failure.error;
+      throw new CompressionError(`Web compression failed: ${failure.error}`, failure.error);
+    }
     completed = true;
   } finally {
-    if (!completed) {
-      // Stopped early or failed: cancel, so the pending write rejects and the
-      // pump's for-await exits, closing the source.
+    if (!completed && !failure) {
+      // The consumer stopped early or failed.
+      stopped = true;
+      closeIterator(it);
       await reader.cancel().catch(() => {});
-      await pump.catch(() => {});
+      writer.abort().catch(() => {});
     }
     reader.releaseLock();
   }

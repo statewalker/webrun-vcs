@@ -4,6 +4,10 @@
  * renamed into place once its id is known, as git (`finalize_object_file`) and
  * JGit (`ObjectDirectoryInserter`) do. Rooted at `.git/objects`, this is the
  * object database native git reads and writes.
+ *
+ * Memory per write depends on the FilesApi: one whose `write` streams keeps it
+ * bounded; one that collects the chunks first (the in-memory FilesApi, and the
+ * Node one in `@statewalker/webrun-files-node` 0.10) holds the compressed object.
  */
 import type { StagingBlobStore } from "@statewalker/vcs-core";
 import { type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
@@ -16,7 +20,8 @@ export interface FilesStagingStore extends StagingBlobStore {
   /**
    * Remove temporaries (`tmp_obj_*`, at the top level and in fan-out
    * directories) older than `olderThanMs`, left by a crash, as `git prune` does.
-   * Returns how many were removed.
+   * Files whose age the FilesApi does not report are kept. Returns how many
+   * were removed.
    */
   sweepStaged(olderThanMs: number): Promise<number>;
 }
@@ -55,18 +60,20 @@ export function filesStagingStore(files: FilesApi, objectsDir: string): FilesSta
         throw e;
       }
       const target = pathOf(id);
-      // An existing object wins, as in git. Against a concurrent writer of the same
-      // new id, FilesApi.move may overwrite (git uses link() and EEXIST): both files
-      // hold the same bytes, so either rename leaves a valid object.
-      if (await isFile(target)) {
-        await files.remove(tmp);
-        return { id, stored: false };
+      let moved = false;
+      try {
+        // An existing object wins, as in git. Against a concurrent writer of the same
+        // new id, FilesApi.move may overwrite (git uses link() and EEXIST): both files
+        // hold the same bytes, so either rename leaves a valid object.
+        if (await isFile(target)) return { id, stored: false };
+        await ensureDir(joinPath(objectsDir, id.slice(0, 2)));
+        moved = await files.move(tmp, target);
+        if (moved) return { id, stored: true };
+        if (await isFile(target)) return { id, stored: false };
+        throw new Error(`could not move ${tmp} to ${target}`);
+      } finally {
+        if (!moved) await files.remove(tmp).catch(() => false);
       }
-      await ensureDir(joinPath(objectsDir, id.slice(0, 2)));
-      if (await files.move(tmp, target)) return { id, stored: true };
-      await files.remove(tmp).catch(() => false);
-      if (await isFile(target)) return { id, stored: false };
-      throw new Error(`could not move ${tmp} to ${target}`);
     },
 
     async *get(id) {
@@ -104,7 +111,12 @@ export function filesStagingStore(files: FilesApi, objectsDir: string): FilesSta
         for await (const info of files.list(dir)) {
           if (info.kind === "directory") {
             if (descend && FANOUT.test(info.name)) await scan(info.path, false);
-          } else if (info.name.startsWith(TMP_PREFIX) && (info.lastModified ?? 0) < cutoff) {
+          } else if (
+            info.name.startsWith(TMP_PREFIX) &&
+            // An unknown age is never stale: the file may be a write in flight.
+            info.lastModified !== undefined &&
+            info.lastModified < cutoff
+          ) {
             stale.push(info.path);
           }
         }

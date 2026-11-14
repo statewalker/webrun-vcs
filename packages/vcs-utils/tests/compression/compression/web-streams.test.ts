@@ -390,3 +390,59 @@ describe("deflateWeb: early stop and source errors", () => {
     await expect(collectStream(deflateWeb(failing()))).rejects.toBeInstanceOf(SourceError);
   });
 });
+
+describe("deflateWeb: stalled sources and compressor errors", () => {
+  /** A source that yields one chunk, then never answers again. */
+  function stalling() {
+    const state = { closed: false };
+    let n = 0;
+    const source: ByteStream = {
+      [Symbol.asyncIterator]() {
+        return {
+          next: () =>
+            n++ === 0
+              ? Promise.resolve({ done: false, value: new Uint8Array(70_000).fill(7) })
+              : new Promise<IteratorResult<Uint8Array>>(() => {}),
+          async return() {
+            state.closed = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    return { source, state };
+  }
+
+  it("an early stop does not wait for a stalled source", async () => {
+    const { source, state } = stalling();
+    const it = deflateWeb(source)[Symbol.asyncIterator]();
+    const stop = (async () => {
+      await it.next().catch(() => {});
+      await it.return?.();
+      return "stopped";
+    })();
+    const timeout = new Promise((r) => setTimeout(() => r("timeout"), 2000));
+    expect(await Promise.race([stop, timeout])).toBe("stopped");
+    expect(state.closed).toBe(true);
+  });
+
+  it("a chunk the compressor refuses is a CompressionError", async () => {
+    async function* bad(): ByteStream {
+      yield 42 as unknown as Uint8Array;
+    }
+    const result = collectStream(deflateWeb(bad())).then(
+      () => "resolved",
+      (e) => e,
+    );
+    const timeout = new Promise((r) => setTimeout(() => r("timeout"), 2000));
+    expect(await Promise.race([result, timeout])).toBeInstanceOf(CompressionError);
+  });
+});
+
+describe("deflateWeb: sync input", () => {
+  it("accepts a plain array of chunks", async () => {
+    const input = new TextEncoder().encode("hello hello hello");
+    const out = await collectStream(inflateWeb(deflateWeb([input] as unknown as ByteStream)));
+    expect(out).toEqual(input);
+  });
+});

@@ -20,11 +20,6 @@ import {
 } from "./git-objects.js";
 import type { ObjectTypeString } from "./object-types.js";
 
-export interface GitObjectsOptions {
-  /** The hash of object ids; SHA-1 (git's default object format) if omitted. */
-  newHasher?: () => Hasher;
-}
-
 type Header = { type: ObjectTypeString; size: number };
 
 const TYPES = new Set<string>(["blob", "tree", "commit", "tag"]);
@@ -129,16 +124,18 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
  * const id = await objects.put("blob", 6, [new TextEncoder().encode("hello\n")]);
  * ```
  */
-export function createGitObjects(
-  store: StagingBlobStore,
-  options: GitObjectsOptions = {},
-): GitObjects {
-  const newHasher = options.newHasher ?? createSha1;
+export function createGitObjects(store: StagingBlobStore): GitObjects {
+  // Ids are SHA-1 (git's default object format); SHA-256 repositories are not supported.
+  const newHasher = createSha1;
   const pool = createInflaterPool();
   const hex = (h: Hasher) => bytesToHex(h.digest());
 
   /** Inflates a stored object, failing on truncation and on bytes after the zlib stream. */
-  async function* inflate(id: string, state: { absent: boolean }): AsyncGenerator<Uint8Array> {
+  async function* inflate(
+    id: string,
+    state: { absent: boolean },
+    retried = false,
+  ): AsyncGenerator<Uint8Array> {
     const inflater = pool.acquire();
     let done = false;
     let any = false;
@@ -164,8 +161,14 @@ export function createGitObjects(
         }
       }
       if (!any) {
-        if (await store.has(id)) throw new CorruptObjectError(`${id}: empty object file`);
-        state.absent = true;
+        if (!(await store.has(id))) {
+          state.absent = true;
+          return;
+        }
+        // Read nothing, yet it exists: a concurrent first put may have landed in
+        // between. Read once more; an object that is still empty is corrupt.
+        if (retried) throw new CorruptObjectError(`${id}: empty object file`);
+        yield* inflate(id, state, true);
         return;
       }
       if (!done) throw new CorruptObjectError(`${id}: truncated zlib stream`);

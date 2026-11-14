@@ -5,7 +5,16 @@
  * platform's DecompressionStream, independent of the kernel's inflater.
  */
 
-import type { GitObjects, ObjectTypeString, StagingBlobStore } from "@statewalker/vcs-core";
+import {
+  CorruptObjectError,
+  createGitObjects,
+  type GitObjects,
+  InvalidObjectIdError,
+  ObjectIdMismatchError,
+  type ObjectTypeString,
+  SizeMismatchError,
+  type StagingBlobStore,
+} from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -115,6 +124,19 @@ export function createGitObjectsTests(
       expect(await objects.put("blob", 0, [])).toBe("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
     });
 
+    it("accepts 1-byte and empty chunks anywhere, header included", async () => {
+      const raw = commit.raw;
+      async function* bytewise() {
+        for (const b of raw) {
+          yield new Uint8Array(0);
+          yield Uint8Array.of(b);
+        }
+        yield new Uint8Array(0);
+      }
+      await objects.putRaw(commit.id, bytewise());
+      expect(await collect(objects.getRaw(commit.id))).toEqual(raw);
+    });
+
     it("putRaw then getRaw is byte-identical; get returns type, size and content", async () => {
       for (const o of corpus) {
         await objects.putRaw(o.id, chunked(o.raw, 5));
@@ -156,20 +178,18 @@ export function createGitObjectsTests(
         expect(await objects.has(bad), bad).toBe(false);
         expect(await objects.get(bad), bad).toBeUndefined();
         expect((await collect(objects.getRaw(bad))).length, bad).toBe(0);
-        await expect(objects.putRaw(bad, [blob.raw]), bad).rejects.toMatchObject({
-          name: "InvalidObjectIdError",
-        });
-        await expect(objects.remove(bad), bad).rejects.toMatchObject({
-          name: "InvalidObjectIdError",
-        });
+        await expect(objects.putRaw(bad, [blob.raw]), bad).rejects.toBeInstanceOf(
+          InvalidObjectIdError,
+        );
+        await expect(objects.remove(bad), bad).rejects.toBeInstanceOf(InvalidObjectIdError);
       }
       expect(await storedIds(store)).toEqual([]);
     });
 
     it("putRaw with a wrong id rejects with ObjectIdMismatchError and stores nothing", async () => {
-      await expect(objects.putRaw(commit.id, [blob.raw])).rejects.toMatchObject({
-        name: "ObjectIdMismatchError",
-      });
+      await expect(objects.putRaw(commit.id, [blob.raw])).rejects.toBeInstanceOf(
+        ObjectIdMismatchError,
+      );
       expect(await storedIds(store)).toEqual([]);
     });
 
@@ -187,24 +207,24 @@ export function createGitObjectsTests(
       ];
       for (const text of bad) {
         const raw = enc.encode(text);
-        await expect(objects.putRaw(idOf(raw), [raw]), JSON.stringify(text)).rejects.toMatchObject({
-          name: "CorruptObjectError",
-        });
+        await expect(objects.putRaw(idOf(raw), [raw]), JSON.stringify(text)).rejects.toBeInstanceOf(
+          CorruptObjectError,
+        );
       }
-      await expect(objects.putRaw(idOf(new Uint8Array(0)), [])).rejects.toMatchObject({
-        name: "CorruptObjectError",
-      });
+      await expect(objects.putRaw(idOf(new Uint8Array(0)), [])).rejects.toBeInstanceOf(
+        CorruptObjectError,
+      );
       expect(await storedIds(store)).toEqual([]);
     });
 
     it("put with a size lie (short or long) rejects with SizeMismatchError and stores nothing", async () => {
       const b = body(blob);
-      await expect(objects.put("blob", b.length + 1, [b])).rejects.toMatchObject({
-        name: "SizeMismatchError",
-      });
-      await expect(objects.put("blob", b.length - 1, [b])).rejects.toMatchObject({
-        name: "SizeMismatchError",
-      });
+      await expect(objects.put("blob", b.length + 1, [b])).rejects.toBeInstanceOf(
+        SizeMismatchError,
+      );
+      await expect(objects.put("blob", b.length - 1, [b])).rejects.toBeInstanceOf(
+        SizeMismatchError,
+      );
       expect(await storedIds(store)).toEqual([]);
     });
 
@@ -245,19 +265,15 @@ export function createGitObjectsTests(
           if (!g) throw new Error("get returned undefined for a stored object");
           await collect(g.content);
         })();
-        await expect(viaGet).rejects.toMatchObject({ name: "CorruptObjectError" });
-        await expect(collect(objects.getRaw(blob.id))).rejects.toMatchObject({
-          name: "CorruptObjectError",
-        });
+        await expect(viaGet).rejects.toBeInstanceOf(CorruptObjectError);
+        await expect(collect(objects.getRaw(blob.id))).rejects.toBeInstanceOf(CorruptObjectError);
       });
     }
 
     it("get with verify detects an object whose bytes hash to another id", async () => {
       await plant(store, blob.id, await zlib(commit.raw)); // a valid object, wrong name
       const g = await objects.get(blob.id, { verify: true });
-      await expect(collect(g?.content ?? [])).rejects.toMatchObject({
-        name: "ObjectIdMismatchError",
-      });
+      await expect(collect(g?.content ?? [])).rejects.toBeInstanceOf(ObjectIdMismatchError);
     });
 
     it("get().content is single-use: a second iteration throws", async () => {
@@ -299,7 +315,6 @@ export function createGitObjectsTests(
           throw new Error("unreachable");
         },
       };
-      const { createGitObjects } = await import("@statewalker/vcs-core");
       await expect(createGitObjects(failing).put("blob", 1 << 30, source)).rejects.toThrow(
         "disk full",
       );

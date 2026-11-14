@@ -33,7 +33,7 @@ export interface StagingBlobStore {
  * A `StagingBlobStore` over any `RawStorage`: the staged bytes are collected,
  * then stored under their id if it is not there yet. Memory per write is the
  * compressed object, as the memory, KV and SQL raw stores keep each value whole
- * anyway; stores with a rename (git's files) stream instead.
+ * anyway.
  *
  * @example
  * ```typescript
@@ -56,7 +56,19 @@ export function rawStorageStaging(raw: RawStorage): StagingBlobStore {
       return { id, stored: true };
     },
     async *get(id) {
-      if (await raw.has(id)) yield* raw.load(id);
+      if (!(await raw.has(id))) return;
+      let chunks: AsyncIterator<Uint8Array>;
+      let first: IteratorResult<Uint8Array>;
+      try {
+        chunks = raw.load(id)[Symbol.asyncIterator]();
+        first = await chunks.next();
+      } catch (e) {
+        if (!(await raw.has(id))) return; // removed in between: absent
+        throw e;
+      }
+      if (first.done) return;
+      yield first.value;
+      for (let r = await chunks.next(); !r.done; r = await chunks.next()) yield r.value;
     },
     has: (id) => raw.has(id),
     remove: (id) => raw.remove(id),

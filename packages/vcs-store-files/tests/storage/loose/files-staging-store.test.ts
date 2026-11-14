@@ -135,12 +135,19 @@ describe("loose objects and native git", () => {
     expect(await objects.has(id)).toBe(true);
   });
 
-  it("a failed put leaves no temporary behind", async () => {
+  it("a failed put or putRaw leaves no temporary behind", async () => {
     const { dir, files } = gitRepo();
     const objects = createGitObjects(filesStagingStore(files, ".git/objects"));
     await expect(objects.put("blob", 10, [enc.encode("short")])).rejects.toMatchObject({
       name: "SizeMismatchError",
     });
+    const raw = enc.encode("blob 6\0hello\n");
+    await expect(objects.putRaw("0".repeat(40), [raw])).rejects.toMatchObject({
+      name: "ObjectIdMismatchError",
+    });
+    await expect(
+      objects.putRaw("7d6fc2b2c5d4cf3b5c4f2f33fa1e4b7e1d9f8b0a", [enc.encode("blub 1\0x")]),
+    ).rejects.toMatchObject({ name: "CorruptObjectError" });
     expect(readdirSync(join(dir, ".git/objects")).filter((n) => n.startsWith("tmp_obj_"))).toEqual(
       [],
     );

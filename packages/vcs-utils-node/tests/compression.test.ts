@@ -96,3 +96,88 @@ describe("Node.js Compression", () => {
     });
   });
 });
+
+describe("deflateNode: early stop, stalled sources and source errors", () => {
+  type Source = AsyncIterable<Uint8Array>;
+  const within = <T>(p: Promise<T>, ms = 2000) =>
+    Promise.race([p, new Promise<"timeout">((r) => setTimeout(() => r("timeout"), ms))]);
+
+  function endless() {
+    const state = { closed: false };
+    const source: Source = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            return { done: false, value: crypto.getRandomValues(new Uint8Array(64 * 1024)) };
+          },
+          async return() {
+            state.closed = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    return { source, state };
+  }
+
+  it("closes the source when the consumer stops early", async () => {
+    const { source, state } = endless();
+    const run = (async () => {
+      for await (const _ of deflateNode(source)) break;
+      return "done";
+    })();
+    expect(await within(run)).toBe("done");
+    expect(state.closed).toBe(true);
+  });
+
+  it("rethrows the source's own error unchanged, without hanging", async () => {
+    class SourceError extends Error {}
+    async function* failing(): Source {
+      yield new Uint8Array(10);
+      throw new SourceError("source failed");
+    }
+    const run = collect(deflateNode(failing())).then(
+      () => "resolved",
+      (e) => e,
+    );
+    expect(await within(run)).toBeInstanceOf(SourceError);
+  });
+
+  it("an early stop does not wait for a stalled source", async () => {
+    let closed = false;
+    let n = 0;
+    const source: Source = {
+      [Symbol.asyncIterator]() {
+        return {
+          next: () =>
+            n++ === 0
+              ? Promise.resolve({ done: false, value: new Uint8Array(200_000).fill(7) })
+              : new Promise<IteratorResult<Uint8Array>>(() => {}),
+          async return() {
+            closed = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    const it = deflateNode(source)[Symbol.asyncIterator]();
+    const run = (async () => {
+      await it.next();
+      await it.return?.();
+      return "stopped";
+    })();
+    expect(await within(run)).toBe("stopped");
+    expect(closed).toBe(true);
+  });
+
+  it("still round-trips large input", async () => {
+    const data = new Uint8Array(300_000);
+    for (let i = 0; i < data.length; i += 65_536)
+      crypto.getRandomValues(data.subarray(i, i + 65_536));
+    async function* src(): Source {
+      for (let i = 0; i < data.length; i += 10_000) yield data.subarray(i, i + 10_000);
+    }
+    const out = await collect(inflateNode(deflateNode(src())));
+    expect(out).toEqual(data);
+  });
+});

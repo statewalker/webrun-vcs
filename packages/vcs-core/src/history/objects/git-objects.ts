@@ -7,6 +7,9 @@
 import type { ObjectId } from "../../common/id/index.js";
 import type { ObjectTypeString } from "./object-types.js";
 
+/** `put` rejects with this when the content is not as long as the size given for it. */
+export { SizeMismatchError } from "@statewalker/vcs-utils/pack";
+
 /** An object read back: its header and its content. */
 export interface GitObject {
   type: ObjectTypeString;
@@ -33,7 +36,8 @@ export interface GitObject {
 export interface GitObjects {
   /**
    * Store an object in one pass over `content`: frame, hash, deflate and stage
-   * together, so memory stays bounded whatever the size. Returns git's id.
+   * together. Memory stays bounded where the store writes as it receives (see
+   * `StagingBlobStore`). Returns git's id.
    * Rejects with `SizeMismatchError`, storing nothing, when `content` is not
    * `size` bytes long.
    */
