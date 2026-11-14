@@ -28,7 +28,7 @@ pnpm add @statewalker/vcs-core
 | `@statewalker/vcs-core` | Everything from `history`, `storage` and `backend`, plus `createVcsCore`, GC (`GcOrchestrator`, `MemoryGcStrategy`), `FileMode`, `ObjectId`, `PersonIdent` and the file helpers re-exported from `@statewalker/vcs-utils/files` |
 | `@statewalker/vcs-core/history` | `History`, `HistoryWithOperations`, typed stores (`Blobs`, `Trees`, `Commits`, `Tags`, `Refs`), factories (`createMemoryHistory`, `createMemoryHistoryWithOperations`, `createGitFilesHistory`, `createHistoryFromStores`, `createHistoryFromComponents`), object/commit/tree/tag formats, ref constants (`HEAD`, `R_HEADS`, ...) |
 | `@statewalker/vcs-core/storage` | Raw storage (`MemoryRawStorage`, `CompressedRawStorage`, `ChunkedRawStorage`, ...), delta engine and strategies, webrun-storage adapters (`blobStoreToRawStorage`, `kvStoreRefs`) |
-| `@statewalker/vcs-core/backend` | Backend registry (`createHistory`, `registerHistoryBackendFactory`), `BackendCapabilities`, `StorageOperations`, pack files (`listObjects`, `writePack`, `indexPack`, `readPackIndex`, `installPack`, `importPack`, `unpackObjects`, ...) |
+| `@statewalker/vcs-core/backend` | Backend registry (`createHistory`, `registerHistoryBackendFactory`), `BackendCapabilities`, `StorageOperations`, pack files (`openPackSet`, `listObjects`, `writePack`, `readPackIndex`, `installPack`, `importPack`, `unpackObjects`, ...) |
 | `@statewalker/vcs-core/serialization` | `SerializationApi`, `DefaultSerializationApi`, `createSerializationApi(history)` (not in the root export) |
 
 The happy path is an in-memory `History`:
@@ -302,7 +302,7 @@ const { pruned } = await vcs.gc();
 
 ### Git repositories on disk
 
-`createGitFilesHistory(config)` assembles a `HistoryWithOperations` from already-built Git-file stores (blobs, trees, commits, tags, refs and a pack delta store). The package that builds those stores from a `FilesApi` is `@statewalker/vcs-store-files` (`createGitFilesBackend({ files, gitDir })`).
+`createGitFilesHistory(config)` assembles a `HistoryWithOperations` from already-built Git-file stores (blobs, trees, commits, tags, refs and the `PackSet`; its `delta` is a read-only `PackSetDeltaApi` over the packs). The package that builds those stores from a `FilesApi` is `@statewalker/vcs-store-files` (`createGitFilesBackend({ files, gitDir })`).
 
 ## Internals
 

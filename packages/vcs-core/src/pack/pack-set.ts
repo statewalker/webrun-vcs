@@ -361,7 +361,8 @@ export async function openPackSet(
    * The first sound copy of `id`. A copy that fails before `get` returns (a corrupt header, a
    * bad delta, a missing base, a broken first chunk) is marked bad and the next pack is tried;
    * the first error is raised only when no copy remains. A pack whose file disappeared is
-   * dropped.
+   * dropped, and the miss then rescans whatever the rate limit: the pack was removed by a
+   * repack, which installed its replacement first.
    */
   async function lookup(
     id: ObjectId,
@@ -370,6 +371,7 @@ export async function openPackSet(
   ): Promise<GitObject | undefined> {
     if (!isId(id)) return undefined;
     let failed: unknown;
+    let vanished = false;
     for (const p of [...packs]) {
       if (!p.has(id)) continue;
       if (isBad(p, id)) {
@@ -382,6 +384,7 @@ export async function openPackSet(
       } catch (e) {
         if (!(await files.exists(p.packPath))) {
           drop(p);
+          vanished = true;
           continue;
         }
         if (!(e instanceof CorruptObjectError)) throw e;
@@ -390,12 +393,13 @@ export async function openPackSet(
       }
     }
     if (failed) throw failed;
-    if (rescan && (await rescanOnMiss())) return lookup(id, o, false);
+    if (rescan && (await (vanished ? refresh() : rescanOnMiss()))) return lookup(id, o, false);
     return undefined;
   }
 
   async function findEntry(id: ObjectId, rescan: boolean): Promise<PackedEntry | undefined> {
     if (!isId(id)) return undefined;
+    let vanished = false;
     for (const p of [...packs]) {
       if (!holds(p, id)) continue;
       let stored: PackedEntry | undefined;
@@ -404,6 +408,7 @@ export async function openPackSet(
       } catch (e) {
         if (!(await files.exists(p.packPath))) {
           drop(p);
+          vanished = true;
           continue;
         }
         if (!(e instanceof PackError)) throw e;
@@ -424,7 +429,7 @@ export async function openPackSet(
         },
       };
     }
-    if (rescan && (await rescanOnMiss())) return findEntry(id, false);
+    if (rescan && (await (vanished ? refresh() : rescanOnMiss()))) return findEntry(id, false);
     return undefined;
   }
 

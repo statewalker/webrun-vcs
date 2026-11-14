@@ -18,7 +18,6 @@ import { describe, expect, it } from "vitest";
 import {
   createGitFilesBackend,
   filesStagingStore,
-  PackDirectory,
   repack,
   skipPacked,
   withPacks,
@@ -44,8 +43,7 @@ const packFiles = async (files: FilesApi) => {
 };
 async function backend() {
   const files = createInMemoryFilesApi();
-  const b = await createGitFilesBackend({ files, create: true });
-  return { files, ...b };
+  return createGitFilesBackend({ files, create: true });
 }
 /** Deletes every pack file behind the backend's back (as `git repack -a -d` or gc would). */
 async function deletePacks(files: FilesApi) {
@@ -144,13 +142,15 @@ describe("misses are rate-limited", () => {
 
   it("a pack written by an in-process repack is read at once by the same backend", async () => {
     const files = createInMemoryFilesApi();
-    const { history, objects, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history, objects, looseStorage } = backend;
     const id = await history.blobs.store([enc.encode("pack me")]);
+    await history.refs.set("refs/tags/blob", id); // repack packs reachable objects
     expect(await objects.has("0".repeat(40))).toBe(false); // spends the free rescan
-    await repack({ looseStorage, packDirectory, files });
+    await repack(backend);
     expect(await looseStorage.has(id)).toBe(false);
     expect(await text((await objects.get(id))?.content)).toBe("pack me");
   });
@@ -234,7 +234,7 @@ describe("re-review of P2.3: packed reads are released", () => {
   });
 });
 
-describe("re-review of P2.3: list and PackDirectory.onChange", () => {
+describe("re-review of P2.3: list over one pack snapshot", () => {
   it("list uses one pack snapshot: a pack installed while listing hides no loose object", async () => {
     const { objects, packs } = await backend();
     const Y = enc.encode("packed Y\n");
@@ -251,25 +251,5 @@ describe("re-review of P2.3: list and PackDirectory.onChange", () => {
       }
     }
     expect(listed.sort()).toEqual([Xid, oidOf("blob", Y)].sort());
-  });
-
-  it("an onChange failure does not fail addPack or removePack", async () => {
-    const files = createInMemoryFilesApi();
-    const dir = new PackDirectory({
-      files,
-      basePath: PACK_DIR,
-      onChange: () => {
-        throw new Error("refresh failed");
-      },
-    });
-    const bytes = buildPack([{ kind: 3, data: X }]);
-    const idx = writePackIdx(
-      [{ id: Xid, offset: 12, crc32: 0 }],
-      bytes.subarray(bytes.length - 20),
-    );
-    await dir.addPack("pack-test", bytes, idx);
-    expect(await files.exists(joinPath(PACK_DIR, "pack-test.idx"))).toBe(true);
-    await dir.removePack("pack-test");
-    expect(await files.exists(joinPath(PACK_DIR, "pack-test.idx"))).toBe(false);
   });
 });

@@ -1,30 +1,65 @@
 /**
- * Repack loose objects into a pack file.
+ * Repack a file-backed repository, as `git repack -a -d` (or `git repack -d`).
  *
- * Moves all loose objects from FileRawStorage into a single pack file
- * with an index, then removes the loose files.
+ * One streaming pipeline: `listObjects` lists what is reachable, `writePack` streams the pack
+ * (reusing stored entries and searching deltas) and `PackSet.install` indexes it while it is
+ * stored. No pack is held in memory. Then the packs and loose objects the new pack replaces are
+ * deleted, after it is installed, so a concurrent reader always finds every object.
  */
 
-import type { FilesApi, GitObject, ObjectTypeString } from "@statewalker/vcs-core";
-import { type WrittenPackEntry, writePack, writePackIndexV2 } from "@statewalker/vcs-core";
+import type {
+  DeltaSearchOptions,
+  FilesApi,
+  GitObjects,
+  History,
+  ListedObject,
+  ObjectId,
+  Pack,
+  PackSet,
+} from "@statewalker/vcs-core";
+import { joinPath, writePack } from "@statewalker/vcs-core";
 
-import type { PackDirectory } from "./pack/pack-directory.js";
+import { listReachableObjects } from "./reachable-objects.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
 /** A loose object file name, fan-out directory included. */
 const OBJECT_ID = /^[0-9a-f]{40}$/;
 
+/** The repository a repack works on: the fields of `createGitFilesBackend`'s result. */
+export interface RepackTarget {
+  /** The repository's refs (`history.refs`): every ref is a root. */
+  history: Pick<History, "refs">;
+  /** The object kernel (packs first, then loose objects). */
+  objects: GitObjects;
+  /** The installed packs: the new pack is installed here, replaced ones are removed. */
+  packs: PackSet;
+  /** The loose objects. */
+  looseStorage: FileRawStorage;
+  /** The FilesApi the repository lives in (reflogs, index, `.keep` files). */
+  files: FilesApi;
+  /** Path of the `.git` directory within `files` (default ".git"). */
+  gitDir?: string;
+}
+
 /**
  * Options for the repack operation.
  */
-export interface RepackOptions {
-  /** Source: loose object storage */
-  looseStorage: FileRawStorage;
-  /** Destination: pack directory for pack files */
-  packDirectory: PackDirectory;
-  /** @deprecated Unused — kept for backward compatibility */
-  files?: FilesApi;
-  /** If true, report what would be done without actually doing it */
+export interface RepackOptions extends RepackTarget {
+  /**
+   * Pack everything reachable into one pack and delete the packs it replaces (`git repack -a
+   * -d`, the default). `false` packs only the reachable objects that are loose and deletes
+   * those loose copies (`git repack -d`); existing packs are left alone.
+   */
+  all?: boolean;
+  /** Search deltas (git's window search); an object sets window and depth. Default true. */
+  deltaSearch?: boolean | DeltaSearchOptions;
+  /** Copy stored deltas (git: no `-f`). Default true. */
+  reuseDeltas?: boolean;
+  /** Copy stored whole objects (git: no `-F`). Default true. */
+  reuseObjects?: boolean;
+  /** Blobs larger than this are written whole (git's core.bigFileThreshold). Default 50 MiB. */
+  bigFileThreshold?: number;
+  /** Report what would be done without writing or deleting anything. */
   dryRun?: boolean;
 }
 
@@ -32,142 +67,127 @@ export interface RepackOptions {
  * Result of the repack operation.
  */
 export interface RepackResult {
-  /** Name of the created pack file (without path/extension) */
+  /** Name of the created pack (`pack-<id>`, without path or extension); "" in a dry run */
   packName: string;
   /** Number of objects packed */
   objectCount: number;
   /** Number of loose object files removed */
   looseObjectsRemoved: number;
+  /** Packs removed (`pack-<id>`): replaced by the new one */
+  packsRemoved: string[];
+  /** Packs kept because they have a `.keep` file (`pack-<id>`) */
+  keptPacks: string[];
 }
 
 /**
- * Repack all loose objects into a single pack file.
+ * Repack the repository.
  *
- * 1. Collects all loose object IDs
- * 2. Creates a pack file with all objects
- * 3. Builds a V2 index for the pack
- * 4. Saves pack + index via PackDirectory
- * 5. Removes loose object files
+ * With `all` (the default), as `git repack -a -d`:
+ *  1. lists every object reachable from the refs, HEAD, the reflogs and the index;
+ *  2. leaves out objects held by `.keep` packs (git's `--honor-pack-keep`);
+ *  3. streams them into one pack (`writePack` into `PackSet.install`), reusing stored entries;
+ *  4. once it is installed and the pack set refreshed, removes the other packs (not the
+ *     `.keep` ones), then the loose objects now packed (`git prune-packed`).
  *
- * @returns Repack result with stats, or null if no loose objects to pack
+ * Unreachable objects of the removed packs are dropped, as `git repack -a -d` drops them;
+ * unreachable loose objects stay, for `gc()` to prune after its grace period.
+ *
+ * Without `all`, as `git repack -d`: the reachable objects that are only loose go into a new
+ * pack and their loose copies are removed; existing packs are untouched.
+ *
+ * @returns the result, or null if there is nothing to pack (then nothing is changed)
  *
  * @example
  * ```typescript
- * const { looseStorage, packDirectory } = await createGitFilesBackend({ files, create: true });
- * // ... store some objects ...
- * const result = await repack({ looseStorage, packDirectory, files });
- * if (result) {
- *   console.log(`Packed ${result.objectCount} objects into ${result.packName}`);
- * }
+ * const backend = await createGitFilesBackend({ files });
+ * const result = await repack(backend); // git repack -a -d
+ * await repack({ ...backend, all: false }); // git repack -d: loose objects only
  * ```
  */
 export async function repack(options: RepackOptions): Promise<RepackResult | null> {
-  const { looseStorage, packDirectory, dryRun = false } = options;
+  const listed = await listReachableObjects({
+    files: options.files,
+    gitDir: options.gitDir,
+    refs: options.history.refs,
+    objects: options.objects,
+  });
+  return repackListed(options, listed);
+}
 
-  // Collect all loose object IDs
-  const objectIds: string[] = [];
-  for await (const id of looseStorage.keys()) {
-    // Only object files: native git writes objects/ab/tmp_obj_* while it works.
-    if (OBJECT_ID.test(id)) objectIds.push(id);
+/**
+ * Repack with the reachable objects already listed (gc lists them once for repack and prune).
+ * @internal
+ */
+export async function repackListed(
+  options: RepackOptions,
+  reachable: readonly ListedObject[],
+): Promise<RepackResult | null> {
+  const { files, packs, looseStorage, objects, all = true, dryRun = false } = options;
+  const packDir = joinPath(options.gitDir ?? ".git", "objects", "pack");
+
+  await packs.refresh();
+  const before = await packs.packs();
+  const kept: Pack[] = [];
+  const replaced: Pack[] = [];
+  for (const p of before) {
+    if (await files.exists(joinPath(packDir, `pack-${p.packId}.keep`))) kept.push(p);
+    else replaced.push(p);
   }
 
-  if (objectIds.length === 0) {
-    return null;
-  }
+  // -a: everything reachable but what .keep packs hold; -d alone: what no pack holds
+  const skip = all ? kept : before;
+  const ids = reachable.filter((o) => !skip.some((p) => p.has(o.id)));
+  if (ids.length === 0) return null;
 
+  const keptPacks = kept.map((p) => `pack-${p.packId}`);
   if (dryRun) {
     return {
       packName: "",
-      objectCount: objectIds.length,
+      objectCount: ids.length,
       looseObjectsRemoved: 0,
+      packsRemoved: all ? replaced.map((p) => `pack-${p.packId}`) : [],
+      keptPacks,
     };
   }
 
-  // Stream a pack of the loose objects: each is read as it is written
-  const written: WrittenPackEntry[] = [];
-  const source = { get: (id: string) => looseObject(looseStorage, id) };
-  const packChunks: Uint8Array[] = [];
-  for await (const chunk of writePack(source, objectIds, { onEntry: (e) => written.push(e) })) {
-    packChunks.push(chunk);
+  // One stream: objects are read one at a time, the pack goes straight into its temporary file
+  const stream = writePack(objects, ids, {
+    packs,
+    reuseObjects: options.reuseObjects ?? true,
+    reuseDeltas: options.reuseDeltas ?? true,
+    deltaSearch: options.deltaSearch ?? true,
+    bigFileThreshold: options.bigFileThreshold,
+  });
+  const installed = await packs.install(stream);
+  // Install before remove: every reader finds each object in the new pack from now on
+  await packs.refresh();
+
+  const packsRemoved = all
+    ? replaced.filter((p) => p.packId !== installed.packId).map((p) => `pack-${p.packId}`)
+    : [];
+  if (packsRemoved.length) await packs.remove(packsRemoved.map((n) => n.slice(5)));
+
+  const looseObjectsRemoved = await prunePacked(looseStorage, packs);
+
+  return {
+    packName: `pack-${installed.packId}`,
+    objectCount: installed.count,
+    looseObjectsRemoved,
+    packsRemoved,
+    keptPacks,
+  };
+}
+
+/** Removes the loose objects a pack holds (`git prune-packed`). Returns how many. */
+export async function prunePacked(looseStorage: FileRawStorage, packs: PackSet): Promise<number> {
+  const loose: ObjectId[] = [];
+  for await (const id of looseStorage.keys()) {
+    // Only object files: native git writes objects/ab/tmp_obj_* while it works.
+    if (OBJECT_ID.test(id)) loose.push(id);
   }
-  // PackDirectory.addPack takes the pack whole
-  const packData = concatBytes(packChunks);
-
-  // Build the pack index (entries must be sorted by ID for binary search)
-  const packChecksum = packData.subarray(packData.length - 20);
-  const indexEntries = written
-    .map(({ id, offset, crc32 }) => ({ id, offset, crc32 }))
-    .sort((a, b) => a.id.localeCompare(b.id));
-  const indexData = await writePackIndexV2(indexEntries, packChecksum);
-
-  // Generate pack name from checksum
-  const packName = `pack-${bytesToHex(packChecksum)}`;
-
-  // Save pack + index
-  await packDirectory.addPack(packName, packData, indexData);
-
-  // Remove loose objects
   let removed = 0;
-  for (const id of objectIds) {
-    if (await looseStorage.remove(id)) {
-      removed++;
-    }
+  for (const id of loose) {
+    if ((await packs.has(id)) && (await looseStorage.remove(id))) removed++;
   }
-
-  return {
-    packName,
-    objectCount: objectIds.length,
-    looseObjectsRemoved: removed,
-  };
-}
-
-function concatBytes(chunks: Uint8Array[]): Uint8Array {
-  const total = chunks.reduce((sum, c) => sum + c.length, 0);
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    result.set(c, offset);
-    offset += c.length;
-  }
-  return result;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-const TYPES = new Set(["commit", "tree", "blob", "tag"]);
-
-/** A loose object read as a stream: its header parsed, its content passed on. */
-async function looseObject(storage: FileRawStorage, id: string): Promise<GitObject | undefined> {
-  if (!(await storage.has(id))) return undefined;
-  const it = storage.load(id)[Symbol.asyncIterator]();
-  let head = new Uint8Array(0);
-  let nul = -1;
-  while (nul < 0) {
-    const r = await it.next();
-    if (r.done) throw new Error(`loose object ${id} has no header`);
-    const joined = new Uint8Array(head.length + r.value.length);
-    joined.set(head);
-    joined.set(r.value, head.length);
-    head = joined;
-    nul = head.indexOf(0);
-  }
-  const m = /^(\w+) (\d+)$/.exec(new TextDecoder().decode(head.subarray(0, nul)));
-  if (!m || !TYPES.has(m[1] as string)) throw new Error(`loose object ${id} has a bad header`);
-  const rest = head.subarray(nul + 1);
-  return {
-    type: m[1] as ObjectTypeString,
-    size: Number(m[2]),
-    content: (async function* () {
-      try {
-        if (rest.length) yield rest;
-        for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
-      } finally {
-        await it.return?.();
-      }
-    })(),
-  };
+  return removed;
 }

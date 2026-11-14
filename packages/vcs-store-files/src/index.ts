@@ -3,10 +3,9 @@
  *
  * Provides file-dependent implementations of storage interfaces:
  * - Storage: filesStagingStore (object kernel), FileRawStorage (gc, repack)
- * - Objects: withPacks (loose objects, then packs)
- * - Pack: PackDirectory, PackReader, PackDeltaStore, GitPackStoreImpl
+ * - Objects: withPacks (packs first, then loose objects)
  * - Factories: createGitFilesBackend(), createGitFilesHistoryFromFiles()
- * - GC: gc(), FileGcStrategy, repack()
+ * - Maintenance: repack(), gc(), FileGcStrategy
  */
 
 // Factory functions
@@ -17,6 +16,8 @@ export * from "./gc.js";
 export * from "./gc-strategy.js";
 // Pack file management (file-dependent)
 export * from "./pack/index.js";
+// Reachability roots (refs, reflogs, index) for repack and gc
+export * from "./reachable-objects.js";
 // Refs (file-dependent)
 export * from "./refs/index.js";
 // Repack

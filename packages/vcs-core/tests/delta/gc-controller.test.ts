@@ -291,3 +291,29 @@ describe("GCController", () => {
     });
   });
 });
+
+describe("GCController size cap (P2.6)", () => {
+  it("does not hand blobs larger than maxDeltaBlobSize to the delta engine", async () => {
+    const seen: string[] = [];
+    const deltaEngine = {
+      async findBestDelta(target: { id: string }) {
+        seen.push(target.id);
+        return null;
+      },
+    } as unknown as NonNullable<Parameters<typeof createTestRepository>[0]>["deltaEngine"];
+    const ctx = await createTestRepository({ deltaEngine, maxDeltaBlobSize: 100 });
+    const small = await ctx.blob("small blob\n");
+    const big = await ctx.blob("x".repeat(101));
+
+    await ctx.gc.runGC();
+    expect(seen).toContain(small);
+    expect(seen).not.toContain(big);
+
+    seen.length = 0;
+    await ctx.gc.onBlob(big);
+    await ctx.gc.onBlob(small);
+    await ctx.gc.quickPack();
+    expect(seen).toEqual([small]);
+    expect(ctx.gc.getOptions().maxDeltaBlobSize).toBe(100);
+  });
+});

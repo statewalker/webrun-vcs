@@ -6,10 +6,11 @@ import { createGitFilesBackend, FileGcStrategy } from "../src/index.js";
 describe("FileGcStrategy", () => {
   it("prunes unreachable loose objects", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history } = backend;
     await history.initialize();
     await history.refs.setSymbolic("HEAD", "refs/heads/main");
 
@@ -30,7 +31,7 @@ describe("FileGcStrategy", () => {
     });
     await history.refs.set("refs/heads/main", commitId);
 
-    const strategy = new FileGcStrategy({ looseStorage, packDirectory });
+    const strategy = new FileGcStrategy(backend);
     const orchestrator = new GcOrchestrator(history, strategy);
 
     const result = await orchestrator.run();
@@ -43,10 +44,11 @@ describe("FileGcStrategy", () => {
 
   it("compacts loose objects into pack files", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history, looseStorage } = backend;
     await history.initialize();
     await history.refs.setSymbolic("HEAD", "refs/heads/main");
 
@@ -62,7 +64,7 @@ describe("FileGcStrategy", () => {
     });
     await history.refs.set("refs/heads/main", commitId);
 
-    const strategy = new FileGcStrategy({ looseStorage, packDirectory });
+    const strategy = new FileGcStrategy(backend);
 
     // Compact: should repack loose objects
     const compactResult = await strategy.compact();
@@ -81,10 +83,11 @@ describe("FileGcStrategy", () => {
 
   it("prune + compact via orchestrator", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history } = backend;
     await history.initialize();
     await history.refs.setSymbolic("HEAD", "refs/heads/main");
 
@@ -105,7 +108,7 @@ describe("FileGcStrategy", () => {
     });
     await history.refs.set("refs/heads/main", commitId);
 
-    const strategy = new FileGcStrategy({ looseStorage, packDirectory });
+    const strategy = new FileGcStrategy(backend);
     const orchestrator = new GcOrchestrator(history, strategy);
 
     const result = await orchestrator.run({ compact: true });
@@ -119,17 +122,18 @@ describe("FileGcStrategy", () => {
 
   it("getStats counts loose and packed objects", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history } = backend;
     await history.initialize();
 
     const enc = new TextEncoder();
     await history.blobs.store([enc.encode("a")]);
     await history.blobs.store([enc.encode("b")]);
 
-    const strategy = new FileGcStrategy({ looseStorage, packDirectory });
+    const strategy = new FileGcStrategy(backend);
     const stats = await strategy.getStats();
 
     expect(stats.looseObjectCount).toBe(2);

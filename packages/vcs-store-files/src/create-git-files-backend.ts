@@ -16,7 +16,6 @@ import {
   openPackSet,
 } from "@statewalker/vcs-core";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
-import { PackDirectory } from "./pack/pack-directory.js";
 import { skipPacked, withPacks } from "./pack/with-packs.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
@@ -54,15 +53,14 @@ export interface GitFilesBackendResult {
   history: History;
   /** The object kernel: packs first, then loose objects (`withPacks`). */
   objects: GitObjects;
-  /** The installed packs, read by `objects`; installs and removes packs. */
+  /** The installed packs, read by `objects`; `repack()` installs and removes packs here. */
   packs: PackSet;
-  /**
-   * Pack directory for repack and gc (the previous pack reader). Kept until those
-   * move to `packs`; packs it adds or removes refresh `packs` at once.
-   */
-  packDirectory: PackDirectory;
   /** Loose object storage (for repack/GC operations) */
   looseStorage: FileRawStorage;
+  /** The FilesApi the repository lives in (for `repack()` and `gc()`). */
+  files: FilesApi;
+  /** Path of the `.git` directory within `files`. */
+  gitDir: string;
 }
 
 /**
@@ -112,13 +110,6 @@ export async function createGitFilesBackend(
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
   });
-  // packs repack and gc write or remove through PackDirectory are seen by `packs` at once
-  const packDirectory = new PackDirectory({
-    files,
-    basePath: packDir,
-    onChange: () => packs.refresh(),
-  });
-  await packDirectory.scan();
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);
   const refStore = createFileRefStore(files, gitDir, {
@@ -133,7 +124,7 @@ export async function createGitFilesBackend(
     packs,
   });
 
-  return { history, objects, packs, packDirectory, looseStorage };
+  return { history, objects, packs, looseStorage, files, gitDir };
 }
 
 /**

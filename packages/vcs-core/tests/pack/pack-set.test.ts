@@ -1294,3 +1294,27 @@ describe("re-review 2 of P2.3: freshen expiry and stale skips", () => {
     expect(set.skipped).toEqual([]);
   });
 });
+
+describe("P2.6: a reader whose pack was removed by a repack", () => {
+  it("rescans at once, whatever the rate limit, and finds the replacement pack", async () => {
+    const files = createInMemoryFilesApi();
+    const old = await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 60_000 });
+    expect(await set.has(Aid)).toBe(true);
+    expect(await set.has(fakeId(1))).toBe(false); // spends the free rescan
+    // another process repacks: installs a pack holding A and B, then removes the old one
+    await installPack(
+      files,
+      PACK_DIR,
+      chunks(
+        pack([
+          { kind: 3, data: A },
+          { kind: 3, data: B },
+        ]),
+      ),
+    );
+    for (const ext of [".idx", ".pack"]) await files.remove(`${PACK_DIR}/pack-${old.packId}${ext}`);
+    expect(await content(await set.get(Aid))).toEqual(A);
+    expect((await set.entry(Bid))?.kind).toBe(3);
+  });
+});

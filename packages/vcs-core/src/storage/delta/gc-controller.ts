@@ -3,6 +3,10 @@
  *
  * Garbage collection controller that uses HistoryWithOperations.
  * Focuses on blob-only delta compression as per the unified architecture.
+ *
+ * It maintains the delta stores of the memory, KV and SQL backends, whose `history.delta`
+ * writes deltas. Git file repositories keep deltas only in packs: use `repack()` and `gc()`
+ * from `@statewalker/vcs-store-files` there (their delta API does not write deltas).
  */
 
 import { FileMode } from "../../common/files/index.js";
@@ -28,6 +32,11 @@ export interface GCScheduleOptions {
   minInterval?: number;
   /** Number of pending blobs before quick pack */
   quickPackThreshold?: number;
+  /**
+   * Blobs larger than this are never deltified: computing a delta holds the target and its
+   * candidates whole. Default 16 MiB (writePack's limit for its delta window).
+   */
+  maxDeltaBlobSize?: number;
 }
 
 /**
@@ -58,6 +67,7 @@ const DEFAULT_GC_OPTIONS: ResolvedGCOptions = {
   maxChainDepth: 50,
   minInterval: 60000, // 1 minute
   quickPackThreshold: 5,
+  maxDeltaBlobSize: 16 * 1024 * 1024,
 };
 
 /**
@@ -134,6 +144,7 @@ export class GCController {
     try {
       for (const blobId of this.pendingBlobs) {
         const size = await this.history.blobs.size(blobId);
+        if (size > this.options.maxDeltaBlobSize) continue;
 
         const target: DeltaTarget = {
           id: blobId,
@@ -305,6 +316,7 @@ export class GCController {
 
         try {
           const sizeBefore = await blobs.size(id);
+          if (sizeBefore > this.options.maxDeltaBlobSize) continue;
 
           const target: DeltaTarget = {
             id,
