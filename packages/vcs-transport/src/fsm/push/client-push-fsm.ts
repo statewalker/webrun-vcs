@@ -287,7 +287,10 @@ export const clientPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
         // Export and send raw pack data.
         // In Git push protocol, sideband is server→client only.
-        const packStream = repository.exportPack(wants, haves);
+        // OFS deltas only when the server advertised ofs-delta
+        const packStream = repository.exportPack(wants, haves, {
+          ofsDelta: state.capabilities.has("ofs-delta"),
+        });
         await transport.writeRawPack(packStream);
 
         if (!state.capabilities.has("report-status")) {

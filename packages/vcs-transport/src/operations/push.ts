@@ -8,7 +8,7 @@
 import type { BaseHttpOptions, BasePushOptions } from "../api/options.js";
 import { ZERO_OID } from "../protocol/constants.js";
 import { createEmptyPack } from "../protocol/pack-utils.js";
-import { requestBody, supportsRequestStreams } from "../utils/request-stream.js";
+import { fetchWithRequestBody, shouldStreamRequestBody } from "../utils/request-stream.js";
 import { authorizationHeader } from "./http-auth.js";
 
 /**
@@ -24,12 +24,20 @@ export interface PushOptions extends BaseHttpOptions, BasePushOptions {
   /**
    * The pack of the objects reachable from `wants` and not from `exclude` (the remote's refs),
    * streamed (`SerializationApi.exportPack`, or `listObjects` + `writePack`). Required when the
-   * push sends objects.
+   * push sends objects. `options.ofsDelta` is whether the remote advertised `ofs-delta`: write
+   * deltas on a base in the pack as OFS deltas only then. It may be called twice when a streamed
+   * request is retried with a collected body.
    */
-  exportPack?: (wants: Set<string>, exclude: Set<string>) => AsyncIterable<Uint8Array>;
+  exportPack?: (
+    wants: Set<string>,
+    exclude: Set<string>,
+    options: { ofsDelta: boolean },
+  ) => AsyncIterable<Uint8Array>;
   /**
-   * Stream the request body (fetch `duplex: "half"`). Default: where the runtime supports it
-   * (`supportsRequestStreams()`); Firefox and Safari collect the body first.
+   * Stream the request body (fetch `duplex: "half"`). Default: outside browsers, where the
+   * runtime supports it (`shouldStreamRequestBody()`); browsers collect the body first unless
+   * this is `true` (Chromium refuses streamed bodies over HTTP/1.1). A streamed request that
+   * fails with a `TypeError` before any response is sent once more with a collected body.
    */
   streamRequestBody?: boolean;
 }
@@ -81,7 +89,8 @@ export interface HttpPushResult {
  *   refspecs: ["refs/heads/main:refs/heads/main"],
  *   auth: { token: "ghp_xxx" },
  *   getLocalRef: async (ref) => store.refs.get(ref)?.objectId,
- *   exportPack: (wants, exclude) => history.serialization.exportPack(wants, exclude),
+ *   exportPack: (wants, exclude, { ofsDelta }) =>
+ *     history.serialization.exportPack(wants, exclude, { ofsDelta }),
  * });
  *
  * for (const [ref, status] of result.updates) {
@@ -155,7 +164,9 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
 
     // Parse remote refs
     const infoRefsData = new Uint8Array(await infoRefsResponse.arrayBuffer());
-    const remoteRefs = parseReceivePackAdvertisement(infoRefsData);
+    const { refs: remoteRefs, capabilities: remoteCapabilities } =
+      parseReceivePackAdvertisement(infoRefsData);
+    const ofsDelta = remoteCapabilities.has("ofs-delta");
 
     // Phase 2: Parse refspecs and determine what to push
     const refUpdates: Array<{
@@ -215,7 +226,7 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
 
       // Build capability string for first line (NUL-separated per Git protocol)
       const caps = firstUpdate
-        ? `\0report-status side-band-64k${options.atomic ? " atomic" : ""}`
+        ? `\0report-status side-band-64k${options.atomic ? " atomic" : ""}${ofsDelta ? " ofs-delta" : ""}`
         : "";
 
       const line = `${update.oldOid} ${update.newOid} ${update.refName}${caps}`;
@@ -230,14 +241,17 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
       throw new Error("push sends objects: exportPack is required");
     }
 
-    // Counted as the request reads them: the bytes sent and the pack's object count
+    // Counted as the request reads them: the bytes sent and the pack's object count (reset when
+    // a streamed request is retried with a collected body, produced again from the start)
     let bytesSent = 0;
     let objectCount = 0;
-    const pack =
-      newOids.length > 0 && exportPack
-        ? exportPack(new Set(newOids), new Set(oldOids))
-        : [createEmptyPack()];
     async function* body(): AsyncGenerator<Uint8Array> {
+      bytesSent = 0;
+      objectCount = 0;
+      const pack =
+        newOids.length > 0 && exportPack
+          ? exportPack(new Set(newOids), new Set(oldOids), { ofsDelta })
+          : [createEmptyPack()];
       let head = new Uint8Array(0);
       for (const chunk of commandChunks) {
         bytesSent += chunk.length;
@@ -258,17 +272,22 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
 
     // Phase 4: POST /git-receive-pack
     const receivePackUrl = `${baseUrl}/git-receive-pack`;
-    const receivePackResponse = await doFetch(
-      new Request(receivePackUrl, {
-        method: "POST",
-        headers: {
-          ...headers,
-          "Content-Type": "application/x-git-receive-pack-request",
-          Accept: "application/x-git-receive-pack-result",
-        },
-        ...(await requestBody(body(), options.streamRequestBody ?? supportsRequestStreams())),
-        signal: controller?.signal,
-      } as RequestInit),
+    const receivePackResponse = await fetchWithRequestBody(
+      body,
+      (init) =>
+        doFetch(
+          new Request(receivePackUrl, {
+            method: "POST",
+            headers: {
+              ...headers,
+              "Content-Type": "application/x-git-receive-pack-request",
+              Accept: "application/x-git-receive-pack-result",
+            },
+            ...init,
+            signal: controller?.signal,
+          } as RequestInit),
+        ),
+      shouldStreamRequestBody(options.streamRequestBody),
     );
 
     if (!receivePackResponse.ok) {
@@ -321,8 +340,12 @@ export async function push(options: PushOptions): Promise<HttpPushResult> {
  * a line-oriented reader hands back the first ref with its own pkt-length
  * still glued to the object id.
  */
-function parseReceivePackAdvertisement(data: Uint8Array): Map<string, string> {
+function parseReceivePackAdvertisement(data: Uint8Array): {
+  refs: Map<string, string>;
+  capabilities: Set<string>;
+} {
   const refs = new Map<string, string>();
+  const capabilities = new Set<string>();
   const textDecoder = new TextDecoder();
   let pos = 0;
 
@@ -346,6 +369,14 @@ function parseReceivePackAdvertisement(data: Uint8Array): Map<string, string> {
     // Capabilities follow the ref name after a NUL on the first ref line.
     const nullIndex = content.indexOf("\0");
     const refPart = nullIndex >= 0 ? content.slice(0, nullIndex) : content;
+    if (nullIndex >= 0) {
+      for (const cap of content
+        .slice(nullIndex + 1)
+        .trim()
+        .split(" ")) {
+        if (cap) capabilities.add(cap);
+      }
+    }
 
     const spaceIndex = refPart.indexOf(" ");
     if (spaceIndex > 0) {
@@ -358,7 +389,7 @@ function parseReceivePackAdvertisement(data: Uint8Array): Map<string, string> {
     }
   }
 
-  return refs;
+  return { refs, capabilities };
 }
 
 /**

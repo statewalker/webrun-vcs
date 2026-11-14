@@ -12,6 +12,9 @@
  *  - the delta search (off by default): git's windowed search over the candidates sorted by
  *    type, name hash and size, window 10 and depth 50, with `encodeGitDelta`. Only the window's
  *    objects are held, each under a size cap; blobs over `bigFileThreshold` are not searched;
+ *  - the depth limit holds for reused chains too (git's break_delta_chains): a stored chain
+ *    deeper than it is broken by writing an object whole, and the search never turns the base
+ *    of reused deltas into a delta they would pass the limit on;
  *  - thin packs: deltas against `haves` the receiver has, which are not written;
  *  - a base is always written before its deltas, whatever the order of `ids`.
  */
@@ -47,7 +50,12 @@ export interface PackReuseSource {
 export interface DeltaSearchOptions {
   /** Objects a candidate is compared with (git's pack.window). Default 10. */
   window?: number;
-  /** Longest delta chain (git's pack.depth). Default 50. */
+  /**
+   * Longest delta chain (git's pack.depth), reused deltas included: a stored chain longer than
+   * this is broken by writing an object whole, and an object with reused deltas on it becomes
+   * a delta only if they stay within it. Default 50 (also the limit for reused chains when the
+   * search is off).
+   */
   depth?: number;
   /** Largest object held in the window; bigger ones are not searched. Default 16 MiB. */
   maxObjectSize?: number;
@@ -105,6 +113,8 @@ const TYPE_CODE: Record<ObjectTypeString, PackedEntryKind> = {
 const TYPE_NAME: Record<number, ObjectTypeString> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
 const OFS_DELTA = 6;
 const REF_DELTA = 7;
+/** git's pack.depth: the longest delta chain written. */
+const DEFAULT_DEPTH = 50;
 /** git's try_delta: smaller targets are never deltified. */
 const MIN_DELTA_TARGET = 50;
 
@@ -118,7 +128,10 @@ interface Planned {
   /** a base chosen by the search */
   deltaBase?: Planned;
   delta?: Uint8Array;
+  /** length of the delta chain down to a whole object (reused deltas included) */
   depth: number;
+  /** longest chain of reused deltas on top of this object (they get deeper if it becomes a delta) */
+  reusedAbove?: number;
   /** a have: a base only, never written */
   have: boolean;
   offset?: number;
@@ -186,6 +199,9 @@ export async function* writePack(
       }
     }
     breakReuseCycles(order, byId);
+    // git's break_delta_chains: reused chains are kept within the depth limit, here or after
+    // the search (which never makes a base of reused deltas so deep that they pass it)
+    limitReusedChains(order, byId, search?.depth ?? DEFAULT_DEPTH);
   }
 
   if (search) await searchDeltas(objects, order, haves, search, bigFileThreshold);
@@ -328,6 +344,38 @@ function breakReuseCycles(order: Planned[], byId: Map<ObjectId, Planned>) {
   }
 }
 
+/**
+ * The depth of each reused delta (its chain down to a whole object or a have); one that would
+ * pass `maxDepth` is written whole instead (git's break_delta_chains), starting a new chain.
+ * Then each object at the root of reused chains records the longest chain on it (`reusedAbove`),
+ * so the search does not make it a delta those chains would pass the limit on.
+ */
+function limitReusedChains(order: Planned[], byId: Map<ObjectId, Planned>, maxDepth: number) {
+  const done = new Set<Planned>();
+  const depthOf = (p: Planned): number => {
+    if (done.has(p)) return p.depth;
+    done.add(p);
+    const baseId = p.reuse && p.reuse.kind > 4 ? p.reuse.baseId : undefined;
+    const base = baseId ? byId.get(baseId) : undefined;
+    let d = baseId ? (base ? depthOf(base) + 1 : 1) : 0; // 1: on a have of a thin pack
+    if (d > maxDepth) {
+      p.reuse = undefined; // written whole: the chain is broken here
+      d = 0;
+    }
+    p.depth = d;
+    return d;
+  };
+  for (const p of order) depthOf(p);
+  for (const p of order) {
+    if (!(p.reuse && p.reuse.kind > 4)) continue;
+    let root: Planned | undefined = p;
+    while (root?.reuse && root.reuse.kind > 4 && root.reuse.baseId) {
+      root = byId.get(root.reuse.baseId);
+    }
+    if (root) root.reusedAbove = Math.max(root.reusedAbove ?? 0, p.depth);
+  }
+}
+
 /** git's pack_name_hash: the last characters of the path weigh most; spaces are skipped. */
 function nameHash(path: string | undefined): number {
   if (!path) return 0;
@@ -384,7 +432,8 @@ interface WindowEntry {
 /**
  * git's find_deltas: candidates sorted by type, name hash, haves first and size (largest first), each tried
  * against the previous `window` ones of its type; the smallest delta within git's size limit
- * wins. Objects reused as deltas are neither targets nor bases.
+ * wins. Objects reused as deltas are neither targets nor bases; an object with reused deltas on
+ * it becomes a delta only where their chains stay within the depth limit.
  */
 async function searchDeltas(
   objects: PackObjectSource,
@@ -430,7 +479,8 @@ async function searchDeltas(
       let best: { base: WindowEntry; delta: Uint8Array } | undefined;
       for (let i = window.length - 1; i >= 0; i--) {
         const w = window[i] as WindowEntry;
-        if (w.p.type !== p.type || w.p.depth >= maxDepth) continue;
+        // the reused deltas on p get as much deeper as p does
+        if (w.p.type !== p.type || w.p.depth + 1 + (p.reusedAbove ?? 0) > maxDepth) continue;
         // git's try_delta size limit, tighter for bases deep in a chain
         const trgSize = data.length;
         let maxSize: number;

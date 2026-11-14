@@ -276,7 +276,8 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
           if (pkt.type === "data" && pkt.payload.length > 0) {
             const channel = pkt.payload[0];
             if (channel === SIDEBAND_DATA) {
-              yield pkt.payload.slice(1);
+              // an empty band-1 packet is the server's keep-alive
+              if (pkt.payload.length > 1) yield pkt.payload.slice(1);
             } else if (channel === 3) {
               // Error channel
               const errorMsg = textDecoder.decode(pkt.payload.slice(1));

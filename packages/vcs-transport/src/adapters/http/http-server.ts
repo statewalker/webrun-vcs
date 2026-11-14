@@ -68,9 +68,26 @@ export interface HttpServerOptions {
   requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
   /** Advertised capabilities */
   capabilities?: string[];
+  /**
+   * Side-band keep-alive interval (ms) while upload-pack prepares the pack, until its first
+   * byte (default 5000, as git's `uploadpack.keepAlive`; 0: none).
+   */
+  keepAliveMs?: number;
 }
 
 const textEncoder = new TextEncoder();
+
+/** The capabilities upload-pack advertises by default (GET /info/refs). */
+const DEFAULT_UPLOAD_PACK_CAPABILITIES = [
+  "multi_ack_detailed",
+  "side-band-64k",
+  "thin-pack",
+  "no-progress",
+  "include-tag",
+  "ofs-delta",
+  "shallow",
+  "no-done",
+];
 
 /**
  * Handles GET /info/refs?service=git-upload-pack
@@ -96,17 +113,8 @@ export async function handleInfoRefs(
   chunks.push(encodePacketLine("# service=git-upload-pack\n"));
   chunks.push(encodeFlush());
 
-  // Default capabilities
-  const capabilities = options.capabilities ?? [
-    "multi_ack_detailed",
-    "side-band-64k",
-    "thin-pack",
-    "no-progress",
-    "include-tag",
-    "ofs-delta",
-    "shallow",
-    "no-done",
-  ];
+  // Default capabilities (copied: the symref below must not change the caller's array)
+  const capabilities = [...(options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES)];
 
   // Add symref capability if HEAD is a symbolic ref
   if (refStore.getSymrefTarget) {
@@ -187,15 +195,11 @@ export async function handleUploadPack(
     state.refs.set(refName, oid);
   }
 
-  // Set up capabilities from info/refs response
-  state.capabilities.add("multi_ack_detailed");
-  state.capabilities.add("side-band-64k");
-  state.capabilities.add("thin-pack");
-  state.capabilities.add("no-progress");
-  state.capabilities.add("include-tag");
-  state.capabilities.add("ofs-delta");
-  state.capabilities.add("shallow");
-  state.capabilities.add("no-done");
+  // What GET /info/refs advertised; the client's first want line picks from it (the FSM sets
+  // `state.capabilities` to that request, possibly empty)
+  for (const cap of options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES) {
+    state.advertisedCapabilities.add(cap);
+  }
 
   // The response streams as the FSM writes it: each write waits until the reader pulled the
   // previous chunk (an identity TransformStream with no readable buffer).
@@ -222,6 +226,7 @@ export async function handleUploadPack(
   const config: ProcessConfiguration = {
     requestPolicy: options.requestPolicy ?? "ADVERTISED",
     maxEmptyBatches: 10,
+    keepAliveMs: options.keepAliveMs,
   };
 
   const ctx: ProcessContext = {
@@ -238,10 +243,14 @@ export async function handleUploadPack(
   const fsm = new Fsm(serverFetchTransitions, serverFetchHandlers);
   fsm.setState("READ_WANTS");
 
-  // a protocol error (output.error) was reported in band (sideband 3) once writing started;
-  // a thrown one breaks the stream
+  // a protocol error (output.error) was reported in band (sideband 3) once writing started,
+  // unless the FSM says it could not be (`streamBroken`: raw pack bytes were out); that one and
+  // a thrown one break the stream
   const run = fsm.run(ctx).then(
-    () => (ctx.output.error ? { error: new Error(ctx.output.error), thrown: false } : undefined),
+    () =>
+      ctx.output.error
+        ? { error: new Error(ctx.output.error), thrown: ctx.output.streamBroken === true }
+        : undefined,
     (error: unknown) => ({
       error: error instanceof Error ? error : new Error(String(error)),
       thrown: true,

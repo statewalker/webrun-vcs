@@ -18,7 +18,7 @@ import { createEmptyPack } from "../../protocol/pack-utils.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { parseReportStatusLines } from "../../protocol/report-status.js";
 import { sidebandPackStream } from "../../protocol/sideband-pack-stream.js";
-import { requestBody } from "../../utils/request-stream.js";
+import { fetchWithRequestBody, shouldStreamRequestBody } from "../../utils/request-stream.js";
 import {
   collectChunks,
   decodeSidebandResponse,
@@ -354,6 +354,13 @@ export interface HttpPushOptions {
   onProgress?: (message: string) => void;
   /** Custom fetch function (for testing or different environments) */
   fetchFn?: typeof fetch;
+  /**
+   * Stream the request body (fetch `duplex: "half"`). Default: outside browsers, where the
+   * runtime supports it; browsers collect the body first unless this is `true` (Chromium
+   * refuses streamed bodies over HTTP/1.1). A streamed request that fails with a `TypeError`
+   * before any response is sent once more with a collected body.
+   */
+  streamRequestBody?: boolean;
 }
 
 /**
@@ -432,6 +439,8 @@ export async function httpPush(
 
     // Build request body
     const requestChunks: Uint8Array[] = [];
+    // OFS deltas only when the server advertised ofs-delta
+    const ofsDelta = state.capabilities.has("ofs-delta");
 
     // Send ref update commands
     let firstUpdate = true;
@@ -445,7 +454,7 @@ export async function httpPush(
 
       // Build capability string for first line (null byte separates refname from capabilities)
       const caps = firstUpdate
-        ? `\0report-status side-band-64k${atomic ? " atomic" : ""}${pushOptions.length > 0 ? " push-options" : ""}`
+        ? `\0report-status side-band-64k${atomic ? " atomic" : ""}${pushOptions.length > 0 ? " push-options" : ""}${ofsDelta ? " ofs-delta" : ""}`
         : "";
 
       const line = `${update.oldOid} ${update.newOid} ${update.refName}${caps}`;
@@ -470,23 +479,28 @@ export async function httpPush(
       yield* requestChunks;
       if (wantedOids.size > 0) {
         // the objects the server does not have
-        yield* repository.exportPack(wantedOids, excludeOids);
+        yield* repository.exportPack(wantedOids, excludeOids, { ofsDelta });
       } else {
         // an empty pack for delete-only operations
         yield createEmptyPack();
       }
     }
 
-    // Send POST request
-    const receivePackResponse = await fetchFn(receivePackUrl, {
-      method: "POST",
-      headers: {
-        ...combinedHeaders,
-        "Content-Type": "application/x-git-receive-pack-request",
-        Accept: "application/x-git-receive-pack-result",
-      },
-      ...(await requestBody(body())),
-    } as RequestInit);
+    // Send POST request (retried once with a collected body if a streamed one is refused)
+    const receivePackResponse = await fetchWithRequestBody(
+      body,
+      (init) =>
+        fetchFn(receivePackUrl, {
+          method: "POST",
+          headers: {
+            ...combinedHeaders,
+            "Content-Type": "application/x-git-receive-pack-request",
+            Accept: "application/x-git-receive-pack-result",
+          },
+          ...init,
+        } as RequestInit),
+      shouldStreamRequestBody(options.streamRequestBody),
+    );
 
     if (!receivePackResponse.ok) {
       return {

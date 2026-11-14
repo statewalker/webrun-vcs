@@ -8,6 +8,7 @@
  */
 
 import type { ProcessContext } from "../../context/process-context.js";
+import { sendPackStream } from "../fetch/index.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { createEmptyFetchRequest, type FetchV2Request, SERVER_V2_CAPABILITIES } from "./types.js";
 
@@ -545,8 +546,18 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           },
         );
 
-        await ctx.transport.writePack(packStream);
-        return "PACKFILE_SENT";
+        // The packfile section is side-band multiplexed (seeded as side-band-64k by the
+        // server): keep-alives until the first byte, an error on band 3 after it
+        const sent = await sendPackStream(ctx.transport, packStream, {
+          sideband: ctx.state.capabilities.has("side-band-64k"),
+          progress: false,
+          keepAliveMs: ctx.config.keepAliveMs,
+        });
+        if (sent.ok) return "PACKFILE_SENT";
+        ctx.output.error = sent.error;
+        // without side-band the client must see a broken stream, not a short pack
+        if (!sent.inBand) ctx.output.streamBroken = true;
+        return "ERROR";
       } catch (e) {
         ctx.output.error = String(e);
         return "ERROR";

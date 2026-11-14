@@ -14,6 +14,7 @@ import {
   openPackSet,
   type PackObjectRef,
   type PackSet,
+  readPackIndex,
   unpackObjects,
   type WritePackOptions,
   type WrittenPackEntry,
@@ -337,4 +338,134 @@ describe("writePack: bounded memory", () => {
     expect(maxAhead).toBeLessThan(8 * MiB);
     expect(bytesToHex(tail)).toBe(bytesToHex(hash.digest()));
   }, 120_000);
+});
+
+describe("writePack: the depth limit holds for reused chains", () => {
+  /** The delta chain length of each written entry (a base outside the pack counts as one). */
+  function chainDepths(entries: WrittenPackEntry[]): number[] {
+    const base = new Map(entries.map((e) => [e.id, e.baseId]));
+    const depth = (id: string): number => {
+      const b = base.get(id);
+      return b ? 1 + (base.has(b) ? depth(b) : 0) : 0;
+    };
+    return entries.map((e) => depth(e.id));
+  }
+
+  /** A, B, C (and D, larger and like C) in a loose store, with packedABC for reuse. */
+  async function abcd() {
+    const set = await packedABC();
+    const objects = memObjects();
+    const D = enc.encode(`${new TextDecoder().decode(C)}plus D, a larger version\n`);
+    for (const data of [A, B, C, D]) await objects.put("blob", data.length, [data]);
+    const Did = oidOf("blob", D);
+    return { set, objects, Did };
+  }
+
+  it("breaks a reused chain longer than the depth by writing an object whole", async () => {
+    const { set, objects } = await abcd();
+    const { bytes, entries } = await write(objects, [Aid, Bid, Cid], {
+      packs: set,
+      deltaSearch: { depth: 1 },
+    });
+    expect(Math.max(...chainDepths(entries))).toBeLessThanOrEqual(1);
+    expect(entries.find((e) => e.id === Bid)).toMatchObject({ kind: 6, reused: true });
+    expect(entries.find((e) => e.id === Cid)).toMatchObject({ kind: 3, reused: false });
+    await checkUnpacks(bytes, objects);
+  });
+
+  it("does not make the base of reused deltas a delta they would pass the depth on", async () => {
+    const { set, objects, Did } = await abcd();
+    const refs = [Aid, Bid, Cid, Did].map((id) => ({ id, type: "blob" as const, path: "f" }));
+    const { bytes, entries } = await write(objects, refs, {
+      packs: set,
+      deltaSearch: { depth: 1 },
+    });
+    expect(Math.max(...chainDepths(entries))).toBeLessThanOrEqual(1);
+    // the search still runs: something became a delta besides the reused B
+    expect(entries.some((e) => e.baseId && !e.reused)).toBe(true);
+    await checkUnpacks(bytes, objects);
+  });
+
+  it("keeps the base of a reused delta whole when the depth allows nothing more", async () => {
+    // B is a reused delta on A at depth 1; D (larger, like A) is searched first, and A must not
+    // become a delta on it
+    const { set, objects, Did } = await abcd();
+    const refs = [Aid, Bid, Did].map((id) => ({ id, type: "blob" as const, path: "f" }));
+    const { bytes, entries } = await write(objects, refs, {
+      packs: set,
+      deltaSearch: { depth: 1 },
+    });
+    expect(entries.find((e) => e.id === Aid)?.kind).toBe(3);
+    expect(entries.find((e) => e.id === Bid)).toMatchObject({ kind: 6, baseId: Aid });
+    expect(Math.max(...chainDepths(entries))).toBeLessThanOrEqual(1);
+    await checkUnpacks(bytes, objects);
+  });
+});
+
+describe("writePack: onEntry CRC-32", () => {
+  /** CRC-32 (IEEE, reflected), bit by bit: independent of the writer's table-driven one. */
+  function crc32(data: Uint8Array): number {
+    let c = 0xffffffff;
+    for (const byte of data) {
+      c ^= byte;
+      for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1;
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  it("matches the CRC of each entry's bytes and installPack's idx", async () => {
+    const objects = memObjects();
+    const set = await packedABC();
+    for (const data of [A, B, C]) await objects.put("blob", data.length, [data]);
+    const b1 = await blob(objects, "hello\n".repeat(30));
+    const t = await tree(objects, [["100644", "hello.txt", b1]]);
+    const c = await commit(objects, t, [], 1000);
+    const { bytes, entries } = await write(objects, [c, t, b1, Aid, Bid, Cid], {
+      packs: set,
+      deltaSearch: true,
+    });
+    const offsets = entries.map((e) => e.offset).sort((x, y) => x - y);
+    const end = (offset: number) => offsets.find((o) => o > offset) ?? bytes.length - 20;
+    for (const e of entries) {
+      expect(e.crc32).toBe(crc32(bytes.subarray(e.offset, end(e.offset))));
+    }
+    const files = createInMemoryFilesApi();
+    const { packId } = await installPack(files, "/p", chunks(bytes, 1000));
+    const idx = readPackIndex(await collect(files.read(`/p/pack-${packId}.idx`)));
+    for (const e of entries) expect(idx.findCRC32(e.id)).toBe(e.crc32);
+    expect(entries.some((e) => e.reused)).toBe(true);
+  });
+});
+
+describe("writePack: reuse cycles", () => {
+  it("writes the first of a cycle of reused deltas whole (copies from two packs)", async () => {
+    const { deflate } = await import("@statewalker/vcs-utils/compression");
+    const { createGitDeltaIndex, encodeGitDelta } = await import("@statewalker/vcs-utils/diff");
+    const dBA = encodeGitDelta(createGitDeltaIndex(B), A) as Uint8Array;
+    async function* once(d: Uint8Array) {
+      yield d;
+    }
+    // A stored as a delta on B in one pack, B as a delta on A in another
+    const stored = new Map([
+      [Aid, { kind: 7 as const, size: dBA.length, baseId: Bid, data: dBA }],
+      [Bid, { kind: 7 as const, size: dAB.length, baseId: Aid, data: dAB }],
+    ]);
+    const packs = {
+      async entry(id: string) {
+        const e = stored.get(id);
+        return (
+          e && { kind: e.kind, size: e.size, baseId: e.baseId, raw: () => deflate(once(e.data)) }
+        );
+      },
+    };
+    const objects = memObjects();
+    for (const data of [A, B]) await objects.put("blob", data.length, [data]);
+    const { bytes, entries } = await write(objects, [Aid, Bid], { packs });
+    expect(entries.filter((e) => e.kind === 3).length).toBe(1);
+    const delta = entries.find((e) => e.baseId) as WrittenPackEntry;
+    expect(delta).toMatchObject({ reused: true });
+    expect(entries.find((e) => e.id === delta.baseId)?.kind).toBe(3);
+    const r = await checkUnpacks(bytes, objects);
+    expect(r.deltas).toBe(1);
+  });
 });

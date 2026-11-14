@@ -364,8 +364,9 @@ export class PushCommand extends TransportCommand<PushResult> {
     const serialization =
       (history as Partial<HistoryWithOperations>).serialization ??
       new DefaultSerializationApi({ history });
-    const exportPack = (wants: Set<string>, exclude: Set<string>) =>
-      serialization.exportPack(wants, exclude);
+    // OFS deltas only when the remote advertised ofs-delta (the transport says which)
+    const exportPack = (wants: Set<string>, exclude: Set<string>, options: { ofsDelta: boolean }) =>
+      serialization.exportPack(wants, exclude, { ofsDelta: options.ofsDelta });
 
     // Object ids resolved for each source ref, captured as the transport asks
     // for them, so we report the value that was really sent on the wire.

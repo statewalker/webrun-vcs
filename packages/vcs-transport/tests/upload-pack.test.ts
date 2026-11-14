@@ -991,7 +991,8 @@ describe("Upload-Pack: Ref Advertisement", () => {
 
     const state = getState(ctx);
     expect(state.refs.get("refs/heads/main")).toBe(mainOid);
-    expect(state.capabilities.size).toBeGreaterThan(0);
+    // the advertised set; `capabilities` is what the first want line requests
+    expect(state.advertisedCapabilities.size).toBeGreaterThan(0);
   });
 });
 

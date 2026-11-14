@@ -17,6 +17,13 @@ export class HandlerOutput {
   error?: string;
 
   /**
+   * Server side: the error came after raw (non-side-band) bytes were written, so it could not
+   * be reported in band; the transport must break the response (abort it) so the client sees a
+   * failure rather than a truncated pack that looks complete.
+   */
+  streamBroken?: boolean;
+
+  /**
    * Last acknowledged object ID from server.
    * Updated during ACK/NAK negotiation.
    */

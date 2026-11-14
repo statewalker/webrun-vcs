@@ -226,7 +226,8 @@ export class VcsHttpServer {
     const wants: string[] = [];
     const haves: string[] = [];
     let _done = false;
-    let useSideband = false;
+    // The client's capabilities are on its first want line only (possibly none)
+    let clientCaps: Set<string> | undefined;
 
     for await (const packet of packets) {
       if (packet.type === "flush") {
@@ -239,11 +240,9 @@ export class VcsHttpServer {
       const line = packetDataToString(packet);
 
       if (line.startsWith("want ")) {
-        const parts = line.slice(5).split(" ");
+        const parts = line.slice(5).trim().split(" ");
         wants.push(parts[0]);
-        if (line.includes(CAPABILITY_SIDE_BAND_64K)) {
-          useSideband = true;
-        }
+        clientCaps ??= new Set(parts.slice(1));
       } else if (line.startsWith("have ")) {
         haves.push(line.slice(5).trim());
       } else if (line === "done") {
@@ -253,15 +252,18 @@ export class VcsHttpServer {
     }
 
     const res = new ResponseBodyWriter();
+    const useSideband = clientCaps?.has(CAPABILITY_SIDE_BAND_64K) ?? false;
 
     // Send NAK (we don't implement multi-ack negotiation)
     res.write(this.pktLine("NAK\n"));
 
-    // Build pack file
-    const packResult = await this.buildPackForWants(storage, wants, haves);
+    // Build pack file: OFS deltas only when the client asked for ofs-delta
+    const packResult = await this.buildPackForWants(storage, wants, haves, {
+      ofsDelta: clientCaps?.has(CAPABILITY_OFS_DELTA) ?? false,
+    });
 
     if (useSideband) {
-      await this.sendSidebandPack(res, packResult.packData);
+      await this.sendSidebandPack(res, packResult.packData, !clientCaps?.has("no-progress"));
     } else {
       res.write(packResult.packData);
     }
@@ -391,12 +393,16 @@ export class VcsHttpServer {
     storage: FileHistory,
     wants: string[],
     haves: string[],
+    options: { ofsDelta: boolean },
   ): Promise<{ packData: Uint8Array }> {
     // git rev-list --objects, then git pack-objects (whole objects and found deltas)
     const listed: ListedObject[] = [];
     for await (const o of listObjects(storage.objects, { wants, haves })) listed.push(o);
     const chunks: Uint8Array[] = [];
-    for await (const chunk of writePack(storage.objects, listed, { deltaSearch: true })) {
+    for await (const chunk of writePack(storage.objects, listed, {
+      deltaSearch: true,
+      ofsDelta: options.ofsDelta,
+    })) {
       chunks.push(chunk);
     }
     return { packData: this.concatBytes(chunks) };
@@ -405,9 +411,15 @@ export class VcsHttpServer {
   /**
    * Send pack data via sideband.
    */
-  private async sendSidebandPack(res: ResponseBodyWriter, packData: Uint8Array): Promise<void> {
-    const progressMsg = textEncoder.encode("Counting objects...\n");
-    res.write(this.encodeSidebandPacket(SIDEBAND_PROGRESS, progressMsg));
+  private async sendSidebandPack(
+    res: ResponseBodyWriter,
+    packData: Uint8Array,
+    progress: boolean,
+  ): Promise<void> {
+    if (progress) {
+      const progressMsg = textEncoder.encode("Counting objects...\n");
+      res.write(this.encodeSidebandPacket(SIDEBAND_PROGRESS, progressMsg));
+    }
 
     const chunkSize = 65515;
     for (let i = 0; i < packData.length; i += chunkSize) {

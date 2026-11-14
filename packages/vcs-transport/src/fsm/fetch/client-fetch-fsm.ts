@@ -543,7 +543,7 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               const channel = pkt.payload[0];
               const data = pkt.payload.subarray(1);
               if (channel === 1) {
-                yield data;
+                if (data.length > 0) yield data; // an empty band-1 packet is a keep-alive
               } else if (channel === 2) {
                 if (!config.noProgress) output.progress = decoder.decode(data);
               } else if (channel === 3) {

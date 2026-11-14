@@ -356,7 +356,7 @@ async function pushChanges(history: FileHistory, url: string): Promise<void> {
       return ref?.objectId;
     },
     // the objects the remote lacks, streamed as a pack (listObjects + writePack)
-    exportPack: (wants, exclude) => exportPack(history.objects, wants, exclude),
+    exportPack: (wants, exclude, options) => exportPack(history.objects, wants, exclude, options),
     onProgressMessage: (msg) => {
       if (msg.trim()) {
         printInfo(`  ${msg.trim()}`);

@@ -142,3 +142,29 @@ describe("listObjects: the boundary", () => {
     expect(byId.has(h.v3)).toBe(false);
   });
 });
+
+describe("listObjects: gitlinks", () => {
+  it("skips submodule commits (mode 160000): neither listed nor read", async () => {
+    const objects = memObjects();
+    const file = await blob(objects, "readme\n");
+    // a commit of another repository: not in this store
+    const sub = "5".repeat(40);
+    const t = await tree(objects, [
+      ["100644", "README", file],
+      ["160000", "vendor", sub],
+    ]);
+    const c = await commit(objects, t, [], 1000);
+    const reads: string[] = [];
+    const spy = {
+      ...objects,
+      get: (id: string) => {
+        reads.push(id);
+        return objects.get(id);
+      },
+      has: (id: string) => objects.has(id),
+    } as GitObjects;
+    const out = await list(spy, { wants: [c] });
+    expect(out.map((o) => o.id).sort()).toEqual([c, t, file].sort());
+    expect(reads).not.toContain(sub);
+  });
+});
