@@ -6,15 +6,13 @@
 
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   indexPack,
   indexPackFromStream,
   PackObjectType,
   PackWriterStream,
 } from "../../src/pack/index.js";
-
-beforeAll(() => {});
 
 /** Compute git object ID */
 async function computeObjectId(type: string, content: Uint8Array): Promise<string> {

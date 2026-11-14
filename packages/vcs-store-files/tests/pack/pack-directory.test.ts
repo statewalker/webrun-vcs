@@ -11,11 +11,8 @@ import {
   writePack,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { PackDirectory } from "../../src/pack/index.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {});
 
 /**
  * Create a pack file with test objects

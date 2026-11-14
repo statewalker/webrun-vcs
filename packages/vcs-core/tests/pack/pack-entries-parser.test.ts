@@ -5,7 +5,7 @@
  */
 
 import { MemoryPackObjectCache } from "@statewalker/vcs-utils/pack";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   type PackEntry,
   PackObjectType,
@@ -14,8 +14,6 @@ import {
   parsePackEntriesFromStream,
   writePack,
 } from "../../src/pack/index.js";
-
-beforeAll(() => {});
 
 function toChunkedStream(data: Uint8Array, chunkSize: number): AsyncIterable<Uint8Array> {
   return (async function* () {

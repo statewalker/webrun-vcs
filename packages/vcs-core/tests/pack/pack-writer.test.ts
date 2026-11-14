@@ -7,16 +7,13 @@
 import { crc32 } from "@statewalker/vcs-utils/hash/crc32";
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   PackObjectType,
   type PackWriterObject,
   PackWriterStream,
   writePack,
 } from "../../src/pack/index.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {});
 
 /**
  * Compute SHA-1 hash of data (for pack name verification)

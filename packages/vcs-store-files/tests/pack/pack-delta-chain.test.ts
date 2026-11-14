@@ -16,11 +16,8 @@ import {
   writePackIndexV2,
 } from "@statewalker/vcs-core";
 import { applyGitDelta } from "@statewalker/vcs-utils";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { PackDirectory, PackReader } from "../../src/pack/index.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {});
 
 /**
  * Encode a variable-length integer (Git varint format)

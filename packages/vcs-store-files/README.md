@@ -167,8 +167,9 @@ the lock, write the new id into the lock and rename it over the ref. Several ref
 then `packed-refs.lock`, and commit as JGit's `PackedBatchRefUpdate` does, first moving the
 involved loose refs into `packed-refs` and then landing the whole batch in `packed-refs` with one
 rename. A crash at any file operation leaves every ref at its old or its new value once stale
-locks are removed; native `git` reads the result, honours our locks and makes us report `locked`
-while it holds its own. Reflog lines are written to `logs/` in git's format (HEAD's too when it
+locks are removed; native `git` reads the result, refuses to update a ref we hold locked, and makes
+us report `locked` while it holds its own (a lock created in the same instant by both is not
+excluded: FilesApi has no exclusive create). Reflog lines are written to `logs/` in git's format (HEAD's too when it
 points at an updated branch). `compareAndSwap` is a one-command batch.
 
 The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`, which is
@@ -233,8 +234,8 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
 - `.git/config` is read and written by `GitWorkingCopyConfig` as one file: `[include]` /
   `[includeIf]` are not followed, a malformed section header is kept but ignored where `git`
   would reject the file, and `save()` rewrites the whole file without a `config.lock`.
-- Ref batches and `compareAndSwap` use `.lock` files and rename (with native `AtomicFiles`, safe
-  next to a running `git`). `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
+- Ref batches and `compareAndSwap` use `.lock` files and rename, exclusive among writers sharing
+  one FilesApi; another process such as a running `git` is not excluded. `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
   `packed-refs` without `packed-refs.lock` and can lose a concurrent batch), loose objects and the
   index are still written directly, without locks: do not run them next to a batch or a `git`
   process writing the same repository.

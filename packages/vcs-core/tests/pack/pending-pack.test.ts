@@ -4,11 +4,8 @@
  * Tests object buffering, threshold detection, and pack generation.
  */
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { PackObjectType, PendingPack, readPackIndex } from "../../src/pack/index.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {});
 
 describe("PendingPack", () => {
   describe("basic operations", () => {

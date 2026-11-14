@@ -1,6 +1,6 @@
 /**
  * Atomic ref batches on a real .git directory: native git reads what the batch
- * writes, locks interoperate both ways, and a crash at any file operation
+ * writes, it and our batches respect each other's locks, and a crash at any file operation
  * leaves every ref at its old or new value. Needs native git.
  */
 import { execFileSync, spawnSync } from "node:child_process";

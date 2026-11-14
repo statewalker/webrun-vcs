@@ -10,11 +10,8 @@ import {
   type GitPackStore,
   MemoryRawStorage,
 } from "@statewalker/vcs-core";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createGitPackStore } from "../../../src/pack/git-pack-store.impl.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {});
 
 /**
  * Helper to create Git object content (with header)

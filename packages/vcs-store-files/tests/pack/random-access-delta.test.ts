@@ -15,11 +15,8 @@ import {
   readPackIndex,
   writePackIndexV2,
 } from "@statewalker/vcs-core";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { PackReader } from "../../src/pack/index.js";
-
-// Set up Node.js compression before tests
-beforeAll(() => {});
 
 /**
  * Encode a variable-length integer (Git varint format)

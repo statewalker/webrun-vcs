@@ -36,13 +36,19 @@ export interface AtomicFiles {
 
 /** Paths held by an in-flight `createExclusive`, per FilesApi, shared by every adapter over it. */
 const pending = new WeakMap<FilesApi, Set<string>>();
+/**
+ * The tail of the structural operations (exclusive create, empty-directory
+ * removal) on each FilesApi. Running them one at a time makes each one's checks
+ * and its change a single step for every adapter over that FilesApi.
+ */
+const structural = new WeakMap<FilesApi, Promise<unknown>>();
 
 /**
  * `AtomicFiles` over any FilesApi, rooted at `root`.
  *
  * Exclusive creation is guaranteed only among adapters over the same FilesApi
- * instance (a per-instance registry closes the gap between the existence check
- * and the write). Two FilesApi instances over one directory, even in one
+ * instance: exclusive creates and empty-directory removals on one FilesApi run
+ * one at a time, so each one's checks and its change happen as one step. Two FilesApi instances over one directory, even in one
  * process, and other processes such as native git are not excluded: use one
  * FilesApi instance per repository, and do not run another writer on the same
  * directory. (Cross-process exclusion needs an exclusive create in FilesApi.)
@@ -64,6 +70,14 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
     pending.set(fs, held);
   }
   const claims = held;
+  const serial = <T>(op: () => Promise<T>): Promise<T> => {
+    const run = (structural.get(fs) ?? Promise.resolve()).then(op, op);
+    structural.set(
+      fs,
+      run.catch(() => {}),
+    );
+    return run;
+  };
   const isFile = async (path: string) => (await fs.stats(abs(path)))?.kind === "file";
   const ensureDir = async (path: string) => {
     const dir = dirname(abs(path));
@@ -93,27 +107,28 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
       }
       yield* out.sort();
     },
-    async createExclusive(path, content) {
-      const key = abs(path);
-      if (claims.has(key)) return false;
-      claims.add(key);
-      try {
-        // A file where a directory is needed: refuse, as open(2) does with ENOTDIR.
-        const parts = path.split("/").filter(Boolean);
-        for (let i = 1; i < parts.length; i++) {
-          const parent = parts.slice(0, i).join("/");
-          if ((await fs.stats(abs(parent)))?.kind === "file") {
-            throw Object.assign(new Error(`ENOTDIR: ${parent} is a file`), { code: "ENOTDIR" });
+    createExclusive: (path, content) =>
+      serial(async () => {
+        const key = abs(path);
+        if (claims.has(key)) return false;
+        claims.add(key);
+        try {
+          // A file where a directory is needed: refuse, as open(2) does with ENOTDIR.
+          const parts = path.split("/").filter(Boolean);
+          for (let i = 1; i < parts.length; i++) {
+            const parent = parts.slice(0, i).join("/");
+            if ((await fs.stats(abs(parent)))?.kind === "file") {
+              throw Object.assign(new Error(`ENOTDIR: ${parent} is a file`), { code: "ENOTDIR" });
+            }
           }
+          if (await fs.exists(key)) return false;
+          await ensureDir(path);
+          await fs.write(key, [content]);
+          return true;
+        } finally {
+          claims.delete(key);
         }
-        if (await fs.exists(key)) return false;
-        await ensureDir(path);
-        await fs.write(key, [content]);
-        return true;
-      } finally {
-        claims.delete(key);
-      }
-    },
+      }),
     async replace(source, target) {
       await ensureDir(target);
       if (!(await fs.move(abs(source), abs(target)))) {
@@ -126,10 +141,13 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
       await ensureDir(path);
       await fs.write(abs(path), [...old, content]);
     },
-    async removeEmptyDir(dir) {
-      if ((await fs.stats(abs(dir)))?.kind !== "directory") return false;
-      for await (const _ of fs.list(abs(dir))) return false;
-      return fs.remove(abs(dir));
-    },
+    // Serialized with createExclusive, so a lock created in this directory cannot
+    // slip in between the emptiness check and the (possibly recursive) remove.
+    removeEmptyDir: (dir) =>
+      serial(async () => {
+        if ((await fs.stats(abs(dir)))?.kind !== "directory") return false;
+        for await (const _ of fs.list(abs(dir))) return false;
+        return fs.remove(abs(dir));
+      }),
   };
 }

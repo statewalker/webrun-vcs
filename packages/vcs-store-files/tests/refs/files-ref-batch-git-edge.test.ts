@@ -81,9 +81,9 @@ const batchFor = (repo: string, options = {}) => createFilesRefBatch(atomicFor(r
 const updateRef = (repo: string, stdin: string, extra: string[] = []) =>
   git(repo, ["update-ref", ...extra, "-m", "msg", "--stdin"], stdin);
 
-// The full batch contract on disk, through FileRefStore with native lock files.
+// The full batch contract on disk, through FileRefStore with FilesApi lock files.
 createRefBatchTests(
-  "Git files on disk (native AtomicFiles)",
+  "Git files on disk (FilesApi AtomicFiles)",
   async () => {
     const dir = mkdtempSync(join(tmpdir(), "refs-contract-"));
     roots.push(dir);

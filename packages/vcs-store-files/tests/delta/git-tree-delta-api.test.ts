@@ -13,10 +13,8 @@ import {
   GitFilesTreeDeltaApi,
   parseBinaryDelta,
 } from "@statewalker/vcs-core";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { PackDeltaStore } from "../../src/pack/index.js";
-
-beforeAll(() => {});
 
 function oid(seed: string): string {
   return seed.padStart(40, "0");

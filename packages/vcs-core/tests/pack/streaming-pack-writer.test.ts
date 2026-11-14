@@ -7,7 +7,7 @@
 
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   PackObjectType,
   PackWriterStream,
@@ -15,8 +15,6 @@ import {
   parsePackEntriesFromStream,
   StreamingPackWriter,
 } from "../../src/pack/index.js";
-
-beforeAll(() => {});
 
 /** Collect all chunks from an async generator into a single Uint8Array */
 async function collect(gen: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
