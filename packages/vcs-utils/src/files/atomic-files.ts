@@ -38,16 +38,31 @@ export interface AtomicFiles {
 }
 
 /**
- * The exclusive create of webrun-files' FilesApi (`open "wx"` on Node, Web Locks in the
- * browser, a transaction in sqlite). Optional there, and missing from the FilesApi
- * versions without it, so it is detected at run time.
+ * How many times a delegated `createExclusive` is retried after ENOENT. webrun-files-node
+ * runs `mkdir -p` and then `open "wx"`; another process (native git pruning empty ref
+ * directories) can remove the directory in between. Git's `raceproof_create_file` retries
+ * the same way.
  */
-type WithCreateExclusive = {
-  createExclusive?: (
-    path: string,
-    content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
-  ) => Promise<boolean>;
-};
+const ENOENT_RETRIES = 3;
+
+const isEnoent = (error: unknown) =>
+  typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT";
+
+/** `createExclusive` of the FilesApi, retried while its directory vanishes underneath it. */
+async function createExclusiveRaceproof(
+  fs: FilesApi,
+  exclusive: NonNullable<FilesApi["createExclusive"]>,
+  path: string,
+  content: Uint8Array,
+): Promise<boolean> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await exclusive.call(fs, path, [content]);
+    } catch (error) {
+      if (!isEnoent(error) || attempt >= ENOENT_RETRIES) throw error;
+    }
+  }
+}
 
 /** Paths held by an in-flight `createExclusive`, per FilesApi, shared by every adapter over it. */
 const pending = new WeakMap<FilesApi, Set<string>>();
@@ -61,10 +76,11 @@ const structural = new WeakMap<FilesApi, Promise<unknown>>();
 /**
  * `AtomicFiles` over any FilesApi, rooted at `root`.
  *
- * When the FilesApi has `createExclusive` (`@statewalker/webrun-files-node` from
- * its next release, and the browser and sqlite FilesApis), `createExclusive`
- * delegates to it, and a lock excludes every writer the backend excludes: other
- * processes such as native git, other tabs, other FilesApi instances.
+ * When the FilesApi has `createExclusive` (every webrun-files FilesApi from 0.11:
+ * node, browser, mem, sqlite), `createExclusive` delegates to it, and a lock
+ * excludes every writer the backend excludes: other processes such as native git,
+ * other tabs, other FilesApi instances. A delegated call that fails with ENOENT
+ * (its directory pruned by another process between `mkdir` and `open`) is retried.
  *
  * Without it, exclusive creation is guaranteed only among adapters over the same
  * FilesApi instance: exclusive creates and empty-directory removals on one
@@ -142,8 +158,8 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
           }
         }
         const key = abs(path);
-        const exclusive = (fs as FilesApi & WithCreateExclusive).createExclusive;
-        if (exclusive) return exclusive.call(fs, key, [content]);
+        const exclusive = fs.createExclusive;
+        if (exclusive) return createExclusiveRaceproof(fs, exclusive, key, content);
         if (claims.has(key)) return false;
         claims.add(key);
         try {

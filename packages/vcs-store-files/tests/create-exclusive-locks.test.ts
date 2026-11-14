@@ -53,10 +53,17 @@ function withCreateExclusive(base: FilesApi): { files: FilesApi; calls: string[]
   return { files, calls };
 }
 
-/** `base` behind a second instance, without `createExclusive` (today's FilesApi). */
+/**
+ * `base` behind a second instance, without `createExclusive` (a FilesApi that has none;
+ * webrun-files-mem 0.11 has one, so it is hidden here).
+ */
 function plainWrapper(base: FilesApi): FilesApi {
   return new Proxy(base, {
+    has(target, prop) {
+      return prop !== "createExclusive" && Reflect.has(target, prop);
+    },
     get(target, prop) {
+      if (prop === "createExclusive") return undefined;
       const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? value.bind(target) : value;
     },
@@ -159,3 +166,105 @@ describe("ref batches and gc through FilesApi.createExclusive", () => {
     expect(await base.exists(".git/gc.pid")).toBe(false);
   });
 });
+
+describe("createExclusive retries when the lock's directory vanishes (ENOENT)", () => {
+  /**
+   * `base` with a `createExclusive` that throws ENOENT on its first `failures` calls, as
+   * webrun-files-node's does when another process (native git) prunes the empty directory
+   * between its `mkdir -p` and its `open "wx"`.
+   */
+  function flaky(base: FilesApi, failures: number): { files: FilesApi; attempts: () => number } {
+    let n = 0;
+    const createExclusive = async (
+      path: string,
+      content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+    ): Promise<boolean> => {
+      n++;
+      if (n <= failures) {
+        throw Object.assign(new Error(`ENOENT: no such file or directory, open '${path}'`), {
+          code: "ENOENT",
+        });
+      }
+      if (await base.exists(path)) return false;
+      await base.write(path, content);
+      return true;
+    };
+    const files = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "createExclusive") return createExclusive;
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    return { files, attempts: () => n };
+  }
+
+  it("retries once after ENOENT and takes the lock", async () => {
+    const base = createInMemoryFilesApi();
+    const { files, attempts } = flaky(base, 1);
+    const atomic = atomicFilesOver(files, "/repo/.git");
+    expect(await atomic.createExclusive("refs/heads/main.lock", enc.encode("x"))).toBe(true);
+    expect(attempts()).toBe(2);
+    expect(await base.exists("/repo/.git/refs/heads/main.lock")).toBe(true);
+  });
+
+  it("gives up and rethrows when ENOENT persists", async () => {
+    const { files, attempts } = flaky(createInMemoryFilesApi(), 1000);
+    const atomic = atomicFilesOver(files, "/repo/.git");
+    await expect(atomic.createExclusive("index.lock", enc.encode("x"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(attempts()).toBeGreaterThan(1);
+    expect(attempts()).toBeLessThan(1000);
+  });
+
+  it("does not retry other errors", async () => {
+    const base = createInMemoryFilesApi();
+    let n = 0;
+    const files = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "createExclusive") {
+          return async () => {
+            n++;
+            throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const atomic = atomicFilesOver(files, "/repo/.git");
+    await expect(atomic.createExclusive("index.lock", enc.encode("x"))).rejects.toMatchObject({
+      code: "EACCES",
+    });
+    expect(n).toBe(1);
+  });
+});
+
+createAtomicFilesTests("webrun-files-mem 0.11 createExclusive", async () => ({
+  files: atomicFilesOver(createInMemoryFilesApi(), "/repo/.git"),
+}));
+
+describe("webrun-files-mem's own createExclusive", () => {
+  it("is present, and two instances over one MemFilesApi exclude each other", async () => {
+    const base = createInMemoryFilesApi();
+    expect(typeof base.createExclusive).toBe("function");
+    const a = atomicFilesOver(plainProxy(base), "/repo/.git");
+    const b = atomicFilesOver(plainProxy(base), "/repo/.git");
+    const won = await Promise.all([
+      a.createExclusive("index.lock", enc.encode("a")),
+      b.createExclusive("index.lock", enc.encode("b")),
+    ]);
+    expect(won.filter(Boolean)).toHaveLength(1);
+  });
+});
+
+/** A second handle on `base` that keeps all its methods, `createExclusive` included. */
+function plainProxy(base: FilesApi): FilesApi {
+  return new Proxy(base, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}

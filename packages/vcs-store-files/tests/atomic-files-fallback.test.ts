@@ -1,6 +1,27 @@
 import { createAtomicFilesTests } from "@statewalker/vcs-testing";
-import { atomicFilesOver, createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
+import {
+  atomicFilesOver,
+  createInMemoryFilesApi as createMemFilesApi,
+  type FilesApi,
+} from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
+
+/**
+ * An in-memory FilesApi without `createExclusive`, so these suites exercise the
+ * in-process fallback (webrun-files-mem 0.11 has its own `createExclusive`).
+ */
+function createInMemoryFilesApi(): FilesApi {
+  return new Proxy(createMemFilesApi(), {
+    has(target, prop) {
+      return prop !== "createExclusive" && Reflect.has(target, prop);
+    },
+    get(target, prop) {
+      if (prop === "createExclusive") return undefined;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
 
 createAtomicFilesTests("FilesApi fallback (in memory)", async () => ({
   files: atomicFilesOver(createInMemoryFilesApi(), "/repo/.git"),
