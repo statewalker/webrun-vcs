@@ -4,7 +4,7 @@
  * as git's own and leaves `git status` clean.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-utils/files";
@@ -73,10 +73,10 @@ describe("GitStaging writes an index native git reads", () => {
 
     // streamed in several chunks, not one buffer
     expect(chunks.get(".git/index")).toBeGreaterThan(2);
-    // git's own TREE extension is not written, so the file differs, but its entries do not
+    // the entries did not change, so git's own TREE extension is kept as it was
     const ours = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
     expect(ours.entries).toHaveLength(2001);
-    expect(ours.extensions).toEqual([]);
+    expect(ours.extensions).toEqual(["TREE"]);
     expect(git(dir, ["ls-files", "--stage"])).toBe(stageBefore);
     expect(git(dir, ["status", "--porcelain"])).toBe("");
     git(dir, ["fsck", "--strict"]);
@@ -103,3 +103,106 @@ async function collect(files: FilesApi, path: string): Promise<Uint8Array> {
   }
   return out;
 }
+
+describe("GitStaging rewrites git's index through index.lock, keeping what still applies", () => {
+  /** A repository whose index holds a resolved conflict (REUC) and the untracked cache (UNTR). */
+  function resolvedConflictRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "index-ext-git-"));
+    dirs.push(dir);
+    git(dir, ["init", "-q", "--initial-branch=main", "."]);
+    git(dir, ["config", "core.untrackedCache", "true"]);
+    writeFileSync(join(dir, "f.txt"), "base\n");
+    writeFileSync(join(dir, "g.txt"), "g\n");
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-q", "-m", "base"]);
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    writeFileSync(join(dir, "f.txt"), "side\n");
+    git(dir, ["commit", "-q", "-am", "side"]);
+    git(dir, ["checkout", "-q", "main"]);
+    writeFileSync(join(dir, "f.txt"), "main\n");
+    git(dir, ["commit", "-q", "-am", "main"]);
+    try {
+      git(dir, ["merge", "-q", "side"]);
+    } catch {
+      // the expected conflict
+    }
+    writeFileSync(join(dir, "f.txt"), "resolved\n");
+    git(dir, ["add", "f.txt"]);
+    git(dir, ["status", "--porcelain", "-uall"]); // writes UNTR
+    return dir;
+  }
+
+  it("keeps resolve-undo data when the entries change; native git reads the index", async () => {
+    const dir = resolvedConflictRepo();
+    const undoBefore = git(dir, ["ls-files", "--resolve-undo"]);
+    expect(undoBefore.split("\n")).toHaveLength(3);
+    const before = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    expect(before.extensions).toContain("REUC");
+    expect(before.extensions).toContain("UNTR");
+
+    writeFileSync(join(dir, "h.txt"), "h\n");
+    const hId = git(dir, ["hash-object", "-w", "h.txt"]);
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await staging.setEntry({ path: "h.txt", mode: 0o100644, objectId: hId });
+    await staging.write();
+
+    expect(existsSync(join(dir, ".git/index.lock"))).toBe(false);
+    const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    // the entries changed: the cache-tree and untracked cache go, resolve-undo stays
+    expect(after.extensions).toEqual(["REUC"]);
+    expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
+    expect(git(dir, ["ls-files", "--stage", "h.txt"])).toBe(`100644 ${hId} 0\th.txt`);
+    git(dir, ["status", "--porcelain"]);
+    git(dir, ["fsck", "--strict"]);
+  });
+
+  it("keeps every extension unchanged when the entries do not change", async () => {
+    const dir = resolvedConflictRepo();
+    const before = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await staging.write();
+    const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    expect(after.extensions).toEqual(before.extensions.filter((s) => s !== "EOIE" && s !== "IEOT"));
+    for (const ext of after.extensionData) {
+      const old = before.extensionData.find((e) => e.signature === ext.signature);
+      expect(old && Buffer.from(old.data).equals(Buffer.from(ext.data)), ext.signature).toBe(true);
+    }
+  });
+
+  it("drops the resolve-undo record of a path that is no longer in the index", async () => {
+    const dir = resolvedConflictRepo();
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await staging.removeEntry("f.txt");
+    await staging.write();
+    const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    expect(after.extensions).toEqual([]);
+    expect(git(dir, ["ls-files", "--resolve-undo"])).toBe("");
+  });
+
+  it("refuses to rewrite a split index (required 'link' extension)", async () => {
+    const dir = resolvedConflictRepo();
+    git(dir, ["update-index", "--split-index"]);
+    const before = readFileSync(join(dir, ".git/index"));
+    expect((await parseIndexFile(new Uint8Array(before))).extensions).toContain("link");
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await expect(staging.write()).rejects.toThrow("required extension 'link'");
+    expect(readFileSync(join(dir, ".git/index")).equals(before)).toBe(true);
+    expect(existsSync(join(dir, ".git/index.lock"))).toBe(false);
+  });
+
+  it("refuses to write while native git holds index.lock", async () => {
+    const dir = resolvedConflictRepo();
+    const before = readFileSync(join(dir, ".git/index"));
+    writeFileSync(join(dir, ".git/index.lock"), "");
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await staging.removeEntry("g.txt");
+    await expect(staging.write()).rejects.toThrow("index.lock': File exists");
+    expect(readFileSync(join(dir, ".git/index")).equals(before)).toBe(true);
+    rmSync(join(dir, ".git/index.lock"));
+  });
+});

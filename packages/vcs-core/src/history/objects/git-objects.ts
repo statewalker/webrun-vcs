@@ -115,3 +115,26 @@ export class ObjectIdMismatchError extends CorruptObjectError {
 export class InvalidObjectIdError extends Error {
   override name = "InvalidObjectIdError";
 }
+
+const OBJECT_ID_PATTERN = /^[0-9a-f]{40}$/;
+
+/**
+ * The 20 bytes of a SHA-1 object id, for the binary formats that store ids raw
+ * (tree entries, index entries, pack indexes).
+ *
+ * @example
+ * ```typescript
+ * objectIdToBytes("ce013625030ba8dba906f756967f9e9ca394464a").length; // 20
+ * objectIdToBytes("ce01362"); // throws InvalidObjectIdError
+ * ```
+ *
+ * @throws InvalidObjectIdError unless `id` is exactly 40 lowercase hex characters
+ */
+export function objectIdToBytes(id: string): Uint8Array {
+  if (typeof id !== "string" || !OBJECT_ID_PATTERN.test(id)) {
+    throw new InvalidObjectIdError(`not an object id: ${JSON.stringify(id)}`);
+  }
+  const bytes = new Uint8Array(20);
+  for (let i = 0; i < 20; i++) bytes[i] = Number.parseInt(id.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}

@@ -1,13 +1,13 @@
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
-import { FileMode, type FilesApi, readFile } from "@statewalker/vcs-core";
+import { FileMode, type FilesApi } from "@statewalker/vcs-core";
 import type { IndexBuilder, IndexEditor, Staging } from "@statewalker/vcs-working-tree";
 import {
-  encodeIndexFile,
+  type GitStagingOptions,
   INDEX_VERSION_2,
+  IndexFile,
   type IndexVersion,
   MergeStage,
   type MergeStageValue,
-  parseIndexFile,
   type StagingEdit,
   type StagingEntry,
   type StagingEntryOptions,
@@ -20,16 +20,23 @@ import {
  * Supports index versions 2, 3, and 4.
  *
  * All entries are kept sorted by (path, stage) for binary search.
+ *
+ * `write()` follows git's lock-file protocol (`<index>.lock`, then a rename) and
+ * keeps the extensions git wrote that still apply, as `GitStaging` does.
  */
 export class FileStagingStore implements Staging {
   private _entries: StagingEntry[] = [];
   private updateTime = 0;
   private version: IndexVersion = INDEX_VERSION_2;
+  private readonly indexFile: IndexFile;
 
   constructor(
     private readonly files: FilesApi,
     private readonly indexPath: string,
-  ) {}
+    options: GitStagingOptions = {},
+  ) {
+    this.indexFile = new IndexFile(files, indexPath, options);
+  }
 
   // ============ Reading Operations ============
 
@@ -305,24 +312,21 @@ export class FileStagingStore implements Staging {
   // ============ Persistence ============
 
   async read(): Promise<void> {
-    const stats = await this.files.stats(this.indexPath);
-    if (!stats) {
+    const read = await this.indexFile.read();
+    if (!read) {
       // No index file - start empty
       this._entries = [];
       this.updateTime = 0;
       return;
     }
-
-    const data = await readFile(this.files, this.indexPath);
-    const parsed = await parseIndexFile(data);
-
-    this._entries = parsed.entries;
-    this.version = parsed.version;
-    this.updateTime = stats.lastModified ?? Date.now();
+    this._entries = read.entries;
+    this.version = this.indexFile.version;
+    this.updateTime = read.lastModified;
   }
 
   async write(): Promise<void> {
-    await this.files.write(this.indexPath, encodeIndexFile(this._entries, this.version));
+    this.indexFile.version = this.version;
+    await this.indexFile.write(this._entries);
     this.updateTime = Date.now();
   }
 

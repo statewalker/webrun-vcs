@@ -43,3 +43,16 @@ describe("bytesToHex", () => {
     expect(bytesToHex(hexToBytes(original))).toBe(original);
   });
 });
+
+describe("hexToBytes rejects malformed hex", () => {
+  it("throws on odd length", () => {
+    expect(() => hexToBytes("abc")).toThrow(/odd length/);
+  });
+
+  it("throws on non-hex characters", () => {
+    expect(() => hexToBytes("zz")).toThrow(/not hex/);
+    expect(() => hexToBytes("0g")).toThrow(/not hex/);
+    expect(() => hexToBytes("+1")).toThrow(/not hex/);
+    expect(() => hexToBytes("a ")).toThrow(/not hex/);
+  });
+});

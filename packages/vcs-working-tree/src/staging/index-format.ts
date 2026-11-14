@@ -1,4 +1,5 @@
-import { bytesToHex, createSha1, hexToBytes, sha1 } from "@statewalker/vcs-utils";
+import { objectIdToBytes } from "@statewalker/vcs-core";
+import { bytesToHex, createSha1, sha1 } from "@statewalker/vcs-utils";
 import type { MergeStageValue, StagingEntry } from "./types.js";
 
 /**
@@ -85,6 +86,18 @@ export interface ParsedIndex {
    * for a split index, ...). Their contents are not parsed.
    */
   extensions: string[];
+  /**
+   * The extensions themselves, signature and payload (a copy), in file order. Pass
+   * them through `carryIndexExtensions` before writing them back with
+   * `encodeIndexFile`.
+   */
+  extensionData: IndexExtension[];
+}
+
+/** An index extension as stored: a four-character signature and its payload. */
+export interface IndexExtension {
+  signature: string;
+  data: Uint8Array;
 }
 
 /**
@@ -145,16 +158,19 @@ export async function parseIndexFile(data: Uint8Array): Promise<ParsedIndex> {
 
   // Extensions: a 4-byte signature and a 4-byte size, then the data, up to the checksum
   const extensions: string[] = [];
+  const extensionData: IndexExtension[] = [];
   const end = data.length - CHECKSUM_SIZE;
   while (offset + 8 <= end) {
     const size = view.getUint32(offset + 4);
     // a size past the checksum: not an extension git wrote; stop (the entries are complete)
     if (offset + 8 + size > end) break;
-    extensions.push(String.fromCharCode(...data.subarray(offset, offset + 4)));
+    const signature = String.fromCharCode(...data.subarray(offset, offset + 4));
+    extensions.push(signature);
+    extensionData.push({ signature, data: data.slice(offset + 8, offset + 8 + size) });
     offset += 8 + size;
   }
 
-  return { version, entries, extensions };
+  return { version, entries, extensions, extensionData };
 }
 
 /**
@@ -302,7 +318,7 @@ const INDEX_CHUNK_SIZE = 64 * 1024;
  * Encode entries in Git index format, as chunks.
  *
  * Entries are validated and sorted by (path, stage) before anything is yielded,
- * so an invalid path throws here and not halfway through a write. The chunks
+ * so an invalid path or object id throws here and not halfway through a write. The chunks
  * (the header, entries gathered into about 64 KiB pieces, then the trailing
  * SHA-1, computed as they go) are produced as they are pulled, so an index is
  * never built as one buffer.
@@ -314,27 +330,36 @@ const INDEX_CHUNK_SIZE = 64 * 1024;
  *
  * @param entries Entries to encode (sorted here; the array is not changed)
  * @param version Index version (default: 2)
+ * @param extensions Extensions written after the entries, as given (see `carryIndexExtensions`)
  * @returns The index file's bytes, chunk by chunk; the last chunk is the 20-byte checksum
- * @throws Error when a path is invalid
+ * @throws Error when a path is invalid; InvalidObjectIdError when an object id is not 40 lowercase hex
  */
 export function encodeIndexFile(
   entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
+  extensions: readonly IndexExtension[] = [],
 ): Iterable<Uint8Array> {
   for (const entry of entries) {
     validatePath(entry.path);
+    objectIdToBytes(entry.objectId);
+  }
+  for (const ext of extensions) {
+    if (!/^[\x21-\x7e]{4}$/.test(ext.signature)) {
+      throw new Error(`Invalid index extension signature: ${JSON.stringify(ext.signature)}`);
+    }
   }
   const sortedEntries = [...entries].sort((a, b) => {
     const pathCmp = comparePaths(a.path, b.path);
     if (pathCmp !== 0) return pathCmp;
     return a.stage - b.stage;
   });
-  return encodeSorted(sortedEntries, version);
+  return encodeSorted(sortedEntries, version, extensions);
 }
 
 function* encodeSorted(
   sortedEntries: StagingEntry[],
   version: IndexVersion,
+  extensions: readonly IndexExtension[],
 ): Generator<Uint8Array> {
   const hasher = createSha1();
 
@@ -362,6 +387,14 @@ function* encodeSorted(
     previousPath = entry.path;
     if (pendingLength >= INDEX_CHUNK_SIZE) yield take();
   }
+  for (const ext of extensions) {
+    const head = new Uint8Array(8);
+    for (let i = 0; i < 4; i++) head[i] = ext.signature.charCodeAt(i);
+    new DataView(head.buffer).setUint32(4, ext.data.length);
+    pending.push(head, ext.data);
+    pendingLength += 8 + ext.data.length;
+    if (pendingLength >= INDEX_CHUNK_SIZE) yield take();
+  }
   if (pendingLength > 0) yield take();
 
   yield hasher.digest();
@@ -380,8 +413,9 @@ function* encodeSorted(
 export async function serializeIndexFile(
   entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
+  extensions: readonly IndexExtension[] = [],
 ): Promise<Uint8Array> {
-  return concatBytes([...encodeIndexFile(entries, version)]);
+  return concatBytes([...encodeIndexFile(entries, version, extensions)]);
 }
 
 /**
@@ -508,7 +542,7 @@ function writeEntryHeader(
   view.setUint32(P_SIZE, entry.size);
 
   // object ID (20 bytes)
-  const oidBytes = hexToBytes(entry.objectId);
+  const oidBytes = objectIdToBytes(entry.objectId);
   const buffer = new Uint8Array(view.buffer, view.byteOffset);
   buffer.set(oidBytes, P_OBJECTID);
 

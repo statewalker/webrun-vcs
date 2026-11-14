@@ -8,13 +8,9 @@
  */
 
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
-import { createInMemoryFilesApi, FileMode, type FilesApi, readFile } from "@statewalker/vcs-core";
-import {
-  encodeIndexFile,
-  INDEX_VERSION_2,
-  type IndexVersion,
-  parseIndexFile,
-} from "./index-format.js";
+import { createInMemoryFilesApi, FileMode, type FilesApi } from "@statewalker/vcs-core";
+import { IndexFile } from "./index-file.js";
+import { INDEX_VERSION_2, type IndexVersion } from "./index-format.js";
 import type {
   ConflictResolution,
   EntryIteratorOptions,
@@ -32,16 +28,23 @@ import { MergeStage, type MergeStageValue, type StagingEntry } from "./types.js"
  * Git index file-based Staging implementation
  *
  * This implements the new Staging interface using the standard Git index format.
+ *
+ * `write()` follows git's lock-file protocol (see `writeIndexFile`) and keeps the
+ * extensions git wrote that still apply (see `carryIndexExtensions`).
  */
 export class GitStaging implements Staging {
   private _entries: IndexEntry[] = [];
   private updateTime = 0;
   private version: IndexVersion = INDEX_VERSION_2;
+  private readonly indexFile: IndexFile;
 
   constructor(
     private readonly files: FilesApi,
     private readonly indexPath: string,
-  ) {}
+    options: GitStagingOptions = {},
+  ) {
+    this.indexFile = new IndexFile(files, indexPath, options);
+  }
 
   // ============ Entry Operations ============
 
@@ -291,24 +294,21 @@ export class GitStaging implements Staging {
   // ============ Persistence ============
 
   async read(): Promise<void> {
-    const stats = await this.files.stats(this.indexPath);
-    if (!stats) {
+    const read = await this.indexFile.read();
+    if (!read) {
       // No index file - start empty
       this._entries = [];
       this.updateTime = 0;
       return;
     }
-
-    const data = await readFile(this.files, this.indexPath);
-    const parsed = await parseIndexFile(data);
-
-    this._entries = parsed.entries;
-    this.version = parsed.version;
-    this.updateTime = stats.lastModified ?? Date.now();
+    this._entries = read.entries;
+    this.version = this.indexFile.version;
+    this.updateTime = read.lastModified;
   }
 
   async write(): Promise<void> {
-    await this.files.write(this.indexPath, encodeIndexFile(this._entries, this.version));
+    this.indexFile.version = this.version;
+    await this.indexFile.write(this._entries);
     this.updateTime = Date.now();
   }
 
@@ -666,11 +666,24 @@ function storeTreeEntries(trees: Trees, entries: Iterable<TreeEntry>): Promise<O
   return trees.store(entries);
 }
 
+/** Options for `GitStaging` / `createGitStaging`. */
+export interface GitStagingOptions {
+  /**
+   * How long `write()` keeps retrying while `<index>.lock` exists, in
+   * milliseconds (default 0: fail at once with `IndexLockedError`, as git does).
+   */
+  lockTimeoutMs?: number;
+}
+
 /**
  * Factory function to create a Git-based Staging
  */
-export function createGitStaging(files: FilesApi, indexPath: string): Staging {
-  return new GitStaging(files, indexPath);
+export function createGitStaging(
+  files: FilesApi,
+  indexPath: string,
+  options?: GitStagingOptions,
+): Staging {
+  return new GitStaging(files, indexPath, options);
 }
 
 /**
