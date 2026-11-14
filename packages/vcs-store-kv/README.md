@@ -36,7 +36,7 @@ adapter needs.
 | `KvDeltaStore`, `createKvDeltaStore(kv, prefix?)` | `DeltaStore` on a `KVStore`. |
 | `KvBinStore`, `createKvBinStore(kv, rawPrefix?, deltaPrefix?)` | `BinStore` combining the two above. |
 | `uint8ArrayEquals(a, b)` | Byte comparison helper for adapters implementing `compareAndSwap`. |
-| `createGitObjectStore`, `createBlobs`, `createTrees`, `createCommits`, `createTags` | Re-exported from `@statewalker/vcs-core`. |
+| `createGitObjects`, `GitObjects`, `createBlobs`, `createTrees`, `createCommits`, `createTags` | Re-exported from `@statewalker/vcs-core`. |
 
 ## Examples
 

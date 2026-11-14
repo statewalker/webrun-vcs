@@ -133,7 +133,7 @@ bin.clear();
 ### Git-format objects
 
 `createMemoryObjectStores()` serializes every object in Git format into a `MemoryRawStorage` and
-hashes it with SHA-1. It uses the same `createGitObjectStore` / `createBlobs` / `createTrees` /
+hashes it with SHA-1. It uses the same `createGitObjects` / `createBlobs` / `createTrees` /
 `createCommits` / `createTags` code as the persistent backends, so its ids match native Git.
 
 Tree entries are sorted in Git canonical order (directories compare as `name/`) before hashing.

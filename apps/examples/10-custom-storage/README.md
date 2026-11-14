@@ -7,7 +7,7 @@ A runnable example that builds `History` instances five ways, from the zero-conf
 What you will learn:
 
 - Which factory function fits which use case
-- Building a `History` from a `GitObjectStore` with `createHistoryFromComponents()`
+- Building a `History` from a `GitObjects` kernel with `createHistoryFromComponents()`
 - Composing a `History` from explicit store instances with `createHistoryFromStores()`
 - Sharing object storage between `History` instances while keeping refs independent
 - The difference between `History` and `HistoryWithOperations`
@@ -29,9 +29,9 @@ How the layers stack, from bytes up:
 
 ```
  RawStorage (MemoryRawStorage, or your own)
-      │  createGitObjectStore(storage)
+      │  createGitObjects(rawStorageStaging(storage))
       v
- GitObjectStore  ── one store for blobs, trees, commits and tags
+ GitObjects  ── one object kernel for blobs, trees, commits and tags
       │  createBlobs / createTrees / createCommits / createTags
       v
  Blobs, Trees, Commits, Tags  +  Refs (createMemoryRefs, or an adapter)
@@ -59,7 +59,7 @@ All snippets import from `@statewalker/vcs-core`.
 
 ### Pattern 1: createMemoryHistory() wires everything for you
 
-The fastest way to a working repository. It allocates a `MemoryRawStorage`, wraps it in a `GitObjectStore`, and uses in-memory refs. It returns the basic `History` interface.
+The fastest way to a working repository. It allocates a `MemoryRawStorage`, wraps it in a `GitObjects` kernel, and uses in-memory refs. It returns the basic `History` interface.
 
 ```typescript
 import { createMemoryHistory, type History } from "@statewalker/vcs-core";
@@ -96,16 +96,17 @@ for await (const oid of history.collectReachableObjects(new Set([commitId]), new
 
 ### Pattern 3: createHistoryFromComponents() builds the typed stores from one object store
 
-You supply a `GitObjectStore` and a refs choice; the factory creates the blob, tree, commit and tag stores over that one object store.
+You supply a `GitObjects` kernel and a refs choice; the factory creates the blob, tree, commit and tag stores over that one object store.
 
 ```typescript
 import {
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromComponents,
   MemoryRawStorage,
+  rawStorageStaging,
 } from "@statewalker/vcs-core";
 
-const objects = createGitObjectStore(new MemoryRawStorage());
+const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
 
 const history = createHistoryFromComponents({
   objects,
@@ -124,15 +125,16 @@ For full control, build each store yourself. This is where you plug in a store t
 import {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromStores,
   createMemoryRefs,
   createTags,
   createTrees,
   MemoryRawStorage,
+  rawStorageStaging,
 } from "@statewalker/vcs-core";
 
-const objects = createGitObjectStore(new MemoryRawStorage());
+const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
 
 const history = createHistoryFromStores({
   blobs: createBlobs(objects),
@@ -144,14 +146,14 @@ const history = createHistoryFromStores({
 await history.initialize();
 ```
 
-The store factories all take a `GitObjectStore`. Any object that implements `Blobs`, `Trees`, `Commits`, `Tags` or `Refs` can replace the matching one.
+The store factories all take a `GitObjects`. Any object that implements `Blobs`, `Trees`, `Commits`, `Tags` or `Refs` can replace the matching one.
 
 ### Pattern 5: two Histories over one object store
 
-Two instances built from the same `GitObjectStore` see each other's objects immediately. Each `{ type: "memory" }` refs config creates its own ref store, so branches stay separate.
+Two instances built from the same `GitObjects` see each other's objects immediately. Each `{ type: "memory" }` refs config creates its own ref store, so branches stay separate.
 
 ```typescript
-const sharedObjects = createGitObjectStore(new MemoryRawStorage());
+const sharedObjects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
 
 const historyA = createHistoryFromComponents({ objects: sharedObjects, refs: { type: "memory" } });
 const historyB = createHistoryFromComponents({ objects: sharedObjects, refs: { type: "memory" } });
@@ -184,7 +186,7 @@ Commit ids differ on every run because the timestamp is `Date.now() / 1000`. A r
 === Pattern 3: createHistoryFromComponents() ===
   ...
   Commit: 67e24c5
-  All Git objects share a single MemoryRawStorage via GitObjectStore
+  All Git objects share a single MemoryRawStorage via GitObjects
   createHistoryFromComponents auto-builds typed stores (blobs, trees, commits, tags)
 
 === Pattern 4: createHistoryFromStores() ===
@@ -217,9 +219,9 @@ Example completed successfully!
 
 Only the memory-with-operations and Git-files factories return `HistoryWithOperations`; the other three return plain `History`. Code that needs `delta` or `serialization` must be given one of those two.
 
-### All object types share one GitObjectStore
+### All object types share one GitObjects kernel
 
-Blobs, trees, commits and tags are stored as Git objects, with Git headers, in a single `GitObjectStore`. Object ids are then real Git SHA-1s and objects can go into a pack without conversion, which is what the transport layer needs. Swapping the backend means swapping the `RawStorage` underneath, not reimplementing four stores.
+Blobs, trees, commits and tags are stored as Git objects, with Git headers, in a single `GitObjects` kernel, each as a zlib git loose object. Object ids are then real Git SHA-1s and objects can go into a pack without conversion, which is what the transport layer needs. Swapping the backend means swapping the `RawStorage` underneath, not reimplementing four stores.
 
 ### Refs are separate from objects
 
@@ -229,7 +231,7 @@ Refs are passed in independently of the object store. That is what makes pattern
 
 - **Ref changes do not cross instances.** In pattern 5, `historyA.refs.resolve("refs/heads/feature")` returns `undefined` after B set it; the output says `not set`. Share a `Refs` instance (pass the same one to `createHistoryFromStores`) if you need shared branches.
 - **Plain `History` has no `delta` or `serialization`.** Patterns 1, 3 and 4 return `History`, so there is no `history.serialization` to hand to APIs that need one, such as `createVcsRepositoryFacade({ history, serialization })`.
-- **Store factories take a `GitObjectStore`, not a `RawStorage`.** `createBlobs(new MemoryRawStorage())` is a type error; wrap the storage with `createGitObjectStore()` first.
+- **Store factories take a `GitObjects`, not a `RawStorage`.** `createBlobs(new MemoryRawStorage())` is a type error; wrap the storage with `createGitObjects(rawStorageStaging(storage))` first.
 - **Commit ids change between runs**, because commit timestamps are taken from the clock.
 - **Nothing persists.** Every pattern uses `MemoryRawStorage`; the data is gone when the process exits.
 - **Pattern 4 allocates an unused `_customBlobStorage`.** It is leftover in `main.ts`; blobs go into the shared object store like everything else.
@@ -249,11 +251,12 @@ Refs are passed in independently of the object store. That is what makes pattern
 |------------------|----------|---------|
 | `createMemoryHistory()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | Zero-config in-memory `History` |
 | `createMemoryHistoryWithOperations()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | In-memory `HistoryWithOperations` |
-| `createHistoryFromComponents()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | `History` from a `GitObjectStore` and refs config |
+| `createHistoryFromComponents()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | `History` from a `GitObjects` and refs config |
 | `createHistoryFromStores()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | `History` from explicit stores |
 | `createGitFilesHistory()` | [history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) | `HistoryWithOperations` over Git-files stores |
 | `History`, `HistoryWithOperations` | [history/history.ts](../../../packages/vcs-core/src/history/history.ts) | The interfaces |
-| `createGitObjectStore()` | [history/objects/object-store.impl.ts](../../../packages/vcs-core/src/history/objects/object-store.impl.ts) | Wrap a `RawStorage` as a Git object store |
+| `createGitObjects()` | [history/objects/git-objects.impl.ts](../../../packages/vcs-core/src/history/objects/git-objects.impl.ts) | The object kernel over a `StagingBlobStore` |
+| `rawStorageStaging()` | [storage/adapters/staging-blob-store.ts](../../../packages/vcs-core/src/storage/adapters/staging-blob-store.ts) | Adapt a `RawStorage` to a `StagingBlobStore` |
 | `MemoryRawStorage` | [storage/raw/memory-raw-storage.ts](../../../packages/vcs-core/src/storage/raw/memory-raw-storage.ts) | In-memory `RawStorage` |
 | `createBlobs()` | [history/blobs/blobs.impl.ts](../../../packages/vcs-core/src/history/blobs/blobs.impl.ts) | Blob store factory |
 | `createTrees()` | [history/trees/trees.impl.ts](../../../packages/vcs-core/src/history/trees/trees.impl.ts) | Tree store factory |

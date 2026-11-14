@@ -220,17 +220,19 @@ History / HistoryWithOperations        createMemoryHistory(), createGitFilesHist
   ├─ blobs, trees, commits, tags      typed, parsed objects (Blobs, Trees, Commits, Tags)
   └─ refs                             Refs: get/resolve/set/setSymbolic/batch/compareAndSwap/list
         │
-GitObjectStore                         "<type> <size>\0<content>", SHA-1 over the whole thing
+GitObjects                             "<type> <size>\0<content>", SHA-1 over the whole thing, zlib
+        │
+StagingBlobStore                       bytes by id: rawStorageStaging(RawStorage), filesStagingStore()
         │
 RawStorage                             bytes by key: MemoryRawStorage, CompressedRawStorage,
                                        ChunkedRawStorage, blobStoreToRawStorage(BlobStore), ...
 ```
 
-Every typed store delegates to one `GitObjectStore`, which adds the Git header, computes the id and reads the type back. Below it, a `RawStorage` stores bytes by key and knows nothing about Git. A new backend can stop at that level: `createHistoryFromComponents({ objects: createGitObjectStore(rawStorage), refs: { type: "memory" } })` gives a full `History` (pass any `Refs`, such as a store package's ref store, for persistent refs). `HistoryWithOperations` adds `delta` (deltify objects for storage), `serialization` (loose objects and packs) and `capabilities` (what the backend does natively), which GC and transport use.
+Every typed store delegates to one `GitObjects` kernel, which adds the Git header, computes the id, compresses the object and reads the type back. Below it, a `StagingBlobStore` stores bytes under an id known only after the last byte, and `rawStorageStaging()` adapts any `RawStorage`, which stores bytes by key and knows nothing about Git. A new backend can stop at that level: `createHistoryFromComponents({ objects: createGitObjects(rawStorageStaging(rawStorage)), refs: { type: "memory" } })` gives a full `History` (pass any `Refs`, such as a store package's ref store, for persistent refs). `HistoryWithOperations` adds `delta` (deltify objects for storage), `serialization` (loose objects and packs) and `capabilities` (what the backend does natively), which GC and transport use.
 
-### The object kernel (being wired in)
+### The object kernel
 
-`createGitObjects(store)` is the object layer that replaces `GitObjectStore` (P1.5c switches the typed stores to it). An object is the bytes `"<type> <size>\0" + content`, named by their SHA-1 and stored as their zlib stream, exactly a git loose object; the kernel never parses commits or trees, so any bytes git produced keep their id.
+`createGitObjects(store)` is the object layer under the typed stores. An object is the bytes `"<type> <size>\0" + content`, named by their SHA-1 and stored as their zlib stream, exactly a git loose object; the kernel never parses commits or trees, so any bytes git produced keep their id.
 
 ```typescript
 import { createGitObjects, MemoryRawStorage, rawStorageStaging } from "@statewalker/vcs-core";
@@ -247,7 +249,7 @@ const obj = await objects.get(id, { verify: true }); // { type: "blob", size: 6,
 
 ### Why everything streams
 
-Blob content is `AsyncIterable<Uint8Array>` on the way in and out, and trees load as async iterables of entries. A large file passes through with bounded memory, which matters in browsers. `VcsCore` collects trees into arrays because trees are small and arrays are easier to use.
+Blob content is `AsyncIterable<Uint8Array>` on the way in and out, and trees load as async iterables of entries. A large file passes through with bounded memory when its size is known: `blobs.store(content, size)` hashes and stores in one pass, while `blobs.store(content)` collects the content first to learn the size. That matters in browsers. `VcsCore` collects trees into arrays because trees are small and arrays are easier to use.
 
 ### Only SHA-1 is implemented
 

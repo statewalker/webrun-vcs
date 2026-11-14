@@ -6,7 +6,7 @@ Adapters that turn `@statewalker/vcs-core` stores into the interfaces `@statewal
 
 ## Why it exists: the transport knows nothing about storage
 
-`@statewalker/vcs-transport` speaks the Git protocol but never touches storage. It asks for a `RepositoryFacade` and a `RefStore`. This package is the bridge between those small interfaces and the `History`, `GitObjectStore` and `@statewalker/webrun-storage` stores of `@statewalker/vcs-core`. Keeping the bridge separate keeps the transport free of any storage dependency.
+`@statewalker/vcs-transport` speaks the Git protocol but never touches storage. It asks for a `RepositoryFacade` and a `RefStore`. This package is the bridge between those small interfaces and the `History`, `GitObjects` and `@statewalker/webrun-storage` stores of `@statewalker/vcs-core`. Keeping the bridge separate keeps the transport free of any storage dependency.
 
 ## How to use: choose an adapter by what you have
 
@@ -21,8 +21,8 @@ No peer dependencies. One entry point, `@statewalker/vcs-transport-adapters` (ES
 | `BlobStore` + `KvStore` from `@statewalker/webrun-storage` | `createStorageRepositoryFacade({ objects, refs })` | `{ facade, refStore }` ready for fetch/push/serve |
 | A `History` and a `SerializationApi` | `createVcsRepositoryFacade({ history, serialization })` | `RepositoryFacade` |
 | A `History` | `createVcsRepositoryAccess({ history })` | `RepositoryAccess` |
-| A `GitObjectStore` and a core `Refs` | `createCoreRepositoryAccess({ objectStore, refStore })` | `RepositoryAccess` |
-| A `GitObjectStore` only | `new GitNativeRepositoryAccess(objectStore)` | object-only access (no refs) |
+| A `GitObjects` and a core `Refs` | `createCoreRepositoryAccess({ objectStore, refStore })` | `RepositoryAccess` |
+| A `GitObjects` only | `new GitNativeRepositoryAccess(objectStore)` | object-only access (no refs) |
 | A store matching `MinimalStorage` | `createStorageAdapter(storage)` | `RepositoryAccess` |
 
 Other exports:
@@ -31,7 +31,7 @@ Other exports:
 |--------|-------------|
 | `VcsRepositoryFacade`, `VcsRepositoryAccess` | The classes behind the two `createVcs*` factories |
 | `DeltaAwareGitNativeRepositoryAccess` | `GitNativeRepositoryAccess` plus `isDelta`, `getDeltaBase`, `getChainDepth` from a `DeltaAwareStore` |
-| `createObjectGraphWalker(objectStore)` | `walk(wants, haves)` yields every object reachable from `wants` and not from `haves`, once each |
+| `createObjectGraphWalker(objects)` | Over a `GitObjects`: `walk(wants, haves)` yields every object reachable from `wants` and not from `haves`, once each |
 | `createGitWireFormat`, `parseGitWireFormat` | Build and parse `"<type> <size>\0<content>"` bytes |
 | `stringToObjectType`, `objectTypeToString` | Convert between `"commit"`/`"tree"`/`"blob"`/`"tag"` and type codes |
 
@@ -105,9 +105,9 @@ const { type, body } = parseGitWireFormat(bytes); // type is the blob type code
 ### How the facades map onto vcs-core
 
 - `VcsRepositoryFacade.exportPack` collects objects with `history.collectReachableObjects(wants, exclude)` and encodes them with `serialization.createPack`. Pack import goes through the `SerializationApi` too.
-- `createStorageRepositoryFacade` builds the full stack from two byte stores: `blobStoreToRawStorage(objects)` feeds `createGitObjectStore`, `kvStoreRefs(refs)` provides refs, `createHistoryFromStores` composes a `History`, and `DefaultSerializationApi` handles packs. It returns the facade plus a transport `RefStore` over the same refs.
+- `createStorageRepositoryFacade` builds the full stack from two byte stores: `blobStoreToRawStorage(objects)` feeds `createGitObjects(rawStorageStaging(...))`, `kvStoreRefs(refs)` provides refs, `createHistoryFromStores` composes a `History`, and `DefaultSerializationApi` handles packs. It returns the facade plus a transport `RefStore` over the same refs.
 - `VcsRepositoryAccess.updateRef` uses the refs store's `compareAndSwap` when an old id is given, so concurrent updates fail instead of overwriting.
-- `GitNativeRepositoryAccess` reads straight from a `GitObjectStore`, which already stores objects in wire format, so no re-serialization is needed.
+- `GitNativeRepositoryAccess` reads straight from a `GitObjects` (`getRaw` returns the object in wire format), so no re-serialization is needed.
 
 ### Constraints
 

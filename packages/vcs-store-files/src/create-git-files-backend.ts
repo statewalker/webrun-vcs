@@ -61,10 +61,10 @@ export interface GitFilesBackendResult {
  * Create a file-backed Git storage backend.
  *
  * Wires up all storage layers from a single FilesApi:
- * 1. FileRawStorage (loose objects with zlib compression)
- * 2. PackDirectoryAdapter (read-only pack file access)
- * 3. CompositeRawStorage (loose + packs) → GitObjectStore
- * 4. FileRefStore → Refs adapter
+ * 1. filesStagingStore → createGitObjects (loose objects, git's layout)
+ * 2. PackDirectory, read through withPacks (loose first, then packs)
+ * 3. FileRawStorage over the same loose files, for gc and repack
+ * 4. FileRefStore (Refs)
  * 5. Composed into History via createHistoryFromComponents()
  *
  * @example

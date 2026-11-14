@@ -299,7 +299,7 @@ await git.status().call();  // Returns staged/unstaged/untracked
 - `initializeGitInMemory(ctx)`: `createMemoryHistory()`, `createMemoryGitStaging()` and an
   in-memory checkout and worktree, combined into a `WorkingCopy`.
 - `initializeGitFromFiles(ctx, files)`: a Git `.git` layout over a `FilesApi`, using
-  `createGitObjectStore` over `FileRawStorage`, `createFileRefStore`, `createHistoryFromComponents`,
+  `createGitObjects` over `filesStagingStore`, `createFileRefStore`, `createHistoryFromComponents`,
   `createGitStaging` and `FileWorktree` from `@statewalker/vcs-store-files`.
 
 Both end with `Git.fromWorkingCopy(workingCopy)` from `@statewalker/vcs-commands`.

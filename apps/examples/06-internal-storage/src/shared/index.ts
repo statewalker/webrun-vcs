@@ -119,9 +119,7 @@ export async function createFileHistory(options: {
 
   const objectsDir = joinPath(gitDir, "objects");
 
-  // Create file storage for objects (FileRawStorage compresses by default)
-
-  // Create Git object store for blobs, trees, commits, tags
+  // Git objects (blobs, trees, commits, tags) as loose objects in .git/objects
   const objects = createGitObjects(filesStagingStore(files, objectsDir));
 
   // Create file-based ref store

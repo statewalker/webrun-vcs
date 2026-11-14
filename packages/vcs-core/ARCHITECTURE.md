@@ -114,8 +114,8 @@ The package organizes stores in layers, each building on the one below:
 │  CommitStore    TreeStore    BlobStore    TagStore           │
 │  Semantic operations on specific object types                │
 ├─────────────────────────────────────────────────────────────┤
-│                    GitObjectStore                            │
-│  Unified object storage with type headers                    │
+│                    GitObjects                                │
+│  Object kernel: type headers, SHA-1, zlib loose objects      │
 ├─────────────────────────────────────────────────────────────┤
 │               BinStore (binary storage)                      │
 │  Combines raw storage with delta compression                 │
@@ -127,9 +127,9 @@ The package organizes stores in layers, each building on the one below:
 
 ### Two-Tier API Design
 
-The HistoryStore exposes both `GitObjectStore` and typed stores (`blobs`, `trees`, `commits`, `tags`) because they serve different purposes:
+The HistoryStore exposes both the `GitObjects` kernel and typed stores (`blobs`, `trees`, `commits`, `tags`) because they serve different purposes:
 
-**GitObjectStore** provides low-level, type-agnostic, format-aware access. It works with raw Git objects including their headers (`"blob 123\0content"`), enabling operations that need the wire format: transport protocols, pack file generation, and object introspection.
+**GitObjects** provides low-level, type-agnostic, format-aware access. It works with raw Git objects including their headers (`"blob 123\0content"`), enabling operations that need the wire format: transport protocols, pack file generation, and object introspection.
 
 **Typed stores** provide high-level, type-specific, parsed interfaces. They parse object content into structured data (`Commit`, `TreeEntry[]`, etc.) and handle serialization automatically. Application code typically uses these for everyday VCS operations.
 
@@ -166,28 +166,31 @@ interface BinStore {
 }
 ```
 
-### GitObjectStore - Type-Aware Layer
+### GitObjects - The Object Kernel
 
-Adds Git object semantics (type headers, content hashing):
+Adds Git object semantics (type headers, content hashing) and stores every object as a zlib git loose object, on every backend. It is created with `createGitObjects(store)` over a `StagingBlobStore`; `rawStorageStaging(raw)` adapts any `RawStorage`:
 
 ```typescript
-interface GitObjectStore {
-  store(type: ObjectTypeString, content: AsyncIterable<Uint8Array>): Promise<ObjectId>;
-  loadRaw(id: ObjectId): AsyncIterable<Uint8Array>;  // With header
-  load(id: ObjectId): AsyncIterable<Uint8Array>;     // Without header
-  loadWithHeader(id: ObjectId): Promise<[GitObjectHeader, AsyncGenerator<Uint8Array>]>;
-  getHeader(id: ObjectId): Promise<GitObjectHeader>;
+const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+```
+
+```typescript
+interface GitObjects {
+  put(type: ObjectTypeString, size: number, content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<ObjectId>;
+  putRaw(id: ObjectId, raw: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<void>;
+  getRaw(id: ObjectId): AsyncIterable<Uint8Array>;   // "type size\0content", empty if absent
+  get(id: ObjectId, options?: { verify?: boolean }): Promise<GitObject | undefined>; // { type, size, content }
   has(id: ObjectId): Promise<boolean>;
-  delete(id: ObjectId): Promise<boolean>;
   list(): AsyncIterable<ObjectId>;                   // All object IDs
+  remove(id: ObjectId): Promise<boolean>;
 }
 ```
 
-The distinction between `loadRaw()` and `load()` matters for different use cases. Transport protocols need `loadRaw()` to get the complete Git object with header for pack file generation. Application code uses `load()` to get just the content, or works through typed stores that handle parsing.
+`put()` reads the content once, hashing and deflating as it goes; a `size` that does not match the content rejects with `SizeMismatchError` and stores nothing. The distinction between `getRaw()` and `get()` matters for different use cases. Transport protocols need `getRaw()` to get the complete Git object with header for pack file generation, and `putRaw()` to store an object received with its id. Application code uses `get()` to get the header and content separately, or works through typed stores that handle parsing.
 
 ### Semantic Stores
 
-Built on GitObjectStore, these provide domain-specific operations:
+Built on GitObjects, these provide domain-specific operations:
 
 | Store | Key Operations |
 |-------|----------------|
@@ -198,7 +201,7 @@ Built on GitObjectStore, these provide domain-specific operations:
 
 ### Why `objects` is Exposed in the Public API
 
-The current `History` interface does not carry an `objects` property: the `GitObjectStore` is created with `createGitObjectStore(rawStorage)` and passed to the typed-store factories and history factories, and callers that need raw access keep a reference to it (for example `createGitFilesBackend()` in `@statewalker/vcs-store-files` returns `{ history, objects, ... }`). This design choice enables several important use cases:
+The current `History` interface does not carry an `objects` property: the `GitObjects` kernel is created with `createGitObjects(rawStorageStaging(rawStorage))` and passed to the typed-store factories and history factories, and callers that need raw access keep a reference to it (for example `createGitFilesBackend()` in `@statewalker/vcs-store-files` returns `{ history, objects, ... }`). This design choice enables several important use cases:
 
 **Transport and Protocol Operations**
 
@@ -212,20 +215,23 @@ const repositoryAccess = createCoreRepositoryAccess({ objectStore, refStore });
 
 **Object Introspection**
 
-Sometimes you need to query an object's type and size without parsing its content. The `getHeader()` method provides this efficiently:
+Sometimes you need to query an object's type and size without parsing its content. `get()` returns the header with a content stream you can release unread:
 
 ```typescript
-const header = await historyStore.objects.getHeader(unknownId);
-console.log(`Type: ${header.type}, Size: ${header.size} bytes`);
+const obj = await objects.get(unknownId);
+if (obj) {
+  console.log(`Type: ${obj.type}, Size: ${obj.size} bytes`);
+  await obj.content[Symbol.asyncIterator]().return?.(); // release the read unconsumed
+}
 ```
 
 **Raw Object Streaming**
 
-The `loadRaw()` method streams objects with their Git headers intact, essential for network transfer and pack file generation:
+The `getRaw()` method streams objects with their Git headers intact, essential for network transfer and pack file generation:
 
 ```typescript
 // Collect raw object for push operation
-for await (const chunk of historyStore.objects.loadRaw(id)) {
+for await (const chunk of objects.getRaw(id)) {
   chunks.push(chunk);
 }
 const rawData = concatBytes(chunks);
@@ -238,15 +244,16 @@ const content = extractGitObjectContent(rawData);
 The `list()` method returns all object IDs regardless of type, useful for garbage collection, repository analysis, and migration tools:
 
 ```typescript
-for await (const id of historyStore.objects.list()) {
-  const header = await historyStore.objects.getHeader(id);
-  console.log(`${id}: ${header.type}`);
+for await (const id of objects.list()) {
+  const obj = await objects.get(id);
+  if (obj) console.log(`${id}: ${obj.type}`);
+  await obj?.content[Symbol.asyncIterator]().return?.();
 }
 ```
 
 **Internal Composition**
 
-The typed stores are thin wrappers that delegate to `GitObjectStore`. For example, `BlobStore.store()` simply calls `objects.store("blob", content)`. Exposing `objects` allows advanced users to bypass the typed layer when needed while keeping the common case simple.
+The typed stores are thin wrappers that delegate to `GitObjects`. For example, `blobs.store(content, size)` simply calls `objects.put("blob", size, content)`; without a size it collects the content first to learn it. Exposing `objects` allows advanced users to bypass the typed layer when needed while keeping the common case simple.
 
 ## Directory Structure Deep Dive
 
@@ -347,10 +354,8 @@ Low-level storage abstractions for bytes, packs, and deltas.
 | `raw/compressed-raw-storage.ts` | Zlib-compressed RawStorage wrapper |
 | `raw/combined-raw-storage.ts`, `raw/composite-raw-storage.ts` | RawStorage composed from several storages |
 | `binary/bin-store.ts` | `BinStore`: raw storage plus delta storage |
-| `binary/volatile-store.ts` | `VolatileStore` interface for transient data |
-| `binary/volatile-store.memory.ts` | In-memory VolatileStore implementation |
 
-File-based RawStorage lives in `@statewalker/vcs-store-files`; the webrun-storage adapter `blobStoreToRawStorage()` is in `storage/adapters/`. The `RawStorage` interface is implemented by each storage backend. All higher layers build on this abstraction.
+File-based RawStorage lives in `@statewalker/vcs-store-files`; the webrun-storage adapter `blobStoreToRawStorage()` is in `storage/adapters/`, next to `rawStorageStaging()`, which turns any `RawStorage` into the `StagingBlobStore` that `createGitObjects()` takes. The `RawStorage` interface is implemented by each storage backend. All higher layers build on this abstraction.
 
 #### pack/ (`src/pack`, exported through `backend`)
 
@@ -399,11 +404,11 @@ Git object model: objects, commits, trees, blobs, tags, and refs.
 
 | File | Purpose |
 |------|---------|
-| `object-store.ts` | `GitObjectStore` interface |
-| `object-store.impl.ts` | Implementation |
+| `git-objects.ts` | `GitObjects` interface (the object kernel) and its errors |
+| `git-objects.impl.ts` | `createGitObjects(store)` |
 | `object-header.ts` | Header encoding/decoding |
 | `object-types.ts` | Type codes and strings |
-| `load-with-header.ts` | Combined header+content loading |
+| `typed-object-access.ts` | How the typed stores use `GitObjects` (store of unknown size, header, typed load) |
 
 Header format: `"<type> <size>\0"`
 
@@ -418,8 +423,8 @@ Simplest object type - raw file contents.
 
 | File | Purpose |
 |------|---------|
-| `blob-store.ts` | `BlobStore` interface |
-| `blob-store.impl.ts` | Implementation delegating to `GitObjectStore` |
+| `blobs.ts` | `Blobs` interface |
+| `blobs.impl.ts` | Implementation delegating to `GitObjects` |
 
 Blobs have no internal structure to parse. They're stored as-is with a Git header.
 
@@ -637,7 +642,7 @@ These provide byte-level access to Git objects in wire format for transport oper
 
 - `RepositoryAccess` interface
 - `createVcsRepositoryAccess` - adapts VCS stores to RepositoryAccess
-- `createCoreRepositoryAccess` - adapts GitObjectStore + Refs to RepositoryAccess
+- `createCoreRepositoryAccess` - adapts GitObjects + Refs to RepositoryAccess
 - `GitNativeRepositoryAccess` - direct passthrough for object-only operations
 
 ```typescript
@@ -881,7 +886,7 @@ Then compose higher-level stores using the provided implementations:
 
 ```typescript
 const rawStorage = new MyRawStorage();
-const objects = createGitObjectStore(rawStorage);
+const objects = createGitObjects(rawStorageStaging(rawStorage));
 const commits = createCommits(objects);
 ```
 
@@ -970,7 +975,7 @@ The workspace-private `@statewalker/vcs-testing` package (`packages/vcs-testing`
 import { createCommitStoreTests } from "@statewalker/vcs-testing";
 
 createCommitStoreTests("MyCustomStorage", async () => ({
-  commitStore: createCommits(createGitObjectStore(new MyRawStorage())),
+  commitStore: createCommits(createGitObjects(rawStorageStaging(new MyRawStorage()))),
   cleanup: async () => {},
 }));
 ```
