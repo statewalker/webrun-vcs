@@ -19,8 +19,12 @@ const lines = createInterface({ input: process.stdin });
 process.stdout.write("ready\n");
 for await (const line of lines) {
   if (line.trim() !== "go") continue;
-  const results = await Promise.all(locks.map((lock) => files.createExclusive(lock, enc.encode(label))));
-  process.stdout.write(`${JSON.stringify(Object.fromEntries(locks.map((l, i) => [l, results[i]])))}\n`);
+  const results = await Promise.all(
+    locks.map((lock) => files.createExclusive(lock, enc.encode(label))),
+  );
+  process.stdout.write(
+    `${JSON.stringify(Object.fromEntries(locks.map((l, i) => [l, results[i]])))}\n`,
+  );
   break;
 }
 lines.close();

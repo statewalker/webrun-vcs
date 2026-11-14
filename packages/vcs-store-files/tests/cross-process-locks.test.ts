@@ -91,9 +91,7 @@ describe("lock files across processes (webrun-files-node createExclusive)", () =
     const dir = gitRepo();
     writeFileSync(join(dir, "a.txt"), "a\n");
     const files = atomicFilesOver(createNodeFilesApi({ rootDir: dir }), ".git");
-    expect(await files.createExclusive("index.lock", new TextEncoder().encode("ours"))).toBe(
-      true,
-    );
+    expect(await files.createExclusive("index.lock", new TextEncoder().encode("ours"))).toBe(true);
     let message = "";
     try {
       git(dir, ["add", "a.txt"]);
@@ -112,8 +110,6 @@ describe("lock files across processes (webrun-files-node createExclusive)", () =
     const dir = gitRepo();
     writeFileSync(join(dir, ".git", "index.lock"), "");
     const files = atomicFilesOver(createNodeFilesApi({ rootDir: dir }), ".git");
-    expect(await files.createExclusive("index.lock", new TextEncoder().encode("ours"))).toBe(
-      false,
-    );
+    expect(await files.createExclusive("index.lock", new TextEncoder().encode("ours"))).toBe(false);
   });
 });
