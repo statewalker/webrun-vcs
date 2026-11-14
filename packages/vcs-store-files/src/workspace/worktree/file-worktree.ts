@@ -248,6 +248,7 @@ export class FileWorktree implements Worktree {
       {
         size: async () => {
           const stats = await this.files.stats(fullPath);
+          if (stats?.kind === "directory") throw new Error(`Is a directory: ${path}`);
           return stats?.kind === "file" ? stats.size : undefined;
         },
         read: () => this.files.read(fullPath),

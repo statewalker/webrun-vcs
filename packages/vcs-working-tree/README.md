@@ -140,7 +140,7 @@ the blob's size), which is what the index must record. The add commands and the 
 ### Hash a worktree file without reading it whole
 
 ```typescript
-import { hashWorktreeFile, unknownContentId } from "@statewalker/vcs-working-tree";
+import { hashWorktreeFile, isUnknownContentId } from "@statewalker/vcs-working-tree";
 
 const id = await hashWorktreeFile("video.mp4", {
   size: async () => {
@@ -149,7 +149,7 @@ const id = await hashWorktreeFile("video.mp4", {
   },
   read: () => files.read("/repo/video.mp4"),
 });
-if (id === unknownContentId()) {
+if (isUnknownContentId(id)) {
   // the file kept changing while it was read: treat it as modified
 }
 ```
@@ -159,8 +159,14 @@ Every `Worktree.computeHash` (`MemoryWorktree`, and `FileWorktree` and `FileTree
 check and the stash hash a file as it streams past: the size comes from stat, because the git
 header that starts the hash carries it. If the file produces a different number of bytes, it was
 changed while it was read; it is stat'ed and read once more, and if that disagrees too the result
-is `unknownContentId()`, an id of zeros that no blob has, so any comparison with the index reports
-the file as modified.
+is `unknownContentId()`: a value that is not hex and differs on every call, so it never equals an
+index id (not the all-zero id, not an empty one), and any comparison reports the file as modified.
+`isUnknownContentId(id)` recognises it; it is never written anywhere. (`add -N` records the empty
+blob's id flagged `intentToAdd`, as git does, rather than an empty id.)
+
+Checkout writes stream each blob into `FilesApi.write`, so a write is exactly as atomic as the
+`FilesApi`: the Node and in-memory ones write to a temporary and rename, so a blob that fails part
+way leaves the old file; a `FilesApi` that writes in place can leave a cut-off file.
 
 The worktrees take a `newHasher` factory instead of the old `hashFunction` option, which needed
 the whole file in one buffer. It returns an incremental `Hasher` and defaults to SHA-1:

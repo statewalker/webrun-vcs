@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   createMemoryWorktree,
   hashWorktreeFile,
+  isUnknownContentId,
   unknownContentId,
 } from "../../src/worktree/index.js";
 
@@ -71,8 +72,11 @@ describe("hashWorktreeFile", () => {
       },
     });
     expect(reads).toBe(2);
-    expect(id).toBe(unknownContentId());
-    expect(id).toBe("0".repeat(40));
+    expect(isUnknownContentId(id)).toBe(true);
+    // never an id an index entry can hold: not all-zero, not empty, not hex, never repeated
+    expect(id).not.toBe("0".repeat(40));
+    expect(id).not.toMatch(/^[0-9a-f]*$/);
+    expect(id).not.toBe(unknownContentId());
   });
 
   it("refuses a file that does not exist", async () => {

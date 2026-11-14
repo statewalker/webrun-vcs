@@ -208,3 +208,18 @@ describe("checkout writes stream", () => {
     expect(maxOutstanding).toBe(0);
   });
 });
+
+describe("worktree hashing: a path that changed type", () => {
+  it("says a directory is a directory, not a missing file", async () => {
+    const files = createInMemoryFilesApi();
+    await files.mkdir("/repo/now-a-dir");
+    await files.write("/repo/now-a-dir/inner.txt", [enc.encode("x")]);
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "/repo",
+      blobs: {} as Blobs,
+      trees: {} as Trees,
+    });
+    await expect(worktree.computeHash("now-a-dir")).rejects.toThrow(/Is a directory/);
+  });
+});

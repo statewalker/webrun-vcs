@@ -3,8 +3,8 @@
  * in memory.
  */
 import type { ObjectId } from "@statewalker/vcs-core";
+import { randomHexId } from "@statewalker/vcs-utils";
 import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 
 /** Makes a fresh incremental hasher; the worktrees default to SHA-1 (`createSha1`). */
@@ -20,13 +20,22 @@ export interface WorktreeFileSource {
 
 const isSizeMismatch = (e: unknown) => (e as Error)?.name === "SizeMismatchError";
 
+const UNKNOWN_PREFIX = "unknown:";
+
 /**
- * The id `hashWorktreeFile` returns for a file whose size kept changing while it
- * was read: all zeros, as long as the hasher's digest. No blob has it, so a
- * caller comparing it with the index sees the file as modified.
+ * The value `hashWorktreeFile` returns for a file whose size kept changing while
+ * it was read: not hex, and different on every call, so it never equals an id in
+ * the index (not even an all-zero or empty one) or another such value; a caller
+ * comparing it sees the file as modified. It is never a stored object's id: do not
+ * write it anywhere. {@link isUnknownContentId} recognises it.
  */
-export function unknownContentId(newHasher: NewHasher = createSha1): ObjectId {
-  return bytesToHex(new Uint8Array(newHasher().digest().length));
+export function unknownContentId(): ObjectId {
+  return `${UNKNOWN_PREFIX}${randomHexId()}`;
+}
+
+/** Whether `id` came from {@link unknownContentId} (a file that would not hold still). */
+export function isUnknownContentId(id: string): boolean {
+  return id.startsWith(UNKNOWN_PREFIX);
 }
 
 /**
@@ -35,8 +44,7 @@ export function unknownContentId(newHasher: NewHasher = createSha1): ObjectId {
  * The git header carries the size, so it comes from stat first. If the file
  * produces a different number of bytes (it changed while it was read), it is
  * stat'ed and read once more; if that disagrees too, the file is reported as
- * modified with {@link unknownContentId}, as `storeWorktreeFile` falls back for
- * a file that will not hold still.
+ * modified with {@link unknownContentId}, a value no index entry can hold.
  *
  * @example
  * ```typescript
@@ -63,5 +71,5 @@ export async function hashWorktreeFile(
       if (!isSizeMismatch(e)) throw e;
     }
   }
-  return unknownContentId(newHasher);
+  return unknownContentId();
 }
