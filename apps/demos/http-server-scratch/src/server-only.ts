@@ -16,8 +16,7 @@
  *   POST /repo.git/git-receive-pack                    (receive pack data)
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
+import type { FilesApi } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
@@ -29,6 +28,7 @@ import {
   printInfo,
   printSection,
   printSuccess,
+  resolvePath,
   type VcsHttpServer,
 } from "./shared/index.js";
 
@@ -38,14 +38,14 @@ import {
 function parseArgs(): { port: number; reposDir: string } {
   const args = process.argv.slice(2);
   let port = 8080;
-  let reposDir = path.join(process.cwd(), "repos");
+  let reposDir = resolvePath(process.cwd(), "repos");
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--port" && args[i + 1]) {
       port = parseInt(args[i + 1], 10);
       i++;
     } else if (args[i] === "--dir" && args[i + 1]) {
-      reposDir = path.resolve(args[i + 1]);
+      reposDir = resolvePath(process.cwd(), args[i + 1]);
       i++;
     }
   }
@@ -62,8 +62,9 @@ async function main(): Promise<void> {
   printSection("HTTP Git Server - Standalone Mode");
   console.log("A Git HTTP server built from scratch using VCS.\n");
 
-  // Ensure repos directory exists
-  await ensureDirectory(reposDir);
+  // FilesApi rooted at the repos directory; creating its root creates the directory
+  const reposFiles = createNodeFilesApi({ rootDir: reposDir });
+  await ensureDirectory(reposFiles, "/");
 
   printInfo(`Repos directory: ${reposDir}`);
   printInfo(`Port: ${port}`);
@@ -85,14 +86,15 @@ async function main(): Promise<void> {
         }
 
         // Try to open repository
-        const fullPath = path.join(reposDir, repoPath);
+        const fullPath = resolvePath(reposDir, repoPath);
 
         try {
-          const stat = await fs.stat(fullPath);
-          if (!stat.isDirectory()) {
+          const stat = await reposFiles.stats(repoPath);
+          if (stat?.kind !== "directory") {
             return null;
           }
         } catch {
+          // Invalid path (e.g. outside the repos directory)
           return null;
         }
 
@@ -123,7 +125,7 @@ async function main(): Promise<void> {
     console.log("\nPress Ctrl+C to stop the server.\n");
 
     // List available repositories
-    await listRepositories(reposDir);
+    await listRepositories(reposFiles, reposDir);
 
     // Keep running until interrupted
     await new Promise<void>((resolve) => {
@@ -161,10 +163,14 @@ async function main(): Promise<void> {
 /**
  * List available repositories in the repos directory.
  */
-async function listRepositories(reposDir: string): Promise<void> {
+async function listRepositories(reposFiles: FilesApi, reposDir: string): Promise<void> {
   try {
-    const entries = await fs.readdir(reposDir, { withFileTypes: true });
-    const repos = entries.filter((e) => e.isDirectory() && e.name.endsWith(".git"));
+    const repos: Array<{ name: string }> = [];
+    for await (const entry of reposFiles.list("/")) {
+      if (entry.kind === "directory" && entry.name.endsWith(".git")) {
+        repos.push(entry);
+      }
+    }
 
     if (repos.length === 0) {
       printInfo("No repositories found. Create a bare repository with:");

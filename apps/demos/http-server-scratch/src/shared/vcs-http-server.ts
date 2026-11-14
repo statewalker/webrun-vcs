@@ -4,6 +4,11 @@
  * Implements the Git smart HTTP protocol using VCS storage,
  * without depending on native git binaries.
  *
+ * Request handling is portable: `VcsHttpServer.fetch()` takes a Web
+ * `Request` and returns a Web `Response`, so it runs anywhere the Fetch API
+ * exists (browsers, service workers, Deno, Bun, Node). `start()` serves it on
+ * Node through `@hono/node-server`.
+ *
  * Handles:
  * - GET /repo.git/info/refs?service=git-upload-pack (fetch/clone refs)
  * - POST /repo.git/git-upload-pack (send pack data to client)
@@ -11,7 +16,7 @@
  * - POST /repo.git/git-receive-pack (receive pack data from client)
  */
 
-import * as http from "node:http";
+import { type ServerType, serve } from "@hono/node-server";
 import {
   type ObjectTypeCode,
   PackWriterStream,
@@ -38,6 +43,32 @@ import { type FileHistory, getHead } from "./file-history.js";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
+/**
+ * Collects the chunks of a response body, then turns them into a Response.
+ */
+class ResponseBodyWriter {
+  private chunks: Uint8Array[] = [];
+
+  write(chunk: string | Uint8Array): void {
+    this.chunks.push(typeof chunk === "string" ? textEncoder.encode(chunk) : chunk);
+  }
+
+  toResponse(headers: Record<string, string>, status = 200): Response {
+    const total = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      body.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return new Response(body, { status, headers });
+  }
+}
+
+function textResponse(status: number, text: string): Response {
+  return new Response(text, { status, headers: { "Content-Type": "text/plain" } });
+}
+
 export interface VcsHttpServerOptions {
   /** Port to listen on */
   port: number;
@@ -49,7 +80,7 @@ export interface VcsHttpServerOptions {
  * A Git HTTP server that uses VCS storage directly.
  */
 export class VcsHttpServer {
-  private server: http.Server | null = null;
+  private server: ServerType | null = null;
   private port: number;
   private getStorage: (repoPath: string) => Promise<FileHistory | null>;
 
@@ -63,21 +94,11 @@ export class VcsHttpServer {
    */
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server = http.createServer((req, res) => {
-        this.handleRequest(req, res).catch((error) => {
-          console.error("Request error:", error);
-          if (!res.headersSent) {
-            res.writeHead(500);
-            res.end("Internal Server Error");
-          }
-        });
-      });
-
-      this.server.on("error", reject);
-
-      this.server.listen(this.port, () => {
+      const server = serve({ fetch: (request) => this.fetch(request), port: this.port }, () => {
         resolve();
       });
+      server.on("error", reject);
+      this.server = server;
     });
   }
 
@@ -98,19 +119,26 @@ export class VcsHttpServer {
   }
 
   /**
-   * Handle an incoming HTTP request.
+   * Handle an incoming HTTP request (portable Fetch API handler).
    */
-  private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url || "/", `http://localhost:${this.port}`);
+  async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.handleRequest(request);
+    } catch (error) {
+      console.error("Request error:", error);
+      return textResponse(500, "Internal Server Error");
+    }
+  }
+
+  private async handleRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
     const pathname = url.pathname;
 
     // Parse the repository path from URL
     // URL format: /repo.git/info/refs or /repo.git/git-upload-pack
     const match = pathname.match(/^\/([^/]+\.git)(\/.*)?$/);
     if (!match) {
-      res.writeHead(404);
-      res.end("Not Found");
-      return;
+      return textResponse(404, "Not Found");
     }
 
     const repoName = match[1];
@@ -119,44 +147,33 @@ export class VcsHttpServer {
     // Get storage for this repository
     const storage = await this.getStorage(repoName);
     if (!storage) {
-      res.writeHead(404);
-      res.end("Repository not found");
-      return;
+      return textResponse(404, "Repository not found");
     }
 
     // Handle different git HTTP endpoints
     if (gitPath === "/info/refs") {
-      await this.handleInfoRefs(req, res, storage, url);
-    } else if (gitPath === "/git-upload-pack") {
-      await this.handleUploadPack(req, res, storage);
-    } else if (gitPath === "/git-receive-pack") {
-      await this.handleReceivePack(req, res, storage);
-    } else {
-      res.writeHead(404);
-      res.end("Not Found");
+      return this.handleInfoRefs(storage, url);
     }
+    if (gitPath === "/git-upload-pack") {
+      return this.handleUploadPack(request, storage);
+    }
+    if (gitPath === "/git-receive-pack") {
+      return this.handleReceivePack(request, storage);
+    }
+    return textResponse(404, "Not Found");
   }
 
   /**
    * Handle /info/refs endpoint (ref discovery).
    */
-  private async handleInfoRefs(
-    _req: http.IncomingMessage,
-    res: http.ServerResponse,
-    storage: FileHistory,
-    url: URL,
-  ): Promise<void> {
+  private async handleInfoRefs(storage: FileHistory, url: URL): Promise<Response> {
     const service = url.searchParams.get("service");
 
     if (!service || !["git-upload-pack", "git-receive-pack"].includes(service)) {
-      res.writeHead(403);
-      res.end("Forbidden");
-      return;
+      return textResponse(403, "Forbidden");
     }
 
-    // Set headers for smart HTTP
-    res.setHeader("Content-Type", `application/x-${service}-advertisement`);
-    res.setHeader("Cache-Control", "no-cache");
+    const res = new ResponseBodyWriter();
 
     // Write service announcement
     const serviceAnnouncement = `# service=${service}\n`;
@@ -188,19 +205,20 @@ export class VcsHttpServer {
     }
 
     res.write("0000"); // Flush packet
-    res.end();
+
+    // Headers for smart HTTP
+    return res.toResponse({
+      "Content-Type": `application/x-${service}-advertisement`,
+      "Cache-Control": "no-cache",
+    });
   }
 
   /**
    * Handle git-upload-pack (send objects to client for fetch/clone).
    */
-  private async handleUploadPack(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    storage: FileHistory,
-  ): Promise<void> {
+  private async handleUploadPack(request: Request, storage: FileHistory): Promise<Response> {
     // Collect request body
-    const body = await this.collectRequestBody(req);
+    const body = await this.collectRequestBody(request);
 
     // Parse the request
     const packets = pktLineReader(this.bufferToAsyncIterable(body));
@@ -233,9 +251,7 @@ export class VcsHttpServer {
       }
     }
 
-    // Set response headers
-    res.setHeader("Content-Type", "application/x-git-upload-pack-result");
-    res.setHeader("Cache-Control", "no-cache");
+    const res = new ResponseBodyWriter();
 
     // Send NAK (we don't implement multi-ack negotiation)
     res.write(this.pktLine("NAK\n"));
@@ -250,22 +266,21 @@ export class VcsHttpServer {
     }
 
     res.write("0000"); // Flush
-    res.end();
+
+    return res.toResponse({
+      "Content-Type": "application/x-git-upload-pack-result",
+      "Cache-Control": "no-cache",
+    });
   }
 
   /**
    * Handle git-receive-pack (receive objects from client for push).
    */
-  private async handleReceivePack(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    storage: FileHistory,
-  ): Promise<void> {
-    const body = await this.collectRequestBody(req);
+  private async handleReceivePack(request: Request, storage: FileHistory): Promise<Response> {
+    const body = await this.collectRequestBody(request);
     const { updates, packData } = this.parseReceivePackRequest(body);
 
-    res.setHeader("Content-Type", "application/x-git-receive-pack-result");
-    res.setHeader("Cache-Control", "no-cache");
+    const res = new ResponseBodyWriter();
 
     const useSideband = updates.some((u) => u.capabilities?.includes(CAPABILITY_SIDE_BAND_64K));
 
@@ -315,7 +330,10 @@ export class VcsHttpServer {
       }
     }
 
-    res.end();
+    return res.toResponse({
+      "Content-Type": "application/x-git-receive-pack-result",
+      "Cache-Control": "no-cache",
+    });
   }
 
   /**
@@ -425,7 +443,7 @@ export class VcsHttpServer {
   /**
    * Send pack data via sideband.
    */
-  private async sendSidebandPack(res: http.ServerResponse, packData: Uint8Array): Promise<void> {
+  private async sendSidebandPack(res: ResponseBodyWriter, packData: Uint8Array): Promise<void> {
     const progressMsg = textEncoder.encode("Counting objects...\n");
     res.write(this.encodeSidebandPacket(SIDEBAND_PROGRESS, progressMsg));
 
@@ -665,12 +683,8 @@ export class VcsHttpServer {
   /**
    * Collect request body.
    */
-  private async collectRequestBody(req: http.IncomingMessage): Promise<Uint8Array> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(chunk);
-    }
-    return new Uint8Array(Buffer.concat(chunks));
+  private async collectRequestBody(request: Request): Promise<Uint8Array> {
+    return new Uint8Array(await request.arrayBuffer());
   }
 
   /**

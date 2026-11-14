@@ -12,11 +12,11 @@
  * - Unreachable objects may be pruned
  */
 
+import { joinPath } from "@statewalker/vcs-utils/files";
 import {
   countLooseObjects,
   createFileHistory,
   createFilesApi,
-  fs,
   GIT_DIR,
   getPackFileStats,
   listPackFiles,
@@ -24,8 +24,8 @@ import {
   logInfo,
   logSection,
   logSuccess,
+  looseObjectPath,
   OBJECTS_DIR,
-  path,
   state,
 } from "../shared/index.js";
 
@@ -33,26 +33,15 @@ import {
  * Delete loose object from filesystem.
  */
 async function deleteLooseObject(objectId: string): Promise<void> {
-  const prefix = objectId.substring(0, 2);
-  const suffix = objectId.substring(2);
-  const objectPath = path.join(OBJECTS_DIR, prefix, suffix);
+  const files = createFilesApi();
+  await files.remove(looseObjectPath(objectId));
 
-  try {
-    await fs.unlink(objectPath);
-  } catch {
-    // Ignore errors
+  // Remove the fanout directory if it is now empty
+  const parentDir = joinPath(OBJECTS_DIR, objectId.substring(0, 2));
+  for await (const _entry of files.list(parentDir)) {
+    return;
   }
-
-  // Try to remove empty parent directory
-  try {
-    const parentDir = path.join(OBJECTS_DIR, prefix);
-    const remaining = await fs.readdir(parentDir);
-    if (remaining.length === 0) {
-      await fs.rmdir(parentDir);
-    }
-  } catch {
-    // Ignore errors
-  }
+  await files.remove(parentDir);
 }
 
 export async function run(): Promise<void> {

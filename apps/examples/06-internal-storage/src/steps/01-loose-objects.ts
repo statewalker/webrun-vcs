@@ -12,20 +12,19 @@
 
 import { FileMode } from "@statewalker/vcs-core";
 import { decompressBlock } from "@statewalker/vcs-utils";
+import { readFile } from "@statewalker/vcs-utils/files";
 import {
   cleanupRepo,
   countLooseObjects,
   createAuthor,
   createFileHistory,
   createFilesApi,
-  fs,
   GIT_DIR,
   log,
   logInfo,
   logSection,
   logSuccess,
-  OBJECTS_DIR,
-  path,
+  looseObjectPath,
   shortId,
   state,
   storeBlob,
@@ -106,12 +105,10 @@ export async function run(): Promise<void> {
   // Read and decode a loose object to show its structure
   log("\n--- Loose Object Format ---\n");
 
-  const blobPrefix = readmeId.substring(0, 2);
-  const blobSuffix = readmeId.substring(2);
-  const blobPath = path.join(OBJECTS_DIR, blobPrefix, blobSuffix);
+  const blobPath = looseObjectPath(readmeId);
 
   try {
-    const compressedData = await fs.readFile(blobPath);
+    const compressedData = await readFile(files, blobPath);
     const decompressed = await decompressBlock(compressedData);
 
     // Find null byte that separates header from content

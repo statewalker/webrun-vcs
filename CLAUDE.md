@@ -23,6 +23,9 @@ All files and folders use **kebab-case**: `my-component.ts`, `utils/date-formatt
 
 **[Full Guide](.claude/code/naming-conventions.md)**
 
+### Portable APIs only
+Library and app code (`packages/*/src`, `apps/*/*/src`) uses only APIs that exist in browsers and on servers: files through `FilesApi`, Web Streams, Web Crypto, `fetch`. No `node:*` imports (Biome `noNodejsModules` is an error there); tests may use Node (to drive native git, for example). On Node, get a `FilesApi` from `createNodeFilesApi` (`@statewalker/vcs-utils-node/files`).
+
 ### Module Structure
 Folder-based exports with wildcard re-exports. Import from `index.js`, use `.js` extensions.
 
@@ -101,6 +104,7 @@ git push                                        # MANDATORY
 - **Refs vs Checkout**: `CommitCommand` uses `history.refs`, not `checkout.head`
 - **Apps are built without type checking**: vite builds `apps/*` even when they use removed APIs. After changing a package API, run `pnpm -r typecheck` (it covers the apps) and grep `apps/` for the old names.
 - **Workspace cycles**: `vcs-core` depends on `vcs-utils-node`, and `vcs-testing` on `vcs-core`, so `vcs-utils`/`vcs-utils-node` must not depend on `vcs-testing` (not even as a devDependency): pnpm then builds in the wrong order and CI fails on missing declarations. Put such tests in a store package.
+- **`createNodeFilesApi({ rootDir: "/" })` rejects every path** (webrun-files-node checks `rootDir + sep`, i.e. `//`): root a FilesApi at the directory you work in, or at its parent to remove that directory
 - **Native git in tests**: CI has no `user.name`/`user.email`; pass `GIT_AUTHOR_*`/`GIT_COMMITTER_*` in the env of every git call, and fix both `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` when two repositories must produce the same commit ids
 
 ## Self-Maintenance

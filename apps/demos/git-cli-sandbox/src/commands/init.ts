@@ -2,9 +2,8 @@
  * Init command - Create a new Git repository
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { fatal, info, initRepository, success } from "../shared.js";
+import { joinPath } from "@statewalker/vcs-utils/files";
+import { createDirFilesApi, fatal, info, initRepository, resolvePath, success } from "../shared.js";
 
 /**
  * Parse init command arguments
@@ -31,18 +30,16 @@ function parseArgs(args: string[]): { directory: string; bare: boolean } {
 export async function runInit(args: string[]): Promise<void> {
   const { directory, bare } = parseArgs(args);
 
-  const absDir = path.resolve(process.cwd(), directory);
+  const absDir = resolvePath(process.cwd(), directory);
+  const dirFiles = createDirFilesApi(absDir);
 
   // Create directory if it doesn't exist
-  await fs.mkdir(absDir, { recursive: true });
+  await dirFiles.mkdir("/");
 
   // Check if already a repository
-  const gitDir = path.join(absDir, bare ? "." : ".git");
-  try {
-    await fs.access(path.join(absDir, ".git"));
+  const gitDir = joinPath(absDir, bare ? "." : ".git");
+  if (await dirFiles.exists(".git")) {
     fatal(`Reinitialized existing Git repository in ${gitDir}/`);
-  } catch {
-    // Good - not a repository yet
   }
 
   const ctx = await initRepository(absDir, { bare });

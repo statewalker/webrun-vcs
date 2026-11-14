@@ -148,8 +148,8 @@ for (const [name, oid] of allRefs) {
 console.log("\n=== Step 4: Serve Over Duplex (MessagePort) ===\n");
 
 // In a real application, you would use MessagePort, WebSocket, or WebRTC.
-// This demonstrates the pattern using Node's MessageChannel.
-const { MessageChannel } = await import("node:worker_threads");
+// This demonstrates the pattern using the standard (global) MessageChannel,
+// available in browsers, workers and Node.
 const { serveOverDuplex, fetchOverDuplex, createMessagePortDuplex } = await import(
   "@statewalker/vcs-transport"
 );

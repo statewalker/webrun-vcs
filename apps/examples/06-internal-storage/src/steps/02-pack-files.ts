@@ -13,18 +13,18 @@
 
 import { ObjectType, PackWriterStream, writePackIndexV2 } from "@statewalker/vcs-core";
 import { bytesToHex, decompressBlock } from "@statewalker/vcs-utils";
+import { joinPath, readFile } from "@statewalker/vcs-utils/files";
 import {
   countLooseObjects,
-  fs,
+  createFilesApi,
   getPackFileStats,
   listPackFiles,
   log,
   logInfo,
   logSection,
   logSuccess,
-  OBJECTS_DIR,
+  looseObjectPath,
   PACK_DIR,
-  path,
   shortId,
   state,
 } from "../shared/index.js";
@@ -35,12 +35,8 @@ import {
 async function readLooseObject(
   objectId: string,
 ): Promise<{ type: number; content: Uint8Array } | null> {
-  const prefix = objectId.substring(0, 2);
-  const suffix = objectId.substring(2);
-  const objectPath = path.join(OBJECTS_DIR, prefix, suffix);
-
   try {
-    const compressed = await fs.readFile(objectPath);
+    const compressed = await readFile(createFilesApi(), looseObjectPath(objectId));
     const decompressed = await decompressBlock(compressed);
 
     // Find null byte
@@ -86,29 +82,7 @@ async function readLooseObject(
  * Collect all loose object IDs.
  */
 async function collectLooseObjectIds(): Promise<string[]> {
-  const ids: string[] = [];
-
-  try {
-    const prefixes = await fs.readdir(OBJECTS_DIR);
-    for (const prefix of prefixes) {
-      if (prefix === "pack" || prefix === "info" || prefix.length !== 2) continue;
-
-      const prefixPath = path.join(OBJECTS_DIR, prefix);
-      const stat = await fs.stat(prefixPath);
-      if (!stat.isDirectory()) continue;
-
-      const suffixes = await fs.readdir(prefixPath);
-      for (const suffix of suffixes) {
-        if (suffix.length === 38) {
-          ids.push(prefix + suffix);
-        }
-      }
-    }
-  } catch {
-    // Ignore errors
-  }
-
-  return ids;
+  return (await countLooseObjects()).objects;
 }
 
 export async function run(): Promise<void> {
@@ -161,20 +135,17 @@ export async function run(): Promise<void> {
   // Write pack file
   const packName = `pack-${bytesToHex(result.packChecksum)}`;
 
-  try {
-    await fs.mkdir(PACK_DIR, { recursive: true });
-  } catch {
-    // Directory may exist
-  }
+  const files = createFilesApi();
+  await files.mkdir(PACK_DIR);
 
-  const packPath = path.join(PACK_DIR, `${packName}.pack`);
-  await fs.writeFile(packPath, result.packData);
+  const packPath = joinPath(PACK_DIR, `${packName}.pack`);
+  await files.write(packPath, [result.packData]);
   log(`\n  Written: ${packName}.pack`);
 
   // Write pack index
   const indexData = await writePackIndexV2(result.indexEntries, result.packChecksum);
-  const indexPath = path.join(PACK_DIR, `${packName}.idx`);
-  await fs.writeFile(indexPath, indexData);
+  const indexPath = joinPath(PACK_DIR, `${packName}.idx`);
+  await files.write(indexPath, [indexData]);
   log(`  Written: ${packName}.idx`);
 
   // Explain pack structure

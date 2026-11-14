@@ -13,7 +13,6 @@
  *      the pointer oid and the byte length equals the pointer size.
  */
 
-import { createHash } from "node:crypto";
 import {
   type LfsPointer,
   type LfsResolver,
@@ -33,9 +32,8 @@ const LFS_BASE_URL = `https://huggingface.co/${MODEL}.git/info/lfs`;
 /** Content-store identity: opaque, algorithm-agnostic, prefixed so it never
  * collides with a bare LFS oid. */
 async function contentHash(input: ByteStream): Promise<string> {
-  const h = createHash("sha256");
-  for await (const chunk of input) h.update(chunk);
-  return `cs-sha256:${h.digest("hex")}`;
+  // Web Crypto has no streaming digest: collect the chunks, then hash once.
+  return `cs-sha256:${await sha256Hex(await collect(input))}`;
 }
 
 /** A `Map`-backed LFS-oid -> content-store-id resolver (no persistence). */
