@@ -92,9 +92,9 @@ content-transfer addresses objects by content-store id, not by LFS oid. On downl
 
 ### Why the whole object is hashed after a chunk download
 
-Chunks are verified one by one by content-transfer, but the LFS oid covers the whole file. After a xet download the client streams the assembled object out of the store through `createLfsPointer`, an incremental SHA-256 that also counts bytes, so memory stays at one chunk however large the object is. If the SHA-256 differs from the oid or the size from the pointer, the object is removed from the store (unless the resolver already maps its real oid to it). Only a match records the oid mapping.
+Chunks are verified one by one by content-transfer, but the LFS oid covers the whole file. After a xet download the client streams the assembled object out of the store through `createLfsPointer`, an incremental SHA-256 that also counts bytes, so memory stays at one chunk however large the object is. If the SHA-256 differs from the oid or the size from the pointer, no mapping is recorded; only a match records it. The refused object is not removed: content-store ids are derived from content, so a concurrent honest download of the same bytes shares its id and may be about to record it. It stays until the store's `gc` runs with the resolver's values as live roots.
 
-The upload side does the same on the server: when content-transfer assembles an uploaded object, `serveXet` stores it through `storeVerified` from `@statewalker/vcs-transport-lfs`, hashing the reassembled bytes as they stream into the store. A mismatch removes the object and fails the assemble, which the client sees as an `error` event for that oid; the mapping is recorded only for a match.
+The upload side does the same on the server: when content-transfer assembles an uploaded object, `serveXet` stores it through `storeVerified` from `@statewalker/vcs-transport-lfs`, hashing the reassembled bytes as they stream into the store. A mismatch fails the assemble, which the client sees as an `error` event for that oid; the mapping is recorded only for a match, and the refused object is left for the server store's `gc` in the same way.
 
 ### Which hashes Xet uses here
 
@@ -112,8 +112,8 @@ Per-object failures are yielded as `{ type: "error", oid, reason }`, never throw
 - `no local object for oid` (upload: resolver has no mapping)
 - `no download action` (download: the action or its `objectId` is missing)
 - `Object does not exist` (download batch for an oid the server does not know)
-- `sha256 mismatch` (assembled object does not hash to the oid; the object is removed)
-- `size mismatch` (assembled object is not the pointer size; the object is removed)
+- `sha256 mismatch` (assembled object does not hash to the oid; nothing is recorded, and the object remains until the store's `gc`)
+- `size mismatch` (assembled object is not the pointer size; nothing is recorded, and the object remains until the store's `gc`)
 - `xet upload refused: sha256 mismatch` (upload: the server's assembled object does not hash to the oid)
 - any error message thrown by content-transfer during the chunk exchange
 

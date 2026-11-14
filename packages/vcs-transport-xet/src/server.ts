@@ -30,8 +30,9 @@ function json(body: unknown, status = 200): Response {
  * reassemble + `put`) hashes the reassembled bytes as they stream into the
  * store and checks them against the LFS oid. On a match the LFS-oid →
  * content-store-id mapping is recorded, so a later xet/basic download can
- * resolve this oid; on a mismatch the object is removed again and the assemble
- * fails, which the client sees as an upload error.
+ * resolve this oid; on a mismatch nothing is recorded and the assemble fails,
+ * which the client sees as an upload error. The refused object is left for the
+ * store's `gc` (live roots: the resolver's values), never removed here.
  */
 function recordingStore(store: ContentStore, oid: string, resolver: LfsResolver): ContentStore {
   return {

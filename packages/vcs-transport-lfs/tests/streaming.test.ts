@@ -125,7 +125,10 @@ describe("lfsUpload streams the request body", () => {
   it("sends a lazily generated 50 MiB object as a stream consumed incrementally", async () => {
     const obj = lazyObject(BIG);
     const ptr = obj.pointer();
-    const store = { read: () => obj.chunks() } as unknown as ContentStore;
+    const store = {
+      read: () => obj.chunks(),
+      getManifest: async () => ({ size: BIG }),
+    } as unknown as ContentStore;
     const resolver = memResolver();
     await resolver.record(ptr.oid, "local-id");
 
@@ -196,22 +199,26 @@ describe("lfsDownload hashes while it stores", () => {
     return { events, store, resolver, storedId };
   }
 
-  it("refuses a download whose bytes do not hash to the oid, leaving nothing stored", async () => {
+  it("refuses a download whose bytes do not hash to the oid, recording nothing; gc reclaims it", async () => {
     const served = prng(5000, 11);
     const ptr = { oid: "c".repeat(64), size: served.length };
     const { events, store, resolver, storedId } = await corrupted(served, ptr);
     expect(events).toContainEqual({ type: "error", oid: ptr.oid, reason: "sha256 mismatch" });
     expect(await resolver.toObject(ptr.oid)).toBeUndefined();
+    expect(await store.has(storedId)).toBe(true); // not removed: left for gc
+    await store.gc(resolver.roots());
     expect(await store.has(storedId)).toBe(false);
   });
 
-  it("refuses a download shorter than the pointer size, leaving nothing stored", async () => {
+  it("refuses a download shorter than the pointer size, recording nothing; gc reclaims it", async () => {
     const real = prng(5000, 12);
     const served = real.subarray(0, 4000);
     const ptr = { oid: await sha256Hex(real), size: real.length };
     const { events, store, resolver, storedId } = await corrupted(served, ptr);
     expect(events).toContainEqual({ type: "error", oid: ptr.oid, reason: "size mismatch" });
     expect(await resolver.toObject(ptr.oid)).toBeUndefined();
+    expect(await store.has(storedId)).toBe(true); // not removed: left for gc
+    await store.gc(resolver.roots());
     expect(await store.has(storedId)).toBe(false);
   });
 
@@ -261,7 +268,7 @@ describe("serveLfs streams uploads and downloads", () => {
     expect(await resolver.toObject(ptr.oid)).toBeDefined();
   }, 60_000);
 
-  it("refuses a streamed PUT whose bytes do not hash to the oid, leaving nothing stored", async () => {
+  it("refuses a streamed PUT whose bytes do not hash to the oid, recording nothing; gc reclaims it", async () => {
     const payload = prng(4000, 21);
     const store = makeStore();
     const resolver = memResolver();
@@ -280,15 +287,14 @@ describe("serveLfs streams uploads and downloads", () => {
     );
     expect(res.status).toBe(422);
     expect(await resolver.toObject(oid)).toBeUndefined();
-    expect(
-      await store.has(
-        await csHash(
-          (async function* () {
-            yield payload;
-          })(),
-        ),
-      ),
-    ).toBe(false);
+    const storedId = await csHash(
+      (async function* () {
+        yield payload;
+      })(),
+    );
+    expect(await store.has(storedId)).toBe(true); // not removed: left for gc
+    await store.gc(resolver.roots());
+    expect(await store.has(storedId)).toBe(false);
   });
 
   it("serves a GET as a stream with the object's content-length", async () => {

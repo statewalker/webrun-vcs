@@ -19,12 +19,12 @@ No peer dependencies. One entry point, `@statewalker/vcs-transport-lfs` (ESM, wi
 | Export | Description |
 |--------|-------------|
 | `serveLfs(store, resolver)` | Server: a `(Request) => Promise<Response>` handler for `POST {base}/objects/batch`, `PUT {base}/objects/<oid>` and `GET {base}/objects/<oid>` |
-| `lfsUpload(store, resolver, url, pointers, fetchImpl?, opts?)` | Client: batch `upload`, then `PUT` each object the server asks for, as a streaming body. Yields `TransportEvent`s |
+| `lfsUpload(store, resolver, url, pointers, fetchImpl?, opts?)` | Client: batch `upload`, then `PUT` each object the server asks for, as a streaming body whose `content-length` is the local object's size. Yields `TransportEvent`s |
 | `lfsDownload(store, resolver, url, pointers, fetchImpl?)` | Client: batch `download`, then `GET` each object, hashing it while it is stored and checking oid and size at the end. Yields `TransportEvent`s |
 | `sha256Hex(content)` | `Promise<string>`: SHA-256 as bare hex (the LFS oid) of a buffer or a stream of chunks |
 | `createLfsPointer(content)` | `Promise<LfsPointer>`: oid and size of a buffer or stream, in one streaming pass (what a clean filter needs) |
-| `formatLfsPointer(pointer)`, `parseLfsPointer(text)` | Write and read the v1 pointer file text; `parseLfsPointer` returns `undefined` for anything else |
-| `storeVerified(store, resolver, content, expected)` | Store a stream while hashing it; keep and record it only if it matches `expected.oid` (and `expected.size`) |
+| `formatLfsPointer(pointer)`, `parseLfsPointer(text)` | Write and read the v1 pointer file text; `parseLfsPointer` returns `undefined` for anything else, including keys out of the spec's order and sizes beyond `Number.MAX_SAFE_INTEGER` |
+| `storeVerified(store, resolver, content, expected)` | Store a stream while hashing it; record it only if it matches `expected.oid` (and `expected.size`). A refused object is not removed; the store's `gc` reclaims it |
 | `LFS_POINTER_VERSION` | `"version https://git-lfs.github.com/spec/v1"` |
 | `BASIC_TRANSFER`, `LFS_CONTENT_TYPE` | `"basic"` and `"application/vnd.git-lfs+json"` |
 | `BatchRequest`, `BatchResponse`, `BatchObjectRequest`, `BatchObjectResponse`, `BatchAction` | Batch API JSON shapes |
@@ -95,6 +95,8 @@ const text = formatLfsPointer(pointer);
 parseLfsPointer(text); // { oid: "4fab47c1...", size: 3561811 }
 ```
 
+`parseLfsPointer` follows the git-lfs pointer spec: `version` comes first and the other keys follow in alphabetical order (extension keys `ext-…`, then `oid`, then `size`), each at most once. A pointer with `size` before `oid`, or a size that is not a safe integer, is not a pointer.
+
 `createLfsPointer` reads the content once, feeding each chunk to an incremental SHA-256 and counting its bytes, so a multi-gigabyte file costs one chunk of memory. This is the hashing half of a clean filter; writing the pointer into the index is the working tree's job.
 
 ## Internals
@@ -105,13 +107,19 @@ The LFS oid is fixed by the LFS spec: SHA-256 of the whole file. The content-sto
 
 ### Why every transfer is hash-checked while it streams
 
-The LFS spec requires the receiver to verify the whole-object SHA-256. Web Crypto's `subtle.digest` is one-shot and would need the whole object in memory, so both sides use the incremental `createSha256` from `@statewalker/vcs-utils/hash` instead. The client in `lfsDownload` and the server on `PUT` pass the incoming body straight into `store.put`, hashing and counting each chunk on the way (`storeVerified`). When the stream ends, the oid (and, on the client, the pointer size) must match; otherwise the stored object is removed again and the transfer is refused. A download that runs past the pointer size is cut off at once, before its manifest is written.
+The LFS spec requires the receiver to verify the whole-object SHA-256. Web Crypto's `subtle.digest` is one-shot and would need the whole object in memory, so both sides use the incremental `createSha256` from `@statewalker/vcs-utils/hash` instead. The client in `lfsDownload` and the server on `PUT` pass the incoming body straight into `store.put`, hashing and counting each chunk on the way (`storeVerified`). When the stream ends, the oid and the size (on the client the pointer size, on the server the request's `content-length` when it has one) must match; otherwise the transfer is refused and no mapping is recorded. A body that runs past the expected size is cut off at once, its stream cancelled, before its manifest is written, so a `PUT` cannot write more than it declared.
 
-The removal has one exception: if the resolver already maps the content's real oid to the same store object, the bytes were stored legitimately before and a lying transfer merely repeated them, so the object stays. Chunks written for a refused object stay in the chunk store until the store's `gc` reclaims them.
+A refused object is never removed from the store. Store ids are derived from content, so a peer that sends the same bytes under a bogus oid gets the very id an honest transfer of those bytes may be verifying at that moment; removing it would delete the honest object just before its mapping is recorded, leaving a mapping with nothing behind it. Instead the refused object, or the chunks written before an overrun, stays until the store's `gc` runs with the resolver's values as live roots:
+
+```typescript
+await store.gc([...mapping.values()]); // every store id some LFS oid maps to
+```
 
 ### Streaming
 
-Downloads and server uploads always stream. `lfsUpload` sends a `ReadableStream` body with `duplex: "half"` and a `content-length` taken from the pointer (S3-style presigned URLs reject chunked uploads), using `fetchWithRequestBody` from `@statewalker/vcs-utils/streams`. Node, Deno and Bun stream such bodies. Browsers collect the body first by default, because Firefox and Safari cannot stream request bodies and Chromium only can over HTTP/2; pass `{ streamRequestBody: true }` to stream there anyway, and a body that Chromium refuses before reading it is sent once more, collected. The server answers a `GET` with the store's stream and the object's `content-length`.
+Downloads and server uploads always stream. `lfsUpload` sends a `ReadableStream` body with `duplex: "half"`, using `fetchWithRequestBody` from `@statewalker/vcs-utils/streams`, and a `content-length` (S3-style presigned URLs reject chunked uploads). The length is the size of the local object, read from its manifest, never a size the server sent: a wrong length would make the runtime's `fetch` reject the request (undici's `UND_ERR_REQ_CONTENT_LENGTH_MISMATCH`). When the local size disagrees with the requested pointer or with the batch response, that object gets a `size mismatch` error event and is not sent; any other failure, a rejected `fetch` included, also becomes that object's error event, and the other objects are still uploaded.
+
+Node, Deno and Bun stream such bodies. Browsers collect the body first by default, because Firefox and Safari cannot stream request bodies and Chromium only can over HTTP/2; pass `{ streamRequestBody: true }` to stream there anyway, and a body that Chromium refuses before reading it is sent once more, collected. A streamed browser upload has no length, though: `content-length` is a forbidden header in browsers, which drop it, so the body goes out chunked and a presigned S3-style URL may reject it. A collected body gets its length from the browser, which is one more reason collecting is the browser default. The server answers a `GET` with the store's stream and the object's `content-length`.
 
 ### Constraints
 
@@ -128,11 +136,13 @@ Client generators do not throw for per-object failures. They yield `{ type: "err
 - the server's batch error message, for example `Object does not exist` (download of an unknown oid)
 - `no local object for oid` (upload: resolver has no mapping)
 - `no download action`
-- `upload failed: <status>` / `download failed: <status>`
-- `sha256 mismatch` (downloaded bytes do not hash to the oid; nothing is kept)
-- `size mismatch` (downloaded bytes are shorter or longer than the pointer size; nothing is kept)
+- `upload failed: <status>` / `download failed: <status>` (the response body is cancelled unread)
+- `size mismatch` (upload: the local object's size differs from the pointer or the batch response; nothing is sent)
+- `sha256 mismatch` (downloaded bytes do not hash to the oid; nothing is recorded, and the stored bytes remain until the store's `gc`)
+- `size mismatch` (downloaded bytes are shorter or longer than the pointer size; nothing is recorded, and the stored bytes or chunks remain until the store's `gc`)
+- the message of an error thrown while transferring one object, such as a rejected `fetch`
 
-Server responses: `422 {"message":"oid does not match content"}` on a `PUT` whose bytes do not hash to the path oid; `404 {"message":"Object does not exist"}` on a `GET` for an unknown oid; `404 {"message":"Not found"}` for any other route.
+Server responses: `422 {"message":"oid does not match content"}` on a `PUT` whose bytes do not hash to the path oid; `422 {"message":"size does not match content-length"}` on a `PUT` whose body is shorter or longer than its `content-length`; `404 {"message":"Object does not exist"}` on a `GET` for an unknown oid; `404 {"message":"Not found"}` for any other route.
 
 ### Dependencies
 

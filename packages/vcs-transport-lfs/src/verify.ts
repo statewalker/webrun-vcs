@@ -1,10 +1,5 @@
 import { bytesToHex, createSha256 } from "@statewalker/vcs-utils/hash";
-import type {
-  ByteStream,
-  ContentStore,
-  ObjectDescriptor,
-  ObjectId,
-} from "@statewalker/webrun-content-store";
+import type { ByteStream, ContentStore, ObjectDescriptor } from "@statewalker/webrun-content-store";
 import { type ByteSource, chunksOf } from "./sha256.js";
 import type { LfsPointer, LfsResolver } from "./types.js";
 
@@ -54,12 +49,16 @@ export type LfsStoreResult =
  * Stores `content` while hashing it, then checks it against `expected`: the
  * SHA-256 must equal `expected.oid` and, when given, the byte count
  * `expected.size`. A stream longer than `expected.size` is cut off as soon as
- * it overruns, so no manifest is written for it.
+ * it overruns, so no manifest is written for it (a server passes the request's
+ * `content-length` here, so a `PUT` cannot write past what it declared).
  *
- * On a mismatch the stored object is removed again, unless the resolver
- * already maps the content's real oid to it (an object stored before, which
- * the lying transfer merely repeated). On a match the mapping is recorded.
- * Chunks written for a refused object are reclaimed by the store's `gc`.
+ * On a match the mapping is recorded. On a mismatch nothing is recorded and
+ * nothing is removed: the refused object (or, after an overrun, its chunks)
+ * stays in the store until its `gc` runs with the resolver's values as live
+ * roots. It is never removed here because store ids are derived from content:
+ * a peer sending the same bytes under a bogus oid gets the very id another,
+ * honest transfer of those bytes may be verifying at that moment, and removing
+ * it would leave that transfer's mapping pointing at nothing.
  *
  * @example
  * ```typescript
@@ -82,7 +81,6 @@ export async function storeVerified(
     if (error instanceof SizeExceeded) return { ok: false, reason: "size mismatch" };
     throw error;
   }
-  const id: ObjectId = descriptor.id;
   const actual = h.pointer();
   const reason =
     expected.size !== undefined && actual.size !== expected.size
@@ -90,10 +88,8 @@ export async function storeVerified(
       : actual.oid !== expected.oid
         ? "sha256 mismatch"
         : undefined;
-  if (reason) {
-    if ((await resolver.toObject(actual.oid)) !== id) await store.remove(id);
-    return { ok: false, reason };
-  }
-  await resolver.record(expected.oid, id);
+  // Never removed on a mismatch (see above): the store's gc reclaims it.
+  if (reason) return { ok: false, reason };
+  await resolver.record(expected.oid, descriptor.id);
   return { ok: true, descriptor };
 }

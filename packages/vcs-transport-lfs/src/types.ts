@@ -48,7 +48,9 @@ export interface LfsTransferOptions {
    * stream outside browsers where the runtime supports it, collect in browsers
    * (see `shouldStreamRequestBody` in `@statewalker/vcs-utils/streams`). A
    * streamed body that the browser refuses before reading it is sent once more,
-   * collected.
+   * collected. Browsers drop `content-length` (a forbidden header), so a
+   * streamed browser upload goes out without a length, which presigned
+   * S3-style URLs may reject; a collected body gets its length from the browser.
    */
   streamRequestBody?: boolean;
 }

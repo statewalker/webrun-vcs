@@ -81,4 +81,26 @@ describe("lfs over a real HTTP server", () => {
     expect(got.length).toBe(bytes.length);
     expect(Buffer.compare(got, bytes)).toBe(0);
   });
+
+  it("a wrong size in the batch response errors that object only; the others upload", async () => {
+    const clientStore = makeStore();
+    const clientResolver = memResolver();
+    const a = await seedObject(clientStore, clientResolver, prng(70_000, 32));
+    const b = await seedObject(clientStore, clientResolver, prng(80_000, 33));
+    // A host whose batch response misreports the first object's size.
+    const lying = async (request: Request): Promise<Response> => {
+      const res = await fetch(request);
+      if (!request.url.endsWith("/objects/batch")) return res;
+      const body = (await res.json()) as { objects: { oid: string; size: number }[] };
+      for (const o of body.objects) if (o.oid === a.oid) o.size += 1000;
+      return Response.json(body);
+    };
+    const up = await drain(
+      lfsUpload(clientStore, clientResolver, url, [a, b], lying, { streamRequestBody: true }),
+    );
+    expect(up.find((e) => e.type === "error")).toMatchObject({ oid: a.oid });
+    expect(up).toContainEqual({ type: "object-uploaded", oid: b.oid });
+    expect(await serverResolver.toObject(b.oid)).toBeDefined();
+    expect(await serverResolver.toObject(a.oid)).toBeUndefined();
+  });
 });

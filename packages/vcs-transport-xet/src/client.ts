@@ -107,8 +107,10 @@ export async function* xetUpload(
  * object is pulled chunk-by-chunk (only the chunks missing locally) through
  * content-transfer, then its whole-file SHA-256 and size are verified against
  * the pointer (streamed from the store, never collected) before the mapping is
- * recorded; a mismatch removes the object again; on a `basic` response the whole download
- * defers to `vcs-transport-lfs`.
+ * recorded. A mismatch records nothing and leaves the object for the store's
+ * `gc` (live roots: the resolver's values) rather than removing it, since a
+ * concurrent honest download of the same bytes shares its content-derived id.
+ * On a `basic` response the whole download defers to `vcs-transport-lfs`.
  */
 export async function* xetDownload(
   store: ContentStore,
@@ -165,8 +167,8 @@ export async function* xetDownload(
           ? "sha256 mismatch"
           : undefined;
     if (reason) {
-      // Keep an object that was already stored here for its real oid.
-      if ((await resolver.toObject(actual.oid)) !== remoteId) await store.remove(remoteId);
+      // Never removed: the id is derived from content, so another download of the
+      // same bytes may be recording it right now. The store's gc reclaims it.
       yield { type: "error", oid: obj.oid, reason };
       continue;
     }

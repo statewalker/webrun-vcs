@@ -29,11 +29,38 @@ export function formatLfsPointer(pointer: LfsPointer): string {
   return `${LFS_POINTER_VERSION}\noid sha256:${pointer.oid}\nsize ${pointer.size}\n`;
 }
 
-/** Reads a pointer file; `undefined` when `text` is not a v1 SHA-256 pointer. */
+/**
+ * Reads a pointer file; `undefined` when `text` is not a v1 SHA-256 pointer.
+ *
+ * It follows the git-lfs pointer spec: one `key value` line each, `version`
+ * first, the other keys after it in strictly ascending (alphabetical) order, so
+ * extension keys (`ext-0-…`) come before `oid`, and `oid` before `size`. The
+ * oid must be `sha256:` and 64 lowercase hex digits, the size a decimal safe
+ * integer. Only the final newline may be missing.
+ *
+ * @example
+ * ```typescript
+ * parseLfsPointer(`${LFS_POINTER_VERSION}\noid sha256:${oid}\nsize 12\n`); // { oid, size: 12 }
+ * parseLfsPointer(`${LFS_POINTER_VERSION}\nsize 12\noid sha256:${oid}\n`); // undefined: out of order
+ * ```
+ */
 export function parseLfsPointer(text: string): LfsPointer | undefined {
-  if (!text.startsWith(`${LFS_POINTER_VERSION}\n`)) return undefined;
-  const oid = text.match(/^oid sha256:([0-9a-f]{64})$/m);
-  const size = text.match(/^size (\d+)$/m);
-  if (!oid || !size) return undefined;
-  return { oid: oid[1], size: Number(size[1]) };
+  const lines = (text.endsWith("\n") ? text.slice(0, -1) : text).split("\n");
+  if (lines[0] !== LFS_POINTER_VERSION) return undefined;
+  const values = new Map<string, string>();
+  let previous = "";
+  for (const line of lines.slice(1)) {
+    const space = line.indexOf(" ");
+    if (space <= 0) return undefined;
+    const key = line.slice(0, space);
+    if (!/^[a-z0-9.-]+$/.test(key) || key <= previous) return undefined;
+    values.set(key, line.slice(space + 1));
+    previous = key;
+  }
+  const oid = values.get("oid")?.match(/^sha256:([0-9a-f]{64})$/);
+  const sizeText = values.get("size");
+  if (!oid || sizeText === undefined || !/^\d+$/.test(sizeText)) return undefined;
+  const size = Number(sizeText);
+  if (!Number.isSafeInteger(size)) return undefined;
+  return { oid: oid[1], size };
 }

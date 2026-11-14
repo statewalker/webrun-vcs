@@ -13,14 +13,25 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+/** The request's `content-length` as a byte count, if it carries a valid one. */
+function declaredLength(request: Request): number | undefined {
+  const header = request.headers.get("content-length");
+  if (header === null || !/^\d+$/.test(header)) return undefined;
+  const length = Number(header);
+  return Number.isSafeInteger(length) ? length : undefined;
+}
+
 /**
  * A Git LFS server over a content-store: the batch API + basic whole-object
  * transfer. Routes `POST {base}/objects/batch`, and `PUT`/`GET
  * {base}/objects/<oid>` for the basic transfer.
  *
  * On upload (`PUT`) the request body is stored via `store.put` as it arrives,
- * hashed on the way; its SHA-256 must equal the path oid, else the object is
- * removed again and the upload rejected (422). On success the LFS-oid →
+ * hashed on the way; its SHA-256 must equal the path oid and, when the request
+ * declares a `content-length`, its size must equal it (a longer body is cut
+ * off as soon as it overruns). Otherwise the upload is rejected (422) and
+ * nothing is recorded; what was stored stays until the store's `gc` (run with
+ * the resolver's values as live roots) reclaims it. On success the LFS-oid →
  * content-store-id mapping is recorded. On download (`GET`) the mapping is
  * resolved and the object streamed back from the store with its
  * `content-length`; an unknown oid is 404. A batch `download` for an unknown oid is reported as an `error`
@@ -58,11 +69,19 @@ export function serveLfs(store: ContentStore, resolver: LfsResolver): HttpHandle
       const oid = m[1];
 
       if (request.method === "PUT") {
-        // Standard LFS requirement: the whole object must hash to the oid.
+        // Standard LFS requirement: the whole object must hash to the oid. A declared
+        // content-length caps the body, so a PUT cannot write past what it announced.
         const stored = await storeVerified(store, resolver, request.body ?? new Uint8Array(0), {
           oid,
+          size: declaredLength(request),
         });
-        if (!stored.ok) return json({ message: "oid does not match content" }, 422);
+        if (!stored.ok) {
+          const message =
+            stored.reason === "size mismatch"
+              ? "size does not match content-length"
+              : "oid does not match content";
+          return json({ message }, 422);
+        }
         return new Response(null, { status: 200 });
       }
 
