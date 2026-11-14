@@ -70,7 +70,7 @@ export async function writePackedRefs(
  * Format refs for packed-refs file
  *
  * @param refs Refs to format (should be sorted)
- * @param peeled Whether to include peeled trait in header
+ * @param peeled Whether to write the `peeled` header (peel lines are written either way)
  * @returns Formatted packed-refs content
  */
 export function formatPackedRefs(refs: Ref[], peeled = true): string {
@@ -89,8 +89,9 @@ export function formatPackedRefs(refs: Ref[], peeled = true): string {
 
     lines.push(`${ref.objectId} ${ref.name}`);
 
-    // Write peeled line for annotated tags
-    if (peeled && ref.peeledObjectId !== undefined) {
+    // Write the peel line of an annotated tag whatever the header says: git's reader
+    // accepts a `^` line after any ref line, with or without the `peeled` trait.
+    if (ref.peeledObjectId !== undefined) {
       lines.push(`^${ref.peeledObjectId}`);
     }
   }

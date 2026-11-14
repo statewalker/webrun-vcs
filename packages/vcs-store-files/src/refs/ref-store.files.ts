@@ -117,12 +117,13 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Remove a ref (loose and packed). The loose file is removed without a ref lock
-   * (prefer `batch` next to other writers); packed-refs is rewritten under its lock.
+   * Remove a ref (loose and packed). packed-refs is rewritten first, under its lock
+   * (throwing `PackedRefsLockedError` with nothing changed if it stays held), then the
+   * loose file is removed, as git does; the loose file is removed without a ref lock
+   * (prefer `batch` next to other writers).
    */
   async remove(refName: string): Promise<boolean> {
     // A ref may be loose, packed, or both (a loose ref shadows its packed copy).
-    const loose = await deleteRef(this.files, this.gitDir, refName);
     let packed = false;
     await this.ops.updatePackedRefs((text) => {
       if (text === undefined) return undefined;
@@ -132,6 +133,7 @@ export class FileRefStore implements Refs {
       packed = true;
       return rest.length ? new TextEncoder().encode(formatPackedRefs(rest, peeled)) : null;
     });
+    const loose = await deleteRef(this.files, this.gitDir, refName);
     return loose || packed;
   }
 

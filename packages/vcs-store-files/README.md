@@ -214,11 +214,22 @@ It takes `packed-refs.lock` (retrying for `packedLockTimeoutMs`, git's `core.pac
 and the loose refs under the lock, writes the new content into the lock and renames it over
 `packed-refs`. Only then does it remove the loose refs it packed, each under its own `.lock` and
 only if it still holds the packed value: a ref updated in between stays loose with its new value.
-Symbolic and broken loose refs are left alone. `writePackedRefs`, `addPackedRef`, `removePackedRef`
-and `FileRefStore.remove` rewrite `packed-refs` under the same lock (`createFilesRefOps` exposes it
-as `updatePackedRefs`), so they never write back content read before a concurrent batch, or a
-native `git pack-refs` / `git update-ref -d`, committed. Native `git` sees the lock and waits or
-fails in turn.
+Symbolic and broken loose refs are left alone.
+
+Deleting a ref in a batch goes through `packed-refs.lock` even when the ref is only loose, as git
+queues every delete in its packed-refs transaction: a `pack-refs` holding the lock may be copying
+that loose ref right now. Under the lock the batch re-reads `packed-refs`, rewrites it only if the
+fresh copy still names the ref, and removes the loose file before it lets the lock go, so a
+deleted ref cannot come back from `packed-refs`. A briefly held lock is waited for
+(`packedLockTimeoutMs`); one held past that fails the delete as `locked` with nothing changed.
+
+`writePackedRefs`, `addPackedRef`, `removePackedRef` and `FileRefStore.remove` rewrite
+`packed-refs` under the same lock (`createFilesRefOps` exposes it as `updatePackedRefs`), so they
+never write back content read before a concurrent batch, or a native `git pack-refs` /
+`git update-ref -d`, committed. They keep the `^` peel lines of annotated tags whatever the header
+says, as git's reader accepts them after any ref line. `remove` rewrites `packed-refs` first and
+then deletes the loose file, as git: if the lock stays held it throws `PackedRefsLockedError` with
+nothing changed. Native `git` sees the lock and waits or fails in turn.
 
 ## Internals
 
@@ -363,10 +374,14 @@ reports what it would prune.
   the FilesApi has `createExclusive`, and otherwise only among writers sharing one FilesApi.
   Every rewrite of `packed-refs` (batches, `packRefs` / `optimize` and so gc, `remove`, and the
   functions `writePackedRefs`, `addPackedRef`, `removePackedRef`, `packRefs`) takes
-  `packed-refs.lock` the same way, so none of them loses a concurrent batch or a native
-  `git pack-refs` / `git update-ref -d`. `set`, `setSymbolic`, the loose file `remove` deletes,
-  loose objects and the index are still written directly, without locks: do not run them next to
-  a batch or a `git` process writing the same repository.
+  `packed-refs.lock` the same way and decides on a copy re-read under it, so none of them writes
+  back a `packed-refs` that drops a concurrent batch or a native `git pack-refs` /
+  `git update-ref -d`. Batches and `packRefs` also lock every loose ref they change or prune, so
+  between themselves (and native `git`) they lose nothing and a deleted ref stays deleted.
+  `set`, `setSymbolic`, the loose file `remove` deletes, loose objects and the index are still
+  written directly, without locks: next to a batch they can lose its update, and a `remove` that
+  runs while a `pack-refs` is packing that ref can see it come back from `packed-refs`. Do not run
+  them next to a batch, `packRefs` or a `git` process writing the same repository.
 
 ### What will surprise you
 

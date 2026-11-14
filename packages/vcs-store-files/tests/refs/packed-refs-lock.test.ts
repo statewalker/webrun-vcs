@@ -244,3 +244,143 @@ describe("packed-refs rewrites take packed-refs.lock", () => {
     expect(await base.exists("/.git/refs/heads/a.lock")).toBe(false);
   });
 });
+
+describe("deletes take packed-refs.lock even for a ref that is not packed", () => {
+  it("a loose-only ref deleted while packRefs is between reading it and writing packed-refs stays deleted", async () => {
+    const base = await repo();
+    const writer = new FileRefStore(base, "/.git");
+    await writer.batch([{ name: "refs/heads/x", new: oid(1) }]);
+    await writer.batch([
+      { name: "refs/heads/p", new: oid(2) },
+      { name: "refs/heads/q", new: oid(3) },
+    ]);
+    const g = gate();
+    const packer = gated(base, g, { readPath: "/.git/refs/heads/x" });
+
+    const pack = packRefs(packer, "/.git", ["refs/heads/x"], true);
+    await g.hit; // packRefs holds packed-refs.lock and has read loose x, packed-refs not written
+    const del = writer.batch([{ name: "refs/heads/x", old: oid(1), new: null }]);
+    await new Promise((r) => setTimeout(r, 30));
+    g.open();
+    await pack;
+    expect(await del).toEqual({ ok: true, rejected: [] });
+
+    expect(await writer.has("refs/heads/x")).toBe(false);
+    expect(await text(base, PACKED)).not.toContain("refs/heads/x");
+    expect((await writer.resolve("refs/heads/p"))?.objectId).toBe(oid(2));
+    expect(await base.exists("/.git/refs/heads/x")).toBe(false);
+    expect(await base.exists(LOCK)).toBe(false);
+  });
+
+  it("deleting a loose-only ref waits for a briefly held packed-refs.lock", async () => {
+    const files = await repo();
+    const refs = new FileRefStore(files, "/.git", { packedLockTimeoutMs: 1000 });
+    await refs.batch([{ name: "refs/heads/x", new: oid(1) }]);
+    await files.write(LOCK, [new Uint8Array(0)]);
+    setTimeout(() => void files.remove(LOCK), 50);
+    expect(await refs.batch([{ name: "refs/heads/x", old: oid(1), new: null }])).toEqual({
+      ok: true,
+      rejected: [],
+    });
+    expect(await refs.has("refs/heads/x")).toBe(false);
+    expect(await files.exists(LOCK)).toBe(false);
+  });
+
+  it("deleting a loose-only ref fails without a change while packed-refs.lock stays held", async () => {
+    const files = await repo();
+    const refs = new FileRefStore(files, "/.git", { packedLockTimeoutMs: 30 });
+    await refs.batch([{ name: "refs/heads/x", new: oid(1) }]);
+    await files.write(LOCK, [new Uint8Array(0)]);
+    expect(await refs.batch([{ name: "refs/heads/x", old: oid(1), new: null }])).toEqual({
+      ok: false,
+      rejected: [{ name: "packed-refs", reason: "locked" }],
+    });
+    expect((await refs.resolve("refs/heads/x"))?.objectId).toBe(oid(1));
+    expect(await files.exists("/.git/refs/heads/x.lock")).toBe(false);
+    expect(await files.exists(LOCK)).toBe(true);
+  });
+});
+
+describe("FileRefStore.remove rewrites packed-refs before the loose file", () => {
+  it("leaves the ref untouched when packed-refs.lock stays held", async () => {
+    const files = await repo();
+    const refs = new FileRefStore(files, "/.git", { packedLockTimeoutMs: 30 });
+    await refs.batch([
+      { name: "refs/heads/p", new: oid(1) },
+      { name: "refs/heads/q", new: oid(2) },
+    ]);
+    await refs.batch([{ name: "refs/heads/p", old: oid(1), new: oid(5) }]); // loose over packed
+    const before = await text(files, PACKED);
+    await files.write(LOCK, [new Uint8Array(0)]);
+
+    await expect(refs.remove("refs/heads/p")).rejects.toThrow(/packed-refs\.lock/);
+    expect(await text(files, "/.git/refs/heads/p")).toBe(`${oid(5)}\n`);
+    expect((await refs.resolve("refs/heads/p"))?.objectId).toBe(oid(5));
+    expect(await text(files, PACKED)).toBe(before);
+  });
+
+  it("removes a ref that is both loose and packed", async () => {
+    const files = await repo();
+    const refs = new FileRefStore(files, "/.git");
+    await refs.batch([
+      { name: "refs/heads/p", new: oid(1) },
+      { name: "refs/heads/q", new: oid(2) },
+    ]);
+    await refs.batch([{ name: "refs/heads/p", old: oid(1), new: oid(5) }]);
+    expect(await refs.remove("refs/heads/p")).toBe(true);
+    expect(await refs.has("refs/heads/p")).toBe(false);
+    expect((await refs.resolve("refs/heads/q"))?.objectId).toBe(oid(2));
+    expect(await refs.remove("refs/heads/p")).toBe(false);
+  });
+});
+
+describe("packed-refs rewrites keep peel lines under a sorted-only header", () => {
+  const TAG = "refs/tags/v1";
+  const seed = async () => {
+    const files = await repo();
+    // as packRefs and ref batches write it: "sorted" only, with a peel line kept
+    await files.write(PACKED, [
+      new TextEncoder().encode(
+        `# pack-refs with: sorted \n${oid(1)} refs/heads/a\n${oid(2)} refs/heads/b\n${oid(3)} ${TAG}\n^${oid(4)}\n`,
+      ),
+    ]);
+    return files;
+  };
+
+  it("removePackedRef keeps the peel line", async () => {
+    const files = await seed();
+    expect(await removePackedRef(files, "/.git", "refs/heads/a")).toBe(true);
+    expect(await text(files, PACKED)).toContain(`${oid(3)} ${TAG}\n^${oid(4)}\n`);
+  });
+
+  it("addPackedRef keeps the peel line", async () => {
+    const files = await seed();
+    await addPackedRef(files, "/.git", { name: "refs/heads/c", objectId: oid(5) } as never);
+    expect(await text(files, PACKED)).toContain(`${oid(3)} ${TAG}\n^${oid(4)}\n`);
+  });
+
+  it("FileRefStore.remove keeps the peel line", async () => {
+    const files = await seed();
+    const refs = new FileRefStore(files, "/.git");
+    expect(await refs.remove("refs/heads/a")).toBe(true);
+    expect(await text(files, PACKED)).toContain(`${oid(3)} ${TAG}\n^${oid(4)}\n`);
+  });
+
+  it("a remove after packRefs keeps the peel line", async () => {
+    const files = await repo();
+    await files.write(PACKED, [
+      new TextEncoder().encode(
+        `# pack-refs with: peeled fully-peeled sorted \n${oid(3)} ${TAG}\n^${oid(4)}\n`,
+      ),
+    ]);
+    const refs = new FileRefStore(files, "/.git");
+    await refs.batch([{ name: "refs/heads/a", new: oid(1) }]);
+    await refs.batch([{ name: "refs/heads/b", new: oid(2) }]);
+    await refs.packRefs([], { all: true });
+    await refs.remove("refs/heads/a");
+    expect(await text(files, PACKED)).toContain(`${oid(3)} ${TAG}\n^${oid(4)}\n`);
+    expect((await refs.get(TAG)) as { peeledObjectId?: string }).toMatchObject({
+      peeledObjectId: oid(4),
+    });
+  });
+});

@@ -398,16 +398,25 @@ export function createFilesRefOps(
         return fail([{ name: u.requested, reason: "mismatch" }]);
       }
       if (u.newValue === null) {
-        if (packed.has(u.name)) {
-          // git's order: drop it from packed-refs first, then remove the loose file
+        // As git, every delete goes through packed-refs.lock, decided on a copy re-read
+        // under it: a pack-refs that holds the lock may be packing this loose ref right
+        // now. git's order: drop it from packed-refs first, then remove the loose file,
+        // which happens while packed-refs.lock is held so that no pack-refs can copy it
+        // back in between. Committing packed-refs releases the lock, so it is re-taken
+        // and re-checked until the fresh copy no longer names the ref.
+        for (;;) {
           const r = await withPackedLock(async (commitPacked) => {
             const fresh = await readPacked();
-            fresh.delete(u.name);
-            await commitPacked(serializePacked(fresh));
+            if (fresh.delete(u.name)) {
+              await commitPacked(serializePacked(fresh));
+              return "again" as const;
+            }
+            if (await files.exists(u.name)) await removeAndPrune(u.name);
+            return "done" as const; // the lock is released without a write
           });
           if (r === "held") return fail([{ name: PACKED, reason: "locked" }]);
+          if (r === "done") break;
         }
-        if (await files.exists(u.name)) await removeAndPrune(u.name);
         await writeLogs([u], () => curId, o);
       } else {
         await writeLogs([u], () => curId, o); // under the ref lock, before the rename (as git)
