@@ -210,6 +210,33 @@ Resolving deltas holds the delta chain being resolved, not the pack: entries are
 
 `writePackIdx(entries, packChecksum)` writes the same `.idx` v2 from a list of `{ id, offset, crc32 }`.
 
+### Reading packs
+
+```typescript
+import { openPackSet } from "@statewalker/vcs-core";
+
+const packs = await openPackSet(files, ".git/objects/pack", {
+  externalBase: (id) => looseObjects.get(id), // REF_DELTA bases no pack holds (optional)
+});
+const obj = await packs.get(id, { verify: true }); // { type, size, content } or undefined
+for await (const chunk of obj?.content ?? []) consume(chunk);
+
+for (const s of packs.skipped) console.warn(`skipped ${s.pack}: ${s.error}`);
+
+await packs.install(received); // installPack, then the pack is readable at once
+await packs.remove([oldPackId]); // .idx first, then .pack, .keep, .rev…
+```
+
+`openPackSet` reads every `pack-<id>.idx` of a directory together with its `.pack`, the way git's object database does. Each idx is validated when it is opened: version (v2, and v1 for old repositories), monotonic fan-out, exact length including the 64-bit offset table, its own SHA-1, ids sorted and in their fan-out buckets, and the pack trailer must be the checksum the idx records. That last check is the one that catches an idx of another pack with the same object count. A pack that fails any of this is skipped and recorded in `skipped`, as git warns and skips; the rest of the set stays readable.
+
+Lookups go through the fan-out table and a binary search. Whole objects stream straight out of the inflater, so a large blob is never held in memory. Deltas are walked down to a whole object (or a cached one) and patched upwards with the checked delta applier, through one byte-bounded base cache for the whole set (`baseCacheBytes`, default 16 MiB, git's `core.deltaBaseCacheLimit`). The cache keeps checkpoints spread along a chain rather than every step: on random reads of a 50-deep chain it halves the inflations, where caching every step lets the top of the last chain evict the rest. Callers always receive copies, never a cached buffer.
+
+A miss rescans the directory, at most once per `rescanIntervalMs` (default 1 s; the first miss always rescans), so a pack native git writes after open is found; `refresh()` rescans now. A REF_DELTA whose base is in another pack of the set resolves through that pack, then through `externalBase`, carrying the ids being resolved so that a cycle across packs fails with `PackError` instead of recursing. A copy that turns out corrupt (a broken header, a bad delta, a missing base) is passed over for another pack's copy, as git's `mark_bad_packed_object` does; its error is raised only when no other copy exists. Declared sizes over `maxObjectSize` (default 1 GiB), delta results over it, and sizes zlib could not produce from the entry's compressed bytes are refused before anything is allocated. Format and zlib errors raise `PackError`; storage errors come through unchanged. With `verify`, a mismatch raises `ObjectIdMismatchError` at the end of the content, as loose objects do.
+
+`entry(id)` returns an object's entry as stored, for reuse when writing another pack: its kind (1 to 4, or 6 and 7 for deltas), the size in its header, the base id of a delta (an OFS_DELTA's base looked up through the idx), the CRC-32 from the idx, and `raw()`, the compressed bytes, which checks the CRC of the whole entry and throws `PackError` at the end when it does not match. An idx v1 has no CRCs: the entry is then read once to compute its CRC and check its zlib stream.
+
+`openPack(files, packPath, idxPath, options)` opens a single pack with the same checks. Not supported: `multi-pack-index`, `.rev` and bitmap files (packs are read without them), SHA-256 repositories.
+
 ### The `VcsCore` facade over `@statewalker/webrun-storage`
 
 `createVcsCore()` builds the same engine over a `BlobStore` (object bytes) and a `KvStore` (refs) and returns a smaller API: arrays instead of async iterables where that is simpler, one merge base, hydrated log entries, and refs with `read` / `compareAndSet` / `list`.

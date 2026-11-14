@@ -1,0 +1,8 @@
+---
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-store-files": minor
+---
+
+**New: `openPackSet(files, packDir, options?)`**, reading installed packs as git's object database does. Every `pack-<id>.idx` is validated on open (version 2 or 1, fan-out, length, its own SHA-1, sort order, the 64-bit table, and the pack trailer it names); a corrupt pack is skipped and listed in `skipped`. Lookups use the fan-out table and a binary search; whole objects stream from the inflater; deltas resolve through one byte-bounded base cache for the set (checkpoints along each chain), and callers always get copies. A miss rescans the directory (rate-limited, `rescanIntervalMs`), so packs written by native git after open are found; `refresh()` rescans now. REF_DELTA bases in other packs, or outside the set through `externalBase`, are resolved with cycle detection (`PackError`). `entry(id)` returns an entry as stored (kind, size, base id, CRC-32 and its compressed bytes, CRC-checked) for pack reuse. `install()` delegates to `installPack` and adds the pack; `remove()` deletes `.idx` first, then `.pack`, `.keep`, `.rev`. Also new: `openPack(files, packPath, idxPath, options?)` for one pack, `DeltaBaseCache`, and the types `Pack`, `PackSet`, `PackFile`, `PackedEntry`, `OpenPackOptions`, `OpenPackSetOptions`.
+
+**Changed in vcs-store-files:** `withPacks(loose, packs)` and `skipPacked(store, packs)` take a `PackSet` instead of a `PackDirectory`. Reads go to the packs first, then loose objects, and rescan the pack directory once when both miss; packed objects stream instead of being buffered, and `getRaw` is built from `get`. `createGitFilesBackend` returns the set as `packs` (and still `packDirectory`, for repack and gc).
