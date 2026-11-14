@@ -221,7 +221,7 @@ queues every delete in its packed-refs transaction: a `pack-refs` holding the lo
 that loose ref right now. Under the lock the batch re-reads `packed-refs`, rewrites it only if the
 fresh copy still names the ref, and removes the loose file before it lets the lock go, so a
 deleted ref cannot come back from `packed-refs`. A briefly held lock is waited for
-(`packedLockTimeoutMs`); one held past that fails the delete as `locked` with nothing changed.
+(`packedLockTimeoutMs`); one held past that fails the delete as `locked`, and the ref keeps its value (a stale packed copy behind a loose ref may already be gone; the loose ref shadows it either way).
 
 `writePackedRefs`, `addPackedRef`, `removePackedRef` and `FileRefStore.remove` rewrite
 `packed-refs` under the same lock (`createFilesRefOps` exposes it as `updatePackedRefs`), so they
