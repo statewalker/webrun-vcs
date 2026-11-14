@@ -285,4 +285,4 @@ The delta algorithm in `@statewalker/vcs-utils/diff` has no knowledge of storage
 
 - [06-internal-storage](../06-internal-storage/): loose objects and pack files
 - [10-custom-storage](../10-custom-storage/): building storage backends
-- [09-repository-access](../09-repository-access/): transport layer integration
+- [09-repository-facade](../09-repository-facade/): transport layer integration

@@ -1,18 +1,18 @@
 {
-  "name": "@statewalker/vcs-example-09-repository-access",
+  "name": "@statewalker/vcs-example-09-repository-facade",
   "version": "0.1.1",
   "private": true,
   "type": "module",
-  "description": "Repository Access: Serving repositories over transport",
+  "description": "Repository Facade: Serving repositories over transport",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/statewalker/webrun-vcs.git",
-    "directory": "apps/examples/09-repository-access"
+    "directory": "apps/examples/09-repository-facade"
   },
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
   },
-  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/examples/09-repository-access#readme",
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/apps/examples/09-repository-facade#readme",
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit"

@@ -2,7 +2,7 @@
  * Transport test helpers for @statewalker/vcs-commands
  *
  * Provides test infrastructure for remote operations (fetch, push, clone, pull).
- * Uses an in-memory Git HTTP server for testing with createVcsRepositoryAccess.
+ * Uses an in-memory Git HTTP server backed by a RepositoryFacade (createRepositoryFacade).
  */
 
 import {
@@ -58,7 +58,7 @@ export interface TransportTestStores {
  * Create transport test stores with Git-format object storage.
  *
  * All stores coordinate to use Git-format SHA-1 IDs, making this
- * compatible with createVcsRepositoryAccess.
+ * compatible with the transport's RepositoryFacade.
  */
 export function createTransportTestStores(): TransportTestStores {
   const objectStores = createMemoryObjectStores();
@@ -550,7 +550,7 @@ export async function addFileAndCommitWc(
  * Add a file to stores and create a commit.
  *
  * This function stores objects in Git format, compatible with
- * createVcsRepositoryAccess.
+ * the transport's RepositoryFacade.
  */
 export async function addFileAndCommit(
   stores: TransportTestStores,

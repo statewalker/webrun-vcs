@@ -1,4 +1,4 @@
-# @statewalker/vcs-example-09-repository-access
+# @statewalker/vcs-example-09-repository-facade
 
 ## 0.1.1
 

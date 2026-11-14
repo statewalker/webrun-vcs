@@ -1,12 +1,13 @@
 /**
- * Example 09: Repository Access for Transport
+ * Example 09: Repository Facade for Transport
  *
  * Demonstrates how to expose a repository for transport operations
- * using the RepositoryAccess, RepositoryFacade, and RefStore interfaces.
+ * using the RepositoryFacade and RefStore interfaces.
  *
  * Topics covered:
- * - Creating RepositoryAccess from a History instance
+ * - Reading refs through the History API
  * - Creating RepositoryFacade for pack import/export
+ * - Round-tripping a pack: exportPack from one repository, importPack into another
  * - Adapting core Refs to transport RefStore
  * - Using serveOverDuplex to serve Git requests
  * - Using fetchOverDuplex to fetch from a served repository
@@ -14,16 +15,18 @@
  * Run with: pnpm start
  */
 
-import { createMemoryHistoryWithOperations, FileMode, type Refs } from "@statewalker/vcs-core";
+import {
+  createMemoryHistoryWithOperations,
+  FileMode,
+  isSymbolicRef,
+  type Refs,
+} from "@statewalker/vcs-core";
 import {
   createTransportRefStore,
   type RefStore,
   type RepositoryFacade,
 } from "@statewalker/vcs-transport";
-import {
-  createVcsRepositoryAccess,
-  createVcsRepositoryFacade,
-} from "@statewalker/vcs-transport-adapters";
+import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
 
 // ============================================================
 //  Step 1: Create and populate a server repository
@@ -69,72 +72,86 @@ console.log(`  Server blob:   ${blobId.slice(0, 7)}`);
 console.log(`  Server tree:   ${treeId.slice(0, 7)}`);
 
 // ============================================================
-//  Step 2: Create RepositoryAccess adapter
+//  Step 2: Inspect the repository through the facade
 // ============================================================
 
-console.log("\n=== Step 2: Create RepositoryAccess ===\n");
+console.log("\n=== Step 2: Create RepositoryFacade ===\n");
 
-// RepositoryAccess provides low-level byte-level operations for
-// protocol handlers. It bridges History to the transport layer.
-const repoAccess = createVcsRepositoryAccess({
-  history: serverHistory,
-});
-
-// Demonstrate RepositoryAccess operations
-const hasCommit = await repoAccess.hasObject(commitId);
-console.log(`  hasObject(${commitId.slice(0, 7)}): ${hasCommit}`);
-
-const commitInfo = await repoAccess.getObjectInfo(commitId);
-console.log(`  getObjectInfo: type=${commitInfo?.type} size=${commitInfo?.size}`);
-
-const headInfo = await repoAccess.getHead();
-console.log(`  getHead: target=${headInfo?.target}`);
-
-console.log("  listRefs:");
-for await (const ref of repoAccess.listRefs()) {
-  console.log(`    ${ref.name} -> ${ref.objectId.slice(0, 7)}`);
-}
-
-// Walk the object graph
-console.log("  walkObjects (from commit, no exclusions):");
-let objectCount = 0;
-const typeNames = ["", "commit", "tree", "blob", "tag"];
-for await (const obj of repoAccess.walkObjects([commitId], [])) {
-  console.log(`    ${typeNames[obj.type]}: ${obj.id.slice(0, 7)} (${obj.content.length} bytes)`);
-  objectCount++;
-}
-console.log(`  Total objects walked: ${objectCount}`);
-
-// ============================================================
-//  Step 3: Create RepositoryFacade and RefStore adapter
-// ============================================================
-
-console.log("\n=== Step 3: Create RepositoryFacade & RefStore ===\n");
-
-// RepositoryFacade provides pack-level operations (importPack, exportPack)
-// for the transport FSM. It needs both History and SerializationApi.
+// RepositoryFacade provides what the transport FSM needs: pack import and
+// export, existence checks and ancestry walks. It needs both History and
+// SerializationApi.
 const serverFacade: RepositoryFacade = createVcsRepositoryFacade({
   history: serverHistory,
   serialization: serverHistory.serialization,
 });
 
+console.log(`  facade.has(${commitId.slice(0, 7)}): ${await serverFacade.has(commitId)}`);
+console.log(`  facade.getObjectSize(blob): ${await serverFacade.getObjectSize?.(blobId)} bytes`);
+
+console.log("  facade.walkAncestors(commit):");
+for await (const oid of serverFacade.walkAncestors(commitId)) {
+  console.log(`    ${oid.slice(0, 7)}`);
+}
+
+// Refs come from the History API; symbolic refs such as HEAD name a target.
+console.log("  history.refs.list():");
+for await (const ref of serverHistory.refs.list()) {
+  if (isSymbolicRef(ref)) {
+    console.log(`    ${ref.name} -> ${ref.target} (symbolic)`);
+  } else {
+    console.log(`    ${ref.name} -> ${ref.objectId?.slice(0, 7)}`);
+  }
+}
+
+// ============================================================
+//  Step 3: Round-trip a pack, adapt Refs to RefStore
+// ============================================================
+
+console.log("\n=== Step 3: Pack Round Trip & RefStore ===\n");
+
+// exportPack streams the objects reachable from `wants` and not from `exclude`.
+console.log("  Exporting pack (wants=[commit], haves=[]):");
+const packChunks: Uint8Array[] = [];
+let packSize = 0;
+for await (const chunk of serverFacade.exportPack(new Set([commitId]), new Set())) {
+  packChunks.push(chunk);
+  packSize += chunk.length;
+}
+const packHeader = readPackHeader(packChunks);
+console.log(`    Pack size: ${packSize} bytes`);
+console.log(
+  `    Pack header: ${packHeader.signature} v${packHeader.version}, ${packHeader.objectCount} objects`,
+);
+
+// importPack takes the same stream on the other side.
+const scratchHistory = createMemoryHistoryWithOperations();
+await scratchHistory.initialize();
+const scratchFacade = createVcsRepositoryFacade({
+  history: scratchHistory,
+  serialization: scratchHistory.serialization,
+});
+const importResult = await scratchFacade.importPack(
+  (async function* () {
+    yield* packChunks;
+  })(),
+);
+console.log(
+  `  Imported into a scratch repository: ${importResult.objectsImported} objects ` +
+    `(${importResult.commitsImported} commit, ${importResult.treesImported} tree)`,
+);
+for (const [label, oid] of [
+  ["commit", commitId],
+  ["tree", treeId],
+  ["blob", blobId],
+] as const) {
+  console.log(`    scratch has ${label} ${oid.slice(0, 7)}: ${await scratchFacade.has(oid)}`);
+}
+await scratchHistory.close();
+
 // RefStore adapts the core Refs interface to the transport RefStore interface.
 // The transport layer needs a simpler refs API for protocol operations.
 const serverRefStore: RefStore = createRefStoreAdapter(serverHistory.refs);
 
-// Verify the facade works
-const hasFacadeCommit = await serverFacade.has(commitId);
-console.log(`  facade.has(${commitId.slice(0, 7)}): ${hasFacadeCommit}`);
-
-// Export a pack to demonstrate
-console.log("  Exporting pack (wants=[commit], haves=[]):");
-let packSize = 0;
-for await (const chunk of serverFacade.exportPack(new Set([commitId]), new Set())) {
-  packSize += chunk.length;
-}
-console.log(`    Pack size: ${packSize} bytes`);
-
-// List refs via RefStore adapter
 const allRefs = await serverRefStore.listAll();
 console.log("  RefStore.listAll():");
 for (const [name, oid] of allRefs) {
@@ -212,13 +229,11 @@ channel.port2.close();
 
 console.log("\n=== Summary ===\n");
 console.log("Key interfaces demonstrated:");
-console.log("  - RepositoryAccess: Low-level byte-level protocol operations");
 console.log("  - RepositoryFacade: Pack-level import/export operations");
 console.log("  - RefStore: Transport-compatible ref storage adapter");
 console.log("  - serveOverDuplex: Serve Git requests over any duplex stream");
 console.log("  - fetchOverDuplex: Fetch from a served repository");
 console.log("\nAdapter functions:");
-console.log("  - createVcsRepositoryAccess({ history })");
 console.log("  - createVcsRepositoryFacade({ history, serialization })");
 console.log("  - createRefStoreAdapter(refs)  (see code in this example)");
 
@@ -230,6 +245,31 @@ console.log("\nExample completed successfully!");
 // ============================================================
 //  Helper: RefStore adapter (inline for clarity)
 // ============================================================
+
+/**
+ * Reads the 12-byte pack header: "PACK", a version and an object count
+ * (big-endian 32-bit integers).
+ */
+function readPackHeader(chunks: Uint8Array[]): {
+  signature: string;
+  version: number;
+  objectCount: number;
+} {
+  const header = new Uint8Array(12);
+  let filled = 0;
+  for (const chunk of chunks) {
+    const take = Math.min(chunk.length, 12 - filled);
+    header.set(chunk.subarray(0, take), filled);
+    filled += take;
+    if (filled === 12) break;
+  }
+  const view = new DataView(header.buffer);
+  return {
+    signature: new TextDecoder().decode(header.subarray(0, 4)),
+    version: view.getUint32(4),
+    objectCount: view.getUint32(8),
+  };
+}
 
 /**
  * Adapts core Refs interface to transport RefStore.
