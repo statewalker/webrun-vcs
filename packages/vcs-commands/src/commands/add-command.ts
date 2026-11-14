@@ -37,6 +37,7 @@ import {
   UpdateStagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
+import { storeWorktreeFile } from "../core-commands/index.js";
 
 import {
   IncompatibleOptionsError,
@@ -450,7 +451,7 @@ export class AddCommand extends GitCommand<AddResult> {
       }
 
       // Hash and store content
-      const objectId = await this.storeFileContent(worktree, file.path);
+      const objectId = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry);
 
       // Add to staging
       editor.add(
@@ -474,23 +475,5 @@ export class AddCommand extends GitCommand<AddResult> {
       removed,
       totalProcessed: added.length + removed.length,
     };
-  }
-
-  /**
-   * Store file content as blob and return object ID.
-   *
-   * Note: The object store handles blob header internally.
-   */
-  private async storeFileContent(worktree: Worktree, path: string): Promise<string> {
-    // Read content from working tree
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    for await (const chunk of worktree.readContent(path)) {
-      chunks.push(chunk);
-      size += chunk.length;
-    }
-
-    // Store raw content - the blob store handles blob formatting
-    return this.blobs.store(chunks, size);
   }
 }

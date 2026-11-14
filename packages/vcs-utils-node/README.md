@@ -59,7 +59,7 @@ const files = createNodeFilesApi({ rootDir: "/path/to/project" });
 const head = await readText(files, ".git/HEAD"); // "ref: refs/heads/main\n"
 ```
 
-Paths are resolved against `rootDir`. `write` streams: each chunk goes to the file as it arrives, so writing a large object holds one chunk in memory, not the whole file (`StreamingNodeFilesApi`; the `NodeFilesApi` of `@statewalker/webrun-files-node` 0.10 collects the chunks first). A failed write can leave a partial file, so write a temporary and rename it where that matters, as git does. To open a Git repository on disk, pass this `FilesApi` to a storage backend such as `createGitFilesBackend()` from `@statewalker/vcs-store-files`.
+Paths are resolved against `rootDir`. `write` streams: each chunk goes to the file as it arrives, so writing a large object holds one chunk in memory, not the whole file (`StreamingNodeFilesApi`; the `NodeFilesApi` of `@statewalker/webrun-files-node` 0.10 collects the chunks first). The bytes go to a dot-named temporary beside the file, renamed over it at the end: a source that fails leaves the old file as it was, and a file can be rewritten from its own `read`. As in `NodeFilesApi`, a path whose `..` would leave `rootDir` is refused. To open a Git repository on disk, pass this `FilesApi` to a storage backend such as `createGitFilesBackend()` from `@statewalker/vcs-store-files`.
 
 ## Internals
 

@@ -17,6 +17,7 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import type { Add, AddOptions, AddResult } from "./add.command.js";
+import { storeWorktreeFile } from "./store-worktree-file.js";
 
 /**
  * Options for creating an AddCommand.
@@ -222,7 +223,7 @@ export class AddCommand implements Add {
       }
 
       // Hash and store content
-      const objectId = await this.storeFileContent(file.path);
+      const objectId = await storeWorktreeFile(this.blobs, this.worktree, file.path, worktreeEntry);
 
       // Add to staging
       editor.add(
@@ -250,26 +251,6 @@ export class AddCommand implements Add {
    */
   async addAll(options: AddOptions = {}): Promise<AddResult> {
     return this.add(["**/*"], { ...options, all: true });
-  }
-
-  /**
-   * Store file content as blob and return object ID.
-   */
-  private async storeFileContent(path: string): Promise<string> {
-    // A regular file's size is known: the blob is written in one pass, without
-    // holding it in memory. Symlinks and anything else are collected first.
-    const entry = await this.worktree.getEntry(path);
-    const regular =
-      entry !== undefined && !entry.isDirectory && (entry.mode & 0o170000) === 0o100000;
-    if (regular) {
-      try {
-        return await this.blobs.store(this.worktree.readContent(path), entry.size);
-      } catch (e) {
-        // The file changed while it was read: store what it holds now.
-        if ((e as Error)?.name !== "SizeMismatchError") throw e;
-      }
-    }
-    return await this.blobs.store(this.worktree.readContent(path));
   }
 }
 

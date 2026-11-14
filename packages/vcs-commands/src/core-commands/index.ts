@@ -11,3 +11,4 @@ export type {
   CheckoutOptions,
 } from "./checkout.command.js";
 export { CheckoutConflictReason as CheckoutConflictReasonValues } from "./checkout.command.js";
+export * from "./store-worktree-file.js";
