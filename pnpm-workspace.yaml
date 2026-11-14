@@ -23,10 +23,12 @@ catalog:
   "@statewalker/webrun-content-store": "^0.2.0"
   "@statewalker/webrun-content-transfer": "^0.2.0"
   "@statewalker/webrun-files-sync": "^0.2.0"
-  "@statewalker/webrun-http-streams": ^0.2.1
-  "@statewalker/webrun-streams-signaling": ^0.1.1
-  "@statewalker/webrun-streams-livekit": "^0.2.0"
-  "@statewalker/webrun-streams": "^0.2.0"
+  "@statewalker/webrun-http-streams": "^0.6.0"
+  "@statewalker/webrun-streams-signaling": "^0.3.0"
+  "@statewalker/webrun-streams-livekit": "^0.3.0"
+  "@statewalker/webrun-streams": "^0.4.0"
+  "@statewalker/webrun-rpc": "^0.12.0"
+  "@statewalker/webrun-msgpack": "^0.11.0"
   "@biomejs/biome": ^2.5.15
   "@observablehq/framework": ^1.13.4
   "@statewalker/webrun-files": "^0.11.0"

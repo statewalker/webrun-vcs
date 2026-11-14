@@ -30,7 +30,7 @@ View ──action──> UserActionsModel ──> main-controller ──> contro
   ^                                                            |
   └───────────── onUpdate() ◄─────── models ◄──── update ──────┘
 
-RTCDataChannel ─ byteChannelFromDataChannel ─ emulateMux ─ webrunClientDuplex ─ fetchOverDuplex / pushOverDuplex
+RTCDataChannel ─ byteChannelFromDataChannel ─ messageTargetOverByteChannel ─ createPeerMux (webrun-rpc port stack) ─ webrunClientDuplex ─ fetchOverDuplex / pushOverDuplex
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the patterns (context adapters, registries, user actions).
@@ -56,7 +56,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the patterns (context adapt
 
 ```typescript
 // sync-controller.ts / utils/transport-helpers.ts
-const mux = emulateMux(byteChannelFromDataChannel(channel), { side }); // "initiator" | "responder"
+const mux = createPeerMux(channel, side); // "initiator" | "responder"
+// inside: messageTargetOverByteChannel(byteChannelFromDataChannel(channel)) gives
+// { target, signal, maxMessageSize }, and utils/peer-mux.ts runs one webrun-rpc
+// multiplexPort (msgpackCodec) over it for both calling and serving
 
 // Fetch: peer branches land in refs/remotes/peer/*
 await fetchOverDuplex({
@@ -71,18 +74,18 @@ await pushOverDuplex({ duplex: webrunClientDuplex(mux.call), repository, refStor
   refspecs: ["refs/heads/main:refs/heads/main"] });
 ```
 
-The two sides take opposite `side` values so multiplexed stream ids do not collide. `servePeer(mux, history)` in `transport-helpers.ts` registers a side as a Git server with `serveRepoOverWebrun()`.
+The two sides take opposite `side` values so their port ids do not collide. Each `mux.call` opens one port of `webrun-rpc`'s port stack; when the data channel closes, the mux closes and every call in flight fails. `servePeer(mux, history)` in `transport-helpers.ts` registers a side as a Git server with `serveRepoOverWebrun()`.
 
 ## Why it is the way it is
 
 - **Views talk only to models.** Views enqueue actions on `UserActionsModel` and re-render on model updates; only controllers touch the file system, Git and WebRTC. This keeps the views free of side effects and lets the models be unit-tested without a browser (`tests/models.test.ts`).
-- **Real Git protocol over the data channel.** The data channel is wrapped as a byte channel and multiplexed, and each push or fetch is a normal upload-pack/receive-pack exchange, so the same transport code would work over HTTP.
+- **Real Git protocol over the data channel.** The data channel is wrapped as a byte channel and multiplexed with `webrun-rpc`'s port stack (one port per call), and each push or fetch is a normal upload-pack/receive-pack exchange, so the same transport code would work over HTTP.
 - **Manual signaling.** Offers and answers are compressed, encoded strings that the user copies between windows, so no signaling server is needed.
 - **Polling the folder.** With a real folder the app re-reads the working directory every 3 seconds, so edits made in an editor show up without a file-watcher API.
 
 ## What will surprise you
 
-- **Nothing serves the Git requests.** `servePeer()` is defined but never called, so neither window answers the other's push or fetch over the data channel. The receiving multiplexer answers every call with `emulateMux: no handler registered`, and the activity log shows `Push failed: <reason>` or `Fetch failed: <reason>`. `serveRepoOverWebrun()` also serves only `git-upload-pack` by default, so even once registered it answers fetches, not pushes.
+- **Nothing serves the Git requests.** `servePeer()` is defined but never called, so neither window answers the other's push or fetch over the data channel. The receiving multiplexer has no handler, so it rejects every port the other side opens, and the activity log shows `Push failed: <reason>` or `Fetch failed: <reason>`. `serveRepoOverWebrun()` also serves only `git-upload-pack` by default, so even once registered it answers fetches, not pushes.
 - **Commits are not written to the folder.** `Git.init()` always creates an in-memory history; with **Open Folder** your files and `.git/index` are on disk, but objects and refs are not. After a reload the folder's `.git` is detected (`Opened existing repository`) but the history starts empty.
 - **Restore moves `main`.** **Restore** writes the commit's tree into the working directory and sets `refs/heads/main` to that commit, so later commits drop out of the history list. It is refused with `Cannot restore: uncommitted changes exist` while there are changes.
 - **Push overwrites the peer's `main`**, not a remote-tracking ref. Fetch writes `refs/remotes/peer/*` and leaves your branch alone.
@@ -113,6 +116,7 @@ The two sides take opposite `side` values so multiplexed stream ids do not colli
 | `@statewalker/vcs-working-tree` | `WorkingCopy` type |
 | `@statewalker/vcs-transport` | `fetchOverDuplex`, `pushOverDuplex`, `webrunClientDuplex`, `serveRepoOverWebrun` |
 | `@statewalker/vcs-transport-adapters` | `createVcsRepositoryFacade` |
-| `@statewalker/webrun-streams` | `emulateMux` |
-| `@statewalker/webrun-streams-signaling` | `PeerConnection`, signal encoding, `byteChannelFromDataChannel` |
+| `@statewalker/webrun-streams` | the `Duplex` type |
+| `@statewalker/webrun-rpc`, `@statewalker/webrun-msgpack` | `multiplexPort`, `connect`, `serve`, `msgpackCodec`: the port stack behind `createPeerMux` |
+| `@statewalker/webrun-streams-signaling` | `PeerConnection`, signal encoding, `byteChannelFromDataChannel`, `messageTargetOverByteChannel` |
 | `@statewalker/webrun-files`, `-files-browser`, `-files-mem` | `FilesApi`, `BrowserFilesApi`, `MemFilesApi` |

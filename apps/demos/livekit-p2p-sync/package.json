@@ -25,6 +25,8 @@
     "@statewalker/vcs-transport": "workspace:^",
     "@statewalker/vcs-transport-adapters": "workspace:^",
     "@statewalker/vcs-working-tree": "workspace:^",
+    "@statewalker/webrun-msgpack": "catalog:",
+    "@statewalker/webrun-rpc": "catalog:",
     "@statewalker/webrun-streams": "catalog:",
     "@statewalker/webrun-streams-livekit": "catalog:",
     "livekit-client": "catalog:"

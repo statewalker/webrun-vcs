@@ -1,6 +1,6 @@
 import { toReadableStream } from "@statewalker/vcs-utils/streams";
 import type { ContentStore } from "@statewalker/webrun-content-store";
-import type { HttpHandler } from "@statewalker/webrun-http-streams";
+import type { FetchHandler } from "@statewalker/webrun-http-streams";
 import type { BatchObjectResponse, BatchRequest, BatchResponse } from "./batch.js";
 import { BASIC_TRANSFER, LFS_CONTENT_TYPE } from "./batch.js";
 import type { LfsResolver } from "./types.js";
@@ -37,7 +37,7 @@ function declaredLength(request: Request): number | undefined {
  * `content-length`; an unknown oid is 404. A batch `download` for an unknown oid is reported as an `error`
  * object, never a crash.
  */
-export function serveLfs(store: ContentStore, resolver: LfsResolver): HttpHandler {
+export function serveLfs(store: ContentStore, resolver: LfsResolver): FetchHandler {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
     const base = url.href.slice(0, url.href.length - url.pathname.length);

@@ -4,3 +4,4 @@ export {
   type ServeGitDispatchOptions,
   serveGitDispatch,
 } from "./webrun-git.js";
+export { createPeerMux, type PeerMux, type PeerMuxOptions } from "./peer-mux.js";
