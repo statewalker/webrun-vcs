@@ -19,8 +19,13 @@ import type {
 } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 
-import { createFilesRefBatch, type FilesRefBatchOptions } from "./files-ref-batch.js";
-import { packRefs, removePackedRef } from "./packed-refs-writer.js";
+import {
+  createFilesRefOps,
+  type FilesRefBatchOptions,
+  type FilesRefOps,
+} from "./files-ref-batch.js";
+import { parsePackedRefs } from "./packed-refs-reader.js";
+import { formatPackedRefs } from "./packed-refs-writer.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
 import { createRefsStructure, deleteRef, writeObjectRef, writeSymbolicRef } from "./ref-writer.js";
 import { createReflogReader } from "./reflog-reader.js";
@@ -46,20 +51,14 @@ export interface FileRefStoreOptions extends FilesRefBatchOptions {
  * - .git/packed-refs for packed refs
  */
 export class FileRefStore implements Refs {
-  private readonly applyBatch: (
-    commands: RefCommand[],
-    options?: BatchOptions,
-  ) => Promise<BatchResult>;
+  private readonly ops: FilesRefOps;
 
   constructor(
     private readonly files: FilesApi,
     private readonly gitDir: string,
     options: FileRefStoreOptions = {},
   ) {
-    this.applyBatch = createFilesRefBatch(
-      options.atomicFiles ?? atomicFilesOver(files, gitDir),
-      options,
-    );
+    this.ops = createFilesRefOps(options.atomicFiles ?? atomicFilesOver(files, gitDir), options);
   }
 
   /**
@@ -68,7 +67,7 @@ export class FileRefStore implements Refs {
    * Writes reflog lines in git's format (`options.ident`, `options.message`).
    */
   batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
-    return this.applyBatch(commands, options);
+    return this.ops.batch(commands, options);
   }
 
   /**
@@ -118,12 +117,23 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Remove a ref (loose and packed). Not locked: prefer `batch` next to other writers.
+   * Remove a ref (loose and packed). packed-refs is rewritten first, under its lock
+   * (throwing `PackedRefsLockedError` with nothing changed if it stays held), then the
+   * loose file is removed, as git does; the loose file is removed without a ref lock
+   * (prefer `batch` next to other writers).
    */
   async remove(refName: string): Promise<boolean> {
     // A ref may be loose, packed, or both (a loose ref shadows its packed copy).
+    let packed = false;
+    await this.ops.updatePackedRefs((text) => {
+      if (text === undefined) return undefined;
+      const { refs, peeled } = parsePackedRefs(text);
+      const rest = refs.filter((r) => r.name !== refName);
+      if (rest.length === refs.length) return undefined;
+      packed = true;
+      return rest.length ? new TextEncoder().encode(formatPackedRefs(rest, peeled)) : null;
+    });
     const loose = await deleteRef(this.files, this.gitDir, refName);
-    const packed = await removePackedRef(this.files, this.gitDir, refName);
     return loose || packed;
   }
 
@@ -136,7 +146,7 @@ export class FileRefStore implements Refs {
     newValue: ObjectId,
   ): Promise<RefUpdateResult> {
     // A one-command batch: locked, checked under the lock, committed by rename.
-    const r = await this.applyBatch([{ name: refName, old: expectedOld ?? null, new: newValue }]);
+    const r = await this.ops.batch([{ name: refName, old: expectedOld ?? null, new: newValue }]);
     if (r.ok) return { success: true, previousValue: expectedOld };
     return {
       success: false,
@@ -153,15 +163,10 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Pack loose refs into packed-refs file
+   * Pack every loose ref into packed-refs (`git pack-refs --all`), under packed-refs.lock
    */
   async optimize(): Promise<void> {
-    // Get all loose refs to pack
-    const refs = await readAllRefs(this.files, this.gitDir, "refs/");
-    const refNames = refs.map((r) => r.name);
-    if (refNames.length > 0) {
-      await packRefs(this.files, this.gitDir, refNames, true);
-    }
+    await this.ops.packRefs([], { all: true, prune: true });
   }
 
   /**
@@ -176,25 +181,19 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Pack loose refs into packed-refs file
+   * Pack loose refs into packed-refs, as `git pack-refs`: packed-refs is written under
+   * packed-refs.lock (waiting up to `packedLockTimeoutMs`, then throwing
+   * `PackedRefsLockedError`), and only then is each packed loose ref removed, under its
+   * own lock and only if it still holds the packed value.
    */
   async packRefs(
     refNames: string[],
     options?: { all?: boolean; deleteLoose?: boolean },
   ): Promise<void> {
-    const deleteLoose = options?.deleteLoose ?? true;
-
-    if (options?.all) {
-      // Pack all refs
-      const refs = await readAllRefs(this.files, this.gitDir, "refs/");
-      const allRefNames = refs.map((r) => r.name);
-      if (allRefNames.length > 0) {
-        await packRefs(this.files, this.gitDir, allRefNames, deleteLoose);
-      }
-    } else if (refNames.length > 0) {
-      // Pack specific refs
-      await packRefs(this.files, this.gitDir, refNames, deleteLoose);
-    }
+    await this.ops.packRefs(refNames, {
+      all: options?.all === true,
+      prune: options?.deleteLoose ?? true,
+    });
   }
 }
 

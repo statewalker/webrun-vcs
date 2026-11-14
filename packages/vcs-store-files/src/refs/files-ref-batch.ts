@@ -11,6 +11,11 @@
  * A crash at any point leaves every ref at its old or its new value once stale
  * locks are removed. Reflog lines are written in git's format after the
  * decision (best effort: a failed log line never fails a committed batch).
+ *
+ * Every other rewrite of packed-refs (pack-refs, the packed-refs writers) goes
+ * through the same `packed-refs.lock` protocol, `updatePackedRefs`: lock,
+ * re-read under the lock, write the new content into the lock, rename it over
+ * packed-refs, and remove the lock on failure.
  */
 import type {
   BatchOptions,
@@ -84,6 +89,40 @@ function serializePacked(entries: Map<string, PackedEntry>): Uint8Array {
   return enc.encode(s);
 }
 
+/** Thrown when `packed-refs.lock` stays held by another writer past the timeout. */
+export class PackedRefsLockedError extends Error {
+  readonly code = "ELOCKED";
+  constructor(timeoutMs: number) {
+    super(
+      `Unable to lock packed-refs: packed-refs.lock is held by another writer (waited ${timeoutMs} ms)`,
+    );
+    this.name = "PackedRefsLockedError";
+  }
+}
+
+/**
+ * The packed-refs operations of a git-files ref store, all under `packed-refs.lock`.
+ */
+export interface FilesRefOps {
+  /** An atomic ref batch (see `createFilesRefBatch`). */
+  batch(commands: RefCommand[], batchOptions?: BatchOptions): Promise<BatchResult>;
+  /**
+   * Rewrite packed-refs under `packed-refs.lock`: `update` gets the file's text,
+   * re-read under the lock (undefined if absent), and returns the new bytes,
+   * `null` to delete the file, or `undefined` to leave it unchanged. Throws
+   * `PackedRefsLockedError` if the lock stays held past `packedLockTimeoutMs`.
+   */
+  updatePackedRefs(
+    update: (text: string | undefined) => Uint8Array | null | undefined,
+  ): Promise<void>;
+  /**
+   * `git pack-refs`: under `packed-refs.lock`, copy the named loose refs into
+   * packed-refs (`all`: every loose ref under `refs/`). With `prune`, then remove
+   * each loose ref under its own `.lock`, only if it still holds the packed value.
+   */
+  packRefs(names: string[], options?: { all?: boolean; prune?: boolean }): Promise<void>;
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const defaultIdent = () => `webrun-vcs <vcs@localhost> ${Math.floor(Date.now() / 1000)} +0000`;
 /** git's reflog message: whitespace runs collapsed to one space, trimmed (refs.c copy_reflog_msg). */
@@ -104,6 +143,23 @@ export function createFilesRefBatch(
   files: AtomicFiles,
   options: FilesRefBatchOptions = {},
 ): (commands: RefCommand[], batchOptions?: BatchOptions) => Promise<BatchResult> {
+  return createFilesRefOps(files, options).batch;
+}
+
+/**
+ * Ref batches, pack-refs and packed-refs rewrites over `files` rooted at the
+ * `.git` directory, sharing one lock protocol and its timeouts.
+ *
+ * @example
+ * ```typescript
+ * const ops = createFilesRefOps(atomicFilesOver(files, ".git"));
+ * await ops.packRefs([], { all: true, prune: true }); // git pack-refs --all
+ * ```
+ */
+export function createFilesRefOps(
+  files: AtomicFiles,
+  options: FilesRefBatchOptions = {},
+): FilesRefOps {
   const refLockTimeout = options.refLockTimeoutMs ?? 100;
   const packedLockTimeout = options.packedLockTimeoutMs ?? 1000;
 
@@ -185,6 +241,32 @@ export function createFilesRefBatch(
     }
   }
   const unlock = (path: string) => removeAndPrune(`${path}.lock`).catch(() => {});
+  /**
+   * Run `fn` holding `packed-refs.lock`; "held" if another writer keeps it past the
+   * timeout. `fn` commits with `commitPacked` (which releases the lock); a lock still
+   * held when `fn` returns or throws is removed.
+   */
+  async function withPackedLock<T>(
+    fn: (commitPacked: (content: Uint8Array | null) => Promise<void>) => Promise<T>,
+  ): Promise<T | "held"> {
+    if ((await lock(PACKED, packedLockTimeout)) !== "ok") return "held";
+    let held = true;
+    const commitPacked = async (content: Uint8Array | null) => {
+      if (content === null) {
+        await files.remove(PACKED);
+        await files.remove(`${PACKED}.lock`);
+      } else {
+        await files.write(`${PACKED}.lock`, content);
+        await files.replace(`${PACKED}.lock`, PACKED);
+      }
+      held = false;
+    };
+    try {
+      return await fn(commitPacked);
+    } finally {
+      if (held) await files.remove(`${PACKED}.lock`).catch(() => false);
+    }
+  }
   /**
    * Commit a lock over its target; an empty directory left at the target is removed
    * first. A directory still holding another writer's lock (a batch on `<path>/…`
@@ -316,23 +398,25 @@ export function createFilesRefBatch(
         return fail([{ name: u.requested, reason: "mismatch" }]);
       }
       if (u.newValue === null) {
-        if (packed.has(u.name)) {
-          // git's order: drop it from packed-refs first, then remove the loose file
-          if ((await lock(PACKED, packedLockTimeout)) !== "ok") {
-            return fail([{ name: PACKED, reason: "locked" }]);
-          }
-          let packedOurs = true;
-          try {
+        // As git, every delete goes through packed-refs.lock, decided on a copy re-read
+        // under it: a pack-refs that holds the lock may be packing this loose ref right
+        // now. git's order: drop it from packed-refs first, then remove the loose file,
+        // which happens while packed-refs.lock is held so that no pack-refs can copy it
+        // back in between. Committing packed-refs releases the lock, so it is re-taken
+        // and re-checked until the fresh copy no longer names the ref.
+        for (;;) {
+          const r = await withPackedLock(async (commitPacked) => {
             const fresh = await readPacked();
-            fresh.delete(u.name);
-            await files.write(`${PACKED}.lock`, serializePacked(fresh));
-            await files.replace(`${PACKED}.lock`, PACKED);
-            packedOurs = false;
-          } finally {
-            if (packedOurs) await files.remove(`${PACKED}.lock`).catch(() => false);
-          }
+            if (fresh.delete(u.name)) {
+              await commitPacked(serializePacked(fresh));
+              return "again" as const;
+            }
+            if (await files.exists(u.name)) await removeAndPrune(u.name);
+            return "done" as const; // the lock is released without a write
+          });
+          if (r === "held") return fail([{ name: PACKED, reason: "locked" }]);
+          if (r === "done") break;
         }
-        if (await files.exists(u.name)) await removeAndPrune(u.name);
         await writeLogs([u], () => curId, o);
       } else {
         await writeLogs([u], () => curId, o); // under the ref lock, before the rename (as git)
@@ -420,7 +504,67 @@ export function createFilesRefBatch(
     return ref && "objectId" in ref ? ref.objectId : undefined;
   }
 
-  return async (commands, batchOptions = {}) => {
+  async function updatePackedRefs(
+    update: (text: string | undefined) => Uint8Array | null | undefined,
+  ): Promise<void> {
+    const r = await withPackedLock(async (commitPacked) => {
+      const text = await readText(PACKED);
+      const next = update(text);
+      if (next === undefined || (next === null && text === undefined)) return;
+      await commitPacked(next);
+    });
+    if (r === "held") throw new PackedRefsLockedError(packedLockTimeout);
+  }
+
+  /**
+   * As git's files_pack_refs and JGit's RefDirectory.pack: the loose refs are read
+   * and packed-refs is written under packed-refs.lock; only then is each packed
+   * loose ref removed, under its own lock and only if it still holds the packed
+   * value, so a ref updated meanwhile stays loose with its new value.
+   */
+  async function packRefs(
+    names: string[],
+    o: { all?: boolean; prune?: boolean } = {},
+  ): Promise<void> {
+    const packedNow = new Map<string, string>();
+    const r = await withPackedLock(async (commitPacked) => {
+      const packed = await readPacked();
+      const wanted = o.all ? await looseRefNames() : names;
+      for (const n of wanted) {
+        // absent, broken (git's iteration skips those) or symbolic (git keeps symrefs loose)
+        const l = await readLoose(n).catch(() => undefined);
+        if (!l || "target" in l) continue;
+        const prev = packed.get(n);
+        packed.set(n, prev?.id === l.id ? prev : { id: l.id });
+        packedNow.set(n, l.id);
+      }
+      if (packedNow.size) await commitPacked(serializePacked(packed));
+    });
+    if (r === "held") throw new PackedRefsLockedError(packedLockTimeout);
+    if (!o.prune) return;
+    for (const [n, id] of packedNow) {
+      // A ref someone is updating right now keeps its loose file (git skips it too).
+      if ((await lock(n, refLockTimeout)) !== "ok") continue;
+      try {
+        const l = await readLoose(n).catch(() => undefined);
+        if (l && "id" in l && l.id === id) await files.remove(n);
+      } finally {
+        await unlock(n); // also prunes the directories the removal emptied
+      }
+    }
+  }
+
+  /** Loose refs under refs/ (lock files skipped). */
+  async function looseRefNames(): Promise<string[]> {
+    const out: string[] = [];
+    for await (const p of files.list("refs")) if (!p.endsWith(".lock")) out.push(p);
+    return out;
+  }
+
+  const batch = async (
+    commands: RefCommand[],
+    batchOptions: BatchOptions = {},
+  ): Promise<BatchResult> => {
     if (commands.length === 0) return { ok: true, rejected: [] };
     // Plan without locks: names, policy, D/F conflicts and old values (all re-checked under the locks).
     const packed = await readPacked();
@@ -450,4 +594,6 @@ export function createFilesRefBatch(
       ? single(updates[0] as Update, batchOptions)
       : multi(updates, batchOptions);
   };
+
+  return { batch, updatePackedRefs, packRefs };
 }
