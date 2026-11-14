@@ -57,6 +57,22 @@ async function collectBytes(input: AsyncIterable<Uint8Array>): Promise<Uint8Arra
 /**
  * Helper to collect async iterable to array
  */
+/**
+ * Assert two byte arrays are equal. Large arrays are compared directly rather than with
+ * `toEqual`, whose element-by-element diff takes seconds on a few hundred KiB.
+ */
+function expectSameBytes(actual: Uint8Array, expected: Uint8Array): void {
+  expect(actual.length).toBe(expected.length);
+  let mismatch = -1;
+  for (let i = 0; i < actual.length; i++) {
+    if (actual[i] !== expected[i]) {
+      mismatch = i;
+      break;
+    }
+  }
+  expect(mismatch, `first differing byte at ${mismatch}`).toBe(-1);
+}
+
 async function toArray<T>(input: AsyncIterable<T>): Promise<T[]> {
   const result: T[] = [];
   for await (const item of input) {
@@ -370,10 +386,11 @@ export function createRawStorageTests(name: string, factory: RawStorageFactory):
         const data = large(1);
         await ctx.rawStorage.store("big", pieces(data, 7777));
         expect(await ctx.rawStorage.size("big")).toBe(data.length);
-        expect(await collectBytes(ctx.rawStorage.load("big"))).toEqual(data);
+        expectSameBytes(await collectBytes(ctx.rawStorage.load("big")), data);
         const start = 256 * 1024 - 10;
         const end = 512 * 1024 + 10;
-        expect(await collectBytes(ctx.rawStorage.load("big", { start, end }))).toEqual(
+        expectSameBytes(
+          await collectBytes(ctx.rawStorage.load("big", { start, end })),
           data.subarray(start, end),
         );
         expect(await collectBytes(ctx.rawStorage.load("big", { start: data.length - 5 }))).toEqual(
@@ -388,7 +405,7 @@ export function createRawStorageTests(name: string, factory: RawStorageFactory):
         expect(await ctx.rawStorage.size("v")).toBe(5);
         const again = large(3);
         await ctx.rawStorage.store("v", pieces(again, 65536));
-        expect(await collectBytes(ctx.rawStorage.load("v"))).toEqual(again);
+        expectSameBytes(await collectBytes(ctx.rawStorage.load("v")), again);
         expect(await toArray(ctx.rawStorage.keys())).toEqual(["v"]);
         expect(await ctx.rawStorage.remove("v")).toBe(true);
         expect(await toArray(ctx.rawStorage.keys())).toEqual([]);
@@ -435,7 +452,7 @@ export function createRawStorageTests(name: string, factory: RawStorageFactory):
         await ctx.rawStorage.store("b", toStream(encoder.encode("old")));
         expect(await move("a", "b")).toBe(true);
         expect(await ctx.rawStorage.has("a")).toBe(false);
-        expect(await collectBytes(ctx.rawStorage.load("b"))).toEqual(big);
+        expectSameBytes(await collectBytes(ctx.rawStorage.load("b")), big);
         await ctx.rawStorage.store("c", toStream(encoder.encode("tiny")));
         expect(await move("c", "b")).toBe(true);
         expect(decoder.decode(await collectBytes(ctx.rawStorage.load("b")))).toBe("tiny");
