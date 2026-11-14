@@ -454,13 +454,20 @@ describe("pktLineReader: many small packets in odd-sized chunks", () => {
   });
 
   it("decodes in time linear in the input (no copy of the buffer per packet)", async () => {
-    const many = Array.from({ length: 150_000 }, (_, i) => `${i}\n`);
-    const data = encodeAll(many);
-    const started = performance.now();
-    let n = 0;
-    for await (const _ of pktLineReader(from([data]))) n++;
-    expect(n).toBe(many.length);
-    expect(performance.now() - started).toBeLessThan(1500);
+    // Compare 4x the packets with 1x rather than a wall-clock bound, which a loaded machine
+    // can miss: linear decoding takes about 4x as long, copying the buffer per packet ~16x.
+    const timeFor = async (count: number) => {
+      const data = encodeAll(Array.from({ length: count }, (_, i) => `${i}\n`));
+      const started = performance.now();
+      let n = 0;
+      for await (const _ of pktLineReader(from([data]))) n++;
+      expect(n).toBe(count);
+      return performance.now() - started;
+    };
+    await timeFor(5_000); // warm up
+    const small = Math.max(await timeFor(25_000), 1);
+    const large = await timeFor(100_000);
+    expect(large / small).toBeLessThan(9);
   }, 60_000);
 
   it("still reports a packet cut short at the end", async () => {

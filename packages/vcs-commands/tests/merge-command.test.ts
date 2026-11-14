@@ -2245,6 +2245,8 @@ describe.each(backends)("MergeCommand - binary and big files ($name backend)", (
 
   /** main and side each change `path` from `base`; returns the git facade and stores. */
   async function diverge(path: string, base: string, ours: string, theirs: string) {
+    // a test that diverges twice cleans the first repository up before making the second
+    if (cleanup) await cleanup();
     const result = await createInitializedGitFromFactory(factory);
     cleanup = result.cleanup;
     const { git, workingCopy, repository } = result;

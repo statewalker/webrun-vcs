@@ -29,6 +29,10 @@ import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import { DEFAULT_BIG_FILE_THRESHOLD } from "../history/blobs/index.js";
+
+// still available from `@statewalker/vcs-core/pack`, where it used to be defined
+export { DEFAULT_BIG_FILE_THRESHOLD };
+
 import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { MissingObjectError } from "./list-objects.js";
