@@ -20,7 +20,7 @@ Package names follow `@statewalker/vcs-example-<name>`, `@statewalker/vcs-demo-<
 | [06-internal-storage](#06-internal-storage) | example | Loose objects, packs, GC, deltas |
 | [07-staging-checkout](#07-staging-checkout) | example | Working directory and staging area |
 | [08-transport-basics](#08-transport-basics) | example | List refs, clone, fetch over HTTP |
-| [09-repository-access](#09-repository-access) | example | Serving repositories over transport |
+| [09-repository-facade](#09-repository-facade) | example | Serving repositories over transport |
 | [10-custom-storage](#10-custom-storage) | example | Building storage backends from components |
 | [11-delta-strategies](#11-delta-strategies) | example | Storage optimization with the DeltaApi |
 | [browser-vcs-app](#browser-vcs-app) | demo | Browser VCS with swappable storage |
@@ -125,14 +125,14 @@ Git transport over the HTTP smart protocol against a real remote (`octocat/Hello
 pnpm --filter @statewalker/vcs-example-08-transport-basics start
 ```
 
-### 09-repository-access
+### 09-repository-facade
 
-**Location:** [apps/examples/09-repository-access](../apps/examples/09-repository-access)
+**Location:** [apps/examples/09-repository-facade](../apps/examples/09-repository-facade)
 
-Exposing a repository for transport: build a `RepositoryAccess`/`RepositoryFacade` from a `History`, adapt core `Refs` to the transport `RefStore`, and serve/fetch over a duplex channel with `serveOverDuplex`/`fetchOverDuplex`.
+Exposing a repository for transport: build a `RepositoryFacade` from a `History`, round-trip a pack with `exportPack`/`importPack`, read refs through the `History` API, adapt core `Refs` to the transport `RefStore`, and serve/fetch over a duplex channel with `serveOverDuplex`/`fetchOverDuplex`.
 
 ```bash
-pnpm --filter @statewalker/vcs-example-09-repository-access start
+pnpm --filter @statewalker/vcs-example-09-repository-facade start
 ```
 
 ### 10-custom-storage

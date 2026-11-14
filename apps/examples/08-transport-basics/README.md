@@ -222,5 +222,5 @@ The client speaks the Git smart-HTTP protocol to the server's upload-pack servic
 
 ### Related examples
 
-- [09-repository-access](../09-repository-access/) - server-side repository access for transport handlers
+- [09-repository-facade](../09-repository-facade/) - exposing a repository to transport through RepositoryFacade
 - [webrtc-p2p-sync](../../demos/webrtc-p2p-sync/) - peer-to-peer sync without a central server

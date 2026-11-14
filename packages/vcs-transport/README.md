@@ -62,7 +62,6 @@ All entry points are ESM with type declarations.
 | `RepositoryFacade` | `importPack`, `exportPack`, `has`, `walkAncestors`, optional reachability helpers |
 | `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip`, `batch` |
 | `createTransportRefStore(refs)` | the `RefStore` over a vcs-core `Refs`, with `batch` |
-| `RepositoryAccess` | Object/ref access: `hasObject`, `getObjectInfo`, `loadObject`, `storeObject`, `listRefs`, `getHead`, `updateRef`, `walkObjects` |
 | `TransportApi` | Pkt-line, sideband and pack I/O over a `Duplex` |
 | `Credentials` | `{ username?, password?, token? }`. The HTTP operations send Basic auth: `token` as the password (username defaults to `x-access-token`), otherwise `username`/`password`. |
 

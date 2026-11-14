@@ -31,9 +31,9 @@ Duplex (bidirectional async byte stream)
 The transport layer never touches storage directly. Two interfaces provide the bridge:
 
 - **`RepositoryFacade`** — Pack-level operations: export packs, import packs, check object existence, walk ancestry. Used by FSM handlers for pack generation and consumption.
-- **`RepositoryAccess`** — Object-level operations: CRUD on objects and refs, HEAD resolution. Used by higher-level server code.
+- **`RefStore`** — Ref operations: read, update and list refs, resolve symbolic refs. Used by FSM handlers for ref advertisement and updates.
 
-Storage adapters that implement these interfaces live in the separate `@statewalker/vcs-transport-adapters` package.
+Storage adapters that implement `RepositoryFacade` live in the separate `@statewalker/vcs-transport-adapters` package.
 
 ### Web Standard APIs
 
@@ -53,7 +53,6 @@ packages/vcs-transport/src/
 │   ├── fetch-result.ts     #   FetchResult, ServeResult, RawFetchResult
 │   ├── push-result.ts      #   PushResult, RefPushStatus
 │   ├── options.ts          #   Base option interfaces
-│   ├── repository-access.ts #  Server-side repo interface
 │   ├── repository-facade.ts #  Transport-layer repo interface
 │   └── transport-api.ts    #   Git wire protocol I/O interface
 │
@@ -218,15 +217,13 @@ const [getRefStore, setRefStore] = newAdapter<RefStore>("refStore");
 const refs = getRefStore(ctx);
 ```
 
-### RepositoryFacade vs RepositoryAccess
+### RepositoryFacade
 
-Two interfaces bridge transport and storage:
+One interface bridges transport and storage for objects:
 
-- **`RepositoryFacade`** — Optimized for pack-based protocol operations. Exposes pack export/import, ancestry walking, reachability checking. Used by FSM handlers. Created via `createVcsRepositoryFacade()` or `createStorageRepositoryFacade()` (in `@statewalker/vcs-transport-adapters`), or `createRepositoryFacade()` (in this package).
+- **`RepositoryFacade`** — Optimized for pack-based protocol operations. Exposes pack export/import, ancestry walking, reachability checking. Used by FSM handlers for fetch, push and serve. Both pack directions stream. Created via `createVcsRepositoryFacade()` or `createStorageRepositoryFacade()` (in `@statewalker/vcs-transport-adapters`), or `createRepositoryFacade()` (in this package).
 
-- **`RepositoryAccess`** — Optimized for object-level server operations. Exposes object/ref CRUD, HEAD resolution, graph walking. Used by HTTP server routing. Created via `createVcsRepositoryAccess()`.
-
-Both are implemented in `@statewalker/vcs-transport-adapters`.
+Refs go through `RefStore` (see above); `createTransportRefStore()` adapts a vcs-core `Refs`.
 
 ## Pkt-Line Format
 

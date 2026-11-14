@@ -205,12 +205,12 @@ The current `History` interface does not carry an `objects` property: the `GitOb
 
 **Transport and Protocol Operations**
 
-Git's HTTP and SSH protocols transfer objects in pack files, which contain raw objects with their Git headers. The transport layer needs direct access to `objects` for building pack files during push and receiving objects during fetch. `createCoreRepositoryAccess()` in `@statewalker/vcs-transport-adapters` builds protocol access directly from an object store and a ref store:
+Git's HTTP and SSH protocols transfer objects in pack files, which contain raw objects with their Git headers. The transport layer needs direct access to `objects` for building pack files during push and receiving objects during fetch. The transport reaches them through a `RepositoryFacade`, whose `exportPack` and `importPack` stream packs through the `SerializationApi`; `createVcsRepositoryFacade()` in `@statewalker/vcs-transport-adapters` builds one from a `HistoryWithOperations` (a `History` plus its `serialization`):
 
 ```typescript
-import { createCoreRepositoryAccess } from "@statewalker/vcs-transport-adapters";
+import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
 
-const repositoryAccess = createCoreRepositoryAccess({ objectStore, refStore });
+const facade = createVcsRepositoryFacade({ history, serialization: history.serialization });
 ```
 
 **Object Introspection**
@@ -634,21 +634,14 @@ Commands encapsulate multi-step workflows:
 - `Add`: Hash files, update staging entries, handle ignore patterns
 - `Checkout`: Compare trees, detect conflicts, update worktree
 
-### Repository Access (Moved)
+### Transport access (moved)
 
-**Note:** The `RepositoryAccess` interface and its implementations (`GitNativeRepositoryAccess`, `SerializingRepositoryAccess`) have been moved to the `@statewalker/vcs-transport-adapters` package.
-
-These provide byte-level access to Git objects in wire format for transport operations (fetch, push, clone). See the transport-adapters package for:
-
-- `RepositoryAccess` interface
-- `createVcsRepositoryAccess` - adapts VCS stores to RepositoryAccess
-- `createCoreRepositoryAccess` - adapts GitObjects + Refs to RepositoryAccess
-- `GitNativeRepositoryAccess` - direct passthrough for object-only operations
+Transport access lives in `@statewalker/vcs-transport-adapters`: `createVcsRepositoryFacade({ history, serialization })` adapts a `History` and its `SerializationApi` to the transport's `RepositoryFacade`, which streams packs in both directions. Refs reach the transport through `createTransportRefStore(refs)` in `@statewalker/vcs-transport`.
 
 ```typescript
-import { createVcsRepositoryAccess } from "@statewalker/vcs-transport-adapters";
+import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
 
-const repositoryAccess = createVcsRepositoryAccess({ history });
+const facade = createVcsRepositoryFacade({ history, serialization: history.serialization });
 ```
 
 ### History factories
