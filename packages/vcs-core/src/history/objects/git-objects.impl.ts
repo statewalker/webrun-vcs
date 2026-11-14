@@ -316,5 +316,9 @@ export function createGitObjects(
       checkId(id);
       return store.remove(id);
     },
+
+    ...(store.sweepStale
+      ? { sweepStale: (o: { olderThanMs: number }) => store.sweepStale?.(o) ?? Promise.resolve(0) }
+      : {}),
   };
 }

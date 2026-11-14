@@ -336,7 +336,7 @@ const id = await objects.put("blob", bytes.length, [bytes]); // "ce013625…", a
 const obj = await objects.get(id, { verify: true }); // { type: "blob", size: 6, content }
 ```
 
-`put(type, size, content)` reads `content` once: each chunk is hashed and deflated as it passes, and the store receives the compressed bytes before anyone knows the id. That is what a `StagingBlobStore` is for: `putStaged(bytes, idOf)` stores bytes under the id `idOf()` returns after the last byte, as git writes `objects/tmp_obj_*` and renames it. `rawStorageStaging(raw)` adapts any `RawStorage`: when the raw store has `move` it streams into a temporary key and renames it to the id (the memory, KV and SQL raw stores all do), otherwise it collects the compressed bytes first; `filesStagingStore` in `@statewalker/vcs-store-files` writes git's own layout, streaming where the FilesApi's `write` streams (the Node and in-memory ones collect the chunks first). A size that does not match the content rejects with `SizeMismatchError` (exported here too) and stores nothing. Ids are SHA-1; SHA-256 repositories are not supported.
+`put(type, size, content)` reads `content` once: each chunk is hashed and deflated as it passes, and the store receives the compressed bytes before anyone knows the id. That is what a `StagingBlobStore` is for: `putStaged(bytes, idOf)` stores bytes under the id `idOf()` returns after the last byte, as git writes `objects/tmp_obj_*` and renames it. `rawStorageStaging(raw)` adapts any `RawStorage`: content up to 256 KiB (`STAGING_INLINE_THRESHOLD`, `{ inlineThreshold }`; nearly every tree, commit and small blob) is collected and stored under its id with one `has` and one `store`, and a duplicate writes nothing. Longer content streams into a temporary key and is renamed to the id when the raw store has `move` (the memory, KV and SQL raw stores all do); otherwise the compressed bytes are collected first. An id that is already stored keeps its value: objects are content addressed, so a second write never replaces the first; `filesStagingStore` in `@statewalker/vcs-store-files` writes git's own layout, streaming where the FilesApi's `write` streams (the Node and in-memory ones collect the chunks first). A size that does not match the content rejects with `SizeMismatchError` (exported here too) and stores nothing. Ids are SHA-1; SHA-256 repositories are not supported.
 
 `putRaw(id, raw)` stores an object received with its id, refusing it (`ObjectIdMismatchError`, `CorruptObjectError`) unless the header is valid and the bytes hash to that id. Reading checks as git does: a truncated zlib stream, bytes after it, a bad header or a body of the wrong size raise `CorruptObjectError`, and `get(id, { verify: true })` re-hashes the content. A string that is not an id is simply absent for `has`, `get` and `getRaw`; `putRaw` and `remove` refuse it with `InvalidObjectIdError`.
 
@@ -355,7 +355,18 @@ const id = await objects.putUnsized("blob", download.body); // a stream of unkno
 
 Blob content is `AsyncIterable<Uint8Array>` on the way in and out, and trees load as async iterables of entries. A large file passes through with bounded memory when its size is known: `blobs.store(content, size)`, `vcs.writeBlob(bytes, { size })` and `serialization.importObject("blob", content, size)` hash and store in one pass. Without a size, the content is spooled (see above). That matters in browsers. `VcsCore` collects trees into arrays because trees are small and arrays are easier to use.
 
-Two `RawStorage` details serve the same goal. `move(from, to)` is optional and renames a value without copying it; `rawStorageStaging` uses it to stream. `CompressedRawStorage.size(key)` returns the uncompressed size: for a git loose object it inflates only the start of the stream and adds the length of the header to the size the header declares; other content is inflated and counted as it streams, never collected.
+Two `RawStorage` details serve the same goal. `move(from, to)` is optional and renames a value without copying it; `rawStorageStaging` uses it to stream. `CompressedRawStorage.size(key)` returns the uncompressed size, inflating and counting the content as it streams (never collected); a truncated or corrupt stream gives -1. Constructed with `{ gitObjects: true }`, for a store that holds only git loose objects, it inflates just the start of the stream and adds the length of the header to the size the header declares, without checking the rest.
+
+### Leftovers of interrupted writes are swept by gc
+
+A process that dies mid-write leaves temporaries behind: `tmp_obj_*` keys of `rawStorageStaging`, and storage only the raw store knows about (the KV store's chunks with no manifest, the SQL store's chunk rows with no row). `GcOrchestrator.run()` removes those older than `staleExpiryMs` (two weeks by default, as `git gc` prunes `tmp_obj_*`) and reports `removedTemporaries`:
+
+```typescript
+const result = await new GcOrchestrator(history, strategy).run({ staleExpiryMs: 24 * 3600_000 });
+result.removedTemporaries; // tmp_obj_* keys and orphaned chunks removed
+```
+
+It calls `history.objects.sweepStale({ olderThanMs })` (from `StagingBlobStore.sweepStale`, which calls the optional `RawStorage.sweepStale`) and the optional `GcStrategy.sweepStale(olderThanMs)`. Temporary keys and chunk tokens are `timestampedId`s (from `@statewalker/vcs-utils`), so a sweep judges their age from the name; one without a time, written by an older version, goes only with `staleExpiryMs: 0`. Writes running in this process are never swept. A write in another process that shares the store is protected only by its age, so keep the expiry longer than any write, and use 0 only when nothing else writes.
 
 ### Only SHA-1 is implemented
 

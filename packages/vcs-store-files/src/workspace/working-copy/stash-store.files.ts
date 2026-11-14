@@ -222,7 +222,7 @@ export class GitStashStore implements StashStore {
       // Check if file is tracked
       if (!trackedPaths.has(wtEntry.path)) {
         // Store blob content
-        const blobId = await storeWorktreeFile(
+        const { id: blobId } = await storeWorktreeFile(
           this.history.blobs,
           this.worktree,
           wtEntry.path,
@@ -275,7 +275,7 @@ export class GitStashStore implements StashStore {
         const wtHash = await this.worktree.computeHash(entry.name);
         if (wtHash !== entry.id) {
           // File is modified, store new content
-          const blobId = await storeWorktreeFile(
+          const { id: blobId } = await storeWorktreeFile(
             this.history.blobs,
             this.worktree,
             entry.name,

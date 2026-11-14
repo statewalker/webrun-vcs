@@ -97,3 +97,24 @@ describe("AddCommand when a file changes while it is hashed", () => {
     expect(await history.blobs.has("ce013625030ba8dba906f756967f9e9ca394464a")).toBe(true);
   });
 });
+
+describe("AddCommand index stat after a retry", () => {
+  it("records the fresh stat that matched the stored content", async () => {
+    const history = createMemoryHistory();
+    const base = worktreeOf({ "a.txt": { content: "hello\n" } });
+    let stats = 0;
+    const worktree = {
+      ...base,
+      async getEntry(path: string) {
+        const e = await base.getEntry(path);
+        return e && stats++ === 0 ? { ...e, size: 3, mtime: 1 } : { ...e, mtime: 2 };
+      },
+    } as unknown as Worktree;
+    const staging = new MemoryStagingStore();
+    await new AddCommand({ worktree, blobs: history.blobs, staging }).add(["a.txt"]);
+    const entry = await staging.getEntry("a.txt");
+    expect(entry?.objectId).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
+    expect(entry?.size).toBe(6);
+    expect(entry?.mtime).toBe(2);
+  });
+});

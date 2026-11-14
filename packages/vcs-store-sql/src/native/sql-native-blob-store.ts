@@ -11,7 +11,13 @@ import {
   type ObjectId,
   SizeMismatchError,
 } from "@statewalker/vcs-core";
-import { bytesToHex, compressBlock, createSha1, decompressBlock } from "@statewalker/vcs-utils";
+import {
+  bytesToHex,
+  compressBlock,
+  createSha1,
+  decompressBlock,
+  randomHexId,
+} from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 import type { SqlNativeBlobStore } from "./types.js";
 
@@ -39,6 +45,9 @@ const CHUNK_THRESHOLD = 262144;
 
 /** `blob_id` of a blob row being written, before its id is known. */
 const TMP_PREFIX = "tmp:";
+
+/** Placeholder rows of writes running in this process: `sweepStale` keeps them. */
+const inFlight = new Set<string>();
 
 function concatChunks(chunks: Uint8Array[]): Uint8Array {
   if (chunks.length === 1) return chunks[0] as Uint8Array;
@@ -153,12 +162,13 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
     content: AsyncIterable<Uint8Array>,
     onBytes?: (chunk: Uint8Array) => void,
   ): Promise<{ blobFk: number; tmpId: string; totalSize: number }> {
-    const tmpId = `${TMP_PREFIX}${crypto.randomUUID()}`;
+    const tmpId = `${TMP_PREFIX}${randomHexId()}`;
     const inserted = await this.db.execute(
       `INSERT INTO ${BLOB_TABLE} (blob_id, content, size, storage_type, created_at) VALUES (?, NULL, 0, 'chunked', ?)`,
       [tmpId, Date.now()],
     );
     const blobFk = inserted.lastInsertRowId;
+    inFlight.add(tmpId);
     let position = 0;
     let totalSize = 0;
     try {
@@ -173,6 +183,7 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
       }
     } catch (e) {
       await this.dropRow(blobFk);
+      inFlight.delete(tmpId);
       throw e;
     }
     return { blobFk, tmpId, totalSize };
@@ -250,41 +261,86 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
       return blobId;
     }
     const rest = (async function* () {
-      yield* head.splice(0);
-      for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+      let done = false;
+      try {
+        yield* head.splice(0);
+        for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+        done = true;
+      } finally {
+        // stopped early (too long for its size, a failing write): release the source
+        if (!done) await it.return?.();
+      }
     })();
 
     if (size !== undefined) {
       const sha1 = createSha1();
       sha1.update(encodeObjectHeader("blob", size));
       let seen = 0;
-      const { blobFk, totalSize } = await this.writePlaceholder(rest, (chunk) => {
+      const { blobFk, tmpId, totalSize } = await this.writePlaceholder(rest, (chunk) => {
         seen += chunk.length;
         if (seen > size) throw new SizeMismatchError(size, seen);
         sha1.update(chunk);
       });
-      if (totalSize !== size) {
-        await this.dropRow(blobFk);
-        throw new SizeMismatchError(size, totalSize);
+      try {
+        if (totalSize !== size) {
+          await this.dropRow(blobFk);
+          throw new SizeMismatchError(size, totalSize);
+        }
+        const blobId = bytesToHex(sha1.digest());
+        await this.publish(blobFk, blobId, totalSize);
+        return blobId;
+      } finally {
+        inFlight.delete(tmpId);
       }
-      const blobId = bytesToHex(sha1.digest());
-      await this.publish(blobFk, blobId, totalSize);
-      return blobId;
     }
 
-    const { blobFk, totalSize } = await this.writePlaceholder(rest);
-    let blobId: ObjectId;
+    const { blobFk, tmpId, totalSize } = await this.writePlaceholder(rest);
     try {
-      const sha1 = createSha1();
-      sha1.update(encodeObjectHeader("blob", totalSize));
-      for await (const chunk of this.chunksOf(blobFk)) sha1.update(chunk);
-      blobId = bytesToHex(sha1.digest());
-    } catch (e) {
-      await this.dropRow(blobFk);
-      throw e;
+      let blobId: ObjectId;
+      try {
+        const sha1 = createSha1();
+        sha1.update(encodeObjectHeader("blob", totalSize));
+        for await (const chunk of this.chunksOf(blobFk)) sha1.update(chunk);
+        blobId = bytesToHex(sha1.digest());
+      } catch (e) {
+        await this.dropRow(blobFk);
+        throw e;
+      }
+      await this.publish(blobFk, blobId, totalSize);
+      return blobId;
+    } finally {
+      inFlight.delete(tmpId);
     }
-    await this.publish(blobFk, blobId, totalSize);
-    return blobId;
+  }
+
+  /**
+   * Remove what interrupted writes left behind: placeholder rows (`tmp:*`)
+   * created more than `olderThanMs` ago (rows record `created_at`) with their
+   * chunk rows, and chunk rows whose blob row is gone (a write inserts its row
+   * before its chunks, so these belong to no write). Placeholders of writes
+   * running in this process are kept; one written by another process sharing
+   * the database is safe only through its age, so pick an expiry longer than
+   * any write. `SqlGcStrategy.sweepStale` calls it.
+   *
+   * @returns The number of placeholder rows and orphaned chunk rows removed
+   */
+  async sweepStale({ olderThanMs }: { olderThanMs: number }): Promise<number> {
+    await this.ensureTable();
+    const cutoff = Date.now() - olderThanMs;
+    const stale = await this.db.query<{ id: number; blob_id: string }>(
+      `SELECT id, blob_id FROM ${BLOB_TABLE} WHERE blob_id LIKE '${TMP_PREFIX}%' AND created_at ${olderThanMs <= 0 ? "<=" : "<"} ?`,
+      [cutoff],
+    );
+    let removed = 0;
+    for (const row of stale) {
+      if (inFlight.has(row.blob_id)) continue;
+      await this.dropRow(row.id);
+      removed++;
+    }
+    const orphans = await this.db.execute(
+      `DELETE FROM ${CHUNK_TABLE} WHERE blob_fk NOT IN (SELECT id FROM ${BLOB_TABLE})`,
+    );
+    return removed + orphans.changes;
   }
 
   /** The decompressed chunks of a chunked blob row, read one row at a time. */

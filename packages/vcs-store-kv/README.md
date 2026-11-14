@@ -213,7 +213,15 @@ for await (const chunk of raw.load(id, { start: 1_000_000 })) send(chunk); // on
 
 A value up to one chunk (256 KiB by default) is one entry, as before. A longer one is written
 chunk by chunk while it streams in, under a fresh token, and published by writing its manifest
-last; a stream that fails leaves nothing behind. `load()` reads only the chunks a range touches,
+last; a stream that fails removes the chunks it wrote. A process that dies mid-write, or two
+concurrent stores of the same key (the manifest written first is replaced and its chunks are never
+dropped), leaves chunks that no manifest references. `sweepStale({ olderThanMs })` removes those
+once older than `olderThanMs` (the token records when its write started), never the chunks of a
+write running in this process; `GcOrchestrator` calls it through `rawStorageStaging`.
+
+Overwrites are last writer wins, and a reader streaming a value while it is overwritten or removed
+may fail with `Missing chunk`. Git objects never meet this: `rawStorageStaging` keeps an id that is
+already stored instead of writing it again. `load()` reads only the chunks a range touches,
 one at a time, so neither a write nor a read holds a whole object. `move(from, to)` renames a
 value by moving its manifest (its chunks stay where they are), which is what lets
 `rawStorageStaging` stream a git object into a temporary key and rename it to its id. Values

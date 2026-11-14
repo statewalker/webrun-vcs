@@ -79,6 +79,14 @@ export interface GitObjects {
   list(): AsyncIterable<ObjectId>;
   /** Remove an object; true if one was removed. Throws `InvalidObjectIdError` for a non-id. */
   remove(id: ObjectId): Promise<boolean>;
+  /**
+   * Remove what interrupted writes left in the store (temporaries, orphaned
+   * chunks) once older than `olderThanMs`; present when the store can
+   * (`StagingBlobStore.sweepStale`). `GcOrchestrator` calls it.
+   *
+   * @returns The number of leftovers removed
+   */
+  sweepStale?(options: { olderThanMs: number }): Promise<number>;
 }
 
 /** Options of `createGitObjects`. */

@@ -5,7 +5,8 @@
  * fixed-size chunk rows so that neither a write nor a read holds a whole value.
  */
 
-import { fixedSizeChunks, type RawStorage } from "@statewalker/vcs-core";
+import { fixedSizeChunks, type RawStorage, type SweepStaleOptions } from "@statewalker/vcs-core";
+import { timestampedId, timestampOfId } from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 
 /** Default chunk size: 256 KiB. */
@@ -54,6 +55,13 @@ export async function upgradeRawStoreTable(db: DatabaseClient, tableName: string
   `);
 }
 
+/**
+ * Chunk tokens of writes running in this process (tokens are unique across
+ * stores), and how many run: `sweepStale` never removes their chunk rows.
+ */
+const inFlight = new Set<string>();
+let activeWrites = 0;
+
 interface Row {
   data: Uint8Array;
   size: number;
@@ -70,6 +78,16 @@ interface Row {
  * then holds the size, the chunk count and the token, and an empty `data`.
  * A fresh token per write makes `move` an update of one small row. Reads stream
  * one chunk row at a time.
+ *
+ * Chunk rows are inserted outside a transaction, so a process that dies
+ * mid-write leaves rows whose token no `<table>` row references. A token is a
+ * `timestampedId` (it records when its write started), and `sweepStale`
+ * removes such rows once old enough; gc calls it.
+ *
+ * Overwrites are last writer wins. A reader streaming a value while it is
+ * overwritten or removed may fail with `Missing chunk`. Git objects never hit
+ * this: `rawStorageStaging` keeps an id that is already stored instead of
+ * writing it again.
  *
  * @example
  * ```typescript
@@ -148,10 +166,12 @@ export class SqlRawStore implements RawStorage {
       return;
     }
 
-    const token = crypto.randomUUID();
+    const token = timestampedId();
     let count = 0;
     let size = 0;
     let published = false;
+    inFlight.add(token);
+    activeWrites++;
     try {
       const put = async (chunk: Uint8Array) => {
         await this.db.execute(
@@ -173,7 +193,12 @@ export class SqlRawStore implements RawStorage {
       });
       published = true;
     } finally {
-      if (!published) await this.dropChunks(this.db, token);
+      try {
+        if (!published) await this.dropChunks(this.db, token);
+      } finally {
+        inFlight.delete(token);
+        activeWrites--;
+      }
     }
   }
 
@@ -275,6 +300,38 @@ export class SqlRawStore implements RawStorage {
       [key],
     );
     return rows.length === 0 ? -1 : rows[0].size;
+  }
+
+  /**
+   * Remove chunk rows whose token no `<table>` row references and that are
+   * older than `olderThanMs` (a token records when its write started). A token
+   * without a time is removed only when `olderThanMs <= 0`. Rows of writes
+   * running in this process are kept, and with `olderThanMs <= 0` nothing is
+   * removed while one runs. A write in another process sharing the database is
+   * safe only through its age: pick an expiry longer than any write.
+   *
+   * @returns The number of orphaned tokens removed
+   */
+  async sweepStale({ olderThanMs }: SweepStaleOptions): Promise<number> {
+    await this.ensureInitialized();
+    if (olderThanMs <= 0 && activeWrites > 0) return 0;
+    const cutoff = Date.now() - olderThanMs;
+    const orphans = await this.db.query<{ token: string }>(
+      `SELECT DISTINCT token FROM ${this.chunkTable} WHERE token NOT IN (SELECT chunk_token FROM ${this.tableName} WHERE chunk_token IS NOT NULL)`,
+    );
+    let removed = 0;
+    for (const { token } of orphans) {
+      if (inFlight.has(token)) continue;
+      const made = timestampOfId(token);
+      if (!(olderThanMs <= 0 || (made !== undefined && made < cutoff))) continue;
+      // still unreferenced at delete time (a move or publish in between keeps it)
+      const result = await this.db.execute(
+        `DELETE FROM ${this.chunkTable} WHERE token = ? AND NOT EXISTS (SELECT 1 FROM ${this.tableName} WHERE chunk_token = ?)`,
+        [token, token],
+      );
+      if (result.changes > 0) removed++;
+    }
+    return removed;
   }
 }
 

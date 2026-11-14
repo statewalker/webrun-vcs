@@ -3,7 +3,9 @@
  * chunks, written as they arrive, renamed with `move`, and values written in
  * the old single-value format still read.
  */
+import { rawStorageStaging } from "@statewalker/vcs-core";
 import { createRawStorageTests } from "@statewalker/vcs-testing";
+import { timestampedId } from "@statewalker/vcs-utils";
 import { describe, expect, it } from "vitest";
 import { MemoryKVAdapter } from "../src/adapters/memory-adapter.js";
 import { KvRawStore } from "../src/binary-storage/kv-raw-store.js";
@@ -64,5 +66,136 @@ describe("KvRawStore old single-value format", () => {
     for await (const k of kv.list("test:chunk:")) chunkKeys.push(k);
     expect(chunkKeys.length).toBe(4);
     expect(await store.size("big")).toBe(4000);
+  });
+});
+
+describe("KvRawStore.sweepStale", () => {
+  const bytes = (n: number, fill = 1) =>
+    (async function* () {
+      yield new Uint8Array(n).fill(fill);
+    })();
+
+  async function chunkKeys(kv: MemoryKVAdapter): Promise<string[]> {
+    const out: string[] = [];
+    for await (const k of kv.list("test:chunk:")) out.push(k);
+    return out.sort();
+  }
+
+  it("removes chunks no manifest references once older than the expiry", async () => {
+    const kv = new MemoryKVAdapter();
+    const store = new KvRawStore(kv, "test", { chunkSize: 1024 });
+    await store.store("kept", bytes(3000));
+    const kept = await chunkKeys(kv);
+    // a write that crashed before its manifest, two days ago, and one that crashed just now
+    const old = timestampedId(Date.now() - 2 * 24 * 3600_000);
+    const fresh = timestampedId();
+    for (const t of [old, fresh]) {
+      await kv.set(`test:chunk:${t}:0`, new Uint8Array(1024));
+      await kv.set(`test:chunk:${t}:1`, new Uint8Array(1024));
+    }
+    expect(await store.sweepStale({ olderThanMs: 24 * 3600_000 })).toBe(1); // one leftover write
+    expect(await chunkKeys(kv)).toEqual(
+      [...kept, `test:chunk:${fresh}:0`, `test:chunk:${fresh}:1`].sort(),
+    );
+    expect(await store.size("kept")).toBe(3000);
+  });
+
+  it("removes orphans of unknown age only with olderThanMs 0", async () => {
+    const kv = new MemoryKVAdapter();
+    const store = new KvRawStore(kv, "test", { chunkSize: 1024 });
+    await kv.set("test:chunk:3f2b8c1e-0d4a-4e8b-9c6f-2a1b3c4d5e6f:0", new Uint8Array(4));
+    expect(await store.sweepStale({ olderThanMs: 3600_000 })).toBe(0);
+    expect(await store.sweepStale({ olderThanMs: 0 })).toBe(1);
+    expect(await chunkKeys(kv)).toEqual([]);
+  });
+
+  it("never removes the chunks of a write in progress", async () => {
+    const kv = new MemoryKVAdapter();
+    const store = new KvRawStore(kv, "test", { chunkSize: 1024 });
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const writing = store.store(
+      "big",
+      (async function* () {
+        yield new Uint8Array(3000).fill(7);
+        await gate;
+        yield new Uint8Array(3000).fill(8);
+      })(),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect((await chunkKeys(kv)).length).toBeGreaterThan(0);
+    expect(await store.sweepStale({ olderThanMs: 0 })).toBe(0);
+    release();
+    await writing;
+    expect(await store.size("big")).toBe(6000);
+    let n = 0;
+    for await (const c of store.load("big")) n += c.length;
+    expect(n).toBe(6000);
+  });
+
+  it("makes the chunks leaked by two concurrent stores of one key sweepable", async () => {
+    const kv = new MemoryKVAdapter();
+    const store = new KvRawStore(kv, "test", { chunkSize: 1024 });
+    await Promise.all([store.store("k", bytes(3000, 1)), store.store("k", bytes(3000, 2))]);
+    await store.sweepStale({ olderThanMs: 0 });
+    // only the chunks of the manifest that won remain
+    expect((await chunkKeys(kv)).length).toBe(3);
+    let n = 0;
+    for await (const c of store.load("k")) n += c.length;
+    expect(n).toBe(3000);
+  });
+});
+
+describe("KvRawStore holding git objects (same id twice)", () => {
+  const big = (fill: number) =>
+    (async function* () {
+      for (let i = 0; i < 4; i++) yield new Uint8Array(100 * 1024).fill(fill);
+    })();
+
+  it("keeps the stored value: a reader of it never loses its chunks", async () => {
+    const kv = new MemoryKVAdapter();
+    const raw = new KvRawStore(kv, "test", { chunkSize: 64 * 1024 });
+    const staging = rawStorageStaging(raw);
+    expect(await staging.putStaged(big(1), () => "id")).toEqual({ id: "id", stored: true });
+    const chunksBefore: string[] = [];
+    for await (const k of kv.list("test:chunk:")) chunksBefore.push(k);
+
+    const reader = raw.load("id")[Symbol.asyncIterator]();
+    await reader.next(); // the reader holds the manifest
+    expect(await staging.putStaged(big(1), () => "id")).toEqual({ id: "id", stored: false });
+    let rest = 64 * 1024;
+    for (let r = await reader.next(); !r.done; r = await reader.next()) rest += r.value.length;
+    expect(rest).toBe(400 * 1024);
+
+    const chunksAfter: string[] = [];
+    for await (const k of kv.list("test:chunk:")) chunksAfter.push(k);
+    expect(chunksAfter.sort()).toEqual(chunksBefore.sort());
+  });
+
+  it("writes nothing for a duplicate small object", async () => {
+    const kv = new MemoryKVAdapter();
+    const raw = new KvRawStore(kv, "test");
+    const staging = rawStorageStaging(raw);
+    await staging.putStaged(big(1), () => "x"); // warm up
+    const small = () =>
+      (async function* () {
+        yield new Uint8Array(200);
+      })();
+    await staging.putStaged(small(), () => "s");
+    let writes = 0;
+    const set = kv.set.bind(kv);
+    const setMany = kv.setMany.bind(kv);
+    kv.set = (k, v) => {
+      writes++;
+      return set(k, v);
+    };
+    kv.setMany = (e) => {
+      writes++;
+      return setMany(e);
+    };
+    expect(await staging.putStaged(small(), () => "s")).toEqual({ id: "s", stored: false });
+    expect(writes).toBe(0);
   });
 });

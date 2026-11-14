@@ -5,10 +5,11 @@
  * while small blobs remain inline.
  */
 
-import { encodeObjectHeader } from "@statewalker/vcs-core";
+import { encodeObjectHeader, type History } from "@statewalker/vcs-core";
 import { bytesToHex, collect, createSha1 } from "@statewalker/vcs-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SqlJsAdapter } from "../src/adapters/sql-js-adapter.js";
+import { SqlGcStrategy } from "../src/gc-strategy.js";
 import { SqlNativeBlobStoreImpl } from "../src/native/sql-native-blob-store.js";
 
 /** Chunk size used by the blob store (256KB) */
@@ -580,5 +581,77 @@ describe("SqlNativeBlobStore streaming writes", () => {
     expect(await store.count()).toBe(1);
     const chunks = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM vcs_blob_chunk");
     expect(chunks[0]?.n).toBe(3);
+  });
+});
+
+describe("SqlNativeBlobStore early stops and leftovers", () => {
+  let db: SqlJsAdapter;
+  beforeEach(async () => {
+    db = await SqlJsAdapter.create();
+  });
+  afterEach(async () => {
+    await db.close();
+  });
+
+  it("releases the source when a large blob is longer than its size", async () => {
+    const store = new SqlNativeBlobStoreImpl(db);
+    let released = false;
+    let pulled = 0;
+    const source = (async function* () {
+      try {
+        for (let i = 0; i < 64; i++) {
+          pulled++;
+          yield new Uint8Array(64 * 1024).fill(i);
+        }
+      } finally {
+        released = true;
+      }
+    })();
+    await expect(store.store(source, 600 * 1024)).rejects.toMatchObject({
+      name: "SizeMismatchError",
+    });
+    expect(pulled).toBeLessThan(64);
+    expect(released).toBe(true);
+    expect(await store.count()).toBe(0);
+  });
+
+  it("sweeps tmp rows of a crashed write once older than the expiry", async () => {
+    const store = new SqlNativeBlobStoreImpl(db);
+    await store.store([new Uint8Array(10)]); // create the tables, one real blob
+    const insertTmp = async (name: string, createdAt: number) => {
+      const r = await db.execute(
+        "INSERT INTO vcs_blob (blob_id, content, size, storage_type, created_at) VALUES (?, NULL, 0, 'chunked', ?)",
+        [name, createdAt],
+      );
+      await db.execute(
+        "INSERT INTO vcs_blob_chunk (blob_fk, position, chunk_offset, chunk_length, compressed_length, content) VALUES (?, 0, 0, 1, 1, ?)",
+        [r.lastInsertRowId, new Uint8Array(1)],
+      );
+    };
+    await insertTmp("tmp:old", Date.now() - 2 * 24 * 3600_000);
+    await insertTmp("tmp:fresh", Date.now());
+    // a chunk row whose blob row is gone
+    await db.execute(
+      "INSERT INTO vcs_blob_chunk (blob_fk, position, chunk_offset, chunk_length, compressed_length, content) VALUES (999, 0, 0, 1, 1, ?)",
+      [new Uint8Array(1)],
+    );
+    expect(await store.sweepStale({ olderThanMs: 24 * 3600_000 })).toBe(2);
+    const rows = await db.query<{ blob_id: string }>(
+      "SELECT blob_id FROM vcs_blob ORDER BY blob_id",
+    );
+    expect(rows.map((r) => r.blob_id).filter((b) => b.startsWith("tmp:"))).toEqual(["tmp:fresh"]);
+    const chunks = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM vcs_blob_chunk");
+    expect(chunks[0]?.n).toBe(1);
+    expect(await store.count()).toBe(1);
+  });
+
+  it("is what SqlGcStrategy sweeps for SQL native blobs", async () => {
+    const store = new SqlNativeBlobStoreImpl(db);
+    await store.store([new Uint8Array(10)]);
+    await db.execute(
+      "INSERT INTO vcs_blob (blob_id, content, size, storage_type, created_at) VALUES ('tmp:x', NULL, 0, 'chunked', 0)",
+    );
+    const strategy = new SqlGcStrategy({ blobs: store } as unknown as History);
+    expect(await strategy.sweepStale(1000)).toBe(1);
   });
 });

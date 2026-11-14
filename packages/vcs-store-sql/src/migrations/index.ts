@@ -25,6 +25,11 @@ export interface Migration {
    * missing), run after `up` in the same transaction, on its client.
    */
   upgrade?: (db: DatabaseClient) => Promise<void>;
+  /**
+   * Steps plain SQL cannot express on the way back (such as touching a table
+   * only where it exists), run before `down` in the same transaction.
+   */
+  downgrade?: (db: DatabaseClient) => Promise<void>;
 }
 
 /** The table names `SqlRawStore` users get by default (`createSqlObjectStores`, `SqlBinStore`). */
@@ -274,7 +279,18 @@ export const migrations: Migration[] = [
         if (found.length > 0) await upgradeRawStoreTable(db, table);
       }
     },
-    // The added columns stay (harmless to the old layout); values stored in chunks are lost.
+    // Data loss: values stored in chunks cannot be expressed in the old layout.
+    // Their rows (`chunk_token` set, empty `data`) would read as empty values
+    // there, so they are deleted before the chunk tables are dropped. The added
+    // columns stay (harmless to the old layout); single-row values are kept.
+    downgrade: async (db) => {
+      for (const table of DEFAULT_RAW_TABLES) {
+        const columns = await db.query<{ name: string }>(`PRAGMA table_info(${table})`);
+        if (columns.some((c) => c.name === "chunk_token")) {
+          await db.execute(`DELETE FROM ${table} WHERE chunk_token IS NOT NULL`);
+        }
+      }
+    },
     down: `
       DROP TABLE IF EXISTS raw_objects_chunk;
       DROP TABLE IF EXISTS raw_store_chunk;
@@ -345,6 +361,7 @@ export async function rollbackMigration(db: DatabaseClient, targetVersion: numbe
 
   for (const migration of toRollback) {
     await db.transaction(async (tx) => {
+      await migration.downgrade?.(tx);
       // Split and run rollback statements
       const statements = splitStatements(migration.down);
       for (const stmt of statements) {

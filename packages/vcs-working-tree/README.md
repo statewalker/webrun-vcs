@@ -124,7 +124,8 @@ import { storeWorktreeFile } from "@statewalker/vcs-working-tree";
 
 const entry = await worktree.getEntry("video.mp4");
 if (entry) {
-  const id = await storeWorktreeFile(history.blobs, worktree, "video.mp4", entry);
+  const { id, entry: stat } = await storeWorktreeFile(history.blobs, worktree, "video.mp4", entry);
+  // record stat.size and stat.mtime in the index
 }
 ```
 
@@ -132,7 +133,9 @@ A regular file is stored with the size the worktree reported, in one pass and wi
 in memory. If the file changes while it is read, the store rejects with `SizeMismatchError`;
 `storeWorktreeFile` then stats the file again and retries once with the new size, as git retries
 a file that changed during `git add`. If that read disagrees too, and for symlinks, the content is
-stored without a size, which spools it when it is large. The add commands and the stash use it.
+stored without a size, which spools it when it is large. The result carries the stat that matched
+the stored content (the fresh one after a retry; after the unsized fallback, the latest stat with
+the blob's size), which is what the index must record. The add commands and the stash use it.
 
 ### Match `.gitignore` rules
 

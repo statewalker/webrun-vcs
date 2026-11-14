@@ -5,7 +5,8 @@
  * fixed-size chunks so that neither a write nor a read holds a whole value.
  */
 
-import { fixedSizeChunks, type RawStorage } from "@statewalker/vcs-core";
+import { fixedSizeChunks, type RawStorage, type SweepStaleOptions } from "@statewalker/vcs-core";
+import { timestampedId, timestampOfId } from "@statewalker/vcs-utils";
 import type { KVStore } from "../kv-store.js";
 
 /** Default chunk size: 256 KiB. */
@@ -24,6 +25,14 @@ interface Manifest {
   /** Chunks are `chunk:{token}:{seq}`; a fresh token per write makes `move` a rename of the manifest. */
   token: string;
 }
+
+/**
+ * Chunk tokens of writes and moves running in this process (tokens are unique
+ * across stores), and how many such operations run: `sweepStale` never removes
+ * their chunks.
+ */
+const inFlight = new Set<string>();
+let activeWrites = 0;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -52,6 +61,17 @@ function decodeSize(data: Uint8Array): number {
  *
  * Reads stream one chunk at a time. Values written by older versions (always
  * one entry) read unchanged.
+ *
+ * A token is a `timestampedId`, so it records when its write started. A write
+ * that fails cleans up its chunks, but a process that dies mid-write, or two
+ * concurrent stores of the same key (both publish; the first manifest is
+ * overwritten and its chunks are never dropped), leave chunks that no manifest
+ * references. `sweepStale` removes those; gc calls it.
+ *
+ * Overwrites are last writer wins. A reader that loaded the old manifest of a
+ * key being overwritten or removed may fail with `Missing chunk`. Git objects
+ * never hit this: `rawStorageStaging` keeps an id that is already stored
+ * instead of writing it again.
  *
  * @example
  * ```typescript
@@ -130,10 +150,12 @@ export class KvRawStore implements RawStorage {
       return;
     }
 
-    const token = crypto.randomUUID();
+    const token = timestampedId();
     let count = 0;
     let size = 0;
     let published = false;
+    inFlight.add(token);
+    activeWrites++;
     try {
       const put = async (chunk: Uint8Array) => {
         await this.kv.set(this.chunkKey(token, count++), chunk);
@@ -151,7 +173,12 @@ export class KvRawStore implements RawStorage {
       await this.kv.delete(this.sizeKey(key));
       await this.dropManifest(previous);
     } finally {
-      if (!published) await this.removeChunks(token, count);
+      try {
+        if (!published) await this.removeChunks(token, count);
+      } finally {
+        inFlight.delete(token);
+        activeWrites--;
+      }
     }
   }
 
@@ -205,7 +232,20 @@ export class KvRawStore implements RawStorage {
    */
   async move(from: string, to: string): Promise<boolean> {
     if (from === to) return this.has(from);
-    const m = await this.manifest(from);
+    activeWrites++;
+    let token: string | undefined;
+    try {
+      const m = await this.manifest(from);
+      token = m?.token;
+      if (token) inFlight.add(token);
+      return await this.moveValue(from, to, m);
+    } finally {
+      if (token) inFlight.delete(token);
+      activeWrites--;
+    }
+  }
+
+  private async moveValue(from: string, to: string, m: Manifest | undefined): Promise<boolean> {
     const inline = m ? undefined : await this.kv.get(this.dataKey(from));
     if (!m && !inline) return false;
     const replaced = await this.manifest(to);
@@ -245,6 +285,56 @@ export class KvRawStore implements RawStorage {
     if (m) return m.size;
     const sizeData = await this.kv.get(this.sizeKey(key));
     return sizeData ? decodeSize(sizeData) : -1;
+  }
+
+  /**
+   * Remove chunks that no manifest references and whose token is older than
+   * `olderThanMs` (a token records when its write started). A token without a
+   * time (written before tokens carried one) is removed only when
+   * `olderThanMs <= 0`. Chunks of writes and moves running in this process are
+   * kept, and with `olderThanMs <= 0` nothing is removed while one runs. A
+   * write in another process sharing the KV store is safe only through its
+   * age: pick an expiry longer than any write.
+   *
+   * @returns The number of orphaned tokens removed
+   */
+  async sweepStale({ olderThanMs }: SweepStaleOptions): Promise<number> {
+    if (olderThanMs <= 0 && activeWrites > 0) return 0;
+    const cutoff = Date.now() - olderThanMs;
+    // Chunks first, manifests second: a write published in between is then seen.
+    const chunkPrefix = `${this.prefix}:chunk:`;
+    const candidates = new Map<string, string[]>();
+    for await (const fullKey of this.kv.list(chunkPrefix)) {
+      const rest = fullKey.substring(chunkPrefix.length);
+      const colon = rest.lastIndexOf(":");
+      if (colon <= 0) continue;
+      const token = rest.slice(0, colon);
+      if (inFlight.has(token)) continue;
+      const made = timestampOfId(token);
+      if (!(olderThanMs <= 0 || (made !== undefined && made < cutoff))) continue;
+      const keys = candidates.get(token) ?? [];
+      keys.push(fullKey);
+      candidates.set(token, keys);
+    }
+    if (candidates.size === 0) return 0;
+    const manifestPrefix = this.manifestKey("");
+    for await (const fullKey of this.kv.list(manifestPrefix)) {
+      const bytes = await this.kv.get(fullKey);
+      if (!bytes) continue;
+      try {
+        candidates.delete((JSON.parse(dec.decode(bytes)) as Manifest).token);
+      } catch {
+        // not a manifest we can read: leave chunks alone rather than guess
+        return 0;
+      }
+    }
+    let removed = 0;
+    for (const [token, keys] of candidates) {
+      if (inFlight.has(token)) continue;
+      for (const key of keys) await this.kv.delete(key);
+      removed++;
+    }
+    return removed;
   }
 }
 

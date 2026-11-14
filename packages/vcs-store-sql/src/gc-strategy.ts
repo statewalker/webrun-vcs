@@ -6,6 +6,7 @@
  * - compact: no-op (SQL storage doesn't need pack files)
  * - deltify: no-op (placeholder for Phase 5)
  * - getStats: count objects across stores
+ * - sweepStale: placeholder rows of interrupted SQL native blob writes
  */
 
 import type {
@@ -58,6 +59,18 @@ export class SqlGcStrategy implements GcStrategy {
   async deltify(_candidates: DeltaCandidatePair[]): Promise<number> {
     // Placeholder for Phase 5 delta candidate selection
     return 0;
+  }
+
+  /**
+   * Leftovers of interrupted writes in the blob store, when it can sweep them
+   * (`SqlNativeBlobStore.sweepStale`). Raw-store leftovers (`createSqlObjectStores`)
+   * are swept by `GcOrchestrator` through `history.objects.sweepStale`.
+   */
+  async sweepStale(olderThanMs: number): Promise<number> {
+    const blobs = this.history.blobs as {
+      sweepStale?(o: { olderThanMs: number }): Promise<number>;
+    };
+    return (await blobs.sweepStale?.({ olderThanMs })) ?? 0;
   }
 
   async getStats(): Promise<StorageStats> {

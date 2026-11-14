@@ -451,13 +451,14 @@ export class AddCommand extends GitCommand<AddResult> {
       }
 
       // Hash and store content
-      const objectId = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry);
+      // the stat that matched the stored content (a fresh one after a retry)
+      const stored = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry);
 
       // Add to staging
       editor.add(
-        new UpdateStagingEntry(file.path, objectId, worktreeEntry.mode, {
-          size: worktreeEntry.size,
-          mtime: worktreeEntry.mtime,
+        new UpdateStagingEntry(file.path, stored.id, stored.entry.mode, {
+          size: stored.entry.size,
+          mtime: stored.entry.mtime,
         }),
       );
       added.push(file.path);

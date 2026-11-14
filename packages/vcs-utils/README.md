@@ -202,6 +202,18 @@ for await (const line of toLines(source)) { // decoded strings, LF or CRLF
 const doubled = mapStream([1, 2, 3], (n) => n * 2);
 ```
 
+### Random ids on every origin
+
+```typescript
+import { randomHexId, timestampedId, timestampOfId } from "@statewalker/vcs-utils";
+
+randomHexId();            // 16 random bytes as hex
+const token = timestampedId(); // "<ms, base 36>-<randomHexId()>"
+timestampOfId(token);     // when it was made; undefined for other strings
+```
+
+Both use `crypto.getRandomValues`, because `crypto.randomUUID` is missing on non-secure browser origins. Stores name temporaries with `timestampedId` so that a sweep after a crash can tell an old leftover from a write in progress.
+
 ### In-memory files
 
 ```typescript

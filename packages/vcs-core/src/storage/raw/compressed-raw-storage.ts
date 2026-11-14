@@ -20,6 +20,14 @@ export interface CompressedRawStorageOptions {
    * Git uses ZLIB format (raw: false), which is the default.
    */
   raw?: boolean;
+  /**
+   * The store holds git loose objects (`"<type> <size>\0" + content`), so
+   * `size` may read the size from the object header instead of inflating the
+   * whole stream. Off by default: other content could start with bytes that
+   * look like a header, and a truncated object would report the size its
+   * header declares instead of -1.
+   */
+  gitObjects?: boolean;
 }
 
 /**
@@ -37,6 +45,7 @@ export interface CompressedRawStorageOptions {
  */
 export class CompressedRawStorage implements RawStorage {
   private readonly rawDeflate: boolean;
+  private readonly gitObjects: boolean;
 
   /**
    * Create a compressed raw storage wrapper
@@ -49,6 +58,7 @@ export class CompressedRawStorage implements RawStorage {
     options?: CompressedRawStorageOptions,
   ) {
     this.rawDeflate = options?.raw ?? false;
+    this.gitObjects = options?.gitObjects ?? false;
   }
 
   /**
@@ -114,11 +124,12 @@ export class CompressedRawStorage implements RawStorage {
   /**
    * Get uncompressed content size for a key
    *
-   * The stored zlib stream does not record its length. For a git loose object
-   * (`"<type> <size>\0" + content`, what this wrapper holds in a git object
-   * directory) the size is the header's length plus the size it declares, so
-   * only the start of the stream is inflated. Other content is inflated and
-   * counted as it streams (never collected).
+   * The stored zlib stream does not record its length, so the content is
+   * inflated and counted as it streams (never collected); a stream that does
+   * not inflate (truncated, corrupt) gives -1. With `gitObjects: true` the
+   * content is a git loose object (`"<type> <size>\0" + content`) and the size
+   * is the header's length plus the size it declares, so only the start of
+   * the stream is inflated; the rest is not checked.
    *
    * @param key Storage key
    * @returns Uncompressed content size, or -1 if key not found or unreadable
@@ -128,7 +139,7 @@ export class CompressedRawStorage implements RawStorage {
       return -1;
     }
     const it = inflate(this.inner.load(key), { raw: this.rawDeflate })[Symbol.asyncIterator]();
-    let head: number[] | undefined = [];
+    let head: number[] | undefined = this.gitObjects ? [] : undefined;
     let total = 0;
     try {
       for (let r = await it.next(); !r.done; r = await it.next()) {

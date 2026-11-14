@@ -230,7 +230,7 @@ await blobs.store(response.body); // unknown size: chunks first, then read back 
 ```
 
 With the size, the SHA-1 is computed while the chunks are written under a temporary
-`tmp:<uuid>` row, which is renamed to the blob id at the end (or dropped when that blob already
+`tmp:<random hex>` row, which is renamed to the blob id at the end (or dropped when that blob already
 exists). Without it, the database itself is the spool: the chunks are written first, then read
 back to compute the id, because a git id hashes the size before the content.
 
@@ -243,7 +243,23 @@ token. `load()` reads only the chunk rows a range touches. `move(from, to)` upda
 row, so `rawStorageStaging` streams a git object into a temporary key and renames it.
 `SqlRawStore` upgrades a table of the old layout on first use (adding the two columns and the
 chunk table), and migration 6 does the same for `raw_objects` and `raw_store`; old rows keep
-reading as they are.
+reading as they are. Rolling migration 6 back loses data: the rows of values kept in chunks
+(`chunk_token` set) are deleted, since the old layout cannot express them, and the chunk tables
+are dropped; single-row values stay.
+
+### Leftovers of interrupted writes
+
+Chunk rows are inserted before their value's row is published, outside a transaction, so a process
+that dies mid-write leaves chunk rows no row references; `SqlRawStore.sweepStale({ olderThanMs })`
+removes them once their token (a `timestampedId`) is older than `olderThanMs`. The native blob
+store's `sweepStale` removes `tmp:*` placeholder rows older than that (by `created_at`) with their
+chunks, and chunk rows of no blob. Neither touches a write running in this process.
+`GcOrchestrator` reaches the raw store through `history.objects.sweepStale` and the native blobs
+through `SqlGcStrategy.sweepStale`.
+
+Overwrites of a raw key are last writer wins, and a reader streaming a value while it is
+overwritten or removed may fail with `Missing chunk`. Git objects never meet this:
+`rawStorageStaging` keeps an id that is already stored instead of writing it again.
 
 ### What will surprise you
 
