@@ -106,3 +106,44 @@ describe("probeBlob with loadText: one read for text", () => {
     expect(probe.content?.length).toBe(0);
   });
 });
+
+describe("probeBlob with loadText: a binary blob is never allocated whole", () => {
+  it("allocates and reads only about 8 KB of a large binary blob", async () => {
+    const history = createMemoryHistory();
+    const size = 20 * 2 ** 20;
+    const data = new Uint8Array(size).fill(0x61);
+    data[10] = 0;
+    const id = await history.blobs.store([data], data.length);
+    const { blobs, state } = counting(history.blobs);
+
+    // record the largest Uint8Array allocated by length while the probe runs
+    const Original = globalThis.Uint8Array;
+    let largest = 0;
+    let largestByProbe = 0;
+    class Tracking extends Original {
+      // biome-ignore lint/suspicious/noExplicitAny: forwards every constructor form
+      constructor(...args: any[]) {
+        // biome-ignore lint/suspicious/noExplicitAny: forwards every constructor form
+        super(...(args as [any]));
+        if (typeof args[0] !== "number") return;
+        largest = Math.max(largest, args[0]);
+        if (new Error().stack?.includes("src/history/blobs/probe-blob.ts")) {
+          largestByProbe = Math.max(largestByProbe, args[0]);
+        }
+      }
+    }
+    globalThis.Uint8Array = Tracking as Uint8ArrayConstructor;
+    let probe: Awaited<ReturnType<typeof probeBlob>>;
+    try {
+      probe = await probeBlob(blobs, id, { loadText: true });
+    } finally {
+      globalThis.Uint8Array = Original;
+    }
+    expect(probe).toEqual({ size, binary: true, big: false });
+    expect(state.pulled).toBeLessThanOrEqual(8192);
+    // the probe's own buffer is the 8000-byte window; inflating the stored
+    // object adds zlib's 32 KiB window, nothing near the blob's 20 MiB
+    expect(largestByProbe).toBe(8000);
+    expect(largest).toBeLessThanOrEqual(64 * 1024);
+  });
+});

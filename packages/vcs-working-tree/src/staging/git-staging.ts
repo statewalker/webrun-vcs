@@ -245,6 +245,8 @@ export class GitStaging implements Staging {
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
     if (!options?.keepExisting) {
       this._entries = [];
+      // a whole tree replaces the index: git's read-tree and reset clear resolve-undo too
+      this.indexFile.clearResolveUndo();
     }
 
     const prefix = options?.prefix ?? "";

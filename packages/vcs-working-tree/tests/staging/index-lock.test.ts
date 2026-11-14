@@ -4,7 +4,13 @@
  */
 import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
-import { createGitStaging, GitStaging } from "../../src/staging/index.js";
+import {
+  breakIndexLock,
+  createGitStaging,
+  GitStaging,
+  IndexChangedError,
+  IndexLockedError,
+} from "../../src/staging/index.js";
 
 const ID_A = "a".repeat(40);
 const ID_B = "b".repeat(40);
@@ -116,6 +122,165 @@ describe("index.lock", () => {
     await staging.setEntry({ path: "b.txt", mode: 0o100644, objectId: "b".repeat(39) });
     await expect(staging.write()).rejects.toThrow("not an object id");
     expect(sameBytes(await bytes(files, ".git/index"), before)).toBe(true);
+    expect(await files.exists(".git/index.lock")).toBe(false);
+  });
+});
+
+describe("index changed on disk since it was read", () => {
+  it("refuses a write after an external change, removes its lock and leaves the index", async () => {
+    const files = createInMemoryFilesApi();
+    await stagedIndex(files);
+    const staging = createGitStaging(files, ".git/index");
+    await staging.read();
+
+    // another writer (native git, say) replaces the index in between
+    const other = createGitStaging(files, ".git/index");
+    await other.read();
+    await other.setEntry({ path: "other.txt", mode: 0o100644, objectId: ID_B });
+    await other.write();
+    const changed = await bytes(files, ".git/index");
+
+    await staging.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+    const error = await staging.write().then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(error).toBeInstanceOf(IndexChangedError);
+    expect(error?.message).toContain("index changed on disk since it was read");
+    expect(sameBytes(await bytes(files, ".git/index"), changed)).toBe(true);
+    expect(await files.exists(".git/index.lock")).toBe(false);
+
+    // re-reading picks up the other change and the write goes through
+    await staging.read();
+    await staging.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+    await staging.write();
+    const check = createGitStaging(files, ".git/index");
+    await check.read();
+    expect(await check.getEntryCount()).toBe(3);
+  });
+
+  it("refuses a write when an index appeared after a read found none", async () => {
+    const files = createInMemoryFilesApi();
+    const staging = createGitStaging(files, ".git/index");
+    await staging.read();
+    const before = await stagedIndex(files);
+    await staging.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+    await expect(staging.write()).rejects.toBeInstanceOf(IndexChangedError);
+    expect(sameBytes(await bytes(files, ".git/index"), before)).toBe(true);
+  });
+
+  it("read, edit, write, edit, write in one instance passes", async () => {
+    const files = createInMemoryFilesApi();
+    await stagedIndex(files);
+    const staging = createGitStaging(files, ".git/index");
+    await staging.read();
+    await staging.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+    await staging.write();
+    await staging.setEntry({ path: "c.txt", mode: 0o100644, objectId: ID_B });
+    await staging.write();
+    const check = createGitStaging(files, ".git/index");
+    await check.read();
+    expect(await check.getEntryCount()).toBe(3);
+  });
+
+  it("the first write when no index exists passes", async () => {
+    const files = createInMemoryFilesApi();
+    const staging = createGitStaging(files, ".git/index");
+    await staging.read();
+    await staging.setEntry({ path: "a.txt", mode: 0o100644, objectId: ID_A });
+    await staging.write();
+    expect(await files.exists(".git/index")).toBe(true);
+  });
+});
+
+describe("index write failures and concurrent writers", () => {
+  for (const [label, move] of [
+    ["returns false", async () => false],
+    [
+      "throws",
+      async () => {
+        throw new Error("rename failed");
+      },
+    ],
+  ] as const) {
+    it(`a rename that ${label} removes the lock and leaves the index`, async () => {
+      const files = createInMemoryFilesApi();
+      const before = await stagedIndex(files);
+      const failing = Object.create(files) as FilesApi;
+      failing.move = move;
+      const staging = createGitStaging(failing, ".git/index");
+      await staging.read();
+      await staging.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+      await expect(staging.write()).rejects.toThrow();
+      expect(sameBytes(await bytes(files, ".git/index"), before)).toBe(true);
+      expect(await files.exists(".git/index.lock")).toBe(false);
+    });
+  }
+
+  it("of two writers on one FilesApi, the second fails with IndexLockedError", async () => {
+    const files = createInMemoryFilesApi();
+    // hold the first writer inside its lock until the second has tried
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = Object.create(files) as FilesApi;
+    slow.move = async (source, target) => {
+      await gate;
+      return files.move(source, target);
+    };
+    const first = createGitStaging(slow, ".git/index");
+    await first.setEntry({ path: "a.txt", mode: 0o100644, objectId: ID_A });
+    const second = createGitStaging(files, ".git/index");
+    await second.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+
+    const firstWrite = first.write();
+    while (!(await files.exists(".git/index.lock"))) await new Promise((r) => setTimeout(r, 1));
+    await expect(second.write()).rejects.toBeInstanceOf(IndexLockedError);
+    release();
+    await firstWrite;
+    expect(await files.exists(".git/index.lock")).toBe(false);
+  });
+
+  it("of two writers on one FilesApi, the second waits with lockTimeoutMs", async () => {
+    const files = createInMemoryFilesApi();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = Object.create(files) as FilesApi;
+    slow.move = async (source, target) => {
+      await gate;
+      return files.move(source, target);
+    };
+    const first = createGitStaging(slow, ".git/index");
+    await first.setEntry({ path: "a.txt", mode: 0o100644, objectId: ID_A });
+    const second = new GitStaging(files, ".git/index", { lockTimeoutMs: 2000 });
+    await second.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+
+    const firstWrite = first.write();
+    while (!(await files.exists(".git/index.lock"))) await new Promise((r) => setTimeout(r, 1));
+    const secondWrite = second.write();
+    setTimeout(release, 50);
+    await Promise.all([firstWrite, secondWrite]);
+    const check = createGitStaging(files, ".git/index");
+    await check.read();
+    expect((await check.getEntry("b.txt"))?.objectId).toBe(ID_B);
+    expect(await files.exists(".git/index.lock")).toBe(false);
+  });
+});
+
+describe("breakIndexLock", () => {
+  it("removes a lock left by a crashed writer, so the next write passes", async () => {
+    const files = createInMemoryFilesApi();
+    await stagedIndex(files);
+    await files.write(".git/index.lock", [enc.encode("crashed")]);
+    expect(await breakIndexLock(files, ".git")).toBe(true);
+    expect(await breakIndexLock(files, ".git")).toBe(false);
+    const staging = createGitStaging(files, ".git/index");
+    await staging.read();
+    await staging.setEntry({ path: "b.txt", mode: 0o100644, objectId: ID_B });
+    await staging.write();
     expect(await files.exists(".git/index.lock")).toBe(false);
   });
 });

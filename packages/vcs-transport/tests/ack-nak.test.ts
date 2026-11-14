@@ -129,3 +129,14 @@ describe("formatNak", () => {
     expect(formatNak()).toBe("NAK\n");
   });
 });
+
+describe("ACK with an id that is not hex", () => {
+  const notHex = "g".repeat(40);
+  it("parseAckNak throws PackProtocolError", () => {
+    expect(() => parseAckNak(`ACK ${notHex}`)).toThrow(PackProtocolError);
+    expect(() => parseAckNak(`ACK ${notHex} continue`)).toThrow(PackProtocolError);
+  });
+  it("parseAckNakV2 throws PackProtocolError", () => {
+    expect(() => parseAckNakV2(`ACK ${notHex}`)).toThrow(PackProtocolError);
+  });
+});

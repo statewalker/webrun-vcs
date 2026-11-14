@@ -202,7 +202,7 @@ import { probeBlob } from "@statewalker/vcs-core";
 const { size, binary, big } = await probeBlob(history.blobs, id);
 ```
 
-With `loadText: true`, the probe keeps reading a text blob to its end and returns it as `content`, so a caller that needs the text reads it once (one stream, and for a packed delta one delta resolution); a binary blob is still read only to its first 8000 bytes. `DiffFormatter` and `MergeCommand` use it.
+With `loadText: true`, the probe keeps reading a text blob to its end and returns it as `content`, so a caller that needs the text reads it once (one stream, and for a packed delta one delta resolution); a binary blob is still read only to its first 8000 bytes, and those are buffered on their own, so the full size is allocated only once the blob is known to be text. `DiffFormatter` and `MergeCommand` use it.
 
 ```typescript
 const { binary, content } = await probeBlob(history.blobs, id, { loadText: true });

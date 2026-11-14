@@ -7,18 +7,25 @@
  * with a lowercase letter is required: a reader that does not understand it must
  * not use the index (`link`, the split index; `sdir`, the sparse index).
  *
- * When we rewrite an index git wrote:
+ * When we rewrite an index git wrote, we keep only the extensions we know, as
+ * git drops the optional extensions it does not know when it rewrites:
  *
  * | Extension | Kept when |
  * |-----------|-----------|
  * | `TREE` (cache-tree), `UNTR` (untracked cache), `FSMN` (fsmonitor) | the entries did not change; dropped otherwise, git rebuilds them |
- * | `REUC` (resolve-undo) | always, minus the records whose path no longer has an entry |
+ * | `REUC` (resolve-undo) | always, every record (dropped only when it cannot be parsed) |
  * | `EOIE`, `IEOT` (offsets into the file) | never; git writes them again when configured to |
- * | any other uppercase signature | always, unchanged |
+ * | any other uppercase signature | never: an optional extension we do not know is dropped |
  * | any lowercase signature | never: the rewrite is refused (`UnsupportedIndexExtensionError`) |
  *
  * "The entries did not change" means the same (path, stage, mode, object id,
  * intent-to-add) list; stat data may differ.
+ *
+ * Resolve-undo records stay even for a path that is no longer in the index (a
+ * conflict resolved with `git rm`), as git keeps them. Git clears them on
+ * `read-tree`, `reset` and `commit`; here a full `Staging.readTree` (without
+ * `keepExisting`) clears them, which covers our reset. Our commit does not
+ * rewrite the index, so it leaves them until the next read-tree or reset.
  */
 import { objectIdToBytes } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
@@ -38,8 +45,6 @@ export class UnsupportedIndexExtensionError extends Error {
 
 /** Extensions derived from the entries, valid only while the entries stay the same. */
 const ENTRY_DERIVED = new Set(["TREE", "UNTR", "FSMN"]);
-/** Extensions holding offsets into the file as written, never valid after a rewrite. */
-const LAYOUT_DERIVED = new Set(["EOIE", "IEOT"]);
 
 /** Whether a signature names a required extension (first character not uppercase A-Z). */
 export function isRequiredIndexExtension(signature: string): boolean {
@@ -77,38 +82,36 @@ export function indexEntriesDigest(entries: readonly StagingEntry[]): string {
  * The extensions to write with `entries`, from those read with the index.
  *
  * @param extensions The extensions as read (`ParsedIndex.extensionData`)
- * @param entries The entries about to be written
+ * @param _entries The entries about to be written (unused; kept for the signature)
  * @param entriesChanged Whether `entries` differ from the entries read (see `indexEntriesDigest`)
  * @throws UnsupportedIndexExtensionError when a required extension was read
  */
 export function carryIndexExtensions(
   extensions: readonly IndexExtension[],
-  entries: readonly StagingEntry[],
+  _entries: readonly StagingEntry[],
   entriesChanged: boolean,
 ): IndexExtension[] {
   assertWritableIndexExtensions(extensions);
   const out: IndexExtension[] = [];
-  let paths: Set<string> | undefined;
   for (const ext of extensions) {
-    if (LAYOUT_DERIVED.has(ext.signature)) continue;
     if (ENTRY_DERIVED.has(ext.signature)) {
       if (!entriesChanged) out.push(ext);
-      continue;
+    } else if (ext.signature === "REUC") {
+      if (isValidResolveUndo(ext.data)) out.push(ext);
     }
-    if (ext.signature === "REUC") {
-      if (!entriesChanged) {
-        out.push(ext);
-        continue;
-      }
-      paths ??= new Set(entries.map((e) => e.path));
-      const known = paths;
-      const records = parseResolveUndo(ext.data).filter((r) => known.has(r.path));
-      if (records.length > 0) out.push({ signature: "REUC", data: encodeResolveUndo(records) });
-      continue;
-    }
-    out.push(ext);
+    // EOIE, IEOT and unknown optional extensions are dropped
   }
   return out;
+}
+
+/** Whether a `REUC` payload parses; a corrupt one is dropped rather than failing the write. */
+function isValidResolveUndo(data: Uint8Array): boolean {
+  try {
+    parseResolveUndo(data);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** One resolve-undo record: a path and its stage 1-3 modes and ids before resolution (0 / undefined: absent). */

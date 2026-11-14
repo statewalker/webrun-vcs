@@ -281,6 +281,7 @@ The transport never touches storage directly. It needs only a `RepositoryFacade`
 - Pkt-lines are limited to 65520 bytes (`MAX_PACKET_SIZE`). Larger packets fail with `Packet too large: <n> bytes (max 65520)`.
 - `pktLineReader` and `parsePacket` return the three special packets typed: `0000` as `flush`, `0001` as `delim`, and `0002` as `response-end` (protocol v2's end of a stateless response; this packet type was named `end` before). `demuxSideband` and `parseReportStatus` stop at `response-end` as at a flush. `TransportApi.readPktLine` rejects `0002` with `Unexpected response-end packet (0002)`: none of the exchanges it drives uses it.
 - The readers keep received bytes as a queue of chunks and copy each byte once, so a packet that arrives in many small chunks is read in linear time: `pktLineReader`, `TransportApi.readPktLine` and `readGitProtocolRequest`.
+- An `ACK` whose object id is not 40 hex digits fails with `PackProtocolError` (`Expected ACK/NAK, got: ...`), in v0/v1 (`parseAckNak`) and v2 (`parseAckNakV2`).
 - Protocol v2 is fetch-only. `serveOverDuplex` with `protocolVersion: "2"` and `service: "git-receive-pack"` runs the v1 push machine.
 
 ### What failures look like

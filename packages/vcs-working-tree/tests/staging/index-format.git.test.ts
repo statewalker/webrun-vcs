@@ -4,9 +4,11 @@
  * as git's own and leaves `git status` clean.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { serializeTree, type Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
@@ -171,15 +173,16 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
     }
   });
 
-  it("drops the resolve-undo record of a path that is no longer in the index", async () => {
+  it("keeps the resolve-undo record of a path that is no longer in the index, as git does", async () => {
     const dir = resolvedConflictRepo();
+    const undoBefore = git(dir, ["ls-files", "--resolve-undo"]);
     const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
     await staging.read();
     await staging.removeEntry("f.txt");
     await staging.write();
     const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
-    expect(after.extensions).toEqual([]);
-    expect(git(dir, ["ls-files", "--resolve-undo"])).toBe("");
+    expect(after.extensions).toEqual(["REUC"]);
+    expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
   });
 
   it("refuses to rewrite a split index (required 'link' extension)", async () => {
@@ -206,5 +209,99 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
     await expect(staging.write()).rejects.toThrow("index.lock': File exists");
     expect(readFileSync(join(dir, ".git/index")).equals(before)).toBe(true);
     rmSync(join(dir, ".git/index.lock"));
+  });
+});
+
+describe("native git and the extensions we keep", () => {
+  function conflictRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "index-reuc-git-"));
+    dirs.push(dir);
+    git(dir, ["init", "-q", "--initial-branch=main", "."]);
+    writeFileSync(join(dir, "f.txt"), "base\n");
+    writeFileSync(join(dir, "g.txt"), "g\n");
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-q", "-m", "base"]);
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    writeFileSync(join(dir, "f.txt"), "side\n");
+    git(dir, ["commit", "-q", "-am", "side"]);
+    git(dir, ["checkout", "-q", "main"]);
+    writeFileSync(join(dir, "f.txt"), "main\n");
+    git(dir, ["commit", "-q", "-am", "main"]);
+    try {
+      git(dir, ["merge", "-q", "side"]);
+    } catch {
+      // the expected conflict
+    }
+    return dir;
+  }
+
+  it("a conflict resolved with git rm keeps its resolve-undo record through our rewrite", async () => {
+    const dir = conflictRepo();
+    git(dir, ["rm", "-q", "f.txt"]);
+    const undo = git(dir, ["ls-files", "--resolve-undo"]);
+    expect(undo).toContain("f.txt");
+    writeFileSync(join(dir, "h.txt"), "h\n");
+    const hId = git(dir, ["hash-object", "-w", "h.txt"]);
+
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await staging.setEntry({ path: "h.txt", mode: 0o100644, objectId: hId });
+    await staging.write();
+    expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undo);
+    git(dir, ["fsck", "--strict"]);
+  });
+
+  /** Trees that only compute ids, as git hashes a tree object. */
+  const hashingTrees = {
+    store: async (entries: Iterable<{ name: string; mode: number; id: string }>) => {
+      const body = serializeTree([...entries]);
+      return createHash("sha1").update(`tree ${body.length}\0`).update(body).digest("hex");
+    },
+  } as unknown as Trees;
+
+  function treeRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "index-tree-git-"));
+    dirs.push(dir);
+    git(dir, ["init", "-q", "--initial-branch=main", "."]);
+    for (const p of ["a.txt", "d/b.txt", "d/e/c.txt", "z.txt"]) {
+      mkdirSync(join(dir, p, ".."), { recursive: true });
+      writeFileSync(join(dir, p), `${p}\n`);
+    }
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-q", "-m", "base"]);
+    return dir;
+  }
+
+  it("a changed entry drops TREE, and git write-tree equals the tree we compute", async () => {
+    const dir = treeRepo();
+    expect(
+      (await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))))).extensions,
+    ).toEqual(["TREE"]);
+    writeFileSync(join(dir, "d/e/c.txt"), "changed\n");
+    const cId = git(dir, ["hash-object", "-w", "d/e/c.txt"]);
+
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await staging.setEntry({ path: "d/e/c.txt", mode: 0o100644, objectId: cId });
+    await staging.write();
+
+    const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    expect(after.extensions).toEqual([]);
+    const ours = await staging.writeTree(hashingTrees);
+    expect(git(dir, ["write-tree"])).toBe(ours);
+    expect(ours).not.toBe(git(dir, ["rev-parse", "HEAD^{tree}"]));
+  });
+
+  it("unchanged entries keep TREE, and git write-tree still equals the tree we compute", async () => {
+    const dir = treeRepo();
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await staging.read();
+    await staging.write();
+
+    const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    expect(after.extensions).toEqual(["TREE"]);
+    const ours = await staging.writeTree(hashingTrees);
+    expect(git(dir, ["write-tree"])).toBe(ours);
+    expect(ours).toBe(git(dir, ["rev-parse", "HEAD^{tree}"]));
   });
 });

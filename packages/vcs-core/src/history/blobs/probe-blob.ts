@@ -79,23 +79,34 @@ export async function probeBlob(
   return readTextOnce(content, size);
 }
 
-/** Read to the end, unless the first 8000 bytes show the blob is binary. */
+/**
+ * Read to the end, unless the first 8000 bytes show the blob is binary. Those
+ * bytes are buffered on their own, so the full `size` is allocated only for text.
+ */
 async function readTextOnce(content: AsyncIterable<Uint8Array>, size: number): Promise<BlobProbe> {
-  const probeLength = RawText.BINARY_PROBE_LENGTH;
-  const out = new Uint8Array(size);
+  const probeLength = Math.min(RawText.BINARY_PROBE_LENGTH, size);
+  const head = new Uint8Array(probeLength);
+  let out: Uint8Array | undefined;
   let at = 0;
-  let checked = false;
   for await (const chunk of content) {
     if (at + chunk.length > size) throw new Error(`Blob longer than its size ${size}`);
-    out.set(chunk, at);
-    at += chunk.length;
-    if (!checked && at >= Math.min(probeLength, size)) {
-      checked = true;
-      if (RawText.isBinary(out.subarray(0, Math.min(probeLength, at)))) {
-        return { size, binary: true, big: false };
-      }
+    if (out) {
+      out.set(chunk, at);
+      at += chunk.length;
+      continue;
     }
+    const taken = Math.min(chunk.length, probeLength - at);
+    head.set(chunk.subarray(0, taken), at);
+    at += taken;
+    if (at < probeLength) continue;
+    if (RawText.isBinary(head)) return { size, binary: true, big: false };
+    out = new Uint8Array(size);
+    out.set(head, 0);
+    out.set(chunk.subarray(taken), at);
+    at += chunk.length - taken;
   }
-  if (at !== size) throw new Error(`Blob shorter than its size ${size}: ${at} bytes`);
+  if (at !== size || !out) {
+    throw new Error(`Blob shorter than its size ${size}: ${at} bytes`);
+  }
   return { size, binary: false, big: false, content: out };
 }

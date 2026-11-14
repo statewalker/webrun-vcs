@@ -277,6 +277,8 @@ export class FileStagingStore implements Staging {
 
   async readTree(trees: Trees, treeId: ObjectId): Promise<void> {
     this._entries = [];
+    // a whole tree replaces the index: git's read-tree and reset clear resolve-undo too
+    this.indexFile.clearResolveUndo();
     await this.addTreeRecursive(trees, treeId, "", MergeStage.MERGED);
     this.sortEntries();
   }
