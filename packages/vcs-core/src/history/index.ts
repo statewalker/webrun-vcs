@@ -2,7 +2,6 @@ export * from "./blobs/index.js";
 export * from "./commits/index.js";
 export * from "./create-history.js";
 export * from "./format/index.js";
-export * from "./hash/index.js";
 export { HistoryImpl, HistoryWithOperationsImpl } from "./history.impl.js";
 export type { History, HistoryWithOperations } from "./history.js";
 export * from "./objects/index.js";

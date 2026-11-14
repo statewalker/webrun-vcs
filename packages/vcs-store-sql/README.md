@@ -42,7 +42,6 @@ Typical setup:
 | `SqlNativeCommitStoreImpl`, `SqlNativeTreeStoreImpl`, `SqlNativeBlobStoreImpl`, `SqlNativeTagStoreImpl` | The classes behind `createSqlNativeStores`. |
 | `SQLRefStore` | `Refs` in table `vcs_ref`; a batch of ref updates is planned and written in one transaction, with its reflog lines (table `vcs_reflog`, migration 5). |
 | `SQLStaging` | `Staging` (the index) in table `staging_entry`. |
-| `SQLCommitStore`, `SQLTreeStore`, `SQLTagStore` | Same tables as the native stores, but ids from FNV-1a, **not Git ids** (see Internals). |
 | `createSqlObjectStores({ db, tableName? })` | `{ objects, blobs, trees, commits, tags }`: Git-format bytes in one key/value table (default `raw_objects`), Git ids, no query methods. |
 | `SQLHistoryFactory`, `registerSqlHistoryFactory()` | Build a `HistoryWithOperations` directly, or register it as the `"sql"` backend for `createHistory("sql", { db })` from `@statewalker/vcs-core`. |
 | `SqlDeltaApi`, `SqlTreeDeltaApi` | `DeltaApi` for blobs (table `blob_delta`) and structural tree deltas (`tree_delta`, `tree_delta_entry`). |
@@ -223,32 +222,23 @@ Blobs up to 256 KiB are stored inline in `vcs_blob`, uncompressed. Larger blobs 
 reasonable BLOB for SQLite while bounding memory per chunk. The whole blob is still read once to
 compute its SHA-1 before it is written.
 
-### Two id schemes in the same tables
-
-`SQLCommitStore`, `SQLTreeStore` and `SQLTagStore` write to the same tables as the native stores,
-but take ids from `computeCommitHash` / `computeTreeHash` / `computeTagHash` in
-`@statewalker/vcs-core`: a 32-bit FNV-1a hash with a type prefix, zero-padded to 40 characters
-(`tree84b15896000…`, `commit63bc4c49000…`). These are not Git ids. Do not mix the two families
-on one database unless you track which id came from which store.
-
 ### What will surprise you
 
-- **`SQLHistoryFactory` (and `createHistory("sql", …)`) does not produce Git ids for trees,
-  commits and tags.** It wires `SqlNativeBlobStoreImpl` (SHA-1) with `SQLTreeStore`,
-  `SQLCommitStore` and `SQLTagStore` (FNV-1a). Storing `hello\n`, a one-file tree and a commit
-  through it gives `ce0136…` (Git), `tree84b15896000…`, `commit63bc4c49000…`. Its capabilities
-  report `nativeGitFormat: false`. If you need Git-compatible history, build it from
-  `createSqlNativeStores(db)` instead.
-- **`SQLRefStore.compareAndSwap` on a symbolic ref replaces the symbolic ref.** Calling it with
-  `"HEAD"` compares against the branch HEAD points to, then writes the new id into `HEAD` itself.
-  HEAD becomes a detached direct ref and the branch does not move. Call it with the branch name.
-  It is also a read followed by a write, not one transaction.
+- **`SQLHistoryFactory` (`createHistory("sql", …)`) keeps objects as rows, not Git bytes.** Trees,
+  commits and tags get Git's ids for what the columns model (it wires the native stores) and
+  are rebuilt from columns on read. Headers the columns do not model (`mergetag`,
+  `gpgsig-sha256`, custom headers) are dropped when an object is parsed, so such a commit gets a
+  different id than in Git, here and in every store that imports through
+  `DefaultSerializationApi`. Its capabilities report
+  `nativeGitFormat: false`.
+- `SQLRefStore.compareAndSwap` is a one-command `batch`: on a symbolic ref such as `HEAD` it
+  checks and moves the branch the ref points to, in one transaction.
 - `SqlDeltaApi.startBatch()` / `endBatch()` only count nesting; each write commits on its own and
   `cancelBatch()` does not roll anything back. `endBatch()` without `startBatch()` throws
   `No batch in progress`. `listDeltas()` reports `ratio: 0`.
-- `SqlJsAdapter.transaction()` is reentrant by an instance-wide flag. A second, unrelated
-  `transaction()` started while one is awaiting joins it instead of waiting. Do not run
-  independent transactions on one adapter concurrently.
+- `SqlJsAdapter.transaction()` runs one transaction at a time: a second one waits for the first,
+  and plain statements wait too. Inside `fn`, use only the client passed to it; calling the outer
+  adapter's `transaction` there waits for itself and never runs.
 - `SqlGcStrategy.getStats()` reports `totalSize: 0`; it counts objects only.
 - `sql.js` keeps the whole database in memory. Nothing is on disk until you `export()` it.
 

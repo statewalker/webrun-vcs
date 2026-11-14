@@ -89,6 +89,23 @@ export function createCommitStoreTests(name: string, factory: CommitStoreFactory
     });
 
     describe("Basic Operations", () => {
+      it("stores a commit under the id git gives it (git commit-tree)", async () => {
+        const ident = {
+          name: "A U Thor",
+          email: "author@example.com",
+          timestamp: 1700000000,
+          tzOffset: "+0000",
+        };
+        const id = await ctx.commitStore.store({
+          tree: "aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7",
+          parents: [],
+          author: ident,
+          committer: ident,
+          message: "initial\n",
+        });
+        expect(id).toBe("91e296066e54b1080fcd3bee892880098880dbb1");
+      });
+
       it("stores and retrieves commits", async () => {
         const commit = createCommit({ message: "Initial commit" });
         const id = await ctx.commitStore.store(commit);

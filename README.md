@@ -140,11 +140,10 @@ console.log(commit.id);
 - **`pnpm test` does not run the browser end-to-end tests.** `pnpm test:app` runs them (Playwright,
   through turbo, which builds first). Install the browsers once with
   `pnpm --filter @statewalker/vcs-demo-browser-app exec playwright install`.
-- **Not every store produces Git ids.** The standalone tree, commit and tag stores in
-  `vcs-store-mem`, `vcs-store-kv` and `vcs-store-sql`, and the `"sql"` history backend, compute
-  their own (FNV-1a) ids instead of SHA-1 object ids. Use the `create*ObjectStores` factories of
-  those packages, `vcs-store-files` or `createMemoryHistory` when ids must match Git. See each
-  store's README.
+- **The SQL history rebuilds commits and tags from columns.** Every store uses Git's SHA-1 ids,
+  but `createHistory("sql")` keeps only the headers it models: a commit with `mergetag` or other
+  extra headers is not kept byte for byte. Use `vcs-store-files` or the `create*ObjectStores`
+  factories when objects must stay byte-exact.
 - **The HuggingFace demos need network access** to `huggingface.co`.
 - **`pnpm lint` and `pnpm format` rewrite files.** Use `lint:check` and `format:check` to only
   report.

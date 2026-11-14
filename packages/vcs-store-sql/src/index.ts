@@ -31,8 +31,6 @@
 
 // Binary storage (new architecture)
 export * from "./binary-storage/index.js";
-// High-level store implementations
-export * from "./commit-store.js";
 // Database client interface
 export * from "./database-client.js";
 // GC strategy for SQL storage
@@ -52,5 +50,3 @@ export * from "./sql-tree-delta-api.js";
 export * from "./staging-store.js";
 // Synchronization utilities
 export * from "./sync.js";
-export * from "./tag-store.js";
-export * from "./tree-store.js";

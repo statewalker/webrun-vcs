@@ -31,8 +31,9 @@ export type TreeStoreFactory = () => Promise<TreeStoreTestContext>;
  * Helper function to generate a fake object ID (for testing)
  */
 function fakeObjectId(seed: string): string {
-  const hash = seed.padEnd(40, "0").slice(0, 40);
-  return hash;
+  // hex digits of the seed's characters: a valid id a Git tree can encode
+  const hex = [...seed].map((c) => (c.codePointAt(0) ?? 0).toString(16).padStart(2, "0")).join("");
+  return hex.padEnd(40, "0").slice(0, 40);
 }
 
 /**
@@ -70,6 +71,17 @@ export function createTreeStoreTests(name: string, factory: TreeStoreFactory): v
     });
 
     describe("Basic Operations", () => {
+      it("stores a tree under the id git gives it (git mktree)", async () => {
+        const id = await ctx.treeStore.store([
+          {
+            mode: FileMode.REGULAR_FILE,
+            name: "hello.txt",
+            id: "ce013625030ba8dba906f756967f9e9ca394464a",
+          },
+        ]);
+        expect(id).toBe("aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7");
+      });
+
       it("stores and retrieves tree entries", async () => {
         const entries: TreeEntry[] = [
           { mode: FileMode.REGULAR_FILE, name: "file.txt", id: fakeObjectId("abc123") },

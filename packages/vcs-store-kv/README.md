@@ -32,7 +32,6 @@ adapter needs.
 | `KVRefStore` | `Refs` on a `KVStore`: direct and symbolic refs, atomic batches. All refs live in one root value, so every write is one `compareAndSwap`. Reflogs under `reflog:<name>`. |
 | `CorruptRefRootError` | Thrown when the refs root is not a JSON object of strings. |
 | `KVStaging` | `Staging` (the index) on a `KVStore`. |
-| `KVCommitStore`, `KVTreeStore`, `KVTagStore` | JSON-serialized `Commits` / `Trees` / `Tags` with scan-based queries. **Ids are not Git ids** (see Internals). |
 | `KvRawStore`, `createKvRawStore(kv, prefix?)` | `RawStorage` (key to bytes) on a `KVStore`. |
 | `KvDeltaStore`, `createKvDeltaStore(kv, prefix?)` | `DeltaStore` on a `KVStore`. |
 | `KvBinStore`, `createKvBinStore(kv, rawPrefix?, deltaPrefix?)` | `BinStore` combining the two above. |
@@ -154,31 +153,6 @@ export class IdbKVAdapter implements KVStore {
 }
 ```
 
-### Scan-based queries on the JSON stores
-
-```ts
-import { KVCommitStore, MemoryKVAdapter } from "@statewalker/vcs-store-kv";
-
-const commits = new KVCommitStore(new MemoryKVAdapter());
-const who = { name: "Ada", email: "ada@example.com", timestamp: 1700000000, tzOffset: "+0000" };
-await commits.store({
-  tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-  parents: [],
-  author: who,
-  committer: who,
-  message: "fix: bug",
-});
-
-for await (const id of commits.findByAuthor("ada@example.com")) console.log(id);
-for await (const id of commits.searchMessage("fix")) console.log(id); // case-insensitive substring
-await commits.count(); // 1
-```
-
-`KVTreeStore` has `findTreesWithBlob(blobId)` and `findByNamePattern("*.ts")` (`*` and `?`
-wildcards, case-insensitive). `KVTagStore` has `findByNamePattern`, `findByTagger(email)` and
-`findByTargetType(type)`. Every one of them loads every object of its kind: cost is O(n) in the
-number of stored objects.
-
 ### Binary storage with deltas
 
 ```ts
@@ -218,24 +192,16 @@ All stores can share one `KVStore` because each writes under its own prefix:
 | --- | --- |
 | `createKvObjectStores` (prefix `objects:`) / `KvRawStore` (prefix `raw`) | `<prefix>:raw:<key>` (bytes), `<prefix>:size:<key>` (4-byte little-endian length) |
 | `KvDeltaStore` (prefix `delta`) | `<prefix>:delta:<targetKey>` (JSON) |
-| `KVRefStore` | `ref:<name>`: `{"oid":…}` or `{"t":<target>}` |
+| `KVRefStore` | `ref:root` (every ref, see above) and `reflog:<name>` |
 | `KVStaging` | `staging:<path><NUL><stage>`, plus `staging:__meta__` |
-| `KVCommitStore` / `KVTreeStore` / `KVTagStore` | `commit:<id>`, `tree:<id>`, `tag:<id>` (compact JSON) |
 
 The default `objects:` prefix plus the `:` separator yields a double colon (`objects::raw:…`).
-`list(prefix)` must be a real prefix scan; `KVRefStore.list()` and the query methods depend on it.
+`list(prefix)` must be a real prefix scan; `KVStaging`, the raw and delta stores' `keys()` and the old-layout check of `KVRefStore` depend on it.
 
-### Two kinds of object stores, and why their ids differ
+### Object ids are git's
 
 `createKvObjectStores` serializes objects in Git format and hashes them with SHA-1 through the
-same `@statewalker/vcs-core` codecs as the other backends. Its ids match native Git. Use it when
-ids must interoperate (transport, packs, comparing with `git`).
-
-`KVCommitStore`, `KVTreeStore` and `KVTagStore` store compact JSON (`{"t":…,"p":[…],"an":…}`) and
-take ids from `computeCommitHash` / `computeTreeHash` / `computeTagHash`: a 32-bit FNV-1a hash
-with a type prefix, zero-padded to 40 characters (`commitd0ac0057000…`). Ids are stable but are
-not Git ids. The empty tree is always Git's `4b825dc642cb6eb9a060e54bf8d69288fbee4904`. These
-stores add the scan-based query methods shown above.
+same `@statewalker/vcs-core` codecs as the other backends, so its ids match native Git.
 
 ### Raw storage holds whole values
 
@@ -260,8 +226,8 @@ single value and by memory.
 
 ### Dependencies
 
-- `@statewalker/vcs-core`: store interfaces, Git object codecs, id hash functions, and the
-  ancestry algorithms (`walkAncestry`, `findMergeBase`, `isAncestor`) `KVCommitStore` delegates to.
+- `@statewalker/vcs-core`: store interfaces, Git object codecs and the Git object stores behind
+  `createKvObjectStores`.
 - `@statewalker/vcs-working-tree`: the `Staging` interface and merge-stage constants.
 - `@statewalker/vcs-utils`: the `Delta` type.
 

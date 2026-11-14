@@ -30,7 +30,6 @@ No peer dependencies. Runs anywhere modern JavaScript runs (browser, Node, worke
 | `MemoryStagingStore` | In-memory `Staging` (the index): entries, conflict stages, builder/editor, `readTree`/`writeTree`. |
 | `MemoryRefs` | In-memory `Refs` (re-exported from `@statewalker/vcs-core`). |
 | `MemoryRawStorage` | In-memory `RawStorage` key/bytes map (re-exported from `@statewalker/vcs-core`). |
-| `MemoryCommitStore`, `MemoryTreeStore`, `MemoryTagStore` | Object-map `Commits` / `Trees` / `Tags`. **Ids are not Git ids** (see Internals). |
 | `MemBinStore`, `createMemBinStore()` | `BinStore` combining a `MemoryRawStorage` and a `MemDeltaStore`. |
 | `MemDeltaStore` | `DeltaStore` that records base/target delta relationships. |
 
@@ -91,13 +90,12 @@ it("stores a blob", async () => {
 });
 ```
 
-### Object-map stores (fast, non-Git ids)
+### Trees, commits and ancestry
 
 ```ts
-import { MemoryCommitStore, MemoryTreeStore } from "@statewalker/vcs-store-mem";
+import { createMemoryObjectStores } from "@statewalker/vcs-store-mem";
 
-const trees = new MemoryTreeStore();
-const commits = new MemoryCommitStore();
+const { trees, commits } = createMemoryObjectStores();
 
 const treeId = await trees.store([]); // empty tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 const who = { name: "Ada", email: "ada@example.com", timestamp: 1700000000, tzOffset: "+0000" };
@@ -132,25 +130,13 @@ bin.clear();
 
 ## Internals
 
-### Two kinds of object stores, and why their ids differ
+### Git-format objects
 
 `createMemoryObjectStores()` serializes every object in Git format into a `MemoryRawStorage` and
 hashes it with SHA-1. It uses the same `createGitObjectStore` / `createBlobs` / `createTrees` /
 `createCommits` / `createTags` code as the persistent backends, so its ids match native Git.
 
-`MemoryCommitStore`, `MemoryTreeStore` and `MemoryTagStore` keep plain JavaScript objects and skip
-serialization. Their ids come from `computeCommitHash` / `computeTreeHash` / `computeTagHash` in
-`@statewalker/vcs-core`: a 32-bit FNV-1a hash with a type prefix, zero-padded to 40 characters
-(`commit2814e9b0000…`, `tree84b15896000…`, `tag…`). They are deterministic and content-derived,
-but they are not Git ids. Do not mix them with ids from a Git-format store. The one exception is
-the empty tree, which `MemoryTreeStore` always reports as Git's
-`4b825dc642cb6eb9a060e54bf8d69288fbee4904`. `gpgSignature` is stored but not hashed.
-
-### Copies in, copies out
-
-The object-map stores deep-copy on `store` and on `load`, so mutating a returned commit, tree
-entry or tag never changes stored state. Tree entries are sorted in Git canonical order
-(directories compare as `name/`) before hashing.
+Tree entries are sorted in Git canonical order (directories compare as `name/`) before hashing.
 
 ### Staging keeps entries sorted
 
@@ -167,8 +153,6 @@ is persisted.
 | Builder `finish()` with the same path and stage twice | `Duplicate entry: <path> stage <n>` |
 | Builder `finish()` with stage 0 next to stages 1-3 | `Invalid stages for <path>: stage 0 cannot coexist with other stages` |
 | `resolveConflict()` with an unknown resolution | `Invalid resolution: <value>` |
-| `MemoryCommitStore.getParents()` on a missing id | `Commit <id> not found` |
-| `MemoryTagStore.getTarget(id, true)` over more than 100 nested tags | `Tag chain too deep (> 100)` |
 | `storeDelta()` on an update after its `close()` | `Update already closed` |
 
 ### Delta store limits
@@ -182,8 +166,8 @@ packing decisions.
 ### Dependencies
 
 - `@statewalker/vcs-core`: store interfaces, Git object codecs, `MemoryRefs`,
-  `MemoryRawStorage`, and the ancestry algorithms (`walkAncestry`, `findMergeBase`,
-  `isAncestor`) that `MemoryCommitStore` delegates to.
+  `MemoryRawStorage`, and the Git object stores (`createBlobs`, `createTrees`, `createCommits`,
+  `createTags`) behind `createMemoryObjectStores`.
 - `@statewalker/vcs-working-tree`: the `Staging` interface and merge-stage constants.
 - `@statewalker/vcs-utils`: the `Delta` type.
 

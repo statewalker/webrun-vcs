@@ -494,3 +494,34 @@ describe("SQL HistoryWithOperations (via SQLHistoryFactory)", () => {
     });
   });
 });
+
+describe("SQL history object ids", () => {
+  it("stores blobs, trees and commits under the ids git gives them", async () => {
+    const db = await SqlJsAdapter.create();
+    const history = await new SQLHistoryFactory().createHistory({ db });
+    await history.initialize();
+    try {
+      const blob = await history.blobs.store([new TextEncoder().encode("hello\n")]);
+      const tree = await history.trees.store([{ mode: 0o100644, name: "hello.txt", id: blob }]);
+      const ident = {
+        name: "A U Thor",
+        email: "author@example.com",
+        timestamp: 1700000000,
+        tzOffset: "+0000",
+      };
+      const commit = await history.commits.store({
+        tree,
+        parents: [],
+        author: ident,
+        committer: ident,
+        message: "initial\n",
+      });
+      // ids from git hash-object, git mktree and git commit-tree
+      expect(blob).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
+      expect(tree).toBe("aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7");
+      expect(commit).toBe("91e296066e54b1080fcd3bee892880098880dbb1");
+    } finally {
+      await history.close();
+    }
+  });
+});
