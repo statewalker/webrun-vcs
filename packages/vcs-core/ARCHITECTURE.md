@@ -255,7 +255,7 @@ The package is organized into four logical layers, plus transversal modules:
 ```
 src/
 ├── common/           # Shared types: id, person, files (re-exported from @statewalker/vcs-utils/files)
-├── history/          # Version control objects: objects, commits, trees, blobs, tags, refs, format, hash
+├── history/          # Version control objects: objects, commits, trees, blobs, tags, refs, format
 ├── storage/          # Byte storage: raw, binary, chunked, delta, adapters (webrun-storage seam)
 ├── pack/             # Pack files: reader/parser, writer, indexer, index reader/writer
 ├── serialization/    # SerializationApi: loose objects and packs over a History

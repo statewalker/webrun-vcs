@@ -130,17 +130,13 @@ bin.clear();
 
 ## Internals
 
-### Two kinds of object stores, and why their ids differ
+### Git-format objects
 
 `createMemoryObjectStores()` serializes every object in Git format into a `MemoryRawStorage` and
 hashes it with SHA-1. It uses the same `createGitObjectStore` / `createBlobs` / `createTrees` /
 `createCommits` / `createTags` code as the persistent backends, so its ids match native Git.
 
-### Copies in, copies out
-
-The object-map stores deep-copy on `store` and on `load`, so mutating a returned commit, tree
-entry or tag never changes stored state. Tree entries are sorted in Git canonical order
-(directories compare as `name/`) before hashing.
+Tree entries are sorted in Git canonical order (directories compare as `name/`) before hashing.
 
 ### Staging keeps entries sorted
 

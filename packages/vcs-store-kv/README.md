@@ -196,7 +196,7 @@ All stores can share one `KVStore` because each writes under its own prefix:
 | `KVStaging` | `staging:<path><NUL><stage>`, plus `staging:__meta__` |
 
 The default `objects:` prefix plus the `:` separator yields a double colon (`objects::raw:…`).
-`list(prefix)` must be a real prefix scan; the old-layout check of `KVRefStore` depends on it.
+`list(prefix)` must be a real prefix scan; `KVStaging`, the raw and delta stores' `keys()` and the old-layout check of `KVRefStore` depend on it.
 
 ### Object ids are git's
 

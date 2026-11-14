@@ -31,7 +31,6 @@
 
 // Binary storage (new architecture)
 export * from "./binary-storage/index.js";
-// High-level store implementations
 // Database client interface
 export * from "./database-client.js";
 // GC strategy for SQL storage

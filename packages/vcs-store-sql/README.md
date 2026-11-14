@@ -224,9 +224,12 @@ compute its SHA-1 before it is written.
 
 ### What will surprise you
 
-- **`SQLHistoryFactory` (`createHistory("sql", …)`) keeps objects as rows, not Git bytes.** Its
-  ids are Git's (it wires the native stores), but trees, commits and tags are rebuilt from
-  columns on read, so headers the columns do not model are not kept. Its capabilities report
+- **`SQLHistoryFactory` (`createHistory("sql", …)`) keeps objects as rows, not Git bytes.** Trees,
+  commits and tags get Git's ids for what the columns model (it wires the native stores) and
+  are rebuilt from columns on read. Headers the columns do not model (`mergetag`,
+  `gpgsig-sha256`, custom headers) are dropped when an object is parsed, so such a commit gets a
+  different id than in Git, here and in every store that imports through
+  `DefaultSerializationApi`. Its capabilities report
   `nativeGitFormat: false`.
 - `SQLRefStore.compareAndSwap` is a one-command `batch`: on a symbolic ref such as `HEAD` it
   checks and moves the branch the ref points to, in one transaction.

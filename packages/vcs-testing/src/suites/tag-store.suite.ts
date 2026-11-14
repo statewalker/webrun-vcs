@@ -79,6 +79,18 @@ export function createTagStoreTests(name: string, factory: TagStoreFactory): voi
     });
 
     describe("Basic Operations", () => {
+      it("keeps a tagger with an empty name and email, so the id stays the same", async () => {
+        const tag = createTag({
+          tag: "v0",
+          message: "m\n",
+          tagger: { name: "", email: "", timestamp: 0, tzOffset: "+0000" },
+        });
+        const id = await ctx.tagStore.store(tag);
+        const loaded = await ctx.tagStore.load(id);
+        expect(loaded?.tagger).toEqual(tag.tagger);
+        expect(loaded && (await ctx.tagStore.store(loaded))).toBe(id);
+      });
+
       it("stores a tag under the id git gives it (git mktag)", async () => {
         const id = await ctx.tagStore.store({
           object: "91e296066e54b1080fcd3bee892880098880dbb1",

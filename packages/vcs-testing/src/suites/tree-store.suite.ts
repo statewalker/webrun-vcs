@@ -31,8 +31,9 @@ export type TreeStoreFactory = () => Promise<TreeStoreTestContext>;
  * Helper function to generate a fake object ID (for testing)
  */
 function fakeObjectId(seed: string): string {
-  const hash = seed.padEnd(40, "0").slice(0, 40);
-  return hash;
+  // hex digits of the seed's characters: a valid id a Git tree can encode
+  const hex = [...seed].map((c) => (c.codePointAt(0) ?? 0).toString(16).padStart(2, "0")).join("");
+  return hex.padEnd(40, "0").slice(0, 40);
 }
 
 /**
@@ -199,7 +200,7 @@ export function createTreeStoreTests(name: string, factory: TreeStoreFactory): v
     describe("Entry Lookup", () => {
       it("finds entry by name", async () => {
         const entries: TreeEntry[] = [
-          { mode: FileMode.REGULAR_FILE, name: "target.txt", id: fakeObjectId("7a5e7") },
+          { mode: FileMode.REGULAR_FILE, name: "target.txt", id: fakeObjectId("target") },
           { mode: FileMode.REGULAR_FILE, name: "other.txt", id: fakeObjectId("other") },
         ];
         const id = await ctx.treeStore.store(entries);
@@ -207,7 +208,7 @@ export function createTreeStoreTests(name: string, factory: TreeStoreFactory): v
         const found = await ctx.treeStore.getEntry(id, "target.txt");
         expect(found).toBeDefined();
         expect(found?.name).toBe("target.txt");
-        expect(found?.id).toBe(fakeObjectId("7a5e7"));
+        expect(found?.id).toBe(fakeObjectId("target"));
       });
 
       it("returns undefined for missing entry", async () => {
