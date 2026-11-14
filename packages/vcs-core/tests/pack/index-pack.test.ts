@@ -675,3 +675,54 @@ describe("sweepPackTemporaries", () => {
     expect(await sweepPackTemporaries(createInMemoryFilesApi(), PACK_DIR, 0)).toEqual([]);
   });
 });
+
+describe("installPack: storage failures and the final renames", () => {
+  const wrap = (files: FilesApi, patch: Partial<Record<"read" | "move", unknown>>) =>
+    new Proxy(files, {
+      get(target, prop, receiver) {
+        if (prop in patch) return patch[prop as "read" | "move"];
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+  it("passes a storage read error through unchanged (not a PackError)", async () => {
+    const base = createInMemoryFilesApi();
+    const files = wrap(base, {
+      read: (path: string, options?: unknown) =>
+        (async function* () {
+          if (!path.includes("tmp_pack_")) {
+            yield* base.read(path, options as never);
+            return;
+          }
+          // the first bytes arrive, then the disk fails inside the first entry's zlib stream
+          let sent = 0;
+          for await (const chunk of base.read(path, options as never)) {
+            const part = chunk.subarray(0, Math.max(0, 30 - sent));
+            if (part.length > 0) yield part;
+            sent += part.length;
+            if (sent >= 30) break;
+          }
+          throw Object.assign(new Error("EIO: disk gone"), { code: "EIO" });
+        })(),
+    });
+    const err = await installPack(files, PACK_DIR, chunks(pack([{ kind: 3, data: A }]))).catch(
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(PackError);
+    expect((err as { code?: string }).code).toBe("EIO");
+    expect(await listed(base)).toEqual([]);
+  });
+
+  it("leaves no pack without its idx when the idx cannot be moved into place", async () => {
+    const base = createInMemoryFilesApi();
+    const files = wrap(base, {
+      move: async (from: string, to: string) => (to.endsWith(".idx") ? false : base.move(from, to)),
+    });
+    await expect(
+      installPack(files, PACK_DIR, chunks(pack([{ kind: 3, data: A }]))),
+    ).rejects.toThrow(/could not move/);
+    expect(await listed(base)).toEqual([]);
+  });
+});

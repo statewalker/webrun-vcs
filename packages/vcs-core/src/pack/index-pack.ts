@@ -17,6 +17,7 @@
  * Durable Object. Any failure removes every temporary.
  */
 import {
+  CompressionError,
   compressBlockPako,
   createInflaterPool,
   type InflaterPool,
@@ -44,7 +45,7 @@ export type ExternalBase = (
   id: ObjectId,
 ) => Promise<{ type: ObjectTypeString; data: Uint8Array } | undefined>;
 
-export interface IndexPackOptions {
+export interface InstallPackOptions {
   /** Completes thin packs from the local repository (git's `--fix-thin`). Without it they are refused. */
   externalBase?: ExternalBase;
   /** Largest object (or delta) accepted, by its header and by delta results. Default 1 GiB. */
@@ -335,8 +336,11 @@ async function parseWith(
       });
     } catch (err) {
       inflater.abort();
-      if (err instanceof PackError) throw err;
-      throw new PackError(`entry at ${offset}: ${(err as Error).message}`);
+      // zlib errors are the pack's; storage errors (EIO…) pass through unchanged
+      if (err instanceof CompressionError) {
+        throw new PackError(`entry at ${offset}: ${(err as Error).message}`);
+      }
+      throw err;
     }
     if (got !== size)
       throw new PackError(`entry at ${offset} inflates to ${got} bytes, header says ${size}`);
@@ -347,8 +351,13 @@ async function parseWith(
     }
   }
   t.n = count;
-  if (r.pos !== packLen - 20)
-    throw new PackError(`${packLen - 20 - r.pos} unexpected bytes before the trailer`);
+  if (r.pos !== packLen - 20) {
+    throw new PackError(
+      r.pos < packLen - 20
+        ? `${packLen - 20 - r.pos} bytes after the last entry (junk after the pack, or a wrong count)`
+        : "the last entry runs into the trailer",
+    );
+  }
   const expected = hex(r.hasher.digest());
   const trailer = hex(await r.bytes(20));
   if (trailer !== expected)
@@ -437,8 +446,10 @@ async function loadEntry(
     }
   } catch (err) {
     inflater.abort();
-    if (err instanceof PackError) throw err;
-    throw new PackError(`entry at ${offset} could not be re-read: ${(err as Error).message}`);
+    if (err instanceof CompressionError) {
+      throw new PackError(`entry at ${offset} could not be re-read: ${(err as Error).message}`);
+    }
+    throw err; // PackError, or a storage error, unchanged
   }
   if (!done || o !== size) {
     inflater.abort();
@@ -970,7 +981,7 @@ export async function installPack(
   files: FilesApi,
   packDir: string,
   source: AsyncIterable<Uint8Array>,
-  options: IndexPackOptions = {},
+  options: InstallPackOptions = {},
 ): Promise<InstalledPack> {
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
   const baseCacheBytes = options.baseCacheBytes ?? 32 * 2 ** 20;
@@ -1054,15 +1065,21 @@ export async function installPack(
       return result;
     }
     await files.write(tmpIdx, [idx]);
+    // The pack goes first, then its idx (as git): readers ignore a pack without one.
+    // A leftover pack-<id>.pack from a crash is replaced here (move overwrites).
     if (!(await files.move(packFile, `${name}.pack`)))
       throw new Error(`could not move ${packFile}`);
-    if (!(await files.move(tmpIdx, `${name}.idx`))) throw new Error(`could not move ${tmpIdx}`);
+    if (!(await files.move(tmpIdx, `${name}.idx`))) {
+      await safeRemove(files, `${name}.pack`); // no orphan pack without its idx
+      throw new Error(`could not move ${tmpIdx}`);
+    }
     return result;
   } catch (e) {
     win.release();
     appended?.release();
-    for (const p of [tmpPack, tmpIdx, tmpFixed, ...(appended?.allPaths ?? [])])
-      await files.remove(p).catch(() => false);
+    for (const p of [tmpPack, tmpIdx, tmpFixed, ...(appended?.allPaths ?? [])]) {
+      await safeRemove(files, p);
+    }
     throw e;
   }
 }
@@ -1095,4 +1112,13 @@ export async function sweepPackTemporaries(
   const removed: string[] = [];
   for (const p of stale) if (await files.remove(p)) removed.push(p);
   return removed;
+}
+
+/** Remove a file, ignoring any failure (cleanup must not hide the original error). */
+async function safeRemove(files: FilesApi, path: string): Promise<void> {
+  try {
+    await files.remove(path);
+  } catch {
+    // best effort
+  }
 }
