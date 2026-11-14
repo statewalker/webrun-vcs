@@ -6,6 +6,7 @@
  * 2. POST /git-upload-pack - Negotiate and receive pack
  */
 
+import { fetchWithRequestBody, shouldStreamRequestBody } from "@statewalker/vcs-utils/streams";
 import type { FetchResult } from "../../api/fetch-result.js";
 import type { RepositoryFacade } from "../../api/repository-facade.js";
 import type { RefStore } from "../../context/process-context.js";
@@ -18,7 +19,6 @@ import { createEmptyPack } from "../../protocol/pack-utils.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { parseReportStatusLines } from "../../protocol/report-status.js";
 import { sidebandPackStream } from "../../protocol/sideband-pack-stream.js";
-import { fetchWithRequestBody, shouldStreamRequestBody } from "../../utils/request-stream.js";
 import {
   collectChunks,
   decodeSidebandResponse,

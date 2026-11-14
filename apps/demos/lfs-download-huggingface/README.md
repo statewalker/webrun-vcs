@@ -15,7 +15,7 @@ lfsDownload(store, resolver, "https://huggingface.co/<model>.git/info/lfs", [{ o
   POST <lfs>/objects/batch   { operation: "download", transfers: ["basic"] }
   GET  <download action href>          (whole object, SHA-256 checked == oid)
   store.put(bytes) -> content-store id;  resolver.record(oid, id)
-verify: resolver.toObject(oid) -> store.read(id) -> sha256Hex == oid, length == size
+verify: resolver.toObject(oid) -> createLfsPointer(store.read(id)) == { oid, size }  (streamed)
 ```
 
 The model is `hf-internal-testing/tiny-random-gpt2`. Its `pytorch_model.bin` is a real LFS object:
@@ -67,13 +67,18 @@ for await (const event of lfsDownload(store, resolver, LFS_BASE_URL, [pointer]))
 }
 ```
 
-`lfsDownload` takes an optional fifth argument, `fetchImpl`, which defaults to the global `fetch`.
+`lfsDownload` takes an optional fifth argument, `fetchImpl`, which defaults to the global `fetch`. It stores the response body as it arrives, hashing it on the way, and records the object only if its SHA-256 and size match the pointer, so the model is never held in memory whole. The demo's own re-check works the same way:
+
+```typescript
+const actual = await createLfsPointer(store.read(storedId)); // streamed SHA-256 + byte count
+if (actual.oid !== pointer.oid || actual.size !== pointer.size) throw new Error("verification failed");
+```
 
 ## Why it is the way it is
 
 - **Standard LFS, whole objects.** The batch request asks only for the `basic` transfer and objects are identified by their whole-file SHA-256, so the same client works against any Git-LFS host. Chunk-level deduplication is a different transfer and is shown by the `xet-transfer-huggingface` demo.
 - **LFS oid and content-store id are kept apart.** The content store has its own identity (`contentHash` prefixes ids with `cs-sha256:` so they never collide with a bare LFS oid); the `LfsResolver` maps one to the other. Here the resolver is a `Map`, so nothing persists.
-- **Verification twice.** `lfsDownload` rejects an object whose SHA-256 does not match the oid before storing it, as the LFS spec requires. The demo then reads the stored bytes back and checks the hash and the size again, so a store that loses or reorders chunks would also be caught.
+- **Verification twice.** `lfsDownload` refuses an object whose SHA-256 does not match the oid, as the LFS spec requires: it records no mapping, and the stored bytes wait for the store's `gc`. The demo then reads the stored bytes back and checks the hash and the size again, so a store that loses or reorders chunks would also be caught.
 - **`chunkThreshold: 1024`** forces even this small file through the content store's chunking path.
 - **In memory.** Both blob stores are `memBlobStore()`. To keep the bytes on disk, use `filesBlobStore(files)` from `@statewalker/webrun-storage` over a `FilesApi`; the transport code does not change.
 
@@ -105,4 +110,4 @@ for await (const event of lfsDownload(store, resolver, LFS_BASE_URL, [pointer]))
 
 ### Dependencies
 
-`@statewalker/vcs-transport-lfs` (batch client, `sha256Hex`), `@statewalker/webrun-content-store` (content store), `@statewalker/webrun-storage` (`memBlobStore`).
+`@statewalker/vcs-transport-lfs` (batch client, `sha256Hex`, `createLfsPointer`, `parseLfsPointer`), `@statewalker/webrun-content-store` (content store), `@statewalker/webrun-storage` (`memBlobStore`).

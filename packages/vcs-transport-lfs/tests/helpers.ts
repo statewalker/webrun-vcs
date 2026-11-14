@@ -10,7 +10,7 @@ import { sha256Hex } from "../src/index.js";
  * (`<hex>`) — the resolver genuinely translates between the two id spaces.
  */
 export async function csHash(input: ByteStream): Promise<string> {
-  return `cs-sha256:${await sha256Hex(await collect(input))}`;
+  return `cs-sha256:${await sha256Hex(input)}`;
 }
 
 export function makeStore(): ContentStore {
@@ -22,9 +22,13 @@ export function makeStore(): ContentStore {
 }
 
 /** A `Map`-backed LFS-oid → content-store-id resolver (no persistence). */
-export function memResolver(): LfsResolver {
+export function memResolver(): LfsResolver & { roots(): ObjectId[] } {
   const map = new Map<string, ObjectId>();
   return {
+    /** The recorded store ids: the live roots to pass to the store's `gc`. */
+    roots() {
+      return [...map.values()];
+    },
     async toObject(lfsOid) {
       return map.get(lfsOid);
     },

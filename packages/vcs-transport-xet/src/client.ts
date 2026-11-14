@@ -4,12 +4,14 @@
  * through `content-transfer` (chunk dedup, resumable) over a per-oid chunk
  * channel; otherwise the whole transfer defers to the reused
  * `@statewalker/vcs-transport-lfs` basic path. The whole-file SHA-256 (the LFS
- * oid) is verified on a completed xet download — the interop guarantee.
+ * oid) and size are verified on a completed xet download — the interop
+ * guarantee — by streaming the stored object through an incremental SHA-256,
+ * so memory stays bounded by one chunk.
  */
 
 import type { BatchRequest, LfsPointer, LfsResolver } from "@statewalker/vcs-transport-lfs";
-import { lfsDownload, lfsUpload, sha256Hex } from "@statewalker/vcs-transport-lfs";
-import type { ByteStream, ContentStore } from "@statewalker/webrun-content-store";
+import { createLfsPointer, lfsDownload, lfsUpload } from "@statewalker/vcs-transport-lfs";
+import type { ContentStore } from "@statewalker/webrun-content-store";
 import { remoteStore, transfer } from "@statewalker/webrun-content-transfer";
 import {
   XET_TRANSFER,
@@ -22,19 +24,6 @@ import type { XetOptions, XetTransportEvent } from "./types.js";
 
 const LFS_CONTENT_TYPE = "application/vnd.git-lfs+json";
 const defaultFetch = (request: Request) => fetch(request);
-
-async function collect(stream: ByteStream): Promise<Uint8Array> {
-  const parts: Uint8Array[] = [];
-  for await (const chunk of stream) parts.push(chunk);
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
-  return out;
-}
 
 async function postXetBatch(
   fetchImpl: XetOptions["fetchImpl"] & {},
@@ -74,7 +63,9 @@ export async function* xetUpload(
   const batch = await postXetBatch(fetchImpl, url, "upload", oids);
 
   if (batch.transfer !== XET_TRANSFER) {
-    yield* lfsUpload(store, resolver, url, oids, fetchImpl);
+    yield* lfsUpload(store, resolver, url, oids, fetchImpl, {
+      streamRequestBody: opts.streamRequestBody,
+    });
     return;
   }
 
@@ -114,9 +105,12 @@ export async function* xetUpload(
 /**
  * Download objects from a xet-or-basic LFS endpoint. On a `xet` agreement each
  * object is pulled chunk-by-chunk (only the chunks missing locally) through
- * content-transfer, then its whole-file SHA-256 is verified against the oid
- * before the mapping is recorded; on a `basic` response the whole download
- * defers to `vcs-transport-lfs`.
+ * content-transfer, then its whole-file SHA-256 and size are verified against
+ * the pointer (streamed from the store, never collected) before the mapping is
+ * recorded. A mismatch records nothing and leaves the object for the store's
+ * `gc` (live roots: the resolver's values) rather than removing it, since a
+ * concurrent honest download of the same bytes shares its content-derived id.
+ * On a `basic` response the whole download defers to `vcs-transport-lfs`.
  */
 export async function* xetDownload(
   store: ContentStore,
@@ -134,6 +128,7 @@ export async function* xetDownload(
   }
 
   yield { type: "batch", operation: "download", count: batch.objects.length };
+  const requested = new Map(oids.map((p) => [p.oid, p.size]));
   for (const obj of batch.objects as XetBatchObjectResponse[]) {
     if (obj.error) {
       yield { type: "error", oid: obj.oid, reason: obj.error.message };
@@ -161,11 +156,20 @@ export async function* xetDownload(
       continue;
     }
 
-    // Interop guarantee: the reassembled whole object must hash to the LFS oid.
-    const bytes = await collect(store.read(remoteId));
-    if ((await sha256Hex(bytes)) !== obj.oid) {
-      await store.remove(remoteId);
-      yield { type: "error", oid: obj.oid, reason: "sha256 mismatch" };
+    // Interop guarantee: the reassembled whole object must hash to the LFS oid
+    // and have the pointer's size. Hashed as it streams from the store.
+    const actual = await createLfsPointer(store.read(remoteId));
+    const size = requested.get(obj.oid) ?? obj.size;
+    const reason =
+      actual.size !== size
+        ? "size mismatch"
+        : actual.oid !== obj.oid
+          ? "sha256 mismatch"
+          : undefined;
+    if (reason) {
+      // Never removed: the id is derived from content, so another download of the
+      // same bytes may be recording it right now. The store's gc reclaims it.
+      yield { type: "error", oid: obj.oid, reason };
       continue;
     }
     await resolver.record(obj.oid, remoteId);

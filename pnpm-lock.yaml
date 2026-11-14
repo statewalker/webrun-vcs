@@ -1211,6 +1211,9 @@ importers:
 
   packages/vcs-transport-lfs:
     dependencies:
+      '@statewalker/vcs-utils':
+        specifier: workspace:^
+        version: link:../vcs-utils
       '@statewalker/webrun-content-store':
         specifier: 'catalog:'
         version: 0.2.3

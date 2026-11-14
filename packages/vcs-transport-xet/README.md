@@ -33,6 +33,7 @@ No peer dependencies. One entry point, `@statewalker/vcs-transport-xet` (ESM, wi
 - `hashContent`: chunk-integrity hasher passed to content-transfer.
 - `checkpoint`: a `TransferCheckpoint` to resume from.
 - `limits`: `TransferLimits` for the transfer pipeline.
+- `streamRequestBody`: whether an upload that falls back to basic LFS streams its body (see `LfsTransferOptions` in `@statewalker/vcs-transport-lfs`).
 
 The last three apply on the xet path only.
 
@@ -79,7 +80,7 @@ client                                   server (serveXet)
   POST /objects/batch {transfers:[xet,basic]}  -->  {transfer:"xet", actions:{download:{href, objectId}}}
   transfer([objectId], remote, local)
     each request frame = one POST /xet-chunks/<oid>  -->  content-transfer serveStore(store)
-  read whole object, check sha256 == oid
+  stream the stored object through SHA-256, check oid and size
   resolver.record(oid, objectId)
 ```
 
@@ -91,11 +92,15 @@ content-transfer addresses objects by content-store id, not by LFS oid. On downl
 
 ### Why the whole object is hashed after a chunk download
 
-Chunks are verified one by one by content-transfer, but the LFS oid covers the whole file. After a xet download the client reads the assembled object, checks its SHA-256 against the oid, and removes it from the store on mismatch. Only then does it record the oid mapping.
+Chunks are verified one by one by content-transfer, but the LFS oid covers the whole file. After a xet download the client streams the assembled object out of the store through `createLfsPointer`, an incremental SHA-256 that also counts bytes, so memory stays at one chunk however large the object is. If the SHA-256 differs from the oid or the size from the pointer, no mapping is recorded; only a match records it. The refused object is not removed: content-store ids are derived from content, so a concurrent honest download of the same bytes shares its id and may be about to record it. It stays until the store's `gc` runs with the resolver's values as live roots.
+
+The upload side does the same on the server: when content-transfer assembles an uploaded object, `serveXet` stores it through `storeVerified` from `@statewalker/vcs-transport-lfs`, hashing the reassembled bytes as they stream into the store. A mismatch fails the assemble, which the client sees as an `error` event for that oid; the mapping is recorded only for a match, and the refused object is left for the server store's `gc` in the same way.
+
+### Which hashes Xet uses here
+
+Two, and neither needs the whole object in memory. Chunk and content-store ids come from the injected `hashContent` (the demos and tests use SHA-256 over each chunk, streamed). The interop identity is the LFS oid, a whole-file SHA-256, computed incrementally. Hugging Face's own Xet storage uses BLAKE3-keyed merkle hashes for chunks and files; this package does not speak that protocol, so it needs no BLAKE3 implementation.
 
 ### Constraints
-
-- On a xet upload the server records `oid -> content-store id` when the object is assembled. It does not re-check the whole-file SHA-256 against the oid, unlike the basic `PUT` path.
 - The server always offers an upload action for every object in an upload batch.
 - As in `@statewalker/vcs-transport-lfs`, the client does not check the batch `POST` status before parsing the body.
 - `checkpoint` object ids are content-store ids, not LFS oids.
@@ -107,14 +112,16 @@ Per-object failures are yielded as `{ type: "error", oid, reason }`, never throw
 - `no local object for oid` (upload: resolver has no mapping)
 - `no download action` (download: the action or its `objectId` is missing)
 - `Object does not exist` (download batch for an oid the server does not know)
-- `sha256 mismatch` (assembled object does not hash to the oid; the object is removed)
+- `sha256 mismatch` (assembled object does not hash to the oid; nothing is recorded, and the object remains until the store's `gc`)
+- `size mismatch` (assembled object is not the pointer size; nothing is recorded, and the object remains until the store's `gc`)
+- `xet upload refused: sha256 mismatch` (upload: the server's assembled object does not hash to the oid)
 - any error message thrown by content-transfer during the chunk exchange
 
 On the basic fallback path the reasons are those of `@statewalker/vcs-transport-lfs`.
 
 ### Dependencies
 
-- `@statewalker/vcs-transport-lfs`: batch types, `serveLfs`, the basic fallback client, `sha256Hex`.
+- `@statewalker/vcs-transport-lfs`: batch types, `serveLfs`, the basic fallback client, `createLfsPointer` and `storeVerified` for streaming verification.
 - `@statewalker/webrun-content-transfer`: `transfer`, `remoteStore`, `serveStore` (chunk dedup and resume).
 - `@statewalker/webrun-content-store`: the `ContentStore` and id types.
 - `@statewalker/webrun-streams`: the `Duplex` type of the chunk channel.

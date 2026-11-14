@@ -16,8 +16,8 @@ import { memBlobStore } from "@statewalker/webrun-storage";
  * a bare LFS oid — the resolver genuinely translates between the two id spaces.
  */
 export async function csHash(input: ByteStream): Promise<string> {
-  // Web Crypto (portable) has no streaming digest: collect the chunks, hash once.
-  return `cs-sha256:${await sha256Hex(await collect(input))}`;
+  // sha256Hex hashes the stream chunk by chunk (incremental SHA-256).
+  return `cs-sha256:${await sha256Hex(input)}`;
 }
 
 export function makeStore(): ContentStore {

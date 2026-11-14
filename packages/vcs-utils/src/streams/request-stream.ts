@@ -1,6 +1,6 @@
 /**
- * Streaming request bodies (fetch's `duplex: "half"`): a push sends its pack as it is written,
- * where the runtime can. Node (undici), Deno and Bun stream a `ReadableStream` body over any
+ * Streaming request bodies (fetch's `duplex: "half"`): a push sends its pack, and an LFS upload
+ * its object, as it is produced, where the runtime can. Node (undici), Deno and Bun stream a `ReadableStream` body over any
  * HTTP version, so outside browsers a push streams by default.
  *
  * Browsers collect the body first unless `streamRequestBody: true` is set: Firefox and Safari

@@ -42,6 +42,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@statewalker/vcs-utils": "workspace:^",
     "@statewalker/webrun-content-store": "catalog:",
     "@statewalker/webrun-http-streams": "catalog:"
   },

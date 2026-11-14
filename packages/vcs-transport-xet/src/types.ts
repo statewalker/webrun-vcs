@@ -37,6 +37,8 @@ export interface XetOptions {
   checkpoint?: TransferCheckpoint;
   /** Pipeline bounds forwarded to content-transfer. */
   limits?: TransferLimits;
+  /** Whether a basic-fallback upload streams its request body; see `LfsTransferOptions`. */
+  streamRequestBody?: boolean;
 }
 
 /**

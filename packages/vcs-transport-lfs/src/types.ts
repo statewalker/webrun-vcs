@@ -40,3 +40,17 @@ export type TransportEvent =
 /** A fetch-like transport: exactly the `HttpHandler` shape, so a `serveLfs`
  * handler can be injected directly as an in-process loopback in tests. */
 export type FetchLike = (request: Request) => Response | Promise<Response>;
+
+/** Options for {@link import("./client.js").lfsUpload} and `lfsDownload`. */
+export interface LfsTransferOptions {
+  /**
+   * Whether an upload streams its request body (`duplex: "half"`). Default:
+   * stream outside browsers where the runtime supports it, collect in browsers
+   * (see `shouldStreamRequestBody` in `@statewalker/vcs-utils/streams`). A
+   * streamed body that the browser refuses before reading it is sent once more,
+   * collected. Browsers drop `content-length` (a forbidden header), so a
+   * streamed browser upload goes out without a length, which presigned
+   * S3-style URLs may reject; a collected body gets its length from the browser.
+   */
+  streamRequestBody?: boolean;
+}

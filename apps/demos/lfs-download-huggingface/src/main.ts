@@ -9,14 +9,16 @@
  *   2. `lfsDownload(...)` POSTs the standard LFS batch request to HF's real LFS
  *      endpoint, follows the returned `download` action href, streams the bytes
  *      into a content-store, and (inside the library) verifies SHA-256 == oid.
- *   3. Independently re-verify: whole-file SHA-256 of the stored bytes equals
- *      the pointer oid and the byte length equals the pointer size.
+ *   3. Independently re-verify: `createLfsPointer` streams the stored object
+ *      through an incremental SHA-256; its oid and size must equal the pointer.
  */
 
 import {
+  createLfsPointer,
   type LfsPointer,
   type LfsResolver,
   lfsDownload,
+  parseLfsPointer,
   sha256Hex,
 } from "@statewalker/vcs-transport-lfs";
 import { type ByteStream, createContentStore } from "@statewalker/webrun-content-store";
@@ -32,8 +34,8 @@ const LFS_BASE_URL = `https://huggingface.co/${MODEL}.git/info/lfs`;
 /** Content-store identity: opaque, algorithm-agnostic, prefixed so it never
  * collides with a bare LFS oid. */
 async function contentHash(input: ByteStream): Promise<string> {
-  // Web Crypto has no streaming digest: collect the chunks, then hash once.
-  return `cs-sha256:${await sha256Hex(await collect(input))}`;
+  // sha256Hex hashes the stream chunk by chunk (incremental SHA-256).
+  return `cs-sha256:${await sha256Hex(input)}`;
 }
 
 /** A `Map`-backed LFS-oid -> content-store-id resolver (no persistence). */
@@ -49,27 +51,11 @@ function memResolver(): LfsResolver {
   };
 }
 
-async function collect(stream: ByteStream): Promise<Uint8Array> {
-  const parts: Uint8Array[] = [];
-  for await (const chunk of stream) parts.push(chunk);
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
-  return out;
-}
-
 /** Parse a Git-LFS v1 pointer file into `{ oid, size }`. */
 function parsePointer(text: string): LfsPointer {
-  const oidMatch = text.match(/^oid sha256:([0-9a-f]{64})$/m);
-  const sizeMatch = text.match(/^size (\d+)$/m);
-  if (!oidMatch || !sizeMatch) {
-    throw new Error(`not a Git-LFS pointer:\n${text}`);
-  }
-  return { oid: oidMatch[1], size: Number(sizeMatch[1]) };
+  const pointer = parseLfsPointer(text);
+  if (!pointer) throw new Error(`not a Git-LFS pointer:\n${text}`);
+  return pointer;
 }
 
 async function main(): Promise<void> {
@@ -114,16 +100,16 @@ async function main(): Promise<void> {
   if (!storedId) throw new Error("resolver has no content-store id for the oid");
   if (!(await store.has(storedId))) throw new Error("object not present in content-store");
 
-  const bytes = await collect(store.read(storedId));
-  const actualOid = await sha256Hex(bytes);
-  const sizeOk = bytes.length === ptr.size;
-  const oidOk = actualOid === ptr.oid;
+  // Streams the stored object through SHA-256; nothing is held in memory whole.
+  const actual = await createLfsPointer(store.read(storedId));
+  const sizeOk = actual.size === ptr.size;
+  const oidOk = actual.oid === ptr.oid;
 
   console.log(`    content-store id: ${storedId}`);
   console.log(
-    `    bytes read back:  ${bytes.length} (expected ${ptr.size}) — ${sizeOk ? "OK" : "MISMATCH"}`,
+    `    bytes read back:  ${actual.size} (expected ${ptr.size}) — ${sizeOk ? "OK" : "MISMATCH"}`,
   );
-  console.log(`    sha256:           ${actualOid}`);
+  console.log(`    sha256:           ${actual.oid}`);
   console.log(`    matches oid:      ${oidOk ? "OK" : "MISMATCH"}`);
 
   if (!sizeOk || !oidOk) throw new Error("verification failed");

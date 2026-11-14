@@ -5,10 +5,10 @@
  * over HTTP/HTTPS.
  */
 
+import { fetchWithRequestBody, shouldStreamRequestBody } from "@statewalker/vcs-utils/streams";
 import type { BaseHttpOptions, BasePushOptions } from "../api/options.js";
 import { ZERO_OID } from "../protocol/constants.js";
 import { createEmptyPack } from "../protocol/pack-utils.js";
-import { fetchWithRequestBody, shouldStreamRequestBody } from "../utils/request-stream.js";
 import { authorizationHeader } from "./http-auth.js";
 
 /**

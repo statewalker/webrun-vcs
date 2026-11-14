@@ -23,7 +23,14 @@
  *      `serveLfs` server transparently moves the whole object and verifies.
  */
 
-import { type LfsPointer, lfsDownload, serveLfs, sha256Hex } from "@statewalker/vcs-transport-lfs";
+import {
+  createLfsPointer,
+  type LfsPointer,
+  lfsDownload,
+  parseLfsPointer,
+  serveLfs,
+  sha256Hex,
+} from "@statewalker/vcs-transport-lfs";
 import { serveXet, xetDownload } from "@statewalker/vcs-transport-xet";
 import {
   type ContentStore,
@@ -43,10 +50,9 @@ const LFS_BASE_URL = `https://huggingface.co/${MODEL}.git/info/lfs`;
 const LOOPBACK_URL = "http://xet.loopback";
 
 function parsePointer(text: string): LfsPointer {
-  const oidMatch = text.match(/^oid sha256:([0-9a-f]{64})$/m);
-  const sizeMatch = text.match(/^size (\d+)$/m);
-  if (!oidMatch || !sizeMatch) throw new Error(`not a Git-LFS pointer:\n${text}`);
-  return { oid: oidMatch[1], size: Number(sizeMatch[1]) };
+  const pointer = parseLfsPointer(text);
+  if (!pointer) throw new Error(`not a Git-LFS pointer:\n${text}`);
+  return pointer;
 }
 
 /** Fetch the real HF object once via the standard LFS basic transfer. */
@@ -137,11 +143,12 @@ async function main(): Promise<void> {
 
   const destId = await destResolver.toObject(ptr.oid);
   if (!destId) throw new Error("xet transfer produced no object mapping");
-  const reconstructed = await collect(spiedDest.read(destId));
-  const oidOk = (await sha256Hex(reconstructed)) === ptr.oid;
-  const sizeOk = reconstructed.length === ptr.size;
+  // Streams the reconstructed object through SHA-256 instead of collecting it.
+  const reconstructed = await createLfsPointer(spiedDest.read(destId));
+  const oidOk = reconstructed.oid === ptr.oid;
+  const sizeOk = reconstructed.size === ptr.size;
   console.log(
-    `    reconstructed:      ${reconstructed.length} bytes, sha256 ${oidOk ? "OK" : "MISMATCH"}, size ${sizeOk ? "OK" : "MISMATCH"}`,
+    `    reconstructed:      ${reconstructed.size} bytes, sha256 ${oidOk ? "OK" : "MISMATCH"}, size ${sizeOk ? "OK" : "MISMATCH"}`,
   );
   if (!oidOk || !sizeOk) throw new Error("xet reconstruction failed verification");
 
@@ -161,8 +168,8 @@ async function main(): Promise<void> {
   }
   const fbId = await fbResolver.toObject(ptr.oid);
   if (!fallbackDownloaded || !fbId) throw new Error("fallback produced no object");
-  const fbBytes = await collect(spiedFb.read(fbId));
-  const fbOk = (await sha256Hex(fbBytes)) === ptr.oid && fbBytes.length === ptr.size;
+  const fb = await createLfsPointer(spiedFb.read(fbId));
+  const fbOk = fb.oid === ptr.oid && fb.size === ptr.size;
   console.log(`    whole object moved via basic transfer, sha256 ${fbOk ? "OK" : "MISMATCH"}`);
   console.log(
     `    (no xet negotiation → 0 chunk-level putChunk calls; object stored whole via store.put)`,
