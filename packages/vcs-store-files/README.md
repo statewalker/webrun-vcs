@@ -186,8 +186,8 @@ excluded only when the FilesApi has `createExclusive`, see below). Reflog lines 
 points at an updated branch). `compareAndSwap` is a one-command batch.
 
 The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`. When the
-FilesApi has `createExclusive` (an O_CREAT|O_EXCL create: `@statewalker/webrun-files-node` from
-its next release, Web Locks in the browser, a transaction in sqlite), every lock is created with
+FilesApi has `createExclusive` (an O_CREAT|O_EXCL create: `open "wx"` in `@statewalker/webrun-files-node`
+0.11, Web Locks in the browser, a transaction in sqlite, a synchronous reservation in memory), every lock is created with
 it, and the exclusion is cross-process: other processes such as native `git`, other tabs and other
 FilesApi instances are excluded. Without it, a lock is atomic only among users of the same FilesApi
 instance: two FilesApi instances over one directory, even in one process, do not exclude each

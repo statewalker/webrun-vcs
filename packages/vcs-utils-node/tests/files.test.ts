@@ -69,13 +69,15 @@ describe("NodeFilesApi from webrun-files-node 0.11", () => {
       // the first chunk is taken while the source is still open: nothing is collected first
       while (pulled === 0) await new Promise((r) => setTimeout(r, 1));
       expect(await read(files, "f.txt")).toBe("old");
+      // ...and is already on disk, in a temporary beside the target (FilesApi.list hides
+      // those temporaries, so the directory is read directly)
+      const { readdirSync } = await import("node:fs");
+      expect(readdirSync(dir)).toHaveLength(2);
       release();
       await writing;
       expect(await read(files, "f.txt")).toBe("new-content");
       // a temporary file was renamed over the target; none is left behind
-      const names: string[] = [];
-      for await (const e of files.list("/")) names.push(e.name);
-      expect(names).toEqual(["f.txt"]);
+      expect(readdirSync(dir)).toEqual(["f.txt"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
