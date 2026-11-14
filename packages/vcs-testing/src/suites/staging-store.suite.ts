@@ -29,7 +29,14 @@ export type StagingStoreFactory = () => Promise<StagingStoreTestContext>;
  * Helper function to generate a fake object ID (for testing)
  */
 function fakeObjectId(seed: string): string {
-  return seed.padEnd(40, "0").slice(0, 40);
+  // a valid (40 lowercase hex) id that differs per seed: five salted FNV-1a hashes
+  let out = "";
+  for (let salt = 0; salt < 5; salt++) {
+    let h = 0x811c9dc5 ^ salt;
+    for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 0x01000193);
+    out += (h >>> 0).toString(16).padStart(8, "0");
+  }
+  return out;
 }
 
 /**

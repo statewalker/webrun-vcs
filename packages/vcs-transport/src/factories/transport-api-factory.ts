@@ -10,12 +10,14 @@
 import type { Duplex } from "../api/duplex.js";
 import type { PktLineResult, SidebandResult, TransportApi } from "../api/transport-api.js";
 import type { ProtocolState } from "../context/protocol-state.js";
+import { ChunkQueue } from "../protocol/chunk-queue.js";
+import { MIN_PACKET_LENGTH, PKT_DELIM, PKT_END, PKT_FLUSH } from "../protocol/constants.js";
+import { PacketLineError } from "../protocol/errors.js";
 import {
   encodeDelim,
   encodeFlush,
   encodePacket,
   encodePacketLine,
-  parsePacket,
 } from "../protocol/pkt-line-codec.js";
 import {
   encodeSidebandPacket,
@@ -30,9 +32,12 @@ const textDecoder = new TextDecoder();
 
 /**
  * Internal pkt-line reader with buffering support.
+ *
+ * Received bytes wait in a chunk queue and are copied once, when a packet is
+ * taken, so a packet arriving in many small chunks is read in linear time.
  */
 class PktLineReader {
-  private buffer: Uint8Array = new Uint8Array(0);
+  private queue = new ChunkQueue();
   private iterator: AsyncIterator<Uint8Array>;
   private done = false;
 
@@ -45,62 +50,48 @@ class PktLineReader {
    */
   async read(): Promise<PktLineResult> {
     while (true) {
-      // Try to parse a packet from buffer
-      const result = parsePacket(this.buffer);
-      if (result !== null) {
-        this.buffer = result.remaining;
-        const packet = result.packet;
-
-        if (packet.type === "flush") {
-          return { type: "flush" };
-        }
-        if (packet.type === "delim") {
-          return { type: "delim" };
-        }
-        if (packet.type === "data") {
-          const payload = packet.data ?? new Uint8Array(0);
-          let text = textDecoder.decode(payload);
-          // Strip trailing newline
-          if (text.endsWith("\n")) {
-            text = text.slice(0, -1);
-          }
-          return { type: "data", payload, text };
-        }
-      }
-
-      // Need more data
-      if (this.done) {
-        return { type: "eof" };
-      }
-
+      const packet = this.parse();
+      if (packet) return packet;
+      if (this.done) return { type: "eof" };
       const { value, done } = await this.iterator.next();
-      if (done) {
-        this.done = true;
-        // Check if there's remaining data in buffer
-        if (this.buffer.length > 0) {
-          const result = parsePacket(this.buffer);
-          if (result !== null) {
-            this.buffer = result.remaining;
-            const packet = result.packet;
-            if (packet.type === "flush") return { type: "flush" };
-            if (packet.type === "delim") return { type: "delim" };
-            if (packet.type === "data") {
-              const payload = packet.data ?? new Uint8Array(0);
-              let text = textDecoder.decode(payload);
-              if (text.endsWith("\n")) text = text.slice(0, -1);
-              return { type: "data", payload, text };
-            }
-          }
-        }
-        return { type: "eof" };
-      }
-
-      // Append to buffer
-      const newBuffer = new Uint8Array(this.buffer.length + value.length);
-      newBuffer.set(this.buffer);
-      newBuffer.set(value, this.buffer.length);
-      this.buffer = newBuffer;
+      if (done) this.done = true;
+      else this.queue.push(value);
     }
+  }
+
+  /** The next complete packet in the queue, or null when more bytes are needed. */
+  private parse(): PktLineResult | null {
+    const queue = this.queue;
+    if (queue.length < 4) return null;
+    const header = queue.peekHeader();
+    if (header === PKT_FLUSH) {
+      queue.take(4);
+      return { type: "flush" };
+    }
+    if (header === PKT_DELIM) {
+      queue.take(4);
+      return { type: "delim" };
+    }
+    if (header === PKT_END) {
+      // Only stateless protocol-v2 exchanges (over HTTP) end a response with 0002;
+      // none of the exchanges driven through TransportApi does.
+      queue.take(4);
+      throw new PacketLineError(
+        "Unexpected response-end packet (0002): not part of this exchange",
+        header,
+      );
+    }
+    const length = /^[0-9a-fA-F]{4}$/.test(header) ? Number.parseInt(header, 16) : Number.NaN;
+    if (Number.isNaN(length) || length < MIN_PACKET_LENGTH) {
+      throw new PacketLineError(`Invalid packet line header: ${header}`, header);
+    }
+    if (queue.length < length) return null;
+    queue.take(4);
+    const payload = queue.take(length - 4);
+    let text = textDecoder.decode(payload);
+    // Strip trailing newline
+    if (text.endsWith("\n")) text = text.slice(0, -1);
+    return { type: "data", payload, text };
   }
 
   /**
@@ -108,9 +99,7 @@ class PktLineReader {
    * Used when switching from pkt-line mode to raw binary mode.
    */
   drainBuffer(): Uint8Array {
-    const buf = this.buffer;
-    this.buffer = new Uint8Array(0);
-    return buf;
+    return this.queue.drain();
   }
 
   /**
@@ -139,13 +128,8 @@ class PktLineReader {
     return {
       stream: raw(),
       restore: (leftover: Uint8Array) => {
-        if (leftover.length > 0) {
-          // Prepend leftover before any existing buffer content
-          const merged = new Uint8Array(leftover.length + this.buffer.length);
-          merged.set(leftover);
-          merged.set(this.buffer, leftover.length);
-          this.buffer = merged;
-        }
+        // Prepend leftover before any existing buffer content
+        this.queue.unshift(leftover);
       },
     };
   }

@@ -19,6 +19,13 @@ export const DEFAULT_BIG_FILE_THRESHOLD = 50 * 2 ** 20;
 export interface ProbeBlobOptions {
   /** Blobs larger than this are binary and are not read at all. Default 50 MiB. */
   bigFileThreshold?: number;
+  /**
+   * Keep reading a text blob to its end and return it as `content`, so a caller
+   * that needs text (diff, merge) reads it once: one stream, one delta
+   * resolution for a packed blob. A binary blob is still read only up to the
+   * first 8000 bytes. Default false: read only that prefix.
+   */
+  loadText?: boolean;
 }
 
 /** What `probeBlob` found. */
@@ -29,6 +36,8 @@ export interface BlobProbe {
   binary: boolean;
   /** Over the threshold (and so binary, and never read). */
   big: boolean;
+  /** The whole blob, with `loadText` and only for text. */
+  content?: Uint8Array;
 }
 
 /**
@@ -39,6 +48,10 @@ export interface BlobProbe {
  * const probe = await probeBlob(history.blobs, id);
  * if (probe.binary) console.log("Binary files differ");
  * else diffText(await collect(await history.blobs.load(id))); // text under the threshold
+ *
+ * // or read text once:
+ * const { binary, content } = await probeBlob(history.blobs, id, { loadText: true });
+ * if (!binary) diffText(content);
  * ```
  *
  * @throws Error when the blob is missing
@@ -52,9 +65,48 @@ export async function probeBlob(
   const size = await blobs.size(id);
   if (size < 0) throw new Error(`Blob not found: ${id}`);
   if (size > threshold) return { size, binary: true, big: true };
-  if (size === 0) return { size, binary: false, big: false };
+  if (size === 0) {
+    return options.loadText
+      ? { size, binary: false, big: false, content: new Uint8Array(0) }
+      : { size, binary: false, big: false };
+  }
   const content = await blobs.load(id);
   if (!content) throw new Error(`Blob not found: ${id}`);
-  const head = await readPrefix(content, RawText.BINARY_PROBE_LENGTH);
-  return { size, binary: RawText.isBinary(head), big: false };
+  if (!options.loadText) {
+    const head = await readPrefix(content, RawText.BINARY_PROBE_LENGTH);
+    return { size, binary: RawText.isBinary(head), big: false };
+  }
+  return readTextOnce(content, size);
+}
+
+/**
+ * Read to the end, unless the first 8000 bytes show the blob is binary. Those
+ * bytes are buffered on their own, so the full `size` is allocated only for text.
+ */
+async function readTextOnce(content: AsyncIterable<Uint8Array>, size: number): Promise<BlobProbe> {
+  const probeLength = Math.min(RawText.BINARY_PROBE_LENGTH, size);
+  const head = new Uint8Array(probeLength);
+  let out: Uint8Array | undefined;
+  let at = 0;
+  for await (const chunk of content) {
+    if (at + chunk.length > size) throw new Error(`Blob longer than its size ${size}`);
+    if (out) {
+      out.set(chunk, at);
+      at += chunk.length;
+      continue;
+    }
+    const taken = Math.min(chunk.length, probeLength - at);
+    head.set(chunk.subarray(0, taken), at);
+    at += taken;
+    if (at < probeLength) continue;
+    if (RawText.isBinary(head)) return { size, binary: true, big: false };
+    out = new Uint8Array(size);
+    out.set(head, 0);
+    out.set(chunk.subarray(taken), at);
+    at += chunk.length - taken;
+  }
+  if (at !== size || !out) {
+    throw new Error(`Blob shorter than its size ${size}: ${at} bytes`);
+  }
+  return { size, binary: false, big: false, content: out };
 }

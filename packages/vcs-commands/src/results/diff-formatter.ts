@@ -4,12 +4,7 @@
  * Based on JGit's DiffFormatter class.
  */
 
-import {
-  type Blobs,
-  DEFAULT_BIG_FILE_THRESHOLD,
-  type ObjectId,
-  probeBlob,
-} from "@statewalker/vcs-core";
+import { type Blobs, DEFAULT_BIG_FILE_THRESHOLD, probeBlob } from "@statewalker/vcs-core";
 import {
   DEFAULT_ALGORITHM,
   type DiffAlgorithm,
@@ -125,22 +120,23 @@ export class DiffFormatter {
    *
    * Each side is probed first (its size, and a NUL byte in its first 8000
    * bytes, as git checks). A side over `bigFileThreshold` or binary makes the
-   * entry binary, and then neither side is loaded. Text sides are loaded whole,
-   * as the diff algorithms need them.
+   * entry binary, and then the other side is not loaded. Text sides are loaded
+   * whole, as the diff algorithms need them, by the same single read as the probe.
    *
    * @param entry The diff entry to format
    * @returns Content diff with hunks
    */
   async format(entry: DiffEntry): Promise<FileContentDiff> {
-    const options = { bigFileThreshold: this.bigFileThreshold };
+    // The probe of a text side reads it whole, once; a binary side only to 8000 bytes
+    const options = { bigFileThreshold: this.bigFileThreshold, loadText: true };
     const oldProbe = entry.oldId ? await probeBlob(this.blobs, entry.oldId, options) : null;
     const newProbe =
       !oldProbe?.binary && entry.newId ? await probeBlob(this.blobs, entry.newId, options) : null;
     const isBinary = (oldProbe?.binary ?? false) || (newProbe?.binary ?? false);
 
     // Text only: binary and big files are never loaded
-    const oldContent = !isBinary && entry.oldId ? await this.loadContent(entry.oldId) : null;
-    const newContent = !isBinary && entry.newId ? await this.loadContent(entry.newId) : null;
+    const oldContent = !isBinary ? (oldProbe?.content ?? null) : null;
+    const newContent = !isBinary ? (newProbe?.content ?? null) : null;
 
     // Build headers
     const result: FileContentDiff = {
@@ -240,31 +236,6 @@ export class DiffFormatter {
     }
 
     return parts.join("\n");
-  }
-
-  /**
-   * Load blob content from storage.
-   */
-  private async loadContent(objectId: ObjectId): Promise<Uint8Array> {
-    const content = await this.blobs.load(objectId);
-    if (!content) {
-      throw new Error(`Blob not found: ${objectId}`);
-    }
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of content) {
-      chunks.push(chunk);
-    }
-
-    // Combine chunks
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    return result;
   }
 
   /**

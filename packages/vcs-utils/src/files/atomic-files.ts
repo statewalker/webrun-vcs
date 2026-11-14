@@ -20,8 +20,10 @@ export interface AtomicFiles {
   /** File paths (not directories) below `dir`, recursively, sorted. */
   list(dir: string): AsyncIterable<string>;
   /**
-   * Create `path` with `content` only if nothing exists there (O_CREAT|O_EXCL),
-   * creating directories. `false` if it already exists. Throws an error with
+   * Create `path` with `content` only if nothing exists there, creating
+   * directories. Not a real O_CREAT|O_EXCL: a check then a write, exclusive
+   * only among adapters over one FilesApi (see `atomicFilesOver`);
+   * `false` if it already exists. Throws an error with
    * `code` "ENOTDIR" (or "EEXIST") when a parent is a file, so `refs/x/y.lock`
    * cannot be created while `refs/x` is a ref.
    */

@@ -202,6 +202,15 @@ import { probeBlob } from "@statewalker/vcs-core";
 const { size, binary, big } = await probeBlob(history.blobs, id);
 ```
 
+With `loadText: true`, the probe keeps reading a text blob to its end and returns it as `content`, so a caller that needs the text reads it once (one stream, and for a packed delta one delta resolution); a binary blob is still read only to its first 8000 bytes, and those are buffered on their own, so the full size is allocated only once the blob is known to be text. `DiffFormatter` and `MergeCommand` use it.
+
+```typescript
+const { binary, content } = await probeBlob(history.blobs, id, { loadText: true });
+if (!binary) diffText(content); // the whole blob
+```
+
+Tree entries are encoded from their ids with `objectIdToBytes(id)`, which accepts exactly 40 lowercase hex characters and throws `InvalidObjectIdError` for anything else (a short id, a non-hex character, uppercase). Before, a malformed id was silently written as zero bytes.
+
 ### Receiving a pack
 
 ```typescript

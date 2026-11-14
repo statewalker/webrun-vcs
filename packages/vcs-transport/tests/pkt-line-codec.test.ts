@@ -19,6 +19,7 @@ import {
   isDelimiter,
   isEnd,
   PKT_DELIM,
+  PKT_END,
   PKT_FLUSH,
   packetDataToString,
   packetDataToStringRaw,
@@ -26,6 +27,8 @@ import {
   pktLineReader,
   pktLineWriter,
 } from "../src/protocol/pkt-line-codec.js";
+import { parseReportStatus } from "../src/protocol/report-status.js";
+import { demuxSideband } from "../src/protocol/sideband.js";
 import type { Packet } from "../src/protocol/types.js";
 
 // Helper to create async iterable from string
@@ -101,10 +104,10 @@ describe("PacketLineIn (Reader)", () => {
       );
     });
 
-    it("should reject length 0002", async () => {
-      await expect(collectPackets(pktLineReader(stringToStream("0002")))).rejects.toThrow(
-        "Invalid packet line header: 0002",
-      );
+    it("should read 0002 as a protocol-v2 response-end packet", async () => {
+      const packets = await collectPackets(pktLineReader(stringToStream("0006a\n00000002")));
+      expect(packets.map((p) => p.type)).toEqual(["data", "flush", "response-end"]);
+      expect(packetDataToString(packets[2])).toBe(PKT_END);
     });
 
     it("should reject length 0003", async () => {
@@ -475,5 +478,49 @@ describe("pktLineReader: many small packets in odd-sized chunks", () => {
     await expect(
       collectPackets(pktLineReader(from(oddChunks(data.subarray(0, data.length - 2), [3])))),
     ).rejects.toThrow(PacketLineError);
+  });
+});
+
+describe("response-end packet (0002, protocol v2)", () => {
+  const enc = new TextEncoder();
+
+  it("parsePacket returns it as a typed packet", () => {
+    const result = parsePacket(enc.encode("0002rest"));
+    expect(result?.packet).toEqual({ type: "response-end" });
+    expect(new TextDecoder().decode(result?.remaining)).toBe("rest");
+  });
+
+  it("pktLineWriter writes it back as 0002", async () => {
+    const result = await collectBytes(
+      pktLineWriter(
+        (async function* () {
+          yield { type: "response-end" } as Packet;
+        })(),
+      ),
+    );
+    expect(result).toBe("0002");
+  });
+
+  it("ends a sideband stream, as flush does", async () => {
+    async function* packets(): AsyncGenerator<Packet> {
+      yield { type: "data", data: new Uint8Array([1, 0x41]) };
+      yield { type: "response-end" };
+      yield { type: "data", data: new Uint8Array([1, 0x42]) };
+    }
+    const messages = [];
+    for await (const m of demuxSideband(packets())) messages.push(m);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.data[0]).toBe(0x41);
+  });
+
+  it("ends a report-status, as flush does", async () => {
+    async function* packets(): AsyncGenerator<Packet> {
+      yield dataPacket("unpack ok\n");
+      yield dataPacket("ok refs/heads/main\n");
+      yield { type: "response-end" };
+      yield dataPacket("ng refs/heads/other failed\n");
+    }
+    const status = await parseReportStatus(packets());
+    expect(status.refUpdates.map((u) => u.refName)).toEqual(["refs/heads/main"]);
   });
 });

@@ -12,10 +12,11 @@
  * - sha1 is 20 raw bytes
  */
 
-import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
+import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { collect, concat, encodeString, toArray } from "@statewalker/vcs-utils/streams";
 import { FileMode } from "../../common/files/index.js";
 import { GitFormat } from "../../common/id/object-id.js";
+import { objectIdToBytes } from "../objects/index.js";
 import type { TreeEntry } from "./tree-entry.js";
 
 const SPACE = 0x20;
@@ -134,11 +135,7 @@ export async function* encodeTreeEntries(
   for (const entry of sorted) {
     const mode = encodeMode(entry.mode);
     const name = encoder.encode(entry.name);
-    const id = hexToBytes(entry.id);
-
-    if (id.length !== OBJECT_ID_LENGTH) {
-      throw new Error(`Invalid object ID length: ${entry.id}`);
-    }
+    const id = objectIdToBytes(entry.id);
 
     // Build entry: mode SP name NUL sha1
     const entryBytes = new Uint8Array(mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH);
@@ -302,11 +299,7 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
   for (const entry of sorted) {
     const mode = encodeMode(entry.mode);
     const name = encoder.encode(entry.name);
-    const id = hexToBytes(entry.id);
-
-    if (id.length !== OBJECT_ID_LENGTH) {
-      throw new Error(`Invalid object ID length: ${entry.id}`);
-    }
+    const id = objectIdToBytes(entry.id);
 
     encodedEntries.push({ mode, name, id });
     totalSize += mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH;

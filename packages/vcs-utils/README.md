@@ -29,7 +29,7 @@ No peer dependencies. Hashing uses `@noble/hashes`.
 | `@statewalker/vcs-utils/hash/fossil-checksum` | `FossilChecksum` |
 | `@statewalker/vcs-utils/hash/rolling-checksum` | `RollingChecksum`, `JgitRollingHash` and related helpers |
 | `@statewalker/vcs-utils/hash/strong-checksum` | `StrongChecksum` |
-| `@statewalker/vcs-utils/hash/utils` | `bytesToHex`, `hexToBytes` |
+| `@statewalker/vcs-utils/hash/utils` | `bytesToHex`, `hexToBytes` (throws on odd length or a non-hex character) |
 | `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `DeltaError`, `createGitDeltaIndex`, `encodeGitDelta`, `parseGitDelta`, ...), text diff (`RawText`, `RawTextComparator`, `MyersDiff`, `HistogramDiff`, `getAlgorithm`, `MergeAlgorithm`, `merge3Way`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
 | `@statewalker/vcs-utils/encoding` | Git varints: `readVarint`, `writeVarint`, `readOfsVarint`, `writeOfsVarint`, `readPackHeader`, `writePackHeader` |
 | `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader` (with a required `maxLength`), `readPrefix`, `BufferedByteReader`, streaming request bodies (`requestBody`, `fetchWithRequestBody`, `shouldStreamRequestBody`, `toReadableStream`, ...), port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
