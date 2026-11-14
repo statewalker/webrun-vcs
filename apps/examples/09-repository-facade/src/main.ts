@@ -243,7 +243,7 @@ await clientHistory.close();
 console.log("\nExample completed successfully!");
 
 // ============================================================
-//  Helper: RefStore adapter (inline for clarity)
+//  Helpers
 // ============================================================
 
 /**
