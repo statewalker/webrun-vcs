@@ -1311,9 +1311,6 @@ importers:
         specifier: 'catalog:'
         version: 0.10.3
     devDependencies:
-      '@statewalker/vcs-testing':
-        specifier: workspace:^
-        version: link:../vcs-testing
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4
