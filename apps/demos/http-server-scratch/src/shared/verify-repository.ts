@@ -37,7 +37,11 @@ export async function openRepositoryForVerification(
   return { history, objects, close: () => history.close() };
 }
 
-/** Result of an integrity check (the library's counterpart of `git fsck --full`). */
+/**
+ * Result of an integrity check over the objects reachable from the refs (like
+ * `git fsck --full --connectivity-only` plus re-hashing; unreachable objects are
+ * not visited).
+ */
 export interface IntegrityReport {
   /** Number of reachable objects read and re-hashed */
   checked: number;
@@ -71,34 +75,37 @@ export async function checkIntegrity(repo: VerifiedRepository): Promise<Integrit
     if (!id || visited.has(id)) continue;
     visited.add(id);
 
-    const obj = await objects.get(id, { verify: true });
-    if (!obj) {
-      report.missing.push(id);
-      continue;
-    }
     try {
-      // Reading to the end re-hashes the content and throws on a mismatch.
+      // A broken zlib stream or header throws in get(); reading to the end
+      // re-hashes the content and throws on a mismatch.
+      const obj = await objects.get(id, { verify: true });
+      if (!obj) {
+        report.missing.push(id);
+        continue;
+      }
       await collect(obj.content);
+      // Parse links before counting, so a malformed commit or tree is reported too.
+      const links: string[] = [];
+      if (obj.type === "commit") {
+        const commit = await history.commits.load(id);
+        if (!commit) throw new Error("commit does not parse");
+        links.push(commit.tree, ...commit.parents);
+      } else if (obj.type === "tree") {
+        const tree = await history.trees.load(id);
+        if (!tree) throw new Error("tree does not parse");
+        for await (const entry of tree) {
+          if (entry.mode !== GITLINK) links.push(entry.id);
+        }
+      } else if (obj.type === "tag") {
+        const tag = await history.tags.load(id);
+        if (!tag) throw new Error("tag does not parse");
+        links.push(tag.object);
+      }
+      report.checked++;
+      report.byType[obj.type] = (report.byType[obj.type] ?? 0) + 1;
+      queue.push(...links);
     } catch (error) {
       report.corrupt.push({ id, error: error instanceof Error ? error.message : String(error) });
-      continue;
-    }
-    report.checked++;
-    report.byType[obj.type] = (report.byType[obj.type] ?? 0) + 1;
-
-    if (obj.type === "commit") {
-      const commit = await history.commits.load(id);
-      if (commit) queue.push(commit.tree, ...commit.parents);
-    } else if (obj.type === "tree") {
-      const tree = await history.trees.load(id);
-      if (tree) {
-        for await (const entry of tree) {
-          if (entry.mode !== GITLINK) queue.push(entry.id);
-        }
-      }
-    } else if (obj.type === "tag") {
-      const tag = await history.tags.load(id);
-      if (tag) queue.push(tag.object);
     }
   }
 

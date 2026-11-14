@@ -135,10 +135,10 @@ await packWriter.addObject(objectId, ObjectType.BLOB, content);
 
 const result = await packWriter.finalize();
 const packName = `pack-${bytesToHex(result.packChecksum)}`;
-await fs.writeFile(`${packName}.pack`, result.packData);
+await files.write(joinPath(PACK_DIR, `${packName}.pack`), [result.packData]);
 
 const indexData = await writePackIndexV2(result.indexEntries, result.packChecksum);
-await fs.writeFile(`${packName}.idx`, indexData);
+await files.write(joinPath(PACK_DIR, `${packName}.idx`), [indexData]);
 ```
 
 The objects are added whole; this pack contains no deltas.
@@ -161,7 +161,7 @@ import { countLooseObjects, listPackFiles } from "../shared/index.js";
 const { count: looseBefore, objects: looseObjectIds } = await countLooseObjects();
 
 for (const objectId of looseObjectIds) {
-  await fs.unlink(path.join(OBJECTS_DIR, objectId.substring(0, 2), objectId.substring(2)));
+  await files.remove(looseObjectPath(objectId)); // .git/objects/ab/cdef…
 }
 
 const { count: looseAfter } = await countLooseObjects(); // 0

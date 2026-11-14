@@ -11,7 +11,7 @@ import {
 } from "@statewalker/vcs-core";
 import { createGitFilesBackend, FileStagingStore } from "@statewalker/vcs-store-files";
 import { clone as transportClone } from "@statewalker/vcs-transport";
-import { basename, dirname, joinPath } from "@statewalker/vcs-utils/files";
+import { joinPath } from "@statewalker/vcs-utils/files";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { createDirFilesApi, dim, fatal, info, resolvePath, success } from "../shared.js";
@@ -262,7 +262,11 @@ export async function runClone(args: string[]): Promise<void> {
   } catch (err) {
     // Clean up on failure
     try {
-      await createDirFilesApi(dirname(absDir)).remove(basename(absDir));
+      // Empty it through its own FilesApi (one rooted at "/" rejects every path).
+      const dirFiles = createDirFilesApi(absDir);
+      const names: string[] = [];
+      for await (const entry of dirFiles.list("/")) names.push(entry.name);
+      for (const name of names) await dirFiles.remove(name);
     } catch {
       // Ignore cleanup errors
     }

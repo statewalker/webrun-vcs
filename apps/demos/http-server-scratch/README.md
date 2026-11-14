@@ -55,7 +55,7 @@ The `@statewalker/vcs-*` workspace packages resolve to their built `dist/`, so b
    1. Create `repos/remote.git` and store a blob, tree and commit with `history.blobs/trees/commits.store()`.
    2. Start the server on the port.
    3. `clone()` from `http://localhost:<port>/remote.git`, import the pack as loose objects with `DefaultSerializationApi.importPack()`, set refs, write the files.
-   4. Open the clone with `createGitFilesBackend()` and verify it through the library: walk and re-hash every reachable object (the counterpart of `git fsck --full`), compare the working tree with the HEAD tree (`git status`), print the latest commit (`git log -1`).
+   4. Open the clone with `createGitFilesBackend()` and verify it through the library: walk and re-hash every object reachable from the refs (like `git fsck --full`, but unreachable objects are not visited), compare the working tree with the HEAD tree (`git status`), print the latest commit (`git log -1`).
    5. Write `DEMO.md` as a new blob and tree.
    6. Commit it on `feature-branch`.
    7. `push()` `refs/heads/feature-branch` back to the server.
@@ -146,7 +146,7 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 - **Loose objects only.** `createFileHistory()` stores every object through `createGitObjects(filesStagingStore(...))` in `.git/objects/xx/...`, which native git reads directly. That store does not read packfiles, so the round trip explodes the received pack into loose objects with `importPack()` instead of writing a `.pack`/`.idx` pair.
 - **The transport package owns the protocol.** The server is a thin Hono route around `createFetchHandler()`; ref advertisement, upload-pack and receive-pack all come from `@statewalker/vcs-transport`. The app's only adapters are the repository facade and a ref store over `history.refs`.
 - **`FileHistory` is the History instance itself with `objects` attached,** not a spread copy. `History` methods live on the prototype, and a spread would drop them; upload-pack would then fail with `history.collectReachableObjects is not a function`.
-- **No native git, not even for verification.** Steps 4 and 8 reopen the repositories with the library's git-compatible file backend (`src/shared/verify-repository.ts`) and read refs, commits, trees and objects back, re-hashing each object with `objects.get(id, { verify: true })`. The app uses only portable APIs (FilesApi, Fetch API, Web Crypto); `@hono/node-server` is the only Node-specific piece, and it just serves the portable `fetch` handler. The repositories stay valid Git, so `git fsck` in `repos/` still passes if you want to check by hand.
+- **No native git, not even for verification.** Steps 4 and 8 reopen the repositories with the library's git-compatible file backend (`src/shared/verify-repository.ts`) and read refs, commits, trees and objects back, re-hashing each object with `objects.get(id, { verify: true })`. The repository code uses only portable APIs (FilesApi, Fetch API, Web Crypto). The Node-specific pieces are the entry points: `@hono/node-server` serves the portable `fetch` handler, `createNodeFilesApi` (`@statewalker/vcs-utils-node`) provides the Node FilesApi, and `process` gives the command line and working directory. The repositories stay valid Git, so `git fsck` in `repos/` still passes if you want to check by hand.
 
 ## What will surprise you
 
@@ -182,6 +182,7 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 | `BASE_DIR` | `<cwd>/repos` |
 | `REMOTE_REPO_DIR` | `<cwd>/repos/remote.git` |
 | `LOCAL_REPO_DIR` | `<cwd>/repos/local` |
+| `BASE_PATH`, `REMOTE_REPO_PATH`, `LOCAL_REPO_PATH` | the same, relative to a FilesApi rooted at `<cwd>` |
 | `TEST_BRANCH` | `feature-branch` |
 | `DEFAULT_BRANCH` | `main` |
 

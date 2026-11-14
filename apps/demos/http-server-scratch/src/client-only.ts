@@ -15,8 +15,6 @@
  */
 
 import {
-  basename,
-  dirname,
   FileMode,
   type FilesApi,
   indexPack,
@@ -41,7 +39,6 @@ import {
   printSection,
   printStep,
   printSuccess,
-  removeDirectory,
   resolvePath,
   shortId,
 } from "./shared/index.js";
@@ -138,8 +135,7 @@ async function cloneRepository(
   printInfo(`Destination: ${localDir}`);
 
   // Clean up and create directory
-  const parentFiles = createNodeFilesApi({ rootDir: dirname(localDir) });
-  await removeDirectory(parentFiles, basename(localDir));
+  await emptyDirectory(localDir);
   await ensureDirectory(files, ".git");
 
   // Perform clone
@@ -443,3 +439,14 @@ async function collectObjectsForPush(
 
 // Run main
 main();
+
+/**
+ * Remove everything in `dir` (a FilesApi rooted at "/" rejects every path, so
+ * the directory's own FilesApi removes its entries instead of its parent's).
+ */
+async function emptyDirectory(dir: string): Promise<void> {
+  const files = createNodeFilesApi({ rootDir: dir });
+  const names: string[] = [];
+  for await (const entry of files.list("/")) names.push(entry.name);
+  for (const name of names) await files.remove(name);
+}
