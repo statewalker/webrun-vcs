@@ -15,6 +15,7 @@ import {
   decodeCommitEntries,
   encodeCommitEntries,
   entriesToCommit,
+  parseCommitFromBytes,
 } from "../history/commits/commit-format.js";
 import type { Commits } from "../history/commits/commits.js";
 import type { History } from "../history/history.js";
@@ -25,6 +26,7 @@ import {
   decodeTagEntries,
   encodeTagEntries,
   entriesToTag,
+  parseTagFromBytes,
   tagToEntries,
 } from "../history/tags/tag-format.js";
 import type { Tags } from "../history/tags/tags.js";
@@ -32,6 +34,7 @@ import {
   collectTreeBytes,
   decodeTreeEntries,
   encodeTreeEntries,
+  parseTreeFromBytes,
 } from "../history/trees/tree-format.js";
 import type { Trees } from "../history/trees/trees.js";
 import {
@@ -119,6 +122,7 @@ export class DefaultSerializationApi implements SerializationApi {
           (await this._blobs.has(id)),
         exportObject: (id) => this.exportObject(id),
         importObject: (type, content) => this.importObject(type, content),
+        reencode: (type, data) => reencode(type, data),
       });
     this.packs = config.packs ?? config.history.packs;
     this.unpackLimit = config.unpackLimit;
@@ -294,6 +298,20 @@ export class DefaultSerializationApi implements SerializationApi {
   ): Promise<ObjectId> {
     const tag = await entriesToTag(decodeTagEntries(content));
     return this._tags.store(tag);
+  }
+}
+
+/** The content typed stores keep for `data`: parsed, then encoded again (blobs as they are). */
+async function reencode(type: ObjectTypeString, data: Uint8Array): Promise<Uint8Array> {
+  switch (type) {
+    case "blob":
+      return data;
+    case "tree":
+      return collectTreeBytes(await parseTreeFromBytes(data));
+    case "commit":
+      return collectCommitBytes(await parseCommitFromBytes(data));
+    case "tag":
+      return collectTagBytes(await parseTagFromBytes(data));
   }
 }
 

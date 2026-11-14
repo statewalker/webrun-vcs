@@ -5,7 +5,8 @@
  *     entry is inflated as it arrives (stopping past its declared size) and every byte feeds the
  *     pack's SHA-1, checked against the trailer at the end;
  *   - whole objects are written as loose objects (`putRaw`, byte for byte as git frames them);
- *     those over `bigObjectThreshold` stream straight into the store (`put`, git's stream_blob);
+ *     those over `bigObjectThreshold` stream straight into the store (`put`, git's stream_blob),
+ *     hashed on the way, and the id `put` returns must be that hash (`ObjectIdMismatchError`);
  *   - deltas are resolved as they arrive: an OFS_DELTA base is always earlier in the pack, so it
  *     is already written; a REF_DELTA base is an earlier entry, an object the store has (a thin
  *     pack) or a later entry, in which case the delta waits for it (git's delta_list);
@@ -21,7 +22,7 @@ import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
 import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
-import type { GitObjects } from "../history/objects/git-objects.js";
+import { type GitObjects, ObjectIdMismatchError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { PackError } from "./index-pack.js";
 import { DeltaBaseCache, type ResolvedObject } from "./pack-file.js";
@@ -52,9 +53,13 @@ export interface UnpackObjectsOptions {
 export interface UnpackResult {
   /** objects in the pack */
   count: number;
-  /** objects written by this call */
+  /**
+   * objects handed to the store by this call. Objects over `bigObjectThreshold` always count
+   * here: they are streamed to `put` before their id is known, so whether the store already had
+   * them is not checked (the store keeps an existing object).
+   */
   written: number;
-  /** objects the store already had (byte-identical) */
+  /** objects the store already had, compared byte for byte (objects up to `bigObjectThreshold`) */
   existing: number;
   /** entries stored in the pack as deltas */
   deltas: number;
@@ -180,7 +185,10 @@ class StreamReader {
 
 const pool = createInflaterPool();
 
-/** Per-entry state in typed arrays (29 bytes an entry), grown as entries are parsed. */
+/**
+ * Per-entry state in typed arrays, 29 bytes an entry, grown by doubling as entries are parsed (so
+ * up to about 58 bytes an entry are allocated just after a doubling).
+ */
 class Entries {
   n = 0;
   offset = new Float64Array(256);
@@ -233,9 +241,14 @@ interface Waiting {
  * trailer) is refused with `PackError`; an object whose id the store holds with other bytes with
  * `ObjectCollisionError`.
  *
- * Memory: the per-entry table (29 bytes an entry), the base cache (`baseCacheBytes`), the entry
- * being resolved (a whole object up to `bigObjectThreshold`, or a delta with its base and result)
- * and REF_DELTAs whose base comes later in the pack, which git's pack-objects never writes.
+ * Memory: the per-entry table (29 bytes an entry, up to about 58 allocated, as the arrays grow by
+ * doubling), the base cache (`baseCacheBytes`), the entry being resolved (a whole object up to
+ * `bigObjectThreshold`, or a delta with its base and result) and deltas waiting for their base:
+ * REF_DELTAs whose base comes later in the pack (which git's pack-objects never writes) and the
+ * deltas built on them. When a base arrives, every delta waiting on it is resolved from it while
+ * it is held, so sibling deltas on one base are all held together with it (as in git). A base
+ * over `bigObjectThreshold` is streamed to the store, not kept: every OFS or waiting delta
+ * against it reads it back from the store (unless it fits the base cache).
  *
  * @example
  * ```typescript
@@ -423,7 +436,20 @@ export async function unpackObjects(
       const typeName = TYPE_NAMES[kind];
       if (typeName) {
         if (size > bigObjectThreshold) {
-          const id = await objects.put(typeName, size, r.inflate(size, offset));
+          // streamed into the store, hashed on the way: the store's id must be the pack's
+          const hasher = createSha1().update(header(typeName, size));
+          const body = (async function* () {
+            for await (const c of r.inflate(size, offset)) {
+              hasher.update(c);
+              yield c;
+            }
+          })();
+          const stored = await objects.put(typeName, size, body);
+          const id = hex(hasher.digest());
+          if (stored !== id)
+            throw new ObjectIdMismatchError(
+              `entry at ${offset} is object ${id}, but the store returned ${stored}`,
+            );
           result.written++;
           record(i, id, typeName);
           await release(i, undefined);

@@ -83,3 +83,12 @@ describe("sidebandPackStream", () => {
     );
   });
 });
+
+describe("sidebandPackStream: ERR lines", () => {
+  it("an ERR pkt-line (instead of the pack) throws ServerError", async () => {
+    const body = concat([encodePacketLine("ERR upload-pack: not our ref deadbeef\n")]);
+    const err = await collect(sidebandPackStream(split(body, 3))).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ServerError);
+    expect((err as Error).message).toBe("upload-pack: not our ref deadbeef");
+  });
+});

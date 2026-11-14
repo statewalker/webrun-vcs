@@ -40,19 +40,27 @@ export function createSimpleDuplex(
 /**
  * HTTP request body adapter.
  *
- * Wraps a ReadableStream (from fetch Response) as an async iterable.
+ * Wraps a ReadableStream (from fetch Response) as an async iterable. When iteration stops before
+ * the end of the stream (the consumer throws, breaks or returns), the stream is cancelled, so a
+ * response body is not left open.
  */
 export async function* readableStreamToAsyncIterable(
   stream: ReadableStream<Uint8Array>,
 ): AsyncIterable<Uint8Array> {
   const reader = stream.getReader();
+  let ended = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        ended = true;
+        break;
+      }
       if (value) yield value;
     }
   } finally {
+    // stopped early (the consumer threw or returned): the rest of the body is not wanted
+    if (!ended) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

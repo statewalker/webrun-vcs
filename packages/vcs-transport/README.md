@@ -143,7 +143,9 @@ const cloned = await clone({ url: "https://example.com/user/repo.git", depth: 1 
 
 Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }` or `{ token }`), `headers`, `timeout` (ms), and `fetchImpl` (a `(Request) => Promise<Response>` used instead of `globalThis.fetch`). `fetch` also accepts `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage` and `onPack`. `clone` accepts `branch`, `depth`, `onProgress`, `onProgressMessage` and `onPack`.
 
-The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3. `httpFetch` and the fetch state machine import the pack this way too. The request bodies (wants and haves) are still built in memory: they are small, and a streamed request body needs `duplex: "half"`, which not every browser supports.
+`fetch` sends wants, so it fails unless a pack comes back (git sends an empty pack, 32 bytes, when every wanted object is already present): a caller never writes refs to objects it did not receive. `httpFetch` and the fetch state machine refuse a missing pack the same way. When the import (or anything after the request) fails, the response body is cancelled. `timeout` bounds each wait for the server, a response or the next chunk of a body, not the whole fetch: the time `onPack` spends storing a large pack does not count, while a server that stops sending is still cut off.
+
+The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3 and on an `ERR <message>` line. `httpFetch` and the fetch state machine import the pack this way too. The request bodies (wants and haves) are still built in memory: they are small, and a streamed request body needs `duplex: "half"`, which not every browser supports.
 
 ### HTTP: push
 

@@ -40,6 +40,12 @@ export interface FetchOptions extends BaseHttpOptions, BaseFetchOptions {
 /**
  * Fetch objects and refs from a remote repository.
  *
+ * Fails (rather than resolving) when the server answers with `ERR` or a sideband error, or sends
+ * no pack after the wants (git sends an empty pack when every wanted object is already present),
+ * so callers never write refs to objects they did not receive. On any failure the response body
+ * is cancelled. `options.timeout` bounds each wait for the server (a response, the next chunk of
+ * a body), not the whole fetch: time spent in `onPack` does not count against it.
+ *
  * @param options - Fetch options
  * @returns Fetch result with refs and pack data
  *
@@ -68,28 +74,39 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
     headers.Authorization = authorizationHeader(options.auth);
   }
 
-  // Setup timeout handling
+  // The timeout bounds each wait for the server (a response, each chunk of a body), not the
+  // whole fetch: time spent in `onPack` (storing a large pack) does not count against it.
   const controller = options.timeout ? new AbortController() : undefined;
-  const timeoutId = options.timeout
-    ? setTimeout(() => controller?.abort(), options.timeout)
-    : undefined;
+  const fromServer = async <T>(wait: () => Promise<T>): Promise<T> => {
+    if (!controller) return wait();
+    const timer = setTimeout(() => controller.abort(), options.timeout);
+    try {
+      return await wait();
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   // Normalize to a single (Request) => Promise<Response> shape; default to
   // native fetch, preserving exact behavior when fetchImpl is omitted.
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
 
+  let uploadPackResponse: Response | undefined;
+  let pack: AsyncGenerator<Uint8Array> | undefined;
   try {
     // Phase 1: GET /info/refs to get ref advertisement
     const infoRefsUrl = `${baseUrl}/info/refs?service=git-upload-pack`;
-    const infoRefsResponse = await doFetch(
-      new Request(infoRefsUrl, {
-        method: "GET",
-        headers: {
-          ...headers,
-          Accept: "application/x-git-upload-pack-advertisement",
-        },
-        signal: controller?.signal,
-      }),
+    const infoRefsResponse = await fromServer(() =>
+      doFetch(
+        new Request(infoRefsUrl, {
+          method: "GET",
+          headers: {
+            ...headers,
+            Accept: "application/x-git-upload-pack-advertisement",
+          },
+          signal: controller?.signal,
+        }),
+      ),
     );
 
     if (!infoRefsResponse.ok) {
@@ -103,12 +120,11 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
     }
 
     // Parse ref advertisement
-    const infoRefsData = new Uint8Array(await infoRefsResponse.arrayBuffer());
+    const infoRefsData = new Uint8Array(await fromServer(() => infoRefsResponse.arrayBuffer()));
     const { refs, defaultBranch, isEmpty } = parseRefAdvertisementForFetch(infoRefsData);
 
     // If repository is empty, return early
     if (isEmpty || refs.size === 0) {
-      if (timeoutId) clearTimeout(timeoutId);
       return {
         refs: new Map(),
         packData: new Uint8Array(0),
@@ -184,18 +200,21 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
 
     // Phase 3: POST /git-upload-pack to receive pack
     const uploadPackUrl = `${baseUrl}/git-upload-pack`;
-    const uploadPackResponse = await doFetch(
-      new Request(uploadPackUrl, {
-        method: "POST",
-        headers: {
-          ...headers,
-          "Content-Type": "application/x-git-upload-pack-request",
-          Accept: "application/x-git-upload-pack-result",
-        },
-        body: requestBody,
-        signal: controller?.signal,
-      }),
+    const response = await fromServer(() =>
+      doFetch(
+        new Request(uploadPackUrl, {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/x-git-upload-pack-request",
+            Accept: "application/x-git-upload-pack-result",
+          },
+          body: requestBody,
+          signal: controller?.signal,
+        }),
+      ),
     );
+    uploadPackResponse = response;
 
     if (!uploadPackResponse.ok) {
       throw new Error(
@@ -203,24 +222,37 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
       );
     }
 
-    if (!uploadPackResponse.body) {
+    const responseBody = uploadPackResponse.body;
+    if (!responseBody) {
       throw new Error("Empty response from /git-upload-pack");
     }
 
     // Demultiplex the response as it arrives: the pack flows to onPack (or is collected)
     let bytesReceived = 0;
     const body = (async function* () {
-      for await (const chunk of readableStreamToAsyncIterable(
-        uploadPackResponse.body as ReadableStream<Uint8Array>,
-      )) {
-        bytesReceived += chunk.length;
-        yield chunk;
+      const it = readableStreamToAsyncIterable(responseBody)[Symbol.asyncIterator]();
+      try {
+        while (true) {
+          const r = await fromServer(() => it.next());
+          if (r.done) return;
+          bytesReceived += r.value.length;
+          yield r.value;
+        }
+      } finally {
+        await it.return?.(); // cancels the body when stopped early
       }
     })();
     const onProgress = options.onProgressMessage;
-    const pack = sidebandPackStream(body, {
+    let packBytes = 0;
+    const demuxed = sidebandPackStream(body, {
       onProgress: onProgress && ((message) => onProgress(message.trim())),
     });
+    pack = (async function* () {
+      for await (const chunk of demuxed) {
+        packBytes += chunk.length;
+        yield chunk;
+      }
+    })();
     let packData: Uint8Array = new Uint8Array(0);
     if (options.onPack) {
       await options.onPack(pack);
@@ -230,8 +262,11 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
     } else {
       packData = await collectBytes(pack);
     }
-
-    if (timeoutId) clearTimeout(timeoutId);
+    // Wants were sent, so a pack must follow (an empty one, 32 bytes, when every wanted object
+    // is already here). Without one the caller would write refs to objects it does not have.
+    if (packBytes === 0) {
+      throw new Error("upload-pack sent no pack for the wanted objects");
+    }
 
     return {
       refs,
@@ -241,7 +276,11 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
       isEmpty: false,
     };
   } catch (error) {
-    if (timeoutId) clearTimeout(timeoutId);
+    // Release the response: stop the demultiplexer (which cancels the body it reads), or cancel
+    // a body nothing has started reading.
+    await pack?.return(undefined).catch(() => {});
+    const unread = uploadPackResponse?.body;
+    if (unread && !unread.locked) await unread.cancel().catch(() => {});
 
     if (error instanceof Error) {
       if (error.name === "AbortError") {

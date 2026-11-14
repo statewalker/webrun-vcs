@@ -465,3 +465,153 @@ describe("DefaultSerializationApi.importPack delegates to importPack", () => {
     );
   });
 });
+
+describe("typedStoreObjects: stores of parsed objects", () => {
+  it("refuses an object they would re-encode, and stores nothing", async () => {
+    const {
+      createHistoryFromStores,
+      createBlobs,
+      createTrees,
+      createCommits,
+      createTags,
+      createMemoryRefs,
+    } = await import("../../src/history/index.js");
+    const { DefaultSerializationApi } = await import("../../src/serialization/index.js");
+    const { ObjectIdMismatchError } = await import("../../src/history/objects/git-objects.js");
+    const backing = new MemoryRawStorage();
+    const kernel = createGitObjects(rawStorageStaging(backing));
+    // typed stores only: no `objects`, so received packs go through typedStoreObjects
+    const history = createHistoryFromStores({
+      blobs: createBlobs(kernel),
+      trees: createTrees(kernel),
+      commits: createCommits(kernel),
+      tags: createTags(kernel),
+      refs: createMemoryRefs(),
+    });
+    const commit = enc.encode(
+      "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\nmergetag object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n type commit\n\nmsg\n",
+    );
+    const api = new DefaultSerializationApi({ history });
+    const err = await api
+      .importPack(chunks(pack([{ kind: 1, data: commit }])))
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ObjectIdMismatchError);
+    const keys: string[] = [];
+    for await (const k of backing.keys()) keys.push(k);
+    expect(keys).toEqual([]);
+  });
+});
+
+describe("importPack: releasing the source", () => {
+  it("a corrupt pack ends the source (its finally runs), so a response body is released", async () => {
+    const bad = pack([{ kind: 3, data: A }]).slice();
+    bad[20] = (bad[20] as number) ^ 0xff; // corrupt zlib
+    let released = false;
+    const source = (async function* () {
+      try {
+        yield* chunks(bad, 8);
+        yield new Uint8Array(4); // never pulled: the importer fails before
+      } finally {
+        released = true;
+      }
+    })();
+    await expect(importPack(memObjects(), source)).rejects.toBeInstanceOf(PackError);
+    expect(released).toBe(true);
+  });
+
+  it("also when the pack is kept (installed through a pack set)", async () => {
+    const bad = pack([{ kind: 3, data: A }]).slice();
+    bad[20] = (bad[20] as number) ^ 0xff;
+    let released = false;
+    const source = (async function* () {
+      try {
+        yield* chunks(bad, 8);
+      } finally {
+        released = true;
+      }
+    })();
+    const objects = memObjects();
+    const packs = await openPackSet(createInMemoryFilesApi(), "/objects/pack", {
+      externalBase: (id) => objects.get(id),
+    });
+    await expect(importPack(objects, source, { packs, unpackLimit: 1 })).rejects.toThrow();
+    expect(released).toBe(true);
+  });
+});
+
+describe("unpackObjects: waiting deltas and big objects", () => {
+  const { d: dCD } = extend(C, "plus D\n");
+
+  it("resolves a chain of waiting REF_DELTAs whose final base comes last", async () => {
+    const objects = memObjects();
+    const ids: string[] = [];
+    const r = await unpackObjects(
+      objects,
+      chunks(
+        pack([
+          { kind: 7, baseOid: Bid, data: dBC }, // waits for B, itself a waiting delta
+          { kind: 7, baseOid: Aid, data: dAB }, // waits for A
+          { kind: 3, data: A }, // releases B, which releases C
+        ]),
+      ),
+      { onObject: (id) => ids.push(id) },
+    );
+    expect(r).toMatchObject({ count: 3, written: 3, deltas: 2 });
+    expect(ids).toEqual([Aid, Bid, Cid]);
+    expect(await content(objects, Cid)).toEqual(C);
+  });
+
+  it("refuses a cycle between waiting REF_DELTAs, storing neither", async () => {
+    // B waits on C and C waits on B: neither base ever arrives
+    const objects = memObjects();
+    const err = await refused(
+      objects,
+      pack([
+        { kind: 7, baseOid: Cid, data: dAB },
+        { kind: 7, baseOid: Bid, data: dCD },
+      ]),
+    );
+    expect(err.message).toMatch(/2 unresolved deltas/);
+    expect(await objects.has(Bid)).toBe(false);
+    expect(await objects.has(Cid)).toBe(false);
+  });
+
+  it("resolves a waiting delta against a big object streamed to put", async () => {
+    const objects = memObjects();
+    const r = await unpackObjects(
+      objects,
+      chunks(
+        pack([
+          { kind: 7, baseOid: Aid, data: dAB },
+          { kind: 6, baseIdx: 0, data: dBC },
+          { kind: 3, data: A }, // over the threshold: streamed, then read back as the base
+        ]),
+      ),
+      { bigObjectThreshold: 16, baseCacheBytes: 0 },
+    );
+    expect(r).toMatchObject({ count: 3, written: 3 });
+    expect(await content(objects, Aid)).toEqual(A);
+    expect(await content(objects, Bid)).toEqual(B);
+    expect(await content(objects, Cid)).toEqual(C);
+  });
+
+  it("refuses a big object whose id from put is not the hash of its bytes", async () => {
+    const { ObjectIdMismatchError } = await import("../../src/history/objects/git-objects.js");
+    const inner = memObjects();
+    const lying: UnpackTarget = {
+      has: (id) => inner.has(id),
+      get: (id) => inner.get(id),
+      getRaw: (id) => inner.getRaw(id),
+      putRaw: (id, raw) => inner.putRaw(id, raw),
+      async put(type, size, body) {
+        await inner.put(type, size, body);
+        return Bid; // not what was streamed
+      },
+    };
+    const err = await unpackObjects(lying, chunks(pack([{ kind: 3, data: A }])), {
+      bigObjectThreshold: 16,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ObjectIdMismatchError);
+    expect((err as Error).message).toMatch(new RegExp(Aid));
+  });
+});

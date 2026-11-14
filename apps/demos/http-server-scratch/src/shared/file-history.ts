@@ -85,7 +85,8 @@ export async function createFileHistory(options: CreateFileHistoryOptions): Prom
   const commits = createCommits(objects);
   const tags = createTags(objects);
 
-  const history = createHistoryFromStores({ blobs, trees, commits, tags, refs: refStore });
+  // `objects` lets received packs be written byte for byte through the kernel.
+  const history = createHistoryFromStores({ blobs, trees, commits, tags, refs: refStore, objects });
 
   // Initialize if creating
   if (create) {

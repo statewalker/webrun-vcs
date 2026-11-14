@@ -512,6 +512,15 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const output = getOutput(ctx);
       const repository = getRepository(ctx);
 
+      // Wants were sent, so a pack must follow (an empty one when every wanted object is here):
+      // without one, UPDATE_REFS would point refs at objects that are not there.
+      let packBytes = 0;
+      const counted = async function* (source: AsyncIterable<Uint8Array>) {
+        for await (const chunk of source) {
+          packBytes += chunk.length;
+          yield chunk;
+        }
+      };
       try {
         // Handle sideband multiplexing
         if (state.capabilities.has("side-band-64k")) {
@@ -520,7 +529,7 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           // readSideband() throws on the flush that ends the pack.
           let sidebandError: string | undefined;
           const decoder = new TextDecoder();
-          const pack = (async function* () {
+          const demuxed = (async function* () {
             while (true) {
               const pkt = await transport.readPktLine();
               if (pkt.type === "flush" || pkt.type === "eof") return;
@@ -537,6 +546,7 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               }
             }
           })();
+          const pack = counted(demuxed);
           try {
             const importResult = await repository.importPack(pack);
             for await (const _ of pack) {
@@ -550,8 +560,12 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           }
         } else {
           // Raw pack data (no sideband)
-          const importResult = await repository.importPack(transport.readPack());
+          const importResult = await repository.importPack(counted(transport.readPack()));
           output.objectCount = importResult.objectsImported;
+        }
+        if (packBytes === 0) {
+          output.error = "upload-pack sent no pack for the wanted objects";
+          return "ERROR";
         }
 
         return "PACK_RECEIVED";

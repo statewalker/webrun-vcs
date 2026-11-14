@@ -192,8 +192,15 @@ export async function httpFetch(
     // Stream the response: skip ACK/NAK, demultiplex the sideband, import the pack as it
     // arrives (never held whole). A server error (channel 3) rejects the import.
     let objectsImported = 0;
+    let packBytes = 0;
     try {
-      const pack = sidebandPackStream(readableStreamToAsyncIterable(uploadPackResponse.body));
+      const demuxed = sidebandPackStream(readableStreamToAsyncIterable(uploadPackResponse.body));
+      const pack = (async function* () {
+        for await (const chunk of demuxed) {
+          packBytes += chunk.length;
+          yield chunk;
+        }
+      })();
       const importResult = await repository.importPack(pack);
       for await (const _ of pack) {
         // the rest of the response after the pack
@@ -202,6 +209,11 @@ export async function httpFetch(
     } catch (error) {
       if (error instanceof ServerError) return { success: false, error: error.message };
       throw error;
+    }
+    // Wants were sent, so a pack must follow (an empty one when every wanted object is here):
+    // without one the refs below would point at objects that are not there.
+    if (packBytes === 0) {
+      return { success: false, error: "upload-pack sent no pack for the wanted objects" };
     }
 
     // Build updated refs map (apply refspec mapping if provided)

@@ -74,13 +74,34 @@ export async function importPack(
     seen += r.value.length;
   }
   if (seen === 0) return { count: 0, types: { commit: 0, tree: 0, blob: 0, tag: 0 } };
+  // The importer ends this stream early on a corrupt pack: pass that on to the source, so a
+  // response body behind it is released.
   const stream = (async function* () {
-    yield* head;
-    head.length = 0;
-    for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+    try {
+      yield* head;
+      head.length = 0;
+      for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+    } finally {
+      await it.return?.();
+    }
   })();
   const count = seen >= 12 ? headerCount(head) : 0;
+  try {
+    return await importStream(objects, stream, count, unpackLimit, maxObjectSize, options);
+  } catch (err) {
+    await stream.return(undefined); // also when the importer failed before reading it
+    throw err;
+  }
+}
 
+async function importStream(
+  objects: UnpackTarget,
+  stream: AsyncGenerator<Uint8Array>,
+  count: number,
+  unpackLimit: number,
+  maxObjectSize: number,
+  options: ImportPackOptions,
+): Promise<ImportPackResult> {
   if (options.packs && count >= unpackLimit) {
     const externalBase = async (id: ObjectId) => {
       const obj = await objects.get(id);

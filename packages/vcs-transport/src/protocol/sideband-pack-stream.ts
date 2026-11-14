@@ -18,7 +18,7 @@ const textDecoder = new TextDecoder();
 /**
  * Yields the pack bytes (sideband channel 1) of a response body as they arrive. Lines that are
  * not sideband packets (NAK, ACK, shallow, unshallow) and flush packets are skipped; channel 2
- * goes to `onProgress`; channel 3 throws `ServerError`. A body ending inside a packet, or with a
+ * goes to `onProgress`; channel 3 and an `ERR <message>` pkt-line throw `ServerError`. A body ending inside a packet, or with a
  * malformed length, throws.
  *
  * @example
@@ -71,6 +71,9 @@ export async function* sidebandPackStream(
         options.onProgress?.(textDecoder.decode(payload));
       } else if (channel === 3) {
         throw new ServerError(textDecoder.decode(payload).trim());
+      } else if (isErrLine(data, off - length, length)) {
+        // `ERR <message>`: the server refuses the request (protocol v0/v1, outside the sideband)
+        throw new ServerError(textDecoder.decode(data.subarray(off - length + 8, off)).trim());
       }
       // anything else is a protocol line before the pack (NAK, ACK, shallow): skipped
     }
@@ -79,6 +82,17 @@ export async function* sidebandPackStream(
     have = rest.length;
   }
   if (have) throw new Error("Incomplete packet at the end of the response");
+}
+
+/** Whether the pkt-line at `start` (of `length` bytes) is `ERR <message>`. */
+function isErrLine(data: Uint8Array, start: number, length: number): boolean {
+  return (
+    length >= 8 &&
+    data[start + 4] === 0x45 && // E
+    data[start + 5] === 0x52 && // R
+    data[start + 6] === 0x52 && // R
+    data[start + 7] === 0x20 // space
+  );
 }
 
 function join(parts: Uint8Array[], total: number): Uint8Array {

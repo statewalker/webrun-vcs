@@ -730,3 +730,30 @@ describe("RECEIVE_PACK with side-band-64k", () => {
     expect(ctx.output.error).toBe("boom");
   });
 });
+
+describe("RECEIVE_PACK without a pack", () => {
+  it("is an error, so UPDATE_REFS does not run", async () => {
+    const transport = createMockTransport();
+    transport._setPackets([{ type: "flush" }]);
+    const repository = createMockRepository();
+    (repository.importPack as ReturnType<typeof vi.fn>).mockImplementation(
+      async (pack: AsyncIterable<Uint8Array>) => {
+        for await (const _ of pack) {
+          // nothing arrives
+        }
+        return {
+          objectsImported: 0,
+          blobsWithDelta: 0,
+          treesImported: 0,
+          commitsImported: 0,
+          tagsImported: 0,
+        };
+      },
+    );
+    const ctx = createContext({ transport, repository });
+    ctx.state.capabilities.add("side-band-64k");
+    const event = await clientFetchHandlers.get("RECEIVE_PACK")?.(ctx);
+    expect(event).toBe("ERROR");
+    expect(ctx.output.error).toMatch(/no pack/);
+  });
+});

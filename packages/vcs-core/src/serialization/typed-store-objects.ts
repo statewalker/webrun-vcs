@@ -1,8 +1,11 @@
 /**
  * The object-kernel calls `importPack` needs, over typed stores that keep parsed objects (the
  * SQL native stores). Such stores re-encode what they store, so an object whose bytes they would
- * change is refused with `ObjectIdMismatchError` instead of being stored under another id.
+ * change is refused with `ObjectIdMismatchError` before anything is stored: `reencode` gives the
+ * bytes the stores would keep, and their id must be the incoming one.
  */
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError, ObjectIdMismatchError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
@@ -14,6 +17,8 @@ export interface TypedStoreAccess {
     id: ObjectId,
   ): Promise<{ type: ObjectTypeString; content: AsyncIterable<Uint8Array> }>;
   importObject(type: ObjectTypeString, content: Iterable<Uint8Array>): Promise<ObjectId>;
+  /** The content `importObject` would keep for `data` (parsed and encoded again). */
+  reencode(type: ObjectTypeString, data: Uint8Array): Promise<Uint8Array>;
 }
 
 const TYPES = new Set(["blob", "tree", "commit", "tag"]);
@@ -38,7 +43,7 @@ async function collect(chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>)
 /**
  * @example
  * ```typescript
- * const objects = typedStoreObjects({ has, exportObject, importObject });
+ * const objects = typedStoreObjects({ has, exportObject, importObject, reencode });
  * await importPack(objects, packStream);
  * ```
  */
@@ -85,7 +90,20 @@ export function typedStoreObjects(access: TypedStoreAccess): UnpackTarget {
       const m = /^([a-z]+) (\d+)$/.exec(head);
       if (!m || !TYPES.has(m[1] as string) || Number(m[2]) !== bytes.length - nul - 1)
         throw new CorruptObjectError(`bad object header "${head}"`);
-      const stored = await store(m[1] as ObjectTypeString, bytes.subarray(nul + 1));
+      const type = m[1] as ObjectTypeString;
+      const data = bytes.subarray(nul + 1);
+      const kept = await access.reencode(type, data);
+      const keptId = bytesToHex(
+        createSha1()
+          .update(enc.encode(`${type} ${kept.length}\0`))
+          .update(kept)
+          .digest(),
+      );
+      if (keptId !== id)
+        throw new ObjectIdMismatchError(
+          `object ${id} cannot be stored byte for byte by these stores (they would keep ${keptId})`,
+        );
+      const stored = await store(type, data);
       if (stored !== id)
         throw new ObjectIdMismatchError(
           `object ${id} cannot be stored byte for byte by these stores (stored as ${stored})`,
