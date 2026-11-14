@@ -142,10 +142,6 @@ export class MemoryRefs implements Refs {
   }
 
   /**
-   * Apply all commands atomically, or none (see {@link Refs.batch}). The memory
-   * store keeps no reflog, so `options` is ignored.
-   */
-  /**
    * Apply all commands atomically, or none (see {@link Refs.batch}), writing
    * reflog lines as git does (`options.ident`, `options.message`).
    */
@@ -168,12 +164,11 @@ export class MemoryRefs implements Refs {
       if (u.newValue === null) this.refs.delete(u.name);
       else this.refs.set(u.name, { type: "direct", objectId: u.newValue });
     }
-    const logs = planReflog(plan.updates, options);
-    for (const name of logs.drop) this.logs.delete(name);
-    for (const { name, line, create } of logs.append) {
-      const log = this.logs.get(name);
-      if (log) log.push(line);
-      else if (create) this.logs.set(name, [line]);
+    for (const w of planReflog(plan.updates, options)) {
+      const log = this.logs.get(w.name);
+      if (w.op === "drop") this.logs.delete(w.name);
+      else if (log) log.push(w.line);
+      else if (w.create) this.logs.set(w.name, [w.line]);
     }
     return { ok: true, rejected: [] };
   }
@@ -197,14 +192,15 @@ export class MemoryRefs implements Refs {
     });
   }
 
-  /**
-   * Initialize storage structure (no-op for in-memory)
-   */
   /** The reflog of `name` (written by `batch`), or undefined if it has none. */
   async getReflog(name: string): Promise<ReflogReader | undefined> {
     const log = this.logs.get(name);
-    return log ? createReflogReaderOf(log) : undefined;
+    return log ? createReflogReaderOf([...log]) : undefined;
   }
+
+  /**
+   * Initialize storage structure (no-op for in-memory)
+   */
 
   async initialize(): Promise<void> {
     // No initialization needed for in-memory store

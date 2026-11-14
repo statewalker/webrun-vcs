@@ -129,7 +129,12 @@ describe("T4.8: KV Backend", () => {
         }
 
         expect(keys).toEqual(["ref:root"]);
-        expect(Object.keys(await root())).toEqual(["refs/heads/main", "refs/remotes/origin/main"]);
+        expect(Object.keys(await root())).toEqual([
+          "refs/heads/main",
+          "refs/remotes/origin/main",
+          ":seq",
+        ]);
+        expect((await root())[":seq"]).toBe("2");
       });
 
       it("writes names in git's order", async () => {
@@ -137,7 +142,12 @@ describe("T4.8: KV Backend", () => {
         await refStore.set("refs/heads/b", objectId);
         await refStore.set("refs/heads/B", objectId);
         await refStore.set("refs/heads/a", objectId);
-        expect(Object.keys(await root())).toEqual(["refs/heads/B", "refs/heads/a", "refs/heads/b"]);
+        expect(Object.keys(await root())).toEqual([
+          "refs/heads/B",
+          "refs/heads/a",
+          "refs/heads/b",
+          ":seq",
+        ]);
       });
 
       it("stores symbolic refs as 'ref: <target>', as git's loose ref files", async () => {

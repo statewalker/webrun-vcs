@@ -415,6 +415,57 @@ export function createRefBatchTests(
       expect(await logOf("refs/tags/t")).toEqual([]);
     });
 
+    itLog("logs each symbolic ref an update goes through, not only HEAD", async () => {
+      await refs.batch([{ name: "refs/remotes/origin/main", new: oid(1) }], {
+        ident: IDENT,
+        message: "fetch",
+      });
+      await refs.setSymbolic("refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+      await refs.batch([{ name: "refs/remotes/origin/HEAD", old: oid(1), new: oid(2) }], {
+        ident: IDENT,
+        message: "via origin/HEAD",
+      });
+      expect(await logOf("refs/remotes/origin/main")).toEqual([
+        `${Z.slice(-4)}>aaa1:fetch`,
+        "aaa1>aaa2:via origin/HEAD",
+      ]);
+      expect(await logOf("refs/remotes/origin/HEAD")).toEqual(["aaa1>aaa2:via origin/HEAD"]);
+    });
+
+    itLog("a rejected batch writes no reflog lines", async () => {
+      await refs.batch([{ name: "refs/heads/a", new: oid(1) }], { ident: IDENT, message: "a" });
+      const r = await refs.batch(
+        [
+          { name: "refs/heads/a", old: oid(1), new: oid(2) },
+          { name: "refs/heads/b", old: oid(9), new: oid(2) },
+        ],
+        { ident: IDENT, message: "rejected" },
+      );
+      expect(r.ok).toBe(false);
+      expect(await logOf("refs/heads/a")).toEqual([`${Z.slice(-4)}>aaa1:a`]);
+      expect(await logOf("refs/heads/b")).toEqual([]);
+    });
+
+    itLog("a multi-ref batch logs every ref, and HEAD once for its branch", async () => {
+      await refs.batch([{ name: "refs/heads/main", new: oid(1) }], {
+        ident: IDENT,
+        message: "init",
+      });
+      await refs.setSymbolic("HEAD", "refs/heads/main");
+      await refs.batch(
+        [
+          { name: "refs/heads/main", old: oid(1), new: oid(2) },
+          { name: "refs/heads/other", old: null, new: oid(2) },
+        ],
+        { ident: IDENT, message: "both" },
+      );
+      expect(await logOf("HEAD")).toEqual(["aaa1>aaa2:both"]);
+      expect(await logOf("refs/heads/other")).toEqual([`${Z.slice(-4)}>aaa2:both`]);
+      const log = await refs.getReflog?.("refs/heads/main");
+      expect((await log?.getReverseEntry(0))?.comment).toBe("both");
+      expect((await log?.getReverseEntries(1))?.map((e) => e.comment)).toEqual(["both"]);
+    });
+
     itMulti("20 concurrent two-ref batches with retry: both refs count every success", async () => {
       const count = (n: number): ObjectId => n.toString(16).padStart(40, "0");
       await seed(["refs/heads/left", count(0)], ["refs/heads/right", count(0)]);

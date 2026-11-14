@@ -309,13 +309,13 @@ export interface ReflogLine {
   message: string;
 }
 
-/** The reflog writes a batch makes. */
-export interface ReflogPlan {
-  /** Lines to append; `create` says whether the log may be created if it does not exist. */
-  append: { name: string; line: ReflogLine; create: boolean }[];
-  /** Logs to remove (refs the batch deleted). */
-  drop: string[];
-}
+/**
+ * One reflog write of a batch: append a line (`create` says whether the log
+ * may be created if it does not exist), or drop the log of a deleted ref.
+ */
+export type ReflogWrite =
+  | { op: "append"; name: string; line: ReflogLine; create: boolean }
+  | { op: "drop"; name: string };
 
 const ZERO_ID = "0".repeat(40);
 /** Refs git logs even without an existing reflog (core.logAllRefUpdates=true, non-bare). */
@@ -327,12 +327,13 @@ const LOGGED_BY_DEFAULT = ["refs/heads/", "refs/remotes/", "refs/notes/"];
  * refs/remotes/ and refs/notes/ (and appended to wherever one exists); the
  * updated ref gets no line for a no-op and loses its log on delete; the refs
  * that record the update too (`reflogAlso`, HEAD among them) always get a line.
+ * Writes come in batch order, to be applied in that order (as the files store does).
  */
-export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = {}): ReflogPlan {
+export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = {}): ReflogWrite[] {
   const ident =
     options.ident ?? `webrun-vcs <vcs@localhost> ${Math.floor(Date.now() / 1000)} +0000`;
   const message = (options.message ?? "").replace(/\s+/g, " ").trim();
-  const plan: ReflogPlan = { append: [], drop: [] };
+  const writes: ReflogWrite[] = [];
   const create = (name: string) =>
     name === "HEAD" || LOGGED_BY_DEFAULT.some((prefix) => name.startsWith(prefix));
   for (const u of updates) {
@@ -342,10 +343,11 @@ export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = 
       ident,
       message,
     };
-    if (u.newValue === null) plan.drop.push(u.name);
+    if (u.newValue === null) writes.push({ op: "drop", name: u.name });
     else if (line.oldId !== u.newValue)
-      plan.append.push({ name: u.name, line, create: create(u.name) });
-    for (const name of u.reflogAlso) plan.append.push({ name, line, create: create(name) });
+      writes.push({ op: "append", name: u.name, line, create: create(u.name) });
+    for (const name of u.reflogAlso)
+      writes.push({ op: "append", name, line, create: create(name) });
   }
-  return plan;
+  return writes;
 }

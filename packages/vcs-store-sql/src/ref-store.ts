@@ -72,7 +72,8 @@ export class SQLRefStore implements Refs {
   /**
    * Apply all commands atomically, or none (see {@link Refs.batch}): the batch is
    * planned and written inside one transaction, with its reflog lines
-   * (`options.ident`, `options.message`; table `vcs_reflog`).
+   * (`options.ident`, `options.message`; table `vcs_reflog`). As in git, a
+   * reflog line that cannot be written fails the batch, which then changes nothing.
    */
   async batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
     if (commands.length === 0) return { ok: true, rejected: [] };
@@ -109,11 +110,12 @@ export class SQLRefStore implements Refs {
           );
         }
       }
-      const logs = planReflog(plan.updates, options);
-      for (const name of logs.drop) {
-        await tx.execute("DELETE FROM vcs_reflog WHERE name = ?", [name]);
-      }
-      for (const { name, line, create } of logs.append) {
+      for (const w of planReflog(plan.updates, options)) {
+        if (w.op === "drop") {
+          await tx.execute("DELETE FROM vcs_reflog WHERE name = ?", [w.name]);
+          continue;
+        }
+        const { name, line, create } = w;
         if (!create) {
           const rows = await tx.query("SELECT 1 FROM vcs_reflog WHERE name = ? LIMIT 1", [name]);
           if (rows.length === 0) continue;
