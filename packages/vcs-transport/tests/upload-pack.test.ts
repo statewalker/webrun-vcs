@@ -364,14 +364,14 @@ describe("Upload-Pack: Protocol V2 Capabilities", () => {
     expect(lines.some((l) => l === "server-option")).toBe(true);
   });
 
-  it("should advertise filter if in default capabilities", async () => {
+  it("should not advertise filter (no partial clone is served)", async () => {
     const transport = createMockTransport();
     const ctx = createServerContext({ transport });
 
     await runHandler("SEND_CAPABILITIES", ctx, serverV2Handlers);
 
     const lines = transport._getWrittenLines();
-    expect(lines.some((l) => l.includes("filter"))).toBe(true);
+    expect(lines.some((l) => l.includes("filter"))).toBe(false);
   });
 
   it("should allow custom capabilities", async () => {
@@ -581,6 +581,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
     const wantOid = randomOid();
 
     repository._addObject(wantOid);
+    refStore._setRef("refs/heads/main", wantOid); // a want must be ours: a tip here
 
     const ctx = createServerContext({ transport, refStore, repository });
     const state = getState(ctx);

@@ -434,8 +434,8 @@ describe("VcsRepositoryFacade", () => {
       const facade = new VcsRepositoryFacade({ history, serialization });
       const boundaries = await facade.computeShallowBoundaries(new Set([commit3Id]), 2);
 
-      // At depth 2: commit3 (0), commit2 (1), commit1 (2 - boundary)
-      expect(boundaries.has(commit1Id)).toBe(true);
+      // git's deepen 2: two commits, commit3 and commit2 (the boundary)
+      expect(boundaries.has(commit2Id)).toBe(true);
       expect(boundaries.size).toBe(1);
     });
 

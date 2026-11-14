@@ -43,6 +43,13 @@ export interface ServeOverDuplexOptions {
   /** Server capabilities to advertise */
   capabilities?: string[];
   /**
+   * Which wants upload-pack serves; anything else is answered `ERR upload-pack: not our ref`.
+   * Default: "ADVERTISED" over protocol v0/v1 (git's default), "REACHABLE_COMMIT" over v2 (the
+   * tips and commits reachable from them, git's `uploadpack.allowReachableSHA1InWant`; git's
+   * own v2 serves any object it has, which "ANY" gives).
+   */
+  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /**
    * Git wire protocol version to serve. Version negotiation is out-of-band in
    * git (the `GIT_PROTOCOL` env / `Git-Protocol: version=2` header), never in
    * the pkt-line stream — so the version is handed to the server as an option.
@@ -105,6 +112,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     localHead: options.currentBranch ?? "refs/heads/main",
     maxHaves: 256,
     serverCapabilities: options.capabilities,
+    requestPolicy: options.requestPolicy,
     allowDeletes: options.allowDeletes ?? true,
     allowNonFastForward: options.allowNonFastForward ?? false,
     denyCurrentBranch: options.denyCurrentBranch ?? true,

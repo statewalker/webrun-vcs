@@ -22,6 +22,7 @@ import {
 import { ZERO_OID } from "../../protocol/constants.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { sendPackStream } from "./send-pack-stream.js";
+import { findUnreachableWant, notOurRef } from "./upload-pack-graph.js";
 
 /**
  * Server fetch FSM transitions.
@@ -133,6 +134,38 @@ async function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
 }
 
 /**
+ * What upload-pack (protocol v0/v1) advertises by default: only what it implements. The
+ * `allow-*-sha1-in-want` capabilities follow the request policy, `deepen-since`/`deepen-not`
+ * the repository's support; no `filter` (no partial clone) and no `deepen-relative`.
+ */
+export function defaultUploadPackCapabilities(
+  policy: string | undefined,
+  repository: {
+    computeShallowSince?: unknown;
+    computeShallowExclude?: unknown;
+  },
+): string[] {
+  const capabilities = [
+    "multi_ack_detailed",
+    "side-band-64k",
+    "thin-pack",
+    "no-done",
+    "ofs-delta",
+    "shallow",
+  ];
+  if (repository.computeShallowSince) capabilities.push("deepen-since");
+  if (repository.computeShallowExclude) capabilities.push("deepen-not");
+  capabilities.push("no-progress", "include-tag");
+  if (policy === "TIP" || policy === "REACHABLE_COMMIT_TIP" || policy === "ANY") {
+    capabilities.push("allow-tip-sha1-in-want");
+  }
+  if (policy === "REACHABLE_COMMIT" || policy === "REACHABLE_COMMIT_TIP" || policy === "ANY") {
+    capabilities.push("allow-reachable-sha1-in-want");
+  }
+  return capabilities;
+}
+
+/**
  * The capabilities a client's first `want` line requests, limited to the advertised ones when
  * the server knows them (a client may not turn on what the server did not offer).
  */
@@ -162,25 +195,13 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const config = getConfig(ctx);
       const state = getState(ctx);
       const output = getOutput(ctx);
+      const repository = getRepository(ctx);
 
       try {
         const refs = await refStore.listAll();
-        const capabilities = config.serverCapabilities ?? [
-          "multi_ack_detailed",
-          "side-band-64k",
-          "thin-pack",
-          "no-done",
-          "ofs-delta",
-          "shallow",
-          "deepen-since",
-          "deepen-not",
-          "deepen-relative",
-          "no-progress",
-          "include-tag",
-          "filter",
-          "allow-tip-sha1-in-want",
-          "allow-reachable-sha1-in-want",
-        ];
+        const capabilities =
+          config.serverCapabilities ??
+          defaultUploadPackCapabilities(config.requestPolicy, repository);
 
         let first = true;
         const refsArray = [...refs];
@@ -301,7 +322,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               break;
             case "REACHABLE_COMMIT":
               // Reachable from any advertised ref
-              if (repository.isReachableFrom) {
+              if (repository.getCommitInfo) {
+                valid = !(await findUnreachableWant(repository, [oid], state.refs.values()));
+              } else if (repository.isReachableFrom) {
                 valid = await repository.isReachableFrom(oid, [...state.refs.values()]);
               } else {
                 valid = [...state.refs.values()].includes(oid);
@@ -330,7 +353,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           }
 
           if (!valid) {
-            output.error = `want ${oid} not valid`;
+            output.error = notOurRef(oid);
             output.invalidWant = oid;
             return "INVALID_WANT";
           }

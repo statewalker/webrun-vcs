@@ -12,10 +12,12 @@
 
 import type { HistoryWithOperations, Ref, SymbolicRef } from "@statewalker/vcs-core";
 import type {
+  CommitGraphInfo,
   ExportPackOptions,
   PackImportResult,
   RepositoryFacade,
 } from "../api/repository-facade.js";
+import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
 
 /**
  * Configuration for creating RepositoryFacade using History facade.
@@ -117,6 +119,17 @@ function createRepositoryFacadeFromHistory(history: HistoryWithOperations): Repo
     // ─────────────────────────────────────────────────────────────────
     // Server-side validation methods
     // ─────────────────────────────────────────────────────────────────
+
+    async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
+      const commit = await commits.load(oid);
+      if (!commit) return undefined;
+      return { parents: commit.parents, time: commit.committer.timestamp };
+    },
+
+    async computeShallowBoundaries(wants: Set<string>, depth: number): Promise<Set<string>> {
+      const update = await computeShallowUpdate(facade, { wants, clientShallow: [], depth });
+      return new Set(update.shallow);
+    },
 
     async isReachableFrom(oid: string, from: string | string[]): Promise<boolean> {
       const roots = Array.isArray(from) ? from : [from];

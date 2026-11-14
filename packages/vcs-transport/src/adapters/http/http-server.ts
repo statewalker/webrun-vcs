@@ -73,9 +73,93 @@ export interface HttpServerOptions {
    * byte (default 5000, as git's `uploadpack.keepAlive`; 0: none).
    */
   keepAliveMs?: number;
+  /**
+   * Largest request body accepted, in bytes after `Content-Encoding: gzip` is undone; a larger
+   * one is answered 413. Default: {@link DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES} for
+   * upload-pack, {@link DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES} for receive-pack (a push
+   * carries its pack).
+   */
+  maxRequestBodyBytes?: number;
 }
 
+/** Default request body limit of POST /git-upload-pack (git's `http.maxRequestBuffer`). */
+export const DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES = 10 * 1024 * 1024;
+
+/** Default request body limit of POST /git-receive-pack. */
+export const DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES = 1024 * 1024 * 1024;
+
 const textEncoder = new TextEncoder();
+
+/** A request body larger than the server's limit (answered 413). */
+export class RequestBodyTooLargeError extends Error {
+  constructor(readonly limit: number) {
+    super(`request body larger than ${limit} bytes`);
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+/**
+ * The request body as the protocol reads it: gzip undone (git's remote-curl gzips request
+ * bodies) and cut at `limit` bytes, streamed. `tooLarge()` tells whether the limit was hit.
+ * Returns an HTTP error response instead for an encoding it cannot undo, or a declared
+ * `Content-Length` over the limit.
+ */
+function requestBody(
+  request: HttpRequest,
+  body: ReadableStream<Uint8Array>,
+  limit: number,
+): { body: ReadableStream<Uint8Array>; tooLarge: () => boolean } | HttpResponse {
+  const encoding = (header(request, "content-encoding") ?? "").trim().toLowerCase();
+  if (encoding !== "" && encoding !== "identity" && encoding !== "gzip" && encoding !== "x-gzip") {
+    return plain(415, `Unsupported Content-Encoding: ${encoding}`);
+  }
+  const declared = Number(header(request, "content-length") ?? Number.NaN);
+  if (encoding !== "gzip" && encoding !== "x-gzip" && declared > limit) {
+    return plain(413, new RequestBodyTooLargeError(limit).message);
+  }
+  const decoded =
+    encoding === "gzip" || encoding === "x-gzip"
+      ? body.pipeThrough(
+          new DecompressionStream("gzip") as unknown as ReadableWritablePair<
+            Uint8Array,
+            Uint8Array
+          >,
+        )
+      : body;
+  let total = 0;
+  let exceeded = false;
+  const limited = decoded.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        total += chunk.byteLength;
+        if (total > limit) {
+          exceeded = true;
+          controller.error(new RequestBodyTooLargeError(limit));
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+  return { body: limited, tooLarge: () => exceeded };
+}
+
+function header(request: HttpRequest, name: string): string | undefined {
+  const direct = request.headers[name];
+  if (direct !== undefined) return direct;
+  for (const [key, value] of Object.entries(request.headers)) {
+    if (key.toLowerCase() === name) return value;
+  }
+  return undefined;
+}
+
+function plain(status: number, message: string): HttpResponse {
+  return {
+    status,
+    headers: { "Content-Type": "text/plain" },
+    body: textEncoder.encode(message),
+  };
+}
 
 /** The capabilities upload-pack advertises by default (GET /info/refs). */
 const DEFAULT_UPLOAD_PACK_CAPABILITIES = [
@@ -187,6 +271,13 @@ export async function handleUploadPack(
     };
   }
 
+  const input = requestBody(
+    request,
+    request.body,
+    options.maxRequestBodyBytes ?? DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES,
+  );
+  if ("status" in input) return input;
+
   const state = new ProtocolState();
 
   // Populate refs from refStore
@@ -219,8 +310,7 @@ export async function handleUploadPack(
   };
 
   // Create duplex from request body and response writer
-  const input = readableStreamToAsyncIterable(request.body);
-  const duplex = createSimpleDuplex(input, writer);
+  const duplex = createSimpleDuplex(readableStreamToAsyncIterable(input.body), writer);
   const transport = createTransportApi(duplex, state);
 
   const config: ProcessConfiguration = {
@@ -262,6 +352,7 @@ export async function handleUploadPack(
     const failure = await run;
     if (failure) {
       await out.abort(failure.error).catch(() => {});
+      if (input.tooLarge()) return plain(413, failure.error.message);
       return {
         status: 500,
         headers: { "Content-Type": "text/plain" },
@@ -311,7 +402,6 @@ export async function handleReceivePackInfoRefs(
   // Default capabilities for receive-pack
   const capabilities = options.capabilities ?? [
     "report-status",
-    "report-status-v2",
     "delete-refs",
     "side-band-64k",
     "quiet",
@@ -383,6 +473,13 @@ export async function handleReceivePack(
     };
   }
 
+  const input = requestBody(
+    request,
+    request.body,
+    options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES,
+  );
+  if ("status" in input) return input;
+
   const state = new ProtocolState();
 
   // Populate refs from refStore
@@ -405,8 +502,7 @@ export async function handleReceivePack(
   };
 
   // Create duplex from request body and response writer
-  const input = readableStreamToAsyncIterable(request.body);
-  const duplex = createSimpleDuplex(input, writer);
+  const duplex = createSimpleDuplex(readableStreamToAsyncIterable(input.body), writer);
   const transport = createTransportApi(duplex, state);
 
   const config: ProcessConfiguration = {
@@ -431,6 +527,11 @@ export async function handleReceivePack(
 
   try {
     await fsm.run(ctx);
+    // the pack was cut at the limit: nothing of it is applied, the push is refused
+    if (input.tooLarge()) {
+      const limit = options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES;
+      return plain(413, new RequestBodyTooLargeError(limit).message);
+    }
 
     // Only return 500 if the FSM errored without producing a proper
     // protocol response (e.g., it never reached SEND_STATUS).
@@ -463,6 +564,7 @@ export async function handleReceivePack(
       body,
     };
   } catch (error) {
+    if (input.tooLarge()) return plain(413, String(error));
     return {
       status: 500,
       headers: { "Content-Type": "text/plain" },
@@ -545,6 +647,8 @@ export interface HttpHandlerOptions {
   } | null>;
   /** Optional request policy */
   requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
+  maxRequestBodyBytes?: number;
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -579,7 +683,7 @@ export interface HttpHandlerOptions {
 export function createHttpHandler(
   options: HttpHandlerOptions,
 ): (request: HttpRequest) => Promise<HttpResponse> {
-  const { resolveRepository, requestPolicy, logger } = options;
+  const { resolveRepository, requestPolicy, maxRequestBodyBytes, logger } = options;
 
   return async (request: HttpRequest): Promise<HttpResponse> => {
     // Parse the Git request
@@ -621,7 +725,7 @@ export function createHttpHandler(
     }
 
     const { repository, refStore } = resolved;
-    const serverOptions: HttpServerOptions = { requestPolicy };
+    const serverOptions: HttpServerOptions = { requestPolicy, maxRequestBodyBytes };
 
     try {
       if (parsed.isInfoRefs) {
@@ -677,6 +781,8 @@ export interface GitHttpServerOptions {
   ) => Promise<{ repository: RepositoryFacade; refStore: RefStore } | null>;
   /** Optional request policy */
   requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
+  maxRequestBodyBytes?: number;
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -720,6 +826,7 @@ export function createGitHttpServer(options: GitHttpServerOptions): GitHttpServe
   const handler = createHttpHandler({
     resolveRepository: options.resolveRepository,
     requestPolicy: options.requestPolicy,
+    maxRequestBodyBytes: options.maxRequestBodyBytes,
     logger: options.logger,
   });
 
