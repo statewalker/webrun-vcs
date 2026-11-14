@@ -173,7 +173,7 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
       }),
     async replace(source, target) {
       await ensureDir(target);
-      if (!(await fs.move(abs(source), abs(target)))) {
+      if (!(await moveCompleting(fs, abs(source), abs(target)))) {
         throw new Error(`replace: could not move ${source} to ${target}`);
       }
     },
@@ -192,4 +192,35 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
         return fs.remove(abs(dir));
       }),
   };
+}
+
+/**
+ * `files.move(source, target)`, finishing a move that a copy-then-delete FilesApi left
+ * half done. From webrun-files 0.11 such a backend (a browser without native move, S3,
+ * a composite across mounts) throws `MoveIncompleteError` when the target was written
+ * but the source could not be removed. The target then holds the new content, so the
+ * move is finished here by removing the source; only if it still cannot be removed (a
+ * lock file would stay behind) is the error rethrown. The error is recognised by name,
+ * so it works whichever webrun-files copy raised it.
+ *
+ * @example
+ * ```typescript
+ * if (!(await moveCompleting(files, "/repo/.git/index.lock", "/repo/.git/index"))) {
+ *   throw new Error("index.lock is gone");
+ * }
+ * ```
+ */
+export async function moveCompleting(
+  files: FilesApi,
+  source: string,
+  target: string,
+): Promise<boolean> {
+  try {
+    return await files.move(source, target);
+  } catch (error) {
+    if ((error as Error | undefined)?.name !== "MoveIncompleteError") throw error;
+    const removed = await files.remove(source).catch(() => false);
+    if (removed || !(await files.exists(source).catch(() => true))) return true;
+    throw error;
+  }
 }

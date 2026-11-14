@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 const env = {
   ...process.env,
@@ -38,6 +38,22 @@ function gitRepo(): string {
 
 const racer = join(import.meta.dirname, "fixtures", "lock-racer.ts");
 
+/** Racers still running: killed after each test, so a failed test leaves no process behind. */
+const running = new Set<ChildProcessWithoutNullStreams>();
+afterEach(() => {
+  for (const child of running) child.kill();
+  running.clear();
+});
+
+/** Rejects after `ms` (a racer that stops answering fails the test instead of hanging it). */
+function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`racer: no ${what} within ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** A racer process; resolves once it has printed "ready". */
 async function startRacer(gitDir: string, locks: string[]) {
   const child: ChildProcessWithoutNullStreams = spawn(
@@ -45,13 +61,15 @@ async function startRacer(gitDir: string, locks: string[]) {
     ["--conditions=source", "--import", "tsx", racer, gitDir, ...locks],
     { cwd: import.meta.dirname, env, stdio: "pipe" },
   );
+  running.add(child);
+  child.on("close", () => running.delete(child));
   let stderr = "";
   child.stderr.on("data", (d) => {
     stderr += d;
   });
   const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
   const next = async () => {
-    const { value, done } = await lines.next();
+    const { value, done } = await within(lines.next(), 20000, "answer");
     if (done) throw new Error(`racer exited early: ${stderr}`);
     return value as string;
   };

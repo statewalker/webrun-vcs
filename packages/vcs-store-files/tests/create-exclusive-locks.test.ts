@@ -214,8 +214,7 @@ describe("createExclusive retries when the lock's directory vanishes (ENOENT)", 
     await expect(atomic.createExclusive("index.lock", enc.encode("x"))).rejects.toMatchObject({
       code: "ENOENT",
     });
-    expect(attempts()).toBeGreaterThan(1);
-    expect(attempts()).toBeLessThan(1000);
+    expect(attempts()).toBe(4); // the first try and 3 retries
   });
 
   it("does not retry other errors", async () => {

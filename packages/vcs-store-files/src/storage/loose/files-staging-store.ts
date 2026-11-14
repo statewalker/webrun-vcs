@@ -17,7 +17,7 @@
  * trusts a pack of unknown age the same way.
  */
 import type { StagingBlobStore } from "@statewalker/vcs-core";
-import { type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
+import { type FilesApi, joinPath, moveCompleting } from "@statewalker/vcs-utils/files";
 
 const FANOUT = /^[0-9a-f]{2}$/;
 const REST = /^[0-9a-f]{38}$/;
@@ -106,11 +106,11 @@ export function filesStagingStore(
         const existing = await state(target);
         if (existing === "fresh") return { id, stored: false };
         if (existing === "stale") {
-          moved = await files.move(tmp, target);
+          moved = await moveCompleting(files, tmp, target);
           return { id, stored: moved };
         }
         await ensureDir(joinPath(objectsDir, id.slice(0, 2)));
-        moved = await files.move(tmp, target);
+        moved = await moveCompleting(files, tmp, target);
         if (moved) return { id, stored: true };
         if (await isFile(target)) return { id, stored: false };
         throw new Error(`could not move ${tmp} to ${target}`);
