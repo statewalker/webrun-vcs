@@ -123,7 +123,7 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
 
     // Run garbage collection if GCController is available
     // Note: This requires access to the Repository's gc property
-    // For now, we'll check if the RefStore supports the gc operations
+    // For now, we'll check if the ref store supports the gc operations
 
     // Check if refs support packRefs
     if (this._packRefs && this.refsStore.packRefs) {

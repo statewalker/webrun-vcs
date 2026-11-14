@@ -5,7 +5,7 @@
  * No serialization overhead - just delegates to the underlying store.
  *
  * Can also implement full RepositoryAccess from transport package when
- * RefStore is provided.
+ * `Refs` is provided.
  */
 
 import {
@@ -18,7 +18,7 @@ import {
   parseCommit,
   parseTree,
   type Ref,
-  type RefStore,
+  type Refs,
 } from "@statewalker/vcs-core";
 import type { HeadInfo, ObjectInfo, RefInfo, RepositoryAccess } from "@statewalker/vcs-transport";
 import { collect } from "@statewalker/vcs-utils/streams";
@@ -198,14 +198,14 @@ export class DeltaAwareGitNativeRepositoryAccess
 export interface CoreRepositoryAccessOptions {
   /** Object store for Git objects */
   objectStore: GitObjectStore;
-  /** Reference store for Git refs */
-  refStore: RefStore;
+  /** Refs (any vcs-core `Refs` implementation) */
+  refStore: Refs;
 }
 
 /**
  * Create a RepositoryAccess adapter from core storage.
  *
- * Adapts GitObjectStore and RefStore to the RepositoryAccess interface
+ * Adapts GitObjectStore and Refs to the RepositoryAccess interface
  * used by protocol handlers (upload-pack, receive-pack).
  *
  * @param options - Object store and ref store
@@ -298,21 +298,15 @@ export function createCoreRepositoryAccess(options: CoreRepositoryAccessOptions)
       oldId: ObjectId | null,
       newId: ObjectId | null,
     ): Promise<boolean> {
-      // Delete case
+      // One atomic command. `oldId` null means "must not exist" for a create or
+      // update. A delete removes the named ref itself (a symbolic ref, not its
+      // target), checks `oldId` when given, and reports false for a missing ref.
       if (newId === null) {
-        if (oldId !== null) {
-          // Check current value before deleting
-          const resolved = await refStore.resolve(name);
-          if (resolved?.objectId !== oldId) {
-            return false;
-          }
-        }
-        return refStore.delete(name);
+        if (!(await refStore.get(name))) return false;
+        const old = oldId === null ? undefined : oldId;
+        return (await refStore.batch([{ name, old, new: null, noDeref: true }])).ok;
       }
-
-      // Create or update case
-      const result = await refStore.compareAndSwap(name, oldId ?? undefined, newId);
-      return result.success;
+      return (await refStore.batch([{ name, old: oldId, new: newId }])).ok;
     },
 
     async *walkObjects(

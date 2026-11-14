@@ -31,8 +31,7 @@ import { HistoryImpl, HistoryWithOperationsImpl } from "./history.impl.js";
 import type { History, HistoryWithOperations } from "./history.js";
 import { createGitObjectStore } from "./objects/index.js";
 import type { GitObjectStore } from "./objects/object-store.js";
-import type { RefStore } from "./refs/ref-store.js";
-import { createMemoryRefs, createRefsAdapter } from "./refs/refs.impl.js";
+import { createMemoryRefs } from "./refs/refs.impl.js";
 import type { Refs } from "./refs/refs.js";
 import { createTags } from "./tags/tags.impl.js";
 import type { Tags } from "./tags/tags.js";
@@ -68,12 +67,10 @@ export interface HistoryComponentsConfig {
   objects: GitObjectStore;
 
   /**
-   * Refs configuration
-   *
-   * Either use in-memory refs (for testing) or adapt an existing
-   * RefStore implementation.
+   * Refs: a `Refs` implementation (such as a store backend's ref store), or
+   * `{ type: "memory" }` for in-memory refs.
    */
-  refs: { type: "memory" } | { type: "adapter"; refStore: RefStore };
+  refs: { type: "memory" } | Refs;
 }
 
 /**
@@ -123,11 +120,16 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
   const commits = createCommits(config.objects);
   const tags = createTags(config.objects);
 
+  const given = config.refs as Partial<Refs> & { type?: unknown };
   let refs: Refs;
-  if (config.refs.type === "memory") {
+  if (typeof given.batch === "function") {
+    refs = config.refs as Refs;
+  } else if (given.type === "memory") {
     refs = createMemoryRefs();
   } else {
-    refs = createRefsAdapter(config.refs.refStore);
+    throw new Error(
+      `createHistoryFromComponents: refs must be a Refs implementation or { type: "memory" }, got ${JSON.stringify(given.type ?? given)}`,
+    );
   }
   return createHistoryFromStores({
     blobs,

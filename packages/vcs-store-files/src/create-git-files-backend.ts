@@ -117,7 +117,7 @@ export async function createGitFilesBackend(
 
   const history = createHistoryFromComponents({
     objects,
-    refs: { type: "adapter", refStore },
+    refs: refStore,
   });
 
   return { history, objects, packDirectory, looseStorage };

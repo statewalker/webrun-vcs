@@ -8,9 +8,6 @@
 export * from "./ref-batch.js";
 export * from "./ref-directory.js";
 export * from "./ref-name.js";
-// Legacy interface - export only RefStore and RefStoreLocation (RefUpdateResult from new interface)
-export type { RefStore } from "./ref-store.js";
-export { RefStoreLocation } from "./ref-store.js";
 export * from "./ref-types.js";
 export * from "./reflog-types.js";
 // New implementations (Phase C2)

@@ -1,21 +1,16 @@
-import {
-  createInMemoryFilesApi,
-  createRefsAdapter,
-  type FilesApi,
-  type ObjectId,
-} from "@statewalker/vcs-core";
+import { createInMemoryFilesApi, type FilesApi, type ObjectId } from "@statewalker/vcs-core";
 import { createRefBatchTests } from "@statewalker/vcs-testing";
 import { describe, expect, it } from "vitest";
 import { createRefsStructure, FileRefStore, packRefs } from "../../src/refs/index.js";
 
 async function gitFilesRefs(): Promise<{
   files: FilesApi;
-  refs: ReturnType<typeof createRefsAdapter>;
+  refs: FileRefStore;
 }> {
   const files = createInMemoryFilesApi();
   await files.mkdir("/.git");
   await createRefsStructure(files, "/.git");
-  return { files, refs: createRefsAdapter(new FileRefStore(files, "/.git")) };
+  return { files, refs: new FileRefStore(files, "/.git") };
 }
 
 createRefBatchTests("Git files", async () => ({ refs: (await gitFilesRefs()).refs }));

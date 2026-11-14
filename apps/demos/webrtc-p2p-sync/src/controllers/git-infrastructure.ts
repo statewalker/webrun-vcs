@@ -110,7 +110,7 @@ export async function initializeGitFromFiles(ctx: AppContext, files: FilesApi): 
 
   const history = createHistoryFromComponents({
     objects,
-    refs: { type: "adapter", refStore },
+    refs: refStore,
   });
   await history.initialize();
   setHistory(ctx, history);

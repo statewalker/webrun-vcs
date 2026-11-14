@@ -18,7 +18,7 @@ import {
   isValidBranchName,
   joinPath,
   type ObjectId,
-  type RefStore,
+  type Refs,
   type TreeEntry,
   type Trees,
 } from "@statewalker/vcs-core";
@@ -54,7 +54,7 @@ export interface CheckoutCommandOptions {
   commits: Commits;
 
   /** Reference storage for resolving refs and updating HEAD */
-  refs: RefStore;
+  refs: Refs;
 
   /** Staging area (index) for updating after checkout */
   staging: Staging;
@@ -69,7 +69,7 @@ export class CheckoutCommand implements Checkout {
   private readonly blobs: Blobs;
   private readonly trees: Trees;
   private readonly commits: Commits;
-  private readonly refs: RefStore;
+  private readonly refs: Refs;
   private readonly staging: Staging;
 
   constructor(options: CheckoutCommandOptions) {

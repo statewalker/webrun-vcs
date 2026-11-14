@@ -227,7 +227,7 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
   `[includeIf]` are not followed, a malformed section header is kept but ignored where `git`
   would reject the file, and `save()` rewrites the whole file without a `config.lock`.
 - Ref batches and `compareAndSwap` use `.lock` files and rename (with native `AtomicFiles`, safe
-  next to a running `git`). `set`, `setSymbolic`, `delete`, `packRefs` / `optimize` (which rewrite
+  next to a running `git`). `set`, `setSymbolic`, `remove`, `packRefs` / `optimize` (which rewrite
   `packed-refs` without `packed-refs.lock` and can lose a concurrent batch), loose objects and the
   index are still written directly, without locks: do not run them next to a batch or a `git`
   process writing the same repository.

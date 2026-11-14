@@ -381,7 +381,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       }
 
       // For other indices, need reflog support
-      // Note: The core RefStore interface doesn't include reflog methods.
+      // Note: The core Refs interface doesn't include reflog methods.
       // Without reflog, we can only access the most recent stash (index 0).
       throw new RefNotFoundError(refName, `Stash entry ${index} not found (reflog not supported)`);
     }

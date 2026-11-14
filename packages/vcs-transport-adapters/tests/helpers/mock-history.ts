@@ -2,7 +2,7 @@
  * Mock History helpers for testing VcsRepositoryAccess and VcsRepositoryFacade
  *
  * This module provides History-based test helpers that replace the legacy
- * store-based helpers in mock-stores.ts. Uses createMemoryHistory() from
+ * Uses createMemoryHistory() from
  * @statewalker/vcs-core for proper History interface implementation.
  */
 

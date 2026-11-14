@@ -11,7 +11,7 @@ import { STASH_REF } from "./stash-list-command.js";
  *
  * Based on JGit's StashDropCommand.
  *
- * Note: Without reflog support in RefStore, only the most recent stash (index 0)
+ * Note: Without reflog support in Refs, only the most recent stash (index 0)
  * can be dropped. Dropping by index > 0 requires reflog support.
  *
  * @example

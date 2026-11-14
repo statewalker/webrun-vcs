@@ -461,13 +461,14 @@ Annotated tags can point to any object type and optionally chain (tag pointing t
 
 | File | Purpose |
 |------|---------|
-| `ref-store.ts` | `RefStore` interface |
-| `ref-store.files.ts` | File-based RefStore implementation |
-| `ref-store.memory.ts` | In-memory RefStore implementation |
+| `refs.ts` | `Refs` interface (the one ref interface) |
+| `refs.impl.ts` | `MemoryRefs`, the in-memory implementation |
+| `ref-batch.ts` | `RefCommand`, `BatchResult`, `planRefBatch` (atomic batch rules) |
+| `ref-name.ts` | git's ref-name rules and order |
 | `ref-types.ts` | `Ref`, `SymbolicRef`, `RefStorage` |
-| `ref-reader.ts` | Read loose refs |
-| `ref-writer.ts` | Write loose refs |
-| `ref-directory.ts` | Refs directory structure |
+| `ref-directory.ts` | Ref helpers (`peelRef`, `shortenRefName`) |
+
+The git-files implementation (`FileRefStore`, loose and packed refs, lock files) lives in `@statewalker/vcs-store-files`.
 | `packed-refs-reader.ts` | Read packed-refs |
 | `packed-refs-writer.ts` | Write packed-refs |
 
@@ -636,7 +637,7 @@ These provide byte-level access to Git objects in wire format for transport oper
 
 - `RepositoryAccess` interface
 - `createVcsRepositoryAccess` - adapts VCS stores to RepositoryAccess
-- `createCoreRepositoryAccess` - adapts GitObjectStore + RefStore to RepositoryAccess
+- `createCoreRepositoryAccess` - adapts GitObjectStore + Refs to RepositoryAccess
 - `GitNativeRepositoryAccess` - direct passthrough for object-only operations
 
 ```typescript

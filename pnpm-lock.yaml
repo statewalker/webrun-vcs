@@ -1184,9 +1184,15 @@ importers:
         specifier: 'catalog:'
         version: 0.2.2
     devDependencies:
+      '@statewalker/vcs-store-files':
+        specifier: workspace:^
+        version: link:../vcs-store-files
       '@statewalker/vcs-store-mem':
         specifier: workspace:^
         version: link:../vcs-store-mem
+      '@statewalker/vcs-utils-node':
+        specifier: workspace:^
+        version: link:../vcs-utils-node
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.10.3

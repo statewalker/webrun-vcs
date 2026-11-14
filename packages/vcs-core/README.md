@@ -213,7 +213,7 @@ RawStorage                             bytes by key: MemoryRawStorage, Compresse
                                        ChunkedRawStorage, blobStoreToRawStorage(BlobStore), ...
 ```
 
-Every typed store delegates to one `GitObjectStore`, which adds the Git header, computes the id and reads the type back. Below it, a `RawStorage` stores bytes by key and knows nothing about Git. A new backend can stop at that level: `createHistoryFromComponents({ objects: createGitObjectStore(rawStorage), refs: { type: "memory" } })` gives a full `History` (use `{ type: "adapter", refStore }` for persistent refs). `HistoryWithOperations` adds `delta` (deltify objects for storage), `serialization` (loose objects and packs) and `capabilities` (what the backend does natively), which GC and transport use.
+Every typed store delegates to one `GitObjectStore`, which adds the Git header, computes the id and reads the type back. Below it, a `RawStorage` stores bytes by key and knows nothing about Git. A new backend can stop at that level: `createHistoryFromComponents({ objects: createGitObjectStore(rawStorage), refs: { type: "memory" } })` gives a full `History` (pass any `Refs`, such as a store package's ref store, for persistent refs). `HistoryWithOperations` adds `delta` (deltify objects for storage), `serialization` (loose objects and packs) and `capabilities` (what the backend does natively), which GC and transport use.
 
 ### Why everything streams
 

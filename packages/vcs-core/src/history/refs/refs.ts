@@ -1,7 +1,6 @@
 /**
  * Refs - New interface for reference storage
  *
- * This is the new interface with bare naming convention (Refs instead of RefStore)
  * and consistent method names (remove instead of delete).
  *
  * Unlike Blobs, Trees, Commits, and Tags, Refs does NOT extend ObjectStorage<V>
