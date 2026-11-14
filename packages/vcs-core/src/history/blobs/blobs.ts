@@ -31,10 +31,15 @@ export interface Blobs extends ObjectStorage<BlobContent> {
    * Accepts both sync and async iterables for flexibility.
    * The content is hashed incrementally during storage.
    *
+   * With `size`, the content is read once and never held in memory (it must be
+   * exactly `size` bytes, or the store rejects with `SizeMismatchError` and keeps
+   * nothing). Without it, the content is collected first to learn its size.
+   *
    * @param content Blob content as byte stream
+   * @param size The content's length in bytes, when known
    * @returns SHA-1 hash of the blob content (with "blob <size>\0" prefix)
    */
-  store(content: BlobContent | Iterable<Uint8Array>): Promise<ObjectId>;
+  store(content: BlobContent | Iterable<Uint8Array>, size?: number): Promise<ObjectId>;
 
   /**
    * Load blob content

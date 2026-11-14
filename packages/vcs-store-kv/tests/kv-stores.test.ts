@@ -9,7 +9,6 @@ import { createGitObjects, rawStorageStaging } from "@statewalker/vcs-core";
 import {
   createBlobStoreTests,
   createCommitStoreTests,
-  createGitObjectStoreTests,
   createGitObjectsTests,
   createRefBatchTests,
   createRefStoreTests,
@@ -94,13 +93,6 @@ createBlobStoreTests("KV", async () => {
   const kv = new MemoryKVAdapter();
   const stores = createKvObjectStores({ kv });
   return { blobStore: stores.blobs };
-});
-
-// GitObjectStore tests
-createGitObjectStoreTests("KV", async () => {
-  const kv = new MemoryKVAdapter();
-  const stores = createKvObjectStores({ kv });
-  return { objectStore: stores.objects };
 });
 
 // Object kernel tests

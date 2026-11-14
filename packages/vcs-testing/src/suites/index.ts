@@ -59,7 +59,6 @@
  *
  * ### Core Store Suites
  * - `createBlobStoreTests` - BlobStore interface
- * - `createGitObjectStoreTests` - GitObjectStore interface
  * - `createCommitStoreTests` - CommitStore interface
  * - `createTreeStoreTests` - TreeStore interface
  * - `createTagStoreTests` - TagStore interface
@@ -75,7 +74,6 @@
  * ### Storage Backend Suites
  * - `createRawStorageTests` - RawStorage interface
  * - `createGitObjectsTests` - GitObjects (the object kernel) over a StagingBlobStore
- * - `createVolatileStoreTests` - VolatileStore interface
  * - `createDeltaApiTests` - DeltaApi interface
  *
  * ### Combined/Integration Suites
@@ -90,7 +88,6 @@ export * from "./blob-store.suite.js";
 export * from "./commit-store.suite.js";
 export * from "./delta-api.suite.js";
 export * from "./git-compatibility.suite.js";
-export * from "./git-object-store.suite.js";
 export * from "./git-objects.suite.js";
 export * from "./raw-store.suite.js";
 export * from "./ref-batch.suite.js";
@@ -100,5 +97,4 @@ export * from "./stash-store.suite.js";
 export * from "./streaming-stores.suite.js";
 export * from "./tag-store.suite.js";
 export * from "./tree-store.suite.js";
-export * from "./volatile-store.suite.js";
 export * from "./worktree-store.suite.js";

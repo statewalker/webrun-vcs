@@ -97,7 +97,7 @@ The type system and algorithms align with Eclipse JGit, a mature Java implementa
 **@statewalker/vcs-core** defines the VCS contracts and object model:
 - History interface (Blobs, Trees, Commits, Tags, Refs)
 - Workspace interfaces (Staging, Checkout, Worktree)
-- Storage abstractions (RawStorage, ChunkAccess, GitObjectStore)
+- Storage abstractions (RawStorage, ChunkAccess) and the object kernel (GitObjects)
 - Pack file format and delta compression
 - TransformationStore for operation state (merge, rebase, cherry-pick)
 - ResolutionStore for conflict management with rerere support

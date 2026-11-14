@@ -10,6 +10,9 @@ import { joinPath } from "@statewalker/vcs-core";
 
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
+/** A loose object file name, fan-out directory included. */
+const OBJECT_ID = /^[0-9a-f]{40}$/;
+
 /**
  * Options for garbage collection.
  */
@@ -81,6 +84,8 @@ export async function gc(options: GcOptions): Promise<GcResult> {
   let removedObjects = 0;
 
   for await (const key of looseStorage.keys()) {
+    // Only object files: native git writes objects/ab/tmp_obj_* while it works.
+    if (!OBJECT_ID.test(key)) continue;
     totalLooseObjects++;
     if (!reachable.has(key)) {
       if (!dryRun) {

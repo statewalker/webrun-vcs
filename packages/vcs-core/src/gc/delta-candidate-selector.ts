@@ -55,8 +55,7 @@ export interface DeltaCandidateSelectorOptions {
  * ```typescript
  * const objects: DeltaObjectInfo[] = [];
  * for await (const id of history.blobs.keys()) {
- *   const header = await history.objects.getHeader(id);
- *   objects.push({ id, type: header.type, size: header.size });
+ *   objects.push({ id, type: "blob", size: await history.blobs.size(id) });
  * }
  * const candidates = selectDeltaCandidates(objects, { window: 10 });
  * await strategy.deltify(candidates);

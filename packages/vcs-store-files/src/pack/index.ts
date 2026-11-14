@@ -13,3 +13,4 @@ export * from "./pack-delta-store.js";
 export * from "./pack-directory.js";
 export * from "./pack-reader.js";
 export * from "./random-access-delta-reader.js";
+export * from "./with-packs.js";

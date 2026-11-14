@@ -7,7 +7,7 @@ import type { ObjectId } from "../../common/index.js";
  * interface with domain-specific operations. This is the **high-level layer**
  * that works with parsed values (Commit objects, TreeEntry arrays, etc.).
  *
- * Concrete implementations typically wrap a {@link GitObjectStore} which
+ * Concrete implementations typically wrap a {@link GitObjects} which
  * handles the underlying Git object format (headers, SHA-1 hashing).
  *
  * Type parameter V represents the object type being stored:
@@ -17,7 +17,7 @@ import type { ObjectId } from "../../common/index.js";
  * - Tags: Tag structure
  *
  * @template V The object type being stored
- * @see {@link GitObjectStore} for the raw byte-level storage interface
+ * @see {@link GitObjects} for the raw byte-level storage interface
  */
 export interface ObjectStorage<V> {
   /**

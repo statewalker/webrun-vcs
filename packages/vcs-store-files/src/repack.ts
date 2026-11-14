@@ -16,6 +16,9 @@ import {
 import type { PackDirectory } from "./pack/pack-directory.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
+/** A loose object file name, fan-out directory included. */
+const OBJECT_ID = /^[0-9a-f]{40}$/;
+
 /**
  * Options for the repack operation.
  */
@@ -69,7 +72,8 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
   // Collect all loose object IDs
   const objectIds: string[] = [];
   for await (const id of looseStorage.keys()) {
-    objectIds.push(id);
+    // Only object files: native git writes objects/ab/tmp_obj_* while it works.
+    if (OBJECT_ID.test(id)) objectIds.push(id);
   }
 
   if (objectIds.length === 0) {

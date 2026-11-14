@@ -48,7 +48,7 @@ Typical setup:
 | `SqlRawStore`, `SqlDeltaStore`, `SqlBinStore` + `createSqlRawStore` / `createSqlDeltaStore` / `createSqlBinStore` | `RawStorage` / `DeltaStore` / `BinStore` on tables `raw_store` and `delta_store` (names configurable). |
 | `importToNative`, `exportToGit`, `syncObjects` | Copy objects between any `History` and the native SQL stores. |
 | `SqlGcStrategy` | `GcStrategy` for a `History`: `prune()` deletes rows; `compact()` and `deltify()` do nothing. |
-| `createGitObjectStore`, `createBlobs`, `createTrees`, `createCommits`, `createTags` | Re-exported from `@statewalker/vcs-core`. |
+| `createGitObjects`, `GitObjects`, `createBlobs`, `createTrees`, `createCommits`, `createTags` | Re-exported from `@statewalker/vcs-core`. |
 
 ## Examples
 

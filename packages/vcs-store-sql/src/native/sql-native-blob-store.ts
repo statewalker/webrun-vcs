@@ -5,7 +5,7 @@
  * identical to native Git. Supports chunked storage for large blobs.
  */
 
-import { encodeObjectHeader, type ObjectId } from "@statewalker/vcs-core";
+import { encodeObjectHeader, type ObjectId, SizeMismatchError } from "@statewalker/vcs-core";
 import { bytesToHex, compressBlock, createSha1, decompressBlock } from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 import type { SqlNativeBlobStore } from "./types.js";
@@ -228,11 +228,14 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
    * Streams content, computes Git-compatible hash, and stores either
    * inline (for small blobs) or in compressed chunks (for large blobs).
    */
-  async store(content: AsyncIterable<Uint8Array>): Promise<ObjectId> {
+  async store(content: AsyncIterable<Uint8Array>, size?: number): Promise<ObjectId> {
     await this.ensureTable();
 
     // Stream, collect, and compute hash
     const { hash: blobId, chunks, totalSize } = await this.streamHashAndCollect(content);
+    // The content is collected before anything is written, so a size that does not
+    // match is refused here and nothing is stored.
+    if (size !== undefined && size !== totalSize) throw new SizeMismatchError(size, totalSize);
 
     // Check if blob already exists (deduplication)
     const existing = await this.db.query<{ id: number }>(

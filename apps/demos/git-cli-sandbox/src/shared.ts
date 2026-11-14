@@ -5,7 +5,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Git } from "@statewalker/vcs-commands";
-import type { FilesApi, GitObjectStore, History } from "@statewalker/vcs-core";
+import type { FilesApi, GitObjects, History } from "@statewalker/vcs-core";
 import {
   createFileWorktree,
   createGitFilesBackend,
@@ -32,7 +32,7 @@ export interface CliContext {
   git: Git;
   workingCopy: WorkingCopy;
   history: History;
-  objects: GitObjectStore;
+  objects: GitObjects;
   files: FilesApi;
 }
 

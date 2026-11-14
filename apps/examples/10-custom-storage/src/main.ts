@@ -17,7 +17,7 @@
 import {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromComponents,
   createHistoryFromStores,
   createMemoryHistory,
@@ -29,6 +29,7 @@ import {
   type History,
   type HistoryWithOperations,
   MemoryRawStorage,
+  rawStorageStaging,
 } from "@statewalker/vcs-core";
 
 const encoder = new TextEncoder();
@@ -132,9 +133,9 @@ console.log("  Returns: History (basic interface)\n");
 
 // Use a single object store for all Git objects (blobs, trees, commits, tags).
 // createHistoryFromComponents builds typed stores (blobs, trees, commits, tags)
-// from the shared GitObjectStore automatically.
+// from the shared GitObjects automatically.
 const objectStorage = new MemoryRawStorage();
-const objects = createGitObjectStore(objectStorage);
+const objects = createGitObjects(rawStorageStaging(objectStorage));
 
 const history3 = createHistoryFromComponents({
   objects,
@@ -167,7 +168,7 @@ const commit3 = await history3.commits.store({
 await history3.refs.set("refs/heads/main", commit3);
 
 console.log(`  Commit: ${commit3.slice(0, 7)}`);
-console.log("  All Git objects share a single MemoryRawStorage via GitObjectStore");
+console.log("  All Git objects share a single MemoryRawStorage via GitObjects");
 console.log("  createHistoryFromComponents auto-builds typed stores (blobs, trees, commits, tags)");
 
 await history3.close();
@@ -183,7 +184,7 @@ console.log("  Returns: History (basic interface)\n");
 // Build individual store instances manually
 const _customBlobStorage = new MemoryRawStorage();
 const customObjectStorage = new MemoryRawStorage();
-const customObjects = createGitObjectStore(customObjectStorage);
+const customObjects = createGitObjects(rawStorageStaging(customObjectStorage));
 
 const customBlobs = createBlobs(customObjects);
 const customTrees = createTrees(customObjects);
@@ -241,7 +242,7 @@ console.log("  Pattern: Multiple History instances sharing the same raw storage\
 
 // Create shared object storage
 const sharedObjectStorage = new MemoryRawStorage();
-const sharedObjects = createGitObjectStore(sharedObjectStorage);
+const sharedObjects = createGitObjects(rawStorageStaging(sharedObjectStorage));
 
 // Create two History instances that share the same underlying storage
 const historyA = createHistoryFromComponents({

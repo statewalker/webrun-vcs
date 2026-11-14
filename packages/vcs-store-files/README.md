@@ -44,8 +44,8 @@ Lower-level building blocks, also exported:
 
 | Area | Exports |
 | --- | --- |
-| Object kernel store | `filesStagingStore(files, objectsDir)`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does |
-| Loose objects | `FileRawStorage` (`compress` option, default `true`), `PackDirectoryAdapter` (read-only `RawStorage` over packs), `FileVolatileStore` / `createFileVolatileStore` (temp files for large content) |
+| Object kernel store | `filesStagingStore(files, objectsDir)`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packDirectory)`: a `GitObjects` that reads loose objects first, then packs; `skipPacked(store, packDirectory)`: a staging store that does not write objects already packed |
+| Loose objects | `FileRawStorage` (`compress` option, default `true`), `PackDirectoryAdapter` (read-only `RawStorage` over packs) |
 | Packs | `PackDirectory`, `PackReader`, `PackDeltaStore`, `PackConsolidator`, `RandomAccessDeltaReader`, `GitPackStoreImpl` / `createGitPackStore`, `DirectPackObjectReader`, `isDeltaType` |
 | Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs? })` with atomic `batch`; `createFilesRefBatch(atomicFiles)`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
 | Working copy | `GitWorkingCopy`, `GitWorkingCopyFactory` / `createGitWorkingCopyFactory`, `GitWorkingCopyConfig` / `createWorkingCopyConfig` (reads and writes `.git/config`), `GitCheckout` / `createGitCheckout`, `GitStashStore` / `createGitStashStore` (`refs/stash`) |
@@ -193,12 +193,18 @@ around `packed-refs`, so a listing never combines states of a batch committing m
 
 ```
 History (blobs / trees / commits / tags / refs)
-  └─ GitObjectStore          adds and strips the "type size\0" header, computes SHA-1
-       └─ CompositeRawStorage
-            ├─ FileRawStorage          read/write  .git/objects/ab/cdef...   (zlib)
-            └─ PackDirectoryAdapter    read-only   .git/objects/pack/*.pack + *.idx
+  └─ withPacks               loose objects first, then packs
+       ├─ GitObjects         adds and strips the "type size\0" header, computes SHA-1
+       │    └─ skipPacked         drops a write whose object is already packed
+       │         └─ filesStagingStore   read/write  .git/objects/ab/cdef...   (zlib)
+       └─ PackDirectory            read-only   .git/objects/pack/*.pack + *.idx
   └─ FileRefStore            .git/HEAD, .git/refs/**, .git/packed-refs, .git/logs/**
 ```
+
+Writing an object that is already packed (`put` or `putRaw`) writes nothing, as git and JGit do.
+`gc()` and `repack()` still work on `FileRawStorage` (the `looseStorage` the backend returns) and
+`PackDirectory`, and ignore files in `objects/` that are not objects (such as git's
+`objects/ab/tmp_obj_*` while it writes).
 
 New objects are always written loose. Packs are only read, until `repack()` turns loose objects
 into a pack. This keeps writes simple (one file per object, no pack index to rewrite) and matches
@@ -239,15 +245,16 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
   accepted and ignored.
 - `FileGcStrategy.getStats().totalSize` counts loose objects only; pack sizes are not included.
   `FileGcStrategy.deltify()` always returns `0`.
-- `FileRawStorage` stores the full `type size\0` header plus content. Use it through
-  `GitObjectStore`, not as a general-purpose blob store, unless you pass `compress: false` and
-  your own keys.
+- `FileRawStorage` stores the full `type size\0` header plus content, compressed. Do not wrap it
+  in `rawStorageStaging()` for `createGitObjects` (that would compress twice); use
+  `filesStagingStore(files, objectsDir)` instead. It is not a general-purpose blob store either,
+  unless you pass `compress: false` and your own keys.
 
 ### Errors
 
 | Situation | Error |
 | --- | --- |
-| Reading a loose object that does not exist | `Key not found: <id>` |
+| `FileRawStorage.load()` of a loose object that does not exist (`objects.get()` returns `undefined` instead) | `Key not found: <id>` |
 | A pack with a bad header | `Invalid pack file signature` / `Unsupported pack version: <n>` |
 | A delta whose base is missing | `Base object not found: <id>` |
 | A broken `packed-refs` file | `Invalid packed-refs line: <line>`, `Peeled line before ref in packed-refs` |
@@ -259,7 +266,7 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
 
 ### Dependencies
 
-- `@statewalker/vcs-core`: the store interfaces, `FilesApi`, `GitObjectStore`,
+- `@statewalker/vcs-core`: the store interfaces, `FilesApi`, `GitObjects`,
   `CompositeRawStorage`, pack reading/writing (`StreamingPackWriter`, `writePackIndexV2`), and
   `createHistoryFromComponents` / `createGitFilesHistory`.
 - `@statewalker/vcs-utils`: zlib `deflate`/`inflate`, SHA-1.

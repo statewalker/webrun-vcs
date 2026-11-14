@@ -9,10 +9,11 @@ import type { Blobs, Commits, Tags, Trees } from "@statewalker/vcs-core";
 import {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createTags,
   createTrees,
-  type GitObjectStore,
+  type GitObjects,
+  rawStorageStaging,
 } from "@statewalker/vcs-core";
 import { KvRawStore } from "../binary-storage/index.js";
 import type { KVStore } from "../kv-store.js";
@@ -22,7 +23,7 @@ import type { KVStore } from "../kv-store.js";
  */
 export interface KvObjectStores {
   /** Low-level Git object store */
-  objects: GitObjectStore;
+  objects: GitObjects;
   /** Blob (file content) store */
   blobs: Blobs;
   /** Tree (directory) store */
@@ -75,7 +76,7 @@ export function createKvObjectStores(options: CreateKvObjectStoresOptions): KvOb
 
   // KvRawStore implements RawStorage directly
   const storage = new KvRawStore(kv, prefix);
-  const objects = createGitObjectStore(storage);
+  const objects = createGitObjects(rawStorageStaging(storage));
 
   return {
     objects,
@@ -90,8 +91,8 @@ export function createKvObjectStores(options: CreateKvObjectStoresOptions): KvOb
 export {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createTags,
   createTrees,
-  type GitObjectStore,
+  type GitObjects,
 } from "@statewalker/vcs-core";

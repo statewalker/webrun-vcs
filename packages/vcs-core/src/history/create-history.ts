@@ -22,6 +22,7 @@ import type {
 import { MemoryDeltaApi } from "../backend/memory-storage-backend.js";
 import type { BackendCapabilities } from "../backend/storage-backend.js";
 import { DefaultSerializationApi } from "../serialization/serialization-api.impl.js";
+import { rawStorageStaging } from "../storage/adapters/staging-blob-store.js";
 import { MemoryRawStorage } from "../storage/raw/memory-raw-storage.js";
 import { createBlobs } from "./blobs/blobs.impl.js";
 import type { Blobs } from "./blobs/blobs.js";
@@ -29,8 +30,8 @@ import { createCommits } from "./commits/commits.impl.js";
 import type { Commits } from "./commits/commits.js";
 import { HistoryImpl, HistoryWithOperationsImpl } from "./history.impl.js";
 import type { History, HistoryWithOperations } from "./history.js";
-import { createGitObjectStore } from "./objects/index.js";
-import type { GitObjectStore } from "./objects/object-store.js";
+import { createGitObjects } from "./objects/git-objects.impl.js";
+import type { GitObjects } from "./objects/git-objects.js";
 import { createMemoryRefs } from "./refs/refs.impl.js";
 import type { Refs } from "./refs/refs.js";
 import { createTags } from "./tags/tags.impl.js";
@@ -64,7 +65,7 @@ export interface HistoryComponentsConfig {
    * Trees, commits, and tags are stored as Git objects with
    * headers for transport compatibility.
    */
-  objects: GitObjectStore;
+  objects: GitObjects;
 
   /**
    * Refs: a `Refs` implementation (such as a store backend's ref store), or
@@ -109,7 +110,7 @@ export function createHistoryFromStores(config: HistoryStoresConfig): History {
  * @example
  * ```typescript
  * const history = createHistoryFromComponents({
- *   objects: createGitObjectStore(new MemoryRawStorage()),
+ *   objects: createGitObjects(rawStorageStaging(new MemoryRawStorage())),
  *   refs: { type: "memory" },
  * });
  * ```
@@ -162,7 +163,7 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
  */
 export function createMemoryHistory(): History {
   const objectStorage = new MemoryRawStorage();
-  const objects = createGitObjectStore(objectStorage);
+  const objects = createGitObjects(rawStorageStaging(objectStorage));
   return createHistoryFromComponents({
     objects,
     refs: { type: "memory" },
@@ -203,7 +204,7 @@ export function createMemoryHistoryWithOperations(
 ): HistoryWithOperations {
   // Create memory object storage for trees, commits, tags
   const objectStorage = new MemoryRawStorage();
-  const objects = createGitObjectStore(objectStorage);
+  const objects = createGitObjects(rawStorageStaging(objectStorage));
 
   // Create typed stores using new interfaces
   const blobs = createBlobs(objects);

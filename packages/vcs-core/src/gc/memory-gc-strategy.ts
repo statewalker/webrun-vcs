@@ -14,7 +14,7 @@ import type { CompactResult, DeltaCandidatePair, GcStrategy, StorageStats } from
  * @example
  * ```typescript
  * const storage = new MemoryRawStorage();
- * const objects = createGitObjectStore(storage);
+ * const objects = createGitObjects(rawStorageStaging(storage));
  * const history = createHistoryFromComponents({ objects, refs: { type: "memory" } });
  * const strategy = new MemoryGcStrategy(storage);
  * const orchestrator = new GcOrchestrator(history, strategy);

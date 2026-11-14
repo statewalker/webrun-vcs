@@ -10,10 +10,11 @@ import {
   type Commits,
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createTags,
   createTrees,
-  type GitObjectStore,
+  type GitObjects,
+  rawStorageStaging,
   type Tags,
   type Trees,
 } from "@statewalker/vcs-core";
@@ -28,7 +29,7 @@ import type { DatabaseClient } from "../database-client.js";
  */
 export interface SqlObjectStores {
   /** Low-level Git object store */
-  objects: GitObjectStore;
+  objects: GitObjects;
   /** Blob (file content) store */
   blobs: Blobs;
   /** Tree (directory) store */
@@ -74,7 +75,7 @@ export function createSqlObjectStores(options: CreateSqlObjectStoresOptions): Sq
 
   // SqlRawStore implements RawStorage directly
   const storage = new SqlRawStore(db, tableName);
-  const objects = createGitObjectStore(storage);
+  const objects = createGitObjects(rawStorageStaging(storage));
 
   return {
     objects,
@@ -89,8 +90,8 @@ export function createSqlObjectStores(options: CreateSqlObjectStoresOptions): Sq
 export {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createTags,
   createTrees,
-  type GitObjectStore,
+  type GitObjects,
 } from "@statewalker/vcs-core";

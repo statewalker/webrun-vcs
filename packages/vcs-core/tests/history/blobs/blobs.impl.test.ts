@@ -6,7 +6,8 @@
 
 import { createBlobs } from "../../../src/history/blobs/blobs.impl.js";
 import type { Blobs } from "../../../src/history/blobs/blobs.js";
-import { createGitObjectStore } from "../../../src/history/objects/index.js";
+import { createGitObjects } from "../../../src/history/objects/index.js";
+import { rawStorageStaging } from "../../../src/storage/adapters/staging-blob-store.js";
 import { MemoryRawStorage } from "../../../src/storage/raw/memory-raw-storage.js";
 import { blobsConformanceTests } from "./blobs.conformance.test.js";
 
@@ -16,7 +17,7 @@ blobsConformanceTests(
   "BlobsImpl",
   async (): Promise<Blobs> => {
     storage = new MemoryRawStorage();
-    return createBlobs(createGitObjectStore(storage));
+    return createBlobs(createGitObjects(rawStorageStaging(storage)));
   },
   async (): Promise<void> => {
     storage.clear();

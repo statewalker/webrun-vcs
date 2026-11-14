@@ -8,26 +8,26 @@
 import {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromStores,
   createTags,
   createTrees,
   type FilesApi,
-  type GitObjectStore,
+  type GitObjects,
   type History,
   joinPath,
 } from "@statewalker/vcs-core";
-import { createFileRefStore, FileRawStorage } from "@statewalker/vcs-store-files";
+import { createFileRefStore, filesStagingStore } from "@statewalker/vcs-store-files";
 
 /**
- * Extended History type that also exposes the GitObjectStore for low-level operations.
+ * Extended History type that also exposes the GitObjects for low-level operations.
  *
  * This is needed for the HTTP server demo to access raw object data for
  * pack file building during push operations.
  */
 export interface FileHistory extends History {
   /** Low-level object store for raw object access */
-  readonly objects: GitObjectStore;
+  readonly objects: GitObjects;
 }
 
 /**
@@ -67,7 +67,7 @@ export interface CreateFileHistoryOptions {
  * const blobId = await history.blobs.store([content]);
  *
  * // Use objects API for low-level access
- * const header = await history.objects.getHeader(id);
+ * const obj = await history.objects.get(id); // { type, size, content }
  * ```
  */
 export async function createFileHistory(options: CreateFileHistoryOptions): Promise<FileHistory> {
@@ -75,11 +75,9 @@ export async function createFileHistory(options: CreateFileHistoryOptions): Prom
 
   const objectsDir = joinPath(gitDir, "objects");
 
-  // Create file storage for objects (FileRawStorage handles zlib compression by default).
-  // All objects (including blobs) go through the same GitObjectStore so they
-  // are stored with Git headers in the shared .git/objects directory.
-  const looseStorage = new FileRawStorage(files, objectsDir);
-  const objects = createGitObjectStore(looseStorage);
+  // All objects (including blobs) go through one GitObjects over git's loose
+  // layout (zlib, written through tmp_obj_* and a rename) in .git/objects.
+  const objects = createGitObjects(filesStagingStore(files, objectsDir));
   const refStore = createFileRefStore(files, gitDir);
 
   const blobs = createBlobs(objects);
@@ -120,7 +118,7 @@ export async function createFileHistory(options: CreateFileHistoryOptions): Prom
   // properties, so `{ ...history }` would silently drop those methods — which
   // makes the transport RepositoryFacade throw
   // "history.collectReachableObjects is not a function" during upload-pack.
-  const fileHistory = history as History & { objects: GitObjectStore };
+  const fileHistory = history as History & { objects: GitObjects };
   fileHistory.objects = objects;
   return fileHistory;
 }

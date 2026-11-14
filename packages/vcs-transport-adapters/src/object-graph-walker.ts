@@ -12,14 +12,14 @@
  */
 
 import {
-  type GitObjectStore,
+  type GitObjects,
   type ObjectId,
   ObjectType,
   type ObjectTypeCode,
   parseCommit,
   parseTree,
 } from "@statewalker/vcs-core";
-import { collect } from "@statewalker/vcs-utils/streams";
+import { loadObject } from "./object-access.js";
 
 /**
  * Object graph walker interface.
@@ -52,12 +52,12 @@ const TYPE_STRING_TO_CODE: Record<string, ObjectTypeCode> = {
 };
 
 /**
- * Create an object graph walker for a GitObjectStore.
+ * Create an object graph walker for a GitObjects.
  *
  * @param objectStore - The object store to walk
  * @returns ObjectGraphWalker instance
  */
-export function createObjectGraphWalker(objectStore: GitObjectStore): ObjectGraphWalker {
+export function createObjectGraphWalker(objectStore: GitObjects): ObjectGraphWalker {
   return {
     async *walk(
       wants: ObjectId[],
@@ -79,7 +79,7 @@ export function createObjectGraphWalker(objectStore: GitObjectStore): ObjectGrap
  */
 async function* walkObject(
   id: ObjectId,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {
@@ -96,8 +96,7 @@ async function* walkObject(
   }
 
   // Load object with header
-  const [header, contentStream] = await objectStore.loadWithHeader(id);
-  const content = await collect(contentStream);
+  const { header, content } = await loadObject(objectStore, id);
   const typeCode = TYPE_STRING_TO_CODE[header.type];
 
   if (typeCode === undefined) {
@@ -131,7 +130,7 @@ async function* walkObject(
 async function* walkCommit(
   _id: ObjectId,
   content: Uint8Array,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {
@@ -157,7 +156,7 @@ async function* walkCommit(
  */
 async function* walkTree(
   content: Uint8Array,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {
@@ -176,7 +175,7 @@ async function* walkTree(
  */
 async function* walkTag(
   content: Uint8Array,
-  objectStore: GitObjectStore,
+  objectStore: GitObjects,
   haves: Set<ObjectId>,
   seen: Set<ObjectId>,
 ): AsyncGenerator<{ id: ObjectId; type: ObjectTypeCode; content: Uint8Array }> {

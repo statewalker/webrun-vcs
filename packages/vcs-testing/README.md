@@ -33,13 +33,11 @@ Every suite has the same shape: `createXxxTests(name, factory)`, where `factory`
 | `createCommitStoreTests` | `commitStore: Commits` |
 | `createTagStoreTests` | `tagStore: Tags` |
 | `createRefStoreTests` | `refStore: Refs` |
-| `createGitObjectStoreTests` | `objectStore: GitObjectStore` |
 | `createStagingStoreTests` | `stagingStore: Staging`, `trees?: Trees` |
 | `createStashStoreTests` | `stashStore: StashStore`, `setupStagedChanges?` |
 | `createWorktreeStoreTests` | `worktreeStore: Worktree`, `setupFiles?` |
 | `createRawStorageTests` | `rawStorage: RawStorage` |
 | `createGitObjectsTests` | `objects: GitObjects`, `store: StagingBlobStore` (the store under the kernel) |
-| `createVolatileStoreTests` | `volatileStore: VolatileStore` |
 | `createDeltaApiTests` | `deltaApi: DeltaApi`, `createTestBlobs?` |
 | `createStreamingStoresTests` | `stores: History` |
 | `createGitCompatibilityTests` | `stores: History` |

@@ -10,24 +10,25 @@
  */
 
 import {
-  CompressedRawStorage,
   createGitObject,
-  createGitObjectStore,
+  createGitObjects,
   createInMemoryFilesApi,
   createMemoryHistory,
   encodeObjectHeader,
   extractGitObjectContent,
   type FilesApi,
-  type GitObjectStore,
+  type GitObjects,
   type History,
   joinPath,
   MemoryRawStorage,
   parseHeader,
+  rawStorageStaging,
 } from "@statewalker/vcs-core";
 import { deflate, inflate } from "@statewalker/vcs-utils";
 import { sha1 } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { filesStagingStore } from "../../src/storage/loose/index.js";
 import { FileRawStorage } from "../../src/storage/raw/index.js";
 
 // Helper to compute sha1 and return hex string
@@ -245,19 +246,18 @@ describe("Git Files Format Compliance", () => {
     });
   });
 
-  describe("GitObjectStore with Compressed Storage", () => {
+  describe("GitObjects over a RawStorage (zlib by the kernel)", () => {
     let innerStorage: MemoryRawStorage;
-    let store: GitObjectStore;
+    let store: GitObjects;
 
     beforeEach(() => {
       innerStorage = new MemoryRawStorage();
-      const compressedStorage = new CompressedRawStorage(innerStorage);
-      store = createGitObjectStore(compressedStorage);
+      store = createGitObjects(rawStorageStaging(innerStorage));
     });
 
     it("stores blob with correct SHA-1", async () => {
       const content = toBytes("hello");
-      const id = await store.store("blob", [content]);
+      const id = await store.put("blob", content.length, [content]);
 
       // Should be the known SHA-1 for "blob 5\0hello"
       expect(id).toBe("b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0");
@@ -265,15 +265,15 @@ describe("Git Files Format Compliance", () => {
 
     it("stores and loads blob correctly", async () => {
       const originalContent = toBytes("test content");
-      const id = await store.store("blob", [originalContent]);
+      const id = await store.put("blob", originalContent.length, [originalContent]);
 
-      const loaded = await collectBytes(store.load(id));
+      const loaded = await collectBytes((await store.get(id))?.content ?? []);
       expect(loaded).toEqual(originalContent);
     });
 
     it("stores compressed content in underlying storage", async () => {
       const content = toBytes("hello world");
-      const id = await store.store("blob", [content]);
+      const id = await store.put("blob", content.length, [content]);
 
       // Get raw bytes from the inner (uncompressed) storage
       const rawStored = await collectBytes(innerStorage.load(id));
@@ -284,10 +284,10 @@ describe("Git Files Format Compliance", () => {
 
     it("loads raw content with header", async () => {
       const content = toBytes("hello");
-      const id = await store.store("blob", [content]);
+      const id = await store.put("blob", content.length, [content]);
 
-      // loadRaw should return header + content (decompressed by storage layer)
-      const raw = await collectBytes(store.loadRaw(id));
+      // getRaw returns header + content, inflated by the kernel
+      const raw = await collectBytes(store.getRaw(id));
 
       // Should start with "blob 5\0"
       expect(bytesToString(raw.subarray(0, 7))).toBe("blob 5\0");
@@ -298,7 +298,7 @@ describe("Git Files Format Compliance", () => {
 
     it("has returns true for stored objects", async () => {
       const content = toBytes("test");
-      const id = await store.store("blob", [content]);
+      const id = await store.put("blob", content.length, [content]);
 
       expect(await store.has(id)).toBe(true);
       expect(await store.has("0".repeat(40))).toBe(false);
@@ -308,19 +308,19 @@ describe("Git Files Format Compliance", () => {
   describe("Loose Object Path Structure", () => {
     let files: FilesApi;
     let storage: FileRawStorage;
-    let store: GitObjectStore;
+    let store: GitObjects;
     const basePath = "/objects";
 
     beforeEach(async () => {
       files = createInMemoryFilesApi();
       await files.mkdir(basePath);
       storage = new FileRawStorage(files, basePath);
-      store = createGitObjectStore(storage);
+      store = createGitObjects(filesStagingStore(files, basePath));
     });
 
     it("stores object with 2-char prefix directory", async () => {
       const content = toBytes("hello");
-      const id = await store.store("blob", [content]);
+      const id = await store.put("blob", content.length, [content]);
 
       // ID should be 40 chars
       expect(id).toHaveLength(40);
@@ -336,7 +336,7 @@ describe("Git Files Format Compliance", () => {
 
     it("creates prefix directory automatically", async () => {
       const content = toBytes("test content");
-      const id = await store.store("blob", [content]);
+      const id = await store.put("blob", content.length, [content]);
 
       const prefix = id.substring(0, 2);
       const dirPath = joinPath(basePath, prefix);
@@ -351,7 +351,7 @@ describe("Git Files Format Compliance", () => {
       // Store many objects to get different prefixes
       for (let i = 0; i < 10; i++) {
         const content = toBytes(`content-${i}`);
-        const id = await store.store("blob", [content]);
+        const id = await store.put("blob", content.length, [content]);
         ids.add(id.substring(0, 2));
       }
 
@@ -363,7 +363,9 @@ describe("Git Files Format Compliance", () => {
       const storedIds: string[] = [];
 
       for (let i = 0; i < 5; i++) {
-        const id = await store.store("blob", [toBytes(`content-${i}`)]);
+        const id = await store.put("blob", toBytes(`content-${i}`).length, [
+          toBytes(`content-${i}`),
+        ]);
         storedIds.push(id);
       }
 

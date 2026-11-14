@@ -1,12 +1,13 @@
 /**
- * Tests for domain stores (GitObjectStore, GitBlobStore, GitCommits, GitTrees, GitTags)
+ * Tests for domain stores (GitBlobStore, GitCommits, GitTrees, GitTags) over GitObjects
  */
 
 import { describe, expect, it } from "vitest";
 import { FileMode } from "../../src/common/files/index.js";
 import { createBlobs, createCommits, createTags, createTrees } from "../../src/history/index.js";
-import { createGitObjectStore } from "../../src/history/objects/object-store.impl.js";
+import { createGitObjects } from "../../src/history/objects/git-objects.impl.js";
 import { ObjectType } from "../../src/history/objects/object-types.js";
+import { rawStorageStaging } from "../../src/storage/adapters/staging-blob-store.js";
 import { MemoryRawStorage } from "../../src/storage/raw/memory-raw-storage.js";
 import { collectBytes } from "../helpers/assertion-helpers.js";
 import {
@@ -17,7 +18,7 @@ import {
 
 function createTestStores() {
   const storage = new MemoryRawStorage();
-  const objectStore = createGitObjectStore(storage);
+  const objectStore = createGitObjects(rawStorageStaging(storage));
   return {
     storage,
     objectStore,
@@ -27,111 +28,6 @@ function createTestStores() {
     tagStore: createTags(objectStore),
   };
 }
-
-describe("GitObjectStoreImpl", () => {
-  it("stores and loads blob objects", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("Hello, World!");
-
-    const id = await objectStore.store("blob", [content]);
-
-    expect(id).toMatch(/^[0-9a-f]{40}$/);
-    const loaded = await collectBytes(objectStore.load(id));
-    expect(new TextDecoder().decode(loaded)).toBe("Hello, World!");
-  });
-
-  it("stores and loads with correct header", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("test content");
-
-    const id = await objectStore.store("blob", [content]);
-
-    const [header, contentStream] = await objectStore.loadWithHeader(id);
-    expect(header.type).toBe("blob");
-    expect(header.size).toBe(12);
-    const loadedContent = await collectBytes(contentStream);
-    expect(new TextDecoder().decode(loadedContent)).toBe("test content");
-  });
-
-  it("loads raw object with header", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("blob data");
-
-    const id = await objectStore.store("blob", [content]);
-
-    const raw = await collectBytes(objectStore.loadRaw(id));
-    const rawStr = new TextDecoder().decode(raw);
-    expect(rawStr).toBe("blob 9\0blob data");
-  });
-
-  it("gets header without loading content", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("some content");
-
-    const id = await objectStore.store("blob", [content]);
-
-    const header = await objectStore.getHeader(id);
-    expect(header.type).toBe("blob");
-    expect(header.size).toBe(12);
-  });
-
-  it("checks if object exists", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("test");
-
-    const id = await objectStore.store("blob", [content]);
-
-    expect(await objectStore.has(id)).toBe(true);
-    expect(await objectStore.has("nonexistent")).toBe(false);
-  });
-
-  it("removes objects", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("remove me");
-
-    const id = await objectStore.store("blob", [content]);
-    expect(await objectStore.has(id)).toBe(true);
-
-    const removed = await objectStore.remove(id);
-    expect(removed).toBe(true);
-    expect(await objectStore.has(id)).toBe(false);
-  });
-
-  it("lists all object IDs", async () => {
-    const { objectStore } = createTestStores();
-
-    const id1 = await objectStore.store("blob", [new TextEncoder().encode("content1")]);
-    const id2 = await objectStore.store("blob", [new TextEncoder().encode("content2")]);
-
-    const ids: string[] = [];
-    for await (const id of objectStore.list()) {
-      ids.push(id);
-    }
-
-    expect(ids).toContain(id1);
-    expect(ids).toContain(id2);
-  });
-
-  it("produces consistent hash for same content", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("same content");
-
-    const id1 = await objectStore.store("blob", [content]);
-    const id2 = await objectStore.store("blob", [content]);
-
-    expect(id1).toBe(id2);
-  });
-
-  it("produces different hash for different types", async () => {
-    const { objectStore } = createTestStores();
-    const content = new TextEncoder().encode("same bytes");
-
-    const blobId = await objectStore.store("blob", [content]);
-    // Note: Normally you wouldn't store arbitrary bytes as a commit, but this tests the hash
-    // We skip this test since commit has specific format requirements
-    expect(blobId).toMatch(/^[0-9a-f]{40}$/);
-  });
-});
 
 describe("GitBlobStore", () => {
   it("stores and loads blob content", async () => {

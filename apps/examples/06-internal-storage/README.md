@@ -81,8 +81,8 @@ The step deletes any previous `test-repo/`, builds a file-backed History, and st
 The History is assembled from parts in `shared/index.ts`, because the example needs the raw object store as well as the typed stores:
 
 ```typescript
-import { createGitObjectStore, createHistoryFromComponents, FileMode } from "@statewalker/vcs-core";
-import { createFileRefStore, FileRawStorage } from "@statewalker/vcs-store-files";
+import { createGitObjects, createHistoryFromComponents, FileMode } from "@statewalker/vcs-core";
+import { createFileRefStore, filesStagingStore } from "@statewalker/vcs-store-files";
 import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -90,7 +90,7 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 setCompressionUtils(createNodeCompression());
 
 const files = createNodeFilesApi({ rootDir: "test-repo" });
-const objects = createGitObjectStore(new FileRawStorage(files, ".git/objects"));
+const objects = createGitObjects(filesStagingStore(files, ".git/objects"));
 const history = createHistoryFromComponents({
   objects,
   refs: createFileRefStore(files, ".git"),
@@ -180,7 +180,7 @@ const { count: looseAfter } = await countLooseObjects(); // 0
 
 **File:** [src/steps/04-direct-storage.ts](src/steps/04-direct-storage.ts)
 
-Blobs can be stored and loaded without staging or committing. The id is the hash of the content, so storing the same bytes twice returns the same id and stores nothing new. The step stores text, JSON and binary data, and reads type and size with `objects.getHeader()` without loading the content.
+Blobs can be stored and loaded without staging or committing. The id is the hash of the content, so storing the same bytes twice returns the same id and stores nothing new. The step stores text, JSON and binary data, and reads type and size with `objects.get()`, releasing the content unread.
 
 ```typescript
 const version1 = new TextEncoder().encode("Version 1 content");
@@ -194,13 +194,14 @@ if (stream) {
   for await (const chunk of stream) chunks.push(chunk);
 }
 
-const header = await history.objects.getHeader(id1); // { type: "blob", size: 17 }
+const obj = await objects.get(id1); // { type: "blob", size: 17, content }
+await obj?.content[Symbol.asyncIterator]().return?.(); // only the header was inflated
 ```
 
 **Key APIs:**
 - `history.blobs.store(chunks)` - store bytes, returns the content-addressed id
 - `history.blobs.load(id)` - content as an async iterable of chunks
-- `objects.getHeader(id)` - object type and size
+- `objects.get(id)` - object type, size and a content stream
 
 ### Step 5: A delta is copy and insert instructions against a base
 
@@ -245,14 +246,14 @@ The step then deltas a 271-byte document against a 362-byte revision and prints 
 ## Why it is the way it is
 
 - **A real directory, not memory.** Loose objects and packs are files; the point of the example is to look at them. Writing a standard `.git` layout means `git` can verify the result.
-- **The History is built from parts.** `createHistoryFromComponents()` with a `FileRawStorage` keeps a handle on the `GitObjectStore`, which step 04 needs for `getHeader()`. `FileRawStorage` compresses with zlib by default, which is what makes the files valid loose objects.
+- **The History is built from parts.** `createHistoryFromComponents()` with `createGitObjects(filesStagingStore(...))` keeps a handle on the `GitObjects` kernel, which step 04 needs for `get()`. The kernel stores every object as a zlib stream named by its SHA-1, which is what makes the files valid loose objects.
 - **Compression is installed first.** `shared/index.ts` calls `setCompressionUtils(createNodeCompression())` at import time, before any storage call, so compression and decompression (including `decompressBlock()` in steps 01-02) use the Node implementation from `@statewalker/vcs-utils-node`.
 - **Steps run cumulatively.** Steps 02-04 operate on the repository step 01 created, so `--step=NN` runs the earlier steps first instead of failing.
 
 ## What will surprise you
 
 - **It writes `test-repo/` into the current working directory.** With `pnpm --filter ... start` that is the app directory (ignored by the app's `.gitignore`). Running `tsx src/main.ts` from elsewhere creates `test-repo/` there. Step 01 deletes and recreates it on every run.
-- **After step 03 the History cannot read the packed objects.** The History reads only loose objects through `FileRawStorage`; nothing in the example registers the pack for reading. After the loose copies are deleted, `history.commits.load()` of the step 01 commit returns `undefined`. `git` itself reads the pack fine. Step 04 still works because it only stores and loads new blobs, which are written as new loose objects.
+- **After step 03 the History cannot read the packed objects.** The History reads only loose objects through `filesStagingStore`; nothing in the example registers the pack for reading. After the loose copies are deleted, `history.commits.load()` of the step 01 commit returns `undefined`. `git` itself reads the pack fine. Step 04 still works because it only stores and loads new blobs, which are written as new loose objects.
 - **Garbage collection does not check what was packed.** Step 03 deletes every loose object it finds. Anything written after step 02 and before step 03 would be lost.
 - **Ids and timestamps change on every run.** The commit uses the current time, and log lines are prefixed with the wall-clock time.
 - **Unknown step names exit with code 1.** `--step=09` prints `Unknown step: 09` and the list of valid `--step=` values. A step that throws prints `Step <name> failed:` (all-steps mode) or `Fatal error:` and exits with code 1. Steps 02-04 throw `History not initialized. Run step 01 first.` if called without step 01, which only happens when the step modules are imported directly.
@@ -272,10 +273,10 @@ The step then deltas a 271-byte document against a 362-byte revision and prints 
 | API | Location |
 |-----|----------|
 | `createHistoryFromComponents` | [packages/vcs-core/src/history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) |
-| `createGitObjectStore`, `GitObjectStore` | [packages/vcs-core/src/history/objects/](../../../packages/vcs-core/src/history/objects/) |
+| `createGitObjects`, `GitObjects` | [packages/vcs-core/src/history/objects/](../../../packages/vcs-core/src/history/objects/) |
 | `PackWriterStream` | [packages/vcs-core/src/pack/pack-writer.ts](../../../packages/vcs-core/src/pack/pack-writer.ts) |
 | `writePackIndexV2` | [packages/vcs-core/src/pack/pack-index-writer.ts](../../../packages/vcs-core/src/pack/pack-index-writer.ts) |
-| `FileRawStorage` | [packages/vcs-store-files/src/storage/raw/file-raw-storage.ts](../../../packages/vcs-store-files/src/storage/raw/file-raw-storage.ts) |
+| `filesStagingStore` | [packages/vcs-store-files/src/storage/loose/files-staging-store.ts](../../../packages/vcs-store-files/src/storage/loose/files-staging-store.ts) |
 | `createFileRefStore` | [packages/vcs-store-files/src/refs/ref-store.files.ts](../../../packages/vcs-store-files/src/refs/ref-store.files.ts) |
 | `createDeltaRanges` | [packages/vcs-utils/src/diff/delta/create-delta-ranges.ts](../../../packages/vcs-utils/src/diff/delta/create-delta-ranges.ts) |
 | `createDelta` | [packages/vcs-utils/src/diff/delta/create-delta.ts](../../../packages/vcs-utils/src/diff/delta/create-delta.ts) |

@@ -5,15 +5,9 @@
 import { execSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type {
-  FilesApi,
-  GitObjectStore,
-  History,
-  ObjectId,
-  PersonIdent,
-} from "@statewalker/vcs-core";
-import { createGitObjectStore, createHistoryFromComponents, joinPath } from "@statewalker/vcs-core";
-import { createFileRefStore, FileRawStorage } from "@statewalker/vcs-store-files";
+import type { FilesApi, GitObjects, History, ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import { createGitObjects, createHistoryFromComponents, joinPath } from "@statewalker/vcs-core";
+import { createFileRefStore, filesStagingStore } from "@statewalker/vcs-store-files";
 import { setCompressionUtils } from "@statewalker/vcs-utils";
 import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -35,12 +29,12 @@ export const PACK_DIR = path.join(OBJECTS_DIR, "pack");
 // ============================================================================
 
 /**
- * Extended History type that also exposes the GitObjectStore for low-level operations.
+ * Extended History type that also exposes the GitObjects for low-level operations.
  * This is needed for internal storage demonstrations.
  */
 export interface FileHistory extends History {
   /** Low-level object store for raw object access */
-  readonly objects: GitObjectStore;
+  readonly objects: GitObjects;
 }
 
 // ============================================================================
@@ -125,11 +119,8 @@ export async function createFileHistory(options: {
 
   const objectsDir = joinPath(gitDir, "objects");
 
-  // Create file storage for objects (FileRawStorage compresses by default)
-  const looseStorage = new FileRawStorage(files, objectsDir);
-
-  // Create Git object store for blobs, trees, commits, tags
-  const objects = createGitObjectStore(looseStorage);
+  // Git objects (blobs, trees, commits, tags) as loose objects in .git/objects
+  const objects = createGitObjects(filesStagingStore(files, objectsDir));
 
   // Create file-based ref store
   const refStore = createFileRefStore(files, gitDir);

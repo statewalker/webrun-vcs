@@ -2,10 +2,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  createGitObjectStore,
+  createGitObjects,
   MemoryRawStorage,
   MemoryRefs,
   type Refs,
+  rawStorageStaging,
 } from "@statewalker/vcs-core";
 import { createRefsStructure, FileRefStore } from "@statewalker/vcs-store-files";
 import { createNodeAtomicFiles, createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -41,7 +42,7 @@ describe.each(backends)("createCoreRepositoryAccess.updateRef [%s]", (_name, mak
   async function setup() {
     const refs = await makeRefs();
     const access = createCoreRepositoryAccess({
-      objectStore: createGitObjectStore(new MemoryRawStorage()),
+      objectStore: createGitObjects(rawStorageStaging(new MemoryRawStorage())),
       refStore: refs,
     });
     return { refs, access };

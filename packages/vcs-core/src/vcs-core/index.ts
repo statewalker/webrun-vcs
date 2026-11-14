@@ -22,7 +22,7 @@ import type { Commit } from "../history/commits/commits.js";
 import {
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromStores,
   createTags,
   createTrees,
@@ -34,6 +34,7 @@ import { DefaultSerializationApi } from "../serialization/serialization-api.impl
 import type { SerializationApi } from "../serialization/serialization-api.js";
 import { blobStoreToRawStorage } from "../storage/adapters/blob-store-raw-storage.js";
 import { kvStoreRefs } from "../storage/adapters/kv-store-refs.js";
+import { rawStorageStaging } from "../storage/adapters/staging-blob-store.js";
 import type { RawStorage } from "../storage/raw/raw-storage.js";
 
 /** Object id (git SHA-1 hex string). */
@@ -123,7 +124,7 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
   // Build the existing engine over the seam. `raw` is reused by the GC strategy
   // so pruning removes the same bytes the engine reads.
   const raw: RawStorage = blobStoreToRawStorage(deps.objects);
-  const objects = createGitObjectStore(raw);
+  const objects = createGitObjects(rawStorageStaging(raw));
   const history: History = createHistoryFromStores({
     blobs: createBlobs(objects),
     trees: createTrees(objects),

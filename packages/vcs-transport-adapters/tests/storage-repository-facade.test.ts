@@ -18,12 +18,13 @@ import {
   blobStoreToRawStorage,
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromStores,
   createTags,
   createTrees,
   type History,
   kvStoreRefs,
+  rawStorageStaging,
 } from "@statewalker/vcs-core";
 import {
   Fsm,
@@ -63,7 +64,7 @@ function buildRepo(): StorageRepo {
   const objects = memBlobStore();
   const refs = memKvStore();
   const { facade, refStore } = createStorageRepositoryFacade({ objects, refs });
-  const objectStore = createGitObjectStore(blobStoreToRawStorage(objects));
+  const objectStore = createGitObjects(rawStorageStaging(blobStoreToRawStorage(objects)));
   const history = createHistoryFromStores({
     blobs: createBlobs(objectStore),
     trees: createTrees(objectStore),

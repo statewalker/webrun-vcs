@@ -4,7 +4,7 @@
  *
  * It mirrors `createVcsCore`'s internal wiring
  * (packages/vcs-core/src/vcs-core/index.ts): object bytes ride
- * {@link blobStoreToRawStorage}(objects) → {@link createGitObjectStore}, refs ride
+ * {@link blobStoreToRawStorage}(objects) → {@link createGitObjects}, refs ride
  * {@link kvStoreRefs}(refs), and the {@link History} composed from those stores
  * backs both a {@link DefaultSerializationApi} (packs) and the
  * {@link VcsRepositoryFacade}. The returned {@link RefStore} adapts the same core
@@ -20,12 +20,13 @@ import {
   blobStoreToRawStorage,
   createBlobs,
   createCommits,
-  createGitObjectStore,
+  createGitObjects,
   createHistoryFromStores,
   createTags,
   createTrees,
   DefaultSerializationApi,
   kvStoreRefs,
+  rawStorageStaging,
   type SerializationApi,
 } from "@statewalker/vcs-core";
 import {
@@ -63,7 +64,7 @@ export function createStorageRepositoryFacade(
   deps: StorageRepositoryFacadeDeps,
 ): StorageRepositoryFacade {
   const raw = blobStoreToRawStorage(deps.objects);
-  const objectStore = createGitObjectStore(raw);
+  const objectStore = createGitObjects(rawStorageStaging(raw));
   const coreRefs = kvStoreRefs(deps.refs);
   const history = createHistoryFromStores({
     blobs: createBlobs(objectStore),

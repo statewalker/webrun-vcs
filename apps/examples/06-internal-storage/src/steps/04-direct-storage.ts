@@ -11,7 +11,16 @@
  * - Custom data deduplication
  */
 
+import type { GitObjects } from "@statewalker/vcs-core";
 import { log, logInfo, logSection, logSuccess, shortId, state } from "../shared/index.js";
+
+/** An object's type and size: `get` inflates only the header until the content is read. */
+async function objectHeader(objects: GitObjects, id: string) {
+  const obj = await objects.get(id);
+  if (!obj) throw new Error(`Object not found: ${id}`);
+  await obj.content[Symbol.asyncIterator]().return?.();
+  return { type: obj.type, size: obj.size };
+}
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -79,8 +88,8 @@ export async function run(): Promise<void> {
   // Get object metadata
   log("\n--- Object Metadata ---\n");
 
-  const header1 = await history.objects.getHeader(id1);
-  const header2 = await history.objects.getHeader(id2);
+  const header1 = await objectHeader(history.objects, id1);
+  const header2 = await objectHeader(history.objects, id2);
 
   log("Version 1 metadata:");
   logInfo("  Type", header1.type);
