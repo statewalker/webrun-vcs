@@ -60,4 +60,59 @@ describe("createPeerMux", () => {
     channel.port1.close();
     channel.port2.close();
   });
+
+  it("keeps a replacement handler when the earlier serve is stopped", async () => {
+    const channel = new MessageChannel();
+    const a = createPeerMux(channel.port1, { side: "initiator" });
+    const b = createPeerMux(channel.port2, { side: "responder" });
+    const stopFirst = b.serve(tagging("first"));
+    const stopSecond = b.serve(tagging("second"));
+    try {
+      await stopFirst();
+      expect(await collect(a.call([encoder.encode("x")]))).toBe("second:x");
+    } finally {
+      await stopSecond();
+      await a.close();
+      await b.close();
+      channel.port1.close();
+      channel.port2.close();
+    }
+  });
+
+  it("streams a payload larger than the window in both directions", async () => {
+    const channel = new MessageChannel();
+    const a = createPeerMux(channel.port1, {
+      side: "initiator",
+      window: 64 * 1024,
+      maxMessageSize: 16 * 1024,
+    });
+    const b = createPeerMux(channel.port2, {
+      side: "responder",
+      window: 64 * 1024,
+      maxMessageSize: 16 * 1024,
+    });
+    const echo = async function* (input: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+      for await (const chunk of input) yield chunk;
+    };
+    const stopA = a.serve(echo);
+    const stopB = b.serve(echo);
+    const chunks = Array.from({ length: 40 }, (_, i) => new Uint8Array(10 * 1024).fill(i));
+    const total = async (stream: AsyncIterable<Uint8Array>) => {
+      let n = 0;
+      for await (const chunk of stream) n += chunk.length;
+      return n;
+    };
+    try {
+      const [ab, ba] = await Promise.all([total(a.call(chunks)), total(b.call(chunks))]);
+      expect(ab).toBe(400 * 1024);
+      expect(ba).toBe(400 * 1024);
+    } finally {
+      await stopA();
+      await stopB();
+      await a.close();
+      await b.close();
+      channel.port1.close();
+      channel.port2.close();
+    }
+  });
 });

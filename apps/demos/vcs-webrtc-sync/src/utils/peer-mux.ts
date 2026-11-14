@@ -38,7 +38,16 @@ export interface PeerMuxOptions {
   signal?: AbortSignal;
   /** Payload ceiling of the transport; bodies are chunked under it. */
   maxMessageSize?: number;
+  /**
+   * Per-port flow-control window in bytes (default 1 MiB). With a window a
+   * port keeps up to this many bytes in flight instead of waiting a round trip
+   * for every chunk; both ends run this module, so both understand it.
+   */
+  window?: number;
 }
+
+/** Default per-port window: pipelines transfers without unbounded buffering. */
+export const DEFAULT_PEER_WINDOW = 1024 * 1024;
 
 /** Wrap a pipe of bytes (a `messageTargetOver…` target) as a {@link PeerMux}. */
 export function createPeerMux(pipe: MessageTarget, options: PeerMuxOptions): PeerMux {
@@ -48,6 +57,7 @@ export function createPeerMux(pipe: MessageTarget, options: PeerMuxOptions): Pee
     side: options.side,
     signal: options.signal,
     maxMessageSize: options.maxMessageSize,
+    window: options.window ?? DEFAULT_PEER_WINDOW,
     onPort: (port, meta) => (inbound ? inbound(port, meta) : false),
   });
   const shared: PortMux = {
@@ -57,12 +67,29 @@ export function createPeerMux(pipe: MessageTarget, options: PeerMuxOptions): Pee
     maxMessageSize: mux.maxMessageSize,
   };
 
+  // `connect` builds its mux synchronously from the factory, but resolves the
+  // client asynchronously. Wait for it once, then hand calls straight to the
+  // client's `call` so its prompt cancellation (`return()` while a `next()`
+  // waits) is kept.
   const client = connect({ mux: () => shared });
-  const call: Duplex = (input) =>
-    (async function* () {
-      const { call: inner } = await client;
-      yield* inner(input);
-    })();
+  const call: Duplex = (input) => {
+    const ready = client.then(({ call: inner }) => inner(input)[Symbol.asyncIterator]());
+    return {
+      next: async () => (await ready).next(),
+      return: async (value?: unknown) => {
+        const it = await ready;
+        return it.return ? it.return(value) : { done: true, value: undefined };
+      },
+      throw: async (error?: unknown) => {
+        const it = await ready;
+        if (it.throw) return it.throw(error);
+        throw error;
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    } as AsyncGenerator<Uint8Array>;
+  };
 
   return {
     call,
@@ -76,9 +103,12 @@ export function createPeerMux(pipe: MessageTarget, options: PeerMuxOptions): Pee
         },
         handler,
       );
+      // `serve` calls its factory synchronously, so `inbound` is ours now.
+      const mine = inbound;
       return async () => {
-        inbound = undefined;
         await (await stop)();
+        // Clear only our own handler: a later `serve` may have replaced it.
+        if (inbound === mine) inbound = undefined;
       };
     },
     async close() {

@@ -122,6 +122,10 @@ async function connectToRoom(): Promise<void> {
   });
 
   instance.on(RoomEvent.Disconnected, () => {
+    // Muxes are bound to this Room; a reconnect must build new ones.
+    for (const identity of [...participantMuxes.keys()]) {
+      cleanupParticipant(identity);
+    }
     connected = false;
     log("Connection state: disconnected");
     updateConnectionStatus("disconnected");
@@ -181,6 +185,19 @@ function setupParticipant(identity: string): void {
   const { target, signal, maxMessageSize } = messageTargetOverLiveKit(room, identity);
   const mux = createPeerMux(target, { side, signal, maxMessageSize });
   participantMuxes.set(identity, mux);
+  // The pipe can end while the participant stays in the room (a failed
+  // publish, an oversized post, the peer's goodbye). Drop the dead mux so the
+  // next `setupParticipant` builds a fresh one instead of reusing it.
+  signal.addEventListener(
+    "abort",
+    () => {
+      if (participantMuxes.get(identity) !== mux) return;
+      cleanupParticipant(identity);
+      log(`Connection to ${identity} ended`);
+      updatePeerList();
+    },
+    { once: true },
+  );
 
   // Start Git server for this participant
   const stopServer = setupGitPeerServer({
@@ -315,6 +332,10 @@ async function handleAddFile(): Promise<void> {
 async function handleSync(identity: string): Promise<void> {
   if (!history || !serialization) return;
 
+  // Rebuild the connection if its pipe ended while the participant stayed.
+  if (!participantMuxes.has(identity) && room?.remoteParticipants.has(identity)) {
+    setupParticipant(identity);
+  }
   const mux = participantMuxes.get(identity);
   if (!mux) {
     log(`No connection to ${identity}`, "error");
