@@ -1,5 +1,5 @@
 /**
- * SQL-based RefStore implementation
+ * SQL-based Refs implementation
  *
  * Stores Git references in a SQL database.
  */

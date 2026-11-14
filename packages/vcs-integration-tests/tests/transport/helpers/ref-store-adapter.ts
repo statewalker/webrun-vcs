@@ -1,7 +1,7 @@
 /**
  * RefStore adapter for transport integration tests
  *
- * Wraps the core RefStore interface to implement the transport-layer
+ * Wraps the core Refs interface to implement the transport-layer
  * RefStore interface used by fetch/push operations.
  */
 
@@ -12,14 +12,14 @@ import {
 } from "@statewalker/vcs-transport";
 
 /**
- * Creates a transport-layer RefStore from a core RefStore
+ * Creates a transport-layer RefStore  from a core Refs
  *
  * The transport layer uses a simpler RefStore interface with:
  * - get(name) -> string | undefined (returns OID directly)
  * - update(name, oid) -> void
  * - listAll() -> Iterable<[name, oid]>
  *
- * @param coreRefStore Core RefStore from HistoryStore
+ * @param coreRefStore Core Refs from History
  * @returns Transport-compatible RefStore
  *
  * @example

@@ -5,7 +5,7 @@
  * No serialization overhead - just delegates to the underlying store.
  *
  * Can also implement full RepositoryAccess from transport package when
- * RefStore is provided.
+ * `Refs` is provided.
  */
 
 import {
@@ -299,10 +299,14 @@ export function createCoreRepositoryAccess(options: CoreRepositoryAccessOptions)
       newId: ObjectId | null,
     ): Promise<boolean> {
       // One atomic command. `oldId` null means "must not exist" for a create or
-      // update, and "no check" for a delete (as before).
-      const old = newId === null && oldId === null ? undefined : oldId;
-      const r = await refStore.batch([{ name, old, new: newId }]);
-      return r.ok;
+      // update. A delete removes the named ref itself (a symbolic ref, not its
+      // target), checks `oldId` when given, and reports false for a missing ref.
+      if (newId === null) {
+        if (!(await refStore.get(name))) return false;
+        const old = oldId === null ? undefined : oldId;
+        return (await refStore.batch([{ name, old, new: null, noDeref: true }])).ok;
+      }
+      return (await refStore.batch([{ name, old: oldId, new: newId }])).ok;
     },
 
     async *walkObjects(

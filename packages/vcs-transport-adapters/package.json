@@ -43,11 +43,13 @@
     "@statewalker/vcs-utils": "workspace:^"
   },
   "devDependencies": {
+    "@statewalker/vcs-store-files": "workspace:^",
     "@statewalker/vcs-store-mem": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@statewalker/webrun-files-mem": "catalog:",
+    "@types/node": "catalog:",
     "rolldown": "catalog:",
-    "vitest": "catalog:",
     "typescript": "catalog:",
-    "@types/node": "catalog:"
+    "vitest": "catalog:"
   }
 }

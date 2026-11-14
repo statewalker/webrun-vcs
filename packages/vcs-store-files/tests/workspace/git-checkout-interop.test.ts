@@ -90,8 +90,7 @@ describe("GitCheckout Git Interoperability", () => {
         removeDir: nodeFiles.remove.bind(nodeFiles),
       };
 
-      const refStore = new FileRefStore(nodeFiles, ".git");
-      const refs = refStore;
+      const refs = new FileRefStore(nodeFiles, ".git");
       await refs.initialize();
 
       const staging = createMemoryGitStaging();
@@ -153,8 +152,7 @@ describe("GitCheckout Git Interoperability", () => {
         removeDir: nodeFiles.remove.bind(nodeFiles),
       };
 
-      const refStore = new FileRefStore(nodeFiles, ".git");
-      const refs = refStore;
+      const refs = new FileRefStore(nodeFiles, ".git");
       await refs.initialize();
 
       const staging = createMemoryGitStaging();
@@ -208,8 +206,7 @@ describe("GitCheckout Git Interoperability", () => {
         removeDir: nodeFiles.remove.bind(nodeFiles),
       };
 
-      const refStore = new FileRefStore(nodeFiles, ".git");
-      const refs = refStore;
+      const refs = new FileRefStore(nodeFiles, ".git");
       await refs.initialize();
       const initialCommit = git(["rev-parse", "HEAD"], repoDir);
 

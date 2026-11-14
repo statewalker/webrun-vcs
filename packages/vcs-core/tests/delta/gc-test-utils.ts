@@ -121,7 +121,7 @@ export async function createTestRepository(gcOptions?: GCScheduleOptions): Promi
   };
 
   const deleteRef = async (name: string): Promise<void> => {
-    await refs.delete(name);
+    await refs.remove(name);
   };
 
   return {

@@ -329,7 +329,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   /**
    * Update the stash ref.
    *
-   * Note: Reflog support is not part of the core RefStore interface.
+   * Note: Reflog support is not part of the core Refs interface.
    * Stash history is tracked via parent commit chain instead.
    */
   private async updateStashRef(ref: string, commitId: ObjectId, _message: string): Promise<void> {

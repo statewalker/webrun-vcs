@@ -35,6 +35,15 @@ export interface RepositoryAccess {
   storeObject(type: ObjectTypeCode, content: Uint8Array): Promise<ObjectId>;
   listRefs(): AsyncIterable<RefInfo>;
   getHead(): Promise<HeadInfo | null>;
+  /**
+   * Update, create or delete `name`; `true` when it changed.
+   *
+   * - `newId` set, `oldId` set: the ref must currently hold `oldId`.
+   * - `newId` set, `oldId` null: create; the ref must not exist (some older
+   *   implementations overwrite instead).
+   * - `newId` null: delete the named ref itself; `oldId`, when set, must match;
+   *   `false` when the ref does not exist.
+   */
   updateRef(name: string, oldId: ObjectId | null, newId: ObjectId | null): Promise<boolean>;
   walkObjects(
     wants: ObjectId[],

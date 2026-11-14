@@ -120,17 +120,16 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
   const commits = createCommits(config.objects);
   const tags = createTags(config.objects);
 
+  const given = config.refs as Partial<Refs> & { type?: unknown };
   let refs: Refs;
-  if ("type" in config.refs) {
-    const type = (config.refs as { type: unknown }).type;
-    if (type !== "memory") {
-      throw new Error(
-        `createHistoryFromComponents: unknown refs type ${JSON.stringify(type)}; pass a Refs implementation or { type: "memory" }`,
-      );
-    }
+  if (typeof given.batch === "function") {
+    refs = config.refs as Refs;
+  } else if (given.type === "memory") {
     refs = createMemoryRefs();
   } else {
-    refs = config.refs;
+    throw new Error(
+      `createHistoryFromComponents: refs must be a Refs implementation or { type: "memory" }, got ${JSON.stringify(given.type ?? given)}`,
+    );
   }
   return createHistoryFromStores({
     blobs,

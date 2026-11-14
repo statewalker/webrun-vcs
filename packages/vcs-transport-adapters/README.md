@@ -21,7 +21,7 @@ No peer dependencies. One entry point, `@statewalker/vcs-transport-adapters` (ES
 | `BlobStore` + `KvStore` from `@statewalker/webrun-storage` | `createStorageRepositoryFacade({ objects, refs })` | `{ facade, refStore }` ready for fetch/push/serve |
 | A `History` and a `SerializationApi` | `createVcsRepositoryFacade({ history, serialization })` | `RepositoryFacade` |
 | A `History` | `createVcsRepositoryAccess({ history })` | `RepositoryAccess` |
-| A `GitObjectStore` and a core `RefStore` | `createCoreRepositoryAccess({ objectStore, refStore })` | `RepositoryAccess` |
+| A `GitObjectStore` and a core `Refs` | `createCoreRepositoryAccess({ objectStore, refStore })` | `RepositoryAccess` |
 | A `GitObjectStore` only | `new GitNativeRepositoryAccess(objectStore)` | object-only access (no refs) |
 | A store matching `MinimalStorage` | `createStorageAdapter(storage)` | `RepositoryAccess` |
 

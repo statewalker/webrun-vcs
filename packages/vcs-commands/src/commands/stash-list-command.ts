@@ -59,7 +59,7 @@ export class StashListCommand extends GitCommand<StashEntry[]> {
   /**
    * Get stash entries.
    *
-   * Note: Without reflog support in the core RefStore interface,
+   * Note: Without reflog support in the core Refs interface,
    * this returns only the most recent stash (if any).
    */
   private async getStashReflog(): Promise<Array<{ commitId: ObjectId; message: string }>> {

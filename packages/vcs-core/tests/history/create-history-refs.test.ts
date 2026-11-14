@@ -29,12 +29,12 @@ describe("createHistoryFromComponents refs", () => {
     });
   });
 
-  it("refuses an unknown refs type instead of silently using memory refs", () => {
+  it('refuses { type: "adapter" } and other non-Refs values', () => {
     expect(() =>
       createHistoryFromComponents({
         objects: createGitObjectStore(new MemoryRawStorage()),
         refs: { type: "adapter", refStore: {} } as never,
       }),
-    ).toThrow(/unknown refs type "adapter"/);
+    ).toThrow(/refs must be a Refs implementation or \{ type: "memory" \}, got "adapter"/);
   });
 });
