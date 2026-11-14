@@ -19,9 +19,18 @@ afterAll(() => {
   for (const r of roots) rmSync(r, { recursive: true, force: true });
 });
 
+/** A fixed identity, so git works on machines without user.name / user.email (CI). */
+const GIT_ENV = {
+  ...process.env,
+  GIT_AUTHOR_NAME: "A",
+  GIT_AUTHOR_EMAIL: "a@b",
+  GIT_COMMITTER_NAME: "A",
+  GIT_COMMITTER_EMAIL: "a@b",
+};
 const git = (cwd: string, args: string[], input?: string) =>
-  execFileSync("git", args, { cwd, input, encoding: "utf8" }).trim();
-const gitTry = (cwd: string, args: string[]) => spawnSync("git", args, { cwd, encoding: "utf8" });
+  execFileSync("git", args, { cwd, input, env: GIT_ENV, encoding: "utf8" }).trim();
+const gitTry = (cwd: string, args: string[]) =>
+  spawnSync("git", args, { cwd, env: GIT_ENV, encoding: "utf8" });
 
 function newRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "refs-git-"));
@@ -31,22 +40,9 @@ function newRepo(): string {
 }
 
 function commits(repo: string, n: number): ObjectId[] {
-  const env = {
-    ...process.env,
-    GIT_AUTHOR_NAME: "A",
-    GIT_AUTHOR_EMAIL: "a@b",
-    GIT_COMMITTER_NAME: "A",
-    GIT_COMMITTER_EMAIL: "a@b",
-  };
   const blob = git(repo, ["hash-object", "-w", "--stdin"], "x\n");
   const tree = git(repo, ["mktree"], `100644 blob ${blob}\tf\n`);
-  return Array.from({ length: n }, (_, i) =>
-    execFileSync("git", ["commit-tree", "-m", `c${i}`, tree], {
-      cwd: repo,
-      env,
-      encoding: "utf8",
-    }).trim(),
-  );
+  return Array.from({ length: n }, (_, i) => git(repo, ["commit-tree", "-m", `c${i}`, tree]));
 }
 
 /** Resolve a ref as native git does (undefined if absent). */
