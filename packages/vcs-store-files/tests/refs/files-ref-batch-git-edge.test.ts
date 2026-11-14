@@ -71,18 +71,22 @@ const updateRef = (repo: string, stdin: string, extra: string[] = []) =>
   git(repo, ["update-ref", ...extra, "-m", "msg", "--stdin"], stdin);
 
 // The full batch contract on disk, through FileRefStore with native lock files.
-createRefBatchTests("Git files on disk (native AtomicFiles)", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "refs-contract-"));
-  roots.push(dir);
-  const files = createNodeFilesApi({ rootDir: dir });
-  await files.mkdir(".git");
-  await createRefsStructure(files, ".git");
-  return {
-    refs: new FileRefStore(files, ".git", {
-      atomicFiles: createNodeAtomicFiles(join(dir, ".git")),
-    }),
-  };
-});
+createRefBatchTests(
+  "Git files on disk (native AtomicFiles)",
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), "refs-contract-"));
+    roots.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    await files.mkdir(".git");
+    await createRefsStructure(files, ".git");
+    return {
+      refs: new FileRefStore(files, ".git", {
+        atomicFiles: createNodeAtomicFiles(join(dir, ".git")),
+      }),
+    };
+  },
+  { reflog: true },
+);
 
 describe("reflogs as git writes them", () => {
   it("noDeref on a symbolic HEAD: same refs and same HEAD log line as git", async () => {

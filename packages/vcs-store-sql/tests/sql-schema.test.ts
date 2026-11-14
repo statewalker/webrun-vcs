@@ -594,6 +594,9 @@ describe("T4.5: SQL Schema Validation", () => {
       expect(tableNames).toContain("vcs_tag");
       expect(tableNames).toContain("vcs_ref");
       expect(tableNames).toContain("staging_entry");
+
+      // v5 tables
+      expect(tableNames).toContain("vcs_reflog");
     });
 
     it("all views exist after full migration", async () => {

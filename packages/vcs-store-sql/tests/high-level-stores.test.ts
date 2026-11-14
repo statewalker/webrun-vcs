@@ -78,10 +78,14 @@ createRefStoreTests("SQL", async () => {
 });
 
 // Ref batch tests
-createRefBatchTests("SQL", async () => {
-  const db = await createTestDb();
-  return { refs: new SQLRefStore(db), cleanup: () => db.close() };
-});
+createRefBatchTests(
+  "SQL",
+  async () => {
+    const db = await createTestDb();
+    return { refs: new SQLRefStore(db), cleanup: () => db.close() };
+  },
+  { reflog: true },
+);
 
 // StagingStore tests
 createStagingStoreTests("SQL", async () => {

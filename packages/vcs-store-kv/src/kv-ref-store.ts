@@ -13,18 +13,44 @@ import type {
   BatchOptions,
   BatchResult,
   ObjectId,
+  PlannedRefUpdate,
   Ref,
   RefCommand,
   RefEntry,
+  ReflogLine,
+  ReflogReader,
   Refs,
   RefUpdateResult,
   SymbolicRef,
 } from "@statewalker/vcs-core";
-import { compareRefNames, planRefBatch, RefStorage } from "@statewalker/vcs-core";
+import {
+  compareRefNames,
+  createReflogReaderOf,
+  planRefBatch,
+  planReflog,
+  RefStorage,
+} from "@statewalker/vcs-core";
 import type { KVStore } from "./kv-store.js";
 
 /** The key holding all refs. */
 const ROOT_KEY = "ref:root";
+/** Reflogs, one key per ref, outside the `ref:` keys the root layout owns. */
+const REFLOG_PREFIX = "reflog:";
+/** A reflog value: its lines in batch order, and the last batch that dropped it. */
+interface StoredLog {
+  dropped: number;
+  lines: (ReflogLine & { seq: number })[];
+}
+
+function decodeLog(bytes: Uint8Array | undefined): StoredLog {
+  if (!bytes) return { dropped: 0, lines: [] };
+  const log = JSON.parse(decoder.decode(bytes)) as StoredLog;
+  if (typeof log?.dropped !== "number" || !Array.isArray(log.lines)) {
+    throw new Error("corrupt reflog value");
+  }
+  return log;
+}
+
 /** Symbolic refs are stored as "ref: <target>", as in git's loose ref files. */
 const SYMREF_PREFIX = "ref: ";
 /** Follow at most this many refs along a symbolic chain (git's read limit). */
@@ -45,8 +71,14 @@ export class CorruptRefRootError extends Error {
   }
 }
 
-function decode(bytes: Uint8Array | undefined): Snapshot {
-  if (!bytes) return new Map();
+/**
+ * Root entry counting the root's writes (not a ref: git ref names cannot
+ * contain ":"). Reflog lines carry it, so they keep the order of the batches.
+ */
+const SEQ_KEY = ":seq";
+
+function decode(bytes: Uint8Array | undefined): { refs: Snapshot; seq: number } {
+  if (!bytes) return { refs: new Map(), seq: 0 };
   let parsed: unknown;
   try {
     parsed = JSON.parse(decoder.decode(bytes));
@@ -57,18 +89,23 @@ function decode(bytes: Uint8Array | undefined): Snapshot {
     throw new CorruptRefRootError("not a JSON object");
   }
   const refs: Snapshot = new Map();
+  let seq = 0;
   for (const [name, value] of Object.entries(parsed)) {
     if (typeof value !== "string")
       throw new CorruptRefRootError(`value of ${name} is not a string`);
-    refs.set(name, value);
+    if (name === SEQ_KEY) {
+      if (!/^\d+$/.test(value)) throw new CorruptRefRootError(`${SEQ_KEY} is not a number`);
+      seq = Number(value);
+    } else refs.set(name, value);
   }
-  return refs;
+  return { refs, seq };
 }
 
-function encode(refs: Snapshot): Uint8Array {
+function encode(refs: Snapshot, seq: number): Uint8Array {
   // fromEntries defines own properties, so even a name like "__proto__" survives.
   const sorted = [...refs.keys()].sort(compareRefNames);
-  return encoder.encode(JSON.stringify(Object.fromEntries(sorted.map((n) => [n, refs.get(n)]))));
+  const entries = sorted.map((n) => [n, refs.get(n)]);
+  return encoder.encode(JSON.stringify(Object.fromEntries([...entries, [SEQ_KEY, String(seq)]])));
 }
 
 function sameBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
@@ -100,21 +137,21 @@ function toRef(name: string, value: string | undefined): Ref | SymbolicRef | und
  */
 export class KVRefStore implements Refs {
   /** The last root read and its decoded refs: reused while the bytes are unchanged. */
-  private cache: { bytes: Uint8Array; refs: Snapshot } | undefined;
+  private cache: { bytes: Uint8Array; refs: Snapshot; seq: number } | undefined;
 
   constructor(private kv: KVStore) {}
 
   /** Read the root. The returned map is a private copy the caller may change. */
-  private async read(): Promise<{ bytes: Uint8Array | undefined; refs: Snapshot }> {
+  private async read(): Promise<{ bytes: Uint8Array | undefined; refs: Snapshot; seq: number }> {
     const bytes = await this.kv.get(ROOT_KEY);
     if (!bytes) {
       await this.checkNoOldLayout();
-      return { bytes, refs: new Map() };
+      return { bytes, refs: new Map(), seq: 0 };
     }
     if (!this.cache || !sameBytes(this.cache.bytes, bytes)) {
-      this.cache = { bytes: new Uint8Array(bytes), refs: decode(bytes) };
+      this.cache = { bytes: new Uint8Array(bytes), ...decode(bytes) };
     }
-    return { bytes, refs: new Map(this.cache.refs) };
+    return { bytes, refs: new Map(this.cache.refs), seq: this.cache.seq };
   }
 
   /**
@@ -133,18 +170,18 @@ export class KVRefStore implements Refs {
 
   /**
    * Apply `change` to the snapshot and write it with one compare-and-swap,
-   * retrying on a lost race. `change` returns the result, or `undefined` to
-   * write nothing.
+   * retrying on a lost race. `change` gets the sequence number the write will
+   * commit with and returns the result and whether to write.
    */
   private async update<T>(
-    change: (refs: Snapshot) => Promise<{ result: T; write: boolean }>,
+    change: (refs: Snapshot, seq: number) => Promise<{ result: T; write: boolean }>,
     locked: () => T,
   ): Promise<T> {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const { bytes, refs } = await this.read();
-      const { result, write } = await change(refs);
+      const { bytes, refs, seq } = await this.read();
+      const { result, write } = await change(refs, seq + 1);
       if (!write) return result;
-      if (await this.kv.compareAndSwap(ROOT_KEY, bytes, encode(refs))) return result;
+      if (await this.kv.compareAndSwap(ROOT_KEY, bytes, encode(refs, seq + 1))) return result;
       // Lost the race: back off briefly, re-read and re-check.
       await new Promise((r) => setTimeout(r, Math.random() * Math.min(2 ** attempt, 20)));
     }
@@ -218,12 +255,13 @@ export class KVRefStore implements Refs {
 
   /**
    * Apply all commands atomically, or none (see {@link Refs.batch}): one
-   * compare-and-swap of the root value. Reflogs are not kept yet, so `options`
-   * is ignored.
+   * compare-and-swap of the root value, then the reflog lines.
    */
-  batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
-    return this.update<BatchResult>(
-      async (refs) => {
+  async batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    let applied: PlannedRefUpdate[] = [];
+    let committed = 0;
+    const result = await this.update<BatchResult>(
+      async (refs, seq) => {
         const plan = await planRefBatch(commands, {
           read: (name) => toRef(name, refs.get(name)),
           hasChildren: (name) => {
@@ -237,12 +275,61 @@ export class KVRefStore implements Refs {
           if (u.newValue === null) refs.delete(u.name);
           else refs.set(u.name, u.newValue);
         }
+        applied = plan.updates;
+        committed = seq;
         return { result: { ok: true, rejected: [] }, write: plan.updates.length > 0 };
       },
       () => ({
         ok: false,
         rejected: commands.map((c) => ({ name: c.name, reason: "locked" as const })),
       }),
+    );
+    if (result.ok && applied.length > 0) await this.writeReflogs(applied, committed, options);
+    return result;
+  }
+
+  /**
+   * Reflog lines, after the batch committed as root write `seq`. Each ref's log
+   * is one key (`reflog:<name>`) holding its lines with the `seq` of the batch
+   * that wrote them, kept in that order whatever order concurrent batches write
+   * in. A drop leaves a mark: lines of earlier batches are removed and late ones
+   * ignored, while later batches log anew. A log write that fails or keeps
+   * losing its compare-and-swap is skipped; the committed batch stands.
+   */
+  private async writeReflogs(
+    updates: PlannedRefUpdate[],
+    seq: number,
+    options?: BatchOptions,
+  ): Promise<void> {
+    for (const w of planReflog(updates, options)) {
+      const key = `${REFLOG_PREFIX}${w.name}`;
+      try {
+        for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+          const bytes = await this.kv.get(key);
+          const log = decodeLog(bytes);
+          if (w.op === "drop") {
+            log.dropped = Math.max(log.dropped, seq);
+            log.lines = log.lines.filter((l) => l.seq > seq);
+          } else {
+            if (seq < log.dropped || (log.lines.length === 0 && !w.create)) break;
+            let at = log.lines.length;
+            while (at > 0 && log.lines[at - 1].seq > seq) at--;
+            log.lines.splice(at, 0, { seq, ...w.line });
+          }
+          if (await this.kv.compareAndSwap(key, bytes, encoder.encode(JSON.stringify(log)))) break;
+        }
+      } catch {
+        // a broken log value or a failing store: the ref update stands without this line
+      }
+    }
+  }
+
+  /** The reflog of `name` (written by `batch`), or undefined if it has none. */
+  async getReflog(refName: string): Promise<ReflogReader | undefined> {
+    const { lines } = decodeLog(await this.kv.get(`${REFLOG_PREFIX}${refName}`));
+    if (lines.length === 0) return undefined;
+    return createReflogReaderOf(
+      lines.map(({ oldId, newId, ident, message }) => ({ oldId, newId, ident, message })),
     );
   }
 

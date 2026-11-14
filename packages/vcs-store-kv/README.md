@@ -29,7 +29,7 @@ adapter needs.
 | `KVStore` (type) | The adapter contract: `get`, `set`, `delete`, `has`, `list(prefix)`, `getMany`, `setMany`, `compareAndSwap`, optional `close`. |
 | `MemoryKVAdapter` | `Map`-backed `KVStore`. Copies values in and out. `close()` clears it. |
 | `createKvObjectStores({ kv, prefix? })` | `{ objects, blobs, trees, commits, tags }` with **Git-compatible SHA-1 ids**, stored through a `KvRawStore`. |
-| `KVRefStore` | `Refs` on a `KVStore`: direct and symbolic refs, atomic batches. All refs live in one root value, so every write is one `compareAndSwap`. |
+| `KVRefStore` | `Refs` on a `KVStore`: direct and symbolic refs, atomic batches. All refs live in one root value, so every write is one `compareAndSwap`. Reflogs under `reflog:<name>`. |
 | `CorruptRefRootError` | Thrown when the refs root is not a JSON object of strings. |
 | `KVStaging` | `Staging` (the index) on a `KVStore`. |
 | `KVCommitStore`, `KVTreeStore`, `KVTagStore` | JSON-serialized `Commits` / `Trees` / `Tags` with scan-based queries. **Ids are not Git ids** (see Internals). |
@@ -89,7 +89,9 @@ staging:README.md<NUL>0
 ref:root
 ```
 
-`ref:root` holds every ref as one JSON object in git's name order, `{ "HEAD": "ref: refs/heads/main", "refs/heads/main": "<id>" }`. A KV store offers compare-and-swap on one key only, so this is how a batch of ref updates (`refs.batch([...])`) applies all-or-nothing: the store reads the root, checks the batch against it, and writes it back only if the root still holds the bytes it read, re-reading and re-checking after a lost race. The cost is one rewrite of the root per write, and one parse of it per read when it has changed since the last read (the decoded root is cached while its bytes stay the same): 10,000 refs take about 760 KB, about 18 ms per write and 8 ms per read after a change. A root that is not a JSON object of strings is refused with `CorruptRefRootError` and never overwritten. A store written in the earlier layout (one `ref:<name>` key per ref) is refused with an error rather than shown empty.
+`ref:root` holds every ref as one JSON object in git's name order, `{ "HEAD": "ref: refs/heads/main", "refs/heads/main": "<id>", ":seq": "2" }`. `:seq` counts the root's writes (git ref names cannot contain `:`, so it never names a ref). A KV store offers compare-and-swap on one key only, so this is how a batch of ref updates (`refs.batch([...])`) applies all-or-nothing: the store reads the root, checks the batch against it, and writes it back only if the root still holds the bytes it read, re-reading and re-checking after a lost race. The cost is one rewrite of the root per write, and one parse of it per read when it has changed since the last read (the decoded root is cached while its bytes stay the same): 10,000 refs take about 760 KB, about 18 ms per write and 8 ms per read after a change. A root that is not a JSON object of strings is refused with `CorruptRefRootError` and never overwritten. A store written in the earlier layout (one `ref:<name>` key per ref) is refused with an error rather than shown empty.
+
+Reflogs live outside the root, one key per ref under `reflog:<name>`: `{ "dropped": 0, "lines": [{ "seq": 1, "oldId": "...", "newId": "...", "ident": "...", "message": "..." }] }`. Each log is written after the batch commits, with its own compare-and-swap, so a log can briefly lag its ref; a failed or broken log write is skipped and never fails the committed batch. Every line carries the `:seq` its batch committed with and is kept in that order, so two batches that write their lines in the opposite order still log in commit order. Deleting a ref marks its log as dropped at that `seq`: lines of earlier batches go, a late line from one of them is ignored, and a ref recreated afterwards logs anew. Each line rewrites the ref's whole log.
 
 ### Writing an adapter
 

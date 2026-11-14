@@ -7,10 +7,13 @@
 import {
   type BatchOptions,
   type BatchResult,
+  createReflogReaderOf,
   type ObjectId,
   planRefBatch,
+  planReflog,
   type Ref,
   type RefCommand,
+  type ReflogReader,
   RefStorage,
   type Refs,
   type RefUpdateResult,
@@ -68,10 +71,11 @@ export class SQLRefStore implements Refs {
 
   /**
    * Apply all commands atomically, or none (see {@link Refs.batch}): the batch is
-   * planned and written inside one transaction. Reflogs are not kept yet, so
-   * `options` is ignored.
+   * planned and written inside one transaction, with its reflog lines
+   * (`options.ident`, `options.message`; table `vcs_reflog`). As in git, a
+   * reflog line that cannot be written fails the batch, which then changes nothing.
    */
-  async batch(commands: RefCommand[], _options?: BatchOptions): Promise<BatchResult> {
+  async batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
     if (commands.length === 0) return { ok: true, rejected: [] };
     return this.db.transaction(async (tx) => {
       const plan = await planRefBatch(commands, {
@@ -106,8 +110,39 @@ export class SQLRefStore implements Refs {
           );
         }
       }
+      for (const w of planReflog(plan.updates, options)) {
+        if (w.op === "drop") {
+          await tx.execute("DELETE FROM vcs_reflog WHERE name = ?", [w.name]);
+          continue;
+        }
+        const { name, line, create } = w;
+        if (!create) {
+          const rows = await tx.query("SELECT 1 FROM vcs_reflog WHERE name = ? LIMIT 1", [name]);
+          if (rows.length === 0) continue;
+        }
+        await tx.execute(
+          "INSERT INTO vcs_reflog (name, old_id, new_id, ident, message) VALUES (?, ?, ?, ?, ?)",
+          [name, line.oldId, line.newId, line.ident, line.message],
+        );
+      }
       return { ok: true, rejected: [] };
     });
+  }
+
+  /** The reflog of `refName` (written by `batch`), or undefined if it has none. */
+  async getReflog(refName: string): Promise<ReflogReader | undefined> {
+    const rows = await this.db.query<{
+      old_id: string;
+      new_id: string;
+      ident: string;
+      message: string;
+    }>("SELECT old_id, new_id, ident, message FROM vcs_reflog WHERE name = ? ORDER BY id", [
+      refName,
+    ]);
+    if (rows.length === 0) return undefined;
+    return createReflogReaderOf(
+      rows.map((r) => ({ oldId: r.old_id, newId: r.new_id, ident: r.ident, message: r.message })),
+    );
   }
 
   /**

@@ -111,3 +111,85 @@ describe("KVRefStore limits and guards", () => {
     expect((await a.resolve("refs/heads/x"))?.objectId).toBe(oid(2));
   });
 });
+
+/** A KV that holds back one chosen read or write of a reflog key until released. */
+class StallingKV extends MemoryKVAdapter {
+  stall: ((key: string) => boolean) | undefined;
+  private release: (() => void) | undefined;
+  private onStall: () => void = () => {};
+  stalled = new Promise<void>((resolve) => {
+    this.onStall = resolve;
+  });
+  override async get(key: string): Promise<Uint8Array | undefined> {
+    if (this.stall?.(key)) {
+      this.stall = undefined;
+      await new Promise<void>((resolve) => {
+        this.release = resolve;
+        this.onStall();
+      });
+    }
+    return super.get(key);
+  }
+  resume(): void {
+    this.release?.();
+  }
+}
+
+const IDENT = "A U Thor <a@example.com> 1700000000 +0000";
+const lines = async (refs: KVRefStore, name: string) =>
+  ((await (await refs.getReflog(name))?.getReverseEntries()) ?? [])
+    .reverse()
+    .map((e) => `${e.oldId.slice(-1)}>${e.newId.slice(-1)} ${e.comment}`);
+
+describe("KVRefStore reflogs under concurrent batches", () => {
+  it("keeps lines in the order the batches committed, whichever writes its line first", async () => {
+    const kv = new StallingKV();
+    const refs = new KVRefStore(kv);
+    await refs.batch([{ name: "refs/heads/main", new: oid(1) }], { ident: IDENT, message: "init" });
+    kv.stall = (key) => key === "reflog:refs/heads/main";
+    const a = refs.batch([{ name: "refs/heads/main", old: oid(1), new: oid(2) }], {
+      ident: IDENT,
+      message: "A",
+    });
+    await kv.stalled; // A committed; its line is held back
+    await refs.batch([{ name: "refs/heads/main", old: oid(2), new: oid(3) }], {
+      ident: IDENT,
+      message: "B",
+    });
+    kv.resume();
+    await a;
+    expect(await lines(refs, "refs/heads/main")).toEqual(["0>1 init", "1>2 A", "2>3 B"]);
+    expect((await (await refs.getReflog("refs/heads/main"))?.getLastEntry())?.newId).toBe(oid(3));
+  });
+
+  it("a late drop of a deleted ref keeps the log of the ref created after it", async () => {
+    const kv = new StallingKV();
+    const refs = new KVRefStore(kv);
+    await refs.batch([{ name: "refs/heads/b", new: oid(1) }], { ident: IDENT, message: "one" });
+    kv.stall = (key) => key === "reflog:refs/heads/b";
+    const d = refs.batch([{ name: "refs/heads/b", old: oid(1), new: null }], {
+      ident: IDENT,
+      message: "delete",
+    });
+    await kv.stalled; // the delete committed; dropping its log is held back
+    await refs.batch([{ name: "refs/heads/b", old: null, new: oid(2) }], {
+      ident: IDENT,
+      message: "two",
+    });
+    kv.resume();
+    await d;
+    expect((await refs.resolve("refs/heads/b"))?.objectId).toBe(oid(2));
+    expect(await lines(refs, "refs/heads/b")).toEqual(["0>2 two"]);
+  });
+
+  it("a broken log value skips that log only; the batch and other logs are written", async () => {
+    const kv = new MemoryKVAdapter();
+    const refs = new KVRefStore(kv);
+    await refs.setSymbolic("HEAD", "refs/heads/main");
+    await kv.set("reflog:refs/heads/main", new TextEncoder().encode("not json"));
+    const r = await refs.batch([{ name: "HEAD", new: oid(1) }], { ident: IDENT, message: "x" });
+    expect(r.ok).toBe(true);
+    expect((await refs.resolve("HEAD"))?.objectId).toBe(oid(1));
+    expect(await lines(refs, "HEAD")).toEqual(["0>1 x"]);
+  });
+});
