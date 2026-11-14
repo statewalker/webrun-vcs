@@ -1,7 +1,7 @@
 import { sha256Hex } from "@statewalker/vcs-transport-lfs";
 import type { ContentStore } from "@statewalker/webrun-content-store";
 import { describe, expect, it } from "vitest";
-import { serveXet, xetDownload } from "../src/index.js";
+import { serveXet, xetDownload, xetUpload } from "../src/index.js";
 import {
   collect,
   csHash,
@@ -99,5 +99,53 @@ describe("xet interop / integrity", () => {
     expect(events).toContainEqual({ type: "error", oid: bogusOid, reason: "sha256 mismatch" });
     expect(await clientResolver.toObject(bogusOid)).toBeUndefined();
     expect(await clientStore.has(id)).toBe(false); // removed after the mismatch
+  });
+});
+
+describe("xet streaming verification", () => {
+  it("rejects a download whose size differs from the pointer (oid right), recording nothing", async () => {
+    const real = prng(60000, 71);
+    const serverStore = makeStore();
+    const serverResolver = memResolver();
+    const { ptr, id } = await seedObject(serverStore, serverResolver, real);
+    const handler = serveXet(serverStore, serverResolver);
+
+    const clientStore = makeStore();
+    const clientResolver = memResolver();
+    const lying = { oid: ptr.oid, size: ptr.size + 1 };
+    const events = await drain(
+      xetDownload(clientStore, clientResolver, URL, [lying], {
+        fetchImpl: handler,
+        hashContent: csHash,
+      }),
+    );
+
+    expect(events).toContainEqual({ type: "error", oid: ptr.oid, reason: "size mismatch" });
+    expect(await clientResolver.toObject(ptr.oid)).toBeUndefined();
+    expect(await clientStore.has(id)).toBe(false);
+  });
+
+  it("the server refuses a xet upload whose bytes do not hash to the oid", async () => {
+    const real = prng(60000, 72);
+    const clientStore = makeStore();
+    const clientResolver = memResolver();
+    const { id } = await seedObject(clientStore, clientResolver, real);
+    const bogusOid = await sha256Hex(prng(1000, 9));
+    await clientResolver.record(bogusOid, id); // the client lies: bogusOid → real object
+
+    const serverStore = makeStore();
+    const serverResolver = memResolver();
+    const handler = serveXet(serverStore, serverResolver);
+    const events = await drain(
+      xetUpload(clientStore, clientResolver, URL, [{ oid: bogusOid, size: real.length }], {
+        fetchImpl: handler,
+        hashContent: csHash,
+      }),
+    );
+
+    expect(events.some((e) => e.type === "error" && e.oid === bogusOid)).toBe(true);
+    expect(events).not.toContainEqual({ type: "object-uploaded", oid: bogusOid });
+    expect(await serverResolver.toObject(bogusOid)).toBeUndefined();
+    expect(await serverStore.has(id)).toBe(false);
   });
 });

@@ -7,6 +7,7 @@ export * from "./map-stream.js";
 export * from "./new-async-generator.js";
 export * from "./port-stream.js";
 export * from "./read-header.js";
+export * from "./request-stream.js";
 export * from "./slice.js";
 export * from "./split-stream.js";
 export * from "./to-chunks.js";

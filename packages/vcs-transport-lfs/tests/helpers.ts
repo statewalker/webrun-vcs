@@ -10,7 +10,7 @@ import { sha256Hex } from "../src/index.js";
  * (`<hex>`) — the resolver genuinely translates between the two id spaces.
  */
 export async function csHash(input: ByteStream): Promise<string> {
-  return `cs-sha256:${await sha256Hex(await collect(input))}`;
+  return `cs-sha256:${await sha256Hex(input)}`;
 }
 
 export function makeStore(): ContentStore {

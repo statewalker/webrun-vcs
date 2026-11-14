@@ -9,8 +9,8 @@
  */
 
 import type { BatchRequest, LfsResolver } from "@statewalker/vcs-transport-lfs";
-import { serveLfs } from "@statewalker/vcs-transport-lfs";
-import type { ContentStore, ObjectDescriptor } from "@statewalker/webrun-content-store";
+import { serveLfs, storeVerified } from "@statewalker/vcs-transport-lfs";
+import type { ContentStore } from "@statewalker/webrun-content-store";
 import { serveStore } from "@statewalker/webrun-content-transfer";
 import type { HttpHandler } from "@statewalker/webrun-http-streams";
 import { XET_TRANSFER, type XetBatchObjectResponse, type XetBatchResponse } from "./batch.js";
@@ -27,16 +27,19 @@ function json(body: unknown, status = 200): Response {
 
 /**
  * Wrap a store so that assembling an object (content-transfer's `putManifest` →
- * reassemble + `put`) also records the LFS-oid → content-store-id mapping, so a
- * later xet/basic download can resolve this oid.
+ * reassemble + `put`) hashes the reassembled bytes as they stream into the
+ * store and checks them against the LFS oid. On a match the LFS-oid →
+ * content-store-id mapping is recorded, so a later xet/basic download can
+ * resolve this oid; on a mismatch the object is removed again and the assemble
+ * fails, which the client sees as an upload error.
  */
 function recordingStore(store: ContentStore, oid: string, resolver: LfsResolver): ContentStore {
   return {
     ...store,
     async put(content) {
-      const descriptor: ObjectDescriptor = await store.put(content);
-      await resolver.record(oid, descriptor.id);
-      return descriptor;
+      const stored = await storeVerified(store, resolver, content, { oid });
+      if (!stored.ok) throw new Error(`xet upload refused: ${stored.reason}`);
+      return stored.descriptor;
     },
   };
 }

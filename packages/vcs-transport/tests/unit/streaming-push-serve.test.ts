@@ -9,7 +9,7 @@ import type { Duplex } from "../../src/api/duplex.js";
 import { ProtocolState } from "../../src/context/protocol-state.js";
 import { createTransportApi } from "../../src/factories/transport-api-factory.js";
 import { push } from "../../src/operations/push.js";
-import { requestBody, supportsRequestStreams } from "../../src/utils/request-stream.js";
+import { requestBody, supportsRequestStreams } from "../../src/utils/index.js";
 import { createMockRefStore, createMockRepository } from "../helpers/test-protocol.js";
 
 const enc = new TextEncoder();
@@ -275,7 +275,7 @@ describe("upload-pack: a first want without capabilities asks for none", () => {
 
 describe("request bodies: when to stream", () => {
   it("streams by default outside browsers only, where supported", async () => {
-    const { shouldStreamRequestBody } = await import("../../src/utils/request-stream.js");
+    const { shouldStreamRequestBody } = await import("../../src/utils/index.js");
     expect(shouldStreamRequestBody(undefined, { browser: false, supported: true })).toBe(true);
     expect(shouldStreamRequestBody(undefined, { browser: false, supported: false })).toBe(false);
     // Chromium passes the feature test but refuses streamed bodies over HTTP/1.1
@@ -285,7 +285,7 @@ describe("request bodies: when to stream", () => {
   });
 
   it("tells a window or a worker from Node", async () => {
-    const { isBrowserContext } = await import("../../src/utils/request-stream.js");
+    const { isBrowserContext } = await import("../../src/utils/index.js");
     expect(isBrowserContext()).toBe(false);
     expect(isBrowserContext({ document: {} })).toBe(true);
     class WorkerGlobalScope {}
@@ -295,7 +295,7 @@ describe("request bodies: when to stream", () => {
   });
 
   it("retries a streamed request refused with a TypeError once, with a collected body", async () => {
-    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    const { fetchWithRequestBody } = await import("../../src/utils/index.js");
     let made = 0;
     const bodies: unknown[] = [];
     const response = await fetchWithRequestBody(
@@ -322,7 +322,7 @@ describe("request bodies: when to stream", () => {
   });
 
   it("does not retry when the body's source failed or the error is not a TypeError", async () => {
-    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    const { fetchWithRequestBody } = await import("../../src/utils/index.js");
     let made = 0;
     await expect(
       fetchWithRequestBody(
@@ -596,7 +596,7 @@ describe("fetchWithRequestBody: when a refused streamed push may be sent again",
   };
 
   it("outside browsers, a connection lost after part of the body is not retried", async () => {
-    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    const { fetchWithRequestBody } = await import("../../src/utils/index.js");
     let made = 0;
     const chunks = () => {
       made++;
@@ -607,7 +607,7 @@ describe("fetchWithRequestBody: when a refused streamed push may be sent again",
   });
 
   it("outside browsers, a request refused before reading the body is retried", async () => {
-    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    const { fetchWithRequestBody } = await import("../../src/utils/index.js");
     let made = 0;
     const chunks = () => {
       made++;
@@ -619,7 +619,7 @@ describe("fetchWithRequestBody: when a refused streamed push may be sent again",
   });
 
   it("a body read to its end is never retried (the server may have applied the push)", async () => {
-    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    const { fetchWithRequestBody } = await import("../../src/utils/index.js");
     let made = 0;
     const chunks = () => {
       made++;
@@ -634,7 +634,7 @@ describe("fetchWithRequestBody: when a refused streamed push may be sent again",
 
 describe("isBrowserContext: server runtimes with worker globals", () => {
   it("is false in a Deno or Bun worker", async () => {
-    const { isBrowserContext } = await import("../../src/utils/request-stream.js");
+    const { isBrowserContext } = await import("../../src/utils/index.js");
     class WorkerGlobalScope {}
     const deno = Object.assign(new WorkerGlobalScope(), { WorkerGlobalScope, Deno: {} });
     const bun = Object.assign(new WorkerGlobalScope(), { WorkerGlobalScope, Bun: {} });

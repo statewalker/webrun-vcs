@@ -84,4 +84,4 @@ for await (const event of xetDownload(fbStore, fbResolver, "http://xet.loopback"
 
 ### Dependencies
 
-`@statewalker/vcs-transport-xet` (`serveXet`, `xetDownload`), `@statewalker/vcs-transport-lfs` (`lfsDownload`, `serveLfs`, `sha256Hex`), `@statewalker/webrun-content-store` (content store), `@statewalker/webrun-storage` (`memBlobStore`).
+`@statewalker/vcs-transport-xet` (`serveXet`, `xetDownload`), `@statewalker/vcs-transport-lfs` (`lfsDownload`, `serveLfs`, `sha256Hex`, `createLfsPointer`, `parseLfsPointer`), `@statewalker/webrun-content-store` (content store), `@statewalker/webrun-storage` (`memBlobStore`).

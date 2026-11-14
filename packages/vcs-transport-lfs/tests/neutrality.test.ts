@@ -14,6 +14,8 @@ describe("neutrality (dep-lint)", () => {
   const allowed = new Set([
     "@statewalker/webrun-content-store",
     "@statewalker/webrun-http-streams",
+    "@statewalker/vcs-utils/hash",
+    "@statewalker/vcs-utils/streams",
   ]);
   const forbidden = ["vcs-core", "transport-git", "transport-xet", "files-sync", "working-tree"];
 

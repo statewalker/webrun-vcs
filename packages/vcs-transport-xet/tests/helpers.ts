@@ -17,7 +17,7 @@ import type { XetTransportEvent } from "../src/index.js";
  * so chunk ids line up for dedup negotiation.
  */
 export async function csHash(input: ByteStream): Promise<string> {
-  return `cs-sha256:${await sha256Hex(await collect(input))}`;
+  return `cs-sha256:${await sha256Hex(input)}`;
 }
 
 export function makeStore(): ContentStore {

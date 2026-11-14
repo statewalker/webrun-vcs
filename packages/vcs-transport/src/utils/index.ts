@@ -1,3 +1,11 @@
+export {
+  fetchWithRequestBody,
+  isBrowserContext,
+  requestBody,
+  shouldStreamRequestBody,
+  supportsRequestStreams,
+  toReadableStream,
+} from "@statewalker/vcs-utils/streams";
 export type { GitUrl } from "../protocol/types.js";
 export type { RefSpec } from "./refspec.js";
 export {
@@ -11,14 +19,6 @@ export {
   matchSource,
   parseRefSpec,
 } from "./refspec.js";
-export {
-  fetchWithRequestBody,
-  isBrowserContext,
-  requestBody,
-  shouldStreamRequestBody,
-  supportsRequestStreams,
-  toReadableStream,
-} from "./request-stream.js";
 export {
   formatGitUrl,
   getDefaultPort,

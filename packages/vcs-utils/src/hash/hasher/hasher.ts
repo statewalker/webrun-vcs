@@ -1,10 +1,11 @@
 /**
  * Incremental SHA-1 on @noble/hashes. No `node:` imports, so the same module
- * runs in browsers, workers, Node and Durable Objects. SHA-256 (Git LFS) and
- * BLAKE3 (Xet) join this module, behind the same `Hasher`, with the packages
- * that use them.
+ * runs in browsers, workers, Node and Durable Objects. SHA-256 (the Git LFS
+ * object id) sits behind the same `Hasher`, so large objects are hashed as they
+ * stream instead of being collected for Web Crypto's one-shot `subtle.digest`.
  */
 import { sha1 } from "@noble/hashes/legacy.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 
 /**
  * An incremental hash. Feed bytes with `update`, read the result once with
@@ -52,5 +53,21 @@ function wrap(h: NobleHash): Hasher {
 /** SHA-1, 20-byte digest. */
 export function createSha1(): Hasher {
   const h: NobleHash = sha1.create();
+  return wrap(h);
+}
+
+/**
+ * SHA-256, 32-byte digest: the Git LFS object id. Incremental, so a large
+ * object is hashed chunk by chunk as it streams.
+ *
+ * @example
+ * ```typescript
+ * const h = createSha256();
+ * for await (const chunk of stream) h.update(chunk);
+ * const oid = bytesToHex(h.digest());
+ * ```
+ */
+export function createSha256(): Hasher {
+  const h: NobleHash = sha256.create();
   return wrap(h);
 }
