@@ -5,10 +5,12 @@
  * to verify the SQL implementations follow the interface contracts.
  */
 
+import { createGitObjects, rawStorageStaging } from "@statewalker/vcs-core";
 import {
   createBlobStoreTests,
   createCommitStoreTests,
   createGitObjectStoreTests,
+  createGitObjectsTests,
   createRefBatchTests,
   createRefStoreTests,
   createStagingStoreTests,
@@ -16,6 +18,7 @@ import {
   createTreeStoreTests,
 } from "@statewalker/vcs-testing";
 import { SqlJsAdapter } from "../src/adapters/sql-js-adapter.js";
+import { SqlRawStore } from "../src/binary-storage/sql-raw-store.js";
 import { initializeSchema } from "../src/migrations/index.js";
 import {
   SqlNativeCommitStoreImpl,
@@ -123,4 +126,11 @@ createGitObjectStoreTests("SQL", async () => {
       await db.close();
     },
   };
+});
+
+// Object kernel tests
+createGitObjectsTests("SQL", async () => {
+  const db = await createTestDb();
+  const store = rawStorageStaging(new SqlRawStore(db, "raw_objects"));
+  return { objects: createGitObjects(store), store, cleanup: () => db.close() };
 });

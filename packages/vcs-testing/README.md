@@ -38,6 +38,7 @@ Every suite has the same shape: `createXxxTests(name, factory)`, where `factory`
 | `createStashStoreTests` | `stashStore: StashStore`, `setupStagedChanges?` |
 | `createWorktreeStoreTests` | `worktreeStore: Worktree`, `setupFiles?` |
 | `createRawStorageTests` | `rawStorage: RawStorage` |
+| `createGitObjectsTests` | `objects: GitObjects`, `store: StagingBlobStore` (the store under the kernel) |
 | `createVolatileStoreTests` | `volatileStore: VolatileStore` |
 | `createDeltaApiTests` | `deltaApi: DeltaApi`, `createTestBlobs?` |
 | `createStreamingStoresTests` | `stores: History` |

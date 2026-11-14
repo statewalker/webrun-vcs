@@ -21,8 +21,44 @@ import type {
 } from "@statewalker/vcs-utils/compression";
 import { CompressionError } from "@statewalker/vcs-utils/compression";
 
+/** The stream's iterator; plain arrays and other sync iterables are accepted too. */
+function iteratorOf(stream: ByteStream): AsyncIterator<Uint8Array> {
+  if (Symbol.asyncIterator in Object(stream)) return stream[Symbol.asyncIterator]();
+  return (async function* () {
+    yield* stream as unknown as Iterable<Uint8Array>;
+  })();
+}
+
+/** Close an iterator without waiting for a source that is stalled in `next()`. */
+function closeIterator(it: AsyncIterator<unknown>): void {
+  try {
+    const r = it.return?.();
+    if (r && typeof r.then === "function") r.then(undefined, () => {});
+  } catch {
+    // the source failed to close; nothing more to do
+  }
+}
+
+/** Resolves once `stream` can take more input, or is closed. */
+function writable(stream: zlib.Deflate | zlib.DeflateRaw): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      stream.off("drain", done);
+      stream.off("close", done);
+      resolve();
+    };
+    stream.on("drain", done);
+    stream.on("close", done);
+  });
+}
+
 /**
- * Compress a stream using DEFLATE (Node.js implementation)
+ * Compress a stream using DEFLATE (Node.js implementation).
+ *
+ * Same contract as the Web implementation: input is pulled as zlib takes it
+ * (backpressure); a consumer that stops early closes the source without waiting
+ * for a stalled one; an error from the source is rethrown unchanged, and zlib's
+ * own errors become `CompressionError`.
  */
 export async function* deflateNode(
   stream: ByteStream,
@@ -31,63 +67,41 @@ export async function* deflateNode(
   const deflater = options?.raw
     ? zlib.createDeflateRaw({ level: options?.level ?? 6 })
     : zlib.createDeflate({ level: options?.level ?? 6 });
-
-  const outputQueue: Uint8Array[] = [];
-  let resolveWait: (() => void) | null = null;
-  let finished = false;
-  let error: Error | null = null;
-
-  deflater.on("data", (chunk: Buffer) => {
-    outputQueue.push(new Uint8Array(chunk));
-    if (resolveWait) {
-      resolveWait();
-      resolveWait = null;
-    }
-  });
-
-  deflater.on("end", () => {
-    finished = true;
-    if (resolveWait) {
-      resolveWait();
-      resolveWait = null;
-    }
-  });
-
-  deflater.on("error", (err) => {
-    error = err;
-    finished = true;
-    if (resolveWait) {
-      resolveWait();
-      resolveWait = null;
-    }
-  });
-
-  (async () => {
+  const it = iteratorOf(stream);
+  let stopped = false;
+  let sourceError: { error: unknown } | undefined;
+  void (async () => {
     try {
-      for await (const chunk of stream) {
-        deflater.write(Buffer.from(chunk));
+      for (;;) {
+        const r = await it.next();
+        if (stopped || deflater.destroyed) return;
+        if (r.done) {
+          deflater.end();
+          return;
+        }
+        if (!deflater.write(Buffer.from(r.value))) await writable(deflater);
       }
-      deflater.end();
-    } catch (err) {
-      error = err instanceof Error ? err : new Error(String(err));
-      deflater.destroy();
+    } catch (error) {
+      if (stopped) return;
+      sourceError = { error };
+      deflater.destroy(error instanceof Error ? error : new Error(String(error)));
     }
   })();
-
-  while (!finished || outputQueue.length > 0) {
-    if (outputQueue.length > 0) {
-      const chunk = outputQueue.shift();
-      if (chunk) yield chunk;
-    } else if (!finished) {
-      await new Promise<void>((resolve) => {
-        resolveWait = resolve;
-      });
+  let completed = false;
+  try {
+    try {
+      for await (const chunk of deflater) yield new Uint8Array(chunk as Buffer);
+    } catch (error) {
+      if (sourceError) throw sourceError.error;
+      throw new CompressionError(`Compression failed: ${(error as Error).message}`, error);
     }
-  }
-
-  if (error !== null) {
-    const err = error as Error;
-    throw new CompressionError(`Compression failed: ${err.message}`, err);
+    completed = true;
+  } finally {
+    if (!completed && !sourceError) {
+      stopped = true;
+      closeIterator(it);
+      deflater.destroy();
+    }
   }
 }
 

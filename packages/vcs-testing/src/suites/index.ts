@@ -74,6 +74,7 @@
  *
  * ### Storage Backend Suites
  * - `createRawStorageTests` - RawStorage interface
+ * - `createGitObjectsTests` - GitObjects (the object kernel) over a StagingBlobStore
  * - `createVolatileStoreTests` - VolatileStore interface
  * - `createDeltaApiTests` - DeltaApi interface
  *
@@ -90,6 +91,7 @@ export * from "./commit-store.suite.js";
 export * from "./delta-api.suite.js";
 export * from "./git-compatibility.suite.js";
 export * from "./git-object-store.suite.js";
+export * from "./git-objects.suite.js";
 export * from "./raw-store.suite.js";
 export * from "./ref-batch.suite.js";
 export * from "./ref-store.suite.js";

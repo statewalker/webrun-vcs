@@ -228,6 +228,23 @@ RawStorage                             bytes by key: MemoryRawStorage, Compresse
 
 Every typed store delegates to one `GitObjectStore`, which adds the Git header, computes the id and reads the type back. Below it, a `RawStorage` stores bytes by key and knows nothing about Git. A new backend can stop at that level: `createHistoryFromComponents({ objects: createGitObjectStore(rawStorage), refs: { type: "memory" } })` gives a full `History` (pass any `Refs`, such as a store package's ref store, for persistent refs). `HistoryWithOperations` adds `delta` (deltify objects for storage), `serialization` (loose objects and packs) and `capabilities` (what the backend does natively), which GC and transport use.
 
+### The object kernel (being wired in)
+
+`createGitObjects(store)` is the object layer that replaces `GitObjectStore` (P1.5c switches the typed stores to it). An object is the bytes `"<type> <size>\0" + content`, named by their SHA-1 and stored as their zlib stream, exactly a git loose object; the kernel never parses commits or trees, so any bytes git produced keep their id.
+
+```typescript
+import { createGitObjects, MemoryRawStorage, rawStorageStaging } from "@statewalker/vcs-core";
+
+const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+const bytes = new TextEncoder().encode("hello\n");
+const id = await objects.put("blob", bytes.length, [bytes]); // "ce013625…", as git hash-object
+const obj = await objects.get(id, { verify: true }); // { type: "blob", size: 6, content }
+```
+
+`put(type, size, content)` reads `content` once: each chunk is hashed and deflated as it passes, and the store receives the compressed bytes before anyone knows the id. That is what a `StagingBlobStore` is for: `putStaged(bytes, idOf)` stores bytes under the id `idOf()` returns after the last byte, as git writes `objects/tmp_obj_*` and renames it. `rawStorageStaging(raw)` adapts any `RawStorage` (it collects the compressed bytes first); `filesStagingStore` in `@statewalker/vcs-store-files` writes git's own layout, streaming where the FilesApi's `write` streams (the Node and in-memory ones collect the chunks first). A size that does not match the content rejects with `SizeMismatchError` (exported here too) and stores nothing. Ids are SHA-1; SHA-256 repositories are not supported.
+
+`putRaw(id, raw)` stores an object received with its id, refusing it (`ObjectIdMismatchError`, `CorruptObjectError`) unless the header is valid and the bytes hash to that id. Reading checks as git does: a truncated zlib stream, bytes after it, a bad header or a body of the wrong size raise `CorruptObjectError`, and `get(id, { verify: true })` re-hashes the content. A string that is not an id is simply absent for `has`, `get` and `getRaw`; `putRaw` and `remove` refuse it with `InvalidObjectIdError`.
+
 ### Why everything streams
 
 Blob content is `AsyncIterable<Uint8Array>` on the way in and out, and trees load as async iterables of entries. A large file passes through with bounded memory, which matters in browsers. `VcsCore` collects trees into arrays because trees are small and arrays are easier to use.

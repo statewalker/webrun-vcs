@@ -5,10 +5,12 @@
  * to verify the KV implementations follow the interface contracts.
  */
 
+import { createGitObjects, rawStorageStaging } from "@statewalker/vcs-core";
 import {
   createBlobStoreTests,
   createCommitStoreTests,
   createGitObjectStoreTests,
+  createGitObjectsTests,
   createRefBatchTests,
   createRefStoreTests,
   createStagingStoreTests,
@@ -16,6 +18,7 @@ import {
   createTreeStoreTests,
 } from "@statewalker/vcs-testing";
 import { MemoryKVAdapter } from "../src/adapters/memory-adapter.js";
+import { KvRawStore } from "../src/binary-storage/kv-raw-store.js";
 import { KVRefStore } from "../src/kv-ref-store.js";
 import { KVStaging } from "../src/kv-staging-store.js";
 import { createKvObjectStores } from "../src/object-storage/index.js";
@@ -98,4 +101,11 @@ createGitObjectStoreTests("KV", async () => {
   const kv = new MemoryKVAdapter();
   const stores = createKvObjectStores({ kv });
   return { objectStore: stores.objects };
+});
+
+// Object kernel tests
+createGitObjectsTests("KV", async () => {
+  const kv = new MemoryKVAdapter();
+  const store = rawStorageStaging(new KvRawStore(kv, "objects"));
+  return { objects: createGitObjects(store), store, cleanup: () => kv.close() };
 });

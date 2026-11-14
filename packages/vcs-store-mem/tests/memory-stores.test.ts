@@ -5,10 +5,12 @@
  * to verify the memory implementations follow the interface contracts.
  */
 
+import { createGitObjects, MemoryRawStorage, rawStorageStaging } from "@statewalker/vcs-core";
 import {
   createBlobStoreTests,
   createCommitStoreTests,
   createGitObjectStoreTests,
+  createGitObjectsTests,
   createRefBatchTests,
   createRefStoreTests,
   createStagingStoreTests,
@@ -56,4 +58,10 @@ createBlobStoreTests("Memory", async () => {
 createGitObjectStoreTests("Memory", async () => {
   const stores = createMemoryObjectStores();
   return { objectStore: stores.objects };
+});
+
+// Object kernel tests
+createGitObjectsTests("Memory", async () => {
+  const store = rawStorageStaging(new MemoryRawStorage());
+  return { objects: createGitObjects(store), store };
 });
