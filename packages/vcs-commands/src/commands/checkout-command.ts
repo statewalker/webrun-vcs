@@ -490,17 +490,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           await worktree.mkdir(parentDir);
         }
 
-        // Load blob content
-        const chunks: Uint8Array[] = [];
+        // Stream the blob into the file (an empty file when the blob is missing)
         const blobContent = await this.blobs.load(entry.id);
-        if (blobContent) {
-          for await (const chunk of blobContent) {
-            chunks.push(chunk);
-          }
-        }
-
-        // Write file using worktree interface
-        await worktree.writeContent(relativePath, chunks);
+        await worktree.writeContent(relativePath, blobContent ?? []);
       }
     }
   }

@@ -11,8 +11,8 @@
 
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
-import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { hashWorktreeFile, type NewHasher } from "./hash-worktree-file.js";
 import type {
   Worktree,
   WorktreeCheckoutOptions,
@@ -41,22 +41,10 @@ export interface MemoryWorktreeOptions {
   blobs: Blobs;
   /** Trees interface for tree access */
   trees: Trees;
-  /** Custom hash function */
-  hashFunction?: (data: Uint8Array) => Promise<Uint8Array>;
+  /** Makes the incremental hasher for `computeHash` (default: SHA-1) */
+  newHasher?: NewHasher;
   /** Ignore patterns */
   ignorePatterns?: string[];
-}
-
-/**
- * Text encoder for Git header
- */
-const textEncoder = new TextEncoder();
-
-/**
- * Create Git blob header
- */
-function createBlobHeader(size: number): Uint8Array {
-  return textEncoder.encode(`blob ${size}\0`);
 }
 
 /**
@@ -66,7 +54,7 @@ export class MemoryWorktree implements Worktree {
   private readonly rootPath: string;
   private readonly blobs: Blobs;
   private readonly trees: Trees;
-  private readonly hashFunction: (data: Uint8Array) => Promise<Uint8Array>;
+  private readonly newHasher: NewHasher;
   private readonly ignorePatterns: string[];
 
   /** In-memory file storage */
@@ -78,7 +66,7 @@ export class MemoryWorktree implements Worktree {
     this.rootPath = options.rootPath ?? "/";
     this.blobs = options.blobs;
     this.trees = options.trees;
-    this.hashFunction = options.hashFunction ?? sha1;
+    this.newHasher = options.newHasher ?? createSha1;
     this.ignorePatterns = options.ignorePatterns ?? [];
   }
 
@@ -184,13 +172,12 @@ export class MemoryWorktree implements Worktree {
       throw new Error(`File not found: ${path}`);
     }
 
-    const header = createBlobHeader(file.content.length);
-    const combined = new Uint8Array(header.length + file.content.length);
-    combined.set(header, 0);
-    combined.set(file.content, header.length);
-
-    const hash = await this.hashFunction(combined);
-    return bytesToHex(hash);
+    const { content } = file;
+    return hashWorktreeFile(
+      path,
+      { size: async () => content.length, read: () => [content] },
+      this.newHasher,
+    );
   }
 
   async *readContent(path: string): AsyncIterable<Uint8Array> {
@@ -396,12 +383,7 @@ export class MemoryWorktree implements Worktree {
 
           const content = await this.blobs.load(entry.id);
           if (content) {
-            const chunks: Uint8Array[] = [];
-            for await (const chunk of content) {
-              chunks.push(chunk);
-            }
-
-            await this.writeContent(path, chunks, {
+            await this.writeContent(path, content, {
               mode: entry.mode,
               createParents: true,
             });
