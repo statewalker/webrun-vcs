@@ -16,18 +16,15 @@ import {
   createTreeStoreTests,
 } from "@statewalker/vcs-testing";
 import { MemoryKVAdapter } from "../src/adapters/memory-adapter.js";
-import { KVCommitStore } from "../src/kv-commit-store.js";
 import { KVRefStore } from "../src/kv-ref-store.js";
 import { KVStaging } from "../src/kv-staging-store.js";
-import { KVTagStore } from "../src/kv-tag-store.js";
-import { KVTreeStore } from "../src/kv-tree-store.js";
 import { createKvObjectStores } from "../src/object-storage/index.js";
 
 // TreeStore tests
 createTreeStoreTests("KV", async () => {
   const kv = new MemoryKVAdapter();
   return {
-    treeStore: new KVTreeStore(kv),
+    treeStore: createKvObjectStores({ kv }).trees,
     cleanup: async () => {
       await kv.close();
     },
@@ -38,7 +35,7 @@ createTreeStoreTests("KV", async () => {
 createCommitStoreTests("KV", async () => {
   const kv = new MemoryKVAdapter();
   return {
-    commitStore: new KVCommitStore(kv),
+    commitStore: createKvObjectStores({ kv }).commits,
     cleanup: async () => {
       await kv.close();
     },
@@ -49,7 +46,7 @@ createCommitStoreTests("KV", async () => {
 createTagStoreTests("KV", async () => {
   const kv = new MemoryKVAdapter();
   return {
-    tagStore: new KVTagStore(kv),
+    tagStore: createKvObjectStores({ kv }).tags,
     cleanup: async () => {
       await kv.close();
     },
@@ -82,7 +79,7 @@ createStagingStoreTests("KV", async () => {
   const kv = new MemoryKVAdapter();
   return {
     stagingStore: new KVStaging(kv),
-    treeStore: new KVTreeStore(kv),
+    trees: createKvObjectStores({ kv }).trees,
     cleanup: async () => {
       await kv.close();
     },

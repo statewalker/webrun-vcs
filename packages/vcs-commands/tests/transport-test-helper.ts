@@ -22,7 +22,6 @@ import {
   createMemoryObjectStores,
   MemoryRefs,
   MemoryStagingStore,
-  MemoryTagStore,
 } from "@statewalker/vcs-store-mem";
 import {
   createFetchHandler,
@@ -69,7 +68,7 @@ export function createTransportTestStores(): TransportTestStores {
     commits: objectStores.commits,
     refs: new MemoryRefs(),
     staging: new MemoryStagingStore(),
-    tags: new MemoryTagStore(),
+    tags: objectStores.tags,
   };
 }
 

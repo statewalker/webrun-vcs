@@ -16,13 +16,15 @@ import {
   createTreeStoreTests,
 } from "@statewalker/vcs-testing";
 import { SqlJsAdapter } from "../src/adapters/sql-js-adapter.js";
-import { SQLCommitStore } from "../src/commit-store.js";
 import { initializeSchema } from "../src/migrations/index.js";
+import {
+  SqlNativeCommitStoreImpl,
+  SqlNativeTagStoreImpl,
+  SqlNativeTreeStoreImpl,
+} from "../src/native/index.js";
 import { createSqlObjectStores } from "../src/object-storage/index.js";
 import { SQLRefStore } from "../src/ref-store.js";
 import { SQLStaging } from "../src/staging-store.js";
-import { SQLTagStore } from "../src/tag-store.js";
-import { SQLTreeStore } from "../src/tree-store.js";
 
 /**
  * Create a fresh database with schema for testing
@@ -37,7 +39,7 @@ async function createTestDb() {
 createTreeStoreTests("SQL", async () => {
   const db = await createTestDb();
   return {
-    treeStore: new SQLTreeStore(db),
+    treeStore: new SqlNativeTreeStoreImpl(db),
     cleanup: async () => {
       await db.close();
     },
@@ -48,7 +50,7 @@ createTreeStoreTests("SQL", async () => {
 createCommitStoreTests("SQL", async () => {
   const db = await createTestDb();
   return {
-    commitStore: new SQLCommitStore(db),
+    commitStore: new SqlNativeCommitStoreImpl(db),
     cleanup: async () => {
       await db.close();
     },
@@ -59,7 +61,7 @@ createCommitStoreTests("SQL", async () => {
 createTagStoreTests("SQL", async () => {
   const db = await createTestDb();
   return {
-    tagStore: new SQLTagStore(db),
+    tagStore: new SqlNativeTagStoreImpl(db),
     cleanup: async () => {
       await db.close();
     },
@@ -92,7 +94,7 @@ createStagingStoreTests("SQL", async () => {
   const db = await createTestDb();
   return {
     stagingStore: new SQLStaging(db),
-    treeStore: new SQLTreeStore(db),
+    trees: new SqlNativeTreeStoreImpl(db),
     cleanup: async () => {
       await db.close();
     },

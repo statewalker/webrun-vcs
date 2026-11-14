@@ -79,6 +79,22 @@ export function createTagStoreTests(name: string, factory: TagStoreFactory): voi
     });
 
     describe("Basic Operations", () => {
+      it("stores a tag under the id git gives it (git mktag)", async () => {
+        const id = await ctx.tagStore.store({
+          object: "91e296066e54b1080fcd3bee892880098880dbb1",
+          objectType: ObjectType.COMMIT,
+          tag: "v1",
+          tagger: {
+            name: "A U Thor",
+            email: "author@example.com",
+            timestamp: 1700000000,
+            tzOffset: "+0000",
+          },
+          message: "release\n",
+        });
+        expect(id).toBe("5f8557341e4fb04d268f41e0538014c9af896509");
+      });
+
       it("stores and retrieves tags", async () => {
         const tag = createTag({ tag: "v1.0.0", message: "Version 1.0.0" });
         const id = await ctx.tagStore.store(tag);

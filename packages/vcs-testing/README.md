@@ -60,14 +60,13 @@ import {
   createMemoryObjectStores,
   MemoryRefs,
   MemoryStagingStore,
-  MemoryTreeStore,
 } from "@statewalker/vcs-store-mem";
 
 createBlobStoreTests("Memory", async () => ({ blobStore: createMemoryObjectStores().blobs }));
 createRefStoreTests("Memory", async () => ({ refStore: new MemoryRefs() }));
 createStagingStoreTests("Memory", async () => ({
   stagingStore: new MemoryStagingStore(),
-  trees: new MemoryTreeStore(),
+  trees: createMemoryObjectStores().trees,
 }));
 ```
 

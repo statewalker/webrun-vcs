@@ -70,6 +70,17 @@ export function createTreeStoreTests(name: string, factory: TreeStoreFactory): v
     });
 
     describe("Basic Operations", () => {
+      it("stores a tree under the id git gives it (git mktree)", async () => {
+        const id = await ctx.treeStore.store([
+          {
+            mode: FileMode.REGULAR_FILE,
+            name: "hello.txt",
+            id: "ce013625030ba8dba906f756967f9e9ca394464a",
+          },
+        ]);
+        expect(id).toBe("aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7");
+      });
+
       it("stores and retrieves tree entries", async () => {
         const entries: TreeEntry[] = [
           { mode: FileMode.REGULAR_FILE, name: "file.txt", id: fakeObjectId("abc123") },
@@ -188,7 +199,7 @@ export function createTreeStoreTests(name: string, factory: TreeStoreFactory): v
     describe("Entry Lookup", () => {
       it("finds entry by name", async () => {
         const entries: TreeEntry[] = [
-          { mode: FileMode.REGULAR_FILE, name: "target.txt", id: fakeObjectId("target") },
+          { mode: FileMode.REGULAR_FILE, name: "target.txt", id: fakeObjectId("7a5e7") },
           { mode: FileMode.REGULAR_FILE, name: "other.txt", id: fakeObjectId("other") },
         ];
         const id = await ctx.treeStore.store(entries);
@@ -196,7 +207,7 @@ export function createTreeStoreTests(name: string, factory: TreeStoreFactory): v
         const found = await ctx.treeStore.getEntry(id, "target.txt");
         expect(found).toBeDefined();
         expect(found?.name).toBe("target.txt");
-        expect(found?.id).toBe(fakeObjectId("target"));
+        expect(found?.id).toBe(fakeObjectId("7a5e7"));
       });
 
       it("returns undefined for missing entry", async () => {

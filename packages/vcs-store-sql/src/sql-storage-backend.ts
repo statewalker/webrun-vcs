@@ -19,14 +19,14 @@ import {
   type StorageOperations,
 } from "@statewalker/vcs-core";
 
-import { SQLCommitStore } from "./commit-store.js";
 import type { DatabaseClient } from "./database-client.js";
 import { initializeSchema } from "./migrations/index.js";
 import { SqlNativeBlobStoreImpl } from "./native/sql-native-blob-store.js";
+import { SqlNativeCommitStoreImpl } from "./native/sql-native-commit-store.js";
+import { SqlNativeTagStoreImpl } from "./native/sql-native-tag-store.js";
+import { SqlNativeTreeStoreImpl } from "./native/sql-native-tree-store.js";
 import { SQLRefStore } from "./ref-store.js";
 import { SqlDeltaApi } from "./sql-delta-api.js";
-import { SQLTagStore } from "./tag-store.js";
-import { SQLTreeStore } from "./tree-store.js";
 
 /**
  * Configuration for SQL history storage
@@ -155,9 +155,9 @@ function createSQLStores(config: SQLStorageBackendConfig) {
   const autoMigrate = config.autoMigrate ?? true;
 
   const blobs = new SqlNativeBlobStoreImpl(db);
-  const trees = new SQLTreeStore(db);
-  const commits = new SQLCommitStore(db);
-  const tags = new SQLTagStore(db);
+  const trees = new SqlNativeTreeStoreImpl(db);
+  const commits = new SqlNativeCommitStoreImpl(db);
+  const tags = new SqlNativeTagStoreImpl(db);
   const refs = new SQLRefStore(db);
   const delta = new SqlDeltaApi(db);
 

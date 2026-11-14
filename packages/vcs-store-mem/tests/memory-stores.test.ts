@@ -15,28 +15,21 @@ import {
   createTagStoreTests,
   createTreeStoreTests,
 } from "@statewalker/vcs-testing";
-import {
-  createMemoryObjectStores,
-  MemoryCommitStore,
-  MemoryRefs,
-  MemoryStagingStore,
-  MemoryTagStore,
-  MemoryTreeStore,
-} from "../src/index.js";
+import { createMemoryObjectStores, MemoryRefs, MemoryStagingStore } from "../src/index.js";
 
 // TreeStore tests
 createTreeStoreTests("Memory", async () => ({
-  treeStore: new MemoryTreeStore(),
+  treeStore: createMemoryObjectStores().trees,
 }));
 
 // CommitStore tests
 createCommitStoreTests("Memory", async () => ({
-  commitStore: new MemoryCommitStore(),
+  commitStore: createMemoryObjectStores().commits,
 }));
 
 // TagStore tests
 createTagStoreTests("Memory", async () => ({
-  tagStore: new MemoryTagStore(),
+  tagStore: createMemoryObjectStores().tags,
 }));
 
 // RefStore tests
@@ -50,7 +43,7 @@ createRefBatchTests("Memory", async () => ({ refs: new MemoryRefs() }), { reflog
 // StagingStore tests
 createStagingStoreTests("Memory", async () => ({
   stagingStore: new MemoryStagingStore(),
-  treeStore: new MemoryTreeStore(),
+  trees: createMemoryObjectStores().trees,
 }));
 
 // BlobStore tests
