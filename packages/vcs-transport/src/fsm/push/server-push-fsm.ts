@@ -11,6 +11,7 @@
  * 7. Send status report
  */
 
+import { isValidRefName, type RefCommand } from "@statewalker/vcs-core";
 import {
   getConfig,
   getOutput,
@@ -20,6 +21,7 @@ import {
   getTransport,
   type ProcessContext,
 } from "../../context/context-adapters.js";
+import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
@@ -390,6 +392,14 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             continue;
           }
 
+          // As git's receive-pack: only valid names under refs/ (never HEAD itself)
+          if (!cmd.refName.startsWith("refs/") || !isValidRefName(cmd.refName)) {
+            cmd.result = "REJECTED_OTHER_REASON";
+            cmd.message = "funny refname";
+            invalidCount++;
+            continue;
+          }
+
           // Validate old OID matches current ref
           const currentOid = state.refs.get(cmd.refName) ?? ZERO_OID;
           if (cmd.oldOid !== currentOid) {
@@ -520,53 +530,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const output = getOutput(ctx);
       try {
         const atomic = state.capabilities.has("atomic");
-
-        let failedCount = 0;
-        const appliedCommands: PushCommand[] = [];
-
-        for (const cmd of state.pushCommands ?? []) {
-          if (cmd.result !== "NOT_ATTEMPTED") {
-            failedCount++;
-            continue;
-          }
-
-          try {
-            if (cmd.type === "DELETE") {
-              // Delete ref - refStore.update should handle this
-              await refStore.update(cmd.refName, ZERO_OID);
-            } else {
-              await refStore.update(cmd.refName, cmd.newOid);
-            }
-            cmd.result = "OK";
-            appliedCommands.push(cmd);
-          } catch (e) {
-            cmd.result = "LOCK_FAILURE";
-            cmd.message = e instanceof Error ? e.message : "update failed";
-            failedCount++;
-
-            // If atomic, abort all
-            if (atomic) {
-              // Rollback applied updates (best effort)
-              for (const applied of appliedCommands) {
-                try {
-                  await refStore.update(applied.refName, applied.oldOid);
-                  applied.result = "ATOMIC_REJECTED";
-                  applied.message = "atomic push failed";
-                } catch {
-                  // Rollback failed, continue
-                }
-              }
-              return "ATOMIC_FAILED";
-            }
-          }
-        }
-
-        state.appliedCommands = appliedCommands;
-
-        if (failedCount === 0) {
-          return "UPDATES_APPLIED";
-        }
-        return "PARTIAL_APPLIED";
+        return await applyUpdates(state, refStore, atomic);
       } catch (e) {
         output.error = String(e);
         return "ERROR";
@@ -679,4 +643,153 @@ interface ContextWithHooks extends ProcessContext {
     }>;
     postReceive?: (commands: PushCommand[], options?: string[]) => Promise<void>;
   };
+}
+
+/** The batch command for a push command; git's zero id means "absent" on both sides. */
+function toRefCommand(cmd: PushCommand): RefCommand {
+  return {
+    name: cmd.refName,
+    old: cmd.oldOid === ZERO_OID ? null : cmd.oldOid,
+    new: cmd.newOid === ZERO_OID ? null : cmd.newOid,
+    noDeref: true, // receive-pack names refs directly, as git does
+  };
+}
+
+type ApplyResult = "UPDATES_APPLIED" | "PARTIAL_APPLIED" | "ATOMIC_FAILED";
+
+/** git's report-status texts. */
+const FAILED_TO_UPDATE = "failed to update ref";
+const ATOMIC_TRANSACTION_FAILED = "atomic transaction failed";
+const ATOMIC_PUSH_FAILURE = "atomic push failure";
+
+/**
+ * Apply the push commands still `NOT_ATTEMPTED`, as git's receive-pack does in
+ * a ref transaction.
+ *
+ * - An atomic push with a command already rejected (validation, hook) changes
+ *   nothing: the others get "atomic push failure".
+ * - With `refStore.batch`, an atomic push is one batch (all refs or none, every
+ *   command "atomic transaction failed" when refused) and a plain push one batch
+ *   per ref ("failed to update ref"). Each update checks the old id the client
+ *   sent. A store whose batch answers `unsupported` (not atomic for several refs)
+ *   gets the one-by-one path.
+ * - Without `batch`, refs are written one by one with `update`.
+ */
+async function applyUpdates(
+  state: ServerPushState,
+  refStore: RefStore,
+  atomic: boolean,
+): Promise<ApplyResult> {
+  const all = state.pushCommands ?? [];
+  const pending = all.filter((c) => c.result === "NOT_ATTEMPTED");
+  state.appliedCommands = [];
+  if (atomic && pending.length < all.length) {
+    for (const c of pending) {
+      c.result = "ATOMIC_REJECTED";
+      c.message = ATOMIC_PUSH_FAILURE;
+    }
+    return "ATOMIC_FAILED";
+  }
+  const batch = refStore.batch?.bind(refStore);
+  if (!batch) return applyOneByOne(state, refStore, atomic);
+  const options = { message: "push" };
+
+  if (atomic) {
+    if (pending.length === 0) return "UPDATES_APPLIED";
+    let result: Awaited<ReturnType<typeof batch>>;
+    try {
+      result = await batch(pending.map(toRefCommand), options);
+    } catch {
+      result = { ok: false, rejected: pending.map((c) => ({ name: c.refName, reason: "locked" })) };
+    }
+    if (result.ok) {
+      for (const c of pending) c.result = "OK";
+      state.appliedCommands = [...pending];
+      return "UPDATES_APPLIED";
+    }
+    if (result.rejected.every((r) => r.reason === "unsupported")) {
+      return applyOneByOne(state, refStore, atomic);
+    }
+    for (const c of pending) {
+      c.result = "ATOMIC_REJECTED";
+      c.message = ATOMIC_TRANSACTION_FAILED;
+    }
+    return "ATOMIC_FAILED";
+  }
+
+  for (const c of pending) {
+    let ok = false;
+    try {
+      ok = (await batch([toRefCommand(c)], options)).ok;
+    } catch {
+      ok = false;
+    }
+    if (ok) {
+      c.result = "OK";
+      state.appliedCommands.push(c);
+    } else {
+      c.result = "LOCK_FAILURE";
+      c.message = FAILED_TO_UPDATE;
+    }
+  }
+  return state.appliedCommands.length === all.length ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
+}
+
+/**
+ * Write refs one by one with `update`, for stores without an atomic batch. An
+ * atomic push is rolled back best effort when a write fails.
+ */
+async function applyOneByOne(
+  state: ServerPushState,
+  refStore: RefStore,
+  atomic: boolean,
+): Promise<ApplyResult> {
+  let failedCount = 0;
+  const appliedCommands: PushCommand[] = [];
+
+  for (const cmd of state.pushCommands ?? []) {
+    if (cmd.result !== "NOT_ATTEMPTED") {
+      failedCount++;
+      continue;
+    }
+
+    try {
+      if (cmd.type === "DELETE") {
+        // Delete ref - refStore.update should handle this
+        await refStore.update(cmd.refName, ZERO_OID);
+      } else {
+        await refStore.update(cmd.refName, cmd.newOid);
+      }
+      cmd.result = "OK";
+      appliedCommands.push(cmd);
+    } catch (e) {
+      cmd.result = "LOCK_FAILURE";
+      cmd.message = e instanceof Error ? e.message : "update failed";
+      failedCount++;
+
+      // If atomic, abort all
+      if (atomic) {
+        // Rollback applied updates (best effort; stores with `batch` need none)
+        for (const applied of appliedCommands) {
+          try {
+            await refStore.update(applied.refName, applied.oldOid);
+            applied.result = "ATOMIC_REJECTED";
+            applied.message = ATOMIC_TRANSACTION_FAILED;
+          } catch {
+            // Rollback failed, continue
+          }
+        }
+        for (const other of state.pushCommands ?? []) {
+          if (other.result === "NOT_ATTEMPTED") {
+            other.result = "ATOMIC_REJECTED";
+            other.message = ATOMIC_TRANSACTION_FAILED;
+          }
+        }
+        return "ATOMIC_FAILED";
+      }
+    }
+  }
+
+  state.appliedCommands = appliedCommands;
+  return failedCount === 0 ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
 }

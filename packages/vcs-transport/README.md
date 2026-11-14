@@ -26,7 +26,7 @@ pnpm add @statewalker/vcs-transport
 
 No peer dependencies.
 
-To get a `RepositoryFacade` and `RefStore` for a VCS store, use [`@statewalker/vcs-transport-adapters`](../vcs-transport-adapters/README.md), or `createRepositoryFacade()` from this package.
+To get a `RepositoryFacade` and `RefStore` for a VCS store, use [`@statewalker/vcs-transport-adapters`](../vcs-transport-adapters/README.md), or `createRepositoryFacade()` and `createTransportRefStore(history.refs)` from this package.
 
 ### Entry points
 
@@ -60,7 +60,8 @@ All entry points are ESM with type declarations.
 |-----------|-------------|
 | `Duplex` | Async-iterable byte stream with `write(data)` and optional `close()` |
 | `RepositoryFacade` | `importPack`, `exportPack`, `has`, `walkAncestors`, optional reachability helpers |
-| `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip` |
+| `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip`, `batch` |
+| `createTransportRefStore(refs)` | the `RefStore` over a vcs-core `Refs`, with `batch` |
 | `RepositoryAccess` | Object/ref access: `hasObject`, `getObjectInfo`, `loadObject`, `storeObject`, `listRefs`, `getHead`, `updateRef`, `walkObjects` |
 | `TransportApi` | Pkt-line, sideband and pack I/O over a `Duplex` |
 | `Credentials` | `{ username?, password?, token? }`. The HTTP operations send Basic auth: `token` as the password (username defaults to `x-access-token`), otherwise `username`/`password`. |
@@ -255,6 +256,7 @@ The transport never touches storage directly. It needs only a `RepositoryFacade`
 
 ### Constraints
 
+- **Receiving a push** (receive-pack), names must be valid refs under `refs/` (anything else, `HEAD` included, gets `ng <ref> funny refname`, as from git). A `RefStore` with `batch` gets git's ref transaction: an `atomic` push is one batch, so every ref changes or none does, and when any ref is refused every ref gets `ng <ref> atomic transaction failed` (`atomic push failure` when validation or a hook already rejected one); a plain push is one batch per ref. Each update checks the old id the client sent, so a ref that moved since the advertisement is refused (`ng <ref> failed to update ref`) instead of overwritten. A store whose batch answers `unsupported` for several refs, and a `RefStore` without `batch`, keep the older path: one `update` per ref, no old-value check, and a best-effort rollback for `atomic`.
 - HTTP `fetch` and `clone` return raw pack bytes and binary OIDs; they do not import anything. The duplex operations do import into the given `RepositoryFacade` and update the `RefStore`.
 - HTTP `fetch`, `push`, `clone` and `lsRemote` send Basic auth. With `auth.token`, the token is the password and the username is `auth.username`, defaulting to `x-access-token` (GitHub and GitLab accept any username with a token; Bitbucket expects `x-token-auth`, passed as `username`). Without a token they use `auth.username` and `auth.password`.
 - `clone` accepts `bare` and `remoteName` in its options type but does not use them.

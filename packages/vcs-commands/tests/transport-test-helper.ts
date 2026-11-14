@@ -12,7 +12,6 @@ import {
   type GitObjectStore,
   type History,
   type HistoryWithOperations,
-  isSymbolicRef,
   type ObjectId,
   type Refs,
   type SerializationApi,
@@ -28,7 +27,7 @@ import {
 import {
   createFetchHandler,
   createRepositoryFacade,
-  type RefStore,
+  createTransportRefStore,
 } from "@statewalker/vcs-transport";
 import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
@@ -201,49 +200,6 @@ function createMockFetch(
 }
 
 /**
- * Create a transport RefStore adapter from a vcs-core Refs.
- */
-function createTransportRefStoreAdapter(refs: Refs): RefStore {
-  return {
-    async get(name: string): Promise<string | undefined> {
-      const ref = await refs.resolve(name);
-      return ref?.objectId;
-    },
-
-    async update(name: string, oid: string): Promise<void> {
-      await refs.set(name, oid);
-    },
-
-    async listAll(): Promise<Iterable<[string, string]>> {
-      const result: Array<[string, string]> = [];
-      for await (const ref of refs.list()) {
-        if (!isSymbolicRef(ref) && ref.objectId) {
-          result.push([ref.name, ref.objectId]);
-        }
-      }
-      return result;
-    },
-
-    async getSymrefTarget(name: string): Promise<string | undefined> {
-      const ref = await refs.get(name);
-      if (ref && isSymbolicRef(ref)) {
-        return ref.target;
-      }
-      return undefined;
-    },
-
-    async isRefTip(oid: string): Promise<boolean> {
-      for await (const ref of refs.list()) {
-        if (!isSymbolicRef(ref) && ref.objectId === oid) {
-          return true;
-        }
-      }
-      return false;
-    },
-  };
-}
-
-/**
  * Create a mock HistoryWithOperations for transport tests.
  *
  * Wraps stores to provide the interface expected by createRepositoryFacade.
@@ -395,7 +351,7 @@ export function createTestServer(serverStores?: TransportTestStores): TestServer
   });
 
   // Create transport ref store adapter
-  const refStore = createTransportRefStoreAdapter(stores.refs);
+  const refStore = createTransportRefStore(stores.refs);
 
   const serverFetch = createFetchHandler({
     async resolveRepository(repoPath) {
@@ -468,7 +424,7 @@ export async function createInitializedTestServer(): Promise<
   });
 
   // Create transport ref store adapter
-  const refStore = createTransportRefStoreAdapter(stores.refs);
+  const refStore = createTransportRefStore(stores.refs);
 
   const serverFetch = createFetchHandler({
     async resolveRepository(repoPath) {

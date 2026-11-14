@@ -20,43 +20,14 @@ import type {
   RepositoryFacade,
 } from "../src/api/repository-facade.js";
 import type { RefStore } from "../src/context/process-context.js";
+import { createTransportRefStore } from "../src/context/transport-ref-store.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Adapters: Bridge History → Transport interfaces
 // ─────────────────────────────────────────────────────────────────────────────
 
 function createRefStoreAdapter(history: HistoryWithOperations): RefStore {
-  return {
-    async get(name: string): Promise<string | undefined> {
-      const ref = await history.refs.resolve(name);
-      if (!ref) return undefined;
-      if ("objectId" in ref) return ref.objectId;
-      return undefined;
-    },
-    async update(name: string, oid: string): Promise<void> {
-      await history.refs.set(name, oid);
-    },
-    async listAll(): Promise<Iterable<[string, string]>> {
-      const result: [string, string][] = [];
-      for await (const ref of history.refs.list()) {
-        if ("objectId" in ref && ref.objectId) {
-          result.push([ref.name, ref.objectId]);
-        }
-      }
-      return result;
-    },
-    async getSymrefTarget(name: string): Promise<string | undefined> {
-      const ref = await history.refs.resolve(name);
-      if (ref && "target" in ref) return (ref as { target: string }).target;
-      return undefined;
-    },
-    async isRefTip(oid: string): Promise<boolean> {
-      for await (const ref of history.refs.list()) {
-        if ("objectId" in ref && ref.objectId === oid) return true;
-      }
-      return false;
-    },
-  };
+  return createTransportRefStore(history.refs);
 }
 
 function createRepoFacade(history: HistoryWithOperations): RepositoryFacade {

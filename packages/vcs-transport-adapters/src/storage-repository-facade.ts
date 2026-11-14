@@ -25,12 +25,14 @@ import {
   createTags,
   createTrees,
   DefaultSerializationApi,
-  isSymbolicRef,
   kvStoreRefs,
-  type Refs,
   type SerializationApi,
 } from "@statewalker/vcs-core";
-import type { RefStore, RepositoryFacade } from "@statewalker/vcs-transport";
+import {
+  createTransportRefStore,
+  type RefStore,
+  type RepositoryFacade,
+} from "@statewalker/vcs-transport";
 import type { BlobStore, KvStore } from "@statewalker/webrun-storage";
 import { createVcsRepositoryFacade } from "./vcs-repository-facade.js";
 
@@ -74,40 +76,4 @@ export function createStorageRepositoryFacade(
   const facade = createVcsRepositoryFacade({ history, serialization });
   const refStore = createTransportRefStore(coreRefs);
   return { facade, refStore };
-}
-
-/** Adapt a core `Refs` into the transport-layer `RefStore` interface. */
-function createTransportRefStore(coreRefs: Refs): RefStore {
-  return {
-    async get(name) {
-      const ref = await coreRefs.resolve(name);
-      return ref?.objectId;
-    },
-    async update(name, oid) {
-      await coreRefs.set(name, oid);
-    },
-    async listAll() {
-      const refs: Array<[string, string]> = [];
-      for await (const ref of coreRefs.list()) {
-        if (isSymbolicRef(ref)) {
-          const resolved = await coreRefs.resolve(ref.name);
-          if (resolved?.objectId) refs.push([ref.name, resolved.objectId]);
-        } else if (ref.objectId) {
-          refs.push([ref.name, ref.objectId]);
-        }
-      }
-      return refs;
-    },
-    async getSymrefTarget(name) {
-      const ref = await coreRefs.get(name);
-      if (ref && isSymbolicRef(ref)) return ref.target;
-      return undefined;
-    },
-    async isRefTip(oid) {
-      for await (const ref of coreRefs.list()) {
-        if (!isSymbolicRef(ref) && ref.objectId === oid) return true;
-      }
-      return false;
-    },
-  };
 }

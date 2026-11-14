@@ -26,8 +26,15 @@ import {
   kvStoreRefs,
 } from "@statewalker/vcs-core";
 import {
+  Fsm,
   fetchOverDuplex,
+  HandlerOutput,
+  ProcessConfiguration,
+  ProtocolState,
+  type PushCommand,
   serveRepoOverWebrun,
+  serverPushHandlers,
+  serverPushTransitions,
   webrunClientDuplex,
 } from "@statewalker/vcs-transport";
 import { memBlobStore, memKvStore } from "@statewalker/webrun-storage";
@@ -152,5 +159,45 @@ describe("createStorageRepositoryFacade transport object-exchange over @statewal
     const destAncestry: string[] = [];
     for await (const oid of dest.facade.walkAncestors(c2)) destAncestry.push(oid);
     expect(destAncestry).toEqual([c2, c1]);
+  });
+});
+
+describe("createStorageRepositoryFacade receiving an atomic push", () => {
+  it("applies an atomic push of several refs (its refs accept single-ref batches only)", async () => {
+    const { refStore } = createStorageRepositoryFacade({
+      objects: memBlobStore(),
+      refs: memKvStore(),
+    });
+    const A = "a".repeat(40);
+    const B = "b".repeat(40);
+    await refStore.update("refs/heads/main", A);
+    await refStore.update("refs/heads/dev", A);
+    const state = new ProtocolState();
+    state.capabilities.add("atomic");
+    const commands: PushCommand[] = ["refs/heads/main", "refs/heads/dev"].map((refName) => ({
+      refName,
+      oldOid: A,
+      newOid: B,
+      type: "UPDATE",
+      result: "NOT_ATTEMPTED",
+    }));
+    (state as { pushCommands?: PushCommand[] }).pushCommands = commands;
+    const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+    fsm.setState("APPLY_UPDATES");
+    await fsm.run(
+      {
+        transport: {} as never,
+        repository: {} as never,
+        refStore,
+        state,
+        output: new HandlerOutput(),
+        config: new ProcessConfiguration(),
+      },
+      "RUN_POST_RECEIVE_HOOK",
+      "SEND_STATUS",
+    );
+    expect(fsm.getState()).toBe("RUN_POST_RECEIVE_HOOK");
+    expect(commands.map((c) => c.result)).toEqual(["OK", "OK"]);
+    expect(await refStore.get("refs/heads/dev")).toBe(B);
   });
 });
