@@ -32,7 +32,7 @@ Main exports:
 
 | Export | What it is |
 | --- | --- |
-| `createGitFilesBackend({ files, gitDir?, create?, defaultBranch? })` | `{ history, objects, packDirectory, looseStorage }` over a `.git` directory. `create: true` writes `HEAD`, `config`, `objects/`, `refs/heads`, `refs/tags`. |
+| `createGitFilesBackend({ files, gitDir?, create?, defaultBranch? })` | `{ history, objects, packs, packDirectory, looseStorage }` over a `.git` directory: `objects` reads packs first, then loose objects; `packs` is the `PackSet` it reads from. `create: true` writes `HEAD`, `config`, `objects/`, `refs/heads`, `refs/tags`. |
 | `createGitFilesHistoryFromFiles(options)` | Same options, returns a `HistoryWithOperations` (adds `delta` and `serialization` backed by the pack directory). |
 | `FileStagingStore(files, indexPath)` | `Staging` stored in Git's binary index format (`.git/index`). |
 | `createFileWorktree({ files, rootPath, blobs, trees, gitDir? })` / `FileWorktree` | `Worktree` over the working directory, with `.gitignore` support and `checkoutTree`. |
@@ -44,7 +44,7 @@ Lower-level building blocks, also exported:
 
 | Area | Exports |
 | --- | --- |
-| Object kernel store | `filesStagingStore(files, objectsDir)`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packDirectory)`: a `GitObjects` that reads loose objects first, then packs; `skipPacked(store, packDirectory)`: a staging store that does not write objects already packed |
+| Object kernel store | `filesStagingStore(files, objectsDir)`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packs)`: a `GitObjects` that reads the packs of a `PackSet` (`openPackSet` from `@statewalker/vcs-core`) first, then loose objects; `skipPacked(store, packs)`: a staging store that does not write objects already packed (in a pack still on storage, in a copy not found corrupt) |
 | Loose objects | `FileRawStorage` (`compress` option, default `true`), `PackDirectoryAdapter` (read-only `RawStorage` over packs) |
 | Packs | `PackDirectory`, `PackReader`, `PackDeltaStore`, `PackConsolidator`, `RandomAccessDeltaReader`, `GitPackStoreImpl` / `createGitPackStore`, `DirectPackObjectReader`, `isDeltaType` |
 | Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs? })` with atomic `batch`; `createFilesRefBatch(atomicFiles)`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
@@ -193,23 +193,45 @@ around `packed-refs`, so a listing never combines states of a batch committing m
 
 ```
 History (blobs / trees / commits / tags / refs)
-  └─ withPacks               loose objects first, then packs
+  └─ withPacks               packs first, then loose objects
        ├─ GitObjects         adds and strips the "type size\0" header, computes SHA-1
        │    └─ skipPacked         drops a write whose object is already packed
        │         └─ filesStagingStore   read/write  .git/objects/ab/cdef...   (zlib)
-       └─ PackDirectory            read-only   .git/objects/pack/*.pack + *.idx
+       └─ PackSet (vcs-core)       read-only   .git/objects/pack/*.pack + *.idx
   └─ FileRefStore            .git/HEAD, .git/refs/**, .git/packed-refs, .git/logs/**
 ```
 
-Writing an object that is already packed (`put` or `putRaw`) writes nothing, as git and JGit do.
+Reads try the packs first, then the loose objects, as git and JGit do: a packed object is
+streamed from its pack (a large blob arrives in many chunks), and `getRaw` is its header followed
+by that stream; a caller that stops after the header releases the pack read. A pack miss, and
+every `list()`, rescans the pack directory at most once per second (git's
+`reprepare_packed_git`, rate-limited; the first rescan after open always runs), so a pack native
+git writes meanwhile is found within that interval, and a run of misses (fetch negotiation probing
+absent ids) does not list the directory each time. `list()` takes one snapshot of the packs for
+both the packed ids and for skipping loose ids that are already packed. Packs that `repack()` and gc add or remove
+through the returned `packDirectory` refresh `packs` at once.
+
+A packed copy that fails before `get` returns (a corrupt entry header, a missing delta base, a
+zlib stream broken from its start: the first chunk is read before `get` returns) gives way to a
+loose copy; its error is raised only when there is none. A stream that breaks later fails while
+it is read, with nothing to fall back to at that point, but the copy is marked bad and the next
+`get` reads the loose copy. A corrupt pack is skipped when the backend opens (`packs.skipped`
+says which and why) and the rest of the repository stays readable.
+
+Writing an object that is already packed (`put` or `putRaw`) writes nothing, as git and JGit do,
+unless its pack file has been deleted behind the backend's back (by `git repack -a -d` or gc) or
+its packed copy was found corrupt: then it is written loose, so a repairing write lands. A pack
+whose file was checked less than a second ago is trusted without another check, so writes made
+within that second after the pack was deleted are skipped and not retried.
 `gc()` and `repack()` still work on `FileRawStorage` (the `looseStorage` the backend returns) and
-`PackDirectory`, and ignore files in `objects/` that are not objects (such as git's
+`PackDirectory` (also returned, until they move to `packs`), and ignore files in `objects/` that are not objects (such as git's
 `objects/ab/tmp_obj_*` while it writes).
 
 New objects are always written loose. Packs are only read, until `repack()` turns loose objects
 into a pack. This keeps writes simple (one file per object, no pack index to rewrite) and matches
-how `git` itself behaves between `git gc` runs. `PackDirectory` keeps at most 10 open packs in
-its cache by default (`maxCachedPacks`).
+how `git` itself behaves between `git gc` runs. A pack `repack()` writes through `PackDirectory`
+is read by `packs` at once (the backend refreshes the set after each `addPack` and `removePack`;
+a failed refresh does not fail them, and the next miss rescans).
 
 ### Reachability is computed from refs only
 
@@ -258,6 +280,7 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
 | `FileRawStorage.load()` of a loose object that does not exist (`objects.get()` returns `undefined` instead) | `Key not found: <id>` |
 | A pack with a bad header | `Invalid pack file signature` / `Unsupported pack version: <n>` |
 | A delta whose base is missing | `Base object not found: <id>` |
+| `objects.get()` of a packed object whose only copy is corrupt (bad zlib, a delta cycle, a missing base) | `PackError` (a `CorruptObjectError`); with `verify`, content hashing to another id raises `ObjectIdMismatchError` |
 | A broken `packed-refs` file | `Invalid packed-refs line: <line>`, `Peeled line before ref in packed-refs` |
 | A truncated ref file | `Invalid ref content in <name>: too short` |
 | A symbolic ref loop | `Symbolic ref depth exceeded for <name>` |

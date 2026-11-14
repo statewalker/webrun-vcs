@@ -1,22 +1,16 @@
 /**
- * Git's object database: loose objects and pack files. Reads try the loose
- * store first, then the packs. Writes and removals go to the loose store, and an
- * object already in a pack is not written again (git's freshen_packed_object,
- * JGit's ObjectDirectoryInserter). Packs are read-only here (repack and gc
- * rewrite them).
+ * Git's object database: pack files and loose objects. Reads try the packs
+ * first, then the loose store (git's find_pack_entry before loose objects, JGit's
+ * ObjectDirectory). A pack miss rescans the pack directory, at most once per the
+ * set's `rescanIntervalMs` (git's reprepare_packed_git, rate-limited), so a pack
+ * written by native git is found. Writes and removals go to the loose store, and
+ * an object already in a pack is not written again, unless that pack's file is
+ * gone or its copy was found corrupt (git's freshen_packed_object, JGit's
+ * ObjectDirectoryInserter). Packs are read-only here (repack and gc rewrite them).
  */
 
-import type { StagingBlobStore } from "@statewalker/vcs-core";
-import {
-  type GitObject,
-  type GitObjects,
-  ObjectIdMismatchError,
-  type ObjectTypeString,
-  parseHeader,
-} from "@statewalker/vcs-core";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import type { PackDirectory } from "./pack-directory.js";
+import type { PackSet, StagingBlobStore } from "@statewalker/vcs-core";
+import { type GitObject, type GitObjects, PackError } from "@statewalker/vcs-core";
 
 const OID = /^[0-9a-f]{40}$/;
 const isId = (id: unknown): id is string => typeof id === "string" && OID.test(id);
@@ -44,7 +38,7 @@ class AlreadyPacked extends Error {}
  * staged as usual, and once their id is known a packed object is dropped (the
  * temporary is removed) and reported as `stored: false`.
  */
-export function skipPacked(store: StagingBlobStore, packs: PackDirectory): StagingBlobStore {
+export function skipPacked(store: StagingBlobStore, packs: PackSet): StagingBlobStore {
   return {
     ...store,
     async putStaged(bytes, idOf) {
@@ -52,7 +46,7 @@ export function skipPacked(store: StagingBlobStore, packs: PackDirectory): Stagi
       try {
         return await store.putStaged(bytes, async () => {
           const id = await idOf();
-          if (await packs.has(id)) {
+          if (await packs.freshen(id)) {
             packedId = id;
             throw new AlreadyPacked(id);
           }
@@ -67,19 +61,42 @@ export function skipPacked(store: StagingBlobStore, packs: PackDirectory): Stagi
 }
 
 /**
- * Reads fall back to packs; build `loose` over `skipPacked` so writes skip packed
- * objects too (as `createGitFilesBackend` does).
+ * Reads packs first, then `loose`; build `loose` over `skipPacked` so writes skip
+ * packed objects too (as `createGitFilesBackend` does).
  *
  * @example
  * ```typescript
+ * const packs = await openPackSet(files, ".git/objects/pack");
  * const loose = createGitObjects(skipPacked(filesStagingStore(files, ".git/objects"), packs));
- * const objects = withPacks(createGitObjects(filesStagingStore(files, ".git/objects")), packs);
- * await objects.get(id); // a loose object, or one from .git/objects/pack/*.pack
+ * const objects = withPacks(loose, packs);
+ * await objects.get(id); // from .git/objects/pack/*.pack, or a loose object
  * ```
  */
-export function withPacks(loose: GitObjects, packs: PackDirectory): GitObjects {
-  /** A packed object, inflated and resolved (header included); undefined if not packed. */
-  const packedRaw = async (id: string) => (isId(id) ? packs.loadRaw(id) : undefined);
+export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
+  /**
+   * Packs, then loose objects. A packed copy that fails before `get` returns (a corrupt entry
+   * header, a missing delta base, a broken first chunk) gives way to a loose copy; its error is
+   * raised only when there is none. A copy failing later in its stream is marked bad by the
+   * set, so the next read goes loose.
+   */
+  const lookup = async (
+    id: string,
+    options?: { verify?: boolean },
+  ): Promise<GitObject | undefined> => {
+    if (!isId(id)) return loose.get(id, options);
+    let failed: unknown;
+    try {
+      const packed = await packs.get(id, options);
+      if (packed) return packed;
+    } catch (e) {
+      if (!(e instanceof PackError)) throw e;
+      failed = e;
+    }
+    const obj = await loose.get(id, options);
+    if (obj) return obj;
+    if (failed) throw failed;
+    return undefined;
+  };
 
   return {
     put: (type, size, content) => loose.put(type, size, content),
@@ -87,7 +104,7 @@ export function withPacks(loose: GitObjects, packs: PackDirectory): GitObjects {
     async putRaw(id, raw) {
       // As JGit's ObjectDirectory.insertUnpackedObject: an object already packed is
       // not written again (git's "freshen" of a packed object is a no-op here).
-      if (isId(id) && (await packs.has(id))) {
+      if (isId(id) && (await packs.freshen(id))) {
         closeSource(raw);
         return;
       }
@@ -95,50 +112,35 @@ export function withPacks(loose: GitObjects, packs: PackDirectory): GitObjects {
     },
 
     async *getRaw(id) {
-      if (await loose.has(id)) {
-        yield* loose.getRaw(id);
-        return;
+      const obj = await lookup(id);
+      if (!obj) return;
+      const it = obj.content[Symbol.asyncIterator]();
+      try {
+        yield new TextEncoder().encode(`${obj.type} ${obj.size}\0`);
+        for (;;) {
+          const r = await it.next();
+          if (r.done) return;
+          yield r.value;
+        }
+      } finally {
+        // also when the caller stops after the header: the packed read is released
+        await it.return?.();
       }
-      const raw = await packedRaw(id);
-      if (raw) yield raw;
     },
 
-    async get(id, options): Promise<GitObject | undefined> {
-      const obj = await loose.get(id, options);
-      if (obj) return obj;
-      const raw = await packedRaw(id);
-      if (!raw) return undefined;
-      if (options?.verify) {
-        const actual = bytesToHex(createSha1().update(raw).digest());
-        if (actual !== id) throw new ObjectIdMismatchError(`object ${id} hashes to ${actual}`);
-      }
-      const header = parseHeader(raw);
-      const body = raw.subarray(header.contentOffset);
-      let used = false;
-      return {
-        type: header.type as ObjectTypeString,
-        size: header.size,
-        content: {
-          async *[Symbol.asyncIterator]() {
-            if (used) throw new Error(`content of ${id} was already iterated`);
-            used = true;
-            yield body;
-          },
-        },
-      };
-    },
+    get: lookup,
 
     async has(id) {
-      return (await loose.has(id)) || (isId(id) && (await packs.has(id)));
+      if (!isId(id)) return loose.has(id);
+      return (await packs.has(id)) || (await loose.has(id));
     },
 
     async *list() {
-      const seen = new Set<string>();
-      for await (const id of loose.list()) {
-        seen.add(id);
-        yield id;
-      }
-      for await (const id of packs.listObjects()) if (!seen.has(id)) yield id;
+      // one snapshot of the packs, for the packed ids and to skip loose ids already in a pack's
+      // idx (no set of every id)
+      const held = await packs.packs();
+      yield* packs.list({ packs: held });
+      for await (const id of loose.list()) if (!held.some((p) => p.has(id))) yield id;
     },
 
     remove: (id) => loose.remove(id),

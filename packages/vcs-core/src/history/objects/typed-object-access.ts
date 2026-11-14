@@ -24,7 +24,12 @@ export async function storeObject(
   return objects.put(type, size, chunks);
 }
 
-/** The object's type and size, or undefined if it is absent (only the header is inflated). */
+/**
+ * The object's type and size, or undefined if it is absent. The read is released at once
+ * (`return()` on the content before iterating it). What is read before that depends on the
+ * store: a loose object's header; for a packed object, the first chunk of a whole object, or
+ * the resolved result of a delta.
+ */
 export async function objectHeader(
   objects: GitObjects,
   id: ObjectId,
