@@ -55,6 +55,20 @@ createBlobStoreTests("Memory", async () => {
 
 // Object kernel tests
 createGitObjectsTests("Memory", async () => {
-  const store = rawStorageStaging(new MemoryRawStorage());
-  return { objects: createGitObjects(store), store };
+  const raw = new MemoryRawStorage();
+  // counts the bytes MemoryRawStorage.store has taken in, for the bounded-memory test
+  let persisted = 0;
+  const storeRaw = raw.store.bind(raw);
+  raw.store = (key, content) =>
+    storeRaw(
+      key,
+      (async function* () {
+        for await (const c of content) {
+          persisted += c.length;
+          yield c;
+        }
+      })(),
+    );
+  const store = rawStorageStaging(raw);
+  return { objects: createGitObjects(store), store, persistedBytes: () => persisted };
 });

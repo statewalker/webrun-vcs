@@ -40,6 +40,14 @@ export class MemoryRawStorage implements RawStorage {
     return this.data.delete(key);
   }
 
+  async move(from: string, to: string): Promise<boolean> {
+    const chunks = this.data.get(from);
+    if (!chunks) return false;
+    this.data.set(to, chunks);
+    if (from !== to) this.data.delete(from);
+    return true;
+  }
+
   async *keys(): AsyncIterable<string> {
     yield* this.data.keys();
   }

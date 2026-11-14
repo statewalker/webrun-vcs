@@ -190,7 +190,7 @@ All stores can share one `KVStore` because each writes under its own prefix:
 
 | Store | Keys |
 | --- | --- |
-| `createKvObjectStores` (prefix `objects:`) / `KvRawStore` (prefix `raw`) | `<prefix>:raw:<key>` (bytes), `<prefix>:size:<key>` (4-byte little-endian length) |
+| `createKvObjectStores` (prefix `objects:`) / `KvRawStore` (prefix `raw`) | values up to one chunk: `<prefix>:raw:<key>` (bytes), `<prefix>:size:<key>` (4-byte little-endian length); longer values: `<prefix>:chunk:<token>:<seq>` (chunks) and `<prefix>:manifest:<key>` (JSON `{ size, chunkSize, count, token }`) |
 | `KvDeltaStore` (prefix `delta`) | `<prefix>:delta:<targetKey>` (JSON) |
 | `KVRefStore` | `ref:root` (every ref, see above) and `reflog:<name>` |
 | `KVStaging` | `staging:<path><NUL><stage>`, plus `staging:__meta__` |
@@ -203,11 +203,21 @@ The default `objects:` prefix plus the `:` separator yields a double colon (`obj
 `createKvObjectStores` serializes objects in Git format and hashes them with SHA-1 through the
 same `@statewalker/vcs-core` codecs as the other backends, so its ids match native Git.
 
-### Raw storage holds whole values
+### Large values are chunked
 
-`KvRawStore.store()` collects the whole stream into one value before writing, and `load()` reads
-the whole value before slicing a range. Object size is bounded by what the backend accepts as a
-single value and by memory.
+```typescript
+const raw = new KvRawStore(kv, "objects", { chunkSize: 256 * 1024 });
+await raw.store(id, stream); // writes each 256 KiB chunk as soon as it is full
+for await (const chunk of raw.load(id, { start: 1_000_000 })) send(chunk); // one chunk at a time
+```
+
+A value up to one chunk (256 KiB by default) is one entry, as before. A longer one is written
+chunk by chunk while it streams in, under a fresh token, and published by writing its manifest
+last; a stream that fails leaves nothing behind. `load()` reads only the chunks a range touches,
+one at a time, so neither a write nor a read holds a whole object. `move(from, to)` renames a
+value by moving its manifest (its chunks stay where they are), which is what lets
+`rawStorageStaging` stream a git object into a temporary key and rename it to its id. Values
+written by older versions, always one entry, read unchanged.
 
 ### What breaks
 

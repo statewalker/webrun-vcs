@@ -20,6 +20,7 @@ import type {
   StashStore,
   Worktree,
 } from "@statewalker/vcs-working-tree";
+import { storeWorktreeFile } from "@statewalker/vcs-working-tree";
 
 /**
  * Files API subset needed for stash operations
@@ -221,7 +222,12 @@ export class GitStashStore implements StashStore {
       // Check if file is tracked
       if (!trackedPaths.has(wtEntry.path)) {
         // Store blob content
-        const blobId = await this.history.blobs.store(this.worktree.readContent(wtEntry.path));
+        const blobId = await storeWorktreeFile(
+          this.history.blobs,
+          this.worktree,
+          wtEntry.path,
+          wtEntry,
+        );
         untrackedEntries.push({
           name: wtEntry.path,
           mode: wtEntry.mode,
@@ -269,7 +275,12 @@ export class GitStashStore implements StashStore {
         const wtHash = await this.worktree.computeHash(entry.name);
         if (wtHash !== entry.id) {
           // File is modified, store new content
-          const blobId = await this.history.blobs.store(this.worktree.readContent(entry.name));
+          const blobId = await storeWorktreeFile(
+            this.history.blobs,
+            this.worktree,
+            entry.name,
+            wtEntry,
+          );
           entries.push({ ...entry, id: blobId });
         } else {
           entries.push(entry);

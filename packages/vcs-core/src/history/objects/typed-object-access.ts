@@ -7,21 +7,16 @@ import { type GitObjects, InvalidObjectIdError } from "./git-objects.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 /**
- * Store content whose size is not known up front: the chunks are collected,
- * then put with their total size. Callers that know the size use `put` directly.
+ * Store content whose size is not known up front (see `GitObjects.putUnsized`:
+ * small content stays in memory, longer content is spooled to the store's
+ * temporary storage). Callers that know the size use `put` directly.
  */
-export async function storeObject(
+export function storeObject(
   objects: GitObjects,
   type: ObjectTypeString,
   content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
 ): Promise<ObjectId> {
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for await (const chunk of content) {
-    chunks.push(chunk);
-    size += chunk.length;
-  }
-  return objects.put(type, size, chunks);
+  return objects.putUnsized(type, content);
 }
 
 /**

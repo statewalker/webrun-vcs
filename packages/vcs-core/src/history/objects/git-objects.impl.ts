@@ -14,7 +14,9 @@ import { SizeMismatchError } from "@statewalker/vcs-utils/pack";
 import type { StagingBlobStore } from "../../storage/adapters/staging-blob-store.js";
 import {
   CorruptObjectError,
+  DEFAULT_SPOOL_THRESHOLD,
   type GitObjects,
+  type GitObjectsOptions,
   InvalidObjectIdError,
   ObjectIdMismatchError,
 } from "./git-objects.js";
@@ -124,7 +126,11 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
  * const id = await objects.put("blob", 6, [new TextEncoder().encode("hello\n")]);
  * ```
  */
-export function createGitObjects(store: StagingBlobStore): GitObjects {
+export function createGitObjects(
+  store: StagingBlobStore,
+  options: GitObjectsOptions = {},
+): GitObjects {
+  const spoolThreshold = options.spoolThreshold ?? DEFAULT_SPOOL_THRESHOLD;
   // Ids are SHA-1 (git's default object format); SHA-256 repositories are not supported.
   const newHasher = createSha1;
   const pool = createInflaterPool();
@@ -190,23 +196,76 @@ export function createGitObjects(store: StagingBlobStore): GitObjects {
     }
   }
 
-  return {
-    async put(type, size, content) {
-      if (!TYPES.has(type)) throw new TypeError(`unknown object type ${type}`);
-      if (!Number.isSafeInteger(size) || size < 0) throw new RangeError(`bad object size ${size}`);
-      const hasher = newHasher();
-      async function* framed() {
-        yield enc.encode(`${type} ${size}\0`);
-        yield* content;
-      }
-      const sizeError = (declared: number, actual: number) =>
-        new SizeMismatchError(declared, actual);
-      const r = await store.putStaged(deflate(checkedRaw(framed(), { hasher, sizeError })), () =>
-        hex(hasher),
-      );
-      return r.id;
-    },
+  async function put(
+    type: ObjectTypeString,
+    size: number,
+    content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+  ): Promise<string> {
+    if (!TYPES.has(type)) throw new TypeError(`unknown object type ${type}`);
+    if (!Number.isSafeInteger(size) || size < 0) throw new RangeError(`bad object size ${size}`);
+    const hasher = newHasher();
+    async function* framed() {
+      yield enc.encode(`${type} ${size}\0`);
+      yield* content;
+    }
+    const sizeError = (declared: number, actual: number) => new SizeMismatchError(declared, actual);
+    const r = await store.putStaged(deflate(checkedRaw(framed(), { hasher, sizeError })), () =>
+      hex(hasher),
+    );
+    return r.id;
+  }
 
+  return {
+    put,
+
+    async putUnsized(type, content) {
+      if (!TYPES.has(type)) throw new TypeError(`unknown object type ${type}`);
+      // Read up to the threshold; content that ends there is put from memory.
+      const it =
+        Symbol.asyncIterator in Object(content)
+          ? (content as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
+          : (content as Iterable<Uint8Array>)[Symbol.iterator]();
+      const head: Uint8Array[] = [];
+      let size = 0;
+      let ended = false;
+      while (size <= spoolThreshold) {
+        const r = await it.next();
+        if (r.done) {
+          ended = true;
+          break;
+        }
+        head.push(r.value);
+        size += r.value.length;
+      }
+      if (ended) return put(type, size, head);
+      async function* rest() {
+        let done = false;
+        try {
+          yield* head.splice(0);
+          for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+          done = true;
+        } finally {
+          // stopped early (a failing spool): release the source
+          if (!done) await it.return?.();
+        }
+      }
+      if (!store.spool) {
+        // No temporary storage: collect the rest in memory.
+        const all: Uint8Array[] = [];
+        let total = 0;
+        for await (const c of rest()) {
+          all.push(c);
+          total += c.length;
+        }
+        return put(type, total, all);
+      }
+      const spooled = await store.spool(rest());
+      try {
+        return await put(type, spooled.size, spooled.read());
+      } finally {
+        await spooled.dispose();
+      }
+    },
     async putRaw(id, rawBytes) {
       checkId(id);
       const hasher = newHasher();

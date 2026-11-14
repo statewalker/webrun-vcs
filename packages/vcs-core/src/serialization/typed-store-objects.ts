@@ -16,7 +16,11 @@ export interface TypedStoreAccess {
   exportObject(
     id: ObjectId,
   ): Promise<{ type: ObjectTypeString; content: AsyncIterable<Uint8Array> }>;
-  importObject(type: ObjectTypeString, content: Iterable<Uint8Array>): Promise<ObjectId>;
+  importObject(
+    type: ObjectTypeString,
+    content: Iterable<Uint8Array>,
+    size: number,
+  ): Promise<ObjectId>;
   /** The content `importObject` would keep for `data` (parsed and encoded again). */
   reencode(type: ObjectTypeString, data: Uint8Array): Promise<Uint8Array>;
 }
@@ -54,7 +58,7 @@ export function typedStoreObjects(access: TypedStoreAccess): UnpackTarget {
     return { type, data: await collect(content) };
   };
   const store = async (type: ObjectTypeString, data: Uint8Array) =>
-    access.importObject(type, [data]);
+    access.importObject(type, [data], data.length);
   return {
     has: (id) => access.has(id),
     async get(id) {

@@ -115,7 +115,7 @@ export class DefaultSerializationApi implements SerializationApi {
           (await this._tags.has(id)) ||
           (await this._blobs.has(id)),
         exportObject: (id) => this.exportObject(id),
-        importObject: (type, content) => this.importObject(type, content),
+        importObject: (type, content, size) => this.importObject(type, content, size),
         reencode: (type, data) => reencode(type, data),
       });
     this.packs = config.packs ?? config.history.packs;
@@ -238,10 +238,11 @@ export class DefaultSerializationApi implements SerializationApi {
   async importObject(
     type: ObjectTypeString,
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    size?: number,
   ): Promise<ObjectId> {
     switch (type) {
       case "blob":
-        return this._blobs.store(content);
+        return this._blobs.store(content, size);
       case "tree":
         return this.storeTreeFromStream(content);
       case "commit":

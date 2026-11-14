@@ -476,3 +476,109 @@ describe("SqlNativeBlobStore chunked storage", () => {
     });
   });
 });
+
+describe("SqlNativeBlobStore streaming writes", () => {
+  let db: SqlJsAdapter;
+  let written: () => number;
+
+  beforeEach(async () => {
+    db = await SqlJsAdapter.create();
+    let n = 0;
+    const execute = db.execute.bind(db);
+    db.execute = (sql, params) => {
+      for (const p of params ?? []) if (p instanceof Uint8Array) n += p.length;
+      return execute(sql, params);
+    };
+    written = () => n;
+  });
+
+  afterEach(async () => {
+    await db.close();
+  });
+
+  /** Barely compressible bytes, generated as they are pulled; `onChunk` sees bytes produced so far. */
+  function lazy(total: number, onChunk: (produced: number) => void) {
+    return (async function* () {
+      let x = 99;
+      for (let produced = 0; produced < total; ) {
+        onChunk(produced);
+        const out = new Uint8Array(Math.min(64 * 1024, total - produced));
+        for (let i = 0; i < out.length; i++) {
+          x ^= x << 13;
+          x ^= x >>> 17;
+          x ^= x << 5;
+          out[i] = x;
+        }
+        produced += out.length;
+        yield out;
+      }
+    })();
+  }
+
+  async function expectedId(total: number): Promise<string> {
+    const sha1 = createSha1();
+    sha1.update(encodeObjectHeader("blob", total));
+    for await (const c of lazy(total, () => {})) sha1.update(c);
+    return bytesToHex(sha1.digest());
+  }
+
+  for (const known of [true, false]) {
+    it(`writes a large blob chunk by chunk (${known ? "known" : "unknown"} size)`, async () => {
+      const store = new SqlNativeBlobStoreImpl(db);
+      const total = 8 * 1024 * 1024;
+      let maxLag = 0;
+      const start = written();
+      const content = lazy(total, (produced) => {
+        maxLag = Math.max(maxLag, produced - (written() - start));
+      });
+      const id = await store.store(content, known ? total : undefined);
+      expect(id).toBe(await expectedId(total));
+      expect(maxLag).toBeLessThanOrEqual(1024 * 1024);
+      expect(await store.size(id)).toBe(total);
+      expect(await store.count()).toBe(1);
+      const keys: string[] = [];
+      for await (const k of store.keys()) keys.push(k);
+      expect(keys).toEqual([id]);
+      let read = 0;
+      for await (const c of (await store.load(id)) ?? []) read += c.length;
+      expect(read).toBe(total);
+    });
+  }
+
+  it("stores nothing when a large blob is not as long as its size", async () => {
+    const store = new SqlNativeBlobStoreImpl(db);
+    await expect(
+      store.store(
+        lazy(1024 * 1024, () => {}),
+        2 * 1024 * 1024,
+      ),
+    ).rejects.toMatchObject({
+      name: "SizeMismatchError",
+    });
+    await expect(
+      store.store(
+        lazy(1024 * 1024, () => {}),
+        512 * 1024,
+      ),
+    ).rejects.toMatchObject({
+      name: "SizeMismatchError",
+    });
+    expect(await store.count()).toBe(0);
+    const chunks = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM vcs_blob_chunk");
+    expect(chunks[0]?.n).toBe(0);
+  });
+
+  it("keeps the existing copy when a large blob is stored twice", async () => {
+    const store = new SqlNativeBlobStoreImpl(db);
+    const total = 600 * 1024;
+    const a = await store.store(
+      lazy(total, () => {}),
+      total,
+    );
+    const b = await store.store(lazy(total, () => {}));
+    expect(b).toBe(a);
+    expect(await store.count()).toBe(1);
+    const chunks = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM vcs_blob_chunk");
+    expect(chunks[0]?.n).toBe(3);
+  });
+});

@@ -76,4 +76,14 @@ export interface RawStorage {
    * @returns Content size in bytes, or -1 if key not found
    */
   size(key: string): Promise<number>;
+
+  /**
+   * Rename a value without copying its bytes, replacing what `to` held. Optional:
+   * stores that can do this cheaply (a map entry, a manifest row, a file rename)
+   * offer it, and `rawStorageStaging` then streams a write into a temporary key
+   * and renames it once the object id is known, instead of collecting the bytes.
+   *
+   * @returns True if `from` existed and was moved, false if it did not exist
+   */
+  move?(from: string, to: string): Promise<boolean>;
 }

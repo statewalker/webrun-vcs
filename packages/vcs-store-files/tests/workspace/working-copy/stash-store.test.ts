@@ -583,3 +583,36 @@ describe("GitStashStore", () => {
     });
   });
 });
+
+describe("GitStashStore blob sizes", () => {
+  it("stores modified and untracked files with the size the worktree reports", async () => {
+    const repository = createMockRepository();
+    const headCommitId = await repository.commits.storeCommit({
+      tree: "tree-1",
+      parents: [],
+      author: { name: "Test", email: "test@example.com", timestamp: 1000, tzOffset: "+0000" },
+      committer: { name: "Test", email: "test@example.com", timestamp: 1000, tzOffset: "+0000" },
+      message: "Initial commit",
+    });
+    const staging = createMockStaging([createStagingEntry("file.txt", "blob-1")]);
+    staging.writeTree = vi.fn().mockResolvedValue("tree-1");
+    staging.readTree = vi.fn().mockResolvedValue(undefined);
+    // file.txt is modified (its hash differs), extra.txt is untracked
+    const worktree = createMockWorktree([
+      createWorktreeEntry("file.txt", { size: 7 }),
+      createWorktreeEntry("extra.txt", { size: 9 }),
+    ]);
+    const stash = new GitStashStore({
+      history: repository,
+      staging,
+      worktree,
+      files: createMockFilesApi(),
+      gitDir: ".git",
+      getHead: async () => headCommitId,
+      getBranch: async () => "main",
+    });
+    await stash.push({ message: "sizes", includeUntracked: true });
+    const sizes = vi.mocked(repository.blobs.store).mock.calls.map((c) => c[1]);
+    expect(sizes.sort()).toEqual([7, 9]);
+  });
+});

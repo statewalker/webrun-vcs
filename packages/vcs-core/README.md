@@ -336,13 +336,26 @@ const id = await objects.put("blob", bytes.length, [bytes]); // "ce013625…", a
 const obj = await objects.get(id, { verify: true }); // { type: "blob", size: 6, content }
 ```
 
-`put(type, size, content)` reads `content` once: each chunk is hashed and deflated as it passes, and the store receives the compressed bytes before anyone knows the id. That is what a `StagingBlobStore` is for: `putStaged(bytes, idOf)` stores bytes under the id `idOf()` returns after the last byte, as git writes `objects/tmp_obj_*` and renames it. `rawStorageStaging(raw)` adapts any `RawStorage` (it collects the compressed bytes first); `filesStagingStore` in `@statewalker/vcs-store-files` writes git's own layout, streaming where the FilesApi's `write` streams (the Node and in-memory ones collect the chunks first). A size that does not match the content rejects with `SizeMismatchError` (exported here too) and stores nothing. Ids are SHA-1; SHA-256 repositories are not supported.
+`put(type, size, content)` reads `content` once: each chunk is hashed and deflated as it passes, and the store receives the compressed bytes before anyone knows the id. That is what a `StagingBlobStore` is for: `putStaged(bytes, idOf)` stores bytes under the id `idOf()` returns after the last byte, as git writes `objects/tmp_obj_*` and renames it. `rawStorageStaging(raw)` adapts any `RawStorage`: when the raw store has `move` it streams into a temporary key and renames it to the id (the memory, KV and SQL raw stores all do), otherwise it collects the compressed bytes first; `filesStagingStore` in `@statewalker/vcs-store-files` writes git's own layout, streaming where the FilesApi's `write` streams (the Node and in-memory ones collect the chunks first). A size that does not match the content rejects with `SizeMismatchError` (exported here too) and stores nothing. Ids are SHA-1; SHA-256 repositories are not supported.
 
 `putRaw(id, raw)` stores an object received with its id, refusing it (`ObjectIdMismatchError`, `CorruptObjectError`) unless the header is valid and the bytes hash to that id. Reading checks as git does: a truncated zlib stream, bytes after it, a bad header or a body of the wrong size raise `CorruptObjectError`, and `get(id, { verify: true })` re-hashes the content. A string that is not an id is simply absent for `has`, `get` and `getRaw`; `putRaw` and `remove` refuse it with `InvalidObjectIdError`.
 
+### Content of unknown size is spooled
+
+A git id hashes `"blob <size>\0"` before the content, so a write needs the size first. When the caller does not know it, the kernel reads the content twice:
+
+```typescript
+const objects = createGitObjects(rawStorageStaging(raw), { spoolThreshold: 1024 * 1024 });
+const id = await objects.putUnsized("blob", download.body); // a stream of unknown length
+```
+
+`putUnsized(type, content)` keeps up to `spoolThreshold` bytes (1 MiB by default) in memory and puts them as usual. Longer content goes to the store's temporary storage, `StagingBlobStore.spool(content)`, which returns its size and a way to read it again; the kernel then `put`s it with that size and disposes the temporary. `rawStorageStaging` spools to a `tmp_obj_*` key of its raw store and `filesStagingStore` to a `tmp_obj_*` file next to the objects, so memory stays bounded wherever the store writes as it receives. A store without `spool` gets the content collected. `blobs.store(content)` without a size, `trees.store`, `commits.store` and `tags.store` all go through `putUnsized`.
+
 ### Why everything streams
 
-Blob content is `AsyncIterable<Uint8Array>` on the way in and out, and trees load as async iterables of entries. A large file passes through with bounded memory when its size is known: `blobs.store(content, size)` hashes and stores in one pass, while `blobs.store(content)` collects the content first to learn the size. That matters in browsers. `VcsCore` collects trees into arrays because trees are small and arrays are easier to use.
+Blob content is `AsyncIterable<Uint8Array>` on the way in and out, and trees load as async iterables of entries. A large file passes through with bounded memory when its size is known: `blobs.store(content, size)`, `vcs.writeBlob(bytes, { size })` and `serialization.importObject("blob", content, size)` hash and store in one pass. Without a size, the content is spooled (see above). That matters in browsers. `VcsCore` collects trees into arrays because trees are small and arrays are easier to use.
+
+Two `RawStorage` details serve the same goal. `move(from, to)` is optional and renames a value without copying it; `rawStorageStaging` uses it to stream. `CompressedRawStorage.size(key)` returns the uncompressed size: for a git loose object it inflates only the start of the stream and adds the length of the header to the size the header declares; other content is inflated and counted as it streams, never collected.
 
 ### Only SHA-1 is implemented
 

@@ -148,7 +148,13 @@ export interface SerializationApi {
    *
    * @param type Object type
    * @param content Object content (without header)
+   * @param size The content's length, when known: a blob is then stored in one
+   *   pass (see `Blobs.store`)
    * @returns Object ID of the stored object
    */
-  importObject(type: ObjectTypeString, content: AsyncIterable<Uint8Array>): Promise<ObjectId>;
+  importObject(
+    type: ObjectTypeString,
+    content: AsyncIterable<Uint8Array>,
+    size?: number,
+  ): Promise<ObjectId>;
 }

@@ -26,6 +26,31 @@ export interface GitObjectsTestContext {
   /** The store the kernel writes to (used to inspect and corrupt stored bytes). */
   store: StagingBlobStore;
   cleanup?: () => Promise<void>;
+  /**
+   * Bytes the backend has persisted so far (values, rows or file bytes written).
+   * When given, the suite writes a 50 MiB blob and checks that the producer
+   * never runs more than a bounded amount ahead of the backend.
+   */
+  persistedBytes?: () => number;
+}
+
+/** Deterministic, barely compressible bytes, generated chunk by chunk as they are pulled. */
+function lazyNoise(total: number, chunk: number, onChunk?: (produced: number) => void) {
+  return (async function* () {
+    let x = 0x1234567;
+    for (let produced = 0; produced < total; ) {
+      onChunk?.(produced);
+      const out = new Uint8Array(Math.min(chunk, total - produced));
+      for (let i = 0; i < out.length; i++) {
+        x ^= x << 13;
+        x ^= x >>> 17;
+        x ^= x << 5;
+        out[i] = x;
+      }
+      produced += out.length;
+      yield out;
+    }
+  })();
 }
 
 const enc = new TextEncoder();
@@ -320,5 +345,43 @@ export function createGitObjectsTests(
       );
       expect(closed).toBe(true);
     });
+
+    it("putUnsized spools large content and leaves only the object behind", async () => {
+      const size = 3 * 1024 * 1024 + 17; // above the default 1 MiB spool threshold
+      const hasher = createSha1().update(enc.encode(`blob ${size}\0`));
+      for await (const c of lazyNoise(size, 65536)) hasher.update(c);
+      const expected = bytesToHex(hasher.digest());
+      expect(await objects.putUnsized("blob", lazyNoise(size, 65536))).toBe(expected);
+      expect(await storedIds(store)).toEqual([expected]);
+      expect((await objects.get(expected))?.size).toBe(size);
+    });
+
+    it("writes a 50 MiB blob of known size without the producer running ahead of the store", async () => {
+      const persisted = ctx.persistedBytes;
+      if (!persisted) return;
+      const size = 50 * 1024 * 1024;
+      const start = persisted();
+      let maxLag = 0;
+      const id = await objects.put(
+        "blob",
+        size,
+        lazyNoise(size, 256 * 1024, (produced) => {
+          maxLag = Math.max(maxLag, produced - (persisted() - start));
+        }),
+      );
+      // a few MiB of deflate window and storage chunk, never the whole blob
+      expect(maxLag).toBeLessThan(8 * 1024 * 1024);
+      // read it back streaming, re-hashing on the way
+      const obj = await objects.get(id, { verify: true });
+      expect(obj?.size).toBe(size);
+      let read = 0;
+      let largest = 0;
+      for await (const c of obj?.content ?? []) {
+        read += c.length;
+        largest = Math.max(largest, c.length);
+      }
+      expect(read).toBe(size);
+      expect(largest).toBeLessThanOrEqual(4 * 1024 * 1024);
+    }, 120_000);
   });
 }

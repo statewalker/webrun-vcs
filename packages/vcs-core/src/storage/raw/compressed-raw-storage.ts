@@ -8,7 +8,7 @@
  * objects are stored compressed on disk.
  */
 
-import { deflate, inflate, slice, toArray } from "@statewalker/vcs-utils";
+import { deflate, inflate, slice } from "@statewalker/vcs-utils";
 import type { RawStorage } from "./raw-storage.js";
 
 /**
@@ -114,23 +114,49 @@ export class CompressedRawStorage implements RawStorage {
   /**
    * Get uncompressed content size for a key
    *
-   * Note: This requires reading and decompressing the content to get the
-   * actual uncompressed size. For performance, consider caching sizes
-   * if you need to call this frequently.
+   * The stored zlib stream does not record its length. For a git loose object
+   * (`"<type> <size>\0" + content`, what this wrapper holds in a git object
+   * directory) the size is the header's length plus the size it declares, so
+   * only the start of the stream is inflated. Other content is inflated and
+   * counted as it streams (never collected).
    *
    * @param key Storage key
-   * @returns Uncompressed content size, or -1 if key not found
+   * @returns Uncompressed content size, or -1 if key not found or unreadable
    */
   async size(key: string): Promise<number> {
     if (!(await this.inner.has(key))) {
       return -1;
     }
-    // Must decompress to get actual size
+    const it = inflate(this.inner.load(key), { raw: this.rawDeflate })[Symbol.asyncIterator]();
+    let head: number[] | undefined = [];
+    let total = 0;
     try {
-      const chunks = await toArray(this.load(key));
-      return chunks.reduce((total, chunk) => total + chunk.length, 0);
+      for (let r = await it.next(); !r.done; r = await it.next()) {
+        total += r.value.length;
+        if (!head) continue;
+        for (const b of r.value.subarray(0, GIT_HEADER_MAX - head.length)) head.push(b);
+        const header = parseGitHeader(head);
+        if (header !== undefined) return header;
+        if (head.length >= GIT_HEADER_MAX || head.includes(0)) head = undefined;
+      }
+      return total;
     } catch {
       return -1;
+    } finally {
+      await it.return?.();
     }
   }
+}
+
+/** "commit " plus 16 digits plus NUL fits. */
+const GIT_HEADER_MAX = 32;
+
+/** Header length plus declared size of a git object header in `bytes`, if they start with one. */
+function parseGitHeader(bytes: number[]): number | undefined {
+  const nul = bytes.indexOf(0);
+  if (nul < 0) return undefined;
+  const text = String.fromCharCode(...bytes.slice(0, nul));
+  const m = /^(blob|tree|commit|tag) (0|[1-9][0-9]{0,15})$/.exec(text);
+  if (!m) return undefined;
+  return nul + 1 + Number(m[2]);
 }
