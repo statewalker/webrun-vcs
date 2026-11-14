@@ -19,7 +19,7 @@ No peer dependencies. Works in browsers, Node and workers.
 | Entry point | Contents |
 |-------------|----------|
 | `@statewalker/vcs-working-tree` | Staging, status, ignore, checkout, worktree and working-copy APIs (everything except `/transformation`) |
-| `@statewalker/vcs-working-tree/staging` | Only the staging part: `Staging` interface, `GitStaging`, `createGitStaging`, `createMemoryGitStaging`, staging edits, conflict helpers, DIRC `parseIndexFile` / `serializeIndexFile` |
+| `@statewalker/vcs-working-tree/staging` | Only the staging part: `Staging` interface, `GitStaging`, `createGitStaging`, `createMemoryGitStaging`, staging edits, conflict helpers, DIRC `parseIndexFile` / `encodeIndexFile` / `serializeIndexFile` |
 | `@statewalker/vcs-working-tree/transformation` | Types only: `MergeState`, `RebaseState`, `CherryPickState`, `RevertState`, `SequencerState`, `ResolutionStore`, `ConflictInfo`, `Resolution`, ... |
 
 Main exports of the root entry:
@@ -96,6 +96,14 @@ await index.write();  // write DIRC format
 `parseIndexFile(bytes)` returns the version, the entries and `extensions`: the signatures of the
 extensions after the entries (`TREE`, `REUC`, `link` for a split index, ...), in file order.
 Their contents are not parsed, and an index is always written without extensions.
+
+`encodeIndexFile(entries, version)` yields the index as chunks (the header, the entries in pieces of about 64 KiB, then the trailing SHA-1, computed as they go), so `GitStaging.write()` streams it into `FilesApi.write` instead of building one buffer. Paths are validated before the first chunk, so an invalid path never leaves a half-written index. `serializeIndexFile` joins the same bytes, for callers that need them in memory.
+
+```typescript
+import { encodeIndexFile } from "@statewalker/vcs-working-tree";
+
+await files.write(".git/index", encodeIndexFile(entries));
+```
 
 ### Compute status
 

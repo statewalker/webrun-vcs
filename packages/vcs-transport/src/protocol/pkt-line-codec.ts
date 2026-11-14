@@ -110,26 +110,15 @@ export async function* pktLineWriter(packets: AsyncIterable<Packet>): AsyncGener
 }
 
 /**
- * Concatenate multiple Uint8Arrays efficiently.
- */
-function concatBytes(...arrays: Uint8Array[]): Uint8Array<ArrayBuffer> {
-  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const arr of arrays) {
-    result.set(arr, offset);
-    offset += arr.length;
-  }
-  return result;
-}
-
-/**
  * Parse a single packet from the beginning of a buffer.
  * Returns the packet and the remaining buffer, or null if incomplete.
+ *
+ * `remaining` is a view of `buffer` (not a copy), so parsing a buffer packet by
+ * packet costs time linear in its length. A data packet's `data` is a copy.
  */
-export function parsePacket(
-  buffer: Uint8Array,
-): { packet: Packet; remaining: Uint8Array<ArrayBuffer> } | null {
+export function parsePacket<T extends ArrayBufferLike>(
+  buffer: Uint8Array<T>,
+): { packet: Packet; remaining: Uint8Array<T> } | null {
   if (buffer.length < 4) {
     return null; // Need more data for header
   }
@@ -140,13 +129,13 @@ export function parsePacket(
   if (lengthHex === PKT_FLUSH) {
     return {
       packet: { type: "flush" },
-      remaining: new Uint8Array(buffer.subarray(4)),
+      remaining: buffer.subarray(4),
     };
   }
   if (lengthHex === PKT_DELIM) {
     return {
       packet: { type: "delim" },
-      remaining: new Uint8Array(buffer.subarray(4)),
+      remaining: buffer.subarray(4),
     };
   }
   // Note: PKT_END (0002) is only used in protocol v2
@@ -167,7 +156,7 @@ export function parsePacket(
   if (length === MIN_PACKET_LENGTH) {
     return {
       packet: { type: "data", data: new Uint8Array(0) },
-      remaining: new Uint8Array(buffer.subarray(4)),
+      remaining: buffer.subarray(4),
     };
   }
 
@@ -180,41 +169,114 @@ export function parsePacket(
   const data = new Uint8Array(buffer.subarray(4, length));
   return {
     packet: { type: "data", data },
-    remaining: new Uint8Array(buffer.subarray(length)),
+    remaining: buffer.subarray(length),
   };
+}
+
+/**
+ * Bytes received but not yet parsed, kept as the chunks they arrived in.
+ *
+ * Reading from the front copies only the bytes taken, so a stream of many small
+ * packets, or one large packet in many small chunks, is decoded in linear time.
+ */
+class ChunkQueue {
+  private chunks: Uint8Array[] = [];
+  /** Bytes of `chunks[0]` already consumed. */
+  private offset = 0;
+  length = 0;
+
+  push(chunk: Uint8Array): void {
+    if (chunk.length === 0) return;
+    this.chunks.push(chunk);
+    this.length += chunk.length;
+  }
+
+  /** Copies of the first `n` bytes (n <= length), removed from the queue. */
+  take(n: number): Uint8Array<ArrayBuffer> {
+    const out = new Uint8Array(n);
+    let at = 0;
+    while (at < n) {
+      const head = this.chunks[0] as Uint8Array;
+      const count = Math.min(n - at, head.length - this.offset);
+      out.set(head.subarray(this.offset, this.offset + count), at);
+      at += count;
+      this.offset += count;
+      if (this.offset === head.length) {
+        this.chunks.shift();
+        this.offset = 0;
+      }
+    }
+    this.length -= n;
+    return out;
+  }
+
+  /** The first four bytes as a string, without removing them (length >= 4). */
+  peekHeader(): string {
+    const head = this.chunks[0] as Uint8Array;
+    if (head.length - this.offset >= 4) {
+      return String.fromCharCode(...head.subarray(this.offset, this.offset + 4));
+    }
+    let s = "";
+    let i = 0;
+    let off = this.offset;
+    while (s.length < 4) {
+      const c = this.chunks[i] as Uint8Array;
+      if (off >= c.length) {
+        i++;
+        off = 0;
+        continue;
+      }
+      s += String.fromCharCode(c[off++] as number);
+    }
+    return s;
+  }
 }
 
 /**
  * Read packets from a byte stream.
  * Handles partial packets and buffering internally.
+ *
+ * The bytes received are queued as chunks and parsed from the front, so the
+ * reader works in time linear in the input however it is chunked.
  */
 export async function* pktLineReader(stream: AsyncIterable<Uint8Array>): AsyncGenerator<Packet> {
-  let buffer = new Uint8Array(0);
+  const queue = new ChunkQueue();
+  // Length of the data packet whose header has been read, or -1
+  let pending = -1;
 
   for await (const chunk of stream) {
-    // Append incoming chunk to buffer
-    buffer = concatBytes(buffer, chunk);
-
-    // Parse complete packets from buffer
-    let result = parsePacket(buffer);
-    while (result !== null) {
-      yield result.packet;
-      buffer = result.remaining;
-      result = parsePacket(buffer);
+    queue.push(chunk);
+    while (true) {
+      if (pending < 0) {
+        if (queue.length < 4) break;
+        const lengthHex = queue.peekHeader();
+        if (lengthHex === PKT_FLUSH) {
+          queue.take(4);
+          yield { type: "flush" };
+          continue;
+        }
+        if (lengthHex === PKT_DELIM) {
+          queue.take(4);
+          yield { type: "delim" };
+          continue;
+        }
+        const length = /^[0-9a-fA-F]{4}$/.test(lengthHex) ? parseInt(lengthHex, 16) : Number.NaN;
+        if (Number.isNaN(length) || length < MIN_PACKET_LENGTH) {
+          throw new PacketLineError(`Invalid packet line header: ${lengthHex}`, lengthHex);
+        }
+        queue.take(4);
+        pending = length - 4;
+      }
+      if (queue.length < pending) break;
+      const data = queue.take(pending);
+      pending = -1;
+      yield { type: "data", data };
     }
   }
 
-  // Check for incomplete packet at end
-  if (buffer.length > 0) {
-    // Try to parse one more time in case buffer contains a complete packet
-    const result = parsePacket(buffer);
-    if (result !== null) {
-      yield result.packet;
-      buffer = result.remaining;
-    }
-    if (buffer.length > 0) {
-      throw new PacketLineError(`Incomplete packet: ${buffer.length} bytes remaining`);
-    }
+  if (pending >= 0 || queue.length > 0) {
+    const remaining = queue.length + (pending >= 0 ? 4 : 0);
+    throw new PacketLineError(`Incomplete packet: ${remaining} bytes remaining`);
   }
 }
 

@@ -2,6 +2,7 @@ import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode, type FilesApi, readFile } from "@statewalker/vcs-core";
 import type { IndexBuilder, IndexEditor, Staging } from "@statewalker/vcs-working-tree";
 import {
+  encodeIndexFile,
   INDEX_VERSION_2,
   type IndexVersion,
   MergeStage,
@@ -10,7 +11,6 @@ import {
   type StagingEdit,
   type StagingEntry,
   type StagingEntryOptions,
-  serializeIndexFile,
 } from "@statewalker/vcs-working-tree";
 
 /**
@@ -322,8 +322,7 @@ export class FileStagingStore implements Staging {
   }
 
   async write(): Promise<void> {
-    const data = await serializeIndexFile(this._entries, this.version);
-    await this.files.write(this.indexPath, [data]);
+    await this.files.write(this.indexPath, encodeIndexFile(this._entries, this.version));
     this.updateTime = Date.now();
   }
 

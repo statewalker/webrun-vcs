@@ -2232,3 +2232,79 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     });
   });
 });
+
+describe.each(backends)("MergeCommand - binary and big files ($name backend)", ({ factory }) => {
+  let cleanup: (() => Promise<void>) | undefined;
+
+  afterEach(async () => {
+    if (cleanup) {
+      await cleanup();
+      cleanup = undefined;
+    }
+  });
+
+  /** main and side each change `path` from `base`; returns the git facade and stores. */
+  async function diverge(path: string, base: string, ours: string, theirs: string) {
+    const result = await createInitializedGitFromFactory(factory);
+    cleanup = result.cleanup;
+    const { git, workingCopy, repository } = result;
+    await addFile(workingCopy, path, base);
+    await git.commit().setMessage("base").call();
+    await git.branchCreate().setName("side").call();
+    await repository.refs.setSymbolic("HEAD", "refs/heads/side");
+    const sideRef = await repository.refs.resolve("refs/heads/side");
+    const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
+    const theirsId = await addFile(workingCopy, path, theirs);
+    await git.commit().setMessage("side").call();
+    await repository.refs.setSymbolic("HEAD", "refs/heads/main");
+    const mainRef = await repository.refs.resolve("refs/heads/main");
+    const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
+    const oursId = await addFile(workingCopy, path, ours);
+    await git.commit().setMessage("main").call();
+    return { git, workingCopy, oursId, theirsId };
+  }
+
+  it("reports a conflict for binary files instead of a UNION content merge", async () => {
+    const { git } = await diverge("b.bin", "a\0\nb\nc\n", "a\0\nZ\nc\n", "a\0\nY\nc\n");
+    const result = await git
+      .merge()
+      .include("refs/heads/side")
+      .setContentMergeStrategy(ContentMergeStrategy.UNION)
+      .call();
+    expect(result.status).toBe(MergeStatus.CONFLICTING);
+    expect(result.conflicts).toContain("b.bin");
+  });
+
+  it("reports a conflict for files over bigFileThreshold instead of a UNION content merge", async () => {
+    const lines = (x: string) => `${"same line\n".repeat(200)}${x}\n${"same line\n".repeat(200)}`;
+    const { git } = await diverge("big.txt", lines("b"), lines("Z"), lines("Y"));
+    const result = await git
+      .merge()
+      .include("refs/heads/side")
+      .setContentMergeStrategy(ContentMergeStrategy.UNION)
+      .setBigFileThreshold(1024)
+      .call();
+    expect(result.status).toBe(MergeStatus.CONFLICTING);
+    expect(result.conflicts).toContain("big.txt");
+  });
+
+  it("takes the favoured side of a binary file whole with OURS or THEIRS, as git -X does", async () => {
+    for (const [strategy, side] of [
+      [ContentMergeStrategy.OURS, "ours"],
+      [ContentMergeStrategy.THEIRS, "theirs"],
+    ] as const) {
+      const ids = await diverge("b.bin", "a\0\nb\nc\nd\n", "a\0\nZ\nc\nd\n", "a\0\nb\nc\nY\n");
+      const result = await ids.git
+        .merge()
+        .include("refs/heads/side")
+        .setContentMergeStrategy(strategy)
+        .call();
+      expect(result.status).toBe(MergeStatus.MERGED);
+      const entry = await ids.workingCopy.checkout.staging.getEntry("b.bin");
+      // whole files, never a line merge (which would combine Z and Y)
+      expect(entry?.objectId).toBe(side === "ours" ? ids.oursId : ids.theirsId);
+    }
+  });
+});

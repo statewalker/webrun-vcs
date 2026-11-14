@@ -406,3 +406,67 @@ describe("chunked input", () => {
     expect(packetDataToString(packets[0])).toBe("a");
   });
 });
+
+describe("pktLineReader: many small packets in odd-sized chunks", () => {
+  function encodeAll(lines: string[]): Uint8Array {
+    const parts = lines.map((l, i) => (i % 97 === 96 ? encodeFlush() : encodePacket(l)));
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
+    return out;
+  }
+
+  function* oddChunks(data: Uint8Array, sizes: number[]): Generator<Uint8Array> {
+    let at = 0;
+    for (let i = 0; at < data.length; i++) {
+      const size = sizes[i % sizes.length] as number;
+      yield data.subarray(at, at + size);
+      at += size;
+    }
+  }
+
+  async function* from(chunks: Iterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+    yield* chunks;
+  }
+
+  const lines = Array.from({ length: 5000 }, (_, i) => `line ${i} ${"x".repeat(i % 23)}\n`);
+  const wire = encodeAll(lines);
+
+  it("decodes every packet under every chunking", async () => {
+    for (const sizes of [[1], [3], [7, 1, 13], [4093], [wire.length]]) {
+      const packets = await collectPackets(pktLineReader(from(oddChunks(wire, sizes))));
+      expect(packets).toHaveLength(lines.length);
+      packets.forEach((p, i) => {
+        if (i % 97 === 96) expect(p.type).toBe("flush");
+        else expect(packetDataToStringRaw(p)).toBe(lines[i]);
+      });
+    }
+  });
+
+  it("splits a large packet arriving in small chunks", async () => {
+    const big = "y".repeat(65000);
+    const data = encodeAll([big, "tail\n"]);
+    const packets = await collectPackets(pktLineReader(from(oddChunks(data, [5, 11, 2]))));
+    expect(packets.map(packetDataToStringRaw)).toEqual([big, "tail\n"]);
+  });
+
+  it("decodes in time linear in the input (no copy of the buffer per packet)", async () => {
+    const many = Array.from({ length: 150_000 }, (_, i) => `${i}\n`);
+    const data = encodeAll(many);
+    const started = performance.now();
+    let n = 0;
+    for await (const _ of pktLineReader(from([data]))) n++;
+    expect(n).toBe(many.length);
+    expect(performance.now() - started).toBeLessThan(1500);
+  }, 60_000);
+
+  it("still reports a packet cut short at the end", async () => {
+    const data = encodeAll(["abc\n", "defgh\n"]);
+    await expect(
+      collectPackets(pktLineReader(from(oddChunks(data.subarray(0, data.length - 2), [3])))),
+    ).rejects.toThrow(PacketLineError);
+  });
+});

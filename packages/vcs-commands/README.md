@@ -155,6 +155,25 @@ await git.cherryPick().include(commitId).call();
 await git.revert().include(commitId).setNoCommit(true).call();
 ```
 
+### Big and binary files in diff, merge and blame
+
+```typescript
+import { DiffFormatter } from "@statewalker/vcs-commands";
+
+const formatter = new DiffFormatter(history.blobs, { bigFileThreshold: 10 * 2 ** 20 });
+const diff = await formatter.format(entry);
+console.log(formatter.toString(diff)); // "Binary files a/video.mp4 and b/video.mp4 differ"
+
+await git.merge().include("feature").setContentMergeStrategy(ContentMergeStrategy.UNION).setBigFileThreshold(10 * 2 ** 20).call();
+await git.blame().setFilePath("data.csv").setBigFileThreshold(10 * 2 ** 20).call();
+```
+
+Diff, merge and blame read sizes from object headers first and never load a file above `bigFileThreshold` (50 MiB by default, git's `core.bigFileThreshold`). They check whether a file is binary as git does, from a NUL byte in its first 8000 bytes, and read only that prefix (`probeBlob` from `@statewalker/vcs-core`). Text under the threshold is still loaded whole, because the diff algorithms need it.
+
+- `DiffFormatter` shows a big or binary file as `Binary files a/<path> and b/<path> differ` and loads neither side. `oldContent` and `newContent` are set for text files only.
+- `merge()` never content-merges a big or binary file. With `ContentMergeStrategy.OURS` or `THEIRS` it takes that side's file whole, as `git merge -X ours` does; with `UNION`, or without a content strategy, the path is a conflict.
+- `blame()` rejects for a file above the threshold. A parent version above it is not compared, so the lines stay with the child commit, and it is never a rename candidate.
+
 ### Remotes
 
 ```typescript

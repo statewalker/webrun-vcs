@@ -419,3 +419,23 @@ describe("RawText", () => {
     });
   });
 });
+
+describe("RawText.isBinary looks at the first 8000 bytes, as git does", () => {
+  it("finds a NUL within the first 8000 bytes", () => {
+    const data = new Uint8Array(20_000).fill(0x61);
+    data[7999] = 0;
+    expect(RawText.isBinary(data)).toBe(true);
+  });
+
+  it("ignores a NUL after the first 8000 bytes", () => {
+    const data = new Uint8Array(20_000).fill(0x61);
+    data[8000] = 0;
+    expect(RawText.isBinary(data)).toBe(false);
+    expect(RawText.BINARY_PROBE_LENGTH).toBe(8000);
+  });
+
+  it("still honours an explicit shorter length", () => {
+    const data = new Uint8Array([0x61, 0x62, 0x00]);
+    expect(RawText.isBinary(data, 2)).toBe(false);
+  });
+});

@@ -10,10 +10,10 @@
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, FileMode, type FilesApi, readFile } from "@statewalker/vcs-core";
 import {
+  encodeIndexFile,
   INDEX_VERSION_2,
   type IndexVersion,
   parseIndexFile,
-  serializeIndexFile,
 } from "./index-format.js";
 import type {
   ConflictResolution,
@@ -308,8 +308,7 @@ export class GitStaging implements Staging {
   }
 
   async write(): Promise<void> {
-    const data = await serializeIndexFile(this._entries, this.version);
-    await this.files.write(this.indexPath, [data]);
+    await this.files.write(this.indexPath, encodeIndexFile(this._entries, this.version));
     this.updateTime = Date.now();
   }
 

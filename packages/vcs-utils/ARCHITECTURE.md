@@ -322,22 +322,6 @@ Most Recently Used           Least Recently Used
 - Evicts from tail when limits exceeded
 - Access moves entry to head
 
-### Intermediate Cache
-
-Optimizes delta chain reconstruction by caching waypoints:
-
-```typescript
-import { IntermediateCache } from "@statewalker/vcs-utils/cache";
-
-const cache = new IntermediateCache();
-
-// Cache every 8 steps in reconstruction
-cache.set(baseRecordId, depth, reconstructedContent);
-
-// Later reconstructions can start from cached waypoint
-const cached = cache.getByComponents(baseRecordId, 4);
-```
-
 ## Streams Module
 
 Async stream utilities for composable data processing:

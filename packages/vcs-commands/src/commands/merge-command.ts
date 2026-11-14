@@ -1,5 +1,10 @@
 import type { Commit, ObjectId, TreeEntry } from "@statewalker/vcs-core";
-import { FileMode, isSymbolicRef } from "@statewalker/vcs-core";
+import {
+  DEFAULT_BIG_FILE_THRESHOLD,
+  FileMode,
+  isSymbolicRef,
+  probeBlob,
+} from "@statewalker/vcs-core";
 import {
   merge3Way,
   MergeContentStrategy as UtilsMergeContentStrategy,
@@ -68,6 +73,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private squash = false;
   private commit = true;
   private message?: string;
+  private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
 
   /**
    * Add a commit/branch to merge.
@@ -126,6 +132,22 @@ export class MergeCommand extends GitCommand<MergeResult> {
   setContentMergeStrategy(contentStrategy: ContentMergeStrategy): this {
     this.checkCallable();
     this.contentStrategy = contentStrategy;
+    return this;
+  }
+
+  /**
+   * Set the size above which files are binary to the content merge (git's
+   * `core.bigFileThreshold`, default 50 MiB).
+   *
+   * A binary file (over the threshold, or a NUL byte in its first 8000 bytes) is
+   * never content-merged and never loaded: as git does, OURS and THEIRS take that
+   * side's file whole, and UNION reports a conflict.
+   *
+   * @param threshold Size in bytes
+   */
+  setBigFileThreshold(threshold: number): this {
+    this.checkCallable();
+    this.bigFileThreshold = threshold;
     return this;
   }
 
@@ -518,7 +540,19 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
 
     try {
-      // Load content from all three versions
+      // Binary or big files are never content-merged (git's ll_binary_merge)
+      if (await this.anyBinary([base?.id, ours.id, theirs.id])) {
+        switch (this.contentStrategy) {
+          case ContentMergeStrategy.OURS:
+            return ours;
+          case ContentMergeStrategy.THEIRS:
+            return { ...theirs, name: ours.name };
+          default:
+            return undefined;
+        }
+      }
+
+      // Load content from all three versions (text under the threshold)
       const baseContent = base ? await this.collectBlobContent(base.id) : new Uint8Array(0);
       const oursContent = await this.collectBlobContent(ours.id);
       const theirsContent = await this.collectBlobContent(theirs.id);
@@ -545,6 +579,16 @@ export class MergeCommand extends GitCommand<MergeResult> {
       // Content merge failed - fall back to conflict
       return undefined;
     }
+  }
+
+  /** Whether any of the blobs is binary or over the threshold, read up to 8000 bytes each. */
+  private async anyBinary(ids: (ObjectId | undefined)[]): Promise<boolean> {
+    for (const id of ids) {
+      if (!id) continue;
+      const probe = await probeBlob(this.blobs, id, { bigFileThreshold: this.bigFileThreshold });
+      if (probe.binary) return true;
+    }
+    return false;
   }
 
   /**
