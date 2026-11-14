@@ -57,6 +57,14 @@ const id = await computeObjectIdFromStream("blob", size, files.read(path));
 
 A git object id is the SHA-1 of `"<type> <size>\0"` followed by the content, so the stream form needs the size before the first byte. If the stream ends early, or runs past the declared size, it rejects with `SizeMismatchError` (`declared`, `actual`). An overrun is caught at the first chunk that crosses the size, nothing after it is pulled, and `actual` (above `declared`) counts up to that chunk.
 
+The stream form takes an optional fourth argument, a factory for the incremental hasher (`createSha1` by default), for callers that make the hash configurable:
+
+```typescript
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+
+await computeObjectIdFromStream("blob", size, files.read(path), createSha1);
+```
+
 `computeObjectId` hashes small objects with the portable hasher and objects of 64 KiB and more with Web Crypto, where the runtime has it: each is the faster path for its size.
 
 ### Incremental SHA-1

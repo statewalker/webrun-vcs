@@ -20,14 +20,14 @@ import {
   joinPath,
   readFile,
 } from "@statewalker/vcs-core";
-import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import type {
   IgnoreManager,
+  NewHasher,
   WorktreeEntry,
   WorktreeStoreOptions,
 } from "@statewalker/vcs-working-tree";
-import { createIgnoreManager } from "@statewalker/vcs-working-tree";
+import { createIgnoreManager, hashWorktreeFile } from "@statewalker/vcs-working-tree";
 
 /**
  * Simplified file entry information for mode determination.
@@ -58,8 +58,11 @@ export interface FileTreeIteratorOptions {
   /** Path to global excludes file (from core.excludesFile config) */
   globalExcludesFile?: string;
 
-  /** Custom hash function (for testing or alternate algorithms) */
-  hashFunction?: (data: Uint8Array) => Promise<Uint8Array>;
+  /**
+   * Makes the incremental hasher `computeHash` streams a file through
+   * (default: SHA-1, `createSha1`).
+   */
+  newHasher?: NewHasher;
 }
 
 /**
@@ -81,20 +84,6 @@ function getFileMode(info: SimplifiedFileInfo, hasGitDir: boolean): number {
 }
 
 /**
- * Text encoder for Git header construction.
- */
-const textEncoder = new TextEncoder();
-
-/**
- * Create a Git blob header.
- *
- * Git blobs are stored as: "blob <size>\0<content>"
- */
-function createBlobHeader(size: number): Uint8Array {
-  return textEncoder.encode(`blob ${size}\0`);
-}
-
-/**
  * FileTreeIterator implementation.
  *
  * Provides worktree iteration functionality using a platform-agnostic
@@ -107,7 +96,7 @@ export class FileTreeIterator {
   private readonly autoLoadGitignore: boolean;
   private readonly gitDir?: string;
   private readonly globalExcludesFile?: string;
-  private readonly hashFunction: (data: Uint8Array) => Promise<Uint8Array>;
+  private readonly newHasher: NewHasher;
   private repositoryExcludesLoaded = false;
 
   constructor(options: FileTreeIteratorOptions) {
@@ -117,7 +106,7 @@ export class FileTreeIterator {
     this.autoLoadGitignore = options.autoLoadGitignore ?? true;
     this.gitDir = options.gitDir;
     this.globalExcludesFile = options.globalExcludesFile;
-    this.hashFunction = options.hashFunction ?? sha1;
+    this.newHasher = options.newHasher ?? createSha1;
   }
 
   /**
@@ -286,25 +275,23 @@ export class FileTreeIterator {
   /**
    * Compute content hash for a file (without storing).
    *
-   * Uses Git blob format: "blob <size>\0<content>"
+   * Uses Git blob format: "blob <size>\0<content>". The file streams through the
+   * hasher with its size from stat; see `hashWorktreeFile` for a file that
+   * changes while it is read.
    */
   async computeHash(path: string): Promise<ObjectId> {
     const fullPath = joinPath(this.rootPath, path);
-
-    // Read entire file content
-    const content = await readFile(this.files, fullPath);
-
-    // Create Git blob header
-    const header = createBlobHeader(content.length);
-
-    // Combine header and content
-    const combined = new Uint8Array(header.length + content.length);
-    combined.set(header, 0);
-    combined.set(content, header.length);
-
-    // Hash the combined data
-    const hash = await this.hashFunction(combined);
-    return bytesToHex(hash);
+    return hashWorktreeFile(
+      path,
+      {
+        size: async () => {
+          const stats = await this.files.stats(fullPath);
+          return stats?.kind === "file" ? stats.size : undefined;
+        },
+        read: () => this.files.read(fullPath),
+      },
+      this.newHasher,
+    );
   }
 
   /**
@@ -313,12 +300,7 @@ export class FileTreeIterator {
   async *readContent(path: string): AsyncIterable<Uint8Array> {
     const fullPath = joinPath(this.rootPath, path);
 
-    // Use read() if available for streaming, otherwise readFile()
-    if (this.files.read) {
-      yield* this.files.read(fullPath);
-    } else {
-      yield await readFile(this.files, fullPath);
-    }
+    yield* this.files.read(fullPath);
   }
 
   /**

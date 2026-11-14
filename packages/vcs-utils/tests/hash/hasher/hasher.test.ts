@@ -158,3 +158,25 @@ describe("computeObjectIdFromStream", () => {
     }
   });
 });
+
+describe("computeObjectIdFromStream with a hasher factory", () => {
+  it("feeds header and content to the hasher the factory returns", async () => {
+    const fed: string[] = [];
+    const newHasher = (): Hasher => {
+      const inner = createSha1();
+      const self: Hasher = {
+        update(data) {
+          fed.push(new TextDecoder().decode(data));
+          inner.update(data);
+          return self;
+        },
+        digest: () => inner.digest(),
+        clone: () => inner.clone(),
+      };
+      return self;
+    };
+    const id = await computeObjectIdFromStream("blob", 6, [enc.encode("hello\n")], newHasher);
+    expect(id).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
+    expect(fed).toEqual(["blob 6\0", "hello\n"]);
+  });
+});

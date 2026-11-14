@@ -137,6 +137,45 @@ stored without a size, which spools it when it is large. The result carries the 
 the stored content (the fresh one after a retry; after the unsized fallback, the latest stat with
 the blob's size), which is what the index must record. The add commands and the stash use it.
 
+### Hash a worktree file without reading it whole
+
+```typescript
+import { hashWorktreeFile, unknownContentId } from "@statewalker/vcs-working-tree";
+
+const id = await hashWorktreeFile("video.mp4", {
+  size: async () => {
+    const stats = await files.stats("/repo/video.mp4");
+    return stats?.kind === "file" ? stats.size : undefined;
+  },
+  read: () => files.read("/repo/video.mp4"),
+});
+if (id === unknownContentId()) {
+  // the file kept changing while it was read: treat it as modified
+}
+```
+
+Every `Worktree.computeHash` (`MemoryWorktree`, and `FileWorktree` and `FileTreeIterator` in
+`@statewalker/vcs-store-files`) goes through `hashWorktreeFile`, so status, the checkout conflict
+check and the stash hash a file as it streams past: the size comes from stat, because the git
+header that starts the hash carries it. If the file produces a different number of bytes, it was
+changed while it was read; it is stat'ed and read once more, and if that disagrees too the result
+is `unknownContentId()`, an id of zeros that no blob has, so any comparison with the index reports
+the file as modified.
+
+The worktrees take a `newHasher` factory instead of the old `hashFunction` option, which needed
+the whole file in one buffer. It returns an incremental `Hasher` and defaults to SHA-1:
+
+```typescript
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+
+const worktree = createMemoryWorktree({ blobs, trees, newHasher: createSha1 });
+```
+
+Checkout writes stream the same way: `checkoutTree`, `reset --hard`, `stash apply` and the
+conflict resolution store hand the blob's content stream to `writeContent` / `FilesApi.write`. No
+content filter (`core.autocrlf`, smudge, LFS pointers) is applied on checkout, so nothing needs the
+whole blob in between.
+
 ### Match `.gitignore` rules
 
 ```typescript
