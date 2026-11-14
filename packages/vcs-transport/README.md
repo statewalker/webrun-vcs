@@ -209,6 +209,8 @@ const refs = await lsRemote("http://localhost/repo.git", {
 
 ### Fetch over a Duplex
 
+`serveOverDuplex` returns `success: false` when a pack failed part way. With side-band the client was told in band (`ERR` on band 3); without it, a `Duplex` has no abort, so the caller should close the duplex with an error rather than end it normally (the pack's trailer checksum still catches a truncated pack on the client).
+
 `serveRepoOverWebrun` builds a webrun-streams handler that runs `serveOverDuplex`. `webrunClientDuplex` wraps a webrun caller as a transport `Duplex`. In-process:
 
 ```typescript

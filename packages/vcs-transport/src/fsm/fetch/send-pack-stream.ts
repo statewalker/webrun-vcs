@@ -79,8 +79,8 @@ export async function sendPackStream(
 
   const keepAliveMs = options.keepAliveMs ?? DEFAULT_KEEP_ALIVE_MS;
   let bytes = 0;
+  const it = pack[Symbol.asyncIterator]();
   try {
-    const it = pack[Symbol.asyncIterator]();
     let result = await firstChunk(it.next(), keepAliveMs, () =>
       transport.writePktLine(KEEP_ALIVE_PAYLOAD),
     );
@@ -96,6 +96,9 @@ export async function sendPackStream(
     await transport.writeFlush();
     return { ok: true, bytes };
   } catch (error) {
+    // The client went away (a write failed): end the pack source so its readers are released.
+    // Not awaited: a read still pending (keep-alive path) settles first, then it closes.
+    void Promise.resolve(it.return?.())?.catch(() => {});
     try {
       await transport.writeSideband(3, textEncoder.encode(`ERR ${error}`));
       await transport.writeFlush();

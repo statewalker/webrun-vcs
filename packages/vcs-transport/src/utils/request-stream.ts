@@ -47,7 +47,14 @@ export function supportsRequestStreams(): boolean {
  * dedicated, shared and service workers). Node, Deno and Bun define neither.
  */
 export function isBrowserContext(g: object = globalThis): boolean {
-  const scope = g as { document?: unknown; WorkerGlobalScope?: unknown };
+  const scope = g as {
+    document?: unknown;
+    WorkerGlobalScope?: unknown;
+    Deno?: unknown;
+    Bun?: unknown;
+  };
+  // Deno (and possibly Bun) define WorkerGlobalScope in their workers: they stream bodies
+  if (scope.Deno !== undefined || scope.Bun !== undefined) return false;
   if (typeof scope.document === "object" && scope.document !== null) return true;
   const workerScope = scope.WorkerGlobalScope;
   return typeof workerScope === "function" && g instanceof (workerScope as new () => object);
@@ -73,7 +80,11 @@ export function shouldStreamRequestBody(
  * Sends a request whose body is `makeChunks()`: streamed when `stream`, else collected. A
  * streamed request that `send` rejects with a `TypeError` (Chromium refusing a streamed body
  * over HTTP/1.1, before any response) is sent once more with a body collected from a fresh
- * `makeChunks()`, unless the body's own source failed (that error is thrown as it is).
+ * `makeChunks()`, but only when the body was not read to its end (a server cannot apply a push
+ * whose pack it did not receive whole) and either nothing was read or this is a browser
+ * (Chromium may read the first chunk before refusing). Elsewhere a `TypeError` after part of
+ * the body is a lost connection, not a refusal: it is thrown, rather than collecting the whole
+ * pack in memory to send it again. The body's own source failing is thrown as it is.
  *
  * @example
  * ```typescript
@@ -88,12 +99,19 @@ export async function fetchWithRequestBody(
   makeChunks: () => AsyncIterable<Uint8Array>,
   send: (init: { body: BodyInit; duplex?: "half" }) => Promise<Response>,
   stream: boolean,
+  browser: boolean = isBrowserContext(),
 ): Promise<Response> {
   if (!stream) return send(await requestBody(makeChunks(), false));
   let sourceError: { error: unknown } | undefined;
+  let pulled = 0;
+  let drained = false;
   async function* watched(): AsyncGenerator<Uint8Array> {
     try {
-      yield* makeChunks();
+      for await (const chunk of makeChunks()) {
+        pulled++;
+        yield chunk;
+      }
+      drained = true;
     } catch (error) {
       sourceError = { error };
       throw error;
@@ -104,6 +122,7 @@ export async function fetchWithRequestBody(
   } catch (error) {
     if (sourceError) throw sourceError.error;
     if (!(error instanceof TypeError)) throw error;
+    if (drained || (pulled > 0 && !browser)) throw error;
     return send(await requestBody(makeChunks(), false));
   }
 }

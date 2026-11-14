@@ -313,6 +313,7 @@ describe("request bodies: when to stream", () => {
         return new Response("ok");
       },
       true,
+      true, // a browser: Chromium may read the first chunk before refusing HTTP/1.1
     );
     expect(await response.text()).toBe("ok");
     expect(made).toBe(2);
@@ -351,7 +352,7 @@ describe("request bodies: when to stream", () => {
     ).rejects.toThrow("other");
   });
 
-  it("push re-exports the pack for the retry and counts it once", async () => {
+  it("push retries a refused streamed body with a collected one and counts it once", async () => {
     let exports = 0;
     let posts = 0;
     const result = await push({
@@ -367,7 +368,7 @@ describe("request bodies: when to stream", () => {
         if (request.url.includes("/info/refs")) return new Response(advertisement);
         posts++;
         if (posts === 1) {
-          await request.body?.getReader().read();
+          // refused before the body was read (Chromium over HTTP/1.1)
           throw new TypeError("Failed to fetch");
         }
         await request.arrayBuffer();
@@ -375,7 +376,7 @@ describe("request bodies: when to stream", () => {
       },
     });
     expect(result.ok).toBe(true);
-    expect(exports).toBe(2);
+    expect(exports).toBe(1); // the refused attempt never read its body, so never exported
     expect(result.objectCount).toBe(7);
     expect(result.bytesSent).toBeLessThan(2 * (12 + 2 * 1024));
   });
@@ -580,5 +581,90 @@ describe("push: OFS deltas only when the server advertised ofs-delta", () => {
       await clientPushHandlers.get("SEND_PACK")?.(ctx);
       expect(seen?.ofsDelta).toBe(expected);
     }
+  });
+});
+
+describe("fetchWithRequestBody: when a refused streamed push may be sent again", () => {
+  const refuse = (pulls: number | "all") => async (init: { body: BodyInit; duplex?: "half" }) => {
+    if (init.duplex === "half") {
+      const reader = (init.body as ReadableStream<Uint8Array>).getReader();
+      if (pulls === "all") while (!(await reader.read()).done) {}
+      else for (let i = 0; i < pulls; i++) await reader.read();
+      throw new TypeError("fetch failed");
+    }
+    return new Response("ok");
+  };
+
+  it("outside browsers, a connection lost after part of the body is not retried", async () => {
+    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    let made = 0;
+    const chunks = () => {
+      made++;
+      return lazyPack(3).pack();
+    };
+    await expect(fetchWithRequestBody(chunks, refuse(1), true, false)).rejects.toThrow(TypeError);
+    expect(made).toBe(1);
+  });
+
+  it("outside browsers, a request refused before reading the body is retried", async () => {
+    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    let made = 0;
+    const chunks = () => {
+      made++;
+      return lazyPack(3).pack();
+    };
+    const response = await fetchWithRequestBody(chunks, refuse(0), true, false);
+    expect(await response.text()).toBe("ok");
+    expect(made).toBe(1); // the refused attempt never started its pack (produced on first read)
+  });
+
+  it("a body read to its end is never retried (the server may have applied the push)", async () => {
+    const { fetchWithRequestBody } = await import("../../src/utils/request-stream.js");
+    let made = 0;
+    const chunks = () => {
+      made++;
+      return lazyPack(3).pack();
+    };
+    await expect(fetchWithRequestBody(chunks, refuse("all"), true, true)).rejects.toThrow(
+      TypeError,
+    );
+    expect(made).toBe(1);
+  });
+});
+
+describe("isBrowserContext: server runtimes with worker globals", () => {
+  it("is false in a Deno or Bun worker", async () => {
+    const { isBrowserContext } = await import("../../src/utils/request-stream.js");
+    class WorkerGlobalScope {}
+    const deno = Object.assign(new WorkerGlobalScope(), { WorkerGlobalScope, Deno: {} });
+    const bun = Object.assign(new WorkerGlobalScope(), { WorkerGlobalScope, Bun: {} });
+    expect(isBrowserContext(deno)).toBe(false);
+    expect(isBrowserContext(bun)).toBe(false);
+  });
+});
+
+describe("sendPackStream: a client that goes away", () => {
+  it("ends the pack source, so its readers are released", async () => {
+    const { sendPackStream } = await import("../../src/fsm/fetch/index.js");
+    let released = false;
+    async function* pack() {
+      try {
+        yield new Uint8Array(4);
+        yield new Uint8Array(4);
+      } finally {
+        released = true;
+      }
+    }
+    const failing = {
+      writeSideband: async () => {
+        throw new Error("connection reset");
+      },
+      writePktLine: async () => {},
+      writeFlush: async () => {},
+    };
+    const r = await sendPackStream(failing as never, pack(), { sideband: true, keepAliveMs: 0 });
+    expect(r.ok).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(released).toBe(true);
   });
 });
