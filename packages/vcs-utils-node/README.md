@@ -34,7 +34,7 @@ Paths are resolved against `rootDir`; a path whose `..` would leave it is refuse
 ### What NodeFilesApi does not do yet
 
 - `write` collects every chunk before writing the file (webrun-files-node 0.10), so storing a large object holds it in memory once. A streaming `write` belongs upstream in `@statewalker/webrun-files-node`; the object kernel already streams up to the `FilesApi`.
-- There is no exclusive create (O_EXCL). Ref batches use `atomicFilesOver(files, gitDir)` from `@statewalker/vcs-utils/files`, which excludes concurrent writers sharing one `FilesApi` instance, but not other processes such as a running `git`. Exclusive create also belongs upstream, in `FilesApi`.
+- Exclusive create (O_EXCL) arrives with the next release of `@statewalker/webrun-files-node`, as `FilesApi.createExclusive` (`open "wx"`). Lock files (`<ref>.lock`, `packed-refs.lock`, `index.lock`, `gc.pid`) go through `atomicFilesOver(files, gitDir)` from `@statewalker/vcs-utils/files`, which uses `createExclusive` when the FilesApi has it: the lock then excludes other processes too, such as a running `git`. With the current release, which lacks it, a lock excludes only concurrent writers sharing one `FilesApi` instance.
 
 ### Dependencies
 

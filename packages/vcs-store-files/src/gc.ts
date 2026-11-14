@@ -117,8 +117,8 @@ export interface GcResult {
  * 6. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`) and `.pack` files without
  *    an `.idx`.
  *
- * The lock excludes other gcs over the same FilesApi instance (see `atomicFilesOver`), not
- * native git or another process.
+ * The lock excludes gcs in other processes when the FilesApi has `createExclusive`, and
+ * otherwise only gcs over the same FilesApi instance (see `atomicFilesOver`).
  *
  * @example
  * ```typescript

@@ -284,3 +284,65 @@ describe("breakIndexLock", () => {
     expect(await files.exists(".git/index.lock")).toBe(false);
   });
 });
+
+describe("index.lock through FilesApi.createExclusive", () => {
+  /** Reservations shared by every wrapper over one storage, as the file system is by processes. */
+  const reservations = new WeakMap<FilesApi, Set<string>>();
+  function withCreateExclusive(base: FilesApi): { files: FilesApi; calls: string[] } {
+    let held = reservations.get(base);
+    if (!held) {
+      held = new Set();
+      reservations.set(base, held);
+    }
+    const reserved = held;
+    const calls: string[] = [];
+    const createExclusive = async (
+      path: string,
+      content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+    ): Promise<boolean> => {
+      calls.push(path);
+      const key = path.replace(/^\/+/, "");
+      if (reserved.has(key)) return false;
+      reserved.add(key);
+      try {
+        if (await base.exists(path)) return false;
+        await base.write(path, content);
+        return true;
+      } finally {
+        reserved.delete(key);
+      }
+    };
+    const files = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "createExclusive") return createExclusive;
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    return { files, calls };
+  }
+
+  it("creates the lock with the FilesApi's createExclusive", async () => {
+    const { files, calls } = withCreateExclusive(createInMemoryFilesApi());
+    const staging = createGitStaging(files, ".git/index");
+    await staging.setEntry({ path: "a.txt", mode: 0o100644, objectId: ID_A });
+    await staging.write();
+    expect(calls.map((p) => p.replace(/^\/+/, ""))).toEqual([".git/index.lock"]);
+    expect(await files.exists(".git/index.lock")).toBe(false);
+  });
+
+  it("of two writers on two FilesApi instances over one storage, one fails with IndexLockedError", async () => {
+    const base = createInMemoryFilesApi();
+    const writers = [ID_A, ID_B].map((objectId) => {
+      const staging = createGitStaging(withCreateExclusive(base).files, ".git/index");
+      return { staging, objectId };
+    });
+    for (const { staging, objectId } of writers) {
+      await staging.setEntry({ path: "a.txt", mode: 0o100644, objectId });
+    }
+    const results = await Promise.allSettled(writers.map(({ staging }) => staging.write()));
+    const failed = results.filter((r) => r.status === "rejected");
+    expect(failed).toHaveLength(1);
+    expect((failed[0] as PromiseRejectedResult).reason).toBeInstanceOf(IndexLockedError);
+  });
+});
