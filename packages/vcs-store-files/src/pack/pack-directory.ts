@@ -34,6 +34,11 @@ export interface PackDirectoryOptions {
   basePath: string;
   /** Maximum cached pack readers (default: 10) */
   maxCachedPacks?: number;
+  /**
+   * Called after `addPack` or `removePack` changed the directory, e.g. to refresh a `PackSet`
+   * reading the same directory, so it sees the change without waiting for its next rescan.
+   */
+  onChange?: () => unknown;
 }
 
 /**
@@ -59,11 +64,13 @@ export class PackDirectory {
   private readonly maxCachedPacks: number;
   private readonly cache: Map<string, CachedPack> = new Map();
   private packNames: string[] | null = null;
+  private readonly onChange?: () => unknown;
 
   constructor(options: PackDirectoryOptions) {
     this.files = options.files;
     this.basePath = options.basePath;
     this.maxCachedPacks = options.maxCachedPacks ?? 10;
+    this.onChange = options.onChange;
   }
 
   /**
@@ -231,6 +238,7 @@ export class PackDirectory {
 
     // Invalidate pack name cache
     this.packNames = null;
+    await this.onChange?.();
   }
 
   /**
@@ -255,6 +263,7 @@ export class PackDirectory {
 
     // Invalidate pack name cache
     this.packNames = null;
+    await this.onChange?.();
   }
 
   /**

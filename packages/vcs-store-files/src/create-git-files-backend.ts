@@ -58,7 +58,7 @@ export interface GitFilesBackendResult {
   packs: PackSet;
   /**
    * Pack directory for repack and gc (the previous pack reader). Kept until those
-   * move to `packs`; packs it writes are found by `packs` on its next rescan.
+   * move to `packs`; packs it adds or removes refresh `packs` at once.
    */
   packDirectory: PackDirectory;
   /** Loose object storage (for repack/GC operations) */
@@ -112,7 +112,12 @@ export async function createGitFilesBackend(
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
   });
-  const packDirectory = new PackDirectory({ files, basePath: packDir });
+  // packs repack and gc write or remove through PackDirectory are seen by `packs` at once
+  const packDirectory = new PackDirectory({
+    files,
+    basePath: packDir,
+    onChange: () => packs.refresh(),
+  });
   await packDirectory.scan();
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);

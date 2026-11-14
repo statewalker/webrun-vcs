@@ -3,18 +3,20 @@
  * packed_git list and JGit's PackDirectory:
  *
  *  - a pack that cannot be opened (corrupt idx, pack/idx mismatch) is skipped and recorded in
- *    `skipped`, as git warns and skips; the other packs stay readable;
+ *    `skipped`, as git warns and skips; the other packs stay readable. It is opened again by a
+ *    later scan only if its `.idx` or `.pack` changed size or mtime (one seen half-written);
  *  - a lookup miss rescans the directory (git's reprepare_packed_git), at most once per
  *    `rescanIntervalMs`, so a pack written by native git after open is found; packs whose idx
  *    disappeared are dropped;
  *  - a REF_DELTA base outside its pack is looked up in the other packs, then through the set's
  *    `externalBase` (loose objects), carrying the ids being resolved so a cycle fails;
- *  - a copy found corrupt is passed over for another pack's copy (git's mark_bad_packed_object);
+ *  - a copy found corrupt is passed over for another pack's copy (git's mark_bad_packed_object),
+ *    and counts as absent for `has` and `freshen` (JGit's hasObject), so a repairing write lands;
  *  - one byte-bounded delta base cache serves every pack of the set.
  */
 import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
-import type { GitObject } from "../history/objects/git-objects.js";
+import { CorruptObjectError, type GitObject } from "../history/objects/git-objects.js";
 import {
   type InstalledPack,
   type InstallPackOptions,
@@ -46,10 +48,19 @@ export interface OpenPackSetOptions {
 
 /** The packs of one directory, read as one object store. */
 export interface PackSet {
+  /** Whether a pack holds a copy not found corrupt (a miss rescans, within the rate limit). */
   has(id: ObjectId): Promise<boolean>;
   /**
-   * The object from the first pack holding a sound copy, or undefined. With `verify`, the end of
-   * the content throws `ObjectIdMismatchError` if it hashes to another id.
+   * Whether a pack still on storage holds a copy not found corrupt: the check before skipping a
+   * write of an object already packed (git's freshen_packed_object). A pack whose file is gone is
+   * dropped. No rescan: a miss only means the object is written loose.
+   */
+  freshen(id: ObjectId): Promise<boolean>;
+  /**
+   * The object from the first pack holding a sound copy, or undefined. The first chunk of the
+   * content is read before `get` returns, so a copy whose stream is broken from the start fails
+   * here (and the next copy is tried); a failure later in the stream marks the copy bad. With
+   * `verify`, the end of the content throws `ObjectIdMismatchError` if it hashes to another id.
    */
   get(id: ObjectId, options?: { verify?: boolean }): Promise<GitObject | undefined>;
   /** The object's entry as stored in the first pack holding a sound copy (for reuse). */
@@ -62,7 +73,10 @@ export interface PackSet {
   install(source: AsyncIterable<Uint8Array>, options?: InstallPackOptions): Promise<InstalledPack>;
   /** Removes packs: `.idx` first, then `.pack`, and `.keep`, `.rev`, `.bitmap`… if present. */
   remove(packIds: readonly string[]): Promise<void>;
-  /** Rescans the directory now; true if packs were added or dropped. */
+  /**
+   * Rescans the directory now, whatever the rate limit: a scan that started before the call is
+   * followed by a new one. True if packs were added or dropped.
+   */
   refresh(): Promise<boolean>;
   /** Packs that could not be opened, skipped as git does. */
   readonly skipped: readonly { pack: string; error: string }[];
@@ -95,9 +109,14 @@ export async function openPackSet(
   const baseCache = new DeltaBaseCache(options.baseCacheBytes ?? 16 * 2 ** 20);
   let packs: PackFile[] = [];
   const byName = new Map<string, PackFile>();
+  /** opens in flight, shared by scans and installs of the same pack */
+  const opening = new Map<string, Promise<PackFile>>();
   const skipped: { pack: string; error: string }[] = [];
-  /** packs refused as corrupt: not retried by rescans */
-  const refused = new Set<string>();
+  /** packs refused as corrupt, with the size and mtime of their files when they were refused */
+  const refused = new Map<string, string>();
+  /** removals: a scan does not add a pack removed after it started */
+  let removals = 0;
+  const removedAt = new Map<string, number>();
   /** copies found corrupt, per pack */
   const bad = new WeakMap<PackFile, Set<ObjectId>>();
   const isBad = (p: PackFile, id: ObjectId) => bad.get(p)?.has(id) ?? false;
@@ -109,6 +128,7 @@ export async function openPackSet(
     }
     s.add(id);
   };
+  const holds = (p: PackFile, id: ObjectId) => p.has(id) && !isBad(p, id);
   const nameOf = (p: PackFile) => `pack-${p.packId}`;
   const drop = (p: PackFile) => {
     packs = packs.filter((x) => x !== p);
@@ -120,6 +140,18 @@ export async function openPackSet(
     const entry = { pack, error: message(error) };
     if (i >= 0) skipped[i] = entry;
     else skipped.push(entry);
+  };
+  const unrecord = (pack: string) => {
+    const i = skipped.findIndex((s) => s.pack === pack);
+    if (i >= 0) skipped.splice(i, 1);
+  };
+  /** size and mtime of a pack's files: a refused pack is retried once they change */
+  const signature = async (name: string) => {
+    const [i, p] = await Promise.all([
+      files.stats(`${dir}/${name}.idx`),
+      files.stats(`${dir}/${name}.pack`),
+    ]);
+    return `${i?.size}:${i?.lastModified}:${p?.size}:${p?.lastModified}`;
   };
 
   /** Resolves a REF_DELTA base no pack of its own holds: the other packs, then loose objects. */
@@ -149,16 +181,24 @@ export async function openPackSet(
     return { type: o.type, data };
   };
 
-  const open = (name: string) =>
-    openPack(files, `${dir}/${name}.pack`, `${dir}/${name}.idx`, {
-      baseCache,
-      maxObjectSize,
-      externalBase,
-    });
+  /** Opens a pack; concurrent opens of the same name share one promise. */
+  const open = (name: string): Promise<PackFile> => {
+    let pending = opening.get(name);
+    if (!pending) {
+      pending = openPack(files, `${dir}/${name}.pack`, `${dir}/${name}.idx`, {
+        baseCache,
+        maxObjectSize,
+        externalBase,
+      }).finally(() => opening.delete(name));
+      opening.set(name, pending);
+    }
+    return pending;
+  };
 
-  let scanning: Promise<boolean> | undefined;
-  let lastRescan = Number.NEGATIVE_INFINITY;
   const scan = async (): Promise<boolean> => {
+    const started = removals;
+    const removedSince = (name: string) => (removedAt.get(name) ?? -1) > started;
+    const before = [...packs];
     const found: { name: string; lastModified: number }[] = [];
     if (await files.exists(dir)) {
       for await (const e of files.list(dir)) {
@@ -168,8 +208,9 @@ export async function openPackSet(
     }
     let changed = false;
     const present = new Set(found.map((f) => f.name));
-    for (const p of [...packs]) {
-      if (!present.has(nameOf(p))) {
+    // only packs known before the listing: one installed meanwhile is not in it
+    for (const p of before) {
+      if (!present.has(nameOf(p)) && packs.includes(p)) {
         drop(p);
         changed = true;
       }
@@ -178,50 +219,99 @@ export async function openPackSet(
     found.sort((a, b) => b.lastModified - a.lastModified || (a.name < b.name ? -1 : 1));
     const added: PackFile[] = [];
     for (const { name } of found) {
-      if (byName.has(name) || refused.has(name)) continue;
+      if (byName.has(name) || removedSince(name)) continue;
+      const refusedAs = refused.get(name);
+      if (refusedAs !== undefined && refusedAs === (await signature(name))) continue;
       // an idx without its pack is ignored (a pack being removed, or not fully installed)
       if (!(await files.exists(`${dir}/${name}.pack`))) continue;
       try {
         const p = await open(name);
+        if (removedSince(name) || byName.has(name)) continue; // removed, or added by install
         byName.set(name, p);
         added.push(p);
-        const i = skipped.findIndex((s) => s.pack === name);
-        if (i >= 0) skipped.splice(i, 1);
+        refused.delete(name);
+        unrecord(name);
       } catch (e) {
-        // git warns and skips a pack it cannot use; a corrupt one is not retried, a storage
-        // failure is retried by the next rescan
+        if (removedSince(name)) continue;
+        // git warns and skips a pack it cannot use. A corrupt one is retried only once its files
+        // change (an idx seen while it was written in place); a storage failure is retried by
+        // the next scan.
         record(name, e);
-        if (e instanceof PackError) refused.add(name);
+        if (e instanceof PackError) refused.set(name, await signature(name));
+        else refused.delete(name);
       }
     }
-    if (added.length) {
-      packs = [...added, ...packs];
+    // a pack removed while this scan ran is no longer in `byName`
+    const kept = added.filter((p) => byName.get(nameOf(p)) === p);
+    if (kept.length) {
+      packs = [...kept, ...packs];
       changed = true;
     }
     return changed;
   };
+
+  let scanning: Promise<boolean> | undefined;
+  let queued: Promise<boolean> | undefined;
+  let lastRescan = Number.NEGATIVE_INFINITY;
+  const startScan = (): Promise<boolean> => {
+    scanning = scan().finally(() => {
+      scanning = undefined;
+    });
+    return scanning;
+  };
   const refresh = (): Promise<boolean> => {
     lastRescan = Date.now();
-    if (!scanning) {
-      scanning = scan().finally(() => {
-        scanning = undefined;
+    if (!scanning) return startScan();
+    // the running scan may have listed the directory before this call: one more after it
+    if (!queued) {
+      const after = scanning.then(
+        () => undefined,
+        () => undefined,
+      );
+      queued = after.then(() => {
+        queued = undefined;
+        return scanning ?? startScan();
       });
     }
-    return scanning;
+    return queued;
   };
   /** A rescan after a miss, unless one ran less than `rescanIntervalMs` ago. */
   const rescanOnMiss = async (): Promise<boolean> => {
-    if (Date.now() - lastRescan < rescanInterval) {
-      if (scanning) return scanning;
-      return false;
-    }
+    if (Date.now() - lastRescan < rescanInterval) return (await (queued ?? scanning)) ?? false;
     return refresh();
   };
 
   /**
+   * Reads the first chunk before handing the object out, so a stream broken from its start
+   * fails `get` itself; a failure later marks the copy bad for the next `get`.
+   */
+  const guarded = async (p: PackFile, id: ObjectId, obj: GitObject): Promise<GitObject> => {
+    const it = obj.content[Symbol.asyncIterator]();
+    const first = await it.next();
+    async function* content(): AsyncGenerator<Uint8Array> {
+      try {
+        if (first.done) return;
+        yield first.value;
+        for (;;) {
+          const r = await it.next();
+          if (r.done) return;
+          yield r.value;
+        }
+      } catch (e) {
+        if (e instanceof CorruptObjectError) markBad(p, id);
+        throw e;
+      } finally {
+        await it.return?.();
+      }
+    }
+    return { ...obj, content: content() };
+  };
+
+  /**
    * The first sound copy of `id`. A copy that fails before `get` returns (a corrupt header, a
-   * bad delta, a missing base) is marked bad and the next pack is tried; the first error is
-   * raised only when no copy remains. A pack whose file disappeared is dropped.
+   * bad delta, a missing base, a broken first chunk) is marked bad and the next pack is tried;
+   * the first error is raised only when no copy remains. A pack whose file disappeared is
+   * dropped.
    */
   async function lookup(
     id: ObjectId,
@@ -237,13 +327,14 @@ export async function openPackSet(
         continue;
       }
       try {
-        return await p.get(id, o);
+        const obj = await p.get(id, o);
+        if (obj) return await guarded(p, id, obj);
       } catch (e) {
         if (!(await files.exists(p.packPath))) {
           drop(p);
           continue;
         }
-        if (!(e instanceof PackError)) throw e;
+        if (!(e instanceof CorruptObjectError)) throw e;
         markBad(p, id);
         failed ??= e;
       }
@@ -256,7 +347,7 @@ export async function openPackSet(
   async function findEntry(id: ObjectId, rescan: boolean): Promise<PackedEntry | undefined> {
     if (!isId(id)) return undefined;
     for (const p of [...packs]) {
-      if (!p.has(id) || isBad(p, id)) continue;
+      if (!holds(p, id)) continue;
       let stored: PackedEntry | undefined;
       try {
         stored = await p.entry(id);
@@ -287,26 +378,37 @@ export async function openPackSet(
     return undefined;
   }
 
-  await scan();
+  await startScan();
 
   return {
     skipped,
     refresh,
     async has(id) {
       if (!isId(id)) return false;
-      if (packs.some((p) => p.has(id))) return true;
-      return (await rescanOnMiss()) && packs.some((p) => p.has(id));
+      if (packs.some((p) => holds(p, id))) return true;
+      return (await rescanOnMiss()) && packs.some((p) => holds(p, id));
+    },
+    async freshen(id) {
+      if (!isId(id)) return false;
+      for (const p of [...packs]) {
+        if (!holds(p, id)) continue;
+        if (await files.exists(p.packPath)) return true;
+        drop(p); // deleted behind our back (git repack -a -d, gc): the object must be written
+      }
+      return false;
     },
     get: (id, o) => lookup(id, { verify: o?.verify }, true),
     entry: (id) => findEntry(id, true),
     async *list() {
       await rescanOnMiss();
-      const seen = new Set<ObjectId>();
-      for (const p of [...packs]) {
+      // an id is yielded by the first pack holding it: no set of every id
+      const snapshot = [...packs];
+      for (let k = 0; k < snapshot.length; k++) {
+        const p = snapshot[k] as PackFile;
         for (const id of p.ids()) {
-          if (seen.has(id)) continue;
-          seen.add(id);
-          yield id;
+          let earlier = false;
+          for (let j = 0; j < k && !earlier; j++) earlier = (snapshot[j] as PackFile).has(id);
+          if (!earlier) yield id;
         }
       }
     },
@@ -317,23 +419,24 @@ export async function openPackSet(
       const r = await installPack(files, dir, source, { maxObjectSize, ...o });
       const name = `pack-${r.packId}`;
       if (!byName.has(name)) {
-        refused.delete(name);
         const p = await open(name);
-        byName.set(name, p);
-        packs = [p, ...packs];
-        const i = skipped.findIndex((s) => s.pack === name);
-        if (i >= 0) skipped.splice(i, 1);
+        if (!byName.has(name)) {
+          byName.set(name, p);
+          packs = [p, ...packs];
+          refused.delete(name);
+          unrecord(name);
+        }
       }
       return r;
     },
     async remove(packIds) {
       for (const packId of packIds) {
         const name = `pack-${packId}`;
+        removedAt.set(name, ++removals);
         const p = byName.get(name);
         if (p) drop(p);
         refused.delete(name);
-        const i = skipped.findIndex((s) => s.pack === name);
-        if (i >= 0) skipped.splice(i, 1);
+        unrecord(name);
         // the idx goes first: a pack without its idx is invisible to every reader
         for (const ext of EXTENSIONS) {
           const path = `${dir}/${name}${ext}`;

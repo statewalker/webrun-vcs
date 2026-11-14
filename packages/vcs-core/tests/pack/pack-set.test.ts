@@ -270,7 +270,10 @@ describe("openPackSet: reading objects", () => {
     const raw = await collect(files.read(paths(r.packId).pack));
     await files.write(paths(r.packId).pack, [flipAt(raw, 60)]);
     const set = await openPackSet(files, PACK_DIR);
-    await expect(content(await set.get(oidOf("blob", big)))).rejects.toBeInstanceOf(PackError);
+    // the first chunk is read before get returns: get itself rejects
+    await expect((async () => content(await set.get(oidOf("blob", big))))()).rejects.toBeInstanceOf(
+      PackError,
+    );
   });
 
   it("returned buffers are never the cached ones", async () => {
@@ -754,5 +757,225 @@ describe("storage errors", () => {
     })().catch((e) => e);
     expect(err).toBe(failure);
     expect(r.count).toBe(1);
+  });
+});
+
+describe("review of P2.3: copies that cannot serve a read", () => {
+  it("freshen is false for a pack deleted behind the set's back, and drops it", async () => {
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    expect(await set.freshen(Aid)).toBe(true);
+    await files.remove(paths(r.packId).idx);
+    await files.remove(paths(r.packId).pack);
+    expect(await set.freshen(Aid)).toBe(false);
+    expect(await set.packs()).toEqual([]);
+  });
+
+  it("has and freshen are false for a copy found corrupt (JGit's hasObject, git's fill_pack_entry)", async () => {
+    const files = createInMemoryFilesApi();
+    await writeRaw(files, [{ kind: 7, data: dAB, baseOid: fakeId(0xee) }], [Bid]);
+    const set = await openPackSet(files, PACK_DIR);
+    expect(await set.has(Bid)).toBe(true); // not known to be bad yet
+    await expect(set.get(Bid)).rejects.toBeInstanceOf(PackError);
+    expect(await set.has(Bid)).toBe(false);
+    expect(await set.freshen(Bid)).toBe(false);
+  });
+
+  it("a corrupt whole object fails get() itself (its first chunk is read before returning)", async () => {
+    const files = createInMemoryFilesApi();
+    const big = enc.encode(Array.from({ length: 400 }, (_, i) => `line ${i}\n`).join(""));
+    const r = await install(files, [{ kind: 3, data: big }]);
+    const raw = await collect(files.read(paths(r.packId).pack));
+    await files.write(paths(r.packId).pack, [flipAt(raw, 60)]);
+    const set = await openPackSet(files, PACK_DIR);
+    await expect(set.get(oidOf("blob", big))).rejects.toBeInstanceOf(PackError);
+    expect(await set.has(oidOf("blob", big))).toBe(false);
+  });
+
+  it("a stream that fails after its first chunk marks the copy bad", async () => {
+    const files = createInMemoryFilesApi();
+    const big = noise(MiB, 9);
+    const built = buildPack([{ kind: 3, data: big }]);
+    const r = await installPack(files, PACK_DIR, chunks(built.bytes));
+    // corrupt the end of the zlib stream: the first chunks inflate, the end does not
+    const at = (built.ends[0] as number) - 6;
+    await files.write(paths(r.packId).pack, [flipAt(built.bytes, at)]);
+    const set = await openPackSet(files, PACK_DIR);
+    const id = oidOf("blob", big);
+    const o = await set.get(id);
+    await expect(content(o)).rejects.toBeInstanceOf(PackError);
+    expect(await set.has(id)).toBe(false);
+  });
+
+  it("entry().raw() checks the CRC before it yields a byte", async () => {
+    const files = createInMemoryFilesApi();
+    const built = buildPack([
+      { kind: 3, data: A },
+      { kind: 3, data: C },
+    ]);
+    const r = await installPack(files, PACK_DIR, chunks(built.bytes));
+    await files.write(paths(r.packId).pack, [
+      flipAt(built.bytes, (built.offsets[1] as number) + 10),
+    ]);
+    const set = await openPackSet(files, PACK_DIR);
+    const e = await set.entry(Cid);
+    let yielded = 0;
+    const err = await (async () => {
+      for await (const _ of e?.raw() ?? []) yielded++;
+    })().catch((x) => x);
+    expect(err).toBeInstanceOf(PackError);
+    expect(yielded).toBe(0);
+  });
+
+  it("list yields an object held by two packs once", async () => {
+    const files = createInMemoryFilesApi();
+    await install(files, [{ kind: 3, data: A }]);
+    await install(files, [
+      { kind: 3, data: A },
+      { kind: 3, data: B },
+    ]);
+    const set = await openPackSet(files, PACK_DIR);
+    const listed: string[] = [];
+    for await (const id of set.list()) listed.push(id);
+    expect(listed.sort()).toEqual([Aid, Bid].sort());
+  });
+});
+
+describe("review of P2.3: packs seen while they are written", () => {
+  it("a pack seen with a half-written idx is found once the idx is complete", async () => {
+    const files = createInMemoryFilesApi();
+    const built = buildPack([{ kind: 3, data: A }]);
+    const checksum = built.bytes.subarray(built.bytes.length - 20);
+    const packId = bytesToHex(checksum);
+    const idx = writePackIdx(
+      [{ id: Aid, offset: 12, crc32: crc32(built.bytes.subarray(12, built.ends[0])) }],
+      checksum,
+    );
+    await files.write(paths(packId).pack, [built.bytes]);
+    await files.write(paths(packId).idx, [idx.subarray(0, 600)]); // written in place, not yet complete
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    expect(set.skipped.map((s) => s.pack)).toEqual([`pack-${packId}`]);
+    await files.write(paths(packId).idx, [idx]);
+    await set.refresh();
+    expect(set.skipped).toEqual([]);
+    expect(await content(await set.get(Aid))).toEqual(A);
+  });
+
+  it("a corrupt pack whose files do not change is not reopened by later scans", async () => {
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const idx = await collect(files.read(paths(r.packId).idx));
+    await files.write(paths(r.packId).idx, [flipAt(idx, idx.length - 1)]);
+    const set = await openPackSet(files, PACK_DIR);
+    let idxReads = 0;
+    const read = files.read.bind(files);
+    files.read = (path, o) => {
+      if (path.endsWith(".idx")) idxReads++;
+      return read(path, o);
+    };
+    await set.refresh();
+    expect(idxReads).toBe(0);
+    expect(set.skipped.length).toBe(1);
+  });
+});
+
+describe("review of P2.3: concurrent scans, installs and removals", () => {
+  /** A one-shot gate: `wait()` blocks the first caller until `open()`. */
+  function gate() {
+    let release = () => {};
+    const opened = new Promise<void>((r) => {
+      release = r;
+    });
+    let used = false;
+    return {
+      open: () => release(),
+      async wait(): Promise<boolean> {
+        if (used) return false;
+        used = true;
+        await opened;
+        return true;
+      },
+    };
+  }
+
+  it("refresh starts a new scan when the running one started before the call", async () => {
+    const files = createInMemoryFilesApi();
+    await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const g = gate();
+    let listed = () => {};
+    const listedP = new Promise<void>((r) => {
+      listed = r;
+    });
+    const list = files.list.bind(files);
+    files.list = (path, o) =>
+      (async function* () {
+        const entries = [];
+        for await (const e of list(path, o)) entries.push(e);
+        listed();
+        await g.wait();
+        yield* entries;
+      })();
+    const first = set.refresh();
+    await listedP; // the first scan has its listing
+    const r = await install(files, [{ kind: 3, data: B }]);
+    const second = set.refresh();
+    g.open();
+    await Promise.all([first, second]);
+    expect((await set.packs()).map((p) => p.packId)).toContain(r.packId);
+  });
+
+  it("remove wins over a scan that is opening the pack", async () => {
+    const files = createInMemoryFilesApi();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const r = await install(files, [{ kind: 3, data: A }]);
+    const g = gate();
+    let opening = () => {};
+    const openingP = new Promise<void>((res) => {
+      opening = res;
+    });
+    const stats = files.stats.bind(files);
+    files.stats = async (path) => {
+      if (path === paths(r.packId).pack) {
+        opening();
+        await g.wait();
+      }
+      return stats(path);
+    };
+    const scan = set.refresh();
+    await openingP; // the scan read the idx and is about to check the pack
+    await set.remove([r.packId]);
+    g.open();
+    await scan;
+    expect(await set.packs()).toEqual([]);
+    expect(set.skipped).toEqual([]);
+  });
+
+  it("an install during a scan that is opening the same pack adds it once", async () => {
+    const files = createInMemoryFilesApi();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const bytes = pack([{ kind: 3, data: A }]);
+    const r = await installPack(files, PACK_DIR, chunks(bytes));
+    const g = gate();
+    let opening = () => {};
+    const openingP = new Promise<void>((res) => {
+      opening = res;
+    });
+    const stats = files.stats.bind(files);
+    files.stats = async (path) => {
+      if (path === paths(r.packId).pack) {
+        opening();
+        await g.wait();
+      }
+      return stats(path);
+    };
+    const scan = set.refresh();
+    await openingP;
+    const installed = set.install(chunks(bytes));
+    await new Promise((res) => setTimeout(res, 50)); // the install reaches its open meanwhile
+    g.open();
+    await Promise.all([scan, installed]);
+    expect((await set.packs()).map((p) => p.packId)).toEqual([r.packId]);
   });
 });

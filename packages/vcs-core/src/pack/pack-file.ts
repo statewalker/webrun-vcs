@@ -48,7 +48,8 @@ export interface PackedEntry {
   crc32: number;
   /**
    * The entry's compressed data (its zlib stream, without the entry header). The CRC of the
-   * whole entry is checked as it streams: a mismatch throws `PackError` at the end.
+   * whole entry is checked in a first pass, before any byte is yielded (a mismatch throws
+   * `PackError` from the first `next()`), and again while streaming, in case the file changed.
    */
   raw(): AsyncIterable<Uint8Array>;
 }
@@ -679,19 +680,32 @@ export async function openPack(
         ...(baseId ? { baseId } : {}),
         crc32,
         async *raw() {
-          const crc = new CRC32();
+          // Two passes, as JGit's copyAsIs validates before copying: the CRC of the whole entry
+          // is checked before a byte is yielded, then again while streaming (the file could
+          // change in between). Entries are compressed and usually small.
+          const check = (crc: CRC32, at: number) => {
+            if (at !== e.end) throw new PackError(`${packPath}: entry at ${offset} truncated`);
+            if (crc.getValue() !== crc32)
+              throw new PackError(
+                `${packPath}: entry ${id} at ${offset} does not match its idx CRC (corrupt)`,
+              );
+          };
+          const first = new CRC32();
           let at = offset;
+          for await (const c of files.read(packPath, { start: offset, length: e.end - offset })) {
+            first.update(c);
+            at += c.length;
+          }
+          check(first, at);
+          const crc = new CRC32();
+          at = offset;
           for await (const c of files.read(packPath, { start: offset, length: e.end - offset })) {
             crc.update(c);
             const from = Math.max(0, e.dataStart - at);
             if (from < c.length) yield c.subarray(from);
             at += c.length;
           }
-          if (at !== e.end) throw new PackError(`${packPath}: entry at ${offset} truncated`);
-          if (crc.getValue() !== crc32)
-            throw new PackError(
-              `${packPath}: entry ${id} at ${offset} does not match its idx CRC (corrupt)`,
-            );
+          check(crc, at);
         },
       };
     },

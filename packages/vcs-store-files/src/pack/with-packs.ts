@@ -1,12 +1,12 @@
 /**
  * Git's object database: pack files and loose objects. Reads try the packs
  * first, then the loose store (git's find_pack_entry before loose objects, JGit's
- * ObjectDirectory); when both miss, the pack directory is rescanned once (git's
- * reprepare_packed_git), so a pack written meanwhile (by native git, or by a
- * repack that removed the loose copies) is found. Writes and removals go to the
- * loose store, and an object already in a pack is not written again (git's
- * freshen_packed_object, JGit's ObjectDirectoryInserter). Packs are read-only
- * here (repack and gc rewrite them).
+ * ObjectDirectory). A pack miss rescans the pack directory, at most once per the
+ * set's `rescanIntervalMs` (git's reprepare_packed_git, rate-limited), so a pack
+ * written by native git is found. Writes and removals go to the loose store, and
+ * an object already in a pack is not written again, unless that pack's file is
+ * gone or its copy was found corrupt (git's freshen_packed_object, JGit's
+ * ObjectDirectoryInserter). Packs are read-only here (repack and gc rewrite them).
  */
 
 import type { PackSet, StagingBlobStore } from "@statewalker/vcs-core";
@@ -46,7 +46,7 @@ export function skipPacked(store: StagingBlobStore, packs: PackSet): StagingBlob
       try {
         return await store.putStaged(bytes, async () => {
           const id = await idOf();
-          if (await packs.has(id)) {
+          if (await packs.freshen(id)) {
             packedId = id;
             throw new AlreadyPacked(id);
           }
@@ -74,9 +74,10 @@ export function skipPacked(store: StagingBlobStore, packs: PackSet): StagingBlob
  */
 export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
   /**
-   * Packs, then loose objects, then — when both miss — packs again after a rescan. A packed copy
-   * that fails (a corrupt entry, a missing delta base) gives way to a loose copy; its error is
-   * raised only when there is none.
+   * Packs, then loose objects. A packed copy that fails before `get` returns (a corrupt entry
+   * header, a missing delta base, a broken first chunk) gives way to a loose copy; its error is
+   * raised only when there is none. A copy failing later in its stream is marked bad by the
+   * set, so the next read goes loose.
    */
   const lookup = async (
     id: string,
@@ -94,7 +95,6 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
     const obj = await loose.get(id, options);
     if (obj) return obj;
     if (failed) throw failed;
-    if (await packs.refresh()) return packs.get(id, options);
     return undefined;
   };
 
@@ -104,7 +104,7 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
     async putRaw(id, raw) {
       // As JGit's ObjectDirectory.insertUnpackedObject: an object already packed is
       // not written again (git's "freshen" of a packed object is a no-op here).
-      if (isId(id) && (await packs.has(id))) {
+      if (isId(id) && (await packs.freshen(id))) {
         closeSource(raw);
         return;
       }
@@ -122,17 +122,14 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
 
     async has(id) {
       if (!isId(id)) return loose.has(id);
-      if ((await packs.has(id)) || (await loose.has(id))) return true;
-      return (await packs.refresh()) && (await packs.has(id));
+      return (await packs.has(id)) || (await loose.has(id));
     },
 
     async *list() {
-      const seen = new Set<string>();
-      for await (const id of packs.list()) {
-        seen.add(id);
-        yield id;
-      }
-      for await (const id of loose.list()) if (!seen.has(id)) yield id;
+      // no set of every id: loose ids already in a pack's idx are skipped
+      yield* packs.list();
+      const held = await packs.packs();
+      for await (const id of loose.list()) if (!held.some((p) => p.has(id))) yield id;
     },
 
     remove: (id) => loose.remove(id),
