@@ -47,6 +47,18 @@ export interface GitObjects {
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
   ): Promise<ObjectId>;
   /**
+   * Store an object whose size is not known up front. A git id hashes the size
+   * first, so the content is read twice: content up to the kernel's
+   * `spoolThreshold` is kept in memory; longer content is written to the
+   * store's temporary storage (`StagingBlobStore.spool`) and then stored with
+   * `put`. A store without `spool` gets the content collected in memory.
+   * Callers that know the size use `put`, which reads the content once.
+   */
+  putUnsized(
+    type: ObjectTypeString,
+    content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+  ): Promise<ObjectId>;
+  /**
    * Store an uncompressed loose object (`"<type> <size>\0" + content`) received
    * with its id, as transport and pack import do. Rejects, storing nothing, with
    * `CorruptObjectError` for a malformed object and `ObjectIdMismatchError` when
@@ -67,7 +79,27 @@ export interface GitObjects {
   list(): AsyncIterable<ObjectId>;
   /** Remove an object; true if one was removed. Throws `InvalidObjectIdError` for a non-id. */
   remove(id: ObjectId): Promise<boolean>;
+  /**
+   * Remove what interrupted writes left in the store (temporaries, orphaned
+   * chunks) once older than `olderThanMs`; present when the store can
+   * (`StagingBlobStore.sweepStale`). `GcOrchestrator` calls it.
+   *
+   * @returns The number of leftovers removed
+   */
+  sweepStale?(options: { olderThanMs: number }): Promise<number>;
 }
+
+/** Options of `createGitObjects`. */
+export interface GitObjectsOptions {
+  /**
+   * `putUnsized` keeps content up to this many bytes in memory and spools longer
+   * content to the store's temporary storage. Default `DEFAULT_SPOOL_THRESHOLD`.
+   */
+  spoolThreshold?: number;
+}
+
+/** Default `spoolThreshold`: 1 MiB. */
+export const DEFAULT_SPOOL_THRESHOLD = 1024 * 1024;
 
 /** A stored object that is not a valid loose object (bad zlib, header or size). */
 export class CorruptObjectError extends Error {

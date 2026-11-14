@@ -14,6 +14,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 export interface RawStorageTestContext {
   rawStorage: RawStorage;
   cleanup?: () => Promise<void>;
+  /** Set when the store implements `move`; the move tests then run. */
+  supportsMove?: boolean;
+  /**
+   * Bytes the backend has persisted so far (for example, the sizes of the KV
+   * values or SQL blobs written). When given, the suite checks that `store`
+   * writes content as it arrives instead of collecting it first.
+   */
+  persistedBytes?: () => number;
 }
 
 /**
@@ -340,6 +348,99 @@ export function createRawStorageTests(name: string, factory: RawStorageFactory):
 
         const removed2 = await ctx.rawStorage.remove("multi-rem");
         expect(removed2).toBe(false);
+      });
+    });
+
+    describe("Large values", () => {
+      /** 600 KiB + 123 of deterministic bytes, so values cross several 256 KiB chunks. */
+      const large = (seed: number) => {
+        const out = new Uint8Array(600 * 1024 + 123);
+        let x = seed;
+        for (let i = 0; i < out.length; i++) {
+          x = (Math.imul(x, 1103515245) + 12345) | 0;
+          out[i] = x >>> 24;
+        }
+        return out;
+      };
+      async function* pieces(data: Uint8Array, size: number): AsyncIterable<Uint8Array> {
+        for (let i = 0; i < data.length; i += size) yield data.subarray(i, i + size);
+      }
+
+      it("round-trips a value fed in odd-sized pieces, with ranges across chunk boundaries", async () => {
+        const data = large(1);
+        await ctx.rawStorage.store("big", pieces(data, 7777));
+        expect(await ctx.rawStorage.size("big")).toBe(data.length);
+        expect(await collectBytes(ctx.rawStorage.load("big"))).toEqual(data);
+        const start = 256 * 1024 - 10;
+        const end = 512 * 1024 + 10;
+        expect(await collectBytes(ctx.rawStorage.load("big", { start, end }))).toEqual(
+          data.subarray(start, end),
+        );
+        expect(await collectBytes(ctx.rawStorage.load("big", { start: data.length - 5 }))).toEqual(
+          data.subarray(data.length - 5),
+        );
+      });
+
+      it("replaces large values with small ones and back, listing only the key", async () => {
+        await ctx.rawStorage.store("v", pieces(large(2), 65536));
+        await ctx.rawStorage.store("v", toStream(encoder.encode("small")));
+        expect(decoder.decode(await collectBytes(ctx.rawStorage.load("v")))).toBe("small");
+        expect(await ctx.rawStorage.size("v")).toBe(5);
+        const again = large(3);
+        await ctx.rawStorage.store("v", pieces(again, 65536));
+        expect(await collectBytes(ctx.rawStorage.load("v"))).toEqual(again);
+        expect(await toArray(ctx.rawStorage.keys())).toEqual(["v"]);
+        expect(await ctx.rawStorage.remove("v")).toBe(true);
+        expect(await toArray(ctx.rawStorage.keys())).toEqual([]);
+      });
+
+      it("keeps nothing of a write whose stream fails", async () => {
+        async function* failing(): AsyncIterable<Uint8Array> {
+          yield* pieces(large(4), 65536);
+          throw new Error("source failed");
+        }
+        await expect(ctx.rawStorage.store("broken", failing())).rejects.toThrow("source failed");
+        expect(await ctx.rawStorage.has("broken")).toBe(false);
+        expect(await toArray(ctx.rawStorage.keys())).toEqual([]);
+      });
+
+      it("writes content as it arrives (when the backend reports persisted bytes)", async () => {
+        const persisted = ctx.persistedBytes;
+        if (!persisted) return;
+        const before = persisted();
+        let produced = 0;
+        let maxLag = 0;
+        async function* source(): AsyncIterable<Uint8Array> {
+          for (let i = 0; i < 64; i++) {
+            maxLag = Math.max(maxLag, produced - (persisted?.() ?? 0) + before);
+            produced += 64 * 1024;
+            yield new Uint8Array(64 * 1024).fill(i);
+          }
+        }
+        await ctx.rawStorage.store("streamed", source());
+        expect(await ctx.rawStorage.size("streamed")).toBe(64 * 64 * 1024);
+        // never more than about one storage chunk (plus the piece in hand) ahead
+        expect(maxLag).toBeLessThanOrEqual(1024 * 1024);
+      });
+    });
+
+    describe("move", () => {
+      it("renames a value, small or large, replacing the target", async () => {
+        if (!ctx.supportsMove) return;
+        const move = ctx.rawStorage.move?.bind(ctx.rawStorage);
+        expect(move).toBeTypeOf("function");
+        if (!move) return;
+        const big = new Uint8Array(300 * 1024).fill(7);
+        await ctx.rawStorage.store("a", toStream(big));
+        await ctx.rawStorage.store("b", toStream(encoder.encode("old")));
+        expect(await move("a", "b")).toBe(true);
+        expect(await ctx.rawStorage.has("a")).toBe(false);
+        expect(await collectBytes(ctx.rawStorage.load("b"))).toEqual(big);
+        await ctx.rawStorage.store("c", toStream(encoder.encode("tiny")));
+        expect(await move("c", "b")).toBe(true);
+        expect(decoder.decode(await collectBytes(ctx.rawStorage.load("b")))).toBe("tiny");
+        expect(await move("missing", "d")).toBe(false);
+        expect(await toArray(ctx.rawStorage.keys())).toEqual(["b"]);
       });
     });
   });

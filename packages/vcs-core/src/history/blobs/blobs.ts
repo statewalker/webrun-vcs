@@ -33,7 +33,9 @@ export interface Blobs extends ObjectStorage<BlobContent> {
    *
    * With `size`, the content is read once and never held in memory (it must be
    * exactly `size` bytes, or the store rejects with `SizeMismatchError` and keeps
-   * nothing). Without it, the content is collected first to learn its size.
+   * nothing). Without it, the content is read twice: content up to the kernel's
+   * spool threshold (1 MiB by default) is kept in memory, longer content is
+   * spooled to the store's temporary storage first (`GitObjects.putUnsized`).
    *
    * @param content Blob content as byte stream
    * @param size The content's length in bytes, when known

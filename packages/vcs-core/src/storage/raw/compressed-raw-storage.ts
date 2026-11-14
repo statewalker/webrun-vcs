@@ -8,7 +8,7 @@
  * objects are stored compressed on disk.
  */
 
-import { deflate, inflate, slice, toArray } from "@statewalker/vcs-utils";
+import { deflate, inflate, slice } from "@statewalker/vcs-utils";
 import type { RawStorage } from "./raw-storage.js";
 
 /**
@@ -20,6 +20,14 @@ export interface CompressedRawStorageOptions {
    * Git uses ZLIB format (raw: false), which is the default.
    */
   raw?: boolean;
+  /**
+   * The store holds git loose objects (`"<type> <size>\0" + content`), so
+   * `size` may read the size from the object header instead of inflating the
+   * whole stream. Off by default: other content could start with bytes that
+   * look like a header, and a truncated object would report the size its
+   * header declares instead of -1.
+   */
+  gitObjects?: boolean;
 }
 
 /**
@@ -37,6 +45,7 @@ export interface CompressedRawStorageOptions {
  */
 export class CompressedRawStorage implements RawStorage {
   private readonly rawDeflate: boolean;
+  private readonly gitObjects: boolean;
 
   /**
    * Create a compressed raw storage wrapper
@@ -49,6 +58,7 @@ export class CompressedRawStorage implements RawStorage {
     options?: CompressedRawStorageOptions,
   ) {
     this.rawDeflate = options?.raw ?? false;
+    this.gitObjects = options?.gitObjects ?? false;
   }
 
   /**
@@ -114,23 +124,50 @@ export class CompressedRawStorage implements RawStorage {
   /**
    * Get uncompressed content size for a key
    *
-   * Note: This requires reading and decompressing the content to get the
-   * actual uncompressed size. For performance, consider caching sizes
-   * if you need to call this frequently.
+   * The stored zlib stream does not record its length, so the content is
+   * inflated and counted as it streams (never collected); a stream that does
+   * not inflate (truncated, corrupt) gives -1. With `gitObjects: true` the
+   * content is a git loose object (`"<type> <size>\0" + content`) and the size
+   * is the header's length plus the size it declares, so only the start of
+   * the stream is inflated; the rest is not checked.
    *
    * @param key Storage key
-   * @returns Uncompressed content size, or -1 if key not found
+   * @returns Uncompressed content size, or -1 if key not found or unreadable
    */
   async size(key: string): Promise<number> {
     if (!(await this.inner.has(key))) {
       return -1;
     }
-    // Must decompress to get actual size
+    const it = inflate(this.inner.load(key), { raw: this.rawDeflate })[Symbol.asyncIterator]();
+    let head: number[] | undefined = this.gitObjects ? [] : undefined;
+    let total = 0;
     try {
-      const chunks = await toArray(this.load(key));
-      return chunks.reduce((total, chunk) => total + chunk.length, 0);
+      for (let r = await it.next(); !r.done; r = await it.next()) {
+        total += r.value.length;
+        if (!head) continue;
+        for (const b of r.value.subarray(0, GIT_HEADER_MAX - head.length)) head.push(b);
+        const header = parseGitHeader(head);
+        if (header !== undefined) return header;
+        if (head.length >= GIT_HEADER_MAX || head.includes(0)) head = undefined;
+      }
+      return total;
     } catch {
       return -1;
+    } finally {
+      await it.return?.();
     }
   }
+}
+
+/** "commit " plus 16 digits plus NUL fits. */
+const GIT_HEADER_MAX = 32;
+
+/** Header length plus declared size of a git object header in `bytes`, if they start with one. */
+function parseGitHeader(bytes: number[]): number | undefined {
+  const nul = bytes.indexOf(0);
+  if (nul < 0) return undefined;
+  const text = String.fromCharCode(...bytes.slice(0, nul));
+  const m = /^(blob|tree|commit|tag) (0|[1-9][0-9]{0,15})$/.exec(text);
+  if (!m) return undefined;
+  return nul + 1 + Number(m[2]);
 }

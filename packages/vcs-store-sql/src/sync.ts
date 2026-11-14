@@ -91,9 +91,11 @@ export async function importToNative(
         if (await nativeStores.blobs.has(id)) continue;
 
         // Load content from Git store
+        // With the size, the target stores the blob in one pass.
+        const size = await gitStores.blobs.size(id);
         const content = await gitStores.blobs.load(id);
-        if (!content) throw new Error(`Blob not found: ${id}`);
-        await nativeStores.blobs.store(content);
+        if (!content || size < 0) throw new Error(`Blob not found: ${id}`);
+        await nativeStores.blobs.store(content, size);
         count++;
         break;
       }
@@ -181,9 +183,11 @@ export async function exportToGit(
         if (await gitStores.blobs.has(id)) continue;
 
         // Load content from native store
+        // With the size, the target stores the blob in one pass.
+        const size = await nativeStores.blobs.size(id);
         const content = await nativeStores.blobs.load(id);
-        if (!content) throw new Error(`Blob not found: ${id}`);
-        await gitStores.blobs.store(content);
+        if (!content || size < 0) throw new Error(`Blob not found: ${id}`);
+        await gitStores.blobs.store(content, size);
         count++;
         break;
       }

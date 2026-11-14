@@ -21,7 +21,17 @@ export interface GcRunOptions {
   compact?: boolean;
   /** If true, run aggressive optimization (deltification) */
   aggressive?: boolean;
+  /**
+   * Remove leftovers of interrupted writes (temporaries, orphaned chunks) older
+   * than this. Default `DEFAULT_STALE_EXPIRY_MS` (two weeks, git's prune expiry).
+   * 0 removes every leftover not in use by a write running in this process;
+   * use it only when no other process writes to the store.
+   */
+  staleExpiryMs?: number;
 }
+
+/** Default `GcRunOptions.staleExpiryMs`: two weeks, as `git gc` prunes `tmp_obj_*`. */
+export const DEFAULT_STALE_EXPIRY_MS = 14 * 24 * 60 * 60 * 1000;
 
 /**
  * Result of a GC run.
@@ -37,6 +47,8 @@ export interface GcRunResult {
   deltasCreated?: number;
   /** Storage statistics after GC */
   stats?: StorageStats;
+  /** Leftovers of interrupted writes removed (`GitObjects.sweepStale`, `GcStrategy.sweepStale`) */
+  removedTemporaries?: number;
 }
 
 /**
@@ -62,12 +74,18 @@ export class GcOrchestrator {
    * 1. Collect ref tips via history.refs.list() + resolve()
    * 2. Walk reachable objects via history.collectReachableObjects()
    * 3. Compute unreachable = allStoredObjects - reachable
-   * 4. Call strategy.prune(unreachable)
+   * 4. Call strategy.prune(unreachable), then sweep stale temporaries
+   *    (`history.objects.sweepStale`, `strategy.sweepStale`)
    * 5. Optionally call strategy.compact()
    * 6. Optionally call strategy.deltify() (aggressive mode)
    */
   async run(options: GcRunOptions = {}): Promise<GcRunResult> {
-    const { dryRun = false, compact = false, aggressive = false } = options;
+    const {
+      dryRun = false,
+      compact = false,
+      aggressive = false,
+      staleExpiryMs = DEFAULT_STALE_EXPIRY_MS,
+    } = options;
 
     // Step 1: Collect ref tips
     const refTips = await this.collectRefTips();
@@ -93,6 +111,13 @@ export class GcOrchestrator {
       prunedObjects,
       reachableObjects: reachable.size,
     };
+
+    // Step 4b: leftovers of interrupted writes (mem, KV and SQL raw stores; SQL native blobs)
+    if (!dryRun) {
+      result.removedTemporaries =
+        ((await this.history.objects?.sweepStale?.({ olderThanMs: staleExpiryMs })) ?? 0) +
+        ((await this.strategy.sweepStale?.(staleExpiryMs)) ?? 0);
+    }
 
     // Step 5: Compact
     if (compact && !dryRun) {

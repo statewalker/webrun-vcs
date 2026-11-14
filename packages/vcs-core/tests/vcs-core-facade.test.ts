@@ -241,3 +241,20 @@ describe("VcsCore facade over the storage seam", () => {
     });
   });
 });
+
+describe("VcsCore.writeBlob with a known size", () => {
+  it("writes in one pass and refuses content that is not that long", async () => {
+    const vcs = newVcsCore();
+    const payload = new TextEncoder().encode("hello\n");
+    const stream = () =>
+      (async function* () {
+        yield payload;
+      })();
+    expect(await vcs.writeBlob(stream(), { size: 6 })).toBe(
+      "ce013625030ba8dba906f756967f9e9ca394464a",
+    );
+    await expect(vcs.writeBlob(stream(), { size: 7 })).rejects.toMatchObject({
+      name: "SizeMismatchError",
+    });
+  });
+});

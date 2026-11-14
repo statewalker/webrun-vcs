@@ -196,6 +196,8 @@ each in its own transaction:
 | 2 | `delta_content_table` | `delta_content` |
 | 3 | `high_level_stores` | `tree`, `tree_entry`, `vcs_commit`, `commit_parent`, `vcs_tag`, `vcs_ref`, `staging_entry` |
 | 4 | `extended_query_indexes` | indexes on author/committer email and time, message, tag name/tagger/type, `tree_entry.object_id` |
+| 5 | `reflog` | `vcs_reflog` |
+| 6 | `raw_store_chunks` | adds `chunk_count` and `chunk_token` to existing `raw_objects` / `raw_store` tables and creates their `<table>_chunk` tables |
 
 No store reads or writes the version 1 and 2 tables. Other tables are created on first use by the
 store that owns them: `vcs_blob` and `vcs_blob_chunk` (native blobs), `blob_delta`, `tree_delta`,
@@ -218,9 +220,46 @@ table. Use it when you only need Git-compatible storage in SQLite and no queries
 
 Blobs up to 256 KiB are stored inline in `vcs_blob`, uncompressed. Larger blobs are split into
 256 KiB chunks in `vcs_blob_chunk`, each compressed with `compressBlock` from
-`@statewalker/vcs-utils`, and streamed back chunk by chunk on `load`. 256 KiB keeps each row a
-reasonable BLOB for SQLite while bounding memory per chunk. The whole blob is still read once to
-compute its SHA-1 before it is written.
+`@statewalker/vcs-utils`, written as they stream in and read back one row at a time on `load`.
+256 KiB keeps each row a reasonable BLOB for SQLite while bounding memory per chunk.
+
+```typescript
+const blobs = new SqlNativeBlobStoreImpl(db);
+await blobs.store(file.stream(), file.size); // hashed while its chunks are written: one pass
+await blobs.store(response.body); // unknown size: chunks first, then read back to hash
+```
+
+With the size, the SHA-1 is computed while the chunks are written under a temporary
+`tmp:<random hex>` row, which is renamed to the blob id at the end (or dropped when that blob already
+exists). Without it, the database itself is the spool: the chunks are written first, then read
+back to compute the id, because a git id hashes the size before the content.
+
+### Raw storage is chunked too
+
+`SqlRawStore` keeps a value up to one chunk (256 KiB by default) in one row of its table, the
+layout older versions used for every value. A longer value is written as `(token, seq)` rows of
+`<table>_chunk` while it streams in; its main row then holds the size, the chunk count and the
+token. `load()` reads only the chunk rows a range touches. `move(from, to)` updates one small
+row, so `rawStorageStaging` streams a git object into a temporary key and renames it.
+`SqlRawStore` upgrades a table of the old layout on first use (adding the two columns and the
+chunk table), and migration 6 does the same for `raw_objects` and `raw_store`; old rows keep
+reading as they are. Rolling migration 6 back loses data: the rows of values kept in chunks
+(`chunk_token` set) are deleted, since the old layout cannot express them, and the chunk tables
+are dropped; single-row values stay.
+
+### Leftovers of interrupted writes
+
+Chunk rows are inserted before their value's row is published, outside a transaction, so a process
+that dies mid-write leaves chunk rows no row references; `SqlRawStore.sweepStale({ olderThanMs })`
+removes them once their token (a `timestampedId`) is older than `olderThanMs`. The native blob
+store's `sweepStale` removes `tmp:*` placeholder rows older than that (by `created_at`) with their
+chunks, and chunk rows of no blob. Neither touches a write running in this process.
+`GcOrchestrator` reaches the raw store through `history.objects.sweepStale` and the native blobs
+through `SqlGcStrategy.sweepStale`.
+
+Overwrites of a raw key are last writer wins, and a reader streaming a value while it is
+overwritten or removed may fail with `Missing chunk`. Git objects never meet this:
+`rawStorageStaging` keeps an id that is already stored instead of writing it again.
 
 ### What will surprise you
 

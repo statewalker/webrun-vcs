@@ -101,6 +101,8 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
   return {
     put: (type, size, content) => loose.put(type, size, content),
 
+    putUnsized: (type, content) => loose.putUnsized(type, content),
+
     async putRaw(id, raw) {
       // As JGit's ObjectDirectory.insertUnpackedObject: an object already packed is
       // not written again (git's "freshen" of a packed object is a no-op here).

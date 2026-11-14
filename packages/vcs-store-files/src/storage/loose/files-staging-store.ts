@@ -8,6 +8,7 @@
  * Memory per write depends on the FilesApi: one whose `write` streams keeps it
  * bounded; one that collects the chunks first (the in-memory FilesApi, and the
  * Node one in `@statewalker/webrun-files-node` 0.10) holds the compressed object.
+ * Content of unknown size is spooled (`spool`) to a `tmp_obj_*` file first.
  *
  * A write of an object whose loose file is older than `freshenMaxAgeMs` (one hour by default)
  * moves the new temporary over it, so the rename renews its mtime and a concurrent gc keeps it
@@ -116,6 +117,34 @@ export function filesStagingStore(
       } finally {
         if (!moved) await files.remove(tmp).catch(() => false);
       }
+    },
+
+    async spool(content) {
+      // A tmp_obj_ file: native git ignores it and sweepStaged removes it after a crash.
+      await ensureDir(objectsDir);
+      const tmp = joinPath(objectsDir, tmpName());
+      let size = 0;
+      try {
+        await files.write(
+          tmp,
+          (async function* () {
+            for await (const chunk of content) {
+              size += chunk.length;
+              yield chunk;
+            }
+          })(),
+        );
+      } catch (e) {
+        await files.remove(tmp).catch(() => false);
+        throw e;
+      }
+      return {
+        size,
+        read: () => files.read(tmp),
+        dispose: async () => {
+          await files.remove(tmp).catch(() => false);
+        },
+      };
     },
 
     async *get(id) {

@@ -104,6 +104,12 @@ export interface SqlNativeBlobStore extends Blobs {
    * Get total size of all blobs in the store
    */
   totalSize(): Promise<number>;
+
+  /**
+   * Remove placeholder rows of interrupted writes older than `olderThanMs`, and
+   * chunk rows of no blob. Optional; `SqlGcStrategy` calls it when present.
+   */
+  sweepStale?(options: { olderThanMs: number }): Promise<number>;
 }
 
 /**

@@ -76,4 +76,30 @@ export interface RawStorage {
    * @returns Content size in bytes, or -1 if key not found
    */
   size(key: string): Promise<number>;
+
+  /**
+   * Rename a value without copying its bytes, replacing what `to` held. Optional:
+   * stores that can do this cheaply (a map entry, a manifest row, a file rename)
+   * offer it, and `rawStorageStaging` then streams a write into a temporary key
+   * and renames it once the object id is known, instead of collecting the bytes.
+   *
+   * @returns True if `from` existed and was moved, false if it did not exist
+   */
+  move?(from: string, to: string): Promise<boolean>;
+
+  /**
+   * Remove storage that no key reaches any more and that is older than
+   * `olderThanMs`: what an interrupted write or a lost race left behind (the
+   * KV store's unreferenced chunks, the SQL store's unreferenced chunk rows).
+   * Optional; `rawStorageStaging(raw).sweepStale` calls it, and gc calls that.
+   * Must not remove the parts of a write still in progress.
+   *
+   * @returns The number of leftovers removed
+   */
+  sweepStale?(options: SweepStaleOptions): Promise<number>;
+}
+
+/** What `sweepStale` removes: leftovers older than `olderThanMs` (0 or less: every leftover not in use). */
+export interface SweepStaleOptions {
+  olderThanMs: number;
 }

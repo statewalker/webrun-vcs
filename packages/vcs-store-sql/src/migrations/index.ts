@@ -5,6 +5,7 @@
  * Fossil's proven patterns.
  */
 
+import { upgradeRawStoreTable } from "../binary-storage/sql-raw-store.js";
 import type { DatabaseClient } from "../database-client.js";
 
 /**
@@ -19,7 +20,20 @@ export interface Migration {
   up: string;
   /** SQL statements to revert migration (semicolon-separated) */
   down: string;
+  /**
+   * Steps plain SQL cannot express (such as adding a column only where it is
+   * missing), run after `up` in the same transaction, on its client.
+   */
+  upgrade?: (db: DatabaseClient) => Promise<void>;
+  /**
+   * Steps plain SQL cannot express on the way back (such as touching a table
+   * only where it exists), run before `down` in the same transaction.
+   */
+  downgrade?: (db: DatabaseClient) => Promise<void>;
 }
+
+/** The table names `SqlRawStore` users get by default (`createSqlObjectStores`, `SqlBinStore`). */
+const DEFAULT_RAW_TABLES = ["raw_objects", "raw_store"];
 
 /**
  * All migrations in order
@@ -249,6 +263,39 @@ export const migrations: Migration[] = [
       DROP TABLE IF EXISTS vcs_reflog;
     `,
   },
+  {
+    version: 6,
+    name: "raw_store_chunks",
+    // Raw-store tables of the old single-row layout get the chunk columns and a
+    // `<table>_chunk` table; their rows stay as they are and keep reading.
+    // `SqlRawStore` does the same for any table name before first use.
+    up: "",
+    upgrade: async (db) => {
+      for (const table of DEFAULT_RAW_TABLES) {
+        const found = await db.query<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+          [table],
+        );
+        if (found.length > 0) await upgradeRawStoreTable(db, table);
+      }
+    },
+    // Data loss: values stored in chunks cannot be expressed in the old layout.
+    // Their rows (`chunk_token` set, empty `data`) would read as empty values
+    // there, so they are deleted before the chunk tables are dropped. The added
+    // columns stay (harmless to the old layout); single-row values are kept.
+    downgrade: async (db) => {
+      for (const table of DEFAULT_RAW_TABLES) {
+        const columns = await db.query<{ name: string }>(`PRAGMA table_info(${table})`);
+        if (columns.some((c) => c.name === "chunk_token")) {
+          await db.execute(`DELETE FROM ${table} WHERE chunk_token IS NOT NULL`);
+        }
+      }
+    },
+    down: `
+      DROP TABLE IF EXISTS raw_objects_chunk;
+      DROP TABLE IF EXISTS raw_store_chunk;
+    `,
+  },
 ];
 
 /**
@@ -283,6 +330,7 @@ export async function initializeSchema(db: DatabaseClient): Promise<void> {
         for (const stmt of statements) {
           await tx.execute(stmt);
         }
+        await migration.upgrade?.(tx);
 
         // Record migration
         await tx.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [
@@ -313,6 +361,7 @@ export async function rollbackMigration(db: DatabaseClient, targetVersion: numbe
 
   for (const migration of toRollback) {
     await db.transaction(async (tx) => {
+      await migration.downgrade?.(tx);
       // Split and run rollback statements
       const statements = splitStatements(migration.down);
       for (const stmt of statements) {

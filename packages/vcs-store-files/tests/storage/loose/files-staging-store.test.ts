@@ -4,8 +4,9 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdir, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createGitObjects } from "@statewalker/vcs-core";
 import { createGitObjectsTests } from "@statewalker/vcs-testing";
 import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
@@ -44,14 +45,54 @@ function gitRepo(): { dir: string; files: ReturnType<typeof createNodeFilesApi> 
 }
 
 createGitObjectsTests("Files (in memory)", async () => {
-  const store = filesStagingStore(createInMemoryFilesApi(), "/repo/.git/objects");
-  return { objects: createGitObjects(store), store };
+  const files = createInMemoryFilesApi();
+  // counts the bytes FilesApi.write has taken in, for the bounded-memory test
+  let persisted = 0;
+  const write = files.write.bind(files);
+  files.write = (path, content) =>
+    write(
+      path,
+      (async function* () {
+        for await (const c of content) {
+          persisted += c.length;
+          yield c;
+        }
+      })(),
+    );
+  const store = filesStagingStore(files, "/repo/.git/objects");
+  return { objects: createGitObjects(store), store, persistedBytes: () => persisted };
 });
 
 createGitObjectsTests("Files (Node)", async () => {
   const dir = tempDir("loose-node-");
   const store = filesStagingStore(createNodeFilesApi({ rootDir: dir }), ".git/objects");
   return { objects: createGitObjects(store), store };
+});
+
+/**
+ * `NodeFilesApi.write` in webrun-files-node 0.10 collects a file before writing it, so the
+ * bounded-memory test runs on a Node FilesApi whose `write` appends each chunk to the file
+ * as it arrives, counting the bytes on disk.
+ */
+createGitObjectsTests("Files (Node, streaming write)", async () => {
+  const dir = tempDir("loose-node-stream-");
+  const files = createNodeFilesApi({ rootDir: dir });
+  let persisted = 0;
+  files.write = async (path, content) => {
+    const real = join(dir, path);
+    await mkdir(dirname(real), { recursive: true });
+    const handle = await open(real, "w");
+    try {
+      for await (const c of content) {
+        await handle.write(c);
+        persisted += c.length;
+      }
+    } finally {
+      await handle.close();
+    }
+  };
+  const store = filesStagingStore(files, ".git/objects");
+  return { objects: createGitObjects(store), store, persistedBytes: () => persisted };
 });
 
 const enc = new TextEncoder();
@@ -148,6 +189,47 @@ describe("loose objects and native git", () => {
     await expect(
       objects.putRaw("7d6fc2b2c5d4cf3b5c4f2f33fa1e4b7e1d9f8b0a", [enc.encode("blub 1\0x")]),
     ).rejects.toMatchObject({ name: "CorruptObjectError" });
+    expect(readdirSync(join(dir, ".git/objects")).filter((n) => n.startsWith("tmp_obj_"))).toEqual(
+      [],
+    );
+  });
+});
+
+describe("filesStagingStore.spool", () => {
+  it("spools content of unknown size to a tmp_obj_ file, which git does not see, and removes it", async () => {
+    const { dir, files } = gitRepo();
+    const store = filesStagingStore(files, ".git/objects");
+    const spooled = await store.spool?.(
+      (async function* () {
+        yield enc.encode("hel");
+        yield enc.encode("lo\n");
+      })(),
+    );
+    expect(spooled?.size).toBe(6);
+    expect(await text(spooled?.read() ?? (async function* () {})())).toBe("hello\n");
+    const tmp = () =>
+      readdirSync(join(dir, ".git/objects")).filter((n) => n.startsWith("tmp_obj_"));
+    expect(tmp()).toHaveLength(1);
+    await spooled?.dispose();
+    expect(tmp()).toEqual([]);
+  });
+
+  it("putUnsized above the threshold goes through the spool and git reads the object", async () => {
+    const { dir, files } = gitRepo();
+    const store = filesStagingStore(files, ".git/objects");
+    let spooled = 0;
+    const spool = store.spool?.bind(store);
+    if (!spool) throw new Error("filesStagingStore has no spool");
+    store.spool = async (c) => {
+      const s = await spool(c);
+      spooled = s.size;
+      return s;
+    };
+    const objects = createGitObjects(store, { spoolThreshold: 4 });
+    const id = await objects.putUnsized("blob", [enc.encode("hel"), enc.encode("lo\n")]);
+    expect(id).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
+    expect(spooled).toBe(6);
+    expect(git(dir, ["cat-file", "-p", id])).toBe("hello");
     expect(readdirSync(join(dir, ".git/objects")).filter((n) => n.startsWith("tmp_obj_"))).toEqual(
       [],
     );

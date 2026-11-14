@@ -77,8 +77,13 @@ export interface VcsCore {
   /** Read an annotated tag; throws if the id is not a stored tag. */
   readTag(id: Oid): Promise<Tag>;
 
-  /** Store blob bytes, returning the object id. */
-  writeBlob(bytes: ByteStream): Promise<Oid>;
+  /**
+   * Store blob bytes, returning the object id. With `size`, the bytes are read
+   * once and never held in memory (they must be exactly `size` long, or the
+   * write rejects with `SizeMismatchError`); without it, they are read twice
+   * (small content in memory, longer content spooled; see `Blobs.store`).
+   */
+  writeBlob(bytes: ByteStream, options?: { size?: number }): Promise<Oid>;
   /** Store a tree from entries, returning the object id. */
   writeTree(entries: TreeEntry[]): Promise<Oid>;
   /** Store a commit, returning the object id. */
@@ -163,8 +168,8 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
       return tag;
     },
 
-    writeBlob(bytes: ByteStream): Promise<Oid> {
-      return history.blobs.store(bytes);
+    writeBlob(bytes: ByteStream, options?: { size?: number }): Promise<Oid> {
+      return history.blobs.store(bytes, options?.size);
     },
 
     writeTree(entries: TreeEntry[]): Promise<Oid> {
