@@ -534,6 +534,12 @@ export const clientFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               const pkt = await transport.readPktLine();
               if (pkt.type === "flush" || pkt.type === "eof") return;
               if (pkt.type !== "data" || pkt.payload.length < 1) continue;
+              // "ERR <message>" comes as a plain pkt-line, not on a sideband channel
+              const text = decoder.decode(pkt.payload.subarray(0, 4));
+              if (text === "ERR ") {
+                sidebandError = decoder.decode(pkt.payload.subarray(4)).trimEnd();
+                throw new Error(`Server error: ${sidebandError}`);
+              }
               const channel = pkt.payload[0];
               const data = pkt.payload.subarray(1);
               if (channel === 1) {

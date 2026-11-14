@@ -193,9 +193,10 @@ export async function httpFetch(
     // arrives (never held whole). A server error (channel 3) rejects the import.
     let objectsImported = 0;
     let packBytes = 0;
+    let pack: AsyncGenerator<Uint8Array> | undefined;
     try {
       const demuxed = sidebandPackStream(readableStreamToAsyncIterable(uploadPackResponse.body));
-      const pack = (async function* () {
+      pack = (async function* () {
         for await (const chunk of demuxed) {
           packBytes += chunk.length;
           yield chunk;
@@ -207,6 +208,9 @@ export async function httpFetch(
       }
       objectsImported = importResult.objectsImported;
     } catch (error) {
+      // a failed import releases the response: stop the stream, or cancel a body never read
+      await pack?.return(undefined).catch(() => {});
+      if (!uploadPackResponse.body.locked) await uploadPackResponse.body.cancel().catch(() => {});
       if (error instanceof ServerError) return { success: false, error: error.message };
       throw error;
     }

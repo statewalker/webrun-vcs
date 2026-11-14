@@ -757,3 +757,18 @@ describe("RECEIVE_PACK without a pack", () => {
     expect(ctx.output.error).toMatch(/no pack/);
   });
 });
+
+describe("RECEIVE_PACK with an ERR line", () => {
+  it("reports the server's message", async () => {
+    const transport = createMockTransport();
+    transport._setPackets([
+      { type: "data", payload: new TextEncoder().encode("ERR upload-pack: not our ref\n") },
+      { type: "flush" },
+    ]);
+    const ctx = createContext({ transport });
+    ctx.state.capabilities.add("side-band-64k");
+    const event = await clientFetchHandlers.get("RECEIVE_PACK")?.(ctx);
+    expect(event).toBe("SIDEBAND_ERROR");
+    expect(ctx.output.error).toBe("upload-pack: not our ref");
+  });
+});

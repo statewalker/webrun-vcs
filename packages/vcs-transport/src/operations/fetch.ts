@@ -5,7 +5,6 @@
  * over HTTP/HTTPS.
  */
 
-import { readableStreamToAsyncIterable } from "../adapters/http/http-duplex.js";
 import type { ProgressInfo } from "../api/credentials.js";
 import type { RawFetchResult } from "../api/fetch-result.js";
 import type { BaseFetchOptions, BaseHttpOptions } from "../api/options.js";
@@ -79,9 +78,17 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
   const controller = options.timeout ? new AbortController() : undefined;
   const fromServer = async <T>(wait: () => Promise<T>): Promise<T> => {
     if (!controller) return wait();
-    const timer = setTimeout(() => controller.abort(), options.timeout);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Rejects on its own as well as aborting: a fetchImpl or body that ignores the signal
+    // would otherwise leave a stalled server waited on forever.
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new DOMException("The server did not answer in time", "AbortError"));
+      }, options.timeout);
+    });
     try {
-      return await wait();
+      return await Promise.race([wait(), timedOut]);
     } finally {
       clearTimeout(timer);
     }
@@ -230,16 +237,28 @@ export async function fetch(options: FetchOptions): Promise<HttpFetchResult> {
     // Demultiplex the response as it arrives: the pack flows to onPack (or is collected)
     let bytesReceived = 0;
     const body = (async function* () {
-      const it = readableStreamToAsyncIterable(responseBody)[Symbol.asyncIterator]();
+      // The reader itself, not a generator over it: after a timeout a read is still pending,
+      // and only reader.cancel() ends it (a generator's return() would wait behind that read).
+      const reader = responseBody.getReader();
+      let ended = false;
       try {
         while (true) {
-          const r = await fromServer(() => it.next());
-          if (r.done) return;
+          const r = await fromServer(() => reader.read());
+          if (r.done) {
+            ended = true;
+            return;
+          }
+          if (!r.value) continue;
           bytesReceived += r.value.length;
           yield r.value;
         }
       } finally {
-        await it.return?.(); // cancels the body when stopped early
+        if (!ended) await reader.cancel().catch(() => {}); // stopped early: cancel the body
+        try {
+          reader.releaseLock();
+        } catch {
+          // a read still settling
+        }
       }
     })();
     const onProgress = options.onProgressMessage;

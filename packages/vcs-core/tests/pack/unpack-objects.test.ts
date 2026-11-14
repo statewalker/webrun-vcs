@@ -615,3 +615,20 @@ describe("unpackObjects: waiting deltas and big objects", () => {
     expect((err as Error).message).toMatch(new RegExp(Aid));
   });
 });
+
+describe("importPack: a failing source cleanup", () => {
+  it("does not hide the import's own error", async () => {
+    const bad = pack([{ kind: 3, data: A }]).slice();
+    bad[20] = (bad[20] as number) ^ 0xff;
+    const inner = chunks(bad, 8)[Symbol.asyncIterator]();
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => inner.next(),
+        return: async () => {
+          throw new Error("socket cleanup failed");
+        },
+      }),
+    };
+    await expect(importPack(memObjects(), source)).rejects.toBeInstanceOf(PackError);
+  });
+});

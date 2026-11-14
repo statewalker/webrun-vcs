@@ -306,3 +306,65 @@ describe("httpFetch: no pack after the wants", () => {
     expect(updates).toEqual([]);
   });
 });
+
+describe("fetch: a timeout without a cooperating fetchImpl", () => {
+  it("cuts off a stalled server even when the body ignores the abort signal", async () => {
+    const url = "https://example.com/repo.git";
+    const enc = new TextEncoder();
+    const pkt = (s: string) => (s.length + 4).toString(16).padStart(4, "0") + s;
+    const id = "a".repeat(40);
+    const advertisement = enc.encode(
+      `${pkt("# service=git-upload-pack\n")}0000${pkt(`${id} HEAD\0side-band-64k ofs-delta\n`)}${pkt(`${id} refs/heads/main\n`)}0000`,
+    );
+    const deaf = async (request: Request): Promise<Response> => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
+      await request.arrayBuffer();
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode(pkt("NAK\n")));
+          }, // never sends more, never errors
+        }),
+      );
+    };
+    await expect(fetchPack({ url, fetchImpl: deaf, timeout: 50 })).rejects.toThrow(/timeout/);
+  }, 5000);
+});
+
+describe("httpFetch: a failed import", () => {
+  it("cancels the response body even when the importer never read it", async () => {
+    const { httpFetch } = await import("../../src/adapters/http/http-client.js");
+    let cancelled = false;
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const u = String(input);
+      if (u.endsWith("/info/refs?service=git-upload-pack")) return new Response(advertisement);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(pkt("NAK\n")));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+      );
+    }) as typeof fetch;
+    const repository = {
+      has: async () => false,
+      importPack: async () => {
+        throw new Error("store unavailable");
+      },
+    };
+    const refStore = { listAll: async () => new Map<string, string>(), update: async () => {} };
+    const r = await httpFetch(
+      "https://example.test/repo.git",
+      repository as never,
+      refStore as never,
+      { fetchFn },
+    );
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/store unavailable/);
+    expect(cancelled).toBe(true);
+  });
+});

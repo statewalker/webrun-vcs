@@ -82,7 +82,8 @@ export async function importPack(
       head.length = 0;
       for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
     } finally {
-      await it.return?.();
+      // a source whose cleanup fails must not hide the import's own error
+      await it.return?.()?.catch?.(() => {});
     }
   })();
   const count = seen >= 12 ? headerCount(head) : 0;
