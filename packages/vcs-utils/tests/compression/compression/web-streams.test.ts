@@ -343,3 +343,50 @@ describe("format compatibility", () => {
     }
   });
 });
+
+describe("deflateWeb: early stop and source errors", () => {
+  /** An endless source that records whether it was closed. */
+  function endless() {
+    const state = { closed: false, pulled: 0 };
+    const source: ByteStream = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            state.pulled++;
+            return { done: false, value: crypto.getRandomValues(new Uint8Array(64 * 1024)) };
+          },
+          async return() {
+            state.closed = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    return { source, state };
+  }
+
+  it("closes the source when the consumer stops early", async () => {
+    const { source, state } = endless();
+    for await (const _ of deflateWeb(source)) break;
+    expect(state.closed).toBe(true);
+  });
+
+  it("closes the source when the consumer throws", async () => {
+    const { source, state } = endless();
+    await expect(
+      (async () => {
+        for await (const _ of deflateWeb(source)) throw new Error("consumer failed");
+      })(),
+    ).rejects.toThrow("consumer failed");
+    expect(state.closed).toBe(true);
+  });
+
+  it("rethrows the source's own error unchanged", async () => {
+    class SourceError extends Error {}
+    async function* failing(): ByteStream {
+      yield new Uint8Array(10);
+      throw new SourceError("source failed");
+    }
+    await expect(collectStream(deflateWeb(failing()))).rejects.toBeInstanceOf(SourceError);
+  });
+});

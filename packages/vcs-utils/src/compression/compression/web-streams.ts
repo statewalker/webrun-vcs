@@ -17,51 +17,56 @@ function getFormat(raw?: boolean): CompressionFormat {
 }
 
 /**
- * Compress a stream using DEFLATE (Web implementation)
+ * Compress a stream using DEFLATE (Web implementation).
+ *
+ * Input is pulled as the compressor accepts it. When the consumer stops early
+ * or fails, the compression stream is cancelled and the source closed (its
+ * `return()` runs), so no pump or zlib state is left behind. An error from the
+ * source is rethrown unchanged; compressor errors become `CompressionError`.
  */
 export async function* deflateWeb(
   stream: ByteStream,
   options?: StreamingCompressionOptions,
 ): ByteStream {
-  try {
-    const format = getFormat(options?.raw);
-    const compressionStream = new CompressionStream(format);
-    const writer = compressionStream.writable.getWriter();
+  const cs = new CompressionStream(getFormat(options?.raw));
+  const writer = cs.writable.getWriter();
+  const reader = cs.readable.getReader();
+  let sourceError: { error: unknown } | undefined;
+  const pump = (async () => {
     try {
-      const reader = compressionStream.readable.getReader();
-      // Read and yield compressed chunks
-      try {
-        // Start writing input stream to compression stream
-        const writePromise = (async () => {
-          try {
-            for await (const chunk of stream) {
-              await writer.write(chunk as unknown as BufferSource);
-            }
-            await writer.close();
-          } catch (err) {
-            await writer.abort(err);
-            throw err;
-          }
-        })();
-        // Prevent unhandled rejection if generator is aborted before await
-        writePromise.catch(() => {});
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          yield value;
-        }
-
-        // Ensure write completed without error
-        await writePromise;
-      } finally {
-        reader.releaseLock();
-      }
-    } finally {
-      writer.releaseLock();
+      for await (const chunk of stream) await writer.write(chunk as unknown as BufferSource);
+      await writer.close();
+    } catch (error) {
+      // a failed write after a cancel lands here too; only the source's own error matters
+      sourceError ??= { error };
+      await writer.abort(error).catch(() => {});
     }
-  } catch (error) {
-    throw new CompressionError(`Web compression failed: ${error}`, error);
+  })();
+  let completed = false;
+  try {
+    for (;;) {
+      let r: ReadableStreamReadResult<Uint8Array>;
+      try {
+        r = await reader.read();
+      } catch (error) {
+        await pump;
+        if (sourceError) throw sourceError.error;
+        throw new CompressionError(`Web compression failed: ${error}`, error);
+      }
+      if (r.done) break;
+      yield r.value;
+    }
+    await pump;
+    if (sourceError) throw sourceError.error;
+    completed = true;
+  } finally {
+    if (!completed) {
+      // Stopped early or failed: cancel, so the pending write rejects and the
+      // pump's for-await exits, closing the source.
+      await reader.cancel().catch(() => {});
+      await pump.catch(() => {});
+    }
+    reader.releaseLock();
   }
 }
 
