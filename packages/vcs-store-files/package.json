@@ -39,7 +39,8 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "format:fix": "biome check --write --unsafe .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:bench": "vitest run --config vitest.bench.config.ts"
   },
   "dependencies": {
     "@statewalker/vcs-core": "workspace:^",

@@ -162,7 +162,7 @@ export class VcsRepositoryAccess implements RepositoryAccess {
       }
 
       case ObjectType.BLOB: {
-        return this.history.blobs.store([content]);
+        return this.history.blobs.store([content], content.length);
       }
 
       case ObjectType.TAG: {

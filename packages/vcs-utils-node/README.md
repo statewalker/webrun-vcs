@@ -20,7 +20,7 @@ pnpm add @statewalker/vcs-utils-node
 |-------------|----------|
 | `@statewalker/vcs-utils-node` | Everything below |
 | `@statewalker/vcs-utils-node/compression` | `createNodeCompression()`, `deflateNode`, `inflateNode`, `compressBlockNode`, `decompressBlockNode` |
-| `@statewalker/vcs-utils-node/files` | `createNodeFilesApi()`, `NodeFilesApi`, `createNodeAtomicFiles(root)` |
+| `@statewalker/vcs-utils-node/files` | `createNodeFilesApi()`, `StreamingNodeFilesApi`, `NodeFilesApi`, `createNodeAtomicFiles(root)` |
 
 The happy path is two lines at application startup:
 
@@ -59,7 +59,7 @@ const files = createNodeFilesApi({ rootDir: "/path/to/project" });
 const head = await readText(files, ".git/HEAD"); // "ref: refs/heads/main\n"
 ```
 
-Paths are resolved against `rootDir`. To open a Git repository on disk, pass this `FilesApi` to a storage backend such as `createGitFilesBackend()` from `@statewalker/vcs-store-files`.
+Paths are resolved against `rootDir`. `write` streams: each chunk goes to the file as it arrives, so writing a large object holds one chunk in memory, not the whole file (`StreamingNodeFilesApi`; the `NodeFilesApi` of `@statewalker/webrun-files-node` 0.10 collects the chunks first). A failed write can leave a partial file, so write a temporary and rename it where that matters, as git does. To open a Git repository on disk, pass this `FilesApi` to a storage backend such as `createGitFilesBackend()` from `@statewalker/vcs-store-files`.
 
 ## Internals
 

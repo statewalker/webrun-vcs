@@ -256,10 +256,20 @@ export class AddCommand implements Add {
    * Store file content as blob and return object ID.
    */
   private async storeFileContent(path: string): Promise<string> {
-    // Read content from working tree
-    const content = this.worktree.readContent(path);
-    // Store using BlobStore which handles Git header automatically
-    return await this.blobs.store(content);
+    // A regular file's size is known: the blob is written in one pass, without
+    // holding it in memory. Symlinks and anything else are collected first.
+    const entry = await this.worktree.getEntry(path);
+    const regular =
+      entry !== undefined && !entry.isDirectory && (entry.mode & 0o170000) === 0o100000;
+    if (regular) {
+      try {
+        return await this.blobs.store(this.worktree.readContent(path), entry.size);
+      } catch (e) {
+        // The file changed while it was read: store what it holds now.
+        if ((e as Error)?.name !== "SizeMismatchError") throw e;
+      }
+    }
+    return await this.blobs.store(this.worktree.readContent(path));
   }
 }
 
