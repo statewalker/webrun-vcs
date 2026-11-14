@@ -7,9 +7,10 @@
  * Migrated off the retired `@statewalker/vcs-port-webrtc`: the old path was
  * RTCDataChannel -> MessagePort (`createDataChannelPort`) -> transport `Duplex`
  * (`createMessagePortDuplex`). The new path wraps the data channel as a webrun
- * `ByteChannel` (`byteChannelFromDataChannel`), multiplexes logical calls over
- * it with `emulateMux`, and bridges each call to the git transport with
- * `webrunClientDuplex` / `serveRepoOverWebrun`.
+ * `ByteChannel` (`byteChannelFromDataChannel`), turns it into a pipe for
+ * `webrun-rpc`'s port stack (`messageTargetOverByteChannel`), multiplexes
+ * logical calls over it (`createPeerMux`: one port per call), and bridges each
+ * call to the git transport with `webrunClientDuplex` / `serveRepoOverWebrun`.
  */
 
 import { DefaultSerializationApi, type History, isSymbolicRef } from "@statewalker/vcs-core";
@@ -24,15 +25,18 @@ import {
   webrunClientDuplex,
 } from "@statewalker/vcs-transport";
 import { createVcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
-import { emulateMux } from "@statewalker/webrun-streams";
-import { byteChannelFromDataChannel } from "@statewalker/webrun-streams-signaling";
+import {
+  byteChannelFromDataChannel,
+  messageTargetOverByteChannel,
+} from "@statewalker/webrun-streams-signaling";
+import { createPeerMux as createPortStackMux, type PeerMux } from "./peer-mux.js";
 
 /**
  * A multiplexer over a single peer connection: each `call` opens a fresh
  * logical git exchange, `serve` registers this side as a git server. The two
- * peers pick opposite `side`s so `emulateMux` stream-ids never collide.
+ * peers pick opposite `side`s so their port ids never collide.
  */
-export type PeerMux = ReturnType<typeof emulateMux>;
+export type { PeerMux };
 
 /**
  * Wrap an established `RTCDataChannel` as a multiplexed peer connection.
@@ -42,7 +46,10 @@ export type PeerMux = ReturnType<typeof emulateMux>;
  *   answering peer (matches the WebRTC signaling role).
  */
 export function createPeerMux(channel: RTCDataChannel, side: "initiator" | "responder"): PeerMux {
-  return emulateMux(byteChannelFromDataChannel(channel), { side });
+  const { target, signal, maxMessageSize } = messageTargetOverByteChannel(
+    byteChannelFromDataChannel(channel),
+  );
+  return createPortStackMux(target, { side, signal, maxMessageSize });
 }
 
 /**

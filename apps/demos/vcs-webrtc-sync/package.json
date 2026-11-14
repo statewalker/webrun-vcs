@@ -31,6 +31,8 @@
     "@statewalker/webrun-files": "catalog:",
     "@statewalker/webrun-files-browser": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
+    "@statewalker/webrun-msgpack": "catalog:",
+    "@statewalker/webrun-rpc": "catalog:",
     "@statewalker/webrun-streams": "catalog:",
     "@statewalker/webrun-streams-signaling": "catalog:"
   },

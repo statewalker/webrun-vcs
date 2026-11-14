@@ -147,7 +147,7 @@ Server responses: `422 {"message":"oid does not match content"}` on a `PUT` whos
 ### Dependencies
 
 - `@statewalker/webrun-content-store`: the `ContentStore` that holds object bytes.
-- `@statewalker/webrun-http-streams`: the `HttpHandler` type returned by `serveLfs`.
+- `@statewalker/webrun-http-streams`: the `FetchHandler` type returned by `serveLfs`.
 - `@statewalker/vcs-utils`: the incremental `createSha256` and the streaming request body helpers.
 
 ### Commands

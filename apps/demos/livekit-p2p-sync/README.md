@@ -2,7 +2,7 @@
 
 ## What it is
 
-A Vite single-page app that syncs in-memory Git repositories between browsers that join the same LiveKit room. Each participant pair gets a multiplexed byte channel over LiveKit data messages (`@statewalker/webrun-streams-livekit` + `emulateMux`), every participant serves Git upload-pack and receive-pack to the others, and **Sync** runs a fetch, a fast-forward or merge, and a push with the Git wire protocol from `@statewalker/vcs-transport`. It needs a LiveKit server; for local use, `livekit-server --dev`.
+A Vite single-page app that syncs in-memory Git repositories between browsers that join the same LiveKit room. Each participant pair gets a multiplexed byte channel over LiveKit data messages (`messageTargetOverLiveKit` from `@statewalker/webrun-streams-livekit`, under `webrun-rpc`'s port stack), every participant serves Git upload-pack and receive-pack to the others, and **Sync** runs a fetch, a fast-forward or merge, and a push with the Git wire protocol from `@statewalker/vcs-transport`. It needs a LiveKit server; for local use, `livekit-server --dev`.
 
 ## Layout
 
@@ -16,13 +16,14 @@ src/
     git-peer-session.ts        createGitPeerSession(): fetch / push through mux.call
   adapters/
     webrun-git.ts              gitClientDuplex(), serveGitDispatch(): 1-byte service marker per call
+    peer-mux.ts                createPeerMux(): one webrun-rpc multiplexPort that both calls and serves
     ref-store-adapter.ts       core Refs -> transport RefStore
 ```
 
 ```
 Room (livekit-client)
   └─ per remote participant:
-       byteChannelFromLiveKit(room, identity) ─ emulateMux({ side })
+       messageTargetOverLiveKit(room, identity) ─ createPeerMux(target, { side, signal, maxMessageSize })
             ├─ mux.serve(serveGitDispatch)            answers peer's fetch and push
             └─ mux.call ─ gitClientDuplex(service)    our fetch and push
                               └─ fetchOverDuplex / pushOverDuplex
@@ -60,8 +61,11 @@ Room (livekit-client)
 3. Push `refs/heads/main:refs/heads/main` to the participant. The participant's server logs `Received push from <identity>` and redraws.
 
 ```typescript
-const mux = emulateMux(byteChannelFromLiveKit(room, identity), {
+const { target, signal, maxMessageSize } = messageTargetOverLiveKit(room, identity);
+const mux = createPeerMux(target, {
   side: localIdentity < identity ? "initiator" : "responder",
+  signal,         // aborts when the room or the participant goes; closes the mux
+  maxMessageSize, // 12 KiB: bodies are chunked under LiveKit's packet limit
 });
 
 setupGitPeerServer({ serve: mux.serve, history, serialization, onPushReceived });
@@ -76,7 +80,8 @@ Commits are written directly with the object API (`history.blobs.store`, `histor
 ## Why it is the way it is
 
 - **One channel, two Git services.** A participant must answer both fetch (upload-pack) and push (receive-pack) on the same multiplexed channel, but `serveRepoOverWebrun()` serves one fixed service. So each call starts with a one-byte marker (`0x01` upload-pack, `0x02` receive-pack) that `gitClientDuplex()` prepends and `serveGitDispatch()` reads to pick the service.
-- **Mux sides from identities.** Both ends must choose opposite `side`s so stream ids do not collide; comparing the two identities gives the same answer on both ends without any extra message.
+- **One mux for both directions.** `webrun-rpc`'s `connect` and `serve` each expect to own the mux their factory builds, and two muxes on one pipe would both read every packet. `createPeerMux` builds one `multiplexPort` and gives both a view of it, so only `mux.close()` releases the pipe.
+- **Mux sides from identities.** Both ends must choose opposite `side`s so port ids do not collide; comparing the two identities gives the same answer on both ends without any extra message.
 - **Client-side dev tokens.** With an empty token field the page signs a JWT with LiveKit's development key and secret, so a local `livekit-server --dev` works with no token service. The key and secret are public, so this only works against dev servers.
 - **Fetch into remote-tracking refs first.** Local `main` is only moved after comparing histories, so a fetch never discards local commits.
 
@@ -118,6 +123,7 @@ Commits are written directly with the object API (`history.blobs.store`, `histor
 | `@statewalker/vcs-commands`, `@statewalker/vcs-working-tree` | a `Git` facade over a memory working copy (built at startup; the demo's own actions use the object API) |
 | `@statewalker/vcs-transport` | `fetchOverDuplex`, `pushOverDuplex`, `serveRepoOverWebrun`, `webrunClientDuplex` |
 | `@statewalker/vcs-transport-adapters` | `createVcsRepositoryFacade` |
-| `@statewalker/webrun-streams` | `emulateMux` |
-| `@statewalker/webrun-streams-livekit` | `byteChannelFromLiveKit` |
+| `@statewalker/webrun-streams` | the `Duplex` type |
+| `@statewalker/webrun-rpc`, `@statewalker/webrun-msgpack` | `multiplexPort`, `connect`, `serve`, `msgpackCodec`: the port stack behind `createPeerMux` |
+| `@statewalker/webrun-streams-livekit` | `messageTargetOverLiveKit` |
 | `livekit-client` | `Room`, participant events |

@@ -125,7 +125,7 @@ On the basic fallback path the reasons are those of `@statewalker/vcs-transport-
 - `@statewalker/webrun-content-transfer`: `transfer`, `remoteStore`, `serveStore` (chunk dedup and resume).
 - `@statewalker/webrun-content-store`: the `ContentStore` and id types.
 - `@statewalker/webrun-streams`: the `Duplex` type of the chunk channel.
-- `@statewalker/webrun-http-streams`: the `HttpHandler` type returned by `serveXet`.
+- `@statewalker/webrun-http-streams`: the `FetchHandler` type returned by `serveXet`.
 
 ### Commands
 

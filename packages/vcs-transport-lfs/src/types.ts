@@ -37,7 +37,7 @@ export type TransportEvent =
   | { type: "object-downloaded"; oid: string }
   | { type: "error"; oid: string; reason: string };
 
-/** A fetch-like transport: exactly the `HttpHandler` shape, so a `serveLfs`
+/** A fetch-like transport: exactly the `FetchHandler` shape, so a `serveLfs`
  * handler can be injected directly as an in-process loopback in tests. */
 export type FetchLike = (request: Request) => Response | Promise<Response>;
 

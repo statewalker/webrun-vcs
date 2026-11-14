@@ -5,12 +5,13 @@
  * The old demo multiplexed two git services (upload-pack for fetch, receive-pack
  * for push) over ONE MessagePort with a 1-byte service handshake, then ran
  * `fetchOverDuplex`/`serveOverDuplex` on top. The new path multiplexes logical
- * calls over a webrun `emulateMux` and bridges each to the git transport with
+ * calls over `webrun-rpc`'s port stack (`createPeerMux`, one port per call) and
+ * bridges each to the git transport with
  * `webrunClientDuplex` / `serveRepoOverWebrun`.
  *
  * `serveRepoOverWebrun` serves a FIXED service, but a P2P peer must serve BOTH
  * (the remote can fetch *and* push against us). So this module keeps the old
- * 1-byte service marker, now sent as the first chunk of each mux stream: the
+ * 1-byte service marker, now sent as the first chunk of each call: the
  * client prefixes it (`gitClientDuplex`), the server reads it and dispatches to
  * the right service (`serveGitDispatch`).
  */

@@ -12,7 +12,7 @@ import type { BatchRequest, LfsResolver } from "@statewalker/vcs-transport-lfs";
 import { serveLfs, storeVerified } from "@statewalker/vcs-transport-lfs";
 import type { ContentStore } from "@statewalker/webrun-content-store";
 import { serveStore } from "@statewalker/webrun-content-transfer";
-import type { HttpHandler } from "@statewalker/webrun-http-streams";
+import type { FetchHandler } from "@statewalker/webrun-http-streams";
 import { XET_TRANSFER, type XetBatchObjectResponse, type XetBatchResponse } from "./batch.js";
 import { serveChunkChannel } from "./chunk-channel.js";
 
@@ -45,7 +45,7 @@ function recordingStore(store: ContentStore, oid: string, resolver: LfsResolver)
   };
 }
 
-export function serveXet(store: ContentStore, resolver: LfsResolver): HttpHandler {
+export function serveXet(store: ContentStore, resolver: LfsResolver): FetchHandler {
   const basic = serveLfs(store, resolver);
 
   return async (request: Request): Promise<Response> => {
