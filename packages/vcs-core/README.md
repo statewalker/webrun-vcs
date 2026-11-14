@@ -181,6 +181,35 @@ const stats = await target.serialization.importPack(pack);
 // { objectsImported: 3, treesImported: 1, commitsImported: 1, ... }
 ```
 
+### Installing packs
+
+```typescript
+import { installPack, PackError, sweepPackTemporaries } from "@statewalker/vcs-core";
+
+// `received` is the pack a fetch delivered, as an AsyncIterable<Uint8Array>
+const { packId, count, appended } = await installPack(files, ".git/objects/pack", received, {
+  // a thin pack's missing bases, from the objects the repository already has
+  externalBase: async (id) => {
+    const object = await loadObject(id); // your object lookup
+    return object && { type: object.type, data: object.bytes };
+  },
+});
+// .git/objects/pack/pack-<packId>.pack and pack-<packId>.idx are now in place
+
+// at startup or during gc: remove temporaries a crashed install left behind
+await sweepPackTemporaries(files, ".git/objects/pack", 14 * 24 * 3600 * 1000);
+```
+
+`installPack` is `git index-pack --stdin --fix-thin` over a `FilesApi`. It stores the stream as `tmp_pack_*` in the pack directory, reads it once (entry headers, every zlib stream inflated once, the CRC-32 of each entry, the trailer), resolves the deltas from each base down, writes an `.idx` v2 that is byte-identical to `git index-pack`'s, and renames the pack into place first and the idx last. Readers open packs through their `.idx`, so they never see a pack that is not complete.
+
+A thin pack, the kind every `git fetch` receives, has REF_DELTA entries whose bases are not in the pack. With `externalBase`, each missing base is asked for once, must hash to the id it was asked for, and is appended to the pack as a whole object; the pack gets a new object count and trailer, so `packId` names the completed pack and `appended` counts the added bases. Without `externalBase` a thin pack is refused. Appended bases are compressed with pako at zlib level 6, so the completed pack is valid for git but not byte-identical to the one `git index-pack --fix-thin` writes: its id differs.
+
+A corrupt or hostile pack is refused with `PackError` (a `CorruptObjectError`) and leaves nothing in the pack directory: a bad trailer, truncation, trailing bytes, broken zlib, an entry that inflates past its declared size (inflation stops at the first extra byte), a delta cycle, a missing base, or an object over `maxObjectSize` (default 1 GiB; delta results are checked before they are allocated). `maxPackSize` bounds the stream while it is stored, and a stream that does not start with `PACK` is refused at its first chunk.
+
+Resolving deltas holds the delta chain being resolved, not the pack: entries are kept in typed arrays (about 80 bytes each), resolved bases are cached up to `baseCacheBytes` (default 32 MiB) and re-derived when evicted, and entries are re-read through one window of `windowBytes` (default 1 MiB) over the stored pack. Storing the incoming pack is up to the FilesApi: the Node and in-memory ones collect a file before writing it, so there the pack is held once while it is stored (set `maxPackSize` for untrusted sources). A storage failure (EIO and the like) comes through unchanged; only a malformed pack raises `PackError`. The pack is moved into place before its idx, and a leftover pack from a crash between the two is replaced by the next install of that pack (FilesApi `move` overwrites). Not yet checked: an incoming object whose id the repository already has with other bytes (git's collision check); the pack importer adds that. An install interrupted by a crash leaves `tmp_*` files; `sweepPackTemporaries(files, packDir, olderThanMs)` removes those older than the threshold, as `git prune` does, and keeps younger ones that may belong to an install in progress.
+
+`writePackIdx(entries, packChecksum)` writes the same `.idx` v2 from a list of `{ id, offset, crc32 }`.
+
 ### The `VcsCore` facade over `@statewalker/webrun-storage`
 
 `createVcsCore()` builds the same engine over a `BlobStore` (object bytes) and a `KvStore` (refs) and returns a smaller API: arrays instead of async iterables where that is simpler, one merge base, hydrated log entries, and refs with `read` / `compareAndSet` / `list`.
