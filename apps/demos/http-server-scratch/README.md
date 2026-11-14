@@ -142,7 +142,7 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 
 ## Why it is the way it is
 
-- **Loose objects only.** `createFileHistory()` stores every object through `FileRawStorage` in `.git/objects/xx/...`, which native git reads directly. That store does not read packfiles, so the round trip explodes the received pack into loose objects with `importPack()` instead of writing a `.pack`/`.idx` pair.
+- **Loose objects only.** `createFileHistory()` stores every object through `createGitObjects(filesStagingStore(...))` in `.git/objects/xx/...`, which native git reads directly. That store does not read packfiles, so the round trip explodes the received pack into loose objects with `importPack()` instead of writing a `.pack`/`.idx` pair.
 - **The transport package owns the protocol.** The server is a thin Hono route around `createFetchHandler()`; ref advertisement, upload-pack and receive-pack all come from `@statewalker/vcs-transport`. The app's only adapters are the repository facade and a ref store over `history.refs`.
 - **`FileHistory` is the History instance itself with `objects` attached,** not a spread copy. `History` methods live on the prototype, and a spread would drop them; upload-pack would then fail with `history.collectReachableObjects is not a function`.
 - **Native git only verifies.** It is never used to create, serve, clone or push; it checks that what VCS wrote is valid Git.
@@ -159,7 +159,7 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 - **`start` deletes `repos/` first.** Step 1 removes the whole `repos/` directory under the working directory, including anything you put there for `server` mode.
 - **Run through `pnpm --filter`, the working directory is the app folder,** so `repos/` and `cloned-repo/` are created in `apps/demos/http-server-scratch/` (`repos/` is in `.gitignore`).
 - **`git status` in the clone shows `D  README.md` and `?? README.md`.** The demo writes the files and objects but no index, so native git sees the file as deleted from the index and untracked on disk. This is expected output of step 4, not a failure.
-- **Repositories served by `server` must hold loose objects.** A repository whose objects are packed (for example after `git gc`) cannot be read by `FileRawStorage`.
+- **Repositories served by `server` must hold loose objects.** A repository whose objects are packed (for example after `git gc`) cannot be read by its loose-only store (`createGitFilesBackend` reads packs through `withPacks`).
 - **`client` does not produce a usable clone.** It treats `defaultBranch` as a short name, so it writes `HEAD` as `ref: refs/heads/refs/heads/main`, finds no HEAD commit, prints `Empty repository - no checkout needed` and still reports `SUCCESS!`. It writes the received pack as `.pack`/`.idx`, which the loose-object store cannot read. With `--push` it fails with `Error: Cannot push to empty repository`. Native `git clone` against `server` works.
 
 ## Reference
@@ -186,4 +186,4 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 
 ### Dependencies
 
-`@statewalker/vcs-transport` (`createFetchHandler`, `clone`, `push`), `@statewalker/vcs-transport-adapters` (`createVcsRepositoryFacade`), `@statewalker/vcs-core` (object API, `DefaultSerializationApi`), `@statewalker/vcs-store-files` (`FileRawStorage`, `createFileRefStore`), `@statewalker/vcs-utils` and `@statewalker/vcs-utils-node` (compression, Node `FilesApi`), `hono` and `@hono/node-server` (HTTP).
+`@statewalker/vcs-transport` (`createFetchHandler`, `clone`, `push`), `@statewalker/vcs-transport-adapters` (`createVcsRepositoryFacade`), `@statewalker/vcs-core` (object API, `DefaultSerializationApi`), `@statewalker/vcs-store-files` (`filesStagingStore`, `createFileRefStore`), `@statewalker/vcs-utils` and `@statewalker/vcs-utils-node` (compression, Node `FilesApi`), `hono` and `@hono/node-server` (HTTP).

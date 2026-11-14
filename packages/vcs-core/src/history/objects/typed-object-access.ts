@@ -3,7 +3,7 @@
  * store content of unknown size, read a header, load content of one type.
  */
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjects } from "./git-objects.js";
+import { type GitObjects, InvalidObjectIdError } from "./git-objects.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 /**
@@ -55,4 +55,14 @@ export async function loadTypedObject(
     throw new Error(`Object ${id} is not a ${type} (found type: ${obj.type})`);
   }
   return { content: { [Symbol.asyncIterator]: () => it }, size: obj.size, release };
+}
+
+/** Remove an object; false if it is absent or `id` is not an object id. */
+export async function removeObject(objects: GitObjects, id: ObjectId): Promise<boolean> {
+  try {
+    return await objects.remove(id);
+  } catch (e) {
+    if (e instanceof InvalidObjectIdError) return false;
+    throw e;
+  }
 }

@@ -6,7 +6,12 @@
 
 import type { ObjectId } from "../../common/id/index.js";
 import type { GitObjects } from "../objects/git-objects.js";
-import { loadTypedObject, objectHeader, storeObject } from "../objects/typed-object-access.js";
+import {
+  loadTypedObject,
+  objectHeader,
+  removeObject,
+  storeObject,
+} from "../objects/typed-object-access.js";
 import type { TreeEntry } from "./tree-entry.js";
 import { decodeTreeEntries, EMPTY_TREE_ID, encodeTreeEntries } from "./tree-format.js";
 import type { Trees } from "./trees.js";
@@ -57,7 +62,7 @@ class GitTreeStore implements Trees {
   async remove(id: ObjectId): Promise<boolean> {
     // Git objects are content-addressed and generally immutable
     // This is implemented for interface compliance but shouldn't be used in practice
-    return this.objects.remove(id);
+    return removeObject(this.objects, id);
   }
 
   /**

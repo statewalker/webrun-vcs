@@ -1,5 +1,5 @@
 /**
- * Tests for TagsImpl using GitObjectStore with MemoryRawStorage
+ * Tests for TagsImpl using GitObjects over MemoryRawStorage
  *
  * Runs conformance tests against the new Tags implementation.
  */

@@ -1,5 +1,5 @@
 /**
- * Tests for TreesImpl using GitObjectStore with MemoryRawStorage
+ * Tests for TreesImpl using GitObjects over MemoryRawStorage
  *
  * Runs conformance tests against the new Trees implementation.
  */

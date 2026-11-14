@@ -111,3 +111,27 @@ describe("createGitFilesBackend over packs (withPacks)", () => {
     expect(git(dir, ["cat-file", "-p", `${commit}:hello.txt`])).toBe("hello");
   });
 });
+
+describe("writes skip objects already packed", () => {
+  it("history writes of packed objects create no loose files", async () => {
+    const dir = repo();
+    const blob = git(dir, ["hash-object", "-w", "--stdin"], "packed content\n");
+    const tree = git(dir, ["mktree"], `100644 blob ${blob}\tf.txt\n`);
+    const commit = git(dir, ["commit-tree", tree, "-m", "packed"]);
+    git(dir, ["update-ref", "refs/heads/main", commit]);
+    git(dir, ["gc", "-q", "--prune=now"]);
+    const { history } = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: dir }),
+    });
+    const content = new TextEncoder().encode("packed content\n");
+    expect(await history.blobs.store([content], content.length)).toBe(blob);
+    expect(await history.blobs.store([content])).toBe(blob);
+    const loaded = await history.commits.load(commit);
+    expect(loaded && (await history.commits.store(loaded))).toBe(commit);
+    const loose = readdirSync(join(dir, ".git/objects")).filter((d) => /^[0-9a-f]{2}$/.test(d));
+    expect(loose).toEqual([]);
+    expect(readdirSync(join(dir, ".git/objects")).filter((n) => n.startsWith("tmp_obj_"))).toEqual(
+      [],
+    );
+  });
+});

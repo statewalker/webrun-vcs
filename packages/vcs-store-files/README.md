@@ -44,7 +44,7 @@ Lower-level building blocks, also exported:
 
 | Area | Exports |
 | --- | --- |
-| Object kernel store | `filesStagingStore(files, objectsDir)`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packDirectory)`: a `GitObjects` that reads loose objects first, then packs |
+| Object kernel store | `filesStagingStore(files, objectsDir)`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packDirectory)`: a `GitObjects` that reads loose objects first, then packs; `skipPacked(store, packDirectory)`: a staging store that does not write objects already packed |
 | Loose objects | `FileRawStorage` (`compress` option, default `true`), `PackDirectoryAdapter` (read-only `RawStorage` over packs) |
 | Packs | `PackDirectory`, `PackReader`, `PackDeltaStore`, `PackConsolidator`, `RandomAccessDeltaReader`, `GitPackStoreImpl` / `createGitPackStore`, `DirectPackObjectReader`, `isDeltaType` |
 | Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs? })` with atomic `batch`; `createFilesRefBatch(atomicFiles)`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
@@ -195,13 +195,16 @@ around `packed-refs`, so a listing never combines states of a batch committing m
 History (blobs / trees / commits / tags / refs)
   └─ withPacks               loose objects first, then packs
        ├─ GitObjects         adds and strips the "type size\0" header, computes SHA-1
-       │    └─ filesStagingStore   read/write  .git/objects/ab/cdef...   (zlib)
+       │    └─ skipPacked         drops a write whose object is already packed
+       │         └─ filesStagingStore   read/write  .git/objects/ab/cdef...   (zlib)
        └─ PackDirectory            read-only   .git/objects/pack/*.pack + *.idx
   └─ FileRefStore            .git/HEAD, .git/refs/**, .git/packed-refs, .git/logs/**
 ```
 
-`putRaw` of an object that is already packed writes nothing, as JGit does. `gc()` and `repack()`
-still work on `FileRawStorage` (the `looseStorage` the backend returns) and `PackDirectory`.
+Writing an object that is already packed (`put` or `putRaw`) writes nothing, as git and JGit do.
+`gc()` and `repack()` still work on `FileRawStorage` (the `looseStorage` the backend returns) and
+`PackDirectory`, and ignore files in `objects/` that are not objects (such as git's
+`objects/ab/tmp_obj_*` while it writes).
 
 New objects are always written loose. Packs are only read, until `repack()` turns loose objects
 into a pack. This keeps writes simple (one file per object, no pack index to rewrite) and matches

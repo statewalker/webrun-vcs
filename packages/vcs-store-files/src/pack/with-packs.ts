@@ -1,8 +1,12 @@
 /**
- * Git's object database: loose objects first, then pack files, as git and
- * JGit's ObjectDirectory read them. Writes and removals go to the loose store;
- * packs are read-only here (repack and gc rewrite them).
+ * Git's object database: loose objects and pack files. Reads try the loose
+ * store first, then the packs. Writes and removals go to the loose store, and an
+ * object already in a pack is not written again (git's freshen_packed_object,
+ * JGit's ObjectDirectoryInserter). Packs are read-only here (repack and gc
+ * rewrite them).
  */
+
+import type { StagingBlobStore } from "@statewalker/vcs-core";
 import {
   type GitObject,
   type GitObjects,
@@ -32,9 +36,43 @@ function closeSource(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>):
   }
 }
 
+/** Thrown inside `idOf` to cancel a staged write whose object is already packed. */
+class AlreadyPacked extends Error {}
+
 /**
+ * A staging store that does not keep objects already in `packs`: the bytes are
+ * staged as usual, and once their id is known a packed object is dropped (the
+ * temporary is removed) and reported as `stored: false`.
+ */
+export function skipPacked(store: StagingBlobStore, packs: PackDirectory): StagingBlobStore {
+  return {
+    ...store,
+    async putStaged(bytes, idOf) {
+      let packedId: string | undefined;
+      try {
+        return await store.putStaged(bytes, async () => {
+          const id = await idOf();
+          if (await packs.has(id)) {
+            packedId = id;
+            throw new AlreadyPacked(id);
+          }
+          return id;
+        });
+      } catch (e) {
+        if (e instanceof AlreadyPacked && packedId) return { id: packedId, stored: false };
+        throw e;
+      }
+    },
+  };
+}
+
+/**
+ * Reads fall back to packs; build `loose` over `skipPacked` so writes skip packed
+ * objects too (as `createGitFilesBackend` does).
+ *
  * @example
  * ```typescript
+ * const loose = createGitObjects(skipPacked(filesStagingStore(files, ".git/objects"), packs));
  * const objects = withPacks(createGitObjects(filesStagingStore(files, ".git/objects")), packs);
  * await objects.get(id); // a loose object, or one from .git/objects/pack/*.pack
  * ```

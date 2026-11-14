@@ -101,9 +101,8 @@ export async function initializeGitFromFiles(ctx: AppContext, files: FilesApi): 
   }
 
   // Build History from file components.
-  // FileRawStorage handles zlib compression/decompression by default.
-  // GitObjects adds Git headers ("type size\0content")
-  // — matching real Git's on-disk format.
+  // GitObjects stores zlib loose objects ("type size\0content") through
+  // filesStagingStore, matching real Git's on-disk format.
   const objects = createGitObjects(filesStagingStore(files, objectsDir));
   const refStore = createFileRefStore(files, gitDir);
 

@@ -268,7 +268,7 @@ async function cloneWithVcs(): Promise<void> {
     printInfo("Processing received pack data...");
 
     // Import the received pack into the local object store as loose objects.
-    // The file-backed object store (FileRawStorage) reads loose objects only,
+    // The file-backed object store (filesStagingStore) reads loose objects only,
     // not packfiles, so we explode the pack via the serialization pipeline.
     // The resulting loose objects are Git-compatible and readable both by the
     // VCS History API and by native git (used for verification in step 4).

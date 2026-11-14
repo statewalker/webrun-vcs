@@ -110,7 +110,7 @@ export function createHistoryFromStores(config: HistoryStoresConfig): History {
  * @example
  * ```typescript
  * const history = createHistoryFromComponents({
- *   objects: createGitObjectStore(new MemoryRawStorage()),
+ *   objects: createGitObjects(rawStorageStaging(new MemoryRawStorage())),
  *   refs: { type: "memory" },
  * });
  * ```

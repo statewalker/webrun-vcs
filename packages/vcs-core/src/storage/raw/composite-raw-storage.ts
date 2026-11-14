@@ -5,7 +5,9 @@
  * read-only fallback storages. Writes go to primary only.
  * Reads try primary first, then each fallback in order.
  *
- * Used to layer pack-backed storage behind loose object storage.
+ * All layers must hold values in the same format. For git objects, combine
+ * loose objects and packs with `withPacks` (vcs-store-files) instead: packs
+ * hold uncompressed objects, the object kernel stores zlib.
  */
 
 import type { RawStorage } from "./raw-storage.js";
@@ -15,10 +17,10 @@ import type { RawStorage } from "./raw-storage.js";
  *
  * @example
  * ```typescript
- * const loose = new FileRawStorage(files, objectsDir, { compress: true });
- * const packAdapter = new PackDirectoryAdapter(packDir);
- * const composite = new CompositeRawStorage(loose, [packAdapter]);
- * const objects = createGitObjects(rawStorageStaging(composite));
+ * const local = new MemoryRawStorage();
+ * const shared = new MemoryRawStorage(); // read-only here
+ * const composite = new CompositeRawStorage(local, [shared]);
+ * await composite.store("k", [bytes]); // goes to `local`
  * ```
  */
 export class CompositeRawStorage implements RawStorage {

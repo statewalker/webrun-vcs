@@ -5,9 +5,9 @@
  * fallback in CompositeRawStorage. Store and remove operations
  * are not supported (packs are immutable).
  *
- * PackDirectory.loadRaw() returns content with Git headers
- * ("type size\0content"), which is the same format that
- * GitObjectStore expects from its underlying RawStorage.
+ * PackDirectory.loadRaw() returns uncompressed objects with Git headers
+ * ("type size\0content"). That is not the zlib the object kernel stores, so
+ * do not put this under `createGitObjects`; `withPacks` reads packs for it.
  *
  * Note: The PackDirectory must be initialized (scan() called)
  * before the adapter is used.

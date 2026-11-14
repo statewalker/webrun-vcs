@@ -1,5 +1,5 @@
 /**
- * Tests for CommitsImpl using GitObjectStore with MemoryRawStorage
+ * Tests for CommitsImpl using GitObjects over MemoryRawStorage
  *
  * Runs conformance tests against the new Commits implementation.
  */

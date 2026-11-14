@@ -75,9 +75,8 @@ export async function createFileHistory(options: CreateFileHistoryOptions): Prom
 
   const objectsDir = joinPath(gitDir, "objects");
 
-  // Create file storage for objects (FileRawStorage handles zlib compression by default).
-  // All objects (including blobs) go through the same GitObjects so they
-  // are stored with Git headers in the shared .git/objects directory.
+  // All objects (including blobs) go through one GitObjects over git's loose
+  // layout (zlib, written through tmp_obj_* and a rename) in .git/objects.
   const objects = createGitObjects(filesStagingStore(files, objectsDir));
   const refStore = createFileRefStore(files, gitDir);
 

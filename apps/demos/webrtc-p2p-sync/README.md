@@ -95,7 +95,7 @@ const worktree = new MemoryWorktree({ blobs: history.blobs, trees: history.trees
 const git = Git.fromWorkingCopy(new MemoryWorkingCopy({ history, checkout, worktree }));
 ```
 
-For a folder, `initializeGitFromFiles()` builds the same pieces from `FileRawStorage` (loose objects in `.git/objects`), `createFileRefStore`, `FileWorktree` and `createGitStaging(files, ".git/index")`, creating the `.git` skeleton if it is missing.
+For a folder, `initializeGitFromFiles()` builds the same pieces from `createGitObjects(filesStagingStore(...))` (loose objects in `.git/objects`), `createFileRefStore`, `FileWorktree` and `createGitStaging(files, ".git/index")`, creating the `.git` skeleton if it is missing.
 
 ## Why it is the way it is
 
@@ -111,7 +111,7 @@ For a folder, `initializeGitFromFiles()` builds the same pieces from `FileRawSto
 - **Only `main` is synced back.** Fetch brings all of the peer's branches into `refs/remotes/peer/*`, but only `main` is merged and pushed.
 - **Unresolvable merges stop the sync** with `Sync failed: Merge conflicts: <paths>` or `Sync failed: Merge failed: <status>`; nothing is pushed.
 - **In-memory repositories are lost on reload.** That includes the fallback used when the File System Access API is missing (`File System Access API not available, using in-memory storage.`).
-- **Repositories with packed objects cannot be read.** `FileRawStorage` reads loose objects only, so opening a folder whose objects were packed by `git gc` or a clone shows missing commits. A fresh `git init` repository works.
+- **Repositories with packed objects cannot be read.** The loose-object store reads loose objects only, so opening a folder whose objects were packed by `git gc` or a clone shows missing commits. A fresh `git init` repository works.
 - **The folder picker asks for read-write access up front** (`showDirectoryPicker({ mode: "readwrite" })`); denying it fails with `Failed to open repository: <reason>`.
 - **Some tests need native `git`.** `open-native-repo.test.ts` and `sync-merge-history.test.ts` create or prepare repositories by running `git` through `execSync`.
 
@@ -137,7 +137,7 @@ For a folder, `initializeGitFromFiles()` builds the same pieces from `FileRawSto
 |---|---|
 | `@statewalker/vcs-commands` | `Git`, merge strategies |
 | `@statewalker/vcs-core` | History, object store, `DefaultSerializationApi` |
-| `@statewalker/vcs-store-files` | `FileRawStorage`, `createFileRefStore`, `FileWorktree` |
+| `@statewalker/vcs-store-files` | `filesStagingStore`, `createFileRefStore`, `FileWorktree` |
 | `@statewalker/vcs-working-tree` | staging, checkout, worktree, working copy |
 | `@statewalker/vcs-transport` | `fetchOverDuplex`, `pushOverDuplex`, `serveOverDuplex` |
 | `@statewalker/vcs-transport-adapters` | `createVcsRepositoryFacade` |

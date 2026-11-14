@@ -19,6 +19,9 @@ import type { PackDirectory } from "./pack/pack-directory.js";
 import { repack } from "./repack.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
+/** A loose object file name, fan-out directory included. */
+const OBJECT_ID = /^[0-9a-f]{40}$/;
+
 /**
  * Options for creating a FileGcStrategy.
  */
@@ -86,6 +89,7 @@ export class FileGcStrategy implements GcStrategy {
     let looseCount = 0;
     let looseSize = 0;
     for await (const key of this.looseStorage.keys()) {
+      if (!OBJECT_ID.test(key)) continue;
       looseCount++;
       const size = await this.looseStorage.size(key);
       if (size >= 0) looseSize += size;

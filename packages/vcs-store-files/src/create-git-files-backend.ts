@@ -12,7 +12,7 @@ import type { FilesApi, GitObjects, History } from "@statewalker/vcs-core";
 import { createGitObjects, createHistoryFromComponents, joinPath } from "@statewalker/vcs-core";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import { PackDirectory } from "./pack/pack-directory.js";
-import { withPacks } from "./pack/with-packs.js";
+import { skipPacked, withPacks } from "./pack/with-packs.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
@@ -100,7 +100,8 @@ export async function createGitFilesBackend(
   const looseStorage = new FileRawStorage(files, objectsDir);
   const packDirectory = new PackDirectory({ files, basePath: packDir });
   await packDirectory.scan();
-  const objects = withPacks(createGitObjects(filesStagingStore(files, objectsDir)), packDirectory);
+  const loose = createGitObjects(skipPacked(filesStagingStore(files, objectsDir), packDirectory));
+  const objects = withPacks(loose, packDirectory);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
     refLockTimeoutMs: options.refLockTimeoutMs,

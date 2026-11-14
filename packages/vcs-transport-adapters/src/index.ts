@@ -1,4 +1,4 @@
-// Git-native repository access (direct passthrough to GitObjectStore)
+// Git-native repository access (direct passthrough to GitObjects)
 export * from "./git-native-repository-access.js";
 // Object graph walker
 export * from "./object-graph-walker.js";

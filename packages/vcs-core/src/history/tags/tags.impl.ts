@@ -7,7 +7,12 @@
 import type { ObjectId } from "../../common/id/index.js";
 import type { GitObjects } from "../objects/git-objects.js";
 import { ObjectType } from "../objects/object-types.js";
-import { loadTypedObject, objectHeader, storeObject } from "../objects/typed-object-access.js";
+import {
+  loadTypedObject,
+  objectHeader,
+  removeObject,
+  storeObject,
+} from "../objects/typed-object-access.js";
 import { decodeTagEntries, encodeTagEntries, entriesToTag, tagToEntries } from "./tag-format.js";
 import type { AnnotatedTag, Tags } from "./tags.js";
 
@@ -44,7 +49,7 @@ class GitTagStore implements Tags {
    * Remove tag (new interface)
    */
   async remove(id: ObjectId): Promise<boolean> {
-    return this.objects.remove(id);
+    return removeObject(this.objects, id);
   }
 
   /**

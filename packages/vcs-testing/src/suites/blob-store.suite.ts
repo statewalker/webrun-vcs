@@ -162,6 +162,10 @@ export function createBlobStoreTests(name: string, factory: BlobStoreFactory): v
         expect(removed).toBe(false);
       });
 
+      it("returns false when removing something that is not an object id", async () => {
+        expect(await ctx.blobStore.remove("not-an-object-id")).toBe(false);
+      });
+
       it("lists all blob keys", async () => {
         const content1 = encoder.encode("blob 1");
         const content2 = encoder.encode("blob 2");

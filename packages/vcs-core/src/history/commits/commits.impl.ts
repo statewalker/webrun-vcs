@@ -7,7 +7,12 @@
 
 import type { ObjectId } from "../../common/id/index.js";
 import type { GitObjects } from "../objects/git-objects.js";
-import { loadTypedObject, objectHeader, storeObject } from "../objects/typed-object-access.js";
+import {
+  loadTypedObject,
+  objectHeader,
+  removeObject,
+  storeObject,
+} from "../objects/typed-object-access.js";
 import {
   commitToEntries,
   decodeCommitEntries,
@@ -53,7 +58,7 @@ class GitCommitStore implements Commits {
    * Remove commit (new interface)
    */
   async remove(id: ObjectId): Promise<boolean> {
-    return this.objects.remove(id);
+    return removeObject(this.objects, id);
   }
 
   /**
