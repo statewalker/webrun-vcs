@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRefsAdapter, type FilesApi } from "@statewalker/vcs-core";
+import type { FilesApi } from "@statewalker/vcs-core";
 import { createRefBatchTests } from "@statewalker/vcs-testing";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import { createNodeAtomicFiles, createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -27,6 +27,8 @@ const GIT_ENV = {
   GIT_COMMITTER_NAME: "A U Thor",
   GIT_COMMITTER_EMAIL: "author@example.com",
   GIT_COMMITTER_DATE: "1700000000 +0000",
+  // Both dates fixed: twin repositories must get the same commit ids.
+  GIT_AUTHOR_DATE: "1700000000 +0000",
 };
 const roots: string[] = [];
 afterAll(() => {
@@ -76,9 +78,9 @@ createRefBatchTests("Git files on disk (native AtomicFiles)", async () => {
   await files.mkdir(".git");
   await createRefsStructure(files, ".git");
   return {
-    refs: createRefsAdapter(
-      new FileRefStore(files, ".git", { atomicFiles: createNodeAtomicFiles(join(dir, ".git")) }),
-    ),
+    refs: new FileRefStore(files, ".git", {
+      atomicFiles: createNodeAtomicFiles(join(dir, ".git")),
+    }),
   };
 });
 

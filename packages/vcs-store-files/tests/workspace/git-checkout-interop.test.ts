@@ -9,7 +9,6 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { RefsAdapter } from "@statewalker/vcs-core";
 import { FileRefStore, GitCheckout, type GitCheckoutFilesApi } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { createMemoryGitStaging } from "@statewalker/vcs-working-tree";
@@ -92,7 +91,7 @@ describe("GitCheckout Git Interoperability", () => {
       };
 
       const refStore = new FileRefStore(nodeFiles, ".git");
-      const refs = new RefsAdapter(refStore);
+      const refs = refStore;
       await refs.initialize();
 
       const staging = createMemoryGitStaging();
@@ -155,7 +154,7 @@ describe("GitCheckout Git Interoperability", () => {
       };
 
       const refStore = new FileRefStore(nodeFiles, ".git");
-      const refs = new RefsAdapter(refStore);
+      const refs = refStore;
       await refs.initialize();
 
       const staging = createMemoryGitStaging();
@@ -210,7 +209,7 @@ describe("GitCheckout Git Interoperability", () => {
       };
 
       const refStore = new FileRefStore(nodeFiles, ".git");
-      const refs = new RefsAdapter(refStore);
+      const refs = refStore;
       await refs.initialize();
       const initialCommit = git(["rev-parse", "HEAD"], repoDir);
 

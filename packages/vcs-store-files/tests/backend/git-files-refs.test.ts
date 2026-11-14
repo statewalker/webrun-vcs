@@ -476,7 +476,7 @@ ${TEST_OID_1} refs/tags/v1.0.0
     it("delete removes ref via store", async () => {
       await refStore.set("refs/heads/todelete", TEST_OID_1);
 
-      const deleted = await refStore.delete("refs/heads/todelete");
+      const deleted = await refStore.remove("refs/heads/todelete");
 
       expect(deleted).toBe(true);
       expect(await refStore.has("refs/heads/todelete")).toBe(false);

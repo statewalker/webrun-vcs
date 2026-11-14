@@ -18,7 +18,7 @@ import {
   parseCommit,
   parseTree,
   type Ref,
-  type RefStore,
+  type Refs,
 } from "@statewalker/vcs-core";
 import type { HeadInfo, ObjectInfo, RefInfo, RepositoryAccess } from "@statewalker/vcs-transport";
 import { collect } from "@statewalker/vcs-utils/streams";
@@ -198,14 +198,14 @@ export class DeltaAwareGitNativeRepositoryAccess
 export interface CoreRepositoryAccessOptions {
   /** Object store for Git objects */
   objectStore: GitObjectStore;
-  /** Reference store for Git refs */
-  refStore: RefStore;
+  /** Refs (any vcs-core `Refs` implementation) */
+  refStore: Refs;
 }
 
 /**
  * Create a RepositoryAccess adapter from core storage.
  *
- * Adapts GitObjectStore and RefStore to the RepositoryAccess interface
+ * Adapts GitObjectStore and Refs to the RepositoryAccess interface
  * used by protocol handlers (upload-pack, receive-pack).
  *
  * @param options - Object store and ref store
@@ -298,21 +298,11 @@ export function createCoreRepositoryAccess(options: CoreRepositoryAccessOptions)
       oldId: ObjectId | null,
       newId: ObjectId | null,
     ): Promise<boolean> {
-      // Delete case
-      if (newId === null) {
-        if (oldId !== null) {
-          // Check current value before deleting
-          const resolved = await refStore.resolve(name);
-          if (resolved?.objectId !== oldId) {
-            return false;
-          }
-        }
-        return refStore.delete(name);
-      }
-
-      // Create or update case
-      const result = await refStore.compareAndSwap(name, oldId ?? undefined, newId);
-      return result.success;
+      // One atomic command. `oldId` null means "must not exist" for a create or
+      // update, and "no check" for a delete (as before).
+      const old = newId === null && oldId === null ? undefined : oldId;
+      const r = await refStore.batch([{ name, old, new: newId }]);
+      return r.ok;
     },
 
     async *walkObjects(

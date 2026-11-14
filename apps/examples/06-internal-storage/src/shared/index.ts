@@ -137,7 +137,7 @@ export async function createFileHistory(options: {
   // Create History from components
   const history = createHistoryFromComponents({
     objects,
-    refs: { type: "adapter", refStore },
+    refs: refStore,
   });
 
   // Initialize if creating

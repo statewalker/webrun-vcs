@@ -114,7 +114,7 @@ const history = createHistoryFromComponents({
 await history.initialize();
 ```
 
-`refs` is either `{ type: "memory" }` or `{ type: "adapter", refStore }`, where `refStore` is an implementation of the core `RefStore` interface.
+`refs` is either `{ type: "memory" }` or any implementation of the core `Refs` interface (`get`, `resolve`, `list`, `set`, `setSymbolic`, `remove`, `batch`, `compareAndSwap`, …).
 
 ### Pattern 4: createHistoryFromStores() takes every store explicitly
 

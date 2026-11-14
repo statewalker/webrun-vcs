@@ -93,7 +93,7 @@ const files = createNodeFilesApi({ rootDir: "test-repo" });
 const objects = createGitObjectStore(new FileRawStorage(files, ".git/objects"));
 const history = createHistoryFromComponents({
   objects,
-  refs: { type: "adapter", refStore: createFileRefStore(files, ".git") },
+  refs: createFileRefStore(files, ".git"),
 });
 await history.initialize();
 

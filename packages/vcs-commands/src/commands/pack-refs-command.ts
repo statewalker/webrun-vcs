@@ -69,9 +69,9 @@ export class PackRefsCommand extends GitCommand<PackRefsResult> {
     this.checkCallable();
     this.setCallable(false);
 
-    // Check if RefStore supports packRefs
+    // Check if the ref store supports packRefs
     if (!this.refsStore.packRefs) {
-      throw new Error("RefStore does not support packRefs");
+      throw new Error("This ref store does not support packRefs");
     }
 
     let refsPacked = 0;

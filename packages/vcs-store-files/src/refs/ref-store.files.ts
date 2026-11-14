@@ -1,5 +1,5 @@
 /**
- * File-based RefStore implementation
+ * File-based Refs implementation
  *
  * Stores refs as files in the .git/refs directory structure.
  * Supports both loose refs and packed-refs.
@@ -13,7 +13,7 @@ import type {
   Ref,
   RefCommand,
   ReflogReader,
-  RefStore,
+  Refs,
   RefUpdateResult,
   SymbolicRef,
 } from "@statewalker/vcs-core";
@@ -37,7 +37,7 @@ export interface FileRefStoreOptions extends FilesRefBatchOptions {
 }
 
 /**
- * File-based RefStore implementation
+ * File-based Refs implementation
  *
  * Uses the standard Git refs directory structure:
  * - .git/refs/heads/* for branches
@@ -45,7 +45,7 @@ export interface FileRefStoreOptions extends FilesRefBatchOptions {
  * - .git/refs/remotes/* for remote tracking branches
  * - .git/packed-refs for packed refs
  */
-export class FileRefStore implements RefStore {
+export class FileRefStore implements Refs {
   private readonly applyBatch: (
     commands: RefCommand[],
     options?: BatchOptions,
@@ -118,9 +118,9 @@ export class FileRefStore implements RefStore {
   }
 
   /**
-   * Delete a ref
+   * Remove a ref (loose and packed). Not locked: prefer `batch` next to other writers.
    */
-  async delete(refName: string): Promise<boolean> {
+  async remove(refName: string): Promise<boolean> {
     // A ref may be loose, packed, or both (a loose ref shadows its packed copy).
     const loose = await deleteRef(this.files, this.gitDir, refName);
     const packed = await removePackedRef(this.files, this.gitDir, refName);

@@ -10,7 +10,6 @@ import {
   createCommits,
   createGitObjectStore,
   createHistoryFromStores,
-  createRefsAdapter,
   createTags,
   createTrees,
   type FilesApi,
@@ -87,7 +86,7 @@ export async function createFileHistory(options: CreateFileHistoryOptions): Prom
   const trees = createTrees(objects);
   const commits = createCommits(objects);
   const tags = createTags(objects);
-  const refs = createRefsAdapter(refStore);
+  const refs = refStore;
 
   const history = createHistoryFromStores({ blobs, trees, commits, tags, refs });
 

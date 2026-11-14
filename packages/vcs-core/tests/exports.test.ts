@@ -27,7 +27,6 @@ import {
   type PersonIdent,
   parsePersonIdent,
   RefStorage,
-  RefStoreLocation,
 } from "../src/index.js";
 
 describe("Core exports", () => {
@@ -65,11 +64,6 @@ describe("Core exports", () => {
       expect(RefStorage.LOOSE).toBe("loose");
       expect(RefStorage.PACKED).toBe("packed");
       expect(RefStorage.NEW).toBe("new");
-    });
-
-    it("exports RefStoreLocation as alias for RefStorage", () => {
-      expect(RefStoreLocation).toBeDefined();
-      expect(RefStoreLocation).toBe(RefStorage);
     });
 
     it("exports isSymbolicRef function", () => {

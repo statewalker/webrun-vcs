@@ -99,8 +99,9 @@ git push                                        # MANDATORY
 - **`git-cli-sandbox`**: `apps/demos/git-cli-sandbox/` is stale — ignore its test failures
 - **`split()` limit**: `"a b".split(" ", 2)` gives `["a","b"]` not `["a","b c"]` — use `indexOf` + `slice`
 - **Refs vs Checkout**: `CommitCommand` uses `history.refs`, not `checkout.head`
+- **Apps are built without type checking**: vite builds `apps/*` even when they use removed APIs. After changing a package API, run `pnpm -r typecheck` (it covers the apps) and grep `apps/` for the old names.
 - **Workspace cycles**: `vcs-core` depends on `vcs-utils-node`, and `vcs-testing` on `vcs-core`, so `vcs-utils`/`vcs-utils-node` must not depend on `vcs-testing` (not even as a devDependency): pnpm then builds in the wrong order and CI fails on missing declarations. Put such tests in a store package.
-- **Native git in tests**: CI has no `user.name`/`user.email`; pass `GIT_AUTHOR_*`/`GIT_COMMITTER_*` in the env of every git call
+- **Native git in tests**: CI has no `user.name`/`user.email`; pass `GIT_AUTHOR_*`/`GIT_COMMITTER_*` in the env of every git call, and fix both `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` when two repositories must produce the same commit ids
 
 ## Self-Maintenance
 
