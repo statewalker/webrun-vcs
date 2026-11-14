@@ -60,4 +60,22 @@ describe("applyGitDelta (checked)", () => {
     const d = delta(...varint(0x10000), ...varint(0x10000), 0x80);
     expect(applyGitDelta(big, d)).toEqual(big);
   });
+
+  it("reads copy offsets of 2^24 and beyond", () => {
+    const big = new Uint8Array(0x1000010);
+    big.set([1, 2, 3, 4], 0x1000004);
+    // copy 4 bytes at offset 0x1000004: offset bytes 0, 1, 2, 3 present
+    const d = delta(...varint(big.length), ...varint(4), 0x80 | 0x0f | 0x10, 0x04, 0, 0, 1, 4);
+    expect(applyGitDelta(big, d)).toEqual(Uint8Array.of(1, 2, 3, 4));
+  });
+
+  it("allows a result of exactly maxSize, and refuses trailing instructions", () => {
+    const d = delta(...varint(11), ...varint(5), 0x90, 5);
+    expect(applyGitDelta(base, d, 5)).toHaveLength(5);
+    expect(() => applyGitDelta(base, d, 4)).toThrow(/exceeds/);
+    // the result is complete after the first copy; a second one is refused (as git)
+    expect(() => applyGitDelta(base, delta(...varint(11), ...varint(5), 0x90, 5, 0x90, 1))).toThrow(
+      DeltaError,
+    );
+  });
 });

@@ -1,7 +1,6 @@
 import { FossilChecksum } from "../../hash/fossil-checksum/index.js";
-import { BufferedByteReader, slice } from "../../streams/index.js";
 import { getGitDeltaBaseSize, getGitDeltaResultSize } from "./git-delta-format.js";
-import type { Delta, RandomAccessStream } from "./types.js";
+import type { Delta } from "./types.js";
 
 // Re-export Git delta size utilities
 export { getGitDeltaBaseSize, getGitDeltaResultSize };
@@ -12,16 +11,17 @@ export class DeltaError extends Error {
 }
 
 /**
- * Apply a git binary delta (pack format) to its base, with every bound checked
- * as git's patch-delta.c and JGit's BinaryDelta do.
+ * Apply a git binary delta (pack format) to its base, with the bounds git's
+ * patch-delta.c and JGit's BinaryDelta check.
  *
  * The header holds the base size and the result size (7-bit little-endian
  * varints); then come instructions: `1xxxxxxx` copies from the base (offset
  * bytes for bits 0-3, size bytes for bits 4-6, size 0 meaning 0x10000) and
  * `0nnnnnnn` inserts the next n bytes (n = 0 is reserved). A first pass checks
  * every instruction and sums the output; only when that equals the declared
- * result size, and the size is within `maxSize`, is the result allocated, so a
- * hostile header cannot make it allocate.
+ * result size, and the size is within `maxSize`, is the result allocated. A
+ * small delta can still describe a large result (a 1-byte copy yields 64 KiB),
+ * so readers of untrusted packs pass `maxSize` (their maximum object size).
  *
  * @example
  * ```typescript
@@ -165,106 +165,5 @@ export function* applyDelta(source: Uint8Array, deltas: Iterable<Delta>): Genera
   const actualChecksum = checksumObj.finalize();
   if (actualChecksum !== expectedChecksum) {
     throw new Error(`Checksum mismatch: expected ${expectedChecksum}, got ${actualChecksum}`);
-  }
-}
-
-/** Maximum copy size in Git pack v2 format */
-const MAX_V2_COPY = 0x10000;
-
-/**
- * Read a little-endian varint from a BufferedByteReader.
- *
- * Used for parsing the base/result size headers in Git binary deltas.
- */
-async function readDeltaVarint(reader: BufferedByteReader): Promise<number> {
-  let value = 0;
-  let shift = 0;
-  let c: number;
-  do {
-    const byte = await reader.readExact(1);
-    c = byte[0];
-    value |= (c & 0x7f) << shift;
-    shift += 7;
-  } while ((c & 0x80) !== 0);
-  return value;
-}
-
-/**
- * Apply a Git binary delta to a base object, streaming both input and output.
- *
- * Unlike `applyGitDelta` which requires both base and delta fully in memory,
- * this function uses `RandomAccessStream` for the base (enabling offset reads
- * without full materialization) and reads the delta sequentially.
- *
- * For COPY instructions, slices are read from the source stream at the
- * requested offset. For INSERT instructions, literal bytes are read from
- * the delta stream. Result chunks are yielded incrementally.
- *
- * @param source Random-access stream over the base object
- * @param delta Random-access stream over the Git binary delta
- * @yields Chunks of the resulting object data
- * @throws Error if result size doesn't match expected size in delta
- */
-export async function* applyGitDeltaStreaming(
-  source: RandomAccessStream,
-  delta: RandomAccessStream,
-): AsyncGenerator<Uint8Array> {
-  const reader = new BufferedByteReader(delta()[Symbol.asyncIterator]());
-
-  // Read base size header (unused for streaming, but must be consumed)
-  await readDeltaVarint(reader);
-
-  // Read result size header
-  const resultSize = await readDeltaVarint(reader);
-
-  let produced = 0;
-
-  while (produced < resultSize) {
-    const cmdBytes = await reader.readExact(1);
-    const cmd = cmdBytes[0];
-
-    if ((cmd & 0x80) !== 0) {
-      // COPY instruction: read sparse offset and size bytes
-      let offset = 0;
-      if (cmd & 0x01) {
-        offset = (await reader.readExact(1))[0];
-      }
-      if (cmd & 0x02) {
-        offset |= (await reader.readExact(1))[0] << 8;
-      }
-      if (cmd & 0x04) {
-        offset |= (await reader.readExact(1))[0] << 16;
-      }
-      if (cmd & 0x08) {
-        offset |= (await reader.readExact(1))[0] << 24;
-      }
-
-      let size = 0;
-      if (cmd & 0x10) {
-        size = (await reader.readExact(1))[0];
-      }
-      if (cmd & 0x20) {
-        size |= (await reader.readExact(1))[0] << 8;
-      }
-      if (cmd & 0x40) {
-        size |= (await reader.readExact(1))[0] << 16;
-      }
-      if (size === 0) size = MAX_V2_COPY;
-
-      // Yield data from source at the requested offset
-      yield* slice(source(offset), 0, size);
-      produced += size;
-    } else if (cmd !== 0) {
-      // INSERT instruction: read literal data from delta
-      const data = await reader.readExact(cmd);
-      yield data;
-      produced += cmd;
-    } else {
-      throw new Error("Unsupported delta command 0");
-    }
-  }
-
-  if (produced !== resultSize) {
-    throw new Error(`Delta result size mismatch: expected ${resultSize}, got ${produced}`);
   }
 }

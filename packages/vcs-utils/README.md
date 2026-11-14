@@ -146,10 +146,10 @@ import { applyGitDelta, createGitDeltaIndex, encodeGitDelta } from "@statewalker
 
 const index = createGitDeltaIndex(base); // index a base once, try many targets against it
 const delta = encodeGitDelta(index, target, target.length / 2); // undefined if not worth it
-const rebuilt = applyGitDelta(base, delta!); // equals target
+if (delta) applyGitDelta(base, delta, maxObjectSize); // equals target
 ```
 
-`encodeGitDelta` writes git's own delta format (diff-delta.c): native `git index-pack` accepts packs carrying these deltas. `applyGitDelta` checks every instruction before it allocates, as git's patch-delta.c does: a copy past the end of the base, a truncated operand, the reserved instruction 0, or sizes that do not match throw `DeltaError`, and `maxSize` bounds what a hostile header can make it allocate.
+`encodeGitDelta` writes git's own delta format (diff-delta.c): native `git index-pack` accepts packs carrying these deltas. `applyGitDelta` makes the checks git's patch-delta.c makes, but all of them before it allocates: a copy past the end of the base, a truncated operand, the reserved instruction 0, or sizes that do not match throw `DeltaError`. A small delta can still describe a large result, so pass `maxSize` when the delta comes from an untrusted source.
 
 ### Diff two texts line by line
 

@@ -50,7 +50,7 @@ export function craftDelta(baseLen: number, resultLen: number, ops: number[]): U
   return Uint8Array.from([...deltaVarint(baseLen), ...deltaVarint(resultLen), ...ops]);
 }
 
-/** The instruction copying [0, n) of the base (n <= 0xffffff). */
+/** The instruction copying [0, n) of the base (1 <= n <= 0xffffff; a size of 0 means 0x10000). */
 export function copyAll(n: number): number[] {
   return [0x80 | 0x10 | 0x20 | 0x40, n & 255, (n >> 8) & 255, (n >> 16) & 255];
 }

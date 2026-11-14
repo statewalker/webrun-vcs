@@ -1,6 +1,6 @@
 /**
  * git's binary delta encoder (diff-delta.c, JGit DeltaIndex/DeltaEncoder), producing what
- * `applyGitDelta` reads: the source is indexed by the hash of its 16-byte blocks (every block boundary;
+ * `applyGitDelta` reads: the source is indexed by the hash of its 16-byte windows (densely for small sources, see indexStep;
  * at most HASH_LIMIT entries per bucket, as git, so repetitive sources stay cheap); the target is
  * scanned with a rolling hash of the same window; a hit is verified, extended forward, and
  * backward into the pending literals. Copies are at most 0x10000 bytes, inserts at most 127.
