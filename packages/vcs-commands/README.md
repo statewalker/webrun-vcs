@@ -168,7 +168,7 @@ await git.merge().include("feature").setContentMergeStrategy(ContentMergeStrateg
 await git.blame().setFilePath("data.csv").setBigFileThreshold(10 * 2 ** 20).call();
 ```
 
-Diff, merge and blame read sizes from object headers first and never load a file above `bigFileThreshold` (50 MiB by default, git's `core.bigFileThreshold`). They check whether a file is binary as git does, from a NUL byte in its first 8000 bytes, and read only that prefix (`probeBlob` from `@statewalker/vcs-core`). Text under the threshold is still loaded whole, because the diff algorithms need it.
+Diff, merge and blame read sizes from object headers first and never load a file above `bigFileThreshold` (50 MiB by default, git's `core.bigFileThreshold`). They check whether a file is binary as git does, from a NUL byte in its first 8000 bytes, and read only that prefix (`probeBlob` from `@statewalker/vcs-core`). Text under the threshold is still loaded whole, because the diff algorithms need it, by the same single read that checked it (`probeBlob(..., { loadText: true })`).
 
 - `DiffFormatter` shows a big or binary file as `Binary files a/<path> and b/<path> differ` and loads neither side. `oldContent` and `newContent` are set for text files only.
 - `merge()` never content-merges a big or binary file. With `ContentMergeStrategy.OURS` or `THEIRS` it takes that side's file whole, as `git merge -X ours` does; with `UNION`, or without a content strategy, the path is a conflict.

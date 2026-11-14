@@ -57,7 +57,7 @@ export async function parseReportStatus(packets: AsyncIterable<Packet>): Promise
   let firstLine = true;
 
   for await (const packet of packets) {
-    if (packet.type === "flush") {
+    if (packet.type === "flush" || packet.type === "response-end") {
       break;
     }
 

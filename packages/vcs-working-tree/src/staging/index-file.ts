@@ -9,7 +9,11 @@
  */
 import { readFile } from "@statewalker/vcs-core";
 import { atomicFilesOver, type FilesApi } from "@statewalker/vcs-utils/files";
-import { carryIndexExtensions, indexEntriesDigest } from "./index-extensions.js";
+import {
+  assertWritableIndexExtensions,
+  carryIndexExtensions,
+  indexEntriesDigest,
+} from "./index-extensions.js";
 import {
   encodeIndexFile,
   INDEX_VERSION_2,
@@ -95,6 +99,8 @@ export class IndexFile {
   private extensions: IndexExtension[] = [];
   /** Digest of the entries read, when an extension depends on them. */
   private entriesDigest: string | undefined;
+  /** Why the last read refused the index; writes refuse it too until a read succeeds. */
+  private refused: Error | undefined;
 
   constructor(
     private readonly files: FilesApi,
@@ -102,15 +108,29 @@ export class IndexFile {
     private readonly options: { lockTimeoutMs?: number } = {},
   ) {}
 
-  /** The entries and modification time, or nothing when there is no index file. */
+  /**
+   * The entries and modification time, or nothing when there is no index file.
+   *
+   * @throws UnsupportedIndexExtensionError for an index with a required extension
+   *   (a split or sparse index), whose entries cannot be read without it
+   */
   async read(): Promise<{ entries: StagingEntry[]; lastModified: number } | undefined> {
     const stats = await this.files.stats(this.path);
     if (!stats) {
       this.extensions = [];
       this.entriesDigest = undefined;
+      this.refused = undefined;
       return undefined;
     }
     const parsed = await parseIndexFile(await readFile(this.files, this.path));
+    try {
+      assertWritableIndexExtensions(parsed.extensionData);
+      this.refused = undefined;
+    } catch (error) {
+      // do not let a later write replace an index we could not read
+      this.refused = error as Error;
+      throw error;
+    }
     this.version = parsed.version;
     this.extensions = parsed.extensionData;
     this.entriesDigest =
@@ -120,6 +140,7 @@ export class IndexFile {
 
   /** Write `entries` (sorted by path, stage) with the extensions that still apply. */
   async write(entries: readonly StagingEntry[]): Promise<void> {
+    if (this.refused) throw this.refused;
     const changed =
       this.entriesDigest === undefined || indexEntriesDigest(entries) !== this.entriesDigest;
     const extensions = carryIndexExtensions(this.extensions, entries, changed);

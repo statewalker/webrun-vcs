@@ -415,3 +415,33 @@ describe.each(backends)(
     });
   },
 );
+
+describe.each(backends)(
+  "DiffFormatter reads each text blob once ($name backend)",
+  ({ factory }) => {
+    let cleanup: (() => Promise<void>) | undefined;
+
+    afterEach(async () => {
+      if (cleanup) {
+        await cleanup();
+        cleanup = undefined;
+      }
+    });
+
+    it("pulls each side's bytes once: the probe's read is the content", async () => {
+      const result = await createInitializedGitFromFactory(factory);
+      cleanup = result.cleanup;
+      const a = new TextEncoder().encode("old line\n".repeat(5000));
+      const b = new TextEncoder().encode("new line\n".repeat(5000));
+      const oldId = await result.repository.blobs.store([a], a.length);
+      const newId = await result.repository.blobs.store([b], b.length);
+      const { blobs, state } = countingBlobs(result.repository.blobs);
+      const diff = await new DiffFormatter(blobs).format(
+        createModifyEntry("t.txt", oldId, newId, 0o100644, 0o100644),
+      );
+      expect(diff.isBinary).toBe(false);
+      expect(diff.hunks.length).toBeGreaterThan(0);
+      expect(state.pulled).toBe(a.length + b.length);
+    });
+  },
+);

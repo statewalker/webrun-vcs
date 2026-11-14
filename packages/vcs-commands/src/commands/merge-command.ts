@@ -541,7 +541,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
 
     try {
       // Binary or big files are never content-merged (git's ll_binary_merge)
-      if (await this.anyBinary([base?.id, ours.id, theirs.id])) {
+      const contents = await this.loadTexts([base?.id, ours.id, theirs.id]);
+      if (!contents) {
         switch (this.contentStrategy) {
           case ContentMergeStrategy.OURS:
             return ours;
@@ -553,9 +554,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
       }
 
       // Load content from all three versions (text under the threshold)
-      const baseContent = base ? await this.collectBlobContent(base.id) : new Uint8Array(0);
-      const oursContent = await this.collectBlobContent(ours.id);
-      const theirsContent = await this.collectBlobContent(theirs.id);
+      // (read once, by the probe)
+      const [baseContent, oursContent, theirsContent] = contents;
 
       // Convert ContentMergeStrategy to utils MergeContentStrategy
       const strategy = this.convertContentStrategy(this.contentStrategy);
@@ -581,41 +581,27 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
   }
 
-  /** Whether any of the blobs is binary or over the threshold, read up to 8000 bytes each. */
-  private async anyBinary(ids: (ObjectId | undefined)[]): Promise<boolean> {
-    for (const id of ids) {
-      if (!id) continue;
-      const probe = await probeBlob(this.blobs, id, { bigFileThreshold: this.bigFileThreshold });
-      if (probe.binary) return true;
-    }
-    return false;
-  }
-
   /**
-   * Collect all bytes from a blob into a single Uint8Array.
+   * The blobs' contents, each read once; nothing when one is binary or over the
+   * threshold (then the rest are not read). A missing id is empty content.
    */
-  private async collectBlobContent(blobId: ObjectId): Promise<Uint8Array> {
-    const chunks: Uint8Array[] = [];
-    const blobContent = await this.blobs.load(blobId);
-    if (blobContent) {
-      for await (const chunk of blobContent) {
-        chunks.push(chunk);
+  private async loadTexts(
+    ids: [ObjectId | undefined, ObjectId, ObjectId],
+  ): Promise<[Uint8Array, Uint8Array, Uint8Array] | undefined> {
+    const out: Uint8Array[] = [];
+    for (const id of ids) {
+      if (!id) {
+        out.push(new Uint8Array(0));
+        continue;
       }
+      const probe = await probeBlob(this.blobs, id, {
+        bigFileThreshold: this.bigFileThreshold,
+        loadText: true,
+      });
+      if (probe.binary || !probe.content) return undefined;
+      out.push(probe.content);
     }
-    if (chunks.length === 0) {
-      return new Uint8Array(0);
-    }
-    if (chunks.length === 1) {
-      return chunks[0];
-    }
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
+    return out as [Uint8Array, Uint8Array, Uint8Array];
   }
 
   /**

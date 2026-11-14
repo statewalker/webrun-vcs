@@ -70,3 +70,39 @@ describe("probeBlob", () => {
     await expect(probeBlob(history.blobs, "0".repeat(40))).rejects.toThrow(/not found/);
   });
 });
+
+describe("probeBlob with loadText: one read for text", () => {
+  const same = (a: Uint8Array | undefined, b: Uint8Array) =>
+    !!a && a.length === b.length && a.every((v, i) => v === b[i]);
+
+  it("returns a text blob's whole content from the same, single read", async () => {
+    const history = createMemoryHistory();
+    const data = new TextEncoder().encode("line of text\n".repeat(10_000));
+    const id = await history.blobs.store([data], data.length);
+    const { blobs, state } = counting(history.blobs);
+    const probe = await probeBlob(blobs, id, { loadText: true });
+    expect(probe.binary).toBe(false);
+    expect(same(probe.content, data)).toBe(true);
+    expect(state.loads).toBe(1);
+    expect(state.pulled).toBe(data.length);
+  });
+
+  it("stops after the first 8000 bytes of a binary blob and returns no content", async () => {
+    const history = createMemoryHistory();
+    const data = new Uint8Array(100_000).fill(0x61);
+    data[10] = 0;
+    const id = await history.blobs.store([data], data.length);
+    const { blobs, state } = counting(history.blobs);
+    const probe = await probeBlob(blobs, id, { loadText: true });
+    expect(probe.binary).toBe(true);
+    expect(probe.content).toBeUndefined();
+    expect(state.pulled).toBeLessThanOrEqual(8192);
+  });
+
+  it("returns empty content for an empty blob without loading it", async () => {
+    const history = createMemoryHistory();
+    const id = await history.blobs.store([new Uint8Array(0)], 0);
+    const probe = await probeBlob(history.blobs, id, { loadText: true });
+    expect(probe.content?.length).toBe(0);
+  });
+});

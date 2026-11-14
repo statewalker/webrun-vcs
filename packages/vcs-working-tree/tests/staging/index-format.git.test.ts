@@ -71,8 +71,8 @@ describe("GitStaging writes an index native git reads", () => {
     await staging.read();
     await staging.write();
 
-    // streamed in several chunks, not one buffer
-    expect(chunks.get(".git/index")).toBeGreaterThan(2);
+    // streamed in several chunks, not one buffer, into the lock file
+    expect(chunks.get(".git/index.lock")).toBeGreaterThan(2);
     // the entries did not change, so git's own TREE extension is kept as it was
     const ours = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
     expect(ours.entries).toHaveLength(2001);
@@ -86,7 +86,7 @@ describe("GitStaging writes an index native git reads", () => {
     const { files, chunks } = countingWrites(createInMemoryFilesApi());
     const staging = createGitStaging(files, "index");
     await staging.write();
-    expect(chunks.get("index")).toBeGreaterThanOrEqual(2);
+    expect(chunks.get("index.lock")).toBeGreaterThanOrEqual(2);
     const empty = await parseIndexFile(await collect(files, "index"));
     expect(empty.entries).toEqual([]);
   });
@@ -188,7 +188,9 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
     const before = readFileSync(join(dir, ".git/index"));
     expect((await parseIndexFile(new Uint8Array(before))).extensions).toContain("link");
     const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
-    await staging.read();
+    // its entries cannot be read without the shared index, so it is refused on read
+    await expect(staging.read()).rejects.toThrow("required extension 'link'");
+    // and a write after that failed read does not replace it with an empty index
     await expect(staging.write()).rejects.toThrow("required extension 'link'");
     expect(readFileSync(join(dir, ".git/index")).equals(before)).toBe(true);
     expect(existsSync(join(dir, ".git/index.lock"))).toBe(false);

@@ -83,7 +83,9 @@ export interface ParsedIndex {
   entries: StagingEntry[];
   /**
    * The signatures of the extensions after the entries, in file order (`TREE`, `REUC`, `link`
-   * for a split index, ...). Their contents are not parsed.
+   * for a split index, ...). Their contents are not parsed. When one is required
+   * (lowercase), `entries` are not validated: they are incomplete or need that
+   * extension to be read.
    */
   extensions: string[];
   /**
@@ -168,6 +170,13 @@ export async function parseIndexFile(data: Uint8Array): Promise<ParsedIndex> {
     extensions.push(signature);
     extensionData.push({ signature, data: data.slice(offset + 8, offset + 8 + size) });
     offset += 8 + size;
+  }
+
+  // A required extension we do not understand (a split index's `link`) changes what
+  // the entries mean: entries there may legitimately have empty paths. Leave them
+  // as they are; callers refuse such an index (see `assertWritableIndexExtensions`).
+  if (!extensions.some((sig) => !/^[A-Z]/.test(sig))) {
+    for (const entry of entries) validatePath(entry.path);
   }
 
   return { version, entries, extensions, extensionData };
@@ -286,8 +295,7 @@ function parseEntry(
     offset = startOffset + alignedLen;
   }
 
-  // Validate path
-  validatePath(path);
+  // Paths are validated by the caller, once the extensions are known
 
   // Convert timestamps to milliseconds
   const mtime = mtimeSeconds * 1000 + Math.floor(mtimeNanos / 1_000_000);

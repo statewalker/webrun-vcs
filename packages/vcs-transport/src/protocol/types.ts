@@ -5,13 +5,13 @@
 /**
  * Packet type markers in the pkt-line protocol.
  */
-export type PacketType = "data" | "flush" | "delim" | "end";
+export type PacketType = "data" | "flush" | "delim" | "response-end";
 
 /**
  * A single packet in the pkt-line protocol.
  *
- * Data packets contain a payload; control packets (flush, delim, end)
- * have no data.
+ * Data packets contain a payload; control packets (flush `0000`, delim `0001`,
+ * response-end `0002`) have no data.
  */
 export interface Packet {
   type: PacketType;

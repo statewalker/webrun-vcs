@@ -16,6 +16,7 @@ import { MAX_PACKET_SIZE, MIN_PACKET_LENGTH, PKT_DELIM, PKT_END, PKT_FLUSH } fro
 // Re-export for convenience
 export { PKT_DELIM, PKT_END, PKT_FLUSH } from "./constants.js";
 
+import { ChunkQueue } from "./chunk-queue.js";
 import { PacketLineError } from "./errors.js";
 import type { Packet } from "./types.js";
 
@@ -97,7 +98,7 @@ export async function* pktLineWriter(packets: AsyncIterable<Packet>): AsyncGener
       case "delim":
         yield encodeDelim();
         break;
-      case "end":
+      case "response-end":
         yield encodeEnd();
         break;
       case "data":
@@ -138,8 +139,13 @@ export function parsePacket<T extends ArrayBufferLike>(
       remaining: buffer.subarray(4),
     };
   }
-  // Note: PKT_END (0002) is only used in protocol v2
-  // In protocol v1, length 0002 is invalid
+  // 0002: response end (protocol v2); it never appears in a v1 exchange
+  if (lengthHex === PKT_END) {
+    return {
+      packet: { type: "response-end" },
+      remaining: buffer.subarray(4),
+    };
+  }
 
   // Parse data packet length
   const length = parseInt(lengthHex, 16);
@@ -174,65 +180,6 @@ export function parsePacket<T extends ArrayBufferLike>(
 }
 
 /**
- * Bytes received but not yet parsed, kept as the chunks they arrived in.
- *
- * Reading from the front copies only the bytes taken, so a stream of many small
- * packets, or one large packet in many small chunks, is decoded in linear time.
- */
-class ChunkQueue {
-  private chunks: Uint8Array[] = [];
-  /** Bytes of `chunks[0]` already consumed. */
-  private offset = 0;
-  length = 0;
-
-  push(chunk: Uint8Array): void {
-    if (chunk.length === 0) return;
-    this.chunks.push(chunk);
-    this.length += chunk.length;
-  }
-
-  /** Copies of the first `n` bytes (n <= length), removed from the queue. */
-  take(n: number): Uint8Array<ArrayBuffer> {
-    const out = new Uint8Array(n);
-    let at = 0;
-    while (at < n) {
-      const head = this.chunks[0] as Uint8Array;
-      const count = Math.min(n - at, head.length - this.offset);
-      out.set(head.subarray(this.offset, this.offset + count), at);
-      at += count;
-      this.offset += count;
-      if (this.offset === head.length) {
-        this.chunks.shift();
-        this.offset = 0;
-      }
-    }
-    this.length -= n;
-    return out;
-  }
-
-  /** The first four bytes as a string, without removing them (length >= 4). */
-  peekHeader(): string {
-    const head = this.chunks[0] as Uint8Array;
-    if (head.length - this.offset >= 4) {
-      return String.fromCharCode(...head.subarray(this.offset, this.offset + 4));
-    }
-    let s = "";
-    let i = 0;
-    let off = this.offset;
-    while (s.length < 4) {
-      const c = this.chunks[i] as Uint8Array;
-      if (off >= c.length) {
-        i++;
-        off = 0;
-        continue;
-      }
-      s += String.fromCharCode(c[off++] as number);
-    }
-    return s;
-  }
-}
-
-/**
  * Read packets from a byte stream.
  * Handles partial packets and buffering internally.
  *
@@ -258,6 +205,11 @@ export async function* pktLineReader(stream: AsyncIterable<Uint8Array>): AsyncGe
         if (lengthHex === PKT_DELIM) {
           queue.take(4);
           yield { type: "delim" };
+          continue;
+        }
+        if (lengthHex === PKT_END) {
+          queue.take(4);
+          yield { type: "response-end" };
           continue;
         }
         const length = /^[0-9a-fA-F]{4}$/.test(lengthHex) ? parseInt(lengthHex, 16) : Number.NaN;
@@ -291,7 +243,7 @@ export function packetDataToString(packet: Packet): string {
   if (packet.type === "delim") {
     return PKT_DELIM;
   }
-  if (packet.type === "end") {
+  if (packet.type === "response-end") {
     return PKT_END;
   }
   if (!packet.data) {
@@ -316,7 +268,7 @@ export function packetDataToStringRaw(packet: Packet): string {
   if (packet.type === "delim") {
     return PKT_DELIM;
   }
-  if (packet.type === "end") {
+  if (packet.type === "response-end") {
     return PKT_END;
   }
   if (!packet.data) {
@@ -351,7 +303,7 @@ export function delimPacket(): Packet {
  * Create an end packet.
  */
 export function endPacket(): Packet {
-  return { type: "end" };
+  return { type: "response-end" };
 }
 
 /**

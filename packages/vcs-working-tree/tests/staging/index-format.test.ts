@@ -181,7 +181,7 @@ describe("Index Format", () => {
         {
           path: "z.txt",
           mode: 0o100644,
-          objectId: "z".repeat(40),
+          objectId: "f".repeat(40),
           stage: 0,
           size: 0,
           mtime: 0,
@@ -197,7 +197,7 @@ describe("Index Format", () => {
         {
           path: "m.txt",
           mode: 0o100644,
-          objectId: "m".repeat(40),
+          objectId: "c".repeat(40),
           stage: 0,
           size: 0,
           mtime: 0,
@@ -392,7 +392,7 @@ describe("Index Format", () => {
         {
           path: longPath,
           mode: 0o100644,
-          objectId: "x".repeat(40),
+          objectId: "e".repeat(40),
           stage: 0,
           size: 0,
           mtime: 0,
