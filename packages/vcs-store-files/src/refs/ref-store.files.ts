@@ -6,15 +6,20 @@
  */
 
 import type {
+  BatchOptions,
+  BatchResult,
   FilesApi,
   ObjectId,
   Ref,
+  RefCommand,
   ReflogReader,
   RefStore,
   RefUpdateResult,
   SymbolicRef,
 } from "@statewalker/vcs-core";
+import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 
+import { createFilesRefBatch, type FilesRefBatchOptions } from "./files-ref-batch.js";
 import { packRefs, removePackedRef } from "./packed-refs-writer.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
 import {
@@ -36,11 +41,41 @@ import { hasReflog } from "./reflog-writer.js";
  * - .git/refs/remotes/* for remote tracking branches
  * - .git/packed-refs for packed refs
  */
+export interface FileRefStoreOptions extends FilesRefBatchOptions {
+  /**
+   * Lock-file primitives rooted at `gitDir`. Defaults to `atomicFilesOver(files, gitDir)`,
+   * which is atomic only within one process; pass a native implementation
+   * (`createNodeAtomicFiles` from `@statewalker/vcs-utils-node`) to interoperate
+   * safely with other processes, native git included.
+   */
+  atomicFiles?: AtomicFiles;
+}
+
 export class FileRefStore implements RefStore {
+  private readonly applyBatch: (
+    commands: RefCommand[],
+    options?: BatchOptions,
+  ) => Promise<BatchResult>;
+
   constructor(
     private readonly files: FilesApi,
     private readonly gitDir: string,
-  ) {}
+    options: FileRefStoreOptions = {},
+  ) {
+    this.applyBatch = createFilesRefBatch(
+      options.atomicFiles ?? atomicFilesOver(files, gitDir),
+      options,
+    );
+  }
+
+  /**
+   * Apply all commands atomically, or none, with git's lock-file protocol:
+   * `<ref>.lock` files, and for several refs a two-phase packed-refs commit.
+   * Writes reflog lines in git's format (`options.ident`, `options.message`).
+   */
+  batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    return this.applyBatch(commands, options);
+  }
 
   /**
    * Read a ref by exact name
@@ -106,24 +141,14 @@ export class FileRefStore implements RefStore {
     expectedOld: ObjectId | undefined,
     newValue: ObjectId,
   ): Promise<RefUpdateResult> {
-    const resolved = await this.resolve(refName);
-    const currentValue = resolved?.objectId;
-
-    if (currentValue !== expectedOld) {
-      return {
-        success: false,
-        previousValue: currentValue,
-        errorMessage: expectedOld
-          ? `Expected ${expectedOld}, found ${currentValue ?? "nothing"}`
-          : `Ref already exists with value ${currentValue}`,
-      };
-    }
-
-    // The value was checked above, packed refs included; write the ref the name
-    // resolved to (through a symbolic ref), as a loose ref that shadows any packed copy.
-    // Not atomic: the files store gets lock-file batches of its own.
-    await updateRef(this.files, this.gitDir, resolved?.name ?? refName, undefined, newValue);
-    return { success: true, previousValue: expectedOld };
+    // A one-command batch: locked, checked under the lock, committed by rename.
+    const r = await this.applyBatch([{ name: refName, old: expectedOld ?? null, new: newValue }]);
+    if (r.ok) return { success: true, previousValue: expectedOld };
+    return {
+      success: false,
+      previousValue: (await this.resolve(refName))?.objectId,
+      errorMessage: r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", "),
+    };
   }
 
   /**
@@ -182,6 +207,10 @@ export class FileRefStore implements RefStore {
 /**
  * Create a file-based ref store
  */
-export function createFileRefStore(files: FilesApi, gitDir: string): FileRefStore {
-  return new FileRefStore(files, gitDir);
+export function createFileRefStore(
+  files: FilesApi,
+  gitDir: string,
+  options?: FileRefStoreOptions,
+): FileRefStore {
+  return new FileRefStore(files, gitDir, options);
 }

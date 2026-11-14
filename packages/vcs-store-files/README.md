@@ -46,7 +46,7 @@ Lower-level building blocks, also exported:
 | --- | --- |
 | Loose objects | `FileRawStorage` (`compress` option, default `true`), `PackDirectoryAdapter` (read-only `RawStorage` over packs), `FileVolatileStore` / `createFileVolatileStore` (temp files for large content) |
 | Packs | `PackDirectory`, `PackReader`, `PackDeltaStore`, `PackConsolidator`, `RandomAccessDeltaReader`, `GitPackStoreImpl` / `createGitPackStore`, `DirectPackObjectReader`, `isDeltaType` |
-| Refs | `FileRefStore` / `createFileRefStore(files, gitDir)`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
+| Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs? })` with atomic `batch`; `createFilesRefBatch(atomicFiles)`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
 | Working copy | `GitWorkingCopy`, `GitWorkingCopyFactory` / `createGitWorkingCopyFactory`, `GitWorkingCopyConfig` / `createWorkingCopyConfig` (reads and writes `.git/config`), `GitCheckout` / `createGitCheckout`, `GitStashStore` / `createGitStashStore` (`refs/stash`) |
 | Operation state | `GitTransformationStore` / `createTransformationStore(files, gitDir)`, the merge/rebase/cherry-pick/revert/sequencer stores, `GitResolutionStore`, `detectRepositoryState(files, gitDir, hasConflicts)` and `readMergeState` / `readRebaseState` / `readCherryPickState` / `readRevertState` |
 
@@ -143,6 +143,40 @@ await refs.resolve("HEAD"); // follows HEAD to refs/heads/main, loose or packed
 for (const ref of await readAllRefs(files, ".git")) console.log(ref.name); // refs/ by default
 ```
 
+### Update several refs at once, safely next to native git
+
+```ts
+import { createFileRefStore } from "@statewalker/vcs-store-files";
+import { createNodeAtomicFiles, createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+
+const files = createNodeFilesApi({ rootDir: "/path/to/repo" });
+const refs = createFileRefStore(files, ".git", {
+  atomicFiles: createNodeAtomicFiles("/path/to/repo/.git"),
+});
+const r = await refs.batch(
+  [
+    { name: "refs/heads/main", old: oldMain, new: newMain },
+    { name: "refs/tags/v1", old: null, new: tagId },
+  ],
+  { ident: "A U Thor <a@example.com> 1700000000 +0000", message: "release v1" },
+);
+// r.ok, or r.rejected: [{ name, reason: "mismatch" | "locked" | ... }]; nothing changed then
+```
+
+`batch` uses git's lock-file protocol. One ref: create `<ref>.lock` exclusively, re-check under
+the lock, write the new id into the lock and rename it over the ref. Several refs: lock them all,
+then `packed-refs.lock`, and commit as JGit's `PackedBatchRefUpdate` does, first moving the
+involved loose refs into `packed-refs` and then landing the whole batch in `packed-refs` with one
+rename. A crash at any file operation leaves every ref at its old or its new value once stale
+locks are removed; native `git` reads the result, honours our locks and makes us report `locked`
+while it holds its own. Reflog lines are written to `logs/` in git's format (HEAD's too when it
+points at an updated branch). `compareAndSwap` is a one-command batch.
+
+The lock-file primitives (`AtomicFiles`) default to `atomicFilesOver(files, gitDir)`, which is
+atomic only within one JavaScript process. Pass `createNodeAtomicFiles` (O_CREAT|O_EXCL, rename,
+O_APPEND) wherever another process, native `git` included, may write the same repository.
+`createGitFilesBackend` takes the same `atomicFiles` option.
+
 ## Internals
 
 ### The storage stack
@@ -183,16 +217,13 @@ small packs separately (defaults: consolidate when there are more than 50 packs,
 - `.git/config` is read and written by `GitWorkingCopyConfig` as one file: `[include]` /
   `[includeIf]` are not followed, a malformed section header is kept but ignored where `git`
   would reject the file, and `save()` rewrites the whole file without a `config.lock`.
-- Loose objects, refs and the index are written directly, without `.lock` files or
-  write-then-rename. Do not run a `git` process that writes the same repository at the same time.
+- Ref batches and `compareAndSwap` use `.lock` files and rename (with native `AtomicFiles`, safe
+  next to a running `git`). `set`, `setSymbolic` and `delete`, loose objects and the index are
+  still written directly, without locks: do not run a `git` process that writes them at the same
+  time.
 
 ### What will surprise you
 
-- **`refs.compareAndSwap()` fails on a ref that exists only in `packed-refs`.** `resolve()` finds
-  the packed value and the comparison passes, but `updateRef` re-reads only the loose file,
-  finds none, and returns `{ success: false, previousValue: <the matching id> }` with no
-  `errorMessage`. This happens after `git pack-refs` or `git gc` in the same repository.
-  `refs.set()` works.
 - `createGitFilesHistoryFromFiles({ enableDeltas: false })` has no effect; the option is
   accepted and ignored.
 - `FileGcStrategy.getStats().totalSize` counts loose objects only; pack sizes are not included.

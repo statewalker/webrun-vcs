@@ -15,6 +15,7 @@ import {
   createHistoryFromComponents,
   joinPath,
 } from "@statewalker/vcs-core";
+import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import { PackDirectory } from "./pack/pack-directory.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
@@ -32,6 +33,13 @@ export interface GitFilesBackendOptions {
   create?: boolean;
   /** Default branch name when creating a new repository (default: "main") */
   defaultBranch?: string;
+  /**
+   * Lock-file primitives rooted at the `.git` directory, for atomic ref batches.
+   * Defaults to a FilesApi-based implementation that is atomic within one process;
+   * pass `createNodeAtomicFiles(gitDirOnDisk)` from `@statewalker/vcs-utils-node`
+   * to interoperate safely with native git.
+   */
+  atomicFiles?: AtomicFiles;
 }
 
 /**
@@ -96,7 +104,7 @@ export async function createGitFilesBackend(
   const packAdapter = new PackDirectoryAdapter(packDirectory);
   const compositeStorage = new CompositeRawStorage(looseStorage, [packAdapter]);
   const objects = createGitObjectStore(compositeStorage);
-  const refStore = createFileRefStore(files, gitDir);
+  const refStore = createFileRefStore(files, gitDir, { atomicFiles: options.atomicFiles });
 
   const history = createHistoryFromComponents({
     objects,

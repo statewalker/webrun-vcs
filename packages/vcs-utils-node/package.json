@@ -47,6 +47,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@statewalker/vcs-testing": "workspace:^",
     "@types/node": "catalog:",
     "rolldown": "catalog:",
     "typescript": "catalog:",

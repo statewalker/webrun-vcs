@@ -34,7 +34,7 @@ No peer dependencies. Hashing uses `@noble/hashes`.
 | `@statewalker/vcs-utils/encoding` | Git varints: `readVarint`, `writeVarint`, `readOfsVarint`, `writeOfsVarint`, `readPackHeader`, `writePackHeader` |
 | `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader`, `BufferedByteReader`, port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
 | `@statewalker/vcs-utils/cache` | `LRUCache`, `IntermediateCache` |
-| `@statewalker/vcs-utils/files` | `FilesApi` type, `createInMemoryFilesApi`, `readFile`, `readText`, `tryReadText`, `readAt`, `readRange`, path helpers, `FileMode` |
+| `@statewalker/vcs-utils/files` | `FilesApi` type, `createInMemoryFilesApi`, `AtomicFiles` and `atomicFilesOver` (lock-file primitives), `readFile`, `readText`, `tryReadText`, `readAt`, `readRange`, path helpers, `FileMode` |
 | `@statewalker/vcs-utils/ports` | Request/response over `MessagePort`: `callPort`, `listenPort`, `callBidi`, `listenBidi`, `send`, `receive`, ... |
 | `@statewalker/vcs-utils/pack` | Pack helpers: `parsePackHeader`, `computeObjectId`, `computeObjectIdFromStream`, `SizeMismatchError`, `packTypeToString`, `MemoryPackObjectCache`, async varint readers |
 

@@ -29,6 +29,7 @@
   },
   "dependencies": {
     "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
     "@statewalker/vcs-working-tree": "workspace:^"
   },
   "peerDependencies": {

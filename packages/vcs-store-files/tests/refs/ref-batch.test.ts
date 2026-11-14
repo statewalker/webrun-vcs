@@ -18,10 +18,7 @@ async function gitFilesRefs(): Promise<{
   return { files, refs: createRefsAdapter(new FileRefStore(files, "/.git")) };
 }
 
-// Interim single-command batch until the git-files store gets lock-file batches.
-createRefBatchTests("Git files", async () => ({ refs: (await gitFilesRefs()).refs }), {
-  multiRef: false,
-});
+createRefBatchTests("Git files", async () => ({ refs: (await gitFilesRefs()).refs }));
 
 describe("Refs.batch on packed refs [Git files]", () => {
   const oid = (n: number): ObjectId => n.toString(16).padStart(40, "a");

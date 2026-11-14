@@ -83,6 +83,7 @@
  * - `createCrossBackendTests` - Cross-backend roundtrip
  */
 
+export * from "./atomic-files.suite.js";
 export * from "./blob-store.suite.js";
 // Disabled: export * from "./checkout-store.suite.js";
 export * from "./commit-store.suite.js";

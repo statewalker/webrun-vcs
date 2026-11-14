@@ -5,6 +5,7 @@
  * All library code should depend on FilesApi interface, not specific implementations.
  */
 
+export * from "./atomic-files.js";
 export * from "./file-mode.js";
 export * from "./file-utils.js";
 // Core types and interfaces
