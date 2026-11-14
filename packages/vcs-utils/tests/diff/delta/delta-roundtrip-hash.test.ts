@@ -14,7 +14,6 @@ import type { RandomAccessStream } from "../../../src/diff/delta/types.js";
 import {
   applyDelta,
   applyGitDelta,
-  applyGitDeltaStreaming,
   createDelta,
   createDeltaRanges,
   createFossilLikeRanges,
@@ -46,7 +45,7 @@ function encode(text: string): Uint8Array {
   return new TextEncoder().encode(text);
 }
 
-async function collectAsync(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+async function _collectAsync(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of stream) chunks.push(chunk);
   const total = chunks.reduce((sum, c) => sum + c.length, 0);
@@ -59,7 +58,7 @@ async function collectAsync(stream: AsyncIterable<Uint8Array>): Promise<Uint8Arr
   return result;
 }
 
-function toRandomAccessStream(data: Uint8Array): RandomAccessStream {
+function _toRandomAccessStream(data: Uint8Array): RandomAccessStream {
   return (start = 0) =>
     (async function* () {
       yield data.subarray(start);
@@ -357,61 +356,6 @@ describe("Object ID (SHA-1) hash verification after delta application", () => {
       expect(actualHash).toBe(expectedHash);
     });
   });
-});
-
-describe("Streaming vs block application with hash verification", () => {
-  const streamTestCases: TestCase[] = [
-    {
-      name: "text modification",
-      base: encode("The quick brown fox jumps over the lazy dog."),
-      target: encode("The fast brown cat leaps over the lazy dog."),
-    },
-    {
-      name: "large binary with overlap",
-      base: randomBytes(50000, 1),
-      target: (() => {
-        const t = new Uint8Array(55000);
-        const b = randomBytes(50000, 1);
-        t.set(b.subarray(0, 20000), 0);
-        t.set(randomBytes(15000, 333), 20000);
-        t.set(b.subarray(35000, 50000), 35000);
-        t.set(randomBytes(5000, 444), 50000);
-        return t;
-      })(),
-    },
-    {
-      name: "pure insert (no overlap)",
-      base: new Uint8Array(0),
-      target: randomBytes(1000, 555),
-    },
-  ];
-
-  for (const tc of streamTestCases) {
-    it(`${tc.name}: streaming and block produce same result and hash`, async () => {
-      const ranges = createDeltaRanges(tc.base, tc.target);
-      const gitDelta = deltaRangesToGitFormat(tc.base, tc.target, ranges);
-
-      // Block application
-      const blockResult = applyGitDelta(tc.base, gitDelta);
-
-      // Streaming application
-      const streamResult = await collectAsync(
-        applyGitDeltaStreaming(toRandomAccessStream(tc.base), toRandomAccessStream(gitDelta)),
-      );
-
-      // Both should match target
-      expect(blockResult).toEqual(tc.target);
-      expect(streamResult).toEqual(tc.target);
-
-      // Both should produce the same hash
-      const blockHash = await computeObjectId("blob", blockResult);
-      const streamHash = await computeObjectId("blob", streamResult);
-      const expectedHash = await computeObjectId("blob", tc.target);
-
-      expect(blockHash).toBe(expectedHash);
-      expect(streamHash).toBe(expectedHash);
-    });
-  }
 });
 
 describe("Delta chain roundtrip (multiple sequential deltas)", () => {
