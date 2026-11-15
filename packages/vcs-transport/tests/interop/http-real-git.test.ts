@@ -24,6 +24,7 @@ import {
   cleanupDir,
   createTransportRepo,
   gitAvailable,
+  loopbackEnv,
   makeTmpDir,
   type TransportRepo,
 } from "./helpers.js";
@@ -69,7 +70,7 @@ function gitAsync(
       args,
       {
         cwd,
-        env: { ...process.env, ...GIT_ENV, ...options.env },
+        env: { ...loopbackEnv(), ...GIT_ENV, ...options.env },
         timeout: GIT_TIMEOUT,
         killSignal: "SIGKILL",
         maxBuffer: 64 * 1024 * 1024,
@@ -301,5 +302,47 @@ describeGit("Interop · real git client ← our smart-HTTP server", { timeout: T
     const r = await gitAsync(root, ["ls-remote", `${server.baseUrl}/missing.git`]);
     expect(r.code).not.toBe(0);
     expect(serverLog.some((l) => l.includes("Repository not found: /missing.git"))).toBe(true);
+  });
+});
+
+describeGit("Interop · real git clones an empty repository (unborn HEAD)", { timeout: TEST_TIMEOUT }, () => {
+  afterEach(() => {
+    for (const child of children) child.kill("SIGKILL");
+    children.clear();
+  });
+
+  it("protocol v2: the clone's HEAD is the server's unborn branch (ls-refs=unborn)", async () => {
+    const root = makeTmpDir("vcs-interop-unborn-");
+    const repo = await createTransportRepo();
+    await repo.history.refs.setSymbolic("HEAD", "refs/heads/trunk");
+    const server = await serveFetchHandler(
+      createFetchHandler({
+        resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+      }),
+    );
+    try {
+      const dst = join(root, "empty");
+      const trace = join(root, "trace.txt");
+      const r = await gitAsync(
+        root,
+        [
+          "-c",
+          "protocol.version=2",
+          "-c",
+          "init.defaultBranch=master",
+          "clone",
+          `${server.baseUrl}/r.git`,
+          dst,
+        ],
+        { env: { GIT_TRACE_PACKET: trace } },
+      );
+      expect(r.code, r.stderr).toBe(0);
+      expect(readFileSync(trace, "utf8")).toMatch(/clone< unborn HEAD symref-target:refs\/heads\/trunk$/m);
+      expect(readFileSync(join(dst, ".git", "HEAD"), "utf8").trim()).toBe("ref: refs/heads/trunk");
+    } finally {
+      await server.close();
+      await repo.close();
+      cleanupDir(root);
+    }
   });
 });

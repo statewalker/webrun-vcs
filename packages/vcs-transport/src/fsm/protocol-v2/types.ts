@@ -55,12 +55,14 @@ export type FetchV2ResponseSection =
   | { type: "packfile" };
 
 /**
- * Default V2 server capabilities: what the server implements. `fetch=shallow` covers `deepen`,
- * `deepen-relative`, `deepen-since` and `deepen-not`; no `filter` (no partial clone).
+ * Default V2 server capabilities: what the server implements. `ls-refs=unborn`: ls-refs reports
+ * an unborn HEAD (`unborn HEAD symref-target:<ref>`), so cloning an empty repository picks its
+ * branch; `fetch=shallow` covers `deepen`, `deepen-relative`, `deepen-since` and `deepen-not`;
+ * no `filter` (no partial clone).
  */
 export const SERVER_V2_CAPABILITIES = [
   "agent=statewalker-vcs/1.0",
-  "ls-refs",
+  "ls-refs=unborn",
   "fetch=shallow wait-for-done",
   "server-option",
   "object-format=sha1",

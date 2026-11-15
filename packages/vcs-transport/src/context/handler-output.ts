@@ -24,6 +24,13 @@ export class HandlerOutput {
   streamBroken?: boolean;
 
   /**
+   * Server side: the error was reported to the client in band (an `ERR` line, or band 3 of the
+   * side-band). A transport that sees `error` without this flag once it started writing must
+   * still make the failure visible (an `ERR` line, or by aborting the response).
+   */
+  errorReported?: boolean;
+
+  /**
    * Last acknowledged object ID from server.
    * Updated during ACK/NAK negotiation.
    */

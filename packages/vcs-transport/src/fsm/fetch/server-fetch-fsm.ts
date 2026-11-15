@@ -82,6 +82,8 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["READ_HAVES", "HAVES_RECEIVED", "SEND_ACKS"],
   ["READ_HAVES", "DONE_RECEIVED", "SEND_FINAL_ACK"], // client sent done
   ["READ_HAVES", "FLUSH_RECEIVED", "SEND_ACKS"], // End of have batch
+  // stateless-rpc (smart HTTP): the request ends after a batch; its answer was sent
+  ["READ_HAVES", "REQUEST_END", ""],
   ["READ_HAVES", "ERROR", ""],
 
   // Send ACK/NAK responses (depends on multi_ack mode)
@@ -380,6 +382,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
 
       try {
         await transport.writeLine(`ERR ${output.error}`);
+        output.errorReported = true;
         return "ERROR_SENT";
       } catch (e) {
         output.error = String(e);
@@ -519,6 +522,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const repository = getRepository(ctx);
 
       try {
+        let first = true;
         while (true) {
           const pkt = await transport.readPktLine();
 
@@ -526,9 +530,13 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             return "FLUSH_RECEIVED";
           }
           if (pkt.type === "eof") {
+            // git's upload-pack with --stateless-rpc exits once a batch was answered: a
+            // request that ends between batches is complete, not cut short
+            if (first && getConfig(ctx).statelessRpc) return "REQUEST_END";
             output.error = "Unexpected end of input";
             return "ERROR";
           }
+          first = false;
           if (pkt.type === "delim") {
             continue; // Unexpected delimiter in v1 haves
           }
@@ -725,7 +733,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           return "PACK_SENT";
         }
         output.error = sent.error;
-        if (sent.inBand) return "SIDEBAND_ERROR";
+        if (sent.inBand) {
+          output.errorReported = true;
+          return "SIDEBAND_ERROR";
+        }
         // raw pack bytes may be out: the client must see a broken stream, not a short pack
         output.streamBroken = true;
         return "ERROR";

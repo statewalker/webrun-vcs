@@ -1,7 +1,11 @@
 /**
  * Sending a pack from upload-pack (protocol v0/v1 `SEND_PACK` and the v2 `packfile` section).
  *
- * With side-band, the pack goes on band 1, an error on band 3 (`ERR <message>`), so the client
+ * With side-band, the pack goes on band 1 in frames as full as the side-band allows (65515
+ * payload bytes with side-band-64k, 995 with side-band: 65520- and 1000-byte packets, as git's
+ * upload-pack), whatever the chunking of the pack source; at most one frame is held, and a
+ * partial one is sent when the source stalls for `keepAliveMs`. An error goes on band 3
+ * (`ERR <message>`), so the client
  * sees a failure in band even after the first pack byte. Until the first pack byte (while the
  * pack is prepared: listing objects, reading headers, the delta search) a keep-alive, an empty
  * band-1 packet `0005\x01`, is sent every `keepAliveMs`, as git's upload-pack does with
@@ -17,6 +21,12 @@ import type { TransportApi } from "../../api/transport-api.js";
 /** The default keep-alive interval (git's `uploadpack.keepAlive` is 5 seconds). */
 export const DEFAULT_KEEP_ALIVE_MS = 5000;
 
+/** The payload of a full side-band-64k packet (65520 bytes with the length and band byte). */
+export const SIDEBAND_64K_MAX_PAYLOAD = 65515;
+
+/** The payload of a full plain side-band packet (1000 bytes with the length and band byte). */
+export const SIDEBAND_MAX_PAYLOAD = 995;
+
 /** An empty band-1 packet: git's side-band keep-alive (`0005\x01`). */
 const KEEP_ALIVE_PAYLOAD = new Uint8Array([1]);
 
@@ -28,8 +38,16 @@ export interface SendPackStreamOptions {
   sideband: boolean;
   /** Send progress on band 2 (side-band only; off when the client sent `no-progress`). */
   progress?: boolean;
-  /** Keep-alive interval until the first pack byte, side-band only (0: none). Default 5000. */
+  /**
+   * Keep-alive interval until the first pack byte, side-band only (0: none). Default 5000.
+   * After it, a partial frame is sent when the pack source gives nothing for this long.
+   */
   keepAliveMs?: number;
+  /**
+   * Largest band-1 payload: {@link SIDEBAND_64K_MAX_PAYLOAD} (default) for side-band-64k,
+   * {@link SIDEBAND_MAX_PAYLOAD} for plain side-band.
+   */
+  maxPayload?: number;
 }
 
 /** What `sendPackStream` did. */
@@ -78,21 +96,58 @@ export async function sendPackStream(
   }
 
   const keepAliveMs = options.keepAliveMs ?? DEFAULT_KEEP_ALIVE_MS;
+  const maxPayload = Math.max(
+    1,
+    Math.min(options.maxPayload ?? SIDEBAND_64K_MAX_PAYLOAD, SIDEBAND_64K_MAX_PAYLOAD),
+  );
+  // one frame, filled from the pack chunks and sent when full (or at the end)
+  const frame = new Uint8Array(maxPayload);
+  let fill = 0;
   let bytes = 0;
+  let sent = 0;
+  const sendFrame = async (data: Uint8Array) => {
+    // writeSideband copies the payload into the packet: the frame buffer can be refilled
+    await transport.writeSideband(1, data);
+    sent += data.length;
+    if (options.progress) {
+      await transport.writeSideband(2, textEncoder.encode(`Sending objects: ${sent}\r`));
+    }
+  };
+  const flushFrame = async () => {
+    if (fill === 0) return;
+    const data = frame.subarray(0, fill);
+    fill = 0;
+    await sendFrame(data);
+  };
+  const append = async (chunk: Uint8Array) => {
+    let offset = 0;
+    while (offset < chunk.length) {
+      // whole frames straight from the chunk when nothing is held
+      if (fill === 0 && chunk.length - offset >= maxPayload) {
+        await sendFrame(chunk.subarray(offset, offset + maxPayload));
+        offset += maxPayload;
+        continue;
+      }
+      const n = Math.min(maxPayload - fill, chunk.length - offset);
+      frame.set(chunk.subarray(offset, offset + n), fill);
+      fill += n;
+      offset += n;
+      if (fill === maxPayload) await flushFrame();
+    }
+  };
+
   const it = pack[Symbol.asyncIterator]();
   try {
     let result = await firstChunk(it.next(), keepAliveMs, () =>
       transport.writePktLine(KEEP_ALIVE_PAYLOAD),
     );
     while (!result.done) {
-      const chunk = result.value;
-      await transport.writeSideband(1, chunk);
-      if (options.progress) {
-        await transport.writeSideband(2, textEncoder.encode(`Sending objects: ${bytes}\r`));
-      }
-      bytes += chunk.length;
-      result = await it.next();
+      bytes += result.value.length;
+      await append(result.value);
+      // a stalled source does not hold a partial frame back
+      result = await firstChunk(it.next(), keepAliveMs, flushFrame);
     }
+    await flushFrame();
     await transport.writeFlush();
     return { ok: true, bytes };
   } catch (error) {

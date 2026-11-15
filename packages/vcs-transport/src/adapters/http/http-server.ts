@@ -109,6 +109,16 @@ export const DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES = 1024 * 1024 * 1024;
 
 const textEncoder = new TextEncoder();
 
+/**
+ * git's http-backend `hdr_nocache`, sent with every info/refs and rpc response: neither the
+ * advertisement nor a negotiation answer may come from a cache.
+ */
+export const NO_CACHE_HEADERS: Readonly<Record<string, string>> = {
+  Expires: "Fri, 01 Jan 1980 00:00:00 GMT",
+  Pragma: "no-cache",
+  "Cache-Control": "no-cache, max-age=0, must-revalidate",
+};
+
 /** A request body larger than the server's limit (answered 413). */
 export class RequestBodyTooLargeError extends Error {
   constructor(readonly limit: number) {
@@ -334,7 +344,7 @@ export async function handleInfoRefs(
     status: 200,
     headers: {
       "Content-Type": "application/x-git-upload-pack-advertisement",
-      "Cache-Control": "no-cache",
+      ...NO_CACHE_HEADERS,
     },
     body,
   };
@@ -343,10 +353,12 @@ export async function handleInfoRefs(
 /**
  * Whether a `Git-Protocol` header asks for protocol v2. The value holds `key=value` parameters
  * separated by `:` (git's `GIT_PROTOCOL`), e.g. `version=2` or `version=2:object-format=sha1`.
+ * As git's `determine_protocol_version_server`, the entries are split on `:` exactly and not
+ * trimmed: `foo : version=2` asks for no version (v0).
  */
 export function requestsProtocolV2(gitProtocol: string | undefined): boolean {
   if (!gitProtocol) return false;
-  return gitProtocol.split(":").some((param) => param.trim() === "version=2");
+  return gitProtocol.split(":").some((param) => param === "version=2");
 }
 
 /** Whether `request` carries `Git-Protocol: version=2` (and v2 is not switched off). */
@@ -360,22 +372,18 @@ export function isProtocolV2Request(
 /**
  * Handles GET /info/refs?service=git-upload-pack with `Git-Protocol: version=2`.
  *
- * Returns the v2 capability advertisement: the smart-HTTP `# service=git-upload-pack` line
- * and a flush, then `version 2`, one capability per line and a flush. git's client reads the
- * advertisement with or without the service preamble.
+ * Returns the v2 capability advertisement: `version 2`, one capability per line and a flush.
+ * As git's http-backend, without the smart-HTTP `# service=git-upload-pack` preamble, which it
+ * writes only for v0.
  *
  * @example
  * ```ts
  * const response = handleInfoRefsV2();
- * // "# service=git-upload-pack", flush, "version 2", "agent=…", "ls-refs", …, flush
+ * // "version 2", "agent=…", "ls-refs=unborn", "fetch=shallow wait-for-done", …, flush
  * ```
  */
 export function handleInfoRefsV2(options: HttpServerOptions = {}): HttpResponse {
-  const chunks: Uint8Array[] = [
-    encodePacketLine("# service=git-upload-pack\n"),
-    encodeFlush(),
-    encodePacketLine("version 2\n"),
-  ];
+  const chunks: Uint8Array[] = [encodePacketLine("version 2\n")];
   for (const capability of options.v2Capabilities ?? SERVER_V2_CAPABILITIES) {
     chunks.push(encodePacketLine(`${capability}\n`));
   }
@@ -384,7 +392,7 @@ export function handleInfoRefsV2(options: HttpServerOptions = {}): HttpResponse 
     status: 200,
     headers: {
       "Content-Type": "application/x-git-upload-pack-advertisement",
-      "Cache-Control": "no-cache",
+      ...NO_CACHE_HEADERS,
     },
     body: concatBytes(chunks),
   };
@@ -429,6 +437,8 @@ export async function handleUploadPack(
     requestPolicy: options.requestPolicy ?? "ADVERTISED",
     maxEmptyBatches: 10,
     keepAliveMs: options.keepAliveMs,
+    // each POST is one request of a stateless negotiation (git's --stateless-rpc)
+    statelessRpc: true,
   };
 
   // Run server FSM starting from READ_WANTS state
@@ -473,6 +483,8 @@ export async function handleUploadPackV2(
     // git's upload-pack serves a stateless client any commit reachable from a ref
     requestPolicy: options.requestPolicy ?? "REACHABLE_COMMIT",
     keepAliveMs: options.keepAliveMs,
+    // one command per request (git's serve loop with --stateless-rpc); more are ignored
+    statelessRpc: true,
   };
 
   const fsm = new Fsm(serverV2Transitions, serverV2Handlers);
@@ -504,7 +516,15 @@ async function readUploadPackRequest(
 /**
  * Runs an upload-pack FSM over `requestBytes` and streams what it writes as the response
  * body: each write waits until the reader pulled the previous chunk (a slow client slows the
- * pack writer down; the pack is never buffered). A failure before the first write is a 500.
+ * pack writer down; the pack is never buffered).
+ *
+ * A failure before the first write is a 500 (git's http-backend answers an empty 200 there,
+ * its upload-pack having died before writing; the 500 carries the message). After the first
+ * write the status is out, so every failure must still reach the client: one the FSM reported
+ * in band (`errorReported`: an `ERR` line, or band 3 of the side-band) ends the response
+ * normally; any other is written as an `ERR <message>` pkt-line, which git's client takes as
+ * a remote error wherever a pkt-line may come; and where no pkt-line can come (raw pack bytes
+ * were out, `streamBroken`) or the FSM threw, the response stream is aborted.
  */
 async function streamUploadPack(
   requestBytes: Uint8Array,
@@ -539,17 +559,18 @@ async function streamUploadPack(
     output: new HandlerOutput(),
   };
 
-  // a protocol error (output.error) was reported in band (sideband 3, or an ERR line) once
-  // writing started, unless the FSM says it could not be (`streamBroken`: raw pack bytes were
-  // out); that one and a thrown one break the stream
-  const run = fsm.run(ctx).then(
-    () =>
-      ctx.output.error
-        ? { error: new Error(ctx.output.error), thrown: ctx.output.streamBroken === true }
-        : undefined,
+  type Failure = { error: Error; how: "reported" | "err-line" | "abort" };
+  const run: Promise<Failure | undefined> = fsm.run(ctx).then(
+    () => {
+      const output = ctx.output;
+      if (!output.error) return undefined;
+      const error = new Error(output.error);
+      if (output.streamBroken) return { error, how: "abort" };
+      return { error, how: output.errorReported ? "reported" : "err-line" };
+    },
     (error: unknown) => ({
       error: error instanceof Error ? error : new Error(String(error)),
-      thrown: true,
+      how: "abort",
     }),
   );
   // Until the FSM writes, a failure can still be a 500; after that the status is sent
@@ -562,15 +583,25 @@ async function streamUploadPack(
     }
   }
   void run.then(async (failure) => {
-    if (failure?.thrown) await out.abort(failure.error).catch(() => {});
-    else await out.close().catch(() => {});
+    if (failure?.how === "abort") {
+      await out.abort(failure.error).catch(() => {});
+      return;
+    }
+    if (failure?.how === "err-line") {
+      try {
+        await out.write(encodePacketLine(`ERR ${failure.error.message}\n`));
+      } catch {
+        // the client is gone
+      }
+    }
+    await out.close().catch(() => {});
   });
 
   return {
     status: 200,
     headers: {
       "Content-Type": "application/x-git-upload-pack-result",
-      "Cache-Control": "no-cache",
+      ...NO_CACHE_HEADERS,
     },
     body: pipe.readable,
   };
@@ -653,7 +684,7 @@ export async function handleReceivePackInfoRefs(
     status: 200,
     headers: {
       "Content-Type": "application/x-git-receive-pack-advertisement",
-      "Cache-Control": "no-cache",
+      ...NO_CACHE_HEADERS,
     },
     body,
   };
@@ -770,7 +801,7 @@ export async function handleReceivePack(
       status: 200,
       headers: {
         "Content-Type": "application/x-git-receive-pack-result",
-        "Cache-Control": "no-cache",
+        ...NO_CACHE_HEADERS,
       },
       body,
     };

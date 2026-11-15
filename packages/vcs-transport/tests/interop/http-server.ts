@@ -2,6 +2,9 @@
  * Test-only bridge from a `node:http` server on a loopback port to a Fetch API handler
  * (`createFetchHandler`): the request body and the response body are both streamed.
  *
+ * A client that disconnects mid-response (`res` emits 'close' before the body ended) cancels
+ * the response body reader, so the handler stops producing it.
+ *
  * Every request is logged with its method, path, `Git-Protocol` and `Content-Encoding`
  * headers, so tests can tell which protocol a real git client spoke.
  */
@@ -60,9 +63,34 @@ export async function serveFetchHandler(
         res.setHeader(key, value);
       });
       if (response.body) {
-        for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
-          // wait for the socket to take each chunk: the pack is pulled, not buffered
-          if (!res.write(chunk)) await new Promise((resolve) => res.once("drain", resolve));
+        const reader = response.body.getReader();
+        // a client that disconnects mid-response: cancel the body, so the server stops
+        // producing it (the pack source is finalized) instead of waiting on a dead socket
+        let closed = false;
+        const onClose = () => {
+          closed = true;
+          reader.cancel(new Error("client disconnected")).catch(() => {});
+        };
+        res.once("close", onClose);
+        try {
+          while (!closed) {
+            const next = await reader.read();
+            if (next.done) break;
+            // wait for the socket to take each chunk: the pack is pulled, not buffered
+            if (!res.write(next.value)) {
+              await new Promise<void>((resolve) => {
+                const done = () => {
+                  res.off("drain", done);
+                  res.off("close", done);
+                  resolve();
+                };
+                res.once("drain", done);
+                res.once("close", done);
+              });
+            }
+          }
+        } finally {
+          res.off("close", onClose);
         }
       }
       res.end();

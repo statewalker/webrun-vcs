@@ -65,6 +65,33 @@ export function git(cwd: string, args: string[]): string {
   }).trim();
 }
 
+const PROXY_VARIABLES = new Set([
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+]);
+
+/**
+ * `process.env` for a git that talks to a loopback HTTP server: without proxy variables, and
+ * with `127.0.0.1` and `localhost` in `NO_PROXY`/`no_proxy`, so a proxy configured on the
+ * machine (or in CI) never sees the request.
+ */
+export function loopbackEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !PROXY_VARIABLES.has(key)) env[key] = value;
+  }
+  const noProxy = [env.NO_PROXY, env.no_proxy, "127.0.0.1", "localhost"]
+    .filter((v) => v !== undefined && v !== "")
+    .join(",");
+  env.NO_PROXY = noProxy;
+  env.no_proxy = noProxy;
+  return env;
+}
+
 /** Create a throwaway tmp directory; caller cleans up via {@link cleanupDir}. */
 export function makeTmpDir(prefix = "vcs-interop-"): string {
   return mkdtempSync(join(tmpdir(), prefix));
