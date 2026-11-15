@@ -547,3 +547,131 @@ describe("receive-pack: review fixes", () => {
     expect(createRepositoryFacade({ history: repo.history, bare: false }).isBare?.()).toBe(false);
   });
 });
+
+describe("receive-pack: atomic pushes as git's execute_commands_atomic", () => {
+  /** The server, and a pack with n0 complete and n1 missing its tree */
+  async function brokenPush() {
+    const { repo, c2 } = await serverRepo();
+    const { client, commits } = await clientWithNewCommits(2);
+    const [n0, n1] = commits as [string, string];
+    const pack = await packOf(client, [n1, n0, ...(await treeClosure(client, n0))]);
+    return { repo, c2, n0, n1, pack };
+  }
+
+  it("a ref missing objects is refused, the others land together (git's default)", async () => {
+    const { repo, n0, n1, pack } = await brokenPush();
+    const run = await runReceivePack(repo, {
+      commands: [`${ZERO} ${n1} refs/heads/broken`, `${ZERO} ${n0} refs/heads/fine`],
+      caps: "report-status side-band-64k atomic",
+      pack,
+    });
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/broken missing necessary objects",
+      "ok refs/heads/fine",
+    ]);
+    expect(await repo.refStore.get("refs/heads/fine")).toBe(n0);
+    expect(await repo.facade.has(n0)).toBe(true);
+  });
+
+  it("strictAtomic: a ref missing objects fails the whole push", async () => {
+    const { repo, n0, n1, pack } = await brokenPush();
+    const run = await runReceivePack(
+      repo,
+      {
+        commands: [`${ZERO} ${n1} refs/heads/broken`, `${ZERO} ${n0} refs/heads/fine`],
+        caps: "report-status side-band-64k atomic",
+        pack,
+      },
+      { strictAtomic: true },
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/broken missing necessary objects",
+      "ng refs/heads/fine atomic push failure",
+    ]);
+    expect(await repo.refStore.get("refs/heads/fine")).toBeUndefined();
+    // nothing applied: the quarantine was discarded
+    expect(await repo.facade.has(n0)).toBe(false);
+  });
+
+  it("refs pre-receive refuses keep its error, the others land; strictAtomic fails them all", async () => {
+    for (const strictAtomic of [false, true]) {
+      const { repo, c2 } = await serverRepo();
+      const { client, commits } = await clientWithNewCommits(1);
+      const [n0] = commits as [string];
+      const pack = await fullPackOf(client, [n0], [c2]);
+      const run = await runReceivePack(
+        repo,
+        {
+          commands: [`${ZERO} ${n0} refs/heads/a`, `${ZERO} ${n0} refs/heads/b`],
+          caps: "report-status side-band-64k atomic",
+          pack,
+        },
+        {
+          strictAtomic,
+          hooks: { preReceive: () => ({ ok: false, rejectedRefs: ["refs/heads/a"] }) },
+        },
+      );
+      expect(run.report).toEqual([
+        "unpack ok",
+        "ng refs/heads/a pre-receive hook declined",
+        strictAtomic ? "ng refs/heads/b atomic push failure" : "ok refs/heads/b",
+      ]);
+      expect(await repo.refStore.get("refs/heads/b")).toBe(strictAtomic ? undefined : n0);
+    }
+  });
+
+  it("the first refusal in update() stops the checks: later update hooks do not run", async () => {
+    const { repo, c2 } = await serverRepo();
+    const { client, commits } = await clientWithNewCommits(1);
+    const [n0] = commits as [string];
+    const pack = await fullPackOf(client, [n0], [c2]);
+    const hooked: string[] = [];
+    const run = await runReceivePack(
+      repo,
+      {
+        commands: [
+          `${ZERO} ${n0} refs/heads/a`,
+          `${ZERO} ${n0} refs/heads/x..y`,
+          `${ZERO} ${n0} refs/heads/b`,
+        ],
+        caps: "report-status side-band-64k atomic",
+        pack,
+      },
+      {
+        hooks: {
+          update: (refName) => {
+            hooked.push(refName);
+            return true;
+          },
+        },
+      },
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/a atomic push failure",
+      "ng refs/heads/x..y funny refname",
+      "ng refs/heads/b atomic push failure",
+    ]);
+    expect(hooked).toEqual(["refs/heads/a"]);
+  });
+
+  it("a stale old value fails the transaction once every ref passed update()", async () => {
+    const { repo, c1, c2 } = await serverRepo();
+    const { client, commits } = await clientWithNewCommits(1);
+    const [n0] = commits as [string];
+    const pack = await fullPackOf(client, [n0], [c2]);
+    const run = await runReceivePack(repo, {
+      commands: [`${ZERO} ${n0} refs/heads/a`, `${c1} ${n0} refs/heads/main`],
+      caps: "report-status side-band-64k atomic",
+      pack,
+    });
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/a atomic transaction failed",
+      "ng refs/heads/main atomic transaction failed",
+    ]);
+    expect(await repo.refStore.get("refs/heads/a")).toBeUndefined();
+  });
+});

@@ -3,6 +3,10 @@
  * repository): the same requests must get the same protocol v2 answers, byte for byte where
  * git's output is deterministic, and git's no-cache headers. Errors git reports before
  * writing anything (it exits with an empty 200 body) are a 500 here carrying git's message.
+ *
+ * Three servers of ours: the defaults (no object-info, any object served over v2, as current
+ * git), `advertiseObjectInfo` (compared with git under `transfer.advertiseObjectInfo=true`) and
+ * `requestPolicy: "REACHABLE_COMMIT"` (a stricter v2 than any git setting gives).
  */
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
@@ -57,6 +61,7 @@ function httpBackend(
   query: string,
   headers: Record<string, string>,
   body?: Buffer,
+  config: Record<string, string> = {},
 ): Promise<Answer> {
   return new Promise((resolve) => {
     const env: Record<string, string> = {
@@ -64,12 +69,6 @@ function httpBackend(
       ...GIT_ENV,
       GIT_PROJECT_ROOT: root,
       GIT_HTTP_EXPORT_ALL: "1",
-      // Newer git (CI runs 2.5x) no longer advertises or serves object-info unless
-      // `transfer.advertiseObjectInfo` is set; older git ignores the key. We serve
-      // object-info, so pin the oracle to advertise it too.
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "transfer.advertiseObjectInfo",
-      GIT_CONFIG_VALUE_0: "true",
       REQUEST_METHOD: method,
       PATH_INFO: path,
       QUERY_STRING: query,
@@ -77,6 +76,12 @@ function httpBackend(
       REMOTE_ADDR: "127.0.0.1",
     };
     if (body) env.CONTENT_LENGTH = String(body.length);
+    const entries = Object.entries(config);
+    env.GIT_CONFIG_COUNT = String(entries.length);
+    entries.forEach(([key, value], i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = key;
+      env[`GIT_CONFIG_VALUE_${i}`] = value;
+    });
     for (const [k, v] of Object.entries(headers)) {
       env[`HTTP_${k.toUpperCase().replace(/-/g, "_")}`] = v;
     }
@@ -139,23 +144,69 @@ async function ours(
 
 /** The body with the `agent=` capability line made comparable. */
 function sameAgent(body: Buffer): string {
-  return (
-    body
-      .toString("latin1")
-      .replace(/[0-9a-f]{4}agent=[^\n]*\n/, "XXXXagent=*\n")
-      // git's object-info line depends on its version: 2.43 sends `object-info`, newer git
-      // sends `object-info=size type` (and only when transfer.advertiseObjectInfo is set).
-      // We serve the `size` attribute, so compare everything else byte for byte.
-      .replace(/[0-9a-f]{4}object-info(=[^\n]*)?\n/, "XXXXobject-info*\n")
+  return body.toString("latin1").replace(/[0-9a-f]{4}agent=[^\n]*\n/, "XXXXagent=*\n");
+}
+
+/**
+ * git's advertisement as current git writes it. git 2.43 (the sandbox's) advertises a bare
+ * `object-info` whatever `transfer.advertiseObjectInfo` says; since 2.46 git advertises
+ * `object-info=size type` only with that setting (CI's git). A bare line is 2.43's: dropped
+ * when the setting is off, written as current git does when it is on.
+ */
+function asCurrentGit(body: Buffer, advertiseObjectInfo: boolean): Buffer {
+  const legacy = pkt("object-info\n");
+  const text = body.toString("latin1");
+  if (!text.includes(legacy)) return body;
+  return Buffer.from(
+    text.replace(legacy, advertiseObjectInfo ? pkt("object-info=size type\n") : ""),
+    "latin1",
   );
+}
+
+/** Whether a git advertisement offers object-info (2.43 always does). */
+function offersObjectInfo(body: Buffer): boolean {
+  return /[0-9a-f]{4}object-info(=[^\n]*)?\n/.test(body.toString("latin1"));
+}
+
+/** A v2 fetch response: its text pkt-lines up to the pack, and the pack's object count. */
+function fetchSections(body: Buffer): { lines: string[]; packObjects?: number } {
+  const lines: string[] = [];
+  const pack: Buffer[] = [];
+  let pos = 0;
+  let inPack = false;
+  while (pos + 4 <= body.length) {
+    const len = Number.parseInt(body.subarray(pos, pos + 4).toString("latin1"), 16);
+    if (len < 4) {
+      if (!inPack) lines.push(len === 0 ? "FLUSH" : "DELIM");
+      pos += 4;
+      continue;
+    }
+    const payload = body.subarray(pos + 4, pos + len);
+    pos += len;
+    if (inPack) {
+      if (payload[0] === 1) pack.push(payload.subarray(1));
+      continue;
+    }
+    const text = payload.toString("latin1").replace(/\n$/, "");
+    lines.push(text);
+    if (text === "packfile") inPack = true;
+  }
+  const bytes = Buffer.concat(pack);
+  return { lines, packObjects: bytes.length >= 12 ? bytes.readUInt32BE(8) : undefined };
 }
 
 describeGit("Interop · our smart-HTTP v2 server against git http-backend", () => {
   let repo: TransportRepo;
   let server: LoopbackHttpServer;
+  /** Ours with `advertiseObjectInfo` */
+  let infoServer: LoopbackHttpServer;
+  /** Ours with `requestPolicy: "REACHABLE_COMMIT"` */
+  let strictServer: LoopbackHttpServer;
   let root: string;
   let c1: string;
   let c2: string;
+  /** A blob no ref reaches, in both repositories */
+  let dangling: string;
 
   beforeAll(async () => {
     repo = await createTransportRepo();
@@ -163,11 +214,14 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
     c2 = await commitInRepo(repo, "c2", { "a.txt": "b\n" }, [c1]);
     await repo.refStore.update("refs/heads/main", c2);
     await repo.history.refs.setSymbolic("HEAD", "refs/heads/main");
-    server = await serveFetchHandler(
-      createFetchHandler({
-        resolveRepository: async (p) =>
-          p === "/r.git" ? { repository: repo.facade, refStore: repo.refStore } : null,
-      }),
+    const resolveRepository = async (p: string) =>
+      p === "/r.git" ? { repository: repo.facade, refStore: repo.refStore } : null;
+    server = await serveFetchHandler(createFetchHandler({ resolveRepository }));
+    infoServer = await serveFetchHandler(
+      createFetchHandler({ resolveRepository, advertiseObjectInfo: true }),
+    );
+    strictServer = await serveFetchHandler(
+      createFetchHandler({ resolveRepository, requestPolicy: "REACHABLE_COMMIT" }),
     );
     root = makeTmpDir("vcs-oracle-");
     await new Promise<void>((resolve, reject) => {
@@ -183,6 +237,29 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
       );
       children.add(child);
     });
+    // the same unreferenced blob on both sides
+    dangling = await repo.history.blobs.store([new TextEncoder().encode("dangling\n")]);
+    await new Promise<void>((resolve, reject) => {
+      const child = execFile(
+        "git",
+        ["hash-object", "-w", "--stdin"],
+        {
+          cwd: join(root, "r.git"),
+          env: { ...loopbackEnv(), ...GIT_ENV },
+          timeout: GIT_TIMEOUT,
+          killSignal: "SIGKILL",
+        },
+        (error, stdout) => {
+          children.delete(child);
+          if (error) reject(error);
+          else if (stdout.trim() !== dangling) reject(new Error(`blob ${stdout} != ${dangling}`));
+          else resolve();
+        },
+      );
+      children.add(child);
+      child.stdin?.on("error", () => {});
+      child.stdin?.end("dangling\n");
+    });
   }, 30000);
 
   afterEach(() => {
@@ -192,6 +269,8 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
 
   afterAll(async () => {
     await server?.close();
+    await infoServer?.close();
+    await strictServer?.close();
     await repo?.close();
     if (root) cleanupDir(root);
   });
@@ -199,17 +278,27 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
   const V2 = { "git-protocol": "version=2" };
   const POST = { "content-type": "application/x-git-upload-pack-request", ...V2 };
 
+  /**
+   * The same request to git and to ours. "objectInfo": git with
+   * `transfer.advertiseObjectInfo=true`, ours with `advertiseObjectInfo`; "strict": ours with
+   * `requestPolicy: "REACHABLE_COMMIT"`, git as configured by `config`.
+   */
   async function both(
     method: string,
     path: string,
     query: string,
     headers: Record<string, string>,
     body?: string,
+    mode: "default" | "objectInfo" | "strict" = "default",
+    config: Record<string, string> = {},
   ): Promise<[Answer, Answer]> {
     const bytes = body === undefined ? undefined : Buffer.from(body, "latin1");
+    const gitConfig =
+      mode === "objectInfo" ? { "transfer.advertiseObjectInfo": "true", ...config } : config;
+    const target = mode === "objectInfo" ? infoServer : mode === "strict" ? strictServer : server;
     return [
-      await httpBackend(root, method, path, query, headers, bytes),
-      await ours(server, method, path, query, headers, bytes),
+      await httpBackend(root, method, path, query, headers, bytes, gitConfig),
+      await ours(target, method, path, query, headers, bytes),
     ];
   }
 
@@ -218,7 +307,8 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
       const [git, our] = await both("GET", "/r.git/info/refs", "service=git-upload-pack", {
         "git-protocol": gitProtocol,
       });
-      expect(sameAgent(our.body), gitProtocol).toBe(sameAgent(git.body));
+      expect(sameAgent(our.body), gitProtocol).toBe(sameAgent(asCurrentGit(git.body, false)));
+      expect(our.body.toString("latin1")).not.toContain("object-info");
     }
     // a padded entry is not version=2, for git as for us: both answer v0 (a header value's
     // leading and trailing spaces are dropped by HTTP itself, so only inner ones count)
@@ -244,14 +334,12 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
     }
   });
 
-  it("answers ls-refs, object-info and an acks-only fetch byte for byte as git", async () => {
+  it("answers ls-refs and an acks-only fetch byte for byte as git", async () => {
     const requests = [
       `${pkt("command=ls-refs\n")}${pkt("agent=git/2\n")}0001${pkt("symrefs\n")}${pkt("peel\n")}${pkt("unborn\n")}0000`,
       `${pkt("command=ls-refs\n")}0001${pkt("ref-prefix HEAD\n")}0000`,
       // two commands in one POST: git runs only the first
       `${pkt("command=ls-refs\n")}00010000${pkt("command=ls-refs\n")}00010000`,
-      `${pkt("command=object-info\n")}0001${pkt("size\n")}${pkt(`oid ${c2}\n`)}${pkt(`oid ${"1".repeat(40)}\n`)}0000`,
-      `${pkt("command=object-info\n")}0001${pkt(`oid ${c2}\n`)}0000`,
       `${pkt("command=fetch\n")}0001${pkt(`want ${c2}\n`)}${pkt(`have ${"2".repeat(40)}\n`)}0000`,
       "",
       "0000",
@@ -261,6 +349,94 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
       expect(our.status, JSON.stringify(body)).toBe(200);
       expect(our.body.toString("latin1"), JSON.stringify(body)).toBe(git.body.toString("latin1"));
     }
+  });
+
+  it("object-info: not served by default (current git); git 2.43 serves it regardless", async () => {
+    const [advert] = await both("GET", "/r.git/info/refs", "service=git-upload-pack", V2);
+    const body = `${pkt("command=object-info\n")}0001${pkt("size\n")}${pkt(`oid ${c2}\n`)}0000`;
+    const [git, our] = await both("POST", "/r.git/git-upload-pack", "", POST, body);
+    expect(our.status).toBe(500);
+    expect(our.body.toString()).toContain("invalid command 'object-info'");
+    // current git refuses it unless transfer.advertiseObjectInfo; 2.43 always offers it
+    const legacy = advert.body.toString("latin1").includes(pkt("object-info\n"));
+    if (!legacy) {
+      expect(offersObjectInfo(advert.body)).toBe(false);
+      expect(git.stderr).toContain("invalid command 'object-info'");
+    }
+  });
+
+  it("object-info with advertiseObjectInfo: advertisement and sizes byte for byte as git", async () => {
+    const [advertGit, advertOurs] = await both(
+      "GET",
+      "/r.git/info/refs",
+      "service=git-upload-pack",
+      V2,
+      undefined,
+      "objectInfo",
+    );
+    expect(sameAgent(advertOurs.body)).toBe(sameAgent(asCurrentGit(advertGit.body, true)));
+    expect(advertOurs.body.toString("latin1")).toContain(pkt("object-info=size type\n"));
+
+    const requests = [
+      `${pkt("command=object-info\n")}0001${pkt("size\n")}${pkt(`oid ${c2}\n`)}${pkt(`oid ${"1".repeat(40)}\n`)}0000`,
+      `${pkt("command=object-info\n")}0001${pkt(`oid ${c2}\n`)}0000`,
+      `${pkt("command=object-info\n")}0001${pkt("size\n")}0000`,
+    ];
+    for (const body of requests) {
+      const [git, our] = await both("POST", "/r.git/git-upload-pack", "", POST, body, "objectInfo");
+      expect(our.status, JSON.stringify(body)).toBe(200);
+      expect(our.body.toString("latin1"), JSON.stringify(body)).toBe(git.body.toString("latin1"));
+    }
+  });
+
+  it("v2 fetch of an object no ref reaches: served by default, as git's upload-pack", async () => {
+    const body = `${pkt("command=fetch\n")}0001${pkt(`want ${dangling}\n`)}${pkt("done\n")}0000`;
+    const [git, our] = await both("POST", "/r.git/git-upload-pack", "", POST, body);
+    expect(git.status).toBe(200);
+    expect(our.status).toBe(200);
+    const [gitFetch, ourFetch] = [fetchSections(git.body), fetchSections(our.body)];
+    expect(gitFetch).toEqual({ lines: ["packfile"], packObjects: 1 });
+    expect(ourFetch).toEqual(gitFetch);
+  });
+
+  it("v2 fetch of a missing object: 'not our ref' byte for byte as git", async () => {
+    const missing = "3".repeat(40);
+    const body = `${pkt("command=fetch\n")}0001${pkt(`want ${missing}\n`)}${pkt("done\n")}0000`;
+    const [git, our] = await both("POST", "/r.git/git-upload-pack", "", POST, body);
+    expect(git.body.toString("latin1")).toContain(`ERR upload-pack: not our ref ${missing}`);
+    expect(our.body.toString("latin1")).toBe(git.body.toString("latin1"));
+  });
+
+  it("requestPolicy REACHABLE_COMMIT refuses it as git refuses a missing object; no git setting does", async () => {
+    // git's v2 ignores uploadpack.allow*SHA1InWant: even all false, it serves the object
+    const strictest = {
+      "uploadpack.allowAnySHA1InWant": "false",
+      "uploadpack.allowReachableSHA1InWant": "false",
+      "uploadpack.allowTipSHA1InWant": "false",
+    };
+    const body = `${pkt("command=fetch\n")}0001${pkt(`want ${dangling}\n`)}${pkt("done\n")}0000`;
+    const [git, our] = await both(
+      "POST",
+      "/r.git/git-upload-pack",
+      "",
+      POST,
+      body,
+      "strict",
+      strictest,
+    );
+    expect(fetchSections(git.body)).toEqual({ lines: ["packfile"], packObjects: 1 });
+    // ours: git's message for a want it refuses
+    const missing = "3".repeat(40);
+    const gitRefusal = (
+      await both(
+        "POST",
+        "/r.git/git-upload-pack",
+        "",
+        POST,
+        `${pkt("command=fetch\n")}0001${pkt(`want ${missing}\n`)}${pkt("done\n")}0000`,
+      )
+    )[0].body.toString("latin1");
+    expect(our.body.toString("latin1")).toBe(gitRefusal.replaceAll(missing, dangling));
   });
 
   it("refuses what git refuses, with git's message", async () => {

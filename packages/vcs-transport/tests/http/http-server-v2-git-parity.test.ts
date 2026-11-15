@@ -145,6 +145,7 @@ describe("v2 over HTTP: a failure after the first byte is visible", () => {
       };
       return {
         resolveRepository: async () => ({ repository: facade, refStore: repo.refStore }),
+        advertiseObjectInfo: true,
       };
     });
     try {
@@ -241,8 +242,54 @@ describe("v2 over HTTP: ls-refs unborn", () => {
 });
 
 describe("v2 over HTTP: object-info as git writes it", () => {
+  // git serves object-info only with transfer.advertiseObjectInfo (since 2.46)
+  const withObjectInfo = () => ({ advertiseObjectInfo: true });
+
+  it("is neither advertised nor served by default, as git", async () => {
+    const { repo, handler } = await setup();
+    try {
+      const lines = pktLines(await bodyText(await handler(infoRefs("git-upload-pack", V2))));
+      expect(lines.some((l) => l.startsWith("object-info"))).toBe(false);
+      const response = await handler(post(command("object-info", ["size"])));
+      expect(response.status).toBe(500);
+      expect(await bodyText(response)).toContain("invalid command 'object-info'");
+    } finally {
+      await repo.close();
+    }
+  });
+
+  it("advertiseObjectInfo advertises `object-info=size type`, as current git", async () => {
+    const { repo, handler } = await setup(withObjectInfo);
+    try {
+      const lines = pktLines(await bodyText(await handler(infoRefs("git-upload-pack", V2))));
+      expect(lines.filter((l) => l.startsWith("object-info"))).toEqual(["object-info=size type"]);
+    } finally {
+      await repo.close();
+    }
+  });
+
+  it("the type attribute: `<oid> <size> <type>`, a missing object as `<oid> `", async () => {
+    const { repo, handler, c2 } = await setup(withObjectInfo);
+    try {
+      const size = await repo.facade.getObjectSize?.(c2);
+      const missing = "1".repeat(40);
+      const text = await bodyText(
+        await handler(
+          post(command("object-info", ["size", "type", `oid ${c2}`, `oid ${missing}`])),
+        ),
+      );
+      expect(text).toBe(
+        `${pkt("size")}${pkt("type")}${pkt(`${c2} ${size} commit`)}${pkt(`${missing} `)}0000`,
+      );
+      // without attributes the object is still looked up (current git's send_info)
+      const bare = await bodyText(await handler(post(command("object-info", [`oid ${missing}`]))));
+      expect(bare).toBe(`${pkt(`${missing} `)}0000`);
+    } finally {
+      await repo.close();
+    }
+  });
   it("one line per requested oid, a missing one as `<oid> `, no newlines", async () => {
-    const { repo, handler, c2 } = await setup();
+    const { repo, handler, c2 } = await setup(withObjectInfo);
     try {
       const size = await repo.facade.getObjectSize?.(c2);
       const missing = "1".repeat(40);
@@ -256,7 +303,7 @@ describe("v2 over HTTP: object-info as git writes it", () => {
   });
 
   it("sends sizes only when the size attribute is requested", async () => {
-    const { repo, handler, c2 } = await setup();
+    const { repo, handler, c2 } = await setup(withObjectInfo);
     try {
       const text = await bodyText(await handler(post(command("object-info", [`oid ${c2}`]))));
       expect(text).toBe(`${pkt(c2)}0000`);
@@ -268,7 +315,7 @@ describe("v2 over HTTP: object-info as git writes it", () => {
   });
 
   it("answers a malformed oid with ERR and goes on", async () => {
-    const { repo, handler, c2 } = await setup();
+    const { repo, handler, c2 } = await setup(withObjectInfo);
     try {
       const size = await repo.facade.getObjectSize?.(c2);
       const text = await bodyText(

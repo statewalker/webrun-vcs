@@ -2,7 +2,8 @@
  * Protocol v2 upload-pack against git's upload-pack.c, over raw pkt-line requests into
  * `serveOverDuplex` (real vcs-core repositories):
  *
- * - "not our ref" for wants that are no tip and not reachable from one,
+ * - wants: any object the repository has by default (git's v2), "not our ref" for a missing
+ *   one; with `requestPolicy: "REACHABLE_COMMIT"`, also for wants no tip reaches,
  * - negotiation: "ready" only from ok_to_give_up, no acknowledgments after "done" or without
  *   haves, NAK when nothing is common, never "ready" with wait-for-done,
  * - shallow: deepen, unshallow, deepen-relative, deepen-since, deepen-not, and the pack cut at
@@ -12,7 +13,7 @@
 
 import { describe, expect, it } from "vitest";
 import { createSimpleDuplex } from "../src/adapters/http/http-duplex.js";
-import { fetchOverDuplex, serveOverDuplex } from "../src/index.js";
+import { fetchOverDuplex, serveOverDuplex, type UploadPackRequestPolicy } from "../src/index.js";
 import { encodeDelim, encodeFlush, encodePacketLine } from "../src/protocol/pkt-line-codec.js";
 import { createTransportRepo, type TransportRepo } from "./interop/helpers.js";
 
@@ -99,7 +100,7 @@ function parseResponse(bytes: Uint8Array): V2Response {
 async function fetchRaw(
   repo: TransportRepo,
   args: string[],
-  options: { requestPolicy?: "ANY" } = {},
+  options: { requestPolicy?: UploadPackRequestPolicy } = {},
 ): Promise<V2Response> {
   const request = concat([
     encodePacketLine("command=fetch\n"),
@@ -140,9 +141,18 @@ async function linearRepo() {
 }
 
 describe("protocol v2 upload-pack: not our ref", () => {
-  it("refuses a commit no ref reaches", async () => {
+  it("serves a commit no ref reaches by default, as git's v2", async () => {
     const { repo, dangling } = await linearRepo();
     const res = await fetchRaw(repo, [`want ${dangling}`, "done"]);
+    expect(res.lines).toContain("packfile");
+    expect(res.packObjects).toBe(9); // d, c2, c1: commit + tree + blob each
+  });
+
+  it("refuses a commit no ref reaches with requestPolicy REACHABLE_COMMIT", async () => {
+    const { repo, dangling } = await linearRepo();
+    const res = await fetchRaw(repo, [`want ${dangling}`, "done"], {
+      requestPolicy: "REACHABLE_COMMIT",
+    });
     expect(res.lines).toContain(`ERR upload-pack: not our ref ${dangling}`);
     expect(res.lines).not.toContain("packfile");
   });
@@ -161,14 +171,16 @@ describe("protocol v2 upload-pack: not our ref", () => {
     expect(res.packObjects).toBe(6); // c1, c2: commit + tree + blob each
   });
 
-  it("refuses a blob that is no tip (as allowReachableSHA1InWant), unless the policy is ANY", async () => {
+  it("refuses a tree that is no tip with REACHABLE_COMMIT (allowReachableSHA1InWant); serves it by default", async () => {
     const { repo, c1 } = await linearRepo();
     const tree = await repo.history.commits.getTree(c1);
-    const res = await fetchRaw(repo, [`want ${tree}`, "done"]);
+    const res = await fetchRaw(repo, [`want ${tree}`, "done"], {
+      requestPolicy: "REACHABLE_COMMIT",
+    });
     expect(res.lines).toContain(`ERR upload-pack: not our ref ${tree}`);
 
-    const any = await fetchRaw(repo, [`want ${tree}`, "done"], { requestPolicy: "ANY" });
-    expect(any.lines).toContain("packfile");
+    const byDefault = await fetchRaw(repo, [`want ${tree}`, "done"]);
+    expect(byDefault.lines).toContain("packfile");
   });
 });
 

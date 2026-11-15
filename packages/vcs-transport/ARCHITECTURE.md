@@ -288,7 +288,7 @@ done
 0000
 ```
 
-Supported V2 commands: `ls-refs`, `fetch`, `object-info`.
+Supported V2 commands: `ls-refs`, `fetch`, `object-info` (advertised and served only with `advertiseObjectInfo`, as git's `transfer.advertiseObjectInfo`).
 
 ## Error Recovery
 

@@ -20,7 +20,7 @@ import {
   UploadPackRequestError,
 } from "../fetch/index.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
-import { createEmptyFetchRequest, type FetchV2Request, SERVER_V2_CAPABILITIES } from "./types.js";
+import { createEmptyFetchRequest, type FetchV2Request, serverV2Capabilities } from "./types.js";
 
 /**
  * Server V2 FSM transitions.
@@ -116,8 +116,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
       try {
         await ctx.transport.writeLine("version 2");
 
-        const capabilities = ctx.config.serverCapabilities ?? SERVER_V2_CAPABILITIES;
-        for (const cap of capabilities) {
+        for (const cap of advertisedCapabilities(ctx)) {
           await ctx.transport.writeLine(cap);
         }
 
@@ -415,9 +414,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           return "INVALID_WANT";
         }
 
-        // Direct wants: by default git's allowReachableSHA1InWant (the tips, or commits
-        // reachable from them); "not our ref" for anything else
-        const policy = ctx.config.requestPolicy ?? "REACHABLE_COMMIT";
+        // Direct wants: by default any object the repository has, as git's v2 upload-pack
+        // (its parse_want refuses only a missing object, whatever uploadpack.allow* say); a
+        // stricter policy is ours. "not our ref" for anything refused
+        const policy = ctx.config.requestPolicy ?? "ANY";
         const tips = [...(await ctx.refStore.listAll())].map(([, oid]) => oid);
         let refused: string | undefined;
         if (policy === "ANY") {
@@ -708,6 +708,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
       try {
         const objectIds: string[] = [];
         let size = false;
+        let type = false;
 
         // Read arguments until flush (git's cap_object_info)
         while (true) {
@@ -721,16 +722,18 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
           const line = pkt.text;
           if (line === "size") size = true;
+          else if (line === "type") type = true;
           else if (line.startsWith("oid ")) objectIds.push(line.slice(4));
           else await writeRaw(ctx, `ERR object-info: unexpected line: '${line}'`);
         }
 
-        // git's send_info: nothing for no oid; the `size` attribute line when sizes were
-        // asked for; then a line per requested oid, in order, written as git writes them
-        // (no newline): "<oid> <size>", "<oid> " for an object it does not have, "<oid>"
-        // without the size attribute; an ERR for what is not an oid
+        // git's send_info: nothing for no oid; the attribute lines asked for (`size`, then
+        // `type`); then a line per requested oid, in order, written as git writes them (no
+        // newline): "<oid> <size> <type>" with the attributes asked for, "<oid> " for an
+        // object it does not have; an ERR for what is not an oid
         if (objectIds.length > 0) {
           if (size) await writeRaw(ctx, "size");
+          if (type) await writeRaw(ctx, "type");
           for (const oid of objectIds) {
             if (!OID_PATTERN.test(oid)) {
               await writeRaw(
@@ -739,12 +742,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
               );
               continue;
             }
-            if (!size) {
-              await writeRaw(ctx, oid);
+            const info = await objectInfo(ctx, oid, size, type);
+            if (info === null) {
+              await writeRaw(ctx, `${oid} `);
               continue;
             }
-            const objectSize = (await ctx.repository.getObjectSize?.(oid)) ?? null;
-            await writeRaw(ctx, objectSize === null ? `${oid} ` : `${oid} ${objectSize}`);
+            await writeRaw(ctx, [oid, ...info].join(" "));
           }
         }
 
@@ -763,8 +766,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     async (ctx) => {
       try {
         const errorMsg = ctx.output.error ?? "Unknown error";
-        await ctx.transport.writeLine(`ERR ${errorMsg}`);
-        await ctx.transport.writeFlush();
+        // git's packet_writer_error, then it dies: no newline, no flush
+        await writeRaw(ctx, `ERR ${errorMsg}`);
         ctx.output.errorReported = true;
         return "ERROR_SENT";
       } catch (e) {
@@ -816,7 +819,33 @@ function writeRaw(ctx: ProcessContext, text: string): Promise<void> {
 }
 
 function advertisedCapabilities(ctx: ProcessContext): string[] {
-  return ctx.config.serverCapabilities ?? SERVER_V2_CAPABILITIES;
+  return serverV2Capabilities(ctx.config.serverCapabilities, ctx.config.advertiseObjectInfo);
+}
+
+/**
+ * The attributes object-info asks for, in git's order (size, type), or null for an object the
+ * repository does not have (current git's send_info looks every object up, attributes or not;
+ * 2.43 only for `size`).
+ */
+async function objectInfo(
+  ctx: ProcessContext,
+  oid: string,
+  size: boolean,
+  type: boolean,
+): Promise<string[] | null> {
+  const out: string[] = [];
+  if (size) {
+    const objectSize = (await ctx.repository.getObjectSize?.(oid)) ?? null;
+    if (objectSize === null) return null;
+    out.push(String(objectSize));
+  }
+  if (type) {
+    const objectType = await ctx.repository.getObjectType?.(oid);
+    if (objectType === undefined) return null;
+    out.push(objectType);
+  }
+  if (!size && !type && !(await ctx.repository.has(oid))) return null;
+  return out;
 }
 
 /** Whether the advertisement has capability `name` (`name` or `name=<features>`). */

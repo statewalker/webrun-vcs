@@ -235,12 +235,26 @@ describe("Server V2 FSM", () => {
         { type: "data", payload: new Uint8Array(0), text: "command=object-info" },
       ]);
       context.transport = transport;
+      context.config.advertiseObjectInfo = true;
 
       const fsm = new Fsm(serverV2Transitions, serverV2Handlers);
       fsm.setState("READ_COMMAND");
       await fsm.run(context, "HANDLE_OBJECT_INFO");
 
       expect(fsm.getState()).toBe("HANDLE_OBJECT_INFO");
+    });
+
+    it("refuses object-info unless advertiseObjectInfo is set (git's serve.c)", async () => {
+      transport = createMockTransport([
+        { type: "data", payload: new Uint8Array(0), text: "command=object-info" },
+      ]);
+      context.transport = transport;
+
+      const fsm = new Fsm(serverV2Transitions, serverV2Handlers);
+      fsm.setState("READ_COMMAND");
+      await fsm.run(context);
+
+      expect(context.output.error).toBe("invalid command 'object-info'");
     });
 
     it("returns FLUSH on client disconnect", async () => {
@@ -623,8 +637,8 @@ describe("Server V2 FSM", () => {
       const result = await fsm.run(context);
 
       expect(result).toBe(true);
-      expect(transport.written).toContain("ERR Something went wrong");
-      expect(transport.written).toContain("FLUSH");
+      // as git's packet_writer_error before it dies: no newline, no flush after
+      expect(transport.written).toEqual(["ERR Something went wrong"]);
     });
   });
 });

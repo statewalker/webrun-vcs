@@ -107,7 +107,12 @@ roles the rule set does not allow at all is 403, a revoked or downgraded member'
   prefix). Commands outside it are refused before the pack is read, as
   `ng <ref> not allowed: this peer writes refs/peers/<peerId>/* only`, the other commands of the
   push go on, and a push refused for every ref stores nothing. The application's own
-  `receivePack.hooks` run after this check.
+  `receivePack.hooks` run after this check;
+- `git:read` covers what the refs publish: by id, a caller may fetch the ref tips and the
+  commits they reach, over protocol v0 and v2 alike (`requestPolicy: "REACHABLE_COMMIT"`).
+  An object no branch or tag reaches (a refused push's leftovers, history a ref was rewound
+  past) is `ERR upload-pack: not our ref <oid>`. Plain git's v2 serves any object it has;
+  `requestPolicy: "ANY"` serves the mesh that way.
 
 The identity is the transport's, and binding it is the edge's job. `servePeerConnection` binds
 every request to the peer its transport proved (`bindProvenPeer`), replacing any
@@ -157,7 +162,7 @@ verified object, or a copy it sent whole that failed to verify.
 
 | Export | Description |
 |--------|-------------|
-| `meshGitHandler(options)` | git smart-HTTP handler behind the mesh's access checks. `options`: `createFetchHandler`'s (protocol v2, limits, `receivePack`), plus `repository` + `refStore` or `resolveRepository`, `access`, `ownNamespace?` (a `refs/` prefix; a trailing `/` is added) |
+| `meshGitHandler(options)` | git smart-HTTP handler behind the mesh's access checks. `options`: `createFetchHandler`'s (protocol v2, limits, `receivePack`), plus `repository` + `refStore` or `resolveRepository`, `access`, `ownNamespace?` (a `refs/` prefix; a trailing `/` is added), `requestPolicy?` (default `"REACHABLE_COMMIT"`, not git's v2 `"ANY"`) |
 | `meshLfsHandler(options)` | LFS handler behind the mesh's access checks. `options`: `serveLfs`'s except `transferAuth` (per-action headers would let a transfer skip the capability check), plus `objects`, `access`, `locks?` (`identify` optional), `ranged?` (default true), `authorize?(request, operation, caller, lock?)` |
 | `lfsSwarmDownload(pointers, sources, store, opts?)` | Multi-source download → `{ downloaded, failed, bad, received }`. `opts`: `chunkSize?`, `windowBytes?` (positive), `idleTimeoutMs?`, `reassignAfterMs?`, `signal?` |
 | `meshGitFetch(options)`, `meshGitPush(options)` | The fetch client and push of `@statewalker/vcs-transport` through a peer (`call` or `fetchImpl`, and `token`) |

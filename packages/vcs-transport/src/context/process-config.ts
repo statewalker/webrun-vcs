@@ -1,6 +1,30 @@
 import type { ReceivePackConfig } from "../fsm/push/receive-pack-types.js";
 
 /**
+ * Which objects upload-pack serves when a client asks for them by id (`want <oid>`); anything
+ * else is answered `ERR upload-pack: not our ref <oid>`. The names follow git's
+ * `uploadpack.*` settings:
+ *
+ * - "ADVERTISED": only the ids of the refs (git's default over protocol v0/v1)
+ * - "TIP": the ids of the refs, hidden ones too (`uploadpack.allowTipSHA1InWant`)
+ * - "REACHABLE_COMMIT": the refs and the commits reachable from them
+ *   (`uploadpack.allowReachableSHA1InWant`)
+ * - "REACHABLE_COMMIT_TIP": both of the above
+ * - "ANY": any object the repository has (`uploadpack.allowAnySHA1InWant`, and what git's
+ *   protocol v2 always does)
+ *
+ * The servers default to git's behaviour: "ADVERTISED" over v0/v1, "ANY" over v2. Git's v2
+ * ignores the `uploadpack.allow*` settings; a stricter v2 policy (such as "REACHABLE_COMMIT",
+ * to refuse objects no branch or tag reaches) is an extension of ours.
+ */
+export type UploadPackRequestPolicy =
+  | "ADVERTISED"
+  | "REACHABLE_COMMIT"
+  | "TIP"
+  | "REACHABLE_COMMIT_TIP"
+  | "ANY";
+
+/**
  * Configuration options for FSM execution.
  *
  * Read-only settings that control FSM behavior.
@@ -199,15 +223,17 @@ export class ProcessConfiguration {
   maxEmptyBatches?: number;
 
   /**
-   * Policy for validating want requests (server-side).
-   * - "ADVERTISED": Only allow wants that were advertised in refs
-   * - "REACHABLE_COMMIT": Allow any reachable commit
-   * - "TIP": Only allow refs/tips
-   * - "REACHABLE_COMMIT_TIP": Allow tips and reachable commits
-   * - "ANY": Allow any valid object ID
-   * @default "ADVERTISED"
+   * Policy for validating want requests (server-side), see {@link UploadPackRequestPolicy}.
+   * Default: "ADVERTISED" over protocol v0/v1, "ANY" over v2 (git's).
    */
-  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  requestPolicy?: UploadPackRequestPolicy;
+
+  /**
+   * Protocol v2: advertise and serve `object-info` (git's `transfer.advertiseObjectInfo`,
+   * default false: not advertised, and the command is refused as "invalid command"). Added
+   * to `serverCapabilities` as `object-info=size type` unless they name it already.
+   */
+  advertiseObjectInfo?: boolean;
 
   /**
    * Whether to include automatically annotated tags pointing to fetched objects.
