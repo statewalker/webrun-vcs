@@ -92,8 +92,12 @@ class GitIgnoreManagerImpl implements IgnoreManager {
       }
     }
 
-    // Then the exclude files (info/exclude before core.excludesFile)
-    for (const node of this.excludeNodes.values()) {
+    // Then the exclude files: info/exclude before core.excludesFile, whatever the order
+    // they were set in, then any other source in the order first set
+    const rank = (source: string) =>
+      source === "info/exclude" ? 0 : source === "core.excludesFile" ? 1 : 2;
+    const sources = [...this.excludeNodes.keys()].sort((a, b) => rank(a) - rank(b));
+    for (const node of sources.map((source) => this.excludeNodes.get(source) as IgnoreNode)) {
       const result = node.checkIgnored(normalizedPath, isDirectory);
       if (result !== undefined) return result ? MatchResult.IGNORED : MatchResult.NOT_IGNORED;
     }

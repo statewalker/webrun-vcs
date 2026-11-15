@@ -129,8 +129,10 @@ export interface Worktree {
   probeCaseFolding?(): Promise<{ ignoreCase: boolean; precomposeUnicode: boolean }>;
 
   /**
-   * Runs `fn` as one batch of operations (a checkout's writes), which may share a cache of
-   * directories verified not to be links, dropped when the batch ends.
+   * Runs `fn` as one batch of operations (a checkout's checks and writes), which may share
+   * a cache of directories verified not to be links and one reading of the ignore rules
+   * (`.gitignore` files, exclude files), both dropped when the batch ends. Outside a batch,
+   * every walk and ignore check reads the rules afresh.
    */
   batch?<T>(fn: () => Promise<T>): Promise<T>;
 

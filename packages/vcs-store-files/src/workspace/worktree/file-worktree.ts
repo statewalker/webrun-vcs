@@ -86,6 +86,11 @@ export class FileWorktree implements Worktree {
   private readonly rootFiles: WorktreeFilesApi;
   /** The FilesApi of the batch in progress (`withLstatCache` view), if any */
   private scoped?: WorktreeFilesApi;
+  /**
+   * The ignore sources read during the batch in progress (directories, and `<excludes>`):
+   * read once per batch; outside a batch every walk and ignore check reads its own.
+   */
+  private batchIgnores?: Set<string>;
   private readonly rootPath: string;
   private readonly blobs: Blobs;
   private readonly trees: Trees;
@@ -149,15 +154,44 @@ export class FileWorktree implements Worktree {
   /**
    * Runs `fn` as one batch: over a FilesApi with `withLstatCache`, its operations share a
    * cache of directories verified not to be links, dropped when the batch ends (git's
-   * per-command lstat cache). Nested batches join the outer one.
+   * per-command lstat cache), and the ignore rules are read once for the whole batch.
+   * Nested batches join the outer one.
    */
   async batch<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.scoped || !this.rootFiles.withLstatCache) return fn();
-    this.scoped = this.rootFiles.withLstatCache();
+    if (this.batchIgnores) return fn();
+    this.batchIgnores = new Set();
+    if (this.rootFiles.withLstatCache) this.scoped = this.rootFiles.withLstatCache();
     try {
       return await fn();
     } finally {
       this.scoped = undefined;
+      this.batchIgnores = undefined;
+    }
+  }
+
+  /**
+   * Reads, once per operation (`loaded`), the ignore rules that apply to `path`: the exclude
+   * files and the `.gitignore` of every directory from the root down to `path`'s parent
+   * (its own too when `inclusive`). No rule read by an earlier operation is relied on.
+   */
+  private async loadIgnoresFor(
+    path: string,
+    loaded: Set<string>,
+    files = this.files,
+    inclusive = false,
+  ): Promise<void> {
+    if (!loaded.has("<excludes>")) {
+      loaded.add("<excludes>");
+      await this.loadRepositoryExcludes();
+    }
+    if (!this.autoLoadGitignore) return;
+    const parts = path ? path.split("/") : [];
+    const last = inclusive ? parts.length : parts.length - 1;
+    for (let i = 0; i <= last; i++) {
+      const dir = parts.slice(0, i).join("/");
+      if (loaded.has(dir)) continue;
+      loaded.add(dir);
+      await this.tryLoadGitignore(dir ? joinPath(this.rootPath, dir) : this.rootPath, dir, files);
     }
   }
 
@@ -167,8 +201,8 @@ export class FileWorktree implements Worktree {
     const includeIgnored = options?.includeIgnored ?? false;
     const includeDirectories = options?.includeDirectories ?? false;
     const pathPrefix = options?.pathPrefix ?? "";
-
-    await this.loadRepositoryExcludes();
+    // the rules of this walk: read now (the prefix's ancestors included), or once per batch
+    const loaded = this.batchIgnores ?? new Set<string>();
 
     if (options?.ignorePatterns?.length) {
       this.ignoreManager.addGlobalPatterns(options.ignorePatterns);
@@ -178,7 +212,9 @@ export class FileWorktree implements Worktree {
     // one walk is one batch: its lstat-caching view stays local to this walk (an abandoned
     // iterator leaves nothing behind for other operations)
     const files = this.scoped ?? this.rootFiles.withLstatCache?.() ?? this.rootFiles;
+    await this.loadIgnoresFor(pathPrefix, loaded, files);
     yield* this.walkDirectory(
+      loaded,
       files,
       startPath,
       pathPrefix,
@@ -189,6 +225,7 @@ export class FileWorktree implements Worktree {
   }
 
   private async *walkDirectory(
+    loaded: Set<string>,
     files: WorktreeFilesApi,
     dirPath: string,
     relativePath: string,
@@ -201,7 +238,8 @@ export class FileWorktree implements Worktree {
       return;
     }
 
-    if (this.autoLoadGitignore) {
+    if (this.autoLoadGitignore && !loaded.has(relativePath)) {
+      loaded.add(relativePath);
       await this.tryLoadGitignore(dirPath, relativePath, files);
     }
 
@@ -268,6 +306,7 @@ export class FileWorktree implements Worktree {
 
       if (isDirectory && !hasGitDir) {
         yield* this.walkDirectory(
+          loaded,
           files,
           fullPath,
           entryPath,
@@ -396,16 +435,9 @@ export class FileWorktree implements Worktree {
   }
 
   async isIgnored(path: string): Promise<boolean> {
-    await this.loadRepositoryExcludes();
-    // the .gitignore files of the path's directories, as git reads them (never through a
-    // link: a symlinked .gitignore is skipped)
-    if (this.autoLoadGitignore) {
-      const parts = path.split("/");
-      for (let i = 0; i < parts.length; i++) {
-        const dir = parts.slice(0, i).join("/");
-        await this.tryLoadGitignore(dir ? joinPath(this.rootPath, dir) : this.rootPath, dir);
-      }
-    }
+    // the .gitignore files of the path's directories and the exclude files, read for this
+    // check (once per batch), never through a link
+    await this.loadIgnoresFor(path, this.batchIgnores ?? new Set<string>());
 
     // Check if it's a directory
     let isDir = false;

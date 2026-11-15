@@ -291,13 +291,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     this.checkCallable();
     this.setCallable(false);
 
-    // Path checkout mode
-    if (this.allPaths || this.paths.length > 0) {
-      return this.checkoutPaths();
-    }
-
-    // Branch checkout mode
-    return this.checkoutBranch();
+    // path checkout, or branch checkout; one worktree batch, so the checks and the writes
+    // share one reading of the ignore rules
+    const run = () =>
+      this.allPaths || this.paths.length > 0 ? this.checkoutPaths() : this.checkoutBranch();
+    const worktree = this.worktreeAccess;
+    return worktree?.batch ? worktree.batch(run) : run();
   }
 
   /**
