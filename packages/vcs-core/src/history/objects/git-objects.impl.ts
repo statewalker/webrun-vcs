@@ -19,7 +19,9 @@ import {
   type GitObjectsOptions,
   InvalidObjectIdError,
   ObjectIdMismatchError,
+  type ObjectQuarantine,
 } from "./git-objects.js";
+import { overlayObjects } from "./object-quarantine.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 type Header = { type: ObjectTypeString; size: number };
@@ -215,7 +217,7 @@ export function createGitObjects(
     return r.id;
   }
 
-  return {
+  const objects: GitObjects = {
     put,
 
     async putUnsized(type, content) {
@@ -321,4 +323,17 @@ export function createGitObjects(
       ? { sweepStale: (o: { olderThanMs: number }) => store.sweepStale?.(o) ?? Promise.resolve(0) }
       : {}),
   };
+  const begin = store.beginQuarantine?.bind(store);
+  if (begin) {
+    // the quarantine's own kernel, read through an overlay that falls back to this one
+    objects.beginQuarantine = async (): Promise<ObjectQuarantine> => {
+      const q = await begin();
+      return {
+        objects: overlayObjects(createGitObjects(q.store, options), objects),
+        commit: () => q.commit(),
+        discard: () => q.discard(),
+      };
+    };
+  }
+  return objects;
 }

@@ -17,10 +17,18 @@ import { createTransportApi } from "../factories/transport-api-factory.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../fsm/fetch/server-fetch-fsm.js";
 import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
-import type { ReceivePackHooks, ReceivePackLogger } from "../fsm/push/receive-pack-types.js";
-import { serverPushHandlers, serverPushTransitions } from "../fsm/push/server-push-fsm.js";
+import {
+  DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+  type ReceivePackHooks,
+  type ReceivePackLogger,
+} from "../fsm/push/receive-pack-types.js";
+import {
+  releaseReceivePack,
+  serverPushHandlers,
+  serverPushTransitions,
+} from "../fsm/push/server-push-fsm.js";
 import type { ServiceType } from "../protocol/types.js";
-import { withIdleTimeout } from "../utils/idle-timeout.js";
+import { withIdleTimeout, withWriteTimeout } from "../utils/idle-timeout.js";
 
 /**
  * Options for serve-over-duplex operation.
@@ -62,6 +70,14 @@ export interface ServeOverDuplexOptions {
    * answered "unpack request idle for … ms". Default: none.
    */
   idleTimeoutMs?: number;
+  /**
+   * receive-pack: fail a write the client does not take within this long (ms), ending the run: a client that
+   * stopped reading cannot hold it (and a push's quarantine) forever. Default
+   * {@link DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS}; 0: none.
+   */
+  writeTimeoutMs?: number;
+  /** A receive-pack hook still running after this long (ms) refuses its commands (default: none) */
+  hookTimeoutMs?: number;
   /** Logs hook failures that cannot reach the client (default: console.error) */
   logger?: ReceivePackLogger;
   /** Server capabilities to advertise */
@@ -121,12 +137,22 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
 
   const state = new ProtocolState();
   const input = withIdleTimeout(duplex, options.idleTimeoutMs);
+  // receive-pack: a client that stops reading the answer must not hold the run (and its
+  // quarantine) forever
+  const write =
+    service === "git-receive-pack"
+      ? withWriteTimeout(
+          (data) => duplex.write(data),
+          options.writeTimeoutMs ?? DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+        )
+      : undefined;
   const transport = createTransportApi(
-    input === duplex
+    input === duplex && !write
       ? duplex
       : {
           [Symbol.asyncIterator]: () => input[Symbol.asyncIterator](),
-          write: (data) => duplex.write(data),
+          write: write ?? ((data) => duplex.write(data)),
+          ...(duplex.close ? { close: () => duplex.close?.() ?? Promise.resolve() } : {}),
         },
     state,
   );
@@ -154,6 +180,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       hooks: options.hooks,
       maxCommands: options.maxCommands,
       keepAliveMs: options.keepAliveMs,
+      hookTimeoutMs: options.hookTimeoutMs,
       bare: options.bare,
       denyDeleteCurrent: options.denyDeleteCurrent,
       shallowUpdate: options.shallowUpdate,
@@ -204,5 +231,8 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       success: false,
       error: error instanceof Error ? error.message : String(error),
     };
+  } finally {
+    // objects of a push that stopped before applying its refs are not left behind
+    if (service === "git-receive-pack" && !useV2) await releaseReceivePack(ctx);
   }
 }

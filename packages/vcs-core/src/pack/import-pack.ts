@@ -5,6 +5,7 @@
  * stream is never buffered.
  */
 import type { ObjectId } from "../common/id/index.js";
+import type { GitObjects, ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import type { InstalledPack, InstallPackOptions } from "./index-pack.js";
 import { PackError } from "./index-pack.js";
@@ -31,6 +32,15 @@ export interface ImportPackOptions extends UnpackObjectsOptions {
   };
   /** Packs with at least this many objects are kept as packs (git's `transfer.unpackLimit`). Default 100. */
   unpackLimit?: number;
+  /**
+   * Import into a quarantine (git's receive-pack `tmp_objdir`) when `objects` can open one
+   * (`GitObjects.beginQuarantine`): the objects stay invisible to readers of `objects` until
+   * `result.quarantine.commit()`, and `result.quarantine.discard()` removes them. A kept pack
+   * goes to the quarantine's `packs` (not `options.packs`). A failed import discards the
+   * quarantine itself. Objects that cannot quarantine are imported directly, and the result
+   * has no `quarantine`: the caller sees that the objects are already published.
+   */
+  quarantine?: boolean;
 }
 
 export interface ImportPackResult {
@@ -42,7 +52,20 @@ export interface ImportPackResult {
   kept?: InstalledPack;
   /** what was unpacked, when it was not kept */
   unpacked?: UnpackResult;
+  /**
+   * The quarantine holding the objects, with `quarantine: true` on objects that can open one:
+   * the caller must `commit()` or `discard()` it.
+   */
+  quarantine?: ObjectQuarantine;
+  /**
+   * With `quarantine: true`: whether the objects were quarantined (true, `quarantine` set) or,
+   * `objects` being unable to, imported straight into the store (false). Absent otherwise.
+   */
+  quarantined?: boolean;
 }
+
+/** What `importPack` writes to: the unpack target, and a quarantine when it can open one. */
+export type ImportTarget = UnpackTarget & Partial<Pick<GitObjects, "beginQuarantine">>;
 
 /**
  * Imports a received pack into `objects`: kept as a pack through `options.packs` when it has at
@@ -55,13 +78,37 @@ export interface ImportPackResult {
  * const { objects, packs } = await createGitFilesBackend({ files });
  * const result = await importPack(objects, packStream, { packs });
  * // result.kept for 100 objects or more, result.unpacked below
+ *
+ * // receive-pack: kept aside until the push is accepted
+ * const pushed = await importPack(objects, packStream, { packs, quarantine: true });
+ * await connectivityCheck(pushed.quarantine?.objects ?? objects);
+ * await pushed.quarantine?.commit(); // or discard() when the push is refused
  * ```
  */
 export async function importPack(
-  objects: UnpackTarget,
+  objects: ImportTarget,
   pack: AsyncIterable<Uint8Array>,
   options: ImportPackOptions = {},
 ): Promise<ImportPackResult> {
+  if (options.quarantine && objects.beginQuarantine) {
+    const quarantine = await objects.beginQuarantine();
+    try {
+      const result = await importPack(quarantine.objects, pack, {
+        ...options,
+        quarantine: false,
+        packs: quarantine.packs,
+      });
+      return { ...result, quarantine, quarantined: true };
+    } catch (err) {
+      await quarantine.discard().catch(() => {});
+      throw err;
+    }
+  }
+  if (options.quarantine) {
+    // asked for, but these objects cannot keep a quarantine: said in the result
+    const result = await importPack(objects, pack, { ...options, quarantine: false });
+    return { ...result, quarantined: false };
+  }
   const unpackLimit = options.unpackLimit ?? DEFAULT_UNPACK_LIMIT;
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
   const it = pack[Symbol.asyncIterator]();

@@ -134,3 +134,53 @@ export function readStreamWithIdleTimeout(
   };
   return chunks;
 }
+
+/** A write the peer did not take within the write timeout (it stopped reading). */
+export class WriteTimeoutError extends Error {
+  constructor(readonly ms: number) {
+    super(`peer took no data for ${ms} ms`);
+    this.name = "WriteTimeoutError";
+  }
+}
+
+/**
+ * `write`, failing with {@link WriteTimeoutError} when one write is not taken within `ms` (a
+ * peer that stopped reading: a full pipe or socket). After a timeout the connection is dead:
+ * `onTimeout` is called once (to abort the underlying writer, which also fails the stalled
+ * write) and every later write fails at once. `ms <= 0` (or undefined) returns `write`.
+ *
+ * @example
+ * ```ts
+ * const write = withWriteTimeout((d) => out.write(d), 600_000, (e) => out.abort(e));
+ * ```
+ */
+export function withWriteTimeout(
+  write: (data: Uint8Array) => void | Promise<void>,
+  ms: number | undefined,
+  onTimeout?: (error: WriteTimeoutError) => void,
+): (data: Uint8Array) => void | Promise<void> {
+  if (!ms || ms <= 0) return write;
+  let dead: WriteTimeoutError | undefined;
+  return async (data) => {
+    if (dead) throw dead;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stalled = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        dead ??= new WriteTimeoutError(ms);
+        try {
+          onTimeout?.(dead);
+        } catch {
+          // the writer is gone either way
+        }
+        reject(dead);
+      }, ms);
+    });
+    const pending = Promise.resolve().then(() => write(data));
+    pending.catch(() => {}); // fails after the timeout when the writer is aborted
+    try {
+      await Promise.race([pending, stalled]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}

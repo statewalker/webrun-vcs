@@ -35,15 +35,20 @@ import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
 import { Fsm } from "../../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/server-v2-fsm.js";
 import { SERVER_V2_CAPABILITIES } from "../../fsm/protocol-v2/types.js";
-import type { ReceivePackHooks, ReceivePackLogger } from "../../fsm/push/receive-pack-types.js";
+import {
+  DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+  type ReceivePackHooks,
+  type ReceivePackLogger,
+} from "../../fsm/push/receive-pack-types.js";
 import {
   RECEIVE_PACK_CAPABILITIES,
+  releaseReceivePack,
   serverPushHandlers,
   serverPushTransitions,
 } from "../../fsm/push/server-push-fsm.js";
 import { ZERO_OID } from "../../protocol/constants.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
-import { readStreamWithIdleTimeout } from "../../utils/idle-timeout.js";
+import { readStreamWithIdleTimeout, withWriteTimeout } from "../../utils/idle-timeout.js";
 import { createSimpleDuplex } from "./http-duplex.js";
 
 /**
@@ -144,6 +149,13 @@ export interface ReceivePackServerOptions {
    * `unpack request idle for … ms` (default {@link DEFAULT_RECEIVE_PACK_IDLE_TIMEOUT_MS}; 0: none)
    */
   idleTimeoutMs?: number;
+  /**
+   * A client that takes no answer byte for this long (ms) is dropped and the run ends (its
+   * quarantined objects discarded): default {@link DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS}; 0: none
+   */
+  writeTimeoutMs?: number;
+  /** A hook still running after this long (ms) refuses its commands (default: none) */
+  hookTimeoutMs?: number;
   /**
    * Side-band keep-alive interval (ms) while a received push is checked (default 5000, as
    * git's `receive.keepAlive`; 0: none)
@@ -810,7 +822,17 @@ export async function handleReceivePack(
     input.body,
     rp.idleTimeoutMs ?? DEFAULT_RECEIVE_PACK_IDLE_TIMEOUT_MS,
   );
-  const duplex = createSimpleDuplex(body, (data) => out.write(data));
+  // a client that stops reading the answer must not hold the run (and its quarantine) forever
+  const duplex = createSimpleDuplex(
+    body,
+    withWriteTimeout(
+      (data) => out.write(data),
+      rp.writeTimeoutMs ?? DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+      (error) => {
+        void out.abort(error).catch(() => {});
+      },
+    ),
+  );
 
   let authorized: (() => void) | undefined;
   const onAuthorized = new Promise<"authorized">((resolve) => {
@@ -829,6 +851,7 @@ export async function handleReceivePack(
       hooks: rp.hooks,
       maxCommands: rp.maxCommands,
       keepAliveMs: rp.keepAliveMs,
+      hookTimeoutMs: rp.hookTimeoutMs,
       bare: rp.bare,
       denyDeleteCurrent: rp.denyDeleteCurrent,
       shallowUpdate: rp.shallowUpdate,
@@ -862,10 +885,17 @@ export async function handleReceivePack(
   // The ref advertisement was sent by GET /info/refs: start at the commands
   const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
   fsm.setState("READ_COMMANDS");
-  const run: Promise<{ thrown?: unknown }> = fsm.run(ctx).then(
-    () => ({}),
-    (thrown: unknown) => ({ thrown }),
-  );
+  const run: Promise<{ thrown?: unknown }> = fsm
+    .run(ctx)
+    .then(
+      () => ({}),
+      (thrown: unknown) => ({ thrown }),
+    )
+    // objects of a push that stopped before applying its refs are not left behind
+    .then(async (r) => {
+      await releaseReceivePack(ctx);
+      return r;
+    });
 
   const first = await Promise.race([run.then(() => "finished" as const), onAuthorized]);
   if (first === "finished") {

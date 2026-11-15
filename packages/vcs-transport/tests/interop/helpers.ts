@@ -300,8 +300,8 @@ export async function createTransportRepo(): Promise<TransportRepo> {
   const facade = createRepositoryFacade({ history });
   const imports: PackImportResult[] = [];
   const baseImportPack = facade.importPack.bind(facade);
-  facade.importPack = async (packStream) => {
-    const result = await baseImportPack(packStream);
+  facade.importPack = async (packStream, options) => {
+    const result = await baseImportPack(packStream, options);
     imports.push(result);
     return result;
   };

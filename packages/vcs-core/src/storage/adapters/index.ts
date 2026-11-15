@@ -2,11 +2,14 @@
 export { blobStoreToRawStorage } from "./blob-store-raw-storage.js";
 export { kvStoreRefs } from "./kv-store-refs.js";
 export {
+  QUARANTINE_MAX_IDLE_MS,
+  RAW_QUARANTINE_PREFIX,
   RAW_STAGING_TMP_PREFIX,
   type RawStorageStagingOptions,
   rawStorageStaging,
   type SpooledContent,
   STAGING_INLINE_THRESHOLD,
   type StagingBlobStore,
+  type StagingQuarantine,
   sweepStaleRawStaging,
 } from "./staging-blob-store.js";

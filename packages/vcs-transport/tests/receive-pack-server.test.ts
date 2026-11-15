@@ -63,6 +63,14 @@ describe("receive-pack: connectivity (git's check_connected)", () => {
       pack,
     });
     expect(run.report).toEqual(["unpack ok", "ng refs/heads/deep missing necessary objects"]);
+    // the refused push's objects were quarantined and discarded: even the commit is gone
+    expect(await repo.facade.has(commit)).toBe(false);
+    // the same objects in the store: the walk finds the blob missing deep down
+    await repo.facade.importPack(
+      (async function* () {
+        yield pack;
+      })(),
+    );
     expect(await checkConnectivity(repo.facade, [commit], [c2])).toMatchObject({
       ok: false,
       missing: blob,
@@ -432,9 +440,20 @@ async function treeClosure(
   return ids;
 }
 
-/** Counts the facade's graph reads. */
-function countReads(facade: Awaited<ReturnType<typeof createTransportRepo>>["facade"]) {
-  const reads = { commits: 0, trees: 0 };
+/**
+ * Counts the facade's graph reads, and those of the quarantine view of a push it imports
+ * (receive-pack reads the pushed objects through it).
+ */
+function countReads(
+  facade: Awaited<ReturnType<typeof createTransportRepo>>["facade"],
+  reads = { commits: 0, trees: 0 },
+) {
+  const importPack = facade.importPack.bind(facade);
+  facade.importPack = async (stream, options) => {
+    const result = await importPack(stream, options);
+    if (result.quarantine) countReads(result.quarantine.repository, reads);
+    return result;
+  };
   const getCommitInfo = facade.getCommitInfo?.bind(facade);
   const getTreeEntries = facade.getTreeEntries?.bind(facade);
   facade.getCommitInfo = async (oid) => {

@@ -37,16 +37,17 @@ import {
 } from "../history/trees/tree-format.js";
 import type { Trees } from "../history/trees/trees.js";
 import {
+  type ImportTarget,
   importPack,
   type ListedObject,
   listObjects,
   type PackSet,
-  type UnpackTarget,
   type WritePackOptions,
   writePack,
 } from "../pack/index.js";
 import type {
   ExportOptions,
+  PackImportOptions,
   PackImportResult,
   PackOptions,
   SerializationApi,
@@ -95,7 +96,7 @@ export class DefaultSerializationApi implements SerializationApi {
   /** Tag storage interface (new interface) */
   private readonly _tags: Tags;
   /** The object kernel received packs are written through */
-  private readonly objects: UnpackTarget;
+  private readonly objects: ImportTarget;
   /** Where large received packs are kept, if anywhere */
   private readonly packs?: PackSet;
   private readonly unpackLimit?: number;
@@ -183,10 +184,14 @@ export class DefaultSerializationApi implements SerializationApi {
   /**
    * Import objects from a pack stream, byte for byte, through `importPack`.
    */
-  async importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult> {
+  async importPack(
+    pack: AsyncIterable<Uint8Array>,
+    options: PackImportOptions = {},
+  ): Promise<PackImportResult> {
     const r = await importPack(this.objects, pack, {
       packs: this.packs,
       unpackLimit: this.unpackLimit,
+      quarantine: options.quarantine,
     });
     return {
       objectsImported: r.count,
@@ -195,6 +200,8 @@ export class DefaultSerializationApi implements SerializationApi {
       commitsImported: r.types.commit,
       tagsImported: r.types.tag,
       packId: r.kept?.packId,
+      ...(r.quarantine ? { quarantine: r.quarantine } : {}),
+      ...(r.quarantined !== undefined ? { quarantined: r.quarantined } : {}),
     };
   }
 

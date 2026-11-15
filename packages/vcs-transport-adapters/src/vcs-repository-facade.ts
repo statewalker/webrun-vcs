@@ -6,11 +6,19 @@
  */
 
 import type { History, SerializationApi } from "@statewalker/vcs-core";
-import { isSymbolicRef, serializeCommit, serializeTag, serializeTree } from "@statewalker/vcs-core";
+import {
+  createHistoryFromComponents,
+  DefaultSerializationApi,
+  isSymbolicRef,
+  serializeCommit,
+  serializeTag,
+  serializeTree,
+} from "@statewalker/vcs-core";
 import type {
   CommitGraphInfo,
   ExportPackOptions,
   GitObjectTypeName,
+  PackImportOptions,
   PackImportResult,
   RepositoryFacade,
   TagTargetInfo,
@@ -65,10 +73,33 @@ export class VcsRepositoryFacade implements RepositoryFacade {
 
   /**
    * Import a pack stream into the repository.
-   * Delegates to SerializationApi.importPack.
+   * Delegates to SerializationApi.importPack; with `quarantine` (receive-pack) the objects
+   * stay aside until the returned quarantine is committed, and its `repository` sees them.
    */
-  async importPack(packStream: AsyncIterable<Uint8Array>): Promise<PackImportResult> {
-    return this.serialization.importPack(packStream);
+  async importPack(
+    packStream: AsyncIterable<Uint8Array>,
+    options?: PackImportOptions,
+  ): Promise<PackImportResult> {
+    const { quarantine, ...result } = await this.serialization.importPack(packStream, options);
+    if (!quarantine) return result;
+    // the push's view: the quarantined objects, then the repository's, with the same refs
+    const history = createHistoryFromComponents({
+      objects: quarantine.objects,
+      refs: this.history.refs,
+    });
+    const repository = new VcsRepositoryFacade({
+      history,
+      serialization: new DefaultSerializationApi({ history }),
+      bare: this.bare,
+    });
+    return {
+      ...result,
+      quarantine: {
+        repository,
+        commit: () => quarantine.commit(),
+        discard: () => quarantine.discard(),
+      },
+    };
   }
 
   /**

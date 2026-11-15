@@ -2,6 +2,7 @@
  * Server-side push (receive-pack) hooks and settings.
  */
 
+import type { RepositoryFacade } from "../../api/repository-facade.js";
 import type { PushCommandType } from "./types.js";
 
 /** A push command as receive-pack's hooks see it. */
@@ -36,6 +37,13 @@ export interface ReceivePackHookContext {
   readonly request?: ReceivePackRequestInfo;
   /** The repository path of the HTTP request */
   readonly repoPath?: string;
+  /**
+   * The repository as the push sees it, as git gives hooks `GIT_QUARANTINE_PATH` and the
+   * quarantine as an alternate object directory: from the import of the pack until its objects
+   * are published (pre-receive, update), it reads the quarantined objects, then the
+   * repository's; otherwise (authorize, post-receive) it is the repository itself.
+   */
+  readonly repository: RepositoryFacade;
   /**
    * Shows `text` to the pushing user (side-band channel 2, as git relays a hook's output;
    * nothing without side-band).
@@ -112,6 +120,8 @@ export interface ReceivePackHooks {
 /** A logger for receive-pack (hook failures after the report). */
 export interface ReceivePackLogger {
   error(message: string, error?: unknown): void;
+  /** Something the operator should know that is not a failure (default: console.warn) */
+  warn?(message: string): void;
 }
 
 /** Default most commands one push may carry. */
@@ -119,6 +129,12 @@ export const DEFAULT_MAX_PUSH_COMMANDS = 65536;
 
 /** Default keep-alive interval (git's `receive.keepAlive`, seconds there). */
 export const DEFAULT_RECEIVE_KEEP_ALIVE_MS = 5000;
+
+/**
+ * Default write timeout of a receive-pack answer: a client that takes nothing for this long
+ * (a full pipe or socket) ends the run, so it cannot hold the push (and its quarantine) forever.
+ */
+export const DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * receive-pack settings (`ProcessConfiguration.receivePack`). The ref policies
@@ -138,6 +154,13 @@ export interface ReceivePackConfig {
    * applied (git's `receive.keepAlive`, default 5 s; 0: none).
    */
   keepAliveMs?: number;
+  /**
+   * A hook (`authorize`, `preReceive`, `update`) still running after this long (ms) counts as
+   * failed: logged, and its commands refused as when it throws ("authorization failed",
+   * "pre-receive hook declined", "hook declined"). Default: none. `postReceive` is detached
+   * and never timed.
+   */
+  hookTimeoutMs?: number;
   /** Whether the repository has no working tree (default: the facade's `isBare()`, else true) */
   bare?: boolean;
   /**

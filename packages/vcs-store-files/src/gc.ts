@@ -9,6 +9,7 @@ import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-co
 import { joinPath, sweepPackTemporaries } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 
+import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { createFilesRefOps } from "./refs/index.js";
 import {
@@ -92,6 +93,11 @@ export interface GcResult {
   /** Stale `.pack` files without an `.idx` removed (always 0 in a dry run) */
   removedOrphanPacks: number;
   /**
+   * Quarantine directories of received packs (`objects/tmp_objdir-incoming-*`) left by a crash
+   * and older than `tmpExpiryMs`, removed (always 0 in a dry run)
+   */
+  removedQuarantines: number;
+  /**
    * True if another gc holds `gc.pid` (git's "gc is already running"): nothing was done. A lock
    * older than 12 hours is taken over, as git does; without `lastModified` from the FilesApi a
    * lock's age is unknown and it is never taken over (remove `gc.pid` by hand after a crash).
@@ -142,6 +148,7 @@ export async function gc(options: GcOptions): Promise<GcResult> {
       reachableObjects: 0,
       totalLooseObjects: 0,
       removedTemporaries: 0,
+      removedQuarantines: 0,
       removedOrphanPacks: 0,
       refsPacked: false,
       repack: null,
@@ -239,10 +246,12 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // Step 6: temporaries and orphaned packs
   let removedTemporaries = 0;
   let removedOrphanPacks = 0;
+  let removedQuarantines = 0;
   if (!dryRun) {
     const packDir = joinPath(objectsDir, "pack");
     removedTemporaries += await filesStagingStore(files, objectsDir).sweepStaged(tmpExpiryMs);
     removedTemporaries += (await sweepPackTemporaries(files, packDir, tmpExpiryMs)).length;
+    removedQuarantines = await sweepQuarantines(files, objectsDir, tmpExpiryMs);
     // packed-refs.new is written only under packed-refs.lock: stale whenever the lock is free
     removedTemporaries += await createFilesRefOps(
       atomicFilesOver(files, gitDir),
@@ -259,6 +268,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
     totalLooseObjects: looseBefore.length,
     removedTemporaries,
     removedOrphanPacks,
+    removedQuarantines,
     refsPacked,
     repack: repackResult,
     skipped: false,

@@ -189,3 +189,18 @@ describe("GcOrchestrator stale temporaries", () => {
     expect(result.removedTemporaries).toBe(2);
   });
 });
+
+describe("MemoryGcStrategy.getStats", () => {
+  it("counts objects only, not temporaries nor an open quarantine", async () => {
+    const { history, strategy } = createTestSetup();
+    const enc = new TextEncoder();
+    await history.blobs.store([enc.encode("one")]);
+    const objects = history.objects;
+    if (!objects?.beginQuarantine) throw new Error("no quarantine");
+    const q = await objects.beginQuarantine();
+    await q.objects.put("blob", 7, [enc.encode("pending")]);
+    expect((await strategy.getStats()).looseObjectCount).toBe(1);
+    await q.commit();
+    expect((await strategy.getStats()).looseObjectCount).toBe(2);
+  });
+});
