@@ -539,7 +539,7 @@ export class Git implements Disposable {
   // ============ Status Operations ============
 
   /**
-   * Create a StatusCommand for showing staging area status.
+   * Create a StatusCommand for showing the index and worktree status.
    *
    * @example
    * ```typescript
@@ -767,8 +767,8 @@ export class Git implements Disposable {
    *
    * @example
    * ```typescript
+   * // the working copy's index and worktree are stashed, then reset to HEAD
    * const stashCommit = await git.stashCreate()
-   *   .setWorkingTreeProvider(provider)
    *   .setMessage("WIP: feature work")
    *   .call();
    * ```

@@ -24,16 +24,21 @@ import {
   type ObjectId,
   type PersonIdent,
   type Refs,
-  type TreeEntry,
 } from "@statewalker/vcs-core";
 import type {
   Staging,
   StashEntry,
   StashPushOptions,
   StashStore,
+  StashTreesSource,
   Worktree,
+  WorktreeModeTrust,
 } from "@statewalker/vcs-working-tree";
-import { storeWorktreeFile } from "@statewalker/vcs-working-tree";
+import {
+  createIndexTree,
+  createUntrackedTree,
+  createWorktreeTree,
+} from "@statewalker/vcs-working-tree";
 import { RefUpdateRejectedError } from "../../refs/index.js";
 
 /** git's stash ref. */
@@ -55,6 +60,8 @@ export interface GitStashStoreOptions {
   getBranch: () => Promise<string | undefined>;
   /** Identity of stash commits and reflog lines (the time is taken at each push) */
   author?: Omit<PersonIdent, "timestamp">;
+  /** `core.filemode` / `core.symlinks`; defaults to what the worktree can represent */
+  trust?: WorktreeModeTrust;
 }
 
 /**
@@ -67,6 +74,7 @@ export class GitStashStore implements StashStore {
   private readonly getHead: () => Promise<ObjectId | undefined>;
   private readonly getBranch: () => Promise<string | undefined>;
   private readonly defaultAuthor: Omit<PersonIdent, "timestamp">;
+  private readonly trust?: WorktreeModeTrust;
 
   constructor(options: GitStashStoreOptions) {
     this.history = options.history;
@@ -74,6 +82,7 @@ export class GitStashStore implements StashStore {
     this.worktree = options.worktree;
     this.getHead = options.getHead;
     this.getBranch = options.getBranch;
+    this.trust = options.trust;
     this.defaultAuthor = options.author ?? {
       name: "Git Stash",
       email: "stash@localhost",
@@ -129,7 +138,8 @@ export class GitStashStore implements StashStore {
     const onHead = `${branch}: ${head.slice(0, 7)} ${subject}`;
 
     // 1. The index tree, and its commit (parent: HEAD)
-    const indexTree = await this.staging.writeTree(this.history.trees);
+    const source = this.treesSource;
+    const indexTree = await createIndexTree(source);
     const indexCommitId = await this.history.commits.store({
       tree: indexTree,
       parents: [head],
@@ -138,15 +148,23 @@ export class GitStashStore implements StashStore {
       message: `index on ${onHead}\n`,
     });
 
-    // 2. The working tree: the index with the worktree's changes
-    const worktreeTree = await this.createWorktreeTree(indexTree);
+    // 2. The working tree: the index with the worktree's changes to tracked files
+    const worktreeTree = await createWorktreeTree(source, headCommit?.tree);
     const parents: ObjectId[] = [head, indexCommitId];
 
-    // 3. With includeUntracked, the untracked files commit (3rd parent)
+    // 3. With includeUntracked, the untracked files commit (3rd parent, no parents itself)
     if (options.includeUntracked) {
-      const untrackedCommitId = await this.createUntrackedFilesCommit(author, onHead);
-      if (untrackedCommitId) {
-        parents.push(untrackedCommitId);
+      const untracked = await createUntrackedTree(source);
+      if (untracked) {
+        parents.push(
+          await this.history.commits.store({
+            tree: untracked.treeId,
+            parents: [],
+            author,
+            committer: author,
+            message: `untracked files on ${onHead}\n`,
+          }),
+        );
       }
     }
 
@@ -174,107 +192,15 @@ export class GitStashStore implements StashStore {
     return stashCommitId;
   }
 
-  /**
-   * Create a commit containing only untracked files.
-   *
-   * This is the 3rd parent of a stash when --include-untracked is used.
-   * The commit has no parents (orphan commit).
-   *
-   * @returns Commit ID, or undefined if no untracked files
-   */
-  private async createUntrackedFilesCommit(
-    author: PersonIdent,
-    onHead: string,
-  ): Promise<ObjectId | undefined> {
-    // Collect set of tracked paths from index
-    const trackedPaths = new Set<string>();
-    for await (const entry of this.staging.entries()) {
-      trackedPaths.add(entry.path);
-    }
-
-    // Walk working tree to find untracked files
-    const untrackedEntries: TreeEntry[] = [];
-    for await (const wtEntry of this.worktree.walk()) {
-      if (wtEntry.isDirectory || wtEntry.isIgnored) {
-        continue;
-      }
-
-      // Check if file is tracked
-      if (!trackedPaths.has(wtEntry.path)) {
-        // Store blob content
-        const { id: blobId } = await storeWorktreeFile(
-          this.history.blobs,
-          this.worktree,
-          wtEntry.path,
-          wtEntry,
-        );
-        untrackedEntries.push({
-          name: wtEntry.path,
-          mode: wtEntry.mode,
-          id: blobId,
-        });
-      }
-    }
-
-    if (untrackedEntries.length === 0) {
-      return undefined;
-    }
-
-    // Create tree with untracked files
-    const untrackedTree = await this.history.trees.store(untrackedEntries);
-
-    // Create orphan commit (no parents)
-    return this.history.commits.store({
-      tree: untrackedTree,
-      parents: [],
-      author,
-      committer: author,
-      message: `untracked files on ${onHead}\n`,
-    });
-  }
-
-  /**
-   * Create worktree tree by checking for modifications.
-   * For now, uses the index tree. Full implementation would
-   * scan worktree for modifications and create blobs.
-   */
-  private async createWorktreeTree(indexTree: ObjectId): Promise<ObjectId> {
-    // Collect all entries, checking for worktree modifications
-    const entries: TreeEntry[] = [];
-
-    const indexTreeEntries = await this.history.trees.load(indexTree);
-    if (!indexTreeEntries) {
-      return this.history.trees.store([]);
-    }
-
-    for await (const entry of indexTreeEntries) {
-      // Get worktree file content if it exists
-      const wtEntry = await this.worktree.getEntry(entry.name);
-      if (wtEntry && !wtEntry.isDirectory) {
-        // Check if modified by computing hash
-        const wtHash = await this.worktree.computeHash(entry.name);
-        if (wtHash !== entry.id) {
-          // File is modified, store new content
-          const { id: blobId } = await storeWorktreeFile(
-            this.history.blobs,
-            this.worktree,
-            entry.name,
-            wtEntry,
-          );
-          entries.push({ ...entry, id: blobId });
-        } else {
-          entries.push(entry);
-        }
-      } else {
-        entries.push(entry);
-      }
-    }
-
-    // Create new tree if any modifications, otherwise return original
-    if (entries.length > 0) {
-      return this.history.trees.store(entries);
-    }
-    return indexTree;
+  /** The source the stash trees are built from (shared with `git.stashCreate()`). */
+  private get treesSource(): StashTreesSource {
+    return {
+      blobs: this.history.blobs,
+      trees: this.history.trees,
+      staging: this.staging,
+      worktree: this.worktree,
+      trust: this.trust,
+    };
   }
 
   /**

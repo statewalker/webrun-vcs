@@ -12,5 +12,7 @@ export * from "./checkout-utils.js";
 export * from "./repository-state.js";
 // Stash (memory only - file-based moved to store-files)
 export * from "./stash-store.memory.js";
+// The trees of a stash (index, worktree, untracked), as git stash push builds them
+export * from "./stash-trees.js";
 // Memory implementation
 export * from "./working-copy.memory.js";

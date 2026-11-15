@@ -1,8 +1,10 @@
 import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import type { Staging } from "@statewalker/vcs-working-tree";
 
 import { NoHeadError, RefNotFoundError, StoreNotAvailableError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { STASH_REF } from "./stash-list-command.js";
+import { WorkingCopyStashProvider } from "./stash-working-tree.js";
 
 /**
  * Get timezone offset string in Git format (+HHMM or -HHMM).
@@ -34,10 +36,24 @@ const MSG_WORKING_DIR = "WIP on {0}: {1} {2}";
 const MSG_UNTRACKED = "untracked files on {0}: {1} {2}";
 
 /**
+ * What the reset after a stash covers, as `git stash push` options.
+ */
+export interface StashResetOptions {
+  /** `-u`: the untracked files were stashed and are removed (`git clean -fd`) */
+  includeUntracked?: boolean;
+  /** `-a`: the ignored files too (`git clean -fdx`) */
+  includeIgnored?: boolean;
+  /** `--keep-index`: the index tree is checked out again after the reset */
+  keepIndex?: boolean;
+  /** The stashed index tree (for `keepIndex`) */
+  indexTree?: ObjectId;
+}
+
+/**
  * Interface for providing working tree and index state.
  *
- * The stash create operation requires access to the working directory
- * and index, which requires a WorkingCopy with worktree access.
+ * A working copy with an index and a worktree has a built-in provider
+ * ({@link WorkingCopyStashProvider}); set one only to stash something else.
  */
 export interface StashWorkingTreeProvider {
   /**
@@ -51,19 +67,23 @@ export interface StashWorkingTreeProvider {
   getWorkingTree(): Promise<ObjectId>;
 
   /**
-   * Get tree of untracked files (optional).
+   * Get tree of untracked files (optional); the ignored ones too with `includeIgnored`.
    */
-  getUntrackedTree?(): Promise<ObjectId | undefined>;
+  getUntrackedTree?(options?: { includeIgnored?: boolean }): Promise<ObjectId | undefined>;
 
   /**
-   * Check if there are local changes to stash.
+   * Check if there are local changes to stash (untracked files count with
+   * `includeUntracked`, as `git stash -u`).
    */
-  hasLocalChanges(): Promise<boolean>;
+  hasLocalChanges(options?: {
+    includeUntracked?: boolean;
+    includeIgnored?: boolean;
+  }): Promise<boolean>;
 
   /**
-   * Reset working directory to HEAD after stash.
+   * Reset the working directory and index to HEAD after the stash, as `git stash push`.
    */
-  resetHard(): Promise<void>;
+  resetHard(options?: StashResetOptions): Promise<void>;
 }
 
 /**
@@ -73,22 +93,21 @@ export interface StashWorkingTreeProvider {
  *
  * Based on JGit's StashCreateCommand.
  *
- * Note: This command requires a working tree provider to access
- * uncommitted changes. Without a provider, `call()` throws
- * `StoreNotAvailableError` rather than stash HEAD's state.
+ * On a working copy with an index and a worktree it stashes as `git stash push` does:
+ * the index tree, the worktree tree (tracked files as they are on disk), with `-u` the
+ * untracked files, then resets the index and the worktree to HEAD (keeping untracked files
+ * unless they were stashed). A working copy without a worktree has nothing to stash:
+ * `call()` throws `StoreNotAvailableError` unless a provider is set.
  *
  * @example
  * ```typescript
- * // Create a stash with working tree provider
- * const stashCommit = await git.stashCreate()
- *   .setWorkingTreeProvider(provider)
- *   .setMessage("WIP: feature work")
- *   .call();
+ * // git stash push -m "WIP: feature work"
+ * const stashCommit = await git.stashCreate().setMessage("WIP: feature work").call();
  *
- * // Create stash including untracked files
+ * // git stash push -u --keep-index
  * const stashCommit = await git.stashCreate()
- *   .setWorkingTreeProvider(provider)
  *   .setIncludeUntracked(true)
+ *   .setKeepIndex(true)
  *   .call();
  * ```
  */
@@ -97,6 +116,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   private workingDirectoryMessage = MSG_WORKING_DIR;
   private ref: string | null = STASH_REF;
   private includeUntracked = false;
+  private includeIgnored = false;
+  private keepIndex = false;
   private workingTreeProvider?: StashWorkingTreeProvider;
   private customMessage?: string;
   private author?: PersonIdent;
@@ -168,6 +189,27 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   }
 
   /**
+   * Set whether to stash (and remove) the ignored files too, as `git stash --all`; implies
+   * untracked files.
+   */
+  setIncludeIgnored(includeIgnored: boolean): this {
+    this.checkCallable();
+    this.includeIgnored = includeIgnored;
+    if (includeIgnored) this.includeUntracked = true;
+    return this;
+  }
+
+  /**
+   * Set whether the staged changes stay in the index and the worktree after the stash, as
+   * `git stash push --keep-index`.
+   */
+  setKeepIndex(keepIndex: boolean): this {
+    this.checkCallable();
+    this.keepIndex = keepIndex;
+    return this;
+  }
+
+  /**
    * Set the working tree provider for accessing uncommitted changes.
    *
    * @param provider The working tree provider
@@ -197,7 +239,12 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   async call(): Promise<ObjectId | undefined> {
     this.checkCallable();
     this.setCallable(false);
+    // one operation: one reading of the ignore rules for the trees, the clean and the reset
+    const worktree = this.worktreeAccess;
+    return worktree?.batch ? worktree.batch(() => this.stash()) : this.stash();
+  }
 
+  private async stash(): Promise<ObjectId | undefined> {
     // Get current HEAD
     const headRef = await this.refsStore.resolve("HEAD");
     if (!headRef?.objectId) {
@@ -219,28 +266,27 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     };
 
     // Determine trees to stash
-    let indexTree: ObjectId;
-    let workingTree: ObjectId;
-    let untrackedTree: ObjectId | undefined;
-
-    if (this.workingTreeProvider) {
-      // Check if there are changes to stash
-      const hasChanges = await this.workingTreeProvider.hasLocalChanges();
-      if (!hasChanges) {
-        return undefined;
-      }
-
-      indexTree = await this.workingTreeProvider.getIndexTree();
-      workingTree = await this.workingTreeProvider.getWorkingTree();
-
-      if (this.includeUntracked && this.workingTreeProvider.getUntrackedTree) {
-        untrackedTree = await this.workingTreeProvider.getUntrackedTree();
-      }
-    } else {
+    const provider = this.workingTreeProvider ?? this.defaultProvider();
+    if (!provider) {
       // without a working tree there is nothing to stash: stashing HEAD's tree instead
       // would report success while the local changes stay unsaved
       throw new StoreNotAvailableError("worktree", "stash requires a working tree");
     }
+    const untrackedOptions = {
+      includeUntracked: this.includeUntracked,
+      includeIgnored: this.includeIgnored,
+    };
+    // Check if there are changes to stash ("No local changes to save")
+    if (!(await provider.hasLocalChanges(untrackedOptions))) {
+      return undefined;
+    }
+
+    const indexTree = await provider.getIndexTree();
+    const workingTree = await provider.getWorkingTree();
+    const untrackedTree =
+      this.includeUntracked && provider.getUntrackedTree
+        ? await provider.getUntrackedTree({ includeIgnored: this.includeIgnored })
+        : undefined;
 
     // Build commit messages
     const abbrev = headRef.objectId.substring(0, 7);
@@ -295,12 +341,33 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       await this.updateStashRef(this.ref, stashCommit, workingMsg, author);
     }
 
-    // Reset working directory (if provider supports it)
-    if (this.workingTreeProvider) {
-      await this.workingTreeProvider.resetHard();
-    }
+    // Reset the index and the working directory, as git stash push does
+    await provider.resetHard({ ...untrackedOptions, keepIndex: this.keepIndex, indexTree });
 
     return stashCommit;
+  }
+
+  /** The built-in provider, for a working copy with an index and a worktree. */
+  private defaultProvider(): StashWorkingTreeProvider | undefined {
+    const worktree = this.worktreeAccess;
+    if (!worktree) return undefined;
+    let staging: Staging;
+    try {
+      staging = this.staging;
+    } catch {
+      return undefined;
+    }
+    return new WorkingCopyStashProvider({
+      workingCopy: this.workingCopy,
+      trees: this.trees,
+      blobs: this.blobs,
+      staging,
+      worktree,
+      headTree: async () => {
+        const head = await this.refsStore.resolve("HEAD");
+        return head?.objectId ? (await this.commits.load(head.objectId))?.tree : undefined;
+      },
+    });
   }
 
   /**

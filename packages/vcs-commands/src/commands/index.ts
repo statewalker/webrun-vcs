@@ -27,5 +27,6 @@ export * from "./stash-apply-command.js";
 export * from "./stash-create-command.js";
 export * from "./stash-drop-command.js";
 export * from "./stash-list-command.js";
+export * from "./stash-working-tree.js";
 export * from "./status-command.js";
 export * from "./tag-command.js";
