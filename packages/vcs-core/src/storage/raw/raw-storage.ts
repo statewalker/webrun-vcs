@@ -88,6 +88,16 @@ export interface RawStorage {
   move?(from: string, to: string): Promise<boolean>;
 
   /**
+   * Rename several values at once, all or none (each as `move`, replacing what its target
+   * held). Optional: a store with transactions (the SQL store) offers it, and a quarantine's
+   * `commit` then publishes every quarantined object in one step; without it the objects are
+   * moved one by one.
+   *
+   * @throws when a source does not exist; nothing is moved then
+   */
+  moveAll?(moves: ReadonlyArray<readonly [from: string, to: string]>): Promise<void>;
+
+  /**
    * Remove storage that no key reaches any more and that is older than
    * `olderThanMs`: what an interrupted write or a lost race left behind (the
    * KV store's unreferenced chunks, the SQL store's unreferenced chunk rows).

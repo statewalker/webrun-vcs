@@ -38,6 +38,7 @@ import { SERVER_V2_CAPABILITIES } from "../../fsm/protocol-v2/types.js";
 import type { ReceivePackHooks, ReceivePackLogger } from "../../fsm/push/receive-pack-types.js";
 import {
   RECEIVE_PACK_CAPABILITIES,
+  releaseReceivePack,
   serverPushHandlers,
   serverPushTransitions,
 } from "../../fsm/push/server-push-fsm.js";
@@ -862,10 +863,17 @@ export async function handleReceivePack(
   // The ref advertisement was sent by GET /info/refs: start at the commands
   const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
   fsm.setState("READ_COMMANDS");
-  const run: Promise<{ thrown?: unknown }> = fsm.run(ctx).then(
-    () => ({}),
-    (thrown: unknown) => ({ thrown }),
-  );
+  const run: Promise<{ thrown?: unknown }> = fsm
+    .run(ctx)
+    .then(
+      () => ({}),
+      (thrown: unknown) => ({ thrown }),
+    )
+    // objects of a push that stopped before applying its refs are not left behind
+    .then(async (r) => {
+      await releaseReceivePack(ctx);
+      return r;
+    });
 
   const first = await Promise.race([run.then(() => "finished" as const), onAuthorized]);
   if (first === "finished") {

@@ -29,10 +29,50 @@
  * ```
  */
 
-import type { PackImportResult } from "@statewalker/vcs-core";
+import type { PackImportResult as CorePackImportResult } from "@statewalker/vcs-core";
 
-// Re-export PackImportResult from core for transport consumers
-export type { PackImportResult } from "@statewalker/vcs-core";
+/** Options of {@link RepositoryFacade.importPack}. */
+export interface PackImportOptions {
+  /**
+   * Keep the received objects in a quarantine until the push is accepted, as git's
+   * receive-pack does with `tmp_objdir`: the result then carries {@link RepositoryQuarantine}
+   * when the repository can quarantine (its object store has `beginQuarantine`).
+   */
+  quarantine?: boolean;
+}
+
+/**
+ * Received objects kept aside (git's receive-pack quarantine): invisible to the repository's
+ * readers until `commit()`, removed by `discard()`.
+ *
+ * @example
+ * ```ts
+ * const imported = await facade.importPack(pack, { quarantine: true });
+ * const view = imported.quarantine?.repository ?? facade; // sees the pushed objects
+ * if (await accepted(view)) await imported.quarantine?.commit();
+ * else await imported.quarantine?.discard();
+ * ```
+ */
+export interface RepositoryQuarantine {
+  /**
+   * The repository as the push sees it: the quarantined objects, then the repository's.
+   * receive-pack's connectivity check, its `update()` checks and its hooks read through it.
+   */
+  readonly repository: RepositoryFacade;
+  /** Publish the quarantined objects into the repository (before any ref names them). */
+  commit(): Promise<void>;
+  /** Remove every quarantined object. Safe to call more than once. */
+  discard(): Promise<void>;
+}
+
+/** Statistics of an imported pack, with its quarantine when one was asked for and possible. */
+export interface PackImportResult extends Omit<CorePackImportResult, "quarantine"> {
+  /**
+   * With `quarantine: true`, where the repository can quarantine: the caller must
+   * `commit()` or `discard()` it. Absent otherwise: the objects are already published.
+   */
+  quarantine?: RepositoryQuarantine;
+}
 /**
  * Options for exportPack operation (Protocol V2 extensions).
  */
@@ -92,10 +132,17 @@ export interface RepositoryFacade {
    *
    * Delegates to: SerializationApi.importPack
    *
+   * With `options.quarantine` the objects are kept aside until the caller commits them
+   * (receive-pack); see {@link PackImportResult.quarantine}.
+   *
    * @param packStream - Stream of pack bytes
+   * @param options - Import options
    * @returns Import statistics
    */
-  importPack(packStream: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
+  importPack(
+    packStream: AsyncIterable<Uint8Array>,
+    options?: PackImportOptions,
+  ): Promise<PackImportResult>;
 
   /**
    * Exports objects as a pack stream.

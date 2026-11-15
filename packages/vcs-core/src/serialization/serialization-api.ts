@@ -12,6 +12,7 @@
  */
 
 import type { ObjectId } from "../common/id/index.js";
+import type { ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 
 /**
@@ -33,6 +34,21 @@ export interface PackImportResult {
   tagsImported: number;
   /** The kept pack's id, when the pack was installed instead of unpacked */
   packId?: string;
+  /**
+   * With `quarantine: true`, where the backend can quarantine: the objects kept aside until the
+   * caller calls `commit()` (publish) or `discard()` (remove them all). Absent when the
+   * backend cannot (stores of parsed objects): the objects are then already published.
+   */
+  quarantine?: ObjectQuarantine;
+}
+
+/** Options of `SerializationApi.importPack`. */
+export interface PackImportOptions {
+  /**
+   * Keep the objects in a quarantine until the caller accepts them, as git's receive-pack does
+   * (see `GitObjects.beginQuarantine`): `result.quarantine` is set when the backend can.
+   */
+  quarantine?: boolean;
 }
 
 /**
@@ -126,10 +142,17 @@ export interface SerializationApi {
    * packs (thin packs completed from the local objects), any other is unpacked into loose
    * objects. The stream is never buffered whole. Refuses a corrupt pack with `PackError`.
    *
+   * With `options.quarantine`, the objects stay invisible to the repository's readers until
+   * `result.quarantine.commit()` (backends that can quarantine; see `PackImportResult`).
+   *
    * @param pack Pack file stream
+   * @param options Import options
    * @returns Import statistics
    */
-  importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
+  importPack(
+    pack: AsyncIterable<Uint8Array>,
+    options?: PackImportOptions,
+  ): Promise<PackImportResult>;
 
   /**
    * Export single object in Git format

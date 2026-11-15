@@ -5,12 +5,22 @@
  * 2. Read the commands (and the client's `shallow` lines), then the push options
  * 3. Authorize the commands (the `authorize` hook), before any pack byte is read
  * 4. Receive and import the pack (unless every command needing it is refused, or a delete)
+ *    into a quarantine (git's `tmp_objdir`), where the repository can keep one
  * 5. Check connectivity (git's `check_connected`) and shallow updates
  * 6. Run the pre-receive hook
  * 7. Check each command as git's `update()` does (ref name, current branch, deletes,
  *    fast-forward, branch tips are commits, duplicates), then the per-ref update hook
- * 8. Apply the ref updates (one transaction when atomic)
+ * 8. Publish the quarantined objects, then apply the ref updates (one transaction when atomic)
  * 9. Send the status report, then start the post-receive hook (detached)
+ *
+ * Quarantine: steps 5 to 7 read the pushed objects through the quarantine's view
+ * (`RepositoryQuarantine.repository`, also given to hooks as `repository`); nobody else sees
+ * them. They are published (`commit`) only when at least one ref update is still to be applied,
+ * before any ref moves, as git migrates the objects and then updates the refs. A push refused
+ * as a whole (unpack error, connectivity, authorize, pre-receive or update refusals of every
+ * ref, an atomic push with a refused ref, an internal error, a client gone mid-pack) leaves no
+ * object behind: the quarantine is discarded. Drivers call `releaseReceivePack` once the FSM
+ * stops, so a run that ends on an error discards it too.
  *
  * The report texts are git's: `unpacker error`, `missing necessary objects`, `funny refname`,
  * `branch is currently checked out`, `deletion prohibited`, `deletion of the current branch
@@ -21,6 +31,7 @@
  */
 
 import { isValidRefName, type RefCommand } from "@statewalker/vcs-core";
+import type { RepositoryFacade, RepositoryQuarantine } from "../../api/repository-facade.js";
 import {
   getConfig,
   getOutput,
@@ -400,7 +411,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const state = getState<ServerPushState>(ctx);
       try {
         if (state.packStream) {
-          output.packResult = await repository.importPack(state.packStream);
+          // kept aside until the push is accepted (when the repository can quarantine)
+          const { quarantine, ...result } = await repository.importPack(state.packStream, {
+            quarantine: true,
+          });
+          state.quarantine = quarantine;
+          output.packResult = result;
         }
         return "UNPACK_OK";
       } catch (e) {
@@ -419,7 +435,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
   [
     "CHECK_CONNECTIVITY",
     async (ctx) => {
-      const repository = getRepository(ctx);
+      // the pushed objects are read through the quarantine
+      const repository = pushView(ctx);
       const state = getState<ServerPushState>(ctx);
       const rp = receivePackConfig(ctx);
       // the pack is read: keep the client's connection alive while the push is checked
@@ -437,7 +454,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         for (const oid of state.pushShallow ?? []) {
           if (await repository.has(oid)) theirs.add(oid);
         }
-        const shallowAllowed = rp.shallowUpdate === true && !!repository.updateShallow;
+        const shallowAllowed = rp.shallowUpdate === true && !!getRepository(ctx).updateShallow;
 
         const tips = [...new Set(pending().map((c) => c.newOid))];
         if (tips.length === 0) return "CONNECTIVITY_OK";
@@ -524,11 +541,18 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const repository = getRepository(ctx);
       try {
         const atomic = state.capabilities.has("atomic");
+        const all = state.pushCommands ?? [];
+        // git migrates the quarantined objects, then updates the refs: published only when a
+        // ref update is still to be applied (an atomic push with a refused ref applies none)
+        const applying =
+          all.some((c) => c.result === "NOT_ATTEMPTED") &&
+          !(atomic && all.some((c) => c.result !== "NOT_ATTEMPTED"));
+        if (applying) await publishQuarantine(ctx);
+        else await discardQuarantine(ctx);
         // An accepted shallow push records the client's boundary before its refs move: only
         // the shallow commits the new history of the refs still accepted ends at (git's
         // delayed_reachability_test), not those the existing refs already reach
         if (state.shallowConnectivity && repository.updateShallow) {
-          const all = state.pushCommands ?? [];
           const blocked = atomic && all.some((c) => c.result !== "NOT_ATTEMPTED");
           const tips = all
             .filter((c) => c.result === "NOT_ATTEMPTED" && c.type !== "DELETE")
@@ -552,6 +576,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const output = getOutput(ctx);
       stopKeepAlive(ctx);
       try {
+        // a push that got here without applying its refs leaves no object behind
+        await discardQuarantine(ctx);
         await state.bandQueue;
         const useSideband = state.capabilities.has("side-band-64k");
         if (state.capabilities.has("report-status")) {
@@ -623,6 +649,8 @@ interface ServerPushState extends ProtocolState {
   shallowConnectivity?: PushConnectivity;
   /** The unpack status when not "ok" */
   unpackStatus?: string;
+  /** The received objects, kept aside until the push is accepted (git's tmp_objdir) */
+  quarantine?: RepositoryQuarantine;
   /** Side-band writes besides the FSM's own (keep-alive, messages), in order */
   bandQueue?: Promise<void>;
   keepAliveTimer?: ReturnType<typeof setInterval>;
@@ -633,6 +661,54 @@ interface ServerPushState extends ProtocolState {
 /** Context with hooks set directly (older callers). */
 interface ContextWithHooks extends ProcessContext {
   hooks?: ReceivePackHooks;
+}
+
+/**
+ * The repository as the push sees it: the quarantine's view (the pushed objects, then the
+ * repository's) while there is one, else the repository.
+ */
+function pushView(ctx: ProcessContext): RepositoryFacade {
+  return getState<ServerPushState>(ctx).quarantine?.repository ?? getRepository(ctx);
+}
+
+/** Publishes the quarantined objects into the repository (git's tmp_objdir_migrate). */
+async function publishQuarantine(ctx: ProcessContext): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  const quarantine = state.quarantine;
+  if (!quarantine) return;
+  state.quarantine = undefined;
+  await quarantine.commit();
+}
+
+/** Removes the quarantined objects of a push that will not apply them. */
+async function discardQuarantine(ctx: ProcessContext): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  const quarantine = state.quarantine;
+  if (!quarantine) return;
+  state.quarantine = undefined;
+  try {
+    await quarantine.discard();
+  } catch (e) {
+    logError(ctx, "could not discard the quarantined objects", e);
+  }
+}
+
+/**
+ * Ends a receive-pack run: discards the quarantined objects it did not publish (a run that
+ * stopped on an error, a client that went away). Drivers call it once `Fsm.run` returns or
+ * throws; a run that reached the report has nothing left to discard.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await fsm.run(ctx);
+ * } finally {
+ *   await releaseReceivePack(ctx);
+ * }
+ * ```
+ */
+export async function releaseReceivePack(ctx: ProcessContext): Promise<void> {
+  await discardQuarantine(ctx);
 }
 
 function receivePackConfig(ctx: ProcessContext): ReceivePackConfig {
@@ -701,6 +777,9 @@ function hookContext(ctx: ProcessContext): ReceivePackHookContext {
       },
       get shallow() {
         return state.pushShallow ?? [];
+      },
+      get repository() {
+        return pushView(ctx);
       },
       request: rp.request,
       repoPath: rp.repoPath,
@@ -771,7 +850,7 @@ function stopKeepAlive(ctx: ProcessContext): void {
 
 /** The object's type, as far as the facade tells (undefined: absent or unknown). */
 async function objectType(ctx: ProcessContext, oid: string): Promise<string | undefined> {
-  const repository = getRepository(ctx);
+  const repository = pushView(ctx);
   if (repository.getObjectType) return repository.getObjectType(oid);
   if (repository.getCommitInfo) {
     if (await repository.getCommitInfo(oid)) return "commit";
@@ -946,7 +1025,7 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
 
 /** Whether `ancestor` is reachable from `oid` through parents. */
 function isAncestor(ctx: ProcessContext, ancestor: string, oid: string): Promise<boolean> {
-  return isAncestorOf(getRepository(ctx), ancestor, oid);
+  return isAncestorOf(pushView(ctx), ancestor, oid);
 }
 
 /** A delete of a ref that does not exist: nothing to do, reported ok (git warns). */

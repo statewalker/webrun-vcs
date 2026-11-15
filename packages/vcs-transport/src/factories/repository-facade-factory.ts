@@ -11,9 +11,11 @@
  */
 
 import {
+  createHistoryFromComponents,
   DefaultSerializationApi,
   type History,
   type HistoryWithOperations,
+  type ObjectQuarantine,
   type Ref,
   type SymbolicRef,
 } from "@statewalker/vcs-core";
@@ -21,8 +23,10 @@ import type {
   CommitGraphInfo,
   ExportPackOptions,
   GitObjectTypeName,
+  PackImportOptions,
   PackImportResult,
   RepositoryFacade,
+  RepositoryQuarantine,
   TagTargetInfo,
   TreeEntryInfo,
 } from "../api/repository-facade.js";
@@ -72,6 +76,30 @@ export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryF
 }
 
 /**
+ * A core quarantine as the transport's {@link RepositoryQuarantine}: its `repository` is a
+ * facade over the quarantine's objects (the quarantined ones, then the repository's) and the
+ * repository's refs, so receive-pack's checks and hooks see the pushed objects before anyone
+ * else does.
+ *
+ * @example
+ * ```ts
+ * const { quarantine } = await serialization.importPack(pack, { quarantine: true });
+ * if (quarantine) return { ...stats, quarantine: repositoryQuarantine(quarantine, history) };
+ * ```
+ */
+export function repositoryQuarantine(
+  quarantine: ObjectQuarantine,
+  history: Pick<History, "refs">,
+): RepositoryQuarantine {
+  const view = createHistoryFromComponents({ objects: quarantine.objects, refs: history.refs });
+  return {
+    repository: createRepositoryFacadeFromHistory(view),
+    commit: () => quarantine.commit(),
+    discard: () => quarantine.discard(),
+  };
+}
+
+/**
  * Create RepositoryFacade using new History interface (recommended)
  */
 function createRepositoryFacadeFromHistory(
@@ -87,8 +115,14 @@ function createRepositoryFacadeFromHistory(
     // Pack I/O - delegated to SerializationApi
     // ─────────────────────────────────────────────────────────────────
 
-    importPack(packStream: AsyncIterable<Uint8Array>): Promise<PackImportResult> {
-      return serialization.importPack(packStream);
+    async importPack(
+      packStream: AsyncIterable<Uint8Array>,
+      options?: PackImportOptions,
+    ): Promise<PackImportResult> {
+      const { quarantine, ...result } = await serialization.importPack(packStream, options);
+      return quarantine
+        ? { ...result, quarantine: repositoryQuarantine(quarantine, history) }
+        : result;
     },
 
     exportPack(

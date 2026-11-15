@@ -18,7 +18,11 @@ import { serverFetchHandlers, serverFetchTransitions } from "../fsm/fetch/server
 import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
 import type { ReceivePackHooks, ReceivePackLogger } from "../fsm/push/receive-pack-types.js";
-import { serverPushHandlers, serverPushTransitions } from "../fsm/push/server-push-fsm.js";
+import {
+  releaseReceivePack,
+  serverPushHandlers,
+  serverPushTransitions,
+} from "../fsm/push/server-push-fsm.js";
 import type { ServiceType } from "../protocol/types.js";
 import { withIdleTimeout } from "../utils/idle-timeout.js";
 
@@ -204,5 +208,8 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       success: false,
       error: error instanceof Error ? error.message : String(error),
     };
+  } finally {
+    // objects of a push that stopped before applying its refs are not left behind
+    if (service === "git-receive-pack" && !useV2) await releaseReceivePack(ctx);
   }
 }

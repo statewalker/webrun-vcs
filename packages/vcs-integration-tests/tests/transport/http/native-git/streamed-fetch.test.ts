@@ -86,7 +86,7 @@ describeWithGit("fetch streams the pack into importPack (git-http-backend)", () 
               yield chunk;
             }
           })();
-          const r = await history.serialization.importPack(counted);
+          const r = await facade.importPack(counted);
           streamed = chunks > 1;
           imported = r.objectsImported;
           return r;

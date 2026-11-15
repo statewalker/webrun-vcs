@@ -272,16 +272,32 @@ export class SqlRawStore implements RawStorage {
    */
   async move(from: string, to: string): Promise<boolean> {
     await this.ensureInitialized();
-    return this.db.transaction(async (tx) => {
-      const moving = await this.tokenOf(tx, from);
-      if (moving === undefined) return false;
-      if (from === to) return true;
-      const replaced = await this.tokenOf(tx, to);
-      await tx.execute(`DELETE FROM ${this.tableName} WHERE key = ?`, [to]);
-      await tx.execute(`UPDATE ${this.tableName} SET key = ? WHERE key = ?`, [to, from]);
-      if (replaced !== moving) await this.dropChunks(tx, replaced);
-      return true;
+    return this.db.transaction((tx) => this.moveIn(tx, from, to));
+  }
+
+  /**
+   * Rename several values in one transaction, all or none: a quarantine's `commit` publishes
+   * every object of a push at once. Throws, moving nothing, when a source is missing.
+   */
+  async moveAll(moves: ReadonlyArray<readonly [from: string, to: string]>): Promise<void> {
+    if (moves.length === 0) return;
+    await this.ensureInitialized();
+    await this.db.transaction(async (tx) => {
+      for (const [from, to] of moves) {
+        if (!(await this.moveIn(tx, from, to))) throw new Error(`moveAll: ${from} does not exist`);
+      }
     });
+  }
+
+  private async moveIn(tx: DatabaseClient, from: string, to: string): Promise<boolean> {
+    const moving = await this.tokenOf(tx, from);
+    if (moving === undefined) return false;
+    if (from === to) return true;
+    const replaced = await this.tokenOf(tx, to);
+    await tx.execute(`DELETE FROM ${this.tableName} WHERE key = ?`, [to]);
+    await tx.execute(`UPDATE ${this.tableName} SET key = ? WHERE key = ?`, [to, from]);
+    if (replaced !== moving) await this.dropChunks(tx, replaced);
+    return true;
   }
 
   async *keys(): AsyncIterable<string> {

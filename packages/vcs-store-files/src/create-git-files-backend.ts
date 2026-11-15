@@ -17,6 +17,7 @@ import {
 } from "@statewalker/vcs-core";
 import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
 import { skipPacked, withPacks } from "./pack/with-packs.js";
+import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
@@ -130,6 +131,9 @@ export async function createGitFilesBackend(
   });
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);
+  // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is accepted
+  objects.beginQuarantine = () =>
+    beginFilesQuarantine({ files, objectsDir, objects, packs, freshenMaxAgeMs });
   const reflog = await readReflogConfig(files, gitDir);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,

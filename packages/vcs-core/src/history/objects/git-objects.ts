@@ -5,6 +5,7 @@
  * produced keep their id.
  */
 import type { ObjectId } from "../../common/id/index.js";
+import type { InstalledPack, InstallPackOptions } from "../../pack/index-pack.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 /** `put` rejects with this when the content is not as long as the size given for it. */
@@ -87,6 +88,56 @@ export interface GitObjects {
    * @returns The number of leftovers removed
    */
   sweepStale?(options: { olderThanMs: number }): Promise<number>;
+  /**
+   * Open a quarantine, as git's receive-pack does with `tmp_objdir`: objects written through
+   * `quarantine.objects` stay invisible to every other reader of this store until
+   * `quarantine.commit()` publishes them, and `quarantine.discard()` removes them all. Reads
+   * through `quarantine.objects` see the quarantined objects and this store's. Present when the
+   * store can keep objects aside (the memory, KV and SQL raw stores, the files backend); a store
+   * without it (typed stores of parsed objects) cannot quarantine, and `importPack` with
+   * `quarantine: true` then writes straight into it and returns no quarantine.
+   */
+  beginQuarantine?(): Promise<ObjectQuarantine>;
+}
+
+/**
+ * Objects kept aside until they are accepted (git's `tmp_objdir`): see
+ * `GitObjects.beginQuarantine`.
+ *
+ * @example
+ * ```typescript
+ * const q = await objects.beginQuarantine!();
+ * const id = await q.objects.put("blob", 6, [bytes]); // q.objects.has(id), not objects.has(id)
+ * await q.commit(); // now objects.has(id); after q.discard() instead it is gone
+ * ```
+ */
+export interface ObjectQuarantine {
+  /**
+   * The quarantine's view: writes stay in the quarantine (an object the store already has is
+   * not written again), reads see the quarantined objects, then the store's. `remove` removes
+   * quarantined objects only.
+   */
+  readonly objects: GitObjects;
+  /**
+   * Where a received pack is kept inside the quarantine, for backends that keep packs (the
+   * files backend: `objects/tmp_objdir-incoming-<id>/pack`). Its objects are read through
+   * `objects`. Without it a quarantined pack is unpacked into `objects`.
+   */
+  readonly packs?: {
+    install(
+      source: AsyncIterable<Uint8Array>,
+      options?: InstallPackOptions,
+    ): Promise<InstalledPack>;
+  };
+  /**
+   * Publish every quarantined object into the store (git's `tmp_objdir_migrate`), then close
+   * the quarantine. Objects are moved one by one (renames where the store can), packs before
+   * their indexes, so a crash part way leaves some objects published (unreachable until a ref
+   * names them, so gc prunes them) and the rest for gc to sweep.
+   */
+  commit(): Promise<void>;
+  /** Remove every quarantined object and close the quarantine. Safe to call more than once. */
+  discard(): Promise<void>;
 }
 
 /** Options of `createGitObjects`. */

@@ -171,6 +171,25 @@ describe("connectivity cost (facade reads)", () => {
       treeReads++;
       return getTreeEntries?.(oid);
     };
+    // the pushed objects are read through the quarantine's view: count its reads too
+    const importPack = repo.facade.importPack.bind(repo.facade);
+    repo.facade.importPack = async (stream, options) => {
+      const result = await importPack(stream, options);
+      const view = result.quarantine?.repository;
+      if (view) {
+        const viewCommit = view.getCommitInfo?.bind(view);
+        const viewTree = view.getTreeEntries?.bind(view);
+        view.getCommitInfo = async (oid) => {
+          commitReads++;
+          return viewCommit?.(oid);
+        };
+        view.getTreeEntries = async (oid) => {
+          treeReads++;
+          return viewTree?.(oid);
+        };
+      }
+      return result;
+    };
     const run = await runReceivePack(repo, {
       commands: Array.from({ length: 200 }, (_, i) =>
         i % 2 === 0 ? `${ZERO} ${n1} refs/heads/broken${i}` : `${ZERO} ${n0} refs/heads/fine${i}`,

@@ -56,10 +56,149 @@ export interface StagingBlobStore {
    * @returns The number of leftovers removed
    */
   sweepStale?(options: SweepStaleOptions): Promise<number>;
+  /**
+   * Open a store kept apart from this one (git's `tmp_objdir`): what is written there is not
+   * seen by this store's `get`, `has` or `list` until `commit()`, and `discard()` removes it.
+   * Optional; `createGitObjects` builds `GitObjects.beginQuarantine` on it.
+   */
+  beginQuarantine?(): Promise<StagingQuarantine>;
+}
+
+/** A store kept apart from its parent until `commit` (see `StagingBlobStore.beginQuarantine`). */
+export interface StagingQuarantine {
+  /** The quarantine's own store: its keys only, none of the parent's. */
+  readonly store: StagingBlobStore;
+  /** Move every object of `store` into the parent store (one already there is dropped). */
+  commit(): Promise<void>;
+  /** Remove everything `store` holds. Safe to call more than once. */
+  discard(): Promise<void>;
 }
 
 /** Prefix of the temporary keys `rawStorageStaging` writes (never an object id). */
 export const RAW_STAGING_TMP_PREFIX = "tmp_obj_";
+
+/**
+ * Prefix of the keys of a `rawStorageStaging` quarantine: `incoming-<timestampedId>/<key>`,
+ * never an object id, so the store's object listing skips them.
+ */
+export const RAW_QUARANTINE_PREFIX = "incoming-";
+
+/** Quarantines of this process (their key prefixes), which `sweepStale` leaves alone. */
+const openQuarantines = new Set<string>();
+
+/**
+ * The keys of `raw` under `prefix`, as a store of their own (`prefix` stripped). The view of
+ * a quarantine of `rawStorageStaging`.
+ */
+function prefixedRawStorage(raw: RawStorage, prefix: string): RawStorage {
+  const view: RawStorage = {
+    store: (key, content) => raw.store(prefix + key, content),
+    load: (key, options) => raw.load(prefix + key, options),
+    has: (key) => raw.has(prefix + key),
+    remove: (key) => raw.remove(prefix + key),
+    async *keys() {
+      for await (const key of raw.keys())
+        if (key.startsWith(prefix)) yield key.slice(prefix.length);
+    },
+    size: (key) => raw.size(prefix + key),
+  };
+  if (raw.move) {
+    const move = raw.move.bind(raw);
+    view.move = (from, to) => move(prefix + from, prefix + to);
+  }
+  return view;
+}
+
+/**
+ * A quarantine over `raw` (see `StagingBlobStore.beginQuarantine`): objects are written under
+ * `incoming-<timestampedId>/` in `raw` itself and moved to their ids on `commit` (with
+ * `raw.moveAll`, all in one step; else with `raw.move`, else copied and removed). The ids
+ * written are remembered in memory (one string per object of the push), so neither `commit`
+ * nor `discard` lists the store. A crash leaves the prefixed keys; `sweepStaleRawStaging`
+ * removes them once older than its expiry.
+ */
+function rawStorageQuarantine(
+  raw: RawStorage,
+  options: RawStorageStagingOptions,
+): StagingQuarantine {
+  const prefix = `${RAW_QUARANTINE_PREFIX}${timestampedId()}/`;
+  openQuarantines.add(prefix);
+  const inner = rawStorageStaging(prefixedRawStorage(raw, prefix), options);
+  const written = new Set<string>();
+  let closed = false;
+
+  const removeWritten = async () => {
+    for (const id of written) await raw.remove(prefix + id).catch(() => false);
+    written.clear();
+  };
+  const close = () => {
+    closed = true;
+    openQuarantines.delete(prefix);
+  };
+  const checkOpen = () => {
+    if (closed) throw new Error("the quarantine is closed");
+  };
+
+  const store: StagingBlobStore = {
+    async putStaged(bytes, idOf) {
+      checkOpen();
+      const r = await inner.putStaged(bytes, idOf);
+      written.add(r.id);
+      return r;
+    },
+    spool: inner.spool,
+    get: (id) => inner.get(id),
+    has: (id) => inner.has(id),
+    async remove(id) {
+      written.delete(id);
+      return inner.remove(id);
+    },
+    async *list() {
+      yield* written;
+    },
+  };
+
+  return {
+    store,
+    async commit() {
+      checkOpen();
+      try {
+        const moves: [string, string][] = [];
+        for (const id of written) {
+          // published meanwhile (another push of the same object): the copy here goes
+          if (await raw.has(id)) await raw.remove(prefix + id);
+          else moves.push([prefix + id, id]);
+        }
+        if (raw.moveAll) {
+          await raw.moveAll(moves);
+        } else {
+          for (const [from, to] of moves) {
+            if (raw.move) {
+              if (!(await raw.move(from, to))) throw new Error(`could not move ${from} to ${to}`);
+            } else {
+              await raw.store(to, raw.load(from));
+              await raw.remove(from);
+            }
+            written.delete(to);
+          }
+        }
+        written.clear();
+      } finally {
+        // what could not be published is not left behind
+        await removeWritten();
+        close();
+      }
+    },
+    async discard() {
+      if (closed) return;
+      try {
+        await removeWritten();
+      } finally {
+        close();
+      }
+    },
+  };
+}
 
 /**
  * Content up to this many bytes is collected and stored under its id directly
@@ -86,7 +225,9 @@ const tmpKey = () => `${RAW_STAGING_TMP_PREFIX}${timestampedId()}`;
  * A temporary whose name carries no time (written by an older version) is
  * removed only when `olderThanMs <= 0`. Temporaries of writes running in this
  * process are kept; one written by another process sharing the store is safe
- * only through its age, so pick an expiry longer than any write.
+ * only through its age, so pick an expiry longer than any write. Quarantines
+ * (`incoming-<timestampedId>/…` keys) left by a crash are removed the same way,
+ * except those this process still has open.
  */
 export async function sweepStaleRawStaging(
   raw: RawStorage,
@@ -95,6 +236,14 @@ export async function sweepStaleRawStaging(
   const cutoff = Date.now() - olderThanMs;
   const stale: string[] = [];
   for await (const key of raw.keys()) {
+    if (key.startsWith(RAW_QUARANTINE_PREFIX)) {
+      // a quarantine left by a crash (or a process that never committed nor discarded it)
+      const slash = key.indexOf("/");
+      if (slash < 0 || openQuarantines.has(key.slice(0, slash + 1))) continue;
+      const made = timestampOfId(key.slice(RAW_QUARANTINE_PREFIX.length, slash));
+      if (olderThanMs <= 0 || (made !== undefined && made < cutoff)) stale.push(key);
+      continue;
+    }
     if (!key.startsWith(RAW_STAGING_TMP_PREFIX) || inFlight.has(key)) continue;
     const made = timestampOfId(key.slice(RAW_STAGING_TMP_PREFIX.length));
     if (olderThanMs <= 0 || (made !== undefined && made < cutoff)) stale.push(key);
@@ -264,5 +413,6 @@ export function rawStorageStaging(
     remove: (id) => raw.remove(id),
     list: () => raw.keys(),
     sweepStale: (o) => sweepStaleRawStaging(raw, o),
+    beginQuarantine: async () => rawStorageQuarantine(raw, options),
   };
 }
