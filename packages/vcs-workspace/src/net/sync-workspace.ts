@@ -83,7 +83,7 @@ const RETRY_STATUSES = new Set<PushRefUpdate["status"]>([
  * transaction messages); anything else, a declined hook for one, is a refusal
  */
 const RETRY_REASONS =
-  /cannot lock ref|is at [0-9a-f]+ but expected|failed to update ref|non-fast-forward|fetch first|stale info|^locked$/i;
+  /cannot lock ref|failed to lock|is at [0-9a-f]+ but expected|failed to update ref|non-fast-forward|fetch first|stale info|^locked$/i;
 
 function asSyncError(what: string, error: unknown): SyncError {
   if (error instanceof SyncError) return error;
@@ -146,6 +146,7 @@ async function syncRounds(
   const conflicts = new Set<string>();
   let committed = false;
   let lastReason = "";
+  let folderKeptChanging = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let local: Awaited<ReturnType<typeof commitFolder>>;
@@ -185,6 +186,7 @@ async function syncRounds(
           throw asSyncError(`bringing in ${remote.name}/${branchName} failed`, error);
         }
         lastReason = error.message;
+        folderKeptChanging = true;
         emit({ type: "retry", attempt, reason: lastReason });
         continue;
       }
@@ -232,7 +234,13 @@ async function syncRounds(
       );
     }
     lastReason = update.message ?? update.summary;
+    folderKeptChanging = false;
     emit({ type: "retry", attempt, reason: lastReason });
+  }
+  if (folderKeptChanging) {
+    throw new SyncError(
+      `the folder kept changing during the sync (${maxAttempts} attempts; last: ${lastReason})`,
+    );
   }
   throw new SyncError(
     `no agreement with ${remote.name} after ${maxAttempts} attempts (last: ${lastReason})`,

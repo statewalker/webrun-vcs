@@ -58,6 +58,7 @@
   "devDependencies": {
     "@statewalker/httpeers-access": "catalog:",
     "@statewalker/vcs-transport-httpeers": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "@statewalker/webrun-files-mem": "catalog:",
     "@statewalker/webrun-storage": "catalog:",
     "rolldown": "catalog:",

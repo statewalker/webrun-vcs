@@ -153,31 +153,152 @@ export async function findMergeBases(
   a: ObjectId[],
   b: ObjectId[],
 ): Promise<ObjectId[]> {
-  const ancestors = async (heads: ObjectId[]) => {
-    const seen = new Set<ObjectId>();
-    const queue = [...heads];
-    while (queue.length > 0) {
-      const id = queue.pop() as ObjectId;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      for (const p of await history.commits.getParents(id)) if (!seen.has(p)) queue.push(p);
-    }
-    return seen;
-  };
-  const fromA = await ancestors(a);
-  const fromB = await ancestors(b);
-  const common = [...fromA].filter((id) => fromB.has(id));
-  // a common ancestor reachable from another one's parents is not a best one
-  const covered = new Set<ObjectId>();
-  const queue: ObjectId[] = [];
-  for (const id of common) queue.push(...(await history.commits.getParents(id)));
-  while (queue.length > 0) {
-    const id = queue.pop() as ObjectId;
-    if (covered.has(id)) continue;
-    covered.add(id);
-    queue.push(...(await history.commits.getParents(id)));
+  const graph = commitGraph(history);
+  const candidates = await paintDownToCommon(graph, a, b);
+  if (candidates.length < 2) return candidates;
+  // git's remove_redundant: a candidate another candidate descends from is not a best one
+  const times = await Promise.all(candidates.map(async (c) => (await graph(c)).time));
+  const oldest = Math.min(...times);
+  const redundant = new Set<ObjectId>();
+  for (const c of candidates) {
+    if (redundant.has(c)) continue;
+    const others = candidates.filter((o) => o !== c && !redundant.has(o));
+    for (const reached of await reachable(graph, c, new Set(others), oldest))
+      redundant.add(reached);
   }
-  return common.filter((id) => !covered.has(id)).sort();
+  return candidates.filter((c) => !redundant.has(c)).sort();
+}
+
+interface CommitInfo {
+  parents: ObjectId[];
+  /** Committer time (seconds) */
+  time: number;
+}
+
+/** Commit parents and times, each commit read once. */
+function commitGraph(history: History): (id: ObjectId) => Promise<CommitInfo> {
+  const cache = new Map<ObjectId, Promise<CommitInfo>>();
+  return (id) => {
+    let info = cache.get(id);
+    if (!info) {
+      info = history.commits.load(id).then((c) => {
+        if (!c) throw new Error(`commit ${id} is missing`);
+        return { parents: c.parents, time: c.committer.timestamp };
+      });
+      cache.set(id, info);
+    }
+    return info;
+  };
+}
+
+/** A queue of commits, newest first (git's date-ordered commit queue). */
+class DateQueue {
+  private items: { id: ObjectId; time: number; seq: number }[] = [];
+  private seq = 0;
+  get size() {
+    return this.items.length;
+  }
+  some(test: (id: ObjectId) => boolean): boolean {
+    return this.items.some((item) => test(item.id));
+  }
+  push(id: ObjectId, time: number) {
+    const items = this.items;
+    items.push({ id, time, seq: this.seq++ });
+    for (let i = items.length - 1; i > 0; ) {
+      const up = (i - 1) >> 1;
+      if (!this.before(items[i], items[up])) break;
+      [items[i], items[up]] = [items[up], items[i]];
+      i = up;
+    }
+  }
+  pop(): ObjectId | undefined {
+    const items = this.items;
+    const top = items[0];
+    const last = items.pop();
+    if (items.length > 0 && last) {
+      items[0] = last;
+      for (let i = 0; ; ) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < items.length && this.before(items[l], items[m])) m = l;
+        if (r < items.length && this.before(items[r], items[m])) m = r;
+        if (m === i) break;
+        [items[i], items[m]] = [items[m], items[i]];
+        i = m;
+      }
+    }
+    return top?.id;
+  }
+  private before(x: { time: number; seq: number }, y: { time: number; seq: number }) {
+    return x.time > y.time || (x.time === y.time && x.seq < y.seq);
+  }
+}
+
+const PARENT1 = 1;
+const PARENT2 = 2;
+const STALE = 4;
+const RESULT = 8;
+
+/**
+ * git's paint_down_to_common: walks both sides newest first, painting each commit with the
+ * sides it is reached from; a commit painted by both is a common ancestor, and everything
+ * below it is stale. The walk ends when only stale commits are queued, so it reads the
+ * history down to the merge bases, not all of it.
+ */
+async function paintDownToCommon(
+  graph: (id: ObjectId) => Promise<CommitInfo>,
+  one: ObjectId[],
+  two: ObjectId[],
+): Promise<ObjectId[]> {
+  const flags = new Map<ObjectId, number>();
+  const queue = new DateQueue();
+  const paint = async (id: ObjectId, add: number) => {
+    const had = flags.get(id) ?? 0;
+    if ((had & add) === add) return;
+    flags.set(id, had | add);
+    queue.push(id, (await graph(id)).time);
+  };
+  for (const id of one) await paint(id, PARENT1);
+  for (const id of two) await paint(id, PARENT2);
+  const result: ObjectId[] = [];
+  const live = (id: ObjectId) => !((flags.get(id) ?? 0) & STALE);
+  while (queue.size > 0 && queue.some(live)) {
+    const id = queue.pop() as ObjectId;
+    const f = flags.get(id) ?? 0;
+    let down = f & (PARENT1 | PARENT2 | STALE);
+    if ((f & (PARENT1 | PARENT2)) === (PARENT1 | PARENT2)) {
+      if (!(f & RESULT)) {
+        flags.set(id, f | RESULT);
+        result.push(id);
+      }
+      down |= STALE;
+    }
+    for (const parent of (await graph(id)).parents) await paint(parent, down);
+  }
+  return result.filter(live);
+}
+
+/** Which of `targets` are ancestors of `from`, walking no lower than `oldest` (seconds). */
+async function reachable(
+  graph: (id: ObjectId) => Promise<CommitInfo>,
+  from: ObjectId,
+  targets: Set<ObjectId>,
+  oldest: number,
+): Promise<ObjectId[]> {
+  const found: ObjectId[] = [];
+  const seen = new Set<ObjectId>([from]);
+  const stack = [...(await graph(from)).parents];
+  while (stack.length > 0) {
+    const id = stack.pop() as ObjectId;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (targets.has(id)) found.push(id);
+    const info = await graph(id);
+    if (info.time < oldest) continue;
+    stack.push(...info.parents);
+  }
+  return found;
 }
 
 /** One side of a recursive merge: the commits whose history it holds, and its files. */

@@ -1485,6 +1485,9 @@ importers:
       '@statewalker/vcs-transport-httpeers':
         specifier: workspace:^
         version: link:../vcs-transport-httpeers
+      '@statewalker/vcs-utils-node':
+        specifier: workspace:^
+        version: link:../vcs-utils-node
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.11.0

@@ -22,7 +22,12 @@ A new entry point keeps a folder (any `FilesApi`) as commits on one branch and s
 - Fetched trees are checked against git's `verify_path` rules before anything is written: a `.git` component in any case, `..`, an absolute path, a backslash or a NUL fails the sync.
 - What a folder cannot hold stays in history: ignored paths, submodule entries, executable modes and symbolic links.
 - On case-insensitive folders, paths differing only in case are moved aside. Case sensitivity is probed when the workspace opens, or set with `caseInsensitive`.
-- Each file is checked again just before a checkout replaces it, and new content is written through a temporary file. A checkout cut short is recorded (`refs/workspace/pending/<branch>`) and finished by the next commit or sync. Failures reject with a `SyncError`.
+- Each file is checked again just before a checkout replaces it. New content is staged in a temporary file; an existing file is rewritten in place so it keeps its permissions.
+- A checkout cut short is recorded (`refs/workspace/pending/<branch>`) and finished by the next commit or sync, from a plan stored on the first attempt, so retries never merge a merged file twice. When a directory becomes a file, ignored files in it are removed.
+- Folder snapshots skip unchanged files by size and modification time. Racily clean entries (a time within `racyWindowMs`, default 3 s, of the last read) are hashed again.
+- Merge bases are found with git's paint-down-to-common walk.
+- `.git` is refused in its NTFS and HFS+ spellings too. The `.vcs-sync-tmp-` prefix is reserved, and stale temporary files are swept.
+- Failures reject with a `SyncError`. A folder that keeps changing fails with its own message.
 - Remotes:
   - `httpRemote({ url, auth?, fetchImpl? })`: the transport's fetch and push clients over smart HTTP. An httpeers peer connection plugs in as `fetchImpl: meshRemoteFetch(...)`.
   - `duplexRemote({ connect })`: `fetchOverDuplex` / `pushOverDuplex`, one connection per operation.
