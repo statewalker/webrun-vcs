@@ -34,19 +34,32 @@ const remote: RemoteRef[] = [
 describe("mapRefs (refspecs → local refs)", () => {
   it("maps through a wildcard refspec, keeping the force flag", () => {
     expect(mapRefs(remote, ["+refs/heads/*:refs/remotes/origin/*"])).toEqual([
-      { remoteRef: "refs/heads/main", localRef: "refs/remotes/origin/main", oid: A, force: true },
+      {
+        remoteRef: "refs/heads/main",
+        localRef: "refs/remotes/origin/main",
+        oid: A,
+        force: true,
+        refspec: 0,
+      },
       {
         remoteRef: "refs/heads/feature",
         localRef: "refs/remotes/origin/feature",
         oid: B,
         force: true,
+        refspec: 0,
       },
     ]);
   });
 
   it("maps an exact refspec, and only the ref it names", () => {
     expect(mapRefs(remote, ["refs/heads/main:refs/remotes/peer/main"])).toEqual([
-      { remoteRef: "refs/heads/main", localRef: "refs/remotes/peer/main", oid: A, force: false },
+      {
+        remoteRef: "refs/heads/main",
+        localRef: "refs/remotes/peer/main",
+        oid: A,
+        force: false,
+        refspec: 0,
+      },
     ]);
   });
 
@@ -65,7 +78,7 @@ describe("mapRefs (refspecs → local refs)", () => {
       localRef: "refs/heads/pinned",
     });
     expect(mapRefs(remote, ["HEAD"])).toEqual([
-      { remoteRef: "HEAD", localRef: undefined, oid: A, force: false },
+      { remoteRef: "HEAD", localRef: undefined, oid: A, force: false, refspec: 0 },
     ]);
   });
 

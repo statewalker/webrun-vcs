@@ -30,6 +30,7 @@ import {
   RemoteAddCommand,
   RemoteListCommand,
   RemoteRemoveCommand,
+  RemoteSetHeadCommand,
   RemoteSetUrlCommand,
   RenameBranchCommand,
   ResetCommand,
@@ -707,6 +708,19 @@ export class Git implements Disposable {
   remoteSetUrl(): RemoteSetUrlCommand {
     this.checkClosed();
     return new RemoteSetUrlCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RemoteSetHeadCommand for setting or deleting `refs/remotes/<name>/HEAD`.
+   *
+   * @example
+   * ```typescript
+   * await git.remoteSetHead().setRemoteName("origin").setBranch("develop").call();
+   * ```
+   */
+  remoteSetHead(): RemoteSetHeadCommand {
+    this.checkClosed();
+    return new RemoteSetHeadCommand(this._workingCopy);
   }
 
   // ============ Rebase Operations ============

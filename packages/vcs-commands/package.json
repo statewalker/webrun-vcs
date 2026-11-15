@@ -61,10 +61,11 @@
     "@statewalker/vcs-working-tree": "workspace:^"
   },
   "devDependencies": {
+    "@statewalker/vcs-store-kv": "workspace:^",
+    "@statewalker/vcs-store-sql": "workspace:^",
     "@statewalker/vcs-transport-adapters": "workspace:^",
     "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
-    "@statewalker/vcs-store-sql": "workspace:^",
     "rolldown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"

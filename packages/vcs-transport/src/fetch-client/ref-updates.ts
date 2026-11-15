@@ -48,6 +48,8 @@ export interface PlannedRef {
   localRef?: string;
   oid: string;
   force: boolean;
+  /** Index of the refspec that selected it in the list {@link mapRefs} got */
+  refspec?: number;
 }
 
 /**
@@ -65,13 +67,16 @@ export function mapRefs(
   const byName = new Map(remoteRefs.map((r) => [r.name, r]));
   const planned: PlannedRef[] = [];
   const seen = new Set<string>();
+  // git's ref_remove_duplicates: a ref fetched without destination is listed each time
   const add = (p: PlannedRef) => {
-    const key = `${p.remoteRef}\0${p.localRef ?? ""}`;
-    if (seen.has(key)) return;
-    seen.add(key);
+    if (p.localRef !== undefined) {
+      const key = `${p.remoteRef}\0${p.localRef}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+    }
     planned.push(p);
   };
-  for (const spec of specs) {
+  for (const [index, spec] of specs.entries()) {
     if (spec.negative || !spec.source) continue;
     if (spec.wildcard) {
       for (const ref of remoteRefs) {
@@ -81,6 +86,7 @@ export function mapRefs(
           localRef: expandFromSource(spec, ref.name).destination ?? undefined,
           oid: ref.oid,
           force: spec.force,
+          refspec: index,
         });
       }
       continue;
@@ -91,6 +97,7 @@ export function mapRefs(
         localRef: spec.destination ?? undefined,
         oid: spec.source,
         force: spec.force,
+        refspec: index,
       });
       continue;
     }
@@ -101,6 +108,7 @@ export function mapRefs(
       localRef: spec.destination ?? undefined,
       oid: ref.oid,
       force: spec.force,
+      refspec: index,
     });
   }
   return planned;
