@@ -47,6 +47,7 @@ export const serverV2Transitions: FsmTransition[] = [
 
   // Parse fetch arguments
   ["PARSE_FETCH", "FETCH_PARSED", "VALIDATE_FETCH_WANTS"],
+  ["PARSE_FETCH", "INVALID_REQUEST", "SEND_ERROR"],
   ["PARSE_FETCH", "ERROR", ""],
 
   // Validate fetch wants
@@ -299,14 +300,15 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
             const depth = Number(line.slice(7));
             if (!Number.isInteger(depth) || depth <= 0) {
               ctx.output.error = `Invalid deepen: ${line}`;
-              return "ERROR";
+              return "INVALID_REQUEST";
             }
             req.deepen = depth;
           } else if (line.startsWith("deepen-since ")) {
+            // git refuses 0 (and its -1): no positive time is no cutoff
             const since = Number(line.slice(13));
-            if (!Number.isInteger(since)) {
+            if (!Number.isInteger(since) || since <= 0) {
               ctx.output.error = `Invalid deepen-since: ${line}`;
-              return "ERROR";
+              return "INVALID_REQUEST";
             }
             req.deepenSince = since;
           } else if (line.startsWith("deepen-not ")) {
@@ -348,6 +350,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         }
 
         ctx.state.wants = new Set();
+        ctx.state.wantedRefs = new Map();
 
         // Resolve want-refs to OIDs
         for (const refName of req.wantRefs) {
@@ -358,11 +361,11 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
             return "INVALID_WANT";
           }
           ctx.state.wants.add(oid);
-          ctx.state.wantedRefs = ctx.state.wantedRefs ?? new Map();
           ctx.state.wantedRefs.set(refName, oid);
         }
 
-        // A filter is refused unless advertised (no partial clone here)
+        // A filter is refused unless advertised (the built-in facades do not filter); an
+        // advertised one goes to exportPack as `filterSpec`
         if (req.filter !== null && !advertisesFetchFeature(ctx, "filter")) {
           ctx.output.error = `unexpected line: 'filter ${req.filter}'`;
           return "INVALID_WANT";
@@ -535,9 +538,11 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         try {
           const deepenNot: string[] = [];
           for (const name of req.deepenNot ?? []) {
-            const oid = await resolveDeepenNot(ctx, name);
+            const oid = await resolveDeepenNot(ctx.refStore, name);
             if (!oid) {
-              throw new UploadPackRequestError(`upload-pack: ambiguous deepen-not: ${name}`);
+              throw new UploadPackRequestError(
+                `git upload-pack: ambiguous deepen-not: deepen-not ${name}`,
+              );
             }
             deepenNot.push(oid);
           }
@@ -627,6 +632,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           thin,
           ofsDelta: req?.ofsDeltas ?? false,
           includeTag: req?.includeTags,
+          filterSpec: req?.filter ?? undefined,
           shallow: packShallow,
         });
 
@@ -728,17 +734,25 @@ function advertisesFetchFeature(ctx: ProcessContext, feature: string): boolean {
   return fetch?.slice("fetch=".length).split(" ").includes(feature) ?? false;
 }
 
-/** A `deepen-not` ref, expanded as git's `expand_ref` (the name, refs/<name>, tags, heads). */
-async function resolveDeepenNot(ctx: ProcessContext, name: string): Promise<string | undefined> {
+/**
+ * A `deepen-not` ref, expanded as git's `expand_ref` (the name, refs/<name>, tags, heads,
+ * remotes, a remote's HEAD); undefined unless exactly one ref matches (git: "ambiguous").
+ */
+export async function resolveDeepenNot(
+  refStore: ProcessContext["refStore"],
+  name: string,
+): Promise<string | undefined> {
+  const found: string[] = [];
   for (const candidate of [
     name,
     `refs/${name}`,
     `refs/tags/${name}`,
     `refs/heads/${name}`,
     `refs/remotes/${name}`,
+    `refs/remotes/${name}/HEAD`,
   ]) {
-    const oid = await ctx.refStore.get(candidate);
-    if (oid) return oid;
+    const oid = await refStore.get(candidate);
+    if (oid) found.push(oid);
   }
-  return undefined;
+  return found.length === 1 ? found[0] : undefined;
 }

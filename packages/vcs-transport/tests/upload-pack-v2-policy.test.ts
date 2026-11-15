@@ -398,3 +398,102 @@ function channel() {
     },
   };
 }
+
+/** Serves raw v2 request bytes (any number of commands); returns the raw response. */
+async function serveRaw(
+  repository: TransportRepo["facade"],
+  refStore: TransportRepo["refStore"],
+  request: Uint8Array,
+  capabilities?: string[],
+): Promise<Uint8Array> {
+  const out: Uint8Array[] = [];
+  await serveOverDuplex({
+    duplex: createSimpleDuplex(
+      (async function* () {
+        yield request;
+      })(),
+      (data) => {
+        out.push(data);
+      },
+    ),
+    repository,
+    refStore,
+    service: "git-upload-pack",
+    protocolVersion: "2",
+    capabilities,
+  });
+  return concat(out);
+}
+
+function fetchCommand(args: string[]): Uint8Array[] {
+  return [
+    encodePacketLine("command=fetch\n"),
+    encodePacketLine("object-format=sha1\n"),
+    encodeDelim(),
+    ...args.map((a) => encodePacketLine(`${a}\n`)),
+    encodeFlush(),
+  ];
+}
+
+describe("protocol v2 upload-pack: review fixes", () => {
+  it("says ready for a want older than the common commit it is a child of (start is walked)", async () => {
+    const { repo, c4 } = await linearRepo();
+    const old = await commitAt(repo, "old", 10, [c4]);
+    await repo.refStore.update("refs/heads/old", old);
+    const res = await fetchRaw(repo, [`want ${old}`, `have ${c4}`]);
+    expect(res.lines.slice(0, 4)).toEqual(["acknowledgments", `ACK ${c4}`, "ready", "DELIM"]);
+  });
+
+  it("lists only the current command's want-refs in wanted-refs", async () => {
+    const { repo, c3, c4 } = await linearRepo();
+    await repo.refStore.update("refs/heads/other", c3);
+    const response = await serveRaw(
+      repo.facade,
+      repo.refStore,
+      concat([
+        ...fetchCommand(["want-ref refs/heads/main", "done"]),
+        ...fetchCommand(["want-ref refs/heads/other", "done"]),
+      ]),
+    );
+    const text = new TextDecoder("latin1").decode(response);
+    expect(text.split(`${c4} refs/heads/main`).length - 1).toBe(1);
+    expect(text.split(`${c3} refs/heads/other`).length - 1).toBe(1);
+  });
+
+  it("refuses a deepen-not that names several refs as ambiguous", async () => {
+    const { repo, c2, c4 } = await linearRepo();
+    await repo.refStore.update("refs/heads/dup", c2);
+    await repo.refStore.update("refs/tags/dup", c2);
+    const res = await fetchRaw(repo, [`want ${c4}`, "deepen-not dup", "done"]);
+    expect(res.lines.some((l) => l.startsWith("ERR ") && l.includes("ambiguous deepen-not"))).toBe(
+      true,
+    );
+    expect(res.lines).not.toContain("packfile");
+  });
+
+  it("refuses deepen-since 0 or a negative time", async () => {
+    const { repo, c4 } = await linearRepo();
+    for (const since of ["0", "-5"]) {
+      const res = await fetchRaw(repo, [`want ${c4}`, `deepen-since ${since}`, "done"]);
+      expect(res.lines).toContain(`ERR Invalid deepen-since: deepen-since ${since}`);
+      expect(res.lines).not.toContain("packfile");
+    }
+  });
+
+  it("passes an advertised filter on to exportPack", async () => {
+    const { repo, c4 } = await linearRepo();
+    const seen: (string | undefined)[] = [];
+    const facade = Object.create(repo.facade) as TransportRepo["facade"];
+    facade.exportPack = (wants, exclude, options) => {
+      seen.push(options?.filterSpec);
+      return repo.facade.exportPack(wants, exclude, options);
+    };
+    await serveRaw(
+      facade,
+      repo.refStore,
+      concat(fetchCommand([`want ${c4}`, "filter blob:none", "done"])),
+      ["agent=test", "ls-refs", "fetch=shallow filter", "object-format=sha1"],
+    );
+    expect(seen).toEqual(["blob:none"]);
+  });
+});

@@ -77,7 +77,9 @@ export interface HttpServerOptions {
    * Largest request body accepted, in bytes after `Content-Encoding: gzip` is undone; a larger
    * one is answered 413. Default: {@link DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES} for
    * upload-pack, {@link DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES} for receive-pack (a push
-   * carries its pack).
+   * carries its pack). With gzip, the compressed body is held to the same limit (plus gzip's
+   * worst-case overhead). An upload-pack request is read whole before upload-pack runs (as
+   * git's http-backend buffers it), so an over-limit one is always a 413.
    */
   maxRequestBodyBytes?: number;
 }
@@ -103,6 +105,11 @@ export class RequestBodyTooLargeError extends Error {
  * bodies) and cut at `limit` bytes, streamed. `tooLarge()` tells whether the limit was hit.
  * Returns an HTTP error response instead for an encoding it cannot undo, or a declared
  * `Content-Length` over the limit.
+ *
+ * The limit holds for the inflated bytes and, with gzip, for the compressed ones too (plus
+ * gzip's worst-case overhead): a decompressor takes input faster than it hands output on, so
+ * the inflated count alone would let a client push far more than `limit` bytes. At the
+ * limit, the source is cancelled: nothing more is read from the client.
  */
 function requestBody(
   request: HttpRequest,
@@ -113,35 +120,105 @@ function requestBody(
   if (encoding !== "" && encoding !== "identity" && encoding !== "gzip" && encoding !== "x-gzip") {
     return plain(415, `Unsupported Content-Encoding: ${encoding}`);
   }
+  const gzip = encoding === "gzip" || encoding === "x-gzip";
   const declared = Number(header(request, "content-length") ?? Number.NaN);
-  if (encoding !== "gzip" && encoding !== "x-gzip" && declared > limit) {
+  const compressedLimit = gzip ? limit + Math.ceil(limit / 16384) * 5 + 64 : limit;
+  if (declared > compressedLimit) {
     return plain(413, new RequestBodyTooLargeError(limit).message);
   }
-  const decoded =
-    encoding === "gzip" || encoding === "x-gzip"
-      ? body.pipeThrough(
+  let exceeded = false;
+  const onExceeded = () => {
+    exceeded = true;
+  };
+  const input = limitStream(body, compressedLimit, limit, onExceeded);
+  const decoded = gzip
+    ? limitStream(
+        input.pipeThrough(
           new DecompressionStream("gzip") as unknown as ReadableWritablePair<
             Uint8Array,
             Uint8Array
           >,
-        )
-      : body;
+        ),
+        limit,
+        limit,
+        onExceeded,
+      )
+    : input;
+  return { body: decoded, tooLarge: () => exceeded };
+}
+
+/**
+ * `source`, pulled one chunk at a time, failing with {@link RequestBodyTooLargeError} once
+ * more than `max` bytes went through; the source is cancelled then.
+ */
+function limitStream(
+  source: ReadableStream<Uint8Array>,
+  max: number,
+  limit: number,
+  onExceeded: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
   let total = 0;
-  let exceeded = false;
-  const limited = decoded.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        total += chunk.byteLength;
-        if (total > limit) {
-          exceeded = true;
-          controller.error(new RequestBodyTooLargeError(limit));
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        let next: ReadableStreamReadResult<Uint8Array>;
+        try {
+          next = await reader.read();
+        } catch (error) {
+          controller.error(error);
           return;
         }
-        controller.enqueue(chunk);
+        if (next.done) {
+          controller.close();
+          return;
+        }
+        total += next.value.byteLength;
+        if (total > max) {
+          onExceeded();
+          const error = new RequestBodyTooLargeError(limit);
+          controller.error(error);
+          await reader.cancel(error).catch(() => {});
+          return;
+        }
+        controller.enqueue(next.value);
       },
-    }),
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
   );
-  return { body: limited, tooLarge: () => exceeded };
+}
+
+/**
+ * The whole request body (at most `limit` bytes), as git's http-backend buffers an
+ * upload-pack request before upload-pack runs: an over-limit body is a 413, never a response
+ * cut short after its status went out.
+ */
+async function bufferBody(
+  body: ReadableStream<Uint8Array>,
+): Promise<{ bytes: Uint8Array } | { error: unknown }> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(next.value);
+      size += next.value.byteLength;
+    }
+  } catch (error) {
+    return { error };
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes };
 }
 
 function header(request: HttpRequest, name: string): string | undefined {
@@ -271,12 +348,15 @@ export async function handleUploadPack(
     };
   }
 
-  const input = requestBody(
-    request,
-    request.body,
-    options.maxRequestBodyBytes ?? DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES,
-  );
+  const maxBytes = options.maxRequestBodyBytes ?? DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES;
+  const input = requestBody(request, request.body, maxBytes);
   if ("status" in input) return input;
+  const buffered = await bufferBody(input.body);
+  if ("error" in buffered) {
+    if (input.tooLarge()) return plain(413, new RequestBodyTooLargeError(maxBytes).message);
+    return plain(400, `Cannot read request body: ${String(buffered.error)}`);
+  }
+  const requestBytes = buffered.bytes;
 
   const state = new ProtocolState();
 
@@ -310,7 +390,12 @@ export async function handleUploadPack(
   };
 
   // Create duplex from request body and response writer
-  const duplex = createSimpleDuplex(readableStreamToAsyncIterable(input.body), writer);
+  const duplex = createSimpleDuplex(
+    (async function* () {
+      if (requestBytes.length > 0) yield requestBytes;
+    })(),
+    writer,
+  );
   const transport = createTransportApi(duplex, state);
 
   const config: ProcessConfiguration = {
@@ -352,7 +437,6 @@ export async function handleUploadPack(
     const failure = await run;
     if (failure) {
       await out.abort(failure.error).catch(() => {});
-      if (input.tooLarge()) return plain(413, failure.error.message);
       return {
         status: 500,
         headers: { "Content-Type": "text/plain" },

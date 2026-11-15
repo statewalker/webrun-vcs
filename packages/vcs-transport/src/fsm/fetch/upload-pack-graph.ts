@@ -118,9 +118,12 @@ export async function findUnreachableWant(
 }
 
 /**
- * git's `ok_to_give_up`: true when every want reaches a commit the client has (a common `have`,
- * or a parent of one), walking no commit older than the oldest common have. A want that is no
- * commit (a tree, a blob) cannot be judged by ancestry and counts as reached, as in git.
+ * git's `ok_to_give_up` (`can_all_from_reach_with_flag`): true when every want reaches a
+ * commit the client has (a common `have`, or a parent of one), walking no parent older than
+ * the oldest common have (a want itself is always walked). Each commit is walked once for all
+ * wants: what an earlier want's walk learned (reaches, or not) holds for the later ones. A
+ * want that is no commit (a tree, a blob) cannot be judged by ancestry and counts as reached,
+ * as in git.
  *
  * Without `getCommitInfo` it walks `walkAncestors` of each want looking for a common have.
  */
@@ -158,31 +161,42 @@ export async function okToGiveUp(
     for (const parent of commit.parents) theyHave.add(parent);
   }
 
-  const reaches = new Set<string>();
-  const dead = new Set<string>(); // commits known not to reach a have above the cutoff
-  for (const want of wants) {
-    const start = await graph.peel(want);
-    if (!(await graph.get(start))) continue; // no commit: nothing to judge
-    const seen = new Set<string>();
+  // the want commits, oldest first (git orders them by generation)
+  const starts: { oid: string; time: number }[] = [];
+  for (const want of new Set(wants)) {
+    const oid = await graph.peel(want);
+    const commit = await graph.get(oid);
+    if (commit) starts.push({ oid, time: commit.time });
+  }
+  starts.sort((a, b) => a.time - b.time);
+
+  const visited = new Set<string>(); // git's assign_flag: walked by any want
+  const result = new Set<string>(); // git's RESULT: reaches a commit they have
+  const reaches = (oid: string) => theyHave.has(oid) || result.has(oid);
+  for (const { oid: start } of starts) {
+    visited.add(start);
     const stack = [start];
-    let found = false;
-    while (stack.length > 0 && !found) {
-      const oid = stack.pop() as string;
-      if (seen.has(oid) || dead.has(oid)) continue;
-      seen.add(oid);
-      if (theyHave.has(oid) || reaches.has(oid)) {
-        found = true;
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1] as string;
+      if (reaches(top)) {
+        stack.pop();
+        if (stack.length > 0) result.add(stack[stack.length - 1] as string);
+        continue;
+      }
+      let pushed = false;
+      for (const parent of (await graph.get(top))?.parents ?? []) {
+        if (reaches(parent)) result.add(top);
+        if (visited.has(parent)) continue;
+        visited.add(parent);
+        const commit = await graph.get(parent);
+        if (!commit || commit.time < oldest) continue;
+        stack.push(parent);
+        pushed = true;
         break;
       }
-      const commit = await graph.get(oid);
-      if (!commit || commit.time < oldest) continue;
-      stack.push(...commit.parents);
+      if (!pushed) stack.pop();
     }
-    if (!found) {
-      for (const oid of seen) dead.add(oid);
-      return false;
-    }
-    reaches.add(start);
+    if (!reaches(start)) return false;
   }
   return true;
 }
@@ -228,8 +242,9 @@ export interface ShallowUpdate {
  *   left out are the new shallow commits;
  * - a client shallow commit inside the history sent is unshallowed, its parents become tips.
  *
- * Without `getCommitInfo` only `deepen` is answered, through `computeShallowBoundaries`, and no
- * commit is unshallowed.
+ * Without `getCommitInfo` only `deepen` of a client that is not shallow is answered, through
+ * `computeShallowBoundaries` (deepening a shallow client is refused: nothing could be
+ * unshallowed).
  *
  * @throws UploadPackRequestError when the request cannot be answered
  */
@@ -265,12 +280,14 @@ export async function computeShallowUpdate(
         byRevList ? "deepen-since and deepen-not are not supported" : "shallow is not supported",
       );
     }
-    if (depth >= INFINITE_DEPTH) return result([], new Set());
-    const heads = request.deepenRelative ? clientShallow : new Set(request.wants);
-    const boundary = await repository.computeShallowBoundaries(
-      heads,
-      request.deepenRelative ? depth + 1 : depth,
-    );
+    // without the graph, no client shallow commit can be unshallowed: the pack would stop at
+    // them and leave holes, so a shallow client cannot be deepened
+    if (clientShallow.size > 0) {
+      throw new UploadPackRequestError("deepening a shallow repository is not supported");
+    }
+    // deepen-relative counts from the client's shallow commits: there are none
+    if (depth >= INFINITE_DEPTH || request.deepenRelative) return result([], new Set());
+    const boundary = await repository.computeShallowBoundaries(new Set(request.wants), depth);
     return result(boundary, new Set());
   }
 

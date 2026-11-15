@@ -204,3 +204,112 @@ describe("smart-HTTP server: wants and capabilities", () => {
     expect(reachable).toContain("deepen-since");
   });
 });
+
+/** A body source that counts the bytes pulled from it and notes whether it was cancelled. */
+function trackedStream(bytes: Uint8Array, chunkSize: number) {
+  const log = { pulled: 0, cancelled: false };
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (log.pulled >= bytes.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(bytes.slice(log.pulled, log.pulled + chunkSize));
+        log.pulled += chunkSize;
+      },
+      cancel() {
+        log.cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return { stream, log };
+}
+
+/** `have` lines with random ids: hex text, so gzip only halves it. */
+function randomHaves(count: number): Uint8Array[] {
+  const random = new Uint8Array(20 * count);
+  for (let i = 0; i < random.length; i += 65536) {
+    crypto.getRandomValues(random.subarray(i, Math.min(i + 65536, random.length)));
+  }
+  const lines: Uint8Array[] = [];
+  for (let i = 0; i < count; i++) {
+    const hex = Array.from(random.subarray(i * 20, i * 20 + 20), (b) =>
+      b.toString(16).padStart(2, "0"),
+    ).join("");
+    lines.push(encodePacketLine(`have ${hex}\n`));
+  }
+  return lines;
+}
+
+describe("smart-HTTP server: request body limit stops reading", () => {
+  it("stops pulling a gzip body at the limit and cancels its source", async () => {
+    const { repo, c2 } = await serverRepo();
+    const raw = concat([
+      encodePacketLine(`want ${c2} side-band-64k\n`),
+      encodeFlush(),
+      ...randomHaves(100_000), // ~5 MB inflated, ~2.5 MB compressed
+    ]);
+    const body = await gzip(raw);
+    expect(body.length).toBeGreaterThan(2 * 1024 * 1024);
+    const { stream, log } = trackedStream(body, 16384);
+    const limit = 64 * 1024;
+    const response = await handleUploadPack(
+      {
+        method: "POST",
+        path: "/repo.git/git-upload-pack",
+        query: {},
+        headers: { "content-encoding": "gzip" },
+        body: stream,
+      },
+      repo.facade,
+      repo.refStore,
+      { maxRequestBodyBytes: limit },
+    );
+    expect(response.status).toBe(413);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(log.cancelled).toBe(true);
+    expect(log.pulled).toBeLessThan(4 * limit);
+  });
+
+  it("stops pulling a plain body at the limit and cancels its source", async () => {
+    const { repo, c2 } = await serverRepo();
+    const raw = concat([
+      encodePacketLine(`want ${c2} side-band-64k\n`),
+      encodeFlush(),
+      ...randomHaves(20_000),
+    ]);
+    const { stream, log } = trackedStream(raw, 1000);
+    const response = await handleUploadPack(
+      { method: "POST", path: "/repo.git/git-upload-pack", query: {}, headers: {}, body: stream },
+      repo.facade,
+      repo.refStore,
+      { maxRequestBodyBytes: 10_000 },
+    );
+    expect(response.status).toBe(413);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(log.cancelled).toBe(true);
+    expect(log.pulled).toBeLessThanOrEqual(11_000);
+  });
+
+  it("answers 413 for an upload-pack body over the limit even after a have batch", async () => {
+    const { repo, c2 } = await serverRepo();
+    // a first batch of haves ends in a flush: upload-pack answers it (NAK) before reading on
+    const raw = concat([
+      encodePacketLine(`want ${c2} side-band-64k multi_ack_detailed\n`),
+      encodeFlush(),
+      ...randomHaves(32),
+      encodeFlush(),
+      ...randomHaves(2000),
+      encodePacketLine("done\n"),
+    ]);
+    const response = await handleUploadPack(
+      post("/repo.git/git-upload-pack", raw, {}, 512),
+      repo.facade,
+      repo.refStore,
+      { maxRequestBodyBytes: 8192 },
+    );
+    expect(response.status).toBe(413);
+  });
+});
