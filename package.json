@@ -19,7 +19,7 @@
     "test:app": "turbo run test:app",
     "test:nightly": "pnpm --no-bail --workspace-concurrency=1 --filter @statewalker/vcs-utils --filter @statewalker/vcs-demo-browser-app run test:browser",
     "lint": "biome check --write .",
-    "lint:check": "biome check .",
+    "lint:check": "biome check . && node scripts/check-changesets.mjs",
     "lint:fix": "biome check --write --unsafe .",
     "format": "biome format --write .",
     "format:check": "biome format .",
