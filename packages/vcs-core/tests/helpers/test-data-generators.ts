@@ -3,7 +3,8 @@
  */
 
 import type { Delta } from "@statewalker/vcs-utils";
-import type { ObjectId, PersonIdent } from "../../src/common/id/index.js";
+import type { ObjectId } from "../../src/common/id/index.js";
+import type { PersonIdent } from "../../src/common/person/index.js";
 import type { Commit } from "../../src/history/commits/commits.js";
 import type { TreeEntry } from "../../src/history/trees/tree-entry.js";
 
@@ -116,7 +117,7 @@ export function randomTreeEntries(count: number, seed?: number): TreeEntry[] {
   for (let i = 0; i < count; i++) {
     const isDirectory = rng.next() > 0.7;
     entries.push({
-      mode: isDirectory ? "40000" : "100644",
+      mode: isDirectory ? 0o40000 : 0o100644,
       name: `entry-${i.toString().padStart(4, "0")}${isDirectory ? "" : ".txt"}`,
       id: randomObjectId(seed ? seed + i : undefined),
     });

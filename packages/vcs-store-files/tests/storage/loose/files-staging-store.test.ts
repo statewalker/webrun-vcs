@@ -93,7 +93,7 @@ createGitObjectsTests("Files (Node, streaming write)", async () => {
 });
 
 const enc = new TextEncoder();
-const text = async (s: AsyncIterable<Uint8Array>) => {
+const text = async (s: AsyncIterable<Uint8Array> | Iterable<Uint8Array>) => {
   let out = "";
   for await (const c of s) out += new TextDecoder().decode(c, { stream: true });
   return out;

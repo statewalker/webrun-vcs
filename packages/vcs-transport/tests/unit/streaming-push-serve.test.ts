@@ -146,7 +146,7 @@ describe("handleUploadPack: the response streams", () => {
     expect(response.status).toBe(200);
     expect(response.body).toBeInstanceOf(ReadableStream);
     expect(state.produced).toBeLessThan(200);
-    const text = dec.decode(await new Response(response.body).arrayBuffer());
+    const text = dec.decode(await new Response(response.body as BodyInit).arrayBuffer());
     expect(state.produced).toBe(200);
     expect(text).toContain("PACK");
   });
@@ -176,7 +176,7 @@ describe("handleUploadPack: the pack follows the client's capabilities", () => {
       refStore,
       { requestPolicy: "ANY" },
     );
-    await new Response(response.body).arrayBuffer();
+    await new Response(response.body as BodyInit).arrayBuffer();
     return seen as { thin?: boolean; ofsDelta?: boolean };
   }
 
@@ -217,7 +217,7 @@ async function uploadPack(
   try {
     return {
       status: response.status,
-      bytes: new Uint8Array(await new Response(response.body).arrayBuffer()),
+      bytes: new Uint8Array(await new Response(response.body as BodyInit).arrayBuffer()),
     };
   } catch (error) {
     return { status: response.status, error };

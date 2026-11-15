@@ -4,7 +4,8 @@
  * Implements both old CommitStore and new Commits interfaces for backward compatibility.
  */
 
-import type { ObjectId, PersonIdent } from "../../src/common/id/index.js";
+import type { ObjectId } from "../../src/common/id/index.js";
+import type { PersonIdent } from "../../src/common/person/index.js";
 import type { AncestryOptions, Commit, Commits } from "../../src/history/commits/commits.js";
 
 /**

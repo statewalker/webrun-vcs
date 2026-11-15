@@ -277,6 +277,7 @@ describe.each(backends)("Phase 2 Integration Workflow ($name backend)", ({ facto
     const headRef = await repository.refs.resolve("HEAD");
     expect(headRef?.objectId).toBeDefined();
     const mergeCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!mergeCommit) throw new Error("mergeCommit not found");
     expect(mergeCommit.parents.length).toBe(2);
 
     // === STEP 7: Log should show all commits ===
@@ -323,6 +324,7 @@ describe.each(backends)("Phase 2 Integration Workflow ($name backend)", ({ facto
     await repository.refs.setSymbolic("HEAD", "refs/heads/feature");
     const featureRef = await repository.refs.resolve("refs/heads/feature");
     const featureCommit = await repository.commits.load(featureRef?.objectId ?? "");
+    if (!featureCommit) throw new Error("featureCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, featureCommit.tree);
 
     // Add different file on feature
@@ -401,6 +403,7 @@ describe.each(backends)("Phase 2 Integration Workflow ($name backend)", ({ facto
     await repository.refs.setSymbolic("HEAD", "refs/heads/feature");
     const featureRef = await repository.refs.resolve("refs/heads/feature");
     const featureCommit = await repository.commits.load(featureRef?.objectId ?? "");
+    if (!featureCommit) throw new Error("featureCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, featureCommit.tree);
 
     // Add different file on feature

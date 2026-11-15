@@ -46,14 +46,9 @@ export function stagingConformanceTests(
           stage: 0,
           size: 100,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         };
 
         await staging.setEntry(entry);
@@ -75,14 +70,9 @@ export function stagingConformanceTests(
           stage: 0,
           size: 50,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         expect(await staging.hasEntry("exists.txt")).toBe(true);
@@ -96,14 +86,9 @@ export function stagingConformanceTests(
           stage: 0,
           size: 25,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         expect(await staging.hasEntry("remove-me.txt")).toBe(true);
@@ -126,14 +111,9 @@ export function stagingConformanceTests(
           stage: 0,
           size: 10,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         await staging.setEntry({
@@ -143,14 +123,9 @@ export function stagingConformanceTests(
           stage: 0,
           size: 10,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         const paths: string[] = [];
@@ -178,14 +153,9 @@ export function stagingConformanceTests(
           stage: 1, // base
           size: 10,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         await staging.setEntry({
@@ -195,14 +165,9 @@ export function stagingConformanceTests(
           stage: 2, // ours
           size: 10,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         await staging.setEntry({
@@ -212,14 +177,9 @@ export function stagingConformanceTests(
           stage: 3, // theirs
           size: 10,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         expect(await staging.hasConflicts()).toBe(true);
@@ -240,14 +200,9 @@ export function stagingConformanceTests(
             stage,
             size: 10,
             mtime: Date.now(),
-            mtimeNs: 0,
             ctime: Date.now(),
-            ctimeNs: 0,
             dev: 0,
             ino: 0,
-            uid: 0,
-            gid: 0,
-            flags: 0,
           });
         }
 
@@ -274,14 +229,9 @@ export function stagingConformanceTests(
           stage: 0,
           size: 10,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         await staging.setEntry({
@@ -291,14 +241,9 @@ export function stagingConformanceTests(
           stage: 0,
           size: 10,
           mtime: Date.now(),
-          mtimeNs: 0,
           ctime: Date.now(),
-          ctimeNs: 0,
           dev: 0,
           ino: 0,
-          uid: 0,
-          gid: 0,
-          flags: 0,
         });
 
         expect(await staging.getEntryCount()).toBe(2);

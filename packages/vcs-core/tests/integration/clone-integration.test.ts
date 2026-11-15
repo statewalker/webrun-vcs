@@ -11,7 +11,8 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { HistoryWithOperations, PersonIdent } from "../../src/history/index.js";
+import type { PersonIdent } from "../../src/common/person/index.js";
+import type { HistoryWithOperations } from "../../src/history/index.js";
 import { createMemoryHistoryWithOperations } from "../../src/history/index.js";
 import { ObjectType } from "../../src/history/objects/object-types.js";
 
@@ -249,6 +250,7 @@ describe("Clone Simulation Integration", () => {
       // Simulate checkout: resolve HEAD → commit → tree → entries
       const commit = await local.commits.load(commitId);
       expect(commit).toBeDefined();
+      if (!commit) throw new Error("commit is undefined");
 
       const tree = await local.trees.load(commit?.tree);
       expect(tree).toBeDefined();
@@ -260,6 +262,7 @@ describe("Clone Simulation Integration", () => {
       // Root tree should have "readme.md" and "src" subtree
       const readmeEntry = entries.find((e) => e.name === "readme.md");
       expect(readmeEntry).toBeDefined();
+      if (!readmeEntry) throw new Error("readmeEntry is undefined");
 
       // Extract readme content
       const readmeBlob = await local.blobs.load(readmeEntry?.id);
@@ -272,6 +275,7 @@ describe("Clone Simulation Integration", () => {
       // Navigate into src subtree
       const srcEntry = entries.find((e) => e.name === "src");
       expect(srcEntry).toBeDefined();
+      if (!srcEntry) throw new Error("srcEntry is undefined");
       expect(srcEntry?.mode).toBe(0o40000);
 
       const srcTree = await local.trees.load(srcEntry?.id);
@@ -284,6 +288,7 @@ describe("Clone Simulation Integration", () => {
       // Extract src/index.ts content
       const indexEntry = srcEntries.find((e) => e.name === "index.ts");
       expect(indexEntry).toBeDefined();
+      if (!indexEntry) throw new Error("indexEntry is undefined");
       const indexBlob = await local.blobs.load(indexEntry?.id);
       const indexContent = await collectAsyncIterableBytes(indexBlob as AsyncIterable<Uint8Array>);
       expect(new TextDecoder().decode(indexContent)).toBe('export const VERSION = "1.0"');
@@ -343,6 +348,7 @@ describe("Clone Simulation Integration", () => {
       while (current) {
         const commit = await local.commits.load(current);
         expect(commit).toBeDefined();
+        if (!commit) throw new Error("commit is undefined");
         history.push(commit?.message);
         current = commit?.parents[0];
       }

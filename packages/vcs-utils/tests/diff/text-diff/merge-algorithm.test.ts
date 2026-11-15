@@ -27,7 +27,7 @@ describe("MergeAlgorithm", () => {
     theirs: string,
     strategy?: MergeContentStrategy,
   ): string {
-    const result = merge3Way(toLines(base), toLines(ours), toLines(theirs), strategy);
+    const result = merge3Way(toLines(base), toLines(ours), toLines(theirs), { strategy });
     return new TextDecoder().decode(result.content);
   }
 

@@ -72,7 +72,7 @@ describe("sidebandPackStream", () => {
     const it = sidebandPackStream(counted)[Symbol.asyncIterator]();
     await it.next();
     expect(pulled).toBeLessThan(70_000); // one sideband packet, not the whole response
-    await it.return?.();
+    await it.return?.(undefined);
   });
 
   it("a server error (channel 3) throws ServerError", async () => {

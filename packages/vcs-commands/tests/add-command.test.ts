@@ -210,11 +210,10 @@ class MockWorkingTree implements Worktree {
  */
 function createWorkingCopyWithMockWorktree(
   repository: History,
-  staging: WorkingCopy["staging"],
+  staging: WorkingCopy["checkout"]["staging"],
   worktree: MockWorkingTree,
 ): WorkingCopy {
   return {
-    staging,
     worktree: worktree as unknown as Worktree,
     stash: {} as never,
     config: {} as never,
@@ -278,7 +277,7 @@ async function createInitializedGitWithWorkTreeFromFactory(factory: WorkingCopyF
   worktree: MockWorkingTree;
   workingCopy: WorkingCopy;
   repository: History;
-  staging: WorkingCopy["staging"];
+  staging: WorkingCopy["checkout"]["staging"];
   initialCommitId: string;
   cleanup?: () => Promise<void>;
 }> {
@@ -364,8 +363,6 @@ describe.each(backends)("AddCommand ($name backend)", ({ factory }) => {
     const staging = ctx.workingCopy.checkout.staging;
 
     return {
-      repository,
-      staging,
       worktree: undefined as unknown as Worktree,
       stash: {} as never,
       config: {} as never,
@@ -418,7 +415,7 @@ describe.each(backends)("AddCommand ($name backend)", ({ factory }) => {
           hasConflicts: false,
         };
       },
-    };
+    } as unknown as WorkingCopy;
   }
   describe("validation", () => {
     /**
@@ -829,7 +826,8 @@ describe.each(backends)("AddCommand ($name backend)", ({ factory }) => {
       // Create WorkingCopy without worktree
       const workingCopy = await createEmptyWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
-      const { repository, staging } = workingCopy;
+      const repository = workingCopy.history;
+      const staging = workingCopy.checkout.staging;
 
       // Initialize store - store the empty tree first
       const emptyTreeId = await repository.trees.store([]);

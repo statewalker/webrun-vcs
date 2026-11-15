@@ -24,7 +24,7 @@ import {
   parseHeader,
   rawStorageStaging,
 } from "@statewalker/vcs-core";
-import { deflate, inflate } from "@statewalker/vcs-utils";
+import { asAsyncIterable, deflate, inflate } from "@statewalker/vcs-utils";
 import { sha1 } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -38,7 +38,9 @@ async function sha1Hex(data: Uint8Array): Promise<string> {
 }
 
 // Helper to collect async iterable into bytes
-async function collectBytes(iterable: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+async function collectBytes(
+  iterable: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of iterable) {
     chunks.push(chunk);
@@ -204,7 +206,7 @@ describe("Git Files Format Compliance", () => {
       const fullObject = createGitObject("blob", content);
 
       // Deflate (compress)
-      const compressed = await collectBytes(deflate([fullObject], { raw: false }));
+      const compressed = await collectBytes(deflate(asAsyncIterable([fullObject]), { raw: false }));
 
       // Should be different from original
       expect(compressed.length).not.toBe(fullObject.length);
@@ -213,7 +215,9 @@ describe("Git Files Format Compliance", () => {
       expect(compressed[0]).toBe(0x78);
 
       // Inflate (decompress)
-      const decompressed = await collectBytes(inflate([compressed], { raw: false }));
+      const decompressed = await collectBytes(
+        inflate(asAsyncIterable([compressed]), { raw: false }),
+      );
 
       // Should match original
       expect(decompressed).toEqual(fullObject);
@@ -224,7 +228,7 @@ describe("Git Files Format Compliance", () => {
       const content = toBytes("a".repeat(1000));
       const fullObject = createGitObject("blob", content);
 
-      const compressed = await collectBytes(deflate([fullObject], { raw: false }));
+      const compressed = await collectBytes(deflate(asAsyncIterable([fullObject]), { raw: false }));
 
       // Compressed should be smaller
       expect(compressed.length).toBeLessThan(fullObject.length);
@@ -238,8 +242,10 @@ describe("Git Files Format Compliance", () => {
       }
       const fullObject = createGitObject("blob", content);
 
-      const compressed = await collectBytes(deflate([fullObject], { raw: false }));
-      const decompressed = await collectBytes(inflate([compressed], { raw: false }));
+      const compressed = await collectBytes(deflate(asAsyncIterable([fullObject]), { raw: false }));
+      const decompressed = await collectBytes(
+        inflate(asAsyncIterable([compressed]), { raw: false }),
+      );
 
       // Round-trip should work regardless of compression ratio
       expect(decompressed).toEqual(fullObject);

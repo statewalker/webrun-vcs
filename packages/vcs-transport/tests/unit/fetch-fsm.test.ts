@@ -58,6 +58,12 @@ function createMockTransport(): TransportApi & {
       }
     },
     writePack: vi.fn(async () => {}),
+    async *readRawPack() {
+      while (packIndex < packChunks.length) {
+        yield packChunks[packIndex++];
+      }
+    },
+    writeRawPack: vi.fn(async () => {}),
     // Test helpers
     _setPackets: (pkts: PktLineResult[]) => {
       packets.length = 0;

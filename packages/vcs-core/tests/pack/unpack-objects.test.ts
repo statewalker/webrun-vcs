@@ -245,7 +245,7 @@ describe("unpackObjects: refusals", () => {
     // the store holds B's bytes under A's id: what a SHA-1 collision would look like
     const backing = new MemoryRawStorage();
     const rawB = concat([enc.encode(`blob ${B.length}\0`), B]);
-    await backing.store(Aid, [compressBlockPako(rawB)]);
+    await backing.store(Aid, chunks(compressBlockPako(rawB)));
     const colliding = createGitObjects(rawStorageStaging(backing));
     const err = await refused(colliding, pack([{ kind: 3, data: A }]));
     expect(err).toBeInstanceOf(ObjectCollisionError);
@@ -255,7 +255,7 @@ describe("unpackObjects: refusals", () => {
   it("a collision on a delta result", async () => {
     const backing = new MemoryRawStorage();
     const rawA = concat([enc.encode(`blob ${A.length}\0`), A]);
-    await backing.store(Bid, [compressBlockPako(rawA)]);
+    await backing.store(Bid, chunks(compressBlockPako(rawA)));
     const colliding = createGitObjects(rawStorageStaging(backing));
     const err = await refused(
       colliding,

@@ -64,7 +64,7 @@ describe("GitCheckout Git Interoperability", () => {
       expect(headContent).toContain("ref: refs/heads/");
 
       // Create GitCheckout and verify it reads HEAD correctly
-      const nodeFiles = createNodeFilesApi({ fs, rootDir: repoDir });
+      const nodeFiles = createNodeFilesApi({ rootDir: repoDir });
       const files: GitCheckoutFilesApi = {
         ...nodeFiles,
         read: async (filePath: string) => {
@@ -87,7 +87,12 @@ describe("GitCheckout Git Interoperability", () => {
           if (!fileStats) return undefined;
           return { isDirectory: fileStats.kind === "directory" };
         },
-        removeDir: nodeFiles.remove.bind(nodeFiles),
+        remove: async (filePath: string) => {
+          await nodeFiles.remove(filePath);
+        },
+        removeDir: async (dirPath: string) => {
+          await nodeFiles.remove(dirPath);
+        },
       };
 
       const refs = new FileRefStore(nodeFiles, ".git");
@@ -126,7 +131,7 @@ describe("GitCheckout Git Interoperability", () => {
       expect(headContent.trim()).toBe(commitHash);
 
       // Create GitCheckout and verify it reads detached HEAD
-      const nodeFiles = createNodeFilesApi({ fs, rootDir: repoDir });
+      const nodeFiles = createNodeFilesApi({ rootDir: repoDir });
       const files: GitCheckoutFilesApi = {
         ...nodeFiles,
         read: async (filePath: string) => {
@@ -149,7 +154,12 @@ describe("GitCheckout Git Interoperability", () => {
           if (!fileStats) return undefined;
           return { isDirectory: fileStats.kind === "directory" };
         },
-        removeDir: nodeFiles.remove.bind(nodeFiles),
+        remove: async (filePath: string) => {
+          await nodeFiles.remove(filePath);
+        },
+        removeDir: async (dirPath: string) => {
+          await nodeFiles.remove(dirPath);
+        },
       };
 
       const refs = new FileRefStore(nodeFiles, ".git");
@@ -180,7 +190,7 @@ describe("GitCheckout Git Interoperability", () => {
 
   describe("Writing native git compatible state", () => {
     it("writes HEAD readable by native git", async () => {
-      const nodeFiles = createNodeFilesApi({ fs, rootDir: repoDir });
+      const nodeFiles = createNodeFilesApi({ rootDir: repoDir });
       const files: GitCheckoutFilesApi = {
         ...nodeFiles,
         read: async (filePath: string) => {
@@ -203,7 +213,12 @@ describe("GitCheckout Git Interoperability", () => {
           if (!fileStats) return undefined;
           return { isDirectory: fileStats.kind === "directory" };
         },
-        removeDir: nodeFiles.remove.bind(nodeFiles),
+        remove: async (filePath: string) => {
+          await nodeFiles.remove(filePath);
+        },
+        removeDir: async (dirPath: string) => {
+          await nodeFiles.remove(dirPath);
+        },
       };
 
       const refs = new FileRefStore(nodeFiles, ".git");

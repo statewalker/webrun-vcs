@@ -74,7 +74,7 @@ export async function drain(events: AsyncIterable<TransportEvent>): Promise<Tran
 }
 
 /** Deterministic pseudo-random bytes (xorshift32). */
-export function prng(n: number, seed: number): Uint8Array {
+export function prng(n: number, seed: number): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(n);
   let x = seed >>> 0 || 1;
   for (let i = 0; i < n; i++) {

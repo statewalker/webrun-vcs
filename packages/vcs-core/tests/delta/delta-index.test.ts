@@ -314,6 +314,7 @@ describe("computeDeltaInstructions", () => {
     expect(instructions).not.toBeNull();
     // Should have only insert instructions (no matches found)
     const inserts = instructions?.filter((i) => i.type === "insert");
+    if (!inserts) throw new Error("inserts is undefined");
     expect(inserts.length).toBeGreaterThan(0);
   });
 
@@ -329,6 +330,7 @@ describe("computeDeltaInstructions", () => {
     expect(instructions).not.toBeNull();
     // Should have at least one copy instruction
     const copies = instructions?.filter((i) => i.type === "copy");
+    if (!copies) throw new Error("copies is undefined");
     expect(copies.length).toBeGreaterThan(0);
   });
 

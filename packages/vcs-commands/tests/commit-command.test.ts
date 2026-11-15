@@ -276,18 +276,21 @@ describe.each(backends)("CommitCommand with --only flag ($name backend)", ({ fac
     // Get the committed tree
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!headCommit) throw new Error("headCommit not found");
 
     // Check that file1 was updated
     const file1Entry = await repository.trees.getEntry(headCommit.tree, "file1.txt");
     expect(file1Entry).toBeDefined();
-    const file1Content = await repository.blobs.load(file1Entry?.id);
+    if (!file1Entry) throw new Error("file1Entry not found");
+    const file1Content = await repository.blobs.load(file1Entry.id);
     const file1Text = new TextDecoder().decode(await collectBytes(file1Content));
     expect(file1Text).toBe("modified1\n");
 
     // Check that file2 was NOT updated (still has original content)
     const file2Entry = await repository.trees.getEntry(headCommit.tree, "file2.txt");
     expect(file2Entry).toBeDefined();
-    const file2Content = await repository.blobs.load(file2Entry?.id);
+    if (!file2Entry) throw new Error("file2Entry not found");
+    const file2Content = await repository.blobs.load(file2Entry.id);
     const file2Text = new TextDecoder().decode(await collectBytes(file2Content));
     expect(file2Text).toBe("content2\n");
   });
@@ -312,20 +315,24 @@ describe.each(backends)("CommitCommand with --only flag ($name backend)", ({ fac
     // Get committed tree
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!headCommit) throw new Error("headCommit not found");
 
     // Verify a.txt was updated
     const aEntry = await repository.trees.getEntry(headCommit.tree, "a.txt");
-    const aContent = await repository.blobs.load(aEntry?.id);
+    if (!aEntry) throw new Error("aEntry not found");
+    const aContent = await repository.blobs.load(aEntry.id);
     expect(new TextDecoder().decode(await collectBytes(aContent))).toBe("aa\n");
 
     // Verify b.txt was NOT updated
     const bEntry = await repository.trees.getEntry(headCommit.tree, "b.txt");
-    const bContent = await repository.blobs.load(bEntry?.id);
+    if (!bEntry) throw new Error("bEntry not found");
+    const bContent = await repository.blobs.load(bEntry.id);
     expect(new TextDecoder().decode(await collectBytes(bContent))).toBe("b\n");
 
     // Verify c.txt was updated
     const cEntry = await repository.trees.getEntry(headCommit.tree, "c.txt");
-    const cContent = await repository.blobs.load(cEntry?.id);
+    if (!cEntry) throw new Error("cEntry not found");
+    const cContent = await repository.blobs.load(cEntry.id);
     expect(new TextDecoder().decode(await collectBytes(cContent))).toBe("cc\n");
   });
 
@@ -349,22 +356,27 @@ describe.each(backends)("CommitCommand with --only flag ($name backend)", ({ fac
     // Verify results
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!headCommit) throw new Error("headCommit not found");
 
     // Need to walk tree to get src subtree
     const srcEntry = await repository.trees.getEntry(headCommit.tree, "src");
     expect(srcEntry).toBeDefined();
+    if (!srcEntry) throw new Error("srcEntry not found");
 
-    const mainEntry = await repository.trees.getEntry(srcEntry?.id, "main.ts");
-    const mainContent = await repository.blobs.load(mainEntry?.id);
+    const mainEntry = await repository.trees.getEntry(srcEntry.id, "main.ts");
+    if (!mainEntry) throw new Error("mainEntry not found");
+    const mainContent = await repository.blobs.load(mainEntry.id);
     expect(new TextDecoder().decode(await collectBytes(mainContent))).toBe("main updated\n");
 
-    const utilsEntry = await repository.trees.getEntry(srcEntry?.id, "utils.ts");
-    const utilsContent = await repository.blobs.load(utilsEntry?.id);
+    const utilsEntry = await repository.trees.getEntry(srcEntry.id, "utils.ts");
+    if (!utilsEntry) throw new Error("utilsEntry not found");
+    const utilsContent = await repository.blobs.load(utilsEntry.id);
     expect(new TextDecoder().decode(await collectBytes(utilsContent))).toBe("utils\n");
   });
 });
 
-async function collectBytes(iterable: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+async function collectBytes(iterable: AsyncIterable<Uint8Array> | undefined): Promise<Uint8Array> {
+  if (!iterable) throw new Error("blob not found");
   const chunks: Uint8Array[] = [];
   for await (const chunk of iterable) {
     chunks.push(chunk);
@@ -569,13 +581,16 @@ describe.each(backends)("CommitCommand with --all flag ($name backend)", ({ fact
     // Verify both files were updated in the commit
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!headCommit) throw new Error("headCommit not found");
 
     const file1Entry = await repository.trees.getEntry(headCommit.tree, "file1.txt");
-    const file1Content = await repository.blobs.load(file1Entry?.id);
+    if (!file1Entry) throw new Error("file1Entry not found");
+    const file1Content = await repository.blobs.load(file1Entry.id);
     expect(new TextDecoder().decode(await collectBytes(file1Content))).toBe("modified1\n");
 
     const file2Entry = await repository.trees.getEntry(headCommit.tree, "file2.txt");
-    const file2Content = await repository.blobs.load(file2Entry?.id);
+    if (!file2Entry) throw new Error("file2Entry not found");
+    const file2Content = await repository.blobs.load(file2Entry.id);
     expect(new TextDecoder().decode(await collectBytes(file2Content))).toBe("modified2\n");
   });
 
@@ -604,6 +619,7 @@ describe.each(backends)("CommitCommand with --all flag ($name backend)", ({ fact
     // Verify file1 was removed from the tree
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!headCommit) throw new Error("headCommit not found");
 
     const file1Entry = await repository.trees.getEntry(headCommit.tree, "file1.txt");
     expect(file1Entry).toBeUndefined();
@@ -654,6 +670,7 @@ describe.each(backends)("CommitCommand with --all flag ($name backend)", ({ fact
     // Verify untracked file was NOT added
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!headCommit) throw new Error("headCommit not found");
 
     const untrackedEntry = await repository.trees.getEntry(headCommit.tree, "untracked.txt");
     expect(untrackedEntry).toBeUndefined();

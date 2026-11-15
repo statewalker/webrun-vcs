@@ -210,7 +210,9 @@ describe("Open Native Git Repository", () => {
     // Get HEAD commit
     const headRef = await history.refs.resolve("HEAD");
     expect(headRef?.objectId).toBeTruthy();
-    const commit = await history.commits.load(headRef?.objectId);
+    const headOid = headRef?.objectId;
+    if (!headOid) throw new Error("HEAD does not resolve");
+    const commit = await history.commits.load(headOid);
     expect(commit).toBeDefined();
     if (!commit) return;
 

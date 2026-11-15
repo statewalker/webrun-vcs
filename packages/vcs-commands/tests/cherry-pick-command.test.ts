@@ -51,6 +51,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
       .call();
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const firstCommit = await repository.commits.load(firstMaster?.objectId ?? "");
+    if (!firstCommit) throw new Error("firstCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, firstCommit.tree);
 
     // Modify a on side branch
@@ -105,6 +106,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
       .call();
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const firstCommitData = await repository.commits.load(initialCommit?.objectId ?? "");
+    if (!firstCommitData) throw new Error("firstCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, firstCommitData.tree);
 
     // Add new file on side branch
@@ -167,6 +169,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     // Checkout side
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const commit1Data = await repository.commits.load(commit1?.objectId ?? "");
+    if (!commit1Data) throw new Error("commit1Data not found");
     await workingCopy.checkout.staging.readTree(repository.trees, commit1Data.tree);
 
     // Add different file on side
@@ -223,6 +226,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     // Checkout side and modify
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "side.txt", "side");
     await git.commit().setMessage("side change").call();
@@ -280,6 +284,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     // Checkout side and add different file
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "side-file.txt", "from side");
     await git.commit().setMessage("side add").call();
@@ -338,6 +343,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
 
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "side.txt", "side");
     await git.commit().setMessage("side").call();
@@ -392,6 +398,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     // Checkout side and add different file
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "new-side.txt", "from side");
     await git.commit().setMessage("add file on side").call();
@@ -401,6 +408,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainData = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainData) throw new Error("mainData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainData.tree);
 
     // Cherry-pick side - should add new-side.txt cleanly
@@ -443,6 +451,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     // Checkout side and delete the file
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
 
     // Remove delete.txt from staging
@@ -454,6 +463,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainData = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainData) throw new Error("mainData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainData.tree);
 
     // Cherry-pick side - should delete delete.txt
@@ -496,6 +506,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     // Checkout side and modify the file
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "conflict.txt", "modified");
     await git.commit().setMessage("modify on side").call();
@@ -505,6 +516,7 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainData = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainData) throw new Error("mainData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainData.tree);
 
     // Cherry-pick side - should conflict (we deleted, they modified)
@@ -620,6 +632,7 @@ describe.each(backends)(
         .call();
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+      if (!baseCommitData) throw new Error("baseCommitData not found");
       await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
 
       await addFile(workingCopy, "b.txt", "b");
@@ -681,6 +694,7 @@ describe.each(backends)(
         .call();
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+      if (!baseCommitData) throw new Error("baseCommitData not found");
       await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
 
       // Add file with custom author
@@ -706,6 +720,7 @@ describe.each(backends)(
 
       // Check the new commit preserves the original author
       const newCommit = await repository.commits.load(result.newHead ?? "");
+      if (!newCommit) throw new Error("newCommit not found");
       expect(newCommit.author.name).toBe("Custom Author");
       expect(newCommit.author.email).toBe("custom@example.com");
     });
@@ -728,6 +743,7 @@ describe.each(backends)(
         .call();
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+      if (!baseCommitData) throw new Error("baseCommitData not found");
       await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
 
       const detailedMessage =
@@ -749,6 +765,7 @@ describe.each(backends)(
       expect(result.status).toBe(CherryPickStatus.OK);
 
       const newCommit = await repository.commits.load(result.newHead ?? "");
+      if (!newCommit) throw new Error("newCommit not found");
       expect(newCommit.message).toBe(detailedMessage);
     });
 
@@ -770,6 +787,7 @@ describe.each(backends)(
         .call();
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+      if (!baseCommitData) throw new Error("baseCommitData not found");
       await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
 
       await addFile(workingCopy, "b.txt", "b");
@@ -793,6 +811,7 @@ describe.each(backends)(
 
       // The new commit's parent should be mainCommit2
       const newCommit = await repository.commits.load(result.newHead ?? "");
+      if (!newCommit) throw new Error("newCommit not found");
       expect(newCommit.parents).toHaveLength(1);
       expect(newCommit.parents[0]).toBe(mainCommit2?.objectId);
     });
@@ -854,6 +873,7 @@ describe.each(backends)(
         .call();
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const firstCommit = await repository.commits.load(firstMaster?.objectId ?? "");
+      if (!firstCommit) throw new Error("firstCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, firstCommit.tree);
 
       // Modify a on side branch
@@ -902,6 +922,7 @@ describe.each(backends)(
         .call();
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+      if (!baseCommitData) throw new Error("baseCommitData not found");
       await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
 
       await addFile(workingCopy, "b.txt", "b");

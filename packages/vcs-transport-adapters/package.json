@@ -34,7 +34,8 @@
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",
     "test": "vitest run",
     "lint": "biome lint src tests",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "@statewalker/webrun-storage": "catalog:",

@@ -34,7 +34,7 @@ index abc123..def456 100644
       expect(result.errors).toHaveLength(0);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe("line 1\nline 2\nline 3 modified\nline 4\nline 5\n");
     });
 
@@ -66,7 +66,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe("a\nb\nnew line after b\nc\nd\ne\nf\ng\nh\nj\n");
     });
 
@@ -97,7 +97,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe("context 1\ncontext 2\nnew content\ncontext 3\ncontext 4\n");
     });
   });
@@ -131,7 +131,7 @@ index abc123..def456 100644
       expect(result.warnings.length).toBeGreaterThan(0); // Should warn about shift
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toContain("modified target line");
     });
 
@@ -165,7 +165,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe(
         "line 1\nline 2 mod\nline 3\nline 4\nline 5\nline 6 mod\nline 7\nline 8\n",
       );
@@ -220,7 +220,7 @@ index 0000000..abc123
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe("First line\nSecond line\nThird line\n");
     });
 
@@ -274,7 +274,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe("new content\n");
     });
   });
@@ -303,7 +303,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe("line 1\nline 2 modified\n");
     });
 
@@ -355,7 +355,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toContain("line 10 modified");
       expect(newContent).toContain("line 30 modified");
       expect(newContent).toContain("line 50 modified");
@@ -389,7 +389,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe(
         "existing line 1\nexisting line 2\nnew line 1\nnew line 2\nnew line 3\n",
       );
@@ -419,7 +419,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       expect(newContent).toBe("line 1\nline 5\n");
     });
   });
@@ -455,13 +455,13 @@ index abc123..def456 100644
       const result1 = await applier.apply(patch.getFiles()[0], file1Content);
       expect(result1.success).toBe(true);
       expect(result1.content).not.toBeNull();
-      const newContent1 = new TextDecoder().decode(result1.content);
+      const newContent1 = new TextDecoder().decode(result1.content ?? undefined);
       expect(newContent1).toBe("file 1 new\n");
 
       const result2 = await applier.apply(patch.getFiles()[1], file2Content);
       expect(result2.success).toBe(true);
       expect(result2.content).not.toBeNull();
-      const newContent2 = new TextDecoder().decode(result2.content);
+      const newContent2 = new TextDecoder().decode(result2.content ?? undefined);
       expect(newContent2).toBe("file 2 new\n");
     });
   });
@@ -490,7 +490,7 @@ index abc123..def456 100644
       expect(result.success).toBe(true);
       expect(result.content).not.toBeNull();
 
-      const newContent = new TextDecoder().decode(result.content);
+      const newContent = new TextDecoder().decode(result.content ?? undefined);
       // Should preserve the trailing whitespace from original lines
       expect(newContent).toContain("line 1");
       expect(newContent).toContain("line 2 modified");

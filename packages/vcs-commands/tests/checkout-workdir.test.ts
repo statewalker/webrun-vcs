@@ -40,7 +40,6 @@ interface TestStores {
  */
 function createWorkingCopyFromTestStores(stores: TestStores): WorkingCopy {
   const repository = createSimpleHistory({
-    objects: (stores.blobs as { objects?: unknown }).objects,
     blobs: stores.blobs,
     trees: stores.trees,
     commits: stores.commits,
@@ -51,6 +50,7 @@ function createWorkingCopyFromTestStores(stores: TestStores): WorkingCopy {
   return new MemoryWorkingCopy({
     history: repository,
     checkout: { staging: stores.staging } as never,
+    // @ts-expect-error -- bare test stores deliberately pass no worktree (undefined)
     worktree: stores.worktree,
   });
 }
@@ -128,6 +128,8 @@ function createStoresWithFiles(
   const worktree = createFileWorktree({
     files,
     rootPath: workTreeRoot,
+    blobs: objectStores.blobs,
+    trees: objectStores.trees,
     gitDir: ".git",
   });
 

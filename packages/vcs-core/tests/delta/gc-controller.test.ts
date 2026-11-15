@@ -213,7 +213,7 @@ describe("GCController", () => {
       const refs = await ctx.history.refs.list();
       const roots: string[] = [];
       for await (const ref of refs) {
-        if (ref.objectId) {
+        if ("objectId" in ref && ref.objectId) {
           roots.push(ref.objectId);
         }
       }

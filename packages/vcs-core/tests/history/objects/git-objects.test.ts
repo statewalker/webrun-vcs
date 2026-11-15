@@ -8,7 +8,7 @@ import {
 
 const enc = new TextEncoder();
 
-async function text(s: AsyncIterable<Uint8Array>): Promise<string> {
+async function text(s: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<string> {
   let out = "";
   for await (const c of s) out += new TextDecoder().decode(c, { stream: true });
   return out;

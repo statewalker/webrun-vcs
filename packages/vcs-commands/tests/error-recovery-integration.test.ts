@@ -62,6 +62,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       await repository.refs.setSymbolic("HEAD", "refs/heads/feature");
       const featureRef = await repository.refs.resolve("refs/heads/feature");
       const featureCommit = await repository.commits.load(featureRef?.objectId ?? "");
+      if (!featureCommit) throw new Error("featureCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, featureCommit.tree);
 
       await addFile(workingCopy, "file.txt", "feature change");
@@ -72,6 +73,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       const result = await git
@@ -108,6 +110,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       await repository.refs.setSymbolic("HEAD", "refs/heads/other");
       const otherRef = await repository.refs.resolve("refs/heads/other");
       const otherCommit = await repository.commits.load(otherRef?.objectId ?? "");
+      if (!otherCommit) throw new Error("otherCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, otherCommit.tree);
 
       await addFile(workingCopy, "conflict.txt", "other version");
@@ -117,6 +120,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Merge conflicts
@@ -130,6 +134,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       // Reset staging to HEAD tree (abort merge) and continue working
       const headRef = await repository.refs.resolve("HEAD");
       const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+      if (!headCommit) throw new Error("headCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, headCommit.tree);
 
       // Add a new file and commit on a clean staging
@@ -233,6 +238,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       await repository.refs.setSymbolic("HEAD", "refs/heads/conflict-branch");
       const branchRef = await repository.refs.resolve("refs/heads/conflict-branch");
       const branchCommit = await repository.commits.load(branchRef?.objectId ?? "");
+      if (!branchCommit) throw new Error("branchCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, branchCommit.tree);
 
       await addFile(workingCopy, "data.txt", "branch version");
@@ -242,6 +248,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Attempt merge (will conflict)

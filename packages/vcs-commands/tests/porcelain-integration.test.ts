@@ -57,6 +57,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       await repository.refs.setSymbolic("HEAD", "refs/heads/feature");
       const featureRef = await repository.refs.resolve("refs/heads/feature");
       const featureCommit = await repository.commits.load(featureRef?.objectId ?? "");
+      if (!featureCommit) throw new Error("featureCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, featureCommit.tree);
 
       // Add commits on feature
@@ -79,6 +80,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Cherry-pick Feature B onto main
@@ -88,6 +90,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       // Verify main now has feat-b.txt
       const headRef = await repository.refs.resolve("HEAD");
       const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+      if (!headCommit) throw new Error("headCommit not found");
       const treeEntries: string[] = [];
       for await (const entry of (await repository.trees.load(headCommit.tree)) ?? []) {
         treeEntries.push(entry.name);
@@ -155,6 +158,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       // Verify content is back to v1 by checking blob
       const headRef = await repository.refs.resolve("HEAD");
       const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+      if (!headCommit) throw new Error("headCommit not found");
       const tree = await repository.trees.load(headCommit.tree);
       let appBlobId = "";
       for await (const entry of tree ?? []) {
@@ -207,6 +211,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       // Verify b.txt is gone from the tree
       const headRef = await repository.refs.resolve("HEAD");
       const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+      if (!headCommit) throw new Error("headCommit not found");
       const files: string[] = [];
       for await (const entry of (await repository.trees.load(headCommit.tree)) ?? []) {
         files.push(entry.name);
@@ -452,6 +457,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Cherry-pick the feature commit onto main
@@ -489,6 +495,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       // Verify file is gone
       let headRef = await repository.refs.resolve("HEAD");
       let headCommit = await repository.commits.load(headRef?.objectId ?? "");
+      if (!headCommit) throw new Error("headCommit not found");
       let files: string[] = [];
       for await (const entry of (await repository.trees.load(headCommit.tree)) ?? []) {
         files.push(entry.name);
@@ -502,6 +509,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       // Verify file is restored
       headRef = await repository.refs.resolve("HEAD");
       headCommit = await repository.commits.load(headRef?.objectId ?? "");
+      if (!headCommit) throw new Error("headCommit not found");
       files = [];
       for await (const entry of (await repository.trees.load(headCommit.tree)) ?? []) {
         files.push(entry.name);

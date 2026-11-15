@@ -14,16 +14,19 @@
   //                             (a drift becomes a FAILING TEST)
   //   package.json "typecheck": tsc --noEmit && tsc --noEmit -p <this file>
   //
-  // Scope is `src` + `tests/files` on purpose: the rest of `tests/**` carries
-  // 77 pre-existing type errors (delta/ports/streams suites), which would drown
-  // the signal this config exists to produce. Widen the include when those are
-  // cleaned up.
+  // Scope is `src` + all of `tests/`, with Node types since tests may use Node
+  // (portable-APIs rule covers src only; Biome still forbids `node:*` there).
+  // Excluded on purpose: the `diff/[skipped] *` files (dead suites vitest never
+  // collects, importing a `../src` path that no longer exists) and
+  // `* copy.ts` duplicates, which vitest's `*.test.ts` include never runs.
   "extends": "../tsconfig.json",
   "compilerOptions": {
     "rootDir": "..",
     "noEmit": true,
     "declaration": false,
-    "declarationMap": false
+    "declarationMap": false,
+    "types": ["node"]
   },
-  "include": ["../src", "./files"]
+  "include": ["../src", "."],
+  "exclude": ["../node_modules", "../dist", "./diff/*skipped*", "./**/* copy.ts"]
 }

@@ -247,6 +247,7 @@ describe("Merge History: Low-level isolation", () => {
     const headRef = await history.refs.resolve("HEAD");
     expect(headRef?.objectId).toBeTruthy();
     const headOid = headRef?.objectId;
+    if (!headOid) throw new Error("HEAD does not resolve");
 
     // Walk all commits from HEAD
     const commitIds: string[] = [];
@@ -269,6 +270,7 @@ describe("Merge History: Low-level isolation", () => {
 
     const headRef = await history.refs.resolve("HEAD");
     const headOid = headRef?.objectId;
+    if (!headOid) throw new Error("HEAD does not resolve");
 
     // Collect all reachable objects
     const commitCount = { value: 0 };
@@ -296,6 +298,7 @@ describe("Merge History: Low-level isolation", () => {
     const serialization = createSerializationApi(history);
     const headRef = await history.refs.resolve("HEAD");
     const headOid = headRef?.objectId;
+    if (!headOid) throw new Error("HEAD does not resolve");
 
     // Collect all server commit OIDs for later verification
     const serverCommitOids: string[] = [];
@@ -512,7 +515,7 @@ describe("Merge History: Full P2P sync", () => {
     const headRef2 = await history2?.refs.resolve("HEAD");
     expect(headRef2?.objectId).toBeTruthy();
 
-    if (!history2 || !headRef2) throw new Error("client history has no HEAD");
+    if (!history2 || !headRef2?.objectId) throw new Error("client history has no HEAD");
     const clientCommitIds: string[] = [];
     for await (const id of history2.commits.walkAncestry(headRef2.objectId)) {
       clientCommitIds.push(id);

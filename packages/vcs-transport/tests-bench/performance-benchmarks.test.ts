@@ -33,7 +33,10 @@ function createRefStoreAdapter(history: HistoryWithOperations): RefStore {
 function createRepoFacade(history: HistoryWithOperations): RepositoryFacade {
   return {
     async importPack(packStream: AsyncIterable<Uint8Array>): Promise<PackImportResult> {
-      return history.serialization.importPack(packStream);
+      // No quarantine is asked for here, so the result carries none.
+      const { quarantine, ...result } = await history.serialization.importPack(packStream);
+      if (quarantine) throw new Error("unexpected quarantine");
+      return result;
     },
     async *exportPack(
       wants: Set<string>,
@@ -250,7 +253,7 @@ describe("Performance Benchmarks", () => {
       expect(totalReceived).toBe(totalSize);
       expect(throughput).toBeGreaterThan(10 * 1024 * 1024); // >10MB/sec
 
-      await duplex1.close();
+      await duplex1.close?.();
       channel.port1.close();
       channel.port2.close();
     });
@@ -606,7 +609,7 @@ describe("Performance Benchmarks", () => {
           }
 
           await receivePromise;
-          await duplex1.close();
+          await duplex1.close?.();
           channel.port1.close();
           channel.port2.close();
 

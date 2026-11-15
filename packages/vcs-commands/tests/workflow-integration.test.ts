@@ -58,6 +58,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/feature/auth");
       const featureRef = await repository.refs.resolve("refs/heads/feature/auth");
       const featureCommit = await repository.commits.load(featureRef?.objectId ?? "");
+      if (!featureCommit) throw new Error("featureCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, featureCommit.tree);
 
       // Make feature commits
@@ -73,6 +74,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       const mergeResult = await git.merge().include("refs/heads/feature/auth").call();
@@ -81,6 +83,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       // Verify merge commit has two parents
       const headRef = await repository.refs.resolve("HEAD");
       const head = await repository.commits.load(headRef?.objectId ?? "");
+      if (!head) throw new Error("head not found");
       expect(head.parents.length).toBe(2);
 
       // Verify all files present
@@ -155,6 +158,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/release/1.0.x");
       const releaseRef = await repository.refs.resolve("refs/heads/release/1.0.x");
       const releaseCommit = await repository.commits.load(releaseRef?.objectId ?? "");
+      if (!releaseCommit) throw new Error("releaseCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, releaseCommit.tree);
 
       // Cherry-pick the fix
@@ -198,6 +202,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/hotfix/critical");
       const hotfixRef = await repository.refs.resolve("refs/heads/hotfix/critical");
       const hotfixCommit = await repository.commits.load(hotfixRef?.objectId ?? "");
+      if (!hotfixCommit) throw new Error("hotfixCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, hotfixCommit.tree);
 
       // Apply hotfix
@@ -209,6 +214,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       const mergeResult = await git.merge().include("refs/heads/hotfix/critical").call();
@@ -245,6 +251,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/feature");
       const featureRef = await repository.refs.resolve("refs/heads/feature");
       const featureCommit = await repository.commits.load(featureRef?.objectId ?? "");
+      if (!featureCommit) throw new Error("featureCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, featureCommit.tree);
 
       await addFile(workingCopy, "shared.txt", "feature's version");
@@ -255,6 +262,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       const mergeResult = await git
@@ -265,7 +273,8 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
 
       // Should detect conflict
       expect(mergeResult.status).toBe(MergeStatus.CONFLICTING);
-      expect(mergeResult.conflicts.length).toBeGreaterThan(0);
+      expect(mergeResult.conflicts).toBeDefined();
+      expect(mergeResult.conflicts?.length).toBeGreaterThan(0);
     });
 
     it("non-conflicting merge of different files", async () => {
@@ -283,6 +292,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/feature");
       const featureRef = await repository.refs.resolve("refs/heads/feature");
       const featureCommit = await repository.commits.load(featureRef?.objectId ?? "");
+      if (!featureCommit) throw new Error("featureCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, featureCommit.tree);
 
       await addFile(workingCopy, "feature-file.txt", "feature content");
@@ -293,6 +303,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       const result = await git
@@ -329,6 +340,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       await addFile(workingCopy, "docs.txt", "Documentation");

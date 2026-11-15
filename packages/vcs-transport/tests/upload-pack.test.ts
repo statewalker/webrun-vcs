@@ -32,6 +32,7 @@ import { ProcessConfiguration } from "../src/context/process-config.js";
 import { ProtocolState } from "../src/context/protocol-state.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../src/fsm/fetch/index.js";
 import { Fsm } from "../src/fsm/fsm.js";
+import type { FsmStateHandler } from "../src/fsm/index.js";
 import { serverV2Handlers, serverV2Transitions } from "../src/fsm/protocol-v2/index.js";
 import {
   createMockRefStore,
@@ -70,11 +71,13 @@ function createServerContext(overrides?: {
 async function runHandler(
   handlerName: string,
   ctx: ProcessContext,
-  handlers: Map<string, (ctx: ProcessContext) => Promise<string>> = serverFetchHandlers,
+  handlers: ReadonlyMap<string, FsmStateHandler<never>> = serverFetchHandlers,
 ): Promise<string> {
   const handler = handlers.get(handlerName);
   if (!handler) throw new Error(`No handler for state: ${handlerName}`);
-  return handler(ctx);
+  // The v2 handlers type their context as the structured ProcessContext; the
+  // adapter bag built here holds the same keys (transport, state, ...).
+  return (handler as FsmStateHandler<ProcessContext>)(ctx);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -445,10 +448,8 @@ describe("Upload-Pack: Protocol V2 ls-refs", () => {
     refStore._setRef("refs/heads/main", mainOid);
 
     // Mock getSymrefTarget
-    (
-      refStore as MockRefStore & { getSymrefTarget?: (name: string) => Promise<string | null> }
-    ).getSymrefTarget = async (name: string) => {
-      return name === "HEAD" ? "refs/heads/main" : null;
+    refStore.getSymrefTarget = async (name: string) => {
+      return name === "HEAD" ? "refs/heads/main" : undefined;
     };
 
     transport._setPackets(packets().data("symrefs").flush().build());
@@ -560,7 +561,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
     const ctx = createServerContext({ transport });
     const state = getState(ctx);
     // Initialize fetchRequest as HANDLE_FETCH does
-    (state as Record<string, unknown>).fetchRequest = {
+    (state as unknown as Record<string, unknown>).fetchRequest = {
       wants: [],
       wantRefs: [],
       haves: [],
@@ -573,7 +574,10 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
     const event = await runHandler("PARSE_FETCH", ctx, serverV2Handlers);
     expect(event).toBe("FETCH_PARSED");
 
-    const req = (state as Record<string, unknown>).fetchRequest as Record<string, unknown>;
+    const req = (state as unknown as Record<string, unknown>).fetchRequest as Record<
+      string,
+      unknown
+    >;
     expect((req.wants as string[]).includes(wantOid)).toBe(true);
     expect((req.haves as string[]).includes(haveOid)).toBe(true);
     expect(req.done).toBe(true);
@@ -594,7 +598,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
 
     const ctx = createServerContext({ transport, refStore, repository });
     const state = getState(ctx);
-    (state as Record<string, unknown>).fetchRequest = {
+    (state as unknown as Record<string, unknown>).fetchRequest = {
       wants: [wantOid],
       wantRefs: [],
       haves: [],
@@ -619,7 +623,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
 
     const ctx = createServerContext({ transport, refStore, repository });
     const state = getState(ctx);
-    (state as Record<string, unknown>).fetchRequest = {
+    (state as unknown as Record<string, unknown>).fetchRequest = {
       wants: [unknownOid],
       wantRefs: [],
       haves: [],
@@ -645,7 +649,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
 
     const ctx = createServerContext({ transport, refStore, repository });
     const state = getState(ctx);
-    (state as Record<string, unknown>).fetchRequest = {
+    (state as unknown as Record<string, unknown>).fetchRequest = {
       wants: [],
       wantRefs: ["refs/heads/main"],
       haves: [],
@@ -667,7 +671,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
 
     const ctx = createServerContext({ transport, refStore, repository });
     const state = getState(ctx);
-    (state as Record<string, unknown>).fetchRequest = {
+    (state as unknown as Record<string, unknown>).fetchRequest = {
       wants: [],
       wantRefs: ["refs/heads/nonexistent"],
       haves: [],
@@ -692,7 +696,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
 
     const ctx = createServerContext({ transport, repository });
     const state = getState(ctx);
-    (state as Record<string, unknown>).fetchRequest = {
+    (state as unknown as Record<string, unknown>).fetchRequest = {
       wants: [],
       wantRefs: [],
       haves: [haveOid, unknownHaveOid],
@@ -712,7 +716,7 @@ describe("Upload-Pack: Protocol V2 Fetch", () => {
     const transport = createMockTransport();
     const ctx = createServerContext({ transport });
     const state = getState(ctx);
-    (state as Record<string, unknown>).fetchRequest = {
+    (state as unknown as Record<string, unknown>).fetchRequest = {
       wants: [randomOid()],
       wantRefs: [],
       haves: [],
@@ -1047,7 +1051,7 @@ describe("Upload-Pack: Packfile Generation", () => {
 
     // Channel 2 is used for progress
     const sidebandCalls = transport.writeSideband.mock.calls;
-    const progressCalls = sidebandCalls.filter((call: [number, Uint8Array]) => call[0] === 2);
+    const progressCalls = sidebandCalls.filter((call: unknown[]) => call[0] === 2);
     expect(progressCalls.length).toBeGreaterThan(0);
   });
 
@@ -1062,7 +1066,7 @@ describe("Upload-Pack: Packfile Generation", () => {
     await runHandler("SEND_PACK", ctx);
 
     const sidebandCalls = transport.writeSideband.mock.calls;
-    const progressCalls = sidebandCalls.filter((call: [number, Uint8Array]) => call[0] === 2);
+    const progressCalls = sidebandCalls.filter((call: unknown[]) => call[0] === 2);
     expect(progressCalls.length).toBe(0);
   });
 

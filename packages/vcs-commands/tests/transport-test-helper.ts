@@ -63,6 +63,7 @@ export interface TransportTestStores {
 export function createTransportTestStores(): TransportTestStores {
   const objectStores = createMemoryObjectStores();
   return {
+    objects: objectStores.objects,
     blobs: objectStores.blobs,
     trees: objectStores.trees,
     commits: objectStores.commits,

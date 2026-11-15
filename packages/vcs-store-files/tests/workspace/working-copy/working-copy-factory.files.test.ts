@@ -1,11 +1,13 @@
-import type { History } from "@statewalker/vcs-core";
+import { createRef, createSymbolicRef, type History } from "@statewalker/vcs-core";
 import {
   type GitWorkingCopyContext,
   GitWorkingCopyFactory,
   type WorkingCopyFactoryFilesApi,
 } from "@statewalker/vcs-store-files";
 import type { Checkout, Staging, Worktree } from "@statewalker/vcs-working-tree";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+
+type CreateContext = ConstructorParameters<typeof GitWorkingCopyFactory>[1];
 
 /**
  * Create mock files API
@@ -154,19 +156,21 @@ function createMockCheckout(staging: Staging): Checkout {
 describe("GitWorkingCopyFactory", () => {
   let factory: GitWorkingCopyFactory;
   let mockFiles: WorkingCopyFactoryFilesApi;
-  let mockCreateContext: ReturnType<typeof vi.fn>;
+  let mockCreateContext: Mock<CreateContext>;
 
   beforeEach(() => {
     mockFiles = createMockFilesApi();
-    mockCreateContext = vi.fn().mockImplementation(async (): Promise<GitWorkingCopyContext> => {
-      const staging = createMockStaging();
-      const checkout = createMockCheckout(staging);
-      return {
-        history: createMockHistory({ path: "/repo/.git" }),
-        createCheckout: vi.fn().mockResolvedValue(checkout),
-        createWorktree: vi.fn().mockReturnValue(createMockWorktree()),
-      };
-    });
+    mockCreateContext = vi
+      .fn<CreateContext>()
+      .mockImplementation(async (): Promise<GitWorkingCopyContext> => {
+        const staging = createMockStaging();
+        const checkout = createMockCheckout(staging);
+        return {
+          history: createMockHistory({ path: "/repo/.git" }),
+          createCheckout: vi.fn().mockResolvedValue(checkout),
+          createWorktree: vi.fn().mockReturnValue(createMockWorktree()),
+        };
+      });
 
     factory = new GitWorkingCopyFactory(mockFiles, mockCreateContext);
   });
@@ -249,10 +253,10 @@ describe("GitWorkingCopyFactory", () => {
       const history = createMockHistory({ path: "/repo/.git" });
       vi.mocked(history.refs.get).mockImplementation(async (name: string) => {
         if (name === "refs/heads/feature") {
-          return { objectId: "feature-commit" };
+          return createRef("refs/heads/feature", "feature-commit");
         }
         if (name === "HEAD") {
-          return { target: "refs/heads/main" };
+          return createSymbolicRef("HEAD", "refs/heads/main");
         }
         return undefined;
       });
@@ -278,7 +282,7 @@ describe("GitWorkingCopyFactory", () => {
       const history = createMockHistory({ path: "/repo/.git", headCommit: "abc123" });
       vi.mocked(history.refs.get).mockImplementation(async (name: string) => {
         if (name === "HEAD") {
-          return { target: "refs/heads/main" };
+          return createSymbolicRef("HEAD", "refs/heads/main");
         }
         // Return undefined for new-branch to simulate it doesn't exist
         return undefined;

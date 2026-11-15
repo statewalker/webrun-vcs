@@ -12,6 +12,7 @@ import {
   MergeStrategy,
   RebaseOperation,
   RebaseStatus,
+  ResetMode,
 } from "../src/index.js";
 import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
 
@@ -74,7 +75,7 @@ describe.each(backends)("RebaseCommand ($name backend)", ({ factory }) => {
     const secondCommit = secondHead?.objectId ?? "";
 
     // Reset back to initial commit
-    await git.reset().setRef(initialCommit).setMode("hard").call();
+    await git.reset().setRef(initialCommit).setMode(ResetMode.HARD).call();
 
     // Rebase onto second commit should fast-forward
     const result = await git.rebase().setUpstream(secondCommit).call();

@@ -41,8 +41,8 @@ expect.extend({
 
 // Extend TypeScript types for custom matchers
 declare module "vitest" {
-  interface Assertion<T = any> {
-    toBeValidObjectId(): T;
+  interface Matchers<R extends void | Promise<void> = void | Promise<void>, T = unknown> {
+    toBeValidObjectId(): R;
   }
   interface AsymmetricMatchersContaining {
     toBeValidObjectId(): any;

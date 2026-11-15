@@ -25,13 +25,18 @@ import type { Worktree } from "../../src/worktree/worktree.js";
 
 // Test helper to create realistic mocks
 
+/** Staging entry as scenarios write it: `mtime` defaults to 0 when omitted. */
+type ScenarioStagingEntry = Omit<StagingEntry, "mtime"> & { mtime?: number };
+/** Worktree entry as scenarios write it: `name` defaults to the path's basename. */
+type ScenarioWorktreeEntry = Omit<WorktreeEntry, "name"> & { name?: string };
+
 interface TestScenario {
   /** Tree entries for HEAD commit */
   headTree: Map<string, TreeEntry[]>;
   /** Index/staging entries */
-  staging: StagingEntry[];
+  staging: ScenarioStagingEntry[];
   /** Working tree entries */
-  worktree: WorktreeEntry[];
+  worktree: ScenarioWorktreeEntry[];
   /** Worktree file hashes (for content comparison) */
   worktreeHashes: Map<string, string>;
   /** Optional HEAD commit ID */
@@ -42,8 +47,16 @@ interface TestScenario {
 
 function createTestContext(scenario: TestScenario) {
   const trees = createMockTreeStore(scenario.headTree);
-  const staging = createMockStaging(scenario.staging, scenario.conflictPaths ?? []);
-  const worktree = createMockWorktree(scenario.worktree, scenario.worktreeHashes);
+  const stagingEntries: StagingEntry[] = scenario.staging.map((e) => ({
+    ...e,
+    mtime: e.mtime ?? 0,
+  }));
+  const worktreeEntries: WorktreeEntry[] = scenario.worktree.map((e) => ({
+    ...e,
+    name: e.name ?? e.path.split("/").pop() ?? e.path,
+  }));
+  const staging = createMockStaging(stagingEntries, scenario.conflictPaths ?? []);
+  const worktree = createMockWorktree(worktreeEntries, scenario.worktreeHashes);
   const commits = createMockCommitStore(scenario.headTree.size > 0 ? "root-tree-id" : undefined);
   const refs = createMockRefStore(scenario.headCommitId);
 

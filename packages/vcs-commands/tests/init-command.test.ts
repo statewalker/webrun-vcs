@@ -164,7 +164,7 @@ describe("InitCommand", () => {
       const result = await Git.init().setStagingStore(staging).call();
 
       // The store should be using our staging store
-      expect(result.workingCopy.staging).toBe(staging);
+      expect(result.workingCopy.checkout.staging).toBe(staging);
     });
   });
 

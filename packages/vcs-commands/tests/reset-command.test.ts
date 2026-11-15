@@ -80,6 +80,7 @@ describe.each(backends)("ResetCommand ($name backend)", ({ factory }) => {
       // Staging should match initial commit's tree
       const treeId = await workingCopy.checkout.staging.writeTree(repository.trees);
       const initialCommit = await repository.commits.load(initialCommitId);
+      if (!initialCommit) throw new Error("initialCommit not found");
       expect(treeId).toBe(initialCommit.tree);
     });
 

@@ -11,7 +11,8 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { HistoryWithOperations, PersonIdent } from "../../src/history/index.js";
+import type { PersonIdent } from "../../src/common/person/index.js";
+import type { HistoryWithOperations } from "../../src/history/index.js";
 import { createMemoryHistoryWithOperations } from "../../src/history/index.js";
 import type { SerializationApi } from "../../src/serialization/serialization-api.js";
 

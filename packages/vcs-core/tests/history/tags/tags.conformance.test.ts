@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ObjectId } from "../../../src/history/object-storage.js";
+import type { ObjectId } from "../../../src/common/id/index.js";
 import { ObjectType } from "../../../src/history/objects/object-types.js";
 import type { Tag, Tags } from "../../../src/history/tags/tags.js";
 

@@ -83,7 +83,7 @@ function post(body: Uint8Array, headers: Record<string, string> = V2): HttpReque
     path: "/repo.git/git-upload-pack",
     query: {},
     headers,
-    body: new Response(body).body as ReadableStream<Uint8Array>,
+    body: new Response(body as BodyInit).body as ReadableStream<Uint8Array>,
   };
 }
 
@@ -401,7 +401,7 @@ describe("v2 over HTTP: advertisement and headers as git's http-backend", () => 
           path: "/repo.git/git-receive-pack",
           query: {},
           headers: {},
-          body: new Response(encodeFlush()).body as ReadableStream<Uint8Array>,
+          body: new Response(encodeFlush() as BodyInit).body as ReadableStream<Uint8Array>,
         }),
       ];
       for (const response of responses) {

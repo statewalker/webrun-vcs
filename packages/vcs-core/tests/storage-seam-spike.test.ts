@@ -11,7 +11,7 @@
 
 import { memBlobStore } from "@statewalker/webrun-storage";
 import { describe, expect, it } from "vitest";
-import type { PersonIdent } from "../src/history/index.js";
+import type { PersonIdent } from "../src/common/person/index.js";
 import {
   createGitObjects,
   createHistoryFromComponents,

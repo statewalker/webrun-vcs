@@ -10,6 +10,7 @@ import type { RepositoryFacade } from "../../src/api/repository-facade.js";
 import type { RefStore } from "../../src/context/process-context.js";
 import {
   applyRefUpdates,
+  type FetchRefUpdate,
   isFastForward,
   mapRefs,
   planRefUpdates,
@@ -193,7 +194,11 @@ describe("planRefUpdates (git's update_local_ref)", () => {
 });
 
 describe("applyRefUpdates", () => {
-  const update = (localRef: string, oldOid: string | undefined, newOid: string) => ({
+  const update = (
+    localRef: string,
+    oldOid: string | undefined,
+    newOid: string,
+  ): FetchRefUpdate => ({
     remoteRef: localRef,
     localRef,
     oldOid,

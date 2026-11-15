@@ -9,7 +9,7 @@ import { createHistory, hasHistoryBackendFactory } from "@statewalker/vcs-core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SqlJsAdapter } from "../src/adapters/sql-js-adapter.js";
 import { registerSqlHistoryFactory } from "../src/register-backend.js";
-import { SQLHistoryFactory } from "../src/sql-storage-backend.js";
+import { SQLHistoryFactory, type SQLStorageBackendConfig } from "../src/sql-storage-backend.js";
 
 describe("registerSqlHistoryFactory", () => {
   it("registers the SQL backend with the factory", async () => {
@@ -17,7 +17,8 @@ describe("registerSqlHistoryFactory", () => {
     expect(hasHistoryBackendFactory("sql")).toBe(true);
 
     const db = await SqlJsAdapter.create();
-    const history = await createHistory("sql", { db });
+    const config: SQLStorageBackendConfig = { db };
+    const history = await createHistory("sql", config);
 
     await history.initialize();
     // Verify we can use the history
@@ -207,6 +208,7 @@ describe("SQL HistoryWithOperations (via SQLHistoryFactory)", () => {
         expect(commitId).toBeTruthy();
 
         const loaded = await history.commits.load(commitId);
+        if (!loaded) throw new Error("loaded is undefined");
         expect(loaded.tree).toBe(emptyTreeId);
         expect(loaded.message).toBe("Initial commit");
         expect(loaded.author.name).toBe("Test Author");

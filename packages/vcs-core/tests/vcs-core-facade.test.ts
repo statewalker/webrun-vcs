@@ -8,7 +8,7 @@
 import { memBlobStore, memKvStore } from "@statewalker/webrun-storage";
 import { describe, expect, it } from "vitest";
 
-import type { PersonIdent } from "../src/history/index.js";
+import type { PersonIdent } from "../src/common/person/index.js";
 import { createVcsCore, type VcsCore } from "../src/vcs-core/index.js";
 
 const EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";

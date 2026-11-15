@@ -179,7 +179,7 @@ describe("fetch: the upload-pack response", () => {
     return out;
   };
   /** Answers /info/refs, then upload-pack with `body` (a stream, to observe cancellation). */
-  function server(body: () => ReadableStream<Uint8Array> | Uint8Array) {
+  function server(body: () => ReadableStream<Uint8Array> | Uint8Array<ArrayBuffer>) {
     return async (request: Request): Promise<Response> => {
       if (request.url.endsWith("/info/refs?service=git-upload-pack"))
         return new Response(advertisement);

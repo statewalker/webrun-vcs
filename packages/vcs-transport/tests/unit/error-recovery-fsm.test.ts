@@ -49,7 +49,11 @@ function createMockTransport(): MockTransportApi {
 
     async *readPack(): AsyncGenerator<Uint8Array> {},
 
+    async *readRawPack(): AsyncGenerator<Uint8Array> {},
+
     async writePack(): Promise<void> {},
+
+    async writeRawPack(): Promise<void> {},
 
     async close(): Promise<void> {
       this.closed = true;

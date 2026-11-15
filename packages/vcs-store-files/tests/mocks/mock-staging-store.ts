@@ -33,9 +33,6 @@ export function createStagingEntry(
     ctime: options.ctime ?? Date.now(),
     dev: options.dev ?? 0,
     ino: options.ino ?? 0,
-    uid: options.uid ?? 0,
-    gid: options.gid ?? 0,
-    flags: options.flags ?? 0,
     assumeValid: options.assumeValid ?? false,
     ...options,
   };

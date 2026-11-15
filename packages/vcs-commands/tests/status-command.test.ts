@@ -302,6 +302,7 @@ describe.each(backends)("StatusCommand ($name backend)", ({ factory }) => {
       // Checkout side and modify
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+      if (!baseCommitData) throw new Error("baseCommitData not found");
       await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
       await addFile(workingCopy, "file.txt", "side content");
       await git.commit().setMessage("side").call();
@@ -345,6 +346,7 @@ describe.each(backends)("StatusCommand ($name backend)", ({ factory }) => {
 
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+      if (!baseCommitData) throw new Error("baseCommitData not found");
       await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
       await addFile(workingCopy, "file.txt", "side");
       await git.commit().setMessage("side").call();

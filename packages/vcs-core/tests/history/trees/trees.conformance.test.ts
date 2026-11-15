@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ObjectId } from "../../../src/history/object-storage.js";
+import type { ObjectId } from "../../../src/common/id/index.js";
 import type { TreeEntry } from "../../../src/history/trees/tree-entry.js";
 import type { Trees } from "../../../src/history/trees/trees.js";
 
