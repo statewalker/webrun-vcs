@@ -255,6 +255,28 @@ describeGit("status against native git", () => {
     const status = await ours.status().call();
     expect(status.modified).toEqual(new Set(["c.txt"]));
     // the size differs: no file was read at all
+    if (hash.mock.calls.length > 0) {
+      // show what the index recorded next to what the filesystem reports
+      const stats = ["a.txt", "b.txt"].map((f) => {
+        const s = lstatSync(join(dir, f), { bigint: true });
+        return `${f}: mtimeNs=${s.mtimeNs} ctimeNs=${s.ctimeNs} size=${s.size}`;
+      });
+      const index = lstatSync(join(dir, ".git/index"), { bigint: true });
+      const debug = run(dir, "ls-files", "--debug", "a.txt", "b.txt");
+      const entries = await Promise.all(
+        ["a.txt", "b.txt"].map(async (f) => JSON.stringify(await worktree.getEntry(f))),
+      );
+      throw new Error(
+        [
+          `hashed: ${hash.mock.calls.map((c) => c[0]).join(", ")}`,
+          `index mtimeNs=${index.mtimeNs}`,
+          ...stats,
+          debug,
+          ...entries,
+          run(dir, "--version"),
+        ].join("\n"),
+      );
+    }
     expect(hash).not.toHaveBeenCalled();
     expect(content).not.toHaveBeenCalled();
   });
