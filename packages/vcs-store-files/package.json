@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-files",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "File-backed storage backend for StateWalker VCS",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
