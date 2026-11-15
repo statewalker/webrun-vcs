@@ -7,14 +7,18 @@
  */
 
 import type { HistoryWithOperations } from "@statewalker/vcs-core";
+import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
 import type { FilesApi } from "@statewalker/webrun-files";
+import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { describe, expect, it } from "vitest";
 import {
   abortMerge,
   commitWorkspaceChanges,
   concludeMerge,
+  defaultIgnore,
   type GitWorkspace,
   type GitWorkspaceOptions,
+  MergeAbortRefusedError,
   openGitWorkspace,
   readCommitTree,
   readMergeState,
@@ -505,5 +509,197 @@ describe("a path that comes back with changes on both sides stops like a merge",
     expect((await serverFiles(history))["docs/e.md"]).toBe("resolved\n");
     expect(await plain.history.refs.resolve(MERGE)).toBeUndefined();
     expect(await plain.history.refs.resolve(SKIP)).toBeUndefined();
+  });
+});
+
+/** Review round of the recovery stop (R1, R3, R5, R9). */
+describe("a recovery stop never takes a file back from being ignored", () => {
+  const ignoreSecret = (p: string) => defaultIgnore(p) || p === "secret.env";
+
+  async function withSecret(annFiles: Record<string, string> = {}) {
+    const { server, history } = await serverRepo();
+    const r = () => messageChannelRemote(server);
+    const a = await workspace("Ann", { "a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n" });
+    await syncWorkspace(a, r());
+    const h = createMemoryHistoryWithOperations();
+    await h.initialize();
+    const plain = await openGitWorkspace({
+      folder: new MemFilesApi({ initialFiles: { "/secret.env": "TOKEN=hunter2\n" } }),
+      history: h,
+      identity: { name: "Bob", email: "bob@example.com" },
+      now: tick,
+      ignore: ignoreSecret,
+    });
+    await syncWorkspace(plain, r());
+    await writeFile(a, "a.txt", "a2\n");
+    await writeFile(a, "b.txt", "b2\n");
+    await writeFile(a, "c.txt", "c from Ann\n");
+    for (const [p, c] of Object.entries(annFiles)) await writeFile(a, p, c);
+    await syncWorkspace(a, r());
+    const f = faulty(plain, (p) => p === "/c.txt");
+    await expect(syncWorkspace(await f.open({ ignore: ignoreSecret }), r())).rejects.toThrow(
+      /disk full/,
+    );
+    f.state.armed = false;
+    await writeFile(plain, "c.txt", "c from Bob\n");
+    // restarted with an ignore that no longer ignores secret.env
+    return { r, history, plain, b: await f.open() };
+  }
+
+  it("R1: the un-ignored local file is held: not in the edits, not concluded, not pushed", async () => {
+    const { r, history, plain, b } = await withSecret();
+    const res = await syncWorkspace(b, r());
+    expect(res).toMatchObject({ integration: "conflicted", conflicts: ["c.txt"] });
+    expect(res.skipped).toContainEqual({ path: "secret.env", reason: "unignored-local" });
+    expect((await treeFiles(plain.history, res.merge?.head))["secret.env"]).toBeUndefined();
+    await writeFile(plain, "c.txt", "resolved\n");
+    const done = await concludeMerge(b);
+    expect(done.skipped).toContainEqual({ path: "secret.env", reason: "unignored-local" });
+    await syncWorkspace(b, r());
+    expect(await serverFiles(history)).toEqual({
+      "a.txt": "a2\n",
+      "b.txt": "b2\n",
+      "c.txt": "resolved\n",
+    });
+    expect(await readFile(plain, "secret.env")).toBe("TOKEN=hunter2\n");
+  });
+
+  it("R1: when the target adds the same path, the local copy is held and the target's stays", async () => {
+    const { r, history, plain, b } = await withSecret({ "secret.env": "TOKEN=public\n" });
+    const res = await syncWorkspace(b, r());
+    expect(res.conflicts).toEqual(["c.txt"]);
+    expect(res.skipped).toContainEqual({ path: "secret.env", reason: "unignored-local" });
+    expect(await readFile(plain, "secret.env")).toBe("TOKEN=hunter2\n");
+    expect((await treeFiles(plain.history, res.merge?.head))["secret.env"]).toBeUndefined();
+    await writeFile(plain, "c.txt", "resolved\n");
+    await concludeMerge(b);
+    await syncWorkspace(b, r());
+    expect((await serverFiles(history))["secret.env"]).toBe("TOKEN=public\n");
+  });
+});
+
+describe("abort keeps edits made after the stop to paths that merged cleanly", () => {
+  it("R3: a recovery abort is refused with the paths, nothing changed; force discards them", async () => {
+    const { r, plain, b, f } = await cutShort();
+    f.state.armed = false;
+    await writeFile(plain, "c.txt", "c from Bob\n");
+    await syncWorkspace(b, r());
+    // after the stop Bob edits b.txt (the checkout wrote b2) and c.txt (the conflict)
+    await writeFile(plain, "b.txt", "b2 + Bob's work after the stop\n");
+    await writeFile(plain, "c.txt", "half resolved\n");
+    const refused = await abortMerge(b).catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(MergeAbortRefusedError);
+    expect((refused as MergeAbortRefusedError).paths).toEqual(["b.txt"]);
+    expect(await readFile(plain, "b.txt")).toBe("b2 + Bob's work after the stop\n");
+    expect(await readFile(plain, "c.txt")).toBe("half resolved\n");
+    expect((await readMergeState(b))?.kind).toBe("recovery");
+    await abortMerge(b, { force: true });
+    expect(await folderFiles(plain)).toEqual({
+      "a.txt": "a\n",
+      "b.txt": "b\n",
+      "c.txt": "c from Bob\n",
+    });
+  });
+
+  it("R3: the same for a merge with the remote; a conflicted file's edit alone is discarded", async () => {
+    const { server } = await serverRepo();
+    const r = () => messageChannelRemote(server);
+    const a = await workspace("Ann", { "p.txt": "p\n", "q.txt": "q\n" });
+    await syncWorkspace(a, r());
+    const b = await workspace("Bob");
+    await syncWorkspace(b, r());
+    await writeFile(a, "p.txt", "p by Ann\n");
+    await writeFile(a, "q.txt", "q by Ann\n");
+    await syncWorkspace(a, r());
+    await writeFile(b, "p.txt", "p by Bob\n");
+    const res = await syncWorkspace(b, r());
+    expect(res).toMatchObject({ integration: "conflicted", conflicts: ["p.txt"] });
+    await writeFile(b, "q.txt", "q by Ann, then Bob\n");
+    await writeFile(b, "p.txt", "half resolved\n");
+    await expect(abortMerge(b)).rejects.toThrow(MergeAbortRefusedError);
+    await writeFile(b, "q.txt", "q by Ann\n"); // back to the merge result
+    await abortMerge(b);
+    expect(await folderFiles(b)).toEqual({ "p.txt": "p by Bob\n", "q.txt": "q\n" });
+  });
+});
+
+describe("a rejoin step stopped on does not outlive its crash", () => {
+  it("R5: left out again and edited for weeks, the path comes back by a fresh merge", async () => {
+    const { r, plain } = await rejoining();
+    const f = faulty(plain, () => false);
+    f.state.crash = { method: "set", ref: MERGE };
+    await expect(syncWorkspace(await f.open(), r())).rejects.toThrow(/crash/);
+    // Bob puts the nested repository back, and works in it
+    await writeFile(plain, "docs/.git/HEAD", "ref: refs/heads/main\n");
+    const ws = await reopen(plain);
+    await syncWorkspace(ws, r());
+    await writeFile(plain, "docs/e.md", "Bob's much newer work\n");
+    await syncWorkspace(ws, r());
+    await plain.folder.remove("/docs/.git");
+    const later = await reopen(plain);
+    const res = await syncWorkspace(later, r());
+    expect(res).toMatchObject({ integration: "conflicted", conflicts: ["docs/e.md"] });
+    const e = await readFile(plain, "docs/e.md");
+    expect(markers(e)).toBe(1);
+    expect(e).toContain("Bob's much newer work");
+    await abortMerge(later);
+    expect(await readFile(plain, "docs/e.md")).toBe("Bob's much newer work\n");
+  });
+});
+
+describe("a first checkout cut short has nothing to commit the edits on", () => {
+  async function firstCheckout() {
+    const { server, history } = await serverRepo();
+    const r = () => messageChannelRemote(server);
+    const a = await workspace("Ann", { "a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n" });
+    const target = (await syncWorkspace(a, r())).head as string;
+    const plain = await workspace("Bob");
+    const f = faulty(plain, (p) => p === "/b.txt");
+    const b = await f.open();
+    await expect(syncWorkspace(b, r())).rejects.toThrow(/disk full/);
+    expect(await headOf(plain)).toBeUndefined();
+    f.state.armed = false;
+    await writeFile(plain, "c.txt", "c by Bob\n");
+    const res = await syncWorkspace(b, r());
+    return { r, history, plain, b, target, res };
+  }
+
+  it("R9: the branch takes the target, the edits are a commit on it; conclude commits on the target", async () => {
+    const { r, history, plain, b, target, res } = await firstCheckout();
+    expect(res).toMatchObject({ integration: "conflicted", committed: false });
+    expect(res.merge).toMatchObject({ kind: "recovery", head: target, conflicts: ["c.txt"] });
+    expect(await headOf(plain)).toBe(target);
+    const theirs = res.merge?.theirs as string;
+    expect((await plain.history.commits.load(theirs))?.parents).toEqual([target]);
+    expect((await treeFiles(plain.history, theirs))["c.txt"]).toBe("c by Bob\n");
+    expect(markers(await readFile(plain, "c.txt"))).toBe(1);
+    await writeFile(plain, "c.txt", "c by Ann and Bob\n");
+    const done = await concludeMerge(b);
+    // one parent: no unrelated histories are merged
+    expect((await plain.history.commits.load(done.head as string))?.parents).toEqual([target]);
+    const pushed = await syncWorkspace(b, r());
+    expect(pushed.pushed).toBe(true);
+    expect(await serverFiles(history)).toEqual({
+      "a.txt": "a\n",
+      "b.txt": "b\n",
+      "c.txt": "c by Ann and Bob\n",
+    });
+  });
+
+  it("R9: abort gives the folder's file back on the target; the next sync takes it as an edit", async () => {
+    const { r, history, plain, b, target } = await firstCheckout();
+    const aborted = await abortMerge(b);
+    expect(aborted.head).toBe(target);
+    expect(await folderFiles(plain)).toEqual({
+      "a.txt": "a\n",
+      "b.txt": "b\n",
+      "c.txt": "c by Bob\n",
+    });
+    expect(await plain.history.refs.resolve(MERGE)).toBeUndefined();
+    const next = await syncWorkspace(b, r());
+    expect(next).toMatchObject({ committed: true, pushed: true });
+    const head = (await headOf(plain)) as string;
+    expect((await plain.history.commits.load(head))?.parents).toEqual([target]);
+    expect((await serverFiles(history))["c.txt"]).toBe("c by Bob\n");
   });
 });

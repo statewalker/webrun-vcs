@@ -12,5 +12,8 @@ Behaviour change: with `onConflict: "stop"` (the default), two recovery steps no
 - Rejoin: the branch stays (`merge.head`). The folder's copies of the conflicted paths become a commit on it (`merge.theirs`), and concluding merges the two. Aborting gives the folder's copies back and keeps the paths in the skip record, so the next commit brings them back again.
 - Crash safety:
   - The recovery stop is recorded (`writing`) before the first folder write after a conflict, and takes over from the pending checkout. It is finished from the stored plan by the next commit, sync, conclude or abort, then stopped. The branch move to the edits' commit is finished if it was cut short.
-  - A rejoin step stopped on is marked written, so a crash before the stop is recorded never merges the path twice.
+  - A rejoin step stopped on is marked written. It counts only while the folder still holds its result and the path is not left out again, so a decision stale since a crash is never replayed over newer work.
   - A conclude cut short after the branch moved also clears the rejoin's records.
+- A first checkout cut short (nothing committed before it) does not commit the edits as a history of their own. The branch takes the target (`merge.head`), the edits are a commit on it (`merge.theirs`), and concluding commits on the target with one parent. Aborting gives the edits back, as edits on top of the target.
+- Files back from being ignored are held before a cut-short checkout is finished, even where the target adds the same path. They are never written over, never taken for edits, and frozen as left out by a stop, so concluding never commits them.
+- New: `abortMerge(ws, { force })` and `MergeAbortRefusedError`. For every kind of merge, as `git reset --merge` does, an abort is refused when it would discard edits made since the stop to a file that merged cleanly. Edits to conflicted files are still discarded. `force: true` discards both.

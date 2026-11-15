@@ -699,7 +699,9 @@ interface RejoinStep {
   mine?: FlatEntry | null;
   /**
    * A conflict stopped on (`onConflict: "stop"`): its writes are done, and the step stays in
-   * the record until the merge is concluded or aborted (a later change is the user's)
+   * the record until the merge is concluded or aborted. Without a merge record (a crash before
+   * the stop was recorded), it counts only while the folder holds `result` and the path is not
+   * left out again; otherwise it goes and the path is decided afresh.
    */
   written?: boolean;
 }
@@ -988,15 +990,19 @@ async function rejoinLeftOut(
   const taken = new Set([...headFiles.keys(), ...record.paths.keys()]);
   try {
     for (const [path, base] of [...record.paths]) {
-      if (skip(path)) continue;
       let step = record.rejoining.get(path);
-      // decided before a crash: done when the folder holds the result (or a stop wrote it),
-      // made again otherwise
-      if (
-        step &&
-        !step.written &&
-        (await currentFileId(ws.folder, path)) !== (step.result ?? undefined)
-      ) {
+      if (skip(path)) {
+        // left out again before a stop on it was recorded: the decision is stale (the folder
+        // may change a lot meanwhile), and the path comes back by a fresh one
+        if (step?.written) {
+          record.rejoining.delete(path);
+          await saveStale(ws, record);
+        }
+        continue;
+      }
+      // decided before a crash (no merge is in progress here): done when the folder holds the
+      // result, made again otherwise, a stopped-on step too
+      if (step && (await currentFileId(ws.folder, path)) !== (step.result ?? undefined)) {
         step = undefined;
       }
       if (!step) {
@@ -1167,7 +1173,9 @@ function mergeRef(ws: GitWorkspace): string {
  *   merged in);
  * - `recovery`: finishing a checkout that was cut short found folder edits that clash with the
  *   checkout's target. `head` is the commit of those edits, made on the commit the checkout
- *   started from (the branch moves there); `theirs` is the checkout's target;
+ *   started from (the branch moves there); `theirs` is the checkout's target. A first checkout
+ *   (nothing committed before it) has the target as `head` and the edits as a commit on it,
+ *   `theirs`, and concludes with one parent;
  * - `rejoin`: paths that come back from being left out (a nested repository removed, `ignore`
  *   changed) were changed both in the folder and on the branch. `head` is the branch tip,
  *   `theirs` a commit on it holding the folder's copies of those paths.
@@ -1278,10 +1286,12 @@ async function readMerge(ws: GitWorkspace): Promise<MergeRecord | undefined> {
   const tip = await workspaceHead(ws);
   if (tip && tip !== head) {
     const landed = await ws.history.commits.load(tip);
+    // a first checkout's recovery concludes with one parent (see concludeParents)
+    const single = kind === "recovery" && typeof meta.from !== "string";
+    const expected = single ? [head] : [head, theirs];
     if (
-      landed?.parents.length === 2 &&
-      landed.parents[0] === head &&
-      landed.parents[1] === theirs
+      landed?.parents.length === expected.length &&
+      expected.every((p, i) => landed.parents[i] === p)
     ) {
       // concluded, cut short before the record went: what the conclude still had to do
       if (kind === "rejoin") await endRejoin(ws, strings(meta.conflicts), "concluded");
@@ -1394,6 +1404,14 @@ const isBlobId = (id: string) => !id.includes(":");
  * the checkout had already written), the record names that commit as `head` and the target as
  * `theirs`, then the branch moves there and the plan goes. The record is stored before the
  * branch moves: a move cut short is finished by {@link recoverMerge}.
+ *
+ * A first checkout (no commit before it) has nothing to commit the edits on: the branch moves
+ * to the target, which is `head`, and the edits become a commit on it, `theirs`; concluding
+ * then commits on the target (one parent) and aborting gives the edits back (see
+ * {@link editsOnTop}).
+ *
+ * Paths left out now (a file back from being ignored and held, say) are never taken as edits:
+ * the merge result keeps the target's version there, and they are not reported.
  */
 async function stopRecovery(ws: GitWorkspace, record: MergeRecord): Promise<MergeRecord> {
   const target = record.theirs;
@@ -1402,20 +1420,33 @@ async function stopRecovery(ws: GitWorkspace, record: MergeRecord): Promise<Merg
   const to = (await readCommitTree(ws.history, target)).files;
   const plan = await loadPlan(ws, target);
   if (!plan) throw new Error(`the plan of the checkout of ${target.slice(0, 7)} is missing`);
-  const mine: FlatTree = new Map(fromFiles);
+  // the edits go on the start, or on the target when there is none
+  const mine: FlatTree = new Map(from ? fromFiles : to);
+  const files: FlatTree = new Map(plan.files);
+  const leftOut = new Set<string>();
   const skipWrite = skipFor(ws, to);
   const skipRemove = skipFor(ws, fromFiles);
   const paths = new Set([...fromFiles.keys(), ...to.keys(), ...plan.files.keys()]);
   for (const path of [...paths].sort()) {
     const h = inFolder(fromFiles.get(path));
+    const t = inFolder(to.get(path));
+    const base = from ? h : t;
     const want = inFolder(plan.files.get(path));
     if (path in plan.seen) {
+      if (t ? skipWrite(path) : skipRemove(path)) {
+        // left out now: the folder's copy is not history's, the target's version stays
+        leftOut.add(path);
+        const entry = to.get(path);
+        if (entry) files.set(path, entry);
+        else files.delete(path);
+        continue;
+      }
       // a conflict: the folder's own content, as the plan found it
       const seen = plan.seen[path];
       if (seen === null || seen === KEPT_DIRECTORY) {
-        if (h) mine.delete(path);
+        if (base) mine.delete(path);
       } else {
-        const mode = h?.mode ?? inFolder(to.get(path))?.mode ?? MODE_FILE;
+        const mode = h?.mode ?? t?.mode ?? MODE_FILE;
         mine.set(path, { id: seen, mode });
       }
       continue;
@@ -1424,35 +1455,60 @@ async function stopRecovery(ws: GitWorkspace, record: MergeRecord): Promise<Merg
     // written by the checkout, then changed: the user's edit, kept by an abort too
     const now = await currentFileId(ws.folder, path);
     if (now === undefined) {
-      if (want && h) mine.delete(path);
+      if (want && base) mine.delete(path);
       continue;
     }
     if (now === h?.id || now === want?.id || !isBlobId(now)) continue;
     const id = await ws.history.blobs.store(ws.folder.read(`/${path}`));
     mine.set(path, { id, mode: h?.mode ?? want?.mode ?? MODE_FILE });
   }
-  let head = from;
   const tree = await storeFlatTree(ws.history, mine);
-  if (!from || tree !== (await readCommitTree(ws.history, from)).tree) {
-    const who = person(ws);
-    head = await ws.history.commits.store({
+  const who = person(ws);
+  const editsCommit = (parents: ObjectId[]) =>
+    ws.history.commits.store({
       tree,
-      parents: from ? [from] : [],
+      parents,
       author: who,
       committer: who,
       message: `Folder edits made while the checkout of ${target.slice(0, 7)} was unfinished\n`,
     });
+  let head: ObjectId;
+  let theirs = target;
+  if (!from) {
+    head = target;
+    theirs = await editsCommit([target]);
+  } else if (tree !== (await readCommitTree(ws.history, from)).tree) {
+    head = await editsCommit([from]);
+  } else {
+    head = from;
   }
   const stopped = await storeMerge(ws, {
     ...record,
     phase: "stopped",
-    head: head as ObjectId,
-    files: plan.files,
-    conflicts: [...plan.conflicts].sort(),
+    head,
+    theirs,
+    files,
+    conflicts: plan.conflicts.filter((c) => !leftOut.has(c)).sort(),
   });
-  if ((await workspaceHead(ws)) !== head) await moveBranch(ws, from, head as ObjectId);
+  if ((await workspaceHead(ws)) !== head) await moveBranch(ws, from, head);
   await ws.history.refs.remove(planRef(ws));
   return stopped;
+}
+
+/**
+ * Whether the merge's `theirs` is the folder's own side, as a commit on `head`: a rejoin, or
+ * a recovery of a first checkout. An abort gives `theirs` back; a conclude of a first
+ * checkout commits on `head` alone (see {@link concludeParents}).
+ */
+function editsOnTop(record: MergeRecord): boolean {
+  return record.kind === "rejoin" || (record.kind === "recovery" && record.from === undefined);
+}
+
+/** The parents of the commit that concludes `record`. */
+function concludeParents(record: MergeRecord): ObjectId[] {
+  // a first checkout: nothing to merge the target with, the resolution is a commit on it
+  if (record.kind === "recovery" && record.from === undefined) return [record.head];
+  return [record.head, record.theirs];
 }
 
 /**
@@ -1553,6 +1609,15 @@ export async function commitFolder(
   // the snapshot and the tree, and the snapshot is taken from it. Only when the finish or the
   // rejoin wrote something is the folder listed again (its repositories added to the round's).
   let walked = await walk(ws);
+  if (await ws.history.refs.resolve(pendingRef(ws))) {
+    // files back from being ignored are held before the finish: it never writes over them,
+    // never takes them for edits that clash with the target, and a stop freezes them as left out
+    const stale = await loadStale(ws);
+    const from = (await readCommitTree(ws.history, await workspaceHead(ws))).files;
+    const early = await holdUnignored(ws, stale, walked, from, options.include ?? []);
+    if (early.changed) await saveStale(ws, stale);
+    heldPaths.set(ws, early.hold);
+  }
   const finished = await finishPendingCheckout(ws, walked, onConflict);
   const conflicts = [...finished.conflicts];
   const touched = [...finished.touched];
@@ -1572,7 +1637,11 @@ export async function commitFolder(
     return {
       head: await workspaceHead(ws),
       // a recovery stop commits the folder's edits on their own (never the target's content)
-      changed: started && record.kind === "recovery" && record.head !== record.from,
+      changed:
+        started &&
+        record.kind === "recovery" &&
+        record.from !== undefined &&
+        record.head !== record.from,
       conflicts: record.conflicts,
       skipped,
       rejoined: [],
@@ -2068,7 +2137,7 @@ export function concludeMerge(
     const commit = await commitTree(
       ws,
       composeTree(record.files, snapshot, skip),
-      [record.head, record.theirs],
+      concludeParents(record),
       message,
     );
     await moveBranch(ws, record.head, commit);
@@ -2093,29 +2162,57 @@ export interface MergeAbort {
   kept: string[];
 }
 
+/** Options of {@link abortMerge}. */
+export interface AbortMergeOptions {
+  /**
+   * Abort although paths that merged cleanly were edited since the merge stopped (default
+   * false: refused with {@link MergeAbortRefusedError}); those edits are discarded
+   */
+  force?: boolean;
+}
+
 /**
- * Abandons the merge in progress, as `git merge --abort` does: every path the merge changed
- * gets the branch tip's version back (files the merge added are removed), and the record goes.
- * Edits made to those paths since the merge started are discarded, as git discards them;
- * other paths are not touched, so edits elsewhere stay (the merge started from a committed
- * folder, so nothing from before it is lost). A directory is never removed with files of its
- * own: such a path is reported in `kept`. What was left out when the merge stopped (ignored
- * paths, nested repositories, held files) is never touched. A merge whose writing was cut
- * short is undone from its stored plan too: copies the plan put beside files are removed.
+ * {@link abortMerge} refused, nothing changed: paths that merged cleanly (not conflicted) and
+ * that the abort would write over were edited since the merge stopped, as `git merge --abort`
+ * refuses ("not uptodate"). Commit nothing, but save the edits elsewhere, or abort with `force`.
+ */
+export class MergeAbortRefusedError extends Error {
+  constructor(readonly paths: string[]) {
+    super(
+      `the abort would discard edits made since the merge stopped in ${paths.join(", ")}; keep them elsewhere, or abort with force`,
+    );
+    this.name = "MergeAbortRefusedError";
+  }
+}
+
+/**
+ * Abandons the merge in progress, as `git merge --abort` (`git reset --merge`) does: every
+ * path the merge changed gets back the version it had before the merge (files the merge added
+ * are removed), and the record goes. Edits made since the merge stopped to conflicted paths
+ * are discarded, as git discards them. Edits made since to paths that merged cleanly would be
+ * discarded too, so the abort is refused ({@link MergeAbortRefusedError}, nothing changed)
+ * unless `force`. Paths the merge did not change are never touched. A directory is never
+ * removed with files of its own: such a path is reported in `kept`. What was left out when the
+ * merge stopped (ignored paths, nested repositories, held files) is never touched. A merge
+ * whose writing was cut short is undone from its stored plan too: copies the plan put beside
+ * files are removed.
  *
  * Aborting a stop of a recovery or a rejoin gives the folder's own version back, never the
  * incoming one, and keeps the incoming one in history for the next sync:
  * - `recovery`: every path gets the version of `head`, the commit of the folder's edits (the
  *   user's version of each conflicted path, the version the checkout started from elsewhere).
  *   The branch stays on that commit, as if the edits had been committed before the sync; the
- *   checkout's target is not taken, and the next sync merges the remote's commits again.
+ *   checkout's target is not taken, and the next sync merges the remote's commits again. A
+ *   first checkout (nothing committed before it) has the target as `head`: the paths get the
+ *   version of `theirs`, the folder's own files, and the branch stays on the target, so the
+ *   next commit takes those files as edits on top of it.
  * - `rejoin`: every path gets the version of `theirs`, the folder's copies of the paths that
  *   came back (the branch tip's elsewhere). The branch does not move; the paths stay recorded
  *   as left out with the version the folder last held, so the next commit brings them back
  *   again (and stops again while both sides still differ).
  * A recovery stop whose writing was cut short is finished first (from its plan), then aborted.
  */
-export function abortMerge(ws: GitWorkspace): Promise<MergeAbort> {
+export function abortMerge(ws: GitWorkspace, options: AbortMergeOptions = {}): Promise<MergeAbort> {
   return runExclusive(ws, async () => {
     heldPaths.set(ws, new Set((await loadStale(ws)).held));
     await walk(ws);
@@ -2124,8 +2221,8 @@ export function abortMerge(ws: GitWorkspace): Promise<MergeAbort> {
     if (record.kind === "recovery") record = (await recoverMerge(ws))?.record ?? record;
     const head = await workspaceHead(ws);
     if (head !== record.head) throw new Error(`${ws.branch} moved during the merge`);
-    // what the folder gets back: the branch tip's version, or the folder's own copies (rejoin)
-    const ours = record.kind === "rejoin" ? record.theirs : head;
+    // what the folder gets back: the branch tip's version, or the folder's own side
+    const ours = editsOnTop(record) ? record.theirs : head;
     const headFiles = (await readCommitTree(ws.history, ours)).files;
     // a write cut short may have followed a plan that differs from the result (copies beside)
     const plan = record.phase === "writing" ? await loadPlan(ws, record.id) : undefined;
@@ -2147,6 +2244,21 @@ export function abortMerge(ws: GitWorkspace): Promise<MergeAbort> {
     };
     const removals = paths.filter((p) => differs(p) && !inFolder(headFiles.get(p)));
     const writes = paths.filter((p) => differs(p) && inFolder(headFiles.get(p)));
+    if (!options.force) {
+      // git's reset --merge: a path that merged cleanly and was edited since is not discarded
+      const conflicted = new Set(record.conflicts);
+      const edited: string[] = [];
+      for (const path of [...removals, ...writes]) {
+        const h = inFolder(headFiles.get(path));
+        if (conflicted.has(path) || (h ? skipWrite(path) : skipRemove(path))) continue;
+        const now = await currentFileId(ws.folder, path);
+        if (now === undefined || !isBlobId(now) || now === h?.id) continue;
+        if (now === inFolder(record.files.get(path))?.id) continue;
+        if (plan && now === inFolder(planned.get(path))?.id) continue;
+        edited.push(path);
+      }
+      if (edited.length > 0) throw new MergeAbortRefusedError(edited.sort());
+    }
     try {
       for (const path of [...removals, ...writes]) {
         const h = inFolder(headFiles.get(path));
