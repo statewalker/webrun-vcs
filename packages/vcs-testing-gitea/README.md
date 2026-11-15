@@ -11,7 +11,7 @@ cd packages/vcs-testing-gitea
 GITEA=1 pnpm test                               # or: pnpm test:oracle
 ```
 
-The first run downloads Gitea 1.22.6 (about 143 MB) from dl.gitea.com, checks it against its published SHA-256 and keeps it. Later runs hash the cached binary again and reuse it. Both test files start their own Gitea, so a run takes about ten seconds once the binary is cached.
+The first run downloads Gitea 1.22.6 (about 143 MB) from dl.gitea.com, checks it against its published SHA-256 and keeps it. Later runs hash the cached binary again and reuse it. Each oracle test file starts its own Gitea, so a run takes about twenty seconds once the binary is cached.
 
 Without `GITEA=1` the oracle tests are skipped: `pnpm test` at the root runs only the unit tests of the configuration. With `GITEA=1` a Gitea that cannot be downloaded, verified or started fails the run rather than skipping it. Native `git` and `git-lfs` must be installed.
 
@@ -65,6 +65,9 @@ The pure pieces (`giteaAppIni`, `giteaCommand`, `giteaRelease`, `giteaOracleEnab
 | G2 | A commit with `.gitattributes` and an LFS pointer: `lfsUpload` sends the object (batch, PUT, Gitea's verify action) and `httpPush` the commit. A native `git clone` with git-lfs smudges the 3 MiB file byte-identical and `git lfs fsck` is clean. A second upload sends nothing. |
 | G3 | A file native git-lfs pushed: an anonymous batch is a 401; `lfsDownload` stores it byte-identical. A download cut after 1 MiB resumes with `Range: bytes=N-`, Gitea answers 206, and the bytes over both attempts add up to the size. |
 | G4 | A missing object is Gitea's per-object 404 (our error says not found). Bytes altered in transit are refused (`sha256 mismatch`) and nothing is kept. Gitea itself refuses a PUT whose bytes do not hash to their oid with 422. |
+| G5 | The File Locking API (on whenever Gitea serves LFS): `lfsLocks` as the admin and as a second user with write access. A lock is created (201), the same path again is a 409 carrying the existing lock, listing by path, by id and page by page finds every lock, `verifyLocks` splits them into ours and theirs by owner, an unlock of someone else's lock without `force` is refused and leaves it in place, `force` takes it, and the owner unlocks their own. Anonymous listing of a private repository is a 401. |
+
+Two Gitea 1.22 locking quirks are pinned loosely in G5, so a fixed Gitea still passes: its list cursor is a page number that starts at 0 while its pages are 1-based, so following `next_cursor` returns the first page twice (our `allLocks` drops locks it has already seen, by id, so G5 sees each lock once); and an unlock of another user's lock without `force` is a 500 ("unable to delete lock") rather than the spec's 403.
 
 Two Gitea behaviours shape our client, and the oracle pins both. Gitea's LFS actions carry `Authorization` with a capital A: the client merges its own `authorization` with them by name, case-insensitively, or `fetch` sends the two joined by a comma and Gitea answers 401 to every transfer (reverting the merge fails G2 to G4). And Gitea 1.22 reports the total in `Content-Range` as size minus start (`bytes 1048576-4194303/3145728`), so the client reads only the start.
 

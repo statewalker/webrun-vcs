@@ -12,7 +12,10 @@
  * clean/smudge wiring belongs to the working tree. Besides a content-store, the
  * server and client run over any `LfsObjectStore`, such as
  * `createFilesLfsStore`: a `FilesApi` in git-lfs's own `lfs/objects` layout,
- * shared with native git-lfs, with resumable partial downloads.
+ * shared with native git-lfs, with resumable partial downloads. The File
+ * Locking API is here too: the `lfsLocks` client, and `serveLfs`'s `locks`
+ * option over an `LfsLockStore` (`createMemoryLockStore`,
+ * `createFilesLockStore`).
  */
 
 export {
@@ -26,6 +29,32 @@ export {
 } from "./batch.js";
 export { lfsDownload, lfsUpload } from "./client.js";
 export { createFilesLfsStore, LfsPartialChangedError } from "./files-store.js";
+export {
+  basicUserIdentity,
+  createFilesLockStore,
+  createMemoryLockStore,
+  type LfsCreateLockRequest,
+  type LfsListLocksQuery,
+  type LfsListLocksResponse,
+  type LfsLock,
+  type LfsLockClientOptions,
+  LfsLockError,
+  type LfsLockOperation,
+  type LfsLockOwner,
+  type LfsLockPage,
+  type LfsLockQuery,
+  type LfsLockRef,
+  type LfsLockStore,
+  type LfsLocksClient,
+  type LfsLocksOptions,
+  type LfsStoredLock,
+  type LfsUnlockRequest,
+  type LfsVerifyLocksPage,
+  type LfsVerifyLocksRequest,
+  type LfsVerifyLocksResponse,
+  lfsLocks,
+  normalizeLockPath,
+} from "./locks/index.js";
 export {
   createLfsPointer,
   formatLfsPointer,

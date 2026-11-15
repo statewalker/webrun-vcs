@@ -30,7 +30,10 @@ describe("neutrality (dep-lint)", () => {
   }
 
   it("src imports only relative paths, node builtins, content-store and http-streams", () => {
-    const files = readdirSync(srcDir).filter((f) => f.endsWith(".ts"));
+    // recursive: the locking API lives in src/locks/
+    const files = (readdirSync(srcDir, { recursive: true }) as string[]).filter((f) =>
+      f.endsWith(".ts"),
+    );
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) {
       for (const spec of importsOf(path.join(srcDir, f))) {
