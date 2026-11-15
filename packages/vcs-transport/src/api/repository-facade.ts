@@ -57,6 +57,32 @@ export interface CommitGraphInfo {
   parents: string[];
   /** Committer time, seconds since the epoch */
   time: number;
+  /**
+   * The commit's root tree. receive-pack's connectivity check needs it (with
+   * {@link RepositoryFacade.getTreeEntries}) to verify the objects a pushed commit names.
+   */
+  tree?: string;
+}
+
+/** A git object type name. */
+export type GitObjectTypeName = "commit" | "tree" | "blob" | "tag";
+
+/** One entry of a tree object, as receive-pack's connectivity check reads it. */
+export interface TreeEntryInfo {
+  /** File mode, e.g. `0o100644`, `0o040000` (a tree), `0o160000` (a gitlink: not followed) */
+  mode: number;
+  /** Entry name */
+  name: string;
+  /** Object id of the blob, tree or (gitlink) commit */
+  id: string;
+}
+
+/** What an annotated tag points at. */
+export interface TagTargetInfo {
+  /** Id of the tagged object */
+  object: string;
+  /** Type of the tagged object */
+  type: GitObjectTypeName;
 }
 
 export interface RepositoryFacade {
@@ -160,6 +186,39 @@ export interface RepositoryFacade {
    * @returns true if oid is reachable from any tip
    */
   isReachableFromAnyTip?(oid: string): Promise<boolean>;
+
+  // receive-pack: connectivity and ref checks (optional)
+
+  /**
+   * The type of the object stored under `oid`, or undefined when it is absent. receive-pack
+   * uses it to refuse a branch that would point at a non-commit, and to start its
+   * connectivity walk from each pushed tip.
+   */
+  getObjectType?(oid: string): Promise<GitObjectTypeName | undefined>;
+
+  /**
+   * The entries of a tree, or undefined when `oid` is not a tree here (absent, or another
+   * type). With {@link CommitGraphInfo.tree} and {@link getTagInfo}, receive-pack walks the
+   * objects a push introduces (git's `check_connected`); without them it only checks that
+   * each new tip exists.
+   */
+  getTreeEntries?(oid: string): Promise<TreeEntryInfo[] | undefined>;
+
+  /** What an annotated tag points at, or undefined when `oid` is not a tag here. */
+  getTagInfo?(oid: string): Promise<TagTargetInfo | undefined>;
+
+  /**
+   * Whether the repository has no working tree. receive-pack refuses to update the checked
+   * out branch of a non-bare repository (git's `receive.denyCurrentBranch`). Absent: bare.
+   */
+  isBare?(): boolean | Promise<boolean>;
+
+  /**
+   * Record commits as shallow (git's `.git/shallow`). receive-pack calls it for a shallow
+   * push it accepted with `shallowUpdate` (git's `receive.shallowUpdate`); without it such a
+   * push is refused ("shallow update not allowed").
+   */
+  updateShallow?(oids: string[]): Promise<void>;
 
   // Shallow clone computation methods (optional)
 

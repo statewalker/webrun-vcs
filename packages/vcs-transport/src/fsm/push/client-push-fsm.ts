@@ -318,10 +318,13 @@ export const clientPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
         // Read status lines.
         // Use readPktLine() with manual channel demux for sideband,
-        // because readSideband() throws on flush packets.
+        // because readSideband() throws on flush packets. With side-band, channel 1
+        // carries the report as a pkt-line stream of its own (split anywhere across
+        // packets); an empty channel-1 packet is a keep-alive.
+        const lines: string[] = [];
+        let inner = new Uint8Array(0);
+        let innerDone = false;
         while (true) {
-          let line: string;
-
           const pkt = await transport.readPktLine();
           if (pkt.type === "flush" || pkt.type === "eof") break;
           if (pkt.type === "delim") continue;
@@ -332,23 +335,47 @@ export const clientPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             if (!payload || payload.length < 1) continue;
             const channel = payload[0];
             if (channel === 1) {
-              // Data channel
-              line = new TextDecoder().decode(payload.slice(1)).trim();
-            } else if (channel === 2) {
-              // Progress — ignore
-              continue;
+              if (innerDone || payload.length === 1) continue;
+              const joined = new Uint8Array(inner.length + payload.length - 1);
+              joined.set(inner);
+              joined.set(payload.subarray(1), inner.length);
+              inner = joined;
+              // take the complete inner pkt-lines
+              let pos = 0;
+              while (pos + 4 <= inner.length) {
+                const size = Number.parseInt(
+                  new TextDecoder().decode(inner.subarray(pos, pos + 4)),
+                  16,
+                );
+                if (Number.isNaN(size)) {
+                  innerDone = true;
+                  break;
+                }
+                if (size === 0) {
+                  innerDone = true;
+                  pos += 4;
+                  break;
+                }
+                if (pos + size > inner.length) break;
+                lines.push(new TextDecoder().decode(inner.subarray(pos + 4, pos + size)).trim());
+                pos += size;
+              }
+              inner = inner.slice(pos);
             } else if (channel === 3) {
               // Error channel
               output.error = new TextDecoder().decode(payload.slice(1));
               return "ERROR";
-            } else {
-              continue;
             }
+            // channel 2: progress, ignored
           } else {
-            line = pkt.text.trim();
+            const line = pkt.text.trim();
+            if (!line) break;
+            lines.push(line);
           }
+        }
 
-          if (!line) break;
+        for (const line of lines) {
+          if (!line) continue;
 
           // Parse status line
           if (line.startsWith("unpack ")) {

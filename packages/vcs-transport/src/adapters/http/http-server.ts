@@ -35,10 +35,16 @@ import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
 import { Fsm } from "../../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/server-v2-fsm.js";
 import { SERVER_V2_CAPABILITIES } from "../../fsm/protocol-v2/types.js";
-import { serverPushHandlers, serverPushTransitions } from "../../fsm/push/server-push-fsm.js";
+import type { ReceivePackHooks, ReceivePackLogger } from "../../fsm/push/receive-pack-types.js";
+import {
+  RECEIVE_PACK_CAPABILITIES,
+  serverPushHandlers,
+  serverPushTransitions,
+} from "../../fsm/push/server-push-fsm.js";
 import { ZERO_OID } from "../../protocol/constants.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
-import { createSimpleDuplex, readableStreamToAsyncIterable } from "./http-duplex.js";
+import { readStreamWithIdleTimeout } from "../../utils/idle-timeout.js";
+import { createSimpleDuplex } from "./http-duplex.js";
 
 /**
  * HTTP request information needed by handlers.
@@ -100,7 +106,67 @@ export interface HttpServerOptions {
   protocolV2?: boolean;
   /** Capabilities of the v2 advertisement (default {@link SERVER_V2_CAPABILITIES}) */
   v2Capabilities?: string[];
+  /** receive-pack (push) hooks, limits and ref policies */
+  receivePack?: ReceivePackServerOptions;
+  /** Logs hook failures that cannot reach the client (default: console.error) */
+  logger?: ReceivePackLogger;
 }
+
+/**
+ * receive-pack settings of the smart-HTTP server. The request body limit is
+ * {@link HttpServerOptions.maxRequestBodyBytes}.
+ *
+ * @example
+ * ```ts
+ * createFetchHandler({
+ *   resolveRepository,
+ *   receivePack: {
+ *     hooks: {
+ *       authorize: (_commands, ctx) =>
+ *         ctx.request?.headers.authorization === `Bearer ${token}` || "permission denied",
+ *       postReceive: (commands) => notify(commands),
+ *     },
+ *     maxCommands: 1000,
+ *   },
+ * });
+ * ```
+ */
+export interface ReceivePackServerOptions {
+  /**
+   * The hooks. A push `authorize` refuses as a whole is answered 403 before its body is read;
+   * `postReceive` starts once the report is written.
+   */
+  hooks?: ReceivePackHooks;
+  /** Most commands in one push; more is a 400 (default 65536) */
+  maxCommands?: number;
+  /**
+   * A request body that brings nothing for this long (ms) is abandoned: the push is answered
+   * `unpack request idle for … ms` (default {@link DEFAULT_RECEIVE_PACK_IDLE_TIMEOUT_MS}; 0: none)
+   */
+  idleTimeoutMs?: number;
+  /**
+   * Side-band keep-alive interval (ms) while a received push is checked (default 5000, as
+   * git's `receive.keepAlive`; 0: none)
+   */
+  keepAliveMs?: number;
+  /** Allow ref deletions (default true; false: "deletion prohibited" under refs/heads/) */
+  allowDeletes?: boolean;
+  /** Allow non-fast-forward branch updates (default false) */
+  allowNonFastForward?: boolean;
+  /** Whether the repository has no working tree (default: `repository.isBare()`, else true) */
+  bare?: boolean;
+  /** Refuse updating the checked-out branch of a non-bare repository (default true) */
+  denyCurrentBranch?: boolean;
+  /** Refuse deleting the branch HEAD names (default true) */
+  denyDeleteCurrent?: boolean;
+  /** The branch HEAD names (default: `refStore.getSymrefTarget("HEAD")`) */
+  currentBranch?: string;
+  /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
+  shallowUpdate?: boolean;
+}
+
+/** Default idle timeout of a POST /git-receive-pack body. */
+export const DEFAULT_RECEIVE_PACK_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Default request body limit of POST /git-upload-pack (git's `http.maxRequestBuffer`). */
 export const DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES = 10 * 1024 * 1024;
@@ -651,15 +717,7 @@ export async function handleReceivePackInfoRefs(
   chunks.push(encodeFlush());
 
   // Default capabilities for receive-pack
-  const capabilities = options.capabilities ?? [
-    "report-status",
-    "delete-refs",
-    "side-band-64k",
-    "quiet",
-    "atomic",
-    "ofs-delta",
-    "push-options",
-  ];
+  const capabilities = options.capabilities ?? RECEIVE_PACK_CAPABILITIES;
 
   // First ref with capabilities
   if (refs.length > 0) {
@@ -702,12 +760,21 @@ export async function handleReceivePackInfoRefs(
 /**
  * Handles POST /git-receive-pack
  *
- * Runs the push operation to receive pack data and update refs.
+ * Runs receive-pack over the request body and streams its answer. The commands are read
+ * first and handed to the `authorize` hook: until then a failure is an HTTP error (400 for a
+ * malformed request or too many commands, 403 for a push `authorize` refuses as a whole, 413
+ * for a body over the limit), and the pack is not read. Once the commands are authorized the
+ * response head goes out at once, before the pack is read, so a relay that bounds a call by
+ * its response head does not time out a long push; side-band keep-alive packets follow while
+ * the push is checked, then the report. From then on every failure is answered in band (an
+ * `unpack <error>` line for a pack that could not be read: over the limit, idle, corrupt).
+ * The `postReceive` hook starts once the report is written.
  *
  * @param request - HTTP request with body
  * @param repository - Repository facade for pack import
  * @param refStore - Ref store for reading/writing refs
  * @param options - Server options
+ * @param context - The repository path (for the hooks)
  * @returns HTTP response
  */
 export async function handleReceivePack(
@@ -715,113 +782,135 @@ export async function handleReceivePack(
   repository: RepositoryFacade,
   refStore: RefStore,
   options: HttpServerOptions = {},
+  context: { repoPath?: string } = {},
 ): Promise<HttpResponse> {
-  if (!request.body) {
-    return {
-      status: 400,
-      headers: { "Content-Type": "text/plain" },
-      body: textEncoder.encode("Missing request body"),
-    };
-  }
+  if (!request.body) return plain(400, "Missing request body");
 
-  const input = requestBody(
-    request,
-    request.body,
-    options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES,
-  );
+  const limit = options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES;
+  const input = requestBody(request, request.body, limit);
   if ("status" in input) return input;
+  const rp = options.receivePack ?? {};
 
   const state = new ProtocolState();
-
-  // Populate refs from refStore
-  const allRefs = await refStore.listAll();
-  for (const [refName, oid] of allRefs) {
+  for (const [refName, oid] of await refStore.listAll()) {
     state.refs.set(refName, oid);
   }
+  // state.capabilities stays empty: READ_COMMANDS takes the client's request from the first
+  // command (assuming a capability it did not ask for would misread the body)
 
-  // NOTE: Do NOT pre-populate state.capabilities here.
-  // The client's negotiated capabilities will be parsed from the first
-  // command line by the READ_COMMANDS FSM handler. Pre-populating would
-  // cause the FSM to assume capabilities the client didn't negotiate
-  // (e.g., push-options would make the FSM try to read push option
-  // pkt-lines even when the client sends raw pack data instead).
+  // An identity TransformStream with no readable buffer: each write waits for the reader
+  const pipe = new TransformStream<Uint8Array, Uint8Array>(
+    undefined,
+    { highWaterMark: 1 },
+    { highWaterMark: 0 },
+  );
+  const out = pipe.writable.getWriter();
+  // one reader for the whole body: a stalled read cancels it, a refused pack is drained
+  const body = readStreamWithIdleTimeout(
+    input.body,
+    rp.idleTimeoutMs ?? DEFAULT_RECEIVE_PACK_IDLE_TIMEOUT_MS,
+  );
+  const duplex = createSimpleDuplex(body, (data) => out.write(data));
 
-  // Collect response data
-  const responseChunks: Uint8Array[] = [];
-  const writer = (data: Uint8Array) => {
-    responseChunks.push(data);
-  };
-
-  // Create duplex from request body and response writer
-  const duplex = createSimpleDuplex(readableStreamToAsyncIterable(input.body), writer);
-  const transport = createTransportApi(duplex, state);
+  let authorized: (() => void) | undefined;
+  const onAuthorized = new Promise<"authorized">((resolve) => {
+    authorized = () => resolve("authorized");
+  });
+  const afterReport: Array<() => Promise<void>> = [];
 
   const config: ProcessConfiguration = {
     requestPolicy: options.requestPolicy ?? "ADVERTISED",
     maxEmptyBatches: 10,
-    allowDeletes: true,
-    allowNonFastForward: false,
+    allowDeletes: rp.allowDeletes ?? true,
+    allowNonFastForward: rp.allowNonFastForward ?? false,
+    denyCurrentBranch: rp.denyCurrentBranch ?? true,
+    currentBranch: rp.currentBranch,
+    receivePack: {
+      hooks: rp.hooks,
+      maxCommands: rp.maxCommands,
+      keepAliveMs: rp.keepAliveMs,
+      bare: rp.bare,
+      denyDeleteCurrent: rp.denyDeleteCurrent,
+      shallowUpdate: rp.shallowUpdate,
+      logger: options.logger,
+      request: {
+        method: request.method,
+        path: request.path,
+        query: request.query,
+        headers: request.headers,
+      },
+      repoPath: context.repoPath,
+      // a push refused as a whole is a 403, its body unread
+      authorizeFailure: "fatal",
+      // a pack refused once the head is out is read and dropped (at most the body limit):
+      // a client cut off mid-upload would never see the report
+      drainRefusedPack: true,
+      discardPack: () => body.discard(),
+      onAuthorized: () => authorized?.(),
+      afterReport: (task) => afterReport.push(task),
+    },
   };
 
   const ctx: AdapterProcessContext = {};
-  setTransport(ctx, transport);
+  setTransport(ctx, createTransportApi(duplex, state));
   setRepository(ctx, repository);
   setRefStore(ctx, refStore);
   setState(ctx, state);
   setOutput(ctx, new HandlerOutput());
   setConfig(ctx, config);
 
-  // Run server push FSM starting from READ_COMMANDS state
-  // (ref advertisement was already sent in GET /info/refs)
+  // The ref advertisement was sent by GET /info/refs: start at the commands
   const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
   fsm.setState("READ_COMMANDS");
+  const run: Promise<{ thrown?: unknown }> = fsm.run(ctx).then(
+    () => ({}),
+    (thrown: unknown) => ({ thrown }),
+  );
 
-  try {
-    await fsm.run(ctx);
-    // the pack was cut at the limit: nothing of it is applied, the push is refused
-    if (input.tooLarge()) {
-      const limit = options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES;
-      return plain(413, new RequestBodyTooLargeError(limit).message);
-    }
-
-    // Only return 500 if the FSM errored without producing a proper
-    // protocol response (e.g., it never reached SEND_STATUS).
-    // When SEND_STATUS runs, responseChunks will contain pkt-line data
-    // even if earlier stages (like UNPACK) set output.error.
+  const first = await Promise.race([run.then(() => "finished" as const), onAuthorized]);
+  if (first === "finished") {
+    // nothing was written: the answer is still an HTTP status
+    const { thrown } = await run;
     const output = getOutput(ctx);
-    if (output.error && responseChunks.length === 0) {
-      return {
-        status: 500,
-        headers: { "Content-Type": "text/plain" },
-        body: textEncoder.encode(output.error),
-      };
+    const error = thrown ?? (output.error ? new Error(output.error) : undefined);
+    await out.abort().catch(() => {});
+    if (input.tooLarge()) return plain(413, new RequestBodyTooLargeError(limit).message);
+    if (output.authorizationDenied !== undefined) return plain(403, output.authorizationDenied);
+    if (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return plain(output.protocolError ? 400 : 500, message);
     }
-
-    // Concatenate response chunks
-    const totalLength = responseChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const body = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of responseChunks) {
-      body.set(chunk, offset);
-      offset += chunk.length;
-    }
-
+    // no commands: an empty answer, as git's receive-pack
     return {
       status: 200,
-      headers: {
-        "Content-Type": "application/x-git-receive-pack-result",
-        ...NO_CACHE_HEADERS,
-      },
-      body,
-    };
-  } catch (error) {
-    if (input.tooLarge()) return plain(413, String(error));
-    return {
-      status: 500,
-      headers: { "Content-Type": "text/plain" },
-      body: textEncoder.encode(error instanceof Error ? error.message : String(error)),
+      headers: { "Content-Type": "application/x-git-receive-pack-result", ...NO_CACHE_HEADERS },
+      body: new Uint8Array(0),
     };
   }
+
+  void run.then(async ({ thrown }) => {
+    const output = getOutput(ctx);
+    const reported = (state as ProtocolState & { reportSent?: boolean }).reportSent === true;
+    if (thrown !== undefined || (output.error && !reported)) {
+      // the status is out and no report could be written: break the response
+      const error = thrown ?? new Error(output.error);
+      options.logger?.error("receive-pack failed", error);
+      await out.abort(error).catch(() => {});
+      return;
+    }
+    await out.close().catch(() => {});
+    // git's post-receive: once the report is written, apart from the response
+    for (const task of afterReport) setTimeout(() => void task(), 0);
+  });
+
+  return {
+    status: 200,
+    headers: {
+      "Content-Type": "application/x-git-receive-pack-result",
+      ...NO_CACHE_HEADERS,
+    },
+    body: pipe.readable,
+  };
 }
 
 /**
@@ -904,6 +993,8 @@ export interface HttpHandlerOptions {
   protocolV2?: boolean;
   /** Capabilities of the v2 advertisement (see {@link HttpServerOptions.v2Capabilities}) */
   v2Capabilities?: string[];
+  /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
+  receivePack?: ReceivePackServerOptions;
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -944,6 +1035,7 @@ export function createHttpHandler(
     maxRequestBodyBytes,
     protocolV2,
     v2Capabilities,
+    receivePack,
     logger,
   } = options;
 
@@ -965,6 +1057,8 @@ export function createHttpHandler(
       maxRequestBodyBytes,
       protocolV2,
       v2Capabilities,
+      receivePack,
+      logger,
     };
     // git has no v2 push: receive-pack is v0 whatever the client asks
     const v2 = parsed.service === "git-upload-pack" && isProtocolV2Request(request, serverOptions);
@@ -1034,7 +1128,9 @@ export function createHttpHandler(
         if (parsed.service === "git-upload-pack") {
           return await handleUploadPack(request, repository, refStore, uploadPackOptions);
         } else {
-          return await handleReceivePack(request, repository, refStore, serverOptions);
+          return await handleReceivePack(request, repository, refStore, serverOptions, {
+            repoPath: parsed.repoPath,
+          });
         }
       }
     } catch (err) {
@@ -1064,6 +1160,8 @@ export interface GitHttpServerOptions {
   protocolV2?: boolean;
   /** Capabilities of the v2 advertisement (see {@link HttpServerOptions.v2Capabilities}) */
   v2Capabilities?: string[];
+  /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
+  receivePack?: ReceivePackServerOptions;
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -1110,6 +1208,7 @@ export function createGitHttpServer(options: GitHttpServerOptions): GitHttpServe
     maxRequestBodyBytes: options.maxRequestBodyBytes,
     protocolV2: options.protocolV2,
     v2Capabilities: options.v2Capabilities,
+    receivePack: options.receivePack,
     logger: options.logger,
   });
 

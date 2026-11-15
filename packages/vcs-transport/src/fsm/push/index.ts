@@ -3,5 +3,7 @@
  */
 
 export * from "./client-push-fsm.js";
+export * from "./connectivity.js";
+export * from "./receive-pack-types.js";
 export * from "./server-push-fsm.js";
 export * from "./types.js";

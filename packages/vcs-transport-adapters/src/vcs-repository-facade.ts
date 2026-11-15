@@ -10,10 +10,21 @@ import { isSymbolicRef, serializeCommit, serializeTag, serializeTree } from "@st
 import type {
   CommitGraphInfo,
   ExportPackOptions,
+  GitObjectTypeName,
   PackImportResult,
   RepositoryFacade,
+  TagTargetInfo,
+  TreeEntryInfo,
 } from "@statewalker/vcs-transport";
 import { toArray } from "@statewalker/vcs-utils/streams";
+
+/** git's object type names by type code. */
+const OBJECT_TYPE_NAMES: Record<number, GitObjectTypeName> = {
+  1: "commit",
+  2: "tree",
+  3: "blob",
+  4: "tag",
+};
 
 /**
  * Configuration for VcsRepositoryFacade using History facade
@@ -23,6 +34,11 @@ export interface VcsRepositoryFacadeConfig {
   history: History;
   /** Serialization API for pack operations */
   serialization: SerializationApi;
+  /**
+   * Whether the repository has no working tree (default true). receive-pack refuses to
+   * update the checked-out branch of a non-bare one ("branch is currently checked out").
+   */
+  bare?: boolean;
 }
 
 /**
@@ -34,10 +50,17 @@ export interface VcsRepositoryFacadeConfig {
 export class VcsRepositoryFacade implements RepositoryFacade {
   private readonly history: History;
   private readonly serialization: SerializationApi;
+  private readonly bare: boolean;
 
   constructor(config: VcsRepositoryFacadeConfig) {
     this.history = config.history;
     this.serialization = config.serialization;
+    this.bare = config.bare ?? true;
+  }
+
+  /** Whether the repository has no working tree (receive-pack's current-branch rule). */
+  isBare(): boolean {
+    return this.bare;
   }
 
   /**
@@ -149,7 +172,43 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
     const commit = await this.history.commits.load(oid);
     if (!commit) return undefined;
-    return { parents: commit.parents, time: commit.committer.timestamp };
+    return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+  }
+
+  /**
+   * The entries of a tree (receive-pack's connectivity check), undefined when not a tree.
+   */
+  async getTreeEntries(oid: string): Promise<TreeEntryInfo[] | undefined> {
+    try {
+      const tree = await this.history.trees.load(oid);
+      if (!tree) return undefined;
+      return (await toArray(tree)).map((e) => ({ mode: e.mode, name: e.name, id: e.id }));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * What an annotated tag points at, undefined when not a tag.
+   */
+  async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {
+    try {
+      const tag = await this.history.tags.load(oid);
+      if (!tag) return undefined;
+      return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The object's type (receive-pack checks branch tips are commits), undefined when absent.
+   */
+  async getObjectType(oid: string): Promise<GitObjectTypeName | undefined> {
+    if (await this.history.commits.load(oid)) return "commit";
+    if (await this.getTagInfo(oid)) return "tag";
+    if ((await this.getTreeEntries(oid)) !== undefined) return "tree";
+    return (await this.history.blobs.has(oid)) ? "blob" : undefined;
   }
 
   /**

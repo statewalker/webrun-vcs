@@ -242,7 +242,29 @@ console.log(result.updatedRefs, result.objectsImported);
 
 Over a `MessagePort`, wrap each end with `createMessagePortDuplex(port)`. Call `fetchOverDuplex` or `pushOverDuplex` on one side and `serveOverDuplex` on the other. `messagePortFetch(port, repository, refStore, options)` and `messagePortServe(port, repository, refStore, options)` do this in one call.
 
-`serveOverDuplex` options: `duplex`, `repository`, `refStore`, `service` (`"git-upload-pack"` by default, or `"git-receive-pack"`), `allowDeletes`, `allowNonFastForward`, `denyCurrentBranch`, `currentBranch`, `capabilities`, `protocolVersion` (`"1"` or `"2"`; v2 applies to upload-pack only).
+`serveOverDuplex` options: `duplex`, `repository`, `refStore`, `service` (`"git-upload-pack"` by default, or `"git-receive-pack"`), `allowDeletes`, `allowNonFastForward`, `denyCurrentBranch`, `currentBranch`, `capabilities`, `protocolVersion` (`"1"` or `"2"`; v2 applies to upload-pack only), and for receive-pack `hooks`, `maxCommands`, `keepAliveMs`, `idleTimeoutMs`, `bare`, `denyDeleteCurrent`, `shallowUpdate`, `logger`.
+
+### Receiving pushes
+
+```typescript
+const handleGit = createFetchHandler({
+  resolveRepository,
+  receivePack: {
+    hooks: {
+      // before the pack is read: a refusal of the whole push is a 403, the body unread
+      authorize: (commands, ctx) =>
+        ctx.request?.headers.authorization === `Bearer ${token}` || "permission denied",
+      // once per ref: "ng <ref> hook declined" for this ref only (all of them when atomic)
+      update: (refName) => (refName === "refs/heads/release" ? "release is frozen" : undefined),
+      // after the report went out, detached: it cannot change the outcome
+      postReceive: (commands) => notifyCi(commands),
+    },
+    maxCommands: 1000,
+  },
+});
+```
+
+receive-pack follows git's `receive-pack.c`. The order is: read the commands (and a shallow client's `shallow` lines) and push options, `authorize`, read and import the pack, check connectivity, `preReceive`, check each command (git's `update()`, then the `update` hook), apply the refs in a ref transaction, write the report, start `postReceive`. The connectivity check (`checkConnectivity`, git's `check_connected`) walks from every new tip down to what the existing refs reach and verifies that each commit, tree, blob and tag it names is present; a tip that fails gets `ng <ref> missing necessary objects` while the other refs go on. It needs the facade's `getObjectType`, `getTreeEntries`, `getTagInfo` and `CommitGraphInfo.tree` (`createRepositoryFacade` has them); without them only each tip's presence is checked. The report texts are git's: `funny refname`, `failed to update ref` (a stale old value, a branch pointing at a non-commit, the same ref twice), `deletion of the current branch prohibited`, `branch is currently checked out` (a non-bare repository: `bare: false`), `non-fast-forward`, `shallow update not allowed` (unless `shallowUpdate` and the facade's `updateShallow`), `pre-receive hook declined`, `hook declined`, `unpacker error`; deleting a ref that does not exist is `ok`. With side-band, git's `error:` explanations and hook messages go to channel 2, `Checking connectivity: N, done.` too unless the client asked `quiet`, and keep-alive packets follow every `keepAliveMs` (5 s) while a received push is checked. Over smart HTTP the response head goes out as soon as the commands are authorized, so a relay that bounds a call by its first byte does not time out a long push; before that a malformed request or too many commands is a 400, an oversized body a 413, a refused push a 403; after it every failure is reported in band (an over-limit or idle body is `unpack request body larger than … bytes` / `unpack request idle for … ms`). report-status-v2 is not advertised.
 
 ### Peer-to-peer sync
 

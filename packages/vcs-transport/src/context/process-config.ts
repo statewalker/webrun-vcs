@@ -1,3 +1,5 @@
+import type { ReceivePackConfig } from "../fsm/push/receive-pack-types.js";
+
 /**
  * Configuration options for FSM execution.
  *
@@ -104,7 +106,8 @@ export class ProcessConfiguration {
   allowNonFastForward?: boolean;
 
   /**
-   * Whether to deny updates to the currently checked-out branch.
+   * Whether to deny updates to the currently checked-out branch of a non-bare repository
+   * ("branch is currently checked out", git's `receive.denyCurrentBranch`).
    * @default true
    */
   denyCurrentBranch?: boolean;
@@ -114,6 +117,9 @@ export class ProcessConfiguration {
    * Used with denyCurrentBranch to prevent updates.
    */
   currentBranch?: string;
+
+  /** receive-pack hooks, limits and driver integration */
+  receivePack?: ReceivePackConfig;
 
   // Protocol V2 configuration
 
