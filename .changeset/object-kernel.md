@@ -1,7 +1,6 @@
 ---
 "@statewalker/vcs-core": minor
 "@statewalker/vcs-store-files": minor
-"@statewalker/vcs-testing": minor
 "@statewalker/vcs-utils": patch
 ---
 

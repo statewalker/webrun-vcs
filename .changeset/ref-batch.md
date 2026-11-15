@@ -4,7 +4,6 @@
 "@statewalker/vcs-store-kv": minor
 "@statewalker/vcs-store-sql": minor
 "@statewalker/vcs-store-files": patch
-"@statewalker/vcs-testing": minor
 ---
 
 **New (vcs-core):** `Refs.batch(commands, options?)` applies ref updates atomically: all of them or none. It follows `git update-ref --stdin`'s rules:

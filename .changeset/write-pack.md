@@ -4,7 +4,6 @@
 "@statewalker/vcs-transport-adapters": minor
 "@statewalker/vcs-commands": minor
 "@statewalker/vcs-store-files": patch
-"@statewalker/vcs-testing": minor
 ---
 
 **Breaking: one streaming pack writer, `writePack`, and `listObjects` to feed it.**

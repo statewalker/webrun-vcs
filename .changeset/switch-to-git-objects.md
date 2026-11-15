@@ -5,7 +5,6 @@
 "@statewalker/vcs-store-kv": major
 "@statewalker/vcs-store-sql": major
 "@statewalker/vcs-transport-adapters": major
-"@statewalker/vcs-testing": major
 ---
 
 **Breaking: every store reads and writes objects through the object kernel (`GitObjects`).**

@@ -6,7 +6,6 @@
 "@statewalker/vcs-store-mem": patch
 "@statewalker/vcs-working-tree": minor
 "@statewalker/vcs-commands": patch
-"@statewalker/vcs-testing": minor
 "@statewalker/vcs-utils": minor
 ---
 
