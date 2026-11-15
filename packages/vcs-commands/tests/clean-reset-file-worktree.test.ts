@@ -96,6 +96,23 @@ async function initRepo(workingCopy: WorkingCopy): Promise<void> {
 }
 
 describe("clean / reset --hard on a real FileWorktree", () => {
+  it("clean skips untracked names that spell .git and still cleans the rest", async () => {
+    const files = createInMemoryFilesApi();
+    const workingCopy = createFileBackedWorkingCopy(files);
+    const git = Git.fromWorkingCopy(workingCopy);
+    await initRepo(workingCopy);
+
+    await putFile(files, "git~1", "short name");
+    await putFile(files, "junk.log", "untracked garbage");
+
+    const result = await git.clean().setDryRun(false).call();
+
+    expect(await hasFile(files, "junk.log")).toBe(false);
+    // Refused by the worktree (git's verify_path): left in place and not reported as cleaned.
+    expect(await hasFile(files, "git~1")).toBe(true);
+    expect(result.cleaned.has("git~1")).toBe(false);
+  });
+
   it("clean with dryRun:false should delete the untracked file from the filesystem", async () => {
     const files = createInMemoryFilesApi();
     const workingCopy = createFileBackedWorkingCopy(files);
