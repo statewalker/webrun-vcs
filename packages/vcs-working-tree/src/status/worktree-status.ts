@@ -65,27 +65,27 @@ function sameType(a: number, b: number): boolean {
 /** Times in whole milliseconds: the index and the filesystem may keep fractions differently. */
 const ms = (t: number | undefined) => Math.floor(t ?? 0);
 
+/** Whole seconds of a time in milliseconds. */
+const seconds = (t: number | undefined) => Math.floor(ms(t) / 1000);
+
 /**
- * Whether a time the index recorded matches the file's. An index written by a git built
- * without nanosecond support (or on a filesystem with whole-second times) keeps no
- * fraction: then only whole seconds are compared, as that git compares them.
+ * Whether a time the index recorded matches the file's, compared in whole seconds as git
+ * compares them in its default build (without USE_NSEC). The fraction the index keeps is not
+ * reliable: writers record it differently (a time set through utimes can come back a few
+ * nanoseconds off), so comparing it would make unchanged files look changed. A same-size
+ * edit within the same second is caught by the racy check instead, as in git.
  */
 function sameTime(recorded: number | undefined, current: number | undefined): boolean {
-  const r = ms(recorded);
-  const c = ms(current);
-  if (r % 1000 === 0) return Math.floor(r / 1000) === Math.floor(c / 1000);
-  return r === c;
+  return seconds(recorded) === seconds(current);
 }
 
 /**
- * Racy git: an entry not older than the index file may hide a same-size change. Compared in
- * whole seconds when the entry keeps no fraction, as git does for such an index.
+ * Racy git: an entry whose mtime is not older than the index file (in whole seconds, as
+ * git's default build compares them) may hide a same-size change, so its content is checked.
  */
 function isRacy(recorded: number | undefined, indexTime: number): boolean {
   if (indexTime === 0) return true;
-  const r = ms(recorded);
-  if (r % 1000 === 0) return Math.floor(r / 1000) >= Math.floor(ms(indexTime) / 1000);
-  return r >= ms(indexTime);
+  return seconds(recorded) >= seconds(indexTime);
 }
 
 /**

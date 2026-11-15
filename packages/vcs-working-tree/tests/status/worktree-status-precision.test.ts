@@ -62,11 +62,28 @@ describe("compareWithWorktree with whole-second index times", () => {
     expect(computeHash).toHaveBeenCalledTimes(1);
   });
 
-  it("compares in milliseconds when the index kept a fraction", async () => {
+  it("ignores a fraction recorded a few nanoseconds off (seen with git 2.56.1 on CI)", async () => {
+    // the index kept mtime .724000000 for a file whose filesystem time is .723999977
+    const second = 1_794_774_513_000;
+    const { worktree, computeHash } = worktreeWith({
+      size: 2,
+      mtime: second + 723.999977,
+      ctime: second + 120_723.492678,
+    });
+    const result = await compareWithWorktree(
+      worktree,
+      { ...entry({ mtime: second + 724, ctime: second + 120_723.492678 }), size: 2 },
+      { indexTime: second + 120_789 },
+    );
+    expect(result.kind).toBeUndefined();
+    expect(computeHash).not.toHaveBeenCalled();
+  });
+
+  it("re-hashes an entry modified in the same second as the index, whatever its fraction", async () => {
     const second = 1_700_000_000_000;
-    const { worktree, computeHash } = worktreeWith({ size: 6, mtime: second + 438 });
+    const { worktree, computeHash } = worktreeWith({ size: 6, mtime: second + 437 });
     await compareWithWorktree(worktree, entry({ mtime: second + 437 }), {
-      indexTime: second + 60_000,
+      indexTime: second + 900,
     });
     expect(computeHash).toHaveBeenCalledTimes(1);
   });
