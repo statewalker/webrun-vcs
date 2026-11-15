@@ -1,0 +1,17 @@
+# gitleaks configuration for the secret scan in CI (statewalker/statewalker-ci, `secret-scan`).
+# The default rules apply; the allowlist below only removes false positives.
+
+[extend]
+useDefault = true
+
+# A Git implementation's code, tests and fixtures are full of object ids: 40 (SHA-1) or 64
+# (SHA-256) lowercase hex digits, such as `const key = "b45ef6fe…"` in vcs-testing's raw-store
+# suite, which `generic-api-key` reports for their entropy. An object id is a content hash, not a
+# credential. The trade-off: a raw random secret of exactly that shape (`openssl rand -hex 20` or
+# `-hex 32`) is no longer reported by `generic-api-key`; prefixed tokens (ghp_, AKIA, ...) still
+# are, by their own rules.
+[[allowlists]]
+description = "Git object ids (SHA-1 and SHA-256 hex)"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{40}$''', '''^[0-9a-f]{64}$''']

@@ -10,6 +10,10 @@ jobs:
     uses: statewalker/statewalker-ci/.github/workflows/ci.yml@main
     with:
       release-path: true
+      # publint and attw (profile esm-only) on every packed public package.
+      package-checks: true
+      # gitleaks over the files and the pull request's commits; false positives in .gitleaks.toml.
+      secret-scan: true
       # Required root scripts, and every test file typechecked (root typecheck:tests).
       baseline: library
 

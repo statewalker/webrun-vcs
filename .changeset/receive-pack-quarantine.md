@@ -4,7 +4,6 @@
 "@statewalker/vcs-store-sql": minor
 "@statewalker/vcs-transport": minor
 "@statewalker/vcs-transport-adapters": minor
-"@statewalker/vcs-testing": minor
 ---
 
 **Breaking: receive-pack quarantines a pushed pack until the push is accepted (git's `tmp_objdir`).**
