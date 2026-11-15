@@ -16,6 +16,9 @@ jobs:
       secret-scan: true
       # Required root scripts, and every test file typechecked (root typecheck:tests).
       baseline: library
+      # Fails a breaking API change (against npm's latest) that no changeset or version bump
+      # declares: minor on 0.x, major from 1.0.
+      api-diff: true
 
   # The lockfile-only pull request that .github/workflows/statewalker-update.yml opens: merged
   # once every other check on it passes, after checking it changes pnpm-lock.yaml alone
