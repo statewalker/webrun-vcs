@@ -59,10 +59,10 @@ catalogs:
       version: 0.6.0
     '@statewalker/webrun-msgpack':
       specifier: ^0.11.0
-      version: 0.11.0
+      version: 0.11.1
     '@statewalker/webrun-rpc':
       specifier: ^0.12.0
-      version: 0.12.0
+      version: 0.12.1
     '@statewalker/webrun-storage':
       specifier: ^0.2.0
       version: 0.2.2
@@ -421,10 +421,10 @@ importers:
         version: link:../../../packages/vcs-working-tree
       '@statewalker/webrun-msgpack':
         specifier: 'catalog:'
-        version: 0.11.0
+        version: 0.11.1
       '@statewalker/webrun-rpc':
         specifier: 'catalog:'
-        version: 0.12.0
+        version: 0.12.1
       '@statewalker/webrun-streams':
         specifier: 'catalog:'
         version: 0.4.0
@@ -519,10 +519,10 @@ importers:
         version: 0.11.0
       '@statewalker/webrun-msgpack':
         specifier: 'catalog:'
-        version: 0.11.0
+        version: 0.11.1
       '@statewalker/webrun-rpc':
         specifier: 'catalog:'
-        version: 0.12.0
+        version: 0.12.1
       '@statewalker/webrun-streams':
         specifier: 'catalog:'
         version: 0.4.0
@@ -2812,11 +2812,11 @@ packages:
   '@statewalker/webrun-merge@0.2.2':
     resolution: {integrity: sha512-Sl/WDSR5KbXxCbHUEYYHh18lPA6NlXEnU5d7ytierG4inU++dYaGbOwZ43P/X5yWYNzBfy4Odx8Q3+55hxtuvQ==}
 
-  '@statewalker/webrun-msgpack@0.11.0':
-    resolution: {integrity: sha512-ehkuqUGK8JhV/hPGDcnmfcyFpRDliJdgbtESklvNOi8o4VRrp2bbc6TC//CF3K6e+pVRzNlzsaSq0je2ks4QJQ==}
+  '@statewalker/webrun-msgpack@0.11.1':
+    resolution: {integrity: sha512-IFTrH0bfns55AG8g7Bi9z/++67ZULXEtnpwCGb/MChHh7sQJcFN+qMeB8VsVRF5fAIlGCBaTKTrDHmDzZm9Bbw==}
 
-  '@statewalker/webrun-rpc@0.12.0':
-    resolution: {integrity: sha512-RPhB6tiY8aQQBsLk1BJAMbjDDWwqzlG18PnpWCJPlg+Mhw7TPssM/xrM3FqBoVfkQdieFLpiCt8+xDwDDZ9JuQ==}
+  '@statewalker/webrun-rpc@0.12.1':
+    resolution: {integrity: sha512-Zg3iOfMjsL4tc6UTyy7yeBBpk46IP/wZLWpvLkv2Frlfmn+k6ef+TgcefHEgozZCVQEFF8h1fJEBNv3Ka2xzKg==}
 
   '@statewalker/webrun-storage@0.2.2':
     resolution: {integrity: sha512-O14peslfjR0XV09jAdKkHNp9p5mnslkLVL3oLqqKHe9J0x9FLntQgZn9FZht/bguDqJzPGj7udOhf4qfjhGAXQ==}
@@ -6466,11 +6466,11 @@ snapshots:
     dependencies:
       '@statewalker/webrun-files': 0.10.5
 
-  '@statewalker/webrun-msgpack@0.11.0':
+  '@statewalker/webrun-msgpack@0.11.1':
     dependencies:
-      '@statewalker/webrun-rpc': 0.12.0
+      '@statewalker/webrun-rpc': 0.12.1
 
-  '@statewalker/webrun-rpc@0.12.0':
+  '@statewalker/webrun-rpc@0.12.1':
     dependencies:
       '@statewalker/webrun-streams': 0.4.0
 
