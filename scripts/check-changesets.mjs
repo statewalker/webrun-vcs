@@ -39,7 +39,7 @@ for (const file of files) {
   const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
   if (!match) continue;
   for (const line of match[1].split(/\r?\n/)) {
-    const entry = /^\s*["']?([^"':]+)["']?\s*:\s*(\w+)\s*$/.exec(line);
+    const entry = /^\s*["']?([^"':]+)["']?\s*:\s*["']?(\w+)["']?\s*$/.exec(line);
     if (!entry) continue;
     const name = entry[1].trim();
     const pkg = packages.get(name);
