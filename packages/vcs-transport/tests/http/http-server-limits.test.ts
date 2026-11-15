@@ -197,11 +197,13 @@ describe("smart-HTTP server: wants and capabilities", () => {
     expect(plain).not.toContain("allow-reachable-sha1-in-want");
 
     const reachable = defaultUploadPackCapabilities("REACHABLE_COMMIT", {
-      computeShallowSince: () => {},
+      getCommitInfo: () => {},
     });
     expect(reachable).toContain("allow-reachable-sha1-in-want");
     expect(reachable).not.toContain("allow-tip-sha1-in-want");
     expect(reachable).toContain("deepen-since");
+    expect(reachable).toContain("deepen-not");
+    expect(reachable).toContain("deepen-relative");
   });
 });
 

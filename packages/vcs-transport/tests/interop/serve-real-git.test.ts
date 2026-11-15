@@ -10,12 +10,12 @@
  * `git rev-list --count`, and "not our ref" for a want no ref reaches.
  */
 
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { serveOverDuplex } from "../../src/index.js";
 import {
@@ -41,22 +41,36 @@ const GIT_ENV = {
   GIT_TERMINAL_PROMPT: "0",
 };
 
+/** Per-test timeout; each git call is killed well before it. */
+const TEST_TIMEOUT = 60000;
+const GIT_TIMEOUT = 20000;
+
+/** git processes still running (killed after each test). */
+const children = new Set<ChildProcess>();
+
 /** Runs git without blocking the event loop (our server answers in this process). */
 function gitAsync(
   cwd: string,
   args: string[],
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    execFile(
+    const child = execFile(
       "git",
       args,
-      { cwd, env: { ...process.env, ...GIT_ENV }, timeout: 30000 },
+      { cwd, env: { ...process.env, ...GIT_ENV }, timeout: GIT_TIMEOUT, killSignal: "SIGKILL" },
       (error, stdout, stderr) => {
+        children.delete(child);
         const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
         resolve({ code, stdout: stdout.trim(), stderr });
       },
     );
+    children.add(child);
   });
+}
+
+/** A word for `sh -c` (git runs `--upload-pack` through the shell). */
+function shellQuote(word: string): string {
+  return `'${word.replace(/'/g, "'\\''")}'`;
 }
 
 async function gitOk(cwd: string, args: string[]): Promise<string> {
@@ -72,7 +86,11 @@ const socket = net.connect(Number(process.argv[2]), "127.0.0.1", () => {
   process.stdin.pipe(socket);
   socket.pipe(process.stdout);
 });
-socket.on("close", () => process.exit(0));
+// exit once everything relayed reached git: end stdout, exit when it is flushed
+socket.on("close", () => {
+  process.stdout.on("finish", () => process.exit(0));
+  process.stdout.end();
+});
 socket.on("error", () => process.exit(1));
 `;
 
@@ -167,7 +185,12 @@ describeGit("Interop · real git client ← our upload-pack", () => {
     const port = (server.address() as AddressInfo).port;
     const relay = join(root, "relay.mjs");
     writeFileSync(relay, RELAY);
-    uploadPack = `${process.execPath} ${relay} ${port}`;
+    uploadPack = `${shellQuote(process.execPath)} ${shellQuote(relay)} ${port}`;
+  });
+
+  afterEach(() => {
+    for (const child of children) child.kill("SIGKILL");
+    children.clear();
   });
 
   afterAll(async () => {
@@ -201,7 +224,7 @@ describeGit("Interop · real git client ← our upload-pack", () => {
     expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("4");
     expect(existsSync(join(dst, "shallow"))).toBe(false);
     await gitOk(dst, ["fsck", "--no-dangling"]);
-  });
+  }, TEST_TIMEOUT);
 
   it("protocol v0: --depth 2 clone has two commits", async () => {
     const dst = join(root, "v0.git");
@@ -218,7 +241,7 @@ describeGit("Interop · real git client ← our upload-pack", () => {
     ]);
     expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("2");
     expect(readFileSync(join(dst, "shallow"), "utf8").trim()).toBe(commits[2]);
-  });
+  }, TEST_TIMEOUT);
 
   it("protocol v2: a want no ref reaches is 'not our ref'; a reachable commit is served", async () => {
     const dst = join(root, "want.git");
@@ -231,5 +254,50 @@ describeGit("Interop · real git client ← our upload-pack", () => {
 
     await gitOk(dst, [...fetch, `${commits[1]}:refs/heads/old`]);
     expect(await gitOk(dst, ["rev-list", "--count", "old"])).toBe("2");
-  });
+  }, TEST_TIMEOUT);
+
+  it("protocol v0: --depth 2 clone, then --depth=3, then --unshallow", async () => {
+    const dst = join(root, "v0-deepen.git");
+    await gitOk(root, [
+      "-c",
+      "protocol.version=0",
+      "clone",
+      "--bare",
+      "--depth",
+      "2",
+      `--upload-pack=${uploadPack}`,
+      url,
+      dst,
+    ]);
+    expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("2");
+
+    const fetch = ["-c", "protocol.version=0", "fetch", `--upload-pack=${uploadPack}`];
+    await gitOk(dst, [...fetch, "--depth=3", url, "refs/heads/main:refs/heads/main"]);
+    expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("3");
+    expect(readFileSync(join(dst, "shallow"), "utf8").trim()).toBe(commits[1]);
+
+    await gitOk(dst, [...fetch, "--unshallow", url, "refs/heads/main:refs/heads/main"]);
+    expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("4");
+    expect(existsSync(join(dst, "shallow"))).toBe(false);
+    await gitOk(dst, ["fsck", "--no-dangling"]);
+  }, TEST_TIMEOUT);
+
+  it("protocol v0: a shallow clone fetches without deepening", async () => {
+    const dst = join(root, "v0-plain.git");
+    await gitOk(root, [
+      "-c",
+      "protocol.version=0",
+      "clone",
+      "--bare",
+      "--depth",
+      "1",
+      `--upload-pack=${uploadPack}`,
+      url,
+      dst,
+    ]);
+    await gitOk(dst, ["update-ref", "-d", "refs/heads/main"]);
+    const fetch = ["-c", "protocol.version=0", "fetch", `--upload-pack=${uploadPack}`];
+    await gitOk(dst, [...fetch, url, "refs/heads/main:refs/heads/main"]);
+    expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("1");
+  }, TEST_TIMEOUT);
 });

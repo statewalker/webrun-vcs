@@ -17,6 +17,7 @@
  */
 
 import type { CommitGraphInfo, RepositoryFacade } from "../../api/repository-facade.js";
+import type { RefStore } from "../../context/process-context.js";
 
 /** The depth `git fetch --unshallow` asks for (git's INFINITE_DEPTH). */
 export const INFINITE_DEPTH = 0x7fffffff;
@@ -428,4 +429,27 @@ async function reachableAmong(
     if (commit) stack.push(...commit.parents);
   }
   return found;
+}
+
+/**
+ * A `deepen-not` ref, expanded as git's `expand_ref` (the name, refs/<name>, tags, heads,
+ * remotes, a remote's HEAD); undefined unless exactly one ref matches (git: "ambiguous").
+ */
+export async function resolveDeepenNot(
+  refStore: Pick<RefStore, "get">,
+  name: string,
+): Promise<string | undefined> {
+  const found: string[] = [];
+  for (const candidate of [
+    name,
+    `refs/${name}`,
+    `refs/tags/${name}`,
+    `refs/heads/${name}`,
+    `refs/remotes/${name}`,
+    `refs/remotes/${name}/HEAD`,
+  ]) {
+    const oid = await refStore.get(candidate);
+    if (oid) found.push(oid);
+  }
+  return found.length === 1 ? found[0] : undefined;
 }

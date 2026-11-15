@@ -129,43 +129,50 @@ describe("Upload-Pack: Shallow Clone Support", () => {
     const state = getState(ctx);
     state.wants.add(randomOid());
     state.deepenRequest = "deepen 2";
+    state.deepen = 2;
 
     const event = await runHandler("COMPUTE_SHALLOW", ctx);
     expect(event).toBe("SHALLOW_COMPUTED");
     expect(state.serverShallow?.has(boundary)).toBe(true);
-    expect(repository.computeShallowBoundaries).toHaveBeenCalled();
+    // a facade without getCommitInfo answers deepen through computeShallowBoundaries
+    expect(repository.computeShallowBoundaries).toHaveBeenCalledWith(state.wants, 2);
   });
 
-  it("should compute shallow boundaries for deepen-since", async () => {
+  it("should refuse deepen-since without the commit graph (getCommitInfo)", async () => {
     const repository = createMockRepository();
-    const boundary = randomOid();
-    repository._setShallowBoundaries(new Set([boundary]));
+    repository._setShallowBoundaries(new Set([randomOid()]));
 
     const ctx = createServerContext({ repository });
     const state = getState(ctx);
     state.wants.add(randomOid());
     state.deepenRequest = "deepen-since 1609459200";
+    state.deepenSince = 1609459200;
 
     const event = await runHandler("COMPUTE_SHALLOW", ctx);
-    expect(event).toBe("SHALLOW_COMPUTED");
-    expect(state.serverShallow?.has(boundary)).toBe(true);
-    expect(repository.computeShallowSince).toHaveBeenCalledWith(state.wants, 1609459200);
+    expect(event).toBe("INVALID_REQUEST");
+    expect(getOutput(ctx).error).toContain("not supported");
+    expect(repository.computeShallowSince).not.toHaveBeenCalled();
   });
 
-  it("should compute shallow boundaries for deepen-not", async () => {
+  it("should refuse deepen-not without the commit graph, or for no single ref", async () => {
     const repository = createMockRepository();
-    const boundary = randomOid();
-    repository._setShallowBoundaries(new Set([boundary]));
+    repository._setShallowBoundaries(new Set([randomOid()]));
+    const refStore = createMockRefStore();
+    refStore._setRef("refs/heads/old", randomOid());
 
-    const ctx = createServerContext({ repository });
+    const ctx = createServerContext({ repository, refStore });
     const state = getState(ctx);
     state.wants.add(randomOid());
     state.deepenRequest = "deepen-not refs/heads/old";
+    state.deepenNot = ["refs/heads/old"];
 
-    const event = await runHandler("COMPUTE_SHALLOW", ctx);
-    expect(event).toBe("SHALLOW_COMPUTED");
-    expect(state.serverShallow?.has(boundary)).toBe(true);
-    expect(repository.computeShallowExclude).toHaveBeenCalled();
+    expect(await runHandler("COMPUTE_SHALLOW", ctx)).toBe("INVALID_REQUEST");
+    expect(getOutput(ctx).error).toContain("not supported");
+    expect(repository.computeShallowExclude).not.toHaveBeenCalled();
+
+    state.deepenNot = ["refs/heads/missing"];
+    expect(await runHandler("COMPUTE_SHALLOW", ctx)).toBe("INVALID_REQUEST");
+    expect(getOutput(ctx).error).toContain("ambiguous deepen-not");
   });
 
   it("should send shallow/unshallow updates to client", async () => {
@@ -187,7 +194,7 @@ describe("Upload-Pack: Shallow Clone Support", () => {
     expect(transport.writeFlush).toHaveBeenCalled();
   });
 
-  it("should mark objects for unshallow when client was shallow but server has full history", async () => {
+  it("should not unshallow without a deepen request; the pack stops at the client's shallows", async () => {
     const repository = createMockRepository();
     const shallowOid = randomOid();
     repository._addObject(shallowOid);
@@ -196,12 +203,13 @@ describe("Upload-Pack: Shallow Clone Support", () => {
     const state = getState(ctx);
     state.wants.add(randomOid());
     state.clientShallow = new Set([shallowOid]);
-    // No deepen request means serverShallow will be empty
+    // No deepen request: git registers the client's shallows and sends no shallow section
     state.deepenRequest = undefined;
 
     const event = await runHandler("COMPUTE_SHALLOW", ctx);
-    expect(event).toBe("SHALLOW_COMPUTED");
-    expect(state.serverUnshallow?.has(shallowOid)).toBe(true);
+    expect(event).toBe("SHALLOW_REGISTERED");
+    expect(state.serverUnshallow?.size).toBe(0);
+    expect(state.packShallow?.has(shallowOid)).toBe(true);
   });
 });
 

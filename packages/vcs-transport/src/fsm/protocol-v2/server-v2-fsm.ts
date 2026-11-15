@@ -13,6 +13,7 @@ import {
   findUnreachableWant,
   notOurRef,
   okToGiveUp,
+  resolveDeepenNot,
   type ShallowUpdate,
   sendPackStream,
   UploadPackRequestError,
@@ -732,27 +733,4 @@ function advertisesFetchFeature(ctx: ProcessContext, feature: string): boolean {
   const capabilities = ctx.config.serverCapabilities ?? SERVER_V2_CAPABILITIES;
   const fetch = capabilities.find((c) => c === "fetch" || c.startsWith("fetch="));
   return fetch?.slice("fetch=".length).split(" ").includes(feature) ?? false;
-}
-
-/**
- * A `deepen-not` ref, expanded as git's `expand_ref` (the name, refs/<name>, tags, heads,
- * remotes, a remote's HEAD); undefined unless exactly one ref matches (git: "ambiguous").
- */
-export async function resolveDeepenNot(
-  refStore: ProcessContext["refStore"],
-  name: string,
-): Promise<string | undefined> {
-  const found: string[] = [];
-  for (const candidate of [
-    name,
-    `refs/${name}`,
-    `refs/tags/${name}`,
-    `refs/heads/${name}`,
-    `refs/remotes/${name}`,
-    `refs/remotes/${name}/HEAD`,
-  ]) {
-    const oid = await refStore.get(candidate);
-    if (oid) found.push(oid);
-  }
-  return found.length === 1 ? found[0] : undefined;
 }
