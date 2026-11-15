@@ -175,7 +175,8 @@ export interface RepositoryFacade {
   computeShallowBoundaries?(wants: Set<string>, depth: number): Promise<Set<string>>;
 
   /**
-   * Computes shallow boundaries since a timestamp.
+   * Computes shallow boundaries since a timestamp. upload-pack does not call it: it answers
+   * `deepen-since` through `getCommitInfo`.
    *
    * @param wants - Object IDs being fetched
    * @param timestamp - Unix timestamp cutoff
@@ -184,7 +185,8 @@ export interface RepositoryFacade {
   computeShallowSince?(wants: Set<string>, timestamp: number): Promise<Set<string>>;
 
   /**
-   * Computes shallow boundaries excluding refs.
+   * Computes shallow boundaries excluding refs. upload-pack does not call it: it answers
+   * `deepen-not` through `getCommitInfo`.
    *
    * @param wants - Object IDs being fetched
    * @param excludeRefs - Ref names to exclude

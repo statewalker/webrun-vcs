@@ -157,7 +157,7 @@ function serveRelay(repo: TransportRepo): Server {
   });
 }
 
-describeGit("Interop · real git client ← our upload-pack", () => {
+describeGit("Interop · real git client ← our upload-pack", { timeout: TEST_TIMEOUT }, () => {
   let root: string;
   let repo: TransportRepo;
   let server: Server;
@@ -224,7 +224,7 @@ describeGit("Interop · real git client ← our upload-pack", () => {
     expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("4");
     expect(existsSync(join(dst, "shallow"))).toBe(false);
     await gitOk(dst, ["fsck", "--no-dangling"]);
-  }, TEST_TIMEOUT);
+  });
 
   it("protocol v0: --depth 2 clone has two commits", async () => {
     const dst = join(root, "v0.git");
@@ -241,7 +241,7 @@ describeGit("Interop · real git client ← our upload-pack", () => {
     ]);
     expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("2");
     expect(readFileSync(join(dst, "shallow"), "utf8").trim()).toBe(commits[2]);
-  }, TEST_TIMEOUT);
+  });
 
   it("protocol v2: a want no ref reaches is 'not our ref'; a reachable commit is served", async () => {
     const dst = join(root, "want.git");
@@ -254,7 +254,7 @@ describeGit("Interop · real git client ← our upload-pack", () => {
 
     await gitOk(dst, [...fetch, `${commits[1]}:refs/heads/old`]);
     expect(await gitOk(dst, ["rev-list", "--count", "old"])).toBe("2");
-  }, TEST_TIMEOUT);
+  });
 
   it("protocol v0: --depth 2 clone, then --depth=3, then --unshallow", async () => {
     const dst = join(root, "v0-deepen.git");
@@ -280,7 +280,7 @@ describeGit("Interop · real git client ← our upload-pack", () => {
     expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("4");
     expect(existsSync(join(dst, "shallow"))).toBe(false);
     await gitOk(dst, ["fsck", "--no-dangling"]);
-  }, TEST_TIMEOUT);
+  });
 
   it("protocol v0: a shallow clone fetches without deepening", async () => {
     const dst = join(root, "v0-plain.git");
@@ -304,5 +304,5 @@ describeGit("Interop · real git client ← our upload-pack", () => {
     expect(await gitOk(dst, ["rev-list", "--count", "next"])).toBe("2");
     expect(readFileSync(join(dst, "shallow"), "utf8").trim()).toBe(commits[3]);
     await gitOk(dst, ["fsck", "--no-dangling"]);
-  }, TEST_TIMEOUT);
+  });
 });
