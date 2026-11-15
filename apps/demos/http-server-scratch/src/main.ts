@@ -35,7 +35,6 @@ import {
   DEFAULT_BRANCH,
   describeCommit,
   ensureDirectory,
-  exportPack,
   type FileHistory,
   formatIntegrityReport,
   getHead,
@@ -506,13 +505,10 @@ async function pushChanges(history: FileHistory): Promise<void> {
     url: REMOTE_URL,
     refspecs: [`refs/heads/${TEST_BRANCH}:refs/heads/${TEST_BRANCH}`],
     force: true,
-    getLocalRef: async (refName: string) => {
-      const ref = await history.refs.resolve(refName);
-      return ref?.objectId;
-    },
-    // the objects the remote lacks, streamed as a pack (listObjects + writePack)
-    exportPack: (wants, exclude, options) => exportPack(history.objects, wants, exclude, options),
-    onProgressMessage: (msg) => {
+    // the local refs, and the objects the remote lacks, streamed as a thin pack
+    repository: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+    onProgress: (msg) => {
       if (msg.trim()) {
         printInfo(`  ${msg.trim()}`);
       }
@@ -522,12 +518,12 @@ async function pushChanges(history: FileHistory): Promise<void> {
   if (result.ok) {
     printSuccess(`Push successful!`);
     printInfo(`Bytes sent: ${result.bytesSent}`);
-    printInfo(`Objects sent: ${result.objectCount}`);
+    printInfo(`Objects sent: ${result.packObjects}`);
   } else {
-    printError(`Push failed: ${result.unpackStatus}`);
-    for (const [ref, status] of result.updates) {
-      if (!status.ok) {
-        printError(`  ${ref}: ${status.message}`);
+    printError(`Push failed: ${result.unpack?.message ?? "refused"}`);
+    for (const update of result.updates) {
+      if (update.status !== "ok" && update.status !== "up-to-date") {
+        printError(`  ${update.remoteRef}: ${update.summary}`);
       }
     }
     throw new Error("Push failed");

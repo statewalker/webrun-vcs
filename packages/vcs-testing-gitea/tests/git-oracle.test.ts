@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { httpPush, fetch as transportFetch } from "@statewalker/vcs-transport";
+import { push, fetch as transportFetch } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { type GiteaServer, startGitea } from "../src/index.js";
 import {
@@ -99,11 +99,15 @@ describeGitea("Gitea oracle · G1 git over smart HTTP", () => {
     try {
       await commitFiles(ours, "ours 1", { "a.txt": "ours\n" });
       const tip = await commitFiles(ours, "ours 2", { "a.txt": "ours 2\n", "b.txt": "b\n" });
-      const pushed = await httpPush(repo.cloneUrl, ours.facade, ours.refStore, {
-        refspecs: ["refs/heads/main:refs/heads/main"],
-        credentials: { username: gitea.user, password: gitea.token },
+      const local = { repository: ours.facade, refStore: ours.refStore };
+      const pushed = await push({
+        url: repo.cloneUrl,
+        ...local,
+        refspecs: ["main"],
+        auth: { username: gitea.user, password: gitea.token },
       });
-      expect(pushed.success, pushed.error).toBe(true);
+      expect(pushed.ok, JSON.stringify(pushed.updates)).toBe(true);
+      expect(pushed.updates.map((u) => u.summary)).toEqual(["[new branch]"]);
 
       const clone = join(tmp.make(), "c");
       nativeGit(env, tmp.make(), ["clone", "-q", repo.authenticatedUrl, clone]);
@@ -113,20 +117,27 @@ describeGitea("Gitea oracle · G1 git over smart HTTP", () => {
 
       // a fast-forward on top of what is there
       const tip2 = await commitFiles(ours, "ours 3", { "a.txt": "ours 3\n", "b.txt": "b\n" });
-      const again = await httpPush(repo.cloneUrl, ours.facade, ours.refStore, {
+      const again = await push({
+        url: repo.cloneUrl,
+        ...local,
         refspecs: ["refs/heads/main:refs/heads/main"],
-        credentials: { username: gitea.user, password: gitea.password },
+        auth: { username: gitea.user, password: gitea.password },
       });
-      expect(again.success, again.error).toBe(true);
+      expect(again.ok, JSON.stringify(again.updates)).toBe(true);
+      expect(again.updates[0]?.summary).toBe(`${tip.slice(0, 7)}..${tip2.slice(0, 7)}`);
       nativeGit(env, clone, ["pull", "-q", "--ff-only"]);
       expect(nativeGit(env, clone, ["rev-parse", "HEAD"]).trim()).toBe(tip2);
+      // thin against the remote tip: only the new commit, its tree and its changed blob
+      expect(again.packObjects).toBe(
+        nativeGit(env, clone, ["rev-list", "--objects", `${tip}..${tip2}`])
+          .trim()
+          .split("\n").length,
+      );
       nativeGit(env, clone, ["fsck", "--strict"]);
 
-      const refused = await httpPush(repo.cloneUrl, ours.facade, ours.refStore, {
-        refspecs: ["refs/heads/main:refs/heads/other"],
-      });
-      expect(refused.success).toBe(false);
-      expect(refused.error).toMatch(/\b401\b/);
+      await expect(
+        push({ url: repo.cloneUrl, ...local, refspecs: ["refs/heads/main:refs/heads/other"] }),
+      ).rejects.toThrow(/\b401\b/);
       expect(nativeGit(env, clone, ["ls-remote", "origin"])).not.toContain("refs/heads/other");
     } finally {
       await ours.close();

@@ -6,8 +6,6 @@
  */
 
 import type { Credentials } from "./credentials.js";
-import type { Duplex } from "./duplex.js";
-import type { RepositoryFacade } from "./repository-facade.js";
 
 /**
  * Common HTTP transport options.
@@ -28,26 +26,4 @@ export interface BaseHttpOptions {
    * webrun-streams `Duplex`) can back the client without a network port.
    */
   fetchImpl?: (request: Request) => Promise<Response>;
-}
-
-/**
- * Common duplex transport options.
- */
-export interface BaseDuplexOptions {
-  /** Bidirectional stream to use for transport */
-  duplex: Duplex;
-  /** Repository facade for pack import/export */
-  repository: RepositoryFacade;
-}
-
-/**
- * Common push options shared across transports.
- */
-export interface BasePushOptions {
-  /** Refspecs to push (source:destination format) */
-  refspecs?: string[];
-  /** Force push even if not fast-forward */
-  force?: boolean;
-  /** Use atomic push (all-or-nothing) */
-  atomic?: boolean;
 }

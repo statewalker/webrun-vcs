@@ -447,14 +447,17 @@ incremental fetch downloads only the missing objects.
 ```
 PushCommand
     ↓ calls
-transport.push({
+transport.push({          → the push client (git's send-pack)
   url, refspecs,
   auth, headers, timeout,
-  force, atomic,
-  exportPack,        → Builds the pack from local history
-  getLocalRef,       → Resolves source refs
-  onProgressMessage,
+  force, atomic, forceWithLease, pushOptions, prune, thin, dryRun,
+  repository,        → createRepositoryFacade({ history }): the thin pack, ancestry checks
+  refStore,          → createTransportRefStore(history.refs): the refspec sources
+  onProgress,
 })
+    ↓
+updates (git's statuses and summaries) → RemoteRefUpdate; accepted refs move their
+remote-tracking refs (refs/remotes/<remote>/…)
 ```
 
 ### Storage Backend Integration

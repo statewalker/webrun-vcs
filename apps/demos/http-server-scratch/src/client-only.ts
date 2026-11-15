@@ -28,7 +28,6 @@ import {
   createAuthor,
   createFileHistory,
   ensureDirectory,
-  exportPack,
   type FileHistory,
   getHead,
   printError,
@@ -321,13 +320,10 @@ async function pushChanges(history: FileHistory, url: string): Promise<void> {
     url,
     refspecs: [refspec],
     force: true,
-    getLocalRef: async (refName: string) => {
-      const ref = await history.refs.resolve(refName);
-      return ref?.objectId;
-    },
-    // the objects the remote lacks, streamed as a pack (listObjects + writePack)
-    exportPack: (wants, exclude, options) => exportPack(history.objects, wants, exclude, options),
-    onProgressMessage: (msg) => {
+    // the local refs, and the objects the remote lacks, streamed as a thin pack
+    repository: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+    onProgress: (msg) => {
       if (msg.trim()) {
         printInfo(`  ${msg.trim()}`);
       }
@@ -337,9 +333,10 @@ async function pushChanges(history: FileHistory, url: string): Promise<void> {
   if (result.ok) {
     printSuccess("Push successful!");
     printInfo(`Bytes sent: ${result.bytesSent}`);
-    printInfo(`Objects sent: ${result.objectCount}`);
+    printInfo(`Objects sent: ${result.packObjects}`);
   } else {
-    throw new Error(`Push failed: ${result.unpackStatus}`);
+    const failed = result.updates.map((u) => `${u.remoteRef} ${u.summary}`).join(", ");
+    throw new Error(`Push failed: ${result.unpack?.message ?? failed}`);
   }
 }
 

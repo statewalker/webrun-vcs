@@ -81,8 +81,8 @@ const pushFrom = (
     call,
     token,
     refspecs: [refspec],
-    getLocalRef: (ref) => local.refStore.get(ref),
-    exportPack: (wants, exclude) => local.facade.exportPack(wants, exclude),
+    repository: local.facade,
+    refStore: local.refStore,
   });
 
 const status = async (
@@ -183,14 +183,18 @@ describe("roles and per-ref authorization", () => {
 
     let r = await pushFrom(local, call, member, "refs/heads/main:refs/heads/main");
     expect(r.ok).toBe(false);
-    expect(r.updates.get("refs/heads/main")?.ok).toBe(false);
-    expect(r.updates.get("refs/heads/main")?.message).toMatch(/not allowed/);
+    expect(r.updates.find((u) => u.remoteRef === "refs/heads/main")?.status === "ok").toBe(false);
+    expect(r.updates.find((u) => u.remoteRef === "refs/heads/main")?.message).toMatch(
+      /not allowed/,
+    );
     expect(await served.refStore.get("refs/heads/main")).toBe(c2);
     // a push refused for every ref stores nothing
     expect(await served.facade.has(tip)).toBe(false);
 
     r = await pushFrom(local, call, member, "refs/heads/main:refs/peers/X/main");
-    expect(r.updates.get("refs/peers/X/main")?.message).toMatch(/not allowed/);
+    expect(r.updates.find((u) => u.remoteRef === "refs/peers/X/main")?.message).toMatch(
+      /not allowed/,
+    );
 
     r = await pushFrom(local, call, member, "refs/heads/main:refs/peers/M/main");
     expect(r.ok).toBe(true);
@@ -219,11 +223,11 @@ describe("roles and per-ref authorization", () => {
       call,
       token: member,
       refspecs: ["refs/heads/main:refs/peers/M/a", "refs/heads/main:refs/heads/b"],
-      getLocalRef: (ref) => local.refStore.get(ref),
-      exportPack: (wants, exclude) => local.facade.exportPack(wants, exclude),
+      repository: local.facade,
+      refStore: local.refStore,
     });
-    expect(r.updates.get("refs/peers/M/a")?.ok).toBe(true);
-    expect(r.updates.get("refs/heads/b")?.ok).toBe(false);
+    expect(r.updates.find((u) => u.remoteRef === "refs/peers/M/a")?.status === "ok").toBe(true);
+    expect(r.updates.find((u) => u.remoteRef === "refs/heads/b")?.status === "ok").toBe(false);
     expect(await served.refStore.get("refs/peers/M/a")).toBe(tip);
     expect(await served.refStore.get("refs/heads/b")).toBeUndefined();
   });
@@ -249,6 +253,10 @@ describe("roles and per-ref authorization", () => {
       refspecs: ["+refs/peers/*:refs/remotes/peers/*"],
     });
     expect(await a.local.refStore.get("refs/remotes/peers/C/main")).toBe(c.tip);
+    // A's own next commit: A and C committed alike (deterministic ids), and an equal value would
+    // be "up to date", never sent
+    const a2 = await commit(a.local, "a only", { "a.txt": "a\n" }, [a.tip]);
+    await a.local.refStore.update("refs/heads/main", a2);
     const r = await pushFrom(a.local, callA, ta, "+refs/heads/main:refs/peers/C/main");
     expect(r.ok).toBe(false);
     expect(await served.refStore.get("refs/peers/C/main")).toBe(c.tip);

@@ -132,17 +132,17 @@ console.log(result.packBytes, result.defaultBranch, result.refUpdates.map((u) =>
 ### Pushing
 
 ```typescript
-import { push } from "@statewalker/vcs-transport";
+import { createRepositoryFacade, createTransportRefStore, push } from "@statewalker/vcs-transport";
 
 const result = await push({
   url: "http://localhost:8080/remote.git",
-  refspecs: ["refs/heads/feature-branch:refs/heads/feature-branch"],
+  refspecs: ["feature-branch"],
   force: true,
-  getLocalRef: async (refName) => (await history.refs.resolve(refName))?.objectId,
-  // listObjects + writePack (src/shared/export-pack.ts): the pack streams in the POST body
-  exportPack: (wants, exclude) => exportPack(history.objects, wants, exclude),
+  // the local refs, and a thin pack of what the remote lacks, streamed in the POST body
+  repository: createRepositoryFacade({ history }),
+  refStore: createTransportRefStore(history.refs),
 });
-if (!result.ok) console.error(result.unpackStatus, result.updates);
+for (const u of result.updates) console.log(u.summary, u.remoteRef); // "[new branch] refs/heads/feature-branch"
 ```
 
 ## Why it is the way it is

@@ -8,7 +8,7 @@ import {
   type FetchOptions,
   fetch as gitFetch,
   push as gitPush,
-  type HttpPushResult,
+  type PushClientResult,
   type PushOptions,
 } from "@statewalker/vcs-transport";
 import { type MeshToken, peerFetch, type WebrunDuplex, withMeshToken } from "../peer/index.js";
@@ -65,8 +65,8 @@ export function meshGitFetch(options: MeshGitFetchOptions): Promise<FetchClientR
 export type MeshGitPushOptions = Omit<PushOptions, "fetchImpl"> & MeshRemote;
 
 /**
- * Pushes to a peer's repository through the peer connection. Refs the peer refuses come back as
- * `ok: false` with git's reason (`not allowed: this peer writes refs/peers/<id>/* only`); a
+ * Pushes to a peer's repository through the peer connection (the push client of
+ * `@statewalker/vcs-transport`). Refs the peer refuses come back as `remote-rejected` with git's reason (`not allowed: this peer writes refs/peers/<id>/* only`); a
  * caller without any write capability is refused with 403 (thrown).
  *
  * @example
@@ -76,12 +76,12 @@ export type MeshGitPushOptions = Omit<PushOptions, "fetchImpl"> & MeshRemote;
  *   call: connection.call,
  *   token,
  *   refspecs: [`refs/heads/main:refs/peers/${myPeerId}/main`],
- *   getLocalRef: (ref) => refStore.get(ref),
- *   exportPack: (wants, exclude) => repository.exportPack(wants, exclude),
+ *   repository,
+ *   refStore,
  * });
  * ```
  */
-export function meshGitPush(options: MeshGitPushOptions): Promise<HttpPushResult> {
+export function meshGitPush(options: MeshGitPushOptions): Promise<PushClientResult> {
   const { call, fetchImpl, token, origin = options.url, ...rest } = options;
   return gitPush({ ...rest, fetchImpl: meshRemoteFetch({ call, fetchImpl, token, origin }) });
 }

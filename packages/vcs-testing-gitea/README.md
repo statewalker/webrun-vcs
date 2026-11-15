@@ -41,9 +41,12 @@ import { startGitea } from "@statewalker/vcs-testing-gitea";
 const gitea = await startGitea(); // downloads or reuses the binary, then starts it
 const repo = await gitea.createRepo("demo"); // private, empty, default branch main
 
-await httpPush(repo.cloneUrl, facade, refStore, {
-  refspecs: ["refs/heads/main:refs/heads/main"],
-  credentials: { username: gitea.user, password: gitea.token },
+await push({
+  url: repo.cloneUrl,
+  repository: facade,
+  refStore,
+  refspecs: ["main"],
+  auth: { username: gitea.user, password: gitea.token },
 });
 lfsUpload(store, repo.lfsUrl, pointers, fetch, { headers: { authorization: gitea.authorization } });
 execFileSync("git", ["clone", repo.authenticatedUrl, dir]); // native git, with credentials in the URL
@@ -61,8 +64,8 @@ The pure pieces (`giteaAppIni`, `giteaCommand`, `giteaRelease`, `giteaOracleEnab
 
 | # | Check |
 |---|---|
-| G1 | The transport's `fetch` clones a repository native git pushed (refs, tags and every commit equal), then fetches only the new commit (haves sent; the pack holds exactly `git rev-list --objects old..new`). `httpPush` with the token as password lands commits that a native `git clone` reads back and `fsck --strict` accepts, and a fast-forward on top. Without credentials, fetch and push of a private repository are a 401. |
-| G2 | A commit with `.gitattributes` and an LFS pointer: `lfsUpload` sends the object (batch, PUT, Gitea's verify action) and `httpPush` the commit. A native `git clone` with git-lfs smudges the 3 MiB file byte-identical and `git lfs fsck` is clean. A second upload sends nothing. |
+| G1 | The transport's `fetch` clones a repository native git pushed (refs, tags and every commit equal), then fetches only the new commit (haves sent; the pack holds exactly `git rev-list --objects old..new`). The transport's `push` (the push client) with the token as password lands commits that a native `git clone` reads back and `fsck --strict` accepts (`[new branch]`), and a fast-forward on top whose thin pack holds exactly `git rev-list --objects old..new`. Without credentials, fetch and push of a private repository are a 401. |
+| G2 | A commit with `.gitattributes` and an LFS pointer: `lfsUpload` sends the object (batch, PUT, Gitea's verify action) and `push` the commit. A native `git clone` with git-lfs smudges the 3 MiB file byte-identical and `git lfs fsck` is clean. A second upload sends nothing. |
 | G3 | A file native git-lfs pushed: an anonymous batch is a 401; `lfsDownload` stores it byte-identical. A download cut after 1 MiB resumes with `Range: bytes=N-`, Gitea answers 206, and the bytes over both attempts add up to the size. |
 | G4 | A missing object is Gitea's per-object 404 (our error says not found). Bytes altered in transit are refused (`sha256 mismatch`) and nothing is kept. Gitea itself refuses a PUT whose bytes do not hash to their oid with 422. |
 | G5 | The File Locking API (on whenever Gitea serves LFS): `lfsLocks` as the admin and as a second user with write access. A lock is created (201), the same path again is a 409 carrying the existing lock, listing by path, by id and page by page finds every lock, `verifyLocks` splits them into ours and theirs by owner, an unlock of someone else's lock without `force` is refused and leaves it in place, `force` takes it, and the owner unlocks their own. Anonymous listing of a private repository is a 401. |

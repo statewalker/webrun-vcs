@@ -245,6 +245,17 @@ export class RemoteConfigStore {
     return this.strings(name, "url")[0];
   }
 
+  /** A config variable (`push.default`, `branch.main.merge`), the last value when repeated. */
+  value(key: string): string | undefined {
+    const value = this.config.get(key);
+    return value === undefined || value === null ? undefined : String(value);
+  }
+
+  /** Sets a config variable, replacing every value it had. */
+  setValue(key: string, value: string): void {
+    this.config.set(key, value);
+  }
+
   /** Flush to the backing file, if the config has one. */
   async save(): Promise<void> {
     await this.config.save?.();

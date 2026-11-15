@@ -161,29 +161,16 @@ class ProtocolState {
 
 ### Push FSM
 
-Client and server implementations for push operations:
+The server side of push (receive-pack). The client side is not an FSM: it is the push client in
+`push-client/` (git's send-pack: refspecs, per-ref checks, thin pack, report-status, over smart
+HTTP or a duplex), used by `push` and `pushOverDuplex`.
 
 ```typescript
-import {
-  clientPushTransitions,
-  clientPushHandlers,
-  serverPushTransitions,
-  serverPushHandlers,
-} from "@statewalker/vcs-transport";
-
-// Client push
-const clientFsm = new Fsm(clientPushTransitions, clientPushHandlers);
-await clientFsm.run(context);
+import { serverPushTransitions, serverPushHandlers } from "@statewalker/vcs-transport";
 
 // Server push handler
 const serverFsm = new Fsm(serverPushTransitions, serverPushHandlers);
 await serverFsm.run(context);
-```
-
-**Client Push States:**
-```
-"" → DISCOVER_REFS → NEGOTIATE_CAPABILITIES → BUILD_COMMANDS
-   → SEND_COMMANDS → SEND_PACK → READ_STATUS → ""
 ```
 
 **Server Push States:**

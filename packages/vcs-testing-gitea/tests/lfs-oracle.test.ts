@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { httpPush } from "@statewalker/vcs-transport";
+import { push } from "@statewalker/vcs-transport";
 import {
   type BatchResponse,
   createFilesLfsStore,
@@ -95,11 +95,14 @@ describeGitea("Gitea oracle · G2–G4 Git LFS", () => {
         ".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n",
         "big.bin": formatLfsPointer(pointer),
       });
-      const pushed = await httpPush(repo.cloneUrl, ours.facade, ours.refStore, {
+      const pushed = await push({
+        url: repo.cloneUrl,
+        repository: ours.facade,
+        refStore: ours.refStore,
         refspecs: ["refs/heads/main:refs/heads/main"],
-        credentials: { username: gitea.user, password: gitea.password },
+        auth: { username: gitea.user, password: gitea.password },
       });
-      expect(pushed.success, pushed.error).toBe(true);
+      expect(pushed.ok, JSON.stringify(pushed.updates)).toBe(true);
     } finally {
       await ours.close();
     }

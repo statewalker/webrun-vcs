@@ -7,7 +7,7 @@
  * Skips gracefully when git-http-backend is not available.
  */
 
-import { fetch, httpPush, type RefStore, type RepositoryFacade } from "@statewalker/vcs-transport";
+import { fetch, type RefStore, type RepositoryFacade } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   createInitializedTestRepository,
@@ -15,6 +15,7 @@ import {
   createTestCommit,
   createTestRepository,
   createTransportRefStore,
+  httpPush,
 } from "../../helpers/index.js";
 import {
   type GitHttpBackendServer,

@@ -13,13 +13,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { httpPush, push } from "@statewalker/vcs-transport";
+import { push } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   createInitializedTestRepository,
   createRepositoryFacade,
   createTestCommit,
   createTransportRefStore,
+  httpPush,
   type TestRepositoryContext,
 } from "../../helpers/index.js";
 import {
@@ -166,11 +167,11 @@ describeWithGit("our client pushes into git-http-backend", () => {
       const result = await push({
         url,
         refspecs: ["refs/heads/main:refs/heads/main"],
-        getLocalRef: async (name) => (await ctx.repository.refs.resolve(name))?.objectId,
-        exportPack: (wants, exclude) => ctx.repository.serialization.exportPack(wants, exclude),
+        repository: createRepositoryFacade(ctx.repository),
+        refStore: createTransportRefStore(ctx.repository.refs),
       });
       expect(result.ok).toBe(true);
-      expect(result.objectCount).toBeGreaterThan(8);
+      expect(result.packObjects).toBeGreaterThan(8);
       await fsck(bare);
       expect(await git(bare, ["rev-parse", "refs/heads/main"])).toBe(tip);
     } finally {

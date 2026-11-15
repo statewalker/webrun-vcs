@@ -226,6 +226,18 @@ function createRepositoryFacadeFromHistory(
       }
     },
 
+    async resolvePrefix(prefix: string): Promise<string[]> {
+      const found: string[] = [];
+      if (!history.objects) return found;
+      for await (const id of history.objects.list()) {
+        if (id.startsWith(prefix)) {
+          found.push(id);
+          if (found.length > 1) break;
+        }
+      }
+      return found;
+    },
+
     async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {
       try {
         const tag = await tags.load(oid);

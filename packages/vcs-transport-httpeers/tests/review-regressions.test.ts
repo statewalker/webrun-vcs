@@ -495,18 +495,17 @@ describe("git handler", () => {
     });
     const call = servePeerConnection(handler, { remotePeer: "a" });
     const token = await hub.token("a", ["member"]);
-    const main = (await repo.refStore.get("refs/heads/main")) as string;
     const push = (dest: string) =>
       meshGitPush({
         url: "http://b/repo.git",
         call,
         token,
         refspecs: [`refs/heads/main:${dest}`],
-        getLocalRef: async () => main,
-        exportPack: (wants, exclude) => repo.facade.exportPack(wants, exclude),
+        repository: repo.facade,
+        refStore: repo.refStore,
       });
-    expect((await push("refs/peers/ab/x")).updates.get("refs/peers/ab/x")?.ok).toBe(false);
-    expect((await push("refs/peers/a/x")).updates.get("refs/peers/a/x")?.ok).toBe(true);
+    expect((await push("refs/peers/ab/x")).updates[0]?.status).toBe("remote-rejected");
+    expect((await push("refs/peers/a/x")).updates[0]?.status).toBe("ok");
   });
 });
 

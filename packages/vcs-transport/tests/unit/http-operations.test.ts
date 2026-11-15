@@ -4,6 +4,7 @@ import type { RefStore } from "../../src/context/process-context.js";
 import { fetch as fetchPack } from "../../src/operations/fetch.js";
 import { lsRemote } from "../../src/operations/ls-remote.js";
 import { push } from "../../src/operations/push.js";
+import { createMockRefStore, createMockRepository } from "../helpers/test-protocol.js";
 
 const enc = new TextEncoder();
 const pkt = (line: string) =>
@@ -103,7 +104,10 @@ describe("smart-HTTP operations with a token", () => {
     const fetchImpl = async (request: Request): Promise<Response> => {
       authorizations.push(request.headers.get("Authorization"));
       if (request.url.endsWith(`/info/refs?service=${service}`))
-        return new Response(advertisement.replace("git-upload-pack", service));
+        // the service line re-framed: its pkt-length changes with the name
+        return new Response(
+          advertisement.replace(pkt("# service=git-upload-pack\n"), pkt(`# service=${service}\n`)),
+        );
       return new Response("0000");
     };
     return { fetchImpl, authorizations };
@@ -111,13 +115,18 @@ describe("smart-HTTP operations with a token", () => {
 
   it("push sends the token as the Basic auth password", async () => {
     const { fetchImpl, authorizations } = recordingServer("git-receive-pack");
+    const repository = createMockRepository();
+    repository.exportPack = async function* () {};
+    const refStore = createMockRefStore();
+    refStore._setRef("refs/heads/master", TEST);
     await push({
       url,
       auth,
       fetchImpl,
-      refspecs: ["refs/heads/master:refs/heads/master"],
-      getLocalRef: async () => TEST,
-      exportPack: async function* () {},
+      // forced: the remote's master is not here (otherwise refused locally, nothing posted)
+      refspecs: ["+refs/heads/master:refs/heads/master"],
+      repository,
+      refStore,
     }).catch(() => {});
     // GET /info/refs, then POST /git-receive-pack
     expect(authorizations).toEqual([tokenBasic, tokenBasic]);

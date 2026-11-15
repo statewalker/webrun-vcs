@@ -66,13 +66,6 @@ export class ProcessConfiguration {
   // Push configuration
 
   /**
-   * Refspecs for push operation.
-   * Format: "[+]src:dst" where + means force push
-   * @example ["refs/heads/main:refs/heads/main", "+refs/heads/feature:refs/heads/feature"]
-   */
-  pushRefspecs?: string[];
-
-  /**
    * Whether to use atomic push mode.
    * All refs are updated together or none are updated.
    * @default false

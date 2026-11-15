@@ -255,6 +255,13 @@ export interface RepositoryFacade {
   getTagInfo?(oid: string): Promise<TagTargetInfo | undefined>;
 
   /**
+   * The ids of the local objects that start with `prefix` (an abbreviated id, 4 or more hex
+   * digits); at most two are enough to tell a unique one from an ambiguous one. A push resolves
+   * an abbreviated source (`abc1234:refs/heads/x`) or lease value with it.
+   */
+  resolvePrefix?(prefix: string): Promise<string[]>;
+
+  /**
    * Whether the repository has no working tree. receive-pack refuses to update the checked
    * out branch of a non-bare repository (git's `receive.denyCurrentBranch`). Absent: bare.
    */
