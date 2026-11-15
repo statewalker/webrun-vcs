@@ -1,10 +1,10 @@
 ---
-"@statewalker/vcs-core": major
-"@statewalker/vcs-store-files": major
-"@statewalker/vcs-store-mem": major
-"@statewalker/vcs-store-kv": major
-"@statewalker/vcs-store-sql": major
-"@statewalker/vcs-transport-adapters": major
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-store-files": minor
+"@statewalker/vcs-store-mem": minor
+"@statewalker/vcs-store-kv": minor
+"@statewalker/vcs-store-sql": minor
+"@statewalker/vcs-transport-adapters": minor
 ---
 
 **Breaking: every store reads and writes objects through the object kernel (`GitObjects`).**
