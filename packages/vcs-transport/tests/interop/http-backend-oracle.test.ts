@@ -105,6 +105,9 @@ function httpBackend(
         stderr: Buffer.concat(err).toString(),
       });
     });
+    // git http-backend answers a GET without reading stdin and may exit first; writing
+    // the (empty) body then fails with EPIPE, which must not become an uncaught error.
+    child.stdin.on("error", () => {});
     child.stdin.end(body ?? Buffer.alloc(0));
   });
 }

@@ -215,6 +215,8 @@ export function gitProcessDuplex(child: ChildProcessWithoutNullStreams): GitProc
   };
   child.stdout.on("end", signalEnd);
   child.stdout.on("close", signalEnd);
+  // git may exit while we still write to it; EPIPE must not become an uncaught error.
+  child.stdin.on("error", () => {});
   child.stderr.on("data", (chunk: Buffer) => {
     stderrText += chunk.toString("utf8");
   });
