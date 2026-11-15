@@ -3,8 +3,11 @@ import {
   compareWithWorktree,
   findUntrackedFiles,
   getStageState,
+  type IndexStatUpdate,
   modeFromWorktree,
+  refreshIndexStats,
   type StageStateValue,
+  statUpdateOf,
   trackedUnder,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -127,6 +130,7 @@ export class StatusCommand extends GitCommand<Status> {
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const indexTime = this.staging.getUpdateTime();
     const tracked = new Set<string>();
+    const refresh: IndexStatUpdate[] = [];
     const unmerged = new Map<string, [StatusSide?, StatusSide?, StatusSide?]>();
 
     for await (const entry of this.staging.entries()) {
@@ -152,9 +156,15 @@ export class StatusCommand extends GitCommand<Status> {
       }
       let y: StatusCode = " ";
       let worktreeMode: number | undefined = entry.mode;
+      let commitChanged = false;
       if (worktree && !entry.skipWorktree && !entry.assumeValid) {
         const result = await compareWithWorktree(worktree, entry, { trust, indexTime });
         worktreeMode = result.worktreeMode;
+        // proved clean only by hashing: its fresh stat goes into the index (git's refresh);
+        // changed behind a matching stat: smudged
+        const update = statUpdateOf(entry, result);
+        if (update) refresh.push(update);
+        if (entry.mode === FileMode.GITLINK && result.kind === "modified") commitChanged = true;
         if (result.kind === "deleted") {
           y = "D";
           missing.add(entry.path);
@@ -167,7 +177,18 @@ export class StatusCommand extends GitCommand<Status> {
         }
       }
       if (x !== " " || y !== " ") {
-        files.push({ path: entry.path, index: x, worktree: y, head: h, staged, worktreeMode });
+        // git's v2 line of an intent-to-add entry: no index side while the file is there
+        // (".A"), and the placeholder as the HEAD side once it is gone (".D")
+        const ita = entry.intentToAdd;
+        files.push({
+          path: entry.path,
+          index: x,
+          worktree: y,
+          head: ita && y === "D" ? staged : h,
+          staged: ita && y === "A" ? undefined : staged,
+          worktreeMode,
+          ...(commitChanged ? { submoduleCommitChanged: true } : {}),
+        });
       }
     }
 
@@ -206,6 +227,9 @@ export class StatusCommand extends GitCommand<Status> {
         }
       }
     }
+
+    // as git status: the refreshed stats written back when the index is free and unchanged
+    await refreshIndexStats(this.staging, refresh);
 
     return new StatusImpl(added, changed, removed, conflicting, {
       modified,

@@ -14,13 +14,17 @@
 
 import { type Blobs, FileMode, type ObjectId, type Trees } from "@statewalker/vcs-core";
 import type { Staging } from "../staging/staging.js";
+import type { StagingEntry } from "../staging/types.js";
 import {
   compareWithWorktree,
   defaultModeTrust,
   findUntrackedFiles,
   trackedUnder,
+  type WorktreeComparison,
 } from "../status/worktree-status.js";
+import { isUnknownContentId } from "../worktree/hash-worktree-file.js";
 import { storeWorktreeFile } from "../worktree/store-worktree-file.js";
+import type { WorktreeEntry } from "../worktree/types.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { modeFromWorktree, type WorktreeModeTrust } from "../worktree/worktree-mode.js";
 import { flattenTree } from "./checkout-utils.js";
@@ -92,46 +96,226 @@ export async function createIndexTree(source: StashTreesSource): Promise<ObjectI
   return source.staging.writeTree(source.trees);
 }
 
+/** One index entry (stage 0) and how its worktree file compares. */
+export interface ScannedEntry {
+  entry: StagingEntry;
+  /** Absent for a skip-worktree entry (never compared) */
+  compared?: WorktreeComparison;
+}
+
 /**
- * The stash's worktree tree: the index, updated from the worktree for every tracked path
- * (index or HEAD) whose file differs, removed where the file is gone, as git's
- * `stash_working_tree`. Submodules keep their index entry.
+ * The index compared with the worktree once, for everything a stash needs from it (the
+ * check for changes, the worktree tree, the reset, the stat refresh).
+ */
+export interface IndexScan {
+  /** The stage-0 entries in index order */
+  entries: ScannedEntry[];
+  /** Paths with unmerged entries */
+  unmerged: string[];
+  /** Every path of the index, any stage */
+  paths: Set<string>;
+}
+
+/** The index's write time as the staging reports it (0 where it cannot). */
+export function indexTimeOf(staging: Staging): number {
+  return typeof staging.getUpdateTime === "function" ? staging.getUpdateTime() : 0;
+}
+
+/** Compares every index entry with the worktree, through the stat (racy ones re-hashed). */
+export async function scanIndex(source: StashTreesSource): Promise<IndexScan> {
+  const { staging, worktree } = source;
+  const trust = source.trust ?? defaultModeTrust(worktree);
+  const indexTime = indexTimeOf(staging);
+  const entries: ScannedEntry[] = [];
+  const unmerged: string[] = [];
+  const paths = new Set<string>();
+  for await (const entry of staging.entries()) {
+    paths.add(entry.path);
+    if (entry.stage !== 0) {
+      unmerged.push(entry.path);
+      continue;
+    }
+    if (entry.skipWorktree) {
+      entries.push({ entry });
+      continue;
+    }
+    entries.push({
+      entry,
+      compared: await compareWithWorktree(worktree, entry, { trust, indexTime }),
+    });
+  }
+  return { entries, unmerged: [...new Set(unmerged)], paths };
+}
+
+/** Fresh stat for an index entry. */
+export interface IndexStatUpdate {
+  path: string;
+  objectId: ObjectId;
+  mode: number;
+  size: number;
+  mtime: number;
+  ctime?: number;
+}
+
+/**
+ * The entries a scan found clean only by hashing (their stat no longer matched, or was
+ * racy): their fresh stat lets the next comparison skip reading them, as git's index
+ * refresh does.
+ */
+export function refreshableEntries(scan: IndexScan): IndexStatUpdate[] {
+  const out: IndexStatUpdate[] = [];
+  for (const { entry, compared } of scan.entries) {
+    const update = statUpdateOf(entry, compared);
+    if (update) out.push(update);
+  }
+  return out;
+}
+
+/**
+ * The index stat to write for an entry after comparing it: its fresh stat when it was
+ * proved clean by hashing, or its old stat with size 0 when it changed though its stat
+ * matched (git's racy-git smudging); undefined when nothing needs writing.
+ */
+export function statUpdateOf(
+  entry: StagingEntry,
+  compared: WorktreeComparison | undefined,
+): IndexStatUpdate | undefined {
+  if (!compared || entry.intentToAdd) return undefined;
+  if (compared.smudge) {
+    return {
+      path: entry.path,
+      objectId: entry.objectId,
+      mode: entry.mode,
+      size: 0,
+      mtime: entry.mtime,
+      ...(entry.ctime !== undefined ? { ctime: entry.ctime } : {}),
+    };
+  }
+  const file = compared.worktreeEntry;
+  if (compared.kind || !file || file.isDirectory || compared.hashedId !== entry.objectId) {
+    return undefined;
+  }
+  return {
+    path: entry.path,
+    objectId: entry.objectId,
+    mode: entry.mode,
+    size: file.size,
+    mtime: file.mtime,
+    ...(file.ctime !== undefined ? { ctime: file.ctime } : {}),
+  };
+}
+
+/**
+ * Stores fresh stats in the index and writes it, as git refreshes the index during status:
+ * only when the index was not changed meanwhile (`isOutdated`), and with git's racy-git
+ * smudging (an entry modified at or after the write gets size 0, so it is re-hashed next
+ * time). A write that fails (another writer holds `index.lock`) is given up quietly.
+ * Returns whether the index was written.
+ */
+export async function refreshIndexStats(
+  staging: Staging,
+  updates: IndexStatUpdate[],
+): Promise<boolean> {
+  if (updates.length === 0) return false;
+  try {
+    if (typeof staging.isOutdated === "function" && (await staging.isOutdated())) return false;
+    const now = Date.now();
+    const editor = staging.createEditor();
+    for (const u of updates) {
+      editor.upsert({ ...u, stage: 0, size: Math.floor(u.mtime) >= now ? 0 : u.size });
+    }
+    await editor.finish();
+    await staging.write();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a leading component of `path` is a symbolic link. */
+async function beyondSymlink(worktree: Worktree, path: string): Promise<boolean> {
+  const parts = path.split("/");
+  for (let k = 1; k < parts.length; k++) {
+    const entry = await worktree.getEntry(parts.slice(0, k).join("/"));
+    if (!entry) return false;
+    if (entry.mode === FileMode.SYMLINK) return true;
+    if (!entry.isDirectory) return false;
+  }
+  return false;
+}
+
+/**
+ * The stash's worktree tree, as git's `stash_working_tree` (`diff-index HEAD` piped to
+ * `update-index --add --remove` on a copy of the index tree):
+ * - a tracked file that changed is taken from the worktree, with the mode git stages;
+ * - a file gone from the worktree is removed, but a file that is not in HEAD (staged new)
+ *   keeps its staged blob and a file replaced by a directory keeps its index entry;
+ * - a path beyond a symbolic link refuses the stash, as does an intent-to-add entry;
+ * - a submodule takes the commit checked out in it;
+ * - a path HEAD has but the index does not (`git rm --cached`) is taken from the worktree
+ *   where the file is still there.
  *
- * @param headTree HEAD's tree: a path HEAD has but the index does not (`git rm --cached`)
- *   is taken from the worktree where the file is still there, as git does
+ * @param scan The index already compared with the worktree ({@link scanIndex}); computed
+ *   here when absent
  */
 export async function createWorktreeTree(
   source: StashTreesSource,
   headTree?: ObjectId,
+  scan?: IndexScan,
 ): Promise<ObjectId> {
-  const { staging, worktree, blobs } = source;
-  await assertNoUnmergedEntries(staging);
-  const trust = source.trust ?? defaultModeTrust(worktree);
-  const indexTime = typeof staging.getUpdateTime === "function" ? staging.getUpdateTime() : 0;
-  const result = new Map<string, FlatTreeEntry>();
-  const store = async (
-    path: string,
-    entry: NonNullable<Awaited<ReturnType<Worktree["getEntry"]>>>,
-  ) => (await storeWorktreeFile(blobs, worktree, path, entry)).id;
-  const indexed = new Set<string>();
-  for await (const entry of staging.entries()) {
-    indexed.add(entry.path);
-    if (entry.stage !== 0) continue;
-    if (entry.mode === FileMode.GITLINK || entry.skipWorktree) {
-      result.set(entry.path, { id: entry.objectId, mode: entry.mode });
-      continue;
-    }
-    const compared = await compareWithWorktree(worktree, entry, { trust, indexTime });
-    if (compared.kind === "deleted" || !compared.worktreeEntry) continue;
-    const mode = compared.worktreeMode ?? entry.mode;
-    if (compared.kind || entry.intentToAdd) {
-      result.set(entry.path, { id: await store(entry.path, compared.worktreeEntry), mode });
-    } else {
-      result.set(entry.path, { id: entry.objectId, mode: entry.mode });
+  const { worktree, blobs } = source;
+  const scanned = scan ?? (await scanIndex(source));
+  if (scanned.unmerged.length > 0) await assertNoUnmergedEntries(source.staging);
+  const cannot = "Cannot save the current worktree state";
+  for (const { entry } of scanned.entries) {
+    if (entry.intentToAdd) {
+      throw new Error(`error: Entry '${entry.path}' not uptodate. Cannot merge.\n${cannot}`);
     }
   }
-  for (const [path] of await flattenTree(source.trees, headTree)) {
-    if (indexed.has(path)) continue;
+  const trust = source.trust ?? defaultModeTrust(worktree);
+  const head = await flattenTree(source.trees, headTree);
+  const store = async (path: string, file: WorktreeEntry, known?: ObjectId) => {
+    if (known && !isUnknownContentId(known) && (await blobs.has(known))) return known;
+    return (await storeWorktreeFile(blobs, worktree, path, file)).id;
+  };
+  const result = new Map<string, FlatTreeEntry>();
+  for (const { entry, compared } of scanned.entries) {
+    const kept = { id: entry.objectId, mode: entry.mode };
+    if (!compared) {
+      result.set(entry.path, kept);
+      continue;
+    }
+    if (entry.mode === FileMode.GITLINK) {
+      const moved = compared.kind === "modified" && compared.hashedId;
+      result.set(
+        entry.path,
+        moved ? { id: compared.hashedId as ObjectId, mode: entry.mode } : kept,
+      );
+      continue;
+    }
+    if (compared.kind === "deleted") {
+      if (await beyondSymlink(worktree, entry.path)) {
+        throw new Error(
+          `error: '${entry.path}' is beyond a symbolic link\nfatal: Unable to process path ${entry.path}\n${cannot}`,
+        );
+      }
+      // update-index keeps an entry whose path became a directory; diff-index does not
+      // report a staged new file that is gone (match_missing off)
+      if (compared.worktreeEntry?.isDirectory || !head.has(entry.path))
+        result.set(entry.path, kept);
+      continue;
+    }
+    if (compared.kind && compared.worktreeEntry) {
+      result.set(entry.path, {
+        id: await store(entry.path, compared.worktreeEntry, compared.hashedId),
+        mode: compared.worktreeMode ?? entry.mode,
+      });
+      continue;
+    }
+    result.set(entry.path, kept);
+  }
+  for (const [path] of head) {
+    if (scanned.paths.has(path)) continue;
     const current = await worktree.getEntry(path);
     if (!current || current.isDirectory) continue;
     result.set(path, {
@@ -150,13 +334,13 @@ export interface UntrackedTree {
 
 /**
  * The files the index does not track, as `git stash -u` (or `-a` with `includeIgnored`)
- * stores them in its third parent; undefined when there are none. Nested repositories are
- * not stored.
+ * stores them in its third parent. As git, the tree is written even when there is none
+ * (the empty tree). Nested repositories are not stored.
  */
 export async function createUntrackedTree(
   source: StashTreesSource,
   options: { includeIgnored?: boolean } = {},
-): Promise<UntrackedTree | undefined> {
+): Promise<UntrackedTree> {
   const { staging, worktree, blobs } = source;
   const trust = source.trust ?? defaultModeTrust(worktree);
   const tracked = new Set<string>();
@@ -173,31 +357,27 @@ export async function createUntrackedTree(
       mode: modeFromWorktree(file.entry.mode, undefined, trust),
     });
   }
-  if (result.size === 0) return undefined;
   return { treeId: await storeFlatTree(source.trees, result), paths: [...result.keys()] };
 }
 
 /**
- * Whether there is anything tracked to stash: the index differs from HEAD (`diff-index
- * --cached HEAD`), or a worktree file differs from the index (`diff-files`).
+ * Whether there is anything tracked to stash (git's `check_changes_tracked_files`): the
+ * index differs from HEAD, or a worktree file differs from the index; submodules ignored.
  */
 export async function hasTrackedChanges(
   source: StashTreesSource,
   headTree?: ObjectId,
+  scan?: IndexScan,
 ): Promise<boolean> {
-  const { staging, worktree } = source;
+  const scanned = scan ?? (await scanIndex(source));
+  if (scanned.unmerged.length > 0) return true;
   const head = await flattenTree(source.trees, headTree);
-  const trust = source.trust ?? defaultModeTrust(worktree);
-  const indexTime = typeof staging.getUpdateTime === "function" ? staging.getUpdateTime() : 0;
-  let indexed = 0;
-  for await (const entry of staging.entries()) {
-    if (entry.stage !== 0) return true;
-    indexed++;
+  for (const { entry, compared } of scanned.entries) {
     const inHead = head.get(entry.path);
     if (!inHead || inHead.id !== entry.objectId || inHead.mode !== entry.mode) return true;
     if (entry.intentToAdd) return true;
-    if (entry.skipWorktree || entry.assumeValid) continue;
-    if ((await compareWithWorktree(worktree, entry, { trust, indexTime })).kind) return true;
+    if (entry.mode === FileMode.GITLINK || entry.assumeValid) continue;
+    if (compared?.kind) return true;
   }
-  return indexed !== head.size;
+  return scanned.entries.length !== head.size;
 }

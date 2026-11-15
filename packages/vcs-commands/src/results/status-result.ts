@@ -35,6 +35,8 @@ export interface StatusFileEntry {
   staged?: StatusSide;
   /** The mode git would stage for the worktree file, if there is one */
   worktreeMode?: number;
+  /** A submodule whose checked-out commit differs from the index's (porcelain v2 `SC..`) */
+  submoduleCommitChanged?: boolean;
   /** An unmerged path's stages 1-3 (base, ours, theirs) */
   stages?: [StatusSide | undefined, StatusSide | undefined, StatusSide | undefined];
 }
@@ -144,8 +146,11 @@ function comparePaths(a: string, b: string): number {
 const ZERO_ID = "0".repeat(40);
 const octal = (mode: number | undefined) => (mode ?? 0).toString(8).padStart(6, "0");
 
-/** git's quoting of a path in status output (`core.quotePath`, on by default). */
-function quotePath(path: string): string {
+/**
+ * git's quoting of a path in status output (`core.quotePath`, on by default); porcelain v1
+ * quotes a path with a space too (`QUOTE_PATH_QUOTE_SP`), v2 does not.
+ */
+function quotePath(path: string, quoteSpace = false): string {
   const bytes = new TextEncoder().encode(path);
   let needs = false;
   let out = "";
@@ -159,6 +164,9 @@ function quotePath(path: string): string {
     } else if (b === 0x0a) {
       needs = true;
       out += "\\n";
+    } else if (b === 0x20 && quoteSpace) {
+      needs = true;
+      out += " ";
     } else if (b < 0x20 || b >= 0x7f) {
       needs = true;
       out += `\\${b.toString(8).padStart(3, "0")}`;
@@ -192,13 +200,14 @@ export function formatStatusPorcelain(status: Status, version: 1 | 2 = 1): strin
     .sort((a, b) => comparePaths(a.path, b.path));
   const lines: string[] = [];
   for (const e of tracked) {
-    const path = quotePath(e.path);
+    const path = quotePath(e.path, version === 1);
     if (version === 1) {
       lines.push(`${e.index}${e.worktree} ${path}`);
       continue;
     }
     const xy = `${e.index === " " ? "." : e.index}${e.worktree === " " ? "." : e.worktree}`;
-    const sub = e.staged?.mode === 0o160000 || e.head?.mode === 0o160000 ? "S..." : "N...";
+    const isSubmodule = e.staged?.mode === 0o160000 || e.head?.mode === 0o160000;
+    const sub = isSubmodule ? `S${e.submoduleCommitChanged ? "C" : "."}..` : "N...";
     if (e.stages) {
       const [s1, s2, s3] = e.stages;
       lines.push(
@@ -233,7 +242,7 @@ export function formatStatusPorcelain(status: Status, version: 1 | 2 = 1): strin
     );
   }
   const mark = version === 1 ? ["??", "!!"] : ["?", "!"];
-  for (const e of untracked) lines.push(`${mark[0]} ${quotePath(e.path)}`);
-  for (const e of ignored) lines.push(`${mark[1]} ${quotePath(e.path)}`);
+  for (const e of untracked) lines.push(`${mark[0]} ${quotePath(e.path, version === 1)}`);
+  for (const e of ignored) lines.push(`${mark[1]} ${quotePath(e.path, version === 1)}`);
   return lines.map((l) => `${l}\n`).join("");
 }

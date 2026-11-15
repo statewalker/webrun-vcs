@@ -635,3 +635,567 @@ describe("stash apply on a case-folding worktree (core.ignorecase)", () => {
     expect(stages).toEqual(["0 p/x", "2 p~Updated upstream_0", "0 p~updated upstream"]);
   });
 });
+
+/** Files (outside any `.git`), index and the newest stash's three trees of `dir`. */
+function stashSnapshot(dir: string): string {
+  const files = listing(dir)
+    .filter((p) => !p.includes("/.git/") && !p.endsWith("/.git"))
+    .map((p) => `${p}: ${read(join(dir, p))}`);
+  const tree = (rev: string) => {
+    try {
+      return run(dir, "ls-tree", "-r", rev);
+    } catch {
+      return "<none>";
+    }
+  };
+  const parents = (() => {
+    try {
+      return run(dir, "log", "-1", "--format=%P", "stash@{0}").split(" ");
+    } catch {
+      return [];
+    }
+  })();
+  return [
+    "FILES",
+    ...files,
+    "INDEX",
+    run(dir, "ls-files", "-s"),
+    "W",
+    tree("stash@{0}"),
+    "I",
+    parents[1] ? tree(parents[1]) : "<none>",
+    "U",
+    parents[2] ? tree(parents[2]) : "<none>",
+  ].join("\n");
+}
+
+/** A nested repository at `p` in `dir`, with one committed file. */
+const nestedRepo = (dir: string, p: string) => {
+  mkdirSync(join(dir, p), { recursive: true });
+  run(join(dir, p), "init", "-q", "-b", "main");
+  put(join(dir, p), "inner.txt", "precious\n");
+  run(join(dir, p), "add", ".");
+  run(join(dir, p), "commit", "-qm", "inner");
+};
+
+/**
+ * `git stash push` (with `opts`) in `<name>-n` and ours in its twin `<name>-o`, both set up
+ * by `setup`: the same files, index and stash trees, and both refuse or both succeed.
+ */
+async function twinStash(
+  name: string,
+  setup: (dir: string) => void,
+  opts: { u?: boolean; a?: boolean; k?: boolean } = {},
+) {
+  const n = join(root, `${name}-n`);
+  const o = join(root, `${name}-o`);
+  repo(n);
+  setup(n);
+  cpSync(n, o, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
+  const args = ["stash", "push", "-q"];
+  if (opts.a) args.push("-a");
+  else if (opts.u) args.push("-u");
+  if (opts.k) args.push("--keep-index");
+  let nativeError = "";
+  try {
+    exec(n, ...args);
+  } catch (e) {
+    // git stash prints some refusals ("<path>: needs merge") on stdout
+    const out = e as { stderr?: string; stdout?: string };
+    nativeError = (out.stderr || out.stdout || String(e)).trim();
+  }
+  let ourError = "";
+  try {
+    const { ours } = await open(o);
+    await ours
+      .stashCreate()
+      .setIncludeUntracked(!!opts.u || !!opts.a)
+      .setIncludeIgnored(!!opts.a)
+      .setKeepIndex(!!opts.k)
+      .call();
+  } catch (e) {
+    ourError = (e as Error).message;
+  }
+  expect(ourError !== "", `ours: ${ourError} / native: ${nativeError}`).toBe(nativeError !== "");
+  expect(stashSnapshot(o)).toBe(stashSnapshot(n));
+  return { native: n, ours: o, nativeError, ourError };
+}
+
+describeGit("stash push twins against native git (review cases)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-twins-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("-u keeps an untracked nested repository next to stashed untracked files", async () => {
+    const { ours } = await twinStash(
+      "nested-u",
+      (d) => {
+        put(d, "x/a.txt", "u\n");
+        nestedRepo(d, "x/sub");
+      },
+      { u: true },
+    );
+    expect(read(join(ours, "x/sub/inner.txt"))).toBe("precious\n");
+    expect(existsSync(join(ours, "x/sub/.git"))).toBe(true);
+  });
+
+  it("a staged new file next to a nested repository: the repository stays", async () => {
+    const { ours } = await twinStash("nested-staged-new", (d) => {
+      put(d, "x/new.txt", "n\n");
+      run(d, "add", "x/new.txt");
+      nestedRepo(d, "x/sub");
+    });
+    expect(existsSync(join(ours, "x/sub/.git"))).toBe(true);
+  });
+
+  it("-a with an ignored directory holding a nested repository", async () => {
+    const { ours } = await twinStash(
+      "nested-ignored-a",
+      (d) => {
+        put(d, ".gitignore", "x/\n");
+        run(d, "add", ".gitignore");
+        run(d, "commit", "-qm", "ig");
+        put(d, "x/a.log", "l\n");
+        nestedRepo(d, "x/sub");
+      },
+      { a: true },
+    );
+    expect(existsSync(join(ours, "x/sub/.git"))).toBe(true);
+  });
+
+  it("-u with tracked files removed from a directory holding a nested repository", async () => {
+    const { ours } = await twinStash(
+      "tracked-deleted-dir-nested",
+      (d) => {
+        rmSync(join(d, "d/e.txt"));
+        rmSync(join(d, "d/f.txt"));
+        run(d, "rm", "-q", "--cached", "d/e.txt", "d/f.txt");
+        nestedRepo(d, "d/sub");
+        put(d, "d/u.txt", "u\n");
+      },
+      { u: true },
+    );
+    expect(existsSync(join(ours, "d/sub/.git"))).toBe(true);
+  });
+
+  it("more nested repositories, staged and unstaged, exec bits, links, keep-index", async () => {
+    await twinStash(
+      "nested-top-u",
+      (d) => {
+        put(d, "u.txt", "u\n");
+        nestedRepo(d, "sub");
+        put(d, "a.txt", "mod\n");
+      },
+      { u: true },
+    );
+    await twinStash("dir-with-tracked-and-nested", (d) => {
+      put(d, "d/e.txt", "emod\n");
+      rmSync(join(d, "d/f.txt"));
+      nestedRepo(d, "d/sub");
+      run(d, "rm", "-q", "--cached", "d/f.txt");
+    });
+    await twinStash("staged-and-unstaged", (d) => {
+      put(d, "a.txt", "staged\n");
+      run(d, "add", "a.txt");
+      put(d, "a.txt", "unstaged\n");
+    });
+    await twinStash(
+      "staged-and-unstaged-k",
+      (d) => {
+        put(d, "a.txt", "staged\n");
+        run(d, "add", "a.txt");
+        put(d, "a.txt", "unstaged\n");
+        put(d, "b.txt", "bmod\n");
+      },
+      { k: true },
+    );
+    await twinStash(
+      "k-del-new",
+      (d) => {
+        run(d, "rm", "-q", "b.txt");
+        put(d, "n.txt", "n\n");
+        run(d, "add", "n.txt");
+        put(d, "n.txt", "n edited\n");
+        put(d, "c.txt", "cm\n");
+      },
+      { k: true },
+    );
+    await twinStash(
+      "k-u",
+      (d) => {
+        put(d, "a.txt", "s\n");
+        run(d, "add", "a.txt");
+        put(d, "u.txt", "u\n");
+        put(d, "b.txt", "bm\n");
+      },
+      { k: true, u: true },
+    );
+    await twinStash("exec-bit", (d) => chmodSync(join(d, "a.txt"), 0o755));
+    await twinStash("exec-staged-content-unstaged", (d) => {
+      chmodSync(join(d, "a.txt"), 0o755);
+      run(d, "add", "a.txt");
+      put(d, "a.txt", "changed\n");
+    });
+    await twinStash("filemode-false", (d) => {
+      run(d, "config", "core.filemode", "false");
+      chmodSync(join(d, "a.txt"), 0o755);
+      put(d, "b.txt", "bm\n");
+    });
+    await twinStash("link-retarget", (d) => {
+      symlinkSync("a.txt", join(d, "l"));
+      run(d, "add", "l");
+      run(d, "commit", "-qm", "l");
+      rmSync(join(d, "l"));
+      symlinkSync("b.txt", join(d, "l"));
+    });
+  });
+
+  it("a tracked file replaced by a link to a directory outside: nothing outside touched", async () => {
+    const outside = join(root, "outside-1");
+    mkdirSync(outside, { recursive: true });
+    put(root, "outside-1/keep.txt", "keep\n");
+    await twinStash("symlink-typechange", (d) => {
+      rmSync(join(d, "a.txt"));
+      symlinkSync(outside, join(d, "a.txt"));
+    });
+    expect(listing(outside)).toEqual(["keep.txt"]);
+    expect(read(join(outside, "keep.txt"))).toBe("keep\n");
+  });
+
+  it("a tracked directory replaced by a link: refused as git, nothing changed", async () => {
+    const outside = join(root, "outside-2");
+    mkdirSync(outside, { recursive: true });
+    put(root, "outside-2/e.txt", "outside e\n");
+    const { ourError, nativeError } = await twinStash("dir-replaced-by-link", (d) => {
+      rmSync(join(d, "d"), { recursive: true });
+      symlinkSync(outside, join(d, "d"));
+    });
+    // native git ran with -q: our message also has git's last line
+    expect(ourError).toBe(`${nativeError}\nCannot save the current worktree state`);
+    expect(listing(outside)).toEqual(["e.txt"]);
+    expect(read(join(outside, "e.txt"))).toBe("outside e\n");
+  });
+
+  it("an untracked link to a directory with -u: the link goes, its target stays", async () => {
+    const outside = join(root, "outside-3");
+    mkdirSync(outside, { recursive: true });
+    put(root, "outside-3/f.txt", "f\n");
+    await twinStash(
+      "untracked-link-u",
+      (d) => {
+        symlinkSync(outside, join(d, "lnk"));
+        put(d, "a.txt", "m\n");
+      },
+      { u: true },
+    );
+    expect(listing(outside)).toEqual(["f.txt"]);
+  });
+
+  it("ignored files: -u keeps them, -a stashes them; ignored dirs with tracked files", async () => {
+    const ignores = (d: string) => {
+      put(d, ".gitignore", "*.log\nbuild/\n");
+      run(d, "add", ".gitignore");
+      run(d, "commit", "-qm", "ig");
+      put(d, "x.log", "l\n");
+      put(d, "build/o", "o\n");
+      put(d, "d/u.txt", "u\n");
+    };
+    await twinStash("ignored-u", ignores, { u: true });
+    await twinStash("ignored-a", ignores, { a: true });
+    await twinStash(
+      "ignored-dir-with-tracked-u",
+      (d) => {
+        put(d, ".gitignore", "d/\n");
+        run(d, "add", ".gitignore");
+        run(d, "commit", "-qm", "ig");
+        put(d, "d/x.o", "o\n");
+        put(d, "d/e.txt", "em\n");
+      },
+      { u: true },
+    );
+  });
+
+  it("-u removes empty untracked directories, as git clean -d", async () => {
+    await twinStash(
+      "empty-dirs-u",
+      (d) => {
+        mkdirSync(join(d, "empty/deeper"), { recursive: true });
+        put(d, "u/v.txt", "v\n");
+      },
+      { u: true },
+    );
+  });
+
+  it("a tracked file replaced by a directory, a staged new file deleted from disk", async () => {
+    await twinStash("file-to-dir", (d) => {
+      rmSync(join(d, "a.txt"));
+      put(d, "a.txt/inner", "untracked inside\n");
+      put(d, "b.txt", "bm\n");
+    });
+    await twinStash(
+      "file-to-dir-u",
+      (d) => {
+        rmSync(join(d, "a.txt"));
+        put(d, "a.txt/inner", "untracked inside\n");
+      },
+      { u: true },
+    );
+    await twinStash("staged-new-deleted-wt", (d) => {
+      put(d, "n.txt", "n\n");
+      run(d, "add", "n.txt");
+      rmSync(join(d, "n.txt"));
+    });
+  });
+
+  it("git rm --cached, intent-to-add, untracked only, unmerged, racy", async () => {
+    await twinStash(
+      "rm-cached-u",
+      (d) => {
+        run(d, "rm", "-q", "--cached", "a.txt");
+        put(d, "a.txt", "edited\n");
+      },
+      { u: true },
+    );
+    await twinStash("rm-cached", (d) => {
+      run(d, "rm", "-q", "--cached", "a.txt");
+      put(d, "a.txt", "edited\n");
+    });
+    const ita = await twinStash("ita", (d) => {
+      put(d, "n.txt", "n\n");
+      run(d, "add", "-N", "n.txt");
+    });
+    expect(ita.ourError).toBe(`${ita.nativeError}\nCannot save the current worktree state`);
+    await twinStash("only-untracked-noflag", (d) => put(d, "u.txt", "u\n"));
+    await twinStash(
+      "unmerged",
+      (d) => {
+        run(d, "checkout", "-qb", "side");
+        put(d, "a.txt", "side\n");
+        run(d, "commit", "-qam", "side");
+        run(d, "checkout", "-q", "main");
+        put(d, "a.txt", "main\n");
+        run(d, "commit", "-qam", "main");
+        try {
+          exec(d, "merge", "-q", "side");
+        } catch {
+          // conflict expected
+        }
+        put(d, "b.txt", "bm\n");
+        put(d, "u.txt", "u\n");
+      },
+      { u: true },
+    );
+    await twinStash("same-size-racy", (d) => {
+      const when = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+      utimesSync(join(d, "a.txt"), when, when);
+      run(d, "add", "a.txt");
+      utimesSync(join(d, ".git/index"), when, when);
+      put(d, "a.txt", "A\n");
+      utimesSync(join(d, "a.txt"), when, when);
+    });
+  });
+
+  it("stash create (no ref) saves the stash and changes nothing", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "a.txt", "changed\n");
+    const { ours } = await open(dir);
+    const id = await ours.stashCreate().setRef(null).call();
+    expect(id).toBeDefined();
+    expect(read(join(dir, "a.txt"))).toBe("changed\n");
+    expect(run(dir, "status", "--porcelain")).toBe("M a.txt");
+    expect(run(dir, "cat-file", "-p", `${id}:a.txt`)).toBe("changed");
+  });
+
+  it("checkout keeps an untracked nested repository in a directory it empties", async () => {
+    const dir = join(root, "co");
+    repo(dir);
+    run(dir, "branch", "other");
+    put(dir, "x/t.txt", "t\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "x");
+    nestedRepo(dir, "x/sub");
+    const native = `${dir}-native`;
+    cpSync(dir, native, { recursive: true, verbatimSymlinks: true });
+    run(native, "checkout", "-q", "other");
+    const { ours } = await open(dir);
+    await ours.checkout().setName("other").call();
+    expect(existsSync(join(dir, "x/sub/.git"))).toBe(true);
+    expect(read(join(dir, "x/sub/inner.txt"))).toBe("precious\n");
+    expect(listing(dir).filter((p) => !p.includes(".git"))).toEqual(
+      listing(native).filter((p) => !p.includes(".git")),
+    );
+  });
+
+  it("stash apply keeps an untracked nested repository in a directory it empties", async () => {
+    const dir = join(root, "ap");
+    repo(dir);
+    run(dir, "rm", "-q", "d/e.txt", "d/f.txt");
+    run(dir, "stash", "-q");
+    nestedRepo(dir, "d/sub");
+    const native = `${dir}-native`;
+    cpSync(dir, native, { recursive: true, verbatimSymlinks: true });
+    run(native, "stash", "apply", "-q");
+    const { ours } = await open(dir);
+    await ours.stashApply().call();
+    expect(existsSync(join(dir, "d/sub/.git"))).toBe(true);
+    expect(listing(dir).filter((p) => !p.includes(".git"))).toEqual(
+      listing(native).filter((p) => !p.includes(".git")),
+    );
+    expect(run(dir, "ls-files", "-s")).toBe(run(native, "ls-files", "-s"));
+  });
+});
+
+describeGit("status against native git (review cases)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-review-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const at = (name: string, setup: (d: string) => void) => {
+    const d = join(root, name);
+    repo(d);
+    setup(d);
+    return d;
+  };
+
+  it("intent-to-add entries, present and deleted (v1 and v2)", async () => {
+    await expectStatusAsNative(
+      at("ita", (d) => {
+        put(d, "n.txt", "n\n");
+        run(d, "add", "-N", "n.txt");
+      }),
+    );
+    await expectStatusAsNative(
+      at("ita-deleted", (d) => {
+        put(d, "n.txt", "n\n");
+        run(d, "add", "-N", "n.txt");
+        rmSync(join(d, "n.txt"));
+      }),
+    );
+  });
+
+  it("a submodule moved to another commit (its dirty content is not inspected)", async () => {
+    const sub = (d: string) => {
+      nestedRepo(d, "sub");
+      run(d, "add", "sub");
+      run(d, "commit", "-qm", "sub");
+    };
+    await expectStatusAsNative(
+      at("submodule-moved", (d) => {
+        sub(d);
+        put(join(d, "sub"), "inner.txt", "changed\n");
+        run(join(d, "sub"), "commit", "-qam", "x");
+      }),
+    );
+    // a submodule whose own worktree is dirty: git reports ` M sub` (`S.M.` / `S..U`); we
+    // do not read the submodule's index, so it is clean here
+    const dirty = at("submodule-dirty", (d) => {
+      sub(d);
+      put(join(d, "sub"), "inner.txt", "changed\n");
+    });
+    const { ours } = await open(dirty);
+    expect(formatStatusPorcelain(await ours.status().call())).toBe("");
+  });
+
+  it("deleted by both (DD), ignored directory files, quoted paths", async () => {
+    await expectStatusAsNative(
+      at("unmerged-dd", (d) => {
+        run(d, "checkout", "-qb", "side");
+        run(d, "mv", "a.txt", "side.txt");
+        run(d, "commit", "-qm", "side");
+        run(d, "checkout", "-q", "main");
+        run(d, "mv", "a.txt", "main.txt");
+        run(d, "commit", "-qm", "main");
+        try {
+          exec(d, "merge", "-q", "side");
+        } catch {
+          // conflict expected
+        }
+      }),
+    );
+    await expectStatusAsNative(
+      at("ignored-dir", (d) => {
+        put(d, ".gitignore", "build/\n");
+        put(d, "build/a/b.o", "o\n");
+        put(d, "build/c.o", "o\n");
+      }),
+      true,
+    );
+    await expectStatusAsNative(
+      at("quoted", (d) => {
+        put(d, "sp ace.txt", "x");
+        put(d, "tab\tx", "x");
+        put(d, "ü.txt", "x");
+        put(d, 'q"uote', "x");
+        put(d, "a.txt", "mod\n");
+        run(d, "mv", "b.txt", "b c.txt");
+      }),
+    );
+  });
+
+  it("a file replaced by a directory and a directory by a file; after our mixed reset", async () => {
+    await expectStatusAsNative(
+      at("typechange-dir", (d) => {
+        rmSync(join(d, "a.txt"));
+        put(d, "a.txt/x", "x\n");
+      }),
+    );
+    await expectStatusAsNative(
+      at("file-in-place-of-dir", (d) => {
+        rmSync(join(d, "d"), { recursive: true });
+        put(d, "d", "file\n");
+      }),
+    );
+    const d = at("after-mixed-reset", (dir) => put(dir, "a.txt", "AX\n"));
+    const { ours } = await open(d);
+    await ours.reset().setRef("HEAD").call();
+    await expectStatusAsNative(d);
+  });
+});
+
+describeGit("status and stash refresh the index (review cases)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "refresh-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("files proved clean by hashing get their stat: the next status reads none", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    // our mixed reset leaves every entry without a stat
+    const { ours: resetter } = await open(dir);
+    await resetter.reset().setRef("HEAD").call();
+    const first = await open(dir);
+    const hashedFirst = vi.spyOn(first.worktree, "computeHash");
+    expect((await first.ours.status().call()).isClean()).toBe(true);
+    expect(hashedFirst).toHaveBeenCalledTimes(5);
+    const second = await open(dir);
+    const hashedSecond = vi.spyOn(second.worktree, "computeHash");
+    expect((await second.ours.status().call()).isClean()).toBe(true);
+    expect(hashedSecond).not.toHaveBeenCalled();
+    // native git reads the refreshed index as clean too, its stats included (diff-files
+    // trusts them without refreshing)
+    expect(nativeStatus(dir, 1)).toBe("");
+    expect(run(dir, "diff-files", "--name-only")).toBe("");
+    run(dir, "ls-files", "--debug");
+  });
+
+  it("stash push compares each file once and leaves an index the next status trusts", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    const { ours: resetter } = await open(dir);
+    await resetter.reset().setRef("HEAD").call();
+    put(dir, "a.txt", "dirty\n");
+    const stasher = await open(dir);
+    const hashed = vi.spyOn(stasher.worktree, "computeHash");
+    expect(await stasher.ours.stashCreate().call()).toBeDefined();
+    // one comparison per tracked file (no stat after the reset: each is hashed once)
+    expect(hashed).toHaveBeenCalledTimes(5);
+    const after = await open(dir);
+    const hashedAfter = vi.spyOn(after.worktree, "computeHash");
+    expect((await after.ours.status().call()).isClean()).toBe(true);
+    expect(hashedAfter).not.toHaveBeenCalled();
+  });
+});

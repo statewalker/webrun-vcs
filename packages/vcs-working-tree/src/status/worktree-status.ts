@@ -30,6 +30,12 @@ export interface WorktreeComparison {
   worktreeMode?: number;
   /** The file's blob id, when it had to be hashed */
   hashedId?: ObjectId;
+  /**
+   * The file changed though its entry is racy (modified at or after the index was written):
+   * writing the index must give it size 0 so the next comparison reads it again even when
+   * its stat matches (git's smudging)
+   */
+  smudge?: boolean;
 }
 
 /** What the comparison of index entries with the worktree needs. */
@@ -75,10 +81,18 @@ export async function compareWithWorktree(
   if (entry.mode === FileMode.GITLINK) {
     // a submodule: its directory (populated or not) is no change; its contents are not ours
     if (!current) return { kind: "deleted" };
-    if (current.isDirectory) return { worktreeEntry: current, worktreeMode: FileMode.GITLINK };
+    if (current.isDirectory) {
+      // the commit checked out there against the index's (an unpopulated one is no change)
+      const head = await worktree.readGitlinkHead?.(entry.path);
+      const found = { worktreeEntry: current, worktreeMode: FileMode.GITLINK };
+      if (head && head !== entry.objectId) return { kind: "modified", ...found, hashedId: head };
+      return found;
+    }
     return { kind: "typechange", worktreeEntry: current, worktreeMode: current.mode };
   }
-  if (!current || current.isDirectory) return { kind: "deleted" };
+  if (!current) return { kind: "deleted" };
+  // a directory where the file was: deleted, the directory kept for the caller to see
+  if (current.isDirectory) return { kind: "deleted", worktreeEntry: current };
   const worktreeMode = modeFromWorktree(current.mode, entry.mode, trust);
   const found = { worktreeEntry: current, worktreeMode };
   if (!sameType(worktreeMode, entry.mode)) return { kind: "typechange", ...found };
@@ -107,9 +121,10 @@ export async function compareWithWorktree(
     return { kind: "modified", ...found };
   }
   const hashedId = await worktree.computeHash(entry.path);
-  return hashedId === entry.objectId
-    ? { ...found, hashedId }
-    : { kind: "modified", ...found, hashedId };
+  if (hashedId === entry.objectId) return { ...found, hashedId };
+  // a racy entry that changed: smudged when the index is written, as git does for an entry
+  // its own (coarser) stat check would take as clean
+  return { kind: "modified", ...found, hashedId, ...(racy ? { smudge: true } : {}) };
 }
 
 /** One index entry that no longer matches the worktree. */

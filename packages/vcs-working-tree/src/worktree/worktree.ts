@@ -153,6 +153,18 @@ export interface Worktree {
     options?: WorktreeWriteOptions,
   ): Promise<void>;
   remove(path: string, options?: { recursive?: boolean }): Promise<boolean>;
+  /**
+   * Removes the directory at `path` only if it holds nothing at all (git's `rmdir`): no
+   * file, link, directory, `.git`, FIFO or ignored file. Returns whether it was removed.
+   * Absent: callers fall back to a check through `walk`.
+   */
+  removeEmptyDirectory?(path: string): Promise<boolean>;
+
+  /**
+   * The commit checked out in the submodule at `path` (its `HEAD`), read from its `.git`
+   * directory or `gitdir:` file; undefined when it is not populated or cannot be read.
+   */
+  readGitlinkHead?(path: string): Promise<ObjectId | undefined>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
 

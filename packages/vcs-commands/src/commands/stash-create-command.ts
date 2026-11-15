@@ -160,7 +160,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
 
   /**
    * Set the reference to update with the stashed commit ID.
-   * If null, no reference is updated.
+   * If null, no reference is updated and the index and worktree are left as they are
+   * (`git stash create`).
    *
    * @param ref The ref name (default: refs/stash)
    */
@@ -336,10 +337,9 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       message: workingMsg,
     });
 
-    // Update stash ref
-    if (this.ref) {
-      await this.updateStashRef(this.ref, stashCommit, workingMsg, author);
-    }
+    // `git stash create` (no ref): the stash commit only, nothing else changes
+    if (!this.ref) return stashCommit;
+    await this.updateStashRef(this.ref, stashCommit, workingMsg, author);
 
     // Reset the index and the working directory, as git stash push does
     await provider.resetHard({ ...untrackedOptions, keepIndex: this.keepIndex, indexTree });

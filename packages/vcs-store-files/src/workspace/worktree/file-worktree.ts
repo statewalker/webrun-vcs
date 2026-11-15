@@ -545,6 +545,61 @@ export class FileWorktree implements Worktree {
     return this.files.remove(fullPath);
   }
 
+  /**
+   * Removes the directory at `path` only if its listing is empty (git's `rmdir`): a
+   * directory holding anything, a nested repository's `.git` or a FIFO included, stays.
+   * Never follows a link: a link (or anything else) at `path` is not removed.
+   */
+  async removeEmptyDirectory(path: string): Promise<boolean> {
+    assertValidWorktreePath(path, undefined, this.pathRules);
+    if (!this.files.refusesBeyondLinks && (await this.hasLinkOrFileLeading(path))) return false;
+    const fullPath = joinPath(this.rootPath, path);
+    const kind = await this.kindOf(fullPath).catch((error: unknown) => {
+      if (isBeyondSymlinkError(error)) return undefined;
+      throw error;
+    });
+    if (kind !== "directory") return false;
+    for await (const _ of this.files.list(fullPath)) return false;
+    return this.files.remove(fullPath);
+  }
+
+  async readGitlinkHead(path: string): Promise<ObjectId | undefined> {
+    const text = async (full: string) => {
+      try {
+        if ((await this.files.lstat?.(full))?.kind === "symlink") return undefined;
+        if (!(await this.files.exists(full))) return undefined;
+        return new TextDecoder().decode(await readFile(this.files, full)).trim();
+      } catch {
+        return undefined;
+      }
+    };
+    const dotGit = joinPath(this.rootPath, path, ".git");
+    const kind = await this.kindOf(dotGit).catch(() => undefined);
+    let gitDir: string;
+    if (kind === "directory") gitDir = dotGit;
+    else if (kind === "file") {
+      const pointer = await text(dotGit);
+      const target = pointer?.match(/^gitdir: (.+)$/)?.[1];
+      if (!target) return undefined;
+      gitDir = target.startsWith("/")
+        ? target
+        : normalizePath(joinPath(this.rootPath, path, target));
+    } else return undefined;
+    let head = await text(joinPath(gitDir, "HEAD"));
+    for (let depth = 0; head?.startsWith("ref: ") && depth < 5; depth++) {
+      const ref = head.slice(5).trim();
+      const loose = await text(joinPath(gitDir, ref));
+      if (loose) {
+        head = loose;
+        continue;
+      }
+      const packed = await text(joinPath(gitDir, "packed-refs"));
+      const line = packed?.split("\n").find((l) => l.endsWith(` ${ref}`));
+      head = line?.split(" ")[0];
+    }
+    return head && /^[0-9a-f]{40,64}$/.test(head) ? head : undefined;
+  }
+
   async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {
     assertValidWorktreePath(path, undefined, this.pathRules);
     if (!this.files.refusesBeyondLinks) await this.checkLeadingPath(path);

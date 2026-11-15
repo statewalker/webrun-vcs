@@ -270,6 +270,14 @@ export class MemoryWorktree implements Worktree {
     return false;
   }
 
+  async removeEmptyDirectory(path: string): Promise<boolean> {
+    if (!this.directories.has(path) || this.hasFilesUnder(path)) return false;
+    const prefix = `${path}/`;
+    for (const dir of this.directories) if (dir.startsWith(prefix)) return false;
+    this.directories.delete(path);
+    return true;
+  }
+
   async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {
     if (options?.recursive) {
       const parts = path.split("/");

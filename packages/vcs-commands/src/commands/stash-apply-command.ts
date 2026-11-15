@@ -21,6 +21,7 @@ import {
   findInTheWay,
   overwriteMessage,
   pruneEmptyParents,
+  removeDirectoryIfEmpty,
   worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
 
@@ -63,15 +64,7 @@ async function removeIfEmptyDirectory(worktree: Worktree, path: string): Promise
     if (entry) await worktree.remove(path);
     return;
   }
-  const inside = worktree.walk({
-    pathPrefix: path,
-    includeIgnored: true,
-    includeDirectories: true,
-  });
-  for await (const _ of inside) return;
-  // a nested repository's own `.git` is not walked: never remove one
-  if (await worktree.exists(`${path}/.git`)) return;
-  await worktree.remove(path, { recursive: true });
+  await removeDirectoryIfEmpty(worktree, path);
 }
 
 /**

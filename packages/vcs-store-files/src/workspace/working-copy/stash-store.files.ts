@@ -152,20 +152,19 @@ export class GitStashStore implements StashStore {
     const worktreeTree = await createWorktreeTree(source, headCommit?.tree);
     const parents: ObjectId[] = [head, indexCommitId];
 
-    // 3. With includeUntracked, the untracked files commit (3rd parent, no parents itself)
+    // 3. With includeUntracked, the untracked files commit (3rd parent, no parents itself;
+    //    as git, written even when there are none: the empty tree)
     if (options.includeUntracked) {
       const untracked = await createUntrackedTree(source);
-      if (untracked) {
-        parents.push(
-          await this.history.commits.store({
-            tree: untracked.treeId,
-            parents: [],
-            author,
-            committer: author,
-            message: `untracked files on ${onHead}\n`,
-          }),
-        );
-      }
+      parents.push(
+        await this.history.commits.store({
+          tree: untracked.treeId,
+          parents: [],
+          author,
+          committer: author,
+          message: `untracked files on ${onHead}\n`,
+        }),
+      );
     }
 
     // 4. The stash commit

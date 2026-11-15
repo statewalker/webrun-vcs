@@ -280,9 +280,9 @@ export function createRepositoryController(ctx: AppContext): () => void {
     }
 
     try {
-      // Check if there are staged changes
+      // Check if there are staged changes (unstaged and untracked files are not committed)
       const status = await git.status().call();
-      if (!status.hasUncommittedChanges()) {
+      if (status.added.size + status.changed.size + status.removed.size === 0) {
         logModel.warn("Nothing staged to commit");
         return;
       }
