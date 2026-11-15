@@ -166,14 +166,7 @@ const decompressed = await decompressBlock(compressed);
 
 ### Pluggable Implementations
 
-The default streaming implementation uses the Web `CompressionStream` / `DecompressionStream` API; partial decompression uses pako. To use Node.js zlib instead:
-
-```typescript
-import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-
-setCompressionUtils(createNodeCompression());
-```
+The default streaming implementation uses the Web `CompressionStream` / `DecompressionStream` API, which browsers, Node.js and workers all have; partial decompression uses pako. `setCompressionUtils(partial)` swaps in another implementation of the same contract (a test double, say). No package ships a platform-specific one: the VCS packages use only portable APIs.
 
 ### Partial Decompression
 
@@ -328,22 +321,6 @@ Most Recently Used           Least Recently Used
 - O(1) get, set, delete via Map + linked list
 - Evicts from tail when limits exceeded
 - Access moves entry to head
-
-### Intermediate Cache
-
-Optimizes delta chain reconstruction by caching waypoints:
-
-```typescript
-import { IntermediateCache } from "@statewalker/vcs-utils/cache";
-
-const cache = new IntermediateCache();
-
-// Cache every 8 steps in reconstruction
-cache.set(baseRecordId, depth, reconstructedContent);
-
-// Later reconstructions can start from cached waypoint
-const cached = cache.getByComponents(baseRecordId, 4);
-```
 
 ## Streams Module
 

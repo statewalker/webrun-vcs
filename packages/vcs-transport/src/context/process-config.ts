@@ -1,3 +1,5 @@
+import type { ReceivePackConfig } from "../fsm/push/receive-pack-types.js";
+
 /**
  * Configuration options for FSM execution.
  *
@@ -48,19 +50,20 @@ export class ProcessConfiguration {
   sideBand?: boolean;
 
   /**
+   * Server side: the side-band keep-alive interval in milliseconds while a pack is prepared,
+   * until its first byte (an empty band-1 packet, as git's `uploadpack.keepAlive`); 0 turns
+   * keep-alives off.
+   * @default 5000
+   */
+  keepAliveMs?: number;
+
+  /**
    * Progress callback for reporting transfer status.
    * @param message - Progress message to display
    */
   onProgress?: (message: string) => void;
 
   // Push configuration
-
-  /**
-   * Refspecs for push operation.
-   * Format: "[+]src:dst" where + means force push
-   * @example ["refs/heads/main:refs/heads/main", "+refs/heads/feature:refs/heads/feature"]
-   */
-  pushRefspecs?: string[];
 
   /**
    * Whether to use atomic push mode.
@@ -96,7 +99,8 @@ export class ProcessConfiguration {
   allowNonFastForward?: boolean;
 
   /**
-   * Whether to deny updates to the currently checked-out branch.
+   * Whether to deny updates to the currently checked-out branch of a non-bare repository
+   * ("branch is currently checked out", git's `receive.denyCurrentBranch`).
    * @default true
    */
   denyCurrentBranch?: boolean;
@@ -106,6 +110,9 @@ export class ProcessConfiguration {
    * Used with denyCurrentBranch to prevent updates.
    */
   currentBranch?: string;
+
+  /** receive-pack hooks, limits and driver integration */
+  receivePack?: ReceivePackConfig;
 
   // Protocol V2 configuration
 

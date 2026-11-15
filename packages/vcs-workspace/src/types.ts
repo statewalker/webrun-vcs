@@ -53,7 +53,7 @@ export interface Repository {
 /**
  * The push surface the orchestrator needs from the transport axis, as a MINIMAL
  * structural interface. A real adapter wraps `@statewalker/vcs-transport`'s
- * `push()` (`HttpPushResult` → the pushed commit id). `objects` is the OPTIONAL
+ * `push()` (`PushClientResult` → the pushed commit id). `objects` is the OPTIONAL
  * remote large-object store (an LFS/xet side channel); the WorkspaceRemotes
  * model carries no separate content-store remote, so large objects travel with
  * their history remote.

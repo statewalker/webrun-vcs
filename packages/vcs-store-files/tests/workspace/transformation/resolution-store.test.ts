@@ -709,3 +709,116 @@ describe("ResolutionStore", () => {
     });
   });
 });
+
+describe("ResolutionStore streams worktree files", () => {
+  const MiB = 1024 * 1024;
+  const CHUNK = 64 * 1024;
+  const SIZE = 8 * MiB;
+  const oursId = "ours222222222222222222222222222222222222";
+
+  /** A FilesApi whose writes record how far loading ran ahead of writing. */
+  function probedFiles(probe: { produced: number; maxOutstanding: number }): FilesApi {
+    const base = createInMemoryFilesApi();
+    return new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop === "write") {
+          return async (path: string, content: AsyncIterable<Uint8Array>) => {
+            let consumed = 0;
+            for await (const _chunk of content) {
+              consumed++;
+              probe.maxOutstanding = Math.max(probe.maxOutstanding, probe.produced - consumed);
+            }
+            await target.write(path, [new Uint8Array(0)]);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as FilesApi;
+  }
+
+  async function withConflict(staging: Staging): Promise<void> {
+    for (const [stage, objectId] of [
+      [MergeStage.BASE, "base111111111111111111111111111111111111"],
+      [MergeStage.OURS, oursId],
+      [MergeStage.THEIRS, "theirs33333333333333333333333333333333"],
+    ] as const) {
+      await staging.setEntry({ path: "conflict.txt", objectId, mode: 0o100644, stage });
+    }
+  }
+
+  it("acceptOurs streams the blob into the worktree file", async () => {
+    const probe = { produced: 0, maxOutstanding: 0 };
+    const staging = createMemoryGitStaging();
+    await withConflict(staging);
+    const blobs = {
+      load: async (id: string) =>
+        id === oursId
+          ? (async function* () {
+              for (let off = 0; off < SIZE; off += CHUNK) {
+                probe.produced++;
+                yield new Uint8Array(CHUNK);
+              }
+            })()
+          : undefined,
+    };
+    const files = probedFiles(probe);
+    await files.mkdir("/.git");
+    const store = new GitResolutionStore(files, staging, blobs as never, "/.git", "/");
+
+    await store.acceptOurs("conflict.txt");
+    expect(probe.produced).toBe(SIZE / CHUNK);
+    expect(probe.maxOutstanding).toBe(0);
+  });
+
+  it("markAllResolved stores the worktree file as a stream of known size", async () => {
+    const staging = createMemoryGitStaging();
+    await withConflict(staging);
+    const files = createInMemoryFilesApi();
+    await files.mkdir("/.git");
+    const content = new TextEncoder().encode("resolved content without markers");
+    await files.write("/conflict.txt", [content]);
+    const stored: Array<{ array: boolean; size?: number; bytes: number }> = [];
+    const blobs = {
+      load: async () => undefined,
+      store: async (
+        data: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+        size?: number,
+      ): Promise<string> => {
+        let bytes = 0;
+        for await (const chunk of data) bytes += chunk.length;
+        stored.push({ array: Array.isArray(data), size, bytes });
+        return "resolved4444444444444444444444444444444";
+      },
+    };
+    const store = new GitResolutionStore(files, staging, blobs as never, "/.git", "/");
+
+    await store.markAllResolved();
+    expect(stored).toEqual([{ array: false, size: content.length, bytes: content.length }]);
+    expect((await staging.getEntry("conflict.txt"))?.objectId).toBe(
+      "resolved4444444444444444444444444444444",
+    );
+  });
+
+  it("finds a conflict marker split across read chunks", async () => {
+    const staging = createMemoryGitStaging();
+    await withConflict(staging);
+    const base = createInMemoryFilesApi();
+    await base.write("/conflict.txt", [new TextEncoder().encode("a\n<<<<<<< ours\nb\n")]);
+    const files = new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop === "read") {
+          return async function* (path: string) {
+            for await (const chunk of target.read(path)) {
+              for (let i = 0; i < chunk.length; i += 3) yield chunk.subarray(i, i + 3);
+            }
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as FilesApi;
+    const store = new GitResolutionStore(files, staging, {} as never, "/.git", "/");
+    expect((await store.getConflict("conflict.txt"))?.resolvedInWorktree).toBe(false);
+  });
+});

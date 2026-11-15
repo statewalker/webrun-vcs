@@ -23,10 +23,12 @@
 
 import type { BackendCapabilities } from "../backend/storage-backend.js";
 import type { ObjectId } from "../common/id/index.js";
+import type { PackSet } from "../pack/pack-set.js";
 import type { SerializationApi } from "../serialization/serialization-api.js";
 import type { DeltaApi } from "../storage/delta/delta-api.js";
 import type { Blobs } from "./blobs/blobs.js";
 import type { Commits } from "./commits/commits.js";
+import type { GitObjects } from "./objects/git-objects.js";
 import type { Refs } from "./refs/refs.js";
 import type { Tags } from "./tags/tags.js";
 import type { Trees } from "./trees/trees.js";
@@ -81,6 +83,19 @@ export interface History {
    * Supports both direct refs and symbolic refs.
    */
   readonly refs: Refs;
+
+  /**
+   * The object kernel the typed stores sit on: git objects as their exact bytes. Received packs
+   * are written through it (`importPack`), so commits and tags keep their ids byte for byte.
+   * Absent for stores that keep parsed objects only (such as the SQL native stores).
+   */
+  readonly objects?: GitObjects;
+
+  /**
+   * The installed packs, where the backend keeps packs (the files backend). Large received packs
+   * are kept here instead of being unpacked (git's `transfer.unpackLimit`).
+   */
+  readonly packs?: PackSet;
 
   /**
    * Initialize the history store

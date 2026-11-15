@@ -2,18 +2,37 @@
  * VcsRepositoryFacade
  *
  * Implements RepositoryFacade using the History facade for object access.
- * Delegates to History.collectReachableObjects() for pack export and
- * SerializationApi for pack import/creation.
+ * Delegates pack export and import to SerializationApi (exportPack: listObjects + writePack).
  */
 
 import type { History, SerializationApi } from "@statewalker/vcs-core";
-import { isSymbolicRef, serializeCommit, serializeTag, serializeTree } from "@statewalker/vcs-core";
+import {
+  createHistoryFromComponents,
+  DefaultSerializationApi,
+  isSymbolicRef,
+  serializeCommit,
+  serializeTag,
+  serializeTree,
+} from "@statewalker/vcs-core";
 import type {
+  CommitGraphInfo,
   ExportPackOptions,
+  GitObjectTypeName,
+  PackImportOptions,
   PackImportResult,
   RepositoryFacade,
+  TagTargetInfo,
+  TreeEntryInfo,
 } from "@statewalker/vcs-transport";
 import { toArray } from "@statewalker/vcs-utils/streams";
+
+/** git's object type names by type code. */
+const OBJECT_TYPE_NAMES: Record<number, GitObjectTypeName> = {
+  1: "commit",
+  2: "tree",
+  3: "blob",
+  4: "tag",
+};
 
 /**
  * Configuration for VcsRepositoryFacade using History facade
@@ -23,6 +42,11 @@ export interface VcsRepositoryFacadeConfig {
   history: History;
   /** Serialization API for pack operations */
   serialization: SerializationApi;
+  /**
+   * Whether the repository has no working tree (default true). receive-pack refuses to
+   * update the checked-out branch of a non-bare one ("branch is currently checked out").
+   */
+  bare?: boolean;
 }
 
 /**
@@ -34,32 +58,65 @@ export interface VcsRepositoryFacadeConfig {
 export class VcsRepositoryFacade implements RepositoryFacade {
   private readonly history: History;
   private readonly serialization: SerializationApi;
+  private readonly bare: boolean;
 
   constructor(config: VcsRepositoryFacadeConfig) {
     this.history = config.history;
     this.serialization = config.serialization;
+    this.bare = config.bare ?? true;
+  }
+
+  /** Whether the repository has no working tree (receive-pack's current-branch rule). */
+  isBare(): boolean {
+    return this.bare;
   }
 
   /**
    * Import a pack stream into the repository.
-   * Delegates to SerializationApi.importPack.
+   * Delegates to SerializationApi.importPack; with `quarantine` (receive-pack) the objects
+   * stay aside until the returned quarantine is committed, and its `repository` sees them.
    */
-  async importPack(packStream: AsyncIterable<Uint8Array>): Promise<PackImportResult> {
-    return this.serialization.importPack(packStream);
+  async importPack(
+    packStream: AsyncIterable<Uint8Array>,
+    options?: PackImportOptions,
+  ): Promise<PackImportResult> {
+    const { quarantine, ...result } = await this.serialization.importPack(packStream, options);
+    if (!quarantine) return result;
+    // the push's view: the quarantined objects, then the repository's, with the same refs
+    const history = createHistoryFromComponents({
+      objects: quarantine.objects,
+      refs: this.history.refs,
+    });
+    const repository = new VcsRepositoryFacade({
+      history,
+      serialization: new DefaultSerializationApi({ history }),
+      bare: this.bare,
+    });
+    return {
+      ...result,
+      quarantine: {
+        repository,
+        commit: () => quarantine.commit(),
+        discard: () => quarantine.discard(),
+      },
+    };
   }
 
   /**
    * Export objects as a pack stream.
-   * Collects reachable objects from wants, excluding those in exclude set.
-   * Delegates to History.collectReachableObjects().
+   * The objects reachable from wants and not from exclude, streamed.
+   * Delegates to SerializationApi.exportPack.
    */
-  async *exportPack(
+  exportPack(
     wants: Set<string>,
     exclude: Set<string>,
-    _options?: ExportPackOptions,
+    options?: ExportPackOptions,
   ): AsyncIterable<Uint8Array> {
-    const objectIds = this.history.collectReachableObjects(wants, exclude);
-    yield* this.serialization.createPack(objectIds);
+    return this.serialization.exportPack(wants, exclude, {
+      thinPack: options?.thin,
+      shallow: options?.shallow,
+      ofsDelta: options?.ofsDelta,
+    });
   }
 
   /**
@@ -141,6 +198,51 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   }
 
   /**
+   * A commit's parents and committer time (upload-pack walks the graph with it).
+   */
+  async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
+    const commit = await this.history.commits.load(oid);
+    if (!commit) return undefined;
+    return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+  }
+
+  /**
+   * The entries of a tree (receive-pack's connectivity check), undefined when not a tree.
+   */
+  async getTreeEntries(oid: string): Promise<TreeEntryInfo[] | undefined> {
+    try {
+      const tree = await this.history.trees.load(oid);
+      if (!tree) return undefined;
+      return (await toArray(tree)).map((e) => ({ mode: e.mode, name: e.name, id: e.id }));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * What an annotated tag points at, undefined when not a tag.
+   */
+  async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {
+    try {
+      const tag = await this.history.tags.load(oid);
+      if (!tag) return undefined;
+      return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The object's type (receive-pack checks branch tips are commits), undefined when absent.
+   */
+  async getObjectType(oid: string): Promise<GitObjectTypeName | undefined> {
+    if (await this.history.commits.load(oid)) return "commit";
+    if (await this.getTagInfo(oid)) return "tag";
+    if ((await this.getTreeEntries(oid)) !== undefined) return "tree";
+    return (await this.history.blobs.has(oid)) ? "blob" : undefined;
+  }
+
+  /**
    * Check if an object is reachable from other objects.
    */
   async isReachableFrom(oid: string, from: string | string[]): Promise<boolean> {
@@ -174,37 +276,25 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   }
 
   /**
-   * Compute shallow boundaries for depth-limited clone.
+   * Compute shallow boundaries for depth-limited clone, as git's `deepen <depth>`: the
+   * commits `depth` commits deep (the wants for depth 1), each at its smallest depth.
    */
   async computeShallowBoundaries(wants: Set<string>, depth: number): Promise<Set<string>> {
     const boundaries = new Set<string>();
-
-    for (const want of wants) {
-      const queue: Array<{ oid: string; depth: number }> = [{ oid: want, depth: 0 }];
-      const visited = new Set<string>();
-
-      while (queue.length > 0) {
-        const item = queue.shift();
-        if (!item) continue;
-
-        const { oid, depth: d } = item;
-        if (visited.has(oid)) continue;
-        visited.add(oid);
-
-        if (d >= depth) {
-          boundaries.add(oid);
-          continue;
-        }
-
+    const seen = new Set<string>();
+    let level = [...wants];
+    for (let d = 1; level.length > 0; d++) {
+      const next: string[] = [];
+      for (const oid of level) {
+        if (seen.has(oid)) continue;
+        seen.add(oid);
         const commit = await this.history.commits.load(oid);
-        if (commit) {
-          for (const parent of commit.parents) {
-            queue.push({ oid: parent, depth: d + 1 });
-          }
-        }
+        if (!commit) continue;
+        if (d >= depth) boundaries.add(oid);
+        else next.push(...commit.parents);
       }
+      level = next;
     }
-
     return boundaries;
   }
 

@@ -1,4 +1,20 @@
+export {
+  fetchWithRequestBody,
+  isBrowserContext,
+  requestBody,
+  shouldStreamRequestBody,
+  supportsRequestStreams,
+  toReadableStream,
+} from "@statewalker/vcs-utils/streams";
 export type { GitUrl } from "../protocol/types.js";
+export {
+  IdleTimeoutError,
+  readStreamWithIdleTimeout,
+  type StreamChunks,
+  WriteTimeoutError,
+  withIdleTimeout,
+  withWriteTimeout,
+} from "./idle-timeout.js";
 export type { RefSpec } from "./refspec.js";
 export {
   defaultFetchRefSpec,

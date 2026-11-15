@@ -8,8 +8,6 @@ import type { ProcessContext, RefStore } from "../../src/context/process-context
 import { ProtocolState } from "../../src/context/protocol-state.js";
 import { Fsm } from "../../src/fsm/index.js";
 import {
-  clientPushHandlers,
-  clientPushTransitions,
   mapRejectReason,
   type PushCommand,
   serverPushHandlers,
@@ -201,219 +199,8 @@ describe("Push FSM Types", () => {
   });
 });
 
-describe("Client Push FSM", () => {
-  let transport: ReturnType<typeof createMockTransport>;
-  let repository: RepositoryFacade;
-  let refStore: RefStore;
-  let context: ProcessContext;
-
-  beforeEach(() => {
-    transport = createMockTransport();
-    repository = createMockRepository();
-    refStore = createMockRefStore(new Map([["refs/heads/main", "abc123".padEnd(40, "0")]]));
-    context = {
-      transport,
-      repository,
-      refStore,
-      state: new ProtocolState(),
-      output: new HandlerOutput(),
-      config: new ProcessConfiguration(),
-    };
-  });
-
-  describe("READ_ADVERTISEMENT state", () => {
-    it("reads refs from server advertisement", async () => {
-      const oid1 = "a".repeat(40);
-      const oid2 = "b".repeat(40);
-
-      transport = createMockTransport([
-        {
-          type: "data",
-          payload: new Uint8Array(0),
-          text: `${oid1} refs/heads/main\0report-status ofs-delta\n`,
-        },
-        { type: "data", payload: new Uint8Array(0), text: `${oid2} refs/heads/feature\n` },
-        { type: "flush" },
-      ]);
-      context.transport = transport;
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      await fsm.run(context, "COMPUTE_UPDATES");
-
-      expect(fsm.getState()).toBe("COMPUTE_UPDATES");
-      expect(context.state.refs.get("refs/heads/main")).toBe(oid1);
-      expect(context.state.refs.get("refs/heads/feature")).toBe(oid2);
-      expect(context.state.capabilities.has("report-status")).toBe(true);
-      expect(context.state.capabilities.has("ofs-delta")).toBe(true);
-    });
-
-    it("handles empty repository", async () => {
-      transport = createMockTransport([
-        {
-          type: "data",
-          payload: new Uint8Array(0),
-          text: `${ZERO_OID} capabilities^{}\0report-status\n`,
-        },
-        { type: "flush" },
-      ]);
-      context.transport = transport;
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      await fsm.run(context, "COMPUTE_UPDATES");
-
-      expect(fsm.getState()).toBe("COMPUTE_UPDATES");
-      expect(context.state.refs.size).toBe(0);
-      expect(context.state.capabilities.has("report-status")).toBe(true);
-    });
-  });
-
-  describe("COMPUTE_UPDATES state", () => {
-    it("computes update for existing ref (fast-forward)", async () => {
-      const localOid = "a".repeat(40);
-      const remoteOid = "b".repeat(40);
-
-      context.state.refs.set("refs/heads/main", remoteOid);
-      refStore = createMockRefStore(new Map([["refs/heads/main", localOid]]));
-      context.refStore = refStore;
-      context.config.pushRefspecs = ["refs/heads/main:refs/heads/main"];
-
-      // Ancestry: localOid descends from remoteOid (fast-forward)
-      repository = createMockRepository(
-        new Set([remoteOid, localOid]),
-        new Map([[localOid, [localOid, remoteOid]]]),
-      );
-      context.repository = repository;
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      fsm.setState("COMPUTE_UPDATES");
-      await fsm.run(context, "SEND_COMMANDS");
-
-      expect(fsm.getState()).toBe("SEND_COMMANDS");
-      const state = context.state as { pushCommands?: PushCommand[] };
-      expect(state.pushCommands).toHaveLength(1);
-      expect(state.pushCommands?.[0].type).toBe("UPDATE");
-    });
-
-    it("detects non-fast-forward when remote OID is not an ancestor of local OID", async () => {
-      const localOid = "a".repeat(40);
-      const remoteOid = "b".repeat(40);
-      const commonAncestor = "c".repeat(40);
-
-      context.state.refs.set("refs/heads/main", remoteOid);
-      refStore = createMockRefStore(new Map([["refs/heads/main", localOid]]));
-      context.refStore = refStore;
-      context.config.pushRefspecs = ["+refs/heads/main:refs/heads/main"];
-
-      // Ancestry: localOid descends from commonAncestor, NOT from remoteOid
-      // Both objects exist locally but they diverged from a common ancestor
-      repository = createMockRepository(
-        new Set([remoteOid, localOid, commonAncestor]),
-        new Map([[localOid, [localOid, commonAncestor]]]),
-      );
-      context.repository = repository;
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      fsm.setState("COMPUTE_UPDATES");
-      await fsm.run(context, "SEND_COMMANDS");
-
-      expect(fsm.getState()).toBe("SEND_COMMANDS");
-      const state = context.state as { pushCommands?: PushCommand[] };
-      expect(state.pushCommands).toHaveLength(1);
-      // With force (+), non-FF is allowed, so type should be UPDATE_NONFASTFORWARD
-      expect(state.pushCommands?.[0].type).toBe("UPDATE_NONFASTFORWARD");
-    });
-
-    it("rejects non-fast-forward without force flag", async () => {
-      const localOid = "a".repeat(40);
-      const remoteOid = "b".repeat(40);
-      const commonAncestor = "c".repeat(40);
-
-      context.state.refs.set("refs/heads/main", remoteOid);
-      refStore = createMockRefStore(new Map([["refs/heads/main", localOid]]));
-      context.refStore = refStore;
-      // No force (+) prefix
-      context.config.pushRefspecs = ["refs/heads/main:refs/heads/main"];
-
-      // Ancestry: localOid descends from commonAncestor, NOT from remoteOid
-      repository = createMockRepository(
-        new Set([remoteOid, localOid, commonAncestor]),
-        new Map([[localOid, [localOid, commonAncestor]]]),
-      );
-      context.repository = repository;
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      fsm.setState("COMPUTE_UPDATES");
-      const result = await fsm.run(context);
-
-      // Should fail with LOCAL_VALIDATION_FAILED (terminal state "")
-      expect(result).toBe(true);
-      expect(fsm.getState()).toBe("");
-      expect(context.output.error).toContain("non-fast-forward");
-    });
-
-    it("computes create for new ref", async () => {
-      const localOid = "a".repeat(40);
-
-      refStore = createMockRefStore(new Map([["refs/heads/feature", localOid]]));
-      context.refStore = refStore;
-      context.config.pushRefspecs = ["refs/heads/feature:refs/heads/feature"];
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      fsm.setState("COMPUTE_UPDATES");
-      await fsm.run(context, "SEND_COMMANDS");
-
-      expect(fsm.getState()).toBe("SEND_COMMANDS");
-      const state = context.state as { pushCommands?: PushCommand[] };
-      expect(state.pushCommands).toHaveLength(1);
-      expect(state.pushCommands?.[0].type).toBe("CREATE");
-    });
-
-    it("returns NO_UPDATES when nothing to push", async () => {
-      const oid = "a".repeat(40);
-
-      context.state.refs.set("refs/heads/main", oid);
-      refStore = createMockRefStore(new Map([["refs/heads/main", oid]]));
-      context.refStore = refStore;
-      context.config.pushRefspecs = ["refs/heads/main:refs/heads/main"];
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      fsm.setState("COMPUTE_UPDATES");
-      const result = await fsm.run(context);
-
-      expect(result).toBe(true);
-      expect(fsm.getState()).toBe("");
-    });
-  });
-
-  describe("SEND_COMMANDS state", () => {
-    it("sends push commands with capabilities", async () => {
-      const oldOid = "b".repeat(40);
-      const newOid = "a".repeat(40);
-
-      context.state.capabilities.add("report-status");
-      context.state.capabilities.add("side-band-64k");
-      (context.state as { pushCommands?: PushCommand[] }).pushCommands = [
-        {
-          oldOid,
-          newOid,
-          refName: "refs/heads/main",
-          type: "UPDATE",
-          result: "NOT_ATTEMPTED",
-        },
-      ];
-
-      const fsm = new Fsm(clientPushTransitions, clientPushHandlers);
-      fsm.setState("SEND_COMMANDS");
-      await fsm.run(context, "SEND_PACK");
-
-      expect(fsm.getState()).toBe("SEND_PACK");
-      expect(transport.written).toContain(
-        `${oldOid} ${newOid} refs/heads/main\0report-status side-band-64k`,
-      );
-      expect(transport.written).toContain("FLUSH");
-    });
-  });
-});
+// The client side of a push is the push client (src/push-client/), tested in
+// tests/push-client-*.test.ts; the client push FSM is gone.
 
 describe("Server Push FSM", () => {
   let transport: ReturnType<typeof createMockTransport>;
@@ -505,9 +292,9 @@ describe("Server Push FSM", () => {
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
       fsm.setState("READ_COMMANDS");
-      await fsm.run(context, "CHECK_DELETE_ALLOWED");
+      await fsm.run(context, "READ_PUSH_OPTIONS");
 
-      expect(fsm.getState()).toBe("CHECK_DELETE_ALLOWED");
+      expect(fsm.getState()).toBe("READ_PUSH_OPTIONS");
       const state = context.state as { pushCommands?: PushCommand[] };
       expect(state.pushCommands?.[0].type).toBe("DELETE");
     });
@@ -538,10 +325,10 @@ describe("Server Push FSM", () => {
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
       fsm.setState("VALIDATE_COMMANDS");
-      // Stop at RUN_PRE_RECEIVE_HOOK or SEND_STATUS (depending on path)
-      await fsm.run(context, "RUN_PRE_RECEIVE_HOOK", "SEND_STATUS");
+      // Stop at APPLY_UPDATES or SEND_STATUS (depending on path)
+      await fsm.run(context, "APPLY_UPDATES", "SEND_STATUS");
 
-      expect(fsm.getState()).toBe("RUN_PRE_RECEIVE_HOOK");
+      expect(fsm.getState()).toBe("APPLY_UPDATES");
     });
 
     it("rejects non-fast-forward push on server", async () => {
@@ -603,9 +390,9 @@ describe("Server Push FSM", () => {
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
       fsm.setState("VALIDATE_COMMANDS");
-      await fsm.run(context, "RUN_PRE_RECEIVE_HOOK", "SEND_STATUS");
+      await fsm.run(context, "APPLY_UPDATES", "SEND_STATUS");
 
-      expect(fsm.getState()).toBe("RUN_PRE_RECEIVE_HOOK");
+      expect(fsm.getState()).toBe("APPLY_UPDATES");
       const state = context.state as { pushCommands?: PushCommand[] };
       // Should be reclassified as non-fast-forward but still allowed
       expect(state.pushCommands?.[0].type).toBe("UPDATE_NONFASTFORWARD");
@@ -637,7 +424,9 @@ describe("Server Push FSM", () => {
 
       expect(fsm.getState()).toBe("SEND_STATUS");
       const state = context.state as { pushCommands?: PushCommand[] };
-      expect(state.pushCommands?.[0].result).toBe("REJECTED_NONFASTFORWARD");
+      // git: the ref transaction's old-value check, "failed to update ref"
+      expect(state.pushCommands?.[0].result).toBe("LOCK_FAILURE");
+      expect(state.pushCommands?.[0].message).toBe("failed to update ref");
     });
   });
 
@@ -657,6 +446,7 @@ describe("Server Push FSM", () => {
       ];
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+      context.state.capabilities.add("report-status"); // the report is sent when asked
       fsm.setState("SEND_STATUS");
       const result = await fsm.run(context);
 
@@ -681,6 +471,7 @@ describe("Server Push FSM", () => {
       ];
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+      context.state.capabilities.add("report-status"); // the report is sent when asked
       fsm.setState("SEND_STATUS");
       const result = await fsm.run(context);
 
@@ -729,15 +520,22 @@ describe("Server Push FSM: APPLY_UPDATES through an atomic ref batch", () => {
     result: "NOT_ATTEMPTED",
   });
 
-  /** Run APPLY_UPDATES through SEND_STATUS; returns the state after APPLY_UPDATES. */
+  /**
+   * Run APPLY_UPDATES through SEND_STATUS. Returns "RUN_POST_RECEIVE_HOOK" when refs were
+   * applied (post-receive runs, after the report) and "SEND_STATUS" for a failed atomic push.
+   */
   async function apply(context: ProcessContext): Promise<string> {
-    const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+    let event = "";
+    const handlers = new Map(serverPushHandlers);
+    const applyUpdates = serverPushHandlers.get("APPLY_UPDATES");
+    handlers.set("APPLY_UPDATES", async (ctx) => {
+      event = (await applyUpdates?.(ctx)) ?? "";
+      return event;
+    });
+    const fsm = new Fsm(serverPushTransitions, handlers);
     fsm.setState("APPLY_UPDATES");
-    await fsm.run(context, "RUN_POST_RECEIVE_HOOK", "SEND_STATUS");
-    const after = fsm.getState();
-    if (after === "RUN_POST_RECEIVE_HOOK") fsm.setState("SEND_STATUS");
     await fsm.run(context);
-    return after;
+    return event === "ATOMIC_FAILED" ? "SEND_STATUS" : "RUN_POST_RECEIVE_HOOK";
   }
 
   it("applies an atomic push as one batch: update, create and delete together", async () => {

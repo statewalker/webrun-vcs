@@ -17,21 +17,26 @@ import type {
   RefUpdateResult,
   SymbolicRef,
 } from "@statewalker/vcs-core";
+import { isUpdatableRefName, SYMREF_PREFIX } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 
-import { createFilesRefBatch, type FilesRefBatchOptions } from "./files-ref-batch.js";
-import { packRefs, removePackedRef } from "./packed-refs-writer.js";
+import {
+  createFilesRefOps,
+  type FilesRefBatchOptions,
+  type FilesRefOps,
+  RefUpdateRejectedError,
+} from "./files-ref-batch.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
-import { createRefsStructure, deleteRef, writeObjectRef, writeSymbolicRef } from "./ref-writer.js";
+import { createRefsStructure } from "./ref-writer.js";
 import { createReflogReader } from "./reflog-reader.js";
 import { hasReflog } from "./reflog-writer.js";
 
 export interface FileRefStoreOptions extends FilesRefBatchOptions {
   /**
    * Lock-file primitives rooted at `gitDir`. Defaults to `atomicFilesOver(files, gitDir)`,
-   * which is atomic only among users of the same FilesApi instance; pass a native implementation
-   * (`createNodeAtomicFiles` from `@statewalker/vcs-utils-node`) to interoperate
-   * safely with other processes, native git included.
+   * which excludes other processes when the FilesApi has `createExclusive`. Without it, it
+   * is atomic only among users of the same FilesApi instance: share one FilesApi per
+   * repository, and do not let another process (native git included) write it at the same time.
    */
   atomicFiles?: AtomicFiles;
 }
@@ -45,21 +50,68 @@ export interface FileRefStoreOptions extends FilesRefBatchOptions {
  * - .git/refs/remotes/* for remote tracking branches
  * - .git/packed-refs for packed refs
  */
+/** git's shallow file, relative to the git directory */
+const SHALLOW_FILE = "shallow";
+
 export class FileRefStore implements Refs {
-  private readonly applyBatch: (
-    commands: RefCommand[],
-    options?: BatchOptions,
-  ) => Promise<BatchResult>;
+  private readonly ops: FilesRefOps;
+  private readonly atomic: AtomicFiles;
 
   constructor(
     private readonly files: FilesApi,
     private readonly gitDir: string,
     options: FileRefStoreOptions = {},
   ) {
-    this.applyBatch = createFilesRefBatch(
-      options.atomicFiles ?? atomicFilesOver(files, gitDir),
-      options,
-    );
+    this.atomic = options.atomicFiles ?? atomicFilesOver(files, gitDir);
+    this.ops = createFilesRefOps(this.atomic, options);
+  }
+
+  /**
+   * The shallow commits: git's `shallow` file (one id per line), empty when there is none.
+   */
+  async getShallow(): Promise<ObjectId[]> {
+    const decoder = new TextDecoder();
+    let text = "";
+    for await (const chunk of this.atomic.read(SHALLOW_FILE)) {
+      text += decoder.decode(chunk, { stream: true });
+    }
+    text += decoder.decode();
+    return text
+      .split("\n")
+      .filter((line) => /^[0-9a-f]{40}$/.test(line))
+      .sort();
+  }
+
+  /**
+   * Replace the `shallow` file under `shallow.lock`, as git does; an empty list removes it.
+   * Throws when another writer holds the lock, and, with `expected`, when the file no longer
+   * holds what the caller read (git's check_shallow_file_for_update), checked under the lock.
+   */
+  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
+    const ids = [...new Set(commits)].sort();
+    const lock = `${SHALLOW_FILE}.lock`;
+    const content = new TextEncoder().encode(ids.map((id) => `${id}\n`).join(""));
+    if (!(await this.atomic.createExclusive(lock, content))) {
+      throw new Error(`Unable to lock ${SHALLOW_FILE}: ${lock} exists`);
+    }
+    try {
+      if (expected) {
+        const current = await this.getShallow();
+        const want = [...new Set(expected)].sort();
+        if (current.length !== want.length || current.some((id, i) => id !== want[i])) {
+          throw new Error(`shallow file has changed since we read it (${SHALLOW_FILE})`);
+        }
+      }
+      if (ids.length === 0) {
+        await this.atomic.remove(SHALLOW_FILE);
+        await this.atomic.remove(lock);
+      } else {
+        await this.atomic.replace(lock, SHALLOW_FILE);
+      }
+    } catch (error) {
+      await this.atomic.remove(lock).catch(() => false);
+      throw error;
+    }
   }
 
   /**
@@ -68,7 +120,7 @@ export class FileRefStore implements Refs {
    * Writes reflog lines in git's format (`options.ident`, `options.message`).
    */
   batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
-    return this.applyBatch(commands, options);
+    return this.ops.batch(commands, options);
   }
 
   /**
@@ -104,27 +156,36 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Set a ref to point to an object ID
+   * Set a ref to point to an object ID, replacing a symbolic ref of that name (git
+   * `update-ref --no-deref`). A one-command batch without an old-value check: under
+   * `<ref>.lock`, with D/F checks and reflog lines. Names outside `refs/` other than HEAD
+   * (`ORIG_HEAD`) are written under their lock without a reflog. Throws
+   * `RefUpdateRejectedError` (`code` "ELOCKED" when the lock stays held past
+   * `refLockTimeoutMs`) with the ref unchanged.
    */
   async set(refName: string, objectId: ObjectId): Promise<void> {
-    await writeObjectRef(this.files, this.gitDir, refName, objectId);
+    if (!isUpdatableRefName(refName)) return this.ops.writeLoose(refName, `${objectId}\n`);
+    const r = await this.ops.batch([{ name: refName, new: objectId, noDeref: true }]);
+    if (!r.ok) throw new RefUpdateRejectedError(r.rejected);
   }
 
   /**
-   * Set a symbolic ref
+   * Set a symbolic ref: `ref: <target>` written into `<ref>.lock` and renamed over the
+   * ref. Throws `RefUpdateRejectedError` with the ref unchanged when the lock stays held
+   * or on a D/F conflict.
    */
   async setSymbolic(refName: string, target: string): Promise<void> {
-    await writeSymbolicRef(this.files, this.gitDir, refName, target);
+    await this.ops.writeLoose(refName, `${SYMREF_PREFIX}${target}\n`);
   }
 
   /**
-   * Remove a ref (loose and packed). Not locked: prefer `batch` next to other writers.
+   * Remove a ref (loose and packed) and its reflog, as a batch delete does: under
+   * `<ref>.lock`, then in one pass under `packed-refs.lock`, packed-refs is rewritten and
+   * the loose file removed before the lock is released. Throws `RefUpdateRejectedError`
+   * or `PackedRefsLockedError` with nothing changed when a lock stays held.
    */
   async remove(refName: string): Promise<boolean> {
-    // A ref may be loose, packed, or both (a loose ref shadows its packed copy).
-    const loose = await deleteRef(this.files, this.gitDir, refName);
-    const packed = await removePackedRef(this.files, this.gitDir, refName);
-    return loose || packed;
+    return this.ops.removeRef(refName);
   }
 
   /**
@@ -136,7 +197,7 @@ export class FileRefStore implements Refs {
     newValue: ObjectId,
   ): Promise<RefUpdateResult> {
     // A one-command batch: locked, checked under the lock, committed by rename.
-    const r = await this.applyBatch([{ name: refName, old: expectedOld ?? null, new: newValue }]);
+    const r = await this.ops.batch([{ name: refName, old: expectedOld ?? null, new: newValue }]);
     if (r.ok) return { success: true, previousValue: expectedOld };
     return {
       success: false,
@@ -153,15 +214,10 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Pack loose refs into packed-refs file
+   * Pack every loose ref into packed-refs (`git pack-refs --all`), under packed-refs.lock
    */
   async optimize(): Promise<void> {
-    // Get all loose refs to pack
-    const refs = await readAllRefs(this.files, this.gitDir, "refs/");
-    const refNames = refs.map((r) => r.name);
-    if (refNames.length > 0) {
-      await packRefs(this.files, this.gitDir, refNames, true);
-    }
+    await this.ops.packRefs([], { all: true, prune: true });
   }
 
   /**
@@ -176,25 +232,19 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Pack loose refs into packed-refs file
+   * Pack loose refs into packed-refs, as `git pack-refs`: packed-refs is written under
+   * packed-refs.lock (waiting up to `packedLockTimeoutMs`, then throwing
+   * `PackedRefsLockedError`), and only then is each packed loose ref removed, under its
+   * own lock and only if it still holds the packed value.
    */
   async packRefs(
     refNames: string[],
     options?: { all?: boolean; deleteLoose?: boolean },
   ): Promise<void> {
-    const deleteLoose = options?.deleteLoose ?? true;
-
-    if (options?.all) {
-      // Pack all refs
-      const refs = await readAllRefs(this.files, this.gitDir, "refs/");
-      const allRefNames = refs.map((r) => r.name);
-      if (allRefNames.length > 0) {
-        await packRefs(this.files, this.gitDir, allRefNames, deleteLoose);
-      }
-    } else if (refNames.length > 0) {
-      // Pack specific refs
-      await packRefs(this.files, this.gitDir, refNames, deleteLoose);
-    }
+    await this.ops.packRefs(refNames, {
+      all: options?.all === true,
+      prune: options?.deleteLoose ?? true,
+    });
   }
 }
 

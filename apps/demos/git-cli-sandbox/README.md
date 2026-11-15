@@ -60,7 +60,7 @@ The package also has `start` and `git` scripts (`tsx src/main.ts`). Through `pnp
 
 ## Why it is the way it is
 
-- **Porcelain for local commands, transport functions for the network.** `add`, `commit`, `branch`, `checkout`, `merge`, `log`, `diff`, `remote`, `fetch` and `pull` go through `git.<command>().call()`. `clone` and `push` call `clone()` and `push()` from `@statewalker/vcs-transport` directly: `clone` indexes the received pack with `indexPack()` and writes `pack-<sha>.pack` and `.idx` itself, then writes `.git/config` with the `origin` remote; `push` collects the commit, its tree and blobs and hands them to `push()`.
+- **Porcelain for local commands, transport functions for the network.** `add`, `commit`, `branch`, `checkout`, `merge`, `log`, `diff`, `remote`, `fetch` and `pull` go through `git.<command>().call()`. `clone` and `push` call `clone()` and `push()` from `@statewalker/vcs-transport` directly: `clone` installs the received pack with `installPack()` (index-pack: checks it, writes `pack-<sha>.pack`, then `.idx`), then writes `.git/config` with the `origin` remote; `push` collects the commit, its tree and blobs and hands them to `push()`.
 - **One process per command.** Each command opens the repository, does its work and closes the history, so state lives only in `.git`.
 - **Author from the environment.** `commit` uses `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`, falling back to `$USER` and `$USER@localhost`, unless `--author "Name <email>"` is given.
 
@@ -113,4 +113,4 @@ The package also has `start` and `git` scripts (`tsx src/main.ts`). Through `pnp
 
 ### Dependencies
 
-`@statewalker/vcs-commands` (porcelain), `@statewalker/vcs-core` (types, `indexPack`, `writePackIndex`), `@statewalker/vcs-store-files` (Git file backend, index, worktree), `@statewalker/vcs-working-tree` (working copy), `@statewalker/vcs-transport` (HTTP clone/push), `@statewalker/vcs-utils` and `@statewalker/vcs-utils-node` (compression, Node `FilesApi`). `@statewalker/vcs-store-mem` is declared but not imported.
+`@statewalker/vcs-commands` (porcelain), `@statewalker/vcs-core` (types, `installPack`), `@statewalker/vcs-store-files` (Git file backend, index, worktree), `@statewalker/vcs-working-tree` (working copy), `@statewalker/vcs-transport` (HTTP clone/push), `@statewalker/vcs-utils` and `@statewalker/vcs-utils-node` (compression, Node `FilesApi`). `@statewalker/vcs-store-mem` is declared but not imported.

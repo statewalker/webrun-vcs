@@ -2,18 +2,23 @@
  * Common result types for fetch operations.
  */
 
+import type { FetchClientResult } from "../fetch-client/index.js";
+
 /**
- * Result of a high-level fetch operation (duplex or HTTP).
+ * Result of a fetch over a duplex (`fetchOverDuplex`), which reports failures instead of
+ * throwing them.
  */
 export interface FetchResult {
   /** Whether the fetch completed successfully */
   success: boolean;
   /** Error message if failed */
   error?: string;
-  /** Refs that were updated */
+  /** Local refs that hold the fetched values (written, or already up to date), name to id */
   updatedRefs?: Map<string, string>;
   /** Number of objects imported */
   objectsImported?: number;
+  /** The whole report of a successful fetch: ref statuses, shallow change, counters */
+  report?: FetchClientResult;
 }
 
 /**
@@ -26,23 +31,4 @@ export interface ServeResult {
   error?: string;
   /** Number of objects sent */
   objectsSent?: number;
-}
-
-/**
- * Raw fetch/clone result with pack data and binary OIDs.
- *
- * Shared interface for HTTP fetch and clone operations that return
- * low-level protocol data before it's imported into a repository.
- */
-export interface RawFetchResult {
-  /** Map of ref names to object IDs */
-  refs: Map<string, Uint8Array>;
-  /** Pack data received */
-  packData: Uint8Array;
-  /** Default branch name */
-  defaultBranch?: string;
-  /** Total bytes received */
-  bytesReceived: number;
-  /** Whether the remote repository is empty */
-  isEmpty: boolean;
 }

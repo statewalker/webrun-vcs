@@ -1,13 +1,13 @@
 /**
  * VCS Client vs Native Git Server integration tests.
  *
- * Tests our httpFetch and httpPush against a real git-http-backend server.
+ * Tests our fetch client and httpPush against a real git-http-backend server.
  * Validates wire-level interoperability with the reference Git implementation.
  *
  * Skips gracefully when git-http-backend is not available.
  */
 
-import { httpFetch, httpPush } from "@statewalker/vcs-transport";
+import { fetch, type RefStore, type RepositoryFacade } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   createInitializedTestRepository,
@@ -15,6 +15,7 @@ import {
   createTestCommit,
   createTestRepository,
   createTransportRefStore,
+  httpPush,
 } from "../../helpers/index.js";
 import {
   type GitHttpBackendServer,
@@ -24,6 +25,23 @@ import {
 import { createNativeGitClient } from "./helpers/native-git-client.js";
 
 const describeWithGit = gitHttpBackendAvailable() ? describe : describe.skip;
+
+/**
+ * The transport fetch (every branch and tag under its own name), reported as these tests
+ * read it: success or error, the refs that hold the fetched values, the objects imported.
+ */
+async function httpFetch(url: string, repository: RepositoryFacade, refStore: RefStore) {
+  try {
+    const result = await fetch({ url, repository, refStore });
+    const updatedRefs = new Map<string, string>();
+    for (const u of result.refUpdates)
+      if (u.status !== "rejected") updatedRefs.set(u.localRef, u.newOid);
+    const objectsImported = result.imports.reduce((n, r) => n + r.objectsImported, 0);
+    return { success: true, error: undefined, updatedRefs, objectsImported };
+  } catch (error) {
+    return { success: false, error: String(error), updatedRefs: undefined, objectsImported: 0 };
+  }
+}
 
 describeWithGit("VCS Client vs Native Git Server", () => {
   let server: GitHttpBackendServer;

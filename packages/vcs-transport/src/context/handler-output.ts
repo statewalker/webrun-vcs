@@ -17,6 +17,29 @@ export class HandlerOutput {
   error?: string;
 
   /**
+   * receive-pack: the reason `authorize` refused the whole push, when the run ended there
+   * (`receivePack.authorizeFailure: "fatal"`; HTTP answers 403).
+   */
+  authorizationDenied?: string;
+
+  /** The client broke the protocol (a malformed request, over a limit): HTTP answers 400. */
+  protocolError?: boolean;
+
+  /**
+   * Server side: the error came after raw (non-side-band) bytes were written, so it could not
+   * be reported in band; the transport must break the response (abort it) so the client sees a
+   * failure rather than a truncated pack that looks complete.
+   */
+  streamBroken?: boolean;
+
+  /**
+   * Server side: the error was reported to the client in band (an `ERR` line, or band 3 of the
+   * side-band). A transport that sees `error` without this flag once it started writing must
+   * still make the failure visible (an `ERR` line, or by aborting the response).
+   */
+  errorReported?: boolean;
+
+  /**
    * Last acknowledged object ID from server.
    * Updated during ACK/NAK negotiation.
    */

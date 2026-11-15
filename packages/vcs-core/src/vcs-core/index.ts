@@ -4,7 +4,7 @@
  *
  * It builds the existing {@link History} (objects over
  * {@link blobStoreToRawStorage}, refs over {@link kvStoreRefs}), a
- * {@link DefaultSerializationApi} for packs and a {@link GcOrchestrator} for gc,
+ * `writePack` / `unpackObjects` for packs and a {@link GcOrchestrator} for gc,
  * then returns the normalized target API by pure DELEGATION — no new engine
  * logic. Normalization is limited to shape adjustments: collect async-iterables
  * to arrays, take the first merge base, hydrate ids into commits, unify `has`,
@@ -30,8 +30,7 @@ import {
 } from "../history/index.js";
 import type { Tag } from "../history/tags/tags.js";
 import type { TreeEntry } from "../history/trees/tree-entry.js";
-import { DefaultSerializationApi } from "../serialization/serialization-api.impl.js";
-import type { SerializationApi } from "../serialization/serialization-api.js";
+import { unpackObjects, writePack } from "../pack/index.js";
 import { blobStoreToRawStorage } from "../storage/adapters/blob-store-raw-storage.js";
 import { kvStoreRefs } from "../storage/adapters/kv-store-refs.js";
 import { rawStorageStaging } from "../storage/adapters/staging-blob-store.js";
@@ -78,8 +77,13 @@ export interface VcsCore {
   /** Read an annotated tag; throws if the id is not a stored tag. */
   readTag(id: Oid): Promise<Tag>;
 
-  /** Store blob bytes, returning the object id. */
-  writeBlob(bytes: ByteStream): Promise<Oid>;
+  /**
+   * Store blob bytes, returning the object id. With `size`, the bytes are read
+   * once and never held in memory (they must be exactly `size` long, or the
+   * write rejects with `SizeMismatchError`); without it, they are read twice
+   * (small content in memory, longer content spooled; see `Blobs.store`).
+   */
+  writeBlob(bytes: ByteStream, options?: { size?: number }): Promise<Oid>;
   /** Store a tree from entries, returning the object id. */
   writeTree(entries: TreeEntry[]): Promise<Oid>;
   /** Store a commit, returning the object id. */
@@ -98,14 +102,12 @@ export interface VcsCore {
   /** Walk ancestry from `from`, yielding hydrated commits (each with `.id`). */
   log(from: Oid): AsyncIterable<LogEntry>;
 
-  /** Rewrite reachable objects through the pack path (idempotent for loose stores). */
-  repack(): Promise<void>;
   /** Garbage-collect unreachable objects; returns the pruned count. */
   gc(): Promise<{ pruned: number }>;
 
-  /** Import a pack, storing its objects and yielding their ids. */
+  /** Import a pack byte for byte (`unpackObjects`), yielding the ids of its objects. */
   readPack(pack: ByteStream): AsyncIterable<Oid>;
-  /** Build a pack over the given object ids. */
+  /** Stream a pack of the given objects (`writePack`: whole objects, read as they are written). */
   writePack(ids: Oid[]): ByteStream;
 }
 
@@ -131,8 +133,8 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
     commits: createCommits(objects),
     tags: createTags(objects),
     refs: kvStoreRefs(deps.refs),
+    objects,
   });
-  const serialization: SerializationApi = new DefaultSerializationApi({ history });
 
   const readCommit = async (id: Oid): Promise<Commit> => {
     const commit = await history.commits.load(id);
@@ -166,8 +168,8 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
       return tag;
     },
 
-    writeBlob(bytes: ByteStream): Promise<Oid> {
-      return history.blobs.store(bytes);
+    writeBlob(bytes: ByteStream, options?: { size?: number }): Promise<Oid> {
+      return history.blobs.store(bytes, options?.size);
     },
 
     writeTree(entries: TreeEntry[]): Promise<Oid> {
@@ -201,16 +203,6 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
       })();
     },
 
-    async repack(): Promise<void> {
-      async function* allObjectIds(): AsyncIterable<Oid> {
-        yield* history.blobs.keys();
-        yield* history.trees.keys();
-        yield* history.commits.keys();
-        yield* history.tags.keys();
-      }
-      await serialization.importPack(serialization.createPack(allObjectIds()));
-    },
-
     async gc(): Promise<{ pruned: number }> {
       const orchestrator = new GcOrchestrator(history, new MemoryGcStrategy(raw));
       const result = await orchestrator.run();
@@ -219,18 +211,15 @@ export function createVcsCore(deps: VcsCoreDeps, opts: VcsCoreOptions = {}): Vcs
 
     readPack(pack: ByteStream): AsyncIterable<Oid> {
       return (async function* () {
-        const reader = serialization.createPackReader(pack);
-        for await (const entry of reader.entries()) {
-          yield await serialization.importObject(entry.type, entry.resolvedContent);
-        }
+        // byte-exact, streamed: only the ids are kept to be yielded
+        const ids: Oid[] = [];
+        await unpackObjects(objects, pack, { onObject: (id) => ids.push(id) });
+        yield* ids;
       })();
     },
 
     writePack(ids: Oid[]): ByteStream {
-      async function* idStream(): AsyncIterable<Oid> {
-        yield* ids;
-      }
-      return serialization.createPack(idStream());
+      return writePack(objects, ids);
     },
   };
 }

@@ -13,6 +13,15 @@ import { PackProtocolError } from "./errors.js";
 import { packetDataToString } from "./pkt-line-codec.js";
 import type { AckNackResult, Packet } from "./types.js";
 
+/** The id of an ACK as bytes; `PackProtocolError` when it is not an object id. */
+function ackObjectId(idHex: string, line: string): Uint8Array {
+  try {
+    return hexToBytes(idHex);
+  } catch {
+    throw new PackProtocolError(`Expected ACK/NAK, got: ${line}`);
+  }
+}
+
 /**
  * Parse an ACK/NAK response line (protocol v0/v1).
  *
@@ -37,7 +46,7 @@ export function parseAckNak(line: string): AckNackResult {
       throw new PackProtocolError(`Expected ACK/NAK, got: ${line}`);
     }
 
-    const objectId = hexToBytes(idHex);
+    const objectId = ackObjectId(idHex, line);
     const modifier = parts[1];
 
     switch (modifier) {
@@ -87,7 +96,7 @@ export function parseAckNakV2(line: string): AckNackResult {
       throw new PackProtocolError(`Expected ACK/NAK, got: ${line}`);
     }
 
-    const objectId = hexToBytes(idHex);
+    const objectId = ackObjectId(idHex, line);
     // In v2, ACK always means ACK_COMMON
     return { type: "ACK_COMMON", objectId };
   }

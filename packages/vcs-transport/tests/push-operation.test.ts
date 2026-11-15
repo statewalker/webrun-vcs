@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import { push } from "../src/operations/push.js";
 import { ZERO_OID } from "../src/protocol/constants.js";
+import { createMockRefStore, createMockRepository } from "./helpers/test-protocol.js";
 
 /** Distinctive, non-zero remote values: a wrong wire-up cannot accidentally match. */
 const REMOTE_MAIN_OID = "1".repeat(40);
@@ -31,7 +32,8 @@ function pkt(payload: string): string {
  * capability list after a NUL, and follows the flush with no newline between.
  */
 function advertisement(refs: Array<[string, string]>): string {
-  const caps = "report-status side-band-64k delete-refs";
+  // no side-band-64k: the stub answers with a plain report
+  const caps = "report-status delete-refs";
   let body = pkt("# service=git-receive-pack\n") + FLUSH;
   refs.forEach(([name, oid], index) => {
     body += pkt(index === 0 ? `${oid} ${name}\0${caps}\n` : `${oid} ${name}\n`);
@@ -63,6 +65,20 @@ function parseSentCommands(body: string): Array<[string, string, string]> {
 }
 
 /**
+ * A local repository whose every branch and tag named in `refs` is LOCAL_OID. The remote
+ * values are not here, so the refspecs are forced (`+`): otherwise the client itself refuses
+ * them ("fetch first") and sends nothing.
+ */
+function localRepo(refs: string[]) {
+  const repository = createMockRepository();
+  // the stub server reads only the commands
+  repository.exportPack = async function* () {};
+  const refStore = createMockRefStore();
+  for (const ref of refs) refStore._setRef(ref, LOCAL_OID);
+  return { repository, refStore };
+}
+
+/**
  * Run `push()` against a stub server, returning both what the client sent and
  * what the operation reported.
  */
@@ -80,8 +96,8 @@ async function runPush(options: {
 
   const result = await push({
     url: "http://example.test/repo.git",
-    refspecs: options.refspecs,
-    getLocalRef: async () => LOCAL_OID,
+    refspecs: options.refspecs.map((spec) => (spec.startsWith("+") ? spec : `+${spec}`)),
+    ...localRepo(options.refspecs.map((spec) => spec.replace(/^\+/, "").split(":")[0] ?? "")),
     fetchImpl: async (request: Request) => {
       if (request.url.includes("/info/refs")) {
         return new Response(advertisement(options.advertisedRefs), { status: 200 });
@@ -143,8 +159,9 @@ describe("push() — ref advertisement", () => {
     let requestBody = "";
     await push({
       url: "http://example.test/repo.git",
-      refspecs: ["refs/tags/v1:refs/tags/v1"],
-      getLocalRef: async () => LOCAL_OID,
+      // a tag the remote has moves only when forced
+      refspecs: ["+refs/tags/v1:refs/tags/v1"],
+      ...localRepo(["refs/tags/v1"]),
       fetchImpl: async (request: Request) => {
         if (request.url.includes("/info/refs")) {
           return new Response(advertised, { status: 200 });
@@ -165,6 +182,9 @@ describe("push() — reported old object id", () => {
     ["refs/heads/other", REMOTE_OTHER_OID],
   ];
 
+  const byRef = (result: Awaited<ReturnType<typeof push>>, ref: string) =>
+    result.updates.find((u) => u.remoteRef === ref);
+
   it("reports the remote's pre-push value for an accepted ref", async () => {
     const { result } = await runPush({
       advertisedRefs,
@@ -172,9 +192,9 @@ describe("push() — reported old object id", () => {
     });
 
     // Distinct per ref: a single shared value, or the newOid, cannot pass both.
-    expect(result.updates.get("refs/heads/main")?.oldOid).toBe(REMOTE_MAIN_OID);
-    expect(result.updates.get("refs/heads/other")?.oldOid).toBe(REMOTE_OTHER_OID);
-    expect(result.updates.get("refs/heads/main")?.ok).toBe(true);
+    expect(byRef(result, "refs/heads/main")?.oldOid).toBe(REMOTE_MAIN_OID);
+    expect(byRef(result, "refs/heads/other")?.oldOid).toBe(REMOTE_OTHER_OID);
+    expect(byRef(result, "refs/heads/main")?.status).toBe("ok");
   });
 
   it("reports the pre-push value for a REJECTED ref, alongside the reason", async () => {
@@ -184,8 +204,8 @@ describe("push() — reported old object id", () => {
       reportStatus: () => pkt("unpack ok\n") + pkt("ng refs/heads/main non-fast-forward\n") + FLUSH,
     });
 
-    const update = result.updates.get("refs/heads/main");
-    expect(update?.ok).toBe(false);
+    const update = byRef(result, "refs/heads/main");
+    expect(update?.status).toBe("remote-rejected");
     expect(update?.message).toBe("non-fast-forward");
     expect(update?.oldOid).toBe(REMOTE_MAIN_OID);
   });
@@ -196,7 +216,7 @@ describe("push() — reported old object id", () => {
       refspecs: ["refs/heads/main:refs/heads/brand-new"],
     });
 
-    expect(result.updates.get("refs/heads/brand-new")?.oldOid).toBe(ZERO_OID);
+    expect(byRef(result, "refs/heads/brand-new")?.oldOid).toBe(ZERO_OID);
   });
 
   it("reports the pre-push value even when the server sends no status for the ref", async () => {
@@ -206,9 +226,9 @@ describe("push() — reported old object id", () => {
       reportStatus: () => pkt("unpack ok\n") + FLUSH,
     });
 
-    const update = result.updates.get("refs/heads/main");
-    expect(update?.ok).toBe(false);
-    expect(update?.message).toBe("No status received");
+    const update = byRef(result, "refs/heads/main");
+    expect(update?.status).toBe("remote-failure");
+    expect(update?.summary).toBe("[remote failure] (remote failed to report status)");
     expect(update?.oldOid).toBe(REMOTE_MAIN_OID);
   });
 });

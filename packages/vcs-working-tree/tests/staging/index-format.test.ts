@@ -7,10 +7,11 @@
  * Based on JGit DirCache format tests and Git source documentation.
  */
 
-import { sha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, sha1 } from "@statewalker/vcs-utils";
 import { describe, expect, it } from "vitest";
 
 import {
+  encodeIndexFile,
   INDEX_SIGNATURE,
   INDEX_VERSION_2,
   INDEX_VERSION_3,
@@ -180,7 +181,7 @@ describe("Index Format", () => {
         {
           path: "z.txt",
           mode: 0o100644,
-          objectId: "z".repeat(40),
+          objectId: "f".repeat(40),
           stage: 0,
           size: 0,
           mtime: 0,
@@ -196,7 +197,7 @@ describe("Index Format", () => {
         {
           path: "m.txt",
           mode: 0o100644,
-          objectId: "m".repeat(40),
+          objectId: "c".repeat(40),
           stage: 0,
           size: 0,
           mtime: 0,
@@ -391,7 +392,7 @@ describe("Index Format", () => {
         {
           path: longPath,
           mode: 0o100644,
-          objectId: "x".repeat(40),
+          objectId: "e".repeat(40),
           stage: 0,
           size: 0,
           mtime: 0,
@@ -527,5 +528,134 @@ describe("Index Format", () => {
       ];
       await expect(serializeIndexFile(entries)).rejects.toThrow("contains .git");
     });
+  });
+});
+
+describe("index extensions", () => {
+  it("lists the extension signatures after the entries", async () => {
+    const base = await serializeIndexFile([
+      {
+        path: "a.txt",
+        mode: 0o100644,
+        objectId: "a".repeat(40),
+        stage: 0,
+        size: 1,
+        mtime: 0,
+      },
+    ]);
+    expect((await parseIndexFile(base)).extensions).toEqual([]);
+    const body = base.subarray(0, base.length - 20);
+    const ext = (sig: string, size: number) => {
+      const out = new Uint8Array(8 + size);
+      out.set(new TextEncoder().encode(sig), 0);
+      new DataView(out.buffer).setUint32(4, size);
+      return out;
+    };
+    const parts = [body, ext("TREE", 6), ext("link", 20)];
+    const content = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      content.set(p, at);
+      at += p.length;
+    }
+    const file = new Uint8Array(content.length + 20);
+    file.set(content, 0);
+    file.set(await sha1(content), content.length);
+    const parsed = await parseIndexFile(file);
+    expect(parsed.extensions).toEqual(["TREE", "link"]);
+    expect(parsed.entries.map((e) => e.path)).toEqual(["a.txt"]);
+  });
+});
+
+describe("encodeIndexFile: streamed chunks", () => {
+  /** Entries of every shape: modes, stages, flags, and a path longer than 0xFFF bytes. */
+  function fixtureEntries(): StagingEntry[] {
+    const out: StagingEntry[] = [];
+    for (let i = 0; i < 300; i++) {
+      const hex = ((i * 2654435761) >>> 0).toString(16).padStart(8, "0");
+      out.push({
+        path: `dir${i % 7}/sub${i % 3}/file-${i}.${i % 2 ? "txt" : "bin"}`,
+        mode: i % 11 === 0 ? 0o100755 : i % 13 === 0 ? 0o120000 : 0o100644,
+        objectId: hex.repeat(5),
+        stage: (i % 17 === 0 ? 2 : 0) as 0 | 2,
+        size: i * 37,
+        mtime: 1_700_000_000_000 + i * 1001,
+        ctime: 1_600_000_000_000 + i * 7,
+        dev: 2049,
+        ino: 100_000 + i,
+        assumeValid: i % 19 === 0,
+        intentToAdd: i % 23 === 0,
+        skipWorktree: i % 29 === 0,
+      });
+    }
+    out.push({
+      path: `${"a-very-long-path/".repeat(300)}x`,
+      mode: 0o100644,
+      objectId: "e".repeat(40),
+      stage: 0,
+      size: 1,
+      mtime: 0,
+    });
+    return out;
+  }
+
+  function join(chunks: Uint8Array[]): Uint8Array {
+    const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of chunks) {
+      out.set(c, at);
+      at += c.length;
+    }
+    return out;
+  }
+
+  // SHA-1 of what the one-buffer encoder (before encodeIndexFile) wrote for fixtureEntries()
+  const GOLDEN: Record<IndexVersion, string> = {
+    2: "80abda03ed9e128794ad01a47545336ede03eb74",
+    3: "404ec54b4f5dd6e16c8263e846c27ab41c0ad23f",
+    4: "ea7a27f6f440e183a101165c6b34e4955b4bf55b",
+  };
+
+  for (const version of [INDEX_VERSION_2, INDEX_VERSION_3, INDEX_VERSION_4] as const) {
+    it(`is byte-identical to the one-buffer encoder (v${version})`, async () => {
+      const chunks = [...encodeIndexFile(fixtureEntries(), version)];
+      const bytes = join(chunks);
+      expect(bytesToHex(await sha1(bytes))).toBe(GOLDEN[version]);
+      expect(bytesToHex(await sha1(await serializeIndexFile(fixtureEntries(), version)))).toBe(
+        GOLDEN[version],
+      );
+      const parsed = await parseIndexFile(bytes);
+      expect(parsed.entries).toHaveLength(301);
+    });
+  }
+
+  it("yields many bounded chunks, the trailing SHA-1 last", async () => {
+    const entries = fixtureEntries();
+    for (let i = 0; i < 3000; i++) {
+      entries.push({
+        path: `bulk/${i}`,
+        mode: 0o100644,
+        objectId: "1".repeat(40),
+        stage: 0,
+        size: 0,
+        mtime: 0,
+      });
+    }
+    const chunks = [...encodeIndexFile(entries)];
+    expect(chunks.length).toBeGreaterThan(2);
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    expect(Math.max(...chunks.map((c) => c.length))).toBeLessThan(total / 2);
+    const last = chunks[chunks.length - 1] as Uint8Array;
+    expect(last.length).toBe(20);
+    const body = join(chunks.slice(0, -1));
+    expect(last).toEqual(await sha1(body));
+  });
+
+  it("validates paths before it yields anything", () => {
+    const bad: StagingEntry[] = [
+      { path: "ok.txt", mode: 0o100644, objectId: "a".repeat(40), stage: 0, size: 0, mtime: 0 },
+      { path: "a//b", mode: 0o100644, objectId: "a".repeat(40), stage: 0, size: 0, mtime: 0 },
+    ];
+    expect(() => encodeIndexFile(bad)).toThrow("contains //");
   });
 });

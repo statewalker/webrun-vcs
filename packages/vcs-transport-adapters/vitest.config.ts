@@ -37,10 +37,6 @@ export default defineConfig({
         find: /^@statewalker\/vcs-transport$/,
         replacement: path.resolve(import.meta.dirname, "../vcs-transport/src/index.ts"),
       },
-      {
-        find: "@statewalker/vcs-store-mem",
-        replacement: path.resolve(import.meta.dirname, "../vcs-store-mem/src/index.ts"),
-      },
     ],
   },
 });

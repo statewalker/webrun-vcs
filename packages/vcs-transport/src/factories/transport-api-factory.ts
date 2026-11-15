@@ -10,12 +10,14 @@
 import type { Duplex } from "../api/duplex.js";
 import type { PktLineResult, SidebandResult, TransportApi } from "../api/transport-api.js";
 import type { ProtocolState } from "../context/protocol-state.js";
+import { ChunkQueue } from "../protocol/chunk-queue.js";
+import { MIN_PACKET_LENGTH, PKT_DELIM, PKT_END, PKT_FLUSH } from "../protocol/constants.js";
+import { PacketLineError } from "../protocol/errors.js";
 import {
   encodeDelim,
   encodeFlush,
   encodePacket,
   encodePacketLine,
-  parsePacket,
 } from "../protocol/pkt-line-codec.js";
 import {
   encodeSidebandPacket,
@@ -30,9 +32,12 @@ const textDecoder = new TextDecoder();
 
 /**
  * Internal pkt-line reader with buffering support.
+ *
+ * Received bytes wait in a chunk queue and are copied once, when a packet is
+ * taken, so a packet arriving in many small chunks is read in linear time.
  */
 class PktLineReader {
-  private buffer: Uint8Array = new Uint8Array(0);
+  private queue = new ChunkQueue();
   private iterator: AsyncIterator<Uint8Array>;
   private done = false;
 
@@ -45,62 +50,48 @@ class PktLineReader {
    */
   async read(): Promise<PktLineResult> {
     while (true) {
-      // Try to parse a packet from buffer
-      const result = parsePacket(this.buffer);
-      if (result !== null) {
-        this.buffer = result.remaining;
-        const packet = result.packet;
-
-        if (packet.type === "flush") {
-          return { type: "flush" };
-        }
-        if (packet.type === "delim") {
-          return { type: "delim" };
-        }
-        if (packet.type === "data") {
-          const payload = packet.data ?? new Uint8Array(0);
-          let text = textDecoder.decode(payload);
-          // Strip trailing newline
-          if (text.endsWith("\n")) {
-            text = text.slice(0, -1);
-          }
-          return { type: "data", payload, text };
-        }
-      }
-
-      // Need more data
-      if (this.done) {
-        return { type: "eof" };
-      }
-
+      const packet = this.parse();
+      if (packet) return packet;
+      if (this.done) return { type: "eof" };
       const { value, done } = await this.iterator.next();
-      if (done) {
-        this.done = true;
-        // Check if there's remaining data in buffer
-        if (this.buffer.length > 0) {
-          const result = parsePacket(this.buffer);
-          if (result !== null) {
-            this.buffer = result.remaining;
-            const packet = result.packet;
-            if (packet.type === "flush") return { type: "flush" };
-            if (packet.type === "delim") return { type: "delim" };
-            if (packet.type === "data") {
-              const payload = packet.data ?? new Uint8Array(0);
-              let text = textDecoder.decode(payload);
-              if (text.endsWith("\n")) text = text.slice(0, -1);
-              return { type: "data", payload, text };
-            }
-          }
-        }
-        return { type: "eof" };
-      }
-
-      // Append to buffer
-      const newBuffer = new Uint8Array(this.buffer.length + value.length);
-      newBuffer.set(this.buffer);
-      newBuffer.set(value, this.buffer.length);
-      this.buffer = newBuffer;
+      if (done) this.done = true;
+      else this.queue.push(value);
     }
+  }
+
+  /** The next complete packet in the queue, or null when more bytes are needed. */
+  private parse(): PktLineResult | null {
+    const queue = this.queue;
+    if (queue.length < 4) return null;
+    const header = queue.peekHeader();
+    if (header === PKT_FLUSH) {
+      queue.take(4);
+      return { type: "flush" };
+    }
+    if (header === PKT_DELIM) {
+      queue.take(4);
+      return { type: "delim" };
+    }
+    if (header === PKT_END) {
+      // Only stateless protocol-v2 exchanges (over HTTP) end a response with 0002;
+      // none of the exchanges driven through TransportApi does.
+      queue.take(4);
+      throw new PacketLineError(
+        "Unexpected response-end packet (0002): not part of this exchange",
+        header,
+      );
+    }
+    const length = /^[0-9a-fA-F]{4}$/.test(header) ? Number.parseInt(header, 16) : Number.NaN;
+    if (Number.isNaN(length) || length < MIN_PACKET_LENGTH) {
+      throw new PacketLineError(`Invalid packet line header: ${header}`, header);
+    }
+    if (queue.length < length) return null;
+    queue.take(4);
+    const payload = queue.take(length - 4);
+    let text = textDecoder.decode(payload);
+    // Strip trailing newline
+    if (text.endsWith("\n")) text = text.slice(0, -1);
+    return { type: "data", payload, text };
   }
 
   /**
@@ -108,9 +99,7 @@ class PktLineReader {
    * Used when switching from pkt-line mode to raw binary mode.
    */
   drainBuffer(): Uint8Array {
-    const buf = this.buffer;
-    this.buffer = new Uint8Array(0);
-    return buf;
+    return this.queue.drain();
   }
 
   /**
@@ -139,13 +128,8 @@ class PktLineReader {
     return {
       stream: raw(),
       restore: (leftover: Uint8Array) => {
-        if (leftover.length > 0) {
-          // Prepend leftover before any existing buffer content
-          const merged = new Uint8Array(leftover.length + this.buffer.length);
-          merged.set(leftover);
-          merged.set(this.buffer, leftover.length);
-          this.buffer = merged;
-        }
+        // Prepend leftover before any existing buffer content
+        this.queue.unshift(leftover);
       },
     };
   }
@@ -179,38 +163,38 @@ class PktLineWriter {
   constructor(private duplex: Duplex) {}
 
   /**
-   * Writes a pkt-line with proper framing.
+   * Writes a pkt-line with proper framing. Each write waits for the duplex (backpressure).
    */
-  write(data: string | Uint8Array): void {
+  async write(data: string | Uint8Array): Promise<void> {
     const encoded = typeof data === "string" ? encodePacketLine(data) : encodePacket(data);
-    this.duplex.write(encoded);
+    await this.duplex.write(encoded);
   }
 
   /**
    * Writes a flush packet (0000).
    */
-  flush(): void {
-    this.duplex.write(encodeFlush());
+  async flush(): Promise<void> {
+    await this.duplex.write(encodeFlush());
   }
 
   /**
    * Writes a delimiter packet (0001).
    */
-  delimiter(): void {
-    this.duplex.write(encodeDelim());
+  async delimiter(): Promise<void> {
+    await this.duplex.write(encodeDelim());
   }
 
   /**
    * Writes data on a sideband channel.
    * Automatically chunks data that exceeds the pkt-line size limit.
    */
-  writeSideband(channel: 1 | 2 | 3, data: Uint8Array): void {
+  async writeSideband(channel: 1 | 2 | 3, data: Uint8Array): Promise<void> {
     const maxPayload = SIDEBAND_MAX_BUF - SIDEBAND_HDR_SIZE;
     let offset = 0;
     while (offset < data.length) {
       const end = Math.min(offset + maxPayload, data.length);
       const chunk = data.subarray(offset, end);
-      this.duplex.write(encodeSidebandPacket(channel, chunk));
+      await this.duplex.write(encodeSidebandPacket(channel, chunk));
       offset = end;
     }
   }
@@ -249,35 +233,20 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
   return {
     // Pkt-line level
     readPktLine: () => reader.read(),
-    writePktLine: (data) => {
-      writer.write(data);
-      return Promise.resolve();
-    },
-    writeFlush: () => {
-      writer.flush();
-      return Promise.resolve();
-    },
-    writeDelimiter: () => {
-      writer.delimiter();
-      return Promise.resolve();
-    },
+    writePktLine: (data) => writer.write(data),
+    writeFlush: () => writer.flush(),
+    writeDelimiter: () => writer.delimiter(),
 
     // Line level convenience
     readLine: async () => {
       const pkt = await reader.read();
       return pkt.type === "data" ? pkt.text : null;
     },
-    writeLine: (line) => {
-      writer.write(line.endsWith("\n") ? line : `${line}\n`);
-      return Promise.resolve();
-    },
+    writeLine: (line) => writer.write(line.endsWith("\n") ? line : `${line}\n`),
 
     // Sideband I/O
     readSideband: () => reader.readSideband(),
-    writeSideband: (channel, data) => {
-      writer.writeSideband(channel, data);
-      return Promise.resolve();
-    },
+    writeSideband: (channel, data) => writer.writeSideband(channel, data),
 
     // Pack streaming
     async *readPack(): AsyncGenerator<Uint8Array> {
@@ -291,7 +260,8 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
           if (pkt.type === "data" && pkt.payload.length > 0) {
             const channel = pkt.payload[0];
             if (channel === SIDEBAND_DATA) {
-              yield pkt.payload.slice(1);
+              // an empty band-1 packet is the server's keep-alive
+              if (pkt.payload.length > 1) yield pkt.payload.slice(1);
             } else if (channel === 3) {
               // Error channel
               const errorMsg = textDecoder.decode(pkt.payload.slice(1));
@@ -333,13 +303,13 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
       if (state.hasCapability("side-band-64k")) {
         // Write pack data on sideband channel 1
         for await (const chunk of packStream) {
-          writer.writeSideband(1, chunk);
+          await writer.writeSideband(1, chunk);
         }
-        writer.flush();
+        await writer.flush();
       } else {
         // Write raw pack data
         for await (const chunk of packStream) {
-          duplex.write(chunk);
+          await duplex.write(chunk);
         }
       }
     },
@@ -348,7 +318,7 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
       // Write raw pack data bypassing sideband.
       // Used by push clients where sideband is server→client only.
       for await (const chunk of packStream) {
-        duplex.write(chunk);
+        await duplex.write(chunk);
       }
     },
 

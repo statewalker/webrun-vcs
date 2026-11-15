@@ -6,7 +6,7 @@
  * stream form needs the size up front (from file stats, a pack entry header or
  * Content-Length), because the header that starts the hash carries it.
  */
-import { createSha1 } from "../hash/hasher/index.js";
+import { createSha1, type Hasher } from "../hash/hasher/index.js";
 import { sha1 } from "../hash/sha1/index.js";
 import { bytesToHex } from "../hash/utils/index.js";
 
@@ -70,6 +70,9 @@ function hasWebCrypto(): boolean {
  * Rejects with `SizeMismatchError` when the stream ends early, and as soon as it
  * produces more than `size` bytes (the rest is not pulled).
  *
+ * `newHasher` makes the incremental hash (SHA-1 by default); pass another
+ * factory for a repository that uses a different object format.
+ *
  * @example
  * ```typescript
  * const size = (await files.stats(path))?.size;
@@ -81,11 +84,12 @@ export async function computeObjectIdFromStream(
   typeStr: string,
   size: number,
   content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+  newHasher: () => Hasher = createSha1,
 ): Promise<string> {
   if (!Number.isSafeInteger(size) || size < 0) {
     throw new RangeError(`object size must be a non-negative safe integer, got ${size}`);
   }
-  const hasher = createSha1().update(encoder.encode(`${typeStr} ${size}\0`));
+  const hasher = newHasher().update(encoder.encode(`${typeStr} ${size}\0`));
   let seen = 0;
   for await (const chunk of content) {
     seen += chunk.length;

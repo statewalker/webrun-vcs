@@ -431,14 +431,7 @@ await history.initialize();
 
 ### Custom Compression
 
-The compression layer supports pluggable implementations:
-
-```typescript
-import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
-
-setCompressionUtils(createNodeCompression()); // Use native zlib
-```
+Compression uses the Web `CompressionStream` API everywhere. `setCompressionUtils()` can swap in another implementation of the same contract, but the packages ship none: every package uses only portable APIs (files through `FilesApi`, no `node:*` modules).
 
 ### Repository Resolution
 

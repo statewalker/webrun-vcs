@@ -65,6 +65,33 @@ export function git(cwd: string, args: string[]): string {
   }).trim();
 }
 
+const PROXY_VARIABLES = new Set([
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+]);
+
+/**
+ * `process.env` for a git that talks to a loopback HTTP server: without proxy variables, and
+ * with `127.0.0.1` and `localhost` in `NO_PROXY`/`no_proxy`, so a proxy configured on the
+ * machine (or in CI) never sees the request.
+ */
+export function loopbackEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !PROXY_VARIABLES.has(key)) env[key] = value;
+  }
+  const noProxy = [env.NO_PROXY, env.no_proxy, "127.0.0.1", "localhost"]
+    .filter((v) => v !== undefined && v !== "")
+    .join(",");
+  env.NO_PROXY = noProxy;
+  env.no_proxy = noProxy;
+  return env;
+}
+
 /** Create a throwaway tmp directory; caller cleans up via {@link cleanupDir}. */
 export function makeTmpDir(prefix = "vcs-interop-"): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -188,6 +215,8 @@ export function gitProcessDuplex(child: ChildProcessWithoutNullStreams): GitProc
   };
   child.stdout.on("end", signalEnd);
   child.stdout.on("close", signalEnd);
+  // git may exit while we still write to it; EPIPE must not become an uncaught error.
+  child.stdin.on("error", () => {});
   child.stderr.on("data", (chunk: Buffer) => {
     stderrText += chunk.toString("utf8");
   });
@@ -271,8 +300,8 @@ export async function createTransportRepo(): Promise<TransportRepo> {
   const facade = createRepositoryFacade({ history });
   const imports: PackImportResult[] = [];
   const baseImportPack = facade.importPack.bind(facade);
-  facade.importPack = async (packStream) => {
-    const result = await baseImportPack(packStream);
+  facade.importPack = async (packStream, options) => {
+    const result = await baseImportPack(packStream, options);
     imports.push(result);
     return result;
   };

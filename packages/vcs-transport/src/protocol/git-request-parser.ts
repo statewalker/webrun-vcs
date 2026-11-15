@@ -20,7 +20,9 @@
  * - Optional: extra parameters after second NUL (e.g., version=2)
  */
 
-import { parsePacket } from "./pkt-line-codec.js";
+import { ChunkQueue } from "./chunk-queue.js";
+import { MIN_PACKET_LENGTH } from "./constants.js";
+import { PacketLineError } from "./errors.js";
 import type { ServiceType } from "./types.js";
 
 /** Git protocol service type alias. */
@@ -120,26 +122,23 @@ export function parseGitProtocolRequest(data: Uint8Array): GitProtocolRequest {
 export async function readGitProtocolRequest(
   input: AsyncIterable<Uint8Array>,
 ): Promise<GitProtocolRequest> {
-  // Collect bytes until we have a complete pkt-line
-  const chunks: Uint8Array[] = [];
-  let buffer = new Uint8Array(0);
-
+  // Queue the chunks until a whole pkt-line is there; copy it once
+  const queue = new ChunkQueue();
   for await (const chunk of input) {
-    // Append chunk to buffer
-    const newBuffer = new Uint8Array(buffer.length + chunk.length);
-    newBuffer.set(buffer, 0);
-    newBuffer.set(chunk, buffer.length);
-    buffer = newBuffer;
-    chunks.push(chunk);
-
-    // Try to parse a packet
-    const result = parsePacket(buffer);
-    if (result !== null) {
-      if (result.packet.type !== "data" || !result.packet.data) {
-        throw new Error("Invalid git protocol request: expected data packet");
-      }
-      return parseGitProtocolRequest(result.packet.data);
+    queue.push(chunk);
+    if (queue.length < 4) continue;
+    const header = queue.peekHeader();
+    const length = /^[0-9a-fA-F]{4}$/.test(header) ? Number.parseInt(header, 16) : Number.NaN;
+    if (Number.isNaN(length)) {
+      throw new PacketLineError(`Invalid packet line header: ${header}`, header);
     }
+    if (length < MIN_PACKET_LENGTH) {
+      // flush, delim, response-end or an invalid length: not a request
+      throw new Error("Invalid git protocol request: expected data packet");
+    }
+    if (queue.length < length) continue;
+    queue.take(4);
+    return parseGitProtocolRequest(queue.take(length - 4));
   }
 
   throw new Error("Connection closed before complete request received");

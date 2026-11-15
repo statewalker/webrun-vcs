@@ -1,5 +1,10 @@
 import type { Commit, ObjectId, TreeEntry } from "@statewalker/vcs-core";
-import { FileMode, isSymbolicRef } from "@statewalker/vcs-core";
+import {
+  DEFAULT_BIG_FILE_THRESHOLD,
+  FileMode,
+  isSymbolicRef,
+  probeBlob,
+} from "@statewalker/vcs-core";
 import {
   merge3Way,
   MergeContentStrategy as UtilsMergeContentStrategy,
@@ -68,6 +73,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private squash = false;
   private commit = true;
   private message?: string;
+  private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
 
   /**
    * Add a commit/branch to merge.
@@ -126,6 +132,22 @@ export class MergeCommand extends GitCommand<MergeResult> {
   setContentMergeStrategy(contentStrategy: ContentMergeStrategy): this {
     this.checkCallable();
     this.contentStrategy = contentStrategy;
+    return this;
+  }
+
+  /**
+   * Set the size above which files are binary to the content merge (git's
+   * `core.bigFileThreshold`, default 50 MiB).
+   *
+   * A binary file (over the threshold, or a NUL byte in its first 8000 bytes) is
+   * never content-merged and never loaded: as git does, OURS and THEIRS take that
+   * side's file whole, and UNION reports a conflict.
+   *
+   * @param threshold Size in bytes
+   */
+  setBigFileThreshold(threshold: number): this {
+    this.checkCallable();
+    this.bigFileThreshold = threshold;
     return this;
   }
 
@@ -518,10 +540,22 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
 
     try {
-      // Load content from all three versions
-      const baseContent = base ? await this.collectBlobContent(base.id) : new Uint8Array(0);
-      const oursContent = await this.collectBlobContent(ours.id);
-      const theirsContent = await this.collectBlobContent(theirs.id);
+      // Binary or big files are never content-merged (git's ll_binary_merge)
+      const contents = await this.loadTexts([base?.id, ours.id, theirs.id]);
+      if (!contents) {
+        switch (this.contentStrategy) {
+          case ContentMergeStrategy.OURS:
+            return ours;
+          case ContentMergeStrategy.THEIRS:
+            return { ...theirs, name: ours.name };
+          default:
+            return undefined;
+        }
+      }
+
+      // Load content from all three versions (text under the threshold)
+      // (read once, by the probe)
+      const [baseContent, oursContent, theirsContent] = contents;
 
       // Convert ContentMergeStrategy to utils MergeContentStrategy
       const strategy = this.convertContentStrategy(this.contentStrategy);
@@ -548,30 +582,26 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
-   * Collect all bytes from a blob into a single Uint8Array.
+   * The blobs' contents, each read once; nothing when one is binary or over the
+   * threshold (then the rest are not read). A missing id is empty content.
    */
-  private async collectBlobContent(blobId: ObjectId): Promise<Uint8Array> {
-    const chunks: Uint8Array[] = [];
-    const blobContent = await this.blobs.load(blobId);
-    if (blobContent) {
-      for await (const chunk of blobContent) {
-        chunks.push(chunk);
+  private async loadTexts(
+    ids: [ObjectId | undefined, ObjectId, ObjectId],
+  ): Promise<[Uint8Array, Uint8Array, Uint8Array] | undefined> {
+    const out: Uint8Array[] = [];
+    for (const id of ids) {
+      if (!id) {
+        out.push(new Uint8Array(0));
+        continue;
       }
+      const probe = await probeBlob(this.blobs, id, {
+        bigFileThreshold: this.bigFileThreshold,
+        loadText: true,
+      });
+      if (probe.binary || !probe.content) return undefined;
+      out.push(probe.content);
     }
-    if (chunks.length === 0) {
-      return new Uint8Array(0);
-    }
-    if (chunks.length === 1) {
-      return chunks[0];
-    }
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
+    return out as [Uint8Array, Uint8Array, Uint8Array];
   }
 
   /**

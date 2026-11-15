@@ -23,6 +23,7 @@
 
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import type { TransportApi } from "../api/transport-api.js";
+import type { ReceivePackHooks } from "../fsm/push/receive-pack-types.js";
 import { HandlerOutput } from "./handler-output.js";
 import { ProcessConfiguration } from "./process-config.js";
 import type { RefStore } from "./process-context.js";
@@ -184,19 +185,9 @@ export interface ServerPushCommand {
 }
 
 /**
- * Push hooks interface for server-side push operations.
+ * Push hooks for server-side push operations (receive-pack's hooks).
  */
-export interface ServerPushHooks {
-  preReceive?: (
-    commands: ServerPushCommand[],
-    options?: string[],
-  ) => Promise<{
-    ok: boolean;
-    message?: string;
-    rejectedRefs?: string[];
-  }>;
-  postReceive?: (commands: ServerPushCommand[], options?: string[]) => Promise<void>;
-}
+export type ServerPushHooks = ReceivePackHooks;
 
 /** Context key for push commands */
 export const PUSH_COMMANDS_KEY = "pushCommands";

@@ -3,7 +3,12 @@ export {
   type DeltaObjectInfo,
   selectDeltaCandidates,
 } from "./delta-candidate-selector.js";
-export { GcOrchestrator, type GcRunOptions, type GcRunResult } from "./gc-orchestrator.js";
+export {
+  DEFAULT_STALE_EXPIRY_MS,
+  GcOrchestrator,
+  type GcRunOptions,
+  type GcRunResult,
+} from "./gc-orchestrator.js";
 export type {
   CompactResult,
   DeltaCandidatePair,

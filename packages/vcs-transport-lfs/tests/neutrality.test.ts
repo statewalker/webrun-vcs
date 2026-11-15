@@ -14,6 +14,10 @@ describe("neutrality (dep-lint)", () => {
   const allowed = new Set([
     "@statewalker/webrun-content-store",
     "@statewalker/webrun-http-streams",
+    "@statewalker/vcs-utils/hash",
+    "@statewalker/vcs-utils/streams",
+    // the portable FilesApi type, for the git-lfs-layout store (createFilesLfsStore)
+    "@statewalker/vcs-utils/files",
   ]);
   const forbidden = ["vcs-core", "transport-git", "transport-xet", "files-sync", "working-tree"];
 
@@ -26,7 +30,10 @@ describe("neutrality (dep-lint)", () => {
   }
 
   it("src imports only relative paths, node builtins, content-store and http-streams", () => {
-    const files = readdirSync(srcDir).filter((f) => f.endsWith(".ts"));
+    // recursive: the locking API lives in src/locks/
+    const files = (readdirSync(srcDir, { recursive: true }) as string[]).filter((f) =>
+      f.endsWith(".ts"),
+    );
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) {
       for (const spec of importsOf(path.join(srcDir, f))) {

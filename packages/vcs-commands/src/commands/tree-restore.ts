@@ -116,11 +116,7 @@ export async function writeTreeRestorePlan(
       throw new Error(`${operation} cannot restore ${path}: blob ${objectId} is missing`);
     }
 
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of content) {
-      chunks.push(chunk);
-    }
-
-    await worktree.writeContent(path, chunks, { mode, createParents: true });
+    // the blob streams into the file; it is never held whole in memory
+    await worktree.writeContent(path, content, { mode, createParents: true });
   }
 }

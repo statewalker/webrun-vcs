@@ -161,29 +161,16 @@ class ProtocolState {
 
 ### Push FSM
 
-Client and server implementations for push operations:
+The server side of push (receive-pack). The client side is not an FSM: it is the push client in
+`push-client/` (git's send-pack: refspecs, per-ref checks, thin pack, report-status, over smart
+HTTP or a duplex), used by `push` and `pushOverDuplex`.
 
 ```typescript
-import {
-  clientPushTransitions,
-  clientPushHandlers,
-  serverPushTransitions,
-  serverPushHandlers,
-} from "@statewalker/vcs-transport";
-
-// Client push
-const clientFsm = new Fsm(clientPushTransitions, clientPushHandlers);
-await clientFsm.run(context);
+import { serverPushTransitions, serverPushHandlers } from "@statewalker/vcs-transport";
 
 // Server push handler
 const serverFsm = new Fsm(serverPushTransitions, serverPushHandlers);
 await serverFsm.run(context);
-```
-
-**Client Push States:**
-```
-"" → DISCOVER_REFS → NEGOTIATE_CAPABILITIES → BUILD_COMMANDS
-   → SEND_COMMANDS → SEND_PACK → READ_STATUS → ""
 ```
 
 **Server Push States:**
@@ -194,30 +181,16 @@ await serverFsm.run(context);
 
 ### Fetch FSM
 
-Client and server implementations for fetch/clone operations (Protocol V1):
+The server side of fetch (upload-pack, Protocol V1). The client side is not an FSM: it is the
+fetch client in `fetch-client/` (git's fetch-pack: negotiation, shallow, tags, ref updates, over
+protocol v2 or v0, smart HTTP or a duplex), used by `fetch` and `fetchOverDuplex`.
 
 ```typescript
-import {
-  clientFetchTransitions,
-  clientFetchHandlers,
-  serverFetchTransitions,
-  serverFetchHandlers,
-} from "@statewalker/vcs-transport";
-
-// Client fetch
-const clientFsm = new Fsm(clientFetchTransitions, clientFetchHandlers);
-await clientFsm.run(context);
+import { serverFetchTransitions, serverFetchHandlers } from "@statewalker/vcs-transport";
 
 // Server fetch handler
 const serverFsm = new Fsm(serverFetchTransitions, serverFetchHandlers);
 await serverFsm.run(context);
-```
-
-**Client Fetch States:**
-```
-"" → READ_ADVERTISEMENT → SEND_WANTS → SEND_SHALLOW_INFO
-   → SEND_HAVES → READ_ACKS → SEND_DONE → READ_FINAL_ACK
-   → RECEIVE_PACK → UPDATE_REFS → ""
 ```
 
 **Server Fetch States:**
@@ -236,15 +209,10 @@ await serverFsm.run(context);
 
 ### Protocol V2 FSM
 
-Git Protocol V2 client and server implementations:
+Git Protocol V2 server implementation (the v2 client is the fetch client):
 
 ```typescript
-import {
-  clientV2Transitions,
-  clientV2Handlers,
-  serverV2Transitions,
-  serverV2Handlers,
-} from "@statewalker/vcs-transport";
+import { serverV2Transitions, serverV2Handlers } from "@statewalker/vcs-transport";
 ```
 
 **Protocol V2 Commands:**
@@ -266,8 +234,8 @@ import {
 } from "@statewalker/vcs-transport";
 
 // Merge with protocol transitions
-const transitions = withErrorRecovery(clientV2Transitions);
-const handlers = withErrorRecoveryHandlers(clientV2Handlers);
+const transitions = withErrorRecovery(serverV2Transitions);
+const handlers = withErrorRecoveryHandlers(serverV2Handlers);
 
 // Use the enhanced FSM
 const fsm = new Fsm(transitions, handlers);
@@ -300,7 +268,7 @@ if (context.state.restoreCheckpoint()) {
 
 ## Usage Examples
 
-### Fetch with Error Recovery
+### Serve with Error Recovery
 
 ```typescript
 import {
@@ -313,8 +281,8 @@ import {
   createRepositoryFacade,
   withErrorRecovery,
   withErrorRecoveryHandlers,
-  clientV2Transitions,
-  clientV2Handlers,
+  serverV2Transitions,
+  serverV2Handlers,
 } from "@statewalker/vcs-transport";
 
 // Create context
@@ -334,8 +302,8 @@ context.config.allowReconnect = true;
 context.config.reconnect = async () => createNewConnection();
 
 // Create FSM with error recovery
-const transitions = withErrorRecovery(clientV2Transitions);
-const handlers = withErrorRecoveryHandlers(clientV2Handlers);
+const transitions = withErrorRecovery(serverV2Transitions);
+const handlers = withErrorRecoveryHandlers(serverV2Handlers);
 const fsm = new Fsm(transitions, handlers);
 
 // Run

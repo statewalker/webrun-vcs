@@ -25,11 +25,6 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./compression": {
-      "source": "./src/compression/index.ts",
-      "types": "./dist/compression/index.d.ts",
-      "import": "./dist/compression/index.js"
-    },
     "./files": {
       "source": "./src/files/index.ts",
       "types": "./dist/files/index.d.ts",

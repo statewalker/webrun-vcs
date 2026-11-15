@@ -18,10 +18,10 @@ import {
   joinPath,
   readFile,
 } from "@statewalker/vcs-core";
-import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import type {
   IgnoreManager,
+  NewHasher,
   Worktree,
   WorktreeCheckoutOptions,
   WorktreeCheckoutResult,
@@ -29,7 +29,7 @@ import type {
   WorktreeWalkOptions,
   WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
-import { createIgnoreManager } from "@statewalker/vcs-working-tree";
+import { createIgnoreManager, hashWorktreeFile } from "@statewalker/vcs-working-tree";
 
 /**
  * Extended FilesApi with additional operations for worktree
@@ -61,20 +61,11 @@ export interface FileWorktreeOptions {
   gitDir?: string;
   /** Path to global excludes file */
   globalExcludesFile?: string;
-  /** Custom hash function */
-  hashFunction?: (data: Uint8Array) => Promise<Uint8Array>;
-}
-
-/**
- * Text encoder for Git header construction
- */
-const textEncoder = new TextEncoder();
-
-/**
- * Create a Git blob header for hashing
- */
-function createBlobHeader(size: number): Uint8Array {
-  return textEncoder.encode(`blob ${size}\0`);
+  /**
+   * Makes the incremental hasher `computeHash` streams a file through
+   * (default: SHA-1, `createSha1`).
+   */
+  newHasher?: NewHasher;
 }
 
 /**
@@ -89,7 +80,7 @@ export class FileWorktree implements Worktree {
   private readonly autoLoadGitignore: boolean;
   private readonly gitDir?: string;
   private readonly globalExcludesFile?: string;
-  private readonly hashFunction: (data: Uint8Array) => Promise<Uint8Array>;
+  private readonly newHasher: NewHasher;
   private repositoryExcludesLoaded = false;
 
   constructor(options: FileWorktreeOptions) {
@@ -101,7 +92,7 @@ export class FileWorktree implements Worktree {
     this.autoLoadGitignore = options.autoLoadGitignore ?? true;
     this.gitDir = options.gitDir;
     this.globalExcludesFile = options.globalExcludesFile;
-    this.hashFunction = options.hashFunction ?? sha1;
+    this.newHasher = options.newHasher ?? createSha1;
   }
 
   // ========== Reading ==========
@@ -252,25 +243,24 @@ export class FileWorktree implements Worktree {
 
   async computeHash(path: string): Promise<ObjectId> {
     const fullPath = joinPath(this.rootPath, path);
-    const content = await readFile(this.files, fullPath);
-    const header = createBlobHeader(content.length);
-
-    const combined = new Uint8Array(header.length + content.length);
-    combined.set(header, 0);
-    combined.set(content, header.length);
-
-    const hash = await this.hashFunction(combined);
-    return bytesToHex(hash);
+    return hashWorktreeFile(
+      path,
+      {
+        size: async () => {
+          const stats = await this.files.stats(fullPath);
+          if (stats?.kind === "directory") throw new Error(`Is a directory: ${path}`);
+          return stats?.kind === "file" ? stats.size : undefined;
+        },
+        read: () => this.files.read(fullPath),
+      },
+      this.newHasher,
+    );
   }
 
   async *readContent(path: string): AsyncIterable<Uint8Array> {
     const fullPath = joinPath(this.rootPath, path);
 
-    if (this.files.read) {
-      yield* this.files.read(fullPath);
-    } else {
-      yield await readFile(this.files, fullPath);
-    }
+    yield* this.files.read(fullPath);
   }
 
   async exists(path: string): Promise<boolean> {
@@ -443,17 +433,10 @@ export class FileWorktree implements Worktree {
             }
           }
 
-          // Load blob content
+          // Stream the blob straight into the file
           const content = await this.blobs.load(entry.id);
           if (content) {
-            // Collect content into array
-            const chunks: Uint8Array[] = [];
-            for await (const chunk of content) {
-              chunks.push(chunk);
-            }
-
-            // Write to worktree
-            await this.writeContent(path, chunks, {
+            await this.writeContent(path, content, {
               mode: entry.mode,
               createParents: true,
             });

@@ -16,6 +16,13 @@ export interface TrackingRefUpdate {
   newObjectId: ObjectId;
   /** Update result status */
   status: RefUpdateStatus;
+  /**
+   * How git prints the update: `[new branch]`, `[new tag]`, `abc1234..def5678` (fast-forward),
+   * `+ abc1234...def5678` (forced), `[rejected]`, `[up to date]`
+   */
+  summary?: string;
+  /** Why a ref was rejected (`non-fast-forward`, `would clobber existing tag`, a lock failure) */
+  reason?: string;
 }
 
 /**

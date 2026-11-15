@@ -3,6 +3,9 @@
  * the source is read once, live memory stays under 64 MB whatever the size,
  * and native git reads the result. Run with `pnpm test:bench`
  * (BIG_BLOB_MB sets the size, default 200).
+ *
+ * It runs on the real NodeFilesApi, whose `write` streams from webrun-files-node
+ * 0.11 (a temporary file, then a rename).
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";

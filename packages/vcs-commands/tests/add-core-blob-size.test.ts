@@ -64,3 +64,57 @@ describe("AddCommand blob sizes", () => {
     expect(await history.blobs.has("ce013625030ba8dba906f756967f9e9ca394464a")).toBe(true);
   });
 });
+
+describe("AddCommand when a file changes while it is hashed", () => {
+  it("re-stats the file and retries once with its new size, as git does", async () => {
+    const history = createMemoryHistory();
+    const sizes: (number | undefined)[] = [];
+    const store = history.blobs.store.bind(history.blobs);
+    history.blobs.store = (content, size) => {
+      sizes.push(size);
+      return store(content, size);
+    };
+    // the walk reports the old size (3); a fresh stat reports what the file holds now (6)
+    const base = worktreeOf({ "a.txt": { content: "hello\n" } });
+    let stats = 0;
+    const worktree = {
+      ...base,
+      async *walk() {
+        for await (const e of base.walk()) yield { ...e, size: 3 };
+      },
+      async getEntry(path: string) {
+        const e = await base.getEntry(path);
+        return e && stats++ === 0 ? { ...e, size: 3 } : e;
+      },
+    } as unknown as Worktree;
+    const add = new AddCommand({
+      worktree,
+      blobs: history.blobs,
+      staging: new MemoryStagingStore(),
+    });
+    await add.add(["a.txt"]);
+    expect(sizes).toEqual([3, 6]);
+    expect(await history.blobs.has("ce013625030ba8dba906f756967f9e9ca394464a")).toBe(true);
+  });
+});
+
+describe("AddCommand index stat after a retry", () => {
+  it("records the fresh stat that matched the stored content", async () => {
+    const history = createMemoryHistory();
+    const base = worktreeOf({ "a.txt": { content: "hello\n" } });
+    let stats = 0;
+    const worktree = {
+      ...base,
+      async getEntry(path: string) {
+        const e = await base.getEntry(path);
+        return e && stats++ === 0 ? { ...e, size: 3, mtime: 1 } : { ...e, mtime: 2 };
+      },
+    } as unknown as Worktree;
+    const staging = new MemoryStagingStore();
+    await new AddCommand({ worktree, blobs: history.blobs, staging }).add(["a.txt"]);
+    const entry = await staging.getEntry("a.txt");
+    expect(entry?.objectId).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
+    expect(entry?.size).toBe(6);
+    expect(entry?.mtime).toBe(2);
+  });
+});

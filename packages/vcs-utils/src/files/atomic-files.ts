@@ -20,8 +20,11 @@ export interface AtomicFiles {
   /** File paths (not directories) below `dir`, recursively, sorted. */
   list(dir: string): AsyncIterable<string>;
   /**
-   * Create `path` with `content` only if nothing exists there (O_CREAT|O_EXCL),
-   * creating directories. `false` if it already exists. Throws an error with
+   * Create `path` with `content` only if nothing exists there, creating
+   * directories; `false` if it already exists. With a FilesApi that has
+   * `createExclusive` this is a real exclusive create, excluding other
+   * processes and tabs; without it, a check then a write, exclusive only among
+   * adapters over one FilesApi (see `atomicFilesOver`). Throws an error with
    * `code` "ENOTDIR" (or "EEXIST") when a parent is a file, so `refs/x/y.lock`
    * cannot be created while `refs/x` is a ref.
    */
@@ -34,19 +37,62 @@ export interface AtomicFiles {
   removeEmptyDir(dir: string): Promise<boolean>;
 }
 
+/**
+ * How many times a delegated `createExclusive` is retried after ENOENT. webrun-files-node
+ * runs `mkdir -p` and then `open "wx"`; another process (native git pruning empty ref
+ * directories) can remove the directory in between. Git's `raceproof_create_file` retries
+ * the same way.
+ */
+const ENOENT_RETRIES = 3;
+
+const isEnoent = (error: unknown) =>
+  typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT";
+
+/** `createExclusive` of the FilesApi, retried while its directory vanishes underneath it. */
+async function createExclusiveRaceproof(
+  fs: FilesApi,
+  exclusive: NonNullable<FilesApi["createExclusive"]>,
+  path: string,
+  content: Uint8Array,
+): Promise<boolean> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await exclusive.call(fs, path, [content]);
+    } catch (error) {
+      if (!isEnoent(error) || attempt >= ENOENT_RETRIES) throw error;
+    }
+  }
+}
+
 /** Paths held by an in-flight `createExclusive`, per FilesApi, shared by every adapter over it. */
 const pending = new WeakMap<FilesApi, Set<string>>();
+/**
+ * The tail of the structural operations (exclusive create, empty-directory
+ * removal) on each FilesApi. Running them one at a time makes each one's checks
+ * and its change a single step for every adapter over that FilesApi.
+ */
+const structural = new WeakMap<FilesApi, Promise<unknown>>();
 
 /**
  * `AtomicFiles` over any FilesApi, rooted at `root`.
  *
- * Exclusive creation is guaranteed only among adapters over the same FilesApi
- * instance (a per-instance registry closes the gap between the existence check
- * and the write). Two FilesApi instances over one directory, even in one
- * process, and other processes such as native git are not excluded: give
- * those setups a native implementation (`createNodeAtomicFiles` in
- * `@statewalker/vcs-utils-node`).
- * `replace` is FilesApi's `move`, which is atomic only where the backend's is.
+ * When the FilesApi has `createExclusive` (every webrun-files FilesApi from 0.11:
+ * node, browser, mem, sqlite), `createExclusive` delegates to it, and a lock
+ * excludes every writer the backend excludes: other processes such as native git,
+ * other tabs, other FilesApi instances. A delegated call that fails with ENOENT
+ * (its directory pruned by another process between `mkdir` and `open`) is retried.
+ *
+ * Without it, exclusive creation is guaranteed only among adapters over the same
+ * FilesApi instance: exclusive creates and empty-directory removals on one
+ * FilesApi run one at a time, so each one's checks and its change happen as one
+ * step. Two FilesApi instances over one directory, even in one process, and other
+ * processes are not excluded then: use one FilesApi instance per repository, and
+ * do not run another writer on the same directory.
+ *
+ * In both cases exclusive creates and empty-directory removals through one
+ * FilesApi run one at a time, so `removeEmptyDir` never removes a lock created
+ * meanwhile in-process. `replace` is FilesApi's `move`, which is atomic only
+ * where the backend's is.
  *
  * @example
  * ```typescript
@@ -64,6 +110,14 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
     pending.set(fs, held);
   }
   const claims = held;
+  const serial = <T>(op: () => Promise<T>): Promise<T> => {
+    const run = (structural.get(fs) ?? Promise.resolve()).then(op, op);
+    structural.set(
+      fs,
+      run.catch(() => {}),
+    );
+    return run;
+  };
   const isFile = async (path: string) => (await fs.stats(abs(path)))?.kind === "file";
   const ensureDir = async (path: string) => {
     const dir = dirname(abs(path));
@@ -93,11 +147,8 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
       }
       yield* out.sort();
     },
-    async createExclusive(path, content) {
-      const key = abs(path);
-      if (claims.has(key)) return false;
-      claims.add(key);
-      try {
+    createExclusive: (path, content) =>
+      serial(async () => {
         // A file where a directory is needed: refuse, as open(2) does with ENOTDIR.
         const parts = path.split("/").filter(Boolean);
         for (let i = 1; i < parts.length; i++) {
@@ -106,17 +157,23 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
             throw Object.assign(new Error(`ENOTDIR: ${parent} is a file`), { code: "ENOTDIR" });
           }
         }
-        if (await fs.exists(key)) return false;
-        await ensureDir(path);
-        await fs.write(key, [content]);
-        return true;
-      } finally {
-        claims.delete(key);
-      }
-    },
+        const key = abs(path);
+        const exclusive = fs.createExclusive;
+        if (exclusive) return createExclusiveRaceproof(fs, exclusive, key, content);
+        if (claims.has(key)) return false;
+        claims.add(key);
+        try {
+          if (await fs.exists(key)) return false;
+          await ensureDir(path);
+          await fs.write(key, [content]);
+          return true;
+        } finally {
+          claims.delete(key);
+        }
+      }),
     async replace(source, target) {
       await ensureDir(target);
-      if (!(await fs.move(abs(source), abs(target)))) {
+      if (!(await moveCompleting(fs, abs(source), abs(target)))) {
         throw new Error(`replace: could not move ${source} to ${target}`);
       }
     },
@@ -126,10 +183,44 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
       await ensureDir(path);
       await fs.write(abs(path), [...old, content]);
     },
-    async removeEmptyDir(dir) {
-      if ((await fs.stats(abs(dir)))?.kind !== "directory") return false;
-      for await (const _ of fs.list(abs(dir))) return false;
-      return fs.remove(abs(dir));
-    },
+    // Serialized with createExclusive, so a lock created in this directory cannot
+    // slip in between the emptiness check and the (possibly recursive) remove.
+    removeEmptyDir: (dir) =>
+      serial(async () => {
+        if ((await fs.stats(abs(dir)))?.kind !== "directory") return false;
+        for await (const _ of fs.list(abs(dir))) return false;
+        return fs.remove(abs(dir));
+      }),
   };
+}
+
+/**
+ * `files.move(source, target)`, finishing a move that a copy-then-delete FilesApi left
+ * half done. From webrun-files 0.11 such a backend (a browser without native move, S3,
+ * a composite across mounts) throws `MoveIncompleteError` when the target was written
+ * but the source could not be removed. The target then holds the new content, so the
+ * move is finished here by removing the source; only if it still cannot be removed (a
+ * lock file would stay behind) is the error rethrown. The error is recognised by name,
+ * so it works whichever webrun-files copy raised it.
+ *
+ * @example
+ * ```typescript
+ * if (!(await moveCompleting(files, "/repo/.git/index.lock", "/repo/.git/index"))) {
+ *   throw new Error("index.lock is gone");
+ * }
+ * ```
+ */
+export async function moveCompleting(
+  files: FilesApi,
+  source: string,
+  target: string,
+): Promise<boolean> {
+  try {
+    return await files.move(source, target);
+  } catch (error) {
+    if ((error as Error | undefined)?.name !== "MoveIncompleteError") throw error;
+    const removed = await files.remove(source).catch(() => false);
+    if (removed || !(await files.exists(source).catch(() => true))) return true;
+    throw error;
+  }
 }

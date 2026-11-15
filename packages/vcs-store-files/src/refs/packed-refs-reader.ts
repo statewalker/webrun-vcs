@@ -45,10 +45,25 @@ export interface PackedRefs {
  * @param gitDir Path to .git directory
  * @returns Parsed refs and metadata
  */
-export async function readPackedRefs(files: FilesApi, gitDir: string): Promise<PackedRefs> {
+export async function readPackedRefs(
+  files: FilesApi,
+  gitDir: string,
+  options: { strict?: boolean } = {},
+): Promise<PackedRefs> {
   const packedRefsPath = joinPath(gitDir, PACKED_REFS);
 
   let content: string;
+  if (options.strict) {
+    // Only a missing file is no packed refs: a failed read or a bad line throws
+    if ((await files.stats(packedRefsPath))?.kind !== "file") return { refs: [], peeled: false };
+    const parsed = parsePackedRefs(new TextDecoder().decode(await readFile(files, packedRefsPath)));
+    for (const r of parsed.refs) {
+      if (!/^[0-9a-f]{40}$/.test(r.objectId ?? "") || !r.name) {
+        throw new Error(`Invalid packed ref ${r.name || "(no name)"} in ${PACKED_REFS}`);
+      }
+    }
+    return parsed;
+  }
   try {
     const data = await readFile(files, packedRefsPath);
     content = new TextDecoder().decode(data);

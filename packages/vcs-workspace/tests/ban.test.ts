@@ -6,26 +6,35 @@ const here = import.meta.dirname;
 const srcDir = path.resolve(here, "../src");
 const packagesDir = path.resolve(here, "../..");
 
-function readSrc(dir: string): string {
+/** Every `.ts` file under `dir`, recursively, except the subdirectories named in `exclude`. */
+function readSrc(dir: string, exclude: string[] = []): string {
   let out = "";
-  for (const name of readdirSync(dir)) {
-    const p = path.join(dir, name);
-    if (name.endsWith(".ts")) out += readFileSync(p, "utf8");
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!exclude.includes(entry.name)) out += readSrc(p, exclude);
+    } else if (entry.name.endsWith(".ts")) out += readFileSync(p, "utf8");
   }
   return out;
 }
 
-/** Collect the `@statewalker/...` specifiers imported anywhere under a src dir. */
-function importsOf(dir: string): Set<string> {
-  const src = readSrc(dir);
+/** Module specifiers of `from "x"`, side-effect `import "x"` and dynamic `import("x")`. */
+const SPECIFIER = /(?:\bfrom\s+|\bimport\s*\(?\s*)["']([^"']+)["']/g;
+
+/** Collect the `@statewalker/...` packages imported anywhere under a src dir. */
+function importsOf(dir: string, exclude: string[] = []): Set<string> {
+  const src = readSrc(dir, exclude);
   const found = new Set<string>();
-  for (const m of src.matchAll(/from\s+["'](@statewalker\/[\w-]+)/g)) found.add(m[1]);
+  for (const m of src.matchAll(SPECIFIER)) {
+    const pkg = m[1].match(/^@statewalker\/[\w-]+/);
+    if (pkg) found.add(pkg[0]);
+  }
   return found;
 }
 
 describe("the hard cross-axis ban holds", () => {
   it("workspace/src composes BOTH axes — file axis directly, history axis only structurally", () => {
-    const imports = importsOf(srcDir);
+    const imports = importsOf(srcDir, ["net"]);
     // Axis A (files) + large-object store are imported for real calls.
     expect(imports.has("@statewalker/webrun-files-sync")).toBe(true);
     expect(imports.has("@statewalker/webrun-content-store")).toBe(true);
@@ -54,5 +63,24 @@ describe("the hard cross-axis ban holds", () => {
     // vcs-core's facade dir must not reach into files-sync.
     const vcsCore = importsOf(path.join(packagesDir, "vcs-core", "src", "vcs-core"));
     expect(vcsCore.has("@statewalker/webrun-files-sync")).toBe(false);
+  });
+
+  it("network sync is a separate entry: the root never loads it, and it never loads files-sync", () => {
+    // the root entry's files do not reach into net/, so `@statewalker/vcs-workspace` stays
+    // engine-free; `@statewalker/vcs-workspace/net` is where the git engine is used
+    const rootSpecifiers = [...readSrc(srcDir, ["net"]).matchAll(SPECIFIER)].map((m) => m[1]);
+    expect(rootSpecifiers.filter((s) => /(^|\/)net(\/|$)/.test(s))).toEqual([]);
+    // the scan sees every import form
+    const forms =
+      'import "./net/index.js";\nconst m = import("./net/index.js");\nexport * from "./net/x.js";';
+    expect([...forms.matchAll(SPECIFIER)].map((m) => m[1])).toEqual([
+      "./net/index.js",
+      "./net/index.js",
+      "./net/x.js",
+    ]);
+    const net = importsOf(path.join(srcDir, "net"));
+    expect(net.has("@statewalker/vcs-core")).toBe(true);
+    expect(net.has("@statewalker/vcs-transport")).toBe(true);
+    expect(net.has("@statewalker/webrun-files-sync")).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+export { type HttpPushTestOptions, type HttpPushTestResult, httpPush } from "./http-push.js";
 export { createTransportRefStore } from "./ref-store-adapter.js";
 export { createRepositoryFacade } from "./repository-facade-adapter.js";
 export {

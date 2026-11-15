@@ -7,8 +7,6 @@ import type { ProcessContext, RefStore } from "../../src/context/process-context
 import { ProtocolState } from "../../src/context/protocol-state.js";
 import { Fsm } from "../../src/fsm/index.js";
 import {
-  clientV2Handlers,
-  clientV2Transitions,
   createEmptyFetchRequest,
   type FetchV2Request,
   SERVER_V2_CAPABILITIES,
@@ -155,346 +153,9 @@ describe("Protocol V2 FSM Types", () => {
 
   describe("SERVER_V2_CAPABILITIES", () => {
     it("includes required capabilities", () => {
-      expect(SERVER_V2_CAPABILITIES).toContain("ls-refs");
+      expect(SERVER_V2_CAPABILITIES).toContain("ls-refs=unborn");
       expect(SERVER_V2_CAPABILITIES.some((c) => c.startsWith("fetch="))).toBe(true);
       expect(SERVER_V2_CAPABILITIES.some((c) => c.startsWith("object-format="))).toBe(true);
-    });
-  });
-});
-
-describe("Client V2 FSM", () => {
-  let transport: ReturnType<typeof createMockTransport>;
-  let repository: RepositoryFacade;
-  let refStore: ReturnType<typeof createMockRefStore>;
-  let context: ProcessContext;
-
-  beforeEach(() => {
-    transport = createMockTransport();
-    repository = createMockRepository();
-    refStore = createMockRefStore(new Map([["refs/heads/main", "abc123".padEnd(40, "0")]]));
-    context = {
-      transport,
-      repository,
-      refStore,
-      state: new ProtocolState(),
-      output: new HandlerOutput(),
-      config: new ProcessConfiguration(),
-    };
-  });
-
-  describe("READ_CAPABILITIES state", () => {
-    it("reads server capabilities", async () => {
-      transport = createMockTransport([
-        { type: "data", payload: new Uint8Array(0), text: "version 2" },
-        { type: "data", payload: new Uint8Array(0), text: "ls-refs" },
-        { type: "data", payload: new Uint8Array(0), text: "fetch=shallow filter" },
-        { type: "data", payload: new Uint8Array(0), text: "server-option" },
-        { type: "flush" },
-      ]);
-      context.transport = transport;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      await fsm.run(context, "SEND_LS_REFS");
-
-      expect(fsm.getState()).toBe("SEND_LS_REFS");
-      expect(context.state.protocolVersion).toBe(2);
-      expect(context.state.capabilities.has("ls-refs")).toBe(true);
-      expect(context.state.capabilities.has("fetch")).toBe(true);
-      expect(context.state.capabilityValues?.get("fetch")).toBe("shallow filter");
-    });
-
-    it("handles EOF error", async () => {
-      transport = createMockTransport([{ type: "eof" }]);
-      context.transport = transport;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      await fsm.run(context);
-
-      expect(fsm.getState()).toBe("");
-      expect(context.output.error).toBe("Unexpected end of stream");
-    });
-  });
-
-  describe("SEND_LS_REFS state", () => {
-    it("sends ls-refs command with options", async () => {
-      context.config.lsRefsSymrefs = true;
-      context.config.lsRefsPeel = true;
-      context.config.refPrefixes = ["refs/heads/"];
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("SEND_LS_REFS");
-      await fsm.run(context, "READ_LS_REFS_RESPONSE");
-
-      expect(fsm.getState()).toBe("READ_LS_REFS_RESPONSE");
-      expect(transport.written).toContain("command=ls-refs");
-      expect(transport.written).toContain("DELIM");
-      expect(transport.written).toContain("symrefs");
-      expect(transport.written).toContain("peel");
-      expect(transport.written).toContain("ref-prefix refs/heads/");
-      expect(transport.written).toContain("FLUSH");
-    });
-
-    it("skips ls-refs when refs already known", async () => {
-      context.state.refs.set("refs/heads/main", "a".repeat(40));
-      context.config.forceRefFetch = false;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("SEND_LS_REFS");
-      await fsm.run(context, "COMPUTE_WANTS");
-
-      expect(fsm.getState()).toBe("COMPUTE_WANTS");
-    });
-  });
-
-  describe("READ_LS_REFS_RESPONSE state", () => {
-    it("parses ref list with attributes", async () => {
-      const oid1 = "a".repeat(40);
-      const oid2 = "b".repeat(40);
-
-      transport = createMockTransport([
-        {
-          type: "data",
-          payload: new Uint8Array(0),
-          text: `${oid1} refs/heads/main symref-target:refs/heads/master`,
-        },
-        { type: "data", payload: new Uint8Array(0), text: `${oid2} refs/tags/v1.0 peeled:${oid1}` },
-        { type: "flush" },
-      ]);
-      context.transport = transport;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("READ_LS_REFS_RESPONSE");
-      await fsm.run(context, "COMPUTE_WANTS");
-
-      expect(fsm.getState()).toBe("COMPUTE_WANTS");
-      expect(context.state.refs.get("refs/heads/main")).toBe(oid1);
-      expect(context.state.refs.get("refs/tags/v1.0")).toBe(oid2);
-      expect(context.state.symrefs?.get("refs/heads/main")).toBe("refs/heads/master");
-      expect(context.state.peeled?.get("refs/tags/v1.0")).toBe(oid1);
-    });
-  });
-
-  describe("COMPUTE_WANTS state", () => {
-    it("computes wants for missing objects", async () => {
-      const oid1 = "a".repeat(40);
-      const oid2 = "b".repeat(40);
-
-      context.state.refs.set("refs/heads/main", oid1);
-      context.state.refs.set("refs/heads/feature", oid2);
-      // Repository doesn't have oid1
-      repository = createMockRepository(new Set([oid2]));
-      context.repository = repository;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("COMPUTE_WANTS");
-      await fsm.run(context, "SEND_FETCH");
-
-      expect(fsm.getState()).toBe("SEND_FETCH");
-      expect(context.state.wants.has(oid1)).toBe(true);
-      expect(context.state.wants.has(oid2)).toBe(false);
-    });
-
-    it("returns NO_WANTS when up to date", async () => {
-      const oid = "a".repeat(40);
-
-      context.state.refs.set("refs/heads/main", oid);
-      repository = createMockRepository(new Set([oid]));
-      context.repository = repository;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("COMPUTE_WANTS");
-      const result = await fsm.run(context);
-
-      expect(result).toBe(true);
-      expect(fsm.getState()).toBe("");
-    });
-  });
-
-  describe("SEND_FETCH state", () => {
-    it("sends fetch command with wants and capabilities", async () => {
-      const oid = "a".repeat(40);
-      context.state.wants.add(oid);
-      context.state.capabilities.add("thin-pack");
-      context.state.capabilities.add("ofs-delta");
-      context.config.statelessRpc = true; // Enables sending "done"
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("SEND_FETCH");
-      await fsm.run(context, "READ_FETCH_RESPONSE");
-
-      expect(fsm.getState()).toBe("READ_FETCH_RESPONSE");
-      expect(transport.written).toContain("command=fetch");
-      expect(transport.written).toContain("DELIM");
-      expect(transport.written).toContain("thin-pack");
-      expect(transport.written).toContain("ofs-delta");
-      expect(transport.written).toContain(`want ${oid}`);
-      expect(transport.written).toContain("done");
-      expect(transport.written).toContain("FLUSH");
-    });
-
-    it("sends want-ref when capability available", async () => {
-      const oid = "a".repeat(40);
-      context.state.wants.add(oid);
-      context.state.wantedRefs = new Map([["refs/heads/main", oid]]);
-      context.state.capabilities.add("want-ref");
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("SEND_FETCH");
-      await fsm.run(context, "READ_FETCH_RESPONSE");
-
-      expect(transport.written).toContain("want-ref refs/heads/main");
-    });
-
-    it("sends shallow options", async () => {
-      const oid = "a".repeat(40);
-      context.state.wants.add(oid);
-      context.config.depth = 5;
-      context.config.deepenRelative = true;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("SEND_FETCH");
-      await fsm.run(context, "READ_FETCH_RESPONSE");
-
-      expect(transport.written).toContain("deepen 5");
-      expect(transport.written).toContain("deepen-relative");
-    });
-  });
-
-  describe("READ_FETCH_RESPONSE state", () => {
-    it("parses acknowledgments section", async () => {
-      const oid1 = "a".repeat(40);
-      const oid2 = "b".repeat(40);
-
-      transport = createMockTransport([
-        { type: "data", payload: new Uint8Array(0), text: "acknowledgments" },
-        { type: "data", payload: new Uint8Array(0), text: `ACK ${oid1}` },
-        { type: "data", payload: new Uint8Array(0), text: `ACK ${oid2}` },
-        { type: "data", payload: new Uint8Array(0), text: "ready" },
-        { type: "delim" },
-        { type: "data", payload: new Uint8Array(0), text: "packfile" },
-      ]);
-      context.transport = transport;
-      context.state.sentDone = true;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("READ_FETCH_RESPONSE");
-      await fsm.run(context, "RECEIVE_PACK");
-
-      expect(fsm.getState()).toBe("RECEIVE_PACK");
-      expect(context.state.commonBase?.has(oid1)).toBe(true);
-      expect(context.state.commonBase?.has(oid2)).toBe(true);
-      expect(context.state.serverReady).toBe(true);
-    });
-
-    it("returns ACKS_ONLY when flush received without done", async () => {
-      transport = createMockTransport([
-        { type: "data", payload: new Uint8Array(0), text: "acknowledgments" },
-        { type: "flush" },
-      ]);
-      context.transport = transport;
-      context.state.sentDone = false;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("READ_FETCH_RESPONSE");
-      await fsm.run(context, "SEND_FETCH");
-
-      expect(fsm.getState()).toBe("SEND_FETCH");
-    });
-
-    it("transitions to SHALLOW_INFO section", async () => {
-      transport = createMockTransport([
-        { type: "data", payload: new Uint8Array(0), text: "shallow-info" },
-      ]);
-      context.transport = transport;
-      context.state.sentDone = true;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("READ_FETCH_RESPONSE");
-      await fsm.run(context, "PROCESS_SHALLOW");
-
-      expect(fsm.getState()).toBe("PROCESS_SHALLOW");
-    });
-
-    it("transitions to WANTED_REFS section", async () => {
-      transport = createMockTransport([
-        { type: "data", payload: new Uint8Array(0), text: "wanted-refs" },
-      ]);
-      context.transport = transport;
-      context.state.sentDone = true;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("READ_FETCH_RESPONSE");
-      await fsm.run(context, "PROCESS_REFS");
-
-      expect(fsm.getState()).toBe("PROCESS_REFS");
-    });
-  });
-
-  describe("PROCESS_SHALLOW state", () => {
-    it("parses shallow and unshallow entries", async () => {
-      const oid1 = "a".repeat(40);
-      const oid2 = "b".repeat(40);
-
-      transport = createMockTransport([
-        { type: "data", payload: new Uint8Array(0), text: `shallow ${oid1}` },
-        { type: "data", payload: new Uint8Array(0), text: `unshallow ${oid2}` },
-        { type: "delim" },
-      ]);
-      context.transport = transport;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("PROCESS_SHALLOW");
-      await fsm.run(context, "READ_FETCH_RESPONSE");
-
-      expect(fsm.getState()).toBe("READ_FETCH_RESPONSE");
-      expect(context.state.clientShallow?.has(oid1)).toBe(true);
-      expect(context.state.serverUnshallow?.has(oid2)).toBe(true);
-    });
-  });
-
-  describe("PROCESS_REFS state", () => {
-    it("parses wanted-refs response", async () => {
-      const oid1 = "a".repeat(40);
-      const oid2 = "b".repeat(40);
-
-      transport = createMockTransport([
-        { type: "data", payload: new Uint8Array(0), text: `${oid1} refs/heads/main` },
-        { type: "data", payload: new Uint8Array(0), text: `${oid2} refs/heads/feature` },
-        { type: "delim" },
-      ]);
-      context.transport = transport;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("PROCESS_REFS");
-      await fsm.run(context, "READ_FETCH_RESPONSE");
-
-      expect(fsm.getState()).toBe("READ_FETCH_RESPONSE");
-      expect(context.state.resolvedWantedRefs?.get("refs/heads/main")).toBe(oid1);
-      expect(context.state.resolvedWantedRefs?.get("refs/heads/feature")).toBe(oid2);
-    });
-  });
-
-  describe("UPDATE_REFS state", () => {
-    it("updates local refs from resolved wanted-refs", async () => {
-      const oid1 = "a".repeat(40);
-      const oid2 = "b".repeat(40);
-
-      context.state.resolvedWantedRefs = new Map([
-        ["refs/heads/main", oid1],
-        ["refs/heads/feature", oid2],
-      ]);
-
-      const refs = new Map<string, string>();
-      refStore = createMockRefStore(refs);
-      context.refStore = refStore;
-
-      const fsm = new Fsm(clientV2Transitions, clientV2Handlers);
-      fsm.setState("UPDATE_REFS");
-      const result = await fsm.run(context);
-
-      expect(result).toBe(true);
-      expect(refs.get("refs/heads/main")).toBe(oid1);
-      expect(refs.get("refs/heads/feature")).toBe(oid2);
     });
   });
 });
@@ -605,7 +266,7 @@ describe("Server V2 FSM", () => {
       await fsm.run(context);
 
       expect(fsm.getState()).toBe("");
-      expect(context.output.error).toContain("Unknown command");
+      expect(context.output.error).toBe("invalid command 'unknown'");
     });
   });
 
@@ -748,7 +409,7 @@ describe("Server V2 FSM", () => {
       await fsm.run(context, "SEND_ERROR");
 
       expect(fsm.getState()).toBe("SEND_ERROR");
-      expect(context.output.error).toContain("Object not found");
+      expect(context.output.error).toBe(`upload-pack: not our ref ${oid}`);
     });
   });
 
@@ -859,7 +520,12 @@ describe("Server V2 FSM", () => {
         ...createEmptyFetchRequest(),
         deepen: 5,
       };
-      context.state.serverShallow = new Set([oid]);
+      // the boundary comes from the repository (the mock has no commit graph)
+      context.state.wants = new Set(["b".repeat(40)]);
+      context.repository = {
+        ...repository,
+        computeShallowBoundaries: async () => new Set([oid]),
+      };
 
       const fsm = new Fsm(serverV2Transitions, serverV2Handlers);
       fsm.setState("SEND_SHALLOW_INFO");
@@ -930,6 +596,8 @@ describe("Server V2 FSM", () => {
 
       transport = createMockTransport([
         { type: "delim" },
+        // sizes only for the size attribute (git's object-info)
+        { type: "data", payload: new Uint8Array(0), text: "size" },
         { type: "data", payload: new Uint8Array(0), text: `oid ${oid1}` },
         { type: "data", payload: new Uint8Array(0), text: `oid ${oid2}` },
         { type: "flush" },

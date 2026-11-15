@@ -10,8 +10,15 @@
  * with remote Git servers like GitHub.
  */
 
-import { type CloneResult, clone, fetch, lsRemote } from "@statewalker/vcs-transport";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
+import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  fetch,
+  lsRemote,
+  type RefStore,
+  type RepositoryFacade,
+} from "@statewalker/vcs-transport";
 
 // Use a small public repository for demonstration
 const REPO_URL = "https://github.com/octocat/Hello-World.git";
@@ -127,61 +134,67 @@ async function demonstrateRefListing(): Promise<void> {
   console.log();
 }
 
+/** A local repository in memory: where the clone and the fetch store what they receive. */
+interface LocalRepository {
+  repository: RepositoryFacade;
+  refStore: RefStore;
+}
+
+async function createLocalRepository(): Promise<LocalRepository> {
+  const history = createMemoryHistoryWithOperations();
+  await history.initialize();
+  return {
+    repository: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+  };
+}
+
 /**
- * Demonstrate clone operation.
+ * Demonstrate a clone: a fetch into an empty repository.
  *
- * Clone fetches all objects and refs from a remote repository.
- * The pack data can then be stored locally.
+ * Every branch lands under refs/remotes/origin/, tags under refs/tags/; the pack is
+ * imported into the local object store as it arrives.
  */
-async function demonstrateClone(): Promise<CloneResult> {
+async function demonstrateClone(local: LocalRepository): Promise<void> {
   console.log("=== clone: Download Repository ===\n");
 
   console.log(`Cloning: ${REPO_URL}`);
   console.log();
 
-  const result = await clone({
+  const result = await fetch({
     url: REPO_URL,
-    onProgress: (info) => {
-      const percent = info.total ? Math.round((info.current / info.total) * 100) : undefined;
-      const percentStr = percent !== undefined ? ` (${percent}%)` : "";
-      console.log(
-        `  ${info.stage}: ${info.current}${info.total ? `/${info.total}` : ""}${percentStr}`,
-      );
-    },
-    onProgressMessage: (message) => {
+    ...local,
+    refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    tags: "all",
+    onProgress: (message) => {
       // Show raw server messages
-      const trimmed = message.trim();
-      if (trimmed) {
-        console.log(`  Server: ${trimmed}`);
-      }
+      if (message) console.log(`  Server: ${message}`);
     },
   });
 
   console.log();
   console.log("Clone complete:");
+  console.log(`  Protocol: v${result.protocolVersion}`);
   console.log(`  Default branch: ${result.defaultBranch}`);
-  console.log(`  Refs fetched: ${result.refs.size}`);
-  console.log(`  Pack size: ${formatBytes(result.packData.length)}`);
-  console.log(`  Bytes received: ${formatBytes(result.bytesReceived)}`);
+  console.log(`  Objects received: ${result.packObjects}`);
+  console.log(`  Pack size: ${formatBytes(result.packBytes)}`);
   console.log(`  Empty: ${result.isEmpty}`);
   console.log();
 
-  console.log("Fetched refs:");
-  for (const [name, id] of result.refs) {
-    console.log(`  ${name.padEnd(50)} ${bytesToHex(id).slice(0, 8)}`);
+  console.log("Refs written:");
+  for (const update of result.refUpdates) {
+    console.log(`  ${update.summary.padEnd(18)} ${update.localRef}`);
   }
   console.log();
-
-  return result;
 }
 
 /**
- * Demonstrate fetch operation.
+ * Demonstrate an incremental fetch.
  *
- * Fetch updates local refs from a remote. It uses negotiation
- * to minimize data transfer.
+ * The local refs are offered as "have" lines, so the server sends only what the clone
+ * does not have yet (nothing, right after it).
  */
-async function demonstrateFetch(): Promise<void> {
+async function demonstrateFetch(local: LocalRepository): Promise<void> {
   console.log("=== fetch: Update from Remote ===\n");
 
   console.log(`Fetching from: ${REPO_URL}`);
@@ -190,31 +203,20 @@ async function demonstrateFetch(): Promise<void> {
 
   const result = await fetch({
     url: REPO_URL,
-    refspecs: ["+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"],
-    onProgress: (info) => {
-      const percent = info.total ? Math.round((info.current / info.total) * 100) : undefined;
-      const percentStr = percent !== undefined ? ` (${percent}%)` : "";
-      console.log(
-        `  ${info.stage}: ${info.current}${info.total ? `/${info.total}` : ""}${percentStr}`,
-      );
-    },
+    ...local,
+    refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
   });
 
-  console.log();
   console.log("Fetch complete:");
   console.log(`  Default branch: ${result.defaultBranch || "unknown"}`);
-  console.log(`  Refs updated: ${result.refs.size}`);
-  console.log(`  Pack size: ${formatBytes(result.packData.length)}`);
-  console.log(`  Empty: ${result.isEmpty}`);
+  console.log(`  Haves sent: ${result.stats.haves}`);
+  console.log(`  Objects received: ${result.packObjects}`);
   console.log();
 
-  if (result.refs.size > 0) {
-    console.log("Updated refs:");
-    for (const [name, id] of result.refs) {
-      console.log(`  ${name.padEnd(50)} ${bytesToHex(id).slice(0, 8)}`);
-    }
-    console.log();
+  for (const update of result.refUpdates) {
+    console.log(`  ${update.summary.padEnd(18)} ${update.localRef}`);
   }
+  console.log();
 }
 
 /**
@@ -264,16 +266,12 @@ async function main(): Promise<void> {
   // 3. Detailed ref listing
   if (await runStep("refListing", demonstrateRefListing)) successCount++;
 
-  // 4. Clone the repository
-  if (
-    await runStep("clone", async () => {
-      await demonstrateClone();
-    })
-  )
-    successCount++;
+  // 4. Clone the repository into memory
+  const local = await createLocalRepository();
+  if (await runStep("clone", () => demonstrateClone(local))) successCount++;
 
-  // 5. Fetch updates (simulating incremental update)
-  if (await runStep("fetch", demonstrateFetch)) successCount++;
+  // 5. Fetch updates into the same repository (incremental: haves from the local refs)
+  if (await runStep("fetch", () => demonstrateFetch(local))) successCount++;
 
   console.log("═══════════════════════════════════════════════════════════════");
   if (successCount === totalSteps) {

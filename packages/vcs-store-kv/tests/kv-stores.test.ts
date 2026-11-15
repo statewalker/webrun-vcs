@@ -98,6 +98,23 @@ createBlobStoreTests("KV", async () => {
 // Object kernel tests
 createGitObjectsTests("KV", async () => {
   const kv = new MemoryKVAdapter();
+  // counts the bytes of every value written, for the bounded-memory test
+  let persisted = 0;
+  const set = kv.set.bind(kv);
+  kv.set = (key, value) => {
+    persisted += value.length;
+    return set(key, value);
+  };
+  const setMany = kv.setMany.bind(kv);
+  kv.setMany = (entries) => {
+    for (const v of entries.values()) persisted += v.length;
+    return setMany(entries);
+  };
   const store = rawStorageStaging(new KvRawStore(kv, "objects"));
-  return { objects: createGitObjects(store), store, cleanup: () => kv.close() };
+  return {
+    objects: createGitObjects(store),
+    store,
+    cleanup: () => kv.close(),
+    persistedBytes: () => persisted,
+  };
 });

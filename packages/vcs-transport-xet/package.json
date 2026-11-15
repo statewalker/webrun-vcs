@@ -1,7 +1,7 @@
 {
   "name": "@statewalker/vcs-transport-xet",
   "version": "0.2.4",
-  "description": "Git LFS custom transfer agent (Xet) — chunk-dedup transfer via content-transfer, falls back to basic LFS",
+  "description": "Hugging Face Xet read client (chunking, BLAKE3 hashes, xorbs, shards, reconstruction, CAS), plus the webrun-chunks LFS custom transfer",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
   },
@@ -24,6 +24,11 @@
       "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./webrun-chunks": {
+      "source": "./src/webrun-chunks/index.ts",
+      "types": "./dist/webrun-chunks/index.d.ts",
+      "import": "./dist/webrun-chunks/index.js"
     }
   },
   "files": [
@@ -42,6 +47,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@noble/hashes": "catalog:",
     "@statewalker/webrun-content-store": "catalog:",
     "@statewalker/webrun-content-transfer": "catalog:",
     "@statewalker/vcs-transport-lfs": "workspace:^",

@@ -12,19 +12,8 @@
  */
 
 import type { ObjectId } from "../common/id/index.js";
+import type { ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
-
-/**
- * Object metadata returned when parsing
- */
-export interface ParsedObjectMeta {
-  /** Object ID (SHA-1 hash) */
-  id: ObjectId;
-  /** Object type */
-  type: ObjectTypeString;
-  /** Content size in bytes */
-  size: number;
-}
 
 /**
  * Result of importing a pack file
@@ -32,7 +21,10 @@ export interface ParsedObjectMeta {
 export interface PackImportResult {
   /** Total objects imported */
   objectsImported: number;
-  /** Blobs stored with delta preservation */
+  /**
+   * Always 0: received objects are stored byte for byte (loose, or inside a kept pack), never
+   * re-encoded as backend deltas.
+   */
   blobsWithDelta: number;
   /** Trees imported */
   treesImported: number;
@@ -40,150 +32,52 @@ export interface PackImportResult {
   commitsImported: number;
   /** Tags imported */
   tagsImported: number;
+  /** The kept pack's id, when the pack was installed instead of unpacked */
+  packId?: string;
+  /**
+   * With `quarantine: true`, where the backend can quarantine: the objects kept aside until the
+   * caller calls `commit()` (publish) or `discard()` (remove them all). Absent when the
+   * backend cannot (stores of parsed objects): the objects are then already published.
+   */
+  quarantine?: ObjectQuarantine;
+  /**
+   * With `quarantine: true`: true when the objects were quarantined, false when the backend
+   * cannot quarantine and imported them straight into the store. Absent otherwise.
+   */
+  quarantined?: boolean;
 }
 
-/**
- * Statistics from pack building
- */
-export interface PackBuildStats {
-  /** Total objects added */
-  totalObjects: number;
-  /** Objects stored as deltas */
-  deltifiedObjects: number;
-  /** Total uncompressed size */
-  totalSize: number;
-  /** Bytes saved by delta compression */
-  deltaSavings: number;
+/** Options of `SerializationApi.importPack`. */
+export interface PackImportOptions {
+  /**
+   * Keep the objects in a quarantine until the caller accepts them, as git's receive-pack does
+   * (see `GitObjects.beginQuarantine`): `result.quarantine` is set when the backend can.
+   */
+  quarantine?: boolean;
 }
 
 /**
  * Options for creating a pack file
  */
 export interface PackOptions {
-  /** Enable delta compression (default: true) */
+  /** Search deltas between the objects, git's windowed search (default: true) */
   useDelta?: boolean;
-  /** Create thin pack with external base references (default: false) */
-  thinPack?: boolean;
-  /** Maximum delta chain depth (default: 50) */
+  /** Longest delta chain the search builds (default: 50, git's pack.depth) */
   maxChainDepth?: number;
-  /** Progress callback */
-  onProgress?: (stats: PackBuildStats) => void;
+  /** Write deltas on a base in the pack as OFS deltas (default: true, git's ofs-delta) */
+  ofsDelta?: boolean;
+  /** Reuse entries stored in the backend's packs as they are (default: true) */
+  reuse?: boolean;
 }
 
 /**
- * Pack file header information
+ * Options for exporting the objects between wants and haves
  */
-export interface PackHeader {
-  /** Pack version (usually 2) */
-  version: number;
-  /** Number of objects in the pack */
-  objectCount: number;
-}
-
-/**
- * Entry from reading a pack file
- */
-export interface PackEntry {
-  /** Object ID */
-  id: ObjectId;
-  /** Object type (resolved for deltas) */
-  type: ObjectTypeString;
-  /** Whether stored as delta in the pack */
-  isDelta: boolean;
-  /** Base object reference (for delta entries) */
-  baseRef?: ObjectId | number;
-  /** Raw content as stored in pack (may be delta) */
-  rawContent: AsyncIterable<Uint8Array>;
-  /** Resolved content (delta applied if needed) */
-  resolvedContent: AsyncIterable<Uint8Array>;
-  /** Uncompressed size */
-  size: number;
-  /** Delta chain depth (0 for non-deltas) */
-  chainDepth: number;
-  /** Compression ratio for deltas */
-  ratio?: number;
-}
-
-/**
- * PackBuilder - Incremental pack file builder
- *
- * Build pack files one object at a time with optional delta compression.
- *
- * @example
- * ```typescript
- * const builder = serialization.createPackBuilder();
- *
- * await builder.addObject(commitId);
- * await builder.addObject(treeId);
- * await builder.addObjectWithDelta(blobId, baseBlobId);
- *
- * const packStream = builder.finalize();
- * for await (const chunk of packStream) {
- *   // Write to transport or file
- * }
- * ```
- */
-export interface PackBuilder {
-  /**
-   * Add object (engine decides full vs delta)
-   *
-   * @param id Object ID to add
-   */
-  addObject(id: ObjectId): Promise<void>;
-
-  /**
-   * Add object with explicit delta preference
-   *
-   * If preferredBaseId is provided and suitable, the object
-   * will be stored as a delta against that base.
-   *
-   * @param id Object ID to add
-   * @param preferredBaseId Optional preferred base for delta
-   */
-  addObjectWithDelta(id: ObjectId, preferredBaseId?: ObjectId): Promise<void>;
-
-  /**
-   * Finalize and get pack stream
-   *
-   * Returns the complete pack file as a byte stream.
-   * After calling this, no more objects can be added.
-   */
-  finalize(): AsyncIterable<Uint8Array>;
-
-  /**
-   * Get current pack statistics
-   */
-  getStats(): PackBuildStats;
-}
-
-/**
- * PackReader - Streaming pack file parser
- *
- * Parse pack files entry by entry with automatic delta resolution.
- *
- * @example
- * ```typescript
- * const reader = serialization.createPackReader(packStream);
- *
- * const header = await reader.getHeader();
- * console.log(`Pack has ${header.objectCount} objects`);
- *
- * for await (const entry of reader.entries()) {
- *   // Use entry.resolvedContent for the actual content
- *   // Use entry.rawContent for delta-as-stored
- * }
- * ```
- */
-export interface PackReaderApi {
-  /**
-   * Iterate entries in pack order
-   */
-  entries(): AsyncIterable<PackEntry>;
-
-  /**
-   * Get pack header info
-   */
-  getHeader(): Promise<PackHeader>;
+export interface ExportOptions extends PackOptions {
+  /** A thin pack: deltas against objects the receiver has, not sent (default: false) */
+  thinPack?: boolean;
+  /** The receiver's shallow commits: their parents are not walked */
+  shallow?: Iterable<ObjectId>;
 }
 
 /**
@@ -202,11 +96,9 @@ export interface PackReaderApi {
  *   // Write to .git/objects/XX/YYYY...
  * }
  *
- * // Parse a loose object
- * const { id, type } = await serialization.parseLooseObject(compressedStream);
- *
- * // Create a pack file
+ * // Create a pack file of given objects, or of what a receiver lacks
  * const packStream = serialization.createPack(objectIds);
+ * const forPush = serialization.exportPack([localTip], [remoteTip]);
  *
  * // Import a pack file
  * const result = await serialization.importPack(packStream);
@@ -214,7 +106,7 @@ export interface PackReaderApi {
  */
 export interface SerializationApi {
   /**
-   * Serialize an object to Git loose format
+   * Serialize an object to Git loose format, streamed
    *
    * Produces: zlib(type + " " + size + "\0" + content)
    *
@@ -224,17 +116,9 @@ export interface SerializationApi {
   serializeLooseObject(id: ObjectId): AsyncIterable<Uint8Array>;
 
   /**
-   * Parse Git loose format into internal representation
-   *
-   * Also stores the object in the backend.
-   *
-   * @param compressed Compressed object stream
-   * @returns Parsed object metadata
-   */
-  parseLooseObject(compressed: AsyncIterable<Uint8Array>): Promise<ParsedObjectMeta>;
-
-  /**
-   * Create a pack file from objects
+   * Create a pack file from objects, streamed through `writePack`. The ids are collected
+   * first (a pack header carries the count); objects are read one at a time as they are
+   * written, and entries the backend's packs hold are copied as stored.
    *
    * @param objects Object IDs to pack
    * @param options Pack creation options
@@ -243,29 +127,37 @@ export interface SerializationApi {
   createPack(objects: AsyncIterable<ObjectId>, options?: PackOptions): AsyncIterable<Uint8Array>;
 
   /**
-   * Import objects from a pack file
+   * The pack of objects reachable from `wants` and not from `haves` (`git pack-objects --revs`):
+   * `listObjects`, then `writePack` with the paths for the delta search.
    *
-   * - Blob deltas: preserve if beneficial
-   * - Tree/commit deltas: resolve to full content on import
+   * @param wants Tips to send
+   * @param haves Tips the receiver has
+   * @param options Export options
+   * @returns Pack file stream
+   */
+  exportPack(
+    wants: Iterable<ObjectId>,
+    haves: Iterable<ObjectId>,
+    options?: ExportOptions,
+  ): AsyncIterable<Uint8Array>;
+
+  /**
+   * Import objects from a received pack stream, byte for byte (see `importPack` in the pack
+   * module): a pack of at least `unpackLimit` objects is kept as a pack where the backend has
+   * packs (thin packs completed from the local objects), any other is unpacked into loose
+   * objects. The stream is never buffered whole. Refuses a corrupt pack with `PackError`.
+   *
+   * With `options.quarantine`, the objects stay invisible to the repository's readers until
+   * `result.quarantine.commit()` (backends that can quarantine; see `PackImportResult`).
    *
    * @param pack Pack file stream
+   * @param options Import options
    * @returns Import statistics
    */
-  importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
-
-  /**
-   * Create incremental pack builder
-   *
-   * @param options Pack builder options
-   */
-  createPackBuilder(options?: PackOptions): PackBuilder;
-
-  /**
-   * Create pack file reader
-   *
-   * @param pack Pack file stream
-   */
-  createPackReader(pack: AsyncIterable<Uint8Array>): PackReaderApi;
+  importPack(
+    pack: AsyncIterable<Uint8Array>,
+    options?: PackImportOptions,
+  ): Promise<PackImportResult>;
 
   /**
    * Export single object in Git format
@@ -284,7 +176,13 @@ export interface SerializationApi {
    *
    * @param type Object type
    * @param content Object content (without header)
+   * @param size The content's length, when known: a blob is then stored in one
+   *   pass (see `Blobs.store`)
    * @returns Object ID of the stored object
    */
-  importObject(type: ObjectTypeString, content: AsyncIterable<Uint8Array>): Promise<ObjectId>;
+  importObject(
+    type: ObjectTypeString,
+    content: AsyncIterable<Uint8Array>,
+    size?: number,
+  ): Promise<ObjectId>;
 }

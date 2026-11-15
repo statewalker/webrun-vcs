@@ -2,14 +2,16 @@
  * Clone command - Clone a repository via HTTP
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { FileMode, type History, indexPack, writePackIndex } from "@statewalker/vcs-core";
+import { FileMode, type FilesApi, type History } from "@statewalker/vcs-core";
 import { createGitFilesBackend, FileStagingStore } from "@statewalker/vcs-store-files";
-import { clone as transportClone } from "@statewalker/vcs-transport";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  fetch as transportFetch,
+} from "@statewalker/vcs-transport";
+import { joinPath } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { dim, fatal, info, success } from "../shared.js";
+import { createDirFilesApi, dim, fatal, info, resolvePath, success } from "../shared.js";
 
 /**
  * Parse clone command arguments
@@ -85,16 +87,21 @@ const GITLINK = 0o160000;
 /**
  * Extract a tree to a directory
  */
-async function extractTree(repository: History, treeId: string, dirPath: string): Promise<void> {
+async function extractTree(
+  repository: History,
+  files: FilesApi,
+  treeId: string,
+  dirPath: string,
+): Promise<void> {
   const tree = await repository.trees.load(treeId);
   if (!tree) return;
 
   for await (const entry of tree) {
-    const entryPath = path.join(dirPath, entry.name);
+    const entryPath = joinPath(dirPath, entry.name);
 
     if (entry.mode === FileMode.TREE) {
-      await fs.mkdir(entryPath, { recursive: true });
-      await extractTree(repository, entry.id, entryPath);
+      await files.mkdir(entryPath);
+      await extractTree(repository, files, entry.id, entryPath);
     } else if (entry.mode === GITLINK) {
     } else {
       const chunks: Uint8Array[] = [];
@@ -105,7 +112,7 @@ async function extractTree(repository: History, treeId: string, dirPath: string)
         }
       }
       const content = concatBytes(...chunks);
-      await fs.writeFile(entryPath, content);
+      await files.write(entryPath, [content]);
     }
   }
 }
@@ -122,44 +129,20 @@ export async function runClone(args: string[]): Promise<void> {
 
   // Determine target directory
   const targetDir = directory || extractRepoName(url);
-  const absDir = path.resolve(process.cwd(), targetDir);
+  const absDir = resolvePath(process.cwd(), targetDir);
+  const dirFiles = createDirFilesApi(absDir);
 
   // Check if directory exists and is not empty
-  try {
-    const entries = await fs.readdir(absDir);
-    if (entries.length > 0) {
-      fatal(`destination path '${targetDir}' already exists and is not an empty directory.`);
-    }
-  } catch {
-    // Directory doesn't exist - good
+  for await (const _entry of dirFiles.list("/")) {
+    fatal(`destination path '${targetDir}' already exists and is not an empty directory.`);
   }
 
   console.log(info(`Cloning into '${targetDir}'...`));
 
   // Create target directory
-  await fs.mkdir(absDir, { recursive: true });
+  await dirFiles.mkdir("/");
 
   try {
-    // Execute transport clone
-    const cloneResult = await transportClone({
-      url,
-      branch,
-      depth,
-      bare,
-      remoteName: "origin",
-      onProgressMessage: (msg) => {
-        const trimmed = msg.trim();
-        if (trimmed) {
-          process.stdout.write(`\r${dim(trimmed)}`.padEnd(80));
-        }
-      },
-    });
-
-    process.stdout.write(`${"\r".padEnd(80)}\r`);
-
-    console.log(info(`remote: Enumerating objects: done.`));
-    console.log(info(`remote: Total ${cloneResult.refs.size} refs.`));
-
     // Create repository structure
     const files = createNodeFilesApi({ rootDir: absDir });
     const gitDir = bare ? "." : ".git";
@@ -168,48 +151,45 @@ export async function runClone(args: string[]): Promise<void> {
       files,
       gitDir,
       create: true,
-      defaultBranch: cloneResult.defaultBranch || "main",
+      defaultBranch: branch || "main",
     });
     await repository.initialize();
 
-    // Store pack data
-    if (cloneResult.packData.length > 0) {
-      console.log(info(`Receiving objects: 100%`));
-
-      const indexResult = await indexPack(cloneResult.packData);
-      console.log(info(`Resolving deltas: ${indexResult.objectCount} objects`));
-
-      // Write pack and index files
-      const packChecksum = bytesToHex(indexResult.packChecksum);
-      const packDir = `${gitDir}/objects/pack`;
-      await files.mkdir(packDir);
-
-      const packFileName = `pack-${packChecksum}.pack`;
-      const idxFileName = `pack-${packChecksum}.idx`;
-      const packPath = `${packDir}/${packFileName}`;
-      const idxPath = `${packDir}/${idxFileName}`;
-
-      // Write pack and index files (directly without temp files since atomic write isn't strictly required here)
-      await files.write(packPath, toAsyncIterable(cloneResult.packData));
-
-      const indexData = await writePackIndex(indexResult.entries, indexResult.packChecksum);
-      await files.write(idxPath, toAsyncIterable(indexData));
-    }
-
-    // Set up refs
+    // Clone: a fetch into the empty repository (the pack is stored as it arrives)
     const remoteName = "origin";
-    for (const [refName, objectId] of cloneResult.refs) {
-      await repository.refs.set(refName, bytesToHex(objectId));
-    }
+    const heads = branch ? `refs/heads/${branch}` : "refs/heads/*";
+    const tracking = bare
+      ? heads
+      : branch
+        ? `refs/remotes/${remoteName}/${branch}`
+        : `refs/remotes/${remoteName}/*`;
+    const result = await transportFetch({
+      url,
+      repository: createRepositoryFacade({ history: repository }),
+      refStore: createTransportRefStore(repository.refs),
+      refspecs: [`+${heads}:${tracking}`],
+      tags: branch || depth ? "auto" : "all",
+      depth,
+      onProgress: (msg) => {
+        if (msg) process.stdout.write(`\r${dim(msg)}`.padEnd(80));
+      },
+    });
+
+    process.stdout.write(`${"\r".padEnd(80)}\r`);
+
+    console.log(info(`remote: Enumerating objects: done.`));
+    console.log(info(`Receiving objects: 100% (${result.packObjects})`));
 
     // Create local branch from remote tracking
-    const defaultBranch = cloneResult.defaultBranch || "main";
-    const trackingRef = `refs/remotes/${remoteName}/${defaultBranch}`;
+    const defaultBranch = branch || result.defaultBranch?.replace(/^refs\/heads\//, "") || "main";
     const localRef = `refs/heads/${defaultBranch}`;
-
-    const trackingValue = cloneResult.refs.get(trackingRef);
-    if (trackingValue) {
-      await repository.refs.set(localRef, bytesToHex(trackingValue));
+    if (!bare) {
+      const trackingValue = await repository.refs.resolve(
+        `refs/remotes/${remoteName}/${defaultBranch}`,
+      );
+      if (trackingValue?.objectId) {
+        await repository.refs.set(localRef, trackingValue.objectId);
+      }
     }
 
     // Set HEAD
@@ -236,7 +216,7 @@ export async function runClone(args: string[]): Promise<void> {
       if (headCommit) {
         const commit = await repository.commits.load(headCommit);
         if (commit) {
-          await extractTree(repository, commit.tree, absDir);
+          await extractTree(repository, files, commit.tree, "/");
 
           // Initialize index from HEAD tree
           const staging = new FileStagingStore(files, `${gitDir}/index`);
@@ -256,7 +236,11 @@ export async function runClone(args: string[]): Promise<void> {
   } catch (err) {
     // Clean up on failure
     try {
-      await fs.rm(absDir, { recursive: true, force: true });
+      // Empty it through its own FilesApi (one rooted at "/" rejects every path).
+      const dirFiles = createDirFilesApi(absDir);
+      const names: string[] = [];
+      for await (const entry of dirFiles.list("/")) names.push(entry.name);
+      for (const name of names) await dirFiles.remove(name);
     } catch {
       // Ignore cleanup errors
     }

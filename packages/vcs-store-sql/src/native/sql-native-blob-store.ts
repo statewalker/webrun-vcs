@@ -5,8 +5,19 @@
  * identical to native Git. Supports chunked storage for large blobs.
  */
 
-import { encodeObjectHeader, type ObjectId, SizeMismatchError } from "@statewalker/vcs-core";
-import { bytesToHex, compressBlock, createSha1, decompressBlock } from "@statewalker/vcs-utils";
+import {
+  encodeObjectHeader,
+  fixedSizeChunks,
+  type ObjectId,
+  SizeMismatchError,
+} from "@statewalker/vcs-core";
+import {
+  bytesToHex,
+  compressBlock,
+  createSha1,
+  decompressBlock,
+  randomHexId,
+} from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 import type { SqlNativeBlobStore } from "./types.js";
 
@@ -32,6 +43,30 @@ const CHUNK_SIZE = 262144;
  */
 const CHUNK_THRESHOLD = 262144;
 
+/** `blob_id` of a blob row being written, before its id is known. */
+const TMP_PREFIX = "tmp:";
+
+/** Placeholder rows of writes running in this process: `sweepStale` keeps them. */
+const inFlight = new Set<string>();
+
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  if (chunks.length === 1) return chunks[0] as Uint8Array;
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
+}
+
+function hashBlob(chunks: Uint8Array[], size: number): ObjectId {
+  const sha1 = createSha1();
+  sha1.update(encodeObjectHeader("blob", size));
+  for (const c of chunks) sha1.update(c);
+  return bytesToHex(sha1.digest());
+}
+
 /**
  * Native SQL BlobStore implementation
  *
@@ -42,7 +77,8 @@ const CHUNK_THRESHOLD = 262144;
  * - storage_type: 'inline' or 'chunked'
  * - created_at: Storage timestamp
  *
- * Large blobs (>256KB) are stored in chunks with per-chunk compression.
+ * Large blobs (>256KB) are stored in chunks with per-chunk compression,
+ * written and read one chunk at a time.
  * Computes Git-compatible SHA-1 object IDs for interoperability.
  */
 export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
@@ -106,55 +142,6 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
   }
 
   /**
-   * Collect content from stream and compute Git-compatible hash
-   *
-   * Git hash format requires knowing size upfront: "blob <size>\0<content>"
-   * So we collect chunks first, then compute hash over all content.
-   */
-  private async streamHashAndCollect(
-    content: AsyncIterable<Uint8Array>,
-  ): Promise<{ hash: ObjectId; chunks: Uint8Array[]; totalSize: number }> {
-    const chunks: Uint8Array[] = [];
-    let totalSize = 0;
-
-    // First pass: collect chunks and count total size
-    for await (const chunk of content) {
-      chunks.push(chunk);
-      totalSize += chunk.length;
-    }
-
-    // Compute Git hash: "blob <size>\0<content>"
-    const sha1 = createSha1();
-    sha1.update(encodeObjectHeader("blob", totalSize));
-    for (const chunk of chunks) {
-      sha1.update(chunk);
-    }
-
-    return {
-      hash: bytesToHex(sha1.digest()),
-      chunks,
-      totalSize,
-    };
-  }
-
-  /**
-   * Combine collected chunks into single Uint8Array
-   */
-  private combineChunks(chunks: Uint8Array[]): Uint8Array {
-    if (chunks.length === 0) return new Uint8Array(0);
-    if (chunks.length === 1) return chunks[0];
-
-    const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
-  }
-
-  /**
    * Store blob inline (single row, no compression)
    */
   private async storeInline(blobId: ObjectId, data: Uint8Array, size: number): Promise<void> {
@@ -166,98 +153,217 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
   }
 
   /**
-   * Store blob in compressed chunks
+   * Write `content` as compressed chunk rows of a new placeholder blob row
+   * (`blob_id` = `tmp:<uuid>`, ignored by `keys` and `count`), one chunk at a
+   * time. `hasher`, when given, sees every byte. Returns the placeholder's row
+   * id and the bytes written. On failure the placeholder is removed.
    */
-  private async storeChunked(
-    blobId: ObjectId,
-    inputChunks: Uint8Array[],
-    totalSize: number,
-  ): Promise<void> {
-    const now = Date.now();
-
-    await this.db.transaction(async (tx) => {
-      // Insert blob metadata (content is NULL for chunked storage)
-      const result = await tx.execute(
-        `INSERT INTO ${BLOB_TABLE} (blob_id, content, size, storage_type, created_at) VALUES (?, NULL, ?, 'chunked', ?)`,
-        [blobId, totalSize, now],
+  private async writePlaceholder(
+    content: AsyncIterable<Uint8Array>,
+    onBytes?: (chunk: Uint8Array) => void,
+  ): Promise<{ blobFk: number; tmpId: string; totalSize: number }> {
+    const tmpId = `${TMP_PREFIX}${randomHexId()}`;
+    // In flight before the row exists: a sweep in this process never sees it unprotected.
+    inFlight.add(tmpId);
+    let blobFk: number;
+    try {
+      const inserted = await this.db.execute(
+        `INSERT INTO ${BLOB_TABLE} (blob_id, content, size, storage_type, created_at) VALUES (?, NULL, 0, 'chunked', ?)`,
+        [tmpId, Date.now()],
       );
-      const blobFk = result.lastInsertRowId;
-
-      // Process input chunks into fixed-size storage chunks
-      let position = 0;
-      let byteOffset = 0;
-      let buffer = new Uint8Array(0);
-
-      for (const inputChunk of inputChunks) {
-        // Accumulate into buffer
-        const combined = new Uint8Array(buffer.length + inputChunk.length);
-        combined.set(buffer, 0);
-        combined.set(inputChunk, buffer.length);
-        buffer = combined;
-
-        // Emit complete chunks
-        while (buffer.length >= CHUNK_SIZE) {
-          const toStore = buffer.subarray(0, CHUNK_SIZE);
-          const compressed = await compressBlock(toStore);
-
-          await tx.execute(
-            `INSERT INTO ${CHUNK_TABLE} (blob_fk, position, chunk_offset, chunk_length, compressed_length, content) VALUES (?, ?, ?, ?, ?, ?)`,
-            [blobFk, position, byteOffset, CHUNK_SIZE, compressed.length, compressed],
-          );
-
-          position++;
-          byteOffset += CHUNK_SIZE;
-          buffer = buffer.subarray(CHUNK_SIZE);
-        }
-      }
-
-      // Store final partial chunk if any
-      if (buffer.length > 0) {
-        const compressed = await compressBlock(buffer);
-        await tx.execute(
+      blobFk = inserted.lastInsertRowId;
+    } catch (e) {
+      inFlight.delete(tmpId);
+      throw e;
+    }
+    let position = 0;
+    let totalSize = 0;
+    try {
+      for await (const chunk of fixedSizeChunks(content, CHUNK_SIZE)) {
+        onBytes?.(chunk);
+        const compressed = await compressBlock(chunk);
+        await this.db.execute(
           `INSERT INTO ${CHUNK_TABLE} (blob_fk, position, chunk_offset, chunk_length, compressed_length, content) VALUES (?, ?, ?, ?, ?, ?)`,
-          [blobFk, position, byteOffset, buffer.length, compressed.length, compressed],
+          [blobFk, position++, totalSize, chunk.length, compressed.length, compressed],
         );
+        totalSize += chunk.length;
       }
+    } catch (e) {
+      await this.dropRow(blobFk);
+      inFlight.delete(tmpId);
+      throw e;
+    }
+    return { blobFk, tmpId, totalSize };
+  }
+
+  private async dropRow(blobFk: number): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      await tx.execute(`DELETE FROM ${CHUNK_TABLE} WHERE blob_fk = ?`, [blobFk]);
+      await tx.execute(`DELETE FROM ${BLOB_TABLE} WHERE id = ?`, [blobFk]);
     });
   }
 
+  /** Name a written placeholder `blobId`, or drop it when that blob is already stored. */
+  private async publish(blobFk: number, blobId: ObjectId, totalSize: number): Promise<void> {
+    const kept = await this.db.transaction(async (tx) => {
+      const existing = await tx.query<{ id: number }>(
+        `SELECT id FROM ${BLOB_TABLE} WHERE blob_id = ?`,
+        [blobId],
+      );
+      if (existing.length > 0) return false;
+      const updated = await tx.execute(
+        `UPDATE ${BLOB_TABLE} SET blob_id = ?, size = ? WHERE id = ?`,
+        [blobId, totalSize, blobFk],
+      );
+      // The placeholder is gone (swept by another process with no age guard): the blob is
+      // not stored, so say so rather than return an id with nothing behind it.
+      if (updated.changes === 0)
+        throw new Error(`Placeholder for ${blobId} disappeared before it was published`);
+      return true;
+    });
+    if (!kept) await this.dropRow(blobFk);
+  }
+
   /**
-   * Store blob with unknown size
+   * Store a blob without ever holding it whole.
    *
-   * Streams content, computes Git-compatible hash, and stores either
-   * inline (for small blobs) or in compressed chunks (for large blobs).
+   * With `size`, a large blob is hashed while its compressed chunks are
+   * written, in one pass. Without it, content up to the inline threshold is
+   * kept in memory; longer content is written as chunks first (the database is
+   * the spool), then read back to hash it, since a git id needs the size first.
+   * A blob that is not `size` bytes long is refused with `SizeMismatchError`
+   * and nothing is kept.
    */
   async store(content: AsyncIterable<Uint8Array>, size?: number): Promise<ObjectId> {
     await this.ensureTable();
+    if (size !== undefined && (!Number.isSafeInteger(size) || size < 0)) {
+      throw new RangeError(`bad blob size ${size}`);
+    }
 
-    // Stream, collect, and compute hash
-    const { hash: blobId, chunks, totalSize } = await this.streamHashAndCollect(content);
-    // The content is collected before anything is written, so a size that does not
-    // match is refused here and nothing is stored.
-    if (size !== undefined && size !== totalSize) throw new SizeMismatchError(size, totalSize);
-
-    // Check if blob already exists (deduplication)
-    const existing = await this.db.query<{ id: number }>(
-      `SELECT id FROM ${BLOB_TABLE} WHERE blob_id = ?`,
-      [blobId],
-    );
-
-    if (existing.length > 0) {
+    // Read up to the inline threshold; what ends there is stored from memory.
+    // Callers pass sync iterables too, whatever the declared type says.
+    const source = content as AsyncIterable<Uint8Array> | Iterable<Uint8Array>;
+    const it =
+      Symbol.asyncIterator in Object(source)
+        ? (source as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
+        : (source as Iterable<Uint8Array>)[Symbol.iterator]();
+    const head: Uint8Array[] = [];
+    let headSize = 0;
+    let ended = false;
+    while (headSize <= CHUNK_THRESHOLD) {
+      const r = await it.next();
+      if (r.done) {
+        ended = true;
+        break;
+      }
+      head.push(r.value);
+      headSize += r.value.length;
+      if (size !== undefined && headSize > size) {
+        await it.return?.();
+        throw new SizeMismatchError(size, headSize);
+      }
+    }
+    if (ended) {
+      if (size !== undefined && size !== headSize) throw new SizeMismatchError(size, headSize);
+      const data = concatChunks(head);
+      const blobId = hashBlob([data], headSize);
+      if (!(await this.has(blobId))) await this.storeInline(blobId, data, headSize);
       return blobId;
     }
+    const rest = (async function* () {
+      let done = false;
+      try {
+        yield* head.splice(0);
+        for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+        done = true;
+      } finally {
+        // stopped early (too long for its size, a failing write): release the source
+        if (!done) await it.return?.();
+      }
+    })();
 
-    // Choose storage strategy based on size
-    if (totalSize <= CHUNK_THRESHOLD) {
-      // Store inline (combine chunks for small blobs)
-      const data = this.combineChunks(chunks);
-      await this.storeInline(blobId, data, totalSize);
-    } else {
-      // Store chunked with compression
-      await this.storeChunked(blobId, chunks, totalSize);
+    if (size !== undefined) {
+      const sha1 = createSha1();
+      sha1.update(encodeObjectHeader("blob", size));
+      let seen = 0;
+      const { blobFk, tmpId, totalSize } = await this.writePlaceholder(rest, (chunk) => {
+        seen += chunk.length;
+        if (seen > size) throw new SizeMismatchError(size, seen);
+        sha1.update(chunk);
+      });
+      try {
+        if (totalSize !== size) {
+          await this.dropRow(blobFk);
+          throw new SizeMismatchError(size, totalSize);
+        }
+        const blobId = bytesToHex(sha1.digest());
+        await this.publish(blobFk, blobId, totalSize);
+        return blobId;
+      } finally {
+        inFlight.delete(tmpId);
+      }
     }
 
-    return blobId;
+    const { blobFk, tmpId, totalSize } = await this.writePlaceholder(rest);
+    try {
+      let blobId: ObjectId;
+      try {
+        const sha1 = createSha1();
+        sha1.update(encodeObjectHeader("blob", totalSize));
+        for await (const chunk of this.chunksOf(blobFk)) sha1.update(chunk);
+        blobId = bytesToHex(sha1.digest());
+      } catch (e) {
+        await this.dropRow(blobFk);
+        throw e;
+      }
+      await this.publish(blobFk, blobId, totalSize);
+      return blobId;
+    } finally {
+      inFlight.delete(tmpId);
+    }
+  }
+
+  /**
+   * Remove what interrupted writes left behind: placeholder rows (`tmp:*`)
+   * created more than `olderThanMs` ago (rows record `created_at`) with their
+   * chunk rows, and chunk rows whose blob row is gone (a write inserts its row
+   * before its chunks, so these belong to no write). Placeholders of writes
+   * running in this process are kept; one written by another process sharing
+   * the database is safe only through its age, so pick an expiry longer than
+   * any write. `SqlGcStrategy.sweepStale` calls it.
+   *
+   * @returns The number of placeholder rows and orphaned chunk rows removed
+   */
+  async sweepStale({ olderThanMs }: { olderThanMs: number }): Promise<number> {
+    await this.ensureTable();
+    const cutoff = Date.now() - olderThanMs;
+    const stale = await this.db.query<{ id: number; blob_id: string }>(
+      `SELECT id, blob_id FROM ${BLOB_TABLE} WHERE blob_id LIKE '${TMP_PREFIX}%' AND created_at ${olderThanMs <= 0 ? "<=" : "<"} ?`,
+      [cutoff],
+    );
+    let removed = 0;
+    for (const row of stale) {
+      if (inFlight.has(row.blob_id)) continue;
+      await this.dropRow(row.id);
+      removed++;
+    }
+    const orphans = await this.db.execute(
+      `DELETE FROM ${CHUNK_TABLE} WHERE blob_fk NOT IN (SELECT id FROM ${BLOB_TABLE})`,
+    );
+    return removed + orphans.changes;
+  }
+
+  /** The decompressed chunks of a chunked blob row, read one row at a time. */
+  private async *chunksOf(blobFk: number): AsyncGenerator<Uint8Array> {
+    for (let position = 0; ; position++) {
+      const rows = await this.db.query<{ content: Uint8Array }>(
+        `SELECT content FROM ${CHUNK_TABLE} WHERE blob_fk = ? AND position = ?`,
+        [blobFk, position],
+      );
+      const row = rows[0];
+      if (!row) return;
+      yield await decompressBlock(row.content);
+    }
   }
 
   /**
@@ -282,7 +388,7 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
     }
 
     const { id: blobFk, content, storage_type } = rows[0];
-    const db = this.db;
+    const chunksOf = (fk: number) => this.chunksOf(fk);
 
     return (async function* () {
       // Handle inline storage (default for existing blobs without storage_type)
@@ -293,16 +399,8 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
         return;
       }
 
-      // Stream chunks for chunked storage
-      const chunks = await db.query<{ content: Uint8Array }>(
-        `SELECT content FROM ${CHUNK_TABLE} WHERE blob_fk = ? ORDER BY position`,
-        [blobFk],
-      );
-
-      for (const chunk of chunks) {
-        const decompressed = await decompressBlock(chunk.content);
-        yield decompressed;
-      }
+      // Stream chunks for chunked storage, one row at a time
+      yield* chunksOf(blobFk);
     })();
   }
 
@@ -329,7 +427,7 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
     await this.ensureTable();
 
     const result = await this.db.query<{ cnt: number }>(
-      `SELECT COUNT(*) as cnt FROM ${BLOB_TABLE}`,
+      `SELECT COUNT(*) as cnt FROM ${BLOB_TABLE} WHERE blob_id NOT LIKE '${TMP_PREFIX}%'`,
     );
     return result[0].cnt;
   }
@@ -341,7 +439,7 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
     await this.ensureTable();
 
     const result = await this.db.query<{ total: number | null }>(
-      `SELECT SUM(size) as total FROM ${BLOB_TABLE}`,
+      `SELECT SUM(size) as total FROM ${BLOB_TABLE} WHERE blob_id NOT LIKE '${TMP_PREFIX}%'`,
     );
     return result[0].total || 0;
   }
@@ -352,7 +450,9 @@ export class SqlNativeBlobStoreImpl implements SqlNativeBlobStore {
   async *keys(): AsyncIterable<ObjectId> {
     await this.ensureTable();
 
-    const rows = await this.db.query<{ blob_id: ObjectId }>(`SELECT blob_id FROM ${BLOB_TABLE}`);
+    const rows = await this.db.query<{ blob_id: ObjectId }>(
+      `SELECT blob_id FROM ${BLOB_TABLE} WHERE blob_id NOT LIKE '${TMP_PREFIX}%'`,
+    );
     for (const row of rows) {
       yield row.blob_id;
     }

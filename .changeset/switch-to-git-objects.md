@@ -5,7 +5,6 @@
 "@statewalker/vcs-store-kv": major
 "@statewalker/vcs-store-sql": major
 "@statewalker/vcs-transport-adapters": major
-"@statewalker/vcs-testing": major
 ---
 
 **Breaking: every store reads and writes objects through the object kernel (`GitObjects`).**
@@ -16,5 +15,4 @@ Removed: `GitObjectStore`, `GitObjectStoreOptions`, `createGitObjectStore`, `Git
 - `Blobs.store(content, size?)`: with a size, the blob is written in one pass without being buffered.
 - `createGitFilesBackend` builds its objects as `withPacks(createGitObjects(skipPacked(filesStagingStore(...), packs)), packs)`: reads try loose objects, then packs, and an object already packed is not written again (as git and JGit). gc and repack ignore anything in `objects/` that is not an object file, such as git's `objects/ab/tmp_obj_*` in flight.
 - The typed stores' `remove` still returns false for a string that is not an object id; `GitObjects.remove` throws `InvalidObjectIdError` for one.
-- `GitNativeRepositoryAccess` and `createObjectGraphWalker` take a `GitObjects`.
 - Stored bytes: the memory, KV and SQL object stores (and the `BlobStore` behind `createVcsCore` and `createStorageRepositoryFacade`) now hold zlib loose objects, as `.git/objects` does. Data those stores persisted before is not readable; re-import from a git remote.

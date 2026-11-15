@@ -150,3 +150,57 @@ describe("GcOrchestrator", () => {
     expect(result.deltasCreated).toBe(0);
   });
 });
+
+describe("GcOrchestrator stale temporaries", () => {
+  const leftover = (made: number) => `tmp_obj_${made.toString(36)}-${"0123456789abcdef".repeat(2)}`;
+  const one = () =>
+    (async function* () {
+      yield new Uint8Array([1]);
+    })();
+
+  it("sweeps temporaries older than staleExpiryMs left by a crashed write", async () => {
+    const { history, orchestrator, storage } = createTestSetup();
+    await history.initialize();
+    await storage.store(leftover(Date.now() - 3 * 24 * 3600_000), one());
+    await storage.store(leftover(Date.now()), one());
+    const result = await orchestrator.run({ staleExpiryMs: 24 * 3600_000 });
+    expect(result.removedTemporaries).toBe(1);
+    const keys: string[] = [];
+    for await (const k of storage.keys()) keys.push(k);
+    expect(keys.filter((k) => k.startsWith("tmp_obj_"))).toHaveLength(1);
+  });
+
+  it("leaves temporaries alone in a dry run", async () => {
+    const { history, orchestrator, storage } = createTestSetup();
+    await history.initialize();
+    await storage.store(leftover(0), one());
+    const result = await orchestrator.run({ dryRun: true, staleExpiryMs: 0 });
+    expect(result.removedTemporaries ?? 0).toBe(0);
+    expect(await storage.has(leftover(0))).toBe(true);
+  });
+
+  it("adds what the strategy sweeps itself", async () => {
+    const { history, storage } = createTestSetup();
+    await history.initialize();
+    const strategy = Object.assign(new MemoryGcStrategy(storage), {
+      sweepStale: async (olderThanMs: number) => (olderThanMs === 5 ? 2 : 0),
+    });
+    const result = await new GcOrchestrator(history, strategy).run({ staleExpiryMs: 5 });
+    expect(result.removedTemporaries).toBe(2);
+  });
+});
+
+describe("MemoryGcStrategy.getStats", () => {
+  it("counts objects only, not temporaries nor an open quarantine", async () => {
+    const { history, strategy } = createTestSetup();
+    const enc = new TextEncoder();
+    await history.blobs.store([enc.encode("one")]);
+    const objects = history.objects;
+    if (!objects?.beginQuarantine) throw new Error("no quarantine");
+    const q = await objects.beginQuarantine();
+    await q.objects.put("blob", 7, [enc.encode("pending")]);
+    expect((await strategy.getStats()).looseObjectCount).toBe(1);
+    await q.commit();
+    expect((await strategy.getStats()).looseObjectCount).toBe(2);
+  });
+});

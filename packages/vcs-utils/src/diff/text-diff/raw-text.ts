@@ -181,17 +181,22 @@ export class RawText extends Sequence {
     return this.content.slice(start, end);
   }
 
+  /** Bytes git looks at for a NUL to call content binary (`buffer_is_binary`). */
+  static readonly BINARY_PROBE_LENGTH = 8000;
+
   /**
-   * Check if the content appears to be binary.
+   * Check if the content appears to be binary, as git does: a NUL byte within
+   * the first 8000 bytes (`BINARY_PROBE_LENGTH`).
    *
-   * Simple heuristic: check for NUL bytes.
+   * Only that prefix is needed, so a caller can read it with `readPrefix`
+   * instead of loading a whole blob.
    *
-   * @param raw The content to check
-   * @param length The length to check
+   * @param raw The content to check (or its first bytes)
+   * @param length The length to check (default and maximum: `BINARY_PROBE_LENGTH`)
    * @returns true if the content appears to be binary
    */
   static isBinary(raw: Uint8Array, length?: number): boolean {
-    const len = length ?? raw.length;
+    const len = Math.min(length ?? raw.length, RawText.BINARY_PROBE_LENGTH);
     for (let ptr = 0; ptr < len && ptr < raw.length; ptr++) {
       if (raw[ptr] === 0) {
         // NUL byte

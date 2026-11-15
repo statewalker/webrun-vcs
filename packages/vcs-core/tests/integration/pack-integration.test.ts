@@ -7,14 +7,16 @@
  * - Incremental export with haves (only new objects)
  * - Pack format correctness (header, checksum)
  * - Error handling (corrupted pack)
- * - PackReader and PackBuilder APIs
+ * - Reading packs (unpackObjects) and the PackBuilder API
  */
 
+import { inflate } from "@statewalker/vcs-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { HistoryWithOperations, PersonIdent } from "../../src/history/index.js";
 import { createMemoryHistoryWithOperations } from "../../src/history/index.js";
 import { ObjectType } from "../../src/history/objects/object-types.js";
+import { unpackObjects } from "../../src/pack/index.js";
 import type { SerializationApi } from "../../src/serialization/serialization-api.js";
 
 describe("Pack Import/Export Integration", () => {
@@ -282,30 +284,22 @@ describe("Pack Import/Export Integration", () => {
       const view = new DataView(packBytes.buffer, packBytes.byteOffset);
       const headerObjectCount = view.getUint32(8, false);
 
-      // Parse the pack to count actual entries
-      const reader = sourceSerialization.createPackReader(toAsyncIterable(packBytes));
-      const header = await reader.getHeader();
-      expect(header.objectCount).toBe(headerObjectCount);
-
-      let actualCount = 0;
-      for await (const _entry of reader.entries()) {
-        actualCount++;
-      }
-      expect(actualCount).toBe(headerObjectCount);
+      // Read the pack to count actual entries
+      const entries = await readEntries(target, packBytes);
+      expect(entries.count).toBe(headerObjectCount);
+      expect(entries.ids.length).toBe(headerObjectCount);
     });
   });
 
-  describe("PackReader API", () => {
+  describe("reading packs (unpackObjects)", () => {
     it("reads pack header", async () => {
       const commitId = await createSimpleCommit(source, "Test", []);
       const objects = source.collectReachableObjects(new Set([commitId]), new Set());
       const packBytes = await collectPackBytes(sourceSerialization.createPack(objects));
 
-      const reader = sourceSerialization.createPackReader(toAsyncIterable(packBytes));
-      const header = await reader.getHeader();
-
-      expect(header.version).toBe(2);
-      expect(header.objectCount).toBeGreaterThanOrEqual(3);
+      const view = new DataView(packBytes.buffer, packBytes.byteOffset);
+      expect(view.getUint32(4, false)).toBe(2);
+      expect((await readEntries(target, packBytes)).count).toBeGreaterThanOrEqual(3);
     });
 
     it("iterates entries with correct types", async () => {
@@ -313,14 +307,8 @@ describe("Pack Import/Export Integration", () => {
       const objects = source.collectReachableObjects(new Set([commitId]), new Set());
       const packBytes = await collectPackBytes(sourceSerialization.createPack(objects));
 
-      const reader = sourceSerialization.createPackReader(toAsyncIterable(packBytes));
-      const types = new Set<string>();
-
-      for await (const entry of reader.entries()) {
-        types.add(entry.type);
-        expect(entry.id).toBeTruthy();
-        expect(entry.size).toBeGreaterThan(0);
-      }
+      const { ids, types } = await readEntries(target, packBytes);
+      for (const id of ids) expect(id).toBeTruthy();
 
       expect(types).toContain("blob");
       expect(types).toContain("tree");
@@ -342,67 +330,58 @@ describe("Pack Import/Export Integration", () => {
       const objects = source.collectReachableObjects(new Set([commitId]), new Set());
       const packBytes = await collectPackBytes(sourceSerialization.createPack(objects));
 
-      const reader = sourceSerialization.createPackReader(toAsyncIterable(packBytes));
-
-      for await (const entry of reader.entries()) {
-        // Every entry should have resolvedContent
-        const content = await collectAsyncIterableBytes(entry.resolvedContent);
-        expect(content.length).toBeGreaterThan(0);
+      const { ids } = await readEntries(target, packBytes);
+      for (const id of ids) {
+        // Every object is stored with its content, byte for byte
+        const raw = await collectAsyncIterableBytes(kernelOf(source).getRaw(id));
+        expect(await collectAsyncIterableBytes(kernelOf(target).getRaw(id))).toEqual(raw);
+        expect(raw.length).toBeGreaterThan(0);
       }
     });
   });
 
-  describe("PackBuilder API", () => {
-    it("builds pack with addObject", async () => {
-      const blobId = await source.blobs.store([new TextEncoder().encode("Builder test")]);
-      const treeId = await source.trees.store([{ mode: 0o100644, name: "test.txt", id: blobId }]);
-      const commitId = await source.commits.store({
-        tree: treeId,
-        parents: [],
-        author: createTestPerson(),
-        committer: createTestPerson(),
-        message: "Builder test",
-      });
+  describe("exportPack (listObjects + writePack)", () => {
+    it("sends what the wants reach and the haves do not", async () => {
+      const first = await createSimpleCommit(source, "First", []);
+      const second = await createSimpleCommit(source, "Second", [first]);
 
-      const builder = sourceSerialization.createPackBuilder();
-      await builder.addObject(blobId);
-      await builder.addObject(treeId);
-      await builder.addObject(commitId);
+      await targetSerialization.importPack(
+        sourceSerialization.exportPack([first], [], { useDelta: false }),
+      );
+      const packBytes = await collectPackBytes(sourceSerialization.exportPack([second], [first]));
+      const view = new DataView(packBytes.buffer, packBytes.byteOffset);
+      // the second commit, its tree and its blob: the first commit's objects are excluded
+      expect(view.getUint32(8, false)).toBe(3);
 
-      const packBytes = await collectPackBytes(builder.finalize());
-
-      // Verify pack is valid
-      const reader = sourceSerialization.createPackReader(toAsyncIterable(packBytes));
-      const header = await reader.getHeader();
-      expect(header.objectCount).toBe(3);
-
-      // Verify it can be imported
       const result = await targetSerialization.importPack(toAsyncIterable(packBytes));
-      expect(result.objectsImported).toBe(3);
+      expect(result.commitsImported).toBe(1);
+      expect(await target.commits.load(second)).toBeDefined();
     });
 
-    it("tracks stats", async () => {
-      const blobId = await source.blobs.store([new TextEncoder().encode("Stats test")]);
-
-      const builder = sourceSerialization.createPackBuilder();
-      await builder.addObject(blobId);
-
-      const stats = builder.getStats();
-      expect(stats.totalObjects).toBe(1);
-      expect(stats.totalSize).toBeGreaterThan(0);
-    });
-
-    it("rejects objects after finalization", async () => {
-      const blobId = await source.blobs.store([new TextEncoder().encode("Finalized test")]);
-
-      const builder = sourceSerialization.createPackBuilder();
-      await builder.addObject(blobId);
-
-      // Consume the finalize iterator
-      await collectPackBytes(builder.finalize());
-
-      // Should throw when adding after finalize
-      await expect(builder.addObject(blobId)).rejects.toThrow();
+    it("searches deltas by default, and not with useDelta: false", async () => {
+      const lines = Array.from({ length: 300 }, (_, i) => `line ${i} of a file that changes`);
+      let parent: string[] = [];
+      let tip = "";
+      for (let v = 0; v < 6; v++) {
+        lines[v * 13] = `changed in version ${v}`;
+        const blobId = await source.blobs.store([new TextEncoder().encode(lines.join("\n"))]);
+        const treeId = await source.trees.store([{ mode: 0o100644, name: "f.txt", id: blobId }]);
+        tip = await source.commits.store({
+          tree: treeId,
+          parents: parent,
+          author: createTestPerson(),
+          committer: createTestPerson(),
+          message: `v${v}`,
+        });
+        parent = [tip];
+      }
+      const searched = await collectPackBytes(sourceSerialization.exportPack([tip], []));
+      const plain = await collectPackBytes(
+        sourceSerialization.exportPack([tip], [], { useDelta: false }),
+      );
+      expect(searched.length).toBeLessThan(plain.length / 2);
+      const result = await targetSerialization.importPack(toAsyncIterable(searched));
+      expect(result.objectsImported).toBe(18);
     });
   });
 
@@ -417,11 +396,10 @@ describe("Pack Import/Export Integration", () => {
       );
       expect(looseBytes.length).toBeGreaterThan(0);
 
-      // Parse back into target
-      const meta = await targetSerialization.parseLooseObject(toAsyncIterable(looseBytes));
-      expect(meta.id).toBe(blobId);
-      expect(meta.type).toBe("blob");
-      expect(meta.size).toBe(originalContent.length);
+      // Store back into target (git's loose objects are zlib of the raw object)
+      const meta = await importLoose(target, blobId, looseBytes);
+      expect(meta?.type).toBe("blob");
+      expect(meta?.size).toBe(originalContent.length);
 
       // Verify content in target
       const loadedBlob = await target.blobs.load(blobId);
@@ -448,12 +426,11 @@ describe("Pack Import/Export Integration", () => {
       const treeLoose = await collectAsyncIterableBytes(
         sourceSerialization.serializeLooseObject(commit?.tree),
       );
-      await targetSerialization.parseLooseObject(toAsyncIterable(blobLoose));
-      await targetSerialization.parseLooseObject(toAsyncIterable(treeLoose));
+      await importLoose(target, treeEntries[0].id, blobLoose);
+      await importLoose(target, commit?.tree as string, treeLoose);
 
-      const meta = await targetSerialization.parseLooseObject(toAsyncIterable(looseBytes));
-      expect(meta.id).toBe(commitId);
-      expect(meta.type).toBe("commit");
+      const meta = await importLoose(target, commitId, looseBytes);
+      expect(meta?.type).toBe("commit");
     });
   });
 
@@ -650,6 +627,26 @@ async function collectAsyncIterableBytes(iterable: AsyncIterable<Uint8Array>): P
   return result;
 }
 
+/** The ids and types of a pack's objects, stored into `history` by unpackObjects. */
+async function readEntries(history: HistoryWithOperations, packBytes: Uint8Array) {
+  const ids: string[] = [];
+  const types = new Set<string>();
+  const { count } = await unpackObjects(kernelOf(history), toAsyncIterable(packBytes), {
+    onObject: (id, type) => {
+      ids.push(id);
+      types.add(type);
+    },
+  });
+  return { count, ids, types };
+}
+
+/** Stores a loose object (zlib of "type size\0content") under `id`; returns its header. */
+async function importLoose(history: HistoryWithOperations, id: string, loose: Uint8Array) {
+  await kernelOf(history).putRaw(id, inflate(toAsyncIterable(loose), { raw: false }));
+  const obj = await kernelOf(history).get(id);
+  return obj && { type: obj.type, size: obj.size };
+}
+
 async function* toAsyncIterable(data: Uint8Array): AsyncIterable<Uint8Array> {
   yield data;
 }
@@ -657,4 +654,10 @@ async function* toAsyncIterable(data: Uint8Array): AsyncIterable<Uint8Array> {
 async function sha1(data: Uint8Array): Promise<Uint8Array> {
   const hash = await crypto.subtle.digest("SHA-1", data);
   return new Uint8Array(hash);
+}
+
+/** The history's object kernel (the memory backend always has one). */
+function kernelOf(history: HistoryWithOperations) {
+  if (!history.objects) throw new Error("history has no object kernel");
+  return history.objects;
 }

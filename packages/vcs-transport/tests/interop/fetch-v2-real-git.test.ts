@@ -3,7 +3,7 @@
  * `git upload-pack` speaking Git protocol v2.
  *
  * Spawns real `git upload-pack <repo>` with `GIT_PROTOCOL=version=2` over stdio
- * and drives it with the transport's `fetchV2OverDuplex`, cloning into a fresh
+ * and drives it with the transport's `fetchOverDuplex` (v2 from the server's first line), cloning into a fresh
  * in-memory vcs-core repository. Compatibility is asserted against the real git
  * CLI: the v2 `ls-refs` result (`show-ref`), imported object identity
  * (`rev-list --objects --all`), and incremental transfer with a "have".
@@ -11,7 +11,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { fetchV2OverDuplex } from "../../src/index.js";
+import { fetchOverDuplex } from "../../src/index.js";
 import {
   cleanupDir,
   createTransportRepo,
@@ -45,7 +45,7 @@ describeGit("Interop A · fetch ← real git upload-pack (protocol v2)", () => {
     const client = await createTransportRepo();
     const duplex = spawnGitServiceV2("upload-pack", fx.dir);
     try {
-      const result = await fetchV2OverDuplex({
+      const result = await fetchOverDuplex({
         duplex,
         repository: client.facade,
         refStore: client.refStore,
@@ -83,7 +83,7 @@ describeGit("Interop A · fetch ← real git upload-pack (protocol v2)", () => {
     let baselineImported: number;
     const baseDuplex = spawnGitServiceV2("upload-pack", fx.dir);
     try {
-      const base = await fetchV2OverDuplex({
+      const base = await fetchOverDuplex({
         duplex: baseDuplex,
         repository: baselineRepo.facade,
         refStore: baselineRepo.refStore,
@@ -100,7 +100,7 @@ describeGit("Interop A · fetch ← real git upload-pack (protocol v2)", () => {
       // Step 1: v2-clone the c1-only repo ⇒ client holds exactly c1's objects.
       const cloneOld = spawnGitServiceV2("upload-pack", old.dir);
       try {
-        const r = await fetchV2OverDuplex({
+        const r = await fetchOverDuplex({
           duplex: cloneOld,
           repository: client.facade,
           refStore: client.refStore,
@@ -115,11 +115,10 @@ describeGit("Interop A · fetch ← real git upload-pack (protocol v2)", () => {
       // Step 2: incremental v2 fetch from the FULL repo, offering c1 as a "have".
       const inc = spawnGitServiceV2("upload-pack", fx.dir);
       try {
-        const result = await fetchV2OverDuplex({
+        const result = await fetchOverDuplex({
           duplex: inc,
           repository: client.facade,
           refStore: client.refStore,
-          localHead: "refs/heads/main",
         });
         expect(result.success, `v2 incremental failed: ${result.error}\n${inc.stderr()}`).toBe(
           true,

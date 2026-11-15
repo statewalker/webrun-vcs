@@ -6,14 +6,15 @@
  * (SFU) that mediates connections, enabling multi-party sync.
  *
  * Architecture:
- * LiveKit Room → per-participant webrun ByteChannel (`byteChannelFromLiveKit`)
- *   → `emulateMux` → webrun `Duplex` → Git protocol FSM.
+ * LiveKit Room → per-participant pipe (`messageTargetOverLiveKit`)
+ *   → `webrun-rpc` port stack (`createPeerMux`: one `multiplexPort` with
+ *   `msgpackCodec`, one port per call) → webrun `Duplex` → Git protocol FSM.
  *
  * Migrated off the retired `@statewalker/vcs-port-livekit`: the old
  * `RoomManager` wrapper is replaced by a `livekit-client` `Room` driven
  * directly, and `createLiveKitPort` (Room → MessagePort) is replaced by
- * `byteChannelFromLiveKit` (Room → webrun `ByteChannel`) multiplexed with
- * `emulateMux`.
+ * `messageTargetOverLiveKit` (Room → pipe of bytes) run under `webrun-rpc`'s
+ * port stack.
  *
  * Prerequisites:
  *   livekit-server --dev    # Start local LiveKit server on ws://localhost:7880
@@ -28,14 +29,11 @@ import {
   MemoryWorkingCopy,
   MemoryWorktree,
 } from "@statewalker/vcs-working-tree";
-import { emulateMux } from "@statewalker/webrun-streams";
-import { byteChannelFromLiveKit } from "@statewalker/webrun-streams-livekit";
+import { messageTargetOverLiveKit } from "@statewalker/webrun-streams-livekit";
 import { type RemoteParticipant, Room, RoomEvent } from "livekit-client";
+import { createPeerMux, type PeerMux } from "./adapters/index.js";
 import { generateDevToken } from "./services/dev-token.js";
 import { createGitPeerSession, setupGitPeerServer } from "./services/index.js";
-
-/** Per-participant multiplexer over the LiveKit data channel. */
-type PeerMux = ReturnType<typeof emulateMux>;
 
 // --- State ---
 
@@ -124,6 +122,10 @@ async function connectToRoom(): Promise<void> {
   });
 
   instance.on(RoomEvent.Disconnected, () => {
+    // Muxes are bound to this Room; a reconnect must build new ones.
+    for (const identity of [...participantMuxes.keys()]) {
+      cleanupParticipant(identity);
+    }
     connected = false;
     log("Connection state: disconnected");
     updateConnectionStatus("disconnected");
@@ -174,13 +176,28 @@ function setupParticipant(identity: string): void {
   if (!room || !history || !serialization) return;
   if (participantMuxes.has(identity)) return;
 
-  // Two peers over one room data channel must pick opposite mux sides so
-  // `emulateMux` stream-ids never collide; a deterministic identity compare
-  // does that without any extra negotiation.
+  // The two ends of one pipe must pick opposite mux sides so their port ids
+  // never collide; a deterministic identity compare does that without any
+  // extra negotiation.
   const side = localIdentity < identity ? "initiator" : "responder";
-  const channel = byteChannelFromLiveKit(room, identity);
-  const mux = emulateMux(channel, { side });
+  // Throws if the participant is not announced yet; callers run this from
+  // `ParticipantConnected` or for `room.remoteParticipants`.
+  const { target, signal, maxMessageSize } = messageTargetOverLiveKit(room, identity);
+  const mux = createPeerMux(target, { side, signal, maxMessageSize });
   participantMuxes.set(identity, mux);
+  // The pipe can end while the participant stays in the room (a failed
+  // publish, an oversized post, the peer's goodbye). Drop the dead mux so the
+  // next `setupParticipant` builds a fresh one instead of reusing it.
+  signal.addEventListener(
+    "abort",
+    () => {
+      if (participantMuxes.get(identity) !== mux) return;
+      cleanupParticipant(identity);
+      log(`Connection to ${identity} ended`);
+      updatePeerList();
+    },
+    { once: true },
+  );
 
   // Start Git server for this participant
   const stopServer = setupGitPeerServer({
@@ -315,6 +332,10 @@ async function handleAddFile(): Promise<void> {
 async function handleSync(identity: string): Promise<void> {
   if (!history || !serialization) return;
 
+  // Rebuild the connection if its pipe ended while the participant stayed.
+  if (!participantMuxes.has(identity) && room?.remoteParticipants.has(identity)) {
+    setupParticipant(identity);
+  }
   const mux = participantMuxes.get(identity);
   if (!mux) {
     log(`No connection to ${identity}`, "error");

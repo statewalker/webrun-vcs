@@ -167,9 +167,10 @@ export function createGitSocketClient(options: GitSocketClientOptions): Duplex {
       return io.read()[Symbol.asyncIterator]();
     },
 
-    write(data: Uint8Array): void {
+    // the socket's own write promise: the transport waits for it (backpressure)
+    async write(data: Uint8Array): Promise<void> {
       if (!closed) {
-        io.write(data);
+        await io.write(data);
       }
     },
 

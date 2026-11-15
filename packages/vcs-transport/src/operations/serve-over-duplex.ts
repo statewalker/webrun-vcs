@@ -17,8 +17,18 @@ import { createTransportApi } from "../factories/transport-api-factory.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../fsm/fetch/server-fetch-fsm.js";
 import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
-import { serverPushHandlers, serverPushTransitions } from "../fsm/push/server-push-fsm.js";
+import {
+  DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+  type ReceivePackHooks,
+  type ReceivePackLogger,
+} from "../fsm/push/receive-pack-types.js";
+import {
+  releaseReceivePack,
+  serverPushHandlers,
+  serverPushTransitions,
+} from "../fsm/push/server-push-fsm.js";
 import type { ServiceType } from "../protocol/types.js";
+import { withIdleTimeout, withWriteTimeout } from "../utils/idle-timeout.js";
 
 /**
  * Options for serve-over-duplex operation.
@@ -36,12 +46,49 @@ export interface ServeOverDuplexOptions {
   allowDeletes?: boolean;
   /** Allow non-fast-forward updates (receive-pack only) */
   allowNonFastForward?: boolean;
-  /** Deny updates to the currently checked-out branch */
+  /**
+   * Refuse updating the checked-out branch of a non-bare repository ("branch is currently
+   * checked out", git's `receive.denyCurrentBranch`; default true)
+   */
   denyCurrentBranch?: boolean;
-  /** Currently checked-out branch (for denyCurrentBranch) */
+  /** The branch HEAD names (default: `refStore.getSymrefTarget("HEAD")`) */
   currentBranch?: string;
+  /** Whether the repository has no working tree (default: `repository.isBare()`, else true) */
+  bare?: boolean;
+  /** Refuse deleting the current branch (git's `receive.denyDeleteCurrent`; default true) */
+  denyDeleteCurrent?: boolean;
+  /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
+  shallowUpdate?: boolean;
+  /** receive-pack hooks: authorize, preReceive, update, postReceive */
+  hooks?: ReceivePackHooks;
+  /** Most commands in one push (receive-pack; default 65536) */
+  maxCommands?: number;
+  /** Side-band keep-alive interval while a push is checked (ms; default 5000; 0: none) */
+  keepAliveMs?: number;
+  /**
+   * Fail a read from the client that brings nothing for this long (ms): a stalled push is
+   * answered "unpack request idle for … ms". Default: none.
+   */
+  idleTimeoutMs?: number;
+  /**
+   * receive-pack: fail a write the client does not take within this long (ms), ending the run: a client that
+   * stopped reading cannot hold it (and a push's quarantine) forever. Default
+   * {@link DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS}; 0: none.
+   */
+  writeTimeoutMs?: number;
+  /** A receive-pack hook still running after this long (ms) refuses its commands (default: none) */
+  hookTimeoutMs?: number;
+  /** Logs hook failures that cannot reach the client (default: console.error) */
+  logger?: ReceivePackLogger;
   /** Server capabilities to advertise */
   capabilities?: string[];
+  /**
+   * Which wants upload-pack serves; anything else is answered `ERR upload-pack: not our ref`.
+   * Default: "ADVERTISED" over protocol v0/v1 (git's default), "REACHABLE_COMMIT" over v2 (the
+   * tips and commits reachable from them, git's `uploadpack.allowReachableSHA1InWant`; git's
+   * own v2 serves any object it has, which "ANY" gives).
+   */
+  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
   /**
    * Git wire protocol version to serve. Version negotiation is out-of-band in
    * git (the `GIT_PROTOCOL` env / `Git-Protocol: version=2` header), never in
@@ -89,7 +136,26 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
   const useV2 = options.protocolVersion === "2" && service !== "git-receive-pack";
 
   const state = new ProtocolState();
-  const transport = createTransportApi(duplex, state);
+  const input = withIdleTimeout(duplex, options.idleTimeoutMs);
+  // receive-pack: a client that stops reading the answer must not hold the run (and its
+  // quarantine) forever
+  const write =
+    service === "git-receive-pack"
+      ? withWriteTimeout(
+          (data) => duplex.write(data),
+          options.writeTimeoutMs ?? DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+        )
+      : undefined;
+  const transport = createTransportApi(
+    input === duplex && !write
+      ? duplex
+      : {
+          [Symbol.asyncIterator]: () => input[Symbol.asyncIterator](),
+          write: write ?? ((data) => duplex.write(data)),
+          ...(duplex.close ? { close: () => duplex.close?.() ?? Promise.resolve() } : {}),
+        },
+    state,
+  );
 
   // Protocol-v2's packfile section is ALWAYS side-band-64k multiplexed
   // (protocol-v2.txt), even though the v2 capability advertisement never lists
@@ -105,11 +171,27 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     localHead: options.currentBranch ?? "refs/heads/main",
     maxHaves: 256,
     serverCapabilities: options.capabilities,
+    requestPolicy: options.requestPolicy,
     allowDeletes: options.allowDeletes ?? true,
     allowNonFastForward: options.allowNonFastForward ?? false,
     denyCurrentBranch: options.denyCurrentBranch ?? true,
     currentBranch: options.currentBranch,
+    receivePack: {
+      hooks: options.hooks,
+      maxCommands: options.maxCommands,
+      keepAliveMs: options.keepAliveMs,
+      hookTimeoutMs: options.hookTimeoutMs,
+      bare: options.bare,
+      denyDeleteCurrent: options.denyDeleteCurrent,
+      shallowUpdate: options.shallowUpdate,
+      logger: options.logger,
+      // a pipe's writer blocks until its pack is taken: read a refused pack, store nothing
+      drainRefusedPack: true,
+      afterReport: (task) => afterReport.push(task),
+    },
   };
+  // post-receive tasks: started once the report is written (detached from this call)
+  const afterReport: Array<() => Promise<void>> = [];
 
   const output = new HandlerOutput();
 
@@ -131,6 +213,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
 
   try {
     const success = await fsm.run(ctx);
+    for (const task of afterReport) setTimeout(() => void task(), 0);
 
     if (!success || ctx.output.error) {
       return {
@@ -148,5 +231,8 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       success: false,
       error: error instanceof Error ? error.message : String(error),
     };
+  } finally {
+    // objects of a push that stopped before applying its refs are not left behind
+    if (service === "git-receive-pack" && !useV2) await releaseReceivePack(ctx);
   }
 }

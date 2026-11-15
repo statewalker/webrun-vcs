@@ -24,7 +24,8 @@ class GitBlobStore implements Blobs {
   constructor(private readonly objects: GitObjects) {}
 
   /**
-   * Store blob with unknown size
+   * Store a blob: in one pass with `size`, else through `putUnsized` (small
+   * content in memory, longer content spooled).
    */
   store(
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,

@@ -5,15 +5,20 @@ import { splitStream } from "./split-stream.js";
  * Reads a header from an async iterable stream.
  * @param input the input async iterable stream
  * @param getHeaderEnd  function that determines the end of the header within a block.
- * @param maxLength Optional maximum length for the header. If exceeded, an error is thrown.
- * No limit if zero or negative. Default is -1.
+ * @param maxLength Maximum number of bytes to read while looking for the header end (a
+ * positive integer). Reading past it rejects, so a malformed stream with no header end is
+ * never read without limit.
  * @returns A tuple containing the header as a Uint8Array and an async generator for the remaining data.
+ * @throws RangeError when `maxLength` is not a positive integer
  */
 export async function readHeader(
   input: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
   getHeaderEnd: (block: Uint8Array) => number,
-  maxLength = -1,
+  maxLength: number,
 ): Promise<[header: Uint8Array, rest: AsyncGenerator<Uint8Array>]> {
+  if (!Number.isSafeInteger(maxLength) || maxLength <= 0) {
+    throw new RangeError(`maxLength must be a positive integer, got ${maxLength}`);
+  }
   let header: Uint8Array | null = null;
   let len = 0;
 
@@ -33,12 +38,9 @@ export async function readHeader(
       return endPos;
     }
 
-    // Check max length
-    if (maxLength > 0) {
-      len += block.length;
-      if (len > maxLength) {
-        throw new Error(`Header exceeds maximum length of ${maxLength} bytes`);
-      }
+    len += block.length;
+    if (len > maxLength) {
+      throw new Error(`Header exceeds maximum length of ${maxLength} bytes`);
     }
 
     return -1;
@@ -64,13 +66,14 @@ export async function readHeader(
  *
  * @param input The input async iterable stream
  * @param getHeaderEnd Function that determines the end of the header within a block.
- * @param maxLength Optional maximum length for the header. If exceeded, an error is thrown.
+ * @param maxLength Maximum number of bytes to read while looking for the header end (required,
+ * as for `readHeader`).
  * @returns A tuple containing the header as a Uint8Array and an async generator for the remaining data.
  */
 export async function readAhead(
   input: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
   getHeaderEnd: (block: Uint8Array) => number,
-  maxLength = -1,
+  maxLength: number,
 ): Promise<[header: Uint8Array, stream: AsyncGenerator<Uint8Array>]> {
   const [header, rest] = await readHeader(input, getHeaderEnd, maxLength);
   async function* combinedStream(): AsyncGenerator<Uint8Array> {

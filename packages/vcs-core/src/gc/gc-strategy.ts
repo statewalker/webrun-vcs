@@ -95,4 +95,13 @@ export interface GcStrategy {
    * Get current storage statistics.
    */
   getStats(): Promise<StorageStats>;
+
+  /**
+   * Remove leftovers of interrupted writes older than `olderThanMs` that
+   * `History.objects.sweepStale` does not reach (such as the SQL native blob
+   * store's `tmp:*` rows). Optional.
+   *
+   * @returns The number of leftovers removed
+   */
+  sweepStale?(olderThanMs: number): Promise<number>;
 }

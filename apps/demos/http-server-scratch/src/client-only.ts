@@ -14,22 +14,20 @@
  * - Pushing changes back to the server
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { FileMode, indexPack, writePackIndex } from "@statewalker/vcs-core";
-import { clone, type PushObject, push } from "@statewalker/vcs-transport";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
+import { FileMode, type FilesApi, joinPath } from "@statewalker/vcs-core";
+import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  push,
+  fetch as transportFetch,
+} from "@statewalker/vcs-transport";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
-  atomicWriteFile,
   concatBytes,
   createAuthor,
   createFileHistory,
   ensureDirectory,
-  ensureDirFiles,
   type FileHistory,
   getHead,
   printError,
@@ -37,12 +35,11 @@ import {
   printSection,
   printStep,
   printSuccess,
-  removeDirectory,
+  resolvePath,
   shortId,
 } from "./shared/index.js";
 
 // Initialize compression
-setCompressionUtils(createNodeCompression());
 
 const textEncoder = new TextEncoder();
 
@@ -51,13 +48,13 @@ function parseArgs(): { url: string; shouldPush: boolean; localDir: string } {
   const args = process.argv.slice(2);
   let url = "";
   let shouldPush = false;
-  let localDir = path.join(process.cwd(), "cloned-repo");
+  let localDir = resolvePath(process.cwd(), "cloned-repo");
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--push") {
       shouldPush = true;
     } else if (args[i] === "--dir" && args[i + 1]) {
-      localDir = path.resolve(args[i + 1]);
+      localDir = resolvePath(process.cwd(), args[i + 1]);
       i++;
     } else if (!args[i].startsWith("--")) {
       url = args[i];
@@ -91,16 +88,17 @@ async function main(): Promise<void> {
   try {
     // Step 1: Clone
     printStep(1, "Cloning repository");
-    history = await cloneRepository(url, localDir);
+    const files = createNodeFilesApi({ rootDir: localDir });
+    history = await cloneRepository(url, localDir, files);
 
     if (shouldPush) {
       // Step 2: Make changes
       printStep(2, "Creating changes");
-      const { commitId } = await makeChanges(history, localDir);
+      await makeChanges(history, files);
 
       // Step 3: Push
       printStep(3, "Pushing changes");
-      await pushChanges(history, url, commitId);
+      await pushChanges(history, url);
     }
 
     printSection("SUCCESS!");
@@ -124,73 +122,48 @@ async function main(): Promise<void> {
 /**
  * Clone a repository using VCS transport.
  */
-async function cloneRepository(url: string, localDir: string): Promise<FileHistory> {
+async function cloneRepository(
+  url: string,
+  localDir: string,
+  files: FilesApi,
+): Promise<FileHistory> {
   printInfo(`Cloning from: ${url}`);
   printInfo(`Destination: ${localDir}`);
 
   // Clean up and create directory
-  await removeDirectory(localDir);
-  await ensureDirectory(localDir);
-  const gitDir = path.join(localDir, ".git");
-  await ensureDirectory(gitDir);
+  await emptyDirectory(localDir);
+  await ensureDirectory(files, ".git");
 
-  // Perform clone
-  const cloneResult = await clone({
+  // Create local repository
+  const history = await createFileHistory({ files, gitDir: ".git", create: true });
+
+  // Clone: a fetch into the empty repository (the pack is imported as it arrives)
+  const result = await transportFetch({
     url,
-    onProgressMessage: (msg) => {
-      if (msg.trim()) {
-        printInfo(`  ${msg.trim()}`);
-      }
+    repository: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+    refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    tags: "all",
+    onProgress: (msg) => {
+      if (msg) printInfo(`  ${msg}`);
     },
   });
 
-  printInfo(`Received ${cloneResult.bytesReceived} bytes`);
-  printInfo(`Default branch: ${cloneResult.defaultBranch}`);
-  printInfo(`Refs received: ${cloneResult.refs.size}`);
-
-  // Create local repository
-  const files = createNodeFilesApi({ rootDir: localDir });
-  const history = await createFileHistory({
-    files,
-    gitDir: ".git",
-    create: true,
-    defaultBranch: cloneResult.defaultBranch,
-  });
-
-  // Process pack data
-  if (cloneResult.packData.length > 0) {
-    printInfo("Processing pack data...");
-
-    const indexResult = await indexPack(cloneResult.packData);
-    printInfo(`Pack contains ${indexResult.objectCount} objects`);
-
-    const packChecksum = bytesToHex(indexResult.packChecksum);
-    const packDir = ".git/objects/pack";
-    await ensureDirFiles(files, packDir);
-
-    const packPath = `${packDir}/pack-${packChecksum}.pack`;
-    const idxPath = `${packDir}/pack-${packChecksum}.idx`;
-
-    await atomicWriteFile(files, packPath, cloneResult.packData);
-    const indexData = await writePackIndex(indexResult.entries, indexResult.packChecksum);
-    await atomicWriteFile(files, idxPath, indexData);
-  }
-
-  // Set up refs
-  for (const [refName, objectId] of cloneResult.refs) {
-    await history.refs.set(refName, bytesToHex(objectId));
-  }
+  const defaultBranch = (result.defaultBranch ?? "refs/heads/main").replace(/^refs\/heads\//, "");
+  printInfo(`Received ${result.packBytes} bytes (${result.packObjects} objects)`);
+  printInfo(`Default branch: ${defaultBranch}`);
+  for (const update of result.refUpdates) printInfo(`  ${update.summary} ${update.localRef}`);
 
   // Set up local main branch
-  const mainRef = cloneResult.refs.get(`refs/remotes/origin/${cloneResult.defaultBranch}`);
-  if (mainRef) {
-    await history.refs.set(`refs/heads/${cloneResult.defaultBranch}`, bytesToHex(mainRef));
+  const tracking = await history.refs.resolve(`refs/remotes/origin/${defaultBranch}`);
+  if (tracking?.objectId) {
+    await history.refs.set(`refs/heads/${defaultBranch}`, tracking.objectId);
   }
 
-  await history.refs.setSymbolic("HEAD", `refs/heads/${cloneResult.defaultBranch}`);
+  await history.refs.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
   // Checkout working tree
-  await checkoutHead(history, localDir);
+  await checkoutHead(history, files);
 
   printSuccess(`Repository cloned successfully`);
 
@@ -200,7 +173,7 @@ async function cloneRepository(url: string, localDir: string): Promise<FileHisto
 /**
  * Checkout HEAD to working tree.
  */
-async function checkoutHead(history: FileHistory, localDir: string): Promise<void> {
+async function checkoutHead(history: FileHistory, files: FilesApi): Promise<void> {
   const headCommit = await getHead(history);
   if (!headCommit) {
     printInfo("Empty repository - no checkout needed");
@@ -211,24 +184,29 @@ async function checkoutHead(history: FileHistory, localDir: string): Promise<voi
   if (!commit) {
     throw new Error(`Commit ${headCommit} not found`);
   }
-  await extractTree(history, commit.tree, localDir);
+  await extractTree(history, files, commit.tree, "/");
 }
 
 /**
  * Extract a tree to a directory.
  */
-async function extractTree(history: FileHistory, treeId: string, dirPath: string): Promise<void> {
+async function extractTree(
+  history: FileHistory,
+  files: FilesApi,
+  treeId: string,
+  dirPath: string,
+): Promise<void> {
   const entries = await history.trees.load(treeId);
   if (!entries) {
     throw new Error(`Tree ${treeId} not found`);
   }
 
   for await (const entry of entries) {
-    const entryPath = path.join(dirPath, entry.name);
+    const entryPath = joinPath(dirPath, entry.name);
 
     if (entry.mode === FileMode.TREE) {
-      await ensureDirectory(entryPath);
-      await extractTree(history, entry.id, entryPath);
+      await ensureDirectory(files, entryPath);
+      await extractTree(history, files, entry.id, entryPath);
     } else {
       const content = await history.blobs.load(entry.id);
       if (!content) {
@@ -240,7 +218,7 @@ async function extractTree(history: FileHistory, treeId: string, dirPath: string
         chunks.push(chunk);
       }
       const data = concatBytes(...chunks);
-      await fs.writeFile(entryPath, data);
+      await files.write(entryPath, [data]);
     }
   }
 }
@@ -250,7 +228,7 @@ async function extractTree(history: FileHistory, treeId: string, dirPath: string
  */
 async function makeChanges(
   history: FileHistory,
-  localDir: string,
+  files: FilesApi,
 ): Promise<{ newTreeId: string; commitId: string }> {
   const headCommit = await getHead(history);
   if (!headCommit) {
@@ -296,7 +274,7 @@ Timestamp: ${new Date().toISOString()}
   printInfo(`Created tree: ${shortId(newTreeId)}`);
 
   // Write file to working directory
-  await fs.writeFile(path.join(localDir, "CLIENT-DEMO.md"), newFileContent);
+  await files.write("CLIENT-DEMO.md", [textEncoder.encode(newFileContent)]);
 
   // Create commit
   const author = createAuthor();
@@ -323,7 +301,7 @@ Timestamp: ${new Date().toISOString()}
 /**
  * Push changes to remote.
  */
-async function pushChanges(history: FileHistory, url: string, commitId: string): Promise<void> {
+async function pushChanges(history: FileHistory, url: string): Promise<void> {
   printInfo(`Pushing to: ${url}`);
 
   // Get current branch
@@ -337,25 +315,15 @@ async function pushChanges(history: FileHistory, url: string, commitId: string):
 
   printInfo(`Pushing branch: ${branchName}`);
 
-  // Collect objects to push
-  const objects = await collectObjectsForPush(history, commitId);
-  printInfo(`Objects to push: ${objects.length}`);
-
   // Push
   const result = await push({
     url,
     refspecs: [refspec],
     force: true,
-    getLocalRef: async (refName: string) => {
-      const ref = await history.refs.resolve(refName);
-      return ref?.objectId;
-    },
-    getObjectsToPush: async function* () {
-      for (const obj of objects) {
-        yield obj;
-      }
-    },
-    onProgressMessage: (msg) => {
+    // the local refs, and the objects the remote lacks, streamed as a thin pack
+    repository: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+    onProgress: (msg) => {
       if (msg.trim()) {
         printInfo(`  ${msg.trim()}`);
       }
@@ -365,69 +333,23 @@ async function pushChanges(history: FileHistory, url: string, commitId: string):
   if (result.ok) {
     printSuccess("Push successful!");
     printInfo(`Bytes sent: ${result.bytesSent}`);
+    printInfo(`Objects sent: ${result.packObjects}`);
   } else {
-    throw new Error(`Push failed: ${result.unpackStatus}`);
+    const failed = result.updates.map((u) => `${u.remoteRef} ${u.summary}`).join(", ");
+    throw new Error(`Push failed: ${result.unpack?.message ?? failed}`);
   }
-}
-
-/**
- * Collect objects needed for push.
- */
-async function collectObjectsForPush(
-  history: FileHistory,
-  commitId: string,
-): Promise<PushObject[]> {
-  const objects: PushObject[] = [];
-  const seen = new Set<string>();
-
-  const typeStringToCode: Record<string, number> = {
-    commit: 1,
-    tree: 2,
-    blob: 3,
-    tag: 4,
-  };
-
-  async function collectObject(id: string): Promise<void> {
-    if (seen.has(id)) return;
-    seen.add(id);
-
-    const obj = await history.objects.get(id);
-    if (!obj) throw new Error(`Object not found: ${id}`);
-    const typeCode = typeStringToCode[obj.type];
-
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of obj.content) {
-      chunks.push(chunk);
-    }
-    const content = concatBytes(...chunks);
-
-    objects.push({ id, type: typeCode, content });
-  }
-
-  async function collectTree(treeId: string): Promise<void> {
-    await collectObject(treeId);
-
-    const entries = await history.trees.load(treeId);
-    if (entries) {
-      for await (const entry of entries) {
-        if (entry.mode === FileMode.TREE) {
-          await collectTree(entry.id);
-        } else {
-          await collectObject(entry.id);
-        }
-      }
-    }
-  }
-
-  await collectObject(commitId);
-
-  const commit = await history.commits.load(commitId);
-  if (commit) {
-    await collectTree(commit.tree);
-  }
-
-  return objects;
 }
 
 // Run main
 main();
+
+/**
+ * Remove everything in `dir` (a FilesApi rooted at "/" rejects every path, so
+ * the directory's own FilesApi removes its entries instead of its parent's).
+ */
+async function emptyDirectory(dir: string): Promise<void> {
+  const files = createNodeFilesApi({ rootDir: dir });
+  const names: string[] = [];
+  for await (const entry of files.list("/")) names.push(entry.name);
+  for (const name of names) await files.remove(name);
+}

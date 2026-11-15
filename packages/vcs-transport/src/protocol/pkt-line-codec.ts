@@ -16,6 +16,7 @@ import { MAX_PACKET_SIZE, MIN_PACKET_LENGTH, PKT_DELIM, PKT_END, PKT_FLUSH } fro
 // Re-export for convenience
 export { PKT_DELIM, PKT_END, PKT_FLUSH } from "./constants.js";
 
+import { ChunkQueue } from "./chunk-queue.js";
 import { PacketLineError } from "./errors.js";
 import type { Packet } from "./types.js";
 
@@ -97,7 +98,7 @@ export async function* pktLineWriter(packets: AsyncIterable<Packet>): AsyncGener
       case "delim":
         yield encodeDelim();
         break;
-      case "end":
+      case "response-end":
         yield encodeEnd();
         break;
       case "data":
@@ -110,26 +111,15 @@ export async function* pktLineWriter(packets: AsyncIterable<Packet>): AsyncGener
 }
 
 /**
- * Concatenate multiple Uint8Arrays efficiently.
- */
-function concatBytes(...arrays: Uint8Array[]): Uint8Array<ArrayBuffer> {
-  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const arr of arrays) {
-    result.set(arr, offset);
-    offset += arr.length;
-  }
-  return result;
-}
-
-/**
  * Parse a single packet from the beginning of a buffer.
  * Returns the packet and the remaining buffer, or null if incomplete.
+ *
+ * `remaining` is a view of `buffer` (not a copy), so parsing a buffer packet by
+ * packet costs time linear in its length. A data packet's `data` is a copy.
  */
-export function parsePacket(
-  buffer: Uint8Array,
-): { packet: Packet; remaining: Uint8Array<ArrayBuffer> } | null {
+export function parsePacket<T extends ArrayBufferLike>(
+  buffer: Uint8Array<T>,
+): { packet: Packet; remaining: Uint8Array<T> } | null {
   if (buffer.length < 4) {
     return null; // Need more data for header
   }
@@ -140,17 +130,22 @@ export function parsePacket(
   if (lengthHex === PKT_FLUSH) {
     return {
       packet: { type: "flush" },
-      remaining: new Uint8Array(buffer.subarray(4)),
+      remaining: buffer.subarray(4),
     };
   }
   if (lengthHex === PKT_DELIM) {
     return {
       packet: { type: "delim" },
-      remaining: new Uint8Array(buffer.subarray(4)),
+      remaining: buffer.subarray(4),
     };
   }
-  // Note: PKT_END (0002) is only used in protocol v2
-  // In protocol v1, length 0002 is invalid
+  // 0002: response end (protocol v2); it never appears in a v1 exchange
+  if (lengthHex === PKT_END) {
+    return {
+      packet: { type: "response-end" },
+      remaining: buffer.subarray(4),
+    };
+  }
 
   // Parse data packet length
   const length = parseInt(lengthHex, 16);
@@ -167,7 +162,7 @@ export function parsePacket(
   if (length === MIN_PACKET_LENGTH) {
     return {
       packet: { type: "data", data: new Uint8Array(0) },
-      remaining: new Uint8Array(buffer.subarray(4)),
+      remaining: buffer.subarray(4),
     };
   }
 
@@ -180,41 +175,60 @@ export function parsePacket(
   const data = new Uint8Array(buffer.subarray(4, length));
   return {
     packet: { type: "data", data },
-    remaining: new Uint8Array(buffer.subarray(length)),
+    remaining: buffer.subarray(length),
   };
 }
 
 /**
  * Read packets from a byte stream.
  * Handles partial packets and buffering internally.
+ *
+ * The bytes received are queued as chunks and parsed from the front, so the
+ * reader works in time linear in the input however it is chunked.
  */
 export async function* pktLineReader(stream: AsyncIterable<Uint8Array>): AsyncGenerator<Packet> {
-  let buffer = new Uint8Array(0);
+  const queue = new ChunkQueue();
+  // Length of the data packet whose header has been read, or -1
+  let pending = -1;
 
   for await (const chunk of stream) {
-    // Append incoming chunk to buffer
-    buffer = concatBytes(buffer, chunk);
-
-    // Parse complete packets from buffer
-    let result = parsePacket(buffer);
-    while (result !== null) {
-      yield result.packet;
-      buffer = result.remaining;
-      result = parsePacket(buffer);
+    queue.push(chunk);
+    while (true) {
+      if (pending < 0) {
+        if (queue.length < 4) break;
+        const lengthHex = queue.peekHeader();
+        if (lengthHex === PKT_FLUSH) {
+          queue.take(4);
+          yield { type: "flush" };
+          continue;
+        }
+        if (lengthHex === PKT_DELIM) {
+          queue.take(4);
+          yield { type: "delim" };
+          continue;
+        }
+        if (lengthHex === PKT_END) {
+          queue.take(4);
+          yield { type: "response-end" };
+          continue;
+        }
+        const length = /^[0-9a-fA-F]{4}$/.test(lengthHex) ? parseInt(lengthHex, 16) : Number.NaN;
+        if (Number.isNaN(length) || length < MIN_PACKET_LENGTH) {
+          throw new PacketLineError(`Invalid packet line header: ${lengthHex}`, lengthHex);
+        }
+        queue.take(4);
+        pending = length - 4;
+      }
+      if (queue.length < pending) break;
+      const data = queue.take(pending);
+      pending = -1;
+      yield { type: "data", data };
     }
   }
 
-  // Check for incomplete packet at end
-  if (buffer.length > 0) {
-    // Try to parse one more time in case buffer contains a complete packet
-    const result = parsePacket(buffer);
-    if (result !== null) {
-      yield result.packet;
-      buffer = result.remaining;
-    }
-    if (buffer.length > 0) {
-      throw new PacketLineError(`Incomplete packet: ${buffer.length} bytes remaining`);
-    }
+  if (pending >= 0 || queue.length > 0) {
+    const remaining = queue.length + (pending >= 0 ? 4 : 0);
+    throw new PacketLineError(`Incomplete packet: ${remaining} bytes remaining`);
   }
 }
 
@@ -229,7 +243,7 @@ export function packetDataToString(packet: Packet): string {
   if (packet.type === "delim") {
     return PKT_DELIM;
   }
-  if (packet.type === "end") {
+  if (packet.type === "response-end") {
     return PKT_END;
   }
   if (!packet.data) {
@@ -254,7 +268,7 @@ export function packetDataToStringRaw(packet: Packet): string {
   if (packet.type === "delim") {
     return PKT_DELIM;
   }
-  if (packet.type === "end") {
+  if (packet.type === "response-end") {
     return PKT_END;
   }
   if (!packet.data) {
@@ -289,7 +303,7 @@ export function delimPacket(): Packet {
  * Create an end packet.
  */
 export function endPacket(): Packet {
-  return { type: "end" };
+  return { type: "response-end" };
 }
 
 /**

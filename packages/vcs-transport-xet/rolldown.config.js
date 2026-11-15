@@ -1,13 +1,16 @@
 import { defineConfig } from "rolldown";
 
 export default defineConfig({
-  input: "src/index.ts",
+  input: {
+    index: "src/index.ts",
+    "webrun-chunks/index": "src/webrun-chunks/index.ts",
+  },
   output: {
     dir: "dist",
     format: "esm",
     entryFileNames: "[name].js",
     chunkFileNames: "[name]-[hash].js",
   },
-  external: [/^@statewalker\//],
+  external: [/^@statewalker\//, /^@noble\//],
   treeshake: true,
 });

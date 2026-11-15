@@ -15,7 +15,7 @@ apps/examples/06-internal-storage/
     │   └── index.ts                     # Paths, file-backed History factory, disk helpers
     └── steps/
         ├── 01-loose-objects.ts          # blobs, tree, commit as loose objects
-        ├── 02-pack-files.ts             # PackWriterStream + writePackIndexV2
+        ├── 02-pack-files.ts             # writePack + writePackIndexV2
         ├── 03-garbage-collection.ts     # delete loose copies of packed objects
         ├── 04-direct-storage.ts         # blobs.store()/load() without a commit
         └── 05-delta-internals.ts        # createDeltaRanges/createDelta/applyDelta
@@ -83,11 +83,7 @@ The History is assembled from parts in `shared/index.ts`, because the example ne
 ```typescript
 import { createGitObjects, createHistoryFromComponents, FileMode } from "@statewalker/vcs-core";
 import { createFileRefStore, filesStagingStore } from "@statewalker/vcs-store-files";
-import { setCompressionUtils } from "@statewalker/vcs-utils";
-import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-
-setCompressionUtils(createNodeCompression());
 
 const files = createNodeFilesApi({ rootDir: "test-repo" });
 const objects = createGitObjects(filesStagingStore(files, ".git/objects"));
@@ -128,29 +124,31 @@ Output of the run:
 
 **File:** [src/steps/02-pack-files.ts](src/steps/02-pack-files.ts)
 
-The step reads each loose object from disk, adds it to a `PackWriterStream`, and writes `pack-<checksum>.pack` and `pack-<checksum>.idx` into `.git/objects/pack/`. It then decodes the 12-byte pack header (`PACK`, version 2, object count).
+The step hands the ids of the loose objects to `writePack`, which reads each object from disk only when it writes it, and writes `pack-<checksum>.pack` and `pack-<checksum>.idx` into `.git/objects/pack/`. It then decodes the 12-byte pack header (`PACK`, version 2, object count).
 
 ```typescript
-import { ObjectType, PackWriterStream, writePackIndexV2 } from "@statewalker/vcs-core";
+import { type WrittenPackEntry, writePack, writePackIndexV2 } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
 
-const packWriter = new PackWriterStream();
-await packWriter.addObject(objectId, ObjectType.BLOB, content);
+const written: WrittenPackEntry[] = [];
+const chunks: Uint8Array[] = [];
+for await (const chunk of writePack(source, looseObjectIds, { onEntry: (e) => written.push(e) })) {
+  chunks.push(chunk); // header, entries, then the 20-byte SHA-1 trailer
+}
+const packData = concat(chunks);
+const packChecksum = packData.subarray(packData.length - 20);
+const packName = `pack-${bytesToHex(packChecksum)}`;
+await files.write(joinPath(PACK_DIR, `${packName}.pack`), [packData]);
 
-const result = await packWriter.finalize();
-const packName = `pack-${bytesToHex(result.packChecksum)}`;
-await fs.writeFile(`${packName}.pack`, result.packData);
-
-const indexData = await writePackIndexV2(result.indexEntries, result.packChecksum);
-await fs.writeFile(`${packName}.idx`, indexData);
+const entries = written.map(({ id, offset, crc32 }) => ({ id, offset, crc32 })).sort(byId);
+await files.write(joinPath(PACK_DIR, `${packName}.idx`), [await writePackIndexV2(entries, packChecksum)]);
 ```
 
-The objects are added whole; this pack contains no deltas.
+`source` is anything with `get(id)` returning `{ type, size, content }`; the step reads loose files. The objects are written whole: the delta search (`deltaSearch: true`) is off by default.
 
 **Key APIs:**
-- `new PackWriterStream()` - build a pack incrementally
-- `packWriter.addObject(id, type, content)` - add an object with its uncompressed content
-- `packWriter.finalize()` - returns `packData`, `indexEntries` and `packChecksum`
+- `writePack(source, ids, options)` - stream a pack of the given objects
+- `onEntry` - each entry's id, offset and CRC-32, what an index needs
 - `writePackIndexV2(entries, packChecksum)` - build a version 2 `.idx` file
 
 ### Step 3: Garbage collection here means deleting the loose copies
@@ -165,7 +163,7 @@ import { countLooseObjects, listPackFiles } from "../shared/index.js";
 const { count: looseBefore, objects: looseObjectIds } = await countLooseObjects();
 
 for (const objectId of looseObjectIds) {
-  await fs.unlink(path.join(OBJECTS_DIR, objectId.substring(0, 2), objectId.substring(2)));
+  await files.remove(looseObjectPath(objectId)); // .git/objects/ab/cdef…
 }
 
 const { count: looseAfter } = await countLooseObjects(); // 0
@@ -247,7 +245,7 @@ The step then deltas a 271-byte document against a 362-byte revision and prints 
 
 - **A real directory, not memory.** Loose objects and packs are files; the point of the example is to look at them. Writing a standard `.git` layout means `git` can verify the result.
 - **The History is built from parts.** `createHistoryFromComponents()` with `createGitObjects(filesStagingStore(...))` keeps a handle on the `GitObjects` kernel, which step 04 needs for `get()`. The kernel stores every object as a zlib stream named by its SHA-1, which is what makes the files valid loose objects.
-- **Compression is installed first.** `shared/index.ts` calls `setCompressionUtils(createNodeCompression())` at import time, before any storage call, so compression and decompression (including `decompressBlock()` in steps 01-02) use the Node implementation from `@statewalker/vcs-utils-node`.
+- **Portable compression.** Compression and decompression (including `decompressBlock()` in steps 01-02) use the Web `CompressionStream` API, the same code as in a browser.
 - **Steps run cumulatively.** Steps 02-04 operate on the repository step 01 created, so `--step=NN` runs the earlier steps first instead of failing.
 
 ## What will surprise you
@@ -274,7 +272,7 @@ The step then deltas a 271-byte document against a 362-byte revision and prints 
 |-----|----------|
 | `createHistoryFromComponents` | [packages/vcs-core/src/history/create-history.ts](../../../packages/vcs-core/src/history/create-history.ts) |
 | `createGitObjects`, `GitObjects` | [packages/vcs-core/src/history/objects/](../../../packages/vcs-core/src/history/objects/) |
-| `PackWriterStream` | [packages/vcs-core/src/pack/pack-writer.ts](../../../packages/vcs-core/src/pack/pack-writer.ts) |
+| `writePack` | [packages/vcs-core/src/pack/write-pack.ts](../../../packages/vcs-core/src/pack/write-pack.ts) |
 | `writePackIndexV2` | [packages/vcs-core/src/pack/pack-index-writer.ts](../../../packages/vcs-core/src/pack/pack-index-writer.ts) |
 | `filesStagingStore` | [packages/vcs-store-files/src/storage/loose/files-staging-store.ts](../../../packages/vcs-store-files/src/storage/loose/files-staging-store.ts) |
 | `createFileRefStore` | [packages/vcs-store-files/src/refs/ref-store.files.ts](../../../packages/vcs-store-files/src/refs/ref-store.files.ts) |

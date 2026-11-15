@@ -9,6 +9,7 @@
  * - Loose object round-trip between backends
  */
 
+import { inflate } from "@statewalker/vcs-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { HistoryWithOperations, PersonIdent } from "../../src/history/index.js";
@@ -323,10 +324,9 @@ describe("Cross-Backend Integration", () => {
         sourceHistory.serialization.serializeLooseObject(blobId),
       );
 
-      // Parse into target
-      const meta = await targetHistory.serialization.parseLooseObject(toAsyncIterable(looseBytes));
-      expect(meta.id).toBe(blobId);
-      expect(meta.type).toBe("blob");
+      // Store into target (a loose object is zlib of the raw object)
+      await kernelOf(targetHistory).putRaw(blobId, inflate(toAsyncIterable(looseBytes)));
+      expect((await kernelOf(targetHistory).get(blobId))?.type).toBe("blob");
 
       // Verify in target
       const loaded = await targetHistory.blobs.load(blobId);
@@ -354,7 +354,7 @@ describe("Cross-Backend Integration", () => {
         const loose = await collectAsyncIterableBytes(
           sourceHistory.serialization.serializeLooseObject(id),
         );
-        await targetHistory.serialization.parseLooseObject(toAsyncIterable(loose));
+        await kernelOf(targetHistory).putRaw(id, inflate(toAsyncIterable(loose)));
       }
 
       // Verify all objects in target
@@ -525,4 +525,10 @@ async function collectAsyncIterableBytes(iterable: AsyncIterable<Uint8Array>): P
 
 async function* toAsyncIterable(data: Uint8Array): AsyncIterable<Uint8Array> {
   yield data;
+}
+
+/** The history's object kernel (the memory backend always has one). */
+function kernelOf(history: HistoryWithOperations) {
+  if (!history.objects) throw new Error("history has no object kernel");
+  return history.objects;
 }

@@ -23,20 +23,20 @@ No peer dependencies. Hashing uses `@noble/hashes`.
 | `@statewalker/vcs-utils` | Re-exports `cache`, `compression`, `diff`, `encoding`, `hash`, `streams`, plus `insertSorted` / `insertByTimestamp`. Does not include `files`, `ports` or `pack`. |
 | `@statewalker/vcs-utils/compression` | `deflate`, `inflate` (streams), `compressBlock`, `decompressBlock`, `decompressBlockPartial`, `createInflater`, `createInflaterPool`, `TruncatedStreamError`, `InflateError`, `setCompressionUtils`, `CompressionError`, pako and stream helpers |
 | `@statewalker/vcs-utils/hash` | All of the `hash/*` entries below, plus `fnv1aHash` |
-| `@statewalker/vcs-utils/hash/hasher` | `Hasher`, `createSha1` |
+| `@statewalker/vcs-utils/hash/hasher` | `Hasher`, `createSha1`, `createSha256` |
 | `@statewalker/vcs-utils/hash/sha1` | `sha1` (async one-shot) |
 | `@statewalker/vcs-utils/hash/crc32` | `crc32`, `CRC32` |
 | `@statewalker/vcs-utils/hash/fossil-checksum` | `FossilChecksum` |
 | `@statewalker/vcs-utils/hash/rolling-checksum` | `RollingChecksum`, `JgitRollingHash` and related helpers |
 | `@statewalker/vcs-utils/hash/strong-checksum` | `StrongChecksum` |
-| `@statewalker/vcs-utils/hash/utils` | `bytesToHex`, `hexToBytes` |
-| `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `parseGitDelta`, ...), text diff (`RawText`, `RawTextComparator`, `MyersDiff`, `HistogramDiff`, `getAlgorithm`, `MergeAlgorithm`, `merge3Way`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
+| `@statewalker/vcs-utils/hash/utils` | `bytesToHex`, `hexToBytes` (throws on odd length or a non-hex character) |
+| `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `DeltaError`, `createGitDeltaIndex`, `encodeGitDelta`, `parseGitDelta`, ...), text diff (`RawText`, `RawTextComparator`, `MyersDiff`, `HistogramDiff`, `getAlgorithm`, `MergeAlgorithm`, `merge3Way`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
 | `@statewalker/vcs-utils/encoding` | Git varints: `readVarint`, `writeVarint`, `readOfsVarint`, `writeOfsVarint`, `readPackHeader`, `writePackHeader` |
-| `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader`, `BufferedByteReader`, port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
-| `@statewalker/vcs-utils/cache` | `LRUCache`, `IntermediateCache` |
+| `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader` (with a required `maxLength`), `readPrefix`, `BufferedByteReader`, streaming request bodies (`requestBody`, `fetchWithRequestBody`, `shouldStreamRequestBody`, `toReadableStream`, ...), port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
+| `@statewalker/vcs-utils/cache` | `LRUCache` |
 | `@statewalker/vcs-utils/files` | `FilesApi` type, `createInMemoryFilesApi`, `AtomicFiles` and `atomicFilesOver` (lock-file primitives), `readFile`, `readText`, `tryReadText`, `readAt`, `readRange`, path helpers, `FileMode` |
 | `@statewalker/vcs-utils/ports` | Request/response over `MessagePort`: `callPort`, `listenPort`, `callBidi`, `listenBidi`, `send`, `receive`, ... |
-| `@statewalker/vcs-utils/pack` | Pack helpers: `parsePackHeader`, `computeObjectId`, `computeObjectIdFromStream`, `SizeMismatchError`, `packTypeToString`, `MemoryPackObjectCache`, async varint readers |
+| `@statewalker/vcs-utils/pack` | Pack helpers: `parsePackHeader`, `computeObjectId`, `computeObjectIdFromStream`, `SizeMismatchError`, `packTypeToString`, async varint readers |
 
 ## Examples
 
@@ -57,6 +57,14 @@ const id = await computeObjectIdFromStream("blob", size, files.read(path));
 
 A git object id is the SHA-1 of `"<type> <size>\0"` followed by the content, so the stream form needs the size before the first byte. If the stream ends early, or runs past the declared size, it rejects with `SizeMismatchError` (`declared`, `actual`). An overrun is caught at the first chunk that crosses the size, nothing after it is pulled, and `actual` (above `declared`) counts up to that chunk.
 
+The stream form takes an optional fourth argument, a factory for the incremental hasher (`createSha1` by default), for callers that make the hash configurable:
+
+```typescript
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+
+await computeObjectIdFromStream("blob", size, files.read(path), createSha1);
+```
+
 `computeObjectId` hashes small objects with the portable hasher and objects of 64 KiB and more with Web Crypto, where the runtime has it: each is the faster path for its size.
 
 ### Incremental SHA-1
@@ -71,6 +79,18 @@ bytesToHex(h.digest());
 ```
 
 `createSha1()` returns a `Hasher`: `update(bytes)` (chainable), `digest()` and `clone()`. Read `digest()` once; the hasher is spent after it and every later call throws, so `clone()` first if the state is still needed. For a buffer already in memory, `await sha1(bytes)` from `@statewalker/vcs-utils/hash/sha1` uses Web Crypto where the runtime has it and the portable hasher elsewhere.
+
+### Incremental SHA-256
+
+```typescript
+import { bytesToHex, createSha256 } from "@statewalker/vcs-utils/hash";
+
+const h = createSha256();
+for await (const chunk of files.read(["weights.bin"])) h.update(chunk);
+const oid = bytesToHex(h.digest()); // the Git LFS object id
+```
+
+Web Crypto's `subtle.digest` is one-shot: it needs the whole input in one buffer. `createSha256()` is the same `Hasher` as `createSha1()`, so a large object is hashed chunk by chunk as it streams, in a few hundred bytes of state. Git LFS uses it for its object ids.
 
 ### Compress and decompress
 
@@ -139,6 +159,18 @@ const gitDelta = deltaToGitFormat(base.length, delta);
 const rebuilt2 = applyGitDelta(base, gitDelta);
 ```
 
+### Encode and apply git pack deltas
+
+```typescript
+import { applyGitDelta, createGitDeltaIndex, encodeGitDelta } from "@statewalker/vcs-utils/diff";
+
+const index = createGitDeltaIndex(base); // index a base once, try many targets against it
+const delta = encodeGitDelta(index, target, target.length / 2); // undefined if not worth it
+if (delta) applyGitDelta(base, delta, maxObjectSize); // equals target
+```
+
+`encodeGitDelta` writes git's own delta format (diff-delta.c): native `git index-pack` accepts packs carrying these deltas. `applyGitDelta` makes the checks git's patch-delta.c makes, but all of them before it allocates: a copy past the end of the base, a truncated operand, the reserved instruction 0, or sizes that do not match throw `DeltaError`. A small delta can still describe a large result, so pass `maxSize` when the delta comes from an untrusted source.
+
 ### Diff two texts line by line
 
 ```typescript
@@ -154,6 +186,16 @@ for (const edit of MyersDiff.diff(RawTextComparator.DEFAULT, a, b)) {
 ```
 
 `getAlgorithm(SupportedAlgorithm.HISTOGRAM)` returns `HistogramDiff.diff` with the same signature. Histogram is `DEFAULT_ALGORITHM`.
+
+Before diffing, check whether the content is binary. Git calls content binary when a NUL byte appears in its first 8000 bytes, and `RawText.isBinary` looks at those bytes only (`RawText.BINARY_PROBE_LENGTH`), so a prefix is enough:
+
+```typescript
+import { RawText } from "@statewalker/vcs-utils/diff";
+import { readPrefix } from "@statewalker/vcs-utils/streams";
+
+const head = await readPrefix(content, RawText.BINARY_PROBE_LENGTH); // stops pulling after 8000 bytes
+if (RawText.isBinary(head)) console.log("Binary files differ");
+```
 
 ### CRC32
 
@@ -190,6 +232,32 @@ for await (const line of toLines(source)) { // decoded strings, LF or CRLF
 const doubled = mapStream([1, 2, 3], (n) => n * 2);
 ```
 
+### Stream a request body
+
+```typescript
+import { fetchWithRequestBody, shouldStreamRequestBody } from "@statewalker/vcs-utils/streams";
+
+const response = await fetchWithRequestBody(
+  () => store.read(id), // called again if the body must be resent collected
+  (init) => fetch(url, { method: "PUT", headers, ...init }),
+  shouldStreamRequestBody(),
+);
+```
+
+`fetchWithRequestBody` sends the chunks as a `ReadableStream` with `duplex: "half"`, pulling each chunk only when the request reads it. Node, Deno and Bun stream such bodies; browsers collect by default (`shouldStreamRequestBody()` is false there), because Firefox and Safari cannot stream request bodies and Chromium does only over HTTP/2. When a streamed request is refused with a `TypeError` before its body was read, it is sent once more with a collected body. Git pushes (`vcs-transport`) and Git LFS uploads (`vcs-transport-lfs`) both send their bodies this way.
+
+### Random ids on every origin
+
+```typescript
+import { randomHexId, timestampedId, timestampOfId } from "@statewalker/vcs-utils";
+
+randomHexId();            // 16 random bytes as hex
+const token = timestampedId(); // "<ms, base 36>-<randomHexId()>"
+timestampOfId(token);     // when it was made; undefined for other strings
+```
+
+Both use `crypto.getRandomValues`, because `crypto.randomUUID` is missing on non-secure browser origins. Stores name temporaries with `timestampedId` so that a sweep after a crash can tell an old leftover from a write in progress.
+
 ### In-memory files
 
 ```typescript
@@ -221,7 +289,7 @@ Byte streams with backpressure over a port (`writeStream`, `readStream`, `create
 
 ### Why compression is replaceable
 
-`deflate` and `inflate` default to the Web `CompressionStream` / `DecompressionStream` API, which every current runtime has. `compressBlock` and `decompressBlock` run the same streams over one buffer. `deflate` pulls its input as the compressor takes it; a consumer that stops early closes the source (without waiting for one that is stalled), and an error from the source comes out unchanged, compressor errors as `CompressionError`. The `node:zlib` set from `@statewalker/vcs-utils-node` keeps the same contract. `setCompressionUtils(partial)` replaces any subset of the five functions process-wide; `@statewalker/vcs-utils-node` provides a `node:zlib` set. Nothing registers itself on import.
+`deflate` and `inflate` default to the Web `CompressionStream` / `DecompressionStream` API, which every current runtime has. `compressBlock` and `decompressBlock` run the same streams over one buffer. `deflate` pulls its input as the compressor takes it; a consumer that stops early closes the source (without waiting for one that is stalled), and an error from the source comes out unchanged, compressor errors as `CompressionError`. `setCompressionUtils(partial)` replaces any subset of the five functions process-wide (for example in a test). Nothing registers itself on import, and no package ships a non-portable set.
 
 ### Why partial decompression uses pako
 
@@ -251,8 +319,8 @@ The text diff (`MyersDiff`, `HistogramDiff`, `RawText`, `RawTextComparator`, `Ed
 
 ### Dependencies
 
-- `@noble/hashes`: incremental SHA-1 (audited, dependency-free, runs in every JavaScript runtime). The `Hasher` interface keeps it replaceable by a native or WASM implementation.
-- `pako`: partial zlib decompression with byte accounting (see above), and an alternative pure-JS compression set (`createPakoCompression`).
+- `@noble/hashes`: incremental SHA-1 and SHA-256 (audited, dependency-free, runs in every JavaScript runtime). The `Hasher` interface keeps it replaceable by a native or WASM implementation.
+- `pako`: partial zlib decompression with byte accounting (see above), and an alternative pure-JS compression set (`createPakoCompression`, whose `deflate` and `inflate` push each chunk through pako's `Deflate` / `Inflate` and yield its output as it comes, never holding a whole stream).
 - `@statewalker/webrun-files-mem`: backs `createInMemoryFilesApi`. The `FilesApi` interface itself is declared in this package (`src/files/files-api.ts`) and matches the one implemented by the `@statewalker/webrun-files*` packages.
 - `@statewalker/webrun-files` is listed in `package.json`, but no source file imports it.
 

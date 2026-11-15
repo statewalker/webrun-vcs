@@ -805,7 +805,7 @@ describe("stream-utils", () => {
   describe("readHeader", () => {
     it("reads header from empty stream", async () => {
       async function* empty(): AsyncIterable<Uint8Array> {}
-      const [header, rest] = await readHeader(empty(), () => -1);
+      const [header, rest] = await readHeader(empty(), () => -1, 1 << 20);
       expect(header).toEqual(new Uint8Array(0));
       const remaining = await collect(rest);
       expect(remaining).toEqual(new Uint8Array(0));
@@ -813,7 +813,7 @@ describe("stream-utils", () => {
 
     it("reads header when no delimiter found", async () => {
       const input = fromArray([encode("no delimiter here")]);
-      const [header, rest] = await readHeader(input, () => -1);
+      const [header, rest] = await readHeader(input, () => -1, 1 << 20);
       expect(new TextDecoder().decode(header)).toBe("no delimiter here");
       const remaining = await collect(rest);
       expect(remaining).toEqual(new Uint8Array(0));
@@ -821,10 +821,14 @@ describe("stream-utils", () => {
 
     it("reads header with delimiter in single chunk", async () => {
       const input = fromArray([encode("header\0body data")]);
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0); // null byte
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0); // null byte
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("body data");
@@ -832,10 +836,14 @@ describe("stream-utils", () => {
 
     it("reads header with delimiter at chunk boundary", async () => {
       const input = fromArray([encode("header"), encode("\0"), encode("body")]);
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("body");
@@ -843,10 +851,14 @@ describe("stream-utils", () => {
 
     it("reads header split across chunks", async () => {
       const input = fromArray([encode("hea"), encode("der\0bo"), encode("dy")]);
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("body");
@@ -854,10 +866,14 @@ describe("stream-utils", () => {
 
     it("reads empty header when delimiter is at start", async () => {
       const input = fromArray([encode("\0body data")]);
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("\0");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("body data");
@@ -865,10 +881,14 @@ describe("stream-utils", () => {
 
     it("reads header when delimiter is at end", async () => {
       const input = fromArray([encode("header\0")]);
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const remaining = await collect(rest);
       expect(remaining).toEqual(new Uint8Array(0));
@@ -876,10 +896,14 @@ describe("stream-utils", () => {
 
     it("reads header with newline delimiter", async () => {
       const input = fromArray([encode("Content-Type: text/plain\n\nBody content")]);
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(10); // \n
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(10); // \n
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("Content-Type: text/plain\n");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("\nBody content");
@@ -888,11 +912,15 @@ describe("stream-utils", () => {
     it("reads header with multi-byte delimiter pattern", async () => {
       // Find \r\n\r\n (HTTP header separator)
       const input = fromArray([encode("HTTP/1.1 200 OK\r\n\r\nResponse body")]);
-      const [header, rest] = await readHeader(input, (block) => {
-        const text = new TextDecoder().decode(block);
-        const idx = text.indexOf("\r\n\r\n");
-        return idx >= 0 ? idx + 4 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const text = new TextDecoder().decode(block);
+          const idx = text.indexOf("\r\n\r\n");
+          return idx >= 0 ? idx + 4 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("HTTP/1.1 200 OK\r\n\r\n");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("Response body");
@@ -904,10 +932,14 @@ describe("stream-utils", () => {
       const combined = new Uint8Array([...headerBytes, ...bodyBytes]);
       const input = fromArray([combined]);
 
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0xff);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0xff);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(header).toEqual(new Uint8Array([0x01, 0x02, 0x03, 0xff]));
       const remaining = await collect(rest);
       expect(remaining).toEqual(new Uint8Array([0x04, 0x05, 0x06]));
@@ -919,10 +951,14 @@ describe("stream-utils", () => {
       const chunks = text.split("").map((c) => encode(c));
       const input = fromArray(chunks);
 
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("body");
@@ -933,10 +969,14 @@ describe("stream-utils", () => {
       const body = "body";
       const input = fromArray([encode(largeHeader + body)]);
 
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe(largeHeader);
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe(body);
@@ -947,10 +987,14 @@ describe("stream-utils", () => {
       const largeBody = "x".repeat(10000);
       const input = fromArray([encode(headerText + largeBody)]);
 
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe(headerText);
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe(largeBody);
@@ -967,10 +1011,14 @@ describe("stream-utils", () => {
         yield encode("chunk2");
       }
 
-      const [header, rest] = await readHeader(countingInput(), (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        countingInput(),
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("header\0");
       // Only header chunk should be read so far
@@ -986,10 +1034,14 @@ describe("stream-utils", () => {
       // Git object format: "blob 13\0Hello, World!"
       const input = fromArray([encode("blob 13\0Hello, World!")]);
 
-      const [header, rest] = await readHeader(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, rest] = await readHeader(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
       expect(new TextDecoder().decode(header)).toBe("blob 13\0");
       const remaining = await collect(rest);
       expect(new TextDecoder().decode(remaining)).toBe("Hello, World!");
@@ -999,7 +1051,7 @@ describe("stream-utils", () => {
   describe("readAhead", () => {
     it("reads ahead from empty stream", async () => {
       async function* empty(): AsyncIterable<Uint8Array> {}
-      const [header, stream] = await readAhead(empty(), () => -1);
+      const [header, stream] = await readAhead(empty(), () => -1, 1 << 20);
       expect(header).toEqual(new Uint8Array(0));
       const allData = await collect(stream);
       expect(allData).toEqual(new Uint8Array(0));
@@ -1007,10 +1059,14 @@ describe("stream-utils", () => {
 
     it("returns header and combined stream with full data", async () => {
       const input = fromArray([encode("header\0body data")]);
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("header\0");
       // Combined stream should contain header + body
@@ -1020,10 +1076,14 @@ describe("stream-utils", () => {
 
     it("stream yields header first, then rest", async () => {
       const input = fromArray([encode("header\0body")]);
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("header\0");
 
@@ -1036,7 +1096,7 @@ describe("stream-utils", () => {
 
     it("handles no delimiter - entire input becomes header", async () => {
       const input = fromArray([encode("no delimiter here")]);
-      const [header, stream] = await readAhead(input, () => -1);
+      const [header, stream] = await readAhead(input, () => -1, 1 << 20);
 
       expect(new TextDecoder().decode(header)).toBe("no delimiter here");
       const allData = await collect(stream);
@@ -1045,10 +1105,14 @@ describe("stream-utils", () => {
 
     it("handles delimiter at end - no body", async () => {
       const input = fromArray([encode("header\0")]);
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const allData = await collect(stream);
@@ -1057,10 +1121,14 @@ describe("stream-utils", () => {
 
     it("handles multiple chunks", async () => {
       const input = fromArray([encode("hea"), encode("der\0bo"), encode("dy")]);
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const allData = await collect(stream);
@@ -1072,10 +1140,14 @@ describe("stream-utils", () => {
       const bodyBytes = new Uint8Array([0x03, 0x04]);
       const input = fromArray([new Uint8Array([...headerBytes, ...bodyBytes])]);
 
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0xff);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0xff);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(header).toEqual(new Uint8Array([0x01, 0x02, 0xff]));
       const allData = await collect(stream);
@@ -1086,10 +1158,14 @@ describe("stream-utils", () => {
       // Simulate peeking at a git object header
       const input = fromArray([encode("blob 13\0Hello, World!")]);
 
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       // Parse header to get type and size
       const headerText = new TextDecoder().decode(header);
@@ -1113,10 +1189,14 @@ describe("stream-utils", () => {
         yield encode("chunk2");
       }
 
-      const [header, stream] = await readAhead(countingInput(), (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        countingInput(),
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("header\0");
       expect(chunksRead).toBe(1); // Only header chunk read so far
@@ -1129,10 +1209,14 @@ describe("stream-utils", () => {
 
     it("handles empty header when delimiter at start", async () => {
       const input = fromArray([encode("\0body")]);
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("\0");
       const allData = await collect(stream);
@@ -1144,10 +1228,14 @@ describe("stream-utils", () => {
       const largeBody = "y".repeat(5000);
       const input = fromArray([encode(largeHeader + largeBody)]);
 
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe(largeHeader);
       const allData = await collect(stream);
@@ -1156,10 +1244,14 @@ describe("stream-utils", () => {
 
     it("stream iterator can be used with for-await", async () => {
       const input = fromArray([encode("header\0body1"), encode("body2")]);
-      const [header, stream] = await readAhead(input, (block) => {
-        const idx = block.indexOf(0);
-        return idx >= 0 ? idx + 1 : -1;
-      });
+      const [header, stream] = await readAhead(
+        input,
+        (block) => {
+          const idx = block.indexOf(0);
+          return idx >= 0 ? idx + 1 : -1;
+        },
+        1 << 20,
+      );
 
       expect(new TextDecoder().decode(header)).toBe("header\0");
 
@@ -1412,7 +1504,7 @@ describe("stream-utils", () => {
         encode("\nBody content"),
       ]);
 
-      const [header, rest] = await readHeader(input, detector);
+      const [header, rest] = await readHeader(input, detector, 1 << 20);
       expect(new TextDecoder().decode(header)).toBe("HTTP/1.1 200 OK\r\n\r\n");
       const body = await collect(rest);
       expect(new TextDecoder().decode(body)).toBe("Body content");
@@ -1422,7 +1514,7 @@ describe("stream-utils", () => {
       const detector = newSplitter(new Uint8Array([0]));
       const input = fromArray([encode("blob "), encode("13"), encode("\0Hello, World!")]);
 
-      const [header, rest] = await readHeader(input, detector);
+      const [header, rest] = await readHeader(input, detector, 1 << 20);
       expect(new TextDecoder().decode(header)).toBe("blob 13\0");
       const body = await collect(rest);
       expect(new TextDecoder().decode(body)).toBe("Hello, World!");
@@ -1539,7 +1631,7 @@ describe("stream-utils", () => {
       const input = fromArray([encode("header\0body content")]);
       const splitter = newByteSplitter(0);
 
-      const [header, rest] = await readHeader(input, splitter);
+      const [header, rest] = await readHeader(input, splitter, 1 << 20);
       expect(new TextDecoder().decode(header)).toBe("header\0");
       const body = await collect(rest);
       expect(new TextDecoder().decode(body)).toBe("body content");
@@ -1549,10 +1641,35 @@ describe("stream-utils", () => {
       const input = fromArray([encode("blob 13\0Hello, World!")]);
       const splitter = newByteSplitter(0);
 
-      const [header, rest] = await readHeader(input, splitter);
+      const [header, rest] = await readHeader(input, splitter, 1 << 20);
       expect(new TextDecoder().decode(header)).toBe("blob 13\0");
       const body = await collect(rest);
       expect(new TextDecoder().decode(body)).toBe("Hello, World!");
     });
+  });
+});
+
+describe("readHeader: maxLength is required and enforced", () => {
+  it("rejects a limit that is not a positive integer", async () => {
+    for (const limit of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(readHeader(fromArray([encode("a\0b")]), () => -1, limit)).rejects.toThrow(
+        RangeError,
+      );
+      await expect(readAhead(fromArray([encode("a\0b")]), () => -1, limit)).rejects.toThrow(
+        RangeError,
+      );
+    }
+  });
+
+  it("stops pulling a stream with no header end once past the limit", async () => {
+    let pulled = 0;
+    async function* endless(): AsyncIterable<Uint8Array> {
+      while (true) {
+        pulled++;
+        yield encode("x".repeat(100));
+      }
+    }
+    await expect(readHeader(endless(), () => -1, 1000)).rejects.toThrow(/maximum length/);
+    expect(pulled).toBeLessThanOrEqual(11);
   });
 });

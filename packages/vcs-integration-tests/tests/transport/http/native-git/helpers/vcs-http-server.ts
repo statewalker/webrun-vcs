@@ -65,7 +65,15 @@ export async function startVcsHttpServer(options: {
       const response = await handler(httpRequest);
 
       res.writeHead(response.status, response.headers);
-      res.end(Buffer.from(response.body));
+      if (response.body instanceof ReadableStream) {
+        // upload-pack streams its pack: written as it is read, waiting on the socket
+        for await (const chunk of response.body) {
+          if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+        }
+        res.end();
+      } else {
+        res.end(Buffer.from(response.body));
+      }
     } catch (err) {
       res.writeHead(500);
       res.end(String(err));

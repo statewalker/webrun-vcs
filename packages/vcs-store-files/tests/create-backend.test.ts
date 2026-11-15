@@ -213,10 +213,11 @@ describe("gc", () => {
     // Verify orphan exists
     expect(await history.blobs.has(orphanId)).toBe(true);
 
-    // Run GC
+    // Run GC, pruning unreachable objects whatever their age (git gc --prune=now)
     const result = await gc({
       history,
       files,
+      pruneExpireMs: 0,
     });
 
     expect(result.removedObjects).toBe(1); // orphan blob
@@ -246,6 +247,7 @@ describe("gc", () => {
       history,
       files,
       dryRun: true,
+      pruneExpireMs: 0,
     });
 
     expect(result.removedObjects).toBe(1);

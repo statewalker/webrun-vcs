@@ -37,6 +37,13 @@ export class ProtocolState {
    */
   capabilities = new Set<string>();
 
+  /**
+   * Capabilities the server advertised (server side). Kept apart from `capabilities`: an
+   * upload-pack server replaces `capabilities` with what the client's first `want` line
+   * requests (possibly nothing), limited to this set when it is not empty.
+   */
+  advertisedCapabilities = new Set<string>();
+
   // Protocol V2 specific state
 
   /**
@@ -134,6 +141,24 @@ export class ProtocolState {
    */
   deepenRequest?: string;
 
+  /** `deepen <n>` (V1 fetch; 0 or undefined: none) */
+  deepen?: number;
+
+  /** `deepen-since <time>` (V1 fetch) */
+  deepenSince?: number;
+
+  /** `deepen-not <ref>` lines, unresolved (V1 fetch) */
+  deepenNot?: string[];
+
+  /** `deepen-relative` (V1 fetch) */
+  deepenRelative?: boolean;
+
+  /** The pack's shallow set (server FSM): its commits' parents are not walked */
+  packShallow?: Set<string>;
+
+  /** Further pack tips (server FSM): the parents of unshallowed commits */
+  extraWants?: Set<string>;
+
   /**
    * Filter specification for partial clone.
    * e.g., "blob:none", "tree:0", "blob:limit=1m"
@@ -179,6 +204,7 @@ export class ProtocolState {
       haves: new Set(this.haves),
       commonBase: new Set(this.commonBase),
       capabilities: new Set(this.capabilities),
+      advertisedCapabilities: new Set(this.advertisedCapabilities),
       protocolVersion: this.protocolVersion,
       capabilityValues: this.capabilityValues ? new Map(this.capabilityValues) : undefined,
       symrefs: this.symrefs ? new Map(this.symrefs) : undefined,
@@ -195,6 +221,12 @@ export class ProtocolState {
       currentCommand: this.currentCommand,
       acks: this.acks ? [...this.acks] : undefined,
       deepenRequest: this.deepenRequest,
+      deepen: this.deepen,
+      deepenSince: this.deepenSince,
+      deepenNot: this.deepenNot ? [...this.deepenNot] : undefined,
+      deepenRelative: this.deepenRelative,
+      packShallow: this.packShallow ? new Set(this.packShallow) : undefined,
+      extraWants: this.extraWants ? new Set(this.extraWants) : undefined,
       filterSpec: this.filterSpec,
       emptyBatchCount: this.emptyBatchCount,
       ackedCommon: this.ackedCommon ? new Set(this.ackedCommon) : undefined,
@@ -214,6 +246,9 @@ export class ProtocolState {
     this.haves = cp.haves ? new Set(cp.haves) : new Set();
     this.commonBase = cp.commonBase ? new Set(cp.commonBase) : new Set();
     this.capabilities = cp.capabilities ? new Set(cp.capabilities) : new Set();
+    this.advertisedCapabilities = cp.advertisedCapabilities
+      ? new Set(cp.advertisedCapabilities)
+      : new Set();
     this.protocolVersion = cp.protocolVersion;
     this.capabilityValues = cp.capabilityValues ? new Map(cp.capabilityValues) : undefined;
     this.symrefs = cp.symrefs ? new Map(cp.symrefs) : undefined;
@@ -230,6 +265,12 @@ export class ProtocolState {
     this.currentCommand = cp.currentCommand;
     this.acks = cp.acks ? [...cp.acks] : undefined;
     this.deepenRequest = cp.deepenRequest;
+    this.deepen = cp.deepen;
+    this.deepenSince = cp.deepenSince;
+    this.deepenNot = cp.deepenNot ? [...cp.deepenNot] : undefined;
+    this.deepenRelative = cp.deepenRelative;
+    this.packShallow = cp.packShallow ? new Set(cp.packShallow) : undefined;
+    this.extraWants = cp.extraWants ? new Set(cp.extraWants) : undefined;
     this.filterSpec = cp.filterSpec;
     this.emptyBatchCount = cp.emptyBatchCount;
     this.ackedCommon = cp.ackedCommon ? new Set(cp.ackedCommon) : undefined;
@@ -247,6 +288,7 @@ export class ProtocolState {
     this.haves.clear();
     this.commonBase.clear();
     this.capabilities.clear();
+    this.advertisedCapabilities.clear();
     this.protocolVersion = undefined;
     this.capabilityValues = undefined;
     this.symrefs = undefined;
@@ -263,6 +305,12 @@ export class ProtocolState {
     this.currentCommand = undefined;
     this.acks = undefined;
     this.deepenRequest = undefined;
+    this.deepen = undefined;
+    this.deepenSince = undefined;
+    this.deepenNot = undefined;
+    this.deepenRelative = undefined;
+    this.packShallow = undefined;
+    this.extraWants = undefined;
     this.filterSpec = undefined;
     this.emptyBatchCount = undefined;
     this.ackedCommon = undefined;

@@ -40,5 +40,32 @@
       "indentStyle": "space",
       "indentWidth": 2
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "packages/*/src/**",
+        "!packages/*/src/**/__tests__/**",
+        "apps/*/*/src/**",
+        "!apps/*/*/src/**/__tests__/**"
+      ],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noNodejsModules": "error"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/vcs-testing-gitea/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noNodejsModules": "off"
+          }
+        }
+      }
+    }
+  ]
 }

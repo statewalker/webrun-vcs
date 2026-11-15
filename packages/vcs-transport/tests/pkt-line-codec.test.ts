@@ -19,6 +19,7 @@ import {
   isDelimiter,
   isEnd,
   PKT_DELIM,
+  PKT_END,
   PKT_FLUSH,
   packetDataToString,
   packetDataToStringRaw,
@@ -26,6 +27,8 @@ import {
   pktLineReader,
   pktLineWriter,
 } from "../src/protocol/pkt-line-codec.js";
+import { parseReportStatus } from "../src/protocol/report-status.js";
+import { demuxSideband } from "../src/protocol/sideband.js";
 import type { Packet } from "../src/protocol/types.js";
 
 // Helper to create async iterable from string
@@ -101,10 +104,10 @@ describe("PacketLineIn (Reader)", () => {
       );
     });
 
-    it("should reject length 0002", async () => {
-      await expect(collectPackets(pktLineReader(stringToStream("0002")))).rejects.toThrow(
-        "Invalid packet line header: 0002",
-      );
+    it("should read 0002 as a protocol-v2 response-end packet", async () => {
+      const packets = await collectPackets(pktLineReader(stringToStream("0006a\n00000002")));
+      expect(packets.map((p) => p.type)).toEqual(["data", "flush", "response-end"]);
+      expect(packetDataToString(packets[2])).toBe(PKT_END);
     });
 
     it("should reject length 0003", async () => {
@@ -404,5 +407,120 @@ describe("chunked input", () => {
     const packets = await collectPackets(pktLineReader(singleByte()));
     expect(packets).toHaveLength(1);
     expect(packetDataToString(packets[0])).toBe("a");
+  });
+});
+
+describe("pktLineReader: many small packets in odd-sized chunks", () => {
+  function encodeAll(lines: string[]): Uint8Array {
+    const parts = lines.map((l, i) => (i % 97 === 96 ? encodeFlush() : encodePacket(l)));
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
+    return out;
+  }
+
+  function* oddChunks(data: Uint8Array, sizes: number[]): Generator<Uint8Array> {
+    let at = 0;
+    for (let i = 0; at < data.length; i++) {
+      const size = sizes[i % sizes.length] as number;
+      yield data.subarray(at, at + size);
+      at += size;
+    }
+  }
+
+  async function* from(chunks: Iterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+    yield* chunks;
+  }
+
+  const lines = Array.from({ length: 5000 }, (_, i) => `line ${i} ${"x".repeat(i % 23)}\n`);
+  const wire = encodeAll(lines);
+
+  it("decodes every packet under every chunking", async () => {
+    for (const sizes of [[1], [3], [7, 1, 13], [4093], [wire.length]]) {
+      const packets = await collectPackets(pktLineReader(from(oddChunks(wire, sizes))));
+      expect(packets).toHaveLength(lines.length);
+      packets.forEach((p, i) => {
+        if (i % 97 === 96) expect(p.type).toBe("flush");
+        else expect(packetDataToStringRaw(p)).toBe(lines[i]);
+      });
+    }
+  });
+
+  it("splits a large packet arriving in small chunks", async () => {
+    const big = "y".repeat(65000);
+    const data = encodeAll([big, "tail\n"]);
+    const packets = await collectPackets(pktLineReader(from(oddChunks(data, [5, 11, 2]))));
+    expect(packets.map(packetDataToStringRaw)).toEqual([big, "tail\n"]);
+  });
+
+  it("decodes in time linear in the input (no copy of the buffer per packet)", async () => {
+    // Compare 4x the packets with 1x rather than a wall-clock bound, which a loaded machine
+    // can miss: linear decoding takes about 4x as long, copying the buffer per packet ~16x.
+    const timeFor = async (count: number) => {
+      const data = encodeAll(Array.from({ length: count }, (_, i) => `${i}\n`));
+      const started = performance.now();
+      let n = 0;
+      for await (const _ of pktLineReader(from([data]))) n++;
+      expect(n).toBe(count);
+      return performance.now() - started;
+    };
+    await timeFor(5_000); // warm up
+    const small = Math.max(await timeFor(25_000), 1);
+    const large = await timeFor(100_000);
+    expect(large / small).toBeLessThan(9);
+  }, 60_000);
+
+  it("still reports a packet cut short at the end", async () => {
+    const data = encodeAll(["abc\n", "defgh\n"]);
+    await expect(
+      collectPackets(pktLineReader(from(oddChunks(data.subarray(0, data.length - 2), [3])))),
+    ).rejects.toThrow(PacketLineError);
+  });
+});
+
+describe("response-end packet (0002, protocol v2)", () => {
+  const enc = new TextEncoder();
+
+  it("parsePacket returns it as a typed packet", () => {
+    const result = parsePacket(enc.encode("0002rest"));
+    expect(result?.packet).toEqual({ type: "response-end" });
+    expect(new TextDecoder().decode(result?.remaining)).toBe("rest");
+  });
+
+  it("pktLineWriter writes it back as 0002", async () => {
+    const result = await collectBytes(
+      pktLineWriter(
+        (async function* () {
+          yield { type: "response-end" } as Packet;
+        })(),
+      ),
+    );
+    expect(result).toBe("0002");
+  });
+
+  it("ends a sideband stream, as flush does", async () => {
+    async function* packets(): AsyncGenerator<Packet> {
+      yield { type: "data", data: new Uint8Array([1, 0x41]) };
+      yield { type: "response-end" };
+      yield { type: "data", data: new Uint8Array([1, 0x42]) };
+    }
+    const messages = [];
+    for await (const m of demuxSideband(packets())) messages.push(m);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.data[0]).toBe(0x41);
+  });
+
+  it("ends a report-status, as flush does", async () => {
+    async function* packets(): AsyncGenerator<Packet> {
+      yield dataPacket("unpack ok\n");
+      yield dataPacket("ok refs/heads/main\n");
+      yield { type: "response-end" };
+      yield dataPacket("ng refs/heads/other failed\n");
+    }
+    const status = await parseReportStatus(packets());
+    expect(status.refUpdates.map((u) => u.refName)).toEqual(["refs/heads/main"]);
   });
 });

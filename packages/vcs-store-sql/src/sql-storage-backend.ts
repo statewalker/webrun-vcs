@@ -162,11 +162,8 @@ function createSQLStores(config: SQLStorageBackendConfig) {
   const delta = new SqlDeltaApi(db);
 
   const history = new HistoryImpl(blobs, trees, commits, tags, refs);
-  const serialization = new DefaultSerializationApi({
-    history,
-    blobDeltaApi: delta.blobs,
-    treeDeltaApi: delta.trees,
-  });
+  // native stores keep parsed rows, so received packs go through the typed stores
+  const serialization = new DefaultSerializationApi({ history });
 
   return { db, autoMigrate, blobs, trees, commits, tags, refs, delta, serialization };
 }

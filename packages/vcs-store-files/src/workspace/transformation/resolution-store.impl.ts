@@ -163,10 +163,9 @@ export class GitResolutionStore implements ResolutionStore {
 
     for (const conflict of conflicts) {
       if (conflict.resolvedInWorktree) {
-        // Get content from working tree and stage it
-        const content = await this.readWorktreeFile(conflict.path);
-        if (content) {
-          const objectId = await this.blobs.store([content], content.length);
+        // Stream the working tree file into a blob and stage it
+        const objectId = await this.storeWorktreeFile(conflict.path);
+        if (objectId) {
           await this.markResolved(conflict.path, {
             strategy: "manual",
             objectId,
@@ -405,12 +404,23 @@ export class GitResolutionStore implements ResolutionStore {
    * Check if file is resolved in working tree (no conflict markers)
    */
   private async isResolvedInWorktree(path: string): Promise<boolean> {
-    const content = await this.readWorktreeFile(path);
-    if (!content) return false;
-
-    // Check if file still has conflict markers
-    const text = new TextDecoder().decode(content);
-    return !text.includes("<<<<<<<") && !text.includes(">>>>>>>");
+    const fullPath = joinPath(this.worktreePath, path);
+    try {
+      if (!(await this.files.stats(fullPath))) return false;
+      // Scan for conflict markers chunk by chunk; the tail of each chunk is kept
+      // so a marker split across two chunks is still found.
+      const decoder = new TextDecoder();
+      let tail = "";
+      for await (const chunk of this.files.read(fullPath)) {
+        const text = tail + decoder.decode(chunk, { stream: true });
+        if (text.includes("<<<<<<<") || text.includes(">>>>>>>")) return false;
+        tail = text.slice(-6);
+      }
+      const rest = tail + decoder.decode();
+      return !rest.includes("<<<<<<<") && !rest.includes(">>>>>>>");
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -501,10 +511,28 @@ export class GitResolutionStore implements ResolutionStore {
    * Write content to working tree
    */
   private async writeWorktreeFile(path: string, objectId: ObjectId): Promise<void> {
-    const content = await this.loadBlobContent(objectId);
+    // the blob streams into the file; it is never held whole in memory
+    const content = await this.blobs.load(objectId);
     if (content) {
       const fullPath = joinPath(this.worktreePath, path);
-      await this.files.write(fullPath, [content]);
+      await this.files.write(fullPath, content);
+    }
+  }
+
+  /**
+   * Store a working tree file as a blob, streamed with its size from stat. If
+   * the file changes size while it is read, it is stored again without a size
+   * (the blob store spools it).
+   */
+  private async storeWorktreeFile(path: string): Promise<ObjectId | undefined> {
+    const fullPath = joinPath(this.worktreePath, path);
+    const stats = await this.files.stats(fullPath).catch(() => undefined);
+    if (stats?.kind !== "file") return undefined;
+    try {
+      return await this.blobs.store(this.files.read(fullPath), stats.size);
+    } catch (e) {
+      if ((e as Error)?.name !== "SizeMismatchError") throw e;
+      return this.blobs.store(this.files.read(fullPath));
     }
   }
 

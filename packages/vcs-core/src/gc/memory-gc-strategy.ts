@@ -8,6 +8,8 @@
 import type { RawStorage } from "../storage/raw/raw-storage.js";
 import type { CompactResult, DeltaCandidatePair, GcStrategy, StorageStats } from "./gc-strategy.js";
 
+const OBJECT_ID = /^[0-9a-f]{40}$/;
+
 /**
  * GcStrategy backed by in-memory RawStorage.
  *
@@ -45,6 +47,8 @@ export class MemoryGcStrategy implements GcStrategy {
     let count = 0;
     let totalSize = 0;
     for await (const key of this.storage.keys()) {
+      // objects only: not the temporaries (tmp_obj_*) nor a quarantine (incoming-*/...)
+      if (!OBJECT_ID.test(key)) continue;
       count++;
       const size = await this.storage.size(key);
       if (size >= 0) totalSize += size;

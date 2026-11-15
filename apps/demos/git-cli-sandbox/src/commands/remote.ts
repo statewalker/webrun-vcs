@@ -3,10 +3,12 @@
  */
 
 import { MergeStatus } from "@statewalker/vcs-commands";
-import { FileMode } from "@statewalker/vcs-core";
-import { type PushObject, push as transportPush } from "@statewalker/vcs-transport";
 import {
-  type CliContext,
+  createRepositoryFacade,
+  createTransportRefStore,
+  push as transportPush,
+} from "@statewalker/vcs-transport";
+import {
   dim,
   error,
   fatal,
@@ -205,69 +207,6 @@ export async function runPull(args: string[]): Promise<void> {
 }
 
 /**
- * Collect objects needed for push
- */
-async function collectObjectsForPush(ctx: CliContext, commitId: string): Promise<PushObject[]> {
-  const objects: PushObject[] = [];
-  const seen = new Set<string>();
-
-  const typeStringToCode: Record<string, number> = {
-    commit: 1,
-    tree: 2,
-    blob: 3,
-    tag: 4,
-  };
-
-  async function collectObject(id: string): Promise<void> {
-    if (seen.has(id)) return;
-    seen.add(id);
-
-    const obj = await ctx.objects.get(id);
-    if (!obj) throw new Error(`Object not found: ${id}`);
-    const typeCode = typeStringToCode[obj.type];
-
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of obj.content) {
-      chunks.push(chunk);
-    }
-
-    const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-    const content = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      content.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    objects.push({ id, type: typeCode, content });
-  }
-
-  async function collectTree(treeId: string): Promise<void> {
-    await collectObject(treeId);
-
-    const tree = await ctx.history.trees.load(treeId);
-    if (!tree) return;
-
-    for await (const entry of tree) {
-      if (entry.mode === FileMode.TREE) {
-        await collectTree(entry.id);
-      } else {
-        await collectObject(entry.id);
-      }
-    }
-  }
-
-  await collectObject(commitId);
-
-  const commit = await ctx.history.commits.load(commitId);
-  if (commit) {
-    await collectTree(commit.tree);
-  }
-
-  return objects;
-}
-
-/**
  * Run push command
  */
 export async function runPush(args: string[]): Promise<void> {
@@ -324,25 +263,14 @@ export async function runPush(args: string[]): Promise<void> {
     const commitId = localRefValue.objectId;
     console.log(dim(`  Commit: ${shortId(commitId)}`));
 
-    // Collect objects to push
-    const objectsToPush = await collectObjectsForPush(ctx, commitId);
-    console.log(dim(`  Objects: ${objectsToPush.length}`));
-
     // Execute push
     const result = await transportPush({
       url: remoteUrl,
       refspecs: [`${localRef}:${localRef}`],
       force,
-      getLocalRef: async (refName: string) => {
-        const ref = await ctx.history.refs.resolve(refName);
-        return ref?.objectId;
-      },
-      getObjectsToPush: async function* () {
-        for (const obj of objectsToPush) {
-          yield obj;
-        }
-      },
-      onProgressMessage: (msg) => {
+      repository: createRepositoryFacade({ history: ctx.history }),
+      refStore: createTransportRefStore(ctx.history.refs),
+      onProgress: (msg) => {
         const trimmed = msg.trim();
         if (trimmed) {
           process.stdout.write(`\r${dim(trimmed)}`.padEnd(60));
@@ -352,18 +280,17 @@ export async function runPush(args: string[]): Promise<void> {
 
     process.stdout.write(`${"\r".padEnd(60)}\r`);
 
+    for (const u of result.updates) {
+      console.log(` ${u.summary.padEnd(18)} ${u.localRef ?? ""} -> ${u.remoteRef}`);
+    }
     if (result.ok) {
-      console.log(` * [new branch]      ${branchName} -> ${branchName}`);
       console.log(success(`Push complete`));
       console.log(dim(`  Bytes sent: ${result.bytesSent}`));
-      console.log(dim(`  Objects sent: ${result.objectCount}`));
+      console.log(dim(`  Objects sent: ${result.packObjects}`));
     } else {
-      console.log(error(`Push failed: ${result.unpackStatus}`));
-      for (const [ref, status] of result.updates) {
-        if (!status.ok) {
-          console.log(error(`  ${ref}: ${status.message}`));
-        }
-      }
+      console.log(
+        error(`Push failed${result.unpack?.message ? `: ${result.unpack.message}` : ""}`),
+      );
     }
   } finally {
     await ctx.history.close();

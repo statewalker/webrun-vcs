@@ -755,8 +755,9 @@ describe.each(backends)("AddCommand ($name backend)", ({ factory }) => {
 
       const entry = await staging.getEntry("new.txt");
       expect(entry).toBeDefined();
-      // Intent-to-add entries have empty object ID and zero size
-      expect(entry?.objectId).toBe("");
+      // Intent-to-add entries carry the empty blob's id and the intent-to-add flag, as git's
+      expect(entry?.objectId).toBe("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+      expect(entry?.intentToAdd).toBe(true);
       expect(entry?.size).toBe(0);
     });
   });
@@ -868,5 +869,34 @@ describe.each(backends)("AddCommand ($name backend)", ({ factory }) => {
 
       expect(result.added).toContain("custom.txt");
     });
+  });
+});
+
+describe("AddCommand index stat after a retry (memory backend)", () => {
+  it("records the stat that matched the stored content, not the first one", async () => {
+    const result = await createInitializedGitWithWorkTreeFromFactory(backends[0].factory);
+    try {
+      const { git, worktree, staging } = result;
+      worktree.addFile("a.txt", "hello\n");
+      // until the file is first read, stats report an older, shorter version
+      let read = false;
+      const getEntry = worktree.getEntry.bind(worktree);
+      const readContent = worktree.readContent.bind(worktree);
+      worktree.getEntry = async (path) => {
+        const e = await getEntry(path);
+        return e && !read ? { ...e, size: 3, mtime: 1 } : e;
+      };
+      worktree.readContent = (path) => {
+        read = true;
+        return readContent(path);
+      };
+      await git.add().addFilepattern("a.txt").call();
+      const entry = await staging.getEntry("a.txt");
+      expect(entry?.objectId).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
+      expect(entry?.size).toBe(6);
+      expect(entry?.mtime).not.toBe(1);
+    } finally {
+      await result.cleanup?.();
+    }
   });
 });

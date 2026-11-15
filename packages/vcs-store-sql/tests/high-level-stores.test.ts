@@ -119,8 +119,20 @@ createBlobStoreTests("SQL", async () => {
 // Object kernel tests
 createGitObjectsTests("SQL", async () => {
   const db = await createTestDb();
+  // counts the bytes of every blob parameter written, for the bounded-memory test
+  let persisted = 0;
+  const execute = db.execute.bind(db);
+  db.execute = (sql, params) => {
+    for (const p of params ?? []) if (p instanceof Uint8Array) persisted += p.length;
+    return execute(sql, params);
+  };
   const store = rawStorageStaging(new SqlRawStore(db, "raw_objects"));
-  return { objects: createGitObjects(store), store, cleanup: () => db.close() };
+  return {
+    objects: createGitObjects(store),
+    store,
+    cleanup: () => db.close(),
+    persistedBytes: () => persisted,
+  };
 });
 
 // BlobStore tests on the native SQL blob store (createHistory("sql") uses it)

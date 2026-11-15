@@ -15,11 +15,12 @@ This makes protocol logic explicit and testable. Each handler reads from or writ
 ### Three Abstraction Levels
 
 ```
-Operations (fetch, push, clone, lsRemote)
+Operations (fetch, push, lsRemote)
     ↓ uses
 Duplex Operations (fetchOverDuplex, pushOverDuplex, serveOverDuplex)
     ↓ uses
-FSM Engine (Fsm + transitions + handlers)
+Fetch client (fetch-client/: git's fetch-pack over an UploadPackConnection: HTTP or duplex)
+  and the FSM Engine (Fsm + transitions + handlers: push, and the servers)
     ↓ uses
 TransportApi (pkt-line reader/writer, sideband read/write, pack streaming)
     ↓ uses
@@ -31,9 +32,9 @@ Duplex (bidirectional async byte stream)
 The transport layer never touches storage directly. Two interfaces provide the bridge:
 
 - **`RepositoryFacade`** — Pack-level operations: export packs, import packs, check object existence, walk ancestry. Used by FSM handlers for pack generation and consumption.
-- **`RepositoryAccess`** — Object-level operations: CRUD on objects and refs, HEAD resolution. Used by higher-level server code.
+- **`RefStore`** — Ref operations: read, update and list refs, resolve symbolic refs. Used by FSM handlers for ref advertisement and updates.
 
-Storage adapters that implement these interfaces live in the separate `@statewalker/vcs-transport-adapters` package.
+Storage adapters that implement `RepositoryFacade` live in the separate `@statewalker/vcs-transport-adapters` package.
 
 ### Web Standard APIs
 
@@ -50,10 +51,9 @@ packages/vcs-transport/src/
 ├── api/                    # Core interfaces
 │   ├── credentials.ts      #   Authentication types
 │   ├── duplex.ts           #   Bidirectional stream interface
-│   ├── fetch-result.ts     #   FetchResult, ServeResult, RawFetchResult
+│   ├── fetch-result.ts     #   FetchResult (duplex fetch), ServeResult
 │   ├── push-result.ts      #   PushResult, RefPushStatus
 │   ├── options.ts          #   Base option interfaces
-│   ├── repository-access.ts #  Server-side repo interface
 │   ├── repository-facade.ts #  Transport-layer repo interface
 │   └── transport-api.ts    #   Git wire protocol I/O interface
 │
@@ -61,28 +61,32 @@ packages/vcs-transport/src/
 │   ├── fsm.ts              #   FSM engine (run, transition, handler dispatch)
 │   ├── types.ts            #   FsmTransition, FsmStateHandler
 │   ├── fetch/              #   Fetch protocol FSMs
-│   │   ├── client-fetch-fsm.ts  # Client-side fetch (39 handlers, 49 transitions)
 │   │   ├── server-fetch-fsm.ts  # Server-side fetch (43 handlers, 44 transitions)
+│   │   ├── upload-pack-graph.ts # Commit-graph walks of upload-pack (shallow, ok_to_give_up)
 │   │   └── types.ts             # ClientFetchEvent, ServerFetchEvent
 │   ├── push/               #   Push protocol FSMs
-│   │   ├── client-push-fsm.ts   # Client-side push (25 handlers, 32 transitions)
 │   │   ├── server-push-fsm.ts   # Server-side push (41 handlers, 41 transitions)
 │   │   └── types.ts             # PushCommand, PushCommandType, PushCommandResult
 │   ├── protocol-v2/        #   Protocol V2 FSMs
-│   │   ├── client-v2-fsm.ts     # V2 client fetch
 │   │   ├── server-v2-fsm.ts     # V2 server fetch
 │   │   └── types.ts             # FetchV2Request, FetchV2ResponseSection
 │   └── error-recovery/     #   Error handling FSM
 │       ├── error-classifier.ts   # classifyError
 │       └── error-recovery-fsm.ts # Retry, reconnect, escalate
 │
+├── fetch-client/           # The fetch client (git's fetch-pack, remote-curl)
+│   ├── connection.ts       #   UploadPackConnection: smart HTTP (stateless) or duplex (stateful), v2 or v0
+│   ├── pkt-stream.ts       #   Pkt-lines from a byte stream, the side-band pack
+│   ├── negotiator.ts       #   git's default negotiator (commit-date queue, common marking)
+│   ├── fetch-pack.ts       #   Negotiation rounds and the pack (v0, v2)
+│   ├── ref-updates.ts      #   Refspec mapping, fast-forward checks, ref transactions
+│   └── fetch-remote.ts     #   A whole fetch: ls-refs, wants, shallow file, tag following, refs
+│
 ├── operations/             # High-level operations
-│   ├── fetch.ts            #   HTTP fetch
-│   ├── push.ts             #   HTTP push
-│   ├── clone.ts            #   HTTP clone
+│   ├── fetch.ts            #   HTTP fetch (the fetch client over smart HTTP)
+│   ├── push.ts             #   HTTP push (the push client over smart HTTP)
 │   ├── ls-remote.ts        #   HTTP ls-remote
-│   ├── fetch-over-duplex.ts    # Duplex fetch
-│   ├── fetch-v2-over-duplex.ts # Duplex fetch (protocol v2)
+│   ├── fetch-over-duplex.ts    # Duplex fetch (the fetch client over a duplex)
 │   ├── push-over-duplex.ts     # Duplex push
 │   ├── serve-over-duplex.ts    # Duplex server
 │   └── p2p-sync.ts             # Bidirectional P2P sync
@@ -141,18 +145,17 @@ UPDATE_REFS → [update local refs]
 DONE
 ```
 
-### Push (Client-Side FSM)
+### Push (the push client)
+
+The client side of a push is not an FSM: it is the push client in `push-client/` (git's
+send-pack), used by `push` (smart HTTP) and `pushOverDuplex`:
 
 ```
-START → [read server advertisement]
-  ↓ REFS_RECEIVED
-COMPUTE_UPDATES → [diff local vs remote refs]
-  ↓ COMMANDS_SENT
-SEND_PACK → [generate and send pack]
-  ↓ PACK_SENT
-READ_STATUS → [parse report-status response]
-  ↓ STATUS_RECEIVED
-DONE
+open a ReceivePackConnection → [ref advertisement, capabilities, .have lines]
+matchPushRefs               → [refspecs onto remote refs, as git's match_push_refs]
+setPushStatus               → [up to date, fast-forward, fetch first, tags, leases]
+send                        → [commands, push options, thin pack: one request]
+read report                 → [unpack, ok/ng per ref; side-band, keep-alives]
 ```
 
 ### Server Fetch (Upload-Pack)
@@ -178,12 +181,12 @@ The `Duplex` interface abstracts any bidirectional byte stream:
 ```typescript
 interface Duplex {
   [Symbol.asyncIterator](): AsyncIterator<Uint8Array>;
-  write(data: Uint8Array): void;
+  write(data: Uint8Array): void | Promise<void>; // a Promise is backpressure
   close?(): Promise<void>;
 }
 ```
 
-HTTP, MessagePort, and webrun-streams channels are all adapted to this interface. Operations like `fetchOverDuplex` work with any `Duplex`, making the protocol transport-agnostic.
+The transport awaits every `write`: a duplex with flow control returns a Promise that settles when it can take more (the upload-pack HTTP response, sockets); one without returns nothing. HTTP, MessagePort, and webrun-streams channels are all adapted to this interface. Operations like `fetchOverDuplex` work with any `Duplex`, making the protocol transport-agnostic.
 
 ### TransportApi
 
@@ -218,15 +221,13 @@ const [getRefStore, setRefStore] = newAdapter<RefStore>("refStore");
 const refs = getRefStore(ctx);
 ```
 
-### RepositoryFacade vs RepositoryAccess
+### RepositoryFacade
 
-Two interfaces bridge transport and storage:
+One interface bridges transport and storage for objects:
 
-- **`RepositoryFacade`** — Optimized for pack-based protocol operations. Exposes pack export/import, ancestry walking, reachability checking. Used by FSM handlers. Created via `createVcsRepositoryFacade()` or `createStorageRepositoryFacade()` (in `@statewalker/vcs-transport-adapters`), or `createRepositoryFacade()` (in this package).
+- **`RepositoryFacade`** — Optimized for pack-based protocol operations. Exposes pack export/import, ancestry walking, reachability checking. Used by FSM handlers for fetch, push and serve. Both pack directions stream. Created via `createVcsRepositoryFacade()` or `createStorageRepositoryFacade()` (in `@statewalker/vcs-transport-adapters`), or `createRepositoryFacade()` (in this package).
 
-- **`RepositoryAccess`** — Optimized for object-level server operations. Exposes object/ref CRUD, HEAD resolution, graph walking. Used by HTTP server routing. Created via `createVcsRepositoryAccess()`.
-
-Both are implemented in `@statewalker/vcs-transport-adapters`.
+Refs go through `RefStore` (see above); `createTransportRefStore()` adapts a vcs-core `Refs`.
 
 ## Pkt-Line Format
 

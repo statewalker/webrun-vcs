@@ -199,6 +199,7 @@ const history4 = createHistoryFromStores({
   commits: customCommits,
   tags: customTags,
   refs: customRefs,
+  objects: customObjects, // received packs are written through it byte for byte
 });
 await history4.initialize();
 await history4.refs.setSymbolic("HEAD", "refs/heads/main");

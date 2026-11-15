@@ -182,7 +182,6 @@ packages/vcs-commands/src/
 │   ├── push-command.ts
 │   └── ... (31 command modules)
 ├── core-commands/        # Add/Checkout interfaces + impls (not exported)
-├── pack-import/          # Import received packs into History
 ├── remote-config/        # [remote "<name>"] config read/write (internal)
 ├── rename/               # Similarity index for rename detection
 ├── tree-merge/           # Shared three-way tree merge
@@ -426,29 +425,39 @@ Staging.createBuilder()   → Build merged index
 Remote commands delegate to `@statewalker/vcs-transport`:
 
 ```
-FetchCommand
+FetchCommand / CloneCommand
     ↓ calls
 transport.fetch({
   url,               → Remote URL (from setRemote / [remote] config)
-  auth, headers,     → Credentials and custom headers
-  timeout, depth,
-  onProgressMessage, → Raw progress messages
+  auth, headers, timeout,
+  repository,        → createRepositoryFacade({ history }): importPack (streamed into
+                       vcs-core importPack), commit graph for negotiation and fast-forwards
+  refStore,          → createTransportRefStore(history.refs): refs, batch, shallow file
+  refspecs, tags,    → which refs land where; auto-follow / all / none
+  depth, deepenSince, deepenNot, unshallow,
+  force, dryRun,
 })
-    ↓ then
-importPackIntoHistory(history, packData)
+    ↓
+refUpdates (new / up-to-date / fast-forward / forced / rejected) → TrackingRefUpdate
 ```
+
+The transport client negotiates as git does: the local refs' history is offered as haves, so an
+incremental fetch downloads only the missing objects.
 
 ```
 PushCommand
     ↓ calls
-transport.push({
+transport.push({          → the push client (git's send-pack)
   url, refspecs,
   auth, headers, timeout,
-  force, atomic,
-  exportPack,        → Builds the pack from local history
-  getLocalRef,       → Resolves source refs
-  onProgressMessage,
+  force, atomic, forceWithLease, pushOptions, prune, thin, dryRun,
+  repository,        → createRepositoryFacade({ history }): the thin pack, ancestry checks
+  refStore,          → createTransportRefStore(history.refs): the refspec sources
+  onProgress,
 })
+    ↓
+updates (git's statuses and summaries) → RemoteRefUpdate; accepted refs move their
+remote-tracking refs (refs/remotes/<remote>/…)
 ```
 
 ### Storage Backend Integration

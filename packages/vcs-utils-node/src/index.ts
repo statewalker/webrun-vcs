@@ -1,20 +1,16 @@
 /**
- * Node.js-specific utilities for @statewalker/vcs-utils
+ * Node.js entry points for @statewalker/vcs-utils: the Node FilesApi.
  *
- * This package provides optimized Node.js implementations that can be
- * explicitly registered with the main vcs-utils package.
+ * Everything else in the VCS packages uses only portable APIs (FilesApi, Web
+ * Streams, Web Crypto), so the same code runs in browsers, Node and workers.
  *
  * @example
  * ```ts
- * import { setCompressionUtils } from "@statewalker/vcs-utils/compression";
- * import { createNodeCompression } from "@statewalker/vcs-utils-node/compression";
- *
- * // Explicitly opt-in to Node.js optimizations
- * setCompressionUtils(createNodeCompression());
+ * import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+ * const files = createNodeFilesApi({ rootDir: "/path/to/repo" });
  * ```
  *
  * @packageDocumentation
  */
 
-export * from "./compression/index.js";
 export * from "./files/index.js";

@@ -306,27 +306,15 @@ export class CheckoutCommand implements Checkout {
       await this.files.mkdir(parentDir);
     }
 
-    // Load and write content
-    const content = await this.loadBlobContent(objectId);
-    await this.files.write(absolutePath, [content]);
+    // Stream the blob straight into the file
+    const content = await this.blobs.load(objectId);
+    if (!content) {
+      throw new Error(`Blob ${objectId} not found`);
+    }
+    await this.files.write(absolutePath, content);
 
     // Note: FilesApi doesn't support chmod, so executable bit is not set
     // This could be extended with FilesApiAdapter if needed
-  }
-
-  /**
-   * Load blob content as Uint8Array.
-   */
-  private async loadBlobContent(objectId: ObjectId): Promise<Uint8Array> {
-    const result = await this.blobs.load(objectId);
-    if (!result) {
-      throw new Error(`Blob ${objectId} not found`);
-    }
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of result) {
-      chunks.push(chunk);
-    }
-    return concatBytes(chunks);
   }
 
   /**
@@ -559,25 +547,6 @@ export class CheckoutCommand implements Checkout {
     builder.finish();
     await this.staging.write();
   }
-}
-
-/**
- * Concatenate Uint8Arrays.
- */
-function concatBytes(arrays: Uint8Array[]): Uint8Array {
-  if (arrays.length === 0) return new Uint8Array(0);
-  if (arrays.length === 1) return arrays[0];
-
-  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-
-  for (const arr of arrays) {
-    result.set(arr, offset);
-    offset += arr.length;
-  }
-
-  return result;
 }
 
 /**

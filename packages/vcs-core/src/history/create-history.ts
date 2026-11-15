@@ -12,8 +12,8 @@
  */
 
 import {
-  GitFilesDeltaApi,
   type GitFilesStorageBackendConfig,
+  PackSetDeltaApi,
 } from "../backend/git-files-storage-backend.js";
 import type {
   GitFilesBackendConfig,
@@ -21,6 +21,7 @@ import type {
 } from "../backend/history-backend-factory.js";
 import { MemoryDeltaApi } from "../backend/memory-storage-backend.js";
 import type { BackendCapabilities } from "../backend/storage-backend.js";
+import type { PackSet } from "../pack/pack-set.js";
 import { DefaultSerializationApi } from "../serialization/serialization-api.impl.js";
 import { rawStorageStaging } from "../storage/adapters/staging-blob-store.js";
 import { MemoryRawStorage } from "../storage/raw/memory-raw-storage.js";
@@ -53,6 +54,10 @@ export interface HistoryStoresConfig {
   tags: Tags;
   /** Reference (branch/tag pointer) storage */
   refs: Refs;
+  /** The object kernel the stores sit on (received packs are written through it) */
+  objects?: GitObjects;
+  /** The installed packs, for backends that keep packs */
+  packs?: PackSet;
 }
 
 /**
@@ -72,6 +77,9 @@ export interface HistoryComponentsConfig {
    * `{ type: "memory" }` for in-memory refs.
    */
   refs: { type: "memory" } | Refs;
+
+  /** The installed packs `objects` reads, for backends that keep packs (the files backend). */
+  packs?: PackSet;
 }
 
 /**
@@ -95,7 +103,10 @@ export interface HistoryComponentsConfig {
  * ```
  */
 export function createHistoryFromStores(config: HistoryStoresConfig): History {
-  return new HistoryImpl(config.blobs, config.trees, config.commits, config.tags, config.refs);
+  return new HistoryImpl(config.blobs, config.trees, config.commits, config.tags, config.refs, {
+    objects: config.objects,
+    packs: config.packs,
+  });
 }
 
 /**
@@ -138,6 +149,8 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
     commits,
     tags,
     refs,
+    objects: config.objects,
+    packs: config.packs,
   });
 }
 
@@ -214,16 +227,13 @@ export function createMemoryHistoryWithOperations(
   const refs = createMemoryRefs();
 
   // Create base History for serialization API
-  const history = new HistoryImpl(blobs, trees, commits, tags, refs);
+  const history = new HistoryImpl(blobs, trees, commits, tags, refs, { objects });
 
   // Create delta API (memory backend doesn't track blob deltas, but supports tree deltas)
   const delta = new MemoryDeltaApi(blobs, undefined, trees);
 
   // Create serialization API using the History interface
-  const serialization = new DefaultSerializationApi({
-    history,
-    treeDeltaApi: delta.trees,
-  });
+  const serialization = new DefaultSerializationApi({ history });
 
   // Memory backend capabilities
   const capabilities: BackendCapabilities = {
@@ -251,6 +261,7 @@ export function createMemoryHistoryWithOperations(
     async () => {
       // No cleanup needed for memory storage
     },
+    { objects },
   );
 }
 
@@ -261,9 +272,10 @@ export function createMemoryHistoryWithOperations(
  * GitFilesStorageBackend configuration. This is the recommended way
  * to create production Git-compatible storage.
  *
- * Note: This requires the stores (blobs, trees, commits, tags, refs, packDeltaStore)
- * to be provided. For file-system-based stores, use @statewalker/vcs-store-fs
- * which provides createGitFilesBackend() that sets up all components.
+ * Note: This requires the stores (blobs, trees, commits, tags, refs) and the installed packs
+ * to be provided. For file-system-based stores, use @statewalker/vcs-store-files,
+ * whose createGitFilesBackend() sets up all components. The delta API is a read-only view of
+ * the packs (`PackSetDeltaApi`): git writes deltas only when it writes a pack (`repack()`).
  *
  * @param config GitFilesStorageBackend configuration with all stores
  * @returns HistoryWithOperations instance
@@ -277,33 +289,26 @@ export function createMemoryHistoryWithOperations(
  *   commits: myCommitStore,
  *   tags: myTagStore,
  *   refs: myRefStore,
- *   packDeltaStore: myDeltaStore,
+ *   packs: myPackSet,
  * });
  * await history.initialize();
  *
  * // Use history for normal operations
  * const commit = await history.commits.load(commitId);
  *
- * // Use delta API for GC
- * history.delta.startBatch();
- * await history.delta.blobs.deltifyBlob(blobId, baseId, delta);
- * await history.delta.endBatch();
+ * // Inspect how packed objects are stored
+ * const chain = await history.delta.getDeltaChain(blobId);
  * ```
  */
 export function createGitFilesHistory(config: GitFilesStorageBackendConfig): HistoryWithOperations {
-  const { blobs, trees, commits, tags, refs, packDeltaStore } = config;
+  const { blobs, trees, commits, tags, refs, objects, packs } = config;
 
-  // Create delta API directly (with tree and commit delta support)
-  const delta = new GitFilesDeltaApi(packDeltaStore, blobs, trees, { enableCommitDeltas: true });
+  // The delta view of the installed packs (deltas are written by repack)
+  const delta = new PackSetDeltaApi(packs);
 
   // Create base History for serialization API
-  const history = new HistoryImpl(blobs, trees, commits, tags, refs);
-  const serialization = new DefaultSerializationApi({
-    history,
-    blobDeltaApi: delta.blobs,
-    treeDeltaApi: delta.trees,
-    commitDeltaApi: delta.commits,
-  });
+  const history = new HistoryImpl(blobs, trees, commits, tags, refs, { objects, packs });
+  const serialization = new DefaultSerializationApi({ history });
 
   // Git-files backend capabilities
   const capabilities: BackendCapabilities = {
@@ -315,8 +320,6 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
     nativeGitFormat: true,
   };
 
-  let initialized = false;
-
   return new HistoryWithOperationsImpl(
     blobs,
     trees,
@@ -327,17 +330,12 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
     serialization,
     capabilities,
     async () => {
-      if (!initialized) {
-        await packDeltaStore.initialize?.();
-        initialized = true;
-      }
+      // the pack set is opened when it is created
     },
     async () => {
-      if (initialized) {
-        await packDeltaStore.close?.();
-        initialized = false;
-      }
+      // nothing to release: pack reads close when their streams end
     },
+    { objects, packs },
   );
 }
 

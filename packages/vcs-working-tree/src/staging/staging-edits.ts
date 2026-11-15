@@ -14,6 +14,8 @@ export class UpdateStagingEntry implements StagingEdit {
     readonly objectId: ObjectId,
     readonly mode: FileModeValue | number,
     readonly stats?: { size: number; mtime: number },
+    /** `intentToAdd`: an `add -N` placeholder (git's CE_INTENT_TO_ADD). */
+    readonly flags?: { intentToAdd?: boolean },
   ) {}
 
   apply(_entry: StagingEntry | undefined): StagingEntry {
@@ -24,6 +26,7 @@ export class UpdateStagingEntry implements StagingEdit {
       stage: MergeStage.MERGED,
       size: this.stats?.size ?? 0,
       mtime: this.stats?.mtime ?? Date.now(),
+      ...(this.flags?.intentToAdd ? { intentToAdd: true } : {}),
     };
   }
 }

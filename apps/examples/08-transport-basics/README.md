@@ -1,6 +1,6 @@
 # 08-transport-basics
 
-A runnable example of the Git smart-HTTP client in `@statewalker/vcs-transport`. It lists the refs of a public GitHub repository, checks whether a repository is reachable, and calls `clone()` and `fetch()` against it. It needs network access: every operation talks to `https://github.com/octocat/Hello-World.git`, and one deliberately asks for a repository that does not exist. Results are printed only; nothing is written to disk.
+A runnable example of the Git smart-HTTP client in `@statewalker/vcs-transport`. It lists the refs of a public GitHub repository, checks whether a repository is reachable, clones it into an in-memory repository with `fetch()`, and fetches again incrementally. It needs network access: every operation talks to `https://github.com/octocat/Hello-World.git`, and one deliberately asks for a repository that does not exist. The repository lives in memory; nothing is written to disk.
 
 ## One file, five operations against one remote
 
@@ -14,10 +14,10 @@ apps/examples/08-transport-basics/
 
 ```
   main.ts ── HTTPS ──▶ github.com/octocat/Hello-World.git
-     │                   GET  /info/refs?service=git-upload-pack   (lsRemote, clone, fetch)
+     │                   GET  /info/refs?service=git-upload-pack   (lsRemote, fetch)
      │                   POST /git-upload-pack                      (clone, fetch)
      ▼
-  stdout (ref lists, pack size, byte counts)
+  in-memory repository (objects, refs) and stdout (ref updates, object counts)
 ```
 
 Each operation runs inside `runStep()`, which catches its error, prints it, and moves on to the next.
@@ -98,74 +98,50 @@ Checking: https://github.com/nonexistent-user-12345/nonexistent-repo.git
   Error: HTTP error 401: Unauthorized
 ```
 
-### `clone()` asks for every advertised ref with no local objects
+### A clone is a fetch into an empty repository
 
-`clone()` is a fetch with nothing to negotiate: no `localHas`, no `localCommits`, and all refs unless `branch` is set. It returns the raw pack and the refs; it does not store anything. Importing the pack into an object store is up to the caller.
-
-```typescript
-import { clone } from "@statewalker/vcs-transport";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-
-const result = await clone({
-  url: REPO_URL,
-  onProgress: (info) => {
-    const percent = info.total ? Math.round((info.current / info.total) * 100) : undefined;
-    console.log(`  ${info.stage}: ${info.current}${info.total ? `/${info.total}` : ""}`
-      + (percent !== undefined ? ` (${percent}%)` : ""));
-  },
-  onProgressMessage: (message) => {
-    if (message.trim()) console.log(`  Server: ${message.trim()}`);
-  },
-});
-
-console.log(`Default branch: ${result.defaultBranch}`);
-console.log(`Refs fetched: ${result.refs.size}`);
-console.log(`Pack size: ${result.packData.length} bytes`);
-console.log(`Bytes received: ${result.bytesReceived}`);
-for (const [name, id] of result.refs) {
-  console.log(`  ${name} ${bytesToHex(id).slice(0, 8)}`);
-}
-```
-
-Output of the run:
-
-```
-Clone complete:
-  Default branch: refs/heads/master
-  Refs fetched: 3734
-  Pack size: 20.08 MB
-  Bytes received: 20.09 MB
-  Empty: false
-```
-
-**Key APIs:**
-- `clone(options)` - `Promise<CloneResult>`
-- `CloneOptions` - `url`, `auth`, `headers`, `timeout`, `fetchImpl`, `branch`, `depth`, `onProgress`, `onProgressMessage` (`bare` and `remoteName` are declared but `clone()` does not use them)
-- `CloneResult` - `refs` (`Map<string, Uint8Array>`), `packData`, `defaultBranch`, `bytesReceived`, `isEmpty`
-
-### `fetch()` takes refspecs and negotiation callbacks
-
-`fetch()` adds refspecs and two callbacks for negotiation: `localHas(id)` and `localCommits()`, which let the client tell the server what it already has. The example passes no callbacks, so the request is the same as a clone.
+`fetch()` stores what it receives: the pack goes into `repository.importPack` as it arrives, and the refs the refspecs select are written to `refStore`, each with git's status. Into an empty repository that is a clone.
 
 ```typescript
-import { fetch } from "@statewalker/vcs-transport";
+import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
+import { createRepositoryFacade, createTransportRefStore, fetch } from "@statewalker/vcs-transport";
+
+const history = createMemoryHistoryWithOperations();
+await history.initialize();
+const local = {
+  repository: createRepositoryFacade({ history }),
+  refStore: createTransportRefStore(history.refs),
+};
 
 const result = await fetch({
   url: REPO_URL,
-  refspecs: ["+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"],
-  onProgress: (info) => console.log(`  ${info.stage}: ${info.current}`),
+  ...local,
+  refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+  tags: "all",
+  onProgress: (message) => console.log(`  Server: ${message}`),
 });
 
-console.log(`Refs updated: ${result.refs.size}`);
-console.log(`Pack size: ${result.packData.length} bytes`);
+console.log(`Protocol: v${result.protocolVersion}`);
+console.log(`Default branch: ${result.defaultBranch}`);
+console.log(`Objects received: ${result.packObjects}`);
+for (const update of result.refUpdates) console.log(`  ${update.summary} ${update.localRef}`);
+```
+
+### A second fetch sends haves and receives only what is new
+
+The same call against the same repository offers the local refs' history as `have` lines (git's negotiator: newest commits first, in growing batches), so the server sends only the objects the repository lacks. Right after the clone that is none, and every ref is `[up to date]`.
+
+```typescript
+const again = await fetch({ url: REPO_URL, ...local, refspecs: ["+refs/heads/*:refs/remotes/origin/*"] });
+console.log(`Haves sent: ${again.stats.haves}, objects received: ${again.packObjects}`);
 ```
 
 Note that `fetch` here is the transport function, not the global `fetch`; importing it shadows the global in this module.
 
 **Key APIs:**
-- `fetch(options)` - `Promise<HttpFetchResult>`, same fields as `CloneResult`
-- `FetchOptions` - `url`, `auth`, `headers`, `timeout`, `fetchImpl`, `refspecs`, `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage`
-- Refspec format: `[+]<src>:<dst>`, `+` allows non-fast-forward updates
+- `fetch(options)` - `Promise<FetchClientResult>`: `protocolVersion`, `remoteRefs`, `defaultBranch`, `refUpdates` (each with `status` and git's `summary`), `packObjects`, `packBytes`, `stats`, `shallow`
+- `FetchOptions` - `url`, `auth`, `headers`, `timeout`, `fetchImpl`, `protocolVersion`, `repository`, `refStore`, `refspecs`, `tags`, `depth`, `deepenSince`, `deepenNot`, `unshallow`, `force`, `dryRun`, `onProgress`
+- Refspec format: `[+]<src>:<dst>`, `+` allows non-fast-forward updates; without it a non-fast-forward is `rejected`
 
 ## How the smart-HTTP exchange works
 
@@ -174,21 +150,19 @@ The client speaks the Git smart-HTTP protocol to the server's upload-pack servic
 1. `GET <url>/info/refs?service=git-upload-pack` returns the ref advertisement: a `# service=` line, then one pkt-line per ref (`<oid> <name>`), with the server capabilities after a NUL byte on the first ref line. Every pkt-line starts with a 4-character hex length; `0000` is a flush packet.
 2. `POST <url>/git-upload-pack` sends `want` lines for the refs to fetch and `have` lines for objects the client has, and receives a pack, multiplexed with progress messages on side-band channels.
 
-`lsRemote()` performs only step 1. `clone()` and `fetch()` perform both.
+`lsRemote()` performs only step 1. `fetch()` asks for protocol v2 (`Git-Protocol: version=2`): GitHub then answers step 1 with its capabilities, lists refs with an `ls-refs` POST, and negotiates with `fetch` POSTs, one per round.
 
 ## Why it is the way it is
 
 - **A real public repository.** `octocat/Hello-World` is small, public and stable, so the example needs no credentials and no local server.
 - **Failures do not stop the run.** Each operation is wrapped in `runStep()`, and the process exits 0 even when operations fail, so an offline run still shows how far each operation gets.
-- **No local storage.** The example stops at the transport boundary: refs and raw pack bytes. Storing them is a separate concern, handled by the object stores in other packages.
+- **Storage in memory.** The clone goes into a vcs-core in-memory history, so the incremental fetch has something to negotiate against, and nothing touches the disk.
 
 ## What will surprise you
 
 - **No network, no results.** Offline, every operation prints `[!] <name> failed: <message>` followed by `(This may be a network or transport layer issue)`, the run ends with `Example finished with 0/5 operations successful.`, and the exit code is still 0. Behind a proxy, `globalThis.fetch` must be able to reach github.com.
 - **A missing repository looks like an auth failure.** GitHub answers 401 for repositories that do not exist, so `lsRemote()` throws `HTTP error 401: Unauthorized`, not 404. Other HTTP failures throw `HTTP error <status>: <statusText>`; a `timeout` throws `Request timeout`.
-- **The output is about 15,000 lines, and the pack is about 20 MB.** The 3734 refs (mostly `refs/pull/*`) are printed four times: grouped, in full, after clone and after fetch. `clone()` and `fetch()` want every advertised ref, pull-request refs included, so each downloads the objects of all of them.
-- **The progress callbacks never fire.** The client sends the `no-progress` capability in its first `want` line, so the server sends no progress messages and `onProgress` / `onProgressMessage` print nothing.
-- **Refspecs do not filter the returned refs.** With refspecs for `refs/heads/*` and `refs/tags/*`, `fetch()` still returns all 3734 refs under their remote names (`refs/heads/master`, `refs/pull/...`), not mapped to `refs/remotes/origin/*`.
+- **The ref listing is long, the clone is not.** `lsRemote()` lists all 3734 refs (mostly `refs/pull/*`); `fetch()` asks only for the refspecs' refs (branches, and tags), so pull-request objects are not downloaded.
 - **The banner mentions push.** The banner reads "Clone, fetch, and push operations", but the example does not push.
 
 ## Reference
@@ -212,15 +186,14 @@ The client speaks the Git smart-HTTP protocol to the server's upload-pack servic
 | API | Location |
 |-----|----------|
 | `lsRemote`, `LsRemoteOptions` | [packages/vcs-transport/src/operations/ls-remote.ts](../../../packages/vcs-transport/src/operations/ls-remote.ts) |
-| `clone`, `CloneOptions`, `CloneResult` | [packages/vcs-transport/src/operations/clone.ts](../../../packages/vcs-transport/src/operations/clone.ts) |
 | `fetch`, `FetchOptions` | [packages/vcs-transport/src/operations/fetch.ts](../../../packages/vcs-transport/src/operations/fetch.ts) |
-| `BaseHttpOptions`, `BaseFetchOptions` | [packages/vcs-transport/src/api/options.ts](../../../packages/vcs-transport/src/api/options.ts) |
-| `RawFetchResult` | [packages/vcs-transport/src/api/fetch-result.ts](../../../packages/vcs-transport/src/api/fetch-result.ts) |
+| `FetchClientOptions`, `FetchClientResult` | [packages/vcs-transport/src/fetch-client/fetch-remote.ts](../../../packages/vcs-transport/src/fetch-client/fetch-remote.ts) |
+| `BaseHttpOptions` | [packages/vcs-transport/src/api/options.ts](../../../packages/vcs-transport/src/api/options.ts) |
 | `ProgressInfo`, `RefSpec` | [packages/vcs-transport/src/protocol/types.ts](../../../packages/vcs-transport/src/protocol/types.ts) |
 | Refspec parsing | [packages/vcs-transport/src/utils/refspec.ts](../../../packages/vcs-transport/src/utils/refspec.ts) |
 | `bytesToHex` | [packages/vcs-utils/src/hash/utils/index.ts](../../../packages/vcs-utils/src/hash/utils/index.ts) |
 
 ### Related examples
 
-- [09-repository-access](../09-repository-access/) - server-side repository access for transport handlers
+- [09-repository-facade](../09-repository-facade/) - exposing a repository to transport through RepositoryFacade
 - [webrtc-p2p-sync](../../demos/webrtc-p2p-sync/) - peer-to-peer sync without a central server

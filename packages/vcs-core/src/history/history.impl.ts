@@ -4,14 +4,22 @@
 
 import type { BackendCapabilities } from "../backend/storage-backend.js";
 import type { ObjectId } from "../common/id/index.js";
+import type { PackSet } from "../pack/pack-set.js";
 import type { SerializationApi } from "../serialization/serialization-api.js";
 import type { DeltaApi } from "../storage/delta/delta-api.js";
 import type { Blobs } from "./blobs/blobs.js";
 import type { Commits } from "./commits/commits.js";
 import type { History, HistoryWithOperations } from "./history.js";
+import type { GitObjects } from "./objects/git-objects.js";
 import type { Refs } from "./refs/refs.js";
 import type { Tags } from "./tags/tags.js";
 import type { Trees } from "./trees/trees.js";
+
+/** The object kernel (and packs) under a history's typed stores, when it has one. */
+export interface HistoryKernel {
+  objects?: GitObjects;
+  packs?: PackSet;
+}
 
 /**
  * History implementation that composes individual stores
@@ -40,7 +48,14 @@ export class HistoryImpl implements History {
     readonly commits: Commits,
     readonly tags: Tags,
     readonly refs: Refs,
-  ) {}
+    kernel: HistoryKernel = {},
+  ) {
+    this.objects = kernel.objects;
+    this.packs = kernel.packs;
+  }
+
+  readonly objects?: GitObjects;
+  readonly packs?: PackSet;
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -206,8 +221,9 @@ export class HistoryWithOperationsImpl extends HistoryImpl implements HistoryWit
     readonly capabilities: BackendCapabilities,
     private readonly initializeOps: () => Promise<void>,
     private readonly closeOps: () => Promise<void>,
+    kernel: HistoryKernel = {},
   ) {
-    super(blobs, trees, commits, tags, refs);
+    super(blobs, trees, commits, tags, refs, kernel);
   }
 
   async initialize(): Promise<void> {

@@ -110,7 +110,7 @@ async function main(): Promise<void> {
     console.log("  - repository.blobs.store() - Store blob objects");
     console.log("  - repository.blobs.load() - Load blob content");
     console.log("  - repository.objects.get(id) - Get object type, size and content");
-    console.log("  - PackWriterStream - Create pack files");
+    console.log("  - writePack - Stream pack files");
     console.log("  - createDeltaRanges() - Compute deltas");
     console.log("  - applyDelta() - Reconstruct from delta");
 

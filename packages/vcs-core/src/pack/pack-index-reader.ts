@@ -19,6 +19,11 @@ const TOC_SIGNATURE = new Uint8Array([0xff, 0x74, 0x4f, 0x63]);
 /** Number of fanout buckets (one per possible first byte) */
 const FANOUT_SIZE = 256;
 
+/** A full id; anything else is never in an index (and `hexToBytes` would reject it). */
+const isObjectId = (id: string): boolean => /^[0-9a-f]{40}$/.test(id);
+/** A lowercase hex prefix of at most 40 characters. */
+const HEX_PREFIX = /^[0-9a-f]{0,40}$/;
+
 /** SHA-1 hash size in bytes */
 const OBJECT_ID_LENGTH = 20;
 
@@ -230,6 +235,7 @@ class PackIndexV1 extends BasePackIndex {
   }
 
   findOffset(id: ObjectId): number {
+    if (!isObjectId(id)) return -1;
     const idBytes = hexToBytes(id);
     const levelOne = idBytes[0];
 
@@ -266,6 +272,7 @@ class PackIndexV1 extends BasePackIndex {
   }
 
   findPosition(id: ObjectId): number {
+    if (!isObjectId(id)) return -1;
     const idBytes = hexToBytes(id);
     const levelOne = idBytes[0];
 
@@ -335,6 +342,8 @@ class PackIndexV1 extends BasePackIndex {
   }
 
   resolve(prefix: string, limit = 10): ObjectId[] {
+    prefix = prefix.toLowerCase();
+    if (!HEX_PREFIX.test(prefix)) return [];
     const prefixBytes = hexToBytes(prefix.padEnd(40, "0"));
     const prefixLen = Math.floor(prefix.length / 2);
     const levelOne = prefixBytes[0];
@@ -453,6 +462,7 @@ class PackIndexV2 extends BasePackIndex {
   }
 
   findPosition(id: ObjectId): number {
+    if (!isObjectId(id)) return -1;
     const idBytes = hexToBytes(id);
     const levelOne = idBytes[0];
 
@@ -521,6 +531,8 @@ class PackIndexV2 extends BasePackIndex {
   }
 
   resolve(prefix: string, limit = 10): ObjectId[] {
+    prefix = prefix.toLowerCase();
+    if (!HEX_PREFIX.test(prefix)) return [];
     const prefixBytes = hexToBytes(prefix.padEnd(40, "0"));
     const prefixLen = Math.floor(prefix.length / 2);
     const levelOne = prefixBytes[0];

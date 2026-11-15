@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+import type { RepositoryFacade } from "../../src/api/repository-facade.js";
+import type { RefStore } from "../../src/context/process-context.js";
 import { fetch as fetchPack } from "../../src/operations/fetch.js";
 import { lsRemote } from "../../src/operations/ls-remote.js";
 import { push } from "../../src/operations/push.js";
+import { createMockRefStore, createMockRepository } from "../helpers/test-protocol.js";
 
 const enc = new TextEncoder();
 const pkt = (line: string) =>
@@ -20,6 +23,41 @@ const advertisement =
   pkt(`${HEAD} refs/heads/master\n`) +
   pkt(`${TEST} refs/heads/test\n`) +
   "0000";
+
+/**
+ * An empty local repository for a fetch: its `importPack` hands the pack to `onPack` (or
+ * collects it into `received`), its refs live in `refs`.
+ */
+function localRepo(onPack?: (pack: AsyncIterable<Uint8Array>) => Promise<void>) {
+  const refs = new Map<string, string>();
+  const received: number[] = [];
+  const updates: string[] = [];
+  const repository = {
+    async importPack(pack: AsyncIterable<Uint8Array>) {
+      if (onPack) await onPack(pack);
+      else for await (const chunk of pack) received.push(...chunk);
+      return {
+        objectsImported: 0,
+        blobsWithDelta: 0,
+        treesImported: 0,
+        commitsImported: 0,
+        tagsImported: 0,
+      };
+    },
+    exportPack: async function* () {},
+    has: async () => false,
+    walkAncestors: async function* () {},
+  } as unknown as RepositoryFacade;
+  const refStore: RefStore = {
+    get: async (name) => refs.get(name),
+    update: async (name, oid) => {
+      updates.push(name);
+      refs.set(name, oid);
+    },
+    listAll: async () => refs.entries(),
+  };
+  return { repository, refStore, received, updates };
+}
 
 /** A fake server: answers /info/refs and records the upload-pack request body. */
 function fakeServer() {
@@ -44,7 +82,9 @@ describe("smart-HTTP operations against a real-format advertisement", () => {
 
   it("a fetch without haves sends wants, one flush, then done", async () => {
     const { fetchImpl, requests } = fakeServer();
-    await fetchPack({ url: "https://example.test/repo.git", fetchImpl }).catch(() => {});
+    await fetchPack({ url: "https://example.test/repo.git", fetchImpl, ...localRepo() }).catch(
+      () => {},
+    );
     const body = requests[0] ?? "";
     expect(body).toMatch(/^[0-9a-f]{4}want /);
     // A second flush before `done` ends the negotiation: the server answers NAK and sends no pack.
@@ -64,7 +104,10 @@ describe("smart-HTTP operations with a token", () => {
     const fetchImpl = async (request: Request): Promise<Response> => {
       authorizations.push(request.headers.get("Authorization"));
       if (request.url.endsWith(`/info/refs?service=${service}`))
-        return new Response(advertisement.replace("git-upload-pack", service));
+        // the service line re-framed: its pkt-length changes with the name
+        return new Response(
+          advertisement.replace(pkt("# service=git-upload-pack\n"), pkt(`# service=${service}\n`)),
+        );
       return new Response("0000");
     };
     return { fetchImpl, authorizations };
@@ -72,13 +115,18 @@ describe("smart-HTTP operations with a token", () => {
 
   it("push sends the token as the Basic auth password", async () => {
     const { fetchImpl, authorizations } = recordingServer("git-receive-pack");
+    const repository = createMockRepository();
+    repository.exportPack = async function* () {};
+    const refStore = createMockRefStore();
+    refStore._setRef("refs/heads/master", TEST);
     await push({
       url,
       auth,
       fetchImpl,
-      refspecs: ["refs/heads/master:refs/heads/master"],
-      getLocalRef: async () => TEST,
-      getObjectsToPush: async function* () {},
+      // forced: the remote's master is not here (otherwise refused locally, nothing posted)
+      refspecs: ["+refs/heads/master:refs/heads/master"],
+      repository,
+      refStore,
     }).catch(() => {});
     // GET /info/refs, then POST /git-receive-pack
     expect(authorizations).toEqual([tokenBasic, tokenBasic]);
@@ -87,7 +135,7 @@ describe("smart-HTTP operations with a token", () => {
   it("fetch and lsRemote send the token as the Basic auth password", async () => {
     const { fetchImpl, authorizations } = recordingServer("git-upload-pack");
     await lsRemote(url, { auth, fetchImpl });
-    await fetchPack({ url, auth, fetchImpl }).catch(() => {});
+    await fetchPack({ url, auth, fetchImpl, ...localRepo() }).catch(() => {});
     expect(authorizations).toEqual([tokenBasic, tokenBasic, tokenBasic]);
   });
 
@@ -95,5 +143,254 @@ describe("smart-HTTP operations with a token", () => {
     const { fetchImpl, authorizations } = recordingServer("git-upload-pack");
     await lsRemote(url, { auth: { username: "user", password: "secret" }, fetchImpl });
     expect(authorizations).toEqual([`Basic ${btoa("user:secret")}`]);
+  });
+});
+
+describe("fetch: the upload-pack response", () => {
+  const url = "https://example.test/repo.git";
+  /** A pack of no objects: what git sends when every want is already present. */
+  const emptyPack = Uint8Array.from([
+    ...enc.encode("PACK"),
+    0,
+    0,
+    0,
+    2,
+    0,
+    0,
+    0,
+    0,
+    ...Array.from({ length: 20 }, (_, i) => i),
+  ]);
+  const sideband = (channel: number, data: Uint8Array) => {
+    const out = new Uint8Array(data.length + 5);
+    out.set(enc.encode((data.length + 5).toString(16).padStart(4, "0")));
+    out[4] = channel;
+    out.set(data, 5);
+    return out;
+  };
+  const join = (parts: (string | Uint8Array)[]) => {
+    const bytes = parts.map((p) => (typeof p === "string" ? enc.encode(p) : p));
+    const out = new Uint8Array(bytes.reduce((n, b) => n + b.length, 0));
+    let o = 0;
+    for (const b of bytes) {
+      out.set(b, o);
+      o += b.length;
+    }
+    return out;
+  };
+  /** Answers /info/refs, then upload-pack with `body` (a stream, to observe cancellation). */
+  function server(body: () => ReadableStream<Uint8Array> | Uint8Array) {
+    return async (request: Request): Promise<Response> => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
+      await request.arrayBuffer();
+      const b = body();
+      return new Response(b instanceof Uint8Array ? new Blob([b]) : b);
+    };
+  }
+
+  it("an ERR line instead of a pack fails the fetch", async () => {
+    const fetchImpl = server(() => join([pkt("ERR upload-pack: not our ref\n")]));
+    await expect(fetchPack({ url, fetchImpl, ...localRepo() })).rejects.toThrow(/not our ref/);
+  });
+
+  it("no pack after the wants fails the fetch, so no refs are written", async () => {
+    const fetchImpl = server(() => join([pkt("NAK\n"), "0000"]));
+    const local = localRepo();
+    await expect(fetchPack({ url, fetchImpl, ...local })).rejects.toThrow(/no pack/);
+    expect(local.updates).toEqual([]);
+    let called = false;
+    await expect(
+      fetchPack({
+        url,
+        fetchImpl,
+        ...localRepo(async (p) => {
+          called = true;
+          for await (const _ of p) {
+            // nothing arrives
+          }
+        }),
+      }),
+    ).rejects.toThrow(/no pack/);
+    expect(called).toBe(true);
+  });
+
+  it("an empty pack (every want already present) is a success", async () => {
+    const fetchImpl = server(() => join([pkt("NAK\n"), sideband(1, emptyPack), "0000"]));
+    const local = localRepo();
+    const r = await fetchPack({ url, fetchImpl, ...local });
+    expect(local.received).toEqual([...emptyPack]);
+    expect(r.packObjects).toBe(0);
+  });
+
+  it("a failed import cancels the response body", async () => {
+    let cancelled = false;
+    const fetchImpl = server(
+      () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(join([pkt("NAK\n"), sideband(1, emptyPack.subarray(0, 12))]));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+    );
+    await expect(
+      fetchPack({
+        url,
+        fetchImpl,
+        ...localRepo(async (p) => {
+          for await (const _ of p) throw new Error("corrupt pack");
+        }),
+      }),
+    ).rejects.toThrow(/corrupt pack/);
+    expect(cancelled).toBe(true);
+  });
+
+  it("the timeout limits each wait for the server, not the time spent importing", async () => {
+    // a server that honours the abort signal, sending the pack in two packets
+    const fetchImpl = async (request: Request): Promise<Response> => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
+      await request.arrayBuffer();
+      const signal = request.signal;
+      const parts = [
+        join([pkt("NAK\n"), sideband(1, emptyPack.subarray(0, 12))]),
+        join([sideband(1, emptyPack.subarray(12)), "0000"]),
+      ];
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull(c) {
+            if (signal.aborted) c.error(new DOMException("aborted", "AbortError"));
+            else if (parts.length) c.enqueue(parts.shift() as Uint8Array);
+            else c.close();
+          },
+        }),
+      );
+    };
+    const r = await fetchPack({
+      url,
+      fetchImpl,
+      timeout: 50,
+      ...localRepo(async (p) => {
+        for await (const _ of p) await new Promise((res) => setTimeout(res, 150)); // a slow store
+      }),
+    });
+    expect(r.isEmpty).toBe(false);
+
+    // a server that stops sending is still cut off
+    const stalled = async (request: Request): Promise<Response> => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
+      await request.arrayBuffer();
+      const signal = request.signal;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode(pkt("NAK\n")));
+            signal.addEventListener("abort", () =>
+              c.error(new DOMException("aborted", "AbortError")),
+            );
+          },
+        }),
+      );
+    };
+    await expect(
+      fetchPack({ url, fetchImpl: stalled, timeout: 50, ...localRepo() }),
+    ).rejects.toThrow(/timeout/);
+  });
+});
+
+describe("readableStreamToAsyncIterable", () => {
+  it("cancels the stream when iteration stops before its end", async () => {
+    const { readableStreamToAsyncIterable } = await import(
+      "../../src/adapters/http/http-duplex.js"
+    );
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        c.enqueue(new Uint8Array(4));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    await expect(
+      (async () => {
+        for await (const _ of readableStreamToAsyncIterable(stream)) throw new Error("consumer");
+      })(),
+    ).rejects.toThrow("consumer");
+    expect(cancelled).toBe(true);
+  });
+});
+
+describe("fetch: no pack after the wants", () => {
+  it("fails without writing refs", async () => {
+    const fetchImpl = async (request: Request) => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
+      return new Response(`${pkt("NAK\n")}0000`);
+    };
+    const local = localRepo();
+    await expect(
+      fetchPack({ url: "https://example.test/repo.git", fetchImpl, ...local }),
+    ).rejects.toThrow(/no pack/);
+    expect(local.updates).toEqual([]);
+  });
+});
+
+describe("fetch: a timeout without a cooperating fetchImpl", () => {
+  it("cuts off a stalled server even when the body ignores the abort signal", async () => {
+    const url = "https://example.com/repo.git";
+    const enc = new TextEncoder();
+    const pkt = (s: string) => (s.length + 4).toString(16).padStart(4, "0") + s;
+    const id = "a".repeat(40);
+    const advertisement = enc.encode(
+      `${pkt("# service=git-upload-pack\n")}0000${pkt(`${id} HEAD\0side-band-64k ofs-delta\n`)}${pkt(`${id} refs/heads/main\n`)}0000`,
+    );
+    const deaf = async (request: Request): Promise<Response> => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
+      await request.arrayBuffer();
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode(pkt("NAK\n")));
+          }, // never sends more, never errors
+        }),
+      );
+    };
+    await expect(fetchPack({ url, fetchImpl: deaf, timeout: 50, ...localRepo() })).rejects.toThrow(
+      /timeout/,
+    );
+  }, 5000);
+});
+
+describe("fetch: a failed import", () => {
+  it("cancels the response body even when the importer never read it", async () => {
+    let cancelled = false;
+    const fetchImpl = async (request: Request) => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(pkt("NAK\n")));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+      );
+    };
+    const local = localRepo(async () => {
+      throw new Error("store unavailable");
+    });
+    await expect(
+      fetchPack({ url: "https://example.test/repo.git", fetchImpl, ...local }),
+    ).rejects.toThrow(/store unavailable/);
+    expect(local.updates).toEqual([]);
+    expect(cancelled).toBe(true);
   });
 });

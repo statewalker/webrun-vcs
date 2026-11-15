@@ -1,0 +1,178 @@
+/**
+ * The webrun-chunks client. Each direction negotiates once over the standard LFS batch
+ * API advertising `["webrun-chunks","basic"]`. If the server agreed to `webrun-chunks`, bytes move
+ * through `content-transfer` (chunk dedup, resumable) over a per-oid chunk
+ * channel; otherwise the whole transfer defers to the reused
+ * `@statewalker/vcs-transport-lfs` basic path. The whole-file SHA-256 (the LFS
+ * oid) and size are verified on a completed webrun-chunks download — the interop
+ * guarantee — by streaming the stored object through an incremental SHA-256,
+ * so memory stays bounded by one chunk.
+ */
+
+import type { BatchRequest, LfsPointer, LfsResolver } from "@statewalker/vcs-transport-lfs";
+import { createLfsPointer, lfsDownload, lfsUpload } from "@statewalker/vcs-transport-lfs";
+import type { ContentStore } from "@statewalker/webrun-content-store";
+import { remoteStore, transfer } from "@statewalker/webrun-content-transfer";
+import {
+  WEBRUN_CHUNKS_TRANSFER,
+  WEBRUN_CHUNKS_TRANSFERS,
+  type WebrunChunksBatchObjectResponse,
+  type WebrunChunksBatchResponse,
+} from "./batch.js";
+import { httpChunkChannel } from "./chunk-channel.js";
+import type { WebrunChunksOptions, WebrunChunksTransportEvent } from "./types.js";
+
+const LFS_CONTENT_TYPE = "application/vnd.git-lfs+json";
+const defaultFetch = (request: Request) => fetch(request);
+
+async function postWebrunChunksBatch(
+  fetchImpl: WebrunChunksOptions["fetchImpl"] & {},
+  url: string,
+  operation: "upload" | "download",
+  oids: LfsPointer[],
+): Promise<WebrunChunksBatchResponse> {
+  const body: BatchRequest = {
+    operation,
+    transfers: WEBRUN_CHUNKS_TRANSFERS,
+    objects: oids.map(({ oid, size }) => ({ oid, size })),
+  };
+  const res = await fetchImpl(
+    new Request(`${url}/objects/batch`, {
+      method: "POST",
+      headers: { "content-type": LFS_CONTENT_TYPE, accept: LFS_CONTENT_TYPE },
+      body: JSON.stringify(body),
+    }),
+  );
+  return (await res.json()) as WebrunChunksBatchResponse;
+}
+
+/**
+ * Upload objects to a webrun-chunks-or-basic LFS endpoint. On a `webrun-chunks` agreement each
+ * object's already-local bytes are pushed chunk-by-chunk (only the chunks the
+ * server is missing) through content-transfer; on a `basic` response the whole
+ * upload defers to `vcs-transport-lfs`.
+ */
+export async function* webrunChunksUpload(
+  store: ContentStore,
+  resolver: LfsResolver,
+  url: string,
+  oids: LfsPointer[],
+  opts: WebrunChunksOptions = {},
+): AsyncIterable<WebrunChunksTransportEvent> {
+  const fetchImpl = opts.fetchImpl ?? defaultFetch;
+  const batch = await postWebrunChunksBatch(fetchImpl, url, "upload", oids);
+
+  if (batch.transfer !== WEBRUN_CHUNKS_TRANSFER) {
+    yield* lfsUpload(store, resolver, url, oids, fetchImpl, {
+      streamRequestBody: opts.streamRequestBody,
+    });
+    return;
+  }
+
+  yield { type: "batch", operation: "upload", count: batch.objects.length };
+  for (const obj of batch.objects) {
+    if (obj.error) {
+      yield { type: "error", oid: obj.oid, reason: obj.error.message };
+      continue;
+    }
+    const action = obj.actions?.upload;
+    if (!action) continue; // server already has it
+
+    const localId = await resolver.toObject(obj.oid);
+    if (localId === undefined) {
+      yield { type: "error", oid: obj.oid, reason: "no local object for oid" };
+      continue;
+    }
+    const remote = remoteStore(httpChunkChannel(fetchImpl, action.href));
+    try {
+      for await (const ev of transfer([localId], store, remote, {
+        checkpoint: opts.checkpoint,
+        limits: opts.limits,
+        hashContent: opts.hashContent,
+      })) {
+        if (ev.type === "chunk-sent") {
+          yield { type: "chunk-sent", oid: obj.oid, chunkId: ev.chunkId, size: ev.size };
+        }
+      }
+    } catch (err) {
+      yield { type: "error", oid: obj.oid, reason: (err as Error).message };
+      continue;
+    }
+    yield { type: "object-uploaded", oid: obj.oid };
+  }
+}
+
+/**
+ * Download objects from a webrun-chunks-or-basic LFS endpoint. On a `webrun-chunks` agreement each
+ * object is pulled chunk-by-chunk (only the chunks missing locally) through
+ * content-transfer, then its whole-file SHA-256 and size are verified against
+ * the pointer (streamed from the store, never collected) before the mapping is
+ * recorded. A mismatch records nothing and leaves the object for the store's
+ * `gc` (live roots: the resolver's values) rather than removing it, since a
+ * concurrent honest download of the same bytes shares its content-derived id.
+ * On a `basic` response the whole download defers to `vcs-transport-lfs`.
+ */
+export async function* webrunChunksDownload(
+  store: ContentStore,
+  resolver: LfsResolver,
+  url: string,
+  oids: LfsPointer[],
+  opts: WebrunChunksOptions = {},
+): AsyncIterable<WebrunChunksTransportEvent> {
+  const fetchImpl = opts.fetchImpl ?? defaultFetch;
+  const batch = await postWebrunChunksBatch(fetchImpl, url, "download", oids);
+
+  if (batch.transfer !== WEBRUN_CHUNKS_TRANSFER) {
+    yield* lfsDownload(store, resolver, url, oids, fetchImpl);
+    return;
+  }
+
+  yield { type: "batch", operation: "download", count: batch.objects.length };
+  const requested = new Map(oids.map((p) => [p.oid, p.size]));
+  for (const obj of batch.objects as WebrunChunksBatchObjectResponse[]) {
+    if (obj.error) {
+      yield { type: "error", oid: obj.oid, reason: obj.error.message };
+      continue;
+    }
+    const action = obj.actions?.download;
+    if (!action || action.objectId === undefined) {
+      yield { type: "error", oid: obj.oid, reason: "no download action" };
+      continue;
+    }
+    const remoteId = action.objectId;
+    const remote = remoteStore(httpChunkChannel(fetchImpl, action.href));
+    try {
+      for await (const ev of transfer([remoteId], remote, store, {
+        checkpoint: opts.checkpoint,
+        limits: opts.limits,
+        hashContent: opts.hashContent,
+      })) {
+        if (ev.type === "chunk-sent") {
+          yield { type: "chunk-sent", oid: obj.oid, chunkId: ev.chunkId, size: ev.size };
+        }
+      }
+    } catch (err) {
+      yield { type: "error", oid: obj.oid, reason: (err as Error).message };
+      continue;
+    }
+
+    // Interop guarantee: the reassembled whole object must hash to the LFS oid
+    // and have the pointer's size. Hashed as it streams from the store.
+    const actual = await createLfsPointer(store.read(remoteId));
+    const size = requested.get(obj.oid) ?? obj.size;
+    const reason =
+      actual.size !== size
+        ? "size mismatch"
+        : actual.oid !== obj.oid
+          ? "sha256 mismatch"
+          : undefined;
+    if (reason) {
+      // Never removed: the id is derived from content, so another download of the
+      // same bytes may be recording it right now. The store's gc reclaims it.
+      yield { type: "error", oid: obj.oid, reason };
+      continue;
+    }
+    await resolver.record(obj.oid, remoteId);
+    yield { type: "object-downloaded", oid: obj.oid };
+  }
+}

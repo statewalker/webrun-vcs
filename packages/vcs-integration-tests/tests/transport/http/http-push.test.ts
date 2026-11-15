@@ -5,7 +5,7 @@
  * with real in-memory repositories for pack operations.
  */
 
-import { createFetchHandler, httpPush } from "@statewalker/vcs-transport";
+import { createFetchHandler } from "@statewalker/vcs-transport";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { defined } from "../../test-helper.js";
 import {
@@ -14,6 +14,7 @@ import {
   createTestCommit,
   createTestRepository,
   createTransportRefStore,
+  httpPush,
   type TestRepositoryContext,
 } from "../helpers/index.js";
 

@@ -1,4 +1,5 @@
-import { bytesToHex, hexToBytes, sha1 } from "@statewalker/vcs-utils";
+import { objectIdToBytes } from "@statewalker/vcs-core";
+import { bytesToHex, createSha1, sha1 } from "@statewalker/vcs-utils";
 import type { MergeStageValue, StagingEntry } from "./types.js";
 
 /**
@@ -80,6 +81,25 @@ export type IndexVersion = typeof INDEX_VERSION_2 | typeof INDEX_VERSION_3 | typ
 export interface ParsedIndex {
   version: IndexVersion;
   entries: StagingEntry[];
+  /**
+   * The signatures of the extensions after the entries, in file order (`TREE`, `REUC`, `link`
+   * for a split index, ...). Their contents are not parsed. When one is required
+   * (lowercase), `entries` are not validated: they are incomplete or need that
+   * extension to be read.
+   */
+  extensions: string[];
+  /**
+   * The extensions themselves, signature and payload (a copy), in file order. Pass
+   * them through `carryIndexExtensions` before writing them back with
+   * `encodeIndexFile`.
+   */
+  extensionData: IndexExtension[];
+}
+
+/** An index extension as stored: a four-character signature and its payload. */
+export interface IndexExtension {
+  signature: string;
+  data: Uint8Array;
 }
 
 /**
@@ -138,7 +158,28 @@ export async function parseIndexFile(data: Uint8Array): Promise<ParsedIndex> {
     offset = nextOffset;
   }
 
-  return { version, entries };
+  // Extensions: a 4-byte signature and a 4-byte size, then the data, up to the checksum
+  const extensions: string[] = [];
+  const extensionData: IndexExtension[] = [];
+  const end = data.length - CHECKSUM_SIZE;
+  while (offset + 8 <= end) {
+    const size = view.getUint32(offset + 4);
+    // a size past the checksum: not an extension git wrote; stop (the entries are complete)
+    if (offset + 8 + size > end) break;
+    const signature = String.fromCharCode(...data.subarray(offset, offset + 4));
+    extensions.push(signature);
+    extensionData.push({ signature, data: data.slice(offset + 8, offset + 8 + size) });
+    offset += 8 + size;
+  }
+
+  // A required extension we do not understand (a split index's `link`) changes what
+  // the entries mean: entries there may legitimately have empty paths. Leave them
+  // as they are; callers refuse such an index (see `assertWritableIndexExtensions`).
+  if (!extensions.some((sig) => !/^[A-Z]/.test(sig))) {
+    for (const entry of entries) validatePath(entry.path);
+  }
+
+  return { version, entries, extensions, extensionData };
 }
 
 /**
@@ -254,8 +295,7 @@ function parseEntry(
     offset = startOffset + alignedLen;
   }
 
-  // Validate path
-  validatePath(path);
+  // Paths are validated by the caller, once the extensions are known
 
   // Convert timestamps to milliseconds
   const mtime = mtimeSeconds * 1000 + Math.floor(mtimeNanos / 1_000_000);
@@ -279,56 +319,111 @@ function parseEntry(
   return { entry, nextOffset: offset };
 }
 
+/** Entries are gathered into chunks of about this many bytes before they are yielded. */
+const INDEX_CHUNK_SIZE = 64 * 1024;
+
 /**
- * Serialize entries to Git index format.
+ * Encode entries in Git index format, as chunks.
  *
- * Entries are validated and sorted by (path, stage) before serialization.
+ * Entries are validated and sorted by (path, stage) before anything is yielded,
+ * so an invalid path or object id throws here and not halfway through a write. The chunks
+ * (the header, entries gathered into about 64 KiB pieces, then the trailing
+ * SHA-1, computed as they go) are produced as they are pulled, so an index is
+ * never built as one buffer.
+ *
+ * @example
+ * ```typescript
+ * await files.write(".git/index", encodeIndexFile(entries));
+ * ```
+ *
+ * @param entries Entries to encode (sorted here; the array is not changed)
+ * @param version Index version (default: 2)
+ * @param extensions Extensions written after the entries, as given (see `carryIndexExtensions`)
+ * @returns The index file's bytes, chunk by chunk; the last chunk is the 20-byte checksum
+ * @throws Error when a path is invalid; InvalidObjectIdError when an object id is not 40 lowercase hex
+ */
+export function encodeIndexFile(
+  entries: readonly StagingEntry[],
+  version: IndexVersion = INDEX_VERSION_2,
+  extensions: readonly IndexExtension[] = [],
+): Iterable<Uint8Array> {
+  for (const entry of entries) {
+    validatePath(entry.path);
+    objectIdToBytes(entry.objectId);
+  }
+  for (const ext of extensions) {
+    if (!/^[\x21-\x7e]{4}$/.test(ext.signature)) {
+      throw new Error(`Invalid index extension signature: ${JSON.stringify(ext.signature)}`);
+    }
+  }
+  const sortedEntries = [...entries].sort((a, b) => {
+    const pathCmp = comparePaths(a.path, b.path);
+    if (pathCmp !== 0) return pathCmp;
+    return a.stage - b.stage;
+  });
+  return encodeSorted(sortedEntries, version, extensions);
+}
+
+function* encodeSorted(
+  sortedEntries: StagingEntry[],
+  version: IndexVersion,
+  extensions: readonly IndexExtension[],
+): Generator<Uint8Array> {
+  const hasher = createSha1();
+
+  const header = new Uint8Array(HEADER_SIZE);
+  const headerView = new DataView(header.buffer);
+  headerView.setUint32(0, INDEX_SIGNATURE);
+  headerView.setUint32(4, version);
+  headerView.setUint32(8, sortedEntries.length);
+
+  let pending: Uint8Array[] = [header];
+  let pendingLength = header.length;
+  const take = (): Uint8Array => {
+    const chunk = pending.length === 1 ? (pending[0] as Uint8Array) : concatBytes(pending);
+    pending = [];
+    pendingLength = 0;
+    hasher.update(chunk);
+    return chunk;
+  };
+
+  let previousPath = "";
+  for (const entry of sortedEntries) {
+    const entryBytes = serializeEntry(entry, version, previousPath);
+    pending.push(entryBytes);
+    pendingLength += entryBytes.length;
+    previousPath = entry.path;
+    if (pendingLength >= INDEX_CHUNK_SIZE) yield take();
+  }
+  for (const ext of extensions) {
+    const head = new Uint8Array(8);
+    for (let i = 0; i < 4; i++) head[i] = ext.signature.charCodeAt(i);
+    new DataView(head.buffer).setUint32(4, ext.data.length);
+    pending.push(head, ext.data);
+    pendingLength += 8 + ext.data.length;
+    if (pendingLength >= INDEX_CHUNK_SIZE) yield take();
+  }
+  if (pendingLength > 0) yield take();
+
+  yield hasher.digest();
+}
+
+/**
+ * Serialize entries to Git index format, as one buffer.
+ *
+ * The bytes `encodeIndexFile` yields, joined. To write an index, pass
+ * `encodeIndexFile` to `FilesApi.write` instead.
  *
  * @param entries Entries to serialize (will be sorted)
  * @param version Index version (default: 2)
  * @returns Serialized index file bytes
  */
 export async function serializeIndexFile(
-  entries: StagingEntry[],
+  entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
+  extensions: readonly IndexExtension[] = [],
 ): Promise<Uint8Array> {
-  // Validate all paths first
-  for (const entry of entries) {
-    validatePath(entry.path);
-  }
-
-  // Sort entries by (path, stage)
-  const sortedEntries = [...entries].sort((a, b) => {
-    const pathCmp = comparePaths(a.path, b.path);
-    if (pathCmp !== 0) return pathCmp;
-    return a.stage - b.stage;
-  });
-
-  const chunks: Uint8Array[] = [];
-
-  // Header
-  const header = new Uint8Array(HEADER_SIZE);
-  const headerView = new DataView(header.buffer);
-  headerView.setUint32(0, INDEX_SIGNATURE);
-  headerView.setUint32(4, version);
-  headerView.setUint32(8, sortedEntries.length);
-  chunks.push(header);
-
-  // Entries
-  let previousPath = "";
-  for (const entry of sortedEntries) {
-    const entryBytes = serializeEntry(entry, version, previousPath);
-    chunks.push(entryBytes);
-    previousPath = entry.path;
-  }
-
-  // Combine without checksum
-  const withoutChecksum = concatBytes(chunks);
-
-  // Compute and append checksum
-  const checksum = await sha1(withoutChecksum);
-
-  return concatBytes([withoutChecksum, checksum]);
+  return concatBytes([...encodeIndexFile(entries, version, extensions)]);
 }
 
 /**
@@ -455,7 +550,7 @@ function writeEntryHeader(
   view.setUint32(P_SIZE, entry.size);
 
   // object ID (20 bytes)
-  const oidBytes = hexToBytes(entry.objectId);
+  const oidBytes = objectIdToBytes(entry.objectId);
   const buffer = new Uint8Array(view.buffer, view.byteOffset);
   buffer.set(oidBytes, P_OBJECTID);
 

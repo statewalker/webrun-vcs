@@ -30,8 +30,7 @@ Deno can use the npm packages directly:
 import { createMemoryHistory } from "npm:@statewalker/vcs-core@^0.3";
 ```
 
-`@statewalker/vcs-utils-node` uses Node.js APIs (`node:zlib`, and the Node file adapter from `@statewalker/webrun-files-node`) and is meant for Node.js
-only.
+`@statewalker/vcs-utils-node` only picks the Node `FilesApi` (`NodeFilesApi` from `@statewalker/webrun-files-node`) and is meant for Node.js only. Every other package uses portable APIs.
 
 ### JSR
 

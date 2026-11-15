@@ -42,12 +42,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@statewalker/vcs-utils": "workspace:^",
     "@statewalker/webrun-content-store": "catalog:",
     "@statewalker/webrun-http-streams": "catalog:"
   },
   "devDependencies": {
     "@statewalker/webrun-storage": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "rolldown": "catalog:",
     "vitest": "catalog:",
     "typescript": "catalog:",

@@ -6,21 +6,22 @@ import { createGitFilesBackend, repack } from "../src/index.js";
 describe("repack", () => {
   it("returns null when no loose objects exist", async () => {
     const files = createInMemoryFilesApi();
-    const { looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
 
-    const result = await repack({ looseStorage, packDirectory, files });
+    const result = await repack(backend);
     expect(result).toBeNull();
   });
 
   it("packs loose objects into a pack file", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history, looseStorage, packs } = backend;
     await history.initialize();
 
     // Store some objects as loose
@@ -37,8 +38,11 @@ describe("repack", () => {
     expect(await looseStorage.has(blob2)).toBe(true);
     expect(await looseStorage.has(treeId)).toBe(true);
 
+    // Only reachable objects are packed (git repack): a tag names the tree
+    await history.refs.set("refs/tags/snapshot", treeId);
+
     // Run repack
-    const result = await repack({ looseStorage, packDirectory, files });
+    const result = await repack(backend);
 
     expect(result).not.toBeNull();
     expect(result?.objectCount).toBe(3);
@@ -51,26 +55,28 @@ describe("repack", () => {
     expect(await looseStorage.has(treeId)).toBe(false);
 
     // Pack directory should have the new pack
-    await packDirectory.invalidate(); // Force rescan
-    const packs = await packDirectory.scan();
-    expect(packs.length).toBe(1);
-    expect(packs[0]).toBe(result?.packName);
+    const installed = await packs.packs();
+    expect(installed.length).toBe(1);
+    expect(`pack-${installed[0]?.packId}`).toBe(result?.packName);
   });
 
   it("objects are readable from pack after repack", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history, looseStorage } = backend;
     await history.initialize();
 
     const enc = new TextEncoder();
     const blobId = await history.blobs.store([enc.encode("pack me")]);
     const treeId = await history.trees.store([{ name: "file.txt", mode: 0o100644, id: blobId }]);
 
-    // Repack
-    await repack({ looseStorage, packDirectory, files });
+    // Repack (a tag makes the tree reachable)
+    await history.refs.set("refs/tags/snapshot", treeId);
+    await repack(backend);
+    expect(await looseStorage.has(blobId)).toBe(false);
 
     // Re-open the backend to pick up pack files
     const { history: h2 } = await createGitFilesBackend({ files });
@@ -96,21 +102,18 @@ describe("repack", () => {
 
   it("dry run reports count without modifying anything", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history, looseStorage, packs } = backend;
     await history.initialize();
 
     const enc = new TextEncoder();
     const blobId = await history.blobs.store([enc.encode("dry run test")]);
 
-    const result = await repack({
-      looseStorage,
-      packDirectory,
-      files,
-      dryRun: true,
-    });
+    await history.refs.set("refs/tags/blob", blobId);
+    const result = await repack({ ...backend, dryRun: true });
 
     expect(result).not.toBeNull();
     expect(result?.objectCount).toBe(1);
@@ -121,17 +124,16 @@ describe("repack", () => {
     expect(await looseStorage.has(blobId)).toBe(true);
 
     // No pack files should have been created
-    await packDirectory.invalidate();
-    const packs = await packDirectory.scan();
-    expect(packs.length).toBe(0);
+    expect((await packs.packs()).length).toBe(0);
   });
 
   it("handles commits with full object graphs", async () => {
     const files = createInMemoryFilesApi();
-    const { history, looseStorage, packDirectory } = await createGitFilesBackend({
+    const backend = await createGitFilesBackend({
       files,
       create: true,
     });
+    const { history, looseStorage } = backend;
     await history.initialize();
 
     const enc = new TextEncoder();
@@ -157,9 +159,10 @@ describe("repack", () => {
     await history.refs.set("refs/heads/main", commitId);
 
     // Repack all 3 objects (blob + tree + commit)
-    const result = await repack({ looseStorage, packDirectory, files });
+    const result = await repack(backend);
     expect(result).not.toBeNull();
     expect(result?.objectCount).toBe(3);
+    expect(await looseStorage.has(commitId)).toBe(false);
 
     // Re-open and verify commit is readable
     const { history: h2 } = await createGitFilesBackend({ files });

@@ -21,59 +21,78 @@ describe("Node.js Files API", () => {
   });
 });
 
-describe("createNodeFilesApi: streaming write", () => {
-  it("writes each chunk as it arrives, not after the whole stream", async () => {
-    const { mkdtempSync, readdirSync, rmSync, statSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
+describe("NodeFilesApi from webrun-files-node 0.11", () => {
+  const enc = new TextEncoder();
+  const read = async (files: ReturnType<typeof createNodeFilesApi>, path: string) => {
+    let out = "";
+    for await (const c of files.read(path)) out += new TextDecoder().decode(c, { stream: true });
+    return out;
+  };
+
+  it("rooted at / accepts absolute paths", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const { createNodeFilesApi } = await import("../src/files/index.js");
-    const dir = mkdtempSync(join(tmpdir(), "stream-write-"));
+    const dir = mkdtempSync(join(tmpdir(), "root-slash-"));
     try {
-      const files = createNodeFilesApi({ rootDir: dir });
-      const seen: number[] = [];
-      const onDisk = () => {
-        const tmp = readdirSync(join(dir, "a")).find((n) => n.startsWith(".b.bin."));
-        return tmp ? statSync(join(dir, "a", tmp)).size : 0;
-      };
-      async function* chunks() {
-        for (let i = 0; i < 4; i++) {
-          if (i > 0) seen.push(onDisk());
-          yield new Uint8Array(64 * 1024).fill(i);
-        }
-      }
-      await files.write("a/b.bin", chunks());
-      // each 64 KiB chunk was on disk (in the temporary) before the next was pulled
-      expect(seen).toEqual([65536, 131072, 196608]);
-      expect(statSync(join(dir, "a/b.bin")).size).toBe(4 * 65536);
-      await files.write("a/b.bin", [new Uint8Array(10)]);
-      expect(statSync(join(dir, "a/b.bin")).size).toBe(10); // replaced, not appended
-      await expect(files.write("../escape", [new Uint8Array(1)])).rejects.toThrow(/outside/);
-      await expect(files.write("a/../../x", [new Uint8Array(1)])).rejects.toThrow(/outside/);
+      const files = createNodeFilesApi({ rootDir: "/" });
+      await files.write(`${dir}/a/b.txt`, [enc.encode("hello")]);
+      expect(await files.exists(`${dir}/a/b.txt`)).toBe(true);
+      expect(await read(files, `${dir}/a/b.txt`)).toBe("hello");
+      expect(await files.remove(dir)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-});
 
-describe("createNodeFilesApi: write keeps the old file until the new one is complete", () => {
-  it("a failing source leaves the old content; a file can be rewritten from its own read", async () => {
-    const { mkdtempSync, readFileSync, readdirSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
+  it("write streams: the old content stays until the new one is complete", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const { createNodeFilesApi } = await import("../src/files/index.js");
-    const dir = mkdtempSync(join(tmpdir(), "stream-keep-"));
+    const dir = mkdtempSync(join(tmpdir(), "stream-write-"));
     try {
       const files = createNodeFilesApi({ rootDir: dir });
-      await files.write("f.txt", [new TextEncoder().encode("ORIGINAL")]);
-      async function* failing() {
-        yield new TextEncoder().encode("A");
-        throw new Error("source failed");
-      }
-      await expect(files.write("f.txt", failing())).rejects.toThrow("source failed");
-      expect(readFileSync(join(dir, "f.txt"), "utf8")).toBe("ORIGINAL");
-      await files.write("f.txt", files.read("f.txt"));
-      expect(readFileSync(join(dir, "f.txt"), "utf8")).toBe("ORIGINAL");
-      expect(readdirSync(dir)).toEqual(["f.txt"]); // no temporaries left
+      await files.write("f.txt", [enc.encode("old")]);
+      let release = () => {};
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      let pulled = 0;
+      const writing = files.write(
+        "f.txt",
+        (async function* () {
+          pulled++;
+          yield enc.encode("new-");
+          await gate;
+          pulled++;
+          yield enc.encode("content");
+        })(),
+      );
+      // the first chunk is taken while the source is still open: nothing is collected first
+      while (pulled === 0) await new Promise((r) => setTimeout(r, 1));
+      expect(await read(files, "f.txt")).toBe("old");
+      // ...and is already on disk, in a temporary beside the target (FilesApi.list hides
+      // those temporaries, so the directory is read directly)
+      const { readdirSync } = await import("node:fs");
+      expect(readdirSync(dir)).toHaveLength(2);
+      release();
+      await writing;
+      expect(await read(files, "f.txt")).toBe("new-content");
+      // a temporary file was renamed over the target; none is left behind
+      expect(readdirSync(dir)).toEqual(["f.txt"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("has createExclusive (open 'wx')", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "excl-"));
+    try {
+      const files = createNodeFilesApi({ rootDir: dir });
+      expect(typeof files.createExclusive).toBe("function");
+      expect(await files.createExclusive?.("x/y.lock", [enc.encode("1")])).toBe(true);
+      expect(await files.createExclusive?.("x/y.lock", [enc.encode("2")])).toBe(false);
+      expect(await read(files, "x/y.lock")).toBe("1");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
