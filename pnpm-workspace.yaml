@@ -24,6 +24,8 @@ catalog:
   "@statewalker/webrun-content-transfer": "^0.2.0"
   "@statewalker/webrun-files-sync": "^0.2.0"
   "@statewalker/webrun-http-streams": "^0.6.0"
+  "@statewalker/httpeers-access": "^0.1.5"
+  "@statewalker/httpeers-core": "^0.1.4"
   "@statewalker/webrun-streams-signaling": "^0.3.0"
   "@statewalker/webrun-streams-livekit": "^0.3.0"
   "@statewalker/webrun-streams": "^0.4.0"
