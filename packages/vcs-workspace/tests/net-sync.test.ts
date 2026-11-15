@@ -103,7 +103,11 @@ describe("syncWorkspace over loopback HTTP", () => {
     await writeFile(b, "p.txt", "title by Bob\nbody\n");
     await syncWorkspace(a, srv.remote());
     const events: SyncEvent[] = [];
-    const result = await syncWorkspace(b, srv.remote(), { onEvent: (e) => events.push(e) });
+    // the pre-0.4 behaviour, kept as an option: the conflicts are committed and pushed
+    const result = await syncWorkspace(b, srv.remote(), {
+      onEvent: (e) => events.push(e),
+      onConflict: "commit",
+    });
 
     expect(result.conflicts).toEqual(["p.txt"]);
     expect(result.pushed).toBe(true);

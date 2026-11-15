@@ -78,10 +78,13 @@ export interface SnapshotOptions {
   /** Read every file again, whatever the cache says */
   rehashAll?: boolean;
   /**
-   * The nested repositories to leave out (see {@link findNestedRepositories}); found by this
-   * snapshot when not given
+   * Nested repositories to leave out besides those this snapshot's own listing finds (see
+   * {@link findNestedRepositories}): files under a directory the listing shows holding a `.git`
+   * are never taken as ordinary files, whatever this list says
    */
   nested?: string[];
+  /** A listing of the folder already made (see {@link walkFolder}): the folder is not listed again */
+  walk?: FolderWalk;
 }
 
 /** A folder path the snapshot left out of history, and why */
@@ -92,7 +95,7 @@ export interface SkippedPath {
    * it); `reserved-name`: a name no tree may hold (`.git` below the root, the temporary-file
    * prefix); `unsafe-path`: any other name git refuses in a tree
    */
-  reason: "nested-repository" | "reserved-name" | "unsafe-path";
+  reason: "nested-repository" | "reserved-name" | "unsafe-path" | "unignored-local";
 }
 
 /** Whether `path` is below one of the directories `roots` */
@@ -139,11 +142,61 @@ function outermost(dirs: Iterable<string>): string[] {
  * directory or a `.git` file starting with `gitdir:`.
  */
 export async function findNestedRepositories(folder: FilesApi): Promise<string[]> {
+  return (await walkFolder(folder)).nested;
+}
+
+/** A folder file as {@link walkFolder} listed it */
+export interface WalkedFile {
+  /** Relative path (`dir/file.txt`) */
+  path: string;
+  /** The path as the FilesApi spells it */
+  at: string;
+  size: number;
+  lastModified: number;
+}
+
+/** One listing of the whole folder, and what it found. */
+export interface FolderWalk {
+  /** Every file, ignored ones included */
+  files: WalkedFile[];
+  /** Nested repositories, outermost only (see {@link findNestedRepositories}) */
+  nested: string[];
+  /**
+   * The topmost paths `ignore` leaves out (a file, or a directory whose contents are all left
+   * out with it), the folder's own `.git` excepted
+   */
+  ignored: string[];
+}
+
+function parentPath(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? "" : path.slice(0, slash);
+}
+
+/**
+ * Lists the folder once, recursively: its files, its nested repositories and its ignored
+ * paths. A snapshot ({@link snapshotFolder}) can be taken from it without listing again.
+ */
+export async function walkFolder(
+  folder: FilesApi,
+  options: { ignore?: IgnorePath } = {},
+): Promise<FolderWalk> {
+  const files: WalkedFile[] = [];
   const nested = new Set<string>();
+  const ignored: string[] = [];
+  const ignore = options.ignore;
   for await (const info of folder.list("/", { recursive: true })) {
-    if (await isGitEntry(folder, info)) nested.add(parentOf(relative(info.path)));
+    const path = relative(info.path);
+    if (await isGitEntry(folder, info)) nested.add(parentOf(path));
+    if (info.kind === "file") {
+      files.push({ path, at: info.path, size: info.size, lastModified: info.lastModified });
+    }
+    if (ignore && !defaultIgnore(path) && ignore(path)) {
+      const parent = parentPath(path);
+      if (!parent || !ignore(parent)) ignored.push(path);
+    }
   }
-  return outermost(nested);
+  return { files, nested: outermost(nested), ignored: ignored.sort() };
 }
 
 /** What {@link snapshotFolder} found besides the files it took. */
@@ -171,14 +224,10 @@ export async function snapshotFolder(
   const skip = options.skip ?? defaultIgnore;
   const window = options.racyWindowMs ?? DEFAULT_RACY_WINDOW_MS;
   const files: FolderSnapshot = new Map();
-  const infos: { path: string; size: number; lastModified: number; at: string }[] = [];
-  const nested = new Set<string>();
-  for await (const info of folder.list("/", { recursive: true })) {
-    const path = relative(info.path);
-    if (!options.nested && (await isGitEntry(folder, info))) nested.add(parentOf(path));
-    if (info.kind === "file") infos.push({ ...info, path, at: info.path });
-  }
-  const roots = options.nested ? [...options.nested].sort() : outermost(nested);
+  const walk = options.walk ?? (await walkFolder(folder));
+  const infos = walk.files;
+  // the repositories this listing shows are always left out, with any the caller names
+  const roots = outermost(new Set([...(options.nested ?? []), ...walk.nested]));
   const inNested = under(roots);
   report.nested.push(...roots);
   for (const root of roots) {

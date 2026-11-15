@@ -43,7 +43,7 @@ import {
   defaultIgnore,
   FolderChangedError,
   type FolderSnapshot,
-  findNestedRepositories,
+  type FolderWalk,
   type IgnorePath,
   isExpendableDirectory,
   isSyncTempFile,
@@ -53,9 +53,10 @@ import {
   snapshotFolder,
   sweepTempFiles,
   under,
+  walkFolder,
 } from "./folder-tree.js";
-import { mergeRecursive } from "./merge-trees.js";
-import { assertSafePaths } from "./path-rules.js";
+import { hasConflictMarkers, mergeRecursive } from "./merge-trees.js";
+import { assertSafePaths, isSafePath } from "./path-rules.js";
 
 /** Who commits, and when. */
 export interface WorkspaceIdentity {
@@ -97,7 +98,25 @@ export interface GitWorkspaceOptions {
    * is skewed by more than the racy window (default false)
    */
   rehashAll?: boolean;
+  /**
+   * What a merge with conflicts does (default `stop`):
+   * - `stop`, as git does: the merge result is written into the folder (markers in text
+   *   files, the other side beside binary ones), nothing is committed or pushed, and the merge
+   *   stays in progress until {@link concludeMerge} or {@link abortMerge};
+   * - `commit`: the merge is committed with the conflicts in the files, pushed, and the sync
+   *   goes on; fixing them is an ordinary edit
+   */
+  onConflict?: ConflictMode;
+  /**
+   * Commit files that come back from being ignored as the folder holds them (default false:
+   * a file the branch never held, or whose folder copy differs from what the branch had, is
+   * held out of commits and reported as `unignored-local` until it is included explicitly)
+   */
+  commitUnignored?: boolean;
 }
+
+/** See {@link GitWorkspaceOptions.onConflict}. */
+export type ConflictMode = "stop" | "commit";
 
 /** A folder and its repository, as {@link openGitWorkspace} opened them. */
 export interface GitWorkspace {
@@ -114,6 +133,8 @@ export interface GitWorkspace {
   readonly caseInsensitive: boolean;
   readonly racyWindowMs: number;
   readonly rehashAll: boolean;
+  readonly onConflict: ConflictMode;
+  readonly commitUnignored: boolean;
 }
 
 /**
@@ -143,6 +164,8 @@ export async function openGitWorkspace(options: GitWorkspaceOptions): Promise<Gi
     caseInsensitive: options.caseInsensitive ?? (await probeCaseInsensitive(options.folder)),
     racyWindowMs: options.racyWindowMs ?? DEFAULT_RACY_WINDOW_MS,
     rehashAll: options.rehashAll ?? false,
+    onConflict: options.onConflict ?? "stop",
+    commitUnignored: options.commitUnignored ?? false,
   };
 }
 
@@ -152,6 +175,8 @@ const queues = new WeakMap<GitWorkspace, Promise<unknown>>();
 const snapshots = new WeakMap<GitWorkspace, FolderSnapshot>();
 // the nested repositories the last snapshot found: their files are left alone like ignored ones
 const nestedRoots = new WeakMap<GitWorkspace, string[]>();
+// files back from being ignored, held out of commits: left alone like ignored ones
+const heldPaths = new WeakMap<GitWorkspace, Set<string>>();
 
 /** Runs `task` once everything queued on `ws` before it has finished. */
 export function runExclusive<T>(ws: GitWorkspace, task: () => Promise<T>): Promise<T> {
@@ -197,7 +222,20 @@ function underGitlink(files: FlatTree): (path: string) => boolean {
 function skipFor(ws: GitWorkspace, files: FlatTree): IgnorePath {
   const inLink = underGitlink(files);
   const inNested = under(nestedRoots.get(ws) ?? []);
-  return (path) => ws.ignore(path) || isSyncTempFile(path) || inLink(path) || inNested(path);
+  const held = heldPaths.get(ws) ?? new Set<string>();
+  return (path) =>
+    ws.ignore(path) || isSyncTempFile(path) || inLink(path) || inNested(path) || held.has(path);
+}
+
+/**
+ * Lists the folder once (see {@link walkFolder}). The nested repositories it finds are the
+ * round's (see {@link skipFor}); `keep` adds them to those already found this round instead.
+ */
+async function walk(ws: GitWorkspace, keep = false): Promise<FolderWalk> {
+  const found = await walkFolder(ws.folder, { ignore: ws.ignore });
+  const before = keep ? (nestedRoots.get(ws) ?? []) : [];
+  nestedRoots.set(ws, [...new Set([...before, ...found.nested])].sort());
+  return found;
 }
 
 /** What the folder can hold of an entry (submodules: nothing). */
@@ -223,13 +261,14 @@ function composeTree(headFiles: FlatTree, snapshot: FolderSnapshot, skip: Ignore
 }
 
 /**
- * Snapshots the folder, remembering the nested repositories it found (see {@link skipFor}).
- * Returns the snapshot, what to skip now (nested repositories included) and what was left out
- * (submodule checkouts of `headFiles` not counted).
+ * Snapshots the folder from the round's listing `walked`, remembering the nested repositories
+ * (see {@link skipFor}). Returns the snapshot, what to skip now (nested repositories included)
+ * and what was left out (submodule checkouts of `headFiles` not counted).
  */
 async function folderSnapshot(
   ws: GitWorkspace,
   headFiles: FlatTree,
+  walked: FolderWalk,
   tempFiles?: Map<string, number>,
 ): Promise<{ snapshot: FolderSnapshot; skip: IgnorePath; skipped: SkippedPath[] }> {
   const report: SnapshotReport = { nested: [], skipped: [] };
@@ -242,12 +281,14 @@ async function folderSnapshot(
       racyWindowMs: ws.racyWindowMs,
       rehashAll: ws.rehashAll,
       tempFiles,
-      // the nested repositories this round decided on: what the snapshot leaves out is
-      // exactly what the tree carries over
+      walk: walked,
+      // the nested repositories this round decided on, with any the listing shows: what the
+      // snapshot leaves out is exactly what the tree carries over
       nested: nestedRoots.get(ws) ?? [],
     },
     report,
   );
+  nestedRoots.set(ws, report.nested);
   snapshots.set(ws, snapshot);
   const skipped = report.skipped.filter(
     (s) => !(s.reason === "nested-repository" && headFiles.get(s.path)?.mode === MODE_GITLINK),
@@ -283,6 +324,21 @@ export interface WorkspaceCommit {
    * brought up to the branch where the folder's copy was unchanged, merged where both changed
    */
   rejoined: string[];
+  /**
+   * A merge with conflicts in progress (see {@link concludeMerge}): nothing was committed
+   */
+  merge?: MergeInProgress;
+}
+
+/** Options of {@link commitWorkspaceChanges}. */
+export interface CommitOptions {
+  /** The commit message (default `Workspace changes`) */
+  message?: string;
+  /**
+   * Files (or directories) back from being ignored to commit as the folder holds them,
+   * although they are held out by default (`unignored-local` in `skipped`)
+   */
+  include?: string[];
 }
 
 /** Where the plan of an unfinished checkout is kept: a ref only this workspace writes. */
@@ -454,16 +510,38 @@ async function loadPlan(ws: GitWorkspace, target: ObjectId): Promise<CheckoutPla
  * the finish with the branch unmoved; only when every path is done does the branch move to the
  * target.
  */
-async function finishPendingCheckout(ws: GitWorkspace): Promise<string[]> {
+async function finishPendingCheckout(ws: GitWorkspace): Promise<FinishResult> {
   const ref = pendingRef(ws);
   const target = (await ws.history.refs.resolve(ref))?.objectId;
-  if (!target) return [];
+  if (!target) return { conflicts: [], touched: [] };
   const head = await workspaceHead(ws);
   if (head === target) {
     await ws.history.refs.remove(ref);
     await ws.history.refs.remove(planRef(ws));
-    return [];
+    return { conflicts: [], touched: [] };
   }
+  const finished = await finishCheckout(ws, head, target);
+  await moveBranch(ws, head, target);
+  await ws.history.refs.remove(ref);
+  await ws.history.refs.remove(planRef(ws));
+  return finished;
+}
+
+/** What finishing a checkout did: the paths it reported, and those it wrote or removed. */
+interface FinishResult {
+  conflicts: string[];
+  touched: string[];
+}
+
+/**
+ * Brings the folder from `head`'s tree to `target`'s, from the stored plan (see
+ * {@link finishPendingCheckout}); the caller moves whatever records the checkout.
+ */
+async function finishCheckout(
+  ws: GitWorkspace,
+  head: ObjectId | undefined,
+  target: ObjectId,
+): Promise<FinishResult> {
   const from = (await readCommitTree(ws.history, head)).files;
   const to = (await readCommitTree(ws.history, target)).files;
   await recordLeftAlone(ws, from, to);
@@ -524,10 +602,7 @@ async function finishPendingCheckout(ws: GitWorkspace): Promise<string[]> {
   } finally {
     invalidate(ws, touched);
   }
-  await moveBranch(ws, head, target);
-  await ws.history.refs.remove(ref);
-  await ws.history.refs.remove(planRef(ws));
-  return plan.conflicts;
+  return { conflicts: plan.conflicts, touched };
 }
 
 /**
@@ -539,11 +614,32 @@ function staleRef(ws: GitWorkspace): string {
   return `refs/workspace/skip/${ws.branch.slice("refs/heads/".length)}`;
 }
 
-/**
- * Paths whose folder copy may be behind the branch because they were left out: the version
- * the folder last held (null: it never held one, a file the remote added meanwhile).
- */
-type StaleRecord = Map<string, FlatEntry | null>;
+/** A path's rejoin, recorded before anything is written, so a retry never merges it twice. */
+interface RejoinStep {
+  /** What the folder holds at the path once the step is done (null: nothing) */
+  result: ObjectId | null;
+  /** Folder writes, in order: the blob to write (null: remove) and what the path must hold */
+  writes: { at: string; id: ObjectId | null; mode: number; expect: ObjectId | null }[];
+  /** Whether both sides were kept */
+  conflict: boolean;
+}
+
+/** What the workspace remembers of left-out paths (`refs/workspace/skip/<branch>`). */
+interface SkipRecord {
+  /**
+   * Left-out paths the branch tracks, whose folder copy may be behind the branch: the version
+   * the folder last held (null: it never held one, a file the remote added meanwhile)
+   */
+  paths: Map<string, FlatEntry | null>;
+  /** Those of `paths` left out as part of a nested repository (the others were ignored) */
+  nested: Set<string>;
+  /** The topmost ignored folder paths the last commit saw (see {@link walkFolder}) */
+  local: string[];
+  /** Folder files back from being ignored, held out of commits until included */
+  held: Set<string>;
+  /** Rejoins decided and recorded, perhaps not yet written to the folder */
+  rejoining: Map<string, RejoinStep>;
+}
 
 /** What checkouts leave alone and later come back: ignored paths and nested repositories. */
 function staleSkip(ws: GitWorkspace): IgnorePath {
@@ -551,20 +647,41 @@ function staleSkip(ws: GitWorkspace): IgnorePath {
   return (path) => ws.ignore(path) || inNested(path);
 }
 
-async function loadStale(ws: GitWorkspace): Promise<StaleRecord> {
-  const record: StaleRecord = new Map();
+const strings = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+
+async function loadStale(ws: GitWorkspace): Promise<SkipRecord> {
+  const record: SkipRecord = {
+    paths: new Map(),
+    nested: new Set(),
+    local: [],
+    held: new Set(),
+    rejoining: new Map(),
+  };
   const id = (await ws.history.refs.resolve(staleRef(ws)))?.objectId;
   if (!id) return record;
   try {
     const commit = await ws.history.commits.load(id);
     if (!commit) return record;
-    for (const [path, entry] of (await readCommitTree(ws.history, id)).files)
-      record.set(path, entry);
+    for (const [path, entry] of (await readCommitTree(ws.history, id)).files) {
+      record.paths.set(path, entry);
+    }
     const meta = JSON.parse(commit.message.slice(commit.message.indexOf("\n\n") + 2)) as {
       absent?: unknown;
+      nested?: unknown;
+      local?: unknown;
+      held?: unknown;
+      rejoining?: unknown;
     };
-    if (Array.isArray(meta.absent)) {
-      for (const p of meta.absent) if (typeof p === "string") record.set(p, null);
+    for (const p of strings(meta.absent)) record.paths.set(p, null);
+    // a record without reasons treats every path as ignored: the safer rules apply
+    record.nested = new Set(strings(meta.nested));
+    record.local = strings(meta.local);
+    record.held = new Set(strings(meta.held));
+    if (meta.rejoining && typeof meta.rejoining === "object") {
+      for (const [path, step] of Object.entries(meta.rejoining as Record<string, RejoinStep>)) {
+        if (step && Array.isArray(step.writes)) record.rejoining.set(path, step);
+      }
     }
   } catch {
     // an unreadable record is an empty one: nothing is taken for stale
@@ -572,19 +689,44 @@ async function loadStale(ws: GitWorkspace): Promise<StaleRecord> {
   return record;
 }
 
-async function saveStale(ws: GitWorkspace, record: StaleRecord): Promise<void> {
-  if (record.size === 0) {
+async function saveStale(ws: GitWorkspace, record: SkipRecord): Promise<void> {
+  if (
+    record.paths.size === 0 &&
+    record.local.length === 0 &&
+    record.held.size === 0 &&
+    record.rejoining.size === 0
+  ) {
     await ws.history.refs.remove(staleRef(ws));
     return;
   }
   const files: FlatTree = new Map();
   const absent: string[] = [];
-  for (const [path, entry] of record) {
+  for (const [path, entry] of record.paths) {
     if (entry) files.set(path, entry);
     else absent.push(path);
   }
-  const id = await commitTree(ws, files, [], `skipped paths\n\n${JSON.stringify({ absent })}`);
+  const meta = {
+    absent,
+    nested: [...record.nested].filter((p) => record.paths.has(p)).sort(),
+    local: record.local,
+    held: [...record.held].sort(),
+    rejoining: Object.fromEntries(record.rejoining),
+  };
+  const id = await commitTree(ws, files, [], `skipped paths\n\n${JSON.stringify(meta)}`);
   await ws.history.refs.set(staleRef(ws), id);
+}
+
+/** Records `path` as left out with the version the folder holds, and why it is left out. */
+function remember(ws: GitWorkspace, record: SkipRecord, path: string, entry: FlatEntry | null) {
+  record.paths.set(path, entry);
+  if (ws.ignore(path)) record.nested.delete(path);
+  else record.nested.add(path);
+}
+
+function forget(record: SkipRecord, path: string) {
+  record.paths.delete(path);
+  record.nested.delete(path);
+  record.rejoining.delete(path);
 }
 
 /**
@@ -599,55 +741,64 @@ async function recordLeftAlone(ws: GitWorkspace, from: FlatTree, to: FlatTree): 
   for (const path of new Set([...from.keys(), ...to.keys()])) {
     const h = inFolder(from.get(path));
     const t = inFolder(to.get(path));
-    if (h?.id === t?.id || !skip(path) || record.has(path)) continue;
-    record.set(path, h ?? null);
+    if (h?.id === t?.id || !skip(path) || record.paths.has(path)) continue;
+    remember(ws, record, path, h ?? null);
     changed = true;
   }
   if (changed) await saveStale(ws, record);
 }
 
 /**
- * Brings back a path that is no longer left out: a three-way merge of the version the folder
- * last held (`base`), the folder's copy and the branch's. A copy unchanged in the folder gets
- * the branch's version (written, or removed); one changed only in the folder is kept; one
+ * How a path that is no longer left out comes back: a three-way merge of the version the
+ * folder last held (`base`), the folder's copy and the branch's. A copy unchanged in the folder
+ * gets the branch's version (written, or removed); one changed only in the folder is kept; one
  * changed on both sides is merged (text, git's markers) or kept with the branch's version
- * beside it (binary, or a directory in its place), and reported. Returns whether it conflicted.
+ * beside it (binary, or a directory in its place), and reported. With `hold` (a path back from
+ * being ignored), a file the folder holds of its own, which the branch never had there, is not
+ * merged or committed at all: `hold` is returned and nothing is written.
  */
-async function rejoinPath(
+async function planRejoin(
   ws: GitWorkspace,
   path: string,
   base: FlatEntry | null,
   theirs: FlatEntry | undefined,
   taken: Set<string>,
-): Promise<boolean> {
-  const expendable = expendableFor(ws);
+  hold: boolean,
+): Promise<RejoinStep | "hold"> {
   const ours = await currentFileId(ws.folder, path);
-  const write = (entry: FlatEntry | undefined, at = path, expect = ours) =>
-    applyFolderPath(ws.history, ws.folder, at, entry, {
-      accept: (now) => now === expect,
-      expendable,
-    });
+  const keep = (conflict: boolean): RejoinStep => ({ result: ours ?? null, writes: [], conflict });
+  const write = (at: string, entry: FlatEntry | undefined, expect: ObjectId | undefined) => ({
+    at,
+    id: entry?.id ?? null,
+    mode: entry?.mode ?? MODE_FILE,
+    expect: expect ?? null,
+  });
   const aside = () => {
     let name = `${path}.theirs-${theirs?.id.slice(0, 7)}`;
     for (let n = 2; taken.has(name); n++) name = `${path}.theirs-${theirs?.id.slice(0, 7)}-${n}`;
     taken.add(name);
     return name;
   };
-  if (ours === theirs?.id) return false;
-  if (ours === (base?.id ?? undefined)) {
-    await write(theirs);
-    return false;
+  const baseId = base?.id ?? undefined;
+  if (ours === theirs?.id) return keep(false);
+  if (ours === baseId) {
+    return { result: theirs?.id ?? null, writes: [write(path, theirs, ours)], conflict: false };
   }
-  if (theirs?.id === (base?.id ?? undefined)) return false; // changed only in the folder
+  // the folder holds content of its own here, which history never had
+  if (hold && ours !== undefined && !ours.startsWith("directory:")) return "hold";
+  if (theirs?.id === baseId) return keep(false); // changed only in the folder
   if (ours?.startsWith("directory:")) {
-    if (theirs) await write(theirs, aside(), undefined);
-    return true;
+    return theirs
+      ? { result: ours, writes: [write(aside(), theirs, undefined)], conflict: true }
+      : keep(true);
   }
   if (ours === undefined) {
-    if (theirs) await write(theirs); // removed in the folder, changed on the branch: it comes back
-    return true;
+    // removed in the folder, changed on the branch: it comes back
+    return theirs
+      ? { result: theirs.id, writes: [write(path, theirs, undefined)], conflict: true }
+      : keep(true);
   }
-  if (!theirs) return true; // removed on the branch, changed in the folder: kept
+  if (!theirs) return keep(true); // removed on the branch, changed in the folder: kept
   const mine: FlatEntry = {
     id: await ws.history.blobs.store(ws.folder.read(`/${path}`)),
     mode: theirs.mode,
@@ -663,48 +814,142 @@ async function rejoinPath(
       theirsLabel: `${ws.branch.slice("refs/heads/".length)}`,
     });
     const id = await ws.history.blobs.store([merged.content]);
-    await write({ id, mode: theirs.mode }, path, mine.id);
-    return merged.conflicts > 0;
+    return {
+      result: id,
+      writes: [write(path, { id, mode: theirs.mode }, mine.id)],
+      conflict: merged.conflicts > 0,
+    };
   }
-  await write(theirs, aside(), undefined);
-  return true;
+  return { result: mine.id, writes: [write(aside(), theirs, undefined)], conflict: true };
 }
 
 /**
  * Paths that were left out and no longer are (a nested repository removed, an `ignore` that
- * changed) come back, one by one (see {@link rejoinPath}); paths the branch has that are left
- * out now are recorded with the version the folder holds.
+ * changed) come back, one by one (see {@link planRejoin}); paths the branch has that are left
+ * out now are recorded with the version the folder holds. Each path's rejoin is recorded
+ * before it is written: a retry after a crash finds the folder holding the recorded result
+ * and only finishes the step, never merging the path again.
  */
 async function rejoinLeftOut(
   ws: GitWorkspace,
   headFiles: FlatTree,
-): Promise<{ rejoined: string[]; conflicts: string[] }> {
+): Promise<{ rejoined: string[]; conflicts: string[]; touched: string[] }> {
   const skip = staleSkip(ws);
   const record = await loadStale(ws);
   const rejoined: string[] = [];
   const conflicts: string[] = [];
-  const taken = new Set([...headFiles.keys(), ...record.keys()]);
+  const touched: string[] = [];
+  const expendable = expendableFor(ws);
+  const taken = new Set([...headFiles.keys(), ...record.paths.keys()]);
   try {
-    for (const [path, base] of [...record]) {
+    for (const [path, base] of [...record.paths]) {
       if (skip(path)) continue;
-      if (await rejoinPath(ws, path, base, inFolder(headFiles.get(path)), taken)) {
-        conflicts.push(path);
+      let step = record.rejoining.get(path);
+      // decided before a crash: done when the folder holds the result, made again otherwise
+      if (step && (await currentFileId(ws.folder, path)) !== (step.result ?? undefined)) {
+        step = undefined;
       }
-      record.delete(path);
+      if (!step) {
+        const hold = !record.nested.has(path) && !ws.commitUnignored;
+        const planned = await planRejoin(
+          ws,
+          path,
+          base,
+          inFolder(headFiles.get(path)),
+          taken,
+          hold,
+        );
+        if (planned === "hold") {
+          forget(record, path);
+          record.held.add(path);
+          await saveStale(ws, record);
+          continue;
+        }
+        step = planned;
+        if (step.writes.length > 0) {
+          record.rejoining.set(path, step);
+          await saveStale(ws, record); // write-ahead: the decision first, then the folder
+        }
+      }
+      for (const w of step.writes) {
+        touched.push(w.at);
+        await applyFolderPath(
+          ws.history,
+          ws.folder,
+          w.at,
+          w.id ? { id: w.id, mode: w.mode } : undefined,
+          { accept: (now) => now === (w.expect ?? undefined), expendable },
+        );
+      }
+      if (step.conflict) conflicts.push(path);
+      forget(record, path);
       rejoined.push(path);
       await saveStale(ws, record); // each path once, even when a later one fails
     }
   } finally {
-    invalidate(ws, rejoined);
+    invalidate(ws, [...rejoined, ...touched]);
   }
   let changed = false;
   for (const [path, entry] of headFiles) {
-    if (entry.mode === MODE_GITLINK || !skip(path) || record.has(path)) continue;
-    record.set(path, entry);
+    if (entry.mode === MODE_GITLINK || !skip(path) || record.paths.has(path)) continue;
+    remember(ws, record, path, entry);
     changed = true;
   }
   if (changed) await saveStale(ws, record);
-  return { rejoined: rejoined.sort(), conflicts: conflicts.sort() };
+  return { rejoined: rejoined.sort(), conflicts: conflicts.sort(), touched };
+}
+
+/**
+ * Which folder files are held out of commits this round: files back from being ignored that
+ * history never had there (`unignored-local`), until `include` names them or the workspace
+ * commits them all (`commitUnignored`). A held file that is removed stops being held; when the
+ * branch tracks that path, the branch's version (never written over the held file) comes back
+ * at the next commit, and the tree keeps it meanwhile. Updates `record`; returns the paths to
+ * hold now and whether the record changed.
+ */
+function holdUnignored(
+  ws: GitWorkspace,
+  record: SkipRecord,
+  walked: FolderWalk,
+  headFiles: FlatTree,
+  include: string[],
+): { hold: Set<string>; report: string[]; changed: boolean } {
+  const within = (list: string[]) => (p: string) =>
+    list.some((l) => p === l || p.startsWith(`${l}/`));
+  const wasIgnored = within(record.local);
+  const included = ws.commitUnignored ? () => true : within(include);
+  const inLink = underGitlink(headFiles);
+  const inNested = under(nestedRoots.get(ws) ?? []);
+  const leftOut = (p: string) => isSyncTempFile(p) || inLink(p) || inNested(p);
+  const present = new Set(walked.files.map((f) => f.path));
+  const hold = new Set<string>();
+  const kept = new Set<string>();
+  let changed = false;
+  for (const p of record.held) {
+    if (ws.ignore(p) || included(p)) continue;
+    if (present.has(p)) {
+      kept.add(p);
+    } else if (inFolder(headFiles.get(p)) && !record.paths.has(p)) {
+      // removed while held: the branch's version comes back at the next commit (the folder
+      // never held it), and nothing is deleted meanwhile
+      record.paths.set(p, null);
+      hold.add(p);
+    }
+  }
+  for (const f of walked.files) {
+    const p = f.path;
+    if (kept.has(p) || headFiles.has(p) || !wasIgnored(p) || ws.ignore(p) || included(p)) continue;
+    if (leftOut(p) || !isSafePath(p)) continue;
+    kept.add(p);
+  }
+  for (const p of kept) hold.add(p);
+  const same = (a: Iterable<string>, b: Iterable<string>) =>
+    [...a].sort().join("\n") === [...b].sort().join("\n");
+  if (!same(kept, record.held) || !same(walked.ignored, record.local)) changed = true;
+  if (hold.size !== kept.size) changed = true;
+  record.held = kept;
+  record.local = walked.ignored;
+  return { hold, report: [...kept].sort(), changed };
 }
 
 async function commitTree(
@@ -724,21 +969,193 @@ async function commitTree(
 }
 
 /**
+ * Where a merge with conflicts in progress is kept (git's `MERGE_HEAD`): a ref only this
+ * workspace writes, never pushed. It names a commit whose parents are the branch tip and the
+ * commit merged in, whose tree is the merge result, and whose message holds the merge's state.
+ */
+function mergeRef(ws: GitWorkspace): string {
+  return `refs/workspace/merge/${ws.branch.slice("refs/heads/".length)}`;
+}
+
+/** A merge with conflicts in progress (see {@link concludeMerge}). */
+export interface MergeInProgress {
+  /** The branch tip the merge started from: the branch stays there until it is concluded */
+  head: ObjectId;
+  /** The commit merged in */
+  theirs: ObjectId;
+  /** Paths with both sides kept, to resolve before concluding */
+  conflicts: string[];
+  /** The message the merge commit gets */
+  message: string;
+}
+
+interface MergeRecord {
+  /** The record's own commit */
+  id: ObjectId;
+  /**
+   * `writing`: the merge result is being written into the folder (a write cut short is
+   * finished first, from the checkout plan); `stopped`: the folder holds it, for the user
+   */
+  phase: "writing" | "stopped";
+  head: ObjectId;
+  theirs: ObjectId;
+  /** The merge result */
+  files: FlatTree;
+  conflicts: string[];
+  /** First line of the merge commit's message */
+  title: string;
+}
+
+/** The record's commit, not yet named by the ref. */
+async function mergeCommit(
+  ws: GitWorkspace,
+  record: Omit<MergeRecord, "id">,
+): Promise<MergeRecord> {
+  const meta = JSON.stringify({
+    phase: record.phase,
+    conflicts: record.conflicts,
+    title: record.title,
+  });
+  const id = await commitTree(
+    ws,
+    record.files,
+    [record.head, record.theirs],
+    `workspace merge\n\n${meta}`,
+  );
+  return { ...record, id };
+}
+
+async function storeMerge(ws: GitWorkspace, record: Omit<MergeRecord, "id">): Promise<MergeRecord> {
+  const stored = await mergeCommit(ws, record);
+  await ws.history.refs.set(mergeRef(ws), stored.id);
+  return stored;
+}
+
+async function loadMerge(ws: GitWorkspace): Promise<MergeRecord | undefined> {
+  const id = (await ws.history.refs.resolve(mergeRef(ws)))?.objectId;
+  if (!id) return undefined;
+  const commit = await ws.history.commits.load(id);
+  if (!commit) return undefined;
+  if (commit.parents.length !== 2) return undefined;
+  const meta = JSON.parse(commit.message.slice(commit.message.indexOf("\n\n") + 2)) as {
+    phase?: unknown;
+    conflicts?: unknown;
+    title?: unknown;
+  };
+  return {
+    id,
+    phase: meta.phase === "writing" ? "writing" : "stopped",
+    head: commit.parents[0] as ObjectId,
+    theirs: commit.parents[1] as ObjectId,
+    files: (await readCommitTree(ws.history, id)).files,
+    conflicts: strings(meta.conflicts),
+    title: typeof meta.title === "string" ? meta.title : "Merge",
+  };
+}
+
+function mergeMessage(record: MergeRecord): string {
+  const lines = [record.title];
+  if (record.conflicts.length > 0) {
+    lines.push("", "Conflicts:", ...record.conflicts.map((p) => `\t${p}`));
+  }
+  return lines.join("\n");
+}
+
+function publicMerge(record: MergeRecord): MergeInProgress {
+  return {
+    head: record.head,
+    theirs: record.theirs,
+    conflicts: record.conflicts,
+    message: mergeMessage(record),
+  };
+}
+
+/**
+ * The merge in progress, if any. A merge result whose writing was cut short is written first
+ * (from the checkout plan, so nothing is merged twice), then the merge is `stopped`.
+ */
+async function recoverMerge(
+  ws: GitWorkspace,
+): Promise<{ record: MergeRecord; touched: string[] } | undefined> {
+  const record = await loadMerge(ws);
+  if (!record) return undefined;
+  if (record.phase === "stopped") return { record, touched: [] };
+  const head = await workspaceHead(ws);
+  if (head !== record.head) {
+    throw new Error(`${ws.branch} moved while a merge was being written into the folder`);
+  }
+  const done = await finishCheckout(ws, record.head, record.id);
+  const stopped = await storeMerge(ws, {
+    ...record,
+    phase: "stopped",
+    conflicts: [...new Set([...record.conflicts, ...done.conflicts])].sort(),
+  });
+  await ws.history.refs.remove(planRef(ws));
+  return { record: stopped, touched: done.touched };
+}
+
+/**
+ * The merge in progress on the workspace branch, if any: its conflicts are in the folder, and
+ * nothing is committed or synced until {@link concludeMerge} or {@link abortMerge}.
+ */
+export function readMergeState(ws: GitWorkspace): Promise<MergeInProgress | undefined> {
+  return runExclusive(ws, async () => {
+    const record = await loadMerge(ws);
+    return record ? publicMerge(record) : undefined;
+  });
+}
+
+/**
  * The commit step of {@link commitWorkspaceChanges}, without taking the workspace's queue: for
  * code that already runs inside {@link runExclusive} (a sync).
  */
-export async function commitFolder(ws: GitWorkspace, message: string): Promise<WorkspaceCommit> {
-  // one set of nested repositories for the whole round: the finish, the rejoin, the snapshot
-  // and the tree all leave out the same paths
-  nestedRoots.set(ws, await findNestedRepositories(ws.folder));
-  const conflicts = await finishPendingCheckout(ws);
+export async function commitFolder(
+  ws: GitWorkspace,
+  message: string,
+  options: { include?: string[] } = {},
+): Promise<WorkspaceCommit> {
+  heldPaths.set(ws, new Set((await loadStale(ws)).held));
+  // one listing for the round: the nested repositories it finds drive the finish, the rejoin,
+  // the snapshot and the tree, and the snapshot is taken from it. Only when the finish or the
+  // rejoin wrote something is the folder listed again (its repositories added to the round's).
+  let walked = await walk(ws);
+  const finished = await finishPendingCheckout(ws);
+  const conflicts = [...finished.conflicts];
+  const touched = [...finished.touched];
+  const merging = await recoverMerge(ws);
+  if (merging) {
+    // a merge with conflicts in progress: nothing is committed until it is concluded
+    touched.push(...merging.touched);
+    if (touched.length > 0) walked = await walk(ws, true);
+    const tempFiles = new Map<string, number>();
+    const { skipped } = await folderSnapshot(ws, merging.record.files, walked, tempFiles);
+    await sweepTempFiles(ws.folder, tempFiles);
+    for (const path of [...(heldPaths.get(ws) ?? [])].sort()) {
+      skipped.push({ path, reason: "unignored-local" });
+    }
+    return {
+      head: await workspaceHead(ws),
+      changed: false,
+      conflicts: merging.record.conflicts,
+      skipped,
+      rejoined: [],
+      merge: publicMerge(merging.record),
+    };
+  }
   const head = await workspaceHead(ws);
   const current = await readCommitTree(ws.history, head);
   const back = await rejoinLeftOut(ws, current.files);
   conflicts.push(...back.conflicts.filter((c) => !conflicts.includes(c)));
+  touched.push(...back.touched);
   const { rejoined } = back;
+  if (touched.length > 0) walked = await walk(ws, true);
+  const record = await loadStale(ws);
+  const held = holdUnignored(ws, record, walked, current.files, options.include ?? []);
+  if (held.changed) await saveStale(ws, record);
+  heldPaths.set(ws, held.hold);
   const tempFiles = new Map<string, number>();
-  const { snapshot, skip, skipped } = await folderSnapshot(ws, current.files, tempFiles);
+  const { snapshot, skip, skipped } = await folderSnapshot(ws, current.files, walked, tempFiles);
+  for (const path of held.report) skipped.push({ path, reason: "unignored-local" });
   await sweepTempFiles(ws.folder, tempFiles);
   const tree = await storeFlatTree(ws.history, composeTree(current.files, snapshot, skip));
   if (tree === current.tree) return { head, changed: false, conflicts, skipped, rejoined };
@@ -756,22 +1173,32 @@ export async function commitFolder(ws: GitWorkspace, message: string): Promise<W
 
 /**
  * Commits the folder as it is now on the workspace branch, when it differs from the branch tip.
+ * While a merge with conflicts is in progress nothing is committed: the result's `merge` says
+ * so (see {@link concludeMerge}).
  *
  * @example
  * ```ts
  * const { head, changed } = await commitWorkspaceChanges(ws, "notes from the train");
+ * // a file back from being ignored is committed only when named
+ * await commitWorkspaceChanges(ws, { include: ["app.cfg"] });
  * ```
  */
 export function commitWorkspaceChanges(
   ws: GitWorkspace,
-  message = "Workspace changes",
+  options: string | CommitOptions = {},
 ): Promise<WorkspaceCommit> {
-  return runExclusive(ws, () => commitFolder(ws, message));
+  const { message = "Workspace changes", include } =
+    typeof options === "string" ? { message: options } : options;
+  return runExclusive(ws, () => commitFolder(ws, message, { include }));
 }
 
 /** How {@link integrateCommit} brought `theirs` into the workspace. */
 export interface Integration {
-  kind: "up-to-date" | "fast-forward" | "merge";
+  /**
+   * `conflicted`: a merge with conflicts stopped, as git stops: the folder holds the merge
+   * result, the branch did not move, and the merge is in progress (see {@link concludeMerge})
+   */
+  kind: "up-to-date" | "fast-forward" | "merge" | "conflicted";
   /** The branch tip afterwards */
   head?: ObjectId;
   /** Paths merged with both sides kept, or moved aside (see the merge) */
@@ -779,6 +1206,8 @@ export interface Integration {
   /** Folder paths written and removed */
   written: string[];
   removed: string[];
+  /** The merge in progress (`conflicted` only) */
+  merge?: MergeInProgress;
 }
 
 /** Options of {@link integrateCommit}. */
@@ -787,6 +1216,8 @@ export interface IntegrateOptions {
   theirsName?: string;
   /** Message of a merge commit */
   message?: string;
+  /** What a merge with conflicts does (default: the workspace's `onConflict`) */
+  onConflict?: ConflictMode;
 }
 
 /** How a case-insensitive (and, on HFS+, normalizing) folder compares names */
@@ -830,22 +1261,29 @@ function caseCollisions(files: FlatTree, tag: string): { files: FlatTree; moved:
   return { files: out, moved };
 }
 
+/**
+ * Brings the folder from `head` to `target`, recorded first under `record` (default: the
+ * pending checkout), then `complete` (default: the branch moves to `target` and the record
+ * goes). A checkout cut short leaves the record and a plan to finish it.
+ */
 async function checkoutAndMove(
   ws: GitWorkspace,
   head: ObjectId | undefined,
   headFiles: FlatTree,
   target: ObjectId,
   targetFiles: FlatTree,
+  options: { record?: string; complete?: () => Promise<void> } = {},
 ) {
-  nestedRoots.set(ws, await findNestedRepositories(ws.folder));
-  // the folder must still be what `head` recorded: an edit made since is not overwritten
-  const { snapshot, skip } = await folderSnapshot(ws, headFiles);
+  // one listing: the folder must still be what `head` recorded, an edit made since is not
+  // overwritten; the nested repositories it finds are left alone by the checkout
+  const walked = await walk(ws);
+  const { snapshot, skip } = await folderSnapshot(ws, headFiles, walked);
   const expected = composeTree(headFiles, snapshot, skip);
   const tree = await storeFlatTree(ws.history, expected);
   if (tree !== (await readCommitTree(ws.history, head)).tree) throw new FolderChangedError();
   await ws.history.refs.remove(planRef(ws));
   await recordLeftAlone(ws, headFiles, targetFiles);
-  await ws.history.refs.set(pendingRef(ws), target);
+  await ws.history.refs.set(options.record ?? pendingRef(ws), target);
   const changed = new Set<string>();
   for (const p of new Set([...headFiles.keys(), ...targetFiles.keys()])) {
     if (headFiles.get(p)?.id !== targetFiles.get(p)?.id) changed.add(p);
@@ -872,8 +1310,12 @@ async function checkoutAndMove(
   } finally {
     invalidate(ws, changed);
   }
-  await moveBranch(ws, head, target);
-  await ws.history.refs.remove(pendingRef(ws));
+  if (options.complete) {
+    await options.complete();
+  } else {
+    await moveBranch(ws, head, target);
+    await ws.history.refs.remove(pendingRef(ws));
+  }
   return done;
 }
 
@@ -887,6 +1329,10 @@ async function checkoutAndMove(
  * before the branch moves. Call it with the folder committed ({@link commitFolder}); a folder
  * that changed since is not overwritten ({@link FolderChangedError}). Like
  * {@link commitFolder} it does not take the workspace's queue.
+ *
+ * A merge with conflicts, with `onConflict: "stop"` (the default), stops as git stops: the
+ * merge result is written into the folder, the branch stays where it was, and the merge is in
+ * progress (`kind: "conflicted"`) until {@link concludeMerge} or {@link abortMerge}.
  */
 export async function integrateCommit(
   ws: GitWorkspace,
@@ -895,6 +1341,9 @@ export async function integrateCommit(
 ): Promise<Integration> {
   const { commits } = ws.history;
   const head = await workspaceHead(ws);
+  if (await ws.history.refs.resolve(mergeRef(ws))) {
+    throw new Error(`a merge is in progress on ${ws.branch}: conclude or abort it first`);
+  }
   const none = { conflicts: [], written: [], removed: [] };
   if (head === theirs || (head && (await commits.isAncestor(theirs, head)))) {
     return { kind: "up-to-date", head, ...none };
@@ -904,6 +1353,7 @@ export async function integrateCommit(
   const ours = await readCommitTree(ws.history, head);
   const branchName = ws.branch.slice("refs/heads/".length);
   const theirsName = options.theirsName ?? "theirs";
+  const onConflict = options.onConflict ?? ws.onConflict;
 
   let kind: Integration["kind"];
   let target: ObjectId;
@@ -927,13 +1377,16 @@ export async function integrateCommit(
       },
     );
     for (const c of merged.conflicts) conflicts.add(c);
-    const lines = [
-      options.message ?? `Merge ${theirsName} (${theirs.slice(0, 7)}) into ${branchName}`,
-    ];
+    const title =
+      options.message ?? `Merge ${theirsName} (${theirs.slice(0, 7)}) into ${branchName}`;
+    targetFiles = merged.files;
+    if (merged.conflicts.length > 0 && onConflict === "stop") {
+      return stopMerge(ws, head, ours.files, theirs, targetFiles, conflicts, title);
+    }
+    const lines = [title];
     if (merged.conflicts.length > 0) {
       lines.push("", "Conflicts:", ...merged.conflicts.map((p) => `\t${p}`));
     }
-    targetFiles = merged.files;
     target = await commitTree(ws, targetFiles, [head, theirs], lines.join("\n"));
   }
   if (ws.caseInsensitive) {
@@ -953,4 +1406,210 @@ export async function integrateCommit(
   }
   const done = await checkoutAndMove(ws, head, ours.files, target, targetFiles);
   return { kind, head: target, conflicts: [...conflicts].sort(), ...done };
+}
+
+/**
+ * A merge with conflicts, stopped as git stops it: the merge result is recorded as the merge
+ * in progress (`writing`), written into the folder (from the checkout plan if cut short), and
+ * the record becomes `stopped`. The branch does not move; nothing is committed.
+ */
+async function stopMerge(
+  ws: GitWorkspace,
+  head: ObjectId,
+  headFiles: FlatTree,
+  theirs: ObjectId,
+  mergedFiles: FlatTree,
+  conflicts: Set<string>,
+  title: string,
+): Promise<Integration> {
+  let files = mergedFiles;
+  if (ws.caseInsensitive) {
+    // the paths a case-insensitive folder would merge are moved aside in the result itself
+    const fixed = caseCollisions(files, `case-${theirs.slice(0, 7)}`);
+    for (const c of fixed.moved) conflicts.add(c);
+    files = fixed.files;
+  }
+  const record: Omit<MergeRecord, "id"> = {
+    phase: "writing",
+    head,
+    theirs,
+    files,
+    conflicts: [...conflicts].sort(),
+    title,
+  };
+  // the record's commit is made before the folder is touched; the ref is set by the checkout
+  const writing = await mergeCommit(ws, record);
+  let stopped = writing;
+  const done = await checkoutAndMove(ws, head, headFiles, writing.id, files, {
+    record: mergeRef(ws),
+    complete: async () => {
+      stopped = await storeMerge(ws, { ...record, phase: "stopped" });
+    },
+  });
+  return {
+    kind: "conflicted",
+    head,
+    conflicts: record.conflicts,
+    ...done,
+    merge: publicMerge(stopped),
+  };
+}
+
+/** Conflicted paths that still hold conflict markers when {@link concludeMerge} is called. */
+export class UnresolvedConflictsError extends Error {
+  constructor(readonly paths: string[]) {
+    super(`conflict markers are still in ${paths.join(", ")}`);
+    this.name = "UnresolvedConflictsError";
+  }
+}
+
+/** {@link concludeMerge} or {@link abortMerge} with no merge in progress. */
+export class NoMergeInProgressError extends Error {
+  constructor(branch: string) {
+    super(`no merge in progress on ${branch}`);
+    this.name = "NoMergeInProgressError";
+  }
+}
+
+async function readBytes(folder: FilesApi, path: string): Promise<Uint8Array | undefined> {
+  const stats = await folder.stats(`/${path}`);
+  if (stats?.kind !== "file") return undefined;
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of folder.read(`/${path}`)) {
+    parts.push(chunk);
+    size += chunk.length;
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+/** Options of {@link concludeMerge}. */
+export interface ConcludeMergeOptions {
+  /** Message of the merge commit (default: git's, with the conflicted paths listed) */
+  message?: string;
+}
+
+/**
+ * Concludes the merge in progress, as `git commit` does after a conflicted merge: the folder
+ * as it is now becomes a merge commit with both parents, and the next sync pushes it. Refused
+ * ({@link UnresolvedConflictsError}, nothing changed) while a conflicted text file still holds
+ * a conflict marker line (`<<<<<<<` or `>>>>>>>`): git refuses unmerged index entries, and
+ * markers are this workspace's equivalent. Binary conflicts are not checked: the folder's
+ * version is taken, and a `.theirs-<id>` copy still beside it is committed like any file.
+ *
+ * @example
+ * ```ts
+ * const result = await syncWorkspace(ws, remote);
+ * if (result.integration === "conflicted") {
+ *   // edit the files in result.conflicts, then:
+ *   await concludeMerge(ws);
+ *   await syncWorkspace(ws, remote); // pushes the merge
+ * }
+ * ```
+ */
+export function concludeMerge(
+  ws: GitWorkspace,
+  options: ConcludeMergeOptions = {},
+): Promise<WorkspaceCommit> {
+  return runExclusive(ws, async () => {
+    heldPaths.set(ws, new Set((await loadStale(ws)).held));
+    let walked = await walk(ws);
+    const merging = await recoverMerge(ws);
+    if (!merging) throw new NoMergeInProgressError(ws.branch);
+    const { record } = merging;
+    if (merging.touched.length > 0) walked = await walk(ws, true);
+    if ((await workspaceHead(ws)) !== record.head) {
+      throw new Error(`${ws.branch} moved during the merge`);
+    }
+    const unresolved: string[] = [];
+    for (const path of record.conflicts) {
+      const bytes = await readBytes(ws.folder, path);
+      if (bytes && hasConflictMarkers(bytes)) unresolved.push(path);
+    }
+    if (unresolved.length > 0) throw new UnresolvedConflictsError(unresolved);
+    const tempFiles = new Map<string, number>();
+    const { snapshot, skip, skipped } = await folderSnapshot(ws, record.files, walked, tempFiles);
+    await sweepTempFiles(ws.folder, tempFiles);
+    for (const path of [...(heldPaths.get(ws) ?? [])].sort()) {
+      skipped.push({ path, reason: "unignored-local" });
+    }
+    const message = (options.message ?? mergeMessage(record)).replace(/\n+$/, "");
+    const commit = await commitTree(
+      ws,
+      composeTree(record.files, snapshot, skip),
+      [record.head, record.theirs],
+      message,
+    );
+    await moveBranch(ws, record.head, commit);
+    await ws.history.refs.remove(mergeRef(ws));
+    return { head: commit, changed: true, conflicts: record.conflicts, skipped, rejoined: [] };
+  });
+}
+
+/** What {@link abortMerge} did. */
+export interface MergeAbort {
+  /** The branch tip, where the merge started */
+  head: ObjectId;
+  /** Paths brought back to the branch tip's version */
+  restored: string[];
+  /**
+   * Paths left as they are: a directory with files of its own stands where the branch tip
+   * has a file, or where the merge put one (nothing in it is removed)
+   */
+  kept: string[];
+}
+
+/**
+ * Abandons the merge in progress, as `git merge --abort` does: every path the merge changed
+ * gets the branch tip's version back (files the merge added are removed), and the record goes.
+ * Edits made to those paths since the merge started are discarded, as git discards them;
+ * other paths are not touched, so edits elsewhere stay (the merge started from a committed
+ * folder, so nothing from before it is lost). A directory is never removed with files of its
+ * own: such a path is reported in `kept`.
+ */
+export function abortMerge(ws: GitWorkspace): Promise<MergeAbort> {
+  return runExclusive(ws, async () => {
+    const record = await loadMerge(ws);
+    if (!record) throw new NoMergeInProgressError(ws.branch);
+    const head = await workspaceHead(ws);
+    if (head !== record.head) throw new Error(`${ws.branch} moved during the merge`);
+    heldPaths.set(ws, new Set((await loadStale(ws)).held));
+    await walk(ws);
+    const headFiles = (await readCommitTree(ws.history, head)).files;
+    const skipWrite = skipFor(ws, headFiles);
+    const skipRemove = skipFor(ws, record.files);
+    const expendable = expendableFor(ws);
+    const accept = (now: ObjectId | undefined) => !now?.startsWith("directory:");
+    const restored: string[] = [];
+    const kept: string[] = [];
+    const paths = [...new Set([...headFiles.keys(), ...record.files.keys()])].sort();
+    const differs = (p: string) =>
+      inFolder(headFiles.get(p))?.id !== inFolder(record.files.get(p))?.id;
+    const removals = paths.filter((p) => differs(p) && !inFolder(headFiles.get(p)));
+    const writes = paths.filter((p) => differs(p) && inFolder(headFiles.get(p)));
+    try {
+      for (const path of [...removals, ...writes]) {
+        const h = inFolder(headFiles.get(path));
+        if (h ? skipWrite(path) : skipRemove(path)) continue;
+        try {
+          const did = await applyFolderPath(ws.history, ws.folder, path, h, { accept, expendable });
+          if (did !== "unchanged") restored.push(path);
+        } catch (error) {
+          if (!(error instanceof FolderChangedError)) throw error;
+          kept.push(path);
+        }
+      }
+    } finally {
+      invalidate(ws, paths.filter(differs));
+    }
+    await ws.history.refs.remove(planRef(ws));
+    await ws.history.refs.remove(mergeRef(ws));
+    return { head, restored: restored.sort(), kept: kept.sort() };
+  });
 }

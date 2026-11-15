@@ -9,10 +9,12 @@ import type { ObjectId } from "@statewalker/vcs-core";
 import type { PushRefUpdate } from "@statewalker/vcs-transport";
 import { FolderChangedError, type SkippedPath } from "./folder-tree.js";
 import {
+  type ConflictMode,
   commitFolder,
   type GitWorkspace,
   type Integration,
   integrateCommit,
+  type MergeInProgress,
   runExclusive,
   workspaceHead,
 } from "./git-workspace.js";
@@ -32,7 +34,18 @@ export type SyncEvent =
   | { type: "push"; attempt: number; head: ObjectId; status: PushRefUpdate["status"] }
   | { type: "retry"; attempt: number; reason: string }
   | { type: "skipped"; attempt: number; paths: SkippedPath[] }
-  | { type: "rejoined"; attempt: number; paths: string[] };
+  | { type: "rejoined"; attempt: number; paths: string[] }
+  /**
+   * A merge with conflicts is in progress: `started` when this sync's merge stopped, false
+   * when the sync was refused because an earlier one is not concluded yet
+   */
+  | {
+      type: "conflicted";
+      attempt: number;
+      started: boolean;
+      theirs: ObjectId;
+      conflicts: string[];
+    };
 
 /** Options of {@link syncWorkspace}. */
 export interface SyncWorkspaceOptions {
@@ -44,6 +57,14 @@ export interface SyncWorkspaceOptions {
   signal?: AbortSignal;
   /** Each step as it happens */
   onEvent?: (event: SyncEvent) => void;
+  /**
+   * What a merge with conflicts does (default: the workspace's `onConflict`, itself `stop` by
+   * default): `stop` writes the merge result into the folder and stops, as git does, with
+   * nothing committed or pushed; `commit` commits the conflicts, pushes, and goes on
+   */
+  onConflict?: ConflictMode;
+  /** Files back from being ignored to commit as the folder holds them (see `commitWorkspaceChanges`) */
+  include?: string[];
 }
 
 /** What {@link syncWorkspace} did. */
@@ -52,14 +73,19 @@ export interface SyncWorkspaceResult {
   head?: ObjectId;
   /** Whether local changes were committed */
   committed: boolean;
-  /** How the remote's commits came in (the last round's) */
+  /**
+   * How the remote's commits came in (the last round's). `conflicted`: a merge with conflicts
+   * is in progress (`merge`), started by this sync or left by an earlier one; nothing was
+   * pushed, and syncs do nothing more until it is concluded or aborted
+   */
   integration: Integration["kind"];
   /** Whether the push moved the remote branch */
   pushed: boolean;
   /**
    * Paths merged with both sides kept (git's conflict markers in text files; the other side
-   * as `<path>.theirs-<id>` for binary ones): committed and pushed, for someone to resolve.
-   * Empty when the merge was clean.
+   * as `<path>.theirs-<id>` for binary ones), for someone to resolve: in the folder, with the
+   * merge in progress (`onConflict: "stop"`), or committed and pushed (`"commit"`). Empty when
+   * the merge was clean.
    */
   conflicts: string[];
   /** Rounds it took (more than one when the remote moved during a round) */
@@ -75,6 +101,8 @@ export interface SyncWorkspaceResult {
    * `ignore` changed): brought up to the branch, or merged where both sides changed
    */
   rejoined: string[];
+  /** The merge with conflicts in progress (`integration: "conflicted"`) */
+  merge?: MergeInProgress;
 }
 
 /** A sync that could not finish; the workspace and its repository are left consistent. */
@@ -111,9 +139,11 @@ function shouldRetry(update: PushRefUpdate): boolean {
 
 /**
  * Syncs the workspace with `remote`: commits the folder's changes, fetches the remote branch
- * into `refs/remotes/<remote.name>/<branch>`, integrates it (a fast-forward, or a merge commit
- * whose conflicts are kept in the files and reported, never resolved silently), and pushes the
- * branch. A push refused because the remote moved meanwhile (non-fast-forward, or a ref that
+ * into `refs/remotes/<remote.name>/<branch>`, integrates it (a fast-forward, or a merge commit),
+ * and pushes the branch. A merge with conflicts stops as git stops (the default,
+ * `onConflict: "stop"`): the conflicts are written into the folder, nothing is committed or
+ * pushed, and later syncs only report them until {@link concludeMerge} or {@link abortMerge}.
+ * With `onConflict: "commit"` the conflicts are committed in the files and pushed instead. A push refused because the remote moved meanwhile (non-fast-forward, or a ref that
  * changed under receive-pack's compare-and-swap) runs the round again, up to `maxAttempts`.
  *
  * Failures (an unreachable remote, a link cut mid-transfer, a push refused for another reason)
@@ -125,7 +155,7 @@ function shouldRetry(update: PushRefUpdate): boolean {
  * @example
  * ```ts
  * const result = await syncWorkspace(ws, httpRemote({ url: "https://example.com/notes.git" }));
- * if (result.conflicts.length > 0) console.warn("both sides kept in", result.conflicts);
+ * if (result.integration === "conflicted") console.warn("resolve, then concludeMerge:", result.conflicts);
  * ```
  */
 export function syncWorkspace(
@@ -166,9 +196,34 @@ async function syncRounds(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let local: Awaited<ReturnType<typeof commitFolder>>;
     try {
-      local = await commitFolder(ws, options.message ?? "Workspace changes");
+      local = await commitFolder(ws, options.message ?? "Workspace changes", {
+        include: options.include,
+      });
     } catch (error) {
       throw asSyncError("committing the folder failed", error);
+    }
+    if (local.merge) {
+      // a merge with conflicts in progress: nothing is fetched, merged or pushed until the
+      // user concludes it (or aborts it)
+      if (local.skipped.length > 0) emit({ type: "skipped", attempt, paths: local.skipped });
+      emit({
+        type: "conflicted",
+        attempt,
+        started: false,
+        theirs: local.merge.theirs,
+        conflicts: local.merge.conflicts,
+      });
+      return {
+        head: local.head,
+        committed: false,
+        integration: "conflicted",
+        pushed: false,
+        conflicts: [...new Set([...conflicts, ...local.merge.conflicts])].sort(),
+        attempts: attempt,
+        skipped: local.skipped,
+        rejoined: [...rejoined].sort(),
+        merge: local.merge,
+      };
     }
     for (const path of local.conflicts) conflicts.add(path);
     skipped = local.skipped;
@@ -199,6 +254,7 @@ async function syncRounds(
       try {
         integration = await integrateCommit(ws, theirs, {
           theirsName: `${remote.name}/${branchName}`,
+          onConflict: options.onConflict,
         });
       } catch (error) {
         if (!(error instanceof FolderChangedError)) {
@@ -217,6 +273,27 @@ async function syncRounds(
         head: integration.head,
         conflicts: integration.conflicts,
       });
+    }
+    if (integration.kind === "conflicted" && integration.merge) {
+      // stopped as git stops: the merge result is in the folder, nothing committed or pushed
+      emit({
+        type: "conflicted",
+        attempt,
+        started: true,
+        theirs: integration.merge.theirs,
+        conflicts: integration.merge.conflicts,
+      });
+      return {
+        head: await workspaceHead(ws),
+        committed,
+        integration: "conflicted",
+        pushed: false,
+        conflicts: [...conflicts].sort(),
+        attempts: attempt,
+        skipped,
+        rejoined: [...rejoined].sort(),
+        merge: integration.merge,
+      };
     }
 
     const head = await workspaceHead(ws);

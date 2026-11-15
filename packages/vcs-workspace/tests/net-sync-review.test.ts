@@ -194,14 +194,15 @@ describe("2. line merges keep every byte", () => {
   });
 
   it("conflict markers are git's, labelled with branch and commit", async () => {
-    const { res, bytes, pushed, b } = await conflictOrMerge(
+    const { res, bytes, pushed } = await conflictOrMerge(
       enc.encode("x\ny\n"),
       enc.encode("ann\ny\n"),
       enc.encode("bob\ny\n"),
     );
     expect(res.conflicts).toEqual(["f.txt"]);
-    const merge = await b.history.commits.load(res.head as string);
-    const ours = String(merge?.parents[0]).slice(0, 7);
+    // the merge stops (the default): ours is the branch tip the merge started from
+    expect(res.integration).toBe("conflicted");
+    const ours = String(res.merge?.head).slice(0, 7);
     const theirs = (pushed.head as string).slice(0, 7);
     expect(bytes.toString()).toBe(
       `<<<<<<< main (${ours})\nbob\n=======\nann\n>>>>>>> origin/main (${theirs})\ny\n`,
@@ -399,9 +400,10 @@ describe("7. a checkout cut short is finished, not committed as local edits", ()
     });
     await writeFile(b, "p.txt", "title by Bob\nbody\n");
     armed = true;
-    await expect(syncWorkspace(b, r())).rejects.toThrow(/disk full/);
+    // committed conflicts (onConflict: "commit"); the default is covered in net-sync-conflicts
+    await expect(syncWorkspace(b, r(), { onConflict: "commit" })).rejects.toThrow(/disk full/);
     armed = false;
-    const res = await syncWorkspace(b, r());
+    const res = await syncWorkspace(b, r(), { onConflict: "commit" });
     const text = await readFile(b, "p.txt");
     expect(text.match(/<<<<<<</g)).toHaveLength(1);
     expect(text).toContain("title by Ann");
