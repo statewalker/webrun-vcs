@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport-xet",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Hugging Face Xet read client (chunking, BLAKE3 hashes, xorbs, shards, reconstruction, CAS), plus the webrun-chunks LFS custom transfer",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

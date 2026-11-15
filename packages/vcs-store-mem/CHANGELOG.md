@@ -1,5 +1,39 @@
 # @statewalker/vcs-store-mem
 
+## 0.5.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+  - @statewalker/vcs-utils crosses a breaking line
+  - @statewalker/vcs-working-tree crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [875db86]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [01d2219]
+- Updated dependencies [3818fee]
+- Updated dependencies [3292f46]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [d45dfb0]
+  - @statewalker/vcs-working-tree@0.5.0
+  - @statewalker/vcs-utils@0.5.0
+  - @statewalker/vcs-core@0.5.0
+
 ## 0.4.0
 
 ### Minor Changes

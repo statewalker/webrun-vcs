@@ -1,5 +1,51 @@
 # @statewalker/vcs-store-kv
 
+## 0.5.0
+
+### Minor Changes
+
+- 875db86: **Clone and fetch leave what git leaves: remote and upstream configuration, `refs/remotes/<name>/HEAD`, `FETCH_HEAD`; shallow clones on the KV store. Breaking: `CloneCommand.setBranch` no longer implies `--single-branch`.**
+  
+  - **vcs-commands, `CloneCommand`:** writes the configuration `git clone` writes: `remote.<name>.url`, `remote.<name>.tagOpt = --no-tags` for `setNoTags()` and for a mirror (as git 2.49+, whose `--mirror` implies `--no-tags`), the `remote.<name>.fetch` refspec of the clone (`+refs/heads/*:refs/remotes/<name>/*`; one branch or tag for a single-branch clone; none for a bare clone; `+refs/*:refs/*` with `remote.<name>.mirror = true` for a mirror), and `branch.<b>.remote` / `branch.<b>.merge` for the checked-out branch (an empty remote's unborn branch included). `refs/remotes/<name>/HEAD` becomes a symbolic ref to the tracking ref of the remote's default branch when the clone took it. `setRemote(name)` (`--origin`) names the remote in all of it. The configuration is saved through the working copy's config (`.git/config` for the files backend), and native git reads it: `git status` shows the upstream and `git pull` works in our clone.
+  - **vcs-commands, breaking:** `CloneCommand.setBranch(b)` is git's `--branch`: every branch is still cloned and `b` (or a tag `b`, checked out detached) is set up. New `setSingleBranch(true)` (`--single-branch`) restricts the clone to it, as before; a shallow clone and `setBranchesToClone` (with `setCloneAllBranches(false)`) stay single-branch unless `setSingleBranch(false)`.
+  - **vcs-commands, `FetchCommand`:** writes `FETCH_HEAD` in git's format through the checkout (`<oid>\t[not-for-merge]\t<description>`, `branch 'main' of <url>`, `tag 'v1' of <url>`, the URL without credentials or `.git`), the refs to merge first: every ref of explicit refspecs, or with configured refspecs the current branch's `branch.<b>.merge` refs (fetched for this alone when no refspec takes them), or, when the current branch has no upstream at all, the first ref of an exact first refspec; a ref named twice without destination is listed twice; tags (auto-followed ones by name) and the rest are `not-for-merge`. Byte-identical to native `git fetch` for the same fetch. New `setAppend(true)` (`--append`) and `setWriteFetchHead(false)` (`--no-write-fetch-head`); FETCH_HEAD is truncated when the fetch starts (a failed fetch leaves it empty); a dry run writes nothing. Without `setTagOpt`, a configured remote's `remote.<name>.tagOpt` decides; a configured remote without `fetch` lines fetches the current branch's merge refs when it is that branch's upstream, else its HEAD only, as git (the default refspec is no longer filled in).
+  - **vcs-commands:** new `git.remoteSetHead()` (`RemoteSetHeadCommand`, `git remote set-head <name> <branch>` / `-d`). `fetch --prune` keeps `refs/remotes/<name>/HEAD` (a symbolic ref), as git.
+  - **vcs-transport:** `FetchClientResult.fetched` lists every remote ref a fetch took, with or without a local ref, in git's FETCH_HEAD order (refspec matches, then auto-followed tags: those of fetched or present objects first, then those found in the fetched history), each with the index of the refspec that selected it (`PlannedRef.refspec`). New `formatFetchHead`, `parseFetchHead`, `fetchHeadUrl` and `anonymizeUrl` (git's transport_anonymize_url).
+  - **vcs-working-tree:** `Checkout` has optional `readFetchHead()` / `writeFetchHead(content, { append })`; `MemoryCheckout` keeps it in memory.
+  - **vcs-store-files:** `GitCheckout` reads and writes `.git/FETCH_HEAD`.
+  - **vcs-store-kv:** `KVRefStore.getShallow()` / `setShallow(commits, expected)`, with the `expected` check of the other stores (one compare-and-swap of a `shallow:root` key), so shallow fetches and clones work on the KV store.
+- 01d2219: **Every ref and reflog write goes through git's locks; the unlocked writers are gone (breaking).** `vcs-store-files` no longer exports `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `deleteRef`, `updateRef` (`refs/ref-writer.ts`) or `appendReflog`, `deleteReflog` (`refs/reflog-writer.ts`, removed; `hasReflog` moved to `reflog-reader.ts`). They wrote loose refs and reflogs with plain writes. Use `FileRefStore` instead: `set`, `setSymbolic`, `remove`, `batch`, `compareAndSwap` and the new `deleteReflogEntry` all take `<ref>.lock` (and `packed-refs.lock` where git does), and a reflog line is appended while the ref's lock is held, as git does. A batch now also locks every symbolic ref that logs the update (not only HEAD), the updated ref first. As in git, a reflog line that cannot be written now fails the update before its commit (the ref keeps its value) instead of being skipped.
+  
+  **Stash as git keeps it.** `GitStashStore` (the files `WorkingCopy.stash`) writes `refs/stash` through the history's ref store: a push is a one-ref batch under `refs/stash.lock` that creates the reflog (git's REF_FORCE_CREATE_REFLOG) with the stash commit's message, a drop is `git reflog delete --rewrite --updateref refs/stash@{n}` under `refs/stash.lock` and `logs/refs/stash.lock`, and the last drop deletes the ref and its log. Messages follow git ("WIP on main: abc1234 subject", "On main: message", "index on main: …"), commit timestamps are seconds (they were milliseconds), and `list()` returns the reflog message. Native `git stash list` / `show` / `drop` work on our stashes and we read and drop git's. `GitStashStoreOptions` loses `files` and `gitDir` (and `StashFilesApi` is gone): the store needs only `history`. In `vcs-commands`, `stashCreate` logs every stash (a custom message becomes "On <branch>: <message>", a detached HEAD "(no branch)", as in git), `stashList` lists every `stash@{n}` from the reflog, `stashApply` resolves `stash@{n}`, and `stashDrop` drops any `stash@{n}` (stores without reflogs keep the old `stash@{0}`-only behaviour).
+  
+  **Pseudo refs and HEAD.** ORIG_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD and REVERT_HEAD are written and removed through the ref store (under `<name>.lock` on git files) by the merge, cherry-pick and revert state stores and by `GitCheckout`, which also reads them from its `refs`. `createGitFilesBackend({ create: true })` writes HEAD with `setSymbolic` (under `HEAD.lock`).
+  
+  **New core API.** `BatchOptions.createReflog` creates the updated refs' reflogs whatever their names. `Refs.deleteReflogEntry(name, index, { rewrite, updateRef })` (optional) deletes `name@{index}`; it is implemented by the memory, KV, SQL and git-files stores. `deleteReflogLine` and `ReflogEntryNotFoundError` are exported from `vcs-core`.
+
+### Patch Changes
+
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [875db86]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [01d2219]
+- Updated dependencies [3818fee]
+- Updated dependencies [3292f46]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [d45dfb0]
+  - @statewalker/vcs-working-tree@0.5.0
+  - @statewalker/vcs-utils@0.5.0
+  - @statewalker/vcs-core@0.5.0
+
 ## 0.4.0
 
 ### Minor Changes

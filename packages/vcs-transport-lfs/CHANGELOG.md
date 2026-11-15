@@ -1,5 +1,23 @@
 # @statewalker/vcs-transport-lfs
 
+## 0.4.0
+
+### Minor Changes
+
+- f474fe0: **Runs on webrun-wire's current lines: `@statewalker/webrun-streams` ^0.6, `@statewalker/webrun-http-streams` ^0.8, and (for vcs-transport-xet) `@statewalker/webrun-content-transfer` ^0.4.**
+  
+  The dependency ranges cross breaking lines, so an application that also depends on webrun-streams or webrun-http-streams moves with them to keep one copy. The transport code is unchanged: it already used the current names (no misspelt aliases), and the `Duplex`, `fetchOverDuplex` / `serveFetchOverDuplex` and `FetchHandler` it uses keep their shape.
+
+### Patch Changes
+
+- Updated dependencies [7d77bf8]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+  - @statewalker/vcs-utils@0.5.0
+
 ## 0.3.0
 
 ### Minor Changes

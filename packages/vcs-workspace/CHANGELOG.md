@@ -1,5 +1,79 @@
 # @statewalker/vcs-workspace
 
+## 0.5.0
+
+### Minor Changes
+
+- d45dfb0: **Links only through the FilesApi contract; checkout keeps local changes as git; workspace sync records links as 120000 entries.**
+  
+  - **vcs-utils:** the `PosixFilesApi` contract is spelled out (links, beneath-link refusal, modes, `pathSeparators`, case folding) and gains `refusesBeyondLinks` and `openLinkTarget`. New portable `createSymlinkFilesApi(base, { pathSeparators, ignoreCase, precomposeUnicode, defaultFileMode })`: simulated links and permission bits over any FilesApi, kept in a side table in the reserved hidden file `/.webrun-symlinks.json` (`SYMLINK_TABLE_PATH`), with simulated case and Unicode folding for tests. New `createMountedFilesApi(base, mounts)` and `createSubtreeFilesApi(base, root)`, passing the link operations through. All re-exported by vcs-core.
+  - **vcs-utils-node:** `PosixNodeFilesApi.write` replaces files with webrun-files' `replaceFile` semantics (Windows retry on EPERM/EACCES/EBUSY; in-place copy over a mount point or across devices, never through a link) and `writeBatched` (short writes repeated, small chunks batched); `createExclusive` too. `chmod` masks with `0o777` (no setuid/setgid/sticky) and works on a descriptor opened without following links. `read` opens with `O_NOFOLLOW | O_NONBLOCK` and checks the descriptor is a regular file (a FIFO is never read). New `openLinkTarget` (a FilesApi at a link's target, for a `.git` linked elsewhere). Directories verified as not-links are cached per instance (cleared on its own removes and moves), and `list` streams in path order (`listInPathOrder`) instead of buffering the tree. New dependency on `@statewalker/webrun-files`.
+  - **vcs-store-files:** a `.git` or `.git/objects` that is a symbolic link is followed as git follows it: `resolveLinkedGitDir(files, gitDir)` resolves it through the FilesApi (`openLinkTarget`, or `readlink` within it) and mounts the target; `createGitFilesBackend` uses it. Ref, packed-refs and reflog readers rethrow `BeyondSymlinkError` instead of reading "no ref" (an empty repository). `FileWorktree` skips its own leading-component checks over a FilesApi with `refusesBeyondLinks`, and a forced write (`replaceInTheWay`) also removes an untracked directory where a file must go.
+  - **vcs-commands:**
+    - **Breaking (behaviour):** a branch checkout without `setForced` is git's two-way merge: a path HEAD and the target agree on keeps its index entry and worktree file (unstaged edits survive); a path they differ on is switched only when index and worktree hold HEAD's version; otherwise the checkout is refused (`status` CONFLICTS, new `CheckoutResult.message` with git's text: "Your local changes to the following files would be overwritten by checkout", "The following untracked working tree files would be overwritten by checkout", "you need to resolve your current index first"). A plain checkout between identical trees no longer rewrites the worktree; `setForced(true)` does, as `git checkout -f`.
+    - With `core.ignorecase`, files differing only in case are both checked out (the last wins) and reported in the new `CloneResult.collidedPaths`, as git's "the following paths have collided" warning; only a path beneath a file, link or submodule of another case is refused.
+    - `stash apply` writes with `replaceInTheWay`, as `reset --hard` does.
+    - `InitCommand` resolves a linked `.git` as clone does.
+  - **vcs-workspace (behaviour change):** a symbolic link in a synced folder is recorded as a mode 120000 entry whose content is its target (never followed), as git records it, instead of being skipped (which made peers delete it); written back as a link where the folder's FilesApi can make one, else as a file holding the target (git's `core.symlinks=false`). An `lstat` error fails the walk instead of dropping the file. Special files stay skipped (`special-file`). `FolderFile.link`, `WalkedFile.link`, `folderHasSymlinks`; the `symbolic-link` skip reason is gone.
+- d45dfb0: **Breaking: no operation follows a symbolic link; git's Windows path rules on Windows worktrees; the core CheckoutCommand is gone.**
+  
+  - **vcs-core:** `isValidWorktreePath(path, mode?, { windows? })` / `assertValidWorktreePath`: with `windows: true` (a worktree on Windows) git's Windows rules apply too, as its `verify_path` built for Windows: `\` refused (CVE-2019-1354, `d\post-checkout` would land inside `d`), and `is_valid_win32_path` (drive prefix, control characters and `<>:"|?*`, components ending in a space or a dot, reserved device names `CON`, `NUL`, `COM1`, `LPT1`, `CONIN$`...). Without it `a\b.txt` is an ordinary file name, as git on Linux and macOS; `.git` behind a backslash (`.git\x`) is still refused everywhere (git's `is_ntfs_dotgit`). New `WorktreePathOptions`. New `isGitWorktreeFile(component, "gitmodules" | "gitattributes" | "gitignore" | "mailmap")` (git's `is_hfs_dot*` / `is_ntfs_dot*`, with the NTFS fallback short names `gi7eba~N`, `gi7d29~N`, `gi250a~N`, `maba30~N`); a symlinked `.gitmodules` is refused under all of them.
+  - **vcs-utils:** new `BeyondSymlinkError` / `isBeyondSymlinkError`; `PosixFilesApi.lstat` throws it for a path beneath a link (never "absent"). New optional `PosixFilesApi.pathSeparators` (`"/\\"` on Windows).
+  - **vcs-utils-node:** `PosixNodeFilesApi` (from `createNodeFilesApi`) never follows a link in any operation: read, write, createExclusive, mkdir, list (recursive too), stats, exists, remove, move, copy, chmod, symlink, lstat, readlink all refuse a path beneath a link (`BeyondSymlinkError`; `exists` answers false). A link at the path is a link: listed and stat'ed with its own size, read as nothing, never listed into, replaced by a write (new file written beside it and renamed over the link itself; a regular file it replaces passes on its permission bits, so a new file gets a new inode), unlinked by remove, copied and moved as a link. Directories are created without following a linked component. On Windows (`platform` option, default `process.platform`) a `\` in a path is refused and `pathSeparators` is `"/\\"` (`"/"` elsewhere).
+  - **vcs-store-files:**
+    - `FileWorktree` no longer chmods to fixed bits: an executable gets x where r is set (`mode | ((mode & 0o444) >> 2)`) and a regular file loses x, from the file's own mode, so the umask holds.
+    - `readContent` / `computeHash` refuse a path beneath a link; `getEntry` / `exists` report it absent; `remove` of it returns false (git's `has_symlink_or_noent_leading_path`).
+    - New `WorktreeWriteOptions.replaceInTheWay` (forced checkout: a file or link where a parent directory must go is unlinked, as git's `create_directories` with force).
+    - FIFOs, sockets and devices are skipped by `walk` and are no `getEntry`.
+    - New `probeCaseFolding(files, gitDir)` / `FileWorktree.probeCaseFolding()` (git init's `CoNfIg` and NFC/NFD probes; only over a FilesApi with `lstat`).
+    - `GitResolutionStore` reads and writes worktree files through a `FileWorktree` (new optional `worktree` constructor argument): a link is staged as a link by `markAllResolved` and replaced, not written through, by `acceptOurs` / `acceptTheirs` / `applyRecordedResolution`.
+  - **vcs-working-tree:** `Worktree.probeCaseFolding?()`; `WorktreeWriteOptions.replaceInTheWay`; `WorktreeCapabilities.windowsPaths?` (set by `FileWorktree` from its FilesApi's `pathSeparators`: checkout and the restore plans, via `planTreeRestore`'s new `windows` option, then apply git's Windows path rules).
+  - **vcs-commands:**
+    - Removed the unexported core `CheckoutCommand` (`core-commands/checkout.command*.ts`), which wrote and deleted through raw FilesApi calls; nothing used it.
+    - The porcelain `CheckoutCommand` writes a branch checkout through the restore plan, worktree first: paths verified and collisions refused before writing, tracked files the target drops removed, links written as links (or files holding the target), executables, an empty directory per submodule; then HEAD and the index.
+    - `reset --hard` and `stash apply` restore symbolic links (as links, or as files holding the target where the worktree or `core.symlinks` cannot have them) instead of refusing them; deletions go first; `reset --hard` unlinks a file or link where a directory must go.
+    - `writeTreeRestorePlan` takes `{ symlinks, replaceInTheWay, gitlinks }`.
+    - `CloneCommand` and `InitCommand` write `core.ignorecase = true` / `core.precomposeunicode = true` when the probe finds the filesystem folds case or Unicode composition (git writes each only then on Linux; on macOS it also writes `precomposeunicode = false`, which we do not).
+  - **vcs-workspace:** `walkFolder` / `snapshotFolder` never read or descend a symbolic link or a special file (over a FilesApi with `lstat`, e.g. `createNodeFilesApi`): they are listed in the new `FolderWalk.special` and reported as skipped with the new reasons `symbolic-link` / `special-file`.
+- 3292f46: **upload-pack honours `include-tag` and negotiates over v0 as git does, both servers hide refs as git's `hideRefs`, upload-pack gets hooks, and the fetch client gzips large requests.**
+  
+  - **vcs-transport, v0 negotiation (fix):** upload-pack answers haves exactly as git's `get_common_commits`: `ACK <oid> common` / `continue` / `ready` while a batch is read (`ready` also without no-done, once every want reaches a common commit), NAK at the end of every batch in the multi_ack modes, the final `ACK <oid>` on `done`, and with no-done after `ready` NAK and the final ACK before the pack. Before, a batch that found a common commit was answered without NAK, and a later batch with nothing new got no answer: our fetch client failed with "Expected ACK/NAK, got a flush" and native git with "expected ACK/NAK, got '?PACK'" (a stale remote-tracking ref plus many local commits over v0). In single-ack mode the server now waits for `done` after its ACK, as git. `multi_ack` is advertised again (git advertises both `multi_ack` and `multi_ack_detailed`).
+  
+  - **vcs-core:** `listObjects` takes `includeTags` (candidate tag ids) and `ExportOptions.includeTags` passes it from `SerializationApi.exportPack`: as `git pack-objects --include-tag`, each annotated tag peeling to a packed object is added after the other objects, with every tag of its chain. Only tag objects are read: a listed target, a lightweight tag of a listed object and an object the walk met cost no read.
+  - **vcs-transport, include-tag:** upload-pack (v0/v1 and v2) adds the annotated tags of packed objects when the client asks for `include-tag`, so a client no longer needs a second fetch to backfill them. The candidates are the visible `refs/tags/*` (a hidden tag is never sent; git's pack-objects ignores hideRefs). `ExportPackOptions.includeTags` carries them to the facade; `includeTag: true` without it uses the facade's own `refs/tags/*` (both `createRepositoryFacade` and vcs-transport-adapters' `VcsRepositoryFacade`).
+  - **vcs-transport, hidden refs:** new `hideRefs` (git's `transfer.hideRefs`) on `serveOverDuplex`, `createHttpHandler`, `createGitHttpServer`, `createFetchHandler` and `messagePortServe`, plus upload-pack's (`uploadPack.hideRefs` / `uploadPackHideRefs`, git's `uploadpack.hideRefs`) and receive-pack's (`receivePack.hideRefs` / `receivePackHideRefs`, git's `receive.hideRefs`), with git's pattern rules (`isRefHidden`: component prefixes, `!` negation, `^` full names, last match wins). Hidden refs are left out of the v0 advertisements and v2 `ls-refs`; a want of a hidden tip is `not our ref` under the "ADVERTISED" policy ("TIP" and the reachable policies count hidden tips, as git's `allow*SHA1InWant`); a v2 `want-ref` of one is `unknown ref <name>`; receive-pack refuses changing one (`deny updating a hidden ref`, `deny deleting a hidden ref`) after the connectivity check, as git. `handleGitSocketConnection` passes the hidden refs and both services' hooks through. **Hiding refs is not access control**, as in git: hidden history stays fetchable by id under the "ANY" (v2's default), "TIP" and reachable policies, and HEAD naming a hidden branch is still advertised.
+  - **vcs-transport, upload-pack hooks:** new `UploadPackHooks` (`uploadPack.hooks` on the HTTP handlers, `uploadPackHooks` on `serveOverDuplex`, `hooks` on `messagePortServe`): `authorize(request, ctx)` sees the wants, every ref whose tip they name (hidden ones included), the `want-ref`s, the haves of a v2 request, a copy of the capabilities and the shallow/deepen arguments (`depth`, `deepenSince`, `deepenNot`, `filter`) before any negotiation or pack byte, and may refuse with `ERR <message>`; it runs on every request, so once per round over stateless HTTP. A want need not be a tip (a parent under "ANY" or the reachable policies), so a hook guarding refs must check reachability or keep "ADVERTISED". `postUpload(result, ctx)` runs detached once a pack was sent.
+  - **vcs-transport, v2:** `ls-refs peel` fully peels a chain of tags (was one level); an unknown `want-ref` reads git's `unknown ref <name>` (was `Unknown ref: <name>`).
+  - **vcs-transport, fetch client:** upload-pack request bodies over 1024 bytes (large have-batches) are sent with `Content-Encoding: gzip`, as git's remote-curl, where `CompressionStream` exists. `gzipRequests: false` (`fetch`, `openHttpConnection`) turns it off, for browsers behind a CORS proxy that does not allow `Content-Encoding` (not a CORS-safelisted header).
+  - **vcs-commands:** `TransportCommand.setGzipRequests(false)` passes that to the fetch and clone commands.
+  - **vcs-workspace:** `createSyncServer` takes `hideRefs` and `uploadPackHooks`.
+
+### Patch Changes
+
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [875db86]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [01d2219]
+- Updated dependencies [3818fee]
+- Updated dependencies [3292f46]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [7d77bf8]
+- Updated dependencies [f474fe0]
+- Updated dependencies [d45dfb0]
+  - @statewalker/vcs-working-tree@0.5.0
+  - @statewalker/vcs-utils@0.5.0
+  - @statewalker/vcs-transport@0.5.0
+  - @statewalker/vcs-core@0.5.0
+
 ## 0.4.0
 
 ### Minor Changes
