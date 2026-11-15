@@ -695,3 +695,54 @@ describeGit(
     });
   },
 );
+
+describeGit("Interop · native git push of a large pack refused per ref", { timeout: 90000 }, () => {
+  afterEach(() => {
+    for (const child of children) child.kill("SIGKILL");
+    children.clear();
+  });
+
+  it("authorize refusing every ref after the head: git reads its report (the body is drained)", async () => {
+    const root = makeTmpDir("vcs-interop-rp-big-");
+    try {
+      const repo = await createTransportRepo();
+      const importSpy = vi.fn(repo.facade.importPack.bind(repo.facade));
+      repo.facade.importPack = importSpy;
+      const server = await serveFetchHandler(
+        createFetchHandler({
+          resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+          receivePack: {
+            hooks: {
+              authorize: (commands) => ({
+                ok: false,
+                message: "read-only branch",
+                rejectedRefs: commands.map((c) => c.refName),
+              }),
+            },
+          },
+        }),
+      );
+      try {
+        git(root, ["init", "-q", "--initial-branch=main", "w"]);
+        const work = join(root, "w");
+        writeFileSync(join(work, "big.bin"), randomBytes(16 * 1024 * 1024));
+        git(work, ["add", "big.bin"]);
+        git(work, ["commit", "-q", "-m", "big"]);
+        const r = await gitAsync(work, [
+          "-c",
+          "http.postBuffer=1048576",
+          "push",
+          `${server.baseUrl}/repo.git`,
+          "main:main",
+        ]);
+        expect(r.code).not.toBe(0);
+        expect(r.stderr).toMatch(/\[remote rejected\]\s+main -> main \(read-only branch\)/);
+        expect(importSpy).not.toHaveBeenCalled();
+      } finally {
+        await server.close();
+      }
+    } finally {
+      cleanupDir(root);
+    }
+  });
+});

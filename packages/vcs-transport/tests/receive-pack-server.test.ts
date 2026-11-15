@@ -447,3 +447,84 @@ function countReads(facade: Awaited<ReturnType<typeof createTransportRepo>>["fac
   };
   return reads;
 }
+
+describe("receive-pack: review fixes", () => {
+  it("deleting an existing ref with the zero id as old value deletes it (git warns)", async () => {
+    const { repo, c2 } = await serverRepo();
+    await repo.refStore.update("refs/heads/a", c2);
+    const run = await runReceivePack(repo, {
+      commands: [`${ZERO} ${ZERO} refs/heads/a`],
+      caps: "report-status delete-refs side-band-64k",
+    });
+    expect(run.report).toEqual(["unpack ok", "ok refs/heads/a"]);
+    expect(run.messages).toContain("warning: allowing deletion of corrupt ref");
+    expect(await repo.refStore.get("refs/heads/a")).toBeUndefined();
+    // the deletion rules still hold: the current branch stays
+    const current = await runReceivePack(repo, {
+      commands: [`${ZERO} ${ZERO} refs/heads/main`],
+      caps: "report-status delete-refs",
+    });
+    expect(current.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/main deletion of the current branch prohibited",
+    ]);
+    expect(await repo.refStore.get("refs/heads/main")).toBe(c2);
+  });
+
+  it("shallowUpdate records only the shallow commits the refs do not reach already", async () => {
+    const { repo, c2 } = await serverRepo();
+    const recorded: string[][] = [];
+    repo.facade.updateShallow = async (oids) => {
+      recorded.push(oids);
+    };
+    const { client, commits } = await clientWithNewCommits(1);
+    const n0 = commits[0] as string;
+    // the client is shallow at c2, which the server has with its history
+    const run = await runReceivePack(
+      repo,
+      {
+        shallow: [c2],
+        commands: [`${c2} ${n0} refs/heads/main`],
+        pack: await fullPackOf(client, [n0], [c2]),
+      },
+      { shallowUpdate: true },
+    );
+    expect(run.report).toEqual(["unpack ok", "ok refs/heads/main"]);
+    expect(recorded).toEqual([]);
+  });
+
+  it("a facade that is not bare protects its checked-out branch", async () => {
+    const { repo, c1, c2 } = await serverRepo();
+    repo.facade.isBare = () => false;
+    const run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/main`], pack: await packOf(repo, []) },
+      { allowNonFastForward: true },
+    );
+    expect(run.report).toEqual(["unpack ok", "ng refs/heads/main branch is currently checked out"]);
+  });
+
+  it("an explicit currentBranch keeps its protection unless bare is set", async () => {
+    const { repo, c1, c2 } = await serverRepo();
+    const empty = await packOf(repo, []);
+    let run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/main`], pack: empty },
+      { allowNonFastForward: true, currentBranch: "refs/heads/main" },
+    );
+    expect(run.report).toEqual(["unpack ok", "ng refs/heads/main branch is currently checked out"]);
+    run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/main`], pack: empty },
+      { allowNonFastForward: true, currentBranch: "refs/heads/main", bare: true },
+    );
+    expect(run.report).toEqual(["unpack ok", "ok refs/heads/main"]);
+  });
+
+  it("createRepositoryFacade tells its bareness", async () => {
+    const { createRepositoryFacade } = await import("../src/index.js");
+    const { repo } = await serverRepo();
+    expect(createRepositoryFacade({ history: repo.history }).isBare?.()).toBe(true);
+    expect(createRepositoryFacade({ history: repo.history, bare: false }).isBare?.()).toBe(false);
+  });
+});

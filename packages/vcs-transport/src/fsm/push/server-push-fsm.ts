@@ -34,7 +34,7 @@ import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
-import { checkConnectivity, findNewCommits } from "./connectivity.js";
+import { isAncestorOf, PushConnectivity } from "./connectivity.js";
 import {
   DEFAULT_MAX_PUSH_COMMANDS,
   DEFAULT_RECEIVE_KEEP_ALIVE_MS,
@@ -127,6 +127,9 @@ export const RECEIVE_PACK_CAPABILITIES: readonly string[] = [
 ];
 
 const OID = /^[0-9a-f]{40}$/;
+
+/** The reason given for every command when the authorize hook throws (details: the log). */
+const AUTHORIZE_FAILED = "authorization failed";
 
 /** git's report-status texts. */
 const FAILED_TO_UPDATE = "failed to update ref";
@@ -309,9 +312,20 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         const hook = receivePackHooks(ctx)?.authorize;
         if (hook) {
           const commands = state.pushCommands ?? [];
-          const verdict = normalizeVerdict(
-            await hook(commands.map(toReceiveCommand), hookContext(ctx)),
-          );
+          let verdict: ReturnType<typeof normalizeVerdict>;
+          try {
+            verdict = normalizeVerdict(
+              await hook(commands.map(toReceiveCommand), hookContext(ctx)),
+            );
+          } catch (e) {
+            // the details go to the server's log, never to the client
+            logError(ctx, "authorize hook failed", e);
+            if (rp.authorizeFailure === "fatal") {
+              output.error = AUTHORIZE_FAILED;
+              return "ERROR";
+            }
+            verdict = { ok: false, message: AUTHORIZE_FAILED };
+          }
           if (!verdict.ok) {
             const reason = oneLine(verdict.message ?? "") || "not authorized";
             if (!verdict.rejectedRefs && rp.authorizeFailure === "fatal") {
@@ -351,7 +365,10 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         }
         // Every command needing the pack refused: nothing of it is stored
         if (!commands.some((cmd) => cmd.type !== "DELETE" && cmd.result === "NOT_ATTEMPTED")) {
-          if (receivePackConfig(ctx).drainRefusedPack) {
+          const rp = receivePackConfig(ctx);
+          if (rp.drainRefusedPack && rp.discardPack) {
+            await rp.discardPack();
+          } else if (rp.drainRefusedPack) {
             try {
               for await (const _ of transport.readRawPack()) {
                 // discarded
@@ -416,42 +433,32 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
         // The client's shallow commits we now have: a push whose new history ends there
         // would leave the repository with missing parents (git's update_shallow_info)
-        const theirs: string[] = [];
+        const theirs = new Set<string>();
         for (const oid of state.pushShallow ?? []) {
-          if (await repository.has(oid)) theirs.push(oid);
+          if (await repository.has(oid)) theirs.add(oid);
         }
-        let graft: Set<string> | undefined;
-        if (theirs.length > 0) {
-          const shallowSet = new Set(theirs);
-          if (rp.shallowUpdate && repository.updateShallow) {
-            graft = shallowSet;
-            state.acceptedShallow = theirs;
-          } else {
-            for (const cmd of pending()) {
-              if (!(await isCommit(ctx, cmd.newOid))) continue;
-              const found = await findNewCommits(repository, [cmd.newOid], known, {
-                shallow: shallowSet,
-              });
-              if ("commits" in found && found.commits.some((c) => shallowSet.has(c))) {
-                reject(cmd, "shallow update not allowed");
-              }
-            }
-          }
-        }
+        const shallowAllowed = rp.shallowUpdate === true && !!repository.updateShallow;
 
         const tips = [...new Set(pending().map((c) => c.newOid))];
         if (tips.length === 0) return "CONNECTIVITY_OK";
-        // One walk for the push; only when it fails, one per tip to name the broken refs
-        const result = await checkConnectivity(repository, tips, known, { shallow: graft });
-        await sendProgress(ctx, `Checking connectivity: ${result.objects}, done.\n`);
-        if (result.ok) return "CONNECTIVITY_OK";
+        // One analysis for the push: the shallow commits are grafts (git's shallow file), each
+        // ref's verdict is read off the new history without walking again
+        const conn = new PushConnectivity(repository, known, { shallow: theirs });
+        await conn.analyze(tips);
+        await sendProgress(ctx, `Checking connectivity: ${conn.objects}, done.\n`);
+        let failed = false;
         for (const cmd of pending()) {
-          const one = await checkConnectivity(repository, [cmd.newOid], known, { shallow: graft });
-          if (!one.ok) {
+          const verdict = conn.verdict(cmd.newOid);
+          if (verdict.reachesShallow && !shallowAllowed) {
+            reject(cmd, "shallow update not allowed");
+          } else if (!verdict.ok) {
             cmd.result = "REJECTED_MISSING_OBJECT";
             cmd.message = "missing necessary objects";
+            failed = true;
           }
         }
+        if (shallowAllowed && theirs.size > 0) state.shallowConnectivity = conn;
+        if (!failed) return "CONNECTIVITY_OK";
         return "CONNECTIVITY_FAILED";
       } catch (e) {
         return internalError(ctx, e);
@@ -476,7 +483,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         verdict = normalizeVerdict(await hook(open.map(toReceiveCommand), hookContext(ctx)));
       } catch (e) {
         logError(ctx, "pre-receive hook failed", e);
-        verdict = { ok: false, message: e instanceof Error ? e.message : String(e) };
+        await sendError(ctx, "pre-receive hook error");
+        verdict = { ok: false };
       }
       if (verdict.ok) return "HOOK_OK";
 
@@ -516,13 +524,17 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const repository = getRepository(ctx);
       try {
         const atomic = state.capabilities.has("atomic");
-        // An accepted shallow push records the client's boundary before its refs move
-        if (state.acceptedShallow && repository.updateShallow) {
+        // An accepted shallow push records the client's boundary before its refs move: only
+        // the shallow commits the new history of the refs still accepted ends at (git's
+        // delayed_reachability_test), not those the existing refs already reach
+        if (state.shallowConnectivity && repository.updateShallow) {
           const all = state.pushCommands ?? [];
           const blocked = atomic && all.some((c) => c.result !== "NOT_ATTEMPTED");
-          if (!blocked && all.some((c) => c.result === "NOT_ATTEMPTED" && c.type !== "DELETE")) {
-            await repository.updateShallow(state.acceptedShallow);
-          }
+          const tips = all
+            .filter((c) => c.result === "NOT_ATTEMPTED" && c.type !== "DELETE")
+            .map((c) => c.newOid);
+          const reached = blocked ? [] : state.shallowConnectivity.shallowReachedFrom(tips);
+          if (reached.length > 0) await repository.updateShallow(reached);
         }
         return await applyUpdates(state, refStore, atomic);
       } catch (e) {
@@ -607,8 +619,8 @@ interface ServerPushState extends ProtocolState {
   appliedCommands?: PushCommand[];
   /** The client's `shallow` lines */
   pushShallow?: string[];
-  /** Shallow commits recorded for an accepted shallow push */
-  acceptedShallow?: string[];
+  /** The connectivity analysis of an accepted shallow push (which shallow commits to record) */
+  shallowConnectivity?: PushConnectivity;
   /** The unpack status when not "ok" */
   unpackStatus?: string;
   /** Side-band writes besides the FSM's own (keep-alive, messages), in order */
@@ -768,11 +780,6 @@ async function objectType(ctx: ProcessContext, oid: string): Promise<string | un
   return (await repository.has(oid)) ? "unknown" : undefined;
 }
 
-async function isCommit(ctx: ProcessContext, oid: string): Promise<boolean> {
-  const type = await objectType(ctx, oid);
-  return type === "commit" || type === "unknown";
-}
-
 /** The checks of git's `update()`, per command, then the update hook. */
 async function validateCommands(ctx: ProcessContext): Promise<void> {
   const state = getState<ServerPushState>(ctx);
@@ -783,7 +790,15 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   const commands = state.pushCommands ?? [];
   const atomic = state.capabilities.has("atomic");
 
-  const bare = rp.bare ?? (repository.isBare ? await repository.isBare() : true);
+  // bareness: the option, else a caller naming the checked-out branch means a working tree
+  // (its protection is never dropped silently), else the facade, else bare
+  const bare =
+    rp.bare ??
+    (config.currentBranch !== undefined
+      ? false
+      : repository.isBare
+        ? await repository.isBare()
+        : true);
   const head = config.currentBranch ?? (await refStore.getSymrefTarget?.("HEAD"));
   const denyCurrentBranch = config.denyCurrentBranch ?? true;
   const denyDeleteCurrent = rp.denyDeleteCurrent ?? true;
@@ -831,7 +846,13 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
       continue;
     }
 
-    if (isDelete && cmd.oldOid !== ZERO_OID) {
+    // git deletes an existing ref even when the client sent the zero id as its old value
+    // ("allowing deletion of corrupt ref"); the deletion rules still apply here
+    const existing = state.refs.get(name);
+    if (isDelete && cmd.oldOid === ZERO_OID && existing !== undefined) {
+      cmd.expectedOid = existing;
+    }
+    if (isDelete && (cmd.oldOid !== ZERO_OID || existing !== undefined)) {
       if (config.allowDeletes === false && name.startsWith("refs/heads/")) {
         await sendError(ctx, `denying ref deletion for ${name}`);
         cmd.result = "REJECTED_NODELETE";
@@ -846,8 +867,12 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
       }
     }
 
+    if (cmd.expectedOid !== undefined) {
+      await sendMessage(ctx, "warning: allowing deletion of corrupt ref");
+    }
+
     // the old value the client saw (git's ref transaction checks it)
-    const current = state.refs.get(name) ?? ZERO_OID;
+    const current = existing ?? ZERO_OID;
     if (cmd.oldOid !== current && !(isDelete && cmd.oldOid === ZERO_OID)) {
       await sendError(
         ctx,
@@ -907,7 +932,8 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         verdict = normalizeVerdict(await hook(name, cmd.oldOid, cmd.newOid, hookContext(ctx)));
       } catch (e) {
         logError(ctx, `update hook failed for ${name}`, e);
-        verdict = { ok: false, message: e instanceof Error ? e.message : String(e) };
+        await sendError(ctx, "update hook error");
+        verdict = { ok: false };
       }
       if (!verdict.ok) {
         if (verdict.message) await sendMessage(ctx, verdict.message);
@@ -919,24 +945,20 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
 }
 
 /** Whether `ancestor` is reachable from `oid` through parents. */
-async function isAncestor(ctx: ProcessContext, ancestor: string, oid: string): Promise<boolean> {
-  const repository = getRepository(ctx);
-  for await (const commit of repository.walkAncestors(oid)) {
-    if (commit === ancestor) return true;
-  }
-  return false;
+function isAncestor(ctx: ProcessContext, ancestor: string, oid: string): Promise<boolean> {
+  return isAncestorOf(getRepository(ctx), ancestor, oid);
 }
 
 /** A delete of a ref that does not exist: nothing to do, reported ok (git warns). */
 function isNoop(cmd: PushCommand): boolean {
-  return cmd.oldOid === ZERO_OID && cmd.newOid === ZERO_OID;
+  return cmd.oldOid === ZERO_OID && cmd.newOid === ZERO_OID && cmd.expectedOid === undefined;
 }
 
 /** The batch command for a push command; git's zero id means "absent" on both sides. */
 function toRefCommand(cmd: PushCommand): RefCommand {
   return {
     name: cmd.refName,
-    old: cmd.oldOid === ZERO_OID ? null : cmd.oldOid,
+    old: cmd.expectedOid ?? (cmd.oldOid === ZERO_OID ? null : cmd.oldOid),
     new: cmd.newOid === ZERO_OID ? null : cmd.newOid,
     noDeref: true, // receive-pack names refs directly, as git does
   };

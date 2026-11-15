@@ -34,6 +34,11 @@ export interface VcsRepositoryFacadeConfig {
   history: History;
   /** Serialization API for pack operations */
   serialization: SerializationApi;
+  /**
+   * Whether the repository has no working tree (default true). receive-pack refuses to
+   * update the checked-out branch of a non-bare one ("branch is currently checked out").
+   */
+  bare?: boolean;
 }
 
 /**
@@ -45,10 +50,17 @@ export interface VcsRepositoryFacadeConfig {
 export class VcsRepositoryFacade implements RepositoryFacade {
   private readonly history: History;
   private readonly serialization: SerializationApi;
+  private readonly bare: boolean;
 
   constructor(config: VcsRepositoryFacadeConfig) {
     this.history = config.history;
     this.serialization = config.serialization;
+    this.bare = config.bare ?? true;
+  }
+
+  /** Whether the repository has no working tree (receive-pack's current-branch rule). */
+  isBare(): boolean {
+    return this.bare;
   }
 
   /**

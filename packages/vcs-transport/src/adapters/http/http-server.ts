@@ -43,8 +43,8 @@ import {
 } from "../../fsm/push/server-push-fsm.js";
 import { ZERO_OID } from "../../protocol/constants.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
-import { withIdleTimeout } from "../../utils/idle-timeout.js";
-import { createSimpleDuplex, readableStreamToAsyncIterable } from "./http-duplex.js";
+import { readStreamWithIdleTimeout } from "../../utils/idle-timeout.js";
+import { createSimpleDuplex } from "./http-duplex.js";
 
 /**
  * HTTP request information needed by handlers.
@@ -805,8 +805,9 @@ export async function handleReceivePack(
     { highWaterMark: 0 },
   );
   const out = pipe.writable.getWriter();
-  const body = withIdleTimeout(
-    readableStreamToAsyncIterable(input.body),
+  // one reader for the whole body: a stalled read cancels it, a refused pack is drained
+  const body = readStreamWithIdleTimeout(
+    input.body,
     rp.idleTimeoutMs ?? DEFAULT_RECEIVE_PACK_IDLE_TIMEOUT_MS,
   );
   const duplex = createSimpleDuplex(body, (data) => out.write(data));
@@ -841,7 +842,10 @@ export async function handleReceivePack(
       repoPath: context.repoPath,
       // a push refused as a whole is a 403, its body unread
       authorizeFailure: "fatal",
-      drainRefusedPack: false,
+      // a pack refused once the head is out is read and dropped (at most the body limit):
+      // a client cut off mid-upload would never see the report
+      drainRefusedPack: true,
+      discardPack: () => body.discard(),
       onAuthorized: () => authorized?.(),
       afterReport: (task) => afterReport.push(task),
     },

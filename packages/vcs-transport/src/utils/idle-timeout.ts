@@ -13,8 +13,11 @@ export class IdleTimeoutError extends Error {
 
 /**
  * `source`, failing with {@link IdleTimeoutError} when one chunk takes longer than `ms` to
- * come. `ms <= 0` (or undefined) returns `source` unchanged. The source is closed (`return`)
- * on a timeout.
+ * come. `ms <= 0` (or undefined) returns `source` unchanged. On a timeout the source is asked
+ * to close (`return`), which an async generator only does once its pending read settles: for
+ * a `ReadableStream`, use {@link readStreamWithIdleTimeout}, which cancels it at once. There
+ * is no overall deadline: a client sending a byte now and then keeps the request alive (the
+ * request body limit bounds it).
  *
  * @example
  * ```ts
@@ -54,4 +57,80 @@ export function withIdleTimeout<T>(
       };
     },
   };
+}
+
+/** A stream read chunk by chunk, see {@link readStreamWithIdleTimeout}. */
+export interface StreamChunks extends AsyncIterableIterator<Uint8Array> {
+  /** Reads what is left and drops it (errors, the idle timeout included, end it quietly) */
+  discard(): Promise<void>;
+}
+
+/**
+ * Reads `stream` chunk by chunk; a read that brings nothing for `ms` milliseconds cancels the
+ * stream (its source stops) and fails with {@link IdleTimeoutError}. The result iterates
+ * itself: every `for await` over it continues where the last one stopped, and `discard()`
+ * drains the rest (a request body nobody needs, so the client is not cut off mid-upload).
+ *
+ * @example
+ * ```ts
+ * const body = readStreamWithIdleTimeout(request.body, 60_000);
+ * for await (const chunk of body) consume(chunk);
+ * ```
+ */
+export function readStreamWithIdleTimeout(
+  stream: ReadableStream<Uint8Array>,
+  ms: number | undefined,
+): StreamChunks {
+  const reader = stream.getReader();
+  let finished = false;
+  const finish = async (reason?: unknown) => {
+    if (finished) return;
+    finished = true;
+    await reader.cancel(reason).catch(() => {});
+  };
+  const chunks: StreamChunks = {
+    [Symbol.asyncIterator]() {
+      return chunks;
+    },
+    async next(): Promise<IteratorResult<Uint8Array>> {
+      if (finished) return { done: true, value: undefined };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const read = reader.read();
+        const result =
+          ms && ms > 0
+            ? await Promise.race([
+                read,
+                new Promise<never>((_, rejectIdle) => {
+                  timer = setTimeout(() => rejectIdle(new IdleTimeoutError(ms)), ms);
+                }),
+              ])
+            : await read;
+        if (result.done) {
+          finished = true;
+          return { done: true, value: undefined };
+        }
+        return { done: false, value: result.value };
+      } catch (error) {
+        await finish(error);
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    async return(): Promise<IteratorResult<Uint8Array>> {
+      // a consumer that stops early (the pack ended): the rest stays readable for discard()
+      return { done: true, value: undefined };
+    },
+    async discard(): Promise<void> {
+      try {
+        while (!(await chunks.next()).done) {
+          // dropped
+        }
+      } catch {
+        // over the limit, idle, or the client went away
+      }
+    },
+  };
+  return chunks;
 }

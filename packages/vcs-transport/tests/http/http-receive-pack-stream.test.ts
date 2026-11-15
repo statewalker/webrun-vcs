@@ -153,3 +153,47 @@ describe("smart-HTTP receive-pack: streamed answer", () => {
     ]);
   });
 });
+
+describe("smart-HTTP receive-pack: the idle timeout cancels the body", () => {
+  it("cancels a stalled body's source (not only stops reading it)", async () => {
+    const { repo, c2 } = await serverRepo();
+    let cancelled: unknown;
+    const request = pushRequest({
+      commands: [`${c2} ${c2} refs/heads/main`],
+      pack: new Uint8Array(12),
+    });
+    const stalled = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(request.slice(0, request.length - 6));
+      },
+      pull() {
+        return new Promise(() => {}); // never more
+      },
+      cancel(reason) {
+        cancelled = reason ?? "cancelled";
+      },
+    });
+    const response = await handleReceivePack(post(stalled), repo.facade, repo.refStore, {
+      receivePack: { idleTimeoutMs: 50 },
+    });
+    const answer = decodeAnswer(await read(response.body), true);
+    expect(answer.report[0]).toBe("unpack request idle for 50 ms");
+    expect(cancelled).toBeDefined();
+  });
+
+  it("readStreamWithIdleTimeout cancels the stream on a timeout", async () => {
+    const { readStreamWithIdleTimeout } = await import("../../src/index.js");
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull() {
+        return new Promise(() => {});
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const chunks = readStreamWithIdleTimeout(stream, 30);
+    await expect(chunks.next()).rejects.toThrow("request idle for 30 ms");
+    expect(cancelled).toBe(true);
+  });
+});

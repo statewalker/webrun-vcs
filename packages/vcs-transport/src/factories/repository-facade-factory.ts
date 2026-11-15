@@ -38,6 +38,11 @@ export interface HistoryFacadeConfig {
    * brings its own.
    */
   history: History | HistoryWithOperations;
+  /**
+   * Whether the repository has no working tree (default true). receive-pack refuses to
+   * update the checked-out branch of a non-bare one ("branch is currently checked out").
+   */
+  bare?: boolean;
 }
 
 /**
@@ -60,7 +65,10 @@ export interface HistoryFacadeConfig {
  * ```
  */
 export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryFacade {
-  return createRepositoryFacadeFromHistory(config.history);
+  const facade = createRepositoryFacadeFromHistory(config.history);
+  const bare = config.bare ?? true;
+  facade.isBare = () => bare;
+  return facade;
 }
 
 /**

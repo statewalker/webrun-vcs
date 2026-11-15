@@ -364,3 +364,115 @@ describe("our duplex push client reads receive-pack's report", () => {
     expect(await repo.refStore.get("refs/heads/main")).toBe(n0);
   });
 });
+
+describe("receive-pack hook failures stay on the server", () => {
+  it("authorize throwing over a duplex: every ref refused with a generic reason, the pack not imported", async () => {
+    const { repo, c2, n1, pack } = await setup();
+    const importSpy = spyImport(repo);
+    const errors: unknown[] = [];
+    const run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${n1} refs/heads/main`, `${ZERO} ${n1} refs/heads/x`], pack },
+      {
+        hooks: {
+          authorize: () => {
+            throw new Error("db password is hunter2");
+          },
+        },
+        logger: { error: (_m, e) => errors.push(e) },
+      },
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/main authorization failed",
+      "ng refs/heads/x authorization failed",
+    ]);
+    expect(new TextDecoder().decode(run.bytes)).not.toContain("hunter2");
+    expect(importSpy).not.toHaveBeenCalled();
+    expect(String(errors[0])).toContain("hunter2");
+  });
+
+  it("authorize throwing over HTTP: a 500 without the exception text", async () => {
+    const { repo, c2, n1, pack } = await setup();
+    const errors: unknown[] = [];
+    const handler = createFetchHandler({
+      resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+      receivePack: {
+        hooks: {
+          authorize: () => {
+            throw new Error("db password is hunter2");
+          },
+        },
+      },
+      logger: { info: () => {}, error: (_m, e) => errors.push(e) },
+    });
+    const response = await postReceive(
+      handler,
+      pushRequest({ commands: [`${c2} ${n1} refs/heads/main`], pack }),
+    );
+    expect(response.status).toBe(500);
+    const text = await response.text();
+    expect(text).toBe("authorization failed");
+    expect(errors.map(String).join(" ")).toContain("hunter2");
+  });
+
+  it("pre-receive and update hooks throwing: a generic 'hook error' to the client, details logged", async () => {
+    const { repo, c2, n0, n1, pack } = await setup();
+    const errors: unknown[] = [];
+    let run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${n1} refs/heads/main`], pack },
+      {
+        hooks: {
+          preReceive: () => {
+            throw new Error("secret-pre");
+          },
+        },
+        logger: { error: (_m, e) => errors.push(e) },
+      },
+    );
+    expect(run.report).toEqual(["unpack ok", "ng refs/heads/main pre-receive hook declined"]);
+    expect(run.messages).toContain("error: pre-receive hook error");
+    expect(run.messages).not.toContain("secret-pre");
+
+    run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${n1} refs/heads/main`, `${ZERO} ${n0} refs/heads/y`], pack },
+      {
+        hooks: {
+          update: (refName) => {
+            if (refName === "refs/heads/y") throw new Error("secret-update");
+          },
+        },
+        logger: { error: (_m, e) => errors.push(e) },
+      },
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ok refs/heads/main",
+      "ng refs/heads/y hook declined",
+    ]);
+    expect(run.messages).toContain("error: update hook error");
+    expect(run.messages).not.toContain("secret-update");
+    expect(errors.map(String).join(" ")).toContain("secret-pre");
+    expect(errors.map(String).join(" ")).toContain("secret-update");
+  });
+
+  it("HTTP: a pack refused per ref after the head is drained, so the client reads its report", async () => {
+    const { repo, c2, n1, pack } = await setup();
+    const handler = createFetchHandler({
+      resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+      receivePack: {
+        hooks: {
+          authorize: () => ({ ok: false, message: "no", rejectedRefs: ["refs/heads/main"] }),
+        },
+      },
+    });
+    const request = pushRequest({ commands: [`${c2} ${n1} refs/heads/main`], pack });
+    const { body, log } = trackedBody(request, 64);
+    const response = await postReceive(handler, body);
+    const answer = decodeAnswer(new Uint8Array(await response.arrayBuffer()), true);
+    expect(answer.report).toEqual(["unpack ok", "ng refs/heads/main no"]);
+    expect(log.pulled).toBeGreaterThanOrEqual(request.length);
+  });
+});

@@ -167,10 +167,14 @@ export interface ReceivePackConfig {
   authorizeFailure?: "report" | "fatal";
   /**
    * Read and discard a pack nothing will use (every command needing it refused before it was
-   * read). True for streams where the client blocks until its pack is taken (a pipe); false
-   * for HTTP, where the body is left unread.
+   * read): the client blocks (a pipe) or is cut off (HTTP) until its pack is taken.
    */
   drainRefusedPack?: boolean;
+  /**
+   * Drops the rest of the client's input, raw (with `drainRefusedPack`). A driver whose input
+   * ends with the pack (an HTTP body) gives it; otherwise the pack is parsed to find its end.
+   */
+  discardPack?: () => Promise<void>;
   /** Called once the commands are read and authorized, before the pack is read */
   onAuthorized?: () => void;
   /**

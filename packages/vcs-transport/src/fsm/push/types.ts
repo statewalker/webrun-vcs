@@ -44,6 +44,11 @@ export interface PushCommand {
   result: PushCommandResult;
   /** Server's rejection message */
   message?: string;
+  /**
+   * Server side: the ref's value when the client deletes an existing ref with the zero id as
+   * its old value (git deletes it anyway, "allowing deletion of corrupt ref")
+   */
+  expectedOid?: string;
 }
 
 /**
