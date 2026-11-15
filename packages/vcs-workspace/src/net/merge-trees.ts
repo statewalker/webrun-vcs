@@ -145,6 +145,39 @@ export async function mergeFlatTrees(
 }
 
 /**
+ * Whether text still holds a conflict marker line: a line starting with seven `<` or seven
+ * `>` followed by a space or the line's end (git's `<<<<<<< ours` / `>>>>>>> theirs`). The
+ * `=======` separator alone is not taken for one, since Markdown underlines headings with it.
+ * Binary content (a NUL in the first 8000 bytes, as git decides it) never holds markers.
+ *
+ * @example
+ * ```ts
+ * hasConflictMarkers(new TextEncoder().encode("<<<<<<< main\na\n=======\nb\n>>>>>>> x\n")); // true
+ * ```
+ */
+export function hasConflictMarkers(bytes: Uint8Array): boolean {
+  const head = bytes.subarray(0, 8000);
+  if (head.includes(0)) return false;
+  const LT = 0x3c;
+  const GT = 0x3e;
+  for (let start = 0; start < bytes.length; ) {
+    const c = bytes[start];
+    if (c === LT || c === GT) {
+      let n = 0;
+      while (n < 7 && bytes[start + n] === c) n++;
+      const next = bytes[start + 7];
+      if (n === 7 && (next === undefined || next === 0x20 || next === 0x0a || next === 0x0d)) {
+        return true;
+      }
+    }
+    const eol = bytes.indexOf(0x0a, start);
+    if (eol < 0) break;
+    start = eol + 1;
+  }
+  return false;
+}
+
+/**
  * The best common ancestors of two sets of commits (git's `merge-base --all` for `a` and `b`):
  * the common ancestors no other common ancestor descends from, sorted.
  */

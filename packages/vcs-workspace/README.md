@@ -128,8 +128,9 @@ const ws = await openGitWorkspace({
 });
 
 const result = await syncWorkspace(ws, httpRemote({ url: "https://example.com/notes.git" }));
-// { head, committed, integration: "up-to-date" | "fast-forward" | "merge", pushed, conflicts, attempts, skipped, rejoined }
-if (result.conflicts.length > 0) console.warn("both sides kept in", result.conflicts);
+// { head, committed, integration: "up-to-date" | "fast-forward" | "merge" | "conflicted",
+//   pushed, conflicts, attempts, skipped, rejoined, merge? }
+if (result.integration === "conflicted") console.warn("resolve, then concludeMerge:", result.conflicts);
 ```
 
 One call does what `git add -A && git commit && git pull && git push` does for a folder: it commits the folder's changes on `main`, fetches the remote's `main` into `refs/remotes/origin/main`, brings it in, and pushes the result. It never forces. If someone else pushed between our fetch and our push, the push is refused as git refuses it, and the round runs again: fetch, merge, push. After `maxAttempts` rounds (default 5) it gives up with a `SyncError`.
@@ -181,13 +182,50 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
 - Paths only one side changed are taken from that side.
 - Text files both sides changed are merged line by line with `mergeLines` of `@statewalker/vcs-utils`. That merge works on bytes: it splits on LF and keeps every terminator, so CRLF files, a missing final newline and non-UTF-8 text come out unchanged. A file with a NUL byte in its first 8000 bytes is binary, as git decides it.
 - `mergeLines` aligns lines with a histogram diff, while `git merge-file` uses its own xdiff. They agree on almost every input. In a fuzz run against `git merge-file` (1500 random three-way merges), the merged output was identical whenever both were clean, but 3 inputs that git reports as conflicts merged cleanly here. In those, one side deleted a line the other side kept next to its own change.
-- **Conflicts are kept and reported, never resolved silently.** The merge commit holds both sides:
+- **Conflicts are kept and reported, never resolved silently.** The merge result holds both sides:
   - text files get git's markers, labelled with the branch and the commit: `<<<<<<< main (1a2b3c4)` … `=======` … `>>>>>>> origin/main (5d6e7f8)`, in the file's own line ending;
   - a binary file keeps ours, with theirs next to it as `<path>.theirs-<id>` (`-2`, `-3`… when that name is taken);
   - a change against a deletion keeps the change;
   - a file against a directory moves the file aside as `<path>.ours-<id>` or `<path>.theirs-<id>`, after the side it came from.
 
-  The paths are in `result.conflicts`, in the `integrate` event and in the merge commit's message. The merge is committed and pushed, so every workspace sees the same marked file, and fixing it is an ordinary edit that the next sync carries.
+  By default the merge then stops, as git stops; see [When a merge conflicts](#when-a-merge-conflicts).
+
+### When a merge conflicts
+
+```typescript
+import { abortMerge, concludeMerge, readMergeState, syncWorkspace } from "@statewalker/vcs-workspace/net";
+
+const result = await syncWorkspace(ws, remote);
+if (result.integration === "conflicted") {
+  // the folder holds the merge result; result.conflicts (and result.merge.conflicts) name the files
+  // ...the user edits them, removing the markers...
+  await concludeMerge(ws); // the merge commit, both parents
+  await syncWorkspace(ws, remote); // pushes it
+}
+// or, to give up the merge: await abortMerge(ws);
+```
+
+A merge with conflicts does what `git merge` does (the default, `onConflict: "stop"`):
+
+- The merge result is written into the folder: markers in text files, the other side beside binary files and beside files that met a directory, as listed above. Paths that merged cleanly get their merged content too.
+- Nothing is committed or pushed. The branch stays where it was (local edits made before the sync are committed, as `git commit` before `git pull` would).
+- The merge stays in progress under `refs/workspace/merge/main`, git's `MERGE_HEAD`: a ref only the workspace writes, never pushed. Its commit holds the merge result, the other parent and the conflicted paths. `readMergeState(ws)` returns it.
+- The sync returns `integration: "conflicted"`, `pushed: false`, the paths in `conflicts`, and `merge`. It emits the `integrate` event and a `conflicted` event (`started: true`).
+
+While the merge is in progress, `syncWorkspace` fetches, merges and pushes nothing. It returns the same `conflicted` result and a `conflicted` event (`started: false`), so a sync on a timer is safe. The exception is a sync that finished writing a merge result whose writing was cut short (below): the merge stopped in that sync, so its event says `started: true`. `commitWorkspaceChanges` makes no commit either, and its result has `merge` (and `mergeStarted` in that same case).
+
+What was left out when the merge stopped stays left out until it ends. The record freezes the ignored paths, nested repositories and held files of that moment. It keeps only the topmost ones (an ignored directory is one entry), and paths are matched against it with one lookup per ancestor directory. If `ignore` changes or a nested repository's `.git` is removed during the merge, `concludeMerge` still carries those paths over from the merge result, and `abortMerge` never writes or removes them. The commit after the merge ends brings them back by the usual rules (below): a stale ignored copy gets the branch's version, and a local file that history never had is held.
+
+Two calls end the merge:
+
+- `concludeMerge(ws, { message?, force? })` makes the merge commit from the folder as it is then, with both parents. The next sync pushes it. The call is refused with an `UnresolvedConflictsError` (its `paths` name the files) while a conflicted text file still holds a marker line: a line starting with `<<<<<<<` or `>>>>>>>` and then a space or the line's end. git refuses while the index has unmerged entries; a folder has no index, so the markers are the equivalent. The `=======` line is not checked, since Markdown underlines headings with it. Binary conflicts are not checked: the folder's version is taken, and a `.theirs-<id>` copy still beside it is committed like any other file, so remove it first if you keep ours. A change against a deletion is not checked either: the changed file is in the folder, and it is committed as it is, so delete it first to accept the deletion. A file against a directory is in the folder as the directory, plus the file moved aside, both committed as they are. A conflicted path that was left out of the folder when the merge stopped (ignored, say) never reached the folder, so its markers are looked for in the merge result. The conclude is refused the same way, and the error's `leftOut` names such paths. Abort the merge, stop leaving the path out, and sync again to resolve it in the folder. `force: true` skips the marker check, for files whose content really has such lines. `hasConflictMarkers(bytes)` is exported for your own checks.
+- `abortMerge(ws)` does what `git merge --abort` does. Every path the merge changed gets the branch tip's version back, and files the merge added are removed. Edits made to those paths since the merge started are discarded, as git discards them. Other paths are not touched, so edits made elsewhere during the merge stay, and nothing from before the merge is lost: the merge started from a committed folder. A directory holding files of its own is never removed; such a path is listed in `kept`.
+
+Both refuse with a `NoMergeInProgressError` when no merge is in progress. A conclude cut short after the branch moved but before the record went leaves nothing stuck: the record is dropped as soon as the branch tip is seen to be that merge commit (both parents match), and the next sync pushes it.
+
+The former behaviour is an option: `onConflict: "commit"`, on `openGitWorkspace` or on one `syncWorkspace` (or `integrateCommit`) call. The merge is then committed with the conflicts in the files, the commit's message lists them, and it is pushed. Every workspace sees the same marked file, and fixing it is an ordinary edit that the next sync carries.
+
+Conflicts that a checkout finds while finishing after a crash (an edit made while the checkout was cut short, below) are not merge conflicts: they are kept in the file and committed in both modes, as before.
 
 ### What the folder cannot hold stays in history
 
@@ -209,7 +247,8 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
 - **What is left out is reported.** `result.skipped` (and a `skipped` event, and `skipped` from `commitWorkspaceChanges`) lists every folder path the commit did not take, each with a reason:
   - `nested-repository`, by its directory;
   - `reserved-name`: a `.git` file below the root, or the temporary-file prefix;
-  - `unsafe-path`.
+  - `unsafe-path`;
+  - `unignored-local`: a file back from being ignored, held out of commits (below).
 
   Ignored paths and submodule checkouts are not listed.
 - **Coming back.** A path can stop being left out: a nested repository's `.git` is removed, or `ignore` changes. Meanwhile the branch may have moved on there while the folder's copy stayed as it was. So the workspace records, under a ref only it writes (`refs/workspace/skip/main`), the version the folder last held of every left-out path that the branch tracks. A path the remote added meanwhile is recorded as never held.
@@ -221,7 +260,20 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
 
   The paths are listed in `result.rejoined` and a `rejoined` event. A nested repository's removal is therefore never pushed as the deletion of its files.
 
-  Un-ignoring a path commits whatever the folder holds there. A local file that was ignored for a reason (a `.env` with secrets, say) is merged with the branch's version and pushed, conflict markers and all. Move such files away before removing them from `ignore`.
+  Each path's rejoin is decided and recorded before anything is written to the folder. A crash after the file is written but before the record is updated is found at the next commit: the folder already holds the recorded result, so the path is done, never merged a second time.
+
+- **Un-ignored files are held.** A file that was ignored for a reason, such as a `.env` with secrets, is not committed just because `ignore` changed:
+
+  ```typescript
+  const ws = await openGitWorkspace({ folder, history }); // `.env` no longer ignored
+  const result = await syncWorkspace(ws, remote);
+  // result.skipped: [{ path: ".env", reason: "unignored-local" }]; nothing of it committed or pushed
+  await commitWorkspaceChanges(ws, { include: [".env"] }); // only now, as the folder holds it
+  ```
+
+  When a path comes back from being ignored and the folder holds content that history never had there, the file is held. That covers a local-only file (the branch never had it), a file the remote added while it was ignored (recorded as never held), and a folder copy that differs from what the branch had there. A held file stays as it is in the folder. It is not committed (the branch keeps its own version there, or nothing), nothing is written over it (a remote change there stays in history only), and it is reported as `unignored-local` until you opt in. To opt in, name the file or its directory in `include` of `commitWorkspaceChanges` (or of `syncWorkspace`). It is then committed as the folder holds it when the branch has not changed it since it was held. If the branch has changed it, it is first merged three ways (base: the branch's version when the file was held; ours: the folder's; theirs: the branch's now), so the branch's change is not dropped. A conflict is kept with markers, or with the branch's version beside a binary file, and reported in `conflicts`. Or open the workspace with `commitUnignored: true`, which brings every such file back by the three-way merge above, as before. Removing a held file stops holding it. Where the branch tracks the path, nothing is deleted: the commit that sees the removal keeps the branch's version, and the commit after it writes that version into the folder. Ignoring it again stops holding it too. So does a held file whose content becomes the branch's again: it is released, listed in `rejoined`, and from then on follows the branch like any file.
+
+  The workspace knows a file was ignored because each commit records the topmost ignored paths it saw (in `refs/workspace/skip/main`). A file created and un-ignored with no commit or sync in between was never seen ignored, so it is committed as a new file. Paths that came back from a nested repository are the user's files in that repository: they come back by the three-way merge, as above. So do the paths of a skip record written by an earlier version of this package, which kept no reasons: they rejoin by the three-way merge that version promised, never held.
 
 ### Why a failure leaves nothing half-done
 
@@ -236,6 +288,10 @@ A checkout cut short, by a full disk for example, is finished at the start of th
 Each retry then follows the stored plan, so a merged file is never merged again, and a failing retry changes nothing it already did. The plan also records which paths are done. A file the checkout had already written and the user changed afterwards, a hand-resolved conflict for one, is the user's edit: it stays as it is and is committed on top. A file changed before the checkout reached it is kept like an edit found when the plan was made: merged or moved aside, the plan updated first, the path reported. Nothing the finish refuses is dropped. A path it cannot bring to the plan stops it with the branch unmoved, and the branch moves to the target only when every path is done. A half-written folder is never committed as local edits.
 
 An edit made while a sync runs is not overwritten, with one small window left. Before the checkout, the sync checks that the folder still matches the branch; if not, it starts the round again and commits the edit first. Then, just before each file is replaced or removed, its content is hashed again. The new content is staged in a temporary file first. After that check, it is moved in place (a new file) or copied over the old file in place (an existing one, to keep its permissions). An edit found at the check stops the checkout, and the next round finishes it as above. What remains is the moment between the last check of a file and its replacement: a save that lands exactly then is replaced.
+
+A merge with conflicts is written the same way. Its record (`refs/workspace/merge/main`) is set before the first file is written, marked as being written. A write cut short (a full disk, a crash, an edit found at a check) is finished by the next `commitWorkspaceChanges`, `syncWorkspace` or `concludeMerge`, from the same stored plan, so no file gets its markers twice and an edit made meanwhile, a hand resolution for one, is kept. Then the record is marked stopped. After a restart, the merge is still in progress. `abortMerge` works on a half-written merge too. It follows the stored plan as well as the merge result: every path either changed gets the branch tip's version, and copies the plan put beside files (an edit found during the finish) are removed. The blobs the workspace's own records name only in their messages (rejoin results, the bases of held files) stay reachable from the record's commit, through a parent commit whose tree holds them.
+
+Each step of a round lists the folder once. The commit lists it once, and that one listing gives the snapshot, the nested repositories, and the ignored paths that a later un-ignore is checked against. A checkout lists it once more, to check that the folder still matches the branch. A round that pulls therefore lists the folder twice, and a round that only pushes, once. Only a commit that first finishes a cut-short checkout or brings back left-out paths lists the folder again, because those steps wrote to it. That second listing adds the nested repositories it finds to the round's set, never removes any. The same set then drives the snapshot and the tree, so no file under a `.git` that a listing found is ever committed as an ordinary file.
 
 The folder snapshot does not read a file again when its size and modification time are unchanged. A time within `racyWindowMs` (default 3 s) of when the file was last read is not trusted, because a later write in the same clock tick would look the same. Such a file is hashed again, as git does for "racily clean" index entries. Raise the window for a filesystem with coarser times. Files a checkout writes are always read again. Two cases are beyond the window: a same-size replacement whose modification time is set back (`rsync -t`, `cp -p`, a restore from backup), and a clock skewed by more than the window between the folder's filesystem and this machine. For such folders, set `rehashAll: true`, which reads every file on every snapshot.
 

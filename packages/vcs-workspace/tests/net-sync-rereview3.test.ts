@@ -183,12 +183,14 @@ describe("R3. a hand resolution during a stuck finish", () => {
     });
     await writeFile(plain, "p.txt", "title by Bob\nbody\n");
     state.fail = (p) => p === "/q.txt";
-    await expect(syncWorkspace(b, r(), { maxAttempts: 1 })).rejects.toThrow(/disk full/);
-    await expect(syncWorkspace(b, r(), { maxAttempts: 1 })).rejects.toThrow(/disk full/);
+    // committed conflicts (onConflict: "commit"); the default is covered in net-sync-conflicts
+    const commit = { maxAttempts: 1, onConflict: "commit" } as const;
+    await expect(syncWorkspace(b, r(), commit)).rejects.toThrow(/disk full/);
+    await expect(syncWorkspace(b, r(), commit)).rejects.toThrow(/disk full/);
     expect((await readFile(b, "p.txt")).match(/<<<<<<</g)).toHaveLength(1);
     await writeFile(plain, "p.txt", "title by Ann and Bob\nbody\n"); // resolved by hand
     state.fail = () => false;
-    const res = await syncWorkspace(b, r());
+    const res = await syncWorkspace(b, r(), { onConflict: "commit" });
     expect(await readFile(b, "p.txt")).toBe("title by Ann and Bob\nbody\n");
     expect((await serverFiles(history))["p.txt"]).toBe("title by Ann and Bob\nbody\n");
     expect(res.pushed).toBe(true);

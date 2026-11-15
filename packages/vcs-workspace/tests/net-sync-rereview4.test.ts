@@ -46,13 +46,19 @@ async function nodeWs(name: string, dir: string, ignore?: IgnorePath) {
 }
 
 /** The same folder and repository, opened again (a restart), with other options. */
-function reopen(ws: GitWorkspace, folder: FilesApi = ws.folder, ignore?: IgnorePath) {
+function reopen(
+  ws: GitWorkspace,
+  folder: FilesApi = ws.folder,
+  ignore?: IgnorePath,
+  commitUnignored?: boolean,
+) {
   return openGitWorkspace({
     folder,
     history: ws.history,
     identity: ws.identity,
     now: ws.now,
     ignore,
+    commitUnignored,
   });
 }
 
@@ -185,7 +191,8 @@ describe("Q1. a path that is no longer ignored", () => {
     writeFileSync(join(db, "app.cfg"), "port=9 (local)\n");
     await syncWorkspace(b2, r());
     expect((await serverFiles(history))["app.cfg"]).toBe("port=1\n");
-    const b3 = await reopen(b2);
+    // commitUnignored: the folder's copy is committed (by default it is held, see net-sync-conflicts)
+    const b3 = await reopen(b2, b2.folder, undefined, true);
     const res = await syncWorkspace(b3, r());
     expect(res.rejoined).toEqual(["app.cfg"]);
     expect((await serverFiles(history))["app.cfg"]).toBe("port=9 (local)\n");
