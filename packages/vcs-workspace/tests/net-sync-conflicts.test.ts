@@ -486,8 +486,8 @@ describe("B3. narrow windows", () => {
       },
       { history },
     );
-    await expect(syncWorkspace(b, r())).rejects.toThrow(/crash/);
-    const res = await syncWorkspace(await reopen(plain), r());
+    await expect(syncWorkspace(b, r(), { onConflict: "commit" })).rejects.toThrow(/crash/);
+    const res = await syncWorkspace(await reopen(plain), r(), { onConflict: "commit" });
     const text = await readFile(plain, "docs/e.md");
     expect(text.match(/<<<<<<</g)).toHaveLength(1);
     expect(text).toContain("title by Ann");
