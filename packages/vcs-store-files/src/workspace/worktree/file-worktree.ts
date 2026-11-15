@@ -568,8 +568,25 @@ export class FileWorktree implements Worktree {
   async isRepository(path: string): Promise<boolean> {
     const dotGit = joinPath(this.rootPath, path, ".git");
     const kind = await this.kindOf(dotGit).catch(() => undefined);
-    // a gitdir: file is taken as a repository (never removed on a guess)
-    if (kind === "file") return true;
+    if (kind === "file") {
+      // a gitdir: file names a repository when its target is one; an absolute target (or
+      // one beyond this FilesApi's root) cannot be checked here and is taken as one, so
+      // nothing is removed on a guess
+      let target: string | undefined;
+      try {
+        target = new TextDecoder()
+          .decode(await readFile(this.files, dotGit))
+          .trim()
+          .match(/^gitdir: (.+)$/)?.[1];
+      } catch {
+        return true;
+      }
+      if (!target) return false;
+      if (target.startsWith("/")) return true;
+      const resolved = resolveDots(joinPath(this.rootPath, path, target));
+      if (resolved === undefined) return true;
+      return (await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) === "file";
+    }
     if (kind !== "directory") return false;
     const kindAt = (name: string) => this.kindOf(joinPath(dotGit, name)).catch(() => undefined);
     return (
@@ -604,13 +621,12 @@ export class FileWorktree implements Worktree {
       const resolved = resolveDots(
         target.startsWith("/") ? target : joinPath(this.rootPath, path, target),
       );
-      // as git: a gitfile pointing where there is no repository (or beyond what this
-      // FilesApi can name) is an error, not a clean submodule
-      const invalid = () =>
-        new Error(`fatal: gitfile does not point to a valid repository: ${path}/.git`);
-      if (resolved === undefined) throw invalid();
+      // an absolute gitdir, or one beyond this FilesApi's root, cannot be read here: the
+      // submodule's commit is unknown (no change reported); one inside without a HEAD is
+      // git's fatal error, not a clean submodule
+      if (resolved === undefined || target.startsWith("/")) return undefined;
       if ((await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) !== "file") {
-        throw invalid();
+        throw new Error(`fatal: gitfile does not point to a valid repository: ${path}/.git`);
       }
       gitDir = resolved;
     } else return undefined;

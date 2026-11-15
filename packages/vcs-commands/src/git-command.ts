@@ -14,6 +14,7 @@ import type {
 } from "@statewalker/vcs-core";
 import { isSymbolicRef } from "@statewalker/vcs-core";
 import {
+  basicStatMatches,
   compareWithWorktree,
   type Staging,
   type WorkingCopy,
@@ -244,6 +245,11 @@ export abstract class GitCommand<T> {
     const trust = worktreeModeTrust(this._workingCopy, worktree);
     staging.setRacyCheck(async (entry, indexTime) => {
       try {
+        // git returns early when the basic stat already differs: changed, nothing to smudge
+        const current = await worktree.getEntry(entry.path);
+        if (!current || current.isDirectory || !basicStatMatches(entry, current, trust)) {
+          return false;
+        }
         return (await compareWithWorktree(worktree, entry, { trust, indexTime })).smudge === true;
       } catch {
         return false;

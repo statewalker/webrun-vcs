@@ -24,7 +24,11 @@ export function coreBool(workingCopy: WorkingCopy, name: string, fallback: boole
  * represent them and `core.filemode` / `core.symlinks` are not false.
  */
 export function worktreeModeTrust(workingCopy: WorkingCopy, worktree: Worktree): WorktreeModeTrust {
+  const minimal =
+    RemoteConfigStore.from(workingCopy).value("core.checkStat")?.trim().toLowerCase() === "minimal";
   return {
+    // inode, owner and group compared unless core.checkStat is minimal
+    fullStat: !minimal,
     executable:
       worktree.capabilities?.executable !== false && coreBool(workingCopy, "filemode", true),
     symlinks: worktree.capabilities?.symlinks !== false && coreBool(workingCopy, "symlinks", true),

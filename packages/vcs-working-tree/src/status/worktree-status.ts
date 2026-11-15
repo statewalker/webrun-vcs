@@ -9,7 +9,7 @@
  * git re-hashes such entries. Only files whose stat does not match are read.
  */
 
-import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { EMPTY_BLOB_ID, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import type { StagingEntry } from "../staging/types.js";
 import type { WorktreeEntry } from "../worktree/types.js";
 import type { Worktree } from "../worktree/worktree.js";
@@ -96,6 +96,53 @@ function sameTime(
   return seconds(recorded, recordedNs) === seconds(current, currentNs);
 }
 
+/** Whole seconds of a time in milliseconds, the exact nanoseconds deciding where known. */
+export const wholeSeconds = seconds;
+
+/** What git's `ce_match_stat_basic` compares of a file against its index entry. */
+export interface StatTrust {
+  /** Compare ctime (`core.trustctime`, not `core.checkStat=minimal`); default true */
+  ctime?: boolean;
+  /** Compare inode, owner and group (not `core.checkStat=minimal`); default true */
+  fullStat?: boolean;
+}
+
+/**
+ * Whether the file's stat still matches the index entry, as git's `ce_match_stat_basic`
+ * (default build): size, mtime and ctime in whole seconds, and inode, owner and group where
+ * the worktree reports them (an entry recorded without them, as 0, then does not match, as
+ * in git). An entry git smudged (size 0 while its blob is not the empty blob) never matches.
+ */
+export function basicStatMatches(
+  entry: StagingEntry,
+  current: WorktreeEntry,
+  trust: StatTrust = {},
+): boolean {
+  if (ms(entry.mtime) === 0) return false;
+  if (entry.size === 0 && entry.objectId !== EMPTY_BLOB_ID && entry.mode !== FileMode.GITLINK) {
+    return false;
+  }
+  if (current.size !== entry.size) return false;
+  if (!sameTime(entry.mtime, entry.mtimeNs, current.mtime, current.mtimeNs)) return false;
+  if (
+    trust.ctime !== false &&
+    entry.ctime !== undefined &&
+    current.ctime !== undefined &&
+    !sameTime(entry.ctime, entry.ctimeNs, current.ctime, current.ctimeNs)
+  ) {
+    return false;
+  }
+  if (trust.fullStat !== false) {
+    // git compares st_ino (and st_dev only when built with USE_STDEV, which it is not by
+    // default), st_uid and st_gid, in 32 bits
+    for (const key of ["ino", "uid", "gid"] as const) {
+      const now = current[key];
+      if (now !== undefined && (entry[key] ?? 0) >>> 0 !== now >>> 0) return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Racy git: an entry whose mtime is not older than the index file (in whole seconds, as
  * git's default build compares them) may hide a same-size change, so its content is checked.
@@ -145,14 +192,7 @@ export async function compareWithWorktree(
     return { kind: "modified", ...found };
   }
   const indexTime = options.indexTime ?? 0;
-  const statMatches =
-    ms(entry.mtime) !== 0 &&
-    current.size === entry.size &&
-    sameTime(entry.mtime, entry.mtimeNs, current.mtime, current.mtimeNs) &&
-    (trust.ctime === false ||
-      entry.ctime === undefined ||
-      current.ctime === undefined ||
-      sameTime(entry.ctime, entry.ctimeNs, current.ctime, current.ctimeNs));
+  const statMatches = basicStatMatches(entry, current, trust);
   // racy git: an entry not older than the index file may hide a same-size change
   const racy = isRacy(entry.mtime, entry.mtimeNs, indexTime);
   if (statMatches && !racy) return found;

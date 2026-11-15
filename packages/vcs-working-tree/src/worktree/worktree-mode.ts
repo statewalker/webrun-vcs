@@ -15,6 +15,11 @@ export interface WorktreeModeTrust {
    * `core.checkStat=minimal`). Absent: compared, as git's default.
    */
   ctime?: boolean;
+  /**
+   * Inode, owner and group are compared with the index's (git's default `core.checkStat`;
+   * false with `core.checkStat=minimal`). Absent: compared.
+   */
+  fullStat?: boolean;
 }
 
 /**

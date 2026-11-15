@@ -154,13 +154,15 @@ export class CleanCommand extends GitCommand<CleanResult> {
    * plain path matches itself and what is below it; one with `*`, `?` or `[...]` is a glob
    * over the whole path (`*` matching `/` too).
    */
-  private matchesPaths(path: string): boolean {
+  private matchesPaths(path: string, isDirectory = false): boolean {
     if (this.paths.size === 0) return true;
     for (const p of this.paths) {
       const spec = p.replace(/\/+$/, "");
       if (spec === "" || spec === ".") return true;
       if (/[*?[]/.test(spec)) {
-        if (globToRegExp(spec).test(path)) return true;
+        // a directory is matched with its trailing slash too (`u/*` names `u/`, as git)
+        const glob = globToRegExp(spec);
+        if (glob.test(path) || (isDirectory && glob.test(`${path}/`))) return true;
         continue;
       }
       if (path === spec || path.startsWith(`${spec}/`)) return true;
@@ -269,7 +271,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
     // what git clean -n prints: the topmost wholly removed untracked directory, else files
     const dirMode = this.directories || this.paths.size > 0;
     const removedDir = (dir: string) =>
-      dirMode && !trackedDirs.has(dir) && !kept.has(dir) && this.matchesPaths(dir);
+      dirMode && !trackedDirs.has(dir) && !kept.has(dir) && this.matchesPaths(dir, true);
     const reportFor = (path: string, suffix = "") => {
       for (const dir of ancestors(path)) if (removedDir(dir)) return `${dir}/`;
       return `${path}${suffix}`;
@@ -287,7 +289,10 @@ export class CleanCommand extends GitCommand<CleanResult> {
         const deepestFirst = [...untrackedDirs].sort(
           (a, b) => b.split("/").length - a.split("/").length || (a < b ? 1 : -1),
         );
-        for (const dir of deepestFirst) await removeDirectoryIfEmpty(worktree, dir);
+        // only the directories the path filter names (a glob emptying one leaves it)
+        for (const dir of deepestFirst) {
+          if (this.matchesPaths(dir, true)) await removeDirectoryIfEmpty(worktree, dir);
+        }
       }
     }
 

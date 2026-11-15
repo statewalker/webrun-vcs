@@ -1520,7 +1520,7 @@ describeGit("submodules (review cases)", () => {
     expect(status.modified.has("sub")).toBe(false);
   }, 10_000);
 
-  it("a gitdir: pointing above the repository's root is not followed (an error, as git)", async () => {
+  it("a gitdir: pointing above the repository's root is not followed", async () => {
     const dir = join(root, "r");
     repo(dir);
     nestedRepo(dir, "sub");
@@ -1531,8 +1531,8 @@ describeGit("submodules (review cases)", () => {
     mkdirSync(join(root, "outside"));
     writeFileSync(join(root, "outside/HEAD"), `${"ab".repeat(20)}\n`);
     const { ours } = await open(dir);
-    // never read beyond the FilesApi's root: refused instead
-    await expect(ours.status().call()).rejects.toThrow(/gitfile does not point/);
+    // never read beyond the FilesApi's root: the submodule's commit is unknown, no change
+    expect((await ours.status().call()).modified.has("sub")).toBe(false);
   });
 });
 
@@ -1691,7 +1691,8 @@ describeGit("clean, racy smudging and submodules against native git (review roun
     run(dir, "add", "sub");
     run(dir, "commit", "-qm", "sub");
     rmSync(join(dir, "sub/.git"), { recursive: true });
-    writeFileSync(join(dir, "sub/.git"), "gitdir: ../../outside\n");
+    // a gitdir inside the repository where there is no repository
+    writeFileSync(join(dir, "sub/.git"), "gitdir: ../nowhere\n");
     expect(() => exec(dir, "status", "--porcelain")).toThrow(/not a git repository|gitfile/);
     const { ours } = await open(dir);
     await expect(ours.status().call()).rejects.toThrow(
@@ -1870,4 +1871,202 @@ describeTimes("stat time precision as native git", () => {
     expect(native).toBe("A  a.txt\n");
     expect(ours).toBe(native);
   });
+});
+
+/** Waits until the clock has moved to the next whole second. */
+async function nextSecond() {
+  const s = Math.floor(Date.now() / 1000);
+  while (Math.floor(Date.now() / 1000) === s) await new Promise((r) => setTimeout(r, 20));
+}
+/** Waits until early in a second (later than the filesystem's coarse clock lags). */
+async function earlyInSecond() {
+  for (;;) {
+    const ms = Date.now() % 1000;
+    if (ms >= 30 && ms < 150) return;
+    await new Promise((r) => setTimeout(r, ms < 30 ? 30 - ms : 1030 - ms));
+  }
+}
+const mtimeSecond = (p: string) => Math.floor(lstatSync(p).mtimeMs / 1000);
+
+describeGit("final review: stat as git's checkStat, smudged entries, gitdirs (round 5)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "round5-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("a same-second edit survives native git rewriting our index (no lost edit)", async () => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const d = join(root, `n${attempt}`);
+      repo(d);
+      await nextSecond();
+      await earlyInSecond();
+      put(d, "a.txt", "A1\n");
+      {
+        const { ours } = await open(d);
+        await ours.add().addFilepattern("a.txt").call();
+      }
+      put(d, "a.txt", "A2\n");
+      if (mtimeSecond(join(d, "a.txt")) !== mtimeSecond(join(d, ".git/index"))) continue;
+      await nextSecond();
+      run(d, "status", "--porcelain");
+      await nextSecond();
+      const o = join(root, `o${attempt}`);
+      cpSync(d, o, { recursive: true, preserveTimestamps: true });
+      {
+        const { ours } = await open(o);
+        await ours.stashCreate().call();
+      }
+      exec(d, "stash", "push", "-q");
+      const show = (x: string) =>
+        `file=${read(join(x, "a.txt")).trim()} W=${run(x, "show", "stash@{0}:a.txt")} I=${run(x, "show", "stash@{0}^2:a.txt")}`;
+      expect(show(o)).toBe(show(d));
+      expect(run(o, "show", "stash@{0}:a.txt")).toBe("A2");
+      return;
+    }
+    throw new Error("could not set up the same-second edit");
+  }, 30_000);
+
+  it("an entry recorded without an inode is re-read when the file has one (checkStat)", async () => {
+    const d = join(root, "r");
+    repo(d);
+    const old = new Date(Date.now() - 100_000);
+    utimesSync(join(d, "a.txt"), old, old);
+    run(d, "update-index", "--refresh");
+    // the entry as a writer without inodes records it; then a same-size edit, same times
+    const { wc } = await open(d);
+    const entry = await wc.checkout.staging.getEntry("a.txt");
+    const editor = wc.checkout.staging.createEditor();
+    editor.upsert({ ...(entry as NonNullable<typeof entry>), ino: 0 });
+    await editor.finish();
+    await wc.checkout.staging.write();
+    const stat = lstatSync(join(d, "a.txt"));
+    put(d, "a.txt", "A\n");
+    utimesSync(join(d, "a.txt"), stat.atime, stat.mtime);
+    const { ours } = await open(d);
+    const status = await ours.status().call();
+    expect(status.modified).toEqual(new Set(["a.txt"]));
+    expect(formatStatusPorcelain(status)).toBe(nativeStatus(d, 1));
+    // with core.checkStat=minimal git compares neither inodes nor ctime: the same-size,
+    // same-mtime edit goes unseen there, and here too
+    run(d, "config", "core.checkStat", "minimal");
+    const { ours: minimal } = await open(d);
+    const relaxed = formatStatusPorcelain(await minimal.status().call());
+    expect(relaxed).toBe(nativeStatus(d, 1));
+    expect(relaxed).toBe("");
+  });
+
+  it("a smudged entry (size 0, non-empty blob) never matches an empty file", async () => {
+    const d = join(root, "z");
+    repo(d);
+    await nextSecond();
+    await earlyInSecond();
+    put(d, "a.txt", "");
+    {
+      const { ours } = await open(d);
+      await ours.reset().addPath("a.txt").call();
+    }
+    await nextSecond();
+    put(d, "b.txt", "bb\n");
+    {
+      const { ours } = await open(d);
+      await ours.add().addFilepattern("b.txt").call();
+    }
+    await nextSecond();
+    const o = join(root, "o");
+    cpSync(d, o, { recursive: true, preserveTimestamps: true });
+    const { ours } = await open(d);
+    expect(formatStatusPorcelain(await ours.status().call(), 1)).toBe(
+      exec(o, "status", "--porcelain"),
+    );
+    const { ours: stasher } = await open(d);
+    await stasher.stashCreate().call();
+    exec(o, "stash", "push", "-q");
+    expect(run(d, "show", "stash@{0}:a.txt")).toBe(run(o, "show", "stash@{0}:a.txt"));
+  }, 30_000);
+
+  it("a submodule with an absolute gitdir: status does not fail (as native git)", async () => {
+    const up = join(root, "up");
+    repo(up);
+    const d = join(root, "r");
+    repo(d);
+    exec(d, "-c", "protocol.file.allow=always", "submodule", "add", "-q", up, "sub");
+    run(d, "commit", "-qm", "sub");
+    writeFileSync(join(d, "sub/.git"), `gitdir: ${join(d, ".git/modules/sub")}\n`);
+    const native = exec(d, "status", "--porcelain");
+    const { ours } = await open(d);
+    expect(formatStatusPorcelain(await ours.status().call(), 1)).toBe(native);
+  }, 30_000);
+});
+
+describeGit("clean twins against native git (final review)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-final-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  const base = (d: string) => {
+    put(d, "top.txt", "t\n");
+    put(d, "atop.md", "t\n");
+    put(d, "u/x.txt", "x\n");
+    put(d, "u/deep/y.log", "y\n");
+    put(d, "d/u.txt", "u\n");
+    put(d, "d/sub/z.txt", "z\n");
+    put(d, "b.txt.orig", "o\n");
+  };
+  const cases: [
+    string,
+    (d: string) => void,
+    { d?: boolean; x?: boolean; ff?: boolean; paths?: string[] },
+  ][] = [
+    ["glob-no-d", base, { paths: ["*.txt"] }],
+    ["glob-d", base, { d: true, paths: ["*.txt"] }],
+    ["glob-dir", base, { paths: ["u/*"] }],
+    ["glob-q", base, { d: true, paths: ["?.txt*"] }],
+    ["glob-class", base, { d: true, paths: ["[ad]*"] }],
+    ["glob-negclass", base, { d: true, paths: ["[!ad]*"] }],
+    ["tracked-dir-spec", base, { paths: ["d"] }],
+    ["tracked-dir-spec-d", base, { d: true, paths: ["d"] }],
+    ["file-in-untracked", base, { paths: ["u/x.txt"] }],
+    ["dir-spec-slash", base, { paths: ["u/"] }],
+    [
+      "fake-gitfile-d",
+      (d) => {
+        put(d, "u/x.txt", "x\n");
+        put(d, "u/w/.git", "gitdir: ../nonexistent\n");
+        put(d, "u/w/f.txt", "f\n");
+      },
+      { d: true },
+    ],
+    [
+      "fake-gitdir-head-only",
+      (d) => {
+        put(d, "u/w/.git/HEAD", "ref: refs/heads/main\n");
+        put(d, "u/w/f.txt", "f\n");
+      },
+      { d: true },
+    ],
+    [
+      "empty-gitdir-path",
+      (d) => {
+        mkdirSync(join(d, "u/w/.git"), { recursive: true });
+        put(d, "u/w/f.txt", "f\n");
+      },
+      { paths: ["u"] },
+    ],
+    [
+      "ignored-in-spec",
+      (d) => {
+        put(d, ".gitignore", "*.log\n");
+        run(d, "add", ".");
+        run(d, "commit", "-qm", "i");
+        put(d, "u/x.txt", "x\n");
+        put(d, "u/k.log", "k\n");
+      },
+      { paths: ["u"] },
+    ],
+  ];
+  for (const [name, setup, flags] of cases) {
+    it(`clean ${name}`, async () => {
+      await twinClean(name, setup, flags);
+    });
+  }
 });

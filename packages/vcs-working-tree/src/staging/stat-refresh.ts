@@ -5,6 +5,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import { wholeSeconds } from "../status/worktree-status.js";
 import type { IndexFile } from "./index-file.js";
 import type { StagingEntry } from "./types.js";
 
@@ -32,8 +33,8 @@ export interface IndexStatUpdate {
 
 const ms = (t: number | undefined) => Math.floor(t ?? 0);
 
-/** Whole seconds of a time in milliseconds (git's default build compares stat times so). */
-const seconds = (t: number | undefined) => Math.floor(ms(t) / 1000);
+/** Whole seconds, as status compares them (the exact nanoseconds deciding where known). */
+const seconds = (t: number | undefined, ns?: number) => wholeSeconds(t, ns);
 
 /**
  * Checks whether an index entry is racily clean and changed: its stat still matches the
@@ -63,7 +64,7 @@ export async function smudgeRacilyClean(
     // an entry set in this session (from the worktree, or a refresh) is up to date, as
     // git's CE_UPTODATE: only entries as they were read are checked
     if (asRead && !asRead(e)) continue;
-    if (seconds(e.mtime) < seconds(indexTime)) continue;
+    if (seconds(e.mtime, e.mtimeNs) < seconds(indexTime)) continue;
     if (!(await check(e, indexTime))) continue;
     out ??= [...entries];
     out[i] = { ...e, size: 0 };
