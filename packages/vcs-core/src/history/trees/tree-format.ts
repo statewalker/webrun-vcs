@@ -230,6 +230,9 @@ export async function* decodeTreeEntries(
       const mode = parseMode(buffer.subarray(offset, spacePos));
       const decoder = new TextDecoder();
       const name = decoder.decode(buffer.subarray(spacePos + 1, nullPos));
+      // A decoded tree may come from a remote. Its names become worktree paths, and
+      // the FilesApi resolves `..` (webrun-files 0.12), so refuse what git fsck refuses.
+      validateEntryName(name);
       const id = bytesToHex(buffer.subarray(nullPos + 1, nullPos + 1 + OBJECT_ID_LENGTH));
 
       yield { mode, name, id };
