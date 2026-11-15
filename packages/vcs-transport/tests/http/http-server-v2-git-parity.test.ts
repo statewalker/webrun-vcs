@@ -58,7 +58,8 @@ function pktLines(text: string): string[] {
     }
     const payload = bytes.subarray(pos + 4, pos + len);
     pos += len;
-    if (payload[0] === 1 || payload[0] === 2 || payload[0] === 3) lines.push(`<band ${payload[0]}>`);
+    if (payload[0] === 1 || payload[0] === 2 || payload[0] === 3)
+      lines.push(`<band ${payload[0]}>`);
     else lines.push(decoder.decode(payload).replace(/\n$/, ""));
   }
   return lines;

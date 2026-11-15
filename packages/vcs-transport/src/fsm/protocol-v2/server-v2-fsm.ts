@@ -827,7 +827,12 @@ function advertisesCapability(ctx: ProcessContext, name: string): boolean {
 /** Whether the advertised `<capability>=` lists `feature` (e.g. `fetch=shallow`). */
 function advertisesFeature(ctx: ProcessContext, capability: string, feature: string): boolean {
   const found = advertisedCapabilities(ctx).find((c) => c.startsWith(`${capability}=`));
-  return found?.slice(capability.length + 1).split(" ").includes(feature) ?? false;
+  return (
+    found
+      ?.slice(capability.length + 1)
+      .split(" ")
+      .includes(feature) ?? false
+  );
 }
 
 /** Whether the advertised `fetch=` capability lists `feature`. */

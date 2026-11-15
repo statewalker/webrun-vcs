@@ -137,42 +137,46 @@ describe("Interop B · smart-HTTP server over a real socket", () => {
     expect(asText).toContain("PACK");
   });
 
-  it.skipIf(!gitAvailable())("real git clone over smart-HTTP", { timeout: TEST_TIMEOUT }, async () => {
-    const dst = join(root, "clone");
-    const run = (cwd: string, args: string[]) =>
-      new Promise<string>((resolve, reject) => {
-        const child = execFile(
-          "git",
-          args,
-          {
-            cwd,
-            timeout: GIT_TIMEOUT,
-            killSignal: "SIGKILL",
-            env: {
-              // no proxy for the loopback server
-              ...loopbackEnv(),
-              GIT_CONFIG_GLOBAL: "/dev/null",
-              GIT_CONFIG_NOSYSTEM: "1",
-              GIT_TERMINAL_PROMPT: "0",
-              GIT_AUTHOR_NAME: "Interop Tester",
-              GIT_AUTHOR_EMAIL: "interop@example.com",
-              GIT_COMMITTER_NAME: "Interop Tester",
-              GIT_COMMITTER_EMAIL: "interop@example.com",
-              GIT_AUTHOR_DATE: "1112911993 +0000",
-              GIT_COMMITTER_DATE: "1112911993 +0000",
+  it.skipIf(!gitAvailable())(
+    "real git clone over smart-HTTP",
+    { timeout: TEST_TIMEOUT },
+    async () => {
+      const dst = join(root, "clone");
+      const run = (cwd: string, args: string[]) =>
+        new Promise<string>((resolve, reject) => {
+          const child = execFile(
+            "git",
+            args,
+            {
+              cwd,
+              timeout: GIT_TIMEOUT,
+              killSignal: "SIGKILL",
+              env: {
+                // no proxy for the loopback server
+                ...loopbackEnv(),
+                GIT_CONFIG_GLOBAL: "/dev/null",
+                GIT_CONFIG_NOSYSTEM: "1",
+                GIT_TERMINAL_PROMPT: "0",
+                GIT_AUTHOR_NAME: "Interop Tester",
+                GIT_AUTHOR_EMAIL: "interop@example.com",
+                GIT_COMMITTER_NAME: "Interop Tester",
+                GIT_COMMITTER_EMAIL: "interop@example.com",
+                GIT_AUTHOR_DATE: "1112911993 +0000",
+                GIT_COMMITTER_DATE: "1112911993 +0000",
+              },
             },
-          },
-          (error, stdout, stderr) => {
-            children.delete(child);
-            if (error) reject(new Error(`git ${args.join(" ")}: ${stderr}`));
-            else resolve(stdout.trim());
-          },
-        );
-        children.add(child);
-      });
-    await run(root, ["clone", `http://127.0.0.1:${port}/repo.git`, dst]);
-    expect(await run(dst, ["rev-parse", "HEAD"])).toBe(head);
-    expect(await run(dst, ["rev-list", "--count", "HEAD"])).toBe("2");
-    await run(dst, ["fsck", "--strict", "--no-dangling"]);
-  });
+            (error, stdout, stderr) => {
+              children.delete(child);
+              if (error) reject(new Error(`git ${args.join(" ")}: ${stderr}`));
+              else resolve(stdout.trim());
+            },
+          );
+          children.add(child);
+        });
+      await run(root, ["clone", `http://127.0.0.1:${port}/repo.git`, dst]);
+      expect(await run(dst, ["rev-parse", "HEAD"])).toBe(head);
+      expect(await run(dst, ["rev-list", "--count", "HEAD"])).toBe("2");
+      await run(dst, ["fsck", "--strict", "--no-dangling"]);
+    },
+  );
 });
