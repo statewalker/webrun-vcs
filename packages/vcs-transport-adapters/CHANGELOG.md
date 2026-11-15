@@ -1,5 +1,44 @@
 # @statewalker/vcs-transport-adapters
 
+## 0.5.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+  - @statewalker/vcs-transport crosses a breaking line
+  - @statewalker/vcs-utils crosses a breaking line
+
+### Patch Changes
+
+- 3292f46: **upload-pack honours `include-tag` and negotiates over v0 as git does, both servers hide refs as git's `hideRefs`, upload-pack gets hooks, and the fetch client gzips large requests.**
+  
+  - **vcs-transport, v0 negotiation (fix):** upload-pack answers haves exactly as git's `get_common_commits`: `ACK <oid> common` / `continue` / `ready` while a batch is read (`ready` also without no-done, once every want reaches a common commit), NAK at the end of every batch in the multi_ack modes, the final `ACK <oid>` on `done`, and with no-done after `ready` NAK and the final ACK before the pack. Before, a batch that found a common commit was answered without NAK, and a later batch with nothing new got no answer: our fetch client failed with "Expected ACK/NAK, got a flush" and native git with "expected ACK/NAK, got '?PACK'" (a stale remote-tracking ref plus many local commits over v0). In single-ack mode the server now waits for `done` after its ACK, as git. `multi_ack` is advertised again (git advertises both `multi_ack` and `multi_ack_detailed`).
+  
+  - **vcs-core:** `listObjects` takes `includeTags` (candidate tag ids) and `ExportOptions.includeTags` passes it from `SerializationApi.exportPack`: as `git pack-objects --include-tag`, each annotated tag peeling to a packed object is added after the other objects, with every tag of its chain. Only tag objects are read: a listed target, a lightweight tag of a listed object and an object the walk met cost no read.
+  - **vcs-transport, include-tag:** upload-pack (v0/v1 and v2) adds the annotated tags of packed objects when the client asks for `include-tag`, so a client no longer needs a second fetch to backfill them. The candidates are the visible `refs/tags/*` (a hidden tag is never sent; git's pack-objects ignores hideRefs). `ExportPackOptions.includeTags` carries them to the facade; `includeTag: true` without it uses the facade's own `refs/tags/*` (both `createRepositoryFacade` and vcs-transport-adapters' `VcsRepositoryFacade`).
+  - **vcs-transport, hidden refs:** new `hideRefs` (git's `transfer.hideRefs`) on `serveOverDuplex`, `createHttpHandler`, `createGitHttpServer`, `createFetchHandler` and `messagePortServe`, plus upload-pack's (`uploadPack.hideRefs` / `uploadPackHideRefs`, git's `uploadpack.hideRefs`) and receive-pack's (`receivePack.hideRefs` / `receivePackHideRefs`, git's `receive.hideRefs`), with git's pattern rules (`isRefHidden`: component prefixes, `!` negation, `^` full names, last match wins). Hidden refs are left out of the v0 advertisements and v2 `ls-refs`; a want of a hidden tip is `not our ref` under the "ADVERTISED" policy ("TIP" and the reachable policies count hidden tips, as git's `allow*SHA1InWant`); a v2 `want-ref` of one is `unknown ref <name>`; receive-pack refuses changing one (`deny updating a hidden ref`, `deny deleting a hidden ref`) after the connectivity check, as git. `handleGitSocketConnection` passes the hidden refs and both services' hooks through. **Hiding refs is not access control**, as in git: hidden history stays fetchable by id under the "ANY" (v2's default), "TIP" and reachable policies, and HEAD naming a hidden branch is still advertised.
+  - **vcs-transport, upload-pack hooks:** new `UploadPackHooks` (`uploadPack.hooks` on the HTTP handlers, `uploadPackHooks` on `serveOverDuplex`, `hooks` on `messagePortServe`): `authorize(request, ctx)` sees the wants, every ref whose tip they name (hidden ones included), the `want-ref`s, the haves of a v2 request, a copy of the capabilities and the shallow/deepen arguments (`depth`, `deepenSince`, `deepenNot`, `filter`) before any negotiation or pack byte, and may refuse with `ERR <message>`; it runs on every request, so once per round over stateless HTTP. A want need not be a tip (a parent under "ANY" or the reachable policies), so a hook guarding refs must check reachability or keep "ADVERTISED". `postUpload(result, ctx)` runs detached once a pack was sent.
+  - **vcs-transport, v2:** `ls-refs peel` fully peels a chain of tags (was one level); an unknown `want-ref` reads git's `unknown ref <name>` (was `Unknown ref: <name>`).
+  - **vcs-transport, fetch client:** upload-pack request bodies over 1024 bytes (large have-batches) are sent with `Content-Encoding: gzip`, as git's remote-curl, where `CompressionStream` exists. `gzipRequests: false` (`fetch`, `openHttpConnection`) turns it off, for browsers behind a CORS proxy that does not allow `Content-Encoding` (not a CORS-safelisted header).
+  - **vcs-commands:** `TransportCommand.setGzipRequests(false)` passes that to the fetch and clone commands.
+  - **vcs-workspace:** `createSyncServer` takes `hideRefs` and `uploadPackHooks`.
+- Updated dependencies [7d77bf8]
+- Updated dependencies [875db86]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [01d2219]
+- Updated dependencies [3818fee]
+- Updated dependencies [3292f46]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [d45dfb0]
+- Updated dependencies [f474fe0]
+- Updated dependencies [d45dfb0]
+  - @statewalker/vcs-utils@0.5.0
+  - @statewalker/vcs-transport@0.5.0
+  - @statewalker/vcs-core@0.5.0
+
 ## 0.4.0
 
 ### Minor Changes
