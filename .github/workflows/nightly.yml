@@ -1,0 +1,25 @@
+name: Nightly
+
+# The browser suites the CI of a pull request does not run (statewalker/statewalker-ci's
+# nightly.yml): root `test:nightly` runs the `test:browser` scripts of
+# - @statewalker/vcs-utils: its Web Platform suite in headless Chromium (vitest browser mode);
+# - @statewalker/vcs-demo-browser-app: its Playwright end-to-end suite (`test:app`, against the
+#   Vite dev server),
+# each to the end even when the other fails. A failure opens one `bug` + `ci-baseline` issue here;
+# later failures comment on it while it is open. (`test:ui` is Playwright's interactive UI mode,
+# for a person at a desktop: there is nothing to run unattended.)
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  nightly:
+    uses: statewalker/statewalker-ci/.github/workflows/nightly.yml@main
+    with:
+      setup: pnpm --filter @statewalker/vcs-demo-browser-app exec playwright install --with-deps chromium
