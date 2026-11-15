@@ -123,6 +123,12 @@ export interface Worktree {
    */
   probeCaseFolding?(): Promise<{ ignoreCase: boolean; precomposeUnicode: boolean }>;
 
+  /**
+   * Runs `fn` as one batch of operations (a checkout's writes), which may share a cache of
+   * directories verified not to be links, dropped when the batch ends.
+   */
+  batch?<T>(fn: () => Promise<T>): Promise<T>;
+
   // ========== Reading ==========
 
   walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry>;

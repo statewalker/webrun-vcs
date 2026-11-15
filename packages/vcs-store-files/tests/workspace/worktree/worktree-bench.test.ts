@@ -29,8 +29,12 @@ describe("FileWorktree benchmark (10k files, depth 5)", () => {
     `d${i % 10}/e${Math.floor(i / 10) % 10}/f${Math.floor(i / 100) % 10}/g${Math.floor(i / 1000) % 10}/file${i}.txt`;
 
   it("writes, walks and hashes", { timeout: 600_000 }, async () => {
+    // the writes as one batch, as a checkout writes its plan (an lstat cache for the batch)
     let start = performance.now();
-    for (let i = 0; i < FILES; i++) await worktree.writeContent(pathOf(i), enc.encode(`${i}\n`));
+    const writeAll = async () => {
+      for (let i = 0; i < FILES; i++) await worktree.writeContent(pathOf(i), enc.encode(`${i}\n`));
+    };
+    await (worktree.batch ? worktree.batch(writeAll) : writeAll());
     const write = performance.now() - start;
 
     start = performance.now();

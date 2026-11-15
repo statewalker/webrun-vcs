@@ -10,6 +10,7 @@
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
+import { isReservedFilesName } from "@statewalker/vcs-utils/files";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import type { CommandTrees } from "../git-command.js";
@@ -140,7 +141,11 @@ async function planInto(
 ): Promise<void> {
   for await (const entry of trees.loadTree(treeId)) {
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (!isValidWorktreePath(path, entry.mode, { windows: options.windows === true })) {
+    if (
+      !isValidWorktreePath(path, entry.mode, { windows: options.windows === true }) ||
+      // the simulated-links table of a FilesApi (createSymlinkFilesApi) is reserved too
+      isReservedFilesName(entry.name)
+    ) {
       throw new Error(`${operation} cannot restore ${JSON.stringify(path)}: invalid path`);
     }
 
@@ -191,6 +196,18 @@ export async function writeTreeRestorePlan(
   plan: TreeRestorePlan,
   operation: string,
   options: TreeWriteOptions = {},
+): Promise<void> {
+  // one batch: the worktree may cache directories verified not to be links meanwhile
+  const run = () => writePlan(worktree, blobs, plan, operation, options);
+  await (worktree.batch ? worktree.batch(run) : run());
+}
+
+async function writePlan(
+  worktree: Worktree,
+  blobs: Blobs,
+  plan: TreeRestorePlan,
+  operation: string,
+  options: TreeWriteOptions,
 ): Promise<void> {
   for (const { path, objectId, mode } of plan.entries) {
     const content = await blobs.load(objectId);

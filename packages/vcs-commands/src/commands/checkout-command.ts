@@ -47,6 +47,12 @@ import {
 import { GitCommand } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import {
+  findInTheWay,
+  overwriteMessage,
+  pruneEmptyParents,
+  worktreeDiffers,
+} from "./worktree-overwrite-checks.js";
 
 /** Names a branch checkout in failure messages. */
 const CHECKOUT = "checkout";
@@ -111,24 +117,11 @@ interface Side {
   mode: number;
   size?: number;
   mtime?: number;
+  ctime?: number;
 }
 
 const sameSide = (a: Side | undefined, b: Side | undefined) =>
   a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
-
-/** git's messages for a refused branch switch (unpack-trees). */
-const WOULD_OVERWRITE = (paths: string[]) =>
-  [
-    "error: Your local changes to the following files would be overwritten by checkout:",
-    ...paths.map((p) => `\t${p}`),
-    "Please commit your changes or stash them before you switch branches.",
-  ].join("\n");
-const UNTRACKED_OVERWRITTEN = (paths: string[]) =>
-  [
-    "error: The following untracked working tree files would be overwritten by checkout:",
-    ...paths.map((p) => `\t${p}`),
-    "Please move or remove them before you switch branches.",
-  ].join("\n");
 
 /**
  * Command to checkout branches, commits, or paths.
@@ -351,24 +344,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     };
   }
 
-  /**
-   * Whether the worktree file at `path` no longer holds the index entry (git's
-   * `verify_uptodate`): changed content or type. A missing file is no local change.
-   */
-  private async worktreeDiffers(worktree: Worktree, path: string, entry: Side): Promise<boolean> {
-    const current = await worktree.getEntry(path);
-    if (!current) return false;
-    if (current.isDirectory) return entry.mode !== FileMode.GITLINK;
-    if (entry.mode === FileMode.GITLINK) return false;
-    // the stat the index recorded still matches: unchanged, as git's ie_match_stat
-    if (entry.mtime && current.size === entry.size && current.mtime === entry.mtime) {
-      return false;
-    }
-    if ((current.mode === FileMode.SYMLINK) !== (entry.mode === FileMode.SYMLINK)) {
-      // a link written as a file (core.symlinks=false) is still the link
-      if (worktree.capabilities?.symlinks !== false) return true;
-    }
-    return (await worktree.computeHash(path)) !== entry.objectId;
+  /** Whether an untracked (not ignored) file or link is at `path`. */
+  private async untrackedFileAt(worktree: Worktree, path: string): Promise<boolean> {
+    const entry = await worktree.getEntry(path);
+    return !!entry && !entry.isDirectory && !(await worktree.isIgnored(path));
   }
 
   /**
@@ -439,6 +418,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const switched: string[] = [];
     const local: string[] = [];
     const untracked: string[] = [];
+    const untrackedRemoved: string[] = [];
+    const lostDirs: string[] = [];
+    const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
+    const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     const paths = [...new Set([...head.keys(), ...target.keys()])].sort();
     // (an orphan branch keeps index and worktree as they are, as git's --orphan)
     for (const path of this.orphan ? [] : paths) {
@@ -450,35 +433,51 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         if (!sameSide(i, t) || t) switched.push(path);
         continue;
       }
-      if (sameSide(i, t)) continue; // the index already holds the target: kept
+      if (sameSide(i, t)) {
+        // kept; but a staged deletion the target also makes leaves the file untracked in
+        // the worktree, and the switch would remove it (git refuses)
+        if (h && !i && !t && worktree && (await this.untrackedFileAt(worktree, path))) {
+          untrackedRemoved.push(path);
+        }
+        continue;
+      }
       if (!sameSide(i, h)) {
         // staged changes (or a staged deletion) the switch would lose
         if (i !== undefined || t !== undefined) local.push(path);
         continue;
       }
-      if (i === undefined) {
-        // in neither HEAD nor the index: an untracked file stands where the target writes
-        if (t && worktree && (await worktree.exists(path)) && !(await worktree.isIgnored(path))) {
-          untracked.push(path);
-          continue;
-        }
-      } else if (worktree && (await this.worktreeDiffers(worktree, path, i))) {
+      if (i !== undefined && worktree && (await worktreeDiffers(worktree, path, i, trust))) {
         local.push(path);
         continue;
       }
       switched.push(path);
     }
-    if (local.length > 0 || untracked.length > 0) {
-      const message = [
-        ...(local.length > 0 ? [WOULD_OVERWRITE(local)] : []),
-        ...(untracked.length > 0 ? [UNTRACKED_OVERWRITTEN(untracked)] : []),
-        "Aborting",
-      ].join("\n");
+
+    // what stands where the switch writes (git's verify_absent, check_leading_path and
+    // verify_clean_subdirectory): untracked files or links on the path or a leading
+    // component, untracked files in a directory a file replaces
+    if (worktree && !this.force) {
+      const found = await findInTheWay(worktree, {
+        writes: switched.filter((p) => target.has(p)),
+        removes: new Set(switched.filter((p) => !target.has(p))),
+        index,
+        ignoreCase,
+      });
+      untracked.push(...found.untracked);
+      lostDirs.push(...found.lostDirs);
+    }
+    if (local.length + untracked.length + untrackedRemoved.length + lostDirs.length > 0) {
+      const message = overwriteMessage("checkout", {
+        local,
+        lostDirs,
+        untracked,
+        untrackedRemoved,
+      });
       return {
         status: CheckoutStatus.CONFLICTS,
         updated: [],
         removed: [],
-        conflicts: [...local, ...untracked],
+        conflicts: [...local, ...lostDirs, ...untracked, ...untrackedRemoved],
         ref: null,
         message,
       };
@@ -499,6 +498,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       for (const path of switched) {
         if (target.has(path)) continue;
         await worktree.remove(path);
+        await pruneEmptyParents(worktree, path);
         removed.push(path);
       }
       // a forced checkout also drops tracked files no tree holds any more
@@ -515,10 +515,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         entries: plan.entries.filter((e) => switching.has(e.path)),
         gitlinks: plan.gitlinks.filter((e) => switching.has(e.path)),
       };
+      // everything in the way was checked above (or the checkout is forced): a file or link
+      // where a directory goes, a clean directory where a file goes, are replaced
       await writeTreeRestorePlan(worktree, this.blobs, only, CHECKOUT, {
         symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
         gitlinks: true,
-        replaceInTheWay: this.force,
+        replaceInTheWay: true,
       });
       updated.push(...only.entries.map((e) => e.path));
     }

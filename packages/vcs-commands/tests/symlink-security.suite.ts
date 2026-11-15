@@ -145,6 +145,24 @@ async function commit(
   return id;
 }
 
+/**
+ * Two commits on main and `other`: HEAD at main (`from`, checked out with reset --hard),
+ * `other` holding `to`.
+ */
+async function branches(
+  wc: WorkingCopy,
+  from: Record<string, [string, number]>,
+  to: Record<string, [string, number]>,
+): Promise<Git> {
+  const git = Git.fromWorkingCopy(wc);
+  const main = await commit(wc, from, "main");
+  await git.reset().setMode(ResetMode.HARD).setRef(main).call();
+  const other = await commit(wc, to, "other");
+  await wc.history.refs.set("refs/heads/other", other);
+  await wc.history.refs.set("refs/heads/main", main);
+  return git;
+}
+
 /** The suite, for one link-aware FilesApi implementation. */
 export function describeSymlinkSecurity(factory: LinkAwareFactory): void {
   describe(`symbolic-link security (${factory.name})`, () => {
@@ -387,6 +405,127 @@ export function describeSymlinkSecurity(factory: LinkAwareFactory): void {
       ).rejects.toThrow(/collides|not a directory/);
     });
 
+    const F = FileMode.REGULAR_FILE;
+
+    it("stash apply never deletes an untracked directory, nor overwrites unrelated edits", async () => {
+      const wc = workingCopyOver(files);
+      const git = Git.fromWorkingCopy(wc);
+      await files.remove(`${ROOT}/x`);
+      const head = await commit(wc, { a: ["a\n", F], b: ["b\n", F] }, "base");
+      await git.reset().setMode(ResetMode.HARD).setRef(head).call();
+      const { trees, blobs, commits, refs } = wc.history;
+      const blob = async (t: string) => blobs.store([enc.encode(t)]);
+      const tree = await trees.store([
+        { name: "a", mode: F, id: await blob("a stashed\n") },
+        { name: "b", mode: F, id: await blob("b\n") },
+        { name: "spot", mode: F, id: await blob("spot\n") },
+      ]);
+      const who = testAuthor();
+      const index = await commits.store({
+        tree,
+        parents: [head],
+        author: who,
+        committer: who,
+        message: "i",
+      });
+      const stash = await commits.store({
+        tree,
+        parents: [head, index],
+        author: who,
+        committer: who,
+        message: "WIP",
+      });
+      await refs.set("refs/stash", stash);
+
+      await files.write(`${ROOT}/spot/precious.txt`, [enc.encode("precious\n")]);
+      await expect(git.stashApply().call()).rejects.toThrow(
+        /Updating the following directories would lose untracked files in them:\n\tspot\n\nAborting/,
+      );
+      expect(await text(files, `${ROOT}/spot/precious.txt`)).toBe("precious\n");
+      expect(await text(files, `${ROOT}/a`)).toBe("a\n");
+
+      await files.remove(`${ROOT}/spot`);
+      await files.write(`${ROOT}/b`, [enc.encode("b EDITED\n")]);
+      await git.stashApply().call();
+      expect(await text(files, `${ROOT}/a`)).toBe("a stashed\n");
+      expect(await text(files, `${ROOT}/b`)).toBe("b EDITED\n");
+
+      await git.reset().setMode(ResetMode.HARD).setRef(head).call();
+      await files.write(`${ROOT}/a`, [enc.encode("a EDITED\n")]);
+      await expect(git.stashApply().call()).rejects.toThrow(
+        /Your local changes to the following files would be overwritten by merge:\n\ta\n/,
+      );
+      expect(await text(files, `${ROOT}/a`)).toBe("a EDITED\n");
+    });
+
+    it("checkout refuses an untracked file on a leading component, removing nothing", async () => {
+      const wc = workingCopyOver(files);
+      const git = await branches(wc, { gone: ["gone\n", F] }, { "new/x": ["x\n", F] });
+      await files.write(`${ROOT}/new`, [enc.encode("untracked\n")]);
+      const result = await git.checkout().setName("other").call();
+      expect(result.status).toBe("CONFLICTS");
+      expect(result.message).toContain(
+        "untracked working tree files would be overwritten by checkout:\n\tnew\n",
+      );
+      expect(await text(files, `${ROOT}/gone`)).toBe("gone\n");
+    });
+
+    it("checkout switches a clean directory to a file, refusing one with untracked files", async () => {
+      const wc = workingCopyOver(files);
+      const git = await branches(wc, { "d/x": ["x\n", F] }, { d: ["file\n", F] });
+      await files.write(`${ROOT}/d/extra`, [enc.encode("untracked\n")]);
+      const refused = await git.checkout().setName("other").call();
+      expect(refused.message).toBe(
+        "error: Updating the following directories would lose untracked files in them:\n\td\n\nAborting",
+      );
+      expect(await text(files, `${ROOT}/d/x`)).toBe("x\n");
+      await files.remove(`${ROOT}/d/extra`);
+      const switched = await git.checkout().setName("other").call();
+      expect(switched.status).toBe("OK");
+      expect(await text(files, `${ROOT}/d`)).toBe("file\n");
+    });
+
+    it("checkout refuses a local executable-bit change on a path the target changes", async () => {
+      const wc = workingCopyOver(files);
+      if (!wc.worktree.capabilities?.executable) return;
+      const git = await branches(wc, { run: ["1\n", F] }, { run: ["2\n", F] });
+      await files.chmod?.(`${ROOT}/run`, 0o755);
+      const result = await git.checkout().setName("other").call();
+      expect(result.status).toBe("CONFLICTS");
+      expect(result.message).toContain(
+        "Your local changes to the following files would be overwritten",
+      );
+    });
+
+    it("checkout refuses to remove a file a staged deletion left untracked", async () => {
+      const wc = workingCopyOver(files);
+      const git = await branches(wc, { keep: ["k\n", F], gone: ["g\n", F] }, { keep: ["k\n", F] });
+      await wc.checkout.staging.removeEntry("gone");
+      const result = await git.checkout().setName("other").call();
+      expect(result.message).toBe(
+        [
+          "error: The following untracked working tree files would be removed by checkout:",
+          "\tgone",
+          "Please move or remove them before you switch branches.",
+          "Aborting",
+        ].join("\n"),
+      );
+      expect(await text(files, `${ROOT}/gone`)).toBe("g\n");
+    });
+
+    it("checkout overwrites an ignored file in the way (.gitignore read as git)", async () => {
+      const wc = workingCopyOver(files);
+      const git = await branches(
+        wc,
+        { ".gitignore": ["*.log\n", F] },
+        { ".gitignore": ["*.log\n", F], "new.log": ["tracked\n", F] },
+      );
+      await files.write(`${ROOT}/new.log`, [enc.encode("ignored scratch\n")]);
+      const result = await git.checkout().setName("other").call();
+      expect(result.status).toBe("OK");
+      expect(await text(files, `${ROOT}/new.log`)).toBe("tracked\n");
+    });
+
     if (factory.windows) {
       it("on Windows refuses a backslash path; elsewhere it is a file name", async () => {
         const win = await factory.windows?.();
@@ -432,6 +571,21 @@ export function describeSymlinkSecurity(factory: LinkAwareFactory): void {
               symlinks: true,
             }),
           ).rejects.toThrow(/collides/);
+
+          // a case-only rename switches, as git does on a case-folding worktree
+          await folded.files.mkdir(ROOT);
+          const renaming = workingCopyOver(folded.files);
+          (renaming.config as Record<string, unknown>)["core.ignorecase"] = "true";
+          const git = await branches(
+            renaming,
+            { README: ["text\n", FileMode.REGULAR_FILE] },
+            { readme: ["text\n", FileMode.REGULAR_FILE] },
+          );
+          const switched = await git.checkout().setName("other").call();
+          expect(switched.status).toBe("OK");
+          const names: string[] = [];
+          for await (const entry of folded.files.list(ROOT)) names.push(entry.name);
+          expect(names).toEqual(["readme"]);
         } finally {
           await folded.cleanup();
         }

@@ -48,7 +48,7 @@ describe.skipIf(!hasGit || process.platform === "win32")(
     it("follows a .git linked outside the worktree, as git does", async () => {
       mkdirSync(join(base, "work"));
       symlinkSync(join(base, "real/.git"), join(base, "work/.git"));
-      const files = new PosixNodeFilesApi({ rootDir: join(base, "work") });
+      const files = new PosixNodeFilesApi({ rootDir: join(base, "work"), openLinkTargets: true });
       const { history } = await createGitFilesBackend({ files });
       expect((await history.refs.resolve("HEAD"))?.objectId).toBe(
         git(join(base, "real"), "rev-parse", "HEAD"),
@@ -62,7 +62,7 @@ describe.skipIf(!hasGit || process.platform === "win32")(
       symlinkSync(join(base, "real/.git/objects"), join(split, ".git/objects"));
       git(split, "update-ref", "refs/heads/main", git(join(base, "real"), "rev-parse", "HEAD"));
       const { history } = await createGitFilesBackend({
-        files: new PosixNodeFilesApi({ rootDir: split }),
+        files: new PosixNodeFilesApi({ rootDir: split, openLinkTargets: true }),
       });
       const head = (await history.refs.resolve("HEAD"))?.objectId ?? "";
       expect(await history.commits.load(head)).toBeDefined();
@@ -98,5 +98,21 @@ describe("a symlinked .git (simulated links)", () => {
     await files.symlink?.(new TextEncoder().encode("../store/git"), "/work/.git");
     const { history } = await createGitFilesBackend({ files, gitDir: "/work/.git" });
     expect((await history.refs.resolve("HEAD"))?.objectId).toBe(commit);
+  });
+});
+
+describe.skipIf(!hasGit || process.platform === "win32")("openLinkTarget is opt-in", () => {
+  it("never reaches outside the root unless enabled", async () => {
+    const base = mkdtempSync(join(tmpdir(), "linked-git-optin-"));
+    try {
+      git(base, "init", "-q", "--initial-branch=main", "real");
+      mkdirSync(join(base, "work"));
+      symlinkSync(join(base, "real/.git"), join(base, "work/.git"));
+      const files = new PosixNodeFilesApi({ rootDir: join(base, "work") });
+      expect(await files.openLinkTarget("/.git")).toBeUndefined();
+      await expect(createGitFilesBackend({ files })).rejects.toThrow(/symbolic link/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

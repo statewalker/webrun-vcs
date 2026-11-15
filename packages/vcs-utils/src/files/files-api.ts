@@ -210,4 +210,11 @@ export interface PosixFilesApi extends FilesApi {
    * is no link to a directory, or the storage cannot reach the target.
    */
   openLinkTarget?(path: string): Promise<PosixFilesApi | undefined>;
+  /**
+   * A view of the same storage for one batch of operations (a worktree walk, a checkout's
+   * writes) that may cache which directories it verified not to be links, as git's
+   * per-command lstat cache; the caller drops it when the batch ends. The instance itself
+   * never caches across calls, so a change made outside is always seen.
+   */
+  withLstatCache?(): PosixFilesApi;
 }

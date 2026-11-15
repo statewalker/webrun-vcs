@@ -285,3 +285,44 @@ describe("PosixNodeFilesApi writes as NodeFilesApi (replaceFile, writeBatched)",
     expect((await files.lstat("/pipe"))?.kind).toBe("other");
   });
 });
+
+describe("PosixNodeFilesApi caches nothing across calls; a batch view only within a batch", () => {
+  let base: string;
+  let root: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "posix-cache-"));
+    root = join(base, "root");
+    mkdirSync(root);
+    mkdirSync(join(base, "outside"));
+  });
+  afterEach(() => rmSync(base, { recursive: true, force: true }));
+
+  it("sees a directory swapped for a link outside since its last call", async () => {
+    const files = new PosixNodeFilesApi({ rootDir: root });
+    await files.write("/a/x", [enc.encode("x")]);
+    rmSync(join(root, "a"), { recursive: true });
+    symlinkSync("../outside", join(root, "a"));
+    await expect(files.write("/a/y", [enc.encode("y")])).rejects.toBeInstanceOf(BeyondSymlinkError);
+    await expect(files.chmod("/a/y", 0o777)).rejects.toBeInstanceOf(BeyondSymlinkError);
+    expect(readdirSync(join(base, "outside"))).toEqual([]);
+  });
+
+  it("a batch view recovers from a directory removed behind it", async () => {
+    const view = new PosixNodeFilesApi({ rootDir: root }).withLstatCache();
+    await view.write("/a/b/x", [enc.encode("x")]);
+    rmSync(join(root, "a"), { recursive: true });
+    await view.write("/a/b/y", [enc.encode("y")]);
+    expect(readFileSync(join(root, "a/b/y"), "utf8")).toBe("y");
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "chmods a file it cannot read",
+    async () => {
+      const files = new PosixNodeFilesApi({ rootDir: root });
+      writeFileSync(join(root, "w"), "x");
+      chmodSync(join(root, "w"), 0o200);
+      await files.chmod("/w", 0o644);
+      expect(statSync(join(root, "w")).mode & 0o777).toBe(0o644);
+    },
+  );
+});

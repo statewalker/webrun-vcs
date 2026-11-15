@@ -28,7 +28,11 @@ import { PosixNodeFilesApi } from "./posix-node-files-api.js";
  * });
  * ```
  */
-export function createNodeFilesApi(options: { rootDir: string }): PosixFilesApi {
+export function createNodeFilesApi(options: {
+  rootDir: string;
+  /** Let `openLinkTarget` reach a linked `.git` outside the root (repository opening) */
+  openLinkTargets?: boolean;
+}): PosixFilesApi {
   return new PosixNodeFilesApi(options);
 }
 

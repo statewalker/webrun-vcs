@@ -3,8 +3,12 @@
  * ({@link createSubtreeFilesApi}), and FilesApis mounted at paths of another
  * ({@link createMountedFilesApi}). Both pass the optional `PosixFilesApi` members (links,
  * modes, separators) through to the FilesApi that holds the path, so a mounted or
- * sub-rooted link-aware storage keeps its no-follow guarantees.
+ * sub-rooted link-aware storage keeps its no-follow guarantees. A path with `..` is refused
+ * (it could leave a subtree). `openLinkTarget` (which may reach beyond a root) is passed
+ * through only when asked for (`forwardOpenLinkTarget`).
  */
+
+import { mergeInPathOrder } from "@statewalker/webrun-files";
 
 import { BeyondSymlinkError } from "./beyond-symlink-error.js";
 import type {
@@ -31,20 +35,36 @@ interface Route {
 const join = (prefix: string, rest: string) =>
   prefix === "/" ? rest : rest === "/" ? prefix : `${prefix}${rest}`;
 
+/** Options of the composing wrappers. */
+export interface ComposedFilesApiOptions {
+  /** Pass `openLinkTarget` through (it may reach beyond a root; default off). */
+  forwardOpenLinkTarget?: boolean;
+}
+
+interface RoutedConfig {
+  route: (path: string) => Route;
+  separators?: string;
+  refusesBeyondLinks?: boolean;
+  /** Mount points (outer paths) and their FilesApis, for listings and removals */
+  mounts?: { point: string; files: PosixFilesApi }[];
+  forwardOpenLinkTarget?: boolean;
+}
+
 class RoutedFilesApi implements PosixFilesApi {
   readonly pathSeparators?: string;
   readonly refusesBeyondLinks?: boolean;
+  private readonly route: (path: string) => Route;
+  private readonly mounts: { point: string; files: PosixFilesApi }[];
 
-  constructor(
-    private readonly route: (path: string) => Route,
-    separators?: string,
-    refusesBeyondLinks?: boolean,
-  ) {
-    if (separators) this.pathSeparators = separators;
-    if (refusesBeyondLinks) this.refusesBeyondLinks = true;
+  constructor(private readonly config: RoutedConfig) {
+    this.route = config.route;
+    this.mounts = config.mounts ?? [];
+    if (config.separators) this.pathSeparators = config.separators;
+    if (config.refusesBeyondLinks) this.refusesBeyondLinks = true;
   }
 
   private at(path: string): Route {
+    if (path.split("/").includes("..")) throw new Error(`'..' in path: ${path}`);
     return this.route(normalizePath(path));
   }
 
@@ -85,8 +105,14 @@ class RoutedFilesApi implements PosixFilesApi {
     await r.files.mkdir(r.path).catch((e) => this.outerError(e, r, path));
   }
 
+  /** Refuses to remove a mount point or a directory holding one (it would empty a mount). */
   async remove(path: string): Promise<boolean> {
     const r = this.at(path);
+    const outer = normalizePath(path);
+    const held = this.mounts.find(
+      (m) => m.point === outer || outer === "/" || m.point.startsWith(`${outer}/`),
+    );
+    if (held) throw new Error(`cannot remove ${outer}: ${held.point} is a mount point`);
     return r.files.remove(r.path).catch((e) => this.outerError(e, r, path));
   }
 
@@ -95,14 +121,52 @@ class RoutedFilesApi implements PosixFilesApi {
     return r.files.stats(r.path).catch((e) => this.outerError(e, r, path));
   }
 
+  /**
+   * The entries of the FilesApi holding `path`, with the mount points below it (as
+   * directories) and, recursively, what is mounted there, in path order.
+   */
   async *list(path: string, options?: ListOptions): AsyncIterable<FileInfo> {
     const r = this.at(path);
-    try {
-      for await (const entry of r.files.list(r.path, options)) {
-        yield { ...entry, path: r.outer(entry.path) };
+    const outer = normalizePath(path);
+    const below = this.mounts.filter(
+      (m) => m.point !== outer && (outer === "/" || m.point.startsWith(`${outer}/`)),
+    );
+    const own = async function* (this: RoutedFilesApi) {
+      try {
+        for await (const entry of r.files.list(r.path, options)) {
+          const p = r.outer(entry.path);
+          if (below.some((m) => p === m.point || p.startsWith(`${m.point}/`))) continue;
+          yield { ...entry, path: p };
+        }
+      } catch (error) {
+        this.outerError(error, r, path);
       }
-    } catch (error) {
-      this.outerError(error, r, path);
+    }.call(this);
+    if (below.length === 0) {
+      yield* own;
+      return;
+    }
+    const recursive = options?.recursive === true;
+    const mounted = below
+      .filter((m) => recursive || m.point.slice(0, m.point.lastIndexOf("/") || 1) === outer)
+      .map((m) =>
+        (async function* () {
+          const name = m.point.slice(m.point.lastIndexOf("/") + 1);
+          yield { name, path: m.point, kind: "directory" as const };
+          if (!recursive) return;
+          for await (const entry of m.files.list("/", { recursive: true })) {
+            yield { ...entry, path: join(m.point, normalizePath(entry.path)) };
+          }
+        })(),
+      );
+    type Info =
+      Parameters<typeof mergeInPathOrder>[0][number] extends AsyncIterable<infer T> ? T : never;
+    for await (const entry of mergeInPathOrder([
+      ...(mounted as unknown as AsyncIterable<Info>[]),
+      own as unknown as AsyncIterable<Info>,
+    ])) {
+      if (options?.after !== undefined && entry.path <= options.after) continue;
+      yield entry as unknown as FileInfo;
     }
   }
 
@@ -158,6 +222,7 @@ class RoutedFilesApi implements PosixFilesApi {
   }
 
   async openLinkTarget(path: string): Promise<PosixFilesApi | undefined> {
+    if (!this.config.forwardOpenLinkTarget) return undefined;
     const r = this.at(path);
     return r.files.openLinkTarget?.(r.path);
   }
@@ -172,11 +237,16 @@ class RoutedFilesApi implements PosixFilesApi {
  * await gitFiles.read("/HEAD"); // reads /repo/.git/HEAD of `files`
  * ```
  */
-export function createSubtreeFilesApi(base: FilesApi, root: string): PosixFilesApi {
+export function createSubtreeFilesApi(
+  base: FilesApi,
+  root: string,
+  options: ComposedFilesApiOptions = {},
+): PosixFilesApi {
+  if (root.split("/").includes("..")) throw new Error(`'..' in path: ${root}`);
   const prefix = normalizePath(root);
   const posix = base as PosixFilesApi;
-  return new RoutedFilesApi(
-    (path) => ({
+  return new RoutedFilesApi({
+    route: (path) => ({
       files: posix,
       path: join(prefix, path),
       outer: (inner) => {
@@ -184,9 +254,10 @@ export function createSubtreeFilesApi(base: FilesApi, root: string): PosixFilesA
         return normalizePath(rest);
       },
     }),
-    posix.pathSeparators,
-    posix.refusesBeyondLinks,
-  );
+    separators: posix.pathSeparators,
+    refusesBeyondLinks: posix.refusesBeyondLinks,
+    forwardOpenLinkTarget: options.forwardOpenLinkTarget,
+  });
 }
 
 /**
@@ -202,12 +273,16 @@ export function createSubtreeFilesApi(base: FilesApi, root: string): PosixFilesA
 export function createMountedFilesApi(
   base: FilesApi,
   mounts: Record<string, FilesApi>,
+  options: ComposedFilesApiOptions = {},
 ): PosixFilesApi {
   const points = Object.entries(mounts)
-    .map(([point, files]) => [normalizePath(point), files as PosixFilesApi] as const)
+    .map(([point, files]) => {
+      if (point.split("/").includes("..")) throw new Error(`'..' in path: ${point}`);
+      return [normalizePath(point), files as PosixFilesApi] as const;
+    })
     .sort((a, b) => b[0].length - a[0].length);
-  return new RoutedFilesApi(
-    (path) => {
+  return new RoutedFilesApi({
+    route: (path) => {
       for (const [point, files] of points) {
         if (path === point || path.startsWith(`${point}/`)) {
           const inner = normalizePath(path.slice(point.length));
@@ -216,7 +291,11 @@ export function createMountedFilesApi(
       }
       return { files: base as PosixFilesApi, path, outer: (p) => p };
     },
-    (base as PosixFilesApi).pathSeparators,
-    [base, ...Object.values(mounts)].every((f) => (f as PosixFilesApi).refusesBeyondLinks),
-  );
+    separators: (base as PosixFilesApi).pathSeparators,
+    refusesBeyondLinks: [base, ...Object.values(mounts)].every(
+      (f) => (f as PosixFilesApi).refusesBeyondLinks,
+    ),
+    mounts: points.map(([point, files]) => ({ point, files })),
+    forwardOpenLinkTarget: options.forwardOpenLinkTarget,
+  });
 }

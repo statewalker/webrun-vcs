@@ -61,6 +61,12 @@ export interface PosixNodeFilesApiOptions {
    * `\` in a path is refused, since Windows reads it as a separator.
    */
   platform?: NodeJS.Platform;
+  /**
+   * Let `openLinkTarget` open the directory a link points to, outside this root too
+   * (default off): for repository opening, where a `.git` linked elsewhere is followed as
+   * git follows it.
+   */
+  openLinkTargets?: boolean;
 }
 
 /**
@@ -82,18 +88,37 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   /** Every operation refuses a path beneath a link itself (`PosixFilesApi` contract). */
   readonly refusesBeyondLinks = true;
   /**
-   * Real directories this instance found (or made) to be directories, not links, so a
-   * leading component is checked once rather than on every operation. Forgotten whenever
-   * this instance removes or moves anything; a link swapped in behind its back by another
-   * process is seen only after that (as git's lstat cache).
+   * In a batch view only ({@link withLstatCache}): real directories found (or made) to be
+   * directories, not links, so a leading component is checked once per batch rather than on
+   * every operation, as git's per-command lstat cache. Forgotten on this view's removes and
+   * moves, on any ENOENT/ENOTDIR/ELOOP, and when an entry is seen not to be a directory.
+   * A base instance caches nothing: an outside change is always seen.
    */
-  private readonly verified = new Set<string>();
+  private readonly verified?: Set<string>;
+  private readonly options: PosixNodeFilesApiOptions;
 
-  constructor(options?: PosixNodeFilesApiOptions) {
+  constructor(options?: PosixNodeFilesApiOptions, lstatCache?: Set<string>) {
     super(options);
+    this.options = { ...options };
     this.root = nodePath.resolve(options?.rootDir ?? process.cwd());
     this.windows = (options?.platform ?? process.platform) === "win32";
     this.pathSeparators = this.windows ? "/\\" : "/";
+    this.verified = lstatCache;
+  }
+
+  /**
+   * A view of the same root for one batch of operations (a walk, a checkout's writes) that
+   * shares a cache of directories verified not to be links; drop it when the batch ends.
+   */
+  withLstatCache(): PosixNodeFilesApi {
+    return new PosixNodeFilesApi({ ...this.options, rootDir: this.root }, new Set());
+  }
+
+  /** Forgets the batch cache when an error shows the tree changed under it. */
+  private forgetOn(error: unknown): never {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") this.verified?.clear();
+    throw error;
   }
 
   // ========== Path resolution ==========
@@ -130,13 +155,13 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     let current = this.root;
     for (let i = 0; i < segments.length - 1; i++) {
       current = nodePath.join(current, segments[i]);
-      if (this.verified.has(current)) continue;
+      if (this.verified?.has(current)) continue;
       const stat = await lstatOrUndefined(current);
       if (!stat) return real;
       if (stat.isSymbolicLink()) {
         throw new BeyondSymlinkError(virtualPath, `/${segments.slice(0, i + 1).join("/")}`);
       }
-      if (stat.isDirectory()) this.verified.add(current);
+      if (stat.isDirectory()) this.verified?.add(current);
     }
     return real;
   }
@@ -148,12 +173,12 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     let current = this.root;
     for (const part of relative.split(nodePath.sep)) {
       current = nodePath.join(current, part);
-      if (this.verified.has(current)) continue;
+      if (this.verified?.has(current)) continue;
       let stat = await this.entryStat(current);
       if (!stat) {
         try {
           await fs.mkdir(current);
-          this.verified.add(current);
+          this.verified?.add(current);
           continue;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -168,7 +193,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
           code: "ENOTDIR",
         });
       }
-      this.verified.add(current);
+      this.verified?.add(current);
     }
   }
 
@@ -221,6 +246,10 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    * applies).
    */
   override async write(path: string, content: Content): Promise<void> {
+    return this.writeImpl(path, content).catch((e) => this.forgetOn(e));
+  }
+
+  private async writeImpl(path: string, content: Content): Promise<void> {
     const real = await this.realNoLinks(path);
     if (real === this.root) {
       throw Object.assign(new Error(`EISDIR: cannot write the root directory: ${path}`), {
@@ -235,7 +264,17 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       });
     }
     const tmp = nodePath.join(nodePath.dirname(real), tmpName());
-    const handle = await fs.open(tmp, "wx", 0o666);
+    let handle: fs.FileHandle;
+    try {
+      handle = await fs.open(tmp, "wx", 0o666);
+    } catch (error) {
+      // a directory the batch cache vouched for is gone: check the path afresh, once
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !this.verified) throw error;
+      this.verified.clear();
+      await this.realNoLinks(path);
+      await this.mkdirs(nodePath.dirname(real), path);
+      handle = await fs.open(tmp, "wx", 0o666);
+    }
     let done = false;
     try {
       // a regular file keeps its permission bits (as NodeFilesApi); a link is replaced
@@ -255,6 +294,10 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /** `open(path, "wx")`: false when anything (a dangling link too) is at the path. */
   override async createExclusive(path: string, content: Content): Promise<boolean> {
+    return this.createExclusiveImpl(path, content).catch((e) => this.forgetOn(e));
+  }
+
+  private async createExclusiveImpl(path: string, content: Content): Promise<boolean> {
     const real = await this.realNoLinks(path);
     if (real === this.root) return false;
     await this.mkdirs(nodePath.dirname(real), path);
@@ -280,6 +323,10 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   }
 
   override async mkdir(path: string): Promise<void> {
+    return this.mkdirImpl(path).catch((e) => this.forgetOn(e));
+  }
+
+  private async mkdirImpl(path: string): Promise<void> {
     const real = await this.realNoLinks(path);
     await this.mkdirs(real, path);
   }
@@ -313,10 +360,12 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       const entryPath = `${prefix}/${entry.name}`;
       // Dirent reports the entry itself: a link to a directory is not a directory
       if (entry.isDirectory()) {
-        this.verified.add(nodePath.join(dir, entry.name));
+        this.verified?.add(nodePath.join(dir, entry.name));
         infos.push({ name: entry.name, path: entryPath, kind: "directory" });
         continue;
       }
+      // not a directory (any more): never a verified one
+      this.verified?.delete(nodePath.join(dir, entry.name));
       const stat = await lstatOrUndefined(nodePath.join(dir, entry.name));
       if (!stat) continue;
       infos.push({
@@ -349,8 +398,12 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /** A link is unlinked (a dangling one too), a directory removed with what is in it. */
   override async remove(path: string): Promise<boolean> {
+    return this.removeImpl(path).catch((e) => this.forgetOn(e));
+  }
+
+  private async removeImpl(path: string): Promise<boolean> {
     const real = await this.realNoLinks(path);
-    this.verified.clear();
+    this.verified?.clear();
     const stat = await lstatOrUndefined(real);
     if (!stat) return false;
     if (stat.isDirectory()) await fs.rm(real, { recursive: true, force: true });
@@ -363,7 +416,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     const from = await this.realNoLinks(source);
     const to = await this.realNoLinks(target);
     if (!(await lstatOrUndefined(from))) return false;
-    this.verified.clear();
+    this.verified?.clear();
     try {
       await this.mkdirs(nodePath.dirname(to), target);
       await fs.rename(from, to);
@@ -405,10 +458,17 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     try {
       handle = await fs.open(real, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ELOOP") {
         throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
       }
-      throw error;
+      if (code !== "EACCES" && code !== "EPERM") this.forgetOn(error);
+      // no read permission (chmod needs none): lstat again just before a path chmod
+      if ((await fs.lstat(real)).isSymbolicLink()) {
+        throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
+      }
+      await fs.chmod(real, mode & 0o777);
+      return;
     }
     try {
       await handle.chmod(mode & 0o777);
@@ -424,6 +484,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    * components of `path` are still never followed.
    */
   async openLinkTarget(path: string): Promise<PosixNodeFilesApi | undefined> {
+    if (!this.options.openLinkTargets) return undefined;
     const real = await this.realNoLinks(path);
     if (!(await lstatOrUndefined(real))?.isSymbolicLink()) return undefined;
     let target: string;
@@ -433,10 +494,14 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     } catch {
       return undefined;
     }
-    return new PosixNodeFilesApi({ rootDir: target, platform: this.windows ? "win32" : "linux" });
+    return new PosixNodeFilesApi({ ...this.options, rootDir: target });
   }
 
   async symlink(target: Uint8Array, path: string): Promise<void> {
+    return this.symlinkImpl(target, path).catch((e) => this.forgetOn(e));
+  }
+
+  private async symlinkImpl(target: Uint8Array, path: string): Promise<void> {
     const real = await this.realNoLinks(path);
     await this.mkdirs(nodePath.dirname(real), path);
     await fs.symlink(Buffer.from(target), real);

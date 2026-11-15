@@ -6,6 +6,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import type {
   Worktree,
   WorktreeCheckoutOptions,
@@ -62,11 +63,11 @@ export class MockWorktree implements Worktree {
   async computeHash(path: string): Promise<ObjectId> {
     const file = this.files.get(path);
     if (!file) throw new Error(`File not found: ${path}`);
-    // Return a placeholder hash - for full implementation, compute SHA-1
-    const size = file.content.length;
-    return `placeholder-${size}-${path.replace(/[^a-z0-9]/gi, "")}`
-      .substring(0, 40)
-      .padEnd(40, "0");
+    // the git blob id of the content, as a real worktree hashes it (commands compare it
+    // with the index to tell local changes)
+    const header = new TextEncoder().encode(`blob ${file.content.length}\0`);
+    const digest = createSha1().update(header).update(file.content).digest();
+    return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
   }
 
   async *readContent(path: string): AsyncIterable<Uint8Array> {

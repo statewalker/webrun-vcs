@@ -1,4 +1,4 @@
-import type { ObjectId } from "@statewalker/vcs-core";
+import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
@@ -16,6 +16,16 @@ import { mergeTreesThreeWay } from "../tree-merge/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { planTreeRestore, type TreeRestorePlan, writeTreeRestorePlan } from "./tree-restore.js";
+import {
+  type CheckedEntry,
+  findInTheWay,
+  overwriteMessage,
+  pruneEmptyParents,
+  worktreeDiffers,
+} from "./worktree-overwrite-checks.js";
+
+const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
+  a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
 
 /** Names this operation in restore failure messages. */
 const STASH_APPLY = "stash apply";
@@ -279,16 +289,48 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       { symlinks: true, ignoreCase, windows: worktree.capabilities?.windowsPaths === true },
     );
 
-    // A tracked path the merged tree does not account for is one the stash
-    // deleted; it has to go, or the delete half of the stash is silently
-    // dropped. Tracked means "in the index", as it does for `reset --hard`:
-    // untracked files are none of this command's business, and a path removed
-    // from the index is no longer tracked whatever HEAD's tree still says.
-    const trackedPaths = new Set<string>();
+    // Only what the stash changes is touched: the paths where the merged tree differs from
+    // HEAD's are written or removed, every other file (an unrelated unstaged edit, a newly
+    // staged file) is left alone, as git's merge leaves it.
+    const head = await this.flatTree(headCommit.tree);
+    const merged = await this.flatTree(mergeResult.tree);
+    const index = new Map<string, CheckedEntry>();
     for await (const entry of this.staging.entries()) {
-      trackedPaths.add(entry.path);
+      if (entry.stage === 0) index.set(entry.path, entry);
     }
-    const removals = [...trackedPaths].filter((path) => !worktreePlan.paths.has(path));
+    const changed = [...new Set([...head.keys(), ...merged.keys()])]
+      .filter((p) => !sameEntry(head.get(p), merged.get(p)))
+      .sort();
+    // a path whose index entry already holds the result is not touched (its worktree file
+    // stays as it is), as git's merge leaves an unchanged entry
+    const settled = (p: string) => sameEntry(index.get(p), merged.get(p));
+    const writes = changed.filter((p) => merged.has(p) && !settled(p));
+    const removes = changed.filter((p) => !merged.has(p) && index.has(p));
+
+    // git's merge refuses before writing anything (protecting untracked files): local
+    // changes on a path the stash changes, untracked files where it writes, untracked
+    // files in a directory a file of the stash replaces
+    const local: string[] = [];
+    for (const path of changed) {
+      const i = index.get(path);
+      if (sameEntry(i, merged.get(path))) continue; // the index already holds the result
+      if (!sameEntry(i, head.get(path))) local.push(path);
+      else if (i && (await worktreeDiffers(worktree, path, i, trust))) local.push(path);
+    }
+    const found = await findInTheWay(worktree, {
+      writes,
+      removes: new Set(removes),
+      index,
+      ignoreCase,
+    });
+    const refused = overwriteMessage("merge", { local, ...found });
+    if (refused) {
+      throw new StashApplyFailedError(
+        stashId,
+        [...local, ...found.lostDirs, ...found.untracked],
+        refused,
+      );
+    }
 
     const untrackedPlan = await this.planUntrackedRestore(
       stashUntrackedCommit,
@@ -298,15 +340,24 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
 
     // Everything below this line writes. Deletions first, as git's unpack-trees: a
     // deleted file or link `d` makes way for `d/x` and is never written through.
-    for (const path of removals) {
+    for (const path of removes) {
       await worktree.remove(path);
+      await pruneEmptyParents(worktree, path);
     }
-    // as git's merge writes them: a file or link where a directory must go is unlinked
-    // (never followed), so the restore completes instead of stopping half way
-    await writeTreeRestorePlan(worktree, this.blobs, worktreePlan, STASH_APPLY, {
-      symlinks: trust.symlinks,
-      replaceInTheWay: true,
-    });
+    // what stands in the way was checked above: a tracked file or link where a directory
+    // goes is unlinked, a clean directory where a file goes is replaced
+    const writing = new Set(writes);
+    await writeTreeRestorePlan(
+      worktree,
+      this.blobs,
+      {
+        ...worktreePlan,
+        entries: worktreePlan.entries.filter((e) => writing.has(e.path)),
+        gitlinks: [],
+      },
+      STASH_APPLY,
+      { symlinks: trust.symlinks, replaceInTheWay: true },
+    );
     if (untrackedPlan) {
       // Restored untracked files are written to the working tree only - they
       // were untracked when stashed and stay untracked now.
@@ -323,6 +374,20 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       status: StashApplyStatus.OK,
       stashCommit: stashId,
     };
+  }
+
+  /** The blobs, links and gitlinks of a tree, by path. */
+  private async flatTree(treeId: ObjectId): Promise<Map<string, CheckedEntry>> {
+    const out = new Map<string, CheckedEntry>();
+    const walk = async (id: ObjectId, prefix: string): Promise<void> => {
+      for await (const entry of this.trees.loadTree(id)) {
+        const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.mode === FileMode.TREE) await walk(entry.id, path);
+        else out.set(path, { objectId: entry.id, mode: entry.mode });
+      }
+    };
+    await walk(treeId, "");
+    return out;
   }
 
   /**

@@ -747,4 +747,137 @@ describeGit("clone, add and reset never follow symbolic links (native git)", () 
     }
     expect(run(dir, "status", "--porcelain")).toBe(run(native, "status", "--porcelain"));
   });
+  /** Our stash of `files` (path -> content) over HEAD's tree, as `git stash` records one. */
+  async function ourStash(wc: WorkingCopy, files: Record<string, string>): Promise<void> {
+    const { trees, blobs, commits, refs } = wc.history;
+    const head = (await refs.resolve("HEAD"))?.objectId ?? "";
+    const headTree = (await commits.load(head))?.tree ?? "";
+    const entries = new Map<string, { name: string; mode: number; id: string }>();
+    for await (const entry of (await trees.load(headTree)) ?? []) entries.set(entry.name, entry);
+    for (const [name, content] of Object.entries(files)) {
+      entries.set(name, {
+        name,
+        mode: 0o100644,
+        id: await blobs.store([new TextEncoder().encode(content)]),
+      });
+    }
+    const tree = await trees.store([...entries.values()]);
+    const who = {
+      name: "Interop Tester",
+      email: "interop@example.com",
+      timestamp: 1112911993,
+      tzOffset: "+0000",
+    };
+    const index = await commits.store({
+      tree,
+      parents: [head],
+      author: who,
+      committer: who,
+      message: "index",
+    });
+    const stash = await commits.store({
+      tree,
+      parents: [head, index],
+      author: who,
+      committer: who,
+      message: "WIP",
+    });
+    await refs.set("refs/stash", stash);
+  }
+
+  /** What native `git <args>` printed on failure (stderr), or "" on success. */
+  function nativeFails(dir: string, ...args: string[]): string {
+    try {
+      run(dir, ...args);
+      return "";
+    } catch (error) {
+      return String((error as { stderr?: string }).stderr ?? "").trim();
+    }
+  }
+
+  it("stash apply refuses as native git: untracked directory, local changes", async () => {
+    twoBranches();
+    const dir = join(root, "ours");
+    const native = join(root, "native");
+    const { ours, wc } = await open(dir);
+    await ours.clone().setURI(URL).call();
+    run(root, "clone", "-q", src, native);
+
+    // a stash adding `spot`, an untracked directory `spot/` in the way
+    writeFileSync(join(native, "spot"), "spot\n");
+    run(native, "add", "spot");
+    run(native, "stash", "-q");
+    await ourStash(wc, { spot: "spot\n" });
+    for (const d of [dir, native]) {
+      mkdirSync(join(d, "spot"));
+      writeFileSync(join(d, "spot/precious.txt"), "precious\n");
+    }
+    const expectedDir = nativeFails(native, "stash", "apply");
+    expect(expectedDir).toContain("would lose untracked files");
+    const errorDir = await ours
+      .stashApply()
+      .call()
+      .catch((e: Error) => e);
+    expect((errorDir as Error).message).toBe(expectedDir);
+    for (const d of [dir, native]) {
+      expect(readFileSync(join(d, "spot/precious.txt"), "utf8")).toBe("precious\n");
+      rmSync(join(d, "spot"), { recursive: true });
+    }
+
+    // a stash changing same.txt, edited in the worktree meanwhile
+    run(native, "stash", "drop", "-q");
+    writeFileSync(join(native, "same.txt"), "stashed\n");
+    run(native, "stash", "-q");
+    await ourStash(wc, { "same.txt": "stashed\n" });
+    for (const d of [dir, native]) writeFileSync(join(d, "same.txt"), "EDITED\n");
+    const expectedLocal = nativeFails(native, "stash", "apply");
+    expect(expectedLocal).toContain("would be overwritten by merge");
+    const errorLocal = await ours
+      .stashApply()
+      .call()
+      .catch((e: Error) => e);
+    expect((errorLocal as Error).message).toBe(expectedLocal);
+    expect(readFileSync(join(dir, "same.txt"), "utf8")).toBe("EDITED\n");
+  });
+
+  it("checkout refusals read as native git: directories, leading files, staged deletions", async () => {
+    const work = join(root, "work-dirs");
+    run(root, "clone", "-q", "-b", "main", src, work);
+    mkdirSync(join(work, "dd"));
+    writeFileSync(join(work, "dd/x"), "x\n");
+    writeFileSync(join(work, "gone"), "g\n");
+    run(work, "add", ".");
+    run(work, "commit", "-q", "-m", "dirs");
+    run(work, "push", "-q", "origin", "main");
+    run(work, "checkout", "-q", "-b", "flip");
+    run(work, "rm", "-q", "-r", "dd", "gone");
+    writeFileSync(join(work, "dd"), "file\n");
+    mkdirSync(join(work, "lead"));
+    writeFileSync(join(work, "lead/x"), "x\n");
+    run(work, "add", ".");
+    run(work, "commit", "-q", "-m", "flip");
+    run(work, "push", "-q", "origin", "flip");
+    rmSync(work, { recursive: true, force: true });
+
+    const dir = join(root, "ours");
+    const native = join(root, "native");
+    const { ours, wc } = await open(dir);
+    await ours.clone().setURI(URL).call();
+    run(root, "clone", "-q", src, native);
+    run(native, "branch", "-q", "flip", "origin/flip");
+    await ours.branchCreate().setName("flip").setStartPoint("refs/remotes/origin/flip").call();
+
+    // untracked files in a directory a file replaces, an untracked file on a leading
+    // component, a staged deletion of a file the target deletes too
+    for (const d of [dir, native]) {
+      writeFileSync(join(d, "dd/extra"), "untracked\n");
+      writeFileSync(join(d, "lead"), "untracked\n");
+    }
+    run(native, "rm", "-q", "--cached", "gone");
+    await wc.checkout.staging.removeEntry("gone");
+    const expected = nativeFails(native, "checkout", "-q", "flip");
+    const refused = await ours.checkout().setName("flip").call();
+    expect(refused.message).toBe(expected);
+    expect(readFileSync(join(dir, "dd/x"), "utf8")).toBe("x\n");
+  });
 });
