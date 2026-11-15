@@ -10,6 +10,7 @@ export * from "./flat-tree.js";
 export * from "./folder-tree.js";
 export * from "./git-workspace.js";
 export * from "./merge-trees.js";
+export * from "./path-rules.js";
 export * from "./sync-remote.js";
 export * from "./sync-server.js";
 export * from "./sync-workspace.js";

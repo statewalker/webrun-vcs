@@ -380,7 +380,7 @@ describe.skipIf(!gitAvailable())("native git reads the served repository", () =>
     expect(await git(clone, ["rev-parse", "HEAD"])).toBe(merged.head);
     const log = (await git(clone, ["log", "--format=%s|%an|%p"])).split("\n");
     expect(log).toHaveLength(4);
-    expect(log[0]).toMatch(/^Merge [0-9a-f]{7} into main\|Bob\|\S+ \S+$/);
+    expect(log[0]).toMatch(/^Merge origin\/main \([0-9a-f]{7}\) into main\|Bob\|\S+ \S+$/);
     expect(
       log
         .map((l) => l.split("|")[0])

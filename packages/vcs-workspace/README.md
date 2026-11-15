@@ -175,23 +175,38 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
 ### How remote changes come in
 
 - **Fast-forward** when the local branch is behind: the folder is brought to the remote commit, writing only the files that differ.
-- **Merge** when both sides committed: a merge commit with both parents. Paths only one side changed are taken from that side. Text files both sides changed are merged line by line (`merge3Way` of `@statewalker/vcs-utils`).
-- **Conflicts are kept and reported, never resolved silently.** The merge commit holds both sides: git's conflict markers in a text file, the other side's copy as `<path>.theirs-<id>` next to a binary file, the changed version where one side deleted the file. The paths are in `result.conflicts`, in the `integrate` event and in the merge commit's message. The merge is committed and pushed, so every workspace sees the same marked file, and fixing it is an ordinary edit that the next sync carries.
+- **Merge** when both sides committed: a merge commit with both parents, against the best common ancestor (git's `merge-base`). When there are several (a criss-cross history), they are first merged into a virtual base, recursively, as git's recursive strategy does. Paths only one side changed are taken from that side. Text files both sides changed are merged line by line with `mergeLines` of `@statewalker/vcs-utils`. That merge works on bytes: it splits on LF and keeps every terminator, so CRLF files, a missing final newline and non-UTF-8 text come out unchanged. A file with a NUL byte in its first 8000 bytes is binary, as git decides it.
+- **Conflicts are kept and reported, never resolved silently.** The merge commit holds both sides:
+  - text files get git's markers, labelled with the branch and the commit: `<<<<<<< main (1a2b3c4)` … `=======` … `>>>>>>> origin/main (5d6e7f8)`, in the file's own line ending;
+  - a binary file keeps ours, with theirs next to it as `<path>.theirs-<id>` (`-2`, `-3`… when that name is taken);
+  - a change against a deletion keeps the change;
+  - a file against a directory moves the file aside as `<path>.ours-<id>` or `<path>.theirs-<id>`, after the side it came from.
+
+  The paths are in `result.conflicts`, in the `integrate` event and in the merge commit's message. The merge is committed and pushed, so every workspace sees the same marked file, and fixing it is an ordinary edit that the next sync carries.
+
+### What the folder cannot hold stays in history
+
+- **Ignored paths** (`ignore`, default `.git/`) are never committed, never written or removed by a checkout, and kept in history as they are: an ignored file another workspace committed stays in the tree, and deleting it locally records nothing.
+- **Unsafe paths** are refused. Every path of a fetched tree is checked against git's `verify_path` rules before anything is written: no `.git` component in any letter case (nor `.git.` or `git~1`), no `..`, `.` or empty component, no absolute path, backslash or NUL. A remote commit with such a path fails the sync with a `SyncError`, and nothing is written. A folder's own `.git` directory is never committed, whatever `ignore` says.
+- **Modes and submodules.** Submodule entries are never checked out and stay in every commit. An executable file stays executable when its content changes. A symbolic link is written as a file holding its target and keeps its mode.
+- **Case.** On a case-insensitive folder (probed with a temporary file when the workspace opens, or set with `caseInsensitive`), two paths that differ only in case would be one file. One of them is moved aside (`<path>.case-<id>`) in a commit on top, and reported as a conflict.
 
 ### Why a failure leaves nothing half-done
 
-The branch always names the commit the folder holds. A fetched commit is checked out into the folder first, and the branch moves last (by compare-and-swap). So a failure in between, such as a disk that fills up mid-checkout, leaves the branch at the previous commit, and the next sync records the files already written as a change identical to the remote's, which merges cleanly.
+The branch always names the commit the folder holds. Before a checkout, the target commit is recorded (`refs/workspace/pending/main`). Then the folder is checked out, the branch moves (by compare-and-swap), and the record goes. A checkout cut short, by a full disk for example, is finished at the start of the next commit or sync: files still at the old content get the new one, and files already written stay. So a half-written folder is never committed as local edits, and a conflicted merge does not come back with its markers nested.
 
-An edit made while a sync runs is never overwritten. Before writing, the sync checks that the folder still matches the branch; if not, it starts the round again and commits the edit first.
+An edit made while a sync runs is not overwritten, with one small window left. Before the checkout, the sync checks that the folder still matches the branch; if not, it starts the round again and commits the edit first. Then, just before each file is replaced or removed, its content is hashed again; the new content goes to a temporary file that is moved in place only after that check. An edit found there stops the checkout. The next round finishes it and merges the edited file with the new content (both kept, reported). What remains is the moment between the last check of a file and the move: a save that lands exactly then is replaced. The temporary file is never committed.
 
-On the wire, objects arrive before refs move on both sides. A link cut mid-fetch leaves no tracking ref. A push cut mid-pack leaves the server's branch where it was (receive-pack quarantines the pack). Both reject with a `SyncError`, and the next sync over a working link completes.
+Failures reject with a `SyncError`: a fetch or push that fails, a checkout that cannot write, a refused path. On the wire, objects arrive before refs move on both sides. A link cut mid-fetch leaves no tracking ref. A push cut mid-pack leaves the server's branch where it was (receive-pack quarantines the pack). The next sync over a working link completes.
+
+Only a lost race is retried: a push refused as a non-fast-forward or fetch-first, or a ref that moved under receive-pack's compare-and-swap (`cannot lock ref`, `failed to update ref`). Any other refusal, such as a declined hook, fails at once.
 
 ### What it does not do
 
 - The served repository is bare. A workspace syncs with a server, or a hub reached through a mesh. It does not serve its own folder to peers that push into it.
 - There is no folder watcher. Call `syncWorkspace` on a timer, on a push notification, or when the user saves.
-- A folder has no file modes or symlinks: files are committed as regular files, and submodule entries are not checked out.
 - Merges are not deterministic across workspaces. Only one workspace makes a given merge, because it pushes the merge and the others fast-forward to it.
+- Merge bases are found by walking the whole history of both sides, which is fine for a folder's history but not tuned for very large repositories.
 
 ## Internals
 
@@ -235,8 +250,7 @@ A `WorkspaceCheckpoint` maps a working-tree manifest to the commit made from it,
 
 - `@statewalker/webrun-files-sync`: `plan` / `execute` for file mirroring, `buildAnchor` for manifests.
 - `@statewalker/webrun-content-store`: the `ContentStore` type for large objects.
-- `@statewalker/vcs-core`, `@statewalker/vcs-transport`, `@statewalker/vcs-utils`: the `./net` entry only (objects and refs; the fetch and push clients and the server; the line merge). The root entry imports none of them, and `tests/ban.test.ts` checks that it does not reach into `net/`.
-- `package.json` also lists `@statewalker/vcs-working-tree`, which no source file imports.
+- `@statewalker/vcs-core`, `@statewalker/vcs-transport`, `@statewalker/vcs-utils`, `@statewalker/vcs-working-tree`: the `./net` entry only (objects and refs; the fetch and push clients and the server; the line merge; streamed blob hashing of folder files). The root entry imports none of them, and `tests/ban.test.ts` checks that it does not reach into `net/` in any import form.
 
 ## License
 

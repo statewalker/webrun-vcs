@@ -9,6 +9,10 @@ import type { History, ObjectId, TreeEntry } from "@statewalker/vcs-core";
 export const MODE_FILE = 0o100644;
 /** A directory (a subtree) */
 export const MODE_TREE = 0o040000;
+/** An executable file: written as a plain file, the mode kept in history */
+export const MODE_EXECUTABLE = 0o100755;
+/** A symbolic link: written as a file holding the target, the mode kept in history */
+export const MODE_SYMLINK = 0o120000;
 /** A submodule commit: kept in trees, never written to a folder */
 export const MODE_GITLINK = 0o160000;
 

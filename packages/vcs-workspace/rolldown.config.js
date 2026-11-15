@@ -20,6 +20,7 @@ export default defineConfig({
     /^@statewalker\/vcs-core(\/.*)?$/,
     /^@statewalker\/vcs-transport(\/.*)?$/,
     /^@statewalker\/vcs-utils(\/.*)?$/,
+    /^@statewalker\/vcs-working-tree(\/.*)?$/,
   ],
   treeshake: true,
 });

@@ -7,6 +7,7 @@ export * from "./edit.js";
 export * from "./hashed-sequence.js";
 export * from "./histogram-diff.js";
 export * from "./histogram-diff-index.js";
+export * from "./line-merge.js";
 export * from "./merge-algorithm.js";
 export * from "./myers-diff.js";
 export * from "./raw-text.js";

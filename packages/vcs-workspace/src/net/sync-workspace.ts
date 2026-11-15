@@ -7,9 +7,9 @@
 
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { PushRefUpdate } from "@statewalker/vcs-transport";
+import { FolderChangedError } from "./folder-tree.js";
 import {
   commitFolder,
-  FolderChangedError,
   type GitWorkspace,
   type Integration,
   integrateCommit,
@@ -78,7 +78,18 @@ const RETRY_STATUSES = new Set<PushRefUpdate["status"]>([
   "rejected-fetch-first",
   "rejected-stale",
 ]);
-const RETRY_REASONS = /non-fast-forward|fetch first|stale|failed to (update|lock)|lock|changed/i;
+/**
+ * receive-pack's reasons for a ref that moved under its compare-and-swap (git's ref
+ * transaction messages); anything else, a declined hook for one, is a refusal
+ */
+const RETRY_REASONS =
+  /cannot lock ref|is at [0-9a-f]+ but expected|failed to update ref|non-fast-forward|fetch first|stale info|^locked$/i;
+
+function asSyncError(what: string, error: unknown): SyncError {
+  if (error instanceof SyncError) return error;
+  const reason = error instanceof Error ? error.message : String(error);
+  return new SyncError(`${what}: ${reason}`, { cause: error });
+}
 
 function shouldRetry(update: PushRefUpdate): boolean {
   if (RETRY_STATUSES.has(update.status)) return true;
@@ -137,7 +148,13 @@ async function syncRounds(
   let lastReason = "";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const local = await commitFolder(ws, options.message ?? "Workspace changes");
+    let local: Awaited<ReturnType<typeof commitFolder>>;
+    try {
+      local = await commitFolder(ws, options.message ?? "Workspace changes");
+    } catch (error) {
+      throw asSyncError("committing the folder failed", error);
+    }
+    for (const path of local.conflicts) conflicts.add(path);
     if (local.changed && local.head) {
       committed = true;
       emit({ type: "commit", attempt, commit: local.head });
@@ -160,9 +177,13 @@ async function syncRounds(
     };
     if (theirs) {
       try {
-        integration = await integrateCommit(ws, theirs);
+        integration = await integrateCommit(ws, theirs, {
+          theirsName: `${remote.name}/${branchName}`,
+        });
       } catch (error) {
-        if (!(error instanceof FolderChangedError)) throw error;
+        if (!(error instanceof FolderChangedError)) {
+          throw asSyncError(`bringing in ${remote.name}/${branchName} failed`, error);
+        }
         lastReason = error.message;
         emit({ type: "retry", attempt, reason: lastReason });
         continue;
@@ -202,7 +223,7 @@ async function syncRounds(
     emit({ type: "push", attempt, head, status: update.status });
     if (update.status === "ok" || update.status === "up-to-date") {
       // the remote holds `head` now: remember it, as git updates the tracking ref on push
-      await ws.history.refs.set(tracking, head);
+      await ws.history.refs.set(tracking, head).catch(() => undefined);
       return done(update.status === "ok");
     }
     if (!shouldRetry(update)) {
