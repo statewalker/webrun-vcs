@@ -25,6 +25,18 @@ export interface XorbChunkHeader {
 }
 
 export const XORB_CHUNK_HEADER_SIZE = 8;
+/** the largest chunk xet-core accepts, uncompressed (`xorb_chunk_format.rs`: 128 KiB) */
+export const XORB_MAX_CHUNK_SIZE = 128 * 1024;
+/** the largest chunk payload xet-core accepts, compressed (twice the chunk maximum: 256 KiB) */
+export const XORB_MAX_COMPRESSED_CHUNK_SIZE = 2 * XORB_MAX_CHUNK_SIZE;
+
+/** refuses sizes past xet-core's limits (before a payload is read or decoded) */
+export function checkXorbChunkSizes(compressedSize: number, uncompressedSize: number): void {
+  if (uncompressedSize > XORB_MAX_CHUNK_SIZE)
+    throw new Error(`xorb: a chunk of ${uncompressedSize} bytes (at most 128 KiB)`);
+  if (compressedSize > XORB_MAX_COMPRESSED_CHUNK_SIZE)
+    throw new Error(`xorb: a chunk payload of ${compressedSize} bytes (at most 256 KiB)`);
+}
 
 /** parses a chunk header at `at` */
 export function parseXorbChunkHeader(b: Uint8Array, at = 0): XorbChunkHeader {
@@ -45,6 +57,7 @@ export function decodeXorbChunk(
   payload: Uint8Array,
   size: number,
 ): Uint8Array {
+  checkXorbChunkSizes(payload.length, size);
   if (compression === XorbCompression.None) {
     if (payload.length !== size) throw new Error("xorb: stored chunk of the wrong size");
     return payload.slice();
@@ -154,6 +167,7 @@ export async function* readXorbChunks(
         );
       const h = parseXorbChunkHeader(q.take(XORB_CHUNK_HEADER_SIZE));
       if (h.version !== 0) throw new Error(`xorb: chunk header version ${h.version}`);
+      checkXorbChunkSizes(h.compressedSize, h.uncompressedSize);
       if (!(await need(h.compressedSize))) throw new Error("xorb: truncated chunk");
       yield decodeXorbChunk(h.compression, q.take(h.compressedSize), h.uncompressedSize);
     }

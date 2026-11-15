@@ -5,7 +5,7 @@
 
 import { lz4FrameEncode } from "../lz4/index.js";
 import { bg4Split } from "./bg4.js";
-import { XorbCompression } from "./xorb-reader.js";
+import { XORB_MAX_CHUNK_SIZE, XorbCompression } from "./xorb-reader.js";
 
 /** at most this many chunks in a xorb (the specification's MUST) */
 export const XORB_MAX_CHUNKS = 8192;
@@ -30,7 +30,8 @@ export function writeXorb(
   let total = 0;
   for (const c of chunks) {
     if (c.length === 0) throw new Error("xorb: an empty chunk");
-    if (c.length >= 1 << 24) throw new Error("xorb: a chunk of 16 MiB or more");
+    if (c.length > XORB_MAX_CHUNK_SIZE)
+      throw new Error(`xorb: a chunk of ${c.length} bytes (at most 128 KiB)`);
     let type: number = XorbCompression.None;
     let payload = c;
     if (o.compression !== "none") {

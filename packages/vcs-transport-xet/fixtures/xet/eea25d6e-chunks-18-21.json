@@ -1,0 +1,26 @@
+{
+  "source": "xorb eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632 (xet-team/xet-spec-reference-files@c4aa3a3f15b1395fff5ce934784bf6c8f2d62de8), written by xet-core (lz4_flex frames)",
+  "chunks": {
+    "start": 18,
+    "end": 21
+  },
+  "xorbBytes": {
+    "start": 302237,
+    "end": 315435
+  },
+  "csvOffset": 1444226,
+  "referenceChunks": [
+    {
+      "hash": "950c6e67d689b7645020da275300355c9ccb067661bbf50e32e883b28eebb40a",
+      "length": 18717
+    },
+    {
+      "hash": "02d78b6fb2e416befd771d4a27d41f27a15878748219da5c6575b675a8c9c40d",
+      "length": 15399
+    },
+    {
+      "hash": "3846545f3eb7b5137ccb33488b021672429712ba3dd619367df0cff0214b1323",
+      "length": 12618
+    }
+  ]
+}

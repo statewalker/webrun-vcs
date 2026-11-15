@@ -273,7 +273,7 @@ describe("U6 (review of #123) verification over several terms, range requests an
     }
   };
   const termsOnly = (o: { wholeFile?: boolean } = {}): ReconstructionVerifier => {
-    const v = verifierFromShard(shard, file, o);
+    const v = verifierFromShard(shard, file, { wholeFile: false, ...o }); // explicit: the default is on
     return { rangeHash: v.rangeHash, done: v.done };
   };
 
@@ -380,7 +380,7 @@ describe("U6 (review of #123) verification over several terms, range requests an
     expect((await go([[0, 8]], verifierFromShard(none))).error).toBeUndefined();
     expect(
       (await go([[0, 8]], verifierFromShard(none, undefined, { strict: true }))).error?.message,
-    ).toMatch(/chunk 0 /);
+    ).toMatch(/xorb .* is not in the shard/); // refused before its first chunk
     expect(() => verifierFromShard({ ...shard, chunkHashesKeyed: true })).toThrow(
       /without the footer key/,
     );

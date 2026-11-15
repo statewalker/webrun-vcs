@@ -56,9 +56,26 @@ export interface ReconstructionVerifier {
    */
   rangeHash?: (term: VerifiedTerm) => Uint8Array | undefined;
   /**
+   * Before anything is fetched: the answer's terms, in order. Return a message to refuse the
+   * answer before any byte is yielded (a term list that is not the file's, an unknown xorb).
+   */
+  start?: (terms: VerifiedTerm[]) => string | undefined;
+  /**
    * After the last term of a reconstruction that ran to the end (not cut short by `length`
    * inside a term): the terms it had. Throw (or return a message) to refuse it: a verifier that
    * knows the whole file can require all of it.
    */
   done?: (terms: VerifiedTerm[]) => string | undefined;
+}
+
+export interface ReconstructOptions {
+  /** a range request's length: the last term is truncated to it */
+  length?: number;
+  /** checks chunks and terms as they stream */
+  verify?: ReconstructionVerifier;
+  /**
+   * Each decoded chunk of a term, whole (before `offset_into_first_range` or `length` cut it),
+   * before its bytes are yielded: over a whole file, the file's chunks in order.
+   */
+  onChunk?: (chunk: Uint8Array) => void;
 }

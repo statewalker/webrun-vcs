@@ -11,6 +11,9 @@ data of the Xet protocol specification (https://huggingface.co/docs/xet):
   `….csv.shard.dedupe`: the reference shards, unchanged;
 - `….csv.sha256`: the CSV's SHA-256 (its LFS oid in the Hub's `paths-info`), which the shards'
   metadata extension holds;
+- `eea25d6e-chunks-18-21.xorb-range`: bytes 302,237-315,435 of the reference xorb, chunks 18-20
+  as xet-core wrote them (lz4_flex frames), with `eea25d6e-chunks-18-21.json` naming the range
+  and copying those chunks' hashes and lengths from the `.chunks` list;
 - `recon.recorded.json`: the reconstruction answer of `cas-server.xethub.hf.co` for the CSV's file
   hash (anonymous read token, 2026-11-12), with each signed URL replaced by `xorb://<hash>`.
 

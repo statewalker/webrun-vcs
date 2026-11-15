@@ -21,10 +21,30 @@ const sleep = (ms: number, signal?: AbortSignal) =>
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 
+/**
+ * A `Retry-After` header's pause in milliseconds, up to a minute: delay-seconds or an HTTP date;
+ * `undefined` when absent or unreadable.
+ */
+export function retryAfterMs(value?: string | null, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const v = value.trim();
+  if (/^\d+$/.test(v)) {
+    const s = Number(v);
+    return s > 0 ? Math.min(s, 60) * 1000 : undefined;
+  }
+  const date = Date.parse(v);
+  if (Number.isNaN(date)) return undefined;
+  return Math.min(Math.max(date - now, 0), 60_000);
+}
+
 export interface HttpRangesOptions {
   fetch?: XetFetch;
-  /** failures in a row tried again (default 4); progress resets the count */
+  /** failures in a row tried again (default 4); `minProgress` bytes between two resets it */
   retries?: number;
+  /** failures tried again over one range, whatever the progress (default 64) */
+  maxFailures?: number;
+  /** the bytes between two failures that count as progress (default 64 KiB) */
+  minProgress?: number;
   /** the first pause, doubled on each failure in a row (default 250 ms) */
   backoffMs?: number;
   signal?: AbortSignal;
@@ -38,8 +58,9 @@ export interface HttpRangesOptions {
 /**
  * Xorb byte ranges over HTTP (signed URLs need no token): `Range: bytes=start-end`, the body
  * streamed as it arrives. A failed request (network error, 429, 5xx), or a body that errors or
- * ends early, is tried again from the next byte not yet yielded, after a growing pause (or a
- * 429's `Retry-After`, up to a minute), up to `retries` times in a row. A server that ignores
+ * ends early, is tried again from the next byte not yet yielded, after a growing pause (or the
+ * answer's `Retry-After`, seconds or an HTTP date, up to a minute), up to `retries` times without
+ * `minProgress` bytes in between and `maxFailures` times in all. A server that ignores
  * `Range` (200) is read from the start, skipping what was yielded; a `Content-Range` that starts
  * elsewhere is refused.
  */
@@ -47,20 +68,23 @@ export function httpRanges(o: HttpRangesOptions = {}): FetchRange {
   const f = o.fetch ?? fetch;
   const retries = o.retries ?? 4;
   const backoff = o.backoffMs ?? 250;
+  const maxFailures = o.maxFailures ?? 64;
+  const minProgress = o.minProgress ?? 64 * 1024;
   return async function* (firstUrl, start, end) {
     let url = firstUrl;
     let at = start;
-    let failures = 0;
+    let failures = 0; // in a row: since the last meaningful progress
+    let total = 0; // over the whole range
+    let mark = start; // where the last failure happened
     let refreshed = false;
     const again = async (why: unknown, retryAfter?: string | null) => {
-      if (++failures > retries)
+      // a few bytes between failures is no progress: a peer cutting every few bytes must not
+      // keep the count at zero forever
+      if (at - mark >= minProgress) failures = 0;
+      mark = at;
+      if (++failures > retries || ++total > maxFailures)
         throw why instanceof Error ? why : new XetHttpError(`${url}: ${String(why)}`);
-      const asked = Number(retryAfter);
-      const wait =
-        retryAfter && Number.isFinite(asked) && asked > 0
-          ? Math.min(asked, 60) * 1000
-          : backoff * 2 ** (failures - 1);
-      await sleep(wait, o.signal);
+      await sleep(retryAfterMs(retryAfter) ?? backoff * 2 ** (failures - 1), o.signal);
     };
     while (at <= end) {
       let res: Response;
@@ -123,7 +147,6 @@ export function httpRanges(o: HttpRangesOptions = {}): FetchRange {
             continue;
           }
           at += piece.length;
-          failures = 0;
           refreshed = false;
           yield piece;
           if (at > end) break;

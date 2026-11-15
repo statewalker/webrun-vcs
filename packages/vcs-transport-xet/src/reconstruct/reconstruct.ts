@@ -7,7 +7,7 @@ import { readXorbChunks } from "../xorb/index.js";
 import type {
   FetchRange,
   ReconstructionAnswer,
-  ReconstructionVerifier,
+  ReconstructOptions,
   VerifiedTerm,
 } from "./types.js";
 import { XetIntegrityError } from "./types.js";
@@ -19,11 +19,16 @@ import { XetIntegrityError } from "./types.js";
  * length) truncates the last. The answer has v1's shape (`fetch_info`, `url_range` inclusive);
  * a v2 answer is turned into it by `v2ToV1`. `verify` checks chunks and
  * terms against a shard's hashes as they stream (`ReconstructionVerifier`).
+ *
+ * The output is provisional until the generator completes: a chunk is checked before it is
+ * yielded, but a term's verification hash only once its last chunk is decoded (after up to a
+ * term's bytes), and `done` after the last term. A consumer that must not act on unverified
+ * bytes writes them somewhere provisional and commits only when the loop ends without an error.
  */
 export async function* reconstruct(
   answer: ReconstructionAnswer,
   fetchRange: FetchRange,
-  opts: { length?: number; verify?: ReconstructionVerifier } = {},
+  opts: ReconstructOptions = {},
 ): AsyncGenerator<Uint8Array> {
   const verify = opts.verify;
   const fail = (message: string): never => {
@@ -71,6 +76,10 @@ export async function* reconstruct(
   };
 
   const terms = answer.terms;
+  const refusedUpFront = verify?.start?.(
+    terms.map((t) => ({ xorb: t.hash.toLowerCase(), start: t.range.start, end: t.range.end })),
+  );
+  if (refusedUpFront) fail(`reconstruction: ${refusedUpFront}`);
   const empty = (t: Term) => t.range.end <= t.range.start;
   for (let first = 0; first < terms.length; ) {
     if (empty(terms[first] as Term)) {
@@ -109,6 +118,7 @@ export async function* reconstruct(
       }
       if (!inTerm) continue; // before the term (its fetch range starts earlier, or a gap)
       current.produced += chunk.length;
+      opts.onChunk?.(chunk);
       const endsTerm = i === current.term.range.end - 1;
       if (skip >= chunk.length) skip -= chunk.length;
       else {

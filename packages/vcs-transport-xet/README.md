@@ -25,17 +25,19 @@ for await (const bytes of downloadXetFile(repo, "Electric_Vehicle_Population_Dat
 
 `downloadXetFile` asks the Hub for the file's Xet hash (`paths-info`) and a CAS read token, gets the reconstruction answer (v2, or v1 where v2 is missing), and streams the xorb ranges it names. Nothing larger than one chunk plus one network piece is held, whatever the file's size. Pass `range: { start, end }` (inclusive) for part of a file, `token` in the repository for a private one, and `fetch` to route requests through your own client.
 
+A whole file is checked by default: the Xet file hash is recomputed from the decoded chunks and compared with the one `paths-info` gave, and the byte count with the announced size. Both are known only when the last byte is out, so a mismatch throws `XetIntegrityError` at the end of the loop. **Treat the output as provisional until the loop completes**: write it to a temporary place and move it into position only when no error was thrown. `verifyFile: false` turns the check off; a `range` download is checked only through `verify`.
+
 ### Check every chunk as it arrives
 
 ```typescript
 import { downloadXetFile, hashFromString, readShard, verifierFromShard } from "@statewalker/vcs-transport-xet";
 
 const shard = readShard(shardBytes); // the file's MDB shard, e.g. from your own upload
-const verify = verifierFromShard(shard, hashFromString(fileHash), { wholeFile: true });
+const verify = verifierFromShard(shard, hashFromString(fileHash));
 for await (const bytes of downloadXetFile(repo, path, { verify })) consume(bytes);
 ```
 
-A reconstruction answer carries no hashes, so the hashes come from a shard: each decoded chunk is hashed and compared before it is yielded (a damaged chunk stops the stream there, with `XetIntegrityError`), and each term's verification hash is compared when its last chunk is decoded.
+A reconstruction answer carries no hashes, so the hashes come from a shard: each decoded chunk is hashed and compared before it is yielded (a damaged chunk stops the stream there, with `XetIntegrityError`), and each term's verification hash is compared when its last chunk is decoded, so a term's bytes may be out before it fails. Given a file hash, the verifier is strict by default: the answer's term list must be the file's, compared before anything is fetched, and chunks of xorbs the shard does not list are refused before they are yielded. For a range request pass `{ wholeFile: false }`.
 
 ### Lower level: tokens, answers, ranges
 
@@ -52,7 +54,7 @@ const answer = await fetchReconstruction({ token: tokens, fileHash });
 for await (const bytes of reconstruct(answer, httpRanges({ retries: 4 }))) consume(bytes);
 ```
 
-`reconstruct(answer, fetchRange, { length?, verify? })` takes any `fetchRange(url, start, end)` that yields the bytes of an inclusive range, so tests and other transports can serve xorbs from memory. `httpRanges` retries 429, 5xx and network errors with a growing pause (or `Retry-After`), resumes a cut body from the next byte, and, given `refreshUrl`, replaces a signed URL refused with 401/403. `downloadXetFile` wires that to a fresh reconstruction answer, so an expired xorb URL during a long download is replaced instead of failing.
+`reconstruct(answer, fetchRange, { length?, verify? })` takes any `fetchRange(url, start, end)` that yields the bytes of an inclusive range, so tests and other transports can serve xorbs from memory. `httpRanges` retries 429, 5xx and network errors with a growing pause (or `Retry-After`, seconds or an HTTP date), resumes a cut body from the next byte (a cut counts as progress only after 64 KiB, and a range gives up after 64 failures in all), and, given `refreshUrl`, replaces a signed URL refused with 401/403. `downloadXetFile` wires that to a fresh reconstruction answer, so an expired xorb URL during a long download is replaced instead of failing.
 
 ### Chunk and hash local data
 
@@ -68,18 +70,18 @@ console.log(hashToString(fileHash(chunks))); // the Xet file hash the Hub shows 
 
 | Export | What it does |
 |--------|--------------|
-| `downloadXetFile(repo, path, options?)` | A Hub file streamed as `AsyncGenerator<Uint8Array>`; options `range`, `version`, `verify`, `xetHash`, `tokens`, `retries`, `backoffMs`, `signal` |
+| `downloadXetFile(repo, path, options?)` | A Hub file streamed as `AsyncGenerator<Uint8Array>`, checked against its Xet hash and size at the end; options `range`, `version`, `verify`, `verifyFile`, `xetHash`, `size`, `tokens`, `retries`, `backoffMs`, `signal` |
 | `hubPathInfo(repo, path)`, `xetReadToken(repo)` | `paths-info` (Xet hash, size, SHA-256) and `GET /api/{models,datasets,spaces}/{repo}/xet-read-token/{revision}` |
 | `xetTokenSource(fetchToken, options?)`, `hubReadTokens(repo, options?)` | Tokens fetched once, renewed `refreshAheadSec` (default 60) before `exp`, and on demand after a 401; concurrent callers share one request |
 | `fetchReconstruction({ token, fileHash, range?, version? })` | `GET {casUrl}/v2/reconstructions/{hash}` (v1 fallback), as the v1 shape; a token source is renewed and the request retried once on 401 |
 | `v2ToV1(answer)` | A v2 answer's `xorbs[].ranges[]` as v1 fetch entries |
 | `httpRanges(options?)` | A `FetchRange` over HTTP `Range` requests with retries, resume and URL refresh |
-| `reconstruct(answer, fetchRange, { length?, verify? })` | The file, chunk by chunk; consecutive terms of one fetch entry share one fetch |
-| `readXorbChunks(bytes, count?)` | A xorb byte stream decoded chunk by chunk |
+| `reconstruct(answer, fetchRange, { length?, verify?, onChunk? })` | The file, chunk by chunk; consecutive terms of one fetch entry share one fetch; provisional until it completes |
+| `readXorbChunks(bytes, count?)` | A xorb byte stream decoded chunk by chunk; chunks over 128 KiB (uncompressed) or 256 KiB (payload) are refused, as xet-core does |
 | `parseXorbChunkHeader`, `decodeXorbChunk`, `XorbCompression` | One chunk header and payload |
 | `writeXorb(chunks, { compression })` | A serialized xorb (for tests and tooling; the CAS upload API is not called) |
 | `readShard(bytes)`, `writeShard(shard)` | MDB shards: header, File Info (terms, verification, metadata extension), CAS Info, footer |
-| `verifierFromShard(shard, fileHash?, { wholeFile?, strict? })` | A `ReconstructionVerifier` from a shard's chunk and term hashes |
+| `verifierFromShard(shard, fileHash?, { wholeFile?, strict? })` | A `ReconstructionVerifier` from a shard's chunk and term hashes; with a file hash, whole-file and strict unless turned off |
 | `dedupeIndex(shards)`, `termsFor(chunks, locate)`, `keyedChunkHash` | Deduplication lookups over shards, including global-dedupe (keyed) shards |
 | `chunkStream(source)` | Xet's gear-hash chunks: target 64 KiB, at least 8 KiB, at most 128 KiB |
 | `chunkHash`, `xorbHash`, `fileHash`, `rangeHash` | Keyed BLAKE3 chunk hash, Merkle xorb and file hashes, verification range hash |
@@ -99,7 +101,7 @@ A xorb is a run of chunks, each an 8-byte header (version, compressed size, comp
 
 ### Reference data
 
-The tests check the specification's reference files (dataset `xet-team/xet-spec-reference-files`, Apache-2.0): 796 chunk hashes and lengths, the xorb, file and range hashes, and four reference shards written byte for byte. The 14.7 MB reference xorb is not committed: the tests that rebuild the 63 MB reference CSV from it run when it is in `XET_REFERENCE_CACHE` (default `<tmp>/xet-reference`) or with `XET_LIVE=1`, which downloads it (pinned revision, SHA-256 checked). `XET_LIVE=1` also runs the live test against huggingface.co. Offline, the same paths run on generated files.
+The tests check the specification's reference files (dataset `xet-team/xet-spec-reference-files`, Apache-2.0): 796 chunk hashes and lengths, the xorb, file and range hashes, and four reference shards written byte for byte. The 14.7 MB reference xorb is not committed: the tests that rebuild the 63 MB reference CSV from it run when it is in `XET_REFERENCE_CACHE` (default `<tmp>/xet-reference`) or with `XET_LIVE=1`, which downloads it (pinned revision, SHA-256 checked). `XET_LIVE=1` also runs the live test against huggingface.co. Offline, the same paths run on generated files, and on a 13 KB slice of the reference xorb that is committed (chunks 18-20, lz4_flex frames written by xet-core): it decodes to the reference chunk hashes, and chunking its bytes gives xet-core's boundaries, so CI checks the decoder and the chunker against external output.
 
 ## The webrun-chunks transfer
 

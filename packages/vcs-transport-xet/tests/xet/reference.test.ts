@@ -504,4 +504,14 @@ describe.runIf(HAVE_REFERENCE_XORB)("reference xorb (cached, or XET_LIVE=1)", ()
       expect(seen.filter((u) => u === "https://cdn.test/x").length).toBe(4); // three cuts, resumed
     }, 300_000);
   });
+
+  it("the committed slice (chunks 18-20) is the reference xorb's own bytes", () => {
+    const meta = JSON.parse(fixture("eea25d6e-chunks-18-21.json")) as {
+      xorbBytes: { start: number; end: number };
+    };
+    const slice = referenceXorb().subarray(meta.xorbBytes.start, meta.xorbBytes.end + 1);
+    expect(
+      Buffer.from(slice).equals(Buffer.from(fixtureBytes("eea25d6e-chunks-18-21.xorb-range"))),
+    ).toBe(true);
+  });
 });

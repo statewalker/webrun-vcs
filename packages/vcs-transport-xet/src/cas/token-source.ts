@@ -33,21 +33,70 @@ export function xetTokenSource(
   const ahead = (o.refreshAheadSec ?? 60) * 1000;
   const now = o.now ?? Date.now;
   let current: XetToken | undefined;
-  let pending: Promise<XetToken> | undefined;
+  /**
+   * The shared request: its own controller, not any caller's signal (one caller giving up must not
+   * fail the others); aborted only when every caller waiting for it has given up.
+   */
+  type Pending = { promise: Promise<XetToken>; controller: AbortController; waiters: number };
+  let pending = undefined as Pending | undefined;
   const fresh = (t: XetToken) => !(t.exp > 0) || t.exp * 1000 - ahead > now();
-  const renew = (signal?: AbortSignal) => {
-    pending ??= fetchToken(signal).then(
-      (t) => {
-        current = t;
-        pending = undefined;
-        return t;
-      },
-      (e) => {
-        pending = undefined;
-        throw e;
-      },
-    );
-    return pending;
+  const renew = (signal?: AbortSignal): Promise<XetToken> => {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (!pending) {
+      const controller = new AbortController();
+      const p: Pending = {
+        controller,
+        waiters: 0,
+        promise: fetchToken(controller.signal).then(
+          (t) => {
+            if (pending === p) {
+              current = t;
+              pending = undefined;
+            }
+            return t;
+          },
+          (e) => {
+            if (pending === p) pending = undefined;
+            throw e;
+          },
+        ),
+      };
+      p.promise.catch(() => {}); // a request every caller left is not an unhandled rejection
+      pending = p;
+    }
+    const p = pending;
+    p.waiters++;
+    if (!signal)
+      return p.promise.finally(() => {
+        p.waiters--;
+      });
+    return new Promise<XetToken>((resolve, reject) => {
+      let done = false;
+      const leave = () => {
+        if (done) return false;
+        done = true;
+        p.waiters--;
+        signal.removeEventListener("abort", onAbort);
+        return true;
+      };
+      const onAbort = () => {
+        if (!leave()) return;
+        if (p.waiters === 0) {
+          p.controller.abort(signal.reason);
+          if (pending === p) pending = undefined;
+        }
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      p.promise.then(
+        (t) => {
+          if (leave()) resolve(t);
+        },
+        (e) => {
+          if (leave()) reject(e);
+        },
+      );
+    });
   };
   return {
     token: (signal) => (current && fresh(current) ? Promise.resolve(current) : renew(signal)),
