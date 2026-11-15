@@ -128,7 +128,7 @@ const ws = await openGitWorkspace({
 });
 
 const result = await syncWorkspace(ws, httpRemote({ url: "https://example.com/notes.git" }));
-// { head, committed, integration: "up-to-date" | "fast-forward" | "merge", pushed, conflicts, attempts, skipped }
+// { head, committed, integration: "up-to-date" | "fast-forward" | "merge", pushed, conflicts, attempts, skipped, rejoined }
 if (result.conflicts.length > 0) console.warn("both sides kept in", result.conflicts);
 ```
 
@@ -210,6 +210,14 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
   - `unsafe-path`.
 
   Ignored paths and submodule checkouts are not listed.
+- **Coming back.** A path can stop being left out: a nested repository's `.git` is removed, or `ignore` changes. Meanwhile the branch may have moved on there while the folder's copy stayed as it was. So the workspace records, under a ref only it writes (`refs/workspace/skip/main`), the version the folder last held of every left-out path that the branch tracks. A path the remote added meanwhile is recorded as never held.
+
+  When the path comes back, it is merged three ways: that recorded version, the folder's copy and the branch's.
+  - Unchanged in the folder: it gets the branch's version (a remote edit arrives, a remote addition is written, a remote deletion is applied).
+  - Changed only in the folder: it is kept and committed.
+  - Changed on both sides: it is merged with git's markers (text), or kept with the branch's version beside it (binary), and reported.
+
+  The paths are listed in `result.rejoined` and a `rejoined` event. A nested repository's removal is therefore never pushed as the deletion of its files.
 
 ### Why a failure leaves nothing half-done
 

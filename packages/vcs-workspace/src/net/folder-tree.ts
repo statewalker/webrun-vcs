@@ -77,6 +77,11 @@ export interface SnapshotOptions {
   tempFiles?: Map<string, number>;
   /** Read every file again, whatever the cache says */
   rehashAll?: boolean;
+  /**
+   * The nested repositories to leave out (see {@link findNestedRepositories}); found by this
+   * snapshot when not given
+   */
+  nested?: string[];
 }
 
 /** A folder path the snapshot left out of history, and why */
@@ -109,6 +114,38 @@ async function isGitFile(folder: FilesApi, at: string): Promise<boolean> {
   return String.fromCharCode(...parts) === "gitdir:";
 }
 
+function parentOf(path: string): string {
+  return path.slice(0, path.lastIndexOf("/"));
+}
+
+/** A `.git` directory or `gitdir:` file below the folder's root */
+async function isGitEntry(
+  folder: FilesApi,
+  info: { path: string; kind: "file" | "directory" },
+): Promise<boolean> {
+  const path = relative(info.path);
+  const slash = path.lastIndexOf("/");
+  if (slash <= 0 || path.slice(slash + 1).toLowerCase() !== ".git") return false;
+  return info.kind === "directory" || (await isGitFile(folder, info.path));
+}
+
+function outermost(dirs: Iterable<string>): string[] {
+  const all = [...dirs];
+  return all.filter((d) => !all.some((o) => d.startsWith(`${o}/`))).sort();
+}
+
+/**
+ * The nested repositories of the folder, outermost only: directories holding a `.git`
+ * directory or a `.git` file starting with `gitdir:`.
+ */
+export async function findNestedRepositories(folder: FilesApi): Promise<string[]> {
+  const nested = new Set<string>();
+  for await (const info of folder.list("/", { recursive: true })) {
+    if (await isGitEntry(folder, info)) nested.add(parentOf(relative(info.path)));
+  }
+  return outermost(nested);
+}
+
 /** What {@link snapshotFolder} found besides the files it took. */
 export interface SnapshotReport {
   /** Directories holding a repository of their own: a `.git` directory, or a `gitdir:` file */
@@ -138,17 +175,10 @@ export async function snapshotFolder(
   const nested = new Set<string>();
   for await (const info of folder.list("/", { recursive: true })) {
     const path = relative(info.path);
-    const slash = path.lastIndexOf("/");
-    if (slash > 0 && path.slice(slash + 1).toLowerCase() === ".git") {
-      if (info.kind === "directory" || (await isGitFile(folder, info.path))) {
-        nested.add(path.slice(0, slash));
-      }
-    }
+    if (!options.nested && (await isGitEntry(folder, info))) nested.add(parentOf(path));
     if (info.kind === "file") infos.push({ ...info, path, at: info.path });
   }
-  // the outermost nested repositories only
-  const all = [...nested];
-  const roots = all.filter((d) => !all.some((o) => d.startsWith(`${o}/`))).sort();
+  const roots = options.nested ? [...options.nested].sort() : outermost(nested);
   const inNested = under(roots);
   report.nested.push(...roots);
   for (const root of roots) {

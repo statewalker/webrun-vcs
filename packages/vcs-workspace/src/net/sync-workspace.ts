@@ -31,7 +31,8 @@ export type SyncEvent =
     }
   | { type: "push"; attempt: number; head: ObjectId; status: PushRefUpdate["status"] }
   | { type: "retry"; attempt: number; reason: string }
-  | { type: "skipped"; attempt: number; paths: SkippedPath[] };
+  | { type: "skipped"; attempt: number; paths: SkippedPath[] }
+  | { type: "rejoined"; attempt: number; paths: string[] };
 
 /** Options of {@link syncWorkspace}. */
 export interface SyncWorkspaceOptions {
@@ -69,6 +70,11 @@ export interface SyncWorkspaceResult {
    * no tree may hold
    */
   skipped: SkippedPath[];
+  /**
+   * Paths that were left out and came back during this sync (a nested repository removed,
+   * `ignore` changed): brought up to the branch, or merged where both sides changed
+   */
+  rejoined: string[];
 }
 
 /** A sync that could not finish; the workspace and its repository are left consistent. */
@@ -153,6 +159,7 @@ async function syncRounds(
   const conflicts = new Set<string>();
   let committed = false;
   let skipped: SkippedPath[] = [];
+  const rejoined = new Set<string>();
   let lastReason = "";
   let folderKeptChanging = false;
 
@@ -166,6 +173,8 @@ async function syncRounds(
     for (const path of local.conflicts) conflicts.add(path);
     skipped = local.skipped;
     if (skipped.length > 0) emit({ type: "skipped", attempt, paths: skipped });
+    for (const path of local.rejoined) rejoined.add(path);
+    if (local.rejoined.length > 0) emit({ type: "rejoined", attempt, paths: local.rejoined });
     if (local.changed && local.head) {
       committed = true;
       emit({ type: "commit", attempt, commit: local.head });
@@ -219,6 +228,7 @@ async function syncRounds(
       conflicts: [...conflicts].sort(),
       attempts: attempt,
       skipped,
+      rejoined: [...rejoined].sort(),
     });
     if (!head || head === theirs) return done(false);
 

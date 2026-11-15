@@ -43,6 +43,7 @@ import {
   defaultIgnore,
   FolderChangedError,
   type FolderSnapshot,
+  findNestedRepositories,
   type IgnorePath,
   isExpendableDirectory,
   isSyncTempFile,
@@ -241,11 +242,13 @@ async function folderSnapshot(
       racyWindowMs: ws.racyWindowMs,
       rehashAll: ws.rehashAll,
       tempFiles,
+      // the nested repositories this round decided on: what the snapshot leaves out is
+      // exactly what the tree carries over
+      nested: nestedRoots.get(ws) ?? [],
     },
     report,
   );
   snapshots.set(ws, snapshot);
-  nestedRoots.set(ws, report.nested);
   const skipped = report.skipped.filter(
     (s) => !(s.reason === "nested-repository" && headFiles.get(s.path)?.mode === MODE_GITLINK),
   );
@@ -275,6 +278,11 @@ export interface WorkspaceCommit {
    * branch keeps what it had there) and names no tree may hold
    */
   skipped: SkippedPath[];
+  /**
+   * Paths that were left out and came back (a nested repository removed, `ignore` changed):
+   * brought up to the branch where the folder's copy was unchanged, merged where both changed
+   */
+  rejoined: string[];
 }
 
 /** Where the plan of an unfinished checkout is kept: a ref only this workspace writes. */
@@ -458,6 +466,7 @@ async function finishPendingCheckout(ws: GitWorkspace): Promise<string[]> {
   }
   const from = (await readCommitTree(ws.history, head)).files;
   const to = (await readCommitTree(ws.history, target)).files;
+  await recordLeftAlone(ws, from, to);
   let plan = await loadPlan(ws, target);
   if (!plan) {
     plan = await makePlan(ws, target, from, to);
@@ -521,6 +530,183 @@ async function finishPendingCheckout(ws: GitWorkspace): Promise<string[]> {
   return plan.conflicts;
 }
 
+/**
+ * Where the workspace remembers the folder's copies that checkouts left alone: paths that were
+ * ignored or inside a nested repository while the branch moved on. A ref only this workspace
+ * writes (never pushed).
+ */
+function staleRef(ws: GitWorkspace): string {
+  return `refs/workspace/skip/${ws.branch.slice("refs/heads/".length)}`;
+}
+
+/**
+ * Paths whose folder copy may be behind the branch because they were left out: the version
+ * the folder last held (null: it never held one, a file the remote added meanwhile).
+ */
+type StaleRecord = Map<string, FlatEntry | null>;
+
+/** What checkouts leave alone and later come back: ignored paths and nested repositories. */
+function staleSkip(ws: GitWorkspace): IgnorePath {
+  const inNested = under(nestedRoots.get(ws) ?? []);
+  return (path) => ws.ignore(path) || inNested(path);
+}
+
+async function loadStale(ws: GitWorkspace): Promise<StaleRecord> {
+  const record: StaleRecord = new Map();
+  const id = (await ws.history.refs.resolve(staleRef(ws)))?.objectId;
+  if (!id) return record;
+  try {
+    const commit = await ws.history.commits.load(id);
+    if (!commit) return record;
+    for (const [path, entry] of (await readCommitTree(ws.history, id)).files)
+      record.set(path, entry);
+    const meta = JSON.parse(commit.message.slice(commit.message.indexOf("\n\n") + 2)) as {
+      absent?: unknown;
+    };
+    if (Array.isArray(meta.absent)) {
+      for (const p of meta.absent) if (typeof p === "string") record.set(p, null);
+    }
+  } catch {
+    // an unreadable record is an empty one: nothing is taken for stale
+  }
+  return record;
+}
+
+async function saveStale(ws: GitWorkspace, record: StaleRecord): Promise<void> {
+  if (record.size === 0) {
+    await ws.history.refs.remove(staleRef(ws));
+    return;
+  }
+  const files: FlatTree = new Map();
+  const absent: string[] = [];
+  for (const [path, entry] of record) {
+    if (entry) files.set(path, entry);
+    else absent.push(path);
+  }
+  const id = await commitTree(ws, files, [], `skipped paths\n\n${JSON.stringify({ absent })}`);
+  await ws.history.refs.set(staleRef(ws), id);
+}
+
+/**
+ * Records the paths a checkout from `from` to `to` leaves alone because they are ignored or
+ * inside a nested repository, with the version the folder holds (from `from`), unless already
+ * recorded.
+ */
+async function recordLeftAlone(ws: GitWorkspace, from: FlatTree, to: FlatTree): Promise<void> {
+  const skip = staleSkip(ws);
+  const record = await loadStale(ws);
+  let changed = false;
+  for (const path of new Set([...from.keys(), ...to.keys()])) {
+    const h = inFolder(from.get(path));
+    const t = inFolder(to.get(path));
+    if (h?.id === t?.id || !skip(path) || record.has(path)) continue;
+    record.set(path, h ?? null);
+    changed = true;
+  }
+  if (changed) await saveStale(ws, record);
+}
+
+/**
+ * Brings back a path that is no longer left out: a three-way merge of the version the folder
+ * last held (`base`), the folder's copy and the branch's. A copy unchanged in the folder gets
+ * the branch's version (written, or removed); one changed only in the folder is kept; one
+ * changed on both sides is merged (text, git's markers) or kept with the branch's version
+ * beside it (binary, or a directory in its place), and reported. Returns whether it conflicted.
+ */
+async function rejoinPath(
+  ws: GitWorkspace,
+  path: string,
+  base: FlatEntry | null,
+  theirs: FlatEntry | undefined,
+  taken: Set<string>,
+): Promise<boolean> {
+  const expendable = expendableFor(ws);
+  const ours = await currentFileId(ws.folder, path);
+  const write = (entry: FlatEntry | undefined, at = path, expect = ours) =>
+    applyFolderPath(ws.history, ws.folder, at, entry, {
+      accept: (now) => now === expect,
+      expendable,
+    });
+  const aside = () => {
+    let name = `${path}.theirs-${theirs?.id.slice(0, 7)}`;
+    for (let n = 2; taken.has(name); n++) name = `${path}.theirs-${theirs?.id.slice(0, 7)}-${n}`;
+    taken.add(name);
+    return name;
+  };
+  if (ours === theirs?.id) return false;
+  if (ours === (base?.id ?? undefined)) {
+    await write(theirs);
+    return false;
+  }
+  if (theirs?.id === (base?.id ?? undefined)) return false; // changed only in the folder
+  if (ours?.startsWith("directory:")) {
+    if (theirs) await write(theirs, aside(), undefined);
+    return true;
+  }
+  if (ours === undefined) {
+    if (theirs) await write(theirs); // removed in the folder, changed on the branch: it comes back
+    return true;
+  }
+  if (!theirs) return true; // removed on the branch, changed in the folder: kept
+  const mine: FlatEntry = {
+    id: await ws.history.blobs.store(ws.folder.read(`/${path}`)),
+    mode: theirs.mode,
+  };
+  const [b, o, t] = [
+    await textOf(ws, base ?? undefined),
+    await textOf(ws, mine),
+    await textOf(ws, theirs),
+  ];
+  if (b && o && t) {
+    const merged = mergeLines(b, o, t, {
+      oursLabel: "folder",
+      theirsLabel: `${ws.branch.slice("refs/heads/".length)}`,
+    });
+    const id = await ws.history.blobs.store([merged.content]);
+    await write({ id, mode: theirs.mode }, path, mine.id);
+    return merged.conflicts > 0;
+  }
+  await write(theirs, aside(), undefined);
+  return true;
+}
+
+/**
+ * Paths that were left out and no longer are (a nested repository removed, an `ignore` that
+ * changed) come back, one by one (see {@link rejoinPath}); paths the branch has that are left
+ * out now are recorded with the version the folder holds.
+ */
+async function rejoinLeftOut(
+  ws: GitWorkspace,
+  headFiles: FlatTree,
+): Promise<{ rejoined: string[]; conflicts: string[] }> {
+  const skip = staleSkip(ws);
+  const record = await loadStale(ws);
+  const rejoined: string[] = [];
+  const conflicts: string[] = [];
+  const taken = new Set([...headFiles.keys(), ...record.keys()]);
+  try {
+    for (const [path, base] of [...record]) {
+      if (skip(path)) continue;
+      if (await rejoinPath(ws, path, base, inFolder(headFiles.get(path)), taken)) {
+        conflicts.push(path);
+      }
+      record.delete(path);
+      rejoined.push(path);
+      await saveStale(ws, record); // each path once, even when a later one fails
+    }
+  } finally {
+    invalidate(ws, rejoined);
+  }
+  let changed = false;
+  for (const [path, entry] of headFiles) {
+    if (entry.mode === MODE_GITLINK || !skip(path) || record.has(path)) continue;
+    record.set(path, entry);
+    changed = true;
+  }
+  if (changed) await saveStale(ws, record);
+  return { rejoined: rejoined.sort(), conflicts: conflicts.sort() };
+}
+
 async function commitTree(
   ws: GitWorkspace,
   files: FlatTree,
@@ -542,14 +728,20 @@ async function commitTree(
  * code that already runs inside {@link runExclusive} (a sync).
  */
 export async function commitFolder(ws: GitWorkspace, message: string): Promise<WorkspaceCommit> {
+  // one set of nested repositories for the whole round: the finish, the rejoin, the snapshot
+  // and the tree all leave out the same paths
+  nestedRoots.set(ws, await findNestedRepositories(ws.folder));
   const conflicts = await finishPendingCheckout(ws);
   const head = await workspaceHead(ws);
   const current = await readCommitTree(ws.history, head);
+  const back = await rejoinLeftOut(ws, current.files);
+  conflicts.push(...back.conflicts.filter((c) => !conflicts.includes(c)));
+  const { rejoined } = back;
   const tempFiles = new Map<string, number>();
   const { snapshot, skip, skipped } = await folderSnapshot(ws, current.files, tempFiles);
   await sweepTempFiles(ws.folder, tempFiles);
   const tree = await storeFlatTree(ws.history, composeTree(current.files, snapshot, skip));
-  if (tree === current.tree) return { head, changed: false, conflicts, skipped };
+  if (tree === current.tree) return { head, changed: false, conflicts, skipped, rejoined };
   const who = person(ws);
   const commit = await ws.history.commits.store({
     tree,
@@ -559,7 +751,7 @@ export async function commitFolder(ws: GitWorkspace, message: string): Promise<W
     message: message.endsWith("\n") ? message : `${message}\n`,
   });
   await moveBranch(ws, head, commit);
-  return { head: commit, changed: true, conflicts, skipped };
+  return { head: commit, changed: true, conflicts, skipped, rejoined };
 }
 
 /**
@@ -645,12 +837,14 @@ async function checkoutAndMove(
   target: ObjectId,
   targetFiles: FlatTree,
 ) {
+  nestedRoots.set(ws, await findNestedRepositories(ws.folder));
   // the folder must still be what `head` recorded: an edit made since is not overwritten
   const { snapshot, skip } = await folderSnapshot(ws, headFiles);
   const expected = composeTree(headFiles, snapshot, skip);
   const tree = await storeFlatTree(ws.history, expected);
   if (tree !== (await readCommitTree(ws.history, head)).tree) throw new FolderChangedError();
   await ws.history.refs.remove(planRef(ws));
+  await recordLeftAlone(ws, headFiles, targetFiles);
   await ws.history.refs.set(pendingRef(ws), target);
   const changed = new Set<string>();
   for (const p of new Set([...headFiles.keys(), ...targetFiles.keys()])) {
