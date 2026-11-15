@@ -370,9 +370,9 @@ describeGit.each([true, false])("fetch client ← our createFetchHandler (v2: %s
     const cloned = await fetch(base);
     expect(cloned.protocolVersion).toBe(protocolV2 ? 2 : 0);
     expect(await c.refStore.get("refs/remotes/origin/main")).toBe(old);
-    // our server ignores include-tag: the tag object comes in a second fetch (git's backfill)
+    // our server honours include-tag: the tag object comes in the pack, no backfill fetch
     expect(cloned.followedTags).toEqual(["refs/tags/v1"]);
-    expect(cloned.imports.length).toBe(2);
+    expect(cloned.imports.length).toBe(1);
     await fsckExport(c, root);
 
     const tip = addCommits(dir, 2, { time: 1_800_000_000, prefix: "n", from: old });

@@ -35,6 +35,7 @@ import {
   serverFetchTransitions,
 } from "../../fsm/fetch/server-fetch-fsm.js";
 import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
+import type { UploadPackConfig, UploadPackHooks } from "../../fsm/fetch/upload-pack-hooks.js";
 import { Fsm } from "../../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/server-v2-fsm.js";
 import { serverV2Capabilities } from "../../fsm/protocol-v2/types.js";
@@ -50,6 +51,7 @@ import {
   serverPushTransitions,
 } from "../../fsm/push/server-push-fsm.js";
 import { ZERO_OID } from "../../protocol/constants.js";
+import { visibleRefs } from "../../protocol/hidden-refs.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { readStreamWithIdleTimeout, withWriteTimeout } from "../../utils/idle-timeout.js";
 import { createSimpleDuplex } from "./http-duplex.js";
@@ -127,8 +129,44 @@ export interface HttpServerOptions {
   advertiseObjectInfo?: boolean;
   /** receive-pack (push) hooks, limits and ref policies */
   receivePack?: ReceivePackServerOptions;
+  /** upload-pack (fetch) hooks and hidden refs */
+  uploadPack?: UploadPackServerOptions;
+  /**
+   * Hidden ref patterns of both services (git's `transfer.hideRefs`; see `isRefHidden`):
+   * not advertised (nor listed by v2 `ls-refs`), a v2 `want-ref` of one is an unknown ref,
+   * and a push changing one is refused ("deny updating a hidden ref"). The services' own
+   * patterns (`uploadPack.hideRefs`, `receivePack.hideRefs`) come after these.
+   */
+  hideRefs?: string[];
   /** Logs hook failures that cannot reach the client (default: console.error) */
   logger?: ReceivePackLogger;
+}
+
+/**
+ * upload-pack settings of the smart-HTTP server.
+ *
+ * @example
+ * ```ts
+ * createFetchHandler({
+ *   resolveRepository,
+ *   uploadPack: {
+ *     hideRefs: ["refs/internal"],
+ *     hooks: {
+ *       authorize: (request, ctx) =>
+ *         ctx.request?.headers.authorization === `Bearer ${token}` || "access denied",
+ *     },
+ *   },
+ * });
+ * ```
+ */
+export interface UploadPackServerOptions {
+  /**
+   * The hooks: `authorize` sees the wants of every request before the negotiation and may
+   * refuse with `ERR <message>`; `postUpload` starts once a pack was sent.
+   */
+  hooks?: UploadPackHooks;
+  /** Hidden ref patterns of upload-pack, after `hideRefs` (git's `uploadpack.hideRefs`) */
+  hideRefs?: string[];
 }
 
 /**
@@ -190,6 +228,11 @@ export interface ReceivePackServerOptions {
   /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
   shallowUpdate?: boolean;
   /**
+   * Hidden ref patterns of receive-pack, after the server's `hideRefs` (git's
+   * `receive.hideRefs`): not advertised, and refused ("deny updating a hidden ref")
+   */
+  hideRefs?: string[];
+  /**
    * An atomic push fails as a whole when any command is refused (default false: as git, a
    * command refused before the ref transaction — missing objects, shallow, `authorize`,
    * `preReceive` — keeps its error and the others still land together; see
@@ -208,6 +251,35 @@ export const DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES = 1024 * 1024 * 1024;
 
 const textEncoder = new TextEncoder();
+
+/** upload-pack's hidden ref patterns: `transfer.hideRefs`, then `uploadpack.hideRefs`. */
+function uploadPackHiddenRefs(options: HttpServerOptions): string[] {
+  return [...(options.hideRefs ?? []), ...(options.uploadPack?.hideRefs ?? [])];
+}
+
+/** receive-pack's hidden ref patterns: `transfer.hideRefs`, then `receive.hideRefs`. */
+function receivePackHiddenRefs(options: HttpServerOptions): string[] {
+  return [...(options.hideRefs ?? []), ...(options.receivePack?.hideRefs ?? [])];
+}
+
+/** upload-pack's hooks with the request they run for. */
+function uploadPackConfig(
+  options: HttpServerOptions,
+  request: HttpRequest,
+  repoPath: string | undefined,
+): UploadPackConfig {
+  return {
+    hooks: options.uploadPack?.hooks,
+    logger: options.logger,
+    request: {
+      method: request.method,
+      path: request.path,
+      query: request.query,
+      headers: request.headers,
+    },
+    repoPath,
+  };
+}
 
 /**
  * git's http-backend `hdr_nocache`, sent with every info/refs and rpc response: neither the
@@ -394,9 +466,8 @@ export async function handleInfoRefs(
   options: HttpServerOptions = {},
   repository?: RepositoryFacade,
 ): Promise<HttpResponse> {
-  // Get all refs
-  const allRefs = await refStore.listAll();
-  const refs = Array.from(allRefs);
+  // Get all refs but the hidden ones
+  const refs = visibleRefs(await refStore.listAll(), uploadPackHiddenRefs(options));
 
   // Build ref advertisement
   const chunks: Uint8Array[] = [];
@@ -418,7 +489,7 @@ export async function handleInfoRefs(
 
   // First ref with capabilities
   if (refs.length > 0) {
-    const [firstRefName, firstOid] = refs[0];
+    const [firstRefName, firstOid] = refs[0] as [string, string];
     const capsStr = capabilities.join(" ");
     chunks.push(encodePacketLine(`${firstOid} ${firstRefName}\0${capsStr}\n`));
     const firstPeeled = await peelFully(repository, firstOid);
@@ -426,7 +497,7 @@ export async function handleInfoRefs(
 
     // Remaining refs
     for (let i = 1; i < refs.length; i++) {
-      const [refName, oid] = refs[i];
+      const [refName, oid] = refs[i] as [string, string];
       chunks.push(encodePacketLine(`${oid} ${refName}\n`));
       const peeled = await peelFully(repository, oid);
       if (peeled) chunks.push(encodePacketLine(`${peeled} ${refName}^{}\n`));
@@ -530,15 +601,16 @@ export async function handleUploadPack(
   repository: RepositoryFacade,
   refStore: RefStore,
   options: HttpServerOptions = {},
+  context: { repoPath?: string } = {},
 ): Promise<HttpResponse> {
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 
   const state = new ProtocolState();
 
-  // Populate refs from refStore
-  const allRefs = await refStore.listAll();
-  for (const [refName, oid] of allRefs) {
+  // What GET /info/refs advertised: the refs but the hidden ones
+  const hiddenRefs = uploadPackHiddenRefs(options);
+  for (const [refName, oid] of visibleRefs(await refStore.listAll(), hiddenRefs)) {
     state.refs.set(refName, oid);
   }
 
@@ -552,6 +624,8 @@ export async function handleUploadPack(
     requestPolicy: options.requestPolicy ?? "ADVERTISED",
     maxEmptyBatches: 10,
     keepAliveMs: options.keepAliveMs,
+    hiddenRefs,
+    uploadPack: uploadPackConfig(options, request, context.repoPath),
     // each POST is one request of a stateless negotiation (git's --stateless-rpc)
     statelessRpc: true,
   };
@@ -585,6 +659,7 @@ export async function handleUploadPackV2(
   repository: RepositoryFacade,
   refStore: RefStore,
   options: HttpServerOptions = {},
+  context: { repoPath?: string } = {},
 ): Promise<HttpResponse> {
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
@@ -599,6 +674,8 @@ export async function handleUploadPackV2(
     // git's v2 upload-pack serves any object it has
     requestPolicy: options.requestPolicy ?? "ANY",
     keepAliveMs: options.keepAliveMs,
+    hiddenRefs: uploadPackHiddenRefs(options),
+    uploadPack: uploadPackConfig(options, request, context.repoPath),
     // one command per request (git's serve loop with --stateless-rpc); more are ignored
     statelessRpc: true,
   };
@@ -746,9 +823,8 @@ export async function handleReceivePackInfoRefs(
   refStore: RefStore,
   options: HttpServerOptions = {},
 ): Promise<HttpResponse> {
-  // Get all refs
-  const allRefs = await refStore.listAll();
-  const refs = Array.from(allRefs);
+  // Get all refs but the hidden ones
+  const refs = visibleRefs(await refStore.listAll(), receivePackHiddenRefs(options));
 
   // Build ref advertisement
   const chunks: Uint8Array[] = [];
@@ -762,13 +838,13 @@ export async function handleReceivePackInfoRefs(
 
   // First ref with capabilities
   if (refs.length > 0) {
-    const [firstRefName, firstOid] = refs[0];
+    const [firstRefName, firstOid] = refs[0] as [string, string];
     const capsStr = capabilities.join(" ");
     chunks.push(encodePacketLine(`${firstOid} ${firstRefName}\0${capsStr}\n`));
 
     // Remaining refs
     for (let i = 1; i < refs.length; i++) {
-      const [refName, oid] = refs[i];
+      const [refName, oid] = refs[i] as [string, string];
       chunks.push(encodePacketLine(`${oid} ${refName}\n`));
     }
   } else {
@@ -833,7 +909,9 @@ export async function handleReceivePack(
   const rp = options.receivePack ?? {};
 
   const state = new ProtocolState();
-  for (const [refName, oid] of await refStore.listAll()) {
+  // what GET /info/refs advertised: the refs but the hidden ones
+  const hiddenRefs = receivePackHiddenRefs(options);
+  for (const [refName, oid] of visibleRefs(await refStore.listAll(), hiddenRefs)) {
     state.refs.set(refName, oid);
   }
   // state.capabilities stays empty: READ_COMMANDS takes the client's request from the first
@@ -876,6 +954,7 @@ export async function handleReceivePack(
     allowNonFastForward: rp.allowNonFastForward ?? false,
     denyCurrentBranch: rp.denyCurrentBranch ?? true,
     currentBranch: rp.currentBranch,
+    hiddenRefs,
     receivePack: {
       hooks: rp.hooks,
       maxCommands: rp.maxCommands,
@@ -1057,6 +1136,10 @@ export interface HttpHandlerOptions {
   advertiseObjectInfo?: boolean;
   /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
   receivePack?: ReceivePackServerOptions;
+  /** upload-pack hooks and hidden refs (see {@link UploadPackServerOptions}) */
+  uploadPack?: UploadPackServerOptions;
+  /** Hidden ref patterns of both services (see {@link HttpServerOptions.hideRefs}) */
+  hideRefs?: string[];
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -1099,6 +1182,8 @@ export function createHttpHandler(
     v2Capabilities,
     advertiseObjectInfo,
     receivePack,
+    uploadPack,
+    hideRefs,
     logger,
   } = options;
 
@@ -1122,6 +1207,8 @@ export function createHttpHandler(
       v2Capabilities,
       advertiseObjectInfo,
       receivePack,
+      uploadPack,
+      hideRefs,
       logger,
     };
     // git has no v2 push: receive-pack is v0 whatever the client asks
@@ -1188,9 +1275,12 @@ export function createHttpHandler(
           };
         }
 
-        if (v2) return await handleUploadPackV2(request, repository, refStore, serverOptions);
+        const context = { repoPath: parsed.repoPath };
+        if (v2) {
+          return await handleUploadPackV2(request, repository, refStore, serverOptions, context);
+        }
         if (parsed.service === "git-upload-pack") {
-          return await handleUploadPack(request, repository, refStore, uploadPackOptions);
+          return await handleUploadPack(request, repository, refStore, uploadPackOptions, context);
         } else {
           return await handleReceivePack(request, repository, refStore, serverOptions, {
             repoPath: parsed.repoPath,
@@ -1228,6 +1318,10 @@ export interface GitHttpServerOptions {
   advertiseObjectInfo?: boolean;
   /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
   receivePack?: ReceivePackServerOptions;
+  /** upload-pack hooks and hidden refs (see {@link UploadPackServerOptions}) */
+  uploadPack?: UploadPackServerOptions;
+  /** Hidden ref patterns of both services (see {@link HttpServerOptions.hideRefs}) */
+  hideRefs?: string[];
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -1276,6 +1370,8 @@ export function createGitHttpServer(options: GitHttpServerOptions): GitHttpServe
     v2Capabilities: options.v2Capabilities,
     advertiseObjectInfo: options.advertiseObjectInfo,
     receivePack: options.receivePack,
+    uploadPack: options.uploadPack,
+    hideRefs: options.hideRefs,
     logger: options.logger,
   });
 

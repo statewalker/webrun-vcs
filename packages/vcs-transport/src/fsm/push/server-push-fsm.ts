@@ -43,6 +43,7 @@ import {
 } from "../../context/context-adapters.js";
 import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
+import { isRefHidden, visibleRefs } from "../../protocol/hidden-refs.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { isAncestorOf, PushConnectivity } from "./connectivity.js";
@@ -169,7 +170,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         const capabilities = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
 
         let first = true;
-        const refsArray = Array.from(refs);
+        // hidden refs are not advertised (git's receive.hideRefs)
+        const refsArray = visibleRefs(refs, getConfig(ctx).hiddenRefs);
 
         // Empty repository
         if (refsArray.length === 0) {
@@ -494,6 +496,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
     async (ctx) => {
       const state = getState<ServerPushState>(ctx);
       const commands = state.pushCommands ?? [];
+      // git's reject_updates_to_hidden: after the connectivity check, before pre-receive
+      rejectHiddenUpdates(ctx, commands);
       const open = commands.filter((cmd) => cmd.result === "NOT_ATTEMPTED");
       if (open.length === 0) return "NOTHING_TO_DO";
 
@@ -838,6 +842,19 @@ function internalError(ctx: ProcessContext, error: unknown): string {
     if (cmd.result === "NOT_ATTEMPTED") reject(cmd, "internal error");
   }
   return "INTERNAL_ERROR";
+}
+
+/** Refuses the commands that would change a hidden ref, with git's texts. */
+function rejectHiddenUpdates(ctx: ProcessContext, commands: PushCommand[]): void {
+  const hidden = getConfig(ctx).hiddenRefs;
+  if (!hidden?.length) return;
+  for (const cmd of commands) {
+    if (cmd.result !== "NOT_ATTEMPTED" || !isRefHidden(cmd.refName, hidden)) continue;
+    reject(
+      cmd,
+      cmd.type === "DELETE" ? "deny deleting a hidden ref" : "deny updating a hidden ref",
+    );
+  }
 }
 
 function reject(cmd: PushCommand, message: string): void {

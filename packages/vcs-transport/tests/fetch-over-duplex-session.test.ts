@@ -109,8 +109,8 @@ describe("fetchOverDuplex ↔ serveOverDuplex sessions", () => {
   );
 });
 
-describe("tags a stateful v0 fetch cannot follow", () => {
-  it("are reported in tagsNotFollowed (our server ignores include-tag; no second request)", async () => {
+describe("tags of a stateful v0 fetch", () => {
+  it("arrive in the pack (our server honours include-tag; no second request)", async () => {
     const server = await createTransportRepo();
     const client = await createTransportRepo();
     try {
@@ -132,9 +132,9 @@ describe("tags a stateful v0 fetch cannot follow", () => {
         refspecs: ["+refs/heads/*:refs/remotes/peer/*"],
       });
       expect(result.success, result.error).toBe(true);
-      expect(result.report?.followedTags).toEqual([]);
-      expect(result.report?.tagsNotFollowed).toEqual(["refs/tags/v1"]);
-      expect(await client.refStore.get("refs/tags/v1")).toBeUndefined();
+      expect(result.report?.followedTags).toEqual(["refs/tags/v1"]);
+      expect(result.report?.tagsNotFollowed ?? []).toEqual([]);
+      expect(await client.refStore.get("refs/tags/v1")).toBe(tag);
       await within(lb.served, 2000);
     } finally {
       await client.close();

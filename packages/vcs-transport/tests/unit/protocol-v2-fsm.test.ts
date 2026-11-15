@@ -415,7 +415,7 @@ describe("Server V2 FSM", () => {
       await fsm.run(context, "SEND_ERROR");
 
       expect(fsm.getState()).toBe("SEND_ERROR");
-      expect(context.output.error).toContain("Unknown ref");
+      expect(context.output.error).toContain("unknown ref");
     });
 
     it("returns INVALID_WANT for unknown object", async () => {

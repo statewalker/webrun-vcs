@@ -157,6 +157,7 @@ export class DefaultSerializationApi implements SerializationApi {
       wants,
       haves,
       shallow: options.shallow,
+      includeTags: options.includeTags,
       onBoundary: options.thinPack ? (b) => boundary.push(b) : undefined,
     })) {
       listed.push(o);

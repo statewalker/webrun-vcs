@@ -168,3 +168,40 @@ describe("listObjects: gitlinks", () => {
     expect(reads).not.toContain(sub);
   });
 });
+
+describe("listObjects: includeTags (git's pack-objects --include-tag)", () => {
+  it("adds the annotated tags peeling to a listed object, chains included, after the rest", async () => {
+    const objects = memObjects();
+    const h = await linear(objects);
+    const onC3 = await tag(objects, h.c3, "commit", "v3");
+    const onC1 = await tag(objects, h.c1, "commit", "v1"); // c1 is the receiver's
+    const onBlob = await tag(objects, h.extra, "blob", "extra");
+    const onTree = await tag(objects, h.t2, "tree", "old-tree"); // the receiver's tree
+    // a chain: outer -> inner -> c3
+    const inner = await tag(objects, h.c3, "commit", "inner");
+    const outer = await tag(objects, inner, "tag", "outer");
+    const out = await list(objects, {
+      wants: [h.c3],
+      haves: [h.c2],
+      // a lightweight tag (a commit id), a missing id and a repeated one are skipped
+      includeTags: [onC3, onC1, onBlob, onTree, outer, h.c3, "9".repeat(40), onC3],
+    });
+    const ids = out.map((o) => o.id);
+    expect(ids.sort()).toEqual(
+      [h.c3, h.t3, h.lib3, h.extra, h.v3, onC3, onBlob, outer, inner].sort(),
+    );
+    // the tags come last, typed, once each
+    const tags = out.filter((o) => o.type === "tag").map((o) => o.id);
+    expect(tags.sort()).toEqual([onC3, onBlob, outer, inner].sort());
+    expect(out.slice(-4).every((o) => o.type === "tag")).toBe(true);
+  });
+
+  it("adds nothing without includeTags, and keeps a wanted tag once", async () => {
+    const objects = memObjects();
+    const h = await linear(objects);
+    const onC3 = await tag(objects, h.c3, "commit", "v3");
+    expect((await list(objects, { wants: [h.c3] })).some((o) => o.type === "tag")).toBe(false);
+    const out = await list(objects, { wants: [onC3], includeTags: [onC3] });
+    expect(out.filter((o) => o.id === onC3)).toHaveLength(1);
+  });
+});

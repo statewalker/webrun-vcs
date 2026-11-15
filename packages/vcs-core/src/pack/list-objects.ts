@@ -10,7 +10,9 @@
  *    marked uninteresting with everything below them, so a tree or blob the receiver has through
  *    its own commits is not listed again;
  *  - commits are yielded first, then wanted tags, then the trees and blobs of each listed commit
- *    (with their path, for the delta search's name hash).
+ *    (with their path, for the delta search's name hash);
+ *  - with `includeTags` (git's `pack-objects --include-tag`), last come the annotated tags among
+ *    them that peel to a listed object, each with the tags of its chain.
  *
  * Memory is a map of flags per visited id and the parsed parents of walked commits; objects are
  * read one at a time and never kept.
@@ -40,6 +42,13 @@ export interface ListObjectsOptions {
    * met, and tree haves), with its path: the receiver's objects, bases for a thin pack.
    */
   onBoundary?: (object: ListedObject) => void;
+  /**
+   * Candidate annotated tags (git's `pack-objects --include-tag`, which tries every
+   * `refs/tags/*`): a tag whose target, followed through any chain of tags, is listed is listed
+   * too, after everything else, with each tag of its chain. Other ids (lightweight tags, tags of
+   * objects not listed, missing objects) are skipped.
+   */
+  includeTags?: Iterable<ObjectId>;
 }
 
 /** One listed object, as `git rev-list --objects` prints it. */
@@ -255,7 +264,10 @@ export async function* listObjects(
   }
 
   // ---- output ----
-  for (const id of kept) yield { id, type: "commit" };
+  for (const id of kept) {
+    set(id, ADDED);
+    yield { id, type: "commit" };
+  }
   for (const id of tags) if (!has(id, UNINTERESTING)) yield { id, type: "tag" };
 
   async function* walkTree(root: ObjectId, rootPath: string): AsyncGenerator<ListedObject> {
@@ -288,6 +300,29 @@ export async function* listObjects(
     if (has(id, UNINTERESTING | ADDED)) continue;
     set(id, ADDED);
     yield { id, type: "blob" };
+  }
+
+  // git's add_ref_tag / add_tag_chain: a tag peeling to a listed object comes with its chain
+  for (const tip of options.includeTags ?? []) {
+    if (has(tip, ADDED)) continue;
+    const chain: ObjectId[] = [];
+    let id = tip;
+    let target: { type: ObjectTypeString } | undefined;
+    for (;;) {
+      const o = await tryRead(id);
+      if (o?.type !== "tag") {
+        target = o;
+        break;
+      }
+      chain.push(id);
+      id = parseTagTarget(id, o.data);
+    }
+    if (!target || chain.length === 0 || !has(id, ADDED) || has(id, UNINTERESTING)) continue;
+    for (const tag of chain) {
+      if (has(tag, ADDED)) continue;
+      set(tag, ADDED);
+      yield { id: tag, type: "tag" };
+    }
   }
 }
 

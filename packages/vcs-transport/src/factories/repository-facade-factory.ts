@@ -132,16 +132,19 @@ function createRepositoryFacadeFromHistory(
         : result;
     },
 
-    exportPack(
+    async *exportPack(
       wants: Set<string>,
       exclude: Set<string>,
       options?: ExportPackOptions,
     ): AsyncIterable<Uint8Array> {
       // listObjects + writePack: streamed, stored entries reused, deltas searched
-      return serialization.exportPack(wants, exclude, {
+      yield* serialization.exportPack(wants, exclude, {
         thinPack: options?.thin,
         shallow: options?.shallow,
         ofsDelta: options?.ofsDelta,
+        includeTags: options?.includeTag
+          ? (options.includeTags ?? (await tagRefIds(refs)))
+          : undefined,
       });
     },
 
@@ -279,6 +282,15 @@ function createRepositoryFacadeFromHistory(
   };
 
   return facade;
+}
+
+/** The ids of the `refs/tags/*` refs (candidates of `include-tag`). */
+async function tagRefIds(refs: History["refs"]): Promise<string[]> {
+  const ids: string[] = [];
+  for await (const ref of refs.list("refs/tags/")) {
+    if (!isSymbolicRef(ref) && ref.objectId) ids.push(ref.objectId);
+  }
+  return ids;
 }
 
 /** git's object type names by type code (vcs-core `ObjectType`). */

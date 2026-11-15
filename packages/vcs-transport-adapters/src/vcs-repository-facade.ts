@@ -116,6 +116,8 @@ export class VcsRepositoryFacade implements RepositoryFacade {
       thinPack: options?.thin,
       shallow: options?.shallow,
       ofsDelta: options?.ofsDelta,
+      // upload-pack's include-tag candidates (the visible refs/tags/*)
+      includeTags: options?.includeTag ? options.includeTags : undefined,
     });
   }
 

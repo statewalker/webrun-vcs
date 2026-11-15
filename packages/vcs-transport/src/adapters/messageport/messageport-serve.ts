@@ -16,7 +16,9 @@ import type { ProcessContext, RefStore } from "../../context/process-context.js"
 import { ProtocolState } from "../../context/protocol-state.js";
 import { createTransportApi } from "../../factories/transport-api-factory.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../../fsm/fetch/server-fetch-fsm.js";
+import type { UploadPackHooks } from "../../fsm/fetch/upload-pack-hooks.js";
 import { Fsm } from "../../fsm/fsm.js";
+import { visibleRefs } from "../../protocol/hidden-refs.js";
 import { createMessagePortDuplex } from "./messageport-duplex.js";
 
 /**
@@ -27,6 +29,13 @@ export interface MessagePortServeOptions {
   requestPolicy?: UploadPackRequestPolicy;
   /** Maximum empty negotiation batches before error */
   maxEmptyBatches?: number;
+  /**
+   * Hidden ref patterns (git's `transfer.hideRefs` / `uploadpack.hideRefs`; see
+   * `isRefHidden`): not advertised, and not "ours" under the "ADVERTISED" policy
+   */
+  hideRefs?: string[];
+  /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
+  hooks?: UploadPackHooks;
 }
 
 /**
@@ -68,8 +77,8 @@ export async function messagePortServe(
   const duplex = createMessagePortDuplex(port);
   const transport = createTransportApi(duplex, state);
 
-  // Populate refs from refStore for advertisement
-  const allRefs = await refStore.listAll();
+  // Populate refs from refStore for advertisement (hidden ones are not ours)
+  const allRefs = visibleRefs(await refStore.listAll(), options.hideRefs);
   for (const [refName, oid] of allRefs) {
     state.refs.set(refName, oid);
   }
@@ -77,6 +86,8 @@ export async function messagePortServe(
   const config: ProcessConfiguration = {
     requestPolicy: options.requestPolicy ?? "ADVERTISED",
     maxEmptyBatches: options.maxEmptyBatches ?? 10,
+    hiddenRefs: options.hideRefs,
+    uploadPack: { hooks: options.hooks },
   };
 
   const ctx: ProcessContext = {

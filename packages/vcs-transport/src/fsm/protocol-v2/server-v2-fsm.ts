@@ -9,15 +9,21 @@
 
 import type { PktLineResult } from "../../api/transport-api.js";
 import type { ProcessContext } from "../../context/process-context.js";
+import { isRefHidden, visibleRefs } from "../../protocol/hidden-refs.js";
 import {
+  authorizeUpload,
   computeShallowUpdate,
   findUnreachableWant,
+  includeTagCandidates,
+  notifyUpload,
   notOurRef,
   okToGiveUp,
+  peelFully,
   resolveDeepenNot,
   type ShallowUpdate,
   sendPackStream,
   UploadPackRequestError,
+  type UploadPackRequestParts,
 } from "../fetch/index.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import {
@@ -239,8 +245,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           }
         }
 
-        // Get refs
-        const allRefs = Array.from(await ctx.refStore.listAll());
+        // Get refs: hidden ones are not listed (git's ls-refs with hideRefs)
+        const allRefs = visibleRefs(await ctx.refStore.listAll(), ctx.config.hiddenRefs);
         const matches = (name: string) =>
           refPrefixes.length === 0 || refPrefixes.some((p) => name.startsWith(p));
 
@@ -271,11 +277,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
               line += ` symref-target:${target}`;
             }
           }
-          if (peel && ctx.repository.peelTag) {
-            const peeled = await ctx.repository.peelTag(oid);
-            if (peeled && peeled !== oid) {
-              line += ` peeled:${peeled}`;
-            }
+          if (peel) {
+            // fully peeled, through a chain of tags (git's peel_iterated_oid)
+            const peeled = await peelFully(ctx.repository, oid);
+            if (peeled) line += ` peeled:${peeled}`;
           }
 
           await ctx.transport.writeLine(line);
@@ -400,11 +405,13 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         ctx.state.wants = new Set();
         ctx.state.wantedRefs = new Map();
 
-        // Resolve want-refs to OIDs
+        // Resolve want-refs to OIDs; a hidden ref is unknown (git's parse_want_ref)
         for (const refName of req.wantRefs) {
-          const oid = await ctx.refStore.get(refName);
+          const oid = isRefHidden(refName, ctx.config.hiddenRefs)
+            ? undefined
+            : await ctx.refStore.get(refName);
           if (!oid) {
-            ctx.output.error = `Unknown ref: ${refName}`;
+            ctx.output.error = `unknown ref ${refName}`;
             ctx.output.invalidWant = refName;
             return "INVALID_WANT";
           }
@@ -423,7 +430,9 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         // (its parse_want refuses only a missing object, whatever uploadpack.allow* say); a
         // stricter policy is ours. "not our ref" for anything refused
         const policy = ctx.config.requestPolicy ?? "ANY";
-        const tips = [...(await ctx.refStore.listAll())].map(([, oid]) => oid);
+        const allRefs = [...(await ctx.refStore.listAll())];
+        // every tip, hidden ones too (git's allowTipSHA1InWant / allowReachableSHA1InWant)
+        const tips = allRefs.map(([, oid]) => oid);
         let refused: string | undefined;
         if (policy === "ANY") {
           for (const oid of req.wants) {
@@ -433,7 +442,11 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
             }
           }
         } else if (policy === "ADVERTISED" || policy === "TIP") {
-          const tipSet = new Set(tips);
+          const tipSet = new Set(
+            policy === "TIP"
+              ? tips
+              : visibleRefs(allRefs, ctx.config.hiddenRefs).map(([, oid]) => oid),
+          );
           refused = req.wants.find((oid) => !tipSet.has(oid));
         } else {
           refused = await findUnreachableWant(ctx.repository, req.wants, tips);
@@ -444,6 +457,18 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           return "INVALID_WANT";
         }
         for (const oid of req.wants) ctx.state.wants.add(oid);
+
+        // the authorize hook decides before the response
+        const denied = await authorizeUpload(
+          ctx.config,
+          ctx.refStore,
+          ctx.repository,
+          uploadRequest(ctx),
+        );
+        if (denied !== undefined) {
+          ctx.output.error = denied;
+          return "INVALID_WANT";
+        }
 
         return "VALID";
       } catch (e) {
@@ -681,6 +706,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           thin,
           ofsDelta: req?.ofsDeltas ?? false,
           includeTag: req?.includeTags,
+          // git's pack-objects --include-tag: the visible annotated tags of packed objects
+          includeTags: req?.includeTags
+            ? await includeTagCandidates(ctx.config, ctx.refStore)
+            : undefined,
           filterSpec: req?.filter ?? undefined,
           shallow: packShallow,
         });
@@ -692,7 +721,13 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           progress: false,
           keepAliveMs: ctx.config.keepAliveMs,
         });
-        if (sent.ok) return "PACKFILE_SENT";
+        if (sent.ok) {
+          notifyUpload(ctx.config, ctx.refStore, ctx.repository, uploadRequest(ctx), {
+            common,
+            packBytes: sent.bytes,
+          });
+          return "PACKFILE_SENT";
+        }
         ctx.output.error = sent.error;
         // reported on band 3; without side-band the client must see a broken stream, not a
         // short pack
@@ -798,6 +833,28 @@ interface ServerV2State {
   sendAcks?: boolean;
   /** The shallow-info sent, and how the pack is cut to match it */
   shallowUpdate?: ShallowUpdate;
+}
+
+/** The current fetch command as upload-pack's hooks see it. */
+function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
+  const req = (ctx.state as ServerV2State).fetchRequest;
+  const capabilities = new Set<string>();
+  if (req?.thinPack) capabilities.add("thin-pack");
+  if (req?.noProgress) capabilities.add("no-progress");
+  if (req?.includeTags) capabilities.add("include-tag");
+  if (req?.ofsDeltas) capabilities.add("ofs-delta");
+  if (req?.deepenRelative) capabilities.add("deepen-relative");
+  if (req?.waitForDone) capabilities.add("wait-for-done");
+  return {
+    protocolVersion: 2,
+    wants: [...ctx.state.wants],
+    wantRefs: new Map(ctx.state.wantedRefs ?? []),
+    haves: [...(req?.haves ?? [])],
+    capabilities,
+    shallow: [...(req?.shallow ?? [])],
+    depth: req?.deepen ?? 0,
+    ...(req?.filter != null ? { filter: req.filter } : {}),
+  };
 }
 
 /** The commands the v2 server implements. */

@@ -15,6 +15,7 @@ import type { ProcessContext, RefStore } from "../context/process-context.js";
 import { ProtocolState } from "../context/protocol-state.js";
 import { createTransportApi } from "../factories/transport-api-factory.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../fsm/fetch/server-fetch-fsm.js";
+import type { UploadPackHooks } from "../fsm/fetch/upload-pack-hooks.js";
 import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
 import {
@@ -67,6 +68,18 @@ export interface ServeOverDuplexOptions {
   strictAtomic?: boolean;
   /** receive-pack hooks: authorize, preReceive, update, postReceive */
   hooks?: ReceivePackHooks;
+  /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
+  uploadPackHooks?: UploadPackHooks;
+  /**
+   * Hidden ref patterns of both services (git's `transfer.hideRefs`; see `isRefHidden`):
+   * not advertised (nor listed by v2 `ls-refs`), a v2 `want-ref` of one is an unknown ref,
+   * and receive-pack refuses changing one ("deny updating a hidden ref")
+   */
+  hideRefs?: string[];
+  /** Hidden ref patterns of upload-pack, after `hideRefs` (git's `uploadpack.hideRefs`) */
+  uploadPackHideRefs?: string[];
+  /** Hidden ref patterns of receive-pack, after `hideRefs` (git's `receive.hideRefs`) */
+  receivePackHideRefs?: string[];
   /** Most commands in one push (receive-pack; default 65536) */
   maxCommands?: number;
   /** Side-band keep-alive interval while a push is checked (ms; default 5000; 0: none) */
@@ -185,6 +198,13 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     serverCapabilities: options.capabilities,
     requestPolicy: options.requestPolicy,
     advertiseObjectInfo: options.advertiseObjectInfo,
+    hiddenRefs: [
+      ...(options.hideRefs ?? []),
+      ...((service === "git-receive-pack"
+        ? options.receivePackHideRefs
+        : options.uploadPackHideRefs) ?? []),
+    ],
+    uploadPack: { hooks: options.uploadPackHooks, logger: options.logger },
     allowDeletes: options.allowDeletes ?? true,
     allowNonFastForward: options.allowNonFastForward ?? false,
     denyCurrentBranch: options.denyCurrentBranch ?? true,

@@ -20,6 +20,7 @@ import {
   type ProcessContext,
 } from "../../context/context-adapters.js";
 import { ZERO_OID } from "../../protocol/constants.js";
+import { visibleRefs } from "../../protocol/hidden-refs.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { sendPackStream } from "./send-pack-stream.js";
 import {
@@ -31,6 +32,12 @@ import {
   resolveDeepenNot,
   UploadPackRequestError,
 } from "./upload-pack-graph.js";
+import {
+  authorizeUpload,
+  includeTagCandidates,
+  notifyUpload,
+  type UploadPackRequestParts,
+} from "./upload-pack-hooks.js";
 
 /**
  * Server fetch FSM transitions.
@@ -123,6 +130,21 @@ function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
   return graphOkToGiveUp(getRepository(ctx), state.wants, state.commonBase);
 }
 
+/** The v0 request as upload-pack's hooks see it. */
+function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
+  const state = getState(ctx);
+  return {
+    protocolVersion: 0,
+    wants: [...state.wants],
+    wantRefs: new Map(),
+    haves: [...state.haves],
+    capabilities: state.capabilities,
+    shallow: [...(state.clientShallow ?? [])],
+    depth: state.deepen ?? 0,
+    ...(state.filterSpec !== undefined ? { filter: state.filterSpec } : {}),
+  };
+}
+
 /**
  * What upload-pack (protocol v0/v1) advertises by default: only what it implements. The
  * `allow-*-sha1-in-want` capabilities follow the request policy; `deepen-since`, `deepen-not`
@@ -191,7 +213,8 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           defaultUploadPackCapabilities(config.requestPolicy, repository);
 
         let first = true;
-        const refsArray = [...refs];
+        // hidden refs are neither advertised nor "ours" under the ADVERTISED policy
+        const refsArray = visibleRefs(refs, config.hiddenRefs);
 
         // Empty repository: send special capabilities^{} line
         if (refsArray.length === 0) {
@@ -322,6 +345,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
 
       try {
         const policy = config.requestPolicy ?? "ADVERTISED";
+        // reachability counts hidden tips too, as git's allowReachableSHA1InWant
+        const reachableFrom = config.hiddenRefs?.length
+          ? [...(await refStore.listAll())].map(([, oid]) => oid)
+          : [...state.refs.values()];
 
         for (const oid of state.wants) {
           let valid = false;
@@ -334,9 +361,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             case "REACHABLE_COMMIT":
               // Reachable from any advertised ref
               if (repository.getCommitInfo) {
-                valid = !(await findUnreachableWant(repository, [oid], state.refs.values()));
+                valid = !(await findUnreachableWant(repository, [oid], reachableFrom));
               } else if (repository.isReachableFrom) {
-                valid = await repository.isReachableFrom(oid, [...state.refs.values()]);
+                valid = await repository.isReachableFrom(oid, reachableFrom);
               } else {
                 valid = [...state.refs.values()].includes(oid);
               }
@@ -368,6 +395,12 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             output.invalidWant = oid;
             return "INVALID_WANT";
           }
+        }
+        // the authorize hook decides before any negotiation or pack byte
+        const refused = await authorizeUpload(config, refStore, repository, uploadRequest(ctx));
+        if (refused !== undefined) {
+          output.error = refused;
+          return "INVALID_WANT";
         }
         return "VALID";
       } catch (e) {
@@ -722,6 +755,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           thin,
           ofsDelta: state.capabilities.has("ofs-delta"),
           includeTag,
+          // git's pack-objects --include-tag: the visible annotated tags of packed objects
+          includeTags: includeTag
+            ? await includeTagCandidates(config, getRefStore(ctx))
+            : undefined,
           filterSpec: state.filterSpec,
           shallow: state.packShallow ?? state.serverShallow,
         });
@@ -734,6 +771,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         });
         if (sent.ok) {
           output.sentBytes = (output.sentBytes ?? 0) + sent.bytes;
+          notifyUpload(config, getRefStore(ctx), repository, uploadRequest(ctx), {
+            common: state.commonBase,
+            packBytes: sent.bytes,
+          });
           return "PACK_SENT";
         }
         output.error = sent.error;
