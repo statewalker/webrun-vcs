@@ -523,11 +523,23 @@ function serializeEntryV4(
   return buffer;
 }
 
-/** The nanoseconds within the second to record for a time of `ms` milliseconds. */
-function nanosOf(ms: number, ns: number | undefined): number {
-  const millis = Math.floor(ms) % 1000;
-  if (ns !== undefined && ns >= 0 && ns < 1e9 && Math.floor(ns / 1e6) === millis) return ns;
-  return Math.min(999_999_999, Math.max(0, Math.floor((ms % 1000) * 1e6)));
+/**
+ * The seconds and nanoseconds to record for a time of `ms` milliseconds whose exact
+ * nanoseconds within the second may be known (`ns`). A time in milliseconds is a double that
+ * cannot hold nanoseconds at today's dates (about 244 ns of resolution), so `ms` can round
+ * across a millisecond, or even a second (.999999931 reads as the next second). The exact
+ * nanoseconds win whenever they are within a few milliseconds of `ms`, and the seconds are
+ * taken from them; otherwise `ms` alone decides.
+ */
+function timeParts(ms: number, ns: number | undefined): [seconds: number, nanos: number] {
+  const approx = (((ms % 1000) + 1000) % 1000) * 1e6;
+  if (ns !== undefined && Number.isInteger(ns) && ns >= 0 && ns < 1e9) {
+    const distance = Math.abs(approx - ns);
+    if (Math.min(distance, 1e9 - distance) < 2e6) {
+      return [Math.round((ms - ns / 1e6) / 1000), ns];
+    }
+  }
+  return [Math.floor(ms / 1000), Math.min(999_999_999, Math.max(0, Math.floor(approx)))];
 }
 
 /**
@@ -539,14 +551,15 @@ function writeEntryHeader(
   pathLength: number,
   hasExtended: boolean,
 ): void {
-  // ctime, mtime: seconds and nanoseconds (the recorded nanoseconds while they still
-  // belong to the time's millisecond, else the millisecond's)
+  // ctime, mtime: seconds and nanoseconds (the exact nanoseconds when known, see timeParts)
   const ctime = entry.ctime ?? entry.mtime;
   const ctimeNs = entry.ctime === undefined ? entry.mtimeNs : entry.ctimeNs;
-  view.setUint32(P_CTIME, Math.floor(ctime / 1000));
-  view.setUint32(P_CTIME + 4, nanosOf(ctime, ctimeNs));
-  view.setUint32(P_MTIME, Math.floor(entry.mtime / 1000));
-  view.setUint32(P_MTIME + 4, nanosOf(entry.mtime, entry.mtimeNs));
+  const [ctimeSec, ctimeNanos] = timeParts(ctime, ctimeNs);
+  const [mtimeSec, mtimeNanos] = timeParts(entry.mtime, entry.mtimeNs);
+  view.setUint32(P_CTIME, ctimeSec);
+  view.setUint32(P_CTIME + 4, ctimeNanos);
+  view.setUint32(P_MTIME, mtimeSec);
+  view.setUint32(P_MTIME + 4, mtimeNanos);
 
   // dev, ino
   view.setUint32(P_DEV, entry.dev ?? 0);

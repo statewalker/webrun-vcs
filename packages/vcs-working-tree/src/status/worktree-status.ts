@@ -65,8 +65,20 @@ function sameType(a: number, b: number): boolean {
 /** Times in whole milliseconds: the index and the filesystem may keep fractions differently. */
 const ms = (t: number | undefined) => Math.floor(t ?? 0);
 
-/** Whole seconds of a time in milliseconds. */
-const seconds = (t: number | undefined) => Math.floor(ms(t) / 1000);
+/**
+ * Whole seconds of a time in milliseconds. When the exact nanoseconds within the second are
+ * known they decide: a double cannot hold nanoseconds at today's dates, so a time just below
+ * a whole second (.999999931) can read as the next second in milliseconds.
+ */
+function seconds(t: number | undefined, ns?: number): number {
+  const time = t ?? 0;
+  if (ns !== undefined && Number.isInteger(ns) && ns >= 0 && ns < 1e9) {
+    const approx = (((time % 1000) + 1000) % 1000) * 1e6;
+    const distance = Math.abs(approx - ns);
+    if (Math.min(distance, 1e9 - distance) < 2e6) return Math.round((time - ns / 1e6) / 1000);
+  }
+  return Math.floor(ms(time) / 1000);
+}
 
 /**
  * Whether a time the index recorded matches the file's, compared in whole seconds as git
@@ -75,17 +87,26 @@ const seconds = (t: number | undefined) => Math.floor(ms(t) / 1000);
  * nanoseconds off), so comparing it would make unchanged files look changed. A same-size
  * edit within the same second is caught by the racy check instead, as in git.
  */
-function sameTime(recorded: number | undefined, current: number | undefined): boolean {
-  return seconds(recorded) === seconds(current);
+function sameTime(
+  recorded: number | undefined,
+  recordedNs: number | undefined,
+  current: number | undefined,
+  currentNs: number | undefined,
+): boolean {
+  return seconds(recorded, recordedNs) === seconds(current, currentNs);
 }
 
 /**
  * Racy git: an entry whose mtime is not older than the index file (in whole seconds, as
  * git's default build compares them) may hide a same-size change, so its content is checked.
  */
-function isRacy(recorded: number | undefined, indexTime: number): boolean {
+function isRacy(
+  recorded: number | undefined,
+  recordedNs: number | undefined,
+  indexTime: number,
+): boolean {
   if (indexTime === 0) return true;
-  return seconds(recorded) >= seconds(indexTime);
+  return seconds(recorded, recordedNs) >= seconds(indexTime);
 }
 
 /**
@@ -127,12 +148,12 @@ export async function compareWithWorktree(
   const statMatches =
     ms(entry.mtime) !== 0 &&
     current.size === entry.size &&
-    sameTime(entry.mtime, current.mtime) &&
+    sameTime(entry.mtime, entry.mtimeNs, current.mtime, current.mtimeNs) &&
     (entry.ctime === undefined ||
       current.ctime === undefined ||
-      sameTime(entry.ctime, current.ctime));
+      sameTime(entry.ctime, entry.ctimeNs, current.ctime, current.ctimeNs));
   // racy git: an entry not older than the index file may hide a same-size change
-  const racy = isRacy(entry.mtime, indexTime);
+  const racy = isRacy(entry.mtime, entry.mtimeNs, indexTime);
   if (statMatches && !racy) return found;
   // a known size that differs is a change, without reading the file (git: DATA_CHANGED)
   if (

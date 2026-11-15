@@ -12,3 +12,5 @@
 - **vcs-utils-node:** `lstat` builds millisecond times from the nanosecond parts exactly (a ~1.8e18 nanosecond time no longer drifts below its millisecond), so the index records the file's nanoseconds exactly.
 - **vcs-store-files:** a submodule `gitdir:` file pointing where there is no repository, or beyond the FilesApi's root, makes status fail with git's message ("fatal: gitfile does not point to a valid repository: sub/.git") instead of reporting the submodule clean.
 - **vcs-working-tree:** stash push keeps the index's commit for a submodule (as git stash), even when the submodule checked out another one.
+
+**Exact index times.** The index writer records the exact nanoseconds a file's stat carried, and takes the seconds from them: a time in milliseconds (a double) cannot hold nanoseconds at today's dates and can round across a millisecond or a second. Status takes whole seconds the same way.
