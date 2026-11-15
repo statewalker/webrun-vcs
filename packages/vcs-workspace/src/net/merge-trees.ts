@@ -156,15 +156,14 @@ export async function findMergeBases(
   const graph = commitGraph(history);
   const candidates = await paintDownToCommon(graph, a, b);
   if (candidates.length < 2) return candidates;
-  // git's remove_redundant: a candidate another candidate descends from is not a best one
-  const times = await Promise.all(candidates.map(async (c) => (await graph(c)).time));
-  const oldest = Math.min(...times);
+  // git's remove_redundant: a candidate another candidate descends from is not a best one.
+  // Exact reachability, no date cutoff: commit dates may be skewed. Several candidates only
+  // happen in criss-cross histories, so this walk is rare.
   const redundant = new Set<ObjectId>();
   for (const c of candidates) {
     if (redundant.has(c)) continue;
     const others = candidates.filter((o) => o !== c && !redundant.has(o));
-    for (const reached of await reachable(graph, c, new Set(others), oldest))
-      redundant.add(reached);
+    for (const reached of await reachable(graph, c, new Set(others))) redundant.add(reached);
   }
   return candidates.filter((c) => !redundant.has(c)).sort();
 }
@@ -279,12 +278,11 @@ async function paintDownToCommon(
   return result.filter(live);
 }
 
-/** Which of `targets` are ancestors of `from`, walking no lower than `oldest` (seconds). */
+/** Which of `targets` are ancestors of `from` (the walk ends once all are found). */
 async function reachable(
   graph: (id: ObjectId) => Promise<CommitInfo>,
   from: ObjectId,
   targets: Set<ObjectId>,
-  oldest: number,
 ): Promise<ObjectId[]> {
   const found: ObjectId[] = [];
   const seen = new Set<ObjectId>([from]);
@@ -293,10 +291,11 @@ async function reachable(
     const id = stack.pop() as ObjectId;
     if (seen.has(id)) continue;
     seen.add(id);
-    if (targets.has(id)) found.push(id);
-    const info = await graph(id);
-    if (info.time < oldest) continue;
-    stack.push(...info.parents);
+    if (targets.has(id)) {
+      found.push(id);
+      if (found.length === targets.size) break;
+    }
+    stack.push(...(await graph(id)).parents);
   }
   return found;
 }

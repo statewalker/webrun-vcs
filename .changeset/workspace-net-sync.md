@@ -23,7 +23,11 @@ A new entry point keeps a folder (any `FilesApi`) as commits on one branch and s
 - What a folder cannot hold stays in history: ignored paths, submodule entries, executable modes and symbolic links.
 - On case-insensitive folders, paths differing only in case are moved aside. Case sensitivity is probed when the workspace opens, or set with `caseInsensitive`.
 - Each file is checked again just before a checkout replaces it. New content is staged in a temporary file; an existing file is rewritten in place so it keeps its permissions.
-- A checkout cut short is recorded (`refs/workspace/pending/<branch>`) and finished by the next commit or sync, from a plan stored on the first attempt, so retries never merge a merged file twice. When a directory becomes a file, ignored files in it are removed.
+- A checkout cut short is recorded (`refs/workspace/pending/<branch>`) and finished by the next commit or sync, from a plan stored on the first attempt under `refs/workspace/plan/<branch>`, so retries never merge a merged file twice. Nothing the finish refuses is dropped:
+  - an edit made later is merged or moved aside and reported;
+  - a path it cannot bring to the plan stops it with the branch unmoved.
+- When a directory becomes a file, ignored files in it are removed. Any other content is kept, such as new files or a submodule's checkout with its `.git`; the target's file goes aside and the path is reported. Nested repositories (directories holding `.git`) are never committed.
+- `rehashAll` reads every file on every snapshot, for folders whose times can be set back.
 - Folder snapshots skip unchanged files by size and modification time. Racily clean entries (a time within `racyWindowMs`, default 3 s, of the last read) are hashed again.
 - Merge bases are found with git's paint-down-to-common walk.
 - `.git` is refused in its NTFS and HFS+ spellings too. The `.vcs-sync-tmp-` prefix is reserved, and stale temporary files are swept.

@@ -64,6 +64,28 @@ export interface SnapshotOptions {
   racyWindowMs?: number;
   /** Temporary checkout files found, by path, with their modification times */
   tempFiles?: Map<string, number>;
+  /** Read every file again, whatever the cache says */
+  rehashAll?: boolean;
+}
+
+/**
+ * The directories of a nested repository (one holding a `.git` entry below the folder's
+ * root, a submodule's checkout for one): their files belong to that repository.
+ */
+export function nestedRepositories(paths: Iterable<string>): string[] {
+  const roots = new Set<string>();
+  for (const path of paths) {
+    const parts = path.split("/");
+    for (let i = 1; i < parts.length; i++) {
+      if (parts[i].toLowerCase() === ".git") roots.add(parts.slice(0, i).join("/"));
+    }
+  }
+  return [...roots];
+}
+
+function under(roots: string[]): (path: string) => boolean {
+  if (roots.length === 0) return () => false;
+  return (path) => roots.some((r) => path.startsWith(`${r}/`));
 }
 
 /**
@@ -80,15 +102,20 @@ export async function snapshotFolder(
   const skip = options.skip ?? defaultIgnore;
   const window = options.racyWindowMs ?? DEFAULT_RACY_WINDOW_MS;
   const files: FolderSnapshot = new Map();
+  const infos: { path: string; size: number; lastModified: number; at: string }[] = [];
   for await (const info of folder.list("/", { recursive: true })) {
     if (info.kind !== "file") continue;
-    const path = relative(info.path);
+    infos.push({ ...info, path: relative(info.path), at: info.path });
+  }
+  const inNested = under(nestedRepositories(infos.map((i) => i.path)));
+  for (const info of infos) {
+    const { path } = info;
     if (isSyncTempFile(path)) {
       options.tempFiles?.set(path, info.lastModified);
       continue;
     }
-    if (skip(path) || !isSafePath(path)) continue;
-    const known = options.cache?.get(path);
+    if (skip(path) || !isSafePath(path) || inNested(path)) continue;
+    const known = options.rehashAll ? undefined : options.cache?.get(path);
     if (
       known &&
       known.size === info.size &&
@@ -99,7 +126,7 @@ export async function snapshotFolder(
       continue;
     }
     const seenAt = Date.now();
-    const id = await history.blobs.store(folder.read(info.path));
+    const id = await history.blobs.store(folder.read(info.at));
     files.set(path, { id, size: info.size, lastModified: info.lastModified, seenAt });
   }
   return files;
@@ -154,11 +181,27 @@ async function removeEmptyParents(folder: FilesApi, path: string): Promise<void>
  */
 async function clearDirectory(folder: FilesApi, path: string, expendable: IgnorePath) {
   for await (const info of folder.list(`/${path}`, { recursive: true })) {
-    if (info.kind !== "file") continue;
     const p = relative(info.path);
+    // a nested repository (a `.git` inside) is never expendable, whatever `ignore` says
+    if (!isSafePath(p)) throw new FolderChangedError(p);
+    if (info.kind !== "file") continue;
     if (!expendable(p) && !isSyncTempFile(p)) throw new FolderChangedError(p);
   }
   await folder.remove(`/${path}`);
+}
+
+/** Whether the directory at `path` holds only what {@link clearDirectory} may remove. */
+export async function isExpendableDirectory(
+  folder: FilesApi,
+  path: string,
+  expendable: IgnorePath,
+): Promise<boolean> {
+  for await (const info of folder.list(`/${path}`, { recursive: true })) {
+    const p = relative(info.path);
+    if (!isSafePath(p)) return false;
+    if (info.kind === "file" && !expendable(p) && !isSyncTempFile(p)) return false;
+  }
+  return true;
 }
 
 /** Options of {@link applyFolderPath}. */
@@ -265,7 +308,14 @@ export async function checkoutFolder(
   return done;
 }
 
-/** Removes temporary checkout files older than `olderThanMs` (left by a crash). */
+/** The names {@link applyFolderPath} gives its temporary files: prefix, time, counter, random */
+const TEMP_NAME = /^\.vcs-sync-tmp-[0-9a-z]+-[0-9a-z]+-[0-9a-z]{1,8}$/;
+
+/**
+ * Removes temporary checkout files older than `olderThanMs` (left by a crash). Only names
+ * of the exact form a checkout writes are removed; any other file with the reserved prefix is
+ * left alone (and never committed).
+ */
 export async function sweepTempFiles(
   folder: FilesApi,
   tempFiles: Map<string, number>,
@@ -275,6 +325,7 @@ export async function sweepTempFiles(
   const now = Date.now();
   for (const [path, lastModified] of tempFiles) {
     if (now - lastModified < olderThanMs) continue;
+    if (!TEMP_NAME.test(path.slice(path.lastIndexOf("/") + 1))) continue;
     if (await folder.remove(`/${path}`)) removed.push(path);
   }
   return removed;

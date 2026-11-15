@@ -189,7 +189,7 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
 
 ### What the folder cannot hold stays in history
 
-- **Ignored paths** (`ignore`, default `.git/`) are never committed and never written by a checkout. They stay in history as they are: an ignored file another workspace committed stays in the tree, and deleting it locally records nothing. There is one exception, as in git: when a tracked directory becomes a file, ignored files inside that directory are removed to make room. Any other untracked file there stops the checkout.
+- **Ignored paths** (`ignore`, default `.git/`) are never committed and never written by a checkout. They stay in history as they are: an ignored file another workspace committed stays in the tree, and deleting it locally records nothing. There is one exception, as in git: when a tracked directory becomes a file, ignored files inside that directory are removed to make room. A directory holding anything else, such as new files of the user's or a nested repository, is kept as it is. The target's file then goes beside it as `<path>.theirs-<id>`, and the path is reported as a conflict.
 - **Unsafe paths** are refused. Every path of a fetched tree is checked against git's `verify_path` rules before anything is written, including the NTFS and HFS+ spellings of `.git` (`is_ntfs_dotgit`, `is_hfs_dotgit`). A path is refused when it has:
   - a component `.git` or `git~1` in any letter case, also with trailing dots or spaces, with an alternate data stream (`.git::$INDEX_ALLOCATION`) or with the code points HFS+ ignores (U+200C–200F, U+202A–202E, U+206A–206F, U+FEFF);
   - a `..`, `.` or empty component;
@@ -197,29 +197,29 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
   - the reserved temporary-file prefix (below).
 
   A remote commit with such a path fails the sync with a `SyncError`, and nothing is written. A folder's own `.git` directory is never committed, whatever `ignore` says.
-- **Modes and submodules.** Submodule entries are never checked out and stay in every commit. When a submodule becomes a plain directory upstream, its files are checked out like any others. An executable file stays executable in history when its content changes. On disk, an existing file is rewritten in place, so it keeps its permissions (the Node FilesApi keeps the mode). A new file gets the filesystem's default mode, because a FilesApi cannot set modes. A symbolic link is written as a file holding its target and keeps its mode in history.
+- **Modes and submodules.** Submodule entries are never checked out and stay in every commit. When a submodule becomes a plain directory upstream, its files are checked out like any others. When a submodule becomes a file upstream, the submodule's checkout is kept (its `.git` and any unpushed work), and the file goes beside it as `<path>.theirs-<id>`, reported. A directory holding a `.git` entry is a nested repository: its files are never committed. An executable file stays executable in history when its content changes. On disk, an existing file is rewritten in place, so it keeps its permissions (the Node FilesApi keeps the mode). A new file gets the filesystem's default mode, because a FilesApi cannot set modes. A symbolic link is written as a file holding its target and keeps its mode in history. A FilesApi does not say whether a folder path is a symbolic link. A link the user made in the folder is therefore followed when its file is rewritten in place, as the Node FilesApi's own writes follow it. The sync itself never creates links.
 - **Case.** On a case-insensitive folder (probed with a temporary file when the workspace opens, or set with `caseInsensitive`), names are compared case-folded and NFC-normalised:
   - a directory spelled two ways (`Docs/`, `docs/`) is renamed to its first spelling;
   - two files that would be one are kept apart by moving one aside as `<path>.case-<id>`.
 
   Both changes go in a commit on top and are reported as conflicts.
-- **Reserved names.** Files whose names start with `.vcs-sync-tmp-` are the checkout's temporary files. They are never committed. Ones older than ten minutes (left by a crash) are removed at the next commit or sync.
+- **Reserved names.** Files whose names start with `.vcs-sync-tmp-` are reserved for the checkout's temporary files, and they are never committed. Temporary files a crash left behind are removed at the next commit or sync once they are older than ten minutes. Only names of the exact form a checkout writes (`.vcs-sync-tmp-<time>-<counter>-<random>`) are removed; any other file with the prefix is left alone.
 
 ### Why a failure leaves nothing half-done
 
 The branch always names the commit the folder holds. Before a checkout, the target commit is recorded (`refs/workspace/pending/main`). Then the folder is checked out, the branch moves (by compare-and-swap), and the record goes.
 
-A checkout cut short, by a full disk for example, is finished at the start of the next commit or sync. The first attempt to finish makes a plan and stores it with the record, as a commit on top of the target:
+A checkout cut short, by a full disk for example, is finished at the start of the next commit or sync. The first attempt to finish makes a plan and stores it under its own ref (`refs/workspace/plan/main`), as a commit on top of the target. Only the workspace writes that ref, so a fetched commit cannot pass for a plan. The plan says:
 
 - a file still at the old content gets the new one;
 - a file already written stays;
 - a file edited meanwhile keeps the edit, merged with the new content: markers for text, the new version beside it for binary content.
 
-Each retry then follows the stored plan, so a merged file is never merged again, and a failing retry changes nothing it already did. A half-written folder is never committed as local edits.
+Each retry then follows the stored plan, so a merged file is never merged again, and a failing retry changes nothing it already did. A file changed again after the plan was stored is kept the same way: merged or moved aside, the plan updated first, the path reported. Nothing the finish refuses is dropped. A path it cannot bring to the plan stops it with the branch unmoved, and the branch moves to the target only when every path is done. A half-written folder is never committed as local edits.
 
 An edit made while a sync runs is not overwritten, with one small window left. Before the checkout, the sync checks that the folder still matches the branch; if not, it starts the round again and commits the edit first. Then, just before each file is replaced or removed, its content is hashed again. The new content is staged in a temporary file first. After that check, it is moved in place (a new file) or copied over the old file in place (an existing one, to keep its permissions). An edit found at the check stops the checkout, and the next round finishes it as above. What remains is the moment between the last check of a file and its replacement: a save that lands exactly then is replaced.
 
-The folder snapshot does not read a file again when its size and modification time are unchanged. A time within `racyWindowMs` (default 3 s) of when the file was last read is not trusted, because a later write in the same clock tick would look the same. Such a file is hashed again, as git does for "racily clean" index entries. Raise the window for a filesystem with coarser times. Files a checkout writes are always read again.
+The folder snapshot does not read a file again when its size and modification time are unchanged. A time within `racyWindowMs` (default 3 s) of when the file was last read is not trusted, because a later write in the same clock tick would look the same. Such a file is hashed again, as git does for "racily clean" index entries. Raise the window for a filesystem with coarser times. Files a checkout writes are always read again. Two cases are beyond the window: a same-size replacement whose modification time is set back (`rsync -t`, `cp -p`, a restore from backup), and a clock skewed by more than the window between the folder's filesystem and this machine. For such folders, set `rehashAll: true`, which reads every file on every snapshot.
 
 Failures reject with a `SyncError`: a fetch or push that fails, a checkout that cannot write, a refused path. On the wire, objects arrive before refs move on both sides. A link cut mid-fetch leaves no tracking ref. A push cut mid-pack leaves the server's branch where it was (receive-pack quarantines the pack). The next sync over a working link completes.
 

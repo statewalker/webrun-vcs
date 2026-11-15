@@ -533,18 +533,18 @@ describe("L3/L6. retry classification and wording", () => {
 describe("L4. temporary checkout files", () => {
   it("stale ones are swept, fresh ones and the reserved prefix stay out of history", async () => {
     const dir = nodeDir();
-    writeFileSync(join(dir, `${SYNC_TEMP_MARK}old`), "left by a crash\n");
-    writeFileSync(join(dir, `${SYNC_TEMP_MARK}fresh`), "being written\n");
+    writeFileSync(join(dir, `${SYNC_TEMP_MARK}lx0abc-0-k3j9x2qa`), "left by a crash\n");
+    writeFileSync(join(dir, `${SYNC_TEMP_MARK}lx0abd-1-p0q1r2s3`), "being written\n");
     writeFileSync(join(dir, "a.txt"), "a\n");
     const hour = Date.now() / 1000 - 3600;
-    utimesSync(join(dir, `${SYNC_TEMP_MARK}old`), hour, hour);
+    utimesSync(join(dir, `${SYNC_TEMP_MARK}lx0abc-0-k3j9x2qa`), hour, hour);
     const b = await ws("Bob", nodeFolder(dir));
     const res = await commitWorkspaceChanges(b);
     expect(res.changed).toBe(true);
     const files = (await readCommitTree(b.history, res.head)).files;
     expect([...files.keys()]).toEqual(["a.txt"]);
-    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}old`)).toBe(false);
-    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}fresh`)).toBe(true);
+    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}lx0abc-0-k3j9x2qa`)).toBe(false);
+    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}lx0abd-1-p0q1r2s3`)).toBe(true);
   });
 
   it("a fetched tree using the reserved prefix is refused", async () => {
