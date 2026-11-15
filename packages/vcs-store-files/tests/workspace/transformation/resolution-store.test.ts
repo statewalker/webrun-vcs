@@ -747,6 +747,24 @@ describe("ResolutionStore streams worktree files", () => {
     }
   }
 
+  it("acceptOurs refuses a conflict path that names .git", async () => {
+    const staging = createMemoryGitStaging();
+    for (const [stage, objectId] of [
+      [MergeStage.BASE, "base111111111111111111111111111111111111"],
+      [MergeStage.OURS, oursId],
+      [MergeStage.THEIRS, "theirs33333333333333333333333333333333"],
+    ] as const) {
+      await staging.setEntry({ path: ".GIT/config", objectId, mode: 0o100644, stage });
+    }
+    const files = createInMemoryFilesApi();
+    await files.mkdir("/.git");
+    const blobs = { load: async () => [new TextEncoder().encode("evil")] };
+    const store = new GitResolutionStore(files, staging, blobs as never, "/.git", "/");
+
+    await expect(store.acceptOurs(".GIT/config")).rejects.toThrow(/Invalid worktree path/);
+    expect(await files.exists("/.GIT/config")).toBe(false);
+  });
+
   it("acceptOurs streams the blob into the worktree file", async () => {
     const probe = { produced: 0, maxOutstanding: 0 };
     const staging = createMemoryGitStaging();

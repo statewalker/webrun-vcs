@@ -1,3 +1,4 @@
+import { isValidWorktreePath } from "@statewalker/vcs-core";
 import { GitCommand } from "../git-command.js";
 
 /**
@@ -171,6 +172,12 @@ export class CleanCommand extends GitCommand<CleanResult> {
 
       // Skip directories unless specified
       if (entryTyped.isDirectory && !this.directories) {
+        continue;
+      }
+
+      // A name that spells `.git` (`.GIT`, `git~1`, …) is refused by the worktree (git's
+      // verify_path): leave it in place rather than abort the whole clean on it.
+      if (!isValidWorktreePath(entryTyped.path)) {
         continue;
       }
 

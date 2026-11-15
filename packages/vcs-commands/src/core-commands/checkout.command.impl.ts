@@ -11,6 +11,7 @@
  */
 
 import {
+  assertValidWorktreePath,
   type Blobs,
   type Commits,
   FileMode,
@@ -297,6 +298,8 @@ export class CheckoutCommand implements Checkout {
    * Write file content to working tree.
    */
   private async writeFileContent(path: string, objectId: ObjectId, _mode: number): Promise<void> {
+    // Tree and index paths may come from a crafted repository: never write into `.git`.
+    assertValidWorktreePath(path);
     const absolutePath = joinPath(this.workTreeRoot, path);
 
     // Ensure parent directory exists
@@ -321,6 +324,7 @@ export class CheckoutCommand implements Checkout {
    * Remove file from working tree.
    */
   private async removeFile(path: string): Promise<void> {
+    assertValidWorktreePath(path);
     const absolutePath = joinPath(this.workTreeRoot, path);
     await this.files.remove(absolutePath);
 
