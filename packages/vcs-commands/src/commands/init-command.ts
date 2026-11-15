@@ -1,5 +1,10 @@
-import { createInMemoryFilesApi, createMemoryHistory, type FilesApi } from "@statewalker/vcs-core";
-import { createFileWorktree } from "@statewalker/vcs-store-files";
+import {
+  createInMemoryFilesApi,
+  createMemoryHistory,
+  type FilesApi,
+  type History,
+} from "@statewalker/vcs-core";
+import { createFileWorktree, createGitFilesHistoryFromFiles } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import {
   createMemoryCheckout,
@@ -219,12 +224,27 @@ export class InitCommand {
     // Determine git directory
     const gitDir = this.resolveGitDir();
 
-    // Create the history (repository)
-    const history = createMemoryHistory();
-    await history.initialize();
-
-    // Set initial branch by creating symbolic ref for HEAD
-    await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
+    // Create the history (repository). With a FilesApi it lives in `gitDir` on those files,
+    // in git's layout, so it survives a reload and native git can read it; like `git init`
+    // on an existing repository, a second init keeps its HEAD, config and objects. Without
+    // one it stays in memory.
+    let history: History;
+    if (this.files) {
+      const headPath = `${gitDir.replace(/\/+$/, "") || "."}/HEAD`;
+      const exists = (await files.stats(headPath))?.kind === "file";
+      history = await createGitFilesHistoryFromFiles({
+        files,
+        gitDir,
+        create: !exists,
+        defaultBranch: this.initialBranch,
+      });
+      await history.initialize();
+    } else {
+      history = createMemoryHistory();
+      await history.initialize();
+      // Set initial branch by creating symbolic ref for HEAD
+      await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
+    }
 
     // Create staging store (use provided or default to MemoryStagingStore)
     const staging = this.stagingStore ?? new MemoryStagingStore();

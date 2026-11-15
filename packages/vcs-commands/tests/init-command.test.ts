@@ -11,6 +11,7 @@
  */
 
 import { createInMemoryFilesApi } from "@statewalker/vcs-core";
+import { createGitFilesHistoryFromFiles } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import { describe, expect, it } from "vitest";
 
@@ -156,6 +157,48 @@ describe("InitCommand", () => {
 
       expect(commit).toBeDefined();
     });
+
+    // Regression (webrun-vcs#88): init with a FilesApi kept the repository in memory, so
+    // nothing reached `.git` and a browser-filesystem repository vanished on reload.
+    it("should write the repository to the provided FilesApi", async () => {
+      const files = createInMemoryFilesApi();
+      const result = await Git.init().setFilesApi(files).setGitDir(".git").call();
+
+      const commit = await result.git
+        .commit()
+        .setMessage("Persisted")
+        .setAuthor("Test", "test@example.com")
+        .setAllowEmpty(true)
+        .call();
+
+      const head = new TextDecoder().decode(await collect(files.read(".git/HEAD")));
+      expect(head).toBe("ref: refs/heads/main\n");
+      const branch = new TextDecoder().decode(await collect(files.read(".git/refs/heads/main")));
+      expect(branch.trim()).toBe(commit.id);
+
+      // Reopening the same files finds the commit.
+      const reopened = await createGitFilesHistoryFromFiles({ files, gitDir: ".git" });
+      await reopened.initialize();
+      expect((await reopened.refs.resolve("HEAD"))?.objectId).toBe(commit.id);
+    });
+
+    it("should keep an existing repository's HEAD when initialized again", async () => {
+      const files = createInMemoryFilesApi();
+      const first = await Git.init().setFilesApi(files).setGitDir(".git").call();
+      const commit = await first.git
+        .commit()
+        .setMessage("First")
+        .setAuthor("Test", "test@example.com")
+        .setAllowEmpty(true)
+        .call();
+      await files.write(".git/HEAD", [new TextEncoder().encode("ref: refs/heads/topic\n")]);
+      await files.write(".git/refs/heads/topic", [new TextEncoder().encode(`${commit.id}\n`)]);
+
+      const again = await Git.init().setFilesApi(files).setGitDir(".git").call();
+
+      expect(await again.workingCopy.getCurrentBranch()).toBe("topic");
+      expect((await again.repository.refs.resolve("HEAD"))?.objectId).toBe(commit.id);
+    });
   });
 
   describe("Custom staging store", () => {
@@ -295,3 +338,15 @@ describe("InitCommand", () => {
     });
   });
 });
+
+async function collect(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
+}
