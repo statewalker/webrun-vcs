@@ -1,5 +1,5 @@
 ---
-"@statewalker/vcs-commands": patch
+"@statewalker/vcs-commands": minor
 ---
 
 **Stash apply: move-aside names made unique, file/directory collisions in conflicts, rename conflicts; `stashCreate` needs a working tree.**

@@ -74,8 +74,8 @@ export interface StashWorkingTreeProvider {
  * Based on JGit's StashCreateCommand.
  *
  * Note: This command requires a working tree provider to access
- * uncommitted changes. Without a provider, it creates a stash
- * from the current HEAD state (no actual changes stashed).
+ * uncommitted changes. Without a provider, `call()` throws
+ * `StoreNotAvailableError` rather than stash HEAD's state.
  *
  * @example
  * ```typescript
