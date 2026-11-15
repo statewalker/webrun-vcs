@@ -1,5 +1,5 @@
 ---
-"@statewalker/vcs-utils-node": major
+"@statewalker/vcs-utils-node": minor
 "@statewalker/vcs-utils": patch
 "@statewalker/vcs-store-files": patch
 ---

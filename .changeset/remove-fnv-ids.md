@@ -1,8 +1,8 @@
 ---
-"@statewalker/vcs-core": major
-"@statewalker/vcs-store-mem": major
-"@statewalker/vcs-store-kv": major
-"@statewalker/vcs-store-sql": major
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-store-mem": minor
+"@statewalker/vcs-store-kv": minor
+"@statewalker/vcs-store-sql": minor
 ---
 
 **Breaking: every store uses git's SHA-1 object ids; the FNV-1a ids are gone.**
