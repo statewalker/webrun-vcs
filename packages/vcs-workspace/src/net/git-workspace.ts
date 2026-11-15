@@ -47,6 +47,7 @@ import {
   type IgnorePath,
   isExpendableDirectory,
   isSyncTempFile,
+  pathMatcher,
   probeCaseInsensitive,
   type SkippedPath,
   type SnapshotReport,
@@ -973,8 +974,7 @@ async function rejoinLeftOut(
 }
 
 /** Whether a path is one of `list` or below one of them */
-const within = (list: string[]) => (p: string) =>
-  list.some((l) => p === l || p.startsWith(`${l}/`));
+const within = (list: string[]) => pathMatcher(list);
 
 /**
  * Which folder files are held out of commits this round: files back from being ignored that
@@ -1573,8 +1573,19 @@ async function stopMerge(
       ...(nestedRoots.get(ws) ?? []),
       ...(heldPaths.get(ws) ?? []),
     ]);
-    for (const p of [...headFiles.keys(), ...files.keys()]) if (ws.ignore(p)) leftOut.add(p);
-    record = { ...record, leftOut: [...leftOut].sort() };
+    // an ignored tree path is recorded by its topmost ignored directory, when there is one
+    const topIgnored = (path: string) => {
+      for (let i = path.indexOf("/"); i > 0; i = path.indexOf("/", i + 1)) {
+        if (ws.ignore(path.slice(0, i))) return path.slice(0, i);
+      }
+      return path;
+    };
+    for (const p of new Set([...headFiles.keys(), ...files.keys()])) {
+      if (ws.ignore(p)) leftOut.add(topIgnored(p));
+    }
+    // only topmost entries: one below another adds nothing, and the record stays small
+    const below = under(leftOut);
+    record = { ...record, leftOut: [...leftOut].filter((p) => !below(p)).sort() };
     frozenPaths.set(ws, record.leftOut);
     return (await mergeCommit(ws, record)).id;
   };
@@ -1595,8 +1606,25 @@ async function stopMerge(
 
 /** Conflicted paths that still hold conflict markers when {@link concludeMerge} is called. */
 export class UnresolvedConflictsError extends Error {
-  constructor(readonly paths: string[]) {
-    super(`conflict markers are still in ${paths.join(", ")}`);
+  /**
+   * @param paths every conflicted path still holding markers
+   * @param leftOut those of `paths` that were left out of the folder when the merge stopped
+   *   (ignored, in a nested repository, held): their markers are in the merge result only,
+   *   and the user never saw them
+   */
+  constructor(
+    readonly paths: string[],
+    readonly leftOut: string[] = [],
+  ) {
+    const inFolder = paths.filter((p) => !leftOut.includes(p));
+    const parts: string[] = [];
+    if (inFolder.length > 0) parts.push(`conflict markers are still in ${inFolder.join(", ")}`);
+    if (leftOut.length > 0) {
+      parts.push(
+        `conflicted paths left out of the folder (ignored, nested repository or held) would be committed with markers: ${leftOut.join(", ")}; abort the merge, stop leaving them out and sync again, or conclude with force`,
+      );
+    }
+    super(parts.join("; "));
     this.name = "UnresolvedConflictsError";
   }
 }
@@ -1627,6 +1655,24 @@ async function readBytes(folder: FilesApi, path: string): Promise<Uint8Array | u
   return out;
 }
 
+async function blobBytes(ws: GitWorkspace, id: ObjectId): Promise<Uint8Array | undefined> {
+  const content = await ws.history.blobs.load(id);
+  if (!content) return undefined;
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of content) {
+    parts.push(chunk);
+    size += chunk.length;
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
 /** Options of {@link concludeMerge}. */
 export interface ConcludeMergeOptions {
   /** Message of the merge commit (default: git's, with the conflicted paths listed) */
@@ -1645,6 +1691,8 @@ export interface ConcludeMergeOptions {
  * a conflict marker line (`<<<<<<<` or `>>>>>>>`): git refuses unmerged index entries, and
  * markers are this workspace's equivalent. Binary conflicts are not checked: the folder's
  * version is taken, and a `.theirs-<id>` copy still beside it is committed like any file.
+ * A conflicted path that was left out when the merge stopped (ignored, say) is never in the
+ * folder, so its markers are looked for in the merge result, and refused the same way.
  * `force` skips the marker check. What was left out when the merge stopped (ignored paths,
  * nested repositories, held files) is carried over from the merge result, whatever `ignore` or
  * the folder say now; the next commit brings such paths back by the usual rules.
@@ -1674,11 +1722,23 @@ export function concludeMerge(
       throw new Error(`${ws.branch} moved during the merge`);
     }
     const unresolved: string[] = [];
+    const leftOutUnresolved: string[] = [];
+    const frozen = within(record.leftOut);
     for (const path of options.force ? [] : record.conflicts) {
+      if (frozen(path)) {
+        // carried over from the merge result, never in the folder: its markers are checked there
+        const entry = inFolder(record.files.get(path));
+        const bytes = entry ? await blobBytes(ws, entry.id) : undefined;
+        if (bytes && hasConflictMarkers(bytes)) {
+          unresolved.push(path);
+          leftOutUnresolved.push(path);
+        }
+        continue;
+      }
       const bytes = await readBytes(ws.folder, path);
       if (bytes && hasConflictMarkers(bytes)) unresolved.push(path);
     }
-    if (unresolved.length > 0) throw new UnresolvedConflictsError(unresolved);
+    if (unresolved.length > 0) throw new UnresolvedConflictsError(unresolved, leftOutUnresolved);
     const tempFiles = new Map<string, number>();
     const { snapshot, skip, skipped } = await folderSnapshot(ws, record.files, walked, tempFiles);
     await sweepTempFiles(ws.folder, tempFiles);

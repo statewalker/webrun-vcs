@@ -100,9 +100,23 @@ export interface SkippedPath {
 
 /** Whether `path` is below one of the directories `roots` */
 export function under(roots: Iterable<string>): (path: string) => boolean {
-  const list = [...roots];
-  if (list.length === 0) return () => false;
-  return (path) => list.some((r) => path.startsWith(`${r}/`));
+  return pathMatcher(roots, false);
+}
+
+/**
+ * Whether a path is one of `entries` (with `self`, the default) or below one of them: one set
+ * lookup for the path and one per ancestor directory, whatever the number of entries.
+ */
+export function pathMatcher(entries: Iterable<string>, self = true): (path: string) => boolean {
+  const set = new Set(entries);
+  if (set.size === 0) return () => false;
+  return (path) => {
+    if (self && set.has(path)) return true;
+    for (let i = path.lastIndexOf("/"); i > 0; i = path.lastIndexOf("/", i - 1)) {
+      if (set.has(path.slice(0, i))) return true;
+    }
+    return false;
+  };
 }
 
 /** Whether the file starts with `gitdir:` (a git worktree's or submodule's `.git` file). */

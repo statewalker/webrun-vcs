@@ -8,7 +8,7 @@
  */
 
 import type { HistoryWithOperations } from "@statewalker/vcs-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   abortMerge,
   commitWorkspaceChanges,
@@ -17,10 +17,12 @@ import {
   type GitWorkspaceOptions,
   NoMergeInProgressError,
   openGitWorkspace,
+  pathMatcher,
   readCommitTree,
   readMergeState,
   type SyncEvent,
   syncWorkspace,
+  UnresolvedConflictsError,
 } from "../src/net/index.js";
 import {
   folderFiles,
@@ -354,5 +356,71 @@ describe("4. smaller points", () => {
     const parent = commit?.parents[0] as string;
     const kept = [...(await readCommitTree(b.history, parent)).files.values()].map((e) => e.id);
     expect(kept).toContain(base);
+  });
+});
+
+describe("5. second review", () => {
+  it("X1: a conflicted path left out of the folder is not concluded with its markers", async () => {
+    const { history, server } = await serverRepo();
+    const r = () => messageChannelRemote(server);
+    const a = await workspace("Ann", { "p.txt": "title\nbody\n", "cfg.txt": "c1\nx\n" });
+    await syncWorkspace(a, r());
+    const plain = await workspace("Bob");
+    await syncWorkspace(plain, r());
+    await writeFile(plain, "cfg.txt", "c-bob\nx\n");
+    await commitWorkspaceChanges(plain, "local only"); // not pushed
+    const b = await reopen(plain, { ignore: (p) => p === "cfg.txt" });
+    await writeFile(a, "cfg.txt", "c-ann\nx\n");
+    await writeFile(a, "p.txt", "title by Ann\nbody\n");
+    await syncWorkspace(a, r());
+    await writeFile(b, "p.txt", "title by Bob\nbody\n");
+    const stopped = await syncWorkspace(b, r());
+    expect(stopped.conflicts).toEqual(["cfg.txt", "p.txt"]);
+    expect(await readFile(b, "cfg.txt")).toBe("c-bob\nx\n"); // ignored: the folder keeps Bob's
+    await writeFile(b, "p.txt", "resolved\nbody\n");
+    const refused = await concludeMerge(b).catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(UnresolvedConflictsError);
+    expect(refused).toMatchObject({ paths: ["cfg.txt"], leftOut: ["cfg.txt"] });
+    expect(String(refused)).toMatch(/abort the merge/);
+    expect((await serverFiles(history))["cfg.txt"]).toBe("c-ann\nx\n");
+    // force takes the merge result as it is, markers included
+    await concludeMerge(b, { force: true });
+    await syncWorkspace(b, r());
+    expect((await serverFiles(history))["cfg.txt"]).toContain("<<<<<<<");
+  });
+
+  it("the left-out paths of a merge are matched by set lookups, not by scanning the list", () => {
+    const entries = Array.from({ length: 20_000 }, (_, i) => `dir${i}/sub`);
+    const queries = Array.from({ length: 20_000 }, (_, i) => `dir${i}/sub/deeper/file.txt`);
+    const matches = pathMatcher(entries);
+    const has = vi.spyOn(Set.prototype, "has");
+    try {
+      let hits = 0;
+      for (const q of queries) if (matches(q)) hits++;
+      expect(hits).toBe(20_000);
+      // the path and each ancestor at most: 4 lookups per query, not 20 000
+      expect(has.mock.calls.length).toBeLessThanOrEqual(queries.length * 4);
+      expect(matches("elsewhere/file.txt")).toBe(false);
+    } finally {
+      has.mockRestore();
+    }
+  });
+
+  it("the merge record keeps topmost left-out paths only: an ignored directory is one entry", async () => {
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 500; i++) many[`gen/f${i}.txt`] = `${i}\n`;
+    const ignore = (p: string) => p === "gen" || p.startsWith("gen/");
+    const { r, a, b } = await setup(many, { ignore });
+    for (let i = 0; i < 500; i++) await writeFile(b, `gen/local${i}.txt`, "x\n");
+    await writeFile(a, "gen/f0.txt", "changed\n");
+    await writeFile(a, "p.txt", "title by Ann\nbody\n");
+    await syncWorkspace(a, r());
+    await writeFile(b, "p.txt", "title by Bob\nbody\n");
+    expect((await syncWorkspace(b, r())).integration).toBe("conflicted");
+    const id = (await b.history.refs.resolve("refs/workspace/merge/main"))?.objectId as string;
+    const message = (await b.history.commits.load(id))?.message ?? "";
+    const meta = JSON.parse(message.slice(message.indexOf("\n\n") + 2));
+    expect(meta.leftOut).toEqual(["gen"]);
+    expect(message.length).toBeLessThan(1000);
   });
 });
