@@ -1,0 +1,9 @@
+---
+"@statewalker/vcs-transport-lfs": minor
+---
+
+**Git LFS File Locking API, client and server** (git-lfs `docs/api/locking.md`), interoperable with native `git lfs lock`, `locks`, `locks --verify`, `unlock` and the pre-push lock check (`lfs.<url>.locksverify=true`), and with Gitea's locking API.
+
+- **Client:** `lfsLocks(url, fetchImpl?, opts?)` gives `createLock(path, ref?)`, `listLocks({ path?, id?, cursor?, limit?, refspec? })`, `allLocks(query?)` (follows `next_cursor`), `verifyLocks({ ref?, cursor?, limit? })` → `{ ours, theirs, nextCursor? }` and `unlock(id, { force?, ref? })`, all in `application/vnd.git-lfs+json`. Refusals throw `LfsLockError` with the `status` (401 with the `authenticate` challenge, 403, 404, 409 with the existing `lock`, …). `headers`/`credentials` go only to the endpoint's origin; redirects are followed by the client, so they never follow one elsewhere (`headersFor(href)` applies there).
+- **Server:** `serveLfs(store, { locks: { store, identify?, admin?, perRef?, pageSize? } })` serves `POST/GET …/locks`, `POST …/locks/verify` and `POST …/locks/<id>/unlock`. `authorize` runs first (as `download` for a listing, `upload` otherwise, with the lock call as a new optional third argument); the owner comes from `identify(request)` (default: the Basic user name; none is 401 with `LFS-Authenticate`). Paths are normalised (`normalizeLockPath`), a held path is 409 with the existing lock, force-unlocking someone else's lock needs `admin(request, lock)`, verify splits by owner, pages use opaque cursors, and refs are ignored unless `perRef: true`. Without `locks`, every lock route is 404 (git-lfs: locking not supported); before, `POST …/locks/verify` reached the object verify route.
+- **Stores:** `LfsLockStore` with `createMemoryLockStore()` and `createFilesLockStore(files, root?)` (one JSON file per lock under `lfs/locks/`, created with an exclusive create).

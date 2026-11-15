@@ -3,6 +3,7 @@ import type { ContentStore } from "@statewalker/webrun-content-store";
 import type { FetchHandler } from "@statewalker/webrun-http-streams";
 import type { BatchAction, BatchObjectResponse, BatchResponse } from "./batch.js";
 import { BASIC_TRANSFER, LFS_CONTENT_TYPE } from "./batch.js";
+import { type LfsLockOperation, type LfsLocksOptions, lockRoutes } from "./locks/index.js";
 import { chunksOf } from "./sha256.js";
 import { contentStoreLfsObjects, isContentStore, type LfsObjectStore } from "./store.js";
 import type { LfsResolver } from "./types.js";
@@ -22,12 +23,21 @@ export type LfsAuthorization = boolean | { status: 401 | 403; message?: string }
 export interface LfsServerOptions {
   /**
    * Decides each batch (before anything in it is answered) and, without
-   * `transferAuth`, each transfer (`GET`/`PUT`/verify) as well.
+   * `transferAuth`, each transfer (`GET`/`PUT`/verify) as well. With
+   * `locks`, it decides each lock call first too: a listing as `download`,
+   * create, verify and unlock as `upload`, with the lock call as `lock`.
    */
   authorize?: (
     request: Request,
     operation: LfsOperation,
+    lock?: LfsLockOperation,
   ) => LfsAuthorization | Promise<LfsAuthorization>;
+  /**
+   * The File Locking API (docs/api/locking.md) under `…/locks`, kept in
+   * `locks.store`. Without it every lock route answers 404, which git-lfs
+   * takes as "this server does not support locking".
+   */
+  locks?: LfsLocksOptions;
   /**
    * Per-action authorization (docs/api/authentication.md): `header` gives the
    * headers an action carries for one object and operation, `check` checks
@@ -204,8 +214,9 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
     status: number,
     message: string,
     headers: Record<string, string> = {},
+    extra: Record<string, unknown> = {},
   ): Response {
-    const body: { message: string; request_id?: string; documentation_url?: string } = { message };
+    const body: Record<string, unknown> = { ...extra, message };
     const requestId = request.headers.get("x-request-id");
     if (requestId) body.request_id = requestId;
     if (opts.documentationUrl) body.documentation_url = opts.documentationUrl;
@@ -231,6 +242,27 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
       status === 401 ? { "lfs-authenticate": `Basic realm="${realm}"` } : {},
     );
   }
+
+  const locks = opts.locks
+    ? lockRoutes({
+        options: opts.locks,
+        authorize: async (request, lock) =>
+          refusal(
+            request,
+            opts.authorize
+              ? await opts.authorize(request, lock === "list" ? "download" : "upload", lock)
+              : true,
+          ),
+        needCredentials: (request) =>
+          error(request, 401, "Credentials needed", {
+            "lfs-authenticate": `Basic realm="${realm}"`,
+          }),
+        error: (request, status, message, extra) => error(request, status, message, {}, extra),
+        json,
+        acceptsLfsJson: (request) => acceptsLfsJson(request.headers.get("accept")),
+        readBody: boundedText,
+      })
+    : undefined;
 
   const authorizeBatch = async (request: Request, operation: LfsOperation) =>
     refusal(request, opts.authorize ? await opts.authorize(request, operation) : true);
@@ -446,6 +478,13 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
         ? opts.publicUrl.replace(/\/+$/, "")
         : `${url.origin}${path.slice(0, path.length - suffixLength)}`;
     try {
+      if (locks) {
+        const answered = locks(request, path);
+        if (answered) return await answered;
+      } else if (/\/locks(\/verify|\/[^/]+\/unlock)?$/.test(path)) {
+        await request.body?.cancel().catch(() => {});
+        return error(request, 404, "File locking is not supported");
+      }
       if (path.endsWith("/objects/batch")) {
         if (request.method !== "POST") return error(request, 405, "Use POST for a batch");
         return await batch(request, endpoint("/objects/batch".length));
