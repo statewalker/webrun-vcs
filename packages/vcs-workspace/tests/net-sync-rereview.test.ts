@@ -259,20 +259,19 @@ describe("M1. unfinished checkouts finish once and never wedge", () => {
       now: plain.now,
     });
     await expect(syncWorkspace(b, r(), { maxAttempts: 1 })).rejects.toThrow(/disk full/);
-    // the checkout wrote a.txt or not; Bob now edits it
+    // the checkout wrote a.txt (Bob sees Ann's version), then Bob edits it: an ordinary
+    // edit on top of the checkout, never merged again (third review, R3)
+    expect(await readFile(b, "a.txt")).toBe("title by Ann\nbody\n");
     await writeFile(b, "a.txt", "title by Bob\nbody\n");
     for (let i = 0; i < 3; i++) {
       await expect(syncWorkspace(b, r())).rejects.toThrow(/disk full/);
-      const text = await readFile(b, "a.txt");
-      expect(text.match(/<<<<<<</g)).toHaveLength(1);
+      expect(await readFile(b, "a.txt")).toBe("title by Bob\nbody\n");
     }
     failZ = false;
     const done = await syncWorkspace(b, r());
-    expect(done.conflicts).toContain("a.txt");
-    const text = await readFile(b, "a.txt");
-    expect(text.match(/<<<<<<</g)).toHaveLength(1);
-    expect(text).toContain("title by Ann");
-    expect(text).toContain("title by Bob");
+    expect(done.conflicts).toEqual([]);
+    expect(done.pushed).toBe(true);
+    expect(await readFile(b, "a.txt")).toBe("title by Bob\nbody\n");
     expect(await readFile(b, "z.txt")).toBe("z by Ann\n");
   });
 });
@@ -533,18 +532,18 @@ describe("L3/L6. retry classification and wording", () => {
 describe("L4. temporary checkout files", () => {
   it("stale ones are swept, fresh ones and the reserved prefix stay out of history", async () => {
     const dir = nodeDir();
-    writeFileSync(join(dir, `${SYNC_TEMP_MARK}lx0abc-0-k3j9x2qa`), "left by a crash\n");
-    writeFileSync(join(dir, `${SYNC_TEMP_MARK}lx0abd-1-p0q1r2s3`), "being written\n");
+    writeFileSync(join(dir, `${SYNC_TEMP_MARK}018c2f6a9b10-0001-1a2b3c4d`), "left by a crash\n");
+    writeFileSync(join(dir, `${SYNC_TEMP_MARK}018c2f6a9b11-0002-5e6f7a8b`), "being written\n");
     writeFileSync(join(dir, "a.txt"), "a\n");
     const hour = Date.now() / 1000 - 3600;
-    utimesSync(join(dir, `${SYNC_TEMP_MARK}lx0abc-0-k3j9x2qa`), hour, hour);
+    utimesSync(join(dir, `${SYNC_TEMP_MARK}018c2f6a9b10-0001-1a2b3c4d`), hour, hour);
     const b = await ws("Bob", nodeFolder(dir));
     const res = await commitWorkspaceChanges(b);
     expect(res.changed).toBe(true);
     const files = (await readCommitTree(b.history, res.head)).files;
     expect([...files.keys()]).toEqual(["a.txt"]);
-    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}lx0abc-0-k3j9x2qa`)).toBe(false);
-    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}lx0abd-1-p0q1r2s3`)).toBe(true);
+    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}018c2f6a9b10-0001-1a2b3c4d`)).toBe(false);
+    expect(await b.folder.exists(`/${SYNC_TEMP_MARK}018c2f6a9b11-0002-5e6f7a8b`)).toBe(true);
   });
 
   it("a fetched tree using the reserved prefix is refused", async () => {

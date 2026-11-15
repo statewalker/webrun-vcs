@@ -47,8 +47,11 @@ import {
   isExpendableDirectory,
   isSyncTempFile,
   probeCaseInsensitive,
+  type SkippedPath,
+  type SnapshotReport,
   snapshotFolder,
   sweepTempFiles,
+  under,
 } from "./folder-tree.js";
 import { mergeRecursive } from "./merge-trees.js";
 import { assertSafePaths } from "./path-rules.js";
@@ -146,6 +149,8 @@ export async function openGitWorkspace(options: GitWorkspaceOptions): Promise<Gi
 const queues = new WeakMap<GitWorkspace, Promise<unknown>>();
 // the last snapshot of each workspace's folder: unchanged files (size, mtime) are not read again
 const snapshots = new WeakMap<GitWorkspace, FolderSnapshot>();
+// the nested repositories the last snapshot found: their files are left alone like ignored ones
+const nestedRoots = new WeakMap<GitWorkspace, string[]>();
 
 /** Runs `task` once everything queued on `ws` before it has finished. */
 export function runExclusive<T>(ws: GitWorkspace, task: () => Promise<T>): Promise<T> {
@@ -190,7 +195,8 @@ function underGitlink(files: FlatTree): (path: string) => boolean {
 /** What a checkout or a commit leaves alone in a folder holding `files`. */
 function skipFor(ws: GitWorkspace, files: FlatTree): IgnorePath {
   const inLink = underGitlink(files);
-  return (path) => ws.ignore(path) || isSyncTempFile(path) || inLink(path);
+  const inNested = under(nestedRoots.get(ws) ?? []);
+  return (path) => ws.ignore(path) || isSyncTempFile(path) || inLink(path) || inNested(path);
 }
 
 /** What the folder can hold of an entry (submodules: nothing). */
@@ -200,7 +206,8 @@ function inFolder(entry: FlatEntry | undefined): FlatEntry | undefined {
 
 /**
  * The tree to commit: the folder's files, with the modes the branch gave them, plus what the
- * folder cannot hold, carried over from the branch (ignored paths, submodule entries).
+ * folder cannot hold, carried over from the branch exactly (ignored paths, submodule entries,
+ * files under a nested repository): no deletion is ever recorded for those.
  */
 function composeTree(headFiles: FlatTree, snapshot: FolderSnapshot, skip: IgnorePath): FlatTree {
   const out: FlatTree = new Map();
@@ -214,20 +221,35 @@ function composeTree(headFiles: FlatTree, snapshot: FolderSnapshot, skip: Ignore
   return out;
 }
 
+/**
+ * Snapshots the folder, remembering the nested repositories it found (see {@link skipFor}).
+ * Returns the snapshot, what to skip now (nested repositories included) and what was left out
+ * (submodule checkouts of `headFiles` not counted).
+ */
 async function folderSnapshot(
   ws: GitWorkspace,
-  skip: IgnorePath,
+  headFiles: FlatTree,
   tempFiles?: Map<string, number>,
-): Promise<FolderSnapshot> {
-  const snapshot = await snapshotFolder(ws.history, ws.folder, {
-    skip,
-    cache: snapshots.get(ws),
-    racyWindowMs: ws.racyWindowMs,
-    rehashAll: ws.rehashAll,
-    tempFiles,
-  });
+): Promise<{ snapshot: FolderSnapshot; skip: IgnorePath; skipped: SkippedPath[] }> {
+  const report: SnapshotReport = { nested: [], skipped: [] };
+  const snapshot = await snapshotFolder(
+    ws.history,
+    ws.folder,
+    {
+      skip: skipFor(ws, headFiles),
+      cache: snapshots.get(ws),
+      racyWindowMs: ws.racyWindowMs,
+      rehashAll: ws.rehashAll,
+      tempFiles,
+    },
+    report,
+  );
   snapshots.set(ws, snapshot);
-  return snapshot;
+  nestedRoots.set(ws, report.nested);
+  const skipped = report.skipped.filter(
+    (s) => !(s.reason === "nested-repository" && headFiles.get(s.path)?.mode === MODE_GITLINK),
+  );
+  return { snapshot, skip: skipFor(ws, headFiles), skipped };
 }
 
 /** Forgets what the snapshot cache knows of `paths` (a checkout wrote or removed them). */
@@ -248,6 +270,11 @@ export interface WorkspaceCommit {
    * checkout's content (both kept) before committing
    */
   conflicts: string[];
+  /**
+   * Folder paths left out of history: nested repositories (their files belong to them; the
+   * branch keeps what it had there) and names no tree may hold
+   */
+  skipped: SkippedPath[];
 }
 
 /** Where the plan of an unfinished checkout is kept: a ref only this workspace writes. */
@@ -268,6 +295,8 @@ interface CheckoutPlan {
    */
   seen: Record<string, string | null>;
   conflicts: string[];
+  /** Paths already brought to the plan: a later change there is a user edit, kept as it is */
+  done: string[];
 }
 
 /** Files a checkout may remove to make room: ignored and temporary ones, never a nested repository. */
@@ -318,7 +347,8 @@ async function keepFolderContent(
     return t ? [path] : [];
   }
   if (now.startsWith("directory:")) {
-    if (await isExpendableDirectory(ws.folder, path, expendableFor(ws))) return [];
+    // only what the checkout may clear: the target's file goes in its place
+    if (await isExpendableDirectory(ws.folder, path, expendableFor(ws))) return [path];
     plan.seen[path] = KEPT_DIRECTORY;
     plan.files.delete(path);
     report();
@@ -363,7 +393,7 @@ async function makePlan(
 ): Promise<CheckoutPlan> {
   const skipWrite = skipFor(ws, to);
   const skipRemove = skipFor(ws, from);
-  const plan: CheckoutPlan = { target, files: new Map(to), seen: {}, conflicts: [] };
+  const plan: CheckoutPlan = { target, files: new Map(to), seen: {}, conflicts: [], done: [] };
   const taken = new Set([...from.keys(), ...to.keys()]);
   for (const path of [...taken].sort()) {
     const h = inFolder(from.get(path));
@@ -377,7 +407,7 @@ async function makePlan(
 }
 
 async function storePlan(ws: GitWorkspace, plan: CheckoutPlan): Promise<void> {
-  const meta = JSON.stringify({ seen: plan.seen, conflicts: plan.conflicts });
+  const meta = JSON.stringify({ seen: plan.seen, conflicts: plan.conflicts, done: plan.done });
   const id = await commitTree(ws, plan.files, [plan.target], `checkout plan\n\n${meta}`);
   await ws.history.refs.set(planRef(ws), id);
 }
@@ -390,7 +420,7 @@ async function loadPlan(ws: GitWorkspace, target: ObjectId): Promise<CheckoutPla
     const commit = await ws.history.commits.load(id);
     if (!commit || commit.parents[0] !== target) return undefined;
     const body = commit.message.slice(commit.message.indexOf("\n\n") + 2);
-    const meta = JSON.parse(body) as { seen?: unknown; conflicts?: unknown };
+    const meta = JSON.parse(body) as { seen?: unknown; conflicts?: unknown; done?: unknown };
     if (typeof meta.seen !== "object" || meta.seen === null || !Array.isArray(meta.conflicts)) {
       return undefined;
     }
@@ -399,6 +429,9 @@ async function loadPlan(ws: GitWorkspace, target: ObjectId): Promise<CheckoutPla
       files: (await readCommitTree(ws.history, id)).files,
       seen: meta.seen as Record<string, string | null>,
       conflicts: (meta.conflicts as unknown[]).filter((c): c is string => typeof c === "string"),
+      done: Array.isArray(meta.done)
+        ? (meta.done as unknown[]).filter((c): c is string => typeof c === "string")
+        : [],
     };
   } catch {
     return undefined;
@@ -449,6 +482,7 @@ async function finishPendingCheckout(ws: GitWorkspace): Promise<string[]> {
     touched.push(path);
     await applyFolderPath(ws.history, ws.folder, path, want, { accept, expendable });
   };
+  const done = new Set(plan.done);
   try {
     for (const path of [...taken].sort()) {
       const h = inFolder(from.get(path));
@@ -459,14 +493,25 @@ async function finishPendingCheckout(ws: GitWorkspace): Promise<string[]> {
         await apply(path, plan);
       } catch (error) {
         if (!(error instanceof FolderChangedError)) throw error;
-        // changed since the plan was made: kept like any folder edit, the plan updated first
+        // already brought to the plan, changed since: the user's edit, committed on top
+        if (done.has(path)) continue;
+        // changed before the plan reached it: kept like any folder edit, the plan updated first
         const t = inFolder(to.get(path));
         const paths = await keepFolderContent(ws, plan, path, h, t, taken);
         await storePlan(ws, plan);
         // a file that changes again stops the finish here, the branch unmoved
-        for (const p of paths) await apply(p, plan);
+        for (const p of paths) {
+          await apply(p, plan);
+          done.add(p);
+        }
       }
+      done.add(path);
     }
+  } catch (error) {
+    // what is done stays done: a retry treats later changes there as the user's
+    plan.done = [...done];
+    await storePlan(ws, plan).catch(() => undefined);
+    throw error;
   } finally {
     invalidate(ws, touched);
   }
@@ -500,12 +545,11 @@ export async function commitFolder(ws: GitWorkspace, message: string): Promise<W
   const conflicts = await finishPendingCheckout(ws);
   const head = await workspaceHead(ws);
   const current = await readCommitTree(ws.history, head);
-  const skip = skipFor(ws, current.files);
   const tempFiles = new Map<string, number>();
-  const snapshot = await folderSnapshot(ws, skip, tempFiles);
+  const { snapshot, skip, skipped } = await folderSnapshot(ws, current.files, tempFiles);
   await sweepTempFiles(ws.folder, tempFiles);
   const tree = await storeFlatTree(ws.history, composeTree(current.files, snapshot, skip));
-  if (tree === current.tree) return { head, changed: false, conflicts };
+  if (tree === current.tree) return { head, changed: false, conflicts, skipped };
   const who = person(ws);
   const commit = await ws.history.commits.store({
     tree,
@@ -515,7 +559,7 @@ export async function commitFolder(ws: GitWorkspace, message: string): Promise<W
     message: message.endsWith("\n") ? message : `${message}\n`,
   });
   await moveBranch(ws, head, commit);
-  return { head: commit, changed: true, conflicts };
+  return { head: commit, changed: true, conflicts, skipped };
 }
 
 /**
@@ -601,9 +645,8 @@ async function checkoutAndMove(
   target: ObjectId,
   targetFiles: FlatTree,
 ) {
-  const skip = skipFor(ws, headFiles);
   // the folder must still be what `head` recorded: an edit made since is not overwritten
-  const snapshot = await folderSnapshot(ws, skip);
+  const { snapshot, skip } = await folderSnapshot(ws, headFiles);
   const expected = composeTree(headFiles, snapshot, skip);
   const tree = await storeFlatTree(ws.history, expected);
   if (tree !== (await readCommitTree(ws.history, head)).tree) throw new FolderChangedError();
@@ -614,6 +657,7 @@ async function checkoutAndMove(
     if (headFiles.get(p)?.id !== targetFiles.get(p)?.id) changed.add(p);
   }
   let done: { written: string[]; removed: string[] };
+  const progress: string[] = [];
   try {
     done = await checkoutFolder(ws.history, ws.folder, headFiles, targetFiles, {
       // files under the target's submodules are not written, under the head's not removed
@@ -621,7 +665,16 @@ async function checkoutAndMove(
       skipRemove: skip,
       // ignored files may go to make room, a submodule's checkout never
       expendable: expendableFor(ws),
+      progress,
     });
+  } catch (error) {
+    // cut short: the plan to finish it is made now, with what is already done
+    const plan = await makePlan(ws, target, headFiles, targetFiles).catch(() => undefined);
+    if (plan) {
+      plan.done = progress;
+      await storePlan(ws, plan).catch(() => undefined);
+    }
+    throw error;
   } finally {
     invalidate(ws, changed);
   }

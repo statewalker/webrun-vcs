@@ -128,7 +128,7 @@ const ws = await openGitWorkspace({
 });
 
 const result = await syncWorkspace(ws, httpRemote({ url: "https://example.com/notes.git" }));
-// { head, committed, integration: "up-to-date" | "fast-forward" | "merge", pushed, conflicts, attempts }
+// { head, committed, integration: "up-to-date" | "fast-forward" | "merge", pushed, conflicts, attempts, skipped }
 if (result.conflicts.length > 0) console.warn("both sides kept in", result.conflicts);
 ```
 
@@ -197,13 +197,19 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
   - the reserved temporary-file prefix (below).
 
   A remote commit with such a path fails the sync with a `SyncError`, and nothing is written. A folder's own `.git` directory is never committed, whatever `ignore` says.
-- **Modes and submodules.** Submodule entries are never checked out and stay in every commit. When a submodule becomes a plain directory upstream, its files are checked out like any others. When a submodule becomes a file upstream, the submodule's checkout is kept (its `.git` and any unpushed work), and the file goes beside it as `<path>.theirs-<id>`, reported. A directory holding a `.git` entry is a nested repository: its files are never committed. An executable file stays executable in history when its content changes. On disk, an existing file is rewritten in place, so it keeps its permissions (the Node FilesApi keeps the mode). A new file gets the filesystem's default mode, because a FilesApi cannot set modes. A symbolic link is written as a file holding its target and keeps its mode in history. A FilesApi does not say whether a folder path is a symbolic link. A link the user made in the folder is therefore followed when its file is rewritten in place, as the Node FilesApi's own writes follow it. The sync itself never creates links.
+- **Modes and submodules.** Submodule entries are never checked out and stay in every commit. When a submodule becomes a plain directory upstream, its files are checked out like any others. When a submodule becomes a file upstream, the submodule's checkout is kept (its `.git` and any unpushed work), and the file goes beside it as `<path>.theirs-<id>`, reported. A directory holding a `.git` directory, or a `.git` file starting with `gitdir:` (a git worktree, a submodule), is a nested repository. Its files belong to that repository and are left alone like ignored ones. They are not committed, the branch keeps exactly what it had there (no deletion is recorded), and a checkout does not touch them. A plain file named `.git` does not make a repository: it is only left out, as a name no tree may hold. An executable file stays executable in history when its content changes. On disk, an existing file is rewritten in place, so it keeps its permissions (the Node FilesApi keeps the mode). A new file gets the filesystem's default mode, because a FilesApi cannot set modes. A symbolic link is written as a file holding its target and keeps its mode in history. A FilesApi does not say whether a folder path is a symbolic link. A link the user made in the folder is therefore followed when its file is rewritten in place, as the Node FilesApi's own writes follow it. The sync itself never creates links.
 - **Case.** On a case-insensitive folder (probed with a temporary file when the workspace opens, or set with `caseInsensitive`), names are compared case-folded and NFC-normalised:
   - a directory spelled two ways (`Docs/`, `docs/`) is renamed to its first spelling;
   - two files that would be one are kept apart by moving one aside as `<path>.case-<id>`.
 
   Both changes go in a commit on top and are reported as conflicts. Names are only changed when they collide after folding, and every change is reported. NTFS folds case but not Unicode normalisation, so there two spellings that differ only in NFC/NFD form are merged although the filesystem would keep them apart.
-- **Reserved names.** Files whose names start with `.vcs-sync-tmp-` are reserved for the checkout's temporary files, and they are never committed. Temporary files a crash left behind are removed at the next commit or sync once they are older than ten minutes. Only names of the exact form a checkout writes (`.vcs-sync-tmp-<time>-<counter>-<random>`) are removed; any other file with the prefix is left alone.
+- **Reserved names.** Files whose names start with `.vcs-sync-tmp-` are reserved for the checkout's temporary files, and they are never committed. Temporary files a crash left behind are removed at the next commit or sync once they are older than ten minutes. Only names of the exact form a checkout writes are removed: `.vcs-sync-tmp-` followed by 12, 4 and 8 lowercase hex digits joined with dashes. Any other file with the prefix is left alone.
+- **What is left out is reported.** `result.skipped` (and a `skipped` event, and `skipped` from `commitWorkspaceChanges`) lists every folder path the commit did not take, each with a reason:
+  - `nested-repository`, by its directory;
+  - `reserved-name`: a `.git` file below the root, or the temporary-file prefix;
+  - `unsafe-path`.
+
+  Ignored paths and submodule checkouts are not listed.
 
 ### Why a failure leaves nothing half-done
 
@@ -215,7 +221,7 @@ A checkout cut short, by a full disk for example, is finished at the start of th
 - a file already written stays;
 - a file edited meanwhile keeps the edit, merged with the new content: markers for text, the new version beside it for binary content.
 
-Each retry then follows the stored plan, so a merged file is never merged again, and a failing retry changes nothing it already did. A file changed again after the plan was stored is kept the same way: merged or moved aside, the plan updated first, the path reported. Nothing the finish refuses is dropped. A path it cannot bring to the plan stops it with the branch unmoved, and the branch moves to the target only when every path is done. A half-written folder is never committed as local edits.
+Each retry then follows the stored plan, so a merged file is never merged again, and a failing retry changes nothing it already did. The plan also records which paths are done. A file the checkout had already written and the user changed afterwards, a hand-resolved conflict for one, is the user's edit: it stays as it is and is committed on top. A file changed before the checkout reached it is kept like an edit found when the plan was made: merged or moved aside, the plan updated first, the path reported. Nothing the finish refuses is dropped. A path it cannot bring to the plan stops it with the branch unmoved, and the branch moves to the target only when every path is done. A half-written folder is never committed as local edits.
 
 An edit made while a sync runs is not overwritten, with one small window left. Before the checkout, the sync checks that the folder still matches the branch; if not, it starts the round again and commits the edit first. Then, just before each file is replaced or removed, its content is hashed again. The new content is staged in a temporary file first. After that check, it is moved in place (a new file) or copied over the old file in place (an existing one, to keep its permissions). An edit found at the check stops the checkout, and the next round finishes it as above. What remains is the moment between the last check of a file and its replacement: a save that lands exactly then is replaced.
 

@@ -7,7 +7,7 @@
 
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { PushRefUpdate } from "@statewalker/vcs-transport";
-import { FolderChangedError } from "./folder-tree.js";
+import { FolderChangedError, type SkippedPath } from "./folder-tree.js";
 import {
   commitFolder,
   type GitWorkspace,
@@ -30,7 +30,8 @@ export type SyncEvent =
       conflicts: string[];
     }
   | { type: "push"; attempt: number; head: ObjectId; status: PushRefUpdate["status"] }
-  | { type: "retry"; attempt: number; reason: string };
+  | { type: "retry"; attempt: number; reason: string }
+  | { type: "skipped"; attempt: number; paths: SkippedPath[] };
 
 /** Options of {@link syncWorkspace}. */
 export interface SyncWorkspaceOptions {
@@ -62,6 +63,12 @@ export interface SyncWorkspaceResult {
   conflicts: string[];
   /** Rounds it took (more than one when the remote moved during a round) */
   attempts: number;
+  /**
+   * Folder paths left out of history (as the last commit saw the folder): nested
+   * repositories, whose files belong to them (the branch keeps what it had there), and names
+   * no tree may hold
+   */
+  skipped: SkippedPath[];
 }
 
 /** A sync that could not finish; the workspace and its repository are left consistent. */
@@ -145,6 +152,7 @@ async function syncRounds(
   };
   const conflicts = new Set<string>();
   let committed = false;
+  let skipped: SkippedPath[] = [];
   let lastReason = "";
   let folderKeptChanging = false;
 
@@ -156,6 +164,8 @@ async function syncRounds(
       throw asSyncError("committing the folder failed", error);
     }
     for (const path of local.conflicts) conflicts.add(path);
+    skipped = local.skipped;
+    if (skipped.length > 0) emit({ type: "skipped", attempt, paths: skipped });
     if (local.changed && local.head) {
       committed = true;
       emit({ type: "commit", attempt, commit: local.head });
@@ -208,6 +218,7 @@ async function syncRounds(
       pushed,
       conflicts: [...conflicts].sort(),
       attempts: attempt,
+      skipped,
     });
     if (!head || head === theirs) return done(false);
 

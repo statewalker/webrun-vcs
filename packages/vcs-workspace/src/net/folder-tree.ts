@@ -16,7 +16,18 @@ export type IgnorePath = (path: string) => boolean;
 /** The default: the folder's own `.git` directory, if it has one, is never committed. */
 export const defaultIgnore: IgnorePath = (path) => path === ".git" || path.startsWith(".git/");
 
-/** Whether `path` is a temporary file of a checkout (never committed) */
+/**
+ * The names a checkout gives its temporary files: the prefix, then the time (12 hex digits),
+ * a counter (4) and random digits (8)
+ */
+export const TEMP_NAME = /^\.vcs-sync-tmp-[0-9a-f]{12}-[0-9a-f]{4}-[0-9a-f]{8}$/;
+
+/** Whether `path` is a temporary file a checkout wrote (by its exact name) */
+export function isCheckoutTempFile(path: string): boolean {
+  return TEMP_NAME.test(path.slice(path.lastIndexOf("/") + 1));
+}
+
+/** Whether `path` has the reserved temporary-file prefix (never committed) */
 export function isSyncTempFile(path: string): boolean {
   return path.slice(path.lastIndexOf("/") + 1).startsWith(SYNC_TEMP_MARK);
 }
@@ -68,53 +79,93 @@ export interface SnapshotOptions {
   rehashAll?: boolean;
 }
 
-/**
- * The directories of a nested repository (one holding a `.git` entry below the folder's
- * root, a submodule's checkout for one): their files belong to that repository.
- */
-export function nestedRepositories(paths: Iterable<string>): string[] {
-  const roots = new Set<string>();
-  for (const path of paths) {
-    const parts = path.split("/");
-    for (let i = 1; i < parts.length; i++) {
-      if (parts[i].toLowerCase() === ".git") roots.add(parts.slice(0, i).join("/"));
-    }
-  }
-  return [...roots];
+/** A folder path the snapshot left out of history, and why */
+export interface SkippedPath {
+  path: string;
+  /**
+   * `nested-repository`: a directory holding a repository of its own (its files belong to
+   * it); `reserved-name`: a name no tree may hold (`.git` below the root, the temporary-file
+   * prefix); `unsafe-path`: any other name git refuses in a tree
+   */
+  reason: "nested-repository" | "reserved-name" | "unsafe-path";
 }
 
-function under(roots: string[]): (path: string) => boolean {
-  if (roots.length === 0) return () => false;
-  return (path) => roots.some((r) => path.startsWith(`${r}/`));
+/** Whether `path` is below one of the directories `roots` */
+export function under(roots: Iterable<string>): (path: string) => boolean {
+  const list = [...roots];
+  if (list.length === 0) return () => false;
+  return (path) => list.some((r) => path.startsWith(`${r}/`));
+}
+
+/** Whether the file starts with `gitdir:` (a git worktree's or submodule's `.git` file). */
+async function isGitFile(folder: FilesApi, at: string): Promise<boolean> {
+  const parts: number[] = [];
+  for await (const chunk of folder.read(at, { start: 0, length: 7 })) {
+    for (const byte of chunk) {
+      if (parts.length < 7) parts.push(byte);
+    }
+    if (parts.length >= 7) break;
+  }
+  return String.fromCharCode(...parts) === "gitdir:";
+}
+
+/** What {@link snapshotFolder} found besides the files it took. */
+export interface SnapshotReport {
+  /** Directories holding a repository of their own: a `.git` directory, or a `gitdir:` file */
+  nested: string[];
+  /** Paths left out, each once (a nested repository by its directory) */
+  skipped: SkippedPath[];
 }
 
 /**
  * Every file of the folder `skip` keeps, stored as a blob. A file the cache knows with the
  * same size and modification time is not read again, unless that time was within the racy
  * window of when the cache read it (a later write in the same clock tick would look the same).
- * Temporary checkout files and paths no tree may hold (`.git`, `..`) are always left out.
+ * Left out, and listed in `report`: files of nested repositories (a directory holding a
+ * `.git` directory or a `gitdir:` file), and names no tree may hold (`.git`, the
+ * temporary-file prefix, `..`). A checkout's own temporary files are left out silently.
  */
 export async function snapshotFolder(
   history: History,
   folder: FilesApi,
   options: SnapshotOptions = {},
+  report: SnapshotReport = { nested: [], skipped: [] },
 ): Promise<FolderSnapshot> {
   const skip = options.skip ?? defaultIgnore;
   const window = options.racyWindowMs ?? DEFAULT_RACY_WINDOW_MS;
   const files: FolderSnapshot = new Map();
   const infos: { path: string; size: number; lastModified: number; at: string }[] = [];
+  const nested = new Set<string>();
   for await (const info of folder.list("/", { recursive: true })) {
-    if (info.kind !== "file") continue;
-    infos.push({ ...info, path: relative(info.path), at: info.path });
+    const path = relative(info.path);
+    const slash = path.lastIndexOf("/");
+    if (slash > 0 && path.slice(slash + 1).toLowerCase() === ".git") {
+      if (info.kind === "directory" || (await isGitFile(folder, info.path))) {
+        nested.add(path.slice(0, slash));
+      }
+    }
+    if (info.kind === "file") infos.push({ ...info, path, at: info.path });
   }
-  const inNested = under(nestedRepositories(infos.map((i) => i.path)));
+  // the outermost nested repositories only
+  const all = [...nested];
+  const roots = all.filter((d) => !all.some((o) => d.startsWith(`${o}/`))).sort();
+  const inNested = under(roots);
+  report.nested.push(...roots);
+  for (const root of roots) {
+    if (!skip(root)) report.skipped.push({ path: root, reason: "nested-repository" });
+  }
   for (const info of infos) {
     const { path } = info;
-    if (isSyncTempFile(path)) {
+    if (isCheckoutTempFile(path)) {
       options.tempFiles?.set(path, info.lastModified);
       continue;
     }
-    if (skip(path) || !isSafePath(path) || inNested(path)) continue;
+    if (skip(path) || inNested(path)) continue;
+    if (!isSafePath(path)) {
+      const reserved = isSyncTempFile(path) || /(^|\/)\.git$/i.test(path);
+      report.skipped.push({ path, reason: reserved ? "reserved-name" : "unsafe-path" });
+      continue;
+    }
     const known = options.rehashAll ? undefined : options.cache?.get(path);
     if (
       known &&
@@ -151,11 +202,15 @@ export async function currentFileId(folder: FilesApi, path: string): Promise<Obj
 }
 
 let tempCounter = 0;
+function hex(value: number, width: number): string {
+  return Math.floor(value).toString(16).padStart(width, "0").slice(-width);
+}
 function tempPathFor(path: string): string {
   const slash = path.lastIndexOf("/");
   const dir = slash >= 0 ? `${path.slice(0, slash)}/` : "";
-  const random = Math.random().toString(36).slice(2, 10);
-  return `${dir}${SYNC_TEMP_MARK}${Date.now().toString(36)}-${(tempCounter++).toString(36)}-${random}`;
+  tempCounter = (tempCounter + 1) % 0x10000;
+  const random = hex(Math.random() * 0x100000000, 8);
+  return `${dir}${SYNC_TEMP_MARK}${hex(Date.now(), 12)}-${hex(tempCounter, 4)}-${random}`;
 }
 
 async function removeEmptyParents(folder: FilesApi, path: string): Promise<void> {
@@ -182,10 +237,12 @@ async function removeEmptyParents(folder: FilesApi, path: string): Promise<void>
 async function clearDirectory(folder: FilesApi, path: string, expendable: IgnorePath) {
   for await (const info of folder.list(`/${path}`, { recursive: true })) {
     const p = relative(info.path);
+    // a checkout's own leftover temporary files may go
+    if (info.kind === "file" && isCheckoutTempFile(p)) continue;
     // a nested repository (a `.git` inside) is never expendable, whatever `ignore` says
     if (!isSafePath(p)) throw new FolderChangedError(p);
     if (info.kind !== "file") continue;
-    if (!expendable(p) && !isSyncTempFile(p)) throw new FolderChangedError(p);
+    if (!expendable(p)) throw new FolderChangedError(p);
   }
   await folder.remove(`/${path}`);
 }
@@ -198,8 +255,9 @@ export async function isExpendableDirectory(
 ): Promise<boolean> {
   for await (const info of folder.list(`/${path}`, { recursive: true })) {
     const p = relative(info.path);
+    if (info.kind === "file" && isCheckoutTempFile(p)) continue;
     if (!isSafePath(p)) return false;
-    if (info.kind === "file" && !expendable(p) && !isSyncTempFile(p)) return false;
+    if (info.kind === "file" && !expendable(p)) return false;
   }
   return true;
 }
@@ -268,6 +326,8 @@ export interface CheckoutFolderOptions {
   skipRemove?: IgnorePath;
   /** Files that may be removed to make room for a file (ignored ones) */
   expendable?: IgnorePath;
+  /** Each path brought to `to`, as it is done (kept when the checkout is cut short) */
+  progress?: string[];
 }
 
 function inFolder(entry: FlatEntry | undefined): FlatEntry | undefined {
@@ -295,6 +355,7 @@ export async function checkoutFolder(
     if (!inFolder(entry) || inFolder(to.get(path)) || skipRemove(path)) continue;
     const r = await applyFolderPath(history, folder, path, undefined, { accept: accept(path) });
     if (r === "removed") done.removed.push(path);
+    options.progress?.push(path);
   }
   for (const [path, entry] of to) {
     const next = inFolder(entry);
@@ -304,12 +365,10 @@ export async function checkoutFolder(
       expendable: options.expendable,
     });
     if (r === "written") done.written.push(path);
+    options.progress?.push(path);
   }
   return done;
 }
-
-/** The names {@link applyFolderPath} gives its temporary files: prefix, time, counter, random */
-const TEMP_NAME = /^\.vcs-sync-tmp-[0-9a-z]+-[0-9a-z]+-[0-9a-z]{1,8}$/;
 
 /**
  * Removes temporary checkout files older than `olderThanMs` (left by a crash). Only names
@@ -325,7 +384,7 @@ export async function sweepTempFiles(
   const now = Date.now();
   for (const [path, lastModified] of tempFiles) {
     if (now - lastModified < olderThanMs) continue;
-    if (!TEMP_NAME.test(path.slice(path.lastIndexOf("/") + 1))) continue;
+    if (!isCheckoutTempFile(path)) continue;
     if (await folder.remove(`/${path}`)) removed.push(path);
   }
   return removed;
