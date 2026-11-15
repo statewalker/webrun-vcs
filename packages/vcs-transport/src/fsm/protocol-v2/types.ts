@@ -14,6 +14,8 @@ export interface FetchV2Request {
   haves: string[];
   /** Client has sent "done" */
   done: boolean;
+  /** Client has sent "wait-for-done": the server must not answer "ready" */
+  waitForDone?: boolean;
   /** Use thin pack (deltas to objects not in pack) */
   thinPack?: boolean;
   /** Suppress progress messages */
@@ -53,12 +55,13 @@ export type FetchV2ResponseSection =
   | { type: "packfile" };
 
 /**
- * Default V2 server capabilities.
+ * Default V2 server capabilities: what the server implements. `fetch=shallow` covers `deepen`,
+ * `deepen-relative`, `deepen-since` and `deepen-not`; no `filter` (no partial clone).
  */
 export const SERVER_V2_CAPABILITIES = [
   "agent=statewalker-vcs/1.0",
   "ls-refs",
-  "fetch=shallow wait-for-done filter",
+  "fetch=shallow wait-for-done",
   "server-option",
   "object-format=sha1",
   "object-info",

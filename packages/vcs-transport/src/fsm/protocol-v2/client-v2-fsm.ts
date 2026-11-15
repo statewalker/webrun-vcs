@@ -270,14 +270,21 @@ export const clientV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         ctx.output.havesSent = ctx.output.havesSent ?? 0;
         const maxHaves = ctx.config.maxHaves ?? 256;
 
+        // v2 is stateless per request: the commits found common so far are sent again (the
+        // server judges "ready" from them), then haves not sent before
+        for (const oid of ctx.state.commonBase ?? []) {
+          await ctx.transport.writeLine(`have ${oid}`);
+        }
+        let newHaves = 0;
         if (ctx.config.localHead) {
           for await (const oid of ctx.repository.walkAncestors(ctx.config.localHead)) {
             if (ctx.output.havesSent >= maxHaves) break;
-            if (ctx.state.commonBase?.has(oid)) continue;
+            if (ctx.state.commonBase?.has(oid) || ctx.state.haves.has(oid)) continue;
 
             await ctx.transport.writeLine(`have ${oid}`);
             ctx.state.haves.add(oid);
             ctx.output.havesSent++;
+            newHaves++;
           }
         }
 
@@ -300,8 +307,9 @@ export const clientV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           await ctx.transport.writeLine(`filter ${ctx.config.filter}`);
         }
 
-        // Done (in stateless mode, always send done)
-        if (ctx.config.statelessRpc || ctx.output.havesSent >= maxHaves) {
+        // Done: in stateless mode always, and once there are no haves left to offer (the
+        // server may never answer "ready", as git's when a want shares no history)
+        if (ctx.config.statelessRpc || ctx.output.havesSent >= maxHaves || newHaves === 0) {
           await ctx.transport.writeLine("done");
           ctx.state.sentDone = true;
         }

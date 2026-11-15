@@ -8,6 +8,7 @@
 import type { History, SerializationApi } from "@statewalker/vcs-core";
 import { isSymbolicRef, serializeCommit, serializeTag, serializeTree } from "@statewalker/vcs-core";
 import type {
+  CommitGraphInfo,
   ExportPackOptions,
   PackImportResult,
   RepositoryFacade,
@@ -143,6 +144,15 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   }
 
   /**
+   * A commit's parents and committer time (upload-pack walks the graph with it).
+   */
+  async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
+    const commit = await this.history.commits.load(oid);
+    if (!commit) return undefined;
+    return { parents: commit.parents, time: commit.committer.timestamp };
+  }
+
+  /**
    * Check if an object is reachable from other objects.
    */
   async isReachableFrom(oid: string, from: string | string[]): Promise<boolean> {
@@ -176,37 +186,25 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   }
 
   /**
-   * Compute shallow boundaries for depth-limited clone.
+   * Compute shallow boundaries for depth-limited clone, as git's `deepen <depth>`: the
+   * commits `depth` commits deep (the wants for depth 1), each at its smallest depth.
    */
   async computeShallowBoundaries(wants: Set<string>, depth: number): Promise<Set<string>> {
     const boundaries = new Set<string>();
-
-    for (const want of wants) {
-      const queue: Array<{ oid: string; depth: number }> = [{ oid: want, depth: 0 }];
-      const visited = new Set<string>();
-
-      while (queue.length > 0) {
-        const item = queue.shift();
-        if (!item) continue;
-
-        const { oid, depth: d } = item;
-        if (visited.has(oid)) continue;
-        visited.add(oid);
-
-        if (d >= depth) {
-          boundaries.add(oid);
-          continue;
-        }
-
+    const seen = new Set<string>();
+    let level = [...wants];
+    for (let d = 1; level.length > 0; d++) {
+      const next: string[] = [];
+      for (const oid of level) {
+        if (seen.has(oid)) continue;
+        seen.add(oid);
         const commit = await this.history.commits.load(oid);
-        if (commit) {
-          for (const parent of commit.parents) {
-            queue.push({ oid: parent, depth: d + 1 });
-          }
-        }
+        if (!commit) continue;
+        if (d >= depth) boundaries.add(oid);
+        else next.push(...commit.parents);
       }
+      level = next;
     }
-
     return boundaries;
   }
 

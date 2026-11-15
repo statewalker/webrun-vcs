@@ -22,6 +22,14 @@ import {
 import { ZERO_OID } from "../../protocol/constants.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { sendPackStream } from "./send-pack-stream.js";
+import {
+  computeShallowUpdate,
+  findUnreachableWant,
+  okToGiveUp as graphOkToGiveUp,
+  notOurRef,
+  resolveDeepenNot,
+  UploadPackRequestError,
+} from "./upload-pack-graph.js";
 
 /**
  * Server fetch FSM transitions.
@@ -39,6 +47,7 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["READ_WANTS", "WANTS_RECEIVED", "VALIDATE_WANTS"],
   ["READ_WANTS", "WANTS_WITH_SHALLOW", "VALIDATE_WANTS"], // Wants + shallow info
   ["READ_WANTS", "NO_WANTS", ""], // client has everything
+  ["READ_WANTS", "INVALID_REQUEST", "SEND_ERROR"], // a deepen line git refuses
   ["READ_WANTS", "ERROR", ""],
 
   // Validate wants against policy (ADVERTISED, REACHABLE_COMMIT, TIP, ANY)
@@ -56,6 +65,8 @@ export const serverFetchTransitions: FsmTransition[] = [
 
   // Compute shallow boundaries
   ["COMPUTE_SHALLOW", "SHALLOW_COMPUTED", "SEND_SHALLOW_UPDATE"],
+  ["COMPUTE_SHALLOW", "SHALLOW_REGISTERED", "READ_HAVES"], // shallow client, no deepen
+  ["COMPUTE_SHALLOW", "INVALID_REQUEST", "SEND_ERROR"],
   ["COMPUTE_SHALLOW", "ERROR", ""],
 
   // Send shallow/unshallow to client
@@ -103,33 +114,39 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["SEND_PACK", "ERROR", ""],
 ];
 
-/**
- * Check if we can satisfy the fetch request with the current common base.
- * We're "ok to give up" when every wanted commit has at least one ancestor in common base.
- */
-async function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
+/** git's ok_to_give_up over the wants and the common commits found so far. */
+function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
   const state = getState(ctx);
-  const repository = getRepository(ctx);
+  return graphOkToGiveUp(getRepository(ctx), state.wants, state.commonBase);
+}
 
-  if (state.commonBase.size === 0) return false;
-
-  // For each want, check if ANY of its ancestors is in the common base
-  for (const wantOid of state.wants) {
-    let foundCommon = false;
-
-    // Walk ancestors of this want looking for any common base
-    for await (const ancestorOid of repository.walkAncestors(wantOid)) {
-      if (state.commonBase.has(ancestorOid)) {
-        foundCommon = true;
-        break;
-      }
-    }
-
-    if (!foundCommon) {
-      return false; // This want has no common ancestor, can't give up yet
-    }
+/**
+ * What upload-pack (protocol v0/v1) advertises by default: only what it implements. The
+ * `allow-*-sha1-in-want` capabilities follow the request policy; `deepen-since`, `deepen-not`
+ * and `deepen-relative` need the commit graph (`getCommitInfo`); no `filter` (no partial
+ * clone).
+ */
+export function defaultUploadPackCapabilities(
+  policy: string | undefined,
+  repository: { getCommitInfo?: unknown },
+): string[] {
+  const capabilities = [
+    "multi_ack_detailed",
+    "side-band-64k",
+    "thin-pack",
+    "no-done",
+    "ofs-delta",
+    "shallow",
+  ];
+  if (repository.getCommitInfo) capabilities.push("deepen-since", "deepen-not", "deepen-relative");
+  capabilities.push("no-progress", "include-tag");
+  if (policy === "TIP" || policy === "REACHABLE_COMMIT_TIP" || policy === "ANY") {
+    capabilities.push("allow-tip-sha1-in-want");
   }
-  return true;
+  if (policy === "REACHABLE_COMMIT" || policy === "REACHABLE_COMMIT_TIP" || policy === "ANY") {
+    capabilities.push("allow-reachable-sha1-in-want");
+  }
+  return capabilities;
 }
 
 /**
@@ -162,25 +179,13 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const config = getConfig(ctx);
       const state = getState(ctx);
       const output = getOutput(ctx);
+      const repository = getRepository(ctx);
 
       try {
         const refs = await refStore.listAll();
-        const capabilities = config.serverCapabilities ?? [
-          "multi_ack_detailed",
-          "side-band-64k",
-          "thin-pack",
-          "no-done",
-          "ofs-delta",
-          "shallow",
-          "deepen-since",
-          "deepen-not",
-          "deepen-relative",
-          "no-progress",
-          "include-tag",
-          "filter",
-          "allow-tip-sha1-in-want",
-          "allow-reachable-sha1-in-want",
-        ];
+        const capabilities =
+          config.serverCapabilities ??
+          defaultUploadPackCapabilities(config.requestPolicy, repository);
 
         let first = true;
         const refsArray = [...refs];
@@ -259,13 +264,32 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             const oid = line.slice(8);
             state.clientShallow = state.clientShallow ?? new Set();
             state.clientShallow.add(oid);
-          } else if (
-            line.startsWith("deepen ") ||
-            line.startsWith("deepen-since ") ||
-            line.startsWith("deepen-not ")
-          ) {
+          } else if (line.startsWith("deepen ")) {
+            // git's process_deepen
+            const depth = Number(line.slice(7));
+            if (!Number.isInteger(depth) || depth <= 0) {
+              output.error = `Invalid deepen: ${line}`;
+              return "INVALID_REQUEST";
+            }
             hasShallow = true;
+            state.deepen = depth;
             state.deepenRequest = line;
+          } else if (line.startsWith("deepen-since ")) {
+            // git's process_deepen_since: 0 (and -1) are refused
+            const since = Number(line.slice(13));
+            if (!Number.isInteger(since) || since <= 0) {
+              output.error = `Invalid deepen-since: ${line}`;
+              return "INVALID_REQUEST";
+            }
+            hasShallow = true;
+            state.deepenSince = since;
+            state.deepenRequest = line;
+          } else if (line.startsWith("deepen-not ")) {
+            hasShallow = true;
+            state.deepenNot = [...(state.deepenNot ?? []), line.slice(11)];
+            state.deepenRequest = line;
+          } else if (line === "deepen-relative") {
+            state.deepenRelative = true;
           } else if (line.startsWith("filter ")) {
             hasFilter = true;
             state.filterSpec = line.slice(7);
@@ -301,7 +325,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               break;
             case "REACHABLE_COMMIT":
               // Reachable from any advertised ref
-              if (repository.isReachableFrom) {
+              if (repository.getCommitInfo) {
+                valid = !(await findUnreachableWant(repository, [oid], state.refs.values()));
+              } else if (repository.isReachableFrom) {
                 valid = await repository.isReachableFrom(oid, [...state.refs.values()]);
               } else {
                 valid = [...state.refs.values()].includes(oid);
@@ -330,7 +356,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           }
 
           if (!valid) {
-            output.error = `want ${oid} not valid`;
+            output.error = notOurRef(oid);
             output.invalidWant = oid;
             return "INVALID_WANT";
           }
@@ -413,58 +439,46 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
     },
   ],
 
-  // Compute shallow boundaries
+  // Compute the shallow update, as git's send_shallow_list (computeShallowUpdate): the new
+  // shallow commits, the client's ones now unshallowed, and how the pack is cut
   [
     "COMPUTE_SHALLOW",
     async (ctx) => {
       const state = getState(ctx);
       const output = getOutput(ctx);
       const repository = getRepository(ctx);
+      const refStore = getRefStore(ctx);
 
       try {
-        state.serverShallow = new Set();
-        state.serverUnshallow = new Set();
-
-        if (state.deepenRequest) {
-          const parts = state.deepenRequest.split(" ");
-          const cmd = parts[0];
-          const value = parts.slice(1).join(" ");
-
-          if (cmd === "deepen" && repository.computeShallowBoundaries) {
-            // Depth-based shallow
-            const depth = Number.parseInt(value, 10);
-            const boundaries = await repository.computeShallowBoundaries(state.wants, depth);
-            state.serverShallow = boundaries;
-          } else if (cmd === "deepen-since" && repository.computeShallowSince) {
-            // Time-based shallow
-            const timestamp = Number.parseInt(value, 10);
-            const boundaries = await repository.computeShallowSince(state.wants, timestamp);
-            state.serverShallow = boundaries;
-          } else if (cmd === "deepen-not" && repository.computeShallowExclude) {
-            // Exclude-based shallow
-            const boundaries = await repository.computeShallowExclude(
-              state.wants,
-              [value], // ref name to exclude (as array)
-            );
-            state.serverShallow = boundaries;
+        const deepenNot: string[] = [];
+        for (const name of state.deepenNot ?? []) {
+          const oid = await resolveDeepenNot(refStore, name);
+          if (!oid) {
+            output.error = `git upload-pack: ambiguous deepen-not: deepen-not ${name}`;
+            return "INVALID_REQUEST";
           }
+          deepenNot.push(oid);
         }
-
-        // Verify client's shallow boundaries
-        if (state.clientShallow) {
-          for (const oid of state.clientShallow) {
-            const exists = await repository.has(oid);
-            if (exists && !state.serverShallow?.has(oid)) {
-              // Client was shallow here but we can now deepen
-              state.serverUnshallow.add(oid);
-            }
-          }
-        }
-
-        return "SHALLOW_COMPUTED";
+        const deepening =
+          (state.deepen ?? 0) > 0 || state.deepenSince !== undefined || deepenNot.length > 0;
+        const update = await computeShallowUpdate(repository, {
+          wants: state.wants,
+          clientShallow: state.clientShallow ?? [],
+          depth: state.deepen,
+          deepenRelative: state.deepenRelative,
+          deepenSince: state.deepenSince,
+          deepenNot,
+          tips: state.refs.values(),
+        });
+        state.serverShallow = new Set(update.shallow);
+        state.serverUnshallow = new Set(update.unshallow);
+        state.packShallow = update.packShallow;
+        state.extraWants = update.extraWants;
+        // without a deepen request git sends no shallow section (the client reads none)
+        return deepening ? "SHALLOW_COMPUTED" : "SHALLOW_REGISTERED";
       } catch (e) {
-        output.error = String(e);
-        return "ERROR";
+        output.error = e instanceof UploadPackRequestError ? e.message : String(e);
+        return e instanceof UploadPackRequestError ? "INVALID_REQUEST" : "ERROR";
       }
     },
   ],
@@ -686,13 +700,16 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         const includeTag = state.capabilities.has("include-tag");
         const noProgress = state.capabilities.has("no-progress");
 
-        // Export pack with options (partial clone filter, shallow boundaries)
-        const packStream = repository.exportPack(state.wants, state.commonBase, {
+        // Export pack, cut at the shallow boundary (the new shallow commits and the client's
+        // own); the parents of unshallowed commits are tips of their own
+        const wants = new Set(state.wants);
+        for (const oid of state.extraWants ?? []) if (!state.commonBase.has(oid)) wants.add(oid);
+        const packStream = repository.exportPack(wants, state.commonBase, {
           thin,
           ofsDelta: state.capabilities.has("ofs-delta"),
           includeTag,
           filterSpec: state.filterSpec,
-          shallow: state.serverShallow,
+          shallow: state.packShallow ?? state.serverShallow,
         });
 
         // Band 1 with keep-alives until the first byte and errors on band 3; raw otherwise

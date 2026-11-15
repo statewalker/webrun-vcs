@@ -49,6 +49,16 @@ export interface ExportPackOptions {
   ofsDelta?: boolean;
 }
 
+/**
+ * A commit as upload-pack walks it: its parents and committer time.
+ */
+export interface CommitGraphInfo {
+  /** Parent commit ids (empty for a root commit) */
+  parents: string[];
+  /** Committer time, seconds since the epoch */
+  time: number;
+}
+
 export interface RepositoryFacade {
   /**
    * Imports a pack stream into the repository.
@@ -122,6 +132,17 @@ export interface RepositoryFacade {
   // Server-side validation methods (optional)
 
   /**
+   * A commit's parents and committer time, or undefined when `oid` is not a commit here
+   * (absent, or another object type). upload-pack walks the commit graph with it: the
+   * "not our ref" check, `ok_to_give_up` in negotiation, and shallow fetches
+   * (`deepen`, `deepen-relative`, `deepen-since`, `deepen-not`, unshallow).
+   *
+   * @param oid - Object ID
+   * @returns The commit's graph data, or undefined
+   */
+  getCommitInfo?(oid: string): Promise<CommitGraphInfo | undefined>;
+
+  /**
    * Checks if an object is reachable from other objects.
    * Used for REACHABLE_COMMIT policy validation.
    *
@@ -143,7 +164,9 @@ export interface RepositoryFacade {
   // Shallow clone computation methods (optional)
 
   /**
-   * Computes shallow boundaries for a depth-limited clone.
+   * Computes shallow boundaries for a depth-limited clone, as git's `deepen <depth>`: the
+   * commits `depth - 1` parents away from the wants (so `depth` commits deep), the wants
+   * themselves for depth 1. A facade with `getCommitInfo` does not need it.
    *
    * @param wants - Object IDs being fetched
    * @param depth - Number of commits to include
@@ -152,7 +175,8 @@ export interface RepositoryFacade {
   computeShallowBoundaries?(wants: Set<string>, depth: number): Promise<Set<string>>;
 
   /**
-   * Computes shallow boundaries since a timestamp.
+   * Computes shallow boundaries since a timestamp. upload-pack does not call it: it answers
+   * `deepen-since` through `getCommitInfo`.
    *
    * @param wants - Object IDs being fetched
    * @param timestamp - Unix timestamp cutoff
@@ -161,7 +185,8 @@ export interface RepositoryFacade {
   computeShallowSince?(wants: Set<string>, timestamp: number): Promise<Set<string>>;
 
   /**
-   * Computes shallow boundaries excluding refs.
+   * Computes shallow boundaries excluding refs. upload-pack does not call it: it answers
+   * `deepen-not` through `getCommitInfo`.
    *
    * @param wants - Object IDs being fetched
    * @param excludeRefs - Ref names to exclude

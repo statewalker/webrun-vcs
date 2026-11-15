@@ -748,7 +748,7 @@ describe("Server V2 FSM", () => {
       await fsm.run(context, "SEND_ERROR");
 
       expect(fsm.getState()).toBe("SEND_ERROR");
-      expect(context.output.error).toContain("Object not found");
+      expect(context.output.error).toBe(`upload-pack: not our ref ${oid}`);
     });
   });
 
@@ -859,7 +859,12 @@ describe("Server V2 FSM", () => {
         ...createEmptyFetchRequest(),
         deepen: 5,
       };
-      context.state.serverShallow = new Set([oid]);
+      // the boundary comes from the repository (the mock has no commit graph)
+      context.state.wants = new Set(["b".repeat(40)]);
+      context.repository = {
+        ...repository,
+        computeShallowBoundaries: async () => new Set([oid]),
+      };
 
       const fsm = new Fsm(serverV2Transitions, serverV2Handlers);
       fsm.setState("SEND_SHALLOW_INFO");

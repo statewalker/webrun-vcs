@@ -8,7 +8,16 @@
  */
 
 import type { ProcessContext } from "../../context/process-context.js";
-import { sendPackStream } from "../fetch/index.js";
+import {
+  computeShallowUpdate,
+  findUnreachableWant,
+  notOurRef,
+  okToGiveUp,
+  resolveDeepenNot,
+  type ShallowUpdate,
+  sendPackStream,
+  UploadPackRequestError,
+} from "../fetch/index.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { createEmptyFetchRequest, type FetchV2Request, SERVER_V2_CAPABILITIES } from "./types.js";
 
@@ -39,6 +48,7 @@ export const serverV2Transitions: FsmTransition[] = [
 
   // Parse fetch arguments
   ["PARSE_FETCH", "FETCH_PARSED", "VALIDATE_FETCH_WANTS"],
+  ["PARSE_FETCH", "INVALID_REQUEST", "SEND_ERROR"],
   ["PARSE_FETCH", "ERROR", ""],
 
   // Validate fetch wants
@@ -61,6 +71,9 @@ export const serverV2Transitions: FsmTransition[] = [
   // Send full fetch response with packfile
   ["SEND_FETCH_RESPONSE", "SEND_ACKS", "SEND_ACKNOWLEDGMENTS"],
 
+  // After "done", or without haves, the response has no acknowledgments section (git)
+  ["SEND_FETCH_RESPONSE", "NO_ACKS", "SEND_SHALLOW_INFO"],
+
   // Send acknowledgments section
   ["SEND_ACKNOWLEDGMENTS", "ACKS_DONE", "SEND_SHALLOW_INFO"],
   ["SEND_ACKNOWLEDGMENTS", "ERROR", ""],
@@ -68,6 +81,7 @@ export const serverV2Transitions: FsmTransition[] = [
   // Send shallow-info section (if shallow requested)
   ["SEND_SHALLOW_INFO", "SHALLOW_DONE", "SEND_WANTED_REFS"],
   ["SEND_SHALLOW_INFO", "NO_SHALLOW", "SEND_WANTED_REFS"],
+  ["SEND_SHALLOW_INFO", "INVALID_REQUEST", "SEND_ERROR"],
   ["SEND_SHALLOW_INFO", "ERROR", ""],
 
   // Send wanted-refs section (if want-ref used)
@@ -234,7 +248,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     "HANDLE_FETCH",
     async (ctx) => {
       try {
-        (ctx.state as ServerV2State).fetchRequest = createEmptyFetchRequest();
+        const state = ctx.state as ServerV2State;
+        state.fetchRequest = createEmptyFetchRequest();
+        state.sendAcks = undefined;
+        state.shallowUpdate = undefined;
+        ctx.state.serverShallow = undefined;
+        ctx.state.serverUnshallow = undefined;
         return "PARSE_FETCH_ARGS";
       } catch (e) {
         ctx.output.error = String(e);
@@ -274,12 +293,25 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
             req.haves.push(line.slice(5));
           } else if (line === "done") {
             req.done = true;
+          } else if (line === "wait-for-done") {
+            req.waitForDone = true;
           } else if (line.startsWith("shallow ")) {
             req.shallow.push(line.slice(8));
           } else if (line.startsWith("deepen ")) {
-            req.deepen = parseInt(line.slice(7), 10);
+            const depth = Number(line.slice(7));
+            if (!Number.isInteger(depth) || depth <= 0) {
+              ctx.output.error = `Invalid deepen: ${line}`;
+              return "INVALID_REQUEST";
+            }
+            req.deepen = depth;
           } else if (line.startsWith("deepen-since ")) {
-            req.deepenSince = parseInt(line.slice(13), 10);
+            // git refuses 0 (and its -1): no positive time is no cutoff
+            const since = Number(line.slice(13));
+            if (!Number.isInteger(since) || since <= 0) {
+              ctx.output.error = `Invalid deepen-since: ${line}`;
+              return "INVALID_REQUEST";
+            }
+            req.deepenSince = since;
           } else if (line.startsWith("deepen-not ")) {
             req.deepenNot = req.deepenNot ?? [];
             req.deepenNot.push(line.slice(11));
@@ -319,6 +351,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         }
 
         ctx.state.wants = new Set();
+        ctx.state.wantedRefs = new Map();
 
         // Resolve want-refs to OIDs
         for (const refName of req.wantRefs) {
@@ -329,20 +362,40 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
             return "INVALID_WANT";
           }
           ctx.state.wants.add(oid);
-          ctx.state.wantedRefs = ctx.state.wantedRefs ?? new Map();
           ctx.state.wantedRefs.set(refName, oid);
         }
 
-        // Add direct wants
-        for (const oid of req.wants) {
-          const valid = await ctx.repository.has(oid);
-          if (!valid) {
-            ctx.output.error = `Object not found: ${oid}`;
-            ctx.output.invalidWant = oid;
-            return "INVALID_WANT";
-          }
-          ctx.state.wants.add(oid);
+        // A filter is refused unless advertised (the built-in facades do not filter); an
+        // advertised one goes to exportPack as `filterSpec`
+        if (req.filter !== null && !advertisesFetchFeature(ctx, "filter")) {
+          ctx.output.error = `unexpected line: 'filter ${req.filter}'`;
+          return "INVALID_WANT";
         }
+
+        // Direct wants: by default git's allowReachableSHA1InWant (the tips, or commits
+        // reachable from them); "not our ref" for anything else
+        const policy = ctx.config.requestPolicy ?? "REACHABLE_COMMIT";
+        const tips = [...(await ctx.refStore.listAll())].map(([, oid]) => oid);
+        let refused: string | undefined;
+        if (policy === "ANY") {
+          for (const oid of req.wants) {
+            if (!(await ctx.repository.has(oid))) {
+              refused = oid;
+              break;
+            }
+          }
+        } else if (policy === "ADVERTISED" || policy === "TIP") {
+          const tipSet = new Set(tips);
+          refused = req.wants.find((oid) => !tipSet.has(oid));
+        } else {
+          refused = await findUnreachableWant(ctx.repository, req.wants, tips);
+        }
+        if (refused !== undefined) {
+          ctx.output.error = notOurRef(refused);
+          ctx.output.invalidWant = refused;
+          return "INVALID_WANT";
+        }
+        for (const oid of req.wants) ctx.state.wants.add(oid);
 
         return "VALID";
       } catch (e) {
@@ -395,15 +448,16 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           return "ERROR";
         }
 
-        // If client sent "done", we must send pack
-        if (req.done) {
-          return "READY";
-        }
-
-        // Without "done", only send pack if we have a good common base
-        // For simplicity, always return READY if we have any common objects
-        const hasCommon = ctx.state.commonBase && ctx.state.commonBase.size > 0;
-        return hasCommon || req.haves.length === 0 ? "READY" : "NOT_READY";
+        // git's FETCH_SEND_ACKS: after "done", or without haves, the pack follows at once
+        // (and no acknowledgments section); otherwise "ready" only once every want reaches a
+        // common commit (ok_to_give_up), and never with "wait-for-done"
+        state.sendAcks = false;
+        if (req.done || req.haves.length === 0) return "READY";
+        if (req.waitForDone) return "NOT_READY";
+        const ready = await okToGiveUp(ctx.repository, ctx.state.wants, ctx.state.commonBase);
+        if (!ready) return "NOT_READY";
+        state.sendAcks = true;
+        return "READY";
       } catch (e) {
         ctx.output.error = String(e);
         return "ERROR";
@@ -418,7 +472,9 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
       try {
         await ctx.transport.writeLine("acknowledgments");
 
-        for (const oid of ctx.state.acks ?? []) {
+        const acks = ctx.state.acks ?? [];
+        if (acks.length === 0) await ctx.transport.writeLine("NAK");
+        for (const oid of acks) {
           await ctx.transport.writeLine(`ACK ${oid}`);
         }
 
@@ -434,8 +490,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
   // Start sending full fetch response
   [
     "SEND_FETCH_RESPONSE",
-    async () => {
-      return "SEND_ACKS";
+    async (ctx) => {
+      return (ctx.state as ServerV2State).sendAcks === false ? "NO_ACKS" : "SEND_ACKS";
     },
   ],
 
@@ -468,23 +524,54 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         const state = ctx.state as ServerV2State;
         const req = state.fetchRequest;
 
-        // Check if shallow info is needed
-        if (!req || (req.deepen === 0 && !req.deepenSince && !req.deepenNot?.length)) {
+        // git's send_shallow_info: only for a deepen request, or a client that is shallow
+        if (
+          !req ||
+          (req.deepen === 0 &&
+            req.deepenSince === undefined &&
+            !req.deepenNot?.length &&
+            req.shallow.length === 0)
+        ) {
           return "NO_SHALLOW";
         }
 
+        let update: ShallowUpdate;
+        try {
+          const deepenNot: string[] = [];
+          for (const name of req.deepenNot ?? []) {
+            const oid = await resolveDeepenNot(ctx.refStore, name);
+            if (!oid) {
+              throw new UploadPackRequestError(
+                `git upload-pack: ambiguous deepen-not: deepen-not ${name}`,
+              );
+            }
+            deepenNot.push(oid);
+          }
+          update = await computeShallowUpdate(ctx.repository, {
+            wants: ctx.state.wants,
+            clientShallow: req.shallow,
+            depth: req.deepen,
+            deepenRelative: req.deepenRelative,
+            deepenSince: req.deepenSince,
+            deepenNot,
+            tips: [...(await ctx.refStore.listAll())].map(([, oid]) => oid),
+          });
+        } catch (e) {
+          if (!(e instanceof UploadPackRequestError)) throw e;
+          ctx.output.error = e.message;
+          return "INVALID_REQUEST";
+        }
+        (state as ServerV2State).shallowUpdate = update;
+        ctx.state.serverShallow = new Set(update.shallow);
+        ctx.state.serverUnshallow = new Set(update.unshallow);
+
         await ctx.transport.writeLine("shallow-info");
 
-        if (ctx.state.serverShallow) {
-          for (const oid of ctx.state.serverShallow) {
-            await ctx.transport.writeLine(`shallow ${oid}`);
-          }
+        for (const oid of update.shallow) {
+          await ctx.transport.writeLine(`shallow ${oid}`);
         }
-
-        if (ctx.state.serverUnshallow) {
-          for (const oid of ctx.state.serverUnshallow) {
-            await ctx.transport.writeLine(`unshallow ${oid}`);
-          }
+        for (const oid of update.unshallow) {
+          await ctx.transport.writeLine(`unshallow ${oid}`);
         }
 
         await ctx.transport.writeDelimiter();
@@ -533,18 +620,22 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
         await ctx.transport.writeLine("packfile");
 
-        // Export pack
+        // Export pack, cut at the shallow boundary: the new shallow commits and the client's
+        // own; the parents of unshallowed commits are tips of their own
         const thin = req?.thinPack ?? false;
-        const packStream = ctx.repository.exportPack(
-          ctx.state.wants,
-          ctx.state.commonBase ?? new Set(),
-          {
-            thin,
-            ofsDelta: req?.ofsDeltas ?? false,
-            includeTag: req?.includeTags,
-            filterSpec: req?.filter ?? undefined,
-          },
-        );
+        const common = ctx.state.commonBase ?? new Set<string>();
+        const shallow = state.shallowUpdate;
+        const wants = new Set(ctx.state.wants);
+        for (const oid of shallow?.extraWants ?? []) if (!common.has(oid)) wants.add(oid);
+        const packShallow =
+          shallow?.packShallow ?? (req?.shallow.length ? new Set(req.shallow) : undefined);
+        const packStream = ctx.repository.exportPack(wants, common, {
+          thin,
+          ofsDelta: req?.ofsDeltas ?? false,
+          includeTag: req?.includeTags,
+          filterSpec: req?.filter ?? undefined,
+          shallow: packShallow,
+        });
 
         // The packfile section is side-band multiplexed (seeded as side-band-64k by the
         // server): keep-alives until the first byte, an error on band 3 after it
@@ -631,4 +722,15 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
  */
 interface ServerV2State {
   fetchRequest?: FetchV2Request;
+  /** The response carries an acknowledgments section ending in "ready" */
+  sendAcks?: boolean;
+  /** The shallow-info sent, and how the pack is cut to match it */
+  shallowUpdate?: ShallowUpdate;
+}
+
+/** Whether the advertised `fetch=` capability lists `feature`. */
+function advertisesFetchFeature(ctx: ProcessContext, feature: string): boolean {
+  const capabilities = ctx.config.serverCapabilities ?? SERVER_V2_CAPABILITIES;
+  const fetch = capabilities.find((c) => c === "fetch" || c.startsWith("fetch="));
+  return fetch?.slice("fetch=".length).split(" ").includes(feature) ?? false;
 }

@@ -73,9 +73,170 @@ export interface HttpServerOptions {
    * byte (default 5000, as git's `uploadpack.keepAlive`; 0: none).
    */
   keepAliveMs?: number;
+  /**
+   * Largest request body accepted, in bytes after `Content-Encoding: gzip` is undone; a larger
+   * one is answered 413. Default: {@link DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES} for
+   * upload-pack, {@link DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES} for receive-pack (a push
+   * carries its pack). With gzip, the compressed body is held to the same limit (plus gzip's
+   * worst-case overhead). An upload-pack request is read whole before upload-pack runs (as
+   * git's http-backend buffers it), so an over-limit one is always a 413.
+   */
+  maxRequestBodyBytes?: number;
 }
 
+/** Default request body limit of POST /git-upload-pack (git's `http.maxRequestBuffer`). */
+export const DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES = 10 * 1024 * 1024;
+
+/** Default request body limit of POST /git-receive-pack. */
+export const DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES = 1024 * 1024 * 1024;
+
 const textEncoder = new TextEncoder();
+
+/** A request body larger than the server's limit (answered 413). */
+export class RequestBodyTooLargeError extends Error {
+  constructor(readonly limit: number) {
+    super(`request body larger than ${limit} bytes`);
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+/**
+ * The request body as the protocol reads it: gzip undone (git's remote-curl gzips request
+ * bodies) and cut at `limit` bytes, streamed. `tooLarge()` tells whether the limit was hit.
+ * Returns an HTTP error response instead for an encoding it cannot undo, or a declared
+ * `Content-Length` over the limit.
+ *
+ * The limit holds for the inflated bytes and, with gzip, for the compressed ones too (plus
+ * gzip's worst-case overhead): a decompressor takes input faster than it hands output on, so
+ * the inflated count alone would let a client push far more than `limit` bytes. At the
+ * limit, the source is cancelled: nothing more is read from the client.
+ */
+function requestBody(
+  request: HttpRequest,
+  body: ReadableStream<Uint8Array>,
+  limit: number,
+): { body: ReadableStream<Uint8Array>; tooLarge: () => boolean } | HttpResponse {
+  const encoding = (header(request, "content-encoding") ?? "").trim().toLowerCase();
+  if (encoding !== "" && encoding !== "identity" && encoding !== "gzip" && encoding !== "x-gzip") {
+    return plain(415, `Unsupported Content-Encoding: ${encoding}`);
+  }
+  const gzip = encoding === "gzip" || encoding === "x-gzip";
+  const declared = Number(header(request, "content-length") ?? Number.NaN);
+  const compressedLimit = gzip ? limit + Math.ceil(limit / 16384) * 5 + 64 : limit;
+  if (declared > compressedLimit) {
+    return plain(413, new RequestBodyTooLargeError(limit).message);
+  }
+  let exceeded = false;
+  const onExceeded = () => {
+    exceeded = true;
+  };
+  const input = limitStream(body, compressedLimit, limit, onExceeded);
+  const decoded = gzip
+    ? limitStream(
+        input.pipeThrough(
+          new DecompressionStream("gzip") as unknown as ReadableWritablePair<
+            Uint8Array,
+            Uint8Array
+          >,
+        ),
+        limit,
+        limit,
+        onExceeded,
+      )
+    : input;
+  return { body: decoded, tooLarge: () => exceeded };
+}
+
+/**
+ * `source`, pulled one chunk at a time, failing with {@link RequestBodyTooLargeError} once
+ * more than `max` bytes went through; the source is cancelled then.
+ */
+function limitStream(
+  source: ReadableStream<Uint8Array>,
+  max: number,
+  limit: number,
+  onExceeded: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  let total = 0;
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        let next: ReadableStreamReadResult<Uint8Array>;
+        try {
+          next = await reader.read();
+        } catch (error) {
+          controller.error(error);
+          return;
+        }
+        if (next.done) {
+          controller.close();
+          return;
+        }
+        total += next.value.byteLength;
+        if (total > max) {
+          onExceeded();
+          const error = new RequestBodyTooLargeError(limit);
+          controller.error(error);
+          await reader.cancel(error).catch(() => {});
+          return;
+        }
+        controller.enqueue(next.value);
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+/**
+ * The whole request body (at most `limit` bytes), as git's http-backend buffers an
+ * upload-pack request before upload-pack runs: an over-limit body is a 413, never a response
+ * cut short after its status went out.
+ */
+async function bufferBody(
+  body: ReadableStream<Uint8Array>,
+): Promise<{ bytes: Uint8Array } | { error: unknown }> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(next.value);
+      size += next.value.byteLength;
+    }
+  } catch (error) {
+    return { error };
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes };
+}
+
+function header(request: HttpRequest, name: string): string | undefined {
+  const direct = request.headers[name];
+  if (direct !== undefined) return direct;
+  for (const [key, value] of Object.entries(request.headers)) {
+    if (key.toLowerCase() === name) return value;
+  }
+  return undefined;
+}
+
+function plain(status: number, message: string): HttpResponse {
+  return {
+    status,
+    headers: { "Content-Type": "text/plain" },
+    body: textEncoder.encode(message),
+  };
+}
 
 /** The capabilities upload-pack advertises by default (GET /info/refs). */
 const DEFAULT_UPLOAD_PACK_CAPABILITIES = [
@@ -187,6 +348,16 @@ export async function handleUploadPack(
     };
   }
 
+  const maxBytes = options.maxRequestBodyBytes ?? DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES;
+  const input = requestBody(request, request.body, maxBytes);
+  if ("status" in input) return input;
+  const buffered = await bufferBody(input.body);
+  if ("error" in buffered) {
+    if (input.tooLarge()) return plain(413, new RequestBodyTooLargeError(maxBytes).message);
+    return plain(400, `Cannot read request body: ${String(buffered.error)}`);
+  }
+  const requestBytes = buffered.bytes;
+
   const state = new ProtocolState();
 
   // Populate refs from refStore
@@ -219,8 +390,12 @@ export async function handleUploadPack(
   };
 
   // Create duplex from request body and response writer
-  const input = readableStreamToAsyncIterable(request.body);
-  const duplex = createSimpleDuplex(input, writer);
+  const duplex = createSimpleDuplex(
+    (async function* () {
+      if (requestBytes.length > 0) yield requestBytes;
+    })(),
+    writer,
+  );
   const transport = createTransportApi(duplex, state);
 
   const config: ProcessConfiguration = {
@@ -311,7 +486,6 @@ export async function handleReceivePackInfoRefs(
   // Default capabilities for receive-pack
   const capabilities = options.capabilities ?? [
     "report-status",
-    "report-status-v2",
     "delete-refs",
     "side-band-64k",
     "quiet",
@@ -383,6 +557,13 @@ export async function handleReceivePack(
     };
   }
 
+  const input = requestBody(
+    request,
+    request.body,
+    options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES,
+  );
+  if ("status" in input) return input;
+
   const state = new ProtocolState();
 
   // Populate refs from refStore
@@ -405,8 +586,7 @@ export async function handleReceivePack(
   };
 
   // Create duplex from request body and response writer
-  const input = readableStreamToAsyncIterable(request.body);
-  const duplex = createSimpleDuplex(input, writer);
+  const duplex = createSimpleDuplex(readableStreamToAsyncIterable(input.body), writer);
   const transport = createTransportApi(duplex, state);
 
   const config: ProcessConfiguration = {
@@ -431,6 +611,11 @@ export async function handleReceivePack(
 
   try {
     await fsm.run(ctx);
+    // the pack was cut at the limit: nothing of it is applied, the push is refused
+    if (input.tooLarge()) {
+      const limit = options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES;
+      return plain(413, new RequestBodyTooLargeError(limit).message);
+    }
 
     // Only return 500 if the FSM errored without producing a proper
     // protocol response (e.g., it never reached SEND_STATUS).
@@ -463,6 +648,7 @@ export async function handleReceivePack(
       body,
     };
   } catch (error) {
+    if (input.tooLarge()) return plain(413, String(error));
     return {
       status: 500,
       headers: { "Content-Type": "text/plain" },
@@ -545,6 +731,8 @@ export interface HttpHandlerOptions {
   } | null>;
   /** Optional request policy */
   requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
+  maxRequestBodyBytes?: number;
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -579,7 +767,7 @@ export interface HttpHandlerOptions {
 export function createHttpHandler(
   options: HttpHandlerOptions,
 ): (request: HttpRequest) => Promise<HttpResponse> {
-  const { resolveRepository, requestPolicy, logger } = options;
+  const { resolveRepository, requestPolicy, maxRequestBodyBytes, logger } = options;
 
   return async (request: HttpRequest): Promise<HttpResponse> => {
     // Parse the Git request
@@ -621,7 +809,7 @@ export function createHttpHandler(
     }
 
     const { repository, refStore } = resolved;
-    const serverOptions: HttpServerOptions = { requestPolicy };
+    const serverOptions: HttpServerOptions = { requestPolicy, maxRequestBodyBytes };
 
     try {
       if (parsed.isInfoRefs) {
@@ -677,6 +865,8 @@ export interface GitHttpServerOptions {
   ) => Promise<{ repository: RepositoryFacade; refStore: RefStore } | null>;
   /** Optional request policy */
   requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
+  maxRequestBodyBytes?: number;
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -720,6 +910,7 @@ export function createGitHttpServer(options: GitHttpServerOptions): GitHttpServe
   const handler = createHttpHandler({
     resolveRepository: options.resolveRepository,
     requestPolicy: options.requestPolicy,
+    maxRequestBodyBytes: options.maxRequestBodyBytes,
     logger: options.logger,
   });
 
