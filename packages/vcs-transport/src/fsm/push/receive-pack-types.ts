@@ -177,8 +177,10 @@ export interface ReceivePackConfig {
   /**
    * How an atomic push treats refusals found before its ref transaction. By default (false),
    * as git's receive-pack: a command refused by the connectivity check ("missing necessary
-   * objects"), the shallow check, `authorize` or `preReceive` keeps its own error and the other
-   * commands are still applied, together, in one transaction. A refusal inside the transaction
+   * objects"), the shallow check or `authorize` keeps its own error and the other
+   * commands are still applied, together, in one transaction. A `preReceive` verdict that
+   * refuses some refs by name (`rejectedRefs`, which git's whole-push pre-receive cannot do)
+   * counts as an `update` hook refusal. A refusal inside the transaction
    * (git's `update()`: ref name, checked-out branch, deletes, non-fast-forward, the `update`
    * hook) fails every command ("atomic push failure"), and so does a ref that moved meanwhile
    * ("atomic transaction failed"). True: all or nothing, any refused command fails the others

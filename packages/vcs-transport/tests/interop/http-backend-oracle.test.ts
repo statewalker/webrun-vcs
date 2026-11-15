@@ -148,10 +148,11 @@ function sameAgent(body: Buffer): string {
 }
 
 /**
- * git's advertisement as current git writes it. git 2.43 (the sandbox's) advertises a bare
- * `object-info` whatever `transfer.advertiseObjectInfo` says; since 2.46 git advertises
- * `object-info=size type` only with that setting (CI's git). A bare line is 2.43's: dropped
- * when the setting is off, written as current git does when it is on.
+ * git's advertisement as git 2.56 writes it. git 2.43 and 2.44 (the sandbox has 2.43)
+ * advertise a bare `object-info` whatever `transfer.advertiseObjectInfo` says; 2.45 to 2.55
+ * advertise the bare line only with that setting; 2.56 writes `object-info=size type` (serve.c
+ * object_info_advertise). A bare line is dropped when the setting is off (2.43/2.44 only) and
+ * written as 2.56 does when it is on.
  */
 function asCurrentGit(body: Buffer, advertiseObjectInfo: boolean): Buffer {
   const legacy = pkt("object-info\n");
@@ -351,13 +352,13 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
     }
   });
 
-  it("object-info: not served by default (current git); git 2.43 serves it regardless", async () => {
+  it("object-info: not served by default (git 2.45+); git 2.43 and 2.44 serve it regardless", async () => {
     const [advert] = await both("GET", "/r.git/info/refs", "service=git-upload-pack", V2);
     const body = `${pkt("command=object-info\n")}0001${pkt("size\n")}${pkt(`oid ${c2}\n`)}0000`;
     const [git, our] = await both("POST", "/r.git/git-upload-pack", "", POST, body);
     expect(our.status).toBe(500);
     expect(our.body.toString()).toContain("invalid command 'object-info'");
-    // current git refuses it unless transfer.advertiseObjectInfo; 2.43 always offers it
+    // git 2.45+ refuses it unless transfer.advertiseObjectInfo; 2.43 and 2.44 always offer it
     const legacy = advert.body.toString("latin1").includes(pkt("object-info\n"));
     if (!legacy) {
       expect(offersObjectInfo(advert.body)).toBe(false);

@@ -242,7 +242,7 @@ describe("v2 over HTTP: ls-refs unborn", () => {
 });
 
 describe("v2 over HTTP: object-info as git writes it", () => {
-  // git serves object-info only with transfer.advertiseObjectInfo (since 2.46)
+  // git serves object-info only with transfer.advertiseObjectInfo (since 2.45)
   const withObjectInfo = () => ({ advertiseObjectInfo: true });
 
   it("is neither advertised nor served by default, as git", async () => {
@@ -258,13 +258,49 @@ describe("v2 over HTTP: object-info as git writes it", () => {
     }
   });
 
-  it("advertiseObjectInfo advertises `object-info=size type`, as current git", async () => {
+  it("advertiseObjectInfo advertises `object-info=size type`, as git 2.56", async () => {
     const { repo, handler } = await setup(withObjectInfo);
     try {
       const lines = pktLines(await bodyText(await handler(infoRefs("git-upload-pack", V2))));
       expect(lines.filter((l) => l.startsWith("object-info"))).toEqual(["object-info=size type"]);
     } finally {
       await repo.close();
+    }
+  });
+
+  it("advertises only the attributes the repository facade can answer", async () => {
+    // a facade without getObjectType: size only; without either: no object-info at all
+    const without = (drop: string[]) => (repo: TransportRepo) => {
+      const facade = Object.create(repo.facade);
+      for (const name of drop) facade[name] = undefined;
+      return {
+        advertiseObjectInfo: true,
+        resolveRepository: async () => ({ repository: facade, refStore: repo.refStore }),
+      };
+    };
+    const sizeOnly = await setup(without(["getObjectType"]));
+    try {
+      const lines = pktLines(
+        await bodyText(await sizeOnly.handler(infoRefs("git-upload-pack", V2))),
+      );
+      expect(lines.filter((l) => l.startsWith("object-info"))).toEqual(["object-info=size"]);
+      const text = await bodyText(
+        await sizeOnly.handler(post(command("object-info", ["type", `oid ${sizeOnly.c2}`]))),
+      );
+      expect(text).toContain("ERR object-info: unexpected line: 'type'");
+    } finally {
+      await sizeOnly.repo.close();
+    }
+
+    const none = await setup(without(["getObjectType", "getObjectSize"]));
+    try {
+      const lines = pktLines(await bodyText(await none.handler(infoRefs("git-upload-pack", V2))));
+      expect(lines.some((l) => l.startsWith("object-info"))).toBe(false);
+      const response = await none.handler(post(command("object-info", ["size"])));
+      expect(response.status).toBe(500);
+      expect(await bodyText(response)).toContain("invalid command 'object-info'");
+    } finally {
+      await none.repo.close();
     }
   });
 
@@ -281,7 +317,7 @@ describe("v2 over HTTP: object-info as git writes it", () => {
       expect(text).toBe(
         `${pkt("size")}${pkt("type")}${pkt(`${c2} ${size} commit`)}${pkt(`${missing} `)}0000`,
       );
-      // without attributes the object is still looked up (current git's send_info)
+      // without attributes the object is still looked up (git 2.56's send_info)
       const bare = await bodyText(await handler(post(command("object-info", [`oid ${missing}`]))));
       expect(bare).toBe(`${pkt(`${missing} `)}0000`);
     } finally {

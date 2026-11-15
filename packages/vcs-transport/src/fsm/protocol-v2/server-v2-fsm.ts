@@ -20,7 +20,12 @@ import {
   UploadPackRequestError,
 } from "../fetch/index.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
-import { createEmptyFetchRequest, type FetchV2Request, serverV2Capabilities } from "./types.js";
+import {
+  createEmptyFetchRequest,
+  type FetchV2Request,
+  objectInfoAttributes,
+  serverV2Capabilities,
+} from "./types.js";
 
 /**
  * Server V2 FSM transitions.
@@ -721,8 +726,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           }
 
           const line = pkt.text;
-          if (line === "size") size = true;
-          else if (line === "type") type = true;
+          // an attribute the facade cannot answer is an unknown line (as 2.43 for `type`)
+          const supported = objectInfoAttributes(ctx.repository);
+          if (line === "size" && supported.includes("size")) size = true;
+          else if (line === "type" && supported.includes("type")) type = true;
           else if (line.startsWith("oid ")) objectIds.push(line.slice(4));
           else await writeRaw(ctx, `ERR object-info: unexpected line: '${line}'`);
         }
@@ -819,12 +826,16 @@ function writeRaw(ctx: ProcessContext, text: string): Promise<void> {
 }
 
 function advertisedCapabilities(ctx: ProcessContext): string[] {
-  return serverV2Capabilities(ctx.config.serverCapabilities, ctx.config.advertiseObjectInfo);
+  return serverV2Capabilities(
+    ctx.config.serverCapabilities,
+    ctx.config.advertiseObjectInfo,
+    ctx.repository,
+  );
 }
 
 /**
  * The attributes object-info asks for, in git's order (size, type), or null for an object the
- * repository does not have (current git's send_info looks every object up, attributes or not;
+ * repository does not have (git 2.56's send_info looks every object up, attributes or not;
  * 2.43 only for `size`).
  */
 async function objectInfo(

@@ -2,6 +2,8 @@
  * Protocol V2 FSM types and interfaces.
  */
 
+import type { RepositoryFacade } from "../../api/repository-facade.js";
+
 /**
  * V2 fetch request structure.
  */
@@ -58,7 +60,7 @@ export type FetchV2ResponseSection =
  * Default V2 server capabilities: what the server implements. `ls-refs=unborn`: ls-refs reports
  * an unborn HEAD (`unborn HEAD symref-target:<ref>`), so cloning an empty repository picks its
  * branch; `fetch=shallow` covers `deepen`, `deepen-relative`, `deepen-since` and `deepen-not`;
- * no `filter` (no partial clone). No `object-info`, as git (since 2.46) without
+ * no `filter` (no partial clone). No `object-info`, as git (since 2.45) without
  * `transfer.advertiseObjectInfo`: the servers' `advertiseObjectInfo` option adds
  * {@link OBJECT_INFO_CAPABILITY}.
  */
@@ -70,13 +72,15 @@ export const SERVER_V2_CAPABILITIES = [
   "object-format=sha1",
 ];
 
-/** The `object-info` capability as current git advertises it (`size` and `type` attributes). */
+/** The `object-info` capability as git 2.56 advertises it (`size` and `type` attributes). */
 export const OBJECT_INFO_CAPABILITY = "object-info=size type";
 
 /**
  * The v2 capability advertisement: `capabilities` (default {@link SERVER_V2_CAPABILITIES}),
- * with {@link OBJECT_INFO_CAPABILITY} added when `advertiseObjectInfo` is set and they do not
- * name `object-info` already.
+ * with `object-info` added when `advertiseObjectInfo` is set and they do not name it already:
+ * {@link OBJECT_INFO_CAPABILITY}, or, given the `repository`, only the attributes its facade
+ * can answer (`size` with `getObjectSize`, `type` with `getObjectType`), and no `object-info`
+ * when it can answer neither.
  *
  * @example
  * ```ts
@@ -87,11 +91,24 @@ export const OBJECT_INFO_CAPABILITY = "object-info=size type";
 export function serverV2Capabilities(
   capabilities: readonly string[] = SERVER_V2_CAPABILITIES,
   advertiseObjectInfo = false,
+  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
 ): string[] {
   const list = [...capabilities];
   const named = list.some((c) => c === "object-info" || c.startsWith("object-info="));
-  if (advertiseObjectInfo && !named) list.push(OBJECT_INFO_CAPABILITY);
+  if (!advertiseObjectInfo || named) return list;
+  const attributes = objectInfoAttributes(repository);
+  if (attributes.length > 0) list.push(`object-info=${attributes.join(" ")}`);
   return list;
+}
+
+/** The object-info attributes a facade can answer (both without a facade to look at). */
+export function objectInfoAttributes(
+  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
+): Array<"size" | "type"> {
+  const out: Array<"size" | "type"> = [];
+  if (!repository || repository.getObjectSize) out.push("size");
+  if (!repository || repository.getObjectType) out.push("type");
+  return out;
 }
 
 /**

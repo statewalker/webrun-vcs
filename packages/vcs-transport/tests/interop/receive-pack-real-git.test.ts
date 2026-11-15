@@ -67,6 +67,8 @@ const GIT_VERSION: [number, number] = (() => {
  * receive-pack's update() refuses it ("invalid new value provided"; an atomic push fails the
  * others with "atomic push failure"). Older git refused it when the transaction committed:
  * "atomic transaction failed" for every ref of an atomic push. Our server follows 2.55+.
+ * Pinned from the release tags: refs.c's ref_transaction_update has the check in v2.55.0 and
+ * not in v2.54.0, whose refs/files-backend.c refuses the object while locking the ref.
  */
 const NON_COMMIT_IN_UPDATE = GIT_VERSION[0] > 2 || (GIT_VERSION[0] === 2 && GIT_VERSION[1] >= 55);
 

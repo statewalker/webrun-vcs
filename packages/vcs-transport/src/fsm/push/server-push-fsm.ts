@@ -517,7 +517,15 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       if (verdict.message) await sendMessage(ctx, verdict.message);
       const refused = verdict.rejectedRefs ? new Set(verdict.rejectedRefs) : undefined;
       for (const cmd of open) {
-        if (!refused || refused.has(cmd.refName)) reject(cmd, "pre-receive hook declined");
+        if (!refused || refused.has(cmd.refName)) {
+          reject(cmd, "pre-receive hook declined");
+          // a refusal of some refs only is ours (git's pre-receive refuses the whole push):
+          // an atomic push treats it as git's update hook, failing the others
+          if (refused) {
+            state.preReceiveRefused = state.preReceiveRefused ?? new Set();
+            state.preReceiveRefused.add(cmd);
+          }
+        }
       }
       return commands.some((c) => c.result === "NOT_ATTEMPTED") ? "HOOK_OK" : "HOOK_REJECTED";
     },
@@ -532,7 +540,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         // what was refused before the ref transaction (git's error_string set before
         // execute_commands_atomic): an atomic push still applies the rest, as git
         state.refusedBeforeTransaction = new Set(
-          (state.pushCommands ?? []).filter((c) => c.result !== "NOT_ATTEMPTED"),
+          (state.pushCommands ?? []).filter(
+            (c) => c.result !== "NOT_ATTEMPTED" && !state.preReceiveRefused?.has(c),
+          ),
         );
         await validateCommands(ctx);
         const commands = state.pushCommands ?? [];
@@ -669,6 +679,11 @@ interface ServerPushState extends ProtocolState {
    * pre-receive): an atomic push applies the others (git), unless `strictAtomic`
    */
   refusedBeforeTransaction?: Set<PushCommand>;
+  /**
+   * The commands a `preReceive` verdict with `rejectedRefs` refused: an atomic push treats
+   * them as refused by the update hook (the others get "atomic push failure")
+   */
+  preReceiveRefused?: Set<PushCommand>;
   /** The unpack status when not "ok" */
   unpackStatus?: string;
   /** The received objects, kept aside until the push is accepted (git's tmp_objdir) */
@@ -953,7 +968,9 @@ async function objectType(ctx: ProcessContext, oid: string): Promise<string | un
  * still open gets "atomic push failure" (a non-commit on a branch included, as git 2.55+).
  * What git's ref transaction refuses only when it commits (a stale old value, the same ref
  * twice) does not stop the checks; once they all pass, every open command gets "atomic transaction failed". With
- * `strictAtomic`, a command already refused before the transaction fails the others at once.
+ * `strictAtomic`, a command already refused before the transaction fails the others at once,
+ * and so does a command `preReceive` refused by name (`rejectedRefs`, no git counterpart: it is
+ * treated as git's update hook).
  */
 async function validateCommands(ctx: ProcessContext): Promise<void> {
   const state = getState<ServerPushState>(ctx);
@@ -973,6 +990,11 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   };
 
   if (atomic && rp.strictAtomic && commands.some((c) => c.result !== "NOT_ATTEMPTED")) {
+    failOpen(ATOMIC_PUSH_FAILURE);
+    return;
+  }
+  // refs preReceive refused one by one count as refused in update() (no update hook runs)
+  if (atomic && state.preReceiveRefused?.size) {
     failOpen(ATOMIC_PUSH_FAILURE);
     return;
   }

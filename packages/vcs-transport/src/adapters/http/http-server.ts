@@ -490,11 +490,15 @@ export function isProtocolV2Request(
  * // "version 2", "agent=…", "ls-refs=unborn", "fetch=shallow wait-for-done", …, flush
  * ```
  */
-export function handleInfoRefsV2(options: HttpServerOptions = {}): HttpResponse {
+export function handleInfoRefsV2(
+  options: HttpServerOptions = {},
+  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
+): HttpResponse {
   const chunks: Uint8Array[] = [encodePacketLine("version 2\n")];
   for (const capability of serverV2Capabilities(
     options.v2Capabilities,
     options.advertiseObjectInfo,
+    repository,
   )) {
     chunks.push(encodePacketLine(`${capability}\n`));
   }
@@ -1167,7 +1171,7 @@ export function createHttpHandler(
           };
         }
 
-        if (v2) return handleInfoRefsV2(serverOptions);
+        if (v2) return handleInfoRefsV2(serverOptions, repository);
         if (parsed.service === "git-upload-pack") {
           return await handleInfoRefs(refStore, uploadPackOptions, repository);
         } else {

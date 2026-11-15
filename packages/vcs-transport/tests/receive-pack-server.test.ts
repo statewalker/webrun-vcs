@@ -596,7 +596,59 @@ describe("receive-pack: atomic pushes as git's execute_commands_atomic", () => {
     expect(await repo.facade.has(n0)).toBe(false);
   });
 
-  it("refs pre-receive refuses keep its error, the others land; strictAtomic fails them all", async () => {
+  it("refs pre-receive refuses by name fail an atomic push as an update hook would", async () => {
+    for (const strictAtomic of [false, true]) {
+      const { repo, c2 } = await serverRepo();
+      const { client, commits } = await clientWithNewCommits(1);
+      const [n0] = commits as [string];
+      const pack = await fullPackOf(client, [n0], [c2]);
+      const hooked: string[] = [];
+      const run = await runReceivePack(
+        repo,
+        {
+          commands: [`${ZERO} ${n0} refs/heads/a`, `${ZERO} ${n0} refs/heads/b`],
+          caps: "report-status side-band-64k atomic",
+          pack,
+        },
+        {
+          strictAtomic,
+          hooks: {
+            preReceive: () => ({ ok: false, rejectedRefs: ["refs/heads/a"] }),
+            update: (refName) => {
+              hooked.push(refName);
+              return true;
+            },
+          },
+        },
+      );
+      expect(run.report).toEqual([
+        "unpack ok",
+        "ng refs/heads/a pre-receive hook declined",
+        "ng refs/heads/b atomic push failure",
+      ]);
+      expect(await repo.refStore.get("refs/heads/b")).toBeUndefined();
+      expect(hooked).toEqual([]);
+    }
+  });
+
+  it("a ref pre-receive refuses by name in a plain push: the others land", async () => {
+    const { repo, c2 } = await serverRepo();
+    const { client, commits } = await clientWithNewCommits(1);
+    const [n0] = commits as [string];
+    const pack = await fullPackOf(client, [n0], [c2]);
+    const run = await runReceivePack(
+      repo,
+      { commands: [`${ZERO} ${n0} refs/heads/a`, `${ZERO} ${n0} refs/heads/b`], pack },
+      { hooks: { preReceive: () => ({ ok: false, rejectedRefs: ["refs/heads/a"] }) } },
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/a pre-receive hook declined",
+      "ok refs/heads/b",
+    ]);
+  });
+
+  it("refs authorize refuses keep its error, the others land (git's hidden refs); strictAtomic fails them all", async () => {
     for (const strictAtomic of [false, true]) {
       const { repo, c2 } = await serverRepo();
       const { client, commits } = await clientWithNewCommits(1);
@@ -611,14 +663,13 @@ describe("receive-pack: atomic pushes as git's execute_commands_atomic", () => {
         },
         {
           strictAtomic,
-          hooks: { preReceive: () => ({ ok: false, rejectedRefs: ["refs/heads/a"] }) },
+          hooks: { authorize: () => ({ ok: false, rejectedRefs: ["refs/heads/a"] }) },
         },
       );
-      expect(run.report).toEqual([
-        "unpack ok",
-        "ng refs/heads/a pre-receive hook declined",
+      expect(run.report[1]).toMatch(/^ng refs\/heads\/a /);
+      expect(run.report[2]).toBe(
         strictAtomic ? "ng refs/heads/b atomic push failure" : "ok refs/heads/b",
-      ]);
+      );
       expect(await repo.refStore.get("refs/heads/b")).toBe(strictAtomic ? undefined : n0);
     }
   });

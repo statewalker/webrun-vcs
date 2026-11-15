@@ -15,6 +15,7 @@ import {
   type RepositoryFacade,
   type ServeResult,
   serveOverDuplex,
+  type UploadPackRequestPolicy,
 } from "@statewalker/vcs-transport";
 import type { GitService } from "./sync-remote.js";
 
@@ -45,6 +46,12 @@ export interface SyncServerOptions {
   hooks?: ReceivePackHooks;
   /** Where failures of hooks and listeners go (default: console.error) */
   logger?: ReceivePackLogger;
+  /**
+   * Which objects a client may fetch by id (default as git: the advertised refs over protocol
+   * v0, any object the repository has over v2); "REACHABLE_COMMIT" refuses objects no branch
+   * or tag reaches. See the transport's `UploadPackRequestPolicy`.
+   */
+  requestPolicy?: UploadPackRequestPolicy;
 }
 
 /** A served repository: the HTTP handler, a duplex server, and push notifications. */
@@ -104,6 +111,7 @@ export function createSyncServer(options: SyncServerOptions): SyncServer {
       refStore: options.refStore,
     }),
     receivePack: { hooks },
+    requestPolicy: options.requestPolicy,
     logger: { info: () => {}, error: (message, error) => logger.error(message, error) },
   });
 
@@ -117,6 +125,7 @@ export function createSyncServer(options: SyncServerOptions): SyncServer {
         service,
         hooks,
         logger,
+        requestPolicy: options.requestPolicy,
       }),
     hooks,
     subscribe(listener) {
