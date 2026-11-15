@@ -107,13 +107,17 @@ function createRepositoryFacadeFromHistory(history: HistoryWithOperations): Repo
     },
 
     async getObjectSize(oid: string): Promise<number | null> {
-      // Try blobs first - most efficient with size() method
+      // Any type (git's object-info): the size in the object header; the content is released
+      // unread
+      if (history.objects) {
+        const object = await history.objects.get(oid);
+        if (!object) return null;
+        await object.content[Symbol.asyncIterator]().return?.();
+        return object.size;
+      }
+      // Without the object store only blobs can be sized
       const blobSize = await history.blobs.size(oid);
-      if (blobSize >= 0) return blobSize;
-
-      // For other types, would need to serialize to determine size
-      // Return null for now as this is an optional optimization
-      return null;
+      return blobSize >= 0 ? blobSize : null;
     },
 
     // ─────────────────────────────────────────────────────────────────

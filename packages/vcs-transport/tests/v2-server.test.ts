@@ -102,15 +102,6 @@ describe("git protocol v2 server over serveOverDuplex", () => {
     }
   });
 
-  // Best-effort: a REAL `git -c protocol.version=2 clone/fetch` driving OUR v2
-  // server. Bridging real git as a *client* requires spawning the git binary
-  // against our server (e.g. via an `ext::` helper). In this sandbox the git
-  // client subprocess cannot complete such an exchange — the same environment
-  // limitation that keeps interop/clone-real-git.test.ts's real-`git clone`
-  // test skipped (the spawned git helper hangs before issuing any request).
-  // The loopback above PLUS the v2 client's own real-git validation
-  // (interop/fetch-v2-real-git.test.ts) together cover wire-compat both ways.
-  it.skip("real git v2 client ↔ our v2 server (blocked: git client subprocess in sandbox)", () => {
-    // Intentionally empty — see the rationale above. Re-enable in unsandboxed CI.
-  });
+  // Real git as the client of our v2 server: interop/serve-real-git.test.ts (over a pipe) and
+  // interop/http-real-git.test.ts (smart HTTP).
 });

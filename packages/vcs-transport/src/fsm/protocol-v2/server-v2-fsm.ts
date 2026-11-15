@@ -7,6 +7,7 @@
  * 3. Send appropriate responses
  */
 
+import type { PktLineResult } from "../../api/transport-api.js";
 import type { ProcessContext } from "../../context/process-context.js";
 import {
   computeShallowUpdate,
@@ -129,38 +130,75 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     },
   ],
 
-  // Read command from client
+  // Read a command request: `command=<name>` and capability lines (in any order), up to the
+  // delimiter that starts the arguments, or a flush (a command without arguments), as git's
+  // serve.c process_request
   [
     "READ_COMMAND",
     async (ctx) => {
       try {
-        const pkt = await ctx.transport.readPktLine();
+        const state = ctx.state as ServerV2State;
+        // stateless-rpc (smart HTTP): one command per request, as git's serve loop
+        if (ctx.config.statelessRpc && state.commandServed) return "FLUSH";
 
-        if (pkt.type === "flush" || pkt.type === "eof") {
-          return "FLUSH";
+        let command: string | undefined;
+        let seen = false;
+        let clientFormat: string | undefined;
+        while (true) {
+          const pkt = await ctx.transport.readPktLine();
+          if (pkt.type === "eof") {
+            if (!seen) return "FLUSH";
+            ctx.output.error = "the remote end hung up unexpectedly";
+            return "ERROR";
+          }
+          if (pkt.type === "flush") {
+            // nothing requested: the client ends the session
+            if (!seen) return "FLUSH";
+            // the command reads this flush as the end of its (empty) arguments
+            state.argumentsEnded = true;
+            break;
+          }
+          if (pkt.type === "delim") break;
+
+          const line = pkt.text;
+          if (line.startsWith("command=")) {
+            const name = line.slice("command=".length);
+            if (command !== undefined) {
+              ctx.output.error = `command '${name}' requested after already requesting command '${command}'`;
+              return "ERROR";
+            }
+            if (!V2_COMMANDS.has(name) || !advertisesCapability(ctx, name)) {
+              ctx.output.error = `invalid command '${name}'`;
+              return "ERROR";
+            }
+            command = name;
+          } else if (line.startsWith("object-format=")) {
+            clientFormat = line.slice("object-format=".length);
+            if (!KNOWN_OBJECT_FORMATS.has(clientFormat)) {
+              ctx.output.error = `unknown object format '${clientFormat}'`;
+              return "ERROR";
+            }
+          }
+          // other capability lines (agent, server-option, session-id, ...) are accepted
+          seen = true;
         }
-        if (pkt.type === "delim") {
-          ctx.output.error = "Unexpected delimiter, expected command";
+
+        if (command === undefined) {
+          ctx.output.error = "no command requested";
+          return "ERROR";
+        }
+        // a client that names no object format speaks sha1 (git)
+        const serverFormat = serverObjectFormat(ctx);
+        if ((clientFormat ?? "sha1") !== serverFormat) {
+          ctx.output.error = `mismatched object format: server ${serverFormat}; client ${clientFormat ?? "sha1"}`;
           return "ERROR";
         }
 
-        const line = pkt.text;
-
-        if (line.startsWith("command=ls-refs")) {
-          ctx.state.currentCommand = "ls-refs";
-          return "LS_REFS";
-        }
-        if (line.startsWith("command=fetch")) {
-          ctx.state.currentCommand = "fetch";
-          return "FETCH";
-        }
-        if (line.startsWith("command=object-info")) {
-          ctx.state.currentCommand = "object-info";
-          return "OBJECT_INFO";
-        }
-
-        ctx.output.error = `Unknown command: ${line}`;
-        return "ERROR";
+        state.commandServed = true;
+        ctx.state.currentCommand = command;
+        if (command === "ls-refs") return "LS_REFS";
+        if (command === "fetch") return "FETCH";
+        return "OBJECT_INFO";
       } catch (e) {
         ctx.output.error = String(e);
         return "ERROR";
@@ -180,7 +218,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
         // Read arguments until flush
         while (true) {
-          const pkt = await ctx.transport.readPktLine();
+          const pkt = await readArgument(ctx);
           if (pkt.type === "flush") break;
           if (pkt.type === "delim") continue;
           if (pkt.type === "eof") {
@@ -199,15 +237,28 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
         // Get refs
         const allRefs = Array.from(await ctx.refStore.listAll());
+        const matches = (name: string) =>
+          refPrefixes.length === 0 || refPrefixes.some((p) => name.startsWith(p));
 
-        // Filter by prefixes
-        const matchingRefs =
-          refPrefixes.length > 0
-            ? allRefs.filter(([name]) => refPrefixes.some((p) => name.startsWith(p)))
-            : allRefs;
+        // An unborn HEAD (a symref to a branch with no commit yet) comes first, as git's
+        // send_possibly_unborn_head: only with both `unborn` (and advertised) and `symrefs`
+        if (
+          unborn &&
+          symrefs &&
+          advertisesFeature(ctx, "ls-refs", "unborn") &&
+          matches("HEAD") &&
+          !allRefs.some(([name]) => name === "HEAD") &&
+          ctx.refStore.getSymrefTarget
+        ) {
+          const headTarget = await ctx.refStore.getSymrefTarget("HEAD");
+          if (headTarget) {
+            await ctx.transport.writeLine(`unborn HEAD symref-target:${headTarget}`);
+          }
+        }
 
         // Send refs
-        for (const [name, oid] of matchingRefs) {
+        for (const [name, oid] of allRefs) {
+          if (!matches(name)) continue;
           let line = `${oid} ${name}`;
 
           if (symrefs && ctx.refStore.getSymrefTarget) {
@@ -224,14 +275,6 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           }
 
           await ctx.transport.writeLine(line);
-        }
-
-        // Handle unborn HEAD
-        if (unborn && matchingRefs.length === 0 && ctx.refStore.getSymrefTarget) {
-          const headTarget = await ctx.refStore.getSymrefTarget("HEAD");
-          if (headTarget) {
-            await ctx.transport.writeLine(`unborn HEAD symref-target:${headTarget}`);
-          }
         }
 
         await ctx.transport.writeFlush();
@@ -275,7 +318,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         }
 
         while (true) {
-          const pkt = await ctx.transport.readPktLine();
+          const pkt = await readArgument(ctx);
           if (pkt.type === "flush") break;
           if (pkt.type === "delim") continue;
           if (pkt.type === "eof") {
@@ -646,8 +689,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         });
         if (sent.ok) return "PACKFILE_SENT";
         ctx.output.error = sent.error;
-        // without side-band the client must see a broken stream, not a short pack
-        if (!sent.inBand) ctx.output.streamBroken = true;
+        // reported on band 3; without side-band the client must see a broken stream, not a
+        // short pack
+        if (sent.inBand) ctx.output.errorReported = true;
+        else ctx.output.streamBroken = true;
         return "ERROR";
       } catch (e) {
         ctx.output.error = String(e);
@@ -662,32 +707,44 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     async (ctx) => {
       try {
         const objectIds: string[] = [];
+        let size = false;
 
-        // Read arguments until flush
+        // Read arguments until flush (git's cap_object_info)
         while (true) {
-          const pkt = await ctx.transport.readPktLine();
+          const pkt = await readArgument(ctx);
           if (pkt.type === "flush") break;
           if (pkt.type === "delim") continue;
           if (pkt.type === "eof") {
-            ctx.output.error = "Unexpected end of stream in object-info args";
+            ctx.output.error = "object-info: expected flush after arguments";
             return "ERROR";
           }
 
           const line = pkt.text;
-          if (line.startsWith("oid ")) {
-            objectIds.push(line.slice(4));
-          }
+          if (line === "size") size = true;
+          else if (line.startsWith("oid ")) objectIds.push(line.slice(4));
+          else await writeRaw(ctx, `ERR object-info: unexpected line: '${line}'`);
         }
 
-        // Send size info for requested objects
-        await ctx.transport.writeLine("size");
-
-        for (const oid of objectIds) {
-          if (ctx.repository.getObjectSize) {
-            const size = await ctx.repository.getObjectSize(oid);
-            if (size !== null) {
-              await ctx.transport.writeLine(`${oid} ${size}`);
+        // git's send_info: nothing for no oid; the `size` attribute line when sizes were
+        // asked for; then a line per requested oid, in order, written as git writes them
+        // (no newline): "<oid> <size>", "<oid> " for an object it does not have, "<oid>"
+        // without the size attribute; an ERR for what is not an oid
+        if (objectIds.length > 0) {
+          if (size) await writeRaw(ctx, "size");
+          for (const oid of objectIds) {
+            if (!OID_PATTERN.test(oid)) {
+              await writeRaw(
+                ctx,
+                `ERR object-info: protocol error, expected to get oid, not '${oid}'`,
+              );
+              continue;
             }
+            if (!size) {
+              await writeRaw(ctx, oid);
+              continue;
+            }
+            const objectSize = (await ctx.repository.getObjectSize?.(oid)) ?? null;
+            await writeRaw(ctx, objectSize === null ? `${oid} ` : `${oid} ${objectSize}`);
           }
         }
 
@@ -708,6 +765,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         const errorMsg = ctx.output.error ?? "Unknown error";
         await ctx.transport.writeLine(`ERR ${errorMsg}`);
         await ctx.transport.writeFlush();
+        ctx.output.errorReported = true;
         return "ERROR_SENT";
       } catch (e) {
         ctx.output.error = String(e);
@@ -721,6 +779,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
  * Extended context state for V2 server operations.
  */
 interface ServerV2State {
+  /** READ_COMMAND consumed the flush that ends the command's (empty) arguments */
+  argumentsEnded?: boolean;
+  /** A command was read (stateless-rpc serves one per request) */
+  commandServed?: boolean;
   fetchRequest?: FetchV2Request;
   /** The response carries an acknowledgments section ending in "ready" */
   sendAcks?: boolean;
@@ -728,9 +790,58 @@ interface ServerV2State {
   shallowUpdate?: ShallowUpdate;
 }
 
+/** The commands the v2 server implements. */
+const V2_COMMANDS = new Set(["ls-refs", "fetch", "object-info"]);
+
+/** Object formats git knows (`object-format=` of a request). */
+const KNOWN_OBJECT_FORMATS = new Set(["sha1", "sha256"]);
+
+const OID_PATTERN = /^[0-9a-f]{40}$/;
+
+const textEncoder = new TextEncoder();
+
+/** The next argument line of the current command (a flush READ_COMMAND already read counts). */
+async function readArgument(ctx: ProcessContext): Promise<PktLineResult> {
+  const state = ctx.state as ServerV2State;
+  if (state.argumentsEnded) {
+    state.argumentsEnded = false;
+    return { type: "flush" };
+  }
+  return ctx.transport.readPktLine();
+}
+
+/** A pkt-line written as git's `packet_writer_write` does: the text, no newline added. */
+function writeRaw(ctx: ProcessContext, text: string): Promise<void> {
+  return ctx.transport.writePktLine(textEncoder.encode(text));
+}
+
+function advertisedCapabilities(ctx: ProcessContext): string[] {
+  return ctx.config.serverCapabilities ?? SERVER_V2_CAPABILITIES;
+}
+
+/** Whether the advertisement has capability `name` (`name` or `name=<features>`). */
+function advertisesCapability(ctx: ProcessContext, name: string): boolean {
+  return advertisedCapabilities(ctx).some((c) => c === name || c.startsWith(`${name}=`));
+}
+
+/** Whether the advertised `<capability>=` lists `feature` (e.g. `fetch=shallow`). */
+function advertisesFeature(ctx: ProcessContext, capability: string, feature: string): boolean {
+  const found = advertisedCapabilities(ctx).find((c) => c.startsWith(`${capability}=`));
+  return (
+    found
+      ?.slice(capability.length + 1)
+      .split(" ")
+      .includes(feature) ?? false
+  );
+}
+
 /** Whether the advertised `fetch=` capability lists `feature`. */
 function advertisesFetchFeature(ctx: ProcessContext, feature: string): boolean {
-  const capabilities = ctx.config.serverCapabilities ?? SERVER_V2_CAPABILITIES;
-  const fetch = capabilities.find((c) => c === "fetch" || c.startsWith("fetch="));
-  return fetch?.slice("fetch=".length).split(" ").includes(feature) ?? false;
+  return advertisesFeature(ctx, "fetch", feature);
+}
+
+/** The server's object format (its `object-format=` capability; sha1 without one). */
+function serverObjectFormat(ctx: ProcessContext): string {
+  const found = advertisedCapabilities(ctx).find((c) => c.startsWith("object-format="));
+  return found ? found.slice("object-format=".length) : "sha1";
 }

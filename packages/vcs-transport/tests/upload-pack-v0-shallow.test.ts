@@ -63,12 +63,11 @@ async function fetchV0(
   wants: string[],
   lines: string[],
   haves: string[] = [],
+  capabilities = "multi_ack_detailed side-band-64k ofs-delta shallow",
 ): Promise<{ lines: string[]; packObjects?: number }> {
   const request = concat([
     ...wants.map((w, i) =>
-      encodePacketLine(
-        i === 0 ? `want ${w} multi_ack_detailed side-band-64k ofs-delta shallow\n` : `want ${w}\n`,
-      ),
+      encodePacketLine(i === 0 ? `want ${w} ${capabilities}\n` : `want ${w}\n`),
     ),
     ...lines.map((l) => encodePacketLine(`${l}\n`)),
     encodeFlush(),
@@ -167,5 +166,21 @@ describe("protocol v0 upload-pack: shallow", () => {
       true,
     );
     expect(dup.packObjects).toBeUndefined();
+  });
+});
+
+describe("protocol v0 upload-pack: deepen-relative", () => {
+  it("takes deepen-relative from the want line's capabilities (git fetch --deepen)", async () => {
+    const { repo, c3, c4 } = await linearRepo();
+    // git's v0 client asks for a relative deepen with a capability, not an argument line
+    const res = await fetchV0(
+      repo,
+      [c4],
+      [`shallow ${c4}`, "deepen 1"],
+      [c4],
+      "multi_ack_detailed side-band-64k ofs-delta shallow deepen-relative",
+    );
+    expect(res.lines.slice(0, 3)).toEqual([`shallow ${c3}`, `unshallow ${c4}`, "FLUSH"]);
+    expect(res.packObjects).toBe(3); // c3, its tree and blob
   });
 });

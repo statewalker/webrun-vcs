@@ -155,7 +155,7 @@ describe("Protocol V2 FSM Types", () => {
 
   describe("SERVER_V2_CAPABILITIES", () => {
     it("includes required capabilities", () => {
-      expect(SERVER_V2_CAPABILITIES).toContain("ls-refs");
+      expect(SERVER_V2_CAPABILITIES).toContain("ls-refs=unborn");
       expect(SERVER_V2_CAPABILITIES.some((c) => c.startsWith("fetch="))).toBe(true);
       expect(SERVER_V2_CAPABILITIES.some((c) => c.startsWith("object-format="))).toBe(true);
     });
@@ -605,7 +605,7 @@ describe("Server V2 FSM", () => {
       await fsm.run(context);
 
       expect(fsm.getState()).toBe("");
-      expect(context.output.error).toContain("Unknown command");
+      expect(context.output.error).toBe("invalid command 'unknown'");
     });
   });
 
@@ -935,6 +935,8 @@ describe("Server V2 FSM", () => {
 
       transport = createMockTransport([
         { type: "delim" },
+        // sizes only for the size attribute (git's object-info)
+        { type: "data", payload: new Uint8Array(0), text: "size" },
         { type: "data", payload: new Uint8Array(0), text: `oid ${oid1}` },
         { type: "data", payload: new Uint8Array(0), text: `oid ${oid2}` },
         { type: "flush" },

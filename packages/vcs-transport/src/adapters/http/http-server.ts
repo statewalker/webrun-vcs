@@ -2,8 +2,12 @@
  * HTTP Smart Protocol server handlers.
  *
  * Implements the Git Smart HTTP protocol:
- * - GET /info/refs?service=git-upload-pack - Ref advertisement
- * - POST /git-upload-pack - Pack negotiation and transfer
+ * - GET /info/refs?service=git-upload-pack - Ref advertisement (v0), or the capability
+ *   advertisement with `Git-Protocol: version=2`
+ * - POST /git-upload-pack - Pack negotiation and transfer (v0), or one stateless v2 command
+ *   (`ls-refs`, `fetch`, `object-info`) with `Git-Protocol: version=2`
+ * - GET /info/refs?service=git-receive-pack, POST /git-receive-pack - push (v0 only: git has
+ *   no v2 push)
  */
 
 import type { RepositoryFacade } from "../../api/repository-facade.js";
@@ -22,8 +26,14 @@ import type { ProcessConfiguration } from "../../context/process-config.js";
 import type { ProcessContext, RefStore } from "../../context/process-context.js";
 import { ProtocolState } from "../../context/protocol-state.js";
 import { createTransportApi } from "../../factories/transport-api-factory.js";
-import { serverFetchHandlers, serverFetchTransitions } from "../../fsm/fetch/server-fetch-fsm.js";
+import {
+  defaultUploadPackCapabilities,
+  serverFetchHandlers,
+  serverFetchTransitions,
+} from "../../fsm/fetch/server-fetch-fsm.js";
 import { Fsm } from "../../fsm/fsm.js";
+import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/server-v2-fsm.js";
+import { SERVER_V2_CAPABILITIES } from "../../fsm/protocol-v2/types.js";
 import { serverPushHandlers, serverPushTransitions } from "../../fsm/push/server-push-fsm.js";
 import { ZERO_OID } from "../../protocol/constants.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
@@ -82,6 +92,13 @@ export interface HttpServerOptions {
    * git's http-backend buffers it), so an over-limit one is always a 413.
    */
   maxRequestBodyBytes?: number;
+  /**
+   * Answer `Git-Protocol: version=2` upload-pack requests with protocol v2 (default true);
+   * false serves them v0, as a server without v2.
+   */
+  protocolV2?: boolean;
+  /** Capabilities of the v2 advertisement (default {@link SERVER_V2_CAPABILITIES}) */
+  v2Capabilities?: string[];
 }
 
 /** Default request body limit of POST /git-upload-pack (git's `http.maxRequestBuffer`). */
@@ -91,6 +108,16 @@ export const DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES = 1024 * 1024 * 1024;
 
 const textEncoder = new TextEncoder();
+
+/**
+ * git's http-backend `hdr_nocache`, sent with every info/refs and rpc response: neither the
+ * advertisement nor a negotiation answer may come from a cache.
+ */
+export const NO_CACHE_HEADERS: Readonly<Record<string, string>> = {
+  Expires: "Fri, 01 Jan 1980 00:00:00 GMT",
+  Pragma: "no-cache",
+  "Cache-Control": "no-cache, max-age=0, must-revalidate",
+};
 
 /** A request body larger than the server's limit (answered 413). */
 export class RequestBodyTooLargeError extends Error {
@@ -317,16 +344,65 @@ export async function handleInfoRefs(
     status: 200,
     headers: {
       "Content-Type": "application/x-git-upload-pack-advertisement",
-      "Cache-Control": "no-cache",
+      ...NO_CACHE_HEADERS,
     },
     body,
   };
 }
 
 /**
+ * Whether a `Git-Protocol` header asks for protocol v2. The value holds `key=value` parameters
+ * separated by `:` (git's `GIT_PROTOCOL`), e.g. `version=2` or `version=2:object-format=sha1`.
+ * As git's `determine_protocol_version_server`, the entries are split on `:` exactly and not
+ * trimmed: `foo : version=2` asks for no version (v0).
+ */
+export function requestsProtocolV2(gitProtocol: string | undefined): boolean {
+  if (!gitProtocol) return false;
+  return gitProtocol.split(":").some((param) => param === "version=2");
+}
+
+/** Whether `request` carries `Git-Protocol: version=2` (and v2 is not switched off). */
+export function isProtocolV2Request(
+  request: HttpRequest,
+  options: HttpServerOptions = {},
+): boolean {
+  return options.protocolV2 !== false && requestsProtocolV2(header(request, "git-protocol"));
+}
+
+/**
+ * Handles GET /info/refs?service=git-upload-pack with `Git-Protocol: version=2`.
+ *
+ * Returns the v2 capability advertisement: `version 2`, one capability per line and a flush.
+ * As git's http-backend, without the smart-HTTP `# service=git-upload-pack` preamble, which it
+ * writes only for v0.
+ *
+ * @example
+ * ```ts
+ * const response = handleInfoRefsV2();
+ * // "version 2", "agent=…", "ls-refs=unborn", "fetch=shallow wait-for-done", …, flush
+ * ```
+ */
+export function handleInfoRefsV2(options: HttpServerOptions = {}): HttpResponse {
+  const chunks: Uint8Array[] = [encodePacketLine("version 2\n")];
+  for (const capability of options.v2Capabilities ?? SERVER_V2_CAPABILITIES) {
+    chunks.push(encodePacketLine(`${capability}\n`));
+  }
+  chunks.push(encodeFlush());
+  return {
+    status: 200,
+    headers: {
+      "Content-Type": "application/x-git-upload-pack-advertisement",
+      ...NO_CACHE_HEADERS,
+    },
+    body: concatBytes(chunks),
+  };
+}
+
+/**
  * Handles POST /git-upload-pack
  *
- * Runs the fetch negotiation and sends pack data.
+ * Runs the fetch negotiation and sends pack data (protocol v0; see
+ * {@link handleUploadPackV2} for a `Git-Protocol: version=2` request).
  *
  * @param request - HTTP request with body
  * @param repository - Repository facade for pack export
@@ -340,23 +416,8 @@ export async function handleUploadPack(
   refStore: RefStore,
   options: HttpServerOptions = {},
 ): Promise<HttpResponse> {
-  if (!request.body) {
-    return {
-      status: 400,
-      headers: { "Content-Type": "text/plain" },
-      body: textEncoder.encode("Missing request body"),
-    };
-  }
-
-  const maxBytes = options.maxRequestBodyBytes ?? DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES;
-  const input = requestBody(request, request.body, maxBytes);
-  if ("status" in input) return input;
-  const buffered = await bufferBody(input.body);
-  if ("error" in buffered) {
-    if (input.tooLarge()) return plain(413, new RequestBodyTooLargeError(maxBytes).message);
-    return plain(400, `Cannot read request body: ${String(buffered.error)}`);
-  }
-  const requestBytes = buffered.bytes;
+  const requestBytes = await readUploadPackRequest(request, options);
+  if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 
   const state = new ProtocolState();
 
@@ -372,8 +433,105 @@ export async function handleUploadPack(
     state.advertisedCapabilities.add(cap);
   }
 
-  // The response streams as the FSM writes it: each write waits until the reader pulled the
-  // previous chunk (an identity TransformStream with no readable buffer).
+  const config: ProcessConfiguration = {
+    requestPolicy: options.requestPolicy ?? "ADVERTISED",
+    maxEmptyBatches: 10,
+    keepAliveMs: options.keepAliveMs,
+    // each POST is one request of a stateless negotiation (git's --stateless-rpc)
+    statelessRpc: true,
+  };
+
+  // Run server FSM starting from READ_WANTS state
+  // (ref advertisement was already sent in GET /info/refs)
+  const fsm = new Fsm(serverFetchTransitions, serverFetchHandlers);
+  fsm.setState("READ_WANTS");
+  return streamUploadPack(requestBytes, fsm, { repository, refStore, state, config });
+}
+
+/**
+ * Handles POST /git-upload-pack with `Git-Protocol: version=2`.
+ *
+ * Runs one v2 command (`ls-refs`, `fetch` or `object-info`) with the v2 server FSM and streams
+ * its response. Stateless, as git's http-backend: every request starts from a fresh state and
+ * reads the command at once (GET /info/refs sent the capability advertisement), and a `fetch`
+ * round carries all the client's haves, so nothing is kept between requests. The request body
+ * is read whole first (gzip undone, at most `maxRequestBodyBytes`); the pack is streamed as
+ * it is written.
+ *
+ * @example
+ * ```ts
+ * if (isProtocolV2Request(request)) {
+ *   return handleUploadPackV2(request, repository, refStore);
+ * }
+ * ```
+ */
+export async function handleUploadPackV2(
+  request: HttpRequest,
+  repository: RepositoryFacade,
+  refStore: RefStore,
+  options: HttpServerOptions = {},
+): Promise<HttpResponse> {
+  const requestBytes = await readUploadPackRequest(request, options);
+  if (!(requestBytes instanceof Uint8Array)) return requestBytes;
+
+  const state = new ProtocolState();
+  // The v2 packfile section is always side-band-64k multiplexed (never advertised in v2)
+  state.capabilities.add("side-band-64k");
+
+  const config: ProcessConfiguration = {
+    serverCapabilities: options.v2Capabilities,
+    // git's upload-pack serves a stateless client any commit reachable from a ref
+    requestPolicy: options.requestPolicy ?? "REACHABLE_COMMIT",
+    keepAliveMs: options.keepAliveMs,
+    // one command per request (git's serve loop with --stateless-rpc); more are ignored
+    statelessRpc: true,
+  };
+
+  const fsm = new Fsm(serverV2Transitions, serverV2Handlers);
+  fsm.setState("READ_COMMAND");
+  return streamUploadPack(requestBytes, fsm, { repository, refStore, state, config });
+}
+
+/**
+ * The upload-pack request body, read whole (as git's http-backend buffers it, so an
+ * over-limit body is a 413, never a response cut short after its status went out), or the
+ * error response.
+ */
+async function readUploadPackRequest(
+  request: HttpRequest,
+  options: HttpServerOptions,
+): Promise<Uint8Array | HttpResponse> {
+  if (!request.body) return plain(400, "Missing request body");
+  const maxBytes = options.maxRequestBodyBytes ?? DEFAULT_MAX_UPLOAD_PACK_REQUEST_BYTES;
+  const input = requestBody(request, request.body, maxBytes);
+  if ("status" in input) return input;
+  const buffered = await bufferBody(input.body);
+  if ("error" in buffered) {
+    if (input.tooLarge()) return plain(413, new RequestBodyTooLargeError(maxBytes).message);
+    return plain(400, `Cannot read request body: ${String(buffered.error)}`);
+  }
+  return buffered.bytes;
+}
+
+/**
+ * Runs an upload-pack FSM over `requestBytes` and streams what it writes as the response
+ * body: each write waits until the reader pulled the previous chunk (a slow client slows the
+ * pack writer down; the pack is never buffered).
+ *
+ * A failure before the first write is a 500 (git's http-backend answers an empty 200 there,
+ * its upload-pack having died before writing; the 500 carries the message). After the first
+ * write the status is out, so every failure must still reach the client: one the FSM reported
+ * in band (`errorReported`: an `ERR` line, or band 3 of the side-band) ends the response
+ * normally; any other is written as an `ERR <message>` pkt-line, which git's client takes as
+ * a remote error wherever a pkt-line may come; and where no pkt-line can come (raw pack bytes
+ * were out, `streamBroken`) or the FSM threw, the response stream is aborted.
+ */
+async function streamUploadPack(
+  requestBytes: Uint8Array,
+  fsm: Fsm<ProcessContext>,
+  parts: Pick<ProcessContext, "repository" | "refStore" | "state" | "config">,
+): Promise<HttpResponse> {
+  // An identity TransformStream with no readable buffer
   const pipe = new TransformStream<Uint8Array, Uint8Array>(
     undefined,
     { highWaterMark: 1 },
@@ -389,46 +547,30 @@ export async function handleUploadPack(
     return out.write(data);
   };
 
-  // Create duplex from request body and response writer
   const duplex = createSimpleDuplex(
     (async function* () {
       if (requestBytes.length > 0) yield requestBytes;
     })(),
     writer,
   );
-  const transport = createTransportApi(duplex, state);
-
-  const config: ProcessConfiguration = {
-    requestPolicy: options.requestPolicy ?? "ADVERTISED",
-    maxEmptyBatches: 10,
-    keepAliveMs: options.keepAliveMs,
-  };
-
   const ctx: ProcessContext = {
-    transport,
-    repository,
-    refStore,
-    state,
+    ...parts,
+    transport: createTransportApi(duplex, parts.state),
     output: new HandlerOutput(),
-    config,
   };
 
-  // Run server FSM starting from READ_WANTS state
-  // (ref advertisement was already sent in GET /info/refs)
-  const fsm = new Fsm(serverFetchTransitions, serverFetchHandlers);
-  fsm.setState("READ_WANTS");
-
-  // a protocol error (output.error) was reported in band (sideband 3) once writing started,
-  // unless the FSM says it could not be (`streamBroken`: raw pack bytes were out); that one and
-  // a thrown one break the stream
-  const run = fsm.run(ctx).then(
-    () =>
-      ctx.output.error
-        ? { error: new Error(ctx.output.error), thrown: ctx.output.streamBroken === true }
-        : undefined,
+  type Failure = { error: Error; how: "reported" | "err-line" | "abort" };
+  const run: Promise<Failure | undefined> = fsm.run(ctx).then(
+    () => {
+      const output = ctx.output;
+      if (!output.error) return undefined;
+      const error = new Error(output.error);
+      if (output.streamBroken) return { error, how: "abort" };
+      return { error, how: output.errorReported ? "reported" : "err-line" };
+    },
     (error: unknown) => ({
       error: error instanceof Error ? error : new Error(String(error)),
-      thrown: true,
+      how: "abort",
     }),
   );
   // Until the FSM writes, a failure can still be a 500; after that the status is sent
@@ -437,26 +579,42 @@ export async function handleUploadPack(
     const failure = await run;
     if (failure) {
       await out.abort(failure.error).catch(() => {});
-      return {
-        status: 500,
-        headers: { "Content-Type": "text/plain" },
-        body: textEncoder.encode(failure.error.message),
-      };
+      return plain(500, failure.error.message);
     }
   }
   void run.then(async (failure) => {
-    if (failure?.thrown) await out.abort(failure.error).catch(() => {});
-    else await out.close().catch(() => {});
+    if (failure?.how === "abort") {
+      await out.abort(failure.error).catch(() => {});
+      return;
+    }
+    if (failure?.how === "err-line") {
+      try {
+        await out.write(encodePacketLine(`ERR ${failure.error.message}\n`));
+      } catch {
+        // the client is gone
+      }
+    }
+    await out.close().catch(() => {});
   });
 
   return {
     status: 200,
     headers: {
       "Content-Type": "application/x-git-upload-pack-result",
-      "Cache-Control": "no-cache",
+      ...NO_CACHE_HEADERS,
     },
     body: pipe.readable,
   };
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const body = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return body;
 }
 
 /**
@@ -526,7 +684,7 @@ export async function handleReceivePackInfoRefs(
     status: 200,
     headers: {
       "Content-Type": "application/x-git-receive-pack-advertisement",
-      "Cache-Control": "no-cache",
+      ...NO_CACHE_HEADERS,
     },
     body,
   };
@@ -643,7 +801,7 @@ export async function handleReceivePack(
       status: 200,
       headers: {
         "Content-Type": "application/x-git-receive-pack-result",
-        "Cache-Control": "no-cache",
+        ...NO_CACHE_HEADERS,
       },
       body,
     };
@@ -733,6 +891,10 @@ export interface HttpHandlerOptions {
   requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
   /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
   maxRequestBodyBytes?: number;
+  /** Serve protocol v2 to `Git-Protocol: version=2` (see {@link HttpServerOptions.protocolV2}) */
+  protocolV2?: boolean;
+  /** Capabilities of the v2 advertisement (see {@link HttpServerOptions.v2Capabilities}) */
+  v2Capabilities?: string[];
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -767,7 +929,14 @@ export interface HttpHandlerOptions {
 export function createHttpHandler(
   options: HttpHandlerOptions,
 ): (request: HttpRequest) => Promise<HttpResponse> {
-  const { resolveRepository, requestPolicy, maxRequestBodyBytes, logger } = options;
+  const {
+    resolveRepository,
+    requestPolicy,
+    maxRequestBodyBytes,
+    protocolV2,
+    v2Capabilities,
+    logger,
+  } = options;
 
   return async (request: HttpRequest): Promise<HttpResponse> => {
     // Parse the Git request
@@ -782,8 +951,17 @@ export function createHttpHandler(
       };
     }
 
+    const serverOptions: HttpServerOptions = {
+      requestPolicy,
+      maxRequestBodyBytes,
+      protocolV2,
+      v2Capabilities,
+    };
+    // git has no v2 push: receive-pack is v0 whatever the client asks
+    const v2 = parsed.service === "git-upload-pack" && isProtocolV2Request(request, serverOptions);
+
     logger?.info(
-      `Git ${parsed.service} request for ${parsed.repoPath} (info/refs: ${parsed.isInfoRefs})`,
+      `Git ${parsed.service} request for ${parsed.repoPath} (info/refs: ${parsed.isInfoRefs}, protocol: ${v2 ? "v2" : "v0"})`,
     );
 
     // Resolve repository
@@ -809,7 +987,11 @@ export function createHttpHandler(
     }
 
     const { repository, refStore } = resolved;
-    const serverOptions: HttpServerOptions = { requestPolicy, maxRequestBodyBytes };
+    // v0 upload-pack advertises (and accepts) only what it implements for this repository
+    const uploadPackOptions: HttpServerOptions = {
+      ...serverOptions,
+      capabilities: defaultUploadPackCapabilities(requestPolicy ?? "ADVERTISED", repository),
+    };
 
     try {
       if (parsed.isInfoRefs) {
@@ -822,8 +1004,9 @@ export function createHttpHandler(
           };
         }
 
+        if (v2) return handleInfoRefsV2(serverOptions);
         if (parsed.service === "git-upload-pack") {
-          return await handleInfoRefs(refStore, serverOptions);
+          return await handleInfoRefs(refStore, uploadPackOptions);
         } else {
           // git-receive-pack info/refs
           return await handleReceivePackInfoRefs(refStore, serverOptions);
@@ -838,8 +1021,9 @@ export function createHttpHandler(
           };
         }
 
+        if (v2) return await handleUploadPackV2(request, repository, refStore, serverOptions);
         if (parsed.service === "git-upload-pack") {
-          return await handleUploadPack(request, repository, refStore, serverOptions);
+          return await handleUploadPack(request, repository, refStore, uploadPackOptions);
         } else {
           return await handleReceivePack(request, repository, refStore, serverOptions);
         }
@@ -867,6 +1051,10 @@ export interface GitHttpServerOptions {
   requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
   /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
   maxRequestBodyBytes?: number;
+  /** Serve protocol v2 to `Git-Protocol: version=2` (see {@link HttpServerOptions.protocolV2}) */
+  protocolV2?: boolean;
+  /** Capabilities of the v2 advertisement (see {@link HttpServerOptions.v2Capabilities}) */
+  v2Capabilities?: string[];
   /** Optional logger */
   logger?: {
     info: (msg: string) => void;
@@ -911,6 +1099,8 @@ export function createGitHttpServer(options: GitHttpServerOptions): GitHttpServe
     resolveRepository: options.resolveRepository,
     requestPolicy: options.requestPolicy,
     maxRequestBodyBytes: options.maxRequestBodyBytes,
+    protocolV2: options.protocolV2,
+    v2Capabilities: options.v2Capabilities,
     logger: options.logger,
   });
 
