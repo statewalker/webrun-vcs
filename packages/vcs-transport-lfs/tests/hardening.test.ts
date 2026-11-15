@@ -285,7 +285,7 @@ describe("parseLfsPointer follows the git-lfs pointer spec", () => {
     expect(parseLfsPointer(`${V}\noid sha256:${oid}\nsize 12345\n`)).toEqual({ oid, size: 12345 });
     expect(
       parseLfsPointer(`${V}\next-0-foo sha256:${"0".repeat(64)}\noid sha256:${oid}\nsize 1\n`),
-    ).toEqual({ oid, size: 1 });
+    ).toMatchObject({ oid, size: 1 });
   });
 
   it("rejects keys out of order", () => {

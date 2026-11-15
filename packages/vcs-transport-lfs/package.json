@@ -49,6 +49,7 @@
   "devDependencies": {
     "@statewalker/webrun-storage": "catalog:",
     "@statewalker/webrun-files-mem": "catalog:",
+    "@statewalker/vcs-utils-node": "workspace:^",
     "rolldown": "catalog:",
     "vitest": "catalog:",
     "typescript": "catalog:",

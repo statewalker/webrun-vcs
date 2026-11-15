@@ -12,10 +12,21 @@
 
 import type { ObjectId } from "@statewalker/webrun-content-store";
 
+/** A pointer extension line, `ext-<priority>-<name> sha256:<oid>` (spec v1). */
+export interface LfsPointerExtension {
+  /** 0 to 9: the order the extensions run in. */
+  priority: number;
+  name: string;
+  /** The SHA-256 (bare hex) of the extension's input. */
+  oid: string;
+}
+
 /** A Git LFS pointer: `oid` is the whole-object SHA-256 (bare hex), `size` in bytes. */
 export interface LfsPointer {
   oid: string;
   size: number;
+  /** Extension lines, by priority; only present when the pointer has any. */
+  extensions?: LfsPointerExtension[];
 }
 
 /**
@@ -53,4 +64,21 @@ export interface LfsTransferOptions {
    * S3-style URLs may reject; a collected body gets its length from the browser.
    */
   streamRequestBody?: boolean;
+  /**
+   * Headers sent with the batch request, and with each transfer whose href is
+   * on the endpoint's origin, unless the server marked the object
+   * `authenticated` (its action headers then carry the authorization). They
+   * never go to another origin. Names are case-insensitive: an action header
+   * replaces a client header of the same name.
+   */
+  headers?: Record<string, string>;
+  /** Shorthand for an `Authorization: Basic …` header (applied like `headers`). */
+  credentials?: { username: string; password: string };
+  /**
+   * Headers for a transfer whose href is on ANOTHER origin than the endpoint
+   * (a CDN, object storage): called with the href, it returns the headers to
+   * send there, or `undefined` for none. Not called for `authenticated`
+   * objects. Action headers still replace these by name.
+   */
+  headersFor?: (href: string) => Record<string, string> | undefined;
 }
