@@ -154,6 +154,26 @@ export interface Refs {
   ): Promise<RefUpdateResult>;
 
   /**
+   * The repository's shallow commits (git's `shallow` file): commits whose parents are not
+   * here, the boundary of a shallow clone. Empty for a complete repository.
+   *
+   * Optional: a store without it cannot hold a shallow repository, and a shallow fetch into
+   * it is refused.
+   */
+  getShallow?(): Promise<ObjectId[]>;
+
+  /**
+   * Replace the shallow commits (an empty list makes the repository complete again: git
+   * removes the `shallow` file).
+   *
+   * @example
+   * ```typescript
+   * await refs.setShallow?.([...(await refs.getShallow?.()) ?? [], boundary]);
+   * ```
+   */
+  setShallow?(commits: Iterable<ObjectId>): Promise<void>;
+
+  /**
    * Initialize the refs store
    *
    * Creates necessary structures (e.g., HEAD pointing to refs/heads/main).

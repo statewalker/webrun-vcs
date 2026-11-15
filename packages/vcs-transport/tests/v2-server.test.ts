@@ -1,7 +1,7 @@
 /**
  * Protocol **v2** server wiring: our v2 server (`serveOverDuplex` with
  * `protocolVersion: "2"`) ↔ our real-git-validated v2 client
- * (`fetchV2OverDuplex`), over an in-process loopback duplex.
+ * (`fetchOverDuplex`, which speaks v2 when the server does), over an in-process loopback duplex.
  *
  * The v2 client is already proven wire-compatible with a real `git upload-pack`
  * speaking protocol v2 (see interop/fetch-v2-real-git.test.ts). Driving that
@@ -17,12 +17,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  fetchOverDuplex,
-  fetchV2OverDuplex,
-  serveRepoOverWebrun,
-  webrunClientDuplex,
-} from "../src/index.js";
+import { fetchOverDuplex, serveRepoOverWebrun, webrunClientDuplex } from "../src/index.js";
 import { commitInRepo, createTransportRepo } from "./interop/helpers.js";
 
 describe("git protocol v2 server over serveOverDuplex", () => {
@@ -45,7 +40,7 @@ describe("git protocol v2 server over serveOverDuplex", () => {
 
     const client = await createTransportRepo();
     try {
-      const result = await fetchV2OverDuplex({
+      const result = await fetchOverDuplex({
         duplex: webrunClientDuplex(handler),
         repository: client.facade,
         refStore: client.refStore,

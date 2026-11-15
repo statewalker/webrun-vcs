@@ -50,15 +50,57 @@ export interface FileRefStoreOptions extends FilesRefBatchOptions {
  * - .git/refs/remotes/* for remote tracking branches
  * - .git/packed-refs for packed refs
  */
+/** git's shallow file, relative to the git directory */
+const SHALLOW_FILE = "shallow";
+
 export class FileRefStore implements Refs {
   private readonly ops: FilesRefOps;
+  private readonly atomic: AtomicFiles;
 
   constructor(
     private readonly files: FilesApi,
     private readonly gitDir: string,
     options: FileRefStoreOptions = {},
   ) {
-    this.ops = createFilesRefOps(options.atomicFiles ?? atomicFilesOver(files, gitDir), options);
+    this.atomic = options.atomicFiles ?? atomicFilesOver(files, gitDir);
+    this.ops = createFilesRefOps(this.atomic, options);
+  }
+
+  /**
+   * The shallow commits: git's `shallow` file (one id per line), empty when there is none.
+   */
+  async getShallow(): Promise<ObjectId[]> {
+    const decoder = new TextDecoder();
+    let text = "";
+    for await (const chunk of this.atomic.read(SHALLOW_FILE)) {
+      text += decoder.decode(chunk, { stream: true });
+    }
+    text += decoder.decode();
+    return text.split("\n").filter((line) => /^[0-9a-f]{40}$/.test(line));
+  }
+
+  /**
+   * Replace the `shallow` file under `shallow.lock`, as git does; an empty list removes it.
+   * Throws when another writer holds the lock.
+   */
+  async setShallow(commits: Iterable<ObjectId>): Promise<void> {
+    const ids = [...new Set(commits)].sort();
+    const lock = `${SHALLOW_FILE}.lock`;
+    const content = new TextEncoder().encode(ids.map((id) => `${id}\n`).join(""));
+    if (!(await this.atomic.createExclusive(lock, content))) {
+      throw new Error(`Unable to lock ${SHALLOW_FILE}: ${lock} exists`);
+    }
+    try {
+      if (ids.length === 0) {
+        await this.atomic.remove(SHALLOW_FILE);
+        await this.atomic.remove(lock);
+      } else {
+        await this.atomic.replace(lock, SHALLOW_FILE);
+      }
+    } catch (error) {
+      await this.atomic.remove(lock).catch(() => false);
+      throw error;
+    }
   }
 
   /**

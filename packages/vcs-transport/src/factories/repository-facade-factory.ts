@@ -10,7 +10,13 @@
  * - Typed stores (Blobs, Trees, Commits, Tags, Refs) for object access
  */
 
-import type { HistoryWithOperations, Ref, SymbolicRef } from "@statewalker/vcs-core";
+import {
+  DefaultSerializationApi,
+  type History,
+  type HistoryWithOperations,
+  type Ref,
+  type SymbolicRef,
+} from "@statewalker/vcs-core";
 import type {
   CommitGraphInfo,
   ExportPackOptions,
@@ -23,8 +29,12 @@ import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
  * Configuration for creating RepositoryFacade using History facade.
  */
 export interface HistoryFacadeConfig {
-  /** History facade for object access */
-  history: HistoryWithOperations;
+  /**
+   * History facade for object access. A plain `History` gets a `DefaultSerializationApi`
+   * over it (pack import and export through its object kernel); a `HistoryWithOperations`
+   * brings its own.
+   */
+  history: History | HistoryWithOperations;
 }
 
 /**
@@ -53,8 +63,13 @@ export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryF
 /**
  * Create RepositoryFacade using new History interface (recommended)
  */
-function createRepositoryFacadeFromHistory(history: HistoryWithOperations): RepositoryFacade {
-  const { commits, tags, refs, serialization } = history;
+function createRepositoryFacadeFromHistory(
+  history: History | HistoryWithOperations,
+): RepositoryFacade {
+  const { commits, tags, refs } = history;
+  const serialization =
+    (history as Partial<HistoryWithOperations>).serialization ??
+    new DefaultSerializationApi({ history });
 
   const facade: RepositoryFacade = {
     // ─────────────────────────────────────────────────────────────────

@@ -3,15 +3,18 @@ import type { ObjectId } from "@statewalker/vcs-core";
 // (dist/index.js); its subpaths resolve for types but not at runtime.
 import { isSymbolicRef } from "@statewalker/vcs-core";
 import {
-  expandFromSource,
-  matchSource,
+  createRepositoryFacade,
+  createTransportRefStore,
+  expandFromDestination,
+  type FetchRefUpdate,
+  matchDestination,
   parseRefSpec,
   type RefSpec,
+  type TagMode,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
 
 import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
-import { importPackIntoHistory } from "../pack-import/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import {
   type FetchResult,
@@ -71,7 +74,6 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private remote = "origin";
   private refSpecs: string[] = [];
   private removeDeletedRefs = false;
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: Set by setTagOpt(), to be used in call()
   private tagOption: TagOption = TagOption.AUTO_FOLLOW;
   private thin = true;
   private depth?: number;
@@ -334,6 +336,12 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /**
    * Execute the fetch operation.
    *
+   * Runs the transport's fetch client (git's fetch-pack): the local refs are offered as
+   * haves, so only the objects the working copy lacks are downloaded; shallow options and
+   * the shallow file are honoured; tags follow the tag option; each tracking ref is
+   * updated when it fast-forwards or its refspec (or {@link setForceUpdate}) forces it, and
+   * rejected otherwise.
+   *
    * @returns Fetch result with updated refs
    * @throws InvalidRemoteError if remote cannot be resolved
    */
@@ -347,109 +355,53 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       throw new InvalidRemoteError(this.remote);
     }
 
-    // Parse refspecs for source→destination mapping
-    const parsedSpecs = this.effectiveRefSpecs().map((s) => parseRefSpec(s));
+    // git: without a refspec the remote's HEAD is fetched, and no ref is written
+    const configured = this.effectiveRefSpecs();
+    const refspecs = configured.length > 0 ? configured : ["HEAD"];
+    const history = this._workingCopy.history;
 
-    // Save old ref values before fetch for status computation
-    const oldRefValues = new Map<string, string | undefined>();
-    for await (const ref of this.refsStore.list()) {
-      if (!isSymbolicRef(ref) && ref.objectId) {
-        oldRefValues.set(ref.name, ref.objectId);
-      }
-    }
-
-    // Execute fetch using high-level fetch API
-    const transportResult = await transportFetch({
+    const result = await transportFetch({
       url: remoteUrl,
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
+      repository: createRepositoryFacade({ history }),
+      refStore: createTransportRefStore(history.refs),
+      refspecs,
+      tags: toTagMode(this.tagOption),
       depth: this.depth,
-      onProgressMessage: this.progressMessageCallback,
-      // the pack flows from the response into the object store as it arrives
-      onPack: (pack) => (this.dryRun ? drain(pack) : this.storePack(pack)),
+      deepenSince: this.shallowSince,
+      deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
+      unshallow: this.unshallow || undefined,
+      force: this.forceUpdate,
+      dryRun: this.dryRun,
+      onProgress: this.progressMessageCallback,
+      reflogMessage: `fetch: ${remoteUrl}`,
     });
 
-    // Convert refs from Uint8Array to hex strings
-    const bytesToHex = (bytes: Uint8Array): string =>
-      Array.from(bytes)
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-
     const advertisedRefs = new Map<string, ObjectId>();
-    for (const [refName, objectId] of transportResult.refs) {
-      advertisedRefs.set(refName, bytesToHex(objectId));
+    for (const ref of result.remoteRefs) {
+      if (ref.oid) advertisedRefs.set(ref.name, ref.oid);
     }
-
-    // Build tracking ref updates by mapping server refs through refspecs
-    const trackingUpdates: TrackingRefUpdate[] = [];
-    for (const [serverRefName, objectIdBytes] of transportResult.refs) {
-      const objectId = bytesToHex(objectIdBytes);
-
-      // Map server ref name to local ref name via refspecs
-      const localRefName = this.mapServerRef(serverRefName, parsedSpecs);
-      if (!localRefName) continue;
-
-      const isForce = this.forceUpdate || this.isRefSpecForced(serverRefName, parsedSpecs);
-      const update = await this.computeRefUpdate(
-        localRefName,
-        serverRefName,
-        objectId,
-        oldRefValues,
-        isForce,
-      );
-
-      // Write the mapped ref to local store (unless dry-run)
-      if (!this.dryRun) {
-        await this.refsStore.set(localRefName, objectId);
-      }
-
-      trackingUpdates.push(update);
-    }
+    const trackingUpdates = result.refUpdates.map(toTrackingRefUpdate);
 
     // Handle prune
     if (!this.dryRun && this.removeDeletedRefs) {
-      const pruned = await this.pruneDeletedRefs(transportResult.refs);
-      trackingUpdates.push(...pruned);
+      const parsed = refspecs.map((s) => parseRefSpec(s));
+      trackingUpdates.push(
+        ...(await this.pruneDeletedRefs(new Set(advertisedRefs.keys()), parsed)),
+      );
     }
 
     return {
       uri: remoteUrl,
       advertisedRefs,
       trackingRefUpdates: trackingUpdates,
-      defaultBranch: transportResult.defaultBranch,
-      bytesReceived: transportResult.bytesReceived,
-      isEmpty: transportResult.isEmpty,
+      defaultBranch: result.defaultBranch,
+      bytesReceived: result.packBytes,
+      isEmpty: result.isEmpty,
       messages: [],
     };
-  }
-
-  /**
-   * Map a server ref name to a local ref name using parsed refspecs.
-   * Returns undefined if no refspec matches.
-   */
-  private mapServerRef(serverRef: string, specs: RefSpec[]): string | undefined {
-    for (const spec of specs) {
-      if (spec.negative) continue;
-      if (!spec.source || !spec.destination) continue;
-      if (!matchSource(spec, serverRef)) continue;
-
-      const expanded = expandFromSource(spec, serverRef);
-      return expanded.destination ?? undefined;
-    }
-    return undefined;
-  }
-
-  /**
-   * Check if any matching refspec has the force flag for a given server ref.
-   */
-  private isRefSpecForced(serverRef: string, specs: RefSpec[]): boolean {
-    for (const spec of specs) {
-      if (spec.negative) continue;
-      if (!spec.source) continue;
-      if (matchSource(spec, serverRef) && spec.force) return true;
-    }
-    return false;
   }
 
   /**
@@ -483,137 +435,80 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Compute ref update status using pre-fetch ref values.
-   *
-   * Uses saved pre-fetch values to correctly determine
-   * NEW vs NO_CHANGE vs FAST_FORWARD status.
-   */
-  private async computeRefUpdate(
-    localRef: string,
-    remoteRef: string,
-    newObjectId: ObjectId,
-    oldRefValues: Map<string, string | undefined>,
-    force: boolean,
-  ): Promise<TrackingRefUpdate> {
-    const oldObjectId = oldRefValues.get(localRef);
-
-    let status: RefUpdateStatus;
-    if (!oldObjectId) {
-      status = RefUpdateStatus.NEW;
-    } else if (oldObjectId === newObjectId) {
-      status = RefUpdateStatus.NO_CHANGE;
-    } else if (force) {
-      status = RefUpdateStatus.FORCED;
-    } else {
-      // Check if fast-forward
-      const isAncestor = await this.isAncestor(oldObjectId, newObjectId);
-      status = isAncestor ? RefUpdateStatus.FAST_FORWARD : RefUpdateStatus.REJECTED;
-    }
-
-    return {
-      localRef,
-      remoteRef,
-      oldObjectId,
-      newObjectId,
-      status,
-    };
-  }
-
-  /**
-   * Check if one commit is an ancestor of another.
-   */
-  private async isAncestor(ancestor: ObjectId, descendant: ObjectId): Promise<boolean> {
-    // Walk from descendant back to see if we hit ancestor
-    const visited = new Set<ObjectId>();
-    const queue: ObjectId[] = [descendant];
-
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (current === undefined) break;
-      if (current === ancestor) {
-        return true;
-      }
-      if (visited.has(current)) {
-        continue;
-      }
-      visited.add(current);
-
-      try {
-        const commit = await this.commits.load(current);
-        if (commit) {
-          queue.push(...commit.parents);
-        }
-      } catch {
-        // Commit not found, skip
-      }
-
-      // Limit walk depth for performance
-      if (visited.size > 10000) {
-        break;
-      }
-    }
-
-    return false;
-  }
-
-  /**
-   * Prune refs that no longer exist on remote.
+   * Prune local refs that a refspec maps from a remote ref that no longer exists (git's
+   * `--prune`): for each refspec with a destination, the local refs matching the
+   * destination whose source is not among the remote refs are deleted.
    */
   private async pruneDeletedRefs(
-    remoteRefs: Map<string, Uint8Array>,
+    remoteRefNames: Set<string>,
+    specs: RefSpec[],
   ): Promise<TrackingRefUpdate[]> {
     const updates: TrackingRefUpdate[] = [];
-    const prefix = `refs/remotes/${this.remote}/`;
-
-    // Get remote ref names for comparison
-    const remoteRefNames = new Set<string>();
-    for (const refName of remoteRefs.keys()) {
-      remoteRefNames.add(refName);
-    }
-
-    // Find local tracking refs that don't exist on remote
-    for await (const ref of this.refsStore.list(prefix)) {
-      // Skip symbolic refs
-      if (isSymbolicRef(ref)) {
-        continue;
-      }
-
-      // Derive remote ref name
-      const localName = ref.name.slice(prefix.length);
-      const remoteRefName = `refs/heads/${localName}`;
-
-      if (!remoteRefNames.has(ref.name) && !remoteRefNames.has(remoteRefName)) {
-        // Delete the local tracking ref
+    const done = new Set<string>();
+    for (const spec of specs) {
+      if (spec.negative || !spec.source || !spec.destination) continue;
+      const prefix = spec.wildcard
+        ? spec.destination.slice(0, spec.destination.indexOf("*"))
+        : spec.destination;
+      for await (const ref of this.refsStore.list(prefix)) {
+        if (isSymbolicRef(ref) || done.has(ref.name)) continue;
+        let source: string | null;
+        if (spec.wildcard) {
+          if (!matchDestination(spec, ref.name)) continue;
+          source = expandFromDestination(spec, ref.name).source;
+        } else {
+          if (ref.name !== spec.destination) continue;
+          source = spec.source;
+        }
+        if (!source || remoteRefNames.has(source)) continue;
+        done.add(ref.name);
         await this.refsStore.delete(ref.name);
         updates.push({
           localRef: ref.name,
-          remoteRef: remoteRefName,
+          remoteRef: source,
           oldObjectId: ref.objectId,
           newObjectId: "", // Empty indicates deletion
           status: RefUpdateStatus.DELETED,
         });
       }
     }
-
     return updates;
-  }
-
-  /**
-   * Store the received pack as it arrives.
-   *
-   * Imports it into the working copy's history (kept as a pack when large and
-   * the history has packs, else unpacked), before the tracking refs are
-   * written, so they point at objects that are there. Import is idempotent:
-   * the stores are content-addressed.
-   */
-  private async storePack(pack: AsyncIterable<Uint8Array>): Promise<void> {
-    await importPackIntoHistory(this._workingCopy.history, pack);
   }
 }
 
-/** Reads a stream to its end, keeping nothing. */
-async function drain(stream: AsyncIterable<Uint8Array>): Promise<void> {
-  for await (const _ of stream) {
-    // discarded
+/** The transport's tag mode for a {@link TagOption}. */
+export function toTagMode(option: TagOption): TagMode {
+  switch (option) {
+    case TagOption.FETCH_TAGS:
+      return "all";
+    case TagOption.NO_TAGS:
+      return "none";
+    default:
+      return "auto";
   }
+}
+
+/** A transport ref update as a {@link TrackingRefUpdate}. */
+export function toTrackingRefUpdate(update: FetchRefUpdate): TrackingRefUpdate {
+  const status =
+    update.status === "new"
+      ? RefUpdateStatus.NEW
+      : update.status === "up-to-date"
+        ? RefUpdateStatus.NO_CHANGE
+        : update.status === "fast-forward"
+          ? RefUpdateStatus.FAST_FORWARD
+          : update.status === "forced"
+            ? RefUpdateStatus.FORCED
+            : update.reason === "non-fast-forward" || update.reason === "would clobber existing tag"
+              ? RefUpdateStatus.REJECTED
+              : RefUpdateStatus.LOCK_FAILURE;
+  return {
+    localRef: update.localRef,
+    remoteRef: update.remoteRef,
+    oldObjectId: update.oldOid,
+    newObjectId: update.newOid,
+    status,
+    summary: update.summary,
+    reason: update.reason,
+  };
 }

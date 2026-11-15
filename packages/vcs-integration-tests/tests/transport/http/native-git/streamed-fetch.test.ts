@@ -1,7 +1,7 @@
 /**
- * The transport's `fetch` against git-http-backend, with the pack streamed (`onPack`) from the
- * response body, through the sideband demux, into vcs-core's `importPack`: every object git
- * has arrives byte for byte, and the pack is never collected (`packData` stays empty).
+ * The transport's `fetch` against git-http-backend, with the pack streamed from the response
+ * body, through the sideband demux, into vcs-core's `importPack` (`repository.importPack`):
+ * every object git has arrives byte for byte, and the pack is never collected.
  *
  * Skips when git-http-backend is not available.
  */
@@ -10,7 +10,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
-import { fetch as transportFetch } from "@statewalker/vcs-transport";
+import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  fetch as transportFetch,
+} from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   type GitHttpBackendServer,
@@ -67,15 +71,32 @@ describeWithGit("fetch streams the pack into importPack (git-http-backend)", () 
     const history = createMemoryHistoryWithOperations();
     await history.initialize();
     let imported = 0;
+    let streamed = true;
+    const facade = createRepositoryFacade({ history });
     const result = await transportFetch({
       url,
-      onPack: async (pack) => {
-        imported = (await history.serialization.importPack(pack)).objectsImported;
+      repository: {
+        ...facade,
+        importPack: async (pack) => {
+          // the pack arrives as a stream of chunks, not as one buffer
+          let chunks = 0;
+          const counted = (async function* () {
+            for await (const chunk of pack) {
+              chunks++;
+              yield chunk;
+            }
+          })();
+          const r = await history.serialization.importPack(counted);
+          streamed = chunks > 1;
+          imported = r.objectsImported;
+          return r;
+        },
       },
+      refStore: createTransportRefStore(history.refs),
     });
 
-    expect(result.packData.length).toBe(0);
-    expect(result.bytesReceived).toBeGreaterThan(0);
+    expect(streamed).toBe(true);
+    expect(result.packBytes).toBeGreaterThan(0);
     expect(imported).toBe(ids.length);
     for (const id of ids) expect(await history.objects?.has(id)).toBe(true);
     const head = git(work, ["rev-parse", "main"]).toString().trim();

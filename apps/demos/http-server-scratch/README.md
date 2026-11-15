@@ -21,7 +21,7 @@ src/
 ```
 
 ```
-            HTTP client (VCS transport clone/push, or native git)
+            HTTP client (VCS transport fetch/push, or native git)
                                   |
      GET  /<repo>/info/refs?service=git-upload-pack | git-receive-pack
      POST /<repo>/git-upload-pack
@@ -54,7 +54,7 @@ The `@statewalker/vcs-*` workspace packages resolve to their built `dist/`, so b
 
    1. Create `repos/remote.git` and store a blob, tree and commit with `history.blobs/trees/commits.store()`.
    2. Start the server on the port.
-   3. `clone()` from `http://localhost:<port>/remote.git`, import the pack as loose objects with `DefaultSerializationApi.importPack()`, set refs, write the files.
+   3. `fetch()` from `http://localhost:<port>/remote.git` into a new repository (the pack is imported as loose objects as it arrives, branches land under `refs/remotes/origin/`), create the local branch and HEAD, write the files.
    4. Open the clone with `createGitFilesBackend()` and verify it through the library: walk and re-hash every object reachable from the refs (like `git fsck --full`, but unreachable objects are not visited), compare the working tree with the HEAD tree (`git status`), print the latest commit (`git log -1`).
    5. Write `DEMO.md` as a new blob and tree.
    6. Commit it on `feature-branch`.
@@ -114,14 +114,19 @@ app.all("/*", (c) => gitHandler(c.req.raw));
 ### Cloning via HTTP
 
 ```typescript
-import { clone } from "@statewalker/vcs-transport";
+import { createRepositoryFacade, createTransportRefStore, fetch } from "@statewalker/vcs-transport";
 
-const result = await clone({
+const history = await createFileHistory({ files, gitDir: ".git", create: true });
+const result = await fetch({
   url: "http://localhost:8080/remote.git",
-  onProgressMessage: (msg) => console.log(msg),
+  repository: createRepositoryFacade({ history }), // the pack is imported as it arrives
+  refStore: createTransportRefStore(history.refs), // tracking refs are written here
+  refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+  tags: "all",
+  onProgress: (msg) => console.log(msg),
 });
-console.log(result.bytesReceived, result.defaultBranch, result.refs.size);
-// result.packData holds the pack; result.defaultBranch is a full ref name ("refs/heads/main")
+console.log(result.packBytes, result.defaultBranch, result.refUpdates.map((u) => u.summary));
+// result.defaultBranch is a full ref name ("refs/heads/main")
 ```
 
 ### Pushing
@@ -160,7 +165,6 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 - **Run through `pnpm --filter`, the working directory is the app folder,** so `repos/` and `cloned-repo/` are created in `apps/demos/http-server-scratch/` (`repos/` is in `.gitignore`).
 - **Step 4 reports the working tree as `(clean)`, but native `git status` in the clone shows `D  README.md` and `?? README.md`.** The library check compares the files with the HEAD tree. The demo writes no index, so native git sees the file as deleted from the index and untracked on disk.
 - **Repositories served by `server` must hold loose objects.** A repository whose objects are packed (for example after `git gc`) cannot be read by its loose-only store (`createGitFilesBackend` reads packs through `withPacks`).
-- **`client` does not produce a usable clone.** It treats `defaultBranch` as a short name, so it writes `HEAD` as `ref: refs/heads/refs/heads/main`, finds no HEAD commit, prints `Empty repository - no checkout needed` and still reports `SUCCESS!`. It writes the received pack as `.pack`/`.idx`, which the loose-object store cannot read. With `--push` it fails with `Error: Cannot push to empty repository`. Native `git clone` against `server` works.
 
 ## Reference
 
@@ -187,4 +191,4 @@ if (!result.ok) console.error(result.unpackStatus, result.updates);
 
 ### Dependencies
 
-`@statewalker/vcs-transport` (`createFetchHandler`, `clone`, `push`), `@statewalker/vcs-transport-adapters` (`createVcsRepositoryFacade`), `@statewalker/vcs-core` (object API, `DefaultSerializationApi`), `@statewalker/vcs-store-files` (`filesStagingStore`, `createFileRefStore`), `@statewalker/vcs-utils` and `@statewalker/vcs-utils-node` (compression, Node `FilesApi`), `hono` and `@hono/node-server` (HTTP).
+`@statewalker/vcs-transport` (`createFetchHandler`, `fetch`, `push`), `@statewalker/vcs-transport-adapters` (`createVcsRepositoryFacade`), `@statewalker/vcs-core` (object API, `DefaultSerializationApi`), `@statewalker/vcs-store-files` (`filesStagingStore`, `createFileRefStore`), `@statewalker/vcs-utils` and `@statewalker/vcs-utils-node` (compression, Node `FilesApi`), `hono` and `@hono/node-server` (HTTP).

@@ -42,6 +42,18 @@ export interface RefStore {
   listAll(): Promise<Iterable<[string, string]>>;
 
   /**
+   * The repository's shallow commits (git's `shallow` file); empty for a complete repository.
+   * A fetch sends them to the server (`shallow <id>`). Without it the repository is complete.
+   */
+  getShallow?(): Promise<string[]>;
+
+  /**
+   * Replaces the shallow commits (a fetch writes the server's `shallow`/`unshallow` answer).
+   * Without it a shallow fetch is refused.
+   */
+  setShallow?(oids: string[]): Promise<void>;
+
+  /**
    * Gets the target of a symbolic ref.
    * Optional method for Protocol V2 ls-refs.
    *

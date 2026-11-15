@@ -2,7 +2,7 @@
 
 ## What it is
 
-Git transport protocol (wire protocol v1 and v2) built on finite state machines. It provides fetch, push, clone and ls-remote over smart HTTP, and fetch/push/serve over any bidirectional byte stream (MessagePort, `@statewalker/webrun-streams` channels, or your own). It uses Web platform APIs only (`fetch`, `Request`/`Response`, `MessagePort`, async iterables), so it runs in browsers, workers and Node.
+Git transport protocol (wire protocol v1 and v2) built on finite state machines. It provides fetch, push and ls-remote over smart HTTP, and fetch/push/serve over any bidirectional byte stream (MessagePort, `@statewalker/webrun-streams` channels, or your own). It uses Web platform APIs only (`fetch`, `Request`/`Response`, `MessagePort`, async iterables), so it runs in browsers, workers and Node.
 
 ## Why it exists: Git sync without a git binary or a socket
 
@@ -14,9 +14,9 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for the design and [src/README.md](./sr
 
 The package has three layers:
 
-1. **HTTP operations**: `fetch`, `push`, `clone`, `lsRemote` (smart-HTTP client).
-2. **Duplex operations**: `fetchOverDuplex`, `fetchV2OverDuplex`, `pushOverDuplex`, `serveOverDuplex`, `p2pSync` (any `Duplex`).
-3. **FSM primitives**: the `Fsm` engine and the client/server transition and handler tables.
+1. **HTTP operations**: `fetch`, `push`, `lsRemote` (smart-HTTP client).
+2. **Duplex operations**: `fetchOverDuplex`, `pushOverDuplex`, `serveOverDuplex`, `p2pSync` (any `Duplex`).
+3. **Fetch client and FSM primitives**: the fetch client (`fetchFromConnection`, `fetchPack`, `Negotiator`, the HTTP and duplex connections) and the `Fsm` engine with the server and push transition and handler tables.
 
 ### Install
 
@@ -34,7 +34,7 @@ To get a `RepositoryFacade` and `RefStore` for a VCS store, use [`@statewalker/v
 |-------------|----------|
 | `@statewalker/vcs-transport` | Everything: operations, adapters, API interfaces, context, factories, FSMs, protocol, utils |
 | `@statewalker/vcs-transport/protocol` | Wire format only: pkt-line codec, sideband, capabilities, ACK/NAK, report-status, request parser, constants, errors, protocol types |
-| `@statewalker/vcs-transport/operations` | Operations only: `fetch`, `push`, `clone`, `lsRemote`, `fetchOverDuplex`, `fetchV2OverDuplex`, `pushOverDuplex`, `serveOverDuplex`, `p2pSync` |
+| `@statewalker/vcs-transport/operations` | Operations only: `fetch`, `push`, `lsRemote`, `fetchOverDuplex`, `pushOverDuplex`, `serveOverDuplex`, `p2pSync` |
 
 All entry points are ESM with type declarations.
 
@@ -44,12 +44,10 @@ All entry points are ESM with type declarations.
 
 | Function | Transport | Result |
 |----------|-----------|--------|
-| `fetch(options)` | HTTP | `HttpFetchResult`: `refs`, `packData`, `defaultBranch`, `bytesReceived`, `isEmpty` |
-| `clone(options)` | HTTP | `CloneResult` (same shape as `HttpFetchResult`) |
+| `fetch(options)` | HTTP | `FetchClientResult`: `protocolVersion`, `remoteRefs`, `defaultBranch`, `isEmpty`, `refUpdates`, `followedTags`, `shallow`, `imports`, `packObjects`, `packBytes`, `stats` (throws on failure) |
 | `push(options)` | HTTP | `HttpPushResult`: `ok`, `updates`, `unpackStatus`, `bytesSent`, `objectCount` |
 | `lsRemote(url, options?)` | HTTP | `Map<refName, oidHex>` |
-| `fetchOverDuplex(options)` | Duplex | `FetchResult` |
-| `fetchV2OverDuplex(options)` | Duplex | `FetchResult` (protocol v2; adds `refPrefixes`, `peel`, `symrefs`) |
+| `fetchOverDuplex(options)` | Duplex | `FetchResult`: `success`, `error`, `updatedRefs`, `objectsImported`, `report` (the `FetchClientResult`); v2 or v0, as the server speaks |
 | `pushOverDuplex(options)` | Duplex | `PushResult` |
 | `serveOverDuplex(options)` | Duplex | `ServeResult` |
 | `p2pSync(options)` | Duplex | `P2PSyncResult` |
@@ -60,8 +58,8 @@ All entry points are ESM with type declarations.
 |-----------|-------------|
 | `Duplex` | Async-iterable byte stream with `write(data)` and optional `close()` |
 | `RepositoryFacade` | `importPack`, `exportPack`, `has`, `walkAncestors`, optional reachability helpers |
-| `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip`, `batch` |
-| `createTransportRefStore(refs)` | the `RefStore` over a vcs-core `Refs`, with `batch` |
+| `RefStore` | `get`, `update`, `listAll`, optional `getSymrefTarget`, `isRefTip`, `batch`, `getShallow`/`setShallow` (git's shallow file) |
+| `createTransportRefStore(refs)` | the `RefStore` over a vcs-core `Refs`, with `batch` and the shallow file |
 | `TransportApi` | Pkt-line, sideband and pack I/O over a `Duplex` |
 | `Credentials` | `{ username?, password?, token? }`. The HTTP operations send Basic auth: `token` as the password (username defaults to `x-access-token`), otherwise `username`/`password`. |
 
@@ -72,14 +70,14 @@ All entry points are ESM with type declarations.
 | `createMessagePortDuplex`, `messagePortFetch`, `messagePortServe` | MessagePort transport |
 | `webrunClientDuplex`, `serveRepoOverWebrun` | Git protocol over a webrun-streams `Duplex` |
 | `serveGitOverWebrunHttp`, `webrunHttpFetch` | Smart HTTP over a webrun-streams `Duplex` |
-| `httpFetch`, `httpPush`, `createSimpleDuplex` | Low-level HTTP client helpers |
+| `httpPush`, `createSimpleDuplex` | Low-level HTTP client helpers |
 | `createFetchHandler`, `createHttpHandler`, `createGitHttpServer` | Smart-HTTP server |
 
 #### Factories
 
 | Function | Description |
 |----------|-------------|
-| `createRepositoryFacade({ history })` | `RepositoryFacade` from a `HistoryWithOperations` (`@statewalker/vcs-core`) |
+| `createRepositoryFacade({ history })` | `RepositoryFacade` from a `History` (`@statewalker/vcs-core`); its own `serialization` when it is a `HistoryWithOperations`, a `DefaultSerializationApi` otherwise |
 | `createTransportApi(duplex, state)` | `TransportApi` from a `Duplex` and a `ProtocolState` |
 
 #### FSM
@@ -87,11 +85,9 @@ All entry points are ESM with type declarations.
 | Export | Description |
 |--------|-------------|
 | `Fsm`, `FsmError` | Engine: `new Fsm(transitions, handlers)`, `fsm.run(context, ...stopStates)` |
-| `clientFetchTransitions` / `clientFetchHandlers` | Client fetch (v1) |
 | `serverFetchTransitions` / `serverFetchHandlers` | Server upload-pack (v1) |
 | `clientPushTransitions` / `clientPushHandlers` | Client push |
 | `serverPushTransitions` / `serverPushHandlers` | Server receive-pack |
-| `clientV2Transitions` / `clientV2Handlers` | Protocol v2 client |
 | `serverV2Transitions` / `serverV2Handlers` | Protocol v2 server |
 | `errorRecoveryTransitions` / `errorRecoveryHandlers`, `withErrorRecovery`, `withErrorRecoveryHandlers`, `classifyError` | Error recovery |
 | `ProtocolState`, `HandlerOutput`, `ProcessConfiguration`, `ProcessContext` | FSM context |
@@ -114,37 +110,36 @@ Protocol constants (`PKT_FLUSH`, `CAPABILITY_*`, `ZERO_OID`, `SERVICE_UPLOAD_PAC
 
 ## Examples
 
-### HTTP: list refs, fetch, clone
+### Fetch: one client, git's fetch-pack
 
-The HTTP operations do not write to a repository. `fetch` and `clone` return the remote refs (binary OIDs). Give them `onPack` and the pack is handed to you as it arrives, demultiplexed from the response body, so it can flow straight into vcs-core's `importPack` without ever being held whole; without `onPack` it is collected into `packData`.
+`fetch` (smart HTTP) and `fetchOverDuplex` (any duplex) run the same client, the one vcs-commands' `FetchCommand` and `CloneCommand` use. It writes into a repository: the pack goes into `repository.importPack` as it arrives (never held whole), the refs into `refStore`.
 
 ```typescript
-import { clone, fetch, lsRemote } from "@statewalker/vcs-transport";
+import { createRepositoryFacade, createTransportRefStore, fetch, lsRemote } from "@statewalker/vcs-transport";
 
 const refs = await lsRemote("https://example.com/user/repo.git");
-for (const [name, oid] of refs) console.log(name, oid);
 
-const fetched = await fetch({
+const result = await fetch({
   url: "https://example.com/user/repo.git",
+  auth: { token: "…" },
+  repository: createRepositoryFacade({ history }),
+  refStore: createTransportRefStore(history.refs),
   refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
-  auth: { username: "user", password: "secret" },
 });
-console.log(fetched.defaultBranch, fetched.bytesReceived, fetched.packData.length);
-
-// stream the pack into a repository instead of collecting it
-await fetch({
-  url: "https://example.com/user/repo.git",
-  onPack: (pack) => history.serialization.importPack(pack).then(() => {}),
-});
-
-const cloned = await clone({ url: "https://example.com/user/repo.git", depth: 1 });
+for (const u of result.refUpdates) console.log(u.summary, u.localRef); // [new branch] refs/remotes/origin/main
 ```
 
-Common HTTP options (`BaseHttpOptions`): `url`, `auth` (`{ username, password }` or `{ token }`), `headers`, `timeout` (ms), and `fetchImpl` (a `(Request) => Promise<Response>` used instead of `globalThis.fetch`). `fetch` also accepts `depth`, `localHas`, `localCommits`, `onProgress`, `onProgressMessage` and `onPack`. `clone` accepts `branch`, `depth`, `onProgress`, `onProgressMessage` and `onPack`.
+What it does, as git does it:
 
-`fetch` sends wants, so it fails unless a pack comes back (git sends an empty pack, 32 bytes, when every wanted object is already present): a caller never writes refs to objects it did not receive. `httpFetch` and the fetch state machine refuse a missing pack the same way. When the import (or anything after the request) fails, the response body is cancelled. `timeout` bounds each wait for the server, a response or the next chunk of a body, not the whole fetch: the time `onPack` spends storing a large pack does not count, while a server that stops sending is still cut off.
+- **Protocol.** HTTP asks for v2 (`Git-Protocol: version=2`): `ls-refs` (`ref-prefix` from the refspecs, `symrefs`, `peel`, `unborn`), then stateless `fetch` rounds. A server that answers the v0 advertisement gets v0 (`protocolVersion: 0` forces it). Over a duplex the server speaks first and the client follows (`version 2` or a v0 advertisement).
+- **Negotiation** (`Negotiator`, git's default negotiator): local ref tips are walked newest commit first; haves go in batches (16, then doubling; on a stateful v0 connection +32 past 32); an `ACK` makes the commit and its ancestors common (they are never offered); `done` when nothing is left, when the server is `ready`, or after 256 haves without a new common commit once one was found. Stateless requests repeat the wants and the common commits. Remote tips already here are offered once (git's known-common). An incremental fetch therefore downloads only the new objects.
+- **Shallow.** `refStore.getShallow()` is sent (`shallow <id>`); `depth`, `deepenRelative`, `deepenSince`, `deepenNot` and `unshallow` ask for a cut; the server's `shallow`/`unshallow` answer is written with `refStore.setShallow()` once the pack is in. A store without `setShallow` refuses shallow fetches.
+- **Tags** (`tags`: `auto` default, `all`, `none`). `auto` asks for `include-tag` and creates the remote tags whose objects are here; tags of fetched objects whose tag objects did not come (a server that ignores `include-tag`, like ours) are fetched in a second request.
+- **Refs.** Each update is `new`, `up-to-date`, `fast-forward`, `forced` (a `+` refspec, or `force`) or `rejected` (`non-fast-forward`, `would clobber existing tag`, or the ref store's refusal), with git's summary (`[new branch]`, `abc1234..def5678`, `+ abc1234...def5678`, `[rejected]`). Each ref is written in its own `refStore.batch` transaction with its old value checked (`atomic`: one for all); a rejected ref does not stop the others. `dryRun` negotiates and reads the pack but stores nothing.
 
-The same demultiplexer is exported as `sidebandPackStream(body, { onProgress })`: it yields the channel-1 bytes of an upload-pack response as they arrive, skips the NAK, ACK and shallow lines and the flush packets, and throws `ServerError` on channel 3 and on an `ERR <message>` line. `httpFetch` and the fetch state machine import the pack this way too. The fetch request bodies (wants and haves) are still built in memory: they are small. A push streams its body (see below).
+`fetch` throws on transport and protocol errors (HTTP status, `ERR`, a missing pack: wants were sent, so a pack must follow, an empty one when everything is here). `timeout` bounds each wait for the server, not the whole fetch. `fetchOverDuplex` never throws: it returns `success: false` with the error, or `success: true` with `updatedRefs`, `objectsImported` and the full `report`.
+
+The pieces are exported for other transports: `openHttpConnection`, `openDuplexConnection` (an `UploadPackConnection`), `fetchFromConnection` (the whole fetch), `fetchPack` (negotiation and pack), `lsRefs`, `mapRefs`, `planRefUpdates`, `applyRefUpdates`, `PktStream`, `readSidebandPack`. `sidebandPackStream(body, { onProgress })` demultiplexes a whole upload-pack response body.
 
 ### HTTP: push
 
@@ -287,10 +282,10 @@ The transport never touches storage directly. It needs only a `RepositoryFacade`
 ### Constraints
 
 - **Receiving a push** (receive-pack), names must be valid refs under `refs/` (anything else, `HEAD` included, gets `ng <ref> funny refname`, as from git). A `RefStore` with `batch` gets git's ref transaction: an `atomic` push is one batch, so every ref changes or none does, and when any ref is refused every ref gets `ng <ref> atomic transaction failed` (`atomic push failure` when validation or a hook already rejected one); a plain push is one batch per ref. Each update checks the old id the client sent, so a ref that moved since the advertisement is refused (`ng <ref> failed to update ref`) instead of overwritten. A store whose batch answers `unsupported` for several refs, and a `RefStore` without `batch`, keep the older path: one `update` per ref, no old-value check, and a best-effort rollback for `atomic`.
-- HTTP `fetch` and `clone` return raw pack bytes and binary OIDs; they do not import anything. The duplex operations do import into the given `RepositoryFacade` and update the `RefStore`.
-- HTTP `fetch`, `push`, `clone` and `lsRemote` send Basic auth. With `auth.token`, the token is the password and the username is `auth.username`, defaulting to `x-access-token` (GitHub and GitLab accept any username with a token; Bitbucket expects `x-token-auth`, passed as `username`). Without a token they use `auth.username` and `auth.password`.
-- `clone` accepts `bare` and `remoteName` in its options type but does not use them.
-- `fetchOverDuplex` resolves `localHead` (default `refs/heads/main`) to pick negotiation haves and sends at most `maxHaves` (default 256).
+- `fetch` and `fetchOverDuplex` import into the given `RepositoryFacade` and update the `RefStore`; a clone is a fetch into an empty repository (`CloneCommand` in vcs-commands adds the local branch, HEAD and checkout).
+- HTTP `fetch`, `push` and `lsRemote` send Basic auth. With `auth.token`, the token is the password and the username is `auth.username`, defaulting to `x-access-token` (GitHub and GitLab accept any username with a token; Bitbucket expects `x-token-auth`, passed as `username`). Without a token they use `auth.username` and `auth.password`.
+- The fetch client's give-up rule counts haves "in vain" from the last newly acknowledged commit, for v2 as for v0 (git's v2 client resets the count on any `ACK`, re-sent commons included, so against a server that is never `ready` it would offer every have).
+- A v0 fetch over a duplex cannot follow tags in a second request (upload-pack ends the session after the pack); `include-tag` still brings the tags of the objects sent when the server honours it.
 - Pkt-lines are limited to 65520 bytes (`MAX_PACKET_SIZE`). Larger packets fail with `Packet too large: <n> bytes (max 65520)`.
 - `pktLineReader` and `parsePacket` return the three special packets typed: `0000` as `flush`, `0001` as `delim`, and `0002` as `response-end` (protocol v2's end of a stateless response; this packet type was named `end` before). `demuxSideband` and `parseReportStatus` stop at `response-end` as at a flush. `TransportApi.readPktLine` rejects `0002` with `Unexpected response-end packet (0002)`: none of the exchanges it drives uses it.
 - The readers keep received bytes as a queue of chunks and copy each byte once, so a packet that arrives in many small chunks is read in linear time: `pktLineReader`, `TransportApi.readPktLine` and `readGitProtocolRequest`.

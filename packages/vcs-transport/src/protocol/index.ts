@@ -1,5 +1,6 @@
 export * from "./ack-nak.js";
 export * from "./capabilities.js";
+export * from "./chunk-queue.js";
 export * from "./constants.js";
 export * from "./errors.js";
 export * from "./git-request-parser.js";

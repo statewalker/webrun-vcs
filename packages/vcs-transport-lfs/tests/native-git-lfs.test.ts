@@ -134,7 +134,8 @@ describe.runIf(!hasGitLfs && !!process.env.CI)("native git-lfs on CI", () => {
   });
 });
 
-describe.skipIf(!hasGitLfs)("native git-lfs", () => {
+// each test spawns git and git-lfs several times: generous per-test time under a loaded CI
+describe.skipIf(!hasGitLfs)("native git-lfs", { timeout: 60_000 }, () => {
   it("parsePointer agrees with the installed git-lfs on all 48 cases", async () => {
     const { env } = await lfsHome();
     const d = tmp();

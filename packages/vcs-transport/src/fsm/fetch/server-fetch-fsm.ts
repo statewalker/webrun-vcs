@@ -27,6 +27,7 @@ import {
   findUnreachableWant,
   okToGiveUp as graphOkToGiveUp,
   notOurRef,
+  peelFully,
   resolveDeepenNot,
   UploadPackRequestError,
 } from "./upload-pack-graph.js";
@@ -203,6 +204,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         for (const [name, oid] of refsArray) {
           const line = first ? `${oid} ${name}\0${capabilities.join(" ")}` : `${oid} ${name}`;
           await transport.writeLine(line);
+          // annotated tags are followed by their peeled line, as git advertises them
+          const peeled = await peelFully(repository, oid);
+          if (peeled) await transport.writeLine(`${peeled} ${name}^{}`);
           state.refs.set(name, oid);
           first = false;
         }

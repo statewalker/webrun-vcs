@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { httpFetch, httpPush } from "@statewalker/vcs-transport";
+import { httpPush, fetch as transportFetch } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { type GiteaServer, startGitea } from "../src/index.js";
 import {
@@ -51,38 +51,43 @@ describeGitea("Gitea oracle · G1 git over smart HTTP", () => {
 
     const ours = await ourRepo();
     try {
+      const local = { repository: ours.facade, refStore: ours.refStore };
       // a private repository: no credentials, no refs
-      const anonymous = await httpFetch(repo.cloneUrl, ours.facade, ours.refStore);
-      expect(anonymous.success).toBe(false);
-      expect(anonymous.error).toMatch(/\b401\b/);
+      await expect(transportFetch({ url: repo.cloneUrl, ...local })).rejects.toThrow(/\b401\b/);
+      expect(await ours.refStore.get("refs/heads/main")).toBeUndefined();
 
-      const first = await httpFetch(repo.cloneUrl, ours.facade, ours.refStore, {
-        fetchFn: gitea.fetch,
-      });
-      expect(first.success, first.error).toBe(true);
+      // every branch and tag under its own name (the transport's default refspecs)
+      const first = await transportFetch({ url: repo.cloneUrl, fetchImpl: gitea.fetch, ...local });
+      expect(first.refUpdates.every((u) => u.status === "new")).toBe(true);
       const tip = nativeGit(env, work, ["rev-parse", "HEAD"]).trim();
       expect(await ours.refStore.get("refs/heads/main")).toBe(tip);
       expect(await ours.refStore.get("refs/tags/v1")).toBe(
         nativeGit(env, work, ["rev-parse", "refs/tags/v1"]).trim(),
       );
       expect(await ourCommits(ours, tip)).toEqual(nativeCommits(env, work));
-      const firstImported = first.objectsImported ?? 0;
-      expect(firstImported).toBeGreaterThan(0);
+      const firstObjects = first.packObjects;
+      expect(firstObjects).toBeGreaterThan(0);
 
       writeFileSync(join(work, "f4.txt"), "file 4\n");
       nativeGit(env, work, ["add", "-A"]);
       nativeGit(env, work, ["commit", "-q", "-m", "c4"]);
       nativeGit(env, work, ["push", "-q", repo.authenticatedUrl, "main"]);
-      const second = await httpFetch(repo.cloneUrl, ours.facade, ours.refStore, {
-        fetchFn: gitea.fetch,
-        localHead: "refs/heads/main",
-      });
-      expect(second.success, second.error).toBe(true);
+      const second = await transportFetch({ url: repo.cloneUrl, fetchImpl: gitea.fetch, ...local });
       const tip2 = nativeGit(env, work, ["rev-parse", "HEAD"]).trim();
       expect(await ours.refStore.get("refs/heads/main")).toBe(tip2);
       expect(await ourCommits(ours, tip2)).toEqual(nativeCommits(env, work));
-      // incremental: one commit, its tree and its new blob, not the whole history again
-      expect(second.objectsImported ?? 0).toBeLessThan(firstImported);
+      expect(second.refUpdates.find((u) => u.localRef === "refs/heads/main")?.status).toBe(
+        "fast-forward",
+      );
+      // incremental: haves were sent, and the pack holds the new commit, its tree and its new
+      // blob only (git rev-list --objects old..new), not the whole history again
+      expect(second.stats.haves).toBeGreaterThan(0);
+      expect(second.packObjects).toBe(
+        nativeGit(env, work, ["rev-list", "--objects", `${tip}..${tip2}`])
+          .trim()
+          .split("\n").length,
+      );
+      expect(second.packObjects).toBeLessThan(firstObjects);
     } finally {
       await ours.close();
     }

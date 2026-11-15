@@ -14,9 +14,13 @@
  * - Pushing changes back to the server
  */
 
-import { FileMode, type FilesApi, installPack, joinPath } from "@statewalker/vcs-core";
-import { clone, push } from "@statewalker/vcs-transport";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { FileMode, type FilesApi, joinPath } from "@statewalker/vcs-core";
+import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  push,
+  fetch as transportFetch,
+} from "@statewalker/vcs-transport";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
@@ -24,7 +28,6 @@ import {
   createAuthor,
   createFileHistory,
   ensureDirectory,
-  ensureDirFiles,
   exportPack,
   type FileHistory,
   getHead,
@@ -132,58 +135,33 @@ async function cloneRepository(
   await emptyDirectory(localDir);
   await ensureDirectory(files, ".git");
 
-  // Perform clone
-  const cloneResult = await clone({
+  // Create local repository
+  const history = await createFileHistory({ files, gitDir: ".git", create: true });
+
+  // Clone: a fetch into the empty repository (the pack is imported as it arrives)
+  const result = await transportFetch({
     url,
-    onProgressMessage: (msg) => {
-      if (msg.trim()) {
-        printInfo(`  ${msg.trim()}`);
-      }
+    repository: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+    refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    tags: "all",
+    onProgress: (msg) => {
+      if (msg) printInfo(`  ${msg}`);
     },
   });
 
-  printInfo(`Received ${cloneResult.bytesReceived} bytes`);
-  printInfo(`Default branch: ${cloneResult.defaultBranch}`);
-  printInfo(`Refs received: ${cloneResult.refs.size}`);
-
-  // Create local repository
-  const history = await createFileHistory({
-    files,
-    gitDir: ".git",
-    create: true,
-    defaultBranch: cloneResult.defaultBranch,
-  });
-
-  // Process pack data
-  if (cloneResult.packData.length > 0) {
-    printInfo("Processing pack data...");
-
-    const packDir = ".git/objects/pack";
-    await ensureDirFiles(files, packDir);
-    // index-pack: checks the pack, writes pack-<id>.pack, then its .idx
-    const packData = cloneResult.packData;
-    const installed = await installPack(
-      files,
-      packDir,
-      (async function* () {
-        yield packData;
-      })(),
-    );
-    printInfo(`Pack contains ${installed.count} objects`);
-  }
-
-  // Set up refs
-  for (const [refName, objectId] of cloneResult.refs) {
-    await history.refs.set(refName, bytesToHex(objectId));
-  }
+  const defaultBranch = (result.defaultBranch ?? "refs/heads/main").replace(/^refs\/heads\//, "");
+  printInfo(`Received ${result.packBytes} bytes (${result.packObjects} objects)`);
+  printInfo(`Default branch: ${defaultBranch}`);
+  for (const update of result.refUpdates) printInfo(`  ${update.summary} ${update.localRef}`);
 
   // Set up local main branch
-  const mainRef = cloneResult.refs.get(`refs/remotes/origin/${cloneResult.defaultBranch}`);
-  if (mainRef) {
-    await history.refs.set(`refs/heads/${cloneResult.defaultBranch}`, bytesToHex(mainRef));
+  const tracking = await history.refs.resolve(`refs/remotes/origin/${defaultBranch}`);
+  if (tracking?.objectId) {
+    await history.refs.set(`refs/heads/${defaultBranch}`, tracking.objectId);
   }
 
-  await history.refs.setSymbolic("HEAD", `refs/heads/${cloneResult.defaultBranch}`);
+  await history.refs.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
   // Checkout working tree
   await checkoutHead(history, files);

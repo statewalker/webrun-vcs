@@ -41,16 +41,6 @@ export interface BaseDuplexOptions {
 }
 
 /**
- * Common fetch options shared across transports.
- */
-export interface BaseFetchOptions {
-  /** Refspecs to fetch */
-  refspecs?: string[];
-  /** Shallow clone depth */
-  depth?: number;
-}
-
-/**
  * Common push options shared across transports.
  */
 export interface BasePushOptions {

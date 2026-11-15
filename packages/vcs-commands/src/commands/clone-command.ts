@@ -1,20 +1,15 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 import {
-  type CloneOptions as TransportCloneOptions,
-  clone as transportClone,
+  createRepositoryFacade,
+  createTransportRefStore,
+  fetch as transportFetch,
 } from "@statewalker/vcs-transport";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
-import { importPackIntoHistory } from "../pack-import/index.js";
 import type { CloneResult } from "../results/clone-result.js";
-import {
-  type FetchResult,
-  RefUpdateStatus,
-  type TrackingRefUpdate,
-} from "../results/fetch-result.js";
+import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
-import { TagOption } from "./fetch-command.js";
+import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 
 /**
  * Clone a remote repository.
@@ -332,90 +327,76 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     }
 
     // Determine clone branch strategy
-    const branchToClone = this.determineBranchToClone();
+    const branchToClone = toBranchName(this.determineBranchToClone());
+    const history = this._workingCopy.history;
 
-    // Execute clone via transport
-    const options: TransportCloneOptions = {
+    // git clone's refspecs: tracking refs, local heads (bare), every ref (mirror)
+    let refspecs: string[];
+    if (this.mirror) {
+      refspecs = ["+refs/*:refs/*"];
+    } else if (this.bare) {
+      refspecs = [`+refs/heads/${branchToClone ?? "*"}:refs/heads/${branchToClone ?? "*"}`];
+    } else {
+      const remote = `refs/remotes/${this.remoteName}`;
+      refspecs = [`+refs/heads/${branchToClone ?? "*"}:${remote}/${branchToClone ?? "*"}`];
+    }
+    // git clone takes every tag, unless one branch is cloned (then tags follow) or --no-tags
+    const tags =
+      this.tagOption === TagOption.AUTO_FOLLOW && !branchToClone && !this.mirror
+        ? "all"
+        : toTagMode(this.tagOption);
+
+    const result = await transportFetch({
       url: this.uri,
-      branch: branchToClone,
-      depth: this.depth,
-      bare: this.bare,
-      remoteName: this.remoteName,
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
-      onProgress: this.progressCallback,
-      onProgressMessage: this.progressMessageCallback,
-      // the pack flows from the response into the object store as it arrives
-      onPack: (pack) => this.storePack(pack),
-    };
-
-    const transportResult = await transportClone(options);
-
-    // Update refs based on clone mode
-    const trackingUpdates: TrackingRefUpdate[] = [];
-    for (const [refName, objectId] of transportResult.refs) {
-      const objectIdHex = bytesToHex(objectId);
-
-      // Filter refs based on tag option
-      if (this.shouldSkipRef(refName)) {
-        continue;
-      }
-
-      // For mirror mode, refs are stored directly without remotes prefix
-      const localRefName = this.mirror ? this.toMirrorRefName(refName) : refName;
-
-      await this.refsStore.set(localRefName, objectIdHex);
-      trackingUpdates.push({
-        localRef: localRefName,
-        remoteRef: refName,
-        newObjectId: objectIdHex,
-        status: RefUpdateStatus.NEW,
-      });
-    }
+      repository: createRepositoryFacade({ history }),
+      refStore: createTransportRefStore(history.refs),
+      refspecs,
+      tags,
+      depth: this.depth,
+      deepenSince: this.shallowSince,
+      deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
+      onProgress: this.progressMessageCallback,
+      reflogMessage: `clone: from ${this.uri}`,
+    });
+    const trackingUpdates: TrackingRefUpdate[] = result.refUpdates.map(toTrackingRefUpdate);
 
     // Set up HEAD and default branch.
     //
     // Two forms, deliberately kept apart: the advertised form goes out on
     // FetchResult unchanged (it is what the remote said), while the ref work
     // below and CloneResult use the bare branch name.
-    const advertisedDefaultBranch = transportResult.defaultBranch;
-    const defaultBranch = toBranchName(advertisedDefaultBranch);
+    const advertisedDefaultBranch = result.defaultBranch;
+    const defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
     let headCommit: ObjectId | undefined;
 
     if (defaultBranch && !this.bare) {
-      // Create local branch from the tip the clone just wrote. Look under the
-      // remote-tracking name first, then under the local branch name: the ref
-      // loop above stores each ref under its advertised name, so which of the
-      // two exists depends on the refspec the remote advertised through.
+      // The local branch starts at the tracking ref the clone just wrote
       const localRef = `refs/heads/${defaultBranch}`;
-      const tip =
-        (await this.refsStore.resolve(`refs/remotes/${this.remoteName}/${defaultBranch}`)) ??
-        (await this.refsStore.resolve(localRef));
-
+      const tip = await this.refsStore.resolve(`refs/remotes/${this.remoteName}/${defaultBranch}`);
       if (tip?.objectId) {
         await this.refsStore.set(localRef, tip.objectId);
         headCommit = tip.objectId;
-
-        // Set HEAD to point to local branch
-        await this.refsStore.setSymbolic("HEAD", localRef);
-
-        // Set up staging area from HEAD tree
         if (!this.noCheckout) {
           await this.checkoutHead(tip.objectId);
         }
       }
+      // HEAD names the default branch, born or not (an empty remote's unborn HEAD)
+      await this.refsStore.setSymbolic("HEAD", localRef);
     } else if (this.bare || this.mirror) {
       // For bare/mirror repos, HEAD points to default branch
       if (defaultBranch) {
         await this.refsStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
+        headCommit = (await this.refsStore.resolve("HEAD"))?.objectId;
       }
     }
 
     // Build fetch result
     const advertisedRefs = new Map<string, ObjectId>();
-    for (const [refName, objectId] of transportResult.refs) {
-      advertisedRefs.set(refName, bytesToHex(objectId));
+    for (const ref of result.remoteRefs) {
+      if (ref.oid) advertisedRefs.set(ref.name, ref.oid);
     }
 
     const fetchResult: FetchResult = {
@@ -423,8 +404,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       advertisedRefs,
       trackingRefUpdates: trackingUpdates,
       defaultBranch: advertisedDefaultBranch,
-      bytesReceived: transportResult.bytesReceived,
-      isEmpty: transportResult.isEmpty,
+      bytesReceived: result.packBytes,
+      isEmpty: result.isEmpty,
       messages: [],
     };
 
@@ -453,49 +434,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
 
     // If specific branches are set, use the first one
     if (this.branchesToClone.length > 0) {
-      // Extract branch name from full ref if provided
-      const first = this.branchesToClone[0];
-      if (first.startsWith("refs/heads/")) {
-        return first.slice("refs/heads/".length);
-      }
-      return first;
+      return this.branchesToClone[0];
     }
 
     return undefined;
-  }
-
-  /**
-   * Check if a ref should be skipped based on tag option.
-   */
-  private shouldSkipRef(refName: string): boolean {
-    // Skip tags if NO_TAGS option is set
-    if (this.tagOption === TagOption.NO_TAGS && refName.startsWith("refs/tags/")) {
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Convert a remote ref name to mirror ref name.
-   */
-  private toMirrorRefName(refName: string): string {
-    // For mirror clones, refs/remotes/origin/* becomes refs/heads/*
-    const remotePrefix = `refs/remotes/${this.remoteName}/`;
-    if (refName.startsWith(remotePrefix)) {
-      return `refs/heads/${refName.slice(remotePrefix.length)}`;
-    }
-    return refName;
-  }
-
-  /**
-   * Store the received pack as it arrives.
-   *
-   * Imports it into the working copy's history (kept as a pack when large and
-   * the history has packs, else unpacked), so the objects the cloned refs
-   * point at are available locally.
-   */
-  private async storePack(pack: AsyncIterable<Uint8Array>): Promise<void> {
-    await importPackIntoHistory(this._workingCopy.history, pack);
   }
 
   /**

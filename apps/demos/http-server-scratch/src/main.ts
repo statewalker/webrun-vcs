@@ -16,9 +16,13 @@
  *      pnpm start -- --port 9000   # Custom port
  */
 
-import { DefaultSerializationApi, FileMode, type FilesApi, joinPath } from "@statewalker/vcs-core";
-import { clone, push } from "@statewalker/vcs-transport";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { FileMode, type FilesApi, joinPath } from "@statewalker/vcs-core";
+import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  push,
+  fetch as transportFetch,
+} from "@statewalker/vcs-transport";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 
 import {
@@ -237,66 +241,43 @@ async function startHttpServer(remoteHistory: FileHistory): Promise<VcsHttpServe
 async function cloneWithVcs(): Promise<void> {
   printInfo(`Cloning from ${REMOTE_URL} using VCS transport`);
 
-  const cloneResult = await clone({
-    url: REMOTE_URL,
-    onProgressMessage: (msg) => {
-      if (msg.trim()) {
-        printInfo(`  ${msg.trim()}`);
-      }
-    },
-  });
-
-  printInfo(`Received ${cloneResult.bytesReceived} bytes`);
-  printInfo(`Default branch: ${cloneResult.defaultBranch}`);
-  printInfo(`Refs received: ${cloneResult.refs.size}`);
-
   await ensureDirectory(workspaceFiles, joinPath(LOCAL_REPO_PATH, ".git"));
 
   const files = createNodeFilesApi({ rootDir: LOCAL_REPO_DIR });
+  const history = await createFileHistory({ files, gitDir: ".git", create: true });
+
+  // Clone: a fetch into the empty repository. The pack is imported as it arrives (into
+  // loose objects: the file-backed object store reads loose objects only), the branches
+  // land under refs/remotes/origin/.
+  const remoteName = "origin";
+  const result = await transportFetch({
+    url: REMOTE_URL,
+    repository: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+    refspecs: [`+refs/heads/*:refs/remotes/${remoteName}/*`],
+    tags: "all",
+    onProgress: (msg) => {
+      if (msg) printInfo(`  ${msg}`);
+    },
+  });
 
   // The transport reports defaultBranch as the full ref that HEAD points to
-  // (e.g. "refs/heads/main", from the server's symref=HEAD capability).
-  // Derive the short branch name for the places that expect one.
-  const defaultBranchName = (cloneResult.defaultBranch ?? "refs/heads/main").replace(
+  // (e.g. "refs/heads/main"). Derive the short branch name for the places that expect one.
+  const defaultBranchName = (result.defaultBranch ?? "refs/heads/main").replace(
     /^refs\/heads\//,
     "",
   );
-
-  const history = await createFileHistory({
-    files,
-    gitDir: ".git",
-    create: true,
-    defaultBranch: defaultBranchName,
-  });
-
-  if (cloneResult.packData.length > 0) {
-    printInfo("Processing received pack data...");
-
-    // Import the received pack into the local object store as loose objects.
-    // The file-backed object store (filesStagingStore) reads loose objects only,
-    // not packfiles, so we explode the pack via the serialization pipeline.
-    // The resulting loose objects are Git-compatible and readable both by the
-    // VCS History API and by native git.
-    const serialization = new DefaultSerializationApi({ history });
-    const importResult = await serialization.importPack(
-      (async function* () {
-        yield cloneResult.packData;
-      })(),
-    );
-
-    printInfo(`Imported ${importResult.objectsImported} objects`);
+  printInfo(
+    `Received ${result.packBytes} bytes, imported ${result.imports[0]?.objectsImported ?? 0} objects`,
+  );
+  printInfo(`Default branch: ${defaultBranchName}`);
+  for (const update of result.refUpdates) {
+    printInfo(`Set ref: ${update.localRef} -> ${shortId(update.newOid)}`);
   }
 
-  const remoteName = "origin";
-  for (const [refName, objectId] of cloneResult.refs) {
-    const localRefName = refName;
-    await history.refs.set(localRefName, bytesToHex(objectId));
-    printInfo(`Set ref: ${localRefName} -> ${shortId(bytesToHex(objectId))}`);
-  }
-
-  const mainRef = cloneResult.refs.get(`refs/remotes/${remoteName}/${defaultBranchName}`);
-  if (mainRef) {
-    await history.refs.set(`refs/heads/${defaultBranchName}`, bytesToHex(mainRef));
+  const tracking = await history.refs.resolve(`refs/remotes/${remoteName}/${defaultBranchName}`);
+  if (tracking?.objectId) {
+    await history.refs.set(`refs/heads/${defaultBranchName}`, tracking.objectId);
   }
 
   await history.refs.setSymbolic("HEAD", `refs/heads/${defaultBranchName}`);

@@ -304,6 +304,8 @@ describe("serveLfs streams uploads and downloads", () => {
     const ptr = await seedObject(store, resolver, bytes);
     const res = await serveLfs(store, resolver)(new Request(`${URL}/objects/${ptr.oid}`));
     expect(res.headers.get("content-length")).toBe(String(bytes.length));
-    expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes);
-  });
+    // compared as bytes: toEqual on 300 KB arrays takes seconds and timed out under load
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(Buffer.from(bytes))).toBe(true);
+  }, 30_000);
 });

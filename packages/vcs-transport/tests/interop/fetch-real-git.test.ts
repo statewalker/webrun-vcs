@@ -116,7 +116,6 @@ describeGit("Interop A · fetch ← real git upload-pack", () => {
           duplex: inc,
           repository: client.facade,
           refStore: client.refStore,
-          localHead: "refs/heads/main",
         });
         expect(result.success, `incremental failed: ${result.error}\n${inc.stderr()}`).toBe(true);
         expect(await client.facade.has(fx.c2)).toBe(true);

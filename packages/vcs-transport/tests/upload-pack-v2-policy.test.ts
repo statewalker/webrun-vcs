@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from "vitest";
 import { createSimpleDuplex } from "../src/adapters/http/http-duplex.js";
-import { fetchV2OverDuplex, serveOverDuplex } from "../src/index.js";
+import { fetchOverDuplex, serveOverDuplex } from "../src/index.js";
 import { encodeDelim, encodeFlush, encodePacketLine } from "../src/protocol/pkt-line-codec.js";
 import { createTransportRepo, type TransportRepo } from "./interop/helpers.js";
 
@@ -224,7 +224,7 @@ describe("protocol v2 upload-pack: negotiation", () => {
     await client.refStore.update("refs/heads/main", k2);
 
     const handlerDuplex = loopback(server);
-    const result = await fetchV2OverDuplex({
+    const result = await fetchOverDuplex({
       duplex: handlerDuplex,
       repository: client.facade,
       refStore: client.refStore,
@@ -330,7 +330,7 @@ describe("protocol v2 upload-pack: shallow", () => {
   it("our v2 client clones with depth 1 and gets one commit", async () => {
     const { repo: server, c3, c4 } = await linearRepo();
     const client = await createTransportRepo();
-    const result = await fetchV2OverDuplex({
+    const result = await fetchOverDuplex({
       duplex: loopback(server),
       repository: client.facade,
       refStore: client.refStore,

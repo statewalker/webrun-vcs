@@ -182,7 +182,6 @@ packages/vcs-commands/src/
 │   ├── push-command.ts
 │   └── ... (31 command modules)
 ├── core-commands/        # Add/Checkout interfaces + impls (not exported)
-├── pack-import/          # Import received packs into History
 ├── remote-config/        # [remote "<name>"] config read/write (internal)
 ├── rename/               # Similarity index for rename detection
 ├── tree-merge/           # Shared three-way tree merge
@@ -426,18 +425,24 @@ Staging.createBuilder()   → Build merged index
 Remote commands delegate to `@statewalker/vcs-transport`:
 
 ```
-FetchCommand
+FetchCommand / CloneCommand
     ↓ calls
 transport.fetch({
   url,               → Remote URL (from setRemote / [remote] config)
-  auth, headers,     → Credentials and custom headers
-  timeout, depth,
-  onProgressMessage, → Raw progress messages
-  onPack,            → The pack as it arrives
+  auth, headers, timeout,
+  repository,        → createRepositoryFacade({ history }): importPack (streamed into
+                       vcs-core importPack), commit graph for negotiation and fast-forwards
+  refStore,          → createTransportRefStore(history.refs): refs, batch, shallow file
+  refspecs, tags,    → which refs land where; auto-follow / all / none
+  depth, deepenSince, deepenNot, unshallow,
+  force, dryRun,
 })
-    ↓ onPack
-importPackIntoHistory(history, pack)  → vcs-core importPack: kept as a pack or unpacked, streamed
+    ↓
+refUpdates (new / up-to-date / fast-forward / forced / rejected) → TrackingRefUpdate
 ```
+
+The transport client negotiates as git does: the local refs' history is offered as haves, so an
+incremental fetch downloads only the missing objects.
 
 ```
 PushCommand

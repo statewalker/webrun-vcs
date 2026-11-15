@@ -21,7 +21,7 @@ import type { FsmStateHandler, FsmTransition } from "../types.js";
  * @example
  * ```ts
  * const fullTransitions = [
- *   ...clientV2Transitions,
+ *   ...serverV2Transitions,
  *   ...errorRecoveryTransitions,
  * ];
  * ```
@@ -71,7 +71,7 @@ export const errorRecoveryTransitions: FsmTransition[] = [
  * @example
  * ```ts
  * const fullHandlers = new Map([
- *   ...clientV2Handlers,
+ *   ...serverV2Handlers,
  *   ...errorRecoveryHandlers,
  * ]);
  * ```

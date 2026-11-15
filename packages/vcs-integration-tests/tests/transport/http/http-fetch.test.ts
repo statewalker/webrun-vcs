@@ -5,7 +5,7 @@
  * with real in-memory repositories for pack operations.
  */
 
-import { createFetchHandler, httpFetch } from "@statewalker/vcs-transport";
+import { createFetchHandler, fetch as httpFetch } from "@statewalker/vcs-transport";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createInitializedTestRepository,
@@ -60,13 +60,15 @@ describe("HTTP Fetch E2E", () => {
     const clientFacade = createRepositoryFacade(clientCtx.repository);
     const clientRefs = createTransportRefStore(clientCtx.repository.refs);
 
-    const result = await httpFetch("http://test-server/repo.git", clientFacade, clientRefs, {
-      fetchFn,
+    const result = await httpFetch({
+      url: "http://test-server/repo.git",
+      repository: clientFacade,
+      refStore: clientRefs,
+      fetchImpl: fetchFn,
     });
 
-    expect(result.success).toBe(true);
-    expect(result.error).toBeUndefined();
-    expect(result.objectsImported).toBeGreaterThan(0);
+    expect(result.imports[0]?.objectsImported).toBeGreaterThan(0);
+    expect(result.refUpdates.every((u) => u.status === "new")).toBe(true);
   });
 
   it("performs info/refs request correctly", async () => {
@@ -89,9 +91,12 @@ describe("HTTP Fetch E2E", () => {
     const clientFacade = createRepositoryFacade(clientCtx.repository);
     const clientRefs = createTransportRefStore(clientCtx.repository.refs);
 
-    await httpFetch("http://test-server/repo.git", clientFacade, clientRefs, {
-      fetchFn: mockFetch,
-    });
+    await httpFetch({
+      url: "http://test-server/repo.git",
+      repository: clientFacade,
+      refStore: clientRefs,
+      fetchImpl: mockFetch,
+    }).catch(() => {});
 
     expect(infoRefsRequested).toBe(true);
     expect(requestUrl).toContain("service=git-upload-pack");
@@ -105,11 +110,15 @@ describe("HTTP Fetch E2E", () => {
       const clientFacade = createRepositoryFacade(clientCtx.repository);
       const clientRefs = createTransportRefStore(clientCtx.repository.refs);
 
-      const result = await httpFetch("http://test-server/repo.git", clientFacade, clientRefs, {
-        fetchFn,
+      const result = await httpFetch({
+        url: "http://test-server/repo.git",
+        repository: clientFacade,
+        refStore: clientRefs,
+        fetchImpl: fetchFn,
       });
 
-      expect(result.success).toBe(true);
+      expect(result.isEmpty).toBe(true);
+      expect(result.refUpdates).toEqual([]);
     } finally {
       await emptyServerCtx.cleanup();
     }
@@ -119,26 +128,30 @@ describe("HTTP Fetch E2E", () => {
     const clientFacade = createRepositoryFacade(clientCtx.repository);
     const clientRefs = createTransportRefStore(clientCtx.repository.refs);
 
-    const result = await httpFetch("http://test-server/repo.git", clientFacade, clientRefs, {
-      fetchFn: async () => new Response("Not Found", { status: 404 }),
-    });
-
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("404");
+    await expect(
+      httpFetch({
+        url: "http://test-server/repo.git",
+        repository: clientFacade,
+        refStore: clientRefs,
+        fetchImpl: async () => new Response("Not Found", { status: 404 }),
+      }),
+    ).rejects.toThrow("404");
   });
 
   it("handles network errors gracefully", async () => {
     const clientFacade = createRepositoryFacade(clientCtx.repository);
     const clientRefs = createTransportRefStore(clientCtx.repository.refs);
 
-    const result = await httpFetch("http://test-server/repo.git", clientFacade, clientRefs, {
-      fetchFn: async () => {
-        throw new Error("Network error");
-      },
-    });
-
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("Network error");
+    await expect(
+      httpFetch({
+        url: "http://test-server/repo.git",
+        repository: clientFacade,
+        refStore: clientRefs,
+        fetchImpl: async () => {
+          throw new Error("Network error");
+        },
+      }),
+    ).rejects.toThrow("Network error");
   });
 });
 

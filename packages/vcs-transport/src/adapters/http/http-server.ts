@@ -31,6 +31,7 @@ import {
   serverFetchHandlers,
   serverFetchTransitions,
 } from "../../fsm/fetch/server-fetch-fsm.js";
+import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
 import { Fsm } from "../../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/server-v2-fsm.js";
 import { SERVER_V2_CAPABILITIES } from "../../fsm/protocol-v2/types.js";
@@ -280,15 +281,19 @@ const DEFAULT_UPLOAD_PACK_CAPABILITIES = [
 /**
  * Handles GET /info/refs?service=git-upload-pack
  *
- * Returns ref advertisement in smart HTTP format.
+ * Returns ref advertisement in smart HTTP format. With `repository` (its `peelTag`), each
+ * annotated tag is followed by its peeled line (`<oid> <tag>^{}`), as git advertises them:
+ * clients follow tags by the commits they point at.
  *
  * @param refStore - Ref store for reading refs
  * @param options - Server options
+ * @param repository - Repository facade, to peel annotated tags
  * @returns HTTP response
  */
 export async function handleInfoRefs(
   refStore: RefStore,
   options: HttpServerOptions = {},
+  repository?: RepositoryFacade,
 ): Promise<HttpResponse> {
   // Get all refs
   const allRefs = await refStore.listAll();
@@ -317,11 +322,15 @@ export async function handleInfoRefs(
     const [firstRefName, firstOid] = refs[0];
     const capsStr = capabilities.join(" ");
     chunks.push(encodePacketLine(`${firstOid} ${firstRefName}\0${capsStr}\n`));
+    const firstPeeled = await peelFully(repository, firstOid);
+    if (firstPeeled) chunks.push(encodePacketLine(`${firstPeeled} ${firstRefName}^{}\n`));
 
     // Remaining refs
     for (let i = 1; i < refs.length; i++) {
       const [refName, oid] = refs[i];
       chunks.push(encodePacketLine(`${oid} ${refName}\n`));
+      const peeled = await peelFully(repository, oid);
+      if (peeled) chunks.push(encodePacketLine(`${peeled} ${refName}^{}\n`));
     }
   } else {
     // Empty repo - send capabilities with zero OID
@@ -1006,7 +1015,7 @@ export function createHttpHandler(
 
         if (v2) return handleInfoRefsV2(serverOptions);
         if (parsed.service === "git-upload-pack") {
-          return await handleInfoRefs(refStore, uploadPackOptions);
+          return await handleInfoRefs(refStore, uploadPackOptions, repository);
         } else {
           // git-receive-pack info/refs
           return await handleReceivePackInfoRefs(refStore, serverOptions);
