@@ -257,6 +257,8 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
                 parts.slice(2),
                 state.advertisedCapabilities,
               );
+              // v0 asks for a relative deepen with a capability (v2 with an argument line)
+              if (state.capabilities.has("deepen-relative")) state.deepenRelative = true;
             }
             state.wants.add(oid);
           } else if (line.startsWith("shallow ")) {

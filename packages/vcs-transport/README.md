@@ -185,7 +185,18 @@ const handleGit = createFetchHandler({
 // e.g. Deno.serve(handleGit) or Bun.serve({ fetch: handleGit })
 ```
 
-Lower-level pieces are also exported: `createHttpHandler`, `createGitHttpServer`, `handleInfoRefs`, `handleUploadPack`, `handleReceivePackInfoRefs`, `handleReceivePack`, `parseGitRequest`, `fetchRequestToHttpRequest`, `httpResponseToFetchResponse`.
+Lower-level pieces are also exported: `createHttpHandler`, `createGitHttpServer`, `handleInfoRefs`, `handleInfoRefsV2`, `handleUploadPack`, `handleUploadPackV2`, `handleReceivePackInfoRefs`, `handleReceivePack`, `parseGitRequest`, `requestsProtocolV2`, `isProtocolV2Request`, `fetchRequestToHttpRequest`, `httpResponseToFetchResponse`.
+
+The handler speaks protocol v2 to clients that ask for it, as git's http-backend does. `git -c protocol.version=2 clone http://…` (the default since git 2.26) sends `Git-Protocol: version=2` (a `:`-separated list of `key=value`; `requestsProtocolV2` reads it):
+
+```
+GET  /repo.git/info/refs?service=git-upload-pack   →  # service=git-upload-pack, flush,
+                                                       version 2, agent=…, ls-refs, fetch=shallow wait-for-done, …, flush
+POST /repo.git/git-upload-pack  command=ls-refs     →  <oid> HEAD symref-target:refs/heads/main, …, flush
+POST /repo.git/git-upload-pack  command=fetch       →  acknowledgments … ready, shallow-info, packfile (side-band, streamed)
+```
+
+Each POST runs one command (`ls-refs`, `fetch` or `object-info`) through the v2 server state machine from a fresh state: the negotiation is stateless, every `fetch` round carries all the client's haves, and the server answers `ready` with the pack once each want reaches a common commit. The request body goes through the same gzip decoding and `maxRequestBodyBytes` limit as v0 and is read whole before the command runs; the pack streams. Requests without the header get protocol v0, and receive-pack is always v0 (git has no v2 push). `protocolV2: false` serves v0 to everyone; `v2Capabilities` replaces the advertised capabilities. In v0 the handler advertises what upload-pack implements for the repository (`defaultUploadPackCapabilities`), so `git fetch --deepen` works there too.
 
 `handleUploadPack` streams its response: `HttpResponse.body` is then a `ReadableStream`, returned as soon as the negotiation starts writing, and each pack chunk waits until the reader took the previous one. A failure before the first byte is still a 500; after it, the error travels in band as `ERR <message>` on sideband channel 3 (protocol v0/v1 and the v2 `packfile` section), and without side-band, where raw pack bytes may be out, the response stream is aborted so the client sees a failure rather than a truncated pack that looks complete (as with a thrown error). While the pack is prepared (listing objects, reading headers, the delta search) and side-band is on, upload-pack sends git's keep-alive, an empty band-1 packet `0005\x01`, every `keepAliveMs` (default 5000, as git's `uploadpack.keepAlive`; 0 turns it off; `HttpServerOptions.keepAliveMs`, `ProcessConfiguration.keepAliveMs`) until the first pack byte, so proxies do not time the connection out; the fetch client skips these packets. `httpResponseToFetchResponse` passes a stream body through; a Node server should write it chunk by chunk and wait for `drain`. The pack follows the capabilities the client asked for in its first `want` line, and only those (possibly none), limited to the advertised ones: a thin pack only with `thin-pack`, OFS deltas only with `ofs-delta`, side-band only with `side-band-64k`. Capabilities on later `want` lines are ignored, and the advertised set is kept apart (`ProtocolState.advertisedCapabilities`). In protocol v2 these are arguments of the `fetch` command (`thin-pack`, `ofs-delta`, `no-progress`), and the packfile section is always side-band. Received packs (`handleReceivePack`, the push state machine) go through vcs-core's `importPack` as before.
 

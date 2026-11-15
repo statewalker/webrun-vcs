@@ -1,5 +1,5 @@
 /**
- * Direction B (best-effort): our smart-HTTP server ↔ a real client.
+ * Direction B: our smart-HTTP server <-> a real client.
  *
  * Bridges the transport's `createFetchHandler` onto a `node:http` server bound
  * to an ephemeral loopback port, serving a repository built from in-memory
@@ -9,23 +9,20 @@
  *  1. A LIVE test drives the server over the real loopback socket with a
  *     single-shot smart-HTTP exchange (GET /info/refs then POST
  *     /git-upload-pack) and asserts the advertisement + pack result are
- *     well-formed git wire bytes. This proves the HTTP adapter works over a
- *     real TCP socket, not just in-process.
- *  2. A SKIPPED test that would run the REAL `git clone` binary against the
- *     same server. In this sandbox the spawned `git-remote-http` helper hangs
- *     before it issues any HTTP request (the server logs receive nothing),
- *     even though a `fetch()` to the very same socket succeeds — i.e. the git
- *     HTTP subprocess cannot open the loopback connection here. This is an
- *     environment limitation, NOT a protocol defect: the server returns a
- *     valid `# service=…` advertisement and a valid `NAK` + side-band `PACK`
- *     for a single-shot request (asserted in part 1). The restructure should
- *     re-enable this against the real git binary in an unsandboxed CI.
+ *     well-formed git wire bytes.
+ *  2. The REAL `git clone` binary against the same server. git must run
+ *     asynchronously: the server answers in this process, so a synchronous
+ *     git call (execFileSync) blocks it, and git then waits forever for the
+ *     answer (which an earlier version of this test blamed on the sandbox).
  *
- * Direction A (fetch/push over upload-pack/receive-pack) is the required
- * deliverable and already covers the pkt-line/capability/pack wire both ways.
+ * interop/http-real-git.test.ts covers real git over HTTP in depth (protocol
+ * v2 and v0, shallow, deepening, multi-round negotiation).
  */
 
-import { type AddressInfo, createServer, type Server } from "node:http";
+import { execFile } from "node:child_process";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -34,6 +31,7 @@ import {
   cleanupDir,
   commitInRepo,
   createTransportRepo,
+  gitAvailable,
   makeTmpDir,
   type TransportRepo,
 } from "./helpers.js";
@@ -126,11 +124,37 @@ describe("Interop B · smart-HTTP server over a real socket", () => {
     expect(asText).toContain("PACK");
   });
 
-  // See file header: real `git clone` cannot open the loopback socket from the
-  // spawned git-remote-http helper in this sandbox. Unskip in unsandboxed CI.
-  it.skip("real git clone over smart-HTTP (blocked: git http subprocess in sandbox)", () => {
-    // Intentionally empty — see the describe rationale in the file header.
-    // Reference wiring lives in git history; the server side is proven by the
-    // single-shot socket test above and the http-transport unit suite.
+  it.skipIf(!gitAvailable())("real git clone over smart-HTTP", async () => {
+    const dst = join(root, "clone");
+    const run = (cwd: string, args: string[]) =>
+      new Promise<string>((resolve, reject) => {
+        execFile(
+          "git",
+          args,
+          {
+            cwd,
+            timeout: 20000,
+            killSignal: "SIGKILL",
+            env: {
+              ...process.env,
+              GIT_CONFIG_GLOBAL: "/dev/null",
+              GIT_CONFIG_NOSYSTEM: "1",
+              GIT_TERMINAL_PROMPT: "0",
+              GIT_AUTHOR_NAME: "Interop Tester",
+              GIT_AUTHOR_EMAIL: "interop@example.com",
+              GIT_COMMITTER_NAME: "Interop Tester",
+              GIT_COMMITTER_EMAIL: "interop@example.com",
+              GIT_AUTHOR_DATE: "1112911993 +0000",
+              GIT_COMMITTER_DATE: "1112911993 +0000",
+            },
+          },
+          (error, stdout, stderr) =>
+            error ? reject(new Error(`git ${args.join(" ")}: ${stderr}`)) : resolve(stdout.trim()),
+        );
+      });
+    await run(root, ["clone", `http://127.0.0.1:${port}/repo.git`, dst]);
+    expect(await run(dst, ["rev-parse", "HEAD"])).toBe(head);
+    expect(await run(dst, ["rev-list", "--count", "HEAD"])).toBe("2");
+    await run(dst, ["fsck", "--strict", "--no-dangling"]);
   });
 });

@@ -95,7 +95,7 @@ export interface TestHttpServerConfig {
   delays?: DelayConfig;
   /** Custom error responses (by path pattern) */
   errors?: Map<string, { status: number; message: string }>;
-  /** Enable protocol v2 */
+  /** Accepted for compatibility: this fake speaks v0 only, a v2 request gets v0 */
   protocolV2?: boolean;
   /** Repository resolver */
   resolveRepository?: (path: string) => RepositoryFacade | null;
@@ -372,7 +372,7 @@ export class TestHttpServer {
 
     // Check for protocol v2
     const gitProtocol = request.headers.get("Git-Protocol");
-    const isV2 = this.config.protocolV2 && gitProtocol === "version=2";
+    const isV2 = this.config.protocolV2 === true && gitProtocol === "version=2";
 
     if (service === "git-upload-pack") {
       return this.createUploadPackAdvertisement(refs, isV2);
@@ -393,27 +393,12 @@ export class TestHttpServer {
     });
   }
 
-  private createUploadPackAdvertisement(refs: Map<string, string>, isV2: boolean): Response {
-    const capabilities = [
-      "multi_ack_detailed",
-      "thin-pack",
-      "side-band",
-      "side-band-64k",
-      "ofs-delta",
-      "shallow",
-      "deepen-since",
-      "deepen-not",
-      "deepen-relative",
-      "no-progress",
-      "include-tag",
-      "filter",
-      "object-format=sha1",
-    ];
-
-    if (isV2) {
-      capabilities.push("object-info");
-      capabilities.push("fetch=shallow filter");
-    }
+  private createUploadPackAdvertisement(refs: Map<string, string>, _isV2: boolean): Response {
+    // Only what handleUploadPack below implements: it answers NAK and the whole pack on
+    // side-band-64k, whatever the request asks (no multi_ack, shallow, deepen, filter or
+    // include-tag), and speaks v0 only (a v2 request gets the v0 advertisement, as from a
+    // server without v2)
+    const capabilities = ["side-band-64k", "ofs-delta", "no-progress", "object-format=sha1"];
 
     const lines: string[] = [];
     lines.push("# service=git-upload-pack\n");
@@ -423,7 +408,7 @@ export class TestHttpServer {
     for (const [name, oid] of refs) {
       if (first) {
         lines.push(this.pktLine(`${oid} ${name}\0${capabilities.join(" ")}\n`));
-        first = true;
+        first = false;
       } else {
         lines.push(this.pktLine(`${oid} ${name}\n`));
       }
@@ -445,17 +430,9 @@ export class TestHttpServer {
   }
 
   private createReceivePackAdvertisement(refs: Map<string, string>, _isV2: boolean): Response {
-    const capabilities = [
-      "report-status",
-      "report-status-v2",
-      "delete-refs",
-      "side-band-64k",
-      "quiet",
-      "atomic",
-      "ofs-delta",
-      "push-options",
-      "object-format=sha1",
-    ];
+    // Only what handleReceivePack below implements: per-ref report-status without side-band,
+    // deletes; no report-status-v2, atomic or push-options
+    const capabilities = ["report-status", "delete-refs", "ofs-delta", "object-format=sha1"];
 
     const lines: string[] = [];
     lines.push("# service=git-receive-pack\n");
