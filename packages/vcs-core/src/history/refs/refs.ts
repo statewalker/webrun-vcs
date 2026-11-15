@@ -164,14 +164,16 @@ export interface Refs {
 
   /**
    * Replace the shallow commits (an empty list makes the repository complete again: git
-   * removes the `shallow` file).
+   * removes the `shallow` file). With `expected` (the list the caller read), a store whose
+   * shallow commits changed meanwhile refuses the write, as git's
+   * check_shallow_file_for_update: a concurrent fetch's boundary is not overwritten.
    *
    * @example
    * ```typescript
    * await refs.setShallow?.([...(await refs.getShallow?.()) ?? [], boundary]);
    * ```
    */
-  setShallow?(commits: Iterable<ObjectId>): Promise<void>;
+  setShallow?(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void>;
 
   /**
    * Initialize the refs store

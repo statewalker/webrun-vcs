@@ -106,6 +106,24 @@ export function mapRefs(
   return planned;
 }
 
+/**
+ * The sources of `refspecs` the remote does not have: exact (not wildcard, not an object id,
+ * not negative) sources that name no remote ref, as git's "couldn't find remote ref".
+ */
+export function missingSources(
+  remoteRefs: readonly RemoteRef[],
+  refspecs: readonly string[],
+): string[] {
+  const byName = new Map(remoteRefs.map((r) => [r.name, r]));
+  const missing: string[] = [];
+  for (const spec of refspecs.map(parseRefSpec)) {
+    if (spec.negative || !spec.source || spec.wildcard) continue;
+    if (/^[0-9a-f]{40}$/.test(spec.source)) continue;
+    if (!dwimRef(spec, byName)?.oid) missing.push(spec.source);
+  }
+  return missing;
+}
+
 /** The ref-prefix lines (v2 ls-refs) that cover `refspecs`: what the server needs to list. */
 export function refPrefixes(refspecs: readonly string[]): string[] {
   const prefixes = new Set<string>();
@@ -287,21 +305,23 @@ export async function isFastForward(
   const from = await peel(oldOid);
   const to = await peel(newOid);
   if (!from || !to) return true;
-  // walk back from the new commit; commits older than the old one cannot lead to it, but
-  // allow a day of clock skew before cutting a path short
-  const cutoff = from.info.time - 86400;
+  // walk back from the new commit, newest first (dates only order the walk: a clock-skewed
+  // history is walked to its end rather than cut short), until the old commit is found
   const seen = new Set<string>([to.id]);
-  const stack = [to.id];
-  while (stack.length > 0) {
-    const id = stack.pop() as string;
+  const queue: { id: string; time: number }[] = [{ id: to.id, time: to.info.time }];
+  while (queue.length > 0) {
+    const { id } = queue.shift() as { id: string; time: number };
     if (id === from.id) return true;
     const info = id === to.id ? to.info : await getInfo(id);
-    if (!info || info.time < cutoff) continue;
-    for (const parent of info.parents) {
-      if (!seen.has(parent)) {
-        seen.add(parent);
-        stack.push(parent);
-      }
+    for (const parent of info?.parents ?? []) {
+      if (seen.has(parent)) continue;
+      seen.add(parent);
+      const parentInfo = await getInfo(parent);
+      if (!parentInfo) continue;
+      const entry = { id: parent, time: parentInfo.time };
+      let i = queue.length;
+      while (i > 0 && (queue[i - 1] as { time: number }).time < entry.time) i--;
+      queue.splice(i, 0, entry);
     }
   }
   return false;

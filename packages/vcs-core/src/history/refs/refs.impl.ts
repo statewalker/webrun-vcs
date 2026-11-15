@@ -67,7 +67,10 @@ export class MemoryRefs implements Refs {
     return [...this.shallow];
   }
 
-  async setShallow(commits: Iterable<ObjectId>): Promise<void> {
+  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
+    if (expected && !sameIds(this.shallow, expected)) {
+      throw new Error("shallow file has changed since we read it");
+    }
     this.shallow = [...new Set(commits)].sort();
   }
 
@@ -238,4 +241,11 @@ export class MemoryRefs implements Refs {
  */
 export function createMemoryRefs(): Refs {
   return new MemoryRefs();
+}
+
+/** Whether two id lists hold the same ids (order and duplicates aside). */
+function sameIds(a: Iterable<ObjectId>, b: Iterable<ObjectId>): boolean {
+  const x = [...new Set(a)].sort();
+  const y = [...new Set(b)].sort();
+  return x.length === y.length && x.every((id, i) => id === y[i]);
 }

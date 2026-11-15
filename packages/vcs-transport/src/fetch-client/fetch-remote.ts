@@ -7,6 +7,8 @@ import type { PackImportResult, RepositoryFacade } from "../api/repository-facad
 import type { RefStore } from "../context/process-context.js";
 import { INFINITE_DEPTH } from "../fsm/index.js";
 import { encodeDelim, encodeFlush, encodePacketLine, TransportError } from "../protocol/index.js";
+import { parseRefSpec } from "../utils/index.js";
+import { Completeness } from "./completeness.js";
 import type { RemoteRef, UploadPackConnection } from "./connection.js";
 import {
   CLIENT_AGENT,
@@ -20,6 +22,7 @@ import {
   applyRefUpdates,
   type FetchRefUpdate,
   mapRefs,
+  missingSources,
   type PlannedRef,
   planRefUpdates,
   refPrefixes,
@@ -43,8 +46,17 @@ export interface FetchClientOptions {
   repository: RepositoryFacade;
   /** The local refs (written after the fetch) and the shallow file (`getShallow`/`setShallow`) */
   refStore: RefStore;
-  /** Refspecs (`[+]src[:dst]`, `^negative`); default {@link DEFAULT_FETCH_REFSPECS} */
-  refspecs?: string[];
+  /**
+   * Refspecs (`[+]src[:dst]`, `^negative`); default {@link DEFAULT_FETCH_REFSPECS}. A
+   * {@link RefspecResolver} picks them once the remote refs are known (a clone of the remote
+   * HEAD's branch).
+   */
+  refspecs?: string[] | RefspecResolver;
+  /**
+   * A refspec source the remote does not have is skipped instead of failing the fetch (git:
+   * configured `remote.<name>.fetch` refspecs; command-line ones fail)
+   */
+  missingRefsOk?: boolean;
   /** Tag following; default `auto` */
   tags?: TagMode;
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
@@ -71,6 +83,14 @@ export interface FetchClientOptions {
   reflogMessage?: string;
 }
 
+/** Refspecs chosen from the remote refs (a clone of the remote HEAD's branch, a tag). */
+export interface RefspecResolver {
+  /** The ref prefixes to list (protocol v2 `ls-refs`; `HEAD` is always listed) */
+  prefixes: string[];
+  /** The refspecs to fetch with; may throw (a branch the remote does not have) */
+  resolve(remoteRefs: readonly RemoteRef[]): string[];
+}
+
 /** What a fetch did. */
 export interface FetchClientResult {
   /** The protocol spoken: 2 or 0 */
@@ -85,6 +105,12 @@ export interface FetchClientResult {
   refUpdates: FetchRefUpdate[];
   /** Tags created by auto-follow (also in `refUpdates`) */
   followedTags: string[];
+  /**
+   * Tags auto-follow would have created but could not fetch: annotated tags of fetched
+   * objects whose tag objects did not come with the pack, over a connection that allows no
+   * second request (protocol v0 over a duplex: upload-pack ends after the pack)
+   */
+  tagsNotFollowed: string[];
   /** The shallow file before and after (equal unless the fetch changed it) */
   shallow: { before: string[]; after: string[] };
   /** What the pack imports reported (one per pack: the fetch, and a tag backfill) */
@@ -121,8 +147,18 @@ export async function fetchFromConnection(
 ): Promise<FetchClientResult> {
   const { repository, refStore } = options;
   const tags = options.tags ?? "auto";
-  const refspecs = [...(options.refspecs ?? DEFAULT_FETCH_REFSPECS)];
-  if (tags === "all") refspecs.push("refs/tags/*:refs/tags/*");
+  const given = options.refspecs ?? DEFAULT_FETCH_REFSPECS;
+  const resolver = Array.isArray(given) ? undefined : (given as RefspecResolver);
+  const withTagSpec = (specs: readonly string[]) =>
+    tags === "all" ? [...specs, "refs/tags/*:refs/tags/*"] : [...specs];
+  // git follows tags only when a refspec writes a ref (fetch.c: autotags); fetching
+  // objects only (`git fetch <url> main`, or HEAD) creates no tag
+  const writesRefs = (specs: readonly string[]) =>
+    tags === "auto" &&
+    specs.some((spec) => {
+      const parsed = parseRefSpec(spec);
+      return !parsed.negative && !!parsed.destination;
+    });
 
   // shallow state and options
   const shallowBefore = (await refStore.getShallow?.()) ?? [];
@@ -143,18 +179,27 @@ export async function fetchFromConnection(
   }
 
   // the remote refs
+  const listTags = resolver ? tags !== "none" : writesRefs(given as string[]) || tags === "all";
   const remoteRefs =
     connection.version === 2
       ? await lsRefs(connection, [
           "HEAD",
-          ...refPrefixes(refspecs),
-          ...(tags !== "none" ? ["refs/tags/"] : []),
+          ...(resolver ? resolver.prefixes : refPrefixes(withTagSpec(given as string[]))),
+          ...(listTags ? ["refs/tags/"] : []),
         ])
       : [...(connection.advertisedRefs ?? [])];
   const head = remoteRefs.find((r) => r.name === "HEAD");
   const defaultBranch = head?.symref;
   const isEmpty = !remoteRefs.some((r) => r.oid);
 
+  const refspecs = withTagSpec(resolver ? resolver.resolve(remoteRefs) : (given as string[]));
+  const autoTags = writesRefs(refspecs);
+  // git: a refspec naming a ref the remote does not have is an error (not for configured
+  // refspecs, `missingRefsOk`, nor against an empty remote, where nothing can match)
+  if (!options.missingRefsOk && !isEmpty) {
+    const missing = missingSources(remoteRefs, refspecs);
+    if (missing.length > 0) throw new TransportError(`couldn't find remote ref ${missing[0]}`);
+  }
   const planned = mapRefs(remoteRefs, refspecs);
   const result: FetchClientResult = {
     protocolVersion: connection.version,
@@ -163,6 +208,7 @@ export async function fetchFromConnection(
     isEmpty,
     refUpdates: [],
     followedTags: [],
+    tagsNotFollowed: [],
     shallow: { before: shallowBefore, after: shallowBefore },
     imports: [],
     packObjects: 0,
@@ -171,13 +217,16 @@ export async function fetchFromConnection(
   };
 
   const source = negotiatorSource(repository);
+  // what is complete here: reachable from the local refs (git's mark_complete), not merely
+  // present (an interrupted fetch leaves commits without their trees and blobs)
+  const localTips = new Set<string>();
+  for (const [, oid] of await refStore.listAll()) localTips.add(oid);
+  const complete = new Completeness(repository, localTips);
   let shallow = shallowBefore;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
-    const localTips = new Set<string>();
-    for (const [, oid] of await refStore.listAll()) localTips.add(oid);
     const knownCommon: string[] = [];
     for (const ref of remoteRefs) {
-      if (ref.oid && !knownCommon.includes(ref.oid) && (await repository.has(ref.oid))) {
+      if (ref.oid && !knownCommon.includes(ref.oid) && (await complete.isComplete(ref.oid))) {
         knownCommon.push(ref.oid);
       }
     }
@@ -188,7 +237,7 @@ export async function fetchFromConnection(
       knownCommon,
       shallow,
       filter: options.filter,
-      includeTag: tags === "auto",
+      includeTag: autoTags,
       onProgress: options.onProgress,
       importPack: options.dryRun ? drainPack : (pack) => repository.importPack(pack),
       onShallowUpdate: (u) => {
@@ -200,6 +249,8 @@ export async function fetchFromConnection(
       },
       ...request,
     });
+    // the pack is in (its trailer checked): the wants are complete now
+    if (!options.dryRun) for (const want of wants) complete.addTip(want);
     result.imports.push(fetched.imported);
     result.packObjects += fetched.packObjects;
     result.packBytes += fetched.packBytes;
@@ -207,7 +258,8 @@ export async function fetchFromConnection(
     result.stats.haves += fetched.stats.haves;
     const after = applyShallow(shallow, update);
     if (after !== shallow) {
-      if (!options.dryRun) await refStore.setShallow?.(after);
+      // checked against what this fetch read: a concurrent fetch's change is not lost
+      if (!options.dryRun) await refStore.setShallow?.(after, shallow);
       shallow = after;
     }
   };
@@ -216,7 +268,7 @@ export async function fetchFromConnection(
   const wants: string[] = [];
   for (const p of planned) {
     if (wants.includes(p.oid)) continue;
-    if (deepen || !(await repository.has(p.oid))) wants.push(p.oid);
+    if (deepen || !(await complete.isComplete(p.oid))) wants.push(p.oid);
   }
   if (wants.length > 0) {
     await runFetchPack(wants, {
@@ -229,7 +281,7 @@ export async function fetchFromConnection(
 
   // tag auto-follow
   const followed: PlannedRef[] = [];
-  if (tags === "auto") {
+  if (autoTags) {
     const mapped = new Set(planned.map((p) => p.localRef));
     const candidates: RemoteRef[] = [];
     for (const ref of remoteRefs) {
@@ -239,23 +291,25 @@ export async function fetchFromConnection(
     }
     const backfill: RemoteRef[] = [];
     for (const ref of candidates) {
-      if (await chainPresent(repository, ref.oid as string)) {
+      if (await complete.isComplete(ref.oid as string)) {
         followed.push({
           remoteRef: ref.name,
           localRef: ref.name,
           oid: ref.oid as string,
           force: false,
         });
-      } else if (ref.peeled && ref.peeled !== ref.oid && (await repository.has(ref.peeled))) {
+      } else if (ref.peeled && ref.peeled !== ref.oid && (await complete.isComplete(ref.peeled))) {
         // an annotated tag of an object here, its tag object missing: fetch it
         backfill.push(ref);
       }
     }
-    if (backfill.length > 0 && (connection.stateless || connection.version === 2)) {
+    if (backfill.length > 0 && !connection.stateless && connection.version !== 2) {
+      result.tagsNotFollowed = backfill.map((r) => r.name);
+    } else if (backfill.length > 0) {
       const backfillWants = [...new Set(backfill.map((r) => r.oid as string))];
       await runFetchPack(backfillWants, {});
       for (const ref of backfill) {
-        if (await chainPresent(repository, ref.oid as string)) {
+        if (await complete.isComplete(ref.oid as string)) {
           followed.push({
             remoteRef: ref.name,
             localRef: ref.name,
@@ -339,18 +393,6 @@ function negotiatorSource(repository: RepositoryFacade): NegotiatorSource {
       : async (oid) => ((await repository.has(oid)) ? { parents: [], time: 0 } : undefined),
     peelTag: repository.peelTag?.bind(repository),
   };
-}
-
-/** Whether the object `oid`, and every object of its tag chain, is here. */
-async function chainPresent(repository: RepositoryFacade, oid: string): Promise<boolean> {
-  let id = oid;
-  for (let i = 0; i < 16; i++) {
-    if (!(await repository.has(id))) return false;
-    const target = await repository.peelTag?.(id);
-    if (!target || target === id) return true;
-    id = target;
-  }
-  return false;
 }
 
 /** A dry run's "import": the pack is read to its end and dropped. */

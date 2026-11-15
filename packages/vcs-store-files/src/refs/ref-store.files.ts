@@ -76,14 +76,18 @@ export class FileRefStore implements Refs {
       text += decoder.decode(chunk, { stream: true });
     }
     text += decoder.decode();
-    return text.split("\n").filter((line) => /^[0-9a-f]{40}$/.test(line));
+    return text
+      .split("\n")
+      .filter((line) => /^[0-9a-f]{40}$/.test(line))
+      .sort();
   }
 
   /**
    * Replace the `shallow` file under `shallow.lock`, as git does; an empty list removes it.
-   * Throws when another writer holds the lock.
+   * Throws when another writer holds the lock, and, with `expected`, when the file no longer
+   * holds what the caller read (git's check_shallow_file_for_update), checked under the lock.
    */
-  async setShallow(commits: Iterable<ObjectId>): Promise<void> {
+  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
     const ids = [...new Set(commits)].sort();
     const lock = `${SHALLOW_FILE}.lock`;
     const content = new TextEncoder().encode(ids.map((id) => `${id}\n`).join(""));
@@ -91,6 +95,13 @@ export class FileRefStore implements Refs {
       throw new Error(`Unable to lock ${SHALLOW_FILE}: ${lock} exists`);
     }
     try {
+      if (expected) {
+        const current = await this.getShallow();
+        const want = [...new Set(expected)].sort();
+        if (current.length !== want.length || current.some((id, i) => id !== want[i])) {
+          throw new Error(`shallow file has changed since we read it (${SHALLOW_FILE})`);
+        }
+      }
       if (ids.length === 0) {
         await this.atomic.remove(SHALLOW_FILE);
         await this.atomic.remove(lock);

@@ -71,6 +71,8 @@ export function gitHttpBackend(projectRoot: string): GitHttpBackend {
     children.add(child);
     child.on("close", () => children.delete(child));
     child.stderr.resume();
+    // a backend that answers without reading its input (a GET) closes stdin first: EPIPE
+    child.stdin.on("error", () => {});
     child.stdin.end(body ?? Buffer.alloc(0));
 
     // the CGI head, then the body as it comes

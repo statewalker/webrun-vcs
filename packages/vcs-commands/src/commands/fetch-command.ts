@@ -8,6 +8,7 @@ import {
   expandFromDestination,
   type FetchRefUpdate,
   matchDestination,
+  matchSource,
   parseRefSpec,
   type RefSpec,
   type TagMode,
@@ -355,7 +356,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       throw new InvalidRemoteError(this.remote);
     }
 
-    // git: without a refspec the remote's HEAD is fetched, and no ref is written
+    // git: without a refspec the remote's HEAD is fetched, and no ref is written (nor any
+    // tag); explicit refspecs must name refs the remote has, configured ones may not
+    const fromConfig = this.refSpecs.length === 0;
     const configured = this.effectiveRefSpecs();
     const refspecs = configured.length > 0 ? configured : ["HEAD"];
     const history = this._workingCopy.history;
@@ -368,6 +371,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       repository: createRepositoryFacade({ history }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
+      missingRefsOk: fromConfig && configured.length > 0,
       tags: toTagMode(this.tagOption),
       depth: this.depth,
       deepenSince: this.shallowSince,
@@ -437,7 +441,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /**
    * Prune local refs that a refspec maps from a remote ref that no longer exists (git's
    * `--prune`): for each refspec with a destination, the local refs matching the
-   * destination whose source is not among the remote refs are deleted.
+   * destination whose source is not among the remote refs are deleted, unless a negative
+   * refspec excludes that source (git's query_matches_negative_refspec).
    */
   private async pruneDeletedRefs(
     remoteRefNames: Set<string>,
@@ -445,6 +450,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   ): Promise<TrackingRefUpdate[]> {
     const updates: TrackingRefUpdate[] = [];
     const done = new Set<string>();
+    const negative = specs.filter((s) => s.negative && s.source);
     for (const spec of specs) {
       if (spec.negative || !spec.source || !spec.destination) continue;
       const prefix = spec.wildcard
@@ -461,6 +467,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
           source = spec.source;
         }
         if (!source || remoteRefNames.has(source)) continue;
+        if (negative.some((n) => matchSource(n, source))) continue;
         done.add(ref.name);
         await this.refsStore.delete(ref.name);
         updates.push({

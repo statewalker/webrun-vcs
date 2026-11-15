@@ -201,8 +201,11 @@ function fakeServer(options: {
   has: Set<string>;
   ready?: (round: number) => boolean;
   shallowInfo?: string[];
+  /** Acknowledge each commit once only (git's upload-pack re-ACKs every common have) */
+  ackOnce?: boolean;
 }): { connection: UploadPackConnection; rounds: Round[] } {
   const rounds: Round[] = [];
+  const acked = new Set<string>();
   const pipe = new Pipe();
   const stateful = new PktStream(pipe);
   const caps =
@@ -243,7 +246,8 @@ function fakeServer(options: {
       const done = text.includes("done");
       const wants = text.filter((l) => l.startsWith("want ")).length;
       rounds.push({ haves, done, wants });
-      const common = haves.filter((h) => options.has.has(h));
+      const common = haves.filter((h) => options.has.has(h) && !(options.ackOnce && acked.has(h)));
+      for (const c of common) acked.add(c);
       const ready = options.ready?.(rounds.length) ?? false;
       if (options.version === 2) {
         if (done) {
@@ -318,12 +322,36 @@ describe("fetchPack negotiation against a scripted server", () => {
     expect(result.stats).toEqual({ rounds: 7, haves: 600 });
   });
 
-  it("v2: after the first ACK, done once MAX_IN_VAIN haves found nothing new; commons re-sent each round", async () => {
+  it("v2: any ACK resets the in-vain count (git), so the first round of 256 haves after one ends it", async () => {
     const g = new Graph();
     const main = g.chain("m", 10, 1000);
     const other = g.chain("o", 600, 0);
-    // the server has main (it ACKs m9..m0), never says ready
+    // git's upload-pack ACKs the re-sent m9 in every round, and is never ready here
     const { connection, rounds } = fakeServer({ version: 2, stateless: true, has: new Set(main) });
+    const result = await fetchPack(
+      connection,
+      g,
+      request([main[9] as string, other[599] as string]),
+    );
+    const fresh = rounds.map((r, i) => r.haves.filter((h) => i === 0 || h !== main[9]).length);
+    // every response ACKs m9 again (in_vain back to 0); the request adding 256 haves reaches
+    // MAX_IN_VAIN by itself and says done, as git's send_fetch_request decides
+    expect(fresh).toEqual([16, 32, 64, 128, 256]);
+    expect(rounds.map((r) => r.done)).toEqual([false, false, false, false, true]);
+    expect(result.stats.haves).toBe(496);
+  });
+
+  it("v2: after the last ACK, done once MAX_IN_VAIN haves found nothing; commons re-sent each round", async () => {
+    const g = new Graph();
+    const main = g.chain("m", 10, 1000);
+    const other = g.chain("o", 600, 0);
+    // a server that acknowledges m9..m0 once, never says ready
+    const { connection, rounds } = fakeServer({
+      version: 2,
+      stateless: true,
+      has: new Set(main),
+      ackOnce: true,
+    });
     const result = await fetchPack(
       connection,
       g,

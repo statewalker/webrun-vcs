@@ -3,6 +3,7 @@
  * updates) over protocol v2 or v0, with I/O adapters for smart HTTP and duplex streams.
  */
 
+export * from "./completeness.js";
 export * from "./connection.js";
 export * from "./fetch-pack.js";
 export * from "./fetch-remote.js";

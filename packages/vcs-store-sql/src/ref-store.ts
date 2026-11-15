@@ -78,9 +78,18 @@ export class SQLRefStore implements Refs {
   }
 
   /** Replace the shallow commits in one transaction. */
-  async setShallow(commits: Iterable<ObjectId>): Promise<void> {
+  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
     const ids = [...new Set(commits)];
     await this.db.transaction(async (tx) => {
+      if (expected) {
+        const rows = await tx.query<{ object_id: string }>(
+          "SELECT object_id FROM vcs_shallow ORDER BY object_id",
+        );
+        const want = [...new Set(expected)].sort();
+        if (rows.length !== want.length || rows.some((r, i) => r.object_id !== want[i])) {
+          throw new Error("shallow file has changed since we read it");
+        }
+      }
       await tx.execute("DELETE FROM vcs_shallow");
       for (const id of ids) {
         await tx.execute("INSERT INTO vcs_shallow (object_id) VALUES (?)", [id]);

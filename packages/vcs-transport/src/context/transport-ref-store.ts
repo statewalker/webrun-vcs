@@ -41,7 +41,9 @@ export function createTransportRefStore(refs: Refs): RefStore {
       return out;
     },
     getShallow: refs.getShallow && (async () => (await refs.getShallow?.()) ?? []),
-    setShallow: refs.setShallow && ((oids) => refs.setShallow?.(oids) ?? Promise.resolve()),
+    setShallow:
+      refs.setShallow &&
+      ((oids, expected) => refs.setShallow?.(oids, expected) ?? Promise.resolve()),
     async getSymrefTarget(name) {
       const ref = await refs.get(name);
       return ref && isSymbolicRef(ref) ? ref.target : undefined;

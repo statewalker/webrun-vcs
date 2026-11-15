@@ -21,7 +21,10 @@ export const INITIAL_FLUSH = 16;
 export const PIPESAFE_FLUSH = 32;
 /** Stateless: past this many haves, batches grow by 10% instead of doubling */
 export const LARGE_FLUSH = 16384;
-/** Haves sent without a newly found common commit, after the first one, before giving up */
+/**
+ * Haves sent in vain, after the first ACK, before giving up: v0 counts from the last newly
+ * common commit, v2 (as git's do_fetch_pack_v2) from the last ACK of any kind
+ */
 export const MAX_IN_VAIN = 256;
 
 /** The agent the client names itself as */
@@ -383,12 +386,10 @@ async function fetchPackV2(
         }
         if (!line.startsWith("ACK ")) throw new TransportError(`Unexpected ${line}`);
         const oid = line.slice(4, 44);
-        if (!(await negotiator.ack(oid))) {
-          commons.push(oid);
-          // a newly found common commit: haves are in vain from here on
-          seenAck = true;
-          inVain = 0;
-        }
+        if (!(await negotiator.ack(oid))) commons.push(oid);
+        // git's do_fetch_pack_v2: any ACK (a re-sent common one too) resets the count
+        seenAck = true;
+        inVain = 0;
       }
       if (end === "flush") {
         if (ready) throw new TransportError("The server is ready but sent no pack");

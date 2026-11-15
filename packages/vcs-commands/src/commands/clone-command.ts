@@ -2,10 +2,11 @@ import type { ObjectId } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
+  type RefspecResolver,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
 
-import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
+import { InvalidArgumentError, InvalidRemoteError, RefNotFoundError } from "../errors/index.js";
 import type { CloneResult } from "../results/clone-result.js";
 import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
@@ -331,18 +332,55 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const history = this._workingCopy.history;
 
     // git clone's refspecs: tracking refs, local heads (bare), every ref (mirror)
-    let refspecs: string[];
+    const tracking = (branch: string) =>
+      this.bare ? `refs/heads/${branch}` : `refs/remotes/${this.remoteName}/${branch}`;
+    // git: a shallow clone is a single-branch clone of the remote HEAD's branch
+    const singleBranch =
+      !this.mirror &&
+      (branchToClone !== undefined ||
+        this.depth !== undefined ||
+        this.shallowSince !== undefined ||
+        this.shallowExcludes.length > 0);
+    let detachedTag: string | undefined;
+    let refspecs: string[] | RefspecResolver;
     if (this.mirror) {
       refspecs = ["+refs/*:refs/*"];
-    } else if (this.bare) {
-      refspecs = [`+refs/heads/${branchToClone ?? "*"}:refs/heads/${branchToClone ?? "*"}`];
+    } else if (branchToClone !== undefined) {
+      // --branch names a branch, or else a tag (checked out as a detached HEAD)
+      const b = branchToClone;
+      refspecs = {
+        prefixes: [`refs/heads/${b}`, `refs/tags/${b}`],
+        resolve: (remoteRefs) => {
+          if (remoteRefs.some((r) => r.name === `refs/heads/${b}` && r.oid)) {
+            return [`+refs/heads/${b}:${tracking(b)}`];
+          }
+          if (remoteRefs.some((r) => r.name === `refs/tags/${b}` && r.oid)) {
+            detachedTag = `refs/tags/${b}`;
+            return [`+refs/tags/${b}:refs/tags/${b}`];
+          }
+          throw new RefNotFoundError(
+            `refs/heads/${b}`,
+            `Remote branch ${b} not found in upstream ${this.remoteName}`,
+          );
+        },
+      };
+    } else if (singleBranch) {
+      refspecs = {
+        prefixes: ["refs/heads/"],
+        resolve: (remoteRefs) => {
+          const head = remoteRefs.find((r) => r.name === "HEAD")?.symref;
+          const name = toBranchName(head);
+          return name && head?.startsWith("refs/heads/")
+            ? [`+${head}:${tracking(name)}`]
+            : [`+refs/heads/*:${tracking("*")}`];
+        },
+      };
     } else {
-      const remote = `refs/remotes/${this.remoteName}`;
-      refspecs = [`+refs/heads/${branchToClone ?? "*"}:${remote}/${branchToClone ?? "*"}`];
+      refspecs = [`+refs/heads/*:${tracking("*")}`];
     }
     // git clone takes every tag, unless one branch is cloned (then tags follow) or --no-tags
     const tags =
-      this.tagOption === TagOption.AUTO_FOLLOW && !branchToClone && !this.mirror
+      this.tagOption === TagOption.AUTO_FOLLOW && !singleBranch && !this.mirror
         ? "all"
         : toTagMode(this.tagOption);
 
@@ -369,10 +407,25 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // FetchResult unchanged (it is what the remote said), while the ref work
     // below and CloneResult use the bare branch name.
     const advertisedDefaultBranch = result.defaultBranch;
-    const defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
+    let defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
     let headCommit: ObjectId | undefined;
 
-    if (defaultBranch && !this.bare) {
+    if (detachedTag) {
+      // git clone --branch <tag>: a detached HEAD at the tag's commit
+      defaultBranch = toBranchName(advertisedDefaultBranch);
+      const tag = await this.refsStore.resolve(detachedTag);
+      let id = tag?.objectId;
+      for (let i = 0; id && i < 16; i++) {
+        const target = await history.tags.getTarget(id);
+        if (!target || !(await history.tags.has(id))) break;
+        id = target;
+      }
+      if (id) {
+        await this.refsStore.set("HEAD", id);
+        headCommit = id;
+        if (!this.bare && !this.noCheckout) await this.checkoutHead(id);
+      }
+    } else if (defaultBranch && !this.bare) {
       // The local branch starts at the tracking ref the clone just wrote
       const localRef = `refs/heads/${defaultBranch}`;
       const tip = await this.refsStore.resolve(`refs/remotes/${this.remoteName}/${defaultBranch}`);

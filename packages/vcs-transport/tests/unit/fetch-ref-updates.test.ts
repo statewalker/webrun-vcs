@@ -235,3 +235,23 @@ describe("applyRefUpdates", () => {
     expect(store.get("refs/heads/a")).toBe(C);
   });
 });
+
+describe("isFastForward under clock skew", () => {
+  it("finds the old commit however far its date is ahead of its descendants'", async () => {
+    // old C (dated 2030) ← B (dated 2001) ← tip A (dated 2001): a true fast-forward
+    const info: Record<string, { parents: string[]; time: number }> = {
+      [A]: { parents: [B], time: 1_000_000_100 },
+      [B]: { parents: [C], time: 1_000_000_000 },
+      [C]: { parents: [], time: 1_900_000_000 },
+      [D]: { parents: [], time: 1_000_000_000 },
+    };
+    const repository = {
+      getCommitInfo: async (oid: string) => info[oid],
+      peelTag: async () => null,
+      has: async (oid: string) => oid in info,
+      walkAncestors: async function* () {},
+    } as unknown as RepositoryFacade;
+    expect(await isFastForward(repository, C, A)).toBe(true);
+    expect(await isFastForward(repository, D, A)).toBe(false);
+  });
+});

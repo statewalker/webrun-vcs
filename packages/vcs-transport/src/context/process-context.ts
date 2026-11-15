@@ -49,9 +49,10 @@ export interface RefStore {
 
   /**
    * Replaces the shallow commits (a fetch writes the server's `shallow`/`unshallow` answer).
-   * Without it a shallow fetch is refused.
+   * With `expected` (what the fetch read), refuses when they changed meanwhile. Without it a
+   * shallow fetch is refused.
    */
-  setShallow?(oids: string[]): Promise<void>;
+  setShallow?(oids: string[], expected?: string[]): Promise<void>;
 
   /**
    * Gets the target of a symbolic ref.

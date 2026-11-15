@@ -5,6 +5,7 @@
  * gets only the new objects.
  */
 
+import { ObjectType } from "@statewalker/vcs-core";
 import { describe, expect, it } from "vitest";
 
 import { fetchOverDuplex, serveOverDuplex } from "../src/index.js";
@@ -106,4 +107,38 @@ describe("fetchOverDuplex ↔ serveOverDuplex sessions", () => {
       }
     },
   );
+});
+
+describe("tags a stateful v0 fetch cannot follow", () => {
+  it("are reported in tagsNotFollowed (our server ignores include-tag; no second request)", async () => {
+    const server = await createTransportRepo();
+    const client = await createTransportRepo();
+    try {
+      const c1 = await commitInRepo(server, "c1", { "a.txt": "1" });
+      await server.refStore.update("refs/heads/main", c1);
+      const tag = await server.history.tags.store({
+        object: c1,
+        objectType: ObjectType.COMMIT,
+        tag: "v1",
+        tagger: { name: "T", email: "t@example.com", timestamp: 1112911993, tzOffset: "+0000" },
+        message: "v1\n",
+      });
+      await server.refStore.update("refs/tags/v1", tag);
+      const lb = loopback(server, "1");
+      const result = await fetchOverDuplex({
+        duplex: lb.duplex,
+        repository: client.facade,
+        refStore: client.refStore,
+        refspecs: ["+refs/heads/*:refs/remotes/peer/*"],
+      });
+      expect(result.success, result.error).toBe(true);
+      expect(result.report?.followedTags).toEqual([]);
+      expect(result.report?.tagsNotFollowed).toEqual(["refs/tags/v1"]);
+      expect(await client.refStore.get("refs/tags/v1")).toBeUndefined();
+      await within(lb.served, 2000);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });
