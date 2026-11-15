@@ -2,8 +2,8 @@
  * Tests for GitStashStore (file-based stash implementation)
  */
 
-import type { History } from "@statewalker/vcs-core";
-import { GitStashStore, type StashFilesApi } from "@statewalker/vcs-store-files";
+import { createInMemoryFilesApi, type History, readFile } from "@statewalker/vcs-core";
+import { FileRefStore, GitStashStore } from "@statewalker/vcs-store-files";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MockCommitStore } from "../../mocks/mock-commit-store.js";
 import { createMockStaging, createStagingEntry } from "../../mocks/mock-staging-store.js";
@@ -11,34 +11,14 @@ import { createMockTreeStore } from "../../mocks/mock-tree-store.js";
 import { createMockWorktree, createWorktreeEntry } from "../../mocks/mock-worktree.js";
 
 /**
- * Create mock files API for testing.
+ * A git directory in an in-memory FilesApi: refs/stash and its reflog are written through
+ * FileRefStore (git's lock files), as in a real repository.
  */
-function createMockFilesApi(): StashFilesApi & { files: Map<string, Uint8Array> } {
-  const files = new Map<string, Uint8Array>();
-
-  return {
-    files,
-    read: vi.fn().mockImplementation(async (path: string) => {
-      return files.get(path);
-    }),
-    write: vi.fn().mockImplementation(async (path: string, content: Uint8Array) => {
-      files.set(path, content);
-    }),
-    remove: vi.fn().mockImplementation(async (path: string) => {
-      files.delete(path);
-    }),
-    mkdir: vi.fn().mockImplementation(async () => {
-      // No-op for in-memory mock
-    }),
-    exists: vi.fn().mockImplementation(async (path: string) => {
-      // Check if path exists as file or if any files are under this directory
-      if (files.has(path)) return true;
-      for (const key of files.keys()) {
-        if (key.startsWith(`${path}/`)) return true;
-      }
-      return false;
-    }),
-  };
+function createGitFiles() {
+  const files = createInMemoryFilesApi();
+  const text = async (path: string) =>
+    (await files.exists(path)) ? new TextDecoder().decode(await readFile(files, path)) : undefined;
+  return { files, refs: new FileRefStore(files, ".git"), text };
 }
 
 /**
@@ -102,7 +82,9 @@ function createMockBlobStore() {
 /** History whose commit store is the mock, so tests can use its storeCommit/loadCommit helpers. */
 type MockHistory = History & { commits: MockCommitStore };
 
-function createMockRepository(): MockHistory {
+function createMockRepository(
+  refs: History["refs"] = new FileRefStore(createInMemoryFilesApi(), ".git"),
+): MockHistory {
   const treeStore = createMockTreeStore({
     "tree-1": [{ name: "file.txt", id: "blob-1", mode: 0o100644 }],
     "tree-2": [
@@ -118,7 +100,7 @@ function createMockRepository(): MockHistory {
     commits: commitStore,
     trees: treeStore,
     blobs: blobStore,
-    refs: {} as History["refs"],
+    refs,
     tags: {} as History["tags"],
     objects: {} as History["objects"],
   } as unknown as MockHistory;
@@ -127,13 +109,13 @@ function createMockRepository(): MockHistory {
 describe("GitStashStore", () => {
   let stash: GitStashStore;
   let repository: MockHistory;
-  let filesApi: ReturnType<typeof createMockFilesApi>;
+  let gitFiles: ReturnType<typeof createGitFiles>;
   let headCommitId: string;
   let headTreeId: string;
 
   beforeEach(async () => {
-    repository = createMockRepository();
-    filesApi = createMockFilesApi();
+    gitFiles = createGitFiles();
+    repository = createMockRepository(gitFiles.refs);
 
     // Create initial HEAD commit
     headTreeId = "tree-1";
@@ -160,8 +142,6 @@ describe("GitStashStore", () => {
       history: repository,
       staging,
       worktree,
-      files: filesApi,
-      gitDir: ".git",
       getHead: async () => headCommitId,
       getBranch: async () => "main",
     });
@@ -175,12 +155,8 @@ describe("GitStashStore", () => {
       expect(stashId.length).toBe(40);
 
       // Verify refs/stash was written
-      const stashRef = filesApi.files.get(".git/refs/stash");
-      expect(stashRef).toBeDefined();
-      if (!stashRef) {
-        throw new Error("stashRef should be defined");
-      }
-      expect(new TextDecoder().decode(stashRef).trim()).toBe(stashId);
+      const stashRef = await gitFiles.text(".git/refs/stash");
+      expect(stashRef?.trim()).toBe(stashId);
     });
 
     it("should create stash commit with default message", async () => {
@@ -192,20 +168,18 @@ describe("GitStashStore", () => {
       }
 
       expect(entries).toHaveLength(1);
-      expect(entries[0].message).toBe("WIP on main");
+      expect(entries[0].message).toMatch(/^WIP on main: [0-9a-f]{7} Initial commit$/);
     });
 
     it("should create reflog entry", async () => {
       await stash.push("My stash");
 
-      const reflog = filesApi.files.get(".git/logs/refs/stash");
-      expect(reflog).toBeDefined();
-      if (!reflog) {
-        throw new Error("reflog should be defined");
-      }
-
-      const content = new TextDecoder().decode(reflog);
-      expect(content).toContain("stash: My stash");
+      const content = await gitFiles.text(".git/logs/refs/stash");
+      expect(content).toBeDefined();
+      // git's line: <old> <new> <ident>\t<message>, the message "On <branch>: <message>"
+      expect(content).toMatch(
+        /^0{40} [0-9a-f]{40} Git Stash <stash@localhost> \d+ \+0000\tOn main: My stash\n$/,
+      );
     });
 
     it("should throw when no HEAD commit exists", async () => {
@@ -213,8 +187,6 @@ describe("GitStashStore", () => {
         history: repository,
         staging: createMockStaging([]),
         worktree: createMockWorktree([]),
-        files: filesApi,
-        gitDir: ".git",
         getHead: async () => undefined,
         getBranch: async () => "main",
       });
@@ -227,11 +199,8 @@ describe("GitStashStore", () => {
       const secondId = await stash.push("Second");
 
       // refs/stash should point to most recent
-      const stashRef = filesApi.files.get(".git/refs/stash");
-      if (!stashRef) {
-        throw new Error("stashRef should be defined");
-      }
-      expect(new TextDecoder().decode(stashRef).trim()).toBe(secondId);
+      const stashRef = await gitFiles.text(".git/refs/stash");
+      expect(stashRef?.trim()).toBe(secondId);
       expect(secondId).not.toBe(firstId);
     });
   });
@@ -258,11 +227,11 @@ describe("GitStashStore", () => {
 
       expect(entries).toHaveLength(3);
       expect(entries[0].index).toBe(0);
-      expect(entries[0].message).toBe("Third stash");
+      expect(entries[0].message).toBe("On main: Third stash");
       expect(entries[1].index).toBe(1);
-      expect(entries[1].message).toBe("Second stash");
+      expect(entries[1].message).toBe("On main: Second stash");
       expect(entries[2].index).toBe(2);
-      expect(entries[2].message).toBe("First stash");
+      expect(entries[2].message).toBe("On main: First stash");
     });
 
     it("should parse reflog entries correctly", async () => {
@@ -275,7 +244,7 @@ describe("GitStashStore", () => {
 
       expect(entries[0]).toMatchObject({
         index: 0,
-        message: "Test stash",
+        message: "On main: Test stash",
       });
       expect(entries[0].commitId).toBeDefined();
       expect(entries[0].timestamp).toBeGreaterThan(0);
@@ -292,8 +261,6 @@ describe("GitStashStore", () => {
         history: repository,
         staging,
         worktree: createMockWorktree([]),
-        files: filesApi,
-        gitDir: ".git",
         getHead: async () => headCommitId,
         getBranch: async () => "main",
       });
@@ -331,8 +298,6 @@ describe("GitStashStore", () => {
         history: repository,
         staging,
         worktree: createMockWorktree([]),
-        files: filesApi,
-        gitDir: ".git",
         getHead: async () => headCommitId,
         getBranch: async () => "main",
       });
@@ -348,7 +313,7 @@ describe("GitStashStore", () => {
       }
 
       expect(entries).toHaveLength(1);
-      expect(entries[0].message).toBe("First");
+      expect(entries[0].message).toBe("On main: First");
       expect(staging.readTree).toHaveBeenCalled();
     });
   });
@@ -366,7 +331,7 @@ describe("GitStashStore", () => {
       }
 
       expect(entries).toHaveLength(1);
-      expect(entries[0].message).toBe("First");
+      expect(entries[0].message).toBe("On main: First");
       expect(entries[0].index).toBe(0);
     });
 
@@ -383,8 +348,8 @@ describe("GitStashStore", () => {
       }
 
       expect(entries).toHaveLength(2);
-      expect(entries[0].message).toBe("Third");
-      expect(entries[1].message).toBe("First");
+      expect(entries[0].message).toBe("On main: Third");
+      expect(entries[1].message).toBe("On main: First");
     });
 
     it("should throw for invalid stash index", async () => {
@@ -399,8 +364,8 @@ describe("GitStashStore", () => {
       await stash.drop(0);
 
       // refs/stash and reflog should be removed
-      expect(filesApi.files.has(".git/refs/stash")).toBe(false);
-      expect(filesApi.files.has(".git/logs/refs/stash")).toBe(false);
+      expect(await gitFiles.text(".git/refs/stash")).toBeUndefined();
+      expect(await gitFiles.text(".git/logs/refs/stash")).toBeUndefined();
     });
 
     it("should update refs/stash after drop", async () => {
@@ -410,12 +375,9 @@ describe("GitStashStore", () => {
       await stash.drop(0); // Drop second (index 0)
 
       // refs/stash should now point to first
-      const stashRef = filesApi.files.get(".git/refs/stash");
+      const stashRef = await gitFiles.text(".git/refs/stash");
       expect(stashRef).toBeDefined();
-      if (!stashRef) {
-        throw new Error("stashRef should be defined");
-      }
-      expect(new TextDecoder().decode(stashRef).trim()).not.toBe(secondId);
+      expect(stashRef?.trim()).not.toBe(secondId);
     });
   });
 
@@ -433,8 +395,8 @@ describe("GitStashStore", () => {
       }
 
       expect(entries).toHaveLength(0);
-      expect(filesApi.files.has(".git/refs/stash")).toBe(false);
-      expect(filesApi.files.has(".git/logs/refs/stash")).toBe(false);
+      expect(await gitFiles.text(".git/refs/stash")).toBeUndefined();
+      expect(await gitFiles.text(".git/logs/refs/stash")).toBeUndefined();
     });
 
     it("should not throw on empty stash", async () => {
@@ -460,7 +422,7 @@ describe("GitStashStore", () => {
       const stashId = await stash.push();
 
       const commit = await repository.commits.loadCommit(stashId);
-      expect(commit.message).toBe("WIP on main");
+      expect(commit.message).toMatch(/^WIP on main: [0-9a-f]{7} Initial commit\n$/);
     });
   });
 
@@ -479,8 +441,6 @@ describe("GitStashStore", () => {
         history: repository,
         staging,
         worktree: modifiedWorktree,
-        files: filesApi,
-        gitDir: ".git",
         getHead: async () => headCommitId,
         getBranch: async () => "main",
       });
@@ -525,8 +485,6 @@ describe("GitStashStore", () => {
         history: repository,
         staging: stagingWithTracked,
         worktree: worktreeWithUntracked,
-        files: filesApi,
-        gitDir: ".git",
         getHead: async () => headCommitId,
         getBranch: async () => "main",
       });
@@ -561,8 +519,6 @@ describe("GitStashStore", () => {
         history: repository,
         staging: stagingAllTracked,
         worktree: worktreeAllTracked,
-        files: filesApi,
-        gitDir: ".git",
         getHead: async () => headCommitId,
         getBranch: async () => "main",
       });
@@ -582,7 +538,7 @@ describe("GitStashStore", () => {
       const stashId = await stash.push("Simple string message");
 
       const commit = await repository.commits.loadCommit(stashId);
-      expect(commit.message).toBe("Simple string message");
+      expect(commit.message).toBe("On main: Simple string message\n");
     });
   });
 });
@@ -609,8 +565,6 @@ describe("GitStashStore blob sizes", () => {
       history: repository,
       staging,
       worktree,
-      files: createMockFilesApi(),
-      gitDir: ".git",
       getHead: async () => headCommitId,
       getBranch: async () => "main",
     });

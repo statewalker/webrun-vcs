@@ -10,6 +10,7 @@
 import { joinPath, readText, tryReadText } from "@statewalker/vcs-core";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { CherryPickState } from "@statewalker/vcs-working-tree/transformation";
+import { createFileRefStore, type FileRefStore } from "../../refs/index.js";
 
 /**
  * Store for cherry-pick operation state
@@ -54,12 +55,15 @@ export interface CherryPickStateStore {
  */
 export class GitCherryPickStateStore implements CherryPickStateStore {
   private readonly gitDir: string;
+  /** CHERRY_PICK_HEAD and ORIG_HEAD are refs: written and removed under their `.lock`, as git. */
+  private readonly refs: FileRefStore;
 
   constructor(
     private readonly files: FilesApi,
     gitDir: string,
   ) {
     this.gitDir = gitDir;
+    this.refs = createFileRefStore(files, gitDir);
   }
 
   async read(): Promise<CherryPickState | undefined> {
@@ -88,11 +92,20 @@ export class GitCherryPickStateStore implements CherryPickStateStore {
   }
 
   async begin(state: Omit<CherryPickState, "type" | "startedAt">): Promise<void> {
-    // Write CHERRY_PICK_HEAD
-    await this.writeText(joinPath(this.gitDir, "CHERRY_PICK_HEAD"), `${state.cherryPickHead}\n`);
-
-    // Write ORIG_HEAD
-    await this.writeText(joinPath(this.gitDir, "ORIG_HEAD"), `${state.origHead}\n`);
+    // ORIG_HEAD first, then CHERRY_PICK_HEAD (which marks the operation in progress): a lock
+    // another writer holds fails begin() with nothing in progress, ORIG_HEAD restored.
+    const previous = await this.refs.get("ORIG_HEAD").catch(() => undefined);
+    await this.refs.set("ORIG_HEAD", state.origHead);
+    try {
+      await this.refs.set("CHERRY_PICK_HEAD", state.cherryPickHead);
+    } catch (error) {
+      if (previous && "objectId" in previous && previous.objectId) {
+        await this.refs.set("ORIG_HEAD", previous.objectId).catch(() => {});
+      } else {
+        await this.refs.remove("ORIG_HEAD").catch(() => false);
+      }
+      throw error;
+    }
 
     // Write MERGE_MSG if provided
     if (state.message) {
@@ -119,14 +132,21 @@ export class GitCherryPickStateStore implements CherryPickStateStore {
   // === Private Helpers ===
 
   private async removeStateFiles(): Promise<void> {
-    const stateFiles = ["CHERRY_PICK_HEAD", "MERGE_MSG", "ORIG_HEAD"];
-    for (const file of stateFiles) {
+    // Every state file goes even if one fails (a held lock); the first error is rethrown.
+    let failure: unknown;
+    for (const ref of ["CHERRY_PICK_HEAD", "ORIG_HEAD"]) {
+      await this.refs.remove(ref).catch((error) => {
+        failure ??= error;
+      });
+    }
+    for (const file of ["MERGE_MSG"]) {
       try {
         await this.files.remove(joinPath(this.gitDir, file));
       } catch {
         // Ignore errors for files that don't exist
       }
     }
+    if (failure !== undefined) throw failure;
   }
 
   private async writeText(path: string, content: string): Promise<void> {

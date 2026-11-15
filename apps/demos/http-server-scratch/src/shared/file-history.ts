@@ -97,9 +97,8 @@ export async function createFileHistory(options: CreateFileHistoryOptions): Prom
     await files.mkdir(joinPath(gitDir, "refs", "heads"));
     await files.mkdir(joinPath(gitDir, "refs", "tags"));
 
-    // Write HEAD
-    const headContent = `ref: refs/heads/${defaultBranch}\n`;
-    await files.write(joinPath(gitDir, "HEAD"), [new TextEncoder().encode(headContent)]);
+    // Write HEAD through the ref store (under HEAD.lock, as git init does)
+    await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
     // Write basic config for bare repos
     const configContent = `[core]

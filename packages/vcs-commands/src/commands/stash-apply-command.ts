@@ -380,10 +380,14 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         return ref.objectId;
       }
 
-      // For other indices, need reflog support
-      // Note: The core Refs interface doesn't include reflog methods.
-      // Without reflog, we can only access the most recent stash (index 0).
-      throw new RefNotFoundError(refName, `Stash entry ${index} not found (reflog not supported)`);
+      // Older entries are in the ref's reflog (stash@{n}), as git reads them
+      const reflog = await this.refsStore.getReflog?.(baseRef);
+      if (!reflog) {
+        throw new RefNotFoundError(refName, `Stash entry ${index} not found (no reflog)`);
+      }
+      const entry = await reflog.getReverseEntry(index);
+      if (!entry) throw new RefNotFoundError(refName, `Stash entry ${index} not found`);
+      return entry.newId;
     }
 
     // Try as direct ref

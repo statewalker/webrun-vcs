@@ -1,4 +1,4 @@
-import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
 
 import { NoHeadError, RefNotFoundError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -127,7 +127,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   }
 
   /**
-   * Set a custom stash message.
+   * Set a custom stash message; the stash is then "On <branch>: <message>", as `git stash push -m`.
    *
    * @param message The custom message
    */
@@ -248,9 +248,11 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const shortMessage = headCommit.message.split("\n")[0];
 
     const indexMsg = this.formatMessage(this.indexMessage, branch, abbrev, shortMessage);
+    // git: `stash push -m <msg>` is "On <branch>: <msg>"
     const workingMsg =
-      this.customMessage ??
-      this.formatMessage(this.workingDirectoryMessage, branch, abbrev, shortMessage);
+      this.customMessage !== undefined
+        ? `On ${branch}: ${this.customMessage}`
+        : this.formatMessage(this.workingDirectoryMessage, branch, abbrev, shortMessage);
 
     // Create index commit (parent: HEAD)
     const indexCommit = await this.commits.store({
@@ -291,7 +293,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
 
     // Update stash ref
     if (this.ref) {
-      await this.updateStashRef(this.ref, stashCommit, workingMsg);
+      await this.updateStashRef(this.ref, stashCommit, workingMsg, author);
     }
 
     // Reset working directory (if provider supports it)
@@ -323,17 +325,29 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       // Strip refs/heads/ prefix
       return branch.replace(/^refs\/heads\//, "");
     }
-    return "HEAD";
+    return "(no branch)"; // detached HEAD, as git names it
   }
 
   /**
-   * Update the stash ref.
-   *
-   * Note: Reflog support is not part of the core Refs interface.
-   * Stash history is tracked via parent commit chain instead.
+   * Update the stash ref as `git stash` does (update_ref with REF_FORCE_CREATE_REFLOG):
+   * a one-ref batch, under `<ref>.lock` on git files, that creates the ref's reflog and
+   * appends a line with the stash commit's message, so the stash is `stash@{0}` and the
+   * earlier ones move down the reflog.
    */
-  private async updateStashRef(ref: string, commitId: ObjectId, _message: string): Promise<void> {
-    // Update ref
-    await this.refsStore.set(ref, commitId);
+  private async updateStashRef(
+    ref: string,
+    commitId: ObjectId,
+    message: string,
+    who: PersonIdent,
+  ): Promise<void> {
+    const result = await this.refsStore.batch([{ name: ref, new: commitId }], {
+      ident: formatPersonIdent(who),
+      message,
+      createReflog: true,
+    });
+    if (!result.ok) {
+      const why = result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ");
+      throw new Error(`Cannot save the current status: ${why}`);
+    }
   }
 }

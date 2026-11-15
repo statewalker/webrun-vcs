@@ -139,7 +139,7 @@ describe.each(backends)("StashCreateCommand ($name backend)", ({ factory }) => {
     // Load the stash commit and check message
     const commit = await repository.commits.load(stashCommit);
     if (!commit) throw new Error("commit not found");
-    expect(commit.message).toBe("My custom stash message");
+    expect(commit.message).toBe("On main: My custom stash message"); // git: stash push -m
   });
 
   /**
@@ -828,5 +828,119 @@ describe.each(backends)("StashListCommand - additional tests ($name backend)", (
 
     // Attempting to call again should throw
     await expect(command.call()).rejects.toThrow();
+  });
+});
+
+describe.each(backends)(
+  "stash@{n} through the reflog of refs/stash ($name backend)",
+  ({ factory }) => {
+    let cleanup: (() => Promise<void>) | undefined;
+
+    afterEach(async () => {
+      if (cleanup) {
+        await cleanup();
+        cleanup = undefined;
+      }
+    });
+
+    /** Three stashes, as `git stash` keeps them: refs/stash and one reflog line each. */
+    async function threeStashes() {
+      const result = await createInitializedGitFromFactory(factory);
+      cleanup = result.cleanup;
+      const { git, workingCopy, repository } = result;
+      await addFile(workingCopy, "file.txt", "content");
+      await git.commit().setMessage("initial").call();
+      const ids: string[] = [];
+      for (const n of [1, 2, 3]) {
+        const id = await git.stashCreate().setMessage(`s${n}`).call();
+        if (!id) throw new Error("no stash commit");
+        ids.push(id);
+      }
+      return { git, repository, ids };
+    }
+
+    it("stashCreate logs each stash; stashList lists stash@{0..2} from the reflog", async () => {
+      const { git, repository, ids } = await threeStashes();
+      const log = await repository.refs.getReflog?.("refs/stash");
+      if (!log) throw new Error("both test backends keep reflogs");
+      expect((await log.getReverseEntries()).map((e) => [e.newId, e.comment])).toEqual([
+        [ids[2], "On main: s3"],
+        [ids[1], "On main: s2"],
+        [ids[0], "On main: s1"],
+      ]);
+      const list = await git.stashList().call();
+      expect(list.map((e) => [e.index, e.commitId, e.message])).toEqual([
+        [0, ids[2], "On main: s3"],
+        [1, ids[1], "On main: s2"],
+        [2, ids[0], "On main: s1"],
+      ]);
+    });
+
+    it("stashApply resolves stash@{2}; stashDrop drops stash@{1} and then all, as git", async () => {
+      const { git, repository, ids } = await threeStashes();
+      expect(repository.refs.deleteReflogEntry).toBeTypeOf("function");
+      const applied = await git.stashApply().setStashRef("stash@{2}").call();
+      expect(applied.stashCommit).toBe(ids[0]);
+
+      expect(await git.stashDrop().setStashRef(1).call()).toBe(ids[2]);
+      expect((await git.stashList().call()).map((e) => e.commitId)).toEqual([ids[2], ids[0]]);
+      // dropping stash@{0} moves refs/stash to the next entry
+      expect(await git.stashDrop().call()).toBe(ids[0]);
+      expect((await repository.refs.resolve("refs/stash"))?.objectId).toBe(ids[0]);
+      await expect(git.stashDrop().setStashRef(3).call()).rejects.toThrow("stash@{3}");
+      // the last drop deletes refs/stash and its reflog
+      expect(await git.stashDrop().call()).toBeUndefined();
+      expect(await repository.refs.get("refs/stash")).toBeUndefined();
+      expect(await git.stashList().call()).toEqual([]);
+    });
+  },
+);
+
+describe.each(backends)("stash drop and messages as git ($name backend)", ({ factory }) => {
+  let cleanup: (() => Promise<void>) | undefined;
+
+  afterEach(async () => {
+    if (cleanup) {
+      await cleanup();
+      cleanup = undefined;
+    }
+  });
+
+  it("dropping the last stash keeps a stash pushed meanwhile, and succeeds", async () => {
+    const result = await createInitializedGitFromFactory(factory);
+    cleanup = result.cleanup;
+    const { git, workingCopy, repository } = result;
+    await addFile(workingCopy, "file.txt", "content");
+    await git.commit().setMessage("initial").call();
+    const only = await git.stashCreate().setMessage("only").call();
+    const pushed = await git.stashCreate().setRef(null).setMessage("pushed").call();
+    if (!only || !pushed) throw new Error("no stash commit");
+    // another writer pushes right after our reflog delete, before refs/stash is deleted
+    const refs = repository.refs;
+    const original = refs.deleteReflogEntry?.bind(refs);
+    if (!original) throw new Error("both test backends keep reflogs");
+    refs.deleteReflogEntry = async (...args) => {
+      const left = await original(...args);
+      await refs.batch([{ name: "refs/stash", new: pushed }], {
+        message: "On main: pushed",
+        createReflog: true,
+      });
+      return left;
+    };
+    expect(await git.stashDrop().call()).toBe(pushed);
+    expect((await repository.refs.resolve("refs/stash"))?.objectId).toBe(pushed);
+    expect((await git.stashList().call()).map((e) => e.message)).toEqual(["On main: pushed"]);
+  });
+
+  it("a detached HEAD stashes as '(no branch)'", async () => {
+    const result = await createInitializedGitFromFactory(factory);
+    cleanup = result.cleanup;
+    const { git, workingCopy, repository } = result;
+    await addFile(workingCopy, "file.txt", "content");
+    const head = await git.commit().setMessage("initial").call();
+    await repository.refs.set("HEAD", head.id);
+    const id = await git.stashCreate().setMessage("detached").call();
+    if (!id) throw new Error("no stash commit");
+    expect((await repository.commits.load(id))?.message).toBe("On (no branch): detached");
   });
 });

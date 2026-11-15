@@ -8,11 +8,14 @@ import {
   type BatchOptions,
   type BatchResult,
   createReflogReaderOf,
+  deleteReflogLine,
   type ObjectId,
   planRefBatch,
   planReflog,
   type Ref,
   type RefCommand,
+  type ReflogDeleteOptions,
+  ReflogEntryNotFoundError,
   type ReflogReader,
   RefStorage,
   type Refs,
@@ -171,6 +174,50 @@ export class SQLRefStore implements Refs {
     return createReflogReaderOf(
       rows.map((r) => ({ oldId: r.old_id, newId: r.new_id, ident: r.ident, message: r.message })),
     );
+  }
+
+  /**
+   * Delete reflog entry `refName@{index}` (see {@link Refs.deleteReflogEntry}) in one
+   * transaction: the row goes, the kept rows are relinked (`rewrite`), and the ref moves
+   * to the newest kept entry (`updateRef`).
+   */
+  async deleteReflogEntry(
+    refName: string,
+    index: number,
+    options: ReflogDeleteOptions = {},
+  ): Promise<number> {
+    return this.db.transaction(async (tx) => {
+      const rows = await tx.query<{ id: number; old_id: string; new_id: string }>(
+        "SELECT id, old_id, new_id FROM vcs_reflog WHERE name = ? ORDER BY id",
+        [refName],
+      );
+      const lines = rows.map((r) => ({ id: r.id, oldId: r.old_id, newId: r.new_id }));
+      const kept = deleteReflogLine(lines, index, options.rewrite);
+      const removed = lines[lines.length - 1 - index];
+      if (!kept || !removed) throw new ReflogEntryNotFoundError(refName, index);
+      await tx.execute("DELETE FROM vcs_reflog WHERE id = ?", [removed.id]);
+      for (const line of kept) {
+        const before = lines.find((l) => l.id === line.id);
+        if (before && before.oldId !== line.oldId) {
+          await tx.execute("UPDATE vcs_reflog SET old_id = ? WHERE id = ?", [line.oldId, line.id]);
+        }
+      }
+      const top = kept.at(-1);
+      if (options.updateRef && top) {
+        // git's rule: the ref takes the newest kept entry (created if absent), unless symbolic
+        await tx.execute(
+          `INSERT INTO vcs_ref (name, object_id, target, storage, updated_at)
+           VALUES (?, ?, NULL, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET
+             object_id = excluded.object_id,
+             peeled_object_id = NULL,
+             updated_at = excluded.updated_at
+           WHERE vcs_ref.target IS NULL`,
+          [refName, top.newId, RefStorage.LOOSE, Date.now()],
+        );
+      }
+      return kept.length;
+    });
   }
 
   /**

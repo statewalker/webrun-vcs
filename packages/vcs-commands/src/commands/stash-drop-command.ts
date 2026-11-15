@@ -11,8 +11,9 @@ import { STASH_REF } from "./stash-list-command.js";
  *
  * Based on JGit's StashDropCommand.
  *
- * Note: Without reflog support in Refs, only the most recent stash (index 0)
- * can be dropped. Dropping by index > 0 requires reflog support.
+ * With a ref store that keeps reflogs (`getReflog`, `deleteReflogEntry`), any
+ * `stash@{n}` can be dropped, as git drops it; otherwise only the most recent
+ * stash (index 0).
  *
  * @example
  * ```typescript
@@ -92,10 +93,39 @@ export class StashDropCommand extends GitCommand<ObjectId | undefined> {
       return undefined;
     }
 
-    // Drop all stashes - just delete the ref
+    // Drop all stashes: delete the ref and its reflog (`git stash clear`)
     if (this.dropAll) {
-      await this.refsStore.delete(STASH_REF);
+      await this.deleteStashRef(stashRef.objectId);
       return undefined;
+    }
+
+    // With reflog support, as `git stash drop stash@{n}`: `git reflog delete --rewrite
+    // --updateref refs/stash@{n}` (under the ref's and the log's locks on git files),
+    // then the ref goes once no entry is left.
+    const refs = this.refsStore;
+    const reflog = await refs.getReflog?.(STASH_REF);
+    if (reflog && refs.deleteReflogEntry) {
+      if (!(await reflog.getReverseEntry(this.stashRefEntry))) {
+        throw new InvalidStashIndexError(
+          this.stashRefEntry,
+          `stash@{${this.stashRefEntry}} does not exist`,
+        );
+      }
+      const left = await refs.deleteReflogEntry(STASH_REF, this.stashRefEntry, {
+        rewrite: true,
+        updateRef: true,
+      });
+      // As git: refs/stash goes only once refs/stash@{0} no longer exists, re-checked
+      // now, so a stash pushed since the drop is kept (and returned).
+      const top = await (await refs.getReflog?.(STASH_REF))?.getReverseEntry(0);
+      if (left > 0 || top) return top?.newId;
+      const current = await refs.get(STASH_REF);
+      if (current && "objectId" in current && current.objectId) {
+        // a push between our read and the delete wins: the drop itself has succeeded
+        await this.deleteStashRef(current.objectId, { ignoreMismatch: true });
+      }
+      const after = await (await refs.getReflog?.(STASH_REF))?.getReverseEntry(0);
+      return after?.newId;
     }
 
     // Without reflog support, we can only drop the most recent stash (index 0)
@@ -109,7 +139,25 @@ export class StashDropCommand extends GitCommand<ObjectId | undefined> {
     }
 
     // Drop stash@{0} by deleting the ref
-    await this.refsStore.delete(STASH_REF);
+    await this.deleteStashRef(stashRef.objectId);
     return undefined;
+  }
+
+  /**
+   * Delete `refs/stash` and its reflog if it still holds `expected` (git's clear_stash).
+   * With `ignoreMismatch`, a ref another writer moved meanwhile is left alone.
+   */
+  private async deleteStashRef(
+    expected: ObjectId,
+    options: { ignoreMismatch?: boolean } = {},
+  ): Promise<void> {
+    const result = await this.refsStore.batch([
+      { name: STASH_REF, old: expected, new: null, noDeref: true },
+    ]);
+    const moved = result.rejected.every((r) => r.reason === "mismatch");
+    if (!result.ok && !(options.ignoreMismatch && moved)) {
+      const why = result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ");
+      throw new Error(`Cannot drop the stash: ${why}`);
+    }
   }
 }

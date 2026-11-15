@@ -14,6 +14,7 @@
 import type { ObjectId } from "../../common/index.js";
 import type { BatchOptions, BatchResult, RefCommand } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
+import type { ReflogDeleteOptions } from "./reflog-lines.js";
 import type { ReflogEntry, ReflogReader } from "./reflog-types.js";
 
 /**
@@ -198,6 +199,25 @@ export interface Refs {
    * @returns ReflogReader or undefined if no reflog exists
    */
   getReflog?(name: string): Promise<ReflogReader | undefined>;
+
+  /**
+   * Delete reflog entry `name@{index}` (0 = newest), as `git reflog delete`: on git
+   * files under `<name>.lock` and `logs/<name>.lock`, the log rewritten into its lock
+   * and renamed, then (with `updateRef`) the ref committed from its lock. `git stash
+   * drop` is `deleteReflogEntry("refs/stash", n, { rewrite: true, updateRef: true })`,
+   * followed by deleting `refs/stash` once no entry is left.
+   *
+   * Throws `ReflogEntryNotFoundError` when there is no such entry, and the store's lock
+   * error when another writer holds a lock, with nothing changed.
+   *
+   * @returns How many entries the log keeps.
+   *
+   * @example
+   * ```typescript
+   * const left = await refs.deleteReflogEntry?.("refs/stash", 1, { rewrite: true, updateRef: true });
+   * ```
+   */
+  deleteReflogEntry?(name: string, index: number, options?: ReflogDeleteOptions): Promise<number>;
 
   /**
    * Pack loose refs

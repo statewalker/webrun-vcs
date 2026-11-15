@@ -114,7 +114,7 @@ export async function createGitFilesBackend(
   const packDir = joinPath(objectsDir, "pack");
 
   if (create) {
-    await createGitDirectoryStructure(files, gitDir, objectsDir, defaultBranch);
+    await createGitDirectoryStructure(files, gitDir, objectsDir);
   }
 
   // Objects: the installed packs first, then the kernel over git's loose layout
@@ -142,6 +142,8 @@ export async function createGitFilesBackend(
     logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
     reflogIdentity: options.reflogIdentity ?? reflog.identity,
   });
+  // HEAD as git init writes it (create_symref): `ref: …` into HEAD.lock, renamed over HEAD
+  if (create) await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
   const history = createHistoryFromComponents({
     objects,
@@ -194,13 +196,12 @@ async function readReflogConfig(
 }
 
 /**
- * Create standard .git directory structure.
+ * Create standard .git directory structure (HEAD is written by the ref store, under its lock).
  */
 async function createGitDirectoryStructure(
   files: FilesApi,
   gitDir: string,
   objectsDir: string,
-  defaultBranch: string,
 ): Promise<void> {
   await files.mkdir(gitDir);
   await files.mkdir(objectsDir);
@@ -210,9 +211,6 @@ async function createGitDirectoryStructure(
   await files.mkdir(joinPath(gitDir, "refs", "tags"));
 
   const encoder = new TextEncoder();
-  await files.write(joinPath(gitDir, "HEAD"), [
-    encoder.encode(`ref: refs/heads/${defaultBranch}\n`),
-  ]);
   await files.write(joinPath(gitDir, "config"), [
     encoder.encode(
       `[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = ${gitDir === "." ? "true" : "false"}\n`,

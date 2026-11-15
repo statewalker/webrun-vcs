@@ -15,17 +15,14 @@ import type {
   Worktree,
 } from "@statewalker/vcs-working-tree";
 
-import { createGitStashStore, type StashFilesApi } from "./stash-store.files.js";
+import { createGitStashStore } from "./stash-store.files.js";
 import { GitWorkingCopy, type WorkingCopyFilesApi } from "./working-copy.files.js";
 import { type ConfigFilesApi, createWorkingCopyConfig } from "./working-copy-config.files.js";
 
 /**
  * Combined files API for all working copy operations
  */
-export interface WorkingCopyFactoryFilesApi
-  extends WorkingCopyFilesApi,
-    StashFilesApi,
-    ConfigFilesApi {
+export interface WorkingCopyFactoryFilesApi extends WorkingCopyFilesApi, ConfigFilesApi {
   /** Create a directory (and parents if needed) */
   mkdir(path: string): Promise<void>;
   /** Write content to a file */
@@ -76,13 +73,11 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     // 3. Create working tree interface
     const worktree = context.createWorktree(worktreePath);
 
-    // 4. Create stash store
+    // 4. Create stash store (refs/stash in the history's ref store, under its locks)
     const stash = createGitStashStore({
       history: context.history,
       staging: checkout.staging,
       worktree: worktree,
-      files: this.files,
-      gitDir: repositoryPath,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
     });
@@ -146,7 +141,9 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     // Create gitdir file in worktrees/NAME pointing back to worktree
     await this.files.writeFile(`${worktreeGitDir}/gitdir`, `${worktreePath}/.git\n`);
 
-    // Set up HEAD in worktrees/NAME
+    // Set up HEAD in worktrees/NAME. Written plainly, as git's `worktree add` writes the
+    // new worktree's HEAD (write_file): worktrees/NAME was created just above and no other
+    // writer knows it yet. Later HEAD updates go through that worktree's ref store (locked).
     if (commit) {
       // Detached HEAD
       await this.files.writeFile(`${worktreeGitDir}/HEAD`, `${commit}\n`);
@@ -184,13 +181,11 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     // Create working tree interface
     const worktree = context.createWorktree(worktreePath);
 
-    // Create stash store (uses main repo's stash)
+    // Create stash store (the main repository's refs/stash, as git shares it across worktrees)
     const stash = createGitStashStore({
       history: context.history,
       staging: checkout.staging,
       worktree: worktree,
-      files: this.files,
-      gitDir: worktreeGitDir,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
     });

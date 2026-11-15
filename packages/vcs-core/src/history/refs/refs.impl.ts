@@ -14,7 +14,12 @@ import {
 } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import { RefStorage } from "./ref-types.js";
-import { createReflogReaderOf } from "./reflog-lines.js";
+import {
+  createReflogReaderOf,
+  deleteReflogLine,
+  type ReflogDeleteOptions,
+  ReflogEntryNotFoundError,
+} from "./reflog-lines.js";
 import type { ReflogReader } from "./reflog-types.js";
 import type { RefEntry, Refs, RefUpdateResult, RefValue } from "./refs.js";
 
@@ -208,7 +213,26 @@ export class MemoryRefs implements Refs {
   /** The reflog of `name` (written by `batch`), or undefined if it has none. */
   async getReflog(name: string): Promise<ReflogReader | undefined> {
     const log = this.logs.get(name);
-    return log ? createReflogReaderOf([...log]) : undefined;
+    // an emptied log reads as none, as in the KV and SQL stores
+    return log?.length ? createReflogReaderOf([...log]) : undefined;
+  }
+
+  /** Delete reflog entry `name@{index}` (see {@link Refs.deleteReflogEntry}). */
+  deleteReflogEntry(
+    name: string,
+    index: number,
+    options: ReflogDeleteOptions = {},
+  ): Promise<number> {
+    return this.exclusive(() => {
+      const kept = deleteReflogLine(this.logs.get(name) ?? [], index, options.rewrite);
+      if (!kept) throw new ReflogEntryNotFoundError(name, index);
+      this.logs.set(name, kept);
+      const top = kept.at(-1);
+      if (options.updateRef && top && this.refs.get(name)?.type !== "symbolic") {
+        this.refs.set(name, { type: "direct", objectId: top.newId });
+      }
+      return kept.length;
+    });
   }
 
   /**

@@ -20,7 +20,7 @@ function createMockFilesApi(): WorkingCopyFactoryFilesApi {
     stat: vi.fn().mockResolvedValue(undefined),
     mkdir: vi.fn().mockResolvedValue(undefined),
     writeFile: vi.fn().mockResolvedValue(undefined),
-    // From StashFilesApi
+    // Extra methods the factory does not use
     deleteFile: vi.fn(),
     rename: vi.fn(),
     // From ConfigFilesApi

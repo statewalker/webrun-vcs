@@ -1,18 +1,31 @@
 /**
- * File-based StashStore implementation using Git's refs/stash.
+ * StashStore over git's `refs/stash` and its reflog, as `git stash` keeps them.
  *
- * Design:
- * - Interface accessed via WorkingCopy.stash
- * - Storage: Central .git/refs/stash for Git compatibility
- * - Uses reflog for stash history (.git/logs/refs/stash)
+ * - `refs/stash` points at the newest stash commit; the reflog of `refs/stash`
+ *   (`logs/refs/stash` on git files) holds every stash, `stash@{0}` newest.
+ * - Every write goes through the repository's ref store (`history.refs`), so on git
+ *   files it takes git's locks: push is a one-ref batch under `refs/stash.lock` that
+ *   creates the reflog (git's REF_FORCE_CREATE_REFLOG) and appends its line under the
+ *   lock; drop is `git reflog delete --rewrite --updateref refs/stash@{n}` under
+ *   `refs/stash.lock` and `logs/refs/stash.lock`; clearing deletes the ref and its log.
+ *   Native git sees our stashes (`git stash list`, `git stash show`) and we see its own.
  *
- * Stash commit structure:
- * - Tree: working tree state (all tracked files)
- * - Parent 1: HEAD at time of stash
- * - Parent 2: commit of current index state
+ * Stash commit structure (as git's):
+ * - Tree: working tree state (tracked files)
+ * - Parent 1: HEAD at the time of the stash
+ * - Parent 2: commit of the index state ("index on <branch>: …")
+ * - Parent 3 (optional): commit of the untracked files
  */
 
-import type { History, ObjectId, PersonIdent, TreeEntry } from "@statewalker/vcs-core";
+import {
+  formatPersonIdent,
+  type History,
+  isSymbolicRef,
+  type ObjectId,
+  type PersonIdent,
+  type Refs,
+  type TreeEntry,
+} from "@statewalker/vcs-core";
 import type {
   Staging,
   StashEntry,
@@ -21,105 +34,81 @@ import type {
   Worktree,
 } from "@statewalker/vcs-working-tree";
 import { storeWorktreeFile } from "@statewalker/vcs-working-tree";
+import { RefUpdateRejectedError } from "../../refs/index.js";
+
+/** git's stash ref. */
+export const STASH_REF = "refs/stash";
 
 /**
- * Files API subset needed for stash operations
- */
-export interface StashFilesApi {
-  read(path: string): Promise<Uint8Array | undefined>;
-  write(path: string, content: Uint8Array): Promise<void>;
-  remove(path: string): Promise<void>;
-  mkdir(path: string): Promise<void>;
-  exists(path: string): Promise<boolean>;
-}
-
-/**
- * Extended options for creating GitStashStore with full push/apply support.
+ * Options for creating GitStashStore with full push/apply support.
  */
 export interface GitStashStoreOptions {
-  /** History interface for object storage */
+  /** History: objects, and the ref store that holds `refs/stash` and its reflog */
   history: History;
   /** Staging area for index state */
   staging: Staging;
   /** Working tree iterator for reading files */
   worktree: Worktree;
-  /** Files API for stash metadata */
-  files: StashFilesApi;
-  /** Path to .git directory */
-  gitDir: string;
   /** Function to get current HEAD commit ID */
   getHead: () => Promise<ObjectId | undefined>;
   /** Function to get current branch name */
   getBranch: () => Promise<string | undefined>;
-  /** Default author for stash commits */
-  author?: PersonIdent;
+  /** Identity of stash commits and reflog lines (the time is taken at each push) */
+  author?: Omit<PersonIdent, "timestamp">;
 }
 
 /**
- * Git-compatible stash store implementation.
- *
- * A stash commit has 2-3 parents:
- * - Parent 1: HEAD at time of stash
- * - Parent 2: Index state commit
- * - Parent 3 (optional): Untracked files commit
- *
- * Tree contains working tree state.
+ * Git-compatible stash store: `refs/stash` and its reflog in the history's ref store.
  */
 export class GitStashStore implements StashStore {
   private readonly history: History;
   private readonly staging: Staging;
   private readonly worktree: Worktree;
-  private readonly files: StashFilesApi;
-  private readonly gitDir: string;
   private readonly getHead: () => Promise<ObjectId | undefined>;
   private readonly getBranch: () => Promise<string | undefined>;
-  private readonly defaultAuthor: PersonIdent;
+  private readonly defaultAuthor: Omit<PersonIdent, "timestamp">;
 
   constructor(options: GitStashStoreOptions) {
     this.history = options.history;
     this.staging = options.staging;
     this.worktree = options.worktree;
-    this.files = options.files;
-    this.gitDir = options.gitDir;
     this.getHead = options.getHead;
     this.getBranch = options.getBranch;
     this.defaultAuthor = options.author ?? {
       name: "Git Stash",
       email: "stash@localhost",
-      timestamp: Date.now(),
       tzOffset: "+0000",
     };
   }
 
+  private get refs(): Refs {
+    return this.history.refs;
+  }
+
   /**
-   * List all stash entries from reflog.
-   * Entries are yielded in order (stash@{0} first).
+   * List the stash entries from the reflog of `refs/stash`, `stash@{0}` first. The
+   * message is the reflog message, as `git stash list` shows it.
    */
   async *list(): AsyncIterable<StashEntry> {
-    const reflogPath = `${this.gitDir}/logs/refs/stash`;
-    const content = await this.files.read(reflogPath);
-    if (!content) return;
-
-    const lines = new TextDecoder().decode(content).trim().split("\n");
-
-    // Reflog entries are newest-last, so reverse for stash order
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const entry = parseReflogEntry(lines[i], lines.length - 1 - i);
-      if (entry) yield entry;
+    const reflog = await this.refs.getReflog?.(STASH_REF);
+    if (!reflog) return;
+    const entries = await reflog.getReverseEntries();
+    for (const [index, entry] of entries.entries()) {
+      yield {
+        index,
+        commitId: entry.newId,
+        message: entry.comment,
+        timestamp: entry.who.timestamp * 1000, // milliseconds
+      };
     }
   }
 
   /**
-   * Push current changes to stash.
-   *
-   * Creates a special stash commit with:
-   * - Tree: current working tree state
-   * - Parent 1: current HEAD
-   * - Parent 2: commit of current index state
-   * - Parent 3 (optional): untracked files commit
+   * Push current changes to stash, as `git stash push`: the stash commits, then
+   * `refs/stash` updated with a reflog line whose message is the stash commit's
+   * ("WIP on <branch>: <abbrev> <subject>", or "On <branch>: <message>").
    */
   async push(messageOrOptions?: string | StashPushOptions): Promise<ObjectId> {
-    // Parse options
     const options: StashPushOptions =
       typeof messageOrOptions === "string"
         ? { message: messageOrOptions }
@@ -130,66 +119,57 @@ export class GitStashStore implements StashStore {
       throw new Error("Cannot stash: no commits in repository");
     }
 
-    const branch = (await this.getBranch()) ?? "HEAD";
-    const now = Date.now();
+    const branch = (await this.getBranch()) ?? "(no branch)";
     const author: PersonIdent = {
       ...this.defaultAuthor,
-      timestamp: now,
+      timestamp: Math.floor(Date.now() / 1000),
     };
+    const headCommit = await this.history.commits.load(head).catch(() => undefined);
+    const subject = headCommit?.message.split("\n")[0] ?? "";
+    const onHead = `${branch}: ${head.slice(0, 7)} ${subject}`;
 
-    // 1. Create tree from index (this is what stash stores)
+    // 1. The index tree, and its commit (parent: HEAD)
     const indexTree = await this.staging.writeTree(this.history.trees);
-
-    // 2. Create index state commit (parent = HEAD)
     const indexCommitId = await this.history.commits.store({
       tree: indexTree,
       parents: [head],
       author,
       committer: author,
-      message: `index on ${branch}: WIP`,
+      message: `index on ${onHead}\n`,
     });
 
-    // 3. Create worktree tree by merging index with worktree changes
+    // 2. The working tree: the index with the worktree's changes
     const worktreeTree = await this.createWorktreeTree(indexTree);
-
-    // 4. Build parents array
     const parents: ObjectId[] = [head, indexCommitId];
 
-    // 5. If includeUntracked, create untracked files commit (3rd parent)
+    // 3. With includeUntracked, the untracked files commit (3rd parent)
     if (options.includeUntracked) {
-      const untrackedCommitId = await this.createUntrackedFilesCommit(author, branch);
+      const untrackedCommitId = await this.createUntrackedFilesCommit(author, onHead);
       if (untrackedCommitId) {
         parents.push(untrackedCommitId);
       }
     }
 
-    // 6. Create stash commit
-    const stashMessage = options.message ?? `WIP on ${branch}`;
+    // 4. The stash commit
+    const stashMessage =
+      options.message !== undefined ? `On ${branch}: ${options.message}` : `WIP on ${onHead}`;
     const stashCommitId = await this.history.commits.store({
       tree: worktreeTree,
       parents,
       author,
       committer: author,
-      message: stashMessage,
+      message: `${stashMessage}\n`,
     });
 
-    // 7. Get old stash ref for reflog
-    const oldStash = await this.getStashRef();
-
-    // 8. Update refs/stash
-    await this.ensureDir(`${this.gitDir}/refs`);
-    await this.files.write(
-      `${this.gitDir}/refs/stash`,
-      new TextEncoder().encode(`${stashCommitId}\n`),
-    );
-
-    // 9. Add reflog entry
-    await this.addReflogEntry(
-      oldStash ?? "0000000000000000000000000000000000000000",
-      stashCommitId,
-      author,
-      `stash: ${stashMessage}`,
-    );
+    // 5. refs/stash and its reflog line, under refs/stash.lock (git's update_ref with
+    //    REF_FORCE_CREATE_REFLOG and no old-value check)
+    const result = await this.refs.batch([{ name: STASH_REF, new: stashCommitId }], {
+      ident: formatPersonIdent(author),
+      message: stashMessage,
+      createReflog: true,
+    });
+    // refused (another writer holds refs/stash.lock: code "ELOCKED"); nothing changed
+    if (!result.ok) throw new RefUpdateRejectedError(result.rejected);
 
     return stashCommitId;
   }
@@ -204,7 +184,7 @@ export class GitStashStore implements StashStore {
    */
   private async createUntrackedFilesCommit(
     author: PersonIdent,
-    branch: string,
+    onHead: string,
   ): Promise<ObjectId | undefined> {
     // Collect set of tracked paths from index
     const trackedPaths = new Set<string>();
@@ -249,7 +229,7 @@ export class GitStashStore implements StashStore {
       parents: [],
       author,
       committer: author,
-      message: `untracked files on ${branch}`,
+      message: `untracked files on ${onHead}\n`,
     });
   }
 
@@ -329,134 +309,41 @@ export class GitStashStore implements StashStore {
    * Get stash commit at given index.
    */
   private async getStashCommit(index: number): Promise<ObjectId | undefined> {
-    let current = 0;
-    for await (const entry of this.list()) {
-      if (current === index) {
-        return entry.commitId;
-      }
-      current++;
-    }
-    return undefined;
+    const reflog = await this.refs.getReflog?.(STASH_REF);
+    return (await reflog?.getReverseEntry(index))?.newId;
   }
 
   /**
-   * Drop a stash entry.
+   * Drop a stash entry, as `git stash drop stash@{n}`: `git reflog delete --rewrite
+   * --updateref refs/stash@{n}`, and once no entry is left, `refs/stash` is deleted.
    */
   async drop(index = 0): Promise<void> {
-    const reflogPath = `${this.gitDir}/logs/refs/stash`;
-    const content = await this.files.read(reflogPath);
-    if (!content) return;
-
-    const lines = new TextDecoder().decode(content).trim().split("\n");
-    const targetLine = lines.length - 1 - index;
-
-    if (targetLine < 0 || targetLine >= lines.length) {
+    const refs = this.refs;
+    if (!refs.deleteReflogEntry) {
+      throw new Error("Cannot drop a stash entry: this ref store keeps no reflog");
+    }
+    if (!(await this.getStashCommit(index))) {
       throw new Error(`stash@{${index}} does not exist`);
     }
-
-    // Remove the line
-    lines.splice(targetLine, 1);
-
-    if (lines.length === 0) {
-      // No more stash entries, clean up
-      await this.clear();
-    } else {
-      // Update reflog
-      await this.files.write(reflogPath, new TextEncoder().encode(`${lines.join("\n")}\n`));
-
-      // Update refs/stash to point to new top
-      const topEntry = parseReflogEntry(lines[lines.length - 1], 0);
-      if (topEntry) {
-        await this.files.write(
-          `${this.gitDir}/refs/stash`,
-          new TextEncoder().encode(`${topEntry.commitId}\n`),
-        );
-      }
-    }
+    const left = await refs.deleteReflogEntry(STASH_REF, index, {
+      rewrite: true,
+      updateRef: true,
+    });
+    // as git: refs/stash goes once refs/stash@{0} no longer exists (re-checked, so a
+    // stash pushed meanwhile is kept)
+    if (left === 0 && !(await this.getStashCommit(0))) await this.clear();
   }
 
   /**
-   * Clear all stash entries.
+   * Clear all stash entries: `refs/stash` and its reflog deleted, under the ref's lock.
    */
   async clear(): Promise<void> {
-    await this.files.remove(`${this.gitDir}/refs/stash`);
-    await this.files.remove(`${this.gitDir}/logs/refs/stash`);
+    const current = await this.refs.get(STASH_REF);
+    if (!current) return;
+    const old = isSymbolicRef(current) ? undefined : current.objectId;
+    const result = await this.refs.batch([{ name: STASH_REF, old, new: null, noDeref: true }]);
+    if (!result.ok) throw new RefUpdateRejectedError(result.rejected);
   }
-
-  /**
-   * Get current stash ref.
-   */
-  private async getStashRef(): Promise<ObjectId | undefined> {
-    const content = await this.files.read(`${this.gitDir}/refs/stash`);
-    if (!content) return undefined;
-    return new TextDecoder().decode(content).trim();
-  }
-
-  /**
-   * Add a reflog entry.
-   */
-  private async addReflogEntry(
-    oldSha: ObjectId,
-    newSha: ObjectId,
-    author: PersonIdent,
-    message: string,
-  ): Promise<void> {
-    const reflogPath = `${this.gitDir}/logs/refs/stash`;
-
-    // Ensure logs/refs directory exists
-    await this.ensureDir(`${this.gitDir}/logs`);
-    await this.ensureDir(`${this.gitDir}/logs/refs`);
-
-    // Format: <old-sha> <new-sha> <author> <timestamp> <timezone>\t<message>
-    const timestamp = Math.floor(author.timestamp / 1000);
-    const line = `${oldSha} ${newSha} ${author.name} <${author.email}> ${timestamp} ${author.tzOffset}\t${message}\n`;
-
-    // Append to existing reflog
-    const existing = await this.files.read(reflogPath);
-    const content = existing
-      ? new TextEncoder().encode(new TextDecoder().decode(existing) + line)
-      : new TextEncoder().encode(line);
-
-    await this.files.write(reflogPath, content);
-  }
-
-  /**
-   * Ensure directory exists.
-   */
-  private async ensureDir(path: string): Promise<void> {
-    const exists = await this.files.exists(path);
-    if (!exists) {
-      await this.files.mkdir(path);
-    }
-  }
-}
-
-/**
- * Parse a reflog entry line.
- *
- * Format: <old-sha> <new-sha> <author> <timestamp> <timezone>\t<message>
- */
-function parseReflogEntry(line: string, index: number): StashEntry | undefined {
-  if (!line.trim()) return undefined;
-
-  const tabIndex = line.indexOf("\t");
-  if (tabIndex === -1) return undefined;
-
-  const header = line.substring(0, tabIndex);
-  const message = line.substring(tabIndex + 1);
-
-  const parts = header.split(" ");
-  if (parts.length < 5) return undefined;
-
-  const newSha = parts[1];
-  const timestamp = parseInt(parts[parts.length - 2], 10);
-
-  return {
-    index,
-    commitId: newSha,
-    message: message.replace(/^stash:\s*/, ""),
-    timestamp: timestamp * 1000, // Convert to milliseconds
-  };
 }
 
 /**
