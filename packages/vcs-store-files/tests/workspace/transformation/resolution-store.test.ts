@@ -771,6 +771,44 @@ describe("ResolutionStore streams worktree files", () => {
     expect(probe.maxOutstanding).toBe(0);
   });
 
+  it("defaults the worktree to the parent of gitDir without a `..` path", async () => {
+    // webrun-files 0.12 resolves `..` itself and throws above the root, so the
+    // default worktree must be computed, not left as `<gitDir>/..` for the store.
+    const staging = createMemoryGitStaging();
+    await withConflict(staging);
+    const inner = createInMemoryFilesApi();
+    await inner.mkdir("/repo/.git");
+    const content = new TextEncoder().encode("resolved content without markers");
+    await inner.write("/repo/conflict.txt", [content]);
+    const seen: string[] = [];
+    const files = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          if (typeof args[0] === "string") seen.push(args[0]);
+          return value.apply(target, args);
+        };
+      },
+    });
+    const stored: number[] = [];
+    const blobs = {
+      load: async () => undefined,
+      store: async (data: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<string> => {
+        let bytes = 0;
+        for await (const chunk of data) bytes += chunk.length;
+        stored.push(bytes);
+        return "resolved5555555555555555555555555555555";
+      },
+    };
+    const store = new GitResolutionStore(files, staging, blobs as never, "/repo/.git");
+
+    await store.markAllResolved();
+    expect(stored).toEqual([content.length]);
+    expect(seen).toContain("/repo/conflict.txt");
+    expect(seen.filter((path) => path.split("/").includes(".."))).toEqual([]);
+  });
+
   it("markAllResolved stores the worktree file as a stream of known size", async () => {
     const staging = createMemoryGitStaging();
     await withConflict(staging);
