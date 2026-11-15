@@ -87,6 +87,9 @@ catalogs:
     '@vitest/browser':
       specifier: ^5.1.0
       version: 5.1.0
+    '@vitest/browser-playwright':
+      specifier: ^5.1.0
+      version: 5.1.0
     '@vitest/coverage-v8':
       specifier: ^5.1.0
       version: 5.1.0
@@ -179,7 +182,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   apps/benchmarks/delta-compression:
     dependencies:
@@ -538,7 +541,7 @@ importers:
         version: 8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1)
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   apps/demos/versioned-documents:
     dependencies:
@@ -636,7 +639,7 @@ importers:
         version: 8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1)
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   apps/demos/xet-transfer-huggingface:
     dependencies:
@@ -956,7 +959,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-core:
     dependencies:
@@ -981,7 +984,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-integration-tests:
     devDependencies:
@@ -1017,7 +1020,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-store-files:
     dependencies:
@@ -1048,7 +1051,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-store-kv:
     dependencies:
@@ -1076,7 +1079,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-store-mem:
     dependencies:
@@ -1104,7 +1107,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-store-sql:
     dependencies:
@@ -1138,7 +1141,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-testing:
     dependencies:
@@ -1163,7 +1166,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-testing-gitea:
     devDependencies:
@@ -1193,7 +1196,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-transport:
     dependencies:
@@ -1227,7 +1230,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-transport-adapters:
     dependencies:
@@ -1255,7 +1258,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-transport-httpeers:
     dependencies:
@@ -1298,7 +1301,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-transport-lfs:
     dependencies:
@@ -1332,7 +1335,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-transport-xet:
     dependencies:
@@ -1372,7 +1375,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-utils:
     dependencies:
@@ -1395,6 +1398,9 @@ importers:
       '@vitest/browser':
         specifier: 'catalog:'
         version: 5.1.0(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))(vitest@5.1.0)
+      '@vitest/browser-playwright':
+        specifier: 'catalog:'
+        version: 5.1.0(playwright@1.63.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))(vitest@5.1.0)
       playwright:
         specifier: 'catalog:'
         version: 1.63.0
@@ -1406,7 +1412,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-utils-node:
     dependencies:
@@ -1428,7 +1434,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-working-tree:
     dependencies:
@@ -1453,7 +1459,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/vcs-workspace:
     dependencies:
@@ -1505,7 +1511,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
 packages:
 
@@ -3026,6 +3032,12 @@ packages:
     engines: {node: '>=16.20.0'}
     cpu: [x64]
     os: [win32]
+
+  '@vitest/browser-playwright@5.1.0':
+    resolution: {integrity: sha512-3PbVvX/KNeUEzUeTTXw5bQDyfJS+WqU/UJ8RNWIojHb0mE6d/IBjuLmt+i7OpJ00tjNWv0O6XBm5ler/tEf3eg==}
+    peerDependencies:
+      playwright: '*'
+      vitest: 5.1.0
 
   '@vitest/browser@5.1.0':
     resolution: {integrity: sha512-2sjGVAC/Rs8Jwv+xxBgklNG2g1LGyNgcFMBw71AcfBstLz25UGv1+fVvvZ+z8IfSuNg3nipERijnFtoEIdRDEA==}
@@ -6602,6 +6614,19 @@ snapshots:
   '@typescript/typescript-win32-x64@7.0.2':
     optional: true
 
+  '@vitest/browser-playwright@5.1.0(playwright@1.63.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))(vitest@5.1.0)':
+    dependencies:
+      '@vitest/browser': 5.1.0(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))(vitest@5.1.0)
+      '@vitest/mocker': 5.1.0(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+      playwright: 1.63.0
+      tinyrainbow: 3.2.0
+      vitest: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+    transitivePeerDependencies:
+      - bufferutil
+      - msw
+      - utf-8-validate
+      - vite
+
   '@vitest/browser@5.1.0(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))(vitest@5.1.0)':
     dependencies:
       '@blazediff/core': 1.10.0
@@ -6612,7 +6637,7 @@ snapshots:
       pngjs: 7.0.0
       sirv: 3.0.2
       tinyrainbow: 3.2.0
-      vitest: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+      vitest: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
       ws: 8.22.0
     transitivePeerDependencies:
       - bufferutil
@@ -6630,7 +6655,7 @@ snapshots:
       obug: 3.0.0
       std-env: 4.3.0
       tinyrainbow: 3.2.0
-      vitest: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+      vitest: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
     optionalDependencies:
       '@vitest/browser': 5.1.0(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))(vitest@5.1.0)
 
@@ -6663,7 +6688,7 @@ snapshots:
       pathe: 2.0.3
       sirv: 3.0.2
       tinyrainbow: 3.2.0
-      vitest: 5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
+      vitest: 5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
   '@vitest/utils@5.1.0':
     dependencies:
@@ -8576,7 +8601,7 @@ snapshots:
       tsx: 4.23.15
       yaml: 2.9.1
 
-  vitest@5.1.0(@types/node@26.6.4)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1)):
+  vitest@5.1.0(@types/node@26.6.4)(@vitest/browser-playwright@5.1.0)(@vitest/coverage-v8@5.1.0)(@vitest/ui@5.1.0)(jsdom@23.2.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1)):
     dependencies:
       '@types/chai': 5.2.3
       '@vitest/mocker': 5.1.0(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
@@ -8594,6 +8619,7 @@ snapshots:
       why-is-node-running: 3.2.1
     optionalDependencies:
       '@types/node': 26.6.4
+      '@vitest/browser-playwright': 5.1.0(playwright@1.63.0)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))(vitest@5.1.0)
       '@vitest/coverage-v8': 5.1.0(@vitest/browser@5.1.0)(vitest@5.1.0)
       '@vitest/ui': 5.1.0(vitest@5.1.0)
       jsdom: 23.2.0

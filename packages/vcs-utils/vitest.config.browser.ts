@@ -13,6 +13,8 @@ export default defineConfig({
   test: {
     browser: {
       enabled: true,
+      // No display on CI runners (nor in containers): a headed browser exits at launch.
+      headless: true,
       provider: playwright(),
       instances: [{ browser: "chromium" }],
     },
