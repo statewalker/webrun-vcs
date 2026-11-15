@@ -6,7 +6,10 @@ import {
   createRepositoryFacade,
   createTransportRefStore,
   expandFromDestination,
+  type FetchClientResult,
+  type FetchHeadEntry,
   type FetchRefUpdate,
+  formatFetchHead,
   matchDestination,
   matchSource,
   parseRefSpec,
@@ -76,6 +79,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private refSpecs: string[] = [];
   private removeDeletedRefs = false;
   private tagOption: TagOption = TagOption.AUTO_FOLLOW;
+  private tagOptionSet = false;
+  private writeFetchHead = true;
+  private appendFetchHead = false;
   private thin = true;
   private depth?: number;
   private dryRun = false;
@@ -151,10 +157,48 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     return this.removeDeletedRefs;
   }
 
+  /**
+   * Set how tags are fetched (`--tags`, `--no-tags`, or auto-follow).
+   *
+   * Unset, a configured remote's `remote.<name>.tagOpt` (`--tags`, `--no-tags`) decides, as
+   * in git; otherwise tags are auto-followed.
+   */
   setTagOpt(option: TagOption): this {
     this.checkCallable();
     this.tagOption = option;
+    this.tagOptionSet = true;
     return this;
+  }
+
+  /**
+   * Set whether the fetch writes `FETCH_HEAD` (default true; `--no-write-fetch-head`).
+   *
+   * Written through the checkout's `writeFetchHead`; a checkout without it keeps none.
+   */
+  setWriteFetchHead(write: boolean): this {
+    this.checkCallable();
+    this.writeFetchHead = write;
+    return this;
+  }
+
+  /** Whether the fetch writes `FETCH_HEAD`. */
+  isWriteFetchHead(): boolean {
+    return this.writeFetchHead;
+  }
+
+  /**
+   * Set whether the fetched refs are added after what `FETCH_HEAD` holds instead of
+   * replacing it (`git fetch --append`).
+   */
+  setAppend(append: boolean): this {
+    this.checkCallable();
+    this.appendFetchHead = append;
+    return this;
+  }
+
+  /** Whether `FETCH_HEAD` is appended to. */
+  isAppend(): boolean {
+    return this.appendFetchHead;
   }
 
   /**
@@ -360,8 +404,24 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // tag); explicit refspecs must name refs the remote has, configured ones may not
     const fromConfig = this.refSpecs.length === 0;
     const configured = this.effectiveRefSpecs();
-    const refspecs = configured.length > 0 ? configured : ["HEAD"];
+    // git's has_merge (branch_has_merge_config): the current branch has an upstream, on
+    // whichever remote
+    const upstream = fromConfig ? await this.upstreamConfig() : undefined;
+    const upstreamHere = upstream?.remote === this.remote;
+    // git (fetch.c get_ref_map): the remote's configured refspecs, or with none the current
+    // branch's upstream refs when this remote is its upstream; else the remote HEAD
+    const useConfig = fromConfig && (configured.length > 0 || upstreamHere);
+    const given = !fromConfig ? this.refSpecs : useConfig ? configured : ["HEAD"];
+    // add_merge_config: fetching the current branch's upstream remote also takes the
+    // branch's `branch.<name>.merge` refs, for FETCH_HEAD
+    const mergeRefs = useConfig && upstream && upstreamHere ? upstream.merge : [];
+    const refspecs = [...given, ...mergeRefs];
     const history = this._workingCopy.history;
+
+    // git truncates FETCH_HEAD when the fetch starts: a failed fetch leaves it empty
+    const checkout = this._workingCopy.checkout;
+    const writesFetchHead = !this.dryRun && this.writeFetchHead && !!checkout?.writeFetchHead;
+    if (writesFetchHead && !this.appendFetchHead) await checkout.writeFetchHead?.("");
 
     const result = await transportFetch({
       url: remoteUrl,
@@ -372,8 +432,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       repository: createRepositoryFacade({ history }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
-      missingRefsOk: fromConfig && configured.length > 0,
-      tags: toTagMode(this.tagOption),
+      missingRefsOk: useConfig,
+      tags: toTagMode(this.effectiveTagOption()),
       depth: this.depth,
       deepenSince: this.shallowSince,
       deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
@@ -389,6 +449,20 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       if (ref.oid) advertisedRefs.set(ref.name, ref.oid);
     }
     const trackingUpdates = result.refUpdates.map(toTrackingRefUpdate);
+
+    if (writesFetchHead && checkout?.writeFetchHead) {
+      const entries = await this.fetchHeadEntries(result, {
+        given: given.length,
+        merge: mergeRefs,
+        // explicit refspecs (and the HEAD of an unconfigured remote) are all to merge;
+        // configured ones only when the first names one ref and no upstream is set
+        explicit: !useConfig,
+        firstIsExact: given.length > 0 && !parseRefSpec(given[0]).wildcard,
+        hasMerge: upstream !== undefined,
+      });
+      // after the truncation above, every fetch adds its lines
+      await checkout.writeFetchHead(formatFetchHead(entries, remoteUrl), { append: true });
+    }
 
     // Handle prune
     if (!this.dryRun && this.removeDeletedRefs) {
@@ -420,7 +494,108 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private effectiveRefSpecs(): string[] {
     if (this.refSpecs.length > 0) return this.refSpecs;
     const store = RemoteConfigStore.from(this.workingCopy);
-    return store.isConfigured(this.remote) ? store.read(this.remote).fetchRefspecs : [];
+    return store.isConfigured(this.remote) ? store.configuredFetchRefspecs(this.remote) : [];
+  }
+
+  /** The tag option given, else the remote's `remote.<name>.tagOpt`, else auto-follow. */
+  private effectiveTagOption(): TagOption {
+    if (this.tagOptionSet) return this.tagOption;
+    const tagOpt = RemoteConfigStore.from(this.workingCopy).value(`remote.${this.remote}.tagOpt`);
+    if (tagOpt === "--no-tags") return TagOption.NO_TAGS;
+    if (tagOpt === "--tags") return TagOption.FETCH_TAGS;
+    return this.tagOption;
+  }
+
+  /**
+   * The current branch's upstream: its `branch.<name>.remote` and `branch.<name>.merge`
+   * refs, when both are set (git's branch_has_merge_config); undefined on a detached HEAD
+   * or without upstream configuration.
+   */
+  private async upstreamConfig(): Promise<{ remote: string; merge: string[] } | undefined> {
+    const head = await this.refsStore.get("HEAD");
+    if (!head || !isSymbolicRef(head) || !head.target.startsWith("refs/heads/")) return undefined;
+    const branch = head.target.slice("refs/heads/".length);
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const remote = store.value(`branch.${branch}.remote`);
+    const merge = store.values(`branch.${branch}.merge`);
+    return remote !== undefined && merge.length > 0 ? { remote, merge } : undefined;
+  }
+
+  /**
+   * The `FETCH_HEAD` lines of a fetch, marked as git's get_ref_map marks them: refs from
+   * explicit refspecs (or the HEAD of an unconfigured remote) are to merge; with configured
+   * refspecs, the refs the current branch's `branch.<name>.merge` names (fetched for this
+   * alone when no refspec took them), or else the first ref when the first refspec names
+   * one ref. Tags (`--tags`, auto-follow), the rest, and anything that does not peel to a
+   * commit are `not-for-merge`.
+   */
+  private async fetchHeadEntries(
+    result: FetchClientResult,
+    marks: {
+      given: number;
+      merge: string[];
+      explicit: boolean;
+      firstIsExact: boolean;
+      hasMerge: boolean;
+    },
+  ): Promise<FetchHeadEntry[]> {
+    const mergeSpec = (index: number | undefined) =>
+      index !== undefined && index >= marks.given && index < marks.given + marks.merge.length
+        ? index - marks.given
+        : undefined;
+    const entries: (FetchHeadEntry & { refspec?: number })[] = [];
+    for (const fetched of result.fetched) {
+      if (mergeSpec(fetched.refspec) !== undefined) continue;
+      const fromGiven = fetched.refspec !== undefined && fetched.refspec < marks.given;
+      entries.push({
+        oid: fetched.oid,
+        remoteRef: fetched.remoteRef,
+        notForMerge: !(marks.explicit && fromGiven),
+        refspec: fetched.refspec,
+      });
+    }
+    if (!marks.explicit) {
+      if (!marks.hasMerge && marks.firstIsExact && entries[0]?.refspec === 0) {
+        entries[0].notForMerge = false;
+      }
+      // each merge ref marks the first ref a configured refspec took that it names...
+      const matched = new Set<number>();
+      for (const [k, ref] of marks.merge.entries()) {
+        const match = entries.find(
+          (e) =>
+            e.refspec !== undefined && e.refspec < marks.given && refNameMatches(ref, e.remoteRef),
+        );
+        if (match) {
+          match.notForMerge = false;
+          matched.add(k);
+        }
+      }
+      // ...or else is listed itself, after the refs the configured refspecs took
+      const extra: typeof entries = [];
+      for (const fetched of result.fetched) {
+        const k = mergeSpec(fetched.refspec);
+        if (k === undefined || matched.has(k)) continue;
+        extra.push({ oid: fetched.oid, remoteRef: fetched.remoteRef, notForMerge: false });
+      }
+      const tagsAt = entries.findIndex((e) => e.refspec === undefined || e.refspec >= marks.given);
+      entries.splice(tagsAt < 0 ? entries.length : tagsAt, 0, ...extra);
+    }
+    for (const entry of entries) {
+      if (!entry.notForMerge && !(await this.peelsToCommit(entry.oid))) entry.notForMerge = true;
+    }
+    return entries.map(({ oid, remoteRef, notForMerge }) => ({ oid, remoteRef, notForMerge }));
+  }
+
+  /** Whether `id` is a commit, or a tag (chain) of one (git's lookup_commit_reference_gently). */
+  private async peelsToCommit(id: ObjectId): Promise<boolean> {
+    const history = this._workingCopy.history;
+    let current: ObjectId | undefined = id;
+    for (let i = 0; current && i < 16; i++) {
+      if (await history.commits.has(current)) return true;
+      if (!(await history.tags.has(current))) return false;
+      current = await history.tags.getTarget(current);
+    }
+    return false;
   }
 
   /**
@@ -519,4 +694,16 @@ export function toTrackingRefUpdate(update: FetchRefUpdate): TrackingRefUpdate {
     summary: update.summary,
     reason: update.reason,
   };
+}
+
+/** git's refname_match: `ref` (`main`, `heads/main`, `refs/heads/main`) names `fullName`. */
+function refNameMatches(ref: string, fullName: string): boolean {
+  return [
+    ref,
+    `refs/${ref}`,
+    `refs/tags/${ref}`,
+    `refs/heads/${ref}`,
+    `refs/remotes/${ref}`,
+    `refs/remotes/${ref}/HEAD`,
+  ].includes(fullName);
 }

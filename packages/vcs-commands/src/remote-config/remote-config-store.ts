@@ -195,6 +195,14 @@ export class RemoteConfigStore {
     };
   }
 
+  /**
+   * The `remote.<name>.fetch` lines as configured, without the default {@link read} fills
+   * in: a remote without any fetches only its HEAD, as `git fetch <name>` does.
+   */
+  configuredFetchRefspecs(name: string): string[] {
+    return this.strings(name, "fetch");
+  }
+
   /** Write every field of a remote, replacing whatever was there. */
   write(remote: RemoteConfig): void {
     this.setAll(remote.name, "url", remote.urls);
@@ -249,6 +257,14 @@ export class RemoteConfigStore {
   value(key: string): string | undefined {
     const value = this.config.get(key);
     return value === undefined || value === null ? undefined : String(value);
+  }
+
+  /** Every value of a config variable (`branch.main.merge` may repeat). */
+  values(key: string): string[] {
+    return this.config
+      .getAll(key)
+      .filter((value) => value !== undefined && value !== null)
+      .map((value) => String(value));
   }
 
   /** Sets a config variable, replacing every value it had. */

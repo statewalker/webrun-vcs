@@ -9,6 +9,12 @@
 
 import type { History } from "@statewalker/vcs-core";
 import {
+  createKvObjectStores,
+  KVRefStore,
+  KVStaging,
+  MemoryKVAdapter,
+} from "@statewalker/vcs-store-kv";
+import {
   createMemoryObjectStores,
   MemoryRefs,
   MemoryStagingStore,
@@ -141,6 +147,32 @@ export const sqlFactory: WorkingCopyFactory = async (options = {}) => {
       await db.close();
     },
   };
+};
+
+/**
+ * KV backend factory (objects, refs and staging in one in-memory KV store)
+ *
+ * Not in {@link backends}: suites opt in where the KV ref store matters
+ * (shallow commits, compare-and-swap).
+ */
+export const kvFactory: WorkingCopyFactory = async (options = {}) => {
+  const kv = new MemoryKVAdapter();
+  const stores = createKvObjectStores({ kv });
+  const refs = new KVRefStore(kv);
+  const repository = createSimpleHistory({
+    blobs: stores.blobs,
+    trees: stores.trees,
+    commits: stores.commits,
+    tags: stores.tags,
+    refs,
+  });
+  const workingCopy = new MemoryWorkingCopy({
+    history: repository,
+    checkout: new MemoryCheckout({ staging: new KVStaging(kv) }),
+    worktree: createMockWorktree(),
+    config: options.config,
+  });
+  return { workingCopy, repository };
 };
 
 /**

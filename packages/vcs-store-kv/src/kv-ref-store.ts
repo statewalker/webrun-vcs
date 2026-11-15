@@ -51,6 +51,18 @@ function decodeLog(bytes: Uint8Array | undefined): StoredLog {
   return log;
 }
 
+/** The shallow commits (git's `shallow` file): a sorted JSON array of ids, `[]` when complete. */
+const SHALLOW_KEY = "shallow:root";
+
+function decodeShallow(bytes: Uint8Array | undefined): ObjectId[] {
+  if (!bytes) return [];
+  const ids = JSON.parse(decoder.decode(bytes)) as unknown;
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
+    throw new Error(`corrupt shallow value (${SHALLOW_KEY})`);
+  }
+  return ids as ObjectId[];
+}
+
 /** Symbolic refs are stored as "ref: <target>", as in git's loose ref files. */
 const SYMREF_PREFIX = "ref: ";
 /** Follow at most this many refs along a symbolic chain (git's read limit). */
@@ -345,6 +357,33 @@ export class KVRefStore implements Refs {
       previousValue: (await this.resolve(refName))?.objectId,
       errorMessage: r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", "),
     };
+  }
+
+  /** The shallow commits (git's `shallow` file), sorted; empty for a complete repository. */
+  async getShallow(): Promise<ObjectId[]> {
+    return decodeShallow(await this.kv.get(SHALLOW_KEY));
+  }
+
+  /**
+   * Replace the shallow commits with one compare-and-swap of their key. With `expected`
+   * (the list the caller read), a list that changed meanwhile is not overwritten: the
+   * write fails with "shallow file has changed since we read it", as git's
+   * check_shallow_file_for_update.
+   */
+  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
+    const ids = [...new Set(commits)].sort();
+    const want = expected ? [...new Set(expected)].sort() : undefined;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const bytes = await this.kv.get(SHALLOW_KEY);
+      const current = decodeShallow(bytes);
+      if (want && (current.length !== want.length || current.some((id, i) => id !== want[i]))) {
+        throw new Error("shallow file has changed since we read it");
+      }
+      if (await this.kv.compareAndSwap(SHALLOW_KEY, bytes, encoder.encode(JSON.stringify(ids)))) {
+        return;
+      }
+    }
+    throw new Error("Could not update the shallow commits: too many concurrent writers");
   }
 
   /** Initialize storage structure (no-op for KV). */

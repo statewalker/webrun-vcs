@@ -7,6 +7,7 @@ import {
 } from "@statewalker/vcs-transport";
 
 import { InvalidArgumentError, InvalidRemoteError, RefNotFoundError } from "../errors/index.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import type { CloneResult } from "../results/clone-result.js";
 import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
@@ -22,6 +23,12 @@ import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
  * Note: Unlike other commands, CloneCommand initializes a new repository
  * rather than operating on an existing one. The store passed to the
  * constructor should be an empty/new store that will be populated.
+ *
+ * Like `git clone`, it configures the remote (`remote.<name>.url`, the
+ * `remote.<name>.fetch` refspec of the clone, `remote.<name>.tagOpt` for
+ * `--no-tags`, `remote.<name>.mirror`), the upstream of the checked-out branch
+ * (`branch.<name>.remote` / `branch.<name>.merge`), and points
+ * `refs/remotes/<name>/HEAD` at the remote's default branch.
  *
  * @example
  * ```typescript
@@ -58,6 +65,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private remoteName = "origin";
   private cloneAllBranches = true;
   private mirror = false;
+  private singleBranch?: boolean;
   private branchesToClone: string[] = [];
   private tagOption: TagOption = TagOption.AUTO_FOLLOW;
   private shallowSince?: Date;
@@ -82,10 +90,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
-   * Set the branch to clone.
+   * Set the branch to check out (`git clone --branch`).
    *
-   * If set, only this branch will be fetched.
-   * Otherwise, all branches are fetched.
+   * The branch, or else a tag of that name (checked out as a detached HEAD), instead
+   * of the remote's default branch. All branches are still fetched unless
+   * {@link setSingleBranch} (or a shallow clone) restricts the clone to this one.
    *
    * @param branch Branch name (e.g., "main" or "refs/heads/main")
    */
@@ -170,6 +179,26 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    */
   getRemote(): string {
     return this.remoteName;
+  }
+
+  /**
+   * Clone only one branch (`git clone --single-branch`): the {@link setBranch} branch or
+   * tag, else the remote's default branch. The remote's fetch refspec is configured for
+   * that branch alone, and tags are auto-followed instead of all fetched.
+   *
+   * Unset, a shallow clone (`setDepth`, `setShallowSince`, `addShallowExclude`) is
+   * single-branch, as in git, and so is a clone restricted by
+   * {@link setBranchesToClone}; `setSingleBranch(false)` clones all branches anyway.
+   */
+  setSingleBranch(singleBranch: boolean): this {
+    this.checkCallable();
+    this.singleBranch = singleBranch;
+    return this;
+  }
+
+  /** Whether `--single-branch` was set (undefined: decided by the other options). */
+  isSingleBranch(): boolean | undefined {
+    return this.singleBranch;
   }
 
   /**
@@ -328,23 +357,47 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     }
 
     // Determine clone branch strategy
-    const branchToClone = toBranchName(this.determineBranchToClone());
+    const branchesToClone = this.mirror || this.cloneAllBranches ? [] : this.branchesToClone;
+    const branchToClone = toBranchName(this.branch ?? branchesToClone[0]);
     const history = this._workingCopy.history;
 
     // git clone's refspecs: tracking refs, local heads (bare), every ref (mirror)
     const tracking = (branch: string) =>
       this.bare ? `refs/heads/${branch}` : `refs/remotes/${this.remoteName}/${branch}`;
-    // git: a shallow clone is a single-branch clone of the remote HEAD's branch
+    // git: a shallow clone is a single-branch clone (of --branch, else the remote HEAD's branch)
     const singleBranch =
       !this.mirror &&
-      (branchToClone !== undefined ||
-        this.depth !== undefined ||
-        this.shallowSince !== undefined ||
-        this.shallowExcludes.length > 0);
+      (this.singleBranch ??
+        (branchesToClone.length > 0 ||
+          this.depth !== undefined ||
+          this.shallowSince !== undefined ||
+          this.shallowExcludes.length > 0));
     let detachedTag: string | undefined;
     let refspecs: string[] | RefspecResolver;
     if (this.mirror) {
       refspecs = ["+refs/*:refs/*"];
+    } else if (branchToClone !== undefined && !singleBranch) {
+      // --branch without --single-branch: every branch, then the branch (or tag) checked out
+      const b = branchToClone;
+      refspecs = {
+        prefixes: ["refs/heads/", `refs/tags/${b}`],
+        resolve: (remoteRefs) => {
+          const all = [`+refs/heads/*:${tracking("*")}`];
+          if (remoteRefs.some((r) => r.name === `refs/heads/${b}` && r.oid)) return all;
+          // git finds the tag among the refs it clones: not with --no-tags
+          if (
+            this.tagOption !== TagOption.NO_TAGS &&
+            remoteRefs.some((r) => r.name === `refs/tags/${b}` && r.oid)
+          ) {
+            detachedTag = `refs/tags/${b}`;
+            return all;
+          }
+          throw new RefNotFoundError(
+            `refs/heads/${b}`,
+            `Remote branch ${b} not found in upstream ${this.remoteName}`,
+          );
+        },
+      };
     } else if (branchToClone !== undefined) {
       // --branch names a branch, or else a tag (checked out as a detached HEAD)
       const b = branchToClone;
@@ -410,6 +463,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const advertisedDefaultBranch = result.defaultBranch;
     let defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
     let headCommit: ObjectId | undefined;
+    let checkedOutBranch: string | undefined;
+    // an empty remote without unborn HEAD: git's default branch (the one init named)
+    if (!detachedTag && !this.bare && defaultBranch === undefined && result.isEmpty) {
+      defaultBranch = (await this.localHeadBranch()) ?? "main";
+    }
 
     if (detachedTag) {
       // git clone --branch <tag>: a detached HEAD at the tag's commit
@@ -439,6 +497,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       }
       // HEAD names the default branch, born or not (an empty remote's unborn HEAD)
       await this.refsStore.setSymbolic("HEAD", localRef);
+      // git's install_branch_config: the branch tracks its remote counterpart
+      if (tip?.objectId || result.isEmpty) checkedOutBranch = defaultBranch;
     } else if (this.bare || this.mirror) {
       // For bare/mirror repos, HEAD points to default branch
       if (defaultBranch) {
@@ -446,6 +506,26 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         headCommit = (await this.refsStore.resolve("HEAD"))?.objectId;
       }
     }
+
+    // git's update_remote_refs: refs/remotes/<name>/HEAD names the tracking ref of the
+    // remote's default branch, when the clone took that branch
+    const remoteHead = advertisedDefaultBranch?.startsWith("refs/heads/")
+      ? toBranchName(advertisedDefaultBranch)
+      : undefined;
+    if (!this.bare && remoteHead) {
+      const target = `refs/remotes/${this.remoteName}/${remoteHead}`;
+      if ((await this.refsStore.resolve(target))?.objectId) {
+        await this.refsStore.setSymbolic(`refs/remotes/${this.remoteName}/HEAD`, target);
+      }
+    }
+
+    await this.writeConfig({
+      singleBranch,
+      branch: branchToClone,
+      detachedTag,
+      remoteHead,
+      checkedOutBranch,
+    });
 
     // Build fetch result
     const advertisedRefs = new Map<string, ObjectId>();
@@ -473,25 +553,58 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
-   * Determine which branch to clone based on options.
+   * Writes the configuration `git clone` writes (clone.c): `remote.<name>.url`,
+   * `remote.<name>.tagOpt` for `--no-tags` and `--mirror` (git 2.49+), the `remote.<name>.fetch` refspec of what was
+   * cloned (none for a bare clone; `+refs/*:refs/*` and `remote.<name>.mirror` for a
+   * mirror; one branch or tag for a single-branch clone), and the upstream of the
+   * checked-out branch (`branch.<b>.remote`, `branch.<b>.merge`).
    */
-  private determineBranchToClone(): string | undefined {
-    // Explicit branch takes precedence
-    if (this.branch) {
-      return this.branch;
+  private async writeConfig(clone: {
+    singleBranch: boolean;
+    branch?: string;
+    detachedTag?: string;
+    remoteHead?: string;
+    checkedOutBranch?: string;
+  }): Promise<void> {
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const remote = `remote.${this.remoteName}`;
+    store.setValue(`${remote}.url`, this.uri as string);
+    // git >= 2.49: --mirror implies --no-tags (its refspec still maps every tag)
+    if (this.tagOption === TagOption.NO_TAGS || this.mirror) {
+      store.setValue(`${remote}.tagOpt`, "--no-tags");
     }
-
-    // Mirror or cloneAllBranches means fetch all
-    if (this.mirror || this.cloneAllBranches) {
-      return undefined;
+    let fetchRefspec: string | undefined;
+    if (this.mirror) {
+      fetchRefspec = "+refs/*:refs/*";
+    } else if (!this.bare) {
+      const top = `refs/remotes/${this.remoteName}/`;
+      if (!clone.singleBranch) fetchRefspec = `+refs/heads/*:${top}*`;
+      else if (clone.detachedTag) fetchRefspec = `+${clone.detachedTag}:${clone.detachedTag}`;
+      else if (clone.branch) fetchRefspec = `+refs/heads/${clone.branch}:${top}${clone.branch}`;
+      // without a remote HEAD branch, a later fetch takes the remote HEAD alone, as in git
+      else if (clone.remoteHead)
+        fetchRefspec = `+refs/heads/${clone.remoteHead}:${top}${clone.remoteHead}`;
     }
-
-    // If specific branches are set, use the first one
-    if (this.branchesToClone.length > 0) {
-      return this.branchesToClone[0];
+    if (fetchRefspec) {
+      store.setValue(`${remote}.fetch`, fetchRefspec);
+      if (this.mirror) store.setValue(`${remote}.mirror`, "true");
     }
+    if (!this.bare && clone.checkedOutBranch) {
+      store.setValue(`branch.${clone.checkedOutBranch}.remote`, this.remoteName);
+      store.setValue(
+        `branch.${clone.checkedOutBranch}.merge`,
+        `refs/heads/${clone.checkedOutBranch}`,
+      );
+    }
+    await store.save();
+  }
 
-    return undefined;
+  /** The branch the local HEAD names (`init.defaultBranch` of the new repository), if any. */
+  private async localHeadBranch(): Promise<string | undefined> {
+    const head = await this.refsStore.get("HEAD");
+    return head && "target" in head && head.target.startsWith("refs/heads/")
+      ? head.target.slice("refs/heads/".length)
+      : undefined;
   }
 
   /**

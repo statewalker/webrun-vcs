@@ -1,5 +1,6 @@
 import {
   MissingArgumentError,
+  RefNotFoundError,
   RemoteAlreadyExistsError,
   RemoteNotFoundError,
 } from "../errors/index.js";
@@ -381,5 +382,71 @@ export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
       return true;
     }
     return false;
+  }
+}
+
+/**
+ * Point `refs/remotes/<name>/HEAD` at one of the remote's tracking branches, or delete it.
+ *
+ * Equivalent to `git remote set-head <name> <branch>` and `git remote set-head <name> -d`.
+ * The symbolic ref names the remote's default branch, so the remote name alone resolves
+ * to that branch (`git log origin`); `git clone` creates it.
+ *
+ * @example
+ * ```typescript
+ * await git.remoteSetHead().setRemoteName("origin").setBranch("develop").call();
+ * await git.remoteSetHead().setRemoteName("origin").setDelete(true).call();
+ * ```
+ */
+export class RemoteSetHeadCommand extends GitCommand<string | undefined> {
+  private remoteName?: string;
+  private branch?: string;
+  private deleteHead = false;
+
+  /** Set the remote whose HEAD is set. */
+  setRemoteName(name: string): this {
+    this.checkCallable();
+    this.remoteName = name;
+    return this;
+  }
+
+  /** Set the branch (`develop`, or `refs/remotes/origin/develop`) HEAD names. */
+  setBranch(branch: string): this {
+    this.checkCallable();
+    this.branch = branch;
+    return this;
+  }
+
+  /** Delete `refs/remotes/<name>/HEAD` instead (`-d`). */
+  setDelete(deleteHead: boolean): this {
+    this.checkCallable();
+    this.deleteHead = deleteHead;
+    return this;
+  }
+
+  /**
+   * @returns The tracking ref HEAD now names, or undefined after a delete
+   * @throws RefNotFoundError if the tracking branch does not exist (git: "Not a valid ref")
+   */
+  async call(): Promise<string | undefined> {
+    this.checkCallable();
+    this.setCallable(false);
+    if (!this.remoteName) {
+      throw new MissingArgumentError("remoteName", "Remote name must be specified");
+    }
+    const top = `refs/remotes/${this.remoteName}/`;
+    if (this.deleteHead) {
+      await this.refsStore.delete(`${top}HEAD`);
+      return undefined;
+    }
+    if (!this.branch) {
+      throw new MissingArgumentError("branch", "Branch must be specified, or delete set");
+    }
+    const target = this.branch.startsWith(top) ? this.branch : `${top}${this.branch}`;
+    if (!(await this.refsStore.resolve(target))?.objectId) {
+      throw new RefNotFoundError(target, `Not a valid ref: ${target}`);
+    }
+    await this.refsStore.setSymbolic(`${top}HEAD`, target);
+    return target;
   }
 }

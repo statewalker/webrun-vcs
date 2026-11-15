@@ -155,6 +155,19 @@ export interface Checkout {
   // -------- Abort --------
   abortOperation(): Promise<void>;
 
+  // -------- FETCH_HEAD --------
+  /**
+   * The refs the last fetch took (git's `FETCH_HEAD`), as git writes the file: one
+   * `<oid>\t[not-for-merge]\t<description>` line per ref. Undefined when no fetch wrote it.
+   * Optional: a checkout without it keeps no `FETCH_HEAD`.
+   */
+  readFetchHead?(): Promise<string | undefined>;
+  /**
+   * Replace `FETCH_HEAD` with `content` (git truncates it at the start of each fetch), or
+   * add `content` after what it holds (`git fetch --append`).
+   */
+  writeFetchHead?(content: string, options?: { append?: boolean }): Promise<void>;
+
   // ========== Lifecycle ==========
   initialize(): Promise<void>;
   refresh(): Promise<void>;

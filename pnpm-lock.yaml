@@ -939,6 +939,9 @@ importers:
         specifier: workspace:^
         version: link:../vcs-working-tree
     devDependencies:
+      '@statewalker/vcs-store-kv':
+        specifier: workspace:^
+        version: link:../vcs-store-kv
       '@statewalker/vcs-store-sql':
         specifier: workspace:^
         version: link:../vcs-store-sql

@@ -332,6 +332,19 @@ export class GitCheckout implements Checkout {
     }
   }
 
+  // ========== FETCH_HEAD ==========
+
+  /** `.git/FETCH_HEAD`, as native git reads and writes it. */
+  async readFetchHead(): Promise<string | undefined> {
+    return this.readFile(`${this.gitDir}/FETCH_HEAD`);
+  }
+
+  /** Writes `.git/FETCH_HEAD` in place, as git does (no lock file: git `fopen`s it). */
+  async writeFetchHead(content: string, options?: { append?: boolean }): Promise<void> {
+    const before = options?.append ? ((await this.readFetchHead()) ?? "") : "";
+    await this.writeFile(`${this.gitDir}/FETCH_HEAD`, `${before}${content}`);
+  }
+
   // ========== Lifecycle ==========
 
   async initialize(): Promise<void> {

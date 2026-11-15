@@ -103,6 +103,13 @@ export interface FetchClientResult {
   isEmpty: boolean;
   /** Each local ref written, or refused, with git's status */
   refUpdates: FetchRefUpdate[];
+  /**
+   * Every remote ref the fetch took, written to a local ref or not, in the order git lists
+   * them in `FETCH_HEAD`: the refspec matches (refspec by refspec, remote order within one),
+   * then the auto-followed tags (those of objects fetched or already here first, then the
+   * ones found in the fetched history). See {@link formatFetchHead}.
+   */
+  fetched: FetchedRef[];
   /** Tags created by auto-follow (also in `refUpdates`) */
   followedTags: string[];
   /**
@@ -121,6 +128,21 @@ export interface FetchClientResult {
   packBytes: number;
   /** Negotiation counters, summed over the packs */
   stats: NegotiationStats;
+}
+
+/** A remote ref a fetch took (see {@link FetchClientResult.fetched}). */
+export interface FetchedRef {
+  /** The remote ref (`refs/heads/main`, `HEAD`, or an object id a refspec named) */
+  remoteRef: string;
+  /** The local ref it maps to; undefined for a refspec without destination */
+  localRef?: string;
+  /** Its value on the remote */
+  oid: string;
+  /**
+   * Index of the refspec that selected it, among the refspecs fetched with (`tags: "all"`
+   * adds `refs/tags/*:refs/tags/*` after them); undefined for a tag auto-follow took
+   */
+  refspec?: number;
 }
 
 /**
@@ -207,6 +229,12 @@ export async function fetchFromConnection(
     defaultBranch,
     isEmpty,
     refUpdates: [],
+    fetched: planned.map(({ remoteRef, localRef, oid, refspec }) => ({
+      remoteRef,
+      localRef,
+      oid,
+      refspec,
+    })),
     followedTags: [],
     tagsNotFollowed: [],
     shallow: { before: shallowBefore, after: shallowBefore },
@@ -263,6 +291,23 @@ export async function fetchFromConnection(
       shallow = after;
     }
   };
+
+  // git's FETCH_HEAD lists first the tags of objects being fetched or already here (fetch.c
+  // find_non_local_tags before the fetch), then those found in the fetched history (backfill)
+  const tagsOfTips = new Set<string>();
+  if (autoTags) {
+    const plannedOids = new Set(planned.map((p) => p.oid));
+    for (const ref of remoteRefs) {
+      if (!ref.oid || !ref.name.startsWith("refs/tags/")) continue;
+      const ids = ref.peeled && ref.peeled !== ref.oid ? [ref.oid, ref.peeled] : [ref.oid];
+      for (const id of ids) {
+        if (plannedOids.has(id) || (await repository.has(id))) {
+          tagsOfTips.add(ref.name);
+          break;
+        }
+      }
+    }
+  }
 
   // wants: the selected tips not here yet (all of them when deepening: their history changes)
   const wants: string[] = [];
@@ -326,6 +371,16 @@ export async function fetchFromConnection(
     force: options.force,
   });
   result.followedTags = followed.map((p) => p.localRef as string);
+  // each group by name, as find_non_local_tags lists them (a sorted string list)
+  const byName = [...followed].sort((a, b) =>
+    a.remoteRef < b.remoteRef ? -1 : a.remoteRef > b.remoteRef ? 1 : 0,
+  );
+  for (const first of [true, false]) {
+    for (const p of byName) {
+      if (tagsOfTips.has(p.remoteRef) !== first) continue;
+      result.fetched.push({ remoteRef: p.remoteRef, localRef: p.localRef, oid: p.oid });
+    }
+  }
   if (!options.dryRun) {
     await applyRefUpdates(result.refUpdates, refStore, {
       atomic: options.atomic,

@@ -51,6 +51,7 @@ export class MemoryCheckout implements Checkout {
   private cherryPickState?: CheckoutCherryPickState;
   private revertState?: CheckoutRevertState;
   private headCommit?: ObjectId;
+  private fetchHead?: string;
   private initialized = false;
 
   constructor(options: MemoryCheckoutOptions) {
@@ -176,6 +177,16 @@ export class MemoryCheckout implements Checkout {
     if (await this.staging.hasConflicts()) {
       await this.staging.clear();
     }
+  }
+
+  // ========== FETCH_HEAD ==========
+
+  async readFetchHead(): Promise<string | undefined> {
+    return this.fetchHead;
+  }
+
+  async writeFetchHead(content: string, options?: { append?: boolean }): Promise<void> {
+    this.fetchHead = options?.append ? `${this.fetchHead ?? ""}${content}` : content;
   }
 
   // ========== Lifecycle ==========
