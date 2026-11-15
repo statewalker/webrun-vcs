@@ -160,7 +160,8 @@ describe("N1. a submodule replaced by a file upstream", () => {
       [c1],
     );
     await h.refs.set("refs/heads/main", c2);
-    const res = await syncWorkspace(b, messageChannelRemote(srv.server));
+    // committing the recovery conflict (the default stops on it: net-sync-recovery-stop)
+    const res = await syncWorkspace(b, messageChannelRemote(srv.server), { onConflict: "commit" });
     expect(res.conflicts).toContain("sub");
     expect(readFileSync(join(db, "sub/unpushed-work.c"), "utf8")).toBe("int x;\n");
     expect(existsSync(join(db, "sub/.git/HEAD"))).toBe(true);
@@ -184,7 +185,7 @@ describe("N2. an edit made after the plan was stored", () => {
     await expect(syncWorkspace(b, r())).rejects.toThrow(/disk full/); // finish: plan stored, cut short
     f.state.armed = false;
     await writeFile(b, "c.txt", "c from Bob\n"); // the plan has not reached c.txt yet
-    const res = await syncWorkspace(b, r());
+    const res = await syncWorkspace(b, r(), { onConflict: "commit" });
     expect(res.conflicts).toContain("c.txt");
     const c = (await serverFiles(history))["c.txt"];
     expect(c).toContain("c from Ann");
@@ -235,7 +236,7 @@ describe("N3. a new user file in a directory the target turns into a file", () =
     f.state.armed = false;
     mkdirSync(join(db, "z"), { recursive: true });
     writeFileSync(join(db, "z/mine.txt"), "Bob's new file\n");
-    const res = await syncWorkspace(b, r());
+    const res = await syncWorkspace(b, r(), { onConflict: "commit" });
     expect(res.conflicts).toContain("z");
     expect(readFileSync(join(db, "z/mine.txt"), "utf8")).toBe("Bob's new file\n");
     const aside = `z.theirs-${(pushed.head as string).slice(0, 7)}`;

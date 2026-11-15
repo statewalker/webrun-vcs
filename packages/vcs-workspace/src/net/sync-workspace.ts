@@ -199,6 +199,7 @@ async function syncRounds(
     try {
       local = await commitFolder(ws, options.message ?? "Workspace changes", {
         include: options.include,
+        onConflict: options.onConflict,
       });
     } catch (error) {
       throw asSyncError("committing the folder failed", error);
@@ -207,6 +208,10 @@ async function syncRounds(
       // a merge with conflicts in progress: nothing is fetched, merged or pushed until the
       // user concludes it (or aborts it)
       if (local.skipped.length > 0) emit({ type: "skipped", attempt, paths: local.skipped });
+      for (const path of local.rejoined) rejoined.add(path);
+      if (local.rejoined.length > 0) emit({ type: "rejoined", attempt, paths: local.rejoined });
+      // a recovery stop commits the folder's edits on their own, locally
+      if (local.changed && local.head) emit({ type: "commit", attempt, commit: local.head });
       emit({
         type: "conflicted",
         attempt,
@@ -216,7 +221,7 @@ async function syncRounds(
       });
       return {
         head: local.head,
-        committed: false,
+        committed: committed || local.changed,
         integration: "conflicted",
         pushed: false,
         conflicts: [...new Set([...conflicts, ...local.merge.conflicts])].sort(),
