@@ -136,7 +136,15 @@ async function ours(
 
 /** The body with the `agent=` capability line made comparable. */
 function sameAgent(body: Buffer): string {
-  return body.toString("latin1").replace(/[0-9a-f]{4}agent=[^\n]*\n/, "XXXXagent=*\n");
+  return (
+    body
+      .toString("latin1")
+      .replace(/[0-9a-f]{4}agent=[^\n]*\n/, "XXXXagent=*\n")
+      // git's object-info line depends on its version: 2.43 sends `object-info`, newer git
+      // sends `object-info=size type` (and only when transfer.advertiseObjectInfo is set).
+      // We serve the `size` attribute, so compare everything else byte for byte.
+      .replace(/[0-9a-f]{4}object-info(=[^\n]*)?\n/, "XXXXobject-info*\n")
+  );
 }
 
 describeGit("Interop · our smart-HTTP v2 server against git http-backend", () => {
