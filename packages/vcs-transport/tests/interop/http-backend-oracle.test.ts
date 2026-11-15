@@ -64,6 +64,12 @@ function httpBackend(
       ...GIT_ENV,
       GIT_PROJECT_ROOT: root,
       GIT_HTTP_EXPORT_ALL: "1",
+      // Newer git (CI runs 2.5x) no longer advertises or serves object-info unless
+      // `transfer.advertiseObjectInfo` is set; older git ignores the key. We serve
+      // object-info, so pin the oracle to advertise it too.
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "transfer.advertiseObjectInfo",
+      GIT_CONFIG_VALUE_0: "true",
       REQUEST_METHOD: method,
       PATH_INFO: path,
       QUERY_STRING: query,
