@@ -9,7 +9,10 @@
  * and verified at the end, so no object is ever held in memory whole. No
  * chunk-aware dedup (that is `vcs-transport-xet`); pointer files are built and
  * read here (`createLfsPointer`, `formatLfsPointer`, `parseLfsPointer`), the
- * clean/smudge wiring belongs to the working tree.
+ * clean/smudge wiring belongs to the working tree. Besides a content-store, the
+ * server and client run over any `LfsObjectStore`, such as
+ * `createFilesLfsStore`: a `FilesApi` in git-lfs's own `lfs/objects` layout,
+ * shared with native git-lfs, with resumable partial downloads.
  */
 
 export {
@@ -22,17 +25,31 @@ export {
   LFS_CONTENT_TYPE,
 } from "./batch.js";
 export { lfsDownload, lfsUpload } from "./client.js";
+export { createFilesLfsStore } from "./files-store.js";
 export {
   createLfsPointer,
   formatLfsPointer,
+  LFS_POINTER_MAX_SIZE,
   LFS_POINTER_VERSION,
   parseLfsPointer,
 } from "./pointer.js";
-export { serveLfs } from "./server.js";
+export {
+  type LfsAuthorization,
+  type LfsOperation,
+  type LfsServerOptions,
+  serveLfs,
+} from "./server.js";
 export { type ByteSource, sha256Hex } from "./sha256.js";
+export {
+  contentStoreLfsObjects,
+  type LfsObjectStore,
+  type LfsPartialStore,
+  type LfsPutResult,
+} from "./store.js";
 export type {
   FetchLike,
   LfsPointer,
+  LfsPointerExtension,
   LfsResolver,
   LfsTransferOptions,
   TransportEvent,

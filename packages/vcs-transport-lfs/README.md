@@ -2,7 +2,7 @@
 
 ## What it is
 
-A client and server for the standard Git LFS batch protocol (`POST /objects/batch`) with the `basic` whole-object transfer. Object bytes live in a `@statewalker/webrun-content-store` `ContentStore`. The LFS object id (`oid`) is the whole-file SHA-256 as bare lowercase hex. An injected `LfsResolver` maps LFS oids to content-store object ids.
+A client and server for the standard Git LFS batch protocol (`POST /objects/batch`) with the `basic` whole-object transfer, conformant with native git-lfs (tested against git-lfs 3.4: `git push`, `git lfs push`, `git lfs pull`, `git clone`). Object bytes live either in a `@statewalker/webrun-content-store` `ContentStore`, with an injected `LfsResolver` mapping LFS oids to content-store ids, or in any `LfsObjectStore`, such as `createFilesLfsStore`: a `FilesApi` in git-lfs's own `lfs/objects/aa/bb/<oid>` layout, which native git-lfs shares. The LFS object id (`oid`) is the whole-file SHA-256 as bare lowercase hex.
 
 ## Why it exists: talk to real LFS hosts from any runtime
 
@@ -18,22 +18,28 @@ No peer dependencies. One entry point, `@statewalker/vcs-transport-lfs` (ESM, wi
 
 | Export | Description |
 |--------|-------------|
-| `serveLfs(store, resolver)` | Server: a `(Request) => Promise<Response>` handler for `POST {base}/objects/batch`, `PUT {base}/objects/<oid>` and `GET {base}/objects/<oid>` |
-| `lfsUpload(store, resolver, url, pointers, fetchImpl?, opts?)` | Client: batch `upload`, then `PUT` each object the server asks for, as a streaming body whose `content-length` is the local object's size. Yields `TransportEvent`s |
-| `lfsDownload(store, resolver, url, pointers, fetchImpl?)` | Client: batch `download`, then `GET` each object, hashing it while it is stored and checking oid and size at the end. Yields `TransportEvent`s |
+| `serveLfs(store, resolver, opts?)`, `serveLfs(objects, opts?)` | Server: a `(Request) => Promise<Response>` handler for `POST {base}/objects/batch`, `PUT`/`GET`/`HEAD {base}/objects/<oid>` and `POST {base}/verify`, over a content-store and resolver or an `LfsObjectStore`. `opts`: `LfsServerOptions` (below) |
+| `lfsUpload(store, resolver, url, pointers, fetchImpl?, opts?)`, `lfsUpload(objects, url, pointers, fetchImpl?, opts?)` | Client: batch `upload`, then `PUT` each object the server asks for, as a streaming body whose `content-length` is the local object's size, then its `verify` action. Yields `TransportEvent`s |
+| `lfsDownload(store, resolver, url, pointers, fetchImpl?, opts?)`, `lfsDownload(objects, url, pointers, fetchImpl?, opts?)` | Client: batch `download`, then `GET` each object, hashing it while it is stored and checking oid and size at the end; resumes with `Range` into a store that keeps partials. Yields `TransportEvent`s |
+| `createFilesLfsStore(files, root?)` | An `LfsObjectStore` on a `FilesApi` in git-lfs's layout under `root` (`".git"` for a repository): objects at `lfs/objects/aa/bb/<oid>`, partial downloads at `lfs/incomplete/<oid>.part`, writes through `lfs/tmp/` then an atomic `move` |
+| `contentStoreLfsObjects(store, resolver)` | The `LfsObjectStore` view of a content-store and its resolver (what the `(store, resolver, ...)` overloads use) |
 | `sha256Hex(content)` | `Promise<string>`: SHA-256 as bare hex (the LFS oid) of a buffer or a stream of chunks |
 | `createLfsPointer(content)` | `Promise<LfsPointer>`: oid and size of a buffer or stream, in one streaming pass (what a clean filter needs) |
-| `formatLfsPointer(pointer)`, `parseLfsPointer(text)` | Write and read the v1 pointer file text; `parseLfsPointer` returns `undefined` for anything else, including keys out of the spec's order and sizes beyond `Number.MAX_SAFE_INTEGER` |
+| `formatLfsPointer(pointer)`, `parseLfsPointer(textOrBytes)` | Write and read pointer files as git-lfs does (`EncodePointer`, `DecodeFrom`); `parseLfsPointer` returns `undefined` for anything git-lfs would not take as a pointer |
 | `storeVerified(store, resolver, content, expected)` | Store a stream while hashing it; record it only if it matches `expected.oid` (and `expected.size`). A refused object is not removed; the store's `gc` reclaims it |
-| `LFS_POINTER_VERSION` | `"version https://git-lfs.github.com/spec/v1"` |
+| `LFS_POINTER_VERSION`, `LFS_POINTER_MAX_SIZE` | `"version https://git-lfs.github.com/spec/v1"`; 1024, the bytes a pointer is read from |
 | `BASIC_TRANSFER`, `LFS_CONTENT_TYPE` | `"basic"` and `"application/vnd.git-lfs+json"` |
 | `BatchRequest`, `BatchResponse`, `BatchObjectRequest`, `BatchObjectResponse`, `BatchAction` | Batch API JSON shapes |
-| `LfsPointer`, `LfsResolver`, `FetchLike`, `TransportEvent`, `LfsTransferOptions`, `LfsStoreResult`, `ByteSource` | Injected and emitted types |
+| `LfsPointer`, `LfsPointerExtension`, `LfsResolver`, `FetchLike`, `TransportEvent`, `LfsTransferOptions`, `LfsStoreResult`, `ByteSource` | Injected and emitted types |
+| `LfsObjectStore`, `LfsPartialStore`, `LfsPutResult` | The store interface the server and client run over (below) |
+| `LfsServerOptions`, `LfsAuthorization`, `LfsOperation` | Server options |
 
-- `LfsPointer` is `{ oid, size }`.
+- `LfsPointer` is `{ oid, size, extensions? }`; `extensions` (`{ priority, name, oid }[]`, by priority) is present only for a pointer with `ext-N-name` lines.
+- `LfsObjectStore` is `{ size(oid), read(oid, range?), put(content, expected, opts?), partial? }`. `put` hashes as it streams and makes the object visible only when its SHA-256 (and size, when given) match, answering `{ ok: true, size }` or `{ ok: false, reason: "sha256 mismatch" | "size mismatch" | "too large" }`. `partial` (`LfsPartialStore`: `size`, `append`, `complete`, `remove`) keeps the bytes of unfinished downloads so they resume.
 - `LfsResolver` is `{ toObject(lfsOid), record(lfsOid, objectId) }`. The package never persists this map; the caller owns it.
 - `FetchLike` is `(request: Request) => Response | Promise<Response>`. It defaults to the global `fetch`. A `serveLfs` handler has the same shape, so it can be passed directly for an in-process loopback.
-- `LfsTransferOptions` is `{ streamRequestBody? }`: whether uploads stream their body. By default they stream outside browsers and are collected in browsers (see "Streaming" below).
+- `LfsTransferOptions` is `{ streamRequestBody?, headers?, credentials? }`. `streamRequestBody`: whether uploads stream their body; by default they stream outside browsers and are collected in browsers (see "Streaming" below). `headers` and `credentials` (`{ username, password }`, sent as Basic auth) go with the batch, and with each transfer unless the server marked the object `authenticated`; an action's headers replace the client's of the same name, case-insensitively.
+- `LfsServerOptions` is `{ authorize?, transferAuth?, maxBatchObjects?, maxBatchBytes?, maxObjectSize?, publicUrl?, realm?, documentationUrl? }`, each described under "Server" below.
 - `ByteSource` is a `Uint8Array`, a sync or async iterable of chunks, or a `ReadableStream<Uint8Array>` such as a `Response` body.
 - `TransportEvent` is one of `{ type: "batch", operation, count }`, `{ type: "object-uploaded", oid }`, `{ type: "object-downloaded", oid }`, `{ type: "error", oid, reason }`.
 
@@ -81,6 +87,29 @@ for await (const e of lfsDownload(otherStore, otherResolver, "http://lfs.host", 
 
 Against a real host, omit the last argument to use the global `fetch`, and pass the LFS endpoint URL (the client appends `/objects/batch`).
 
+### Share objects with native git-lfs, and resume downloads
+
+```typescript
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { createFilesLfsStore, lfsDownload, serveLfs } from "@statewalker/vcs-transport-lfs";
+
+// The objects of a repository on disk, where git-lfs keeps them.
+const store = createFilesLfsStore(createNodeFilesApi({ rootDir: repoDir }), ".git");
+
+// A download that breaks keeps its bytes in .git/lfs/incomplete/<oid>.part;
+// running it again asks for the rest with `Range: bytes=N-`.
+for await (const e of lfsDownload(store, "https://host/repo.git/info/lfs", pointers, fetch, {
+  credentials: { username, password },
+})) {
+  if (e.type === "error") console.warn(e.oid, e.reason);
+}
+
+// Serve the same store: `git push` and `git clone` with `lfs.url` pointing here work.
+const handler = serveLfs(store, {
+  authorize: (request, operation) => operation === "download" || isWriter(request),
+});
+```
+
 ### Make a pointer for a large file
 
 ```typescript
@@ -95,7 +124,15 @@ const text = formatLfsPointer(pointer);
 parseLfsPointer(text); // { oid: "4fab47c1...", size: 3561811 }
 ```
 
-`parseLfsPointer` follows the git-lfs pointer spec: `version` comes first and the other keys follow in alphabetical order (extension keys `ext-…`, then `oid`, then `size`), each at most once. A pointer with `size` before `oid`, or a size that is not a safe integer, is not a pointer.
+`parseLfsPointer` reads a pointer as git-lfs's `DecodeFrom` does, and agrees with native git-lfs on the 48 cases in `tests/pointer-cases.ts`:
+
+- only the first 1024 bytes count (a valid pointer followed by whitespace and then anything is still a pointer; a pointer followed by more text within those bytes is not);
+- the text is trimmed as Go's `TrimSpace` trims (Unicode spaces too, not a BOM), lines may end in CRLF, blank lines are skipped;
+- `version` (spec v1, or the legacy `https://hawser.github.com/spec/v1` and `http://git-media.io/v/2`), then `oid sha256:<64 lowercase hex>`, then `size`, in that order, nothing after `size`;
+- `ext-<digit>-<name> sha256:<hex>` lines may stand anywhere before `size`, one per priority (a repeated key keeps its last value);
+- the size is read as Go's `ParseInt` reads it (`+8` and `08` are 8) and must be at least 0. One difference stays: sizes above 2^53 are refused, where git-lfs takes up to 2^63.
+
+`formatLfsPointer` writes extension lines by priority, and an empty object as the empty string: git-lfs's clean leaves an empty file empty.
 
 `createLfsPointer` reads the content once, feeding each chunk to an incremental SHA-256 and counting its bytes, so a multi-gigabyte file costs one chunk of memory. This is the hashing half of a clean filter; writing the pointer into the index is the working tree's job.
 
@@ -123,15 +160,23 @@ Node, Deno and Bun stream such bodies. Browsers collect the body first by defaul
 
 ### Constraints
 
-- Peak memory is a few chunks per transfer, plus whatever the `ContentStore` keeps (a `memBlobStore` keeps everything).
-- The server always offers an upload action for every object in an `upload` batch, even one it already has.
-- The server ignores the request's `transfers` list and always answers with `basic`.
-- No authentication is built in. Pass a `fetchImpl` that adds headers if the host needs them; batch actions' `header` values are forwarded on `PUT`/`GET`.
-- The client does not check the HTTP status of the batch `POST`; it parses the body as a `BatchResponse`.
+- Peak memory is a few chunks per transfer, plus whatever the `ContentStore` keeps (a `memBlobStore` keeps everything). The files store streams every write and read.
+- The server ignores the request's `transfers` list and always answers with `basic`; the client refuses any other transfer.
+- Only a store with `partial` resumes downloads. Resuming copies the held bytes once into a new `.part` (FilesApi has no append), streamed. Downloads of one oid into one store are serialized within a process only.
+- No locking API, no `tus`/`multipart`/`ssh` adapters, no retries or `expires_at` handling in the client.
+
+### Server
+
+`serveLfs` routes by path suffix, so it can sit under any prefix (git-lfs's default endpoint is `<remote>/info/lfs`); hrefs keep that prefix, or use `publicUrl` behind a proxy.
+
+- **Batch** (`docs/api/batch.md`): an `upload` batch gives `upload` and `verify` actions, and no actions at all for objects the server already holds with that size; a `download` batch gives a `download` action, or per-object errors `{ code, message }`: 404 for a missing object, 422 for an invalid oid or size, a held size that differs, or an object over `maxObjectSize`. Batch-level errors: 409 for a `hash_algo` other than `sha256`, 413 past `maxBatchObjects` (1000) or `maxBatchBytes` (1 MiB), 422 for a malformed request, 406 for an `Accept` without the LFS media type. Responses carry `hash_algo: "sha256"`.
+- **Errors** are `application/vnd.git-lfs+json` objects `{ message, request_id?, documentation_url? }`: `request_id` echoes an `X-Request-Id` header, `documentation_url` is `opts.documentationUrl`.
+- **Authentication** (`docs/api/authentication.md`): `authorize(request, operation)` decides each batch before anything in it is answered, and, without `transferAuth`, each transfer. `false` is 401 with `LFS-Authenticate: Basic realm="Git LFS"` when the request carries no `Authorization` (git-lfs then asks its credential helper and retries), 403 when it does; `{ status, message }` picks them. With `transferAuth: { header(op, oid), check(request, op, oid), expiresIn? }`, actions carry per-object headers and `expires_in`, objects are marked `authenticated`, and a transfer without the right headers is 401.
+- **Basic transfer** (`docs/api/basic-transfers.md`): `GET` answers `Range: bytes=N-` (and RFC 9110's other single ranges) with 206 and `Content-Range`, past the end 416 with `Content-Range: bytes */size`, ignores other ranges, and takes the oid as a strong `ETag` for `If-Range`. `PUT` is verified as it streams (422 on a mismatch, 413 over `maxObjectSize`, 400 for an invalid `Content-Length`). `POST .../verify` is 200 when the object is held with that size, 404 if not, 422 for a malformed body.
 
 ### What failures look like
 
-Client generators do not throw for per-object failures. They yield `{ type: "error", oid, reason }` with one of:
+Client generators throw when the batch `POST` fails (a non-2xx status, with the server's `message`). They do not throw for per-object failures. They yield `{ type: "error", oid, reason }` with one of:
 
 - the server's batch error message, for example `Object does not exist` (download of an unknown oid)
 - `no local object for oid` (upload: resolver has no mapping)
@@ -140,6 +185,10 @@ Client generators do not throw for per-object failures. They yield `{ type: "err
 - `size mismatch` (upload: the local object's size differs from the pointer or the batch response; nothing is sent)
 - `sha256 mismatch` (downloaded bytes do not hash to the oid; nothing is recorded, and the stored bytes remain until the store's `gc`)
 - `size mismatch` (downloaded bytes are shorter or longer than the pointer size; nothing is recorded, and the stored bytes or chunks remain until the store's `gc`)
+- `unexpected object in batch response`, `size mismatch in batch response`, `missing from batch response` (the batch answer does not match what was asked; an unexpected object is never transferred)
+- `verify failed: <status>` (the server's `verify` action refused an upload)
+- `incomplete: N of M bytes (kept to resume)`, or a transfer error with `(N of M bytes kept to resume)` (a store with partials; the next download resumes)
+- `the server resumed at X, not N` (a 206 from another offset; the held bytes stay)
 - the message of an error thrown while transferring one object, such as a rejected `fetch`
 
 Server responses: `422 {"message":"oid does not match content"}` on a `PUT` whose bytes do not hash to the path oid; `422 {"message":"size does not match content-length"}` on a `PUT` whose body is shorter or longer than its `content-length`; `404 {"message":"Object does not exist"}` on a `GET` for an unknown oid; `404 {"message":"Not found"}` for any other route.
@@ -148,7 +197,7 @@ Server responses: `422 {"message":"oid does not match content"}` on a `PUT` whos
 
 - `@statewalker/webrun-content-store`: the `ContentStore` that holds object bytes.
 - `@statewalker/webrun-http-streams`: the `FetchHandler` type returned by `serveLfs`.
-- `@statewalker/vcs-utils`: the incremental `createSha256` and the streaming request body helpers.
+- `@statewalker/vcs-utils`: the incremental `createSha256`, the streaming request body helpers and the `FilesApi` type.
 
 ### Commands
 

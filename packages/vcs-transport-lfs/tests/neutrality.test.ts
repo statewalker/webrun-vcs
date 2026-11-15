@@ -16,6 +16,8 @@ describe("neutrality (dep-lint)", () => {
     "@statewalker/webrun-http-streams",
     "@statewalker/vcs-utils/hash",
     "@statewalker/vcs-utils/streams",
+    // the portable FilesApi type, for the git-lfs-layout store (createFilesLfsStore)
+    "@statewalker/vcs-utils/files",
   ]);
   const forbidden = ["vcs-core", "transport-git", "transport-xet", "files-sync", "working-tree"];
 

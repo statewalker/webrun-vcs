@@ -1227,6 +1227,9 @@ importers:
         specifier: 'catalog:'
         version: 0.6.0
     devDependencies:
+      '@statewalker/vcs-utils-node':
+        specifier: workspace:^
+        version: link:../vcs-utils-node
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.11.0
