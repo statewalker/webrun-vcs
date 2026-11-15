@@ -22,7 +22,10 @@ import {
   setTransport,
 } from "../../context/context-adapters.js";
 import { HandlerOutput } from "../../context/handler-output.js";
-import type { ProcessConfiguration } from "../../context/process-config.js";
+import type {
+  ProcessConfiguration,
+  UploadPackRequestPolicy,
+} from "../../context/process-config.js";
 import type { ProcessContext, RefStore } from "../../context/process-context.js";
 import { ProtocolState } from "../../context/protocol-state.js";
 import { createTransportApi } from "../../factories/transport-api-factory.js";
@@ -34,7 +37,7 @@ import {
 import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
 import { Fsm } from "../../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/server-v2-fsm.js";
-import { SERVER_V2_CAPABILITIES } from "../../fsm/protocol-v2/types.js";
+import { serverV2Capabilities } from "../../fsm/protocol-v2/types.js";
 import {
   DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
   type ReceivePackHooks,
@@ -86,8 +89,13 @@ export interface HttpResponse {
  * Server options for HTTP handlers.
  */
 export interface HttpServerOptions {
-  /** Request policy for validating client wants */
-  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /**
+   * Which objects upload-pack serves by id (see {@link UploadPackRequestPolicy}). Default as
+   * git: "ADVERTISED" over protocol v0/v1, "ANY" over v2 (git's v2 serves any object it has).
+   * Set "REACHABLE_COMMIT" to refuse, over both versions, objects no branch or tag reaches
+   * (`ERR upload-pack: not our ref <oid>`); git has no such v2 setting.
+   */
+  requestPolicy?: UploadPackRequestPolicy;
   /** Advertised capabilities */
   capabilities?: string[];
   /**
@@ -111,6 +119,12 @@ export interface HttpServerOptions {
   protocolV2?: boolean;
   /** Capabilities of the v2 advertisement (default {@link SERVER_V2_CAPABILITIES}) */
   v2Capabilities?: string[];
+  /**
+   * Protocol v2: advertise and serve `object-info` (`object-info=size type`, as git with
+   * `transfer.advertiseObjectInfo`). Default false, as git: not advertised, and a request for
+   * it is refused ("invalid command 'object-info'").
+   */
+  advertiseObjectInfo?: boolean;
   /** receive-pack (push) hooks, limits and ref policies */
   receivePack?: ReceivePackServerOptions;
   /** Logs hook failures that cannot reach the client (default: console.error) */
@@ -175,6 +189,13 @@ export interface ReceivePackServerOptions {
   currentBranch?: string;
   /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
   shallowUpdate?: boolean;
+  /**
+   * An atomic push fails as a whole when any command is refused (default false: as git, a
+   * command refused before the ref transaction — missing objects, shallow, `authorize`,
+   * `preReceive` — keeps its error and the others still land together; see
+   * `ReceivePackConfig.strictAtomic`)
+   */
+  strictAtomic?: boolean;
 }
 
 /** Default idle timeout of a POST /git-receive-pack body. */
@@ -469,9 +490,16 @@ export function isProtocolV2Request(
  * // "version 2", "agent=…", "ls-refs=unborn", "fetch=shallow wait-for-done", …, flush
  * ```
  */
-export function handleInfoRefsV2(options: HttpServerOptions = {}): HttpResponse {
+export function handleInfoRefsV2(
+  options: HttpServerOptions = {},
+  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
+): HttpResponse {
   const chunks: Uint8Array[] = [encodePacketLine("version 2\n")];
-  for (const capability of options.v2Capabilities ?? SERVER_V2_CAPABILITIES) {
+  for (const capability of serverV2Capabilities(
+    options.v2Capabilities,
+    options.advertiseObjectInfo,
+    repository,
+  )) {
     chunks.push(encodePacketLine(`${capability}\n`));
   }
   chunks.push(encodeFlush());
@@ -567,8 +595,9 @@ export async function handleUploadPackV2(
 
   const config: ProcessConfiguration = {
     serverCapabilities: options.v2Capabilities,
-    // git's upload-pack serves a stateless client any commit reachable from a ref
-    requestPolicy: options.requestPolicy ?? "REACHABLE_COMMIT",
+    advertiseObjectInfo: options.advertiseObjectInfo,
+    // git's v2 upload-pack serves any object it has
+    requestPolicy: options.requestPolicy ?? "ANY",
     keepAliveMs: options.keepAliveMs,
     // one command per request (git's serve loop with --stateless-rpc); more are ignored
     statelessRpc: true,
@@ -855,6 +884,7 @@ export async function handleReceivePack(
       bare: rp.bare,
       denyDeleteCurrent: rp.denyDeleteCurrent,
       shallowUpdate: rp.shallowUpdate,
+      strictAtomic: rp.strictAtomic,
       logger: options.logger,
       request: {
         method: request.method,
@@ -1015,14 +1045,16 @@ export interface HttpHandlerOptions {
     repository: RepositoryFacade;
     refStore: RefStore;
   } | null>;
-  /** Optional request policy */
-  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /** Which objects upload-pack serves by id (see {@link HttpServerOptions.requestPolicy}) */
+  requestPolicy?: UploadPackRequestPolicy;
   /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
   maxRequestBodyBytes?: number;
   /** Serve protocol v2 to `Git-Protocol: version=2` (see {@link HttpServerOptions.protocolV2}) */
   protocolV2?: boolean;
   /** Capabilities of the v2 advertisement (see {@link HttpServerOptions.v2Capabilities}) */
   v2Capabilities?: string[];
+  /** Advertise and serve v2 `object-info` (see {@link HttpServerOptions.advertiseObjectInfo}) */
+  advertiseObjectInfo?: boolean;
   /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
   receivePack?: ReceivePackServerOptions;
   /** Optional logger */
@@ -1065,6 +1097,7 @@ export function createHttpHandler(
     maxRequestBodyBytes,
     protocolV2,
     v2Capabilities,
+    advertiseObjectInfo,
     receivePack,
     logger,
   } = options;
@@ -1087,6 +1120,7 @@ export function createHttpHandler(
       maxRequestBodyBytes,
       protocolV2,
       v2Capabilities,
+      advertiseObjectInfo,
       receivePack,
       logger,
     };
@@ -1137,7 +1171,7 @@ export function createHttpHandler(
           };
         }
 
-        if (v2) return handleInfoRefsV2(serverOptions);
+        if (v2) return handleInfoRefsV2(serverOptions, repository);
         if (parsed.service === "git-upload-pack") {
           return await handleInfoRefs(refStore, uploadPackOptions, repository);
         } else {
@@ -1182,14 +1216,16 @@ export interface GitHttpServerOptions {
   resolveRepository: (
     repoPath: string,
   ) => Promise<{ repository: RepositoryFacade; refStore: RefStore } | null>;
-  /** Optional request policy */
-  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /** Which objects upload-pack serves by id (see {@link HttpServerOptions.requestPolicy}) */
+  requestPolicy?: UploadPackRequestPolicy;
   /** Largest request body accepted (see {@link HttpServerOptions.maxRequestBodyBytes}) */
   maxRequestBodyBytes?: number;
   /** Serve protocol v2 to `Git-Protocol: version=2` (see {@link HttpServerOptions.protocolV2}) */
   protocolV2?: boolean;
   /** Capabilities of the v2 advertisement (see {@link HttpServerOptions.v2Capabilities}) */
   v2Capabilities?: string[];
+  /** Advertise and serve v2 `object-info` (see {@link HttpServerOptions.advertiseObjectInfo}) */
+  advertiseObjectInfo?: boolean;
   /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
   receivePack?: ReceivePackServerOptions;
   /** Optional logger */
@@ -1238,6 +1274,7 @@ export function createGitHttpServer(options: GitHttpServerOptions): GitHttpServe
     maxRequestBodyBytes: options.maxRequestBodyBytes,
     protocolV2: options.protocolV2,
     v2Capabilities: options.v2Capabilities,
+    advertiseObjectInfo: options.advertiseObjectInfo,
     receivePack: options.receivePack,
     logger: options.logger,
   });

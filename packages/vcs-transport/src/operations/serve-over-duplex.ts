@@ -10,7 +10,7 @@ import type { Duplex } from "../api/duplex.js";
 import type { ServeResult } from "../api/fetch-result.js";
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import { HandlerOutput } from "../context/handler-output.js";
-import type { ProcessConfiguration } from "../context/process-config.js";
+import type { ProcessConfiguration, UploadPackRequestPolicy } from "../context/process-config.js";
 import type { ProcessContext, RefStore } from "../context/process-context.js";
 import { ProtocolState } from "../context/protocol-state.js";
 import { createTransportApi } from "../factories/transport-api-factory.js";
@@ -59,6 +59,12 @@ export interface ServeOverDuplexOptions {
   denyDeleteCurrent?: boolean;
   /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
   shallowUpdate?: boolean;
+  /**
+   * receive-pack: an atomic push fails as a whole when any command is refused (default false:
+   * as git, a command refused before the ref transaction — missing objects, shallow,
+   * `authorize`, `preReceive` — keeps its error and the others still land together)
+   */
+  strictAtomic?: boolean;
   /** receive-pack hooks: authorize, preReceive, update, postReceive */
   hooks?: ReceivePackHooks;
   /** Most commands in one push (receive-pack; default 65536) */
@@ -83,12 +89,18 @@ export interface ServeOverDuplexOptions {
   /** Server capabilities to advertise */
   capabilities?: string[];
   /**
-   * Which wants upload-pack serves; anything else is answered `ERR upload-pack: not our ref`.
-   * Default: "ADVERTISED" over protocol v0/v1 (git's default), "REACHABLE_COMMIT" over v2 (the
-   * tips and commits reachable from them, git's `uploadpack.allowReachableSHA1InWant`; git's
-   * own v2 serves any object it has, which "ANY" gives).
+   * Which objects upload-pack serves by id (see {@link UploadPackRequestPolicy}); anything else
+   * is answered `ERR upload-pack: not our ref <oid>`. Default as git: "ADVERTISED" over
+   * protocol v0/v1, "ANY" over v2 (git's v2 serves any object it has). "REACHABLE_COMMIT"
+   * refuses, over both versions, objects no branch or tag reaches (git has no such v2
+   * setting).
    */
-  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  requestPolicy?: UploadPackRequestPolicy;
+  /**
+   * Protocol v2: advertise and serve `object-info` (`object-info=size type`, as git with
+   * `transfer.advertiseObjectInfo`). Default false, as git: not advertised, and refused.
+   */
+  advertiseObjectInfo?: boolean;
   /**
    * Git wire protocol version to serve. Version negotiation is out-of-band in
    * git (the `GIT_PROTOCOL` env / `Git-Protocol: version=2` header), never in
@@ -172,6 +184,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     maxHaves: 256,
     serverCapabilities: options.capabilities,
     requestPolicy: options.requestPolicy,
+    advertiseObjectInfo: options.advertiseObjectInfo,
     allowDeletes: options.allowDeletes ?? true,
     allowNonFastForward: options.allowNonFastForward ?? false,
     denyCurrentBranch: options.denyCurrentBranch ?? true,
@@ -184,6 +197,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       bare: options.bare,
       denyDeleteCurrent: options.denyDeleteCurrent,
       shallowUpdate: options.shallowUpdate,
+      strictAtomic: options.strictAtomic,
       logger: options.logger,
       // a pipe's writer blocks until its pack is taken: read a refused pack, store nothing
       drainRefusedPack: true,

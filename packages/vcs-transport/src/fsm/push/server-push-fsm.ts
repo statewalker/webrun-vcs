@@ -25,7 +25,7 @@
  * The report texts are git's: `unpacker error`, `missing necessary objects`, `funny refname`,
  * `branch is currently checked out`, `deletion prohibited`, `deletion of the current branch
  * prohibited`, `non-fast-forward`, `bad ref`, `hook declined`, `pre-receive hook declined`,
- * `shallow update not allowed`, `failed to update ref`, `atomic push failure`, `atomic
+ * `shallow update not allowed`, `failed to update ref`, `invalid new value provided`, `atomic push failure`, `atomic
  * transaction failed`. With side-band, git's `error:` lines explaining a refusal go to the
  * client's progress channel, and keep-alive packets are sent while a received push is checked.
  */
@@ -144,6 +144,8 @@ const AUTHORIZE_FAILED = "authorization failed";
 
 /** git's report-status texts. */
 const FAILED_TO_UPDATE = "failed to update ref";
+/** git's ref_transaction_error_msg(REF_TRANSACTION_ERROR_INVALID_NEW_VALUE) */
+const INVALID_NEW_VALUE = "invalid new value provided";
 const ATOMIC_TRANSACTION_FAILED = "atomic transaction failed";
 const ATOMIC_PUSH_FAILURE = "atomic push failure";
 
@@ -515,7 +517,15 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       if (verdict.message) await sendMessage(ctx, verdict.message);
       const refused = verdict.rejectedRefs ? new Set(verdict.rejectedRefs) : undefined;
       for (const cmd of open) {
-        if (!refused || refused.has(cmd.refName)) reject(cmd, "pre-receive hook declined");
+        if (!refused || refused.has(cmd.refName)) {
+          reject(cmd, "pre-receive hook declined");
+          // a refusal of some refs only is ours (git's pre-receive refuses the whole push):
+          // an atomic push treats it as git's update hook, failing the others
+          if (refused) {
+            state.preReceiveRefused = state.preReceiveRefused ?? new Set();
+            state.preReceiveRefused.add(cmd);
+          }
+        }
       }
       return commands.some((c) => c.result === "NOT_ATTEMPTED") ? "HOOK_OK" : "HOOK_REJECTED";
     },
@@ -527,6 +537,13 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
     async (ctx) => {
       const state = getState<ServerPushState>(ctx);
       try {
+        // what was refused before the ref transaction (git's error_string set before
+        // execute_commands_atomic): an atomic push still applies the rest, as git
+        state.refusedBeforeTransaction = new Set(
+          (state.pushCommands ?? []).filter(
+            (c) => c.result !== "NOT_ATTEMPTED" && !state.preReceiveRefused?.has(c),
+          ),
+        );
         await validateCommands(ctx);
         const commands = state.pushCommands ?? [];
         const invalidCount = commands.filter((c) => c.result !== "NOT_ATTEMPTED").length;
@@ -555,24 +572,22 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         const atomic = state.capabilities.has("atomic");
         const all = state.pushCommands ?? [];
         // git migrates the quarantined objects, then updates the refs: published only when a
-        // ref update is still to be applied (an atomic push with a refused ref applies none)
-        const applying =
-          all.some((c) => c.result === "NOT_ATTEMPTED") &&
-          !(atomic && all.some((c) => c.result !== "NOT_ATTEMPTED"));
+        // ref update is still to be applied (an atomic push that fails applies none)
+        const blocked = atomic && atomicBlocked(ctx, state);
+        const applying = all.some((c) => c.result === "NOT_ATTEMPTED") && !blocked;
         if (applying) await publishQuarantine(ctx);
         else await discardQuarantine(ctx);
         // An accepted shallow push records the client's boundary before its refs move: only
         // the shallow commits the new history of the refs still accepted ends at (git's
         // delayed_reachability_test), not those the existing refs already reach
         if (state.shallowConnectivity && repository.updateShallow) {
-          const blocked = atomic && all.some((c) => c.result !== "NOT_ATTEMPTED");
           const tips = all
             .filter((c) => c.result === "NOT_ATTEMPTED" && c.type !== "DELETE")
             .map((c) => c.newOid);
           const reached = blocked ? [] : state.shallowConnectivity.shallowReachedFrom(tips);
           if (reached.length > 0) await repository.updateShallow(reached);
         }
-        return await applyUpdates(state, refStore, atomic);
+        return await applyUpdates(state, refStore, atomic, blocked);
       } catch (e) {
         return internalError(ctx, e);
       }
@@ -659,6 +674,16 @@ interface ServerPushState extends ProtocolState {
   pushShallow?: string[];
   /** The connectivity analysis of an accepted shallow push (which shallow commits to record) */
   shallowConnectivity?: PushConnectivity;
+  /**
+   * The commands refused before the ref transaction (connectivity, shallow, authorize,
+   * pre-receive): an atomic push applies the others (git), unless `strictAtomic`
+   */
+  refusedBeforeTransaction?: Set<PushCommand>;
+  /**
+   * The commands a `preReceive` verdict with `rejectedRefs` refused: an atomic push treats
+   * them as refused by the update hook (the others get "atomic push failure")
+   */
+  preReceiveRefused?: Set<PushCommand>;
   /** The unpack status when not "ok" */
   unpackStatus?: string;
   /** The received objects, kept aside until the push is accepted (git's tmp_objdir) */
@@ -935,7 +960,18 @@ async function objectType(ctx: ProcessContext, oid: string): Promise<string | un
   return (await repository.has(oid)) ? "unknown" : undefined;
 }
 
-/** The checks of git's `update()`, per command, then the update hook. */
+/**
+ * The checks of git's `update()`, per command in order, then the update hook.
+ *
+ * An atomic push runs them as git's execute_commands_atomic: the first command refused here
+ * stops the checks (the update hook of later commands does not run) and every other command
+ * still open gets "atomic push failure" (a non-commit on a branch included, as git 2.55+).
+ * What git's ref transaction refuses only when it commits (a stale old value, the same ref
+ * twice) does not stop the checks; once they all pass, every open command gets "atomic transaction failed". With
+ * `strictAtomic`, a command already refused before the transaction fails the others at once,
+ * and so does a command `preReceive` refused by name (`rejectedRefs`, no git counterpart: it is
+ * treated as git's update hook).
+ */
 async function validateCommands(ctx: ProcessContext): Promise<void> {
   const state = getState<ServerPushState>(ctx);
   const config = getConfig(ctx);
@@ -944,6 +980,24 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   const refStore = getRefStore(ctx);
   const commands = state.pushCommands ?? [];
   const atomic = state.capabilities.has("atomic");
+  const failOpen = (message: string) => {
+    for (const c of commands) {
+      if (c.result === "NOT_ATTEMPTED") {
+        c.result = "ATOMIC_REJECTED";
+        c.message = message;
+      }
+    }
+  };
+
+  if (atomic && rp.strictAtomic && commands.some((c) => c.result !== "NOT_ATTEMPTED")) {
+    failOpen(ATOMIC_PUSH_FAILURE);
+    return;
+  }
+  // refs preReceive refused one by one count as refused in update() (no update hook runs)
+  if (atomic && state.preReceiveRefused?.size) {
+    failOpen(ATOMIC_PUSH_FAILURE);
+    return;
+  }
 
   // bareness: the option, else a caller naming the checked-out branch means a working tree
   // (its protection is never dropped silently), else the facade, else bare
@@ -957,6 +1011,8 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   const head = config.currentBranch ?? (await refStore.getSymrefTarget?.("HEAD"));
   const denyCurrentBranch = config.denyCurrentBranch ?? true;
   const denyDeleteCurrent = rp.denyDeleteCurrent ?? true;
+  /** An atomic push whose ref transaction will refuse to commit */
+  let transactionFails = false;
 
   // The same ref twice: git's ref transaction refuses ("multiple updates for ref")
   const seen = new Set<string>();
@@ -967,13 +1023,8 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
     }
     await sendError(ctx, `multiple updates for ref '${cmd.refName}' not allowed`);
     if (atomic) {
-      for (const c of commands) {
-        if (c.result === "NOT_ATTEMPTED") {
-          c.result = "ATOMIC_REJECTED";
-          c.message = ATOMIC_TRANSACTION_FAILED;
-        }
-      }
-      return;
+      transactionFails = true;
+      continue;
     }
     if (cmd.result === "NOT_ATTEMPTED") {
       cmd.result = "LOCK_FAILURE";
@@ -982,8 +1033,9 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   }
 
   const hook = receivePackHooks(ctx)?.update;
-  for (const cmd of commands) {
-    if (cmd.result !== "NOT_ATTEMPTED") continue;
+
+  /** git's `update()` for one command: refuses it, or leaves it open */
+  const check = async (cmd: PushCommand): Promise<void> => {
     const name = cmd.refName;
     const isDelete = cmd.type === "DELETE";
 
@@ -991,14 +1043,14 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
     if (!name.startsWith("refs/") || !isValidRefName(name.slice(5), { allowOneLevel: isDelete })) {
       await sendError(ctx, `refusing to update funny ref '${name}' remotely`);
       reject(cmd, "funny refname");
-      continue;
+      return;
     }
 
     if (!bare && denyCurrentBranch && head === name) {
       await sendError(ctx, `refusing to update checked out branch: ${name}`);
       cmd.result = "REJECTED_CURRENT_BRANCH";
       cmd.message = "branch is currently checked out";
-      continue;
+      return;
     }
 
     // git deletes an existing ref even when the client sent the zero id as its old value
@@ -1012,13 +1064,13 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         await sendError(ctx, `denying ref deletion for ${name}`);
         cmd.result = "REJECTED_NODELETE";
         cmd.message = "deletion prohibited";
-        continue;
+        return;
       }
       if (denyDeleteCurrent && head === name) {
         await sendError(ctx, `refusing to delete the current branch: ${name}`);
         cmd.result = "REJECTED_NODELETE";
         cmd.message = "deletion of the current branch prohibited";
-        continue;
+        return;
       }
     }
 
@@ -1026,7 +1078,7 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
       await sendMessage(ctx, "warning: allowing deletion of corrupt ref");
     }
 
-    // the old value the client saw (git's ref transaction checks it)
+    // the old value the client saw (git's ref transaction checks it, when it commits)
     const current = existing ?? ZERO_OID;
     if (cmd.oldOid !== current && !(isDelete && cmd.oldOid === ZERO_OID)) {
       await sendError(
@@ -1037,11 +1089,15 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
             ? `cannot lock ref '${name}': reference already exists`
             : `cannot lock ref '${name}': is at ${current} but expected ${cmd.oldOid}`,
       );
-      cmd.result = "LOCK_FAILURE";
-      cmd.message = FAILED_TO_UPDATE;
-      continue;
+      if (!atomic) {
+        cmd.result = "LOCK_FAILURE";
+        cmd.message = FAILED_TO_UPDATE;
+        return;
+      }
+      transactionFails = true;
     }
 
+    let nonCommitBranch = false;
     if (!isDelete) {
       const type = await objectType(ctx, cmd.newOid);
       if (type === undefined) {
@@ -1049,33 +1105,26 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         await sendError(ctx, `unpack should have generated ${cmd.newOid}, but I can't find it!`);
         cmd.result = "REJECTED_MISSING_OBJECT";
         cmd.message = "bad pack";
-        continue;
+        return;
       }
-      // a branch points at a commit (git's ref backend refuses anything else)
-      if (name.startsWith("refs/heads/") && type !== "commit" && type !== "unknown") {
-        await sendError(
-          ctx,
-          `cannot update ref '${name}': trying to write non-commit object ${cmd.newOid} to branch '${name}'`,
-        );
-        cmd.result = "LOCK_FAILURE";
-        cmd.message = FAILED_TO_UPDATE;
-        continue;
-      }
+      // a branch points at a commit: refused once the update hook has run, as git 2.55+'s
+      // ref_transaction_update (queued in update(), after the hook)
+      nonCommitBranch = name.startsWith("refs/heads/") && type !== "commit" && type !== "unknown";
     }
 
-    if (cmd.type === "UPDATE" && name.startsWith("refs/heads/")) {
+    if (cmd.type === "UPDATE" && name.startsWith("refs/heads/") && !nonCommitBranch) {
       const oldType = await objectType(ctx, cmd.oldOid);
       if (oldType !== "commit" && oldType !== "unknown") {
         await sendError(ctx, `bad sha1 objects for ${name}`);
         reject(cmd, "bad ref");
-        continue;
+        return;
       }
       if (!(await isAncestor(ctx, cmd.oldOid, cmd.newOid))) {
         if (!config.allowNonFastForward) {
           await sendError(ctx, `denying non-fast-forward ${name} (you should pull first)`);
           cmd.result = "REJECTED_NONFASTFORWARD";
           cmd.message = "non-fast-forward";
-          continue;
+          return;
         }
         cmd.type = "UPDATE_NONFASTFORWARD";
       }
@@ -1098,9 +1147,31 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         if (verdict.message) await sendMessage(ctx, verdict.message);
         await sendError(ctx, `hook declined to update ${name}`);
         reject(cmd, "hook declined");
+        return;
       }
     }
+
+    // git 2.55+ refuses it in ref_transaction_update with REF_TRANSACTION_ERROR_INVALID_NEW_VALUE,
+    // reported "invalid new value provided" (and an atomic push fails the others with "atomic
+    // push failure"); older git refused it when the transaction committed ("failed to update
+    // ref" in 2.43, "atomic transaction failed" for an atomic push)
+    if (nonCommitBranch) {
+      await sendError(ctx, `trying to write non-commit object ${cmd.newOid} to branch '${name}'`);
+      cmd.result = "LOCK_FAILURE";
+      cmd.message = INVALID_NEW_VALUE;
+    }
+  };
+
+  for (const cmd of commands) {
+    if (cmd.result !== "NOT_ATTEMPTED") continue;
+    await check(cmd);
+    // git's execute_commands_atomic: the first refusal fails the transaction
+    if (atomic && cmd.result !== "NOT_ATTEMPTED") {
+      failOpen(ATOMIC_PUSH_FAILURE);
+      return;
+    }
   }
+  if (transactionFails) failOpen(ATOMIC_TRANSACTION_FAILED);
 }
 
 /** Whether `ancestor` is reachable from `oid` through parents. */
@@ -1126,11 +1197,25 @@ function toRefCommand(cmd: PushCommand): RefCommand {
 type ApplyResult = "UPDATES_APPLIED" | "PARTIAL_APPLIED" | "ATOMIC_FAILED";
 
 /**
+ * Whether an atomic push must apply none of its commands: a command refused inside the ref
+ * transaction (git's `update()`), or any refused command with `strictAtomic`. Commands refused
+ * before the transaction (connectivity, shallow, authorize, pre-receive) do not count, as in
+ * git's execute_commands_atomic, which skips them. Without that record (APPLY_UPDATES run on
+ * its own) every refusal counts.
+ */
+function atomicBlocked(ctx: ProcessContext, state: ServerPushState): boolean {
+  const early = receivePackConfig(ctx).strictAtomic ? undefined : state.refusedBeforeTransaction;
+  return (state.pushCommands ?? []).some((c) => c.result !== "NOT_ATTEMPTED" && !early?.has(c));
+}
+
+/**
  * Apply the push commands still `NOT_ATTEMPTED`, as git's receive-pack does in
  * a ref transaction.
  *
- * - An atomic push with a command already rejected (validation, hook) changes
- *   nothing: the others get "atomic push failure".
+ * - An atomic push that is `blocked` (a command refused inside the transaction, or any
+ *   refused command with `strictAtomic`) changes nothing: the others get "atomic push
+ *   failure". Commands refused before the transaction keep their errors and the rest is
+ *   applied, as git does.
  * - With `refStore.batch`, an atomic push is one batch (all refs or none, every
  *   command "atomic transaction failed" when refused) and a plain push one batch
  *   per ref ("failed to update ref"). Each update checks the old id the client
@@ -1144,11 +1229,12 @@ async function applyUpdates(
   state: ServerPushState,
   refStore: RefStore,
   atomic: boolean,
+  blocked = (state.pushCommands ?? []).some((c) => c.result !== "NOT_ATTEMPTED"),
 ): Promise<ApplyResult> {
   const all = state.pushCommands ?? [];
   const open = all.filter((c) => c.result === "NOT_ATTEMPTED");
   state.appliedCommands = [];
-  if (atomic && open.length < all.length) {
+  if (atomic && blocked) {
     for (const c of open) {
       c.result = "ATOMIC_REJECTED";
       c.message = ATOMIC_PUSH_FAILURE;
@@ -1157,10 +1243,19 @@ async function applyUpdates(
   }
   for (const c of open) if (isNoop(c)) c.result = "OK";
   const pending = open.filter((c) => !isNoop(c));
+  // a failed transaction fails the commands it held; those refused before keep their errors
+  const failTransaction = (): "ATOMIC_FAILED" => {
+    for (const c of open) {
+      c.result = "ATOMIC_REJECTED";
+      c.message = ATOMIC_TRANSACTION_FAILED;
+    }
+    state.appliedCommands = [];
+    return "ATOMIC_FAILED";
+  };
   const okCount = () => all.filter((c) => c.result === "OK").length;
 
   const batch = refStore.batch?.bind(refStore);
-  if (!batch) return applyOneByOne(state, refStore, atomic, pending);
+  if (!batch) return applyOneByOne(state, refStore, atomic, pending, failTransaction);
   const options = { message: "push" };
 
   if (atomic) {
@@ -1177,13 +1272,9 @@ async function applyUpdates(
       return "UPDATES_APPLIED";
     }
     if (result.rejected.every((r) => r.reason === "unsupported")) {
-      return applyOneByOne(state, refStore, atomic, pending);
+      return applyOneByOne(state, refStore, atomic, pending, failTransaction);
     }
-    for (const c of all) {
-      c.result = "ATOMIC_REJECTED";
-      c.message = ATOMIC_TRANSACTION_FAILED;
-    }
-    return "ATOMIC_FAILED";
+    return failTransaction();
   }
 
   for (const c of pending) {
@@ -1213,6 +1304,7 @@ async function applyOneByOne(
   refStore: RefStore,
   atomic: boolean,
   pending: PushCommand[],
+  failTransaction: () => "ATOMIC_FAILED",
 ): Promise<ApplyResult> {
   const all = state.pushCommands ?? [];
   const appliedCommands: PushCommand[] = [];
@@ -1235,12 +1327,7 @@ async function applyOneByOne(
             // Rollback failed, continue
           }
         }
-        for (const other of all) {
-          other.result = "ATOMIC_REJECTED";
-          other.message = ATOMIC_TRANSACTION_FAILED;
-        }
-        state.appliedCommands = [];
-        return "ATOMIC_FAILED";
+        return failTransaction();
       }
     }
   }

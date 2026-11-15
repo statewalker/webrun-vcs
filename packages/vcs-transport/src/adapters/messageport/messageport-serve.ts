@@ -8,7 +8,10 @@
 import type { ServeResult } from "../../api/fetch-result.js";
 import type { RepositoryFacade } from "../../api/repository-facade.js";
 import { HandlerOutput } from "../../context/handler-output.js";
-import type { ProcessConfiguration } from "../../context/process-config.js";
+import type {
+  ProcessConfiguration,
+  UploadPackRequestPolicy,
+} from "../../context/process-config.js";
 import type { ProcessContext, RefStore } from "../../context/process-context.js";
 import { ProtocolState } from "../../context/protocol-state.js";
 import { createTransportApi } from "../../factories/transport-api-factory.js";
@@ -20,8 +23,8 @@ import { createMessagePortDuplex } from "./messageport-duplex.js";
  * Options for MessagePort serve operation.
  */
 export interface MessagePortServeOptions {
-  /** Request policy for validating client wants */
-  requestPolicy?: "ADVERTISED" | "REACHABLE_COMMIT" | "TIP" | "REACHABLE_COMMIT_TIP" | "ANY";
+  /** Which objects upload-pack serves by id (default "ADVERTISED", git's v0 default) */
+  requestPolicy?: UploadPackRequestPolicy;
   /** Maximum empty negotiation batches before error */
   maxEmptyBatches?: number;
 }

@@ -337,3 +337,52 @@ describe("hostile and stale tokens", () => {
     expect(await status(call, "git-upload-pack", member)).toBe(403);
   });
 });
+
+describe("meshGitHandler: objects no ref reaches", () => {
+  const pkt = (s: string) => (s.length + 4).toString(16).padStart(4, "0") + s;
+
+  /** A raw protocol v2 `fetch` of `oid`; returns the response body as text. */
+  async function fetchById(
+    call: ReturnType<ReturnType<typeof serving>["connect"]>,
+    token: string,
+    oid: string,
+  ): Promise<string> {
+    const res = await peerFetch(
+      call,
+      token,
+    )(
+      new Request(`${URL_}/git-upload-pack`, {
+        method: "POST",
+        headers: {
+          "git-protocol": "version=2",
+          "content-type": "application/x-git-upload-pack-request",
+        },
+        body: `${pkt("command=fetch\n")}0001${pkt(`want ${oid}\n`)}${pkt("done\n")}0000`,
+      }),
+    );
+    return new TextDecoder("latin1").decode(await res.arrayBuffer());
+  }
+
+  it("refuses them by default (REACHABLE_COMMIT), unlike git's v2; requestPolicy ANY serves them", async () => {
+    const hub = await createHub();
+    const { served, c1 } = await servedWithHistory();
+    const dangling = await commit(served, "dangling", { "x.txt": "secret\n" }, [c1]);
+    const token = await hub.token("A", ["admin"]);
+
+    const strict = serving(served, hub).connect("A");
+    const refused = await fetchById(strict, token, dangling);
+    expect(refused).toContain(`ERR upload-pack: not our ref ${dangling}`);
+    expect(refused).not.toContain("packfile");
+    // a commit a ref reaches is served
+    expect(await fetchById(strict, token, c1)).toContain("packfile");
+
+    const handler = meshGitHandler({
+      repository: served.facade,
+      refStore: served.refStore,
+      access: { issuer: hub.issuer, now: hub.now },
+      requestPolicy: "ANY",
+    });
+    const asGit = servePeerConnection(handler, { remotePeer: "A" });
+    expect(await fetchById(asGit, token, dangling)).toContain("packfile");
+  });
+});

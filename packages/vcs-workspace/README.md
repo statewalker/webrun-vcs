@@ -139,7 +139,9 @@ The server side is the transport's own server. `createSyncServer` serves one rep
 ```typescript
 import { createSyncServer, syncWorkspace } from "@statewalker/vcs-workspace/net";
 
-const server = createSyncServer({ repository, refStore }); // a bare repository (vcs-transport facade)
+// a bare repository (vcs-transport facade); `requestPolicy: "REACHABLE_COMMIT"` refuses
+// fetches of objects no branch or tag reaches (git's v2 default serves any object)
+const server = createSyncServer({ repository, refStore });
 Bun.serve({ fetch: server.fetch });
 server.subscribe((updates) => {
   // [{ ref: "refs/heads/main", oldOid, newOid }]: tell the other clients (WebSocket, push message...)

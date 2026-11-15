@@ -44,6 +44,14 @@ export interface MeshGitHandlerOptions extends Omit<HttpHandlerOptions, "resolve
    * every push.
    */
   ownNamespace?: (peer: string) => string | undefined;
+  /**
+   * Which objects a `git:read` caller may fetch by id. Default "REACHABLE_COMMIT": the refs and
+   * the commits they reach, over protocol v0 and v2 alike, so objects no branch or tag reaches
+   * (a refused push's leftovers, history a ref was rewound past, another peer's dropped work)
+   * stay private: `ERR upload-pack: not our ref <oid>`. Plain git's v2 serves any object it
+   * has ("ANY"); pass that to serve the mesh as git does.
+   */
+  requestPolicy?: HttpHandlerOptions["requestPolicy"];
 }
 
 /** The default own namespace: `refs/peers/<peerId>/`, when the peer id can be one ref component. */
@@ -125,7 +133,9 @@ function ownNamespaceHooks(prefix: string, hooks: ReceivePackHooks | undefined):
  *   refused for every ref stores nothing.
  *
  * The rest is `createFetchHandler`'s, with these options (protocol v2, limits, the receive-pack
- * hooks, which run after the namespace check).
+ * hooks, which run after the namespace check). One default differs from git's: `requestPolicy`
+ * is "REACHABLE_COMMIT" (git's v2 serves any object it has), since a peer's read access is
+ * meant to cover what its refs publish, not every object the repository holds.
  *
  * @example
  * ```ts
@@ -137,7 +147,14 @@ function ownNamespaceHooks(prefix: string, hooks: ReceivePackHooks | undefined):
  * ```
  */
 export function meshGitHandler(options: MeshGitHandlerOptions): MeshHandler {
-  const { access, ownNamespace = defaultOwnNamespace, repository, refStore, ...rest } = options;
+  const {
+    access,
+    ownNamespace = defaultOwnNamespace,
+    repository,
+    refStore,
+    requestPolicy = "REACHABLE_COMMIT",
+    ...rest
+  } = options;
   let resolveRepository = options.resolveRepository;
   if (!resolveRepository) {
     if (!repository || !refStore)
@@ -145,7 +162,7 @@ export function meshGitHandler(options: MeshGitHandlerOptions): MeshHandler {
     const resolved = { repository, refStore };
     resolveRepository = async () => resolved;
   }
-  const base: HttpHandlerOptions = { ...rest, resolveRepository };
+  const base: HttpHandlerOptions = { ...rest, requestPolicy, resolveRepository };
   const serve = createFetchHandler(base);
   /** One handler per own namespace (their hooks differ by prefix) */
   const byPrefix = new Map<string, ReturnType<typeof createFetchHandler>>();

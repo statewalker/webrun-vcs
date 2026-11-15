@@ -55,6 +55,23 @@ const GIT_ENV = {
 const TEST_TIMEOUT = 60000;
 const GIT_TIMEOUT = 30000;
 
+/** The native git's version as [major, minor] ([0, 0] without git). */
+const GIT_VERSION: [number, number] = (() => {
+  if (!HAS_GIT) return [0, 0];
+  const match = /(\d+)\.(\d+)/.exec(execFileSync("git", ["--version"]).toString());
+  return match ? [Number(match[1]), Number(match[2])] : [0, 0];
+})();
+
+/**
+ * git 2.55 moved the non-commit-on-a-branch check into ref_transaction_update (refs.c), so
+ * receive-pack's update() refuses it ("invalid new value provided"; an atomic push fails the
+ * others with "atomic push failure"). Older git refused it when the transaction committed:
+ * "atomic transaction failed" for every ref of an atomic push. Our server follows 2.55+.
+ * Pinned from the release tags: refs.c's ref_transaction_update has the check in v2.55.0 and
+ * not in v2.54.0, whose refs/files-backend.c refuses the object while locking the ref.
+ */
+const NON_COMMIT_IN_UPDATE = GIT_VERSION[0] > 2 || (GIT_VERSION[0] === 2 && GIT_VERSION[1] >= 55);
+
 function gitSync(cwd: string, args: string[], input?: Uint8Array | string): Buffer {
   return execFileSync("git", args, {
     cwd,
@@ -365,6 +382,205 @@ describeGit(
         }),
       );
       expect(native).toEqual(["unpack <error>", "ng refs/heads/j unpacker error"]);
+      expect(ours).toEqual(native);
+    });
+
+    // git's execute_commands: refusals found before the ref transaction (connectivity,
+    // shallow, pre-receive) mark their commands, and execute_commands_atomic skips those and
+    // applies the rest in one transaction; a refusal inside it (git's update(): ref names,
+    // deletes, the update hook, a stale old value) fails every command
+    it("atomic: a ref missing objects is refused, the others still land (git)", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [`${ZERO} ${fresh} refs/heads/m`, `${ZERO} ${h()} refs/heads/ok`],
+          caps: "report-status atomic",
+          pack: packOfObjects(src.dir, [fresh]),
+        }),
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ng refs/heads/m missing necessary objects",
+        "ok refs/heads/ok",
+      ]);
+      expect(ours).toEqual(native);
+    });
+
+    it("atomic: an unknown new id is refused, the others still land (git)", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [`${ZERO} ${h()} refs/heads/a`, `${ZERO} ${"1".repeat(40)} refs/heads/u`],
+          caps: "report-status atomic",
+          pack: packOfObjects(src.dir, []),
+        }),
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ok refs/heads/a",
+        "ng refs/heads/u missing necessary objects",
+      ]);
+      expect(ours).toEqual(native);
+    });
+
+    it("atomic: a funny ref name fails the transaction; later refs are not checked", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [
+            `${ZERO} ${h()} refs/heads/fine`,
+            `${ZERO} ${h()} refs/heads/a..b`,
+            `${h()} ${ZERO} refs/heads/main`,
+          ],
+          caps: "report-status atomic delete-refs",
+          pack: packOfObjects(src.dir, []),
+        }),
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ng refs/heads/fine atomic push failure",
+        "ng refs/heads/a..b funny refname",
+        "ng refs/heads/main atomic push failure",
+      ]);
+      expect(ours).toEqual(native);
+    });
+
+    it("atomic: missing objects and a refused delete; the update phase fails the rest", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [
+            `${ZERO} ${fresh} refs/heads/m`,
+            `${ZERO} ${h()} refs/heads/ok`,
+            `${h()} ${ZERO} refs/heads/main`,
+          ],
+          caps: "report-status atomic delete-refs",
+          pack: packOfObjects(src.dir, [fresh]),
+        }),
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ng refs/heads/m missing necessary objects",
+        "ng refs/heads/ok atomic push failure",
+        "ng refs/heads/main deletion of the current branch prohibited",
+      ]);
+      expect(ours).toEqual(native);
+    });
+
+    it("atomic: a stale old value fails the transaction: every ref 'atomic transaction failed'", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [`${ZERO} ${h()} refs/heads/a`, `${p()} ${h()} refs/heads/main`],
+          caps: "report-status atomic",
+          pack: packOfObjects(src.dir, []),
+        }),
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ng refs/heads/a atomic transaction failed",
+        "ng refs/heads/main atomic transaction failed",
+      ]);
+      expect(ours).toEqual(native);
+    });
+
+    it("atomic: a refusal in update() wins over a stale old value", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [`${p()} ${h()} refs/heads/main`, `${ZERO} ${h()} refs/heads/a..b`],
+          caps: "report-status atomic",
+          pack: packOfObjects(src.dir, []),
+        }),
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ng refs/heads/main atomic push failure",
+        "ng refs/heads/a..b funny refname",
+      ]);
+      expect(ours).toEqual(native);
+    });
+
+    it("atomic: missing objects and a stale old value", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [`${p()} ${h()} refs/heads/main`, `${ZERO} ${fresh} refs/heads/m`],
+          caps: "report-status atomic",
+          pack: packOfObjects(src.dir, [fresh]),
+        }),
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ng refs/heads/main atomic transaction failed",
+        "ng refs/heads/m missing necessary objects",
+      ]);
+      expect(ours).toEqual(native);
+    });
+
+    it("atomic: a tree on a branch and a funny name", async () => {
+      const tree = git(src.dir, ["rev-parse", `${h()}^{tree}`]);
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [
+            `${ZERO} ${h()} refs/heads/a`,
+            `${ZERO} ${tree} refs/heads/t`,
+            `${ZERO} ${h()} refs/heads/a..b`,
+          ],
+          caps: "report-status atomic",
+          pack: packOfObjects(src.dir, []),
+        }),
+      );
+      // ours always as git 2.55+: the tree is refused in update(), before the funny name
+      const newest = [
+        "unpack ok",
+        "ng refs/heads/a atomic push failure",
+        "ng refs/heads/t failed to update ref", // "invalid new value provided", normalised
+        "ng refs/heads/a..b atomic push failure",
+      ];
+      expect(ours).toEqual(newest);
+      if (NON_COMMIT_IN_UPDATE) expect(native).toEqual(newest);
+      else
+        expect(native).toEqual([
+          "unpack ok",
+          "ng refs/heads/a atomic push failure",
+          "ng refs/heads/t atomic push failure",
+          "ng refs/heads/a..b funny refname",
+        ]);
+    });
+
+    it("atomic: a tree on a branch fails the push in update() (git 2.55+)", async () => {
+      const tree = git(src.dir, ["rev-parse", `${h()}^{tree}`]);
+      const { native, ours } = await both(
+        pushRequest({
+          commands: [`${ZERO} ${h()} refs/heads/a`, `${ZERO} ${tree} refs/heads/t`],
+          caps: "report-status atomic",
+          pack: packOfObjects(src.dir, []),
+        }),
+      );
+      const newest = [
+        "unpack ok",
+        "ng refs/heads/a atomic push failure",
+        "ng refs/heads/t failed to update ref", // "invalid new value provided", normalised
+      ];
+      expect(ours).toEqual(newest);
+      if (NON_COMMIT_IN_UPDATE) expect(native).toEqual(newest);
+      else
+        expect(native).toEqual([
+          "unpack ok",
+          "ng refs/heads/a atomic transaction failed",
+          "ng refs/heads/t atomic transaction failed",
+        ]);
+    });
+
+    it("atomic: a shallow push refused, the others still land (git)", async () => {
+      const { native, ours } = await both(
+        pushRequest({
+          shallow: [p()],
+          commands: [`${ZERO} ${h()} refs/heads/s`, `${ZERO} ${ZERO} refs/heads/nonexist`],
+          caps: "report-status atomic delete-refs",
+          pack: packOfRevs(src.dir, [h(), `^${src.commits[0]}`]),
+        }),
+        { empty: true },
+      );
+      expect(native).toEqual([
+        "unpack ok",
+        "ng refs/heads/s shallow update not allowed",
+        "ok refs/heads/nonexist",
+      ]);
       expect(ours).toEqual(native);
     });
   },

@@ -89,7 +89,7 @@ function command(name: string, args: string[]): Uint8Array {
   ]);
 }
 
-async function setup(maxRequestBodyBytes?: number) {
+async function setup(maxRequestBodyBytes?: number, advertiseObjectInfo?: boolean) {
   const repo = await createTransportRepo();
   const c1 = await commitInRepo(repo, "c1", { "a.txt": "hello\n" });
   const c2 = await commitInRepo(repo, "c2", { "b.txt": "world\n" }, [c1]);
@@ -101,6 +101,7 @@ async function setup(maxRequestBodyBytes?: number) {
     resolveRepository: async (path) =>
       path === "/repo.git" ? { repository: repo.facade, refStore: repo.refStore } : null,
     maxRequestBodyBytes,
+    advertiseObjectInfo,
     logger: { info: (m) => logs.push(m), error: (m) => logs.push(m) },
   });
   return { repo, handler, logs, c1, c2, c3 };
@@ -140,7 +141,8 @@ describe("smart-HTTP server: protocol v2", () => {
       expect(lines[0]).toBe("version 2");
       expect(lines).toContain("ls-refs=unborn");
       expect(lines).toContain("fetch=shallow wait-for-done");
-      expect(lines).toContain("object-info");
+      // object-info only with advertiseObjectInfo (git's transfer.advertiseObjectInfo)
+      expect(lines.some((l) => l.startsWith("object-info"))).toBe(false);
       expect(lines.at(-1)).toBe("0000");
       // no refs in a v2 advertisement (ls-refs lists them)
       expect(lines.join("\n")).not.toContain(c3);
@@ -334,8 +336,8 @@ describe("smart-HTTP server: protocol v2", () => {
     }
   });
 
-  it("POST object-info sends object sizes", async () => {
-    const { handler, repo, c3 } = await setup();
+  it("POST object-info sends object sizes (with advertiseObjectInfo)", async () => {
+    const { handler, repo, c3 } = await setup(undefined, true);
     try {
       const lines = pktLines(
         await bodyBytes(

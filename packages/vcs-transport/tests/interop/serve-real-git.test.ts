@@ -7,7 +7,8 @@
  * `GIT_PROTOCOL`, so our server picks the protocol version as git's upload-pack would.
  *
  * Covered: shallow clone (`--depth`), deepening (`--deepen`, `--unshallow`) checked with
- * `git rev-list --count`, and "not our ref" for a want no ref reaches.
+ * `git rev-list --count`, and wants by id: a commit no ref reaches is served over v2 by
+ * default (as git's v2), "not our ref" with `requestPolicy: "REACHABLE_COMMIT"`.
  */
 
 import { type ChildProcess, execFile } from "node:child_process";
@@ -17,7 +18,7 @@ import { join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { serveOverDuplex } from "../../src/index.js";
+import { serveOverDuplex, type UploadPackRequestPolicy } from "../../src/index.js";
 import {
   cleanupDir,
   createTransportRepo,
@@ -114,6 +115,9 @@ async function commitAt(
   });
 }
 
+/** The upload-pack request policy of the relay's server (undefined: the default). */
+let relayPolicy: UploadPackRequestPolicy | undefined;
+
 /** Serves `repo` to each relay connection, v2 when its header says GIT_PROTOCOL=version=2. */
 function serveRelay(repo: TransportRepo): Server {
   return createServer({ allowHalfOpen: true }, (socket: Socket) => {
@@ -151,6 +155,7 @@ function serveRelay(repo: TransportRepo): Server {
         refStore: repo.refStore,
         service: "git-upload-pack",
         protocolVersion: v2 ? "2" : "1",
+        requestPolicy: relayPolicy,
       });
       socket.end();
     })().catch(() => socket.destroy());
@@ -243,17 +248,37 @@ describeGit("Interop · real git client ← our upload-pack", { timeout: TEST_TI
     expect(readFileSync(join(dst, "shallow"), "utf8").trim()).toBe(commits[2]);
   });
 
-  it("protocol v2: a want no ref reaches is 'not our ref'; a reachable commit is served", async () => {
+  it("protocol v2 with REACHABLE_COMMIT: a want no ref reaches is 'not our ref'; a reachable commit is served", async () => {
     const dst = join(root, "want.git");
     await gitOk(root, ["init", "-q", "--bare", dst]);
     const fetch = ["-c", "protocol.version=2", "fetch", `--upload-pack=${uploadPack}`, url];
 
-    const refused = await gitAsync(dst, [...fetch, `${dangling}:refs/heads/x`]);
-    expect(refused.code).not.toBe(0);
-    expect(refused.stderr).toContain(`not our ref ${dangling}`);
+    relayPolicy = "REACHABLE_COMMIT";
+    try {
+      const refused = await gitAsync(dst, [...fetch, `${dangling}:refs/heads/x`]);
+      expect(refused.code).not.toBe(0);
+      expect(refused.stderr).toContain(`not our ref ${dangling}`);
 
-    await gitOk(dst, [...fetch, `${commits[1]}:refs/heads/old`]);
-    expect(await gitOk(dst, ["rev-list", "--count", "old"])).toBe("2");
+      await gitOk(dst, [...fetch, `${commits[1]}:refs/heads/old`]);
+      expect(await gitOk(dst, ["rev-list", "--count", "old"])).toBe("2");
+    } finally {
+      relayPolicy = undefined;
+    }
+  });
+
+  it("protocol v2 by default: a want no ref reaches is served (git's v2); a missing one is 'not our ref'", async () => {
+    const dst = join(root, "want-default.git");
+    await gitOk(root, ["init", "-q", "--bare", dst]);
+    const fetch = ["-c", "protocol.version=2", "fetch", `--upload-pack=${uploadPack}`, url];
+
+    await gitOk(dst, [...fetch, `${dangling}:refs/heads/x`]);
+    expect(await gitOk(dst, ["rev-parse", "refs/heads/x"])).toBe(dangling);
+    expect(await gitOk(dst, ["rev-list", "--count", "x"])).toBe("3");
+
+    const missing = "1".repeat(40);
+    const refused = await gitAsync(dst, [...fetch, `${missing}:refs/heads/y`]);
+    expect(refused.code).not.toBe(0);
+    expect(refused.stderr).toContain(`not our ref ${missing}`);
   });
 
   it("protocol v0: --depth 2 clone, then --depth=3, then --unshallow", async () => {
