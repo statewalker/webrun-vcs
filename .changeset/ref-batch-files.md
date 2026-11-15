@@ -2,7 +2,6 @@
 "@statewalker/vcs-store-files": minor
 "@statewalker/vcs-utils": minor
 "@statewalker/vcs-core": minor
-"@statewalker/vcs-testing": minor
 ---
 
 **Atomic ref batches on git's files layout (vcs-store-files).** `FileRefStore.batch` implements git's lock-file protocol:
