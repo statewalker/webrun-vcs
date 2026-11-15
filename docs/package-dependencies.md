@@ -20,7 +20,7 @@ graph TD
         transport["@statewalker/vcs-transport<br/>Git protocols (fetch, push, clone)"]
         adapters["@statewalker/vcs-transport-adapters<br/>Core to transport bridges"]
         lfs["@statewalker/vcs-transport-lfs<br/>Git LFS batch + basic transfer"]
-        xet["@statewalker/vcs-transport-xet<br/>LFS xet chunk transfer"]
+        xet["@statewalker/vcs-transport-xet<br/>HF Xet read + webrun-chunks LFS transfer"]
     end
 
     subgraph "Storage Backends"
@@ -96,7 +96,7 @@ graph TD
 | `@statewalker/vcs-transport` | core, utils | `@statewalker/webrun-streams`, `@statewalker/webrun-http-streams` |
 | `@statewalker/vcs-transport-adapters` | core, transport, utils | `@statewalker/webrun-storage` |
 | `@statewalker/vcs-transport-lfs` | | `@statewalker/webrun-content-store`, `@statewalker/webrun-http-streams` |
-| `@statewalker/vcs-transport-xet` | transport-lfs | `@statewalker/webrun-content-store`, `@statewalker/webrun-content-transfer`, `@statewalker/webrun-streams`, `@statewalker/webrun-http-streams` |
+| `@statewalker/vcs-transport-xet` | transport-lfs | `@noble/hashes`, `@statewalker/webrun-content-store`, `@statewalker/webrun-content-transfer`, `@statewalker/webrun-streams`, `@statewalker/webrun-http-streams` |
 | `@statewalker/vcs-store-files` | core, working-tree, utils | |
 | `@statewalker/vcs-store-mem` | core, working-tree, utils | |
 | `@statewalker/vcs-store-sql` | core, working-tree, utils | peer: `sql.js` |
@@ -159,7 +159,8 @@ Backends implementing the core and working-tree storage interfaces:
 repository interfaces.
 
 **@statewalker/vcs-transport-lfs** and **@statewalker/vcs-transport-xet** - Git LFS batch protocol
-with whole-object (`basic`) and chunk-dedup (`xet`) transfer over a content store.
+with whole-object (`basic`) and chunk-dedup (`webrun-chunks`) transfer over a content store;
+`vcs-transport-xet` also reads Hugging Face Xet files (chunking, hashes, xorbs, shards, CAS).
 
 ### Command Layer
 

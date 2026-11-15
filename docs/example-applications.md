@@ -33,7 +33,7 @@ Package names follow `@statewalker/vcs-example-<name>`, `@statewalker/vcs-demo-<
 | [versioned-documents](#versioned-documents) | demo | DOCX/ODF document versioning |
 | [webrtc-p2p-sync](#webrtc-p2p-sync) | demo | WebRTC sync with QR signaling |
 | [lfs-download-huggingface](#lfs-download-huggingface) | demo | Real HuggingFace LFS download (SHA-256-verified) |
-| [xet-transfer-huggingface](#xet-transfer-huggingface) | demo | Xet chunk-dedup transfer of HF bytes |
+| [xet-transfer-huggingface](#xet-transfer-huggingface) | demo | webrun-chunks dedup transfer of HF bytes |
 | [delta-compression](#delta-compression) | benchmark | Delta encode/decode performance |
 | [pack-operations](#pack-operations) | benchmark | Pack read/write performance |
 | [real-repo-perf](#real-repo-perf) | benchmark | Realistic workflow performance |
@@ -265,7 +265,7 @@ pnpm --filter @statewalker/vcs-demo-lfs-huggingface start
 
 **Location:** [apps/demos/xet-transfer-huggingface](../apps/demos/xet-transfer-huggingface) — **node**
 
-Demonstrates the **Xet custom transfer agent** (`@statewalker/vcs-transport-xet`), which negotiates a `xet` transfer in the standard LFS batch and moves only the missing CDC chunks via `@statewalker/webrun-content-transfer`. Because HuggingFace's production Xet uses a different wire protocol, this demo fetches real HF model bytes once (standard LFS) and then transfers them between two local content-stores over an in-process **loopback** (`serveXet` ↔ `xetDownload`), proving via a `putChunk` spy that only the missing chunks move and re-verifying the reconstructed object's SHA-256. Also shows the basic-LFS fallback path.
+Demonstrates the **webrun-chunks custom transfer agent** (`@statewalker/vcs-transport-xet/webrun-chunks`, formerly advertised as `xet`), which negotiates a `webrun-chunks` transfer in the standard LFS batch and moves only the missing CDC chunks via `@statewalker/webrun-content-transfer`. It is not Hugging Face Xet (the package root reads that). This demo fetches real HF model bytes once (standard LFS) and then transfers them between two local content-stores over an in-process **loopback** (`serveWebrunChunks` ↔ `webrunChunksDownload`), proving via a `putChunk` spy that only the missing chunks move and re-verifying the reconstructed object's SHA-256. Also shows the basic-LFS fallback path.
 
 ```bash
 pnpm --filter @statewalker/vcs-demo-xet-huggingface start

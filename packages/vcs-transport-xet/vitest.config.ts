@@ -6,6 +6,8 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    // the reference-xorb streaming test (H4) measures retained memory after forced collections
+    execArgv: ["--expose-gc"],
   },
   resolve: {
     alias: [

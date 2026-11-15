@@ -6,7 +6,7 @@ A client and server for the standard Git LFS batch protocol (`POST /objects/batc
 
 ## Why it exists: talk to real LFS hosts from any runtime
 
-Large files are exchanged with Git LFS hosts through the batch API. This package implements that wire protocol on top of the content-store, using only `Request`/`Response`, Web Streams and a portable incremental SHA-256, so the same code runs in browsers, workers, Node and Deno. Objects are never held in memory whole: uploads send a streaming body, and every received object is hashed while it is stored. It does whole-object transfer only; chunk-level dedup is `@statewalker/vcs-transport-xet`, which falls back to this package. It builds and reads pointer files but knows nothing about git objects, the clean/smudge wiring or sync.
+Large files are exchanged with Git LFS hosts through the batch API. This package implements that wire protocol on top of the content-store, using only `Request`/`Response`, Web Streams and a portable incremental SHA-256, so the same code runs in browsers, workers, Node and Deno. Objects are never held in memory whole: uploads send a streaming body, and every received object is hashed while it is stored. It does whole-object transfer only; chunk-level dedup is the `webrun-chunks` transfer of `@statewalker/vcs-transport-xet`, which falls back to this package. It builds and reads pointer files but knows nothing about git objects, the clean/smudge wiring or sync.
 
 ## How to use: a server handler and two client generators
 

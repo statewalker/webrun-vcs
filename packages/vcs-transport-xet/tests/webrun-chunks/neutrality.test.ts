@@ -3,14 +3,14 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 /**
- * Dep-lint: the xet agent is a THIN ADAPTER. Its source may import only from
+ * Dep-lint: the webrun-chunks agent is a THIN ADAPTER. Its source may import only from
  * itself (relative `./…`), `node:` builtins, and the three pieces it composes —
  * the content store, the chunk-transfer engine, the reused LFS transport — plus
  * the webrun HTTP/stream substrate it bridges over. Any git-object / vcs-core /
  * files-sync / working-tree import would leak a different domain into this skin.
  */
 describe("neutrality (dep-lint)", () => {
-  const srcDir = path.resolve(import.meta.dirname, "../src");
+  const srcDir = path.resolve(import.meta.dirname, "../../src/webrun-chunks");
   const allowed = new Set([
     "@statewalker/webrun-content-store",
     "@statewalker/webrun-content-transfer",

@@ -1,9 +1,9 @@
 /**
- * Public contract for the Xet custom LFS transfer agent.
+ * Public contract for the webrun-chunks custom LFS transfer agent.
  *
  * This package is a THIN ADAPTER: it negotiates over the STANDARD Git LFS batch
- * API (reusing `@statewalker/vcs-transport-lfs`), advertising a `xet` custom
- * transfer alongside `basic`. When the peer agrees to `xet` it routes bytes
+ * API (reusing `@statewalker/vcs-transport-lfs`), advertising a `webrun-chunks` custom
+ * transfer alongside `basic`. When the peer agrees to `webrun-chunks` it routes bytes
  * through `@statewalker/webrun-content-transfer` (chunk dedup, resumable) over a chunk
  * channel bridged onto the HTTP surface; when the peer is basic-only it falls
  * back to the reused whole-object LFS transfer. Either way the whole-file
@@ -24,11 +24,11 @@ export type HashContent = (
 ) => Promise<string>;
 
 /**
- * Options for {@link import("./client.js").xetUpload}/`xetDownload`. All optional
- * and simply forwarded to `content-transfer` on the xet path (ignored on the
+ * Options for {@link import("./client.js").webrunChunksUpload}/`webrunChunksDownload`. All optional
+ * and simply forwarded to `content-transfer` on the webrun-chunks path (ignored on the
  * basic-fallback path, which moves whole objects).
  */
-export interface XetOptions {
+export interface WebrunChunksOptions {
   /** Injected loopback/HTTP transport; defaults to global `fetch`. */
   fetchImpl?: FetchLike;
   /** Chunk-integrity hasher forwarded to content-transfer. */
@@ -42,11 +42,11 @@ export interface XetOptions {
 }
 
 /**
- * Progress union emitted by the xet client. Reuses the LFS {@link TransportEvent}
+ * Progress union emitted by the webrun-chunks client. Reuses the LFS {@link TransportEvent}
  * (`batch` / `object-uploaded` / `object-downloaded` / `error`) and adds a
  * per-chunk `chunk-sent` so a caller can build a resume checkpoint.
  */
-export type XetTransportEvent =
+export type WebrunChunksTransportEvent =
   | TransportEvent
   | { type: "chunk-sent"; oid: string; chunkId: ChunkId; size: number };
 

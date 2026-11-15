@@ -1251,6 +1251,9 @@ importers:
 
   packages/vcs-transport-xet:
     dependencies:
+      '@noble/hashes':
+        specifier: 'catalog:'
+        version: 2.4.0
       '@statewalker/vcs-transport-lfs':
         specifier: workspace:^
         version: link:../vcs-transport-lfs

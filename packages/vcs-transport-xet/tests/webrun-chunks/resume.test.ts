@@ -1,6 +1,6 @@
 import type { TransferCheckpoint } from "@statewalker/webrun-content-transfer";
 import { describe, expect, it } from "vitest";
-import { serveXet, xetUpload } from "../src/index.js";
+import { serveWebrunChunks, webrunChunksUpload } from "../../src/webrun-chunks/index.js";
 import {
   collect,
   csHash,
@@ -12,9 +12,9 @@ import {
   spyStore,
 } from "./helpers.js";
 
-const URL = "http://xet.test";
+const URL = "http://chunks.test";
 
-describe("resumable xet transfer", () => {
+describe("resumable webrun-chunks transfer", () => {
   it("resumes an interrupted upload without re-sending already-delivered chunks", async () => {
     const bytes = prng(60000, 51);
 
@@ -29,9 +29,9 @@ describe("resumable xet transfer", () => {
     const serverResolver = memResolver();
 
     // Run 1: stop after the first chunk is delivered to the server.
-    const handler1 = serveXet(serverStore, serverResolver);
+    const handler1 = serveWebrunChunks(serverStore, serverResolver);
     const done: string[] = [];
-    const run1 = xetUpload(clientStore, clientResolver, URL, [ptr], {
+    const run1 = webrunChunksUpload(clientStore, clientResolver, URL, [ptr], {
       fetchImpl: handler1,
       hashContent: csHash,
       limits: { concurrency: 1 },
@@ -49,9 +49,9 @@ describe("resumable xet transfer", () => {
     // Run 2: resume from the checkpoint — the delivered chunk is not re-sent.
     const checkpoint: TransferCheckpoint = { objectIds: [id], done, pending: [] };
     const { store: spiedServer, spy } = spyStore(serverStore);
-    const handler2 = serveXet(spiedServer, serverResolver);
+    const handler2 = serveWebrunChunks(spiedServer, serverResolver);
     const events = await drain(
-      xetUpload(clientStore, clientResolver, URL, [ptr], {
+      webrunChunksUpload(clientStore, clientResolver, URL, [ptr], {
         fetchImpl: handler2,
         checkpoint,
         hashContent: csHash,

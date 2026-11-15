@@ -1,11 +1,11 @@
 import { serveLfs, sha256Hex } from "@statewalker/vcs-transport-lfs";
 import { describe, expect, it } from "vitest";
-import { xetDownload, xetUpload } from "../src/index.js";
+import { webrunChunksDownload, webrunChunksUpload } from "../../src/webrun-chunks/index.js";
 import { collect, drain, makeStore, memResolver, prng, seedObject } from "./helpers.js";
 
 const URL = "http://basic.test";
 
-describe("basic-LFS fallback (server offers no xet)", () => {
+describe("basic-LFS fallback (server offers no webrun-chunks)", () => {
   it("upload falls back to whole-object LFS and lands the object on the server", async () => {
     const bytes = prng(5000, 41);
 
@@ -13,13 +13,13 @@ describe("basic-LFS fallback (server offers no xet)", () => {
     const clientResolver = memResolver();
     const { ptr } = await seedObject(clientStore, clientResolver, bytes);
 
-    // A basic-only server: serveLfs never advertises xet.
+    // A basic-only server: serveLfs never advertises webrun-chunks.
     const serverStore = makeStore();
     const serverResolver = memResolver();
     const handler = serveLfs(serverStore, serverResolver);
 
     const events = await drain(
-      xetUpload(clientStore, clientResolver, URL, [ptr], { fetchImpl: handler }),
+      webrunChunksUpload(clientStore, clientResolver, URL, [ptr], { fetchImpl: handler }),
     );
 
     expect(events).toContainEqual({ type: "batch", operation: "upload", count: 1 });
@@ -42,7 +42,7 @@ describe("basic-LFS fallback (server offers no xet)", () => {
     const clientResolver = memResolver();
 
     const events = await drain(
-      xetDownload(clientStore, clientResolver, URL, [ptr], { fetchImpl: handler }),
+      webrunChunksDownload(clientStore, clientResolver, URL, [ptr], { fetchImpl: handler }),
     );
 
     expect(events).toContainEqual({ type: "object-downloaded", oid: ptr.oid });
@@ -65,11 +65,13 @@ describe("basic-LFS fallback (server offers no xet)", () => {
     const serverResolver = memResolver();
     const handler = serveLfs(serverStore, serverResolver);
 
-    await drain(xetUpload(uploader, uploaderResolver, URL, [ptr], { fetchImpl: handler }));
+    await drain(webrunChunksUpload(uploader, uploaderResolver, URL, [ptr], { fetchImpl: handler }));
 
     const downloader = makeStore();
     const downloaderResolver = memResolver();
-    await drain(xetDownload(downloader, downloaderResolver, URL, [ptr], { fetchImpl: handler }));
+    await drain(
+      webrunChunksDownload(downloader, downloaderResolver, URL, [ptr], { fetchImpl: handler }),
+    );
 
     const id = await downloaderResolver.toObject(ptr.oid);
     if (!id) throw new Error("mapping missing");

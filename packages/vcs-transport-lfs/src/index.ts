@@ -7,7 +7,7 @@
  * content-store stores the object. Objects stream both ways: uploads send a
  * streaming body, downloads and server uploads are hashed while they are stored
  * and verified at the end, so no object is ever held in memory whole. No
- * chunk-aware dedup (that is `vcs-transport-xet`); pointer files are built and
+ * chunk-aware dedup (that is `vcs-transport-xet/webrun-chunks`); pointer files are built and
  * read here (`createLfsPointer`, `formatLfsPointer`, `parseLfsPointer`), the
  * clean/smudge wiring belongs to the working tree. Besides a content-store, the
  * server and client run over any `LfsObjectStore`, such as

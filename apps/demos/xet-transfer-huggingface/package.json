@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "private": true,
   "type": "module",
-  "description": "Chunk-dedup transfer of real HuggingFace model bytes over our xet custom-transfer agent (loopback), plus the basic-LFS fallback",
+  "description": "Chunk-dedup transfer of real HuggingFace model bytes over our webrun-chunks custom-transfer agent (loopback), plus the basic-LFS fallback",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/statewalker/webrun-vcs.git",

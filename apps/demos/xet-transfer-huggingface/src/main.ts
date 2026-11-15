@@ -1,25 +1,26 @@
 /**
- * Demo: chunk-dedup transfer of REAL HuggingFace model bytes over our `xet`
- * custom-transfer agent, run as a LOOPBACK (our `serveXet` server <-> our xet
- * client), plus the basic-LFS fallback path.
+ * Demo: chunk-dedup transfer of REAL HuggingFace model bytes over the
+ * `webrun-chunks` custom-transfer agent, run as a LOOPBACK (`serveWebrunChunks`
+ * server <-> `webrunChunksDownload` client), plus the basic-LFS fallback path.
  *
- * IMPORTANT — what "xet" means here. `@statewalker/vcs-transport-xet` is a Git
- * LFS *custom transfer agent* using OUR protocol: it negotiates a `xet` transfer
- * in the standard LFS batch, then moves only the MISSING chunks through
- * `@statewalker/webrun-content-transfer` (CDC chunk dedup). HuggingFace's production
- * Xet uses a DIFFERENT CAS protocol on the wire, so we cannot negotiate `xet`
- * against HF. This demo therefore uses REAL HF model bytes (fetched once via the
- * standard LFS basic transfer) but transfers them between two local
- * content-stores over OUR xet loopback — that is where the chunk dedup is shown.
+ * IMPORTANT: `webrun-chunks` (`@statewalker/vcs-transport-xet/webrun-chunks`,
+ * formerly advertised as `xet`) is a Git LFS *custom transfer agent* using OUR
+ * protocol: it negotiates a `webrun-chunks` transfer in the standard LFS batch,
+ * then moves only the MISSING chunks through `@statewalker/webrun-content-transfer`
+ * (CDC chunk dedup). It is not Hugging Face Xet: reading files from HF's Xet CAS
+ * is the package root (`downloadXetFile` and friends). This demo uses REAL HF
+ * model bytes (fetched once via the standard LFS basic transfer) but transfers
+ * them between two local content-stores over the webrun-chunks loopback, which is
+ * where the chunk dedup is shown.
  *
  * Steps:
  *   1. Fetch the real `pytorch_model.bin` bytes from HF once (standard LFS).
  *   2. Put them into a SOURCE content-store (CDC-chunked) and report the chunks.
  *   3. Pre-seed a DESTINATION store with a subset of those chunks, then
- *      `xetDownload` from `serveXet(source)`; spy the destination's `putChunk`
+ *      `webrunChunksDownload` from `serveWebrunChunks(source)`; spy the destination's `putChunk`
  *      to prove only the MISSING chunks moved, and re-verify the reconstructed
  *      object's whole-file SHA-256 == the HF oid.
- *   4. Show the basic-LFS fallback: the same `xetDownload` against a non-xet
+ *   4. Show the basic-LFS fallback: the same `webrunChunksDownload` against a plain
  *      `serveLfs` server transparently moves the whole object and verifies.
  */
 
@@ -31,7 +32,10 @@ import {
   serveLfs,
   sha256Hex,
 } from "@statewalker/vcs-transport-lfs";
-import { serveXet, xetDownload } from "@statewalker/vcs-transport-xet";
+import {
+  serveWebrunChunks,
+  webrunChunksDownload,
+} from "@statewalker/vcs-transport-xet/webrun-chunks";
 import {
   type ContentStore,
   collect,
@@ -47,7 +51,7 @@ const MODEL = "hf-internal-testing/tiny-random-gpt2";
 const FILE = "pytorch_model.bin";
 const POINTER_URL = `https://huggingface.co/${MODEL}/raw/main/${FILE}`;
 const LFS_BASE_URL = `https://huggingface.co/${MODEL}.git/info/lfs`;
-const LOOPBACK_URL = "http://xet.loopback";
+const LOOPBACK_URL = "http://chunks.loopback";
 
 function parsePointer(text: string): LfsPointer {
   const pointer = parseLfsPointer(text);
@@ -90,7 +94,9 @@ async function seedObject(
 }
 
 async function main(): Promise<void> {
-  console.log(`\n=== Xet chunk-dedup demo — our xet loopback over REAL HF bytes ===\n`);
+  console.log(
+    `\n=== webrun-chunks dedup demo — our webrun-chunks loopback over REAL HF bytes ===\n`,
+  );
 
   // 1 + 2. Real bytes into a CDC-chunked SOURCE store.
   const { ptr, bytes } = await fetchHfObject();
@@ -108,23 +114,25 @@ async function main(): Promise<void> {
   );
   if (uniqueChunks.length < 2) throw new Error("object did not chunk — dedup would be trivial");
 
-  // 3. Dedup over OUR xet loopback: pre-seed the destination with a subset.
+  // 3. Dedup over OUR webrun-chunks loopback: pre-seed the destination with a subset.
   const seeded = uniqueChunks.slice(0, Math.floor(uniqueChunks.length * 0.6));
   const destStore = makeStore();
   const destResolver = memResolver();
   await seedChunks(sourceStore, destStore, seeded);
-  console.log(`\n[3] xet transfer (loopback  serveXet <-> xetDownload)`);
+  console.log(
+    `\n[3] webrun-chunks transfer (loopback  serveWebrunChunks <-> webrunChunksDownload)`,
+  );
   console.log(
     `    destination pre-seeded with ${seeded.length} of ${uniqueChunks.length} unique chunks`,
   );
 
   const { store: spiedDest, spy } = spyStore(destStore);
-  const xetHandler = serveXet(sourceStore, sourceResolver);
-  for await (const event of xetDownload(spiedDest, destResolver, LOOPBACK_URL, [ptr], {
-    fetchImpl: xetHandler,
+  const chunksHandler = serveWebrunChunks(sourceStore, sourceResolver);
+  for await (const event of webrunChunksDownload(spiedDest, destResolver, LOOPBACK_URL, [ptr], {
+    fetchImpl: chunksHandler,
     hashContent: csHash,
   })) {
-    if (event.type === "error") throw new Error(`xet transfer failed: ${event.reason}`);
+    if (event.type === "error") throw new Error(`webrun-chunks transfer failed: ${event.reason}`);
   }
 
   const transferred = spy.putChunkIds.length;
@@ -142,7 +150,7 @@ async function main(): Promise<void> {
   }
 
   const destId = await destResolver.toObject(ptr.oid);
-  if (!destId) throw new Error("xet transfer produced no object mapping");
+  if (!destId) throw new Error("webrun-chunks transfer produced no object mapping");
   // Streams the reconstructed object through SHA-256 instead of collecting it.
   const reconstructed = await createLfsPointer(spiedDest.read(destId));
   const oidOk = reconstructed.oid === ptr.oid;
@@ -150,16 +158,16 @@ async function main(): Promise<void> {
   console.log(
     `    reconstructed:      ${reconstructed.size} bytes, sha256 ${oidOk ? "OK" : "MISMATCH"}, size ${sizeOk ? "OK" : "MISMATCH"}`,
   );
-  if (!oidOk || !sizeOk) throw new Error("xet reconstruction failed verification");
+  if (!oidOk || !sizeOk) throw new Error("webrun-chunks reconstruction failed verification");
 
-  // 4. Basic-LFS fallback: a non-xet server → whole-object transfer.
-  console.log(`\n[4] basic-LFS fallback (serveLfs advertises no xet)`);
+  // 4. Basic-LFS fallback: a non-webrun-chunks server → whole-object transfer.
+  console.log(`\n[4] basic-LFS fallback (serveLfs advertises no webrun-chunks)`);
   const fbStore = makeStore();
   const fbResolver = memResolver();
   const { store: spiedFb, spy: fbSpy } = spyStore(fbStore);
   const lfsHandler = serveLfs(sourceStore, sourceResolver);
   let fallbackDownloaded = false;
-  for await (const event of xetDownload(spiedFb, fbResolver, LOOPBACK_URL, [ptr], {
+  for await (const event of webrunChunksDownload(spiedFb, fbResolver, LOOPBACK_URL, [ptr], {
     fetchImpl: lfsHandler,
     hashContent: csHash,
   })) {
@@ -172,7 +180,7 @@ async function main(): Promise<void> {
   const fbOk = fb.oid === ptr.oid && fb.size === ptr.size;
   console.log(`    whole object moved via basic transfer, sha256 ${fbOk ? "OK" : "MISMATCH"}`);
   console.log(
-    `    (no xet negotiation → 0 chunk-level putChunk calls; object stored whole via store.put)`,
+    `    (no webrun-chunks negotiation → 0 chunk-level putChunk calls; object stored whole via store.put)`,
   );
   if (fbSpy.putChunkIds.length !== 0)
     throw new Error("basic fallback unexpectedly used chunk-level transfer");
@@ -181,7 +189,7 @@ async function main(): Promise<void> {
   console.log(`\n=== SUCCESS ===`);
   console.log(`model=${MODEL} file=${FILE} oid=sha256:${ptr.oid} size=${ptr.size}`);
   console.log(
-    `xet dedup: ${transferred}/${uniqueChunks.length} unique chunks moved (${seeded.length} skipped); basic fallback verified.\n`,
+    `webrun-chunks dedup: ${transferred}/${uniqueChunks.length} unique chunks moved (${seeded.length} skipped); basic fallback verified.\n`,
   );
 }
 

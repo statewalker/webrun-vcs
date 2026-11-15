@@ -1,6 +1,10 @@
 import type { ContentStore } from "@statewalker/webrun-content-store";
 import { describe, expect, it } from "vitest";
-import { serveXet, xetDownload, xetUpload } from "../src/index.js";
+import {
+  serveWebrunChunks,
+  webrunChunksDownload,
+  webrunChunksUpload,
+} from "../../src/webrun-chunks/index.js";
 import {
   collect,
   csHash,
@@ -12,7 +16,7 @@ import {
   spyStore,
 } from "./helpers.js";
 
-const URL = "http://xet.test";
+const URL = "http://chunks.test";
 
 async function manifestChunks(store: ContentStore, id: string) {
   const manifest = await store.getManifest(id);
@@ -25,8 +29,8 @@ async function seedChunks(from: ContentStore, to: ContentStore, ids: string[]): 
   for (const id of ids) await to.putChunk(id, from.getChunk(id));
 }
 
-describe("xet chunk dedup (loopback)", () => {
-  it("upload against a xet server sends only the chunks the server is missing", async () => {
+describe("webrun-chunks chunk dedup (loopback)", () => {
+  it("upload against a webrun-chunks server sends only the chunks the server is missing", async () => {
     const bytes = prng(60000, 21);
 
     const clientStore = makeStore();
@@ -41,10 +45,10 @@ describe("xet chunk dedup (loopback)", () => {
     const seeded = chunks[0].id;
     await seedChunks(clientStore, serverStore, [seeded]);
     const { store: spiedServer, spy } = spyStore(serverStore);
-    const handler = serveXet(spiedServer, serverResolver);
+    const handler = serveWebrunChunks(spiedServer, serverResolver);
 
     const events = await drain(
-      xetUpload(clientStore, clientResolver, URL, [ptr], {
+      webrunChunksUpload(clientStore, clientResolver, URL, [ptr], {
         fetchImpl: handler,
         hashContent: csHash,
       }),
@@ -75,10 +79,10 @@ describe("xet chunk dedup (loopback)", () => {
     const shared = chunks.slice(0, -1).map((c) => c.id);
     await seedChunks(clientStore, serverStore, shared);
     const { store: spiedServer, spy } = spyStore(serverStore);
-    const handler = serveXet(spiedServer, serverResolver);
+    const handler = serveWebrunChunks(spiedServer, serverResolver);
 
     await drain(
-      xetUpload(clientStore, clientResolver, URL, [ptr], {
+      webrunChunksUpload(clientStore, clientResolver, URL, [ptr], {
         fetchImpl: handler,
         hashContent: csHash,
       }),
@@ -89,14 +93,14 @@ describe("xet chunk dedup (loopback)", () => {
     expect(await collect(serverStore.read(id))).toEqual(bytes);
   });
 
-  it("download against a xet server pulls only the missing chunks and reconstructs", async () => {
+  it("download against a webrun-chunks server pulls only the missing chunks and reconstructs", async () => {
     const bytes = prng(60000, 23);
 
     const serverStore = makeStore();
     const serverResolver = memResolver();
     const { ptr, id } = await seedObject(serverStore, serverResolver, bytes);
     const chunks = await manifestChunks(serverStore, id);
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
 
     // Client already holds the FIRST chunk.
     const clientStore = makeStore();
@@ -106,7 +110,7 @@ describe("xet chunk dedup (loopback)", () => {
     const { store: spiedClient, spy } = spyStore(clientStore);
 
     const events = await drain(
-      xetDownload(spiedClient, clientResolver, URL, [ptr], {
+      webrunChunksDownload(spiedClient, clientResolver, URL, [ptr], {
         fetchImpl: handler,
         hashContent: csHash,
       }),

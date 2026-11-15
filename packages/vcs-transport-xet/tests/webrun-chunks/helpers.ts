@@ -8,7 +8,7 @@ import type {
 } from "@statewalker/webrun-content-store";
 import { createContentStore } from "@statewalker/webrun-content-store";
 import { memBlobStore } from "@statewalker/webrun-storage";
-import type { XetTransportEvent } from "../src/index.js";
+import type { WebrunChunksTransportEvent } from "../../src/webrun-chunks/index.js";
 
 /**
  * The content-store's injected `hashContent`. PREFIXED so a content-store
@@ -78,9 +78,9 @@ export async function seedObject(
 }
 
 export async function drain(
-  events: AsyncIterable<XetTransportEvent>,
-): Promise<XetTransportEvent[]> {
-  const out: XetTransportEvent[] = [];
+  events: AsyncIterable<WebrunChunksTransportEvent>,
+): Promise<WebrunChunksTransportEvent[]> {
+  const out: WebrunChunksTransportEvent[] = [];
   for await (const e of events) out.push(e);
   return out;
 }
