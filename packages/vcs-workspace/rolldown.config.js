@@ -1,7 +1,10 @@
 import { defineConfig } from "rolldown";
 
 export default defineConfig({
-  input: "src/index.ts",
+  input: {
+    index: "src/index.ts",
+    "net/index": "src/net/index.ts",
+  },
   output: {
     dir: "dist",
     format: "esm",
@@ -14,6 +17,10 @@ export default defineConfig({
     "@statewalker/webrun-content-store",
     "@statewalker/webrun-files",
     /^@statewalker\/webrun-files\//,
+    /^@statewalker\/vcs-core(\/.*)?$/,
+    /^@statewalker\/vcs-transport(\/.*)?$/,
+    /^@statewalker\/vcs-utils(\/.*)?$/,
+    /^@statewalker\/vcs-working-tree(\/.*)?$/,
   ],
   treeshake: true,
 });

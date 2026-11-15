@@ -1463,6 +1463,9 @@ importers:
       '@statewalker/vcs-transport':
         specifier: workspace:^
         version: link:../vcs-transport
+      '@statewalker/vcs-utils':
+        specifier: workspace:^
+        version: link:../vcs-utils
       '@statewalker/vcs-working-tree':
         specifier: workspace:^
         version: link:../vcs-working-tree
@@ -1476,6 +1479,15 @@ importers:
         specifier: 'catalog:'
         version: 0.2.3
     devDependencies:
+      '@statewalker/httpeers-access':
+        specifier: 'catalog:'
+        version: 0.1.5
+      '@statewalker/vcs-transport-httpeers':
+        specifier: workspace:^
+        version: link:../vcs-transport-httpeers
+      '@statewalker/vcs-utils-node':
+        specifier: workspace:^
+        version: link:../vcs-utils-node
       '@statewalker/webrun-files-mem':
         specifier: 'catalog:'
         version: 0.11.0
