@@ -56,6 +56,16 @@
           }
         }
       }
+    },
+    {
+      "includes": ["packages/vcs-testing-gitea/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noNodejsModules": "off"
+          }
+        }
+      }
     }
   ]
 }

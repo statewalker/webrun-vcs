@@ -1,0 +1,40 @@
+{
+  "name": "@statewalker/vcs-testing-gitea",
+  "version": "0.1.0",
+  "description": "Gitea as a test oracle: a pinned, SHA-256-verified Gitea binary started headless for smart HTTP and LFS interop tests",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "packages/vcs-testing-gitea"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/packages/vcs-testing-gitea#readme",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:oracle": "GITEA=1 vitest run",
+    "lint": "biome check --write .",
+    "lint:check": "biome check .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-transport-lfs": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
+    "@statewalker/webrun-files-mem": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
