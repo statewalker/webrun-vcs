@@ -295,9 +295,14 @@ describeGit("Interop · real git client ← our upload-pack", () => {
       url,
       dst,
     ]);
-    await gitOk(dst, ["update-ref", "-d", "refs/heads/main"]);
+    // a new commit on top of the client's shallow one: the request has a shallow line, no
+    // deepen (the last test: refs/heads/next stays)
+    const next = await commitAt(repo, "c5", 1112912600, [commits[3] as string]);
+    await repo.refStore.update("refs/heads/next", next);
     const fetch = ["-c", "protocol.version=0", "fetch", `--upload-pack=${uploadPack}`];
-    await gitOk(dst, [...fetch, url, "refs/heads/main:refs/heads/main"]);
-    expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("1");
+    await gitOk(dst, [...fetch, url, "refs/heads/next:refs/heads/next"]);
+    expect(await gitOk(dst, ["rev-list", "--count", "next"])).toBe("2");
+    expect(readFileSync(join(dst, "shallow"), "utf8").trim()).toBe(commits[3]);
+    await gitOk(dst, ["fsck", "--no-dangling"]);
   }, TEST_TIMEOUT);
 });
