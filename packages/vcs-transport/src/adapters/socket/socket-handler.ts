@@ -8,7 +8,10 @@
 import type { Duplex } from "../../api/duplex.js";
 import type { RepositoryFacade } from "../../api/repository-facade.js";
 import type { RefStore } from "../../context/process-context.js";
-import { serveOverDuplex } from "../../operations/serve-over-duplex.js";
+import {
+  type ServeOverDuplexOptions,
+  serveOverDuplex,
+} from "../../operations/serve-over-duplex.js";
 import type { ServiceType } from "../../protocol/types.js";
 
 /**
@@ -199,6 +202,16 @@ export interface HandleGitSocketOptions {
   allowNonFastForward?: boolean;
   /** Optional progress callback */
   onProgress?: (message: string) => void;
+  /** Hidden ref patterns of both services (git's `transfer.hideRefs`; see `serveOverDuplex`) */
+  hideRefs?: ServeOverDuplexOptions["hideRefs"];
+  /** Hidden ref patterns of upload-pack, after `hideRefs` (git's `uploadpack.hideRefs`) */
+  uploadPackHideRefs?: ServeOverDuplexOptions["uploadPackHideRefs"];
+  /** Hidden ref patterns of receive-pack, after `hideRefs` (git's `receive.hideRefs`) */
+  receivePackHideRefs?: ServeOverDuplexOptions["receivePackHideRefs"];
+  /** receive-pack hooks */
+  hooks?: ServeOverDuplexOptions["hooks"];
+  /** upload-pack hooks */
+  uploadPackHooks?: ServeOverDuplexOptions["uploadPackHooks"];
 }
 
 /**
@@ -231,6 +244,11 @@ export async function handleGitSocketConnection(
     service: options.service,
     allowDeletes: options.allowDeletes,
     allowNonFastForward: options.allowNonFastForward,
+    hideRefs: options.hideRefs,
+    uploadPackHideRefs: options.uploadPackHideRefs,
+    receivePackHideRefs: options.receivePackHideRefs,
+    hooks: options.hooks,
+    uploadPackHooks: options.uploadPackHooks,
   });
 
   if (!result.success) {

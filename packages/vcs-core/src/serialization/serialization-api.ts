@@ -78,6 +78,12 @@ export interface ExportOptions extends PackOptions {
   thinPack?: boolean;
   /** The receiver's shallow commits: their parents are not walked */
   shallow?: Iterable<ObjectId>;
+  /**
+   * Candidate annotated tags, as git's `pack-objects --include-tag` (upload-pack's
+   * `include-tag`): each one peeling to an object in the pack is added, with every tag of its
+   * chain. Pass the ids of the `refs/tags/*` the receiver may see.
+   */
+  includeTags?: Iterable<ObjectId>;
 }
 
 /**

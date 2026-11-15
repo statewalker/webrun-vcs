@@ -148,7 +148,8 @@ describe("protocol v0 upload-pack: shallow", () => {
   it("a shallow client that does not deepen gets no shallow section; the pack stops at it", async () => {
     const { repo, c3, c4 } = await linearRepo();
     const res = await fetchV0(repo, [c4], [`shallow ${c3}`], [c3]);
-    expect(res.lines[0]).toBe(`ACK ${c3}`);
+    // git's get_common_commits: "ACK <oid> common" for the have, the final ACK on done
+    expect(res.lines.slice(0, 2)).toEqual([`ACK ${c3} common`, `ACK ${c3}`]);
     expect(res.lines).not.toContain(`unshallow ${c3}`);
     expect(res.packObjects).toBe(3); // c4 alone
   });

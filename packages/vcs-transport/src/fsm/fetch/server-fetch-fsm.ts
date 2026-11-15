@@ -20,6 +20,7 @@ import {
   type ProcessContext,
 } from "../../context/context-adapters.js";
 import { ZERO_OID } from "../../protocol/constants.js";
+import { visibleRefs } from "../../protocol/hidden-refs.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { sendPackStream } from "./send-pack-stream.js";
 import {
@@ -31,6 +32,12 @@ import {
   resolveDeepenNot,
   UploadPackRequestError,
 } from "./upload-pack-graph.js";
+import {
+  authorizeUpload,
+  includeTagCandidates,
+  notifyUpload,
+  type UploadPackRequestParts,
+} from "./upload-pack-hooks.js";
 
 /**
  * Server fetch FSM transitions.
@@ -79,32 +86,17 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["READ_FILTER", "FILTER_RECEIVED", "VALIDATE_WANTS"],
   ["READ_FILTER", "ERROR", ""],
 
-  // Read haves from client
-  ["READ_HAVES", "HAVES_RECEIVED", "SEND_ACKS"],
+  // Read a batch of haves (each answered as it is read, as git's get_common_commits)
   ["READ_HAVES", "DONE_RECEIVED", "SEND_FINAL_ACK"], // client sent done
   ["READ_HAVES", "FLUSH_RECEIVED", "SEND_ACKS"], // End of have batch
   // stateless-rpc (smart HTTP): the request ends after a batch; its answer was sent
   ["READ_HAVES", "REQUEST_END", ""],
   ["READ_HAVES", "ERROR", ""],
 
-  // Send ACK/NAK responses (depends on multi_ack mode)
-  // Single-ack mode (no multi_ack capability)
-  ["SEND_ACKS", "SENT_SINGLE_ACK", "SEND_PACK"], // Single ACK, go to pack
-  ["SEND_ACKS", "SENT_NAK_SINGLE", "READ_HAVES"], // NAK, need more haves
-
-  // multi_ack mode
-  ["SEND_ACKS", "SENT_ACK_CONTINUE", "READ_HAVES"], // ACK continue
-
-  // multi_ack_detailed mode
-  ["SEND_ACKS", "SENT_NAK", "READ_HAVES"], // NAK, need more haves
-  ["SEND_ACKS", "SENT_ACK_COMMON", "READ_HAVES"], // ACK common
-  ["SEND_ACKS", "SENT_ACK_READY", "SEND_PACK"], // ACK ready (no-done)
+  // The end of a batch: "ACK <last> ready" when it may give up, NAK in multi_ack modes
+  ["SEND_ACKS", "SENT_NAK", "READ_HAVES"], // more haves (or, stateless, the request ends)
+  ["SEND_ACKS", "SENT_ACK_READY", "SEND_PACK"], // no-done after "ready": NAK, ACK <last>
   ["SEND_ACKS", "ERROR", ""],
-
-  // Check if ready to give up (reachability analysis)
-  ["SEND_ACKS", "CHECK_REACHABILITY", "CHECK_OK_TO_GIVE_UP"],
-  ["CHECK_OK_TO_GIVE_UP", "READY_TO_GIVE_UP", "SEND_ACKS"], // Can send ACK ready
-  ["CHECK_OK_TO_GIVE_UP", "NOT_READY", "READ_HAVES"], // Need more haves
 
   // Send final ACK after done
   ["SEND_FINAL_ACK", "ACK_SENT", "SEND_PACK"],
@@ -117,10 +109,52 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["SEND_PACK", "ERROR", ""],
 ];
 
-/** git's ok_to_give_up over the wants and the common commits found so far. */
-function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
+/** What upload-pack's negotiation keeps between haves (git's get_common_commits locals). */
+interface Negotiation {
+  /** A have of this batch is ours */
+  gotCommon?: boolean;
+  /** A have of this batch is not */
+  gotOther?: boolean;
+  /** "ACK <oid> ready" was sent */
+  sentReady?: boolean;
+  /** This batch carried a have */
+  batchHaves?: boolean;
+  /** ok_to_give_up for a common set of this size (it only changes when the set grows) */
+  giveUp?: { size: number; ready: boolean };
+}
+
+function negotiationOf(ctx: ProcessContext): Negotiation {
+  const state = getState(ctx) as unknown as { negotiation?: Negotiation };
+  state.negotiation ??= {};
+  return state.negotiation;
+}
+
+/** git's ok_to_give_up over the wants and the common commits found so far (memoized). */
+async function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
   const state = getState(ctx);
-  return graphOkToGiveUp(getRepository(ctx), state.wants, state.commonBase);
+  const negotiation = negotiationOf(ctx);
+  const size = state.commonBase.size;
+  if (negotiation.giveUp?.size === size) return negotiation.giveUp.ready;
+  const ready = await graphOkToGiveUp(getRepository(ctx), state.wants, state.commonBase);
+  negotiation.giveUp = { size, ready };
+  return ready;
+}
+
+/** The v0 request as upload-pack's hooks see it. */
+function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
+  const state = getState(ctx);
+  return {
+    protocolVersion: 0,
+    wants: [...state.wants],
+    wantRefs: new Map(),
+    haves: [...state.haves],
+    capabilities: new Set(state.capabilities),
+    shallow: [...(state.clientShallow ?? [])],
+    depth: state.deepen ?? 0,
+    ...(state.deepenSince !== undefined ? { deepenSince: state.deepenSince } : {}),
+    deepenNot: [...(state.deepenNot ?? [])],
+    ...(state.filterSpec !== undefined ? { filter: state.filterSpec } : {}),
+  };
 }
 
 /**
@@ -134,6 +168,7 @@ export function defaultUploadPackCapabilities(
   repository: { getCommitInfo?: unknown },
 ): string[] {
   const capabilities = [
+    "multi_ack",
     "multi_ack_detailed",
     "side-band-64k",
     "thin-pack",
@@ -191,7 +226,8 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           defaultUploadPackCapabilities(config.requestPolicy, repository);
 
         let first = true;
-        const refsArray = [...refs];
+        // hidden refs are neither advertised nor "ours" under the ADVERTISED policy
+        const refsArray = visibleRefs(refs, config.hiddenRefs);
 
         // Empty repository: send special capabilities^{} line
         if (refsArray.length === 0) {
@@ -322,6 +358,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
 
       try {
         const policy = config.requestPolicy ?? "ADVERTISED";
+        // reachability counts hidden tips too, as git's allowReachableSHA1InWant
+        const reachableFrom = config.hiddenRefs?.length
+          ? [...(await refStore.listAll())].map(([, oid]) => oid)
+          : [...state.refs.values()];
 
         for (const oid of state.wants) {
           let valid = false;
@@ -334,9 +374,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             case "REACHABLE_COMMIT":
               // Reachable from any advertised ref
               if (repository.getCommitInfo) {
-                valid = !(await findUnreachableWant(repository, [oid], state.refs.values()));
+                valid = !(await findUnreachableWant(repository, [oid], reachableFrom));
               } else if (repository.isReachableFrom) {
-                valid = await repository.isReachableFrom(oid, [...state.refs.values()]);
+                valid = await repository.isReachableFrom(oid, reachableFrom);
               } else {
                 valid = [...state.refs.values()].includes(oid);
               }
@@ -368,6 +408,12 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             output.invalidWant = oid;
             return "INVALID_WANT";
           }
+        }
+        // the authorize hook decides before any negotiation or pack byte
+        const refused = await authorizeUpload(config, refStore, repository, uploadRequest(ctx));
+        if (refused !== undefined) {
+          output.error = refused;
+          return "INVALID_WANT";
         }
         return "VALID";
       } catch (e) {
@@ -516,7 +562,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
     },
   ],
 
-  // Read haves from client
+  // Read one batch of haves, answering each as git's get_common_commits does while it reads:
+  // a have we have is "ACK <oid> common" (multi_ack_detailed), "ACK <oid> continue"
+  // (multi_ack) or, for the first one only, "ACK <oid>" (no multi_ack); a have we lack, once
+  // every want reaches a common commit (ok_to_give_up), is "ACK <oid> ready" / "continue"
   [
     "READ_HAVES",
     async (ctx) => {
@@ -524,8 +573,11 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const state = getState(ctx);
       const output = getOutput(ctx);
       const repository = getRepository(ctx);
+      const negotiation = negotiationOf(ctx);
 
       try {
+        const multiAckDetailed = state.capabilities.has("multi_ack_detailed");
+        const multiAck = multiAckDetailed || state.capabilities.has("multi_ack");
         let first = true;
         while (true) {
           const pkt = await transport.readPktLine();
@@ -546,7 +598,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           }
 
           // Type narrowing: pkt.type === "data" guaranteed here
-          const line = pkt.text;
+          const line = pkt.text.replace(/\n$/, "");
 
           if (line === "done") {
             return "DONE_RECEIVED";
@@ -555,15 +607,29 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           if (line.startsWith("have ")) {
             const oid = line.slice(5);
             state.haves.add(oid);
-
-            // Reset empty batch counter - we received haves
+            // a batch with haves is not an empty round
             state.emptyBatchCount = 0;
+            negotiation.batchHaves = true;
 
-            // Check if we have this object (to find common ancestors)
-            if (await repository.has(oid)) {
-              state.commonBase.add(oid);
-              output.lastAckOid = oid;
+            if (!(await repository.has(oid))) {
+              // git's got_oid() == -1: they have what we do not
+              negotiation.gotOther = true;
+              if (multiAck && (await okToGiveUp(ctx))) {
+                if (multiAckDetailed) {
+                  negotiation.sentReady = true;
+                  await transport.writeLine(`ACK ${oid} ready`);
+                } else {
+                  await transport.writeLine(`ACK ${oid} continue`);
+                }
+              }
+              continue;
             }
+            negotiation.gotCommon = true;
+            state.commonBase.add(oid);
+            output.lastAckOid = oid;
+            if (multiAckDetailed) await transport.writeLine(`ACK ${oid} common`);
+            else if (multiAck) await transport.writeLine(`ACK ${oid} continue`);
+            else if (state.commonBase.size === 1) await transport.writeLine(`ACK ${oid}`);
           }
         }
       } catch (e) {
@@ -573,7 +639,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
     },
   ],
 
-  // Send ACK/NAK responses (handles all three multi-ack modes)
+  // The end of a batch (a flush), as git's get_common_commits: "ACK <last> ready" when
+  // multi_ack_detailed found a common commit and nothing unknown in this batch and may give
+  // up; NAK when nothing is common yet or in any multi_ack mode; with no-done after "ready",
+  // the final "ACK <last>" and the pack follow at once
   [
     "SEND_ACKS",
     async (ctx) => {
@@ -581,78 +650,43 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const config = getConfig(ctx);
       const state = getState(ctx);
       const output = getOutput(ctx);
+      const negotiation = negotiationOf(ctx);
 
       try {
         const multiAckDetailed = state.capabilities.has("multi_ack_detailed");
-        const multiAck = state.capabilities.has("multi_ack");
-        const noDone = state.capabilities.has("no-done");
+        const multiAck = multiAckDetailed || state.capabilities.has("multi_ack");
+        const last = output.lastAckOid;
 
-        // Helper to track empty batches and prevent infinite cycles
-        const trackEmptyBatch = (): string | null => {
+        if (
+          multiAckDetailed &&
+          negotiation.gotCommon &&
+          !negotiation.gotOther &&
+          last !== undefined &&
+          (await okToGiveUp(ctx))
+        ) {
+          negotiation.sentReady = true;
+          await transport.writeLine(`ACK ${last} ready`);
+        }
+        if (state.commonBase.size === 0 || multiAck) await transport.writeLine("NAK");
+
+        if (state.capabilities.has("no-done") && negotiation.sentReady && last !== undefined) {
+          await transport.writeLine(`ACK ${last}`);
+          return "SENT_ACK_READY";
+        }
+        negotiation.gotCommon = false;
+        negotiation.gotOther = false;
+
+        // rounds without any have: a client that never sends done (a safeguard, not git's)
+        if (!negotiation.batchHaves) {
           state.emptyBatchCount = (state.emptyBatchCount ?? 0) + 1;
           const maxEmpty = config.maxEmptyBatches ?? 10;
           if (state.emptyBatchCount > maxEmpty) {
             output.error = `Too many empty negotiation rounds (${maxEmpty})`;
             return "ERROR";
           }
-          return null;
-        };
-
-        // Single-ack mode (no multi_ack capability)
-        if (!multiAck && !multiAckDetailed) {
-          if (state.commonBase.size > 0) {
-            await transport.writeLine(`ACK ${[...state.commonBase][0]}`);
-            return "SENT_SINGLE_ACK"; // Go directly to pack
-          }
-          await transport.writeLine("NAK");
-          const error = trackEmptyBatch();
-          if (error) return error;
-          return "SENT_NAK_SINGLE";
         }
-
-        // multi_ack mode (not detailed)
-        if (multiAck && !multiAckDetailed) {
-          if (state.commonBase.size > 0) {
-            for (const oid of state.commonBase) {
-              await transport.writeLine(`ACK ${oid} continue`);
-            }
-            return "SENT_ACK_CONTINUE";
-          }
-          await transport.writeLine("NAK");
-          const error = trackEmptyBatch();
-          if (error) return error;
-          return "SENT_NAK";
-        }
-
-        // multi_ack_detailed mode
-        if (state.commonBase.size === 0) {
-          await transport.writeLine("NAK");
-          const error = trackEmptyBatch();
-          if (error) return error;
-          return "SENT_NAK";
-        }
-
-        // Send ACK common for each common object found in this batch
-        const newCommon = [...state.commonBase].filter((oid) => !state.ackedCommon?.has(oid));
-        state.ackedCommon = state.ackedCommon ?? new Set();
-
-        for (const oid of newCommon) {
-          await transport.writeLine(`ACK ${oid} common`);
-          state.ackedCommon.add(oid);
-        }
-
-        // Check if ready to send pack (no-done optimization)
-        if (noDone) {
-          // Check reachability: can we satisfy the request with current common base?
-          const ready = await okToGiveUp(ctx);
-          if (ready) {
-            const ackOid = output.lastAckOid ?? [...state.commonBase][0];
-            await transport.writeLine(`ACK ${ackOid} ready`);
-            return "SENT_ACK_READY";
-          }
-        }
-
-        return "SENT_ACK_COMMON";
+        negotiation.batchHaves = false;
+        return "SENT_NAK";
       } catch (e) {
         output.error = String(e);
         return "ERROR";
@@ -660,23 +694,8 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
     },
   ],
 
-  // Check if OK to give up (reachability analysis for no-done optimization)
-  [
-    "CHECK_OK_TO_GIVE_UP",
-    async (ctx) => {
-      const output = getOutput(ctx);
-
-      try {
-        const ready = await okToGiveUp(ctx);
-        return ready ? "READY_TO_GIVE_UP" : "NOT_READY";
-      } catch (e) {
-        output.error = String(e);
-        return "ERROR";
-      }
-    },
-  ],
-
-  // Send final ACK after done
+  // "done": the final "ACK <last>" (multi_ack modes) or nothing (single ack: its ACK was
+  // sent) when something is common; NAK otherwise (a clone), as git
   [
     "SEND_FINAL_ACK",
     async (ctx) => {
@@ -686,7 +705,11 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
 
       try {
         if (state.commonBase.size > 0) {
-          await transport.writeLine(`ACK ${[...state.commonBase][0]}`);
+          const multiAck =
+            state.capabilities.has("multi_ack_detailed") || state.capabilities.has("multi_ack");
+          if (multiAck && output.lastAckOid !== undefined) {
+            await transport.writeLine(`ACK ${output.lastAckOid}`);
+          }
           return "ACK_SENT";
         }
         await transport.writeLine("NAK");
@@ -722,6 +745,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           thin,
           ofsDelta: state.capabilities.has("ofs-delta"),
           includeTag,
+          // git's pack-objects --include-tag: the visible annotated tags of packed objects
+          includeTags: includeTag
+            ? await includeTagCandidates(config, getRefStore(ctx))
+            : undefined,
           filterSpec: state.filterSpec,
           shallow: state.packShallow ?? state.serverShallow,
         });
@@ -734,6 +761,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         });
         if (sent.ok) {
           output.sentBytes = (output.sentBytes ?? 0) + sent.bytes;
+          notifyUpload(config, getRefStore(ctx), repository, uploadRequest(ctx), {
+            common: state.commonBase,
+            packBytes: sent.bytes,
+          });
           return "PACK_SENT";
         }
         output.error = sent.error;

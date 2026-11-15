@@ -1,3 +1,4 @@
+import type { UploadPackConfig } from "../fsm/fetch/upload-pack-hooks.js";
 import type { ReceivePackConfig } from "../fsm/push/receive-pack-types.js";
 
 /**
@@ -137,6 +138,17 @@ export class ProcessConfiguration {
 
   /** receive-pack hooks, limits and driver integration */
   receivePack?: ReceivePackConfig;
+
+  /** upload-pack hooks and driver integration */
+  uploadPack?: UploadPackConfig;
+
+  /**
+   * Server side: the hidden ref patterns of the served service (git's `transfer.hideRefs`
+   * followed by `uploadpack.hideRefs` or `receive.hideRefs`; see `isRefHidden`). Hidden refs
+   * are not advertised, nor listed by `ls-refs`; a `want-ref` of one is an unknown ref, and
+   * receive-pack refuses to change one.
+   */
+  hiddenRefs?: string[];
 
   // Protocol V2 configuration
 

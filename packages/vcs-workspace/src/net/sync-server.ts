@@ -15,6 +15,7 @@ import {
   type RepositoryFacade,
   type ServeResult,
   serveOverDuplex,
+  type UploadPackHooks,
   type UploadPackRequestPolicy,
 } from "@statewalker/vcs-transport";
 import type { GitService } from "./sync-remote.js";
@@ -52,6 +53,13 @@ export interface SyncServerOptions {
    * or tag reaches. See the transport's `UploadPackRequestPolicy`.
    */
   requestPolicy?: UploadPackRequestPolicy;
+  /** upload-pack hooks: `authorize` (may refuse a fetch), `postUpload` (after the pack) */
+  uploadPackHooks?: UploadPackHooks;
+  /**
+   * Hidden ref patterns (git's `transfer.hideRefs`): not advertised to fetches or pushes, and
+   * a push changing one is refused
+   */
+  hideRefs?: string[];
 }
 
 /** A served repository: the HTTP handler, a duplex server, and push notifications. */
@@ -111,6 +119,8 @@ export function createSyncServer(options: SyncServerOptions): SyncServer {
       refStore: options.refStore,
     }),
     receivePack: { hooks },
+    uploadPack: { hooks: options.uploadPackHooks },
+    hideRefs: options.hideRefs,
     requestPolicy: options.requestPolicy,
     logger: { info: () => {}, error: (message, error) => logger.error(message, error) },
   });
@@ -124,6 +134,8 @@ export function createSyncServer(options: SyncServerOptions): SyncServer {
         refStore: options.refStore,
         service,
         hooks,
+        uploadPackHooks: options.uploadPackHooks,
+        hideRefs: options.hideRefs,
         logger,
         requestPolicy: options.requestPolicy,
       }),

@@ -368,6 +368,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
+      gzipRequests: this.gzipRequests,
       repository: createRepositoryFacade({ history }),
       refStore: createTransportRefStore(history.refs),
       refspecs,

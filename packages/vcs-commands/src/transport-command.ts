@@ -17,6 +17,8 @@ export interface TransportOptions {
   headers?: Record<string, string>;
   /** Request timeout in milliseconds */
   timeout?: number;
+  /** Gzip large fetch request bodies (default true, as git; see `setGzipRequests`) */
+  gzipRequests?: boolean;
   /** Progress callback */
   onProgress?: ProgressCallback;
   /** Raw progress message callback */
@@ -38,6 +40,8 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   protected timeout?: number;
   /** Custom HTTP headers */
   protected headers?: Record<string, string>;
+  /** Gzip large fetch request bodies (undefined: the transport's default, true) */
+  protected gzipRequests?: boolean;
   /** Progress callback */
   protected progressCallback?: ProgressCallback;
   /** Progress message callback */
@@ -74,6 +78,19 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   setTimeout(timeout: number): this {
     this.checkCallable();
     this.timeout = timeout;
+    return this;
+  }
+
+  /**
+   * Send large upload-pack request bodies (a fetch's have-batches over 1024 bytes) gzipped,
+   * with `Content-Encoding: gzip`, as git does (default true). Pass false for a browser behind
+   * a CORS proxy that does not allow that header (it is not CORS-safelisted).
+   *
+   * @param gzip Whether to gzip large request bodies
+   */
+  setGzipRequests(gzip: boolean): this {
+    this.checkCallable();
+    this.gzipRequests = gzip;
     return this;
   }
 
@@ -118,6 +135,7 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
+      gzipRequests: this.gzipRequests,
       onProgress: this.progressCallback,
       onProgressMessage: this.progressMessageCallback,
     };

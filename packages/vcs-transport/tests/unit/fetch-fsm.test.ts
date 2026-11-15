@@ -332,13 +332,13 @@ describe("Fetch Negotiation", () => {
       const ctx = createContext({ transport, repository });
       ctx.state.haves.add("abc123");
       ctx.state.commonBase.add("abc123"); // Already found common
-      ctx.config.multiAck = "detailed";
+      ctx.state.capabilities.add("multi_ack_detailed");
 
       const handler = serverFetchHandlers.get("SEND_ACKS");
       if (handler) {
         await handler(ctx);
-        // Server sends ACK if there's something in commonBase
-        expect(transport.writeLine).toHaveBeenCalled();
+        // multi_ack modes end every batch with NAK (git's get_common_commits)
+        expect(transport.writeLine).toHaveBeenCalledWith("NAK");
       }
     });
 

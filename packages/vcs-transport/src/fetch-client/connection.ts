@@ -60,6 +60,13 @@ export interface HttpConnectionOptions {
   protocolVersion?: 0 | 2;
   /** Aborts every request of the connection */
   signal?: AbortSignal;
+  /**
+   * Send upload-pack request bodies over 1024 bytes (large have-batches) gzipped, with
+   * `Content-Encoding: gzip`, as git's remote-curl does (default true). Set false where that
+   * header cannot go: `Content-Encoding` is not a CORS-safelisted request header, so a browser
+   * behind a CORS proxy that does not allow it fails the preflight.
+   */
+  gzipRequests?: boolean;
 }
 
 /**
@@ -118,6 +125,10 @@ export async function openHttpConnection(
     advertisedRefs: greeting.refs,
     async request(body) {
       await current?.cancel();
+      const payload =
+        options.gzipRequests === false
+          ? { bytes: concat(body), gzip: false }
+          : await gzipLargeBody(concat(body));
       const res = await wait(() =>
         doFetch(
           new Request(`${baseUrl}/git-upload-pack`, {
@@ -127,8 +138,9 @@ export async function openHttpConnection(
               "Content-Type": "application/x-git-upload-pack-request",
               Accept: "application/x-git-upload-pack-result",
               ...(greeting.version === 2 ? { "Git-Protocol": "version=2" } : {}),
+              ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
             },
-            body: concat(body),
+            body: payload.bytes,
             signal: controller.signal,
           }),
         ),
@@ -307,6 +319,25 @@ export async function withTimeout<T>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Request bodies above this many bytes are sent gzipped (git's remote-curl: over 1024). */
+export const GZIP_REQUEST_MIN_BYTES = 1024;
+
+/**
+ * A request body as git's remote-curl sends it: gzipped (`Content-Encoding: gzip`) when longer
+ * than {@link GZIP_REQUEST_MIN_BYTES} (a large have-batch) and the platform has
+ * `CompressionStream`; otherwise as it is. `HttpConnectionOptions.gzipRequests: false` turns
+ * it off.
+ */
+async function gzipLargeBody(
+  bytes: Uint8Array<ArrayBuffer>,
+): Promise<{ bytes: Uint8Array<ArrayBuffer>; gzip: boolean }> {
+  if (bytes.length <= GZIP_REQUEST_MIN_BYTES || typeof CompressionStream === "undefined") {
+    return { bytes, gzip: false };
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
+  return { bytes: new Uint8Array(await new Response(stream).arrayBuffer()), gzip: true };
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array<ArrayBuffer> {

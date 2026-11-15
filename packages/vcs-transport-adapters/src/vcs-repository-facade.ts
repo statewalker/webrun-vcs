@@ -107,16 +107,29 @@ export class VcsRepositoryFacade implements RepositoryFacade {
    * The objects reachable from wants and not from exclude, streamed.
    * Delegates to SerializationApi.exportPack.
    */
-  exportPack(
+  async *exportPack(
     wants: Set<string>,
     exclude: Set<string>,
     options?: ExportPackOptions,
   ): AsyncIterable<Uint8Array> {
-    return this.serialization.exportPack(wants, exclude, {
+    yield* this.serialization.exportPack(wants, exclude, {
       thinPack: options?.thin,
       shallow: options?.shallow,
       ofsDelta: options?.ofsDelta,
+      // include-tag: upload-pack's candidates (the visible refs/tags/*), else our own tags
+      includeTags: options?.includeTag
+        ? (options.includeTags ?? (await this.tagRefIds()))
+        : undefined,
     });
+  }
+
+  /** The ids of the `refs/tags/*` refs (the candidates of `includeTag` without `includeTags`). */
+  private async tagRefIds(): Promise<string[]> {
+    const ids: string[] = [];
+    for await (const ref of this.history.refs.list("refs/tags/")) {
+      if ("objectId" in ref && ref.objectId) ids.push(ref.objectId);
+    }
+    return ids;
   }
 
   /**

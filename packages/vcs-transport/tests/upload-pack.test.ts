@@ -1136,66 +1136,73 @@ describe("Upload-Pack: Negotiation", () => {
     // No multi_ack capabilities, no common base
 
     const event = await runHandler("SEND_ACKS", ctx);
-    expect(event).toBe("SENT_NAK_SINGLE");
+    expect(event).toBe("SENT_NAK");
 
     const lines = transport._getWrittenLines();
     expect(lines).toContain("NAK");
   });
 
-  it("should send single ACK when common found (single-ack mode)", async () => {
+  it("should send single ACK for the first common have, then wait for done (single-ack mode)", async () => {
     const transport = createMockTransport();
+    const repository = createMockRepository();
     const commonOid = randomOid();
+    const otherOid = randomOid();
+    repository._addObject(commonOid);
+    repository._addObject(otherOid);
+    transport._setPackets(
+      packets().data(`have ${commonOid}`).data(`have ${otherOid}`).flush().build(),
+    );
 
-    const ctx = createServerContext({ transport });
-    const state = getState(ctx);
-    state.commonBase.add(commonOid);
-    // No multi_ack capabilities
+    const ctx = createServerContext({ transport, repository });
+    expect(await runHandler("READ_HAVES", ctx)).toBe("FLUSH_RECEIVED");
+    // git: the batch's end writes nothing more once something is common (no multi_ack)
+    expect(await runHandler("SEND_ACKS", ctx)).toBe("SENT_NAK");
 
-    const event = await runHandler("SEND_ACKS", ctx);
-    expect(event).toBe("SENT_SINGLE_ACK");
-
-    const lines = transport._getWrittenLines();
-    expect(lines).toContain(`ACK ${commonOid}`);
+    expect(transport._getWrittenLines()).toEqual([`ACK ${commonOid}`]);
   });
 
-  it("should send ACK common in multi_ack_detailed mode", async () => {
+  it("should send ACK common per have and NAK at the flush in multi_ack_detailed mode", async () => {
     const transport = createMockTransport();
+    const repository = createMockRepository();
     const commonOid = randomOid();
+    repository._addObject(commonOid);
+    transport._setPackets(packets().data(`have ${commonOid}`).flush().build());
 
-    const ctx = createServerContext({ transport });
-    const state = getState(ctx);
-    state.capabilities.add("multi_ack_detailed");
-    state.commonBase.add(commonOid);
-
-    const event = await runHandler("SEND_ACKS", ctx);
-    expect(event).toBe("SENT_ACK_COMMON");
+    const ctx = createServerContext({ transport, repository });
+    getState(ctx).capabilities.add("multi_ack_detailed");
+    await runHandler("READ_HAVES", ctx);
+    expect(await runHandler("SEND_ACKS", ctx)).toBe("SENT_NAK");
 
     const lines = transport._getWrittenLines();
-    expect(lines.some((l) => l === `ACK ${commonOid} common`)).toBe(true);
+    expect(lines[0]).toBe(`ACK ${commonOid} common`);
+    expect(lines.at(-1)).toBe("NAK");
   });
 
-  it("should send ACK continue in multi_ack mode", async () => {
+  it("should send ACK continue and NAK in multi_ack mode", async () => {
     const transport = createMockTransport();
+    const repository = createMockRepository();
     const commonOid = randomOid();
+    repository._addObject(commonOid);
+    transport._setPackets(packets().data(`have ${commonOid}`).flush().build());
 
-    const ctx = createServerContext({ transport });
-    const state = getState(ctx);
-    state.capabilities.add("multi_ack");
-    state.commonBase.add(commonOid);
-
-    const event = await runHandler("SEND_ACKS", ctx);
-    expect(event).toBe("SENT_ACK_CONTINUE");
+    const ctx = createServerContext({ transport, repository });
+    getState(ctx).capabilities.add("multi_ack");
+    await runHandler("READ_HAVES", ctx);
+    expect(await runHandler("SEND_ACKS", ctx)).toBe("SENT_NAK");
 
     const lines = transport._getWrittenLines();
-    expect(lines.some((l) => l === `ACK ${commonOid} continue`)).toBe(true);
+    expect(lines[0]).toBe(`ACK ${commonOid} continue`);
+    expect(lines.at(-1)).toBe("NAK");
   });
 
-  it("should send final ACK when common base exists", async () => {
+  it("should send final ACK when common base exists (multi_ack modes)", async () => {
     const transport = createMockTransport();
     const commonOid = randomOid();
 
     const ctx = createServerContext({ transport });
+    getState(ctx).capabilities.add("multi_ack_detailed");
     getState(ctx).commonBase.add(commonOid);
+    getOutput(ctx).lastAckOid = commonOid;
 
     const event = await runHandler("SEND_FINAL_ACK", ctx);
     expect(event).toBe("ACK_SENT");

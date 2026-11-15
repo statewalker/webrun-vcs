@@ -79,8 +79,17 @@ export interface PackImportResult extends Omit<CorePackImportResult, "quarantine
 export interface ExportPackOptions {
   /** Use thin pack (deltas reference objects not in pack) */
   thin?: boolean;
-  /** Include tags for fetched commits */
+  /**
+   * The client asked for `include-tag`: annotated tags of packed objects are added (git's
+   * `pack-objects --include-tag`), from `includeTags` when given, else from the facade's own
+   * `refs/tags/*`
+   */
   includeTag?: boolean;
+  /**
+   * The candidate tags for `includeTag` (upload-pack passes the ids of the visible
+   * `refs/tags/*`): each one peeling to a packed object is added with its chain of tags
+   */
+  includeTags?: Iterable<string>;
   /** Partial clone filter specification */
   filterSpec?: string;
   /** Shallow boundaries (objects that should not include parents) */

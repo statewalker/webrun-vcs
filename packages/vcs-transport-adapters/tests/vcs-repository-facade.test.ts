@@ -598,3 +598,55 @@ describe("VcsRepositoryFacade", () => {
     });
   });
 });
+
+describe("VcsRepositoryFacade.exportPack: include-tag", () => {
+  async function setup() {
+    const history = createMockHistory();
+    const commitId = await history.commits.store({
+      tree: EMPTY_TREE_ID,
+      parents: [],
+      author: SAMPLE_IDENT,
+      committer: SAMPLE_IDENT,
+      message: "Test",
+    });
+    const tagId = await history.tags.store({
+      object: commitId,
+      objectType: ObjectType.COMMIT,
+      tag: "v1.0",
+      message: "Release",
+    });
+    await history.refs.set("refs/tags/v1.0", tagId);
+    await history.refs.set("refs/heads/main", commitId);
+    const calls: { includeTags?: Iterable<string> }[] = [];
+    const serialization = {
+      ...createMockSerializationApi(),
+      exportPack(_wants: Iterable<string>, _haves: Iterable<string>, options = {}) {
+        calls.push(options as { includeTags?: Iterable<string> });
+        return (async function* () {})();
+      },
+    } as ReturnType<typeof createMockSerializationApi>;
+    return { facade: new VcsRepositoryFacade({ history, serialization }), calls, tagId, commitId };
+  }
+
+  async function drain(stream: AsyncIterable<Uint8Array>) {
+    for await (const _ of stream) {
+      // nothing
+    }
+  }
+
+  it("falls back to its refs/tags/* without includeTags, as the factory facade", async () => {
+    const { facade, calls, tagId, commitId } = await setup();
+    await drain(facade.exportPack(new Set([commitId]), new Set(), { includeTag: true }));
+    expect([...(calls[0]?.includeTags ?? [])]).toEqual([tagId]);
+  });
+
+  it("uses the given candidates, and none without includeTag", async () => {
+    const { facade, calls, commitId } = await setup();
+    await drain(
+      facade.exportPack(new Set([commitId]), new Set(), { includeTag: true, includeTags: [] }),
+    );
+    await drain(facade.exportPack(new Set([commitId]), new Set()));
+    expect([...(calls[0]?.includeTags ?? ["x"])]).toEqual([]);
+    expect(calls[1]?.includeTags).toBeUndefined();
+  });
+});

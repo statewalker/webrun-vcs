@@ -67,6 +67,9 @@ export function gitHttpBackend(projectRoot: string): GitHttpBackend {
     };
     if (body) env.CONTENT_LENGTH = String(body.length);
     if (gitProtocol) env.GIT_PROTOCOL = gitProtocol;
+    // a gzipped request body (git's remote-curl, our fetch client): http-backend inflates it
+    const contentEncoding = request.headers.get("content-encoding");
+    if (contentEncoding) env.HTTP_CONTENT_ENCODING = contentEncoding;
     const child = spawn("git", ["http-backend"], { env });
     children.add(child);
     child.on("close", () => children.delete(child));
