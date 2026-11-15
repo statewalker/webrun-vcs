@@ -703,3 +703,84 @@ describe("a first checkout cut short has nothing to commit the edits on", () => 
     expect((await serverFiles(history))["c.txt"]).toBe("c by Bob\n");
   });
 });
+
+/** Second review round: kept directories are still named; releases are still reported. */
+describe("a recovery stop on a directory kept in place of the target's file", () => {
+  async function nestedBecomesFile() {
+    const { server, history } = await serverRepo();
+    const r = () => messageChannelRemote(server);
+    const a = await workspace("Ann", { README: "r\n", "sub/x.txt": "x\n" });
+    await syncWorkspace(a, r());
+    const plain = await workspace("Bob");
+    await syncWorkspace(plain, r());
+    // Bob makes sub/ a repository of its own, with unpushed work
+    await writeFile(plain, "sub/.git/HEAD", "ref: refs/heads/main\n");
+    await writeFile(plain, "sub/unpushed-work.c", "int x;\n");
+    await syncWorkspace(plain, r());
+    // Ann replaces the directory by a file
+    await a.folder.remove("/sub");
+    await writeFile(a, "sub", "now a file\n");
+    await writeFile(a, "README", "r2\n");
+    const target = (await syncWorkspace(a, r())).head as string;
+    return { r, history, plain, target };
+  }
+
+  it("N1: the path is still named, as kept, with a hint how to get out; conclude keeps both", async () => {
+    const { r, history, plain, target } = await nestedBecomesFile();
+    const res = await syncWorkspace(plain, r());
+    expect(res).toMatchObject({ integration: "conflicted", conflicts: ["sub"] });
+    expect(res.merge).toMatchObject({ kind: "recovery", conflicts: ["sub"], kept: ["sub"] });
+    expect(res.merge?.hint).toMatch(/onConflict: "commit"/);
+    expect(res.merge?.message).toContain("sub (directory kept)");
+    const aside = `sub.theirs-${target.slice(0, 7)}`;
+    expect(await readFile(plain, aside)).toBe("now a file\n");
+    expect(await readFile(plain, "sub/unpushed-work.c")).toBe("int x;\n");
+    await concludeMerge(plain);
+    await syncWorkspace(plain, r());
+    const served = await serverFiles(history);
+    expect(served[aside]).toBe("now a file\n");
+    expect(served.README).toBe("r2\n");
+    expect(await readFile(plain, "sub/.git/HEAD")).toBe("ref: refs/heads/main\n");
+  });
+
+  it("N1: an abort brings the same stop back, still named", async () => {
+    const { r, plain } = await nestedBecomesFile();
+    await syncWorkspace(plain, r());
+    await abortMerge(plain);
+    expect(await readFile(plain, "sub/unpushed-work.c")).toBe("int x;\n");
+    const again = await syncWorkspace(plain, r());
+    expect(again.merge).toMatchObject({ conflicts: ["sub"], kept: ["sub"] });
+    expect(again.merge?.hint).toBeDefined();
+  });
+});
+
+describe("a held file released in a round that finishes a cut-short checkout", () => {
+  it("is reported in rejoined", async () => {
+    const { server } = await serverRepo();
+    const r = () => messageChannelRemote(server);
+    const a = await workspace("Ann", { "a.txt": "a\n", "b.txt": "b\n", "app.cfg": "v1\n" });
+    await syncWorkspace(a, r());
+    const plain = await workspace("Bob");
+    await syncWorkspace(plain, r());
+    const ignoring = await reopen(plain, { ignore: (p) => defaultIgnore(p) || p === "app.cfg" });
+    await writeFile(plain, "app.cfg", "local\n");
+    await syncWorkspace(ignoring, r());
+    await writeFile(a, "a.txt", "a2\n");
+    await writeFile(a, "b.txt", "b2\n");
+    await syncWorkspace(a, r());
+    // app.cfg no longer ignored: held; the checkout is cut short
+    const f = faulty(plain, (p) => p === "/b.txt");
+    const b = await f.open();
+    await expect(syncWorkspace(b, r())).rejects.toThrow(/disk full/);
+    f.state.armed = false;
+    await writeFile(plain, "app.cfg", "v1\n"); // the branch's content again
+    const res = await syncWorkspace(b, r());
+    expect(res.rejoined).toContain("app.cfg");
+    expect(res.skipped).not.toContainEqual({ path: "app.cfg", reason: "unignored-local" });
+    expect(await folderFiles(plain)).toEqual({
+      "a.txt": "a2\n",
+      "app.cfg": "v1\n",
+      "b.txt": "b2\n",
+    });
+  });
+});

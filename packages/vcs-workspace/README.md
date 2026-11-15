@@ -268,6 +268,8 @@ Some loops are worth knowing about:
   - conclude, keeping the target's file beside yours (`<path>.theirs-<id>`);
   - move your directory away first;
   - or sync once with `onConflict: "commit"`.
+
+  Such a path is still named in `conflicts`, and also in `merge.kept`: a directory kept where the other side has a file, with nothing to resolve in it. The merge commit's message marks it `(directory kept)`. When every conflict is of that kind, `merge.hint` lists these ways out. This covers a nested repository's own root too, although its contents stay left out.
 - **A rejoin conflict with nothing to resolve in the file.** Your change can meet the branch's deletion, or a directory of yours can stand where the branch has a file. The folder already holds your side, with no markers, and the branch's file is beside it when there is one. Concluding takes the folder as it is: delete the file first to accept the deletion. Aborting changes nothing in the folder, and the next commit stops on the same path again.
 
 The stop is written ahead:

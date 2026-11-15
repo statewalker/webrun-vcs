@@ -1192,6 +1192,17 @@ export interface MergeInProgress {
   theirs: ObjectId;
   /** Paths with both sides kept, to resolve before concluding */
   conflicts: string[];
+  /**
+   * Those of `conflicts` with nothing to resolve in a file: a directory stands there (a
+   * nested repository, a submodule's checkout, files of your own) where the other side has a
+   * file, which is beside it as `<path>.theirs-<id>`. The directory is never removed.
+   */
+  kept: string[];
+  /**
+   * When every conflict is `kept`, how to get out: aborting alone brings the same stop back
+   * at the next sync while the directory stays
+   */
+  hint?: string;
   /** The message the merge commit gets */
   message: string;
 }
@@ -1217,6 +1228,8 @@ interface MergeRecord {
   /** The merge result */
   files: FlatTree;
   conflicts: string[];
+  /** Conflicts where a directory is kept in place of the other side's file (see {@link MergeInProgress.kept}) */
+  kept?: string[];
   /** First line of the merge commit's message */
   title: string;
   /**
@@ -1240,6 +1253,7 @@ async function mergeCommit(
     leftOut: record.leftOut,
     kind: record.kind,
     ...(record.kind === "recovery" ? { from: record.from ?? null } : {}),
+    ...(record.kept?.length ? { kept: record.kept } : {}),
   });
   const id = await commitTree(
     ws,
@@ -1281,6 +1295,7 @@ async function readMerge(ws: GitWorkspace): Promise<MergeRecord | undefined> {
     leftOut?: unknown;
     kind?: unknown;
     from?: unknown;
+    kept?: unknown;
   };
   const kind: MergeKind = meta.kind === "recovery" || meta.kind === "rejoin" ? meta.kind : "merge";
   const tip = await workspaceHead(ws);
@@ -1309,6 +1324,7 @@ async function readMerge(ws: GitWorkspace): Promise<MergeRecord | undefined> {
     theirs,
     files: (await readCommitTree(ws.history, id)).files,
     conflicts: strings(meta.conflicts),
+    kept: strings(meta.kept),
     title: typeof meta.title === "string" ? meta.title : "Merge",
     leftOut: strings(meta.leftOut),
   };
@@ -1316,8 +1332,13 @@ async function readMerge(ws: GitWorkspace): Promise<MergeRecord | undefined> {
 
 function mergeMessage(record: MergeRecord): string {
   const lines = [record.title];
+  const kept = new Set(record.kept ?? []);
   if (record.conflicts.length > 0) {
-    lines.push("", "Conflicts:", ...record.conflicts.map((p) => `\t${p}`));
+    lines.push(
+      "",
+      "Conflicts:",
+      ...record.conflicts.map((p) => (kept.has(p) ? `\t${p} (directory kept)` : `\t${p}`)),
+    );
   }
   return lines.join("\n");
 }
@@ -1328,8 +1349,27 @@ function publicMerge(record: MergeRecord): MergeInProgress {
     head: record.head,
     theirs: record.theirs,
     conflicts: record.conflicts,
+    kept: record.kept ?? [],
+    ...(keptOnly(record) ? { hint: keptHint(record) } : {}),
     message: mergeMessage(record),
   };
+}
+
+/** Whether every conflict of `record` is a directory kept in place of a file: nothing to resolve. */
+function keptOnly(record: MergeRecord): boolean {
+  const kept = new Set(record.kept ?? []);
+  return record.conflicts.length > 0 && record.conflicts.every((c) => kept.has(c));
+}
+
+function keptHint(record: MergeRecord): string {
+  const paths = record.conflicts.join(", ");
+  return (
+    `nothing to resolve in a file: ${paths} stay directories (a nested repository, a submodule's ` +
+    "checkout or files of your own) where the other side has a file, which is beside each as " +
+    "<path>.theirs-<id>. Conclude to keep both (remove the copy first to drop it), or move the " +
+    'directory away and sync again, or sync once with onConflict: "commit"; aborting alone ' +
+    "brings the same stop back at the next sync."
+  );
 }
 
 /**
@@ -1424,6 +1464,7 @@ async function stopRecovery(ws: GitWorkspace, record: MergeRecord): Promise<Merg
   const mine: FlatTree = new Map(from ? fromFiles : to);
   const files: FlatTree = new Map(plan.files);
   const leftOut = new Set<string>();
+  const kept = new Set<string>();
   const skipWrite = skipFor(ws, to);
   const skipRemove = skipFor(ws, fromFiles);
   const paths = new Set([...fromFiles.keys(), ...to.keys(), ...plan.files.keys()]);
@@ -1433,8 +1474,11 @@ async function stopRecovery(ws: GitWorkspace, record: MergeRecord): Promise<Merg
     const base = from ? h : t;
     const want = inFolder(plan.files.get(path));
     if (path in plan.seen) {
-      if (t ? skipWrite(path) : skipRemove(path)) {
-        // left out now: the folder's copy is not history's, the target's version stays
+      if (plan.seen[path] === KEPT_DIRECTORY) kept.add(path);
+      const held = heldPaths.get(ws)?.has(path) || ws.ignore(path);
+      if (held && plan.seen[path] !== KEPT_DIRECTORY && (t ? skipWrite(path) : skipRemove(path))) {
+        // a file held or ignored now: its folder copy is not history's and never named as a
+        // conflict (it is reported as held), the target's version stays
         leftOut.add(path);
         const entry = to.get(path);
         if (entry) files.set(path, entry);
@@ -1489,6 +1533,7 @@ async function stopRecovery(ws: GitWorkspace, record: MergeRecord): Promise<Merg
     theirs,
     files,
     conflicts: plan.conflicts.filter((c) => !leftOut.has(c)).sort(),
+    kept: [...kept].filter((c) => plan.conflicts.includes(c)).sort(),
   });
   if ((await workspaceHead(ws)) !== head) await moveBranch(ws, from, head);
   await ws.history.refs.remove(planRef(ws));
@@ -1527,9 +1572,11 @@ async function stopRejoin(
   const stale = await loadStale(ws);
   const mine: FlatTree = new Map(headFiles);
   const files: FlatTree = new Map(headFiles);
+  const kept: string[] = [];
   for (const path of paths) {
     const step = stale.rejoining.get(path);
     if (!step) continue;
+    if (step.result?.startsWith("directory:") && headFiles.has(path)) kept.push(path);
     const branch = inFolder(headFiles.get(path));
     if (step.mine) mine.set(path, step.mine);
     else mine.delete(path);
@@ -1552,6 +1599,7 @@ async function stopRejoin(
     theirs,
     files,
     conflicts: [...paths].sort(),
+    kept: kept.sort(),
     title: `Merge folder copies of paths that came back into ${ws.branch.slice("refs/heads/".length)}`,
     leftOut: freezeLeftOut(ws, walked, [headFiles]),
   });
@@ -1609,6 +1657,8 @@ export async function commitFolder(
   // the snapshot and the tree, and the snapshot is taken from it. Only when the finish or the
   // rejoin wrote something is the folder listed again (its repositories added to the round's).
   let walked = await walk(ws);
+  // held files released by the early hold (their content is the branch's again)
+  let released: string[] = [];
   if (await ws.history.refs.resolve(pendingRef(ws))) {
     // files back from being ignored are held before the finish: it never writes over them,
     // never takes them for edits that clash with the target, and a stop freezes them as left out
@@ -1617,6 +1667,7 @@ export async function commitFolder(
     const early = await holdUnignored(ws, stale, walked, from, options.include ?? []);
     if (early.changed) await saveStale(ws, stale);
     heldPaths.set(ws, early.hold);
+    released = early.released;
   }
   const finished = await finishPendingCheckout(ws, walked, onConflict);
   const conflicts = [...finished.conflicts];
@@ -1644,7 +1695,7 @@ export async function commitFolder(
         record.head !== record.from,
       conflicts: record.conflicts,
       skipped,
-      rejoined: [],
+      rejoined: released,
       merge: publicMerge(record),
       mergeStarted: started,
     };
@@ -1659,7 +1710,7 @@ export async function commitFolder(
   const record = await loadStale(ws);
   const held = await holdUnignored(ws, record, walked, current.files, options.include ?? []);
   if (held.changed) await saveStale(ws, record);
-  const rejoined = [...new Set([...back.rejoined, ...held.released])].sort();
+  const rejoined = [...new Set([...released, ...back.rejoined, ...held.released])].sort();
   heldPaths.set(ws, held.hold);
   const tempFiles = new Map<string, number>();
   if (head && back.stopped.length > 0) {
