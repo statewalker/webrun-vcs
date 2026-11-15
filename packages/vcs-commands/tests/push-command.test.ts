@@ -591,7 +591,8 @@ describe.each(backends)("PushCommand ($name backend)", ({ factory }) => {
           const body =
             pkt("# service=git-receive-pack\n") +
             "0000" +
-            pkt(`${STUB_REMOTE_OID} refs/heads/main\0report-status side-band-64k\n`) +
+            // no side-band-64k: the answer below is a plain (not multiplexed) report
+            pkt(`${STUB_REMOTE_OID} refs/heads/main\0report-status delete-refs\n`) +
             "0000";
           return new Response(body, { status: 200 });
         }
@@ -616,7 +617,9 @@ describe.each(backends)("PushCommand ($name backend)", ({ factory }) => {
         return await git
           .push()
           .setRemote("http://localhost:3000/test.git")
-          .add(`refs/heads/main:${destRef}`)
+          // forced: the stub's remote value is unknown here, which the client itself would
+          // refuse as "fetch first"; forced, the server's own verdict is what is classified
+          .add(`+refs/heads/main:${destRef}`)
           .call();
       } finally {
         globalThis.fetch = originalFetch;
@@ -879,5 +882,112 @@ describe.each(backends)("PushCommand ($name backend)", ({ factory }) => {
       expect(command.getPushOptions()).toEqual(["option1", "option2"]);
       expect(command.getReceivePack()).toBe("/custom/receive-pack");
     });
+  });
+});
+
+describe.each(backends)("PushCommand as git push ($name backend)", ({ factory }) => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  /** A client with `origin` configured and fetched: refs/remotes/origin/main is the server's main. */
+  async function fetchedClient() {
+    const server = await createInitializedTestServer();
+    const url = createTestUrl(server.baseUrl);
+    const ctx = await factory();
+    cleanup = ctx.cleanup;
+    const workingCopy = ctx.workingCopy;
+    const git = Git.fromWorkingCopy(workingCopy);
+    const originalFetch = globalThis.fetch;
+    const withFetch = async <T>(run: () => Promise<T>): Promise<T> => {
+      globalThis.fetch = server.mockFetch;
+      try {
+        return await run();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    };
+    await git.remoteAdd().setName("origin").setUri(url).call();
+    await withFetch(() => git.fetch().setRemote("origin").call());
+    await workingCopy.history.refs.setSymbolic("HEAD", "refs/heads/main");
+    await workingCopy.history.refs.set("refs/heads/main", server.initialCommitId);
+    return { server, git, workingCopy, withFetch };
+  }
+
+  it("refuses a remote commit it does not have as 'fetch first', sending nothing", async () => {
+    const server = await createInitializedTestServer();
+    const ctx = await factory();
+    cleanup = ctx.cleanup;
+    const git = Git.fromWorkingCopy(ctx.workingCopy);
+    await ctx.workingCopy.history.refs.setSymbolic("HEAD", "refs/heads/main");
+    await addFileAndCommitWc(ctx.workingCopy, "a.txt", "a", "unrelated");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.mockFetch;
+    try {
+      const result = await git.push().setRemote(createTestUrl(server.baseUrl)).call();
+      expect(result.remoteUpdates[0]).toMatchObject({
+        remoteName: "refs/heads/main",
+        status: PushStatus.REJECTED_NONFASTFORWARD,
+        summary: "[rejected] (fetch first)",
+      });
+      expect(result.bytesSent).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("pushes the current branch by default, short names, and moves the remote-tracking ref", async () => {
+    const { server, git, workingCopy, withFetch } = await fetchedClient();
+    const tip = await addFileAndCommitWc(workingCopy, "b.txt", "b", "on top");
+    const result = await withFetch(() => git.push().call());
+    expect(result.remoteUpdates.map((u) => [u.remoteName, u.status, u.summary])).toEqual([
+      [
+        "refs/heads/main",
+        PushStatus.OK,
+        `${server.initialCommitId.slice(0, 7)}..${tip.slice(0, 7)}`,
+      ],
+    ]);
+    expect((await server.serverStores.refs.resolve("refs/heads/main"))?.objectId).toBe(tip);
+    expect((await workingCopy.history.refs.resolve("refs/remotes/origin/main"))?.objectId).toBe(
+      tip,
+    );
+
+    const again = await withFetch(() => git.push().add("main").call());
+    expect(again.remoteUpdates[0]?.status).toBe(PushStatus.UP_TO_DATE);
+  });
+
+  it("--force-with-lease: a stale lease is REJECTED_REMOTE_CHANGED; the tracking value holds", async () => {
+    const { server, git, workingCopy, withFetch } = await fetchedClient();
+    // a rewrite of main: not a descendant of the server's commit
+    await workingCopy.history.refs.remove("refs/heads/main");
+    const rewritten = await addFileAndCommitWc(workingCopy, "r.txt", "r", "rewritten");
+    await workingCopy.history.refs.set("refs/heads/main", rewritten);
+
+    const stale = await withFetch(() =>
+      git.push().add("main").setForceWithLease("main", "1".repeat(40)).call(),
+    );
+    expect(stale.remoteUpdates[0]?.status).toBe(PushStatus.REJECTED_REMOTE_CHANGED);
+    expect(stale.remoteUpdates[0]?.expectedOldObjectId).toBe("1".repeat(40));
+
+    const held = await withFetch(() => git.push().add("main").setForceWithLease().call());
+    // the lease held (expected: the remote-tracking value), so the client sent the rewrite;
+    // this test server refuses non-fast-forwards itself, which is the server's verdict
+    expect(held.remoteUpdates[0]?.expectedOldObjectId).toBe(server.initialCommitId);
+    expect(held.remoteUpdates[0]?.forceUpdate).toBe(true);
+    expect(held.remoteUpdates[0]?.status).toBe(PushStatus.REJECTED_NONFASTFORWARD);
+    expect(held.remoteUpdates[0]?.summary).toBe("[remote rejected] (non-fast-forward)");
+    expect((await server.serverStores.refs.resolve("refs/heads/main"))?.objectId).toBe(
+      server.initialCommitId,
+    );
+    expect(rewritten).not.toBe(server.initialCommitId);
+  });
+
+  it("a source that matches nothing fails before anything is sent, as git", async () => {
+    const { git, withFetch } = await fetchedClient();
+    await expect(withFetch(() => git.push().add("no-such-branch").call())).rejects.toThrow(
+      /src refspec no-such-branch does not match any/,
+    );
   });
 });

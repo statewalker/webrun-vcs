@@ -20,6 +20,21 @@ const advertisement = `${pkt("# service=git-receive-pack\n")}0000${pkt(
   `${"0".repeat(40)} capabilities^{}\0report-status\n`,
 )}0000`;
 
+/** A local repository whose main is OID, exporting the pack `exportPack` makes. */
+function local(
+  exportPack: (
+    wants: Set<string>,
+    exclude: Set<string>,
+    options?: object,
+  ) => AsyncIterable<Uint8Array>,
+) {
+  const repository = createMockRepository();
+  repository.exportPack = exportPack as typeof repository.exportPack;
+  const refStore = createMockRefStore();
+  refStore._setRef("refs/heads/main", OID);
+  return { repository, refStore };
+}
+
 /** A fake pack of `n` chunks; records how many were produced. */
 function lazyPack(n: number) {
   const state = { produced: 0 };
@@ -50,8 +65,7 @@ describe("push: the request body streams", () => {
     const result = await push({
       url: "http://example.test/repo.git",
       refspecs: ["refs/heads/main:refs/heads/main"],
-      getLocalRef: async () => OID,
-      exportPack: () => pack(),
+      ...local(() => pack()),
       fetchImpl: async (request: Request) => {
         if (request.url.includes("/info/refs")) return new Response(advertisement);
         producedWhenPosted = state.produced;
@@ -63,7 +77,7 @@ describe("push: the request body streams", () => {
     expect(producedWhenPosted).toBe(0); // nothing written before the request is read
     expect(state.produced).toBe(50);
     expect(result.ok).toBe(true);
-    expect(result.objectCount).toBe(7);
+    expect(result.packObjects).toBe(7);
     expect(result.bytesSent).toBe(received);
   });
 
@@ -73,17 +87,6 @@ describe("push: the request body streams", () => {
     expect(state.produced).toBe(3);
     expect(init.duplex).toBeUndefined();
     expect((init.body as Uint8Array).length).toBe(12 + 2 * 1024);
-  });
-
-  it("refuses to send objects without exportPack", async () => {
-    await expect(
-      push({
-        url: "http://example.test/repo.git",
-        refspecs: ["refs/heads/main:refs/heads/main"],
-        getLocalRef: async () => OID,
-        fetchImpl: async () => new Response(advertisement),
-      }),
-    ).rejects.toThrow(/exportPack/);
   });
 });
 
@@ -358,12 +361,11 @@ describe("request bodies: when to stream", () => {
     const result = await push({
       url: "http://example.test/repo.git",
       refspecs: ["refs/heads/main:refs/heads/main"],
-      getLocalRef: async () => OID,
       streamRequestBody: true,
-      exportPack: () => {
+      ...local(() => {
         exports++;
         return lazyPack(3).pack();
-      },
+      }),
       fetchImpl: async (request: Request) => {
         if (request.url.includes("/info/refs")) return new Response(advertisement);
         posts++;
@@ -377,7 +379,7 @@ describe("request bodies: when to stream", () => {
     });
     expect(result.ok).toBe(true);
     expect(exports).toBe(1); // the refused attempt never read its body, so never exported
-    expect(result.objectCount).toBe(7);
+    expect(result.packObjects).toBe(7);
     expect(result.bytesSent).toBeLessThan(2 * (12 + 2 * 1024));
   });
 });
@@ -500,7 +502,7 @@ describe("upload-pack: keep-alive while the pack is prepared", () => {
 
 describe("push: OFS deltas only when the server advertised ofs-delta", () => {
   async function pushWith(caps: string) {
-    let seen: { ofsDelta: boolean } | undefined;
+    let seen: { ofsDelta?: boolean; thin?: boolean } | undefined;
     let commands = "";
     const advert = `${pkt("# service=git-receive-pack\n")}0000${pkt(
       `${"0".repeat(40)} capabilities^{}\0${caps}\n`,
@@ -508,11 +510,10 @@ describe("push: OFS deltas only when the server advertised ofs-delta", () => {
     await push({
       url: "http://example.test/repo.git",
       refspecs: ["refs/heads/main:refs/heads/main"],
-      getLocalRef: async () => OID,
-      exportPack: (_w, _e, options) => {
+      ...local((_w, _e, options) => {
         seen = options;
         return lazyPack(1).pack();
-      },
+      }),
       fetchImpl: async (request: Request) => {
         if (request.url.includes("/info/refs")) return new Response(advert);
         commands = dec.decode(await request.arrayBuffer());
@@ -524,63 +525,11 @@ describe("push: OFS deltas only when the server advertised ofs-delta", () => {
 
   it("push()", async () => {
     const without = await pushWith("report-status");
-    expect(without.seen).toEqual({ ofsDelta: false });
-    expect(without.commands).not.toContain("ofs-delta");
+    expect(without.seen).toMatchObject({ ofsDelta: false });
     const withOfs = await pushWith("report-status ofs-delta");
-    expect(withOfs.seen).toEqual({ ofsDelta: true });
-    expect(withOfs.commands).toContain("ofs-delta");
-  });
-
-  it("httpPush()", async () => {
-    const { httpPush } = await import("../../src/adapters/http/http-client.js");
-    for (const [caps, expected] of [
-      ["report-status", false],
-      ["report-status ofs-delta", true],
-    ] as const) {
-      let seen: { ofsDelta?: boolean } | undefined;
-      const repository = createMockRepository();
-      repository.exportPack = async function* (_w, _e, options) {
-        seen = options;
-        yield* lazyPack(1).pack();
-      };
-      const refStore = createMockRefStore();
-      refStore._setRef("refs/heads/main", OID);
-      const advert = `${pkt("# service=git-receive-pack\n")}0000${pkt(
-        `${"0".repeat(40)} capabilities^{}\0${caps}\n`,
-      )}0000`;
-      await httpPush("http://example.test/repo.git", repository, refStore, {
-        refspecs: ["refs/heads/main:refs/heads/main"],
-        fetchFn: (async (url: string, init: RequestInit) => {
-          if (url.includes("/info/refs")) return new Response(advert);
-          await new Response(init.body).arrayBuffer();
-          return new Response(`${pkt("unpack ok\n")}${pkt("ok refs/heads/main\n")}0000`);
-        }) as typeof fetch,
-      });
-      expect(seen?.ofsDelta).toBe(expected);
-    }
-  });
-
-  it("the client push FSM", async () => {
-    const { clientPushHandlers } = await import("../../src/fsm/push/client-push-fsm.js");
-    const { createTestContext } = await import("../helpers/test-protocol.js");
-    for (const [caps, expected] of [
-      [["report-status"], false],
-      [["report-status", "ofs-delta"], true],
-    ] as const) {
-      let seen: { ofsDelta?: boolean } | undefined;
-      const repository = createMockRepository();
-      repository.exportPack = async function* (_w, _e, options) {
-        seen = options;
-        yield enc.encode("PACK");
-      };
-      const ctx = createTestContext({ repository });
-      for (const c of caps) ctx.state.capabilities.add(c);
-      (ctx.state as ProtocolState & { pushCommands?: unknown[] }).pushCommands = [
-        { type: "CREATE", oldOid: "0".repeat(40), newOid: OID, refName: "refs/heads/main" },
-      ];
-      await clientPushHandlers.get("SEND_PACK")?.(ctx);
-      expect(seen?.ofsDelta).toBe(expected);
-    }
+    expect(withOfs.seen).toMatchObject({ ofsDelta: true });
+    // as git's send-pack: ofs-delta is used, never asked for on the first command
+    expect(withOfs.commands).not.toContain("ofs-delta");
   });
 });
 

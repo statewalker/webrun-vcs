@@ -10,11 +10,7 @@ export type {
   SyncDirection,
 } from "./p2p-sync.js";
 export { p2pSync } from "./p2p-sync.js";
-export type {
-  HttpPushResult,
-  PushOptions,
-  RefUpdateResult,
-} from "./push.js";
+export type { PushOptions } from "./push.js";
 export { push } from "./push.js";
 export type {
   PushOverDuplexOptions,

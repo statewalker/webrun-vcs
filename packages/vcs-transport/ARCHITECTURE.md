@@ -65,7 +65,6 @@ packages/vcs-transport/src/
 │   │   ├── upload-pack-graph.ts # Commit-graph walks of upload-pack (shallow, ok_to_give_up)
 │   │   └── types.ts             # ClientFetchEvent, ServerFetchEvent
 │   ├── push/               #   Push protocol FSMs
-│   │   ├── client-push-fsm.ts   # Client-side push (25 handlers, 32 transitions)
 │   │   ├── server-push-fsm.ts   # Server-side push (41 handlers, 41 transitions)
 │   │   └── types.ts             # PushCommand, PushCommandType, PushCommandResult
 │   ├── protocol-v2/        #   Protocol V2 FSMs
@@ -85,7 +84,7 @@ packages/vcs-transport/src/
 │
 ├── operations/             # High-level operations
 │   ├── fetch.ts            #   HTTP fetch (the fetch client over smart HTTP)
-│   ├── push.ts             #   HTTP push
+│   ├── push.ts             #   HTTP push (the push client over smart HTTP)
 │   ├── ls-remote.ts        #   HTTP ls-remote
 │   ├── fetch-over-duplex.ts    # Duplex fetch (the fetch client over a duplex)
 │   ├── push-over-duplex.ts     # Duplex push
@@ -146,18 +145,17 @@ UPDATE_REFS → [update local refs]
 DONE
 ```
 
-### Push (Client-Side FSM)
+### Push (the push client)
+
+The client side of a push is not an FSM: it is the push client in `push-client/` (git's
+send-pack), used by `push` (smart HTTP) and `pushOverDuplex`:
 
 ```
-START → [read server advertisement]
-  ↓ REFS_RECEIVED
-COMPUTE_UPDATES → [diff local vs remote refs]
-  ↓ COMMANDS_SENT
-SEND_PACK → [generate and send pack]
-  ↓ PACK_SENT
-READ_STATUS → [parse report-status response]
-  ↓ STATUS_RECEIVED
-DONE
+open a ReceivePackConnection → [ref advertisement, capabilities, .have lines]
+matchPushRefs               → [refspecs onto remote refs, as git's match_push_refs]
+setPushStatus               → [up to date, fast-forward, fetch first, tags, leases]
+send                        → [commands, push options, thin pack: one request]
+read report                 → [unpack, ok/ng per ref; side-band, keep-alives]
 ```
 
 ### Server Fetch (Upload-Pack)

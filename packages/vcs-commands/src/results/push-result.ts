@@ -10,6 +10,8 @@ export enum PushStatus {
   OK = "ok",
   /** Update was rejected (not fast-forward) */
   REJECTED_NONFASTFORWARD = "rejected-nonfastforward",
+  /** Update was rejected: the remote ref no longer has the leased value (`--force-with-lease`) */
+  REJECTED_REMOTE_CHANGED = "rejected-remote-changed",
   /** Update was rejected (other reason) */
   REJECTED_OTHER = "rejected-other",
   /** Update failed (remote error) */
@@ -38,9 +40,14 @@ export interface RemoteRefUpdate {
   newObjectId: ObjectId;
   /** Status of the update */
   status: PushStatus;
-  /** Message from server (if any) */
+  /** Why the update was refused: the server's reason, or git's status column */
   message?: string;
-  /** Whether this was a forced update */
+  /**
+   * git's status column (`[new branch]`, `abc1234..def5678`, `[rejected] (fetch first)`,
+   * `[remote rejected] (hook declined)`, …)
+   */
+  summary?: string;
+  /** Whether the update was allowed to be a non-fast-forward (`+`, setForce, a lease that held) */
   forceUpdate: boolean;
   /** Whether this was a delete operation */
   delete: boolean;

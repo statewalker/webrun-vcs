@@ -16,7 +16,7 @@ The package has three layers:
 
 1. **HTTP operations**: `fetch`, `push`, `lsRemote` (smart-HTTP client).
 2. **Duplex operations**: `fetchOverDuplex`, `pushOverDuplex`, `serveOverDuplex`, `p2pSync` (any `Duplex`).
-3. **Fetch client and FSM primitives**: the fetch client (`fetchFromConnection`, `fetchPack`, `Negotiator`, the HTTP and duplex connections) and the `Fsm` engine with the server and push transition and handler tables.
+3. **Fetch and push clients, FSM primitives**: the fetch client (`fetchFromConnection`, `fetchPack`, `Negotiator`, the HTTP and duplex connections), the push client (`pushToConnection`, `matchPushRefs`, `setPushStatus`, the HTTP and duplex receive-pack connections) and the `Fsm` engine with the server transition and handler tables.
 
 ### Install
 
@@ -45,10 +45,10 @@ All entry points are ESM with type declarations.
 | Function | Transport | Result |
 |----------|-----------|--------|
 | `fetch(options)` | HTTP | `FetchClientResult`: `protocolVersion`, `remoteRefs`, `defaultBranch`, `isEmpty`, `refUpdates`, `followedTags`, `shallow`, `imports`, `packObjects`, `packBytes`, `stats` (throws on failure) |
-| `push(options)` | HTTP | `HttpPushResult`: `ok`, `updates`, `unpackStatus`, `bytesSent`, `objectCount` |
+| `push(options)` | HTTP | `PushClientResult`: `ok`, `updates` (each with git's status and summary), `unpack`, `capabilities`, `packObjects`, `packBytes`, `bytesSent` (throws on failure) |
 | `lsRemote(url, options?)` | HTTP | `Map<refName, oidHex>` |
 | `fetchOverDuplex(options)` | Duplex | `FetchResult`: `success`, `error`, `updatedRefs`, `objectsImported`, `report` (the `FetchClientResult`); v2 or v0, as the server speaks |
-| `pushOverDuplex(options)` | Duplex | `PushResult` |
+| `pushOverDuplex(options)` | Duplex | `PushResult`: `success`, `error`, `refStatus`, `report` (the `PushClientResult`) |
 | `serveOverDuplex(options)` | Duplex | `ServeResult` |
 | `p2pSync(options)` | Duplex | `P2PSyncResult` |
 
@@ -70,7 +70,7 @@ All entry points are ESM with type declarations.
 | `createMessagePortDuplex`, `messagePortFetch`, `messagePortServe` | MessagePort transport |
 | `webrunClientDuplex`, `serveRepoOverWebrun` | Git protocol over a webrun-streams `Duplex` |
 | `serveGitOverWebrunHttp`, `webrunHttpFetch` | Smart HTTP over a webrun-streams `Duplex` |
-| `httpPush`, `createSimpleDuplex` | Low-level HTTP client helpers |
+| `createSimpleDuplex` | Low-level HTTP helper |
 | `createFetchHandler`, `createHttpHandler`, `createGitHttpServer` | Smart-HTTP server |
 
 #### Factories
@@ -86,7 +86,6 @@ All entry points are ESM with type declarations.
 |--------|-------------|
 | `Fsm`, `FsmError` | Engine: `new Fsm(transitions, handlers)`, `fsm.run(context, ...stopStates)` |
 | `serverFetchTransitions` / `serverFetchHandlers` | Server upload-pack (v1) |
-| `clientPushTransitions` / `clientPushHandlers` | Client push |
 | `serverPushTransitions` / `serverPushHandlers` | Server receive-pack |
 | `serverV2Transitions` / `serverV2Handlers` | Protocol v2 server |
 | `errorRecoveryTransitions` / `errorRecoveryHandlers`, `withErrorRecovery`, `withErrorRecoveryHandlers`, `classifyError` | Error recovery |
@@ -150,20 +149,28 @@ import { push } from "@statewalker/vcs-transport";
 
 const result = await push({
   url: "https://example.com/user/repo.git",
-  refspecs: ["refs/heads/main:refs/heads/main"],
   auth: { username: "user", password: "token" },
-  getLocalRef: (ref) => refStore.get(ref),
-  exportPack: (wants, exclude) => repository.exportPack(wants, exclude),
+  repository, // the local objects (a RepositoryFacade)
+  refStore, // the local refs
+  refspecs: ["main", "+topic:refs/heads/review", ":refs/heads/old", "refs/tags/*:refs/tags/*"],
 });
 
-for (const [ref, status] of result.updates) {
-  console.log(ref, status.ok ? "ok" : status.message);
-}
+for (const u of result.updates) console.log(u.summary, u.remoteRef);
+// [new branch] refs/heads/main
+// [rejected] (fetch first) refs/heads/review
+// [deleted] refs/heads/old
 ```
 
-`exportPack` produces the pack: the objects reachable from the pushed tips and not from the remote's refs, as `history.serialization.exportPack` (vcs-core's `listObjects` and `writePack`) streams it. It is required whenever the push sends objects; a delete-only push sends git's empty pack. `push` also accepts `force` and `atomic`, and reports `bytesSent` and `objectCount` (read from the pack header as it goes by).
+`push` is the push client, git's send-pack (transport.c, remote.c, send-pack.c), over smart HTTP; `pushOverDuplex` runs the same client over a duplex. It reads the receive-pack advertisement, maps the refspecs onto the remote refs as `git push` does (`matchPushRefs`), decides each ref (`setPushStatus`), sends the commands and a thin pack, and reads the report:
 
-The commands and the pack go out in the POST body. Outside browsers (Node, Deno, Bun) the body is a `ReadableStream` with `duplex: "half"`, pulled as the connection takes it, so the pack writer runs no further ahead than the network and the pack is never collected. In browsers the body is collected and sent whole by default, which holds the pack in memory: Firefox and Safari do not stream request bodies, and Chromium passes the usual feature test (`supportsRequestStreams()`: a `Request` built with a stream body reads its `duplex` option and adds no `Content-Type`) yet rejects a streamed body with a `TypeError` over HTTP/1.1, which a page cannot know in advance. `shouldStreamRequestBody(streamRequestBody)` makes the choice: the option when it is set, otherwise stream only where `isBrowserContext()` is false (no `document` and no `WorkerGlobalScope` instance as the global) and streams are supported. `streamRequestBody: true` opts a browser in (for an HTTP/2 server); `false` always collects. When a streamed request is rejected with a `TypeError` before any response, `fetchWithRequestBody` sends it once more with a collected body, calling `exportPack` again (so it may run twice); an error from the pack itself is thrown as it is. `httpPush` sends its body the same way and takes the same `streamRequestBody` option. Both pass `{ ofsDelta }` to `exportPack`: true only when the receive-pack advertisement lists `ofs-delta` (the push then requests it, as git's send-pack does), so a server without it gets REF deltas; the push state machine does the same.
+- **Refspecs.** `src:dst`, `src` (to its own name), `+` to force, `:dst` to delete, `^src` to exclude; `src` may be a short name, `HEAD`, or an object id (with a full `dst`). A short `dst` names a remote ref the remote has; a new ref needs its full name unless the source is a branch or a tag (`main:topic` creates `refs/heads/topic`; otherwise git's "The destination you provided is not a full refname" error). Patterns push every matching local ref: `refs/heads/*:refs/heads/*` is `--all`, `refs/tags/*:refs/tags/*` `--tags`, `+refs/*:refs/*` with `prune: true` `--mirror`; `:` pushes the branches the remote has ("matching"). git's `push.default` (what a bare `git push` pushes) is the caller's: `PushCommand` pushes the configured `remote.<name>.push` refspecs, else the current branch to its own name. A refspec error (a source that matches nothing, an ambiguous name, two sources for one ref) throws a `PushRefspecError` before anything is sent.
+- **Statuses** are named after git's: `ok`, `up-to-date`, `rejected-fetch-first` (the remote has a commit that is not here), `rejected-nonfastforward` (it is here, and no ancestor of the new value), `rejected-needs-force` (either end is no commit), `rejected-already-exists` (a tag), `rejected-stale` (a `forceWithLease` whose expected value is not the remote's), `rejected-nodelete` (no `delete-refs`), `atomic-push-failed`, `remote-rejected` (the server's `ng`, with its `message`), `remote-failure` (not reported). Each update carries git's status column as `summary` (`[new branch]`, `abc1234..def5678`, `+ abc1234...def5678 (forced update)`, `[rejected] (fetch first)`, `[remote rejected] (hook declined)`). `force` (or `+`) turns a local refusal into a forced update; a lease that holds forces too, a stale one refuses unless `force` is set. Refused refs are not sent; with `atomic` one refusal refuses all and nothing is sent.
+- **The request.** The commands carry the remote's advertised values as old ids. The client asks only for advertised capabilities: `report-status`, `side-band-64k`, `quiet` (with `quiet: true`), `atomic`, `push-options`, `object-format`, `agent`; asking for `atomic` or `pushOptions` the server does not advertise throws. The pack holds what the new values reach and no advertised tip that is here does (`.have` lines included), thin unless the server says `no-thin` or `thin: false`, with OFS deltas when the server says `ofs-delta`. A push of deletes only sends no pack; a push with nothing to update sends no request (over a duplex, the flush that ends receive-pack). `dryRun` decides and reports, and sends nothing.
+- **The report** is read as it arrives: side-band channel 2 goes to `onProgress`, keep-alives (empty channel-1 packets) are skipped, channel 3 throws. `unpack` is the server's unpack status.
+
+The pieces are exported for other transports: `openHttpReceivePackConnection`, `openDuplexReceivePackConnection` (a `ReceivePackConnection`), `pushToConnection`, `matchPushRefs`, `setPushStatus`, `pushSummary`. A 401 or 403 is an `AuthenticationError`.
+
+The commands and the pack go out in the POST body. Outside browsers (Node, Deno, Bun) the body is a `ReadableStream` with `duplex: "half"`, pulled as the connection takes it, so the pack writer runs no further ahead than the network and the pack is never collected. In browsers the body is collected and sent whole by default, which holds the pack in memory: Firefox and Safari do not stream request bodies, and Chromium passes the usual feature test (`supportsRequestStreams()`: a `Request` built with a stream body reads its `duplex` option and adds no `Content-Type`) yet rejects a streamed body with a `TypeError` over HTTP/1.1, which a page cannot know in advance. `shouldStreamRequestBody(streamRequestBody)` makes the choice: the option when it is set, otherwise stream only where `isBrowserContext()` is false (no `document` and no `WorkerGlobalScope` instance as the global) and streams are supported. `streamRequestBody: true` opts a browser in (for an HTTP/2 server); `false` always collects. When a streamed request is rejected with a `TypeError` before any response, `fetchWithRequestBody` sends it once more with a collected body, calling `exportPack` again (so it may run twice); an error from the pack itself is thrown as it is. `timeout` is an idle timeout: it bounds each wait for the server, re-armed each time the request reads a chunk of the body, so a large pack is not bounded as a whole.
 
 ### Smart-HTTP server
 
@@ -284,7 +291,7 @@ if (result.success) console.log(`Synced ${result.refsSynced} refs`);
 
 ### Why every operation is a state machine
 
-Each protocol role (client fetch, server upload-pack, client push, server receive-pack, v2 client and server) is a table of `[source, event, target]` transitions plus a map of state handlers. Handlers do one protocol step through `TransportApi` and return the next event. This keeps the protocol flow readable as data and lets tests drive single states. It also enables stop states: `fsm.run(context, "SOME_STATE")` pauses the machine, which is how the stateless smart-HTTP request/response pair maps onto one continuous protocol conversation. Error recovery is a separate transition table merged in with `withErrorRecovery`.
+Each server role (upload-pack, receive-pack, protocol v2) is a table of `[source, event, target]` transitions plus a map of state handlers. Handlers do one protocol step through `TransportApi` and return the next event. This keeps the protocol flow readable as data and lets tests drive single states. It also enables stop states: `fsm.run(context, "SOME_STATE")` pauses the machine, which is how the stateless smart-HTTP request/response pair maps onto one continuous protocol conversation. Error recovery is a separate transition table merged in with `withErrorRecovery`. The clients are not state machines: the fetch client (`fetch-client/`, git's fetch-pack) and the push client (`push-client/`, git's send-pack) are plain async code over a connection.
 
 ```
 HTTP operations / Duplex operations
@@ -318,7 +325,7 @@ The transport never touches storage directly. It needs only a `RepositoryFacade`
 
 ### What failures look like
 
-- HTTP operations throw: `Failed to get refs: <status> <statusText>`, `Failed to upload-pack: ...`, `Failed to receive-pack: ...`, `Empty response from /info/refs`, `Request timeout` (when `timeout` elapses), `Server error: <message>` (an `ERR` packet or sideband error), and for `push`, `Local ref not found: <ref>`.
+- HTTP operations throw: `Failed to get refs: <status> <statusText>`, `Failed to upload-pack: ...`, `Failed to receive-pack: ...`, `Empty response from /info/refs`, `Request timeout` (when `timeout` elapses), `Server error: <message>` (an `ERR` packet or sideband error), and for `push`, a `PushRefspecError` with git's message (`src refspec x does not match any`, …), `the receiving end does not support --atomic push`, `the receiving end does not support push options`; 401/403 throw an `AuthenticationError`.
 - Duplex operations do not throw on protocol failure. They return `{ success: false, error }`, with `error` set by the failing handler or `FSM did not complete successfully` (`V2 FSM did not complete successfully` for v2). `p2pSync` prefixes `Fetch failed:` or `Push failed:`.
 - A broken custom transition table throws `FsmError`: `No handler for state: "<state>"` or `No transition for event "<event>" from state "<state>"`.
 

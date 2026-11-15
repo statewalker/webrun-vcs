@@ -6,6 +6,5 @@
  * - POST /git-upload-pack
  */
 
-export * from "./http-client.js";
 export * from "./http-duplex.js";
 export * from "./http-server.js";

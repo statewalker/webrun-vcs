@@ -126,12 +126,14 @@ describe("git smart-HTTP over a webrun-http-streams duplex", () => {
         url: "http://localhost/repo.git",
         fetchImpl: serveRepo(server),
         refspecs: ["refs/heads/main:refs/heads/main"],
-        getLocalRef: (ref) => client.refStore.get(ref),
-        exportPack: (wants, exclude) => client.facade.exportPack(wants, exclude),
+        repository: client.facade,
+        refStore: client.refStore,
       });
 
-      expect(result.ok, `push failed: ${result.unpackStatus}`).toBe(true);
-      expect(result.updates.get("refs/heads/main")?.ok).toBe(true);
+      expect(result.ok, `push failed: ${result.unpack?.message}`).toBe(true);
+      expect(result.updates.find((u) => u.remoteRef === "refs/heads/main")?.summary).toBe(
+        "[new branch]",
+      );
 
       // The served repo's ref advanced to the pushed tip; objects landed.
       expect(await server.refStore.get("refs/heads/main")).toBe(c2);

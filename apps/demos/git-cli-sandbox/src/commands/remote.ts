@@ -3,10 +3,12 @@
  */
 
 import { MergeStatus } from "@statewalker/vcs-commands";
-import { type ListedObject, listObjects, writePack } from "@statewalker/vcs-core";
-import { push as transportPush } from "@statewalker/vcs-transport";
 import {
-  type CliContext,
+  createRepositoryFacade,
+  createTransportRefStore,
+  push as transportPush,
+} from "@statewalker/vcs-transport";
+import {
   dim,
   error,
   fatal,
@@ -205,19 +207,6 @@ export async function runPull(args: string[]): Promise<void> {
 }
 
 /**
- * The pack a push sends: what `wants` reach and the remote's refs do not, streamed
- */
-async function* exportPack(
-  ctx: CliContext,
-  wants: Iterable<string>,
-  exclude: Iterable<string>,
-): AsyncGenerator<Uint8Array> {
-  const listed: ListedObject[] = [];
-  for await (const o of listObjects(ctx.objects, { wants, haves: exclude })) listed.push(o);
-  yield* writePack(ctx.objects, listed, { deltaSearch: true });
-}
-
-/**
  * Run push command
  */
 export async function runPush(args: string[]): Promise<void> {
@@ -279,12 +268,9 @@ export async function runPush(args: string[]): Promise<void> {
       url: remoteUrl,
       refspecs: [`${localRef}:${localRef}`],
       force,
-      getLocalRef: async (refName: string) => {
-        const ref = await ctx.history.refs.resolve(refName);
-        return ref?.objectId;
-      },
-      exportPack: (wants, exclude) => exportPack(ctx, wants, exclude),
-      onProgressMessage: (msg) => {
+      repository: createRepositoryFacade({ history: ctx.history }),
+      refStore: createTransportRefStore(ctx.history.refs),
+      onProgress: (msg) => {
         const trimmed = msg.trim();
         if (trimmed) {
           process.stdout.write(`\r${dim(trimmed)}`.padEnd(60));
@@ -294,18 +280,17 @@ export async function runPush(args: string[]): Promise<void> {
 
     process.stdout.write(`${"\r".padEnd(60)}\r`);
 
+    for (const u of result.updates) {
+      console.log(` ${u.summary.padEnd(18)} ${u.localRef ?? ""} -> ${u.remoteRef}`);
+    }
     if (result.ok) {
-      console.log(` * [new branch]      ${branchName} -> ${branchName}`);
       console.log(success(`Push complete`));
       console.log(dim(`  Bytes sent: ${result.bytesSent}`));
-      console.log(dim(`  Objects sent: ${result.objectCount}`));
+      console.log(dim(`  Objects sent: ${result.packObjects}`));
     } else {
-      console.log(error(`Push failed: ${result.unpackStatus}`));
-      for (const [ref, status] of result.updates) {
-        if (!status.ok) {
-          console.log(error(`  ${ref}: ${status.message}`));
-        }
-      }
+      console.log(
+        error(`Push failed${result.unpack?.message ? `: ${result.unpack.message}` : ""}`),
+      );
     }
   } finally {
     await ctx.history.close();

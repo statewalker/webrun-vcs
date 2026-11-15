@@ -107,7 +107,7 @@ export async function openHttpConnection(
     if (flush?.type !== "flush") throw new TransportError("No flush after the service line");
     first = await advert.read();
   }
-  const greeting = await readGreeting(advert, first);
+  const greeting = await readServerGreeting(advert, first);
   await advert.cancel();
 
   let current: PktStream | undefined;
@@ -164,7 +164,7 @@ export async function openDuplexConnection(
   options: DuplexConnectionOptions = {},
 ): Promise<UploadPackConnection> {
   const pkts = new PktStream(duplex);
-  const greeting = await readGreeting(pkts, await pkts.read());
+  const greeting = await readServerGreeting(pkts, await pkts.read());
   let closed = false;
   let requested = false;
   return {
@@ -195,14 +195,22 @@ export async function openDuplexConnection(
   };
 }
 
-interface Greeting {
+/** A server's first answer: its protocol, capabilities and (v0) refs. */
+export interface ServerGreeting {
   version: 0 | 2;
   capabilities: Map<string, string>;
+  /** v0: the advertised refs (HEAD with its symref; `.have` lines as refs named `.have`) */
   refs?: RemoteRef[];
 }
 
-/** The server's first answer: v2 capabilities, or a v0 advertisement (`first` is its first packet). */
-async function readGreeting(pkts: PktStream, first: Pkt | undefined): Promise<Greeting> {
+/**
+ * The server's first answer: v2 capabilities, or a v0 advertisement (`first` is its first
+ * packet). upload-pack and receive-pack advertise alike.
+ */
+export async function readServerGreeting(
+  pkts: PktStream,
+  first: Pkt | undefined,
+): Promise<ServerGreeting> {
   if (!first) throw new TransportError("The server closed the connection without an answer");
   if (first.type === "data" && first.text.startsWith("ERR ")) {
     throw new ServerError(first.text.slice(4));
@@ -269,7 +277,11 @@ async function readGreeting(pkts: PktStream, first: Pkt | undefined): Promise<Gr
   return { version: 0, capabilities, refs };
 }
 
-async function withTimeout<T>(
+/**
+ * Runs `next`, failing with "Request timeout" (and aborting `controller`) when it takes more
+ * than `timeout` milliseconds; no bound without `timeout`.
+ */
+export async function withTimeout<T>(
   next: () => Promise<T>,
   timeout: number | undefined,
   controller: AbortController,

@@ -1,7 +1,13 @@
-import { DefaultSerializationApi, type HistoryWithOperations } from "@statewalker/vcs-core";
 import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  expandFromSource,
+  type ForceWithLease,
   mapRejectReason,
+  matchSource,
   type PushCommandResult,
+  type PushRefUpdate,
+  parseRefSpec,
   push as transportPush,
 } from "@statewalker/vcs-transport";
 
@@ -14,16 +20,11 @@ import { TransportCommand } from "../transport-command.js";
 const ZERO_OBJECT_ID = "0".repeat(40);
 
 /**
- * How the transport's rejection reasons land on the statuses this package
- * reports.
- *
- * The two vocabularies are not the same: the transport tells seven kinds of
- * rejection apart, while PushStatus — following JGit's RemoteRefUpdate — keeps
- * only the non-fast-forward case separate, because that is the one callers act
- * on (callOrThrow raises NonFastForwardError for it). Everything else is a
- * rejection whose detail lives in the server's message, so it collapses to
- * REJECTED_OTHER. Spelled out per reason rather than defaulted, so that a new
- * transport reason is a compile error here instead of a silent REJECTED_OTHER.
+ * How a server's rejection reason (`ng <ref> <reason>`) lands on the statuses this package
+ * reports. PushStatus, following JGit's RemoteRefUpdate, keeps only the non-fast-forward case
+ * separate (callOrThrow raises NonFastForwardError for it); every other refusal is
+ * REJECTED_OTHER with the server's message. Spelled out per reason so that a new transport
+ * reason is a compile error here.
  */
 const REJECT_REASON_STATUS: Record<PushCommandResult, PushStatus> = {
   NOT_ATTEMPTED: PushStatus.NOT_ATTEMPTED,
@@ -39,28 +40,28 @@ const REJECT_REASON_STATUS: Record<PushCommandResult, PushStatus> = {
 };
 
 /**
- * Classify a server's rejection message.
- *
- * Reuses the transport's `mapRejectReason` so both sides read the same wire
- * text the same way; a message the transport cannot place — or none at all —
- * ends up as REJECTED_OTHER.
+ * The status of a transport update. git's local refusals map as JGit's: "fetch first" (the
+ * remote has a commit we lack) and "non-fast-forward" are both REJECTED_NONFASTFORWARD, a
+ * stale lease is REJECTED_REMOTE_CHANGED, a remote ref the server did not report is FAILED.
  */
-function classifyRejection(message: string | undefined): PushStatus {
-  return REJECT_REASON_STATUS[mapRejectReason(message ?? "")];
-}
-
-/**
- * Split a refspec into its source and destination ref names.
- *
- * Mirrors the parsing the transport performs so that the destination keys we
- * derive here line up exactly with the ones it reports back:
- * an optional leading `+` (force) is stripped, and a refspec with no `:` pushes
- * a ref to its own name.
- */
-function parseRefSpec(refSpec: string): { source: string; dest: string } {
-  const normalized = refSpec.startsWith("+") ? refSpec.slice(1) : refSpec;
-  const [source = "", dest] = normalized.split(":");
-  return { source, dest: dest || source };
+function toPushStatus(update: PushRefUpdate): PushStatus {
+  switch (update.status) {
+    case "ok":
+      return PushStatus.OK;
+    case "up-to-date":
+      return PushStatus.UP_TO_DATE;
+    case "rejected-nonfastforward":
+    case "rejected-fetch-first":
+      return PushStatus.REJECTED_NONFASTFORWARD;
+    case "rejected-stale":
+      return PushStatus.REJECTED_REMOTE_CHANGED;
+    case "remote-rejected":
+      return REJECT_REASON_STATUS[mapRejectReason(update.message ?? "")];
+    case "remote-failure":
+      return PushStatus.FAILED;
+    default:
+      return PushStatus.REJECTED_OTHER;
+  }
 }
 
 /**
@@ -114,6 +115,9 @@ export class PushCommand extends TransportCommand<PushResult> {
   private useBitmaps = true;
   private pushOptions: string[] = [];
   private receivePack?: string;
+  private prune = false;
+  /** Leases; empty: every pushed ref at its remote-tracking value; undefined: none */
+  private leases?: ForceWithLease[];
 
   /**
    * Set the remote to push to.
@@ -176,6 +180,33 @@ export class PushCommand extends TransportCommand<PushResult> {
    */
   isForce(): boolean {
     return this.force;
+  }
+
+  /**
+   * `--force-with-lease`: allow a non-fast-forward of `ref` only while the remote ref still
+   * has `expect` (`""` or the zero id: it must not exist). Without `expect` the remote ref's
+   * remote-tracking value is expected (`refs/remotes/<remote>/...`). Without `ref` every pushed
+   * ref is leased at its remote-tracking value. A lease that does not hold is
+   * REJECTED_REMOTE_CHANGED; {@link setForce} overrides it, as in git.
+   *
+   * @param ref The remote ref (full or short name)
+   * @param expect The value it must have
+   */
+  setForceWithLease(ref?: string, expect?: string): this {
+    this.checkCallable();
+    this.leases ??= [];
+    if (ref !== undefined) this.leases.push({ ref, ...(expect !== undefined ? { expect } : {}) });
+    return this;
+  }
+
+  /**
+   * `--prune`: delete remote refs a pattern refspec's destination covers whose local source is
+   * gone (with `+refs/*:refs/*`, `--mirror`).
+   */
+  setPrune(prune: boolean): this {
+    this.checkCallable();
+    this.prune = prune;
+    return this;
   }
 
   /**
@@ -318,118 +349,93 @@ export class PushCommand extends TransportCommand<PushResult> {
   }
 
   /**
-   * Execute the push operation.
+   * Execute the push.
    *
-   * @returns Push result with updated refs
+   * Runs the transport's push client (git's send-pack): the refspecs are mapped onto the
+   * remote refs as `git push` does (short names, `HEAD`, patterns, `:dst` deletes); each ref
+   * is checked first (fast-forward, "fetch first", tags, `--force-with-lease`) and refused
+   * refs are not sent; the pack is thin against the remote refs here. Once the server accepts
+   * a ref, the remote-tracking ref of a named remote follows it (`refs/remotes/<remote>/…`).
+   *
+   * Without refspecs (nor `setPushAll`/`setPushTags`), the configured `remote.<name>.push`
+   * refspecs are used, else the current branch is pushed to the same name (git's
+   * `push.default=current`; `simple`/`matching`/`upstream` are not modelled).
+   *
+   * @returns Push result with each remote ref's status
    * @throws InvalidRemoteError if remote cannot be resolved
-   * @throws PushRejectedException if push is rejected
    */
   async call(): Promise<PushResult> {
     this.checkCallable();
     this.setCallable(false);
 
-    // Resolve remote URL
     const remoteUrl = await this.resolveRemoteUrl(this.remote);
     if (!remoteUrl) {
       throw new InvalidRemoteError(this.remote);
     }
 
-    // Build refspecs
     const refspecs = await this.buildRefSpecs();
-
-    // Map each destination ref back to the local ref it came from. The transport
-    // keys its update results by the destination ref, and carries no object ids,
-    // so this is what lets us report srcRef/newObjectId per update below.
-    const sourceByDest = new Map<string, string>();
-    for (const spec of refspecs) {
-      const { source, dest } = parseRefSpec(spec);
-      sourceByDest.set(dest, source);
-    }
-
     if (refspecs.length === 0) {
-      // Nothing to push
-      return {
-        uri: remoteUrl,
-        remoteUpdates: [],
-        bytesSent: 0,
-        objectCount: 0,
-        messages: [],
-      };
+      return { uri: remoteUrl, remoteUpdates: [], bytesSent: 0, objectCount: 0, messages: [] };
     }
 
-    // The pack of what the remote lacks, streamed (listObjects + writePack): through the
-    // history's serialization where it has one (its packs reused), else through one over its
-    // stores (the object kernel, or the typed stores of a history that keeps parsed objects)
     const history = this._workingCopy.history;
-    const serialization =
-      (history as Partial<HistoryWithOperations>).serialization ??
-      new DefaultSerializationApi({ history });
-    // OFS deltas only when the remote advertised ofs-delta (the transport says which)
-    const exportPack = (wants: Set<string>, exclude: Set<string>, options: { ofsDelta: boolean }) =>
-      serialization.exportPack(wants, exclude, { ofsDelta: options.ofsDelta });
-
-    // Object ids resolved for each source ref, captured as the transport asks
-    // for them, so we report the value that was really sent on the wire.
-    const resolvedLocalOids = new Map<string, string>();
-
-    // Execute push using high-level push API
-    const transportResult = await transportPush({
+    const tracking = this.trackingRefMapper();
+    const messages: string[] = [];
+    const leases = this.leases;
+    const result = await transportPush({
       url: remoteUrl,
-      refspecs,
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
+      repository: createRepositoryFacade({ history }),
+      refStore: createTransportRefStore(history.refs),
+      refspecs,
       force: this.force,
       atomic: this.atomic,
-      onProgressMessage: this.progressMessageCallback,
-      exportPack,
-      getLocalRef: async (refName: string) => {
-        // A refspec with an empty source (":refs/heads/x") is a delete request:
-        // Git expresses it as an update to the all-zero object id.
-        if (refName === "") {
-          resolvedLocalOids.set(refName, ZERO_OBJECT_ID);
-          return ZERO_OBJECT_ID;
-        }
-        const ref = await this.refsStore.resolve(refName);
-        // Memoise exactly the object id the transport used for this source ref,
-        // so the reported newObjectId is the value that was actually pushed.
-        if (ref?.objectId !== undefined) {
-          resolvedLocalOids.set(refName, ref.objectId);
-        }
-        return ref?.objectId;
+      thin: this.thin,
+      dryRun: this.dryRun,
+      prune: this.prune,
+      pushOptions: this.pushOptions.length > 0 ? this.pushOptions : undefined,
+      forceWithLease: leases === undefined ? undefined : leases.length === 0 ? true : leases,
+      trackingValue: async (remoteRef) => {
+        const local = tracking(remoteRef);
+        return local ? (await history.refs.resolve(local))?.objectId : undefined;
+      },
+      onProgress: (message) => {
+        messages.push(message);
+        this.progressMessageCallback?.(message);
       },
     });
 
-    // Convert to PushResult.
-    //
-    // `transportResult.updates` is keyed by the DESTINATION ref name and carries
-    // {ok, message, oldOid}: the new object ids come from the refspecs we built
-    // and the source-ref lookups the transport performed through `getLocalRef`
-    // above, while `oldOid` is the remote's pre-push value — the expectation the
-    // server compared its ref against — as read from its advertisement.
-    const remoteUpdates: RemoteRefUpdate[] = [];
-    for (const [refName, updateResult] of transportResult.updates) {
-      const srcRef = sourceByDest.get(refName);
-      const newObjectId = srcRef !== undefined ? resolvedLocalOids.get(srcRef) : undefined;
-      remoteUpdates.push({
-        // Omit srcRef for a delete: there is no local ref behind it.
-        ...(srcRef ? { srcRef } : {}),
-        remoteName: refName,
-        expectedOldObjectId: updateResult.oldOid,
-        newObjectId: newObjectId ?? "",
-        status: updateResult.ok ? PushStatus.OK : classifyRejection(updateResult.message),
-        message: updateResult.message,
-        forceUpdate: this.force,
-        delete: newObjectId === ZERO_OBJECT_ID,
-      });
+    // git updates the remote-tracking refs of what the server accepted
+    if (!this.dryRun) {
+      for (const update of result.updates) {
+        if (update.status !== "ok") continue;
+        const local = tracking(update.remoteRef);
+        if (!local) continue;
+        if (update.newOid === ZERO_OBJECT_ID) await history.refs.remove(local);
+        else await history.refs.set(local, update.newOid);
+      }
     }
+
+    const remoteUpdates: RemoteRefUpdate[] = result.updates.map((update) => ({
+      ...(update.localRef ? { srcRef: update.localRef } : {}),
+      remoteName: update.remoteRef,
+      expectedOldObjectId: update.expectedOid ?? update.oldOid,
+      newObjectId: update.newOid,
+      status: toPushStatus(update),
+      message: update.message ?? (update.status === "ok" ? undefined : update.summary),
+      summary: update.summary,
+      forceUpdate: update.force,
+      delete: update.newOid === ZERO_OBJECT_ID,
+    }));
 
     return {
       uri: remoteUrl,
       remoteUpdates,
-      bytesSent: transportResult.bytesSent,
-      objectCount: transportResult.objectCount,
-      messages: [],
+      bytesSent: result.bytesSent,
+      objectCount: result.packObjects,
+      messages,
     };
   }
 
@@ -472,45 +478,38 @@ export class PushCommand extends TransportCommand<PushResult> {
   }
 
   /**
-   * Build refspecs for the push.
+   * The refspecs to push: the explicit ones, `--all` (every branch), `--tags` (every tag);
+   * else the remote's configured push refspecs; else the current branch to the same name.
    */
   private async buildRefSpecs(): Promise<string[]> {
-    const specs: string[] = [];
+    const specs = [...this.refSpecs];
+    if (this.pushAll) specs.push("refs/heads/*:refs/heads/*");
+    if (this.pushTags) specs.push("refs/tags/*:refs/tags/*");
+    if (specs.length > 0) return specs;
 
-    // Add explicit refspecs
-    for (const spec of this.refSpecs) {
-      if (this.force && !spec.startsWith("+")) {
-        specs.push(`+${spec}`);
-      } else {
-        specs.push(spec);
-      }
+    const store = RemoteConfigStore.from(this.workingCopy);
+    if (store.isConfigured(this.remote)) {
+      const configured = store.read(this.remote).pushRefspecs;
+      if (configured.length > 0) return configured;
     }
+    const currentBranch = await this.getCurrentBranch();
+    return currentBranch ? [`${currentBranch}:${currentBranch}`] : [];
+  }
 
-    // Push all branches
-    if (this.pushAll) {
-      for await (const ref of this.refsStore.list("refs/heads/")) {
-        const spec = `${ref.name}:${ref.name}`;
-        specs.push(this.force ? `+${spec}` : spec);
-      }
-    }
-
-    // Push all tags
-    if (this.pushTags) {
-      for await (const ref of this.refsStore.list("refs/tags/")) {
-        const spec = `${ref.name}:${ref.name}`;
-        specs.push(this.force ? `+${spec}` : spec);
-      }
-    }
-
-    // Default: push current branch
-    if (specs.length === 0) {
-      const currentBranch = await this.getCurrentBranch();
-      if (currentBranch) {
-        const spec = `${currentBranch}:${currentBranch}`;
-        specs.push(this.force ? `+${spec}` : spec);
-      }
-    }
-
-    return specs;
+  /**
+   * The remote-tracking ref of a remote ref (`refs/heads/main` → `refs/remotes/origin/main`)
+   * through the named remote's fetch refspecs; none for a URL.
+   */
+  private trackingRefMapper(): (remoteRef: string) => string | undefined {
+    const store = RemoteConfigStore.from(this.workingCopy);
+    if (!store.isConfigured(this.remote)) return () => undefined;
+    const specs = store
+      .read(this.remote)
+      .fetchRefspecs.map((spec) => parseRefSpec(spec))
+      .filter((spec) => !spec.negative && spec.source && spec.destination);
+    return (remoteRef) => {
+      const spec = specs.find((s) => matchSource(s, remoteRef));
+      return spec ? (expandFromSource(spec, remoteRef).destination ?? undefined) : undefined;
+    };
   }
 }
