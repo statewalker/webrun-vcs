@@ -201,6 +201,7 @@ export class DefaultSerializationApi implements SerializationApi {
       tagsImported: r.types.tag,
       packId: r.kept?.packId,
       ...(r.quarantine ? { quarantine: r.quarantine } : {}),
+      ...(r.quarantined !== undefined ? { quarantined: r.quarantined } : {}),
     };
   }
 

@@ -82,6 +82,7 @@ describe("SQL native stores: no quarantine (explicit fallback)", () => {
       { quarantine: true },
     );
     expect(result.quarantine).toBeUndefined();
+    expect(result.quarantined).toBe(false);
     expect(await history.blobs.has(id)).toBe(true);
     await history.close();
   });

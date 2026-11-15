@@ -40,6 +40,11 @@ export interface PackImportResult {
    * backend cannot (stores of parsed objects): the objects are then already published.
    */
   quarantine?: ObjectQuarantine;
+  /**
+   * With `quarantine: true`: true when the objects were quarantined, false when the backend
+   * cannot quarantine and imported them straight into the store. Absent otherwise.
+   */
+  quarantined?: boolean;
 }
 
 /** Options of `SerializationApi.importPack`. */

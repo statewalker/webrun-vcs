@@ -83,8 +83,21 @@ export const RAW_STAGING_TMP_PREFIX = "tmp_obj_";
  */
 export const RAW_QUARANTINE_PREFIX = "incoming-";
 
-/** Quarantines of this process (their key prefixes), which `sweepStale` leaves alone. */
-const openQuarantines = new Set<string>();
+/**
+ * A quarantine open in this process is protected from the sweep only while it is used: one
+ * that saw no read or write for this long (or for the sweep's expiry, if longer) counts as
+ * abandoned (a dropped or hung push) and is swept like a crash leftover. One hour.
+ */
+export const QUARANTINE_MAX_IDLE_MS = 60 * 60 * 1000;
+
+/** Quarantines of this process (their key prefixes) and when each was last used. */
+const openQuarantines = new Map<string, number>();
+
+/** Whether the open quarantine `prefix` is in use, for a sweep with this expiry. */
+function quarantineInUse(prefix: string, olderThanMs: number, now: number): boolean {
+  const last = openQuarantines.get(prefix);
+  return last !== undefined && now - last < Math.max(olderThanMs, QUARANTINE_MAX_IDLE_MS);
+}
 
 /**
  * The keys of `raw` under `prefix`, as a store of their own (`prefix` stripped). The view of
@@ -122,10 +135,13 @@ function rawStorageQuarantine(
   options: RawStorageStagingOptions,
 ): StagingQuarantine {
   const prefix = `${RAW_QUARANTINE_PREFIX}${timestampedId()}/`;
-  openQuarantines.add(prefix);
+  const touch = () => {
+    if (!closed) openQuarantines.set(prefix, Date.now());
+  };
+  let closed = false;
+  touch();
   const inner = rawStorageStaging(prefixedRawStorage(raw, prefix), options);
   const written = new Set<string>();
-  let closed = false;
 
   const removeWritten = async () => {
     for (const id of written) await raw.remove(prefix + id).catch(() => false);
@@ -142,13 +158,27 @@ function rawStorageQuarantine(
   const store: StagingBlobStore = {
     async putStaged(bytes, idOf) {
       checkOpen();
-      const r = await inner.putStaged(bytes, idOf);
-      written.add(r.id);
-      return r;
+      touch();
+      try {
+        const r = await inner.putStaged(bytes, idOf);
+        written.add(r.id);
+        return r;
+      } finally {
+        touch();
+      }
     },
-    spool: inner.spool,
-    get: (id) => inner.get(id),
-    has: (id) => inner.has(id),
+    spool: (content) => {
+      touch();
+      return (inner.spool as NonNullable<StagingBlobStore["spool"]>)(content);
+    },
+    get: (id) => {
+      touch();
+      return inner.get(id);
+    },
+    has: (id) => {
+      touch();
+      return inner.has(id);
+    },
     async remove(id) {
       written.delete(id);
       return inner.remove(id);
@@ -162,6 +192,7 @@ function rawStorageQuarantine(
     store,
     async commit() {
       checkOpen();
+      touch();
       try {
         const moves: [string, string][] = [];
         for (const id of written) {
@@ -227,19 +258,21 @@ const tmpKey = () => `${RAW_STAGING_TMP_PREFIX}${timestampedId()}`;
  * process are kept; one written by another process sharing the store is safe
  * only through its age, so pick an expiry longer than any write. Quarantines
  * (`incoming-<timestampedId>/…` keys) left by a crash are removed the same way,
- * except those this process still has open.
+ * except those this process still has open and used within `QUARANTINE_MAX_IDLE_MS`
+ * (or `olderThanMs`, if longer); an open one idle for longer counts as abandoned.
  */
 export async function sweepStaleRawStaging(
   raw: RawStorage,
   { olderThanMs }: SweepStaleOptions,
 ): Promise<number> {
-  const cutoff = Date.now() - olderThanMs;
+  const now = Date.now();
+  const cutoff = now - olderThanMs;
   const stale: string[] = [];
   for await (const key of raw.keys()) {
     if (key.startsWith(RAW_QUARANTINE_PREFIX)) {
       // a quarantine left by a crash (or a process that never committed nor discarded it)
       const slash = key.indexOf("/");
-      if (slash < 0 || openQuarantines.has(key.slice(0, slash + 1))) continue;
+      if (slash < 0 || quarantineInUse(key.slice(0, slash + 1), olderThanMs, now)) continue;
       const made = timestampOfId(key.slice(RAW_QUARANTINE_PREFIX.length, slash));
       if (olderThanMs <= 0 || (made !== undefined && made < cutoff)) stale.push(key);
       continue;

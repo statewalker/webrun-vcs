@@ -7,19 +7,31 @@
  * (`incoming-*` keys) and files backend (`objects/tmp_objdir-incoming-*`, kept packs).
  */
 
-import { createHistoryFromComponents, type History } from "@statewalker/vcs-core";
+import {
+  createGitObjects,
+  createHistoryFromComponents,
+  type History,
+  MemoryRawStorage,
+  rawStorageStaging,
+} from "@statewalker/vcs-core";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
 import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-utils/files";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { createRepositoryFacade, type ReceivePackHooks, serveOverDuplex } from "../src/index.js";
+import {
+  createFetchHandler,
+  createRepositoryFacade,
+  HookTimeoutError,
+  type ReceivePackHooks,
+  type RepositoryFacade,
+  serveOverDuplex,
+} from "../src/index.js";
 import {
   clientWithNewCommits,
   fullPackOf,
   packOf,
   pushRequest,
   runReceivePack,
-  serverRepo,
   ZERO,
 } from "./helpers/receive-pack-harness.js";
 import { commitInRepo, createTransportRefStore, type TransportRepo } from "./interop/helpers.js";
@@ -33,16 +45,52 @@ async function storedIds(repo: { history: Pick<History, "objects"> }): Promise<S
   return ids;
 }
 
+/** Every key of a raw store (objects, temporaries, quarantines). */
+async function rawKeys(raw: MemoryRawStorage): Promise<string[]> {
+  const keys: string[] = [];
+  for await (const key of raw.keys()) keys.push(key);
+  return keys.sort();
+}
+
+/**
+ * A memory server whose raw store the test can see (c1 ← c2 on main, HEAD → main), as
+ * `serverRepo` builds it.
+ */
+async function memoryServer(): Promise<{ repo: TransportRepo; raw: MemoryRawStorage; c2: string }> {
+  const raw = new MemoryRawStorage();
+  const objects = createGitObjects(rawStorageStaging(raw));
+  const history = createHistoryFromComponents({ objects, refs: { type: "memory" } });
+  const repo = {
+    history,
+    facade: createRepositoryFacade({ history }),
+    refStore: createTransportRefStore(history.refs),
+    imports: [],
+    close: async () => {},
+  } as unknown as TransportRepo;
+  const c1 = await commitInRepo(repo, "c1", { "a.txt": "one\n" });
+  const c2 = await commitInRepo(repo, "c2", { "a.txt": "one\n", "b.txt": "two\n" }, [c1]);
+  await repo.refStore.update("refs/heads/main", c2);
+  await history.refs.setSymbolic("HEAD", "refs/heads/main");
+  return { repo, raw, c2 };
+}
+
 /** The server (c1 ← c2 on main), the client's two new commits n0 ← n1 and their pack. */
 async function setup() {
-  const { repo, c2 } = await serverRepo();
+  const { repo, raw, c2 } = await memoryServer();
   const { client, commits } = await clientWithNewCommits(2);
   const [n0, n1] = commits as [string, string];
   const pack = await fullPackOf(client, [n1], [c2]);
   const before = await storedIds(repo);
-  /** The store holds exactly what it held before the push. */
-  const unchanged = async () => expect(await storedIds(repo)).toEqual(before);
-  return { repo, client, c2, n0, n1, pack, before, unchanged };
+  const keysBefore = await rawKeys(raw);
+  /**
+   * The store holds exactly what it held before the push: the same objects, and no other key
+   * (no `incoming-*` quarantine, no `tmp_obj_*` temporary).
+   */
+  const unchanged = async () => {
+    expect(await storedIds(repo)).toEqual(before);
+    expect(await rawKeys(raw)).toEqual(keysBefore);
+  };
+  return { repo, raw, client, c2, n0, n1, pack, before, unchanged };
 }
 
 describe("receive-pack quarantine: a refused push leaves no objects", () => {
@@ -349,5 +397,176 @@ describe("receive-pack quarantine on the files backend (kept packs)", () => {
     expect(run.report).toEqual(["unpack ok", "ng refs/heads/main hook declined"]);
     expect(await storedIds(repo)).toEqual(idsBefore);
     expect(await listNames(files, "objects")).toEqual(objectsBefore);
+  });
+});
+
+describe("receive-pack quarantine: failures, races and stalled peers", () => {
+  it("commit failing in APPLY_UPDATES: ng internal error, quarantine discarded, refs unchanged", async () => {
+    const { repo, c2, n1, pack, unchanged } = await setup();
+    let discarded = 0;
+    const importPack = repo.facade.importPack.bind(repo.facade);
+    repo.facade.importPack = async (stream, options) => {
+      const result = await importPack(stream, options);
+      const q = result.quarantine;
+      if (!q) throw new Error("no quarantine");
+      return {
+        ...result,
+        quarantine: {
+          repository: q.repository,
+          commit: async () => {
+            throw new Error("disk full");
+          },
+          discard: async () => {
+            discarded++;
+            await q.discard();
+          },
+        },
+      };
+    };
+    const errors: string[] = [];
+    const run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${n1} refs/heads/main`], pack },
+      { logger: { error: (m) => errors.push(m) } },
+    );
+    expect(run.report).toEqual(["unpack ok", "ng refs/heads/main internal error"]);
+    expect(discarded).toBe(1);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(await repo.refStore.get("refs/heads/main")).toBe(c2);
+    await unchanged();
+  });
+
+  it("two concurrent pushes of the same objects both land, nothing left aside", async () => {
+    const { repo, raw, n1, pack } = await setup();
+    const [a, b] = await Promise.all([
+      runReceivePack(repo, { commands: [`${ZERO} ${n1} refs/heads/a`], pack }),
+      runReceivePack(repo, { commands: [`${ZERO} ${n1} refs/heads/b`], pack }),
+    ]);
+    expect(a.report).toEqual(["unpack ok", "ok refs/heads/a"]);
+    expect(b.report).toEqual(["unpack ok", "ok refs/heads/b"]);
+    expect(await repo.facade.has(n1)).toBe(true);
+    const odd = (await rawKeys(raw)).filter((k) => !/^[0-9a-f]{40}$/.test(k));
+    expect(odd).toEqual([]);
+  });
+
+  it("an HTTP client gone in the middle of the pack leaves nothing", async () => {
+    const { repo, c2, n1, pack, unchanged } = await setup();
+    const request = pushRequest({ commands: [`${c2} ${n1} refs/heads/main`], pack });
+    const cut = request.length - Math.floor(pack.length / 2);
+    const handler = createFetchHandler({
+      resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+      logger: { info: () => {}, error: () => {} },
+    });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(request.subarray(0, cut));
+        setTimeout(() => controller.error(new Error("connection reset by peer")), 10);
+      },
+    });
+    const response = await handler(
+      new Request("http://localhost/repo.git/git-receive-pack", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-git-receive-pack-request" },
+        body,
+        duplex: "half",
+      } as RequestInit),
+    );
+    try {
+      await response.arrayBuffer();
+    } catch {
+      // the answer may break with the request
+    }
+    await vi.waitFor(unchanged, { timeout: 5000 });
+    expect(await repo.refStore.get("refs/heads/main")).toBe(c2);
+  });
+
+  it("a client that stops reading the answer: the run ends on the write timeout, nothing left", async () => {
+    const { repo, c2, n1, pack, unchanged } = await setup();
+    const request = pushRequest({ commands: [`${c2} ${n1} refs/heads/main`], pack });
+    let sent = false;
+    const result = await serveOverDuplex({
+      repository: repo.facade,
+      refStore: repo.refStore,
+      service: "git-receive-pack",
+      keepAliveMs: 10,
+      writeTimeoutMs: 50,
+      hooks: { preReceive: () => new Promise((r) => setTimeout(r, 200)) },
+      logger: { error: () => {} },
+      duplex: {
+        async *[Symbol.asyncIterator]() {
+          sent = true; // the advertisement is out: the client reads no more
+          yield request;
+        },
+        // the advertisement goes out; after it nothing is taken any more
+        write: () => (sent ? new Promise<void>(() => {}) : undefined),
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(await repo.refStore.get("refs/heads/main")).toBe(c2);
+    await unchanged();
+  });
+
+  it("a hook that never answers is refused after hookTimeoutMs", async () => {
+    const { repo, c2, n1, pack, unchanged } = await setup();
+    const errors: unknown[] = [];
+    const run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${n1} refs/heads/main`], pack },
+      {
+        hookTimeoutMs: 50,
+        hooks: { preReceive: () => new Promise(() => {}) },
+        logger: { error: (_m, e) => errors.push(e) },
+      },
+    );
+    expect(run.report).toEqual(["unpack ok", "ng refs/heads/main pre-receive hook declined"]);
+    expect(errors.some((e) => e instanceof HookTimeoutError)).toBe(true);
+    await unchanged();
+  });
+
+  it("a repository that cannot quarantine is reported once, through the logger", async () => {
+    const { repo, c2, n1, n0, pack } = await setup();
+    // a facade that drops the quarantine option
+    const plain: RepositoryFacade = {
+      ...repo.facade,
+      importPack: (stream) => repo.facade.importPack(stream),
+    };
+    const warnings: string[] = [];
+    const logger = { error: () => {}, warn: (m: string) => warnings.push(m) };
+    const server = { ...repo, facade: plain } as TransportRepo;
+    await runReceivePack(server, { commands: [`${ZERO} ${n0} refs/heads/x`], pack }, { logger });
+    await runReceivePack(server, { commands: [`${c2} ${n1} refs/heads/main`], pack }, { logger });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("cannot quarantine");
+    // a quarantining facade says nothing
+    const fresh = await setup();
+    await runReceivePack(
+      fresh.repo,
+      { commands: [`${fresh.c2} ${fresh.n1} refs/heads/main`], pack: fresh.pack },
+      { logger },
+    );
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("the import result says whether the objects were quarantined", async () => {
+    const { repo, pack } = await setup();
+    const stream = (async function* () {
+      yield pack;
+    })();
+    const result = await repo.facade.importPack(stream, { quarantine: true });
+    expect(result.quarantined).toBe(true);
+    await result.quarantine?.discard();
+  });
+
+  it("the quarantine's view has the repository's bareness", async () => {
+    const { repo, pack } = await setup();
+    const facade = createRepositoryFacade({ history: repo.history, bare: false });
+    const result = await facade.importPack(
+      (async function* () {
+        yield pack;
+      })(),
+      { quarantine: true },
+    );
+    expect(await result.quarantine?.repository.isBare?.()).toBe(false);
+    await result.quarantine?.discard();
   });
 });

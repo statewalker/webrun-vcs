@@ -12,6 +12,7 @@ import {
   importPack,
   MemoryRawStorage,
   type ObjectTypeString,
+  QUARANTINE_MAX_IDLE_MS,
   RAW_QUARANTINE_PREFIX,
   type RawStorage,
   rawStorageStaging,
@@ -19,7 +20,7 @@ import {
   writePack,
 } from "@statewalker/vcs-core";
 import { timestampedId } from "@statewalker/vcs-utils";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 export interface ObjectQuarantineTestContext {
   /** The repository's object kernel, with `beginQuarantine` */
@@ -231,6 +232,7 @@ export function createObjectQuarantineTests(
         const { ids, pack } = await samplePack(6);
         const result = await importPack(objects, streamOf(pack), { quarantine: true, unpackLimit });
         expect(result.count).toBe(ids.length);
+        expect(result.quarantined).toBe(true);
         const q = result.quarantine;
         if (!q) throw new Error("no quarantine");
         for (const id of ids) {
@@ -288,6 +290,44 @@ export function createObjectQuarantineTests(
       expect(await ctx.quarantines()).toBe(1);
       expect(await ctx.sweep(0)).toBe(1);
       expect(await ctx.quarantines()).toBe(0);
+    });
+
+    it("an open quarantine unused for longer than QUARANTINE_MAX_IDLE_MS is swept as abandoned", async () => {
+      const q = await begin();
+      await put(q.objects, "blob", "abandoned\n");
+      const start = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        // idle, but not for long: still protected, even from an expiry of 0
+        vi.setSystemTime(start + QUARANTINE_MAX_IDLE_MS / 2);
+        await ctx.sweep(0);
+        expect(await ctx.quarantines()).toBe(1);
+        // a dropped or hung push: swept like a crash leftover
+        vi.setSystemTime(start + QUARANTINE_MAX_IDLE_MS + 60_000);
+        expect(await ctx.sweep(HOUR)).toBe(1);
+        expect(await ctx.quarantines()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+      await q.discard();
+    });
+
+    it("use keeps an open quarantine protected", async () => {
+      const q = await begin();
+      const id = await put(q.objects, "blob", "busy\n");
+      const start = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(start + QUARANTINE_MAX_IDLE_MS - 60_000);
+        expect(await q.objects.has(id)).toBe(true); // a read: used now
+        vi.setSystemTime(start + QUARANTINE_MAX_IDLE_MS + 60_000);
+        await ctx.sweep(HOUR);
+        expect(await ctx.quarantines()).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+      await q.commit();
+      expect(await objects.has(id)).toBe(true);
     });
   });
 }

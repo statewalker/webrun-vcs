@@ -90,10 +90,14 @@ export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryF
 export function repositoryQuarantine(
   quarantine: ObjectQuarantine,
   history: Pick<History, "refs">,
+  options: Pick<RepositoryFacade, "isBare"> = {},
 ): RepositoryQuarantine {
   const view = createHistoryFromComponents({ objects: quarantine.objects, refs: history.refs });
+  const repository = createRepositoryFacadeFromHistory(view);
+  // the same repository: the same bareness
+  if (options.isBare) repository.isBare = options.isBare;
   return {
-    repository: createRepositoryFacadeFromHistory(view),
+    repository,
     commit: () => quarantine.commit(),
     discard: () => quarantine.discard(),
   };
@@ -121,7 +125,10 @@ function createRepositoryFacadeFromHistory(
     ): Promise<PackImportResult> {
       const { quarantine, ...result } = await serialization.importPack(packStream, options);
       return quarantine
-        ? { ...result, quarantine: repositoryQuarantine(quarantine, history) }
+        ? {
+            ...result,
+            quarantine: repositoryQuarantine(quarantine, history, { isBare: facade.isBare }),
+          }
         : result;
     },
 

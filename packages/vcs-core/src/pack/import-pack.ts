@@ -57,6 +57,11 @@ export interface ImportPackResult {
    * the caller must `commit()` or `discard()` it.
    */
   quarantine?: ObjectQuarantine;
+  /**
+   * With `quarantine: true`: whether the objects were quarantined (true, `quarantine` set) or,
+   * `objects` being unable to, imported straight into the store (false). Absent otherwise.
+   */
+  quarantined?: boolean;
 }
 
 /** What `importPack` writes to: the unpack target, and a quarantine when it can open one. */
@@ -93,11 +98,16 @@ export async function importPack(
         quarantine: false,
         packs: quarantine.packs,
       });
-      return { ...result, quarantine };
+      return { ...result, quarantine, quarantined: true };
     } catch (err) {
       await quarantine.discard().catch(() => {});
       throw err;
     }
+  }
+  if (options.quarantine) {
+    // asked for, but these objects cannot keep a quarantine: said in the result
+    const result = await importPack(objects, pack, { ...options, quarantine: false });
+    return { ...result, quarantined: false };
   }
   const unpackLimit = options.unpackLimit ?? DEFAULT_UNPACK_LIMIT;
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;

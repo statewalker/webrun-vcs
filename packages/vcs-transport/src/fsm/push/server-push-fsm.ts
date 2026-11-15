@@ -326,7 +326,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           let verdict: ReturnType<typeof normalizeVerdict>;
           try {
             verdict = normalizeVerdict(
-              await hook(commands.map(toReceiveCommand), hookContext(ctx)),
+              await timedHook(ctx, "authorize", () =>
+                hook(commands.map(toReceiveCommand), hookContext(ctx)),
+              ),
             );
           } catch (e) {
             // the details go to the server's log, never to the client
@@ -417,6 +419,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           });
           state.quarantine = quarantine;
           output.packResult = result;
+          if (!quarantine) warnNoQuarantine(ctx, repository);
         }
         return "UNPACK_OK";
       } catch (e) {
@@ -497,7 +500,11 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
       let verdict: ReturnType<typeof normalizeVerdict>;
       try {
-        verdict = normalizeVerdict(await hook(open.map(toReceiveCommand), hookContext(ctx)));
+        verdict = normalizeVerdict(
+          await timedHook(ctx, "pre-receive", () =>
+            hook(open.map(toReceiveCommand), hookContext(ctx)),
+          ),
+        );
       } catch (e) {
         logError(ctx, "pre-receive hook failed", e);
         await sendError(ctx, "pre-receive hook error");
@@ -540,6 +547,11 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const refStore = getRefStore(ctx);
       const repository = getRepository(ctx);
       try {
+        // a client that went away mid-check gets no ref update (git dies on the failed write)
+        if (state.peerGone !== undefined) {
+          await discardQuarantine(ctx);
+          return internalError(ctx, state.peerGone);
+        }
         const atomic = state.capabilities.has("atomic");
         const all = state.pushCommands ?? [];
         // git migrates the quarantined objects, then updates the refs: published only when a
@@ -654,6 +666,8 @@ interface ServerPushState extends ProtocolState {
   /** Side-band writes besides the FSM's own (keep-alive, messages), in order */
   bandQueue?: Promise<void>;
   keepAliveTimer?: ReturnType<typeof setInterval>;
+  /** A side-band write failed (the client went away or stopped reading): set to its error */
+  peerGone?: unknown;
   hookContext?: ReceivePackHookContext;
   reportSent?: boolean;
 }
@@ -677,7 +691,32 @@ async function publishQuarantine(ctx: ProcessContext): Promise<void> {
   const quarantine = state.quarantine;
   if (!quarantine) return;
   state.quarantine = undefined;
-  await quarantine.commit();
+  try {
+    await quarantine.commit();
+  } catch (e) {
+    // whatever commit could not publish is not left behind (commit cleans up after itself
+    // in our backends; a facade's own quarantine may not)
+    await quarantine.discard().catch(() => {});
+    throw e;
+  }
+}
+
+/** Repositories already warned about (once each, per process). */
+const warnedNoQuarantine = new WeakSet<object>();
+
+/**
+ * A push imported without a quarantine (the facade ignores `quarantine: true`, or its store
+ * cannot keep objects aside): its objects are visible at once and stay if it is refused. Said
+ * once per repository facade through the logger's `warn` (else `console.warn`).
+ */
+function warnNoQuarantine(ctx: ProcessContext, repository: object): void {
+  if (warnedNoQuarantine.has(repository)) return;
+  warnedNoQuarantine.add(repository);
+  const message =
+    "receive-pack: this repository cannot quarantine received packs; the objects of a refused push stay in its store";
+  const logger = receivePackConfig(ctx).logger;
+  if (logger?.warn) logger.warn(message);
+  else console.warn(message);
 }
 
 /** Removes the quarantined objects of a push that will not apply them. */
@@ -709,6 +748,41 @@ async function discardQuarantine(ctx: ProcessContext): Promise<void> {
  */
 export async function releaseReceivePack(ctx: ProcessContext): Promise<void> {
   await discardQuarantine(ctx);
+}
+
+/** A hook that did not answer within `hookTimeoutMs`. */
+export class HookTimeoutError extends Error {
+  constructor(
+    readonly hook: string,
+    readonly ms: number,
+  ) {
+    super(`${hook} hook timed out after ${ms} ms`);
+    this.name = "HookTimeoutError";
+  }
+}
+
+/**
+ * Runs a hook, failing with {@link HookTimeoutError} once `hookTimeoutMs` passes (the hook
+ * itself is not stopped; its late answer is ignored). No timeout without the option.
+ */
+async function timedHook<T>(
+  ctx: ProcessContext,
+  name: string,
+  run: () => T | Promise<T>,
+): Promise<T> {
+  const ms = receivePackConfig(ctx).hookTimeoutMs;
+  const pending = Promise.resolve().then(run);
+  if (!ms || ms <= 0) return pending;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new HookTimeoutError(name, ms)), ms);
+  });
+  pending.catch(() => {}); // a late failure after the timeout is not unhandled
+  try {
+    return await Promise.race([pending, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function receivePackConfig(ctx: ProcessContext): ReceivePackConfig {
@@ -798,8 +872,10 @@ function logError(ctx: ProcessContext, message: string, error: unknown): void {
 /** Queues a side-band write after the earlier ones (keep-alive and messages interleave). */
 function enqueueBand(ctx: ProcessContext, write: () => Promise<void>): Promise<void> {
   const state = getState<ServerPushState>(ctx);
-  const next = (state.bandQueue ?? Promise.resolve()).then(write).catch(() => {
-    // the client is gone: the report write will tell
+  const next = (state.bandQueue ?? Promise.resolve()).then(write).catch((error: unknown) => {
+    // the client is gone (or stopped reading): no ref is updated after this, and the report
+    // write will fail too
+    state.peerGone ??= error;
   });
   state.bandQueue = next;
   return next;
@@ -1008,7 +1084,11 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
     if (hook) {
       let verdict: ReturnType<typeof normalizeVerdict>;
       try {
-        verdict = normalizeVerdict(await hook(name, cmd.oldOid, cmd.newOid, hookContext(ctx)));
+        verdict = normalizeVerdict(
+          await timedHook(ctx, "update", () =>
+            hook(name, cmd.oldOid, cmd.newOid, hookContext(ctx)),
+          ),
+        );
       } catch (e) {
         logError(ctx, `update hook failed for ${name}`, e);
         await sendError(ctx, "update hook error");

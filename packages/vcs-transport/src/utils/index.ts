@@ -11,7 +11,9 @@ export {
   IdleTimeoutError,
   readStreamWithIdleTimeout,
   type StreamChunks,
+  WriteTimeoutError,
   withIdleTimeout,
+  withWriteTimeout,
 } from "./idle-timeout.js";
 export type { RefSpec } from "./refspec.js";
 export {

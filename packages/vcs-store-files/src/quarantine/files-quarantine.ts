@@ -10,7 +10,13 @@
  * directory older than its expiry).
  */
 import type { GitObjects, ObjectQuarantine, PackSet } from "@statewalker/vcs-core";
-import { createGitObjects, joinPath, openPackSet, overlayObjects } from "@statewalker/vcs-core";
+import {
+  createGitObjects,
+  joinPath,
+  openPackSet,
+  overlayObjects,
+  QUARANTINE_MAX_IDLE_MS,
+} from "@statewalker/vcs-core";
 import { timestampedId, timestampOfId } from "@statewalker/vcs-utils";
 import { type FilesApi, moveCompleting } from "@statewalker/vcs-utils/files";
 import { skipPacked, withPacks } from "../pack/with-packs.js";
@@ -24,8 +30,17 @@ const FANOUT = /^[0-9a-f]{2}$/;
 const DEFAULT_FRESHEN_MAX_AGE_MS = 60 * 60 * 1000;
 const REST = /^[0-9a-f]{38}$/;
 
-/** Quarantine directories open in this process: `sweepQuarantines` leaves them alone. */
-const openDirs = new Set<string>();
+/**
+ * Quarantine directories open in this process, with when each was last used:
+ * `sweepQuarantines` leaves them alone while they are used (see `QUARANTINE_MAX_IDLE_MS`).
+ */
+const openDirs = new Map<string, number>();
+
+/** Whether the open quarantine `dir` is in use, for a sweep with this expiry. */
+function inUse(dir: string, olderThanMs: number, now: number): boolean {
+  const last = openDirs.get(dir);
+  return last !== undefined && now - last < Math.max(olderThanMs, QUARANTINE_MAX_IDLE_MS);
+}
 
 export interface FilesQuarantineOptions {
   files: FilesApi;
@@ -77,8 +92,11 @@ export async function beginFilesQuarantine(
   };
   const dir = joinPath(objectsDir, `${QUARANTINE_DIR_PREFIX}${timestampedId()}`);
   const packDir = joinPath(dir, "pack");
-  openDirs.add(dir);
   let closed = false;
+  const touch = () => {
+    if (!closed) openDirs.set(dir, Date.now());
+  };
+  touch();
   try {
     await files.mkdir(packDir);
   } catch (e) {
@@ -92,7 +110,7 @@ export async function beginFilesQuarantine(
     freshenMaxAgeMs,
   });
   const quarantined = withPacks(createGitObjects(skipPacked(staging, packs)), packs);
-  const view = overlayObjects(quarantined, options.objects);
+  const overlay = overlayObjects(quarantined, options.objects);
 
   const close = async () => {
     closed = true;
@@ -104,6 +122,37 @@ export async function beginFilesQuarantine(
   };
   const checkOpen = () => {
     if (closed) throw new Error("the quarantine is closed");
+  };
+  /** The overlay, refusing writes once closed and recording use (reads and writes) */
+  const view: GitObjects = {
+    ...overlay,
+    put: (type, size, content) => {
+      checkOpen();
+      touch();
+      return overlay.put(type, size, content);
+    },
+    putUnsized: (type, content) => {
+      checkOpen();
+      touch();
+      return overlay.putUnsized(type, content);
+    },
+    putRaw: (id, raw) => {
+      checkOpen();
+      touch();
+      return overlay.putRaw(id, raw);
+    },
+    get: (id, o) => {
+      touch();
+      return overlay.get(id, o);
+    },
+    getRaw: (id) => {
+      touch();
+      return overlay.getRaw(id);
+    },
+    has: (id) => {
+      touch();
+      return overlay.has(id);
+    },
   };
 
   const migrate = async () => {
@@ -149,13 +198,19 @@ export async function beginFilesQuarantine(
   return {
     objects: view,
     packs: {
-      install: (source, o) => {
+      install: async (source, o) => {
         checkOpen();
-        return packs.install(source, o);
+        touch();
+        try {
+          return await packs.install(source, o);
+        } finally {
+          touch();
+        }
       },
     },
     async commit() {
       checkOpen();
+      touch();
       try {
         await migrate();
       } finally {
@@ -174,7 +229,9 @@ export async function beginFilesQuarantine(
  * Removes quarantine directories (`objects/tmp_objdir-incoming-*`) older than `olderThanMs`,
  * left by a process that crashed (or never committed nor discarded its quarantine). The age is
  * read from the name (its `timestampedId`); a directory without one (native git's) is judged by
- * its mtime, and kept when that is unknown. Quarantines open in this process are kept.
+ * its mtime, and kept when that is unknown. Quarantines open in this process are kept while
+ * used within `QUARANTINE_MAX_IDLE_MS` (or `olderThanMs`, if longer); one idle for longer
+ * (a dropped or hung push) is removed like a crash leftover.
  *
  * @returns The number of directories removed
  */
@@ -190,7 +247,7 @@ export async function sweepQuarantines(
   for await (const e of files.list(objectsDir)) {
     if (e.kind !== "directory" || !e.name.startsWith(QUARANTINE_DIR_PREFIX)) continue;
     const path = joinPath(objectsDir, e.name);
-    if (openDirs.has(path)) continue;
+    if (inUse(path, olderThanMs, now)) continue;
     const made =
       timestampOfId(e.name.slice(QUARANTINE_DIR_PREFIX.length)) ??
       e.lastModified ??
@@ -198,6 +255,7 @@ export async function sweepQuarantines(
     if (olderThanMs <= 0 || (made !== undefined && made < cutoff)) stale.push(path);
   }
   let removed = 0;
-  for (const path of stale) if (!openDirs.has(path) && (await files.remove(path))) removed++;
+  for (const path of stale)
+    if (!inUse(path, olderThanMs, now) && (await files.remove(path))) removed++;
   return removed;
 }

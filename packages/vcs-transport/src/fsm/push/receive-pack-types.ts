@@ -120,6 +120,8 @@ export interface ReceivePackHooks {
 /** A logger for receive-pack (hook failures after the report). */
 export interface ReceivePackLogger {
   error(message: string, error?: unknown): void;
+  /** Something the operator should know that is not a failure (default: console.warn) */
+  warn?(message: string): void;
 }
 
 /** Default most commands one push may carry. */
@@ -127,6 +129,12 @@ export const DEFAULT_MAX_PUSH_COMMANDS = 65536;
 
 /** Default keep-alive interval (git's `receive.keepAlive`, seconds there). */
 export const DEFAULT_RECEIVE_KEEP_ALIVE_MS = 5000;
+
+/**
+ * Default write timeout of a receive-pack answer: a client that takes nothing for this long
+ * (a full pipe or socket) ends the run, so it cannot hold the push (and its quarantine) forever.
+ */
+export const DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * receive-pack settings (`ProcessConfiguration.receivePack`). The ref policies
@@ -146,6 +154,13 @@ export interface ReceivePackConfig {
    * applied (git's `receive.keepAlive`, default 5 s; 0: none).
    */
   keepAliveMs?: number;
+  /**
+   * A hook (`authorize`, `preReceive`, `update`) still running after this long (ms) counts as
+   * failed: logged, and its commands refused as when it throws ("authorization failed",
+   * "pre-receive hook declined", "hook declined"). Default: none. `postReceive` is detached
+   * and never timed.
+   */
+  hookTimeoutMs?: number;
   /** Whether the repository has no working tree (default: the facade's `isBare()`, else true) */
   bare?: boolean;
   /**
