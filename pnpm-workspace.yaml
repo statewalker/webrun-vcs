@@ -39,8 +39,8 @@ catalog:
   "@statewalker/webrun-files-node": "^0.11.0"
   "@types/node": ^26.6.4
   "@types/sql.js": ^1.4.11
-  "@vitest/browser": ^5.0.3
-  "@vitest/coverage-v8": ^5.0.3
+  "@vitest/browser": ^5.1.0
+  "@vitest/coverage-v8": ^5.1.0
   livekit-client: ^2.22.3
   "@noble/hashes": ^2.0.1
   pako: ^3.0.2
@@ -52,7 +52,7 @@ catalog:
   tsx: ^4.23.15
   turbo: ^2.11.7
   typescript: ^7.0.2
-  vitest: ^5.0.3
+  vitest: ^5.1.0
 
 catalogs:
   peers:
