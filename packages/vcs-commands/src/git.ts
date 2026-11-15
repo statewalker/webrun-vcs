@@ -30,6 +30,7 @@ import {
   RemoteAddCommand,
   RemoteListCommand,
   RemoteRemoveCommand,
+  RemoteRenameCommand,
   RemoteSetHeadCommand,
   RemoteSetUrlCommand,
   RenameBranchCommand,
@@ -721,6 +722,19 @@ export class Git implements Disposable {
   remoteSetHead(): RemoteSetHeadCommand {
     this.checkClosed();
     return new RemoteSetHeadCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RemoteRenameCommand for renaming a remote (`git remote rename`).
+   *
+   * @example
+   * ```typescript
+   * await git.remoteRename().setOldName("origin").setNewName("upstream").call();
+   * ```
+   */
+  remoteRename(): RemoteRenameCommand {
+    this.checkClosed();
+    return new RemoteRenameCommand(this._workingCopy);
   }
 
   // ============ Rebase Operations ============

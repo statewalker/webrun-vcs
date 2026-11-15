@@ -57,6 +57,21 @@ export interface FetchClientOptions {
    * configured `remote.<name>.fetch` refspecs; command-line ones fail)
    */
   missingRefsOk?: boolean;
+  /**
+   * Refspecs the remote refs the fetch took are also mapped through, to update their
+   * remote-tracking refs too (git's opportunistic update: `git fetch origin main` also
+   * writes `refs/remotes/origin/main` through `remote.origin.fetch`, or through
+   * `--refmap`). These list no more refs, enable no tag following, and stay out of
+   * {@link FetchClientResult.fetched} (FETCH_HEAD); a local ref the refspecs already
+   * write is not written twice.
+   */
+  opportunisticRefspecs?: string[];
+  /**
+   * Called once the remote refs are listed and mapped, before any object is fetched or ref
+   * written: where `git fetch --prune` deletes the stale remote-tracking refs, so a
+   * renamed remote branch (`foo` to `foo/bar`) does not conflict with the old one.
+   */
+  beforeFetch?: (remoteRefs: readonly RemoteRef[]) => Promise<void>;
   /** Tag following; default `auto` */
   tags?: TagMode;
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
@@ -244,6 +259,22 @@ export async function fetchFromConnection(
     stats: { rounds: 0, haves: 0 },
   };
 
+  // git's opportunistic update: the refs the refspecs took (not `--tags`), mapped through
+  // the configured refspecs
+  const tagSpecAt = tags === "all" ? refspecs.length - 1 : -1;
+  const opportunistic = options.opportunisticRefspecs?.length
+    ? mapRefs(
+        planned
+          .filter((p) => p.refspec !== undefined && p.refspec !== tagSpecAt)
+          .map((p) => ({ name: p.remoteRef, oid: p.oid })),
+        options.opportunisticRefspecs,
+      )
+        .filter((p) => p.localRef !== undefined)
+        .map(({ refspec: _refspec, ...p }) => p)
+    : [];
+
+  if (options.beforeFetch) await options.beforeFetch(remoteRefs);
+
   const source = negotiatorSource(repository);
   // what is complete here: reachable from the local refs (git's mark_complete), not merely
   // present (an interrupted fetch leaves commits without their trees and blobs)
@@ -367,9 +398,14 @@ export async function fetchFromConnection(
   }
 
   result.shallow.after = shallow;
-  result.refUpdates = await planRefUpdates([...planned, ...followed], repository, refStore, {
-    force: options.force,
-  });
+  result.refUpdates = await planRefUpdates(
+    [...planned, ...followed, ...opportunistic],
+    repository,
+    refStore,
+    {
+      force: options.force,
+    },
+  );
   result.followedTags = followed.map((p) => p.localRef as string);
   // each group by name, as find_non_local_tags lists them (a sorted string list)
   const byName = [...followed].sort((a, b) =>

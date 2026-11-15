@@ -130,11 +130,15 @@ describe.each(backends)("RemoteRemoveCommand ($name backend)", ({ factory }) => 
       const workingCopy = await createTestWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
 
-      // Create remote tracking refs
+      // A configured remote with remote tracking refs (git refuses a remote without config)
+      await git.remoteAdd().setName("origin").setUri("https://github.com/user/repo").call();
       await workingCopy.history.refs.set("refs/remotes/origin/main", "a".repeat(40));
       await workingCopy.history.refs.set("refs/remotes/origin/feature", "b".repeat(40));
 
-      const result = await git.remoteRemove().setRemoteName("origin").call();
+      const result = await Git.fromWorkingCopy(workingCopy)
+        .remoteRemove()
+        .setRemoteName("origin")
+        .call();
 
       expect(result).toBeDefined();
       expect(result?.name).toBe("origin");
@@ -146,13 +150,26 @@ describe.each(backends)("RemoteRemoveCommand ($name backend)", ({ factory }) => 
       expect(featureRef).toBeUndefined();
     });
 
-    it("should return undefined for non-existent remote", async () => {
+    it("should throw git's error for a non-existent remote", async () => {
       const workingCopy = await createTestWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
 
-      const result = await git.remoteRemove().setRemoteName("nonexistent").call();
+      await expect(git.remoteRemove().setRemoteName("nonexistent").call()).rejects.toThrow(
+        "No such remote: 'nonexistent'",
+      );
+    });
 
-      expect(result).toBeUndefined();
+    it("refuses a remote known only from its tracking refs, deleting nothing (as git)", async () => {
+      const workingCopy = await createTestWorkingCopy();
+      const git = Git.fromWorkingCopy(workingCopy);
+      await workingCopy.history.refs.set("refs/remotes/origin/main", "a".repeat(40));
+
+      await expect(git.remoteRemove().setRemoteName("origin").call()).rejects.toThrow(
+        "No such remote: 'origin'",
+      );
+      expect((await workingCopy.history.refs.resolve("refs/remotes/origin/main"))?.objectId).toBe(
+        "a".repeat(40),
+      );
     });
 
     it("should throw for missing name", async () => {

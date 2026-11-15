@@ -53,6 +53,11 @@ interface GitConfigLike {
   unset(key: string): void;
   unsetSection(section: string): void;
   subsections(section: string): string[];
+  /**
+   * Optional: renames a section in place (git's `git_config_rename_section`), keeping its
+   * position and lines; without it the section's keys are copied and the old one removed.
+   */
+  renameSection?(oldSection: string, newSection: string): void;
   /** Optional: a config with no backing file has nothing to save. */
   save?(): Promise<void>;
 }
@@ -75,17 +80,17 @@ function isGitConfigLike(
 }
 
 /**
- * Split `remote.<subsection>.<name>` into its subsection.
+ * Split `<section>.<subsection>.<name>` into its subsection.
  *
  * Follows git's key grammar (and `GitWorkingCopyConfig`'s): the first part is
  * the section, the last is the variable name and everything in between is the
  * subsection, which keeps its case and may itself contain dots.
  *
- * @returns undefined when the key is not a `remote` subsection key
+ * @returns undefined when the key is not a subsection key of `section`
  */
-function remoteSubsectionOf(key: string): string | undefined {
+function subsectionOf(key: string, section: string): string | undefined {
   const parts = key.split(".");
-  if (parts.length < 3 || parts[0].toLowerCase() !== "remote") return undefined;
+  if (parts.length < 3 || parts[0].toLowerCase() !== section.toLowerCase()) return undefined;
   return parts.slice(1, -1).join(".");
 }
 
@@ -128,19 +133,30 @@ class PlainObjectConfig implements GitConfigLike {
 
   unsetSection(section: string): void {
     const parts = section.split(".");
-    if (parts.length < 2 || parts[0].toLowerCase() !== "remote") return;
+    if (parts.length < 2) return;
     const subsection = parts.slice(1).join(".");
     for (const key of Object.keys(this.bag)) {
-      if (remoteSubsectionOf(key) === subsection) delete this.bag[key];
+      if (subsectionOf(key, parts[0]) === subsection) delete this.bag[key];
+    }
+  }
+
+  renameSection(oldSection: string, newSection: string): void {
+    const [section, ...oldParts] = oldSection.split(".");
+    const oldSub = oldParts.join(".");
+    const newSub = newSection.split(".").slice(1).join(".");
+    for (const key of Object.keys(this.bag)) {
+      if (subsectionOf(key, section) !== oldSub) continue;
+      const name = key.slice(key.lastIndexOf(".") + 1);
+      this.bag[`${section}.${newSub}.${name}`] = this.bag[key];
+      delete this.bag[key];
     }
   }
 
   subsections(section: string): string[] {
-    if (section.toLowerCase() !== "remote") return [];
     const found = new Set<string>();
     for (const key of Object.keys(this.bag)) {
       if (this.getAll(key).length === 0) continue;
-      const subsection = remoteSubsectionOf(key);
+      const subsection = subsectionOf(key, section);
       if (subsection !== undefined) found.add(subsection);
     }
     return [...found];
@@ -217,6 +233,40 @@ export class RemoteConfigStore {
   }
 
   /**
+   * Rename the `[remote "<oldName>"]` section to `[remote "<newName>"]`, in place where the
+   * config can (git's rename_section), else by copying every `remote.<oldName>.*` variable.
+   */
+  rename(oldName: string, newName: string): void {
+    if (this.config.renameSection) {
+      this.config.renameSection(`remote.${oldName}`, `remote.${newName}`);
+      return;
+    }
+    // every remote.<old>.* variable: a git-config object mirrors its keys as own
+    // properties (the WorkingCopyConfig index signature), so they can be listed
+    const variables = new Set<string>();
+    for (const key of Object.keys(this.config)) {
+      if (subsectionOf(key, "remote") === oldName) {
+        variables.add(key.slice(key.lastIndexOf(".") + 1));
+      }
+    }
+    for (const variable of variables) {
+      const values = this.strings(oldName, variable);
+      if (values.length > 0) this.setAll(newName, variable, values);
+    }
+    this.config.unsetSection(`remote.${oldName}`);
+  }
+
+  /** Subsection names of a section (`branch`: the branch names with configuration). */
+  subsections(section: string): string[] {
+    return this.config.subsections(section);
+  }
+
+  /** Remove every value of a config variable. */
+  unset(key: string): void {
+    this.config.unset(key);
+  }
+
+  /**
    * Point a remote at a URL.
    *
    * @param push Write `pushurl` instead of `url`
@@ -270,6 +320,16 @@ export class RemoteConfigStore {
   /** Sets a config variable, replacing every value it had. */
   setValue(key: string, value: string): void {
     this.config.set(key, value);
+  }
+
+  /** Sets every value of a config variable, in order (none: unset). */
+  setValues(key: string, values: string[]): void {
+    if (values.length === 0) {
+      this.config.unset(key);
+      return;
+    }
+    this.config.set(key, values[0]);
+    for (const value of values.slice(1)) this.config.add(key, value);
   }
 
   /** Flush to the backing file, if the config has one. */

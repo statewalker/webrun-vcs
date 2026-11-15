@@ -19,7 +19,7 @@ import {
 } from "@statewalker/vcs-transport";
 
 import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
-import { RemoteConfigStore } from "../remote-config/index.js";
+import { deleteRefs, RemoteConfigStore } from "../remote-config/index.js";
 import {
   type FetchResult,
   RefUpdateStatus,
@@ -77,7 +77,9 @@ export enum TagOption {
 export class FetchCommand extends TransportCommand<FetchResult> {
   private remote = "origin";
   private refSpecs: string[] = [];
-  private removeDeletedRefs = false;
+  private removeDeletedRefs?: boolean;
+  private pruneTags?: boolean;
+  private refmap?: string[];
   private tagOption: TagOption = TagOption.AUTO_FOLLOW;
   private tagOptionSet = false;
   private writeFetchHead = true;
@@ -140,7 +142,11 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /**
    * Set whether to remove refs that no longer exist on the remote.
    *
-   * Equivalent to `git fetch --prune`.
+   * Equivalent to `git fetch --prune` (true) and `--no-prune` (false). Unset, the
+   * remote's `remote.<name>.prune`, else `fetch.prune`, decides, as in git; neither set,
+   * nothing is pruned. The remote-tracking refs the refspecs map from a ref the remote no
+   * longer has are deleted before anything is fetched (so `foo` can become `foo/bar`); the
+   * command-line refspecs are used when given, else the configured ones.
    *
    * @param remove Whether to prune deleted refs
    */
@@ -151,10 +157,42 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Whether to remove deleted refs.
+   * Whether to remove deleted refs, as set with {@link setRemoveDeletedRefs} (false when
+   * unset: the configuration is read when the fetch runs).
    */
   isRemoveDeletedRefs(): boolean {
-    return this.removeDeletedRefs;
+    return this.removeDeletedRefs ?? false;
+  }
+
+  /**
+   * Set whether local tags the remote no longer has are pruned too (`git fetch
+   * --prune-tags` / `--no-prune-tags`). Unset, `remote.<name>.pruneTags`, else
+   * `fetch.pruneTags`, decides.
+   *
+   * As in git, this adds `refs/tags/*:refs/tags/*` to the refspecs (so every remote tag is
+   * fetched), and only when no refspec is given: to the remote's configured refspecs, or for
+   * a URL to the refspecs of the fetch. Tags are pruned only when pruning is on.
+   */
+  setPruneTags(pruneTags: boolean): this {
+    this.checkCallable();
+    this.pruneTags = pruneTags;
+    return this;
+  }
+
+  /**
+   * Set the refspecs that map the refs named on the command line to remote-tracking refs
+   * (`git fetch --refmap=<refspec>`), in place of the remote's `remote.<name>.fetch`.
+   *
+   * With explicit refspecs ({@link setRefSpecs}), git also updates the remote-tracking
+   * ref each fetched ref maps to through the configured refspecs (`git fetch origin main`
+   * moves `refs/remotes/origin/main`); a refmap replaces those, and an empty one
+   * (`setRefmap()`, git's `--refmap=`) turns the update off. Without explicit refspecs a
+   * refmap is an error, as in git.
+   */
+  setRefmap(...refspecs: string[]): this {
+    this.checkCallable();
+    this.refmap = refspecs;
+    return this;
   }
 
   /**
@@ -400,10 +438,38 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       throw new InvalidRemoteError(this.remote);
     }
 
+    const store = RemoteConfigStore.from(this.workingCopy);
+    // git's remote_is_configured: a remote name with a config section, not a URL
+    const viaConfig = store.isConfigured(this.remote);
+    const prune =
+      this.removeDeletedRefs ??
+      configBool(store.value(`remote.${this.remote}.prune`)) ??
+      configBool(store.value("fetch.prune")) ??
+      false;
+    const pruneTags =
+      this.pruneTags ??
+      configBool(store.value(`remote.${this.remote}.pruneTags`)) ??
+      configBool(store.value("fetch.pruneTags")) ??
+      false;
+    const configured = viaConfig ? store.configuredFetchRefspecs(this.remote) : [];
+    const explicitSpecs = [...this.refSpecs];
+    // fetch.c fetch_one: --prune-tags (only without command-line refspecs) adds the tag
+    // refspec to the configured ones, or for a URL to those of the fetch
+    if (pruneTags && this.refSpecs.length === 0) {
+      if (viaConfig) configured.push(TAG_REFSPEC);
+      else explicitSpecs.push(TAG_REFSPEC);
+    }
+
     // git: without a refspec the remote's HEAD is fetched, and no ref is written (nor any
     // tag); explicit refspecs must name refs the remote has, configured ones may not
-    const fromConfig = this.refSpecs.length === 0;
-    const configured = this.effectiveRefSpecs();
+    const fromConfig = explicitSpecs.length === 0;
+    if (fromConfig && this.refmap !== undefined) {
+      throw new InvalidArgumentError(
+        "refmap",
+        this.refmap,
+        "--refmap option is only meaningful with command-line refspec(s)",
+      );
+    }
     // git's has_merge (branch_has_merge_config): the current branch has an upstream, on
     // whichever remote
     const upstream = fromConfig ? await this.upstreamConfig() : undefined;
@@ -411,12 +477,22 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // git (fetch.c get_ref_map): the remote's configured refspecs, or with none the current
     // branch's upstream refs when this remote is its upstream; else the remote HEAD
     const useConfig = fromConfig && (configured.length > 0 || upstreamHere);
-    const given = !fromConfig ? this.refSpecs : useConfig ? configured : ["HEAD"];
+    const given = !fromConfig ? explicitSpecs : useConfig ? configured : ["HEAD"];
     // add_merge_config: fetching the current branch's upstream remote also takes the
     // branch's `branch.<name>.merge` refs, for FETCH_HEAD
     const mergeRefs = useConfig && upstream && upstreamHere ? upstream.merge : [];
     const refspecs = [...given, ...mergeRefs];
     const history = this._workingCopy.history;
+    // get_ref_map: refs named on the command line also update the remote-tracking refs the
+    // refmap (or the remote's configured refspecs) maps them to
+    const opportunistic = fromConfig
+      ? []
+      : (this.refmap ?? configured).filter((spec) => spec !== "");
+    // do_fetch: refs/remotes/<name>/HEAD follows the remote HEAD on a configured fetch
+    const followHead = fromConfig && configured.length > 0 ? this.followRemoteHead(store) : null;
+    const messages: string[] = [];
+    const errors: string[] = [];
+    const trackingUpdates: TrackingRefUpdate[] = [];
 
     // git truncates FETCH_HEAD when the fetch starts: a failed fetch leaves it empty
     const checkout = this._workingCopy.checkout;
@@ -432,6 +508,20 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       repository: createRepositoryFacade({ history }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
+      opportunisticRefspecs: opportunistic.length > 0 ? opportunistic : undefined,
+      // fetch.c do_fetch: stale refs are pruned before anything is fetched; with
+      // command-line refspecs by those, else by the configured ones
+      beforeFetch: prune
+        ? async (remoteRefs) => {
+            const names = new Set(remoteRefs.filter((r) => r.oid).map((r) => r.name));
+            const pruneSpecs = (fromConfig ? configured : explicitSpecs).map((s) =>
+              parseRefSpec(s),
+            );
+            trackingUpdates.push(
+              ...(await this.pruneDeletedRefs(names, pruneSpecs, messages, errors)),
+            );
+          }
+        : undefined,
       missingRefsOk: useConfig,
       tags: toTagMode(this.effectiveTagOption()),
       depth: this.depth,
@@ -448,7 +538,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     for (const ref of result.remoteRefs) {
       if (ref.oid) advertisedRefs.set(ref.name, ref.oid);
     }
-    const trackingUpdates = result.refUpdates.map(toTrackingRefUpdate);
+    trackingUpdates.push(...result.refUpdates.map(toTrackingRefUpdate));
 
     if (writesFetchHead && checkout?.writeFetchHead) {
       const entries = await this.fetchHeadEntries(result, {
@@ -464,12 +554,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       await checkout.writeFetchHead(formatFetchHead(entries, remoteUrl), { append: true });
     }
 
-    // Handle prune
-    if (!this.dryRun && this.removeDeletedRefs) {
-      const parsed = refspecs.map((s) => parseRefSpec(s));
-      trackingUpdates.push(
-        ...(await this.pruneDeletedRefs(new Set(advertisedRefs.keys()), parsed)),
-      );
+    if (followHead) {
+      // git: "way too many cases where this can go wrong ... fail silently"
+      try {
+        await this.setRemoteHead(result.remoteRefs, followHead, store, messages);
+      } catch {
+        // the refs are updated; refs/remotes/<name>/HEAD is left as it was
+      }
     }
 
     return {
@@ -479,22 +570,88 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       defaultBranch: result.defaultBranch,
       bytesReceived: result.packBytes,
       isEmpty: result.isEmpty,
-      messages: [],
+      messages,
+      ...(errors.length > 0 ? { errors } : {}),
     };
   }
 
   /**
-   * The refspecs this fetch runs with.
-   *
-   * Explicit refspecs win; otherwise a configured remote contributes its
-   * `remote.<name>.fetch` lines, which is what makes `fetch().setRemote("origin")`
-   * update tracking refs without being told how. A remote given as a bare URL
-   * has no config and so still needs its refspecs spelled out.
+   * How `refs/remotes/<name>/HEAD` follows the remote HEAD (git 2.48+): the remote's
+   * `remote.<name>.followRemoteHEAD`, else `fetch.followRemoteHEAD`, else `create`; an
+   * unrecognized value is ignored, as git warns and ignores it. Null for `never`.
    */
-  private effectiveRefSpecs(): string[] {
-    if (this.refSpecs.length > 0) return this.refSpecs;
-    const store = RemoteConfigStore.from(this.workingCopy);
-    return store.isConfigured(this.remote) ? store.configuredFetchRefspecs(this.remote) : [];
+  private followRemoteHead(store: RemoteConfigStore): FollowRemoteHead | null {
+    const mode = parseFollowRemoteHead(
+      store.value(`remote.${this.remote}.followRemoteHEAD`),
+      true,
+    ) ??
+      parseFollowRemoteHead(store.value("fetch.followRemoteHEAD"), false) ?? {
+        mode: "create",
+      };
+    return mode.mode === "never" ? null : mode;
+  }
+
+  /**
+   * git's set_head (fetch.c): the one branch the remote HEAD names (its symref, or else the
+   * only branch at its commit) becomes `refs/remotes/<name>/HEAD`, if that tracking ref
+   * exists here: created when missing (`create`, `warn`), or always set (`always`). In a
+   * bare repository mirroring the remote (`remote.<name>.mirror`), HEAD itself is set to
+   * the branch. `warn` reports a local HEAD that differs, in git's words, into `messages`.
+   * As in git, failures are silent and a dry run is no exception.
+   */
+  private async setRemoteHead(
+    remoteRefs: readonly { name: string; oid?: string; symref?: string }[],
+    follow: FollowRemoteHead,
+    store: RemoteConfigStore,
+    messages: string[],
+  ): Promise<void> {
+    const head = remoteRefs.find((r) => r.name === "HEAD");
+    if (!head) return;
+    const branches = remoteRefs.filter((r) => r.oid && r.name.startsWith("refs/heads/"));
+    const heads = head.symref
+      ? branches.filter((r) => r.name === head.symref)
+      : branches.filter((r) => r.oid === head.oid);
+    if (heads.length !== 1) return;
+    const headName = heads[0].name.slice("refs/heads/".length);
+    const remote = this.remote;
+    const baremirror =
+      configBool(store.value("core.bare")) === true &&
+      configBool(store.value(`remote.${remote}.mirror`)) === true;
+    const createOnly = follow.mode === "always" ? false : !baremirror;
+    const name = baremirror ? "HEAD" : `refs/remotes/${remote}/HEAD`;
+    const target = baremirror ? `refs/heads/${headName}` : `refs/remotes/${remote}/${headName}`;
+    if (!baremirror && !(await this.refsStore.resolve(target))?.objectId) return;
+    const previous = await this.refsStore.get(name);
+    if (!createOnly || !previous) await this.refsStore.setSymbolic(name, target);
+    if (follow.mode !== "warn" || follow.noWarnBranch === headName || !previous) return;
+    // warn_set_head
+    const prefix = `refs/remotes/${remote}/`;
+    let warning: string | undefined;
+    if (isSymbolicRef(previous)) {
+      const was = previous.target.startsWith(prefix) ? previous.target.slice(prefix.length) : "";
+      if (was && was !== headName) {
+        warning = `'HEAD' at '${remote}' is '${headName}', but we have '${was}' locally.`;
+      }
+    } else {
+      warning = `'HEAD' at '${remote}' is '${headName}', but we have a detached HEAD pointing to '${previous.objectId}' locally.`;
+    }
+    if (!warning) return;
+    messages.push(warning);
+    // set_head_advice_msg, unless advice.fetchRemoteHEADWarn is false
+    if (configBool(store.value("advice.fetchRemoteHEADWarn")) === false) return;
+    const advice = [
+      `Run 'git remote set-head ${remote} ${headName}' to follow the change, or modify`,
+      `either of the 'remote.${remote}.followRemoteHEAD' or 'fetch.followRemoteHEAD'`,
+      "configuration variables to handle the situation differently.",
+      "",
+      "Using this specific setting",
+      "",
+      `    git config set remote.${remote}.followRemoteHEAD warn-if-not-${headName}`,
+      "",
+      "will suppress the warning until the remote changes HEAD to something else.",
+      'Disable this message with "git config set advice.fetchRemoteHEADWarn false"',
+    ];
+    messages.push(...advice.map((line) => (line ? `hint: ${line}` : "hint:")));
   }
 
   /** The tag option given, else the remote's `remote.<name>.tagOpt`, else auto-follow. */
@@ -615,47 +772,85 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Prune local refs that a refspec maps from a remote ref that no longer exists (git's
-   * `--prune`): for each refspec with a destination, the local refs matching the
-   * destination whose source is not among the remote refs are deleted, unless a negative
-   * refspec excludes that source (git's query_matches_negative_refspec).
+   * The stale remote-tracking refs (git's get_stale_heads): every local ref that the
+   * refspecs map from remote refs (all of the matching refspecs: overlapping ones count
+   * together), none of which the remote has, unless a negative refspec excludes it or it is
+   * a symbolic ref. They are deleted (reflogs too) in one batch, logged `fetch: prune`, and
+   * reported as deleted; a dry run reports them only. The symbolic refs left dangling are
+   * named in `messages` as git does. A refused delete does not stop the fetch: as in git
+   * (which then exits 1), the error goes into `errors` and nothing is reported deleted.
    */
   private async pruneDeletedRefs(
     remoteRefNames: Set<string>,
     specs: RefSpec[],
+    messages: string[],
+    errors: string[],
   ): Promise<TrackingRefUpdate[]> {
-    const updates: TrackingRefUpdate[] = [];
-    const done = new Set<string>();
     const negative = specs.filter((s) => s.negative && s.source);
-    for (const spec of specs) {
-      if (spec.negative || !spec.source || !spec.destination) continue;
-      const prefix = spec.wildcard
-        ? spec.destination.slice(0, spec.destination.indexOf("*"))
-        : spec.destination;
-      for await (const ref of this.refsStore.list(prefix)) {
-        if (isSymbolicRef(ref) || done.has(ref.name)) continue;
-        let source: string | null;
+    const mapping = specs.filter((s) => !s.negative && s.source && s.destination);
+    const stale: { name: string; objectId: ObjectId; source: string }[] = [];
+    for await (const ref of this.refsStore.list("refs/")) {
+      const sources: string[] = [];
+      for (const spec of mapping) {
         if (spec.wildcard) {
           if (!matchDestination(spec, ref.name)) continue;
-          source = expandFromDestination(spec, ref.name).source;
-        } else {
-          if (ref.name !== spec.destination) continue;
-          source = spec.source;
+          const source = expandFromDestination(spec, ref.name).source;
+          if (source) sources.push(source);
+        } else if (ref.name === spec.destination && spec.source) {
+          sources.push(spec.source);
         }
-        if (!source || remoteRefNames.has(source)) continue;
-        if (negative.some((n) => matchSource(n, source))) continue;
-        done.add(ref.name);
-        await this.refsStore.delete(ref.name);
-        updates.push({
-          localRef: ref.name,
-          remoteRef: source,
-          oldObjectId: ref.objectId,
-          newObjectId: "", // Empty indicates deletion
-          status: RefUpdateStatus.DELETED,
-        });
+      }
+      if (sources.length === 0 || isSymbolicRef(ref) || !ref.objectId) continue;
+      if (sources.some((src) => negative.some((n) => matchSource(n, src)))) continue;
+      if (sources.some((src) => remoteRefNames.has(src))) continue;
+      stale.push({ name: ref.name, objectId: ref.objectId, source: sources[0] });
+    }
+    if (stale.length === 0) return [];
+    // refs_warn_dangling_symrefs: listed before the deletion, as the targets go
+    const dangling = await this.danglingSymrefs(new Set(stale.map((r) => r.name)));
+    if (!this.dryRun) {
+      try {
+        await deleteRefs(
+          this.refsStore,
+          stale.map((r) => r.name),
+          "fetch: prune",
+        );
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+        return [];
       }
     }
-    return updates;
+    for (const { name, target } of dangling) {
+      messages.push(
+        this.dryRun
+          ? `   ${name} will become dangling after ${target} is deleted`
+          : `   ${name} has become dangling after ${target} was deleted`,
+      );
+    }
+    return stale.map((ref) => ({
+      localRef: ref.name,
+      remoteRef: ref.source,
+      oldObjectId: ref.objectId,
+      newObjectId: "", // Empty indicates deletion
+      status: RefUpdateStatus.DELETED,
+      summary: "[deleted]",
+    }));
+  }
+
+  /** The symbolic refs whose chain ends at one of `names` (git's warn_if_dangling_symref). */
+  private async danglingSymrefs(names: Set<string>): Promise<{ name: string; target: string }[]> {
+    const found: { name: string; target: string }[] = [];
+    for await (const ref of this.refsStore.list("refs/")) {
+      if (!isSymbolicRef(ref)) continue;
+      let target = ref.target;
+      for (let i = 0; i < 5; i++) {
+        const next = await this.refsStore.get(target);
+        if (!next || !isSymbolicRef(next)) break;
+        target = next.target;
+      }
+      if (names.has(target)) found.push({ name: ref.name, target });
+    }
+    return found.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 }
 
@@ -694,6 +889,42 @@ export function toTrackingRefUpdate(update: FetchRefUpdate): TrackingRefUpdate {
     summary: update.summary,
     reason: update.reason,
   };
+}
+
+/** git's TAG_REFSPEC, which `--prune-tags` adds. */
+const TAG_REFSPEC = "refs/tags/*:refs/tags/*";
+
+/** How `refs/remotes/<name>/HEAD` follows the remote HEAD (`remote.<name>.followRemoteHEAD`). */
+interface FollowRemoteHead {
+  mode: "never" | "create" | "warn" | "always";
+  /** `warn-if-not-<branch>`: no warning while the remote HEAD is this branch */
+  noWarnBranch?: string;
+}
+
+/**
+ * A `followRemoteHEAD` value; undefined when unset or unrecognized. `warn-if-not-<branch>`
+ * is read from `remote.<name>.followRemoteHEAD` only, as git's remote.c does.
+ */
+function parseFollowRemoteHead(
+  value: string | undefined,
+  perRemote: boolean,
+): FollowRemoteHead | undefined {
+  if (value === "never" || value === "create" || value === "warn" || value === "always") {
+    return { mode: value };
+  }
+  if (perRemote && value?.startsWith("warn-if-not-")) {
+    return { mode: "warn", noWarnBranch: value.slice("warn-if-not-".length) };
+  }
+  return undefined;
+}
+
+/** A git boolean config value; undefined when unset or not a boolean. */
+function configBool(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  const v = value.trim().toLowerCase();
+  if (v === "true" || v === "yes" || v === "on" || v === "1") return true;
+  if (v === "false" || v === "no" || v === "off" || v === "0" || v === "") return false;
+  return undefined;
 }
 
 /** git's refname_match: `ref` (`main`, `heads/main`, `refs/heads/main`) names `fullName`. */
