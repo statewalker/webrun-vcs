@@ -219,6 +219,8 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
 
   The paths are listed in `result.rejoined` and a `rejoined` event. A nested repository's removal is therefore never pushed as the deletion of its files.
 
+  Un-ignoring a path commits whatever the folder holds there. A local file that was ignored for a reason (a `.env` with secrets, say) is merged with the branch's version and pushed, conflict markers and all. Move such files away before removing them from `ignore`.
+
 ### Why a failure leaves nothing half-done
 
 The branch always names the commit the folder holds. Before a checkout, the target commit is recorded (`refs/workspace/pending/main`). Then the folder is checked out, the branch moves (by compare-and-swap), and the record goes.
