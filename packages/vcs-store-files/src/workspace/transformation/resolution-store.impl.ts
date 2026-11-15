@@ -10,7 +10,7 @@
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 import { sha1 } from "@statewalker/vcs-utils";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
-import { joinPath, tryReadFile } from "@statewalker/vcs-utils/files";
+import { dirname, joinPath, tryReadFile } from "@statewalker/vcs-utils/files";
 import type { IndexEntry, Staging } from "@statewalker/vcs-working-tree";
 import { MergeStage } from "@statewalker/vcs-working-tree";
 import type {
@@ -42,7 +42,7 @@ export class GitResolutionStore implements ResolutionStore {
   ) {
     this.rerereDir = joinPath(gitDir, "rr-cache");
     // Worktree is typically the parent of .git directory
-    this.worktreePath = worktreePath ?? joinPath(gitDir, "..");
+    this.worktreePath = worktreePath ?? dirname(gitDir);
   }
 
   // ========== Conflict Registry ==========

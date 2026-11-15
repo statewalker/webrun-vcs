@@ -19,10 +19,10 @@ catalog:
   # Peers of vite-plugin-pwa 2, declared by the demo that uses it.
   "workbox-build": "^7.4.1"
   "workbox-window": "^7.4.1"
-  "@statewalker/webrun-storage": "^0.2.0"
-  "@statewalker/webrun-content-store": "^0.2.0"
-  "@statewalker/webrun-content-transfer": "^0.2.0"
-  "@statewalker/webrun-files-sync": "^0.2.0"
+  "@statewalker/webrun-storage": "^0.3.0"
+  "@statewalker/webrun-content-store": "^0.3.0"
+  "@statewalker/webrun-content-transfer": "^0.3.0"
+  "@statewalker/webrun-files-sync": "^0.3.0"
   "@statewalker/webrun-http-streams": "^0.6.0"
   "@statewalker/httpeers-access": "^0.1.5"
   "@statewalker/httpeers-core": "^0.1.4"
@@ -33,10 +33,10 @@ catalog:
   "@statewalker/webrun-msgpack": "^0.11.0"
   "@biomejs/biome": ^2.5.15
   "@observablehq/framework": ^1.13.4
-  "@statewalker/webrun-files": "^0.11.0"
-  "@statewalker/webrun-files-browser": "^0.11.0"
-  "@statewalker/webrun-files-mem": "^0.11.0"
-  "@statewalker/webrun-files-node": "^0.11.0"
+  "@statewalker/webrun-files": "^0.12.0"
+  "@statewalker/webrun-files-browser": "^0.12.0"
+  "@statewalker/webrun-files-mem": "^0.12.0"
+  "@statewalker/webrun-files-node": "^0.12.0"
   "@types/node": ^26.6.4
   "@types/sql.js": ^1.4.11
   "@vitest/browser": ^5.1.0
