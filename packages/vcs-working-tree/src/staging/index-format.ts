@@ -213,7 +213,9 @@ function parseEntry(
   const mode = view.getUint32(offset);
   offset += 4;
 
-  // UID and GID (skip - not used)
+  // UID and GID (kept, so a rewrite does not make git see every entry as changed)
+  const uid = view.getUint32(offset);
+  const gid = view.getUint32(offset + 4);
   offset += 8;
 
   // Size
@@ -311,6 +313,10 @@ function parseEntry(
     ctime,
     dev,
     ino,
+    mtimeNs: mtimeNanos,
+    ctimeNs: ctimeNanos,
+    uid,
+    gid,
     assumeValid,
     intentToAdd,
     skipWorktree,
@@ -518,6 +524,25 @@ function serializeEntryV4(
 }
 
 /**
+ * The seconds and nanoseconds to record for a time of `ms` milliseconds whose exact
+ * nanoseconds within the second may be known (`ns`). A time in milliseconds is a double that
+ * cannot hold nanoseconds at today's dates (about 244 ns of resolution), so `ms` can round
+ * across a millisecond, or even a second (.999999931 reads as the next second). The exact
+ * nanoseconds win whenever they are within a few milliseconds of `ms`, and the seconds are
+ * taken from them; otherwise `ms` alone decides.
+ */
+function timeParts(ms: number, ns: number | undefined): [seconds: number, nanos: number] {
+  const approx = (((ms % 1000) + 1000) % 1000) * 1e6;
+  if (ns !== undefined && Number.isInteger(ns) && ns >= 0 && ns < 1e9) {
+    const distance = Math.abs(approx - ns);
+    if (Math.min(distance, 1e9 - distance) < 2e6) {
+      return [Math.round((ms - ns / 1e6) / 1000), ns];
+    }
+  }
+  return [Math.floor(ms / 1000), Math.min(999_999_999, Math.max(0, Math.floor(approx)))];
+}
+
+/**
  * Write entry header (62 or 64 bytes).
  */
 function writeEntryHeader(
@@ -526,14 +551,15 @@ function writeEntryHeader(
   pathLength: number,
   hasExtended: boolean,
 ): void {
-  // ctime
+  // ctime, mtime: seconds and nanoseconds (the exact nanoseconds when known, see timeParts)
   const ctime = entry.ctime ?? entry.mtime;
-  view.setUint32(P_CTIME, Math.floor(ctime / 1000));
-  view.setUint32(P_CTIME + 4, (ctime % 1000) * 1_000_000);
-
-  // mtime
-  view.setUint32(P_MTIME, Math.floor(entry.mtime / 1000));
-  view.setUint32(P_MTIME + 4, (entry.mtime % 1000) * 1_000_000);
+  const ctimeNs = entry.ctime === undefined ? entry.mtimeNs : entry.ctimeNs;
+  const [ctimeSec, ctimeNanos] = timeParts(ctime, ctimeNs);
+  const [mtimeSec, mtimeNanos] = timeParts(entry.mtime, entry.mtimeNs);
+  view.setUint32(P_CTIME, ctimeSec);
+  view.setUint32(P_CTIME + 4, ctimeNanos);
+  view.setUint32(P_MTIME, mtimeSec);
+  view.setUint32(P_MTIME + 4, mtimeNanos);
 
   // dev, ino
   view.setUint32(P_DEV, entry.dev ?? 0);
@@ -542,9 +568,9 @@ function writeEntryHeader(
   // mode
   view.setUint32(P_MODE, entry.mode);
 
-  // uid, gid (zeros)
-  view.setUint32(P_UID, 0);
-  view.setUint32(P_GID, 0);
+  // uid, gid
+  view.setUint32(P_UID, (entry.uid ?? 0) >>> 0);
+  view.setUint32(P_GID, (entry.gid ?? 0) >>> 0);
 
   // size
   view.setUint32(P_SIZE, entry.size);

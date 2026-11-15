@@ -20,6 +20,15 @@ export interface WorktreeEntry {
   mtime: number;
   /** Status change time (milliseconds since epoch), where the worktree knows it */
   ctime?: number;
+  /** Nanoseconds of `mtime` within its second, where the worktree knows them */
+  mtimeNs?: number;
+  /** Nanoseconds of `ctime` within its second */
+  ctimeNs?: number;
+  /** Device, inode, owner and group, where the worktree knows them (git's stat data) */
+  dev?: number;
+  ino?: number;
+  uid?: number;
+  gid?: number;
   /** Whether this is a directory */
   isDirectory: boolean;
   /** Whether file is ignored by .gitignore */

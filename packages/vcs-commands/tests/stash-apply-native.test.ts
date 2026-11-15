@@ -1068,3 +1068,95 @@ describe("findInTheWay never lets a file replace a tracked directory", () => {
     ).toEqual({ untracked: [], lostDirs: [] });
   });
 });
+
+describeGit("stash apply follow-ups: gitlinks moved aside, kept edits, wording", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-followups-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** The stash adds d/x; the index then has a gitlink at d (a nested repository, or none). */
+  function gitlinkSetup(dir: string, nested: boolean) {
+    repo(dir);
+    put(dir, "d/x", "x\n");
+    run(dir, "add", "d/x");
+    run(dir, "stash", "-q");
+    const sub = join(root, "sub");
+    if (!existsSync(sub)) {
+      mkdirSync(sub);
+      run(sub, "init", "-q", "-b", "main");
+      put(sub, "s", "s\n");
+      run(sub, "add", "s");
+      run(sub, "commit", "-qm", "sub");
+    }
+    const commit = run(sub, "rev-parse", "HEAD");
+    if (nested) cpSync(sub, join(dir, "d"), { recursive: true });
+    run(dir, "update-index", "--add", "--cacheinfo", `160000,${commit},d`);
+  }
+
+  it("a gitlink at a moved-aside path: stage 2 kept, its non-empty directory stays", async () => {
+    const dir = join(root, "r");
+    gitlinkSetup(dir, true);
+    const { actual } = await expectTreeAsNative(dir, ["d/x", "d/s", "d~Updated upstream"]);
+    expect(actual.status).toBe("conflicts");
+    expect(read(join(dir, "d/s"))).toBe("s\n");
+    expect(existsSync(join(dir, "d/.git"))).toBe(true);
+  });
+
+  it("a gitlink at a moved-aside path without a directory: an empty one for it", async () => {
+    const dir = join(root, "r");
+    gitlinkSetup(dir, false);
+    await expectTreeAsNative(dir, ["d/x", "d~Updated upstream"]);
+  });
+
+  it("rename/rename with an unstaged edit at our side's path: applied, the edit kept", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    run(dir, "mv", "a.txt", "d.txt");
+    run(dir, "stash", "-q");
+    run(dir, "mv", "a.txt", "c.txt");
+    run(dir, "commit", "-qm", "mv");
+    put(dir, "c.txt", "UNSTAGED EDIT\n");
+    const { actual } = await expectTreeAsNative(dir, ["a.txt", "c.txt", "d.txt"]);
+    expect(actual.status).toBe("conflicts");
+    expect(read(join(dir, "c.txt"))).toBe("UNSTAGED EDIT\n");
+  });
+
+  it("rename/delete with an unstaged edit at our side's path: applied, the edit kept", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    run(dir, "rm", "-q", "a.txt");
+    run(dir, "stash", "-q");
+    run(dir, "mv", "a.txt", "c.txt");
+    put(dir, "c.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n");
+    run(dir, "commit", "-qam", "mv");
+    put(dir, "c.txt", "UNSTAGED EDIT\n");
+    await expectTreeAsNative(dir, ["a.txt", "c.txt"]);
+    expect(read(join(dir, "c.txt"))).toBe("UNSTAGED EDIT\n");
+  });
+
+  it("a staged file where a stashed untracked file goes: git's message, not 'untracked'", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "u.txt", "stashed untracked\n");
+    run(dir, "stash", "-q", "-u");
+    put(dir, "u.txt", "staged\n");
+    run(dir, "add", "u.txt");
+    const { expected, actual } = await bothApply(dir);
+    expect(expected.ok).toBe(false);
+    expect(actual.ok).toBe(false);
+    expect(actual.message).toBe(expected.message);
+    expect(read(join(dir, "u.txt"))).toBe("staged\n");
+  });
+
+  it("an untracked file where a stashed untracked file goes: the same message", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "u.txt", "stashed untracked\n");
+    run(dir, "stash", "-q", "-u");
+    put(dir, "u.txt", "local\n");
+    const { expected, actual } = await bothApply(dir);
+    expect(actual.message).toBe(expected.message);
+    expect(read(join(dir, "u.txt"))).toBe("local\n");
+  });
+});

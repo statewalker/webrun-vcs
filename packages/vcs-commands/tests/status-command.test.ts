@@ -6,9 +6,24 @@
  * Tests run against all storage backends (Memory, SQL).
  */
 
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { addFile, backends, createInitializedGitFromFactory, removeFile } from "./test-helper.js";
+import {
+  backends,
+  createInitializedGitFromFactory,
+  removeFile,
+  addFile as stageOnly,
+} from "./test-helper.js";
+
+/** Stages a file as `git add` leaves it: in the index and in the worktree. */
+async function addFile(wc: WorkingCopy, path: string, content: string) {
+  const id = await stageOnly(wc, path, content);
+  await wc.worktree?.writeContent(path, new TextEncoder().encode(content), {
+    createParents: true,
+  });
+  return id;
+}
 
 describe.each(backends)("StatusCommand ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;

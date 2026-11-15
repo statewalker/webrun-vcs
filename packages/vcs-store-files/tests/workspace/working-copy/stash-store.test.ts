@@ -505,7 +505,7 @@ describe("GitStashStore", () => {
       expect(untrackedCommit.message).toContain("untracked files");
     });
 
-    it("should create stash with 2 parents when includeUntracked is true but no untracked files", async () => {
+    it("should create stash with an empty-tree 3rd parent when includeUntracked is true but no untracked files (as git)", async () => {
       // All worktree files are tracked
       const worktreeAllTracked = createMockWorktree(
         [createWorktreeEntry("file.txt")],
@@ -530,8 +530,11 @@ describe("GitStashStore", () => {
 
       const commit = await repository.commits.loadCommit(stashId);
 
-      // Should only have 2 parents since no untracked files exist
-      expect(commit.parents).toHaveLength(2);
+      // as git stash -u: the untracked commit is written anyway, with the empty tree
+      expect(commit.parents).toHaveLength(3);
+      const untracked = await repository.commits.loadCommit(commit.parents[2]);
+      expect(untracked.message).toMatch(/^untracked files on main: /);
+      expect(untracked.parents).toEqual([]);
     });
 
     it("should support string message as shorthand for options", async () => {

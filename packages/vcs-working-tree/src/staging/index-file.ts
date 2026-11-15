@@ -207,6 +207,25 @@ export class IndexFile {
     private readonly options: { lockTimeoutMs?: number } = {},
   ) {}
 
+  /** The checksum of the index this instance last read or wrote (`null`: none; `undefined`: never read). */
+  get currentChecksum(): string | null | undefined {
+    return this.checksum;
+  }
+
+  /** A fresh instance over the same file (same options), for a read-modify-write of its own. */
+  fresh(): IndexFile {
+    return new IndexFile(this.files, this.path, this.options);
+  }
+
+  /** Takes over what `other` (over the same file) last read or wrote. */
+  adopt(other: IndexFile): void {
+    this.checksum = other.checksum;
+    this.version = other.version;
+    this.extensions = other.extensions;
+    this.entriesDigest = other.entriesDigest;
+    this.refused = other.refused;
+  }
+
   /**
    * The entries and modification time, or nothing when there is no index file.
    *
@@ -237,7 +256,8 @@ export class IndexFile {
     this.extensions = parsed.extensionData;
     this.entriesDigest =
       this.extensions.length > 0 ? indexEntriesDigest(parsed.entries) : undefined;
-    return { entries: parsed.entries, lastModified: stats.lastModified ?? Date.now() };
+    // the index file's own mtime; unknown is 0 (every entry racy), never "now"
+    return { entries: parsed.entries, lastModified: stats.lastModified ?? 0 };
   }
 
   /**

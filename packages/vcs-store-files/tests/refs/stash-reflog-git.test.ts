@@ -59,11 +59,23 @@ async function stashOf(dir: string, head: string, tree: string, files?: FilesApi
     files: files ?? createNodeFilesApi({ rootDir: dir }),
     gitDir: ".git",
   });
+  // the index holds `tree` (f.txt) and the worktree file holds what the index has
+  const blob = git(dir, ["rev-parse", `${tree}:f.txt`]);
+  const stat = { size: 4, mtime: 1 };
   return new GitStashStore({
     history,
-    staging: { writeTree: async () => tree, entries: async function* () {} } as unknown as Staging,
+    staging: {
+      writeTree: async () => tree,
+      entries: async function* () {
+        yield { path: "f.txt", mode: 0o100644, objectId: blob, stage: 0, ...stat };
+      },
+    } as unknown as Staging,
     worktree: {
-      getEntry: async () => undefined,
+      getEntry: async (path: string) =>
+        path === "f.txt"
+          ? { path, name: path, mode: 0o100644, isDirectory: false, isIgnored: false, ...stat }
+          : undefined,
+      computeHash: async () => blob,
       walk: async function* () {},
     } as unknown as Worktree,
     getHead: async () => head,

@@ -92,6 +92,8 @@ export async function addFileToStaging(
     }),
   });
   await editor.finish();
+  // as `git add` leaves it: the worktree holds the staged content (status compares them)
+  await workingCopy.worktree?.writeContent(path, data, { createParents: true });
 
   return objectId;
 }

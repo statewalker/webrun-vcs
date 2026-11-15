@@ -3,6 +3,45 @@ import type { MergeStageValue, StagingEdit, StagingEntry } from "./types.js";
 import { MergeStage } from "./types.js";
 
 /**
+ * The stat an index entry records for a file (git's stat data): size, times with their exact
+ * nanoseconds, device, inode and owner, as far as the worktree reports them.
+ */
+export interface EntryStat {
+  size: number;
+  mtime: number;
+  ctime?: number;
+  mtimeNs?: number;
+  ctimeNs?: number;
+  dev?: number;
+  ino?: number;
+  uid?: number;
+  gid?: number;
+}
+
+/** The stat to record for a file the worktree reported, keeping every field it has. */
+export function entryStatOf(file: {
+  size?: number;
+  mtime?: number;
+  ctime?: number;
+  mtimeNs?: number;
+  ctimeNs?: number;
+  dev?: number;
+  ino?: number;
+  uid?: number;
+  gid?: number;
+}): EntryStat {
+  const stat: EntryStat = { size: file.size ?? 0, mtime: file.mtime ?? 0 };
+  if (file.ctime !== undefined) stat.ctime = file.ctime;
+  if (file.mtimeNs !== undefined) stat.mtimeNs = file.mtimeNs;
+  if (file.ctimeNs !== undefined) stat.ctimeNs = file.ctimeNs;
+  if (file.dev !== undefined) stat.dev = file.dev;
+  if (file.ino !== undefined) stat.ino = file.ino;
+  if (file.uid !== undefined) stat.uid = file.uid;
+  if (file.gid !== undefined) stat.gid = file.gid;
+  return stat;
+}
+
+/**
  * Update or create an entry.
  *
  * If entry exists, replaces it with new values.
@@ -13,7 +52,7 @@ export class UpdateStagingEntry implements StagingEdit {
     readonly path: string,
     readonly objectId: ObjectId,
     readonly mode: FileModeValue | number,
-    readonly stats?: { size: number; mtime: number },
+    readonly stats?: EntryStat,
     /** `intentToAdd`: an `add -N` placeholder (git's CE_INTENT_TO_ADD). */
     readonly flags?: { intentToAdd?: boolean },
   ) {}
@@ -24,6 +63,7 @@ export class UpdateStagingEntry implements StagingEdit {
       objectId: this.objectId,
       mode: this.mode,
       stage: MergeStage.MERGED,
+      ...this.stats,
       size: this.stats?.size ?? 0,
       mtime: this.stats?.mtime ?? Date.now(),
       ...(this.flags?.intentToAdd ? { intentToAdd: true } : {}),

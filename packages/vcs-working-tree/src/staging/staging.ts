@@ -8,6 +8,7 @@
  */
 
 import type { ObjectId, Trees } from "@statewalker/vcs-core";
+import type { IndexStatUpdate, RacyCheck } from "./stat-refresh.js";
 import type { MergeStageValue, StagingEntry, StagingEntryOptions } from "./types.js";
 
 // Re-export types for consumers
@@ -167,6 +168,21 @@ export interface Staging {
    * Get last update time (ms since epoch)
    */
   getUpdateTime(): number;
+
+  /**
+   * Stores fresh stats for entries still as compared (compare-and-set), as git's index
+   * refresh: for an index file, written only when the file is unchanged since read, and
+   * without writing other in-memory edits. Returns whether anything was stored. Absent:
+   * callers apply the same compare-and-set through an editor.
+   */
+  refreshStats?(updates: IndexStatUpdate[]): Promise<boolean>;
+
+  /**
+   * Sets the check `write()` applies to racily clean entries (git's smudging: an entry whose
+   * mtime second is not older than the index file and that changed behind a matching stat is
+   * written with size 0). Commands install one that reads the worktree.
+   */
+  setRacyCheck?(check: RacyCheck | undefined): void;
 
   /**
    * Clear all entries

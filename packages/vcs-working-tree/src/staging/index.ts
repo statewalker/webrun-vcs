@@ -13,4 +13,6 @@ export * from "./index-format.js";
 // Staging interface
 export * from "./staging.js";
 export * from "./staging-edits.js";
+// Index refresh: fresh stats, compare-and-set
+export * from "./stat-refresh.js";
 export * from "./types.js";

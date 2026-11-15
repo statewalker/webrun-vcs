@@ -34,7 +34,7 @@
  */
 
 import { FileMode, isValidBranchName, type ObjectId, type Ref } from "@statewalker/vcs-core";
-import { UpdateStagingEntry, type Worktree } from "@statewalker/vcs-working-tree";
+import { entryStatOf, UpdateStagingEntry, type Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   InvalidRefNameError,
@@ -560,9 +560,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           path,
           objectId: t.objectId,
           mode: t.mode,
-          size: stats?.size ?? 0,
-          mtime: stats?.mtime ?? 0,
-          ...(stats?.ctime !== undefined ? { ctime: stats.ctime } : {}),
+          ...entryStatOf(stats ?? {}),
         });
       }
       await editor.finish();

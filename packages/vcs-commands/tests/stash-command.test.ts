@@ -6,9 +6,11 @@
  */
 
 import type { History, ObjectId } from "@statewalker/vcs-core";
+import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ContentMergeStrategy,
+  Git,
   MergeStrategy,
   StashApplyStatus,
   type StashWorkingTreeProvider,
@@ -136,7 +138,15 @@ describe.each(backends)("StashCreateCommand ($name backend)", ({ factory }) => {
     await git.commit().setMessage("initial").call();
 
     // Without a working tree there is nothing to stash: refused, not a stash of HEAD
-    await expect(git.stashCreate().call()).rejects.toThrow(StoreNotAvailableError);
+    // (a working copy with a worktree has the built-in provider)
+    // @ts-expect-error -- deliberately omits the required worktree to build a bare working copy
+    const bare = new MemoryWorkingCopy({
+      history: workingCopy.history,
+      checkout: new MemoryCheckout({ staging: workingCopy.checkout.staging }),
+    });
+    await expect(Git.fromWorkingCopy(bare).stashCreate().call()).rejects.toThrow(
+      StoreNotAvailableError,
+    );
     expect(await git.stashList().call()).toHaveLength(0);
   });
 

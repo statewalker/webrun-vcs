@@ -416,6 +416,24 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     return true;
   }
 
+  /** `rmdir(2)`: an empty directory only, never recursively; false otherwise. */
+  async rmdir(path: string): Promise<boolean> {
+    try {
+      const real = await this.realNoLinks(path);
+      const stat = await lstatOrUndefined(real);
+      if (!stat?.isDirectory()) return false;
+      this.verified?.clear();
+      await fs.rmdir(real);
+      return true;
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOENT" || code === "ENOTDIR") {
+        return false;
+      }
+      return this.forgetOn(error);
+    }
+  }
+
   /** `rename(2)` of the entry itself (a link moves as a link). */
   override async move(source: string, target: string): Promise<boolean> {
     const from = await this.realNoLinks(source);
@@ -515,7 +533,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /** The entry itself; `BeyondSymlinkError` beneath a link, never "absent". */
   async lstat(path: string): Promise<LinkStats | undefined> {
-    const stat = await this.entryStat(await this.realNoLinks(path));
+    const stat = await bigintLstatOrUndefined(await this.realNoLinks(path));
     if (!stat) return undefined;
     const kind = stat.isSymbolicLink()
       ? "symlink"
@@ -524,12 +542,19 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
         : stat.isFile()
           ? "file"
           : "other";
+    const low32 = (value: bigint) => Number(value & 0xffffffffn);
     return {
       kind,
-      size: kind === "directory" ? 0 : stat.size,
-      lastModified: stat.mtimeMs,
-      ctime: stat.ctimeMs,
-      mode: stat.mode & 0o7777,
+      size: kind === "directory" ? 0 : Number(stat.size),
+      lastModified: nsToMs(stat.mtimeNs),
+      ctime: nsToMs(stat.ctimeNs),
+      mode: Number(stat.mode & 0o7777n),
+      mtimeNs: Number(stat.mtimeNs % 1_000_000_000n),
+      ctimeNs: Number(stat.ctimeNs % 1_000_000_000n),
+      dev: low32(stat.dev),
+      ino: low32(stat.ino),
+      uid: low32(stat.uid),
+      gid: low32(stat.gid),
     };
   }
 
@@ -540,6 +565,24 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     } catch {
       return undefined;
     }
+  }
+}
+
+/** Milliseconds of a time in nanoseconds, its whole milliseconds exact (no float drift). */
+function nsToMs(ns: bigint): number {
+  return Number(ns / 1_000_000n) + Number(ns % 1_000_000n) / 1e6;
+}
+
+/** `lstat` with exact times (nanoseconds) and full device/inode numbers. */
+async function bigintLstatOrUndefined(
+  real: string,
+): Promise<import("node:fs").BigIntStats | undefined> {
+  try {
+    return await fs.lstat(real, { bigint: true });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw error;
   }
 }
 

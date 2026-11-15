@@ -186,8 +186,12 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
     it("failed commit preserves staging", async () => {
       const { git, workingCopy } = await createInitializedGit();
 
-      // Stage a file
+      // Stage a file (the worktree holds it too, as after `git add`)
       await addFile(workingCopy, "staged.txt", "staged content");
+      await workingCopy.worktree?.writeContent(
+        "staged.txt",
+        new TextEncoder().encode("staged content"),
+      );
 
       // Attempt commit without message (should fail)
       await expect(git.commit().call()).rejects.toThrow();

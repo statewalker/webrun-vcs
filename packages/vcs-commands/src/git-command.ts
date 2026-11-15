@@ -13,7 +13,14 @@ import type {
   Trees,
 } from "@statewalker/vcs-core";
 import { isSymbolicRef } from "@statewalker/vcs-core";
-import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
+import {
+  basicStatMatches,
+  compareWithWorktree,
+  type Staging,
+  type WorkingCopy,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
+import { worktreeModeTrust } from "./commands/core-config.js";
 
 import { NoHeadError, RefNotFoundError } from "./errors/index.js";
 
@@ -152,6 +159,7 @@ function wrapCommits(commits: Commits): CommandCommits {
 export abstract class GitCommand<T> {
   protected readonly _workingCopy: WorkingCopy;
   private callable = true;
+  private racyCheckInstalled = false;
 
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
@@ -217,6 +225,39 @@ export abstract class GitCommand<T> {
    * Supports both new architecture (checkout.staging) and legacy/init (staging directly).
    */
   protected get staging(): Staging {
+    const staging = this.resolveStaging();
+    if (!this.racyCheckInstalled) {
+      this.racyCheckInstalled = true;
+      this.installRacyCheck(staging);
+    }
+    return staging;
+  }
+
+  /**
+   * Gives the staging git's racy-git smudging for its writes: an entry whose mtime second is
+   * not older than the index file and whose content changed behind a matching stat is
+   * written with size 0 (`ce_smudge_racily_clean_entry`), so a later same-size edit in that
+   * second is never taken as clean.
+   */
+  private installRacyCheck(staging: Staging): void {
+    const worktree = this._workingCopy.worktree;
+    if (!worktree || typeof staging.setRacyCheck !== "function") return;
+    const trust = worktreeModeTrust(this._workingCopy, worktree);
+    staging.setRacyCheck(async (entry, indexTime) => {
+      try {
+        // git returns early when the basic stat already differs: changed, nothing to smudge
+        const current = await worktree.getEntry(entry.path);
+        if (!current || current.isDirectory || !basicStatMatches(entry, current, trust)) {
+          return false;
+        }
+        return (await compareWithWorktree(worktree, entry, { trust, indexTime })).smudge === true;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private resolveStaging(): Staging {
     // Try new architecture first (checkout.staging)
     if (this._workingCopy.checkout?.staging) {
       return this._workingCopy.checkout.staging as unknown as Staging;

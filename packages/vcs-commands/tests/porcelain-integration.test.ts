@@ -232,6 +232,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
 
       // Add file → status shows added
       await addFile(workingCopy, "tracked.txt", "initial");
+      await workingCopy.worktree?.writeContent("tracked.txt", new TextEncoder().encode("initial"));
       status = await git.status().call();
       expect(status.added.has("tracked.txt")).toBe(true);
 
@@ -243,6 +244,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
 
       // Modify → status shows changed
       await addFile(workingCopy, "tracked.txt", "modified");
+      await workingCopy.worktree?.writeContent("tracked.txt", new TextEncoder().encode("modified"));
       status = await git.status().call();
       expect(status.changed.has("tracked.txt")).toBe(true);
 
@@ -258,12 +260,18 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
 
       // Add files
       await addFile(workingCopy, "keep.txt", "keep this");
+      await workingCopy.worktree?.writeContent("keep.txt", new TextEncoder().encode("keep this"));
       await addFile(workingCopy, "remove-me.txt", "will be removed");
+      await workingCopy.worktree?.writeContent(
+        "remove-me.txt",
+        new TextEncoder().encode("will be removed"),
+      );
       await workingCopy.checkout.staging.write();
       await git.commit().setMessage("Add files").call();
 
       // Remove one file
       await removeFile(workingCopy, "remove-me.txt");
+      await workingCopy.worktree?.remove("remove-me.txt");
       const status = await git.status().call();
       expect(status.removed.has("remove-me.txt")).toBe(true);
 

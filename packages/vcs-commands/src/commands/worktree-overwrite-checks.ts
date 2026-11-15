@@ -126,15 +126,32 @@ export async function findInTheWay(
   return { untracked: [...untracked], lostDirs };
 }
 
-/** Removes the directories a removal left empty, up to the worktree root (as git). */
+/**
+ * Removes the directory at `dir` if it holds nothing at all, as git's `rmdir`: never a
+ * directory with a file, link, subdirectory, nested repository (`.git`) or FIFO in it, and
+ * never recursively. Returns whether it was removed.
+ */
+export async function removeDirectoryIfEmpty(worktree: Worktree, dir: string): Promise<boolean> {
+  if (worktree.removeEmptyDirectory) return worktree.removeEmptyDirectory(dir);
+  // a worktree without the operation: the walk shows directories (nested repositories too)
+  const entry = await worktree.getEntry(dir);
+  if (!entry?.isDirectory) return false;
+  const inside = worktree.walk({ pathPrefix: dir, includeIgnored: true, includeDirectories: true });
+  for await (const _ of inside) return false;
+  if (await worktree.exists(`${dir}/.git`)) return false;
+  // never recursive: a worktree that cannot remove a directory that way keeps it
+  return worktree.remove(dir);
+}
+
+/**
+ * Removes the directories a removal left empty, bottom-up to the worktree root, as git's
+ * `schedule_dir_for_removal`: each only if it is truly empty, stopping at the first that is
+ * not (a nested repository, an ignored or untracked file, a FIFO keeps its directory).
+ */
 export async function pruneEmptyParents(worktree: Worktree, path: string): Promise<void> {
   const parts = path.split("/");
   for (let k = parts.length - 1; k > 0; k--) {
-    const dir = parts.slice(0, k).join("/");
-    const entry = await worktree.getEntry(dir);
-    if (!entry?.isDirectory) return;
-    for await (const _ of worktree.walk({ pathPrefix: dir, includeIgnored: true })) return;
-    await worktree.remove(dir, { recursive: true });
+    if (!(await removeDirectoryIfEmpty(worktree, parts.slice(0, k).join("/")))) return;
   }
 }
 

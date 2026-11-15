@@ -60,6 +60,11 @@ export interface TreeRestoreOptions {
   windows?: boolean;
   /** Top-level names the worktree's storage reserves (`capabilities.reservedNames`) */
   reservedNames?: string[];
+  /**
+   * Only these paths will be written: the blobs of the others are not checked (every path
+   * is still validated). Absent: every blob is checked.
+   */
+  writing?: Set<string>;
 }
 
 /**
@@ -177,7 +182,7 @@ async function planInto(
       );
     }
 
-    if (!(await blobs.has(entry.id))) {
+    if ((!options.writing || options.writing.has(path)) && !(await blobs.has(entry.id))) {
       throw new Error(`${operation} cannot restore ${path}: blob ${entry.id} is missing`);
     }
 

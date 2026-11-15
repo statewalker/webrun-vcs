@@ -390,6 +390,17 @@ class SymlinkFilesApi implements PosixFilesApi {
     return removed;
   }
 
+  /** An empty directory only (its links are entries of the base): never recursively. */
+  async rmdir(path: string): Promise<boolean> {
+    const { path: p, table } = await this.resolve(path);
+    if (await this.linkAt(table, p)) return false;
+    if ((await this.base.stats(p))?.kind !== "directory") return false;
+    const posix = this.base as PosixFilesApi;
+    if (posix.rmdir) return posix.rmdir(p);
+    for await (const _ of this.base.list(p)) return false;
+    return this.base.remove(p);
+  }
+
   async move(source: string, target: string): Promise<boolean> {
     const from = await this.resolve(source);
     const to = await this.resolve(target);

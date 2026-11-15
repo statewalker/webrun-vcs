@@ -379,10 +379,9 @@ describe.each(backends)("Porcelain Commands ($name backend)", ({ factory }) => {
       const { git, store } = result;
 
       await addFile(store, "wip.txt", "work in progress");
-      // without a working tree there is nothing to stash: refused, not a stash of HEAD
-      await expect(git.stashCreate().setMessage("WIP").call()).rejects.toThrow(
-        /requires a working tree/,
-      );
+      // a working copy with a worktree has the built-in provider: the staged file stashed
+      expect(typeof (await git.stashCreate().setMessage("WIP").call())).toBe("string");
+      await addFile(store, "wip.txt", "work in progress");
       const stashId = await git
         .stashCreate()
         .setWorkingTreeProvider(stagedTree(result))

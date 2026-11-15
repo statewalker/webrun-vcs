@@ -1,6 +1,6 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { mergeLines } from "@statewalker/vcs-utils";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import { entryStatOf, type Worktree } from "@statewalker/vcs-working-tree";
 import {
   InvalidArgumentError,
   NoHeadError,
@@ -21,6 +21,7 @@ import {
   findInTheWay,
   overwriteMessage,
   pruneEmptyParents,
+  removeDirectoryIfEmpty,
   worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
 
@@ -55,6 +56,16 @@ const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
 
 /** Names this operation in restore failure messages. */
 const STASH_APPLY = "stash apply";
+
+/** Removes the directory at `path` if nothing is in it (git's `rmdir` of a submodule). */
+async function removeIfEmptyDirectory(worktree: Worktree, path: string): Promise<void> {
+  const entry = await worktree.getEntry(path);
+  if (!entry?.isDirectory) {
+    if (entry) await worktree.remove(path);
+    return;
+  }
+  await removeDirectoryIfEmpty(worktree, path);
+}
 
 /**
  * Command to apply a stashed commit.
@@ -275,6 +286,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         "error: you need to resolve your current index first",
       );
     }
+    const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     const base = await this.flatTree(stashHeadCommitObj.tree);
     const stashWorking = await this.flatTree(stashCommit.tree);
     const ours = new Map(index);
@@ -284,7 +296,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     if (this.restoreIndex) {
       const stashIndexCommitObj = await this.commits.load(stashIndexCommit);
       const stashIndex = stashIndexCommitObj ? await this.flatTree(stashIndexCommitObj.tree) : base;
-      const indexMerge = await this.mergeFlat(base, ours, stashIndex);
+      const indexMerge = await this.mergeFlat(base, ours, stashIndex, ignoreCase);
       if (indexMerge.conflicts.size > 0) {
         throw new StashApplyFailedError(
           stashId,
@@ -295,12 +307,11 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       restoredIndex = indexMerge.result;
     }
 
-    const merge = await this.mergeFlat(base, ours, stashWorking);
+    const merge = await this.mergeFlat(base, ours, stashWorking, ignoreCase);
 
     // symlinks are restored as links, or as files holding the target where the worktree
     // or core.symlinks cannot have links (as clone writes them)
     const trust = worktreeModeTrust(this.workingCopy, worktree);
-    const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     // every path of the result verified (verify_path, collisions) before anything is written
     const resultTree = await this.storeFlat(merge.result);
     const worktreePlan = await planTreeRestore(this.trees, this.blobs, resultTree, STASH_APPLY, {
@@ -332,6 +343,10 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     // in a directory a file of the stash replaces (ignored files are expendable)
     const local: string[] = [];
     for (const path of changed) {
+      // a conflict that leaves the worktree file as it is (rename/rename, rename/delete on
+      // our side, a binary conflict) only stages: git keeps an unstaged edit there
+      const conflict = conflicts.get(path);
+      if (conflict && !conflict.content && !conflict.write && !conflict.moveFrom) continue;
       const i = index.get(path);
       if (i && (await worktreeDiffers(worktree, path, i, trust))) local.push(path);
     }
@@ -366,6 +381,15 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     // a file a file/directory conflict moves aside goes to `<path>~<side>` first
     for (const conflict of conflicts.values()) {
       if (!conflict.moveFrom) continue;
+      if (conflict.write?.mode === FileMode.GITLINK) {
+        // a submodule moved aside: staged at stage 2, its new path an empty directory (as
+        // git checks out an unpopulated submodule); the old directory goes only if empty
+        if (!(await worktree.getEntry(conflict.stagePath))) {
+          await worktree.mkdir(conflict.stagePath);
+        }
+        await removeIfEmptyDirectory(worktree, conflict.moveFrom);
+        continue;
+      }
       if (conflict.content) {
         await worktree.writeContent(conflict.stagePath, conflict.content, {
           mode: conflict.mode,
@@ -429,9 +453,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         objectId: entry.objectId,
         mode: entry.mode,
         stage: stageNumber,
-        size: stats?.size ?? 0,
-        mtime: stats?.mtime ?? 0,
-        ...(stats?.ctime !== undefined ? { ctime: stats.ctime } : {}),
+        ...entryStatOf(stats ?? {}),
       });
     };
     if (conflicts.size > 0) {
@@ -507,6 +529,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     baseIn: Map<string, CheckedEntry>,
     oursIn: Map<string, CheckedEntry>,
     theirsIn: Map<string, CheckedEntry>,
+    ignoreCase = false,
   ): Promise<{
     result: Map<string, CheckedEntry>;
     conflicts: Map<string, MergeConflict>;
@@ -642,15 +665,18 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       }
       return dirs;
     };
+    // on a case-folding worktree (core.ignorecase) a name taken in another case is taken:
+    // the moved file would land on that path
+    const fold = (name: string) => (ignoreCase ? name.toLowerCase() : name);
     const taken = new Set<string>();
     for (const map of [baseIn, oursIn, theirsIn, base, ours, theirs]) {
-      for (const path of map.keys()) taken.add(path);
-      for (const dir of dirsOf(map.keys())) taken.add(dir);
+      for (const path of map.keys()) taken.add(fold(path));
+      for (const dir of dirsOf(map.keys())) taken.add(fold(dir));
     }
     const uniquePath = (path: string, label: string) => {
       let name = `${path}~${label}`;
-      for (let n = 0; taken.has(name); n++) name = `${path}~${label}_${n}`;
-      taken.add(name);
+      for (let n = 0; taken.has(fold(name)); n++) name = `${path}~${label}_${n}`;
+      taken.add(fold(name));
       return name;
     };
     const outcomeDirs = dirsOf([
@@ -825,6 +851,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       reservedNames: worktree.capabilities?.reservedNames,
     });
 
+    const taken: string[] = [];
     for (const { path } of plan.entries) {
       // a file on a leading component: git cannot create the directory, and restores
       // nothing ("cannot create directory at 'd': File exists")
@@ -840,13 +867,19 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
           );
         }
       }
-      if (worktreePlan.paths.has(path) || (await worktree.exists(path))) {
-        throw new StashApplyFailedError(
-          untrackedCommitId,
-          undefined,
-          `stash apply would overwrite ${path} with a stashed untracked file`,
-        );
-      }
+      // taken by a file on disk (untracked or tracked), or one the merge writes: git's
+      // `checkout-index --all` refuses each such path
+      if (worktreePlan.paths.has(path) || (await worktree.exists(path))) taken.push(path);
+    }
+    if (taken.length > 0) {
+      throw new StashApplyFailedError(
+        untrackedCommitId,
+        taken,
+        [
+          ...taken.map((p) => `${p} already exists, no checkout`),
+          "error: could not restore untracked files from stash",
+        ].join("\n"),
+      );
     }
 
     return plan;

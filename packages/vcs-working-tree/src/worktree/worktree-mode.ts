@@ -10,6 +10,16 @@ export interface WorktreeModeTrust {
   executable: boolean;
   /** Symbolic links read from the worktree are real (`core.symlinks`). */
   symlinks: boolean;
+  /**
+   * The change time (ctime) is compared with the index's (`core.trustctime`, and not
+   * `core.checkStat=minimal`). Absent: compared, as git's default.
+   */
+  ctime?: boolean;
+  /**
+   * Inode, owner and group are compared with the index's (git's default `core.checkStat`;
+   * false with `core.checkStat=minimal`). Absent: compared.
+   */
+  fullStat?: boolean;
 }
 
 /**

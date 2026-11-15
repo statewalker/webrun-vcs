@@ -72,6 +72,14 @@ export interface StagingEntry {
   readonly intentToAdd?: boolean;
   /** Skip-worktree flag (sparse checkout) */
   readonly skipWorktree?: boolean;
+  /** Nanoseconds of `mtime` within its second, as the index records them (optional) */
+  readonly mtimeNs?: number;
+  /** Nanoseconds of `ctime` within its second (optional) */
+  readonly ctimeNs?: number;
+  /** Owner user id, as the index records it (optional) */
+  readonly uid?: number;
+  /** Owner group id (optional) */
+  readonly gid?: number;
 }
 
 /**
@@ -90,6 +98,10 @@ export interface StagingEntryOptions {
   assumeValid?: boolean;
   intentToAdd?: boolean;
   skipWorktree?: boolean;
+  mtimeNs?: number;
+  ctimeNs?: number;
+  uid?: number;
+  gid?: number;
 }
 
 /**
