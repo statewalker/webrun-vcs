@@ -256,7 +256,8 @@ export class IndexFile {
     this.extensions = parsed.extensionData;
     this.entriesDigest =
       this.extensions.length > 0 ? indexEntriesDigest(parsed.entries) : undefined;
-    return { entries: parsed.entries, lastModified: stats.lastModified ?? Date.now() };
+    // the index file's own mtime; unknown is 0 (every entry racy), never "now"
+    return { entries: parsed.entries, lastModified: stats.lastModified ?? 0 };
   }
 
   /**

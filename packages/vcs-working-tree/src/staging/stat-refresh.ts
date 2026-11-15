@@ -32,11 +32,49 @@ export interface IndexStatUpdate {
 
 const ms = (t: number | undefined) => Math.floor(t ?? 0);
 
+/** Whole seconds of a time in milliseconds (git's default build compares stat times so). */
+const seconds = (t: number | undefined) => Math.floor(ms(t) / 1000);
+
+/**
+ * Checks whether an index entry is racily clean and changed: its stat still matches the
+ * file (whole seconds) while its content does not. Supplied by whoever can read the
+ * worktree; used on every index write.
+ */
+export type RacyCheck = (entry: StagingEntry, indexTime: number) => Promise<boolean>;
+
+/**
+ * git's `ce_smudge_racily_clean_entry`, applied when an index is written: every stage-0
+ * entry (not a submodule) whose mtime second is not older than the index file's (`indexTime`,
+ * as read) and that `check` finds changed behind a matching stat gets size 0, so a later
+ * read re-hashes it whatever its stat says. Only entries `asRead` accepts (unchanged since
+ * the index was read or written) are checked. Returns the entries (the same array when none).
+ */
+export async function smudgeRacilyClean(
+  entries: StagingEntry[],
+  indexTime: number,
+  check: RacyCheck | undefined,
+  asRead?: (entry: StagingEntry) => boolean,
+): Promise<StagingEntry[]> {
+  if (!check || !indexTime) return entries;
+  let out: StagingEntry[] | undefined;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.stage !== 0 || e.mode === 0o160000 || e.size === 0) continue;
+    // an entry set in this session (from the worktree, or a refresh) is up to date, as
+    // git's CE_UPTODATE: only entries as they were read are checked
+    if (asRead && !asRead(e)) continue;
+    if (seconds(e.mtime) < seconds(indexTime)) continue;
+    if (!(await check(e, indexTime))) continue;
+    out ??= [...entries];
+    out[i] = { ...e, size: 0 };
+  }
+  return out ?? entries;
+}
+
 /**
  * `existing` with the update's stat, or undefined to leave it: only a stage-0 entry that
  * still has the compared id, mode, size and mtime, and no assume-unchanged, skip-worktree
- * or intent-to-add flag; everything else of it is kept. An entry modified at or after `now`
- * (the index's write time) gets size 0, as git smudges racily clean entries.
+ * or intent-to-add flag; everything else of it is kept.
  */
 export function applyStatUpdate(
   existing: StagingEntry | undefined,
@@ -51,9 +89,12 @@ export function applyStatUpdate(
   }
   if (update.smudge) return existing.size === 0 ? undefined : { ...existing, size: 0 };
   const defined = <T>(value: T | undefined, fallback: T | undefined) => value ?? fallback;
+  // proved clean: recorded as it is, not smudged (git smudges only an entry whose content
+  // changed); one in the second the index is written stays racy and is re-read next time
+  void now;
   return {
     ...existing,
-    size: ms(update.mtime) >= ms(now) ? 0 : update.size,
+    size: update.size,
     mtime: update.mtime,
     ctime: defined(update.ctime, existing.ctime),
     mtimeNs: update.mtimeNs,

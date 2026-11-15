@@ -659,6 +659,12 @@ describe("stash apply on a case-folding worktree (core.ignorecase)", () => {
   });
 });
 
+/** Sets the mtime of `files` in `dir` well before now (not racy against an index written now). */
+function backdate(dir: string, files: string[]): void {
+  const when = new Date(Date.now() - 100_000);
+  for (const f of files) utimesSync(join(dir, f), when, when);
+}
+
 /** Files (outside any `.git`), index and the newest stash's three trees of `dir`. */
 function stashSnapshot(dir: string): string {
   const files = listing(dir)
@@ -1190,6 +1196,8 @@ describeGit("status and stash refresh the index (review cases)", () => {
     // our mixed reset leaves every entry without a stat
     const { ours: resetter } = await open(dir);
     await resetter.reset().setRef("HEAD").call();
+    // files older than the index (by whole seconds, as git compares): not racy once refreshed
+    backdate(dir, ["a.txt", "b.txt", "c.txt", "d/e.txt", "d/f.txt"]);
     const first = await open(dir);
     const hashedFirst = vi.spyOn(first.worktree, "computeHash");
     expect((await first.ours.status().call()).isClean()).toBe(true);
@@ -1211,6 +1219,7 @@ describeGit("status and stash refresh the index (review cases)", () => {
     const { ours: resetter } = await open(dir);
     await resetter.reset().setRef("HEAD").call();
     put(dir, "a.txt", "dirty\n");
+    backdate(dir, ["a.txt", "b.txt", "c.txt", "d/e.txt", "d/f.txt"]);
     const stasher = await open(dir);
     const hashed = vi.spyOn(stasher.worktree, "computeHash");
     expect(await stasher.ours.stashCreate().call()).toBeDefined();
@@ -1219,7 +1228,9 @@ describeGit("status and stash refresh the index (review cases)", () => {
     const after = await open(dir);
     const hashedAfter = vi.spyOn(after.worktree, "computeHash");
     expect((await after.ours.status().call()).isClean()).toBe(true);
-    expect(hashedAfter).not.toHaveBeenCalled();
+    // only the file the stash rewrote may be read again: written in the second the index
+    // was, it is racily clean (git re-reads it too); the others are trusted
+    for (const [path] of hashedAfter.mock.calls) expect(path).toBe("a.txt");
   });
 });
 
@@ -1374,9 +1385,11 @@ describeGit("index refresh is compare-and-set (review cases)", () => {
     const { ours, worktree } = await open(dir);
     const hash = worktree.computeHash.bind(worktree);
     let added = "";
+    let fired = false;
     vi.spyOn(worktree, "computeHash").mockImplementation(async (path: string) => {
       const id = await hash(path);
-      if (path === "c.txt" && !added) {
+      if (path === "c.txt" && !fired) {
+        fired = true;
         put(dir, "a.txt", "STAGED BY OUR ADD\n");
         await ours.add().addFilepattern("a.txt").call();
         added = run(dir, "ls-files", "-s", "a.txt");
@@ -1422,18 +1435,27 @@ describeGit("index refresh is compare-and-set (review cases)", () => {
 
   it("records the exact stat (nanoseconds, inode, owner) so native git trusts it", async () => {
     const dir = join(root, "r");
-    staleRepo(dir);
-    put(dir, "c.txt", "c\n"); // a fresh mtime with nanoseconds
-    utimesSync(join(dir, "c.txt"), new Date(Date.now() - 50_000), new Date(Date.now() - 50_000));
+    repo(dir);
+    // our mixed reset leaves every entry without a stat: the refresh rewrites them all
+    const { ours: resetter } = await open(dir);
+    await resetter.reset().setRef("HEAD").call();
+    backdate(dir, ["a.txt", "b.txt", "d/e.txt", "d/f.txt"]);
+    // a time with a sub-millisecond fraction, older than the index (not racy)
+    const when = Math.floor(Date.now() / 1000) - 50 + 0.123456789;
+    utimesSync(join(dir, "c.txt"), when, when);
     const { ours } = await open(dir);
     await ours.status().call();
-    const debug = run(dir, "ls-files", "--debug", "c.txt");
-    const stat = lstatSync(join(dir, "c.txt"), { bigint: true });
-    const sec = stat.mtimeNs / 1_000_000_000n;
-    const nsec = stat.mtimeNs % 1_000_000_000n;
-    expect(debug).toContain(`mtime: ${sec}:${nsec}`);
-    expect(debug).toContain(`ino: ${stat.ino & 0xffffffffn}`);
-    expect(debug).toContain(`uid: ${stat.uid}\tgid: ${stat.gid}`);
+    for (const file of ["a.txt", "b.txt", "c.txt", "d/e.txt", "d/f.txt"]) {
+      const debug = run(dir, "ls-files", "--debug", file);
+      const stat = lstatSync(join(dir, file), { bigint: true });
+      const time = (ns: bigint) => `${ns / 1_000_000_000n}:${ns % 1_000_000_000n}`;
+      expect(debug, file).toContain(`ctime: ${time(stat.ctimeNs)}`);
+      expect(debug, file).toContain(`mtime: ${time(stat.mtimeNs)}`);
+      expect(debug, file).toContain(
+        `dev: ${stat.dev & 0xffffffffn}\tino: ${stat.ino & 0xffffffffn}`,
+      );
+      expect(debug, file).toContain(`uid: ${stat.uid}\tgid: ${stat.gid}`);
+    }
     expect(run(dir, "diff-files", "--name-only")).toBe("");
   });
 
@@ -1498,7 +1520,7 @@ describeGit("submodules (review cases)", () => {
     expect(status.modified.has("sub")).toBe(false);
   }, 10_000);
 
-  it("a gitdir: pointing above the repository's root is not followed", async () => {
+  it("a gitdir: pointing above the repository's root is not followed (an error, as git)", async () => {
     const dir = join(root, "r");
     repo(dir);
     nestedRepo(dir, "sub");
@@ -1509,7 +1531,8 @@ describeGit("submodules (review cases)", () => {
     mkdirSync(join(root, "outside"));
     writeFileSync(join(root, "outside/HEAD"), `${"ab".repeat(20)}\n`);
     const { ours } = await open(dir);
-    expect((await ours.status().call()).modified.has("sub")).toBe(false);
+    // never read beyond the FilesApi's root: refused instead
+    await expect(ours.status().call()).rejects.toThrow(/gitfile does not point/);
   });
 });
 
@@ -1539,5 +1562,151 @@ describe("removing an empty directory never removes what is in it", () => {
     expect(existsSync(join(root, "d/e/f"))).toBe(true);
     expect(await worktree.removeEmptyDirectory?.("empty")).toBe(true);
     expect(existsSync(join(root, "empty"))).toBe(false);
+  });
+});
+
+describeGit("clean, racy smudging and submodules against native git (review round 4)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "round4-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("clean never enters a directory where the index has a file", async () => {
+    const setup = (d: string) => {
+      rmSync(join(d, "a.txt"));
+      put(d, "a.txt/x", "x\n");
+    };
+    const { ours } = await twinClean("file-dir", setup);
+    expect(read(join(ours, "a.txt/x"))).toBe("x\n");
+    const { ours: withD } = await twinClean("file-dir-d", setup, { d: true });
+    expect(read(join(withD, "a.txt/x"))).toBe("x\n");
+  });
+
+  it("clean never enters a deinitialised submodule's directory", async () => {
+    const setup = (d: string) => {
+      const upstream = join(root, `up-${Math.random().toString(36).slice(2)}`);
+      repo(upstream);
+      exec(d, "-c", "protocol.file.allow=always", "submodule", "add", "-q", upstream, "sub");
+      run(d, "commit", "-qm", "sub");
+      exec(d, "submodule", "deinit", "-q", "-f", "sub");
+      put(d, "sub/mywork.txt", "mine\n");
+      put(d, "sub/deep/more.txt", "more\n");
+    };
+    const { ours } = await twinClean("deinit", setup);
+    expect(read(join(ours, "sub/mywork.txt"))).toBe("mine\n");
+    const { ours: withD } = await twinClean("deinit-d", setup, { d: true });
+    expect(read(join(withD, "sub/deep/more.txt"))).toBe("more\n");
+  });
+
+  it("clean with path filters (a directory, a glob, a nested repository) as git", async () => {
+    const setup = (d: string) => {
+      put(d, "u/x.txt", "x\n");
+      put(d, "top.txt", "t\n");
+      put(d, "top.log", "l\n");
+      nestedRepo(d, "nr");
+      nestedRepo(d, "u/sub");
+    };
+    await twinClean("path-dir", setup, { paths: ["u"] });
+    await twinClean("path-glob", setup, { paths: ["*.txt"] });
+    await twinClean("path-nested", setup, { d: true, paths: ["nr"] });
+    await twinClean("path-nested-inside", setup, { d: true, paths: ["u/sub"] });
+  });
+
+  it("clean -d removes a directory whose .git is no repository", async () => {
+    await twinClean(
+      "empty-git",
+      (d) => {
+        mkdirSync(join(d, "e/.git"), { recursive: true });
+        put(d, "e/x", "x\n");
+        mkdirSync(join(d, "f"));
+        run(join(d, "f"), "init", "-q");
+      },
+      { d: true },
+    );
+  });
+
+  it("an index write smudges a racily clean entry that changed (size 0), as native git", async () => {
+    // all within one second: the entry, the index and the same-size edit share it
+    const sameSecond = async (dir: string, add: (d: string) => Promise<void>) => {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        rmSync(dir, { recursive: true, force: true });
+        repo(dir);
+        // early in a second (not its first milliseconds: the filesystem's clock is coarser)
+        while (Date.now() % 1000 < 30 || Date.now() % 1000 > 150) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        const second = Math.floor(Date.now() / 1000);
+        put(dir, "a.txt", "1\n");
+        run(dir, "add", "a.txt");
+        put(dir, "a.txt", "2\n");
+        put(dir, "b.txt", "b2\n");
+        const sec = (p: string) => Math.floor(lstatSync(join(dir, p)).mtimeMs / 1000);
+        const ctimeSec = Math.floor(lstatSync(join(dir, "a.txt")).ctimeMs / 1000);
+        const sameStamps =
+          sec("a.txt") === second && sec(".git/index") === second && ctimeSec === second;
+        await add(dir);
+        if (sameStamps && Math.floor(Date.now() / 1000) === second) return;
+      }
+      throw new Error("could not stay within one second");
+    };
+    const native = join(root, "n");
+    await sameSecond(native, async (d) => {
+      run(d, "add", "b.txt");
+    });
+    const ours = join(root, "o");
+    await sameSecond(ours, async (d) => {
+      const { ours: git } = await open(d);
+      await git.add().addFilepattern("b.txt").call();
+    });
+    const sizeOf = (d: string) => run(d, "ls-files", "--debug", "a.txt").match(/size: (\d+)/)?.[1];
+    expect(sizeOf(native)).toBe("0");
+    expect(sizeOf(ours)).toBe("0");
+    expect(run(ours, "status", "--porcelain")).toBe(run(native, "status", "--porcelain"));
+  });
+
+  it("the exact stat is recorded for any sub-millisecond time (deterministic)", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    const base = Math.floor(Date.now() / 1000) - 100;
+    for (let i = 0; i < 25; i++) {
+      // fractions whose float conversion drifts (…266000000 read back as …265.9998)
+      const when = base - i + ((0.266 + i * 0.031) % 1);
+      utimesSync(join(dir, "c.txt"), when, when);
+      const { ours: resetter } = await open(dir);
+      await resetter.reset().setRef("HEAD").call();
+      const { ours } = await open(dir);
+      await ours.status().call();
+      const stat = lstatSync(join(dir, "c.txt"), { bigint: true });
+      const time = `${stat.mtimeNs / 1_000_000_000n}:${stat.mtimeNs % 1_000_000_000n}`;
+      expect(run(dir, "ls-files", "--debug", "c.txt"), `fraction ${when}`).toContain(
+        `mtime: ${time}`,
+      );
+    }
+  });
+
+  it("status refuses a submodule gitfile that points to no repository, as git", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    nestedRepo(dir, "sub");
+    run(dir, "add", "sub");
+    run(dir, "commit", "-qm", "sub");
+    rmSync(join(dir, "sub/.git"), { recursive: true });
+    writeFileSync(join(dir, "sub/.git"), "gitdir: ../../outside\n");
+    expect(() => exec(dir, "status", "--porcelain")).toThrow(/not a git repository|gitfile/);
+    const { ours } = await open(dir);
+    await expect(ours.status().call()).rejects.toThrow(
+      "fatal: gitfile does not point to a valid repository: sub/.git",
+    );
+  });
+
+  it("stash push keeps the index's commit for a submodule at a new commit", async () => {
+    await twinStash("submodule-moved", (d) => {
+      nestedRepo(d, "sub");
+      run(d, "add", "sub");
+      run(d, "commit", "-qm", "sub");
+      put(join(d, "sub"), "inner.txt", "changed\n");
+      run(join(d, "sub"), "commit", "-qam", "x");
+      put(d, "b.txt", "bm\n");
+    });
   });
 });

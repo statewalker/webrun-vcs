@@ -149,15 +149,30 @@ export class CleanCommand extends GitCommand<CleanResult> {
     return worktree.batch ? worktree.batch(() => this.clean(worktree)) : this.clean(worktree);
   }
 
-  /** Whether `path` is (or holds, or lies in) one of the requested paths. */
+  /**
+   * Whether `path` is or lies in one of the requested paths, as git's pathspec matches it: a
+   * plain path matches itself and what is below it; one with `*`, `?` or `[...]` is a glob
+   * over the whole path (`*` matching `/` too).
+   */
   private matchesPaths(path: string): boolean {
     if (this.paths.size === 0) return true;
     for (const p of this.paths) {
-      const prefix = p.replace(/\/+$/, "");
-      if (prefix === "" || prefix === ".") return true;
-      if (path === prefix || path.startsWith(`${prefix}/`) || prefix.startsWith(`${path}/`)) {
-        return true;
+      const spec = p.replace(/\/+$/, "");
+      if (spec === "" || spec === ".") return true;
+      if (/[*?[]/.test(spec)) {
+        if (globToRegExp(spec).test(path)) return true;
+        continue;
       }
+      if (path === spec || path.startsWith(`${spec}/`)) return true;
+    }
+    return false;
+  }
+
+  /** Whether a requested path names `path` itself. */
+  private namesPath(path: string): boolean {
+    for (const p of this.paths) {
+      const spec = p.replace(/\/+$/, "");
+      if (spec === path || (/[*?[]/.test(spec) && globToRegExp(spec).test(path))) return true;
     }
     return false;
   }
@@ -168,13 +183,23 @@ export class CleanCommand extends GitCommand<CleanResult> {
     for await (const entry of this.staging.entries()) tracked.add(entry.path);
     const trackedDirs = directoriesOf(tracked);
     const removeIgnored = !this.ignore;
-    // without -d (and without a path filter) git does not enter untracked directories
+    // without -d (and without a path filter) git does not enter untracked directories; a
+    // path filter removes the directories it names as -d does
     const enterUntracked = this.directories || this.paths.size > 0;
     const ancestors = (path: string) => {
       const parts = path.split("/");
       const out: string[] = [];
       for (let k = 1; k < parts.length; k++) out.push(parts.slice(0, k).join("/"));
       return out;
+    };
+
+    // whether something under `dir` stays (an ignored file without -x)
+    const holdsKept = async (dir: string) => {
+      if (removeIgnored) return false;
+      for await (const inside of worktree.walk({ pathPrefix: dir, includeIgnored: true })) {
+        if (inside.isIgnored) return true;
+      }
+      return false;
     };
 
     const removeFiles: string[] = [];
@@ -194,19 +219,31 @@ export class CleanCommand extends GitCommand<CleanResult> {
       if (ancestors(path).some((dir) => notEntered.has(dir))) continue;
       const keptAsIgnored = entry.isIgnored && !removeIgnored;
       if (entry.isDirectory) {
-        if (trackedDirs.has(path) || tracked.has(path)) continue;
-        if (!enterUntracked) {
+        if (trackedDirs.has(path)) continue;
+        // a directory where the index has a file, link or submodule: git never enters it
+        if (tracked.has(path) || !enterUntracked) {
           notEntered.add(path);
           continue;
         }
         if (entry.mode === FileMode.GITLINK) {
+          notEntered.add(path);
+          // a `.git` that is no repository (an empty directory): an ordinary directory
+          // to git clean, removed with what is in it
+          if (worktree.isRepository && !(await worktree.isRepository(path))) {
+            if (keptAsIgnored || !this.matchesPaths(path) || (await holdsKept(path))) {
+              keep(path, true);
+            } else removeRepos.push(path);
+            continue;
+          }
           // a nested repository: only `git clean -ff` removes it (whole)
           if (keptAsIgnored || !this.matchesPaths(path)) keep(path, true);
           else if (!this.forceNested) {
             // git reports the ones it meets while removing an untracked directory
-            // ("Would skip repository u/sub"); one directly under a tracked directory is
-            // passed over silently
-            if (ancestors(path).some((dir) => !trackedDirs.has(dir))) skipped.add(path);
+            // ("Would skip repository u/sub"); one directly under a tracked directory, or
+            // named by a requested path, is passed over silently
+            if (ancestors(path).some((dir) => !trackedDirs.has(dir)) && !this.namesPath(path)) {
+              skipped.add(path);
+            }
             keep(path, true);
           } else removeRepos.push(path);
           continue;
@@ -230,8 +267,9 @@ export class CleanCommand extends GitCommand<CleanResult> {
     }
 
     // what git clean -n prints: the topmost wholly removed untracked directory, else files
+    const dirMode = this.directories || this.paths.size > 0;
     const removedDir = (dir: string) =>
-      this.directories && !trackedDirs.has(dir) && !kept.has(dir) && this.matchesPaths(dir);
+      dirMode && !trackedDirs.has(dir) && !kept.has(dir) && this.matchesPaths(dir);
     const reportFor = (path: string, suffix = "") => {
       for (const dir of ancestors(path)) if (removedDir(dir)) return `${dir}/`;
       return `${path}${suffix}`;
@@ -243,9 +281,9 @@ export class CleanCommand extends GitCommand<CleanResult> {
 
     if (!this.dryRun) {
       for (const path of removeFiles) await worktree.remove(path);
-      // `git clean -ff`: the caller asked for the nested repositories to go, whole
+      // `git clean -ff` (or a `.git` that is no repository): the directory goes, whole
       for (const path of removeRepos) await worktree.remove(path, { recursive: true });
-      if (this.directories) {
+      if (dirMode) {
         const deepestFirst = [...untrackedDirs].sort(
           (a, b) => b.split("/").length - a.split("/").length || (a < b ? 1 : -1),
         );
@@ -255,4 +293,27 @@ export class CleanCommand extends GitCommand<CleanResult> {
 
     return { cleaned, skipped, dryRun: this.dryRun };
   }
+}
+
+/** A pathspec glob as a regular expression over the whole path (`*` matches `/` too). */
+function globToRegExp(glob: string): RegExp {
+  let out = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") out += ".*";
+    else if (c === "?") out += "[^/]";
+    else if (c === "[") {
+      const end = glob.indexOf("]", i + 1);
+      if (end < 0) out += "\\[";
+      else {
+        const body = glob
+          .slice(i + 1, end)
+          .replace(/^!/, "^")
+          .replace(/\\/g, "\\\\");
+        out += `[${body}]`;
+        i = end;
+      }
+    } else out += c.replace(/[.+^${}()|\\/]/g, "\\$&");
+  }
+  return new RegExp(`^${out}$`);
 }

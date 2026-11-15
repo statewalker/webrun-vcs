@@ -165,6 +165,13 @@ export interface Worktree {
    * directory or `gitdir:` file; undefined when it is not populated or cannot be read.
    */
   readGitlinkHead?(path: string): Promise<ObjectId | undefined>;
+
+  /**
+   * Whether the directory at `path` holds a repository of its own: a `.git` directory with
+   * `HEAD`, `objects` and `refs` (or a `gitdir:` file), as git's `is_nonbare_repository_dir`.
+   * An empty `.git` directory is none.
+   */
+  isRepository?(path: string): Promise<boolean>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
 

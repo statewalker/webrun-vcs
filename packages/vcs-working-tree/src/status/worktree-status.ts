@@ -147,7 +147,7 @@ export async function compareWithWorktree(
   if (hashedId === entry.objectId) return { ...found, hashedId };
   // a racy entry that changed: smudged when the index is written, as git does for an entry
   // its own (coarser) stat check would take as clean
-  return { kind: "modified", ...found, hashedId, ...(racy ? { smudge: true } : {}) };
+  return { kind: "modified", ...found, hashedId, ...(statMatches && racy ? { smudge: true } : {}) };
 }
 
 /** One index entry that no longer matches the worktree. */

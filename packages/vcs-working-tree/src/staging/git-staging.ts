@@ -22,7 +22,12 @@ import type {
   ReadTreeOptions,
   Staging,
 } from "./staging.js";
-import { type IndexStatUpdate, refreshIndexFile } from "./stat-refresh.js";
+import {
+  type IndexStatUpdate,
+  type RacyCheck,
+  refreshIndexFile,
+  smudgeRacilyClean,
+} from "./stat-refresh.js";
 import { MergeStage, type MergeStageValue, type StagingEntry } from "./types.js";
 
 /**
@@ -36,6 +41,9 @@ import { MergeStage, type MergeStageValue, type StagingEntry } from "./types.js"
 export class GitStaging implements Staging {
   private _entries: IndexEntry[] = [];
   private updateTime = 0;
+  private racyCheck?: RacyCheck;
+  /** The entries as last read or written (others were set in this session: up to date) */
+  private asRead = new Set<StagingEntry>();
   private version: IndexVersion = INDEX_VERSION_2;
   private readonly indexFile: IndexFile;
 
@@ -305,14 +313,37 @@ export class GitStaging implements Staging {
       return;
     }
     this._entries = read.entries;
+    this.asRead = new Set(this._entries);
     this.version = this.indexFile.version;
     this.updateTime = read.lastModified;
   }
 
   async write(): Promise<void> {
     this.indexFile.version = this.version;
+    // git's smudging of racily clean entries, against the index as it was read or written
+    this._entries = await smudgeRacilyClean(
+      this._entries,
+      this.updateTime,
+      this.racyCheck,
+      (entry) => this.asRead.has(entry),
+    );
     await this.indexFile.write(this._entries);
-    this.updateTime = Date.now();
+    this.asRead = new Set(this._entries);
+    this.updateTime = await this.indexMtime();
+  }
+
+  /** Sets the check `write()` smudges racily clean entries with. */
+  setRacyCheck(check: RacyCheck | undefined): void {
+    this.racyCheck = check;
+  }
+
+  /** The index file's own mtime (0 when unknown: every entry is then racy). */
+  private async indexMtime(): Promise<number> {
+    try {
+      return (await this.files.stats(this.indexPath))?.lastModified ?? 0;
+    } catch {
+      return 0;
+    }
   }
 
   async isOutdated(): Promise<boolean> {
@@ -336,7 +367,7 @@ export class GitStaging implements Staging {
     );
     if (!entries) return false;
     this._entries = entries;
-    this.updateTime = Date.now();
+    this.updateTime = await this.indexMtime();
     return true;
   }
 

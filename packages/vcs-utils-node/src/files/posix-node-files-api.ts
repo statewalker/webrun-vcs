@@ -546,8 +546,8 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     return {
       kind,
       size: kind === "directory" ? 0 : Number(stat.size),
-      lastModified: Number(stat.mtimeNs) / 1e6,
-      ctime: Number(stat.ctimeNs) / 1e6,
+      lastModified: nsToMs(stat.mtimeNs),
+      ctime: nsToMs(stat.ctimeNs),
       mode: Number(stat.mode & 0o7777n),
       mtimeNs: Number(stat.mtimeNs % 1_000_000_000n),
       ctimeNs: Number(stat.ctimeNs % 1_000_000_000n),
@@ -566,6 +566,11 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       return undefined;
     }
   }
+}
+
+/** Milliseconds of a time in nanoseconds, its whole milliseconds exact (no float drift). */
+function nsToMs(ns: bigint): number {
+  return Number(ns / 1_000_000n) + Number(ns % 1_000_000n) / 1e6;
 }
 
 /** `lstat` with exact times (nanoseconds) and full device/inode numbers. */

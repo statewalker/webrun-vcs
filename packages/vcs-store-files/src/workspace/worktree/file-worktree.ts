@@ -565,6 +565,20 @@ export class FileWorktree implements Worktree {
     return this.files.remove(fullPath);
   }
 
+  async isRepository(path: string): Promise<boolean> {
+    const dotGit = joinPath(this.rootPath, path, ".git");
+    const kind = await this.kindOf(dotGit).catch(() => undefined);
+    // a gitdir: file is taken as a repository (never removed on a guess)
+    if (kind === "file") return true;
+    if (kind !== "directory") return false;
+    const kindAt = (name: string) => this.kindOf(joinPath(dotGit, name)).catch(() => undefined);
+    return (
+      (await kindAt("HEAD")) === "file" &&
+      (await kindAt("objects")) === "directory" &&
+      (await kindAt("refs")) === "directory"
+    );
+  }
+
   async readGitlinkHead(path: string): Promise<ObjectId | undefined> {
     const text = async (full: string) => {
       try {
@@ -590,7 +604,14 @@ export class FileWorktree implements Worktree {
       const resolved = resolveDots(
         target.startsWith("/") ? target : joinPath(this.rootPath, path, target),
       );
-      if (resolved === undefined) return undefined;
+      // as git: a gitfile pointing where there is no repository (or beyond what this
+      // FilesApi can name) is an error, not a clean submodule
+      const invalid = () =>
+        new Error(`fatal: gitfile does not point to a valid repository: ${path}/.git`);
+      if (resolved === undefined) throw invalid();
+      if ((await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) !== "file") {
+        throw invalid();
+      }
       gitDir = resolved;
     } else return undefined;
     let head = await text(joinPath(gitDir, "HEAD"));

@@ -254,7 +254,7 @@ async function beyondSymlink(worktree: Worktree, path: string): Promise<boolean>
  * - a file gone from the worktree is removed, but a file that is not in HEAD (staged new)
  *   keeps its staged blob and a file replaced by a directory keeps its index entry;
  * - a path beyond a symbolic link refuses the stash, as does an intent-to-add entry;
- * - a submodule takes the commit checked out in it;
+ * - a submodule keeps the index's commit (as git stash records it);
  * - a path HEAD has but the index does not (`git rm --cached`) is taken from the worktree
  *   where the file is still there.
  *
@@ -289,11 +289,8 @@ export async function createWorktreeTree(
       continue;
     }
     if (entry.mode === FileMode.GITLINK) {
-      const moved = compared.kind === "modified" && compared.hashedId;
-      result.set(
-        entry.path,
-        moved ? { id: compared.hashedId as ObjectId, mode: entry.mode } : kept,
-      );
+      // as git stash: a submodule keeps the index's commit in the stash
+      result.set(entry.path, kept);
       continue;
     }
     if (compared.kind === "deleted") {

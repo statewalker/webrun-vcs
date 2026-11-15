@@ -226,7 +226,14 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
           stage: 0,
           size: current?.size ?? 0,
           mtime: current?.mtime ?? 0,
+          // the exact stat where the worktree reports it (git's stat data)
           ...(current?.ctime !== undefined ? { ctime: current.ctime } : {}),
+          ...(current?.mtimeNs !== undefined ? { mtimeNs: current.mtimeNs } : {}),
+          ...(current?.ctimeNs !== undefined ? { ctimeNs: current.ctimeNs } : {}),
+          ...(current?.dev !== undefined ? { dev: current.dev } : {}),
+          ...(current?.ino !== undefined ? { ino: current.ino } : {}),
+          ...(current?.uid !== undefined ? { uid: current.uid } : {}),
+          ...(current?.gid !== undefined ? { gid: current.gid } : {}),
         });
       }
     }
