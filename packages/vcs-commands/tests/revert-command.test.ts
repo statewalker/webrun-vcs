@@ -69,6 +69,7 @@ describe.each(backends)("RevertCommand ($name backend)", ({ factory }) => {
 
     // Check the revert commit message
     const revertCommit = await repository.commits.load(result.newHead ?? "");
+    if (!revertCommit) throw new Error("revertCommit not found");
     expect(revertCommit.message).toContain('Revert "fixed a"');
     expect(revertCommit.message).toContain("This reverts commit");
     expect(revertCommit.message).toContain(fixingAId);
@@ -201,6 +202,7 @@ describe.each(backends)("RevertCommand ($name backend)", ({ factory }) => {
 
     // The tree in staging should match the base commit's tree content
     const baseCommitData = await repository.commits.load(baseCommit);
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     const stagingTreeId = await workingCopy.checkout.staging.writeTree(repository.trees);
     // The trees should be identical since we reverted to base
     expect(stagingTreeId).toBe(baseCommitData.tree);
@@ -232,6 +234,7 @@ describe.each(backends)("RevertCommand ($name backend)", ({ factory }) => {
     // Checkout side and modify
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "side.txt", "side");
     await git.commit().setMessage("side change").call();
@@ -278,6 +281,7 @@ describe.each(backends)("RevertCommand ($name backend)", ({ factory }) => {
     // Checkout side and add different file
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "side-file.txt", "from side");
     await git.commit().setMessage("side add").call();
@@ -331,6 +335,7 @@ describe.each(backends)("RevertCommand ($name backend)", ({ factory }) => {
 
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const baseCommitData = await repository.commits.load(baseCommit?.objectId ?? "");
+    if (!baseCommitData) throw new Error("baseCommitData not found");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
     await addFile(workingCopy, "side.txt", "side");
     await git.commit().setMessage("side").call();
@@ -607,6 +612,7 @@ describe.each(backends)("RevertCommand - JGit additional tests ($name backend)",
 
     // The new commit's parent should be headBeforeRevert
     const revertCommit = await repository.commits.load(result.newHead ?? "");
+    if (!revertCommit) throw new Error("revertCommit not found");
     expect(revertCommit.parents).toHaveLength(1);
     expect(revertCommit.parents[0]).toBe(headBeforeRevert);
   });
@@ -639,6 +645,7 @@ describe.each(backends)("RevertCommand - JGit additional tests ($name backend)",
 
     // Check message uses only first line in title
     const revertCommit = await repository.commits.load(result.newHead ?? "");
+    if (!revertCommit) throw new Error("revertCommit not found");
     expect(revertCommit.message).toContain('Revert "Fix the bug"');
     expect(revertCommit.message).not.toContain("This is a detailed description");
   });

@@ -19,6 +19,7 @@ import {
   addFile,
   backends,
   createInitializedGitFromFactory,
+  loadCommitTree,
   removeFile,
   toArray,
 } from "./test-helper.js";
@@ -121,6 +122,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
       // Reset staging to branch1's tree (simulating checkout)
       const branch1Ref = await repository.refs.resolve("refs/heads/branch1");
       const branch1Commit = await repository.commits.load(branch1Ref?.objectId ?? "");
+      if (!branch1Commit) throw new Error("branch1Commit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, branch1Commit.tree);
 
       // Merge main into branch1
@@ -183,6 +185,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
 
       // New HEAD should be a merge commit with 2 parents
       const newCommit = await repository.commits.load(result.newHead ?? "");
+      if (!newCommit) throw new Error("newCommit not found");
       expect(newCommit.parents.length).toBe(2);
     });
 
@@ -201,6 +204,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
       // Reset staging to branch1's tree
       const branch1Ref = await repository.refs.resolve("refs/heads/branch1");
       const branch1Commit = await repository.commits.load(branch1Ref?.objectId ?? "");
+      if (!branch1Commit) throw new Error("branch1Commit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, branch1Commit.tree);
 
       // Add different file on branch1 and commit
@@ -242,6 +246,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
       expect(result.status).toBe(MergeStatus.MERGED);
 
       const mergeCommit = await repository.commits.load(result.newHead ?? "");
+      if (!mergeCommit) throw new Error("mergeCommit not found");
       expect(mergeCommit.message).toBe("Custom merge message");
     });
   });
@@ -268,6 +273,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
       // Reset staging to branch1's tree
       const branch1Ref = await repository.refs.resolve("refs/heads/branch1");
       const branch1Commit = await repository.commits.load(branch1Ref?.objectId ?? "");
+      if (!branch1Commit) throw new Error("branch1Commit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, branch1Commit.tree);
 
       // Modify same file differently on branch1
@@ -299,6 +305,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
       await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
       const branch1Ref = await repository.refs.resolve("refs/heads/branch1");
       const branch1Commit = await repository.commits.load(branch1Ref?.objectId ?? "");
+      if (!branch1Commit) throw new Error("branch1Commit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, branch1Commit.tree);
       await addFile(workingCopy, "conflict.txt", "branch version");
       await git.commit().setMessage("branch change").call();
@@ -365,6 +372,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
       await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
       const branch1Before = await repository.refs.resolve("refs/heads/branch1");
       const branch1Commit = await repository.commits.load(branch1Before?.objectId ?? "");
+      if (!branch1Commit) throw new Error("branch1Commit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, branch1Commit.tree);
       await addFile(workingCopy, "file2.txt", "content2");
       await git.commit().setMessage("branch commit").call();
@@ -547,6 +555,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
     // Reset staging to side's tree
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
     // Delete file b on side branch
@@ -557,6 +566,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
     // Modify files a and c on main
@@ -596,6 +606,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
     // Reset staging
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
     // Delete file a on side
@@ -606,6 +617,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
     // Delete file a on main too
@@ -638,6 +650,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
 
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
     // Delete b and modify a on side
@@ -649,6 +662,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
     // Modify a differently on main (will conflict) and c
@@ -681,6 +695,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
 
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
     await removeFile(workingCopy, "a");
@@ -690,6 +705,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
     await addFile(workingCopy, "a", "1\na(main)\n3\n");
@@ -720,6 +736,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
 
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
     await addFile(workingCopy, "a", "1\na(side)\n3\n");
@@ -729,6 +746,7 @@ describe.each(backends)("MergeCommand - JGit deletion tests ($name backend)", ({
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
     await removeFile(workingCopy, "a");
@@ -775,6 +793,7 @@ describe.each(backends)("MergeCommand - JGit creation tests ($name backend)", ({
 
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
     // Create file b on side
@@ -785,6 +804,7 @@ describe.each(backends)("MergeCommand - JGit creation tests ($name backend)", ({
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
     // Create file b with different content on main
@@ -815,6 +835,7 @@ describe.each(backends)("MergeCommand - JGit creation tests ($name backend)", ({
 
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
     // Create file b on side
@@ -825,6 +846,7 @@ describe.each(backends)("MergeCommand - JGit creation tests ($name backend)", ({
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
     // Create file b with same content on main
@@ -882,7 +904,7 @@ describe.each(backends)("MergeCommand - JGit squash tests ($name backend)", ({ f
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Squash merge branch1 into main
@@ -918,7 +940,7 @@ describe.each(backends)("MergeCommand - JGit squash tests ($name backend)", ({ f
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Add file on branch1
@@ -929,7 +951,7 @@ describe.each(backends)("MergeCommand - JGit squash tests ($name backend)", ({ f
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(mainHead?.objectId ?? "")).tree,
+      await loadCommitTree(repository, mainHead?.objectId ?? ""),
     );
 
     // Squash merge branch1
@@ -965,7 +987,7 @@ describe.each(backends)("MergeCommand - JGit squash tests ($name backend)", ({ f
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Add same file with different content on branch1
@@ -976,7 +998,7 @@ describe.each(backends)("MergeCommand - JGit squash tests ($name backend)", ({ f
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(mainHead?.objectId ?? "")).tree,
+      await loadCommitTree(repository, mainHead?.objectId ?? ""),
     );
 
     // Squash merge - should conflict
@@ -1021,7 +1043,7 @@ describe.each(backends)("MergeCommand - JGit fast-forward tests ($name backend)"
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Fast-forward merge with no-commit flag
@@ -1050,7 +1072,7 @@ describe.each(backends)("MergeCommand - JGit fast-forward tests ($name backend)"
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // FF_ONLY merge
@@ -1081,7 +1103,7 @@ describe.each(backends)("MergeCommand - JGit fast-forward tests ($name backend)"
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // NO_FF merge
@@ -1095,6 +1117,7 @@ describe.each(backends)("MergeCommand - JGit fast-forward tests ($name backend)"
 
     // Should have created merge commit with 2 parents
     const newCommit = await repository.commits.load(result.newHead ?? "");
+    if (!newCommit) throw new Error("newCommit not found");
     expect(newCommit.parents.length).toBe(2);
   });
 
@@ -1116,7 +1139,7 @@ describe.each(backends)("MergeCommand - JGit fast-forward tests ($name backend)"
     const branch1Before = await repository.refs.resolve("refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // NO_FF merge with no-commit
@@ -1156,7 +1179,7 @@ describe.each(backends)("MergeCommand - JGit fast-forward tests ($name backend)"
     // Switch to branch1 (which doesn't have file2)
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     const branch1Ref = await repository.refs.resolve("refs/heads/branch1");
-    const branch1Tree = (await repository.commits.load(branch1Ref?.objectId ?? "")).tree;
+    const branch1Tree = await loadCommitTree(repository, branch1Ref?.objectId ?? "");
     await workingCopy.checkout.staging.readTree(repository.trees, branch1Tree);
 
     // Verify file2 not in staging
@@ -1220,6 +1243,7 @@ describe.each(backends)(
 
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify only b on side (not a)
@@ -1230,6 +1254,7 @@ describe.each(backends)(
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify only a and c on main (not b)
@@ -1245,6 +1270,7 @@ describe.each(backends)(
 
       // Verify merge commit has 2 parents
       const mergeCommit = await repository.commits.load(result.newHead ?? "");
+      if (!mergeCommit) throw new Error("mergeCommit not found");
       expect(mergeCommit.parents.length).toBe(2);
     });
 
@@ -1267,6 +1293,7 @@ describe.each(backends)(
 
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file a on side (first line)
@@ -1277,6 +1304,7 @@ describe.each(backends)(
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify file a on main (last line)
@@ -1308,6 +1336,7 @@ describe.each(backends)(
 
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify b on side
@@ -1318,6 +1347,7 @@ describe.each(backends)(
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify a on main
@@ -1354,7 +1384,7 @@ describe.each(backends)(
       await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
       await workingCopy.checkout.staging.readTree(
         repository.trees,
-        (await repository.commits.load(initialCommitId)).tree,
+        await loadCommitTree(repository, initialCommitId),
       );
 
       // Merge the tag
@@ -1396,13 +1426,13 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     await addFile(workingCopy, "file", "main content");
     await git.commit().setMessage("main commit").call();
     const mainHead = await repository.refs.resolve("refs/heads/main");
-    const mainTree = (await repository.commits.load(mainHead?.objectId ?? "")).tree;
+    const mainTree = await loadCommitTree(repository, mainHead?.objectId ?? "");
 
     // Switch to side branch and add different content
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Add different file on side
@@ -1425,6 +1455,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
 
     // Verify merge commit was created with 2 parents
     const mergeCommit = await repository.commits.load(result.newHead ?? "");
+    if (!mergeCommit) throw new Error("mergeCommit not found");
     expect(mergeCommit.parents.length).toBe(2);
 
     // Verify tree is unchanged (same as our tree)
@@ -1445,20 +1476,20 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     await addFile(workingCopy, "file", "main content");
     await git.commit().setMessage("main commit").call();
     const mainHead = await repository.refs.resolve("refs/heads/main");
-    const mainTree = (await repository.commits.load(mainHead?.objectId ?? "")).tree;
+    const mainTree = await loadCommitTree(repository, mainHead?.objectId ?? "");
 
     // Switch to side branch and add different content
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Add different file on side
     await addFile(workingCopy, "file", "side content");
     await git.commit().setMessage("side commit").call();
     const sideHeadAfter = await repository.refs.resolve("refs/heads/side");
-    const sideTree = (await repository.commits.load(sideHeadAfter?.objectId ?? "")).tree;
+    const sideTree = await loadCommitTree(repository, sideHeadAfter?.objectId ?? "");
 
     // Switch back to main
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
@@ -1476,6 +1507,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
 
     // Verify merge commit was created with 2 parents
     const mergeCommit = await repository.commits.load(result.newHead ?? "");
+    if (!mergeCommit) throw new Error("mergeCommit not found");
     expect(mergeCommit.parents.length).toBe(2);
 
     // Verify tree is theirs
@@ -1495,13 +1527,13 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     await addFile(workingCopy, "file", "main content");
     await git.commit().setMessage("main commit").call();
     const mainHead = await repository.refs.resolve("refs/heads/main");
-    const mainTree = (await repository.commits.load(mainHead?.objectId ?? "")).tree;
+    const mainTree = await loadCommitTree(repository, mainHead?.objectId ?? "");
 
     // Switch to side branch and add different content
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Add different file on side
@@ -1541,20 +1573,20 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     await addFile(workingCopy, "file", "main content");
     await git.commit().setMessage("main commit").call();
     const mainHead = await repository.refs.resolve("refs/heads/main");
-    const mainTree = (await repository.commits.load(mainHead?.objectId ?? "")).tree;
+    const mainTree = await loadCommitTree(repository, mainHead?.objectId ?? "");
 
     // Switch to side branch and add different content
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Add different file on side
     await addFile(workingCopy, "file", "side content");
     await git.commit().setMessage("side commit").call();
     const sideHeadAfter = await repository.refs.resolve("refs/heads/side");
-    const sideTree = (await repository.commits.load(sideHeadAfter?.objectId ?? "")).tree;
+    const sideTree = await loadCommitTree(repository, sideHeadAfter?.objectId ?? "");
 
     // Switch back to main
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
@@ -1593,7 +1625,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Merge main into branch1 with OURS strategy (but FF is possible)
@@ -1625,7 +1657,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Merge main into branch1 with THEIRS strategy (but FF is possible)
@@ -1656,7 +1688,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
     await repository.refs.setSymbolic("HEAD", "refs/heads/branch1");
     await workingCopy.checkout.staging.readTree(
       repository.trees,
-      (await repository.commits.load(initialCommitId)).tree,
+      await loadCommitTree(repository, initialCommitId),
     );
 
     // Merge main with OURS + NO_FF
@@ -1671,6 +1703,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
 
     // Should have created merge commit with 2 parents
     const mergeCommit = await repository.commits.load(result.newHead ?? "");
+    if (!mergeCommit) throw new Error("mergeCommit not found");
     expect(mergeCommit.parents.length).toBe(2);
   });
 
@@ -1695,6 +1728,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify on side
@@ -1705,6 +1739,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify same file differently on main
@@ -1734,6 +1769,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file on side only
@@ -1744,6 +1780,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Create an empty commit on main to force non-fast-forward
@@ -1773,6 +1810,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file-b on side
@@ -1783,6 +1821,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify file-a on main
@@ -1811,6 +1850,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Make identical modification on side
@@ -1821,6 +1861,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Make identical modification on main
@@ -1849,6 +1890,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Delete on side
@@ -1859,6 +1901,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify on main
@@ -1887,6 +1930,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Add new file on side
@@ -1897,6 +1941,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify existing file on main
@@ -1961,6 +2006,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file on side (b -> Y)
@@ -1971,6 +2017,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
       await addFile(workingCopy, "file.txt", toLines("aZc"));
       await git.commit().setMessage("main modification").call();
@@ -2009,6 +2056,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file on side (b -> Y)
@@ -2019,6 +2067,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
       await addFile(workingCopy, "file.txt", toLines("aZc"));
       await git.commit().setMessage("main modification").call();
@@ -2057,6 +2106,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file on side (b -> Y)
@@ -2067,6 +2117,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
       await addFile(workingCopy, "file.txt", toLines("aZc"));
       await git.commit().setMessage("main modification").call();
@@ -2107,6 +2158,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file on side (b -> Z)
@@ -2117,6 +2169,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
       await addFile(workingCopy, "file.txt", toLines("aZc"));
       await git.commit().setMessage("main modification").call();
@@ -2154,6 +2207,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file-a on side (b -> Y) and file-b
@@ -2165,6 +2219,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
 
       // Modify file-a differently (b -> Z)
@@ -2210,6 +2265,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/side");
       const sideRef = await repository.refs.resolve("refs/heads/side");
       const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+      if (!sideCommit) throw new Error("sideCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
 
       // Modify file on side
@@ -2220,6 +2276,7 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
       const mainRef = await repository.refs.resolve("refs/heads/main");
       const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+      if (!mainCommit) throw new Error("mainCommit not found");
       await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
       await addFile(workingCopy, "file.txt", toLines("aZc"));
       await git.commit().setMessage("main modification").call();
@@ -2256,12 +2313,14 @@ describe.each(backends)("MergeCommand - binary and big files ($name backend)", (
     await repository.refs.setSymbolic("HEAD", "refs/heads/side");
     const sideRef = await repository.refs.resolve("refs/heads/side");
     const sideCommit = await repository.commits.load(sideRef?.objectId ?? "");
+    if (!sideCommit) throw new Error("sideCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, sideCommit.tree);
     const theirsId = await addFile(workingCopy, path, theirs);
     await git.commit().setMessage("side").call();
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
     const mainRef = await repository.refs.resolve("refs/heads/main");
     const mainCommit = await repository.commits.load(mainRef?.objectId ?? "");
+    if (!mainCommit) throw new Error("mainCommit not found");
     await workingCopy.checkout.staging.readTree(repository.trees, mainCommit.tree);
     const oursId = await addFile(workingCopy, path, ours);
     await git.commit().setMessage("main").call();

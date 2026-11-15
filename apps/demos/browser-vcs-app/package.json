@@ -19,7 +19,8 @@
     "preview": "vite preview",
     "test:app": "playwright test",
     "test:ui": "playwright test --ui",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "@statewalker/vcs-commands": "workspace:^",

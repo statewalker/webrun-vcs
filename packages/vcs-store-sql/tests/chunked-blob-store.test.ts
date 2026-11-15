@@ -18,6 +18,11 @@ const CHUNK_SIZE = 262144;
 /** Threshold for chunked storage (256KB) */
 const CHUNK_THRESHOLD = 262144;
 
+/** Async iterable over the given chunks (blob stores take AsyncIterable content) */
+async function* fromChunks(...chunks: Uint8Array[]): AsyncIterable<Uint8Array> {
+  yield* chunks;
+}
+
 describe("SqlNativeBlobStore chunked storage", () => {
   let db: SqlJsAdapter;
   let store: SqlNativeBlobStoreImpl;
@@ -617,7 +622,7 @@ describe("SqlNativeBlobStore early stops and leftovers", () => {
 
   it("sweeps tmp rows of a crashed write once older than the expiry", async () => {
     const store = new SqlNativeBlobStoreImpl(db);
-    await store.store([new Uint8Array(10)]); // create the tables, one real blob
+    await store.store(fromChunks(new Uint8Array(10))); // create the tables, one real blob
     const insertTmp = async (name: string, createdAt: number) => {
       const r = await db.execute(
         "INSERT INTO vcs_blob (blob_id, content, size, storage_type, created_at) VALUES (?, NULL, 0, 'chunked', ?)",
@@ -647,7 +652,7 @@ describe("SqlNativeBlobStore early stops and leftovers", () => {
 
   it("is what SqlGcStrategy sweeps for SQL native blobs", async () => {
     const store = new SqlNativeBlobStoreImpl(db);
-    await store.store([new Uint8Array(10)]);
+    await store.store(fromChunks(new Uint8Array(10)));
     await db.execute(
       "INSERT INTO vcs_blob (blob_id, content, size, storage_type, created_at) VALUES ('tmp:x', NULL, 0, 'chunked', 0)",
     );
@@ -667,7 +672,7 @@ describe("SqlNativeBlobStore publish without its placeholder", () => {
 
   it("fails rather than report a blob that is not stored", async () => {
     const store = new SqlNativeBlobStoreImpl(db);
-    await store.store([new Uint8Array(10)]); // create the tables
+    await store.store(fromChunks(new Uint8Array(10))); // create the tables
     const transaction = db.transaction.bind(db);
     // another process sweeps the placeholder (no age guard) just before it is published
     db.transaction = (async (fn: Parameters<typeof db.transaction>[0]) => {
@@ -675,7 +680,7 @@ describe("SqlNativeBlobStore publish without its placeholder", () => {
       return transaction(fn);
     }) as typeof db.transaction;
     const big = new Uint8Array(600 * 1024).fill(3);
-    await expect(store.store([big], big.length)).rejects.toThrow(/disappeared/);
+    await expect(store.store(fromChunks(big), big.length)).rejects.toThrow(/disappeared/);
     db.transaction = transaction;
     expect(await store.count()).toBe(1);
   });

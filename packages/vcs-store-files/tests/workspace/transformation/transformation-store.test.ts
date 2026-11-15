@@ -1,6 +1,5 @@
 import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-core";
-import { GitTransformationStore } from "@statewalker/vcs-store-files";
-import type { TransformationStore } from "@statewalker/vcs-working-tree/transformation";
+import { GitTransformationStore, type TransformationStore } from "@statewalker/vcs-store-files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 describe("TransformationStore", () => {

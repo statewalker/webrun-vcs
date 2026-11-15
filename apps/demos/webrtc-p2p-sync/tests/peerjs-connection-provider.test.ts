@@ -276,7 +276,7 @@ describe("PeerJsConnectionProvider", () => {
 
   it("bidirectional message passing through bridge", async () => {
     const hostProvider = new PeerJsConnectionProvider(peerJsApi);
-    let hostPort: MessagePort | null = null;
+    let hostPort = null as MessagePort | null; // assigned in a callback, so keep the declared type
 
     const sessionId = await hostProvider.share({
       onConnection(_peerId, port) {

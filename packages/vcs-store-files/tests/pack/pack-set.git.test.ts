@@ -56,7 +56,7 @@ const filesOf = (repo: string): FilesApi => createNodeFilesApi({ rootDir: repo }
 async function* chunks(bytes: Uint8Array, size = 65536) {
   for (let i = 0; i < bytes.length; i += size) yield bytes.subarray(i, i + size);
 }
-async function collect(s: AsyncIterable<Uint8Array>) {
+async function collect(s: AsyncIterable<Uint8Array> | Iterable<Uint8Array>) {
   const parts: Uint8Array[] = [];
   for await (const c of s) parts.push(c);
   return Buffer.concat(parts);

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ObjectId, ObjectStorage } from "../../src/history/object-storage.js";
+import type { ObjectId } from "../../src/common/id/index.js";
+import type { ObjectStorage } from "../../src/history/objects/index.js";
 
 // This file exports a conformance test factory, not direct tests.
 // Implementations use objectStorageConformanceTests() to run tests.

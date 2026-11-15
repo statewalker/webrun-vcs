@@ -12,7 +12,8 @@
 import { inflate } from "@statewalker/vcs-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { HistoryWithOperations, PersonIdent } from "../../src/history/index.js";
+import type { PersonIdent } from "../../src/common/person/index.js";
+import type { HistoryWithOperations } from "../../src/history/index.js";
 import { createMemoryHistoryWithOperations } from "../../src/history/index.js";
 import { ObjectType } from "../../src/history/objects/object-types.js";
 
@@ -212,6 +213,7 @@ describe("Cross-Backend Integration", () => {
       expect(aEntry?.id).toBe(blobA);
 
       const subEntry = rootEntries.find((e) => e.name === "sub");
+      if (!subEntry) throw new Error("subEntry is undefined");
       expect(subEntry?.mode).toBe(0o40000);
 
       // Verify sub tree

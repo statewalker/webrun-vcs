@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { ObjectId } from "../../../src/common/id/index.js";
 import type { BlobContent, Blobs } from "../../../src/history/blobs/blobs.js";
-import type { ObjectId } from "../../../src/history/object-storage.js";
 
 // This file exports a conformance test factory, not direct tests.
 // Implementations use blobsConformanceTests() to run tests.

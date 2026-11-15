@@ -14,7 +14,7 @@ import {
   RefNotFoundError,
 } from "../src/errors/index.js";
 import { ListBranchMode } from "../src/index.js";
-import { backends, createInitializedGitFromFactory } from "./test-helper.js";
+import { backends, createInitializedGitFromFactory, loadCommitTree } from "./test-helper.js";
 
 describe.each(backends)("BranchCommand ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -185,7 +185,7 @@ describe.each(backends)("BranchCommand ($name backend)", ({ factory }) => {
 
       // Add commit to feature branch (simulated by setting ref directly)
       const commit = {
-        tree: (await repository.commits.load(initialCommitId)).tree,
+        tree: await loadCommitTree(repository, initialCommitId),
         parents: [initialCommitId],
         author: {
           name: "Test",
@@ -217,7 +217,7 @@ describe.each(backends)("BranchCommand ($name backend)", ({ factory }) => {
       await git.branchCreate().setName("feature").setStartPoint(initialCommitId).call();
 
       const commit = {
-        tree: (await repository.commits.load(initialCommitId)).tree,
+        tree: await loadCommitTree(repository, initialCommitId),
         parents: [initialCommitId],
         author: {
           name: "Test",

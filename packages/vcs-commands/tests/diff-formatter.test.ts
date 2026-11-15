@@ -70,6 +70,7 @@ describe.each(backends)("DiffFormatter ($name backend)", ({ factory }) => {
     // Get HEAD commit's tree for later comparison
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = await repository.commits.load(headRef?.objectId ?? "");
+    if (!headCommit) throw new Error("headCommit not found");
 
     // Remove file from staging and commit
     const builder = workingCopy.checkout.staging.createBuilder();

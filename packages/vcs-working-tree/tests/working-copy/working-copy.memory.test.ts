@@ -1,4 +1,4 @@
-import type { History } from "@statewalker/vcs-core";
+import { type History, RefStorage } from "@statewalker/vcs-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Checkout } from "../../src/checkout/checkout.js";
 import type { Staging } from "../../src/staging/staging.js";
@@ -144,7 +144,12 @@ describe("MemoryWorkingCopy", () => {
     });
 
     it("should resolve from repository refs when not set locally", async () => {
-      vi.mocked(mockHistory.refs.resolve).mockResolvedValue({ objectId: "abc123" });
+      vi.mocked(mockHistory.refs.resolve).mockResolvedValue({
+        name: "refs/heads/main",
+        objectId: "abc123",
+        storage: RefStorage.LOOSE,
+        peeled: false,
+      });
       const head = await workingCopy.getHead();
       expect(head).toBe("abc123");
     });

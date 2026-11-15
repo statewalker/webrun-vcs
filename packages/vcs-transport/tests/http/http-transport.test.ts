@@ -576,6 +576,12 @@ describe("Repository Management", () => {
 // These tests verify the real HTTP handler functions from src/adapters/http/
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** handleInfoRefs answers with a buffered body; fail loudly if it ever streams. */
+function bufferedBody(body: Uint8Array | ReadableStream<Uint8Array>): Uint8Array {
+  if (!(body instanceof Uint8Array)) throw new Error("expected a buffered response body");
+  return body;
+}
+
 describe("handleInfoRefs HTTP Handler", () => {
   it("should return refs advertisement with correct content type", async () => {
     const refStore = createMockRefStore();
@@ -586,7 +592,7 @@ describe("handleInfoRefs HTTP Handler", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers["Content-Type"]).toBe("application/x-git-upload-pack-advertisement");
-    expect(response.body.length).toBeGreaterThan(0);
+    expect(bufferedBody(response.body).length).toBeGreaterThan(0);
   });
 
   it("should include service announcement line", async () => {
@@ -595,7 +601,7 @@ describe("handleInfoRefs HTTP Handler", () => {
 
     const response = await handleInfoRefs(refStore);
 
-    const bodyText = new TextDecoder().decode(response.body);
+    const bodyText = new TextDecoder().decode(bufferedBody(response.body));
     expect(bodyText).toContain("# service=git-upload-pack");
   });
 
@@ -605,7 +611,7 @@ describe("handleInfoRefs HTTP Handler", () => {
 
     const response = await handleInfoRefs(refStore);
 
-    const bodyText = new TextDecoder().decode(response.body);
+    const bodyText = new TextDecoder().decode(bufferedBody(response.body));
     // Capabilities are after null byte
     expect(bodyText).toContain("\0");
     // Should include some common capabilities
@@ -619,7 +625,7 @@ describe("handleInfoRefs HTTP Handler", () => {
     const response = await handleInfoRefs(refStore);
 
     expect(response.status).toBe(200);
-    const bodyText = new TextDecoder().decode(response.body);
+    const bodyText = new TextDecoder().decode(bufferedBody(response.body));
     // Should still have service line and capabilities^{}
     expect(bodyText).toContain("# service=git-upload-pack");
     expect(bodyText).toContain("capabilities^{}");
@@ -633,7 +639,7 @@ describe("handleInfoRefs HTTP Handler", () => {
 
     const response = await handleInfoRefs(refStore);
 
-    const bodyText = new TextDecoder().decode(response.body);
+    const bodyText = new TextDecoder().decode(bufferedBody(response.body));
     expect(bodyText).toContain("refs/heads/main");
     expect(bodyText).toContain("refs/heads/feature");
     expect(bodyText).toContain("refs/tags/v1.0");
@@ -646,7 +652,7 @@ describe("handleInfoRefs HTTP Handler", () => {
 
     const response = await handleInfoRefs(refStore);
 
-    const bodyText = new TextDecoder().decode(response.body);
+    const bodyText = new TextDecoder().decode(bufferedBody(response.body));
     expect(bodyText).toContain(oid);
   });
 
@@ -657,7 +663,7 @@ describe("handleInfoRefs HTTP Handler", () => {
     const response = await handleInfoRefs(refStore);
 
     // First 4 bytes should be hex length
-    const body = response.body;
+    const body = bufferedBody(response.body);
     const firstFour = new TextDecoder().decode(body.slice(0, 4));
     // Should be a valid hex length
     expect(/^[0-9a-f]{4}$/.test(firstFour)).toBe(true);

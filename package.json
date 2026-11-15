@@ -16,6 +16,7 @@
     "build": "pnpm -r run build",
     "test": "pnpm -r run test",
     "typecheck": "pnpm -r run typecheck",
+    "typecheck:tests": "pnpm -r run typecheck:tests",
     "test:app": "turbo run test:app",
     "lint": "biome check --write .",
     "lint:check": "biome check .",

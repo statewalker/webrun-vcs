@@ -52,7 +52,9 @@ checkoutConformanceTests(
       },
       write: baseFiles.write.bind(baseFiles),
       mkdir: baseFiles.mkdir.bind(baseFiles),
-      remove: baseFiles.remove.bind(baseFiles),
+      remove: async (path: string): Promise<void> => {
+        await baseFiles.remove(path);
+      },
       removeDir: async (path: string): Promise<void> => {
         await baseFiles.remove(path);
       },

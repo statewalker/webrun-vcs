@@ -556,6 +556,7 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
     await workingCopy.checkout.staging.readTree(repository.trees, baseTree);
 
     // Same history and index, but no worktree at all.
+    // @ts-expect-error -- deliberately omits the required worktree to build a bare working copy
     const bare = new MemoryWorkingCopy({
       history: repository,
       checkout: new MemoryCheckout({ staging: workingCopy.checkout.staging }),

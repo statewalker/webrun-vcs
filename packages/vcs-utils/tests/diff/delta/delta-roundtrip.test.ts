@@ -75,7 +75,7 @@ describe("Delta round-trip integration tests", () => {
       target.set(base.subarray(300, 500), 400);
 
       // Test with createDeltaRanges
-      const ranges1 = createDeltaRanges(base, target, { windowSize: 64 });
+      const ranges1 = createDeltaRanges(base, target, 64);
       const delta1 = deltaRangesToGitFormat(base, target, ranges1);
       expect(applyGitDelta(base, delta1)).toEqual(target);
 

@@ -11,7 +11,8 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createMemoryHistory, type History, type PersonIdent } from "../../src/history/index.js";
+import type { PersonIdent } from "../../src/common/person/index.js";
+import { createMemoryHistory, type History } from "../../src/history/index.js";
 
 describe("Commit Round-Trip Integration", () => {
   let history: History;
@@ -119,15 +120,18 @@ describe("Commit Round-Trip Integration", () => {
 
       // Verify we can walk the tree
       const commit = await history.commits.load(commitId);
+      if (!commit) throw new Error("commit is undefined");
       const root = await collectAsyncIterable((await history.trees.load(commit?.tree))!);
 
       expect(root.find((e) => e.name === "README.md")).toBeDefined();
       const srcEntry = root.find((e) => e.name === "src");
+      if (!srcEntry) throw new Error("srcEntry is undefined");
       expect(srcEntry?.mode).toBe(0o40000);
 
       const src = await collectAsyncIterable((await history.trees.load(srcEntry?.id))!);
       expect(src.find((e) => e.name === "index.js")).toBeDefined();
       const utilsEntry = src.find((e) => e.name === "utils");
+      if (!utilsEntry) throw new Error("utilsEntry is undefined");
       expect(utilsEntry?.mode).toBe(0o40000);
 
       const utils = await collectAsyncIterable((await history.trees.load(utilsEntry?.id))!);
@@ -156,18 +160,23 @@ describe("Commit Round-Trip Integration", () => {
       // Navigate down: root -> a -> b -> c -> d -> file.txt
       const aEntry = await history.trees.getEntry(rootTree, "a");
       expect(aEntry).toBeDefined();
+      if (!aEntry) throw new Error("aEntry is undefined");
 
       const bEntry = await history.trees.getEntry(aEntry?.id, "b");
       expect(bEntry).toBeDefined();
+      if (!bEntry) throw new Error("bEntry is undefined");
 
       const cEntry = await history.trees.getEntry(bEntry?.id, "c");
       expect(cEntry).toBeDefined();
+      if (!cEntry) throw new Error("cEntry is undefined");
 
       const dEntry = await history.trees.getEntry(cEntry?.id, "d");
       expect(dEntry).toBeDefined();
+      if (!dEntry) throw new Error("dEntry is undefined");
 
       const fileEntry = await history.trees.getEntry(dEntry?.id, "file.txt");
       expect(fileEntry).toBeDefined();
+      if (!fileEntry) throw new Error("fileEntry is undefined");
 
       // Verify content
       const loaded = await history.blobs.load(fileEntry?.id);

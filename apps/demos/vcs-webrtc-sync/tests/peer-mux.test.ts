@@ -16,7 +16,9 @@ async function collect(stream: AsyncIterable<Uint8Array>): Promise<string> {
 }
 
 function tagging(tag: string) {
-  return async function* (input: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+  return async function* (
+    input: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+  ): AsyncGenerator<Uint8Array> {
     for await (const chunk of input) yield encoder.encode(`${tag}:${decoder.decode(chunk)}`);
   };
 }
@@ -91,7 +93,9 @@ describe("createPeerMux", () => {
       window: 64 * 1024,
       maxMessageSize: 16 * 1024,
     });
-    const echo = async function* (input: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+    const echo = async function* (
+      input: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    ): AsyncGenerator<Uint8Array> {
       for await (const chunk of input) yield chunk;
     };
     const stopA = a.serve(echo);

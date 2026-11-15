@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   callPort,
   listenPort,
+  type MessageParams,
   receive,
   receiveIterator,
   send,
@@ -33,15 +34,15 @@ describe("sendIterator", () => {
     let calls = 0;
     const values: number[] = [];
 
-    const close = listenPort(channel.port1, async ({ done, value }) => {
-      if (!done) values.push(value);
+    const close = listenPort(channel.port1, async ({ done, value }: MessageParams<number>) => {
+      if (!done) values.push(value as number);
       await new Promise((resolve) => setTimeout(resolve, 10));
       calls++;
     });
 
     try {
-      const sendFn = async (params: unknown) => {
-        return await callPort(channel.port2, params);
+      const sendFn = async (params: MessageParams<number>) => {
+        return await callPort<MessageParams<number>, void>(channel.port2, params);
       };
       await sendIterator(sendFn, dataToSend);
       expect(calls).toBe(control.length + 1);
@@ -63,21 +64,24 @@ describe("sendIterator", () => {
 describe("receiveIterator", () => {
   async function testAsyncCalls(dataToSend: AsyncIterable<number> | number[], control: number[]) {
     const channel = newMessageChannel();
-    let receiveMessage: ((params: unknown) => Promise<void>) | undefined;
+    let receiveMessage: ((params?: MessageParams<number>) => Promise<void>) | undefined;
 
     const it = receiveIterator<number>((p) => {
       receiveMessage = p;
     });
 
-    const close = listenPort(channel.port1, async ({ done, value, error }) => {
-      await receiveMessage?.({ done, value, error });
-    });
+    const close = listenPort(
+      channel.port1,
+      async ({ done, value, error }: MessageParams<number>) => {
+        await receiveMessage?.({ done, value, error });
+      },
+    );
 
     try {
       // Start sending in the background
       (async () => {
-        const sendMessage = async ({ done, value, error }: unknown) => {
-          return await callPort(channel.port2, { done, value, error });
+        const sendMessage = async ({ done, value, error }: MessageParams<number>) => {
+          return await callPort<MessageParams<number>, void>(channel.port2, { done, value, error });
         };
         await sendIterator(sendMessage, dataToSend);
       })();

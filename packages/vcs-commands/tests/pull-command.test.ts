@@ -12,7 +12,7 @@
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { Git, MergeStatus, TagOption } from "../src/index.js";
+import { FastForwardMode, Git, MergeStatus, MergeStrategy, TagOption } from "../src/index.js";
 import { backends, testAuthor } from "./test-helper.js";
 import { addFileAndCommit, createTestServer, createTestUrl } from "./transport-test-helper.js";
 
@@ -160,7 +160,7 @@ describe.each(backends)("PullCommand ($name backend)", ({ factory }) => {
       const workingCopy = await createTestWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
 
-      const command = git.pull().setStrategy("recursive");
+      const command = git.pull().setStrategy(MergeStrategy.RECURSIVE);
       expect(command).toBeDefined();
     });
 
@@ -168,7 +168,7 @@ describe.each(backends)("PullCommand ($name backend)", ({ factory }) => {
       const workingCopy = await createTestWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
 
-      const command = git.pull().setFastForwardMode("ff-only");
+      const command = git.pull().setFastForwardMode(FastForwardMode.FF_ONLY);
       expect(command).toBeDefined();
     });
   });
@@ -237,8 +237,8 @@ describe.each(backends)("PullCommand ($name backend)", ({ factory }) => {
         .setRemote("upstream")
         .setRemoteBranchName("develop")
         .setRebase(false)
-        .setStrategy("recursive")
-        .setFastForwardMode("ff");
+        .setStrategy(MergeStrategy.RECURSIVE)
+        .setFastForwardMode(FastForwardMode.FF);
 
       expect(command.getRemote()).toBe("upstream");
       expect(command.getRemoteBranchName()).toBe("develop");
@@ -277,7 +277,7 @@ describe.each(backends)("PullCommand ($name backend)", ({ factory }) => {
       const workingCopy = await createTestWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
 
-      const command = git.pull().setFastForwardMode("ff-only");
+      const command = git.pull().setFastForwardMode(FastForwardMode.FF_ONLY);
 
       expect(command.getFastForwardMode()).toBe("ff-only");
     });
@@ -291,7 +291,7 @@ describe.each(backends)("PullCommand ($name backend)", ({ factory }) => {
         .setRemote("upstream")
         .setRemoteBranchName("feature")
         .setRebase(true)
-        .setFastForwardMode("ff")
+        .setFastForwardMode(FastForwardMode.FF)
         .setTagOpt(TagOption.NO_TAGS);
 
       expect(command.getRemote()).toBe("upstream");

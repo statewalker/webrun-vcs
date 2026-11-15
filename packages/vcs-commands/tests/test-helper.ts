@@ -284,3 +284,10 @@ export async function toArray<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   }
   return result;
 }
+
+/** Load a commit's tree id, failing the test when the commit is missing. */
+export async function loadCommitTree(repository: History, commitId: ObjectId): Promise<ObjectId> {
+  const commit = await repository.commits.load(commitId);
+  if (!commit) throw new Error(`commit ${commitId} not found`);
+  return commit.tree;
+}

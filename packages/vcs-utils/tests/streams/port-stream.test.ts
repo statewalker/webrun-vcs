@@ -65,7 +65,7 @@ describe("writeStream() and readStream()", () => {
     const port1 = wrapNativePort(channel.port1);
     const port2 = wrapNativePort(channel.port2);
 
-    const sendPromise = writeStream(port1, []);
+    const sendPromise = writeStream(port1, (async function* () {})());
     const received = await collect(readStream(port2));
 
     await sendPromise;

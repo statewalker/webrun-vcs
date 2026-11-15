@@ -47,7 +47,12 @@ export async function assertRoundTrip(
   key: string,
   content: Uint8Array,
 ): Promise<void> {
-  await store.store(key, [content]);
+  await store.store(
+    key,
+    (async function* () {
+      yield content;
+    })(),
+  );
   const loaded = await collectBytes(store.load(key));
   expect(loaded).toEqual(content);
 }
@@ -128,7 +133,7 @@ export async function collectAll<T>(iterable: AsyncIterable<T>): Promise<T[]> {
  * Create a matcher for partial object comparison
  */
 export function matchPartial<T>(partial: Partial<T>) {
-  return expect.objectContaining(partial);
+  return expect.objectContaining<object>(partial);
 }
 
 /**

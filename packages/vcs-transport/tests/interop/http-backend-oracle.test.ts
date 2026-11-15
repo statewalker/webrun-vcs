@@ -128,7 +128,7 @@ async function ours(
   const response = await fetch(`${server.baseUrl}${path}${query ? `?${query}` : ""}`, {
     method,
     headers,
-    body,
+    body: body as BodyInit | undefined,
   });
   const parsed: Record<string, string> = {};
   response.headers.forEach((value, key) => {

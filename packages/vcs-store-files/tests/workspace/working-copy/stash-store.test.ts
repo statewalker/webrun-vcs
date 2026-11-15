@@ -99,7 +99,10 @@ function createMockBlobStore() {
 /**
  * Create a mock repository for testing.
  */
-function createMockRepository(): History {
+/** History whose commit store is the mock, so tests can use its storeCommit/loadCommit helpers. */
+type MockHistory = History & { commits: MockCommitStore };
+
+function createMockRepository(): MockHistory {
   const treeStore = createMockTreeStore({
     "tree-1": [{ name: "file.txt", id: "blob-1", mode: 0o100644 }],
     "tree-2": [
@@ -118,12 +121,12 @@ function createMockRepository(): History {
     refs: {} as History["refs"],
     tags: {} as History["tags"],
     objects: {} as History["objects"],
-  } as unknown as History;
+  } as unknown as MockHistory;
 }
 
 describe("GitStashStore", () => {
   let stash: GitStashStore;
-  let repository: History;
+  let repository: MockHistory;
   let filesApi: ReturnType<typeof createMockFilesApi>;
   let headCommitId: string;
   let headTreeId: string;

@@ -96,7 +96,8 @@ describe("files quarantine freshens objects the repository already has (git's fr
     const dir = mkdtempSync(join(tmpdir(), "quarantine-freshen-"));
     const files = createNodeFilesApi({ rootDir: dir });
     const backend = await createGitFilesBackend({ files, create: true });
-    return { dir, files, ...backend, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+    // backend.files is the `files` passed in
+    return { dir, ...backend, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
   }
 
   async function makeOld(path: string) {

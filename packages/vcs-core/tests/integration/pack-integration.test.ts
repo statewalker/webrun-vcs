@@ -13,7 +13,8 @@
 import { inflate } from "@statewalker/vcs-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { HistoryWithOperations, PersonIdent } from "../../src/history/index.js";
+import type { PersonIdent } from "../../src/common/person/index.js";
+import type { HistoryWithOperations } from "../../src/history/index.js";
 import { createMemoryHistoryWithOperations } from "../../src/history/index.js";
 import { ObjectType } from "../../src/history/objects/object-types.js";
 import { unpackObjects } from "../../src/pack/index.js";
@@ -57,6 +58,7 @@ describe("Pack Import/Export Integration", () => {
       // Verify the commit exists in target and content matches
       const loadedCommit = await target.commits.load(commitId);
       expect(loadedCommit).toBeDefined();
+      if (!loadedCommit) throw new Error("loadedCommit is undefined");
       expect(loadedCommit?.message).toBe("Initial commit");
 
       // Verify tree
@@ -171,6 +173,7 @@ describe("Pack Import/Export Integration", () => {
       // Verify tree structure in target
       const loadedCommit = await target.commits.load(commitId);
       expect(loadedCommit).toBeDefined();
+      if (!loadedCommit) throw new Error("loadedCommit is undefined");
 
       const rootEntries = await collectAsyncIterable(
         (await target.trees.load(loadedCommit?.tree))!,
@@ -179,6 +182,7 @@ describe("Pack Import/Export Integration", () => {
 
       const utilsEntry = rootEntries.find((e) => e.name === "utils");
       expect(utilsEntry).toBeDefined();
+      if (!utilsEntry) throw new Error("utilsEntry is undefined");
       expect(utilsEntry?.mode).toBe(0o40000);
 
       const subEntries = await collectAsyncIterable((await target.trees.load(utilsEntry?.id))!);
@@ -418,6 +422,7 @@ describe("Pack Import/Export Integration", () => {
 
       // Parse back into target (need blob and tree first)
       const commit = await source.commits.load(commitId);
+      if (!commit) throw new Error("commit is undefined");
       const tree = await source.trees.load(commit?.tree);
       const treeEntries = await collectAsyncIterable(tree!);
       const blobLoose = await collectAsyncIterableBytes(
@@ -652,7 +657,7 @@ async function* toAsyncIterable(data: Uint8Array): AsyncIterable<Uint8Array> {
 }
 
 async function sha1(data: Uint8Array): Promise<Uint8Array> {
-  const hash = await crypto.subtle.digest("SHA-1", data);
+  const hash = await crypto.subtle.digest("SHA-1", new Uint8Array(data));
   return new Uint8Array(hash);
 }
 

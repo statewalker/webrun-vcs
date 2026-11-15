@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ObjectId } from "../../../src/history/object-storage.js";
+import type { ObjectId } from "../../../src/common/id/index.js";
 import type { RefEntry, Refs } from "../../../src/history/refs/refs.js";
 
 // This file exports a conformance test factory, not direct tests.

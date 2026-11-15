@@ -120,9 +120,9 @@ describe("DefaultDeltaDecisionStrategy", () => {
       });
 
       const result: DeltaResult = {
-        baseId: "base-id",
-        deltaSize: 400,
-        originalSize: 1000,
+        delta: new Uint8Array(400),
+        baseSize: 1000,
+        targetSize: 1000,
         ratio: 2.5,
         savings: 600,
       };
@@ -136,9 +136,9 @@ describe("DefaultDeltaDecisionStrategy", () => {
       });
 
       const result: DeltaResult = {
-        baseId: "base-id",
-        deltaSize: 600,
-        originalSize: 1000,
+        delta: new Uint8Array(600),
+        baseSize: 1000,
+        targetSize: 1000,
         ratio: 1.67,
         savings: 400,
       };
@@ -153,9 +153,9 @@ describe("DefaultDeltaDecisionStrategy", () => {
       });
 
       const result: DeltaResult = {
-        baseId: "base-id",
-        deltaSize: 950,
-        originalSize: 1000,
+        delta: new Uint8Array(950),
+        baseSize: 1000,
+        targetSize: 1000,
         ratio: 1.05,
         savings: 50,
       };
@@ -254,9 +254,9 @@ describe("Pre-configured strategies", () => {
       expect(
         strategy.shouldUseDelta(
           {
-            baseId: "base",
-            deltaSize: 555,
-            originalSize: 1000,
+            delta: new Uint8Array(555),
+            baseSize: 1000,
+            targetSize: 1000,
             ratio: 1.8,
             savings: 445,
           },
@@ -268,9 +268,9 @@ describe("Pre-configured strategies", () => {
       expect(
         strategy.shouldUseDelta(
           {
-            baseId: "base",
-            deltaSize: 400,
-            originalSize: 1000,
+            delta: new Uint8Array(400),
+            baseSize: 1000,
+            targetSize: 1000,
             ratio: 2.5,
             savings: 600,
           },
@@ -296,9 +296,9 @@ describe("Pre-configured strategies", () => {
       expect(
         strategy.shouldUseDelta(
           {
-            baseId: "base",
-            deltaSize: 900,
-            originalSize: 1000,
+            delta: new Uint8Array(900),
+            baseSize: 1000,
+            targetSize: 1000,
             ratio: 1.11,
             savings: 100,
           },

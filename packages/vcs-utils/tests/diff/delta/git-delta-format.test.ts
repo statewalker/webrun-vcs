@@ -502,7 +502,7 @@ describe("parseGitDelta and gitFormatToDeltaRanges", () => {
     const parsedRanges = gitFormatToDeltaRanges(delta);
 
     // Apply parsed ranges to reconstruct target
-    let reconstructed = new Uint8Array(0);
+    let reconstructed: Uint8Array = new Uint8Array(0);
     for (const range of parsedRanges) {
       if (range.from === "source") {
         reconstructed = concat(reconstructed, src.subarray(range.start, range.start + range.len));

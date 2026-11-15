@@ -8,7 +8,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ContentMergeStrategy, MergeStrategy, StashApplyStatus } from "../src/index.js";
-import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
+import {
+  addFile,
+  backends,
+  createInitializedGitFromFactory,
+  loadCommitTree,
+} from "./test-helper.js";
 
 describe.each(backends)("StashListCommand ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -56,7 +61,7 @@ describe.each(backends)("StashListCommand ($name backend)", ({ factory }) => {
     // Manually create a stash-like commit structure for testing
     // Stash has 2-3 parents: [HEAD, index, optional untracked]
     const indexCommit = await repository.commits.store({
-      tree: (await repository.commits.load(headCommit)).tree,
+      tree: await loadCommitTree(repository, headCommit),
       parents: [headCommit],
       author: { name: "Test", email: "test@test.com", timestamp: 1000, tzOffset: "+0000" },
       committer: { name: "Test", email: "test@test.com", timestamp: 1000, tzOffset: "+0000" },
@@ -64,7 +69,7 @@ describe.each(backends)("StashListCommand ($name backend)", ({ factory }) => {
     });
 
     const stashCommit = await repository.commits.store({
-      tree: (await repository.commits.load(headCommit)).tree,
+      tree: await loadCommitTree(repository, headCommit),
       parents: [headCommit, indexCommit],
       author: { name: "Test", email: "test@test.com", timestamp: 1000, tzOffset: "+0000" },
       committer: { name: "Test", email: "test@test.com", timestamp: 1000, tzOffset: "+0000" },
@@ -133,6 +138,7 @@ describe.each(backends)("StashCreateCommand ($name backend)", ({ factory }) => {
 
     // Load the stash commit and check message
     const commit = await repository.commits.load(stashCommit);
+    if (!commit) throw new Error("commit not found");
     expect(commit.message).toBe("My custom stash message");
   });
 
@@ -238,6 +244,7 @@ describe.each(backends)("StashApplyCommand ($name backend)", ({ factory }) => {
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = headRef?.objectId ?? "";
     const headCommitObj = await repository.commits.load(headCommit);
+    if (!headCommitObj) throw new Error("headCommitObj not found");
 
     const indexCommit = await repository.commits.store({
       tree: headCommitObj.tree,
@@ -517,6 +524,7 @@ describe.each(backends)("StashDropCommand ($name backend)", ({ factory }) => {
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = headRef?.objectId ?? "";
     const headCommitObj = await repository.commits.load(headCommit);
+    if (!headCommitObj) throw new Error("headCommitObj not found");
 
     // Create a stash
     const indexCommit = await repository.commits.store({
@@ -560,6 +568,7 @@ describe.each(backends)("StashDropCommand ($name backend)", ({ factory }) => {
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = headRef?.objectId ?? "";
     const headCommitObj = await repository.commits.load(headCommit);
+    if (!headCommitObj) throw new Error("headCommitObj not found");
 
     // Create a stash
     const indexCommit = await repository.commits.store({
@@ -627,6 +636,7 @@ describe.each(backends)("StashDropCommand ($name backend)", ({ factory }) => {
     const headRef = await repository.refs.resolve("HEAD");
     const headCommit = headRef?.objectId ?? "";
     const headCommitObj = await repository.commits.load(headCommit);
+    if (!headCommitObj) throw new Error("headCommitObj not found");
 
     // Create a stash
     const indexCommit = await repository.commits.store({
@@ -705,6 +715,7 @@ describe.each(backends)(
 
       // Verify stash commit structure
       const commit = await repository.commits.load(stashCommit);
+      if (!commit) throw new Error("commit not found");
       expect(commit.parents.length).toBeGreaterThanOrEqual(2);
     });
 
@@ -789,7 +800,7 @@ describe.each(backends)("StashListCommand - additional tests ($name backend)", (
 
     // Create a commit with only 1 parent (not valid stash structure)
     const invalidStash = await repository.commits.store({
-      tree: (await repository.commits.load(headCommit)).tree,
+      tree: await loadCommitTree(repository, headCommit),
       parents: [headCommit],
       author: { name: "Test", email: "test@test.com", timestamp: 1000, tzOffset: "+0000" },
       committer: { name: "Test", email: "test@test.com", timestamp: 1000, tzOffset: "+0000" },

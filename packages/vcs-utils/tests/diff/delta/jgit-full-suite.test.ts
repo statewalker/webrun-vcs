@@ -257,7 +257,7 @@ describe("JGit Full Test Suite", () => {
         // Text patches should have hunks (unless it's a rename/copy only)
         if (!info.isRename && !info.isCopy && !info.isDeletedFile) {
           // Most text patches should have at least one hunk
-          if (info.hunks === 0 && !testCase.isNewFile) {
+          if (info.hunks === 0 && !info.isNewFile) {
             testLog(`Note: ${testCase.name} has no hunks`);
           }
         }

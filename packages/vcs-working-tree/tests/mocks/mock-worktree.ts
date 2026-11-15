@@ -17,7 +17,6 @@ export function createWorktreeEntry(
     path,
     name: path.split("/").pop() ?? path,
     isDirectory: options.isDirectory ?? false,
-    isSymbolicLink: options.isSymbolicLink ?? false,
     isIgnored: options.isIgnored ?? false,
     size: options.size ?? 100,
     mtime: options.mtime ?? Date.now(),

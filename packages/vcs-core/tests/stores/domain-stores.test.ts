@@ -115,6 +115,7 @@ describe("GitCommits", () => {
 
     const id = await commitStore.store(commit);
     const loaded = await commitStore.load(id);
+    if (!loaded) throw new Error("loaded is undefined");
 
     expect(loaded.message).toBe("Initial commit");
     expect(loaded.tree).toBe(commit.tree);
@@ -133,6 +134,7 @@ describe("GitCommits", () => {
 
     const id = await commitStore.store(commit);
     const loaded = await commitStore.load(id);
+    if (!loaded) throw new Error("loaded is undefined");
 
     expect(loaded.parents).toEqual([parent1, parent2]);
   });
@@ -369,6 +371,7 @@ describe("GitTags", () => {
 
     const id = await tagStore.store(tag);
     const loaded = await tagStore.load(id);
+    if (!loaded) throw new Error("loaded is undefined");
 
     expect(loaded.tag).toBe("v1.0.0");
     expect(loaded.message).toBe("Release version 1.0.0");
@@ -388,6 +391,7 @@ describe("GitTags", () => {
 
     const id = await tagStore.store(tag);
     const loaded = await tagStore.load(id);
+    if (!loaded) throw new Error("loaded is undefined");
 
     expect(loaded.tag).toBe("lightweight-like");
     expect(loaded.tagger).toBeUndefined();

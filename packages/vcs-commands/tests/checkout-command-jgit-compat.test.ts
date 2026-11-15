@@ -9,7 +9,8 @@
  * Reference: tmp/jgit/org.eclipse.jgit.test/tst/org/eclipse/jgit/api/PathCheckoutCommandTest.java
  */
 
-import { DeleteStagingEntry } from "@statewalker/vcs-working-tree";
+import type { History } from "@statewalker/vcs-core";
+import { DeleteStagingEntry, type WorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 import { CheckoutStatus } from "../src/commands/checkout-command.js";
 import { RefNotFoundError } from "../src/errors/index.js";
@@ -37,12 +38,8 @@ async function collectBytes(iterable: AsyncIterable<Uint8Array>): Promise<Uint8A
  * Read file content from staging as string.
  */
 async function readStagedFile(
-  workingCopy: {
-    staging: { getEntry(path: string): Promise<{ objectId: string } | undefined> };
-  },
-  repository: {
-    blobs: { load(id: string): AsyncIterable<Uint8Array> };
-  },
+  workingCopy: WorkingCopy,
+  repository: History,
   path: string,
 ): Promise<string> {
   const entry = await workingCopy.checkout.staging.getEntry(path);
