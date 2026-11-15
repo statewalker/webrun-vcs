@@ -1,7 +1,11 @@
 import { type LfsResolver, sha256Hex } from "@statewalker/vcs-transport-lfs";
 import type { ContentStore } from "@statewalker/webrun-content-store";
 import { describe, expect, it } from "vitest";
-import { serveXet, xetDownload, xetUpload } from "../src/index.js";
+import {
+  serveWebrunChunks,
+  webrunChunksDownload,
+  webrunChunksUpload,
+} from "../../src/webrun-chunks/index.js";
 import {
   collect,
   csHash,
@@ -13,21 +17,21 @@ import {
   streamOf,
 } from "./helpers.js";
 
-const URL = "http://xet.test";
+const URL = "http://chunks.test";
 
-describe("xet interop / integrity", () => {
+describe("webrun-chunks interop / integrity", () => {
   it("reconstructs the exact whole object; the reassembly hashes to the LFS oid", async () => {
     const bytes = prng(60000, 61);
 
     const serverStore = makeStore();
     const serverResolver = memResolver();
     const { ptr } = await seedObject(serverStore, serverResolver, bytes);
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
 
     const clientStore = makeStore();
     const clientResolver = memResolver();
     const events = await drain(
-      xetDownload(clientStore, clientResolver, URL, [ptr], {
+      webrunChunksDownload(clientStore, clientResolver, URL, [ptr], {
         fetchImpl: handler,
         hashContent: csHash,
       }),
@@ -58,12 +62,12 @@ describe("xet interop / integrity", () => {
       ...serverStore,
       getChunk: (cid) => (cid === target ? streamOf(corrupt) : serverStore.getChunk(cid)),
     };
-    const handler = serveXet(badServer, serverResolver);
+    const handler = serveWebrunChunks(badServer, serverResolver);
 
     const clientStore = makeStore();
     const clientResolver = memResolver();
     const events = await drain(
-      xetDownload(clientStore, clientResolver, URL, [ptr], {
+      webrunChunksDownload(clientStore, clientResolver, URL, [ptr], {
         fetchImpl: handler,
         hashContent: csHash,
       }),
@@ -84,13 +88,13 @@ describe("xet interop / integrity", () => {
 
     const bogusOid = await sha256Hex(prng(1000, 7)); // not the sha256 of `real`
     await serverResolver.record(bogusOid, id); // peer lies: bogusOid → real object
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
 
     const clientStore = makeStore();
     const clientResolver = memResolver();
     const ptr = { oid: bogusOid, size: real.length };
     const events = await drain(
-      xetDownload(clientStore, clientResolver, URL, [ptr], {
+      webrunChunksDownload(clientStore, clientResolver, URL, [ptr], {
         fetchImpl: handler,
         hashContent: csHash,
       }),
@@ -104,19 +108,19 @@ describe("xet interop / integrity", () => {
   });
 });
 
-describe("xet streaming verification", () => {
+describe("webrun-chunks streaming verification", () => {
   it("rejects a download whose size differs from the pointer (oid right), recording nothing", async () => {
     const real = prng(60000, 71);
     const serverStore = makeStore();
     const serverResolver = memResolver();
     const { ptr, id } = await seedObject(serverStore, serverResolver, real);
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
 
     const clientStore = makeStore();
     const clientResolver = memResolver();
     const lying = { oid: ptr.oid, size: ptr.size + 1 };
     const events = await drain(
-      xetDownload(clientStore, clientResolver, URL, [lying], {
+      webrunChunksDownload(clientStore, clientResolver, URL, [lying], {
         fetchImpl: handler,
         hashContent: csHash,
       }),
@@ -129,7 +133,7 @@ describe("xet streaming verification", () => {
     expect(await clientStore.has(id)).toBe(false);
   });
 
-  it("the server refuses a xet upload whose bytes do not hash to the oid", async () => {
+  it("the server refuses a webrun-chunks upload whose bytes do not hash to the oid", async () => {
     const real = prng(60000, 72);
     const clientStore = makeStore();
     const clientResolver = memResolver();
@@ -139,9 +143,9 @@ describe("xet streaming verification", () => {
 
     const serverStore = makeStore();
     const serverResolver = memResolver();
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
     const events = await drain(
-      xetUpload(clientStore, clientResolver, URL, [{ oid: bogusOid, size: real.length }], {
+      webrunChunksUpload(clientStore, clientResolver, URL, [{ oid: bogusOid, size: real.length }], {
         fetchImpl: handler,
         hashContent: csHash,
       }),
@@ -156,7 +160,7 @@ describe("xet streaming verification", () => {
   });
 });
 
-describe("a refused xet object is left for gc, never removed", () => {
+describe("a refused webrun-chunks object is left for gc, never removed", () => {
   it("a lying download of the same bytes does not delete an object a correct download is recording", async () => {
     const real = prng(60000, 81);
     const serverStore = makeStore();
@@ -164,7 +168,7 @@ describe("a refused xet object is left for gc, never removed", () => {
     const { ptr, id } = await seedObject(serverStore, serverResolver, real);
     const bogusOid = await sha256Hex(prng(1000, 82));
     await serverResolver.record(bogusOid, id); // the peer lies: bogusOid → real object
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
 
     const clientStore = makeStore();
     const inner = memResolver();
@@ -185,10 +189,16 @@ describe("a refused xet object is left for gc, never removed", () => {
       },
     };
     const opts = { fetchImpl: handler, hashContent: csHash };
-    const correct = drain(xetDownload(clientStore, clientResolver, URL, [ptr], opts));
+    const correct = drain(webrunChunksDownload(clientStore, clientResolver, URL, [ptr], opts));
     await started;
     const lying = await drain(
-      xetDownload(clientStore, clientResolver, URL, [{ oid: bogusOid, size: real.length }], opts),
+      webrunChunksDownload(
+        clientStore,
+        clientResolver,
+        URL,
+        [{ oid: bogusOid, size: real.length }],
+        opts,
+      ),
     );
     expect(lying).toContainEqual({ type: "error", oid: bogusOid, reason: "sha256 mismatch" });
     release();
@@ -203,15 +213,21 @@ describe("a refused xet object is left for gc, never removed", () => {
     const { id } = await seedObject(serverStore, serverResolver, real);
     const bogusOid = await sha256Hex(prng(1000, 84));
     await serverResolver.record(bogusOid, id);
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
 
     const clientStore = makeStore();
     const clientResolver = memResolver();
     const events = await drain(
-      xetDownload(clientStore, clientResolver, URL, [{ oid: bogusOid, size: real.length }], {
-        fetchImpl: handler,
-        hashContent: csHash,
-      }),
+      webrunChunksDownload(
+        clientStore,
+        clientResolver,
+        URL,
+        [{ oid: bogusOid, size: real.length }],
+        {
+          fetchImpl: handler,
+          hashContent: csHash,
+        },
+      ),
     );
     expect(events).toContainEqual({ type: "error", oid: bogusOid, reason: "sha256 mismatch" });
     expect(await clientResolver.toObject(bogusOid)).toBeUndefined();
@@ -220,7 +236,7 @@ describe("a refused xet object is left for gc, never removed", () => {
     expect(await clientStore.has(id)).toBe(false);
   });
 
-  it("a refused xet upload is not recorded on the server, and gc reclaims it there", async () => {
+  it("a refused webrun-chunks upload is not recorded on the server, and gc reclaims it there", async () => {
     const real = prng(60000, 85);
     const clientStore = makeStore();
     const clientResolver = memResolver();
@@ -230,9 +246,9 @@ describe("a refused xet object is left for gc, never removed", () => {
 
     const serverStore = makeStore();
     const serverResolver = memResolver();
-    const handler = serveXet(serverStore, serverResolver);
+    const handler = serveWebrunChunks(serverStore, serverResolver);
     const events = await drain(
-      xetUpload(clientStore, clientResolver, URL, [{ oid: bogusOid, size: real.length }], {
+      webrunChunksUpload(clientStore, clientResolver, URL, [{ oid: bogusOid, size: real.length }], {
         fetchImpl: handler,
         hashContent: csHash,
       }),

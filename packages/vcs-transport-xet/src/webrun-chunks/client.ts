@@ -1,10 +1,10 @@
 /**
- * The xet client. Each direction negotiates once over the standard LFS batch
- * API advertising `["xet","basic"]`. If the server agreed to `xet`, bytes move
+ * The webrun-chunks client. Each direction negotiates once over the standard LFS batch
+ * API advertising `["webrun-chunks","basic"]`. If the server agreed to `webrun-chunks`, bytes move
  * through `content-transfer` (chunk dedup, resumable) over a per-oid chunk
  * channel; otherwise the whole transfer defers to the reused
  * `@statewalker/vcs-transport-lfs` basic path. The whole-file SHA-256 (the LFS
- * oid) and size are verified on a completed xet download — the interop
+ * oid) and size are verified on a completed webrun-chunks download — the interop
  * guarantee — by streaming the stored object through an incremental SHA-256,
  * so memory stays bounded by one chunk.
  */
@@ -14,26 +14,26 @@ import { createLfsPointer, lfsDownload, lfsUpload } from "@statewalker/vcs-trans
 import type { ContentStore } from "@statewalker/webrun-content-store";
 import { remoteStore, transfer } from "@statewalker/webrun-content-transfer";
 import {
-  XET_TRANSFER,
-  XET_TRANSFERS,
-  type XetBatchObjectResponse,
-  type XetBatchResponse,
+  WEBRUN_CHUNKS_TRANSFER,
+  WEBRUN_CHUNKS_TRANSFERS,
+  type WebrunChunksBatchObjectResponse,
+  type WebrunChunksBatchResponse,
 } from "./batch.js";
 import { httpChunkChannel } from "./chunk-channel.js";
-import type { XetOptions, XetTransportEvent } from "./types.js";
+import type { WebrunChunksOptions, WebrunChunksTransportEvent } from "./types.js";
 
 const LFS_CONTENT_TYPE = "application/vnd.git-lfs+json";
 const defaultFetch = (request: Request) => fetch(request);
 
-async function postXetBatch(
-  fetchImpl: XetOptions["fetchImpl"] & {},
+async function postWebrunChunksBatch(
+  fetchImpl: WebrunChunksOptions["fetchImpl"] & {},
   url: string,
   operation: "upload" | "download",
   oids: LfsPointer[],
-): Promise<XetBatchResponse> {
+): Promise<WebrunChunksBatchResponse> {
   const body: BatchRequest = {
     operation,
-    transfers: XET_TRANSFERS,
+    transfers: WEBRUN_CHUNKS_TRANSFERS,
     objects: oids.map(({ oid, size }) => ({ oid, size })),
   };
   const res = await fetchImpl(
@@ -43,26 +43,26 @@ async function postXetBatch(
       body: JSON.stringify(body),
     }),
   );
-  return (await res.json()) as XetBatchResponse;
+  return (await res.json()) as WebrunChunksBatchResponse;
 }
 
 /**
- * Upload objects to a xet-or-basic LFS endpoint. On a `xet` agreement each
+ * Upload objects to a webrun-chunks-or-basic LFS endpoint. On a `webrun-chunks` agreement each
  * object's already-local bytes are pushed chunk-by-chunk (only the chunks the
  * server is missing) through content-transfer; on a `basic` response the whole
  * upload defers to `vcs-transport-lfs`.
  */
-export async function* xetUpload(
+export async function* webrunChunksUpload(
   store: ContentStore,
   resolver: LfsResolver,
   url: string,
   oids: LfsPointer[],
-  opts: XetOptions = {},
-): AsyncIterable<XetTransportEvent> {
+  opts: WebrunChunksOptions = {},
+): AsyncIterable<WebrunChunksTransportEvent> {
   const fetchImpl = opts.fetchImpl ?? defaultFetch;
-  const batch = await postXetBatch(fetchImpl, url, "upload", oids);
+  const batch = await postWebrunChunksBatch(fetchImpl, url, "upload", oids);
 
-  if (batch.transfer !== XET_TRANSFER) {
+  if (batch.transfer !== WEBRUN_CHUNKS_TRANSFER) {
     yield* lfsUpload(store, resolver, url, oids, fetchImpl, {
       streamRequestBody: opts.streamRequestBody,
     });
@@ -103,7 +103,7 @@ export async function* xetUpload(
 }
 
 /**
- * Download objects from a xet-or-basic LFS endpoint. On a `xet` agreement each
+ * Download objects from a webrun-chunks-or-basic LFS endpoint. On a `webrun-chunks` agreement each
  * object is pulled chunk-by-chunk (only the chunks missing locally) through
  * content-transfer, then its whole-file SHA-256 and size are verified against
  * the pointer (streamed from the store, never collected) before the mapping is
@@ -112,24 +112,24 @@ export async function* xetUpload(
  * concurrent honest download of the same bytes shares its content-derived id.
  * On a `basic` response the whole download defers to `vcs-transport-lfs`.
  */
-export async function* xetDownload(
+export async function* webrunChunksDownload(
   store: ContentStore,
   resolver: LfsResolver,
   url: string,
   oids: LfsPointer[],
-  opts: XetOptions = {},
-): AsyncIterable<XetTransportEvent> {
+  opts: WebrunChunksOptions = {},
+): AsyncIterable<WebrunChunksTransportEvent> {
   const fetchImpl = opts.fetchImpl ?? defaultFetch;
-  const batch = await postXetBatch(fetchImpl, url, "download", oids);
+  const batch = await postWebrunChunksBatch(fetchImpl, url, "download", oids);
 
-  if (batch.transfer !== XET_TRANSFER) {
+  if (batch.transfer !== WEBRUN_CHUNKS_TRANSFER) {
     yield* lfsDownload(store, resolver, url, oids, fetchImpl);
     return;
   }
 
   yield { type: "batch", operation: "download", count: batch.objects.length };
   const requested = new Map(oids.map((p) => [p.oid, p.size]));
-  for (const obj of batch.objects as XetBatchObjectResponse[]) {
+  for (const obj of batch.objects as WebrunChunksBatchObjectResponse[]) {
     if (obj.error) {
       yield { type: "error", oid: obj.oid, reason: obj.error.message };
       continue;

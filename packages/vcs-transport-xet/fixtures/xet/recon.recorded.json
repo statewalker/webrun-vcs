@@ -1,0 +1,28 @@
+{
+  "offset_into_first_range": 0,
+  "terms": [
+    {
+      "hash": "eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632",
+      "unpacked_length": 63527244,
+      "range": {
+        "start": 0,
+        "end": 796
+      }
+    }
+  ],
+  "fetch_info": {
+    "eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632": [
+      {
+        "range": {
+          "start": 0,
+          "end": 796
+        },
+        "url": "xorb://eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632",
+        "url_range": {
+          "start": 0,
+          "end": 14737812
+        }
+      }
+    ]
+  }
+}

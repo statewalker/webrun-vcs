@@ -13,7 +13,7 @@
  *
  * The real-HTTP binding is the SAME pair over `@statewalker/webrun-http-streams`
  * (`serveFetchOverDuplex` / `fetchOverDuplex`); here both ends are expressed
- * directly so a test can pass a `serveXet` handler as the client `fetchImpl`.
+ * directly so a test can pass a `serveWebrunChunks` handler as the client `fetchImpl`.
  */
 
 import type { FetchLike } from "@statewalker/vcs-transport-lfs";

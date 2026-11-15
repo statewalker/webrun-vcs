@@ -37,7 +37,7 @@ demos and benchmarks under `apps/`, and a documentation site under `docs/`.
 | [`@statewalker/vcs-transport`](packages/vcs-transport) | Git protocol client and server over a duplex stream or HTTP. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport) |
 | [`@statewalker/vcs-transport-adapters`](packages/vcs-transport-adapters) | Connects `History` and storage to the transport's repository interfaces. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-adapters) |
 | [`@statewalker/vcs-transport-lfs`](packages/vcs-transport-lfs) | Git LFS batch protocol with `basic` whole-object transfer. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-lfs) |
-| [`@statewalker/vcs-transport-xet`](packages/vcs-transport-xet) | Git LFS `xet` transfer: sends only missing chunks, falls back to `basic`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-xet) |
+| [`@statewalker/vcs-transport-xet`](packages/vcs-transport-xet) | Hugging Face Xet read client (CDC, BLAKE3 hashes, xorbs, shards, reconstruction); `webrun-chunks` LFS transfer at `/webrun-chunks`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-transport-xet) |
 | [`@statewalker/vcs-store-files`](packages/vcs-store-files) | Git `.git` layout over a `FilesApi`. | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-files) |
 | [`@statewalker/vcs-store-mem`](packages/vcs-store-mem) | In-memory storage. | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-mem) |
 | [`@statewalker/vcs-store-sql`](packages/vcs-store-sql) | SQL storage; sql.js adapter included (peer: `sql.js`). | [npm](https://www.npmjs.com/package/@statewalker/vcs-store-sql) |
