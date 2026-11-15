@@ -34,6 +34,7 @@
 import { EMPTY_BLOB_ID, FileMode } from "@statewalker/vcs-core";
 import {
   DeleteStagingEntry,
+  modeFromWorktree,
   UpdateStagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -45,6 +46,7 @@ import {
   StoreNotAvailableError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { worktreeModeTrust } from "./core-config.js";
 
 /**
  * Result of AddCommand execution.
@@ -420,6 +422,8 @@ export class AddCommand extends GitCommand<AddResult> {
 
     // Process files
     const editor = this.staging.createEditor();
+    // what the worktree's modes can be trusted for (git's core.filemode / core.symlinks)
+    const trust = worktreeModeTrust(this.workingCopy, worktree);
 
     for (const file of filesToProcess) {
       if (!file.exists) {
@@ -459,9 +463,11 @@ export class AddCommand extends GitCommand<AddResult> {
       // the stat that matched the stored content (a fresh one after a retry)
       const stored = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry);
 
-      // Add to staging
+      // Add to staging, with the mode git's ce_mode_from_stat would record
+      const indexMode = (await this.staging.getEntry(file.path))?.mode;
+      const mode = modeFromWorktree(stored.entry.mode, indexMode, trust);
       editor.add(
-        new UpdateStagingEntry(file.path, stored.id, stored.entry.mode, {
+        new UpdateStagingEntry(file.path, stored.id, mode, {
           size: stored.entry.size,
           mtime: stored.entry.mtime,
         }),

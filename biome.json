@@ -58,7 +58,7 @@
       }
     },
     {
-      "includes": ["packages/vcs-testing-gitea/**"],
+      "includes": ["packages/vcs-testing-gitea/**", "packages/vcs-utils-node/src/**"],
       "linter": {
         "rules": {
           "correctness": {

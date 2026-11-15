@@ -362,16 +362,33 @@ describe.each(backends)("Porcelain Commands ($name backend)", ({ factory }) => {
 
   // Step 8: Stash
   describe("Step 8: Stash", () => {
+    /** The staged tree as both the stash's index and its files (nothing unstaged). */
+    const stagedTree = (result: Awaited<ReturnType<typeof createInitializedGitFromFactory>>) => {
+      const tree = () => result.workingCopy.checkout.staging.writeTree(result.repository.trees);
+      return {
+        getIndexTree: tree,
+        getWorkingTree: tree,
+        hasLocalChanges: async () => true,
+        resetHard: async () => {},
+      };
+    };
+
     it("should create stash", async () => {
       const result = await createInitializedGitFromFactory(factory);
       cleanup = result.cleanup;
       const { git, store } = result;
 
       await addFile(store, "wip.txt", "work in progress");
-      const stashId = await git.stashCreate().setMessage("WIP").call();
-
-      // Stash should be created (may or may not return ID depending on implementation)
-      expect(stashId === null || typeof stashId === "string").toBe(true);
+      // without a working tree there is nothing to stash: refused, not a stash of HEAD
+      await expect(git.stashCreate().setMessage("WIP").call()).rejects.toThrow(
+        /requires a working tree/,
+      );
+      const stashId = await git
+        .stashCreate()
+        .setWorkingTreeProvider(stagedTree(result))
+        .setMessage("WIP")
+        .call();
+      expect(typeof stashId).toBe("string");
     });
 
     it("should list stashes", async () => {
@@ -380,10 +397,14 @@ describe.each(backends)("Porcelain Commands ($name backend)", ({ factory }) => {
       const { git, store } = result;
 
       await addFile(store, "wip1.txt", "wip1");
-      await git.stashCreate().setMessage("Stash 1").call();
+      await git
+        .stashCreate()
+        .setWorkingTreeProvider(stagedTree(result))
+        .setMessage("Stash 1")
+        .call();
 
       const stashes = await git.stashList().call();
-      expect(Array.isArray(stashes)).toBe(true);
+      expect(stashes).toHaveLength(1);
     });
   });
 });

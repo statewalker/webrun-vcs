@@ -4,6 +4,7 @@ import { isSymbolicRef } from "@statewalker/vcs-core";
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
 
 /** Names this operation in restore failure messages. */
@@ -238,15 +239,27 @@ export class ResetCommand extends GitCommand<Ref> {
 
     // Plan the whole restore first. Anything unrestorable then fails while the
     // working tree is still untouched, instead of half-way through rewriting it.
-    const plan = await planTreeRestore(this.trees, this.blobs, commit.tree, RESET_HARD);
+    const plan = await planTreeRestore(this.trees, this.blobs, commit.tree, RESET_HARD, {
+      symlinks: true,
+      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      windows: worktree.capabilities?.windowsPaths === true,
+      reservedNames: worktree.capabilities?.reservedNames,
+    });
 
-    await writeTreeRestorePlan(worktree, this.blobs, plan, RESET_HARD);
-
-    // Delete files that were tracked but are not in the target tree.
+    // Delete the files that were tracked but are not in the target tree first, as git's
+    // unpack-trees does: a tracked file or symlink `d` then makes way for `d/x`, and is
+    // never written beneath or through.
     for (const path of trackedBefore) {
       if (plan.paths.has(path)) continue;
       await worktree.remove(path);
     }
+
+    // a forced checkout: a file or link where a directory must go is unlinked, never
+    // written through; links are written as links where the worktree has them
+    await writeTreeRestorePlan(worktree, this.blobs, plan, RESET_HARD, {
+      symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
+      replaceInTheWay: true,
+    });
   }
 
   /**

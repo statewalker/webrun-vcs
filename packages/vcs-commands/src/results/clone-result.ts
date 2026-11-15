@@ -22,4 +22,10 @@ export interface CloneResult {
   bare: boolean;
   /** Head commit after clone */
   headCommit?: ObjectId;
+  /**
+   * Files of the checked-out tree whose paths differ only in case (`README`, `readme`),
+   * on a worktree that folds case (`core.ignorecase`): only one of each group is in the
+   * worktree, as with git's "the following paths have collided" warning.
+   */
+  collidedPaths?: string[];
 }

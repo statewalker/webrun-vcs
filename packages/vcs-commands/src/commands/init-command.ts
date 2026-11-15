@@ -3,11 +3,14 @@ import {
   createMemoryHistory,
   type FilesApi,
   type History,
+  type PosixFilesApi,
 } from "@statewalker/vcs-core";
 import {
   createFileWorktree,
   createGitFilesHistoryFromFiles,
   FileStagingStore,
+  probeCaseFolding,
+  resolveLinkedGitDir,
 } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import {
@@ -236,14 +239,16 @@ export class InitCommand {
     let staging: Staging;
     if (this.files) {
       const dir = gitDir.replace(/\/+$/, "") || ".";
-      const isFile = async (path: string) => (await files.stats(path))?.kind === "file";
+      // a `.git` the user linked elsewhere is followed (resolved through the FilesApi)
+      const repoFiles = await resolveLinkedGitDir(files, dir);
+      const isFile = async (path: string) => (await repoFiles.stats(path))?.kind === "file";
       const hasHead = await isFile(`${dir}/HEAD`);
       // A repository with a config but no HEAD (damaged or half-made) is opened, not
       // re-created: creating rewrites the config, and its remotes and settings with it.
       const fresh = !hasHead && !(await isFile(`${dir}/config`));
       const open = (create: boolean) =>
         createGitFilesHistoryFromFiles({
-          files,
+          files: repoFiles,
           gitDir,
           create,
           defaultBranch: this.initialBranch,
@@ -252,12 +257,21 @@ export class InitCommand {
         // The directory layout writes `core.bare = true` only for a gitDir of "."; set it
         // before opening, so what reads the config (reflog defaults) sees a bare repository.
         await open(true);
-        await markBare(files, `${dir}/config`);
+        await markBare(repoFiles, `${dir}/config`);
         history = await open(false);
       } else {
         history = await open(fresh);
       }
       await history.initialize();
+      if (fresh) {
+        // git init's probe: a filesystem that folds case or Unicode composition
+        const folding = await probeCaseFolding(repoFiles as PosixFilesApi, dir);
+        if (folding.ignoreCase)
+          await setCoreValue(repoFiles, `${dir}/config`, "ignorecase", "true");
+        if (folding.precomposeUnicode) {
+          await setCoreValue(repoFiles, `${dir}/config`, "precomposeunicode", "true");
+        }
+      }
       if (!hasHead && !fresh) {
         await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
       }
@@ -268,7 +282,7 @@ export class InitCommand {
       } else if (this.bare) {
         staging = new MemoryStagingStore();
       } else {
-        const fileStaging = new FileStagingStore(files, `${dir}/index`);
+        const fileStaging = new FileStagingStore(repoFiles, `${dir}/index`);
         await fileStaging.read();
         staging = fileStaging;
       }
@@ -417,12 +431,23 @@ export class InitCommand {
 
 /** Sets `core.bare = true` in a config file written by the git directory layout. */
 async function markBare(files: FilesApi, configPath: string): Promise<void> {
+  await setCoreValue(files, configPath, "bare", "true");
+}
+
+/** Sets `core.<key>` in the fresh config `init` wrote (one `[core]` section). */
+async function setCoreValue(
+  files: FilesApi,
+  configPath: string,
+  key: string,
+  value: string,
+): Promise<void> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of files.read(configPath)) chunks.push(chunk);
   const text = new TextDecoder().decode(concatChunks(chunks));
-  const updated = /^\s*bare\s*=/m.test(text)
-    ? text.replace(/^(\s*bare\s*=\s*)\S+/m, "$1true")
-    : text.replace(/^\[core\]\s*$/m, "[core]\n\tbare = true");
+  const existing = new RegExp(`^(\\s*${key}\\s*=\\s*)\\S+`, "mi");
+  const updated = existing.test(text)
+    ? text.replace(existing, `$1${value}`)
+    : text.replace(/^\[core\]\s*$/m, `[core]\n\t${key} = ${value}`);
   await files.write(configPath, [new TextEncoder().encode(updated)]);
 }
 

@@ -11,8 +11,12 @@
 // Note: isNotFoundError and tryReadFile are not re-exported here
 // because they conflict with ./utils/file-utils.ts exports.
 export {
+  BeyondSymlinkError,
   basename,
   createInMemoryFilesApi,
+  createMountedFilesApi,
+  createSubtreeFilesApi,
+  createSymlinkFilesApi,
   dirname,
   extname,
   type FileInfo,
@@ -20,9 +24,12 @@ export {
   type FileModeValue,
   type FileStats,
   type FilesApi,
+  isBeyondSymlinkError,
   joinPath,
+  type LinkStats,
   type ListOptions,
   normalizePath,
+  type PosixFilesApi,
   type ReadOptions,
   readAt,
   readFile,

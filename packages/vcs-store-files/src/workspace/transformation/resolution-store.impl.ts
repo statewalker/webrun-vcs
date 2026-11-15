@@ -5,14 +5,18 @@
  * - Staging area entries (stages 1-3) for conflict detection
  * - Working tree for resolved content
  * - .git/rr-cache/ for recorded resolutions (rerere)
+ *
+ * Worktree files are read and written through a Worktree (a FileWorktree over the
+ * FilesApi by default), never with raw FilesApi calls: a symbolic link is read as its
+ * target and replaced rather than written through, and nothing beneath a link is touched.
  */
 
-import { assertValidWorktreePath, type Blobs, type ObjectId } from "@statewalker/vcs-core";
+import { type Blobs, FileMode, type ObjectId, type Trees } from "@statewalker/vcs-core";
 import { sha1 } from "@statewalker/vcs-utils";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { dirname, joinPath, tryReadFile } from "@statewalker/vcs-utils/files";
-import type { IndexEntry, Staging } from "@statewalker/vcs-working-tree";
-import { MergeStage } from "@statewalker/vcs-working-tree";
+import type { IndexEntry, Staging, Worktree } from "@statewalker/vcs-working-tree";
+import { MergeStage, storeWorktreeFile } from "@statewalker/vcs-working-tree";
 import type {
   ConflictEntry,
   ConflictInfo,
@@ -22,6 +26,7 @@ import type {
   Resolution,
   ResolutionStore,
 } from "@statewalker/vcs-working-tree/transformation";
+import { createFileWorktree } from "../worktree/index.js";
 
 /**
  * Git file-based ResolutionStore implementation.
@@ -31,7 +36,7 @@ import type {
  */
 export class GitResolutionStore implements ResolutionStore {
   private readonly rerereDir: string;
-  private readonly worktreePath: string;
+  private readonly worktree: Worktree;
 
   constructor(
     private readonly files: FilesApi,
@@ -39,10 +44,20 @@ export class GitResolutionStore implements ResolutionStore {
     private readonly blobs: Blobs,
     readonly gitDir: string,
     worktreePath?: string,
+    worktree?: Worktree,
   ) {
     this.rerereDir = joinPath(gitDir, "rr-cache");
     // Worktree is typically the parent of .git directory
-    this.worktreePath = worktreePath ?? dirname(gitDir);
+    this.worktree =
+      worktree ??
+      createFileWorktree({
+        files,
+        rootPath: worktreePath ?? dirname(gitDir),
+        gitDir,
+        blobs,
+        // never used: the resolution store reads and writes files, it checks out no tree
+        trees: {} as Trees,
+      });
   }
 
   // ========== Conflict Registry ==========
@@ -164,12 +179,16 @@ export class GitResolutionStore implements ResolutionStore {
     for (const conflict of conflicts) {
       if (conflict.resolvedInWorktree) {
         // Stream the working tree file into a blob and stage it
-        const objectId = await this.storeWorktreeFile(conflict.path);
-        if (objectId) {
+        const stored = await this.storeWorktreeFile(conflict.path);
+        if (stored) {
           await this.markResolved(conflict.path, {
             strategy: "manual",
-            objectId,
-            mode: conflict.ours?.mode ?? conflict.theirs?.mode ?? 0o100644,
+            objectId: stored.id,
+            // a link stays a link; a file keeps the mode the conflict had
+            mode:
+              stored.mode === FileMode.SYMLINK
+                ? FileMode.SYMLINK
+                : (conflict.ours?.mode ?? conflict.theirs?.mode ?? 0o100644),
           });
         }
       }
@@ -198,7 +217,7 @@ export class GitResolutionStore implements ResolutionStore {
     });
 
     // Write to working tree
-    await this.writeWorktreeFile(path, conflict.ours.objectId);
+    await this.writeWorktreeFile(path, conflict.ours.objectId, conflict.ours.mode);
   }
 
   async acceptTheirs(path: string): Promise<void> {
@@ -217,7 +236,7 @@ export class GitResolutionStore implements ResolutionStore {
     });
 
     // Write to working tree
-    await this.writeWorktreeFile(path, conflict.theirs.objectId);
+    await this.writeWorktreeFile(path, conflict.theirs.objectId, conflict.theirs.mode);
   }
 
   // ========== Resolution Recording (rerere) ==========
@@ -271,10 +290,8 @@ export class GitResolutionStore implements ResolutionStore {
     const recorded = await this.getSuggestedResolution(path);
     if (!recorded?.resolvedContent) return false;
 
-    // Write resolved content to working tree
-    assertValidWorktreePath(path);
-    const fullPath = joinPath(this.worktreePath, path);
-    await this.files.write(fullPath, [recorded.resolvedContent]);
+    // Write resolved content to working tree (a link there is replaced, never followed)
+    await this.worktree.writeContent(path, recorded.resolvedContent);
 
     return true;
   }
@@ -405,14 +422,14 @@ export class GitResolutionStore implements ResolutionStore {
    * Check if file is resolved in working tree (no conflict markers)
    */
   private async isResolvedInWorktree(path: string): Promise<boolean> {
-    const fullPath = joinPath(this.worktreePath, path);
     try {
-      if (!(await this.files.stats(fullPath))) return false;
+      const entry = await this.worktree.getEntry(path);
+      if (!entry || entry.isDirectory) return false;
       // Scan for conflict markers chunk by chunk; the tail of each chunk is kept
       // so a marker split across two chunks is still found.
       const decoder = new TextDecoder();
       let tail = "";
-      for await (const chunk of this.files.read(fullPath)) {
+      for await (const chunk of this.worktree.readContent(path)) {
         const text = tail + decoder.decode(chunk, { stream: true });
         if (text.includes("<<<<<<<") || text.includes(">>>>>>>")) return false;
         tail = text.slice(-6);
@@ -496,13 +513,12 @@ export class GitResolutionStore implements ResolutionStore {
    * Read file from working tree
    */
   private async readWorktreeFile(path: string): Promise<Uint8Array | undefined> {
-    const fullPath = joinPath(this.worktreePath, path);
     try {
-      // First check if file exists
-      const stats = await this.files.stats(fullPath);
-      if (!stats) return undefined;
-
-      return await tryReadFile(this.files, fullPath);
+      const entry = await this.worktree.getEntry(path);
+      if (!entry || entry.isDirectory) return undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of this.worktree.readContent(path)) chunks.push(chunk);
+      return this.concat(chunks);
     } catch {
       return undefined;
     }
@@ -511,14 +527,12 @@ export class GitResolutionStore implements ResolutionStore {
   /**
    * Write content to working tree
    */
-  private async writeWorktreeFile(path: string, objectId: ObjectId): Promise<void> {
-    // the blob streams into the file; it is never held whole in memory
-    // Conflict paths come from merged trees: never write into `.git`.
-    assertValidWorktreePath(path);
+  private async writeWorktreeFile(path: string, objectId: ObjectId, mode?: number): Promise<void> {
+    // the blob streams into the file; it is never held whole in memory. The worktree
+    // refuses paths naming `.git` and paths beneath a symbolic link.
     const content = await this.blobs.load(objectId);
     if (content) {
-      const fullPath = joinPath(this.worktreePath, path);
-      await this.files.write(fullPath, content);
+      await this.worktree.writeContent(path, content, mode !== undefined ? { mode } : {});
     }
   }
 
@@ -527,16 +541,14 @@ export class GitResolutionStore implements ResolutionStore {
    * the file changes size while it is read, it is stored again without a size
    * (the blob store spools it).
    */
-  private async storeWorktreeFile(path: string): Promise<ObjectId | undefined> {
-    const fullPath = joinPath(this.worktreePath, path);
-    const stats = await this.files.stats(fullPath).catch(() => undefined);
-    if (stats?.kind !== "file") return undefined;
-    try {
-      return await this.blobs.store(this.files.read(fullPath), stats.size);
-    } catch (e) {
-      if ((e as Error)?.name !== "SizeMismatchError") throw e;
-      return this.blobs.store(this.files.read(fullPath));
-    }
+  private async storeWorktreeFile(
+    path: string,
+  ): Promise<{ id: ObjectId; mode: number } | undefined> {
+    const entry = await this.worktree.getEntry(path).catch(() => undefined);
+    if (!entry || entry.isDirectory) return undefined;
+    // a symbolic link is stored as its target, never as the file it names
+    const stored = await storeWorktreeFile(this.blobs, this.worktree, path, entry);
+    return { id: stored.id, mode: entry.mode };
   }
 
   /**

@@ -34,7 +34,7 @@
  */
 
 import { FileMode, isValidBranchName, type ObjectId, type Ref } from "@statewalker/vcs-core";
-import { UpdateStagingEntry } from "@statewalker/vcs-working-tree";
+import { UpdateStagingEntry, type Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   InvalidRefNameError,
@@ -45,6 +45,17 @@ import {
   RefNotFoundError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import {
+  findInTheWay,
+  overwriteMessage,
+  pruneEmptyParents,
+  worktreeDiffers,
+} from "./worktree-overwrite-checks.js";
+
+/** Names a branch checkout in failure messages. */
+const CHECKOUT = "checkout";
 
 /**
  * Stage to check out for conflicting files.
@@ -92,7 +103,25 @@ export interface CheckoutResult {
 
   /** The ref that was checked out (null for path checkout) */
   readonly ref: Ref | null;
+
+  /**
+   * Why a checkout was refused, in git's words (`status` CONFLICTS): local changes or
+   * untracked files the switch would overwrite, or an index with unmerged entries.
+   */
+  readonly message?: string;
 }
+
+/** A tree or index entry, as the two-way merge compares them (index entries with stat). */
+interface Side {
+  objectId: ObjectId;
+  mode: number;
+  size?: number;
+  mtime?: number;
+  ctime?: number;
+}
+
+const sameSide = (a: Side | undefined, b: Side | undefined) =>
+  a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
 
 /**
  * Command to checkout branches, commits, or paths.
@@ -262,13 +291,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     this.checkCallable();
     this.setCallable(false);
 
-    // Path checkout mode
-    if (this.allPaths || this.paths.length > 0) {
-      return this.checkoutPaths();
-    }
-
-    // Branch checkout mode
-    return this.checkoutBranch();
+    // path checkout, or branch checkout; one worktree batch, so the checks and the writes
+    // share one reading of the ignore rules
+    const run = () =>
+      this.allPaths || this.paths.length > 0 ? this.checkoutPaths() : this.checkoutBranch();
+    const worktree = this.worktreeAccess;
+    return worktree?.batch ? worktree.batch(run) : run();
   }
 
   /**
@@ -315,50 +343,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     };
   }
 
-  /**
-   * Detect conflicts between staged changes and checkout target.
-   *
-   * Returns list of paths that have uncommitted staged changes.
-   * Git prevents checkout when staged changes differ from HEAD,
-   * as they would be lost during checkout.
-   *
-   * @param _targetTreeId Target tree to checkout (unused for now, checks HEAD vs staging)
-   * @returns Array of conflicting paths
-   */
-  private async detectCheckoutConflicts(_targetTreeId?: ObjectId): Promise<string[]> {
-    const conflicts: string[] = [];
-
-    // Get current HEAD tree for comparison
-    const headId = await this.resolveCommitId("HEAD");
-    if (!headId) {
-      // No HEAD commit yet (empty repository) - no conflicts possible
-      return conflicts;
-    }
-
-    const headTreeId = await this.commits.getTree(headId);
-    if (!headTreeId) {
-      return conflicts;
-    }
-
-    // Collect HEAD tree entries
-    const headEntries = new Map<string, { objectId: ObjectId; mode: number }>();
-    await this.collectTreeEntries(headTreeId, "", headEntries);
-
-    // Compare staging with HEAD
-    for await (const entry of this.staging.entries()) {
-      // Skip conflict stages (1-3) - only check stage 0
-      if (entry.stage !== 0) continue;
-
-      const headEntry = headEntries.get(entry.path);
-
-      // Check if staged content differs from HEAD
-      if (!headEntry || headEntry.objectId !== entry.objectId) {
-        // Staged change differs from HEAD - this is an uncommitted change
-        conflicts.push(entry.path);
-      }
-    }
-
-    return conflicts;
+  /** Whether an untracked (not ignored) file or link is at `path`. */
+  private async untrackedFileAt(worktree: Worktree, path: string): Promise<boolean> {
+    const entry = await worktree.getEntry(path);
+    return !!entry && !entry.isDirectory && !(await worktree.isIgnored(path));
   }
 
   /**
@@ -394,18 +382,147 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // Get target tree for conflict detection and checkout
     const targetTreeId = targetId ? await this.commits.getTree(targetId) : undefined;
 
-    // Detect conflicts with staged changes before checkout
-    if (!this.force && !this.orphan) {
-      const conflicts = await this.detectCheckoutConflicts(targetTreeId);
-      if (conflicts.length > 0) {
-        return {
-          status: CheckoutStatus.CONFLICTS,
-          updated: [],
-          removed: [],
-          conflicts,
-          ref: null,
-        };
+    // git's two-way merge (unpack-trees `twoway_merge`, checkout without -f): a path HEAD
+    // and the target agree on keeps its index entry and worktree file as they are (local
+    // edits survive the switch); a path they differ on is switched only when the index and
+    // the worktree still hold HEAD's version, else the checkout is refused, as are
+    // untracked files in the way and an index with unmerged entries. With `setForce`, as
+    // `git checkout -f`, the target's tree replaces index and worktree whatever they hold.
+    const worktree = this.worktreeAccess;
+    const headId = await this.resolveCommitId("HEAD");
+    const headTreeId = headId ? await this.commits.getTree(headId) : undefined;
+    const head = new Map<string, Side>();
+    const target = new Map<string, Side>();
+    if (headTreeId) await this.collectTreeEntries(headTreeId, "", head);
+    if (targetTreeId) await this.collectTreeEntries(targetTreeId, "", target);
+    const index = new Map<string, Side>();
+    const unmerged = new Set<string>();
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage === 0) index.set(entry.path, entry);
+      else unmerged.add(entry.path);
+    }
+
+    if (!this.force && !this.orphan && unmerged.size > 0) {
+      return {
+        status: CheckoutStatus.CONFLICTS,
+        updated: [],
+        removed: [],
+        conflicts: [...unmerged].sort(),
+        ref: null,
+        message: "error: you need to resolve your current index first",
+      };
+    }
+
+    // the paths the switch changes, and those it must refuse to touch
+    const switched: string[] = [];
+    const local: string[] = [];
+    const untracked: string[] = [];
+    const untrackedRemoved: string[] = [];
+    const lostDirs: string[] = [];
+    const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
+    const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
+    const paths = [...new Set([...head.keys(), ...target.keys()])].sort();
+    // (an orphan branch keeps index and worktree as they are, as git's --orphan)
+    for (const path of this.orphan ? [] : paths) {
+      const h = head.get(path);
+      const t = target.get(path);
+      if (!this.force && sameSide(h, t)) continue;
+      const i = index.get(path);
+      if (this.force) {
+        if (!sameSide(i, t) || t) switched.push(path);
+        continue;
       }
+      if (sameSide(i, t)) {
+        // kept; but a staged deletion the target also makes leaves the file untracked in
+        // the worktree, and the switch would remove it (git refuses)
+        if (h && !i && !t && worktree && (await this.untrackedFileAt(worktree, path))) {
+          untrackedRemoved.push(path);
+        }
+        continue;
+      }
+      if (!sameSide(i, h)) {
+        // staged changes (or a staged deletion) the switch would lose
+        if (i !== undefined || t !== undefined) local.push(path);
+        continue;
+      }
+      if (i !== undefined && worktree && (await worktreeDiffers(worktree, path, i, trust))) {
+        local.push(path);
+        continue;
+      }
+      switched.push(path);
+    }
+
+    // what stands where the switch writes (git's verify_absent, check_leading_path and
+    // verify_clean_subdirectory): untracked files or links on the path or a leading
+    // component, untracked files in a directory a file replaces
+    if (worktree && !this.force) {
+      const found = await findInTheWay(worktree, {
+        writes: switched.filter((p) => target.has(p)),
+        removes: new Set(switched.filter((p) => !target.has(p))),
+        index,
+        ignoreCase,
+      });
+      untracked.push(...found.untracked);
+      lostDirs.push(...found.lostDirs);
+    }
+    if (local.length + untracked.length + untrackedRemoved.length + lostDirs.length > 0) {
+      const message = overwriteMessage("checkout", {
+        local,
+        lostDirs,
+        untracked,
+        untrackedRemoved,
+      });
+      return {
+        status: CheckoutStatus.CONFLICTS,
+        updated: [],
+        removed: [],
+        conflicts: [...local, ...lostDirs, ...untracked, ...untrackedRemoved],
+        ref: null,
+        message,
+      };
+    }
+
+    // The worktree first, as git: the target tree is planned (paths verified, entries
+    // checked not to collide) before anything is written; the switched paths the target
+    // drops are removed, then its switched files, links and submodule directories written.
+    const updated: string[] = [];
+    const removed: string[] = [];
+    const switching = new Set(switched);
+    if (targetTreeId && worktree) {
+      const plan = await planTreeRestore(this.trees, this.blobs, targetTreeId, CHECKOUT, {
+        symlinks: true,
+        ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+        windows: worktree.capabilities?.windowsPaths === true,
+        reservedNames: worktree.capabilities?.reservedNames,
+      });
+      for (const path of switched) {
+        if (target.has(path)) continue;
+        await worktree.remove(path);
+        await pruneEmptyParents(worktree, path);
+        removed.push(path);
+      }
+      // a forced checkout also drops tracked files no tree holds any more
+      if (this.force) {
+        for (const path of index.keys()) {
+          if (!target.has(path) && !switching.has(path)) {
+            await worktree.remove(path);
+            removed.push(path);
+          }
+        }
+      }
+      const only = {
+        ...plan,
+        entries: plan.entries.filter((e) => switching.has(e.path)),
+        gitlinks: plan.gitlinks.filter((e) => switching.has(e.path)),
+      };
+      // everything in the way was checked above (or the checkout is forced): a file or link
+      // where a directory goes, a clean directory where a file goes, are replaced
+      await writeTreeRestorePlan(worktree, this.blobs, only, CHECKOUT, {
+        symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
+        gitlinks: true,
+        replaceInTheWay: true,
+      });
+      updated.push(...only.entries.map((e) => e.path));
     }
 
     // Determine if we should use symbolic ref (branch) or detached HEAD (commit/tag)
@@ -425,21 +542,31 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       await this.refsStore.set("HEAD", targetId);
     }
 
-    // Sync staging to match target tree AFTER updating HEAD
-    const updated: string[] = [];
-    const removed: string[] = [];
-
-    if (targetTreeId) {
-      // Use this.trees which is CommandTrees (has loadTree method for TreeStore compatibility)
+    // The index: forced, the target's tree; else the switched paths take the target's
+    // entries (with the stat of the files just written), every other path keeps its own
+    if (targetTreeId && this.force) {
       await this.staging.readTree(this.trees as any, targetTreeId);
-
-      // Persist staging to .git/index so native git sees the correct state
       await this.staging.write();
-
-      // Write files to working directory if not a bare repository
-      if (this.hasFileWriteSupport()) {
-        await this.writeTreeToWorkdir(targetTreeId, "");
+    } else if (switched.length > 0) {
+      const editor = this.staging.createEditor();
+      for (const path of switched) {
+        const t = target.get(path);
+        if (!t) {
+          editor.remove(path);
+          continue;
+        }
+        const stats = worktree ? await worktree.getEntry(path) : undefined;
+        editor.upsert({
+          path,
+          objectId: t.objectId,
+          mode: t.mode,
+          size: stats?.size ?? 0,
+          mtime: stats?.mtime ?? 0,
+          ...(stats?.ctime !== undefined ? { ctime: stats.ctime } : {}),
+        });
       }
+      await editor.finish();
+      await this.staging.write();
     }
 
     // Get the ref we checked out
@@ -452,49 +579,6 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       conflicts: [],
       ref: ref ?? null,
     };
-  }
-
-  /**
-   * Check if the store supports file writes (not a bare repository).
-   *
-   * A repository is considered "bare" if it doesn't have a worktree interface.
-   */
-  private hasFileWriteSupport(): boolean {
-    return !!this.worktreeAccess;
-  }
-
-  /**
-   * Write all files from a tree to the working directory.
-   *
-   * @param treeId The tree ID to checkout
-   * @param basePath The base path prefix for entries in this tree
-   */
-  private async writeTreeToWorkdir(treeId: ObjectId, basePath: string): Promise<void> {
-    const worktree = this.worktreeAccess;
-    if (!worktree) {
-      throw new Error("Worktree not available for file writes");
-    }
-
-    for await (const entry of this.trees.loadTree(treeId)) {
-      const relativePath = basePath ? `${basePath}/${entry.name}` : entry.name;
-      const isDirectory = entry.mode === FileMode.TREE;
-
-      if (isDirectory) {
-        // Recursively process subdirectories
-        await this.writeTreeToWorkdir(entry.id, relativePath);
-      } else {
-        // Ensure parent directory exists
-        const lastSlash = relativePath.lastIndexOf("/");
-        if (lastSlash > 0) {
-          const parentDir = relativePath.substring(0, lastSlash);
-          await worktree.mkdir(parentDir);
-        }
-
-        // Stream the blob into the file (an empty file when the blob is missing)
-        const blobContent = await this.blobs.load(entry.id);
-        await worktree.writeContent(relativePath, blobContent ?? []);
-      }
-    }
   }
 
   /**

@@ -29,7 +29,19 @@ export async function step08Stash(): Promise<void> {
   // Create a stash
   console.log("\nCreating a stash with git.stashCreate()...");
   await addFileToStaging(workingCopy, "work-in-progress.ts", "// WIP code");
-  const stashCommit = await git.stashCreate().setMessage("WIP: feature work").call();
+  // stash needs to know what to save: here the staged tree is both the stash's index and
+  // its files (an in-memory working copy has no separate files)
+  const stagedTree = () => workingCopy.checkout.staging.writeTree(history.trees);
+  const stashCommit = await git
+    .stashCreate()
+    .setWorkingTreeProvider({
+      getIndexTree: stagedTree,
+      getWorkingTree: stagedTree,
+      hasLocalChanges: async () => true,
+      resetHard: async () => {},
+    })
+    .setMessage("WIP: feature work")
+    .call();
 
   if (stashCommit) {
     console.log(`  Stash created: ${shortId(stashCommit)}`);

@@ -23,6 +23,15 @@ export function nativeGitEnv(home: string): Record<string, string> {
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
+    // git >= 2.5x runs `maintenance run --auto --detach` after commands such as commit;
+    // the detached process repacks .git/objects while a test copies or reads the repository
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "maintenance.auto",
+    GIT_CONFIG_VALUE_0: "false",
+    GIT_CONFIG_KEY_1: "gc.auto",
+    GIT_CONFIG_VALUE_1: "0",
+    // a git build run from outside its install (another version) finds its helpers here
+    ...(process.env.GIT_EXEC_PATH ? { GIT_EXEC_PATH: process.env.GIT_EXEC_PATH } : {}),
   };
 }
 

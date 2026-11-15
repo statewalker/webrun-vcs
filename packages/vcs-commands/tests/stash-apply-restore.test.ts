@@ -340,9 +340,10 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
       worktree: { "keep.txt": "keep", "contested.txt": "LOCAL WORK IN PROGRESS" },
     });
 
-    const result = await git.stashApply().call();
-
-    expect(result.status).toBe(StashApplyStatus.CONFLICTS);
+    // with --index git merges the index first, and refuses on its conflict
+    await expect(git.stashApply().setRestoreIndex(true).call()).rejects.toThrow(
+      /conflicts in index\. Try without --index\./,
+    );
     expect(await getFile(workingCopy, "contested.txt")).toBe("LOCAL WORK IN PROGRESS");
   });
 
@@ -357,21 +358,21 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
       worktree: { "keep.txt": "keep", "contested.txt": "LOCAL WORK IN PROGRESS" },
     });
 
-    const result = await git.stashApply().setRestoreIndex(false).call();
-
-    expect(result.status).toBe(StashApplyStatus.CONFLICTS);
+    await expect(git.stashApply().setRestoreIndex(false).call()).rejects.toThrow(
+      /Your local changes to the following files would be overwritten by merge/,
+    );
     expect(await getFile(workingCopy, "contested.txt")).toBe("LOCAL WORK IN PROGRESS");
   });
 
   // -------------------------------------------------------------- the index
 
-  it("stages the merged index tree when restoreIndex is on (the default)", async () => {
+  it("stages the merged index tree when restoreIndex is on (--index)", async () => {
     const { git, workingCopy } = await buildStash({
       baseFiles: { "keep.txt": "keep", "data.txt": "base content" },
       stash: { add: { "data.txt": "stashed content" } },
     });
 
-    await git.stashApply().call();
+    await git.stashApply().setRestoreIndex(true).call();
 
     const staged = await stagedBlobs(workingCopy);
     expect(staged.get("data.txt")).toBe(await blobOf(workingCopy, "stashed content"));
@@ -387,7 +388,7 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
       stashIndex: { add: { "data.txt": "staged content" } },
     });
 
-    await git.stashApply().call();
+    await git.stashApply().setRestoreIndex(true).call();
 
     const staged = await stagedBlobs(workingCopy);
     expect(staged.get("data.txt")).toBe(await blobOf(workingCopy, "staged content"));
@@ -400,7 +401,7 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
       stash: { remove: ["doomed.txt"] },
     });
 
-    await git.stashApply().call();
+    await git.stashApply().setRestoreIndex(true).call();
 
     const staged = await stagedBlobs(workingCopy);
     expect(staged.has("doomed.txt")).toBe(false);
@@ -479,15 +480,15 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
 
   // -------------------------------------------------- what it will not do
 
-  it("refuses to restore a symlink rather than writing it as a regular file", async () => {
-    // The symlink target's blob id is irrelevant: the mode is rejected before
-    // any blob is looked up.
+  it("refuses to restore a symlink whose blob is missing, before writing", async () => {
+    // Symlinks are restored as links now (the worktree gets mode 120000); like any
+    // entry, a link whose blob is missing fails the plan before anything is written.
     const { git, workingCopy } = await buildStash({
       baseFiles: { "keep.txt": "keep" },
       stash: { raw: { link: ["1234abcd".repeat(5), FileMode.SYMLINK] } },
     });
 
-    await expect(git.stashApply().call()).rejects.toThrow(/symbolic links/);
+    await expect(git.stashApply().call()).rejects.toThrow(/cannot restore link: blob/);
     expect(await hasFile(workingCopy, "link")).toBe(false);
   });
 

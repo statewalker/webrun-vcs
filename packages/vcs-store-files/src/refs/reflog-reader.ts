@@ -19,6 +19,7 @@ import {
   type ReflogEntry,
   type ReflogReader,
 } from "@statewalker/vcs-core";
+import { isBeyondSymlinkError } from "@statewalker/vcs-utils/files";
 
 const LOGS_DIR = "logs";
 
@@ -81,7 +82,8 @@ class ReflogReaderImpl implements ReflogReader {
         chunks.push(chunk);
       }
       return new TextDecoder().decode(concatUint8Arrays(chunks));
-    } catch {
+    } catch (error) {
+      if (isBeyondSymlinkError(error)) throw error;
       return undefined;
     }
   }

@@ -1,3 +1,4 @@
+import type { CloneResult } from "../results/index.js";
 import { GitApiError } from "./git-api-error.js";
 
 /**
@@ -38,5 +39,24 @@ export class NotADirectoryError extends GitApiError {
     super(message ?? `Not a directory: ${path}`);
     this.name = "NotADirectoryError";
     this.path = path;
+  }
+}
+
+/**
+ * Thrown when a clone fetched its objects and wrote its refs and configuration, but could
+ * not check out the commit HEAD names (git: "Clone succeeded, but checkout failed").
+ *
+ * The repository is usable: `result` is what the clone returns, and the cause says
+ * why the checkout failed. As with git, fixing the cause and checking out again (or a
+ * `reset --hard`) completes the clone.
+ */
+export class CloneCheckoutError extends GitApiError {
+  readonly result: CloneResult;
+
+  constructor(result: CloneResult, cause: unknown) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    super(`Clone succeeded, but checkout failed: ${reason}`, { cause });
+    this.name = "CloneCheckoutError";
+    this.result = result;
   }
 }

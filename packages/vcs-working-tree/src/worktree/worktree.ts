@@ -42,12 +42,24 @@ export interface WorktreeWalkOptions {
  * Options for writing content.
  */
 export interface WorktreeWriteOptions {
-  /** File mode (default: 0o100644 for regular files) */
+  /**
+   * File mode (default: 0o100644 for regular files). `0o100755` sets the
+   * executable bit where the worktree can; `0o120000` (symlink) makes the
+   * content the link target, written as a symbolic link where the worktree can
+   * create one and as a plain file holding the target otherwise (git with
+   * `core.symlinks=false`). See {@link Worktree.capabilities}.
+   */
   mode?: number;
   /** Overwrite existing file (default: true) */
   overwrite?: boolean;
   /** Create parent directories (default: true) */
   createParents?: boolean;
+  /**
+   * A forced checkout (`reset --hard`): a file or symbolic link standing where a parent
+   * directory must go is unlinked (never followed), as git does with `state->force`.
+   * Without it such a path is refused.
+   */
+  replaceInTheWay?: boolean;
 }
 
 /**
@@ -77,11 +89,53 @@ export interface WorktreeCheckoutResult {
 }
 
 /**
+ * What a worktree can represent of git's file modes: what `git init` probes
+ * the filesystem for and records as `core.filemode` and `core.symlinks`.
+ */
+export interface WorktreeCapabilities {
+  /** Files written with mode `0o100755` are executable. */
+  executable: boolean;
+  /** Files written with mode `0o120000` become symbolic links. */
+  symlinks: boolean;
+  /**
+   * The worktree is on Windows: `\` is a path separator there, and checkout applies git's
+   * Windows path rules (`isValidWorktreePath(path, mode, { windows: true })`).
+   */
+  windowsPaths?: boolean;
+  /**
+   * Top-level names the worktree's storage reserves (a simulated-links table at its root):
+   * restore plans refuse a tree entry of such a name, in any case.
+   */
+  reservedNames?: string[];
+}
+
+/**
  * Worktree interface - filesystem abstraction
  *
  * This is the primary interface for working with the working directory.
  */
 export interface Worktree {
+  /**
+   * What the worktree can represent. Undefined means both executables and
+   * symlinks (an in-memory worktree keeps the mode it is given).
+   */
+  readonly capabilities?: WorktreeCapabilities;
+
+  /**
+   * Probes whether the storage folds case (`core.ignorecase`) and Unicode composition
+   * (`core.precomposeunicode`), as `git init` does. Absent, or both false, for storage that
+   * folds neither (memory).
+   */
+  probeCaseFolding?(): Promise<{ ignoreCase: boolean; precomposeUnicode: boolean }>;
+
+  /**
+   * Runs `fn` as one batch of operations (a checkout's checks and writes), which may share
+   * a cache of directories verified not to be links and one reading of the ignore rules
+   * (`.gitignore` files, exclude files), both dropped when the batch ends. Outside a batch,
+   * every walk and ignore check reads the rules afresh.
+   */
+  batch?<T>(fn: () => Promise<T>): Promise<T>;
+
   // ========== Reading ==========
 
   walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry>;

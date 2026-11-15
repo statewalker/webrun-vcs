@@ -363,9 +363,11 @@ export class StatusCalculatorImpl implements StatusCalculator {
 
     // Quick check: mode mismatch (executable bit)
     // Normalize modes for comparison (ignore tree vs file distinction)
+    // (only where the worktree can show the bit: git with core.filemode=false ignores it)
     const indexIsExecutable = index.mode === FileMode.EXECUTABLE_FILE;
     const worktreeIsExecutable = worktree.mode === FileMode.EXECUTABLE_FILE;
-    if (indexIsExecutable !== worktreeIsExecutable) {
+    const trustExecutable = this.worktree.capabilities?.executable !== false;
+    if (trustExecutable && indexIsExecutable !== worktreeIsExecutable) {
       return true;
     }
 

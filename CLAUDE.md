@@ -24,7 +24,7 @@ All files and folders use **kebab-case**: `my-component.ts`, `utils/date-formatt
 **[Full Guide](.claude/code/naming-conventions.md)**
 
 ### Portable APIs only
-Library and app code (`packages/*/src`, `apps/*/*/src`) uses only APIs that exist in browsers and on servers: files through `FilesApi`, Web Streams, Web Crypto, `fetch`. No `node:*` imports (Biome `noNodejsModules` is an error there); tests may use Node (to drive native git, for example). On Node, get a `FilesApi` from `createNodeFilesApi` (`@statewalker/vcs-utils-node/files`).
+Library and app code (`packages/*/src`, `apps/*/*/src`) uses only APIs that exist in browsers and on servers: files through `FilesApi`, Web Streams, Web Crypto, `fetch`. No `node:*` imports (Biome `noNodejsModules` is an error there); tests may use Node (to drive native git, for example). On Node, get a `FilesApi` from `createNodeFilesApi` (`@statewalker/vcs-utils-node/files`). Every file operation goes through the `FilesApi`, symlinks included (`lstat`/`readlink`/`symlink` in its `PosixFilesApi` contract), so a composite or simulated FilesApi (`createSymlinkFilesApi`, `createMountedFilesApi`) works everywhere. The one exception to the no-`node:*` rule is `packages/vcs-utils-node/src`, which implements Node file access with `node:fs` (Biome override in `biome.json`).
 
 ### Module Structure
 Folder-based exports with wildcard re-exports. Import from `index.js`, use `.js` extensions.
@@ -107,6 +107,7 @@ git push                                        # MANDATORY
 - **`toEqual` on large byte arrays**: Vitest `toEqual` on `Uint8Array`s of hundreds of KB or more takes seconds and has caused CI timeouts; compare the bytes directly (length plus a loop, or `Buffer.equals` in tests)
 - **Native git in tests**: CI has no `user.name`/`user.email`; pass `GIT_AUTHOR_*`/`GIT_COMMITTER_*` in the env of every git call, and fix both `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` when two repositories must produce the same commit ids
 - **git versions differ**: CI runs a newer git (2.5x) than the sandbox (2.43); oracle tests that compare bytes with native git must pin config that changed defaults (e.g. `transfer.advertiseObjectInfo`) or normalise version-dependent lines
+- **Background maintenance in native git**: git 2.5x runs `git maintenance run --auto --detach` after `commit` and similar commands; the detached process changes `.git/objects` while a test copies or reads the repository (CI fails with ENOENT). Set `maintenance.auto=false` and `gc.auto=0` (e.g. `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, as `nativeGitEnv` in vcs-commands tests does)
 - **Gitea oracle**: `GITEA=1 pnpm --filter @statewalker/vcs-testing-gitea test` runs a real Gitea (test infra; Node APIs allowed in that package via a biome override)
 
 ## Self-Maintenance

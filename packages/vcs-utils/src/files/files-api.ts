@@ -122,3 +122,104 @@ export interface FileInfo {
   /** Last modification timestamp in milliseconds since Unix epoch */
   lastModified?: number;
 }
+
+/**
+ * What {@link PosixFilesApi.lstat} reports of one entry: the entry itself, a symbolic link
+ * is not followed (POSIX `lstat`).
+ */
+export interface LinkStats {
+  /** A file, a directory, a symbolic link, or anything else (a FIFO, socket, device) */
+  kind: "file" | "directory" | "symlink" | "other";
+  /** Length in bytes: of the file, or of the link target; 0 for a directory */
+  size: number;
+  /** Modification time in milliseconds since the epoch */
+  lastModified: number;
+  /** Status change time in milliseconds since the epoch, where the storage keeps one */
+  ctime?: number;
+  /** POSIX permission bits (`0o755`), where the storage keeps them */
+  mode?: number;
+}
+
+/**
+ * A FilesApi over storage that holds symbolic links (and, optionally, POSIX modes): a local
+ * filesystem (`createNodeFilesApi`), or any FilesApi wrapped to simulate links
+ * (`createSymlinkFilesApi`). Every member is optional and feature-detected; worktrees,
+ * checkout and workspace sync rely on this contract only, never on a real filesystem.
+ *
+ * **Links.** A symbolic link is an entry of its own, holding a target (bytes). It is never
+ * followed by any operation of this API:
+ * - *Beneath a link.* A path one of whose leading components is a link lies wherever the
+ *   link points; it is neither present nor absent. `lstat`, `read`, `write`,
+ *   `createExclusive`, `mkdir`, `list`, `stats`, `remove`, `move`, `copy`, `chmod`,
+ *   `symlink` and `readlink` reject it with `BeyondSymlinkError`; `exists` answers false.
+ * - *At a link.* `lstat` reports `kind: "symlink"` with the target's length as `size`;
+ *   `stats` and `list` report a file of that size; `read` yields nothing; `list` of the link
+ *   yields nothing (it is no directory); `write` replaces the link by a regular file, never
+ *   writing into its target; `remove` unlinks it (a dangling one too); `move` and `copy`
+ *   carry the link itself; `exists` is true (dangling too); `chmod` refuses it.
+ * - Recursive `list` never descends into a link.
+ *
+ * **Modes.** With `chmod` and a `mode` in `lstat`, permission bits are kept; `write` of an
+ * existing regular file keeps its bits, a new file gets the storage's default.
+ *
+ * **Paths.** `pathSeparators` names the characters the storage splits names on: `"/\\"` on
+ * Windows, where `a\b` would be `a` / `b` (worktrees then apply git's Windows path rules);
+ * `"/"` or absent elsewhere, where `\` is part of a name.
+ *
+ * **Case.** A storage that folds case (or Unicode composition) resolves `A` and `a` (or
+ * NFC and NFD spellings) to one entry; nothing in the API announces it: a repository probes
+ * for it once (`probeCaseFolding`), as `git init` does.
+ *
+ * @example
+ * ```typescript
+ * const files: PosixFilesApi = createNodeFilesApi({ rootDir: "/repo" });
+ * const stats = await files.lstat?.("/link");
+ * if (stats?.kind === "symlink") console.log(await files.readlink?.("/link"));
+ * ```
+ */
+export interface PosixFilesApi extends FilesApi {
+  /**
+   * The characters the storage reads as path separators: `"/\\"` on Windows, where a `\` in
+   * a name would split it; `"/"` (or absent) elsewhere.
+   */
+  readonly pathSeparators?: string;
+  /**
+   * True when every operation refuses a path beneath a link by itself, as this contract
+   * requires of an implementation with `lstat`: a caller need not check leading components
+   * again (doing so costs an `lstat` per component per call).
+   */
+  readonly refusesBeyondLinks?: boolean;
+  /**
+   * Names the storage keeps for itself at its root (`createSymlinkFilesApi`'s table): a
+   * worktree rooted there must not check out a tree entry of that name (in any case).
+   */
+  readonly reservedNames?: string[];
+  /** Set the permission bits (`mode & 0o777`) of a file; refuses a link */
+  chmod?(path: string, mode: number): Promise<void>;
+  /**
+   * Create a symbolic link at `path` pointing to `target` (bytes, as stored in a tree).
+   * Parent directories are created as needed; an existing entry at `path` is an error.
+   */
+  symlink?(target: Uint8Array, path: string): Promise<void>;
+  /**
+   * The entry at `path` itself, a symbolic link not followed; undefined if nothing is there.
+   * A path beneath a symbolic link is neither: it throws `BeyondSymlinkError`.
+   */
+  lstat?(path: string): Promise<LinkStats | undefined>;
+  /** The target of the symbolic link at `path` (bytes); undefined if it is not a link */
+  readlink?(path: string): Promise<Uint8Array | undefined>;
+  /**
+   * A FilesApi rooted at the directory the link at `path` points to, for a link the caller
+   * chose to follow (a `.git` linked to a repository elsewhere, which git follows), when the
+   * target lies beyond what this FilesApi can name (outside its root). Undefined when `path`
+   * is no link to a directory, or the storage cannot reach the target.
+   */
+  openLinkTarget?(path: string): Promise<PosixFilesApi | undefined>;
+  /**
+   * A view of the same storage for one batch of operations (a worktree walk, a checkout's
+   * writes) that may cache which directories it verified not to be links, as git's
+   * per-command lstat cache; the caller drops it when the batch ends. The instance itself
+   * never caches across calls, so a change made outside is always seen.
+   */
+  withLstatCache?(): PosixFilesApi;
+}
