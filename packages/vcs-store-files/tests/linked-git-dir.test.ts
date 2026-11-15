@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 import { createInMemoryFilesApi, createSymlinkFilesApi } from "@statewalker/vcs-core";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
-import { PosixNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { openRepositoryFiles, PosixNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const env = {
@@ -111,6 +111,31 @@ describe.skipIf(!hasGit || process.platform === "win32")("openLinkTarget is opt-
       const files = new PosixNodeFilesApi({ rootDir: join(base, "work") });
       expect(await files.openLinkTarget("/.git")).toBeUndefined();
       await expect(createGitFilesBackend({ files })).rejects.toThrow(/symbolic link/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!hasGit || process.platform === "win32")("openRepositoryFiles", () => {
+  it("follows a .git linked outside the root, and no other link", async () => {
+    const base = mkdtempSync(join(tmpdir(), "open-repo-files-"));
+    try {
+      git(base, "init", "-q", "--initial-branch=main", "real");
+      git(join(base, "real"), "commit", "-q", "--allow-empty", "-m", "first");
+      mkdirSync(join(base, "work"));
+      mkdirSync(join(base, "outdir"));
+      symlinkSync(join(base, "real/.git"), join(base, "work/.git"));
+      symlinkSync(join(base, "outdir"), join(base, "work/elsewhere"));
+      const files = await openRepositoryFiles(join(base, "work"));
+      const { history } = await createGitFilesBackend({ files });
+      expect((await history.refs.resolve("HEAD"))?.objectId).toBe(
+        git(join(base, "real"), "rev-parse", "HEAD"),
+      );
+      expect(await files.openLinkTarget?.("/elsewhere")).toBeUndefined();
+      await expect(files.write("/elsewhere/x", [new Uint8Array([1])])).rejects.toThrow(
+        /symbolic link/,
+      );
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

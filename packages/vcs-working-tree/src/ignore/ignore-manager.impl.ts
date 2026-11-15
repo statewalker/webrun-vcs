@@ -6,7 +6,10 @@
  * - Repository .git/info/exclude
  * - Global patterns
  *
- * Rules are evaluated in order, with later rules taking precedence.
+ * Rules are evaluated in order, with later rules taking precedence. As in git, a path
+ * inside an ignored directory is ignored and cannot be re-included (`build/` then
+ * `!build/keep.txt` leaves keep.txt ignored). Each source is replaced, never appended to,
+ * when it is set again, so a reread file never leaves its old rules behind.
  */
 
 import type { IgnoreManager, IgnoreNode, MatchResultValue } from "./ignore-manager.js";
@@ -45,6 +48,9 @@ class GitIgnoreManagerImpl implements IgnoreManager {
   /** Per-directory ignore nodes, sorted by path depth (deepest first) */
   private directoryNodes: DirectoryIgnoreNode[] = [];
 
+  /** Named exclude files (`info/exclude`, `core.excludesFile`), in precedence order */
+  private excludeNodes = new Map<string, IgnoreNode>();
+
   constructor(options?: GitIgnoreManagerOptions) {
     this.globalNode = createIgnoreNode();
     if (options?.globalPatterns) {
@@ -60,7 +66,19 @@ class GitIgnoreManagerImpl implements IgnoreManager {
   getStatus(path: string, isDirectory: boolean): MatchResultValue {
     // Normalize path (remove leading/trailing slashes)
     const normalizedPath = this.normalizePath(path);
+    // a path inside an ignored directory is ignored, whatever its own rules say (git never
+    // descends into an excluded directory, so nothing in it can be re-included)
+    const parts = normalizedPath.split("/");
+    for (let k = 1; k < parts.length; k++) {
+      if (this.statusOf(parts.slice(0, k).join("/"), true) === MatchResult.IGNORED) {
+        return MatchResult.IGNORED;
+      }
+    }
+    return this.statusOf(normalizedPath, isDirectory);
+  }
 
+  /** The status of `normalizedPath` by the rules alone, its directories not considered. */
+  private statusOf(normalizedPath: string, isDirectory: boolean): MatchResultValue {
     // Check directory-specific nodes first (most specific to least)
     for (const dirNode of this.directoryNodes) {
       // Only check if this path is under this directory
@@ -74,6 +92,12 @@ class GitIgnoreManagerImpl implements IgnoreManager {
       }
     }
 
+    // Then the exclude files (info/exclude before core.excludesFile)
+    for (const node of this.excludeNodes.values()) {
+      const result = node.checkIgnored(normalizedPath, isDirectory);
+      if (result !== undefined) return result ? MatchResult.IGNORED : MatchResult.NOT_IGNORED;
+    }
+
     // Check global patterns
     const globalResult = this.globalNode.checkIgnored(normalizedPath, isDirectory);
     if (globalResult !== undefined) {
@@ -84,7 +108,24 @@ class GitIgnoreManagerImpl implements IgnoreManager {
   }
 
   addIgnoreFile(dirPath: string, content: string): void {
+    this.setIgnoreFile(dirPath, content);
+  }
+
+  setExcludeFile(source: string, content: string | undefined): void {
+    if (content === undefined) {
+      this.excludeNodes.delete(source);
+      return;
+    }
+    const node = createIgnoreNode();
+    node.parse(content);
+    this.excludeNodes.set(source, node);
+  }
+
+  setIgnoreFile(dirPath: string, content: string | undefined): void {
     const normalizedDir = this.normalizePath(dirPath);
+    // the directory's previous rules go: a reread file replaces them
+    this.directoryNodes = this.directoryNodes.filter((n) => n.path !== normalizedDir);
+    if (content === undefined) return;
     const node = createIgnoreNode();
     node.parse(content);
 
@@ -112,6 +153,7 @@ class GitIgnoreManagerImpl implements IgnoreManager {
   clear(): void {
     this.globalNode = createIgnoreNode();
     this.directoryNodes = [];
+    this.excludeNodes = new Map();
   }
 
   /**

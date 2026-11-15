@@ -148,6 +148,18 @@ export interface IgnoreManager {
   addIgnoreFile(dirPath: string, content: string): void;
 
   /**
+   * Set (replace) the rules of the `.gitignore` in `dirPath`; `undefined` removes them
+   * (the file is gone). Rules read again never pile up on the old ones.
+   */
+  setIgnoreFile?(dirPath: string, content: string | undefined): void;
+
+  /**
+   * Set (replace) the rules of a named exclude file (`info/exclude`, `core.excludesFile`),
+   * checked after every `.gitignore`, in the order first set; `undefined` removes them.
+   */
+  setExcludeFile?(source: string, content: string | undefined): void;
+
+  /**
    * Add global patterns that apply to all paths.
    *
    * @param patterns Array of gitignore patterns

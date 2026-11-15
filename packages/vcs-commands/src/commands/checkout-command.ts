@@ -494,6 +494,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         symlinks: true,
         ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
         windows: worktree.capabilities?.windowsPaths === true,
+        reservedNames: worktree.capabilities?.reservedNames,
       });
       for (const path of switched) {
         if (target.has(path)) continue;

@@ -206,3 +206,54 @@ describe("createMountedFilesApi listings and removals", () => {
     expect(await inner.exists("/x/y.txt")).toBe(true);
   });
 });
+
+describe("createSymlinkFilesApi table writes", () => {
+  /** A memory FilesApi counting the writes of the table file. */
+  function counting() {
+    const base = createInMemoryFilesApi({ "/a.txt": "a" });
+    let tableWrites = 0;
+    const write = base.write.bind(base);
+    base.write = async (path, content) => {
+      if (path === SYMLINK_TABLE_PATH) tableWrites++;
+      return write(path, content);
+    };
+    return { base, writes: () => tableWrites };
+  }
+
+  it("never creates the table on a base without links, nor rewrites it for nothing", async () => {
+    const { base, writes } = counting();
+    const files = createSymlinkFilesApi(base);
+    await files.write("/b.txt", [enc.encode("b")]);
+    await files.remove("/a.txt");
+    await files.remove("/missing");
+    expect(writes()).toBe(0);
+    expect(await base.exists(SYMLINK_TABLE_PATH)).toBe(false);
+    await files.symlink?.(enc.encode("t"), "/ln");
+    const after = writes();
+    await files.remove("/b.txt");
+    expect(writes()).toBe(after);
+  });
+
+  it("a stale entry never turns a new empty file into a link", async () => {
+    const base = createInMemoryFilesApi();
+    const files = createSymlinkFilesApi(base);
+    await files.symlink?.(enc.encode("t"), "/x");
+    await base.remove("/x"); // the placeholder gone: the entry is stale
+    expect(await files.createExclusive?.("/x", [])).toBe(true);
+    expect((await files.lstat?.("/x"))?.kind).toBe("file");
+    await base.remove("/x");
+    await files.symlink?.(enc.encode("t"), "/y");
+    await base.remove("/y");
+    await files.write("/y", []);
+    expect((await files.lstat?.("/y"))?.kind).toBe("file");
+  });
+
+  it("reserves its table name at its root only", async () => {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    expect(files.reservedNames).toEqual([".webrun-symlinks.json"]);
+    expect(createSubtreeFilesApi(files, "/repo").reservedNames).toBeUndefined();
+    expect(createInMemoryFilesApi() as { reservedNames?: string[] }).not.toHaveProperty(
+      "reservedNames",
+    );
+  });
+});

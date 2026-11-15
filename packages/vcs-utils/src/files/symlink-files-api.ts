@@ -120,6 +120,8 @@ export function createSymlinkFilesApi(
 class SymlinkFilesApi implements PosixFilesApi {
   readonly pathSeparators: string;
   readonly refusesBeyondLinks = true;
+  /** The table file is reserved at the root: no tree may hold it there */
+  readonly reservedNames = [RESERVED_NAME];
   private readonly fileMode: number;
   private readonly state: BaseState;
 
@@ -164,20 +166,29 @@ class SymlinkFilesApi implements PosixFilesApi {
   }
 
   /**
-   * Runs `change` on the table freshly reloaded from the base, then saves it; mutations of
-   * one base run one after another.
+   * Runs `change` on the table freshly reloaded from the base, then saves it if it changed
+   * (`change` returning false means it did not); mutations of one base run one after
+   * another. A base that never held a link gets no table file.
    */
-  private mutate<T>(change: (table: Table) => Promise<T> | T): Promise<T> {
+  private mutate(
+    change: (table: Table) => Promise<boolean | void> | boolean | void,
+  ): Promise<void> {
     const run = this.state.queue.then(async () => {
       const table = await this.readTable();
       this.state.table = table;
-      const result = await change(table);
+      if ((await change(table)) === false) return;
+      if (
+        table.links.size === 0 &&
+        table.modes.size === 0 &&
+        !(await this.base.exists(SYMLINK_TABLE_PATH))
+      ) {
+        return;
+      }
       const data = {
         links: Object.fromEntries([...table.links].map(([p, t]) => [p, toBase64(t)])),
         modes: Object.fromEntries(table.modes),
       };
       await this.base.write(SYMLINK_TABLE_PATH, [new TextEncoder().encode(JSON.stringify(data))]);
-      return result;
     });
     this.state.queue = run.catch(() => {});
     return run;
@@ -310,6 +321,9 @@ class SymlinkFilesApi implements PosixFilesApi {
     const { path: p, table } = await this.resolve(path);
     if (await this.linkAt(table, p)) return false;
     await this.mkdirs(parentOf(p), table, path);
+    // a stale entry (its placeholder gone) is dropped first: a new empty file at the path
+    // must never complete it into a link
+    if (table.links.has(p)) await this.mutate((t) => t.links.delete(p));
     if (this.base.createExclusive) return this.base.createExclusive(p, content);
     if (await this.base.exists(p)) return false;
     await this.base.write(p, content);
@@ -363,11 +377,16 @@ class SymlinkFilesApi implements PosixFilesApi {
     const { path: p } = await this.resolve(path);
     // the entry (stale once the placeholder is gone) is purged after
     const removed = await this.base.remove(p);
-    await this.mutate((t) => {
-      for (const map of [t.links, t.modes] as Map<string, unknown>[]) {
-        for (const key of [...map.keys()]) if (isUnder(key, p)) map.delete(key);
-      }
-    });
+    const held = (t: Table) =>
+      [...t.links.keys(), ...t.modes.keys()].some((key) => isUnder(key, p));
+    if (held(await this.table())) {
+      await this.mutate((t) => {
+        if (!held(t)) return false;
+        for (const map of [t.links, t.modes] as Map<string, unknown>[]) {
+          for (const key of [...map.keys()]) if (isUnder(key, p)) map.delete(key);
+        }
+      });
+    }
     return removed;
   }
 

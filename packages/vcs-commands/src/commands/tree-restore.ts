@@ -10,7 +10,6 @@
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
-import { isReservedFilesName } from "@statewalker/vcs-utils/files";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import type { CommandTrees } from "../git-command.js";
@@ -59,6 +58,8 @@ export interface TreeRestoreOptions {
   ignoreCase?: boolean;
   /** The worktree is on Windows (`capabilities.windowsPaths`): git's Windows path rules. */
   windows?: boolean;
+  /** Top-level names the worktree's storage reserves (`capabilities.reservedNames`) */
+  reservedNames?: string[];
 }
 
 /**
@@ -143,8 +144,11 @@ async function planInto(
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (
       !isValidWorktreePath(path, entry.mode, { windows: options.windows === true }) ||
-      // the simulated-links table of a FilesApi (createSymlinkFilesApi) is reserved too
-      isReservedFilesName(entry.name)
+      // a name the storage reserves at the worktree's root (a simulated-links table)
+      (prefix === "" &&
+        options.reservedNames?.some(
+          (name) => entry.name.normalize("NFC").toLowerCase() === name.toLowerCase(),
+        ))
     ) {
       throw new Error(`${operation} cannot restore ${JSON.stringify(path)}: invalid path`);
     }

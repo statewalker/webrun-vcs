@@ -8,6 +8,7 @@
 
 import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
+import { openRepositoryFiles } from "./open-repository-files.js";
 import { PosixNodeFilesApi } from "./posix-node-files-api.js";
 
 /**
@@ -36,4 +37,4 @@ export function createNodeFilesApi(options: {
   return new PosixNodeFilesApi(options);
 }
 
-export { NodeFilesApi, PosixNodeFilesApi };
+export { NodeFilesApi, openRepositoryFiles, PosixNodeFilesApi };

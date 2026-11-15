@@ -316,10 +316,10 @@ describe.each(backends)("StashApplyCommand ($name backend)", ({ factory }) => {
     await createStash(git, repository);
 
     const command = git.stashApply();
-    expect(command.getRestoreIndex()).toBe(true); // default
+    expect(command.getRestoreIndex()).toBe(false); // default, as git without --index
 
-    command.setRestoreIndex(false);
-    expect(command.getRestoreIndex()).toBe(false);
+    command.setRestoreIndex(true);
+    expect(command.getRestoreIndex()).toBe(true);
 
     const result = await command.call();
     expect(result.status).toBe(StashApplyStatus.OK);

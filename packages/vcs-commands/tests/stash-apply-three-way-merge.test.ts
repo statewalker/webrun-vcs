@@ -201,7 +201,7 @@ describe.each(backends)("StashApplyCommand three-way merge ($name backend)", ({ 
     expect(result.status).toBe(StashApplyStatus.OK);
   });
 
-  it("conflicts when the stash changed only a path's mode and the branch changed its content", async () => {
+  it("merges a stash that changed only a path's mode with a branch that changed its content", async () => {
     const { git } = await buildStashDiamond({
       baseFiles: { "keep.txt": "keep", "script.sh": "#!/bin/sh" },
       branch: { add: { "script.sh": "#!/bin/bash" } },
@@ -213,8 +213,9 @@ describe.each(backends)("StashApplyCommand three-way merge ($name backend)", ({ 
 
     const result = await git.stashApply().call();
 
-    expect(result.status).toBe(StashApplyStatus.CONFLICTS);
-    expect(result.conflicts).toEqual(["script.sh"]);
+    // as git's merge: the content from the branch, the mode from the stash, no conflict
+    expect(result.status).toBe(StashApplyStatus.OK);
+    expect(result.conflicts).toBeUndefined();
   });
 
   it("conflicts on add/add of different content", async () => {

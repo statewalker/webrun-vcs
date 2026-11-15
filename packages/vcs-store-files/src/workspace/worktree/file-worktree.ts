@@ -24,6 +24,7 @@ import {
   isBeyondSymlinkError,
   joinPath,
   type LinkStats,
+  normalizePath,
   type PosixFilesApi,
   readFile,
 } from "@statewalker/vcs-core";
@@ -117,6 +118,10 @@ export class FileWorktree implements Worktree {
       executable: !!(files.chmod && files.lstat),
       symlinks: !!(files.symlink && files.lstat && files.readlink),
       windowsPaths: this.windowsPaths,
+      // reserved names of the storage's root apply only to a worktree rooted there
+      ...(this.rootFiles.reservedNames && normalizePath(this.rootPath) === "/"
+        ? { reservedNames: this.rootFiles.reservedNames }
+        : {}),
     };
   }
 
@@ -170,23 +175,21 @@ export class FileWorktree implements Worktree {
     }
 
     const startPath = pathPrefix ? joinPath(this.rootPath, pathPrefix) : this.rootPath;
-    // one walk is one batch (its lstat cache dropped at the end)
-    const own = !this.scoped && this.rootFiles.withLstatCache !== undefined;
-    if (own) this.scoped = this.rootFiles.withLstatCache?.();
-    try {
-      yield* this.walkDirectory(
-        startPath,
-        pathPrefix,
-        includeIgnored,
-        includeDirectories,
-        options?.maxDepth,
-      );
-    } finally {
-      if (own) this.scoped = undefined;
-    }
+    // one walk is one batch: its lstat-caching view stays local to this walk (an abandoned
+    // iterator leaves nothing behind for other operations)
+    const files = this.scoped ?? this.rootFiles.withLstatCache?.() ?? this.rootFiles;
+    yield* this.walkDirectory(
+      files,
+      startPath,
+      pathPrefix,
+      includeIgnored,
+      includeDirectories,
+      options?.maxDepth,
+    );
   }
 
   private async *walkDirectory(
+    files: WorktreeFilesApi,
     dirPath: string,
     relativePath: string,
     includeIgnored: boolean,
@@ -199,12 +202,12 @@ export class FileWorktree implements Worktree {
     }
 
     if (this.autoLoadGitignore) {
-      await this.tryLoadGitignore(dirPath, relativePath);
+      await this.tryLoadGitignore(dirPath, relativePath, files);
     }
 
     const entries: FileInfo[] = [];
     try {
-      for await (const entry of this.files.list(dirPath)) {
+      for await (const entry of files.list(dirPath)) {
         entries.push(entry);
       }
     } catch {
@@ -222,7 +225,7 @@ export class FileWorktree implements Worktree {
       }
 
       // the entry itself: a symbolic link is a file of its own, never descended into
-      const link = await this.files.lstat?.(fullPath);
+      const link = await files.lstat?.(fullPath);
       // a FIFO, socket or device is not content git tracks (git skips it too)
       if (link?.kind === "other") continue;
       const isDirectory = link ? link.kind === "directory" : entry.kind === "directory";
@@ -235,12 +238,12 @@ export class FileWorktree implements Worktree {
 
       let hasGitDir = false;
       if (isDirectory) {
-        hasGitDir = await this.hasGitDirectory(fullPath);
+        hasGitDir = await this.hasGitDirectory(fullPath, files);
       }
 
       const stats = link
         ? { size: isDirectory ? 0 : link.size, mtime: isDirectory ? 0 : link.lastModified }
-        : await this.getFileStats(fullPath, isDirectory);
+        : await this.getFileStats(fullPath, isDirectory, files);
 
       const worktreeEntry: WorktreeEntry = {
         path: entryPath,
@@ -265,6 +268,7 @@ export class FileWorktree implements Worktree {
 
       if (isDirectory && !hasGitDir) {
         yield* this.walkDirectory(
+          files,
           fullPath,
           entryPath,
           includeIgnored,
@@ -732,10 +736,10 @@ export class FileWorktree implements Worktree {
     return FileMode.REGULAR_FILE;
   }
 
-  private async hasGitDirectory(dirPath: string): Promise<boolean> {
+  private async hasGitDirectory(dirPath: string, files = this.files): Promise<boolean> {
     const gitPath = joinPath(dirPath, ".git");
     try {
-      return await this.files.exists(gitPath);
+      return await files.exists(gitPath);
     } catch {
       return false;
     }
@@ -744,13 +748,14 @@ export class FileWorktree implements Worktree {
   private async getFileStats(
     fullPath: string,
     isDirectory: boolean,
+    files = this.files,
   ): Promise<{ size: number; mtime: number }> {
     if (isDirectory) {
       return { size: 0, mtime: 0 };
     }
 
     try {
-      const stats = await this.files.stats(fullPath);
+      const stats = await files.stats(fullPath);
       if (stats) {
         return {
           size: stats.size ?? 0,
@@ -764,7 +769,31 @@ export class FileWorktree implements Worktree {
     return { size: 0, mtime: 0 };
   }
 
+  /**
+   * The exclude files (`info/exclude`, `core.excludesFile`): read afresh for every walk and
+   * ignore check where the ignore manager can replace them, so a change is always seen.
+   */
   private async loadRepositoryExcludes(): Promise<void> {
+    if (this.ignoreManager.setExcludeFile) {
+      const read = async (path: string) => {
+        try {
+          if ((await this.files.lstat?.(path))?.kind === "symlink") return undefined;
+          if (!(await this.files.exists(path))) return undefined;
+          return new TextDecoder().decode(await readFile(this.files, path));
+        } catch {
+          return undefined;
+        }
+      };
+      this.ignoreManager.setExcludeFile(
+        "info/exclude",
+        this.gitDir ? await read(joinPath(this.gitDir, "info", "exclude")) : undefined,
+      );
+      this.ignoreManager.setExcludeFile(
+        "core.excludesFile",
+        this.globalExcludesFile ? await read(this.globalExcludesFile) : undefined,
+      );
+      return;
+    }
     if (this.repositoryExcludesLoaded) {
       return;
     }
@@ -779,20 +808,28 @@ export class FileWorktree implements Worktree {
     }
   }
 
-  private async tryLoadGitignore(dirPath: string, relativePath: string): Promise<void> {
+  /**
+   * Reads the `.gitignore` of a directory afresh and replaces that directory's rules (none
+   * when the file is gone, or is a symbolic link, which git 2.32+ never follows).
+   */
+  private async tryLoadGitignore(
+    dirPath: string,
+    relativePath: string,
+    files = this.files,
+  ): Promise<void> {
     const gitignorePath = joinPath(dirPath, ".gitignore");
-
+    let text: string | undefined;
     try {
-      // git (2.32+) never follows a symbolic link to a .gitignore inside the worktree
-      if ((await this.files.lstat?.(gitignorePath))?.kind === "symlink") return;
-      if (await this.files.exists(gitignorePath)) {
-        const content = await readFile(this.files, gitignorePath);
-        const text = new TextDecoder().decode(content);
-        this.ignoreManager.addIgnoreFile(relativePath, text);
+      if ((await files.lstat?.(gitignorePath))?.kind !== "symlink") {
+        if (await files.exists(gitignorePath)) {
+          text = new TextDecoder().decode(await readFile(files, gitignorePath));
+        }
       }
     } catch {
-      // Ignore errors
+      text = undefined;
     }
+    if (this.ignoreManager.setIgnoreFile) this.ignoreManager.setIgnoreFile(relativePath, text);
+    else if (text !== undefined) this.ignoreManager.addIgnoreFile(relativePath, text);
   }
 
   private async tryLoadInfoExclude(gitDir: string): Promise<void> {

@@ -102,6 +102,11 @@ export interface WorktreeCapabilities {
    * Windows path rules (`isValidWorktreePath(path, mode, { windows: true })`).
    */
   windowsPaths?: boolean;
+  /**
+   * Top-level names the worktree's storage reserves (a simulated-links table at its root):
+   * restore plans refuse a tree entry of such a name, in any case.
+   */
+  reservedNames?: string[];
 }
 
 /**

@@ -683,6 +683,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       symlinks: true,
       ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
       windows: worktree.capabilities?.windowsPaths === true,
+      reservedNames: worktree.capabilities?.reservedNames,
     });
     const symlinks = this.symlinksEnabled(worktree);
     await writeTreeRestorePlan(worktree, this.blobs, plan, CLONE, { symlinks, gitlinks: true });

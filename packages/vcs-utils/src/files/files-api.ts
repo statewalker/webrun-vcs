@@ -189,6 +189,11 @@ export interface PosixFilesApi extends FilesApi {
    * again (doing so costs an `lstat` per component per call).
    */
   readonly refusesBeyondLinks?: boolean;
+  /**
+   * Names the storage keeps for itself at its root (`createSymlinkFilesApi`'s table): a
+   * worktree rooted there must not check out a tree entry of that name (in any case).
+   */
+  readonly reservedNames?: string[];
   /** Set the permission bits (`mode & 0o777`) of a file; refuses a link */
   chmod?(path: string, mode: number): Promise<void>;
   /**

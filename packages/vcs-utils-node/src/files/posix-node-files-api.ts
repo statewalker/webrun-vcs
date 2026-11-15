@@ -106,6 +106,11 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     this.verified = lstatCache;
   }
 
+  /** The real directory this FilesApi is rooted at. */
+  get rootDirectory(): string {
+    return this.root;
+  }
+
   /**
    * A view of the same root for one batch of operations (a walk, a checkout's writes) that
    * shares a cache of directories verified not to be links; drop it when the batch ends.
@@ -494,7 +499,8 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     } catch {
       return undefined;
     }
-    return new PosixNodeFilesApi({ ...this.options, rootDir: target });
+    // the opened FilesApi follows no link itself
+    return new PosixNodeFilesApi({ ...this.options, rootDir: target, openLinkTargets: false });
   }
 
   async symlink(target: Uint8Array, path: string): Promise<void> {

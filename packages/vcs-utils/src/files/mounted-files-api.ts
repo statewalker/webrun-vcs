@@ -48,11 +48,13 @@ interface RoutedConfig {
   /** Mount points (outer paths) and their FilesApis, for listings and removals */
   mounts?: { point: string; files: PosixFilesApi }[];
   forwardOpenLinkTarget?: boolean;
+  reservedNames?: string[];
 }
 
 class RoutedFilesApi implements PosixFilesApi {
   readonly pathSeparators?: string;
   readonly refusesBeyondLinks?: boolean;
+  readonly reservedNames?: string[];
   private readonly route: (path: string) => Route;
   private readonly mounts: { point: string; files: PosixFilesApi }[];
 
@@ -61,6 +63,7 @@ class RoutedFilesApi implements PosixFilesApi {
     this.mounts = config.mounts ?? [];
     if (config.separators) this.pathSeparators = config.separators;
     if (config.refusesBeyondLinks) this.refusesBeyondLinks = true;
+    if (config.reservedNames) this.reservedNames = config.reservedNames;
   }
 
   private at(path: string): Route {
@@ -297,5 +300,7 @@ export function createMountedFilesApi(
     ),
     mounts: points.map(([point, files]) => ({ point, files })),
     forwardOpenLinkTarget: options.forwardOpenLinkTarget,
+    // the base's root is this root: its reserved names stay reserved
+    reservedNames: (base as PosixFilesApi).reservedNames,
   });
 }

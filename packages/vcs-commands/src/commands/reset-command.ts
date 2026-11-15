@@ -243,6 +243,7 @@ export class ResetCommand extends GitCommand<Ref> {
       symlinks: true,
       ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
       windows: worktree.capabilities?.windowsPaths === true,
+      reservedNames: worktree.capabilities?.reservedNames,
     });
 
     // Delete the files that were tracked but are not in the target tree first, as git's

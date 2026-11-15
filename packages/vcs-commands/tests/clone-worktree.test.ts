@@ -604,3 +604,38 @@ describe("CloneCommand on a case-folding worktree", () => {
     expect(await readText(files, "README")).toBe("lower\n");
   });
 });
+
+describe("the simulated-links table name in a cloned tree", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("is refused only where the storage reserves it: at the root of a simulated-links FilesApi", async () => {
+    const server = await createInitializedTestServer();
+    globalThis.fetch = server.mockFetch;
+    await commitRawTree(server, async (blob) =>
+      server.serverStores.trees.store([
+        { name: ".WEBRUN-SYMLINKS.JSON", mode: FileMode.REGULAR_FILE, id: await blob("{}") },
+      ]),
+    );
+    const url = createTestUrl(server.baseUrl);
+    const atRoot = (files: WorktreeFilesApi, rootPath: string) =>
+      createWorkingCopy((stores) =>
+        createFileWorktree({ files, rootPath, blobs: stores.blobs, trees: stores.trees }),
+      );
+
+    const simulated = createSymlinkFilesApi(createInMemoryFilesApi());
+    await expect(
+      Git.fromWorkingCopy(atRoot(simulated, "/")).clone().setURI(url).call(),
+    ).rejects.toBeInstanceOf(CloneCheckoutError);
+
+    // a plain storage, or a worktree below the simulated root: an ordinary file name
+    const plain = createInMemoryFilesApi();
+    await Git.fromWorkingCopy(atRoot(plain, "/")).clone().setURI(url).call();
+    expect(await plain.exists("/.WEBRUN-SYMLINKS.JSON")).toBe(true);
+    const below = createSymlinkFilesApi(createInMemoryFilesApi());
+    await Git.fromWorkingCopy(atRoot(below, "/repo")).clone().setURI(url).call();
+    expect(await below.exists("/repo/.WEBRUN-SYMLINKS.JSON")).toBe(true);
+  });
+});
