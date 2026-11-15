@@ -30,6 +30,13 @@ export interface LfsPartialStore {
   complete(pointer: LfsPointer): Promise<LfsPutResult>;
   /** Drops the bytes held for `oid`. */
   remove(oid: string): Promise<void>;
+  /**
+   * Runs `fn` with no other `exclusive` call for the same object running, so
+   * two downloads never append to one partial at once. Optional: without it
+   * the client serializes per store instance. How far the exclusion reaches is
+   * the implementation's to document.
+   */
+  exclusive?<T>(oid: string, fn: () => Promise<T>): Promise<T>;
 }
 
 /**

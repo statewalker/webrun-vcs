@@ -22,7 +22,8 @@ import { checkCases, smudgeCases } from "./pointer-cases.js";
  * Interop with the native git-lfs binary (3.4 when this was written): `git
  * lfs push`, `pull` and `clone` against `serveLfs` on a loopback server, and
  * objects shared through `.git/lfs/objects` both ways. Skipped where git-lfs is
- * not installed.
+ * not installed locally; on CI (`process.env.CI` set) a missing git-lfs fails
+ * instead, so the interop tests can never be skipped there unnoticed.
  */
 const hasGitLfs = spawnSync("git", ["lfs", "version"]).status === 0;
 
@@ -126,6 +127,12 @@ async function lfsRepo(env: NodeJS.ProcessEnv, lfsUrl: string) {
   await git(env, work, ["remote", "add", "origin", bare]);
   return { d, bare, work, files };
 }
+
+describe.runIf(!hasGitLfs && !!process.env.CI)("native git-lfs on CI", () => {
+  it("git-lfs is installed", () => {
+    expect(hasGitLfs, "git-lfs is required on CI for the interop tests").toBe(true);
+  });
+});
 
 describe.skipIf(!hasGitLfs)("native git-lfs", () => {
   it("parsePointer agrees with the installed git-lfs on all 48 cases", async () => {

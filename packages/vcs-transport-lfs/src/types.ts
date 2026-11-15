@@ -65,12 +65,20 @@ export interface LfsTransferOptions {
    */
   streamRequestBody?: boolean;
   /**
-   * Headers sent with the batch request, and with each transfer unless the
-   * server marked the object `authenticated` (its action headers then carry
-   * the authorization). Names are case-insensitive: an action header replaces
-   * a client header of the same name.
+   * Headers sent with the batch request, and with each transfer whose href is
+   * on the endpoint's origin, unless the server marked the object
+   * `authenticated` (its action headers then carry the authorization). They
+   * never go to another origin. Names are case-insensitive: an action header
+   * replaces a client header of the same name.
    */
   headers?: Record<string, string>;
   /** Shorthand for an `Authorization: Basic …` header (applied like `headers`). */
   credentials?: { username: string; password: string };
+  /**
+   * Headers for a transfer whose href is on ANOTHER origin than the endpoint
+   * (a CDN, object storage): called with the href, it returns the headers to
+   * send there, or `undefined` for none. Not called for `authenticated`
+   * objects. Action headers still replace these by name.
+   */
+  headersFor?: (href: string) => Record<string, string> | undefined;
 }

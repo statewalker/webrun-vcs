@@ -1,4 +1,4 @@
-import type { FilesApi } from "@statewalker/vcs-utils/files";
+import { type FilesApi, moveCompleting } from "@statewalker/vcs-utils/files";
 import { bytesToHex, createSha256 } from "@statewalker/vcs-utils/hash";
 import type { ByteStream } from "@statewalker/webrun-content-store";
 import { type ByteSource, chunksOf } from "./sha256.js";
@@ -10,9 +10,24 @@ const OID = /^[0-9a-f]{64}$/;
 /** Thrown inside a stream that runs past the size it was promised. */
 class SizeExceeded extends Error {}
 
+/** The held bytes of a partial changed (removed, rewritten) while they were copied. */
+export class LfsPartialChangedError extends Error {
+  constructor(oid: string) {
+    super(`lfs partial ${oid} changed while it was being appended to`);
+    this.name = "LfsPartialChangedError";
+  }
+}
+
 function randomId(): string {
   return bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
 }
+
+/**
+ * Per FilesApi instance, per `<root>\0<oid>`: the tail of the queue of
+ * `partial.exclusive` calls. Module-level, so every store over the same FilesApi
+ * instance and root shares it.
+ */
+const queues = new WeakMap<FilesApi, Map<string, Promise<unknown>>>();
 
 /**
  * An {@link LfsObjectStore} on any `FilesApi`, in git-lfs's own layout under
@@ -30,8 +45,17 @@ function randomId(): string {
  * temporary file and leaves nothing visible. Appending to a partial download
  * writes the held bytes and the new ones into a temporary file and moves it
  * over the `.part` (FilesApi has no append), so each resume copies what was
- * held once — streamed, never buffered. An invalid oid is never turned into a
- * path: it reads as absent and its writes are refused.
+ * held once — streamed, never buffered; if the held bytes change while they
+ * are copied, the append fails with `LfsPartialChangedError` before it reads
+ * any new byte, and the client starts over. Moves go through `moveCompleting`
+ * (a copy-then-delete backend's half-done move is finished), and a temporary
+ * file is removed whenever a write or move throws. An invalid oid is never
+ * turned into a path: it reads as absent and its writes are refused.
+ *
+ * `partial.exclusive` excludes calls for one object across every store over
+ * the same FilesApi INSTANCE and root (trailing slashes ignored) in this
+ * process; not across processes, nor across two FilesApi instances over one
+ * directory.
  *
  * @example
  * ```typescript
@@ -56,16 +80,31 @@ export function createFilesLfsStore(files: FilesApi, root = ""): LfsObjectStore 
     await files.remove(path).catch(() => false);
   }
 
-  /** Moves a verified file into the object's place; true when the object is there after. */
-  async function publish(source: string, oid: string, size: number): Promise<void> {
+  /**
+   * Moves a verified file into the object's place. A temporary `source` is
+   * removed whenever this fails or throws; a `.part` (`keepOnFailure`) stays
+   * for the next attempt, which verifies it again.
+   */
+  async function publish(
+    source: string,
+    oid: string,
+    size: number,
+    keepOnFailure = false,
+  ): Promise<void> {
     const target = objectPath(oid);
-    if ((await fileSize(target)) === size) {
-      await discard(source); // stored already (by another writer, or native git-lfs)
-      return;
-    }
-    if (!(await files.move(source, target)) && (await fileSize(target)) !== size) {
-      await discard(source);
-      throw new Error(`lfs object ${oid}: could not be moved into place`);
+    let done = false;
+    try {
+      if ((await fileSize(target)) === size) {
+        await discard(source); // stored already (by another writer, or native git-lfs)
+      } else if (
+        !(await moveCompleting(files, source, target)) &&
+        (await fileSize(target)) !== size
+      ) {
+        throw new Error(`lfs object ${oid}: could not be moved into place`);
+      }
+      done = true;
+    } finally {
+      if (!done && !keepOnFailure) await discard(source);
     }
   }
 
@@ -163,22 +202,28 @@ export function createFilesLfsStore(files: FilesApi, root = ""): LfsObjectStore 
           }
         }
         async function* all(): ByteStream {
-          if (held > 0) yield* files.read(part);
+          if (held > 0) {
+            let copied = 0;
+            for await (const chunk of files.read(part)) {
+              copied += chunk.length;
+              yield chunk;
+            }
+            // removed or rewritten under us: never write the new bytes after the wrong ones
+            if (copied !== held || (await fileSize(part)) !== held)
+              throw new LfsPartialChangedError(oid);
+          }
           yield* arriving();
         }
+        let moved = false;
         try {
           await files.write(tmp, all());
-        } catch (error) {
-          await discard(tmp);
-          throw error;
-        }
-        if (added > 0) {
-          if (!(await files.move(tmp, part))) {
-            await discard(tmp);
-            throw new Error(`lfs partial ${oid}: could not be moved into place`);
+          if (added > 0) {
+            if (!(await moveCompleting(files, tmp, part)))
+              throw new Error(`lfs partial ${oid}: could not be moved into place`);
+            moved = true;
           }
-        } else {
-          await discard(tmp);
+        } finally {
+          if (!moved) await discard(tmp);
         }
         if (failure) throw failure.error;
         return held + added;
@@ -201,12 +246,30 @@ export function createFilesLfsStore(files: FilesApi, root = ""): LfsObjectStore 
           await discard(part);
           return { ok: false, reason };
         }
-        await publish(part, pointer.oid, size);
+        await publish(part, pointer.oid, size, true);
         return { ok: true, size };
       },
 
       async remove(oid) {
         if (OID.test(oid)) await discard(partPath(oid));
+      },
+
+      async exclusive(oid, fn) {
+        let queue = queues.get(files);
+        if (!queue) {
+          queue = new Map();
+          queues.set(files, queue);
+        }
+        const key = `${base}\0${oid}`;
+        const before = queue.get(key) ?? Promise.resolve();
+        const run = before.then(fn, fn);
+        const tail = run.catch(() => undefined);
+        queue.set(key, tail);
+        try {
+          return await run;
+        } finally {
+          if (queue.get(key) === tail) queue.delete(key);
+        }
       },
     },
   };

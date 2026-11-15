@@ -54,6 +54,12 @@ export interface LfsServerOptions {
   realm?: string;
   /** Added to every error object as `documentation_url`. */
   documentationUrl?: string;
+  /**
+   * Called with an unexpected error before the handler answers 500. The
+   * response carries only a generic message and `request_id` (the request's
+   * `X-Request-Id`, or a fresh UUID), which is passed here to correlate.
+   */
+  onError?: (error: unknown, request: Request, requestId: string) => void | Promise<void>;
 }
 
 const OID = /^[0-9a-f]{64}$/;
@@ -232,7 +238,7 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
   /** A transfer: the action's own headers with `transferAuth`, else the batch's `authorize`. */
   async function authorizeTransfer(request: Request, operation: LfsOperation, oid: string) {
     if (opts.transferAuth) {
-      const ok = await opts.transferAuth.check(request, operation, oid);
+      const ok = OID.test(oid) && (await opts.transferAuth.check(request, operation, oid));
       return refusal(request, ok ? true : { status: 401, message: "Transfer not authorized" });
     }
     return authorizeBatch(request, operation);
@@ -368,12 +374,13 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
   }
 
   async function upload(request: Request, oid: string): Promise<Response> {
+    // authorized before anything about the request is answered
+    const denied = await authorizeTransfer(request, "upload", oid);
+    if (denied) return denied;
     if (!OID.test(oid)) {
       await request.body?.cancel().catch(() => {});
       return error(request, 422, "Invalid object id");
     }
-    const denied = await authorizeTransfer(request, "upload", oid);
-    if (denied) return denied;
     const length = request.headers.get("content-length");
     const refuse = async (status: number, message: string) => {
       await request.body?.cancel().catch(() => {});
@@ -405,6 +412,12 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
   }
 
   async function verify(request: Request): Promise<Response> {
+    // authorized before the body is looked at; with transferAuth the oid is
+    // needed to check, so a body without a valid one is refused as unauthorized
+    if (!opts.transferAuth) {
+      const denied = await authorizeBatch(request, "upload");
+      if (denied) return denied;
+    }
     const text = await boundedText(request, VERIFY_MAX_BYTES);
     let input: { oid?: unknown; size?: unknown } | undefined;
     try {
@@ -414,10 +427,12 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
     }
     const oid = input?.oid;
     const size = input?.size;
-    if (typeof oid !== "string" || !OID.test(oid) || !isSize(size))
-      return error(request, 422, "Invalid object id or size");
-    const denied = await authorizeTransfer(request, "upload", oid);
-    if (denied) return denied;
+    const valid = typeof oid === "string" && OID.test(oid) && isSize(size);
+    if (opts.transferAuth) {
+      const denied = await authorizeTransfer(request, "upload", valid ? oid : "");
+      if (denied) return denied;
+    }
+    if (!valid) return error(request, 422, "Invalid object id or size");
     return (await store.size(oid)) === size
       ? json(200, {})
       : error(request, 404, "Object does not exist");
@@ -445,7 +460,19 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
       }
       return error(request, 404, "Not found");
     } catch (e) {
-      return error(request, 500, e instanceof Error ? e.message : String(e));
+      // nothing internal goes out: a generic message and an id to find it by
+      const requestId = request.headers.get("x-request-id") || crypto.randomUUID();
+      try {
+        await opts.onError?.(e, request, requestId);
+      } catch {
+        // a failing hook does not change the answer
+      }
+      const body: { message: string; request_id: string; documentation_url?: string } = {
+        message: "Internal server error",
+        request_id: requestId,
+      };
+      if (opts.documentationUrl) body.documentation_url = opts.documentationUrl;
+      return json(500, body);
     }
   };
 }

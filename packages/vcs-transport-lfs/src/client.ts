@@ -42,18 +42,38 @@ function clientHeaders(opts: LfsTransferOptions): Headers {
   return headers;
 }
 
+function originOf(url: string): string | undefined {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * A transfer's headers: the client's own, unless the server marked the object
- * `authenticated`, then the action's. Header names are case-insensitive, so
- * they are merged by name, an action's `Authorization` replacing the client's
- * `authorization` (as object keys both would be sent, joined by a comma).
+ * A transfer's headers: the client's own, then the action's. Header names are
+ * case-insensitive, so they are merged by name, an action's `Authorization`
+ * replacing the client's `authorization` (as object keys both would be sent,
+ * joined by a comma).
+ *
+ * The client's own headers and credentials belong to the LFS endpoint: they go
+ * only to an href on the endpoint's origin (git-lfs scopes credentials per URL
+ * the same way), and not at all when the server marked the object
+ * `authenticated`. An href on another origin (a CDN, a presigned bucket URL)
+ * gets what `opts.headersFor(href)` gives, if anything.
  */
 function transferHeaders(
   obj: BatchObjectResponse,
   action: BatchAction,
   opts: LfsTransferOptions,
+  endpointOrigin: string | undefined,
 ): Headers {
-  const headers = obj.authenticated ? new Headers() : clientHeaders(opts);
+  let headers = new Headers();
+  if (!obj.authenticated) {
+    const origin = originOf(action.href);
+    if (origin !== undefined && origin === endpointOrigin) headers = clientHeaders(opts);
+    else headers = new Headers(opts.headersFor?.(action.href));
+  }
   for (const [name, value] of Object.entries(action.header ?? {})) headers.set(name, value);
   return headers;
 }
@@ -217,6 +237,7 @@ export async function* lfsUpload(
   ...rest: unknown[]
 ): AsyncIterable<TransportEvent> {
   const { objects, url, oids, fetchImpl, opts } = normalize(store, rest);
+  const endpointOrigin = originOf(url);
   const wanted = unique(oids);
   const batch = await postBatch(fetchImpl, url, "upload", wanted, opts);
   yield { type: "batch", operation: "upload", count: batch.objects.length };
@@ -252,7 +273,7 @@ export async function* lfsUpload(
     const size = await objects.size(obj.oid);
     if (size === undefined) return "no local object for oid";
     if (size !== obj.size || size !== requested.get(obj.oid)) return "size mismatch";
-    const headers = transferHeaders(obj, action, opts);
+    const headers = transferHeaders(obj, action, opts, endpointOrigin);
     headers.set("content-length", String(size));
     if (!headers.has("content-type")) headers.set("content-type", "application/octet-stream");
     const res = await fetchWithRequestBody(
@@ -266,7 +287,7 @@ export async function* lfsUpload(
 
     const verify = obj.actions?.verify;
     if (verify) {
-      const verifyHeaders = transferHeaders(obj, verify, opts);
+      const verifyHeaders = transferHeaders(obj, verify, opts, endpointOrigin);
       verifyHeaders.set("content-type", LFS_CONTENT_TYPE);
       verifyHeaders.set("accept", LFS_CONTENT_TYPE);
       const checked = await fetchImpl(
@@ -328,10 +349,13 @@ async function* capped(body: ReadableStream<Uint8Array> | null, limit: number): 
  * A store that keeps partial downloads (`store.partial`, as
  * `createFilesLfsStore` does at `lfs/incomplete/<oid>.part`) resumes: a
  * download that breaks keeps the bytes that arrived, and the next call asks
- * only for the rest with `Range: bytes=N-`. A 206 from another offset is
- * refused (the bytes held stay); a 200 starts over from zero; a 416 drops
- * them. Bytes that do not verify are dropped. Downloads of one oid into one
- * store run one at a time within a process.
+ * only for the rest with `Range: bytes=N-`. A 200 starts over from zero. A
+ * 206 from another offset (or without `Content-Range`), a 416, or held
+ * bytes that change while they are copied drop the held bytes and start once
+ * more from zero, as git-lfs does. Bytes that do not verify are dropped.
+ * Downloads of one oid run one at a time within a process: per store instance,
+ * or, for a store with `partial.exclusive` (`createFilesLfsStore`), per
+ * FilesApi instance and root.
  *
  * Into a content-store (with its resolver) nothing is kept from a broken
  * download, and a refused object stays in the store, unrecorded, until its
@@ -360,6 +384,7 @@ export async function* lfsDownload(
   ...rest: unknown[]
 ): AsyncIterable<TransportEvent> {
   const { objects, url, oids, fetchImpl, opts } = normalize(store, rest);
+  const endpointOrigin = originOf(url);
   const missing: LfsPointer[] = [];
   for (const p of unique(oids)) {
     if ((await objects.size(p.oid)) === p.size) yield { type: "object-downloaded", oid: p.oid };
@@ -386,9 +411,12 @@ export async function* lfsDownload(
     const pointer = { oid: obj.oid, size: requested.get(obj.oid) ?? obj.size };
     let failure: string | undefined;
     try {
-      failure = objects.partial
-        ? await exclusive(objects, obj.oid, () => resumable(pointer, obj, action))
-        : await whole(pointer, obj, action);
+      const partial = objects.partial;
+      failure = !partial
+        ? await whole(pointer, obj, action)
+        : partial.exclusive
+          ? await partial.exclusive(obj.oid, () => resumable(pointer, obj, action))
+          : await exclusive(objects, obj.oid, () => resumable(pointer, obj, action));
     } catch (error) {
       failure = errorMessage(error);
     }
@@ -404,7 +432,10 @@ export async function* lfsDownload(
     action: BatchAction,
   ): Promise<string | undefined> {
     const res = await fetchImpl(
-      new Request(action.href, { method: "GET", headers: transferHeaders(obj, action, opts) }),
+      new Request(action.href, {
+        method: "GET",
+        headers: transferHeaders(obj, action, opts, endpointOrigin),
+      }),
     );
     if (!res.ok) {
       await discard(res);
@@ -430,14 +461,23 @@ export async function* lfsDownload(
       await partial.remove(pointer.oid);
       held = 0;
     }
-    if (held < pointer.size) {
-      const headers = transferHeaders(obj, action, opts);
+    // As git-lfs's basic download: an answer that cannot continue the held
+    // bytes (a 206 from another offset or without Content-Range, a 416, the
+    // held bytes changing under us) drops them and starts once more from 0.
+    for (let restarted = false; held < pointer.size; restarted = true) {
+      const restart = async (): Promise<boolean> => {
+        await partial.remove(pointer.oid);
+        held = 0;
+        return !restarted;
+      };
+      const headers = transferHeaders(obj, action, opts, endpointOrigin);
       if (held > 0) headers.set("range", `bytes=${held}-`);
       const res = await fetchImpl(new Request(action.href, { method: "GET", headers }));
       if (res.status === 206) {
         const start = /^bytes (\d+)-/.exec(res.headers.get("content-range") ?? "")?.[1];
         if (start === undefined || Number(start) !== held) {
           await discard(res);
+          if (await restart()) continue;
           return `the server resumed at ${start ?? "?"}, not ${held}`;
         }
       } else if (res.ok) {
@@ -446,6 +486,7 @@ export async function* lfsDownload(
         held = 0;
       } else {
         await discard(res);
+        if (res.status === 416 && held > 0 && (await restart())) continue;
         if (res.status === 416) await partial.remove(pointer.oid);
         return `download failed: ${res.status}`;
       }
@@ -455,6 +496,11 @@ export async function* lfsDownload(
         if (error instanceof SizeExceeded) {
           await partial.remove(pointer.oid);
           return "size mismatch";
+        }
+        if ((error as Error | undefined)?.name === "LfsPartialChangedError") {
+          await discard(res);
+          if (await restart()) continue;
+          return errorMessage(error);
         }
         const kept = await partial.size(pointer.oid);
         return `${errorMessage(error)} (${kept} of ${pointer.size} bytes kept to resume)`;
