@@ -14,6 +14,7 @@
 
 import { type Blobs, FileMode, type ObjectId, type Trees } from "@statewalker/vcs-core";
 import type { Staging } from "../staging/staging.js";
+import { applyStatUpdate, type IndexStatUpdate } from "../staging/stat-refresh.js";
 import type { StagingEntry } from "../staging/types.js";
 import {
   compareWithWorktree,
@@ -147,16 +148,6 @@ export async function scanIndex(source: StashTreesSource): Promise<IndexScan> {
   return { entries, unmerged: [...new Set(unmerged)], paths };
 }
 
-/** Fresh stat for an index entry. */
-export interface IndexStatUpdate {
-  path: string;
-  objectId: ObjectId;
-  mode: number;
-  size: number;
-  mtime: number;
-  ctime?: number;
-}
-
 /**
  * The entries a scan found clean only by hashing (their stat no longer matched, or was
  * racy): their fresh stat lets the next comparison skip reading them, as git's index
@@ -172,61 +163,73 @@ export function refreshableEntries(scan: IndexScan): IndexStatUpdate[] {
 }
 
 /**
- * The index stat to write for an entry after comparing it: its fresh stat when it was
- * proved clean by hashing, or its old stat with size 0 when it changed though its stat
- * matched (git's racy-git smudging); undefined when nothing needs writing.
+ * The index stat to write for an entry after comparing it: its fresh stat (nanoseconds,
+ * device, inode and owner included where the worktree reports them) when it was proved
+ * clean by hashing, or size 0 when it changed though racy (git's smudging); undefined when
+ * nothing needs writing. Assume-unchanged and skip-worktree entries are never refreshed.
  */
 export function statUpdateOf(
   entry: StagingEntry,
   compared: WorktreeComparison | undefined,
 ): IndexStatUpdate | undefined {
-  if (!compared || entry.intentToAdd) return undefined;
-  if (compared.smudge) {
-    return {
-      path: entry.path,
-      objectId: entry.objectId,
-      mode: entry.mode,
-      size: 0,
-      mtime: entry.mtime,
-      ...(entry.ctime !== undefined ? { ctime: entry.ctime } : {}),
-    };
-  }
+  if (!compared || entry.intentToAdd || entry.assumeValid || entry.skipWorktree) return undefined;
+  const expected = {
+    path: entry.path,
+    objectId: entry.objectId,
+    mode: entry.mode,
+    expectedSize: entry.size,
+    expectedMtime: entry.mtime,
+  };
+  if (compared.smudge) return { ...expected, size: 0, mtime: entry.mtime, smudge: true };
   const file = compared.worktreeEntry;
   if (compared.kind || !file || file.isDirectory || compared.hashedId !== entry.objectId) {
     return undefined;
   }
   return {
-    path: entry.path,
-    objectId: entry.objectId,
-    mode: entry.mode,
+    ...expected,
     size: file.size,
     mtime: file.mtime,
     ...(file.ctime !== undefined ? { ctime: file.ctime } : {}),
+    ...(file.mtimeNs !== undefined ? { mtimeNs: file.mtimeNs } : {}),
+    ...(file.ctimeNs !== undefined ? { ctimeNs: file.ctimeNs } : {}),
+    ...(file.dev !== undefined ? { dev: file.dev } : {}),
+    ...(file.ino !== undefined ? { ino: file.ino } : {}),
+    ...(file.uid !== undefined ? { uid: file.uid } : {}),
+    ...(file.gid !== undefined ? { gid: file.gid } : {}),
   };
 }
 
 /**
- * Stores fresh stats in the index and writes it, as git refreshes the index during status:
- * only when the index was not changed meanwhile (`isOutdated`), and with git's racy-git
- * smudging (an entry modified at or after the write gets size 0, so it is re-hashed next
- * time). A write that fails (another writer holds `index.lock`) is given up quietly.
- * Returns whether the index was written.
+ * Stores fresh stats in the index, as git refreshes the index during status: per entry
+ * compare-and-set (an entry changed meanwhile, by an add or a flag, is left as it is; the
+ * rest of each entry is kept). An index file is written only when it is unchanged since it
+ * was read, under `index.lock`, and without other in-memory edits (`Staging.refreshStats`);
+ * a failure is given up quietly. Returns whether anything was stored.
  */
 export async function refreshIndexStats(
   staging: Staging,
   updates: IndexStatUpdate[],
 ): Promise<boolean> {
   if (updates.length === 0) return false;
+  if (typeof staging.refreshStats === "function") return staging.refreshStats(updates);
   try {
-    if (typeof staging.isOutdated === "function" && (await staging.isOutdated())) return false;
+    // a store without an index file: the same compare-and-set through its editor
     const now = Date.now();
+    let applied = false;
     const editor = staging.createEditor();
     for (const u of updates) {
-      editor.upsert({ ...u, stage: 0, size: Math.floor(u.mtime) >= now ? 0 : u.size });
+      editor.add({
+        path: u.path,
+        apply: (existing) => {
+          const next = applyStatUpdate(existing, u, now);
+          if (next) applied = true;
+          return next ?? existing;
+        },
+      });
     }
     await editor.finish();
-    await staging.write();
-    return true;
+    if (applied) await staging.write();
+    return applied;
   } catch {
     return false;
   }

@@ -138,6 +138,15 @@ export interface LinkStats {
   ctime?: number;
   /** POSIX permission bits (`0o755`), where the storage keeps them */
   mode?: number;
+  /** Nanoseconds of the modification time within its second, where the storage keeps them */
+  mtimeNs?: number;
+  /** Nanoseconds of the status change time within its second */
+  ctimeNs?: number;
+  /** Device and inode (their low 32 bits), owner and group, where the storage has them */
+  dev?: number;
+  ino?: number;
+  uid?: number;
+  gid?: number;
 }
 
 /**
@@ -208,6 +217,12 @@ export interface PosixFilesApi extends FilesApi {
   lstat?(path: string): Promise<LinkStats | undefined>;
   /** The target of the symbolic link at `path` (bytes); undefined if it is not a link */
   readlink?(path: string): Promise<Uint8Array | undefined>;
+  /**
+   * Removes the directory at `path` only if it is empty, as `rmdir(2)`: never recursively,
+   * so an entry created meanwhile makes it fail rather than vanish. False when nothing is
+   * there, it is no directory (a link to one included) or it is not empty.
+   */
+  rmdir?(path: string): Promise<boolean>;
   /**
    * A FilesApi rooted at the directory the link at `path` points to, for a link the caller
    * chose to follow (a `.git` linked to a repository elsewhere, which git follows), when the

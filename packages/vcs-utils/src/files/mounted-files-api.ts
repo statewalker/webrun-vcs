@@ -119,6 +119,20 @@ class RoutedFilesApi implements PosixFilesApi {
     return r.files.remove(r.path).catch((e) => this.outerError(e, r, path));
   }
 
+  /** An empty directory only; never a mount point or a directory holding one. */
+  async rmdir(path: string): Promise<boolean> {
+    const r = this.at(path);
+    const outer = normalizePath(path);
+    if (this.mounts.some((m) => m.point === outer || m.point.startsWith(`${outer}/`))) {
+      return false;
+    }
+    const files = r.files as PosixFilesApi;
+    if (files.rmdir) return files.rmdir(r.path).catch((e) => this.outerError(e, r, path));
+    if ((await files.stats(r.path))?.kind !== "directory") return false;
+    for await (const _ of files.list(r.path)) return false;
+    return files.remove(r.path).catch((e) => this.outerError(e, r, path));
+  }
+
   async stats(path: string): Promise<FileStats | undefined> {
     const r = this.at(path);
     return r.files.stats(r.path).catch((e) => this.outerError(e, r, path));

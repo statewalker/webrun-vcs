@@ -16,6 +16,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  statSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
@@ -1219,5 +1220,324 @@ describeGit("status and stash refresh the index (review cases)", () => {
     const hashedAfter = vi.spyOn(after.worktree, "computeHash");
     expect((await after.ours.status().call()).isClean()).toBe(true);
     expect(hashedAfter).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `git clean` with `flags` in `<name>-n` and our CleanCommand in its twin: the same
+ * "Would remove" / "Would skip repository" lists (dry run), then the same files after
+ * the real clean.
+ */
+async function twinClean(
+  name: string,
+  setup: (dir: string) => void,
+  flags: { d?: boolean; x?: boolean; ff?: boolean; paths?: string[] } = {},
+) {
+  const n = join(root, `${name}-n`);
+  const o = join(root, `${name}-o`);
+  repo(n);
+  setup(n);
+  cpSync(n, o, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
+  const args = ["clean", flags.ff ? "-ff" : "-f"];
+  if (flags.d) args.push("-d");
+  if (flags.x) args.push("-x");
+  const paths = flags.paths ? ["--", ...flags.paths] : [];
+  const lines = exec(n, ...args, "-n", ...paths)
+    .split("\n")
+    .filter(Boolean);
+  const nativeRemove = lines
+    .filter((l) => l.startsWith("Would remove "))
+    .map((l) => l.slice("Would remove ".length))
+    .sort();
+  const nativeSkip = lines
+    .filter((l) => l.startsWith("Would skip repository "))
+    .map((l) => l.slice("Would skip repository ".length))
+    .sort();
+  const command = async (dryRun: boolean) => {
+    const { ours } = await open(o);
+    return ours
+      .clean()
+      .setCleanDirectories(flags.d === true)
+      .setIgnore(flags.x !== true)
+      .setForceNestedRepositories(flags.ff === true)
+      .setPaths(new Set(flags.paths ?? []))
+      .setDryRun(dryRun)
+      .call();
+  };
+  const dry = await command(true);
+  expect([...dry.cleaned].sort(), "would remove").toEqual(nativeRemove);
+  expect([...dry.skipped].sort(), "would skip").toEqual(nativeSkip);
+  exec(n, ...args, "-q", ...paths);
+  await command(false);
+  expect(listing(o)).toEqual(listing(n));
+  expect(run(o, "ls-files", "-s")).toBe(run(n, "ls-files", "-s"));
+  return { native: n, ours: o };
+}
+
+describeGit("clean against native git (review cases)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-twins-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("-d: an untracked file next to tracked files goes, the tracked directory stays", async () => {
+    const { ours } = await twinClean("tracked-dir", (d) => put(d, "d/u.txt", "u\n"), { d: true });
+    expect(read(join(ours, "d/e.txt"))).toBe("e\n");
+  });
+
+  it("-d: a staged new file and its directory stay", async () => {
+    const { ours } = await twinClean(
+      "staged-new-dir",
+      (d) => {
+        put(d, "n/new.txt", "n\n");
+        run(d, "add", "n/new.txt");
+        put(d, "n/u.txt", "u\n");
+      },
+      { d: true },
+    );
+    expect(read(join(ours, "n/new.txt"))).toBe("n\n");
+  });
+
+  it("-d: nested repositories are skipped (top level and inside an untracked dir)", async () => {
+    const { ours } = await twinClean(
+      "nested",
+      (d) => {
+        put(d, "u/x.txt", "x\n");
+        nestedRepo(d, "u/sub");
+        nestedRepo(d, "sub");
+      },
+      { d: true },
+    );
+    expect(read(join(ours, "sub/inner.txt"))).toBe("precious\n");
+    expect(read(join(ours, "u/sub/inner.txt"))).toBe("precious\n");
+  });
+
+  it("-ffd removes nested repositories", async () => {
+    await twinClean(
+      "nested-ff",
+      (d) => {
+        put(d, "u/x.txt", "x\n");
+        nestedRepo(d, "u/sub");
+        nestedRepo(d, "sub");
+      },
+      { d: true, ff: true },
+    );
+  });
+
+  it("-d keeps ignored files (and their directories); -dx removes them", async () => {
+    const setup = (d: string) => {
+      put(d, ".gitignore", "*.log\nbuild/\n");
+      run(d, "add", ".");
+      run(d, "commit", "-qm", "i");
+      put(d, "u/x.txt", "x\n");
+      put(d, "u/keep.log", "precious\n");
+      put(d, "build/o/p.o", "o\n");
+      put(d, "top.log", "log\n");
+      put(d, "w/v.txt", "v\n");
+      mkdirSync(join(d, "empty/deeper"), { recursive: true });
+    };
+    const { ours } = await twinClean("ignored", setup, { d: true });
+    expect(read(join(ours, "u/keep.log"))).toBe("precious\n");
+    await twinClean("ignored-x", setup, { d: true, x: true });
+  });
+
+  it("without -d untracked directories are not entered; a path filter enters them", async () => {
+    const setup = (d: string) => {
+      put(d, "u/x.txt", "x\n");
+      put(d, "d/u.txt", "u\n");
+      put(d, "top.txt", "t\n");
+    };
+    await twinClean("no-d", setup);
+    await twinClean("no-d-path", setup, { paths: ["d"] });
+    await twinClean("d-path", setup, { d: true, paths: ["u"] });
+  });
+});
+
+describeGit("index refresh is compare-and-set (review cases)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "refresh-cas-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A repository whose files' stats no longer match the index (status must hash them). */
+  function staleRepo(dir: string) {
+    repo(dir);
+    const when = new Date(Date.now() - 100_000);
+    for (const f of ["a.txt", "b.txt", "c.txt", "d/e.txt", "d/f.txt"]) {
+      utimesSync(join(dir, f), when, when);
+    }
+  }
+
+  it("an add made while status hashes is not undone by the refresh", async () => {
+    const dir = join(root, "r");
+    staleRepo(dir);
+    const { ours, worktree } = await open(dir);
+    const hash = worktree.computeHash.bind(worktree);
+    let added = "";
+    vi.spyOn(worktree, "computeHash").mockImplementation(async (path: string) => {
+      const id = await hash(path);
+      if (path === "c.txt" && !added) {
+        put(dir, "a.txt", "STAGED BY OUR ADD\n");
+        await ours.add().addFilepattern("a.txt").call();
+        added = run(dir, "ls-files", "-s", "a.txt");
+      }
+      return id;
+    });
+    await ours.status().call();
+    expect(added).toContain("a.txt");
+    expect(run(dir, "ls-files", "-s", "a.txt")).toBe(added);
+    expect(run(dir, "status", "--porcelain")).toBe("M  a.txt");
+  });
+
+  it("keeps the assume-unchanged flag (status and stash), as native git", async () => {
+    const dir = join(root, "r");
+    staleRepo(dir);
+    run(dir, "update-index", "--assume-unchanged", "b.txt");
+    put(dir, "a.txt", "am\n");
+    const native = `${dir}-native`;
+    cpSync(dir, native, { recursive: true, preserveTimestamps: true });
+    exec(native, "stash", "push", "-q");
+    const { ours } = await open(dir);
+    await ours.status().call();
+    expect(run(dir, "ls-files", "-v", "b.txt")).toBe("h b.txt");
+    const { ours: stasher } = await open(dir);
+    await stasher.stashCreate().call();
+    expect(run(dir, "ls-files", "-v")).toBe(run(native, "ls-files", "-v"));
+  });
+
+  it("does not write in-memory edits made before the status, only stats", async () => {
+    const dir = join(root, "r");
+    staleRepo(dir);
+    const { ours, wc } = await open(dir);
+    const id = await wc.history.blobs.store([new TextEncoder().encode("unsaved\n")]);
+    const editor = wc.checkout.staging.createEditor();
+    editor.upsert({ path: "unsaved.txt", objectId: id, mode: 0o100644, size: 8, mtime: 1 });
+    await editor.finish();
+    await ours.status().call();
+    // the refresh reached the disk, the unsaved entry did not
+    expect(run(dir, "ls-files", "unsaved.txt")).toBe("");
+    expect(run(dir, "diff-files", "--name-only")).toBe("");
+    expect(await wc.checkout.staging.getEntry("unsaved.txt")).toBeDefined();
+  });
+
+  it("records the exact stat (nanoseconds, inode, owner) so native git trusts it", async () => {
+    const dir = join(root, "r");
+    staleRepo(dir);
+    put(dir, "c.txt", "c\n"); // a fresh mtime with nanoseconds
+    utimesSync(join(dir, "c.txt"), new Date(Date.now() - 50_000), new Date(Date.now() - 50_000));
+    const { ours } = await open(dir);
+    await ours.status().call();
+    const debug = run(dir, "ls-files", "--debug", "c.txt");
+    const stat = lstatSync(join(dir, "c.txt"), { bigint: true });
+    const sec = stat.mtimeNs / 1_000_000_000n;
+    const nsec = stat.mtimeNs % 1_000_000_000n;
+    expect(debug).toContain(`mtime: ${sec}:${nsec}`);
+    expect(debug).toContain(`ino: ${stat.ino & 0xffffffffn}`);
+    expect(debug).toContain(`uid: ${stat.uid}\tgid: ${stat.gid}`);
+    expect(run(dir, "diff-files", "--name-only")).toBe("");
+  });
+
+  it("an index changed on disk (same mtime) is outdated; the refresh then writes nothing", async () => {
+    const dir = join(root, "r");
+    staleRepo(dir);
+    const { ours, wc } = await open(dir);
+    const before = statSync(join(dir, ".git/index"));
+    put(dir, "n.txt", "n\n");
+    run(dir, "add", "n.txt");
+    utimesSync(join(dir, ".git/index"), before.atime, before.mtime);
+    expect(await wc.checkout.staging.isOutdated()).toBe(true);
+    const after = readFileSync(join(dir, ".git/index"));
+    await ours.status().call();
+    expect(readFileSync(join(dir, ".git/index")).equals(after)).toBe(true);
+  });
+
+  it("a refresh that cannot take index.lock leaves the index and memory as they were", async () => {
+    const dir = join(root, "r");
+    staleRepo(dir);
+    writeFileSync(join(dir, ".git/index.lock"), "");
+    const { ours, wc } = await open(dir);
+    const before = await wc.checkout.staging.getEntry("a.txt");
+    const status = await ours.status().call();
+    expect(status.isClean()).toBe(true);
+    expect(await wc.checkout.staging.getEntry("a.txt")).toEqual(before);
+    rmSync(join(dir, ".git/index.lock"));
+  });
+});
+
+describeGit("submodules (review cases)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "submodule-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("a submodule added by git (gitdir: ../.git/modules/sub) moved to another commit", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    const upstream = join(root, "up");
+    repo(upstream);
+    exec(dir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", upstream, "sub");
+    run(dir, "commit", "-qm", "sub");
+    expect(readFileSync(join(dir, "sub/.git"), "utf8")).toContain("gitdir: ../.git/modules/sub");
+    await expectStatusAsNative(dir);
+    put(join(dir, "sub"), "a.txt", "changed\n");
+    run(join(dir, "sub"), "commit", "-qam", "x");
+    const status = await expectStatusAsNative(dir);
+    expect(status.modified).toEqual(new Set(["sub"]));
+  });
+
+  it("a FIFO where a submodule's HEAD should be is not read", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    nestedRepo(dir, "sub");
+    run(dir, "add", "sub");
+    run(dir, "commit", "-qm", "sub");
+    rmSync(join(dir, "sub/.git/HEAD"));
+    execFileSync("mkfifo", [join(dir, "sub/.git/HEAD")]);
+    const { ours } = await open(dir);
+    const status = await ours.status().call();
+    expect(status.modified.has("sub")).toBe(false);
+  }, 10_000);
+
+  it("a gitdir: pointing above the repository's root is not followed", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    nestedRepo(dir, "sub");
+    run(dir, "add", "sub");
+    run(dir, "commit", "-qm", "sub");
+    rmSync(join(dir, "sub/.git"), { recursive: true });
+    writeFileSync(join(dir, "sub/.git"), "gitdir: ../../outside\n");
+    mkdirSync(join(root, "outside"));
+    writeFileSync(join(root, "outside/HEAD"), `${"ab".repeat(20)}\n`);
+    const { ours } = await open(dir);
+    expect((await ours.status().call()).modified.has("sub")).toBe(false);
+  });
+});
+
+describe("removing an empty directory never removes what is in it", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "rmdir-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("PosixFilesApi.rmdir and FileWorktree.removeEmptyDirectory refuse a non-empty one", async () => {
+    mkdirSync(join(root, "d/e"), { recursive: true });
+    writeFileSync(join(root, "d/e/f"), "f\n");
+    mkdirSync(join(root, "empty"));
+    const files = createNodeFilesApi({ rootDir: root });
+    expect(await files.rmdir?.("/d/e")).toBe(false);
+    expect(readFileSync(join(root, "d/e/f"), "utf8")).toBe("f\n");
+    expect(await files.rmdir?.("/d/e/f")).toBe(false);
+    const { history } = await createGitFilesBackend({ files, create: true });
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "",
+      gitDir: ".git",
+      blobs: history.blobs,
+      trees: history.trees,
+    });
+    expect(await worktree.removeEmptyDirectory?.("d")).toBe(false);
+    expect(existsSync(join(root, "d/e/f"))).toBe(true);
+    expect(await worktree.removeEmptyDirectory?.("empty")).toBe(true);
+    expect(existsSync(join(root, "empty"))).toBe(false);
   });
 });

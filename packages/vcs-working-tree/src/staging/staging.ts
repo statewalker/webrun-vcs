@@ -8,6 +8,7 @@
  */
 
 import type { ObjectId, Trees } from "@statewalker/vcs-core";
+import type { IndexStatUpdate } from "./stat-refresh.js";
 import type { MergeStageValue, StagingEntry, StagingEntryOptions } from "./types.js";
 
 // Re-export types for consumers
@@ -167,6 +168,14 @@ export interface Staging {
    * Get last update time (ms since epoch)
    */
   getUpdateTime(): number;
+
+  /**
+   * Stores fresh stats for entries still as compared (compare-and-set), as git's index
+   * refresh: for an index file, written only when the file is unchanged since read, and
+   * without writing other in-memory edits. Returns whether anything was stored. Absent:
+   * callers apply the same compare-and-set through an editor.
+   */
+  refreshStats?(updates: IndexStatUpdate[]): Promise<boolean>;
 
   /**
    * Clear all entries

@@ -5,9 +5,12 @@ import {
   type GitStagingOptions,
   INDEX_VERSION_2,
   IndexFile,
+  type IndexStatUpdate,
   type IndexVersion,
   MergeStage,
   type MergeStageValue,
+  readIndexChecksum,
+  refreshIndexFile,
   type StagingEdit,
   type StagingEntry,
   type StagingEntryOptions,
@@ -333,9 +336,28 @@ export class FileStagingStore implements Staging {
   }
 
   async isOutdated(): Promise<boolean> {
-    const stats = await this.files.stats(this.indexPath);
-    if (!stats?.lastModified) return false;
-    return stats.lastModified > this.updateTime;
+    // the index on disk is another one than this instance read or wrote (by checksum)
+    const current = this.indexFile.currentChecksum;
+    if (current === undefined) return false;
+    return (await readIndexChecksum(this.files, this.indexPath)) !== current;
+  }
+
+  /**
+   * Stores fresh stats (compare-and-set per entry) in the index file, as git's index
+   * refresh: only while the file is the one this instance read or wrote, under
+   * `index.lock`, and without writing other in-memory edits.
+   */
+  async refreshStats(updates: IndexStatUpdate[]): Promise<boolean> {
+    const entries = await refreshIndexFile(
+      this.indexFile,
+      this.indexFile.fresh(),
+      this._entries,
+      updates,
+    );
+    if (!entries) return false;
+    this._entries = entries;
+    this.updateTime = Date.now();
+    return true;
   }
 
   getUpdateTime(): number {

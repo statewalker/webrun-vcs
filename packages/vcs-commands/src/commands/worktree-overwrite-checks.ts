@@ -139,7 +139,8 @@ export async function removeDirectoryIfEmpty(worktree: Worktree, dir: string): P
   const inside = worktree.walk({ pathPrefix: dir, includeIgnored: true, includeDirectories: true });
   for await (const _ of inside) return false;
   if (await worktree.exists(`${dir}/.git`)) return false;
-  return worktree.remove(dir, { recursive: true });
+  // never recursive: a worktree that cannot remove a directory that way keeps it
+  return worktree.remove(dir);
 }
 
 /**

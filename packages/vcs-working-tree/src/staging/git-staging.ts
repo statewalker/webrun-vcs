@@ -9,7 +9,7 @@
 
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, FileMode, type FilesApi } from "@statewalker/vcs-core";
-import { IndexFile } from "./index-file.js";
+import { IndexFile, readIndexChecksum } from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion } from "./index-format.js";
 import type {
   ConflictResolution,
@@ -22,6 +22,7 @@ import type {
   ReadTreeOptions,
   Staging,
 } from "./staging.js";
+import { type IndexStatUpdate, refreshIndexFile } from "./stat-refresh.js";
 import { MergeStage, type MergeStageValue, type StagingEntry } from "./types.js";
 
 /**
@@ -315,9 +316,28 @@ export class GitStaging implements Staging {
   }
 
   async isOutdated(): Promise<boolean> {
-    const stats = await this.files.stats(this.indexPath);
-    if (!stats?.lastModified) return false;
-    return stats.lastModified > this.updateTime;
+    // the index on disk is another one than this instance read or wrote (by checksum)
+    const current = this.indexFile.currentChecksum;
+    if (current === undefined) return false;
+    return (await readIndexChecksum(this.files, this.indexPath)) !== current;
+  }
+
+  /**
+   * Stores fresh stats (compare-and-set per entry) in the index file, as git's index
+   * refresh: only while the file is the one this instance read or wrote, under
+   * `index.lock`, and without writing other in-memory edits.
+   */
+  async refreshStats(updates: IndexStatUpdate[]): Promise<boolean> {
+    const entries = await refreshIndexFile(
+      this.indexFile,
+      this.indexFile.fresh(),
+      this._entries,
+      updates,
+    );
+    if (!entries) return false;
+    this._entries = entries;
+    this.updateTime = Date.now();
+    return true;
   }
 
   getUpdateTime(): number {
