@@ -66,6 +66,29 @@ function sameType(a: number, b: number): boolean {
 const ms = (t: number | undefined) => Math.floor(t ?? 0);
 
 /**
+ * Whether a time the index recorded matches the file's. An index written by a git built
+ * without nanosecond support (or on a filesystem with whole-second times) keeps no
+ * fraction: then only whole seconds are compared, as that git compares them.
+ */
+function sameTime(recorded: number | undefined, current: number | undefined): boolean {
+  const r = ms(recorded);
+  const c = ms(current);
+  if (r % 1000 === 0) return Math.floor(r / 1000) === Math.floor(c / 1000);
+  return r === c;
+}
+
+/**
+ * Racy git: an entry not older than the index file may hide a same-size change. Compared in
+ * whole seconds when the entry keeps no fraction, as git does for such an index.
+ */
+function isRacy(recorded: number | undefined, indexTime: number): boolean {
+  if (indexTime === 0) return true;
+  const r = ms(recorded);
+  if (r % 1000 === 0) return Math.floor(r / 1000) >= Math.floor(ms(indexTime) / 1000);
+  return r >= ms(indexTime);
+}
+
+/**
  * Compares one index entry (stage 0) with the worktree, as git's `run_diff_files`: missing
  * (or a directory in its place) is "deleted", a file of another kind is "typechange", other
  * content or (where trusted) executable bit is "modified". A matching stat that is not racy
@@ -104,12 +127,12 @@ export async function compareWithWorktree(
   const statMatches =
     ms(entry.mtime) !== 0 &&
     current.size === entry.size &&
-    ms(current.mtime) === ms(entry.mtime) &&
+    sameTime(entry.mtime, current.mtime) &&
     (entry.ctime === undefined ||
       current.ctime === undefined ||
-      ms(entry.ctime) === ms(current.ctime));
+      sameTime(entry.ctime, current.ctime));
   // racy git: an entry not older than the index file may hide a same-size change
-  const racy = indexTime === 0 || ms(entry.mtime) >= ms(indexTime);
+  const racy = isRacy(entry.mtime, indexTime);
   if (statMatches && !racy) return found;
   // a known size that differs is a change, without reading the file (git: DATA_CHANGED)
   if (
