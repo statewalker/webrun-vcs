@@ -16,6 +16,13 @@ export interface FetchOptions extends BaseHttpOptions, FetchClientOptions {
   protocolVersion?: 0 | 2;
   /** Aborts the fetch */
   signal?: AbortSignal;
+  /**
+   * Send upload-pack request bodies over 1024 bytes (large have-batches) gzipped, with
+   * `Content-Encoding: gzip`, as git's remote-curl does (default true). Set false where that
+   * header cannot go: `Content-Encoding` is not a CORS-safelisted request header, so a browser
+   * behind a CORS proxy that does not allow it fails the preflight.
+   */
+  gzipRequests?: boolean;
 }
 
 /**

@@ -19,21 +19,34 @@ export interface UploadPackRequest {
   readonly protocolVersion: 0 | 2;
   /** The object ids wanted (`want` lines, and the tips of v2 `want-ref` lines) */
   readonly wants: readonly string[];
-  /** The visible refs whose tip is wanted (`want-ref` names included), sorted */
+  /**
+   * Every ref whose tip is wanted, hidden ones included (the hook runs on the server), and the
+   * `want-ref` names; sorted. A want that is no ref's tip names no ref here: under the "ANY",
+   * "TIP" and reachable request policies a client may want a parent of a tip, or any object,
+   * so a decision about refs must check what the wants reach (or serve "ADVERTISED" only).
+   */
   readonly refs: readonly string[];
   /** v2 `want-ref` lines: ref name → id */
   readonly wantRefs: ReadonlyMap<string, string>;
   /**
-   * The client's `have` lines. Over v2 a fetch command carries them all; over v0 the hook runs
-   * before the negotiation, so none are known yet (empty).
+   * The client's `have` lines known when the hook runs: over v2, those of this fetch request
+   * (one round of the negotiation); over v0 the hook runs before the negotiation, so none
+   * (empty).
    */
   readonly haves: readonly string[];
-  /** The client's capabilities (v0), or the `fetch` arguments it sent (v2: `thin-pack`, …) */
+  /**
+   * The client's capabilities (v0), or the `fetch` arguments it sent (v2: `thin-pack`, …); a
+   * copy
+   */
   readonly capabilities: ReadonlySet<string>;
   /** The client's shallow commits */
   readonly shallow: readonly string[];
   /** `deepen <depth>` (0: none) */
   readonly depth: number;
+  /** `deepen-since <time>` (seconds since the epoch), when asked */
+  readonly deepenSince?: number;
+  /** `deepen-not <ref>` lines, as sent */
+  readonly deepenNot: readonly string[];
   /** `filter <spec>`, when asked */
   readonly filter?: string;
 }
@@ -63,14 +76,18 @@ export interface UploadPackResult extends UploadPackRequest {
  * ```ts
  * const uploadPack: UploadPackServerOptions = {
  *   hooks: {
- *     authorize: (request, ctx) =>
- *       request.refs.every((ref) => !ref.startsWith("refs/heads/private/")) ||
- *       ctx.request?.headers.authorization === "Bearer secret" ||
- *       "access denied",
+ *     // who may fetch at all: decided on the request, not on what it names
+ *     authorize: (_request, ctx) =>
+ *       ctx.request?.headers.authorization === `Bearer ${token}` || "access denied",
  *     postUpload: (result) => metrics.count("fetch", result.packBytes),
  *   },
  * };
  * ```
+ *
+ * `request.refs` lists the refs whose tips are wanted, but a client may want any object the
+ * request policy serves (a parent of a tip under "ANY" or "REACHABLE_COMMIT"): a hook that
+ * guards some refs must check what the wants reach, or the server must keep the "ADVERTISED"
+ * policy (v0's default) and hide those refs.
  */
 export interface UploadPackHooks {
   /**
@@ -126,7 +143,7 @@ export async function authorizeUpload(
   const hook = config.uploadPack?.hooks?.authorize;
   if (!hook) return undefined;
   try {
-    const request = await withRefs(config, refStore, parts);
+    const request = await withRefs(refStore, parts);
     const verdict = await hook(request, uploadHookContext(config, repository));
     if (verdict === undefined || verdict === true) return undefined;
     if (verdict === false) return UPLOAD_PACK_ACCESS_DENIED;
@@ -153,7 +170,7 @@ export function notifyUpload(
   setTimeout(() => {
     void (async () => {
       try {
-        const request = await withRefs(config, refStore, parts);
+        const request = await withRefs(refStore, parts);
         await hook(
           { ...request, common, packBytes: result.packBytes },
           uploadHookContext(config, repository),
@@ -182,16 +199,17 @@ export async function includeTagCandidates(
 }
 
 async function withRefs(
-  config: ProcessConfiguration,
   refStore: RefStore,
   parts: UploadPackRequestParts,
 ): Promise<UploadPackRequest> {
   const wanted = new Set(parts.wants);
   const refs = new Set(parts.wantRefs.keys());
+  // hidden refs too: the hook is the server's, and must see a want of a hidden tip for what
+  // it is
   for (const [name, oid] of await refStore.listAll()) {
-    if (wanted.has(oid) && !isRefHidden(name, config.hiddenRefs)) refs.add(name);
+    if (wanted.has(oid)) refs.add(name);
   }
-  return { ...parts, refs: [...refs].sort() };
+  return { ...parts, capabilities: new Set(parts.capabilities), refs: [...refs].sort() };
 }
 
 function uploadHookContext(

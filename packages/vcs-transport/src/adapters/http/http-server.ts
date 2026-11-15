@@ -135,7 +135,9 @@ export interface HttpServerOptions {
    * Hidden ref patterns of both services (git's `transfer.hideRefs`; see `isRefHidden`):
    * not advertised (nor listed by v2 `ls-refs`), a v2 `want-ref` of one is an unknown ref,
    * and a push changing one is refused ("deny updating a hidden ref"). The services' own
-   * patterns (`uploadPack.hideRefs`, `receivePack.hideRefs`) come after these.
+   * patterns (`uploadPack.hideRefs`, `receivePack.hideRefs`) come after these. Not access
+   * control, as in git: hidden history stays fetchable by id under the "ANY" (v2's default),
+   * "TIP" and reachable request policies, and HEAD naming a hidden branch is still advertised.
    */
   hideRefs?: string[];
   /** Logs hook failures that cannot reach the client (default: console.error) */
@@ -165,7 +167,10 @@ export interface UploadPackServerOptions {
    * refuse with `ERR <message>`; `postUpload` starts once a pack was sent.
    */
   hooks?: UploadPackHooks;
-  /** Hidden ref patterns of upload-pack, after `hideRefs` (git's `uploadpack.hideRefs`) */
+  /**
+   * Hidden ref patterns of upload-pack, after `hideRefs` (git's `uploadpack.hideRefs`); not
+   * access control (see {@link HttpServerOptions.hideRefs})
+   */
   hideRefs?: string[];
 }
 
@@ -439,6 +444,7 @@ function plain(status: number, message: string): HttpResponse {
 
 /** The capabilities upload-pack advertises by default (GET /info/refs). */
 const DEFAULT_UPLOAD_PACK_CAPABILITIES = [
+  "multi_ack",
   "multi_ack_detailed",
   "side-band-64k",
   "thin-pack",

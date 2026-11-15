@@ -43,10 +43,12 @@ function recording(handler: (request: Request) => Promise<Response>) {
 }
 
 /**
- * A server with `c0`, a client with c0 under 60 commits of its own and no remote-tracking ref:
- * the negotiation walks all of them (many haves) before it meets c0.
+ * A server with `c0`, a client with c0 under 60 commits of its own: the negotiation walks them
+ * (many haves) before it meets c0. `stale`: the remote-tracking ref still names c0 (a v0
+ * server must then answer every batch with NAK, git's get_common_commits); otherwise it is
+ * removed.
  */
-async function setup(repos: TransportRepo[]) {
+async function setup(repos: TransportRepo[], options: { stale?: boolean } = {}) {
   const server = await createTransportRepo();
   const client = await createTransportRepo();
   repos.push(server, client);
@@ -68,7 +70,7 @@ async function setup(repos: TransportRepo[]) {
     tip = await commitInRepo(client, `local ${i}`, { "l.txt": `${i}\n` }, [tip]);
   }
   await client.refStore.update("refs/heads/main", tip);
-  await client.history.refs.remove("refs/remotes/origin/main");
+  if (!options.stale) await client.history.refs.remove("refs/remotes/origin/main");
   const c1 = await commitInRepo(server, "c1", { "a.txt": "1\n" }, [c0]);
   await server.refStore.update("refs/heads/main", c1);
   return { server, client, handler, c1 };
@@ -80,9 +82,13 @@ describe("fetch client: gzipped request bodies", () => {
     for (const r of repos.splice(0)) await r.close();
   });
 
-  for (const protocolVersion of [0, 2] as const) {
-    it(`protocol v${protocolVersion}: a large have-batch goes gzipped, a small request does not`, async () => {
-      const { client, handler, c1 } = await setup(repos);
+  for (const [protocolVersion, stale] of [
+    [0, false],
+    [2, false],
+    // a stale tracking ref names c0: the client knows it common and sends ~16 haves only
+  ] as const) {
+    it(`protocol v${protocolVersion}${stale ? ", stale tracking ref" : ""}: a large have-batch goes gzipped, a small request does not`, async () => {
+      const { client, handler, c1 } = await setup(repos, { stale });
       const { seen, fetchImpl } = recording(handler);
       const result = await fetch({
         url: "http://ours.test/r.git",
@@ -143,5 +149,28 @@ describeGit("fetch client: git http-backend takes the gzipped bodies", () => {
     } finally {
       backend.close();
     }
+  });
+});
+
+describe("fetch client: gzipRequests: false", () => {
+  const repos: TransportRepo[] = [];
+  afterEach(async () => {
+    for (const r of repos.splice(0)) await r.close();
+  });
+
+  it("sends every request body as it is (a browser behind a CORS proxy)", async () => {
+    const { client, handler, c1 } = await setup(repos);
+    const { seen, fetchImpl } = recording(handler);
+    await fetch({
+      url: "http://ours.test/r.git",
+      fetchImpl,
+      gzipRequests: false,
+      repository: client.facade,
+      refStore: client.refStore,
+      refspecs: ["+refs/heads/main:refs/remotes/origin/main"],
+    });
+    expect(await client.refStore.get("refs/remotes/origin/main")).toBe(c1);
+    expect(seen.some((s) => s.bytes > GZIP_REQUEST_MIN_BYTES)).toBe(true);
+    expect(seen.every((s) => s.encoding === null)).toBe(true);
   });
 });

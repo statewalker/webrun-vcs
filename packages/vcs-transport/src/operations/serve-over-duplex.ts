@@ -73,7 +73,9 @@ export interface ServeOverDuplexOptions {
   /**
    * Hidden ref patterns of both services (git's `transfer.hideRefs`; see `isRefHidden`):
    * not advertised (nor listed by v2 `ls-refs`), a v2 `want-ref` of one is an unknown ref,
-   * and receive-pack refuses changing one ("deny updating a hidden ref")
+   * and receive-pack refuses changing one ("deny updating a hidden ref"). Not access control,
+   * as in git: hidden history stays fetchable by id under the "ANY" (v2's default), "TIP" and
+   * reachable request policies, and HEAD naming a hidden branch is still advertised.
    */
   hideRefs?: string[];
   /** Hidden ref patterns of upload-pack, after `hideRefs` (git's `uploadpack.hideRefs`) */

@@ -302,25 +302,37 @@ export async function* listObjects(
     yield { id, type: "blob" };
   }
 
-  // git's add_ref_tag / add_tag_chain: a tag peeling to a listed object comes with its chain
+  // git's add_ref_tag / add_tag_chain: a tag peeling to a listed object comes with its chain.
+  // Only tag objects are read: a listed object (ADDED) ends the chain without a read, an
+  // object the walk met and did not list (other flags) drops the candidate, and any other
+  // object is looked at by its header only
+  const tagIds = new Set(tags);
   for (const tip of options.includeTags ?? []) {
     if (has(tip, ADDED)) continue;
     const chain: ObjectId[] = [];
     let id = tip;
-    let target: { type: ObjectTypeString } | undefined;
-    for (;;) {
-      const o = await tryRead(id);
-      if (o?.type !== "tag") {
-        target = o;
+    let listed = false;
+    for (let depth = 0; depth < 64; depth++) {
+      if (has(id, ADDED) && !tagIds.has(id)) {
+        listed = !has(id, UNINTERESTING);
+        break;
+      }
+      if (!tagIds.has(id) && (flags.get(id) ?? 0) !== 0) break; // met, not listed
+      const o = await objects.get(id);
+      if (!o) break;
+      if (o.type !== "tag") {
+        // neither listed nor a tag: its content is not needed
+        await o.content[Symbol.asyncIterator]().return?.();
         break;
       }
       chain.push(id);
-      id = parseTagTarget(id, o.data);
+      id = parseTagTarget(id, await collect(o));
     }
-    if (!target || chain.length === 0 || !has(id, ADDED) || has(id, UNINTERESTING)) continue;
+    if (!listed || chain.length === 0) continue;
     for (const tag of chain) {
       if (has(tag, ADDED)) continue;
       set(tag, ADDED);
+      tagIds.add(tag);
       yield { id: tag, type: "tag" };
     }
   }

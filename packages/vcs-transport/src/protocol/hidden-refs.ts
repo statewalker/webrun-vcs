@@ -20,6 +20,11 @@
  * `want-ref` of one is refused as an unknown ref, an id wanted only through a hidden ref is
  * "not our ref" under the "ADVERTISED" request policy, and receive-pack refuses to change
  * one ("deny updating a hidden ref", "deny deleting a hidden ref").
+ *
+ * Hiding a ref is not access control, as in git: the objects of a hidden ref stay fetchable by
+ * id under the "ANY" (protocol v2's default), "TIP" and reachable request policies, and HEAD
+ * is still advertised when it names a hidden branch. Keep data private with a separate
+ * repository, or the "ADVERTISED" policy plus an upload-pack `authorize` hook.
  */
 
 /** Whether `refName` is hidden by `patterns` (git's `ref_is_hidden`). */

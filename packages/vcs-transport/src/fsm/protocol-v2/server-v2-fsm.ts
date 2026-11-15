@@ -853,6 +853,8 @@ function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
     capabilities,
     shallow: [...(req?.shallow ?? [])],
     depth: req?.deepen ?? 0,
+    ...(req?.deepenSince !== undefined ? { deepenSince: req.deepenSince } : {}),
+    deepenNot: [...(req?.deepenNot ?? [])],
     ...(req?.filter != null ? { filter: req.filter } : {}),
   };
 }

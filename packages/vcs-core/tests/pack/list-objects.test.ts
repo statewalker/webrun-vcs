@@ -205,3 +205,39 @@ describe("listObjects: includeTags (git's pack-objects --include-tag)", () => {
     expect(out.filter((o) => o.id === onC3)).toHaveLength(1);
   });
 });
+
+describe("listObjects: includeTags reads only tag objects", () => {
+  it("reads no target, no lightweight tag of a listed object and no object the walk met", async () => {
+    const objects = memObjects();
+    const h = await linear(objects);
+    const onC3 = await tag(objects, h.c3, "commit", "v3");
+    const onBlob = await tag(objects, h.extra, "blob", "extra");
+    const onOld = await tag(objects, h.c1, "commit", "v1"); // the receiver's commit
+    let reading = false;
+    const reads: string[] = [];
+    const spy = {
+      ...objects,
+      get: (id: string) => {
+        if (reading) reads.push(id);
+        return objects.get(id);
+      },
+      has: (id: string) => objects.has(id),
+    } as GitObjects;
+    const out: ListedObject[] = [];
+    for await (const o of listObjects(spy, {
+      wants: [h.c3],
+      haves: [h.c2],
+      // lightweight tags: c3 (listed), c2 (the receiver's, met by the walk)
+      includeTags: [h.c3, h.c2, onC3, onBlob, onOld],
+    })) {
+      out.push(o);
+      // count the reads from the first tree or blob on (the commit walk is over)
+      if (o.type !== "commit" && o.type !== "tag") reading = true;
+    }
+    expect(out.filter((o) => o.type === "tag").map((o) => o.id)).toEqual([onC3, onBlob]);
+    // past the walk (whose trees are read as they are listed) only the annotated tags are
+    // read: neither their targets (c3, the blob, c1) nor the lightweight tags (c3, c2)
+    const trees = new Set(out.filter((o) => o.type === "tree").map((o) => o.id));
+    expect(reads.filter((id) => !trees.has(id)).sort()).toEqual([onC3, onBlob, onOld].sort());
+  });
+});

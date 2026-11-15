@@ -26,7 +26,7 @@ import {
   type UploadPackRequest,
   type UploadPackResult,
 } from "../../src/index.js";
-import { runReceivePack, ZERO } from "../helpers/receive-pack-harness.js";
+import { packOf, runReceivePack, ZERO } from "../helpers/receive-pack-harness.js";
 import {
   cleanupDir,
   createTransportRepo,
@@ -516,13 +516,166 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
       expect(answer.report).toContain("ng refs/hidden/secret deny deleting a hidden ref");
       expect(await ours.refStore.get("refs/hidden/secret")).toBe(ids.h1);
     });
+
+    for (const strictAtomic of [false, true]) {
+      it(`an atomic push with a hidden ref: ${strictAtomic ? "strictAtomic refuses all" : "the others still land (as git)"}`, async () => {
+        const target = await createTransportRepo();
+        try {
+          const pack = run(bare, ["pack-objects", "--revs", "--all", "--stdout"], { input: "" });
+          await target.facade.importPack(
+            (async function* () {
+              yield new Uint8Array(pack.stdout);
+            })(),
+          );
+          await target.refStore.update("refs/hidden/secret", ids.h1 as string);
+          const answer = await runReceivePack(
+            target,
+            {
+              commands: [
+                `${ids.h1} ${ids.c4} refs/hidden/secret`,
+                `${ZERO} ${ids.c4} refs/heads/new`,
+              ],
+              caps: "report-status atomic",
+              // the objects are there: an empty pack, as git's send-pack sends
+              pack: await packOf(target, []),
+            },
+            { hideRefs: ["refs/hidden"], strictAtomic },
+          );
+          expect(answer.report).toContain("ng refs/hidden/secret deny updating a hidden ref");
+          if (strictAtomic) {
+            expect(answer.report).toContain("ng refs/heads/new atomic push failure");
+            expect(await target.refStore.get("refs/heads/new")).toBeUndefined();
+          } else {
+            expect(answer.report).toContain("ok refs/heads/new");
+            expect(await target.refStore.get("refs/heads/new")).toBe(ids.c4);
+          }
+          expect(await target.refStore.get("refs/hidden/secret")).toBe(ids.h1);
+        } finally {
+          await target.close();
+        }
+      });
+    }
+
+    it("v2 fetch: ADVERTISED refuses a hidden tip, TIP serves it (ours: git's v2 serves any object)", async () => {
+      const body = v2Fetch([ids.h1 as string], [], ["ofs-delta"]);
+      const advertised = parseResponse(
+        await bodyBytes(
+          await handler({ ...OUR_HIDE, requestPolicy: "ADVERTISED" })(post(body, true)),
+        ),
+      );
+      expect(advertised.lines[0]).toBe(`ERR upload-pack: not our ref ${ids.h1}`);
+      const tip = parseResponse(
+        await bodyBytes(await handler({ ...OUR_HIDE, requestPolicy: "TIP" })(post(body, true))),
+      );
+      expect(tip.lines[0]).toBe("packfile");
+      expect(tip.pack.length).toBeGreaterThan(12);
+      // a want of a shown tip is served under ADVERTISED
+      const shown = parseResponse(
+        await bodyBytes(
+          await handler({ ...OUR_HIDE, requestPolicy: "ADVERTISED" })(
+            post(v2Fetch([ids.c4 as string], [], []), true),
+          ),
+        ),
+      );
+      expect(shown.lines[0]).toBe("packfile");
+    });
+
+    it("HEAD naming a hidden branch is still advertised, as git (hideRefs is no access control)", async () => {
+      const config = [["transfer.hideRefs", "refs/heads/main"]];
+      const native = run(root, ["upload-pack", "--stateless-rpc", "--advertise-refs", bare], {
+        config,
+      }).stdout;
+      const our = await bodyBytes(
+        await handler({ hideRefs: ["refs/heads/main"] })(get("git-upload-pack")),
+      );
+      expect(refLines(our)).toEqual(refLines(native));
+      expect(refLines(our)[0]).toBe(`${ids.c4} HEAD`);
+      expect(refLines(our).join("\n")).not.toContain("refs/heads/main");
+    });
   });
 
   describe("upload-pack hooks", () => {
+    it("authorize sees a v2 want-ref (and every ref of the wants, hidden ones too), and refuses it", async () => {
+      const seen: UploadPackRequest[] = [];
+      const h = handler({
+        ...OUR_HIDE,
+        uploadPack: {
+          ...OUR_HIDE.uploadPack,
+          hooks: {
+            authorize: (request) => {
+              seen.push(request);
+              return request.refs.some((r) => r.startsWith("refs/hidden/")) ? "no" : undefined;
+            },
+          },
+        },
+      });
+      const wantRef = parseResponse(
+        await bodyBytes(await h(post(v2Fetch([], [], ["want-ref refs/heads/main"]), true))),
+      );
+      expect(wantRef.lines).toContain("packfile");
+      expect([...(seen[0]?.wantRefs ?? [])]).toEqual([["refs/heads/main", ids.c4]]);
+      expect(seen[0]?.refs).toEqual(expect.arrayContaining(["HEAD", "refs/heads/main"]));
+      // a hidden tip wanted by id (v2 serves any object): its hidden ref is named
+      const hidden = parseResponse(
+        await bodyBytes(await h(post(v2Fetch([ids.h1 as string], [], ["deepen-since 1"]), true))),
+      );
+      expect(hidden.lines[0]).toBe("ERR no");
+      expect(seen[1]?.refs).toEqual(["refs/hidden/secret"]);
+      expect(seen[1]?.deepenSince).toBe(1);
+      expect(seen[1]?.capabilities).not.toBe(seen[0]?.capabilities);
+    });
+
+    it("authorize runs on every round of a stateless v0 negotiation, and may refuse a later one", async () => {
+      const calls: UploadPackRequest[] = [];
+      const server = await serveFetchHandler(
+        createFetchHandler({
+          resolveRepository: async () => ({ repository: ours.facade, refStore: ours.refStore }),
+          uploadPack: {
+            hooks: {
+              authorize: (request) => {
+                calls.push(request);
+                return calls.length > 1 ? "second round refused" : undefined;
+              },
+            },
+          },
+        }),
+      );
+      const dir = join(root, "rounds");
+      try {
+        git(root, ["init", "-q", "--bare", dir]);
+        git(dir, ["fetch", "-q", bare, `${ids.c1}:refs/heads/main`]);
+        // 100 local commits: the negotiation needs more than one POST
+        let stream = "";
+        for (let i = 0; i < 100; i++) {
+          const message = `l${i}\n`;
+          stream += `commit refs/heads/main\ncommitter T <t@example.com> ${1_900_000_000 + i} +0000\n`;
+          stream += `data ${message.length}\n${message}`;
+          if (i === 0) stream += `from ${ids.c1}\n`;
+          stream += `M 100644 inline l.txt\ndata ${message.length}\n${message}\n`;
+        }
+        run(dir, ["fast-import", "--quiet"], { input: stream });
+        const r = await gitAsync(
+          dir,
+          ["fetch", `${server.baseUrl}/r.git`, "+refs/heads/main:refs/remotes/origin/main"],
+          [["protocol.version", "0"]],
+        );
+        expect(r.code).not.toBe(0);
+        expect(r.stderr).toContain("remote error: second round refused");
+        expect(calls.length).toBe(2);
+        expect(calls.every((c) => c.wants.includes(ids.c4 as string))).toBe(true);
+      } finally {
+        await server.close();
+      }
+    });
+
     for (const version of ["0", "2"]) {
       it(`over smart HTTP (protocol v${version}): authorize refuses with ERR, postUpload reports a fetch`, async () => {
         const seen: UploadPackRequest[] = [];
         const uploads: UploadPackResult[] = [];
+        let uploaded: (() => void) | undefined;
+        const firstUpload = new Promise<void>((resolve) => {
+          uploaded = resolve;
+        });
         let refuse = true;
         const server = await serveFetchHandler(
           createFetchHandler({
@@ -537,6 +690,7 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
                 },
                 postUpload: (result) => {
                   uploads.push(result);
+                  uploaded?.();
                 },
               },
             },
@@ -563,7 +717,7 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
             config,
           );
           expect(ok.code, ok.stderr).toBe(0);
-          await new Promise((r) => setTimeout(r, 50));
+          await firstUpload;
           expect(uploads).toHaveLength(1);
           expect(uploads[0]?.refs).toContain("refs/heads/main");
           expect(uploads[0]?.packBytes).toBeGreaterThan(0);

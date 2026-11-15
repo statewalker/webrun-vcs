@@ -60,6 +60,13 @@ export interface HttpConnectionOptions {
   protocolVersion?: 0 | 2;
   /** Aborts every request of the connection */
   signal?: AbortSignal;
+  /**
+   * Send upload-pack request bodies over 1024 bytes (large have-batches) gzipped, with
+   * `Content-Encoding: gzip`, as git's remote-curl does (default true). Set false where that
+   * header cannot go: `Content-Encoding` is not a CORS-safelisted request header, so a browser
+   * behind a CORS proxy that does not allow it fails the preflight.
+   */
+  gzipRequests?: boolean;
 }
 
 /**
@@ -118,7 +125,10 @@ export async function openHttpConnection(
     advertisedRefs: greeting.refs,
     async request(body) {
       await current?.cancel();
-      const payload = await gzipLargeBody(concat(body));
+      const payload =
+        options.gzipRequests === false
+          ? { bytes: concat(body), gzip: false }
+          : await gzipLargeBody(concat(body));
       const res = await wait(() =>
         doFetch(
           new Request(`${baseUrl}/git-upload-pack`, {
@@ -317,7 +327,8 @@ export const GZIP_REQUEST_MIN_BYTES = 1024;
 /**
  * A request body as git's remote-curl sends it: gzipped (`Content-Encoding: gzip`) when longer
  * than {@link GZIP_REQUEST_MIN_BYTES} (a large have-batch) and the platform has
- * `CompressionStream`; otherwise as it is.
+ * `CompressionStream`; otherwise as it is. `HttpConnectionOptions.gzipRequests: false` turns
+ * it off.
  */
 async function gzipLargeBody(
   bytes: Uint8Array<ArrayBuffer>,
