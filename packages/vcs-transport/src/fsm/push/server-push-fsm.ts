@@ -1,14 +1,23 @@
 /**
- * Server Push FSM for git-receive-pack operations.
+ * Server Push FSM for git-receive-pack operations, as git's `builtin/receive-pack.c`.
  *
- * Handles the server side of push operations:
- * 1. Send advertisement (refs + capabilities)
- * 2. Read push commands from client
- * 3. Read push options (if negotiated)
- * 4. Receive and unpack pack file
- * 5. Validate commands and check connectivity
- * 6. Run hooks and apply ref updates
- * 7. Send status report
+ * 1. Send the advertisement (refs + capabilities)
+ * 2. Read the commands (and the client's `shallow` lines), then the push options
+ * 3. Authorize the commands (the `authorize` hook), before any pack byte is read
+ * 4. Receive and import the pack (unless every command needing it is refused, or a delete)
+ * 5. Check connectivity (git's `check_connected`) and shallow updates
+ * 6. Run the pre-receive hook
+ * 7. Check each command as git's `update()` does (ref name, current branch, deletes,
+ *    fast-forward, branch tips are commits, duplicates), then the per-ref update hook
+ * 8. Apply the ref updates (one transaction when atomic)
+ * 9. Send the status report, then start the post-receive hook (detached)
+ *
+ * The report texts are git's: `unpacker error`, `missing necessary objects`, `funny refname`,
+ * `branch is currently checked out`, `deletion prohibited`, `deletion of the current branch
+ * prohibited`, `non-fast-forward`, `bad ref`, `hook declined`, `pre-receive hook declined`,
+ * `shallow update not allowed`, `failed to update ref`, `atomic push failure`, `atomic
+ * transaction failed`. With side-band, git's `error:` lines explaining a refusal go to the
+ * client's progress channel, and keep-alive packets are sent while a received push is checked.
  */
 
 import { isValidRefName, type RefCommand } from "@statewalker/vcs-core";
@@ -25,6 +34,16 @@ import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
+import { checkConnectivity, findNewCommits } from "./connectivity.js";
+import {
+  DEFAULT_MAX_PUSH_COMMANDS,
+  DEFAULT_RECEIVE_KEEP_ALIVE_MS,
+  type HookVerdict,
+  type ReceiveCommand,
+  type ReceivePackConfig,
+  type ReceivePackHookContext,
+  type ReceivePackHooks,
+} from "./receive-pack-types.js";
 import { type PushCommand, type PushCommandType, ZERO_OID } from "./types.js";
 
 /**
@@ -39,66 +58,80 @@ export const serverPushTransitions: FsmTransition[] = [
   ["SEND_ADVERTISEMENT", "EMPTY_REPO", "READ_COMMANDS"],
   ["SEND_ADVERTISEMENT", "ERROR", ""],
 
-  // Read push commands from client
+  // Read push commands (and shallow lines) from client
   ["READ_COMMANDS", "COMMANDS_RECEIVED", "READ_PUSH_OPTIONS"],
-  ["READ_COMMANDS", "COMMANDS_WITH_DELETE", "CHECK_DELETE_ALLOWED"],
   ["READ_COMMANDS", "NO_COMMANDS", ""], // Client sent nothing
   ["READ_COMMANDS", "ERROR", ""],
 
-  // Check if delete is allowed
-  ["CHECK_DELETE_ALLOWED", "DELETE_ALLOWED", "READ_PUSH_OPTIONS"],
-  ["CHECK_DELETE_ALLOWED", "DELETE_DENIED", "REJECT_COMMANDS"],
-
   // Read push options (if push-options capability negotiated)
-  ["READ_PUSH_OPTIONS", "OPTIONS_RECEIVED", "RECEIVE_PACK"],
-  ["READ_PUSH_OPTIONS", "NO_OPTIONS", "RECEIVE_PACK"],
+  ["READ_PUSH_OPTIONS", "OPTIONS_RECEIVED", "AUTHORIZE"],
+  ["READ_PUSH_OPTIONS", "NO_OPTIONS", "AUTHORIZE"],
   ["READ_PUSH_OPTIONS", "ERROR", ""],
+
+  // Authorize the commands before the pack is read
+  ["AUTHORIZE", "AUTHORIZED", "RECEIVE_PACK"],
+  ["AUTHORIZE", "DENIED", ""], // whole push refused, `authorizeFailure: "fatal"`
+  ["AUTHORIZE", "ERROR", ""],
 
   // Receive pack file from client
   ["RECEIVE_PACK", "PACK_RECEIVED", "UNPACK"],
-  ["RECEIVE_PACK", "EMPTY_PACK", "VALIDATE_COMMANDS"], // Delete-only
+  ["RECEIVE_PACK", "EMPTY_PACK", "CHECK_CONNECTIVITY"], // Delete-only
+  ["RECEIVE_PACK", "PACK_SKIPPED", "CHECK_CONNECTIVITY"], // Every command needing it refused
   ["RECEIVE_PACK", "ERROR", ""],
 
   // Unpack and store objects
   ["UNPACK", "UNPACK_OK", "CHECK_CONNECTIVITY"],
   ["UNPACK", "UNPACK_FAILED", "SEND_STATUS"],
-  ["UNPACK", "ERROR", ""],
 
-  // Check connectivity (all objects reachable)
-  ["CHECK_CONNECTIVITY", "CONNECTIVITY_OK", "VALIDATE_COMMANDS"],
-  ["CHECK_CONNECTIVITY", "CONNECTIVITY_FAILED", "REJECT_COMMANDS"],
-  ["CHECK_CONNECTIVITY", "ERROR", ""],
-
-  // Validate all commands
-  ["VALIDATE_COMMANDS", "ALL_VALID", "RUN_PRE_RECEIVE_HOOK"],
-  ["VALIDATE_COMMANDS", "SOME_INVALID", "RUN_PRE_RECEIVE_HOOK"], // Partial execution
-  ["VALIDATE_COMMANDS", "ALL_INVALID", "SEND_STATUS"],
-  ["VALIDATE_COMMANDS", "ERROR", ""],
-
-  // Reject commands (used for fatal errors)
-  ["REJECT_COMMANDS", "REJECTED", "SEND_STATUS"],
+  // Check connectivity (every object the new tips need is here) and shallow updates
+  ["CHECK_CONNECTIVITY", "CONNECTIVITY_OK", "RUN_PRE_RECEIVE_HOOK"],
+  ["CHECK_CONNECTIVITY", "CONNECTIVITY_FAILED", "RUN_PRE_RECEIVE_HOOK"], // per-ref refusals
+  ["CHECK_CONNECTIVITY", "INTERNAL_ERROR", "SEND_STATUS"], // reported in band: "internal error"
 
   // Pre-receive hook
-  ["RUN_PRE_RECEIVE_HOOK", "HOOK_OK", "APPLY_UPDATES"],
+  ["RUN_PRE_RECEIVE_HOOK", "HOOK_OK", "VALIDATE_COMMANDS"],
+  ["RUN_PRE_RECEIVE_HOOK", "NO_HOOK", "VALIDATE_COMMANDS"],
   ["RUN_PRE_RECEIVE_HOOK", "HOOK_REJECTED", "SEND_STATUS"],
-  ["RUN_PRE_RECEIVE_HOOK", "HOOK_ERROR", "SEND_STATUS"],
-  ["RUN_PRE_RECEIVE_HOOK", "NO_HOOK", "APPLY_UPDATES"],
-  ["RUN_PRE_RECEIVE_HOOK", "ERROR", ""],
+  ["RUN_PRE_RECEIVE_HOOK", "NOTHING_TO_DO", "SEND_STATUS"],
+
+  // Check each command (git's update()) and run the update hook
+  ["VALIDATE_COMMANDS", "ALL_VALID", "APPLY_UPDATES"],
+  ["VALIDATE_COMMANDS", "SOME_INVALID", "APPLY_UPDATES"], // Partial execution
+  ["VALIDATE_COMMANDS", "ALL_INVALID", "SEND_STATUS"],
+  ["VALIDATE_COMMANDS", "INTERNAL_ERROR", "SEND_STATUS"], // reported in band: "internal error"
 
   // Apply ref updates
-  ["APPLY_UPDATES", "UPDATES_APPLIED", "RUN_POST_RECEIVE_HOOK"],
-  ["APPLY_UPDATES", "PARTIAL_APPLIED", "RUN_POST_RECEIVE_HOOK"], // Some failed
+  ["APPLY_UPDATES", "UPDATES_APPLIED", "SEND_STATUS"],
+  ["APPLY_UPDATES", "PARTIAL_APPLIED", "SEND_STATUS"], // Some failed
   ["APPLY_UPDATES", "ATOMIC_FAILED", "SEND_STATUS"], // Atomic push failed
-  ["APPLY_UPDATES", "ERROR", ""],
-
-  // Post-receive hook
-  ["RUN_POST_RECEIVE_HOOK", "HOOK_DONE", "SEND_STATUS"],
-  ["RUN_POST_RECEIVE_HOOK", "NO_HOOK", "SEND_STATUS"],
+  ["APPLY_UPDATES", "INTERNAL_ERROR", "SEND_STATUS"], // reported in band: "internal error"
 
   // Send status report
-  ["SEND_STATUS", "STATUS_SENT", ""],
+  ["SEND_STATUS", "STATUS_SENT", "RUN_POST_RECEIVE_HOOK"],
   ["SEND_STATUS", "ERROR", ""],
+
+  // Post-receive hook: started after the report, detached
+  ["RUN_POST_RECEIVE_HOOK", "HOOK_STARTED", ""],
+  ["RUN_POST_RECEIVE_HOOK", "NO_HOOK", ""],
 ];
+
+/** The capabilities receive-pack advertises (report-status-v2 is not: decision P3.4). */
+export const RECEIVE_PACK_CAPABILITIES: readonly string[] = [
+  "report-status",
+  "delete-refs",
+  "ofs-delta",
+  "side-band-64k",
+  "atomic",
+  "push-options",
+  "quiet",
+];
+
+const OID = /^[0-9a-f]{40}$/;
+
+/** git's report-status texts. */
+const FAILED_TO_UPDATE = "failed to update ref";
+const ATOMIC_TRANSACTION_FAILED = "atomic transaction failed";
+const ATOMIC_PUSH_FAILURE = "atomic push failure";
 
 /**
  * Server push FSM handlers.
@@ -117,15 +150,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const output = getOutput(ctx);
       try {
         const refs = await refStore.listAll();
-        const capabilities = [
-          "report-status",
-          "delete-refs",
-          "ofs-delta",
-          "side-band-64k",
-          "atomic",
-          "push-options",
-          "quiet",
-        ];
+        const capabilities = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
 
         let first = true;
         const refsArray = Array.from(refs);
@@ -134,8 +159,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         if (refsArray.length === 0) {
           await transport.writeLine(`${ZERO_OID} capabilities^{}\0${capabilities.join(" ")}`);
           await transport.writeFlush();
-          // Don't pre-add server capabilities to state.capabilities.
-          // READ_COMMANDS will populate it with the client's negotiated caps.
+          // READ_COMMANDS populates state.capabilities with the client's request.
           return "EMPTY_REPO";
         }
 
@@ -146,8 +170,6 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           first = false;
         }
         await transport.writeFlush();
-        // Don't pre-add server capabilities to state.capabilities.
-        // READ_COMMANDS will populate it with the client's negotiated caps.
         return "REFS_SENT";
       } catch (e) {
         output.error = String(e);
@@ -156,102 +178,82 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
     },
   ],
 
-  // Read push commands from client
+  // Read push commands (and shallow lines) from client
   [
     "READ_COMMANDS",
     async (ctx) => {
       const transport = getTransport(ctx);
       const state = getState<ServerPushState>(ctx);
       const output = getOutput(ctx);
+      const maxCommands = receivePackConfig(ctx).maxCommands ?? DEFAULT_MAX_PUSH_COMMANDS;
       try {
         const pushCommands: PushCommand[] = [];
-        let hasDelete = false;
+        const shallow: string[] = [];
 
         while (true) {
           const pkt = await transport.readPktLine();
           if (pkt.type === "flush") break;
           if (pkt.type === "eof") {
-            output.error = "Unexpected end of input";
-            return "ERROR";
+            // git's receive-pack ends quietly on a client that sends nothing
+            if (pushCommands.length === 0 && shallow.length === 0) break;
+            return protocolError(ctx, "protocol error: unexpected end of the commands");
           }
           if (pkt.type === "delim") {
-            continue; // Unexpected delimiter in push commands
+            return protocolError(ctx, "protocol error: unexpected delimiter in the commands");
           }
 
-          const line = pkt.text;
+          let line = pkt.text.endsWith("\n") ? pkt.text.slice(0, -1) : pkt.text;
 
-          // Parse command: old-oid SP new-oid SP refname\0caps
-          // Cannot use split(" ", 3) — JS split with limit truncates remaining text.
-          // e.g., "a b c d".split(" ", 3) → ["a", "b", "c"] NOT ["a", "b", "c d"]
+          if (line.startsWith("shallow ")) {
+            const oid = line.slice(8);
+            if (!OID.test(oid)) {
+              return protocolError(ctx, `protocol error: expected shallow sha, got '${oid}'`);
+            }
+            shallow.push(oid);
+            continue;
+          }
+
+          // Capabilities after a NUL (the first command carries them)
+          const nul = line.indexOf("\0");
+          if (nul >= 0) {
+            for (const c of line.slice(nul + 1).split(" ")) {
+              if (c) state.capabilities.add(c);
+            }
+            line = line.slice(0, nul);
+          }
+
+          // old-oid SP new-oid SP refname (indexOf, not split with a limit: it truncates)
           const sp1 = line.indexOf(" ");
-          const sp2 = line.indexOf(" ", sp1 + 1);
+          const sp2 = sp1 < 0 ? -1 : line.indexOf(" ", sp1 + 1);
           const oldOid = line.slice(0, sp1);
           const newOid = line.slice(sp1 + 1, sp2);
-          let refName = line.slice(sp2 + 1);
-
-          // Parse capabilities from first command
-          if (refName.includes("\0")) {
-            const nullIdx = refName.indexOf("\0");
-            const caps = refName.slice(nullIdx + 1);
-            refName = refName.slice(0, nullIdx);
-            for (const c of caps.split(" ")) {
-              state.capabilities.add(c);
-            }
+          const refName = line.slice(sp2 + 1);
+          if (sp1 < 0 || sp2 < 0 || !OID.test(oldOid) || !OID.test(newOid) || !refName) {
+            return protocolError(ctx, `protocol error: expected old/new/ref, got '${line}'`);
           }
 
-          // Determine command type
           let type: PushCommandType;
           if (newOid === ZERO_OID) {
             type = "DELETE";
-            hasDelete = true;
           } else if (oldOid === ZERO_OID) {
             type = "CREATE";
           } else {
-            type = "UPDATE"; // Will validate fast-forward later
+            type = "UPDATE"; // fast-forward checked later
           }
 
-          pushCommands.push({
-            oldOid,
-            newOid,
-            refName,
-            type,
-            result: "NOT_ATTEMPTED",
-          });
+          pushCommands.push({ oldOid, newOid, refName, type, result: "NOT_ATTEMPTED" });
+          if (pushCommands.length > maxCommands) {
+            return protocolError(ctx, `protocol error: more than ${maxCommands} commands`);
+          }
         }
 
         state.pushCommands = pushCommands;
+        state.pushShallow = shallow;
 
         if (pushCommands.length === 0) {
           return "NO_COMMANDS";
         }
-
-        return hasDelete ? "COMMANDS_WITH_DELETE" : "COMMANDS_RECEIVED";
-      } catch (e) {
-        output.error = String(e);
-        return "ERROR";
-      }
-    },
-  ],
-
-  // Check if delete is allowed
-  [
-    "CHECK_DELETE_ALLOWED",
-    async (ctx) => {
-      const state = getState<ServerPushState>(ctx);
-      const config = getConfig(ctx);
-      const output = getOutput(ctx);
-      try {
-        if (config.allowDeletes === false && !state.capabilities.has("delete-refs")) {
-          // Mark delete commands as rejected
-          for (const cmd of state.pushCommands ?? []) {
-            if (cmd.type === "DELETE") {
-              cmd.result = "REJECTED_NODELETE";
-              cmd.message = "deletion prohibited";
-            }
-          }
-          return "DELETE_DENIED";
-        }
-        return "DELETE_ALLOWED";
+        return "COMMANDS_RECEIVED";
       } catch (e) {
         output.error = String(e);
         return "ERROR";
@@ -266,6 +268,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const transport = getTransport(ctx);
       const state = getState<ServerPushState>(ctx);
       const output = getOutput(ctx);
+      const maxOptions = receivePackConfig(ctx).maxCommands ?? DEFAULT_MAX_PUSH_COMMANDS;
       try {
         if (!state.capabilities.has("push-options")) {
           return "NO_OPTIONS";
@@ -277,19 +280,57 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           const pkt = await transport.readPktLine();
           if (pkt.type === "flush") break;
           if (pkt.type === "eof") {
-            output.error = "Unexpected end of input";
-            return "ERROR";
+            return protocolError(ctx, "protocol error: unexpected end of the push options");
           }
-          if (pkt.type === "delim") {
-            continue; // Unexpected delimiter in push options
+          if (pkt.type === "delim") continue;
+          pushOptions.push(pkt.text.endsWith("\n") ? pkt.text.slice(0, -1) : pkt.text);
+          if (pushOptions.length > maxOptions) {
+            return protocolError(ctx, `protocol error: more than ${maxOptions} push options`);
           }
-          pushOptions.push(pkt.text);
         }
 
         state.pushOptions = pushOptions;
         return "OPTIONS_RECEIVED";
       } catch (e) {
         output.error = String(e);
+        return "ERROR";
+      }
+    },
+  ],
+
+  // Authorize the commands, before the pack is read
+  [
+    "AUTHORIZE",
+    async (ctx) => {
+      const state = getState<ServerPushState>(ctx);
+      const output = getOutput(ctx);
+      const rp = receivePackConfig(ctx);
+      try {
+        const hook = receivePackHooks(ctx)?.authorize;
+        if (hook) {
+          const commands = state.pushCommands ?? [];
+          const verdict = normalizeVerdict(
+            await hook(commands.map(toReceiveCommand), hookContext(ctx)),
+          );
+          if (!verdict.ok) {
+            const reason = oneLine(verdict.message ?? "") || "not authorized";
+            if (!verdict.rejectedRefs && rp.authorizeFailure === "fatal") {
+              output.authorizationDenied = reason;
+              output.error = reason;
+              return "DENIED";
+            }
+            const refused = verdict.rejectedRefs ? new Set(verdict.rejectedRefs) : undefined;
+            for (const cmd of commands) {
+              if (cmd.result === "NOT_ATTEMPTED" && (!refused || refused.has(cmd.refName))) {
+                reject(cmd, reason);
+              }
+            }
+          }
+        }
+        rp.onAuthorized?.();
+        return "AUTHORIZED";
+      } catch (e) {
+        output.error = e instanceof Error ? e.message : String(e);
         return "ERROR";
       }
     },
@@ -303,17 +344,27 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const state = getState<ServerPushState>(ctx);
       const output = getOutput(ctx);
       try {
-        // Check if pack is expected (not for delete-only)
-        const expectPack = (state.pushCommands ?? []).some((cmd) => cmd.type !== "DELETE");
-
-        if (!expectPack) {
+        const commands = state.pushCommands ?? [];
+        // No pack for a delete-only push
+        if (!commands.some((cmd) => cmd.type !== "DELETE")) {
           return "EMPTY_PACK";
         }
+        // Every command needing the pack refused: nothing of it is stored
+        if (!commands.some((cmd) => cmd.type !== "DELETE" && cmd.result === "NOT_ATTEMPTED")) {
+          if (receivePackConfig(ctx).drainRefusedPack) {
+            try {
+              for await (const _ of transport.readRawPack()) {
+                // discarded
+              }
+            } catch {
+              // a broken pack nobody wanted
+            }
+          }
+          return "PACK_SKIPPED";
+        }
 
-        // Store pack stream on state for UNPACK handler.
-        // Use readRawPack() because the client sends raw pack data
-        // after the pkt-line commands, regardless of sideband capability.
-        // Sideband is only used for the server's response direction.
+        // The client sends the raw pack after the pkt-line commands, whatever side-band says
+        // (side-band is for the server's answer only).
         state.packStream = transport.readRawPack();
         return "PACK_RECEIVED";
       } catch (e) {
@@ -329,151 +380,81 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
     async (ctx) => {
       const repository = getRepository(ctx);
       const output = getOutput(ctx);
+      const state = getState<ServerPushState>(ctx);
       try {
-        const state = getState<ServerPushState>(ctx);
         if (state.packStream) {
-          const result = await repository.importPack(state.packStream);
-          output.packResult = result;
+          output.packResult = await repository.importPack(state.packStream);
         }
         return "UNPACK_OK";
       } catch (e) {
-        output.error = String(e);
+        // git: "unpack <error>", and every command "unpacker error"
+        state.unpackStatus =
+          oneLine(e instanceof Error ? e.message : String(e)).slice(0, 200) || "failed";
+        for (const cmd of state.pushCommands ?? []) {
+          if (cmd.result === "NOT_ATTEMPTED") reject(cmd, "unpacker error");
+        }
         return "UNPACK_FAILED";
       }
     },
   ],
 
-  // Check connectivity
+  // Check connectivity and shallow updates
   [
     "CHECK_CONNECTIVITY",
     async (ctx) => {
       const repository = getRepository(ctx);
-      const output = getOutput(ctx);
+      const state = getState<ServerPushState>(ctx);
+      const rp = receivePackConfig(ctx);
+      // the pack is read: keep the client's connection alive while the push is checked
+      startKeepAlive(ctx);
       try {
-        const state = getState<ServerPushState>(ctx);
+        const known = new Set(state.refs.values());
+        const pending = () =>
+          (state.pushCommands ?? []).filter(
+            (c) => c.result === "NOT_ATTEMPTED" && c.type !== "DELETE",
+          );
 
-        for (const cmd of state.pushCommands ?? []) {
-          if (cmd.type === "DELETE") continue;
+        // The client's shallow commits we now have: a push whose new history ends there
+        // would leave the repository with missing parents (git's update_shallow_info)
+        const theirs: string[] = [];
+        for (const oid of state.pushShallow ?? []) {
+          if (await repository.has(oid)) theirs.push(oid);
+        }
+        let graft: Set<string> | undefined;
+        if (theirs.length > 0) {
+          const shallowSet = new Set(theirs);
+          if (rp.shallowUpdate && repository.updateShallow) {
+            graft = shallowSet;
+            state.acceptedShallow = theirs;
+          } else {
+            for (const cmd of pending()) {
+              if (!(await isCommit(ctx, cmd.newOid))) continue;
+              const found = await findNewCommits(repository, [cmd.newOid], known, {
+                shallow: shallowSet,
+              });
+              if ("commits" in found && found.commits.some((c) => shallowSet.has(c))) {
+                reject(cmd, "shallow update not allowed");
+              }
+            }
+          }
+        }
 
-          // Check if new objects are reachable
-          const exists = await repository.has(cmd.newOid);
-          if (!exists) {
+        const tips = [...new Set(pending().map((c) => c.newOid))];
+        if (tips.length === 0) return "CONNECTIVITY_OK";
+        // One walk for the push; only when it fails, one per tip to name the broken refs
+        const result = await checkConnectivity(repository, tips, known, { shallow: graft });
+        await sendProgress(ctx, `Checking connectivity: ${result.objects}, done.\n`);
+        if (result.ok) return "CONNECTIVITY_OK";
+        for (const cmd of pending()) {
+          const one = await checkConnectivity(repository, [cmd.newOid], known, { shallow: graft });
+          if (!one.ok) {
             cmd.result = "REJECTED_MISSING_OBJECT";
             cmd.message = "missing necessary objects";
           }
         }
-
-        const anyMissing = (state.pushCommands ?? []).some(
-          (c) => c.result === "REJECTED_MISSING_OBJECT",
-        );
-        return anyMissing ? "CONNECTIVITY_FAILED" : "CONNECTIVITY_OK";
+        return "CONNECTIVITY_FAILED";
       } catch (e) {
-        output.error = String(e);
-        return "ERROR";
-      }
-    },
-  ],
-
-  // Validate commands
-  [
-    "VALIDATE_COMMANDS",
-    async (ctx) => {
-      const state = getState<ServerPushState>(ctx);
-      const repository = getRepository(ctx);
-      const config = getConfig(ctx);
-      const output = getOutput(ctx);
-      try {
-        let invalidCount = 0;
-
-        for (const cmd of state.pushCommands ?? []) {
-          // Skip already rejected
-          if (cmd.result !== "NOT_ATTEMPTED") {
-            invalidCount++;
-            continue;
-          }
-
-          // As git's receive-pack: only valid names under refs/ (never HEAD itself)
-          if (!cmd.refName.startsWith("refs/") || !isValidRefName(cmd.refName)) {
-            cmd.result = "REJECTED_OTHER_REASON";
-            cmd.message = "funny refname";
-            invalidCount++;
-            continue;
-          }
-
-          // Validate old OID matches current ref
-          const currentOid = state.refs.get(cmd.refName) ?? ZERO_OID;
-          if (cmd.oldOid !== currentOid) {
-            cmd.result = "REJECTED_NONFASTFORWARD";
-            cmd.message = "remote ref changed since fetch";
-            invalidCount++;
-            continue;
-          }
-
-          // For updates, check fast-forward (unless config allows non-ff)
-          if (cmd.type === "UPDATE") {
-            // Walk ancestry from newOid to verify oldOid is a proper ancestor.
-            // Just checking repository.has(oldOid) only verifies object existence,
-            // not that newOid descends from oldOid.
-            let isFastForward = false;
-            for await (const ancestorOid of repository.walkAncestors(cmd.newOid)) {
-              if (ancestorOid === cmd.oldOid) {
-                isFastForward = true;
-                break;
-              }
-            }
-            if (!isFastForward && !config.allowNonFastForward) {
-              cmd.result = "REJECTED_NONFASTFORWARD";
-              cmd.message = "non-fast-forward";
-              invalidCount++;
-              continue;
-            }
-            if (!isFastForward) {
-              cmd.type = "UPDATE_NONFASTFORWARD";
-            }
-          }
-
-          // Check if updating current branch
-          if (config.denyCurrentBranch && cmd.refName === config.currentBranch) {
-            cmd.result = "REJECTED_CURRENT_BRANCH";
-            cmd.message = "refusing to update checked out branch";
-            invalidCount++;
-          }
-        }
-
-        if (invalidCount === (state.pushCommands ?? []).length) {
-          return "ALL_INVALID";
-        }
-        if (invalidCount > 0) {
-          return "SOME_INVALID";
-        }
-        return "ALL_VALID";
-      } catch (e) {
-        output.error = String(e);
-        return "ERROR";
-      }
-    },
-  ],
-
-  // Reject all commands
-  [
-    "REJECT_COMMANDS",
-    async (ctx) => {
-      const state = getState<ServerPushState>(ctx);
-      const output = getOutput(ctx);
-      try {
-        const reason = output.error ?? "rejected";
-
-        for (const cmd of state.pushCommands ?? []) {
-          // Only reject commands that haven't been rejected yet
-          if (cmd.result === "NOT_ATTEMPTED") {
-            cmd.result = "REJECTED_OTHER_REASON";
-            cmd.message = reason;
-          }
-        }
-        return "REJECTED";
-      } catch (e) {
-        output.error = String(e);
-        return "ERROR";
+        return internalError(ctx, e);
       }
     },
   ],
@@ -483,40 +464,45 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
     "RUN_PRE_RECEIVE_HOOK",
     async (ctx) => {
       const state = getState<ServerPushState>(ctx);
-      const output = getOutput(ctx);
+      const commands = state.pushCommands ?? [];
+      const open = commands.filter((cmd) => cmd.result === "NOT_ATTEMPTED");
+      if (open.length === 0) return "NOTHING_TO_DO";
+
+      const hook = receivePackHooks(ctx)?.preReceive;
+      if (!hook) return "NO_HOOK";
+
+      let verdict: ReturnType<typeof normalizeVerdict>;
       try {
-        const hooks = (ctx as ContextWithHooks).hooks;
-
-        if (!hooks?.preReceive) {
-          return "NO_HOOK";
-        }
-
-        const validCommands = (state.pushCommands ?? []).filter(
-          (cmd) => cmd.result === "NOT_ATTEMPTED",
-        );
-
-        if (validCommands.length === 0) {
-          return "NO_HOOK";
-        }
-
-        const result = await hooks.preReceive(validCommands, state.pushOptions);
-
-        if (!result.ok) {
-          // Reject specified refs or all
-          const rejectedRefs = new Set(result.rejectedRefs ?? validCommands.map((c) => c.refName));
-          for (const cmd of state.pushCommands ?? []) {
-            if (rejectedRefs.has(cmd.refName) && cmd.result === "NOT_ATTEMPTED") {
-              cmd.result = "REJECTED_OTHER_REASON";
-              cmd.message = result.message ?? "pre-receive hook rejected";
-            }
-          }
-          return "HOOK_REJECTED";
-        }
-
-        return "HOOK_OK";
+        verdict = normalizeVerdict(await hook(open.map(toReceiveCommand), hookContext(ctx)));
       } catch (e) {
-        output.error = String(e);
-        return "HOOK_ERROR";
+        logError(ctx, "pre-receive hook failed", e);
+        verdict = { ok: false, message: e instanceof Error ? e.message : String(e) };
+      }
+      if (verdict.ok) return "HOOK_OK";
+
+      if (verdict.message) await sendMessage(ctx, verdict.message);
+      const refused = verdict.rejectedRefs ? new Set(verdict.rejectedRefs) : undefined;
+      for (const cmd of open) {
+        if (!refused || refused.has(cmd.refName)) reject(cmd, "pre-receive hook declined");
+      }
+      return commands.some((c) => c.result === "NOT_ATTEMPTED") ? "HOOK_OK" : "HOOK_REJECTED";
+    },
+  ],
+
+  // Check each command as git's update() does, then the update hook
+  [
+    "VALIDATE_COMMANDS",
+    async (ctx) => {
+      const state = getState<ServerPushState>(ctx);
+      try {
+        await validateCommands(ctx);
+        const commands = state.pushCommands ?? [];
+        const invalidCount = commands.filter((c) => c.result !== "NOT_ATTEMPTED").length;
+        if (invalidCount === commands.length) return "ALL_INVALID";
+        if (invalidCount > 0) return "SOME_INVALID";
+        return "ALL_VALID";
+      } catch (e) {
+        return internalError(ctx, e);
       }
     },
   ],
@@ -527,38 +513,20 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
     async (ctx) => {
       const state = getState<ServerPushState>(ctx);
       const refStore = getRefStore(ctx);
-      const output = getOutput(ctx);
+      const repository = getRepository(ctx);
       try {
         const atomic = state.capabilities.has("atomic");
+        // An accepted shallow push records the client's boundary before its refs move
+        if (state.acceptedShallow && repository.updateShallow) {
+          const all = state.pushCommands ?? [];
+          const blocked = atomic && all.some((c) => c.result !== "NOT_ATTEMPTED");
+          if (!blocked && all.some((c) => c.result === "NOT_ATTEMPTED" && c.type !== "DELETE")) {
+            await repository.updateShallow(state.acceptedShallow);
+          }
+        }
         return await applyUpdates(state, refStore, atomic);
       } catch (e) {
-        output.error = String(e);
-        return "ERROR";
-      }
-    },
-  ],
-
-  // Run post-receive hook
-  [
-    "RUN_POST_RECEIVE_HOOK",
-    async (ctx) => {
-      const state = getState<ServerPushState>(ctx);
-      try {
-        const hooks = (ctx as ContextWithHooks).hooks;
-
-        if (!hooks?.postReceive) {
-          return "NO_HOOK";
-        }
-
-        const appliedCommands = state.appliedCommands ?? [];
-        if (appliedCommands.length > 0) {
-          await hooks.postReceive(appliedCommands, state.pushOptions);
-        }
-
-        return "HOOK_DONE";
-      } catch {
-        // Post-receive hook errors are non-fatal
-        return "HOOK_DONE";
+        return internalError(ctx, e);
       }
     },
   ],
@@ -570,50 +538,61 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const transport = getTransport(ctx);
       const state = getState<ServerPushState>(ctx);
       const output = getOutput(ctx);
+      stopKeepAlive(ctx);
       try {
+        await state.bandQueue;
         const useSideband = state.capabilities.has("side-band-64k");
-        const unpackOk = !output.error?.includes("Unpack");
-
-        if (useSideband) {
-          // With sideband, each status line must be pkt-line encoded
-          // before being wrapped in the sideband frame. The client
-          // demuxes sideband, then parses the inner pkt-line stream.
-          const unpackLine = unpackOk ? "unpack ok" : `unpack ${output.error}`;
-          await transport.writeSideband(1, encodePacketLine(unpackLine));
-
+        if (state.capabilities.has("report-status")) {
+          const lines = [`unpack ${state.unpackStatus ?? "ok"}`];
           for (const cmd of state.pushCommands ?? []) {
-            const line =
+            lines.push(
               cmd.result === "OK"
                 ? `ok ${cmd.refName}`
-                : `ng ${cmd.refName} ${cmd.message || "rejected"}`;
-            await transport.writeSideband(1, encodePacketLine(line));
+                : `ng ${cmd.refName} ${oneLine(cmd.message ?? "") || "rejected"}`,
+            );
           }
-
-          // Send inner flush on channel 1 to terminate the report-status
-          await transport.writeSideband(1, encodeFlush());
-        } else {
-          // Send status directly
-          if (unpackOk) {
-            await transport.writeLine("unpack ok");
-          } else {
-            await transport.writeLine(`unpack ${output.error || "failed"}`);
-          }
-
-          for (const cmd of state.pushCommands ?? []) {
-            if (cmd.result === "OK") {
-              await transport.writeLine(`ok ${cmd.refName}`);
-            } else {
-              await transport.writeLine(`ng ${cmd.refName} ${cmd.message || "rejected"}`);
+          if (useSideband) {
+            // The report is a pkt-line stream inside channel 1
+            for (const line of lines) {
+              await transport.writeSideband(1, encodePacketLine(`${line}\n`));
             }
+            await transport.writeSideband(1, encodeFlush());
+          } else {
+            for (const line of lines) await transport.writeLine(line);
+            await transport.writeFlush();
           }
         }
-
-        await transport.writeFlush();
+        // git ends a side-band answer with a flush, report or not
+        if (useSideband) await transport.writeFlush();
+        state.reportSent = true;
         return "STATUS_SENT";
       } catch (e) {
         output.error = String(e);
         return "ERROR";
       }
+    },
+  ],
+
+  // Start the post-receive hook, detached, once the report is out
+  [
+    "RUN_POST_RECEIVE_HOOK",
+    async (ctx) => {
+      const state = getState<ServerPushState>(ctx);
+      const hook = receivePackHooks(ctx)?.postReceive;
+      const applied = (state.appliedCommands ?? []).map(toReceiveCommand);
+      if (!hook || applied.length === 0) return "NO_HOOK";
+      const hookCtx = hookContext(ctx);
+      const task = async () => {
+        try {
+          await hook(applied, hookCtx);
+        } catch (e) {
+          logError(ctx, "post-receive hook failed", e);
+        }
+      };
+      const afterReport = receivePackConfig(ctx).afterReport;
+      if (afterReport) afterReport(task);
+      else setTimeout(() => void task(), 0);
+      return "HOOK_STARTED";
     },
   ],
 ]);
@@ -626,23 +605,331 @@ interface ServerPushState extends ProtocolState {
   pushOptions?: string[];
   packStream?: AsyncIterable<Uint8Array>;
   appliedCommands?: PushCommand[];
+  /** The client's `shallow` lines */
+  pushShallow?: string[];
+  /** Shallow commits recorded for an accepted shallow push */
+  acceptedShallow?: string[];
+  /** The unpack status when not "ok" */
+  unpackStatus?: string;
+  /** Side-band writes besides the FSM's own (keep-alive, messages), in order */
+  bandQueue?: Promise<void>;
+  keepAliveTimer?: ReturnType<typeof setInterval>;
+  hookContext?: ReceivePackHookContext;
+  reportSent?: boolean;
+}
+
+/** Context with hooks set directly (older callers). */
+interface ContextWithHooks extends ProcessContext {
+  hooks?: ReceivePackHooks;
+}
+
+function receivePackConfig(ctx: ProcessContext): ReceivePackConfig {
+  return getConfig(ctx).receivePack ?? {};
+}
+
+function receivePackHooks(ctx: ProcessContext): ReceivePackHooks | undefined {
+  return receivePackConfig(ctx).hooks ?? (ctx as ContextWithHooks).hooks;
+}
+
+function protocolError(ctx: ProcessContext, message: string): string {
+  const output = getOutput(ctx);
+  output.error = message;
+  output.protocolError = true;
+  return "ERROR";
 }
 
 /**
- * Context with hooks support.
+ * A failure of the server after the pack was read: the commands not decided yet are refused
+ * "internal error" in the report (the client hears about it), and `output.error` tells the
+ * driver.
  */
-interface ContextWithHooks extends ProcessContext {
-  hooks?: {
-    preReceive?: (
-      commands: PushCommand[],
-      options?: string[],
-    ) => Promise<{
-      ok: boolean;
-      message?: string;
-      rejectedRefs?: string[];
-    }>;
-    postReceive?: (commands: PushCommand[], options?: string[]) => Promise<void>;
-  };
+function internalError(ctx: ProcessContext, error: unknown): string {
+  const output = getOutput(ctx);
+  output.error = error instanceof Error ? error.message : String(error);
+  logError(ctx, "receive-pack failed", error);
+  for (const cmd of getState<ServerPushState>(ctx).pushCommands ?? []) {
+    if (cmd.result === "NOT_ATTEMPTED") reject(cmd, "internal error");
+  }
+  return "INTERNAL_ERROR";
+}
+
+function reject(cmd: PushCommand, message: string): void {
+  cmd.result = "REJECTED_OTHER_REASON";
+  cmd.message = message;
+}
+
+/** One report line per command: never a line break inside (hook messages are free text). */
+function oneLine(text: string): string {
+  return text.replace(/[\r\n]+/g, " ").trim();
+}
+
+function toReceiveCommand(cmd: PushCommand): ReceiveCommand {
+  return { refName: cmd.refName, oldOid: cmd.oldOid, newOid: cmd.newOid, type: cmd.type };
+}
+
+function normalizeVerdict(verdict: HookVerdict): {
+  ok: boolean;
+  message?: string;
+  rejectedRefs?: string[];
+} {
+  if (verdict === undefined || verdict === true) return { ok: true };
+  if (verdict === false) return { ok: false };
+  if (typeof verdict === "string") return { ok: false, message: verdict };
+  return verdict;
+}
+
+function hookContext(ctx: ProcessContext): ReceivePackHookContext {
+  const state = getState<ServerPushState>(ctx);
+  if (!state.hookContext) {
+    const rp = receivePackConfig(ctx);
+    state.hookContext = {
+      capabilities: state.capabilities,
+      get pushOptions() {
+        return state.pushOptions ?? [];
+      },
+      get shallow() {
+        return state.pushShallow ?? [];
+      },
+      request: rp.request,
+      repoPath: rp.repoPath,
+      message: (text: string) => sendMessage(ctx, text),
+    };
+  }
+  return state.hookContext;
+}
+
+function logError(ctx: ProcessContext, message: string, error: unknown): void {
+  const logger = receivePackConfig(ctx).logger;
+  if (logger) logger.error(message, error);
+  else console.error(message, error);
+}
+
+/** Queues a side-band write after the earlier ones (keep-alive and messages interleave). */
+function enqueueBand(ctx: ProcessContext, write: () => Promise<void>): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  const next = (state.bandQueue ?? Promise.resolve()).then(write).catch(() => {
+    // the client is gone: the report write will tell
+  });
+  state.bandQueue = next;
+  return next;
+}
+
+/** Writes `text` on the progress channel (side-band only; nothing once the report is out). */
+function sendMessage(ctx: ProcessContext, text: string): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  if (!state.capabilities.has("side-band-64k") || state.reportSent || !text) {
+    return Promise.resolve();
+  }
+  const transport = getTransport(ctx);
+  const bytes = new TextEncoder().encode(text.endsWith("\n") ? text : `${text}\n`);
+  return enqueueBand(ctx, () => transport.writeSideband(2, bytes));
+}
+
+/** Progress text: not sent to a `quiet` client. */
+function sendProgress(ctx: ProcessContext, text: string): Promise<void> {
+  if (getState(ctx).capabilities.has("quiet")) return Promise.resolve();
+  return sendMessage(ctx, text);
+}
+
+/** git's `rp_error`: an `error:` line on the progress channel, quiet or not. */
+function sendError(ctx: ProcessContext, text: string): Promise<void> {
+  return sendMessage(ctx, `error: ${text}`);
+}
+
+/** Starts side-band keep-alive packets (`0005\1`, an empty channel-1 packet), as git does. */
+function startKeepAlive(ctx: ProcessContext): void {
+  const state = getState<ServerPushState>(ctx);
+  const ms = receivePackConfig(ctx).keepAliveMs ?? DEFAULT_RECEIVE_KEEP_ALIVE_MS;
+  if (state.keepAliveTimer || ms <= 0 || !state.capabilities.has("side-band-64k")) return;
+  const transport = getTransport(ctx);
+  const keepAlive = new Uint8Array([1]);
+  state.keepAliveTimer = setInterval(() => {
+    void enqueueBand(ctx, () => transport.writePktLine(keepAlive));
+  }, ms);
+  (state.keepAliveTimer as { unref?: () => void }).unref?.();
+}
+
+function stopKeepAlive(ctx: ProcessContext): void {
+  const state = getState<ServerPushState>(ctx);
+  if (state.keepAliveTimer) {
+    clearInterval(state.keepAliveTimer);
+    state.keepAliveTimer = undefined;
+  }
+}
+
+/** The object's type, as far as the facade tells (undefined: absent or unknown). */
+async function objectType(ctx: ProcessContext, oid: string): Promise<string | undefined> {
+  const repository = getRepository(ctx);
+  if (repository.getObjectType) return repository.getObjectType(oid);
+  if (repository.getCommitInfo) {
+    if (await repository.getCommitInfo(oid)) return "commit";
+    return (await repository.has(oid)) ? "other" : undefined;
+  }
+  return (await repository.has(oid)) ? "unknown" : undefined;
+}
+
+async function isCommit(ctx: ProcessContext, oid: string): Promise<boolean> {
+  const type = await objectType(ctx, oid);
+  return type === "commit" || type === "unknown";
+}
+
+/** The checks of git's `update()`, per command, then the update hook. */
+async function validateCommands(ctx: ProcessContext): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  const config = getConfig(ctx);
+  const rp = receivePackConfig(ctx);
+  const repository = getRepository(ctx);
+  const refStore = getRefStore(ctx);
+  const commands = state.pushCommands ?? [];
+  const atomic = state.capabilities.has("atomic");
+
+  const bare = rp.bare ?? (repository.isBare ? await repository.isBare() : true);
+  const head = config.currentBranch ?? (await refStore.getSymrefTarget?.("HEAD"));
+  const denyCurrentBranch = config.denyCurrentBranch ?? true;
+  const denyDeleteCurrent = rp.denyDeleteCurrent ?? true;
+
+  // The same ref twice: git's ref transaction refuses ("multiple updates for ref")
+  const seen = new Set<string>();
+  for (const cmd of commands) {
+    if (!seen.has(cmd.refName)) {
+      seen.add(cmd.refName);
+      continue;
+    }
+    await sendError(ctx, `multiple updates for ref '${cmd.refName}' not allowed`);
+    if (atomic) {
+      for (const c of commands) {
+        if (c.result === "NOT_ATTEMPTED") {
+          c.result = "ATOMIC_REJECTED";
+          c.message = ATOMIC_TRANSACTION_FAILED;
+        }
+      }
+      return;
+    }
+    if (cmd.result === "NOT_ATTEMPTED") {
+      cmd.result = "LOCK_FAILURE";
+      cmd.message = FAILED_TO_UPDATE;
+    }
+  }
+
+  const hook = receivePackHooks(ctx)?.update;
+  for (const cmd of commands) {
+    if (cmd.result !== "NOT_ATTEMPTED") continue;
+    const name = cmd.refName;
+    const isDelete = cmd.type === "DELETE";
+
+    // only valid names under refs/ (one level allowed for a delete), never HEAD itself
+    if (!name.startsWith("refs/") || !isValidRefName(name.slice(5), { allowOneLevel: isDelete })) {
+      await sendError(ctx, `refusing to update funny ref '${name}' remotely`);
+      reject(cmd, "funny refname");
+      continue;
+    }
+
+    if (!bare && denyCurrentBranch && head === name) {
+      await sendError(ctx, `refusing to update checked out branch: ${name}`);
+      cmd.result = "REJECTED_CURRENT_BRANCH";
+      cmd.message = "branch is currently checked out";
+      continue;
+    }
+
+    if (isDelete && cmd.oldOid !== ZERO_OID) {
+      if (config.allowDeletes === false && name.startsWith("refs/heads/")) {
+        await sendError(ctx, `denying ref deletion for ${name}`);
+        cmd.result = "REJECTED_NODELETE";
+        cmd.message = "deletion prohibited";
+        continue;
+      }
+      if (denyDeleteCurrent && head === name) {
+        await sendError(ctx, `refusing to delete the current branch: ${name}`);
+        cmd.result = "REJECTED_NODELETE";
+        cmd.message = "deletion of the current branch prohibited";
+        continue;
+      }
+    }
+
+    // the old value the client saw (git's ref transaction checks it)
+    const current = state.refs.get(name) ?? ZERO_OID;
+    if (cmd.oldOid !== current && !(isDelete && cmd.oldOid === ZERO_OID)) {
+      await sendError(
+        ctx,
+        current === ZERO_OID
+          ? `cannot lock ref '${name}': unable to resolve reference '${name}'`
+          : cmd.oldOid === ZERO_OID
+            ? `cannot lock ref '${name}': reference already exists`
+            : `cannot lock ref '${name}': is at ${current} but expected ${cmd.oldOid}`,
+      );
+      cmd.result = "LOCK_FAILURE";
+      cmd.message = FAILED_TO_UPDATE;
+      continue;
+    }
+
+    if (!isDelete) {
+      const type = await objectType(ctx, cmd.newOid);
+      if (type === undefined) {
+        // connectivity found it (a facade without the object walk): git's "bad pack"
+        await sendError(ctx, `unpack should have generated ${cmd.newOid}, but I can't find it!`);
+        cmd.result = "REJECTED_MISSING_OBJECT";
+        cmd.message = "bad pack";
+        continue;
+      }
+      // a branch points at a commit (git's ref backend refuses anything else)
+      if (name.startsWith("refs/heads/") && type !== "commit" && type !== "unknown") {
+        await sendError(
+          ctx,
+          `cannot update ref '${name}': trying to write non-commit object ${cmd.newOid} to branch '${name}'`,
+        );
+        cmd.result = "LOCK_FAILURE";
+        cmd.message = FAILED_TO_UPDATE;
+        continue;
+      }
+    }
+
+    if (cmd.type === "UPDATE" && name.startsWith("refs/heads/")) {
+      const oldType = await objectType(ctx, cmd.oldOid);
+      if (oldType !== "commit" && oldType !== "unknown") {
+        await sendError(ctx, `bad sha1 objects for ${name}`);
+        reject(cmd, "bad ref");
+        continue;
+      }
+      if (!(await isAncestor(ctx, cmd.oldOid, cmd.newOid))) {
+        if (!config.allowNonFastForward) {
+          await sendError(ctx, `denying non-fast-forward ${name} (you should pull first)`);
+          cmd.result = "REJECTED_NONFASTFORWARD";
+          cmd.message = "non-fast-forward";
+          continue;
+        }
+        cmd.type = "UPDATE_NONFASTFORWARD";
+      }
+    }
+
+    if (hook) {
+      let verdict: ReturnType<typeof normalizeVerdict>;
+      try {
+        verdict = normalizeVerdict(await hook(name, cmd.oldOid, cmd.newOid, hookContext(ctx)));
+      } catch (e) {
+        logError(ctx, `update hook failed for ${name}`, e);
+        verdict = { ok: false, message: e instanceof Error ? e.message : String(e) };
+      }
+      if (!verdict.ok) {
+        if (verdict.message) await sendMessage(ctx, verdict.message);
+        await sendError(ctx, `hook declined to update ${name}`);
+        reject(cmd, "hook declined");
+      }
+    }
+  }
+}
+
+/** Whether `ancestor` is reachable from `oid` through parents. */
+async function isAncestor(ctx: ProcessContext, ancestor: string, oid: string): Promise<boolean> {
+  const repository = getRepository(ctx);
+  for await (const commit of repository.walkAncestors(oid)) {
+    if (commit === ancestor) return true;
+  }
+  return false;
+}
+
+/** A delete of a ref that does not exist: nothing to do, reported ok (git warns). */
+function isNoop(cmd: PushCommand): boolean {
+  return cmd.oldOid === ZERO_OID && cmd.newOid === ZERO_OID;
 }
 
 /** The batch command for a push command; git's zero id means "absent" on both sides. */
@@ -657,11 +944,6 @@ function toRefCommand(cmd: PushCommand): RefCommand {
 
 type ApplyResult = "UPDATES_APPLIED" | "PARTIAL_APPLIED" | "ATOMIC_FAILED";
 
-/** git's report-status texts. */
-const FAILED_TO_UPDATE = "failed to update ref";
-const ATOMIC_TRANSACTION_FAILED = "atomic transaction failed";
-const ATOMIC_PUSH_FAILURE = "atomic push failure";
-
 /**
  * Apply the push commands still `NOT_ATTEMPTED`, as git's receive-pack does in
  * a ref transaction.
@@ -674,6 +956,8 @@ const ATOMIC_PUSH_FAILURE = "atomic push failure";
  *   sent. A store whose batch answers `unsupported` (not atomic for several refs)
  *   gets the one-by-one path.
  * - Without `batch`, refs are written one by one with `update`.
+ * - Deleting a ref that does not exist is a no-op reported ok, as git does; it is not
+ *   among the applied commands (post-receive does not see it).
  */
 async function applyUpdates(
   state: ServerPushState,
@@ -681,17 +965,21 @@ async function applyUpdates(
   atomic: boolean,
 ): Promise<ApplyResult> {
   const all = state.pushCommands ?? [];
-  const pending = all.filter((c) => c.result === "NOT_ATTEMPTED");
+  const open = all.filter((c) => c.result === "NOT_ATTEMPTED");
   state.appliedCommands = [];
-  if (atomic && pending.length < all.length) {
-    for (const c of pending) {
+  if (atomic && open.length < all.length) {
+    for (const c of open) {
       c.result = "ATOMIC_REJECTED";
       c.message = ATOMIC_PUSH_FAILURE;
     }
     return "ATOMIC_FAILED";
   }
+  for (const c of open) if (isNoop(c)) c.result = "OK";
+  const pending = open.filter((c) => !isNoop(c));
+  const okCount = () => all.filter((c) => c.result === "OK").length;
+
   const batch = refStore.batch?.bind(refStore);
-  if (!batch) return applyOneByOne(state, refStore, atomic);
+  if (!batch) return applyOneByOne(state, refStore, atomic, pending);
   const options = { message: "push" };
 
   if (atomic) {
@@ -708,9 +996,9 @@ async function applyUpdates(
       return "UPDATES_APPLIED";
     }
     if (result.rejected.every((r) => r.reason === "unsupported")) {
-      return applyOneByOne(state, refStore, atomic);
+      return applyOneByOne(state, refStore, atomic, pending);
     }
-    for (const c of pending) {
+    for (const c of all) {
       c.result = "ATOMIC_REJECTED";
       c.message = ATOMIC_TRANSACTION_FAILED;
     }
@@ -732,7 +1020,7 @@ async function applyUpdates(
       c.message = FAILED_TO_UPDATE;
     }
   }
-  return state.appliedCommands.length === all.length ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
+  return okCount() === all.length ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
 }
 
 /**
@@ -743,53 +1031,39 @@ async function applyOneByOne(
   state: ServerPushState,
   refStore: RefStore,
   atomic: boolean,
+  pending: PushCommand[],
 ): Promise<ApplyResult> {
-  let failedCount = 0;
+  const all = state.pushCommands ?? [];
   const appliedCommands: PushCommand[] = [];
 
-  for (const cmd of state.pushCommands ?? []) {
-    if (cmd.result !== "NOT_ATTEMPTED") {
-      failedCount++;
-      continue;
-    }
-
+  for (const cmd of pending) {
     try {
-      if (cmd.type === "DELETE") {
-        // Delete ref - refStore.update should handle this
-        await refStore.update(cmd.refName, ZERO_OID);
-      } else {
-        await refStore.update(cmd.refName, cmd.newOid);
-      }
+      await refStore.update(cmd.refName, cmd.type === "DELETE" ? ZERO_OID : cmd.newOid);
       cmd.result = "OK";
       appliedCommands.push(cmd);
     } catch (e) {
       cmd.result = "LOCK_FAILURE";
-      cmd.message = e instanceof Error ? e.message : "update failed";
-      failedCount++;
+      cmd.message = e instanceof Error ? oneLine(e.message) || FAILED_TO_UPDATE : FAILED_TO_UPDATE;
 
-      // If atomic, abort all
       if (atomic) {
         // Rollback applied updates (best effort; stores with `batch` need none)
         for (const applied of appliedCommands) {
           try {
             await refStore.update(applied.refName, applied.oldOid);
-            applied.result = "ATOMIC_REJECTED";
-            applied.message = ATOMIC_TRANSACTION_FAILED;
           } catch {
             // Rollback failed, continue
           }
         }
-        for (const other of state.pushCommands ?? []) {
-          if (other.result === "NOT_ATTEMPTED") {
-            other.result = "ATOMIC_REJECTED";
-            other.message = ATOMIC_TRANSACTION_FAILED;
-          }
+        for (const other of all) {
+          other.result = "ATOMIC_REJECTED";
+          other.message = ATOMIC_TRANSACTION_FAILED;
         }
+        state.appliedCommands = [];
         return "ATOMIC_FAILED";
       }
     }
   }
 
   state.appliedCommands = appliedCommands;
-  return failedCount === 0 ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
+  return all.every((c) => c.result === "OK") ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
 }

@@ -194,10 +194,10 @@ describe("createStorageRepositoryFacade receiving an atomic push", () => {
         output: new HandlerOutput(),
         config: new ProcessConfiguration(),
       },
-      "RUN_POST_RECEIVE_HOOK",
       "SEND_STATUS",
     );
-    expect(fsm.getState()).toBe("RUN_POST_RECEIVE_HOOK");
+    // the report comes next (post-receive runs after it)
+    expect(fsm.getState()).toBe("SEND_STATUS");
     expect(commands.map((c) => c.result)).toEqual(["OK", "OK"]);
     expect(await refStore.get("refs/heads/dev")).toBe(B);
   });

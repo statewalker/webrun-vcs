@@ -7,6 +7,7 @@ export {
   toReadableStream,
 } from "@statewalker/vcs-utils/streams";
 export type { GitUrl } from "../protocol/types.js";
+export { IdleTimeoutError, withIdleTimeout } from "./idle-timeout.js";
 export type { RefSpec } from "./refspec.js";
 export {
   defaultFetchRefSpec,

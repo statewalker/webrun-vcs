@@ -20,8 +20,11 @@ import {
 import type {
   CommitGraphInfo,
   ExportPackOptions,
+  GitObjectTypeName,
   PackImportResult,
   RepositoryFacade,
+  TagTargetInfo,
+  TreeEntryInfo,
 } from "../api/repository-facade.js";
 import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
 
@@ -142,7 +145,46 @@ function createRepositoryFacadeFromHistory(
     async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
       const commit = await commits.load(oid);
       if (!commit) return undefined;
-      return { parents: commit.parents, time: commit.committer.timestamp };
+      return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+    },
+
+    async getObjectType(oid: string): Promise<GitObjectTypeName | undefined> {
+      if (history.objects) {
+        // the type from the object header; the content is released unread
+        const object = await history.objects.get(oid);
+        if (!object) return undefined;
+        await object.content[Symbol.asyncIterator]().return?.();
+        return object.type;
+      }
+      if (await commits.load(oid)) return "commit";
+      if (await tags.load(oid).catch(() => undefined)) return "tag";
+      if ((await facade.getTreeEntries?.(oid)) !== undefined) return "tree";
+      return (await history.blobs.has(oid)) ? "blob" : undefined;
+    },
+
+    async getTreeEntries(oid: string): Promise<TreeEntryInfo[] | undefined> {
+      try {
+        const tree = await history.trees.load(oid);
+        if (!tree) return undefined;
+        const entries: TreeEntryInfo[] = [];
+        for await (const entry of tree) {
+          entries.push({ mode: entry.mode, name: entry.name, id: entry.id });
+        }
+        return entries;
+      } catch {
+        // not a tree, or a corrupt one
+        return undefined;
+      }
+    },
+
+    async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {
+      try {
+        const tag = await tags.load(oid);
+        if (!tag) return undefined;
+        return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
+      } catch {
+        return undefined;
+      }
     },
 
     async computeShallowBoundaries(wants: Set<string>, depth: number): Promise<Set<string>> {
@@ -177,6 +219,14 @@ function createRepositoryFacadeFromHistory(
 
   return facade;
 }
+
+/** git's object type names by type code (vcs-core `ObjectType`). */
+const OBJECT_TYPE_NAMES: Record<number, GitObjectTypeName> = {
+  1: "commit",
+  2: "tree",
+  3: "blob",
+  4: "tag",
+};
 
 /**
  * Type guard for SymbolicRef

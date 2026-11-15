@@ -17,8 +17,10 @@ import { createTransportApi } from "../factories/transport-api-factory.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../fsm/fetch/server-fetch-fsm.js";
 import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
+import type { ReceivePackHooks, ReceivePackLogger } from "../fsm/push/receive-pack-types.js";
 import { serverPushHandlers, serverPushTransitions } from "../fsm/push/server-push-fsm.js";
 import type { ServiceType } from "../protocol/types.js";
+import { withIdleTimeout } from "../utils/idle-timeout.js";
 
 /**
  * Options for serve-over-duplex operation.
@@ -36,10 +38,32 @@ export interface ServeOverDuplexOptions {
   allowDeletes?: boolean;
   /** Allow non-fast-forward updates (receive-pack only) */
   allowNonFastForward?: boolean;
-  /** Deny updates to the currently checked-out branch */
+  /**
+   * Refuse updating the checked-out branch of a non-bare repository ("branch is currently
+   * checked out", git's `receive.denyCurrentBranch`; default true)
+   */
   denyCurrentBranch?: boolean;
-  /** Currently checked-out branch (for denyCurrentBranch) */
+  /** The branch HEAD names (default: `refStore.getSymrefTarget("HEAD")`) */
   currentBranch?: string;
+  /** Whether the repository has no working tree (default: `repository.isBare()`, else true) */
+  bare?: boolean;
+  /** Refuse deleting the current branch (git's `receive.denyDeleteCurrent`; default true) */
+  denyDeleteCurrent?: boolean;
+  /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
+  shallowUpdate?: boolean;
+  /** receive-pack hooks: authorize, preReceive, update, postReceive */
+  hooks?: ReceivePackHooks;
+  /** Most commands in one push (receive-pack; default 65536) */
+  maxCommands?: number;
+  /** Side-band keep-alive interval while a push is checked (ms; default 5000; 0: none) */
+  keepAliveMs?: number;
+  /**
+   * Fail a read from the client that brings nothing for this long (ms): a stalled push is
+   * answered "unpack request idle for … ms". Default: none.
+   */
+  idleTimeoutMs?: number;
+  /** Logs hook failures that cannot reach the client (default: console.error) */
+  logger?: ReceivePackLogger;
   /** Server capabilities to advertise */
   capabilities?: string[];
   /**
@@ -96,7 +120,16 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
   const useV2 = options.protocolVersion === "2" && service !== "git-receive-pack";
 
   const state = new ProtocolState();
-  const transport = createTransportApi(duplex, state);
+  const input = withIdleTimeout(duplex, options.idleTimeoutMs);
+  const transport = createTransportApi(
+    input === duplex
+      ? duplex
+      : {
+          [Symbol.asyncIterator]: () => input[Symbol.asyncIterator](),
+          write: (data) => duplex.write(data),
+        },
+    state,
+  );
 
   // Protocol-v2's packfile section is ALWAYS side-band-64k multiplexed
   // (protocol-v2.txt), even though the v2 capability advertisement never lists
@@ -117,7 +150,21 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     allowNonFastForward: options.allowNonFastForward ?? false,
     denyCurrentBranch: options.denyCurrentBranch ?? true,
     currentBranch: options.currentBranch,
+    receivePack: {
+      hooks: options.hooks,
+      maxCommands: options.maxCommands,
+      keepAliveMs: options.keepAliveMs,
+      bare: options.bare,
+      denyDeleteCurrent: options.denyDeleteCurrent,
+      shallowUpdate: options.shallowUpdate,
+      logger: options.logger,
+      // a pipe's writer blocks until its pack is taken: read a refused pack, store nothing
+      drainRefusedPack: true,
+      afterReport: (task) => afterReport.push(task),
+    },
   };
+  // post-receive tasks: started once the report is written (detached from this call)
+  const afterReport: Array<() => Promise<void>> = [];
 
   const output = new HandlerOutput();
 
@@ -139,6 +186,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
 
   try {
     const success = await fsm.run(ctx);
+    for (const task of afterReport) setTimeout(() => void task(), 0);
 
     if (!success || ctx.output.error) {
       return {

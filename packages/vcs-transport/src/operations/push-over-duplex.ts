@@ -6,7 +6,7 @@
  */
 
 import type { BaseDuplexOptions, BasePushOptions } from "../api/options.js";
-import type { PushResult } from "../api/push-result.js";
+import type { PushResult, RefPushStatus } from "../api/push-result.js";
 import { HandlerOutput } from "../context/handler-output.js";
 import type { ProcessConfiguration } from "../context/process-config.js";
 import type { ProcessContext, RefStore } from "../context/process-context.js";
@@ -14,6 +14,7 @@ import { ProtocolState } from "../context/protocol-state.js";
 import { createTransportApi } from "../factories/transport-api-factory.js";
 import { Fsm } from "../fsm/fsm.js";
 import { clientPushHandlers, clientPushTransitions } from "../fsm/push/client-push-fsm.js";
+import type { PushCommand } from "../fsm/push/types.js";
 
 export type { PushResult, RefPushStatus } from "../api/push-result.js";
 
@@ -95,8 +96,25 @@ export async function pushOverDuplex(options: PushOverDuplexOptions): Promise<Pu
       };
     }
 
+    // The report's verdict per ref (each command the client sent)
+    const commands = (state as ProtocolState & { pushCommands?: PushCommand[] }).pushCommands ?? [];
+    const refStatus = new Map<string, RefPushStatus>();
+    for (const cmd of commands) {
+      const ok = cmd.result === "OK" || cmd.result === "NOT_ATTEMPTED";
+      refStatus.set(cmd.refName, {
+        success: ok,
+        ...(ok ? {} : { error: cmd.message ?? cmd.result }),
+        oldOid: cmd.oldOid,
+        newOid: cmd.newOid,
+      });
+    }
+    const failed = [...refStatus.values()].filter((r) => !r.success);
     return {
-      success: true,
+      success: failed.length === 0,
+      ...(failed.length > 0
+        ? { error: `${failed.length} ref(s) rejected: ${failed.map((r) => r.error).join(", ")}` }
+        : {}),
+      refStatus,
     };
   } catch (error) {
     return {

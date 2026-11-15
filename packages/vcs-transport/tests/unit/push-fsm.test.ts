@@ -505,9 +505,9 @@ describe("Server Push FSM", () => {
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
       fsm.setState("READ_COMMANDS");
-      await fsm.run(context, "CHECK_DELETE_ALLOWED");
+      await fsm.run(context, "READ_PUSH_OPTIONS");
 
-      expect(fsm.getState()).toBe("CHECK_DELETE_ALLOWED");
+      expect(fsm.getState()).toBe("READ_PUSH_OPTIONS");
       const state = context.state as { pushCommands?: PushCommand[] };
       expect(state.pushCommands?.[0].type).toBe("DELETE");
     });
@@ -538,10 +538,10 @@ describe("Server Push FSM", () => {
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
       fsm.setState("VALIDATE_COMMANDS");
-      // Stop at RUN_PRE_RECEIVE_HOOK or SEND_STATUS (depending on path)
-      await fsm.run(context, "RUN_PRE_RECEIVE_HOOK", "SEND_STATUS");
+      // Stop at APPLY_UPDATES or SEND_STATUS (depending on path)
+      await fsm.run(context, "APPLY_UPDATES", "SEND_STATUS");
 
-      expect(fsm.getState()).toBe("RUN_PRE_RECEIVE_HOOK");
+      expect(fsm.getState()).toBe("APPLY_UPDATES");
     });
 
     it("rejects non-fast-forward push on server", async () => {
@@ -603,9 +603,9 @@ describe("Server Push FSM", () => {
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
       fsm.setState("VALIDATE_COMMANDS");
-      await fsm.run(context, "RUN_PRE_RECEIVE_HOOK", "SEND_STATUS");
+      await fsm.run(context, "APPLY_UPDATES", "SEND_STATUS");
 
-      expect(fsm.getState()).toBe("RUN_PRE_RECEIVE_HOOK");
+      expect(fsm.getState()).toBe("APPLY_UPDATES");
       const state = context.state as { pushCommands?: PushCommand[] };
       // Should be reclassified as non-fast-forward but still allowed
       expect(state.pushCommands?.[0].type).toBe("UPDATE_NONFASTFORWARD");
@@ -637,7 +637,9 @@ describe("Server Push FSM", () => {
 
       expect(fsm.getState()).toBe("SEND_STATUS");
       const state = context.state as { pushCommands?: PushCommand[] };
-      expect(state.pushCommands?.[0].result).toBe("REJECTED_NONFASTFORWARD");
+      // git: the ref transaction's old-value check, "failed to update ref"
+      expect(state.pushCommands?.[0].result).toBe("LOCK_FAILURE");
+      expect(state.pushCommands?.[0].message).toBe("failed to update ref");
     });
   });
 
@@ -657,6 +659,7 @@ describe("Server Push FSM", () => {
       ];
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+      context.state.capabilities.add("report-status"); // the report is sent when asked
       fsm.setState("SEND_STATUS");
       const result = await fsm.run(context);
 
@@ -681,6 +684,7 @@ describe("Server Push FSM", () => {
       ];
 
       const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+      context.state.capabilities.add("report-status"); // the report is sent when asked
       fsm.setState("SEND_STATUS");
       const result = await fsm.run(context);
 
@@ -729,15 +733,22 @@ describe("Server Push FSM: APPLY_UPDATES through an atomic ref batch", () => {
     result: "NOT_ATTEMPTED",
   });
 
-  /** Run APPLY_UPDATES through SEND_STATUS; returns the state after APPLY_UPDATES. */
+  /**
+   * Run APPLY_UPDATES through SEND_STATUS. Returns "RUN_POST_RECEIVE_HOOK" when refs were
+   * applied (post-receive runs, after the report) and "SEND_STATUS" for a failed atomic push.
+   */
   async function apply(context: ProcessContext): Promise<string> {
-    const fsm = new Fsm(serverPushTransitions, serverPushHandlers);
+    let event = "";
+    const handlers = new Map(serverPushHandlers);
+    const applyUpdates = serverPushHandlers.get("APPLY_UPDATES");
+    handlers.set("APPLY_UPDATES", async (ctx) => {
+      event = (await applyUpdates?.(ctx)) ?? "";
+      return event;
+    });
+    const fsm = new Fsm(serverPushTransitions, handlers);
     fsm.setState("APPLY_UPDATES");
-    await fsm.run(context, "RUN_POST_RECEIVE_HOOK", "SEND_STATUS");
-    const after = fsm.getState();
-    if (after === "RUN_POST_RECEIVE_HOOK") fsm.setState("SEND_STATUS");
     await fsm.run(context);
-    return after;
+    return event === "ATOMIC_FAILED" ? "SEND_STATUS" : "RUN_POST_RECEIVE_HOOK";
   }
 
   it("applies an atomic push as one batch: update, create and delete together", async () => {

@@ -51,8 +51,11 @@ export interface PushCommand {
  */
 export function mapRejectReason(reason: string): PushCommandResult {
   if (reason.includes("non-fast-forward")) return "REJECTED_NONFASTFORWARD";
-  if (reason.includes("current branch")) return "REJECTED_CURRENT_BRANCH";
-  if (reason.includes("deny deleting")) return "REJECTED_NODELETE";
+  // git's receive-pack: "deletion prohibited", "deletion of the current branch prohibited"
+  if (reason.includes("deny deleting") || reason.includes("deletion")) return "REJECTED_NODELETE";
+  if (reason.includes("current branch") || reason.includes("currently checked out")) {
+    return "REJECTED_CURRENT_BRANCH";
+  }
   if (reason.includes("deny creating")) return "REJECTED_NOCREATE";
   if (reason.includes("missing")) return "REJECTED_MISSING_OBJECT";
   if (reason.includes("atomic")) return "ATOMIC_REJECTED";
