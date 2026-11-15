@@ -36,7 +36,8 @@ export type SyncEvent =
   | { type: "skipped"; attempt: number; paths: SkippedPath[] }
   | { type: "rejoined"; attempt: number; paths: string[] }
   /**
-   * A merge with conflicts is in progress: `started` when this sync's merge stopped, false
+   * A merge with conflicts is in progress: `started` when this sync stopped it (or finished
+   * writing a stop that was cut short), false
    * when the sync was refused because an earlier one is not concluded yet
    */
   | {
@@ -209,7 +210,7 @@ async function syncRounds(
       emit({
         type: "conflicted",
         attempt,
-        started: false,
+        started: local.mergeStarted ?? false,
         theirs: local.merge.theirs,
         conflicts: local.merge.conflicts,
       });
