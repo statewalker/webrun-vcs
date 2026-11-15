@@ -1,7 +1,7 @@
 {
   "name": "@statewalker/vcs-workspace",
   "version": "0.3.2",
-  "description": "Thin cross-axis orchestration (publish/update/checkpoint/restore) composing files-sync + vcs-working-tree + vcs-transport",
+  "description": "Thin cross-axis orchestration (publish/update/checkpoint/restore) composing files-sync + vcs-working-tree + vcs-transport, and network sync of a workspace with a remote repository",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
   },
@@ -24,6 +24,11 @@
       "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./net": {
+      "source": "./src/net/index.ts",
+      "types": "./dist/net/index.d.ts",
+      "import": "./dist/net/index.js"
     }
   },
   "files": [
@@ -39,17 +44,20 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "format:fix": "biome check --write --unsafe .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tests"
   },
   "dependencies": {
     "@statewalker/webrun-files-sync": "catalog:",
     "@statewalker/vcs-working-tree": "workspace:^",
     "@statewalker/vcs-core": "workspace:^",
     "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
     "@statewalker/webrun-content-store": "catalog:",
     "@statewalker/webrun-files": "catalog:"
   },
   "devDependencies": {
+    "@statewalker/httpeers-access": "catalog:",
+    "@statewalker/vcs-transport-httpeers": "workspace:^",
     "@statewalker/webrun-files-mem": "catalog:",
     "@statewalker/webrun-storage": "catalog:",
     "rolldown": "catalog:",

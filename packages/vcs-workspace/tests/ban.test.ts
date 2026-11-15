@@ -55,4 +55,14 @@ describe("the hard cross-axis ban holds", () => {
     const vcsCore = importsOf(path.join(packagesDir, "vcs-core", "src", "vcs-core"));
     expect(vcsCore.has("@statewalker/webrun-files-sync")).toBe(false);
   });
+
+  it("network sync is a separate entry: the root never loads it, and it never loads files-sync", () => {
+    // the root entry's files do not reach into net/, so `@statewalker/vcs-workspace` stays
+    // engine-free; `@statewalker/vcs-workspace/net` is where the git engine is used
+    expect(readSrc(srcDir)).not.toMatch(/from\s+["']\.\/net\//);
+    const net = importsOf(path.join(srcDir, "net"));
+    expect(net.has("@statewalker/vcs-core")).toBe(true);
+    expect(net.has("@statewalker/vcs-transport")).toBe(true);
+    expect(net.has("@statewalker/webrun-files-sync")).toBe(false);
+  });
 });
