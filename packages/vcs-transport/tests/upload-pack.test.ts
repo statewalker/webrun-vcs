@@ -349,7 +349,8 @@ describe("Upload-Pack: Protocol V2 Capabilities", () => {
     await runHandler("SEND_CAPABILITIES", ctx, serverV2Handlers);
 
     const lines = transport._getWrittenLines();
-    expect(lines.some((l) => l === "ls-refs")).toBe(true);
+    // git's advertisement: ls-refs with the unborn feature
+    expect(lines.some((l) => l === "ls-refs=unborn")).toBe(true);
   });
 
   it("should advertise fetch command with shallow", async () => {

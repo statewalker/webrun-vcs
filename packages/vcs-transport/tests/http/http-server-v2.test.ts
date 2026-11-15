@@ -136,8 +136,9 @@ describe("smart-HTTP server: protocol v2", () => {
       expect(response.status).toBe(200);
       expect(response.headers["Content-Type"]).toBe("application/x-git-upload-pack-advertisement");
       const lines = pktLines(await bodyBytes(response));
-      expect(lines.slice(0, 3)).toEqual(["# service=git-upload-pack", "0000", "version 2"]);
-      expect(lines).toContain("ls-refs");
+      // no "# service=" preamble in v2 (git's http-backend writes it only for v0)
+      expect(lines[0]).toBe("version 2");
+      expect(lines).toContain("ls-refs=unborn");
       expect(lines).toContain("fetch=shallow wait-for-done");
       expect(lines).toContain("object-info");
       expect(lines.at(-1)).toBe("0000");
@@ -390,7 +391,7 @@ describe("smart-HTTP server: protocol v2", () => {
         post("/repo.git/git-upload-pack", command("bundle-uri", []), V2),
       );
       expect(response.status).toBe(500);
-      expect(decoder.decode(await bodyBytes(response))).toContain("Unknown command");
+      expect(decoder.decode(await bodyBytes(response))).toContain("invalid command 'bundle-uri'");
     } finally {
       await repo.close();
     }

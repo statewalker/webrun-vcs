@@ -19,12 +19,12 @@
  * v2 and v0, shallow, deepening, multi-round negotiation).
  */
 
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFetchHandler } from "../../src/index.js";
 import {
@@ -32,9 +32,17 @@ import {
   commitInRepo,
   createTransportRepo,
   gitAvailable,
+  loopbackEnv,
   makeTmpDir,
   type TransportRepo,
 } from "./helpers.js";
+
+/** Each git call is killed after this; the test that runs it has longer (TEST_TIMEOUT). */
+const GIT_TIMEOUT = 20000;
+const TEST_TIMEOUT = 60000;
+
+/** git processes still running (killed after each test). */
+const children = new Set<ChildProcess>();
 
 describe("Interop B · smart-HTTP server over a real socket", () => {
   let server: Server;
@@ -82,6 +90,11 @@ describe("Interop B · smart-HTTP server over a real socket", () => {
     port = (server.address() as AddressInfo).port;
   });
 
+  afterEach(() => {
+    for (const child of children) child.kill("SIGKILL");
+    children.clear();
+  });
+
   afterAll(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await repo.close();
@@ -124,19 +137,20 @@ describe("Interop B · smart-HTTP server over a real socket", () => {
     expect(asText).toContain("PACK");
   });
 
-  it.skipIf(!gitAvailable())("real git clone over smart-HTTP", async () => {
+  it.skipIf(!gitAvailable())("real git clone over smart-HTTP", { timeout: TEST_TIMEOUT }, async () => {
     const dst = join(root, "clone");
     const run = (cwd: string, args: string[]) =>
       new Promise<string>((resolve, reject) => {
-        execFile(
+        const child = execFile(
           "git",
           args,
           {
             cwd,
-            timeout: 20000,
+            timeout: GIT_TIMEOUT,
             killSignal: "SIGKILL",
             env: {
-              ...process.env,
+              // no proxy for the loopback server
+              ...loopbackEnv(),
               GIT_CONFIG_GLOBAL: "/dev/null",
               GIT_CONFIG_NOSYSTEM: "1",
               GIT_TERMINAL_PROMPT: "0",
@@ -148,9 +162,13 @@ describe("Interop B · smart-HTTP server over a real socket", () => {
               GIT_COMMITTER_DATE: "1112911993 +0000",
             },
           },
-          (error, stdout, stderr) =>
-            error ? reject(new Error(`git ${args.join(" ")}: ${stderr}`)) : resolve(stdout.trim()),
+          (error, stdout, stderr) => {
+            children.delete(child);
+            if (error) reject(new Error(`git ${args.join(" ")}: ${stderr}`));
+            else resolve(stdout.trim());
+          },
         );
+        children.add(child);
       });
     await run(root, ["clone", `http://127.0.0.1:${port}/repo.git`, dst]);
     expect(await run(dst, ["rev-parse", "HEAD"])).toBe(head);
