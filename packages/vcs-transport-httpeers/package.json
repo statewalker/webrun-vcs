@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-transport-httpeers",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Git smart HTTP and Git LFS over an httpeers mesh: Biscuit membership tokens, per-ref push authorization, multi-source LFS downloads",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
