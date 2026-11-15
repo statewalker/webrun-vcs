@@ -25,7 +25,7 @@
  * The report texts are git's: `unpacker error`, `missing necessary objects`, `funny refname`,
  * `branch is currently checked out`, `deletion prohibited`, `deletion of the current branch
  * prohibited`, `non-fast-forward`, `bad ref`, `hook declined`, `pre-receive hook declined`,
- * `shallow update not allowed`, `failed to update ref`, `atomic push failure`, `atomic
+ * `shallow update not allowed`, `failed to update ref`, `invalid new value provided`, `atomic push failure`, `atomic
  * transaction failed`. With side-band, git's `error:` lines explaining a refusal go to the
  * client's progress channel, and keep-alive packets are sent while a received push is checked.
  */
@@ -144,6 +144,8 @@ const AUTHORIZE_FAILED = "authorization failed";
 
 /** git's report-status texts. */
 const FAILED_TO_UPDATE = "failed to update ref";
+/** git's ref_transaction_error_msg(REF_TRANSACTION_ERROR_INVALID_NEW_VALUE) */
+const INVALID_NEW_VALUE = "invalid new value provided";
 const ATOMIC_TRANSACTION_FAILED = "atomic transaction failed";
 const ATOMIC_PUSH_FAILURE = "atomic push failure";
 
@@ -948,9 +950,9 @@ async function objectType(ctx: ProcessContext, oid: string): Promise<string | un
  *
  * An atomic push runs them as git's execute_commands_atomic: the first command refused here
  * stops the checks (the update hook of later commands does not run) and every other command
- * still open gets "atomic push failure". What git's ref transaction refuses only when it
- * commits (a stale old value, a non-commit on a branch, the same ref twice) does not stop
- * the checks; once they all pass, every open command gets "atomic transaction failed". With
+ * still open gets "atomic push failure" (a non-commit on a branch included, as git 2.55+).
+ * What git's ref transaction refuses only when it commits (a stale old value, the same ref
+ * twice) does not stop the checks; once they all pass, every open command gets "atomic transaction failed". With
  * `strictAtomic`, a command already refused before the transaction fails the others at once.
  */
 async function validateCommands(ctx: ProcessContext): Promise<void> {
@@ -1083,21 +1085,9 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         cmd.message = "bad pack";
         return;
       }
-      // a branch points at a commit (git's ref backend refuses anything else, when the
-      // transaction commits)
-      if (name.startsWith("refs/heads/") && type !== "commit" && type !== "unknown") {
-        await sendError(
-          ctx,
-          `cannot update ref '${name}': trying to write non-commit object ${cmd.newOid} to branch '${name}'`,
-        );
-        if (!atomic) {
-          cmd.result = "LOCK_FAILURE";
-          cmd.message = FAILED_TO_UPDATE;
-          return;
-        }
-        transactionFails = true;
-        nonCommitBranch = true;
-      }
+      // a branch points at a commit: refused once the update hook has run, as git 2.55+'s
+      // ref_transaction_update (queued in update(), after the hook)
+      nonCommitBranch = name.startsWith("refs/heads/") && type !== "commit" && type !== "unknown";
     }
 
     if (cmd.type === "UPDATE" && name.startsWith("refs/heads/") && !nonCommitBranch) {
@@ -1135,7 +1125,18 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         if (verdict.message) await sendMessage(ctx, verdict.message);
         await sendError(ctx, `hook declined to update ${name}`);
         reject(cmd, "hook declined");
+        return;
       }
+    }
+
+    // git 2.55+ refuses it in ref_transaction_update with REF_TRANSACTION_ERROR_INVALID_NEW_VALUE,
+    // reported "invalid new value provided" (and an atomic push fails the others with "atomic
+    // push failure"); older git refused it when the transaction committed ("failed to update
+    // ref" in 2.43, "atomic transaction failed" for an atomic push)
+    if (nonCommitBranch) {
+      await sendError(ctx, `trying to write non-commit object ${cmd.newOid} to branch '${name}'`);
+      cmd.result = "LOCK_FAILURE";
+      cmd.message = INVALID_NEW_VALUE;
     }
   };
 

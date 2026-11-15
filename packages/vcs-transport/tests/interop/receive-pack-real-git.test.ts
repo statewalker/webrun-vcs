@@ -55,6 +55,21 @@ const GIT_ENV = {
 const TEST_TIMEOUT = 60000;
 const GIT_TIMEOUT = 30000;
 
+/** The native git's version as [major, minor] ([0, 0] without git). */
+const GIT_VERSION: [number, number] = (() => {
+  if (!HAS_GIT) return [0, 0];
+  const match = /(\d+)\.(\d+)/.exec(execFileSync("git", ["--version"]).toString());
+  return match ? [Number(match[1]), Number(match[2])] : [0, 0];
+})();
+
+/**
+ * git 2.55 moved the non-commit-on-a-branch check into ref_transaction_update (refs.c), so
+ * receive-pack's update() refuses it ("invalid new value provided"; an atomic push fails the
+ * others with "atomic push failure"). Older git refused it when the transaction committed:
+ * "atomic transaction failed" for every ref of an atomic push. Our server follows 2.55+.
+ */
+const NON_COMMIT_IN_UPDATE = GIT_VERSION[0] > 2 || (GIT_VERSION[0] === 2 && GIT_VERSION[1] >= 55);
+
 function gitSync(cwd: string, args: string[], input?: Uint8Array | string): Buffer {
   return execFileSync("git", args, {
     cwd,
@@ -507,16 +522,25 @@ describeGit(
           pack: packOfObjects(src.dir, []),
         }),
       );
-      expect(native).toEqual([
+      // ours always as git 2.55+: the tree is refused in update(), before the funny name
+      const newest = [
         "unpack ok",
         "ng refs/heads/a atomic push failure",
-        "ng refs/heads/t atomic push failure",
-        "ng refs/heads/a..b funny refname",
-      ]);
-      expect(ours).toEqual(native);
+        "ng refs/heads/t failed to update ref", // "invalid new value provided", normalised
+        "ng refs/heads/a..b atomic push failure",
+      ];
+      expect(ours).toEqual(newest);
+      if (NON_COMMIT_IN_UPDATE) expect(native).toEqual(newest);
+      else
+        expect(native).toEqual([
+          "unpack ok",
+          "ng refs/heads/a atomic push failure",
+          "ng refs/heads/t atomic push failure",
+          "ng refs/heads/a..b funny refname",
+        ]);
     });
 
-    it("atomic: a tree on a branch fails the transaction", async () => {
+    it("atomic: a tree on a branch fails the push in update() (git 2.55+)", async () => {
       const tree = git(src.dir, ["rev-parse", `${h()}^{tree}`]);
       const { native, ours } = await both(
         pushRequest({
@@ -525,12 +549,19 @@ describeGit(
           pack: packOfObjects(src.dir, []),
         }),
       );
-      expect(native).toEqual([
+      const newest = [
         "unpack ok",
-        "ng refs/heads/a atomic transaction failed",
-        "ng refs/heads/t atomic transaction failed",
-      ]);
-      expect(ours).toEqual(native);
+        "ng refs/heads/a atomic push failure",
+        "ng refs/heads/t failed to update ref", // "invalid new value provided", normalised
+      ];
+      expect(ours).toEqual(newest);
+      if (NON_COMMIT_IN_UPDATE) expect(native).toEqual(newest);
+      else
+        expect(native).toEqual([
+          "unpack ok",
+          "ng refs/heads/a atomic transaction failed",
+          "ng refs/heads/t atomic transaction failed",
+        ]);
     });
 
     it("atomic: a shallow push refused, the others still land (git)", async () => {

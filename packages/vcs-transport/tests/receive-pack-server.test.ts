@@ -125,13 +125,14 @@ describe("receive-pack: git's update() checks", () => {
       commands: [`${ZERO} ${tree} refs/heads/t`, `${ZERO} ${tree} refs/tags/t`],
       pack: await packOf(repo, []),
     });
+    // git 2.55+'s wording (ref_transaction_update; 2.43 said "failed to update ref")
     expect(run.report).toEqual([
       "unpack ok",
-      "ng refs/heads/t failed to update ref",
+      "ng refs/heads/t invalid new value provided",
       "ok refs/tags/t",
     ]);
     expect(run.messages).toContain(
-      `error: cannot update ref 'refs/heads/t': trying to write non-commit object ${tree} to branch 'refs/heads/t'`,
+      `error: trying to write non-commit object ${tree} to branch 'refs/heads/t'`,
     );
     expect(await repo.refStore.get("refs/heads/t")).toBeUndefined();
   });
