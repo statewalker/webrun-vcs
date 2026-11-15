@@ -12,7 +12,9 @@
  *     pack) or a later entry, in which case the delta waits for it (git's delta_list);
  *   - bases come from a byte-bounded LRU of recent objects, or are read back from the store;
  *   - an object the store already has is compared byte for byte with the incoming one (git's
- *     check_collision), and a mismatch is refused with `ObjectCollisionError`.
+ *     check_collision), and a mismatch is refused with `ObjectCollisionError`; a match is
+ *     written again (`putRaw`), which the store answers by keeping its copy and freshening it
+ *     where it can (git's freshen_loose_object / freshen_packed_object).
  *
  * Objects are written before the trailer is read, as git does: each is named by the hash of its
  * own bytes, so a pack refused at its end leaves only sound objects behind.
@@ -333,6 +335,9 @@ export async function unpackObjects(
     if (await objects.has(id)) {
       if (!(await sameAsStored(id, head, data)))
         throw new ObjectCollisionError(`SHA-1 collision found with ${id}: the bytes differ`);
+      // written again so the store renews its copy (git's freshen: an old unreachable object
+      // the push is about to name must not be pruned by a concurrent gc); the store keeps it
+      await objects.putRaw(id, [head, data]);
       result.existing++;
     } else {
       await objects.putRaw(id, [head, data]);

@@ -5,25 +5,15 @@
  */
 import type { GitObjects } from "./git-objects.js";
 
-function closeSource(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): void {
-  const it =
-    Symbol.asyncIterator in Object(content)
-      ? (content as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
-      : (content as Iterable<Uint8Array>)[Symbol.iterator]();
-  try {
-    const r = it.return?.();
-    if (r && typeof (r as Promise<unknown>).then === "function") {
-      (r as Promise<unknown>).then(undefined, () => {});
-    }
-  } catch {
-    // nothing to close
-  }
-}
-
 /**
  * Objects written to `top`, read from `top` then `base`: the view of a quarantine. An object
- * `base` already has is not written to `top` again (`putRaw` checks first; `put` and
- * `putUnsized`, which learn the id at the end, drop the copy they wrote). `remove` removes from
+ * `base` already has is not written to `top` again: `putRaw` hands it to `base.putRaw`, and
+ * `put` and `putUnsized`, which learn the id at the end, hand the copy they wrote to
+ * `base.putRaw` and drop it from `top`. `base` then keeps its copy and renews it as it would
+ * for any write of an object it has (the files backend's freshen: a loose file or pack older than
+ * its freshen window is written again), so a concurrent gc does not prune an old unreachable
+ * object a push is about to name, as git freshens objects found in the main object directory
+ * while it writes into its quarantine. `remove` removes from
  * `top` only, so the view can never remove a published object. `list` yields `top`'s ids, then
  * `base`'s that are not in `top` (it holds `top`'s ids: the quarantine's objects, not the
  * repository's).
@@ -38,17 +28,18 @@ function closeSource(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>):
  */
 export function overlayObjects(top: GitObjects, base: GitObjects): GitObjects {
   const dropIfPublished = async (id: string) => {
-    if (await base.has(id)) await top.remove(id);
+    if (await base.has(id)) {
+      await base.putRaw(id, top.getRaw(id)); // freshens base's copy
+      await top.remove(id);
+    }
     return id;
   };
   return {
     put: async (type, size, content) => dropIfPublished(await top.put(type, size, content)),
     putUnsized: async (type, content) => dropIfPublished(await top.putUnsized(type, content)),
     async putRaw(id, raw) {
-      if (await base.has(id)) {
-        closeSource(raw);
-        return;
-      }
+      // published already: base keeps (and freshens) its copy, nothing goes to the quarantine
+      if (await base.has(id)) return base.putRaw(id, raw);
       return top.putRaw(id, raw);
     },
     async *getRaw(id) {

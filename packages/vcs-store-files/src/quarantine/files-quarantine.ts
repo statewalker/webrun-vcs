@@ -20,6 +20,8 @@ import { filesStagingStore } from "../storage/loose/files-staging-store.js";
 export const QUARANTINE_DIR_PREFIX = "tmp_objdir-incoming-";
 
 const FANOUT = /^[0-9a-f]{2}$/;
+/** git's freshen window, as `createGitFilesBackend`'s default `freshenMaxAgeMs`. */
+const DEFAULT_FRESHEN_MAX_AGE_MS = 60 * 60 * 1000;
 const REST = /^[0-9a-f]{38}$/;
 
 /** Quarantine directories open in this process: `sweepQuarantines` leaves them alone. */
@@ -61,6 +63,18 @@ export async function beginFilesQuarantine(
   options: FilesQuarantineOptions,
 ): Promise<ObjectQuarantine> {
   const { files, objectsDir, freshenMaxAgeMs } = options;
+  const freshenWindow = freshenMaxAgeMs ?? DEFAULT_FRESHEN_MAX_AGE_MS;
+  /**
+   * "absent", "fresh" or "stale" (last modified longer ago than the freshen window): a stale
+   * target is replaced by the quarantined copy (the same bytes), which renews its mtime, as
+   * git's freshen; an unknown age counts as fresh.
+   */
+  const targetState = async (path: string) => {
+    const st = await files.stats(path);
+    if (st?.kind !== "file") return "absent";
+    const m = st.lastModified;
+    return m !== undefined && Date.now() - m > freshenWindow ? "stale" : "fresh";
+  };
   const dir = joinPath(objectsDir, `${QUARANTINE_DIR_PREFIX}${timestampedId()}`);
   const packDir = joinPath(dir, "pack");
   openDirs.add(dir);
@@ -103,7 +117,8 @@ export async function beginFilesQuarantine(
       for await (const f of files.list(joinPath(dir, fanout))) {
         if (f.kind !== "file" || !REST.test(f.name)) continue;
         const target = joinPath(targetDir, f.name);
-        if ((await files.stats(target))?.kind === "file") continue;
+        // the repository has it: kept, and freshened when old (gc must not prune it now)
+        if ((await targetState(target)) === "fresh") continue;
         if (!(await files.exists(targetDir))) await files.mkdir(targetDir);
         if (!(await moveCompleting(files, f.path, target)))
           throw new Error(`could not move ${f.path} to ${target}`);
@@ -120,8 +135,9 @@ export async function beginFilesQuarantine(
       if (!(await files.exists(mainPackDir))) await files.mkdir(mainPackDir);
       for (const name of packFiles) {
         const target = joinPath(mainPackDir, name);
-        // a pack of the same name holds the same objects (its name is its checksum)
-        if (await files.exists(target)) continue;
+        // a pack of the same name holds the same objects (its name is its checksum): kept,
+        // and freshened when old by moving the new copy over it
+        if ((await targetState(target)) === "fresh") continue;
         const source = joinPath(packDir, name);
         if (!(await moveCompleting(files, source, target)))
           throw new Error(`could not move ${source} to ${target}`);
