@@ -19,6 +19,10 @@ export interface PushOverDuplexOptions extends PushClientOptions {
   duplex: Duplex;
   /** Close the duplex when the push ends (default false: the caller owns it) */
   closeDuplex?: boolean;
+  /** Bounds each wait for the server, in milliseconds (not the local pack production) */
+  timeout?: number;
+  /** Aborts the push */
+  signal?: AbortSignal;
 }
 
 /**
@@ -44,6 +48,8 @@ export async function pushOverDuplex(options: PushOverDuplexOptions): Promise<Pu
   try {
     const connection = await openDuplexReceivePackConnection(options.duplex, {
       closeDuplex: options.closeDuplex,
+      timeout: options.timeout,
+      signal: options.signal,
     });
     try {
       const report = await pushToConnection(connection, options);

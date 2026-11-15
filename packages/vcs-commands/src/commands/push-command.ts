@@ -11,7 +11,12 @@ import {
   push as transportPush,
 } from "@statewalker/vcs-transport";
 
-import { InvalidRemoteError, NonFastForwardError, PushRejectedException } from "../errors/index.js";
+import {
+  InvalidArgumentError,
+  InvalidRemoteError,
+  NonFastForwardError,
+  PushRejectedException,
+} from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
@@ -116,7 +121,8 @@ export class PushCommand extends TransportCommand<PushResult> {
   private pushOptions: string[] = [];
   private receivePack?: string;
   private prune = false;
-  /** Leases; empty: every pushed ref at its remote-tracking value; undefined: none */
+  private streamRequestBody?: boolean;
+  /** Leases (an entry without a ref: every other pushed ref at its tracking value) */
   private leases?: ForceWithLease[];
 
   /**
@@ -186,7 +192,8 @@ export class PushCommand extends TransportCommand<PushResult> {
    * `--force-with-lease`: allow a non-fast-forward of `ref` only while the remote ref still
    * has `expect` (`""` or the zero id: it must not exist). Without `expect` the remote ref's
    * remote-tracking value is expected (`refs/remotes/<remote>/...`). Without `ref` every pushed
-   * ref is leased at its remote-tracking value. A lease that does not hold is
+   * ref (that no explicit lease names) is leased at its remote-tracking value; `expect` may be
+   * a revision or an abbreviated id. A lease that does not hold is
    * REJECTED_REMOTE_CHANGED; {@link setForce} overrides it, as in git.
    *
    * @param ref The remote ref (full or short name)
@@ -195,8 +202,26 @@ export class PushCommand extends TransportCommand<PushResult> {
   setForceWithLease(ref?: string, expect?: string): this {
     this.checkCallable();
     this.leases ??= [];
-    if (ref !== undefined) this.leases.push({ ref, ...(expect !== undefined ? { expect } : {}) });
+    // without a ref: every other pushed ref at its remote-tracking value (git's bare
+    // --force-with-lease, which explicit ones combine with)
+    this.leases.push(ref === undefined ? {} : { ref, ...(expect !== undefined ? { expect } : {}) });
     return this;
+  }
+
+  /**
+   * Stream the smart-HTTP request body (default: outside browsers, where supported); `false`
+   * collects it first, so the request has a `Content-Length` (servers or proxies that refuse
+   * chunked requests).
+   */
+  setStreamRequestBody(stream: boolean): this {
+    this.checkCallable();
+    this.streamRequestBody = stream;
+    return this;
+  }
+
+  /** Whether the request body streams (undefined: the transport decides). */
+  isStreamRequestBody(): boolean | undefined {
+    return this.streamRequestBody;
   }
 
   /**
@@ -358,8 +383,9 @@ export class PushCommand extends TransportCommand<PushResult> {
    * a ref, the remote-tracking ref of a named remote follows it (`refs/remotes/<remote>/…`).
    *
    * Without refspecs (nor `setPushAll`/`setPushTags`), the configured `remote.<name>.push`
-   * refspecs are used, else the current branch is pushed to the same name (git's
-   * `push.default=current`; `simple`/`matching`/`upstream` are not modelled).
+   * refspecs are used, else `push.default` decides (default `simple`: the current branch to
+   * its upstream of the same name on its own remote, to the same name elsewhere; see
+   * `buildRefSpecs`). A detached HEAD is refused.
    *
    * @returns Push result with each remote ref's status
    * @throws InvalidRemoteError if remote cannot be resolved
@@ -395,8 +421,9 @@ export class PushCommand extends TransportCommand<PushResult> {
       thin: this.thin,
       dryRun: this.dryRun,
       prune: this.prune,
+      streamRequestBody: this.streamRequestBody,
       pushOptions: this.pushOptions.length > 0 ? this.pushOptions : undefined,
-      forceWithLease: leases === undefined ? undefined : leases.length === 0 ? true : leases,
+      forceWithLease: leases,
       trackingValue: async (remoteRef) => {
         const local = tracking(remoteRef);
         return local ? (await history.refs.resolve(local))?.objectId : undefined;
@@ -407,10 +434,11 @@ export class PushCommand extends TransportCommand<PushResult> {
       },
     });
 
-    // git updates the remote-tracking refs of what the server accepted
+    // git updates the remote-tracking refs of what the server accepted, and of what it had
+    // already (transport.c: update_tracking_ref for ok and up-to-date refs)
     if (!this.dryRun) {
       for (const update of result.updates) {
-        if (update.status !== "ok") continue;
+        if (update.status !== "ok" && update.status !== "up-to-date") continue;
         const local = tracking(update.remoteRef);
         if (!local) continue;
         if (update.newOid === ZERO_OBJECT_ID) await history.refs.remove(local);
@@ -449,7 +477,11 @@ export class PushCommand extends TransportCommand<PushResult> {
       if (update.status === PushStatus.REJECTED_NONFASTFORWARD) {
         throw new NonFastForwardError(update.remoteName, result.uri);
       }
-      if (update.status === PushStatus.REJECTED_OTHER || update.status === PushStatus.FAILED) {
+      if (
+        update.status === PushStatus.REJECTED_OTHER ||
+        update.status === PushStatus.REJECTED_REMOTE_CHANGED ||
+        update.status === PushStatus.FAILED
+      ) {
         throw new PushRejectedException(
           update.remoteName,
           update.message || "rejected",
@@ -479,7 +511,18 @@ export class PushCommand extends TransportCommand<PushResult> {
 
   /**
    * The refspecs to push: the explicit ones, `--all` (every branch), `--tags` (every tag);
-   * else the remote's configured push refspecs; else the current branch to the same name.
+   * else the remote's configured push refspecs; else what `push.default` says (git's
+   * builtin/push.c `setup_default_push_refspecs`, default `simple`):
+   *
+   * - `simple`: the current branch to its upstream of the same name when pushing to the
+   *   branch's own remote (refused without an upstream, or with one of another name); to the
+   *   same name when pushing elsewhere (a URL, another remote)
+   * - `current`: the current branch to the same name
+   * - `upstream` (`tracking`): the current branch to its upstream, on its remote only
+   * - `matching`: `:` (the branches both sides have)
+   * - `nothing`: refused
+   *
+   * A detached HEAD is refused, except with `matching`.
    */
   private async buildRefSpecs(): Promise<string[]> {
     const specs = [...this.refSpecs];
@@ -492,8 +535,66 @@ export class PushCommand extends TransportCommand<PushResult> {
       const configured = store.read(this.remote).pushRefspecs;
       if (configured.length > 0) return configured;
     }
-    const currentBranch = await this.getCurrentBranch();
-    return currentBranch ? [`${currentBranch}:${currentBranch}`] : [];
+    const mode = (store.value("push.default") ?? "simple").toLowerCase();
+    if (mode === "matching") return [":"];
+    if (mode === "nothing") {
+      throw new InvalidArgumentError(
+        "refspecs",
+        undefined,
+        'You didn\'t specify any refspecs to push, and push.default is "nothing".',
+      );
+    }
+    const ref = await this.getCurrentBranch();
+    // a repository without HEAD (nothing committed, nothing checked out) has nothing to push
+    if (!ref && !(await this.refsStore.get("HEAD"))) return [];
+    if (!ref?.startsWith("refs/heads/")) {
+      throw new InvalidArgumentError(
+        "refspecs",
+        undefined,
+        "You are not currently on a branch. To push the history leading to the current " +
+          "(detached HEAD) state now, use git push <remote> HEAD:<name-of-remote-branch>",
+      );
+    }
+    const branch = ref.slice("refs/heads/".length);
+    if (mode === "current") return [`${ref}:${ref}`];
+
+    // the branch's remote (git: branch.<name>.remote, else "origin") and upstream
+    const branchRemote = store.value(`branch.${branch}.remote`) ?? "origin";
+    const merge = store.value(`branch.${branch}.merge`);
+    const triangular = this.remote !== branchRemote;
+    const noUpstream = () =>
+      new InvalidArgumentError(
+        "refspecs",
+        undefined,
+        `The current branch ${branch} has no upstream branch. To push the current branch and ` +
+          `set the remote as upstream, use git push --set-upstream ${this.remote} ${branch}`,
+      );
+    if (mode === "upstream" || mode === "tracking") {
+      if (triangular) {
+        throw new InvalidArgumentError(
+          "refspecs",
+          undefined,
+          `You are pushing to remote '${this.remote}', which is not the upstream of your ` +
+            `current branch '${branch}', without telling me what to push to update which ` +
+            "remote branch.",
+        );
+      }
+      if (!merge) throw noUpstream();
+      return [`${ref}:${merge}`];
+    }
+    // simple (and anything unknown, as git's default)
+    if (triangular) return [`${ref}:${ref}`];
+    if (!merge) throw noUpstream();
+    if (merge !== ref) {
+      throw new InvalidArgumentError(
+        "refspecs",
+        undefined,
+        "The upstream branch of your current branch does not match\n" +
+          `the name of your current branch. To push to the upstream branch on the remote, use\n` +
+          `    git push ${this.remote} HEAD:${merge.replace(/^refs\/heads\//, "")}`,
+      );
+    }
+    return [`${ref}:${ref}`];
   }
 
   /**

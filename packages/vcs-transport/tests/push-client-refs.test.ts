@@ -132,7 +132,7 @@ describe("matchPushRefs: refspecs as git push maps them", () => {
     [
       "two sources for one remote ref",
       ["main:refs/heads/x", "topic:refs/heads/x"],
-      /multiple updates for ref 'refs\/heads\/x'/,
+      /dst ref refs\/heads\/x receives from more than one src/,
     ],
     ["a pattern on one side only", ["refs/heads/*:refs/heads/x"], /invalid refspec/],
   ];

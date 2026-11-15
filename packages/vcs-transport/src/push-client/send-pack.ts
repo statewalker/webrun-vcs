@@ -12,19 +12,18 @@ import {
   type RemoteRef,
   readSidebandPack,
 } from "../fetch-client/index.js";
-import {
-  encodeFlush,
-  encodePacketLine,
-  PackProtocolError,
-  TransportError,
-  ZERO_OID,
-} from "../protocol/index.js";
+import { encodeFlush, encodePacketLine, TransportError, ZERO_OID } from "../protocol/index.js";
 import type { ReceivePackConnection } from "./connection.js";
+import { resolveRevision } from "./revision.js";
+
+const OID = /^[0-9a-f]{40}$/;
+
 import {
   type ForceWithLease,
   isPushSuccess,
   matchPushRefs,
   type PushObjectSource,
+  PushRefspecError,
   type PushRefUpdate,
   pushSummary,
   refnameMatch,
@@ -135,29 +134,44 @@ export async function pushToConnection(
   }
   const headOid = await refStore.get("HEAD");
   const headTarget = await refStore.getSymrefTarget?.("HEAD");
+  const head = { oid: headOid, target: headTarget };
+  const revision = (expr: string) => resolveRevision(expr, { refs: localRefs, head, repository });
   const matched = await matchPushRefs(
     options.refspecs ?? [],
     {
       refs: localRefs,
-      head: { oid: headOid, target: headTarget },
+      head,
       hasObject: (oid) => repository.has(oid),
+      resolveRevision: revision,
     },
     remoteRefs,
     { prune: options.prune },
   );
+  // leases (git's apply_cas): an entry naming the ref wins; one without a ref (or `true`)
+  // covers every other pushed ref at its remote-tracking value
   const leases = new Map<string, string>();
   const lease = options.forceWithLease;
   if (lease) {
+    const entries: ForceWithLease[] = lease === true ? [{}] : lease;
+    const named = entries.filter((l) => l.ref !== undefined);
+    const rest = entries.some((l) => l.ref === undefined);
+    const expected = new Map<ForceWithLease, string>();
+    for (const l of named) {
+      // git: "cannot parse expected object name" before anything is sent
+      if (l.expect === undefined || l.expect === "" || l.expect === ZERO_OID) continue;
+      const oid = OID.test(l.expect) ? l.expect : await revision(l.expect);
+      if (!oid) throw new PushRefspecError(`cannot parse expected object name '${l.expect}'`);
+      expected.set(l, oid);
+    }
     for (const m of matched) {
-      const entry =
-        lease === true
-          ? { ref: m.remoteRef }
-          : lease.find((l) => l.ref === m.remoteRef || refnameMatch(l.ref, m.remoteRef));
-      if (!entry) continue;
+      const entry = named.find(
+        (l) => l.ref === m.remoteRef || refnameMatch(l.ref as string, m.remoteRef),
+      );
+      if (!entry && !rest) continue;
       const expect =
-        entry.expect === undefined
-          ? await options.trackingValue?.(m.remoteRef)
-          : entry.expect || ZERO_OID;
+        entry && entry.expect !== undefined
+          ? (expected.get(entry) ?? ZERO_OID)
+          : await options.trackingValue?.(m.remoteRef);
       leases.set(m.remoteRef, expect ?? ZERO_OID);
     }
   }
@@ -203,17 +217,21 @@ export async function pushToConnection(
   }
 
   // the request: commands, push options, the pack (none for deletes only)
-  const head: Uint8Array[] = toSend.map((u, i) =>
+  // a shallow repository says where its history ends (send-pack's advertise_shallow_grafts),
+  // and its pack stops there
+  const shallow = (await refStore.getShallow?.()) ?? [];
+  const request: Uint8Array[] = shallow.map((oid) => encodePacketLine(`shallow ${oid}\n`));
+  const commands: Uint8Array[] = toSend.map((u, i) =>
     encodePacketLine(
       i === 0
         ? `${u.oldOid} ${u.newOid} ${u.remoteRef}\0${requested.join(" ")}\n`
         : `${u.oldOid} ${u.newOid} ${u.remoteRef}\n`,
     ),
   );
-  head.push(encodeFlush());
+  request.push(...commands, encodeFlush());
   if (options.pushOptions?.length) {
-    for (const option of options.pushOptions) head.push(encodePacketLine(`${option}\n`));
-    head.push(encodeFlush());
+    for (const option of options.pushOptions) request.push(encodePacketLine(`${option}\n`));
+    request.push(encodeFlush());
   }
   const tips = [...new Set(toSend.filter((u) => u.newOid !== ZERO_OID).map((u) => u.newOid))];
   // the edges: every advertised tip (and `.have`) here, as send-pack feeds `^old` to
@@ -230,13 +248,18 @@ export async function pushToConnection(
     result.bytesSent = 0;
     result.packBytes = 0;
     result.packObjects = 0;
-    for (const chunk of head) {
+    for (const chunk of request) {
       result.bytesSent += chunk.length;
       yield chunk;
     }
     if (tips.length === 0) return;
     let header = new Uint8Array(0);
-    for await (const chunk of repository.exportPack(new Set(tips), haves, { thin, ofsDelta })) {
+    const exportOptions = {
+      thin,
+      ofsDelta,
+      ...(shallow.length > 0 ? { shallow: new Set(shallow) } : {}),
+    };
+    for await (const chunk of repository.exportPack(new Set(tips), haves, exportOptions)) {
       if (header.length < 12) {
         const joined = new Uint8Array(header.length + chunk.length);
         joined.set(header);
@@ -262,15 +285,27 @@ export async function pushToConnection(
   const report = caps.has("side-band-64k")
     ? new PktStream(readSidebandPack(answer, options.onProgress))
     : answer;
+  // git's receive_status: a missing or unreadable unpack line is an error, the refs it did not
+  // report stay "[remote failure] (remote failed to report status)"
   const first = await report.readLine();
-  if (first === undefined || !first.startsWith("unpack ")) {
-    throw new PackProtocolError(`unexpected report from receive-pack: ${first ?? "(none)"}`);
+  if (first === undefined) {
+    result.unpack = {
+      ok: false,
+      message: "unexpected flush packet while reading remote unpack status",
+    };
+  } else if (!first.startsWith("unpack ")) {
+    result.unpack = { ok: false, message: `unable to parse remote unpack status: ${first}` };
+  } else {
+    const unpackStatus = first.slice(7);
+    result.unpack = unpackStatus === "ok" ? { ok: true } : { ok: false, message: unpackStatus };
   }
-  const unpackStatus = first.slice(7);
-  result.unpack = unpackStatus === "ok" ? { ok: true } : { ok: false, message: unpackStatus };
   const reported = new Set<PushRefUpdate>();
   const byRef = new Map(toSend.map((u) => [u.remoteRef, u]));
-  for (let line = await report.readLine(); line !== undefined; line = await report.readLine()) {
+  for (
+    let line = first === undefined ? undefined : await report.readLine();
+    line !== undefined;
+    line = await report.readLine()
+  ) {
     if (line.startsWith("option ")) continue; // report-status-v2 (not asked for)
     let ref: string;
     let message: string | undefined;
@@ -280,9 +315,12 @@ export async function pushToConnection(
       const rest = line.slice(3);
       const space = rest.indexOf(" ");
       ref = space < 0 ? rest : rest.slice(0, space);
+      // git shows "failed" for an `ng` without a reason
       message = space < 0 ? "failed" : rest.slice(space + 1);
     } else {
-      throw new PackProtocolError(`unexpected report line: ${line}`);
+      // git: "invalid ref status from remote"; what was not reported is a remote failure
+      result.unpack = { ok: false, message: `invalid ref status from remote: ${line}` };
+      break;
     }
     const update = byRef.get(ref);
     if (!update) continue; // git: a report of a ref not pushed is ignored

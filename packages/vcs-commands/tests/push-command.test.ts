@@ -7,8 +7,9 @@
 
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
-
+import { PushRejectedException } from "../src/errors/index.js";
 import { Git } from "../src/index.js";
+import { RemoteConfigStore } from "../src/remote-config/index.js";
 import { PushStatus } from "../src/results/push-result.js";
 import { backends } from "./test-helper.js";
 import {
@@ -940,6 +941,10 @@ describe.each(backends)("PushCommand as git push ($name backend)", ({ factory })
 
   it("pushes the current branch by default, short names, and moves the remote-tracking ref", async () => {
     const { server, git, workingCopy, withFetch } = await fetchedClient();
+    // push.default=simple pushes to the upstream of the same name
+    const config = RemoteConfigStore.from(workingCopy);
+    config.setValue("branch.main.remote", "origin");
+    config.setValue("branch.main.merge", "refs/heads/main");
     const tip = await addFileAndCommitWc(workingCopy, "b.txt", "b", "on top");
     const result = await withFetch(() => git.push().call());
     expect(result.remoteUpdates.map((u) => [u.remoteName, u.status, u.summary])).toEqual([
@@ -989,5 +994,125 @@ describe.each(backends)("PushCommand as git push ($name backend)", ({ factory })
     await expect(withFetch(() => git.push().add("no-such-branch").call())).rejects.toThrow(
       /src refspec no-such-branch does not match any/,
     );
+  });
+});
+
+describe.each(backends)("PushCommand review fixes ($name backend)", ({ factory }) => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  async function client(options: { upstream?: string; config?: Record<string, string> } = {}) {
+    const server = await createInitializedTestServer();
+    const url = createTestUrl(server.baseUrl);
+    const ctx = await factory();
+    cleanup = ctx.cleanup;
+    const workingCopy = ctx.workingCopy;
+    const git = Git.fromWorkingCopy(workingCopy);
+    const originalFetch = globalThis.fetch;
+    const withFetch = async <T>(run: () => Promise<T>): Promise<T> => {
+      globalThis.fetch = server.mockFetch;
+      try {
+        return await run();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    };
+    await git.remoteAdd().setName("origin").setUri(url).call();
+    await withFetch(() => git.fetch().setRemote("origin").call());
+    await workingCopy.history.refs.setSymbolic("HEAD", "refs/heads/main");
+    await workingCopy.history.refs.set("refs/heads/main", server.initialCommitId);
+    const config = RemoteConfigStore.from(workingCopy);
+    if (options.upstream) {
+      config.setValue("branch.main.remote", "origin");
+      config.setValue("branch.main.merge", options.upstream);
+    }
+    for (const [key, value] of Object.entries(options.config ?? {})) config.setValue(key, value);
+    return { server, git, workingCopy, withFetch };
+  }
+
+  it("callOrThrow throws on a stale lease (REJECTED_REMOTE_CHANGED)", async () => {
+    const { git, workingCopy, withFetch } = await client();
+    await workingCopy.history.refs.remove("refs/heads/main");
+    const rewritten = await addFileAndCommitWc(workingCopy, "r.txt", "r", "rewritten");
+    await workingCopy.history.refs.set("refs/heads/main", rewritten);
+    await expect(
+      withFetch(() =>
+        git.push().add("main").setForceWithLease("main", "1".repeat(40)).callOrThrow(),
+      ),
+    ).rejects.toThrow(PushRejectedException);
+  });
+
+  it("an up-to-date ref still moves its remote-tracking ref, as git", async () => {
+    const { server, git, workingCopy, withFetch } = await client();
+    await workingCopy.history.refs.remove("refs/remotes/origin/main");
+    const result = await withFetch(() => git.push().add("main").call());
+    expect(result.remoteUpdates[0]?.status).toBe(PushStatus.UP_TO_DATE);
+    expect((await workingCopy.history.refs.resolve("refs/remotes/origin/main"))?.objectId).toBe(
+      server.initialCommitId,
+    );
+  });
+
+  it("push.default=simple: the upstream of the same name is pushed", async () => {
+    const { server, git, workingCopy, withFetch } = await client({ upstream: "refs/heads/main" });
+    const tip = await addFileAndCommitWc(workingCopy, "b.txt", "b", "on top");
+    const result = await withFetch(() => git.push().call());
+    expect(result.remoteUpdates.map((u) => u.remoteName)).toEqual(["refs/heads/main"]);
+    expect((await server.serverStores.refs.resolve("refs/heads/main"))?.objectId).toBe(tip);
+  });
+
+  it("push.default=simple: no upstream on the branch's remote is refused", async () => {
+    const { git, withFetch } = await client();
+    await expect(withFetch(() => git.push().call())).rejects.toThrow(
+      /The current branch main has no upstream branch/,
+    );
+  });
+
+  it("push.default=simple: an upstream of another name is refused", async () => {
+    const { git, withFetch } = await client({ upstream: "refs/heads/other" });
+    await expect(withFetch(() => git.push().call())).rejects.toThrow(
+      /does not match\s+the name of your current branch/,
+    );
+  });
+
+  it("a detached HEAD without refspecs is refused", async () => {
+    const { git, workingCopy, withFetch } = await client({ upstream: "refs/heads/main" });
+    const head = (await workingCopy.history.refs.resolve("HEAD"))?.objectId as string;
+    await workingCopy.history.refs.set("HEAD", head);
+    await expect(withFetch(() => git.push().call())).rejects.toThrow(
+      /You are not currently on a branch/,
+    );
+  });
+
+  it("push.default=current, upstream and nothing", async () => {
+    const current = await client({ config: { "push.default": "current" } });
+    await current.workingCopy.history.refs.set("refs/heads/topic", current.server.initialCommitId);
+    await current.workingCopy.history.refs.setSymbolic("HEAD", "refs/heads/topic");
+    const pushed = await current.withFetch(() => current.git.push().call());
+    expect(pushed.remoteUpdates.map((u) => [u.remoteName, u.summary])).toEqual([
+      ["refs/heads/topic", "[new branch]"],
+    ]);
+    await cleanup?.();
+
+    const upstream = await client({
+      upstream: "refs/heads/other",
+      config: { "push.default": "upstream" },
+    });
+    const viaUpstream = await upstream.withFetch(() => upstream.git.push().call());
+    expect(viaUpstream.remoteUpdates.map((u) => u.remoteName)).toEqual(["refs/heads/other"]);
+    await cleanup?.();
+
+    const nothing = await client({ config: { "push.default": "nothing" } });
+    await expect(nothing.withFetch(() => nothing.git.push().call())).rejects.toThrow(
+      /push\.default is "nothing"/,
+    );
+  });
+
+  it("setStreamRequestBody is kept and reported", async () => {
+    const { git } = await client();
+    expect(git.push().isStreamRequestBody()).toBeUndefined();
+    expect(git.push().setStreamRequestBody(false).isStreamRequestBody()).toBe(false);
   });
 });

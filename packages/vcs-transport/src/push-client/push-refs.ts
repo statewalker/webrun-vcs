@@ -6,7 +6,6 @@
 
 import type { RemoteRef } from "../fetch-client/index.js";
 import { ZERO_OID } from "../protocol/index.js";
-import { expandFromDestination, expandFromSource, parseRefSpec } from "../utils/index.js";
 
 /** A refspec could not be resolved (git's push dies before it connects to send anything). */
 export class PushRefspecError extends Error {
@@ -70,6 +69,12 @@ export interface LocalRefState {
   head?: { target?: string; oid?: string };
   /** Whether an object id (a 40-hex refspec source) names an object here */
   hasObject?(oid: string): Promise<boolean>;
+  /**
+   * Resolves a source that is no ref name: a revision expression (`main~1`, `HEAD^`,
+   * `v1^{tree}`, an abbreviated id; see {@link resolveRevision}). Without it only full object
+   * ids are accepted.
+   */
+  resolveRevision?(expr: string): Promise<string | undefined>;
 }
 
 /** A refspec matched: the remote ref, what to set it to and from where. */
@@ -91,6 +96,21 @@ export interface MatchPushRefsOptions {
 }
 
 const OID_PATTERN = /^[0-9a-f]{40}$/;
+
+/** git's error for a short destination it cannot place (remote.c). */
+function unqualifiedDestination(dst: string, src: string): PushRefspecError {
+  return new PushRefspecError(
+    "The destination you provided is not a full refname (i.e.,\n" +
+      'starting with "refs/"). We tried to guess what you meant by:\n' +
+      "\n" +
+      `- Looking for a ref that matches '${dst}' on the remote side.\n` +
+      `- Checking if the <src> being pushed ('${src}')\n` +
+      '  is a ref in "refs/{heads,tags}/". If so we add a corresponding\n' +
+      "  refs/{heads,tags}/ prefix on the remote side.\n" +
+      "\n" +
+      "Neither worked, so we gave up. You must fully qualify the ref.",
+  );
+}
 // git's ref_rev_parse_rules, used to match a short name to a full one
 const RULES = [
   "%s",
@@ -170,10 +190,10 @@ export async function matchPushRefs(
 
   const matched = new Map<string, MatchedPushRef>();
   const link = (m: MatchedPushRef, explicit: boolean) => {
-    const existing = matched.get(m.remoteRef);
-    if (existing) {
-      if (explicit && (existing.newOid !== m.newOid || existing.localRef !== m.localRef)) {
-        throw new PushRefspecError(`multiple updates for ref '${m.remoteRef}' not allowed`);
+    if (matched.has(m.remoteRef)) {
+      // git: two explicit refspecs for one remote ref are an error; a pattern skips it
+      if (explicit) {
+        throw new PushRefspecError(`dst ref ${m.remoteRef} receives from more than one src`);
       }
       return;
     }
@@ -183,57 +203,61 @@ export async function matchPushRefs(
   // explicit refspecs first (git's match_explicit_refs), then patterns
   for (const p of parsed) {
     if (p.negative || p.matching || p.pattern) continue;
-    // the source
+    // the source: a local ref (git's count_refspec_match), else any object name (HEAD, an id,
+    // a revision: try_explicit_object_name)
     let localRef: string | undefined;
     let newOid: string;
-    let srcIsRef = true;
+    // what the source resolves to as a ref (git's resolve_ref_unsafe of its name): a ref name,
+    // HEAD's branch, "HEAD" when detached; undefined for an object name
+    let srcRef: string | undefined;
     if (!p.src) {
       newOid = ZERO_OID;
-      srcIsRef = false;
     } else {
       const { count, match } = countRefspecMatch(p.src, localNames);
       if (count > 1) throw new PushRefspecError(`src refspec ${p.src} matches more than one`);
       if (count === 1 && match) {
         localRef = match;
+        srcRef = match;
         newOid = local.refs.get(match) as string;
       } else if (p.src === "HEAD" || p.src === "@") {
         if (!local.head?.oid) throw new PushRefspecError(`src refspec ${p.src} does not match any`);
         newOid = local.head.oid;
         localRef = local.head.target;
-        srcIsRef = !!local.head.target;
-      } else if (OID_PATTERN.test(p.src) && (await local.hasObject?.(p.src))) {
-        newOid = p.src;
-        srcIsRef = false;
+        srcRef = local.head.target ?? "HEAD";
       } else {
-        throw new PushRefspecError(`src refspec ${p.src} does not match any`);
+        const oid =
+          OID_PATTERN.test(p.src) && (await local.hasObject?.(p.src))
+            ? p.src
+            : await local.resolveRevision?.(p.src);
+        if (!oid) throw new PushRefspecError(`src refspec ${p.src} does not match any`);
+        newOid = oid;
       }
     }
     // the destination
-    let remoteRef: string;
-    if (p.dst === undefined) {
-      // no colon: the source's own name (a branch for HEAD)
-      if (!localRef || !srcIsRef) {
+    let dst = p.dst;
+    if (dst === undefined) {
+      // no colon: the name the source resolves to (HEAD's branch; "HEAD" when detached)
+      if (!srcRef || (srcRef !== "HEAD" && !srcRef.startsWith("refs/"))) {
         throw new PushRefspecError(`${p.src} cannot be resolved to branch`);
       }
-      remoteRef = localRef;
-    } else {
-      const { count, match } = countRefspecMatch(p.dst, remote.keys());
-      if (count > 1) throw new PushRefspecError(`dst refspec ${p.dst} matches more than one`);
+      dst = srcRef;
+    }
+    let remoteRef: string;
+    {
+      const { count, match } = countRefspecMatch(dst, remote.keys());
+      if (count > 1) throw new PushRefspecError(`dst refspec ${dst} matches more than one`);
       if (count === 1 && match) {
         remoteRef = match;
-      } else if (p.dst.startsWith("refs/")) {
-        remoteRef = p.dst;
+      } else if (dst.startsWith("refs/")) {
+        remoteRef = dst;
       } else if (newOid === ZERO_OID) {
-        throw new PushRefspecError(`unable to delete '${p.dst}': remote ref does not exist`);
-      } else if (localRef?.startsWith("refs/heads/") && srcIsRef) {
-        remoteRef = `refs/heads/${p.dst}`;
-      } else if (localRef?.startsWith("refs/tags/") && srcIsRef) {
-        remoteRef = `refs/tags/${p.dst}`;
+        throw new PushRefspecError(`unable to delete '${dst}': remote ref does not exist`);
+      } else if (srcRef?.startsWith("refs/heads/")) {
+        remoteRef = `refs/heads/${dst}`;
+      } else if (srcRef?.startsWith("refs/tags/")) {
+        remoteRef = `refs/tags/${dst}`;
       } else {
-        throw new PushRefspecError(
-          `The destination you provided is not a full refname (i.e., starting with "refs/"). ` +
-            `Cannot guess a full refname for '${p.dst}' from the source '${p.src}'.`,
-        );
+        throw unqualifiedDestination(dst, p.src ?? "");
       }
     }
     link(
@@ -242,11 +266,19 @@ export async function matchPushRefs(
     );
   }
 
-  // patterns and "matching" (git's match_push_refs over the local refs)
+  // patterns and "matching" (git's match_push_refs over the local refs): for each local ref
+  // the first pattern whose source matches, else ":" (git's get_ref_match; a forced "+:" wins
+  // over a plain ":")
   const patterns = parsed.filter((p) => !p.negative && (p.matching || p.pattern));
+  const matchings = patterns.filter((p) => p.matching);
+  const matching = matchings.find((p) => p.force) ?? matchings[0];
+  const patternFor = (name: string, side: "src" | "dst") =>
+    patterns.find(
+      (q) => !q.matching && matchSide((side === "src" ? q.src : (q.dst ?? q.src)) ?? "", name),
+    ) ?? matching;
   for (const name of localNames) {
     if (excluded(name)) continue;
-    const p = patterns.find((q) => q.matching || matchSide(q.src ?? "", name));
+    const p = patternFor(name, "src");
     if (!p) continue;
     let remoteRef: string;
     if (p.matching) {
@@ -254,7 +286,7 @@ export async function matchPushRefs(
       if (!name.startsWith("refs/heads/") || !remote.has(name)) continue;
       remoteRef = name;
     } else {
-      remoteRef = expandFromSource(parseRefSpec(p.spec), name).destination ?? name;
+      remoteRef = expandPattern(p.src ?? "", p.dst ?? p.src ?? "", name);
     }
     if (matched.has(remoteRef)) continue;
     link(
@@ -269,17 +301,22 @@ export async function matchPushRefs(
     );
   }
 
-  // --prune: remote refs a pattern's destination covers, whose source is gone here
+  // --prune: remote refs a pattern's destination (its source, without a colon) or ":" covers,
+  // whose source is gone here (git's get_ref_match from the destination side)
   if (options.prune) {
     for (const [name, oid] of remote) {
       if (matched.has(name)) continue;
-      for (const p of patterns) {
-        if (p.matching || !p.dst || !matchSide(p.dst, name)) continue;
-        const src = expandFromDestination(parseRefSpec(p.spec), name).source;
-        if (!src || local.refs.has(src) || excluded(src)) continue;
-        link({ remoteRef: name, newOid: ZERO_OID, oldOid: oid, force: p.force }, false);
-        break;
+      const p = patternFor(name, "dst");
+      if (!p) continue;
+      let src: string;
+      if (p.matching) {
+        if (!name.startsWith("refs/heads/")) continue;
+        src = name;
+      } else {
+        src = expandPattern(p.dst ?? p.src ?? "", p.src ?? "", name);
       }
+      if (local.refs.has(src) || excluded(src)) continue;
+      link({ remoteRef: name, newOid: ZERO_OID, oldOid: oid, force: p.force }, false);
     }
   }
   return [...matched.values()];
@@ -300,11 +337,15 @@ export interface PushObjectSource {
 
 /** A `--force-with-lease` expectation. */
 export interface ForceWithLease {
-  /** The remote ref (a full name, or a short one: `main`) */
-  ref: string;
   /**
-   * The value it must have; {@link ZERO_OID} or "" for "must not exist". Omitted: the remote
-   * ref's remote-tracking value here (see `PushClientOptions.trackingValue`).
+   * The remote ref (a full name, or a short one: `main`). Omitted: every pushed ref no other
+   * entry names, each at its remote-tracking value (a bare `--force-with-lease`).
+   */
+  ref?: string;
+  /**
+   * The value it must have: an object id or any revision here (`main~1`, an abbreviated id);
+   * {@link ZERO_OID} or "" for "must not exist". Omitted: the remote ref's remote-tracking value
+   * here (see `PushClientOptions.trackingValue`).
    */
   expect?: string;
 }
@@ -464,6 +505,14 @@ function parseSpec(spec: string): ParsedPushSpec {
     pattern: srcPattern,
     matching: false,
   };
+}
+
+/** `name` (matching the pattern `from`) mapped onto the pattern `to`. */
+function expandPattern(from: string, to: string, name: string): string {
+  const star = from.indexOf("*");
+  if (star < 0) return to;
+  const middle = name.slice(star, name.length - (from.length - star - 1));
+  return to.replace("*", middle);
 }
 
 /** A pattern side (`refs/heads/*`) or an exact name, against a ref name. */

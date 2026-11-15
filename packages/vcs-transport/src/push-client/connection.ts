@@ -79,12 +79,33 @@ export async function openHttpReceivePackConnection(
   const headers: Record<string, string> = { ...options.headers };
   if (options.auth) headers.Authorization = authorizationHeader(options.auth);
 
+  const { signal } = options;
+  if (signal?.aborted) throw abortError(signal);
   const controller = new AbortController();
-  const onAbort = () => controller.abort(options.signal?.reason);
-  options.signal?.addEventListener("abort", onAbort, { once: true });
-  const idle = new IdleTimer(options.timeout, controller);
+  const onAbort = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const idle = new IdleTimer(options.timeout, () => controller.abort(), signal);
   const wait = <T>(next: () => Promise<T>): Promise<T> => idle.wait(next);
+  try {
+    return await openHttp(options, baseUrl, doFetch, headers, controller, idle, wait, () =>
+      signal?.removeEventListener("abort", onAbort),
+    );
+  } catch (error) {
+    signal?.removeEventListener("abort", onAbort);
+    throw error;
+  }
+}
 
+async function openHttp(
+  options: HttpReceivePackOptions,
+  baseUrl: string,
+  doFetch: (request: Request) => Promise<Response>,
+  headers: Record<string, string>,
+  controller: AbortController,
+  idle: IdleTimer,
+  wait: <T>(next: () => Promise<T>) => Promise<T>,
+  release: () => void,
+): Promise<ReceivePackConnection> {
   const response = await wait(() =>
     doFetch(
       new Request(`${baseUrl}/info/refs?service=git-receive-pack`, {
@@ -121,14 +142,11 @@ export async function openHttpReceivePackConnection(
     extraHaves,
     async send(body) {
       if (answer) throw new Error("A push connection sends one request");
-      // the idle timer is re-armed each time the request reads a chunk: a large pack is not
-      // bounded as a whole, a server that stops reading is
-      const watched = async function* () {
-        for await (const chunk of body()) {
-          idle.touch();
-          yield chunk;
-        }
-      };
+      // the idle timer times the server only: it is paused while the pack is produced here
+      // (listing objects, the delta search) and re-armed each time a chunk waits for the
+      // request to take it, and once the body is sent; a large pack is not bounded as a
+      // whole, a server that stops reading or answering is
+      const watched = () => idle.serverPaced(body());
       const res = await wait(() =>
         fetchWithRequestBody(
           watched,
@@ -155,7 +173,7 @@ export async function openHttpReceivePackConnection(
     },
     async close() {
       await answer?.cancel();
-      options.signal?.removeEventListener("abort", onAbort);
+      release();
     },
   };
 }
@@ -164,6 +182,14 @@ export async function openHttpReceivePackConnection(
 export interface DuplexReceivePackOptions {
   /** Whether {@link ReceivePackConnection.close} also closes the duplex (default false) */
   closeDuplex?: boolean;
+  /**
+   * Bounds each wait for the server, in milliseconds (its advertisement, a write it does not
+   * take, the report's next chunk), not the time the pack takes to produce here; on expiry the
+   * duplex is closed
+   */
+  timeout?: number;
+  /** Aborts the push: the pending wait fails (the duplex is closed with `closeDuplex`) */
+  signal?: AbortSignal;
 }
 
 /**
@@ -178,8 +204,29 @@ export async function openDuplexReceivePackConnection(
   duplex: Duplex,
   options: DuplexReceivePackOptions = {},
 ): Promise<ReceivePackConnection> {
-  const pkts = new PktStream(duplex);
-  const greeting = await readServerGreeting(pkts, await pkts.read());
+  const { signal } = options;
+  if (signal?.aborted) throw abortError(signal);
+  const idle = new IdleTimer(
+    options.timeout,
+    () => {
+      void duplex.close?.();
+    },
+    signal,
+  );
+  const wait = <T>(next: () => Promise<T>): Promise<T> => idle.wait(next);
+  const onAbort = () => {
+    if (options.closeDuplex) void duplex.close?.();
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const release = () => signal?.removeEventListener("abort", onAbort);
+  const pkts = new PktStream(duplex, wait);
+  let greeting: Awaited<ReturnType<typeof readServerGreeting>>;
+  try {
+    greeting = await readServerGreeting(pkts, await pkts.read());
+  } catch (error) {
+    release();
+    throw error;
+  }
   if (greeting.version !== 0) {
     throw new TransportError("receive-pack answered with protocol v2, which has no push");
   }
@@ -194,7 +241,9 @@ export async function openDuplexReceivePackConnection(
     async send(body) {
       if (sent) throw new Error("A push connection sends one request");
       sent = true;
-      for await (const chunk of body()) await duplex.write(chunk);
+      for await (const chunk of idle.serverPaced(body())) {
+        await wait(async () => duplex.write(chunk));
+      }
       return pkts;
     },
     async close() {
@@ -207,9 +256,14 @@ export async function openDuplexReceivePackConnection(
           // the other end is gone already
         }
       }
+      release();
       if (options.closeDuplex) await duplex.close?.();
     },
   };
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new TransportError("Push aborted");
 }
 
 /** The advertised refs without `.have` lines, and the `.have` object ids. */
@@ -240,8 +294,10 @@ async function checkResponse(response: Response, what: string): Promise<void> {
 }
 
 /**
- * An idle timeout: each wait, and each {@link touch}, re-arms it; when it fires the pending
- * wait fails with "Request timeout" and the requests are aborted.
+ * An idle timeout on the server: each wait, and each {@link touch}, re-arms it; {@link pause}
+ * stops it while the client itself is busy. When it fires the pending wait fails with "Request
+ * timeout" and `onExpire` runs (aborting the requests, closing the duplex). An aborted `signal`
+ * fails the pending wait too.
  */
 class IdleTimer {
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -250,7 +306,8 @@ class IdleTimer {
 
   constructor(
     private readonly timeout: number | undefined,
-    private readonly controller: AbortController,
+    private readonly onExpire: () => void,
+    private readonly signal?: AbortSignal,
   ) {}
 
   touch(): void {
@@ -259,24 +316,56 @@ class IdleTimer {
     this.timer = setTimeout(() => {
       this.expired = true;
       this.reject?.(new TransportError("Request timeout"));
-      this.controller.abort();
+      this.onExpire();
     }, this.timeout);
   }
 
+  pause(): void {
+    clearTimeout(this.timer);
+  }
+
+  /**
+   * `chunks` with the timer paused while each is produced here, and re-armed while each waits
+   * for the server to take it (and after the last).
+   */
+  async *serverPaced(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+    const iterator = chunks[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        this.pause();
+        const next = await iterator.next();
+        this.touch();
+        if (next.done) return;
+        yield next.value;
+      }
+    } finally {
+      this.touch();
+      await iterator.return?.();
+    }
+  }
+
   async wait<T>(next: () => Promise<T>): Promise<T> {
-    if (!this.timeout) return next();
-    const timedOut = new Promise<never>((_, reject) => {
+    const { signal } = this;
+    if (!this.timeout && !signal) return next();
+    if (signal?.aborted) throw abortError(signal);
+    let onAbort: (() => void) | undefined;
+    const stopped = new Promise<never>((_, reject) => {
       this.reject = reject;
+      if (signal) {
+        onAbort = () => reject(abortError(signal));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
     });
     this.touch();
     try {
-      return await Promise.race([next(), timedOut]);
+      return await Promise.race([next(), stopped]);
     } catch (error) {
       if (this.expired) throw new TransportError("Request timeout");
       throw error;
     } finally {
       clearTimeout(this.timer);
       this.reject = undefined;
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   }
 }
