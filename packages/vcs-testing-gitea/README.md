@@ -18,14 +18,20 @@ Without `GITEA=1` the oracle tests are skipped: `pnpm test` at the root runs onl
 | Variable | Meaning |
 |---|---|
 | `GITEA=1` | Run the oracle tests (also `true`) |
-| `GITEA_CACHE_DIR` | Where verified binaries are kept, named `gitea-<version>-<platform>`. Default: `<os temp>/webrun-vcs-gitea-cache` |
+| `GITEA_CACHE_DIR` | Where verified binaries are kept, named `gitea-<version>-<platform>`. Default: `$XDG_CACHE_HOME/webrun-vcs-gitea`, else `~/.cache/webrun-vcs-gitea` |
 | `GITEA_BIN` | A local copy of the binary to take instead of downloading. It must still match the pinned SHA-256 |
 
 Binaries are pinned for linux-amd64, linux-arm64 and macOS (amd64, arm64). Only linux-amd64 runs in CI.
 
+### Where the bytes come from
+
+The cache directory must be private: a real directory (not a symlink), owned by the current user and writable by no one else. The helper makes a new one with mode 0700 and refuses any other, so no one can swap the binary between its check and its use. Downloads land in a private temporary directory inside the cache and are renamed into place only once they match. A cached binary that others could write is fetched again.
+
+Gitea never runs from the cache. Each instance copies the binary into its own work directory (mode 0700, made with `mkdtemp`), hashes that copy again and runs it. Its `app.ini` is mode 0600, and its admin password is random, so instances started side by side cannot be mistaken for each other.
+
 ### As root
 
-Gitea refuses to run as root. When the tests run as root (a container, a sandbox), the helper runs Gitea as `nobody` through `runuser`, with its work directory owned by `nobody`. If `nobody` cannot reach the cached binary (a cache under a private directory of root), Gitea runs from a copy in its work directory. Gitea's own root override is not used. As an ordinary user, as in CI, Gitea runs directly.
+Gitea refuses to run as root. When the tests run as root (a container, a sandbox), the helper runs Gitea as `nobody` through `runuser`, with its work directory (still 0700) owned by `nobody`. Gitea's own root override is not used. As an ordinary user, as in CI, Gitea runs directly.
 
 ## Using the helper
 
@@ -45,9 +51,9 @@ execFileSync("git", ["clone", repo.authenticatedUrl, dir]); // native git, with 
 await gitea.stop(); // in afterAll
 ```
 
-`startGitea()` writes an `app.ini` (SQLite, LFS on, offline, no SSH, registration off, a free port on 127.0.0.1) into a fresh temporary work directory, runs `gitea migrate`, creates an admin with `gitea admin user create`, starts `gitea web` in its own process group and waits until `/api/v1/version` answers with the pinned version. It then creates an API token through the API. A start that fails, say because the port was taken in the meantime, is retried on another port, and the error carries the tail of Gitea's log.
+`startGitea()` writes an `app.ini` (SQLite, LFS on, offline, no SSH, registration off, a free port on 127.0.0.1) into a fresh private work directory, runs `gitea migrate`, creates an admin with a random password, starts `gitea web` in its own process group and waits until `/api/v1/version` answers with the pinned version, its process is still alive, and `/api/v1/user` accepts this instance's password. It then creates an API token through the API. A start that fails, say because another server took the port in the meantime and this Gitea could not bind it, is retried on another port (three attempts within 240 s in all, below the tests' 600 s hook timeout together with the 300 s download limit), and the error carries the tail of Gitea's log.
 
-The server gives the admin's `user`, `password`, `token` and `authorization` (`Basic …`), and a `fetch` that adds those credentials when a request has none. `stop()` sends SIGTERM to the process group, SIGKILL after ten seconds, and removes the work directory. A process that exits without stopping its servers kills them on the way out.
+The server gives the admin's `user`, `password`, `token` and `authorization` (`Basic …`), a `fetch` that adds those credentials when a request has none, its `workDir` and its process group `pid`. `stop()` sends SIGTERM to the process group, SIGKILL after ten seconds, and removes the work directory. A process that exits, or is ended by SIGTERM, SIGINT or SIGHUP, without stopping its servers kills their process groups and removes their work directories on the way out, then ends by the same signal. Only a SIGKILL of the test process itself leaves them behind.
 
 The pure pieces (`giteaAppIni`, `giteaCommand`, `giteaRelease`, `giteaOracleEnabled`, `giteaCacheDir`) are exported for tests of their own; `tests/config.test.ts` covers them without a binary.
 
@@ -64,4 +70,6 @@ Two Gitea behaviours shape our client, and the oracle pins both. Gitea's LFS act
 
 ## In CI
 
-`.github/workflows/gitea-oracle.yml` runs the oracle weekly, by hand (`workflow_dispatch`), and on pull requests that change `vcs-transport/src`, `vcs-transport-lfs/src` or this package. The binary is cached with `actions/cache`, keyed by the Gitea version. To move to another Gitea version, update `GITEA_VERSION` and every hash in `src/release.ts` (from the `.sha256` files next to each binary on dl.gitea.com) and the version in the workflow.
+`.github/workflows/gitea-oracle.yml` runs the oracle weekly, by hand (`workflow_dispatch`), and on pull requests that change the sources of `vcs-transport`, `vcs-transport-lfs`, `vcs-core`, `vcs-utils` or `vcs-utils-node`, this package, or the lockfile and workspace file. The binary is kept in `~/.cache/webrun-vcs-gitea` with `actions/cache/restore` and `actions/cache/save`, under a key derived from `src/release.ts`; it is saved even when the tests fail. To move to another Gitea version, update `GITEA_VERSION` and every hash in `src/release.ts` (from the `.sha256` files next to each binary on dl.gitea.com); the cache key follows.
+
+`tests/lifecycle.test.ts` (also behind `GITEA=1`) checks the helper itself: instances started together reject each other's credentials and keep private work directories, a start on a port another Gitea holds retries elsewhere, and a child process ended by SIGTERM or SIGINT leaves no Gitea and no work directory.

@@ -1,8 +1,20 @@
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  chownSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  assertPrivateDir,
+  copyVerified,
   ensureGiteaBinary,
   fileSha256,
   GITEA_VERSION,
@@ -14,6 +26,7 @@ import {
   giteaOracleEnabled,
   giteaPlatform,
   giteaRelease,
+  redactCredentials,
 } from "../src/index.js";
 
 /** No binary needed: the configuration, command lines and checks that a launch is made of. */
@@ -57,10 +70,14 @@ describe("env", () => {
     expect(giteaOracleEnabled({ GITEA: "true" })).toBe(true);
   });
 
-  it("caches under GITEA_CACHE_DIR, else under the temp directory", () => {
-    expect(giteaCacheDir({ GITEA_CACHE_DIR: "/cache/gitea" })).toBe("/cache/gitea");
-    expect(giteaCacheDir({})).toBe(join(tmpdir(), "webrun-vcs-gitea-cache"));
-    expect(giteaCacheDir({ GITEA_CACHE_DIR: " " })).toBe(join(tmpdir(), "webrun-vcs-gitea-cache"));
+  it("caches under GITEA_CACHE_DIR, else in a per-user cache directory (never the shared temp)", () => {
+    expect(giteaCacheDir({ GITEA_CACHE_DIR: "/cache/gitea" }, "/home/u")).toBe("/cache/gitea");
+    expect(giteaCacheDir({}, "/home/u")).toBe("/home/u/.cache/webrun-vcs-gitea");
+    expect(giteaCacheDir({ GITEA_CACHE_DIR: " " }, "/home/u")).toBe(
+      "/home/u/.cache/webrun-vcs-gitea",
+    );
+    expect(giteaCacheDir({ XDG_CACHE_HOME: "/x" }, "/home/u")).toBe("/x/webrun-vcs-gitea");
+    expect(giteaCacheDir({}).startsWith(tmpdir())).toBe(false);
   });
 });
 
@@ -183,5 +200,78 @@ describe("binary checks", () => {
       }),
     ).rejects.toThrow(/cannot obtain Gitea 0\.0\.0: .*SHA-256 [0-9a-f]{64}, expected 0{64}/);
     expect(readdirSync(cacheDir)).toEqual([]);
+  });
+
+  it("makes a new cache directory private (0700)", async () => {
+    const source = fake("abc");
+    const cacheDir = join(tmp(), "new", "cache");
+    await ensureGiteaBinary({
+      release: { ...release, sha256: await fileSha256(source) },
+      cacheDir,
+      source,
+    });
+    expect(statSync(cacheDir).mode & 0o777).toBe(0o700);
+  });
+
+  it("refuses a cache directory others can write, a symlink, or one of another user", async () => {
+    const source = fake("abc");
+    const r = { ...release, sha256: await fileSha256(source) };
+    const shared = join(tmp(), "shared");
+    mkdirSync(shared);
+    chmodSync(shared, 0o777);
+    await expect(ensureGiteaBinary({ release: r, cacheDir: shared, source })).rejects.toThrow(
+      /writable by group or others \(mode 777\)/,
+    );
+    await expect(assertPrivateDir(shared)).rejects.toThrow(/writable by group or others/);
+    const real = join(tmp(), "real");
+    mkdirSync(real, { mode: 0o700 });
+    const link = join(tmp(), "link");
+    symlinkSync(real, link);
+    await expect(ensureGiteaBinary({ release: r, cacheDir: link, source })).rejects.toThrow(
+      /not a directory/,
+    );
+    await expect(assertPrivateDir(real)).resolves.toBeUndefined();
+    if (process.getuid?.() === 0) {
+      const foreign = join(tmp(), "foreign");
+      mkdirSync(foreign, { mode: 0o700 });
+      chownSync(foreign, 65534, 65534);
+      await expect(ensureGiteaBinary({ release: r, cacheDir: foreign, source })).rejects.toThrow(
+        /belongs to uid 65534/,
+      );
+    }
+  });
+
+  it("replaces a cached binary others can write", async () => {
+    const source = fake("abc");
+    const r = { ...release, sha256: await fileSha256(source) };
+    const cacheDir = join(tmp(), "cache");
+    const bin = await ensureGiteaBinary({ release: r, cacheDir, source });
+    chmodSync(bin, 0o777);
+    expect(await ensureGiteaBinary({ release: r, cacheDir, source })).toBe(bin);
+    expect(statSync(bin).mode & 0o777).toBe(0o700);
+  });
+
+  it("copies the binary and hashes the copy: a copy that does not match is removed", async () => {
+    const source = fake("abc");
+    const dir = tmp();
+    await copyVerified(source, join(dir, "ok"), await fileSha256(source));
+    expect(statSync(join(dir, "ok")).mode & 0o777).toBe(0o700);
+    await expect(copyVerified(source, join(dir, "bad"), "0".repeat(64))).rejects.toThrow(
+      /SHA-256 [0-9a-f]{64}, expected 0{64}/,
+    );
+    expect(readdirSync(dir)).toEqual(["ok"]);
+  });
+});
+
+describe("redaction", () => {
+  it("drops credentials from URLs in messages", () => {
+    expect(
+      redactCredentials(
+        "fatal: unable to access 'http://oracle:s3cr3t@127.0.0.1:3000/oracle/r.git/' and https://a:b@x/y",
+      ),
+    ).toBe("fatal: unable to access 'http://***@127.0.0.1:3000/oracle/r.git/' and https://***@x/y");
+    expect(redactCredentials("http://127.0.0.1:3000/oracle/r.git")).toBe(
+      "http://127.0.0.1:3000/oracle/r.git",
+    );
   });
 });

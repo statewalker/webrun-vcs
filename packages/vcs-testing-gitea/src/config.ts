@@ -130,6 +130,11 @@ export function giteaCreateAdminArgs(
   ];
 }
 
+/** Text with every `scheme://user:password@` reduced to `scheme://***@` (for errors and logs). */
+export function redactCredentials(text: string): string {
+  return text.replace(/(\w+:\/\/)[^\s/@]+:[^\s/@]+@/g, "$1***@");
+}
+
 /**
  * The environment Gitea runs in: only its home, work directory and `PATH`,
  * so the caller's `GIT_*`, proxy and Gitea variables do not leak in.

@@ -18,7 +18,7 @@ import {
   type RepositoryFacade,
 } from "@statewalker/vcs-transport";
 import { describe, expect, it } from "vitest";
-import { giteaOracleEnabled } from "../src/index.js";
+import { giteaOracleEnabled, redactCredentials } from "../src/index.js";
 
 /**
  * The oracle's `describe`: skipped unless GITEA=1. With GITEA=1 a Gitea that
@@ -101,7 +101,9 @@ export function nativeGit(env: NodeJS.ProcessEnv, cwd: string, args: string[]): 
     }).toString();
   } catch (e) {
     const err = e as Error & { stderr?: Buffer };
-    throw new Error(`git ${args.join(" ")}: ${err.message}\n${err.stderr?.toString() ?? ""}`);
+    throw new Error(
+      redactCredentials(`git ${args.join(" ")}: ${err.message}\n${err.stderr?.toString() ?? ""}`),
+    );
   }
 }
 

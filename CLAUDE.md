@@ -106,6 +106,7 @@ git push                                        # MANDATORY
 - **Workspace cycles**: `vcs-core` depends on `vcs-utils-node`, and `vcs-testing` on `vcs-core`, so `vcs-utils`/`vcs-utils-node` must not depend on `vcs-testing` (not even as a devDependency): pnpm then builds in the wrong order and CI fails on missing declarations. Put such tests in a store package.
 - **`toEqual` on large byte arrays**: Vitest `toEqual` on `Uint8Array`s of hundreds of KB or more takes seconds and has caused CI timeouts; compare the bytes directly (length plus a loop, or `Buffer.equals` in tests)
 - **Native git in tests**: CI has no `user.name`/`user.email`; pass `GIT_AUTHOR_*`/`GIT_COMMITTER_*` in the env of every git call, and fix both `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` when two repositories must produce the same commit ids
+- **Gitea oracle**: `GITEA=1 pnpm --filter @statewalker/vcs-testing-gitea test` runs a real Gitea (test infra; Node APIs allowed in that package via a biome override)
 
 ## Self-Maintenance
 

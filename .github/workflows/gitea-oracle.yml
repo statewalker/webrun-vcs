@@ -2,9 +2,9 @@ name: Gitea oracle
 
 # Our smart HTTP (vcs-transport) and Git LFS (vcs-transport-lfs) clients against a real Gitea:
 # packages/vcs-testing-gitea downloads the pinned release (checked against its SHA-256) and runs
-# it headless. Weekly, by hand, and on pull requests that touch the transports or the oracle.
-# The binary (~143 MB) is cached by version: bump the key with GITEA_VERSION in
-# packages/vcs-testing-gitea/src/release.ts.
+# it headless. Weekly, by hand, and on pull requests that touch the transports, what they are
+# built on, the dependencies or the oracle. The binary (~143 MB) is cached under a key derived
+# from src/release.ts, which pins the version and its hashes.
 on:
   schedule:
     - cron: "37 3 * * 1"
@@ -13,7 +13,12 @@ on:
     paths:
       - "packages/vcs-transport/src/**"
       - "packages/vcs-transport-lfs/src/**"
+      - "packages/vcs-core/src/**"
+      - "packages/vcs-utils/src/**"
+      - "packages/vcs-utils-node/src/**"
       - "packages/vcs-testing-gitea/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
       - ".github/workflows/gitea-oracle.yml"
 
 permissions:
@@ -22,10 +27,6 @@ permissions:
 concurrency:
   group: gitea-oracle-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  GITEA_VERSION: "1.22.6"
-  GITEA_CACHE_DIR: ${{ github.workspace }}/../gitea-cache
 
 jobs:
   oracle:
@@ -41,10 +42,16 @@ jobs:
           node-version: "24"
           cache: pnpm
 
-      - uses: actions/cache@v6
+      # A per-user cache directory: the helper refuses one others can write.
+      - name: Cache directory
+        run: echo "GITEA_CACHE_DIR=$HOME/.cache/webrun-vcs-gitea" >> "$GITHUB_ENV"
+
+      - name: Restore the Gitea binary
+        id: gitea-cache
+        uses: actions/cache/restore@v6
         with:
-          path: ${{ env.GITEA_CACHE_DIR }}
-          key: gitea-${{ env.GITEA_VERSION }}-linux-amd64
+          path: ~/.cache/webrun-vcs-gitea
+          key: gitea-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/vcs-testing-gitea/src/release.ts') }}
 
       - name: Native git and git-lfs
         run: |
@@ -63,3 +70,20 @@ jobs:
 
       - name: Oracle tests
         run: pnpm --filter @statewalker/vcs-testing-gitea run test:oracle
+
+      # Saved even when the tests fail, so a failing week does not download again;
+      # skipped when the key was restored (a cache entry is immutable) or nothing was fetched.
+      - name: Check for a fetched binary
+        id: fetched
+        if: always() && steps.gitea-cache.outputs.cache-hit != 'true'
+        run: |
+          if ls "$GITEA_CACHE_DIR"/gitea-* >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the Gitea binary
+        if: always() && steps.fetched.outputs.present == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/webrun-vcs-gitea
+          key: ${{ steps.gitea-cache.outputs.cache-primary-key }}
