@@ -24,7 +24,26 @@ export interface RefCommand {
   old?: ObjectId | null;
   new: ObjectId | null;
   noDeref?: boolean;
+  /**
+   * The reflog lines to write for this ref, oldest first, in place of the line the
+   * update would write (git's `ref_transaction_update_reflog`, as `git remote rename`
+   * carries a renamed ref's log over). The log is created whatever the ref's name; a
+   * line without `ident` takes the batch's (or the store's default) identity.
+   *
+   * @example
+   * ```typescript
+   * const line = { oldId: zero, newId: id, ident: "A <a@b> 1700000000 +0000", message: "fetch" };
+   * await refs.batch([
+   *   { name: "refs/remotes/old/main", new: null },
+   *   { name: "refs/remotes/new/main", old: null, new: id, reflog: [line] },
+   * ]);
+   * ```
+   */
+  reflog?: OwnReflogLine[];
 }
+
+/** A reflog line a {@link RefCommand} brings; without `ident`, the batch's identity. */
+export type OwnReflogLine = Omit<ReflogLine, "ident"> & { ident?: string };
 
 /** Why a batch was refused. */
 export type RefRejectReason =
@@ -97,6 +116,8 @@ export interface PlannedRefUpdate {
    * refs the command went through, and HEAD when it points at `name`.
    */
   reflogAlso: string[];
+  /** The command's own reflog lines ({@link RefCommand.reflog}), written instead of the default one. */
+  reflog?: OwnReflogLine[];
 }
 
 export type RefBatchPlan =
@@ -109,6 +130,31 @@ export type RefBatchPlan =
  * follows longer chains on some backends; this is a project limit for updates.
  */
 const MAX_SYMREF_READS = 5;
+
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+/** Control characters (a newline would start a forged reflog line). */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are the point
+const CONTROL = /[\u0000-\u001f\u007f]+/g;
+
+/** An own reflog line has object ids and, if any, an identity of the git shape. */
+function validOwnLine(line: OwnReflogLine): boolean {
+  if (!OBJECT_ID.test(line.oldId) || !OBJECT_ID.test(line.newId)) return false;
+  if (line.ident === undefined) return true;
+  const ident = line.ident.replace(CONTROL, " ").trim();
+  return /^[^<>]*<[^<>]*> \d+ [+-]\d{4}$/.test(ident);
+}
+
+/** Control characters in the identity and message collapse to one space, as git's copy_reflog_msg. */
+function sanitizeOwnLine(line: OwnReflogLine): OwnReflogLine {
+  return {
+    oldId: line.oldId,
+    newId: line.newId,
+    message: line.message.replace(CONTROL, " ").replace(/\s+/g, " ").trim(),
+    ...(line.ident !== undefined
+      ? { ident: line.ident.replace(CONTROL, " ").replace(/ +/g, " ").trim() }
+      : {}),
+  };
+}
 
 /** Names a batch may update: `HEAD`, or a valid name under `refs/`. */
 export function isUpdatableRefName(name: string): boolean {
@@ -146,6 +192,9 @@ export async function planRefBatch(
     if (!isUpdatableRefName(c.name)) early.push({ name: c.name, reason: "invalid-name" });
     else if (seen.has(c.name)) early.push({ name: c.name, reason: "duplicate" });
     else if (c.new === null && c.old === null) {
+      early.push({ name: c.name, reason: "invalid-command" });
+    } else if (c.reflog && (c.new === null || !c.reflog.every(validOwnLine))) {
+      // own reflog lines: on a written ref only, with object ids and an identity
       early.push({ name: c.name, reason: "invalid-command" });
     }
     seen.add(c.name);
@@ -186,7 +235,15 @@ export async function planRefBatch(
     if (headTarget === name && !reflogAlso.includes("HEAD") && name !== "HEAD") {
       reflogAlso.push("HEAD");
     }
-    updates.push({ name, requested: c.name, current, oldValue, newValue: c.new, reflogAlso });
+    updates.push({
+      name,
+      requested: c.name,
+      current,
+      oldValue,
+      newValue: c.new,
+      reflogAlso,
+      ...(c.reflog ? { reflog: c.reflog.map(sanitizeOwnLine) } : {}),
+    });
   }
 
   // Policy: a ref outside refs/ (a detached HEAD) cannot join a multi-ref batch,
@@ -351,7 +408,13 @@ export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = 
       message,
     };
     if (u.newValue === null) writes.push({ op: "drop", name: u.name });
-    else if (line.oldId !== u.newValue)
+    else if (u.reflog) {
+      for (const own of u.reflog) {
+        const ownMessage = own.message.replace(/\s+/g, " ").trim();
+        const ownLine = { ...own, ident: own.ident ?? ident, message: ownMessage };
+        writes.push({ op: "append", name: u.name, line: ownLine, create: true });
+      }
+    } else if (line.oldId !== u.newValue)
       writes.push({
         op: "append",
         name: u.name,

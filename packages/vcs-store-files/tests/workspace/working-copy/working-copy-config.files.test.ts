@@ -535,6 +535,34 @@ describe("GitWorkingCopyConfig", () => {
       expect(reloaded.get("remote.origin.url")).toBe("https://example.com/lower.git");
     });
 
+    it("renameSection renames the header in place, keeping lines and comments (git remote rename)", async () => {
+      files.set(
+        PATH,
+        '[core]\n\tbare = false\n[remote "origin"]\n\t# the main one\n\turl = a\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch "main"]\n\tremote = origin\n',
+      );
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.renameSection("remote.origin", "remote.upstream");
+      config.set("remote.upstream.fetch", "+refs/heads/*:refs/remotes/upstream/*");
+      expect(config.get("remote.origin.url")).toBeUndefined();
+      expect(config.subsections("remote")).toEqual(["upstream"]);
+
+      await config.save();
+      expect(files.text(PATH)).toBe(
+        '[core]\n\tbare = false\n[remote "upstream"]\n\t# the main one\n\turl = a\n\tfetch = +refs/heads/*:refs/remotes/upstream/*\n[branch "main"]\n\tremote = origin\n',
+      );
+    });
+
+    it("renameSection onto a section removed before the save drops the removed one's lines", async () => {
+      files.set(PATH, '[remote "a"]\n\turl = one\n[remote "b"]\n\turl = two\n');
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.unsetSection("remote.b");
+      config.renameSection("remote.a", "remote.b");
+      await config.save();
+      expect(files.text(PATH)).toBe('[remote "b"]\n\turl = one\n');
+    });
+
     it("lists subsections of a section", async () => {
       files.set(
         PATH,

@@ -72,8 +72,16 @@ export interface FetchResult {
   bytesReceived: number;
   /** Whether the remote repository was empty */
   isEmpty: boolean;
-  /** Messages from the remote */
+  /**
+   * Messages as git prints them: the `followRemoteHEAD=warn` warning and its hint lines,
+   * the symbolic refs a prune left dangling
+   */
   messages: string[];
+  /**
+   * What failed without stopping the fetch (a refused prune), where git reports an error
+   * and exits 1; absent when nothing failed
+   */
+  errors?: string[];
   /** Submodule fetch results (if any) */
   submodules?: Map<string, FetchResult>;
 }

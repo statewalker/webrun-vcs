@@ -228,6 +228,58 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   }
 
   /**
+   * Rename a section in place, as git's `git_config_rename_section` (`git remote rename`):
+   * every `[remote "old"]` header becomes `[remote "new"]` where it stands, its variables
+   * and comments kept as they are.
+   *
+   * @param oldSection `section.subsection`, e.g. `remote.origin`
+   * @param newSection the new name, e.g. `remote.upstream`
+   *
+   * @example
+   * ```typescript
+   * config.renameSection("remote.origin", "remote.upstream");
+   * await config.save();
+   * ```
+   */
+  renameSection(oldSection: string, newSection: string): void {
+    const from = canonicalizeSection(oldSection);
+    const to = canonicalizeSection(newSection);
+    if (from === to) return;
+    const renamed = (key: string) => `${to}${key.slice(from.length)}`;
+    if (this.removedSections.delete(to)) {
+      // the lines of a removed section of the new name go now, before ours take its name
+      this.lines = this.lines.filter((line) => sectionOfLine(line) !== to);
+    }
+    for (const key of [...this.values.keys()]) {
+      if (sectionOfKey(key) !== from) continue;
+      const values = this.values.get(key) ?? [];
+      this.values.delete(key);
+      this.unmirror(key);
+      const newKey = renamed(key);
+      const existing = this.values.get(newKey) ?? [];
+      this.values.set(newKey, [...existing, ...values]);
+      this.mirror(newKey);
+      if (this.dirtyKeys.delete(key) || existing.length > 0) this.dirtyKeys.add(newKey);
+    }
+    if (this.removedSections.delete(from)) this.removedSections.add(to);
+    this.lines = this.lines.map((line): ConfigLine => {
+      if (line.kind === "entry" && line.section === from) {
+        return { ...line, section: to, key: renamed(line.key) };
+      }
+      if (line.kind === "section" && line.section === from) {
+        if (line.inlineKey === undefined) {
+          return { kind: "section", section: to, text: formatSectionHeader(to) };
+        }
+        // a variable on the header line is re-emitted after the new header
+        const inlineKey = renamed(line.inlineKey);
+        this.dirtyKeys.add(inlineKey);
+        return { ...line, section: to, inlineKey, text: formatSectionHeader(to) };
+      }
+      return line;
+    });
+  }
+
+  /**
    * List the subsection names present for a section, e.g. the remote names for
    * `subsections("remote")`.
    */

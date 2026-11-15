@@ -418,6 +418,14 @@ export function createFilesRefOps(
         const line = enc.encode(`${old} ${next} ${ident}${message ? `\t${message}` : ""}\n`);
         if (u.newValue === null) {
           if (await files.exists(`logs/${u.name}`)) await removeAndPrune(`logs/${u.name}`);
+        } else if (u.reflog) {
+          // the command's own lines (a renamed ref's log), in place of this update's line
+          for (const own of u.reflog) {
+            const text = normalizeMessage(own.message);
+            const who = own.ident ?? ident;
+            const ownLine = `${own.oldId} ${own.newId} ${who}${text ? `\t${text}` : ""}\n`;
+            await append(u.name, enc.encode(ownLine), true);
+          }
         } else if (old !== u.newValue) {
           await append(u.name, line, o.createReflog === true);
         }

@@ -10,3 +10,4 @@ export {
   type RemoteConfig,
   RemoteConfigStore,
 } from "./remote-config-store.js";
+export { deleteRefs, moveRefs, type RefMove } from "./remote-refs.js";

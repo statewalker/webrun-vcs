@@ -508,6 +508,66 @@ export function createRefBatchTests(
       },
     );
 
+    (multi ? itLog : it.skip)(
+      "a command's own reflog lines replace its line, as git remote rename carries a log over",
+      async () => {
+        await refs.batch([{ name: "refs/remotes/old/main", new: oid(1) }], {
+          ident: IDENT,
+          message: "fetch",
+        });
+        const r = await refs.batch(
+          [
+            { name: "refs/remotes/old/main", old: oid(1), new: null },
+            {
+              name: "refs/remotes/new/main",
+              old: null,
+              new: oid(1),
+              reflog: [
+                { oldId: Z, newId: oid(1), ident: IDENT, message: "fetch" },
+                { oldId: oid(1), newId: oid(1), message: "remote: renamed old to new" },
+              ],
+            },
+          ],
+          { ident: IDENT, message: "ignored" },
+        );
+        expect(r.ok).toBe(true);
+        expect(await logOf("refs/remotes/old/main")).toEqual([]);
+        expect(await logOf("refs/remotes/new/main")).toEqual([
+          `${Z.slice(-4)}>aaa1:fetch`,
+          "aaa1>aaa1:remote: renamed old to new",
+        ]);
+      },
+    );
+
+    itLog("own reflog lines are checked: bad ids and forged identities refused", async () => {
+      const own = (line: { oldId?: string; newId?: string; ident?: string; message?: string }) =>
+        refs.batch([
+          {
+            name: "refs/remotes/new/main",
+            new: oid(1),
+            reflog: [{ oldId: Z, newId: oid(1), message: "m", ...line }],
+          },
+        ]);
+      for (const bad of [
+        { oldId: "not-an-id" },
+        { newId: `${oid(1)}\n` },
+        { ident: `A <a@b> 1700000000 +0000\n${Z} ${oid(2)} X <x@y> 1 +0000` },
+        { ident: "no email at all" },
+      ]) {
+        const r = await own(bad);
+        expect(r.ok).toBe(false);
+        expect(r.rejected[0]?.reason).toBe("invalid-command");
+      }
+      expect(await refs.get("refs/remotes/new/main")).toBeUndefined();
+
+      // control characters in a message collapse to spaces: no line can be forged
+      const r = await own({ ident: IDENT, message: `one\n${Z} ${oid(2)} X\ttwo` });
+      expect(r.ok).toBe(true);
+      expect(await logOf("refs/remotes/new/main")).toEqual([
+        `${Z.slice(-4)}>aaa1:one ${Z} ${oid(2)} X two`,
+      ]);
+    });
+
     /** Three stash entries, as `git stash` writes them: stash@{0} = oid(3). */
     const threeStashes = async () => {
       for (const n of [1, 2, 3]) {
