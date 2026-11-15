@@ -129,7 +129,11 @@ describe("S1/Q1. a nested repository removed again", () => {
     // Bob removes docs/.git: the paths come back
     rmSync(join(db, "docs/.git"), { recursive: true });
     const events: SyncEvent[] = [];
-    const res = await syncWorkspace(b, r(), { onEvent: (e) => events.push(e) });
+    // committing the rejoin conflict (the default stops on it: net-sync-recovery-stop)
+    const res = await syncWorkspace(b, r(), {
+      onEvent: (e) => events.push(e),
+      onConflict: "commit",
+    });
     expect(res.rejoined).toEqual(["docs/a.md", "docs/b.md", "docs/c.md", "docs/d.md", "docs/e.md"]);
     expect(events.find((e) => e.type === "rejoined")).toBeDefined();
     expect(res.conflicts).toEqual(["docs/e.md"]);

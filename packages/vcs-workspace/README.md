@@ -219,13 +219,65 @@ What was left out when the merge stopped stays left out until it ends. The recor
 Two calls end the merge:
 
 - `concludeMerge(ws, { message?, force? })` makes the merge commit from the folder as it is then, with both parents. The next sync pushes it. The call is refused with an `UnresolvedConflictsError` (its `paths` name the files) while a conflicted text file still holds a marker line: a line starting with `<<<<<<<` or `>>>>>>>` and then a space or the line's end. git refuses while the index has unmerged entries; a folder has no index, so the markers are the equivalent. The `=======` line is not checked, since Markdown underlines headings with it. Binary conflicts are not checked: the folder's version is taken, and a `.theirs-<id>` copy still beside it is committed like any other file, so remove it first if you keep ours. A change against a deletion is not checked either: the changed file is in the folder, and it is committed as it is, so delete it first to accept the deletion. A file against a directory is in the folder as the directory, plus the file moved aside, both committed as they are. A conflicted path that was left out of the folder when the merge stopped (ignored, say) never reached the folder, so its markers are looked for in the merge result. The conclude is refused the same way, and the error's `leftOut` names such paths. Abort the merge, stop leaving the path out, and sync again to resolve it in the folder. `force: true` skips the marker check, for files whose content really has such lines. `hasConflictMarkers(bytes)` is exported for your own checks.
-- `abortMerge(ws)` does what `git merge --abort` does. Every path the merge changed gets the branch tip's version back, and files the merge added are removed. Edits made to those paths since the merge started are discarded, as git discards them. Other paths are not touched, so edits made elsewhere during the merge stay, and nothing from before the merge is lost: the merge started from a committed folder. A directory holding files of its own is never removed; such a path is listed in `kept`.
+- `abortMerge(ws, { force? })` does what `git merge --abort` (`git reset --merge`) does. Every path the merge changed gets the branch tip's version back, and files the merge added are removed. Edits made since the stop to conflicted files are discarded, as git discards them. Edits made since the stop to a file that merged cleanly would be discarded too, so the abort is refused instead, as git refuses with "not uptodate". It throws a `MergeAbortRefusedError` whose `paths` name the files, and nothing changes. Keep those edits elsewhere, or pass `force: true` to discard them. Paths the merge did not change are not touched, so edits made there during the merge stay, and nothing from before the merge is lost: the merge started from a committed folder. A directory holding files of its own is never removed; such a path is listed in `kept`.
 
 Both refuse with a `NoMergeInProgressError` when no merge is in progress. A conclude cut short after the branch moved but before the record went leaves nothing stuck: the record is dropped as soon as the branch tip is seen to be that merge commit (both parents match), and the next sync pushes it.
 
 The former behaviour is an option: `onConflict: "commit"`, on `openGitWorkspace` or on one `syncWorkspace` (or `integrateCommit`) call. The merge is then committed with the conflicts in the files, the commit's message lists them, and it is pushed. Every workspace sees the same marked file, and fixing it is an ordinary edit that the next sync carries.
 
-Conflicts that a checkout finds while finishing after a crash (an edit made while the checkout was cut short, below) are not merge conflicts: they are kept in the file and committed in both modes, as before.
+### When recovering conflicts
+
+Two steps that recover from an earlier round can also meet your edits, and by default they stop the same way:
+
+- **Finishing a checkout that was cut short** (below) finds a file you edited in the meantime, before the checkout reached it. Your edit is the folder's side and the checkout's target is the other.
+- **Bringing back a path that was left out** (a nested repository's `.git` removed, `ignore` changed; see [Coming back](#what-the-folder-cannot-hold-stays-in-history)) finds it changed both in the folder and on the branch. The folder's copy is one side and the branch's version is the other.
+
+```typescript
+const result = await syncWorkspace(ws, remote);
+if (result.integration === "conflicted" && result.merge?.kind === "recovery") {
+  // the folder holds the checkout's target, merged with your edits (markers in c.txt)
+  await concludeMerge(ws); // after resolving: the merge of your edits and the target
+  await syncWorkspace(ws, remote); // pushes it
+}
+```
+
+With `onConflict: "stop"` (the default), the result is written into the folder as before: markers for text, the other side beside binary files and directories, a file you removed brought back. Then the step stops like a merge:
+
+- Nothing of the result is committed or pushed. The merge record (`refs/workspace/merge/main`) holds the result, the conflicted paths and what was left out at that moment, and `result.merge.kind` says which step stopped (`"recovery"` or `"rejoin"`; a merge with the remote is `"merge"`).
+- The sync returns `integration: "conflicted"`. Later syncs fetch, merge and push nothing and return the same result, `commitWorkspaceChanges` commits nothing, and `integrateCommit` refuses, until `concludeMerge` or `abortMerge`. `concludeMerge` checks the markers as for any merge, including those in frozen left-out paths, and `force` skips the check.
+
+The two sides are recorded as commits, so that concluding makes an ordinary merge commit and aborting loses nothing:
+
+- **Recovery.** Your edits become a commit of their own, on the commit the checkout started from. It holds your version of each conflicted path, and any edit you made to a file after the checkout had written it. This is what the sync would have committed had you saved before it started, as `git commit` before `git pull`. The branch moves to that commit, and it is `merge.head`. The checkout's target is `merge.theirs`. Nothing of the target is committed. `concludeMerge` makes the merge commit of the two.
+- **Recovery of a first checkout.** If nothing was committed before the checkout (a new workspace's first sync), there is nothing to commit your edits on, and merging them as a history of their own would push unrelated histories. Instead, the branch takes the target, which is `merge.head`, and your edits become a commit on it, `merge.theirs`. `concludeMerge` commits the resolution on the target, with one parent.
+- **Rejoin.** The branch does not move, and it is `merge.head`. The folder's copies of the conflicted paths become a commit on the branch tip, `merge.theirs`. `concludeMerge` makes the merge commit of the two. The paths' records stay in `refs/workspace/skip/main` until the merge ends.
+
+`abortMerge` gives the folder its own version back, never the incoming one, and keeps the incoming one in history for the next sync:
+
+- **Recovery.** Every path gets the version in your edits' commit. Conflicted paths get your version back, and other paths the checkout wrote go back to where the checkout started, so the checkout is undone. An edit you made to a file the checkout had already written is in that commit, so it stays. The branch stays on your edits' commit, and the target is not taken. The remote's commits are still in `refs/remotes/origin/main`, and the next sync merges them again, as a plain merge with the remote. While both sides still differ there, that merge stops again, as `git pull` after `git merge --abort` would.
+- **Recovery of a first checkout.** Every path gets the version in your edits' commit: your files come back, and the target's elsewhere. The branch stays on the target, so the next sync commits your files on top of it as edits and pushes them. To keep the target's version of a file too, resolve and conclude instead.
+- **Rejoin.** Every conflicted path gets the folder's copy back, and copies put beside files are removed. The branch does not move. The paths stay recorded as left out, with the version the folder last held, so the next commit brings them back again and stops again while both sides still differ. To end that loop, resolve and conclude, leave the path out again (put the `.git` back, or ignore it), or sync once with `onConflict: "commit"`. A held file that you named in `include` goes back to being held.
+
+Every path the stop changed gets that version back, including the paths that merged cleanly. A recovery abort therefore undoes every file the checkout wrote, not only the conflicted ones. As with any merge, edits made since the stop to conflicted files are discarded. An abort that would discard edits made since the stop to a file that merged cleanly is refused with a `MergeAbortRefusedError`, unless you pass `force: true`. Paths the stop did not change are not touched.
+
+A file back from being ignored is held before a cut-short checkout is finished. That covers a local `.env` that `ignore` no longer names, even when the target adds the same path. The finish never writes over it and never takes it for one of your edits. It is not in your edits' commit, and a stop freezes it as left out, so `concludeMerge` does not commit it. The target's version, if any, stays in history.
+
+Some loops are worth knowing about:
+
+- **The checkout keeps failing.** Say a submodule's checkout stands where the target has a file, or a directory with your own files where it has a file. A recovery abort undoes the checkout, but the next sync tries the same checkout, meets the same path, and stops again. Aborting does not help there. To get out:
+  - conclude, keeping the target's file beside yours (`<path>.theirs-<id>`);
+  - move your directory away first;
+  - or sync once with `onConflict: "commit"`.
+
+  Such a path is still named in `conflicts`, and also in `merge.kept`: a directory kept where the other side has a file, with nothing to resolve in it. The merge commit's message marks it `(directory kept)`. When every conflict is of that kind, `merge.hint` lists these ways out. This covers a nested repository's own root too, although its contents stay left out.
+- **A rejoin conflict with nothing to resolve in the file.** Your change can meet the branch's deletion, or a directory of yours can stand where the branch has a file. The folder already holds your side, with no markers, and the branch's file is beside it when there is one. Concluding takes the folder as it is: delete the file first to accept the deletion. Aborting changes nothing in the folder, and the next commit stops on the same path again.
+
+The stop is written ahead:
+
+- **Recovery.** The plan is stored as before. The merge record is set, marked as being written, before the first folder write that follows a conflict, and it takes over from `refs/workspace/pending/main`. A write cut short is finished from the same plan by the next commit, sync, conclude or abort, after a restart too, and the files never get their markers twice. Once the record is marked stopped, the branch moves to your edits' commit and the plan goes. A crash between those two is finished by the next call. The decision to stop is kept: a workspace reopened with `onConflict: "commit"` still finishes a recovery stop that was already being written as a stop.
+- **Rejoin.** Each path's decision is recorded before it is written, as before, and marked as written once the folder holds it. A crash before the merge record is stored is resumed by the next commit, which stops without merging the path again. A conclude cut short after the branch moved also drops the paths' records, once the merge commit is seen.
+
+`onConflict: "commit"`, on `openGitWorkspace`, on one `syncWorkspace` call or on `commitWorkspaceChanges`, keeps the former behaviour. The result is committed with the conflicts in the files, on top of the target (recovery) or the branch (rejoin), and pushed.
 
 ### What the folder cannot hold stays in history
 
@@ -256,7 +308,7 @@ Conflicts that a checkout finds while finishing after a crash (an edit made whil
   When the path comes back, it is merged three ways: that recorded version, the folder's copy and the branch's.
   - Unchanged in the folder: it gets the branch's version (a remote edit arrives, a remote addition is written, a remote deletion is applied).
   - Changed only in the folder: it is kept and committed.
-  - Changed on both sides: it is merged with git's markers (text), or kept with the branch's version beside it (binary), and reported.
+  - Changed on both sides: it is merged with git's markers (text), or kept with the branch's version beside it (binary), and reported. By default this stops like a merge, with nothing committed (see [When recovering conflicts](#when-recovering-conflicts)).
 
   The paths are listed in `result.rejoined` and a `rejoined` event. A nested repository's removal is therefore never pushed as the deletion of its files.
 
@@ -283,7 +335,7 @@ A checkout cut short, by a full disk for example, is finished at the start of th
 
 - a file still at the old content gets the new one;
 - a file already written stays;
-- a file edited meanwhile keeps the edit, merged with the new content: markers for text, the new version beside it for binary content.
+- a file edited meanwhile keeps the edit, merged with the new content: markers for text, the new version beside it for binary content. By default the finish then stops like a merge, and nothing of the target is committed (see [When recovering conflicts](#when-recovering-conflicts)).
 
 Each retry then follows the stored plan, so a merged file is never merged again, and a failing retry changes nothing it already did. The plan also records which paths are done. A file the checkout had already written and the user changed afterwards, a hand-resolved conflict for one, is the user's edit: it stays as it is and is committed on top. A file changed before the checkout reached it is kept like an edit found when the plan was made: merged or moved aside, the plan updated first, the path reported. Nothing the finish refuses is dropped. A path it cannot bring to the plan stops it with the branch unmoved, and the branch moves to the target only when every path is done. A half-written folder is never committed as local edits.
 
