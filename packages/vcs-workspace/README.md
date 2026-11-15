@@ -202,7 +202,7 @@ const overMesh = httpRemote({ url: "http://hub.mesh/notes.git", fetchImpl: meshR
   - a directory spelled two ways (`Docs/`, `docs/`) is renamed to its first spelling;
   - two files that would be one are kept apart by moving one aside as `<path>.case-<id>`.
 
-  Both changes go in a commit on top and are reported as conflicts.
+  Both changes go in a commit on top and are reported as conflicts. Names are only changed when they collide after folding, and every change is reported. NTFS folds case but not Unicode normalisation, so there two spellings that differ only in NFC/NFD form are merged although the filesystem would keep them apart.
 - **Reserved names.** Files whose names start with `.vcs-sync-tmp-` are reserved for the checkout's temporary files, and they are never committed. Temporary files a crash left behind are removed at the next commit or sync once they are older than ten minutes. Only names of the exact form a checkout writes (`.vcs-sync-tmp-<time>-<counter>-<random>`) are removed; any other file with the prefix is left alone.
 
 ### Why a failure leaves nothing half-done
