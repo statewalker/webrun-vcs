@@ -34,6 +34,7 @@
 import { EMPTY_BLOB_ID, FileMode } from "@statewalker/vcs-core";
 import {
   DeleteStagingEntry,
+  entryStatOf,
   modeFromWorktree,
   UpdateStagingEntry,
   type Worktree,
@@ -466,12 +467,7 @@ export class AddCommand extends GitCommand<AddResult> {
       // Add to staging, with the mode git's ce_mode_from_stat would record
       const indexMode = (await this.staging.getEntry(file.path))?.mode;
       const mode = modeFromWorktree(stored.entry.mode, indexMode, trust);
-      editor.add(
-        new UpdateStagingEntry(file.path, stored.id, mode, {
-          size: stored.entry.size,
-          mtime: stored.entry.mtime,
-        }),
-      );
+      editor.add(new UpdateStagingEntry(file.path, stored.id, mode, entryStatOf(stored.entry)));
       added.push(file.path);
     }
 

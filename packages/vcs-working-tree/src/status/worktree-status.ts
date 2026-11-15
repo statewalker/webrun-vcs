@@ -149,7 +149,8 @@ export async function compareWithWorktree(
     ms(entry.mtime) !== 0 &&
     current.size === entry.size &&
     sameTime(entry.mtime, entry.mtimeNs, current.mtime, current.mtimeNs) &&
-    (entry.ctime === undefined ||
+    (trust.ctime === false ||
+      entry.ctime === undefined ||
       current.ctime === undefined ||
       sameTime(entry.ctime, entry.ctimeNs, current.ctime, current.ctimeNs));
   // racy git: an entry not older than the index file may hide a same-size change

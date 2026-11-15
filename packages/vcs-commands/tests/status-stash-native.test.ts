@@ -1710,3 +1710,164 @@ describeGit("clean, racy smudging and submodules against native git (review roun
     });
   });
 });
+
+/**
+ * Time precision as native git has it (checked by hand on git 2.43 and 2.56): the index
+ * records a file's exact nanoseconds, stat times are compared in whole seconds, and an entry
+ * whose mtime second is not older than the index file's second is re-checked (racy git).
+ * Each case runs native git and ours on separate copies, since both write refreshed stats
+ * back into the index.
+ */
+const gnuTouch = (() => {
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "touch-probe-"));
+    const file = join(dir, "f");
+    writeFileSync(file, "");
+    execFileSync("touch", ["-d", "@1700000000.123456789", file]);
+    const ok = lstatSync(file, { bigint: true }).mtimeNs === 1_700_000_000_123_456_789n;
+    rmSync(dir, { recursive: true, force: true });
+    return ok;
+  } catch {
+    return false;
+  }
+})();
+const describeTimes = nativeGitAvailable() && gnuTouch ? describe : describe.skip;
+
+describeTimes("stat time precision as native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-times-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** Sets a file's mtime to exact seconds and nanoseconds. */
+  const touchAt = (path: string, seconds: number, nanos: number) =>
+    execFileSync("touch", ["-d", `@${seconds}.${String(nanos).padStart(9, "0")}`, path]);
+
+  /** A repository with a.txt ("ab\n") at mtime `seconds`.723999977, ctime ignored. */
+  function timedRepo(dir: string, seconds: number): void {
+    mkdirSync(dir, { recursive: true });
+    run(dir, "init", "-q", "-b", "main");
+    run(dir, "config", "core.trustctime", "false");
+    put(dir, "a.txt", "ab\n");
+    touchAt(join(dir, "a.txt"), seconds, 723_999_977);
+  }
+
+  /**
+   * Builds the same repository twice with `setup` (a copy would change inodes and lose
+   * nanoseconds, both of which git compares), then takes native `git status --porcelain` in
+   * one and ours, with what it hashed, in the other.
+   */
+  async function bothStatus(setup: (dir: string) => void) {
+    const nativeDir = join(root, "native");
+    const oursDir = join(root, "ours");
+    setup(nativeDir);
+    setup(oursDir);
+    const native = exec(nativeDir, "status", "--porcelain");
+    const { ours, worktree } = await open(oursDir);
+    const hash = vi.spyOn(worktree, "computeHash");
+    const status = await ours.status().call();
+    return {
+      native,
+      ours: formatStatusPorcelain(status, 1),
+      hashed: hash.mock.calls.map((c) => c[0]),
+    };
+  }
+
+  it("records the file's exact nanoseconds, as native git", async () => {
+    const seconds = Math.floor(Date.now() / 1000) - 1000;
+    const nativeDir = join(root, "native");
+    const oursDir = join(root, "ours");
+    timedRepo(nativeDir, seconds);
+    timedRepo(oursDir, seconds);
+    run(nativeDir, "add", "a.txt");
+    const { ours } = await open(oursDir);
+    await ours.add().addFilepattern("a.txt").call();
+    const mtime = (d: string) =>
+      run(d, "ls-files", "--debug", "a.txt")
+        .split("\n")
+        .find((l) => l.trim().startsWith("mtime:"))
+        ?.trim();
+    expect(mtime(nativeDir)).toBe(`mtime: ${seconds}:723999977`);
+    expect(mtime(oursDir)).toBe(mtime(nativeDir));
+  });
+
+  it("ignores a change of only the nanoseconds within the same second", async () => {
+    const seconds = Math.floor(Date.now() / 1000) - 1000;
+    const { native, ours, hashed } = await bothStatus((dir) => {
+      timedRepo(dir, seconds);
+      run(dir, "add", "a.txt");
+      run(dir, "commit", "-qm", "c");
+      touchAt(join(dir, "a.txt"), seconds, 123_456_789);
+      expect(run(dir, "diff-files", "--name-only")).toBe("");
+    });
+    expect(native).toBe("");
+    expect(ours).toBe(native);
+    expect(hashed).toEqual([]);
+  });
+
+  it("re-checks a file whose whole second changed, and finds it clean", async () => {
+    const seconds = Math.floor(Date.now() / 1000) - 1000;
+    const { native, ours, hashed } = await bothStatus((dir) => {
+      timedRepo(dir, seconds);
+      run(dir, "add", "a.txt");
+      run(dir, "commit", "-qm", "c");
+      touchAt(join(dir, "a.txt"), seconds + 1, 123_456_789);
+      expect(run(dir, "diff-files", "--name-only")).toBe("a.txt");
+    });
+    expect(native).toBe("");
+    expect(ours).toBe(native);
+    expect(hashed).toEqual(["a.txt"]);
+  });
+
+  it("catches a same-size edit when the index was written in the file's second (racy git)", async () => {
+    // a second in the future, so the index file can be stamped in it after the add
+    const seconds = Math.floor(Date.now() / 1000) + 100;
+    const { native, ours } = await bothStatus((dir) => {
+      timedRepo(dir, seconds);
+      touchAt(join(dir, "a.txt"), seconds, 100_000_000);
+      run(dir, "add", "a.txt");
+      touchAt(join(dir, ".git/index"), seconds, 900_000_000);
+      writeFileSync(join(dir, "a.txt"), "cd\n");
+      touchAt(join(dir, "a.txt"), seconds, 100_000_000);
+    });
+    expect(native).toBe("AM a.txt\n");
+    expect(ours).toBe(native);
+  });
+
+  it("compares ctime in whole seconds unless core.trustctime is false, as native git", async () => {
+    const seconds = Math.floor(Date.now() / 1000) - 1000;
+    for (const trustCtime of [true, false]) {
+      rmSync(join(root, "native"), { recursive: true, force: true });
+      rmSync(join(root, "ours"), { recursive: true, force: true });
+      const { native, ours } = await bothStatus((dir) => {
+        timedRepo(dir, seconds);
+        run(dir, "config", "core.trustctime", String(trustCtime));
+        run(dir, "add", "a.txt");
+        // the same size and mtime, but a ctime at least one second later
+        const added = lstatSync(join(dir, "a.txt"), { bigint: true }).ctimeNs / 1_000_000_000n;
+        while (BigInt(Math.floor(Date.now() / 1000)) <= added) execFileSync("sleep", ["0.05"]);
+        writeFileSync(join(dir, "a.txt"), "cd\n");
+        touchAt(join(dir, "a.txt"), seconds, 723_999_977);
+      });
+      expect(native, `core.trustctime=${trustCtime}`).toBe(
+        trustCtime ? "AM a.txt\n" : "A  a.txt\n",
+      );
+      expect(ours, `core.trustctime=${trustCtime}`).toBe(native);
+    }
+  });
+
+  it("trusts the stat when the index was written a second later, as native git", async () => {
+    const seconds = Math.floor(Date.now() / 1000) + 100;
+    const { native, ours } = await bothStatus((dir) => {
+      timedRepo(dir, seconds);
+      touchAt(join(dir, "a.txt"), seconds, 100_000_000);
+      run(dir, "add", "a.txt");
+      touchAt(join(dir, ".git/index"), seconds + 1, 500_000_000);
+      writeFileSync(join(dir, "a.txt"), "cd\n");
+      touchAt(join(dir, "a.txt"), seconds, 100_000_000);
+    });
+    // the edit hides behind a matching stat in both: git's documented racy-git limit
+    expect(native).toBe("A  a.txt\n");
+    expect(ours).toBe(native);
+  });
+});

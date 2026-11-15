@@ -5,7 +5,7 @@ import {
   type RefspecResolver,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import { entryStatOf, type Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CloneCheckoutError,
@@ -699,9 +699,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
           path,
           objectId,
           mode,
-          size: stats.size,
-          mtime: stats.mtime,
-          ...(stats.ctime !== undefined ? { ctime: stats.ctime } : {}),
+          ...entryStatOf(stats),
         });
       }
     }

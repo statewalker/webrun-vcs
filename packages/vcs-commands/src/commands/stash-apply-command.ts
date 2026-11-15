@@ -1,6 +1,6 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { mergeLines } from "@statewalker/vcs-utils";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import { entryStatOf, type Worktree } from "@statewalker/vcs-working-tree";
 import {
   InvalidArgumentError,
   NoHeadError,
@@ -453,9 +453,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         objectId: entry.objectId,
         mode: entry.mode,
         stage: stageNumber,
-        size: stats?.size ?? 0,
-        mtime: stats?.mtime ?? 0,
-        ...(stats?.ctime !== undefined ? { ctime: stats.ctime } : {}),
+        ...entryStatOf(stats ?? {}),
       });
     };
     if (conflicts.size > 0) {

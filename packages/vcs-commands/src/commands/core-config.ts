@@ -28,5 +28,10 @@ export function worktreeModeTrust(workingCopy: WorkingCopy, worktree: Worktree):
     executable:
       worktree.capabilities?.executable !== false && coreBool(workingCopy, "filemode", true),
     symlinks: worktree.capabilities?.symlinks !== false && coreBool(workingCopy, "symlinks", true),
+    // git compares ctime unless core.trustctime is false or core.checkStat is minimal
+    ctime:
+      coreBool(workingCopy, "trustctime", true) &&
+      RemoteConfigStore.from(workingCopy).value("core.checkStat")?.trim().toLowerCase() !==
+        "minimal",
   };
 }

@@ -12,6 +12,7 @@
 import { type Blobs, EMPTY_BLOB_ID, FileMode } from "@statewalker/vcs-core";
 import {
   DeleteStagingEntry,
+  entryStatOf,
   type Staging,
   UpdateStagingEntry,
   type Worktree,
@@ -233,10 +234,7 @@ export class AddCommand implements Add {
 
       // Add to staging
       editor.add(
-        new UpdateStagingEntry(file.path, stored.id, stored.entry.mode, {
-          size: stored.entry.size,
-          mtime: stored.entry.mtime,
-        }),
+        new UpdateStagingEntry(file.path, stored.id, stored.entry.mode, entryStatOf(stored.entry)),
       );
       added.push(file.path);
     }
