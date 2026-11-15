@@ -9,8 +9,9 @@
  *   readers), then the whole batch lands in packed-refs with one rename.
  *
  * A crash at any point leaves every ref at its old or its new value once stale
- * locks are removed. Reflog lines are written in git's format after the
- * decision (best effort: a failed log line never fails a committed batch).
+ * locks are removed. Reflog lines are written in git's format under the ref
+ * locks, before the commit: as in git, a line that cannot be written fails the
+ * update with the refs unchanged (only a delete's log removal is best effort).
  *
  * Every rewrite of packed-refs (batches, pack-refs, the packed-refs writers)
  * follows git's packed-refs protocol (refs/packed-backend.c): take
@@ -28,16 +29,20 @@ import type {
   PlannedRefUpdate,
   Ref,
   RefCommand,
+  ReflogDeleteOptions,
   RefRejection,
   SymbolicRef,
 } from "@statewalker/vcs-core";
 import {
   compareRefNames,
+  deleteReflogLine,
   isUpdatableRefName,
   planRefBatch,
+  ReflogEntryNotFoundError,
   RefStorage,
 } from "@statewalker/vcs-core";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
+import { parseReflogLine } from "./reflog-reader.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -187,6 +192,15 @@ export interface FilesRefOps {
    * held, `PackedRefsLockedError` if `packed-refs.lock` does, with nothing changed.
    */
   removeRef(name: string): Promise<boolean>;
+  /**
+   * Delete reflog entry `name@{index}` as git's files_reflog_expire does for `git reflog
+   * delete`: under `<name>.lock` and `logs/<name>.lock`, the kept lines are written into
+   * the log's lock and renamed over the log; with `updateRef` the newest kept value is
+   * then committed from the ref's lock. Returns how many entries are kept. Throws
+   * `ReflogEntryNotFoundError` without such an entry, `RefUpdateRejectedError` when a
+   * lock stays held, with nothing changed.
+   */
+  deleteReflogEntry(name: string, index: number, options?: ReflogDeleteOptions): Promise<number>;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -370,22 +384,30 @@ export function createFilesRefOps(
   }
   /**
    * Reflog lines in git's format, after the decision (best effort, as git and JGit).
-   * As git: a log is created as `logAllRefUpdates` says (`autocreateReflog`), and
-   * appended to whenever it exists.
+   * As git: a log is created as `logAllRefUpdates` says (`autocreateReflog`) or when
+   * the batch asks for it (`createReflog`), and appended to whenever it exists. Called
+   * while the updated refs' locks (and HEAD's, when it records the update) are held,
+   * so no other writer appends between our read of the value and our line.
    * The updated ref gets no line for a no-op and loses its log on delete; the
    * refs that record the update too (`reflogAlso`, HEAD among them) always get one.
+   *
+   * With `strict` (every write that is still to be committed), a line that cannot be
+   * written fails the update, as git's files backend refuses to commit a ref whose log
+   * write failed: the caller has not renamed any lock yet, so the refs keep their values.
+   * After a commit (deletes), log writes are best effort.
    */
   async function writeLogs(
     updates: Update[],
     current: (u: Update) => ObjectId | undefined,
     o: BatchOptions,
+    strict = false,
   ): Promise<void> {
     const ident =
       o.ident ?? `${identity.name} <${identity.email}> ${Math.floor(Date.now() / 1000)} +0000`;
     const message = normalizeMessage(o.message);
-    const append = async (name: string, line: Uint8Array) => {
+    const append = async (name: string, line: Uint8Array, force = false) => {
       const path = `logs/${name}`;
-      if (!autocreateReflog(name) && !(await files.exists(path))) return;
+      if (!force && !autocreateReflog(name) && !(await files.exists(path))) return;
       await files.removeEmptyDir(path);
       await files.append(path, line);
     };
@@ -397,11 +419,15 @@ export function createFilesRefOps(
         if (u.newValue === null) {
           if (await files.exists(`logs/${u.name}`)) await removeAndPrune(`logs/${u.name}`);
         } else if (old !== u.newValue) {
-          await append(u.name, line);
+          await append(u.name, line, o.createReflog === true);
         }
         for (const n of u.reflogAlso) await append(n, line);
-      } catch {
-        // as git and JGit: the ref update stands without its reflog line
+      } catch (error) {
+        if (strict) {
+          const why = error instanceof Error ? error.message : String(error);
+          throw new Error(`Unable to write the reflog of ${u.name}: ${why}`, { cause: error });
+        }
+        // after the commit: the ref update stands without its reflog line
       }
     }
   }
@@ -454,11 +480,14 @@ export function createFilesRefOps(
 
   async function single(u: Update, o: BatchOptions): Promise<BatchResult> {
     const content = u.newValue === null ? new Uint8Array(0) : enc.encode(`${u.newValue}\n`);
-    const extra = u.reflogAlso.includes("HEAD") && u.name !== "HEAD" ? ["HEAD"] : [];
+    // The refs that log this update too (HEAD, symbolic refs on the way) are locked as
+    // git locks them (REF_LOG_ONLY updates), so their log lines are appended under a lock.
+    const extra = [...new Set(u.reflogAlso)].filter((n) => n !== u.name);
     const held: string[] = [];
     let ours = true;
     try {
-      for (const n of [...extra, u.name]) {
+      // the ref itself first, then the refs that only log the update, as git orders them
+      for (const n of [u.name, ...extra]) {
         const r = await lock(n, refLockTimeout, n === u.name ? content : new Uint8Array(0));
         if (r !== "ok") {
           const name = n === u.name ? u.requested : n;
@@ -484,7 +513,8 @@ export function createFilesRefOps(
         }
         await writeLogs([u], () => curId, o);
       } else {
-        await writeLogs([u], () => curId, o); // under the ref lock, before the rename (as git)
+        // under the ref lock, before the rename (as git); a failed line fails the update
+        await writeLogs([u], () => curId, o, true);
         if (!(await commit(u.name))) return fail([{ name: u.requested, reason: "df-conflict" }]);
         ours = false;
       }
@@ -516,7 +546,7 @@ export function createFilesRefOps(
   }
 
   async function multi(updates: Update[], o: BatchOptions): Promise<BatchResult> {
-    const extra = updates.some((u) => u.reflogAlso.includes("HEAD")) ? ["HEAD"] : [];
+    const extra = updates.flatMap((u) => u.reflogAlso);
     const names = [...new Set([...extra, ...updates.map((u) => u.name)])].sort(compareRefNames);
     const held: string[] = [];
     let packedHeld = false;
@@ -561,6 +591,15 @@ export function createFilesRefOps(
         await commitPacked(serializePacked(packed));
         for (const n of loose.keys()) await removeAndPrune(n);
       }
+      // The log lines of the refs still to be committed, before the commit: a line that
+      // cannot be written fails the batch with every ref unchanged (as git).
+      const at = (u: Update) => current.get(u.name);
+      await writeLogs(
+        updates.filter((u) => u.newValue !== null),
+        at,
+        o,
+        true,
+      );
       // Phase 2: the whole batch in one rename.
       for (const u of updates) {
         if (u.newValue === null) packed.delete(u.name);
@@ -569,7 +608,11 @@ export function createFilesRefOps(
       await commitPacked(serializePacked(packed));
       await files.remove(`${PACKED}.lock`);
       packedHeld = false;
-      await writeLogs(updates, (u) => current.get(u.name), o);
+      await writeLogs(
+        updates.filter((u) => u.newValue === null),
+        at,
+        o,
+      );
       return { ok: true, rejected: [] };
     } finally {
       if (packedHeld) await files.remove(`${PACKED}.lock`).catch(() => false);
@@ -722,5 +765,70 @@ export function createFilesRefOps(
     }
   }
 
-  return { batch, updatePackedRefs, packRefs, sweepTemporaries, writeLoose, removeRef };
+  async function deleteReflogEntry(
+    name: string,
+    index: number,
+    o: ReflogDeleteOptions = {},
+  ): Promise<number> {
+    const log = `logs/${name}`;
+    const r = await lock(name, refLockTimeout);
+    if (r !== "ok") {
+      throw new RefUpdateRejectedError([{ name, reason: r === "held" ? "locked" : "df-conflict" }]);
+    }
+    let refLockOurs = true;
+    let logLockHeld = false;
+    try {
+      // no log, no entry: refused before logs/<name>.lock (and its directories) exist
+      if (!(await files.exists(log))) throw new ReflogEntryNotFoundError(name, index);
+      const lr = await lock(log, refLockTimeout);
+      if (lr !== "ok") {
+        throw new RefUpdateRejectedError([
+          { name: log, reason: lr === "held" ? "locked" : "df-conflict" },
+        ]);
+      }
+      logLockHeld = true;
+      const text = (await readText(log)) ?? "";
+      // Entries are the lines the reader accepts (parseReflogLine), so `index` names the
+      // entry `name@{index}` lists; lines it rejects are dropped, as git's expire does.
+      const lines = text
+        .split("\n")
+        .filter((l) => l !== "" && parseReflogLine(l) !== undefined)
+        .map((l) => ({ oldId: l.slice(0, 40), newId: l.slice(41, 81), rest: l.slice(81) }));
+      const kept = deleteReflogLine(lines, index, o.rewrite);
+      if (!kept) throw new ReflogEntryNotFoundError(name, index);
+      const out = kept.map((l) => `${l.oldId} ${l.newId}${l.rest}\n`).join("");
+      await files.write(`${log}.lock`, enc.encode(out)); // ours: we hold the lock
+      // git: the ref is updated only when an entry is kept and the ref is not symbolic
+      const top = kept.at(-1);
+      let updateRef = false;
+      if (o.updateRef && top) {
+        const current = await readLoose(name).catch(() => undefined);
+        if (!current || !("target" in current)) {
+          await files.write(`${name}.lock`, enc.encode(`${top.newId}\n`));
+          updateRef = true;
+        }
+      }
+      await files.replace(`${log}.lock`, log);
+      logLockHeld = false;
+      if (updateRef) {
+        if (!(await commit(name)))
+          throw new RefUpdateRejectedError([{ name, reason: "df-conflict" }]);
+        refLockOurs = false;
+      }
+      return kept.length;
+    } finally {
+      if (logLockHeld) await files.remove(`${log}.lock`).catch(() => false);
+      if (refLockOurs) await unlock(name);
+    }
+  }
+
+  return {
+    batch,
+    updatePackedRefs,
+    packRefs,
+    sweepTemporaries,
+    writeLoose,
+    removeRef,
+    deleteReflogEntry,
+  };
 }

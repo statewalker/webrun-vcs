@@ -65,6 +65,12 @@ export interface BatchOptions {
   /** git identity with time: "Name <email> 1700000000 +0000". */
   ident?: string;
   message?: string;
+  /**
+   * Create the reflog of every updated ref, even one the store would not log by
+   * default (git's REF_FORCE_CREATE_REFLOG: `git stash` logs `refs/stash` this way,
+   * and `git update-ref --create-reflog`). An existing reflog is appended to anyway.
+   */
+  createReflog?: boolean;
 }
 
 /** A consistent view of a store's refs, read while planning one batch. */
@@ -327,7 +333,8 @@ const LOGGED_BY_DEFAULT = ["refs/heads/", "refs/remotes/", "refs/notes/"];
  * refs/remotes/ and refs/notes/ (and appended to wherever one exists); the
  * updated ref gets no line for a no-op and loses its log on delete; the refs
  * that record the update too (`reflogAlso`, HEAD among them) always get a line.
- * Writes come in batch order, to be applied in that order (as the files store does).
+ * With `options.createReflog` the updated refs' logs are created whatever their
+ * names (git's REF_FORCE_CREATE_REFLOG). Writes come in batch order, to be applied in that order (as the files store does).
  */
 export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = {}): ReflogWrite[] {
   const ident =
@@ -345,7 +352,12 @@ export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = 
     };
     if (u.newValue === null) writes.push({ op: "drop", name: u.name });
     else if (line.oldId !== u.newValue)
-      writes.push({ op: "append", name: u.name, line, create: create(u.name) });
+      writes.push({
+        op: "append",
+        name: u.name,
+        line,
+        create: options.createReflog === true || create(u.name),
+      });
     for (const name of u.reflogAlso)
       writes.push({ op: "append", name, line, create: create(name) });
   }

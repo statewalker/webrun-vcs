@@ -23,7 +23,6 @@ import {
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   createRefsStructure,
-  deleteRef,
   FileRefStore,
   packRefs,
   parsePackedRefs,
@@ -32,8 +31,6 @@ import {
   readPackedRefs,
   readRef,
   resolveRef,
-  writeObjectRef,
-  writeSymbolicRef,
 } from "../../src/refs/index.js";
 
 // Test constants
@@ -56,14 +53,14 @@ describe("Git Files Refs Handling", () => {
 
   describe("loose refs", () => {
     it("creates loose ref file", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
+      await refStore.set("refs/heads/main", TEST_OID_1);
 
       const exists = await files.exists(joinPath(gitDir, "refs/heads/main"));
       expect(exists).toBe(true);
     });
 
     it("reads loose ref file", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
+      await refStore.set("refs/heads/main", TEST_OID_1);
 
       const ref = await readLooseRef(files, gitDir, "refs/heads/main");
 
@@ -74,8 +71,8 @@ describe("Git Files Refs Handling", () => {
     });
 
     it("updates loose ref file", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_2);
+      await refStore.set("refs/heads/main", TEST_OID_1);
+      await refStore.set("refs/heads/main", TEST_OID_2);
 
       const ref = await readLooseRef(files, gitDir, "refs/heads/main");
 
@@ -84,7 +81,7 @@ describe("Git Files Refs Handling", () => {
     });
 
     it("handles symbolic refs", async () => {
-      await writeSymbolicRef(files, gitDir, "HEAD", "refs/heads/main");
+      await refStore.setSymbolic("HEAD", "refs/heads/main");
 
       const ref = await readLooseRef(files, gitDir, "HEAD");
 
@@ -96,7 +93,7 @@ describe("Git Files Refs Handling", () => {
     });
 
     it("creates nested ref directories", async () => {
-      await writeObjectRef(files, gitDir, "refs/remotes/origin/main", TEST_OID_1);
+      await refStore.set("refs/remotes/origin/main", TEST_OID_1);
 
       const exists = await files.exists(joinPath(gitDir, "refs/remotes/origin/main"));
       expect(exists).toBe(true);
@@ -107,7 +104,7 @@ describe("Git Files Refs Handling", () => {
     });
 
     it("stores ref content with newline terminator", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
+      await refStore.set("refs/heads/main", TEST_OID_1);
 
       const data = await readFile(files, joinPath(gitDir, "refs/heads/main"));
       const content = new TextDecoder().decode(data);
@@ -116,7 +113,7 @@ describe("Git Files Refs Handling", () => {
     });
 
     it("stores symbolic ref with ref: prefix", async () => {
-      await writeSymbolicRef(files, gitDir, "HEAD", "refs/heads/main");
+      await refStore.setSymbolic("HEAD", "refs/heads/main");
 
       const data = await readFile(files, joinPath(gitDir, "HEAD"));
       const content = new TextDecoder().decode(data);
@@ -147,8 +144,8 @@ ${TEST_OID_2} refs/heads/feature
 
     it("writes packed-refs file", async () => {
       // Create some loose refs first
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
-      await writeObjectRef(files, gitDir, "refs/heads/feature", TEST_OID_2);
+      await refStore.set("refs/heads/main", TEST_OID_1);
+      await refStore.set("refs/heads/feature", TEST_OID_2);
 
       // Pack refs
       await packRefs(files, gitDir, ["refs/heads/main", "refs/heads/feature"], true);
@@ -212,7 +209,7 @@ ${TEST_OID_1} refs/tags/v1.0.0
       await files.write(joinPath(gitDir, "packed-refs"), [new TextEncoder().encode(packedContent)]);
 
       // Create loose ref with different value
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_2);
+      await refStore.set("refs/heads/main", TEST_OID_2);
 
       // readRef should return loose value
       const ref = await readRef(files, gitDir, "refs/heads/main");
@@ -238,8 +235,8 @@ ${TEST_OID_1} refs/tags/v1.0.0
 
     it("resolves symbolic ref chain", async () => {
       // HEAD -> refs/heads/main -> objectId
-      await writeSymbolicRef(files, gitDir, "HEAD", "refs/heads/main");
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
+      await refStore.setSymbolic("HEAD", "refs/heads/main");
+      await refStore.set("refs/heads/main", TEST_OID_1);
 
       const resolved = await resolveRef(files, gitDir, "HEAD");
 
@@ -249,9 +246,9 @@ ${TEST_OID_1} refs/tags/v1.0.0
 
     it("resolves multi-level symbolic ref chain", async () => {
       // HEAD -> refs/heads/alias -> refs/heads/main -> objectId
-      await writeSymbolicRef(files, gitDir, "HEAD", "refs/heads/alias");
-      await writeSymbolicRef(files, gitDir, "refs/heads/alias", "refs/heads/main");
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
+      await refStore.setSymbolic("HEAD", "refs/heads/alias");
+      await refStore.setSymbolic("refs/heads/alias", "refs/heads/main");
+      await refStore.set("refs/heads/main", TEST_OID_1);
 
       const resolved = await resolveRef(files, gitDir, "HEAD");
 
@@ -260,7 +257,7 @@ ${TEST_OID_1} refs/tags/v1.0.0
     });
 
     it("returns undefined for broken symbolic ref", async () => {
-      await writeSymbolicRef(files, gitDir, "HEAD", "refs/heads/nonexistent");
+      await refStore.setSymbolic("HEAD", "refs/heads/nonexistent");
 
       const resolved = await resolveRef(files, gitDir, "HEAD");
 
@@ -269,19 +266,19 @@ ${TEST_OID_1} refs/tags/v1.0.0
 
     it("throws on circular symbolic ref chain", async () => {
       // Create circular chain
-      await writeSymbolicRef(files, gitDir, "refs/heads/a", "refs/heads/b");
-      await writeSymbolicRef(files, gitDir, "refs/heads/b", "refs/heads/c");
-      await writeSymbolicRef(files, gitDir, "refs/heads/c", "refs/heads/d");
-      await writeSymbolicRef(files, gitDir, "refs/heads/d", "refs/heads/e");
-      await writeSymbolicRef(files, gitDir, "refs/heads/e", "refs/heads/f");
-      await writeSymbolicRef(files, gitDir, "refs/heads/f", "refs/heads/a");
+      await refStore.setSymbolic("refs/heads/a", "refs/heads/b");
+      await refStore.setSymbolic("refs/heads/b", "refs/heads/c");
+      await refStore.setSymbolic("refs/heads/c", "refs/heads/d");
+      await refStore.setSymbolic("refs/heads/d", "refs/heads/e");
+      await refStore.setSymbolic("refs/heads/e", "refs/heads/f");
+      await refStore.setSymbolic("refs/heads/f", "refs/heads/a");
 
       await expect(resolveRef(files, gitDir, "refs/heads/a")).rejects.toThrow("depth exceeded");
     });
 
     it("readAllRefs returns both loose and packed refs", async () => {
       // Create loose ref
-      await writeObjectRef(files, gitDir, "refs/heads/loose", TEST_OID_1);
+      await refStore.set("refs/heads/loose", TEST_OID_1);
 
       // Create packed ref
       const packedContent = `${TEST_OID_2} refs/heads/packed
@@ -297,7 +294,7 @@ ${TEST_OID_1} refs/tags/v1.0.0
 
     it("readAllRefs does not duplicate refs that exist in both", async () => {
       // Create both loose and packed version of same ref
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_2);
+      await refStore.set("refs/heads/main", TEST_OID_2);
       const packedContent = `${TEST_OID_1} refs/heads/main
 `;
       await files.write(joinPath(gitDir, "packed-refs"), [new TextEncoder().encode(packedContent)]);
@@ -316,7 +313,7 @@ ${TEST_OID_1} refs/tags/v1.0.0
 
   describe("atomic operations", () => {
     it("compareAndSwap succeeds when old value matches", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
+      await refStore.set("refs/heads/main", TEST_OID_1);
 
       const result = await refStore.compareAndSwap("refs/heads/main", TEST_OID_1, TEST_OID_2);
 
@@ -328,7 +325,7 @@ ${TEST_OID_1} refs/tags/v1.0.0
     });
 
     it("compareAndSwap fails when old value does not match", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/main", TEST_OID_1);
+      await refStore.set("refs/heads/main", TEST_OID_1);
 
       const result = await refStore.compareAndSwap(
         "refs/heads/main",
@@ -356,7 +353,7 @@ ${TEST_OID_1} refs/tags/v1.0.0
     });
 
     it("compareAndSwap fails for new ref when ref already exists", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/existing", TEST_OID_1);
+      await refStore.set("refs/heads/existing", TEST_OID_1);
 
       const result = await refStore.compareAndSwap(
         "refs/heads/existing",
@@ -369,26 +366,26 @@ ${TEST_OID_1} refs/tags/v1.0.0
     });
 
     it("delete removes loose ref", async () => {
-      await writeObjectRef(files, gitDir, "refs/heads/todelete", TEST_OID_1);
+      await refStore.set("refs/heads/todelete", TEST_OID_1);
 
-      const deleted = await deleteRef(files, gitDir, "refs/heads/todelete");
+      const deleted = await refStore.remove("refs/heads/todelete");
 
       expect(deleted).toBe(true);
       expect(await files.exists(joinPath(gitDir, "refs/heads/todelete"))).toBe(false);
     });
 
     it("delete returns false for non-existent ref", async () => {
-      const deleted = await deleteRef(files, gitDir, "refs/heads/nonexistent");
+      const deleted = await refStore.remove("refs/heads/nonexistent");
 
       expect(deleted).toBe(false);
     });
 
     it("delete cleans up empty parent directories", async () => {
       // Create deeply nested ref
-      await writeObjectRef(files, gitDir, "refs/feature/team/project/branch", TEST_OID_1);
+      await refStore.set("refs/feature/team/project/branch", TEST_OID_1);
 
       // Delete it
-      await deleteRef(files, gitDir, "refs/feature/team/project/branch");
+      await refStore.remove("refs/feature/team/project/branch");
 
       // Empty dirs should be cleaned up, but refs/ should remain
       expect(await files.exists(joinPath(gitDir, "refs/feature/team/project"))).toBe(false);

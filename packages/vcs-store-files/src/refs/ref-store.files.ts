@@ -12,6 +12,7 @@ import type {
   ObjectId,
   Ref,
   RefCommand,
+  ReflogDeleteOptions,
   ReflogReader,
   Refs,
   RefUpdateResult,
@@ -28,8 +29,7 @@ import {
 } from "./files-ref-batch.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
 import { createRefsStructure } from "./ref-writer.js";
-import { createReflogReader } from "./reflog-reader.js";
-import { hasReflog } from "./reflog-writer.js";
+import { createReflogReader, hasReflog } from "./reflog-reader.js";
 
 export interface FileRefStoreOptions extends FilesRefBatchOptions {
   /**
@@ -229,6 +229,21 @@ export class FileRefStore implements Refs {
       return undefined;
     }
     return createReflogReader(this.files, this.gitDir, refName);
+  }
+
+  /**
+   * Delete reflog entry `refName@{index}`, as `git reflog delete` (and so `git stash
+   * drop`): under `<ref>.lock` and `logs/<ref>.lock`, the log is rewritten into its lock
+   * and renamed, then (`updateRef`) the ref is committed from its lock. Throws
+   * `ReflogEntryNotFoundError`, or `RefUpdateRejectedError` (`code` "ELOCKED") when a
+   * lock stays held past `refLockTimeoutMs`, with nothing changed.
+   */
+  deleteReflogEntry(
+    refName: string,
+    index: number,
+    options?: ReflogDeleteOptions,
+  ): Promise<number> {
+    return this.ops.deleteReflogEntry(refName, index, options);
   }
 
   /**

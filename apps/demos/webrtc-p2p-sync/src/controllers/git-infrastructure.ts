@@ -94,7 +94,6 @@ export async function initializeGitFromFiles(ctx: AppContext, files: FilesApi): 
     await files.mkdir(joinPath(gitDir, "refs", "tags"));
 
     const encoder = new TextEncoder();
-    await files.write(joinPath(gitDir, "HEAD"), [encoder.encode("ref: refs/heads/main\n")]);
     await files.write(joinPath(gitDir, "config"), [
       encoder.encode("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"),
     ]);
@@ -105,6 +104,8 @@ export async function initializeGitFromFiles(ctx: AppContext, files: FilesApi): 
   // filesStagingStore, matching real Git's on-disk format.
   const objects = createGitObjects(filesStagingStore(files, objectsDir));
   const refStore = createFileRefStore(files, gitDir);
+  // HEAD through the ref store (under HEAD.lock, as git init does)
+  if (!gitDirExists) await refStore.setSymbolic("HEAD", "refs/heads/main");
 
   const history = createHistoryFromComponents({
     objects,

@@ -7,6 +7,12 @@
  * - rebase-merge/ or rebase-apply/: Rebase state
  * - CHERRY_PICK_HEAD: Cherry-pick in progress
  * - REVERT_HEAD: Revert in progress
+ *
+ * HEAD and the pseudo refs (MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD, ORIG_HEAD) are
+ * read and written through `refs`; on git files that means under `<name>.lock`. git
+ * itself locks HEAD, ORIG_HEAD, CHERRY_PICK_HEAD and REVERT_HEAD (update_ref) but writes
+ * MERGE_HEAD as a plain file (write_merge_heads); taking its lock too is harmless.
+ * MERGE_MSG, MERGE_MODE and the rebase directories are plain state files.
  */
 
 import type { ObjectId, Refs } from "@statewalker/vcs-core";
@@ -22,13 +28,10 @@ import type {
   HeadValue,
   Staging,
 } from "@statewalker/vcs-working-tree";
-import {
-  type CherryPickStateFilesApi,
-  readCherryPickState,
-} from "../working-copy/cherry-pick-state-reader.js";
-import { type MergeStateFilesApi, readMergeState } from "../working-copy/merge-state-reader.js";
+import type { CherryPickStateFilesApi } from "../working-copy/cherry-pick-state-reader.js";
+import type { MergeStateFilesApi } from "../working-copy/merge-state-reader.js";
 import { type RebaseStateFilesApi, readRebaseState } from "../working-copy/rebase-state-reader.js";
-import { type RevertStateFilesApi, readRevertState } from "../working-copy/revert-state-reader.js";
+import type { RevertStateFilesApi } from "../working-copy/revert-state-reader.js";
 
 /**
  * Files API subset needed for GitCheckout
@@ -172,26 +175,27 @@ export class GitCheckout implements Checkout {
   // -------- Merge --------
 
   async getMergeState(): Promise<CheckoutMergeState | undefined> {
-    const state = await readMergeState(this.files, this.gitDir);
-    if (!state) return undefined;
+    const mergeHead = await this.pseudoRef("MERGE_HEAD");
+    if (!mergeHead) return undefined;
+    const mode = await this.readFile(`${this.gitDir}/MERGE_MODE`);
 
     return {
-      mergeHead: state.mergeHead,
-      originalHead: state.origHead,
-      message: state.message,
-      squash: state.squash,
+      mergeHead,
+      originalHead: (await this.getOrigHead()) ?? mergeHead,
+      message: await this.readFile(`${this.gitDir}/MERGE_MSG`),
+      squash: mode?.includes("squash") ?? false,
     };
   }
 
   async setMergeState(state: CheckoutMergeState | null): Promise<void> {
     if (state === null) {
       // Clear merge state
-      await this.removeFile(`${this.gitDir}/MERGE_HEAD`);
+      await this.refs.remove("MERGE_HEAD");
       await this.removeFile(`${this.gitDir}/MERGE_MSG`);
       await this.removeFile(`${this.gitDir}/MERGE_MODE`);
     } else {
-      // Write merge state files
-      await this.writeFile(`${this.gitDir}/MERGE_HEAD`, `${state.mergeHead}\n`);
+      // MERGE_HEAD goes through the ref store (git writes it plainly; the lock is harmless)
+      await this.refs.set("MERGE_HEAD", state.mergeHead);
       if (state.message) {
         await this.writeFile(`${this.gitDir}/MERGE_MSG`, state.message);
       }
@@ -249,25 +253,25 @@ export class GitCheckout implements Checkout {
   // -------- Cherry-pick --------
 
   async getCherryPickState(): Promise<CheckoutCherryPickState | undefined> {
-    const state = await readCherryPickState(this.files, this.gitDir);
-    if (!state) return undefined;
+    const cherryPickHead = await this.pseudoRef("CHERRY_PICK_HEAD");
+    if (!cherryPickHead) return undefined;
 
     const origHead = await this.getOrigHead();
 
     return {
-      commits: [state.cherryPickHead],
+      commits: [cherryPickHead],
       currentIndex: 0,
-      originalHead: origHead ?? state.cherryPickHead, // Fallback
+      originalHead: origHead ?? cherryPickHead, // Fallback
     };
   }
 
   async setCherryPickState(state: CheckoutCherryPickState | null): Promise<void> {
     if (state === null) {
-      await this.removeFile(`${this.gitDir}/CHERRY_PICK_HEAD`);
+      await this.refs.remove("CHERRY_PICK_HEAD");
     } else {
       const currentCommit = state.commits[state.currentIndex];
       if (currentCommit) {
-        await this.writeFile(`${this.gitDir}/CHERRY_PICK_HEAD`, `${currentCommit}\n`);
+        await this.refs.set("CHERRY_PICK_HEAD", currentCommit);
       }
     }
   }
@@ -275,25 +279,25 @@ export class GitCheckout implements Checkout {
   // -------- Revert --------
 
   async getRevertState(): Promise<CheckoutRevertState | undefined> {
-    const state = await readRevertState(this.files, this.gitDir);
-    if (!state) return undefined;
+    const revertHead = await this.pseudoRef("REVERT_HEAD");
+    if (!revertHead) return undefined;
 
     const origHead = await this.getOrigHead();
 
     return {
-      commits: [state.revertHead],
+      commits: [revertHead],
       currentIndex: 0,
-      originalHead: origHead ?? state.revertHead, // Fallback
+      originalHead: origHead ?? revertHead, // Fallback
     };
   }
 
   async setRevertState(state: CheckoutRevertState | null): Promise<void> {
     if (state === null) {
-      await this.removeFile(`${this.gitDir}/REVERT_HEAD`);
+      await this.refs.remove("REVERT_HEAD");
     } else {
       const currentCommit = state.commits[state.currentIndex];
       if (currentCommit) {
-        await this.writeFile(`${this.gitDir}/REVERT_HEAD`, `${currentCommit}\n`);
+        await this.refs.set("REVERT_HEAD", currentCommit);
       }
     }
   }
@@ -377,13 +381,17 @@ export class GitCheckout implements Checkout {
 
   // ========== Internal Helpers ==========
 
-  private async getOrigHead(): Promise<ObjectId | undefined> {
-    try {
-      const content = await this.readFile(`${this.gitDir}/ORIG_HEAD`);
-      return content?.trim();
-    } catch {
-      return undefined;
-    }
+  private getOrigHead(): Promise<ObjectId | undefined> {
+    return this.pseudoRef("ORIG_HEAD");
+  }
+
+  /**
+   * The id a pseudo ref (MERGE_HEAD, CHERRY_PICK_HEAD, ORIG_HEAD, …) holds. Pseudo refs
+   * live in the ref store (on git files, written under `<name>.lock`).
+   */
+  private async pseudoRef(name: string): Promise<ObjectId | undefined> {
+    const ref = await this.refs.get(name).catch(() => undefined);
+    return ref && "objectId" in ref && ref.objectId ? ref.objectId : undefined;
   }
 
   private async readFile(path: string): Promise<string | undefined> {

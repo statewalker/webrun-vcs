@@ -17,6 +17,7 @@ import type {
   Ref,
   RefCommand,
   RefEntry,
+  ReflogDeleteOptions,
   ReflogLine,
   ReflogReader,
   Refs,
@@ -26,8 +27,10 @@ import type {
 import {
   compareRefNames,
   createReflogReaderOf,
+  deleteReflogLine,
   planRefBatch,
   planReflog,
+  ReflogEntryNotFoundError,
   RefStorage,
 } from "@statewalker/vcs-core";
 import type { KVStore } from "./kv-store.js";
@@ -343,6 +346,51 @@ export class KVRefStore implements Refs {
     return createReflogReaderOf(
       lines.map(({ oldId, newId, ident, message }) => ({ oldId, newId, ident, message })),
     );
+  }
+
+  /**
+   * Delete reflog entry `name@{index}` (see {@link Refs.deleteReflogEntry}). The ref
+   * moves first (one compare-and-swap of the root, to the newest kept entry), then the log key is replaced only if it still holds the
+   * bytes the plan was made from; a lost race re-reads and re-plans. A failure between
+   * the two leaves the log whole and the ref at the entry the retried drop moves it to,
+   * so retrying converges and no entry is lost.
+   */
+  async deleteReflogEntry(
+    refName: string,
+    index: number,
+    options: ReflogDeleteOptions = {},
+  ): Promise<number> {
+    const key = `${REFLOG_PREFIX}${refName}`;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const bytes = await this.kv.get(key);
+      const log = decodeLog(bytes);
+      const removed = log.lines[log.lines.length - 1 - index];
+      const kept = deleteReflogLine(log.lines, index, options.rewrite);
+      if (!kept || !removed) throw new ReflogEntryNotFoundError(refName, index);
+      const top = kept.at(-1);
+      if (options.updateRef && top) {
+        await this.update(
+          async (refs) => {
+            // git's rule (the newest kept entry, never through a symbolic ref), applied
+            // only while the ref holds the deleted entry's value or nothing: a ref a
+            // concurrent writer moved keeps its value, as git's ref lock would have
+            // ordered that write after the drop.
+            const current = refs.get(refName);
+            const write = current === undefined || current === removed.newId;
+            if (write) refs.set(refName, top.newId);
+            return { result: undefined, write };
+          },
+          () => {
+            throw new Error(`Could not update ${refName}: too many concurrent writers`);
+          },
+        );
+      }
+      const next = encoder.encode(JSON.stringify({ ...log, lines: kept }));
+      if (await this.kv.compareAndSwap(key, bytes, next)) return kept.length;
+      // Lost the race to another log write: back off, re-read and re-plan.
+      await new Promise((r) => setTimeout(r, Math.random() * Math.min(2 ** attempt, 20)));
+    }
+    throw new Error(`Could not update the reflog of ${refName}: too many concurrent writers`);
   }
 
   async compareAndSwap(

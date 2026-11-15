@@ -58,7 +58,10 @@ class ReflogReaderImpl implements ReflogReader {
     const lines = content.trim().split("\n").filter(Boolean).reverse();
     const entries: ReflogEntry[] = [];
 
-    for (const line of lines.slice(0, max)) {
+    // Parse, then count: a line git skips (a broken ident) is no entry, so `name@{n}`
+    // numbers the same entries here, in `git reflog`, and in deleteReflogEntry.
+    for (const line of lines) {
+      if (entries.length >= max) break;
       const entry = parseReflogLine(line);
       if (entry) entries.push(entry);
     }
@@ -119,6 +122,24 @@ export function parseReflogLine(line: string): ReflogEntry | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether `refName` has a reflog (`logs/<refName>`, an empty one included)
+ *
+ * Reflogs are written only by the ref store, under the ref's lock (`FileRefStore.batch`,
+ * `deleteReflogEntry`); there is no unlocked writer.
+ *
+ * @param files FilesApi for filesystem access
+ * @param gitDir Path to .git directory
+ * @param refName Ref name
+ */
+export async function hasReflog(
+  files: FilesApi,
+  gitDir: string,
+  refName: string,
+): Promise<boolean> {
+  return (await files.stats(joinPath(gitDir, LOGS_DIR, refName)))?.kind === "file";
 }
 
 /**

@@ -44,6 +44,7 @@ export class StashListCommand extends GitCommand<StashEntry[]> {
     const stashes: StashEntry[] = [];
     const reflog = await this.getStashReflog();
 
+    // The index is the reflog position (stash@{n}), even if an entry cannot be parsed.
     let index = 0;
     for (const entry of reflog) {
       const stashEntry = await this.parseStashEntry(entry.commitId, entry.message, index);
@@ -57,12 +58,17 @@ export class StashListCommand extends GitCommand<StashEntry[]> {
   }
 
   /**
-   * Get stash entries.
-   *
-   * Note: Without reflog support in the core Refs interface,
-   * this returns only the most recent stash (if any).
+   * Get stash entries: the reflog of `refs/stash`, newest first, as `git stash list`
+   * reads it. A store without reflogs gives only the current `refs/stash`.
    */
   private async getStashReflog(): Promise<Array<{ commitId: ObjectId; message: string }>> {
+    const reflog = await this.refsStore.getReflog?.(STASH_REF);
+    if (reflog) {
+      return (await reflog.getReverseEntries()).map((e) => ({
+        commitId: e.newId,
+        message: e.comment,
+      }));
+    }
     // Without reflog support, we can only return the current stash ref
     const stashRef = await this.refsStore.resolve(STASH_REF);
     if (stashRef?.objectId) {

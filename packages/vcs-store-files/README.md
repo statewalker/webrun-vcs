@@ -47,8 +47,8 @@ Lower-level building blocks, also exported:
 | --- | --- |
 | Object kernel store | `filesStagingStore(files, objectsDir, { freshenMaxAgeMs? })`: git's loose layout as a `StagingBlobStore` for `createGitObjects`, written through `tmp_obj_*` and a rename (a write over a loose file older than an hour renews it); `spool(content)` writes content of unknown size to a `tmp_obj_*` file so `putUnsized` can hash it in a second pass without holding it; `isFresh(id)` says whether a loose object exists and needs no freshening; `sweepStaged(olderThanMs)` removes stale temporaries as `git prune` does; `withPacks(objects, packs)`: a `GitObjects` that reads the packs of a `PackSet` (`openPackSet` from `@statewalker/vcs-core`) first, then loose objects; `skipPacked(store, packs)`: a staging store that does not write objects already packed (in a pack still on storage, in a copy not found corrupt) |
 | Loose objects | `FileRawStorage` (`compress` option, default `true`); `prunePacked(looseStorage, packs)` removes loose copies of packed objects (`git prune-packed`) |
-| Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs?, logAllRefUpdates?, reflogIdentity? })` with atomic `batch` and locked `packRefs`; `createFilesRefBatch(atomicFiles)`, `createFilesRefOps(atomicFiles)` (`batch`, `packRefs`, `updatePackedRefs`, `writeLoose`, `removeRef`, `sweepTemporaries`), `PackedRefsLockedError`, `RefUpdateRejectedError`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `writeRef`, `writeObjectRef`, `writeSymbolicRef`, `updateRef`, `deleteRef`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `appendReflog`, `createReflogReader`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
-| Working copy | `GitWorkingCopy`, `GitWorkingCopyFactory` / `createGitWorkingCopyFactory`, `GitWorkingCopyConfig` / `createWorkingCopyConfig` (reads and writes `.git/config`), `GitCheckout` / `createGitCheckout`, `GitStashStore` / `createGitStashStore` (`refs/stash`) |
+| Refs | `FileRefStore` / `createFileRefStore(files, gitDir, { atomicFiles?, refLockTimeoutMs?, packedLockTimeoutMs?, logAllRefUpdates?, reflogIdentity? })` with atomic `batch` and locked `packRefs`; `createFilesRefBatch(atomicFiles)`, `createFilesRefOps(atomicFiles)` (`batch`, `packRefs`, `updatePackedRefs`, `writeLoose`, `removeRef`, `deleteReflogEntry`, `sweepTemporaries`), `PackedRefsLockedError`, `RefUpdateRejectedError`; functions `readRef`, `resolveRef`, `readAllRefs`, `getRefsByPrefix`, `readPackedRefs`, `writePackedRefs`, `packRefs`, `createReflogReader`, `hasReflog`, and the parsers `parseRefContent`, `parsePackedRefs`, `parseReflogLine` |
+| Working copy | `GitWorkingCopy`, `GitWorkingCopyFactory` / `createGitWorkingCopyFactory`, `GitWorkingCopyConfig` / `createWorkingCopyConfig` (reads and writes `.git/config`), `GitCheckout` / `createGitCheckout`, `GitStashStore` / `createGitStashStore` (`refs/stash` and its reflog, through `history.refs`, as `git stash` keeps them) |
 | Operation state | `GitTransformationStore` / `createTransformationStore(files, gitDir)`, the merge/rebase/cherry-pick/revert/sequencer stores, `GitResolutionStore`, `detectRepositoryState(files, gitDir, hasConflicts)` and `readMergeState` / `readRebaseState` / `readCherryPickState` / `readRevertState` |
 
 ## Examples
@@ -411,9 +411,12 @@ reports what it would prune.
   back a `packed-refs` that drops a concurrent batch or a native `git pack-refs` /
   `git update-ref -d`. Batches, `packRefs`, `set`, `setSymbolic` and `remove` also lock every
   loose ref they change or prune, so between themselves (and native `git`) they lose nothing and
-  a deleted ref stays deleted. The functions `writeRef`, `writeObjectRef`, `writeSymbolicRef`,
-  `updateRef` and `deleteRef` still write loose ref files directly, without locks; prefer the
-  store's methods next to other writers.
+  a deleted ref stays deleted. There is no unlocked ref writer: reflog lines are appended while
+  the ref's lock is held (and the locks of HEAD and the symbolic refs that log the update),
+  `deleteReflogEntry` rewrites a log under `<ref>.lock` and `logs/<ref>.lock` as `git reflog
+  delete` does, and HEAD at init, ORIG_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD and
+  `refs/stash` (the stash) are all written through the store. Only a new linked worktree's
+  `worktrees/NAME/HEAD` is written plainly at creation, as `git worktree add` does.
 
 ### What will surprise you
 

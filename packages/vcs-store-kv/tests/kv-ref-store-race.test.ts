@@ -193,3 +193,77 @@ describe("KVRefStore reflogs under concurrent batches", () => {
     expect(await lines(refs, "HEAD")).toEqual(["0>1 x"]);
   });
 });
+
+/** A KV whose compare-and-swaps of `failKey` throw while `failures` lasts (a flaky store). */
+class FlakyKV extends MemoryKVAdapter {
+  failures = 0;
+  constructor(private failKey: string) {
+    super();
+  }
+  override async compareAndSwap(
+    key: string,
+    expected: Uint8Array | undefined,
+    newValue: Uint8Array,
+  ): Promise<boolean> {
+    if (key === this.failKey && this.failures > 0) {
+      this.failures--;
+      throw new Error(`store unavailable (${key})`);
+    }
+    return super.compareAndSwap(key, expected, newValue);
+  }
+}
+
+describe("KVRefStore.deleteReflogEntry when a store write fails", () => {
+  const IDENT = "A U Thor <author@example.com> 1700000000 +0000";
+  async function threeStashes(refs: KVRefStore) {
+    for (const n of [1, 2, 3]) {
+      await refs.batch([{ name: "refs/stash", new: oid(n) }], {
+        ident: IDENT,
+        message: `s${n}`,
+        createReflog: true,
+      });
+    }
+  }
+  const stashLog = async (refs: KVRefStore) =>
+    ((await (await refs.getReflog("refs/stash"))?.getReverseEntries()) ?? []).map((e) =>
+      e.newId.slice(-1),
+    );
+  const drop0 = (refs: KVRefStore) =>
+    refs.deleteReflogEntry("refs/stash", 0, { rewrite: true, updateRef: true });
+
+  it("a failed root write changes nothing; the retried drop drops exactly one entry", async () => {
+    const kv = new FlakyKV("ref:root");
+    const refs = new KVRefStore(kv);
+    await threeStashes(refs);
+    kv.failures = 1;
+    await expect(drop0(refs)).rejects.toThrow("store unavailable");
+    expect(await stashLog(refs)).toEqual(["3", "2", "1"]);
+    expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(3));
+    expect(await drop0(refs)).toBe(2);
+    expect(await stashLog(refs)).toEqual(["2", "1"]);
+    expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(2));
+  });
+
+  it("a failed log write after the ref moved converges on retry, the ref never stuck", async () => {
+    const kv = new FlakyKV("reflog:refs/stash");
+    const refs = new KVRefStore(kv);
+    await threeStashes(refs);
+    kv.failures = 1;
+    await expect(drop0(refs)).rejects.toThrow("store unavailable");
+    expect(await drop0(refs)).toBe(2);
+    expect(await stashLog(refs)).toEqual(["2", "1"]);
+    expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(2));
+    expect(await drop0(refs)).toBe(1);
+    expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(1));
+  });
+
+  it("a ref a concurrent writer moved keeps its value; the log still loses the entry", async () => {
+    const refs = new KVRefStore(new MemoryKVAdapter());
+    await threeStashes(refs);
+    // another writer moves refs/stash without a log line (its line is still to come)
+    await refs.set("refs/stash", oid(9));
+    expect(await drop0(refs)).toBe(2);
+    expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(9));
+    expect(await stashLog(refs)).toEqual(["2", "1"]);
+  });
+});

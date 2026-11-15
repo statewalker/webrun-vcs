@@ -485,5 +485,121 @@ export function createRefBatchTests(
       expect((await refs.resolve("refs/heads/left"))?.objectId).toBe(count(20));
       expect((await refs.resolve("refs/heads/right"))?.objectId).toBe(count(20));
     });
+
+    itLog(
+      "createReflog creates the log of a ref outside the default set (refs/stash)",
+      async () => {
+        await refs.batch([{ name: "refs/tags/t", new: oid(1) }], { ident: IDENT, message: "t" });
+        expect(await logOf("refs/tags/t")).toEqual([]);
+        await refs.batch([{ name: "refs/stash", new: oid(1) }], {
+          ident: IDENT,
+          message: "On main: one",
+          createReflog: true,
+        });
+        // an existing log is appended to without the flag
+        await refs.batch([{ name: "refs/stash", new: oid(2) }], {
+          ident: IDENT,
+          message: "On main: two",
+        });
+        expect(await logOf("refs/stash")).toEqual([
+          `${Z.slice(-4)}>aaa1:On main: one`,
+          "aaa1>aaa2:On main: two",
+        ]);
+      },
+    );
+
+    /** Three stash entries, as `git stash` writes them: stash@{0} = oid(3). */
+    const threeStashes = async () => {
+      for (const n of [1, 2, 3]) {
+        const r = await refs.batch([{ name: "refs/stash", new: oid(n) }], {
+          ident: IDENT,
+          message: `On main: s${n}`,
+          createReflog: true,
+        });
+        expect(r.ok).toBe(true);
+      }
+    };
+
+    itLog(
+      "deleteReflogEntry drops stash@{1} and relinks the chain (git reflog delete --rewrite)",
+      async () => {
+        if (!refs.deleteReflogEntry)
+          throw new Error("store keeps reflogs but cannot delete entries");
+        await threeStashes();
+        expect(
+          await refs.deleteReflogEntry("refs/stash", 1, { rewrite: true, updateRef: true }),
+        ).toBe(2);
+        expect(await logOf("refs/stash")).toEqual([
+          `${Z.slice(-4)}>aaa1:On main: s1`,
+          "aaa1>aaa3:On main: s3",
+        ]);
+        expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(3));
+        // now the newest goes: updateRef moves the ref to the entry left on top
+        expect(
+          await refs.deleteReflogEntry("refs/stash", 0, { rewrite: true, updateRef: true }),
+        ).toBe(1);
+        expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(1));
+      },
+    );
+
+    itLog("deleteReflogEntry without updateRef leaves the ref where it is", async () => {
+      if (!refs.deleteReflogEntry) throw new Error("store keeps reflogs but cannot delete entries");
+      await threeStashes();
+      expect(await refs.deleteReflogEntry("refs/stash", 0, { rewrite: true })).toBe(2);
+      expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(3));
+      expect(await logOf("refs/stash")).toEqual([
+        `${Z.slice(-4)}>aaa1:On main: s1`,
+        "aaa1>aaa2:On main: s2",
+      ]);
+    });
+
+    itLog(
+      "deleteReflogEntry of stash@{0} with updateRef moves the ref to the next entry",
+      async () => {
+        if (!refs.deleteReflogEntry)
+          throw new Error("store keeps reflogs but cannot delete entries");
+        await threeStashes();
+        expect(
+          await refs.deleteReflogEntry("refs/stash", 0, { rewrite: true, updateRef: true }),
+        ).toBe(2);
+        expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(2));
+        expect(await logOf("refs/stash")).toEqual([
+          `${Z.slice(-4)}>aaa1:On main: s1`,
+          "aaa1>aaa2:On main: s2",
+        ]);
+        // the last entries: the log empties, the ref stays (git stash then deletes it)
+        await refs.deleteReflogEntry("refs/stash", 0, { rewrite: true, updateRef: true });
+        expect(
+          await refs.deleteReflogEntry("refs/stash", 0, { rewrite: true, updateRef: true }),
+        ).toBe(0);
+        expect(await logOf("refs/stash")).toEqual([]);
+        expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(1));
+        // deleting the ref drops what is left of its log
+        expect((await refs.batch([{ name: "refs/stash", new: null }])).ok).toBe(true);
+        expect(await refs.has("refs/stash")).toBe(false);
+        expect(await logOf("refs/stash")).toEqual([]);
+      },
+    );
+
+    itLog(
+      "deleteReflogEntry without rewrite keeps the old ids; a missing entry is refused",
+      async () => {
+        if (!refs.deleteReflogEntry)
+          throw new Error("store keeps reflogs but cannot delete entries");
+        await threeStashes();
+        await refs.deleteReflogEntry("refs/stash", 1);
+        expect(await logOf("refs/stash")).toEqual([
+          `${Z.slice(-4)}>aaa1:On main: s1`,
+          "aaa2>aaa3:On main: s3",
+        ]);
+        await expect(refs.deleteReflogEntry("refs/stash", 5)).rejects.toMatchObject({
+          name: "ReflogEntryNotFoundError",
+        });
+        await expect(refs.deleteReflogEntry("refs/heads/none", 0)).rejects.toMatchObject({
+          name: "ReflogEntryNotFoundError",
+        });
+        expect((await refs.resolve("refs/stash"))?.objectId).toBe(oid(3));
+      },
+    );
   });
 }

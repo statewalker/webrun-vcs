@@ -10,6 +10,7 @@
 import { joinPath, readText, tryReadText } from "@statewalker/vcs-core";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { RevertState } from "@statewalker/vcs-working-tree/transformation";
+import { createFileRefStore, type FileRefStore } from "../../refs/index.js";
 
 /**
  * Store for revert operation state
@@ -54,12 +55,15 @@ export interface RevertStateStore {
  */
 export class GitRevertStateStore implements RevertStateStore {
   private readonly gitDir: string;
+  /** REVERT_HEAD and ORIG_HEAD are refs: written and removed under their `.lock`, as git. */
+  private readonly refs: FileRefStore;
 
   constructor(
     private readonly files: FilesApi,
     gitDir: string,
   ) {
     this.gitDir = gitDir;
+    this.refs = createFileRefStore(files, gitDir);
   }
 
   async read(): Promise<RevertState | undefined> {
@@ -88,11 +92,20 @@ export class GitRevertStateStore implements RevertStateStore {
   }
 
   async begin(state: Omit<RevertState, "type" | "startedAt">): Promise<void> {
-    // Write REVERT_HEAD
-    await this.writeText(joinPath(this.gitDir, "REVERT_HEAD"), `${state.revertHead}\n`);
-
-    // Write ORIG_HEAD
-    await this.writeText(joinPath(this.gitDir, "ORIG_HEAD"), `${state.origHead}\n`);
+    // ORIG_HEAD first, then REVERT_HEAD (which marks the operation in progress): a lock
+    // another writer holds fails begin() with nothing in progress, ORIG_HEAD restored.
+    const previous = await this.refs.get("ORIG_HEAD").catch(() => undefined);
+    await this.refs.set("ORIG_HEAD", state.origHead);
+    try {
+      await this.refs.set("REVERT_HEAD", state.revertHead);
+    } catch (error) {
+      if (previous && "objectId" in previous && previous.objectId) {
+        await this.refs.set("ORIG_HEAD", previous.objectId).catch(() => {});
+      } else {
+        await this.refs.remove("ORIG_HEAD").catch(() => false);
+      }
+      throw error;
+    }
 
     // Write MERGE_MSG if provided
     if (state.message) {
@@ -119,14 +132,21 @@ export class GitRevertStateStore implements RevertStateStore {
   // === Private Helpers ===
 
   private async removeStateFiles(): Promise<void> {
-    const stateFiles = ["REVERT_HEAD", "MERGE_MSG", "ORIG_HEAD"];
-    for (const file of stateFiles) {
+    // Every state file goes even if one fails (a held lock); the first error is rethrown.
+    let failure: unknown;
+    for (const ref of ["REVERT_HEAD", "ORIG_HEAD"]) {
+      await this.refs.remove(ref).catch((error) => {
+        failure ??= error;
+      });
+    }
+    for (const file of ["MERGE_MSG"]) {
       try {
         await this.files.remove(joinPath(this.gitDir, file));
       } catch {
         // Ignore errors for files that don't exist
       }
     }
+    if (failure !== undefined) throw failure;
   }
 
   private async writeText(path: string, content: string): Promise<void> {

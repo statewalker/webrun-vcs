@@ -12,4 +12,3 @@ export * from "./ref-reader.js";
 export * from "./ref-store.files.js";
 export * from "./ref-writer.js";
 export * from "./reflog-reader.js";
-export * from "./reflog-writer.js";
