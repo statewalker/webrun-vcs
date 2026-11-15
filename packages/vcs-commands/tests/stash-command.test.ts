@@ -5,15 +5,36 @@
  * Tests run against all storage backends (Memory, SQL).
  */
 
+import type { History, ObjectId } from "@statewalker/vcs-core";
 import { afterEach, describe, expect, it } from "vitest";
-
-import { ContentMergeStrategy, MergeStrategy, StashApplyStatus } from "../src/index.js";
+import {
+  ContentMergeStrategy,
+  MergeStrategy,
+  StashApplyStatus,
+  type StashWorkingTreeProvider,
+  StoreNotAvailableError,
+} from "../src/index.js";
 import {
   addFile,
   backends,
   createInitializedGitFromFactory,
   loadCommitTree,
 } from "./test-helper.js";
+
+/** A working tree whose index and files hold HEAD's tree (a stash of no change). */
+function headTree(repository: History): StashWorkingTreeProvider {
+  const tree = async (): Promise<ObjectId> => {
+    const head = await repository.refs.resolve("HEAD");
+    if (!head?.objectId) throw new Error("no HEAD");
+    return loadCommitTree(repository, head.objectId);
+  };
+  return {
+    getIndexTree: tree,
+    getWorkingTree: tree,
+    hasLocalChanges: async () => true,
+    resetHard: async () => {},
+  };
+}
 
 describe.each(backends)("StashListCommand ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -114,12 +135,9 @@ describe.each(backends)("StashCreateCommand ($name backend)", ({ factory }) => {
     await addFile(workingCopy, "file.txt", "content");
     await git.commit().setMessage("initial").call();
 
-    // Without working tree provider, stash create creates a stash but
-    // it's effectively a no-op since there are no actual working tree changes
-    const stashCommit = await git.stashCreate().call();
-
-    // Should create a stash commit (even though it's not useful without working tree)
-    expect(stashCommit).toBeDefined();
+    // Without a working tree there is nothing to stash: refused, not a stash of HEAD
+    await expect(git.stashCreate().call()).rejects.toThrow(StoreNotAvailableError);
+    expect(await git.stashList().call()).toHaveLength(0);
   });
 
   /**
@@ -131,7 +149,11 @@ describe.each(backends)("StashCreateCommand ($name backend)", ({ factory }) => {
     await addFile(workingCopy, "file.txt", "content");
     await git.commit().setMessage("initial").call();
 
-    const stashCommit = await git.stashCreate().setMessage("My custom stash message").call();
+    const stashCommit = await git
+      .stashCreate()
+      .setWorkingTreeProvider(headTree(repository))
+      .setMessage("My custom stash message")
+      .call();
 
     expect(stashCommit).toBeDefined();
     if (!stashCommit) return;
@@ -168,7 +190,7 @@ describe.each(backends)("StashCreateCommand ($name backend)", ({ factory }) => {
     await git.commit().setMessage("initial").call();
 
     // With null ref, no reference is updated
-    await git.stashCreate().setRef(null).call();
+    await git.stashCreate().setWorkingTreeProvider(headTree(repository)).setRef(null).call();
 
     // refs/stash should not exist
     const stashRef = await repository.refs.get("refs/stash");
@@ -707,8 +729,11 @@ describe.each(backends)(
       await addFile(workingCopy, "file.txt", "content");
       await git.commit().setMessage("initial").call();
 
-      // Create stash without provider - still creates commit structure
-      const stashCommit = await git.stashCreate().call();
+      // a stash of no change still has the stash commit structure
+      const stashCommit = await git
+        .stashCreate()
+        .setWorkingTreeProvider(headTree(repository))
+        .call();
 
       expect(stashCommit).toBeDefined();
       if (!stashCommit) return;
@@ -730,8 +755,17 @@ describe.each(backends)(
       await addFile(workingCopy, "file.txt", "content");
       await git.commit().setMessage("initial").call();
 
-      const stash1 = await git.stashCreate().setMessage("stash 1").call();
-      const stash2 = await git.stashCreate().setMessage("stash 2").call();
+      const provider = headTree(repository);
+      const stash1 = await git
+        .stashCreate()
+        .setWorkingTreeProvider(provider)
+        .setMessage("stash 1")
+        .call();
+      const stash2 = await git
+        .stashCreate()
+        .setWorkingTreeProvider(provider)
+        .setMessage("stash 2")
+        .call();
 
       // refs/stash should point to stash2
       const stashRef = await repository.refs.resolve("refs/stash");
@@ -756,12 +790,12 @@ describe.each(backends)(
      * Test command cannot be reused.
      */
     it("should not allow command reuse after call", async () => {
-      const { git, workingCopy } = await createInitializedGit();
+      const { git, workingCopy, repository } = await createInitializedGit();
 
       await addFile(workingCopy, "file.txt", "content");
       await git.commit().setMessage("initial").call();
 
-      const command = git.stashCreate();
+      const command = git.stashCreate().setWorkingTreeProvider(headTree(repository));
       await command.call();
 
       // Attempting to call again should throw
@@ -852,7 +886,11 @@ describe.each(backends)(
       await git.commit().setMessage("initial").call();
       const ids: string[] = [];
       for (const n of [1, 2, 3]) {
-        const id = await git.stashCreate().setMessage(`s${n}`).call();
+        const id = await git
+          .stashCreate()
+          .setWorkingTreeProvider(headTree(repository))
+          .setMessage(`s${n}`)
+          .call();
         if (!id) throw new Error("no stash commit");
         ids.push(id);
       }
@@ -912,8 +950,14 @@ describe.each(backends)("stash drop and messages as git ($name backend)", ({ fac
     const { git, workingCopy, repository } = result;
     await addFile(workingCopy, "file.txt", "content");
     await git.commit().setMessage("initial").call();
-    const only = await git.stashCreate().setMessage("only").call();
-    const pushed = await git.stashCreate().setRef(null).setMessage("pushed").call();
+    const provider = headTree(repository);
+    const only = await git.stashCreate().setWorkingTreeProvider(provider).setMessage("only").call();
+    const pushed = await git
+      .stashCreate()
+      .setWorkingTreeProvider(provider)
+      .setRef(null)
+      .setMessage("pushed")
+      .call();
     if (!only || !pushed) throw new Error("no stash commit");
     // another writer pushes right after our reflog delete, before refs/stash is deleted
     const refs = repository.refs;
@@ -939,7 +983,11 @@ describe.each(backends)("stash drop and messages as git ($name backend)", ({ fac
     await addFile(workingCopy, "file.txt", "content");
     const head = await git.commit().setMessage("initial").call();
     await repository.refs.set("HEAD", head.id);
-    const id = await git.stashCreate().setMessage("detached").call();
+    const id = await git
+      .stashCreate()
+      .setWorkingTreeProvider(headTree(repository))
+      .setMessage("detached")
+      .call();
     if (!id) throw new Error("no stash commit");
     expect((await repository.commits.load(id))?.message).toBe("On (no branch): detached");
   });

@@ -365,8 +365,16 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     }
     // a file a file/directory conflict moves aside goes to `<path>~<side>` first
     for (const conflict of conflicts.values()) {
-      if (!conflict.moveFrom || !conflict.write) continue;
-      await this.writeBlob(worktree, conflict.stagePath, conflict.write, trust.symlinks);
+      if (!conflict.moveFrom) continue;
+      if (conflict.content) {
+        await worktree.writeContent(conflict.stagePath, conflict.content, {
+          mode: conflict.mode,
+          createParents: true,
+          replaceInTheWay: true,
+        });
+      } else if (conflict.write) {
+        await this.writeBlob(worktree, conflict.stagePath, conflict.write, trust.symlinks);
+      }
       await worktree.remove(conflict.moveFrom);
     }
     // deletions next, as git's unpack-trees: a deleted file or link `d` makes way for `d/x`
@@ -503,29 +511,65 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     result: Map<string, CheckedEntry>;
     conflicts: Map<string, MergeConflict>;
   }> {
-    // renames: a path one side moved, the other changed in place, merges at the new path
     const base = new Map(baseIn);
     const ours = new Map(oursIn);
     const theirs = new Map(theirsIn);
-    for (const [side, other] of [
-      [oursIn, theirs],
-      [theirsIn, ours],
+    const conflicts = new Map<string, MergeConflict>();
+    const oursRenames = await this.detectRenames(baseIn, oursIn);
+    const theirsRenames = await this.detectRenames(baseIn, theirsIn);
+    // both sides renamed the same path: to one path, it merges there; to two, git's
+    // CONFLICT (rename/rename): the original at stage 1 (DD), each side's at its path (AU/UA)
+    for (const [from, oursTo] of [...oursRenames]) {
+      const theirsTo = theirsRenames.get(from);
+      const original = base.get(from);
+      if (theirsTo === undefined || !original) continue;
+      oursRenames.delete(from);
+      theirsRenames.delete(from);
+      if (theirsTo === oursTo) {
+        base.delete(from);
+        base.set(oursTo, original);
+        continue;
+      }
+      const o = ours.get(oursTo);
+      const t = theirs.get(theirsTo);
+      if (!o || !t || theirs.has(oursTo) || ours.has(theirsTo)) continue;
+      base.delete(from);
+      ours.delete(oursTo);
+      theirs.delete(theirsTo);
+      conflicts.set(from, { base: original, stagePath: from, mode: original.mode });
+      conflicts.set(oursTo, { ours: o, stagePath: oursTo, mode: o.mode });
+      conflicts.set(theirsTo, { theirs: t, stagePath: theirsTo, mode: t.mode, write: t });
+    }
+    // a path one side renamed: the other side's change merges at the new path; deleted on
+    // the other side, git's CONFLICT (rename/delete): stage 1 and the renaming side's
+    for (const [renames, side, other, sideIsOurs] of [
+      [oursRenames, ours, theirs, true],
+      [theirsRenames, theirs, ours, false],
     ] as const) {
-      for (const [from, to] of await this.detectRenames(baseIn, side)) {
-        const moved = other.get(from);
-        if (!moved || other.has(to)) continue;
-        other.delete(from);
-        other.set(to, moved);
+      for (const [from, to] of renames) {
         const original = base.get(from);
-        if (original) {
-          base.delete(from);
+        if (!original || other.has(to)) continue;
+        const moved = other.get(from);
+        base.delete(from);
+        if (moved) {
+          other.delete(from);
+          other.set(to, moved);
           base.set(to, original);
+          continue;
         }
+        const kept = side.get(to);
+        if (!kept) continue;
+        side.delete(to);
+        conflicts.set(to, {
+          base: original,
+          ...(sideIsOurs ? { ours: kept } : { theirs: kept, write: kept }),
+          stagePath: to,
+          mode: kept.mode,
+        });
       }
     }
 
     const result = new Map<string, CheckedEntry>();
-    const conflicts = new Map<string, MergeConflict>();
     const read = async (e?: CheckedEntry) => {
       if (!e) return new Uint8Array(0);
       const chunks: Uint8Array[] = [];
@@ -586,23 +630,63 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       conflicts.set(path, { base: b, ours: o, theirs: t, stagePath: path, mode });
     }
     // a path cannot be a file and a directory at once (CONFLICT (file/directory)): the
-    // directory keeps the name, the file moves aside to `<path>~<side>`, as git names it
-    const paths = [...result.keys()].sort();
-    for (const path of paths) {
-      if (!result.has(path)) continue;
-      const below = paths.some((q) => q.startsWith(`${path}/`) && result.has(q));
-      if (!below) continue;
-      const file = result.get(path) as CheckedEntry;
-      const oursFile = sameEntry(ours.get(path), file);
+    // directory keeps the name, the file (a merged one, or the side a conflict keeps) moves
+    // aside to `<path>~<side>`, made unique as git's unique_path: `_0`, `_1`, ... appended
+    // while the name is a path (or a directory) of any of the three trees, or already taken
+    const dirsOf = (paths: Iterable<string>) => {
+      const dirs = new Set<string>();
+      for (const path of paths) {
+        for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) {
+          dirs.add(path.slice(0, k));
+        }
+      }
+      return dirs;
+    };
+    const taken = new Set<string>();
+    for (const map of [baseIn, oursIn, theirsIn, base, ours, theirs]) {
+      for (const path of map.keys()) taken.add(path);
+      for (const dir of dirsOf(map.keys())) taken.add(dir);
+    }
+    const uniquePath = (path: string, label: string) => {
+      let name = `${path}~${label}`;
+      for (let n = 0; taken.has(name); n++) name = `${path}~${label}_${n}`;
+      taken.add(name);
+      return name;
+    };
+    const outcomeDirs = dirsOf([
+      ...result.keys(),
+      ...[...conflicts.values()].map((c) => c.stagePath),
+    ]);
+    const theirsDirs = dirsOf(theirs.keys());
+    const files = [
+      ...result.keys(),
+      ...[...conflicts.entries()].filter(([, c]) => c.ours || c.theirs).map(([p]) => p),
+    ].sort();
+    for (const path of files) {
+      if (!outcomeDirs.has(path)) continue;
+      // the side whose tree has the directory keeps it; the file is the other side's
+      const oursFile = theirsDirs.has(path);
       const label = oursFile ? "Updated upstream" : "Stashed changes";
-      result.delete(path);
+      const moveFrom = oursFile && ours.has(path) ? { moveFrom: path } : {};
+      const merged = result.get(path);
+      if (merged) {
+        result.delete(path);
+        conflicts.set(path, {
+          ...(oursFile ? { ours: merged } : { theirs: merged }),
+          stagePath: uniquePath(path, label),
+          mode: merged.mode,
+          write: merged,
+          ...moveFrom,
+        });
+        continue;
+      }
+      const conflict = conflicts.get(path) as MergeConflict;
+      const kept = oursFile ? conflict.ours : conflict.theirs;
       conflicts.set(path, {
-        base: base.get(path),
-        ...(oursFile ? { ours: file } : { theirs: file }),
-        stagePath: `${path}~${label}`,
-        mode: file.mode,
-        write: file,
-        ...(oursFile ? { moveFrom: path } : {}),
+        ...conflict,
+        stagePath: uniquePath(path, label),
+        ...(kept && !conflict.content ? { write: kept } : {}),
+        ...moveFrom,
       });
     }
     return { result, conflicts };

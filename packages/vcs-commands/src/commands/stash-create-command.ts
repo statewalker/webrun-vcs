@@ -1,6 +1,6 @@
 import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
 
-import { NoHeadError, RefNotFoundError } from "../errors/index.js";
+import { NoHeadError, RefNotFoundError, StoreNotAvailableError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { STASH_REF } from "./stash-list-command.js";
 
@@ -237,10 +237,9 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
         untrackedTree = await this.workingTreeProvider.getUntrackedTree();
       }
     } else {
-      // No working tree provider - use HEAD tree
-      // This is a degenerate case where there's nothing to actually stash
-      indexTree = headCommit.tree;
-      workingTree = headCommit.tree;
+      // without a working tree there is nothing to stash: stashing HEAD's tree instead
+      // would report success while the local changes stay unsaved
+      throw new StoreNotAvailableError("worktree", "stash requires a working tree");
     }
 
     // Build commit messages

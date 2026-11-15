@@ -60,7 +60,10 @@ export async function worktreeDiffers(
 export interface InTheWay {
   /** Untracked files or links on a written path, or on a leading component of one */
   untracked: string[];
-  /** Directories a written file replaces that hold untracked files */
+  /**
+   * Directories a written file replaces that hold untracked files, or tracked files the
+   * operation does not remove (never replaced behind the index's back)
+   */
   lostDirs: string[];
 }
 
@@ -84,7 +87,17 @@ export async function findInTheWay(
   const lostDirs: string[] = [];
   const removingFolded = new Set([...removes].map((p) => p.toLowerCase()));
   const tracked = (p: string) => index.has(p) && !removes.has(p);
+  // directories holding tracked files that stay: a file written there would replace them
+  const trackedDirs = new Set<string>();
+  for (const p of index.keys()) {
+    if (removes.has(p)) continue;
+    for (let k = p.indexOf("/"); k > 0; k = p.indexOf("/", k + 1)) trackedDirs.add(p.slice(0, k));
+  }
   for (const path of writes) {
+    if (trackedDirs.has(path)) {
+      lostDirs.push(path);
+      continue;
+    }
     if (index.has(path)) continue;
     const parts = path.split("/");
     let blocked = false;

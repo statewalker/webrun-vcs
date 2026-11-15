@@ -11,7 +11,9 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -32,6 +34,7 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { findInTheWay } from "../src/commands/worktree-overwrite-checks.js";
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
@@ -709,5 +712,359 @@ describeGit("ignore rules read per operation", () => {
     expect(results.every(Boolean)).toBe(true);
     // a rough bound: read once per batch, not once per check
     expect(performance.now() - started).toBeLessThan(5000);
+  });
+});
+
+/** Writes `content` at `path` in `dir`, creating the parent directories. */
+const put = (dir: string, path: string, content: string) => {
+  mkdirSync(join(dir, path, ".."), { recursive: true });
+  writeFileSync(join(dir, path), content);
+};
+
+/** Every path of the worktree (outside `.git`), sorted. */
+function listing(dir: string, prefix = ""): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(join(dir, prefix), { withFileTypes: true })) {
+    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (path === ".git") continue;
+    out.push(path);
+    if (entry.isDirectory()) out.push(...listing(dir, path));
+  }
+  return out.sort();
+}
+
+/** As {@link expectAsNative}, the whole worktree listing too. */
+async function expectTreeAsNative(dir: string, files: string[]) {
+  const outcome = await expectAsNative(dir, files);
+  expect(listing(dir)).toEqual(listing(outcome.native));
+  return outcome;
+}
+
+describeGit("stash apply file/directory conflicts: unique move-aside names", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-moveaside-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** The stash adds p/x; the index has the file p. */
+  function oursFileSetup(dir: string) {
+    put(dir, "p/x", "px\n");
+    run(dir, "add", "p/x");
+    run(dir, "stash", "-q");
+    put(dir, "p", "index p\n");
+    run(dir, "add", "p");
+  }
+  /** The stash adds the file q; the index has q/y. */
+  function theirsFileSetup(dir: string) {
+    put(dir, "q", "stash q\n");
+    run(dir, "add", "q");
+    run(dir, "stash", "-q");
+    put(dir, "q/y", "qy\n");
+    run(dir, "add", "q/y");
+  }
+  const P = ["p", "p/x", "p~Updated upstream", "p~Updated upstream_0"];
+  const Q = ["q", "q/y", "q~Stashed changes", "q~Stashed changes_0"];
+
+  it("an untracked file at `p~Updated upstream` refuses the apply", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    oursFileSetup(dir);
+    put(dir, "p~Updated upstream", "PRECIOUS\n");
+    const { actual } = await expectTreeAsNative(dir, P);
+    expect(actual.message).toContain("untracked working tree files would be overwritten");
+    expect(read(join(dir, "p~Updated upstream"))).toBe("PRECIOUS\n");
+  });
+
+  it("an untracked file at `q~Stashed changes` refuses the apply", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    theirsFileSetup(dir);
+    put(dir, "q~Stashed changes", "PRECIOUS\n");
+    await expectTreeAsNative(dir, Q);
+    expect(read(join(dir, "q~Stashed changes"))).toBe("PRECIOUS\n");
+  });
+
+  it("an ignored file at `p~Updated upstream` is overwritten, as git does", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, ".gitignore", "*~*\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    oursFileSetup(dir);
+    put(dir, "p~Updated upstream", "IGNORED\n");
+    await expectTreeAsNative(dir, P);
+  });
+
+  it("a tracked clean `p~Updated upstream`: the file moves to `p~Updated upstream_0`", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "p~Updated upstream", "TRACKED\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    oursFileSetup(dir);
+    await expectTreeAsNative(dir, P);
+    expect(read(join(dir, "p~Updated upstream"))).toBe("TRACKED\n");
+    expect(read(join(dir, "p~Updated upstream_0"))).toBe("index p\n");
+  });
+
+  it("a tracked `p~Updated upstream` keeps its unstaged edit", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "p~Updated upstream", "TRACKED\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    oursFileSetup(dir);
+    put(dir, "p~Updated upstream", "UNSTAGED EDIT\n");
+    await expectTreeAsNative(dir, P);
+    expect(read(join(dir, "p~Updated upstream"))).toBe("UNSTAGED EDIT\n");
+  });
+
+  it("a tracked `q~Stashed changes` keeps its unstaged edit", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "q~Stashed changes", "TRACKED\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    theirsFileSetup(dir);
+    put(dir, "q~Stashed changes", "UNSTAGED EDIT\n");
+    await expectTreeAsNative(dir, Q);
+    expect(read(join(dir, "q~Stashed changes"))).toBe("UNSTAGED EDIT\n");
+  });
+
+  it("a tracked directory `q~Stashed changes` stays, with its edit", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "q~Stashed changes/t", "TRACKED\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    theirsFileSetup(dir);
+    put(dir, "q~Stashed changes/t", "UNSTAGED EDIT\n");
+    await expectTreeAsNative(dir, [...Q, "q~Stashed changes/t"]);
+    expect(read(join(dir, "q~Stashed changes/t"))).toBe("UNSTAGED EDIT\n");
+  });
+
+  it("a staged edit of `q~Stashed changes` stays staged", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "q~Stashed changes", "TRACKED\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    put(dir, "q", "stash q\n");
+    run(dir, "add", "q");
+    run(dir, "stash", "-q");
+    put(dir, "q/y", "qy\n");
+    put(dir, "q~Stashed changes", "STAGED EDIT\n");
+    run(dir, "add", ".");
+    await expectTreeAsNative(dir, Q);
+  });
+
+  it("a tracked link `q~Stashed changes` stays a link", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    const outside = join(root, "outside.txt");
+    writeFileSync(outside, "OUTSIDE\n");
+    symlinkSync(outside, join(dir, "q~Stashed changes"));
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    theirsFileSetup(dir);
+    await expectTreeAsNative(dir, Q);
+    expect(readlinkSync(join(dir, "q~Stashed changes"))).toBe(outside);
+    expect(read(outside)).toBe("OUTSIDE\n");
+  });
+});
+
+describeGit("stash apply modify/delete with a file/directory collision", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-mddir-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** p committed; the stash modifies it; then p is deleted and p/x added (staged). */
+  function setup(dir: string, ignore = false) {
+    repo(dir);
+    if (ignore) put(dir, ".gitignore", "*.log\n");
+    put(dir, "p", "p0\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    put(dir, "p", "p-stash\n");
+    run(dir, "stash", "-q");
+    run(dir, "rm", "-q", "p");
+    put(dir, "p/x", "px staged\n");
+    run(dir, "add", "p/x");
+  }
+  const files = ["p", "p/x", "p/u", "p/x.log", "p~Stashed changes", "p~Updated upstream"];
+
+  it("ours modified p, the stash deleted p and added p/x: p moves aside", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "p", "p0\n");
+    run(dir, "add", ".");
+    run(dir, "commit", "-qm", "t");
+    run(dir, "rm", "-q", "p");
+    put(dir, "p/x", "px\n");
+    run(dir, "add", "p/x");
+    run(dir, "stash", "-q");
+    put(dir, "p", "p-ours-staged\n");
+    run(dir, "add", "p");
+    await expectTreeAsNative(dir, files);
+    expect(read(join(dir, "p~Updated upstream"))).toBe("p-ours-staged\n");
+  });
+
+  it("the stash modified p, the index has p/x: the stash's p moves aside", async () => {
+    const dir = join(root, "r");
+    setup(dir);
+    await expectTreeAsNative(dir, files);
+    expect(read(join(dir, "p/x"))).toBe("px staged\n");
+  });
+
+  it("an unstaged edit in p/x survives", async () => {
+    const dir = join(root, "r");
+    setup(dir);
+    put(dir, "p/x", "px UNSTAGED\n");
+    await expectTreeAsNative(dir, files);
+    expect(read(join(dir, "p/x"))).toBe("px UNSTAGED\n");
+  });
+
+  it("an unstaged edit and an untracked file in p survive", async () => {
+    const dir = join(root, "r");
+    setup(dir);
+    put(dir, "p/x", "px UNSTAGED\n");
+    put(dir, "p/u", "UNTRACKED\n");
+    await expectTreeAsNative(dir, files);
+    expect(read(join(dir, "p/u"))).toBe("UNTRACKED\n");
+  });
+
+  it("p/x committed on HEAD: its edit and an untracked p/u survive", async () => {
+    const dir = join(root, "r");
+    setup(dir);
+    run(dir, "commit", "-qm", "dir");
+    put(dir, "p/x", "px UNSTAGED\n");
+    put(dir, "p/u", "UNTRACKED\n");
+    await expectTreeAsNative(dir, files);
+  });
+
+  it("p/x committed on HEAD: an ignored p/x.log survives", async () => {
+    const dir = join(root, "r");
+    setup(dir, true);
+    run(dir, "commit", "-qm", "dir");
+    put(dir, "p/x.log", "LOG\n");
+    await expectTreeAsNative(dir, files);
+    expect(read(join(dir, "p/x.log"))).toBe("LOG\n");
+  });
+});
+
+describeGit("stash apply rename conflicts as git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-renames-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const files = ["a.txt", "c.txt", "d.txt", "c.txt/inner", "c.txt~Updated upstream"];
+
+  it("rename/delete: the stash renamed a.txt, HEAD deleted it (DU)", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    run(dir, "mv", "a.txt", "c.txt");
+    run(dir, "stash", "-q");
+    run(dir, "rm", "-q", "a.txt");
+    run(dir, "commit", "-qm", "del");
+    const { actual } = await expectTreeAsNative(dir, files);
+    expect(actual.status).toBe("conflicts");
+    expect(status(dir)).toBe("DU c.txt\n");
+  });
+
+  it("rename/delete: HEAD renamed and modified a.txt, the stash deleted it (UD)", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    run(dir, "rm", "-q", "a.txt");
+    run(dir, "stash", "-q");
+    run(dir, "mv", "a.txt", "c.txt");
+    put(dir, "c.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n");
+    run(dir, "commit", "-qam", "mv");
+    await expectTreeAsNative(dir, files);
+    expect(status(dir)).toBe("UD c.txt\n");
+  });
+
+  it("rename/rename: a.txt renamed to c.txt by HEAD and to d.txt by the stash", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    run(dir, "mv", "a.txt", "d.txt");
+    run(dir, "stash", "-q");
+    run(dir, "mv", "a.txt", "c.txt");
+    run(dir, "commit", "-qm", "mv");
+    await expectTreeAsNative(dir, files);
+    expect(status(dir)).toBe("DD a.txt\nAU c.txt\nUA d.txt\n");
+  });
+
+  it("the stash renamed and modified a.txt, HEAD added another c.txt", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    run(dir, "mv", "a.txt", "c.txt");
+    put(dir, "c.txt", "ONE\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+    run(dir, "add", "c.txt");
+    run(dir, "stash", "-q");
+    put(dir, "c.txt", "HEAD C\n");
+    run(dir, "add", "c.txt");
+    run(dir, "commit", "-qm", "c");
+    await expectTreeAsNative(dir, files);
+  });
+
+  it("HEAD renamed a.txt to c.txt, the stash added c.txt/inner: the file moves aside", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    put(dir, "c.txt/inner", "stash dir\n");
+    run(dir, "add", ".");
+    put(dir, "a.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\nSTASH\n");
+    run(dir, "stash", "-q");
+    run(dir, "mv", "a.txt", "c.txt");
+    run(dir, "commit", "-qm", "mv");
+    await expectTreeAsNative(dir, files);
+    expect(read(join(dir, "c.txt~Updated upstream"))).toBe("1\n2\n3\n4\n5\n6\n7\n8\n9\nSTASH\n");
+  });
+
+  it("the stash renamed a.txt to c, an untracked file in a directory c", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    run(dir, "mv", "a.txt", "c");
+    run(dir, "stash", "-q");
+    put(dir, "c/u", "UNTRACKED in dir\n");
+    await expectTreeAsNative(dir, ["a.txt", "c", "c/u"]);
+    expect(read(join(dir, "c/u"))).toBe("UNTRACKED in dir\n");
+  });
+});
+
+describe("findInTheWay never lets a file replace a tracked directory", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "in-the-way-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("refuses a write at a tracked directory unless its files are removed", async () => {
+    const dir = join(root, "r");
+    mkdirSync(join(dir, "p"), { recursive: true });
+    writeFileSync(join(dir, "p/x"), "tracked\n");
+    const files = createNodeFilesApi({ rootDir: dir });
+    const { history } = await createGitFilesBackend({ files, create: true });
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "",
+      gitDir: ".git",
+      blobs: history.blobs,
+      trees: history.trees,
+    });
+    const index = new Map([["p/x", {}]]);
+    expect(await findInTheWay(worktree, { writes: ["p"], removes: new Set(), index })).toEqual({
+      untracked: [],
+      lostDirs: ["p"],
+    });
+    // also when the directory is missing from the worktree: the index still has it
+    rmSync(join(dir, "p"), { recursive: true });
+    expect(
+      (await findInTheWay(worktree, { writes: ["p"], removes: new Set(), index })).lostDirs,
+    ).toEqual(["p"]);
+    // removing the tracked files first makes way
+    expect(
+      await findInTheWay(worktree, { writes: ["p"], removes: new Set(["p/x"]), index }),
+    ).toEqual({ untracked: [], lostDirs: [] });
   });
 });
