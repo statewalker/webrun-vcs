@@ -30,12 +30,21 @@ const PKT_FLUSH = "0000";
  * has to be re-framed; patching the raw bytes in place would desynchronise
  * the parser. Throws if `patch` changed nothing, so a stale pattern cannot
  * quietly turn the test into a no-op.
+ *
+ * The advertisement is asked for without `Git-Protocol: version=2`, so the
+ * server answers with the v0 ref advertisement (the one carrying `symref=`)
+ * and the client falls back to v0.
  */
 function withPatchedAdvertisement(
   inner: typeof globalThis.fetch,
   patch: (payload: string) => string,
 ): typeof globalThis.fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    if (input instanceof Request && input.url.includes("/info/refs")) {
+      const headers = new Headers(input.headers);
+      headers.delete("git-protocol");
+      input = new Request(input, { headers });
+    }
     const response = await inner(input, init);
     const url = input instanceof Request ? input.url : String(input);
     if (!url.includes("/info/refs")) return response;

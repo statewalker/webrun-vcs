@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import type { RepositoryFacade } from "../../src/api/repository-facade.js";
+import type { RefStore } from "../../src/context/process-context.js";
 import { fetch as fetchPack } from "../../src/operations/fetch.js";
 import { lsRemote } from "../../src/operations/ls-remote.js";
 import { push } from "../../src/operations/push.js";
@@ -20,6 +22,41 @@ const advertisement =
   pkt(`${HEAD} refs/heads/master\n`) +
   pkt(`${TEST} refs/heads/test\n`) +
   "0000";
+
+/**
+ * An empty local repository for a fetch: its `importPack` hands the pack to `onPack` (or
+ * collects it into `received`), its refs live in `refs`.
+ */
+function localRepo(onPack?: (pack: AsyncIterable<Uint8Array>) => Promise<void>) {
+  const refs = new Map<string, string>();
+  const received: number[] = [];
+  const updates: string[] = [];
+  const repository = {
+    async importPack(pack: AsyncIterable<Uint8Array>) {
+      if (onPack) await onPack(pack);
+      else for await (const chunk of pack) received.push(...chunk);
+      return {
+        objectsImported: 0,
+        blobsWithDelta: 0,
+        treesImported: 0,
+        commitsImported: 0,
+        tagsImported: 0,
+      };
+    },
+    exportPack: async function* () {},
+    has: async () => false,
+    walkAncestors: async function* () {},
+  } as unknown as RepositoryFacade;
+  const refStore: RefStore = {
+    get: async (name) => refs.get(name),
+    update: async (name, oid) => {
+      updates.push(name);
+      refs.set(name, oid);
+    },
+    listAll: async () => refs.entries(),
+  };
+  return { repository, refStore, received, updates };
+}
 
 /** A fake server: answers /info/refs and records the upload-pack request body. */
 function fakeServer() {
@@ -44,7 +81,9 @@ describe("smart-HTTP operations against a real-format advertisement", () => {
 
   it("a fetch without haves sends wants, one flush, then done", async () => {
     const { fetchImpl, requests } = fakeServer();
-    await fetchPack({ url: "https://example.test/repo.git", fetchImpl }).catch(() => {});
+    await fetchPack({ url: "https://example.test/repo.git", fetchImpl, ...localRepo() }).catch(
+      () => {},
+    );
     const body = requests[0] ?? "";
     expect(body).toMatch(/^[0-9a-f]{4}want /);
     // A second flush before `done` ends the negotiation: the server answers NAK and sends no pack.
@@ -87,7 +126,7 @@ describe("smart-HTTP operations with a token", () => {
   it("fetch and lsRemote send the token as the Basic auth password", async () => {
     const { fetchImpl, authorizations } = recordingServer("git-upload-pack");
     await lsRemote(url, { auth, fetchImpl });
-    await fetchPack({ url, auth, fetchImpl }).catch(() => {});
+    await fetchPack({ url, auth, fetchImpl, ...localRepo() }).catch(() => {});
     expect(authorizations).toEqual([tokenBasic, tokenBasic, tokenBasic]);
   });
 
@@ -143,23 +182,25 @@ describe("fetch: the upload-pack response", () => {
 
   it("an ERR line instead of a pack fails the fetch", async () => {
     const fetchImpl = server(() => join([pkt("ERR upload-pack: not our ref\n")]));
-    await expect(fetchPack({ url, fetchImpl })).rejects.toThrow(/not our ref/);
+    await expect(fetchPack({ url, fetchImpl, ...localRepo() })).rejects.toThrow(/not our ref/);
   });
 
   it("no pack after the wants fails the fetch, so no refs are written", async () => {
     const fetchImpl = server(() => join([pkt("NAK\n"), "0000"]));
-    await expect(fetchPack({ url, fetchImpl })).rejects.toThrow(/no pack/);
+    const local = localRepo();
+    await expect(fetchPack({ url, fetchImpl, ...local })).rejects.toThrow(/no pack/);
+    expect(local.updates).toEqual([]);
     let called = false;
     await expect(
       fetchPack({
         url,
         fetchImpl,
-        onPack: async (p) => {
+        ...localRepo(async (p) => {
           called = true;
           for await (const _ of p) {
             // nothing arrives
           }
-        },
+        }),
       }),
     ).rejects.toThrow(/no pack/);
     expect(called).toBe(true);
@@ -167,8 +208,10 @@ describe("fetch: the upload-pack response", () => {
 
   it("an empty pack (every want already present) is a success", async () => {
     const fetchImpl = server(() => join([pkt("NAK\n"), sideband(1, emptyPack), "0000"]));
-    const r = await fetchPack({ url, fetchImpl });
-    expect(r.packData).toEqual(emptyPack);
+    const local = localRepo();
+    const r = await fetchPack({ url, fetchImpl, ...local });
+    expect(local.received).toEqual([...emptyPack]);
+    expect(r.packObjects).toBe(0);
   });
 
   it("a failed import cancels the response body", async () => {
@@ -188,9 +231,9 @@ describe("fetch: the upload-pack response", () => {
       fetchPack({
         url,
         fetchImpl,
-        onPack: async (p) => {
+        ...localRepo(async (p) => {
           for await (const _ of p) throw new Error("corrupt pack");
-        },
+        }),
       }),
     ).rejects.toThrow(/corrupt pack/);
     expect(cancelled).toBe(true);
@@ -221,9 +264,9 @@ describe("fetch: the upload-pack response", () => {
       url,
       fetchImpl,
       timeout: 50,
-      onPack: async (p) => {
+      ...localRepo(async (p) => {
         for await (const _ of p) await new Promise((res) => setTimeout(res, 150)); // a slow store
-      },
+      }),
     });
     expect(r.isEmpty).toBe(false);
 
@@ -244,7 +287,9 @@ describe("fetch: the upload-pack response", () => {
         }),
       );
     };
-    await expect(fetchPack({ url, fetchImpl: stalled, timeout: 50 })).rejects.toThrow(/timeout/);
+    await expect(
+      fetchPack({ url, fetchImpl: stalled, timeout: 50, ...localRepo() }),
+    ).rejects.toThrow(/timeout/);
   });
 });
 
@@ -271,39 +316,18 @@ describe("readableStreamToAsyncIterable", () => {
   });
 });
 
-describe("httpFetch: no pack after the wants", () => {
+describe("fetch: no pack after the wants", () => {
   it("fails without writing refs", async () => {
-    const { httpFetch } = await import("../../src/adapters/http/http-client.js");
-    const fetchFn = (async (input: RequestInfo | URL) => {
-      const u = String(input);
-      if (u.endsWith("/info/refs?service=git-upload-pack")) return new Response(advertisement);
+    const fetchImpl = async (request: Request) => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
       return new Response(`${pkt("NAK\n")}0000`);
-    }) as typeof fetch;
-    const updates: string[] = [];
-    const refStore = {
-      listAll: async () => new Map<string, string>(),
-      update: async (name: string) => {
-        updates.push(name);
-      },
     };
-    const repository = {
-      has: async () => false,
-      importPack: async (p: AsyncIterable<Uint8Array>) => {
-        for await (const _ of p) {
-          // nothing arrives
-        }
-        return { objectsImported: 0 };
-      },
-    };
-    const r = await httpFetch(
-      "https://example.test/repo.git",
-      repository as never,
-      refStore as never,
-      { fetchFn },
-    );
-    expect(r.success).toBe(false);
-    expect(r.error).toMatch(/no pack/);
-    expect(updates).toEqual([]);
+    const local = localRepo();
+    await expect(
+      fetchPack({ url: "https://example.test/repo.git", fetchImpl, ...local }),
+    ).rejects.toThrow(/no pack/);
+    expect(local.updates).toEqual([]);
   });
 });
 
@@ -328,17 +352,18 @@ describe("fetch: a timeout without a cooperating fetchImpl", () => {
         }),
       );
     };
-    await expect(fetchPack({ url, fetchImpl: deaf, timeout: 50 })).rejects.toThrow(/timeout/);
+    await expect(fetchPack({ url, fetchImpl: deaf, timeout: 50, ...localRepo() })).rejects.toThrow(
+      /timeout/,
+    );
   }, 5000);
 });
 
-describe("httpFetch: a failed import", () => {
+describe("fetch: a failed import", () => {
   it("cancels the response body even when the importer never read it", async () => {
-    const { httpFetch } = await import("../../src/adapters/http/http-client.js");
     let cancelled = false;
-    const fetchFn = (async (input: RequestInfo | URL) => {
-      const u = String(input);
-      if (u.endsWith("/info/refs?service=git-upload-pack")) return new Response(advertisement);
+    const fetchImpl = async (request: Request) => {
+      if (request.url.endsWith("/info/refs?service=git-upload-pack"))
+        return new Response(advertisement);
       return new Response(
         new ReadableStream<Uint8Array>({
           start(c) {
@@ -349,22 +374,14 @@ describe("httpFetch: a failed import", () => {
           },
         }),
       );
-    }) as typeof fetch;
-    const repository = {
-      has: async () => false,
-      importPack: async () => {
-        throw new Error("store unavailable");
-      },
     };
-    const refStore = { listAll: async () => new Map<string, string>(), update: async () => {} };
-    const r = await httpFetch(
-      "https://example.test/repo.git",
-      repository as never,
-      refStore as never,
-      { fetchFn },
-    );
-    expect(r.success).toBe(false);
-    expect(r.error).toMatch(/store unavailable/);
+    const local = localRepo(async () => {
+      throw new Error("store unavailable");
+    });
+    await expect(
+      fetchPack({ url: "https://example.test/repo.git", fetchImpl, ...local }),
+    ).rejects.toThrow(/store unavailable/);
+    expect(local.updates).toEqual([]);
     expect(cancelled).toBe(true);
   });
 });

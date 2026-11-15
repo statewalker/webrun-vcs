@@ -453,3 +453,21 @@ export async function resolveDeepenNot(
   }
   return found.length === 1 ? found[0] : undefined;
 }
+
+/**
+ * The object an annotated tag (or tag chain) finally points at; undefined for anything that
+ * is not a tag, or without a way to peel.
+ */
+export async function peelFully(
+  repository: RepositoryFacade | undefined,
+  oid: string,
+): Promise<string | undefined> {
+  if (!repository?.peelTag) return undefined;
+  let id = oid;
+  for (let i = 0; i < 16; i++) {
+    const target = await repository.peelTag(id);
+    if (!target || target === id) break;
+    id = target;
+  }
+  return id === oid ? undefined : id;
+}

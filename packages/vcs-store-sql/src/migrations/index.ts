@@ -296,6 +296,19 @@ export const migrations: Migration[] = [
       DROP TABLE IF EXISTS raw_store_chunk;
     `,
   },
+  {
+    version: 7,
+    name: "shallow_commits",
+    // git's shallow file: the boundary commits of a shallow clone (SQLRefStore.getShallow)
+    up: `
+      CREATE TABLE IF NOT EXISTS vcs_shallow (
+        object_id TEXT PRIMARY KEY
+      );
+    `,
+    down: `
+      DROP TABLE IF EXISTS vcs_shallow;
+    `,
+  },
 ];
 
 /**

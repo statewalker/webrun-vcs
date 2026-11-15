@@ -69,6 +69,34 @@ function rowToRef(row: RefRow): Ref | SymbolicRef {
 export class SQLRefStore implements Refs {
   constructor(private db: DatabaseClient) {}
 
+  /** The shallow commits (git's shallow file), table `vcs_shallow`. */
+  async getShallow(): Promise<ObjectId[]> {
+    const rows = await this.db.query<{ object_id: string }>(
+      "SELECT object_id FROM vcs_shallow ORDER BY object_id",
+    );
+    return rows.map((row) => row.object_id);
+  }
+
+  /** Replace the shallow commits in one transaction. */
+  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
+    const ids = [...new Set(commits)];
+    await this.db.transaction(async (tx) => {
+      if (expected) {
+        const rows = await tx.query<{ object_id: string }>(
+          "SELECT object_id FROM vcs_shallow ORDER BY object_id",
+        );
+        const want = [...new Set(expected)].sort();
+        if (rows.length !== want.length || rows.some((r, i) => r.object_id !== want[i])) {
+          throw new Error("shallow file has changed since we read it");
+        }
+      }
+      await tx.execute("DELETE FROM vcs_shallow");
+      for (const id of ids) {
+        await tx.execute("INSERT INTO vcs_shallow (object_id) VALUES (?)", [id]);
+      }
+    });
+  }
+
   /**
    * Apply all commands atomically, or none (see {@link Refs.batch}): the batch is
    * planned and written inside one transaction, with its reflog lines

@@ -15,11 +15,12 @@ This makes protocol logic explicit and testable. Each handler reads from or writ
 ### Three Abstraction Levels
 
 ```
-Operations (fetch, push, clone, lsRemote)
+Operations (fetch, push, lsRemote)
     ↓ uses
 Duplex Operations (fetchOverDuplex, pushOverDuplex, serveOverDuplex)
     ↓ uses
-FSM Engine (Fsm + transitions + handlers)
+Fetch client (fetch-client/: git's fetch-pack over an UploadPackConnection: HTTP or duplex)
+  and the FSM Engine (Fsm + transitions + handlers: push, and the servers)
     ↓ uses
 TransportApi (pkt-line reader/writer, sideband read/write, pack streaming)
     ↓ uses
@@ -50,7 +51,7 @@ packages/vcs-transport/src/
 ├── api/                    # Core interfaces
 │   ├── credentials.ts      #   Authentication types
 │   ├── duplex.ts           #   Bidirectional stream interface
-│   ├── fetch-result.ts     #   FetchResult, ServeResult, RawFetchResult
+│   ├── fetch-result.ts     #   FetchResult (duplex fetch), ServeResult
 │   ├── push-result.ts      #   PushResult, RefPushStatus
 │   ├── options.ts          #   Base option interfaces
 │   ├── repository-facade.ts #  Transport-layer repo interface
@@ -60,28 +61,33 @@ packages/vcs-transport/src/
 │   ├── fsm.ts              #   FSM engine (run, transition, handler dispatch)
 │   ├── types.ts            #   FsmTransition, FsmStateHandler
 │   ├── fetch/              #   Fetch protocol FSMs
-│   │   ├── client-fetch-fsm.ts  # Client-side fetch (39 handlers, 49 transitions)
 │   │   ├── server-fetch-fsm.ts  # Server-side fetch (43 handlers, 44 transitions)
+│   │   ├── upload-pack-graph.ts # Commit-graph walks of upload-pack (shallow, ok_to_give_up)
 │   │   └── types.ts             # ClientFetchEvent, ServerFetchEvent
 │   ├── push/               #   Push protocol FSMs
 │   │   ├── client-push-fsm.ts   # Client-side push (25 handlers, 32 transitions)
 │   │   ├── server-push-fsm.ts   # Server-side push (41 handlers, 41 transitions)
 │   │   └── types.ts             # PushCommand, PushCommandType, PushCommandResult
 │   ├── protocol-v2/        #   Protocol V2 FSMs
-│   │   ├── client-v2-fsm.ts     # V2 client fetch
 │   │   ├── server-v2-fsm.ts     # V2 server fetch
 │   │   └── types.ts             # FetchV2Request, FetchV2ResponseSection
 │   └── error-recovery/     #   Error handling FSM
 │       ├── error-classifier.ts   # classifyError
 │       └── error-recovery-fsm.ts # Retry, reconnect, escalate
 │
+├── fetch-client/           # The fetch client (git's fetch-pack, remote-curl)
+│   ├── connection.ts       #   UploadPackConnection: smart HTTP (stateless) or duplex (stateful), v2 or v0
+│   ├── pkt-stream.ts       #   Pkt-lines from a byte stream, the side-band pack
+│   ├── negotiator.ts       #   git's default negotiator (commit-date queue, common marking)
+│   ├── fetch-pack.ts       #   Negotiation rounds and the pack (v0, v2)
+│   ├── ref-updates.ts      #   Refspec mapping, fast-forward checks, ref transactions
+│   └── fetch-remote.ts     #   A whole fetch: ls-refs, wants, shallow file, tag following, refs
+│
 ├── operations/             # High-level operations
-│   ├── fetch.ts            #   HTTP fetch
+│   ├── fetch.ts            #   HTTP fetch (the fetch client over smart HTTP)
 │   ├── push.ts             #   HTTP push
-│   ├── clone.ts            #   HTTP clone
 │   ├── ls-remote.ts        #   HTTP ls-remote
-│   ├── fetch-over-duplex.ts    # Duplex fetch
-│   ├── fetch-v2-over-duplex.ts # Duplex fetch (protocol v2)
+│   ├── fetch-over-duplex.ts    # Duplex fetch (the fetch client over a duplex)
 │   ├── push-over-duplex.ts     # Duplex push
 │   ├── serve-over-duplex.ts    # Duplex server
 │   └── p2p-sync.ts             # Bidirectional P2P sync

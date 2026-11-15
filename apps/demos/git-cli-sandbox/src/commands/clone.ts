@@ -2,11 +2,14 @@
  * Clone command - Clone a repository via HTTP
  */
 
-import { FileMode, type FilesApi, type History, installPack } from "@statewalker/vcs-core";
+import { FileMode, type FilesApi, type History } from "@statewalker/vcs-core";
 import { createGitFilesBackend, FileStagingStore } from "@statewalker/vcs-store-files";
-import { clone as transportClone } from "@statewalker/vcs-transport";
+import {
+  createRepositoryFacade,
+  createTransportRefStore,
+  fetch as transportFetch,
+} from "@statewalker/vcs-transport";
 import { joinPath } from "@statewalker/vcs-utils/files";
-import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { createDirFilesApi, dim, fatal, info, resolvePath, success } from "../shared.js";
 
@@ -140,26 +143,6 @@ export async function runClone(args: string[]): Promise<void> {
   await dirFiles.mkdir("/");
 
   try {
-    // Execute transport clone
-    const cloneResult = await transportClone({
-      url,
-      branch,
-      depth,
-      bare,
-      remoteName: "origin",
-      onProgressMessage: (msg) => {
-        const trimmed = msg.trim();
-        if (trimmed) {
-          process.stdout.write(`\r${dim(trimmed)}`.padEnd(80));
-        }
-      },
-    });
-
-    process.stdout.write(`${"\r".padEnd(80)}\r`);
-
-    console.log(info(`remote: Enumerating objects: done.`));
-    console.log(info(`remote: Total ${cloneResult.refs.size} refs.`));
-
     // Create repository structure
     const files = createNodeFilesApi({ rootDir: absDir });
     const gitDir = bare ? "." : ".git";
@@ -168,35 +151,45 @@ export async function runClone(args: string[]): Promise<void> {
       files,
       gitDir,
       create: true,
-      defaultBranch: cloneResult.defaultBranch || "main",
+      defaultBranch: branch || "main",
     });
     await repository.initialize();
 
-    // Store pack data
-    if (cloneResult.packData.length > 0) {
-      console.log(info(`Receiving objects: 100%`));
-
-      const packDir = `${gitDir}/objects/pack`;
-      await files.mkdir(packDir);
-      // index-pack: checks the pack, writes pack-<id>.pack, then its .idx
-      const installed = await installPack(files, packDir, toAsyncIterable(cloneResult.packData));
-      console.log(info(`Resolving deltas: ${installed.count} objects`));
-    }
-
-    // Set up refs
+    // Clone: a fetch into the empty repository (the pack is stored as it arrives)
     const remoteName = "origin";
-    for (const [refName, objectId] of cloneResult.refs) {
-      await repository.refs.set(refName, bytesToHex(objectId));
-    }
+    const heads = branch ? `refs/heads/${branch}` : "refs/heads/*";
+    const tracking = bare
+      ? heads
+      : branch
+        ? `refs/remotes/${remoteName}/${branch}`
+        : `refs/remotes/${remoteName}/*`;
+    const result = await transportFetch({
+      url,
+      repository: createRepositoryFacade({ history: repository }),
+      refStore: createTransportRefStore(repository.refs),
+      refspecs: [`+${heads}:${tracking}`],
+      tags: branch || depth ? "auto" : "all",
+      depth,
+      onProgress: (msg) => {
+        if (msg) process.stdout.write(`\r${dim(msg)}`.padEnd(80));
+      },
+    });
+
+    process.stdout.write(`${"\r".padEnd(80)}\r`);
+
+    console.log(info(`remote: Enumerating objects: done.`));
+    console.log(info(`Receiving objects: 100% (${result.packObjects})`));
 
     // Create local branch from remote tracking
-    const defaultBranch = cloneResult.defaultBranch || "main";
-    const trackingRef = `refs/remotes/${remoteName}/${defaultBranch}`;
+    const defaultBranch = branch || result.defaultBranch?.replace(/^refs\/heads\//, "") || "main";
     const localRef = `refs/heads/${defaultBranch}`;
-
-    const trackingValue = cloneResult.refs.get(trackingRef);
-    if (trackingValue) {
-      await repository.refs.set(localRef, bytesToHex(trackingValue));
+    if (!bare) {
+      const trackingValue = await repository.refs.resolve(
+        `refs/remotes/${remoteName}/${defaultBranch}`,
+      );
+      if (trackingValue?.objectId) {
+        await repository.refs.set(localRef, trackingValue.objectId);
+      }
     }
 
     // Set HEAD
