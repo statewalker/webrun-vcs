@@ -1,6 +1,7 @@
 ---
 "@statewalker/vcs-transport": minor
 "@statewalker/vcs-commands": minor
+"@statewalker/vcs-transport-httpeers": minor
 ---
 
 **Breaking: one push client, like git's send-pack (P3.5).**
@@ -12,3 +13,4 @@
 - **The request:** only advertised capabilities are asked for (`report-status`, `side-band-64k`, `quiet`, `atomic`, `push-options`, `object-format`, `agent`; `ofs-delta` is used, not asked, as git); `atomic`/`pushOptions` the server does not advertise throw. The pack is thin against every advertised tip that is here (and `.have` lines), unless `no-thin` or `thin: false`; deletes only send no pack; nothing to update sends no request. Over smart HTTP the body streams (`streamRequestBody: false` collects it, with a `Content-Length`), `timeout` is an idle timeout, the report is read as it arrives (keep-alives, progress), 401/403 are `AuthenticationError`s.
 - **API changes:** `push(options)` takes `repository` and `refStore` (was `getLocalRef` and `exportPack`) and returns `PushClientResult` (`updates: PushRefUpdate[]`, `unpack`, `packObjects`, `packBytes`, `bytesSent`, `capabilities`; was `HttpPushResult` with `updates: Map`, `unpackStatus`, `objectCount`); new options `forceWithLease`, `trackingValue`, `pushOptions`, `prune`, `thin`, `dryRun`, `quiet`, `onProgress` (was `onProgressMessage`). `pushOverDuplex` takes the same options plus `duplex`/`closeDuplex` (no `delete`); `RefPushStatus` gains `status`, `PushResult` gains `report`. Removed: `httpPush` (use `push`), `clientPushTransitions`/`clientPushHandlers` (the client push FSM), `HttpPushResult`, `RefUpdateResult`, `BasePushOptions`, `BaseDuplexOptions`, `ProcessConfiguration.pushRefspecs`. `readServerGreeting`, `ServerGreeting` and `withTimeout` are exported from the fetch client for the push connections.
 - **vcs-commands `PushCommand`:** runs the push client; `setForceWithLease(ref?, expect?)`, `setPrune`; `setPushAll`/`setPushTags` push `refs/heads/*`/`refs/tags/*`; without refspecs the remote's `push` refspecs, else the current branch; accepted refs move their remote-tracking refs (`refs/remotes/<remote>/…`). `PushStatus.REJECTED_REMOTE_CHANGED` (stale lease) and `RemoteRefUpdate.summary` are new; "fetch first" maps to `REJECTED_NONFASTFORWARD` (as JGit), `forceUpdate` is whether the update was allowed to force, `messages` holds the server's progress.
+- **vcs-transport-httpeers:** `meshGitPush` returns the push client's `PushClientResult` and takes `repository`/`refStore` (was `getLocalRef`/`exportPack`).

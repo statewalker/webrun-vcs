@@ -46,10 +46,10 @@ await meshGitFetch({ ...remote, repository, refStore, refspecs: ["+refs/heads/*:
 const result = await meshGitPush({
   ...remote,
   refspecs: [`refs/heads/main:refs/peers/${myPeerId}/main`],
-  getLocalRef: (ref) => refStore.get(ref),
-  exportPack: (wants, exclude) => repository.exportPack(wants, exclude),
+  repository,
+  refStore,
 });
-result.updates.get(`refs/peers/${myPeerId}/main`); // { ok: true }
+result.updates[0]; // { remoteRef: `refs/peers/${myPeerId}/main`, status: "ok", summary: "[new reference]", … }
 ```
 
 `token` is the membership token the hub minted (`mintToken` of
