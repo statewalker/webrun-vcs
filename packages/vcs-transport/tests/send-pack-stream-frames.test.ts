@@ -4,14 +4,13 @@
  * chunking of the pack source, holding at most one frame.
  */
 import { describe, expect, it } from "vitest";
-
-import { createHttpHandler } from "../src/index.js";
 import type { TransportApi } from "../src/api/transport-api.js";
 import {
   SIDEBAND_64K_MAX_PAYLOAD,
   SIDEBAND_MAX_PAYLOAD,
   sendPackStream,
 } from "../src/fsm/fetch/send-pack-stream.js";
+import { createHttpHandler } from "../src/index.js";
 import { encodeDelim, encodeFlush, encodePacketLine } from "../src/protocol/pkt-line-codec.js";
 import { createTransportRepo } from "./interop/helpers.js";
 
