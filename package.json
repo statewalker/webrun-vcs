@@ -17,6 +17,7 @@
     "test": "pnpm -r run test",
     "typecheck": "pnpm -r run typecheck",
     "test:app": "turbo run test:app",
+    "test:nightly": "pnpm --no-bail --workspace-concurrency=1 --filter @statewalker/vcs-utils --filter @statewalker/vcs-demo-browser-app run test:browser",
     "lint": "biome check --write .",
     "lint:check": "biome check .",
     "lint:fix": "biome check --write --unsafe .",

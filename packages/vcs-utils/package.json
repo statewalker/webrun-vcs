@@ -121,6 +121,7 @@
   "devDependencies": {
     "@types/node": "catalog:",
     "@vitest/browser": "catalog:",
+    "@vitest/browser-playwright": "catalog:",
     "playwright": "catalog:",
     "rolldown": "catalog:",
     "typescript": "catalog:",
