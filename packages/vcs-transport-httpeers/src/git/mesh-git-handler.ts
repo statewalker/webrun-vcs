@@ -6,9 +6,11 @@
 import { isValidRefName } from "@statewalker/vcs-core";
 import {
   createFetchHandler,
+  fetchRequestToHttpRequest,
   type HookResult,
   type HookVerdict,
   type HttpHandlerOptions,
+  parseGitRequest,
   type ReceiveCommand,
   type ReceivePackHookContext,
   type ReceivePackHooks,
@@ -37,8 +39,9 @@ export interface MeshGitHandlerOptions extends Omit<HttpHandlerOptions, "resolve
   /** The mesh: issuer, rules, revocation, how the caller's peer is proven */
   access: MeshAccessOptions;
   /**
-   * The ref prefix a `git:write-own` caller may push to (default `refs/peers/<peerId>/`).
-   * `undefined` refuses that caller every push.
+   * The ref prefix a `git:write-own` caller may push to (default `refs/peers/<peerId>/`). It
+   * must start with `refs/`; a missing trailing `/` is added. `undefined` refuses that caller
+   * every push.
    */
   ownNamespace?: (peer: string) => string | undefined;
 }
@@ -49,14 +52,22 @@ export function defaultOwnNamespace(peer: string): string | undefined {
   return `refs/peers/${peer}/`;
 }
 
+/**
+ * Which service a request is for, read exactly as the transport's server reads it
+ * (`parseGitRequest`), or `undefined` when it is no git request (the server answers 400).
+ */
+export function gitServiceOf(request: Request): "git-upload-pack" | "git-receive-pack" | undefined {
+  const { path, query } = fetchRequestToHttpRequest(request);
+  return parseGitRequest(path, query)?.service;
+}
+
 /** Whether a request is for receive-pack (a push, or its ref advertisement). */
 export function isReceivePackRequest(request: Request): boolean {
-  const url = new URL(request.url);
-  return (
-    url.pathname.endsWith("/git-receive-pack") ||
-    (url.pathname.endsWith("/info/refs") && url.searchParams.get("service") === "git-receive-pack")
-  );
+  return gitServiceOf(request) === "git-receive-pack";
 }
+
+const badRequest = (message: string) =>
+  new Response(message, { status: 400, headers: { "content-type": "text/plain" } });
 
 /** A hook verdict as the refs it refuses (`"all"`: the whole push) and why. */
 function refusedBy(
@@ -136,23 +147,42 @@ export function meshGitHandler(options: MeshGitHandlerOptions): MeshHandler {
   }
   const base: HttpHandlerOptions = { ...rest, resolveRepository };
   const serve = createFetchHandler(base);
+  /** One handler per own namespace (their hooks differ by prefix) */
+  const byPrefix = new Map<string, ReturnType<typeof createFetchHandler>>();
+  const servePrefix = (prefix: string) => {
+    let handler = byPrefix.get(prefix);
+    if (!handler) {
+      if (byPrefix.size >= 1024) byPrefix.clear();
+      handler = createFetchHandler({
+        ...base,
+        receivePack: {
+          ...base.receivePack,
+          hooks: ownNamespaceHooks(prefix, base.receivePack?.hooks),
+        },
+      });
+      byPrefix.set(prefix, handler);
+    }
+    return handler;
+  };
 
   return withMeshAccess(access, async (request: Request, caller: MeshCaller) => {
     const caps = caller.capabilities;
+    // one reading of the request for the decision and the server: a repeated `service` is refused
+    if (new URL(request.url).searchParams.getAll("service").length > 1) {
+      await request.body?.cancel().catch(() => {});
+      return badRequest("Repeated service parameter");
+    }
     if (!isReceivePackRequest(request)) {
       if (!caps.has(GIT_READ)) return refusal(403, `${GIT_READ} required`);
       return serve(request);
     }
     if (caps.has(GIT_WRITE)) return serve(request);
     if (!caps.has(GIT_WRITE_OWN)) return refusal(403, `${GIT_WRITE} required`);
-    const prefix = caller.peer === undefined ? undefined : ownNamespace(caller.peer);
-    if (!prefix) return refusal(403, "this peer id cannot name a ref namespace");
-    return createFetchHandler({
-      ...base,
-      receivePack: {
-        ...base.receivePack,
-        hooks: ownNamespaceHooks(prefix, base.receivePack?.hooks),
-      },
-    })(request);
+    let prefix = caller.peer === undefined ? undefined : ownNamespace(caller.peer);
+    if (!prefix?.startsWith("refs/"))
+      return refusal(403, "this peer id cannot name a ref namespace");
+    // a prefix is a directory: `refs/peers/a` must not also admit `refs/peers/ab`
+    if (!prefix.endsWith("/")) prefix = `${prefix}/`;
+    return servePrefix(prefix)(request);
   });
 }

@@ -1,19 +1,14 @@
 /**
  * A peer connection: Fetch exchanges over a webrun `Duplex` (`@statewalker/webrun-http-streams`),
- * with the mesh's two headers handled at the edges. The serving side stamps each request with the
+ * with the mesh's two headers handled at the edges. The serving side binds each request to the
  * peer its transport proved (and drops whatever the caller claimed); the calling side adds its
- * membership token (and never claims an identity itself).
+ * membership token, only for the remote's own origin, and never claims an identity itself.
  */
 
-import {
-  MESH_TOKEN_HEADER,
-  PEER_ID_HEADER,
-  registerAnonymous,
-  registerPeer,
-} from "@statewalker/httpeers-core";
+import { MESH_TOKEN_HEADER, PEER_ID_HEADER } from "@statewalker/httpeers-core";
 import { fetchOverDuplex, serveFetchOverDuplex } from "@statewalker/webrun-http-streams";
 import type { Duplex as WebrunDuplex } from "@statewalker/webrun-streams";
-import type { MeshHandler } from "../access/index.js";
+import { bindProvenPeer, type MeshHandler } from "../access/index.js";
 
 export type { WebrunDuplex };
 
@@ -32,8 +27,8 @@ export interface ServePeerConnectionOptions {
 /**
  * The serving end of one peer connection: a webrun `Duplex` running `handler` (a
  * `meshGitHandler`, a `meshLfsHandler`, or both behind a router) for each Fetch exchange. Every
- * request is bound to `remotePeer` before the handler sees it, replacing any peer header the
- * caller sent.
+ * request is bound to `remotePeer` (`bindProvenPeer`) before the handler sees it, replacing any
+ * peer header the caller sent.
  *
  * @example
  * ```ts
@@ -52,25 +47,81 @@ export function servePeerConnection(
       headers: new Headers(incoming.headers),
       duplex: "half",
     } as RequestInit);
-    if (options.remotePeer === undefined) registerAnonymous(request);
-    else registerPeer(request, options.remotePeer);
+    bindProvenPeer(request, options.remotePeer);
     return handler(request);
   });
 }
 
+/** Options of {@link withMeshToken}. */
+export interface MeshTokenOptions {
+  /**
+   * The remote's origin (`http://peer-b`, or any URL on it): the only origin the token goes to.
+   * Default: the origin of the first request.
+   */
+  origin?: string;
+  /** Same-origin redirects followed at most (default 5); a redirect to another origin throws */
+  maxRedirects?: number;
+}
+
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+/** Thrown for a redirect the mesh client does not follow (another origin, or too many). */
+export class MeshRedirectError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MeshRedirectError";
+  }
+}
+
 /**
- * Adds the membership token to every request of `fetchImpl` (and removes any peer header: an
- * identity is proven by the transport, never claimed).
+ * Adds the membership token to the requests of `fetchImpl` that go to the remote's origin
+ * (`options.origin`, default the first request's), and removes any peer header from all of them:
+ * an identity is proven by the transport, never claimed. Redirects are not left to `fetchImpl`
+ * (`redirect: "manual"`): a same-origin redirect of a request without a body is followed, with
+ * the token; a redirect to another origin throws {@link MeshRedirectError}, so the token never
+ * follows one.
  */
 export function withMeshToken(
   fetchImpl: (request: Request) => Promise<Response>,
   token: MeshToken,
+  options: MeshTokenOptions = {},
 ): (request: Request) => Promise<Response> {
+  let pinned = options.origin === undefined ? undefined : new URL(options.origin).origin;
+  const maxRedirects = options.maxRedirects ?? 5;
   return async (request) => {
-    const headers = new Headers(request.headers);
-    headers.delete(PEER_ID_HEADER);
-    headers.set(MESH_TOKEN_HEADER, typeof token === "function" ? await token() : token);
-    return fetchImpl(new Request(request, { headers, duplex: "half" } as RequestInit));
+    pinned ??= new URL(request.url).origin;
+    let current = request;
+    for (let hops = 0; ; hops++) {
+      const headers = new Headers(current.headers);
+      headers.delete(PEER_ID_HEADER);
+      headers.delete(MESH_TOKEN_HEADER);
+      if (new URL(current.url).origin === pinned)
+        headers.set(MESH_TOKEN_HEADER, typeof token === "function" ? await token() : token);
+      const res = await fetchImpl(
+        new Request(current, { headers, redirect: "manual", duplex: "half" } as RequestInit),
+      );
+      if (!REDIRECTS.has(res.status)) return res;
+      const location = res.headers.get("location");
+      if (location === null) return res;
+      void res.body?.cancel().catch(() => {});
+      const target = new URL(location, current.url);
+      const from = new URL(current.url).origin;
+      if (target.origin !== from)
+        throw new MeshRedirectError(
+          `refused a redirect from ${from} to another origin (${target.origin})`,
+        );
+      if (hops >= maxRedirects) throw new MeshRedirectError(`more than ${maxRedirects} redirects`);
+      const bodiless = current.method === "GET" || current.method === "HEAD";
+      if (!bodiless && res.status !== 303)
+        throw new MeshRedirectError(
+          `cannot follow a ${res.status} redirect of a ${current.method}`,
+        );
+      current = new Request(target, {
+        method: bodiless ? current.method : "GET",
+        headers: current.headers,
+        signal: current.signal,
+      });
+    }
   };
 }
 
@@ -80,13 +131,14 @@ export function withMeshToken(
  *
  * @example
  * ```ts
- * const fetchImpl = peerFetch(connection.call, token);
- * await fetch({ url: "http://peer/repo.git", fetchImpl, repository, refStore });
+ * const fetchImpl = peerFetch(connection.call, token, { origin: "http://peer-b" });
+ * await fetch({ url: "http://peer-b/repo.git", fetchImpl, repository, refStore });
  * ```
  */
 export function peerFetch(
   call: WebrunDuplex,
   token: MeshToken,
+  options: MeshTokenOptions = {},
 ): (request: Request) => Promise<Response> {
-  return withMeshToken((request) => fetchOverDuplex(call, request), token);
+  return withMeshToken((request) => fetchOverDuplex(call, request), token, options);
 }

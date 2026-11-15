@@ -3,11 +3,10 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerPeer } from "@statewalker/httpeers-core";
 import { createFilesLfsStore } from "@statewalker/vcs-transport-lfs";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { afterAll, describe, expect, it } from "vitest";
-import { meshLfsHandler } from "../src/index.js";
+import { bindProvenPeer, meshLfsHandler } from "../src/index.js";
 import { createHub, prng } from "./helpers.js";
 import { serveOnLoopback } from "./node-server.js";
 
@@ -103,7 +102,7 @@ describe.skipIf(!hasGitLfs)("native git-lfs against meshLfsHandler", { timeout: 
     // the loopback edge: the peer it proved is named by the URL's first path segment
     const edge = await serveOnLoopback(async (request) => {
       const peer = new URL(request.url).pathname.split("/")[1] as string;
-      registerPeer(request, peer);
+      bindProvenPeer(request, peer);
       const response = await handler(request);
       if (request.url.endsWith("/objects/batch") && response.ok) {
         const answer = (await response.clone().json()) as { transfer?: string };

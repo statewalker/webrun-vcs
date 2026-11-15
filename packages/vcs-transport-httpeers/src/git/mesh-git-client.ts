@@ -21,12 +21,18 @@ export interface MeshRemote {
   fetchImpl?: (request: Request) => Promise<Response>;
   /** The membership token the hub minted for this peer */
   token: MeshToken;
+  /**
+   * The peer's origin: the only one the token goes to (default: the first request's). The git
+   * helpers set it from their `url`.
+   */
+  origin?: string;
 }
 
 /** The `fetchImpl` for a {@link MeshRemote}. */
 export function meshRemoteFetch(remote: MeshRemote): (request: Request) => Promise<Response> {
-  if (remote.call) return peerFetch(remote.call, remote.token);
-  if (remote.fetchImpl) return withMeshToken(remote.fetchImpl, remote.token);
+  const options = { origin: remote.origin };
+  if (remote.call) return peerFetch(remote.call, remote.token, options);
+  if (remote.fetchImpl) return withMeshToken(remote.fetchImpl, remote.token, options);
   throw new Error("a mesh remote needs a call (Duplex) or a fetchImpl");
 }
 
@@ -51,8 +57,8 @@ export type MeshGitFetchOptions = Omit<FetchOptions, "fetchImpl"> & MeshRemote;
  * ```
  */
 export function meshGitFetch(options: MeshGitFetchOptions): Promise<FetchClientResult> {
-  const { call, fetchImpl, token, ...rest } = options;
-  return gitFetch({ ...rest, fetchImpl: meshRemoteFetch({ call, fetchImpl, token }) });
+  const { call, fetchImpl, token, origin = options.url, ...rest } = options;
+  return gitFetch({ ...rest, fetchImpl: meshRemoteFetch({ call, fetchImpl, token, origin }) });
 }
 
 /** Options of {@link meshGitPush}: push's, and the peer. */
@@ -76,6 +82,6 @@ export type MeshGitPushOptions = Omit<PushOptions, "fetchImpl"> & MeshRemote;
  * ```
  */
 export function meshGitPush(options: MeshGitPushOptions): Promise<HttpPushResult> {
-  const { call, fetchImpl, token, ...rest } = options;
-  return gitPush({ ...rest, fetchImpl: meshRemoteFetch({ call, fetchImpl, token }) });
+  const { call, fetchImpl, token, origin = options.url, ...rest } = options;
+  return gitPush({ ...rest, fetchImpl: meshRemoteFetch({ call, fetchImpl, token, origin }) });
 }

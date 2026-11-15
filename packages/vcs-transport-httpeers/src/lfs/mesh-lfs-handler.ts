@@ -27,7 +27,8 @@ import {
 export const RANGED_TRANSFER = "ranged";
 
 /** Options of {@link meshLfsHandler}. */
-export interface MeshLfsHandlerOptions extends Omit<LfsServerOptions, "authorize" | "locks"> {
+export interface MeshLfsHandlerOptions
+  extends Omit<LfsServerOptions, "authorize" | "locks" | "transferAuth"> {
   /** The LFS objects served (`createFilesLfsStore(files, ".git")`, a content-store view) */
   objects: LfsObjectStore;
   /** The mesh: issuer, rules, revocation, how the caller's peer is proven */
@@ -112,7 +113,11 @@ function offersRanged(body: Uint8Array): boolean {
  * ```
  */
 export function meshLfsHandler(options: MeshLfsHandlerOptions): MeshHandler {
-  const { objects, access, locks, ranged = true, authorize, ...rest } = options;
+  const { objects, access, locks, ranged = true, authorize, ...given } = options;
+  // per-action transfer headers would let a transfer skip the capability check: not offered
+  const { transferAuth: _ignored, ...rest } = given as typeof given & {
+    transferAuth?: unknown;
+  };
   const callers = new WeakMap<Request, MeshCaller>();
   const callerOf = (request: Request): MeshCaller =>
     callers.get(request) ?? { peer: undefined, capabilities: new Set() };

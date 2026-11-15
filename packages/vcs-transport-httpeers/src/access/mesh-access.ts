@@ -11,7 +11,13 @@ import {
   ruleSet,
   withAccess,
 } from "@statewalker/httpeers-access";
-import { ANONYMOUS, lookupPeer, type ProvenPeer } from "@statewalker/httpeers-core";
+import {
+  ANONYMOUS,
+  lookupPeer,
+  type ProvenPeer,
+  registerAnonymous,
+  registerPeer,
+} from "@statewalker/httpeers-core";
 
 /** Fetch (clone, ls-remote) and LFS downloads. */
 export const GIT_READ = "git:read";
@@ -66,8 +72,10 @@ export interface MeshAccessOptions {
   /** This peer's own id, asserted to the policy as `self_peer` */
   selfPeer?: string;
   /**
-   * What the transport proved about the caller (default: the binding the peer connection put
-   * on the request, see `servePeerConnection`; anonymous without one)
+   * What the transport proved about the caller. Default: the peer an edge bound to this very
+   * request with {@link bindProvenPeer} (`servePeerConnection` does); without one the caller is
+   * anonymous, whatever peer header it sent. Mounted straight on HTTP without an edge, give
+   * this (say, from a verified client certificate) or every token is refused (401).
    */
   provenPeer?: (request: Request) => ProvenPeer | Promise<ProvenPeer>;
   /** Clock for token expiry (default `Date.now`) */
@@ -91,14 +99,15 @@ export function withMeshAccess(
   options: MeshAccessOptions,
   next: (request: Request, caller: MeshCaller) => Promise<Response>,
 ): MeshHandler {
-  return withAccess({
+  const guarded = withAccess({
     issuer: options.issuer,
     rules: options.rules ?? gitRules(),
     keys: options.keys,
     revocation: options.revocation,
     selfPeer: options.selfPeer,
     now: options.now,
-    provenPeer: options.provenPeer ?? ((request) => lookupPeer(request) ?? ANONYMOUS),
+    // the binding made below, on the request httpeers-access is given
+    provenPeer: (request) => lookupPeer(request) ?? ANONYMOUS,
   })(async (request) => {
     const ctx = access(request);
     const peer = ctx?.peer;
@@ -107,6 +116,50 @@ export function withMeshAccess(
       capabilities: ctx?.capabilities() ?? new Set<string>(),
     });
   });
+  return async (request) => {
+    const peer: ProvenPeer = options.provenPeer
+      ? await options.provenPeer(request)
+      : BOUND.has(request)
+        ? (lookupPeer(request) ?? ANONYMOUS)
+        : ANONYMOUS;
+    return guarded(withPeer(request, peer));
+  };
+}
+
+/** Requests an edge bound to the peer its transport proved. */
+const BOUND = new WeakSet<Request>();
+
+/** `request` carrying `peer` as its only peer binding (the same request when its headers can change). */
+function withPeer(request: Request, peer: ProvenPeer): Request {
+  const bind = (target: Request) => {
+    if (peer === ANONYMOUS) registerAnonymous(target);
+    else registerPeer(target, peer);
+    return target;
+  };
+  try {
+    return bind(request);
+  } catch {
+    // immutable headers: a copy carries the binding
+    return bind(
+      new Request(request, {
+        headers: new Headers(request.headers),
+        duplex: "half",
+      } as RequestInit),
+    );
+  }
+}
+
+/**
+ * Binds `request` to the peer its transport proved (`undefined`: anonymous), replacing any peer
+ * header the caller sent. This is the edge's job: whatever puts requests from the network in
+ * front of `meshGitHandler` / `meshLfsHandler` calls it (or passes `access.provenPeer`).
+ * `servePeerConnection` does it for webrun duplexes. A peer header on a request no edge bound is
+ * ignored: the caller is anonymous.
+ */
+export function bindProvenPeer(request: Request, peer: string | undefined): void {
+  if (peer === undefined) registerAnonymous(request);
+  else registerPeer(request, peer);
+  BOUND.add(request);
 }
 
 /** A JSON error response. */
