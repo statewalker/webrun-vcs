@@ -7,7 +7,7 @@
  * - .git/rr-cache/ for recorded resolutions (rerere)
  */
 
-import type { Blobs, ObjectId } from "@statewalker/vcs-core";
+import { assertValidWorktreePath, type Blobs, type ObjectId } from "@statewalker/vcs-core";
 import { sha1 } from "@statewalker/vcs-utils";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { dirname, joinPath, tryReadFile } from "@statewalker/vcs-utils/files";
@@ -272,6 +272,7 @@ export class GitResolutionStore implements ResolutionStore {
     if (!recorded?.resolvedContent) return false;
 
     // Write resolved content to working tree
+    assertValidWorktreePath(path);
     const fullPath = joinPath(this.worktreePath, path);
     await this.files.write(fullPath, [recorded.resolvedContent]);
 
@@ -512,6 +513,8 @@ export class GitResolutionStore implements ResolutionStore {
    */
   private async writeWorktreeFile(path: string, objectId: ObjectId): Promise<void> {
     // the blob streams into the file; it is never held whole in memory
+    // Conflict paths come from merged trees: never write into `.git`.
+    assertValidWorktreePath(path);
     const content = await this.blobs.load(objectId);
     if (content) {
       const fullPath = joinPath(this.worktreePath, path);

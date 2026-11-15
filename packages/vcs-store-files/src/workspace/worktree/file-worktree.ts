@@ -11,6 +11,7 @@
 
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import {
+  assertValidWorktreePath,
   basename,
   type FileInfo,
   FileMode,
@@ -297,6 +298,7 @@ export class FileWorktree implements Worktree {
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array> | Uint8Array,
     options?: WorktreeWriteOptions,
   ): Promise<void> {
+    assertValidWorktreePath(path);
     const fullPath = joinPath(this.rootPath, path);
 
     // Check if file exists and overwrite is false
@@ -331,16 +333,20 @@ export class FileWorktree implements Worktree {
   }
 
   async remove(path: string, _options?: { recursive?: boolean }): Promise<boolean> {
+    assertValidWorktreePath(path);
     const fullPath = joinPath(this.rootPath, path);
     return this.files.remove(fullPath);
   }
 
   async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {
+    assertValidWorktreePath(path);
     const fullPath = joinPath(this.rootPath, path);
     await this.files.mkdir(fullPath);
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
+    assertValidWorktreePath(oldPath);
+    assertValidWorktreePath(newPath);
     const fullOldPath = joinPath(this.rootPath, oldPath);
     const fullNewPath = joinPath(this.rootPath, newPath);
     await this.files.move(fullOldPath, fullNewPath);
