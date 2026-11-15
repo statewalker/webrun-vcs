@@ -9,12 +9,17 @@ export interface LfsLocksOptions {
   /** Where locks are kept: `createMemoryLockStore()`, `createFilesLockStore(files)`, or your own. */
   store: LfsLockStore;
   /**
-   * The caller's name, which owns the locks it creates and splits a verify
-   * into `ours` and `theirs`. `undefined` is 401 with `LFS-Authenticate`
-   * (git-lfs then asks its credential helper). Called after `authorize`.
-   * Default: the user name of a Basic `Authorization`.
+   * The caller's VERIFIED name, which owns the locks it creates, decides who
+   * may unlock them without `force`, and splits a verify into `ours` and
+   * `theirs`. `undefined` is 401 with `LFS-Authenticate` (git-lfs then asks
+   * its credential helper). Called after `authorize`. Required: whoever
+   * `identify` names can unlock that user's locks, so it must only name a
+   * user whose credentials were checked, by `identify` itself or by an
+   * `authorize` that checks the very credentials `identify` reads.
+   * `basicUserIdentity` reads the Basic user name WITHOUT checking the
+   * password: use it only behind such an `authorize`.
    */
-  identify?: (request: Request) => string | undefined | Promise<string | undefined>;
+  identify: (request: Request) => string | undefined | Promise<string | undefined>;
   /**
    * Whether the caller may force-unlock a lock someone else owns (`force:
    * true`). Default: nobody may; owners unlock their own locks without
@@ -58,8 +63,22 @@ function wire(lock: LfsStoredLock): LfsLock {
   return { id: lock.id, path: lock.path, locked_at: lock.locked_at, owner: lock.owner };
 }
 
-/** The user name of a Basic `Authorization`, if any. */
-export function basicUser(request: Request): string | undefined {
+/**
+ * The user name of a Basic `Authorization`, if any, for `locks.identify`. It
+ * does NOT check the password: it is only safe when `authorize` refuses every
+ * request whose Basic credentials it has not verified (otherwise anyone can
+ * send `Authorization: Basic <victim>:x`, take the victim's name and unlock
+ * the victim's locks).
+ *
+ * @example
+ * ```typescript
+ * serveLfs(objects, {
+ *   authorize: (request) => checkBasicPassword(request.headers.get("authorization")),
+ *   locks: { store, identify: basicUserIdentity },
+ * });
+ * ```
+ */
+export function basicUserIdentity(request: Request): string | undefined {
   const m = /^basic\s+(\S+)\s*$/i.exec(request.headers.get("authorization") ?? "");
   if (!m) return undefined;
   try {
@@ -76,15 +95,26 @@ export function basicUser(request: Request): string | undefined {
 /**
  * The File Locking API routes (docs/api/locking.md) under the LFS endpoint:
  * `POST …/locks`, `GET …/locks`, `POST …/locks/verify` and `POST
- * …/locks/<id>/unlock`. Returns `undefined` for any other path.
+ * …/locks/<id>/unlock`. Returns `undefined` for any other path. `preread`
+ * is the body when the server already read it (to tell a lock verify from an
+ * object verify, see `serveLfs`).
  */
 export function lockRoutes(
   ctx: LockRouteContext,
-): (request: Request, path: string) => Promise<Response> | undefined {
+): (
+  request: Request,
+  path: string,
+  preread?: { text: string | undefined },
+) => Promise<Response> | undefined {
   const { options: o } = ctx;
   const pageSize = Math.max(1, Math.floor(o.pageSize ?? 100));
-  const identify = o.identify ?? basicUser;
-  const refOf = (name: unknown) => (o.perRef && typeof name === "string" ? name : undefined);
+  if (typeof o.identify !== "function")
+    throw new TypeError(
+      "serveLfs: locks.identify is required (a function naming the verified caller)",
+    );
+  const identify = o.identify;
+  const refOf = (name: unknown) =>
+    o.perRef && typeof name === "string" && name !== "" ? name : undefined;
   const limitOf = (raw: unknown): number | undefined => {
     if (raw === undefined || raw === null || raw === "" || raw === 0) return pageSize;
     const n = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : raw;
@@ -113,8 +143,11 @@ export function lockRoutes(
     return { owner };
   }
 
-  async function body(request: Request): Promise<Record<string, unknown> | undefined> {
-    const text = await ctx.readBody(request, MAX_BODY);
+  async function body(
+    request: Request,
+    preread?: { text: string | undefined },
+  ): Promise<Record<string, unknown> | undefined> {
+    const text = preread ? preread.text : await ctx.readBody(request, MAX_BODY);
     if (text === undefined) return undefined;
     try {
       const v = JSON.parse(text || "{}") as unknown;
@@ -167,10 +200,13 @@ export function lockRoutes(
     });
   }
 
-  async function verify(request: Request): Promise<Response> {
+  async function verify(
+    request: Request,
+    preread?: { text: string | undefined },
+  ): Promise<Response> {
     const admitted = await admit(request, "verify", true);
     if (admitted instanceof Response) return admitted;
-    const input = await body(request);
+    const input = await body(request, preread);
     if (!input) return ctx.error(request, 422, "A verify request needs a JSON body");
     const limit = limitOf(input.limit);
     if (limit === undefined) return ctx.error(request, 422, "Invalid limit");
@@ -209,14 +245,14 @@ export function lockRoutes(
     return ctx.json(200, { lock: wire(removed) });
   }
 
-  return (request, path) => {
+  return (request, path, preread) => {
     if (path.endsWith("/locks")) {
       if (request.method === "POST") return create(request);
       if (request.method === "GET") return list(request);
       return Promise.resolve(ctx.error(request, 405, "Use GET or POST for locks"));
     }
     if (path.endsWith("/locks/verify")) {
-      if (request.method === "POST") return verify(request);
+      if (request.method === "POST") return verify(request, preread);
       return Promise.resolve(ctx.error(request, 405, "Use POST to verify locks"));
     }
     const m = /\/locks\/([^/]+)\/unlock$/.exec(path);

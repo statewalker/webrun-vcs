@@ -96,11 +96,10 @@ describeGitea("Gitea oracle · G5 Git LFS locks", () => {
     // Gitea's cursor is a page number, which our client passes back untouched.
     // Gitea 1.22 starts at cursor 0 and answers next_cursor "1", but its pages
     // are 1-based (0 and 1 are both the first page), so the first page comes
-    // twice: every lock is seen, the first one once more
+    // twice; allLocks drops what it has seen (by id), so each lock comes once
     const paged: string[] = [];
     for await (const l of admin.allLocks({ limit: 1 })) paged.push(l.path);
-    expect([...new Set(paged)].sort()).toEqual(["assets/logo.psd", "b.bin", "c.bin"]);
-    expect([3, 4]).toContain(paged.length);
+    expect(paged.sort()).toEqual(["assets/logo.psd", "b.bin", "c.bin"]);
     const first = await admin.listLocks({ limit: 2 });
     expect(first.locks).toHaveLength(2);
     expect(first.nextCursor).toBeTruthy();

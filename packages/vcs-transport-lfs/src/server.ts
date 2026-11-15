@@ -74,6 +74,19 @@ export interface LfsServerOptions {
 
 const OID = /^[0-9a-f]{64}$/;
 const VERIFY_MAX_BYTES = 4096;
+/** A lock verify body at most (as every lock route reads). */
+const LOCK_VERIFY_MAX_BYTES = 16 * 1024;
+
+/** Whether a body is a JSON object with an `oid`: an object verify, not a lock verify. */
+function namesOid(text: string | undefined): boolean {
+  if (text === undefined) return false;
+  try {
+    const v = JSON.parse(text) as unknown;
+    return !!v && typeof v === "object" && !Array.isArray(v) && "oid" in v;
+  } catch {
+    return false;
+  }
+}
 
 const isSize = (v: unknown): v is number =>
   typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
@@ -443,14 +456,22 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
     );
   }
 
-  async function verify(request: Request): Promise<Response> {
+  async function verify(
+    request: Request,
+    preread?: { text: string | undefined },
+  ): Promise<Response> {
     // authorized before the body is looked at; with transferAuth the oid is
     // needed to check, so a body without a valid one is refused as unauthorized
     if (!opts.transferAuth) {
       const denied = await authorizeBatch(request, "upload");
       if (denied) return denied;
     }
-    const text = await boundedText(request, VERIFY_MAX_BYTES);
+    const text = preread
+      ? preread.text !== undefined &&
+        new TextEncoder().encode(preread.text).length <= VERIFY_MAX_BYTES
+        ? preread.text
+        : undefined
+      : await boundedText(request, VERIFY_MAX_BYTES);
     let input: { oid?: unknown; size?: unknown } | undefined;
     try {
       input = text === undefined ? undefined : (JSON.parse(text) as typeof input);
@@ -478,6 +499,15 @@ function lfsHandler(store: LfsObjectStore, opts: LfsServerOptions): FetchHandler
         ? opts.publicUrl.replace(/\/+$/, "")
         : `${url.origin}${path.slice(0, path.length - suffixLength)}`;
     try {
+      // `…/locks/verify` is a lock verify under the endpoint, or the object
+      // verify of an endpoint that itself ends in `/locks`: the body tells
+      // (an object verify always names an `oid`; a lock verify never does)
+      if (path.endsWith("/locks/verify") && request.method === "POST") {
+        const preread = { text: await boundedText(request, LOCK_VERIFY_MAX_BYTES) };
+        if (namesOid(preread.text)) return await verify(request, preread);
+        if (!locks) return error(request, 404, "File locking is not supported");
+        return await (locks(request, path, preread) as Promise<Response>);
+      }
       if (locks) {
         const answered = locks(request, path);
         if (answered) return await answered;

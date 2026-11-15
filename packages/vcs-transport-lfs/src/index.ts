@@ -30,6 +30,7 @@ export {
 export { lfsDownload, lfsUpload } from "./client.js";
 export { createFilesLfsStore, LfsPartialChangedError } from "./files-store.js";
 export {
+  basicUserIdentity,
   createFilesLockStore,
   createMemoryLockStore,
   type LfsCreateLockRequest,

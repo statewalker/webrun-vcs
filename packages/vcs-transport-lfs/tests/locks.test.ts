@@ -1,6 +1,7 @@
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { describe, expect, it } from "vitest";
 import {
+  basicUserIdentity,
   createFilesLfsStore,
   createFilesLockStore,
   createMemoryLockStore,
@@ -12,6 +13,7 @@ import {
   lfsLocks,
   normalizeLockPath,
   serveLfs,
+  sha256Hex,
 } from "../src/index.js";
 
 const URL_BASE = "http://lfs.test/repo.git/info/lfs";
@@ -24,7 +26,8 @@ function server(
 ) {
   return serveLfs(createFilesLfsStore(new MemFilesApi()), {
     ...opts,
-    locks: { store, ...locks },
+    // the tests trust the Basic user name (no authorize verifies passwords here)
+    locks: { store, identify: basicUserIdentity, ...locks },
   });
 }
 
@@ -349,5 +352,139 @@ describe("files lock store", () => {
     const { lock } = await store.create({ path: "x", owner: { name: "ada" } });
     const removed = await Promise.all(Array.from({ length: 5 }, () => store.remove(lock.id)));
     expect(removed.filter(Boolean)).toHaveLength(1);
+  });
+});
+
+describe("review fixes", () => {
+  const H = {
+    accept: "application/vnd.git-lfs+json",
+    "content-type": "application/vnd.git-lfs+json",
+  };
+  const basicWith = (user: string, password: string) => `Basic ${btoa(`${user}:${password}`)}`;
+
+  it("locks without identify are refused when the handler is made", () => {
+    const objects = createFilesLfsStore(new MemFilesApi());
+    expect(() =>
+      serveLfs(objects, {
+        locks: { store: createMemoryLockStore() } as unknown as LfsLocksOptions,
+      }),
+    ).toThrow(/identify/);
+  });
+
+  it("an identify that verifies passwords: a wrong password cannot unlock", async () => {
+    const users: Record<string, string> = { ada: "secret" };
+    const verified = (request: Request) => {
+      const user = basicUserIdentity(request);
+      const password = user === undefined ? undefined : users[user];
+      return user && password && request.headers.get("authorization") === basicWith(user, password)
+        ? user
+        : undefined;
+    };
+    const handler = serveLfs(createFilesLfsStore(new MemFilesApi()), {
+      locks: { store: createMemoryLockStore(), identify: verified },
+    });
+    const ada = lfsLocks(URL_BASE, handler, {
+      credentials: { username: "ada", password: "secret" },
+    });
+    const lock = await ada.createLock("a.psd");
+    const forger = lfsLocks(URL_BASE, handler, {
+      credentials: { username: "ada", password: "WRONG" },
+    });
+    expect((await rejection(forger.unlock(lock.id))).status).toBe(401);
+    expect((await rejection(forger.unlock(lock.id, { force: true }))).status).toBe(401);
+    expect((await ada.listLocks()).locks).toEqual([lock]);
+  });
+
+  it("files store: a stale empty or partial lock file (a crash mid-write) is replaced", async () => {
+    for (const stale of ["", '{"id":"', "not json"]) {
+      const files = new MemFilesApi();
+      const store = createFilesLockStore(files, "r.git");
+      const { lock } = await store.create({ path: "a.psd", owner: { name: "ada" } });
+      const file = `r.git/lfs/locks/${lock.id.slice(0, 24)}.json`;
+      await files.write(file, [new TextEncoder().encode(stale)]);
+      // remove() of the id whose file is unreadable deletes the file
+      expect(await store.remove(lock.id)).toBeUndefined();
+      expect(await files.exists(file)).toBe(false);
+      // and a create over a stale file (written again) recovers
+      await files.write(file, [new TextEncoder().encode(stale)]);
+      const t = Date.now();
+      const again = await store.create({ path: "a.psd", owner: { name: "bob" } });
+      expect(again.created, JSON.stringify(stale)).toBe(true);
+      expect(again.lock.owner.name).toBe("bob");
+      expect(Date.now() - t).toBeLessThan(2000);
+      expect((await store.list({ limit: 10 })).locks).toEqual([again.lock]);
+    }
+  });
+
+  it("an endpoint ending in /locks: <base>/verify stays the object verify, with or without locks", async () => {
+    const bytes = new TextEncoder().encode("held\n");
+    const oid = await sha256Hex(bytes);
+    for (const withLocks of [false, true]) {
+      const objects = createFilesLfsStore(new MemFilesApi());
+      await objects.put(bytes, { oid, size: bytes.length });
+      const handler = serveLfs(
+        objects,
+        withLocks ? { locks: { store: createMemoryLockStore(), identify: basicUserIdentity } } : {},
+      );
+      const verify = (body: unknown) =>
+        handler(
+          new Request("http://h/team/locks/verify", {
+            method: "POST",
+            headers: { ...H, authorization: basic("ada") },
+            body: JSON.stringify(body),
+          }),
+        );
+      expect((await verify({ oid, size: bytes.length })).status, `locks=${withLocks}`).toBe(200);
+      const missing = await verify({ oid: "a".repeat(64), size: 1 });
+      expect(missing.status, `locks=${withLocks}`).toBe(404);
+      // an oid-less body there is a lock verify (of the endpoint /team)
+      if (withLocks) {
+        const lockVerify = await verify({ ref: { name: "refs/heads/main" } });
+        expect(lockVerify.status).toBe(200);
+        expect(await lockVerify.json()).toEqual({ ours: [], theirs: [] });
+      }
+    }
+  });
+
+  it("allLocks: drops a lock seen twice and stops on an empty page", async () => {
+    const lock = (id: string) => ({ id, path: `${id}.bin`, locked_at: "2026-01-01T00:00:00Z" });
+    // Gitea 1.22 style: the first page twice
+    const pages: Record<string, unknown> = {
+      "": { locks: [lock("a")], next_cursor: "1" },
+      "1": { locks: [lock("a")], next_cursor: "2" },
+      "2": { locks: [lock("b")], next_cursor: "3" },
+      "3": { locks: [] },
+    };
+    const twice = lfsLocks(URL_BASE, async (r) =>
+      Response.json(pages[new URL(r.url).searchParams.get("cursor") ?? ""]),
+    );
+    const seen: string[] = [];
+    for await (const l of twice.allLocks()) seen.push(l.id);
+    expect(seen).toEqual(["a", "b"]);
+
+    // empty pages with ever new cursors: stops at the first
+    let calls = 0;
+    const endless = lfsLocks(URL_BASE, async () => {
+      calls++;
+      return Response.json({ locks: [], next_cursor: `c${calls}` });
+    });
+    const none: string[] = [];
+    for await (const l of endless.allLocks()) none.push(l.id);
+    expect(none).toEqual([]);
+    expect(calls).toBe(1);
+  });
+
+  it("perRef: an empty ref name is no ref", async () => {
+    const handler = server(createMemoryLockStore(), { perRef: true });
+    const post = (user: string, body: unknown) =>
+      handler(
+        new Request(`${URL_BASE}/locks`, {
+          method: "POST",
+          headers: { ...H, authorization: basic(user) },
+          body: JSON.stringify(body),
+        }),
+      );
+    expect((await post("ada", { path: "a", ref: { name: "" } })).status).toBe(201);
+    expect((await post("bob", { path: "a" })).status).toBe(409);
   });
 });

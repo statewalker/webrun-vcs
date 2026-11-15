@@ -68,7 +68,10 @@ export interface LfsLocksClient {
   createLock(path: string, ref?: string): Promise<LfsLock>;
   /** `GET /locks`: one page of locks; pass `nextCursor` back as `cursor` for the next. */
   listLocks(query?: LfsListLocksQuery): Promise<{ locks: LfsLock[]; nextCursor?: string }>;
-  /** Every lock `query` selects, page after page. */
+  /**
+   * Every lock `query` selects, page after page, each once (by id). An empty
+   * page ends it; a repeated cursor throws.
+   */
   allLocks(query?: Omit<LfsListLocksQuery, "cursor">): AsyncIterable<LfsLock>;
   /** `POST /locks/verify`: one page of the caller's locks and everyone else's. */
   verifyLocks(query?: {
@@ -231,9 +234,17 @@ export function lfsLocks(
     async *allLocks(query = {}) {
       let cursor: string | undefined;
       const seen = new Set<string>();
+      const yielded = new Set<string>();
       do {
         const page = await client.listLocks({ ...query, cursor });
-        yield* page.locks;
+        // an empty page ends the listing, whatever cursor it names
+        if (page.locks.length === 0) return;
+        for (const lock of page.locks) {
+          // a lock seen on an earlier page (Gitea 1.22 sends its first page twice)
+          if (yielded.has(lock.id)) continue;
+          yielded.add(lock.id);
+          yield lock;
+        }
         cursor = page.nextCursor;
         if (cursor !== undefined) {
           if (seen.has(cursor)) throw new Error("lfs list locks: the server repeats a cursor");

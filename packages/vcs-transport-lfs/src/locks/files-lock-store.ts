@@ -1,8 +1,12 @@
-import { atomicFilesOver, type FilesApi } from "@statewalker/vcs-utils/files";
+import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
 import { lockKeyHash, pageLocks, randomLockId } from "./lock-paths.js";
 import type { LfsLockStore, LfsStoredLock } from "./types.js";
 
 const KEY_LENGTH = 24;
+/** An unreadable lock file older than this is a crashed writer's (ms). */
+const STALE_MS = 2000;
+/** Looks at an unreadable lock file (5, 10, 15 … ms apart; ~0.3 s in all) before taking it as stale. */
+const STALE_ATTEMPTS = 10;
 const ID = /^[0-9a-f]{32}$/;
 const decoder = new TextDecoder();
 
@@ -62,7 +66,11 @@ const removals = new WeakMap<FilesApi, Map<string, Promise<unknown>>>();
  * for the hundreds of locks a repository has, not for millions.
  *
  * A file another writer is still writing (not yet valid JSON) is waited for
- * briefly by `create`, and skipped by `list`. Removals of one lock file are
+ * briefly by `create`, and skipped by `list`. One that stays unreadable for
+ * about 0.3 s, or was last written over 2 s ago, is a writer's that crashed
+ * between its exclusive create and its write: `create` removes it and
+ * creates over it (once), and `remove` of an id whose file is unreadable
+ * removes that file. Removals of one lock file are
  * serialized within the process; across processes, a removal and a re-lock
  * of the same path in the same instant can race (the id is checked before the
  * file is removed).
@@ -78,9 +86,30 @@ export function createFilesLockStore(files: FilesApi, root = ""): LfsLockStore {
   const dir = "lfs/locks";
   const fileOf = (key: string) => `${dir}/${key}.json`;
 
+  /** The lock in a file, `"absent"`, or `"unreadable"` (empty or partial JSON: a writer still at it, or one that crashed). */
+  async function readState(path: string): Promise<LfsStoredLock | "absent" | "unreadable"> {
+    if (!(await atomic.exists(path))) return "absent";
+    const text = decoder.decode(await bytesOf(atomic.read(path)));
+    if (!(await atomic.exists(path))) return "absent"; // removed while read
+    return parseLock(text) ?? "unreadable";
+  }
+
   async function readLock(path: string): Promise<LfsStoredLock | undefined> {
-    if (!(await atomic.exists(path))) return undefined;
-    return parseLock(decoder.decode(await bytesOf(atomic.read(path))));
+    const state = await readState(path);
+    return typeof state === "string" ? undefined : state;
+  }
+
+  /** Milliseconds since the file was last written; `0` when unknown. */
+  async function age(path: string): Promise<number> {
+    const modified = (await files.stats(joinPath(root || "/", path)))?.lastModified;
+    return modified === undefined ? 0 : Date.now() - modified;
+  }
+
+  /** Removes `path` if it is (still) unreadable. */
+  async function removeUnreadable(path: string): Promise<void> {
+    await serial(path, async () => {
+      if ((await readState(path)) === "unreadable") await atomic.remove(path);
+    });
   }
 
   /** Runs `fn` after every earlier removal queued on `path` in this process. */
@@ -105,6 +134,7 @@ export function createFilesLockStore(files: FilesApi, root = ""): LfsLockStore {
     async create({ path, owner, ref }) {
       const key = (await lockKeyHash(path, ref)).slice(0, KEY_LENGTH);
       const file = fileOf(key);
+      let recovered = false;
       for (let attempt = 0; ; attempt++) {
         const lock: LfsStoredLock = {
           id: `${key}${randomLockId(4)}`,
@@ -115,10 +145,20 @@ export function createFilesLockStore(files: FilesApi, root = ""): LfsLockStore {
         };
         const bytes = new TextEncoder().encode(`${JSON.stringify(lock)}\n`);
         if (await atomic.createExclusive(file, bytes)) return { created: true, lock };
-        const held = await readLock(file);
-        if (held) return { created: false, lock: held };
-        // being written by another writer, or removed meanwhile: look again
-        if (attempt >= 20) throw new Error(`lfs lock file ${file} is unreadable`);
+        const held = await readState(file);
+        if (typeof held !== "string") return { created: false, lock: held };
+        if (held === "unreadable") {
+          // another writer between its exclusive create and its write, or a
+          // writer that crashed there: stale once it stays so for a while
+          // (or is older than STALE_MS), then removed and created over once
+          if (attempt >= STALE_ATTEMPTS || (await age(file)) > STALE_MS) {
+            if (recovered) throw new Error(`lfs lock file ${file} stays unreadable`);
+            recovered = true;
+            await removeUnreadable(file);
+            continue;
+          }
+        }
+        // being written, or removed meanwhile: look again
         await new Promise((r) => setTimeout(r, 5 * (attempt + 1)));
       }
     },
@@ -152,9 +192,11 @@ export function createFilesLockStore(files: FilesApi, root = ""): LfsLockStore {
       if (!ID.test(id)) return undefined;
       const file = fileOf(id.slice(0, KEY_LENGTH));
       return serial(file, async () => {
-        const lock = await readLock(file);
-        if (lock?.id !== id) return undefined;
-        return (await atomic.remove(file)) ? lock : undefined;
+        const state = await readState(file);
+        // an unreadable file at this id's place (a crashed writer) goes too
+        if (state === "unreadable") await atomic.remove(file);
+        if (typeof state === "string" || state.id !== id) return undefined;
+        return (await atomic.remove(file)) ? state : undefined;
       });
     },
   };

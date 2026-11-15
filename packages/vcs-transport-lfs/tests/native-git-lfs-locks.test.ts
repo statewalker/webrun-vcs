@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  basicUserIdentity,
   createFilesLfsStore,
   createFilesLockStore,
   type LfsLocksOptions,
@@ -100,7 +101,7 @@ async function user(name: string) {
     "config",
     "--global",
     "credential.helper",
-    `!f() { echo username=${name}; echo password=pw; }; f`,
+    `!f() { echo username=${name}; echo password=${name}-pw; }; f`,
   ]);
   return { name, env };
 }
@@ -112,10 +113,16 @@ interface Seen {
   body: string;
 }
 
+/** Each user's password is `<name>-pw` (what their credential helper answers). */
+const knownBasic = (header: string | null) =>
+  !!header && ["ada", "bob", "root"].some((u) => header === `Basic ${btoa(`${u}:${u}-pw`)}`);
+
 async function startServer(locks: Partial<LfsLocksOptions> = {}) {
   const files = new MemFilesApi();
   const handler = serveLfs(createFilesLfsStore(files), {
-    locks: { store: createFilesLockStore(files), ...locks },
+    // authorize verifies the Basic password, so identify may trust the user name
+    authorize: (request) => knownBasic(request.headers.get("authorization")),
+    locks: { store: createFilesLockStore(files), identify: basicUserIdentity, ...locks },
   });
   const seen: Seen[] = [];
   const server = await serveOnLoopback(async (request) => {
@@ -178,13 +185,14 @@ function lockLines(text: string): string[][] {
     );
 }
 
-describe.skipIf(!hasGitLfs)("native git-lfs locking against serveLfs", () => {
+// each test runs a dozen git-lfs processes: 30 s each, past vitest's 5 s default
+describe.skipIf(!hasGitLfs)("native git-lfs locking against serveLfs", { timeout: 30_000 }, () => {
   it("lock, locks, conflict, locks --verify, unlock, unlock --force by an admin", async () => {
     const ada = await user("ada");
     const bob = await user("bob");
     const root = await user("root");
     const { url, seen } = await startServer({
-      admin: (request) => request.headers.get("authorization") === `Basic ${btoa("root:pw")}`,
+      admin: (request) => basicUserIdentity(request) === "root",
     });
     const clones = await setup(url, [ada, bob, root]);
     const adaDir = clones.ada as string;
@@ -226,6 +234,8 @@ describe.skipIf(!hasGitLfs)("native git-lfs locking against serveLfs", () => {
     // bob may not unlock ada's lock, even with --force (he is no admin)
     const refused = await run(bob.env, bobDir, ["lfs", "unlock", "a.bin"]);
     expect(refused.code).not.toBe(0);
+    // git-lfs prints the server's 403 message
+    expect(refused.err + refused.out).toMatch(/owned by ada; unlocking it needs force/);
     const forced = await run(bob.env, bobDir, ["lfs", "unlock", "--force", "a.bin"]);
     expect(forced.code).not.toBe(0);
     expect(forced.err + forced.out).toMatch(/force-unlock|403|Forbidden/i);
@@ -242,7 +252,12 @@ describe.skipIf(!hasGitLfs)("native git-lfs locking against serveLfs", () => {
     expect((await git(ada.env, adaDir, ["lfs", "locks"])).trim()).toBe("");
 
     // our client sees the same server state git-lfs left
-    const ours = lfsLocks(url, undefined, { credentials: { username: "ada", password: "pw" } });
+    const ours = lfsLocks(url, undefined, {
+      credentials: { username: "ada", password: "ada-pw" },
+    });
+    // a forged Basic header (the right name, a wrong password) is refused
+    const forger = lfsLocks(url, undefined, { credentials: { username: "ada", password: "x" } });
+    await expect(forger.createLock("forged.bin")).rejects.toMatchObject({ status: 403 });
     expect((await ours.listLocks()).locks).toEqual([]);
     const mine = await ours.createLock("a.bin", "refs/heads/main");
     const view = lockLines(await git(bob.env, bobDir, ["lfs", "locks"]));
