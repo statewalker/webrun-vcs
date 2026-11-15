@@ -135,9 +135,15 @@ export function basicStatMatches(
   if (trust.fullStat !== false) {
     // git compares st_ino (and st_dev only when built with USE_STDEV, which it is not by
     // default), st_uid and st_gid, in 32 bits
-    for (const key of ["ino", "uid", "gid"] as const) {
+    // An entry without an inode (written before stats were recorded) is checked again, as
+    // git does for its ino 0. Owner and group are compared only where the entry kept them:
+    // stores that do not keep them would otherwise re-hash every file on every status.
+    const ino = current.ino;
+    if (ino !== undefined && (entry.ino ?? 0) >>> 0 !== ino >>> 0) return false;
+    for (const key of ["uid", "gid"] as const) {
       const now = current[key];
-      if (now !== undefined && (entry[key] ?? 0) >>> 0 !== now >>> 0) return false;
+      const recorded = entry[key];
+      if (now !== undefined && recorded !== undefined && recorded >>> 0 !== now >>> 0) return false;
     }
   }
   return true;

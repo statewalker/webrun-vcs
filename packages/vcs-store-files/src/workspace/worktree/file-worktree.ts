@@ -585,14 +585,19 @@ export class FileWorktree implements Worktree {
       if (target.startsWith("/")) return true;
       const resolved = resolveDots(joinPath(this.rootPath, path, target));
       if (resolved === undefined) return true;
-      return (await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) === "file";
+      // any HEAD (a file, or a link as core.preferSymlinkRefs writes it) makes it one,
+      // as git's validate_headref; only a target without HEAD is not
+      return (await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) !== undefined;
     }
     if (kind !== "directory") return false;
     const kindAt = (name: string) => this.kindOf(joinPath(dotGit, name)).catch(() => undefined);
+    // git's is_git_directory: a HEAD (file or link), objects and refs (directories, or links
+    // to them); anything that might be a repository is kept rather than removed
+    const dirLike = (k: string | undefined) => k === "directory" || k === "symlink";
     return (
-      (await kindAt("HEAD")) === "file" &&
-      (await kindAt("objects")) === "directory" &&
-      (await kindAt("refs")) === "directory"
+      (await kindAt("HEAD")) !== undefined &&
+      dirLike(await kindAt("objects")) &&
+      dirLike(await kindAt("refs"))
     );
   }
 

@@ -2070,3 +2070,72 @@ describeGit("clean twins against native git (final review)", () => {
     });
   }
 });
+
+/**
+ * A repository whose HEAD is a symbolic link (git writes one under core.preferSymlinkRefs)
+ * is still a repository: clean -d skips it, as git's validate_headref accepts a linked HEAD.
+ */
+describeGit("clean keeps repositories with a symlinked HEAD (native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-symlink-head-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** Native `git clean -d -f` in one build of the layout, ours in another; both listings. */
+  async function bothClean(setup: (dir: string) => void) {
+    const nativeDir = join(root, "native");
+    const oursDir = join(root, "ours");
+    setup(nativeDir);
+    setup(oursDir);
+    exec(nativeDir, "clean", "-d", "-f", "-q");
+    const { ours } = await open(oursDir);
+    await ours.clean().setCleanDirectories(true).setDryRun(false).call();
+    return { native: listing(nativeDir), ours: listing(oursDir) };
+  }
+
+  it("keeps a nested repository created with core.preferSymlinkRefs", async () => {
+    const { native, ours } = await bothClean((dir) => {
+      repo(dir);
+      mkdirSync(join(dir, "u"), { recursive: true });
+      run(dir, "-c", "core.preferSymlinkRefs=true", "init", "-q", join(dir, "u", "nested"));
+      put(dir, "u/nested/work.txt", "uncommitted\n");
+      put(dir, "u/loose.txt", "loose\n");
+      expect(lstatSync(join(dir, "u/nested/.git/HEAD")).isSymbolicLink()).toBe(true);
+    });
+    expect(native).toContain("u/nested/work.txt");
+    expect(ours).toEqual(native);
+  });
+
+  it("keeps an untracked submodule whose gitfile names a repository with a linked HEAD", async () => {
+    const upstream = join(root, "up");
+    mkdirSync(upstream, { recursive: true });
+    run(upstream, "init", "-q", "-b", "main");
+    put(upstream, "x.txt", "x\n");
+    run(upstream, "add", ".");
+    run(upstream, "commit", "-qm", "up");
+    const { native, ours } = await bothClean((dir) => {
+      repo(dir);
+      run(
+        dir,
+        "-c",
+        "core.preferSymlinkRefs=true",
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        upstream,
+        "w/sub",
+      );
+      run(dir, "commit", "-qm", "sub");
+      run(dir, "rm", "-q", "--cached", "w/sub");
+      rmSync(join(dir, ".gitmodules"));
+      run(dir, "add", "-A");
+      run(dir, "commit", "-qm", "untrack");
+      put(dir, "w/sub/work.txt", "uncommitted\n");
+      expect(lstatSync(join(dir, ".git/modules/w/sub/HEAD")).isSymbolicLink()).toBe(true);
+    });
+    expect(native).toContain("w/sub/work.txt");
+    expect(ours).toEqual(native);
+  });
+});
