@@ -11,6 +11,7 @@
  */
 
 import { createInMemoryFilesApi } from "@statewalker/vcs-core";
+import { createGitFilesHistoryFromFiles } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import { describe, expect, it } from "vitest";
 
@@ -156,6 +157,88 @@ describe("InitCommand", () => {
 
       expect(commit).toBeDefined();
     });
+
+    // Regression (webrun-vcs#88): init with a FilesApi kept the repository in memory, so
+    // nothing reached `.git` and a browser-filesystem repository vanished on reload.
+    it("should write the repository to the provided FilesApi", async () => {
+      const files = createInMemoryFilesApi();
+      const result = await Git.init().setFilesApi(files).setGitDir(".git").call();
+
+      const commit = await result.git
+        .commit()
+        .setMessage("Persisted")
+        .setAuthor("Test", "test@example.com")
+        .setAllowEmpty(true)
+        .call();
+
+      const head = new TextDecoder().decode(await collect(files.read(".git/HEAD")));
+      expect(head).toBe("ref: refs/heads/main\n");
+      const branch = new TextDecoder().decode(await collect(files.read(".git/refs/heads/main")));
+      expect(branch.trim()).toBe(commit.id);
+
+      // Reopening the same files finds the commit.
+      const reopened = await createGitFilesHistoryFromFiles({ files, gitDir: ".git" });
+      await reopened.initialize();
+      expect((await reopened.refs.resolve("HEAD"))?.objectId).toBe(commit.id);
+    });
+
+    it("should keep an existing repository's HEAD when initialized again", async () => {
+      const files = createInMemoryFilesApi();
+      const first = await Git.init().setFilesApi(files).setGitDir(".git").call();
+      const commit = await first.git
+        .commit()
+        .setMessage("First")
+        .setAuthor("Test", "test@example.com")
+        .setAllowEmpty(true)
+        .call();
+      await files.write(".git/HEAD", [new TextEncoder().encode("ref: refs/heads/topic\n")]);
+      await files.write(".git/refs/heads/topic", [new TextEncoder().encode(`${commit.id}\n`)]);
+
+      const again = await Git.init().setFilesApi(files).setGitDir(".git").call();
+
+      expect(await again.workingCopy.getCurrentBranch()).toBe("topic");
+      expect((await again.repository.refs.resolve("HEAD"))?.objectId).toBe(commit.id);
+    });
+
+    it("should keep staged files across a reopen, so the next commit keeps them", async () => {
+      const files = createInMemoryFilesApi();
+      const enc = new TextEncoder();
+      const first = await Git.init().setFilesApi(files).setGitDir(".git").setWorktree(true).call();
+      await files.write("a.txt", [enc.encode("a")]);
+      await first.git.add().addFilepattern("a.txt").call();
+      await first.git.commit().setMessage("a").setAuthor("T", "t@t").call();
+
+      const again = await Git.init().setFilesApi(files).setGitDir(".git").setWorktree(true).call();
+      await files.write("b.txt", [enc.encode("b")]);
+      await again.git.add().addFilepattern("b.txt").call();
+      const second = await again.git.commit().setMessage("b").setAuthor("T", "t@t").call();
+
+      const tree = await again.repository.trees.load(second.tree);
+      if (!tree) throw new Error("tree not found");
+      const names = (await toArray(tree)).map((e) => e.name);
+      expect(names.sort()).toEqual(["a.txt", "b.txt"]);
+    });
+
+    it("should keep an existing config when HEAD is missing", async () => {
+      const files = createInMemoryFilesApi();
+      const config = '[core]\n\tbare = false\n[remote "origin"]\n\turl = keep\n';
+      await files.write(".git/config", [new TextEncoder().encode(config)]);
+
+      await Git.init().setFilesApi(files).setGitDir(".git").call();
+
+      const after = new TextDecoder().decode(await collect(files.read(".git/config")));
+      expect(after).toContain('[remote "origin"]');
+      const head = new TextDecoder().decode(await collect(files.read(".git/HEAD")));
+      expect(head.trim()).toBe("ref: refs/heads/main");
+    });
+
+    it("should write core.bare = true for a bare repository", async () => {
+      const files = createInMemoryFilesApi();
+      await Git.init().setFilesApi(files).setDirectory("repo.git").setBare(true).call();
+
+      const config = new TextDecoder().decode(await collect(files.read("repo.git/config")));
+      expect(config).toMatch(/bare = true/);
+    });
   });
 
   describe("Custom staging store", () => {
@@ -295,3 +378,15 @@ describe("InitCommand", () => {
     });
   });
 });
+
+async function collect(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
+}

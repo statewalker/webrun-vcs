@@ -207,37 +207,50 @@ test.describe("Browser VCS App - Browser Filesystem Storage", () => {
         // In-memory file storage
         const storage = ${JSON.stringify(initialFiles)};
 
+        // File contents are kept as byte strings (one char per byte, latin1), so binary files
+        // such as git's zlib-compressed objects survive a write and a read; ASCII text reads
+        // the same either way, which is what the assertions compare.
+        function toBytes(content) {
+          const bytes = new Uint8Array(content.length);
+          for (let i = 0; i < content.length; i++) bytes[i] = content.charCodeAt(i) & 0xff;
+          return bytes;
+        }
+        function fromBytes(bytes) {
+          let out = '';
+          for (let i = 0; i < bytes.length; i += 0x8000) {
+            out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+          }
+          return out;
+        }
+        function chunkToBytes(data) {
+          if (data instanceof Uint8Array) return data;
+          if (data instanceof ArrayBuffer) return new Uint8Array(data);
+          if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          if (typeof data === 'string') return new TextEncoder().encode(data);
+          if (data && data.type === 'write') return chunkToBytes(data.data);
+          return new Uint8Array(0);
+        }
+
         // Create mock FileSystemFileHandle
         function createFileHandle(name, getContent, setContent) {
           const handle = {
             kind: 'file',
             name: name,
+            // A real File, so slice(), stream(), arrayBuffer() and text() all work.
             getFile: async function() {
-              const content = getContent() || '';
-              const encoder = new TextEncoder();
-              const encoded = encoder.encode(content);
-              return {
-                name: name,
-                size: encoded.length,
-                lastModified: Date.now(),
-                arrayBuffer: async function() { return encoded.buffer; },
-                text: async function() { return content; },
-              };
+              return new File([toBytes(getContent() || '')], name, { lastModified: Date.now() });
             },
             createWritable: async function() {
               const chunks = [];
               return {
                 write: async function(data) {
-                  if (data instanceof Uint8Array) {
-                    chunks.push(new TextDecoder().decode(data));
-                  } else if (typeof data === 'string') {
-                    chunks.push(data);
-                  } else if (data && data.type === 'write') {
-                    chunks.push(typeof data.data === 'string' ? data.data : new TextDecoder().decode(data.data));
-                  }
+                  chunks.push(fromBytes(chunkToBytes(data)));
                 },
                 close: async function() {
                   setContent(chunks.join(''));
+                },
+                abort: async function() {
+                  chunks.length = 0;
                 },
               };
             },

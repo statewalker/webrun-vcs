@@ -1,5 +1,14 @@
-import { createInMemoryFilesApi, createMemoryHistory, type FilesApi } from "@statewalker/vcs-core";
-import { createFileWorktree } from "@statewalker/vcs-store-files";
+import {
+  createInMemoryFilesApi,
+  createMemoryHistory,
+  type FilesApi,
+  type History,
+} from "@statewalker/vcs-core";
+import {
+  createFileWorktree,
+  createGitFilesHistoryFromFiles,
+  FileStagingStore,
+} from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import {
   createMemoryCheckout,
@@ -219,15 +228,57 @@ export class InitCommand {
     // Determine git directory
     const gitDir = this.resolveGitDir();
 
-    // Create the history (repository)
-    const history = createMemoryHistory();
-    await history.initialize();
-
-    // Set initial branch by creating symbolic ref for HEAD
-    await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
-
-    // Create staging store (use provided or default to MemoryStagingStore)
-    const staging = this.stagingStore ?? new MemoryStagingStore();
+    // Create the history (repository). With a FilesApi it lives in `gitDir` on those files,
+    // in git's layout, so it survives a reload and native git can read it; like `git init`
+    // on an existing repository, a second init keeps its HEAD, config and objects. Without
+    // one it stays in memory.
+    let history: History;
+    let staging: Staging;
+    if (this.files) {
+      const dir = gitDir.replace(/\/+$/, "") || ".";
+      const isFile = async (path: string) => (await files.stats(path))?.kind === "file";
+      const hasHead = await isFile(`${dir}/HEAD`);
+      // A repository with a config but no HEAD (damaged or half-made) is opened, not
+      // re-created: creating rewrites the config, and its remotes and settings with it.
+      const fresh = !hasHead && !(await isFile(`${dir}/config`));
+      const open = (create: boolean) =>
+        createGitFilesHistoryFromFiles({
+          files,
+          gitDir,
+          create,
+          defaultBranch: this.initialBranch,
+        });
+      if (fresh && this.bare && dir !== ".") {
+        // The directory layout writes `core.bare = true` only for a gitDir of "."; set it
+        // before opening, so what reads the config (reflog defaults) sees a bare repository.
+        await open(true);
+        await markBare(files, `${dir}/config`);
+        history = await open(false);
+      } else {
+        history = await open(fresh);
+      }
+      await history.initialize();
+      if (!hasHead && !fresh) {
+        await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
+      }
+      // The index lives in the repository too: a reopened repository keeps what was staged
+      // (its last commit's files), so the next commit does not drop them.
+      if (this.stagingStore) {
+        staging = this.stagingStore;
+      } else if (this.bare) {
+        staging = new MemoryStagingStore();
+      } else {
+        const fileStaging = new FileStagingStore(files, `${dir}/index`);
+        await fileStaging.read();
+        staging = fileStaging;
+      }
+    } else {
+      history = createMemoryHistory();
+      await history.initialize();
+      // Set initial branch by creating symbolic ref for HEAD
+      await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
+      staging = this.stagingStore ?? new MemoryStagingStore();
+    }
 
     // Create worktree if enabled and not bare
     let worktree: Worktree | undefined;
@@ -362,4 +413,25 @@ export class InitCommand {
   private setCallable(value: boolean): void {
     this.callable = value;
   }
+}
+
+/** Sets `core.bare = true` in a config file written by the git directory layout. */
+async function markBare(files: FilesApi, configPath: string): Promise<void> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of files.read(configPath)) chunks.push(chunk);
+  const text = new TextDecoder().decode(concatChunks(chunks));
+  const updated = /^\s*bare\s*=/m.test(text)
+    ? text.replace(/^(\s*bare\s*=\s*)\S+/m, "$1true")
+    : text.replace(/^\[core\]\s*$/m, "[core]\n\tbare = true");
+  await files.write(configPath, [new TextEncoder().encode(updated)]);
+}
+
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
 }
