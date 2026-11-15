@@ -373,12 +373,12 @@ describe.each(backends)("ResetCommand ($name backend)", ({ factory }) => {
       expect(await readWorktreeText(worktree, "a.txt")).toBe("LOCAL GARBAGE A");
     });
 
-    it("should refuse to restore a symlink rather than write it as a regular file", async () => {
+    it("should restore a symlink as a link (mode 120000, its target as content)", async () => {
       const { git, workingCopy, repository } = await createInitializedGit();
       await createCommit(workingCopy, "Add data", { "data.txt": "committed content" });
 
-      // Build a tree containing a symlink entry; the Worktree interface has no
-      // way to create one, so restoring it faithfully is impossible.
+      // Build a tree containing a symlink entry: the worktree is handed mode 120000
+      // with the target as content (a link, or a file holding the target).
       const targetBlob = await repository.blobs.store([new TextEncoder().encode("data.txt")]);
       const treeId = await repository.trees.store([
         { name: "link", mode: FileMode.SYMLINK, id: targetBlob },
@@ -394,12 +394,13 @@ describe.each(backends)("ResetCommand ($name backend)", ({ factory }) => {
       const worktree = worktreeOf(workingCopy);
       worktree.setFile("data.txt", "LOCAL GARBAGE");
 
-      await expect(
-        git.reset().setRef(symlinkCommitId).setMode(ResetMode.HARD).call(),
-      ).rejects.toThrow(/symbolic links/);
+      await git.reset().setRef(symlinkCommitId).setMode(ResetMode.HARD).call();
 
-      // It refused before writing anything, so "link" was not faked as a file.
-      expect(await worktree.exists("link")).toBe(false);
+      const entry = await worktree.getEntry("link");
+      expect(entry?.mode).toBe(FileMode.SYMLINK);
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of worktree.readContent("link")) chunks.push(chunk);
+      expect(new TextDecoder().decode(chunks[0])).toBe("data.txt");
     });
 
     it("should still move HEAD and staging for a repository with no worktree", async () => {

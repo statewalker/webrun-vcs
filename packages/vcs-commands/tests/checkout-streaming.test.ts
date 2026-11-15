@@ -20,7 +20,6 @@ import type { Staging, Worktree } from "@statewalker/vcs-working-tree";
 import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { describe, expect, it } from "vitest";
 import { writeTreeRestorePlan } from "../src/commands/tree-restore.js";
-import { CheckoutCommand, type CheckoutCommandOptions } from "../src/core-commands/index.js";
 import { Git } from "../src/index.js";
 import { createSimpleHistory } from "./simple-history-store.js";
 import { testAuthor } from "./test-helper.js";
@@ -58,33 +57,6 @@ function streamProbe(blobId: ObjectId) {
   return { probe, blobs, consume };
 }
 
-describe("core CheckoutCommand streams blobs into FilesApi.write", () => {
-  it("writes a 50 MiB blob incrementally", async () => {
-    const blobId = "b".repeat(40);
-    const { probe, blobs, consume } = streamProbe(blobId);
-    const files = {
-      mkdir: async () => {},
-      write: async (_p: string, content: AsyncIterable<Uint8Array>) => consume(content),
-    } as unknown as FilesApi;
-    const staging = {
-      getEntry: async (path: string) =>
-        path === "big.bin" ? { path, objectId: blobId, mode: FileMode.REGULAR_FILE } : undefined,
-    } as unknown as Staging;
-    const checkout = new CheckoutCommand({
-      files,
-      workTreeRoot: "/repo",
-      blobs,
-      staging,
-    } as unknown as CheckoutCommandOptions);
-
-    const result = await checkout.checkoutPaths(["big.bin"]);
-    expect(result.conflicts).toEqual([]);
-    expect(probe.written).toBe(BIG);
-    expect(probe.largestChunk).toBeLessThanOrEqual(CHUNK);
-    expect(probe.maxOutstanding).toBe(0);
-  });
-});
-
 describe("writeTreeRestorePlan streams blobs into the worktree", () => {
   it("writes a 50 MiB blob incrementally", async () => {
     const blobId = "c".repeat(40);
@@ -102,6 +74,8 @@ describe("writeTreeRestorePlan streams blobs into the worktree", () => {
       {
         entries: [{ path: "big.bin", objectId: blobId, mode: FileMode.REGULAR_FILE }],
         paths: new Set(["big.bin"]),
+        gitlinks: [],
+        collided: [],
       },
       "test",
     );

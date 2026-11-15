@@ -12,7 +12,12 @@ import { DeleteStagingEntry } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 import { CheckoutStatus } from "../src/commands/checkout-command.js";
 import { InvalidRefNameError, RefNotFoundError } from "../src/errors/index.js";
-import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
+import {
+  addFile,
+  backends,
+  createInitializedGit,
+  createInitializedGitFromFactory,
+} from "./test-helper.js";
 
 /**
  * Collect async iterable bytes into single Uint8Array.
@@ -526,5 +531,27 @@ describe.each(backends)("CheckoutCommand ($name backend)", ({ factory }) => {
       const contentA = await collectBytes(blobContentA);
       expect(new TextDecoder().decode(contentA)).toBe("main-a");
     });
+  });
+});
+
+describe("CheckoutCommand refuses an index with unmerged entries", () => {
+  it("answers git's 'you need to resolve your current index first'", async () => {
+    const { git, workingCopy } = await createInitializedGit();
+    await addFile(workingCopy, "a.txt", "a");
+    await git.commit().setMessage("a").call();
+    await git.branchCreate().setName("other").call();
+    const staging = workingCopy.checkout.staging;
+    const entry = await staging.getEntry("a.txt");
+    await staging.setEntry({
+      path: "a.txt",
+      objectId: entry?.objectId ?? "",
+      mode: 0o100644,
+      stage: 2,
+    });
+
+    const result = await git.checkout().setName("other").call();
+    expect(result.status).toBe(CheckoutStatus.CONFLICTS);
+    expect(result.message).toBe("error: you need to resolve your current index first");
+    expect(result.conflicts).toEqual(["a.txt"]);
   });
 });

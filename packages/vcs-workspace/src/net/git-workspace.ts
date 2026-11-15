@@ -32,6 +32,7 @@ import {
   type FlatTree,
   MODE_FILE,
   MODE_GITLINK,
+  MODE_SYMLINK,
   readCommitTree,
   storeFlatTree,
 } from "./flat-tree.js";
@@ -44,6 +45,7 @@ import {
   FolderChangedError,
   type FolderSnapshot,
   type FolderWalk,
+  folderHasSymlinks,
   type IgnorePath,
   isExpendableDirectory,
   isSyncTempFile,
@@ -258,14 +260,28 @@ function inFolder(entry: FlatEntry | undefined): FlatEntry | undefined {
  * folder cannot hold, carried over from the branch exactly (ignored paths, submodule entries,
  * files under a nested repository): no deletion is ever recorded for those.
  */
-function composeTree(headFiles: FlatTree, snapshot: FolderSnapshot, skip: IgnorePath): FlatTree {
+function composeTree(
+  headFiles: FlatTree,
+  snapshot: FolderSnapshot,
+  skip: IgnorePath,
+  linksInFolder = false,
+): FlatTree {
   const out: FlatTree = new Map();
   for (const [path, entry] of headFiles) {
     if (entry.mode === MODE_GITLINK || skip(path)) out.set(path, entry);
   }
   for (const [path, file] of snapshot) {
     const previous = inFolder(headFiles.get(path));
-    out.set(path, { id: file.id, mode: previous ? previous.mode : MODE_FILE });
+    // a link is a link; a file keeps the mode the branch gave it (an executable bit, or a
+    // link a folder without links holds as a file of its target)
+    const mode = file.link
+      ? MODE_SYMLINK
+      : previous && previous.mode !== MODE_SYMLINK
+        ? previous.mode
+        : previous?.mode === MODE_SYMLINK && !linksInFolder
+          ? MODE_SYMLINK
+          : MODE_FILE;
+    out.set(path, { id: file.id, mode });
   }
   return out;
 }
@@ -1732,7 +1748,10 @@ export async function commitFolder(
   const { snapshot, skip, skipped } = await folderSnapshot(ws, current.files, walked, tempFiles);
   for (const path of held.report) skipped.push({ path, reason: "unignored-local" });
   await sweepTempFiles(ws.folder, tempFiles);
-  const tree = await storeFlatTree(ws.history, composeTree(current.files, snapshot, skip));
+  const tree = await storeFlatTree(
+    ws.history,
+    composeTree(current.files, snapshot, skip, folderHasSymlinks(ws.folder)),
+  );
   if (tree === current.tree) return { head, changed: false, conflicts, skipped, rejoined };
   const who = person(ws);
   const commit = await ws.history.commits.store({
@@ -1857,7 +1876,7 @@ async function checkoutAndMove(
   // overwritten; the nested repositories it finds are left alone by the checkout
   const walked = await walk(ws);
   const { snapshot, skip } = await folderSnapshot(ws, headFiles, walked);
-  const expected = composeTree(headFiles, snapshot, skip);
+  const expected = composeTree(headFiles, snapshot, skip, folderHasSymlinks(ws.folder));
   const tree = await storeFlatTree(ws.history, expected);
   if (tree !== (await readCommitTree(ws.history, head)).tree) throw new FolderChangedError();
   const target = typeof targetOf === "string" ? targetOf : await targetOf(walked);
@@ -2187,7 +2206,7 @@ export function concludeMerge(
     const message = (options.message ?? mergeMessage(record)).replace(/\n+$/, "");
     const commit = await commitTree(
       ws,
-      composeTree(record.files, snapshot, skip),
+      composeTree(record.files, snapshot, skip, folderHasSymlinks(ws.folder)),
       concludeParents(record),
       message,
     );

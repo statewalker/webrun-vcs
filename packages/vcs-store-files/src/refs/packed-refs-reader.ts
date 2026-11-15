@@ -27,6 +27,7 @@ import {
   RefStorage,
   readFile,
 } from "@statewalker/vcs-core";
+import { isBeyondSymlinkError } from "@statewalker/vcs-utils/files";
 
 /**
  * Parsed packed-refs result
@@ -67,7 +68,9 @@ export async function readPackedRefs(
   try {
     const data = await readFile(files, packedRefsPath);
     content = new TextDecoder().decode(data);
-  } catch {
+  } catch (error) {
+    // beneath a symbolic link is an error, never "no packed refs"
+    if (isBeyondSymlinkError(error)) throw error;
     // File doesn't exist or can't be read
     return { refs: [], peeled: false };
   }

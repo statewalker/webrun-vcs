@@ -226,7 +226,9 @@ export function createRepositoryController(ctx: AppContext): () => void {
       return;
     }
     try {
-      await git.checkout().setName("main").call();
+      // The sync moved refs/heads/main under HEAD: a plain checkout of the branch HEAD
+      // already names changes nothing (git's two-way merge); `checkout -f` writes its tree.
+      await git.checkout().setName("main").setForced(true).call();
       logModel.info("Checked out main branch to working directory");
       await refreshRepositoryState(git);
     } catch (error) {

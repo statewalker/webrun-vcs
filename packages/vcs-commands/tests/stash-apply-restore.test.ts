@@ -479,15 +479,15 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
 
   // -------------------------------------------------- what it will not do
 
-  it("refuses to restore a symlink rather than writing it as a regular file", async () => {
-    // The symlink target's blob id is irrelevant: the mode is rejected before
-    // any blob is looked up.
+  it("refuses to restore a symlink whose blob is missing, before writing", async () => {
+    // Symlinks are restored as links now (the worktree gets mode 120000); like any
+    // entry, a link whose blob is missing fails the plan before anything is written.
     const { git, workingCopy } = await buildStash({
       baseFiles: { "keep.txt": "keep" },
       stash: { raw: { link: ["1234abcd".repeat(5), FileMode.SYMLINK] } },
     });
 
-    await expect(git.stashApply().call()).rejects.toThrow(/symbolic links/);
+    await expect(git.stashApply().call()).rejects.toThrow(/cannot restore link: blob/);
     expect(await hasFile(workingCopy, "link")).toBe(false);
   });
 

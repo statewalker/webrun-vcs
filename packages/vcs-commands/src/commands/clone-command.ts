@@ -1,17 +1,28 @@
-import type { ObjectId } from "@statewalker/vcs-core";
+import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
   type RefspecResolver,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
+import type { Worktree } from "@statewalker/vcs-working-tree";
 
-import { InvalidArgumentError, InvalidRemoteError, RefNotFoundError } from "../errors/index.js";
+import {
+  CloneCheckoutError,
+  InvalidArgumentError,
+  InvalidRemoteError,
+  RefNotFoundError,
+} from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import type { CloneResult } from "../results/clone-result.js";
 import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
+import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+
+/** Names the clone's checkout in failure messages. */
+const CLONE = "clone";
 
 /**
  * Clone a remote repository.
@@ -29,6 +40,19 @@ import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
  * `--no-tags`, `remote.<name>.mirror`), the upstream of the checked-out branch
  * (`branch.<name>.remote` / `branch.<name>.merge`), and points
  * `refs/remotes/<name>/HEAD` at the remote's default branch.
+ *
+ * A non-bare clone checks out the commit HEAD names, as `git clone` does: the files
+ * of its tree are written to the worktree (executable bits and symbolic links where
+ * the worktree can represent them, see `Worktree.capabilities`; an empty directory
+ * for each submodule) and the index records them with their stat data. When the
+ * worktree cannot represent executables or symlinks, `core.filemode` or
+ * `core.symlinks` is set to false, as `git init` does after probing the filesystem.
+ * `setNoCheckout(true)` writes neither files nor index; a bare clone has neither.
+ *
+ * As in git, the checkout comes last, once the refs and the configuration are written:
+ * when it fails (a tree path git's `verify_path` refuses, entries that collide, a file
+ * in the way) the clone throws a `CloneCheckoutError` ("Clone succeeded, but checkout
+ * failed") carrying the clone's result, and the repository stays usable.
  *
  * @example
  * ```typescript
@@ -144,7 +168,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
-   * Set whether to skip checkout.
+   * Set whether to skip checkout (`git clone --no-checkout`): HEAD and the branch are
+   * set up, but no file is written and the index is left empty.
    *
    * @param noCheckout Whether to skip checkout
    */
@@ -464,6 +489,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     let defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
     let headCommit: ObjectId | undefined;
     let checkedOutBranch: string | undefined;
+    // the commit to check out once refs and configuration are in place (git: last)
+    let checkoutId: ObjectId | undefined;
     // an empty remote without unborn HEAD: git's default branch (the one init named)
     if (!detachedTag && !this.bare && defaultBranch === undefined && result.isEmpty) {
       defaultBranch = (await this.localHeadBranch()) ?? "main";
@@ -482,7 +509,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (id) {
         await this.refsStore.set("HEAD", id);
         headCommit = id;
-        if (!this.bare && !this.noCheckout) await this.checkoutHead(id);
+        if (!this.bare && !this.noCheckout) checkoutId = id;
       }
     } else if (defaultBranch && !this.bare) {
       // The local branch starts at the tracking ref the clone just wrote
@@ -491,9 +518,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (tip?.objectId) {
         await this.refsStore.set(localRef, tip.objectId);
         headCommit = tip.objectId;
-        if (!this.noCheckout) {
-          await this.checkoutHead(tip.objectId);
-        }
+        if (!this.noCheckout) checkoutId = tip.objectId;
       }
       // HEAD names the default branch, born or not (an empty remote's unborn HEAD)
       await this.refsStore.setSymbolic("HEAD", localRef);
@@ -520,6 +545,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     }
 
     await this.writeConfig({
+      worktree: this.bare ? undefined : this.worktreeAccess,
       singleBranch,
       branch: branchToClone,
       detachedTag,
@@ -543,13 +569,23 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       messages: [],
     };
 
-    return {
+    const cloneResult: CloneResult = {
       fetchResult,
       defaultBranch: defaultBranch ?? "main",
       remoteName: this.remoteName,
       bare: this.bare,
       headCommit,
     };
+
+    if (checkoutId) {
+      try {
+        const collided = await this.checkoutHead(checkoutId);
+        if (collided.length > 0) cloneResult.collidedPaths = collided;
+      } catch (error) {
+        throw new CloneCheckoutError(cloneResult, error);
+      }
+    }
+    return cloneResult;
   }
 
   /**
@@ -560,6 +596,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * checked-out branch (`branch.<b>.remote`, `branch.<b>.merge`).
    */
   private async writeConfig(clone: {
+    worktree?: Worktree;
     singleBranch: boolean;
     branch?: string;
     detachedTag?: string;
@@ -567,6 +604,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     checkedOutBranch?: string;
   }): Promise<void> {
     const store = RemoteConfigStore.from(this.workingCopy);
+    // git init probes the filesystem: what the worktree cannot represent is turned off
+    const capabilities = clone.worktree?.capabilities;
+    if (capabilities?.executable === false) store.setValue("core.filemode", "false");
+    if (capabilities?.symlinks === false) store.setValue("core.symlinks", "false");
+    // ...and whether it folds case or Unicode composition (git writes each only when found)
+    const folding = await clone.worktree?.probeCaseFolding?.();
+    if (folding?.ignoreCase) store.setValue("core.ignorecase", "true");
+    if (folding?.precomposeUnicode) store.setValue("core.precomposeunicode", "true");
     const remote = `remote.${this.remoteName}`;
     store.setValue(`${remote}.url`, this.uri as string);
     // git >= 2.49: --mirror implies --no-tags (its refspec still maps every tag)
@@ -608,19 +653,65 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
-   * Checkout HEAD commit to staging area.
+   * Check out the cloned commit, as `git clone` does: the files of its tree into the
+   * worktree, then the index with the stat data of the files written. Without a
+   * worktree only the index is filled.
+   *
+   * The whole tree is planned (and every blob checked) before the first file is
+   * written. Symlinks become links where the worktree makes them and `core.symlinks`
+   * is not false, else plain files holding the target (the index keeps mode 120000);
+   * a submodule becomes an empty directory, as in a clone without `--recurse-submodules`.
+   *
+   * The index records size, mtime and (where the worktree reports it) ctime, but no inode,
+   * device, uid or gid, which FilesApi does not give: `git status` sees the files clean and
+   * refreshes the index once, while commands that do not refresh (`git diff-files`,
+   * `git diff-index --quiet`) report every file as changed until then, unless
+   * `core.checkStat=minimal`.
    */
-  private async checkoutHead(commitId: ObjectId): Promise<void> {
-    try {
-      const commit = await this.commits.load(commitId);
-      if (!commit) {
-        return;
-      }
+  private async checkoutHead(commitId: ObjectId): Promise<string[]> {
+    const commit = await this.commits.load(commitId).catch(() => undefined);
+    if (!commit) return [];
+    const worktree = this.bare ? undefined : this.worktreeAccess;
+    if (!worktree) {
       await this.staging.readTree(this.trees, commit.tree);
       await this.staging.write();
-    } catch {
-      // Commit not available yet (pack not unpacked)
+      return [];
     }
+
+    // every path checked (verify_path, collisions) before the first file is written
+    const plan = await planTreeRestore(this.trees, this.blobs, commit.tree, CLONE, {
+      symlinks: true,
+      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      windows: worktree.capabilities?.windowsPaths === true,
+    });
+    const symlinks = this.symlinksEnabled(worktree);
+    await writeTreeRestorePlan(worktree, this.blobs, plan, CLONE, { symlinks, gitlinks: true });
+
+    // the index records what was written (the worktree's stat of each file, a link's
+    // own when the worktree can lstat): native git then sees the files unchanged
+    await this.staging.readTree(this.trees, commit.tree);
+    const editor = this.staging.createEditor();
+    for (const { path, objectId, mode } of plan.entries) {
+      const stats = await worktree.getEntry(path);
+      if (stats) {
+        editor.upsert({
+          path,
+          objectId,
+          mode,
+          size: stats.size,
+          mtime: stats.mtime,
+          ...(stats.ctime !== undefined ? { ctime: stats.ctime } : {}),
+        });
+      }
+    }
+    await editor.finish();
+    await this.staging.write();
+    return plan.collided;
+  }
+
+  /** Whether symlinks are written as links: the worktree can, and `core.symlinks` allows. */
+  private symlinksEnabled(worktree: Worktree): boolean {
+    return worktreeModeTrust(this.workingCopy, worktree).symlinks;
   }
 }
 

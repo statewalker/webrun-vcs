@@ -9,3 +9,5 @@ export * from "./store-worktree-file.js";
 export * from "./types.js";
 // Worktree interface
 export * from "./worktree.js";
+// The mode to stage for a worktree file (git's ce_mode_from_stat)
+export * from "./worktree-mode.js";

@@ -13,6 +13,7 @@ import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-resul
 import type { StashApplyResult } from "../results/stash-result.js";
 import { StashApplyStatus } from "../results/stash-result.js";
 import { mergeTreesThreeWay } from "../tree-merge/index.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { planTreeRestore, type TreeRestorePlan, writeTreeRestorePlan } from "./tree-restore.js";
 
@@ -266,11 +267,16 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     // and the untracked files - and validate it before touching anything. A
     // stash this command cannot restore faithfully then fails with the working
     // tree intact rather than half applied.
+    // symlinks are restored as links, or as files holding the target where the worktree
+    // or core.symlinks cannot have links (as clone writes them)
+    const trust = worktreeModeTrust(this.workingCopy, worktree);
+    const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     const worktreePlan = await planTreeRestore(
       this.trees,
       this.blobs,
       mergeResult.tree,
       STASH_APPLY,
+      { symlinks: true, ignoreCase, windows: worktree.capabilities?.windowsPaths === true },
     );
 
     // A tracked path the merged tree does not account for is one the stash
@@ -290,15 +296,23 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       worktree,
     );
 
-    // Everything below this line writes.
-    await writeTreeRestorePlan(worktree, this.blobs, worktreePlan, STASH_APPLY);
+    // Everything below this line writes. Deletions first, as git's unpack-trees: a
+    // deleted file or link `d` makes way for `d/x` and is never written through.
     for (const path of removals) {
       await worktree.remove(path);
     }
+    // as git's merge writes them: a file or link where a directory must go is unlinked
+    // (never followed), so the restore completes instead of stopping half way
+    await writeTreeRestorePlan(worktree, this.blobs, worktreePlan, STASH_APPLY, {
+      symlinks: trust.symlinks,
+      replaceInTheWay: true,
+    });
     if (untrackedPlan) {
       // Restored untracked files are written to the working tree only - they
       // were untracked when stashed and stay untracked now.
-      await writeTreeRestorePlan(worktree, this.blobs, untrackedPlan, STASH_APPLY);
+      await writeTreeRestorePlan(worktree, this.blobs, untrackedPlan, STASH_APPLY, {
+        symlinks: trust.symlinks,
+      });
     }
     if (mergedIndexTree !== undefined) {
       await this.staging.readTree(this.trees, mergedIndexTree);
@@ -339,7 +353,11 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       throw new RefNotFoundError(untrackedCommitId, "Stash untracked commit not found");
     }
 
-    const plan = await planTreeRestore(this.trees, this.blobs, untrackedCommit.tree, STASH_APPLY);
+    const plan = await planTreeRestore(this.trees, this.blobs, untrackedCommit.tree, STASH_APPLY, {
+      symlinks: true,
+      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      windows: worktree.capabilities?.windowsPaths === true,
+    });
 
     for (const { path } of plan.entries) {
       if (worktreePlan.paths.has(path) || (await worktree.exists(path))) {

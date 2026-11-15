@@ -1,14 +1,20 @@
 /**
- * The Node.js FilesApi: `NodeFilesApi` from `@statewalker/webrun-files-node`.
- * Library code reads and writes files only through FilesApi; this module just
- * picks the Node implementation for apps and tests that run on Node.
+ * The Node.js FilesApi: `NodeFilesApi` from `@statewalker/webrun-files-node`, with the
+ * optional POSIX operations (`chmod`, `symlink`, `lstat`, `readlink`) a worktree needs to
+ * hold executables and symbolic links. Library code reads and writes files only through
+ * FilesApi; this module just picks the Node implementation for apps and tests that run on
+ * Node.
  */
 
-import type { FilesApi } from "@statewalker/vcs-utils/files";
+import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
+import { PosixNodeFilesApi } from "./posix-node-files-api.js";
 
 /**
  * Create a Node.js filesystem-backed FilesApi instance.
+ *
+ * It is a `PosixFilesApi`: a worktree over it writes executables and symbolic links as git
+ * does, and never follows a symbolic link out of the root.
  *
  * @param options.rootDir - Root directory for all operations
  * @returns FilesApi instance
@@ -22,8 +28,8 @@ import { NodeFilesApi } from "@statewalker/webrun-files-node";
  * });
  * ```
  */
-export function createNodeFilesApi(options: { rootDir: string }): FilesApi {
-  return new NodeFilesApi(options);
+export function createNodeFilesApi(options: { rootDir: string }): PosixFilesApi {
+  return new PosixNodeFilesApi(options);
 }
 
-export { NodeFilesApi };
+export { NodeFilesApi, PosixNodeFilesApi };

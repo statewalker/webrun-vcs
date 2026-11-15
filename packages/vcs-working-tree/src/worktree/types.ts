@@ -18,6 +18,8 @@ export interface WorktreeEntry {
   size: number;
   /** Last modified time (milliseconds since epoch) */
   mtime: number;
+  /** Status change time (milliseconds since epoch), where the worktree knows it */
+  ctime?: number;
   /** Whether this is a directory */
   isDirectory: boolean;
   /** Whether file is ignored by .gitignore */

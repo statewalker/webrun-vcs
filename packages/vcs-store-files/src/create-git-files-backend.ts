@@ -19,6 +19,7 @@ import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
 import { skipPacked, withPacks } from "./pack/with-packs.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
+import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
@@ -108,7 +109,9 @@ export interface GitFilesBackendResult {
 export async function createGitFilesBackend(
   options: GitFilesBackendOptions,
 ): Promise<GitFilesBackendResult> {
-  const { files, gitDir = ".git", create = false, defaultBranch = "main" } = options;
+  const { gitDir = ".git", create = false, defaultBranch = "main" } = options;
+  // a `.git` or `.git/objects` the user linked elsewhere is followed, as git follows it
+  const files = await resolveLinkedGitDir(options.files, gitDir);
 
   const objectsDir = joinPath(gitDir, "objects");
   const packDir = joinPath(objectsDir, "pack");

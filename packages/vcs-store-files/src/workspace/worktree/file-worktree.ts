@@ -7,6 +7,12 @@
  * - Checkout operations (checkoutTree, checkoutPaths)
  *
  * This is the primary Worktree implementation for file-based repositories.
+ *
+ * Over a FilesApi with `lstat` (a local filesystem, `createNodeFilesApi`), the worktree
+ * never follows a symbolic link, as git does: a symbolic link is listed, hashed and read
+ * as a link (mode 120000, its target as content), a write or remove beneath a link is
+ * refused (git's `has_symlink_leading_path`), and a link at the path written is
+ * unlinked, not written through.
  */
 
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
@@ -15,15 +21,19 @@ import {
   basename,
   type FileInfo,
   FileMode,
-  type FilesApi,
+  isBeyondSymlinkError,
   joinPath,
+  type LinkStats,
+  type PosixFilesApi,
   readFile,
 } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { collect } from "@statewalker/vcs-utils/streams";
 import type {
   IgnoreManager,
   NewHasher,
   Worktree,
+  WorktreeCapabilities,
   WorktreeCheckoutOptions,
   WorktreeCheckoutResult,
   WorktreeEntry,
@@ -31,16 +41,15 @@ import type {
   WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
 import { createIgnoreManager, hashWorktreeFile } from "@statewalker/vcs-working-tree";
+import { type CaseFolding, probeCaseFolding } from "./probe-case-folding.js";
 
 /**
- * Extended FilesApi with additional operations for worktree
- *
- * Note: FilesApi already has mkdir, remove, move. We add chmod here.
+ * The FilesApi a FileWorktree works over: a FilesApi, with the optional `chmod`,
+ * `symlink`, `lstat` and `readlink` of `PosixFilesApi`. Without them (browsers, object
+ * stores) executables are written as plain files and symlinks as files holding the link
+ * target, as git does with `core.filemode` / `core.symlinks` false.
  */
-export interface WorktreeFilesApi extends FilesApi {
-  /** Set file permissions (optional) */
-  chmod?(path: string, mode: number): Promise<void>;
-}
+export type WorktreeFilesApi = PosixFilesApi;
 
 /**
  * Options for creating a FileWorktree
@@ -96,6 +105,35 @@ export class FileWorktree implements Worktree {
     this.newHasher = options.newHasher ?? createSha1;
   }
 
+  /**
+   * Executables where the FilesApi can chmod and lstat (to read the bit back), symlinks
+   * where it can make, lstat and read links (so they are never followed).
+   */
+  get capabilities(): WorktreeCapabilities {
+    const files = this.files;
+    return {
+      executable: !!(files.chmod && files.lstat),
+      symlinks: !!(files.symlink && files.lstat && files.readlink),
+      windowsPaths: this.windowsPaths,
+    };
+  }
+
+  /** The FilesApi reads `\` as a separator (Windows): git's Windows path rules apply. */
+  private get windowsPaths(): boolean {
+    return this.files.pathSeparators?.includes("\\") ?? false;
+  }
+
+  /** The path rules of this worktree's platform (verify_path). */
+  private get pathRules(): { windows: boolean } {
+    return { windows: this.windowsPaths };
+  }
+
+  /** git init's case and Unicode folding probe, under the repository's `gitDir`. */
+  async probeCaseFolding(): Promise<CaseFolding> {
+    if (this.gitDir === undefined) return { ignoreCase: false, precomposeUnicode: false };
+    return probeCaseFolding(this.files, this.gitDir);
+  }
+
   // ========== Reading ==========
 
   async *walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry> {
@@ -149,11 +187,16 @@ export class FileWorktree implements Worktree {
     for (const entry of entries) {
       const entryPath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
       const fullPath = joinPath(dirPath, entry.name);
-      const isDirectory = entry.kind === "directory";
 
       if (entry.name === ".git") {
         continue;
       }
+
+      // the entry itself: a symbolic link is a file of its own, never descended into
+      const link = await this.files.lstat?.(fullPath);
+      // a FIFO, socket or device is not content git tracks (git skips it too)
+      if (link?.kind === "other") continue;
+      const isDirectory = link ? link.kind === "directory" : entry.kind === "directory";
 
       const isIgnored = this.ignoreManager.isIgnored(entryPath, isDirectory);
 
@@ -166,15 +209,19 @@ export class FileWorktree implements Worktree {
         hasGitDir = await this.hasGitDirectory(fullPath);
       }
 
-      const mode = this.getFileMode(entry, hasGitDir);
-      const stats = await this.getFileStats(fullPath, isDirectory);
+      const stats = link
+        ? { size: isDirectory ? 0 : link.size, mtime: isDirectory ? 0 : link.lastModified }
+        : await this.getFileStats(fullPath, isDirectory);
 
       const worktreeEntry: WorktreeEntry = {
         path: entryPath,
         name: entry.name,
-        mode,
+        mode: link
+          ? this.modeOf(link, hasGitDir)
+          : this.getFileMode({ kind: isDirectory ? "directory" : "file" }, hasGitDir),
         size: stats.size,
         mtime: stats.mtime,
+        ...(link?.ctime !== undefined && !isDirectory ? { ctime: link.ctime } : {}),
         isDirectory,
         isIgnored,
       };
@@ -202,6 +249,28 @@ export class FileWorktree implements Worktree {
 
   async getEntry(path: string): Promise<WorktreeEntry | undefined> {
     const fullPath = joinPath(this.rootPath, path);
+
+    if (this.files.lstat) {
+      // beneath a symbolic link a path is absent, as git's lstat cache has it; a FIFO,
+      // socket or device is no content either
+      const link = await this.files.lstat(fullPath).catch((error: unknown) => {
+        if (isBeyondSymlinkError(error)) return undefined;
+        throw error;
+      });
+      if (!link || link.kind === "other") return undefined;
+      const isDirectory = link.kind === "directory";
+      const hasGitDir = isDirectory && (await this.hasGitDirectory(fullPath));
+      return {
+        path,
+        name: basename(path),
+        mode: this.modeOf(link, hasGitDir),
+        size: isDirectory ? 0 : link.size,
+        mtime: isDirectory ? 0 : link.lastModified,
+        ...(link.ctime !== undefined && !isDirectory ? { ctime: link.ctime } : {}),
+        isDirectory,
+        isIgnored: this.ignoreManager.isIgnored(path, isDirectory),
+      };
+    }
 
     try {
       const stats = await this.files.stats(fullPath);
@@ -243,7 +312,17 @@ export class FileWorktree implements Worktree {
   }
 
   async computeHash(path: string): Promise<ObjectId> {
+    if (!this.files.refusesBeyondLinks) await this.checkLeadingPath(path);
     const fullPath = joinPath(this.rootPath, path);
+    const target = await this.linkTarget(fullPath);
+    if (target) {
+      // a symbolic link hashes as its target, as git stores it (never the file it names)
+      return hashWorktreeFile(
+        path,
+        { size: async () => target.length, read: () => [target] },
+        this.newHasher,
+      );
+    }
     return hashWorktreeFile(
       path,
       {
@@ -259,14 +338,24 @@ export class FileWorktree implements Worktree {
   }
 
   async *readContent(path: string): AsyncIterable<Uint8Array> {
+    // never a file beneath a link: that would read wherever the link points (a FilesApi
+    // that refuses such paths itself is not asked twice)
+    if (!this.files.refusesBeyondLinks) await this.checkLeadingPath(path);
     const fullPath = joinPath(this.rootPath, path);
-
+    const target = await this.linkTarget(fullPath);
+    if (target) {
+      yield target;
+      return;
+    }
     yield* this.files.read(fullPath);
   }
 
   async exists(path: string): Promise<boolean> {
     const fullPath = joinPath(this.rootPath, path);
     try {
+      if (this.files.lstat) {
+        return (await this.files.lstat(fullPath).catch(() => undefined)) !== undefined;
+      }
       return await this.files.exists(fullPath);
     } catch {
       return false;
@@ -298,14 +387,30 @@ export class FileWorktree implements Worktree {
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array> | Uint8Array,
     options?: WorktreeWriteOptions,
   ): Promise<void> {
-    assertValidWorktreePath(path);
+    assertValidWorktreePath(path, options?.mode, this.pathRules);
+    if (!this.files.refusesBeyondLinks || options?.replaceInTheWay) {
+      await this.checkLeadingPath(path, options?.replaceInTheWay === true);
+    }
     const fullPath = joinPath(this.rootPath, path);
+    const existing = await this.kindOf(fullPath);
 
     // Check if file exists and overwrite is false
-    if (options?.overwrite === false) {
-      if (await this.files.exists(fullPath)) {
-        throw new Error(`File already exists: ${path}`);
-      }
+    if (options?.overwrite === false && existing) {
+      throw new Error(`File already exists: ${path}`);
+    }
+    // a directory in the way is removed only by a forced checkout (`reset --hard`), as git
+    // removes untracked directories where a file must go; never otherwise
+    if (existing === "directory" && options?.replaceInTheWay) {
+      await this.files.remove(fullPath);
+      if (await this.kindOf(fullPath)) throw new Error(`Cannot replace directory ${path}`);
+    } else if (existing === "directory") {
+      throw new Error(`Cannot write ${path}: a directory is in the way`);
+    }
+    const asLink = options?.mode === FileMode.SYMLINK && !!this.files.symlink;
+    // a link at the path is replaced, never written through; a file makes way for a link
+    if (existing === "symlink" || (existing && asLink)) {
+      await this.files.remove(fullPath);
+      if (await this.kindOf(fullPath)) throw new Error(`Cannot replace ${path}`);
     }
 
     // Create parent directories if needed
@@ -323,30 +428,66 @@ export class FileWorktree implements Worktree {
     // Convert content to iterable if it's a Uint8Array
     const iterable = content instanceof Uint8Array ? [content] : content;
 
+    // A symlink's content is its target: a link where the FilesApi makes one,
+    // else a plain file holding the target (git with core.symlinks=false)
+    if (asLink && this.files.symlink) {
+      // the target as bytes, as the tree holds it (not necessarily UTF-8)
+      await this.files.symlink(await collect(iterable), fullPath);
+      return;
+    }
+
     // Write content
     await this.files.write(fullPath, iterable);
 
-    // Set mode if specified
-    if (options?.mode !== undefined && this.files.chmod) {
-      await this.files.chmod(fullPath, options.mode);
+    // The executable bit, as git sets it: from the file's own mode (the umask kept), x
+    // added where r is set, or taken away for a regular file
+    const mode = options?.mode;
+    if ((mode === FileMode.REGULAR_FILE || mode === FileMode.EXECUTABLE_FILE) && this.files.chmod) {
+      const current = (await this.files.lstat?.(fullPath))?.mode;
+      if (current !== undefined) {
+        const wanted =
+          mode === FileMode.EXECUTABLE_FILE ? current | ((current & 0o444) >> 2) : current & ~0o111;
+        if (wanted !== current) await this.files.chmod(fullPath, wanted);
+      }
     }
   }
 
-  async remove(path: string, _options?: { recursive?: boolean }): Promise<boolean> {
-    assertValidWorktreePath(path);
+  /**
+   * Removes a file, or a symbolic link itself (never what it points to, a dangling one
+   * included). A directory is removed only with `recursive`; without it, it is left in
+   * place and `false` returned.
+   */
+  async remove(path: string, options?: { recursive?: boolean }): Promise<boolean> {
+    assertValidWorktreePath(path, undefined, this.pathRules);
+    // beneath a link or a file the path is absent (git's has_symlink_or_noent_leading_path)
+    if (!this.files.refusesBeyondLinks && (await this.hasLinkOrFileLeading(path))) return false;
     const fullPath = joinPath(this.rootPath, path);
+    const kind = await this.kindOf(fullPath).catch((error: unknown) => {
+      if (isBeyondSymlinkError(error)) return undefined;
+      throw error;
+    });
+    if (!kind) return false;
+    if (kind === "directory" && !options?.recursive) return false;
     return this.files.remove(fullPath);
   }
 
   async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {
-    assertValidWorktreePath(path);
+    assertValidWorktreePath(path, undefined, this.pathRules);
+    if (!this.files.refusesBeyondLinks) await this.checkLeadingPath(path);
     const fullPath = joinPath(this.rootPath, path);
+    const kind = await this.kindOf(fullPath);
+    if (kind === "directory") return;
+    if (kind) throw new Error(`Cannot create directory ${path}: a ${kind} is in the way`);
     await this.files.mkdir(fullPath);
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
-    assertValidWorktreePath(oldPath);
-    assertValidWorktreePath(newPath);
+    assertValidWorktreePath(oldPath, undefined, this.pathRules);
+    assertValidWorktreePath(newPath, undefined, this.pathRules);
+    if (!this.files.refusesBeyondLinks) {
+      await this.checkLeadingPath(oldPath);
+      await this.checkLeadingPath(newPath);
+    }
     const fullOldPath = joinPath(this.rootPath, oldPath);
     const fullNewPath = joinPath(this.rootPath, newPath);
     await this.files.move(fullOldPath, fullNewPath);
@@ -422,6 +563,18 @@ export class FileWorktree implements Worktree {
         if (subtree) {
           await this.checkoutTreeRecursive(subtree, path, result, options);
         }
+      } else if (entry.mode === FileMode.GITLINK) {
+        // Submodule: an empty directory, as git checks out an unpopulated submodule
+        if (options?.dryRun) {
+          result.updated.push(path);
+          continue;
+        }
+        try {
+          await this.mkdir(path);
+          result.updated.push(path);
+        } catch (error) {
+          result.failed.push({ path, error: String(error) });
+        }
       } else {
         // File - checkout content
         if (options?.dryRun) {
@@ -469,6 +622,67 @@ export class FileWorktree implements Worktree {
   }
 
   // ========== Internal Helpers ==========
+
+  /** The git mode of an entry as `lstat` reports it. */
+  private modeOf(link: LinkStats, hasGitDir: boolean): number {
+    if (link.kind === "symlink") return FileMode.SYMLINK;
+    if (link.kind === "directory") return hasGitDir ? FileMode.GITLINK : FileMode.TREE;
+    if (this.capabilities.executable && ((link.mode ?? 0) & 0o100) !== 0) {
+      return FileMode.EXECUTABLE_FILE;
+    }
+    return FileMode.REGULAR_FILE;
+  }
+
+  /** The target of the symbolic link at `fullPath`, or undefined when it is not a link. */
+  private async linkTarget(fullPath: string): Promise<Uint8Array | undefined> {
+    if (!this.files.lstat || !this.files.readlink) return undefined;
+    if ((await this.files.lstat(fullPath))?.kind !== "symlink") return undefined;
+    return (await this.files.readlink(fullPath)) ?? new Uint8Array(0);
+  }
+
+  /** What is at `fullPath`: `lstat` where the FilesApi has it, else `stats`. */
+  private async kindOf(fullPath: string): Promise<LinkStats["kind"] | undefined> {
+    if (this.files.lstat) return (await this.files.lstat(fullPath))?.kind;
+    return (await this.files.stats(fullPath))?.kind;
+  }
+
+  /** Whether a leading component of `path` is a symbolic link or not a directory. */
+  private async hasLinkOrFileLeading(path: string): Promise<boolean> {
+    try {
+      await this.checkLeadingPath(path);
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Refuses a path beneath a symbolic link or a file (git's `has_symlink_leading_path`):
+   * a write there would land outside the worktree, or wherever the link points. With
+   * `replace` (a forced checkout: `reset --hard`) a link or file standing where a
+   * directory must go is unlinked instead, as git's `create_directories` does with
+   * `state->force`; what it pointed to is never touched.
+   */
+  private async checkLeadingPath(path: string, replace = false): Promise<void> {
+    const parts = path.split("/");
+    for (let i = 1; i < parts.length; i++) {
+      const prefix = parts.slice(0, i).join("/");
+      const full = joinPath(this.rootPath, prefix);
+      const kind = await this.kindOf(full);
+      if (!kind) return;
+      if (replace && kind !== "directory") {
+        await this.files.remove(full);
+        if (await this.kindOf(full)) throw new Error(`Cannot replace ${prefix}`);
+        return;
+      }
+      if (kind === "symlink") {
+        throw new Error(`Refusing to touch ${path}: beyond a symbolic link at ${prefix}`);
+      }
+      if (kind !== "directory") {
+        throw new Error(`Refusing to touch ${path}: ${prefix} is not a directory`);
+      }
+    }
+  }
 
   private getFileMode(info: { kind: "file" | "directory" }, hasGitDir: boolean): number {
     if (info.kind === "directory") {
@@ -531,6 +745,8 @@ export class FileWorktree implements Worktree {
     const gitignorePath = joinPath(dirPath, ".gitignore");
 
     try {
+      // git (2.32+) never follows a symbolic link to a .gitignore inside the worktree
+      if ((await this.files.lstat?.(gitignorePath))?.kind === "symlink") return;
       if (await this.files.exists(gitignorePath)) {
         const content = await readFile(this.files, gitignorePath);
         const text = new TextDecoder().decode(content);

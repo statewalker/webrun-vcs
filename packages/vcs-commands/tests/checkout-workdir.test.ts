@@ -344,7 +344,9 @@ describe("CheckoutCommand working directory updates", () => {
 
       // Create feature branch and switch back
       await git.checkout().setCreateBranch(true).setName("feature").call();
-      await git.checkout().setName("main").call();
+      // the files were only staged: as `git checkout -f`, a forced switch writes them
+      // (a plain one between identical trees keeps the worktree as it is, as git)
+      await git.checkout().setName("main").setForced(true).call();
 
       // Verify all nested files exist
       expect(await fileExists(files, "src/components/ui/button/index.ts")).toBe(true);
@@ -506,7 +508,9 @@ describe("CheckoutCommand working directory updates", () => {
 
       // Create branch and switch back
       await git.checkout().setCreateBranch(true).setName("feature").call();
-      await git.checkout().setName("main").call();
+      // the files were only staged: as `git checkout -f`, a forced switch writes them
+      // (a plain one between identical trees keeps the worktree as it is, as git)
+      await git.checkout().setName("main").setForced(true).call();
 
       // Verify file exists under workTreeRoot
       expect(await fileExists(files, "/project/readme.txt")).toBe(true);

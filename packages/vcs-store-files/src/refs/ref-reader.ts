@@ -24,6 +24,7 @@ import {
   SYMREF_PREFIX,
   type SymbolicRef,
 } from "@statewalker/vcs-core";
+import { isBeyondSymlinkError } from "@statewalker/vcs-utils/files";
 import { findPackedRef, readPackedRefs } from "./packed-refs-reader.js";
 
 /** Maximum depth for resolving symbolic refs */
@@ -95,7 +96,9 @@ export async function readLooseRef(
   }
   try {
     content = await readFile(files, refPath);
-  } catch {
+  } catch (error) {
+    // a ref beneath a symbolic link is an error, never "no ref" (an empty repository)
+    if (isBeyondSymlinkError(error)) throw error;
     return undefined;
   }
 
@@ -281,11 +284,13 @@ async function readLooseRefsRecursive(
             refs.push(ref);
           }
         }
-      } catch {
+      } catch (error) {
+        if (isBeyondSymlinkError(error)) throw error;
         // Skip unreadable entries
       }
     }
-  } catch {
+  } catch (error) {
+    if (isBeyondSymlinkError(error)) throw error;
     return; // Directory doesn't exist
   }
 }
