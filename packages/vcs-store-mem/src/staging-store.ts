@@ -220,7 +220,10 @@ export class MemoryStagingStore implements Staging {
       throw new Error("Cannot write tree with unresolved conflicts");
     }
 
-    const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED);
+    // an intent-to-add entry is no part of the tree (git's update_one skips it)
+    const stage0 = this._entries.filter(
+      (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
+    );
     return this.buildTreeRecursive(trees, stage0, "");
   }
 

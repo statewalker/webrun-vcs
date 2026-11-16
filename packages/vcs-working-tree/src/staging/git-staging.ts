@@ -9,6 +9,7 @@
 
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, FileMode, type FilesApi } from "@statewalker/vcs-core";
+import type { CacheTree } from "./cache-tree.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import { IndexFile, readIndexChecksum } from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion, reuseEntryEncoding } from "./index-format.js";
@@ -208,7 +209,10 @@ export class GitStaging implements Staging {
     }
 
     // Build tree from stage 0 entries only
-    const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED);
+    // an intent-to-add entry is no part of the tree (git's update_one skips it)
+    const stage0 = this._entries.filter(
+      (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
+    );
     return this.buildTreeRecursive(trees, stage0, "");
   }
 
@@ -309,6 +313,14 @@ export class GitStaging implements Staging {
 
   clearResolveUndo(): void {
     this.indexFile.clearResolveUndo();
+  }
+
+  setCacheTree(tree: CacheTree | undefined): void {
+    this.indexFile.setCacheTree(tree);
+  }
+
+  getCacheTree(): CacheTree | undefined {
+    return this.indexFile.cacheTree(this._entries);
   }
 
   createEditor(): IndexEditor {

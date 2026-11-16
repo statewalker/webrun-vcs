@@ -6,6 +6,7 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
+import { objectRemovalEpoch } from "../../storage/raw/object-removals.js";
 import type { GitObjects } from "../objects/git-objects.js";
 import {
   hasObjectOfType,
@@ -29,9 +30,11 @@ import type { AncestryOptions, Commit, Commits } from "./commits.js";
 class GitCommitStore implements Commits {
   /**
    * Parsed commits by id, most recently used last (a commit never changes: its id is its
-   * content's hash). Walks and rebases read the same commits again and again.
+   * content's hash). Walks and rebases read the same commits again and again. A hit read
+   * before the last object removal anywhere (`objectRemovalEpoch`: gc, a repack, a discarded
+   * quarantine) is checked with `objects.has` first, so a pruned commit is not served.
    */
-  private readonly cache = new Map<ObjectId, Commit>();
+  private readonly cache = new Map<ObjectId, { commit: Commit; epoch: number }>();
 
   constructor(private readonly objects: GitObjects) {}
 
@@ -53,12 +56,18 @@ class GitCommitStore implements Commits {
     const hit = this.cache.get(id);
     if (hit) {
       this.cache.delete(id);
-      this.cache.set(id, hit);
-      return copyCommit(hit);
+      const epoch = objectRemovalEpoch();
+      if (hit.epoch === epoch || (await this.objects.has(id))) {
+        hit.epoch = epoch;
+        this.cache.set(id, hit);
+        return copyCommit(hit.commit);
+      }
     }
+    // the count before the read: a removal while reading leaves the entry to be checked
+    const epoch = objectRemovalEpoch();
     const commit = await this.read(id);
     if (commit) {
-      this.cache.set(id, copyCommit(commit));
+      this.cache.set(id, { commit: copyCommit(commit), epoch });
       if (this.cache.size > MAX_CACHED_COMMITS) {
         this.cache.delete(this.cache.keys().next().value as ObjectId);
       }

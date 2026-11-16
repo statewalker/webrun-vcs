@@ -18,9 +18,13 @@ import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
   type Checkout,
+  cacheTreeFullyValid,
   entryStatOf,
   type IndexEntryOptions,
+  invalidateCacheTreeForIntentToAdd,
+  invalidateCacheTreePath,
   type Staging,
+  updateCacheTree,
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -457,6 +461,30 @@ export async function readIndex(
   return { index, unmerged: [...unmerged].sort() };
 }
 
+/**
+ * The tree of the index, as git's `write_index_as_tree` (`cherry-pick -n`, `revert -n`):
+ * unless the index holds a fully valid cache-tree, the index file is written again with
+ * one. That write smudges racily clean entries and gives the index a new timestamp, which
+ * later overwrite checks compare entries with (an entry as new as it is read again).
+ */
+export async function writeIndexAsTree(staging: Staging, trees: CommandTrees): Promise<ObjectId> {
+  if (!staging.getCacheTree || !staging.setCacheTree) return staging.writeTree(trees);
+  const previous = staging.getCacheTree();
+  const treeId = await staging.writeTree(trees);
+  if (!previous || !cacheTreeFullyValid(previous)) {
+    // the valid directories kept, the others computed (cache_tree_update)
+    const cacheTree = await updateCacheTree(trees, treeId, previous);
+    for (const entry of await indexEntryList(staging)) {
+      if (entry.intentToAdd && !entry.skipWorktree) {
+        invalidateCacheTreeForIntentToAdd(cacheTree, entry.path);
+      }
+    }
+    staging.setCacheTree(cacheTree);
+    await staging.write();
+  }
+  return treeId;
+}
+
 /** Every index entry in the index's order, at once where the staging can give them so. */
 async function indexEntryList(staging: Staging): Promise<readonly IndexEntryInput[]> {
   const list = staging.entryList?.();
@@ -643,7 +671,11 @@ export async function switchTrees(
     operation: string;
     /** The conflicts to stage */
     conflicts?: Iterable<OrtConflict>;
-    /** `target` stored as a tree already (saves storing it again) */
+    /**
+     * The stored tree the switch leaves in the index (`target` whole, or the tree `target`
+     * changes HEAD to): planned from (saves storing it again), and written as the index's
+     * cache-tree, as unpack-trees does
+     */
     targetTree?: ObjectId;
   },
 ): Promise<MergeRefusal | undefined> {
@@ -761,16 +793,21 @@ export async function switchTrees(
   for (const path of updates) {
     const t = target.get(path) as CheckedEntry;
     const stats = worktree ? await worktree.getEntry(path) : undefined;
+    // the skip-worktree bit of the entry replaced is kept (merged_entry: "Migrate old flags
+    // over"); assume-unchanged is not
+    const old = index.get(path) as IndexEntryInput | undefined;
     changes.set(path, [
       {
         path,
         objectId: t.objectId,
         mode: t.mode,
         ...entryStatOf(stats && !stats.isDirectory ? stats : {}),
+        ...(old?.skipWorktree ? { skipWorktree: true } : {}),
       },
     ]);
   }
-  for (const conflict of options.conflicts ?? []) {
+  const conflicts = [...(options.conflicts ?? [])];
+  for (const conflict of conflicts) {
     const stages: [CheckedEntry | undefined, 1 | 2 | 3][] = [
       [conflict.base, 1],
       [conflict.ours, 2],
@@ -797,6 +834,27 @@ export async function switchTrees(
   // unpack-trees writes a new index: the resolve-undo records are gone (git keeps them only
   // through commands that edit the index in place)
   ctx.staging.clearResolveUndo?.();
+  if (options.targetTree && ctx.staging.setCacheTree) {
+    // the cache-tree of the target (unpack_trees: the index's cache-tree, each path changed
+    // invalidated, then cache_tree_update: only invalid directories are read), the
+    // directories of the intent-to-add entries kept and of the conflicts invalid
+    // (record_conflicted_index_entries)
+    const previous = ctx.staging.getCacheTree?.();
+    if (previous) {
+      for (const path of [...updates, ...removes]) invalidateCacheTreePath(previous, path);
+    }
+    const cacheTree = await updateCacheTree(ctx.trees, options.targetTree, previous);
+    for (const [path, entry] of index) {
+      const e = entry as IndexEntryInput;
+      if (e.intentToAdd && !e.skipWorktree && !changes.has(path)) {
+        invalidateCacheTreeForIntentToAdd(cacheTree, path);
+      }
+    }
+    for (const conflict of conflicts) {
+      invalidateCacheTreePath(cacheTree, conflict.stagePath);
+    }
+    ctx.staging.setCacheTree(cacheTree);
+  }
   await rewriteIndex(ctx.staging, changes);
   return undefined;
 }

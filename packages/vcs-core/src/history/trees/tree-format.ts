@@ -51,40 +51,44 @@ function isTreeMode(mode: number): boolean {
 }
 
 /**
- * Compare tree entries for canonical sorting (internal use)
+ * Compare tree entries in git's canonical tree order.
  *
- * Git sorts tree entries by name, treating directories as if
- * they have a trailing slash for comparison purposes.
+ * ```typescript
+ * // a file "a-" sorts before a tree "a" (compared as "a/"), a file "a" before both
+ * [{ name: "a", mode: 0o40000 }, { name: "a-", mode: 0o100644 }].sort(compareTreeEntries);
+ * ```
  *
- * Note: Use compareTreeEntries from interfaces/utils for public API.
+ * Git's `base_name_compare` (tree.c): names compare as UTF-8 bytes, and the byte after the
+ * shorter name is `/` for a tree and NUL for anything else. So a tree compares as its name
+ * plus "/", and a tree and a file of the same name are never equal.
  */
-function compareTreeEntriesInternal(a: TreeEntry, b: TreeEntry): number {
-  const aName = a.name;
-  const bName = b.name;
-  const aIsTree = isTreeMode(a.mode);
-  const bIsTree = isTreeMode(b.mode);
-
+export function compareTreeEntries(
+  a: Pick<TreeEntry, "name" | "mode">,
+  b: Pick<TreeEntry, "name" | "mode">,
+): number {
   const encoder = new TextEncoder();
-  const aBytes = encoder.encode(aName);
-  const bBytes = encoder.encode(bName);
+  return compareTreeEntryNames(
+    encoder.encode(a.name),
+    isTreeMode(a.mode),
+    encoder.encode(b.name),
+    isTreeMode(b.mode),
+  );
+}
 
+/** `compareTreeEntries` over names already encoded as UTF-8: git's `base_name_compare`. */
+export function compareTreeEntryNames(
+  aBytes: Uint8Array,
+  aIsTree: boolean,
+  bBytes: Uint8Array,
+  bIsTree: boolean,
+): number {
   const len = Math.min(aBytes.length, bBytes.length);
   for (let i = 0; i < len; i++) {
     const diff = aBytes[i] - bBytes[i];
     if (diff !== 0) return diff;
   }
-
-  // If we get here, one is a prefix of the other
-  // Trees are compared as if they have trailing '/'
-  const aLen = aIsTree ? aBytes.length + 1 : aBytes.length;
-  const bLen = bIsTree ? bBytes.length + 1 : bBytes.length;
-
-  if (aLen === bLen) return 0;
-
-  // Compare the character at the shorter length position
   const aChar = aBytes.length > len ? aBytes[len] : aIsTree ? 0x2f /* '/' */ : 0;
   const bChar = bBytes.length > len ? bBytes[len] : bIsTree ? 0x2f /* '/' */ : 0;
-
   return aChar - bChar;
 }
 
@@ -128,7 +132,7 @@ export async function* encodeTreeEntries(
     validateEntryName(entry.name);
     collected.push({ entry, name: encoder.encode(entry.name), tree: isTreeMode(entry.mode) });
   }
-  collected.sort((a, b) => compareEncodedNames(a.name, a.tree, b.name, b.tree));
+  collected.sort((a, b) => compareTreeEntryNames(a.name, a.tree, b.name, b.tree));
 
   const parts: { mode: Uint8Array; name: Uint8Array; id: Uint8Array }[] = [];
   let size = 0;
@@ -152,26 +156,6 @@ export async function* encodeTreeEntries(
     offset += OBJECT_ID_LENGTH;
   }
   if (size > 0) yield out;
-}
-
-/** compareTreeEntriesInternal over names already encoded. */
-function compareEncodedNames(
-  aBytes: Uint8Array,
-  aIsTree: boolean,
-  bBytes: Uint8Array,
-  bIsTree: boolean,
-): number {
-  const len = Math.min(aBytes.length, bBytes.length);
-  for (let i = 0; i < len; i++) {
-    const diff = aBytes[i] - bBytes[i];
-    if (diff !== 0) return diff;
-  }
-  const aLen = aIsTree ? aBytes.length + 1 : aBytes.length;
-  const bLen = bIsTree ? bBytes.length + 1 : bBytes.length;
-  if (aLen === bLen) return 0;
-  const aChar = aBytes.length > len ? aBytes[len] : aIsTree ? 0x2f /* '/' */ : 0;
-  const bChar = bBytes.length > len ? bBytes[len] : bIsTree ? 0x2f /* '/' */ : 0;
-  return aChar - bChar;
 }
 
 /**
@@ -301,7 +285,7 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
   }
 
   // Sort entries in canonical order
-  const sorted = [...entries].sort(compareTreeEntriesInternal);
+  const sorted = [...entries].sort(compareTreeEntries);
 
   // Calculate total size
   const encoder = new TextEncoder();

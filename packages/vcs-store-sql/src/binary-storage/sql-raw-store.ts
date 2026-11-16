@@ -5,7 +5,12 @@
  * fixed-size chunk rows so that neither a write nor a read holds a whole value.
  */
 
-import { fixedSizeChunks, type RawStorage, type SweepStaleOptions } from "@statewalker/vcs-core";
+import {
+  fixedSizeChunks,
+  noteObjectRemoved,
+  type RawStorage,
+  type SweepStaleOptions,
+} from "@statewalker/vcs-core";
 import { timestampedId, timestampOfId } from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
 
@@ -259,12 +264,14 @@ export class SqlRawStore implements RawStorage {
 
   async remove(key: string): Promise<boolean> {
     await this.ensureInitialized();
-    return this.db.transaction(async (tx) => {
+    const removed = await this.db.transaction(async (tx) => {
       const token = await this.tokenOf(tx, key);
       const result = await tx.execute(`DELETE FROM ${this.tableName} WHERE key = ?`, [key]);
       await this.dropChunks(tx, token);
       return result.changes > 0;
     });
+    if (removed) noteObjectRemoved(key);
+    return removed;
   }
 
   /**

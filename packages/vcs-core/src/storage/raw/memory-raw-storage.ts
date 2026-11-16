@@ -1,4 +1,5 @@
 import { slice } from "@statewalker/vcs-utils";
+import { noteObjectRemoved } from "./object-removals.js";
 import type { RawStorage } from "./raw-storage.js";
 
 /**
@@ -37,7 +38,9 @@ export class MemoryRawStorage implements RawStorage {
   }
 
   async remove(key: string): Promise<boolean> {
-    return this.data.delete(key);
+    const removed = this.data.delete(key);
+    if (removed) noteObjectRemoved(key);
+    return removed;
   }
 
   async move(from: string, to: string): Promise<boolean> {

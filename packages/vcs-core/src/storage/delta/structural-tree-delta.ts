@@ -7,6 +7,7 @@
  */
 
 import type { TreeEntry } from "../../history/trees/tree-entry.js";
+import { compareTreeEntries } from "../../history/trees/tree-format.js";
 import type { StructuralTreeDelta, TreeDeltaChange } from "./tree-delta-api.js";
 
 /**
@@ -106,7 +107,7 @@ export function applyStructuralTreeDelta(
   }
 
   // Return sorted by name (Git tree ordering)
-  return Array.from(entryMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+  return Array.from(entryMap.values()).sort(compareTreeEntries);
 }
 
 /**

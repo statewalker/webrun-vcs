@@ -391,12 +391,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
 
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
-    const ontoTree = await flatTree(this.trees, await this.commits.getTree(onto));
+    const ontoTreeId = await this.commits.getTree(onto);
+    const ontoTree = await flatTree(this.trees, ontoTreeId);
     // nothing of HEAD's to replay: HEAD moves to upstream
     if (await this.isAncestor(headId, onto)) {
       const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
         action: "checkout",
         operation: "rebase",
+        targetTree: ontoTreeId,
       });
       if (refused) {
         await unstash();
@@ -454,6 +456,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
       action: "checkout",
       operation: "rebase",
+      targetTree: ontoTreeId,
     });
     if (refused) {
       await unstash();

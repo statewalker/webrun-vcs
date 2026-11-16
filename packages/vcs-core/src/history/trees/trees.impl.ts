@@ -5,6 +5,7 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
+import { objectRemovalEpoch } from "../../storage/raw/object-removals.js";
 import {
   CorruptObjectError,
   type GitObjects,
@@ -29,10 +30,12 @@ import type { Trees } from "./trees.js";
 class GitTreeStore implements Trees {
   /**
    * Decoded trees by id, most recently used last. A tree is immutable (its id is its
-   * content's hash), so a cached tree never goes stale; a merge or a rebase reads the
-   * same trees again and again. Bounded by the entries held.
+   * content's hash), so a cached tree never changes; a merge or a rebase reads the same
+   * trees again and again. It can stop being stored (gc, a repack, a discarded quarantine):
+   * a hit read before the last removal anywhere (`objectRemovalEpoch`) is checked with
+   * `objects.has` first. Bounded by the entries held.
    */
-  private readonly cache = new Map<ObjectId, readonly TreeEntry[]>();
+  private readonly cache = new Map<ObjectId, CachedTree>();
   private cachedEntries = 0;
   /** Reads in flight, by tree id */
   private readonly reading = new Map<ObjectId, Promise<readonly TreeEntry[] | undefined>>();
@@ -49,9 +52,10 @@ class GitTreeStore implements Trees {
    */
   async store(entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>): Promise<ObjectId> {
     const bytes = await collectTreeBytes(entries);
+    const epoch = objectRemovalEpoch();
     const id = await storeObject(this.objects, "tree", [bytes]);
     // a tree just stored is read next (a merge's result, a rebase's next HEAD)
-    if (!this.cache.has(id)) this.remember(id, decodeTreeBytes(bytes));
+    if (!this.cache.has(id)) this.remember(id, decodeTreeBytes(bytes), epoch);
     return id;
   }
 
@@ -77,12 +81,14 @@ class GitTreeStore implements Trees {
    */
   private read(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
     // as git's parsed objects, a tree read once is kept for the store's life (a prune of an
-    // unreachable tree by another process is not seen)
+    // unreachable tree by another process is not seen); one removed in this process is not
+    // served again
     const hit = this.cache.get(id);
     if (hit) {
       this.cache.delete(id);
       this.cache.set(id, hit);
-      return Promise.resolve(hit);
+      if (hit.epoch === objectRemovalEpoch()) return Promise.resolve(hit.entries);
+      return this.revalidate(id, hit);
     }
     // concurrent reads of one tree (two sides of a merge holding it) read it once
     let reading = this.reading.get(id);
@@ -93,7 +99,23 @@ class GitTreeStore implements Trees {
     return reading;
   }
 
+  /** A hit cached before a removal: served if still stored, else forgotten and read again. */
+  private async revalidate(
+    id: ObjectId,
+    hit: CachedTree,
+  ): Promise<readonly TreeEntry[] | undefined> {
+    const epoch = objectRemovalEpoch();
+    if (await this.objects.has(id)) {
+      hit.epoch = epoch;
+      return hit.entries;
+    }
+    if (this.cache.get(id) === hit) this.forget(id);
+    return this.read(id);
+  }
+
   private async readStored(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
+    // the count before the read: a removal while reading leaves the entry to be checked
+    const epoch = objectRemovalEpoch();
     let obj: Awaited<ReturnType<GitObjects["get"]>>;
     try {
       obj = await this.objects.get(id);
@@ -130,24 +152,24 @@ class GitTreeStore implements Trees {
     }
     const entries = decodeTreeBytes(bytes);
     this.forget(id);
-    this.remember(id, entries);
+    this.remember(id, entries, epoch);
     return entries;
   }
 
   private forget(id: ObjectId): void {
-    const entries = this.cache.get(id);
-    if (!entries) return;
-    this.cachedEntries -= entries.length;
+    const cached = this.cache.get(id);
+    if (!cached) return;
+    this.cachedEntries -= cached.entries.length;
     this.cache.delete(id);
   }
 
-  private remember(id: ObjectId, entries: readonly TreeEntry[]): void {
+  private remember(id: ObjectId, entries: readonly TreeEntry[], epoch: number): void {
     if (entries.length > this.maxCachedEntries) return;
-    this.cache.set(id, entries);
+    this.cache.set(id, { entries, epoch });
     this.cachedEntries += entries.length;
     while (this.cachedEntries > this.maxCachedEntries) {
       const oldest = this.cache.keys().next().value as ObjectId;
-      this.cachedEntries -= this.cache.get(oldest)?.length ?? 0;
+      this.cachedEntries -= this.cache.get(oldest)?.entries.length ?? 0;
       this.cache.delete(oldest);
     }
   }
@@ -210,12 +232,12 @@ class GitTreeStore implements Trees {
   }
 }
 
-/**
- * Return an empty async iterable of tree entries.
- *
- * Extracted as a named function to prevent rolldown from optimizing
- * away `(async function* () {})()` to a bare `return;`.
- */
+/** A decoded tree and the removal count (`objectRemovalEpoch`) when it was last known stored. */
+interface CachedTree {
+  readonly entries: readonly TreeEntry[];
+  epoch: number;
+}
+
 /** Decoded entries the cache holds at most, across trees (about 10 MB). */
 const DEFAULT_MAX_CACHED_ENTRIES = 100_000;
 
@@ -224,6 +246,12 @@ async function* copies(entries: readonly TreeEntry[]): AsyncGenerator<TreeEntry>
   for (const e of entries) yield { mode: e.mode, name: e.name, id: e.id };
 }
 
+/**
+ * Return an empty async iterable of tree entries.
+ *
+ * Extracted as a named function to prevent rolldown from optimizing
+ * away `(async function* () {})()` to a bare `return;`.
+ */
 async function* emptyTreeEntries(): AsyncGenerator<TreeEntry> {
   // intentionally yields nothing
 }

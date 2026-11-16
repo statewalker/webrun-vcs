@@ -1,5 +1,7 @@
 // Shared types (canonical source)
 
+// Cache-tree (TREE extension)
+export * from "./cache-tree.js";
 // Utilities
 export * from "./conflict-utils.js";
 // Staging implementations

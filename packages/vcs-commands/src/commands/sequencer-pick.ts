@@ -32,6 +32,7 @@ import {
   subjectOf,
   switchTrees,
   treeDelta,
+  writeIndexAsTree,
 } from "./merge-support.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
@@ -188,7 +189,7 @@ export class PickSequencer {
     // with --no-commit the change is merged into the index as it is (git's
     // write_index_as_tree): each commit's change on top of the previous one's
     const headTreeId = this.options.noCommit
-      ? await deps.staging.writeTree(deps.trees)
+      ? await writeIndexAsTree(deps.staging, deps.trees)
       : headCommit.tree;
     // a commit is never made on top of staged changes (error_dirty_index)
     const { index } = await readIndex(deps.staging);

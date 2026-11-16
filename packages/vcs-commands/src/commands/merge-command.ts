@@ -3,8 +3,10 @@ import { DEFAULT_BIG_FILE_THRESHOLD, FileMode, isSymbolicRef } from "@statewalke
 import {
   attributesIndexOf,
   type ContentAttributesContext,
+  cacheTreeOfTree,
   entryStatOf,
   type IndexEntryOptions,
+  invalidateCacheTreePath,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import { InvalidArgumentError } from "../errors/command-errors.js";
@@ -40,6 +42,7 @@ import {
   storeFlatTreeOver,
   switchTrees,
   treeDelta,
+  writeIndexAsTree,
 } from "./merge-support.js";
 import { octopusMerge } from "./octopus-merge.js";
 import { ortResultEntries } from "./ort-merge.js";
@@ -53,7 +56,11 @@ import {
   squashMessage,
 } from "./sequencer-support.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
-import { pruneEmptyParents } from "./worktree-overwrite-checks.js";
+import {
+  type CheckedEntry,
+  pruneEmptyParents,
+  worktreeModified,
+} from "./worktree-overwrite-checks.js";
 
 /** What `git merge` is asked to do. */
 export enum MergeOperation {
@@ -531,10 +538,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
   ): Promise<MergeResult> {
     const output = [`Updating ${abbrev(headId)}..${abbrev(srcId)}`];
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
-    const srcTree = await flatTree(this.trees, await this.commits.getTree(srcId));
+    const srcTreeId = await this.commits.getTree(srcId);
+    const srcTree = await flatTree(this.trees, srcTreeId);
     const refused = await switchTrees(this.context(worktree), headTree, srcTree, {
       action: "merge",
       operation: "merge",
+      targetTree: srcTreeId,
     });
     if (refused) {
       return {
@@ -977,8 +986,19 @@ export class MergeCommand extends GitCommand<MergeResult> {
       worktree,
       headTree: async () => headTree,
     });
-    if (!(await provider.hasLocalChanges())) return;
-    const savedTree = await provider.getWorkingTree();
+    // save_state's `stash create`, then the reset. The stash writes the index's tree first
+    // (write_index_as_tree, the index file written with its cache-tree), and fails before
+    // the reset where it cannot save the worktree (an intent-to-add entry)
+    let savedTree: ObjectId | undefined;
+    let indexTree: ObjectId | undefined;
+    if (await provider.hasLocalChanges()) {
+      indexTree = await writeIndexAsTree(this.staging, this.trees);
+      savedTree = await provider.getWorkingTree();
+    }
+    // nothing saved: the reset alone, which leaves the index exactly HEAD (read-tree's
+    // prime_cache_tree: a fully valid cache-tree)
+    await this.resetAssumeUnchanged(worktree, savedTree ? undefined : headTree);
+    if (!savedTree) return;
     await state.setRef("AUTO_MERGE", savedTree);
     // restore_state's `reset --hard` and `stash apply --index`: every changed file is
     // written again from what was saved, through the checkout filters (eol, smudge)
@@ -1020,6 +1040,20 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
     // the reset --hard wrote a new index: no resolve-undo left
     this.staging.clearResolveUndo?.();
+    if (this.staging.setCacheTree && indexTree) {
+      // `stash apply --index` of staged changes ends reading the index's tree (fully valid);
+      // with none, HEAD's cache-tree (the reset) has the paths the apply wrote invalid
+      const staged = indexTree !== headTree;
+      const cacheTree = await cacheTreeOfTree(this.trees, staged ? indexTree : headTree);
+      if (!staged) {
+        const differs = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
+          a?.objectId !== b?.objectId || a?.mode !== b?.mode;
+        for (const path of new Set([...saved.keys(), ...head.keys()])) {
+          if (differs(saved.get(path), head.get(path))) invalidateCacheTreePath(cacheTree, path);
+        }
+      }
+      this.staging.setCacheTree(cacheTree);
+    }
     await rewriteIndex(this.staging, restaged);
     // a file deleted in what was saved: `reset --hard` wrote it, `stash apply` removed it
     // again with the directories it leaves empty
@@ -1027,6 +1061,58 @@ export class MergeCommand extends GitCommand<MergeResult> {
       if (saved.has(path) || (await worktree.getEntry(path))) continue;
       await pruneEmptyParents(worktree, path);
     }
+  }
+
+  /**
+   * restore_state's `reset --hard` over a file the index marks assume-unchanged: `stash
+   * create` did not save its change (the flag hides it), and the reset writes it again from
+   * the index when it no longer matches (oneway_merge compares with CE_MATCH_IGNORE_VALID),
+   * so the local change is lost, as in git. The entry keeps its flag and takes the new stat.
+   * With `cacheTree` (the index is that tree's), the index is written with its cache-tree.
+   */
+  private async resetAssumeUnchanged(worktree: Worktree, cacheTree?: ObjectId): Promise<void> {
+    const marked: IndexEntryOptions[] = [];
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage === 0 && entry.assumeValid && entry.mode !== FileMode.GITLINK) {
+        marked.push(entry);
+      }
+    }
+    if (marked.length === 0 && !cacheTree) return;
+    const trust = worktreeModeTrust(this.workingCopy, worktree);
+    const indexTime = this.staging.getUpdateTime();
+    const { index } = await readIndex(this.staging);
+    const attributes: ContentAttributesContext = {
+      direction: "checkout",
+      index: attributesIndexOf([...index].map(([p, e]) => [p, e.objectId] as const)),
+    };
+    const rewritten = new Map<string, IndexEntryOptions[]>();
+    for (const entry of marked) {
+      if (!(await worktreeModified(worktree, entry.path, entry, trust, indexTime))) continue;
+      const content = await this.blobs.load(entry.objectId);
+      if (!content) continue;
+      const mode =
+        entry.mode === FileMode.SYMLINK && !trust.symlinks ? FileMode.REGULAR_FILE : entry.mode;
+      await worktree.writeContent(entry.path, content, {
+        mode,
+        ...(mode !== entry.mode ? { raw: true } : {}),
+        createParents: true,
+        replaceInTheWay: true,
+        attributes,
+      });
+      const stats = await worktree.getEntry(entry.path);
+      rewritten.set(entry.path, [
+        {
+          ...entry,
+          ...(stats && !stats.isDirectory ? entryStatOf(stats) : {}),
+        },
+      ]);
+    }
+    if (cacheTree && this.staging.setCacheTree) {
+      this.staging.setCacheTree(await cacheTreeOfTree(this.trees, cacheTree));
+    } else if (rewritten.size === 0) {
+      return;
+    }
+    await rewriteIndex(this.staging, rewritten);
   }
 
   private context(worktree: Worktree | undefined) {

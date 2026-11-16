@@ -23,6 +23,7 @@
 import { readFile } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
+import { type CacheTree, encodeCacheTree, parseCacheTree } from "./cache-tree.js";
 import {
   assertWritableIndexExtensions,
   carryIndexExtensions,
@@ -197,6 +198,8 @@ export class IndexFile {
    * changed in place: the references are the snapshot).
    */
   private entriesKept: readonly StagingEntry[] | undefined;
+  /** A cache-tree computed for the entries of the next write (see `setCacheTree`). */
+  private pendingCacheTree: CacheTree | undefined;
   /** Why the last read refused the index; writes refuse it too until a read succeeds. */
   private refused: Error | undefined;
   /**
@@ -314,6 +317,32 @@ export class IndexFile {
   }
 
   /**
+   * Write `tree` as the `TREE` extension with the next `write` (git's cache-tree after
+   * `unpack_trees` or `write_index_as_tree`), replacing what was read. It must describe the
+   * entries that write is given; a valid root whose count disagrees with them is dropped.
+   */
+  setCacheTree(tree: CacheTree | undefined): void {
+    this.pendingCacheTree = tree;
+  }
+
+  /**
+   * The cache-tree of the index as last read or written (its `TREE` extension), when
+   * `entries` are the ones it was read or written with; undefined otherwise or when it
+   * cannot be parsed. A fresh copy each time.
+   */
+  cacheTree(entries: readonly StagingEntry[]): CacheTree | undefined {
+    const ext = this.extensions.find((e) => e.signature === "TREE");
+    if (!ext || this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries)) {
+      return undefined;
+    }
+    try {
+      return parseCacheTree(ext.data);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Write `entries` (sorted by path, stage) with the extensions that still apply.
    *
    * @throws IndexChangedError when the index on disk is no longer the one this
@@ -323,7 +352,16 @@ export class IndexFile {
     if (this.refused) throw this.refused;
     // what indexEntriesDigest compares: path, stage, mode, object id, intent-to-add
     const changed = this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries);
-    const extensions = carryIndexExtensions(this.extensions, entries, changed);
+    let extensions = carryIndexExtensions(this.extensions, entries, changed);
+    const tree = this.pendingCacheTree;
+    this.pendingCacheTree = undefined;
+    if (tree && describesEntries(tree, entries)) {
+      // git writes the cache-tree first
+      extensions = [
+        { signature: "TREE", data: encodeCacheTree(tree) },
+        ...extensions.filter((e) => e.signature !== "TREE"),
+      ];
+    }
     this.checksum = await writeIndexFile(this.files, this.path, entries, {
       version: this.version,
       extensions,
@@ -333,6 +371,17 @@ export class IndexFile {
     this.extensions = extensions;
     this.entriesKept = extensions.length > 0 ? entries.slice() : undefined;
   }
+}
+
+/** Whether a cache-tree can stand for `entries`: a valid root counts their tree entries. */
+function describesEntries(tree: CacheTree, entries: readonly StagingEntry[]): boolean {
+  if (tree.entryCount < 0) return true;
+  let count = 0;
+  for (const e of entries) {
+    if (e.stage !== 0) return false;
+    if (!(e.intentToAdd && !e.skipWorktree)) count++;
+  }
+  return count === tree.entryCount;
 }
 
 /** Whether two entry lists agree on what an entry-derived extension depends on. */

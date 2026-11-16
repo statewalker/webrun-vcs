@@ -369,7 +369,22 @@ export function encodeIndexFile(
     if (pathCmp !== 0) return pathCmp;
     return a.stage - b.stage;
   });
-  return encodeSorted(sortedEntries, version, extensions);
+  return encodeSorted(sortedEntries, writtenVersion(sortedEntries, version), extensions);
+}
+
+/**
+ * The version git writes an index of `entries` in, asked for `version` (`do_write_index`):
+ * versions 2 and 3 differ only in allowing extended flags, so the header says 3 exactly when
+ * an entry has one (skip-worktree, intent-to-add) and 2 otherwise; version 4 stays 4.
+ */
+function writtenVersion(entries: readonly StagingEntry[], version: IndexVersion): IndexVersion {
+  if (version !== INDEX_VERSION_2 && version !== INDEX_VERSION_3) return version;
+  return entries.some(hasExtendedFlags) ? INDEX_VERSION_3 : INDEX_VERSION_2;
+}
+
+/** Whether an entry needs the extended flags word (git's CE_EXTENDED_FLAGS). */
+function hasExtendedFlags(entry: StagingEntry): boolean {
+  return entry.intentToAdd === true || entry.skipWorktree === true;
 }
 
 function* encodeSorted(
@@ -503,7 +518,8 @@ function serializeEntry(
     if (known && known.version === version) return known.bytes;
   }
   const pathBytes = pathEncoder.encode(entry.path);
-  const hasExtended = entry.intentToAdd || entry.skipWorktree || version === INDEX_VERSION_3;
+  // only an entry with an extended flag carries the word ("reduce extended entries")
+  const hasExtended = hasExtendedFlags(entry);
 
   if (version === INDEX_VERSION_4) {
     // Version 4: path compression

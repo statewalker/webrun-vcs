@@ -7,6 +7,7 @@
  */
 
 import {
+  compareTreeEntries,
   computeTreeSize,
   encodeObjectHeader,
   encodeTreeEntries,
@@ -23,15 +24,6 @@ import type { SqlNativeTreeStore } from "./types.js";
  * Well-known empty tree SHA-1 hash
  */
 const EMPTY_TREE_ID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
-/**
- * Compare tree entries for canonical Git sorting
- */
-function compareTreeEntries(a: TreeEntry, b: TreeEntry): number {
-  const aName = a.mode === FileMode.TREE ? `${a.name}/` : a.name;
-  const bName = b.mode === FileMode.TREE ? `${b.name}/` : b.name;
-  return aName < bName ? -1 : aName > bName ? 1 : 0;
-}
 
 /**
  * Compute Git-compatible SHA-1 hash for a tree

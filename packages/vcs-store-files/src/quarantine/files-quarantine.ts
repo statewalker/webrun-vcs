@@ -13,6 +13,7 @@ import type { GitObjects, ObjectQuarantine, PackSet } from "@statewalker/vcs-cor
 import {
   createGitObjects,
   joinPath,
+  noteObjectRemoved,
   openPackSet,
   overlayObjects,
   QUARANTINE_MAX_IDLE_MS,
@@ -118,6 +119,8 @@ export async function beginFilesQuarantine(
       await files.remove(dir);
     } finally {
       openDirs.delete(dir);
+      // its objects are gone (published copies stay): cached parses are checked again
+      noteObjectRemoved();
     }
   };
   const checkOpen = () => {

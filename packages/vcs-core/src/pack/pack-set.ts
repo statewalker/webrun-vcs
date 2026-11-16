@@ -17,6 +17,7 @@
 import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError, type GitObject } from "../history/objects/git-objects.js";
+import { noteObjectRemoved } from "../storage/raw/object-removals.js";
 import {
   type InstalledPack,
   type InstallPackOptions,
@@ -531,6 +532,8 @@ export async function openPackSet(
           removing.delete(name);
         }
       }
+      // objects only in the removed packs are gone: cached parses are checked again
+      if (packIds.length) noteObjectRemoved();
     },
   };
 }

@@ -117,9 +117,38 @@ describe("Index Format", () => {
     });
 
     it("should serialize with specified version", async () => {
-      const data = await serializeIndexFile([], INDEX_VERSION_3);
+      const data = await serializeIndexFile([], INDEX_VERSION_4);
       const view = new DataView(data.buffer, data.byteOffset);
-      expect(view.getUint32(4)).toBe(INDEX_VERSION_3);
+      expect(view.getUint32(4)).toBe(INDEX_VERSION_4);
+    });
+
+    it("writes version 3 exactly when an entry has an extended flag, as git", async () => {
+      const entry: StagingEntry = {
+        path: "a.txt",
+        mode: 0o100644,
+        objectId: "a".repeat(40),
+        stage: 0,
+        size: 1,
+        mtime: 1,
+      };
+      const versionOf = async (entries: StagingEntry[], version: IndexVersion) =>
+        new DataView((await serializeIndexFile(entries, version)).buffer).getUint32(4);
+      // do_write_index: 3 is demoted to 2 when it is not needed, 2 promoted when it is
+      expect(await versionOf([entry], INDEX_VERSION_3)).toBe(INDEX_VERSION_2);
+      expect(await versionOf([{ ...entry, skipWorktree: true }], INDEX_VERSION_2)).toBe(
+        INDEX_VERSION_3,
+      );
+      expect(await versionOf([{ ...entry, intentToAdd: true }], INDEX_VERSION_2)).toBe(
+        INDEX_VERSION_3,
+      );
+      expect(await versionOf([{ ...entry, skipWorktree: true }], INDEX_VERSION_4)).toBe(
+        INDEX_VERSION_4,
+      );
+      // only a flagged entry carries the extended flags word
+      const parsed = await parseIndexFile(
+        await serializeIndexFile([entry, { ...entry, path: "b.txt", skipWorktree: true }], 3),
+      );
+      expect(parsed.entries.map((e) => e.skipWorktree === true)).toEqual([false, true]);
     });
 
     it("should reject invalid paths", async () => {
@@ -609,10 +638,12 @@ describe("encodeIndexFile: streamed chunks", () => {
     return out;
   }
 
-  // SHA-1 of what the one-buffer encoder (before encodeIndexFile) wrote for fixtureEntries()
+  // SHA-1 of what the one-buffer encoder (before encodeIndexFile) wrote for fixtureEntries(),
+  // the entries with flags making it version 3 whether 2 or 3 is asked for (git's
+  // do_write_index), the extended flags word only on those entries
   const GOLDEN: Record<IndexVersion, string> = {
-    2: "80abda03ed9e128794ad01a47545336ede03eb74",
-    3: "404ec54b4f5dd6e16c8263e846c27ab41c0ad23f",
+    2: "5384cce41dd7bb8241c53acbc8dd4cd2db063c7a",
+    3: "5384cce41dd7bb8241c53acbc8dd4cd2db063c7a",
     4: "ea7a27f6f440e183a101165c6b34e4955b4bf55b",
   };
 
