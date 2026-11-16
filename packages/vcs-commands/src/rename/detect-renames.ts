@@ -59,6 +59,125 @@ export interface DetectRenamesOptions {
   renameLimit?: number;
   /** Count a last span without a newline, as git 2.5x (default); false as git 2.43 */
   countLastSpan?: boolean;
+  /**
+   * merge-ort: the sources a merge needs paired (git's `relevant_sources`, by path:
+   * {@link RELEVANT_CONTENT} or {@link RELEVANT_LOCATION}). Every source takes part in exact
+   * renames; only these in the others
+   */
+  relevantSources?: Map<string, number>;
+  /**
+   * merge-ort: the directories this side removed (git's `dirs_removed`, by path:
+   * {@link NOT_RELEVANT}, {@link RELEVANT_FOR_ANCESTOR} or {@link RELEVANT_FOR_SELF}); may be
+   * changed (a directory whose rename is already clear is then needed for its ancestors only)
+   */
+  dirsRemoved?: Map<string, number>;
+  /**
+   * merge-ort: filled with how many files moved from each removed directory to each other
+   * directory (git's `dir_rename_count`), for directory rename detection
+   */
+  dirRenameCount?: Map<string, Map<string, number>>;
+  /** Keep the order the candidates are given in (default: sorted by path) */
+  keepOrder?: boolean;
+}
+
+/** A source a merge needs for its content (the other side changed it). */
+export const RELEVANT_CONTENT = 1;
+/** A source a merge needs only to tell where its directory went. */
+export const RELEVANT_LOCATION = 2;
+/** A removed directory whose rename no path needs. */
+export const NOT_RELEVANT = 0;
+/** A removed directory whose rename only paths under a subdirectory need. */
+export const RELEVANT_FOR_ANCESTOR = 1;
+/** A removed directory the other side added a path to. */
+export const RELEVANT_FOR_SELF = 2;
+
+/** git's placeholder destination of a source not paired yet (a directory cannot be "/"). */
+const UNKNOWN_DIR = "/";
+
+const dirnameOf = (path: string) => {
+  const k = path.lastIndexOf("/");
+  return k < 0 ? "" : path.slice(0, k);
+};
+
+/** The directory rename bookkeeping of a merge's rename detection (git's `dir_rename_info`). */
+class DirRenameInfo {
+  /** Each removed directory's most likely new directory so far (`dir_rename_guess`) */
+  readonly guess = new Map<string, string>();
+  /** The destinations not paired yet, by path (`idx_map`) */
+  readonly idx = new Map<string, number>();
+
+  constructor(
+    readonly counts: Map<string, Map<string, number>>,
+    readonly dirsRemoved: Map<string, number> | undefined,
+  ) {}
+
+  increment(oldDir: string, newDir: string): void {
+    let counts = this.counts.get(oldDir);
+    if (!counts) {
+      counts = new Map();
+      this.counts.set(oldDir, counts);
+    }
+    counts.set(newDir, (counts.get(newDir) ?? 0) + 1);
+  }
+
+  /**
+   * git's update_dir_rename_counts: a rename counts for the old file's directory, and for
+   * each removed ancestor needed for itself as long as the trailing directories agree
+   * (`a/b/c/f` -> `x/c/f` counts `a/b/c` -> `x/c` and `a/b` -> `x`)
+   */
+  update(oldName: string, newName: string): void {
+    let prevOld = oldName;
+    let prevNew = newName;
+    let first = true;
+    for (;;) {
+      const oldDir = dirnameOf(prevOld);
+      if (this.dirsRemoved && !this.dirsRemoved.has(oldDir)) break;
+      const newDir = dirnameOf(prevNew);
+      if (!first && basename(prevOld) !== basename(prevNew)) break;
+      const flag = this.dirsRemoved?.get(oldDir) ?? NOT_RELEVANT;
+      if (flag === RELEVANT_FOR_SELF || first) this.increment(oldDir, newDir);
+      first = false;
+      if (flag === NOT_RELEVANT) break;
+      if (!oldDir || !newDir) break;
+      prevOld = oldDir;
+      prevNew = newDir;
+    }
+  }
+
+  /** The new path of `path` by the best directory guess, as a destination index (or -1). */
+  possibleRename(path: string): number {
+    const newDir = this.guess.get(dirnameOf(path));
+    if (newDir === undefined) return -1;
+    return this.idx.get(`${newDir}/${basename(path)}`) ?? -1;
+  }
+}
+
+/** The destination directory with the highest count (the first of equals). */
+function highestRenamePath(counts: Map<string, number>): string | undefined {
+  let highest = 0;
+  let best: string | undefined;
+  for (const [dir, count] of counts) {
+    if (count > highest) {
+      highest = count;
+      best = dir;
+    }
+  }
+  return best;
+}
+
+/** Whether more sources point to one directory than to all others and the unknown together. */
+function dirRenameAlreadyDeterminable(counts: Map<string, number>): boolean {
+  let first = 0;
+  let second = 0;
+  let unknown = 0;
+  for (const [dir, count] of counts) {
+    if (dir === UNKNOWN_DIR) unknown = count;
+    else if (count >= first) {
+      second = first;
+      first = count;
+    } else if (count >= second) second = count;
+  }
+  return first > second + unknown;
 }
 
 /** git's default `diff.renameLimit`. */
@@ -119,8 +238,11 @@ export async function detectRenames(
   const renameLimit = configured <= 0 ? MAX_RENAME_LIMIT : configured;
   // merges leave empty files out of rename detection (git's rename_empty = 0)
   const keep = (c: RenameCandidate) => options.renameEmpty !== false || c.id !== EMPTY_BLOB_ID;
-  const src = sources.filter(keep).sort(byPath);
-  const dst = destinations.filter(keep).sort(byPath);
+  // in path order, or as given (a merge: the order its trees were read in)
+  const src = options.keepOrder ? sources.filter(keep) : sources.filter(keep).sort(byPath);
+  const dst = options.keepOrder
+    ? destinations.filter(keep)
+    : destinations.filter(keep).sort(byPath);
   const pairs: RenamePair[] = [];
   if (src.length === 0 || dst.length === 0) return pairs;
   const srcUsed = new Set<number>();
@@ -198,8 +320,35 @@ export async function detectRenames(
       ? estimateSimilarity(await side(src[s], "source"), await side(dst[d], "destination"), minimum)
       : 0;
 
-  // renames between the only source and the only destination of a basename
-  // (`find_basename_matches`), at the higher threshold
+  // merge-ort's directory rename bookkeeping (`initialize_dir_rename_info`): the exact
+  // renames counted, a first guess of where each removed directory went
+  const relevant = options.relevantSources;
+  const dirsRemoved = options.dirsRemoved;
+  const info =
+    relevant || dirsRemoved
+      ? new DirRenameInfo(options.dirRenameCount ?? new Map(), dirsRemoved)
+      : undefined;
+  if (info) {
+    info.counts.clear();
+    const renamedTo = new Map(pairs.map((p) => [p.to, p.from]));
+    dst.forEach((d, i) => {
+      const from = renamedTo.get(d.path);
+      if (from === undefined) info.idx.set(d.path, i);
+      else info.update(from, d.path);
+    });
+    for (const [dir, counts] of info.counts) {
+      const best = highestRenamePath(counts);
+      if (best !== undefined) info.guess.set(dir, best);
+    }
+  }
+  const recordPair = (d: number, s: number, score: number) => {
+    record(d, s, score);
+    info?.update(src[s].path, dst[d].path);
+  };
+
+  // renames between the only source and the only destination of a basename, or where the
+  // directory guess puts a source of a shared basename (`find_basename_matches`), at the
+  // higher threshold; a merge only for the sources it needs
   const minimumBasenameScore = minimumScore + Math.trunc(0.5 * (GIT_MAX_SCORE - minimumScore));
   const unique = (paths: Array<[number, string]>) => {
     const map = new Map<string, number>();
@@ -214,23 +363,70 @@ export async function detectRenames(
   const dstNames = unique(
     dst.map((d, i) => [i, d.path] as [number, string]).filter(([i]) => !dstDone.has(i)),
   );
-  for (const s of liveSources()) {
-    const base = basename(src[s].path);
-    if (srcNames.get(base) !== s || !dstNames.has(base)) continue;
-    const d = dstNames.get(base) ?? -1;
-    if (d < 0 || dstDone.has(d)) continue;
+  for (const i of liveSources()) {
+    if (relevant && !relevant.has(src[i].path)) continue;
+    const base = basename(src[i].path);
+    if (!dstNames.has(base)) continue;
+    let s = srcNames.get(base) ?? -1;
+    let d = dstNames.get(base) ?? -1;
+    if (s < 0 || d < 0) {
+      s = i;
+      d = info ? info.possibleRename(src[i].path) : -1;
+    }
+    if (d < 0 || dstDone.has(d) || srcUsed.has(s)) continue;
     const score = await similarity(s, d, minimumBasenameScore);
     if (score < minimumBasenameScore) continue;
-    record(d, s, score);
+    recordPair(d, s, score);
   }
 
+  // a merge drops the sources it does not need (`remove_unneeded_paths_from_src`), then
+  // the ones only needed for a directory rename that is already clear
+  // (`handle_early_known_dir_renames`)
+  let candidates = liveSources();
+  if (relevant) candidates = candidates.filter((s) => relevant.has(src[s].path));
+  if (info && relevant && dirsRemoved) {
+    for (const s of candidates) {
+      for (
+        let dir = dirnameOf(src[s].path);
+        dir !== "" && (dirsRemoved.get(dir) ?? NOT_RELEVANT) !== NOT_RELEVANT;
+        dir = dirnameOf(dir)
+      ) {
+        info.increment(dir, UNKNOWN_DIR);
+      }
+    }
+    for (const [dir, counts] of info.counts) {
+      if (dirsRemoved.get(dir) === RELEVANT_FOR_SELF && dirRenameAlreadyDeterminable(counts)) {
+        dirsRemoved.set(dir, RELEVANT_FOR_ANCESTOR);
+      }
+    }
+    candidates = candidates.filter((s) => {
+      if (relevant.get(src[s].path) !== RELEVANT_LOCATION) return true;
+      for (let dir = dirnameOf(src[s].path); ; dir = dirnameOf(dir)) {
+        const flag = dirsRemoved.get(dir) ?? NOT_RELEVANT;
+        if (flag === NOT_RELEVANT) break;
+        if (flag === RELEVANT_FOR_SELF) return true;
+      }
+      relevant.set(src[s].path, 0);
+      return false;
+    });
+  }
+  const finish = () => {
+    // only the removed directories still needed keep their counts (`cleanup_dir_rename_info`)
+    if (!info || !dirsRemoved) return pairs;
+    for (const [dir, counts] of [...info.counts]) {
+      if (!dirsRemoved.get(dir)) info.counts.delete(dir);
+      else counts.delete(UNKNOWN_DIR);
+    }
+    return pairs;
+  };
+
   // the best remaining pairs, within the rename limit
-  const remainingSources = liveSources();
+  const remainingSources = candidates;
   const remainingDestinations = dst.map((_, i) => i).filter((i) => !dstDone.has(i));
-  if (remainingSources.length === 0 || remainingDestinations.length === 0) return pairs;
+  if (remainingSources.length === 0 || remainingDestinations.length === 0) return finish();
   if (remainingSources.length * remainingDestinations.length > renameLimit * renameLimit) {
     options.onRenameLimit?.(Math.max(remainingSources.length, remainingDestinations.length));
-    return pairs;
+    return finish();
   }
   const matrix: Score[] = [];
   for (const d of remainingDestinations) {
@@ -260,7 +456,7 @@ export async function detectRenames(
   for (const m of matrix) {
     if (m.dst < 0 || m.score < minimumScore) break;
     if (dstDone.has(m.dst) || srcUsed.has(m.src)) continue;
-    record(m.dst, m.src, m.score);
+    recordPair(m.dst, m.src, m.score);
   }
-  return pairs;
+  return finish();
 }

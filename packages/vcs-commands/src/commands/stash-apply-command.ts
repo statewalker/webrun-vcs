@@ -19,6 +19,7 @@ import type { StashApplyResult } from "../results/stash-result.js";
 import { StashApplyStatus } from "../results/stash-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { conflictStyleOf } from "./merge-config.js";
+import { ortConfigOptions } from "./merge-drivers.js";
 import { type OrtConflict, ortMerge, ortResultEntries, readBlob } from "./ort-merge.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { planTreeRestore, type TreeRestorePlan, writeTreeRestorePlan } from "./tree-restore.js";
@@ -444,7 +445,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
 
     // merge-ort records the tree it wrote (AUTO_MERGE), clean or not; a stash whose
     // worktree is its base is "Already up to date." (merge_ort_nonrecursive): no merge
-    const autoMerge = await ortResultEntries(this.blobs, { ...merge, messages: [] });
+    const autoMerge = await ortResultEntries(this.blobs, { ...merge, messages: [], clean: true });
     if (stashCommit.tree !== stashHeadCommitObj.tree) {
       await this.refsStore.set("AUTO_MERGE", await this.storeFlat(autoMerge));
     }
@@ -560,6 +561,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       baseLabel: "Stash base",
       style: conflictStyleOf(this.workingCopy),
       ignoreCase,
+      ...ortConfigOptions(this.workingCopy, this.worktreeAccess),
     });
     return { result, conflicts };
   }

@@ -405,12 +405,11 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
       await expect(git.merge().call()).rejects.toThrow(InvalidMergeHeadsError);
     });
 
-    it("should throw when multiple merge heads specified", async () => {
+    it("should throw when one of several merge heads does not exist", async () => {
+      // several heads are an octopus (merge-octopus-native.test.ts); unknown ones fail
       const { git } = await createInitializedGit();
 
-      await expect(git.merge().include("branch1").include("branch2").call()).rejects.toThrow(
-        InvalidMergeHeadsError,
-      );
+      await expect(git.merge().include("branch1").include("branch2").call()).rejects.toThrow();
     });
 
     it("should not be callable twice", async () => {

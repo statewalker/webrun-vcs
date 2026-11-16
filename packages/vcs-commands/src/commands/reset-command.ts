@@ -1,5 +1,6 @@
 import type { ObjectId, Ref } from "@statewalker/vcs-core";
 import { isSymbolicRef } from "@statewalker/vcs-core";
+import type { ResolveUndoRecord } from "@statewalker/vcs-working-tree";
 
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
@@ -270,7 +271,30 @@ export class ResetCommand extends GitCommand<Ref> {
   private async resetStaging(commitId: ObjectId): Promise<void> {
     const commit = await this.commits.load(commitId);
     if (commit) {
-      await this.staging.readTree(this.trees, commit.tree);
+      if (this.mode !== ResetMode.MIXED) {
+        await this.staging.readTree(this.trees, commit.tree);
+        await this.staging.write();
+        return;
+      }
+      // git's reset --mixed edits the index in place (read_from_tree): the resolve-undo
+      // records stay, and the conflict stages it removes are recorded as well
+      const unmerged = new Map<string, ResolveUndoRecord>();
+      for await (const entry of this.staging.entries()) {
+        if (entry.stage < 1 || entry.stage > 3) continue;
+        let record = unmerged.get(entry.path);
+        if (!record) {
+          record = {
+            path: entry.path,
+            modes: [0, 0, 0],
+            objectIds: [undefined, undefined, undefined],
+          };
+          unmerged.set(entry.path, record);
+        }
+        record.modes[entry.stage - 1] = entry.mode;
+        record.objectIds[entry.stage - 1] = entry.objectId;
+      }
+      await this.staging.readTree(this.trees, commit.tree, { keepResolveUndo: true });
+      if (unmerged.size > 0) this.staging.recordResolveUndo?.([...unmerged.values()]);
       await this.staging.write();
     }
   }

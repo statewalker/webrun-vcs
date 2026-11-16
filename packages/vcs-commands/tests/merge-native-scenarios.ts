@@ -86,3 +86,54 @@ const lines = (n: number, edit: Record<number, string> = {}) =>
 
 /** Ten numbered lines with some replaced (`{ 3: "x" }` puts x on line 3). */
 export const text = (edit: Record<number, string> = {}) => lines(10, edit);
+
+/**
+ * One commit of a {@link buildGraph} history: on `branch` (created from `from` when new),
+ * `files` applied; with `merge`, a merge commit of that ref (its tree ours plus `files`,
+ * `-s ours`, so a criss-cross needs no conflict resolution).
+ */
+export interface GraphStep {
+  branch: string;
+  from?: string;
+  merge?: string;
+  files?: Files;
+  message?: string;
+}
+
+/** A history of branches and merges for {@link buildGraph}. */
+export interface Graph {
+  base: Files;
+  steps: GraphStep[];
+  /** The branch checked out at the end (default main) */
+  checkout?: string;
+  /** Repository config set before the first commit */
+  config?: Record<string, string>;
+}
+
+/**
+ * Builds a history of branches and merges (criss-crosses, several merge bases) at `dir`:
+ * `base` on main, then each step; ends on `checkout`. Commit dates are nativeGitEnv's, so
+ * twins built apart have the same commit ids.
+ */
+export function buildGraph(home: string, dir: string, graph: Graph): void {
+  mkdirSync(dir, { recursive: true });
+  const run = (...args: string[]) => gitOk(home, dir, ...args);
+  run("init", "-q", "-b", "main");
+  for (const [key, value] of Object.entries(graph.config ?? {})) run("config", key, value);
+  applyFiles(dir, graph.base);
+  run("add", "-A");
+  run("commit", "-q", "--allow-empty", "-m", "base");
+  const branches = new Set(["main"]);
+  graph.steps.forEach((step, k) => {
+    if (branches.has(step.branch)) run("checkout", "-q", step.branch);
+    else {
+      run("checkout", "-q", "-b", step.branch, step.from ?? "main");
+      branches.add(step.branch);
+    }
+    if (step.merge) run("merge", "-q", "--no-ff", "--no-commit", "-s", "ours", step.merge);
+    applyFiles(dir, step.files ?? {});
+    run("add", "-A");
+    run("commit", "-q", "--allow-empty", "-m", step.message ?? `step ${k + 1}`);
+  });
+  run("checkout", "-q", graph.checkout ?? "main");
+}

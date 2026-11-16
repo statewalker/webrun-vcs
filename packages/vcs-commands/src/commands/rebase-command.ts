@@ -15,6 +15,7 @@ import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
+import { ortConfigOptions } from "./merge-drivers.js";
 import {
   abbrev,
   conflictsComment,
@@ -29,6 +30,7 @@ import {
   switchTrees,
 } from "./merge-support.js";
 import { ortMerge, ortResultEntries } from "./ort-merge.js";
+import { patchId } from "./patch-id.js";
 import { expandCommitId, expandCommitIds } from "./sequencer-pick.js";
 import {
   applyAutostash,
@@ -114,6 +116,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private interactiveHandler?: InteractiveHandler;
   private committer?: PersonIdent;
   private autoStash?: boolean;
+  private reapplyCherryPicks = false;
   /** The flat trees the picks read (each pick's result is the next one's HEAD) */
   private flatTrees?: FlatTreeCache;
   /** Commit subjects, for the todo and done lines */
@@ -251,6 +254,17 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
+   * Pick commits whose change upstream already has (`--reapply-cherry-picks`); by default
+   * (`--no-reapply-cherry-picks`) they are left out, with git's "skipped previously applied
+   * commit" warnings, as their patch-id is found upstream.
+   */
+  setReapplyCherryPicks(reapply: boolean): this {
+    this.checkCallable();
+    this.reapplyCherryPicks = reapply;
+    return this;
+  }
+
+  /**
    * Stash local changes away for the rebase and apply them after it (`--autostash`;
    * default `rebase.autoStash`, false).
    */
@@ -381,10 +395,28 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
 
     // the commits to pick: HEAD's, not upstream's, merges dropped, oldest first
-    const ids = await this.commitsToRebase(headId, onto);
-    if (ids.length === 0) {
+    const range = await this.commitsToRebase(headId, onto);
+    if (range.length === 0) {
       await unstash();
       return { status: RebaseStatus.UP_TO_DATE, newHead: headId, output };
+    }
+    // commits whose change upstream has already (`--cherry-mark`): left out, with git's
+    // warnings (`make_script`), unless --reapply-cherry-picks
+    const skipped = this.reapplyCherryPicks
+      ? new Set<ObjectId>()
+      : await this.appliedUpstream(headId, onto, range);
+    const ids = range.filter((id) => !skipped.has(id));
+    if (skipped.size > 0) {
+      for (const id of range) {
+        if (skipped.has(id))
+          output.push(`warning: skipped previously applied commit ${abbrev(id)}`);
+      }
+      if (configBool(this.workingCopy, "advice.skippedCherryPicks", true)) {
+        output.push(
+          "hint: use --reapply-cherry-picks to include skipped commits",
+          'hint: Disable this message with "git config set advice.skippedCherryPicks false"',
+        );
+      }
     }
     const steps: RebaseTodoLine[] = [];
     for (const id of ids) {
@@ -512,6 +544,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       style: conflictStyleOf(this.workingCopy),
       favor: favorOf(this.contentStrategy),
       ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      ...ortConfigOptions(this.workingCopy, worktree),
     });
     const target = await ortResultEntries(this.blobs, merge);
     const treeId = await storeFlatTreeOver(this.trees, headTreeId, headTree, target);
@@ -534,14 +567,15 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         reschedule: true,
       };
     }
-    output.push(...merge.messages);
+    // the sequencer shows merge-ort's messages of a rebase only when the pick conflicts
+    if (conflicts.length > 0 || !merge.clean) output.push(...merge.messages);
     await state.setRef("AUTO_MERGE", treeId);
-    if (conflicts.length > 0) {
+    if (conflicts.length > 0 || !merge.clean) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
       const message = commit.message.endsWith("\n") ? commit.message : `${commit.message}\n`;
       await this.stopAt(state, item.id, commit.message, commit.author);
       await state.setRef("REBASE_HEAD", item.id);
-      await state.write("MERGE_MSG", `${message}${conflictsComment(paths)}`);
+      await state.write("MERGE_MSG", `${message}${conflictsComment(paths, true)}`);
       return {
         status: RebaseStatus.STOPPED,
         currentCommit: item.id,
@@ -834,6 +868,53 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       order.push(id);
     }
     return order.reverse().filter((id) => (parents.get(id)?.length ?? 0) <= 1);
+  }
+
+  /**
+   * The commits of `range` (HEAD's side of `upstream...head`) whose patch-id one of
+   * upstream's side has: git's `--cherry-mark` of the todo list (merges and commits that
+   * change nothing never match).
+   */
+  private async appliedUpstream(
+    head: ObjectId,
+    upstream: ObjectId,
+    range: ObjectId[],
+  ): Promise<Set<ObjectId>> {
+    const skipped = new Set<ObjectId>();
+    const headSide = new Set<ObjectId>();
+    for await (const id of this.commits.walkAncestry([head])) headSide.add(id);
+    // upstream's side: reachable from upstream, not from HEAD
+    const left: ObjectId[] = [];
+    const seen = new Set<ObjectId>();
+    const stack = [upstream];
+    while (stack.length > 0) {
+      const id = stack.pop() as ObjectId;
+      if (seen.has(id) || headSide.has(id)) continue;
+      seen.add(id);
+      const commit = await this.commits.load(id);
+      if (!commit) continue;
+      left.push(id);
+      stack.push(...commit.parents);
+    }
+    if (left.length === 0) return skipped;
+    const idOf = async (id: ObjectId) => {
+      const commit = await this.commits.load(id);
+      if (!commit || commit.parents.length > 1) return undefined;
+      const parentTree = commit.parents[0]
+        ? await this.commits.getTree(commit.parents[0])
+        : undefined;
+      return patchId(this.trees, this.blobs, parentTree, commit.tree);
+    };
+    const upstreamIds = new Set<string>();
+    for (const id of left) {
+      const p = await idOf(id);
+      if (p) upstreamIds.add(p);
+    }
+    for (const id of range) {
+      const p = await idOf(id);
+      if (p && upstreamIds.has(p)) skipped.add(id);
+    }
+    return skipped;
   }
 
   private async isAncestor(a: ObjectId, b: ObjectId): Promise<boolean> {

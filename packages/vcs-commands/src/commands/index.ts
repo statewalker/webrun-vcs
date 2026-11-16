@@ -14,6 +14,16 @@ export * from "./init-command.js";
 export * from "./log-command.js";
 export * from "./ls-remote-command.js";
 export * from "./merge-command.js";
+export {
+  createMergeDriver,
+  installMergeDrivers,
+  type MergeAttributeValue,
+  type MergeDriver,
+  type MergeDriverInput,
+  type MergeDriverRegistry,
+  type MergeDriverResult,
+  mergeDriversOf,
+} from "./merge-drivers.js";
 export * from "./pack-refs-command.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";

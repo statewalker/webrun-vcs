@@ -48,6 +48,8 @@ export interface ReadTreeOptions {
   prefix?: string;
   /** Merge stage for entries (default: 0) */
   stage?: MergeStageValue;
+  /** Keep the resolve-undo records (git's `reset --mixed`; default: dropped) */
+  keepResolveUndo?: boolean;
   /** Keep existing entries not in tree */
   keepExisting?: boolean;
 }
@@ -154,6 +156,13 @@ export interface Staging {
    * staging area that keeps none.
    */
   recordResolveUndo?(records: readonly ResolveUndoRecord[]): void;
+
+  /**
+   * Drops the resolve-undo records on the next write, as git does whenever unpack-trees
+   * writes the index (merge, cherry-pick, rebase, checkout, `reset --hard`). Absent: a
+   * staging area that keeps none.
+   */
+  clearResolveUndo?(): void;
 
   // ========== Persistence ==========
 
