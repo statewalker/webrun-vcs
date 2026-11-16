@@ -38,6 +38,7 @@ import type {
   WorktreeCheckoutOptions,
   WorktreeCheckoutResult,
   WorktreeEntry,
+  WorktreeRemoveOptions,
   WorktreeWalkOptions,
   WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
@@ -230,6 +231,11 @@ export class FileWorktree implements Worktree {
       includeIgnored,
       includeDirectories,
       options?.maxDepth,
+      0,
+      {
+        enterNonRepositoryGitDirs: options?.enterNonRepositoryGitDirs === true,
+        onUnreadable: options?.onUnreadable,
+      },
     );
   }
 
@@ -242,6 +248,9 @@ export class FileWorktree implements Worktree {
     includeDirectories: boolean,
     maxDepth?: number,
     currentDepth = 0,
+    extra: { enterNonRepositoryGitDirs: boolean; onUnreadable?: (path: string) => void } = {
+      enterNonRepositoryGitDirs: false,
+    },
   ): AsyncIterable<WorktreeEntry> {
     if (maxDepth !== undefined && currentDepth > maxDepth) {
       return;
@@ -258,6 +267,8 @@ export class FileWorktree implements Worktree {
         entries.push(entry);
       }
     } catch {
+      // unreadable: its content is unknown (reported, so nothing is removed on a guess)
+      extra.onUnreadable?.(relativePath);
       return;
     }
 
@@ -268,7 +279,10 @@ export class FileWorktree implements Worktree {
       const fullPath = joinPath(dirPath, entry.name);
 
       if (entry.name === ".git") {
-        continue;
+        // the worktree's own repository, or a nested one: never listed; a `.git` in a
+        // directory that holds no repository is listed on request (git clean removes it)
+        if (!extra.enterNonRepositoryGitDirs || relativePath === "") continue;
+        if (await this.isRepository(relativePath)) continue;
       }
 
       // the entry itself: a symbolic link is a file of its own, never descended into
@@ -313,7 +327,9 @@ export class FileWorktree implements Worktree {
         yield worktreeEntry;
       }
 
-      if (isDirectory && !hasGitDir) {
+      const enter =
+        !hasGitDir || (extra.enterNonRepositoryGitDirs && !(await this.isRepository(entryPath)));
+      if (isDirectory && enter) {
         yield* this.walkDirectory(
           loaded,
           files,
@@ -323,6 +339,7 @@ export class FileWorktree implements Worktree {
           includeDirectories,
           maxDepth,
           currentDepth + 1,
+          extra,
         );
       }
     }
@@ -540,8 +557,8 @@ export class FileWorktree implements Worktree {
    * included). A directory is removed only with `recursive`; without it, it is left in
    * place and `false` returned.
    */
-  async remove(path: string, options?: { recursive?: boolean }): Promise<boolean> {
-    assertValidWorktreePath(path, undefined, this.pathRules);
+  async remove(path: string, options?: WorktreeRemoveOptions): Promise<boolean> {
+    await this.assertRemovablePath(path, options?.nonRepositoryGitDirs === true);
     // beneath a link or a file the path is absent (git's has_symlink_or_noent_leading_path)
     if (!this.files.refusesBeyondLinks && (await this.hasLinkOrFileLeading(path))) return false;
     const fullPath = joinPath(this.rootPath, path);
@@ -559,8 +576,11 @@ export class FileWorktree implements Worktree {
    * directory holding anything, a nested repository's `.git` or a FIFO included, stays.
    * Never follows a link: a link (or anything else) at `path` is not removed.
    */
-  async removeEmptyDirectory(path: string): Promise<boolean> {
-    assertValidWorktreePath(path, undefined, this.pathRules);
+  async removeEmptyDirectory(
+    path: string,
+    options?: Pick<WorktreeRemoveOptions, "nonRepositoryGitDirs">,
+  ): Promise<boolean> {
+    await this.assertRemovablePath(path, options?.nonRepositoryGitDirs === true);
     if (!this.files.refusesBeyondLinks && (await this.hasLinkOrFileLeading(path))) return false;
     const fullPath = joinPath(this.rootPath, path);
     const kind = await this.kindOf(fullPath).catch((error: unknown) => {
@@ -572,6 +592,30 @@ export class FileWorktree implements Worktree {
     if (this.files.rmdir) return this.files.rmdir(fullPath);
     for await (const _ of this.files.list(fullPath)) return false;
     return this.files.remove(fullPath);
+  }
+
+  /**
+   * Refuses a path git's `verify_path` refuses, except (on request) `.git` components that
+   * name no repository: each must be exactly `.git` in a directory {@link isRepository}
+   * finds no repository in (anything it cannot check counts as one).
+   */
+  private async assertRemovablePath(path: string, nonRepositoryGitDirs: boolean): Promise<void> {
+    if (!nonRepositoryGitDirs || !path.split("/").includes(".git")) {
+      assertValidWorktreePath(path, undefined, this.pathRules);
+      return;
+    }
+    const parts = path.split("/");
+    const checked: string[] = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === ".git") {
+        const dir = parts.slice(0, i).join("/");
+        if (i === 0 || (await this.isRepository(dir))) {
+          throw new Error(`Invalid worktree path: ${JSON.stringify(path)}`);
+        }
+        checked.push("_");
+      } else checked.push(parts[i]);
+    }
+    assertValidWorktreePath(checked.join("/"), undefined, this.pathRules);
   }
 
   /**
@@ -633,8 +677,10 @@ export class FileWorktree implements Worktree {
       // is removed on a guess
       return (await this.kindOrError(joinPath(resolved, "HEAD"))) !== undefined;
     }
-    // a `.git` link (to a repository elsewhere, which git follows): kept, never checked here
-    if (kind === "symlink" || kind === "error") return true;
+    // a `.git` link (to a repository elsewhere, which git follows): kept, unless it is
+    // certainly dangling (its target, inside this FilesApi, confirmed absent)
+    if (kind === "symlink") return !(await this.isDanglingLink(dotGit, path));
+    if (kind === "error") return true;
     if (kind !== "directory") return false;
     const kindAt = (name: string) => this.kindOrError(joinPath(dotGit, name));
     // git's is_git_directory: a HEAD (file or link), objects and refs (directories, or links
@@ -920,6 +966,23 @@ export class FileWorktree implements Worktree {
   }
 
   /** What is at `fullPath`: `lstat` where the FilesApi has it, else `stats`. */
+  /**
+   * Whether the link at `link` (the `.git` of the directory `dir`) certainly points nowhere:
+   * its target, relative or absolute inside this FilesApi's root, is confirmed absent. A
+   * target that cannot be checked is not dangling.
+   */
+  private async isDanglingLink(link: string, dir: string): Promise<boolean> {
+    try {
+      const bytes = await this.files.readlink?.(link);
+      if (!bytes) return false;
+      const target = this.gitfileTarget(dir, new TextDecoder().decode(bytes));
+      if (target === undefined) return false;
+      return (await this.kindOrError(target)) === undefined;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * The kind of entry at `fullPath`, undefined only when it is confirmed absent, `"error"`
    * when it cannot be checked (beneath a link, unreadable).

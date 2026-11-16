@@ -5,7 +5,7 @@
  * least the threshold, as long as the candidates fit the rename limit.
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
+import { EMPTY_BLOB_ID, type ObjectId } from "@statewalker/vcs-core";
 import {
   estimateSimilarity,
   GIT_DEFAULT_RENAME_SCORE,
@@ -67,9 +67,6 @@ export const DEFAULT_RENAME_LIMIT = 1000;
 /** The limit git uses for a `diff.renameLimit` of 0 or less. */
 const MAX_RENAME_LIMIT = 32767;
 
-/** git's empty blob (`e69de29...`), never paired when `renameEmpty` is off. */
-const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
-
 const S_IFMT = 0o170000;
 const isRegular = (mode: number) => (mode & S_IFMT) === 0o100000;
 const basename = (path: string) => path.slice(path.lastIndexOf("/") + 1);
@@ -121,7 +118,7 @@ export async function detectRenames(
   const configured = options.renameLimit ?? DEFAULT_RENAME_LIMIT;
   const renameLimit = configured <= 0 ? MAX_RENAME_LIMIT : configured;
   // merges leave empty files out of rename detection (git's rename_empty = 0)
-  const keep = (c: RenameCandidate) => options.renameEmpty !== false || c.id !== EMPTY_BLOB;
+  const keep = (c: RenameCandidate) => options.renameEmpty !== false || c.id !== EMPTY_BLOB_ID;
   const src = sources.filter(keep).sort(byPath);
   const dst = destinations.filter(keep).sort(byPath);
   const pairs: RenamePair[] = [];

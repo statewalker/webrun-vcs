@@ -906,3 +906,244 @@ describeGit("status review cases against native git", () => {
     ]);
   });
 });
+
+describeGit("clean removes inside non-repository .git directories as git (review 3)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-fake-git-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  type Flags = { d?: boolean; x?: boolean; X?: boolean; ff?: boolean };
+  const argsOf = (flags: Flags) => {
+    const args = ["clean", flags.ff ? "-ff" : "-f"];
+    if (flags.d) args.push("-d");
+    if (flags.x) args.push("-x");
+    if (flags.X) args.push("-X");
+    return args;
+  };
+  /** native `git clean` in one build of `setup`, ours in the other; output and trees equal. */
+  async function twin(name: string, setup: (d: string) => void, flags: Flags) {
+    const n = join(root, `${name}-n`);
+    const o = join(root, `${name}-o`);
+    for (const dir of [n, o]) {
+      repo(dir);
+      setup(dir);
+    }
+    const args = argsOf(flags);
+    const out = exec(n, ...args, "-n")
+      .split("\n")
+      .filter(Boolean);
+    const pick = (prefix: string) =>
+      out
+        .filter((l) => l.startsWith(prefix))
+        .map((l) => l.slice(prefix.length))
+        .sort();
+    const command = async (dryRun: boolean) => {
+      const { ours } = await open(o);
+      return ours
+        .clean()
+        .setCleanDirectories(flags.d === true)
+        .setIgnore(flags.x !== true)
+        .setIgnoredOnly(flags.X === true)
+        .setForceNestedRepositories(flags.ff === true)
+        .setDryRun(dryRun)
+        .call();
+    };
+    const dry = await command(true);
+    expect([...dry.cleaned].sort(), `${name}: would remove`).toEqual(pick("Would remove "));
+    expect([...dry.skipped].sort(), `${name}: would skip`).toEqual(pick("Would skip repository "));
+    exec(n, ...args, "-q");
+    await command(false);
+    expect(fullListing(o), `${name}: worktree`).toEqual(fullListing(n));
+    return { native: fullListing(n), ours: fullListing(o) };
+  }
+  /** Every path below `dir` but its own `.git`, `.git` directories elsewhere included. */
+  const fullListing = (dir: string, prefix = ""): string[] => {
+    const out: string[] = [];
+    for (const entry of readdirSync(join(dir, prefix), { withFileTypes: true })) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (path === ".git") continue;
+      out.push(path);
+      if (entry.isDirectory()) out.push(...fullListing(dir, path));
+    }
+    return out.sort();
+  };
+  const innerRepo = (d: string, path: string) => {
+    mkdirSync(join(d, path), { recursive: true });
+    run(join(d, path), "init", "-q");
+    put(d, `${path}/p.txt`, "precious\n");
+  };
+  const layouts: Record<string, (d: string) => void> = {
+    // review repro 1: an ignored directory whose fake .git holds a repository
+    "ignored-fake-git": (d) => {
+      put(d, ".gitignore", "ign/\n");
+      run(d, "add", ".gitignore");
+      run(d, "commit", "-qm", "ignore");
+      innerRepo(d, "ign/d/.git/inner");
+      put(d, "ign/d/x.txt", "x\n");
+      put(d, "ign/d/.git/junk", "j\n");
+    },
+    // review repro 2: an untracked directory with a fake .git next to a repository
+    "untracked-fake-git": (d) => {
+      mkdirSync(join(d, "w/nf/.git"), { recursive: true });
+      innerRepo(d, "w/nf/in");
+      put(d, "w/nf/q.txt", "q\n");
+      put(d, "w/u/u.txt", "u\n");
+    },
+    // repositories inside fake .git directories, at several depths
+    "deep-fake-git": (d) => {
+      innerRepo(d, "v/f/.git/deep/r");
+      put(d, "v/f/.git/j.txt", "j\n");
+      innerRepo(d, "a/b/c/.git/r2");
+      put(d, "a/b/c/k.txt", "k\n");
+      mkdirSync(join(d, "d/fk/.git/empty"), { recursive: true });
+      put(d, "d/fk/k.txt", "k\n");
+    },
+    // links named .git: a dangling one (no repository) and one to a repository
+    "git-links": (d) => {
+      mkdirSync(join(d, "dl"));
+      symlinkSync("missing", join(d, "dl/.git"));
+      put(d, "dl/d.txt", "d\n");
+      run(d, "init", "-q", "--bare", join(d, ".git/store.git"));
+      mkdirSync(join(d, "u/sl"), { recursive: true });
+      symlinkSync(join(d, ".git/store.git"), join(d, "u/sl/.git"));
+      put(d, "u/sl/s.txt", "s\n");
+      put(d, "u/loose.txt", "l\n");
+    },
+  };
+  const flagSets: Array<[string, Flags]> = [
+    ["-d", { d: true }],
+    ["-dx", { d: true, x: true }],
+    ["-Xd", { d: true, X: true }],
+    ["-dff", { d: true, ff: true }],
+    ["-Xdff", { d: true, X: true, ff: true }],
+    ["-dffx", { d: true, ff: true, x: true }],
+  ];
+  for (const [layout, setup] of Object.entries(layouts)) {
+    for (const [flagName, flags] of flagSets) {
+      it(`${layout}: clean ${flagName}`, async () => {
+        await twin(`${layout}${flagName}`, setup, flags);
+      });
+    }
+  }
+
+  it("regression: -Xd keeps the repository inside an ignored directory's fake .git", async () => {
+    const d = join(root, "r1");
+    repo(d);
+    layouts["ignored-fake-git"](d);
+    const { ours } = await open(d);
+    await ours.clean().setIgnoredOnly(true).setCleanDirectories(true).setDryRun(false).call();
+    expect(existsSync(join(d, "ign/d/.git/inner/p.txt"))).toBe(true);
+    expect(existsSync(join(d, "ign/d/x.txt"))).toBe(false);
+  });
+
+  it("regression: -d keeps the repository next to a fake .git", async () => {
+    const d = join(root, "r2");
+    repo(d);
+    layouts["untracked-fake-git"](d);
+    const { ours } = await open(d);
+    await ours.clean().setCleanDirectories(true).setDryRun(false).call();
+    expect(existsSync(join(d, "w/nf/in/p.txt"))).toBe(true);
+    expect(existsSync(join(d, "w/nf/.git"))).toBe(false);
+  });
+
+  it("an unreadable directory is never removed (its listing fails: content unknown)", async () => {
+    const d = join(root, "r3");
+    repo(d);
+    put(d, "u/locked/secret.txt", "s\n");
+    put(d, "u/free.txt", "f\n");
+    put(d, "ign/locked/secret.txt", "s\n");
+    put(d, ".gitignore", "ign/\n");
+    run(d, "add", ".gitignore");
+    run(d, "commit", "-qm", "ignore");
+    const base = createNodeFilesApi({ rootDir: d });
+    // a FilesApi whose listing of the locked directories fails, as an unreadable one does
+    const files = new Proxy(base, {
+      get(target, key, receiver) {
+        if (key === "withLstatCache") return undefined;
+        if (key === "list") {
+          return (path: string) => {
+            if (path.endsWith("/locked")) throw new Error("EACCES: permission denied");
+            return target.list(path);
+          };
+        }
+        const value = Reflect.get(target, key, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const { history } = await createGitFilesBackend({ files });
+    const staging = new FileStagingStore(files, ".git/index");
+    await staging.read();
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "",
+      gitDir: ".git",
+      blobs: history.blobs,
+      trees: history.trees,
+    });
+    const { MemoryCheckout } = await import("@statewalker/vcs-working-tree");
+    const wc = new MemoryWorkingCopy({
+      history,
+      checkout: new MemoryCheckout({ staging }),
+      worktree,
+    });
+    for (const configure of [
+      (c: ReturnType<Git["clean"]>) => c.setCleanDirectories(true),
+      (c: ReturnType<Git["clean"]>) => c.setCleanDirectories(true).setIgnore(false),
+      (c: ReturnType<Git["clean"]>) => c.setCleanDirectories(true).setIgnoredOnly(true),
+    ]) {
+      const result = await configure(Git.fromWorkingCopy(wc).clean()).setDryRun(false).call();
+      expect([...result.cleaned].some((p) => p.includes("locked"))).toBe(false);
+      expect(existsSync(join(d, "u/locked/secret.txt"))).toBe(true);
+      expect(existsSync(join(d, "ign/locked/secret.txt"))).toBe(true);
+    }
+    expect(existsSync(join(d, "u/free.txt"))).toBe(false);
+  });
+
+  it("randomized layouts: every flag set as native git", async () => {
+    let state = 12345;
+    const rnd = () => {
+      state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+      return state / 2 ** 32;
+    };
+    const pickOne = <T>(xs: T[]) => xs[Math.floor(rnd() * xs.length)];
+    for (let k = 0; k < 6; k++) {
+      // a fixed plan per layout, applied to both builds
+      const plan: Array<(d: string) => void> = [
+        (d) => {
+          put(d, ".gitignore", "*.log\nign*/\n");
+          run(d, "add", ".gitignore");
+          run(d, "commit", "-qm", "ignore");
+        },
+      ];
+      for (let i = 0; i < 8; i++) {
+        const dir = [pickOne(["u", "ign", "d", "w"]), pickOne(["", "a", "ign2", "b/c"])]
+          .filter(Boolean)
+          .join("/");
+        const kind = pickOne(["file", "log", "fake", "fakejunk", "repo", "fakerepo", "empty"]);
+        const name = `n${k}${i}`;
+        plan.push((d) => {
+          if (kind === "file") put(d, `${dir}/${name}.txt`, "f\n");
+          else if (kind === "log") put(d, `${dir}/${name}.log`, "l\n");
+          else if (kind === "fake") mkdirSync(join(d, dir, name, ".git"), { recursive: true });
+          else if (kind === "fakejunk") put(d, `${dir}/${name}/.git/junk`, "j\n");
+          else if (kind === "repo") innerRepo(d, `${dir}/${name}`);
+          else if (kind === "fakerepo") innerRepo(d, `${dir}/${name}/.git/in`);
+          else mkdirSync(join(d, dir, name), { recursive: true });
+        });
+      }
+      const setup = (d: string) => {
+        for (const step of plan) step(d);
+      };
+      for (const [flagName, flags] of [
+        ["-d", { d: true }],
+        ["-dx", { d: true, x: true }],
+        ["-Xd", { d: true, X: true }],
+        ["-X", { X: true }],
+        ["-dff", { d: true, ff: true }],
+      ] as Array<[string, Flags]>) {
+        await twin(`random${k}${flagName}`, setup, flags);
+      }
+    }
+  }, 300_000);
+});

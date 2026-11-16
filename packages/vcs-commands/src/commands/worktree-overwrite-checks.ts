@@ -131,8 +131,14 @@ export async function findInTheWay(
  * directory with a file, link, subdirectory, nested repository (`.git`) or FIFO in it, and
  * never recursively. Returns whether it was removed.
  */
-export async function removeDirectoryIfEmpty(worktree: Worktree, dir: string): Promise<boolean> {
-  if (worktree.removeEmptyDirectory) return worktree.removeEmptyDirectory(dir);
+export async function removeDirectoryIfEmpty(
+  worktree: Worktree,
+  dir: string,
+  options?: { nonRepositoryGitDirs?: boolean },
+): Promise<boolean> {
+  if (worktree.removeEmptyDirectory) return worktree.removeEmptyDirectory(dir, options);
+  // a `.git` that is no repository can only be removed by a worktree that knows it
+  if (options?.nonRepositoryGitDirs && dir.split("/").includes(".git")) return false;
   // a worktree without the operation: the walk shows directories (nested repositories too)
   const entry = await worktree.getEntry(dir);
   if (!entry?.isDirectory) return false;
