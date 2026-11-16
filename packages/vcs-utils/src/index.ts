@@ -5,6 +5,7 @@ export * from "./diff/index.js";
 export * from "./encoding/index.js";
 export * from "./hash/index.js";
 export * from "./ids/index.js";
+export * from "./regex/index.js";
 export * from "./streams/index.js";
 
 // Note: files/ is exported via subpath "@statewalker/vcs-utils/files"

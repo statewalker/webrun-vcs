@@ -314,6 +314,12 @@ export function createGitObjects(
       for await (const id of store.list()) if (isId(id)) yield id;
     },
 
+    async approximateCount() {
+      let n = 0;
+      for await (const id of store.list()) if (isId(id)) n++;
+      return n;
+    },
+
     async remove(id) {
       checkId(id);
       return store.remove(id);

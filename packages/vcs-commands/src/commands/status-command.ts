@@ -93,9 +93,46 @@ async function concat(chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>) 
 }
 
 /** What a submodule's own worktree holds (git's `DIRTY_SUBMODULE_*`). */
-interface SubmoduleDirt {
+export interface SubmoduleDirt {
   modified?: boolean;
   untracked?: boolean;
+}
+
+/**
+ * The state of the submodule at `path` in its own index and worktree, as git's
+ * `is_submodule_modified` reads it from `git status --porcelain=2` run inside it: an
+ * untracked file there (or a nested submodule holding only untracked files, `S..U`) is
+ * untracked content; any other change, a nested submodule's included, is modified content.
+ * Nothing for a submodule that is not populated (or that the worktree cannot open).
+ */
+export async function readSubmoduleDirt(
+  worktree: Worktree,
+  path: string,
+  ignoreUntracked: boolean,
+): Promise<SubmoduleDirt> {
+  const inner: WorkingCopy | undefined = await worktree.openGitlink?.(path);
+  if (!inner) return {};
+  const showUntracked =
+    !ignoreUntracked &&
+    !["no", "false", "off", "0"].includes(
+      RemoteConfigStore.from(inner).value("status.showUntrackedFiles")?.trim().toLowerCase() ?? "",
+    );
+  const status = await new StatusCommand(inner)
+    .setRenames(false)
+    .setUntracked(showUntracked)
+    .call();
+  const dirt: SubmoduleDirt = {};
+  for (const f of status.files) {
+    if (f.index === "!") continue;
+    if (f.index === "?") {
+      dirt.untracked = true;
+      continue;
+    }
+    const token = submoduleToken(f);
+    if (token[0] === "S" && token[3] === "U") dirt.untracked = true;
+    if (f.stages || f.renamedFrom || token !== "S..U") dirt.modified = true;
+  }
+  return dirt;
 }
 
 /**
@@ -293,7 +330,7 @@ export class StatusCommand extends GitCommand<Status> {
           if (flags && result.kind === "modified") commitChanged = true;
           // a populated submodule's own index and worktree (git's is_submodule_modified)
           if (flags && !flags.dirty && result.worktreeEntry?.isDirectory) {
-            dirt = await this.submoduleDirt(worktree, entry.path, flags.untracked);
+            dirt = await readSubmoduleDirt(worktree, entry.path, flags.untracked);
           }
           if (result.kind === "deleted") {
             y = "D";
@@ -593,43 +630,6 @@ export class StatusCommand extends GitCommand<Status> {
    */
   private async indexIgnoresAll(_path: string): Promise<boolean> {
     return this.ignoreSubmodules === "all";
-  }
-
-  /**
-   * The state of the submodule's own index and worktree, as git's `is_submodule_modified`
-   * reads it from `git status --porcelain=2` run inside it: an untracked file there (or a
-   * nested submodule holding only untracked files, `S..U`) is untracked content; any other
-   * change, a nested submodule's included, is modified content.
-   */
-  private async submoduleDirt(
-    worktree: Worktree,
-    path: string,
-    ignoreUntracked: boolean,
-  ): Promise<SubmoduleDirt> {
-    const inner: WorkingCopy | undefined = await worktree.openGitlink?.(path);
-    if (!inner) return {};
-    const showUntracked =
-      !ignoreUntracked &&
-      !["no", "false", "off", "0"].includes(
-        RemoteConfigStore.from(inner).value("status.showUntrackedFiles")?.trim().toLowerCase() ??
-          "",
-      );
-    const status = await new StatusCommand(inner)
-      .setRenames(false)
-      .setUntracked(showUntracked)
-      .call();
-    const dirt: SubmoduleDirt = {};
-    for (const f of status.files) {
-      if (f.index === "!") continue;
-      if (f.index === "?") {
-        dirt.untracked = true;
-        continue;
-      }
-      const token = submoduleToken(f);
-      if (token[0] === "S" && token[3] === "U") dirt.untracked = true;
-      if (f.stages || f.renamedFrom || token !== "S..U") dirt.modified = true;
-    }
-    return dirt;
   }
 
   /**

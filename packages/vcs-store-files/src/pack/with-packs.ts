@@ -145,6 +145,13 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
       for await (const id of loose.list()) if (!held.some((p) => p.has(id))) yield id;
     },
 
+    async approximateCount() {
+      // as git: the objects of the packs, loose objects left out
+      let n = 0;
+      for (const pack of await packs.packs()) n += pack.count;
+      return n;
+    },
+
     remove: (id) => loose.remove(id),
   };
 }

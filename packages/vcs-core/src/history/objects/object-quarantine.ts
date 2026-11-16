@@ -60,6 +60,9 @@ export function overlayObjects(top: GitObjects, base: GitObjects): GitObjects {
       }
       for await (const id of base.list()) if (!seen.has(id)) yield id;
     },
+    async approximateCount() {
+      return ((await top.approximateCount?.()) ?? 0) + ((await base.approximateCount?.()) ?? 0);
+    },
     remove: (id) => top.remove(id),
   };
 }

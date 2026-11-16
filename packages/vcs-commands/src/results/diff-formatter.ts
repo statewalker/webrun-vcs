@@ -1,27 +1,27 @@
 /**
- * Formatter for generating unified diff output from DiffEntry objects.
- *
- * Based on JGit's DiffFormatter class.
+ * Formatter for unified diffs of DiffEntry objects, byte for byte as `git diff` prints them
+ * (see {@link formatPatch} for the rules).
  */
 
-import { type Blobs, DEFAULT_BIG_FILE_THRESHOLD, probeBlob } from "@statewalker/vcs-core";
-import {
-  DEFAULT_ALGORITHM,
-  type DiffAlgorithm,
-  type EditList,
-  getAlgorithm,
-  RawText,
-  RawTextComparator,
-  type SupportedAlgorithm,
-} from "@statewalker/vcs-utils";
+import { type Blobs, DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
+import { ByteSink, type SupportedAlgorithm, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 
 import { ChangeType, type DiffEntry } from "./diff-entry.js";
+import {
+  blobSide,
+  contentSide,
+  type DiffFilePair,
+  type DiffOutputOptions,
+  type DiffSideSpec,
+  type PairPatchReport,
+  writePairPatch,
+} from "./diff-output.js";
 
 /**
  * Options for diff formatting.
  */
-export interface DiffFormatterOptions {
-  /** Number of context lines around changes (default: 3) */
+export interface DiffFormatterOptions extends Omit<DiffOutputOptions, "algorithm"> {
+  /** Number of context lines around changes (default: 3; same as `context`) */
   contextLines?: number;
   /** Whether to include file headers (default: true) */
   includeHeaders?: boolean;
@@ -29,8 +29,8 @@ export interface DiffFormatterOptions {
   abbreviateIds?: boolean;
   /** Length of abbreviated object IDs (default: 7) */
   abbreviationLength?: number;
-  /** Diff algorithm to use (default: histogram) */
-  algorithm?: SupportedAlgorithm;
+  /** Diff algorithm (default: myers, as git's `diff.algorithm`) */
+  algorithm?: XdiffAlgorithm | SupportedAlgorithm;
   /**
    * Files larger than this are binary: they show as "Binary files differ" and are
    * never loaded (git's `core.bigFileThreshold`). Default 50 MiB.
@@ -42,15 +42,20 @@ export interface DiffFormatterOptions {
  * A hunk in unified diff format.
  */
 export interface DiffHunk {
-  /** Starting line in old file (1-based) */
+  /** Starting line in old file, as printed (1-based; the line before for an empty range) */
   oldStart: number;
   /** Number of lines from old file */
   oldCount: number;
-  /** Starting line in new file (1-based) */
+  /** Starting line in new file, as printed */
   newStart: number;
   /** Number of lines from new file */
   newCount: number;
-  /** Lines in the hunk (prefixed with ' ', '+', or '-') */
+  /** The function line of the hunk header ("" when none) */
+  functionName?: string;
+  /**
+   * Lines in the hunk (prefixed with ' ', '+', or '-', without line terminator), with
+   * "\ No newline at end of file" after a line without one
+   */
   lines: string[];
 }
 
@@ -64,22 +69,75 @@ export interface FileContentDiff {
   isBinary: boolean;
   /** File header line (e.g., "diff --git a/path b/path") */
   header: string;
-  /** Old file header (e.g., "--- a/path") */
+  /** Old file header (e.g., "--- a/path"), when hunks follow */
   oldFileHeader?: string;
-  /** New file header (e.g., "+++ b/path") */
+  /** New file header (e.g., "+++ b/path"), when hunks follow */
   newFileHeader?: string;
   /** Index line (e.g., "index abc123..def456 100644") */
   indexLine?: string;
+  /** Lines between the `diff --git` line and the file headers, each with its LF */
+  extendedHeaders?: string;
   /** Hunks of changes */
   hunks: DiffHunk[];
   /** Raw old content of a text file (binary files are not loaded) */
   oldContent?: Uint8Array;
   /** Raw new content of a text file (binary files are not loaded) */
   newContent?: Uint8Array;
+  /** The file's part of `git diff` output, exactly (empty when git prints nothing for it) */
+  patch: Uint8Array;
+}
+
+const decoder = new TextDecoder();
+
+/** The file pair of a diff entry: blob sides, or the content the entry reads */
+export function diffEntryToPair(entry: DiffEntry, blobs: Blobs): DiffFilePair {
+  const side = (
+    path: string | undefined,
+    mode: number | undefined,
+    id: string | undefined,
+    read: (() => Promise<Uint8Array>) | undefined,
+    idValid = false,
+  ): DiffSideSpec | undefined => {
+    if (path === undefined || id === undefined) return undefined;
+    const m = mode ?? 0o100644;
+    return read ? contentSide(path, m, id, read, idValid) : blobSide(blobs, path, m, id);
+  };
+  const status =
+    entry.changeType === ChangeType.ADD
+      ? "A"
+      : entry.changeType === ChangeType.DELETE
+        ? "D"
+        : entry.changeType === ChangeType.RENAME
+          ? "R"
+          : entry.changeType === ChangeType.COPY
+            ? "C"
+            : entry.oldMode !== undefined &&
+                entry.newMode !== undefined &&
+                (entry.oldMode & 0o170000) !== (entry.newMode & 0o170000)
+              ? "T"
+              : "M";
+  return {
+    status,
+    old:
+      status === "A"
+        ? undefined
+        : side(entry.oldPath ?? entry.newPath, entry.oldMode, entry.oldId, entry.readOld),
+    new:
+      status === "D"
+        ? undefined
+        : side(
+            entry.newPath ?? entry.oldPath,
+            entry.newMode,
+            entry.newId,
+            entry.readNew,
+            entry.newDirtySubmodule === true,
+          ),
+    ...(entry.score !== undefined ? { score: entry.score } : {}),
+  };
 }
 
 /**
- * Format DiffEntry objects into unified diff format.
+ * Format DiffEntry objects into unified diff format, as `git diff` prints them.
  *
  * @example
  * ```typescript
@@ -89,30 +147,35 @@ export interface FileContentDiff {
  * const entries = await git.diff().setOldTree(commitA).setNewTree(commitB).call();
  *
  * // Format as unified diff
- * for (const entry of entries) {
- *   const diff = await formatter.format(entry);
- *   console.log(formatter.toString(diff));
- * }
+ * process.stdout.write(await formatter.formatAll(entries));
  * ```
  */
 export class DiffFormatter {
-  private contextLines: number;
-  private includeHeaders: boolean;
-  private abbreviateIds: boolean;
-  private abbreviationLength: number;
-  private diffAlgorithm: DiffAlgorithm;
-  private bigFileThreshold: number;
+  private readonly includeHeaders: boolean;
+  private readonly output: DiffOutputOptions;
 
   constructor(
     private readonly blobs: Blobs,
     options: DiffFormatterOptions = {},
   ) {
-    this.contextLines = options.contextLines ?? 3;
-    this.includeHeaders = options.includeHeaders ?? true;
-    this.abbreviateIds = options.abbreviateIds ?? true;
-    this.abbreviationLength = options.abbreviationLength ?? 7;
-    this.diffAlgorithm = getAlgorithm(options.algorithm ?? DEFAULT_ALGORITHM);
-    this.bigFileThreshold = options.bigFileThreshold ?? DEFAULT_BIG_FILE_THRESHOLD;
+    const {
+      contextLines,
+      includeHeaders,
+      abbreviateIds,
+      abbreviationLength,
+      algorithm,
+      bigFileThreshold,
+      ...rest
+    } = options;
+    this.includeHeaders = includeHeaders ?? true;
+    this.output = {
+      ...rest,
+      context: rest.context ?? contextLines ?? 3,
+      algorithm: (algorithm ? String(algorithm) : "myers") as XdiffAlgorithm,
+      abbrev: abbreviationLength ?? rest.abbrev ?? 7,
+      fullIndex: rest.fullIndex ?? abbreviateIds === false,
+      bigFileThreshold: bigFileThreshold ?? DEFAULT_BIG_FILE_THRESHOLD,
+    };
   }
 
   /**
@@ -127,283 +190,80 @@ export class DiffFormatter {
    * @returns Content diff with hunks
    */
   async format(entry: DiffEntry): Promise<FileContentDiff> {
-    // The probe of a text side reads it whole, once; a binary side only to 8000 bytes
-    const options = { bigFileThreshold: this.bigFileThreshold, loadText: true };
-    const oldProbe = entry.oldId ? await probeBlob(this.blobs, entry.oldId, options) : null;
-    const newProbe =
-      !oldProbe?.binary && entry.newId ? await probeBlob(this.blobs, entry.newId, options) : null;
-    const isBinary = (oldProbe?.binary ?? false) || (newProbe?.binary ?? false);
-
-    // Text only: binary and big files are never loaded
-    const oldContent = !isBinary ? (oldProbe?.content ?? null) : null;
-    const newContent = !isBinary ? (newProbe?.content ?? null) : null;
-
-    // Build headers
+    const sink = new ByteSink();
+    const report: PairPatchReport = { binary: false, gitLine: "", extended: "" };
+    await writePairPatch(sink, diffEntryToPair(entry, this.blobs), this.output, report);
     const result: FileContentDiff = {
       entry,
-      isBinary,
-      header: this.buildHeader(entry),
+      isBinary: report.binary,
+      header: report.gitLine,
       hunks: [],
+      patch: sink.bytes(),
     };
-
     if (this.includeHeaders) {
-      result.indexLine = this.buildIndexLine(entry);
-      result.oldFileHeader = this.buildOldFileHeader(entry);
-      result.newFileHeader = this.buildNewFileHeader(entry);
+      result.extendedHeaders = report.extended;
+      const index = /^index .*$/m.exec(report.extended);
+      if (index) result.indexLine = index[0];
+      if (report.oldLabel) result.oldFileHeader = report.oldLabel;
+      if (report.newLabel) result.newFileHeader = report.newLabel;
     }
-
-    if (oldContent) {
-      result.oldContent = oldContent;
+    const diff = report.result;
+    if (diff) {
+      if (entry.changeType !== ChangeType.ADD) result.oldContent = diff.old.content;
+      if (entry.changeType !== ChangeType.DELETE) result.newContent = diff.new.content;
+      for (const hunk of diff.hunks) {
+        const lines: string[] = [];
+        for (const line of hunk.lines) {
+          const rec = (line.kind === "-" ? diff.old : diff.new).line(line.index);
+          const complete = rec.length > 0 && rec[rec.length - 1] === 0x0a;
+          lines.push(line.kind + decoder.decode(complete ? rec.subarray(0, -1) : rec));
+          if (!complete) lines.push("\\ No newline at end of file");
+        }
+        result.hunks.push({
+          oldStart: hunk.oldStart,
+          oldCount: hunk.oldCount,
+          newStart: hunk.newStart,
+          newCount: hunk.newCount,
+          functionName: decoder.decode(hunk.func),
+          lines,
+        });
+      }
     }
-    if (newContent) {
-      result.newContent = newContent;
-    }
-
-    // Don't generate text diff for binary files
-    if (isBinary) {
-      return result;
-    }
-
-    // Generate hunks for text files
-    const oldText = oldContent ? new RawText(oldContent) : RawText.EMPTY_TEXT;
-    const newText = newContent ? new RawText(newContent) : RawText.EMPTY_TEXT;
-
-    const edits = this.diffAlgorithm(RawTextComparator.DEFAULT, oldText, newText);
-
-    if (edits.length > 0) {
-      result.hunks = this.formatEdits(oldText, newText, edits);
-    }
-
     return result;
   }
 
   /**
-   * Convert a FileContentDiff to string format.
+   * The file's part of the diff as text: exactly git's output (LF-terminated lines), or
+   * without the file headers when `includeHeaders` is false.
    *
    * @param diff The content diff to stringify
    * @returns Unified diff string
    */
   toString(diff: FileContentDiff): string {
-    const lines: string[] = [];
-
-    if (this.includeHeaders) {
-      lines.push(diff.header);
-      if (diff.indexLine) {
-        lines.push(diff.indexLine);
-      }
-    }
-
-    if (diff.isBinary) {
-      // git's wording: a/ and b/ prefixes, /dev/null for a side that does not exist
-      const e = diff.entry;
-      const oldName =
-        e.changeType === ChangeType.ADD || !e.oldPath ? "/dev/null" : `a/${e.oldPath}`;
-      const newName =
-        e.changeType === ChangeType.DELETE || !e.newPath ? "/dev/null" : `b/${e.newPath}`;
-      lines.push(`Binary files ${oldName} and ${newName} differ`);
-      return lines.join("\n");
-    }
-
-    if (this.includeHeaders && diff.hunks.length > 0) {
-      if (diff.oldFileHeader) {
-        lines.push(diff.oldFileHeader);
-      }
-      if (diff.newFileHeader) {
-        lines.push(diff.newFileHeader);
-      }
-    }
-
-    for (const hunk of diff.hunks) {
-      lines.push(this.formatHunkHeader(hunk));
-      lines.push(...hunk.lines);
-    }
-
-    return lines.join("\n");
+    const text = decoder.decode(diff.patch);
+    if (this.includeHeaders) return text;
+    const at = text.search(/^(@@ |Binary files )/m);
+    return at < 0 ? "" : text.slice(at);
   }
 
   /**
-   * Format all diff entries to a single string.
+   * Format all diff entries to a single string, as `git diff` prints them.
    *
    * @param entries Array of diff entries
    * @returns Complete unified diff output
    */
   async formatAll(entries: DiffEntry[]): Promise<string> {
     const parts: string[] = [];
-
-    for (const entry of entries) {
-      const diff = await this.format(entry);
-      parts.push(this.toString(diff));
-    }
-
-    return parts.join("\n");
+    for (const entry of entries) parts.push(this.toString(await this.format(entry)));
+    return parts.join("");
   }
 
   /**
-   * Build the diff header line.
+   * All diff entries as the bytes `git diff` prints (content that is not UTF-8 kept as it is).
    */
-  private buildHeader(entry: DiffEntry): string {
-    const oldPath = entry.oldPath ?? entry.newPath;
-    const newPath = entry.newPath ?? entry.oldPath;
-    return `diff --git a/${oldPath} b/${newPath}`;
-  }
-
-  /**
-   * Build the index line.
-   */
-  private buildIndexLine(entry: DiffEntry): string {
-    const oldId = this.abbreviateId(entry.oldId ?? "0000000");
-    const newId = this.abbreviateId(entry.newId ?? "0000000");
-    const mode = entry.newMode ?? entry.oldMode;
-    const modeStr = mode ? ` ${mode.toString(8)}` : "";
-    return `index ${oldId}..${newId}${modeStr}`;
-  }
-
-  /**
-   * Build the old file header line.
-   */
-  private buildOldFileHeader(entry: DiffEntry): string {
-    if (entry.changeType === ChangeType.ADD) {
-      return "--- /dev/null";
-    }
-    return `--- a/${entry.oldPath}`;
-  }
-
-  /**
-   * Build the new file header line.
-   */
-  private buildNewFileHeader(entry: DiffEntry): string {
-    if (entry.changeType === ChangeType.DELETE) {
-      return "+++ /dev/null";
-    }
-    return `+++ b/${entry.newPath}`;
-  }
-
-  /**
-   * Abbreviate an object ID.
-   */
-  private abbreviateId(id: string): string {
-    if (!this.abbreviateIds) {
-      return id;
-    }
-    return id.slice(0, this.abbreviationLength);
-  }
-
-  /**
-   * Format the hunk header.
-   */
-  private formatHunkHeader(hunk: DiffHunk): string {
-    return `@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`;
-  }
-
-  /**
-   * Format edits into hunks.
-   */
-  private formatEdits(oldText: RawText, newText: RawText, edits: EditList): DiffHunk[] {
-    const hunks: DiffHunk[] = [];
-
-    // Merge edits that are close together
-    const combinedEdits = this.combineEdits(edits, oldText.size(), newText.size());
-
-    for (const combinedEdit of combinedEdits) {
-      const hunk = this.createHunk(oldText, newText, combinedEdit.edits, combinedEdit.contextStart);
-      if (hunk.lines.length > 0) {
-        hunks.push(hunk);
-      }
-    }
-
-    return hunks;
-  }
-
-  /**
-   * Combine edits that are within context range of each other.
-   */
-  private combineEdits(
-    edits: EditList,
-    _oldSize: number,
-    _newSize: number,
-  ): { edits: EditList; contextStart: number }[] {
-    if (edits.length === 0) {
-      return [];
-    }
-
-    const result: { edits: EditList; contextStart: number }[] = [];
-    let currentEdits: EditList = [edits[0]];
-    let contextStart = Math.max(0, edits[0].beginA - this.contextLines);
-
-    for (let i = 1; i < edits.length; i++) {
-      const prevEdit = currentEdits[currentEdits.length - 1];
-      const nextEdit = edits[i];
-
-      // Check if edits are close enough to merge
-      const gap = nextEdit.beginA - prevEdit.endA;
-      if (gap <= this.contextLines * 2) {
-        // Merge into current group
-        currentEdits.push(nextEdit);
-      } else {
-        // Start new group
-        result.push({ edits: currentEdits, contextStart });
-        currentEdits = [nextEdit];
-        contextStart = Math.max(0, nextEdit.beginA - this.contextLines);
-      }
-    }
-
-    result.push({ edits: currentEdits, contextStart });
-    return result;
-  }
-
-  /**
-   * Create a hunk from a group of edits.
-   */
-  private createHunk(
-    oldText: RawText,
-    newText: RawText,
-    edits: EditList,
-    contextStart: number,
-  ): DiffHunk {
-    const lines: string[] = [];
-
-    const firstEdit = edits[0];
-    const lastEdit = edits[edits.length - 1];
-
-    // Calculate hunk bounds
-    const oldStart = contextStart;
-    const oldEnd = Math.min(oldText.size(), lastEdit.endA + this.contextLines);
-    const newStart = contextStart + (firstEdit.beginB - firstEdit.beginA);
-    const newEnd = Math.min(newText.size(), lastEdit.endB + this.contextLines);
-
-    let oldPos = oldStart;
-
-    for (const edit of edits) {
-      // Add context lines before this edit
-      while (oldPos < edit.beginA) {
-        lines.push(` ${oldText.getString(oldPos)}`);
-        oldPos++;
-      }
-
-      // Add deleted lines
-      for (let i = edit.beginA; i < edit.endA; i++) {
-        lines.push(`-${oldText.getString(i)}`);
-      }
-      oldPos = edit.endA;
-
-      // Add inserted lines
-      for (let i = edit.beginB; i < edit.endB; i++) {
-        lines.push(`+${newText.getString(i)}`);
-      }
-    }
-
-    // Add trailing context
-    while (oldPos < oldEnd) {
-      lines.push(` ${oldText.getString(oldPos)}`);
-      oldPos++;
-    }
-
-    return {
-      oldStart: oldStart + 1, // Convert to 1-based
-      oldCount: oldEnd - oldStart,
-      newStart: newStart + 1, // Convert to 1-based
-      newCount: newEnd - newStart,
-      lines,
-    };
+  async formatBytes(entries: DiffEntry[]): Promise<Uint8Array> {
+    const sink = new ByteSink();
+    for (const entry of entries) sink.push((await this.format(entry)).patch);
+    return sink.bytes();
   }
 }
