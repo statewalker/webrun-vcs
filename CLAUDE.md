@@ -110,6 +110,7 @@ git push                                        # MANDATORY
 - **Background maintenance in native git**: git 2.5x runs `git maintenance run --auto --detach` after `commit` and similar commands; the detached process changes `.git/objects` while a test copies or reads the repository (CI fails with ENOENT). Set `maintenance.auto=false` and `gc.auto=0` (e.g. `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, as `nativeGitEnv` in vcs-commands tests does)
 - **Merge-family twins**: `merge`/`cherry-pick`/`revert`/`rebase`/`pull` native tests build both twins with `buildHistory` (`tests/merge-native-scenarios.ts`) and compare `snapshot(..., normalizeState)` (`tests/merge-native-helpers.ts`); `normalizeState` evens out what 2.43 and 2.5x write differently in `rebase-merge/` (todo `# ` subjects, `message`). A refused `git merge` runs `restore_state` (reset --hard + `stash apply --index`), which leaves AUTO_MERGE and rewrites dirty files through smudge
 - **Gitea oracle**: `GITEA=1 pnpm --filter @statewalker/vcs-testing-gitea test` runs a real Gitea (test infra; Node APIs allowed in that package via a biome override)
+- **Funcname patterns**: `diff.<driver>.xfuncname`/`funcname` and the builtin driver patterns are POSIX regexes; run them through `compilePosixRegex` (vcs-utils `regex/`), never a JavaScript `RegExp` (different semantics, catastrophic backtracking)
 
 ## Self-Maintenance
 
