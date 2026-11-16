@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseIndexFile } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ResetMode } from "../src/index.js";
 import {
   git,
   gitOk,
@@ -235,5 +236,36 @@ describeGit("the index merge and cherry-pick leave, against native git", () => {
       .then((c) => c.call());
     expect(r.status).toBe("ok");
     expect(unreachable(ro)).toEqual(unreachable(rn));
+  });
+
+  // core.ignorecase on a filesystem that keeps case (Linux): a file and a directory whose
+  // names differ only in case are two paths, which native git checks out side by side; the
+  // case-variant guard of tree-restore applies only where the worktree folds case
+  it("with core.ignorecase on a case-keeping filesystem a file beside a directory in another case", async () => {
+    const history: History = {
+      base,
+      config: { "core.ignorecase": "true" },
+      main: { "b.txt": T("b1") },
+      side: { D: T("file D"), "E/k.txt": T("Ek") },
+    };
+    for (const op of ["merge", "cherry-pick"] as const) {
+      const { nd, od, native } = await run(history, op);
+      expect(native).toBe(0);
+      await expectSame(nd, od);
+    }
+    // a checkout and a reset --hard of the tree that holds both
+    for (const command of ["checkout", "reset"] as const) {
+      const cn = join(root, `c${n++}`);
+      const co = join(root, `c${n++}`);
+      for (const dir of [cn, co]) buildHistory(root, dir, history);
+      if (command === "checkout") {
+        gitOk(root, cn, "checkout", "-q", "side");
+        await (await openOurs(co)).checkout().setName("side").call();
+      } else {
+        gitOk(root, cn, "reset", "-q", "--hard", "side");
+        await (await openOurs(co)).reset().setRef("side").setMode(ResetMode.HARD).call();
+      }
+      expect(snapshot(root, co, normalizeState)).toEqual(snapshot(root, cn, normalizeState));
+    }
   });
 });

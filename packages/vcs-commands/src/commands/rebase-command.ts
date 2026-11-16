@@ -501,8 +501,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const item = todo[0];
       const rest = todo.slice(1);
       const line = await this.todoText([item]);
-      const done = (await state.read(`${DIR}/done`)) ?? "";
-      await state.write(`${DIR}/done`, `${done}${line}`);
+      // git's save_todo: the command appended to `done` (O_APPEND), the rest written
+      await state.append(`${DIR}/done`, line);
       await state.write(`${DIR}/git-rebase-todo`, await this.todoText(rest));
       doneCount++;
       await state.write(`${DIR}/msgnum`, `${doneCount}\n`);
@@ -808,8 +808,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   private async rewritten(state: OperationState, from: ObjectId, to: ObjectId): Promise<void> {
-    const list = (await state.read(`${DIR}/rewritten-list`)) ?? "";
-    await state.write(`${DIR}/rewritten-list`, `${list}${from} ${to}\n`);
+    // appended, as git's record_in_rewritten
+    await state.append(`${DIR}/rewritten-list`, `${from} ${to}\n`);
   }
 
   /** The branch rebased moves to `id` and HEAD is attached to it again. */

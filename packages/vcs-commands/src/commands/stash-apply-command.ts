@@ -22,7 +22,12 @@ import { conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import { type OrtConflict, ortMerge, ortResultEntries, readBlob } from "./ort-merge.js";
 import { STASH_REF } from "./stash-list-command.js";
-import { planTreeRestore, type TreeRestorePlan, writeTreeRestorePlan } from "./tree-restore.js";
+import {
+  planTreeRestore,
+  restoreCaseOptions,
+  type TreeRestorePlan,
+  writeTreeRestorePlan,
+} from "./tree-restore.js";
 import {
   type CheckedEntry,
   findInTheWay,
@@ -308,7 +313,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     const resultTree = await this.storeFlat(merge.result);
     const worktreePlan = await planTreeRestore(this.trees, this.blobs, resultTree, STASH_APPLY, {
       symlinks: true,
-      ignoreCase,
+      ...(await restoreCaseOptions(worktree, ignoreCase)),
       windows: worktree.capabilities?.windowsPaths === true,
       reservedNames: worktree.capabilities?.reservedNames,
     });
@@ -718,7 +723,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
 
     const plan = await planTreeRestore(this.trees, this.blobs, untrackedCommit.tree, STASH_APPLY, {
       symlinks: true,
-      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
       windows: worktree.capabilities?.windowsPaths === true,
       reservedNames: worktree.capabilities?.reservedNames,
     });

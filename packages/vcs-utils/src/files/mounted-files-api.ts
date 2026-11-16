@@ -11,6 +11,7 @@
 import { mergeInPathOrder } from "@statewalker/webrun-files";
 
 import { BeyondSymlinkError } from "./beyond-symlink-error.js";
+import { appendByRewrite } from "./file-utils.js";
 import type {
   FileInfo,
   FileStats,
@@ -101,6 +102,15 @@ class RoutedFilesApi implements PosixFilesApi {
     if (await r.files.exists(r.path)) return false;
     await r.files.write(r.path, content);
     return true;
+  }
+
+  /** The mounted FilesApi's own append where it has one, else a rewrite. */
+  async append(path: string, content: Content): Promise<void> {
+    const r = this.at(path);
+    const append = r.files.append
+      ? r.files.append(r.path, content)
+      : appendByRewrite(r.files, r.path, content);
+    await append.catch((e) => this.outerError(e, r, path));
   }
 
   async mkdir(path: string): Promise<void> {

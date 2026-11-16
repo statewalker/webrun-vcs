@@ -165,6 +165,36 @@ export class FileWorktree implements Worktree {
     return probeCaseFolding(this.files, this.gitDir);
   }
 
+  /**
+   * Whether the storage folds case, seen without writing anything: the git directory (else
+   * an entry of the worktree's root with a letter in its name) looked up in another case.
+   * Undefined when there is no such entry to look at.
+   */
+  async foldsCase(): Promise<boolean | undefined> {
+    const swapCase = (name: string) =>
+      [...name].map((c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase())).join("");
+    const kind = (path: string) => this.kindOf(path).catch(() => undefined);
+    const candidates: string[] = [];
+    if (this.gitDir !== undefined) candidates.push(this.gitDir);
+    try {
+      let seen = 0;
+      for await (const info of this.rootFiles.list(this.rootPath)) {
+        candidates.push(info.path);
+        if (++seen >= 16) break;
+      }
+    } catch {
+      // no root to list
+    }
+    for (const path of candidates) {
+      const slash = path.lastIndexOf("/");
+      const name = path.slice(slash + 1);
+      const other = swapCase(name);
+      if (other === name || !(await kind(path))) continue;
+      return (await kind(`${path.slice(0, slash + 1)}${other}`)) !== undefined;
+    }
+    return undefined;
+  }
+
   /** The FilesApi operations go through: the batch view while a batch runs. */
   private get files(): WorktreeFilesApi {
     return this.scoped ?? this.rootFiles;

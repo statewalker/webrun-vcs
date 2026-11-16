@@ -20,6 +20,7 @@ import { join } from "node:path";
 
 import { type Blobs, createInMemoryFilesApi, FileMode, type Trees } from "@statewalker/vcs-core";
 import { createFileWorktree, probeCaseFolding } from "@statewalker/vcs-store-files";
+import { createSymlinkFilesApi } from "@statewalker/vcs-utils/files";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { createNodeFilesApi, PosixNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import type { Worktree } from "@statewalker/vcs-working-tree";
@@ -258,6 +259,21 @@ describe("FileWorktree beneath links, special files, umask, case folding", () =>
       "/.git",
     );
     expect(folding).toEqual({ ignoreCase: true, precomposeUnicode: true });
+  });
+
+  it("tells whether the worktree folds case without writing, or that it cannot tell", async () => {
+    const real = await worktree.foldsCase?.();
+    expect(real).toBe(existsSync(join(root, ".GIT")));
+    expect(readdirSync(join(root, ".git"))).toEqual(["config"]);
+    const at = (files: Parameters<typeof createFileWorktree>[0]["files"]) =>
+      createFileWorktree({ files, rootPath: "/", gitDir: "/.git", ...noStores }).foldsCase?.();
+    // memory keeps case; an empty worktree gives nothing to tell by
+    expect(await at(createInMemoryFilesApi({ "/.git/config": "x" }))).toBe(false);
+    expect(await at(createInMemoryFilesApi())).toBeUndefined();
+    const folding = createSymlinkFilesApi(createInMemoryFilesApi({ "/README": "x" }), {
+      ignoreCase: true,
+    });
+    expect(await at(folding)).toBe(true);
   });
 });
 

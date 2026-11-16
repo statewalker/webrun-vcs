@@ -58,6 +58,15 @@ export interface GitCheckoutFilesApi
    */
   removeDir?(path: string): Promise<void>;
   /**
+   * Create a file only if nothing is there (a FilesApi's `createExclusive`): with `remove`,
+   * how a state file is written in place, as git's `fopen(..., "w")`
+   */
+  createExclusive?(path: string, content: Iterable<Uint8Array>): Promise<boolean>;
+  /**
+   * Append to a file, creating it (a FilesApi's `append`: O_APPEND, never a rewrite)
+   */
+  append?(path: string, content: Iterable<Uint8Array>): Promise<void>;
+  /**
    * The entries of a directory (a FilesApi's `list`: names, or info objects with a name)
    */
   list?(path: string): AsyncIterable<string | { name: string }>;
@@ -93,6 +102,11 @@ export class GitCheckout implements Checkout {
   private readonly files: GitCheckoutFilesApi;
   private readonly gitDir: string;
   private initialized = false;
+  /**
+   * Appends to a file under the git directory in place (O_APPEND); only when the files
+   * can append (a caller without it writes the whole file).
+   */
+  readonly appendStateFile?: (name: string, content: Uint8Array | string) => Promise<void>;
 
   constructor(options: GitCheckoutOptions) {
     this.staging = options.staging;
@@ -101,6 +115,13 @@ export class GitCheckout implements Checkout {
     this.gitDir = options.gitDir;
     this.stash = options.stash;
     this.config = options.config;
+    const append = options.files.append?.bind(options.files);
+    if (append) {
+      this.appendStateFile = async (name, content) => {
+        const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+        await append(`${this.gitDir}/${name}`, [bytes]);
+      };
+    }
   }
 
   // ========== HEAD Management ==========
@@ -366,12 +387,30 @@ export class GitCheckout implements Checkout {
     }
   }
 
-  /** Writes a file under the git directory in place, as git writes its state files. */
+  /**
+   * Writes a file under the git directory in place, as git writes its state files: the old
+   * file removed and the new one created holding the content, where the files can create
+   * exclusively (no temporary renamed over it). Else a write, its directory made only when
+   * the write cannot do it (a FilesApi's `write` creates it).
+   */
   async writeStateFile(name: string, content: Uint8Array | string): Promise<void> {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+    const path = `${this.gitDir}/${name}`;
+    if (this.files.createExclusive && this.files.remove) {
+      const stats = await this.files.stats(path).catch(() => undefined);
+      if (!stats?.isDirectory) {
+        if (stats) await this.files.remove(path);
+        if (await this.files.createExclusive(path, [bytes]).catch(() => false)) return;
+      }
+    }
     const slash = name.lastIndexOf("/");
-    if (slash > 0) await this.mkdir(`${this.gitDir}/${name.slice(0, slash)}`);
-    await this.files.write(`${this.gitDir}/${name}`, [bytes]);
+    try {
+      await this.files.write(path, [bytes]);
+    } catch (error) {
+      if (slash <= 0) throw error;
+      await this.mkdir(`${this.gitDir}/${name.slice(0, slash)}`);
+      await this.files.write(path, [bytes]);
+    }
   }
 
   /** Removes a file or directory (recursively) under the git directory. */

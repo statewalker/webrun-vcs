@@ -104,6 +104,9 @@ export async function openOurs(dir: string): Promise<Git> {
     },
     mkdir: (p: string) => files.mkdir(p),
     list: (p: string) => files.list(p),
+    // state files written in place and appended to, as git writes them
+    createExclusive: files.createExclusive?.bind(files),
+    append: files.append?.bind(files),
   } as unknown as GitCheckoutFilesApi;
   const checkout = new GitCheckout({
     staging,

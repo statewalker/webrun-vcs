@@ -17,7 +17,7 @@
  * own, rooted at the link's target, which the caller opts into.
  */
 
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, lstatSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -187,7 +187,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
           continue;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          stat = await fs.lstat(current);
+          stat = lstatQuiet(current, false) as import("node:fs").Stats;
         }
       }
       if (stat.isSymbolicLink()) {
@@ -324,6 +324,41 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
         await handle.close().catch(() => {});
         await fs.unlink(real).catch(() => {});
       }
+    }
+  }
+
+  /**
+   * `open(O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW)` and a write: the file grows in place
+   * (a link at the path is refused, never written through), parents created as `write`
+   * creates them. EISDIR for a directory.
+   */
+  async append(path: string, content: Content): Promise<void> {
+    return this.appendImpl(path, content).catch((e) => this.forgetOn(e));
+  }
+
+  private async appendImpl(path: string, content: Content): Promise<void> {
+    const real = await this.realNoLinks(path);
+    if (real === this.root) {
+      throw Object.assign(new Error(`EISDIR: cannot append to the root directory: ${path}`), {
+        code: "EISDIR",
+      });
+    }
+    const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | O_NOFOLLOW;
+    let handle: fs.FileHandle;
+    try {
+      handle = await fs.open(real, flags, 0o666);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // a missing directory: created (never through a link), then once more
+      this.verified?.clear();
+      await this.realNoLinks(path);
+      await this.mkdirs(nodePath.dirname(real), path);
+      handle = await fs.open(real, flags, 0o666);
+    }
+    try {
+      await writeBatched(handle, content);
+    } finally {
+      await handle.close();
     }
   }
 
@@ -573,22 +608,30 @@ function nsToMs(ns: bigint): number {
   return Number(ns / 1_000_000n) + Number(ns % 1_000_000n) / 1e6;
 }
 
-/** `lstat` with exact times (nanoseconds) and full device/inode numbers. */
+/**
+ * `lstat` with exact times (nanoseconds) and full device/inode numbers.
+ *
+ * The lstats here are synchronous, as git's are: an lstat is a short metadata call, and the
+ * round trip of an async one through libuv's thread pool costs some 25 times the call
+ * itself (every operation checks each leading directory of its path with one).
+ */
 async function bigintLstatOrUndefined(
   real: string,
 ): Promise<import("node:fs").BigIntStats | undefined> {
-  try {
-    return await fs.lstat(real, { bigint: true });
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
-    throw error;
-  }
+  return lstatQuiet(real, true) as import("node:fs").BigIntStats | undefined;
 }
 
+/** `lstat` (synchronous, see {@link bigintLstatOrUndefined}); nothing for a missing path. */
 async function lstatOrUndefined(real: string): Promise<import("node:fs").Stats | undefined> {
+  return lstatQuiet(real, false) as import("node:fs").Stats | undefined;
+}
+
+function lstatQuiet(
+  real: string,
+  bigint: boolean,
+): import("node:fs").Stats | import("node:fs").BigIntStats | undefined {
   try {
-    return await fs.lstat(real);
+    return lstatSync(real, { bigint, throwIfNoEntry: false });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return undefined;

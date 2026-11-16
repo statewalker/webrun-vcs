@@ -58,6 +58,20 @@ createGitObjectsTests("Files (in memory)", async () => {
         }
       })(),
     );
+  // and its exclusive create, which writes a temporary object holding its content
+  const createExclusive = files.createExclusive?.bind(files);
+  if (createExclusive) {
+    files.createExclusive = (path, content) =>
+      createExclusive(
+        path,
+        (async function* () {
+          for await (const c of content) {
+            persisted += c.length;
+            yield c;
+          }
+        })(),
+      );
+  }
   const store = filesStagingStore(files, "/repo/.git/objects");
   return { objects: createGitObjects(store), store, persistedBytes: () => persisted };
 });
@@ -88,6 +102,20 @@ createGitObjectsTests("Files (Node, streaming write)", async () => {
         }
       })(),
     );
+  // the exclusive create of a temporary object streams the same way (writeBatched)
+  const createExclusive = files.createExclusive?.bind(files);
+  if (createExclusive) {
+    files.createExclusive = (path, content) =>
+      createExclusive(
+        path,
+        (async function* () {
+          for await (const c of content) {
+            persisted += c.length;
+            yield c;
+          }
+        })(),
+      );
+  }
   const store = filesStagingStore(files, ".git/objects");
   return { objects: createGitObjects(store), store, persistedBytes: () => persisted };
 });

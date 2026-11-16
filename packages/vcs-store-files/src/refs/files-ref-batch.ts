@@ -278,11 +278,28 @@ export function createFilesRefOps(
     return { id: m[1] as string };
   }
   const readPacked = async () => parsePacked(await readText(PACKED));
+  type ReadLoose = (name: string) => Promise<Loose | undefined>;
+  /**
+   * `readLoose` reading each file once: for one look at the refs (a plan, or the checks
+   * made under the locks, where the locked refs cannot change), not across them.
+   */
+  const onceEach = (): ReadLoose => {
+    const seen = new Map<string, Promise<Loose | undefined>>();
+    return (name) => {
+      let value = seen.get(name);
+      if (!value) {
+        value = readLoose(name);
+        seen.set(name, value);
+      }
+      return value;
+    };
+  };
   async function readRef(
     name: string,
     packed: Map<string, PackedEntry>,
+    read: ReadLoose = readLoose,
   ): Promise<Ref | SymbolicRef | undefined> {
-    const loose = await readLoose(name);
+    const loose = await read(name);
     if (loose && "target" in loose) {
       return { name, target: loose.target, storage: RefStorage.LOOSE };
     }
@@ -290,10 +307,10 @@ export function createFilesRefOps(
     const e = packed.get(name);
     return e ? { name, objectId: e.id, storage: RefStorage.PACKED, peeled: false } : undefined;
   }
-  async function deref(name: string): Promise<string> {
+  async function deref(name: string, read: ReadLoose = readLoose): Promise<string> {
     let current = name;
     for (let i = 0; i < MAX_SYMREF_READS; i++) {
-      const v = await readLoose(current);
+      const v = await read(current);
       if (!v || !("target" in v)) return current;
       current = v.target;
     }
@@ -414,8 +431,14 @@ export function createFilesRefOps(
     const append = async (name: string, line: Uint8Array, force = false) => {
       const path = `logs/${name}`;
       if (!force && !autocreateReflog(name) && !(await files.exists(path))) return;
-      await files.removeEmptyDir(path);
-      await files.append(path, line);
+      try {
+        await files.append(path, line);
+      } catch (error) {
+        // an empty directory where the log goes is removed, as git's log_ref_setup does
+        if ((error as { code?: string })?.code !== "EISDIR") throw error;
+        await files.removeEmptyDir(path);
+        await files.append(path, line);
+      }
     };
     for (const u of updates) {
       try {
@@ -453,12 +476,13 @@ export function createFilesRefOps(
     updates: Update[],
     packed: Map<string, PackedEntry>,
     mine: Set<string>,
+    read: ReadLoose = readLoose,
   ): Promise<RefRejection[]> {
     const plan = await planRefBatch(
       updates.map((u) => ({ name: u.name, new: u.newValue, noDeref: true })),
       {
         read: async (n) =>
-          (await readRef(n, packed)) ??
+          (await readRef(n, packed, read)) ??
           (!mine.has(n) && (await files.exists(`${n}.lock`))
             ? { name: n, objectId: ZERO_ID, storage: RefStorage.LOOSE, peeled: false }
             : undefined),
@@ -480,10 +504,13 @@ export function createFilesRefOps(
    * planned. A name that became a symbolic ref meanwhile (say HEAD re-attached by
    * a checkout) now dereferences elsewhere, and is refused unless noDeref is set.
    */
-  async function sameTargets(updates: Update[]): Promise<RefRejection[]> {
+  async function sameTargets(
+    updates: Update[],
+    read: ReadLoose = readLoose,
+  ): Promise<RefRejection[]> {
     const out: RefRejection[] = [];
     for (const u of updates) {
-      if (!u.noDeref && (await deref(u.requested)) !== u.name) {
+      if (!u.noDeref && (await deref(u.requested, read)) !== u.name) {
         out.push({ name: u.requested, reason: "mismatch" });
       }
     }
@@ -509,12 +536,14 @@ export function createFilesRefOps(
         }
         held.push(n);
       }
-      const moved = await sameTargets([u]);
+      // every loose ref read once under the locks: those held cannot change meanwhile
+      const read = onceEach();
+      const moved = await sameTargets([u], read);
       if (moved.length) return fail(moved);
       const packed = await readPacked();
-      const df = await conflicts([u], packed, new Set(held));
+      const df = await conflicts([u], packed, new Set(held), read);
       if (df.length) return fail(df);
-      const cur = await readRef(u.name, packed);
+      const cur = await readRef(u.name, packed, read);
       // With noDeref on a symbolic ref, `old` (and the log line) use the value it resolves to, as git.
       const curId =
         cur && "target" in cur ? await resolveId(u.name) : cur ? cur.objectId : undefined;
@@ -577,15 +606,16 @@ export function createFilesRefOps(
         return fail([{ name: PACKED, reason: "locked" }]);
       }
       packedHeld = true;
-      const moved = await sameTargets(updates);
+      const read = onceEach();
+      const moved = await sameTargets(updates, read);
       if (moved.length) return fail(moved);
       const packed = await readPacked();
-      const df = await conflicts(updates, packed, new Set(held));
+      const df = await conflicts(updates, packed, new Set(held), read);
       if (df.length) return fail(df);
       const loose = new Map<string, string>();
       const current = new Map<string, string | undefined>();
       for (const u of updates) {
-        const l = await readLoose(u.name);
+        const l = await read(u.name);
         if (l && "target" in l) throw new Error(`${u.name} became a symbolic ref`);
         if (l) loose.set(u.name, l.id);
         current.set(u.name, l?.id ?? packed.get(u.name)?.id);
@@ -705,8 +735,9 @@ export function createFilesRefOps(
     if (commands.length === 0) return { ok: true, rejected: [] };
     // Plan without locks: names, policy, D/F conflicts and old values (all re-checked under the locks).
     const packed = await readPacked();
+    const read = onceEach();
     const plan = await planRefBatch(commands, {
-      read: (name) => readRef(name, packed),
+      read: (name) => readRef(name, packed, read),
       hasChildren: async (name) => {
         for (const k of packed.keys()) if (k.startsWith(`${name}/`)) return true;
         for await (const p of files.list(name)) if (!p.endsWith(".lock")) return true;

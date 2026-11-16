@@ -66,17 +66,27 @@ describe("index.lock", () => {
     const files = createInMemoryFilesApi();
     const before = await stagedIndex(files);
 
-    // a FilesApi whose writes of the lock file fail after the first chunk
+    // a FilesApi whose writes of the lock file fail after the first chunk (the lock is
+    // created holding the index: its exclusive create fails, as a full disk fails it)
     const failing = Object.create(files) as FilesApi;
+    async function* broken(content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>) {
+      for await (const c of content) {
+        yield c;
+        throw new Error("disk full");
+      }
+    }
     failing.write = async (path, content) => {
       if (!path.endsWith(".lock")) return files.write(path, content);
-      async function* broken() {
-        for await (const c of content) {
-          yield c;
-          throw new Error("disk full");
-        }
-      }
-      return files.write(path, broken());
+      return files.write(path, broken(content));
+    };
+    failing.createExclusive = async (path, content) => {
+      if (!path.endsWith(".lock")) return (await files.createExclusive?.(path, content)) ?? false;
+      if (await files.exists(path)) return false;
+      await files.write(path, broken(content)).catch(async (error) => {
+        await files.remove(path); // a failed exclusive create leaves nothing behind
+        throw error;
+      });
+      return true;
     };
     const staging = createGitStaging(failing, ".git/index");
     await staging.read();
@@ -307,10 +317,13 @@ describe("index.lock through FilesApi.createExclusive", () => {
       try {
         if (await base.exists(path)) return false;
         await base.write(path, content);
-        return true;
       } finally {
         reserved.delete(key);
       }
+      // a slow disk: the lock exists a while before its writer goes on, so a second writer
+      // arriving meanwhile finds it held
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return true;
     };
     const files = new Proxy(base, {
       get(target, prop) {

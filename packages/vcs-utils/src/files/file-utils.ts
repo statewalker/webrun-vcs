@@ -107,3 +107,29 @@ export async function readRange(
 ): Promise<Uint8Array> {
   return readBlock(files.read(path, { start: position, length }), length);
 }
+
+/**
+ * `append` over a FilesApi that has none: the file read and written again with the content
+ * after it (created when missing). Its cost grows with the file, unlike a real append; for
+ * FilesApis whose `write` is cheap (memory) or that cannot append in place. Fails with
+ * `code` "EISDIR" when a directory is at `path`.
+ *
+ * @example
+ * ```typescript
+ * await (files.append?.(path, [line]) ?? appendByRewrite(files, path, [line]));
+ * ```
+ */
+export async function appendByRewrite(
+  files: FilesApi,
+  path: string,
+  content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+): Promise<void> {
+  const kind = (await files.stats(path))?.kind;
+  if (kind === "directory") {
+    throw Object.assign(new Error(`EISDIR: ${path} is a directory`), { code: "EISDIR" });
+  }
+  const chunks: Uint8Array[] = [];
+  if (kind === "file") for await (const chunk of files.read(path)) chunks.push(chunk);
+  for await (const chunk of content) chunks.push(chunk);
+  await files.write(path, chunks);
+}

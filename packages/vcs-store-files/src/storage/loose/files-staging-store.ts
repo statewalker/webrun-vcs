@@ -85,11 +85,16 @@ export function filesStagingStore(
 
   return {
     async putStaged(bytes, idOf) {
-      await ensureDir(objectsDir);
+      // The fewest operations: the temporary created with its content in one step (an
+      // exclusive create where the FilesApi has one, which also creates `objects/`), the
+      // target looked at once, then one rename (whose FilesApi creates the fan-out
+      // directory; else it is made and the rename tried again).
       const tmp = joinPath(objectsDir, tmpName());
       let id: string;
       try {
-        await files.write(tmp, bytes);
+        if (!files.createExclusive || !(await files.createExclusive(tmp, bytes))) {
+          await files.write(tmp, bytes);
+        }
         id = await idOf();
       } catch (e) {
         await files.remove(tmp).catch(() => false);
@@ -109,6 +114,8 @@ export function filesStagingStore(
           moved = await moveCompleting(files, tmp, target);
           return { id, stored: moved };
         }
+        moved = await moveCompleting(files, tmp, target).catch(() => false);
+        if (moved) return { id, stored: true };
         await ensureDir(joinPath(objectsDir, id.slice(0, 2)));
         moved = await moveCompleting(files, tmp, target);
         if (moved) return { id, stored: true };

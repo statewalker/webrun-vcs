@@ -472,6 +472,14 @@ export class FileStagingStore implements Staging {
     this._entries = newEntries;
   }
 
+  /**
+   * @internal - Used by the builder: entries it was given back as they are count as set in
+   * this session (as the copies it makes of other options do), not as read.
+   */
+  _forgetAsRead(entries: readonly StagingEntry[]): void {
+    for (const entry of entries) this.asRead.delete(entry);
+  }
+
   /** @internal - Used by builder/editor */
   _getEntries(): StagingEntry[] {
     return this._entries;
@@ -494,10 +502,24 @@ export class FileStagingStore implements Staging {
 class FileStagingBuilder implements IndexBuilder {
   private _entries: StagingEntry[] = [];
   private keeping: Array<{ start: number; count: number }> = [];
+  /** The store's own entries given back to `add` unchanged (an index rewritten around a few paths) */
+  private reused: StagingEntry[] = [];
+  /** Where the next entry given back is looked for in the store's entries */
+  private cursor = 0;
 
   constructor(private readonly store: FileStagingStore) {}
 
   add(options: StagingEntryOptions): void {
+    // one of the store's entries (they are never changed in place) is taken as it is: no
+    // copy to make and encode again; looked for just after the last one taken
+    const existing = this.store._getEntries();
+    for (let k = this.cursor; k < Math.min(existing.length, this.cursor + 16); k++) {
+      if (existing[k] !== options) continue;
+      this.cursor = k + 1;
+      this._entries.push(existing[k]);
+      this.reused.push(existing[k]);
+      return;
+    }
     const entry: StagingEntry = {
       path: options.path,
       mode: options.mode,
@@ -566,12 +588,17 @@ class FileStagingBuilder implements IndexBuilder {
       }
     }
 
-    // Sort entries by (path, stage)
-    this._entries.sort((a, b) => {
+    // Sort entries by (path, stage), unless given in that order (one pass to tell)
+    const order = (a: StagingEntry, b: StagingEntry) => {
       const pathCmp = comparePaths(a.path, b.path);
       if (pathCmp !== 0) return pathCmp;
       return a.stage - b.stage;
-    });
+    };
+    let sorted = true;
+    for (let i = 1; i < this._entries.length && sorted; i++) {
+      sorted = order(this._entries[i - 1], this._entries[i]) <= 0;
+    }
+    if (!sorted) this._entries.sort(order);
 
     // Check for duplicates
     for (let i = 1; i < this._entries.length; i++) {
@@ -587,6 +614,7 @@ class FileStagingBuilder implements IndexBuilder {
 
     // Replace store entries
     this.store._replaceEntries(this._entries);
+    this.store._forgetAsRead(this.reused);
   }
 
   private validateStages(): void {

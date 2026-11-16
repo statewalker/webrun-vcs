@@ -73,8 +73,8 @@ describe("GitStaging writes an index native git reads", () => {
     await staging.read();
     await staging.write();
 
-    // streamed in several chunks, not one buffer, into the lock file
-    expect(chunks.get(".git/index.lock")).toBeGreaterThan(2);
+    // the lock created holding the whole index (one exclusive create), never rewritten
+    expect(chunks.has(".git/index.lock")).toBe(false);
     // the entries did not change, so git's own TREE extension is kept as it was
     const ours = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
     expect(ours.entries).toHaveLength(2001);
@@ -84,11 +84,11 @@ describe("GitStaging writes an index native git reads", () => {
     git(dir, ["fsck", "--strict"]);
   });
 
-  it("streams a small index too, header to checksum", async () => {
+  it("writes a small index too, header to checksum, in its lock's exclusive create", async () => {
     const { files, chunks } = countingWrites(createInMemoryFilesApi());
     const staging = createGitStaging(files, "index");
     await staging.write();
-    expect(chunks.get("index.lock")).toBeGreaterThanOrEqual(2);
+    expect(chunks.has("index.lock")).toBe(false);
     const empty = await parseIndexFile(await collect(files, "index"));
     expect(empty.entries).toEqual([]);
   });

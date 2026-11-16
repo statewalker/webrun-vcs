@@ -35,6 +35,7 @@ import type { OrtConflict } from "./ort-merge.js";
 import {
   planFlatRestore,
   planTreeRestore,
+  restoreCaseOptions,
   type TreeRestorePlan,
   writeTreeRestorePlan,
 } from "./tree-restore.js";
@@ -416,8 +417,8 @@ export class FlatTreeCache {
 /**
  * The restore plan of the paths in `writing`, taken from the flat `target` (the tree
  * `targetTree`): each path validated and its blob checked as {@link planTreeRestore} does,
- * without walking the whole tree. With `core.ignorecase` the whole tree is planned (case
- * collisions are found across it).
+ * without walking the whole tree. With `core.ignorecase` on a worktree that folds case (or
+ * cannot tell) the whole tree is planned (case collisions are found across it).
  */
 export async function planPathsRestore(
   ctx: MergeWriteContext,
@@ -432,11 +433,15 @@ export async function planPathsRestore(
     windows: worktree?.capabilities?.windowsPaths === true,
     reservedNames: worktree?.capabilities?.reservedNames,
   };
-  if (coreBool(ctx.workingCopy, "ignorecase", false)) {
+  const caseOptions = await restoreCaseOptions(
+    worktree,
+    coreBool(ctx.workingCopy, "ignorecase", false),
+  );
+  if (caseOptions.ignoreCase && caseOptions.foldsCase !== false) {
     const tree = targetTree ?? (await storeFlatTree(ctx.trees, target));
     const plan = await planTreeRestore(ctx.trees, ctx.blobs, tree, operation, {
       ...options,
-      ignoreCase: true,
+      ...caseOptions,
       writing,
     });
     return {
@@ -596,6 +601,15 @@ export class OperationState {
 
   async write(name: string, content: string | Uint8Array): Promise<void> {
     await this.checkout.writeStateFile?.(name, content);
+  }
+
+  /** Appends to a state file (O_APPEND where the checkout can; else a rewrite). */
+  async append(name: string, content: string): Promise<void> {
+    if (this.checkout.appendStateFile) {
+      await this.checkout.appendStateFile(name, content);
+      return;
+    }
+    await this.write(name, `${(await this.read(name)) ?? ""}${content}`);
   }
 
   async remove(...names: string[]): Promise<void> {

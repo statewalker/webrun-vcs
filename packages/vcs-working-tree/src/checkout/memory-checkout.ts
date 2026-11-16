@@ -204,6 +204,15 @@ export class MemoryCheckout implements Checkout {
     );
   }
 
+  async appendStateFile(name: string, content: Uint8Array | string): Promise<void> {
+    const add = typeof content === "string" ? new TextEncoder().encode(content) : content;
+    const old = this.stateFiles.get(name) ?? new Uint8Array(0);
+    const both = new Uint8Array(old.length + add.length);
+    both.set(old);
+    both.set(add, old.length);
+    this.stateFiles.set(name, both);
+  }
+
   async removeStateFile(name: string): Promise<void> {
     for (const key of [...this.stateFiles.keys()]) {
       if (key === name || key.startsWith(`${name}/`)) this.stateFiles.delete(key);

@@ -32,7 +32,7 @@ import {
   type ResolveUndoRecord,
 } from "./index-extensions.js";
 import {
-  encodeIndexFile,
+  encodeIndexFileBytes,
   INDEX_VERSION_2,
   type IndexExtension,
   type IndexVersion,
@@ -154,33 +154,30 @@ export async function writeIndexFile(
   options: IndexWriteOptions = {},
 ): Promise<string> {
   // validates every path and object id now, before the lock exists
-  const content = encodeIndexFile(entries, options.version ?? INDEX_VERSION_2, options.extensions);
+  const { bytes: content, checksum } = await encodeIndexFileBytes(
+    entries,
+    options.version ?? INDEX_VERSION_2,
+    options.extensions,
+  );
+  // the lock is created holding the new index: one exclusive create, then one rename
   const lockPath = `${indexPath}.lock`;
   const atomic = atomicFilesOver(files, "");
   const deadline = Date.now() + (options.lockTimeoutMs ?? 0);
-  while (!(await atomic.createExclusive(lockPath, new Uint8Array(0)))) {
+  while (!(await atomic.createExclusive(lockPath, content))) {
     if (Date.now() >= deadline) throw new IndexLockedError(lockPath);
     await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
-  }
-  let last: Uint8Array | undefined;
-  function* tracked(): Generator<Uint8Array> {
-    for (const chunk of content) {
-      last = chunk; // the last chunk is the checksum
-      yield chunk;
-    }
   }
   try {
     if (options.expectedChecksum !== undefined) {
       const current = await readIndexChecksum(files, indexPath);
       if (current !== options.expectedChecksum) throw new IndexChangedError(indexPath);
     }
-    await files.write(lockPath, tracked());
     await atomic.replace(lockPath, indexPath);
   } catch (error) {
     await atomic.remove(lockPath).catch(() => {});
     throw error;
   }
-  return last ? bytesToHex(last) : "";
+  return bytesToHex(checksum);
 }
 
 /**

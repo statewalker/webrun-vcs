@@ -257,3 +257,42 @@ describe("createSymlinkFilesApi table writes", () => {
     );
   });
 });
+
+describe("append", () => {
+  const text = async (files: { read(p: string): AsyncIterable<Uint8Array> }, path: string) => {
+    let out = "";
+    for await (const chunk of files.read(path)) out += new TextDecoder().decode(chunk);
+    return out;
+  };
+
+  it("appends in memory, through links' side table and through mounts", async () => {
+    const mem = createInMemoryFilesApi();
+    const inner = createInMemoryFilesApi();
+    const links = createSymlinkFilesApi(createInMemoryFilesApi());
+    const mounted = createMountedFilesApi(createInMemoryFilesApi(), { "/m": inner });
+    for (const [files, path] of [
+      [mem, "/d/log"],
+      [links, "/d/log"],
+      [mounted, "/m/d/log"],
+    ] as const) {
+      await files.append?.(path, [enc.encode("a\n")]);
+      await files.append?.(path, [enc.encode("b\n"), enc.encode("c\n")]);
+      expect(await text(files, path)).toBe("a\nb\nc\n");
+      await files.mkdir("/dir");
+      await expect(files.append?.("/dir", [enc.encode("x")])).rejects.toMatchObject({
+        code: "EISDIR",
+      });
+    }
+    expect(await text(inner, "/d/log")).toBe("a\nb\nc\n");
+  });
+
+  it("refuses to append through a simulated link", async () => {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    await files.write("/t", [enc.encode("target")]);
+    await files.symlink?.(enc.encode("t"), "/ln");
+    await expect(files.append?.("/ln", [enc.encode("x")])).rejects.toMatchObject({
+      code: "ELOOP",
+    });
+    expect(await text(files, "/t")).toBe("target");
+  });
+});

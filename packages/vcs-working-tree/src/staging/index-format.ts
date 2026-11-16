@@ -353,6 +353,67 @@ export function encodeIndexFile(
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
 ): Iterable<Uint8Array> {
+  const sortedEntries = checkedSorted(entries, extensions);
+  return encodeSorted(sortedEntries, writtenVersion(sortedEntries, version), extensions);
+}
+
+/**
+ * The index file's bytes as one buffer, the checksum hashed by Web Crypto where the runtime
+ * has it (the bytes `encodeIndexFile` yields, joined). For a write of the whole file at once
+ * (an index lock created holding it): a large index is copied once and hashed natively.
+ *
+ * @example
+ * ```typescript
+ * const { bytes, checksum } = await encodeIndexFileBytes(entries);
+ * ```
+ *
+ * @throws as `encodeIndexFile`, before anything is encoded
+ */
+export async function encodeIndexFileBytes(
+  entries: readonly StagingEntry[],
+  version: IndexVersion = INDEX_VERSION_2,
+  extensions: readonly IndexExtension[] = [],
+): Promise<{ bytes: Uint8Array; checksum: Uint8Array }> {
+  const sortedEntries = checkedSorted(entries, extensions);
+  const written = writtenVersion(sortedEntries, version);
+  if (written === INDEX_VERSION_4) {
+    const bytes = concatBytes([...encodeSorted(sortedEntries, written, extensions)]);
+    return { bytes, checksum: bytes.subarray(bytes.length - 20) };
+  }
+  const parts: Uint8Array[] = [];
+  let size = HEADER_SIZE;
+  for (const entry of sortedEntries) {
+    const bytes = serializeEntry(entry, written, "");
+    parts.push(bytes);
+    size += bytes.length;
+  }
+  for (const ext of extensions) size += 8 + ext.data.length;
+  const out = new Uint8Array(size + 20);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, INDEX_SIGNATURE);
+  view.setUint32(4, written);
+  view.setUint32(8, sortedEntries.length);
+  let at = HEADER_SIZE;
+  for (const bytes of parts) {
+    out.set(bytes, at);
+    at += bytes.length;
+  }
+  for (const ext of extensions) {
+    for (let i = 0; i < 4; i++) out[at + i] = ext.signature.charCodeAt(i);
+    view.setUint32(at + 4, ext.data.length);
+    out.set(ext.data, at + 8);
+    at += 8 + ext.data.length;
+  }
+  const checksum = await sha1(out.subarray(0, size));
+  out.set(checksum, size);
+  return { bytes: out, checksum };
+}
+
+/** The entries checked (paths, ids, extension names) and in the index's order. */
+function checkedSorted(
+  entries: readonly StagingEntry[],
+  extensions: readonly IndexExtension[],
+): StagingEntry[] {
   for (const entry of entries) {
     // an entry encoded before was checked then (entries are never changed in place)
     if (encodedEntries.has(entry)) continue;
@@ -364,12 +425,17 @@ export function encodeIndexFile(
       throw new Error(`Invalid index extension signature: ${JSON.stringify(ext.signature)}`);
     }
   }
-  const sortedEntries = [...entries].sort((a, b) => {
+  const order = (a: StagingEntry, b: StagingEntry) => {
     const pathCmp = comparePaths(a.path, b.path);
     if (pathCmp !== 0) return pathCmp;
     return a.stage - b.stage;
-  });
-  return encodeSorted(sortedEntries, writtenVersion(sortedEntries, version), extensions);
+  };
+  // an index is mostly given in its order already: checked in one pass before a sort
+  let sorted = true;
+  for (let i = 1; i < entries.length && sorted; i++) {
+    sorted = order(entries[i - 1] as StagingEntry, entries[i] as StagingEntry) < 0;
+  }
+  return sorted ? [...entries] : [...entries].sort(order);
 }
 
 /**

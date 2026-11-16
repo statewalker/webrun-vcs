@@ -5,8 +5,16 @@
  * Uses the @statewalker/webrun-files-mem package directly.
  */
 
-import { MemFilesApi } from "@statewalker/webrun-files-mem";
+import { MemFilesApi as BaseMemFilesApi } from "@statewalker/webrun-files-mem";
+import { appendByRewrite } from "./file-utils.js";
 import type { FilesApi } from "./files-api.js";
+
+/** webrun-files' in-memory FilesApi, with `append` (a rewrite: memory writes are cheap). */
+class MemFilesApi extends BaseMemFilesApi {
+  append(path: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>): Promise<void> {
+    return appendByRewrite(this, path, content);
+  }
+}
 
 /**
  * Create an in-memory FilesApi instance.

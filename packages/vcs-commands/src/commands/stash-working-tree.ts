@@ -33,7 +33,7 @@ import {
 import type { CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import type { StashResetOptions, StashWorkingTreeProvider } from "./stash-create-command.js";
-import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { pruneEmptyParents, removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
 
 /** Names this operation in restore failure messages. */
@@ -193,7 +193,7 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
     const plan = treeId
       ? await planTreeRestore(trees, blobs, treeId, STASH, {
           symlinks: true,
-          ignoreCase: coreBool(workingCopy, "ignorecase", false),
+          ...(await restoreCaseOptions(worktree, coreBool(workingCopy, "ignorecase", false))),
           windows: worktree.capabilities?.windowsPaths === true,
           reservedNames: worktree.capabilities?.reservedNames,
           writing: stale,
