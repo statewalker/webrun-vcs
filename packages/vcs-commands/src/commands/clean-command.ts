@@ -247,8 +247,6 @@ export class CleanCommand extends GitCommand<CleanResult> {
     await load();
 
     const states = new Map<CleanNode, CleanState>();
-    const hasFiles = (node: CleanNode): boolean =>
-      node.children.some((c) => !c.directory || c.repository || hasFiles(c));
     const state = (node: CleanNode): CleanState => {
       const known = states.get(node);
       if (known) return known;
@@ -257,8 +255,10 @@ export class CleanCommand extends GitCommand<CleanResult> {
       else if (node.repository) {
         // git skips nested repositories without -ff; with it they are untracked content
         result = !this.forceNested ? "none" : node.ignored ? "ignored" : "untracked";
-      } else if (node.ignored) result = hasFiles(node) ? "ignored" : "none";
-      else {
+      } else if (node.ignored) {
+        // an ignored directory is one ignored entry, empty or not (git removes it with -d)
+        result = "ignored";
+      } else {
         const inside = node.children.map(state);
         if (inside.includes("untracked") || !inside.includes("ignored")) result = "untracked";
         else result = "ignored";
@@ -297,40 +297,48 @@ export class CleanCommand extends GitCommand<CleanResult> {
     const cleaned = new Set<string>();
     const skipped = new Set<string>();
     const files: string[] = [];
+    // directories that go whole (with what the walk does not show: a `.git` that is no
+    // repository), and those that stay because a nested repository in them stays
     const wholes: string[] = [];
-    const dirs: string[] = [];
+    const gone = new Map<CleanNode, boolean>();
     const remove = (node: CleanNode): boolean => {
       if (node.repository) {
-        if (!this.forceNested) {
-          skipped.add(node.path);
-          return false;
-        }
-        wholes.push(node.path);
-        return true;
+        if (!this.forceNested) skipped.add(node.path);
+        gone.set(node, this.forceNested);
+        return this.forceNested;
       }
       const dels: string[] = [];
-      let gone = true;
+      let all = true;
       for (const child of node.children) {
         if (child.directory) {
           if (remove(child)) dels.push(child.path);
-          else gone = false;
-        } else {
-          files.push(child.path);
-          dels.push(child.path);
-        }
+          else all = false;
+        } else dels.push(child.path);
       }
-      dirs.push(node.path);
-      if (!gone) for (const d of dels) cleaned.add(d);
-      return gone;
+      if (!all) for (const d of dels) cleaned.add(d);
+      gone.set(node, all);
+      return all;
+    };
+    const plan = (node: CleanNode) => {
+      if (gone.get(node)) {
+        wholes.push(node.path);
+        return;
+      }
+      if (node.repository) return;
+      for (const child of node.children) {
+        if (child.directory) plan(child);
+        else files.push(child.path);
+      }
     };
     for (const path of removeFiles) cleaned.add(path);
-    for (const dir of removeDirs) if (remove(dir)) cleaned.add(`${dir.path}/`);
+    for (const dir of removeDirs) {
+      if (remove(dir)) cleaned.add(`${dir.path}/`);
+      plan(dir);
+    }
 
     if (!this.dryRun) {
       for (const path of [...removeFiles, ...files]) await worktree.remove(path);
       for (const path of wholes) await worktree.remove(path, { recursive: true });
-      const deepestFirst = dirs.sort((a, b) => b.split("/").length - a.split("/").length);
-      for (const dir of deepestFirst) await removeDirectoryIfEmpty(worktree, dir);
     }
     return { cleaned, skipped, dryRun: this.dryRun };
   }
@@ -447,9 +455,14 @@ export class CleanCommand extends GitCommand<CleanResult> {
           } else removeRepos.push(path);
           continue;
         }
+        // an ignored directory stays whole without -x, the (empty) directories in it too:
+        // git does not enter it
+        if (keptAsIgnored) {
+          keep(path, true);
+          notEntered.add(path);
+          continue;
+        }
         untrackedDirs.push(path);
-        // an ignored directory stays whole without -x
-        if (keptAsIgnored) keep(path, true);
         continue;
       }
       if (tracked.has(path)) continue;

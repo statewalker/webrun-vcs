@@ -35,11 +35,26 @@ export interface RenamePair {
 export interface DetectRenamesOptions {
   /** The content of a candidate, for inexact renames */
   load(candidate: RenameCandidate, side: "source" | "destination"): Promise<Uint8Array>;
+  /**
+   * The size of a candidate without reading it (`Blobs.size`), when known: a candidate is
+   * then read only when it is compared, and its content is not kept afterwards
+   */
+  size?(candidate: RenameCandidate, side: "source" | "destination"): Promise<number | undefined>;
+  /**
+   * Whether empty files are paired (git's `rename_empty`): on for `diff` and `status`
+   * (default), off in merges (merge-ort), where an empty file is never a rename
+   */
+  renameEmpty?: boolean;
+  /**
+   * Called when inexact renames were skipped because the candidates exceed the rename limit,
+   * with the limit that would have been needed (git's `needed_rename_limit`)
+   */
+  onRenameLimit?(needed: number): void;
   /** Threshold, 0..{@link GIT_MAX_SCORE} (default 50%) */
   minimumScore?: number;
   /**
    * git's `diff.renameLimit`: inexact renames are looked for only when the remaining sources
-   * times destinations stay within its square (default 1000; 0 or less: no limit)
+   * times destinations stay within its square (default 1000; 0 or less: 32767, as git)
    */
   renameLimit?: number;
   /** Count a last span without a newline, as git 2.5x (default); false as git 2.43 */
@@ -48,6 +63,12 @@ export interface DetectRenamesOptions {
 
 /** git's default `diff.renameLimit`. */
 export const DEFAULT_RENAME_LIMIT = 1000;
+
+/** The limit git uses for a `diff.renameLimit` of 0 or less. */
+const MAX_RENAME_LIMIT = 32767;
+
+/** git's empty blob (`e69de29...`), never paired when `renameEmpty` is off. */
+const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
 const S_IFMT = 0o170000;
 const isRegular = (mode: number) => (mode & S_IFMT) === 0o100000;
@@ -97,9 +118,12 @@ export async function detectRenames(
   options: DetectRenamesOptions,
 ): Promise<RenamePair[]> {
   const minimumScore = options.minimumScore ?? GIT_DEFAULT_RENAME_SCORE;
-  const renameLimit = options.renameLimit ?? DEFAULT_RENAME_LIMIT;
-  const src = [...sources].sort(byPath);
-  const dst = [...destinations].sort(byPath);
+  const configured = options.renameLimit ?? DEFAULT_RENAME_LIMIT;
+  const renameLimit = configured <= 0 ? MAX_RENAME_LIMIT : configured;
+  // merges leave empty files out of rename detection (git's rename_empty = 0)
+  const keep = (c: RenameCandidate) => options.renameEmpty !== false || c.id !== EMPTY_BLOB;
+  const src = sources.filter(keep).sort(byPath);
+  const dst = destinations.filter(keep).sort(byPath);
   const pairs: RenamePair[] = [];
   if (src.length === 0 || dst.length === 0) return pairs;
   const srcUsed = new Set<number>();
@@ -141,22 +165,33 @@ export async function detectRenames(
   }
   if (minimumScore >= GIT_MAX_SCORE) return pairs;
 
-  // each candidate read once: its size, and its span counts when first compared
+  // each candidate's size, and its span counts once first compared; the content itself is
+  // dropped as soon as its spans are counted
   const sides = new Map<RenameCandidate, Promise<SimilaritySide>>();
   const side = (candidate: RenameCandidate, role: "source" | "destination") => {
     let known = sides.get(candidate);
     if (!known) {
-      known = options.load(candidate, role).then((bytes) => {
+      known = (async () => {
+        let bytes: Uint8Array | undefined;
+        let size = await options.size?.(candidate, role);
+        if (size === undefined) {
+          bytes = await options.load(candidate, role);
+          size = bytes.length;
+        }
         let spans: SpanCounts | undefined;
         return {
           mode: candidate.mode,
-          size: bytes.length,
+          size,
           spans: async () => {
-            spans ??= spanCounts(bytes, { countLastSpan: options.countLastSpan });
+            if (!spans) {
+              const content = bytes ?? (await options.load(candidate, role));
+              bytes = undefined;
+              spans = spanCounts(content, { countLastSpan: options.countLastSpan });
+            }
             return spans;
           },
         };
-      });
+      })();
       sides.set(candidate, known);
     }
     return known;
@@ -196,10 +231,8 @@ export async function detectRenames(
   const remainingSources = liveSources();
   const remainingDestinations = dst.map((_, i) => i).filter((i) => !dstDone.has(i));
   if (remainingSources.length === 0 || remainingDestinations.length === 0) return pairs;
-  if (
-    renameLimit > 0 &&
-    remainingSources.length * remainingDestinations.length > renameLimit * renameLimit
-  ) {
+  if (remainingSources.length * remainingDestinations.length > renameLimit * renameLimit) {
+    options.onRenameLimit?.(Math.max(remainingSources.length, remainingDestinations.length));
     return pairs;
   }
   const matrix: Score[] = [];

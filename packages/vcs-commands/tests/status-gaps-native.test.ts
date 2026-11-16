@@ -748,3 +748,161 @@ describeGit("clean -d and absolute gitfile targets (native git)", () => {
     expect(readFileSync(join(root, "b/g"), "utf8")).toContain(a);
   });
 });
+
+describeGit("clean keeps repositories it cannot check; ignored directories as git (review)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-review-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  type Flags = { d?: boolean; x?: boolean; X?: boolean };
+  /** native `git clean -f` with `flags` in one build, ours in the other build of `setup`. */
+  async function twin(name: string, setup: (d: string) => void, flags: Flags) {
+    const n = join(root, `${name}-n`);
+    const o = join(root, `${name}-o`);
+    for (const dir of [n, o]) {
+      repo(dir);
+      setup(dir);
+    }
+    const args = ["clean", "-f"];
+    if (flags.d) args.push("-d");
+    if (flags.x) args.push("-x");
+    if (flags.X) args.push("-X");
+    const out = exec(n, ...args, "-n")
+      .split("\n")
+      .filter(Boolean);
+    const pick = (prefix: string) =>
+      out
+        .filter((l) => l.startsWith(prefix))
+        .map((l) => l.slice(prefix.length))
+        .sort();
+    const command = async (dryRun: boolean) => {
+      const { ours } = await open(o);
+      return ours
+        .clean()
+        .setCleanDirectories(flags.d === true)
+        .setIgnore(flags.x !== true)
+        .setIgnoredOnly(flags.X === true)
+        .setDryRun(dryRun)
+        .call();
+    };
+    const dry = await command(true);
+    expect([...dry.cleaned].sort(), `${name}: would remove`).toEqual(pick("Would remove "));
+    expect([...dry.skipped].sort(), `${name}: would skip`).toEqual(pick("Would skip repository "));
+    exec(n, ...args, "-q");
+    await command(false);
+    expect(listing(o), `${name}: worktree`).toEqual(listing(n));
+    return { native: listing(n), ours: listing(o) };
+  }
+
+  /** u/w is a worktree whose gitdir is reached through a link (in `.git`, never cleaned). */
+  const linkedGitdir = (throughTarget: boolean, ignoreU: boolean) => (d: string) => {
+    if (ignoreU) {
+      put(d, ".gitignore", "u/\n");
+      run(d, "add", ".gitignore");
+      run(d, "commit", "-qm", "ignore");
+    }
+    mkdirSync(join(d, ".git/store"));
+    run(d, "init", "-q", "--bare", join(d, ".git/store/real.git"));
+    symlinkSync("store", join(d, ".git/lnk"));
+    symlinkSync("store/real.git", join(d, ".git/lnk2"));
+    const target = throughTarget ? join(d, ".git/lnk2") : join(d, ".git/lnk/real.git");
+    mkdirSync(join(d, "u/w"), { recursive: true });
+    writeFileSync(join(d, "u/w/.git"), `gitdir: ${target}\n`);
+    put(d, "u/w/precious.txt", "precious\n");
+    put(d, "u/loose.txt", "loose\n");
+  };
+  for (const [name, through, ignore, flags] of [
+    ["link-in-path -d", false, false, { d: true }],
+    ["link-in-path -dx", false, true, { d: true, x: true }],
+    ["link-in-path -Xd", false, true, { d: true, X: true }],
+    ["link-target -d", true, false, { d: true }],
+    ["link-target -dx", true, true, { d: true, x: true }],
+    ["link-target -Xd", true, true, { d: true, X: true }],
+  ] as Array<[string, boolean, boolean, Flags]>) {
+    it(`a gitdir reached through a link is a repository, kept: ${name}`, async () => {
+      const { ours } = await twin(name.replace(/\W+/g, "-"), linkedGitdir(through, ignore), flags);
+      expect(ours).toContain("u/w/precious.txt");
+    });
+  }
+
+  /** Ignored directories empty or holding only empty directories or a `.git` that is none. */
+  const emptyIgnored = (d: string) => {
+    put(d, ".gitignore", "build/\nb2/\nb3/\nb4/\n*.log\nign/\n");
+    run(d, "add", ".gitignore");
+    run(d, "commit", "-qm", "ignore");
+    mkdirSync(join(d, "build"));
+    mkdirSync(join(d, "b2/e/f"), { recursive: true });
+    mkdirSync(join(d, "b3/fake/.git"), { recursive: true });
+    put(d, "b3/fake/x.o", "x\n");
+    mkdirSync(join(d, "b4/fake2/.git"), { recursive: true });
+    mkdirSync(join(d, "u/empty"), { recursive: true });
+    put(d, "u/a.log", "l\n");
+    mkdirSync(join(d, "ign/e1/e2"), { recursive: true });
+    put(d, "ign/i.txt", "i\n");
+    mkdirSync(join(d, "plainu/e"), { recursive: true });
+  };
+  for (const [name, flags] of [
+    ["-Xd", { d: true, X: true }],
+    ["-d", { d: true }],
+    ["-dx", { d: true, x: true }],
+    ["-X", { X: true }],
+  ] as Array<[string, Flags]>) {
+    it(`empty and fake-repository ignored directories: clean ${name}`, async () => {
+      await twin(`empty${name}`, emptyIgnored, flags);
+    });
+  }
+});
+
+describeGit("status review cases against native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-review2-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("a deinitialised submodule's directory is never entered for untracked files", async () => {
+    const d = join(root, "r");
+    superproject(d, join(root, "up"));
+    exec(d, "submodule", "deinit", "-q", "-f", "sub");
+    put(d, "sub/stray.txt", "s\n");
+    put(d, "sub/deep/x.txt", "x\n");
+    const status = await expectStatusAs(d);
+    expect(status.untracked.size).toBe(0);
+  });
+
+  it("a submodule's own status.showUntrackedFiles=no hides its untracked files", async () => {
+    const d = join(root, "r");
+    superproject(d, join(root, "up"));
+    put(join(d, "sub"), "u.txt", "u\n");
+    run(join(d, "sub"), "config", "status.showUntrackedFiles", "no");
+    const status = await expectStatusAs(d);
+    expect(status.modified.size).toBe(0);
+  });
+
+  it("diff.renameLimit 0 or negative is git's 32767; a skipped detection warns", async () => {
+    const setup = (d: string) => {
+      repo(d);
+      run(d, "rm", "-q", "a.txt", "b.txt");
+      put(d, "a2.txt", `${lines(20, "a")}x\n`);
+      put(d, "b2.txt", `${lines(12, "b")}y\n`);
+      run(d, "add", ".");
+    };
+    for (const limit of ["0", "-1"]) {
+      const d = join(root, `limit${limit}`);
+      setup(d);
+      run(d, "config", "diff.renameLimit", limit);
+      const status = await expectStatusAs(d);
+      expect(status.renamed.size).toBe(2);
+      expect(status.warnings).toEqual([]);
+    }
+    const d = join(root, "limit1");
+    setup(d);
+    run(d, "config", "diff.renameLimit", "1");
+    const status = await expectStatusAs(d);
+    expect(status.renamed.size).toBe(0);
+    expect(status.warnings).toEqual([
+      "warning: exhaustive rename detection was skipped due to too many files.",
+      "warning: you may want to set your status.renameLimit variable to at least 2 and retry the command.",
+    ]);
+  });
+});

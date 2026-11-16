@@ -74,6 +74,13 @@ export interface Status {
    * Both paths stay in `added`/`removed` (or `missing`) too.
    */
   readonly renamed: Map<string, string>;
+  /**
+   * git's warnings about this status, as git's diff prints them: when inexact rename
+   * detection was skipped for too many candidates ("exhaustive rename detection was skipped
+   * due to too many files.", with the rename limit that would be needed). `git status`
+   * itself prints none of them.
+   */
+  readonly warnings: string[];
   /** Files with merge conflicts (unmerged index entries). */
   readonly conflicting: Set<string>;
   /** The kind of each conflict (both modified, deleted by them, ...). */
@@ -116,6 +123,7 @@ export class StatusImpl implements Status {
   readonly conflictingStageState: Map<string, StageStateValue>;
   readonly files: StatusFileEntry[];
   readonly renamed: Map<string, string>;
+  readonly warnings: string[];
 
   constructor(
     public readonly added: Set<string>,
@@ -130,6 +138,7 @@ export class StatusImpl implements Status {
       conflictingStageState?: Map<string, StageStateValue>;
       files?: StatusFileEntry[];
       renamed?: Map<string, string>;
+      warnings?: string[];
     } = {},
   ) {
     this.modified = worktree.modified ?? new Set();
@@ -139,6 +148,7 @@ export class StatusImpl implements Status {
     this.conflictingStageState = worktree.conflictingStageState ?? new Map();
     this.files = worktree.files ?? [];
     this.renamed = worktree.renamed ?? new Map();
+    this.warnings = worktree.warnings ?? [];
   }
 
   isClean(): boolean {

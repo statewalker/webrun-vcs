@@ -244,11 +244,13 @@ export class StatusCommand extends GitCommand<Status> {
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const indexTime = this.staging.getUpdateTime();
     const tracked = new Set<string>();
+    const gitlinks = new Set<string>();
     const refresh: IndexStatUpdate[] = [];
     const unmerged = new Map<string, [StatusSide?, StatusSide?, StatusSide?]>();
 
     for await (const entry of this.staging.entries()) {
       tracked.add(entry.path);
+      if (entry.mode === FileMode.GITLINK) gitlinks.add(entry.path);
       if (!this.matchesPath(entry.path)) continue;
       if (entry.stage !== 0) {
         const stages = unmerged.get(entry.path) ?? [undefined, undefined, undefined];
@@ -345,11 +347,13 @@ export class StatusCommand extends GitCommand<Status> {
     }
 
     const renamed = new Map<string, string>();
-    if (this.detectsRenames()) await this.pairRenames(files, renamed, worktree);
+    const warnings: string[] = [];
+    if (this.detectsRenames()) await this.pairRenames(files, renamed, worktree, warnings);
 
     if (worktree && this.showUntracked) {
       for await (const file of findUntrackedFiles(worktree, (p) => tracked.has(p), {
         hasTrackedUnder: trackedUnder(tracked),
+        isGitlink: (p) => gitlinks.has(p),
         includeIgnored: this.showIgnored,
         filter: (p) => this.matchesPath(p),
       })) {
@@ -374,6 +378,7 @@ export class StatusCommand extends GitCommand<Status> {
       conflictingStageState,
       files,
       renamed,
+      warnings,
     });
   }
 
@@ -397,6 +402,7 @@ export class StatusCommand extends GitCommand<Status> {
     files: StatusFileEntry[],
     renamed: Map<string, string>,
     worktree: Worktree | undefined,
+    warnings: string[],
   ): Promise<void> {
     const limit =
       this.renameLimit ??
@@ -405,6 +411,18 @@ export class StatusCommand extends GitCommand<Status> {
       DEFAULT_RENAME_LIMIT;
     const byPath = new Map(files.map((f) => [f.path, f]));
     const blob = async (id: ObjectId) => concat((await this.blobs.load(id)) ?? []);
+    const blobSize = async (id: ObjectId) => {
+      try {
+        return await this.blobs.size(id);
+      } catch {
+        return undefined;
+      }
+    };
+    // git's diff warning when inexact renames were skipped (git status itself prints none)
+    let needed = 0;
+    const onRenameLimit = (n: number) => {
+      needed = Math.max(needed, n);
+    };
     const drop = new Set<StatusFileEntry>();
 
     // index side: HEAD's deletions against the index's additions
@@ -420,6 +438,8 @@ export class StatusCommand extends GitCommand<Status> {
     if (indexSources.length > 0 && indexDestinations.length > 0) {
       const pairs = await detectRenames(indexSources, indexDestinations, {
         renameLimit: limit,
+        onRenameLimit,
+        size: (c) => blobSize(c.id),
         load: (c) => blob(c.id),
       });
       for (const pair of pairs) {
@@ -456,6 +476,9 @@ export class StatusCommand extends GitCommand<Status> {
           destinations.map(([c]) => c),
           {
             renameLimit: limit,
+            onRenameLimit,
+            size: async (c, role) =>
+              role === "source" ? blobSize(c.id) : (await worktree.getEntry(c.path))?.size,
             load: (c, role) =>
               role === "source" ? blob(c.id) : concat(worktree.readContent(c.path)),
           },
@@ -483,6 +506,12 @@ export class StatusCommand extends GitCommand<Status> {
     if (drop.size > 0) {
       const kept = files.filter((f) => !drop.has(f));
       files.splice(0, files.length, ...kept);
+    }
+    if (needed > 0) {
+      warnings.push(
+        "warning: exhaustive rename detection was skipped due to too many files.",
+        `warning: you may want to set your status.renameLimit variable to at least ${needed} and retry the command.`,
+      );
     }
   }
 
@@ -562,8 +591,10 @@ export class StatusCommand extends GitCommand<Status> {
     if (!inner) return {};
     const showUntracked =
       !ignoreUntracked &&
-      RemoteConfigStore.from(inner).value("status.showUntrackedFiles")?.trim().toLowerCase() !==
-        "no";
+      !["no", "false", "off", "0"].includes(
+        RemoteConfigStore.from(inner).value("status.showUntrackedFiles")?.trim().toLowerCase() ??
+          "",
+      );
     const status = await new StatusCommand(inner)
       .setRenames(false)
       .setUntracked(showUntracked)

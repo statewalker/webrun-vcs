@@ -742,6 +742,8 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     const renames = new Map<string, string>();
     if (deleted.length === 0 || added.length === 0) return renames;
     const pairs = await detectRenames(deleted, added, {
+      // merge-ort never pairs empty files
+      renameEmpty: false,
       load: async (c) => {
         const chunks: Uint8Array[] = [];
         for await (const chunk of (await this.blobs.load(c.id)) ?? []) chunks.push(chunk);

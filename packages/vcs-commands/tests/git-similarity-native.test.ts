@@ -175,3 +175,59 @@ describeGit("git's similarity estimate (native git oracle)", () => {
     expect(found.some((p) => p.score === GIT_MAX_SCORE)).toBe(true);
   });
 });
+
+describe("detectRenames options", () => {
+  const content: Record<string, string> = {
+    "a.txt": "1\n2\n3\n4\n5\n6\n",
+    "b.txt": "1\n2\n3\n4\n5\n6\n7\n",
+    "x.txt": "same\n",
+    "y.txt": "same\n",
+    e1: "",
+    e2: "",
+  };
+  const c = (path: string, id = path) => ({ path, mode: 0o100644, id });
+  const EMPTY = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+  const load = async (x: { path: string }) => encode(content[x.path]);
+
+  it("renameEmpty: false never pairs empty files (merge-ort); the default does (status)", async () => {
+    const paired = await detectRenames([c("e1", EMPTY)], [c("e2", EMPTY)], { load });
+    expect(paired.map((p) => p.to)).toEqual(["e2"]);
+    const merge = await detectRenames([c("e1", EMPTY)], [c("e2", EMPTY)], {
+      load,
+      renameEmpty: false,
+    });
+    expect(merge).toEqual([]);
+  });
+
+  it("with sizes known, exact renames read nothing and compared contents are read once", async () => {
+    const loads: string[] = [];
+    const pairs = await detectRenames(
+      [c("a.txt"), c("x.txt", "S")],
+      [c("b.txt"), c("y.txt", "S")],
+      {
+        size: async (x) => content[x.path].length,
+        load: async (x) => {
+          loads.push(x.path);
+          return encode(content[x.path]);
+        },
+      },
+    );
+    expect(pairs.map((p) => `${p.from}>${p.to}`).sort()).toEqual(["a.txt>b.txt", "x.txt>y.txt"]);
+    expect(loads.sort()).toEqual(["a.txt", "b.txt"]);
+  });
+
+  it("a rename limit of 0 or less is 32767; a skipped detection reports the needed limit", async () => {
+    const zero = await detectRenames([c("a.txt")], [c("b.txt")], { load, renameLimit: 0 });
+    expect(zero).toHaveLength(1);
+    let needed = 0;
+    const none = await detectRenames([c("a.txt"), c("x.txt")], [c("b.txt"), c("y.txt", "Y")], {
+      load,
+      renameLimit: 1,
+      onRenameLimit: (n) => {
+        needed = n;
+      },
+    });
+    expect(none).toEqual([]);
+    expect(needed).toBe(2);
+  });
+});
