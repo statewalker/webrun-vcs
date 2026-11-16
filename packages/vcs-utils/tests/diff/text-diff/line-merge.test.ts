@@ -124,3 +124,53 @@ describe("mergeLines refines conflicts as git's xdl_merge", () => {
     expect(styled("x\n", "o\n", "t\n", "merge", "union")).toBe("o\nt\n");
   });
 });
+
+describe("mergeLines diffs as git's xdiff", () => {
+  it("repetitive lines conflict where git's diff puts them", () => {
+    // native: `git merge-file` and merge-ort give the same answer here
+    const expected = "a\nc\n<<<<<<< A\na\nb\n=======\n}\nc\nc\n>>>>>>> B\nb\n";
+    const args = ["c\nc\nc\nb\n}\n", "c\na\nb\nb\n", "a\nc\n}\nc\nc\nb\n}\n"] as const;
+    expect(text(merge(...args).content)).toBe(expected);
+    const asMergeFile = mergeLines(latin1(args[0]), latin1(args[1]), latin1(args[2]), {
+      oursLabel: "A",
+      theirsLabel: "B",
+      algorithm: "myers",
+      level: "zealous-alnum",
+    });
+    expect(text(asMergeFile.content)).toBe(expected);
+  });
+
+  it("zealous-alnum joins conflicts apart only by lines without letters or digits", () => {
+    const [base, ours, theirs] = ["1\n}\n}\n}\n}\n4\n", "X\n}\n}\n}\n}\nY\n", "Z\n}\n}\n}\n}\nW\n"];
+    const opts = { oursLabel: "A", theirsLabel: "B" };
+    expect(text(mergeLines(latin1(base), latin1(ours), latin1(theirs), opts).content)).toBe(
+      "<<<<<<< A\nX\n=======\nZ\n>>>>>>> B\n}\n}\n}\n}\n<<<<<<< A\nY\n=======\nW\n>>>>>>> B\n",
+    );
+    const alnum = mergeLines(latin1(base), latin1(ours), latin1(theirs), {
+      ...opts,
+      level: "zealous-alnum",
+    });
+    expect(text(alnum.content)).toBe(
+      "<<<<<<< A\nX\n}\n}\n}\n}\nY\n=======\nZ\n}\n}\n}\n}\nW\n>>>>>>> B\n",
+    );
+    expect(alnum.conflicts).toBe(1);
+  });
+
+  it("stays near linear on big repetitive inputs", () => {
+    const n = 40000;
+    const base = Array.from({ length: n }, (_, i) =>
+      i % 3 === 0 ? "}\n" : i % 3 === 1 ? "\n" : `x${i % 50}\n`,
+    );
+    const theirs = [...base];
+    theirs.splice(n / 2, 0, "inserted\n");
+    const start = performance.now();
+    for (const algorithm of ["myers", "histogram"] as const) {
+      const r = mergeLines(e(base.join("")), e([...base].reverse().join("")), e(theirs.join("")), {
+        algorithm,
+      });
+      expect(r.conflicts).toBeGreaterThan(0);
+    }
+    // about 0.6 s here; the quadratic merge this replaced took over a minute
+    expect(performance.now() - start).toBeLessThan(15_000);
+  }, 60_000);
+});
