@@ -515,3 +515,27 @@ describe("GcOrchestrator beyond the shallow boundary", () => {
     expect(stored(dir)).toEqual(before);
   });
 });
+
+describe("GcOrchestrator with verifyBlobs off", () => {
+  it("does not read blob bodies: a truncated reachable blob is kept, the orphan pruned", async () => {
+    const dir = repo(6);
+    const blob = git(dir, ["rev-parse", "main~3:c2.txt"]).trim();
+    const path = join(dir, ".git/objects", blob.slice(0, 2), blob.slice(2));
+    const bytes = readFileSync(path);
+    rmSync(path, { force: true });
+    writeFileSync(path, bytes.subarray(0, bytes.length - 6));
+    expireReflogs(dir);
+    const orphan = hashObject(dir, "an unreachable blob\n");
+
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: dir }) });
+    const result = await new GcOrchestrator(backend.history, new FileGcStrategy(backend)).run({
+      pruneExpireMs: 0,
+      verifyBlobs: false,
+    });
+    expect(result.reachableObjects).toBeGreaterThan(0);
+    const after = stored(dir);
+    // the reachable (if corrupt) blob is never pruned; only the unreachable orphan goes
+    expect(after.has(blob)).toBe(true);
+    expect(after.has(orphan)).toBe(false);
+  });
+});

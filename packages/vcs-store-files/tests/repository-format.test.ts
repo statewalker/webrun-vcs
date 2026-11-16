@@ -169,3 +169,42 @@ describe("gc in a partial clone", () => {
     expect(await backend.history.blobs.has(orphan)).toBe(true);
   });
 });
+
+describe("repository format values as git parses them (review fixes)", () => {
+  it.each([
+    ["submodulePathConfig (git 2.56, v1)", v(1, "\tsubmodulePathConfig = true\n")],
+    ["a version written as 01 (strtoimax base 0)", "[core]\n\trepositoryformatversion = 01\n"],
+    ["preciousObjects = 0x1", v(0, "\tpreciousObjects = 0x1\n")],
+  ])("opens: %s", async (_name, config) => {
+    const files = await repoWithConfig(config);
+    const { history } = await createGitFilesBackend({ files });
+    await history.initialize();
+    expect(await history.refs.resolve("HEAD")).toBeUndefined();
+  });
+
+  it("reads 0x1 as a true preciousObjects", async () => {
+    const files = await repoWithConfig(v(0, "\tpreciousObjects = 0x1\n"));
+    expect((await readRepositoryFormat(files, ".git")).preciousObjects).toBe(true);
+  });
+
+  it.each([
+    [
+      "objectFormat = SHA1 (git compares case-sensitively)",
+      v(1, "\tobjectFormat = SHA1\n"),
+      /invalid value for 'extensions.objectformat'/,
+    ],
+    [
+      "refStorage = Files",
+      v(1, "\trefStorage = Files\n"),
+      /invalid value for 'extensions.refstorage'/,
+    ],
+    [
+      "a bare partialClone key (git requires a value)",
+      v(1, "\tpartialClone\n"),
+      /missing value for/,
+    ],
+  ])("refuses: %s", async (_name, config, message) => {
+    const files = await repoWithConfig(config);
+    await expect(createGitFilesBackend({ files })).rejects.toThrow(message);
+  });
+});

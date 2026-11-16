@@ -97,6 +97,9 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
         format.preciousObjects = configBool(value, key);
         continue;
       case "partialclone":
+        if (value === true || value === undefined || value === "") {
+          throw new UnsupportedRepositoryFormatError(`missing value for '${key}'`);
+        }
         format.partialClone = String(value);
         continue;
       case "worktreeconfig":
@@ -108,7 +111,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
       case "noop-v1":
         break;
       case "objectformat": {
-        const name = String(value).toLowerCase();
+        const name = String(value);
         if (name !== "sha1" && name !== "sha256") {
           throw new UnsupportedRepositoryFormatError(
             `invalid value for 'extensions.objectformat': '${String(value)}'`,
@@ -118,7 +121,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
         break;
       }
       case "compatobjectformat": {
-        const name = String(value).toLowerCase();
+        const name = String(value);
         if (name !== "sha1" && name !== "sha256") {
           throw new UnsupportedRepositoryFormatError(
             `invalid value for 'extensions.compatobjectformat': '${String(value)}'`,
@@ -128,7 +131,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
         break;
       }
       case "refstorage": {
-        const name = String(value).toLowerCase();
+        const name = String(value);
         if (name !== "files" && name !== "reftable") {
           throw new UnsupportedRepositoryFormatError(
             `invalid value for 'extensions.refstorage': '${String(value)}'`,
@@ -139,6 +142,9 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
       }
       case "relativeworktrees":
         format.relativeWorktrees = configBool(value, key);
+        break;
+      case "submodulepathconfig":
+        configBool(value, key);
         break;
       default:
         unknown.push(ext);
@@ -262,6 +268,10 @@ export async function assertNoAlternates(
 function configInt(value: unknown, key: string): number {
   if (value === undefined) return 0;
   if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string") {
+    const parsed = parseGitInt(value);
+    if (parsed !== undefined) return parsed;
+  }
   throw new UnsupportedRepositoryFormatError(
     `bad numeric config value '${String(value)}' for '${key}'`,
   );
@@ -272,7 +282,30 @@ function configBool(value: unknown, key: string): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;
   if (value === "") return false;
+  if (typeof value === "string") {
+    const parsed = parseGitInt(value);
+    if (parsed !== undefined) return parsed !== 0;
+  }
   throw new UnsupportedRepositoryFormatError(
     `bad boolean config value '${String(value)}' for '${key}'`,
   );
+}
+
+/**
+ * An integer as git_parse_int reads it: strtoimax with base 0 (decimal, `0x` hexadecimal,
+ * leading-`0` octal) and an optional `k`, `m` or `g` unit. Undefined when it is not one.
+ */
+function parseGitInt(text: string): number | undefined {
+  const match = /^\s*([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)([kKmMgG]?)\s*$/.exec(text);
+  if (!match) return undefined;
+  const [, sign, digits, unit] = match;
+  const magnitude =
+    digits.startsWith("0x") || digits.startsWith("0X")
+      ? Number.parseInt(digits.slice(2), 16)
+      : digits.length > 1 && digits.startsWith("0")
+        ? Number.parseInt(digits.slice(1), 8)
+        : Number.parseInt(digits, 10);
+  const factor = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[unit.toLowerCase()] ?? 1;
+  const result = (sign === "-" ? -1 : 1) * magnitude * factor;
+  return Number.isSafeInteger(result) ? result : undefined;
 }

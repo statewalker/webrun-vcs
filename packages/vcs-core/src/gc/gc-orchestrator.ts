@@ -40,6 +40,12 @@ export interface GcRunOptions {
    * (`--prune=now`). Strategies that cannot tell an object's age (memory, SQL) keep none.
    */
   pruneExpireMs?: number;
+  /**
+   * Read every reachable blob to its end and check its length before pruning (default true),
+   * so a truncated blob aborts the run. Prune only removes unreachable objects, so turning it
+   * off risks no data loss; it only reports such corruption later, as `git gc` does.
+   */
+  verifyBlobs?: boolean;
 }
 
 /** Default `GcRunOptions.pruneExpireMs`: two weeks, git's `gc.pruneExpire`. */
@@ -120,6 +126,7 @@ export class GcOrchestrator {
     for await (const oid of this.history.collectReachableObjects(roots, new Set(), {
       missing: "throw",
       shallow,
+      verifyBlobs: options.verifyBlobs ?? true,
     })) {
       reachable.add(oid);
     }
