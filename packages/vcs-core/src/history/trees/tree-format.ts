@@ -13,7 +13,7 @@
  */
 
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { collect, concat, encodeString, toArray } from "@statewalker/vcs-utils/streams";
+import { collect, encodeString, toArray } from "@statewalker/vcs-utils/streams";
 import { FileMode } from "../../common/files/index.js";
 import { GitFormat } from "../../common/id/object-id.js";
 import { objectIdToBytes } from "../objects/index.js";
@@ -121,42 +121,57 @@ function validateEntryName(name: string): void {
 export async function* encodeTreeEntries(
   entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>,
 ): AsyncGenerator<Uint8Array> {
-  // Collect and sort entries
-  const collected: TreeEntry[] = [];
+  // Collect and sort entries (each name encoded once)
+  const encoder = new TextEncoder();
+  const collected: { entry: TreeEntry; name: Uint8Array; tree: boolean }[] = [];
   for await (const entry of entries) {
     validateEntryName(entry.name);
-    collected.push(entry);
+    collected.push({ entry, name: encoder.encode(entry.name), tree: isTreeMode(entry.mode) });
   }
+  collected.sort((a, b) => compareEncodedNames(a.name, a.tree, b.name, b.tree));
 
-  const sorted = collected.sort(compareTreeEntriesInternal);
-
-  // Encode each entry
-  const encoder = new TextEncoder();
-  for (const entry of sorted) {
+  const parts: { mode: Uint8Array; name: Uint8Array; id: Uint8Array }[] = [];
+  let size = 0;
+  for (const { entry, name } of collected) {
     const mode = encodeMode(entry.mode);
-    const name = encoder.encode(entry.name);
     const id = objectIdToBytes(entry.id);
-
-    // Build entry: mode SP name NUL sha1
-    const entryBytes = new Uint8Array(mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH);
-    let offset = 0;
-
-    entryBytes.set(mode, offset);
-    offset += mode.length;
-
-    entryBytes[offset] = SPACE;
-    offset += 1;
-
-    entryBytes.set(name, offset);
-    offset += name.length;
-
-    entryBytes[offset] = NULL;
-    offset += 1;
-
-    entryBytes.set(id, offset);
-
-    yield entryBytes;
+    parts.push({ mode, name, id });
+    size += mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH;
   }
+  // Build entries: mode SP name NUL sha1
+  const out = new Uint8Array(size);
+  let offset = 0;
+  for (const { mode, name, id } of parts) {
+    out.set(mode, offset);
+    offset += mode.length;
+    out[offset++] = SPACE;
+    out.set(name, offset);
+    offset += name.length;
+    out[offset++] = NULL;
+    out.set(id, offset);
+    offset += OBJECT_ID_LENGTH;
+  }
+  if (size > 0) yield out;
+}
+
+/** compareTreeEntriesInternal over names already encoded. */
+function compareEncodedNames(
+  aBytes: Uint8Array,
+  aIsTree: boolean,
+  bBytes: Uint8Array,
+  bIsTree: boolean,
+): number {
+  const len = Math.min(aBytes.length, bBytes.length);
+  for (let i = 0; i < len; i++) {
+    const diff = aBytes[i] - bBytes[i];
+    if (diff !== 0) return diff;
+  }
+  const aLen = aIsTree ? aBytes.length + 1 : aBytes.length;
+  const bLen = bIsTree ? bBytes.length + 1 : bBytes.length;
+  if (aLen === bLen) return 0;
+  const aChar = aBytes.length > len ? aBytes[len] : aIsTree ? 0x2f /* '/' */ : 0;
+  const bChar = bBytes.length > len ? bBytes[len] : bIsTree ? 0x2f /* '/' */ : 0;
+  return aChar - bChar;
 }
 
 /**
@@ -189,67 +204,65 @@ export async function computeTreeSize(
 export async function* decodeTreeEntries(
   input: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
 ): AsyncGenerator<TreeEntry> {
-  let buffer = new Uint8Array(0);
-
+  const chunks: Uint8Array[] = [];
+  let size = 0;
   for await (const chunk of input) {
-    buffer = concat(buffer, chunk);
-
-    // Parse entries from buffer
-    let offset = 0;
-
-    while (offset < buffer.length) {
-      // Find space after mode
-      let spacePos = offset;
-      while (spacePos < buffer.length && buffer[spacePos] !== SPACE) {
-        spacePos++;
-      }
-
-      if (spacePos >= buffer.length) {
-        // Need more data
-        break;
-      }
-
-      // Find null after name
-      let nullPos = spacePos + 1;
-      while (nullPos < buffer.length && buffer[nullPos] !== NULL) {
-        nullPos++;
-      }
-
-      if (nullPos >= buffer.length) {
-        // Need more data
-        break;
-      }
-
-      // Check if we have complete SHA-1
-      if (nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) {
-        // Need more data
-        break;
-      }
-
-      // Parse entry
-      const mode = parseMode(buffer.subarray(offset, spacePos));
-      const decoder = new TextDecoder();
-      const name = decoder.decode(buffer.subarray(spacePos + 1, nullPos));
-      // A decoded tree may come from a remote. Its names become worktree paths, and
-      // the FilesApi resolves `..` (webrun-files 0.12), so refuse what git fsck refuses.
-      validateEntryName(name);
-      const id = bytesToHex(buffer.subarray(nullPos + 1, nullPos + 1 + OBJECT_ID_LENGTH));
-
-      yield { mode, name, id };
-
-      offset = nullPos + 1 + OBJECT_ID_LENGTH;
-    }
-
-    // Keep unparsed data
-    if (offset > 0) {
-      buffer = buffer.slice(offset);
+    chunks.push(chunk);
+    size += chunk.length;
+  }
+  let buffer: Uint8Array;
+  if (chunks.length === 1) buffer = chunks[0];
+  else {
+    buffer = new Uint8Array(size);
+    let at = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, at);
+      at += chunk.length;
     }
   }
+  yield* decodeTreeBytes(buffer);
+}
 
-  // Check for leftover data
-  if (buffer.length > 0) {
+const nameDecoder = new TextDecoder();
+
+/**
+ * Decode a whole tree's bytes (without header) at once.
+ *
+ * @param buffer Serialized tree content
+ * @returns Tree entries in stored order
+ */
+export function decodeTreeBytes(buffer: Uint8Array): TreeEntry[] {
+  const out: TreeEntry[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const spacePos = buffer.indexOf(SPACE, offset);
+    if (spacePos < 0) break;
+    const nullPos = buffer.indexOf(NULL, spacePos + 1);
+    if (nullPos < 0 || nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) break;
+    const mode = parseModeAt(buffer, offset, spacePos);
+    const name = nameDecoder.decode(buffer.subarray(spacePos + 1, nullPos));
+    // A decoded tree may come from a remote. Its names become worktree paths, and
+    // the FilesApi resolves `..` (webrun-files 0.12), so refuse what git fsck refuses.
+    validateEntryName(name);
+    const id = bytesToHex(buffer.subarray(nullPos + 1, nullPos + 1 + OBJECT_ID_LENGTH));
+    out.push({ mode, name, id });
+    offset = nullPos + 1 + OBJECT_ID_LENGTH;
+  }
+  if (offset < buffer.length) {
     throw new Error("Invalid tree format: truncated entry");
   }
+  return out;
+}
+
+/** The octal mode in `buffer[start, end)`, as parseInt(text, 8) reads it. */
+function parseModeAt(buffer: Uint8Array, start: number, end: number): number {
+  let mode = 0;
+  for (let i = start; i < end; i++) {
+    const digit = buffer[i] - 0x30;
+    if (digit < 0 || digit > 7) return parseMode(buffer.subarray(start, end));
+    mode = mode * 8 + digit;
+  }
+  return end > start ? mode : Number.NaN;
 }
 
 /**

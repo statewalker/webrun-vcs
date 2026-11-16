@@ -80,6 +80,7 @@ export async function resetMerge(
   const worktree = ctx.worktree;
   const checked = conflictEntries.size > 0 ? new Map([...index, ...conflictEntries]) : index;
   const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const indexTime = ctx.staging.getUpdateTime();
   const refuse = (message: string, path: string): MergeRefusal => ({
     message: `error: ${message}\nfatal: Could not reset index file to revision '${label}'.`,
     paths: [path],
@@ -102,7 +103,7 @@ export async function resetMerge(
         return refuse(`Updating '${path}' would lose untracked files in it`, path);
       }
       if (!conflicted && i && !options.hard && worktree) {
-        if (await worktreeDiffers(worktree, path, i, trust)) return notUptodate(path);
+        if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
       }
       removing.add(path);
       changes.push(path);
@@ -110,7 +111,12 @@ export async function resetMerge(
     }
     if (!conflicted && sameEntry(i, t)) {
       // reset --hard writes a modified or missing file again
-      if (options.hard && i && worktree && (await worktreeModified(worktree, path, i, trust))) {
+      if (
+        options.hard &&
+        i &&
+        worktree &&
+        (await worktreeModified(worktree, path, i, trust, indexTime))
+      ) {
         changes.push(path);
       }
       continue;
@@ -121,12 +127,13 @@ export async function resetMerge(
         hard: options.hard === true,
         tracked: inIndex,
         trust,
+        indexTime,
         refuse,
         notUptodate,
       });
       if (refusal) return refusal;
     } else if (worktree && i && !conflicted && !options.hard) {
-      if (await worktreeDiffers(worktree, path, i, trust)) return notUptodate(path);
+      if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
     }
     changes.push(path);
   }
@@ -198,6 +205,7 @@ export async function resetKeep(
   }
   const worktree = ctx.worktree;
   const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const indexTime = ctx.staging.getUpdateTime();
   const refuse = (message: string, path: string): MergeRefusal => ({
     message: `error: ${message}\nfatal: Could not reset index file to revision '${label}'.`,
     paths: [path],
@@ -219,7 +227,7 @@ export async function resetKeep(
       if (sameEntry(i, t)) continue;
       return refuse(`Entry '${path}' would be overwritten by merge. Cannot merge.`, path);
     }
-    if (worktree && i && (await worktreeDiffers(worktree, path, i, trust))) {
+    if (worktree && i && (await worktreeDiffers(worktree, path, i, trust, indexTime))) {
       return notUptodate(path);
     }
     if (!t) {
@@ -229,6 +237,7 @@ export async function resetKeep(
         hard: false,
         tracked: (p) => index.has(p),
         trust,
+        indexTime,
         refuse,
         notUptodate,
       });
@@ -328,6 +337,8 @@ async function verifyAbsent(
     /** Paths the index tracks, at any stage (unmerged ones are no untracked files) */
     tracked: (path: string) => boolean;
     trust: ReturnType<typeof worktreeModeTrust> | undefined;
+    /** The index file's mtime (racy entries are checked by content) */
+    indexTime?: number;
     refuse: (message: string, path: string) => MergeRefusal;
     notUptodate: (path: string) => MergeRefusal;
   },
@@ -354,7 +365,10 @@ async function verifyAbsent(
     const under = `${path}/`;
     for (const [p, i] of index) {
       if (!p.startsWith(under)) continue;
-      if (!options.hard && (await worktreeDiffers(worktree, p, i, options.trust))) {
+      if (
+        !options.hard &&
+        (await worktreeDiffers(worktree, p, i, options.trust, options.indexTime))
+      ) {
         return options.notUptodate(p);
       }
     }

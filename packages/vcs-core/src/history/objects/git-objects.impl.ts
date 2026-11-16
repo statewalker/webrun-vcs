@@ -205,6 +205,20 @@ export function createGitObjects(
   ): Promise<string> {
     if (!TYPES.has(type)) throw new TypeError(`unknown object type ${type}`);
     if (!Number.isSafeInteger(size) || size < 0) throw new RangeError(`bad object size ${size}`);
+    // content held in memory: hashed first, and an object already stored is not written
+    // again (git's write_object_file: freshen_object before writing)
+    if (store.isFresh && Array.isArray(content)) {
+      const chunks = content as Uint8Array[];
+      let total = 0;
+      for (const chunk of chunks) total += chunk.length;
+      if (total === size) {
+        const first = newHasher();
+        first.update(enc.encode(`${type} ${size}\0`));
+        for (const chunk of chunks) first.update(chunk);
+        const id = hex(first);
+        if (await store.isFresh(id)) return id;
+      }
+    }
     const hasher = newHasher();
     async function* framed() {
       yield enc.encode(`${type} ${size}\0`);

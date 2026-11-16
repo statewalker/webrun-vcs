@@ -163,6 +163,66 @@ async function readAll(
   return out;
 }
 
+/** Bytes of a pack read and kept at a time (JGit's WindowCache windows). */
+const WINDOW = 64 * 1024;
+/** Ranges longer than this are read from the file as they stream, never kept. */
+const WINDOWED_MAX = 4 * WINDOW;
+
+/**
+ * Windows of pack files read before, most recently used last, shared by every pack opened
+ * (bounded by `limit` bytes). A pack never changes once installed (its name is its
+ * content's hash), so a window stays valid while its pack is open; reading an entry from
+ * a window saves the file reads of its header and its data (git maps the pack instead).
+ */
+class PackWindowCache {
+  private readonly map = new Map<string, Promise<Uint8Array>>();
+  private held = 0;
+  private readonly sizes = new Map<string, number>();
+  constructor(private readonly limit: number) {}
+
+  get(key: string, load: () => Promise<Uint8Array>): Promise<Uint8Array> {
+    const hit = this.map.get(key);
+    if (hit) {
+      this.map.delete(key);
+      this.map.set(key, hit);
+      return hit;
+    }
+    const loading = load();
+    this.map.set(key, loading);
+    loading.then(
+      (bytes) => {
+        if (this.map.get(key) !== loading) return;
+        this.sizes.set(key, bytes.length);
+        this.held += bytes.length;
+        for (const k of this.map.keys()) {
+          if (this.held <= this.limit) break;
+          const size = this.sizes.get(k);
+          if (size === undefined) continue; // still loading
+          this.map.delete(k);
+          this.sizes.delete(k);
+          this.held -= size;
+        }
+      },
+      () => {
+        if (this.map.get(key) === loading) this.map.delete(key);
+      },
+    );
+    return loading;
+  }
+
+  /** Forgets the windows of one pack (closed). */
+  drop(prefix: string): void {
+    for (const k of [...this.map.keys()]) {
+      if (!k.startsWith(prefix)) continue;
+      this.map.delete(k);
+      this.held -= this.sizes.get(k) ?? 0;
+      this.sizes.delete(k);
+    }
+  }
+}
+
+const windows = new PackWindowCache(32 * 2 ** 20);
+
 async function* once(b: Uint8Array): AsyncGenerator<Uint8Array> {
   yield b;
 }
@@ -412,11 +472,47 @@ export async function openPack(
   const pool = createInflaterPool();
   let inflations = 0;
 
+  /** The pack's bytes [start, start + length) from cached windows; long ranges streamed. */
+  async function* readRange(start: number, length: number): AsyncGenerator<Uint8Array> {
+    if (length > WINDOWED_MAX) {
+      yield* files.read(packPath, { start, length });
+      return;
+    }
+    const end = Math.min(start + length, packLen);
+    for (let at = start; at < end; ) {
+      const w = Math.floor(at / WINDOW);
+      const from = w * WINDOW;
+      const bytes = await windows.get(`${keyPrefix}${w}`, () =>
+        readAll(files, packPath, from, Math.min(WINDOW, packLen - from)),
+      );
+      const to = Math.min(end, from + bytes.length);
+      if (to <= at) return; // the file is shorter than it was
+      yield bytes.subarray(at - from, to - from);
+      at = to;
+    }
+  }
+  const readRangeAll = async (start: number, length: number): Promise<Uint8Array> => {
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for await (const c of readRange(start, length)) {
+      parts.push(c);
+      total += c.length;
+    }
+    if (parts.length === 1) return parts[0] as Uint8Array;
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) {
+      out.set(p, o);
+      o += p.length;
+    }
+    return out;
+  };
+
   const readHead = async (offset: number): Promise<EntryHead> => {
     const end = endOf(offset);
     if (offset < 12 || end <= offset)
       throw new PackError(`${packPath}: bad entry offset ${offset}`);
-    const h = await readAll(files, packPath, offset, Math.min(32, end - offset));
+    const h = await readRangeAll(offset, Math.min(32, end - offset));
     let p = 0;
     const byte = () => {
       if (p >= h.length) throw new PackError(`${packPath}: entry header at ${offset} truncated`);
@@ -475,10 +571,7 @@ export async function openPack(
     let got = 0;
     let done = false;
     try {
-      for await (const c of files.read(packPath, {
-        start: e.dataStart,
-        length: e.end - e.dataStart,
-      })) {
+      for await (const c of readRange(e.dataStart, e.end - e.dataStart)) {
         for (let at = 0; at < c.length && !done; at += SLICE) {
           let r: ReturnType<StreamInflater["push"]>;
           try {
@@ -658,7 +751,10 @@ export async function openPack(
         return cache.peakBytes;
       },
     },
-    close: () => cache.drop(keyPrefix),
+    close: () => {
+      cache.drop(keyPrefix);
+      windows.drop(keyPrefix);
+    },
     has: (id) => t.find(id) >= 0,
     *ids() {
       for (let i = 0; i < n; i++) yield hex(t.idAt(i));

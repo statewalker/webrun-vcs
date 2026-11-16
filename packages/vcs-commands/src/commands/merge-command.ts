@@ -32,15 +32,18 @@ import {
   defaultIdent,
   flatTree,
   indexChanges,
+  indexChangesFromTree,
   OperationState,
   readIndex,
   rewriteIndex,
   storeFlatTree,
+  storeFlatTreeOver,
   switchTrees,
+  treeDelta,
 } from "./merge-support.js";
 import { octopusMerge } from "./octopus-merge.js";
-import { ortMerge, ortResultEntries } from "./ort-merge.js";
-import { mergeBaseTree } from "./ort-recursive.js";
+import { ortResultEntries } from "./ort-merge.js";
+import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
 import {
   applyAutostash,
   cleanupMessage,
@@ -583,15 +586,14 @@ export class MergeCommand extends GitCommand<MergeResult> {
     if (!headCommit || !srcCommit) {
       throw new RefNotFoundError(headId, "Failed to load commits for merge");
     }
-    const headTree = await flatTree(this.trees, headCommit.tree);
     const { index } = await readIndex(this.staging);
 
     const mergeName = await this.describeMergeSource(srcName, srcId);
     const output: string[] = [];
     let target: Map<string, { objectId: ObjectId; mode: number }>;
-    let merge: Awaited<ReturnType<typeof ortMerge>> | undefined;
+    let merge: Awaited<ReturnType<typeof mergeStoredTrees>> | undefined;
     if (this.strategy === MergeStrategy.OURS) {
-      target = headTree;
+      target = await flatTree(this.trees, headCommit.tree);
     } else if (this.strategy === MergeStrategy.THEIRS) {
       target = await flatTree(this.trees, srcCommit.tree);
     } else {
@@ -609,11 +611,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
         mergeBases,
         common,
       );
-      merge = await ortMerge(
-        this.blobs,
-        base.tree,
-        headTree,
-        await flatTree(this.trees, srcCommit.tree),
+      merge = await mergeStoredTrees(
+        { trees: this.trees, blobs: this.blobs },
+        base,
+        headCommit.tree,
+        srcCommit.tree,
         {
           ...common,
           oursLabel: "HEAD",
@@ -624,12 +626,15 @@ export class MergeCommand extends GitCommand<MergeResult> {
       );
       target = await ortResultEntries(this.blobs, merge);
     }
-    const treeId = await storeFlatTree(this.trees, target);
+    // only the directories the merge changes are stored again
+    const treeId = merge
+      ? await storeFlatTreeOver(this.trees, headCommit.tree, merge.ours, target)
+      : await storeFlatTree(this.trees, target);
     // merge-ort records its result tree (AUTO_MERGE) whether or not it can be written
     if (merge) await state.setRef("AUTO_MERGE", treeId);
 
     // merge-ort's sanity check: the index must match HEAD (merge-ort-wrappers' unclean())
-    const staged = indexChanges(index, headTree);
+    const staged = await indexChangesFromTree(index, this.trees, headCommit.tree);
     if (staged.length > 0) {
       await this.restoreStateQuirk(state, headCommit.tree, worktree);
       return {
@@ -643,10 +648,13 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
 
     const conflicts = merge ? [...merge.conflicts.values()] : [];
-    const refused = await switchTrees(this.context(worktree), headTree, target, {
+    // only the paths HEAD and the result differ on are switched
+    const delta = await treeDelta(this.trees, headCommit.tree, treeId);
+    const refused = await switchTrees(this.context(worktree), delta.from, delta.to, {
       action: "merge",
       operation: "merge",
       conflicts,
+      targetTree: treeId,
     });
     if (refused) {
       await this.restoreStateQuirk(state, headCommit.tree, worktree);

@@ -354,6 +354,8 @@ export function encodeIndexFile(
   extensions: readonly IndexExtension[] = [],
 ): Iterable<Uint8Array> {
   for (const entry of entries) {
+    // an entry encoded before was checked then (entries are never changed in place)
+    if (encodedEntries.has(entry)) continue;
     validatePath(entry.path);
     objectIdToBytes(entry.objectId);
   }
@@ -451,12 +453,56 @@ function comparePaths(a: string, b: string): number {
 /**
  * Serialize a single index entry.
  */
+/**
+ * The version 2/3 bytes of entries already encoded, by entry object and version. An index
+ * written again and again (a rebase's picks) keeps most of its entry objects: only the
+ * entries a command replaced are encoded afresh. Entries are never changed in place.
+ */
+const encodedEntries = new WeakMap<StagingEntry, { version: IndexVersion; bytes: Uint8Array }>();
+
+const pathEncoder = new TextEncoder();
+
+/**
+ * Lets `copy`, a new entry object built from `source` (an index builder copies the entries
+ * it keeps), reuse the bytes `source` was encoded to, when every field the encoding reads is
+ * the same in both. A rewrite of a large index then encodes only what changed.
+ */
+export function reuseEntryEncoding(source: object, copy: StagingEntry): void {
+  const known = encodedEntries.get(source as StagingEntry);
+  if (!known) return;
+  const a = source as StagingEntry;
+  if (
+    a.path === copy.path &&
+    a.mode === copy.mode &&
+    a.objectId === copy.objectId &&
+    a.stage === copy.stage &&
+    a.size === copy.size &&
+    a.mtime === copy.mtime &&
+    a.ctime === copy.ctime &&
+    a.mtimeNs === copy.mtimeNs &&
+    a.ctimeNs === copy.ctimeNs &&
+    a.dev === copy.dev &&
+    a.ino === copy.ino &&
+    a.uid === copy.uid &&
+    a.gid === copy.gid &&
+    a.assumeValid === copy.assumeValid &&
+    a.intentToAdd === copy.intentToAdd &&
+    a.skipWorktree === copy.skipWorktree
+  ) {
+    encodedEntries.set(copy, known);
+  }
+}
+
 function serializeEntry(
   entry: StagingEntry,
   version: IndexVersion,
   previousPath: string,
 ): Uint8Array {
-  const pathBytes = new TextEncoder().encode(entry.path);
+  if (version !== INDEX_VERSION_4) {
+    const known = encodedEntries.get(entry);
+    if (known && known.version === version) return known.bytes;
+  }
+  const pathBytes = pathEncoder.encode(entry.path);
   const hasExtended = entry.intentToAdd || entry.skipWorktree || version === INDEX_VERSION_3;
 
   if (version === INDEX_VERSION_4) {
@@ -479,6 +525,7 @@ function serializeEntry(
   buffer.set(pathBytes, infoLen);
   // Remaining bytes are already 0 (null terminator + padding)
 
+  encodedEntries.set(entry, { version, bytes: buffer });
   return buffer;
 }
 

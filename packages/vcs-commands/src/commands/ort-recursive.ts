@@ -10,13 +10,25 @@ import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 
 import type { CommandCommits, CommandTrees } from "../git-command.js";
 import { type BaseNode, MergeBaseGraph } from "./merge-bases.js";
-import { abbrev, flatTree } from "./merge-support.js";
-import { type OrtMergeOptions, ortMerge, ortResultEntries } from "./ort-merge.js";
+import { abbrev, flatTree, prunedFlatTrees } from "./merge-support.js";
+import {
+  type OrtMergeOptions,
+  type OrtMergeResult,
+  ortMerge,
+  ortResultEntries,
+} from "./ort-merge.js";
 import type { CheckedEntry } from "./worktree-overwrite-checks.js";
 
 /** The base a merge runs against, and its name after `|||||||`. */
 export interface MergeBaseTree {
-  tree: Map<string, CheckedEntry>;
+  /** The base as a flat map (read on demand for a stored tree) */
+  tree(): Promise<Map<string, CheckedEntry>>;
+  /**
+   * Whether the base is a stored tree, `treeId` (undefined: the empty tree), rather than a
+   * virtual merge base held in memory
+   */
+  stored: boolean;
+  treeId?: ObjectId;
   label: string;
 }
 
@@ -40,7 +52,7 @@ export async function mergeBaseTree(
   bases: ObjectId[],
   options: Omit<OrtMergeOptions, "oursLabel" | "theirsLabel" | "baseLabel">,
 ): Promise<MergeBaseTree> {
-  if (bases.length === 0) return { tree: new Map(), label: "empty tree" };
+  if (bases.length === 0) return emptyBase();
   const graph = new MergeBaseGraph({
     load: async (id) => {
       const commit = await ctx.commits.load(id);
@@ -63,14 +75,24 @@ async function mergedBases(
   options: Omit<OrtMergeOptions, "oursLabel" | "theirsLabel" | "baseLabel">,
 ): Promise<MergeBaseTree> {
   const [first, ...rest] = bases;
-  if (!first) return { tree: new Map(), label: "empty tree" };
+  if (!first) return emptyBase();
   const label = rest.length > 0 ? "merged common ancestors" : abbrev(first.id ?? "");
+  if (rest.length === 0 && first.id) {
+    // one real commit: its stored tree
+    const treeId = await ctx.commits.getTree(first.id);
+    return { tree: () => first.tree(), stored: true, treeId, label };
+  }
   let merged = first;
   for (const next of rest) {
     const tree = await innerMerge(ctx, graph, merged, next, depth + 1, options);
     merged = graph.virtual(tree, [merged, next]);
   }
-  return { tree: await merged.tree(), label };
+  const tree = await merged.tree();
+  return { tree: async () => tree, stored: false, label };
+}
+
+function emptyBase(): MergeBaseTree {
+  return { tree: async () => new Map(), stored: true, label: "empty tree" };
 }
 
 /** A merge of two merge bases (`call_depth` > 0): its result tree, conflicts and all. */
@@ -84,7 +106,7 @@ async function innerMerge(
 ): Promise<Map<string, CheckedEntry>> {
   const bases = [...(await graph.mergeBases(h1, h2))].reverse();
   const base = await mergedBases(ctx, graph, bases, depth, options);
-  const merge = await ortMerge(ctx.blobs, base.tree, await h1.tree(), await h2.tree(), {
+  const merge = await ortMerge(ctx.blobs, await base.tree(), await h1.tree(), await h2.tree(), {
     ...options,
     oursLabel: "Temporary merge branch 1",
     theirsLabel: "Temporary merge branch 2",
@@ -94,4 +116,41 @@ async function innerMerge(
     callDepth: depth,
   });
   return ortResultEntries(ctx.blobs, merge);
+}
+
+/**
+ * merge-ort over stored trees: `ours` and `theirs` (tree ids) against `base`. A stored base
+ * merges the trees as merge-ort reads them (directories all three hold alike are never
+ * read, {@link prunedFlatTrees}); a virtual base, or a merge that finds directory renames
+ * (which may move a path into any directory), merges the whole trees.
+ */
+export async function mergeStoredTrees(
+  ctx: Pick<VirtualBaseContext, "trees" | "blobs">,
+  base: MergeBaseTree,
+  ours: ObjectId | undefined,
+  theirs: ObjectId | undefined,
+  options: OrtMergeOptions,
+  flat: (id: ObjectId | undefined) => Promise<Map<string, CheckedEntry>> = (id) =>
+    flatTree(ctx.trees, id),
+): Promise<OrtMergeResult & { ours: Map<string, CheckedEntry> }> {
+  if (base.stored) {
+    const { flats, dirs } = await prunedFlatTrees(ctx.trees, [base.treeId, ours, theirs]);
+    const merge = await ortMerge(ctx.blobs, flats[0], flats[1], flats[2], {
+      ...options,
+      dirTrees: dirs,
+    });
+    if (!merge.directoryRenames) return { ...merge, ours: flats[1] };
+  }
+  const oursFlat = await flat(ours);
+  const merge = await ortMerge(ctx.blobs, await base.tree(), oursFlat, await flat(theirs), options);
+  return { ...merge, ours: oursFlat };
+}
+
+/** A stored tree (undefined: the empty tree) as the base of {@link mergeStoredTrees}. */
+export function storedBase(
+  treeId: ObjectId | undefined,
+  label: string,
+  flat: () => Promise<Map<string, CheckedEntry>>,
+): MergeBaseTree {
+  return { tree: flat, stored: true, treeId, label };
 }

@@ -11,7 +11,7 @@ import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, FileMode, type FilesApi } from "@statewalker/vcs-core";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import { IndexFile, readIndexChecksum } from "./index-file.js";
-import { INDEX_VERSION_2, type IndexVersion } from "./index-format.js";
+import { INDEX_VERSION_2, type IndexVersion, reuseEntryEncoding } from "./index-format.js";
 import type {
   ConflictResolution,
   EntryIteratorOptions,
@@ -120,6 +120,10 @@ export class GitStaging implements Staging {
       }
     }
     return removed;
+  }
+
+  entryList(): readonly IndexEntry[] {
+    return this._entries.slice();
   }
 
   async *entries(options?: EntryIteratorOptions): AsyncIterable<IndexEntry> {
@@ -511,7 +515,7 @@ class GitStagingBuilder implements IndexBuilder {
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,
     };
-
+    reuseEntryEncoding(options, entry);
     this.entries.push(entry);
   }
 

@@ -251,7 +251,7 @@ export function createFilesRefOps(
 
   /** File text, or undefined if absent (also when it vanishes between the check and the read). */
   async function readText(path: string): Promise<string | undefined> {
-    if (!(await files.exists(path))) return undefined;
+    // an absent file reads as nothing (told apart from an empty one below)
     let text = "";
     let any = false;
     for await (const chunk of files.read(path)) {

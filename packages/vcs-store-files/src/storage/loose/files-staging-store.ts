@@ -148,8 +148,14 @@ export function filesStagingStore(
     },
 
     async *get(id) {
+      // read at once: a missing file reads as nothing (one lookup instead of two); a
+      // FilesApi that throws for it is asked whether the file is there
       const path = pathOf(id);
-      if (await isFile(path)) yield* files.read(path);
+      try {
+        yield* files.read(path);
+      } catch (e) {
+        if (await isFile(path)) throw e;
+      }
     },
 
     has: (id) => isFile(pathOf(id)),

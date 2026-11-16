@@ -107,6 +107,12 @@ export interface Staging {
    */
   entries(options?: EntryIteratorOptions): AsyncIterable<IndexEntry>;
 
+  /**
+   * Every entry in Git canonical order, at once: what `entries()` yields, for a caller that
+   * reads the whole index (no await per entry). Optional.
+   */
+  entryList?(): readonly IndexEntry[];
+
   // ========== Conflict Handling ==========
 
   /**

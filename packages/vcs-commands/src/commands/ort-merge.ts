@@ -103,6 +103,12 @@ export interface OrtMergeOptions {
   defaultDriver?: string;
   /** merge.<driver>.recursive: the driver used in merges of merge bases */
   recursiveDriver?: (name: string) => string | undefined;
+  /**
+   * The trees given as {@link prunedFlatTrees} reads them (directories all three hold alike
+   * stand as one TREE entry): per tree (base, ours, theirs), the id of each directory, so a
+   * directory taken whole from a side is the side's tree, never read.
+   */
+  dirTrees?: Map<string, ObjectId>[];
 }
 
 /** What {@link ortMerge} found. */
@@ -115,6 +121,8 @@ export interface OrtMergeResult {
   clean: boolean;
   /** merge-ort's messages (`Auto-merging x`, `CONFLICT (...)`), in git's order */
   messages: string[];
+  /** Whether directory renames were found (paths may move into any directory) */
+  directoryRenames?: boolean;
 }
 
 const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
@@ -440,7 +448,8 @@ class OrtMerge {
       // tree order: a directory sorts as `name/`
       const key = (c: string) => {
         const m = nodes.get(c) as Node;
-        return m.dirmask && !filemaskOf(m) ? `${c}/` : c;
+        // a directory, or one all three trees hold alike (a TREE entry standing for it)
+        return (m.dirmask && !filemaskOf(m)) || m.files[0]?.mode === FileMode.TREE ? `${c}/` : c;
       };
       const children = (n.children ?? []).sort((x, y) => compareStrings(key(x), key(y)));
       // a directory one side removed: its children read first, to see whether the side
@@ -1175,7 +1184,8 @@ class OrtMerge {
   /** record_entry_for_tree: the entry is in the result tree (its directories not empty). */
   private record(path: string, info: Info): void {
     if (info.isNull || !info.result) return;
-    if (info.result.mode !== FileMode.TREE) this.recorded.set(path, info.result);
+    // a directory's own entry is no content (TREE), unless it stands for a stored tree
+    if (info.result !== TREE) this.recorded.set(path, info.result);
     for (let dir = dirnameOf(path); ; dir = dirnameOf(dir)) {
       if (this.nonEmptyDirs.has(dir)) break;
       this.nonEmptyDirs.add(dir);
@@ -1197,6 +1207,14 @@ class OrtMerge {
           info.result = kept;
           info.isNull = false;
           this.record(path, info);
+        } else if (this.options.dirTrees?.[trivial]?.has(path)) {
+          // the side's tree as it is
+          const id = this.options.dirTrees[trivial].get(path) as ObjectId;
+          this.record(path, {
+            ...info,
+            result: { objectId: id, mode: FileMode.TREE },
+            isNull: false,
+          });
         } else {
           const prefix = `${path}/`;
           for (const [p, e] of this.trees[trivial]) {
@@ -1437,7 +1455,13 @@ class OrtMerge {
     const messages = this.notes
       .sort((x, y) => compareStrings(x.path, y.path) || x.order - y.order)
       .map((n) => n.text);
-    return { result, conflicts, messages, clean: this.renamesClean && this.conflicted.size === 0 };
+    return {
+      result,
+      conflicts,
+      messages,
+      clean: this.renamesClean && this.conflicted.size === 0,
+      directoryRenames: this.dirRenames[1].size > 0 || this.dirRenames[2].size > 0,
+    };
   }
 }
 

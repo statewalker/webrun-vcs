@@ -27,7 +27,6 @@ import {
   assertWritableIndexExtensions,
   carryIndexExtensions,
   encodeResolveUndo,
-  indexEntriesDigest,
   parseResolveUndo,
   type ResolveUndoRecord,
 } from "./index-extensions.js";
@@ -162,10 +161,10 @@ export async function writeIndexFile(
     if (Date.now() >= deadline) throw new IndexLockedError(lockPath);
     await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
   }
-  let checksum = "";
+  let last: Uint8Array | undefined;
   function* tracked(): Generator<Uint8Array> {
     for (const chunk of content) {
-      checksum = bytesToHex(chunk); // the last chunk is the checksum
+      last = chunk; // the last chunk is the checksum
       yield chunk;
     }
   }
@@ -180,7 +179,7 @@ export async function writeIndexFile(
     await atomic.remove(lockPath).catch(() => {});
     throw error;
   }
-  return checksum;
+  return last ? bytesToHex(last) : "";
 }
 
 /**
@@ -193,8 +192,11 @@ export async function writeIndexFile(
 export class IndexFile {
   version: IndexVersion = INDEX_VERSION_2;
   private extensions: IndexExtension[] = [];
-  /** Digest of the entries read, when an extension depends on them. */
-  private entriesDigest: string | undefined;
+  /**
+   * The entries read or written, when an extension depends on them (entries are never
+   * changed in place: the references are the snapshot).
+   */
+  private entriesKept: readonly StagingEntry[] | undefined;
   /** Why the last read refused the index; writes refuse it too until a read succeeds. */
   private refused: Error | undefined;
   /**
@@ -225,7 +227,7 @@ export class IndexFile {
     this.checksum = other.checksum;
     this.version = other.version;
     this.extensions = other.extensions;
-    this.entriesDigest = other.entriesDigest;
+    this.entriesKept = other.entriesKept;
     this.refused = other.refused;
   }
 
@@ -239,7 +241,7 @@ export class IndexFile {
     const stats = await this.files.stats(this.path);
     if (!stats) {
       this.extensions = [];
-      this.entriesDigest = undefined;
+      this.entriesKept = undefined;
       this.refused = undefined;
       this.checksum = null;
       return undefined;
@@ -257,8 +259,7 @@ export class IndexFile {
     this.checksum = bytesToHex(data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE)));
     this.version = parsed.version;
     this.extensions = parsed.extensionData;
-    this.entriesDigest =
-      this.extensions.length > 0 ? indexEntriesDigest(parsed.entries) : undefined;
+    this.entriesKept = this.extensions.length > 0 ? parsed.entries.slice() : undefined;
     // the index file's own mtime; unknown is 0 (every entry racy), never "now"
     return { entries: parsed.entries, lastModified: stats.lastModified ?? 0 };
   }
@@ -320,8 +321,8 @@ export class IndexFile {
    */
   async write(entries: readonly StagingEntry[]): Promise<void> {
     if (this.refused) throw this.refused;
-    const changed =
-      this.entriesDigest === undefined || indexEntriesDigest(entries) !== this.entriesDigest;
+    // what indexEntriesDigest compares: path, stage, mode, object id, intent-to-add
+    const changed = this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries);
     const extensions = carryIndexExtensions(this.extensions, entries, changed);
     this.checksum = await writeIndexFile(this.files, this.path, entries, {
       version: this.version,
@@ -330,6 +331,26 @@ export class IndexFile {
       expectedChecksum: this.checksum,
     });
     this.extensions = extensions;
-    this.entriesDigest = extensions.length > 0 ? indexEntriesDigest(entries) : undefined;
+    this.entriesKept = extensions.length > 0 ? entries.slice() : undefined;
   }
+}
+
+/** Whether two entry lists agree on what an entry-derived extension depends on. */
+function sameIndexEntries(a: readonly StagingEntry[], b: readonly StagingEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x === y) continue;
+    if (
+      x.path !== y.path ||
+      x.stage !== y.stage ||
+      x.mode !== y.mode ||
+      x.objectId !== y.objectId ||
+      (x.intentToAdd ? 1 : 0) !== (y.intentToAdd ? 1 : 0)
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
