@@ -168,6 +168,22 @@ export interface Checkout {
    */
   writeFetchHead?(content: string, options?: { append?: boolean }): Promise<void>;
 
+  // -------- Operation state files --------
+  /**
+   * A file of the repository's operation state, by its path in git's directory: `MERGE_MSG`,
+   * `MERGE_MODE`, `SQUASH_MSG`, `sequencer/todo`, `rebase-merge/onto`, ... (the pseudo refs
+   * `MERGE_HEAD`, `ORIG_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD` and `AUTO_MERGE` go
+   * through the ref store). Undefined when there is no such file. Optional: a checkout
+   * without these keeps no state a merge, cherry-pick, revert or rebase can resume from.
+   */
+  readStateFile?(name: string): Promise<Uint8Array | undefined>;
+  /** Writes a state file (as git writes them: in place, parent directories created). */
+  writeStateFile?(name: string, content: Uint8Array | string): Promise<void>;
+  /** Removes a state file or directory (recursively); nothing there is no error. */
+  removeStateFile?(name: string): Promise<void>;
+  /** The names in a state directory (e.g. `rebase-merge`), sorted; empty if there is none. */
+  listStateDir?(name: string): Promise<string[]>;
+
   // ========== Lifecycle ==========
   initialize(): Promise<void>;
   refresh(): Promise<void>;

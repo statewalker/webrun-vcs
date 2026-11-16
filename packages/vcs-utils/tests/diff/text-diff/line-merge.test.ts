@@ -73,3 +73,54 @@ describe("mergeLines", () => {
     expect(text(r.content)).toBe("a\nc\nd\nE\n");
   });
 });
+
+describe("mergeLines refines conflicts as git's xdl_merge", () => {
+  const styled = (
+    base: string,
+    ours: string,
+    theirs: string,
+    style: "merge" | "diff3" | "zdiff3",
+    favor?: "ours" | "theirs" | "union",
+  ) =>
+    text(
+      mergeLines(latin1(base), latin1(ours), latin1(theirs), {
+        oursLabel: "HEAD",
+        theirsLabel: "side",
+        baseLabel: "base",
+        style,
+        favor,
+      }).content,
+    );
+
+  it("lines both sides share leave the conflict (XDL_MERGE_ZEALOUS)", () => {
+    const out = styled("1\n2\n3\n4\n", "1\nC\nX\n4\n", "1\nC\nY\n4\n", "merge");
+    expect(out).toBe("1\nC\n<<<<<<< HEAD\nX\n=======\nY\n>>>>>>> side\n4\n");
+  });
+
+  it("conflicts at most three lines apart are joined, shared lines inside", () => {
+    // as native git merges it: X|Y, then `common`, then M|S, joined into one conflict
+    const out = styled(
+      "1\n2\n3\n4\n5\n6\n",
+      "1\nX\ncommon\nM\n5\n6\n",
+      "1\nY\ncommon\nS\n5\n6\n",
+      "merge",
+    );
+    expect(out).toBe("1\n<<<<<<< HEAD\nX\ncommon\nM\n=======\nY\ncommon\nS\n>>>>>>> side\n5\n6\n");
+  });
+
+  it("diff3 writes the base and refines nothing", () => {
+    const out = styled("1\n2\n3\n4\n", "1\nC\nX\n4\n", "1\nC\nY\n4\n", "diff3");
+    expect(out).toBe("1\n<<<<<<< HEAD\nC\nX\n||||||| base\n2\n3\n=======\nC\nY\n>>>>>>> side\n4\n");
+  });
+
+  it("zdiff3 moves the shared first and last lines out, the base kept whole", () => {
+    const out = styled("1\n2\n3\n4\n", "1\nC\nX\n4\n", "1\nC\nY\n4\n", "zdiff3");
+    expect(out).toBe("1\nC\n<<<<<<< HEAD\nX\n||||||| base\n2\n3\n=======\nY\n>>>>>>> side\n4\n");
+  });
+
+  it("a favored side resolves the conflict (-X ours / -X theirs / union)", () => {
+    expect(styled("x\n", "o\n", "t\n", "merge", "ours")).toBe("o\n");
+    expect(styled("x\n", "o\n", "t\n", "merge", "theirs")).toBe("t\n");
+    expect(styled("x\n", "o\n", "t\n", "merge", "union")).toBe("o\nt\n");
+  });
+});

@@ -180,8 +180,11 @@ describe.each(backends)("Branching and Merging ($name backend)", ({ factory }) =
       await store.staging.write();
       await git.commit().setMessage("Feature commit").call();
 
-      // Switch to main and merge with NO_FF
+      // Switch to main (the index too: git merges only onto an index matching HEAD)
       await store.refs.setSymbolic("HEAD", "refs/heads/main");
+      const mainRef = await store.refs.resolve("refs/heads/main");
+      const mainCommit = defined(await store.commits.load(mainRef?.objectId ?? ""), "commit");
+      await store.staging.readTree(store.trees, mainCommit.tree);
       const mergeResult = await git
         .merge()
         .include("feature")

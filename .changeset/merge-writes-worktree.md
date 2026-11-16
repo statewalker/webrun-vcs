@@ -1,0 +1,13 @@
+---
+"@statewalker/vcs-commands": minor
+"@statewalker/vcs-working-tree": minor
+"@statewalker/vcs-store-files": minor
+"@statewalker/vcs-utils": minor
+---
+
+**Merge, cherry-pick, revert, rebase and pull write the working tree as git does.**
+
+- **vcs-commands:** `merge` is git's merge-ort (renames, line merge, modify/delete, rename/delete, rename/rename, binary, distinct types, file/directory placement as `file~HEAD`) written to the index and the worktree through a two-way switch from HEAD, smudged with the attributes of the resulting index. Before anything is written it refuses as git: local changes, staged changes (`  a b` / `Merge with strategy ort failed.`), untracked files in the way, unmerged entries, a merge or cherry-pick in progress. Conflicts leave git's markers (`merge.conflictStyle` `merge`, `diff3`, `zdiff3`; labels `HEAD`, the branch, `<abbrev> (<subject>)`, `parent of ...`), stages 1-3 and git's state (`MERGE_HEAD`, `MERGE_MSG`, `MERGE_MODE`, `ORIG_HEAD`, `AUTO_MERGE`, `SQUASH_MSG`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `sequencer/`, `rebase-merge/`, `REBASE_HEAD`), so native git continues or aborts what we started and the other way round. New: `MergeCommand.setOperation(MergeOperation.ABORT | CONTINUE)`, `setAuthor`, `setCommitter`, `setAutoStash` (`merge.autoStash`); `CherryPickCommand` / `RevertCommand.setOperation(SequencerOperation.CONTINUE | SKIP | ABORT | QUIT)`, `setCommitter`, several commits through `sequencer/`; `RebaseCommand` keeps git's `rebase-merge/` state (continue, skip, abort across implementations), `setCommitter`, `setAutoStash` (`rebase.autoStash`), refuses on unstaged or staged changes, drops picks that become empty; `PullCommand.setRebase(true)` rebases (`PullResult.rebaseResult`) and a merging pull uses git's message (`Merge branch 'x' of <url>`). Results carry `output` (merge-ort's `Auto-merging` / `CONFLICT` lines) and `message` (git's error); a refused merge is `FAILED` with `failingPaths`. A content merge of files both sides changed no longer conflicts when the edits do not touch. `stash apply` shares the merge (and its conflict refinement) and records `AUTO_MERGE`.
+- **vcs-utils:** `mergeLines` is git's `xdl_merge`: zealous conflict refinement (shared lines leave a conflict, conflicts at most three lines apart join), `style` (`merge`, `diff3`, `zdiff3`) with `baseLabel`, `favor` (`ours`, `theirs`, `union`), `markerSize`, and git's choice of CRLF markers.
+- **vcs-working-tree:** `Checkout` gains optional operation state files (`readStateFile`, `writeStateFile`, `removeStateFile`, `listStateDir`); `MemoryCheckout` keeps them in memory.
+- **vcs-store-files:** `GitCheckout` reads and writes them in the git directory (`GitCheckoutFilesApi.list` lists a state directory).

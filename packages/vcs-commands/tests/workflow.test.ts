@@ -263,6 +263,11 @@ describe.each(backends)("Phase 2 Integration Workflow ($name backend)", ({ facto
 
     // === STEP 4: Switch back to main ===
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
+    // the index too: git merges only onto an index matching HEAD
+    const mainTip = await repository.commits.load(
+      (await repository.refs.resolve("HEAD"))?.objectId ?? "",
+    );
+    if (mainTip) await workingCopy.checkout.staging.readTree(repository.trees, mainTip.tree);
 
     // === STEP 5: Merge feature into main ===
     const result = await git
@@ -422,8 +427,12 @@ describe.each(backends)("Phase 2 Integration Workflow ($name backend)", ({ facto
     expect(diffBeforeMerge.length).toBe(2);
 
     // === Merge: Combine branches ===
-    // Switch to main first
+    // Switch to main first (the index too: git merges only onto an index matching HEAD)
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
+    const mainTip = await repository.commits.load(
+      (await repository.refs.resolve("HEAD"))?.objectId ?? "",
+    );
+    if (mainTip) await workingCopy.checkout.staging.readTree(repository.trees, mainTip.tree);
 
     const mergeResult = await git.merge().include("refs/heads/feature").call();
 

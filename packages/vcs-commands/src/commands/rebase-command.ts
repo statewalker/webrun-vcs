@@ -1,4 +1,5 @@
-import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import { isSymbolicRef, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CommitNotFoundError,
@@ -11,115 +12,95 @@ import { GitCommand } from "../git-command.js";
 import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-result.js";
 import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
-import { mergeTreesThreeWay } from "../tree-merge/index.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
+import { configBool, conflictStyleOf } from "./merge-config.js";
+import {
+  abbrev,
+  conflictsComment,
+  defaultIdent,
+  flatTree,
+  indexChanges,
+  OperationState,
+  readIndex,
+  storeFlatTree,
+  subjectOf,
+  switchTrees,
+} from "./merge-support.js";
+import { ortMerge, ortResultEntries } from "./ort-merge.js";
+import { expandCommitId } from "./sequencer-pick.js";
+import {
+  applyAutostash,
+  cleanupMessage,
+  createAutostash,
+  resetMerge,
+} from "./sequencer-support.js";
+import { worktreeDiffers } from "./worktree-overwrite-checks.js";
 
 /**
- * Get timezone offset string in Git format (+HHMM or -HHMM).
- */
-function getTimezoneOffset(): string {
-  const offset = new Date().getTimezoneOffset();
-  const sign = offset <= 0 ? "+" : "-";
-  const absOffset = Math.abs(offset);
-  const hours = Math.floor(absOffset / 60)
-    .toString()
-    .padStart(2, "0");
-  const minutes = (absOffset % 60).toString().padStart(2, "0");
-  return `${sign}${hours}${minutes}`;
-}
-
-/**
- * The available rebase operations.
- *
- * Based on JGit's RebaseCommand.Operation.
+ * Rebase operation types.
  */
 export enum RebaseOperation {
-  /** Initiates rebase */
+  /** Start a new rebase */
   BEGIN = "begin",
-
-  /** Continues after conflict resolution */
+  /** Continue after resolving conflicts */
   CONTINUE = "continue",
-
-  /** Skips the current commit */
+  /** Skip the current commit */
   SKIP = "skip",
-
-  /** Aborts and resets the current rebase */
+  /** Abort and restore original state */
   ABORT = "abort",
-
-  /** Process steps (internal) */
+  /** Process steps (for interactive rebase) */
   PROCESS_STEPS = "process-steps",
 }
 
 /**
- * Interactive rebase handler interface.
- *
- * Based on JGit's RebaseCommand.InteractiveHandler.
+ * Handler for interactive rebase.
  */
 export interface InteractiveHandler {
   /**
-   * Prepare the list of steps before rebase starts.
-   * Can reorder, remove, or change actions.
+   * Modify the steps before execution.
+   * @param steps List of rebase steps to modify
    */
   prepareSteps(steps: RebaseTodoLine[]): void;
 
   /**
-   * Modify commit message during reword/squash.
+   * Modify commit message for reword/squash.
+   * @param message Original message
+   * @returns Modified message
    */
   modifyCommitMessage(message: string): string;
 }
 
-/**
- * In-memory rebase state.
- */
-interface RebaseState {
-  /** Original HEAD ref name */
-  headName: string;
+/** The state directory of git's merge backend. */
+const DIR = "rebase-merge";
 
-  /** Original HEAD commit ID */
-  originalHead: ObjectId;
-
-  /** Onto commit (upstream) */
-  onto: ObjectId;
-
-  /** Onto name for messages */
-  ontoName: string;
-
-  /** Commits to cherry-pick in order */
-  todoSteps: RebaseTodoLine[];
-
-  /** Completed steps */
-  doneSteps: RebaseTodoLine[];
-
-  /** Whether rebase is in progress */
-  inProgress: boolean;
-
-  /** Current commit being processed (for stop/conflict) */
-  currentCommit?: ObjectId;
+/** One line of the todo list. */
+interface TodoItem {
+  action: RebaseAction;
+  id: ObjectId;
 }
 
+/** git's quoting of a value in `author-script` (`'...'`, a quote as `'\''`). */
+const sq = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
 /**
- * Rebase command for replaying commits on top of another branch.
+ * Rebase the current branch onto another commit.
  *
- * Equivalent to `git rebase`.
- *
- * Based on JGit's RebaseCommand.
+ * Equivalent to `git rebase <upstream>` with git's merge backend: the commits HEAD has that
+ * upstream has not (merges dropped) are picked one by one onto upstream by git's merge-ort,
+ * the working tree and the index written as git writes them. A conflict stops the rebase
+ * with git's markers (`<<<<<<< HEAD` / `>>>>>>> <abbrev> (<subject>)`), stages 1-3 and
+ * git's state (`.git/rebase-merge/`, `REBASE_HEAD`, `MERGE_MSG`, `AUTO_MERGE`), so native
+ * `git rebase --continue / --skip / --abort` resumes what we started, and we resume what
+ * native git started. A rebase is refused on unstaged or staged changes, as git refuses it.
  *
  * @example
  * ```typescript
- * // Basic rebase onto main
- * const result = await git.rebase()
- *   .setUpstream("main")
- *   .call();
- *
- * // Abort ongoing rebase
- * const result = await git.rebase()
- *   .setOperation(RebaseOperation.ABORT)
- *   .call();
- *
- * // Rebase with merge strategy
- * const result = await git.rebase()
- *   .setUpstream("main")
- *   .setStrategy(MergeStrategy.OURS)
- *   .call();
+ * const result = await git.rebase().setUpstream(mainId).call();
+ * if (result.status === RebaseStatus.STOPPED) {
+ *   // resolve, `git add`, then
+ *   await git.rebase().setOperation(RebaseOperation.CONTINUE).call();
+ * }
  * ```
  */
 export class RebaseCommand extends GitCommand<RebaseResult> {
@@ -130,14 +111,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private contentStrategy?: ContentMergeStrategy;
   private preserveMerges = false;
   private interactiveHandler?: InteractiveHandler;
-
-  // In-memory state for tracking rebase progress
-  private static rebaseStates = new WeakMap<object, RebaseState>();
+  private committer?: PersonIdent;
+  private autoStash?: boolean;
 
   /**
-   * Set the upstream branch or commit to rebase onto.
+   * Set the upstream commit to rebase onto.
    *
-   * @param upstream The upstream commit ID
+   * @param upstream Upstream commit ID
    */
   setUpstream(upstream: ObjectId): this {
     this.checkCallable();
@@ -147,9 +127,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Set the upstream branch name to rebase onto.
+   * Set the upstream by branch name.
    *
-   * @param upstream The upstream branch name
+   * @param upstream Branch name to rebase onto
    */
   async setUpstreamBranch(upstream: string): Promise<this> {
     this.checkCallable();
@@ -159,9 +139,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Override the upstream name for conflict messages.
+   * Set the upstream name for messages.
    *
-   * @param name The name to use for upstream in messages
+   * @param name Display name for upstream
    */
   setUpstreamName(name: string): this {
     this.checkCallable();
@@ -176,10 +156,15 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     return this;
   }
 
+  /** The upstream's name (the branch given, else its id). */
+  getUpstreamName(): string | undefined {
+    return this.upstreamCommitName;
+  }
+
   /**
    * Set the operation to perform.
    *
-   * @param operation BEGIN, CONTINUE, SKIP, or ABORT
+   * @param operation Rebase operation
    */
   setOperation(operation: RebaseOperation): this {
     this.checkCallable();
@@ -195,9 +180,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Set the merge strategy to use.
+   * Set the merge strategy (only git's merge-ort is run; kept for compatibility).
    *
-   * @param strategy The merge strategy
+   * @param strategy Merge strategy
    */
   setStrategy(strategy: MergeStrategy): this {
     this.checkCallable();
@@ -213,9 +198,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Set the content merge strategy for file-level conflicts.
+   * Set content merge strategy for conflicts (`-X ours`, `-X theirs`).
    *
-   * @param strategy The content merge strategy
+   * @param strategy Content merge strategy
    */
   setContentMergeStrategy(strategy: ContentMergeStrategy): this {
     this.checkCallable();
@@ -231,9 +216,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Set whether to preserve merges during rebase.
+   * Set whether to preserve merge commits (not supported: merges are dropped, as git's
+   * default rebase drops them).
    *
-   * @param preserve true to re-create merges
+   * @param preserve Whether to preserve merges
    */
   setPreserveMerges(preserve: boolean): this {
     this.checkCallable();
@@ -249,9 +235,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Enable interactive rebase with the given handler.
+   * Enable interactive mode with handler.
    *
-   * @param handler The interactive handler
+   * @param handler Interactive handler
    */
   runInteractively(handler: InteractiveHandler): this {
     this.checkCallable();
@@ -260,406 +246,538 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Execute the rebase command.
+   * Stash local changes away for the rebase and apply them after it (`--autostash`;
+   * default `rebase.autoStash`, false).
    */
+  setAutoStash(autoStash: boolean): this {
+    this.checkCallable();
+    this.autoStash = autoStash;
+    return this;
+  }
+
+  /** The committer of the rebased commits (default `Unknown`, now). */
+  setCommitter(committer: PersonIdent): this {
+    this.checkCallable();
+    this.committer = committer;
+    return this;
+  }
+
   async call(): Promise<RebaseResult> {
     this.checkCallable();
     this.setCallable(false);
+    const worktree = this.worktreeAccess;
+    const run = () => this.run(worktree);
+    return worktree?.batch ? worktree.batch(run) : run();
+  }
 
+  private async run(worktree: Worktree | undefined): Promise<RebaseResult> {
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
     switch (this.operation) {
       case RebaseOperation.ABORT:
-        return this.abort();
-
+        return this.abort(state, worktree);
       case RebaseOperation.CONTINUE:
-        return this.continueRebase();
-
+        return this.continueRebase(state, worktree);
       case RebaseOperation.SKIP:
-        return this.skip();
-
-      case RebaseOperation.BEGIN:
-      case RebaseOperation.PROCESS_STEPS:
-        return this.begin();
+        return this.skip(state, worktree);
+      default:
+        return this.begin(state, worktree);
     }
   }
 
-  /**
-   * Begin the rebase operation.
-   */
-  private async begin(): Promise<RebaseResult> {
+  private context(worktree: Worktree | undefined) {
+    return {
+      workingCopy: this.workingCopy,
+      worktree,
+      staging: this.staging,
+      blobs: this.blobs,
+      trees: this.trees,
+      commits: this.commits,
+      refs: this.refsStore,
+    };
+  }
+
+  private async inProgress(state: OperationState): Promise<boolean> {
+    return (
+      (await state.read(`${DIR}/head-name`)) !== undefined ||
+      (await state.read(`${DIR}/onto`)) !== undefined ||
+      (await state.listDir(DIR)).length > 0
+    );
+  }
+
+  private async begin(
+    state: OperationState,
+    worktree: Worktree | undefined,
+  ): Promise<RebaseResult> {
     if (!this.upstreamCommit) {
       throw new UpstreamRequiredError("Upstream commit is required for rebase BEGIN operation");
     }
-
-    // Get current HEAD
+    if (await this.inProgress(state)) {
+      return {
+        status: RebaseStatus.FAILED,
+        message:
+          "fatal: It seems that there is already a rebase-merge directory, and\nI wonder if you are in the middle of another rebase.",
+      };
+    }
     const headResolved = await this.refsStore.resolve("HEAD");
-    if (!headResolved?.objectId) {
-      throw new NoHeadError("HEAD cannot be resolved");
-    }
-
-    const headCommit = headResolved.objectId;
-
-    // Get HEAD's target branch name (if symbolic)
+    if (!headResolved?.objectId) throw new NoHeadError("HEAD cannot be resolved");
+    const headId = headResolved.objectId;
     const headRef = await this.refsStore.get("HEAD");
-    const headName = headRef && "target" in headRef ? headRef.target : headCommit;
+    const headName = headRef && isSymbolicRef(headRef) ? headRef.target : "detached HEAD";
+    const onto = this.upstreamCommit;
 
-    // Check if already up to date
-    const isAncestor = await this.isAncestor(this.upstreamCommit, headCommit);
-    if (isAncestor) {
-      return {
-        status: RebaseStatus.UP_TO_DATE,
-        newHead: headCommit,
-      };
+    // git's require_clean_work_tree: no unstaged, no staged changes, unless they are
+    // stashed away for the rebase (rebase.autoStash) and applied again after it
+    const output: string[] = [];
+    let autostash: ObjectId | undefined;
+    const refusal = await this.uncleanWorktree(headId, worktree);
+    if (refusal) {
+      if (!(this.autoStash ?? configBool(this.workingCopy, "rebase.autoStash", false))) {
+        return refusal;
+      }
+      autostash = await createAutostash(this.context(worktree), headId);
+      if (autostash) output.push(`Created autostash: ${abbrev(autostash)}`);
+    }
+    const unstash = async () => {
+      if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
+    };
+
+    // HEAD already contains upstream: nothing to do
+    if (await this.isAncestor(onto, headId)) {
+      const branch = headName.replace(/^refs\/heads\//, "");
+      output.push(`Current branch ${branch} is up to date.`);
+      await unstash();
+      return { status: RebaseStatus.UP_TO_DATE, newHead: headId, output };
     }
 
-    // Check if can fast-forward
-    const canFastForward = await this.isAncestor(headCommit, this.upstreamCommit);
-    if (canFastForward) {
-      // Fast-forward HEAD to upstream
-      await this.updateHead(headName, this.upstreamCommit);
-      return {
-        status: RebaseStatus.FAST_FORWARD,
-        newHead: this.upstreamCommit,
-      };
+    const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
+    const ontoTree = await flatTree(this.trees, await this.commits.getTree(onto));
+    // nothing of HEAD's to replay: HEAD moves to upstream
+    if (await this.isAncestor(headId, onto)) {
+      const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
+        action: "checkout",
+        operation: "rebase",
+      });
+      if (refused) {
+        await unstash();
+        return { status: RebaseStatus.FAILED, message: refused.message, output };
+      }
+      await state.setRef("ORIG_HEAD", headId);
+      await this.finishBranch(headName, onto);
+      await unstash();
+      return { status: RebaseStatus.FAST_FORWARD, newHead: onto, output };
     }
 
-    // Calculate commits to cherry-pick
-    const commitsToRebase = await this.calculateCommitsToRebase(headCommit, this.upstreamCommit);
-
-    if (commitsToRebase.length === 0) {
-      return {
-        status: RebaseStatus.UP_TO_DATE,
-        newHead: headCommit,
-      };
+    // the commits to pick: HEAD's, not upstream's, merges dropped, oldest first
+    const ids = await this.commitsToRebase(headId, onto);
+    if (ids.length === 0) {
+      await unstash();
+      return { status: RebaseStatus.UP_TO_DATE, newHead: headId, output };
     }
-
-    // Build todo list
-    const todoSteps: RebaseTodoLine[] = [];
-    for (const commitId of commitsToRebase) {
-      const commit = await this.commits.load(commitId);
-      if (!commit) continue;
-      const shortMessage = commit.message.split("\n")[0].substring(0, 50);
-      todoSteps.push({
+    const steps: RebaseTodoLine[] = [];
+    for (const id of ids) {
+      const commit = await this.commits.load(id);
+      steps.push({
         action: RebaseAction.PICK,
-        commit: commitId.substring(0, 7),
-        shortMessage,
+        commit: abbrev(id),
+        shortMessage: subjectOf(commit?.message ?? ""),
       });
     }
-
-    // Let interactive handler modify steps
-    if (this.interactiveHandler) {
-      this.interactiveHandler.prepareSteps(todoSteps);
+    this.interactiveHandler?.prepareSteps(steps);
+    const todo: TodoItem[] = [];
+    for (const step of steps) {
+      if (step.action === RebaseAction.COMMENT) continue;
+      const id = ids.find((c) => c.startsWith(step.commit));
+      if (!id) throw new CommitNotFoundError(step.commit);
+      todo.push({ action: step.action, id });
     }
 
-    // Save rebase state
-    const state: RebaseState = {
-      headName,
-      originalHead: headCommit,
-      onto: this.upstreamCommit,
-      ontoName: this.upstreamCommitName ?? this.upstreamCommit,
-      todoSteps,
-      doneSteps: [],
-      inProgress: true,
-    };
-    RebaseCommand.rebaseStates.set(this._workingCopy, state);
-
-    // Reset HEAD to onto
-    await this.updateHead(headName, this.upstreamCommit);
-
-    // Process steps
-    return this.processSteps(state, commitsToRebase);
-  }
-
-  /**
-   * Process the rebase steps (cherry-pick each commit).
-   */
-  private async processSteps(
-    state: RebaseState,
-    commitsToRebase: ObjectId[],
-  ): Promise<RebaseResult> {
-    let newHead = state.onto;
-
-    for (let i = 0; i < state.todoSteps.length; i++) {
-      const step = state.todoSteps[i];
-
-      if (step.action === RebaseAction.COMMENT) {
-        continue;
-      }
-
-      // Find the full commit ID
-      const commitId = commitsToRebase.find((c) => c.startsWith(step.commit));
-      if (!commitId) {
-        throw new CommitNotFoundError(step.commit);
-      }
-
-      // Cherry-pick the commit
-      const result = await this.cherryPickCommit(commitId, newHead, state);
-
-      if (result.status === RebaseStatus.STOPPED) {
-        state.currentCommit = commitId;
-        state.doneSteps = state.todoSteps.slice(0, i);
-        state.todoSteps = state.todoSteps.slice(i);
-        return result;
-      }
-
-      if (result.newHead) {
-        newHead = result.newHead;
-      }
-
-      // Handle EDIT action - stop after successful pick
-      if (step.action === RebaseAction.EDIT) {
-        state.currentCommit = commitId;
-        state.doneSteps = state.todoSteps.slice(0, i + 1);
-        state.todoSteps = state.todoSteps.slice(i + 1);
-        return {
-          status: RebaseStatus.EDIT,
-          newHead,
-          currentCommit: commitId,
-        };
-      }
-
-      state.doneSteps.push(step);
-    }
-
-    // Rebase complete - clean up state
-    state.inProgress = false;
-    RebaseCommand.rebaseStates.delete(this._workingCopy);
-
-    // Update branch ref to point to new head
-    await this.updateHead(state.headName, newHead);
-
-    return {
-      status: RebaseStatus.OK,
-      newHead,
-    };
-  }
-
-  /**
-   * Cherry-pick a single commit.
-   */
-  private async cherryPickCommit(
-    commitId: ObjectId,
-    ontoCommit: ObjectId,
-    _state: RebaseState,
-  ): Promise<RebaseResult> {
-    const commit = await this.commits.load(commitId);
-    if (!commit) {
-      throw new CommitNotFoundError(commitId);
-    }
-
-    // Skip merge commits unless preserveMerges is set
-    if (commit.parents.length > 1 && !this.preserveMerges) {
-      // Return success without creating a new commit
+    // detach HEAD at upstream, the worktree switched to it (as git's checkout of onto)
+    const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
+      action: "checkout",
+      operation: "rebase",
+    });
+    if (refused) {
+      await unstash();
       return {
-        status: RebaseStatus.OK,
-        newHead: ontoCommit,
+        status: RebaseStatus.FAILED,
+        message: `${refused.message}\nerror: could not detach HEAD`,
+        output,
       };
     }
-
-    // Get parent commit for diff base
-    const parentId = commit.parents[0];
-    if (!parentId) {
-      // Root commit - just use its tree
-      const newCommitId = await this.createRebasedCommit(commit, ontoCommit, commit.tree);
-      return {
-        status: RebaseStatus.OK,
-        newHead: newCommitId,
-      };
-    }
-
-    // Three-way merge: parent -> commit changes applied to onto
-    const parentCommit = await this.commits.load(parentId);
-    const ontoCommitObj = await this.commits.load(ontoCommit);
-    if (!parentCommit || !ontoCommitObj) {
-      throw new CommitNotFoundError(parentId);
-    }
-
-    // Replay this commit's changes onto `onto`: base is the commit's own
-    // parent, so base->commit is exactly the change being replayed. The merge
-    // is path-level; a file both sides edited conflicts even if the edits are
-    // to different regions.
-    const mergeResult = await mergeTreesThreeWay(
-      this.trees,
-      parentCommit.tree,
-      commit.tree,
-      ontoCommitObj.tree,
+    await state.setRef("ORIG_HEAD", headId);
+    await state.write(`${DIR}/head-name`, `${headName}\n`);
+    await state.write(`${DIR}/onto`, `${onto}\n`);
+    await state.write(`${DIR}/orig-head`, `${headId}\n`);
+    await state.write(`${DIR}/interactive`, "");
+    await state.write(`${DIR}/drop_redundant_commits`, "");
+    await state.write(`${DIR}/no-reschedule-failed-exec`, "");
+    await state.write(`${DIR}/end`, `${todo.length}\n`);
+    await state.write(`${DIR}/msgnum`, "0\n");
+    await state.write(`${DIR}/done`, "");
+    const todoText = await this.todoText(todo);
+    await state.write(
+      `${DIR}/git-rebase-todo.backup`,
+      `${todoText}\n# Rebase ${abbrev(onto)}..${abbrev(headId)} onto ${abbrev(onto)} (${todo.length} command${todo.length === 1 ? "" : "s"})\n`,
     );
+    await state.write(`${DIR}/git-rebase-todo`, todoText);
+    if (autostash) await state.write(`${DIR}/autostash`, `${autostash}\n`);
+    await this.refsStore.set("HEAD", onto);
+    return this.processTodo(state, worktree, output);
+  }
 
-    if (mergeResult.conflicts && mergeResult.conflicts.length > 0) {
+  /** Picks what is left in `git-rebase-todo`, then finishes the rebase. */
+  private async processTodo(
+    state: OperationState,
+    worktree: Worktree | undefined,
+    output: string[] = [],
+  ): Promise<RebaseResult> {
+    let todo = await this.readTodoFile(state, "git-rebase-todo");
+    while (todo.length > 0) {
+      const item = todo[0];
+      todo = todo.slice(1);
+      const done = (await state.read(`${DIR}/done`)) ?? "";
+      await state.write(`${DIR}/done`, `${done}${await this.todoText([item])}`);
+      await state.write(`${DIR}/git-rebase-todo`, await this.todoText(todo));
+      const msgnum = Number((await state.read(`${DIR}/msgnum`))?.trim() ?? "0") + 1;
+      await state.write(`${DIR}/msgnum`, `${msgnum}\n`);
+      const outcome = await this.pick(state, worktree, item, output);
+      if (outcome) return { ...outcome, output };
+    }
+    // done: the branch takes the new commits, HEAD attached to it again
+    const headName = (await state.read(`${DIR}/head-name`))?.trim() ?? "detached HEAD";
+    const newHead = await this.resolveHead();
+    await this.finishBranch(headName, newHead);
+    const autostash = (await state.read(`${DIR}/autostash`))?.trim();
+    await state.remove(DIR);
+    if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
+    return { status: RebaseStatus.OK, newHead, output };
+  }
+
+  /** One commit picked onto HEAD; a result when the rebase stops there. */
+  private async pick(
+    state: OperationState,
+    worktree: Worktree | undefined,
+    item: TodoItem,
+    output: string[],
+  ): Promise<RebaseResult | undefined> {
+    const commit = await this.commits.load(item.id);
+    if (!commit) throw new CommitNotFoundError(item.id);
+    const headId = await this.resolveHead();
+    const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
+    const parentId = commit.parents[0];
+    const parentTree = await flatTree(
+      this.trees,
+      parentId ? await this.commits.getTree(parentId) : undefined,
+    );
+    const subject = subjectOf(commit.message);
+    const label = `${abbrev(item.id)} (${subject})`;
+    const merge = await ortMerge(
+      this.blobs,
+      parentTree,
+      headTree,
+      await flatTree(this.trees, commit.tree),
+      {
+        oursLabel: "HEAD",
+        theirsLabel: label,
+        baseLabel: parentId ? `parent of ${label}` : "(empty tree)",
+        style: conflictStyleOf(this.workingCopy),
+        favor: favorOf(this.contentStrategy),
+        ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      },
+    );
+    const target = await ortResultEntries(this.blobs, merge);
+    const conflicts = [...merge.conflicts.values()];
+    const refused = await switchTrees(this.context(worktree), headTree, target, {
+      action: "merge",
+      operation: "rebase",
+      conflicts,
+    });
+    if (refused) {
+      await this.stopAt(state, item.id, commit.message, commit.author);
+      return {
+        status: RebaseStatus.FAILED,
+        currentCommit: item.id,
+        message: `${refused.message}\nerror: could not apply ${abbrev(item.id)}... ${subject}`,
+      };
+    }
+    output.push(...merge.messages);
+    const treeId = await storeFlatTree(this.trees, target);
+    await state.setRef("AUTO_MERGE", treeId);
+    if (conflicts.length > 0) {
+      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
+      const message = commit.message.endsWith("\n") ? commit.message : `${commit.message}\n`;
+      await this.stopAt(state, item.id, commit.message, commit.author);
+      await state.setRef("REBASE_HEAD", item.id);
+      await state.write("MERGE_MSG", `${message}${conflictsComment(paths)}`);
       return {
         status: RebaseStatus.STOPPED,
-        currentCommit: commitId,
-        conflicts: mergeResult.conflicts,
+        currentCommit: item.id,
+        conflicts: [...new Set(merge.conflicts.keys())].sort(),
+        message: [
+          `error: could not apply ${abbrev(item.id)}... ${subject}`,
+          "hint: Resolve all conflicts manually, mark them as resolved with",
+          'hint: "git add/rm <conflicted_files>", then run "git rebase --continue".',
+          'hint: You can instead skip this commit: run "git rebase --skip".',
+          'hint: To abort and get back to the state before "git rebase", run "git rebase --abort".',
+          `Could not apply ${abbrev(item.id)}... ${subject}`,
+        ].join("\n"),
       };
     }
-
-    // Create new commit with merged tree
-    const newCommitId = await this.createRebasedCommit(commit, ontoCommit, mergeResult.tree);
-
-    return {
-      status: RebaseStatus.OK,
-      newHead: newCommitId,
-    };
+    if (treeId === (await this.commits.getTree(headId))) {
+      // a pick that changes nothing is dropped (git's drop_redundant_commits)
+      return undefined;
+    }
+    let message = commit.message;
+    if (item.action === RebaseAction.REWORD && this.interactiveHandler) {
+      message = this.interactiveHandler.modifyCommitMessage(message);
+    }
+    const newId = await this.commitOnto(headId, treeId, commit.author, message);
+    await this.rewritten(state, item.id, newId);
+    if (item.action === RebaseAction.EDIT) {
+      return { status: RebaseStatus.EDIT, newHead: newId, currentCommit: item.id };
+    }
+    return undefined;
   }
 
-  /**
-   * Create a new commit preserving the original author info.
-   */
-  private async createRebasedCommit(
-    original: {
-      author: PersonIdent;
-      message: string;
-    },
-    parentId: ObjectId,
-    treeId: ObjectId,
-  ): Promise<ObjectId> {
-    const committer = await this.getCommitter();
-
-    return this.commits.store({
-      tree: treeId,
-      parents: [parentId],
-      author: original.author,
-      committer,
-      message: original.message,
-    });
+  /** The files git writes where a pick stops. */
+  private async stopAt(
+    state: OperationState,
+    id: ObjectId,
+    message: string,
+    author: PersonIdent,
+  ): Promise<void> {
+    await state.write(`${DIR}/stopped-sha`, `${id}\n`);
+    // git 2.43 writes the message and a blank line (2.5x the conflict list after it)
+    await state.write(`${DIR}/message`, `${message.endsWith("\n") ? message : `${message}\n`}\n`);
+    await state.write(
+      `${DIR}/author-script`,
+      `GIT_AUTHOR_NAME=${sq(author.name)}\nGIT_AUTHOR_EMAIL=${sq(author.email)}\nGIT_AUTHOR_DATE=${sq(`@${author.timestamp} ${author.tzOffset}`)}\n`,
+    );
   }
 
-  /**
-   * Get default committer identity.
-   */
-  private async getCommitter(): Promise<PersonIdent> {
-    return {
-      name: "Unknown",
-      email: "unknown@example.com",
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: getTimezoneOffset(),
-    };
-  }
-
-  /**
-   * Abort the rebase and restore original HEAD.
-   */
-  private async abort(): Promise<RebaseResult> {
-    const state = RebaseCommand.rebaseStates.get(this._workingCopy);
-    if (!state) {
+  /** `git rebase --continue`: the resolved pick committed, the rest picked. */
+  private async continueRebase(
+    state: OperationState,
+    worktree: Worktree | undefined,
+  ): Promise<RebaseResult> {
+    if (!(await this.inProgress(state))) throw new NoRebaseInProgressError();
+    const { unmerged } = await readIndex(this.staging);
+    if (unmerged.length > 0) {
       return {
-        status: RebaseStatus.ABORTED,
+        status: RebaseStatus.STOPPED,
+        conflicts: unmerged,
+        message: UNMERGED_FILES_MESSAGE("Committing"),
       };
     }
-
-    // Restore HEAD to original
-    await this.updateHead(state.headName, state.originalHead);
-
-    // Clean up state
-    RebaseCommand.rebaseStates.delete(this._workingCopy);
-
-    return {
-      status: RebaseStatus.ABORTED,
-      newHead: state.originalHead,
-    };
-  }
-
-  /**
-   * Continue rebase after conflict resolution.
-   */
-  private async continueRebase(): Promise<RebaseResult> {
-    const state = RebaseCommand.rebaseStates.get(this._workingCopy);
-    if (!state || !state.inProgress) {
-      throw new NoRebaseInProgressError();
-    }
-
-    // Get current HEAD
-    const headRef = await this.refsStore.resolve("HEAD");
-    if (!headRef?.objectId) {
-      throw new NoHeadError("HEAD cannot be resolved");
-    }
-
-    // Calculate remaining commits to process
-    const remaining: ObjectId[] = [];
-    for (const step of state.todoSteps) {
-      if (step.action === RebaseAction.COMMENT) continue;
-      // Find full commit ID from original commits
-      const commitId = state.originalHead; // Simplified - would need proper tracking
-      remaining.push(commitId);
-    }
-
-    return this.processSteps(state, remaining);
-  }
-
-  /**
-   * Skip current commit and continue.
-   */
-  private async skip(): Promise<RebaseResult> {
-    const state = RebaseCommand.rebaseStates.get(this._workingCopy);
-    if (!state || !state.inProgress) {
-      throw new NoRebaseInProgressError();
-    }
-
-    // Skip first step
-    if (state.todoSteps.length > 0) {
-      const skipped = state.todoSteps.shift();
-      if (skipped) {
-        state.doneSteps.push(skipped);
+    const stopped =
+      (await state.ref("REBASE_HEAD")) ?? (await state.read(`${DIR}/stopped-sha`))?.trim();
+    if (stopped) {
+      const id = await expandCommitId(
+        { commits: this.commits, refs: this.refsStore, state },
+        stopped,
+      );
+      const headId = await this.resolveHead();
+      const treeId = await this.staging.writeTree(this.trees);
+      const headCommit = await this.commits.load(headId);
+      if (headCommit && headCommit.tree !== treeId) {
+        const commit = await this.commits.load(id);
+        const author =
+          parseAuthorScript((await state.read(`${DIR}/author-script`)) ?? "") ??
+          commit?.author ??
+          defaultIdent();
+        const text =
+          (await state.read("MERGE_MSG")) ??
+          (await state.read(`${DIR}/message`)) ??
+          commit?.message ??
+          "";
+        const newId = await this.commitOnto(headId, treeId, author, cleanupMessage(text));
+        await this.rewritten(state, id, newId);
+        await state.removeRef("AUTO_MERGE");
       }
     }
-
-    state.currentCommit = undefined;
-
-    // Calculate remaining commits
-    const remaining: ObjectId[] = [];
-    return this.processSteps(state, remaining);
+    await state.removeRef("REBASE_HEAD");
+    await state.remove(
+      "MERGE_MSG",
+      `${DIR}/stopped-sha`,
+      `${DIR}/message`,
+      `${DIR}/author-script`,
+      `${DIR}/patch`,
+    );
+    return this.processTodo(state, worktree);
   }
 
-  /**
-   * Calculate which commits need to be rebased.
-   */
-  private async calculateCommitsToRebase(head: ObjectId, upstream: ObjectId): Promise<ObjectId[]> {
-    const commits: ObjectId[] = [];
-    const seen = new Set<ObjectId>();
+  /** `git rebase --skip`: the stopped pick dropped (`reset --hard`), the rest picked. */
+  private async skip(state: OperationState, worktree: Worktree | undefined): Promise<RebaseResult> {
+    if (!(await this.inProgress(state))) throw new NoRebaseInProgressError();
+    const headId = await this.resolveHead();
+    await resetMerge(this.context(worktree), headId, "HEAD", { hard: true });
+    await state.removeRef("REBASE_HEAD");
+    await state.remove(
+      "MERGE_MSG",
+      `${DIR}/stopped-sha`,
+      `${DIR}/message`,
+      `${DIR}/author-script`,
+      `${DIR}/patch`,
+    );
+    return this.processTodo(state, worktree);
+  }
 
-    // Get all commits reachable from upstream
+  /** `git rebase --abort`: back to the original branch and commit (`reset --hard`). */
+  private async abort(
+    state: OperationState,
+    worktree: Worktree | undefined,
+  ): Promise<RebaseResult> {
+    if (!(await this.inProgress(state))) return { status: RebaseStatus.ABORTED };
+    const origHead = (await state.read(`${DIR}/orig-head`))?.trim();
+    const headName = (await state.read(`${DIR}/head-name`))?.trim() ?? "detached HEAD";
+    if (!origHead)
+      return { status: RebaseStatus.FAILED, message: "fatal: could not read orig-head" };
+    await resetMerge(this.context(worktree), origHead, origHead, { hard: true });
+    await this.finishBranch(headName, origHead);
+    const autostash = (await state.read(`${DIR}/autostash`))?.trim();
+    await state.removeRef("REBASE_HEAD", "AUTO_MERGE");
+    await state.remove("MERGE_MSG", DIR);
+    const output = autostash ? await applyAutostash(this.context(worktree), autostash) : [];
+    return { status: RebaseStatus.ABORTED, newHead: origHead, output };
+  }
+
+  /** Refuses as git's require_clean_work_tree: unstaged, then staged changes. */
+  private async uncleanWorktree(
+    headId: ObjectId,
+    worktree: Worktree | undefined,
+  ): Promise<RebaseResult | undefined> {
+    const { index, unmerged } = await readIndex(this.staging);
+    const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
+    const staged = indexChanges(index, headTree);
+    const unstaged: string[] = [...unmerged];
+    if (worktree) {
+      const trust = worktreeModeTrust(this.workingCopy, worktree);
+      for (const [path, entry] of index) {
+        if (await worktreeDiffers(worktree, path, entry, trust)) unstaged.push(path);
+      }
+    }
+    if (staged.length === 0 && unstaged.length === 0) return undefined;
+    const lines = ["error: cannot rebase: You have unstaged changes."];
+    if (unstaged.length === 0)
+      lines[0] = "error: cannot rebase: Your index contains uncommitted changes.";
+    else if (staged.length > 0)
+      lines.push("error: additionally, your index contains uncommitted changes.");
+    lines.push("error: Please commit or stash them.");
+    return {
+      status: RebaseStatus.UNCOMMITTED_CHANGES,
+      uncommittedChanges: [...new Set([...unstaged, ...staged])].sort(),
+      message: lines.join("\n"),
+    };
+  }
+
+  private async commitOnto(
+    parent: ObjectId,
+    tree: ObjectId,
+    author: PersonIdent,
+    message: string,
+  ): Promise<ObjectId> {
+    const committer = this.committer ?? defaultIdent();
+    const id = await this.commits.store({ tree, parents: [parent], author, committer, message });
+    await this.refsStore.set("HEAD", id);
+    return id;
+  }
+
+  private async rewritten(state: OperationState, from: ObjectId, to: ObjectId): Promise<void> {
+    const list = (await state.read(`${DIR}/rewritten-list`)) ?? "";
+    await state.write(`${DIR}/rewritten-list`, `${list}${from} ${to}\n`);
+  }
+
+  /** The branch rebased moves to `id` and HEAD is attached to it again. */
+  private async finishBranch(headName: string, id: ObjectId): Promise<void> {
+    if (headName.startsWith("refs/")) {
+      await this.refsStore.set(headName, id);
+      await this.refsStore.setSymbolic("HEAD", headName);
+    } else {
+      await this.refsStore.set("HEAD", id);
+    }
+  }
+
+  private async todoText(todo: TodoItem[]): Promise<string> {
+    let out = "";
+    for (const item of todo) {
+      const commit = await this.commits.load(item.id);
+      out += `${item.action} ${item.id} ${subjectOf(commit?.message ?? "")}\n`;
+    }
+    return out;
+  }
+
+  private async readTodoFile(state: OperationState, name: string): Promise<TodoItem[]> {
+    const text = (await state.read(`${DIR}/${name}`)) ?? "";
+    const actions: Record<string, RebaseAction> = {
+      p: RebaseAction.PICK,
+      pick: RebaseAction.PICK,
+      r: RebaseAction.REWORD,
+      reword: RebaseAction.REWORD,
+      e: RebaseAction.EDIT,
+      edit: RebaseAction.EDIT,
+      s: RebaseAction.SQUASH,
+      squash: RebaseAction.SQUASH,
+      f: RebaseAction.FIXUP,
+      fixup: RebaseAction.FIXUP,
+    };
+    const out: TodoItem[] = [];
+    for (const line of text.split("\n")) {
+      const match = /^(\w+)\s+([0-9a-f]{4,64})/.exec(line.trim());
+      if (!match || !actions[match[1]]) continue;
+      out.push({
+        action: actions[match[1]],
+        id: await expandCommitId({ commits: this.commits, refs: this.refsStore, state }, match[2]),
+      });
+    }
+    return out;
+  }
+
+  /** The commits of `head` not in `upstream`, merges dropped, oldest first. */
+  private async commitsToRebase(head: ObjectId, upstream: ObjectId): Promise<ObjectId[]> {
     const upstreamCommits = new Set<ObjectId>();
     for await (const commitId of this.commits.walkAncestry([upstream])) {
       upstreamCommits.add(commitId);
     }
-
-    // Walk from head and collect commits not in upstream
-    for await (const commitId of this.commits.walkAncestry([head])) {
-      if (upstreamCommits.has(commitId)) {
-        break;
+    const out: { id: ObjectId; time: number; order: number }[] = [];
+    const seen = new Set<ObjectId>();
+    const stack = [head];
+    while (stack.length > 0) {
+      const id = stack.pop() as ObjectId;
+      if (seen.has(id) || upstreamCommits.has(id)) continue;
+      seen.add(id);
+      const commit = await this.commits.load(id);
+      if (!commit) continue;
+      if (commit.parents.length <= 1) {
+        out.push({ id, time: commit.committer.timestamp, order: out.length });
       }
-      if (!seen.has(commitId)) {
-        seen.add(commitId);
-        commits.push(commitId);
-      }
+      stack.push(...commit.parents);
     }
-
-    // Reverse to get oldest first
-    return commits.reverse();
+    // oldest first: parents before children (the walk found children first)
+    return out.reverse().map((c) => c.id);
   }
 
-  /**
-   * Check if commit A is an ancestor of commit B.
-   */
   private async isAncestor(a: ObjectId, b: ObjectId): Promise<boolean> {
     if (a === b) return true;
-
     for await (const commitId of this.commits.walkAncestry([b])) {
-      if (commitId === a) {
-        return true;
-      }
+      if (commitId === a) return true;
     }
     return false;
   }
+}
 
-  /**
-   * Update HEAD and optionally the branch it points to.
-   */
-  private async updateHead(headName: string, commitId: ObjectId): Promise<void> {
-    if (headName.startsWith("refs/")) {
-      // Update the branch ref
-      await this.refsStore.set(headName, commitId);
-    }
-    // HEAD is symbolic, so it should follow
-    await this.refsStore.set("HEAD", commitId);
+/** The author of git's `author-script` (`GIT_AUTHOR_NAME='...'`, ...). */
+function parseAuthorScript(text: string): PersonIdent | undefined {
+  const values: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const match = /^(GIT_AUTHOR_\w+)='(.*)'$/.exec(line);
+    if (match) values[match[1]] = match[2].replaceAll("'\\''", "'");
   }
+  const date = /^@?(\d+)\s+([+-]\d{4})$/.exec(values.GIT_AUTHOR_DATE ?? "");
+  if (!values.GIT_AUTHOR_NAME || !date) return undefined;
+  return {
+    name: values.GIT_AUTHOR_NAME,
+    email: values.GIT_AUTHOR_EMAIL ?? "",
+    timestamp: Number(date[1]),
+    tzOffset: date[2],
+  };
 }

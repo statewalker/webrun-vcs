@@ -1,13 +1,16 @@
-import { NoHeadError, NotImplementedError } from "../errors/index.js";
+import { NoHeadError } from "../errors/index.js";
 import {
   type FastForwardMode,
   isMergeSuccessful,
   type MergeStrategy,
 } from "../results/merge-result.js";
 import type { PullResult } from "../results/pull-result.js";
+import { isRebaseSuccessful } from "../results/rebase-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { FetchCommand, type TagOption } from "./fetch-command.js";
 import { MergeCommand } from "./merge-command.js";
+import { configValue } from "./merge-config.js";
+import { RebaseCommand } from "./rebase-command.js";
 
 /**
  * Pull changes from a remote repository.
@@ -228,15 +231,30 @@ export class PullCommand extends TransportCommand<PullResult> {
       };
     }
 
-    // Check if rebase was requested
+    // `git pull --rebase`: the branch rebased onto what was fetched
     if (this.rebase) {
-      // Rebase is not yet implemented
-      throw new NotImplementedError("Pull with rebase");
+      const rebaseResult = await new RebaseCommand(this._workingCopy)
+        .setUpstream(trackingRefResolved.objectId)
+        .call();
+      return {
+        fetchResult,
+        rebaseResult,
+        successful: isRebaseSuccessful(rebaseResult.status),
+        rebaseUsed: true,
+        fetchedFrom: this.remote,
+      };
     }
 
-    // Execute merge
+    // Execute merge (git's message for a pull: `Merge branch 'x' of <url>`)
     const mergeCommand = new MergeCommand(this._workingCopy);
     mergeCommand.include(trackingRefResolved.objectId);
+    // git's fmt-merge-msg shortens the URL: no trailing slash, no `.git`
+    const url = (configValue(this._workingCopy, `remote.${this.remote}.url`) ?? this.remote)
+      .replace(/\/+$/, "")
+      .replace(/\.git$/, "");
+    const into =
+      localBranchName === "main" || localBranchName === "master" ? "" : ` into ${localBranchName}`;
+    mergeCommand.setMessage(`Merge branch '${remoteBranch}' of ${url}${into}\n`);
 
     if (this.strategy) {
       mergeCommand.setStrategy(this.strategy);

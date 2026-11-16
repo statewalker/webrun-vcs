@@ -23,6 +23,7 @@ export * from "./remote-command.js";
 export * from "./reset-command.js";
 export * from "./revert-command.js";
 export * from "./rm-command.js";
+export { SequencerOperation } from "./sequencer-pick.js";
 export * from "./stash-apply-command.js";
 export * from "./stash-create-command.js";
 export * from "./stash-drop-command.js";

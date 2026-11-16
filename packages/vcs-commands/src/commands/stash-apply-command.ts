@@ -1,5 +1,4 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
-import { mergeLines } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
@@ -14,16 +13,12 @@ import {
   StoreNotAvailableError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
-import {
-  DEFAULT_RENAME_SCORE,
-  detectRenames,
-  type RenameCandidate,
-  SimilarityIndex,
-} from "../rename/index.js";
 import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-result.js";
 import type { StashApplyResult } from "../results/stash-result.js";
 import { StashApplyStatus } from "../results/stash-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { conflictStyleOf } from "./merge-config.js";
+import { type OrtConflict, ortMerge, ortResultEntries } from "./ort-merge.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { planTreeRestore, type TreeRestorePlan, writeTreeRestorePlan } from "./tree-restore.js";
 import {
@@ -36,30 +31,7 @@ import {
 } from "./worktree-overwrite-checks.js";
 
 /** A path the index and the stash changed beyond a clean merge, as git leaves it. */
-interface MergeConflict {
-  base?: CheckedEntry;
-  ours?: CheckedEntry;
-  theirs?: CheckedEntry;
-  /** Where the stages (and the worktree file) go: the path, or `<path>~<side>` */
-  stagePath: string;
-  /** The file with conflict markers, for a text conflict */
-  content?: Uint8Array;
-  /** The blob the worktree gets at `stagePath` (a modify/delete's surviving stash side) */
-  write?: CheckedEntry;
-  /** The path a file/directory conflict moves ours away from */
-  moveFrom?: string;
-  mode: number;
-}
-
-function concatBytes(chunks: Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c, offset);
-    offset += c.length;
-  }
-  return out;
-}
+type MergeConflict = OrtConflict;
 
 const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
   a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
@@ -468,6 +440,10 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       }
     }
 
+    // merge-ort records the tree it wrote (AUTO_MERGE), clean or not
+    const autoMerge = await ortResultEntries(this.blobs, { ...merge, messages: [] });
+    await this.refsStore.set("AUTO_MERGE", await this.storeFlat(autoMerge));
+
     // the index
     const editor = this.staging.createEditor();
     const stage = async (path: string, entry: CheckedEntry, stageNumber: 0 | 1 | 2 | 3) => {
@@ -559,10 +535,8 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
 
   /**
    * git's ort merge of a stash: `base` (the stash's parent) to `ours` (the current index)
-   * and to `theirs` (the stash). Renames on one side (exact, then by similarity of at least
-   * {@link DEFAULT_RENAME_SCORE}%) carry the other side's change to the new path; files both
-   * sides changed are merged line by line (`Updated upstream` / `Stashed changes` markers);
-   * binary files, modify/delete and file/directory collisions are conflicts as in git.
+   * and to `theirs` (the stash), with git's labels (`Updated upstream` / `Stashed changes`,
+   * `Version stash was based on` for diff3), shared with `merge` ({@link ortMerge}).
    */
   private async mergeFlat(
     baseIn: Map<string, CheckedEntry>,
@@ -573,219 +547,14 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     result: Map<string, CheckedEntry>;
     conflicts: Map<string, MergeConflict>;
   }> {
-    const base = new Map(baseIn);
-    const ours = new Map(oursIn);
-    const theirs = new Map(theirsIn);
-    const conflicts = new Map<string, MergeConflict>();
-    const oursRenames = await this.detectRenames(baseIn, oursIn);
-    const theirsRenames = await this.detectRenames(baseIn, theirsIn);
-    // both sides renamed the same path: to one path, it merges there; to two, git's
-    // CONFLICT (rename/rename): the original at stage 1 (DD), each side's at its path (AU/UA)
-    for (const [from, oursTo] of [...oursRenames]) {
-      const theirsTo = theirsRenames.get(from);
-      const original = base.get(from);
-      if (theirsTo === undefined || !original) continue;
-      oursRenames.delete(from);
-      theirsRenames.delete(from);
-      if (theirsTo === oursTo) {
-        base.delete(from);
-        base.set(oursTo, original);
-        continue;
-      }
-      const o = ours.get(oursTo);
-      const t = theirs.get(theirsTo);
-      if (!o || !t || theirs.has(oursTo) || ours.has(theirsTo)) continue;
-      base.delete(from);
-      ours.delete(oursTo);
-      theirs.delete(theirsTo);
-      conflicts.set(from, { base: original, stagePath: from, mode: original.mode });
-      conflicts.set(oursTo, { ours: o, stagePath: oursTo, mode: o.mode });
-      conflicts.set(theirsTo, { theirs: t, stagePath: theirsTo, mode: t.mode, write: t });
-    }
-    // a path one side renamed: the other side's change merges at the new path; deleted on
-    // the other side, git's CONFLICT (rename/delete): stage 1 and the renaming side's
-    for (const [renames, side, other, sideIsOurs] of [
-      [oursRenames, ours, theirs, true],
-      [theirsRenames, theirs, ours, false],
-    ] as const) {
-      for (const [from, to] of renames) {
-        const original = base.get(from);
-        if (!original || other.has(to)) continue;
-        const moved = other.get(from);
-        base.delete(from);
-        if (moved) {
-          other.delete(from);
-          other.set(to, moved);
-          base.set(to, original);
-          continue;
-        }
-        const kept = side.get(to);
-        if (!kept) continue;
-        side.delete(to);
-        conflicts.set(to, {
-          base: original,
-          ...(sideIsOurs ? { ours: kept } : { theirs: kept, write: kept }),
-          stagePath: to,
-          mode: kept.mode,
-        });
-      }
-    }
-
-    const result = new Map<string, CheckedEntry>();
-    const read = async (e?: CheckedEntry) => {
-      if (!e) return new Uint8Array(0);
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of (await this.blobs.load(e.objectId)) ?? []) chunks.push(chunk);
-      return concatBytes(chunks);
-    };
-    for (const path of new Set([...base.keys(), ...ours.keys(), ...theirs.keys()])) {
-      const b = base.get(path);
-      const o = ours.get(path);
-      const t = theirs.get(path);
-      if (sameEntry(o, t) || sameEntry(b, t)) {
-        if (o) result.set(path, o);
-        continue;
-      }
-      if (sameEntry(b, o)) {
-        if (t) result.set(path, t);
-        continue;
-      }
-      if (!o || !t) {
-        // modify/delete: the surviving side stays in the worktree, staged 1 and 2 or 3
-        conflicts.set(path, {
-          base: b,
-          ours: o,
-          theirs: t,
-          stagePath: path,
-          mode: (o ?? t)?.mode ?? 0,
-          ...(t ? { write: t } : {}),
-        });
-        continue;
-      }
-      const textual = (e?: CheckedEntry) =>
-        e === undefined || e.mode === FileMode.REGULAR_FILE || e.mode === FileMode.EXECUTABLE_FILE;
-      const mode = o.mode === t.mode ? o.mode : b && o.mode === b.mode ? t.mode : o.mode;
-      if (textual(o) && textual(t) && textual(b)) {
-        const [bb, ob, tb] = [await read(b), await read(o), await read(t)];
-        if (![bb, ob, tb].some((bytes) => SimilarityIndex.isBinary(bytes))) {
-          const lines = mergeLines(bb, ob, tb, {
-            oursLabel: "Updated upstream",
-            theirsLabel: "Stashed changes",
-          });
-          if (lines.conflicts === 0) {
-            result.set(path, { objectId: await this.blobs.store([lines.content]), mode });
-          } else {
-            conflicts.set(path, {
-              base: b,
-              ours: o,
-              theirs: t,
-              stagePath: path,
-              content: lines.content,
-              mode,
-            });
-          }
-          continue;
-        }
-      }
-      // binary files (git: "Cannot merge binary files"), or a link or submodule changed on
-      // both sides: ours stays in the worktree, all three staged
-      conflicts.set(path, { base: b, ours: o, theirs: t, stagePath: path, mode });
-    }
-    // a path cannot be a file and a directory at once (CONFLICT (file/directory)): the
-    // directory keeps the name, the file (a merged one, or the side a conflict keeps) moves
-    // aside to `<path>~<side>`, made unique as git's unique_path: `_0`, `_1`, ... appended
-    // while the name is a path (or a directory) of any of the three trees, or already taken
-    const dirsOf = (paths: Iterable<string>) => {
-      const dirs = new Set<string>();
-      for (const path of paths) {
-        for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) {
-          dirs.add(path.slice(0, k));
-        }
-      }
-      return dirs;
-    };
-    // on a case-folding worktree (core.ignorecase) a name taken in another case is taken:
-    // the moved file would land on that path
-    const fold = (name: string) => (ignoreCase ? name.toLowerCase() : name);
-    const taken = new Set<string>();
-    for (const map of [baseIn, oursIn, theirsIn, base, ours, theirs]) {
-      for (const path of map.keys()) taken.add(fold(path));
-      for (const dir of dirsOf(map.keys())) taken.add(fold(dir));
-    }
-    const uniquePath = (path: string, label: string) => {
-      let name = `${path}~${label}`;
-      for (let n = 0; taken.has(fold(name)); n++) name = `${path}~${label}_${n}`;
-      taken.add(fold(name));
-      return name;
-    };
-    const outcomeDirs = dirsOf([
-      ...result.keys(),
-      ...[...conflicts.values()].map((c) => c.stagePath),
-    ]);
-    const theirsDirs = dirsOf(theirs.keys());
-    const files = [
-      ...result.keys(),
-      ...[...conflicts.entries()].filter(([, c]) => c.ours || c.theirs).map(([p]) => p),
-    ].sort();
-    for (const path of files) {
-      if (!outcomeDirs.has(path)) continue;
-      // the side whose tree has the directory keeps it; the file is the other side's
-      const oursFile = theirsDirs.has(path);
-      const label = oursFile ? "Updated upstream" : "Stashed changes";
-      const moveFrom = oursFile && ours.has(path) ? { moveFrom: path } : {};
-      const merged = result.get(path);
-      if (merged) {
-        result.delete(path);
-        conflicts.set(path, {
-          ...(oursFile ? { ours: merged } : { theirs: merged }),
-          stagePath: uniquePath(path, label),
-          mode: merged.mode,
-          write: merged,
-          ...moveFrom,
-        });
-        continue;
-      }
-      const conflict = conflicts.get(path) as MergeConflict;
-      const kept = oursFile ? conflict.ours : conflict.theirs;
-      conflicts.set(path, {
-        ...conflict,
-        stagePath: uniquePath(path, label),
-        ...(kept && !conflict.content ? { write: kept } : {}),
-        ...moveFrom,
-      });
-    }
+    const { result, conflicts } = await ortMerge(this.blobs, baseIn, oursIn, theirsIn, {
+      oursLabel: "Updated upstream",
+      theirsLabel: "Stashed changes",
+      baseLabel: "Version stash was based on",
+      style: conflictStyleOf(this.workingCopy),
+      ignoreCase,
+    });
     return { result, conflicts };
-  }
-
-  /**
-   * The paths `side` renamed from `base`: deleted paths paired with added ones as git's
-   * rename detection pairs them (exact renames, then the best scoring at least 50%,
-   * within the rename limit), shared with `status`.
-   */
-  private async detectRenames(
-    base: Map<string, CheckedEntry>,
-    side: Map<string, CheckedEntry>,
-  ): Promise<Map<string, string>> {
-    const candidate = (path: string, e: CheckedEntry): RenameCandidate => ({
-      path,
-      mode: e.mode,
-      id: e.objectId,
-    });
-    const deleted = [...base].filter(([p]) => !side.has(p)).map(([p, e]) => candidate(p, e));
-    const added = [...side].filter(([p]) => !base.has(p)).map(([p, e]) => candidate(p, e));
-    const renames = new Map<string, string>();
-    if (deleted.length === 0 || added.length === 0) return renames;
-    const pairs = await detectRenames(deleted, added, {
-      // merge-ort never pairs empty files
-      renameEmpty: false,
-      load: async (c) => {
-        const chunks: Uint8Array[] = [];
-        for await (const chunk of (await this.blobs.load(c.id)) ?? []) chunks.push(chunk);
-        return concatBytes(chunks);
-      },
-    });
-    for (const pair of pairs) renames.set(pair.from, pair.to);
-    return renames;
   }
 
   /** Stores a flat path map as a tree. */

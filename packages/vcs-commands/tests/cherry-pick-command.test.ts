@@ -304,6 +304,9 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
       .call();
     await repository.refs.setSymbolic("HEAD", "refs/heads/target");
     await workingCopy.checkout.staging.readTree(repository.trees, baseCommitData.tree);
+    // the merge wrote main-file.txt to the worktree; switching by hand leaves it untracked,
+    // where the cherry-pick (as git's) would refuse to overwrite it
+    await workingCopy.worktree.remove("main-file.txt");
 
     // Cherry-pick with mainline parent 1 (side is parent 1)
     // This means we diff merge commit against side, so we get main's changes
@@ -843,7 +846,10 @@ describe.each(backends)(
         .include(rootCommit?.objectId ?? "")
         .call();
 
-      expect(result.status).toBe(CherryPickStatus.OK);
+      // "orphan" was branched from HEAD, so it already holds a.txt: the pick changes
+      // nothing and, as git's, stops as an empty cherry-pick (for --allow-empty or --skip)
+      expect(result.status).toBe(CherryPickStatus.CONFLICTING);
+      expect(result.message).toContain("The previous cherry-pick is now empty");
 
       // Should have both files now
       const aEntry = await workingCopy.checkout.staging.getEntry("a.txt");

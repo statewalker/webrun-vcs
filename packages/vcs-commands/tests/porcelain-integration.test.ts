@@ -114,8 +114,12 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
       const featCommit = await git.commit().setMessage("Important fix XYZ").call();
       const featCommitId = await repository.commits.store(featCommit);
 
-      // Switch back to main
+      // Switch back to main (the index too: git picks only onto an index matching HEAD)
       await repository.refs.setSymbolic("HEAD", "refs/heads/main");
+      const mainTip = await repository.commits.load(
+        (await repository.refs.resolve("HEAD"))?.objectId ?? "",
+      );
+      if (mainTip) await workingCopy.checkout.staging.readTree(repository.trees, mainTip.tree);
 
       // Cherry-pick
       const result = await git.cherryPick().include(featCommitId).call();

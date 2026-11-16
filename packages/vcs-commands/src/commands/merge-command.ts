@@ -1,18 +1,16 @@
-import type { Commit, ObjectId, TreeEntry } from "@statewalker/vcs-core";
+import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import { DEFAULT_BIG_FILE_THRESHOLD, FileMode, isSymbolicRef } from "@statewalker/vcs-core";
 import {
-  DEFAULT_BIG_FILE_THRESHOLD,
-  FileMode,
-  isSymbolicRef,
-  probeBlob,
-} from "@statewalker/vcs-core";
-import {
-  merge3Way,
-  MergeContentStrategy as UtilsMergeContentStrategy,
-} from "@statewalker/vcs-utils";
-import { MergeStage } from "@statewalker/vcs-working-tree";
+  attributesIndexOf,
+  type ContentAttributesContext,
+  entryStatOf,
+  type IndexEntryOptions,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
 
 import {
   InvalidMergeHeadsError,
+  MergeFailureReason,
   NoMergeBaseError,
   NotFastForwardError,
 } from "../errors/merge-errors.js";
@@ -25,44 +23,74 @@ import {
   MergeStatus,
   MergeStrategy,
 } from "../results/merge-result.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { configBool, conflictStyleOf } from "./merge-config.js";
+import {
+  abbrev,
+  conflictsComment,
+  defaultIdent,
+  flatTree,
+  indexChanges,
+  OperationState,
+  readIndex,
+  rewriteIndex,
+  storeFlatTree,
+  switchTrees,
+} from "./merge-support.js";
+import { ortMerge, ortResultEntries } from "./ort-merge.js";
+import {
+  applyAutostash,
+  cleanupMessage,
+  createAutostash,
+  resetMerge,
+  squashMessage,
+} from "./sequencer-support.js";
+import { WorkingCopyStashProvider } from "./stash-working-tree.js";
+
+/** What `git merge` is asked to do. */
+export enum MergeOperation {
+  /** Merge the included commit (`git merge <commit>`) */
+  MERGE = "merge",
+  /** Give up the merge in progress (`git merge --abort`) */
+  ABORT = "abort",
+  /** Commit the resolved merge in progress (`git merge --continue`) */
+  CONTINUE = "continue",
+}
+
+/** git's refusal while the index has unmerged entries. */
+export const UNMERGED_FILES_MESSAGE = (action: "Merging" | "Committing") =>
+  [
+    `error: ${action} is not possible because you have unmerged files.`,
+    "hint: Fix them up in the work tree, and then use 'git add/rm <file>'",
+    "hint: as appropriate to mark resolution and make a commit.",
+    "fatal: Exiting because of an unresolved conflict.",
+  ].join("\n");
 
 /**
  * Merge branches.
  *
- * Equivalent to `git merge`.
+ * Equivalent to `git merge`: a fast-forward, or git's merge-ort, written to the index and
+ * the working tree as git writes them. Before anything is written the merge is refused, with
+ * git's messages, where it would overwrite local changes or untracked files (or the index
+ * holds staged changes, or unmerged entries, or a merge is already in progress). A merge
+ * with conflicts leaves the files with git's conflict markers (`merge.conflictStyle`), the
+ * conflicts staged at stages 1-3, and git's state (`MERGE_HEAD`, `MERGE_MSG`, `MERGE_MODE`,
+ * `ORIG_HEAD`, `AUTO_MERGE`), so native git can `--continue` or `--abort` it and the other
+ * way round (`setOperation`).
  *
- * Based on JGit's MergeCommand.
+ * The result's `output` holds what git prints (`Auto-merging f`, `CONFLICT (...)`, ...)
+ * without the diffstat; a refused merge has status FAILED and git's error in `message`.
  *
  * @example
  * ```typescript
- * // Fast-forward merge
- * const result = await git.merge()
- *   .include("feature-branch")
- *   .call();
+ * const result = await git.merge().include("feature-branch").call();
+ * if (result.status === MergeStatus.CONFLICTING) {
+ *   // resolve, `git add`, then
+ *   await git.merge().setOperation(MergeOperation.CONTINUE).call();
+ * }
  *
  * // Force merge commit (no fast-forward)
- * const result = await git.merge()
- *   .include("feature-branch")
- *   .setFastForwardMode(FastForwardMode.NO_FF)
- *   .call();
- *
- * // Fail if fast-forward not possible
- * const result = await git.merge()
- *   .include("feature-branch")
- *   .setFastForwardMode(FastForwardMode.FF_ONLY)
- *   .call();
- *
- * // Use "ours" strategy (keep our tree, ignore theirs)
- * const result = await git.merge()
- *   .include("feature-branch")
- *   .setStrategy(MergeStrategy.OURS)
- *   .call();
- *
- * // Use "theirs" strategy (replace our tree with theirs)
- * const result = await git.merge()
- *   .include("feature-branch")
- *   .setStrategy(MergeStrategy.THEIRS)
- *   .call();
+ * await git.merge().include("feature").setFastForwardMode(FastForwardMode.NO_FF).call();
  * ```
  */
 export class MergeCommand extends GitCommand<MergeResult> {
@@ -74,6 +102,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private commit = true;
   private message?: string;
   private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
+  private operation = MergeOperation.MERGE;
+  private author?: PersonIdent;
+  private committer?: PersonIdent;
+  private autoStash?: boolean;
 
   /**
    * Add a commit/branch to merge.
@@ -104,10 +136,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
   /**
    * Set merge strategy.
    *
-   * - RECURSIVE (default): Standard three-way merge
+   * - RECURSIVE (default): git's merge-ort
    * - OURS: Keep our tree, ignore their changes (creates merge commit)
    * - THEIRS: Replace our tree with theirs (creates merge commit)
-   * - RESOLVE: Simple resolve strategy
+   * - RESOLVE: as RECURSIVE
    *
    * @param strategy Merge strategy
    */
@@ -118,14 +150,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
-   * Set content merge strategy for handling file-level conflicts.
-   *
-   * - OURS: Take our version for conflicts
-   * - THEIRS: Take their version for conflicts
-   * - UNION: Concatenate both sides (ours first, then theirs)
-   *
-   * When set, conflicts are resolved automatically using this strategy
-   * instead of producing conflict markers.
+   * Set content merge strategy for handling file-level conflicts (git's `-X ours`,
+   * `-X theirs`, `merge=union`): conflicting hunks are resolved to that side instead of
+   * producing conflict markers.
    *
    * @param contentStrategy Content merge strategy
    */
@@ -140,8 +167,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
    * `core.bigFileThreshold`, default 50 MiB).
    *
    * A binary file (over the threshold, or a NUL byte in its first 8000 bytes) is
-   * never content-merged and never loaded: as git does, OURS and THEIRS take that
-   * side's file whole, and UNION reports a conflict.
+   * never content-merged: as git does, OURS and THEIRS take that side's file whole, and
+   * otherwise ours stays with a conflict.
    *
    * @param threshold Size in bytes
    */
@@ -152,9 +179,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
-   * Set squash mode.
-   *
-   * When true, changes are staged but not committed, and HEAD is not updated.
+   * Set squash mode (`git merge --squash`): the merge's result is written to the index and
+   * the worktree with `SQUASH_MSG`, and HEAD is not updated.
    *
    * @param squash Whether to squash
    */
@@ -165,7 +191,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
-   * Set whether to commit after merge.
+   * Set whether to commit after merge (`--no-commit` when false: the merge stops before
+   * committing, with `MERGE_HEAD` and `MERGE_MSG` written for a later commit).
    *
    * @param commit Whether to commit (default: true)
    */
@@ -176,13 +203,49 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
-   * Set the merge commit message.
+   * Set the merge commit message (default git's: `Merge branch 'feature'`).
    *
    * @param message Commit message
    */
   setMessage(message: string): this {
     this.checkCallable();
     this.message = message;
+    return this;
+  }
+
+  /**
+   * Merge (default), or `--abort` / `--continue` the merge in progress.
+   *
+   * @param operation What to do
+   */
+  setOperation(operation: MergeOperation): this {
+    this.checkCallable();
+    this.operation = operation;
+    return this;
+  }
+
+  /**
+   * Stash local changes away before the merge and apply them after it (`--autostash`;
+   * default `merge.autoStash`, false). A merge that stops (conflicts, `--no-commit`) keeps
+   * them in MERGE_AUTOSTASH until it is continued or aborted.
+   */
+  setAutoStash(autoStash: boolean): this {
+    this.checkCallable();
+    this.autoStash = autoStash;
+    return this;
+  }
+
+  /** The author of the merge commit (default: the committer, else `Unknown`). */
+  setAuthor(author: PersonIdent): this {
+    this.checkCallable();
+    this.author = author;
+    return this;
+  }
+
+  /** The committer of the merge commit (default: the author, else `Unknown`). */
+  setCommitter(committer: PersonIdent): this {
+    this.checkCallable();
+    this.committer = committer;
     return this;
   }
 
@@ -194,14 +257,36 @@ export class MergeCommand extends GitCommand<MergeResult> {
   async call(): Promise<MergeResult> {
     this.checkCallable();
     this.setCallable(false);
+    const worktree = this.worktreeAccess;
+    const run = () => this.run(worktree);
+    return worktree?.batch ? worktree.batch(run) : run();
+  }
+
+  private async run(worktree: Worktree | undefined): Promise<MergeResult> {
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
+    if (this.operation === MergeOperation.ABORT) return this.abort(state, worktree);
+    if (this.operation === MergeOperation.CONTINUE) return this.continueMerge(state);
 
     // Validate parameters
     if (this.includes.length === 0) {
       throw new InvalidMergeHeadsError("No merge head specified");
     }
-
     if (this.includes.length > 1) {
       throw new InvalidMergeHeadsError("Only single-head merges are currently supported");
+    }
+
+    // git refuses on an index with unmerged entries, and while a merge is in progress
+    const { unmerged } = await readIndex(this.staging);
+    if (unmerged.length > 0) return failed(UNMERGED_FILES_MESSAGE("Merging"), unmerged);
+    if (await state.ref("MERGE_HEAD")) {
+      return failed(
+        "fatal: You have not concluded your merge (MERGE_HEAD exists).\nPlease, commit your changes before you merge.",
+      );
+    }
+    if (await state.ref("CHERRY_PICK_HEAD")) {
+      return failed(
+        "fatal: You have not concluded your cherry-pick (CHERRY_PICK_HEAD exists).\nPlease, commit your changes before you merge.",
+      );
     }
 
     // Get HEAD
@@ -209,211 +294,460 @@ export class MergeCommand extends GitCommand<MergeResult> {
     if (!head) {
       throw new NoHeadError("Cannot merge without HEAD");
     }
-
-    const headId = await this.refsStore.resolve("HEAD");
-    if (!headId?.objectId) {
+    const headResolved = await this.refsStore.resolve("HEAD");
+    if (!headResolved?.objectId) {
       throw new NoHeadError("HEAD does not point to a commit");
     }
+    const headId = headResolved.objectId;
 
     // Resolve merge source
     const srcRef = this.includes[0];
     const srcId = await this.resolveRef(srcRef);
 
+    // git records where HEAD was before every merge
+    await state.setRef("ORIG_HEAD", headId);
+
     // Check if already up to date (src is ancestor of HEAD)
-    if (await this.isAncestor(srcId, headId.objectId)) {
+    if (await this.isAncestor(srcId, headId)) {
       return {
         status: MergeStatus.ALREADY_UP_TO_DATE,
-        newHead: headId.objectId,
+        newHead: headId,
         mergedCommits: [srcId],
+        output: [this.squash ? "Already up to date. (nothing to squash)" : "Already up to date."],
       };
     }
 
     // Check if fast-forward is possible (HEAD is ancestor of src)
-    const canFastForward = await this.isAncestor(headId.objectId, srcId);
-
-    if (canFastForward && this.fastForwardMode !== FastForwardMode.NO_FF) {
-      // Fast-forward merge
-      return this.doFastForward(headId.objectId, srcId, head);
+    const canFastForward = await this.isAncestor(headId, srcId);
+    const fastForward = canFastForward && this.fastForwardMode !== FastForwardMode.NO_FF;
+    if (!fastForward && this.fastForwardMode === FastForwardMode.FF_ONLY) {
+      throw new NotFastForwardError("fatal: Not possible to fast-forward, aborting.");
     }
 
-    if (this.fastForwardMode === FastForwardMode.FF_ONLY) {
-      // Cannot fast-forward and FF_ONLY was requested
-      throw new NotFastForwardError();
+    // merge.autoStash: local changes stashed away, applied again once the merge is done
+    const created: string[] = [];
+    if (worktree && (this.autoStash ?? configBool(this.workingCopy, "merge.autoStash", false))) {
+      const autostash = await createAutostash(this.context(worktree), headId);
+      if (autostash) {
+        await state.write("MERGE_AUTOSTASH", `${autostash}\n`);
+        created.push(`Created autostash: ${abbrev(autostash)}`);
+      }
     }
+    const result = fastForward
+      ? await this.doFastForward(headId, srcId, head, state, worktree)
+      : await this.doMerge(headId, srcId, srcRef, head, state, worktree);
+    const output = [...created, ...(result.output ?? [])];
+    // a merge stopped for the user (conflicts, --no-commit) keeps the autostash for later
+    if (
+      result.status !== MergeStatus.CONFLICTING &&
+      result.status !== MergeStatus.MERGED_NOT_COMMITTED
+    ) {
+      const applied = await this.popAutostash(state, worktree);
+      output.push(...applied);
+      // a merge that moved HEAD ends with git's remove_merge_branch_state, after the
+      // autostash was applied (whose own merge recorded AUTO_MERGE)
+      if (
+        applied.length > 0 &&
+        (result.status === MergeStatus.MERGED || result.status === MergeStatus.FAST_FORWARD)
+      ) {
+        await state.removeRef("AUTO_MERGE");
+      }
+    }
+    return { ...result, output };
+  }
 
-    // Need to do a real merge
-    return this.doMerge(headId.objectId, srcId, head);
+  /** Applies MERGE_AUTOSTASH back, if there is one. */
+  private async popAutostash(
+    state: OperationState,
+    worktree: Worktree | undefined,
+  ): Promise<string[]> {
+    const id = (await state.read("MERGE_AUTOSTASH"))?.trim();
+    if (!id) return [];
+    await state.remove("MERGE_AUTOSTASH");
+    return applyAutostash(this.context(worktree), id);
   }
 
   /**
-   * Perform a fast-forward merge.
+   * Perform a fast-forward merge (git's checkout_fast_forward: a two-way switch).
    */
   private async doFastForward(
     headId: ObjectId,
     srcId: ObjectId,
     head: Awaited<ReturnType<typeof this.refsStore.get>>,
+    state: OperationState,
+    worktree: Worktree | undefined,
   ): Promise<MergeResult> {
-    if (!this.squash) {
-      // Update HEAD/branch to point to source commit
-      if (head && isSymbolicRef(head)) {
-        await this.refsStore.set(head.target, srcId);
-      } else {
-        await this.refsStore.set("HEAD", srcId);
-      }
-
-      // Update staging to match new HEAD
-      const srcCommitFF = await this.commits.load(srcId);
-      if (srcCommitFF) {
-        await this.staging.readTree(this.trees, srcCommitFF.tree);
-        await this.staging.write();
-      }
-
+    const output = [`Updating ${abbrev(headId)}..${abbrev(srcId)}`];
+    const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
+    const srcTree = await flatTree(this.trees, await this.commits.getTree(srcId));
+    const refused = await switchTrees(this.context(worktree), headTree, srcTree, {
+      action: "merge",
+      operation: "merge",
+    });
+    if (refused) {
       return {
-        status: MergeStatus.FAST_FORWARD,
-        newHead: srcId,
+        status: MergeStatus.FAILED,
+        newHead: headId,
         mergedCommits: [headId, srcId],
+        message: refused.message,
+        failingPaths: failing(refused.paths),
+        output,
       };
     }
-
-    // Squash: stage changes but don't update HEAD
-    const srcCommitSquash = await this.commits.load(srcId);
-    if (srcCommitSquash) {
-      await this.staging.readTree(this.trees, srcCommitSquash.tree);
-      await this.staging.write();
+    output.push("Fast-forward");
+    if (this.squash) {
+      await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, srcId));
+      output.push("Squash commit -- not updating HEAD");
+      return {
+        status: MergeStatus.FAST_FORWARD_SQUASHED,
+        newHead: headId,
+        mergedCommits: [headId, srcId],
+        message: "Squashed commit of merged changes",
+        output,
+      };
     }
-
+    await this.updateHead(head, srcId);
     return {
-      status: MergeStatus.FAST_FORWARD_SQUASHED,
-      newHead: headId,
+      status: MergeStatus.FAST_FORWARD,
+      newHead: srcId,
       mergedCommits: [headId, srcId],
-      message: "Squashed commit of merged changes",
+      output,
     };
   }
 
   /**
-   * Perform a three-way merge.
+   * Perform a three-way merge (git's merge-ort).
    */
   private async doMerge(
     headId: ObjectId,
     srcId: ObjectId,
+    srcName: string,
     head: Awaited<ReturnType<typeof this.refsStore.get>>,
+    state: OperationState,
+    worktree: Worktree | undefined,
   ): Promise<MergeResult> {
-    // Find merge base
     const mergeBases = await this.commits.findMergeBase(headId, srcId);
     if (mergeBases.length === 0) {
-      // No common ancestor - shouldn't happen with connected histories
       throw new NoMergeBaseError([headId, srcId]);
     }
-
-    const baseId = mergeBases[0]; // Use first merge base
-
-    // Load commits
+    const baseId = mergeBases[0];
     const headCommit = await this.commits.load(headId);
     const srcCommit = await this.commits.load(srcId);
-
     if (!headCommit || !srcCommit) {
       throw new RefNotFoundError(headId, "Failed to load commits for merge");
     }
+    const headTree = await flatTree(this.trees, headCommit.tree);
+    const { index } = await readIndex(this.staging);
 
-    // Handle strategy-specific merge
-    let treeId: ObjectId;
-
+    const mergeName = await this.describeMergeSource(srcName, srcId);
+    const output: string[] = [];
+    let target: Map<string, { objectId: ObjectId; mode: number }>;
+    let merge: Awaited<ReturnType<typeof ortMerge>> | undefined;
     if (this.strategy === MergeStrategy.OURS) {
-      // OURS strategy: keep our tree unchanged, completely ignore theirs
-      treeId = headCommit.tree;
-      await this.staging.readTree(this.trees, treeId);
-      await this.staging.write();
+      target = headTree;
     } else if (this.strategy === MergeStrategy.THEIRS) {
-      // THEIRS strategy: replace our tree with theirs
-      treeId = srcCommit.tree;
-      await this.staging.readTree(this.trees, treeId);
-      await this.staging.write();
+      target = await flatTree(this.trees, srcCommit.tree);
     } else {
-      // RECURSIVE or RESOLVE strategy: do three-way merge
       const baseCommit = await this.commits.load(baseId);
       if (!baseCommit) {
         throw new RefNotFoundError(baseId, "Failed to load merge base commit");
       }
-
-      // Perform tree-level merge
-      const mergeResult = await this.mergeTreesThreeWay(
-        baseCommit.tree,
-        headCommit.tree,
-        srcCommit.tree,
+      merge = await ortMerge(
+        this.blobs,
+        await flatTree(this.trees, baseCommit.tree),
+        headTree,
+        await flatTree(this.trees, srcCommit.tree),
+        {
+          oursLabel: "HEAD",
+          theirsLabel: srcName,
+          baseLabel: abbrev(baseId),
+          style: conflictStyleOf(this.workingCopy),
+          favor: favorOf(this.contentStrategy),
+          ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+          bigFileThreshold: this.bigFileThreshold,
+        },
       );
-
-      if (mergeResult.conflicts.length > 0) {
-        // Has conflicts - write conflict state to staging
-        await this.writeConflictStaging(
-          baseCommit.tree,
-          headCommit.tree,
-          srcCommit.tree,
-          mergeResult,
-        );
-        await this.staging.write();
-
-        return {
-          status: MergeStatus.CONFLICTING,
-          mergeBase: baseId,
-          mergedCommits: [headId, srcId],
-          conflicts: mergeResult.conflicts,
-        };
-      }
-
-      // No conflicts - write merged tree to staging
-      await this.writeMergedStaging(mergeResult);
-      await this.staging.write();
-      treeId = await this.staging.writeTree(this.trees);
+      target = await ortResultEntries(this.blobs, merge);
     }
+    const treeId = await storeFlatTree(this.trees, target);
+    // merge-ort records its result tree (AUTO_MERGE) whether or not it can be written
+    if (merge) await state.setRef("AUTO_MERGE", treeId);
 
-    if (!this.commit || this.squash) {
-      // Don't commit
-      const status = this.squash ? MergeStatus.MERGED_SQUASHED : MergeStatus.MERGED_NOT_COMMITTED;
+    // merge-ort's sanity check: the index must match HEAD (merge-ort-wrappers' unclean())
+    const staged = indexChanges(index, headTree);
+    if (staged.length > 0) {
+      await this.restoreStateQuirk(state, headCommit.tree, worktree);
       return {
-        status,
+        status: MergeStatus.FAILED,
         newHead: headId,
         mergeBase: baseId,
         mergedCommits: [headId, srcId],
+        message: `error: Your local changes to the following files would be overwritten by merge:\n  ${staged.join(" ")}\nMerge with strategy ort failed.`,
+        failingPaths: new Map(staged.map((p) => [p, MergeFailureReason.DIRTY_INDEX])),
       };
     }
 
-    // Create merge commit
-    const mergeMessage = this.message ?? `Merge commit '${srcId.slice(0, 7)}'`;
+    const conflicts = merge ? [...merge.conflicts.values()] : [];
+    const refused = await switchTrees(this.context(worktree), headTree, target, {
+      action: "merge",
+      operation: "merge",
+      conflicts,
+    });
+    if (refused) {
+      await this.restoreStateQuirk(state, headCommit.tree, worktree);
+      return {
+        status: MergeStatus.FAILED,
+        newHead: headId,
+        mergeBase: baseId,
+        mergedCommits: [headId, srcId],
+        message: `${refused.message}\nMerge with strategy ort failed.`,
+        failingPaths: failing(refused.paths),
+      };
+    }
+    output.push(...(merge?.messages ?? []));
+    // a message given is the commit's as it is; git's default ends with a newline
+    const message = this.message ?? (await this.defaultMessage(mergeName));
 
-    const now = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
-    const mergeCommit: Commit = {
-      tree: treeId,
-      parents: [headId, srcId],
-      author: {
-        name: "Author",
-        email: "author@example.com",
-        timestamp: now,
-        tzOffset: "+0000",
-      },
-      committer: {
-        name: "Committer",
-        email: "committer@example.com",
-        timestamp: now,
-        tzOffset: "+0000",
-      },
-      message: mergeMessage,
-    };
-
-    const newCommitId = await this.commits.store(mergeCommit);
-
-    // Update HEAD/branch
-    if (head && isSymbolicRef(head)) {
-      await this.refsStore.set(head.target, newCommitId);
-    } else {
-      await this.refsStore.set("HEAD", newCommitId);
+    if (conflicts.length > 0) {
+      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
+      if (this.squash) {
+        await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, srcId));
+        await state.write("MERGE_MSG", conflictsComment(paths));
+        output.push("Squash commit -- not updating HEAD");
+      } else {
+        const text = message.endsWith("\n") ? message : `${message}\n`;
+        await this.writeMergeState(state, srcId, `${text}${conflictsComment(paths)}`);
+      }
+      output.push("Automatic merge failed; fix conflicts and then commit the result.");
+      return {
+        status: MergeStatus.CONFLICTING,
+        mergeBase: baseId,
+        mergedCommits: [headId, srcId],
+        conflicts: paths,
+        output,
+      };
+    }
+    if (this.squash) {
+      await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, srcId));
+      output.push(
+        "Squash commit -- not updating HEAD",
+        "Automatic merge went well; stopped before committing as requested",
+      );
+      return {
+        status: MergeStatus.MERGED_SQUASHED,
+        newHead: headId,
+        mergeBase: baseId,
+        mergedCommits: [headId, srcId],
+        output,
+      };
+    }
+    if (!this.commit) {
+      await this.writeMergeState(state, srcId, message);
+      output.push("Automatic merge went well; stopped before committing as requested");
+      return {
+        status: MergeStatus.MERGED_NOT_COMMITTED,
+        newHead: headId,
+        mergeBase: baseId,
+        mergedCommits: [headId, srcId],
+        output,
+      };
     }
 
+    const newCommitId = await this.storeCommit(treeId, [headId, srcId], message);
+    await this.updateHead(head, newCommitId);
+    // the commit ends the merge: git's remove_merge_branch_state
+    await state.removeRef("AUTO_MERGE");
+    output.push(`Merge made by the '${this.strategyName()}' strategy.`);
     return {
       status: MergeStatus.MERGED,
       newHead: newCommitId,
       mergeBase: baseId,
       mergedCommits: [headId, srcId],
+      output,
     };
+  }
+
+  /** `git merge --continue`: commits the resolved merge with MERGE_MSG. */
+  private async continueMerge(state: OperationState): Promise<MergeResult> {
+    const mergeHead = await state.ref("MERGE_HEAD");
+    if (!mergeHead) {
+      return failed("fatal: There is no merge in progress (MERGE_HEAD missing).");
+    }
+    const { unmerged } = await readIndex(this.staging);
+    if (unmerged.length > 0) {
+      return failed(UNMERGED_FILES_MESSAGE("Committing"), unmerged);
+    }
+    const headId = await this.resolveHead();
+    const head = await this.refsStore.get("HEAD");
+    const treeId = await this.staging.writeTree(this.trees);
+    const message = cleanupMessage(
+      this.message ?? (await state.read("MERGE_MSG")) ?? `Merge commit '${mergeHead}'\n`,
+    );
+    const newCommitId = await this.storeCommit(treeId, [headId, mergeHead], message);
+    await this.updateHead(head, newCommitId);
+    await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
+    await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
+    return {
+      status: MergeStatus.MERGED,
+      newHead: newCommitId,
+      mergedCommits: [headId, mergeHead],
+      output: await this.popAutostash(state, this.worktreeAccess),
+    };
+  }
+
+  /** `git merge --abort`: `git reset --merge`, the merge's state removed. */
+  private async abort(state: OperationState, worktree: Worktree | undefined): Promise<MergeResult> {
+    const mergeHead = await state.ref("MERGE_HEAD");
+    if (!mergeHead) {
+      return failed("fatal: There is no merge to abort (MERGE_HEAD missing).");
+    }
+    const headId = await this.resolveHead();
+    const refused = await resetMerge(this.context(worktree), headId, "HEAD");
+    if (refused) return failed(refused.message, refused.paths);
+    await state.setRef("ORIG_HEAD", headId);
+    await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
+    await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
+    return {
+      status: MergeStatus.ABORTED,
+      newHead: headId,
+      mergedCommits: [mergeHead],
+      output: await this.popAutostash(state, worktree),
+    };
+  }
+
+  /**
+   * A failed strategy leaves AUTO_MERGE as git leaves it: git's merge restores the local
+   * changes it saved (`restore_state`, a stash of them applied by merge-ort), so AUTO_MERGE
+   * ends up the tree of the index and the tracked files' worktree content, and is absent
+   * when there was nothing to save.
+   */
+  private async restoreStateQuirk(
+    state: OperationState,
+    headTree: ObjectId,
+    worktree: Worktree | undefined,
+  ): Promise<void> {
+    await state.removeRef("AUTO_MERGE");
+    if (!worktree) return;
+    const provider = new WorkingCopyStashProvider({
+      workingCopy: this.workingCopy,
+      trees: this.trees,
+      blobs: this.blobs,
+      staging: this.staging,
+      worktree,
+      headTree: async () => headTree,
+    });
+    if (!(await provider.hasLocalChanges())) return;
+    const savedTree = await provider.getWorkingTree();
+    await state.setRef("AUTO_MERGE", savedTree);
+    // restore_state's `reset --hard` and `stash apply --index`: every changed file is
+    // written again from what was saved, through the checkout filters (eol, smudge)
+    const saved = await flatTree(this.trees, savedTree);
+    const head = await flatTree(this.trees, headTree);
+    const { index } = await readIndex(this.staging);
+    const attributes: ContentAttributesContext = {
+      direction: "checkout",
+      index: attributesIndexOf([...index].map(([p, e]) => [p, e.objectId] as const)),
+    };
+    const symlinks = worktreeModeTrust(this.workingCopy, worktree).symlinks;
+    const restaged = new Map<string, IndexEntryOptions[]>();
+    for (const [path, entry] of saved) {
+      const before = head.get(path);
+      if (before?.objectId === entry.objectId && before.mode === entry.mode) continue;
+      if (entry.mode === FileMode.GITLINK) continue;
+      const content = await this.blobs.load(entry.objectId);
+      if (!content) continue;
+      const mode =
+        entry.mode === FileMode.SYMLINK && !symlinks ? FileMode.REGULAR_FILE : entry.mode;
+      await worktree.writeContent(path, content, {
+        mode,
+        ...(mode !== entry.mode ? { raw: true } : {}),
+        createParents: true,
+        replaceInTheWay: true,
+        attributes,
+      });
+      // `stash apply --index` stages again what was staged: the index entry takes the stat
+      // of the file just written where the file holds its blob
+      const staged = index.get(path);
+      const stats = await worktree.getEntry(path);
+      if (staged && stats && !stats.isDirectory) {
+        if ((await worktree.computeHash(path)) === staged.objectId) {
+          restaged.set(path, [
+            { path, objectId: staged.objectId, mode: staged.mode, ...entryStatOf(stats) },
+          ]);
+        }
+      }
+    }
+    if (restaged.size > 0) await rewriteIndex(this.staging, restaged);
+  }
+
+  private context(worktree: Worktree | undefined) {
+    return {
+      workingCopy: this.workingCopy,
+      worktree,
+      staging: this.staging,
+      blobs: this.blobs,
+      trees: this.trees,
+      commits: this.commits,
+      refs: this.refsStore,
+    };
+  }
+
+  /** MERGE_HEAD, MERGE_MSG and MERGE_MODE of a merge stopped before its commit. */
+  private async writeMergeState(
+    state: OperationState,
+    srcId: ObjectId,
+    message: string,
+  ): Promise<void> {
+    await state.setRef("MERGE_HEAD", srcId);
+    await state.write("MERGE_MSG", message);
+    await state.write("MERGE_MODE", this.fastForwardMode === FastForwardMode.NO_FF ? "no-ff" : "");
+  }
+
+  private strategyName(): string {
+    switch (this.strategy) {
+      case MergeStrategy.OURS:
+        return "ours";
+      case MergeStrategy.THEIRS:
+        return "theirs";
+      default:
+        return "ort";
+    }
+  }
+
+  private async storeCommit(tree: ObjectId, parents: ObjectId[], message: string) {
+    const author = this.author ?? this.committer ?? defaultIdent();
+    const committer = this.committer ?? author;
+    const commit: Commit = { tree, parents, author, committer, message };
+    return this.commits.store(commit);
+  }
+
+  private async updateHead(
+    head: Awaited<ReturnType<typeof this.refsStore.get>>,
+    id: ObjectId,
+  ): Promise<void> {
+    if (head && isSymbolicRef(head)) await this.refsStore.set(head.target, id);
+    else await this.refsStore.set("HEAD", id);
+  }
+
+  /** How git's merge message names what is merged: `branch 'x'`, `tag 'v1'`, ... */
+  private async describeMergeSource(name: string, id: ObjectId): Promise<string> {
+    const strip = (prefix: string) => (name.startsWith(prefix) ? name.slice(prefix.length) : name);
+    if (name.startsWith("refs/heads/")) return `branch '${strip("refs/heads/")}'`;
+    if (name.startsWith("refs/remotes/"))
+      return `remote-tracking branch '${strip("refs/remotes/")}'`;
+    if (name.startsWith("refs/tags/")) return `tag '${strip("refs/tags/")}'`;
+    if (await this.refsStore.has(`refs/heads/${name}`)) return `branch '${name}'`;
+    if (await this.refsStore.has(`refs/tags/${name}`)) return `tag '${name}'`;
+    if (await this.refsStore.has(`refs/remotes/${name}`)) return `remote-tracking branch '${name}'`;
+    return `commit '${name || id}'`;
+  }
+
+  /** git's default merge message: `Merge branch 'x'` (`into <branch>` off main/master). */
+  private async defaultMessage(description: string): Promise<string> {
+    const branch = await this.getCurrentBranch();
+    const short = branch?.startsWith("refs/heads/") ? branch.slice("refs/heads/".length) : "HEAD";
+    const into = short === "main" || short === "master" ? "" : ` into ${short}`;
+    return `Merge ${description}${into}\n`;
   }
 
   /**
@@ -421,363 +755,55 @@ export class MergeCommand extends GitCommand<MergeResult> {
    */
   private async isAncestor(commitA: ObjectId, commitB: ObjectId): Promise<boolean> {
     if (commitA === commitB) return true;
-
-    // Walk ancestors of B looking for A
     const visited = new Set<ObjectId>();
     const queue: ObjectId[] = [commitB];
-
     while (queue.length > 0) {
       const current = queue.shift();
       if (current === undefined) break;
-
       if (visited.has(current)) continue;
       visited.add(current);
-
       if (current === commitA) return true;
-
       try {
         const commit = await this.commits.load(current);
         if (commit) {
           for (const parent of commit.parents) {
-            if (!visited.has(parent)) {
-              queue.push(parent);
-            }
+            if (!visited.has(parent)) queue.push(parent);
           }
         }
       } catch {
         // Commit not found - continue
       }
     }
-
     return false;
   }
-
-  /**
-   * Perform three-way tree merge.
-   *
-   * Returns merged entries and conflicts.
-   */
-  private async mergeTreesThreeWay(
-    baseTreeId: ObjectId,
-    oursTreeId: ObjectId,
-    theirsTreeId: ObjectId,
-  ): Promise<TreeMergeResult> {
-    const result: TreeMergeResult = {
-      merged: [],
-      conflicts: [],
-    };
-
-    // Collect all paths from all three trees
-    const allPaths = new Set<string>();
-    const basePaths = new Map<string, TreeEntry>();
-    const oursPaths = new Map<string, TreeEntry>();
-    const theirsPaths = new Map<string, TreeEntry>();
-
-    await this.collectTreeEntries(baseTreeId, "", basePaths, allPaths);
-    await this.collectTreeEntries(oursTreeId, "", oursPaths, allPaths);
-    await this.collectTreeEntries(theirsTreeId, "", theirsPaths, allPaths);
-
-    // Process each unique path
-    for (const path of allPaths) {
-      const base = basePaths.get(path);
-      const ours = oursPaths.get(path);
-      const theirs = theirsPaths.get(path);
-
-      const mergeEntry = this.mergeEntry(path, base, ours, theirs);
-
-      if (mergeEntry.conflict) {
-        // Try content-level merge if contentStrategy is set
-        if (this.contentStrategy && ours && theirs) {
-          const contentMergeResult = await this.tryContentMerge(path, base, ours, theirs);
-          if (contentMergeResult) {
-            result.merged.push({
-              path,
-              entry: contentMergeResult,
-            });
-            continue;
-          }
-        }
-
-        // No content strategy or content merge not possible - mark as conflict
-        result.conflicts.push(path);
-        result.merged.push({
-          path,
-          base,
-          ours,
-          theirs,
-        });
-      } else if (mergeEntry.entry) {
-        result.merged.push({
-          path,
-          entry: mergeEntry.entry,
-        });
-      }
-      // If entry is undefined and no conflict, the file was deleted
-    }
-
-    return result;
-  }
-
-  /**
-   * Try to perform content-level merge using the configured strategy.
-   *
-   * @returns Merged tree entry if successful, undefined if content merge not applicable
-   */
-  private async tryContentMerge(
-    _path: string,
-    base: TreeEntry | undefined,
-    ours: TreeEntry,
-    theirs: TreeEntry,
-  ): Promise<TreeEntry | undefined> {
-    // Only merge regular files (not symlinks, executables, etc. for now)
-    if (ours.mode !== FileMode.REGULAR_FILE || theirs.mode !== FileMode.REGULAR_FILE) {
-      return undefined;
-    }
-
-    // Content strategy must be set (caller should verify)
-    if (!this.contentStrategy) {
-      return undefined;
-    }
-
-    try {
-      // Binary or big files are never content-merged (git's ll_binary_merge)
-      const contents = await this.loadTexts([base?.id, ours.id, theirs.id]);
-      if (!contents) {
-        switch (this.contentStrategy) {
-          case ContentMergeStrategy.OURS:
-            return ours;
-          case ContentMergeStrategy.THEIRS:
-            return { ...theirs, name: ours.name };
-          default:
-            return undefined;
-        }
-      }
-
-      // Load content from all three versions (text under the threshold)
-      // (read once, by the probe)
-      const [baseContent, oursContent, theirsContent] = contents;
-
-      // Convert ContentMergeStrategy to utils MergeContentStrategy
-      const strategy = this.convertContentStrategy(this.contentStrategy);
-
-      // Perform content-level merge
-      const mergeResult = merge3Way(baseContent, oursContent, theirsContent, { strategy });
-
-      // If using OURS/THEIRS/UNION, conflicts are auto-resolved
-      // Store the merged content
-      const mergedBlobId = await this.blobs.store(
-        [mergeResult.content],
-        mergeResult.content.length,
-      );
-
-      return {
-        name: ours.name,
-        mode: ours.mode,
-        id: mergedBlobId,
-      };
-    } catch {
-      // Content merge failed - fall back to conflict
-      return undefined;
-    }
-  }
-
-  /**
-   * The blobs' contents, each read once; nothing when one is binary or over the
-   * threshold (then the rest are not read). A missing id is empty content.
-   */
-  private async loadTexts(
-    ids: [ObjectId | undefined, ObjectId, ObjectId],
-  ): Promise<[Uint8Array, Uint8Array, Uint8Array] | undefined> {
-    const out: Uint8Array[] = [];
-    for (const id of ids) {
-      if (!id) {
-        out.push(new Uint8Array(0));
-        continue;
-      }
-      const probe = await probeBlob(this.blobs, id, {
-        bigFileThreshold: this.bigFileThreshold,
-        loadText: true,
-      });
-      if (probe.binary || !probe.content) return undefined;
-      out.push(probe.content);
-    }
-    return out as [Uint8Array, Uint8Array, Uint8Array];
-  }
-
-  /**
-   * Convert ContentMergeStrategy to utils MergeContentStrategy.
-   */
-  private convertContentStrategy(strategy: ContentMergeStrategy): UtilsMergeContentStrategy {
-    switch (strategy) {
-      case ContentMergeStrategy.OURS:
-        return UtilsMergeContentStrategy.OURS;
-      case ContentMergeStrategy.THEIRS:
-        return UtilsMergeContentStrategy.THEIRS;
-      case ContentMergeStrategy.UNION:
-        return UtilsMergeContentStrategy.UNION;
-    }
-  }
-
-  /**
-   * Collect all blob entries from a tree recursively.
-   */
-  private async collectTreeEntries(
-    treeId: ObjectId,
-    prefix: string,
-    entries: Map<string, TreeEntry>,
-    allPaths: Set<string>,
-  ): Promise<void> {
-    for await (const entry of this.trees.loadTree(treeId)) {
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-
-      if (entry.mode === FileMode.TREE) {
-        // Recurse into subtree
-        await this.collectTreeEntries(entry.id, path, entries, allPaths);
-      } else {
-        // Blob entry
-        entries.set(path, entry);
-        allPaths.add(path);
-      }
-    }
-  }
-
-  /**
-   * Merge a single entry using three-way merge logic.
-   */
-  private mergeEntry(
-    _path: string,
-    base: TreeEntry | undefined,
-    ours: TreeEntry | undefined,
-    theirs: TreeEntry | undefined,
-  ): { entry?: TreeEntry; conflict?: boolean } {
-    // Case 1: All same (or all undefined)
-    if (this.sameEntry(base, ours) && this.sameEntry(base, theirs)) {
-      return { entry: ours };
-    }
-
-    // Case 2: Only we changed
-    if (this.sameEntry(base, theirs)) {
-      return { entry: ours };
-    }
-
-    // Case 3: Only they changed
-    if (this.sameEntry(base, ours)) {
-      return { entry: theirs };
-    }
-
-    // Case 4: Both changed - check if same change
-    if (this.sameEntry(ours, theirs)) {
-      return { entry: ours };
-    }
-
-    // Case 5: Both changed differently - conflict
-    return { conflict: true };
-  }
-
-  /**
-   * Check if two tree entries are the same.
-   */
-  private sameEntry(a: TreeEntry | undefined, b: TreeEntry | undefined): boolean {
-    if (a === undefined && b === undefined) return true;
-    if (a === undefined || b === undefined) return false;
-    return a.id === b.id && a.mode === b.mode;
-  }
-
-  /**
-   * Write conflict state to staging area.
-   */
-  private async writeConflictStaging(
-    _baseTreeId: ObjectId,
-    _oursTreeId: ObjectId,
-    _theirsTreeId: ObjectId,
-    mergeResult: TreeMergeResult,
-  ): Promise<void> {
-    const builder = this.staging.createBuilder();
-
-    // Add merged entries (stage 0)
-    for (const item of mergeResult.merged) {
-      if (item.entry) {
-        builder.add({
-          path: item.path,
-          mode: item.entry.mode,
-          objectId: item.entry.id,
-          stage: MergeStage.MERGED,
-        });
-      } else if (item.base || item.ours || item.theirs) {
-        // Conflict entry - add all stages
-        if (item.base) {
-          builder.add({
-            path: item.path,
-            mode: item.base.mode,
-            objectId: item.base.id,
-            stage: MergeStage.BASE,
-          });
-        }
-        if (item.ours) {
-          builder.add({
-            path: item.path,
-            mode: item.ours.mode,
-            objectId: item.ours.id,
-            stage: MergeStage.OURS,
-          });
-        }
-        if (item.theirs) {
-          builder.add({
-            path: item.path,
-            mode: item.theirs.mode,
-            objectId: item.theirs.id,
-            stage: MergeStage.THEIRS,
-          });
-        }
-      }
-    }
-
-    await builder.finish();
-  }
-
-  /**
-   * Write successfully merged entries to staging.
-   */
-  private async writeMergedStaging(mergeResult: TreeMergeResult): Promise<void> {
-    const builder = this.staging.createBuilder();
-
-    for (const item of mergeResult.merged) {
-      if (item.entry) {
-        builder.add({
-          path: item.path,
-          mode: item.entry.mode,
-          objectId: item.entry.id,
-          stage: MergeStage.MERGED,
-        });
-      }
-    }
-
-    await builder.finish();
-  }
 }
 
-/**
- * Result of tree-level merge.
- */
-interface TreeMergeResult {
-  /** Merged entries (both clean merges and conflicts) */
-  merged: MergedEntry[];
-  /** Paths with conflicts */
-  conflicts: string[];
+/** A refused merge: git's message, nothing changed. */
+function failed(message: string, paths: string[] = []): MergeResult {
+  return {
+    status: MergeStatus.FAILED,
+    mergedCommits: [],
+    message,
+    ...(paths.length > 0 ? { failingPaths: failing(paths) } : {}),
+  };
 }
 
-/**
- * A merged entry from three-way merge.
- */
-interface MergedEntry {
-  /** File path */
-  path: string;
-  /** Merged entry (for clean merges) */
-  entry?: TreeEntry;
-  /** Base entry (for conflicts) */
-  base?: TreeEntry;
-  /** Our entry (for conflicts) */
-  ours?: TreeEntry;
-  /** Their entry (for conflicts) */
-  theirs?: TreeEntry;
+function failing(paths: string[]): Map<string, MergeFailureReason> {
+  return new Map(paths.map((p) => [p, MergeFailureReason.DIRTY_WORKTREE]));
+}
+
+/** The content strategy as merge-ort's favor (`-X ours`, `-X theirs`, union). */
+export function favorOf(
+  strategy: ContentMergeStrategy | undefined,
+): "ours" | "theirs" | "union" | undefined {
+  switch (strategy) {
+    case ContentMergeStrategy.OURS:
+      return "ours";
+    case ContentMergeStrategy.THEIRS:
+      return "theirs";
+    case ContentMergeStrategy.UNION:
+      return "union";
+    default:
+      return undefined;
+  }
 }

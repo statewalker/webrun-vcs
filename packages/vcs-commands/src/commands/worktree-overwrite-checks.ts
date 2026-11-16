@@ -165,6 +165,8 @@ export async function pruneEmptyParents(worktree: Worktree, path: string): Promi
 export function overwriteMessage(
   action: "checkout" | "merge",
   found: {
+    /** Staged changes the operation would lose (git's ERROR_WOULD_OVERWRITE), listed first */
+    staged?: string[];
     local?: string[];
     lostDirs?: string[];
     untracked?: string[];
@@ -181,11 +183,12 @@ export function overwriteMessage(
       ? "Please move or remove them before you switch branches."
       : "Please move or remove them before you merge.";
   const parts: string[] = [];
-  if (found.local?.length) {
+  for (const paths of [found.staged, found.local]) {
+    if (!paths?.length) continue;
     parts.push(
       [
         `error: Your local changes to the following files would be overwritten by ${action}:`,
-        ...list(found.local),
+        ...list(paths),
         advice,
       ].join("\n"),
     );

@@ -32,4 +32,8 @@ export interface CherryPickResult {
   readonly conflicts?: string[];
   /** Paths that failed (for FAILED status) */
   readonly failingPaths?: Map<string, MergeFailureReason>;
+  /** The error printed on stderr for a refusal, or for a stop at a conflict (with hints) */
+  readonly message?: string;
+  /** What is printed on stdout: merge-ort's `Auto-merging f`, `CONFLICT (...)` lines */
+  readonly output?: string[];
 }
