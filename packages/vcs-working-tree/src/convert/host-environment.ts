@@ -16,6 +16,11 @@ export interface GitHostEnvironment {
   xdgConfigHome?: string;
   /** The system configuration file (`$(prefix)/etc/gitconfig`); not read when absent */
   systemConfig?: string;
+  /**
+   * The one global configuration file (`$GIT_CONFIG_GLOBAL`), read instead of
+   * `$XDG_CONFIG_HOME/git/config` and `~/.gitconfig`
+   */
+  globalConfig?: string;
   /** The system attributes file (`$(prefix)/etc/gitattributes`); not read when absent */
   systemAttributes?: string;
 }

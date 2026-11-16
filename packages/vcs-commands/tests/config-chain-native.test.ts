@@ -70,7 +70,7 @@ async function openConfig(dir: string) {
     write: async (path: string, content: Uint8Array) => writeFileSync(join(dir, path), content),
   };
   const config = new GitWorkingCopyConfig(io, ".git/config", {
-    environment: createNodeGitHostEnvironment({ home, xdgConfigHome: join(home, ".config") }),
+    environment: createNodeGitHostEnvironment({ env: env() }),
     gitDirPath: join(dir, ".git"),
   });
   await config.load();

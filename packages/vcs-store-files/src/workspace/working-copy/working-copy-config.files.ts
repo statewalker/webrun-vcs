@@ -164,10 +164,15 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (env) {
       const hostSource = (path: string): ConfigSource => ({ read: env.readFile, path });
       if (env.systemConfig) await reader.readFile(hostSource(env.systemConfig), base, 0);
-      const xdg = xdgConfigPath(env, "config");
-      if (xdg) await reader.readFile(hostSource(xdg), base, 0);
-      const userConfig = expandUserPath("~/.gitconfig", env);
-      if (userConfig) await reader.readFile(hostSource(userConfig), base, 0);
+      if (env.globalConfig) {
+        // $GIT_CONFIG_GLOBAL replaces both global files
+        await reader.readFile(hostSource(env.globalConfig), base, 0);
+      } else {
+        const xdg = xdgConfigPath(env, "config");
+        if (xdg) await reader.readFile(hostSource(xdg), base, 0);
+        const userConfig = expandUserPath("~/.gitconfig", env);
+        if (userConfig) await reader.readFile(hostSource(userConfig), base, 0);
+      }
     }
     this.baseEntries = base;
     await this.resolveOwnIncludes(reader);
@@ -180,6 +185,30 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       this.overlayEntries = overlay;
     }
     this.resolvedCache = undefined;
+    await this.noteHead(reader);
+  }
+
+  /** What HEAD named when an `onbranch:` condition was last evaluated, if one was. */
+  private headSeen?: { ref: string | undefined };
+
+  private async noteHead(reader: ChainReader): Promise<void> {
+    this.headSeen = reader.branchUsed ? { ref: await reader.headRef() } : undefined;
+  }
+
+  /**
+   * Re-evaluates the conditional includes that depend on the current branch
+   * (`includeIf.onbranch:`) when HEAD names another branch than when they were read (git
+   * evaluates them on every read of the configuration). Without such a condition nothing is
+   * read.
+   *
+   * @returns whether the chain was read again
+   */
+  async refresh(): Promise<boolean> {
+    if (!this.headSeen || !this.loaded) return false;
+    const probe = new ChainReader(this, this.options.environment, this.options, false);
+    if ((await probe.headRef()) === this.headSeen.ref) return false;
+    await this.loadChain();
+    return true;
   }
 
   /** The entries the include directives of this file bring in. */
@@ -198,6 +227,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       await r.include(key, value, source, entries, 1);
       if (entries.length > 0) this.includedEntries.set(line, entries);
     }
+    if (!reader && r.branchUsed) this.headSeen = { ref: await r.headRef() };
   }
 
   /**
@@ -717,18 +747,25 @@ class ChainReader {
     return (this.config as unknown as { configPath: string }).configPath;
   }
 
+  /** Whether an `onbranch:` condition was evaluated (the chain then depends on HEAD). */
+  branchUsed = false;
+
+  /** What HEAD names (`refs/heads/main`; undefined when detached), read once per reader. */
+  headRef(): Promise<string | undefined> {
+    this.branch ??= (async () => {
+      if (this.options.readHead) return this.options.readHead();
+      const files = (this.config as unknown as { files: ConfigFilesApi }).files;
+      const head = await files.read(`${dirOf(this.configPath())}HEAD`).catch(() => undefined);
+      if (!head) return undefined;
+      const text = new TextDecoder().decode(head).trim();
+      return text.startsWith("ref: ") ? text.slice(5).trim() : undefined;
+    })().catch(() => undefined);
+    return this.branch;
+  }
+
   private async currentBranch(): Promise<string | undefined> {
-    if (!this.branch) {
-      this.branch = (async () => {
-        if (this.options.readHead) return this.options.readHead();
-        const files = (this.config as unknown as { files: ConfigFilesApi }).files;
-        const head = await files.read(`${dirOf(this.configPath())}HEAD`).catch(() => undefined);
-        if (!head) return undefined;
-        const text = new TextDecoder().decode(head).trim();
-        return text.startsWith("ref: ") ? text.slice(5).trim() : undefined;
-      })();
-    }
-    const ref = await this.branch;
+    this.branchUsed = true;
+    const ref = await this.headRef();
     return ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
   }
 

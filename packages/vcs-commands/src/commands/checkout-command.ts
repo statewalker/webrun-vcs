@@ -34,7 +34,12 @@
  */
 
 import { FileMode, isValidBranchName, type ObjectId, type Ref } from "@statewalker/vcs-core";
-import { entryStatOf, UpdateStagingEntry, type Worktree } from "@statewalker/vcs-working-tree";
+import {
+  attributesIndexOf,
+  entryStatOf,
+  UpdateStagingEntry,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
 
 import {
   InvalidRefNameError,
@@ -321,18 +326,18 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // Checkout each path
     for (const path of pathsToCheckout) {
       try {
-        if (sourceTreeId) {
-          // Checkout from commit tree
-          await this.checkoutPathFromTree(path, sourceTreeId);
-        } else {
-          // Checkout from index
-          await this.checkoutPathFromIndex(path);
-        }
+        const entry = sourceTreeId
+          ? // Checkout from commit tree
+            await this.checkoutPathFromTree(path, sourceTreeId)
+          : // Checkout from index
+            await this.checkoutPathFromIndex(path);
+        await this.writePathToWorktree(path, entry);
         updated.push(path);
       } catch {
         conflicts.push(path);
       }
     }
+    if (updated.length > 0) await this.staging.write();
 
     return {
       status: conflicts.length > 0 ? CheckoutStatus.CONFLICTS : CheckoutStatus.OK,
@@ -515,12 +520,22 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         entries: plan.entries.filter((e) => switching.has(e.path)),
         gitlinks: plan.gitlinks.filter((e) => switching.has(e.path)),
       };
+      // the attributes of the index the switch leaves (git's o->result): the target's
+      // entries for the switched paths, the index's own for every other
+      const result = new Map<string, ObjectId>();
+      if (!this.force) for (const [path, entry] of index) result.set(path, entry.objectId);
+      for (const path of this.force ? target.keys() : switched) {
+        const t = target.get(path);
+        if (t) result.set(path, t.objectId);
+        else result.delete(path);
+      }
       // everything in the way was checked above (or the checkout is forced): a file or link
       // where a directory goes, a clean directory where a file goes, are replaced
       await writeTreeRestorePlan(worktree, this.blobs, only, CHECKOUT, {
         symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
         gitlinks: true,
         replaceInTheWay: true,
+        attributes: { direction: "checkout", index: attributesIndexOf(result) },
       });
       updated.push(...only.entries.map((e) => e.path));
     }
@@ -567,6 +582,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       await this.staging.write();
     }
 
+    // conditional includes on the branch (includeIf.onbranch:) follow the new HEAD
+    const config = this._workingCopy.config as { refresh?: () => Promise<unknown> } | undefined;
+    if (typeof config?.refresh === "function") await config.refresh();
+
     // Get the ref we checked out
     const ref = await this.refsStore.resolve("HEAD");
 
@@ -582,9 +601,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   /**
    * Checkout a path from the staging index.
    */
-  private async checkoutPathFromIndex(path: string): Promise<void> {
+  private async checkoutPathFromIndex(path: string): Promise<{ objectId: ObjectId; mode: number }> {
     // Find the entry in staging
-    let found = false;
+    let found: { objectId: ObjectId; mode: number } | undefined;
     for await (const entry of this.staging.entries()) {
       if (entry.path !== path) continue;
 
@@ -600,25 +619,60 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
             }),
           );
           await editor.finish();
-          found = true;
+          found = entry;
           break;
         }
         continue;
       }
 
-      found = true;
+      found = entry;
       break;
     }
 
     if (!found) {
       throw new PathNotInIndexError(path);
     }
+    return found;
+  }
+
+  /**
+   * Writes a checked-out path to the worktree (git's `checkout_entry` outside unpack-trees:
+   * attributes read from the worktree first) and records the file's stat in its entry.
+   */
+  private async writePathToWorktree(
+    path: string,
+    entry: { objectId: ObjectId; mode: number },
+  ): Promise<void> {
+    const worktree = this.worktreeAccess;
+    if (!worktree || entry.mode === FileMode.GITLINK || entry.mode === FileMode.TREE) return;
+    const content = await this.blobs.load(entry.objectId);
+    if (!content) throw new Error(`${CHECKOUT} cannot restore ${path}: blob missing`);
+    const symlinks = worktreeModeTrust(this.workingCopy, worktree).symlinks;
+    const mode = entry.mode === FileMode.SYMLINK && !symlinks ? FileMode.REGULAR_FILE : entry.mode;
+    await worktree.writeContent(path, content, {
+      mode,
+      // a link written as a file holds its target as it is (never smudged)
+      ...(mode !== entry.mode ? { raw: true } : {}),
+      createParents: true,
+    });
+    const stats = await worktree.getEntry(path);
+    const editor = this.staging.createEditor();
+    editor.upsert({
+      path,
+      objectId: entry.objectId,
+      mode: entry.mode,
+      ...entryStatOf(stats ?? {}),
+    });
+    await editor.finish();
   }
 
   /**
    * Checkout a path from a tree.
    */
-  private async checkoutPathFromTree(path: string, treeId: ObjectId): Promise<void> {
+  private async checkoutPathFromTree(
+    path: string,
+    treeId: ObjectId,
+  ): Promise<{ objectId: ObjectId; mode: number }> {
     // Navigate tree to find the entry
     const parts = path.split("/");
     let currentTreeId = treeId;
@@ -646,8 +700,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           }),
         );
         await editor.finish();
+        return { objectId: entry.id, mode: entry.mode };
       }
     }
+    throw new PathNotFoundInTreeError(path);
   }
 
   /**

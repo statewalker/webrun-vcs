@@ -56,7 +56,14 @@ export interface GitWorkingCopyContext {
  */
 export interface GitWorkingCopyFactorySetup
   extends Pick<GitConfigOptions, "environment">,
-    Omit<ContentFilterSetup, "environment"> {}
+    Omit<ContentFilterSetup, "environment"> {
+  /**
+   * Where the FilesApi's root is on the host (an absolute path on Node), so that
+   * `includeIf.gitdir:` matches the git directory's real path. Default: the FilesApi's
+   * `rootDirectory`, when it has one.
+   */
+  rootPath?: string;
+}
 
 /**
  * Git-compatible WorkingCopyFactory implementation.
@@ -70,6 +77,53 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     ) => Promise<GitWorkingCopyContext>,
     private readonly setup: GitWorkingCopyFactorySetup = {},
   ) {}
+
+  /**
+   * The configuration of the git directory `gitDir` as git reads it: for a linked worktree
+   * (`.git/worktrees/<name>`, which has a `commondir`) the repository's `config` with the
+   * worktree's own `config.worktree` (when `extensions.worktreeConfig` is set); `HEAD` (for
+   * `includeIf.onbranch:`) and the directory `includeIf.gitdir:` matches are the worktree's.
+   */
+  private async openConfig(gitDir: string, commonDir?: string) {
+    const common = commonDir ?? (await this.commonDirOf(gitDir));
+    const root = this.setup.rootPath ?? (this.files as { rootDirectory?: unknown }).rootDirectory;
+    const gitDirPath =
+      typeof root === "string" && root !== "" && !gitDir.startsWith("/")
+        ? `${root.replace(/\/+$/, "")}/${gitDir.replace(/^\.\//, "")}`
+        : gitDir;
+    const options: GitConfigOptions = {
+      ...(this.setup.environment ? { environment: this.setup.environment } : {}),
+      gitDirPath,
+    };
+    if (common !== gitDir) {
+      options.worktreeConfigPath = `${gitDir}/config.worktree`;
+      options.readHead = async () => {
+        const head = await this.readText(`${gitDir}/HEAD`);
+        const text = head?.trim();
+        return text?.startsWith("ref: ") ? text.slice(5).trim() : undefined;
+      };
+    }
+    return createWorkingCopyConfig(this.files, common, undefined, options);
+  }
+
+  private async readText(path: string): Promise<string | undefined> {
+    const content = await this.files.read(path).catch(() => undefined);
+    return content ? new TextDecoder().decode(content) : undefined;
+  }
+
+  /** git's `commondir`: the repository a linked worktree's git directory belongs to. */
+  private async commonDirOf(gitDir: string): Promise<string> {
+    const text = (await this.readText(`${gitDir}/commondir`))?.trim();
+    if (!text) return gitDir;
+    if (text.startsWith("/")) return text;
+    // relative to the worktree's git directory
+    const parts = gitDir.split("/").filter((p) => p !== "" && p !== ".");
+    for (const part of text.split("/")) {
+      if (part === "..") parts.pop();
+      else if (part !== "." && part !== "") parts.push(part);
+    }
+    return `${gitDir.startsWith("/") ? "/" : ""}${parts.join("/")}`;
+  }
 
   /**
    * Open or create a working copy at the given path.
@@ -98,9 +152,7 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     });
 
     // 5. Create config
-    const config = await createWorkingCopyConfig(this.files, repositoryPath, undefined, {
-      ...(this.setup.environment ? { environment: this.setup.environment } : {}),
-    });
+    const config = await this.openConfig(repositoryPath);
 
     return new GitWorkingCopy({
       history: context.history,
@@ -208,10 +260,8 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       getBranch: async () => checkout.getCurrentBranch(),
     });
 
-    // Create config
-    const config = await createWorkingCopyConfig(this.files, worktreeGitDir, undefined, {
-      ...(this.setup.environment ? { environment: this.setup.environment } : {}),
-    });
+    // Create config: the repository's, with this worktree's config.worktree
+    const config = await this.openConfig(worktreeGitDir, gitDir);
 
     return new GitWorkingCopy({
       history: context.history,

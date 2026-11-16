@@ -12,7 +12,11 @@
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
-import type { WorktreeContentFilter } from "./content-filter.js";
+import {
+  type AttributesIndex,
+  attributesIndexOfTree,
+  type WorktreeContentFilter,
+} from "./content-filter.js";
 import { hashCleanedContent, isConvertedMode, smudgeContent } from "./filtered-content.js";
 import { hashWorktreeFile, type NewHasher } from "./hash-worktree-file.js";
 import type {
@@ -177,6 +181,12 @@ export class MemoryWorktree implements Worktree {
     this.filter = filter;
   }
 
+  /** Runs `fn` as one operation of the content filter (its files read once). */
+  batch<T>(fn: () => Promise<T>): Promise<T> {
+    const filter = this.filter;
+    return filter?.batch ? filter.batch(fn) : fn();
+  }
+
   async computeHash(path: string): Promise<ObjectId> {
     const file = this.files.get(path);
     if (!file) {
@@ -222,7 +232,9 @@ export class MemoryWorktree implements Worktree {
     if (options?.overwrite === false && this.files.has(path)) {
       throw new Error(`File already exists: ${path}`);
     }
-    if (!options?.raw) content = await smudgeContent(this.filter, path, content, options?.mode);
+    if (!options?.raw) {
+      content = await smudgeContent(this.filter, path, content, options?.mode, options?.attributes);
+    }
 
     // Collect content
     let data: Uint8Array;
@@ -256,12 +268,13 @@ export class MemoryWorktree implements Worktree {
       mode: options?.mode ?? FileMode.REGULAR_FILE,
       mtime: Date.now(),
     });
+    this.filter?.noteChanged?.(path);
   }
 
   async remove(path: string, options?: { recursive?: boolean }): Promise<boolean> {
     if (this.files.has(path)) {
       this.files.delete(path);
-      this.filter?.noteRemoved?.(path);
+      this.filter?.noteChanged?.(path);
       return true;
     }
 
@@ -271,6 +284,7 @@ export class MemoryWorktree implements Worktree {
         for (const filePath of this.files.keys()) {
           if (filePath.startsWith(prefix)) {
             this.files.delete(filePath);
+            this.filter?.noteChanged?.(filePath);
           }
         }
         for (const dirPath of this.directories) {
@@ -355,7 +369,11 @@ export class MemoryWorktree implements Worktree {
       throw new Error(`Tree not found: ${treeId}`);
     }
 
-    await this.checkoutTreeRecursive(treeEntries, "", result, options);
+    // the files are smudged with the tree's attributes (git's read-tree -u)
+    const attributes = attributesIndexOfTree(this.trees, treeId);
+    await this.batch(() =>
+      this.checkoutTreeRecursive(treeEntries, "", result, options, attributes),
+    );
 
     return result;
   }
@@ -372,7 +390,8 @@ export class MemoryWorktree implements Worktree {
     tree: AsyncIterable<{ name: string; mode: number; id: ObjectId }>,
     prefix: string,
     result: WorktreeCheckoutResult,
-    options?: WorktreeCheckoutOptions,
+    options: WorktreeCheckoutOptions | undefined,
+    attributes: AttributesIndex,
   ): Promise<void> {
     for await (const entry of tree) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -389,7 +408,7 @@ export class MemoryWorktree implements Worktree {
       if (entry.mode === FileMode.TREE) {
         const subtree = await this.trees.load(entry.id);
         if (subtree) {
-          await this.checkoutTreeRecursive(subtree, path, result, options);
+          await this.checkoutTreeRecursive(subtree, path, result, options, attributes);
         }
       } else {
         if (options?.dryRun) {
@@ -411,6 +430,7 @@ export class MemoryWorktree implements Worktree {
             await this.writeContent(path, content, {
               mode: entry.mode,
               createParents: true,
+              attributes: { direction: "checkout", index: attributes },
             });
             result.updated.push(path);
           } else {

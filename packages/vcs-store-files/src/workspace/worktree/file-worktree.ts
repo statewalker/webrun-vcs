@@ -29,8 +29,10 @@ import {
   readFile,
 } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import { collect } from "@statewalker/vcs-utils/streams";
 import type {
+  AttributesIndex,
   IgnoreManager,
   NestedRepositoryState,
   NewHasher,
@@ -45,8 +47,8 @@ import type {
   WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
 import {
+  attributesIndexOfTree,
   createIgnoreManager,
-  hashCleanedContent,
   hashWorktreeFile,
   MemoryCheckout,
   MemoryWorkingCopy,
@@ -171,15 +173,17 @@ export class FileWorktree implements Worktree {
   /**
    * Runs `fn` as one batch: over a FilesApi with `withLstatCache`, its operations share a
    * cache of directories verified not to be links, dropped when the batch ends (git's
-   * per-command lstat cache), and the ignore rules are read once for the whole batch.
-   * Nested batches join the outer one.
+   * per-command lstat cache), and the ignore rules are read once for the whole batch, as
+   * are the content filter's configuration and attributes files. Nested batches join the
+   * outer one.
    */
   async batch<T>(fn: () => Promise<T>): Promise<T> {
     if (this.batchIgnores) return fn();
     this.batchIgnores = new Set();
     if (this.rootFiles.withLstatCache) this.scoped = this.rootFiles.withLstatCache();
     try {
-      return await fn();
+      const filter = this.filter;
+      return await (filter?.batch ? filter.batch(fn) : fn());
     } finally {
       this.scoped = undefined;
       this.batchIgnores = undefined;
@@ -454,18 +458,15 @@ export class FileWorktree implements Worktree {
         this.newHasher,
       );
     }
-    if (this.filter) {
+    // the content as the content filter cleans it (what `git add` would store); a link
+    // held as a file (`raw`) as it is
+    const conversion = this.filter ? await this.filter.checkin(path) : undefined;
+    if (conversion) {
       const stats = await this.files.stats(fullPath);
       if (stats?.kind === "directory") throw new Error(`Is a directory: ${path}`);
       if (stats?.kind !== "file") throw new Error(`File not found: ${path}`);
-      // the content as the content filter cleans it (what `git add` would store)
-      const cleaned = await hashCleanedContent(
-        this.filter,
-        path,
-        () => this.files.read(fullPath),
-        this.newHasher,
-      );
-      if (cleaned) return cleaned;
+      const cleaned = await conversion.apply(await collect(this.files.read(fullPath)));
+      return computeObjectIdFromStream("blob", cleaned.length, [cleaned], this.newHasher);
     }
     return hashWorktreeFile(
       path,
@@ -525,7 +526,22 @@ export class FileWorktree implements Worktree {
   ): Promise<void> {
     assertValidWorktreePath(path, options?.mode, this.pathRules);
     // a regular file is smudged by the content filter (git's convert_to_working_tree)
-    if (!options?.raw) content = await smudgeContent(this.filter, path, content, options?.mode);
+    if (!options?.raw) {
+      content = await smudgeContent(this.filter, path, content, options?.mode, options?.attributes);
+    }
+    try {
+      await this.writeFile(path, content, options);
+    } finally {
+      // what the filter read from this file (a `.gitattributes`) is read again
+      this.filter?.noteChanged?.(path);
+    }
+  }
+
+  private async writeFile(
+    path: string,
+    content: AsyncIterable<Uint8Array> | Iterable<Uint8Array> | Uint8Array,
+    options?: WorktreeWriteOptions,
+  ): Promise<void> {
     if (!this.files.refusesBeyondLinks || options?.replaceInTheWay) {
       await this.checkLeadingPath(path, options?.replaceInTheWay === true);
     }
@@ -607,7 +623,8 @@ export class FileWorktree implements Worktree {
     if (!kind) return false;
     if (kind === "directory" && !options?.recursive) return false;
     const removed = await this.files.remove(fullPath);
-    if (removed && kind !== "directory") this.filter?.noteRemoved?.(path);
+    // a removed directory takes its attributes files (and its subdirectories') with it
+    if (removed) this.filter?.noteChanged?.(kind === "directory" ? `${path}/.gitattributes` : path);
     return removed;
   }
 
@@ -907,7 +924,11 @@ export class FileWorktree implements Worktree {
       throw new Error(`Tree not found: ${treeId}`);
     }
 
-    await this.checkoutTreeRecursive(treeEntries, "", result, options);
+    // the files are smudged with the tree's attributes (git's read-tree -u)
+    const attributes = attributesIndexOfTree(this.trees, treeId);
+    await this.batch(() =>
+      this.checkoutTreeRecursive(treeEntries, "", result, options, attributes),
+    );
 
     return result;
   }
@@ -929,7 +950,10 @@ export class FileWorktree implements Worktree {
       throw new Error(`Tree not found: ${treeId}`);
     }
 
-    await this.checkoutTreeRecursive(treeEntries, "", result, { ...options, paths });
+    const attributes = attributesIndexOfTree(this.trees, treeId);
+    await this.batch(() =>
+      this.checkoutTreeRecursive(treeEntries, "", result, { ...options, paths }, attributes),
+    );
 
     return result;
   }
@@ -938,7 +962,8 @@ export class FileWorktree implements Worktree {
     tree: AsyncIterable<{ name: string; mode: number; id: ObjectId }>,
     prefix: string,
     result: WorktreeCheckoutResult,
-    options?: WorktreeCheckoutOptions,
+    options: WorktreeCheckoutOptions | undefined,
+    attributes: AttributesIndex,
   ): Promise<void> {
     for await (const entry of tree) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -957,7 +982,7 @@ export class FileWorktree implements Worktree {
         // Directory - recurse
         const subtree = await this.trees.load(entry.id);
         if (subtree) {
-          await this.checkoutTreeRecursive(subtree, path, result, options);
+          await this.checkoutTreeRecursive(subtree, path, result, options, attributes);
         }
       } else if (entry.mode === FileMode.GITLINK) {
         // Submodule: an empty directory, as git checks out an unpopulated submodule
@@ -994,6 +1019,7 @@ export class FileWorktree implements Worktree {
             await this.writeContent(path, content, {
               mode: entry.mode,
               createParents: true,
+              attributes: { direction: "checkout", index: attributes },
             });
             result.updated.push(path);
           } else {

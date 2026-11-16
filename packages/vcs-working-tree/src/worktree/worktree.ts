@@ -17,7 +17,7 @@
 
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { WorkingCopy } from "../working-copy.js";
-import type { WorktreeContentFilter } from "./content-filter.js";
+import type { ContentAttributesContext, WorktreeContentFilter } from "./content-filter.js";
 import type { WorktreeEntry } from "./types.js";
 
 // Re-export types for consumers
@@ -95,6 +95,12 @@ export interface WorktreeWriteOptions {
    * regular file is smudged where a filter is installed ({@link Worktree.setContentFilter}).
    */
   raw?: boolean;
+  /**
+   * Where the smudge reads the file's attributes: a checkout of a tree passes the index it
+   * leaves behind (`direction: "checkout"`, git's unpack-trees). Default: the worktree's
+   * `.gitattributes`, then the current index's (git's `checkout -- <path>`).
+   */
+  attributes?: ContentAttributesContext;
 }
 
 /**

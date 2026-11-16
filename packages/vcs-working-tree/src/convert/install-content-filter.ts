@@ -7,7 +7,7 @@ import type { WorkingCopyConfig } from "../working-copy.js";
 import type { WorktreeContentFilter } from "../worktree/content-filter.js";
 import type { Worktree } from "../worktree/worktree.js";
 import type { FilterDriverRegistry } from "./filter-driver.js";
-import { configValue, createGitContentFilter } from "./git-content-filter.js";
+import { configValue, createGitContentFilter, GitContentFilter } from "./git-content-filter.js";
 import { expandUserPath, type GitHostEnvironment, xdgConfigPath } from "./host-environment.js";
 
 /** How a working copy sets up its worktree's content conversion. */
@@ -53,8 +53,9 @@ export function installExcludesFile(
 }
 
 /**
- * Installs a content filter on the worktree of a working copy (once: a worktree that has a
- * filter keeps it).
+ * Installs a content filter on the worktree of a working copy. A filter the host set on the
+ * worktree itself is kept; git's filter from an earlier working copy is replaced by one
+ * reading this working copy's configuration and drivers.
  *
  * @example
  * ```typescript
@@ -77,7 +78,9 @@ export function installContentFilter(
     worktree.setContentFilter(setup.contentFilter);
     return;
   }
-  if (worktree.contentFilter) return;
+  // a filter the host installed itself is kept; git's (from an earlier opening of a working
+  // copy on this worktree) is replaced, so the configuration and drivers given now apply
+  if (worktree.contentFilter && !(worktree.contentFilter instanceof GitContentFilter)) return;
   worktree.setContentFilter(
     createGitContentFilter({
       worktree,

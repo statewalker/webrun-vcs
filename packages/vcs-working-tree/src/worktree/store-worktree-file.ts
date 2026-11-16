@@ -61,7 +61,9 @@ export async function storeWorktreeFile(
   if (conversion) {
     // cleaned as git's `index_path` cleans what it stores: the whole file, converted
     const raw = await collectChunks(worktree.readContent(path));
-    const cleaned = await conversion.apply(raw, { write: true, ...options });
+    // git's get_conv_flags: a write checks core.safecrlf and fails on a bad encoding; a
+    // renormalisation (CONV_EOL_RENORMALIZE alone) does neither
+    const cleaned = await conversion.apply(raw, { write: !options.renormalize, ...options });
     const id = await blobs.store([cleaned], cleaned.length);
     // the stat that matches what was read (the worktree's size, never the blob's)
     if (raw.length !== entry.size) {

@@ -349,17 +349,20 @@ export class AddCommand extends GitCommand<AddResult> {
       );
     }
 
-    if (this.renormalize)
-      return this.renormalizeFiles(worktree, addAll ? ["."] : this.filepatterns);
-
-    // Whether to stage deletions
-    const stageDeletions = this.update || (this.all !== undefined && this.all);
-
-    // Use addAll pattern if needed
-    const patterns = addAll ? ["."] : this.filepatterns;
-
-    // Process files
-    return this.processFiles(worktree, patterns, stageDeletions);
+    // one worktree batch: the ignore rules, the configuration and the attributes files are
+    // read once for all the files
+    const run = () => {
+      if (this.renormalize) {
+        return this.renormalizeFiles(worktree, addAll ? ["."] : this.filepatterns);
+      }
+      // Whether to stage deletions
+      const stageDeletions = this.update || (this.all !== undefined && this.all);
+      // Use addAll pattern if needed
+      const patterns = addAll ? ["."] : this.filepatterns;
+      // Process files
+      return this.processFiles(worktree, patterns, stageDeletions);
+    };
+    return worktree.batch ? worktree.batch(run) : run();
   }
 
   /**
@@ -555,7 +558,12 @@ export class AddCommand extends GitCommand<AddResult> {
       if (kind !== 0o100000 && kind !== 0o120000) continue;
       if (!matchesPattern(entry.path, patterns)) continue;
       const worktreeEntry = await worktree.getEntry(entry.path);
-      if (!worktreeEntry || worktreeEntry.isDirectory) continue;
+      // git's add_file_to_index dies on a tracked file it cannot stat (the index is left
+      // as it was)
+      if (!worktreeEntry) {
+        throw new Error(`unable to stat '${entry.path}': No such file or directory`);
+      }
+      if (worktreeEntry.isDirectory) continue;
       const stored = await storeWorktreeFile(this.blobs, worktree, entry.path, worktreeEntry, {
         renormalize: true,
         onWarning: (message) => warnings.push(message),

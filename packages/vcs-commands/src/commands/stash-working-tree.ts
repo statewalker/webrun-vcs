@@ -11,6 +11,7 @@
 
 import { type Blobs, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import {
+  attributesIndexOf,
   createIndexTree,
   createUntrackedTree,
   createWorktreeTree,
@@ -173,7 +174,8 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
       if (!b || b.id !== t.id || b.mode !== t.mode) stale.add(path);
     }
     for (const path of before.keys()) if (!target.has(path)) stale.add(path);
-    await this.write(to, target, stale);
+    // a path checkout (`checkout --no-overlay <tree> -- :/`): the worktree's attributes first
+    await this.write(to, target, stale, "checkin");
   }
 
   /** Writes (or removes) the `stale` paths of the worktree and the index to `treeId`. */
@@ -181,6 +183,7 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
     treeId: ObjectId | undefined,
     target: Map<string, { id: ObjectId; mode: number }>,
     stale: Set<string>,
+    direction: "checkin" | "checkout" = "checkout",
   ): Promise<void> {
     if (stale.size === 0) return;
     const { trees, blobs, staging, worktree, workingCopy } = this.context;
@@ -212,7 +215,15 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
         blobs,
         { ...plan, entries: writing, gitlinks: [] },
         STASH,
-        { symlinks: trust.symlinks, replaceInTheWay: true },
+        {
+          symlinks: trust.symlinks,
+          replaceInTheWay: true,
+          // the attributes of the index left behind: the whole target tree
+          attributes: {
+            direction,
+            index: attributesIndexOf([...target].map(([p, t]) => [p, t.id] as const)),
+          },
+        },
       );
       for (const path of stale) {
         const t = target.get(path);

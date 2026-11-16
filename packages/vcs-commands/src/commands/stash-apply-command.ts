@@ -1,6 +1,11 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { mergeLines } from "@statewalker/vcs-utils";
-import { entryStatOf, type Worktree } from "@statewalker/vcs-working-tree";
+import {
+  attributesIndexOf,
+  type ContentAttributesContext,
+  entryStatOf,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
 import {
   InvalidArgumentError,
   NoHeadError,
@@ -377,10 +382,21 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     );
 
     // Everything below this line writes.
+    // git writes the merge's result through unpack-trees: every file smudged with the
+    // attributes of the merged index (whatever order the files are written in)
+    const attributes: ContentAttributesContext = {
+      direction: "checkout",
+      index: attributesIndexOf([...merge.result].map(([p, e]) => [p, e.objectId] as const)),
+    };
     if (untrackedPlan) {
-      // git restores the untracked files first; they stay untracked
+      // git restores the untracked files first (`checkout-index` of their own index: the
+      // worktree's attributes, then that index's); they stay untracked
       await writeTreeRestorePlan(worktree, this.blobs, untrackedPlan, STASH_APPLY, {
         symlinks: trust.symlinks,
+        attributes: {
+          direction: "checkin",
+          index: attributesIndexOf(untrackedPlan.entries.map((e) => [e.path, e.objectId] as const)),
+        },
       });
     }
     // a file a file/directory conflict moves aside goes to `<path>~<side>` first
@@ -400,9 +416,16 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
           mode: conflict.mode,
           createParents: true,
           replaceInTheWay: true,
+          attributes,
         });
       } else if (conflict.write) {
-        await this.writeBlob(worktree, conflict.stagePath, conflict.write, trust.symlinks);
+        await this.writeBlob(
+          worktree,
+          conflict.stagePath,
+          conflict.write,
+          trust.symlinks,
+          attributes,
+        );
       }
       await worktree.remove(conflict.moveFrom);
     }
@@ -421,7 +444,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         gitlinks: [],
       },
       STASH_APPLY,
-      { symlinks: trust.symlinks, replaceInTheWay: true },
+      { symlinks: trust.symlinks, replaceInTheWay: true, attributes },
     );
     // conflicted files: the text with git's markers, or the surviving side of a
     // modify/delete; a binary conflict keeps ours as it is
@@ -432,9 +455,16 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
           mode: conflict.mode,
           createParents: true,
           replaceInTheWay: true,
+          attributes,
         });
       } else if (conflict.write) {
-        await this.writeBlob(worktree, conflict.stagePath, conflict.write, trust.symlinks);
+        await this.writeBlob(
+          worktree,
+          conflict.stagePath,
+          conflict.write,
+          trust.symlinks,
+          attributes,
+        );
       }
     }
 
@@ -512,6 +542,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     path: string,
     entry: CheckedEntry,
     symlinks: boolean,
+    attributes: ContentAttributesContext,
   ): Promise<void> {
     const content = await this.blobs.load(entry.objectId);
     if (!content) throw new Error(`${STASH_APPLY} cannot restore ${path}: blob missing`);
@@ -522,6 +553,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       ...(mode !== entry.mode ? { raw: true } : {}),
       createParents: true,
       replaceInTheWay: true,
+      attributes,
     });
   }
 

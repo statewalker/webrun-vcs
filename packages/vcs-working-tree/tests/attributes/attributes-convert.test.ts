@@ -26,7 +26,7 @@ import {
   SafeCrlfError,
   validateEncoding,
 } from "../../src/convert/index.js";
-import { createMemoryWorktree } from "../../src/worktree/index.js";
+import { attributesIndexOf, createMemoryWorktree } from "../../src/worktree/index.js";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
@@ -206,5 +206,63 @@ describe("GitContentFilter on a memory worktree", () => {
     await worktree.writeContent("link", enc("target\n"), { mode: 0o120000 });
     for await (const chunk of worktree.readContent("link")) content = chunk;
     expect(dec(content)).toBe("target\n");
+  });
+});
+
+describe("GitContentFilter: where a smudge reads attributes", () => {
+  const stores = { blobs: {} as Blobs, trees: {} as Trees };
+  const blobsOf = (contents: Record<string, string>) =>
+    ({
+      load: async (id: string) => (contents[id] !== undefined ? [enc(contents[id])] : undefined),
+    }) as unknown as Blobs;
+  const read = async (worktree: ReturnType<typeof createMemoryWorktree>, path: string) => {
+    let content: Uint8Array = new Uint8Array();
+    for await (const chunk of worktree.readContent(path)) content = chunk;
+    return dec(content);
+  };
+
+  it("a checkout context reads the index it names first; the default reads the worktree first", async () => {
+    const worktree = createMemoryWorktree(stores);
+    const filter = new GitContentFilter({
+      worktree,
+      blobs: blobsOf({ crlf: "*.txt eol=crlf\n" }),
+    });
+    worktree.setContentFilter?.(filter);
+    await worktree.writeContent(".gitattributes", enc("*.txt -text\n"));
+    const index = attributesIndexOf([[".gitattributes", "crlf"]]);
+    await worktree.writeContent("a.txt", enc("x\n"), {
+      attributes: { direction: "checkout", index },
+    });
+    expect(await read(worktree, "a.txt")).toBe("x\r\n");
+    // the worktree's file first (git's checkout -- <path>)
+    await worktree.writeContent("b.txt", enc("x\n"), {
+      attributes: { direction: "checkin", index },
+    });
+    expect(await read(worktree, "b.txt")).toBe("x\n");
+    await worktree.writeContent("c.txt", enc("x\n"));
+    expect(await read(worktree, "c.txt")).toBe("x\n");
+    // an index without the file: the worktree's
+    await worktree.writeContent("d.txt", enc("x\n"), {
+      attributes: { direction: "checkout", index: attributesIndexOf([]) },
+    });
+    expect(await read(worktree, "d.txt")).toBe("x\n");
+  });
+
+  it("within a batch, a .gitattributes the worktree rewrites or removes is read again", async () => {
+    const worktree = createMemoryWorktree(stores);
+    worktree.setContentFilter?.(new GitContentFilter({ worktree }));
+    const batch = worktree.batch?.bind(worktree);
+    expect(batch).toBeDefined();
+    await batch?.(async () => {
+      await worktree.writeContent(".gitattributes", enc("*.txt -text\n"));
+      await worktree.writeContent("a.txt", enc("x\n"));
+      expect(await read(worktree, "a.txt")).toBe("x\n");
+      await worktree.writeContent(".gitattributes", enc("*.txt eol=crlf\n"));
+      await worktree.writeContent("b.txt", enc("x\n"));
+      expect(await read(worktree, "b.txt")).toBe("x\r\n");
+      await worktree.remove(".gitattributes");
+      await worktree.writeContent("c.txt", enc("x\n"));
+      expect(await read(worktree, "c.txt")).toBe("x\n");
+    });
   });
 });

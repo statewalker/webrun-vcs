@@ -81,7 +81,12 @@ async function open(
   };
   const environment =
     extra.environment ??
-    createNodeGitHostEnvironment({ home, xdgConfigHome: join(home, ".config") });
+    createNodeGitHostEnvironment({
+      home,
+      xdgConfigHome: join(home, ".config"),
+      // the global files of `home`, no system files (as the native twins read)
+      env: { GIT_CONFIG_NOSYSTEM: "1", GIT_ATTR_NOSYSTEM: "1" },
+    });
   const config = new GitWorkingCopyConfig(io, ".git/config", {
     environment,
     gitDirPath: join(dir, ".git"),

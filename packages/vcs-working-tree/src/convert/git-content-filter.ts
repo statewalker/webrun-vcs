@@ -4,17 +4,19 @@
  * (`core.autocrlf`, `core.eol`, `core.safecrlf`, `filter.<driver>.*`) decide how a file is
  * cleaned on its way into the index and smudged on its way out.
  *
- * Attributes are read as git reads them: on check-in from the worktree's `.gitattributes`
- * (the index's when the worktree has none), on checkout from the index's (the worktree's
- * when the index has none). A checkout in progress writes `.gitattributes` files before the
- * files they govern (they sort first): what it wrote is what the index will hold, so it is
- * read in their place, as git reads its already-updated index.
+ * Attributes are read as git reads them: on check-in (and a smudge outside unpack-trees,
+ * such as `checkout -- <path>`) from the worktree's `.gitattributes` (the index's when the
+ * worktree has none); on a checkout of a tree from the index the checkout leaves behind
+ * (the worktree's when that index has none), which the operation passes along with each
+ * file it writes, as git's `check_updates` reads `o->result`.
  */
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import {
+  type AttributesContent,
+  AttributesMemo,
   AttributesResolver,
   type AttributesSources,
   type AttributeValue,
@@ -22,6 +24,8 @@ import {
 import type { Staging } from "../staging/staging.js";
 import type { WorkingCopyConfig } from "../working-copy.js";
 import {
+  type AttributesIndex,
+  type ContentAttributesContext,
   type ContentConversion,
   type ContentConversionOptions,
   collectChunks,
@@ -312,8 +316,39 @@ function statKey(entry: WorktreeEntry): string {
 /** How long after its last change a file's stat is trusted to show further changes (ms). */
 const SETTLED_MS = 3000;
 
+/** The directory of an in-tree attributes file ("" for the root's). */
+const dirOfAttributesFile = (path: string) => {
+  const slash = path.lastIndexOf("/");
+  return slash > 0 ? path.slice(0, slash) : "";
+};
+
+/**
+ * What one operation reads once: the configuration, the attributes files outside the tree,
+ * and (per attribute source) each directory's chain of `.gitattributes`.
+ */
+interface Scope {
+  settings: ConversionSettings;
+  memos: Map<string, { sources: AttributesSources; memo: AttributesMemo }>;
+  /** The conversion of a path no attribute applies to */
+  unspecified?: ConvAttrs;
+  outer: {
+    system?: Promise<AttributesContent>;
+    global?: Promise<AttributesContent>;
+    info?: Promise<AttributesContent>;
+  };
+}
+
 /**
  * git's conversion of file content between the worktree and the repository.
+ *
+ * Attributes are read as git reads them: a clean (and a smudge outside unpack-trees, such as
+ * `checkout -- <path>`) from the worktree's `.gitattributes` (the index's when the worktree
+ * has none); a checkout of a tree (`checkout <branch>`, `reset --hard`, `clone`, a merge)
+ * from the index it leaves behind (the worktree's when that index holds none), which the
+ * operation passes as the smudge's {@link ContentAttributesContext}.
+ *
+ * Within a {@link batch} the configuration and the attributes files are read once; outside
+ * one, every call reads them again (files whose stat is unchanged are not re-read).
  *
  * @example
  * ```typescript
@@ -323,23 +358,27 @@ const SETTLED_MS = 3000;
  * ```
  */
 export class GitContentFilter implements WorktreeContentFilter {
-  private readonly checkinResolver: AttributesResolver;
-  private readonly checkoutResolver: AttributesResolver;
-  /** In-tree attributes files a checkout wrote or removed (path -> content, or none) */
-  private readonly written = new Map<string, { content?: Uint8Array; key?: string }>();
+  private readonly resolver: AttributesResolver;
   /** Worktree attributes files read, by path: content kept while their stat is unchanged */
   private readonly worktreeFiles = new Map<string, { key: string; content: Uint8Array }>();
   /** Index blobs read (attributes files), by id */
   private readonly indexBlobs = new Map<string, Uint8Array>();
+  /** Numbers naming the attribute indexes passed in, for the memo of each */
+  private readonly indexIds = new WeakMap<AttributesIndex, number>();
+  private nextIndexId = 1;
   private settingsCache?: ConversionSettings;
+  /** The operation in progress ({@link batch}) */
+  private scope?: Scope;
 
   constructor(private readonly options: GitContentFilterOptions) {
-    const resolverOptions = {
-      ignoreCase: () => (this.settingsCache ?? this.settings()).ignoreCase,
-      ...(options.onWarning ? { onWarning: options.onWarning } : {}),
-    };
-    this.checkinResolver = new AttributesResolver(this.sources("checkin"), resolverOptions);
-    this.checkoutResolver = new AttributesResolver(this.sources("checkout"), resolverOptions);
+    this.resolver = new AttributesResolver(
+      { inTree: async () => undefined },
+      {
+        ignoreCase: () =>
+          (this.scope?.settings ?? this.settingsCache ?? this.settings()).ignoreCase,
+        ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+      },
+    );
   }
 
   /** The configuration's conversion settings, read afresh. */
@@ -356,61 +395,104 @@ export class GitContentFilter implements WorktreeContentFilter {
     );
   }
 
-  private sources(direction: AttributesDirection): AttributesSources {
-    const env = () => this.environment;
+  /** A fresh scope: the configuration re-read (conditional includes re-evaluated). */
+  private async openScope(): Promise<Scope> {
+    const refresh = (this.options.config as { refresh?: () => Promise<unknown> } | undefined)
+      ?.refresh;
+    if (typeof refresh === "function") await refresh.call(this.options.config);
+    return { settings: this.settings(), memos: new Map(), outer: {} };
+  }
+
+  async batch<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.scope) return fn();
+    this.scope = await this.openScope();
+    try {
+      return await fn();
+    } finally {
+      this.scope = undefined;
+    }
+  }
+
+  /** The operation's scope, or a scope of its own for a call outside one. */
+  private async currentScope(): Promise<Scope> {
+    return this.scope ?? (await this.openScope());
+  }
+
+  noteChanged(path: string): void {
+    if (!isAttributesFile(path)) return;
+    this.worktreeFiles.delete(path);
+    const dir = dirOfAttributesFile(path);
+    if (this.scope) for (const { memo } of this.scope.memos.values()) memo.dropDirectory(dir);
+  }
+
+  /** The files outside the tree, read once per scope. */
+  private outerSources(scope: Scope): Omit<AttributesSources, "inTree"> {
+    const env = this.environment;
     return {
-      system: async () => {
-        const path = env()?.systemAttributes;
-        return path ? env()?.readFile(path) : undefined;
+      system: () => {
+        scope.outer.system ??= (async () => {
+          const path = env?.systemAttributes;
+          return path ? env?.readFile(path).catch(() => undefined) : undefined;
+        })();
+        return scope.outer.system;
       },
-      global: async () => {
-        const e = env();
-        const configured = (this.settingsCache ?? this.settings()).attributesFile;
-        const path = configured ? expandUserPath(configured, e) : xdgConfigPath(e, "attributes");
-        if (!path || !e) return undefined;
-        return e.readFile(path).catch(() => undefined);
+      global: () => {
+        scope.outer.global ??= (async () => {
+          const configured = scope.settings.attributesFile;
+          const path = configured
+            ? expandUserPath(configured, env)
+            : xdgConfigPath(env, "attributes");
+          if (!path || !env) return undefined;
+          return env.readFile(path).catch(() => undefined);
+        })();
+        return scope.outer.global;
       },
-      info: async () => {
-        if (this.options.readInfoAttributes) return this.options.readInfoAttributes();
-        return this.options.worktree.readGitDirFile?.("info/attributes");
-      },
-      inTree: async (dir) => {
-        const path = dir ? `${dir}/.gitattributes` : ".gitattributes";
-        if (direction === "checkout") {
-          const written = await this.writtenAttributes(path);
-          if (written) return written.content;
-          return (await this.indexContent(path)) ?? (await this.worktreeContent(path));
-        }
-        return (await this.worktreeContent(path)) ?? (await this.indexContent(path));
+      info: () => {
+        scope.outer.info ??= (async () => {
+          if (this.options.readInfoAttributes) return this.options.readInfoAttributes();
+          return this.options.worktree.readGitDirFile?.("info/attributes");
+        })();
+        return scope.outer.info;
       },
     };
   }
 
-  /** What a checkout wrote at `path`, while the file still holds it. */
-  private async writtenAttributes(path: string): Promise<{ content?: Uint8Array } | undefined> {
-    const note = this.written.get(path);
-    if (!note) return undefined;
-    const entry = await this.options.worktree.getEntry(path).catch(() => undefined);
-    if (note.content === undefined) {
-      if (!entry) return note;
-      this.written.delete(path);
-      return undefined;
+  /** The attribute sources (and their memo in `scope`) for a direction and an index. */
+  private sourcesFor(
+    scope: Scope,
+    context: ContentAttributesContext,
+  ): { sources: AttributesSources; memo: AttributesMemo } {
+    const index = context.index;
+    let indexId = 0;
+    if (index) {
+      indexId = this.indexIds.get(index) ?? 0;
+      if (!indexId) {
+        indexId = this.nextIndexId++;
+        this.indexIds.set(index, indexId);
+      }
     }
-    if (!entry || entry.isDirectory) {
-      this.written.delete(path);
-      return undefined;
-    }
-    const key = statKey(entry);
-    if (note.key === undefined) note.key = key;
-    if (note.key !== key) {
-      this.written.delete(path);
-      return undefined;
-    }
-    return note;
+    const memoKey = `${context.direction}:${indexId}`;
+    const known = scope.memos.get(memoKey);
+    if (known) return known;
+    const fromIndex = (path: string) => this.indexAttributes(path, index);
+    const fromWorktree = (path: string) => this.worktreeAttributes(path);
+    const sources: AttributesSources = {
+      ...this.outerSources(scope),
+      inTree: async (dir) => {
+        const path = dir ? `${dir}/.gitattributes` : ".gitattributes";
+        if (context.direction === "checkout") {
+          return (await fromIndex(path)) ?? (await fromWorktree(path));
+        }
+        return (await fromWorktree(path)) ?? (await fromIndex(path));
+      },
+    };
+    const found = { sources, memo: new AttributesMemo() };
+    scope.memos.set(memoKey, found);
+    return found;
   }
 
   /** The worktree's file at `path` (never through a symbolic link). */
-  private async worktreeContent(path: string): Promise<Uint8Array | undefined> {
+  private async worktreeAttributes(path: string): Promise<AttributesContent> {
     const { worktree } = this.options;
     const entry = await worktree.getEntry(path).catch(() => undefined);
     if (!entry || entry.isDirectory || (entry.mode & S_IFMT) === S_IFLNK) {
@@ -419,7 +501,7 @@ export class GitContentFilter implements WorktreeContentFilter {
     }
     const key = statKey(entry);
     const cached = this.worktreeFiles.get(path);
-    if (cached && cached.key === key) return cached.content;
+    if (cached && cached.key === key) return { key: `${path}@${key}`, content: cached.content };
     let content: Uint8Array;
     try {
       content = await collectChunks(worktree.readContent(path));
@@ -429,8 +511,24 @@ export class GitContentFilter implements WorktreeContentFilter {
     // kept only once settled: a change within the same tick could keep the same stat
     if (entry.mtime && Date.now() - entry.mtime > SETTLED_MS && entry.mtimeNs !== undefined) {
       this.worktreeFiles.set(path, { key, content });
-    } else this.worktreeFiles.delete(path);
+      return { key: `${path}@${key}`, content };
+    }
+    this.worktreeFiles.delete(path);
     return content;
+  }
+
+  /** The attributes file `path` of `index` (default: the current index). */
+  private async indexAttributes(path: string, index?: AttributesIndex): Promise<AttributesContent> {
+    const id = index ? await index.attributesBlob(path) : await this.indexEntryId(path);
+    if (!id) return undefined;
+    let content = this.indexBlobs.get(id);
+    if (!content) {
+      content = await this.loadBlob(id);
+      if (!content) return undefined;
+      if (this.indexBlobs.size > 64) this.indexBlobs.clear();
+      this.indexBlobs.set(id, content);
+    }
+    return { key: `blob:${id}`, content };
   }
 
   /** The index's blob for `path` (stage 0, else "ours" during a merge). */
@@ -448,19 +546,6 @@ export class GitContentFilter implements WorktreeContentFilter {
     return content ? collectChunks(content) : undefined;
   }
 
-  private async indexContent(path: string): Promise<Uint8Array | undefined> {
-    const id = await this.indexEntryId(path);
-    if (!id) return undefined;
-    const cached = this.indexBlobs.get(id);
-    if (cached) return cached;
-    const content = await this.loadBlob(id);
-    if (content) {
-      if (this.indexBlobs.size > 64) this.indexBlobs.clear();
-      this.indexBlobs.set(id, content);
-    }
-    return content;
-  }
-
   /** git's `has_crlf_in_index`. */
   private async hasCrlfInIndex(path: string): Promise<boolean> {
     const id = await this.indexEntryId(path);
@@ -468,24 +553,58 @@ export class GitContentFilter implements WorktreeContentFilter {
     return hasCrlf(await this.loadBlob(id));
   }
 
+  private async attributesIn(
+    scope: Scope,
+    path: string,
+    names: readonly string[] | undefined,
+    context: ContentAttributesContext,
+  ): Promise<Map<string, AttributeValue>> {
+    const { sources, memo } = this.sourcesFor(scope, context);
+    return this.resolver.get(path, names, { sources, memo });
+  }
+
   /**
    * The attributes of `path` as the conversion reads them (`git check-attr`): all that are
-   * set, or only `names`.
+   * set, or only `names`. `direction` (or a whole context) says which files come first.
    */
   async attributes(
     path: string,
     names?: readonly string[],
-    direction: AttributesDirection = "checkin",
+    direction: AttributesDirection | ContentAttributesContext = "checkin",
   ): Promise<Map<string, AttributeValue>> {
-    this.settings();
-    const resolver = direction === "checkout" ? this.checkoutResolver : this.checkinResolver;
-    return resolver.get(path, names);
+    const context = typeof direction === "string" ? { direction } : direction;
+    return this.attributesIn(await this.currentScope(), path, names, context);
+  }
+
+  private async convAttrsIn(
+    scope: Scope,
+    path: string,
+    context: ContentAttributesContext,
+  ): Promise<ConvAttrs> {
+    // the directory's files already read (every path but the first of a directory)
+    const ready = this.resolver.peek(path, CONVERT_ATTRS, this.sourcesFor(scope, context).memo);
+    return this.convAttrsOfScope(
+      scope,
+      ready ?? (await this.attributesIn(scope, path, CONVERT_ATTRS, context)),
+    );
+  }
+
+  private convAttrsOfScope(scope: Scope, attrs: Map<string, AttributeValue>): ConvAttrs {
+    // nothing applies (the common case): one conversion for every such path of the scope
+    for (const value of attrs.values()) {
+      if (value !== undefined) return convAttrsOf(attrs, scope.settings, this.options.drivers);
+    }
+    scope.unspecified ??= convAttrsOf(attrs, scope.settings, this.options.drivers);
+    return scope.unspecified;
   }
 
   /** git's `convert_attrs` for `path`. */
-  async convAttrs(path: string, direction: AttributesDirection = "checkin"): Promise<ConvAttrs> {
-    const attrs = await this.attributes(path, CONVERT_ATTRS, direction);
-    return convAttrsOf(attrs, this.settingsCache ?? this.settings(), this.options.drivers);
+  async convAttrs(
+    path: string,
+    direction: AttributesDirection | ContentAttributesContext = "checkin",
+  ): Promise<ConvAttrs> {
+    const context = typeof direction === "string" ? { direction } : direction;
+    return this.convAttrsIn(await this.currentScope(), path, context);
   }
 
   /** The `attr/` column of `git ls-files --eol` for `path`. */
@@ -532,10 +651,19 @@ export class GitContentFilter implements WorktreeContentFilter {
   async convertToGit(
     path: string,
     src: Uint8Array,
-    options: ContentConversionOptions & { keepCrlf?: boolean; attrs?: ConvAttrs } = {},
+    options: ContentConversionOptions & {
+      keepCrlf?: boolean;
+      attrs?: ConvAttrs;
+      settings?: ConversionSettings;
+    } = {},
   ): Promise<Uint8Array> {
-    const ca = options.attrs ?? (await this.convAttrs(path, "checkin"));
-    const settings = this.settingsCache ?? this.settings();
+    const scope = options.attrs && options.settings ? undefined : await this.currentScope();
+    const settings = options.settings ?? scope?.settings ?? this.settings();
+    const ca =
+      options.attrs ??
+      (await this.convAttrsIn(scope ?? (await this.currentScope()), path, {
+        direction: "checkin",
+      }));
     let out = src;
     const filtered = await this.applyDriver(ca.driver, "clean", path, out);
     if (filtered === undefined && ca.driver?.required) {
@@ -588,10 +716,23 @@ export class GitContentFilter implements WorktreeContentFilter {
   async convertToWorktree(
     path: string,
     src: Uint8Array,
-    options: { normalizing?: boolean; attrs?: ConvAttrs; onWarning?: (m: string) => void } = {},
+    options: {
+      normalizing?: boolean;
+      attrs?: ConvAttrs;
+      settings?: ConversionSettings;
+      context?: ContentAttributesContext;
+      onWarning?: (m: string) => void;
+    } = {},
   ): Promise<Uint8Array> {
-    const ca = options.attrs ?? (await this.convAttrs(path, "checkout"));
-    const settings = this.settingsCache ?? this.settings();
+    const scope = options.attrs && options.settings ? undefined : await this.currentScope();
+    const settings = options.settings ?? scope?.settings ?? this.settings();
+    const ca =
+      options.attrs ??
+      (await this.convAttrsIn(
+        scope ?? (await this.currentScope()),
+        path,
+        options.context ?? { direction: "checkin" },
+      ));
     let out = src;
     if (ca.ident) out = identToWorktree(out, await this.blobId(out));
     const smudger = ca.driver && (ca.driver.smudge || ca.driver.process || ca.driver.host?.smudge);
@@ -612,39 +753,45 @@ export class GitContentFilter implements WorktreeContentFilter {
 
   /** git's `renormalize_buffer`: content as a checkout and check-in would leave it. */
   async renormalize(path: string, src: Uint8Array): Promise<Uint8Array> {
-    const ca = await this.convAttrs(path, "checkin");
-    const smudged = await this.convertToWorktree(path, src, { normalizing: true, attrs: ca });
-    return this.convertToGit(path, smudged, { renormalize: true, attrs: ca });
+    const scope = this.scope ?? (await this.openScope());
+    const ca = await this.convAttrsIn(scope, path, { direction: "checkin" });
+    const { settings } = scope;
+    const smudged = await this.convertToWorktree(path, src, {
+      normalizing: true,
+      attrs: ca,
+      settings,
+    });
+    return this.convertToGit(path, smudged, { renormalize: true, attrs: ca, settings });
   }
 
   async checkin(path: string): Promise<ContentConversion | undefined> {
-    const ca = await this.convAttrs(path, "checkin");
-    if (!converts(ca, "checkin", this.settingsCache ?? this.settings())) return undefined;
+    const scope = this.scope ?? (await this.openScope());
+    const ca = await this.convAttrsIn(scope, path, { direction: "checkin" });
+    const { settings } = scope;
+    if (!converts(ca, "checkin", settings)) return undefined;
     return {
-      apply: (content, options) => this.convertToGit(path, content, { ...options, attrs: ca }),
+      apply: (content, options) =>
+        this.convertToGit(path, content, { ...options, attrs: ca, settings }),
     };
   }
 
-  async checkout(path: string): Promise<ContentConversion | undefined> {
-    const ca = await this.convAttrs(path, "checkout");
-    if (!converts(ca, "checkout", this.settingsCache ?? this.settings())) return undefined;
+  async checkout(
+    path: string,
+    context: ContentAttributesContext = { direction: "checkin" },
+  ): Promise<ContentConversion | undefined> {
+    const scope = this.scope ?? (await this.openScope());
+    const ca = await this.convAttrsIn(scope, path, context);
+    const { settings } = scope;
+    if (!converts(ca, "checkout", settings)) return undefined;
     return {
       apply: (content, options) =>
         this.convertToWorktree(path, content, {
           attrs: ca,
+          settings,
           ...(options?.onWarning ? { onWarning: options.onWarning } : {}),
         }),
     };
   }
-
-  noteWritten(path: string, content: Uint8Array): void {
-    if (isAttributesFile(path)) this.written.set(path, { content });
-  }
-
-  noteRemoved(path: string): void {
-    if (isAttributesFile(path)) this.written.set(path, {});
-  }
-
   /** Whether `encoding` is one the conversion can handle (others fail as in git). */
   static supportsEncoding(encoding: string): boolean {
     return isSupportedEncoding(encoding);

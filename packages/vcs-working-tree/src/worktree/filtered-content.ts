@@ -6,6 +6,7 @@ import type { ObjectId } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import {
+  type ContentAttributesContext,
   type ContentConversionOptions,
   collectChunks,
   type WorktreeContentFilter,
@@ -40,21 +41,36 @@ export async function hashCleanedContent(
 
 /**
  * The content to write for `path` once `filter` smudged it (as it was when no conversion
- * applies), and records written attributes files with the filter.
+ * applies), its attributes read as `context` says (default: the worktree's, then the
+ * index's).
  */
 export async function smudgeContent(
   filter: WorktreeContentFilter | undefined,
   path: string,
   content: AsyncIterable<Uint8Array> | Iterable<Uint8Array> | Uint8Array,
   mode: number | undefined,
+  context?: ContentAttributesContext,
 ): Promise<AsyncIterable<Uint8Array> | Iterable<Uint8Array> | Uint8Array> {
   if (!filter || !isConvertedMode(mode)) return content;
-  const isAttributes = path === ".gitattributes" || path.endsWith("/.gitattributes");
-  const conversion = await filter.checkout(path);
-  if (!conversion && !isAttributes) return content;
-  const bytes = await collectChunks(content);
-  if (isAttributes) filter.noteWritten?.(path, bytes);
-  return conversion ? conversion.apply(bytes) : bytes;
+  const conversion = await filter.checkout(path, context);
+  if (!conversion) return content;
+  return conversion.apply(await collectChunks(content));
+}
+
+/**
+ * The content of the regular file at `path` as `worktree`'s content filter cleans it, or
+ * undefined when no conversion applies to it (its content goes in as it is).
+ */
+export async function readConvertedContent(
+  worktree: Worktree,
+  path: string,
+  options: ContentConversionOptions = {},
+): Promise<Uint8Array | undefined> {
+  const filter = worktree.contentFilter;
+  if (!filter) return undefined;
+  const conversion = await filter.checkin(path);
+  if (!conversion) return undefined;
+  return conversion.apply(await collectChunks(worktree.readContent(path)), options);
 }
 
 /**
