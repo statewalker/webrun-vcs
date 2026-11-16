@@ -14,7 +14,12 @@ import {
   RebaseStatus,
   ResetMode,
 } from "../src/index.js";
-import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
+import {
+  addFile,
+  backends,
+  createInitializedGitFromFactory,
+  writeAddedFiles,
+} from "./test-helper.js";
 
 describe.each(backends)("RebaseCommand ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -29,6 +34,8 @@ describe.each(backends)("RebaseCommand ($name backend)", ({ factory }) => {
   async function createInitializedGit() {
     const result = await createInitializedGitFromFactory(factory);
     cleanup = result.cleanup;
+    // added files are in the worktree too: a rebase sees a missing one as deleted
+    writeAddedFiles(result.workingCopy);
     return result;
   }
   /**
@@ -151,6 +158,8 @@ describe.each(backends)("RebaseCommand - API options ($name backend)", ({ factor
   async function createInitializedGit() {
     const result = await createInitializedGitFromFactory(factory);
     cleanup = result.cleanup;
+    // added files are in the worktree too: a rebase sees a missing one as deleted
+    writeAddedFiles(result.workingCopy);
     return result;
   }
 

@@ -1,6 +1,11 @@
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode, type FilesApi } from "@statewalker/vcs-core";
-import type { IndexBuilder, IndexEditor, Staging } from "@statewalker/vcs-working-tree";
+import type {
+  IndexBuilder,
+  IndexEditor,
+  ResolveUndoRecord,
+  Staging,
+} from "@statewalker/vcs-working-tree";
 import {
   type GitStagingOptions,
   INDEX_VERSION_2,
@@ -216,6 +221,10 @@ export class FileStagingStore implements Staging {
 
   createBuilder(): IndexBuilder {
     return new FileStagingBuilder(this);
+  }
+
+  recordResolveUndo(records: readonly ResolveUndoRecord[]): void {
+    this.indexFile.recordResolveUndo(records);
   }
 
   createEditor(): IndexEditor {
@@ -586,10 +595,8 @@ class FileStagingEditor implements IndexEditor {
     this.edits.push(edit);
   }
 
-  remove(path: string, _stage?: MergeStageValue): void {
-    // For now, remove all stages (ignore stage parameter)
-    // TODO: Implement stage-specific removal if needed
-    this.edits.push({ path, apply: () => undefined });
+  remove(path: string, stage?: MergeStageValue): void {
+    this.edits.push(new RemoveStages(path, stage));
   }
 
   upsert(entry: StagingEntryOptions): void {
@@ -604,97 +611,57 @@ class FileStagingEditor implements IndexEditor {
     });
   }
 
+  /**
+   * Applies the edits path by path, in the order they were added: a removal takes the
+   * path's stages (all, or the one named), a conflict resolution promotes the chosen stage,
+   * a tree deletion takes every entry under its path, and any other edit replaces the
+   * path's stage-0 entry (the conflict stages kept).
+   */
   async finish(): Promise<void> {
-    // Sort edits by path for efficient merge
-    this.edits.sort((a, b) => comparePaths(a.path, b.path));
-
-    const existingEntries = this.store._getEntries();
-    const newEntries: StagingEntry[] = [];
-
-    let entryIndex = 0;
-    let editIndex = 0;
-
-    while (entryIndex < existingEntries.length || editIndex < this.edits.length) {
-      const entry = existingEntries[entryIndex];
-      const edit = this.edits[editIndex];
-
-      if (!edit) {
-        // No more edits, keep remaining entries
-        newEntries.push(entry);
-        entryIndex++;
-      } else if (!entry) {
-        // No more entries, apply remaining edits (insertions)
-        const result = edit.apply(undefined);
-        if (result) newEntries.push(result);
-        editIndex++;
-      } else {
-        const cmp = comparePaths(entry.path, edit.path);
-
-        if (cmp < 0) {
-          // Entry before edit - keep entry
-          newEntries.push(entry);
-          entryIndex++;
-        } else if (cmp > 0) {
-          // Edit path comes before entry path
-          // Check if entry is under a tree being deleted
-          if (isDeleteTree(edit) && entry.path.startsWith(`${edit.path}/`)) {
-            // Skip entry (deleted by tree)
-            entryIndex++;
-          } else {
-            // Apply edit (insertion) and move to next edit
-            const result = edit.apply(undefined);
-            if (result) newEntries.push(result);
-            editIndex++;
-          }
-        } else {
-          // Edit applies to this entry
-          if (isResolveConflict(edit)) {
-            // Handle conflict resolution
-            this.applyConflictResolution(existingEntries, entryIndex, edit, newEntries);
-            // Skip all stages for this path
-            while (
-              entryIndex < existingEntries.length &&
-              existingEntries[entryIndex].path === edit.path
-            ) {
-              entryIndex++;
-            }
-          } else {
-            const result = edit.apply(entry);
-            if (result) newEntries.push(result);
-            entryIndex++;
-          }
-          editIndex++;
-        }
-      }
+    const byPath = new Map<string, StagingEntry[]>();
+    for (const entry of this.store._getEntries()) {
+      const list = byPath.get(entry.path);
+      if (list) list.push(entry);
+      else byPath.set(entry.path, [entry]);
     }
-
+    for (const edit of this.edits) {
+      if (isDeleteTree(edit)) {
+        for (const path of [...byPath.keys()]) {
+          if (path === edit.path || path.startsWith(`${edit.path}/`)) byPath.delete(path);
+        }
+        continue;
+      }
+      const entries = byPath.get(edit.path) ?? [];
+      let next: StagingEntry[];
+      if (edit instanceof RemoveStages) {
+        next = edit.stage === undefined ? [] : entries.filter((e) => e.stage !== edit.stage);
+      } else if (isResolveConflict(edit)) {
+        const chosen = entries.find((e) => e.stage === edit.chooseStage);
+        next = chosen ? [{ ...chosen, stage: MergeStage.MERGED }] : [];
+      } else {
+        const current = entries.find((e) => e.stage === MergeStage.MERGED);
+        const result = edit.apply(current);
+        next = entries.filter((e) => e.stage !== MergeStage.MERGED);
+        if (result) next.push(result);
+      }
+      if (next.length > 0) byPath.set(edit.path, next);
+      else byPath.delete(edit.path);
+    }
+    const newEntries = [...byPath.values()].flat();
+    newEntries.sort((a, b) => comparePaths(a.path, b.path) || a.stage - b.stage);
     this.store._replaceEntries(newEntries);
   }
+}
 
-  private applyConflictResolution(
-    entries: StagingEntry[],
-    startIndex: number,
-    edit: StagingEdit & { chooseStage?: MergeStageValue },
-    output: StagingEntry[],
-  ): void {
-    // Find the entry at the chosen stage
-    let chosen: StagingEntry | undefined;
-    let i = startIndex;
+/** A removal of a path's stages (all of them, or one). */
+class RemoveStages implements StagingEdit {
+  constructor(
+    readonly path: string,
+    readonly stage?: MergeStageValue,
+  ) {}
 
-    while (i < entries.length && entries[i].path === edit.path) {
-      if (edit.chooseStage !== undefined && entries[i].stage === edit.chooseStage) {
-        chosen = entries[i];
-      }
-      i++;
-    }
-
-    if (chosen) {
-      // Create stage 0 entry from chosen stage
-      output.push({
-        ...chosen,
-        stage: MergeStage.MERGED,
-      });
-    }
+  apply(): undefined {
+    return undefined;
   }
 }
 

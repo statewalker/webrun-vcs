@@ -30,6 +30,7 @@ import {
   createCommit,
   createInitializedGitFromFactory,
   removeFile,
+  syncWorktreeToIndex,
 } from "./test-helper.js";
 
 const TREE_MODE = 0o040000;
@@ -177,6 +178,9 @@ describe.each(backends)("RebaseCommand three-way merge ($name backend)", ({ fact
     // HEAD (refs/heads/main) on the feature tip.
     await repository.refs.set("refs/heads/onto", ontoCommit);
     await repository.refs.set("refs/heads/main", featureCommit);
+    // the worktree holds the feature's files, as a checkout of it leaves them (a rebase
+    // refuses on a worktree missing tracked files: they are unstaged deletions)
+    await syncWorktreeToIndex(workingCopy);
 
     return { git, repository, baseCommit, ontoCommit, featureCommit };
   }

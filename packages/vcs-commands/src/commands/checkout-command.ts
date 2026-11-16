@@ -535,6 +535,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
         gitlinks: true,
         replaceInTheWay: true,
+        // a forced checkout overwrites untracked files, as git's checkout -f
+        ...(this.force ? { discardUntracked: true } : {}),
         attributes: { direction: "checkout", index: attributesIndexOf(result) },
       });
       updated.push(...only.entries.map((e) => e.path));

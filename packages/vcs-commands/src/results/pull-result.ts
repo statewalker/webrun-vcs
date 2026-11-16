@@ -1,5 +1,6 @@
 import type { FetchResult } from "./fetch-result.js";
 import type { MergeResult } from "./merge-result.js";
+import type { RebaseResult } from "./rebase-result.js";
 
 /**
  * Result of a pull operation.
@@ -11,6 +12,8 @@ export interface PullResult {
   fetchResult: FetchResult;
   /** Result of the merge phase (if applicable) */
   mergeResult?: MergeResult;
+  /** The rebase's result (`setRebase(true)`: `git pull --rebase`) */
+  rebaseResult?: RebaseResult;
   /** Whether rebase was used instead of merge */
   rebaseUsed: boolean;
   /** Whether pull was successful */

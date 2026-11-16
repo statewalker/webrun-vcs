@@ -8,6 +8,7 @@
  */
 
 import type { ObjectId, Trees } from "@statewalker/vcs-core";
+import type { ResolveUndoRecord } from "./index-extensions.js";
 import type { IndexStatUpdate, RacyCheck } from "./stat-refresh.js";
 import type { MergeStageValue, StagingEntry, StagingEntryOptions } from "./types.js";
 
@@ -146,6 +147,13 @@ export interface Staging {
    * Create an editor for targeted modifications
    */
   createEditor(): IndexEditor;
+
+  /**
+   * Records the conflict stages a resolution removes (git's resolve-undo, written with the
+   * index as its `REUC` extension, what `git checkout -m <path>` restores). Absent: a
+   * staging area that keeps none.
+   */
+  recordResolveUndo?(records: readonly ResolveUndoRecord[]): void;
 
   // ========== Persistence ==========
 

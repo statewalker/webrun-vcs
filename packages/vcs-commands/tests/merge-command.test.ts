@@ -1311,11 +1311,18 @@ describe.each(backends)(
       await addFile(workingCopy, "a", "1\na\n3(main)\n");
       await git.commit().setMessage("main changes").call();
 
-      // Merge - conflicts because same file modified by both (file-level merge)
+      // Merge - git merges the file line by line: the edits are a line apart, so no conflict
       const result = await git.merge().include("refs/heads/side").call();
 
-      expect(result.status).toBe(MergeStatus.CONFLICTING);
-      expect(result.conflicts).toContain("a");
+      expect(result.status).toBe(MergeStatus.MERGED);
+      expect(result.output).toContain("Auto-merging a");
+      const treeId = await loadCommitTree(repository, result.newHead ?? "");
+      const tree = await repository.trees.load(treeId);
+      const entries = tree ? await toArray(tree) : [];
+      const entry = entries.find((e) => e.name === "a");
+      const blob = await repository.blobs.load(entry?.id ?? "");
+      const content = blob ? await toArray(blob) : [];
+      expect(new TextDecoder().decode(content[0])).toBe("1(side)\na\n3(main)\n");
     });
 
     /**

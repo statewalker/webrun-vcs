@@ -191,7 +191,31 @@ export async function addFile(wc: WorkingCopy, path: string, content: string): P
   });
   await editor.finish();
 
+  // the file in the worktree too, as `git add` finds it there (a worktree missing a tracked
+  // file has it deleted: git's require_clean_work_tree refuses a rebase then)
+  if (WRITE_ADDED_FILES.has(wc)) await wc.worktree?.writeContent(path, data);
+
   return objectId;
+}
+
+/**
+ * Writes every stage-0 index entry's content into `wc`'s worktree, for a fixture that built
+ * the index alone: the worktree then holds what the index does (nothing is left deleted).
+ */
+export async function syncWorktreeToIndex(wc: WorkingCopy): Promise<void> {
+  for await (const entry of wc.checkout.staging.entries()) {
+    if (entry.stage !== 0) continue;
+    const content = await wc.history.blobs.load(entry.objectId);
+    if (content) await wc.worktree?.writeContent(entry.path, content, { mode: entry.mode });
+  }
+}
+
+/** Working copies whose {@link addFile} also writes the file into the worktree. */
+const WRITE_ADDED_FILES = new WeakSet<WorkingCopy>();
+
+/** Makes {@link addFile} (and {@link removeFile}) keep `wc`'s worktree in step with the index. */
+export function writeAddedFiles(wc: WorkingCopy): void {
+  WRITE_ADDED_FILES.add(wc);
 }
 
 /**
@@ -272,6 +296,7 @@ export async function removeFile(wc: WorkingCopy, path: string): Promise<void> {
     }
   }
   await builder.finish();
+  if (WRITE_ADDED_FILES.has(wc)) await wc.worktree?.remove(path);
 }
 
 /**

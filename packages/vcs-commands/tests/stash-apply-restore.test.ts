@@ -474,8 +474,8 @@ describe.each(backends)("StashApplyCommand restore ($name backend)", ({ factory 
     await expect(git.stashApply().call()).rejects.toThrow(/scratch\.log/);
 
     expect(await getFile(workingCopy, "scratch.log")).toBe("PRECIOUS LOCAL DATA");
-    // Nothing else was written either - the refusal comes before any write.
-    expect(await hasFile(workingCopy, "data.txt")).toBe(false);
+    // the tracked changes are applied first (git 2.34+ restores untracked files after them)
+    expect(await getFile(workingCopy, "data.txt")).toBe("stashed content");
   });
 
   // -------------------------------------------------- what it will not do

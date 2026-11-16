@@ -218,6 +218,8 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
         {
           symlinks: trust.symlinks,
           replaceInTheWay: true,
+          // reset --hard and checkout -- :/ overwrite untracked files, as in git
+          discardUntracked: true,
           // the attributes of the index left behind: the whole target tree
           attributes: {
             direction,

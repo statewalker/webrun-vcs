@@ -259,6 +259,8 @@ export class ResetCommand extends GitCommand<Ref> {
     await writeTreeRestorePlan(worktree, this.blobs, plan, RESET_HARD, {
       symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
       replaceInTheWay: true,
+      // git's reset --hard overwrites untracked files (UNPACK_RESET_OVERWRITE_UNTRACKED)
+      discardUntracked: true,
     });
   }
 

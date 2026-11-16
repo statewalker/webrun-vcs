@@ -189,6 +189,35 @@ export class MemoryCheckout implements Checkout {
     this.fetchHead = options?.append ? `${this.fetchHead ?? ""}${content}` : content;
   }
 
+  // ========== Operation state files ==========
+
+  private readonly stateFiles = new Map<string, Uint8Array>();
+
+  async readStateFile(name: string): Promise<Uint8Array | undefined> {
+    return this.stateFiles.get(name);
+  }
+
+  async writeStateFile(name: string, content: Uint8Array | string): Promise<void> {
+    this.stateFiles.set(
+      name,
+      typeof content === "string" ? new TextEncoder().encode(content) : content,
+    );
+  }
+
+  async removeStateFile(name: string): Promise<void> {
+    for (const key of [...this.stateFiles.keys()]) {
+      if (key === name || key.startsWith(`${name}/`)) this.stateFiles.delete(key);
+    }
+  }
+
+  async listStateDir(name: string): Promise<string[]> {
+    const names = new Set<string>();
+    for (const key of this.stateFiles.keys()) {
+      if (key.startsWith(`${name}/`)) names.add(key.slice(name.length + 1).split("/")[0]);
+    }
+    return [...names].sort();
+  }
+
   // ========== Lifecycle ==========
 
   async initialize(): Promise<void> {

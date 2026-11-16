@@ -57,6 +57,10 @@ export interface GitCheckoutFilesApi
    * Remove a directory recursively
    */
   removeDir?(path: string): Promise<void>;
+  /**
+   * The entries of a directory (a FilesApi's `list`: names, or info objects with a name)
+   */
+  list?(path: string): AsyncIterable<string | { name: string }>;
 }
 
 /**
@@ -347,6 +351,51 @@ export class GitCheckout implements Checkout {
   async writeFetchHead(content: string, options?: { append?: boolean }): Promise<void> {
     const before = options?.append ? ((await this.readFetchHead()) ?? "") : "";
     await this.writeFile(`${this.gitDir}/FETCH_HEAD`, `${before}${content}`);
+  }
+
+  // ========== Operation state files ==========
+
+  /** A file under the git directory (`MERGE_MSG`, `sequencer/todo`, ...). */
+  async readStateFile(name: string): Promise<Uint8Array | undefined> {
+    try {
+      const stats = await this.files.stats(`${this.gitDir}/${name}`);
+      if (stats?.isDirectory) return undefined;
+      return (await this.files.read(`${this.gitDir}/${name}`)) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Writes a file under the git directory in place, as git writes its state files. */
+  async writeStateFile(name: string, content: Uint8Array | string): Promise<void> {
+    const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+    const slash = name.lastIndexOf("/");
+    if (slash > 0) await this.mkdir(`${this.gitDir}/${name.slice(0, slash)}`);
+    await this.files.write(`${this.gitDir}/${name}`, [bytes]);
+  }
+
+  /** Removes a file or directory (recursively) under the git directory. */
+  async removeStateFile(name: string): Promise<void> {
+    const path = `${this.gitDir}/${name}`;
+    const stats = await this.files.stats(path).catch(() => undefined);
+    if (!stats) return;
+    if (stats.isDirectory && this.files.removeDir) await this.removeDir(path);
+    else await this.removeFile(path);
+  }
+
+  /** The names in a directory under the git directory, sorted. */
+  async listStateDir(name: string): Promise<string[]> {
+    if (!this.files.list) return [];
+    const names: string[] = [];
+    try {
+      for await (const entry of this.files.list(`${this.gitDir}/${name}`)) {
+        const entryName = typeof entry === "string" ? entry : entry.name;
+        names.push(entryName.slice(entryName.lastIndexOf("/") + 1));
+      }
+    } catch {
+      return [];
+    }
+    return names.sort();
   }
 
   // ========== Lifecycle ==========
