@@ -6,13 +6,25 @@
  * where it would overwrite local changes or untracked files, then the conflicts staged).
  */
 
-import { type Blobs, FileMode, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import {
+  type Blobs,
+  collectTreeBytes,
+  FileMode,
+  type ObjectId,
+  type PersonIdent,
+  type TreeEntry,
+} from "@statewalker/vcs-core";
+import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
   type Checkout,
+  cacheTreeFullyValid,
   entryStatOf,
   type IndexEntryOptions,
+  invalidateCacheTreeForIntentToAdd,
+  invalidateCacheTreePath,
   type Staging,
+  updateCacheTree,
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -54,6 +66,219 @@ export async function flatTree(
   await walk(treeId, "");
   return out;
 }
+
+/**
+ * The trees `ids` as flat maps for a merge of them, as merge-ort reads them: a directory
+ * that every one of the trees holds with the same tree id is not read at all, it stands in
+ * each map as one entry of mode TREE carrying that id (merge-ort resolves such a directory
+ * at once, `side1_matches_mbase && side2_matches_mbase`). Every other directory is read.
+ * `dirs` gives, per tree, the id of each directory read or stood in for.
+ */
+export async function prunedFlatTrees(
+  trees: CommandTrees,
+  ids: (ObjectId | undefined)[],
+): Promise<{ flats: Map<string, CheckedEntry>[]; dirs: Map<string, ObjectId>[] }> {
+  const flats = ids.map(() => new Map<string, CheckedEntry>());
+  const dirs = ids.map(() => new Map<string, ObjectId>());
+  const read = async (id: ObjectId | undefined) => {
+    const out: { name: string; mode: number; id: ObjectId }[] = [];
+    if (id) for await (const e of trees.loadTree(id)) out.push(e);
+    return out;
+  };
+  const walk = async (level: (ObjectId | undefined)[], prefix: string): Promise<void> => {
+    const listed = await Promise.all(level.map(read));
+    const byName = new Map<string, ({ mode: number; id: ObjectId } | undefined)[]>();
+    listed.forEach((entries, i) => {
+      for (const e of entries) {
+        let slot = byName.get(e.name);
+        if (!slot) {
+          slot = level.map(() => undefined);
+          byName.set(e.name, slot);
+        }
+        slot[i] = e;
+      }
+    });
+    for (const [name, slot] of byName) {
+      const path = prefix ? `${prefix}/${name}` : name;
+      const first = slot[0];
+      if (
+        first?.mode === FileMode.TREE &&
+        slot.every((e) => e !== undefined && e.mode === FileMode.TREE && e.id === first.id)
+      ) {
+        for (let i = 0; i < slot.length; i++) {
+          flats[i].set(path, { objectId: first.id, mode: FileMode.TREE });
+          dirs[i].set(path, first.id);
+        }
+        continue;
+      }
+      const sub: (ObjectId | undefined)[] = slot.map(() => undefined);
+      let nested = false;
+      slot.forEach((e, i) => {
+        if (!e) return;
+        if (e.mode === FileMode.TREE) {
+          sub[i] = e.id;
+          dirs[i].set(path, e.id);
+          nested = true;
+        } else flats[i].set(path, { objectId: e.id, mode: e.mode });
+      });
+      if (nested) await walk(sub, path);
+    }
+  };
+  await walk(ids, "");
+  return { flats, dirs };
+}
+
+/**
+ * The paths where the trees `from` and `to` differ, with their entries on each side (a
+ * path one side lacks is absent from its map): what comparing their flat maps finds, read
+ * without descending into a subtree both hold with the same id.
+ */
+export async function treeDelta(
+  trees: CommandTrees,
+  from: ObjectId | undefined,
+  to: ObjectId | undefined,
+): Promise<{ from: Map<string, CheckedEntry>; to: Map<string, CheckedEntry> }> {
+  const out = { from: new Map<string, CheckedEntry>(), to: new Map<string, CheckedEntry>() };
+  const read = async (id: ObjectId | undefined) => {
+    const map = new Map<string, { mode: number; id: ObjectId }>();
+    if (id) for await (const e of trees.loadTree(id)) map.set(e.name, { mode: e.mode, id: e.id });
+    return map;
+  };
+  const addAll = async (side: Map<string, CheckedEntry>, id: ObjectId, prefix: string) => {
+    for await (const e of trees.loadTree(id)) {
+      const path = `${prefix}/${e.name}`;
+      if (e.mode === FileMode.TREE) await addAll(side, e.id, path);
+      else side.set(path, { objectId: e.id, mode: e.mode });
+    }
+  };
+  const walk = async (a: ObjectId | undefined, b: ObjectId | undefined, prefix: string) => {
+    if (a === b) return;
+    const [x, y] = await Promise.all([read(a), read(b)]);
+    for (const name of new Set([...x.keys(), ...y.keys()])) {
+      const ex = x.get(name);
+      const ey = y.get(name);
+      if (ex && ey && ex.mode === ey.mode && ex.id === ey.id) continue;
+      const path = prefix ? `${prefix}/${name}` : name;
+      const xTree = ex?.mode === FileMode.TREE;
+      const yTree = ey?.mode === FileMode.TREE;
+      if (xTree && yTree) {
+        await walk(ex.id, ey.id, path);
+        continue;
+      }
+      if (ex) {
+        if (xTree) await addAll(out.from, ex.id, path);
+        else out.from.set(path, { objectId: ex.id, mode: ex.mode });
+      }
+      if (ey) {
+        if (yTree) await addAll(out.to, ey.id, path);
+        else out.to.set(path, { objectId: ey.id, mode: ey.mode });
+      }
+    }
+  };
+  await walk(from, to, "");
+  return out;
+}
+
+/** The index's entries of one directory: its files, its subdirectories, its tree id. */
+interface IndexDir {
+  files: Map<string, CheckedEntry>;
+  dirs: Map<string, IndexDir>;
+  id?: ObjectId;
+}
+
+/** The index's stage-0 entries as directories, each with the id its tree would have. */
+async function indexDirs(index: Map<string, CheckedEntry>): Promise<IndexDir> {
+  const root: IndexDir = { files: new Map(), dirs: new Map() };
+  for (const [path, entry] of index) {
+    let dir = root;
+    let from = 0;
+    for (let k = path.indexOf("/"); k >= 0; k = path.indexOf("/", from)) {
+      const name = path.slice(from, k);
+      let next = dir.dirs.get(name);
+      if (!next) {
+        next = { files: new Map(), dirs: new Map() };
+        dir.dirs.set(name, next);
+      }
+      dir = next;
+      from = k + 1;
+    }
+    dir.files.set(path.slice(from), entry);
+  }
+  const hash = async (dir: IndexDir): Promise<ObjectId> => {
+    const entries: TreeEntry[] = [];
+    for (const [name, sub] of dir.dirs)
+      entries.push({ name, mode: FileMode.TREE, id: await hash(sub) });
+    for (const [name, e] of dir.files) entries.push({ name, mode: e.mode, id: e.objectId });
+    let id: ObjectId;
+    try {
+      const bytes = await collectTreeBytes(entries);
+      const hasher = createSha1().update(new TextEncoder().encode(`tree ${bytes.length}\0`));
+      id = bytesToHex(hasher.update(bytes).digest());
+    } catch {
+      // a name no tree can hold: never the id of a stored tree
+      id = "";
+    }
+    dir.id = id;
+    return id;
+  };
+  await hash(root);
+  return root;
+}
+
+/**
+ * The paths where the index's stage-0 entries differ from the tree `treeId`, sorted (as
+ * {@link indexChanges} over the tree's flat map). As git's cache-tree, each directory of the
+ * index is given the id its tree would have: a subtree of `treeId` with that id holds what
+ * the index holds there and is not read.
+ */
+export async function indexChangesFromTree(
+  index: Map<string, CheckedEntry>,
+  trees: CommandTrees,
+  treeId: ObjectId | undefined,
+): Promise<string[]> {
+  const out: string[] = [];
+  const all = (dir: IndexDir, prefix: string) => {
+    for (const name of dir.files.keys()) out.push(join(prefix, name));
+    for (const [name, sub] of dir.dirs) all(sub, join(prefix, name));
+  };
+  const allOfTree = async (id: ObjectId, prefix: string): Promise<void> => {
+    for await (const e of trees.loadTree(id)) {
+      const path = join(prefix, e.name);
+      if (e.mode === FileMode.TREE) await allOfTree(e.id, path);
+      else out.push(path);
+    }
+  };
+  const compare = async (
+    id: ObjectId | undefined,
+    dir: IndexDir | undefined,
+    prefix: string,
+  ): Promise<void> => {
+    if (!id) {
+      if (dir) all(dir, prefix);
+      return;
+    }
+    if (!dir) return allOfTree(id, prefix);
+    if (dir.id === id) return;
+    const files = new Map<string, { mode: number; id: ObjectId }>();
+    const subtrees = new Map<string, ObjectId>();
+    for await (const e of trees.loadTree(id)) {
+      if (e.mode === FileMode.TREE) subtrees.set(e.name, e.id);
+      else files.set(e.name, { mode: e.mode, id: e.id });
+    }
+    for (const name of new Set([...files.keys(), ...dir.files.keys()])) {
+      const t = files.get(name);
+      const i = dir.files.get(name);
+      if (!t || !i || t.id !== i.objectId || t.mode !== i.mode) out.push(join(prefix, name));
+    }
+    for (const name of new Set([...subtrees.keys(), ...dir.dirs.keys()])) {
+      await compare(subtrees.get(name), dir.dirs.get(name), join(prefix, name));
+    }
+  };
+  await compare(treeId, index.size > 0 ? await indexDirs(index) : undefined, "");
+  return out.sort();
+}
+
+const join = (prefix: string, name: string) => (prefix ? `${prefix}/${name}` : name);
 
 /** Stores a flat path map as a tree. */
 export async function storeFlatTree(
@@ -104,6 +329,13 @@ export async function storeFlatTreeOver(
     if (!sameEntry(base.get(path), entry)) changes.set(path, entry);
   }
   for (const path of base.keys()) if (!target.has(path)) changes.set(path, null);
+  // a directory the target takes whole (one TREE entry): what the base held under it goes
+  const whole = [...changes].filter(([, e]) => e?.mode === FileMode.TREE).map(([p]) => `${p}/`);
+  if (whole.length > 0) {
+    for (const path of [...changes.keys()]) {
+      if (whole.some((dir) => path.startsWith(dir))) changes.delete(path);
+    }
+  }
   if (changes.size === 0) return baseTree;
   const rebuild = async (
     treeId: ObjectId | undefined,
@@ -222,11 +454,44 @@ export async function readIndex(
 ): Promise<{ index: Map<string, CheckedEntry>; unmerged: string[] }> {
   const index = new Map<string, CheckedEntry>();
   const unmerged = new Set<string>();
-  for await (const entry of staging.entries()) {
+  for (const entry of await indexEntryList(staging)) {
     if (entry.stage === 0) index.set(entry.path, entry);
     else unmerged.add(entry.path);
   }
   return { index, unmerged: [...unmerged].sort() };
+}
+
+/**
+ * The tree of the index, as git's `write_index_as_tree` (`cherry-pick -n`, `revert -n`):
+ * unless the index holds a fully valid cache-tree, the index file is written again with
+ * one. That write smudges racily clean entries and gives the index a new timestamp, which
+ * later overwrite checks compare entries with (an entry as new as it is read again).
+ */
+export async function writeIndexAsTree(staging: Staging, trees: CommandTrees): Promise<ObjectId> {
+  if (!staging.getCacheTree || !staging.setCacheTree) return staging.writeTree(trees);
+  const previous = staging.getCacheTree();
+  const treeId = await staging.writeTree(trees);
+  if (!previous || !cacheTreeFullyValid(previous)) {
+    // the valid directories kept, the others computed (cache_tree_update)
+    const cacheTree = await updateCacheTree(trees, treeId, previous);
+    for (const entry of await indexEntryList(staging)) {
+      if (entry.intentToAdd && !entry.skipWorktree) {
+        invalidateCacheTreeForIntentToAdd(cacheTree, entry.path);
+      }
+    }
+    staging.setCacheTree(cacheTree);
+    await staging.write();
+  }
+  return treeId;
+}
+
+/** Every index entry in the index's order, at once where the staging can give them so. */
+async function indexEntryList(staging: Staging): Promise<readonly IndexEntryInput[]> {
+  const list = staging.entryList?.();
+  if (list) return list;
+  const out: IndexEntryInput[] = [];
+  for await (const entry of staging.entries()) out.push(entry);
+  return out;
 }
 
 /** An index entry to write: path, blob, mode, stage and the file's stat. */
@@ -243,7 +508,7 @@ export async function rewriteIndex(
   // the kept entries are in the index's order already: only the changes are sorted, then
   // both merged (git's order: the paths' bytes, then the stage)
   const kept: IndexEntryInput[] = [];
-  for await (const entry of staging.entries()) {
+  for (const entry of await indexEntryList(staging)) {
     if (!changes.has(entry.path)) kept.push(entry);
   }
   const encoder = new TextEncoder();
@@ -256,11 +521,24 @@ export async function rewriteIndex(
     }
     return k;
   };
+  const compareBytes = (a: string, b: string) => {
+    const x = key(a);
+    const y = key(b);
+    for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+    return x.length - y.length;
+  };
   const compare = (a: IndexEntryInput, b: IndexEntryInput) => {
     if (a.path === b.path) return (a.stage ?? 0) - (b.stage ?? 0);
-    const x = key(a.path);
-    const y = key(b.path);
-    for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+    // below the surrogates, UTF-16 code units order as the UTF-8 bytes do
+    const x = a.path;
+    const y = b.path;
+    const n = Math.min(x.length, y.length);
+    for (let i = 0; i < n; i++) {
+      const cx = x.charCodeAt(i);
+      const cy = y.charCodeAt(i);
+      if (cx === cy) continue;
+      return cx < 0xd800 && cy < 0xd800 ? cx - cy : compareBytes(x, y);
+    }
     return x.length - y.length;
   };
   const added = [...changes.values()].flat().sort(compare);
@@ -393,13 +671,18 @@ export async function switchTrees(
     operation: string;
     /** The conflicts to stage */
     conflicts?: Iterable<OrtConflict>;
-    /** `target` stored as a tree already (saves storing it again) */
+    /**
+     * The stored tree the switch leaves in the index (`target` whole, or the tree `target`
+     * changes HEAD to): planned from (saves storing it again), and written as the index's
+     * cache-tree, as unpack-trees does
+     */
     targetTree?: ObjectId;
   },
 ): Promise<MergeRefusal | undefined> {
   const { index } = await readIndex(ctx.staging);
   const worktree = ctx.worktree;
   const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const indexTime = ctx.staging.getUpdateTime();
   const ignoreCase = coreBool(ctx.workingCopy, "ignorecase", false);
   const staged: string[] = [];
   const local: string[] = [];
@@ -419,7 +702,7 @@ export async function switchTrees(
         staged.push(path);
         continue;
       }
-      if (worktree && (await worktreeDiffers(worktree, path, i, trust))) {
+      if (worktree && (await worktreeDiffers(worktree, path, i, trust, indexTime))) {
         local.push(path);
         continue;
       }
@@ -476,9 +759,12 @@ export async function switchTrees(
         writing,
         options.operation,
       );
-      // the attributes of the index the switch leaves (git's o->result)
+      // the attributes of the index the switch leaves (git's o->result): only its
+      // attributes files are looked up
       const result = new Map<string, ObjectId>();
-      for (const [path, entry] of index) result.set(path, entry.objectId);
+      for (const [path, entry] of index) {
+        if (path.endsWith(".gitattributes")) result.set(path, entry.objectId);
+      }
       for (const path of removes) result.delete(path);
       for (const path of updates) result.set(path, (target.get(path) as CheckedEntry).objectId);
       await writeTreeRestorePlan(
@@ -507,16 +793,21 @@ export async function switchTrees(
   for (const path of updates) {
     const t = target.get(path) as CheckedEntry;
     const stats = worktree ? await worktree.getEntry(path) : undefined;
+    // the skip-worktree bit of the entry replaced is kept (merged_entry: "Migrate old flags
+    // over"); assume-unchanged is not
+    const old = index.get(path) as IndexEntryInput | undefined;
     changes.set(path, [
       {
         path,
         objectId: t.objectId,
         mode: t.mode,
         ...entryStatOf(stats && !stats.isDirectory ? stats : {}),
+        ...(old?.skipWorktree ? { skipWorktree: true } : {}),
       },
     ]);
   }
-  for (const conflict of options.conflicts ?? []) {
+  const conflicts = [...(options.conflicts ?? [])];
+  for (const conflict of conflicts) {
     const stages: [CheckedEntry | undefined, 1 | 2 | 3][] = [
       [conflict.base, 1],
       [conflict.ours, 2],
@@ -543,6 +834,27 @@ export async function switchTrees(
   // unpack-trees writes a new index: the resolve-undo records are gone (git keeps them only
   // through commands that edit the index in place)
   ctx.staging.clearResolveUndo?.();
+  if (options.targetTree && ctx.staging.setCacheTree) {
+    // the cache-tree of the target (unpack_trees: the index's cache-tree, each path changed
+    // invalidated, then cache_tree_update: only invalid directories are read), the
+    // directories of the intent-to-add entries kept and of the conflicts invalid
+    // (record_conflicted_index_entries)
+    const previous = ctx.staging.getCacheTree?.();
+    if (previous) {
+      for (const path of [...updates, ...removes]) invalidateCacheTreePath(previous, path);
+    }
+    const cacheTree = await updateCacheTree(ctx.trees, options.targetTree, previous);
+    for (const [path, entry] of index) {
+      const e = entry as IndexEntryInput;
+      if (e.intentToAdd && !e.skipWorktree && !changes.has(path)) {
+        invalidateCacheTreeForIntentToAdd(cacheTree, path);
+      }
+    }
+    for (const conflict of conflicts) {
+      invalidateCacheTreePath(cacheTree, conflict.stagePath);
+    }
+    ctx.staging.setCacheTree(cacheTree);
+  }
   await rewriteIndex(ctx.staging, changes);
   return undefined;
 }

@@ -1,6 +1,7 @@
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode, type FilesApi } from "@statewalker/vcs-core";
 import type {
+  CacheTree,
   IndexBuilder,
   IndexEditor,
   ResolveUndoRecord,
@@ -17,6 +18,7 @@ import {
   type RacyCheck,
   readIndexChecksum,
   refreshIndexFile,
+  reuseEntryEncoding,
   type StagingEdit,
   type StagingEntry,
   type StagingEntryOptions,
@@ -105,6 +107,10 @@ export class FileStagingStore implements Staging {
 
   async getEntryCount(): Promise<number> {
     return this._entries.length;
+  }
+
+  entryList(): readonly StagingEntry[] {
+    return this._entries.slice();
   }
 
   async *entries(
@@ -231,6 +237,14 @@ export class FileStagingStore implements Staging {
     this.indexFile.clearResolveUndo();
   }
 
+  setCacheTree(tree: CacheTree | undefined): void {
+    this.indexFile.setCacheTree(tree);
+  }
+
+  getCacheTree(): CacheTree | undefined {
+    return this.indexFile.cacheTree(this._entries);
+  }
+
   createEditor(): IndexEditor {
     return new FileStagingEditor(this);
   }
@@ -248,7 +262,10 @@ export class FileStagingStore implements Staging {
     }
 
     // Build tree from stage 0 entries only
-    const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED);
+    // an intent-to-add entry is no part of the tree (git's update_one skips it)
+    const stage0 = this._entries.filter(
+      (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
+    );
     return this.buildTreeRecursive(trees, stage0, "");
   }
 
@@ -495,7 +512,7 @@ class FileStagingBuilder implements IndexBuilder {
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,
     };
-
+    reuseEntryEncoding(options, entry);
     this._entries.push(entry);
   }
 
@@ -573,20 +590,21 @@ class FileStagingBuilder implements IndexBuilder {
   }
 
   private validateStages(): void {
-    // If stage 0 exists for a path, no other stages should exist
-    const pathStages = new Map<string, Set<MergeStageValue>>();
-
-    for (const entry of this._entries) {
-      if (!pathStages.has(entry.path)) {
-        pathStages.set(entry.path, new Set());
+    // If stage 0 exists for a path, no other stages should exist (the entries are sorted by
+    // path, then stage: a path's entries are next to each other)
+    const entries = this._entries;
+    for (let k = 0; k < entries.length; ) {
+      const path = entries[k].path;
+      let end = k + 1;
+      while (end < entries.length && entries[end].path === path) end++;
+      if (end - k > 1) {
+        const stages = new Set<MergeStageValue>();
+        for (let j = k; j < end; j++) stages.add(entries[j].stage);
+        if (stages.has(MergeStage.MERGED) && stages.size > 1) {
+          throw new Error(`Invalid stages for ${path}: stage 0 cannot coexist with other stages`);
+        }
       }
-      pathStages.get(entry.path)?.add(entry.stage);
-    }
-
-    for (const [path, stages] of pathStages) {
-      if (stages.has(MergeStage.MERGED) && stages.size > 1) {
-        throw new Error(`Invalid stages for ${path}: stage 0 cannot coexist with other stages`);
-      }
+      k = end;
     }
   }
 }

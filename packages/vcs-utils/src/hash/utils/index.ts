@@ -40,6 +40,9 @@ function preview(s: string): string {
   return JSON.stringify(s.length > 80 ? `${s.slice(0, 80)}...` : s);
 }
 
+/** "00" to "ff", by byte value. */
+const HEX_PAIRS: string[] = Array.from({ length: 256 }, (_, b) => b.toString(16).padStart(2, "0"));
+
 /**
  * Convert Uint8Array to hex string
  *
@@ -47,7 +50,7 @@ function preview(s: string): string {
  * @returns Hexadecimal string (lowercase)
  */
 export function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += HEX_PAIRS[bytes[i]];
+  return out;
 }

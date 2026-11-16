@@ -35,8 +35,10 @@ import {
   storeFlatTreeOver,
   subjectOf,
   switchTrees,
+  treeDelta,
 } from "./merge-support.js";
-import { ortMerge, ortResultEntries } from "./ort-merge.js";
+import { ortResultEntries } from "./ort-merge.js";
+import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { type PatchIdTrees, patchId } from "./patch-id.js";
 import { expandCommitId, expandCommitIds } from "./sequencer-pick.js";
 import {
@@ -80,6 +82,9 @@ export interface InteractiveHandler {
    */
   modifyCommitMessage(message: string): string;
 }
+
+/** Tracked files checked at once against the worktree (stats and hashes in flight). */
+const WORKTREE_CHECK_BATCH = 32;
 
 /** The state directory of git's merge backend. */
 const DIR = "rebase-merge";
@@ -386,12 +391,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
 
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
-    const ontoTree = await flatTree(this.trees, await this.commits.getTree(onto));
+    const ontoTreeId = await this.commits.getTree(onto);
+    const ontoTree = await flatTree(this.trees, ontoTreeId);
     // nothing of HEAD's to replay: HEAD moves to upstream
     if (await this.isAncestor(headId, onto)) {
       const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
         action: "checkout",
         operation: "rebase",
+        targetTree: ontoTreeId,
       });
       if (refused) {
         await unstash();
@@ -449,6 +456,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
       action: "checkout",
       operation: "rebase",
+      targetTree: ontoTreeId,
     });
     if (refused) {
       await unstash();
@@ -541,25 +549,35 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     this.flatTrees ??= new FlatTreeCache(this.trees);
     const flats = this.flatTrees;
     const headTreeId = await this.commits.getTree(headId);
-    const headTree = await flats.get(headTreeId);
     const parentId = commit.parents[0];
-    const parentTree = await flats.get(parentId ? await this.commits.getTree(parentId) : undefined);
+    const parentTreeId = parentId ? await this.commits.getTree(parentId) : undefined;
     const subject = subjectOf(commit.message);
     const label = `${abbrev(item.id)} (${subject})`;
-    const merge = await ortMerge(this.blobs, parentTree, headTree, await flats.get(commit.tree), {
-      oursLabel: "HEAD",
-      theirsLabel: label,
-      baseLabel: parentId ? `parent of ${label}` : "(empty tree)",
-      style: conflictStyleOf(this.workingCopy),
-      favor: favorOf(this.contentStrategy),
-      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
-      ...ortConfigOptions(this.workingCopy, worktree),
-    });
+    const baseLabel = parentId ? `parent of ${label}` : "(empty tree)";
+    // the trees as merge-ort reads them: what all three hold alike is never read
+    const merge = await mergeStoredTrees(
+      this.context(worktree),
+      storedBase(parentTreeId, baseLabel, () => flats.get(parentTreeId)),
+      headTreeId,
+      commit.tree,
+      {
+        oursLabel: "HEAD",
+        theirsLabel: label,
+        baseLabel,
+        style: conflictStyleOf(this.workingCopy),
+        favor: favorOf(this.contentStrategy),
+        ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+        ...ortConfigOptions(this.workingCopy, worktree),
+      },
+      (id) => flats.get(id),
+    );
     const target = await ortResultEntries(this.blobs, merge);
-    const treeId = await storeFlatTreeOver(this.trees, headTreeId, headTree, target);
-    flats.put(treeId, target);
+    // only the directories the pick changes are stored again
+    const treeId = await storeFlatTreeOver(this.trees, headTreeId, merge.ours, target);
     const conflicts = [...merge.conflicts.values()];
-    const refused = await switchTrees(this.context(worktree), headTree, target, {
+    // only the paths HEAD and the result differ on are switched
+    const delta = await treeDelta(this.trees, headTreeId, treeId);
+    const refused = await switchTrees(this.context(worktree), delta.from, delta.to, {
       action: "merge",
       operation: "rebase",
       conflicts,
@@ -599,8 +617,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         ].join("\n"),
       };
     }
-    const parentTreeId = parentId ? await this.commits.getTree(parentId) : EMPTY_TREE_ID;
-    if (treeId === headTreeId && commit.tree !== parentTreeId) {
+    if (treeId === headTreeId && commit.tree !== (parentTreeId ?? EMPTY_TREE_ID)) {
       // a pick that became empty is dropped (git's drop_redundant_commits), and with it the
       // pick's state; a commit that was empty from the start is kept (allow_empty)
       await state.removeRef("AUTO_MERGE");
@@ -749,9 +766,19 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const unstaged: string[] = [...unmerged];
     if (worktree) {
       const trust = worktreeModeTrust(this.workingCopy, worktree);
-      for (const [path, entry] of index) {
+      const indexTime = this.staging.getUpdateTime();
+      // every tracked file is checked (git's refresh_index); several at a time, as git's
+      // preload-index stats in parallel, the results kept in index order
+      const entries = [...index];
+      for (let k = 0; k < entries.length; k += WORKTREE_CHECK_BATCH) {
+        const batch = entries.slice(k, k + WORKTREE_CHECK_BATCH);
+        const modified = await Promise.all(
+          batch.map(([path, entry]) => worktreeModified(worktree, path, entry, trust, indexTime)),
+        );
         // a deleted file is an unstaged change too
-        if (await worktreeModified(worktree, path, entry, trust)) unstaged.push(path);
+        batch.forEach(([path], j) => {
+          if (modified[j]) unstaged.push(path);
+        });
       }
     }
     if (staged.length === 0 && unstaged.length === 0) return undefined;

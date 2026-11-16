@@ -1,3 +1,4 @@
+import { noteObjectRemoved } from "../raw/object-removals.js";
 import type { RawStorage } from "../raw/raw-storage.js";
 import type { ChunkAccess, ChunkMetadata } from "./chunk-access.js";
 
@@ -152,6 +153,7 @@ export class ChunkedRawStorage implements RawStorage {
     await this.access.removeChunks(key);
     // Remove metadata
     await this.access.removeChunks(this.metadataKey(key));
+    if (hadMetadata) noteObjectRemoved(key);
     return hadMetadata;
   }
 

@@ -340,7 +340,8 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       const conflict = conflicts.get(path);
       if (conflict && !conflict.content && !conflict.write && !conflict.moveFrom) continue;
       const i = index.get(path);
-      if (i && (await worktreeDiffers(worktree, path, i, trust))) local.push(path);
+      if (i && (await worktreeDiffers(worktree, path, i, trust, this.staging.getUpdateTime())))
+        local.push(path);
     }
     const found = await findInTheWay(worktree, {
       writes,

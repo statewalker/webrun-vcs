@@ -39,8 +39,12 @@ class AlreadyPacked extends Error {}
  * temporary is removed) and reported as `stored: false`.
  */
 export function skipPacked(store: StagingBlobStore, packs: PackSet): StagingBlobStore {
+  const looseFresh = store.isFresh?.bind(store);
   return {
     ...store,
+    ...(looseFresh
+      ? { isFresh: async (id: string) => (await packs.freshen(id)) || (await looseFresh(id)) }
+      : {}),
     async putStaged(bytes, idOf) {
       let packedId: string | undefined;
       try {

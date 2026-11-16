@@ -24,15 +24,18 @@ import {
   conflictsComment,
   defaultIdent,
   FlatTreeCache,
-  indexChanges,
+  indexChangesFromTree,
   type MergeWriteContext,
   type OperationState,
   readIndex,
   storeFlatTreeOver,
   subjectOf,
   switchTrees,
+  treeDelta,
+  writeIndexAsTree,
 } from "./merge-support.js";
-import { ortMerge, ortResultEntries } from "./ort-merge.js";
+import { ortResultEntries } from "./ort-merge.js";
+import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { cleanupMessage, resetMerge } from "./sequencer-support.js";
 
 /** What the sequencer does with each commit. */
@@ -186,13 +189,14 @@ export class PickSequencer {
     // with --no-commit the change is merged into the index as it is (git's
     // write_index_as_tree): each commit's change on top of the previous one's
     const headTreeId = this.options.noCommit
-      ? await deps.staging.writeTree(deps.trees)
+      ? await writeIndexAsTree(deps.staging, deps.trees)
       : headCommit.tree;
-    const headTree = await this.flats.get(headTreeId);
-
     // a commit is never made on top of staged changes (error_dirty_index)
     const { index } = await readIndex(deps.staging);
-    if (!this.options.noCommit && indexChanges(index, headTree).length > 0) {
+    if (
+      !this.options.noCommit &&
+      (await indexChangesFromTree(index, deps.trees, headTreeId)).length > 0
+    ) {
       return this.fail(
         `error: your local changes would be overwritten by ${ACTION_NAME[action]}.\nhint: commit your changes or stash them to proceed.\nfatal: ${ACTION_NAME[action]} failed`,
       );
@@ -213,31 +217,38 @@ export class PickSequencer {
     } else {
       parentId = commit.parents[0];
     }
-    const parentTree = await this.flats.get(
-      parentId ? await deps.commits.getTree(parentId) : undefined,
-    );
-    const commitTree = await this.flats.get(commit.tree);
+    const parentTreeId = parentId ? await deps.commits.getTree(parentId) : undefined;
     const subject = subjectOf(commit.message);
     const label = `${abbrev(item.id)} (${subject})`;
     const parentLabel = parentId ? `parent of ${label}` : "(empty tree)";
     const [base, theirs, baseLabel, theirsLabel] =
       action === "pick"
-        ? [parentTree, commitTree, parentLabel, label]
-        : [commitTree, parentTree, label, parentLabel];
-    const merge = await ortMerge(deps.blobs, base, headTree, theirs, {
-      oursLabel: this.options.oursLabel ?? "HEAD",
-      theirsLabel,
-      baseLabel,
-      style: conflictStyleOf(deps.workingCopy),
-      favor: this.options.favor,
-      ignoreCase: coreBool(deps.workingCopy, "ignorecase", false),
-      ...ortConfigOptions(deps.workingCopy, deps.worktree),
-    });
+        ? [parentTreeId, commit.tree, parentLabel, label]
+        : [commit.tree, parentTreeId, label, parentLabel];
+    const flats = this.flats;
+    const merge = await mergeStoredTrees(
+      deps,
+      storedBase(base, baseLabel, () => flats.get(base)),
+      headTreeId,
+      theirs,
+      {
+        oursLabel: this.options.oursLabel ?? "HEAD",
+        theirsLabel,
+        baseLabel,
+        style: conflictStyleOf(deps.workingCopy),
+        favor: this.options.favor,
+        ignoreCase: coreBool(deps.workingCopy, "ignorecase", false),
+        ...ortConfigOptions(deps.workingCopy, deps.worktree),
+      },
+      (id) => flats.get(id),
+    );
     const target = await ortResultEntries(deps.blobs, merge);
-    const treeId = await storeFlatTreeOver(deps.trees, headTreeId, headTree, target);
-    this.flats.put(treeId, target);
+    // only the directories the pick changes are stored again
+    const treeId = await storeFlatTreeOver(deps.trees, headTreeId, merge.ours, target);
     const conflicts = [...merge.conflicts.values()];
-    const refused = await switchTrees(deps, headTree, target, {
+    // only the paths HEAD and the result differ on are switched
+    const delta = await treeDelta(deps.trees, headTreeId, treeId);
+    const refused = await switchTrees(deps, delta.from, delta.to, {
       action: "merge",
       operation: ACTION_NAME[action],
       conflicts,

@@ -5,7 +5,12 @@
  * fixed-size chunks so that neither a write nor a read holds a whole value.
  */
 
-import { fixedSizeChunks, type RawStorage, type SweepStaleOptions } from "@statewalker/vcs-core";
+import {
+  fixedSizeChunks,
+  noteObjectRemoved,
+  type RawStorage,
+  type SweepStaleOptions,
+} from "@statewalker/vcs-core";
 import { timestampedId, timestampOfId } from "@statewalker/vcs-utils";
 import type { KVStore } from "../kv-store.js";
 
@@ -226,7 +231,9 @@ export class KvRawStore implements RawStorage {
       await this.kv.delete(this.manifestKey(key));
       await this.dropManifest(m);
     }
-    return inline || m !== undefined;
+    const removed = inline || m !== undefined;
+    if (removed) noteObjectRemoved(key);
+    return removed;
   }
 
   /**

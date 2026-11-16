@@ -282,7 +282,8 @@ export class SQLStaging implements Staging {
 
     const entries: StagingEntry[] = [];
     for await (const entry of this.listEntries()) {
-      if (entry.stage === MergeStage.MERGED) {
+      // an intent-to-add entry is no part of the tree (git's update_one skips it)
+      if (entry.stage === MergeStage.MERGED && !(entry.intentToAdd && !entry.skipWorktree)) {
         entries.push(entry);
       }
     }

@@ -16,7 +16,7 @@
  * file, or one whose mtime the FilesApi does not report, is kept as it is: `PackSet.freshen`
  * trusts a pack of unknown age the same way.
  */
-import type { StagingBlobStore } from "@statewalker/vcs-core";
+import { noteObjectRemoved, type StagingBlobStore } from "@statewalker/vcs-core";
 import { type FilesApi, joinPath, moveCompleting } from "@statewalker/vcs-utils/files";
 
 const FANOUT = /^[0-9a-f]{2}$/;
@@ -148,8 +148,14 @@ export function filesStagingStore(
     },
 
     async *get(id) {
+      // read at once: a missing file reads as nothing (one lookup instead of two); a
+      // FilesApi that throws for it is asked whether the file is there
       const path = pathOf(id);
-      if (await isFile(path)) yield* files.read(path);
+      try {
+        yield* files.read(path);
+      } catch (e) {
+        if (await isFile(path)) throw e;
+      }
     },
 
     has: (id) => isFile(pathOf(id)),
@@ -158,7 +164,9 @@ export function filesStagingStore(
 
     async remove(id) {
       const path = pathOf(id);
-      return (await isFile(path)) && files.remove(path);
+      const removed = (await isFile(path)) && (await files.remove(path));
+      if (removed) noteObjectRemoved();
+      return removed;
     },
 
     async *list() {

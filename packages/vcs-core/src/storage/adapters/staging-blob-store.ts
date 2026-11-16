@@ -41,6 +41,12 @@ export interface StagingBlobStore {
    * held in memory. Without it, the kernel collects that content.
    */
   spool?(content: AsyncIterable<Uint8Array>): Promise<SpooledContent>;
+  /**
+   * Whether `id` is stored and a write of it again would change nothing (git's
+   * `freshen_object` finding a fresh copy). Optional: with it, the object kernel hashes
+   * content held in memory first and skips the write of an object already there.
+   */
+  isFresh?(id: string): Promise<boolean>;
   /** The stored bytes; empty if absent. */
   get(id: string): AsyncIterable<Uint8Array>;
   has(id: string): Promise<boolean>;

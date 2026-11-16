@@ -452,7 +452,11 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         if (i !== undefined || t !== undefined) local.push(path);
         continue;
       }
-      if (i !== undefined && worktree && (await worktreeDiffers(worktree, path, i, trust))) {
+      if (
+        i !== undefined &&
+        worktree &&
+        (await worktreeDiffers(worktree, path, i, trust, this.staging.getUpdateTime()))
+      ) {
         local.push(path);
         continue;
       }

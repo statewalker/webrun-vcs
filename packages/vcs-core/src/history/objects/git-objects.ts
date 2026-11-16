@@ -174,7 +174,13 @@ export class InvalidObjectIdError extends Error {
   override name = "InvalidObjectIdError";
 }
 
-const OBJECT_ID_PATTERN = /^[0-9a-f]{40}$/;
+/** The value of a lowercase hex digit by char code, -1 for anything else. */
+const HEX_VALUE: Int8Array = (() => {
+  const table = new Int8Array(128).fill(-1);
+  for (let c = 0; c < 10; c++) table[48 + c] = c;
+  for (let c = 0; c < 6; c++) table[97 + c] = 10 + c;
+  return table;
+})();
 
 /**
  * The 20 bytes of a SHA-1 object id, for the binary formats that store ids raw
@@ -189,10 +195,15 @@ const OBJECT_ID_PATTERN = /^[0-9a-f]{40}$/;
  * @throws InvalidObjectIdError unless `id` is exactly 40 lowercase hex characters
  */
 export function objectIdToBytes(id: string): Uint8Array {
-  if (typeof id !== "string" || !OBJECT_ID_PATTERN.test(id)) {
+  if (typeof id !== "string" || id.length !== 40) {
     throw new InvalidObjectIdError(`not an object id: ${JSON.stringify(id)}`);
   }
   const bytes = new Uint8Array(20);
-  for (let i = 0; i < 20; i++) bytes[i] = Number.parseInt(id.slice(i * 2, i * 2 + 2), 16);
+  for (let i = 0; i < 20; i++) {
+    const hi = HEX_VALUE[id.charCodeAt(i * 2)] ?? -1;
+    const lo = HEX_VALUE[id.charCodeAt(i * 2 + 1)] ?? -1;
+    if (hi < 0 || lo < 0) throw new InvalidObjectIdError(`not an object id: ${JSON.stringify(id)}`);
+    bytes[i] = (hi << 4) | lo;
+  }
   return bytes;
 }

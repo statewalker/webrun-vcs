@@ -6,7 +6,7 @@
  * upstream already has (`--cherry-mark`).
  */
 
-import { type Blobs, FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { type Blobs, compareTreeEntries, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1, type Hasher, unifiedDiffHunks } from "@statewalker/vcs-utils";
 
 import type { CommandTrees } from "../git-command.js";
@@ -39,16 +39,11 @@ async function treeChanges(
   };
   const a = await load(oldTree);
   const b = await load(newTree);
-  // tree order: a directory sorts as `name/`
-  const key = (name: string) => {
-    const e = b.get(name) ?? a.get(name);
-    return e && e.mode === FileMode.TREE ? `${name}/` : name;
-  };
-  const names = [...new Set([...a.keys(), ...b.keys()])].sort((x, y) => {
-    const kx = key(x);
-    const ky = key(y);
-    return kx < ky ? -1 : kx > ky ? 1 : 0;
-  });
+  // tree order (git's base_name_compare): a directory sorts as `name/`
+  const entry = (name: string) => ({ name, mode: (b.get(name) ?? a.get(name))?.mode ?? 0 });
+  const names = [...new Set([...a.keys(), ...b.keys()])].sort((x, y) =>
+    compareTreeEntries(entry(x), entry(y)),
+  );
   for (const name of names) {
     const x = a.get(name);
     const y = b.get(name);

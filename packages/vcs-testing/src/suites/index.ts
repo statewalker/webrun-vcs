@@ -90,6 +90,7 @@ export * from "./delta-api.suite.js";
 export * from "./git-compatibility.suite.js";
 export * from "./git-objects.suite.js";
 export * from "./object-quarantine.suite.js";
+export * from "./parsed-object-cache.suite.js";
 export * from "./raw-store.suite.js";
 export * from "./ref-batch.suite.js";
 export * from "./ref-store.suite.js";

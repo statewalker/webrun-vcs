@@ -1,5 +1,5 @@
 import type { FilesApi, RawStorage } from "@statewalker/vcs-core";
-import { dirname, joinPath } from "@statewalker/vcs-core";
+import { dirname, joinPath, noteObjectRemoved } from "@statewalker/vcs-core";
 import { deflate, inflate, slice } from "@statewalker/vcs-utils";
 
 /**
@@ -98,10 +98,11 @@ export class FileRawStorage implements RawStorage {
 
     try {
       await this.files.remove(path);
-      return true;
     } catch {
       return false;
     }
+    noteObjectRemoved(key);
+    return true;
   }
 
   async *keys(): AsyncIterable<string> {

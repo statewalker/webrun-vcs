@@ -8,6 +8,7 @@
  */
 
 import type { ObjectId, Trees } from "@statewalker/vcs-core";
+import type { CacheTree } from "./cache-tree.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import type { IndexStatUpdate, RacyCheck } from "./stat-refresh.js";
 import type { MergeStageValue, StagingEntry, StagingEntryOptions } from "./types.js";
@@ -107,6 +108,12 @@ export interface Staging {
    */
   entries(options?: EntryIteratorOptions): AsyncIterable<IndexEntry>;
 
+  /**
+   * Every entry in Git canonical order, at once: what `entries()` yields, for a caller that
+   * reads the whole index (no await per entry). Optional.
+   */
+  entryList?(): readonly IndexEntry[];
+
   // ========== Conflict Handling ==========
 
   /**
@@ -163,6 +170,20 @@ export interface Staging {
    * staging area that keeps none.
    */
   clearResolveUndo?(): void;
+
+  /**
+   * Writes `tree` as the index's cache-tree (`TREE` extension) with the next `write`, as git
+   * does after unpack-trees switches the index to a known tree. It must describe the entries
+   * written then. Absent: a staging area without an index file.
+   */
+  setCacheTree?(tree: CacheTree | undefined): void;
+
+  /**
+   * The index's cache-tree (`TREE` extension) for its current entries, as read or last
+   * written; undefined when there is none or the entries changed since. Absent: a staging
+   * area without an index file.
+   */
+  getCacheTree?(): CacheTree | undefined;
 
   // ========== Persistence ==========
 

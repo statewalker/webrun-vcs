@@ -6,7 +6,14 @@
  */
 
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
-import type { Worktree, WorktreeModeTrust } from "@statewalker/vcs-working-tree";
+import {
+  basicStatMatches,
+  type StagingEntry,
+  type Worktree,
+  type WorktreeEntry,
+  type WorktreeModeTrust,
+  wholeSeconds,
+} from "@statewalker/vcs-working-tree";
 
 /** An index or tree entry, with the index's stat where it has one. */
 export interface CheckedEntry {
@@ -20,16 +27,32 @@ export interface CheckedEntry {
 /**
  * Whether the worktree file at `path` no longer holds the index entry (git's
  * `verify_uptodate`): changed content, type, or executable bit where the worktree shows it.
- * A missing file is no local change.
+ * A missing file is no local change. With `indexTime` (the index file's mtime, as the
+ * caller's index was last read or written: git's `istate->timestamp`), a stat that matches
+ * as git's `ie_match_stat` compares it, on an entry older than the index (not racy),
+ * settles it without reading the file, as in git; a racy entry is read. A caller that
+ * rewrites the index where git does (`write_index_as_tree`) passes the new file's time.
  */
 export async function worktreeDiffers(
   worktree: Worktree,
   path: string,
   entry: CheckedEntry,
   trust?: WorktreeModeTrust,
+  indexTime?: number,
 ): Promise<boolean> {
   const current = await worktree.getEntry(path);
   if (!current) return false;
+  return differsFrom(worktree, path, entry, current, trust, indexTime);
+}
+
+async function differsFrom(
+  worktree: Worktree,
+  path: string,
+  entry: CheckedEntry,
+  current: WorktreeEntry,
+  trust?: WorktreeModeTrust,
+  indexTime?: number,
+): Promise<boolean> {
   if (current.isDirectory) return entry.mode !== FileMode.GITLINK;
   if (entry.mode === FileMode.GITLINK) return false;
   if (
@@ -40,12 +63,29 @@ export async function worktreeDiffers(
   ) {
     return true;
   }
-  // the stat the index recorded still matches: unchanged, as git's ie_match_stat
+  // git's ie_match_stat: a recorded stat that still matches settles it, unless the entry is
+  // racy (modified at or after the index file was written, so a same-size edit in that
+  // second kept the stat): its content is checked. Without the index's time (absent or 0:
+  // unknown) only an exact match of size, mtime and ctime is trusted.
+  const known = indexTime !== undefined && indexTime > 0;
+  const racy =
+    known &&
+    (!entry.mtime ||
+      wholeSeconds(entry.mtime, (entry as StagingEntry).mtimeNs) >= wholeSeconds(indexTime));
   if (
+    !racy &&
     entry.mtime &&
     current.size === entry.size &&
     current.mtime === entry.mtime &&
     (entry.ctime === undefined || current.ctime === undefined || entry.ctime === current.ctime)
+  ) {
+    return false;
+  }
+  if (
+    known &&
+    !racy &&
+    (current.mode === FileMode.SYMLINK) === (entry.mode === FileMode.SYMLINK) &&
+    basicStatMatches(entry as StagingEntry, current, trust)
   ) {
     return false;
   }
@@ -66,10 +106,11 @@ export async function worktreeModified(
   path: string,
   entry: CheckedEntry,
   trust?: WorktreeModeTrust,
+  indexTime?: number,
 ): Promise<boolean> {
   const current = await worktree.getEntry(path);
   if (!current) return entry.mode !== FileMode.GITLINK;
-  return worktreeDiffers(worktree, path, entry, trust);
+  return differsFrom(worktree, path, entry, current, trust, indexTime);
 }
 
 /**
@@ -133,13 +174,22 @@ export async function findInTheWay(
   const removingFolded = new Set([...removes].map((p) => p.toLowerCase()));
   const tracked = (p: string) => index.has(p) && !removes.has(p);
   // directories holding tracked files that stay: a file written there would replace them
-  const trackedDirs = new Set<string>();
-  for (const p of index.keys()) {
-    if (removes.has(p)) continue;
-    for (let k = p.indexOf("/"); k > 0; k = p.indexOf("/", k + 1)) trackedDirs.add(p.slice(0, k));
-  }
+  // (read from the index only when something is written)
+  let trackedDirs: Set<string> | undefined;
+  const holdsTracked = (dir: string) => {
+    if (!trackedDirs) {
+      trackedDirs = new Set<string>();
+      for (const p of index.keys()) {
+        if (removes.has(p)) continue;
+        for (let k = p.indexOf("/"); k > 0; k = p.indexOf("/", k + 1)) {
+          trackedDirs.add(p.slice(0, k));
+        }
+      }
+    }
+    return trackedDirs.has(dir);
+  };
   for (const path of writes) {
-    if (trackedDirs.has(path)) {
+    if (holdsTracked(path)) {
       lostDirs.push(path);
       continue;
     }

@@ -251,12 +251,18 @@ export function createFilesRefOps(
 
   /** File text, or undefined if absent (also when it vanishes between the check and the read). */
   async function readText(path: string): Promise<string | undefined> {
-    if (!(await files.exists(path))) return undefined;
+    // read at once: an absent file reads as nothing (told apart from an empty one below); a
+    // FilesApi that throws for it is asked whether the file is there, as files-staging-store
     let text = "";
     let any = false;
-    for await (const chunk of files.read(path)) {
-      any = true;
-      text += dec.decode(chunk, { stream: true });
+    try {
+      for await (const chunk of files.read(path)) {
+        any = true;
+        text += dec.decode(chunk, { stream: true });
+      }
+    } catch (e) {
+      if (await files.exists(path)) throw e;
+      return undefined;
     }
     if (!any && !(await files.exists(path))) return undefined;
     return text + dec.decode();
