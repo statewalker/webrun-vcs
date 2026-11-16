@@ -5,8 +5,11 @@
  * (`core.autocrlf`, `core.attributesFile`, includes with `~/`) apply as in git. Its shape is
  * `GitHostEnvironment` of `@statewalker/vcs-working-tree`.
  */
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+
+import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
+
+import { PosixNodeFilesApi } from "./posix-node-files-api.js";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
 export interface NodeGitHostEnvironmentOptions {
@@ -32,6 +35,12 @@ export interface NodeGitHostEnvironmentOptions {
   globalConfig?: string;
   /** The environment variables read (default: `process.env`) */
   env?: Record<string, string | undefined>;
+  /**
+   * The file system the files are read from, by their absolute paths (default: the host's,
+   * through a Node FilesApi rooted at `/`, or at the drive of a Windows path). Pass a
+   * composite or in-memory FilesApi to read them from elsewhere.
+   */
+  files?: FilesApi;
 }
 
 /** The environment as `GitHostEnvironment` describes it. */
@@ -42,6 +51,22 @@ export interface NodeGitHostEnvironment {
   systemConfig?: string;
   systemAttributes?: string;
   globalConfig?: string;
+}
+
+/** One Node FilesApi per file-system root: `/`, or a Windows drive such as `C:/`. */
+const hostRoots = new Map<string, FilesApi>();
+
+/** The host FilesApi that holds an absolute path, and the path inside it. */
+function hostFiles(path: string): [FilesApi, string] {
+  const drive = /^[A-Za-z]:[\\/]/.exec(path);
+  const root = drive ? `${path.slice(0, 2)}/` : "/";
+  const relative = drive ? path.slice(3).replaceAll("\\", "/") : path;
+  let files = hostRoots.get(root);
+  if (!files) {
+    files = new PosixNodeFilesApi({ rootDir: root });
+    hostRoots.set(root, files);
+  }
+  return [files, relative];
 }
 
 /** git's `git_env_bool`: set to anything but a false value. */
@@ -79,7 +104,10 @@ export function createNodeGitHostEnvironment(
   return {
     readFile: async (path: string) => {
       try {
-        return new Uint8Array(await readFile(path));
+        const [files, relative] = options.files ? [options.files, path] : hostFiles(path);
+        // A FilesApi reads a missing file as empty: only read what is a file.
+        if ((await files.stats(relative))?.kind !== "file") return undefined;
+        return await readFile(files, relative);
       } catch {
         return undefined;
       }
