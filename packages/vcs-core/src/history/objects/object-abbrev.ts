@@ -1,0 +1,104 @@
+/**
+ * Abbreviated object ids as git prints them (`repo_find_unique_abbrev`): long enough for the
+ * repository's size, and longer where a shorter prefix would name another object too.
+ *
+ * @example
+ * ```typescript
+ * const lengths = await findAbbrevLengths(history.objects, [id1, id2]);
+ * id1.slice(0, lengths.get(id1)); // "1a2b3c4", or longer in a big repository
+ * ```
+ *
+ * The length starts at `minLength`, or, for "auto" (git's default, `core.abbrev=auto`), at
+ * half the bits of the approximate object count in hex digits, at least 7 (git's
+ * `odb_find_abbrev_len`: 7 up to 16383 objects, 8 from 16384, 9 from 65536, 10 from
+ * 262144, ...). Each id is then lengthened until no other stored object shares its prefix
+ * (it need not be stored itself: a worktree file's id, the null id).
+ *
+ * @module
+ */
+
+import type { ObjectId } from "../../common/id/index.js";
+import type { GitObjects } from "./git-objects.js";
+
+/** git's `FALLBACK_DEFAULT_ABBREV` */
+export const DEFAULT_ABBREV_LENGTH = 7;
+const HEX_LENGTH = 40;
+
+/** `msb(count) + 1` halved and rounded up, at least 7: the "auto" length for `count` objects */
+export function autoAbbrevLength(count: number): number {
+  let msb = 0;
+  for (let v = Math.max(0, Math.floor(count)); v > 1; v = Math.floor(v / 2)) msb++;
+  const len = Math.ceil((msb + 1) / 2);
+  return Math.max(DEFAULT_ABBREV_LENGTH, len);
+}
+
+/**
+ * `core.abbrev` as git reads it: unset and "auto" give -1 (the automatic length), a false
+ * boolean ("false", "no", "off") the full length, a number from 4 up that number; anything
+ * else (git refuses it) undefined.
+ */
+export function parseCoreAbbrev(value: string | undefined): number | undefined {
+  if (value === undefined) return -1;
+  const v = value.trim().toLowerCase();
+  if (v === "auto") return -1;
+  if (v === "false" || v === "no" || v === "off" || v === "") return HEX_LENGTH;
+  if (!/^-?\d+$/.test(v)) return undefined;
+  const n = Number(v);
+  return n >= 4 ? Math.min(n, HEX_LENGTH) : undefined;
+}
+
+function commonHexPrefix(a: string, b: string): number {
+  let i = 0;
+  while (i < HEX_LENGTH && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  return i;
+}
+
+/**
+ * The abbreviated length of each id (`repo_find_unique_abbrev`), from `minLength` (-1, the
+ * default, for git's automatic length; 0 or 40 and more for full ids).
+ */
+export async function findAbbrevLengths(
+  objects: GitObjects,
+  ids: Iterable<ObjectId>,
+  minLength = -1,
+): Promise<Map<ObjectId, number>> {
+  const wanted = [...new Set(ids)];
+  const out = new Map<ObjectId, number>();
+  if (wanted.length === 0) return out;
+  let start = minLength;
+  if (start < 0) {
+    let count = 0;
+    if (objects.approximateCount) count = await objects.approximateCount();
+    else for await (const _ of objects.list()) count++;
+    start = autoAbbrevLength(count);
+  }
+  if (start === 0 || start >= HEX_LENGTH) {
+    for (const id of wanted) out.set(id, HEX_LENGTH);
+    return out;
+  }
+  const all: string[] = [];
+  for await (const id of objects.list()) all.push(id);
+  all.sort();
+  for (const id of wanted) {
+    // the stored neighbours in sorted order share the longest prefixes with id
+    let lo = 0;
+    let hi = all.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (all[mid] < id) lo = mid + 1;
+      else hi = mid;
+    }
+    let len = start;
+    const extend = (other: string | undefined) => {
+      if (other === undefined || other === id) return;
+      const common = commonHexPrefix(id, other);
+      if (common !== HEX_LENGTH && common >= len) len = common + 1;
+    };
+    extend(all[lo - 1]);
+    let after = lo;
+    while (all[after] === id) after++;
+    extend(all[after]);
+    out.set(id, Math.min(len, HEX_LENGTH));
+  }
+  return out;
+}

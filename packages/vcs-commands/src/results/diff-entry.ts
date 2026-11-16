@@ -81,6 +81,12 @@ export interface DiffEntry {
 
   /** An unmerged path (index stages 1-3), printed as "* Unmerged path <path>" */
   unmerged?: boolean;
+
+  /**
+   * The new side is a submodule with changes of its own in the worktree: `readNew` gives
+   * "Subproject commit <id>-dirty", `newId` is its commit as git knows it
+   */
+  newDirtySubmodule?: boolean;
 }
 
 /**

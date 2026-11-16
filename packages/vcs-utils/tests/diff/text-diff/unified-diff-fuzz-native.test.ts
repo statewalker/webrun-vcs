@@ -16,7 +16,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  BUILTIN_FUNCNAME_PATTERNS,
+  BUILTIN_FUNCNAME_PATTERNS_2_43,
   diffLineCounts,
+  type FuncnamePattern,
   type UnifiedDiffOptions,
   unifiedDiff,
   userdiffFindFunction,
@@ -79,9 +82,50 @@ const TOKENS = [
   "label:",
   "# comment",
   "x",
+  // function lines of the other builtin drivers
+  "func (r *T) Run() error {",
+  "pub(crate) fn x<T>() -> T {",
+  "sub foo($a) : lvalue {",
+  "public function bar()",
+  "  SUBROUTINE FOO(A)",
+  "\\section{Intro}",
+  "## Heading",
+  "[section]",
+  "<h1>Title</h1>",
+  "@article{key,",
+  "(define (f x)",
+  "defmodule Foo do",
+  "fun foo(): Int",
+  "a:hover {",
+  "&node {",
+  "foo <- function(x)",
+  "MyClass = class(TObject)",
+  "@objc func g()",
+  "- (void)foo:(int)x {",
+  "classdef Foo",
+  "%% Section",
+  "  public async Task<int> Get(int a)",
+  "    List<int> xs = new List<int>();",
+  "namespace N {",
+  "procedure Foo is",
+  "INT. ROOM",
+  "f() {",
+  "function g {",
 ];
-/** Builtin drivers whose pattern is the same in git 2.43 and 2.56 */
-const DRIVERS = ["cpp", "python", "java", "golang", "ruby", "tex", "html", "perl", "css"];
+const atLeast = (ma: number, mi: number) => major > ma || (major === ma && minor >= mi);
+/** The builtin drivers of this git: 2.56's, 2.43's (up to 2.44), else only the common ones */
+const BUILTINS: Readonly<Record<string, FuncnamePattern>> | undefined = atLeast(2, 56)
+  ? BUILTIN_FUNCNAME_PATTERNS
+  : !atLeast(2, 45)
+    ? BUILTIN_FUNCNAME_PATTERNS_2_43
+    : undefined;
+/** Every builtin driver (the common ones only for a git between 2.45 and 2.55) */
+const DRIVERS = Object.keys(BUILTIN_FUNCNAME_PATTERNS).filter(
+  (d) =>
+    BUILTINS !== undefined ||
+    JSON.stringify(BUILTIN_FUNCNAME_PATTERNS[d]) ===
+      JSON.stringify(BUILTIN_FUNCNAME_PATTERNS_2_43[d]),
+);
 const ALGORITHMS: XdiffAlgorithm[] = ["myers", "minimal", "patience", "histogram"];
 const enc = new TextEncoder();
 
@@ -167,7 +211,7 @@ function makeCase(seed: number): Case {
   if (options.ignoreBlankLines) args.push("--ignore-blank-lines");
   if (options.functionContext) args.push("-W");
   const driver = r() < 0.3 ? DRIVERS[Math.floor(r() * DRIVERS.length)] : undefined;
-  if (driver) options.findFunction = userdiffFindFunction(driver);
+  if (driver) options.findFunction = userdiffFindFunction(driver, undefined, BUILTINS);
   return { a: toBytes(r, base), b: toBytes(r, other), options, driver, args };
 }
 
@@ -245,4 +289,263 @@ describe.skipIf(!hasGit)("unifiedDiff against git diff --no-index", () => {
     if (!only) expect(withHunks).toBeGreaterThan(SEEDS / 2);
     expect(mismatches.length).toBe(0);
   }, 600_000);
+});
+
+/** Lines that are function lines for some builtin driver, or near misses */
+const FUNCTION_LINES = [
+  "int main(void)",
+  "static int f(int y) {",
+  "  label:",
+  "label: // x",
+  "::foo()",
+  "def g(self):",
+  "async  def h():",
+  "class K(Base):",
+  "public static void main(String[] args) {",
+  "  private List<Map<String, Integer>> get(int a) {",
+  "    return x;",
+  "    if (x) {",
+  "new Foo();",
+  "func (r *T) Run() error {",
+  "type X struct {",
+  "fn main() {",
+  "pub(crate) fn x<T>() -> T {",
+  "pub async fn y()",
+  "impl<T> Foo for Bar {",
+  "sub foo {",
+  "sub foo($a) : lvalue {",
+  "package Foo::Bar;",
+  "=head1 NAME",
+  "BEGIN {",
+  "function foo() {",
+  "public function bar()",
+  "abstract class Z",
+  "procedure Foo is",
+  "PROCEDURE X",
+  "  SUBROUTINE FOO(A)",
+  "      END SUBROUTINE FOO",
+  "\\section{Intro}",
+  "\\subsubsection*{x}",
+  "# Heading",
+  "   ## h2",
+  "    #### not",
+  "[section]",
+  "[a]b]",
+  "<h1>Title</h1>",
+  "<H2 class=x>T",
+  "@article{key,",
+  "@book {k",
+  "(define (f x)",
+  "  (defun g ()",
+  "(library (foo))",
+  "defmodule Foo do",
+  "  defp bar(x) do",
+  '  test "x" do',
+  "fun foo(): Int",
+  "interface Bar",
+  "data class X(val a: Int)",
+  ".class {",
+  "a:hover {",
+  "#id, .c {",
+  "color: red;",
+  "@media screen {",
+  "/ {",
+  "&node {",
+  "node@0 {",
+  "x = 1;",
+  "foo <- function(x)",
+  "f = function(a, b)",
+  "MyClass = class(TObject)",
+  "constructor Create;",
+  "  func f() {",
+  "@objc func g()",
+  "init?(x: Int) {",
+  "extension Foo {",
+  "- (void)foo:(int)x {",
+  "+ (id)new",
+  "@implementation Foo",
+  "classdef Foo",
+  "function y = f(x)",
+  "%% Section",
+  "## Section",
+  "namespace N {",
+  "public class C : B",
+  "  public async Task<int> Get(int a)",
+  "    List<int> xs = new List<int>();",
+  "INT:",
+  "IF x THEN",
+  "ext. house - day",
+  "INT. ROOM",
+  ".scene",
+  "macro_rules! m {",
+  "\tfunc tabbed()",
+  "  def  spaced",
+  "@@weird",
+  "_under",
+  "$dollar",
+  "f() {",
+  "function g {",
+  "foo () (",
+  `${"List<int> ".repeat(6)}x(`,
+  `public ${"static ".repeat(10)}void f(int a)`,
+  `${"List<int> ".repeat(24)};`,
+  `  ${"List<int> ".repeat(24)}x`,
+];
+
+/** Two files, each function line followed by a changed line further down */
+function functionLineFiles(cands: readonly string[]): [string, string] {
+  let a = "";
+  let b = "";
+  for (const [i, c] of cands.entries()) {
+    a += `${c}\n`;
+    b += `${c}\n`;
+    for (let k = 0; k < 7; k++) {
+      a += ` f${i}.${k}\n`;
+      b += ` f${i}.${k}\n`;
+    }
+    a += " old\n";
+    b += " new\n";
+    for (let k = 0; k < 4; k++) {
+      a += ` g${i}.${k}\n`;
+      b += ` g${i}.${k}\n`;
+    }
+  }
+  return [a, b];
+}
+
+describe.skipIf(!hasGit)("diff drivers against git diff --no-index", () => {
+  it.each(DRIVERS)("builtin driver %s finds git's function lines", (driver) => {
+    dir ??= mkdtempSync(join(tmpdir(), "ud-fuzz-"));
+    const [a, b] = functionLineFiles(FUNCTION_LINES);
+    writeFileSync(join(dir, "fa"), a);
+    writeFileSync(join(dir, "fb"), b);
+    writeFileSync(join(dir, "attrs"), `* diff=${driver}\n`);
+    const res = spawnSync(
+      "git",
+      ["-c", `core.attributesFile=${join(dir, "attrs")}`, "diff", "--no-index", "fa", "fb"],
+      { cwd: dir, env: gitEnv },
+    );
+    const theirs = body(res.stdout).toString("latin1");
+    const ours = Buffer.from(
+      unifiedDiff(enc.encode(a), enc.encode(b), {
+        indentHeuristic: true,
+        findFunction: userdiffFindFunction(driver, undefined, BUILTINS),
+      }),
+    ).toString("latin1");
+    expect(ours).toBe(theirs);
+  });
+
+  /** `diff.<driver>.xfuncname` / `funcname` cases: [kind, pattern, function line] */
+  const CUSTOM: Array<[string, string, string]> = [
+    ["xfuncname", "^(a|ab)", "abc def"],
+    ["xfuncname", "(foo|foobar)", "x foobar y"],
+    ["xfuncname", "^(.*)(x*)$", "hello xxx"],
+    ["xfuncname", "^([a-z]+|[a-z]+[0-9]+)", "abc123 rest"],
+    ["xfuncname", "^(x?)(xy)?", "xy"],
+    ["funcname", "^\\(a*\\)b\\1", "aabaa end"],
+    ["funcname", "^\\(fn\\|def\\) .*", "def x"],
+    ["funcname", "^a\\{2\\}.*", "aab"],
+    ["funcname", "*x.*", "*x y"],
+    ["funcname", "^\\(ab\\)*\\1$", "ababab"],
+    ["xfuncname", "\\<word\\>.*", "a word here"],
+    ["xfuncname", "^[[:upper:]]+.*", "ABC"],
+    ["xfuncname", "^\\s*def.*", " def x"],
+    ["xfuncname", "^\\s.*", "\xa0def x"],
+    ["xfuncname", "^\\w+", "\xe9abc"],
+    ["xfuncname", "^[^a]+", "\xe9\xe9b"],
+    ["xfuncname", "^.+", "\xff\xfe ok"],
+    ["xfuncname", "^(int)?(int|integer) .*", "integer x"],
+    ["xfuncname", "^a{,2}b.*", "aab"],
+    ["xfuncname", "^a\\.b.*", "a.b"],
+    ["xfuncname", "^[]a]+.*", "]a x"],
+    ["xfuncname", "^[a\\]+.*", "a\\x"],
+    ["xfuncname", "^ab|^a.*", "abcd"],
+    ["xfuncname", "a**b.*", "aab x"],
+    ["xfuncname", "^(a*)*(b)", "aab"],
+    ["xfuncname", "(a|ab)(c|bcd)(d*)", "abcd"],
+    ["xfuncname", "^([[:alpha:]]+)[[:space:]]*=", "name = 1"],
+    ["xfuncname", "x(|a)", "xa"],
+    ["xfuncname", "^(\\(|\\[)+.*", "([( z"],
+    ["xfuncname", "!^skip\n^(.*)$", "skip this"],
+    ["xfuncname", "!^skip\n^(.*)$", "keep this"],
+    ["xfuncname", `^((${"List<int> ".repeat(3)})+;)`, `${"List<int> ".repeat(30)};`],
+  ];
+
+  it("runs diff.<driver>.xfuncname and funcname as glibc does (POSIX, leftmost-longest)", () => {
+    dir ??= mkdtempSync(join(tmpdir(), "ud-fuzz-"));
+    const mismatches: string[] = [];
+    for (const [kind, pattern, line] of CUSTOM) {
+      const a = `${line}\n f1\n f2\n f3\n f4\n f5\n old\n`;
+      const b = `${line}\n f1\n f2\n f3\n f4\n f5\n new\n`;
+      writeFileSync(join(dir, "pa"), a, "latin1");
+      writeFileSync(join(dir, "pb"), b, "latin1");
+      writeFileSync(join(dir, "attrs"), "* diff=cust\n");
+      const res = spawnSync(
+        "git",
+        [
+          "-c",
+          `core.attributesFile=${join(dir, "attrs")}`,
+          "-c",
+          `diff.cust.${kind}=${pattern}`,
+          "diff",
+          "--no-index",
+          "pa",
+          "pb",
+        ],
+        { cwd: dir, env: gitEnv },
+      );
+      const theirs = body(res.stdout).toString("latin1");
+      const config = (k: string) => (k === `diff.cust.${kind}` ? pattern : undefined);
+      const ours = Buffer.from(
+        unifiedDiff(Buffer.from(a, "latin1"), Buffer.from(b, "latin1"), {
+          indentHeuristic: true,
+          findFunction: userdiffFindFunction("cust", config),
+        }),
+      ).toString("latin1");
+      if (ours !== theirs)
+        mismatches.push(`${kind} ${JSON.stringify(pattern)}\n${theirs}\n${ours}`);
+    }
+    expect(mismatches).toEqual([]);
+  });
+
+  it("refuses the patterns glibc refuses, as git dies on them", () => {
+    dir ??= mkdtempSync(join(tmpdir(), "ud-fuzz-"));
+    writeFileSync(join(dir, "pa"), "x\n old\n");
+    writeFileSync(join(dir, "pb"), "x\n new\n");
+    writeFileSync(join(dir, "attrs"), "* diff=cust\n");
+    for (const [kind, pattern, valid] of [
+      ["xfuncname", "*a", false],
+      ["xfuncname", "a|*b", false],
+      ["xfuncname", "(", false],
+      ["xfuncname", "a{1", false],
+      ["xfuncname", "[[:nope:]]", false],
+      ["xfuncname", "[z-a]", false],
+      ["funcname", "\\(a", false],
+      ["funcname", "a**", false],
+      ["xfuncname", "a**", true],
+      ["xfuncname", ")", true],
+      ["funcname", "*a", true],
+      ["xfuncname", "x{256}", true],
+    ] as const) {
+      const res = spawnSync(
+        "git",
+        [
+          "-c",
+          `core.attributesFile=${join(dir, "attrs")}`,
+          "-c",
+          `diff.cust.${kind}=${pattern}`,
+          "diff",
+          "--no-index",
+          "pa",
+          "pb",
+        ],
+        { cwd: dir, env: gitEnv },
+      );
+      expect(`${pattern} ${res.status}`).toBe(`${pattern} ${valid ? 1 : 128}`);
+      const make = () =>
+        userdiffFindFunction("cust", (k) => (k === `diff.cust.${kind}` ? pattern : undefined));
+      if (valid) expect(make).not.toThrow();
+      else expect(make).toThrow(/Invalid regexp to look for hunk header/);
+    }
+  });
 });

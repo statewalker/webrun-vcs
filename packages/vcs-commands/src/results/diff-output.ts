@@ -48,6 +48,12 @@ export interface DiffSideSpec {
   /** The content (a symbolic link: its target; a submodule: "Subproject commit <id>\n") */
   read(): Promise<Uint8Array>;
   /**
+   * Whether `id` is known as git knows a stored object's (default true); false for content
+   * hashed here, a worktree file or a file outside the repository (git's `oid_valid` unset):
+   * the diffstat then compares the contents even when the ids are equal
+   */
+  idValid?: boolean;
+  /**
    * Size and binary probe without reading everything (big files): when absent, the content
    * is read
    */
@@ -85,6 +91,12 @@ export interface DiffOutputOptions
   indentHeuristic?: boolean;
   /** Length of abbreviated object ids in `index` lines (default 7) */
   abbrev?: number;
+  /**
+   * The length of each id in `index` lines, as git abbreviates them (`DiffCommand` finds
+   * them from `core.abbrev`, the repository's size and the other objects); ids not in it
+   * take `abbrev`
+   */
+  abbrevLengths?: ReadonlyMap<string, number>;
   /** Full object ids in `index` lines (`--full-index`) */
   fullIndex?: boolean;
   /** `core.quotePath` (default true): bytes above 0x7f in paths are escaped */
@@ -272,8 +284,9 @@ function metainfo(
     mustShow = true;
   }
   if (one.id !== two.id) {
-    const abbrev = options.fullIndex ? 40 : (options.abbrev ?? 7);
-    text += `index ${one.id.slice(0, abbrev)}..${two.id.slice(0, abbrev)}`;
+    const abbrev = (id: string) =>
+      id.slice(0, options.fullIndex ? 40 : (options.abbrevLengths?.get(id) ?? options.abbrev ?? 7));
+    text += `index ${abbrev(one.id)}..${abbrev(two.id)}`;
     if (one.mode === two.mode) text += ` ${octal6(one.mode)}`;
     text += "\n";
   }
@@ -422,7 +435,14 @@ export async function computeDiffstat(
     const twoDriver = nameB === nameA ? oneDriver : await driverOf(options, nameB);
     const one = new LoadedSide(pair.old, oneDriver);
     const two = new LoadedSide(pair.new, twoDriver);
-    const mayDiffer = !(one.valid && two.valid && one.id === two.id);
+    // git's may_differ: both ids known and equal, or the contents are compared
+    const mayDiffer = !(
+      one.valid &&
+      two.valid &&
+      one.spec?.idValid !== false &&
+      two.spec?.idValid !== false &&
+      one.id === two.id
+    );
     if (!options.text && ((await one.isBinary(threshold)) || (await two.isBinary(threshold)))) {
       file.isBinary = true;
       if (mayDiffer) {
@@ -805,12 +825,14 @@ export function contentSide(
   mode: number,
   id: string,
   read: () => Promise<Uint8Array>,
+  idValid = false,
 ): DiffSideSpec {
   let content: Promise<Uint8Array> | undefined;
   return {
     path,
     mode,
     id,
+    idValid,
     read: () => {
       content ??= read();
       return content;

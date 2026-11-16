@@ -78,6 +78,13 @@ export interface GitObjects {
   has(id: ObjectId): Promise<boolean>;
   /** Stored object ids (40 lowercase hex), whatever else the store holds. */
   list(): AsyncIterable<ObjectId>;
+  /**
+   * git's approximate object count, from which abbreviated ids get their length
+   * (`odb_count_objects` with `ODB_COUNT_OBJECTS_APPROXIMATE`): the objects in the packs for
+   * the files backend (git leaves loose objects out of this estimate), every object for the
+   * other stores. Present on the stores of this package; see `findAbbrevLengths`.
+   */
+  approximateCount?(): Promise<number>;
   /** Remove an object; true if one was removed. Throws `InvalidObjectIdError` for a non-id. */
   remove(id: ObjectId): Promise<boolean>;
   /**

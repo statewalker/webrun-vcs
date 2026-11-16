@@ -6,12 +6,15 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 
+import { NoHeadError, RefNotFoundError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { DEFAULT_RENAME_LIMIT, detectRenames, scorePercent } from "../rename/index.js";
+import { writeCombinedDiff } from "../results/combined-diff.js";
 import { ChangeType, type DiffEntry } from "../results/diff-entry.js";
 import { diffEntryToPair } from "../results/diff-formatter.js";
 import {
+  blobSide,
   computeDiffstat,
   contentSide,
   type DiffDriver,
@@ -27,7 +30,8 @@ import {
   writePairPatch,
 } from "../results/diff-output.js";
 import { quotePath } from "../results/quote-path.js";
-import { worktreeModeTrust } from "./core-config.js";
+import { abbrevLengths, worktreeModeTrust } from "./core-config.js";
+import { readSubmoduleDirt } from "./status-command.js";
 
 /** The output formats of {@link DiffCommand.callText} */
 export type DiffOutputFormat =
@@ -66,6 +70,29 @@ interface Side {
   mode: number;
   id: ObjectId;
   read?: () => Promise<Uint8Array>;
+  /** A submodule with changes of its own in the worktree ("Subproject commit <id>-dirty") */
+  dirty?: boolean;
+}
+
+/** An index entry, of any stage */
+type StageEntry = Parameters<typeof compareWithWorktree>[1];
+
+/** The worktree side of an index entry, as diff-files sees it; undefined when deleted */
+type WorktreeCompare = (entry: StageEntry) => Promise<Side | undefined>;
+
+/** A conflicted path `git diff` shows as a combined diff: stages 2 and 3 against the file */
+interface CombinedEntry {
+  path: string;
+  ours: StageEntry;
+  theirs: StageEntry;
+}
+
+/** `diff.ignoreSubmodules` (git's `--ignore-submodules`); undefined when unset or invalid */
+function submoduleIgnoreValue(
+  value: string | undefined,
+): "none" | "untracked" | "dirty" | "all" | undefined {
+  const v = value?.trim().toLowerCase();
+  return v === "none" || v === "untracked" || v === "dirty" || v === "all" ? v : undefined;
 }
 
 const S_IFMT = 0o170000;
@@ -127,8 +154,15 @@ const algorithmValue = (v: string | undefined): XdiffAlgorithm | undefined => {
  * `--numstat`, `--shortstat`, `--name-only`, `--name-status`), byte for byte, reading
  * `diff.algorithm`, `diff.indentHeuristic`, `diff.context`, `diff.interHunkContext`,
  * `diff.renames`, `diff.renameLimit`, `diff.statNameWidth`, `diff.statGraphWidth`,
- * `core.quotePath`, `core.bigFileThreshold` and the `diff` attribute's drivers
- * (`diff.<driver>.xfuncname`, `.funcname`, `.binary`, `.algorithm`, builtin drivers).
+ * `core.quotePath`, `core.bigFileThreshold`, `core.abbrev`, `diff.ignoreSubmodules` and the
+ * `diff` attribute's drivers (`diff.<driver>.xfuncname`, `.funcname`, `.binary`,
+ * `.algorithm`, builtin drivers).
+ *
+ * As git: a conflicted path is, in `git diff`, the combined diff (`diff --cc`) of stages 2
+ * and 3 against the worktree file, printed before the other files (in the other formats, an
+ * unmerged entry and stage 2 against the worktree), and in `git diff A` the worktree file;
+ * a submodule with changes of its own is `Subproject commit <id>-dirty`; `index` lines
+ * abbreviate ids as git does; a revision that names nothing throws `RefNotFoundError`.
  *
  * @example
  * ```typescript
@@ -236,7 +270,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   async call(): Promise<DiffEntry[]> {
     this.checkCallable();
     this.setCallable(false);
-    return this.collect(this.renames ?? false);
+    return (await this.collect(this.renames ?? false)).entries;
   }
 
   /** Execute the diff and print it as `git diff` does, in the given format. */
@@ -250,7 +284,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
-    const entries = await this.collect(renames);
+    const { entries, combined } = await this.collect(renames, format === "patch");
     const options = this.outputOptions();
     const pairs: DiffFilePair[] = [];
     const unmerged = new Set<DiffFilePair>();
@@ -268,13 +302,31 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const quote = options.quotePath;
     const sink = new ByteSink();
     switch (format) {
-      case "patch":
+      case "patch": {
+        // index lines abbreviate as git does (core.abbrev, the repository's size, uniqueness)
+        if (!options.fullIndex) {
+          const ids = new Set<string>();
+          for (const pair of pairs) {
+            if (unmerged.has(pair)) continue;
+            ids.add(pair.old?.id ?? NULL_ID);
+            ids.add(pair.new?.id ?? NULL_ID);
+          }
+          for (const c of combined) {
+            ids.add(c.ours.objectId);
+            ids.add(c.theirs.objectId);
+            ids.add(NULL_ID);
+          }
+          options.abbrevLengths = await abbrevLengths(this.workingCopy, ids);
+        }
+        // git prints the combined diffs of conflicted paths as it finds them, before the rest
+        for (const c of combined) await this.writeCombined(sink, c, options);
         for (const pair of pairs) {
           if (unmerged.has(pair)) {
             sink.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
           } else await writePairPatch(sink, pair, options);
         }
         break;
+      }
       case "name-only":
         sink.text(
           formatNameOnly(await this.shownNames(pairs, unmerged, options), { quotePath: quote }),
@@ -314,6 +366,50 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       }
     }
     return sink.bytes();
+  }
+
+  /** The combined diff (`diff --cc`) of a conflicted path: stages 2 and 3 against the file */
+  private async writeCombined(
+    sink: ByteSink,
+    c: CombinedEntry,
+    options: DiffOutputOptions,
+  ): Promise<void> {
+    const worktree = this.worktreeAccess;
+    const stage = async (e: StageEntry) => ({
+      id: e.objectId,
+      mode: e.mode,
+      content: await blobSide(this.blobs, c.path, e.mode, e.objectId).read(),
+    });
+    // the file as git reads it for the result: its real mode (canon_mode), cleaned content
+    let mode = 0;
+    let content: Uint8Array = new Uint8Array(0);
+    const file = await worktree?.getEntry(c.path);
+    if (worktree && file) {
+      if (file.isDirectory) {
+        mode = GITLINK;
+        content = encoder.encode(`Subproject commit ${NULL_ID}\n`);
+      } else {
+        const kind = file.mode & S_IFMT;
+        mode = kind === 0o120000 ? 0o120000 : file.mode & 0o111 ? 0o100755 : 0o100644;
+        content = await readCleanContent(worktree, c.path);
+      }
+    }
+    const driver = await options.driver?.(c.path);
+    const lengths = options.abbrevLengths;
+    writeCombinedDiff(
+      sink,
+      {
+        path: c.path,
+        parents: [await stage(c.ours), await stage(c.theirs)],
+        result: { id: NULL_ID, mode, content },
+      },
+      {
+        ...options,
+        ...(driver?.binary !== undefined ? { binary: driver.binary } : {}),
+        abbreviate: (id) =>
+          id.slice(0, options.fullIndex ? 40 : (lengths?.get(id) ?? options.abbrev ?? 7)),
+      },
+    );
   }
 
   /** The pairs `--name-only` lists: with whitespace options, those whose patch shows a change */
@@ -393,58 +489,118 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     };
   }
 
-  /** The changed paths (and renames, when asked), in git's order */
-  private async collect(renames: boolean): Promise<DiffEntry[]> {
+  /**
+   * The changed paths (and renames, when asked), in git's order, and the conflicted paths
+   * `git diff` shows as combined diffs (`patch`: the patch format, where a path with both
+   * stage 2 and stage 3 is one; elsewhere it is listed as unmerged and as its stage 2
+   * against the worktree, as `diff-files` does).
+   */
+  private async collect(
+    renames: boolean,
+    patch = false,
+  ): Promise<{ entries: DiffEntry[]; combined: CombinedEntry[] }> {
     const worktree = this.worktreeAccess;
     let oldSide: Map<string, Side>;
     let newSide: Map<string, Side>;
-    const unmerged = new Set<string>();
+    const unmerged = new Map<string, DiffEntry[]>();
+    const combined: CombinedEntry[] = [];
     if (this.newTree) {
-      oldSide = await this.treeSide(this.oldTree ?? "HEAD");
+      oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
       newSide = await this.treeSide(this.newTree);
     } else if (this.cached) {
-      oldSide = await this.treeSide(this.oldTree ?? "HEAD");
-      newSide = await this.indexSide(unmerged);
+      oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
+      const index = await this.indexSide();
+      newSide = index.sides;
+      for (const path of index.unmerged.keys()) unmerged.set(path, []);
     } else if (worktree) {
       const run = async () => {
         if (this.oldTree) {
+          // diff-index: a conflicted path is its worktree file, compared with the tree
           const old = await this.treeSide(this.oldTree);
-          return [old, await this.worktreeSide(worktree, unmerged)] as const;
+          const wt = await this.worktreeSide(worktree, true);
+          return [old, wt.sides] as const;
         }
-        const index = await this.indexSide(unmerged);
-        return [index, await this.worktreeSide(worktree, unmerged)] as const;
+        const index = await this.indexSide();
+        const wt = await this.worktreeSide(worktree, false);
+        for (const [path, stages] of wt.unmerged) {
+          if (!this.matches(path)) continue;
+          const ours = stages.get(2);
+          const theirs = stages.get(3);
+          if (patch && ours && theirs) {
+            combined.push({ path, ours, theirs });
+            continue;
+          }
+          unmerged.set(path, ours ? await this.againstStage(ours, wt.compare) : []);
+        }
+        return [index.sides, wt.sides] as const;
       };
       [oldSide, newSide] = worktree.batch ? await worktree.batch(run) : await run();
     } else {
       // no worktree: HEAD against HEAD (the old tree against HEAD)
-      oldSide = await this.treeSide(this.oldTree ?? "HEAD");
-      newSide = await this.treeSide("HEAD");
+      oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
+      newSide = await this.treeSide("HEAD", true);
     }
     const entries = this.pairUp(oldSide, newSide, unmerged);
     if (renames) await this.detectRenames(entries);
-    return entries;
+    return { entries, combined };
+  }
+
+  /** diff-files on a conflicted path's stage 2 (`--ours`): its entry against the worktree */
+  private async againstStage(stage: StageEntry, compare: WorktreeCompare): Promise<DiffEntry[]> {
+    const path = stage.path;
+    const side = await compare(stage);
+    if (!side) {
+      return [
+        {
+          changeType: ChangeType.DELETE,
+          oldPath: path,
+          oldId: stage.objectId,
+          oldMode: stage.mode as FileModeValue,
+        },
+      ];
+    }
+    if (side.id === stage.objectId && side.mode === stage.mode && !side.dirty) return [];
+    return [
+      {
+        changeType: ChangeType.MODIFY,
+        oldPath: path,
+        newPath: path,
+        oldId: stage.objectId,
+        newId: side.id,
+        oldMode: stage.mode as FileModeValue,
+        newMode: side.mode as FileModeValue,
+        ...(side.read ? { readNew: side.read } : {}),
+        ...(side.dirty ? { newDirtySubmodule: true } : {}),
+      },
+    ];
   }
 
   private matches(path: string): boolean {
     return !this.pathFilter || path.startsWith(this.pathFilter);
   }
 
+  /**
+   * The entries of both sides in path order; an unmerged path is listed as such, followed by
+   * the entries `unmerged` holds for it
+   */
   private pairUp(
     oldSide: Map<string, Side>,
     newSide: Map<string, Side>,
-    unmerged: Set<string>,
+    unmerged: Map<string, DiffEntry[]>,
   ): DiffEntry[] {
-    const paths = new Set<string>([...oldSide.keys(), ...newSide.keys(), ...unmerged]);
+    const paths = new Set<string>([...oldSide.keys(), ...newSide.keys(), ...unmerged.keys()]);
     const sorted = [...paths].filter((p) => this.matches(p)).sort(compareBytes);
     const entries: DiffEntry[] = [];
     for (const path of sorted) {
-      if (unmerged.has(path)) {
+      const extra = unmerged.get(path);
+      if (extra) {
         entries.push({
           changeType: ChangeType.MODIFY,
           oldPath: path,
           newPath: path,
           unmerged: true,
         });
+        entries.push(...extra);
         continue;
       }
       const a = oldSide.get(path);
@@ -463,8 +619,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           newId: b.id,
           newMode: b.mode as FileModeValue,
           ...(b.read ? { readNew: b.read } : {}),
+          ...(b.dirty ? { newDirtySubmodule: true } : {}),
         });
-      } else if (a && b && (a.id !== b.id || a.mode !== b.mode)) {
+      } else if (a && b && (a.id !== b.id || a.mode !== b.mode || b.dirty)) {
         entries.push({
           changeType: ChangeType.MODIFY,
           oldPath: path,
@@ -474,6 +631,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           oldMode: a.mode as FileModeValue,
           newMode: b.mode as FileModeValue,
           ...(b.read ? { readNew: b.read } : {}),
+          ...(b.dirty ? { newDirtySubmodule: true } : {}),
         });
       }
     }
@@ -545,95 +703,163 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     }
   }
 
-  /** The blobs of a commit's (or tree's) tree, by path */
-  private async treeSide(refOrId: string): Promise<Map<string, Side>> {
+  /**
+   * The blobs of a commit's (or tree's) tree, by path. `implicitHead`: HEAD taken by default
+   * (`--cached`, no worktree), an unborn HEAD then being the empty tree as git takes it;
+   * anything else that does not resolve throws (git's "bad revision", exit 128).
+   */
+  private async treeSide(refOrId: string, implicitHead = false): Promise<Map<string, Side>> {
     const out = new Map<string, Side>();
     let treeId: ObjectId;
     try {
       treeId = await this.resolveTreeId(refOrId);
-    } catch {
-      return out;
+    } catch (e) {
+      if (implicitHead && e instanceof NoHeadError) return out;
+      throw e;
     }
     await this.collectTreeEntries(treeId, "", out);
     return out;
   }
 
-  /** The index's stage-0 entries (intent-to-add ones left out: not in the index yet) */
-  private async indexSide(unmerged: Set<string>): Promise<Map<string, Side>> {
-    const out = new Map<string, Side>();
+  /**
+   * The index's stage-0 entries (intent-to-add ones left out: not in the index yet), and the
+   * stages of its conflicted paths
+   */
+  private async indexSide(): Promise<{
+    sides: Map<string, Side>;
+    unmerged: Map<string, Map<number, StageEntry>>;
+  }> {
+    const sides = new Map<string, Side>();
+    const unmerged = new Map<string, Map<number, StageEntry>>();
     for await (const entry of this.staging.entries()) {
       if (entry.stage !== 0) {
-        unmerged.add(entry.path);
+        let stages = unmerged.get(entry.path);
+        if (!stages) {
+          stages = new Map();
+          unmerged.set(entry.path, stages);
+        }
+        stages.set(entry.stage, entry);
         continue;
       }
       if (entry.intentToAdd) continue;
-      out.set(entry.path, { mode: entry.mode, id: entry.objectId });
+      sides.set(entry.path, { mode: entry.mode, id: entry.objectId });
     }
-    return out;
+    return { sides, unmerged };
   }
 
   /**
-   * The worktree as `diff-files` and `diff-index` see it: each index
-   * entry's file, its stat-clean entries taken from the index, changed ones read and hashed
-   * as `git add` would store them; deleted files left out
+   * The worktree as `diff-files` and `diff-index` see it: each index entry's file, its
+   * stat-clean entries taken from the index, changed ones read and hashed as `git add` would
+   * store them; deleted files left out. A conflicted path's stages are handed back (and,
+   * with `unmergedAsFiles`, its file is taken as diff-index takes it, against the lowest
+   * stage); `compare` gives the worktree side of any entry.
    */
   private async worktreeSide(
     worktree: Worktree,
-    unmerged: Set<string>,
-  ): Promise<Map<string, Side>> {
-    const out = new Map<string, Side>();
+    unmergedAsFiles: boolean,
+  ): Promise<{
+    sides: Map<string, Side>;
+    unmerged: Map<string, Map<number, StageEntry>>;
+    compare: WorktreeCompare;
+  }> {
+    const sides = new Map<string, Side>();
+    const unmerged = new Map<string, Map<number, StageEntry>>();
     const trust = worktreeModeTrust(this.workingCopy, worktree);
     const indexTime = this.staging.getUpdateTime();
-    for await (const entry of this.staging.entries()) {
-      if (entry.stage !== 0) {
-        unmerged.add(entry.path);
-        continue;
-      }
-      if (!this.matches(entry.path)) continue;
+    const ignore = submoduleIgnoreValue(this.config.value("diff.ignoreSubmodules"));
+    const compare: WorktreeCompare = async (entry) => {
       const indexSide: Side = { mode: entry.mode, id: entry.objectId };
-      if (entry.skipWorktree || entry.assumeValid) {
-        if (!entry.intentToAdd) out.set(entry.path, indexSide);
-        continue;
-      }
+      if (entry.skipWorktree || entry.assumeValid) return indexSide;
+      if (entry.mode === GITLINK && ignore === "all") return indexSide;
       const result = await compareWithWorktree(worktree, entry, { trust, indexTime });
-      if (result.kind === "deleted") continue;
-      if (!result.kind && !entry.intentToAdd) {
-        out.set(entry.path, indexSide);
-        continue;
-      }
+      if (result.kind === "deleted") return undefined;
       const mode = result.worktreeMode ?? entry.mode;
       if (mode === GITLINK) {
-        out.set(entry.path, { mode, id: result.hashedId ?? entry.objectId });
-        continue;
+        const id = result.hashedId ?? entry.objectId;
+        // a populated submodule with changes of its own: "-dirty" (untracked files count
+        // only with diff.ignoreSubmodules=none, as git's default ignores them)
+        let dirty = false;
+        if (entry.mode === GITLINK && ignore !== "dirty" && result.worktreeEntry?.isDirectory) {
+          const dirt = await readSubmoduleDirt(worktree, entry.path, ignore !== "none");
+          dirty = !!dirt.modified || (ignore === "none" && !!dirt.untracked);
+        }
+        if (!dirty) return result.kind ? { mode, id } : indexSide;
+        const content = encoder.encode(`Subproject commit ${id}-dirty\n`);
+        return { mode, id, dirty, read: async () => content };
       }
+      if (!result.kind && !entry.intentToAdd) return indexSide;
       const path = entry.path;
       const id = result.hashedId ?? (await worktree.computeHash(path));
+      if (!entry.intentToAdd && id === entry.objectId && mode === entry.mode) return indexSide;
       let content: Promise<Uint8Array> | undefined;
       const read = () => {
         content ??= readCleanContent(worktree, path);
         return content;
       };
-      if (!entry.intentToAdd && id === entry.objectId && mode === entry.mode) {
-        out.set(path, indexSide);
+      return { mode, id, read };
+    };
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage !== 0) {
+        let stages = unmerged.get(entry.path);
+        if (!stages) {
+          stages = new Map();
+          unmerged.set(entry.path, stages);
+        }
+        stages.set(entry.stage, entry);
         continue;
       }
-      out.set(path, { mode, id, read });
+      if (!this.matches(entry.path)) continue;
+      const side = await compare(entry);
+      if (!side) continue;
+      if (entry.intentToAdd && side.id === entry.objectId && !side.read) continue;
+      sides.set(entry.path, side);
     }
-    return out;
+    if (unmergedAsFiles) {
+      for (const [path, stages] of unmerged) {
+        if (!this.matches(path)) continue;
+        const lowest = stages.get(1) ?? stages.get(2) ?? stages.get(3);
+        if (!lowest) continue;
+        // the stage's stat is no file's: the file is read and hashed
+        const side = await compare(lowest);
+        if (side) sides.set(path, side);
+      }
+    }
+    return { sides, unmerged, compare };
   }
 
   /**
-   * Resolve a ref to its tree ID.
+   * The tree of a commit-ish or a tree id; throws `NoHeadError` for an unborn HEAD and
+   * `RefNotFoundError` for anything else that names no commit or tree.
    */
   private async resolveTreeId(refOrId: string): Promise<ObjectId> {
+    let id: ObjectId;
     try {
-      const commitId = await this.resolveRef(refOrId);
-      const commit = await this.commits.load(commitId);
-      if (!commit) return refOrId;
-      return commit.tree;
+      id = await this.resolveRef(refOrId);
+    } catch (e) {
+      if (/^[0-9a-f]{40}$/.test(refOrId) && (await this.isTree(refOrId))) return refOrId;
+      if (refOrId === "HEAD") throw new NoHeadError("HEAD cannot be resolved");
+      if (e instanceof RefNotFoundError) {
+        throw new RefNotFoundError(refOrId, `bad revision '${refOrId}'`);
+      }
+      throw e;
+    }
+    let commit: { tree: ObjectId } | undefined;
+    try {
+      commit = await this.commits.load(id);
     } catch {
-      if (refOrId === "HEAD") throw new Error("no HEAD");
-      return refOrId;
+      commit = undefined;
+    }
+    if (commit) return commit.tree;
+    // a tag peeled to a tree
+    if (await this.isTree(id)) return id;
+    throw new RefNotFoundError(refOrId, `bad revision '${refOrId}'`);
+  }
+
+  private async isTree(id: ObjectId): Promise<boolean> {
+    try {
+      return await this.trees.has(id);
+    } catch {
+      return false;
     }
   }
 

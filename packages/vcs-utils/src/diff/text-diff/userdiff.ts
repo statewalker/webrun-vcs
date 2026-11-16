@@ -10,8 +10,9 @@
  * ```
  *
  * The patterns are POSIX regular expressions (extended for builtin drivers and
- * `diff.<driver>.xfuncname`, basic for `diff.<driver>.funcname`); they are translated to
- * JavaScript and run on the bytes of a line (each byte one character, as in the C locale).
+ * `diff.<driver>.xfuncname`, basic for `diff.<driver>.funcname`), matched on the bytes of a
+ * line as glibc matches them in the C locale ({@link compilePosixRegex}: leftmost-longest,
+ * back-references, linear time without them).
  * A pattern holds one regular expression per line; a line starting with `!` rejects the
  * lines it matches. The first matching expression gives the function text: its first group
  * if it has one, else the whole match.
@@ -19,6 +20,7 @@
  * @module
  */
 
+import { compilePosixRegex, PosixRegexError } from "../../regex/index.js";
 import type { FindFunction } from "./xemit.js";
 
 /** A funcname pattern: lines of regular expressions, `!` lines negated */
@@ -121,176 +123,98 @@ export const BUILTIN_FUNCNAME_PATTERNS: Readonly<Record<string, FuncnamePattern>
   tex: { pattern: "^(\\\\((sub)*section|chapter|part)\\*{0,1}\\{.*)$", icase: false },
 };
 
-const CLASSES: Record<string, string> = {
-  alpha: "A-Za-z",
-  digit: "0-9",
-  alnum: "A-Za-z0-9",
-  upper: "A-Z",
-  lower: "a-z",
-  space: " \\t\\n\\r\\f\\v",
-  blank: " \\t",
-  punct: "!-\\/:-@\\[-`{-~",
-  print: " -~",
-  graph: "!-~",
-  cntrl: "\\x00-\\x1f\\x7f",
-  xdigit: "0-9A-Fa-f",
-};
-
-/** A character inside a JavaScript character class */
-function classChar(ch: string): string {
-  return /[\\\]^[-]/.test(ch) ? `\\${ch}` : ch;
-}
-
-/** A literal character outside a class */
-function literal(ch: string): string {
-  return /[\\^$.|?*+()[\]{}/]/.test(ch) ? `\\${ch}` : ch;
-}
-
-/** A POSIX bracket expression starting at `re[i]` (the `[`): its JavaScript class and end */
-function bracket(re: string, i: number): [string, number] {
-  let j = i + 1;
-  let out = "[";
-  if (re[j] === "^") {
-    out += "^";
-    j++;
-  }
-  let first = true;
-  while (j < re.length) {
-    const ch = re[j];
-    if (ch === "]" && !first) return [`${out}]`, j + 1];
-    first = false;
-    if (ch === "[" && (re[j + 1] === ":" || re[j + 1] === "." || re[j + 1] === "=")) {
-      const kind = re[j + 1];
-      const end = re.indexOf(`${kind}]`, j + 2);
-      if (end < 0) throw new Error(`unterminated [${kind} in ${re}`);
-      const name = re.slice(j + 2, end);
-      if (kind === ":") {
-        const cls = CLASSES[name];
-        if (cls === undefined) throw new Error(`unknown character class ${name}`);
-        out += cls;
-      } else {
-        out += classChar(name);
-      }
-      j = end + 2;
-      continue;
-    }
-    // a range: "-" between two characters
-    if (ch === "-" && re[j + 1] !== "]" && out !== "[" && out !== "[^") {
-      out += "-";
-      j++;
-      continue;
-    }
-    out += classChar(ch);
-    j++;
-  }
-  throw new Error(`unterminated bracket expression in ${re}`);
-}
-
 /**
- * A POSIX regular expression (extended, or basic with GNU extensions) as a JavaScript one,
- * to run with the `s` flag on a latin1 view of bytes.
+ * The funcname patterns of the builtin diff drivers of git 2.43 and 2.44, before `csharp`
+ * changed (2.45), `bash` changed and `ini` came (2.50), `r` came (2.51), `scheme` changed
+ * (2.55) and `swift` came (2.56); without a driver of their own, `ini`, `r` and `swift` get
+ * the default function lines.
  */
-export function posixToJsRegExp(re: string, basic = false): string {
-  let out = "";
-  let i = 0;
-  // whether a "*" here is literal (start of a basic expression or group)
-  let atStart = true;
-  while (i < re.length) {
-    const ch = re[i];
-    if (ch === "[") {
-      const [cls, end] = bracket(re, i);
-      out += cls;
-      i = end;
-      atStart = false;
-      continue;
-    }
-    if (ch === "\\" && i + 1 < re.length) {
-      const c = re[i + 1];
-      i += 2;
-      if (basic && "(){}|+?".includes(c)) {
-        out += c;
-        atStart = c === "(" || c === "|";
-        continue;
-      }
-      if ("wWsSbB".includes(c)) out += `\\${c}`;
-      else if (c === "<") out += "\\b(?=\\w)";
-      else if (c === ">") out += "\\b(?<=\\w)";
-      else if (c === "`") out += "^";
-      else if (c === "'") out += "$";
-      else out += literal(c);
-      atStart = false;
-      continue;
-    }
-    if (basic) {
-      if ("(){}|+?".includes(ch)) out += literal(ch);
-      else if (ch === "*" && atStart) out += "\\*";
-      else out += ch === "/" ? "\\/" : ch;
-      atStart = ch === "^" && atStart;
-      i++;
-      continue;
-    }
-    out += ch === "/" ? "\\/" : ch;
-    atStart = ch === "(" || ch === "|";
-    i++;
-  }
-  return out;
-}
-
-interface CompiledFuncname {
-  re: RegExp;
-  negate: boolean;
-}
-
-/** Bytes as a string of one character per byte */
-function latin1(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 8192) {
-    s += String.fromCharCode(...bytes.subarray(i, i + 8192));
-  }
-  return s;
-}
+export const BUILTIN_FUNCNAME_PATTERNS_2_43: Readonly<Record<string, FuncnamePattern>> = (() => {
+  const { ini: _ini, r: _r, swift: _swift, ...kept } = BUILTIN_FUNCNAME_PATTERNS;
+  return {
+    ...kept,
+    bash: {
+      pattern:
+        "^[ \t]*(([a-zA-Z_][a-zA-Z0-9_]*[ \t]*\\([ \t]*\\))|(function[ \t]+[a-zA-Z_][a-zA-Z0-9_]*(([ \t]*\\([ \t]*\\))|([ \t]+)))[ \t]*(\\{|\\(\\(?|\\[\\[))",
+      icase: false,
+    },
+    csharp: {
+      pattern:
+        "!^[ \t]*(do|while|for|if|else|instanceof|new|return|switch|case|throw|catch|using)\n^[ \t]*(((static|public|internal|private|protected|new|virtual|sealed|override|unsafe|async)[ \t]+)*[][<>@.~_[:alnum:]]+[ \t]+[<>@._[:alnum:]]+[ \t]*\\(.*\\))[ \t]*$\n^[ \t]*(((static|public|internal|private|protected|new|virtual|sealed|override|unsafe)[ \t]+)*[][<>@.~_[:alnum:]]+[ \t]+[@._[:alnum:]]+)[ \t]*$\n^[ \t]*(((static|public|internal|private|protected|new|unsafe|sealed|abstract|partial)[ \t]+)*(class|enum|interface|struct|record)[ \t]+.*)$\n^[ \t]*(namespace[ \t]+.*)$",
+      icase: false,
+    },
+    scheme: {
+      pattern:
+        "^[\t ]*(\\(((define|def(struct|syntax|class|method|rules|record|proto|alias)?)[-*/ \t]|(library|module|struct|class)[*+ \t]).*)$",
+      icase: false,
+    },
+  };
+})();
 
 /**
  * The function line finder of a funcname pattern (`xdiff_set_find_func` and `ff_regexp` of
- * git).
+ * git). Throws, as git dies, when an expression does not compile ("Invalid regexp to look
+ * for hunk header") or the last one is negated.
  */
 export function funcnameFindFunction(pattern: FuncnamePattern): FindFunction {
   const lines = pattern.pattern.split("\n");
-  const compiled: CompiledFuncname[] = lines.map((line, k) => {
+  const compiled = lines.map((line, k) => {
     const negate = line.startsWith("!");
     if (negate && k === lines.length - 1) {
       throw new Error(`Last expression must not be negated: ${line}`);
     }
-    const source = posixToJsRegExp(negate ? line.slice(1) : line, pattern.basic);
-    return { re: new RegExp(source, pattern.icase ? "dsi" : "ds"), negate };
+    const expression = negate ? line.slice(1) : line;
+    try {
+      const re = compilePosixRegex(expression, {
+        extended: !pattern.basic,
+        icase: pattern.icase ?? false,
+      });
+      return { re, negate };
+    } catch (e) {
+      if (e instanceof PosixRegexError) {
+        throw new Error(`Invalid regexp to look for hunk header: ${expression}`);
+      }
+      throw e;
+    }
   });
   return (line) => {
-    const text = latin1(line);
     for (const { re, negate } of compiled) {
-      const m = re.exec(text);
+      // negated expressions only need to know whether they match
+      const m = re.exec(line, line.length, negate ? 1 : 2);
       if (!m) continue;
       if (negate) return undefined;
-      const group = m.indices?.[1];
+      const group = m.groups[0];
       if (group) return [group[0], group[1]];
-      return [m.index, m.index + m[0].length];
+      return [m.start, m.end];
     }
     return undefined;
   };
 }
 
+/** Compiled builtin patterns, shared by every lookup */
+const compiledBuiltins = new WeakMap<FuncnamePattern, FindFunction>();
+
 /**
  * The function line finder of a diff driver: `diff.<name>.xfuncname` or `diff.<name>.funcname`
- * from `config` when set, else the builtin driver's pattern; undefined when neither exists
- * (the default then applies: lines starting with a letter, `_` or `$`).
+ * from `config` when set, else the builtin driver's pattern (from `builtins`, default git
+ * 2.56's {@link BUILTIN_FUNCNAME_PATTERNS}); undefined when neither exists (the default then
+ * applies: lines starting with a letter, `_` or `$`).
  */
 export function userdiffFindFunction(
   name: string,
   config?: (key: string) => string | undefined,
+  builtins: Readonly<Record<string, FuncnamePattern>> = BUILTIN_FUNCNAME_PATTERNS,
 ): FindFunction | undefined {
   const xfuncname = config?.(`diff.${name}.xfuncname`);
   if (xfuncname !== undefined) return funcnameFindFunction({ pattern: xfuncname });
   const funcname = config?.(`diff.${name}.funcname`);
   if (funcname !== undefined) return funcnameFindFunction({ pattern: funcname, basic: true });
-  const builtin = BUILTIN_FUNCNAME_PATTERNS[name];
-  return builtin ? funcnameFindFunction(builtin) : undefined;
+  const builtin = Object.hasOwn(builtins, name) ? builtins[name] : undefined;
+  if (!builtin) return undefined;
+  let found = compiledBuiltins.get(builtin);
+  if (!found) {
+    found = funcnameFindFunction(builtin);
+    compiledBuiltins.set(builtin, found);
+  }
+  return found;
 }

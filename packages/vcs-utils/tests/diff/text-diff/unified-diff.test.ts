@@ -5,13 +5,13 @@ import { describe, expect, it } from "vitest";
 import {
   ByteLines,
   diffLineCounts,
-  posixToJsRegExp,
   type UnifiedDiffOptions,
   unifiedDiff,
   userdiffFindFunction,
   xdiff,
   xdiffHunks,
 } from "../../../src/diff/text-diff/index.js";
+import { compilePosixRegex } from "../../../src/regex/index.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -86,8 +86,11 @@ describe("unifiedDiff (git diff --no-index bodies)", () => {
     expect(xdiffHunks(a, b)).toEqual(xdiff(new ByteLines(a), new ByteLines(b)));
   });
 
-  it("translates POSIX bracket expressions", () => {
-    expect(posixToJsRegExp("^[[:alpha:]_][^]]*$")).toBe("^[A-Za-z_][^\\]]*$");
-    expect(new RegExp(posixToJsRegExp("[][[:alnum:]]+"), "s").exec("x[a]")?.[0]).toBe("x[a]");
+  it("matches POSIX bracket expressions", () => {
+    const m = compilePosixRegex("[][[:alnum:]]+", { extended: true }).exec(enc.encode("x[a]"));
+    expect(m && [m.start, m.end]).toEqual([0, 4]);
+    expect(
+      compilePosixRegex("^[[:alpha:]_][^]]*$", { extended: true }).test(enc.encode("a]")),
+    ).toBe(false);
   });
 });

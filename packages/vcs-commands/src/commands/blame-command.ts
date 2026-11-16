@@ -16,6 +16,7 @@ import {
   detectRenames,
   GIT_MAX_SCORE,
 } from "../rename/index.js";
+import { abbrevLengths } from "./core-config.js";
 
 /**
  * A single blame entry - represents authorship of one or more consecutive lines.
@@ -119,6 +120,13 @@ export interface BlameResult {
    * @returns Array of LineTracking objects ordered by result line number
    */
   getLineTracking(): LineTracking[];
+  /**
+   * The length git's default output abbreviates the commits to before room for boundary
+   * marks (`update_auto_abbrev`): the longest of their unique abbreviations, from
+   * `core.abbrev` (auto: from the repository's approximate object count). Pass it to
+   * `formatBlame` as `autoAbbrev`.
+   */
+  autoAbbrev?(): Promise<number>;
 }
 
 /** A version of the file in a commit (`struct blame_origin`) */
@@ -517,7 +525,16 @@ export class BlameCommand extends GitCommand<BlameResult> {
         boundary: st.uninteresting,
       });
     }
-    return createBlameResult(resultPath, lineCount, entries, content);
+    const result = createBlameResult(resultPath, lineCount, entries, content);
+    const workingCopy = this.workingCopy;
+    result.autoAbbrev = async () => {
+      const lengths = await abbrevLengths(
+        workingCopy,
+        entries.map((e) => e.commitId),
+      );
+      return lengths.size > 0 ? Math.max(...lengths.values()) : 7;
+    };
+    return result;
   }
 
   /** The -L ranges as 0-based half-open ranges, sorted and merged; the whole file otherwise */

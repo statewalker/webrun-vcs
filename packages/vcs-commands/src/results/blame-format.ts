@@ -41,8 +41,13 @@ export interface BlameFormatOptions {
   noAuthor?: boolean;
   /** Blank object ids for boundary commits (`-b`, `blame.blankBoundary`) */
   blankBoundary?: boolean;
-  /** Abbreviated id length (`--abbrev`, default 7) */
+  /** Abbreviated id length (`--abbrev`); unset, the automatic length (`autoAbbrev`) */
   abbrev?: number;
+  /**
+   * The automatic length git finds without `--abbrev` (`BlameResult.autoAbbrev()`: the
+   * commits' unique abbreviations, from `core.abbrev`); default 7
+   */
+  autoAbbrev?: number;
   /**
    * One more hex digit always (room for a `^`), as git before 2.5x printed; newer git adds
    * it only when a boundary commit is shown (default false)
@@ -185,9 +190,15 @@ export function formatBlame(result: BlameResult, options: BlameFormatOptions = {
   }
   const maxOrigDigits = String(longestSrc).length;
   const maxDigits = String(longestDst).length;
-  let abbrev = options.abbrev ?? 7;
-  if (options.alwaysWidenAbbrev && options.abbrev === undefined) abbrev += 1;
-  else if (abbrev < 40) abbrev = Math.min(40, abbrev + maxMarks);
+  // git 2.5x widens by the marks shown (a "^"); older git always by one (`--abbrev=0` and
+  // a full automatic length aside)
+  const auto = options.abbrev === undefined;
+  let abbrev = auto ? (options.autoAbbrev ?? 7) : options.abbrev || 40;
+  if (!options.alwaysWidenAbbrev) {
+    if (abbrev < 40) abbrev = Math.min(40, abbrev + maxMarks);
+  } else if (auto || abbrev < 40) {
+    abbrev += 1;
+  }
 
   const sink = new ByteSink();
   for (const e of entries) {

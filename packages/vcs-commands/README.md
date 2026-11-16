@@ -172,7 +172,11 @@ process.stdout.write(formatBlame(blame));
 
 `callText()` prints the patch, `--stat`, `--numstat`, `--shortstat`, `--name-only` or `--name-status` byte for byte as `git diff` does: `diff --git` headers with mode, rename and `index` lines, quoted paths, "Binary files ... differ", hunks from git's xdiff with function lines (default and `diff=<driver>` builtin patterns), renames (`diff.renames`), and the configuration `git diff` reads (`diff.algorithm`, `diff.indentHeuristic`, `diff.context`, `core.quotePath`, ...). Without trees it compares the index with the worktree (`git diff`); with only an old tree, that tree with the worktree. `formatNoIndexDiff` prints `git diff --no-index` for two files. `call()` still returns the changed paths, with renames only on `setRenames(true)`.
 
-`blame()` runs git's blame algorithm: commits newest first, lines passed to the parents through the same xdiff diff, whole-file renames followed (`setFollowRenames(false)` is `--no-follow`), root commits as boundaries unless `setShowRoot(true)`, `-w` and `-L` ranges. `-M`/`-C`, `--reverse` and ignored revisions are not supported.
+A conflicted path is shown as `git diff` shows it: the combined diff of "ours" and "theirs" against the worktree file (`diff --cc`) in the patch, an unmerged entry and stage 2 against the worktree in the other formats, and the plain worktree file against a tree (`git diff A`). A submodule with tracked changes inside reads `Subproject commit <id>-dirty`. Ids are abbreviated as git abbreviates them (`core.abbrev`, the number of packed objects, and lengthened while another object shares the prefix). A revision that names nothing throws, as git refuses it.
+
+`blame()` runs git's blame algorithm: commits newest first, lines passed to the parents through the same xdiff diff, whole-file renames followed (`setFollowRenames(false)` is `--no-follow`), root commits as boundaries unless `setShowRoot(true)`, `-w` and `-L` ranges. `-M`/`-C`, `--reverse` and ignored revisions are not supported. For git's id width in the default output, pass `formatBlame(blame, { autoAbbrev: await blame.autoAbbrev?.() })`.
+
+Remaining differences from `git diff`: paths that are not valid UTF-8 are not supported (paths are strings in core and the stores), and `diff.noprefix`, `diff.mnemonicPrefix`, `diff.orderFile`, textconv drivers and `submodule.<name>.ignore` are not read.
 
 ### Big and binary files in diff, merge and blame
 

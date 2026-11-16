@@ -287,10 +287,11 @@ describeGit("git blame against native git", () => {
         // git before 2.5x blamed with myers whatever --diff-algorithm and diff.algorithm say
         if (!atLeast(2, 50)) cmd.setAlgorithm("myers");
         const result = await cmd.call();
+        const autoAbbrev = await result.autoAbbrev?.();
         const formats: Array<[string[], Uint8Array]> = [
           [["--porcelain"], formatBlamePorcelain(result)],
           [["--line-porcelain"], formatBlamePorcelain(result, { linePorcelain: true })],
-          [[], formatBlame(result, { alwaysWidenAbbrev })],
+          [[], formatBlame(result, { alwaysWidenAbbrev, autoAbbrev })],
           [
             ["-n", "-f", "-e"],
             formatBlame(result, {
@@ -298,6 +299,7 @@ describeGit("git blame against native git", () => {
               showName: true,
               showEmail: true,
               alwaysWidenAbbrev,
+              autoAbbrev,
             }),
           ],
         ];

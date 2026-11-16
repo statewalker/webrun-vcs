@@ -201,6 +201,16 @@ const body = unifiedDiff(before, after, {
 
 `xdiff` gives the changes themselves, `diffLineCounts` the added and deleted lines of the diffstat, and `xdiffHunks` the changes `git blame` compares with.
 
+Diff drivers' patterns are POSIX regular expressions that git hands to glibc, and `compilePosixRegex` matches them the same way, on bytes: the leftmost and then longest match (`^(a|ab)` takes `ab`), subexpressions placed as glibc places them, back-references, `a{,2}`, `\s` without byte 0xA0, case folding of ASCII letters only, and the same patterns refused. It runs in time linear in the subject for patterns without back-references, where a backtracking `RegExp` can take exponential time:
+
+```typescript
+import { compilePosixRegex } from "@statewalker/vcs-utils";
+
+const re = compilePosixRegex("^[ \t]*(def|class)[ \t]+([A-Za-z_]+)", { extended: true });
+const m = re.exec(new TextEncoder().encode("  def parse(self):"));
+// { start: 0, end: 11, groups: [[2, 5], [6, 11]] }
+```
+
 Before diffing, check whether the content is binary. Git calls content binary when a NUL byte appears in its first 8000 bytes, and `RawText.isBinary` looks at those bytes only (`RawText.BINARY_PROBE_LENGTH`), so a prefix is enough:
 
 ```typescript

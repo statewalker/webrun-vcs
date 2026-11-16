@@ -96,10 +96,11 @@ export function diffEntryToPair(entry: DiffEntry, blobs: Blobs): DiffFilePair {
     mode: number | undefined,
     id: string | undefined,
     read: (() => Promise<Uint8Array>) | undefined,
+    idValid = false,
   ): DiffSideSpec | undefined => {
     if (path === undefined || id === undefined) return undefined;
     const m = mode ?? 0o100644;
-    return read ? contentSide(path, m, id, read) : blobSide(blobs, path, m, id);
+    return read ? contentSide(path, m, id, read, idValid) : blobSide(blobs, path, m, id);
   };
   const status =
     entry.changeType === ChangeType.ADD
@@ -124,7 +125,13 @@ export function diffEntryToPair(entry: DiffEntry, blobs: Blobs): DiffFilePair {
     new:
       status === "D"
         ? undefined
-        : side(entry.newPath ?? entry.oldPath, entry.newMode, entry.newId, entry.readNew),
+        : side(
+            entry.newPath ?? entry.oldPath,
+            entry.newMode,
+            entry.newId,
+            entry.readNew,
+            entry.newDirtySubmodule === true,
+          ),
     ...(entry.score !== undefined ? { score: entry.score } : {}),
   };
 }
