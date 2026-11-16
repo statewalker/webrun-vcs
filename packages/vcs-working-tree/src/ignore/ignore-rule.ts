@@ -543,7 +543,9 @@ class NameMatcher implements IMatcher {
           return true; // Has children, so it's a directory
         }
 
-        // For pathMatch, we need exact match - but this is nameOnly so match anywhere
+        // pathMatch: the pattern names the path itself (its last component), as git
+        // matches it; directories above are the caller's to check
+        if (pathMatch) return isLastSegment;
         return true;
       }
     }
@@ -578,12 +580,12 @@ class NameMatcher implements IMatcher {
           }
           return assumeDirectory;
         }
-        // Has more segments, so it's definitely a directory
-        return true;
+        // Has more segments, so it's definitely a directory (pathMatch: not the path itself)
+        return !pathMatch;
       }
 
-      // Regular match at root
-      return true;
+      // Regular match at root (pathMatch: the path itself, a single component)
+      return !pathMatch || segments.length === 1;
     }
 
     // Non-anchored simple pattern - shouldn't reach here for nameOnly=false
@@ -620,7 +622,7 @@ class WildCardMatcher implements IMatcher {
     return this.regex.test(toMatch);
   }
 
-  matchesPath(path: string, assumeDirectory: boolean, _pathMatch: boolean): boolean {
+  matchesPath(path: string, assumeDirectory: boolean, pathMatch: boolean): boolean {
     // Normalize path (remove leading /)
     let p = path;
     if (p.startsWith(PATH_SEPARATOR)) {
@@ -630,6 +632,18 @@ class WildCardMatcher implements IMatcher {
     const segments = p.split(PATH_SEPARATOR).filter((s) => s.length > 0);
     if (segments.length === 0) {
       return false;
+    }
+
+    // git matches a pattern against the path itself: a name-only pattern against its last
+    // component, an anchored one-component pattern against a path of one component, a
+    // directory-only pattern only against a directory. Directories above the path are the
+    // caller's to check (a path inside an excluded directory is excluded; a negated
+    // directory pattern re-includes the directory, never the files below it).
+    if (pathMatch) {
+      if (this.beginning && segments.length !== 1) return false;
+      const last = segments[segments.length - 1];
+      if (!this.regex.test(last)) return false;
+      return !this.dirOnly || assumeDirectory;
     }
 
     // If anchored (starts with /), only match first segment
@@ -674,7 +688,7 @@ class LeadingAsteriskMatcher implements IMatcher {
     return toMatch.endsWith(this.suffix);
   }
 
-  matchesPath(path: string, assumeDirectory: boolean, _pathMatch: boolean): boolean {
+  matchesPath(path: string, assumeDirectory: boolean, pathMatch: boolean): boolean {
     // Normalize path (remove leading /)
     let p = path;
     if (p.startsWith(PATH_SEPARATOR)) {
@@ -684,6 +698,18 @@ class LeadingAsteriskMatcher implements IMatcher {
     const segments = p.split(PATH_SEPARATOR).filter((s) => s.length > 0);
     if (segments.length === 0) {
       return false;
+    }
+
+    // git matches a pattern against the path itself: a name-only pattern against its last
+    // component, an anchored one-component pattern against a path of one component, a
+    // directory-only pattern only against a directory. Directories above the path are the
+    // caller's to check (a path inside an excluded directory is excluded; a negated
+    // directory pattern re-includes the directory, never the files below it).
+    if (pathMatch) {
+      if (this.beginning && segments.length !== 1) return false;
+      const last = segments[segments.length - 1];
+      if (!last.endsWith(this.suffix)) return false;
+      return !this.dirOnly || assumeDirectory;
     }
 
     // If anchored (starts with /), only match first segment
@@ -728,7 +754,7 @@ class TrailingAsteriskMatcher implements IMatcher {
     return toMatch.startsWith(this.prefix);
   }
 
-  matchesPath(path: string, assumeDirectory: boolean, _pathMatch: boolean): boolean {
+  matchesPath(path: string, assumeDirectory: boolean, pathMatch: boolean): boolean {
     // Normalize path (remove leading /)
     let p = path;
     if (p.startsWith(PATH_SEPARATOR)) {
@@ -738,6 +764,18 @@ class TrailingAsteriskMatcher implements IMatcher {
     const segments = p.split(PATH_SEPARATOR).filter((s) => s.length > 0);
     if (segments.length === 0) {
       return false;
+    }
+
+    // git matches a pattern against the path itself: a name-only pattern against its last
+    // component, an anchored one-component pattern against a path of one component, a
+    // directory-only pattern only against a directory. Directories above the path are the
+    // caller's to check (a path inside an excluded directory is excluded; a negated
+    // directory pattern re-includes the directory, never the files below it).
+    if (pathMatch) {
+      if (this.beginning && segments.length !== 1) return false;
+      const last = segments[segments.length - 1];
+      if (!last.startsWith(this.prefix)) return false;
+      return !this.dirOnly || assumeDirectory;
     }
 
     // If anchored (starts with /), only match first segment
