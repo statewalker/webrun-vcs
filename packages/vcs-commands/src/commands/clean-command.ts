@@ -57,6 +57,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
   private dryRun = true; // Default to dry-run for safety
   private directories = false;
   private ignore = true; // Respect .gitignore
+  private ignoredOnly = false;
   private forceNested = false;
 
   /**
@@ -111,6 +112,19 @@ export class CleanCommand extends GitCommand<CleanResult> {
   }
 
   /**
+   * Set whether to remove only the files the ignore rules exclude (`git clean -X`),
+   * keeping untracked files that are not ignored. Off by default; it takes precedence over
+   * {@link setIgnore}.
+   *
+   * @param ignoredOnly Whether to remove only ignored files
+   */
+  setIgnoredOnly(ignoredOnly: boolean): this {
+    this.checkCallable();
+    this.ignoredOnly = ignoredOnly;
+    return this;
+  }
+
+  /**
    * Set whether nested repositories (untracked directories with their own `.git`) are
    * removed too, as `git clean -ff`. Off by default: they are skipped, as `git clean -f`
    * skips them, and listed in `skipped`.
@@ -125,8 +139,8 @@ export class CleanCommand extends GitCommand<CleanResult> {
 
   /**
    * Execute the clean command, as `git clean -f` (`-d` with `setCleanDirectories(true)`,
-   * `-x` with `setIgnore(false)`, `-ff` with `setForceNestedRepositories(true)`, `-n` with
-   * dry run):
+   * `-x` with `setIgnore(false)`, `-X` with `setIgnoredOnly(true)`, `-ff` with
+   * `setForceNestedRepositories(true)`, `-n` with dry run):
    * - only files the index does not track are removed, one at a time;
    * - an untracked directory (one holding no tracked or staged path) is entered only with
    *   `-d` or a path filter; with `-d` it is removed once empty, deepest first and never
@@ -179,7 +193,190 @@ export class CleanCommand extends GitCommand<CleanResult> {
     return false;
   }
 
+  /**
+   * `git clean -X`: only what the ignore rules exclude goes, as git's `read_directory` with
+   * `DIR_SHOW_IGNORED` finds it. Untracked directories are entered for the ignored files in
+   * them; a directory that is ignored itself, or holds only ignored content (an empty
+   * directory is untracked content; a nested repository is invisible without `-ff` and
+   * untracked content with it), is one entry, removed with `-d` or when a path filter
+   * matches it, whole as `git clean` removes directories (nested repositories inside kept
+   * without `-ff`). A path filter that could match below such a directory enters it.
+   */
+  private async cleanIgnored(worktree: Worktree): Promise<CleanResult> {
+    const tracked = new Set<string>();
+    for await (const entry of this.staging.entries()) tracked.add(entry.path);
+    const trackedDirs = directoriesOf(tracked);
+    const root: CleanNode = {
+      path: "",
+      directory: true,
+      ignored: false,
+      repository: false,
+      children: [],
+    };
+    const nodes = new Map<string, CleanNode>([["", root]]);
+    const parentOf = (path: string) => nodes.get(path.slice(0, Math.max(0, path.lastIndexOf("/"))));
+    const load = async (pathPrefix?: string) => {
+      for await (const entry of worktree.walk({
+        includeIgnored: true,
+        includeDirectories: true,
+        ...(pathPrefix ? { pathPrefix } : {}),
+      })) {
+        const parent = parentOf(entry.path);
+        // inside a submodule, a nested repository or a file path: not ours to look at
+        if (!parent?.directory || parent.repository) continue;
+        if (tracked.has(entry.path)) continue;
+        const node: CleanNode = {
+          path: entry.path,
+          directory: entry.isDirectory,
+          ignored: entry.isIgnored === true,
+          repository: false,
+          children: [],
+        };
+        if (entry.isDirectory && entry.mode === FileMode.GITLINK) {
+          node.repository = worktree.isRepository ? await worktree.isRepository(entry.path) : true;
+        }
+        parent.children.push(node);
+        nodes.set(entry.path, node);
+        // a `.git` that is no repository: an ordinary directory, whose content the walk
+        // did not enter
+        if (entry.isDirectory && entry.mode === FileMode.GITLINK && !node.repository) {
+          await load(entry.path);
+        }
+      }
+    };
+    await load();
+
+    const states = new Map<CleanNode, CleanState>();
+    const hasFiles = (node: CleanNode): boolean =>
+      node.children.some((c) => !c.directory || c.repository || hasFiles(c));
+    const state = (node: CleanNode): CleanState => {
+      const known = states.get(node);
+      if (known) return known;
+      let result: CleanState;
+      if (!node.directory) result = node.ignored ? "ignored" : "untracked";
+      else if (node.repository) {
+        // git skips nested repositories without -ff; with it they are untracked content
+        result = !this.forceNested ? "none" : node.ignored ? "ignored" : "untracked";
+      } else if (node.ignored) result = hasFiles(node) ? "ignored" : "none";
+      else {
+        const inside = node.children.map(state);
+        if (inside.includes("untracked") || !inside.includes("ignored")) result = "untracked";
+        else result = "ignored";
+      }
+      states.set(node, result);
+      return result;
+    };
+
+    const removeFiles: string[] = [];
+    const removeDirs: CleanNode[] = [];
+    const listDirs = this.directories || this.paths.size > 0;
+    const visit = (dir: CleanNode) => {
+      for (const child of dir.children) {
+        if (!child.directory) {
+          if (child.ignored && this.matchesPaths(child.path) && isValidWorktreePath(child.path)) {
+            removeFiles.push(child.path);
+          }
+          continue;
+        }
+        if (trackedDirs.has(child.path)) {
+          visit(child);
+          continue;
+        }
+        const st = state(child);
+        if (st === "untracked" && !child.repository) visit(child);
+        else if (st === "ignored") {
+          if (!child.ignored && !child.repository && this.pathspecBelow(child.path)) visit(child);
+          else if (listDirs && this.matchesDirectoryEntry(child.path)) removeDirs.push(child);
+        }
+      }
+    };
+    visit(root);
+
+    // git's remove_dirs: everything in the directory goes, nested repositories kept without
+    // -ff; a directory not wholly removed reports what went in it
+    const cleaned = new Set<string>();
+    const skipped = new Set<string>();
+    const files: string[] = [];
+    const wholes: string[] = [];
+    const dirs: string[] = [];
+    const remove = (node: CleanNode): boolean => {
+      if (node.repository) {
+        if (!this.forceNested) {
+          skipped.add(node.path);
+          return false;
+        }
+        wholes.push(node.path);
+        return true;
+      }
+      const dels: string[] = [];
+      let gone = true;
+      for (const child of node.children) {
+        if (child.directory) {
+          if (remove(child)) dels.push(child.path);
+          else gone = false;
+        } else {
+          files.push(child.path);
+          dels.push(child.path);
+        }
+      }
+      dirs.push(node.path);
+      if (!gone) for (const d of dels) cleaned.add(d);
+      return gone;
+    };
+    for (const path of removeFiles) cleaned.add(path);
+    for (const dir of removeDirs) if (remove(dir)) cleaned.add(`${dir.path}/`);
+
+    if (!this.dryRun) {
+      for (const path of [...removeFiles, ...files]) await worktree.remove(path);
+      for (const path of wholes) await worktree.remove(path, { recursive: true });
+      const deepestFirst = dirs.sort((a, b) => b.split("/").length - a.split("/").length);
+      for (const dir of deepestFirst) await removeDirectoryIfEmpty(worktree, dir);
+    }
+    return { cleaned, skipped, dryRun: this.dryRun };
+  }
+
+  /**
+   * Whether a requested path could match below `dir` (git's leading pathspec match): a
+   * plain path inside it, or a glob whose literal part leads into it or ends before it.
+   */
+  private pathspecBelow(dir: string): boolean {
+    for (const p of this.paths) {
+      const spec = p.replace(/\/+$/, "");
+      if (spec === "" || spec === ".") continue;
+      if (!/[*?[]/.test(spec)) {
+        if (spec.startsWith(`${dir}/`)) return true;
+        continue;
+      }
+      const glob = globToRegExp(spec);
+      if (glob.test(dir) || glob.test(`${dir}/`)) continue;
+      const literal = spec.slice(0, spec.search(/[*?[]/));
+      if (literal.startsWith(`${dir}/`) || `${dir}/`.startsWith(literal)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Whether a requested path matches a directory entry of `git clean -X`: no path filter, a
+   * plain path naming it, one of its ancestors or a path inside it, or a glob matching it
+   * (or whose literal part leads into it).
+   */
+  private matchesDirectoryEntry(dir: string): boolean {
+    if (this.paths.size === 0) return true;
+    if (this.matchesPaths(dir, true)) return true;
+    for (const p of this.paths) {
+      const spec = p.replace(/\/+$/, "");
+      if (!/[*?[]/.test(spec)) {
+        if (spec.startsWith(`${dir}/`)) return true;
+        continue;
+      }
+      const literal = spec.slice(0, spec.search(/[*?[]/));
+      if (literal.startsWith(`${dir}/`) || `${dir}/`.startsWith(literal)) return true;
+    }
+    return false;
+  }
+
   private async clean(worktree: Worktree): Promise<CleanResult> {
+    if (this.ignoredOnly) return this.cleanIgnored(worktree);
     // what the index tracks (any stage): git clean looks at the index, not at HEAD
     const tracked = new Set<string>();
     for await (const entry of this.staging.entries()) tracked.add(entry.path);
@@ -299,6 +496,20 @@ export class CleanCommand extends GitCommand<CleanResult> {
     return { cleaned, skipped, dryRun: this.dryRun };
   }
 }
+
+/** A worktree entry, as `git clean -X` sees it. */
+interface CleanNode {
+  path: string;
+  directory: boolean;
+  /** Excluded by the ignore rules itself */
+  ignored: boolean;
+  /** A nested repository (a directory with a `.git` that is one) */
+  repository: boolean;
+  children: CleanNode[];
+}
+
+/** How a directory counts to `git clean -X`: holding untracked content, only ignored, nothing. */
+type CleanState = "untracked" | "ignored" | "none";
 
 /** A pathspec glob as a regular expression over the whole path (`*` matches `/` too). */
 function globToRegExp(glob: string): RegExp {

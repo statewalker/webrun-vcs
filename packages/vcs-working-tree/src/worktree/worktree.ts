@@ -16,6 +16,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import type { WorkingCopy } from "../working-copy.js";
 import type { WorktreeEntry } from "./types.js";
 
 // Re-export types for consumers
@@ -165,6 +166,14 @@ export interface Worktree {
    * directory or `gitdir:` file; undefined when it is not populated or cannot be read.
    */
   readGitlinkHead?(path: string): Promise<ObjectId | undefined>;
+
+  /**
+   * The repository checked out in the submodule at `path`, opened as a working copy (its
+   * own HEAD, index, config and worktree), so its status can be read as git's
+   * `is_submodule_modified` reads it; undefined when it is not populated or its repository
+   * cannot be read here (beyond the storage's root).
+   */
+  openGitlink?(path: string): Promise<WorkingCopy | undefined>;
 
   /**
    * Whether the directory at `path` holds a repository of its own: a `.git` directory with

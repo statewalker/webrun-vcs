@@ -283,7 +283,7 @@ await git.reset().setRef(commitId).setMode(ResetMode.HARD).call();
 await git.reset().addPath("path/to/file").call(); // unstage one path
 ```
 
-`git.clean()` removes untracked files from the worktree. Its options are `setDryRun(bool)`, `setCleanDirectories(bool)`, `setIgnore(bool)` and `setPaths(set)`. The step only describes it, since the in-memory worktree has no untracked files.
+`git.clean()` removes untracked files from the worktree. Its options are `setDryRun(bool)`, `setCleanDirectories(bool)`, `setIgnore(bool)` (`-x`), `setIgnoredOnly(bool)` (`-X`) and `setPaths(set)`. The step only describes it, since the in-memory worktree has no untracked files.
 
 **Key APIs:**
 - `git.reset().setRef(ref).setMode(ResetMode.SOFT | MIXED | HARD | KEEP).call()`

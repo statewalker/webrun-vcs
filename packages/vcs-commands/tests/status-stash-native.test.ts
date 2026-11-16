@@ -58,15 +58,7 @@ const exec = (cwd: string, ...args: string[]) =>
   });
 const run = (cwd: string, ...args: string[]) => exec(cwd, ...args).trim();
 const nativeStatus = (dir: string, version: 1 | 2, ...extra: string[]) =>
-  exec(
-    dir,
-    "-c",
-    "status.renames=false",
-    "status",
-    `--porcelain=v${version}`,
-    "--untracked-files=all",
-    ...extra,
-  );
+  exec(dir, "status", `--porcelain=v${version}`, "--untracked-files=all", ...extra);
 const put = (dir: string, path: string, content: string) => {
   mkdirSync(join(dir, path, ".."), { recursive: true });
   writeFileSync(join(dir, path), content);
@@ -1105,7 +1097,7 @@ describeGit("status against native git (review cases)", () => {
     );
   });
 
-  it("a submodule moved to another commit (its dirty content is not inspected)", async () => {
+  it("a submodule moved to another commit, and one with dirty content", async () => {
     const sub = (d: string) => {
       nestedRepo(d, "sub");
       run(d, "add", "sub");
@@ -1118,14 +1110,13 @@ describeGit("status against native git (review cases)", () => {
         run(join(d, "sub"), "commit", "-qam", "x");
       }),
     );
-    // a submodule whose own worktree is dirty: git reports ` M sub` (`S.M.` / `S..U`); we
-    // do not read the submodule's index, so it is clean here
+    // a submodule whose own worktree is dirty: git reports ` M sub` (`S.M.`), as we do
     const dirty = at("submodule-dirty", (d) => {
       sub(d);
       put(join(d, "sub"), "inner.txt", "changed\n");
     });
-    const { ours } = await open(dirty);
-    expect(formatStatusPorcelain(await ours.status().call())).toBe("");
+    const status = await expectStatusAsNative(dirty);
+    expect(status.modified).toEqual(new Set(["sub"]));
   });
 
   it("deleted by both (DD), ignored directory files, quoted paths", async () => {
@@ -1242,7 +1233,7 @@ describeGit("status and stash refresh the index (review cases)", () => {
 async function twinClean(
   name: string,
   setup: (dir: string) => void,
-  flags: { d?: boolean; x?: boolean; ff?: boolean; paths?: string[] } = {},
+  flags: { d?: boolean; x?: boolean; X?: boolean; ff?: boolean; paths?: string[] } = {},
 ) {
   const n = join(root, `${name}-n`);
   const o = join(root, `${name}-o`);
@@ -1252,6 +1243,7 @@ async function twinClean(
   const args = ["clean", flags.ff ? "-ff" : "-f"];
   if (flags.d) args.push("-d");
   if (flags.x) args.push("-x");
+  if (flags.X) args.push("-X");
   const paths = flags.paths ? ["--", ...flags.paths] : [];
   const lines = exec(n, ...args, "-n", ...paths)
     .split("\n")
@@ -1270,6 +1262,7 @@ async function twinClean(
       .clean()
       .setCleanDirectories(flags.d === true)
       .setIgnore(flags.x !== true)
+      .setIgnoredOnly(flags.X === true)
       .setForceNestedRepositories(flags.ff === true)
       .setPaths(new Set(flags.paths ?? []))
       .setDryRun(dryRun)

@@ -16,7 +16,12 @@ import type {
   StagingEntry,
   StagingEntryOptions,
 } from "@statewalker/vcs-working-tree";
-import { MergeStage } from "@statewalker/vcs-working-tree";
+import {
+  EntriesAsRead,
+  MergeStage,
+  type RacyCheck,
+  smudgeRacilyClean,
+} from "@statewalker/vcs-working-tree";
 import type { KVStore } from "./kv-store.js";
 
 /**
@@ -82,6 +87,9 @@ function comparePaths(a: string, b: string): number {
  */
 export class KVStaging implements Staging {
   private updateTime: number = Date.now();
+  private racyCheck?: RacyCheck;
+  /** The entries as last read or written: only these are checked for smudging */
+  private readonly asRead = new EntriesAsRead();
 
   constructor(private kv: KVStore) {}
 
@@ -416,13 +424,25 @@ export class KVStaging implements Staging {
   // ============ Persistence ============
 
   async read(): Promise<void> {
-    // For KV, data is already persistent
-    this.updateTime = Date.now();
+    // the time of the last write, stored with the entries (git: the index file's mtime)
+    this.updateTime = (await this.storedUpdateTime()) ?? Date.now();
+    await this.rememberEntries();
   }
 
   async write(): Promise<void> {
-    // For KV, data is already persistent
-    this.updateTime = Date.now();
+    // the entries are stored as they are edited; a write smudges racily clean ones (git)
+    const entries: StagingEntry[] = [];
+    for await (const entry of this.listEntries()) entries.push(entry);
+    const smudged = await this._smudge(entries);
+    for (let i = 0; i < smudged.length; i++) {
+      if (smudged[i] === entries[i]) continue;
+      await this.kv.set(
+        entryKey(smudged[i].path, smudged[i].stage),
+        encoder.encode(JSON.stringify(serializeEntry(smudged[i]))),
+      );
+    }
+    await this.rememberEntries(smudged);
+    await this._written();
   }
 
   async isOutdated(): Promise<boolean> {
@@ -436,6 +456,51 @@ export class KVStaging implements Staging {
   /** @internal */
   _setUpdateTime(time: number): void {
     this.updateTime = time;
+  }
+
+  /**
+   * Sets the check every write applies to racily clean entries (git's smudging): an entry
+   * kept from before the write, whose mtime second is not older than the last write and
+   * whose content changed behind a matching stat, is stored with size 0.
+   */
+  setRacyCheck(check: RacyCheck | undefined): void {
+    this.racyCheck = check;
+  }
+
+  /**
+   * @internal - Used by builder/editor: `entries`, smudged where racily clean and changed
+   * if they are as the store was last read or written.
+   */
+  async _smudge(entries: StagingEntry[]): Promise<StagingEntry[]> {
+    return smudgeRacilyClean(entries, this.updateTime, this.racyCheck, (e) => this.asRead.has(e));
+  }
+
+  /** Remembers the entries as they are now (after a read or an explicit write). */
+  private async rememberEntries(entries?: StagingEntry[]): Promise<void> {
+    const list = entries ?? [];
+    if (!entries) for await (const entry of this.listEntries()) list.push(entry);
+    this.asRead.remember(list);
+  }
+
+  /** @internal - Used by builder/editor: records the time of this write with the entries. */
+  async _written(): Promise<void> {
+    this.updateTime = Date.now();
+    await this.kv.set(
+      STAGING_META_KEY,
+      encoder.encode(JSON.stringify({ updateTime: this.updateTime })),
+    );
+  }
+
+  /** The time of the last write, as stored; undefined when none was. */
+  private async storedUpdateTime(): Promise<number | undefined> {
+    const data = await this.kv.get(STAGING_META_KEY);
+    if (!data) return undefined;
+    try {
+      const time = JSON.parse(decoder.decode(data))?.updateTime;
+      return typeof time === "number" && Number.isFinite(time) ? time : undefined;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -587,6 +652,9 @@ class KVIndexBuilder implements IndexBuilder {
     // Validate stage constraints
     this.validateStages();
 
+    // entries kept from before this write are smudged when racily clean (git)
+    this.entries = await this.store._smudge(this.entries);
+
     // Clear and rewrite all entries
     await this.store.clear();
 
@@ -598,7 +666,7 @@ class KVIndexBuilder implements IndexBuilder {
       );
     }
 
-    this.store._setUpdateTime(Date.now());
+    await this.store._written();
   }
 
   private validateStages(): void {
@@ -711,10 +779,13 @@ class KVIndexEditor implements IndexEditor {
       }
     }
 
+    // entries kept from before this write are smudged when racily clean (git)
+    const written = await this.store._smudge(newEntries);
+
     // Clear and rewrite all entries
     await this.store.clear();
 
-    for (const entry of newEntries) {
+    for (const entry of written) {
       const serialized = serializeEntry(entry);
       await this.kv.set(
         entryKey(entry.path, entry.stage),
@@ -722,7 +793,7 @@ class KVIndexEditor implements IndexEditor {
       );
     }
 
-    this.store._setUpdateTime(Date.now());
+    await this.store._written();
   }
 
   private applyConflictResolution(

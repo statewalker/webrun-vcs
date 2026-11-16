@@ -154,3 +154,32 @@ export async function refreshIndexFile(
     return undefined;
   }
 }
+
+/**
+ * The entries of a staging store as it was last read or written (git: the entries not
+ * `CE_UPTODATE`), by path, stage, object, mode, size and mtime: only these are checked when
+ * the store is written again, so an entry set in this session is never smudged.
+ *
+ * @example
+ * ```typescript
+ * const asRead = new EntriesAsRead();
+ * asRead.remember(entries); // after a read or a write
+ * await smudgeRacilyClean(next, indexTime, check, (e) => asRead.has(e));
+ * ```
+ */
+export class EntriesAsRead {
+  private readonly known = new Map<string, string>();
+
+  /** Replaces what is remembered with `entries`. */
+  remember(entries: Iterable<StagingEntry>): void {
+    this.known.clear();
+    for (const e of entries) this.known.set(`${e.path}\0${e.stage}`, signature(e));
+  }
+
+  /** Whether `entry` is as it was last read or written. */
+  has(entry: StagingEntry): boolean {
+    return this.known.get(`${entry.path}\0${entry.stage}`) === signature(entry);
+  }
+}
+
+const signature = (e: StagingEntry) => `${e.objectId}:${e.mode}:${e.size}:${ms(e.mtime)}`;

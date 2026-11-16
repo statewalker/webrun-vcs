@@ -41,7 +41,16 @@ import type {
   WorktreeWalkOptions,
   WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
-import { createIgnoreManager, hashWorktreeFile } from "@statewalker/vcs-working-tree";
+import {
+  createIgnoreManager,
+  hashWorktreeFile,
+  MemoryCheckout,
+  MemoryWorkingCopy,
+  type WorkingCopy,
+} from "@statewalker/vcs-working-tree";
+import { createGitFilesBackend } from "../../create-git-files-backend.js";
+import { FileStagingStore } from "../staging/index.js";
+import { createWorkingCopyConfig } from "../working-copy/index.js";
 import { type CaseFolding, probeCaseFolding } from "./probe-case-folding.js";
 
 /**
@@ -565,25 +574,58 @@ export class FileWorktree implements Worktree {
     return this.files.remove(fullPath);
   }
 
+  /**
+   * The path in this FilesApi a gitfile's `gitdir:` names: relative to the gitlink's
+   * directory (`../.git/modules/sub`, as git submodule writes it), or absolute (older git,
+   * `--separate-git-dir`) when it lies inside the real directory this FilesApi is rooted at
+   * (`rootDirectory`). Undefined when it lies beyond what this FilesApi can name: outside
+   * its root, or absolute where the root's real directory is unknown.
+   */
+  private gitfileTarget(path: string, target: string): string | undefined {
+    const windows = this.windowsPaths;
+    const absolute = target.startsWith("/") || (windows && /^[A-Za-z]:[\\/]/.test(target));
+    if (!absolute) return resolveDots(joinPath(this.rootPath, path, target));
+    const root = this.rootFiles.rootDirectory;
+    if (!root) return undefined;
+    const slashes = (p: string) => (windows ? p.replace(/\\/g, "/") : p);
+    const realTarget = resolveDots(slashes(target));
+    const realRoot = resolveDots(slashes(root));
+    if (realTarget === undefined || realRoot === undefined) return undefined;
+    const same = (a: string, b: string) =>
+      windows ? a.toLowerCase() === b.toLowerCase() : a === b;
+    const base = realRoot.endsWith("/") ? realRoot.slice(0, -1) : realRoot;
+    if (same(realTarget, base)) return "/";
+    if (!same(realTarget.slice(0, base.length + 1), `${base}/`)) return undefined;
+    return realTarget.slice(base.length);
+  }
+
+  /** The `gitdir:` a `.git` file names, if it is a regular file starting so. */
+  private async readGitfile(dotGit: string): Promise<string | undefined> {
+    // a regular file only: never a link, and never a FIFO (reading one would block)
+    if (this.files.lstat) {
+      if ((await this.files.lstat(dotGit))?.kind !== "file") return undefined;
+    } else if ((await this.files.stats(dotGit))?.kind !== "file") return undefined;
+    return new TextDecoder()
+      .decode(await readFile(this.files, dotGit))
+      .trim()
+      .match(/^gitdir: (.+)$/)?.[1];
+  }
+
   async isRepository(path: string): Promise<boolean> {
     const dotGit = joinPath(this.rootPath, path, ".git");
     const kind = await this.kindOf(dotGit).catch(() => undefined);
     if (kind === "file") {
-      // a gitdir: file names a repository when its target is one; an absolute target (or
-      // one beyond this FilesApi's root) cannot be checked here and is taken as one, so
-      // nothing is removed on a guess
+      // a gitdir: file names a repository when its target is one; a target beyond this
+      // FilesApi's root cannot be checked here and is taken as one, so nothing is removed
+      // on a guess
       let target: string | undefined;
       try {
-        target = new TextDecoder()
-          .decode(await readFile(this.files, dotGit))
-          .trim()
-          .match(/^gitdir: (.+)$/)?.[1];
+        target = await this.readGitfile(dotGit);
       } catch {
         return true;
       }
       if (!target) return false;
-      if (target.startsWith("/")) return true;
-      const resolved = resolveDots(joinPath(this.rootPath, path, target));
+      const resolved = this.gitfileTarget(path, target);
       if (resolved === undefined) return true;
       // any HEAD (a file, or a link as core.preferSymlinkRefs writes it) makes it one,
       // as git's validate_headref; only a target without HEAD is not
@@ -601,6 +643,28 @@ export class FileWorktree implements Worktree {
     );
   }
 
+  /**
+   * The repository directory of the gitlink at `path` (in this FilesApi): its `.git`
+   * directory, or the directory its `gitdir:` file names. Undefined when the submodule is
+   * not populated or its repository lies beyond this FilesApi's root; a gitfile naming a
+   * place without a HEAD is git's fatal error.
+   */
+  private async gitlinkDir(path: string): Promise<string | undefined> {
+    const dotGit = joinPath(this.rootPath, path, ".git");
+    const kind = await this.kindOf(dotGit).catch(() => undefined);
+    if (kind === "directory") return dotGit;
+    if (kind !== "file") return undefined;
+    const target = await this.readGitfile(dotGit).catch(() => undefined);
+    if (!target) return undefined;
+    // refused when it climbs above the FilesApi's root or lies outside it
+    const resolved = this.gitfileTarget(path, target);
+    if (resolved === undefined) return undefined;
+    if ((await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) !== "file") {
+      throw new Error(`fatal: gitfile does not point to a valid repository: ${path}/.git`);
+    }
+    return resolved;
+  }
+
   async readGitlinkHead(path: string): Promise<ObjectId | undefined> {
     const text = async (full: string) => {
       try {
@@ -613,28 +677,8 @@ export class FileWorktree implements Worktree {
         return undefined;
       }
     };
-    const dotGit = joinPath(this.rootPath, path, ".git");
-    const kind = await this.kindOf(dotGit).catch(() => undefined);
-    let gitDir: string;
-    if (kind === "directory") gitDir = dotGit;
-    else if (kind === "file") {
-      const pointer = await text(dotGit);
-      const target = pointer?.match(/^gitdir: (.+)$/)?.[1];
-      if (!target) return undefined;
-      // `gitdir: ../.git/modules/sub` (as git submodule writes it): resolved against the
-      // submodule's directory, refused when it climbs above the FilesApi's root
-      const resolved = resolveDots(
-        target.startsWith("/") ? target : joinPath(this.rootPath, path, target),
-      );
-      // an absolute gitdir, or one beyond this FilesApi's root, cannot be read here: the
-      // submodule's commit is unknown (no change reported); one inside without a HEAD is
-      // git's fatal error, not a clean submodule
-      if (resolved === undefined || target.startsWith("/")) return undefined;
-      if ((await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) !== "file") {
-        throw new Error(`fatal: gitfile does not point to a valid repository: ${path}/.git`);
-      }
-      gitDir = resolved;
-    } else return undefined;
+    const gitDir = await this.gitlinkDir(path);
+    if (gitDir === undefined) return undefined;
     let head = await text(joinPath(gitDir, "HEAD"));
     for (let depth = 0; head?.startsWith("ref: ") && depth < 5; depth++) {
       const ref = head.slice(5).trim();
@@ -648,6 +692,53 @@ export class FileWorktree implements Worktree {
       head = line?.split(" ")[0];
     }
     return head && /^[0-9a-f]{40,64}$/.test(head) ? head : undefined;
+  }
+
+  /**
+   * The repository checked out at the gitlink `path` (a populated submodule) as a working
+   * copy over the same FilesApi: its objects, refs, index, config and worktree. Undefined
+   * when it is not populated (no git directory with HEAD, objects and refs) or its
+   * repository lies beyond this FilesApi's root.
+   */
+  async openGitlink(path: string): Promise<WorkingCopy | undefined> {
+    const gitDir = await this.gitlinkDir(path);
+    if (gitDir === undefined) return undefined;
+    const kindAt = (name: string) => this.kindOf(joinPath(gitDir, name)).catch(() => undefined);
+    // a HEAD that is a file (or a link, core.preferSymlinkRefs): never a FIFO, which
+    // would block the read
+    const headKind = await kindAt("HEAD");
+    if (
+      (headKind !== "file" && headKind !== "symlink") ||
+      (await kindAt("objects")) !== "directory" ||
+      (await kindAt("refs")) !== "directory"
+    ) {
+      return undefined;
+    }
+    const files = this.rootFiles;
+    const { history } = await createGitFilesBackend({ files, gitDir });
+    const staging = new FileStagingStore(files, joinPath(gitDir, "index"));
+    await staging.read();
+    const config = await createWorkingCopyConfig(
+      {
+        read: async (p) => ((await files.exists(p)) ? readFile(files, p) : undefined),
+        write: (p, content) => files.write(p, [content]),
+      },
+      gitDir,
+    );
+    const worktree = new FileWorktree({
+      files,
+      rootPath: joinPath(this.rootPath, path),
+      gitDir,
+      blobs: history.blobs,
+      trees: history.trees,
+      newHasher: this.newHasher,
+    });
+    return new MemoryWorkingCopy({
+      history,
+      checkout: new MemoryCheckout({ staging }),
+      worktree,
+      config,
+    });
   }
 
   async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {

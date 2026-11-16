@@ -16,7 +16,12 @@ import type {
   StagingEntry,
   StagingEntryOptions,
 } from "@statewalker/vcs-working-tree";
-import { MergeStage } from "@statewalker/vcs-working-tree";
+import {
+  EntriesAsRead,
+  MergeStage,
+  type RacyCheck,
+  smudgeRacilyClean,
+} from "@statewalker/vcs-working-tree";
 import type { DatabaseClient } from "./database-client.js";
 
 /**
@@ -62,6 +67,9 @@ function rowToEntry(row: StagingRow): StagingEntry {
  */
 export class SQLStaging implements Staging {
   private updateTime: number = Date.now();
+  private racyCheck?: RacyCheck;
+  /** The entries as last read or written: only these are checked for smudging */
+  private readonly asRead = new EntriesAsRead();
 
   constructor(private db: DatabaseClient) {}
 
@@ -360,13 +368,25 @@ export class SQLStaging implements Staging {
   // ============ Persistence ============
 
   async read(): Promise<void> {
-    // For SQL, data is already persistent, just update timestamp
-    this.updateTime = Date.now();
+    // the time of the last write, stored with the entries (git: the index file's mtime)
+    this.updateTime = (await this.storedUpdateTime()) ?? Date.now();
+    await this.rememberEntries();
   }
 
   async write(): Promise<void> {
-    // For SQL, data is already persistent
-    this.updateTime = Date.now();
+    // the entries are stored as they are edited; a write smudges racily clean ones (git)
+    const entries: StagingEntry[] = [];
+    for await (const entry of this.listEntries()) entries.push(entry);
+    const smudged = await this._smudge(entries);
+    for (let i = 0; i < smudged.length; i++) {
+      if (smudged[i] === entries[i]) continue;
+      await this.db.execute("UPDATE staging_entry SET size = 0 WHERE path = ? AND stage = ?", [
+        smudged[i].path,
+        smudged[i].stage,
+      ]);
+    }
+    await this.rememberEntries(smudged);
+    await this._written();
   }
 
   async isOutdated(): Promise<boolean> {
@@ -380,6 +400,60 @@ export class SQLStaging implements Staging {
   /** @internal - Used by builder */
   _setUpdateTime(time: number): void {
     this.updateTime = time;
+  }
+
+  /**
+   * Sets the check every write applies to racily clean entries (git's smudging): an entry
+   * kept from before the write, whose mtime second is not older than the last write and
+   * whose content changed behind a matching stat, is stored with size 0.
+   */
+  setRacyCheck(check: RacyCheck | undefined): void {
+    this.racyCheck = check;
+  }
+
+  /**
+   * @internal - Used by builder/editor: `entries`, smudged where racily clean and changed
+   * if they are as the store was last read or written.
+   */
+  async _smudge(entries: StagingEntry[]): Promise<StagingEntry[]> {
+    return smudgeRacilyClean(entries, this.updateTime, this.racyCheck, (e) => this.asRead.has(e));
+  }
+
+  /** Remembers the entries as they are now (after a read or an explicit write). */
+  private async rememberEntries(entries?: StagingEntry[]): Promise<void> {
+    const list = entries ?? [];
+    if (!entries) for await (const entry of this.listEntries()) list.push(entry);
+    this.asRead.remember(list);
+  }
+
+  /**
+   * @internal - Used by builder/editor: records the time of this write with the entries
+   * (in `staging_meta`; a database without that table keeps it in memory only).
+   */
+  async _written(): Promise<void> {
+    this.updateTime = Date.now();
+    try {
+      await this.db.execute(
+        "INSERT OR REPLACE INTO staging_meta (name, value) VALUES ('update_time', ?)",
+        [this.updateTime],
+      );
+    } catch {
+      // no staging_meta table (a schema older than its migration)
+    }
+  }
+
+  /** The time of the last write, as stored; undefined when none was. */
+  private async storedUpdateTime(): Promise<number | undefined> {
+    try {
+      const rows = await this.db.query<{ value: number }>(
+        "SELECT value FROM staging_meta WHERE name = 'update_time'",
+        [],
+      );
+      const time = Number(rows[0]?.value);
+      return rows.length > 0 && Number.isFinite(time) ? time : undefined;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -492,6 +566,9 @@ class SQLIndexBuilder implements IndexBuilder {
     // Validate stage constraints
     this.validateStages();
 
+    // entries kept from before this write are smudged when racily clean (git)
+    this.entries = await this.store._smudge(this.entries);
+
     // Replace all entries in a transaction
     await this.db.transaction(async (tx) => {
       await tx.execute("DELETE FROM staging_entry", []);
@@ -520,7 +597,7 @@ class SQLIndexBuilder implements IndexBuilder {
       }
     });
 
-    this.store._setUpdateTime(Date.now());
+    await this.store._written();
   }
 
   private validateStages(): void {
@@ -635,11 +712,14 @@ class SQLIndexEditor implements IndexEditor {
       }
     }
 
+    // entries kept from before this write are smudged when racily clean (git)
+    const written = await this.store._smudge(newEntries);
+
     // Replace all entries in a transaction
     await this.db.transaction(async (tx) => {
       await tx.execute("DELETE FROM staging_entry", []);
 
-      for (const entry of newEntries) {
+      for (const entry of written) {
         await tx.execute(
           `INSERT INTO staging_entry (
             path, stage, mode, object_id, size, mtime,
@@ -663,7 +743,7 @@ class SQLIndexEditor implements IndexEditor {
       }
     });
 
-    this.store._setUpdateTime(Date.now());
+    await this.store._written();
   }
 
   private applyConflictResolution(
