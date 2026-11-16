@@ -58,6 +58,15 @@ export interface GitCheckoutFilesApi
    */
   removeDir?(path: string): Promise<void>;
   /**
+   * Create a file only if nothing is there (a FilesApi's `createExclusive`): with `remove`,
+   * how a state file is written in place, as git's `fopen(..., "w")`
+   */
+  createExclusive?(path: string, content: Iterable<Uint8Array>): Promise<boolean>;
+  /**
+   * Append to a file, creating it (a FilesApi's `append`: O_APPEND, never a rewrite)
+   */
+  append?(path: string, content: Iterable<Uint8Array>): Promise<void>;
+  /**
    * The entries of a directory (a FilesApi's `list`: names, or info objects with a name)
    */
   list?(path: string): AsyncIterable<string | { name: string }>;
@@ -93,6 +102,11 @@ export class GitCheckout implements Checkout {
   private readonly files: GitCheckoutFilesApi;
   private readonly gitDir: string;
   private initialized = false;
+  /**
+   * Appends to a file under the git directory in place (O_APPEND); only when the files
+   * can append (a caller without it writes the whole file).
+   */
+  readonly appendStateFile?: (name: string, content: Uint8Array | string) => Promise<void>;
 
   constructor(options: GitCheckoutOptions) {
     this.staging = options.staging;
@@ -101,6 +115,13 @@ export class GitCheckout implements Checkout {
     this.gitDir = options.gitDir;
     this.stash = options.stash;
     this.config = options.config;
+    const append = options.files.append?.bind(options.files);
+    if (append) {
+      this.appendStateFile = async (name, content) => {
+        const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+        await append(`${this.gitDir}/${name}`, [bytes]);
+      };
+    }
   }
 
   // ========== HEAD Management ==========
@@ -366,12 +387,33 @@ export class GitCheckout implements Checkout {
     }
   }
 
-  /** Writes a file under the git directory in place, as git writes its state files. */
+  /**
+   * Writes a file under the git directory as git writes it. The small files git writes with
+   * `write_file` (`O_TRUNC` in place: `msgnum`, `end`, `head-name`, `onto`, `MERGE_MODE`,
+   * ...) are replaced in place: the old file removed and the new one created holding the
+   * content, where the files can create exclusively. Every other file (`git-rebase-todo`,
+   * `sequencer/todo`, `message`, `author-script`, `MERGE_MSG`, `SQUASH_MSG`, ...) git writes
+   * through a lock file renamed into place, so a crash never leaves it missing or partial:
+   * those go through the files' `write`, which writes a temporary and renames it over.
+   */
   async writeStateFile(name: string, content: Uint8Array | string): Promise<void> {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+    const path = `${this.gitDir}/${name}`;
+    if (this.files.createExclusive && this.files.remove && isWriteFileStyle(name)) {
+      const stats = await this.files.stats(path).catch(() => undefined);
+      if (!stats?.isDirectory) {
+        if (stats) await this.files.remove(path);
+        if (await this.files.createExclusive(path, [bytes]).catch(() => false)) return;
+      }
+    }
     const slash = name.lastIndexOf("/");
-    if (slash > 0) await this.mkdir(`${this.gitDir}/${name.slice(0, slash)}`);
-    await this.files.write(`${this.gitDir}/${name}`, [bytes]);
+    try {
+      await this.files.write(path, [bytes]);
+    } catch (error) {
+      if (slash <= 0) throw error;
+      await this.mkdir(`${this.gitDir}/${name.slice(0, slash)}`);
+      await this.files.write(path, [bytes]);
+    }
   }
 
   /** Removes a file or directory (recursively) under the git directory. */
@@ -490,4 +532,42 @@ export class GitCheckout implements Checkout {
  */
 export function createGitCheckout(options: GitCheckoutOptions): Checkout {
   return new GitCheckout(options);
+}
+
+/**
+ * The state files git writes with `write_file` (`O_CREAT|O_TRUNC`, no lock file): small
+ * one-line files whose loss after a crash git tolerates. Everything else is written as
+ * git's `write_message` does, through a lock file renamed into place.
+ */
+const WRITE_FILE_STYLE = new Set([
+  "msgnum",
+  "end",
+  "head-name",
+  "onto",
+  "orig-head",
+  "interactive",
+  "quiet",
+  "verbose",
+  "stopped-sha",
+  "abort-safety",
+  "head",
+  "autostash",
+  "MERGE_MODE",
+  "MERGE_HEAD",
+  "MERGE_AUTOSTASH",
+  "drop_redundant_commits",
+  "keep_redundant_commits",
+  "reschedule-failed-exec",
+  "no-reschedule-failed-exec",
+  "strategy",
+  "strategy_opts",
+  "allow_rerere_autoupdate",
+  "gpg_sign_opt",
+  "signoff",
+  "amend",
+  "allow_empty_message",
+]);
+
+function isWriteFileStyle(name: string): boolean {
+  return WRITE_FILE_STYLE.has(name.slice(name.lastIndexOf("/") + 1));
 }

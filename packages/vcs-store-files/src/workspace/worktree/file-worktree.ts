@@ -165,6 +165,40 @@ export class FileWorktree implements Worktree {
     return probeCaseFolding(this.files, this.gitDir);
   }
 
+  /**
+   * Whether the worktree's storage folds case, seen without writing anything: an entry of the
+   * worktree's root with a letter in its name looked up in another case (else the git
+   * directory, only when it lies inside the root: a separate git directory, a linked
+   * worktree's or a submodule's, may be on another filesystem). Undefined when there is no
+   * such entry to look at.
+   */
+  async foldsCase(): Promise<boolean | undefined> {
+    const swapCase = (name: string) =>
+      [...name].map((c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase())).join("");
+    const kind = (path: string) => this.kindOf(path).catch(() => undefined);
+    const candidates: string[] = [];
+    try {
+      let seen = 0;
+      for await (const info of this.rootFiles.list(this.rootPath)) {
+        candidates.push(info.path);
+        if (++seen >= 16) break;
+      }
+    } catch {
+      // no root to list
+    }
+    if (this.gitDir !== undefined && isInside(this.gitDir, this.rootPath)) {
+      candidates.push(this.gitDir);
+    }
+    for (const path of candidates) {
+      const slash = path.lastIndexOf("/");
+      const name = path.slice(slash + 1);
+      const other = swapCase(name);
+      if (other === name || !(await kind(path))) continue;
+      return (await kind(`${path.slice(0, slash + 1)}${other}`)) !== undefined;
+    }
+    return undefined;
+  }
+
   /** The FilesApi operations go through: the batch view while a batch runs. */
   private get files(): WorktreeFilesApi {
     return this.scoped ?? this.rootFiles;
@@ -1329,4 +1363,14 @@ function statData(link: LinkStats): Partial<WorktreeEntry> {
 
 export function createFileWorktree(options: FileWorktreeOptions): Worktree {
   return new FileWorktree(options);
+}
+
+/** Whether `path` lies below `root` (both FilesApi paths; "" or "/" is the whole tree). */
+function isInside(path: string, root: string): boolean {
+  const norm = (p: string) => p.replace(/^(\.?\/)+/, "").replace(/\/+$/, "");
+  const p = norm(path);
+  const r = norm(root);
+  if (p.split("/").includes("..")) return false;
+  if (r === "") return true;
+  return p.startsWith(`${r}/`);
 }

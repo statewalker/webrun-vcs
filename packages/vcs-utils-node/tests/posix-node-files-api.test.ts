@@ -325,4 +325,28 @@ describe("PosixNodeFilesApi caches nothing across calls; a batch view only withi
       expect(statSync(join(root, "w")).mode & 0o777).toBe(0o644);
     },
   );
+
+  it("appends in place, creating the file and its directories, never through a link", async () => {
+    const files = new PosixNodeFilesApi({ rootDir: root });
+    await files.append("/logs/refs/x", [enc.encode("a\n")]);
+    const ino = statSync(join(root, "logs/refs/x")).ino;
+    await files.append("/logs/refs/x", [enc.encode("b\n"), enc.encode("c\n")]);
+    expect(readFileSync(join(root, "logs/refs/x"), "utf8")).toBe("a\nb\nc\n");
+    // the same file grew (O_APPEND), no new one renamed over it
+    expect(statSync(join(root, "logs/refs/x")).ino).toBe(ino);
+    mkdirSync(join(root, "dir"));
+    await expect(files.append("/dir", [enc.encode("x")])).rejects.toMatchObject({
+      code: "EISDIR",
+    });
+    if (process.platform !== "win32") {
+      writeFileSync(join(base, "outside-file"), "o");
+      symlinkSync(join(base, "outside-file"), join(root, "ln"));
+      await expect(files.append("/ln", [enc.encode("x")])).rejects.toThrow();
+      symlinkSync(join(base), join(root, "lndir"));
+      await expect(files.append("/lndir/outside-file", [enc.encode("x")])).rejects.toThrow(
+        BeyondSymlinkError,
+      );
+      expect(readFileSync(join(base, "outside-file"), "utf8")).toBe("o");
+    }
+  });
 });

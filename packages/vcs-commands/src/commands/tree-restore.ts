@@ -60,6 +60,13 @@ export interface TreeRestoreOptions {
    * are both planned (the last wins) and reported in `collided`, as git does.
    */
   ignoreCase?: boolean;
+  /**
+   * Whether the worktree's storage folds case ({@link worktreeFoldsCase}). With `ignoreCase`
+   * on storage that keeps case (false: Linux), names differing only in case are different
+   * paths, as git checks them out there: a file beside a directory of another case, two
+   * files in two cases, none refused or reported. Unknown (absent): taken to fold case.
+   */
+  foldsCase?: boolean;
   /** The worktree is on Windows (`capabilities.windowsPaths`): git's Windows path rules. */
   windows?: boolean;
   /** Top-level names the worktree's storage reserves (`capabilities.reservedNames`) */
@@ -99,6 +106,45 @@ export async function planTreeRestore(
   return plan;
 }
 
+/**
+ * Whether `worktree`'s storage folds case (`README` and `readme` one file), from its
+ * `foldsCase`; undefined when the worktree cannot tell. With `core.ignorecase` set, a
+ * restore guards against case variants only where this is not false.
+ *
+ * @example
+ * ```typescript
+ * const plan = await planTreeRestore(trees, blobs, treeId, "checkout", {
+ *   ignoreCase: true,
+ *   foldsCase: await worktreeFoldsCase(worktree),
+ * });
+ * ```
+ */
+export async function worktreeFoldsCase(
+  worktree: Worktree | undefined,
+): Promise<boolean | undefined> {
+  return worktree?.foldsCase?.().catch(() => undefined);
+}
+
+/**
+ * The case options of a restore into `worktree`: `ignoreCase` (`core.ignorecase`) and, when
+ * it is set, whether the worktree folds case (probed only then).
+ *
+ * @example
+ * ```typescript
+ * const plan = await planTreeRestore(trees, blobs, treeId, "reset --hard", {
+ *   ...(await restoreCaseOptions(worktree, coreBool(workingCopy, "ignorecase", false))),
+ * });
+ * ```
+ */
+export async function restoreCaseOptions(
+  worktree: Worktree | undefined,
+  ignoreCase: boolean,
+): Promise<{ ignoreCase: boolean; foldsCase?: boolean }> {
+  if (!ignoreCase) return { ignoreCase };
+  const foldsCase = await worktreeFoldsCase(worktree);
+  return foldsCase === undefined ? { ignoreCase } : { ignoreCase, foldsCase };
+}
+
 /** What a planned path holds, by its (case-folded) key, and its first spelling. */
 type PlannedKinds = Map<string, { kind: "tree" | "leaf"; path: string }>;
 
@@ -115,7 +161,7 @@ function claim(
   operation: string,
   options: TreeRestoreOptions,
 ): void {
-  const key = options.ignoreCase ? path.toLowerCase() : path;
+  const key = options.ignoreCase && options.foldsCase !== false ? path.toLowerCase() : path;
   const existing = planned.get(key);
   if (existing) {
     if (existing.path === path || existing.kind !== kind) {
@@ -290,7 +336,7 @@ export async function planFlatRestore(
   target: Map<string, { objectId: ObjectId; mode: number }>,
   writing: Set<string>,
   operation: string,
-  options: Omit<TreeRestoreOptions, "ignoreCase" | "writing"> = {},
+  options: Omit<TreeRestoreOptions, "ignoreCase" | "foldsCase" | "writing"> = {},
 ): Promise<TreeRestorePlan> {
   const plan: TreeRestorePlan = { entries: [], paths: new Set(), gitlinks: [], collided: [] };
   for (const path of [...writing].sort()) {

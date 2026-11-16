@@ -31,7 +31,10 @@ export interface AtomicFiles {
   createExclusive(path: string, content: Uint8Array): Promise<boolean>;
   /** Move `source` over `target` (rename, replacing it), creating directories. */
   replace(source: string, target: string): Promise<void>;
-  /** Append to a file, creating it and its directories (O_APPEND, as git writes reflogs). */
+  /**
+   * Append to a file, creating it and its directories (O_APPEND, as git writes reflogs).
+   * Fails with `code` "EISDIR" when a directory is at `path`.
+   */
   append(path: string, content: Uint8Array): Promise<void>;
   /** Remove `dir` if it is an empty directory; `false` otherwise. */
   removeEmptyDir(dir: string): Promise<boolean>;
@@ -178,8 +181,17 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
       }
     },
     async append(path, content) {
+      // in place where the FilesApi can (O_APPEND), as git; else read and rewritten
+      if (fs.append) {
+        await fs.append(abs(path), [content]);
+        return;
+      }
       const old: Uint8Array[] = [];
-      if (await isFile(path)) for await (const chunk of fs.read(abs(path))) old.push(chunk);
+      const kind = (await fs.stats(abs(path)))?.kind;
+      if (kind === "directory") {
+        throw Object.assign(new Error(`EISDIR: ${path} is a directory`), { code: "EISDIR" });
+      }
+      if (kind === "file") for await (const chunk of fs.read(abs(path))) old.push(chunk);
       await ensureDir(path);
       await fs.write(abs(path), [...old, content]);
     },

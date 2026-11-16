@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseIndexFile } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ResetMode } from "../src/index.js";
 import {
   git,
   gitOk,
@@ -235,5 +236,72 @@ describeGit("the index merge and cherry-pick leave, against native git", () => {
       .then((c) => c.call());
     expect(r.status).toBe("ok");
     expect(unreachable(ro)).toEqual(unreachable(rn));
+  });
+
+  // core.ignorecase on a filesystem that keeps case (Linux): a file and a directory whose
+  // names differ only in case are two paths, which native git checks out side by side; the
+  // case-variant guard of tree-restore applies only where the worktree folds case
+  it("with core.ignorecase on a case-keeping filesystem a file beside a directory in another case", async () => {
+    const history: History = {
+      base,
+      config: { "core.ignorecase": "true" },
+      main: { "b.txt": T("b1") },
+      side: { D: T("file D"), "E/k.txt": T("Ek") },
+    };
+    for (const op of ["merge", "cherry-pick"] as const) {
+      const { nd, od, native } = await run(history, op);
+      expect(native).toBe(0);
+      await expectSame(nd, od);
+    }
+    // a checkout and a reset --hard of the tree that holds both
+    for (const command of ["checkout", "reset"] as const) {
+      const cn = join(root, `c${n++}`);
+      const co = join(root, `c${n++}`);
+      for (const dir of [cn, co]) buildHistory(root, dir, history);
+      if (command === "checkout") {
+        gitOk(root, cn, "checkout", "-q", "side");
+        await (await openOurs(co)).checkout().setName("side").call();
+      } else {
+        gitOk(root, cn, "reset", "-q", "--hard", "side");
+        await (await openOurs(co)).reset().setRef("side").setMode(ResetMode.HARD).call();
+      }
+      expect(snapshot(root, co, normalizeState)).toEqual(snapshot(root, cn, normalizeState));
+    }
+  });
+
+  // core.ignorecase on a case-keeping filesystem: an untracked `README` beside the tracked
+  // `readme` a switch replaces by `README` is a file of its own (its stat is not the index
+  // entry's: git's icase_exists), so native git refuses to overwrite it, and so do we
+  it("with core.ignorecase on a case-keeping filesystem an untracked file in another case is kept", async () => {
+    // core.ignorecase set once the history is built (with it set, `git add -A` would not
+    // add `README` beside the staged deletion of `readme`)
+    const history: History = {
+      base: { ...base, readme: T("tracked readme") },
+      main: { "b.txt": T("b1") },
+      side: { readme: null, README: T("side README") },
+      dirty: { README: "precious\n" },
+    };
+    const ignoreCase = "git config core.ignorecase true";
+    const cn = join(root, `c${n++}`);
+    const co = join(root, `c${n++}`);
+    for (const dir of [cn, co]) {
+      buildHistory(root, dir, history);
+      gitOk(root, dir, "config", "core.ignorecase", "true");
+    }
+    const nativeCheckout = git(root, cn, "checkout", "side");
+    expect(nativeCheckout.status).not.toBe(0);
+    expect(nativeCheckout.stderr).toContain("untracked working tree files would be overwritten");
+    const ours = await (await openOurs(co)).checkout().setName("side").call();
+    expect(ours.status).toBe("CONFLICTS");
+    expect(ours.message).toContain("untracked working tree files would be overwritten");
+    expect(readFileSync(join(co, "README"), "utf8")).toBe("precious\n");
+    expect(snapshot(root, co, normalizeState)).toEqual(snapshot(root, cn, normalizeState));
+
+    for (const op of ["merge", "cherry-pick"] as const) {
+      const { nd, od, native } = await run(history, op, ignoreCase);
+      expect(native).not.toBe(0);
+      expect(readFileSync(join(od, "README"), "utf8")).toBe("precious\n");
+      expect(snapshot(root, od, normalizeState)).toEqual(snapshot(root, nd, normalizeState));
+    }
   });
 });

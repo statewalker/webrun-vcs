@@ -179,6 +179,12 @@ export interface Checkout {
   readStateFile?(name: string): Promise<Uint8Array | undefined>;
   /** Writes a state file (as git writes them: in place, parent directories created). */
   writeStateFile?(name: string, content: Uint8Array | string): Promise<void>;
+  /**
+   * Appends to a state file, creating it, as git appends `rebase-merge/done` and
+   * `rewritten-list` (O_APPEND: the file is not rewritten). Optional: without it a caller
+   * writes the whole file.
+   */
+  appendStateFile?(name: string, content: Uint8Array | string): Promise<void>;
   /** Removes a state file or directory (recursively); nothing there is no error. */
   removeStateFile?(name: string): Promise<void>;
   /** The names in a state directory (e.g. `rebase-merge`), sorted; empty if there is none. */

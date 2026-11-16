@@ -29,6 +29,7 @@
  */
 
 import { BeyondSymlinkError } from "./beyond-symlink-error.js";
+import { appendByRewrite } from "./file-utils.js";
 import type {
   FileInfo,
   FileStats,
@@ -328,6 +329,24 @@ class SymlinkFilesApi implements PosixFilesApi {
     if (await this.base.exists(p)) return false;
     await this.base.write(p, content);
     return true;
+  }
+
+  /**
+   * Appends to the file at `path` (created when missing), through the base FilesApi's
+   * append where it has one. A link at the path is refused (`ELOOP`, as `O_NOFOLLOW`).
+   */
+  async append(path: string, content: Content): Promise<void> {
+    const { path: p, table } = await this.resolve(path);
+    if (await this.linkAt(table, p)) {
+      throw Object.assign(new Error(`ELOOP: will not append through a link: ${path}`), {
+        code: "ELOOP",
+      });
+    }
+    await this.mkdirs(parentOf(p), table, path);
+    // a stale entry (its placeholder gone) is dropped first, as createExclusive does
+    if (table.links.has(p)) await this.mutate((t) => t.links.delete(p));
+    if (this.base.append) await this.base.append(p, content);
+    else await appendByRewrite(this.base, p, content);
   }
 
   async mkdir(path: string): Promise<void> {

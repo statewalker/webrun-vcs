@@ -281,6 +281,13 @@ function sortDirsNextToChildren(one: string, two: string): number {
 }
 
 /**
+ * How often merges took merge-ort's paths that leave no trace in their result, for tests:
+ * `redos` counts the merges redone with the renames the first pass found
+ * (redo_after_renames). Not part of the package's API.
+ */
+export const ortMergeCounters = { redos: 0 };
+
+/**
  * Merges `theirs` into `ours` against `base`, as git's merge-ort
  * (`merge_ort_nonrecursive_internal`). Content-merged blobs are stored in `blobs`.
  */
@@ -328,6 +335,26 @@ class OrtMerge {
   private possibleTrivial: Map<string, number>[] = [new Map(), new Map(), new Map()];
   /** Directories taken whole from a side (resolve_trivial_directory_merge) */
   private readonly trivialSide = new Map<string, 1 | 2>();
+  /** merge-ort's deferred[side].target_dirs: deferred directories a known rename goes into */
+  private readonly targetDirs: Set<string>[] = [new Set(), new Set(), new Set()];
+  /** Each side's deletions and additions in the order the trees are read (its diff queue) */
+  private readonly queue: { path: string; add: boolean }[][] = [[], [], []];
+  /**
+   * merge-ort's redo_after_renames: 1 when reading the deferred directories tripled the
+   * paths read (the merge is then run again with the renames found), 2 while redoing
+   */
+  private redoAfterRenames = 0;
+  /** Whether rename detection gave up on inexact renames (needed_rename_limit) */
+  private renameLimitHit = false;
+  // what a redo keeps from the first pass, by side: cached_pairs (source -> destination,
+  // none for a deletion), cached_target_names, cached_irrelevant
+  private readonly cachedPairs: Map<string, string | undefined>[] = [
+    new Map(),
+    new Map(),
+    new Map(),
+  ];
+  private readonly cachedTargets: Set<string>[] = [new Set(), new Set(), new Set()];
+  private readonly cachedIrrelevant: Set<string>[] = [new Set(), new Set(), new Set()];
   /** The three trees */
   private trees: Map<string, CheckedEntry>[] = [];
 
@@ -395,9 +422,40 @@ class OrtMerge {
     theirs: Map<string, CheckedEntry>,
   ): Promise<OrtMergeResult> {
     this.collect([base, ours, theirs]);
-    if (this.options.renames !== false) await this.detectAndProcessRenames();
+    if (this.options.renames !== false && (await this.detectAndProcessRenames())) {
+      // redo_after_renames: the trees read again, knowing the renames the merge needs
+      ortMergeCounters.redos++;
+      this.reset();
+      this.collect([base, ours, theirs]);
+      await this.detectAndProcessRenames();
+    }
     await this.processEntries();
     return this.output(ours);
+  }
+
+  /**
+   * clear_or_reinit_internal_opts(reinitialize) for a redo: everything but the renames the
+   * first pass found (and the directory rename counts, as git keeps them)
+   */
+  private reset(): void {
+    this.paths.clear();
+    this.folded.clear();
+    this.conflicted.clear();
+    this.notes.length = 0;
+    for (let i = 0; i < 3; i++) {
+      this.deletes[i] = [];
+      this.adds[i] = [];
+      this.queue[i] = [];
+      this.relevant[i].clear();
+      this.dirsRemoved[i].clear();
+      this.dirRenames[i].clear();
+      this.possibleTrivial[i] = new Map();
+      this.targetDirs[i].clear();
+      this.trivialOkay[i] = i !== 0;
+    }
+    this.trivialSide.clear();
+    this.dirRenameMask = 0;
+    this.renamesClean = true;
   }
 
   // ---- collect_merge_info -------------------------------------------------------------
@@ -514,7 +572,12 @@ class OrtMerge {
         const s2m = side2MatchesBase || dirs2;
         let side = s1m && !s2m ? 2 : s2m && !s1m ? 1 : 0;
         if (filemask === 0 && (dirmask === 2 || dirmask === 4)) side = dirmask / 2;
-        if (this.dirRenameMask !== 7 && side !== 0 && this.trivialOkay[side]) {
+        if (
+          this.dirRenameMask !== 7 &&
+          side !== 0 &&
+          this.trivialOkay[side] &&
+          !this.targetDirs[side].has(path)
+        ) {
           this.possibleTrivial[side].set(path, this.dirRenameMask);
           this.dirRenameMask = prevMask;
           return;
@@ -525,15 +588,57 @@ class OrtMerge {
     };
     traverse("");
 
-    // handle_deferred_entries: a side with no rename source the merge needs takes its
-    // directories whole; otherwise they are read now (their paths after all the others)
+    // the paths git would have read: a directory all three trees hold alike is one entry
+    // (the trees given whole hold its files too)
+    const identical = new Map<string, boolean>();
+    const isIdentical = (dir: string) => {
+      let known = identical.get(dir);
+      if (known === undefined) {
+        known = sameDir(dir, 0, 1) && sameDir(dir, 0, 2);
+        identical.set(dir, known);
+      }
+      return known;
+    };
+    const countPaths = () => {
+      let count = 0;
+      for (const path of this.paths.keys()) {
+        let inside = false;
+        for (let dir = dirnameOf(path); dir !== "" && !inside; dir = dirnameOf(dir)) {
+          inside = isIdentical(dir);
+        }
+        if (!inside) count++;
+      }
+      return count;
+    };
+    const countBefore = countPaths();
+    let readDeferred = false;
+
+    // handle_deferred_entries: a side whose rename sources the merge needs are all known
+    // (none, or found by a first pass) takes its directories whole, but those a known
+    // rename goes into; otherwise they are read now (their paths after all the others)
     for (const side of [1, 2] as const) {
-      const okay = this.relevant[side].size === 0;
+      let okay = true;
+      for (const source of this.relevant[side].keys()) {
+        if (this.cachedIrrelevant[side].has(source)) continue;
+        if (!this.cachedPairs[side].has(source)) {
+          okay = false;
+          break;
+        }
+        const target = this.cachedPairs[side].get(source);
+        if (target === undefined || this.paths.has(target)) continue;
+        let dir = target;
+        for (let k = dir.lastIndexOf("/"); k >= 0; k = dir.lastIndexOf("/")) {
+          dir = dir.slice(0, k);
+          if (this.targetDirs[side].has(dir)) break;
+          this.targetDirs[side].add(dir);
+        }
+      }
+      if (!okay) readDeferred = true;
       this.trivialOkay[side] = okay;
       const deferred = this.possibleTrivial[side];
       this.possibleTrivial[side] = new Map();
       for (const path of gitHashOrder(deferred.keys())) {
-        if (okay) {
+        if (okay && !this.targetDirs[side].has(path)) {
           this.resolveTrivial(path, side);
           continue;
         }
@@ -544,6 +649,16 @@ class OrtMerge {
       for (const path of gitHashOrder(this.possibleTrivial[side].keys())) {
         this.resolveTrivial(path, side);
       }
+    }
+    if (readDeferred) {
+      // reading the deferred directories tripled the paths: worth a second pass once the
+      // renames are known (redo_after_renames)
+      const countAfter = countPaths();
+      if (this.redoAfterRenames === 0 && countBefore > 0) {
+        if (Math.floor(countAfter / countBefore) >= 3) this.redoAfterRenames = 1;
+      }
+    } else if (this.redoAfterRenames === 2) {
+      this.redoAfterRenames = 0;
     }
     this.trees = trees;
   }
@@ -584,26 +699,40 @@ class OrtMerge {
       if (filemask & 1 && !(filemask & sideMask)) {
         const contentRelevant = (matchMask & filemask) === 0;
         const locationRelevant = this.dirRenameMask === 7;
+        if (contentRelevant) this.cachedIrrelevant[side].delete(fullname);
         if (contentRelevant || locationRelevant) {
           this.relevant[side].set(fullname, contentRelevant ? RELEVANT_CONTENT : RELEVANT_LOCATION);
         }
-        if (files[0]) this.deletes[side].push(fullname);
+        // a rename (or deletion) a first pass found is not detected again
+        if (this.cachedPairs[side].has(fullname) || this.cachedIrrelevant[side].has(fullname)) {
+          continue;
+        }
+        if (files[0]) {
+          this.deletes[side].push(fullname);
+          this.queue[side].push({ path: fullname, add: false });
+        }
       }
-      if (!(filemask & 1) && filemask & sideMask) this.adds[side].push(fullname);
+      if (!(filemask & 1) && filemask & sideMask && !this.cachedTargets[side].has(fullname)) {
+        this.adds[side].push(fullname);
+        this.queue[side].push({ path: fullname, add: true });
+      }
     }
   }
 
   // ---- renames --------------------------------------------------------------------------
 
   /** Rename detection of one side (detect_regular_renames): its renames and adds. */
-  private async detectSide(side: 1 | 2): Promise<Pair[]> {
+  private async detectSide(side: 1 | 2): Promise<{ pairs: Pair[]; ran: boolean }> {
     const deletes = this.deletes[side];
     const adds = this.adds[side];
     const pairs: Pair[] = [];
     const addPairs = () => adds.map((p): Pair => ({ status: "A", one: p, two: p, side }));
-    if (deletes.length + adds.length === 0) return pairs;
+    // prune_cached_from_relevant: what a first pass found is not looked for again
+    for (const path of this.cachedPairs[side].keys()) this.relevant[side].delete(path);
+    for (const path of this.cachedIrrelevant[side]) this.relevant[side].delete(path);
+    if (deletes.length + adds.length === 0) return { pairs, ran: false };
     // no source the merge needs: no rename detection at all
-    if (this.relevant[side].size === 0) return addPairs();
+    if (this.relevant[side].size === 0) return { pairs: addPairs(), ran: false };
     const candidate = (path: string, stage: number): RenameCandidate => {
       const e = this.paths.get(path)?.stages[stage] as CheckedEntry;
       return { path, mode: e.mode, id: e.objectId };
@@ -618,6 +747,10 @@ class OrtMerge {
         relevantSources: this.relevant[side],
         dirsRemoved: this.dirsRemoved[side],
         dirRenameCount: this.dirRenameCount[side],
+        cachedPairs: this.cachedPairs[side],
+        onRenameLimit: () => {
+          this.renameLimitHit = true;
+        },
         keepOrder: true,
       },
     );
@@ -630,11 +763,63 @@ class OrtMerge {
           : { status: "A", one: p, two: p, side },
       );
     }
+    return { pairs, ran: true };
+  }
+
+  /**
+   * possibly_cache_new_pair for each pair of a side's diff queue after rename detection:
+   * the renames and deletions of the sources the merge needs, for a redo.
+   */
+  private cacheRenames(side: 1 | 2, pairs: Pair[]): void {
+    const renamedTo = new Map<string, string>();
+    for (const p of pairs) if (p.status === "R") renamedTo.set(p.two, p.one);
+    const renamedFrom = new Set(renamedTo.values());
+    const relevance = (path: string) => this.relevant[side].get(path) ?? -1;
+    for (const { path, add } of this.queue[side]) {
+      if (add) {
+        const from = renamedTo.get(path);
+        if (from === undefined || relevance(from) <= 0) continue;
+        this.cachedPairs[side].set(from, path);
+        this.cachedTargets[side].add(path);
+      } else if (!renamedFrom.has(path)) {
+        const value = relevance(path);
+        if (value === 0) this.cachedIrrelevant[side].add(path);
+        if (value > 0) this.cachedPairs[side].set(path, undefined);
+      }
+    }
+  }
+
+  /**
+   * use_cached_pairs: the renames a first pass found, but those into a path the merge has
+   * no (or a clean) entry for (git >= 2.55).
+   */
+  private cachedRenamePairs(side: 1 | 2): Pair[] {
+    const pairs: Pair[] = [];
+    for (const from of gitHashOrder(this.cachedPairs[side].keys())) {
+      const to = this.cachedPairs[side].get(from);
+      if (to === undefined) continue;
+      const info = this.paths.get(to);
+      if (!info || info.clean) continue;
+      pairs.push({ status: "R", one: from, two: to, side });
+    }
     return pairs;
   }
 
-  private async detectAndProcessRenames(): Promise<void> {
-    const sidePairs: Pair[][] = [[], await this.detectSide(1), await this.detectSide(2)];
+  /** detect_and_process_renames; true when the merge is to be redone (redo_after_renames). */
+  private async detectAndProcessRenames(): Promise<boolean> {
+    const detected = [await this.detectSide(1), await this.detectSide(2)];
+    if (this.renameLimitHit) this.redoAfterRenames = 0;
+    if (this.redoAfterRenames === 1 && detected.some((d) => d.ran)) {
+      this.cacheRenames(1, detected[0].pairs);
+      this.cacheRenames(2, detected[1].pairs);
+      this.redoAfterRenames = 2;
+      return true;
+    }
+    const sidePairs: Pair[][] = [
+      [],
+      [...detected[0].pairs, ...this.cachedRenamePairs(1)],
+      [...detected[1].pairs, ...this.cachedRenamePairs(2)],
+    ];
     if (this.depth === 0 && this.dirRenamesMode !== "false") {
       this.provisionalDirectoryRenames(1);
       this.provisionalDirectoryRenames(2);
@@ -673,6 +858,7 @@ class OrtMerge {
     // stable, by source path
     combined.sort((a, b) => compareStrings(a.one, b.one));
     await this.processRenames(combined);
+    return false;
   }
 
   /** merge-ort's get_provisional_directory_renames: each removed directory's majority. */
@@ -880,6 +1066,9 @@ class OrtMerge {
       const newPath = pair.two;
       const oldinfo = this.paths.get(oldPath);
       const newinfo = this.paths.get(newPath);
+      // a directory rename can move a renamed path back where it was (rename-to-self):
+      // nothing to move (git >= 2.5x; older versions resolved the path away)
+      if (oldPath === newPath) continue;
       if (!oldinfo || oldinfo.clean) continue;
 
       if (i + 1 < renames.length && renames[i + 1].one === oldPath) {

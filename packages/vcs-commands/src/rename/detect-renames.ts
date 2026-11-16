@@ -76,6 +76,11 @@ export interface DetectRenamesOptions {
    * directory (git's `dir_rename_count`), for directory rename detection
    */
   dirRenameCount?: Map<string, Map<string, number>>;
+  /**
+   * merge-ort: the renames (source -> destination; none: a deletion) already known from a
+   * first pass (git's `cached_pairs`), counted into `dirRenameCount` with the others
+   */
+  cachedPairs?: Iterable<[string, string | undefined]>;
   /** Keep the order the candidates are given in (default: sorted by path) */
   keepOrder?: boolean;
 }
@@ -336,6 +341,7 @@ export async function detectRenames(
       if (from === undefined) info.idx.set(d.path, i);
       else info.update(from, d.path);
     });
+    for (const [from, to] of options.cachedPairs ?? []) if (to !== undefined) info.update(from, to);
     for (const [dir, counts] of info.counts) {
       const best = highestRenamePath(counts);
       if (best !== undefined) info.guess.set(dir, best);

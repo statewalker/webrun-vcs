@@ -9,7 +9,7 @@ import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
 import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
-import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 
 /** Names this operation in restore failure messages. */
 const RESET_HARD = "reset --hard";
@@ -288,7 +288,7 @@ export class ResetCommand extends GitCommand<Ref> {
     // working tree is still untouched, instead of half-way through rewriting it.
     const plan = await planTreeRestore(this.trees, this.blobs, commit.tree, RESET_HARD, {
       symlinks: true,
-      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
       windows: worktree.capabilities?.windowsPaths === true,
       reservedNames: worktree.capabilities?.reservedNames,
     });

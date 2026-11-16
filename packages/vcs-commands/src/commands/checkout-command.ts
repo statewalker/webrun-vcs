@@ -53,7 +53,7 @@ import { GitCommand } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
 import { removeBranchState } from "./sequencer-support.js";
-import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   findInTheWay,
   overwriteMessage,
@@ -471,7 +471,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         writes: switched.filter((p) => target.has(p)),
         removes: new Set(switched.filter((p) => !target.has(p))),
         index,
-        ignoreCase,
+        ...(await restoreCaseOptions(worktree, ignoreCase)),
       });
       untracked.push(...found.untracked);
       lostDirs.push(...found.lostDirs);
@@ -502,7 +502,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     if (targetTreeId && worktree) {
       const plan = await planTreeRestore(this.trees, this.blobs, targetTreeId, CHECKOUT, {
         symlinks: true,
-        ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+        ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
         windows: worktree.capabilities?.windowsPaths === true,
         reservedNames: worktree.capabilities?.reservedNames,
       });

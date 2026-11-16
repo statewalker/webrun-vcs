@@ -178,6 +178,13 @@ export interface Worktree {
   probeCaseFolding?(): Promise<{ ignoreCase: boolean; precomposeUnicode: boolean }>;
 
   /**
+   * Whether the storage folds case (`README` and `readme` one file), looked at without
+   * writing anything; undefined when there is nothing to tell by. A restore with
+   * `core.ignorecase` guards against case variants unless this is false.
+   */
+  foldsCase?(): Promise<boolean | undefined>;
+
+  /**
    * Runs `fn` as one batch of operations (a checkout's checks and writes), which may share
    * a cache of directories verified not to be links and one reading of the ignore rules
    * (`.gitignore` files, exclude files), both dropped when the batch ends. Outside a batch,

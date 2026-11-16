@@ -105,6 +105,15 @@ export interface FilesApi {
     path: string,
     content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
   ): Promise<boolean>;
+
+  /**
+   * Append `content` to the file at `path`, creating it (and its parent directories) when
+   * missing, as `open(O_WRONLY | O_APPEND | O_CREAT)` does: the file is never rewritten,
+   * so its cost does not grow with its size (git appends reflogs, `rebase-merge/done` and
+   * `rewritten-list` so). Optional: without it a caller reads and rewrites the file. Fails
+   * with `code` "EISDIR" when a directory is at `path`.
+   */
+  append?(path: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>): Promise<void>;
 }
 
 /**

@@ -19,7 +19,7 @@ import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js"
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
-import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 
 /** Names the clone's checkout in failure messages. */
 const CLONE = "clone";
@@ -681,7 +681,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // every path checked (verify_path, collisions) before the first file is written
     const plan = await planTreeRestore(this.trees, this.blobs, commit.tree, CLONE, {
       symlinks: true,
-      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
       windows: worktree.capabilities?.windowsPaths === true,
       reservedNames: worktree.capabilities?.reservedNames,
     });
