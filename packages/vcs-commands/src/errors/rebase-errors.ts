@@ -32,3 +32,15 @@ export class CommitNotFoundError extends GitApiError {
     this.commitRef = commitRef;
   }
 }
+
+/**
+ * Thrown when a rebase in progress has lost its todo list (git's "could not open
+ * '.../git-rebase-todo' for reading"): a missing todo is never read as an empty one, which
+ * would finish the rebase and drop the commits still to pick.
+ */
+export class RebaseTodoMissingError extends GitApiError {
+  constructor(readonly path: string) {
+    super(`could not open '${path}' for reading: No such file or directory`);
+    this.name = "RebaseTodoMissingError";
+  }
+}

@@ -13,6 +13,7 @@ import {
   InvalidArgumentError,
   NoHeadError,
   NoRebaseInProgressError,
+  RebaseTodoMissingError,
   UpstreamRequiredError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -493,6 +494,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     worktree: Worktree | undefined,
     output: string[] = [],
   ): Promise<RebaseResult> {
+    // git's read_populate_todo: a todo that cannot be read is an error, not an empty list
+    if (state.supported && (await state.read(`${DIR}/git-rebase-todo`)) === undefined) {
+      throw new RebaseTodoMissingError(`${DIR}/git-rebase-todo`);
+    }
     let todo = await this.readTodoFile(state, "git-rebase-todo");
     // git's read_populate_todo: the commands done so far and the total (`end`)
     let doneCount = countCommands((await state.read(`${DIR}/done`)) ?? "");
@@ -501,9 +506,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const item = todo[0];
       const rest = todo.slice(1);
       const line = await this.todoText([item]);
-      // git's save_todo: the command appended to `done` (O_APPEND), the rest written
-      await state.append(`${DIR}/done`, line);
+      // git's save_todo: the rest written to `git-rebase-todo` first (a lock file renamed
+      // into place), then the command appended to `done` (O_APPEND); a crash between the
+      // two loses the `done` line, never the todo
       await state.write(`${DIR}/git-rebase-todo`, await this.todoText(rest));
+      await state.append(`${DIR}/done`, line);
       doneCount++;
       await state.write(`${DIR}/msgnum`, `${doneCount}\n`);
       // what the previous command left (pick_commits unlinks it before each one)

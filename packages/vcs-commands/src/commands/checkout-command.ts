@@ -471,7 +471,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         writes: switched.filter((p) => target.has(p)),
         removes: new Set(switched.filter((p) => !target.has(p))),
         index,
-        ignoreCase,
+        ...(await restoreCaseOptions(worktree, ignoreCase)),
       });
       untracked.push(...found.untracked);
       lostDirs.push(...found.lostDirs);

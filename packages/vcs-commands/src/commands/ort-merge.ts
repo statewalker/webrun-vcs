@@ -281,6 +281,13 @@ function sortDirsNextToChildren(one: string, two: string): number {
 }
 
 /**
+ * How often merges took merge-ort's paths that leave no trace in their result, for tests:
+ * `redos` counts the merges redone with the renames the first pass found
+ * (redo_after_renames). Not part of the package's API.
+ */
+export const ortMergeCounters = { redos: 0 };
+
+/**
  * Merges `theirs` into `ours` against `base`, as git's merge-ort
  * (`merge_ort_nonrecursive_internal`). Content-merged blobs are stored in `blobs`.
  */
@@ -417,6 +424,7 @@ class OrtMerge {
     this.collect([base, ours, theirs]);
     if (this.options.renames !== false && (await this.detectAndProcessRenames())) {
       // redo_after_renames: the trees read again, knowing the renames the merge needs
+      ortMergeCounters.redos++;
       this.reset();
       this.collect([base, ours, theirs]);
       await this.detectAndProcessRenames();

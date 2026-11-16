@@ -181,13 +181,28 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       if (this.verified?.has(current)) continue;
       let stat = await this.entryStat(current);
       if (!stat) {
-        try {
-          await fs.mkdir(current);
+        // Made by someone else between the look and the mkdir (EEXIST): looked at again. Gone
+        // again before that look: made once more, then reported as missing (ENOENT), so a
+        // caller's retry or cache invalidation still works.
+        let made = false;
+        for (let attempt = 0; attempt < 2 && !made && !stat; attempt++) {
+          try {
+            await fs.mkdir(current);
+            made = true;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            stat = await this.entryStat(current);
+          }
+        }
+        if (made) {
           this.verified?.add(current);
           continue;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          stat = lstatQuiet(current, false) as import("node:fs").Stats;
+        }
+        if (!stat) {
+          throw Object.assign(
+            new Error(`ENOENT: no such file or directory, mkdir '${virtualPath}'`),
+            { code: "ENOENT" },
+          );
         }
       }
       if (stat.isSymbolicLink()) {

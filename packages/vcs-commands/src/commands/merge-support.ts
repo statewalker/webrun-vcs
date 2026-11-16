@@ -740,7 +740,7 @@ export async function switchTrees(
         writes: updates,
         removes: new Set(deleting),
         index,
-        ignoreCase,
+        ...(await restoreCaseOptions(worktree, ignoreCase)),
       })
     : { untracked: [], lostDirs: [] };
   const message = overwriteMessage(options.action, {

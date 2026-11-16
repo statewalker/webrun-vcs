@@ -311,9 +311,10 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     const trust = worktreeModeTrust(this.workingCopy, worktree);
     // every path of the result verified (verify_path, collisions) before anything is written
     const resultTree = await this.storeFlat(merge.result);
+    const caseOptions = await restoreCaseOptions(worktree, ignoreCase);
     const worktreePlan = await planTreeRestore(this.trees, this.blobs, resultTree, STASH_APPLY, {
       symlinks: true,
-      ...(await restoreCaseOptions(worktree, ignoreCase)),
+      ...caseOptions,
       windows: worktree.capabilities?.windowsPaths === true,
       reservedNames: worktree.capabilities?.reservedNames,
     });
@@ -352,7 +353,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       writes,
       removes: new Set([...removes, ...movedFrom]),
       index,
-      ignoreCase,
+      ...caseOptions,
     });
     // the stashed untracked files (their paths validated before any write); restored
     // after the merge, as git restores them (`checkout-index --all` of their own index)

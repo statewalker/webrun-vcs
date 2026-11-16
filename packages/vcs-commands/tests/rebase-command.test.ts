@@ -143,6 +143,36 @@ describe.each(backends)("RebaseCommand ($name backend)", ({ factory }) => {
 
     expect(result.status).toBe(RebaseStatus.ABORTED);
   });
+
+  /**
+   * A rebase whose `git-rebase-todo` is gone (a crash) fails as git's read_populate_todo
+   * does, instead of reading an empty todo and finishing with the commits still to pick
+   * dropped.
+   */
+  it("refuses to go on when git-rebase-todo is missing", async () => {
+    const { git, workingCopy, repository } = await createInitializedGit();
+    await addFile(workingCopy, "a.txt", "base\n");
+    await git.commit().setMessage("initial").call();
+    await git.branchCreate().setName("feature").call();
+    await addFile(workingCopy, "a.txt", "main\n");
+    await git.commit().setMessage("main-1").call();
+    const mainHead = (await repository.refs.resolve("HEAD"))?.objectId ?? "";
+    await git.checkout().setName("feature").call();
+    await addFile(workingCopy, "a.txt", "feature\n");
+    await git.commit().setMessage("feature-1").call();
+    await addFile(workingCopy, "b.txt", "b\n");
+    await git.commit().setMessage("feature-2").call();
+
+    const stopped = await git.rebase().setUpstream(mainHead).call();
+    expect(stopped.status).toBe(RebaseStatus.STOPPED);
+    const checkout = workingCopy.checkout;
+    if (!checkout.removeStateFile) return;
+    await checkout.removeStateFile("rebase-merge/git-rebase-todo");
+
+    await expect(git.rebase().setOperation(RebaseOperation.SKIP).call()).rejects.toThrow(
+      "could not open 'rebase-merge/git-rebase-todo' for reading",
+    );
+  });
 });
 
 describe.each(backends)("RebaseCommand - API options ($name backend)", ({ factory }) => {

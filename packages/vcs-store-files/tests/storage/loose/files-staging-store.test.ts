@@ -260,3 +260,41 @@ describe("filesStagingStore.spool", () => {
     );
   });
 });
+
+describe("filesStagingStore.putStaged with a create that answers false", () => {
+  const content = async function* () {
+    yield enc.encode("object bytes");
+  };
+
+  it("fails, never writing an empty object, when the create read the content", async () => {
+    const files = createInMemoryFilesApi();
+    files.createExclusive = async (_path, bytes) => {
+      for await (const _ of bytes) {
+        // consumed, then refused
+      }
+      return false;
+    };
+    const store = filesStagingStore(files, "/repo/.git/objects");
+    await expect(store.putStaged(content(), () => "ab".repeat(20))).rejects.toThrow(
+      "the content was read but not stored",
+    );
+    expect(await files.exists(`/repo/.git/objects/ab/${"ab".repeat(19)}`)).toBe(false);
+  });
+
+  it("tries a fresh temporary when the create met a file without reading the content", async () => {
+    const files = createInMemoryFilesApi();
+    const createExclusive = files.createExclusive?.bind(files);
+    if (!createExclusive) return;
+    const tried: string[] = [];
+    files.createExclusive = async (path, bytes) => {
+      tried.push(path);
+      return tried.length === 1 ? false : createExclusive(path, bytes);
+    };
+    const store = filesStagingStore(files, "/repo/.git/objects");
+    const id = "cd".repeat(20);
+    expect(await store.putStaged(content(), () => id)).toEqual({ id, stored: true });
+    expect(tried.length).toBe(2);
+    expect(tried[0]).not.toBe(tried[1]);
+    expect(await text(files.read(`/repo/.git/objects/cd/${"cd".repeat(19)}`))).toBe("object bytes");
+  });
+});

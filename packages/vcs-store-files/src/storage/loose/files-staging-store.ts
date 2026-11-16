@@ -89,15 +89,36 @@ export function filesStagingStore(
       // exclusive create where the FilesApi has one, which also creates `objects/`), the
       // target looked at once, then one rename (whose FilesApi creates the fan-out
       // directory; else it is made and the rename tried again).
-      const tmp = joinPath(objectsDir, tmpName());
+      // `bytes` is one-shot: it is iterated at most once. A create that found a file at the
+      // temporary name (a collision) without reading the content is tried again under a
+      // fresh name, as git's mkstemp does; one that read it and still answered `false` cannot
+      // be retried (the content is gone), so it fails rather than write an empty object.
+      let started = false;
+      const once = {
+        [Symbol.asyncIterator]() {
+          if (started) throw new Error("staged content can be read only once");
+          started = true;
+          return bytes[Symbol.asyncIterator]();
+        },
+      };
+      let tmp = joinPath(objectsDir, tmpName());
       let id: string;
       try {
-        if (!files.createExclusive || !(await files.createExclusive(tmp, bytes))) {
-          await files.write(tmp, bytes);
+        if (!files.createExclusive) {
+          await files.write(tmp, once);
+        } else {
+          for (let attempt = 0; ; attempt++) {
+            if (await files.createExclusive(tmp, once)) break;
+            if (started) {
+              throw new Error(`could not create ${tmp}: the content was read but not stored`);
+            }
+            if (attempt >= 8) throw new Error(`could not create a temporary in ${objectsDir}`);
+            tmp = joinPath(objectsDir, tmpName());
+          }
         }
         id = await idOf();
       } catch (e) {
-        await files.remove(tmp).catch(() => false);
+        if (started) await files.remove(tmp).catch(() => false);
         throw e;
       }
       const target = pathOf(id);

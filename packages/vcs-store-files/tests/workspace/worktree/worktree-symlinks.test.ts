@@ -275,6 +275,23 @@ describe("FileWorktree beneath links, special files, umask, case folding", () =>
     });
     expect(await at(folding)).toBe(true);
   });
+
+  it("looks at the worktree's own entries for case folding, not a git directory outside it", async () => {
+    const at = (files: Parameters<typeof createFileWorktree>[0]["files"], gitDir: string) =>
+      createFileWorktree({ files, rootPath: "/wt", gitDir, ...noStores }).foldsCase?.();
+    // a separate git directory (linked worktree, submodule) may be on another filesystem
+    const separate = createInMemoryFilesApi({ "/repo.git/config": "x" });
+    await separate.mkdir("/wt");
+    expect(await at(separate, "/repo.git")).toBeUndefined();
+    // one inside the root is still looked at when the root has nothing else
+    expect(await at(createInMemoryFilesApi({ "/wt/.git/config": "x" }), "/wt/.git")).toBe(false);
+    // the worktree's entries come first
+    const folding = createSymlinkFilesApi(
+      createInMemoryFilesApi({ "/wt/README": "x", "/repo.git/config": "x" }),
+      { ignoreCase: true },
+    );
+    expect(await at(folding, "/repo.git")).toBe(true);
+  });
 });
 
 describe("FileWorktree path rules follow the FilesApi's platform", () => {

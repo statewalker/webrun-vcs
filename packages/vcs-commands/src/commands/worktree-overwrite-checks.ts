@@ -156,22 +156,49 @@ export interface InTheWay {
 /**
  * Finds what stands where `writes` (paths not in the index) are written, `removes` being
  * the tracked paths the operation deletes first. Ignored files are expendable, as in git.
- * With `ignoreCase`, a file that is one of `removes` in another case is no obstacle (a
- * case-only rename on a case-folding worktree).
+ * With `ignoreCase`, a file that is an index entry seen in another case is no obstacle (a
+ * case-only rename on a case-folding worktree), as git's `icase_exists`: only where the
+ * worktree folds case (`foldsCase` not false) and the file's stat matches that entry's,
+ * so it is that entry's file. An untracked file of its own in the other case (a
+ * case-sensitive worktree with `core.ignorecase` set) is still in the way.
  */
 export async function findInTheWay(
   worktree: Worktree,
   options: {
     writes: string[];
     removes: Set<string>;
+    /** The index's entries (their stat compared where `ignoreCase` needs it) */
     index: Map<string, unknown>;
     ignoreCase?: boolean;
+    /** Whether the worktree folds case ({@link Worktree.foldsCase}); undefined: unknown */
+    foldsCase?: boolean;
   },
 ): Promise<InTheWay> {
   const { writes, removes, index } = options;
   const untracked = new Set<string>();
   const lostDirs: string[] = [];
-  const removingFolded = new Set([...removes].map((p) => p.toLowerCase()));
+  // the index by folded path (git's index_file_exists with icase), built only when needed
+  let folded: Map<string, unknown> | undefined;
+  const otherCase = (path: string): CheckedEntry | undefined => {
+    if (!folded) {
+      folded = new Map();
+      for (const [p, e] of index) {
+        const key = p.toLowerCase();
+        if (!folded.has(key)) folded.set(key, e);
+      }
+    }
+    const entry = folded.get(path.toLowerCase()) as CheckedEntry | undefined;
+    return typeof entry?.mode === "number" ? entry : undefined;
+  };
+  const icaseExists = async (path: string, current: WorktreeEntry): Promise<boolean> => {
+    if (!options.ignoreCase || options.foldsCase === false) return false;
+    const entry = otherCase(path);
+    if (!entry) return false;
+    if ((current.mode === FileMode.SYMLINK) !== (entry.mode === FileMode.SYMLINK)) return false;
+    if (basicStatMatches(entry as StagingEntry, current)) return true;
+    // an entry without a usable stat (a store that records none): its content tells
+    return !entry.mtime && !(await differsFrom(worktree, path, entry, current));
+  };
   const tracked = (p: string) => index.has(p) && !removes.has(p);
   // directories holding tracked files that stay: a file written there would replace them
   // (read from the index only when something is written)
@@ -212,7 +239,7 @@ export async function findInTheWay(
       if (await untrackedUnder(worktree, path, keeps)) lostDirs.push(path);
       continue;
     }
-    if (options.ignoreCase && removingFolded.has(path.toLowerCase())) continue;
+    if (await icaseExists(path, entry)) continue;
     if (!(await worktree.isIgnored(path))) untracked.add(path);
   }
   return { untracked: [...untracked], lostDirs };

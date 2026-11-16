@@ -22,7 +22,7 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { flatTree, storeFlatTreeOver } from "../src/commands/merge-support.js";
-import { ortResultEntries } from "../src/commands/ort-merge.js";
+import { ortMergeCounters, ortResultEntries } from "../src/commands/ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../src/commands/ort-recursive.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
@@ -269,13 +269,52 @@ function nativeVersion(): [number, number] {
  * rename moves onto a base file is in the way unless that file is its own rename source
  * (path_in_way, t6423 12[npq]), and a rename a directory rename moves back onto its source
  * stays where it is (process_renames' rename-to-self). Older versions differ there.
+ *
+ * Returns the messages that show such a case (ours for one in the way native does not
+ * report, native's for a rename-to-self): only the paths they name are excused, the rest of
+ * the merge is still compared.
  */
-function knownOldGitDifference(ours: Outcome, native: Outcome): boolean {
+function knownOldGitDifference(ours: Outcome, native: Outcome): string[] {
   const inWay = (m: string) => m.includes("in the way of implicit directory rename");
-  if (ours.messages.some((m) => inWay(m) && !native.messages.includes(m))) return true;
   const toSelf =
     /^(?:CONFLICT \(file location\)|Path updated): (\S+) renamed to \S+ in \S+, inside a directory that was renamed in \S+[,;] (?:suggesting it should perhaps be moved|moving it) to \1\.$/;
-  return native.messages.some((m) => toSelf.test(m));
+  return [
+    ...ours.messages.filter((m) => inWay(m) && !native.messages.includes(m)),
+    ...native.messages.filter((m) => toSelf.test(m)),
+  ];
+}
+
+/** The paths of `known` (every path of the merge) that `messages` name. */
+function pathsNamed(messages: string[], known: Set<string>): Set<string> {
+  const named = new Set<string>();
+  for (const m of messages) {
+    for (const word of m.split(/\s+/)) {
+      const path = word.replace(/[.,;:]+$/, "");
+      if (known.has(path)) named.add(path);
+    }
+  }
+  return named;
+}
+
+/**
+ * The outcome with every trace of `paths` left out: their tree entries (listed as
+ * `ls-tree -r` lists them), their conflict stages and the messages naming them.
+ */
+function withoutPaths(
+  outcome: Outcome,
+  listing: string[],
+  paths: Set<string>,
+): { tree: string[]; stages: string[]; messages: string[] } {
+  const excused = (p: string) =>
+    paths.has(p) || [...paths].some((x) => p.startsWith(`${x}/`) || x.startsWith(`${p}/`));
+  const pathOf = (line: string) => line.slice(line.indexOf("\t") + 1);
+  return {
+    tree: listing.filter((l) => !excused(pathOf(l))),
+    stages: outcome.stages.filter((l) => !excused(pathOf(l))),
+    messages: outcome.messages.filter(
+      (m) => !m.split(/\s+/).some((w) => paths.has(w.replace(/[.,;:]+$/, ""))),
+    ),
+  };
 }
 
 const gitVersion = nativeGitAvailable() ? nativeVersion() : ([0, 0] as [number, number]);
@@ -388,8 +427,34 @@ async function compareMerges(
       }
     }
     if (diffs.length === 0) continue;
-    if (!gitAtLeast252 && knownOldGitDifference(ourOutcome, native)) tolerated++;
-    else failures.push(`${name} (${plan.kind}, ${plan.mode}): ${diffs.join("\n")}`);
+    const known = gitAtLeast252 ? [] : knownOldGitDifference(ourOutcome, native);
+    if (known.length > 0) {
+      // only the paths the known difference names are excused: the rest of the tree, the
+      // stages and the messages must still agree
+      const listing = (id: string) =>
+        git(["ls-tree", "-r", id])
+          .stdout.split("\n")
+          .filter((l) => l !== "");
+      const [ourListing, nativeListing] = [listing(ourOutcome.tree), listing(native.tree)];
+      const all = new Set(
+        [...plan.base.keys(), ...plan.main.keys(), ...plan.side.keys()].concat(
+          [...ourListing, ...nativeListing, ...ourOutcome.stages, ...native.stages].map((l) =>
+            l.slice(l.indexOf("\t") + 1),
+          ),
+        ),
+      );
+      const paths = pathsNamed(known, all);
+      const [o, n] = [
+        withoutPaths(ourOutcome, ourListing, paths),
+        withoutPaths(native, nativeListing, paths),
+      ];
+      if (paths.size > 0 && JSON.stringify(o) === JSON.stringify(n)) {
+        tolerated++;
+        continue;
+      }
+      diffs.push(`beyond the known old-git difference on ${JSON.stringify([...paths])}`);
+    }
+    failures.push(`${name} (${plan.kind}, ${plan.mode}): ${diffs.join("\n")}`);
   }
   if (!process.env.ORT_RENAME_FUZZ_KEEP) rmSync(repo, { recursive: true, force: true });
   return { failures, tolerated, conflicted };
@@ -439,11 +504,23 @@ describeGit("merge-ort renames fuzz against git merge-tree", () => {
 
   it("rename conflicts with directory renames merge as native merge-tree merges them", async () => {
     const plans = new Map(seeds.map((seed) => [String(seed), randomPlan(seed)]));
+    const redosBefore = ortMergeCounters.redos;
     const { failures, tolerated, conflicted } = await compareMerges(root, plans);
+    const redos = ortMergeCounters.redos - redosBefore;
     if (process.env.ORT_RENAME_FUZZ_STATS) {
-      console.log("conflicted by kind", Object.fromEntries(conflicted), "tolerated", tolerated);
+      console.log(
+        "conflicted by kind",
+        Object.fromEntries(conflicted),
+        "tolerated",
+        tolerated,
+        "redone",
+        redos,
+      );
     }
     expect(failures).toEqual([]);
+    // the default run takes merge-ort's redo_after_renames at least once (a regression that
+    // disables it would otherwise pass unnoticed: a redo changes no result)
+    if (!only && start === 20000 && count >= 300) expect(redos).toBeGreaterThan(0);
   }, 900_000);
 
   // older versions resolve these the old way (knownOldGitDifference)
