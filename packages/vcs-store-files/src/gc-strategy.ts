@@ -25,6 +25,11 @@ import { joinPath } from "@statewalker/vcs-core";
 import { collectReachabilityRoots } from "./reachable-objects.js";
 
 import { type RepackTarget, repack } from "./repack.js";
+import {
+  assertNoAlternates,
+  assertObjectsDeletable,
+  readRepositoryFormat,
+} from "./repository-format.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
 /** A loose object file name, fan-out directory included. */
@@ -59,9 +64,17 @@ export class FileGcStrategy implements GcStrategy {
     this.target = options;
   }
 
-  /** HEAD, the index, every reflog file, linked worktrees and pseudo-refs; strict, as `gc()`. */
+  /**
+   * HEAD, the index, every reflog file, linked worktrees and pseudo-refs; strict, as `gc()`.
+   * Called first by the orchestrator, so it also refuses, before anything is pruned, a
+   * repository with `extensions.preciousObjects` (git: "cannot prune in a precious-objects
+   * repo"), a partial clone (`extensions.partialClone`, a promisor remote) or a repository
+   * with `objects/info/alternates`: `UnsupportedRepositoryFormatError`.
+   */
   async collectRoots(): Promise<GcRoots> {
     const { files, gitDir, history, objects } = this.target;
+    assertObjectsDeletable(await readRepositoryFormat(files, gitDir), "prune");
+    await assertNoAlternates(files, gitDir, "prune");
     return {
       roots: await collectReachabilityRoots({ files, gitDir, refs: history.refs, objects }),
     };

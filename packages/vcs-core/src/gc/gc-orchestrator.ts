@@ -40,6 +40,12 @@ export interface GcRunOptions {
    * (`--prune=now`). Strategies that cannot tell an object's age (memory, SQL) keep none.
    */
   pruneExpireMs?: number;
+  /**
+   * Read every reachable blob to its end and check its length before pruning (default true),
+   * so a truncated blob aborts the run. Prune only removes unreachable objects, so turning it
+   * off risks no data loss; it only reports such corruption later, as `git gc` does.
+   */
+  verifyBlobs?: boolean;
 }
 
 /** Default `GcRunOptions.pruneExpireMs`: two weeks, git's `gc.pruneExpire`. */
@@ -93,7 +99,9 @@ export class GcOrchestrator {
    *    the index, every reflog file and the linked worktrees)
    * 2. Walk reachable objects via history.collectReachableObjects() with `missing: "throw"`
    *    and the shallow commits: a reachable object that is missing or cannot be read throws
-   *    (`MissingObjectError`, `CorruptObjectError`) before anything is pruned, as `git gc` fails
+   *    (`MissingObjectError`, `CorruptObjectError`) before anything is pruned, as `git gc` fails.
+   *    Blobs are read to their end and their length checked (`verifyBlobs`), so a truncated
+   *    blob aborts too; beyond the shallow boundary objects are optional
    * 3. Compute unreachable = allStoredObjects - reachable, then keep the recent ones
    *    (`GcStrategy.recentObjects`, `pruneExpireMs`) and everything they reach
    * 4. Call strategy.prune(unreachable), then sweep stale temporaries
@@ -118,6 +126,7 @@ export class GcOrchestrator {
     for await (const oid of this.history.collectReachableObjects(roots, new Set(), {
       missing: "throw",
       shallow,
+      verifyBlobs: options.verifyBlobs ?? true,
     })) {
       reachable.add(oid);
     }

@@ -172,6 +172,19 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   }
 
   /**
+   * Every key that has a value and starts with `prefix`, canonical (section and name in
+   * lower case), in no particular order; `listKeys("extensions.")` gives the
+   * repository's extensions.
+   */
+  listKeys(prefix = ""): string[] {
+    const keys: string[] = [];
+    for (const [key, values] of this.values) {
+      if (values.length > 0 && key.startsWith(prefix)) keys.push(key);
+    }
+    return keys;
+  }
+
+  /**
    * Set a configuration value, replacing all existing values of the key.
    *
    * @throws TypeError if the key has no section part

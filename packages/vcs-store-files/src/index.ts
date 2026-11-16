@@ -24,6 +24,8 @@ export * from "./reachable-objects.js";
 export * from "./refs/index.js";
 // Repack
 export * from "./repack.js";
+// core.repositoryformatversion and extensions.*, checked as git does
+export * from "./repository-format.js";
 // A `.git` or `.git/objects` linked elsewhere, resolved through the FilesApi
 export * from "./resolve-linked-git-dir.js";
 // Storage implementations (file-dependent)

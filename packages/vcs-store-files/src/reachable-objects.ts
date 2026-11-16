@@ -1,12 +1,16 @@
 /**
  * What repack and gc keep: the objects reachable from every ref, HEAD, the reflogs, the index
  * (every stage, the trees of its cache-tree and the blobs of its resolve-undo extension) and
- * every linked worktree (its HEAD, index and reflogs), as `git repack -a` (`--all --reflog
- * --indexed-objects`) and `git prune` walk them (git's `mark_reachable_objects`).
+ * every linked worktree (its HEAD, index, reflogs and per-worktree refs: `refs/bisect/*`,
+ * `refs/worktree/*`, `refs/rewritten/*` under `worktrees/<name>/`), as `git repack -a`
+ * (`--all --reflog --indexed-objects`) and `git prune` walk them (git's
+ * `mark_reachable_objects`). The main worktree's per-worktree refs live under `refs/` and are
+ * read with the other refs.
  *
  * Beyond git: the pseudo-refs of an operation in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
- * `REVERT_HEAD`, `REBASE_HEAD`, `ORIG_HEAD`, `AUTO_MERGE`, `BISECT_HEAD`, `FETCH_HEAD`), of
- * the repository and of each linked worktree, are roots too. git's `for_each_ref` does not list
+ * `REVERT_HEAD`, `REBASE_HEAD`, `ORIG_HEAD`, `AUTO_MERGE`, `BISECT_HEAD`, `FETCH_HEAD`) and
+ * the autostash of a merge or rebase (`MERGE_AUTOSTASH`, `rebase-merge/autostash`,
+ * `rebase-apply/autostash`), of the repository and of each linked worktree, are roots too. git's `for_each_ref` does not list
  * them, so `git gc --prune=now` may delete a commit only they name (one fetched into
  * `FETCH_HEAD` alone, or a merged branch deleted mid-merge); we keep it.
  *
@@ -95,6 +99,17 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
         return resolveStored(target) ?? (await refs.resolve(target))?.objectId;
       });
       if (id) tips.add(id);
+      // its per-worktree refs (refs/bisect/*, refs/worktree/*, refs/rewritten/*), always loose
+      const own = await readAllRefs(files, wt.path, "refs/", { strict: true });
+      const ownByName = new Map(own.map((r) => [r.name, r]));
+      for (const ref of own) {
+        let target: typeof ref | undefined = ref;
+        for (let depth = 0; target && isSymbolicRef(target) && depth < 5; depth++) {
+          const name: string = target.target;
+          target = ownByName.get(name) ?? byName.get(name);
+        }
+        if (target && !isSymbolicRef(target) && target.objectId) tips.add(target.objectId);
+      }
       for (const id of await reflogIds(files, joinPath(wt.path, "logs"))) tips.add(id);
       for (const id of await indexIds(files, joinPath(wt.path, "index"))) tips.add(id);
       for (const id of await pseudoRefIds(files, wt.path)) tips.add(id);
@@ -137,8 +152,10 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
 
 /**
  * Pseudo-refs of an operation in progress, which name commits a reflog may not: a merge's
- * `MERGE_HEAD` (one line per merged head), `FETCH_HEAD` (one line per fetched ref), and the
- * single-id ones.
+ * `MERGE_HEAD` (one line per merged head), `FETCH_HEAD` (one line per fetched ref), the
+ * single-id ones, and the stash commits `--autostash` keeps while a merge or rebase runs
+ * (`MERGE_AUTOSTASH`, `rebase-merge/autostash`, `rebase-apply/autostash`), which nothing else
+ * names until they are applied or stored in the stash.
  */
 const PSEUDO_REFS = [
   "ORIG_HEAD",
@@ -149,6 +166,9 @@ const PSEUDO_REFS = [
   "AUTO_MERGE",
   "BISECT_HEAD",
   "FETCH_HEAD",
+  "MERGE_AUTOSTASH",
+  "rebase-merge/autostash",
+  "rebase-apply/autostash",
 ];
 
 /** The object ids at the start of the lines of the pseudo-refs in `dir`. */
