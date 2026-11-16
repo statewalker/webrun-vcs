@@ -4,6 +4,7 @@ export {
   selectDeltaCandidates,
 } from "./delta-candidate-selector.js";
 export {
+  DEFAULT_GC_PRUNE_EXPIRE_MS,
   DEFAULT_STALE_EXPIRY_MS,
   GcOrchestrator,
   type GcRunOptions,
@@ -12,6 +13,7 @@ export {
 export type {
   CompactResult,
   DeltaCandidatePair,
+  GcRoots,
   GcStrategy,
   StorageStats,
 } from "./gc-strategy.js";

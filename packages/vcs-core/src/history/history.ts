@@ -123,11 +123,18 @@ export interface History {
   /**
    * Collect all objects reachable from wants, excluding haves
    *
-   * Used for pack creation during transport operations (fetch/push).
-   * Traverses the object graph from commits through trees to blobs.
+   * Used for pack creation during transport operations (fetch/push) and by gc.
+   * Traverses the object graph from commits through trees to blobs (gitlinks, the commits of
+   * submodules, are not followed).
+   *
+   * An object that is stored but cannot be read or decoded throws `CorruptObjectError`: the
+   * walk never treats it as absent, since what lies behind it would silently drop out (and gc
+   * would delete it). A want that is not stored is skipped; an absent object below a want is
+   * skipped too, unless `options.missing` is `"throw"` (see `CollectReachableOptions`).
    *
    * @param wants - Object IDs to include (with all reachable objects)
    * @param exclude - Object IDs to exclude (already known by recipient)
+   * @param options - How absent objects are handled, and the shallow boundary
    * @returns AsyncIterable of object IDs in traversal order
    *
    * @example
@@ -141,7 +148,43 @@ export interface History {
    * }
    * ```
    */
-  collectReachableObjects(wants: Set<string>, exclude: Set<string>): AsyncIterable<ObjectId>;
+  collectReachableObjects(
+    wants: Set<string>,
+    exclude: Set<string>,
+    options?: CollectReachableOptions,
+  ): AsyncIterable<ObjectId>;
+}
+
+/**
+ * Options of `History.collectReachableObjects`.
+ *
+ * @example
+ * ```typescript
+ * // gc: every object below a root must be there, except beyond the shallow boundary
+ * const shallow = (await history.refs.getShallow?.()) ?? [];
+ * for await (const id of history.collectReachableObjects(roots, new Set(), { missing: "throw", shallow })) {
+ *   keep.add(id);
+ * }
+ * ```
+ */
+export interface CollectReachableOptions {
+  /**
+   * What an object referred to by a reachable one, and not stored, does: `"skip"` (the
+   * default) leaves it out, `"throw"` throws `MissingObjectError`, as `git rev-list` and
+   * `git gc` fail on a missing object. Wants that are not stored are skipped either way (git
+   * ignores a broken ref), and so are the parents of shallow commits.
+   */
+  missing?: "skip" | "throw";
+  /**
+   * Shallow commits (`.git/shallow`): their parents may be absent. Parents that are stored
+   * are still walked, so what lies beyond the boundary is kept, not listed as unreachable.
+   */
+  shallow?: Iterable<ObjectId>;
+  /**
+   * Objects already collected: neither yielded nor walked again. Unlike `exclude`, nothing is
+   * read to expand them (gc passes what it found reachable when it walks from recent objects).
+   */
+  known?: ReadonlySet<ObjectId>;
 }
 
 /**

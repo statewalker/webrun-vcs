@@ -2,6 +2,10 @@
  * File-backed GC strategy.
  *
  * Implements GcStrategy for file-backed repositories:
+ * - collectRoots: what git keeps beyond the refs (`collectReachabilityRoots`: HEAD, the index
+ *   with its cache-tree and resolve-undo, every reflog, linked worktrees, pseudo-refs)
+ * - recentObjects: unreachable loose objects modified within the grace period (git's
+ *   `gc.pruneExpire`), which the orchestrator keeps with what they reach
  * - prune: remove unreachable loose objects
  * - compact: pack the reachable loose objects (`git repack -d`)
  * - deltify: no-op (placeholder for Phase 5)
@@ -11,9 +15,14 @@
 import type {
   CompactResult,
   DeltaCandidatePair,
+  GcRoots,
   GcStrategy,
+  ObjectId,
   StorageStats,
 } from "@statewalker/vcs-core";
+import { joinPath } from "@statewalker/vcs-core";
+
+import { collectReachabilityRoots } from "./reachable-objects.js";
 
 import { type RepackTarget, repack } from "./repack.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
@@ -34,8 +43,12 @@ export type FileGcStrategyOptions = RepackTarget;
  * const backend = await createGitFilesBackend({ files, create: true });
  * const strategy = new FileGcStrategy(backend);
  * const orchestrator = new GcOrchestrator(backend.history, strategy);
- * await orchestrator.run({ compact: true });
+ * await orchestrator.run({ compact: true }); // unreachable loose objects older than two weeks go
  * ```
+ *
+ * Where it differs from `gc()` (and `git gc`): the orchestrator prunes loose objects only (a
+ * packed unreachable object stays until a full repack), walks through the parents of shallow
+ * commits that are stored instead of stopping there, and takes no `gc.pid` lock.
  */
 export class FileGcStrategy implements GcStrategy {
   private readonly looseStorage: FileRawStorage;
@@ -44,6 +57,31 @@ export class FileGcStrategy implements GcStrategy {
   constructor(options: FileGcStrategyOptions) {
     this.looseStorage = options.looseStorage;
     this.target = options;
+  }
+
+  /** HEAD, the index, every reflog file, linked worktrees and pseudo-refs; strict, as `gc()`. */
+  async collectRoots(): Promise<GcRoots> {
+    const { files, gitDir, history, objects } = this.target;
+    return {
+      roots: await collectReachabilityRoots({ files, gitDir, refs: history.refs, objects }),
+    };
+  }
+
+  /**
+   * The loose objects among `ids` modified within `pruneExpireMs` (or of unknown age), as
+   * `git prune --expire` spares them. A packed object is never recent here: `prune` does not
+   * remove packed objects anyway.
+   */
+  async recentObjects(ids: Set<ObjectId>, pruneExpireMs: number): Promise<Set<ObjectId>> {
+    const { files, gitDir = ".git" } = this.target;
+    const cutoff = Date.now() - pruneExpireMs;
+    const recent = new Set<ObjectId>();
+    for (const id of ids) {
+      const stats = await files.stats(joinPath(gitDir, "objects", id.slice(0, 2), id.slice(2)));
+      if (stats?.kind !== "file") continue;
+      if (stats.lastModified === undefined || stats.lastModified >= cutoff) recent.add(id);
+    }
+    return recent;
   }
 
   async prune(unreachableIds: Set<string>): Promise<number> {

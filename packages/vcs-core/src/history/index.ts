@@ -3,7 +3,7 @@ export * from "./commits/index.js";
 export * from "./create-history.js";
 export * from "./format/index.js";
 export { HistoryImpl, HistoryWithOperationsImpl } from "./history.impl.js";
-export type { History, HistoryWithOperations } from "./history.js";
+export type { CollectReachableOptions, History, HistoryWithOperations } from "./history.js";
 export * from "./objects/index.js";
 export * from "./refs/index.js";
 export * from "./tags/index.js";

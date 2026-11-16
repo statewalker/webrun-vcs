@@ -1,14 +1,14 @@
 /**
  * What repack and gc keep: the objects reachable from every ref, HEAD, the reflogs, the index
- * and every linked worktree (its HEAD, index and reflogs), as `git repack -a` (`--all --reflog
- * --indexed-objects`) and `git prune` walk them.
+ * (every stage, the trees of its cache-tree and the blobs of its resolve-undo extension) and
+ * every linked worktree (its HEAD, index and reflogs), as `git repack -a` (`--all --reflog
+ * --indexed-objects`) and `git prune` walk them (git's `mark_reachable_objects`).
  *
- * Not read: the trees of the index's cache-tree (TREE) extension and the blobs of its
- * resolve-undo (REUC) extension, which git also counts as roots. The index parser does not
- * parse extensions. A tree only the cache-tree names may be pruned, and git then rebuilds that
- * part of the cache-tree (it checks each tree exists before use). A blob only resolve-undo names
- * (the stages of a conflict resolved since) may be pruned too, and `git checkout -m` can then
- * not recreate that conflict.
+ * Beyond git: the pseudo-refs of an operation in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
+ * `REVERT_HEAD`, `REBASE_HEAD`, `ORIG_HEAD`, `AUTO_MERGE`, `BISECT_HEAD`, `FETCH_HEAD`), of
+ * the repository and of each linked worktree, are roots too. git's `for_each_ref` does not list
+ * them, so `git gc --prune=now` may delete a commit only they name (one fetched into
+ * `FETCH_HEAD` alone, or a merged branch deleted mid-merge); we keep it.
  *
  * A split index (a `link` extension) is refused: its entries live partly in a shared index
  * file, so the blobs staged there would silently stop being roots. gc and repack throw before
@@ -17,7 +17,8 @@
 
 import type { FilesApi, GitObjects, ListedObject, ObjectId, Refs } from "@statewalker/vcs-core";
 import { isSymbolicRef, joinPath, listObjects } from "@statewalker/vcs-core";
-import { parseIndexFile } from "@statewalker/vcs-working-tree";
+import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { parseIndexFile, parseResolveUndo } from "@statewalker/vcs-working-tree";
 
 import { readAllRefs } from "./refs/index.js";
 
@@ -39,10 +40,12 @@ export interface ReachabilityRoots {
 
 /**
  * The roots of reachability: every ref, HEAD, the old and new ids of every reflog entry
- * (`logs/HEAD`, `logs/refs/...`), the entries of the index (gitlinks excepted), and for each
- * linked worktree (`worktrees/<name>/`) its HEAD (detached or symbolic), index and reflogs, as
- * git's `other_head_refs` and its worktree index and reflog walks. Roots the store does not
- * have are left out (a reflog may name objects pruned long ago).
+ * (`logs/HEAD`, `logs/refs/...`), the entries of the index (gitlinks excepted, every stage),
+ * the trees of its cache-tree (TREE) and the blobs of its resolve-undo (REUC) extension, the
+ * pseudo-refs (see above), and for each linked worktree (`worktrees/<name>/`) its HEAD
+ * (detached or symbolic), index, reflogs and pseudo-refs, as git's `other_head_refs` and its
+ * worktree index and reflog walks. Roots the store does not have are left out (a reflog may
+ * name objects pruned long ago).
  *
  * Refs are listed strictly from the files: a ref that cannot be read or is malformed throws,
  * as does an unreadable reflog, index or worktree HEAD. A root skipped silently would let gc
@@ -81,6 +84,7 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
 
   for (const id of await reflogIds(files, joinPath(gitDir, "logs"))) tips.add(id);
   for (const id of await indexIds(files, joinPath(gitDir, "index"))) tips.add(id);
+  for (const id of await pseudoRefIds(files, gitDir)) tips.add(id);
 
   // Linked worktrees: their HEAD, index and reflogs live under worktrees/<name>/
   const worktrees = joinPath(gitDir, "worktrees");
@@ -93,6 +97,7 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
       if (id) tips.add(id);
       for (const id of await reflogIds(files, joinPath(wt.path, "logs"))) tips.add(id);
       for (const id of await indexIds(files, joinPath(wt.path, "index"))) tips.add(id);
+      for (const id of await pseudoRefIds(files, wt.path)) tips.add(id);
     }
   }
 
@@ -124,8 +129,39 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
   const wants = await collectReachabilityRoots(roots);
   const listed: ListedObject[] = [];
   if (wants.length === 0) return listed;
-  for await (const o of listObjects(roots.objects, { wants })) listed.push(o);
+  // the parents of shallow commits are not there (git's grafts): not walked
+  const shallow = (await roots.refs.getShallow?.()) ?? [];
+  for await (const o of listObjects(roots.objects, { wants, shallow })) listed.push(o);
   return listed;
+}
+
+/**
+ * Pseudo-refs of an operation in progress, which name commits a reflog may not: a merge's
+ * `MERGE_HEAD` (one line per merged head), `FETCH_HEAD` (one line per fetched ref), and the
+ * single-id ones.
+ */
+const PSEUDO_REFS = [
+  "ORIG_HEAD",
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "REBASE_HEAD",
+  "AUTO_MERGE",
+  "BISECT_HEAD",
+  "FETCH_HEAD",
+];
+
+/** The object ids at the start of the lines of the pseudo-refs in `dir`. */
+async function pseudoRefIds(files: FilesApi, dir: string): Promise<ObjectId[]> {
+  const ids: ObjectId[] = [];
+  for (const name of PSEUDO_REFS) {
+    const text = await readText(files, joinPath(dir, name));
+    for (const line of text?.split("\n") ?? []) {
+      const id = line.slice(0, 40).toLowerCase();
+      if (OID.test(id) && id !== ZERO) ids.push(id);
+    }
+  }
+  return ids;
 }
 
 async function readText(files: FilesApi, path: string): Promise<string | undefined> {
@@ -181,5 +217,39 @@ async function indexIds(files: FilesApi, indexPath: string): Promise<ObjectId[]>
         "run `git update-index --no-split-index` first",
     );
   }
-  return parsed.entries.filter((e) => e.mode !== GITLINK).map((e) => e.objectId);
+  const ids = parsed.entries.filter((e) => e.mode !== GITLINK).map((e) => e.objectId);
+  for (const ext of parsed.extensionData) {
+    if (ext.signature === "TREE") ids.push(...cacheTreeIds(ext.data, indexPath));
+    else if (ext.signature === "REUC") {
+      // git's add_resolve_undo_to_pending: `git checkout -m` recreates a conflict from them
+      for (const record of parseResolveUndo(ext.data)) {
+        record.objectIds.forEach((id, i) => {
+          if (id && record.modes[i] !== GITLINK) ids.push(id);
+        });
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * The trees of a cache-tree (TREE) extension: per node, a NUL-terminated path, the ASCII entry
+ * count, a space, the ASCII subtree count and a newline, then the tree id unless the entry
+ * count is -1 (an invalidated node). git's `add_cache_tree` keeps them.
+ */
+function cacheTreeIds(data: Uint8Array, indexPath: string): ObjectId[] {
+  const ids: ObjectId[] = [];
+  let p = 0;
+  while (p < data.length) {
+    const nul = data.indexOf(0, p);
+    const lf = nul < 0 ? -1 : data.indexOf(10, nul);
+    if (lf < 0) throw new Error(`${indexPath}: malformed cache-tree extension`);
+    const [count] = new TextDecoder().decode(data.subarray(nul + 1, lf)).split(" ");
+    p = lf + 1;
+    if (Number(count) < 0) continue;
+    if (p + 20 > data.length) throw new Error(`${indexPath}: malformed cache-tree extension`);
+    ids.push(bytesToHex(data.subarray(p, p + 20)));
+    p += 20;
+  }
+  return ids;
 }

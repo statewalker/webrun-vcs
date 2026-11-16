@@ -7,6 +7,7 @@
 import type { ObjectId } from "../../common/id/index.js";
 import type { GitObjects } from "../objects/git-objects.js";
 import {
+  hasObjectOfType,
   loadTypedObject,
   objectHeader,
   removeObject,
@@ -111,15 +112,7 @@ class GitTreeStore implements Trees {
     if (id === EMPTY_TREE_ID) {
       return true;
     }
-    if (!(await this.objects.has(id))) {
-      return false;
-    }
-    try {
-      const header = await objectHeader(this.objects, id);
-      return header?.type === "tree";
-    } catch {
-      return false;
-    }
+    return hasObjectOfType(this.objects, id, "tree");
   }
 
   /**

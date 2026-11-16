@@ -8,6 +8,7 @@ import type { ObjectId } from "../../common/id/index.js";
 import type { GitObjects } from "../objects/git-objects.js";
 import { ObjectType } from "../objects/object-types.js";
 import {
+  hasObjectOfType,
   loadTypedObject,
   objectHeader,
   removeObject,
@@ -104,15 +105,7 @@ class GitTagStore implements Tags {
    * Check if tag exists
    */
   async has(id: ObjectId): Promise<boolean> {
-    if (!(await this.objects.has(id))) {
-      return false;
-    }
-    try {
-      const header = await objectHeader(this.objects, id);
-      return header?.type === "tag";
-    } catch {
-      return false;
-    }
+    return hasObjectOfType(this.objects, id, "tag");
   }
 
   /**
