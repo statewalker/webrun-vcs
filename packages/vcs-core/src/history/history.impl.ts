@@ -74,17 +74,32 @@ async function readAll(content: AsyncIterable<Uint8Array>, size: number): Promis
   return data;
 }
 
+/** Reads `content` to its end, chunk by chunk, and checks it has the `size` its header says. */
+async function checkLength(content: AsyncIterable<Uint8Array>, size: number): Promise<void> {
+  let length = 0;
+  for await (const chunk of content) {
+    length += chunk.length;
+    if (length > size) throw new Error("longer than its header says");
+  }
+  if (length !== size) throw new Error(`shorter than its header says (${length} of ${size} bytes)`);
+}
+
 /**
  * The ids an object refers to (a commit's tree and parents, a tree's entries but gitlinks, a
  * tag's target, none for a blob), from a single read of the object; undefined if it is absent
- * (the empty tree exists even when not stored).
+ * (the empty tree exists even when not stored). With `verifyBlob`, a blob is read to its end
+ * (inflated and streamed, never held whole) and must have the length its header says.
  *
  * An object that is stored but cannot be read, or whose content does not decode, throws
  * `CorruptObjectError`: treating it as absent would cut the walk there and let gc delete
  * everything only it leads to. Commits are read by their tree and parent lines only, so an odd
  * author line (which git accepts too) does not count as corruption.
  */
-async function readChildIds(objects: GitObjects, oid: string): Promise<string[] | undefined> {
+async function readChildIds(
+  objects: GitObjects,
+  oid: string,
+  verifyBlob = false,
+): Promise<string[] | undefined> {
   let obj: Awaited<ReturnType<GitObjects["get"]>>;
   try {
     obj = await objects.get(oid);
@@ -107,6 +122,9 @@ async function readChildIds(objects: GitObjects, oid: string): Promise<string[] 
       }
       case "tag":
         return [tagTarget(oid, await readAll(content, obj.size))];
+      case "blob":
+        if (verifyBlob) await checkLength(content, obj.size);
+        return [];
       default:
         return [];
     }
@@ -195,7 +213,8 @@ export class HistoryImpl implements History {
    *
    * A stored object that cannot be read or decoded throws `CorruptObjectError`; an absent one
    * is skipped, or throws `MissingObjectError` with `missing: "throw"` unless it is a want or
-   * the parent of a shallow commit (see `CollectReachableOptions`).
+   * lies beyond the shallow boundary (see `CollectReachableOptions`). With `verifyBlobs` (the
+   * default when strict), blobs are read to their end and their length checked.
    */
   async *collectReachableObjects(
     wants: Set<string>,
@@ -206,6 +225,7 @@ export class HistoryImpl implements History {
     const strict = options.missing === "throw";
     const shallow = new Set(options.shallow ?? []);
     const known = options.known ?? new Set<string>();
+    const verifyBlobs = options.verifyBlobs ?? strict;
     // When strict, an object referred to by a reachable one must be stored, unless the
     // reference is a shallow commit's parent; a want alone may be absent (a broken ref, a
     // reflog entry pruned long ago). Whichever is met first, the reference or the absence,
@@ -230,11 +250,17 @@ export class HistoryImpl implements History {
     // BFS from wants; a head index instead of shift() keeps each dequeue O(1)
     const queue: string[] = [...wants];
     const objects = this.objects;
+    // When strict, the parents of shallow commits wait until everything else is walked: what
+    // only they lead to (beyond the boundary) is then walked leniently, so an absent or
+    // corrupt object there is left out instead of aborting, as git does not walk past the
+    // boundary at all. Whatever was reached before that is required.
+    const deferred: string[] = [];
+    let lenient = false;
     /** Queues what `from` refers to; `parents` of a shallow commit may be absent. */
     const enqueue = (from: string, ids: string[], parents: string[] = []) => {
       const optionalParents = shallow.has(from);
       for (const id of [...ids, ...(optionalParents ? [] : parents)]) {
-        if (strict) {
+        if (strict && !lenient) {
           if (missing.has(id)) throw missingError(id);
           required.add(id);
         }
@@ -242,7 +268,9 @@ export class HistoryImpl implements History {
       }
       if (optionalParents) {
         for (const id of parents) {
-          if (!visited.has(id) && !excludeExpanded.has(id)) queue.push(id);
+          if (!visited.has(id) && !excludeExpanded.has(id)) {
+            (strict && !lenient ? deferred : queue).push(id);
+          }
         }
       }
     };
@@ -252,7 +280,12 @@ export class HistoryImpl implements History {
       missing.add(oid);
     };
 
-    for (let head = 0; head < queue.length; head++) {
+    for (let head = 0; ; head++) {
+      if (head >= queue.length) {
+        if (lenient || deferred.length === 0) break;
+        lenient = true;
+        queue.push(...deferred);
+      }
       const oid = queue[head] as string;
 
       if (visited.has(oid) || excludeExpanded.has(oid) || known.has(oid)) {
@@ -260,73 +293,74 @@ export class HistoryImpl implements History {
       }
       visited.add(oid);
 
-      if (objects) {
-        // One read per object: the header gives the type, the same stream is decoded.
-        const children = await readChildIds(objects, oid);
-        if (children === undefined) {
-          absent(oid);
-          continue;
-        }
-        yield oid;
-        // a commit's children are its tree, then its parents
-        if (shallow.has(oid)) enqueue(oid, children.slice(0, 1), children.slice(1));
-        else enqueue(oid, children);
+      let children: string[] | undefined;
+      try {
+        children = objects
+          ? // One read per object: the header gives the type, the same stream is decoded.
+            await readChildIds(objects, oid, verifyBlobs && !lenient)
+          : await this.readChildIdsFromStores(oid);
+      } catch (e) {
+        if (lenient && e instanceof CorruptObjectError) continue;
+        throw e;
+      }
+      if (children === undefined) {
+        if (!lenient) absent(oid);
         continue;
       }
-
-      // Without an object kernel, probe the typed stores in turn. Their has() throws for an
-      // object that is stored but unreadable; a load that fails after has() said yes is
-      // corruption too, never an absent object. (Commits.load parses the whole commit, so here
-      // a commit with an author line it cannot parse counts as corrupt.)
-      if (await this.commits.has(oid)) {
-        let commit: Awaited<ReturnType<Commits["load"]>>;
-        try {
-          commit = await this.commits.load(oid);
-        } catch (e) {
-          throw e instanceof CorruptObjectError
-            ? e
-            : corrupt(oid, "is a commit that cannot be decoded", e);
-        }
-        if (!commit) throw corrupt(oid, "is a commit that cannot be decoded");
-        yield oid;
-        enqueue(oid, [commit.tree], commit.parents);
-        continue;
-      }
-      if (await this.trees.has(oid)) {
-        const ids: string[] = [];
-        try {
-          const tree = await this.trees.load(oid);
-          if (!tree) throw new Error("not found after has()");
-          for await (const entry of tree) if (entry.mode !== GITLINK_MODE) ids.push(entry.id);
-        } catch (e) {
-          throw e instanceof CorruptObjectError
-            ? e
-            : corrupt(oid, "is a tree that cannot be decoded", e);
-        }
-        yield oid;
-        enqueue(oid, ids);
-        continue;
-      }
-      if (await this.tags.has(oid)) {
-        let target: string | undefined;
-        try {
-          target = (await this.tags.load(oid))?.object;
-        } catch (e) {
-          throw e instanceof CorruptObjectError
-            ? e
-            : corrupt(oid, "is a tag that cannot be decoded", e);
-        }
-        if (!target) throw corrupt(oid, "is a tag that cannot be decoded");
-        yield oid;
-        enqueue(oid, [target]);
-        continue;
-      }
-      if (await this.blobs.has(oid)) {
-        yield oid; // a blob: no children to walk
-        continue;
-      }
-      absent(oid);
+      yield oid;
+      // a commit's children are its tree, then its parents
+      if (shallow.has(oid)) enqueue(oid, children.slice(0, 1), children.slice(1));
+      else enqueue(oid, children);
     }
+  }
+
+  /**
+   * The ids an object refers to, as `readChildIds`, through the typed stores when there is no
+   * object kernel; undefined if it is absent. Their has() throws for an object that is stored
+   * but unreadable; a load that fails after has() said yes is corruption too, never an absent
+   * object. (Commits.load parses the whole commit, so here a commit with an author line it
+   * cannot parse counts as corrupt.)
+   */
+  private async readChildIdsFromStores(oid: string): Promise<string[] | undefined> {
+    if (await this.commits.has(oid)) {
+      let commit: Awaited<ReturnType<Commits["load"]>>;
+      try {
+        commit = await this.commits.load(oid);
+      } catch (e) {
+        throw e instanceof CorruptObjectError
+          ? e
+          : corrupt(oid, "is a commit that cannot be decoded", e);
+      }
+      if (!commit) throw corrupt(oid, "is a commit that cannot be decoded");
+      return [commit.tree, ...commit.parents];
+    }
+    if (await this.trees.has(oid)) {
+      const ids: string[] = [];
+      try {
+        const tree = await this.trees.load(oid);
+        if (!tree) throw new Error("not found after has()");
+        for await (const entry of tree) if (entry.mode !== GITLINK_MODE) ids.push(entry.id);
+      } catch (e) {
+        throw e instanceof CorruptObjectError
+          ? e
+          : corrupt(oid, "is a tree that cannot be decoded", e);
+      }
+      return ids;
+    }
+    if (await this.tags.has(oid)) {
+      let target: string | undefined;
+      try {
+        target = (await this.tags.load(oid))?.object;
+      } catch (e) {
+        throw e instanceof CorruptObjectError
+          ? e
+          : corrupt(oid, "is a tag that cannot be decoded", e);
+      }
+      if (!target) throw corrupt(oid, "is a tag that cannot be decoded");
+      return [target];
+    }
+    if (await this.blobs.has(oid)) return []; // a blob: no children to walk
+    return undefined;
   }
 }
 

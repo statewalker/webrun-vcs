@@ -93,7 +93,9 @@ export class GcOrchestrator {
    *    the index, every reflog file and the linked worktrees)
    * 2. Walk reachable objects via history.collectReachableObjects() with `missing: "throw"`
    *    and the shallow commits: a reachable object that is missing or cannot be read throws
-   *    (`MissingObjectError`, `CorruptObjectError`) before anything is pruned, as `git gc` fails
+   *    (`MissingObjectError`, `CorruptObjectError`) before anything is pruned, as `git gc` fails.
+   *    Blobs are read to their end and their length checked (`verifyBlobs`), so a truncated
+   *    blob aborts too; beyond the shallow boundary objects are optional
    * 3. Compute unreachable = allStoredObjects - reachable, then keep the recent ones
    *    (`GcStrategy.recentObjects`, `pruneExpireMs`) and everything they reach
    * 4. Call strategy.prune(unreachable), then sweep stale temporaries

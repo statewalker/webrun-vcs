@@ -23,6 +23,11 @@ import type {
 import { createGitObjects, joinPath, writePack } from "@statewalker/vcs-core";
 
 import { listReachableObjects } from "./reachable-objects.js";
+import {
+  assertNoAlternates,
+  assertObjectsDeletable,
+  readRepositoryFormat,
+} from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
@@ -145,6 +150,9 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
  * Without `all`, as `git repack -d`: the reachable objects that are only loose go into a new
  * pack and their loose copies are removed; existing packs are untouched.
  *
+ * A repository with `extensions.preciousObjects`, a partial clone, or one with
+ * `objects/info/alternates` is refused (`UnsupportedRepositoryFormatError`), unless `dryRun`.
+ *
  * @returns the result, or null if there is nothing to pack (then nothing is changed)
  *
  * @example
@@ -156,6 +164,12 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
  * ```
  */
 export async function repack(options: RepackOptions): Promise<RepackResult | null> {
+  // repack deletes what the new pack replaces: not in a precious-objects repo (git: "cannot
+  // delete packs in a precious-objects repo"), nor in a partial clone (promisor packs)
+  if (!options.dryRun) {
+    assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack");
+    await assertNoAlternates(options.files, options.gitDir, "repack");
+  }
   // The snapshot first: a pack installed during the walk is never removed
   const snapshot = await snapshotPacks(options.packs);
   const listed = await listReachableObjects({

@@ -19,6 +19,7 @@ import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
 import { skipPacked, withPacks } from "./pack/with-packs.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
+import { readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
@@ -91,6 +92,11 @@ export interface GitFilesBackendResult {
  * 4. FileRefStore (Refs)
  * 5. Composed into History via createHistoryFromComponents()
  *
+ * The repository's format is checked first, as git does (`readRepositoryFormat`): a
+ * `core.repositoryformatversion` above 1, an unknown version-1 extension, or one we do not
+ * implement (`extensions.refStorage = reftable`, `extensions.objectFormat = sha256`,
+ * `extensions.compatObjectFormat`) throws `UnsupportedRepositoryFormatError`.
+ *
  * @example
  * ```typescript
  * import { createInMemoryFilesApi } from "@statewalker/vcs-utils";
@@ -115,6 +121,10 @@ export async function createGitFilesBackend(
 
   const objectsDir = joinPath(gitDir, "objects");
   const packDir = joinPath(objectsDir, "pack");
+
+  // git's check_repository_format: a version or extension we cannot honour (reftable refs,
+  // sha256 objects, an unknown v1 extension) is refused before anything is read or written
+  await readRepositoryFormat(files, gitDir);
 
   if (create) {
     await createGitDirectoryStructure(files, gitDir, objectsDir);

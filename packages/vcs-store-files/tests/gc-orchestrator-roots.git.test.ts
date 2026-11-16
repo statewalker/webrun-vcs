@@ -9,8 +9,8 @@
  * reflogs never expiring: we do not expire reflog entries). A corrupt reachable object makes
  * our gc abort with nothing pruned.
  */
-import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CorruptObjectError, GcOrchestrator } from "@statewalker/vcs-core";
@@ -55,6 +55,22 @@ const git = (cwd: string, args: string[], input?: string) =>
     stdio: ["pipe", "pipe", "pipe"],
     maxBuffer: 1 << 30,
   }).toString();
+
+/**
+ * `git fsck --full`. A git built without its own exec path (GIT_EXEC_PATH pointing at an
+ * older git's helpers) fails with "'refs' is not a git command" when fsck runs `git refs
+ * verify`: that build issue alone is tolerated, after checking connectivity another way.
+ */
+function fsck(dir: string) {
+  const run = spawnSync("git", ["fsck", "--full", "--no-progress"], { cwd: dir, env: GIT_ENV });
+  if (run.status === 0) return;
+  const stderr = run.stderr.toString();
+  if (stderr.includes("'refs' is not a git command")) {
+    git(dir, ["rev-list", "--objects", "--all", "--reflog", "--indexed-objects"]);
+    return;
+  }
+  throw new Error(`git fsck failed in ${dir}:\n${stderr}`);
+}
 
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -126,7 +142,7 @@ async function check(dir: string, sameAsNative = true) {
   const native = nativeGcKeeps(dir);
   const result = await ourGc(dir);
   const ours = stored(dir);
-  git(dir, ["fsck", "--full", "--no-progress"]);
+  fsck(dir);
   const after = reachable(dir);
   expect(new Set(after)).toEqual(new Set(before));
   for (const id of before) expect(ours.has(id), `reachable ${id} kept`).toBe(true);
@@ -245,7 +261,7 @@ describe("GcOrchestrator keeps what native git keeps", () => {
     const wtStaged = git(wt, ["rev-parse", ":wt-staged.txt"]).trim();
     const { ours } = await check(dir);
     for (const id of [wtHead, wtReflogOnly, wtStaged]) expect(ours.has(id)).toBe(true);
-    git(wt, ["fsck", "--full", "--no-progress"]);
+    fsck(wt);
   });
 
   it("a commit only ORIG_HEAD names (git itself does not keep it)", async () => {
@@ -341,7 +357,161 @@ describe("gc() on a shallow clone", () => {
     const before = reachable(dir);
     const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: dir }) });
     await gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 });
-    git(dir, ["fsck", "--full", "--no-progress"]);
+    fsck(dir);
     expect(new Set(reachable(dir))).toEqual(new Set(before));
+  });
+});
+
+/** The tree and blobs of a stash commit (its worktree state), which must survive with it. */
+const stashObjects = (dir: string, id: string) =>
+  git(dir, ["rev-list", "--objects", "--no-walk", id, `${id}^2`])
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => l.slice(0, 40));
+
+/** A repository mid-rebase or mid-merge whose dirty worktree was autostashed. */
+function conflictedWithDirtyWorktree(): string {
+  const dir = repo();
+  git(dir, ["checkout", "-q", "-b", "topic", "HEAD~1"]);
+  commit(dir, "topic-side");
+  git(dir, ["checkout", "-q", "main"]);
+  // uncommitted, in a file the conflict does not touch
+  writeFileSync(join(dir, "c0.txt"), "dirty, autostashed\n");
+  return dir;
+}
+
+describe("GcOrchestrator keeps the autostash of a merge or rebase in progress", () => {
+  it.each([
+    [
+      "rebase (merge backend): rebase-merge/autostash",
+      ["rebase", "--autostash", "topic"],
+      ".git/rebase-merge/autostash",
+    ],
+    [
+      "rebase --apply: rebase-apply/autostash",
+      ["rebase", "--apply", "--autostash", "topic"],
+      ".git/rebase-apply/autostash",
+    ],
+    [
+      "merge --autostash: MERGE_AUTOSTASH",
+      ["merge", "--autostash", "--no-edit", "topic"],
+      ".git/MERGE_AUTOSTASH",
+    ],
+  ])("%s", async (_name, args, file) => {
+    const dir = conflictedWithDirtyWorktree();
+    const run = spawnSync("git", args, { cwd: dir, env: GIT_ENV });
+    expect(run.status, run.stderr.toString()).not.toBe(0); // the conflict on f.txt stops it
+    const stash = readFileSync(join(dir, file), "utf8").trim();
+    expect(stash).toMatch(/^[0-9a-f]{40}$/);
+    const objects = stashObjects(dir, stash);
+    expireReflogs(dir);
+    const { ours } = await check(dir, false);
+    for (const id of objects) expect(ours.has(id), `autostash object ${id} kept`).toBe(true);
+    // aborting applies the autostash: the dirty file comes back
+    git(dir, [args[0] as string, "--abort"]);
+    expect(readFileSync(join(dir, "c0.txt"), "utf8")).toBe("dirty, autostashed\n");
+  });
+});
+
+describe("GcOrchestrator keeps what per-worktree refs name", () => {
+  /** A commit made in `dir` and left behind: only the refs under test name it afterwards. */
+  function leftBehind(dir: string, name: string): string {
+    commit(dir, name);
+    const id = git(dir, ["rev-parse", "HEAD"]).trim();
+    git(dir, ["reset", "-q", "--hard", "HEAD~1"]);
+    return id;
+  }
+
+  it("refs/bisect, refs/worktree and refs/rewritten of the main worktree", async () => {
+    const dir = repo();
+    const ids = ["bisected", "worktree-ref", "rewritten-ref"].map((n) => leftBehind(dir, n));
+    git(dir, ["update-ref", "refs/bisect/bad", ids[0] as string]);
+    git(dir, ["update-ref", "refs/worktree/keep", ids[1] as string]);
+    git(dir, ["update-ref", "refs/rewritten/onto", ids[2] as string]);
+    rmSync(join(dir, ".git/ORIG_HEAD"), { force: true });
+    expireReflogs(dir);
+    const { ours, native } = await check(dir);
+    for (const id of ids) {
+      expect(native.has(id)).toBe(true);
+      expect(ours.has(id)).toBe(true);
+    }
+  });
+
+  it("a linked worktree's refs/bisect, refs/worktree and refs/rewritten", async () => {
+    const dir = repo();
+    const wt = join(tempDir("gc-roots-wt-refs-"), "wt");
+    git(dir, ["worktree", "add", "-q", "--detach", wt]);
+    const ids = ["wt-bisected", "wt-worktree-ref", "wt-rewritten-ref"].map((n) =>
+      leftBehind(wt, n),
+    );
+    git(wt, ["update-ref", "refs/bisect/bad", ids[0] as string]);
+    git(wt, ["update-ref", "refs/worktree/keep", ids[1] as string]);
+    git(wt, ["update-ref", "refs/rewritten/onto", ids[2] as string]);
+    // per-worktree refs live in the worktree's own directory
+    expect(readFileSync(join(dir, ".git/worktrees/wt/refs/worktree/keep"), "utf8").trim()).toBe(
+      ids[1],
+    );
+    rmSync(join(dir, ".git/worktrees/wt/ORIG_HEAD"), { force: true });
+    expireReflogs(dir);
+    git(wt, ["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]);
+    // git 2.43's gc --prune=now drops them (its walk misses other worktrees' refs); we keep
+    // them, and `git -C wt rev-list --all` (which lists them) still succeeds
+    const { ours } = await check(dir, false);
+    for (const id of ids) expect(ours.has(id), `we keep ${id}`).toBe(true);
+    git(wt, ["rev-list", "--objects", "--all", "--reflog", "--indexed-objects"]);
+    fsck(wt);
+  });
+});
+
+describe("GcOrchestrator on a truncated reachable blob", () => {
+  it("aborts with nothing pruned (blobs are read to their end in strict mode)", async () => {
+    const dir = repo(6);
+    const blob = git(dir, ["rev-parse", "main~3:c2.txt"]).trim();
+    const path = join(dir, ".git/objects", blob.slice(0, 2), blob.slice(2));
+    const bytes = readFileSync(path);
+    rmSync(path, { force: true });
+    writeFileSync(path, bytes.subarray(0, bytes.length - 6));
+    const orphan = hashObject(dir, "an unreachable blob\n");
+    const before = stored(dir);
+    expect(
+      spawnSync("git", ["cat-file", "blob", blob], { cwd: dir, env: GIT_ENV }).status,
+    ).not.toBe(0);
+
+    await expect(ourGc(dir)).rejects.toBeInstanceOf(CorruptObjectError);
+    expect(stored(dir)).toEqual(before);
+    expect(before.has(orphan)).toBe(true);
+  });
+});
+
+describe("GcOrchestrator beyond the shallow boundary", () => {
+  it("a stored parent beyond the boundary whose tree is missing does not abort", async () => {
+    const dir = repo(4);
+    const boundary = git(dir, ["rev-parse", "main~1"]).trim();
+    const beyond = git(dir, ["rev-parse", "main~2"]).trim();
+    const beyondTree = git(dir, ["rev-parse", "main~2^{tree}"]).trim();
+    // main~1 becomes a shallow commit; main~2, still stored, lies beyond it without its tree
+    writeFileSync(join(dir, ".git/shallow"), `${boundary}\n`);
+    rmSync(join(dir, ".git/objects", beyondTree.slice(0, 2), beyondTree.slice(2)));
+    expireReflogs(dir);
+    const orphan = hashObject(dir, "an unreachable blob\n");
+    const kept = reachable(dir);
+
+    const result = await ourGc(dir);
+    expect(result.reachableObjects).toBeGreaterThan(0);
+    const after = stored(dir);
+    for (const id of kept) expect(after.has(id), `reachable ${id} kept`).toBe(true);
+    expect(after.has(beyond)).toBe(true);
+    expect(after.has(orphan)).toBe(false);
+  });
+
+  it("a missing tree inside the boundary still aborts", async () => {
+    const dir = repo(4);
+    writeFileSync(join(dir, ".git/shallow"), `${git(dir, ["rev-parse", "main~2"]).trim()}\n`);
+    const tree = git(dir, ["rev-parse", "main~1^{tree}"]).trim();
+    rmSync(join(dir, ".git/objects", tree.slice(0, 2), tree.slice(2)));
+    hashObject(dir, "an unreachable blob\n");
+    const before = stored(dir);
+    await expect(ourGc(dir)).rejects.toThrow(/missing/);
+    expect(stored(dir)).toEqual(before);
   });
 });

@@ -19,6 +19,11 @@ import {
   repackListed,
   snapshotPacks,
 } from "./repack.js";
+import {
+  assertNoAlternates,
+  assertObjectsDeletable,
+  readRepositoryFormat,
+} from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
@@ -125,6 +130,11 @@ export interface GcResult {
  * 6. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`, `packed-refs.new`) and `.pack` files without
  *    an `.idx`.
  *
+ * In a repository with `extensions.preciousObjects`, only step 3 runs, as `git gc` skips its
+ * repack and prune there. A partial clone (`extensions.partialClone`, a promisor remote) and
+ * a repository with `objects/info/alternates` are refused with
+ * `UnsupportedRepositoryFormatError` before anything changes.
+ *
  * The lock excludes gcs in other processes when the FilesApi has `createExclusive`, and
  * otherwise only gcs over the same FilesApi instance (see `atomicFilesOver`).
  *
@@ -175,6 +185,31 @@ async function collect(options: GcOptions): Promise<GcResult> {
   const packs = options.packs ?? history.packs;
   const objectsDir = joinPath(gitDir, "objects");
   const looseStorage = new FileRawStorage(files, objectsDir);
+
+  // A partial clone's absent objects come from its promisor remote, which we do not handle:
+  // refused. preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned.
+  const format = await readRepositoryFormat(files, gitDir);
+  if (format.partialClone !== undefined) assertObjectsDeletable(format, "gc");
+  await assertNoAlternates(files, gitDir, "gc");
+  if (format.preciousObjects) {
+    let refsPacked = false;
+    if ((options.packRefs ?? true) && !dryRun && history.refs.packRefs) {
+      await history.refs.packRefs([], { all: true, deleteLoose: true });
+      refsPacked = true;
+    }
+    return {
+      removedObjects: 0,
+      keptRecentObjects: 0,
+      reachableObjects: 0,
+      totalLooseObjects: 0,
+      removedTemporaries: 0,
+      removedOrphanPacks: 0,
+      removedQuarantines: 0,
+      refsPacked,
+      repack: null,
+      skipped: false,
+    };
+  }
 
   const looseBefore: string[] = [];
   for await (const key of looseStorage.keys()) {

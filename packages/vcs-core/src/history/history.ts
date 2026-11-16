@@ -178,8 +178,19 @@ export interface CollectReachableOptions {
   /**
    * Shallow commits (`.git/shallow`): their parents may be absent. Parents that are stored
    * are still walked, so what lies beyond the boundary is kept, not listed as unreachable.
+   * With `missing: "throw"`, everything beyond the boundary is optional: it is walked after
+   * the rest, and an object there that is absent or corrupt (a stored parent whose tree is
+   * gone) is left out instead of throwing.
    */
   shallow?: Iterable<ObjectId>;
+  /**
+   * Read every reachable blob to its end (inflated and streamed, never held whole) and check
+   * it has the length its header says, throwing `CorruptObjectError` for one that does not or
+   * cannot be read: a truncated loose blob otherwise passes, since a walk never reads blob
+   * bodies. Default: on with `missing: "throw"` (gc), off otherwise. Needs the object kernel;
+   * the typed-store fallback does not verify blobs. Not done beyond the shallow boundary.
+   */
+  verifyBlobs?: boolean;
   /**
    * Objects already collected: neither yielded nor walked again. Unlike `exclude`, nothing is
    * read to expand them (gc passes what it found reachable when it walks from recent objects).
