@@ -7,12 +7,7 @@
 
 import type { ObjectId } from "../../common/id/index.js";
 import type { GitObjects } from "../objects/git-objects.js";
-import {
-  loadTypedObject,
-  objectHeader,
-  removeObject,
-  storeObject,
-} from "../objects/typed-object-access.js";
+import { objectHeader, removeObject, storeObject } from "../objects/typed-object-access.js";
 import {
   commitToEntries,
   decodeCommitEntries,
@@ -44,13 +39,23 @@ class GitCommitStore implements Commits {
    * Returns undefined if commit doesn't exist.
    */
   async load(id: ObjectId): Promise<Commit | undefined> {
-    if (!(await this.has(id))) {
-      return undefined;
-    }
+    // One read: the header says whether it is a commit, the same stream is decoded
+    // (a has() check first would read and inflate the object twice).
+    let obj: Awaited<ReturnType<GitObjects["get"]>>;
     try {
-      return await this.loadCommitInternal(id);
+      obj = await this.objects.get(id);
     } catch {
       return undefined;
+    }
+    if (!obj) return undefined;
+    const it = obj.content[Symbol.asyncIterator]();
+    try {
+      if (obj.type !== "commit") return undefined;
+      return await entriesToCommit(decodeCommitEntries({ [Symbol.asyncIterator]: () => it }));
+    } catch {
+      return undefined;
+    } finally {
+      await it.return?.();
     }
   }
 
@@ -59,20 +64,6 @@ class GitCommitStore implements Commits {
    */
   async remove(id: ObjectId): Promise<boolean> {
     return removeObject(this.objects, id);
-  }
-
-  /**
-   * Load a commit object by ID (internal implementation)
-   */
-  private async loadCommitInternal(id: ObjectId): Promise<Commit> {
-    const { content, release } = await loadTypedObject(this.objects, id, "commit");
-    try {
-      const entries = decodeCommitEntries(content);
-      return entriesToCommit(entries);
-    } catch (err) {
-      await release();
-      throw err;
-    }
   }
 
   /**
