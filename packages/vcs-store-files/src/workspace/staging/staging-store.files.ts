@@ -227,6 +227,10 @@ export class FileStagingStore implements Staging {
     this.indexFile.recordResolveUndo(records);
   }
 
+  clearResolveUndo(): void {
+    this.indexFile.clearResolveUndo();
+  }
+
   createEditor(): IndexEditor {
     return new FileStagingEditor(this);
   }
@@ -292,10 +296,14 @@ export class FileStagingStore implements Staging {
     return trees.store(treeEntries);
   }
 
-  async readTree(trees: Trees, treeId: ObjectId): Promise<void> {
+  async readTree(
+    trees: Trees,
+    treeId: ObjectId,
+    options?: { keepResolveUndo?: boolean },
+  ): Promise<void> {
     this._entries = [];
-    // a whole tree replaces the index: git's read-tree and reset clear resolve-undo too
-    this.indexFile.clearResolveUndo();
+    // a whole tree replaces the index: git's read-tree and unpack-trees drop resolve-undo
+    if (!options?.keepResolveUndo) this.indexFile.clearResolveUndo();
     await this.addTreeRecursive(trees, treeId, "", MergeStage.MERGED);
     this.sortEntries();
   }

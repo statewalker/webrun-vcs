@@ -51,6 +51,8 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { OperationState } from "./merge-support.js";
+import { removeBranchState } from "./sequencer-support.js";
 import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   findInTheWay,
@@ -558,9 +560,16 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       // This handles: commit IDs, tags, remote branches, etc.
       await this.refsStore.set("HEAD", targetId);
     }
+    // git's remove_branch_state: a merge, cherry-pick or revert stopped here is forgotten
+    await removeBranchState(
+      { commits: this.commits, refs: this.refsStore },
+      new OperationState(this.workingCopy.checkout, this.refsStore),
+    );
 
     // The index: forced, the target's tree; else the switched paths take the target's
-    // entries (with the stat of the files just written), every other path keeps its own
+    // entries (with the stat of the files just written), every other path keeps its own.
+    // git's switch writes a new index (unpack-trees): no resolve-undo records survive it
+    this.staging.clearResolveUndo?.();
     if (targetTreeId && this.force) {
       await this.staging.readTree(this.trees as any, targetTreeId);
       await this.staging.write();
@@ -581,6 +590,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         });
       }
       await editor.finish();
+      await this.staging.write();
+    } else {
       await this.staging.write();
     }
 

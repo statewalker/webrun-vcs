@@ -327,7 +327,7 @@ A command records options in fields and `call()` acts on them. Running it twice 
 
 - `status()` reads as `git status` does: HEAD against the index, the worktree against the index (`modified`, `missing`, `untracked`), renames (`renamed`, as `status.renames=true`; `setRenames(false)` is `--no-renames`) and the content of populated submodules (`setIgnoreSubmodules()`). `formatStatusPorcelain(status, 1 | 2)` prints `--porcelain[=v2] --untracked-files=all`. Copies (`status.renames=copies`) are detected as renames only.
 - `stashCreate()` on a working copy with an index and a worktree uses a built-in provider; `setWorkingTreeProvider(provider)` replaces it.
-- `merge()` supports a single merge head (`Only single-head merges are currently supported`).
+- `merge()` with several heads (`include("a").include("b")`) is an octopus, as git's octopus strategy; with several merge bases it builds git's virtual merge base. Merge drivers named by the `merge` attribute are callbacks registered with `installMergeDrivers(workingCopy, { name: createMergeDriver(fn) })`: git's `merge.<driver>.driver` shell command is not run.
 - `fetch()` passes only `setProgressMessageCallback()` to the transport; `setProgressMonitor()` has effect on `clone()` only.
 - `Git.init()` (an `InitCommand`) always creates an in-memory history. `setFilesApi()` only backs the worktree when `setWorktree(true)` is set. Its `InitResult` has `git`, `workingCopy`, `repository`, `initialBranch`, `bare` and `gitDir`.
 - `stashDrop().setStashRef(n)` takes an index; without reflog support only index 0 is valid.

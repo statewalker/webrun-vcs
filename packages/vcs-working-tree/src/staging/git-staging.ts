@@ -255,8 +255,8 @@ export class GitStaging implements Staging {
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
     if (!options?.keepExisting) {
       this._entries = [];
-      // a whole tree replaces the index: git's read-tree and reset clear resolve-undo too
-      this.indexFile.clearResolveUndo();
+      // a whole tree replaces the index: git's read-tree and unpack-trees drop resolve-undo
+      if (!options?.keepResolveUndo) this.indexFile.clearResolveUndo();
     }
 
     const prefix = options?.prefix ?? "";
@@ -301,6 +301,10 @@ export class GitStaging implements Staging {
 
   recordResolveUndo(records: readonly ResolveUndoRecord[]): void {
     this.indexFile.recordResolveUndo(records);
+  }
+
+  clearResolveUndo(): void {
+    this.indexFile.clearResolveUndo();
   }
 
   createEditor(): IndexEditor {

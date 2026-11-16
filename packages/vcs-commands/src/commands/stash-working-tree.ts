@@ -159,6 +159,8 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
     }
     for (const path of target.keys()) if (!scan.paths.has(path)) stale.add(path);
     const refresh = refreshableEntries(scan).filter((u) => !stale.has(u.path));
+    // a reset --hard writes a new index (unpack-trees): the resolve-undo records go
+    this.context.staging.clearResolveUndo?.();
     await this.write(headTree, target, stale);
     await refreshIndexStats(this.context.staging, refresh);
   }

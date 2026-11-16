@@ -18,6 +18,7 @@ import type { CommandCommits, CommandRefs, CommandTrees } from "../git-command.j
 import { coreBool } from "./core-config.js";
 import { UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { conflictStyleOf } from "./merge-config.js";
+import { ortConfigOptions } from "./merge-drivers.js";
 import {
   abbrev,
   conflictsComment,
@@ -230,6 +231,7 @@ export class PickSequencer {
       style: conflictStyleOf(deps.workingCopy),
       favor: this.options.favor,
       ignoreCase: coreBool(deps.workingCopy, "ignorecase", false),
+      ...ortConfigOptions(deps.workingCopy, deps.worktree),
     });
     const target = await ortResultEntries(deps.blobs, merge);
     const treeId = await storeFlatTreeOver(deps.trees, headTreeId, headTree, target);
@@ -248,13 +250,13 @@ export class PickSequencer {
     await deps.state.setRef("AUTO_MERGE", treeId);
     const message = this.messageFor(action, item.id, commit, parentId);
 
-    if (conflicts.length > 0) {
+    if (conflicts.length > 0 || !merge.clean) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
       // git records REVERT_HEAD for a revert -n too (do_pick_commit), never CHERRY_PICK_HEAD
       if (!this.options.noCommit || action === "revert") {
         await deps.state.setRef(HEAD_REF[action], item.id);
       }
-      await deps.state.write("MERGE_MSG", `${message}${conflictsComment(paths)}`);
+      await deps.state.write("MERGE_MSG", `${message}${conflictsComment(paths, true)}`);
       const advice = this.options.noCommit
         ? [
             "hint: after resolving the conflicts, mark the corrected paths",

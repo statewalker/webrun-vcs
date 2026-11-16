@@ -752,9 +752,13 @@ export class GitContentFilter implements WorktreeContentFilter {
   }
 
   /** git's `renormalize_buffer`: content as a checkout and check-in would leave it. */
-  async renormalize(path: string, src: Uint8Array): Promise<Uint8Array> {
+  async renormalize(
+    path: string,
+    src: Uint8Array,
+    context: ContentAttributesContext = { direction: "checkin" },
+  ): Promise<Uint8Array> {
     const scope = this.scope ?? (await this.openScope());
-    const ca = await this.convAttrsIn(scope, path, { direction: "checkin" });
+    const ca = await this.convAttrsIn(scope, path, context);
     const { settings } = scope;
     const smudged = await this.convertToWorktree(path, src, {
       normalizing: true,

@@ -540,13 +540,16 @@ export async function switchTrees(
       ...list,
     ]);
   }
+  // unpack-trees writes a new index: the resolve-undo records are gone (git keeps them only
+  // through commands that edit the index in place)
+  ctx.staging.clearResolveUndo?.();
   await rewriteIndex(ctx.staging, changes);
   return undefined;
 }
 
 /** git's `# Conflicts:` block appended to MERGE_MSG. */
-export function conflictsComment(paths: string[]): string {
-  if (paths.length === 0) return "";
+export function conflictsComment(paths: string[], unclean = paths.length > 0): string {
+  if (!unclean) return "";
   return `\n# Conflicts:\n${paths.map((p) => `#\t${p}\n`).join("")}`;
 }
 
