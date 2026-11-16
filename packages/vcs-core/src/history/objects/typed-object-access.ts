@@ -3,7 +3,7 @@
  * store content of unknown size, read a header, load content of one type.
  */
 import type { ObjectId } from "../../common/id/index.js";
-import { type GitObjects, InvalidObjectIdError } from "./git-objects.js";
+import { CorruptObjectError, type GitObjects, InvalidObjectIdError } from "./git-objects.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 /**
@@ -33,6 +33,30 @@ export async function objectHeader(
   if (!obj) return undefined;
   await obj.content[Symbol.asyncIterator]().return?.();
   return { type: obj.type, size: obj.size };
+}
+
+/**
+ * Whether the stored object `id` has `type`: false if it is absent or of another type. An
+ * object that is stored but whose header cannot be read throws `CorruptObjectError` instead
+ * of reading as absent, so a reachability walk (gc) never skips what lies behind it.
+ */
+export async function hasObjectOfType(
+  objects: GitObjects,
+  id: ObjectId,
+  type: ObjectTypeString,
+): Promise<boolean> {
+  if (!(await objects.has(id))) return false;
+  let header: Awaited<ReturnType<typeof objectHeader>>;
+  try {
+    header = await objectHeader(objects, id);
+  } catch (e) {
+    if (e instanceof CorruptObjectError || e instanceof InvalidObjectIdError) throw e;
+    const reason = e instanceof Error ? `: ${e.message}` : "";
+    throw new CorruptObjectError(`object ${id} is stored but cannot be read${reason}`, {
+      cause: e,
+    });
+  }
+  return header?.type === type;
 }
 
 /**

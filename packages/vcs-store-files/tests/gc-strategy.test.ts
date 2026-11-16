@@ -34,7 +34,8 @@ describe("FileGcStrategy", () => {
     const strategy = new FileGcStrategy(backend);
     const orchestrator = new GcOrchestrator(history, strategy);
 
-    const result = await orchestrator.run();
+    // the orphan was just written: only --prune=now (pruneExpireMs 0) removes it
+    const result = await orchestrator.run({ pruneExpireMs: 0 });
     expect(result.prunedObjects).toBe(1);
 
     // Orphan gone, kept blob remains
@@ -111,7 +112,7 @@ describe("FileGcStrategy", () => {
     const strategy = new FileGcStrategy(backend);
     const orchestrator = new GcOrchestrator(history, strategy);
 
-    const result = await orchestrator.run({ compact: true });
+    const result = await orchestrator.run({ compact: true, pruneExpireMs: 0 });
 
     expect(result.prunedObjects).toBe(1); // orphan
     expect(result.compactResult?.packsCreated).toBe(1);

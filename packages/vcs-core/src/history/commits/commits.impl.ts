@@ -7,7 +7,12 @@
 
 import type { ObjectId } from "../../common/id/index.js";
 import type { GitObjects } from "../objects/git-objects.js";
-import { objectHeader, removeObject, storeObject } from "../objects/typed-object-access.js";
+import {
+  hasObjectOfType,
+  objectHeader,
+  removeObject,
+  storeObject,
+} from "../objects/typed-object-access.js";
 import {
   commitToEntries,
   decodeCommitEntries,
@@ -145,15 +150,7 @@ class GitCommitStore implements Commits {
    * Check if commit exists and is actually a commit object
    */
   async has(id: ObjectId): Promise<boolean> {
-    if (!(await this.objects.has(id))) {
-      return false;
-    }
-    try {
-      const header = await objectHeader(this.objects, id);
-      return header?.type === "commit";
-    } catch {
-      return false;
-    }
+    return hasObjectOfType(this.objects, id, "commit");
   }
 
   /**

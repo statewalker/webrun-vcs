@@ -104,4 +104,36 @@ export interface GcStrategy {
    * @returns The number of leftovers removed
    */
   sweepStale?(olderThanMs: number): Promise<number>;
+
+  /**
+   * Roots of reachability the refs do not show, which `GcOrchestrator` adds to every ref,
+   * HEAD and the refs' reflogs: on git files, the index (all stages, its cache-tree and
+   * resolve-undo), every reflog file, and each linked worktree's HEAD, index and reflogs; and
+   * the shallow commits, if the refs do not give them. Optional; ids that are not stored are
+   * skipped. Throw if a root cannot be read: a root skipped would let gc delete what it holds.
+   *
+   * @example
+   * ```typescript
+   * async collectRoots() {
+   *   return { roots: await indexAndWorktreeIds(), shallow: await readShallow() };
+   * }
+   * ```
+   */
+  collectRoots?(): Promise<GcRoots>;
+
+  /**
+   * Of the unreachable `ids`, those written within the last `pruneExpireMs` (git's
+   * `gc.pruneExpire`): `GcOrchestrator` keeps them and everything they reach, as git keeps
+   * recent objects that may belong to a write in progress. An object whose age is unknown
+   * should count as recent. Optional: without it every unreachable object is pruned.
+   */
+  recentObjects?(ids: Set<ObjectId>, pruneExpireMs: number): Promise<Set<ObjectId>>;
+}
+
+/** What `GcStrategy.collectRoots` adds to the roots the refs give. */
+export interface GcRoots {
+  /** Objects to keep, with everything they reach */
+  roots: Iterable<ObjectId>;
+  /** Shallow commits: their parents may be absent */
+  shallow?: Iterable<ObjectId>;
 }
