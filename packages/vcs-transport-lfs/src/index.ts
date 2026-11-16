@@ -8,8 +8,8 @@
  * streaming body, downloads and server uploads are hashed while they are stored
  * and verified at the end, so no object is ever held in memory whole. No
  * chunk-aware dedup (that is `vcs-transport-xet/webrun-chunks`); pointer files are built and
- * read here (`createLfsPointer`, `formatLfsPointer`, `parseLfsPointer`), the
- * clean/smudge wiring belongs to the working tree. Besides a content-store, the
+ * read here (`createLfsPointer`, `formatLfsPointer`, `parseLfsPointer`), and
+ * `createLfsFilterDriver` is the `filter=lfs` clean/smudge a working copy registers. Besides a content-store, the
  * server and client run over any `LfsObjectStore`, such as
  * `createFilesLfsStore`: a `FilesApi` in git-lfs's own `lfs/objects` layout,
  * shared with native git-lfs, with resumable partial downloads. The File
@@ -29,6 +29,12 @@ export {
 } from "./batch.js";
 export { lfsDownload, lfsUpload } from "./client.js";
 export { createFilesLfsStore, LfsPartialChangedError } from "./files-store.js";
+export {
+  createLfsFilterDriver,
+  type LfsFilterContext,
+  type LfsFilterDriver,
+  type LfsFilterDriverOptions,
+} from "./filter-driver.js";
 export {
   basicUserIdentity,
   createFilesLockStore,

@@ -13,6 +13,7 @@ import type { History, ObjectId } from "@statewalker/vcs-core";
 import type {
   Checkout,
   CherryPickState,
+  ContentFilterSetup,
   MergeState,
   RebaseState,
   RevertState,
@@ -25,6 +26,7 @@ import type {
 import {
   createStatusCalculator,
   getStateCapabilities,
+  installContentFilter,
   type RepositoryStateValue,
   type RepositoryStatus,
   type StateCapabilities,
@@ -49,7 +51,7 @@ export interface WorkingCopyFilesApi
 /**
  * Options for creating a GitWorkingCopy
  */
-export interface GitWorkingCopyOptions {
+export interface GitWorkingCopyOptions extends ContentFilterSetup {
   /** History interface */
   history: History;
   /** Checkout interface */
@@ -92,6 +94,8 @@ export class GitWorkingCopy implements WorkingCopy {
     this.config = options.config;
     this.files = options.files;
     this.gitDir = options.gitDir;
+    // git's clean / smudge (attributes, core.autocrlf, ...) on the worktree's content
+    installContentFilter(this, options);
   }
 
   /**

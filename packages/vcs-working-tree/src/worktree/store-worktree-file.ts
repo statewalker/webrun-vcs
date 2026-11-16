@@ -2,6 +2,7 @@
  * Store a worktree file as a blob, in one pass when its size is known.
  */
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
+import { type ContentConversionOptions, collectChunks } from "./content-filter.js";
 import type { WorktreeEntry } from "./types.js";
 import type { Worktree } from "./worktree.js";
 
@@ -23,6 +24,9 @@ export interface StoredWorktreeFile {
    */
   entry: WorktreeEntry;
 }
+
+/** How {@link storeWorktreeFile} cleans the file (when the worktree has a content filter). */
+export type StoreWorktreeFileOptions = Omit<ContentConversionOptions, "write">;
 
 /**
  * A regular file is stored with the size the worktree reported, so the blob is
@@ -49,8 +53,23 @@ export async function storeWorktreeFile(
   worktree: Worktree,
   path: string,
   entry: WorktreeEntry,
+  options: StoreWorktreeFileOptions = {},
 ): Promise<StoredWorktreeFile> {
   let latest = entry;
+  const filter = worktree.contentFilter;
+  const conversion = filter && isRegularFile(entry) ? await filter.checkin(path) : undefined;
+  if (conversion) {
+    // cleaned as git's `index_path` cleans what it stores: the whole file, converted
+    const raw = await collectChunks(worktree.readContent(path));
+    const cleaned = await conversion.apply(raw, { write: true, ...options });
+    const id = await blobs.store([cleaned], cleaned.length);
+    // the stat that matches what was read (the worktree's size, never the blob's)
+    if (raw.length !== entry.size) {
+      const fresh = await worktree.getEntry(path);
+      if (fresh && fresh.size === raw.length) latest = fresh;
+    }
+    return { id, entry: latest };
+  }
   if (isRegularFile(entry)) {
     try {
       return { id: await blobs.store(worktree.readContent(path), entry.size), entry };

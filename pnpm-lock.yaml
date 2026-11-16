@@ -948,6 +948,9 @@ importers:
       '@statewalker/vcs-transport-adapters':
         specifier: workspace:^
         version: link:../vcs-transport-adapters
+      '@statewalker/vcs-transport-lfs':
+        specifier: workspace:^
+        version: link:../vcs-transport-lfs
       '@statewalker/vcs-utils-node':
         specifier: workspace:^
         version: link:../vcs-utils-node

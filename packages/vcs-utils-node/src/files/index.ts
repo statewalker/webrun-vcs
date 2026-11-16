@@ -37,4 +37,5 @@ export function createNodeFilesApi(options: {
   return new PosixNodeFilesApi(options);
 }
 
+export * from "./git-host-environment.js";
 export { NodeFilesApi, openRepositoryFiles, PosixNodeFilesApi };

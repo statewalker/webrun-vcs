@@ -64,6 +64,7 @@
     "@statewalker/vcs-store-kv": "workspace:^",
     "@statewalker/vcs-store-sql": "workspace:^",
     "@statewalker/vcs-transport-adapters": "workspace:^",
+    "@statewalker/vcs-transport-lfs": "workspace:^",
     "@statewalker/vcs-utils-node": "workspace:^",
     "@types/node": "catalog:",
     "rolldown": "catalog:",

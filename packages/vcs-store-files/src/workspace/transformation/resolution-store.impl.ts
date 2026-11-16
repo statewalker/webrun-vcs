@@ -291,7 +291,8 @@ export class GitResolutionStore implements ResolutionStore {
     if (!recorded?.resolvedContent) return false;
 
     // Write resolved content to working tree (a link there is replaced, never followed)
-    await this.worktree.writeContent(path, recorded.resolvedContent);
+    // the resolution as it was recorded from the worktree (already in its form)
+    await this.worktree.writeContent(path, recorded.resolvedContent, { raw: true });
 
     return true;
   }

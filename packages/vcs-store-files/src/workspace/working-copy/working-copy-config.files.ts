@@ -7,7 +7,13 @@
  * - Allows working-copy-specific settings
  */
 
-import type { WorkingCopyConfig } from "@statewalker/vcs-working-tree";
+import {
+  expandUserPath,
+  type GitHostEnvironment,
+  type WorkingCopyConfig,
+  wildmatch,
+  xdgConfigPath,
+} from "@statewalker/vcs-working-tree";
 
 /**
  * Files API subset needed for config operations
@@ -80,13 +86,19 @@ type ConfigLine =
  * own rules (quote when empty, when there is leading/trailing whitespace, or
  * when the value contains `#` or `;`).
  *
+ * ## The configuration chain
+ *
+ * Reads see git's whole chain, lowest precedence first: the system file and the global
+ * files (`$XDG_CONFIG_HOME/git/config`, then `~/.gitconfig`) when the host passes an
+ * {@link GitConfigOptions.environment}, this file, then `config.worktree` when
+ * `extensions.worktreeConfig` is set. `include.path` and `includeIf.<condition>.path`
+ * (`gitdir:`, `gitdir/i:`, `onbranch:`) are followed in every file, their values read where
+ * the directive stands, as git does. Writes go to this file only; included files are never
+ * written, and a directive round-trips as just another line.
+ *
  * ## Known limitations
  *
- * - This is a single-file reader: git's `[include]` / `[includeIf]` directives
- *   are *not* followed. The `include.path` key is readable like any other key,
- *   but values defined in an included file are invisible here, while `git`
- *   resolves them. Nothing in this repository writes includes; a config that
- *   uses them still round-trips unharmed (the directive is just another line).
+ * - `includeIf.hasconfig:remote.*.url:` is not evaluated (never true).
  * - A malformed section header (e.g. an unterminated quote) is kept verbatim
  *   but ignored, so the following variables are attributed to the previous
  *   section. `git` rejects the whole file instead. Reading such a file is
@@ -110,11 +122,25 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   private readonly mirroredKeys: Set<string> = new Set();
   private trailingNewline = true;
   private loaded = false;
+  /** Entries of the system and global files (with their includes), lowest first */
+  private baseEntries: ConfigEntry[] = [];
+  /** Entries of `config.worktree`, when `extensions.worktreeConfig` is set */
+  private overlayEntries: ConfigEntry[] = [];
+  /** Entries an include directive of this file brings in, by the directive's line */
+  private includedEntries = new Map<ConfigLine, ConfigEntry[]>();
+  /** Every value of the chain in order, computed when first read after a change */
+  private resolvedCache?: ConfigEntry[];
+
+  /** The user's environment the chain reads global files from (absent: none are read) */
+  readonly environment?: GitHostEnvironment;
 
   constructor(
     private readonly files: ConfigFilesApi,
     private readonly configPath: string,
-  ) {}
+    private readonly options: GitConfigOptions = {},
+  ) {
+    if (options.environment) this.environment = options.environment;
+  }
 
   /**
    * Load configuration from file, replacing any previously loaded state.
@@ -126,6 +152,91 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const text = content ? new TextDecoder().decode(content) : "";
     this.adoptText(text);
     this.loaded = true;
+    await this.loadChain();
+  }
+
+  /** Reads the files around this one: system, global, includes and `config.worktree`. */
+  private async loadChain(): Promise<void> {
+    const env = this.options.environment;
+    const followIncludes = this.options.includes !== false;
+    const reader = new ChainReader(this, env, this.options, followIncludes);
+    const base: ConfigEntry[] = [];
+    if (env) {
+      const hostSource = (path: string): ConfigSource => ({ read: env.readFile, path });
+      if (env.systemConfig) await reader.readFile(hostSource(env.systemConfig), base, 0);
+      const xdg = xdgConfigPath(env, "config");
+      if (xdg) await reader.readFile(hostSource(xdg), base, 0);
+      const userConfig = expandUserPath("~/.gitconfig", env);
+      if (userConfig) await reader.readFile(hostSource(userConfig), base, 0);
+    }
+    this.baseEntries = base;
+    await this.resolveOwnIncludes(reader);
+    this.overlayEntries = [];
+    this.resolvedCache = undefined;
+    if (isTrue(this.get("extensions.worktreeconfig"))) {
+      const overlay: ConfigEntry[] = [];
+      const path = this.options.worktreeConfigPath ?? `${dirOf(this.configPath)}config.worktree`;
+      await reader.readFile({ read: (p) => this.files.read(p), path }, overlay, 0);
+      this.overlayEntries = overlay;
+    }
+    this.resolvedCache = undefined;
+  }
+
+  /** The entries the include directives of this file bring in. */
+  private async resolveOwnIncludes(reader?: ChainReader): Promise<void> {
+    this.includedEntries = new Map();
+    this.resolvedCache = undefined;
+    if (this.options.includes === false) return;
+    const r = reader ?? new ChainReader(this, this.options.environment, this.options, true);
+    const source: ConfigSource = { read: (p) => this.files.read(p), path: this.configPath };
+    for (const line of this.lines) {
+      const key = keyOfLine(line);
+      if (key === undefined || !isIncludeKey(key)) continue;
+      const value =
+        line.kind === "entry" ? line.value : line.kind === "section" ? line.inlineValue : undefined;
+      const entries: ConfigEntry[] = [];
+      await r.include(key, value, source, entries, 1);
+      if (entries.length > 0) this.includedEntries.set(line, entries);
+    }
+  }
+
+  /**
+   * Every value of the chain in order (system, global, this file with its includes where
+   * they stand, `config.worktree`); a later value of a key wins.
+   */
+  private resolved(): ConfigEntry[] {
+    if (this.resolvedCache) return this.resolvedCache;
+    const out: ConfigEntry[] = [...this.baseEntries];
+    const emitted = new Set<string>();
+    for (const line of this.lines) {
+      const section = sectionOfLine(line);
+      if (section !== undefined && this.removedSections.has(section)) continue;
+      const key = keyOfLine(line);
+      if (key !== undefined) {
+        if (this.dirtyKeys.has(key) || !this.values.has(key)) {
+          if (!emitted.has(key)) {
+            emitted.add(key);
+            for (const value of this.values.get(key) ?? []) out.push({ key, value });
+          }
+        } else {
+          out.push({
+            key,
+            value:
+              line.kind === "entry" ? line.value : (line as { inlineValue?: unknown }).inlineValue,
+          });
+        }
+      }
+      const included = this.includedEntries.get(line);
+      if (included) out.push(...included);
+    }
+    for (const [key, values] of this.values) {
+      if (emitted.has(key)) continue;
+      if (!this.dirtyKeys.has(key) && this.lines.some((l) => keyOfLine(l) === key)) continue;
+      for (const value of values) out.push({ key, value });
+    }
+    out.push(...this.overlayEntries);
+    this.resolvedCache = out;
+    return out;
   }
 
   /**
@@ -150,6 +261,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.dirtyKeys.clear();
     this.removedSections.clear();
     this.loaded = true;
+    await this.resolveOwnIncludes();
   }
 
   /**
@@ -158,14 +270,27 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   get(key: string): unknown {
     const canonical = canonicalizeKey(key);
     if (!canonical) return undefined;
-    const values = this.values.get(canonical);
-    return values && values.length > 0 ? values[values.length - 1] : undefined;
+    const all = this.resolved();
+    for (let i = all.length - 1; i >= 0; i--) if (all[i].key === canonical) return all[i].value;
+    return undefined;
   }
 
   /**
    * Get every value of a (possibly repeated) key, in file order.
    */
   getAll(key: string): unknown[] {
+    const canonical = canonicalizeKey(key);
+    if (!canonical) return [];
+    return this.resolved()
+      .filter((e) => e.key === canonical)
+      .map((e) => e.value);
+  }
+
+  /**
+   * Every value of a key in this file only (not the global files, includes or
+   * `config.worktree`), in file order: what a rewrite of the key here starts from.
+   */
+  getLocal(key: string): unknown[] {
     const canonical = canonicalizeKey(key);
     if (!canonical) return [];
     return [...(this.values.get(canonical) ?? [])];
@@ -177,11 +302,9 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
    * repository's extensions.
    */
   listKeys(prefix = ""): string[] {
-    const keys: string[] = [];
-    for (const [key, values] of this.values) {
-      if (values.length > 0 && key.startsWith(prefix)) keys.push(key);
-    }
-    return keys;
+    const keys = new Set<string>();
+    for (const { key } of this.resolved()) if (key.startsWith(prefix)) keys.add(key);
+    return [...keys];
   }
 
   /**
@@ -194,6 +317,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.values.set(canonical, [value]);
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
+    this.resolvedCache = undefined;
   }
 
   /**
@@ -209,6 +333,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     else this.values.set(canonical, [value]);
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
+    this.resolvedCache = undefined;
   }
 
   /**
@@ -221,6 +346,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.values.set(canonical, []);
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
+    this.resolvedCache = undefined;
   }
 
   /**
@@ -231,6 +357,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   unsetSection(section: string): void {
     const canonical = canonicalizeSection(section);
     this.removedSections.add(canonical);
+    this.resolvedCache = undefined;
     for (const key of [...this.values.keys()]) {
       if (sectionOfKey(key) === canonical) {
         this.values.delete(key);
@@ -258,6 +385,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const from = canonicalizeSection(oldSection);
     const to = canonicalizeSection(newSection);
     if (from === to) return;
+    this.resolvedCache = undefined;
     const renamed = (key: string) => `${to}${key.slice(from.length)}`;
     if (this.removedSections.delete(to)) {
       // the lines of a removed section of the new name go now, before ours take its name
@@ -299,8 +427,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   subsections(section: string): string[] {
     const prefix = `${section.toLowerCase()}.`;
     const found = new Set<string>();
-    for (const [key, values] of this.values) {
-      if (values.length === 0) continue;
+    for (const { key } of this.resolved()) {
       const sectionPart = sectionOfKey(key);
       if (sectionPart.startsWith(prefix)) found.add(sectionPart.slice(prefix.length));
     }
@@ -316,6 +443,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.trailingNewline = parsed.trailingNewline;
     this.dirtyKeys.clear();
     this.removedSections.clear();
+    this.includedEntries = new Map();
+    this.resolvedCache = undefined;
 
     for (const key of this.mirroredKeys) delete this[key];
     this.mirroredKeys.clear();
@@ -453,6 +582,183 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
 
     if (out.length === 0) return "";
     return out.join("\n") + (this.trailingNewline ? "\n" : "");
+  }
+}
+
+/* ----------------------------------------------------------------- chain */
+
+/** Options of {@link GitWorkingCopyConfig}: the chain of files around this one. */
+export interface GitConfigOptions {
+  /**
+   * The user's environment: the system file (`systemConfig`), the global files
+   * (`$XDG_CONFIG_HOME/git/config`, `~/.gitconfig`) and `~/` in include paths. Absent (a
+   * browser), only this file and what it includes are read.
+   */
+  environment?: GitHostEnvironment;
+  /** Follow `include.path` / `includeIf.*.path` (default true) */
+  includes?: boolean;
+  /**
+   * The git directory as the host names it (an absolute path on Node), matched by
+   * `includeIf.gitdir:` and used for `./` in its patterns. Default: the directory of this file.
+   */
+  gitDirPath?: string;
+  /** `config.worktree` (default: next to this file), read when `extensions.worktreeConfig` */
+  worktreeConfigPath?: string;
+  /**
+   * The current branch's ref (`refs/heads/main`) for `includeIf.onbranch:`. Default: `HEAD`
+   * next to this file, read through its FilesApi.
+   */
+  readHead?: () => Promise<string | undefined>;
+}
+
+/** One value of the chain. */
+interface ConfigEntry {
+  key: string;
+  value: unknown;
+}
+
+/** A config file and how to read it. */
+interface ConfigSource {
+  read(path: string): Promise<Uint8Array | undefined>;
+  path: string;
+}
+
+/** git's `MAX_INCLUDE_DEPTH`. */
+const MAX_INCLUDE_DEPTH = 10;
+
+const dirOf = (path: string) => {
+  const slash = path.lastIndexOf("/");
+  return slash >= 0 ? path.slice(0, slash + 1) : "";
+};
+
+const isTrue = (value: unknown) =>
+  value === true ||
+  (typeof value === "number" && value !== 0) ||
+  (typeof value === "string" && ["true", "yes", "on", "1"].includes(value.toLowerCase()));
+
+/** `include.path` or `includeif.<condition>.path`. */
+function isIncludeKey(key: string): boolean {
+  return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
+}
+
+/** Reads config files of the chain, following their include directives as git does. */
+class ChainReader {
+  private branch?: Promise<string | undefined>;
+
+  constructor(
+    private readonly config: GitWorkingCopyConfig,
+    private readonly env: GitHostEnvironment | undefined,
+    private readonly options: GitConfigOptions,
+    private readonly followIncludes: boolean,
+  ) {}
+
+  /** Appends the entries of `source` (and what it includes) to `out`; nothing when absent. */
+  async readFile(source: ConfigSource, out: ConfigEntry[], depth: number): Promise<void> {
+    let content: Uint8Array | undefined;
+    try {
+      content = await source.read(source.path);
+    } catch {
+      content = undefined;
+    }
+    if (!content) return;
+    const { lines } = parseConfigText(new TextDecoder().decode(content));
+    for (const line of lines) {
+      const key = keyOfLine(line);
+      if (key === undefined) continue;
+      const value =
+        line.kind === "entry" ? line.value : line.kind === "section" ? line.inlineValue : undefined;
+      out.push({ key, value });
+      if (this.followIncludes && isIncludeKey(key)) {
+        await this.include(key, value, source, out, depth + 1);
+      }
+    }
+  }
+
+  /** Follows one include directive of `from`. */
+  async include(
+    key: string,
+    value: unknown,
+    from: ConfigSource,
+    out: ConfigEntry[],
+    depth: number,
+  ): Promise<void> {
+    if (typeof value !== "string" || value === "") return;
+    if (key !== "include.path") {
+      const condition = key.slice("includeif.".length, -".path".length);
+      if (!(await this.conditionHolds(condition, from))) return;
+    }
+    if (depth > MAX_INCLUDE_DEPTH) {
+      throw new Error(
+        `exceeded maximum include depth (${MAX_INCLUDE_DEPTH}) while including\n\t${value}\n\tfrom\n\t${from.path}\nThis might be due to circular includes.`,
+      );
+    }
+    const target = this.resolvePath(value, from);
+    if (target) await this.readFile(target, out, depth);
+  }
+
+  /** git's `handle_path_include`: `~/` in the home, a relative path beside `from`. */
+  private resolvePath(value: string, from: ConfigSource): ConfigSource | undefined {
+    const env = this.env;
+    if (value.startsWith("~")) {
+      const expanded = expandUserPath(value, env);
+      return expanded && env ? { read: env.readFile, path: expanded } : undefined;
+    }
+    if (value.startsWith("/")) {
+      return env ? { read: env.readFile, path: value } : undefined;
+    }
+    return { read: from.read, path: `${dirOf(from.path)}${value}` };
+  }
+
+  private gitDirPath(): string {
+    return (this.options.gitDirPath ?? dirOf(this.configPath())).replace(/\/+$/, "");
+  }
+
+  private configPath(): string {
+    return (this.config as unknown as { configPath: string }).configPath;
+  }
+
+  private async currentBranch(): Promise<string | undefined> {
+    if (!this.branch) {
+      this.branch = (async () => {
+        if (this.options.readHead) return this.options.readHead();
+        const files = (this.config as unknown as { files: ConfigFilesApi }).files;
+        const head = await files.read(`${dirOf(this.configPath())}HEAD`).catch(() => undefined);
+        if (!head) return undefined;
+        const text = new TextDecoder().decode(head).trim();
+        return text.startsWith("ref: ") ? text.slice(5).trim() : undefined;
+      })();
+    }
+    const ref = await this.branch;
+    return ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
+  }
+
+  /** git's `include_condition_is_true`. */
+  private async conditionHolds(condition: string, from: ConfigSource): Promise<boolean> {
+    const gitdir = /^gitdir(\/i)?:/.exec(condition);
+    if (gitdir) {
+      const icase = gitdir[1] !== undefined;
+      let pattern = condition.slice(gitdir[0].length);
+      const expanded = expandUserPath(pattern, this.env);
+      if (expanded === undefined) return false;
+      pattern = expanded;
+      if (pattern.startsWith("./")) {
+        // relative to the including file's directory, known only as the host names it
+        const dir = from.path === this.configPath() ? `${this.gitDirPath()}/` : dirOf(from.path);
+        pattern = `${dir}${pattern.slice(2)}`;
+      } else if (!pattern.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(pattern)) {
+        pattern = `**/${pattern}`;
+      }
+      if (pattern.endsWith("/")) pattern = `${pattern}**`;
+      return wildmatch(pattern, this.gitDirPath(), { pathname: true, casefold: icase });
+    }
+    if (condition.startsWith("onbranch:")) {
+      const branch = await this.currentBranch();
+      if (!branch) return false;
+      let pattern = condition.slice("onbranch:".length);
+      if (pattern.endsWith("/")) pattern = `${pattern}**`;
+      return wildmatch(pattern, branch, { pathname: true });
+    }
+    return false;
   }
 }
 
@@ -742,12 +1048,13 @@ export async function createWorkingCopyConfig(
   files: ConfigFilesApi,
   gitDir: string,
   worktreeName?: string,
+  options: GitConfigOptions = {},
 ): Promise<GitWorkingCopyConfig> {
   const configPath = worktreeName
     ? `${gitDir}/worktrees/${worktreeName}/config`
     : `${gitDir}/config`;
 
-  const config = new GitWorkingCopyConfig(files, configPath);
+  const config = new GitWorkingCopyConfig(files, configPath, options);
   await config.load();
   return config;
 }

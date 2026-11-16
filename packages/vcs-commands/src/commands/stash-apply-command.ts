@@ -516,8 +516,10 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     const content = await this.blobs.load(entry.objectId);
     if (!content) throw new Error(`${STASH_APPLY} cannot restore ${path}: blob missing`);
     const mode = entry.mode === FileMode.SYMLINK && !symlinks ? FileMode.REGULAR_FILE : entry.mode;
+    // a link written as a file holds its target as it is (never smudged)
     await worktree.writeContent(path, content, {
       mode,
+      ...(mode !== entry.mode ? { raw: true } : {}),
       createParents: true,
       replaceInTheWay: true,
     });

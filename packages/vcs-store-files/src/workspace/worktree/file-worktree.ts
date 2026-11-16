@@ -38,6 +38,7 @@ import type {
   WorktreeCapabilities,
   WorktreeCheckoutOptions,
   WorktreeCheckoutResult,
+  WorktreeContentFilter,
   WorktreeEntry,
   WorktreeRemoveOptions,
   WorktreeWalkOptions,
@@ -45,9 +46,11 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import {
   createIgnoreManager,
+  hashCleanedContent,
   hashWorktreeFile,
   MemoryCheckout,
   MemoryWorkingCopy,
+  smudgeContent,
   type WorkingCopy,
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
@@ -94,6 +97,9 @@ export interface FileWorktreeOptions {
  * File-based Worktree implementation
  */
 export class FileWorktree implements Worktree {
+  private filter?: WorktreeContentFilter;
+  /** Reads the global excludes file when no `globalExcludesFile` was given */
+  private excludesReader?: () => Promise<string | undefined>;
   private readonly rootFiles: WorktreeFilesApi;
   /** The FilesApi of the batch in progress (`withLstatCache` view), if any */
   private scoped?: WorktreeFilesApi;
@@ -410,6 +416,32 @@ export class FileWorktree implements Worktree {
     }
   }
 
+  get contentFilter(): WorktreeContentFilter | undefined {
+    return this.filter;
+  }
+
+  setContentFilter(filter: WorktreeContentFilter | undefined): void {
+    this.filter = filter;
+  }
+
+  setExcludesFileReader(read: (() => Promise<string | undefined>) | undefined): void {
+    this.excludesReader = read;
+  }
+
+  /** A file of the git directory (`info/attributes`), never through a symbolic link. */
+  async readGitDirFile(path: string): Promise<Uint8Array | undefined> {
+    if (!this.gitDir) return undefined;
+    const fullPath = joinPath(this.gitDir, path);
+    try {
+      if ((await this.files.lstat?.(fullPath))?.kind === "symlink") return undefined;
+      const stats = await this.files.stats(fullPath);
+      if (stats?.kind !== "file") return undefined;
+      return await readFile(this.files, fullPath);
+    } catch {
+      return undefined;
+    }
+  }
+
   async computeHash(path: string): Promise<ObjectId> {
     if (!this.files.refusesBeyondLinks) await this.checkLeadingPath(path);
     const fullPath = joinPath(this.rootPath, path);
@@ -421,6 +453,19 @@ export class FileWorktree implements Worktree {
         { size: async () => target.length, read: () => [target] },
         this.newHasher,
       );
+    }
+    if (this.filter) {
+      const stats = await this.files.stats(fullPath);
+      if (stats?.kind === "directory") throw new Error(`Is a directory: ${path}`);
+      if (stats?.kind !== "file") throw new Error(`File not found: ${path}`);
+      // the content as the content filter cleans it (what `git add` would store)
+      const cleaned = await hashCleanedContent(
+        this.filter,
+        path,
+        () => this.files.read(fullPath),
+        this.newHasher,
+      );
+      if (cleaned) return cleaned;
     }
     return hashWorktreeFile(
       path,
@@ -479,6 +524,8 @@ export class FileWorktree implements Worktree {
     options?: WorktreeWriteOptions,
   ): Promise<void> {
     assertValidWorktreePath(path, options?.mode, this.pathRules);
+    // a regular file is smudged by the content filter (git's convert_to_working_tree)
+    if (!options?.raw) content = await smudgeContent(this.filter, path, content, options?.mode);
     if (!this.files.refusesBeyondLinks || options?.replaceInTheWay) {
       await this.checkLeadingPath(path, options?.replaceInTheWay === true);
     }
@@ -559,7 +606,9 @@ export class FileWorktree implements Worktree {
     });
     if (!kind) return false;
     if (kind === "directory" && !options?.recursive) return false;
-    return this.files.remove(fullPath);
+    const removed = await this.files.remove(fullPath);
+    if (removed && kind !== "directory") this.filter?.noteRemoved?.(path);
+    return removed;
   }
 
   /**
@@ -1124,7 +1173,9 @@ export class FileWorktree implements Worktree {
       );
       this.ignoreManager.setExcludeFile(
         "core.excludesFile",
-        this.globalExcludesFile ? await read(this.globalExcludesFile) : undefined,
+        this.globalExcludesFile
+          ? await read(this.globalExcludesFile)
+          : await this.excludesReader?.().catch(() => undefined),
       );
       return;
     }

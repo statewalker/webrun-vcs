@@ -17,6 +17,7 @@
 
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { WorkingCopy } from "../working-copy.js";
+import type { WorktreeContentFilter } from "./content-filter.js";
 import type { WorktreeEntry } from "./types.js";
 
 // Re-export types for consumers
@@ -88,6 +89,12 @@ export interface WorktreeWriteOptions {
    * Without it such a path is refused.
    */
   replaceInTheWay?: boolean;
+  /**
+   * Write the content as it is, without the worktree's content filter (git's smudge:
+   * end-of-line conversion, `ident`, `working-tree-encoding`, filter drivers). By default a
+   * regular file is smudged where a filter is installed ({@link Worktree.setContentFilter}).
+   */
+  raw?: boolean;
 }
 
 /**
@@ -164,17 +171,54 @@ export interface Worktree {
    */
   batch?<T>(fn: () => Promise<T>): Promise<T>;
 
+  /**
+   * The content filter (git's clean and smudge conversions) this worktree applies, when one
+   * is installed: {@link computeHash} hashes a regular file as its filter cleans it, and
+   * {@link writeContent} smudges what it writes. {@link readContent} always gives the file
+   * as it is on disk.
+   */
+  readonly contentFilter?: WorktreeContentFilter;
+
+  /**
+   * Installs (or, with undefined, removes) the content filter. Working copies install git's
+   * (`createGitContentFilter`) unless one is installed already.
+   */
+  setContentFilter?(filter: WorktreeContentFilter | undefined): void;
+
+  /**
+   * Reads a file of the repository's git directory (`info/attributes`), where the worktree
+   * knows it; undefined when absent.
+   */
+  readGitDirFile?(path: string): Promise<Uint8Array | undefined>;
+
+  /**
+   * Sets how the global excludes file (`core.excludesFile`, by default
+   * `$XDG_CONFIG_HOME/git/ignore`) is read when the worktree was given none: the function
+   * returns its text, or undefined when there is none. Working copies set it from their
+   * configuration chain and the host's environment.
+   */
+  setExcludesFileReader?(read: (() => Promise<string | undefined>) | undefined): void;
+
   // ========== Reading ==========
 
   walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry>;
   getEntry(path: string): Promise<WorktreeEntry | undefined>;
+  /**
+   * The blob id of the file at `path`: of its content as the content filter cleans it (what
+   * `git add` would store), a symbolic link's target as it is.
+   */
   computeHash(path: string): Promise<ObjectId>;
+  /** The file's content as it is on disk (never converted). */
   readContent(path: string): AsyncIterable<Uint8Array>;
   exists(path: string): Promise<boolean>;
   isIgnored(path: string): Promise<boolean>;
 
   // ========== Writing ==========
 
+  /**
+   * Writes a file; a regular file's content is smudged by the content filter unless
+   * `options.raw` is set.
+   */
   writeContent(
     path: string,
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array> | Uint8Array,

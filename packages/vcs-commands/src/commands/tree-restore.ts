@@ -227,9 +227,11 @@ async function writePlan(
     // without symlinks (core.symlinks=false) a link is a file holding its target
     const written =
       mode === FileMode.SYMLINK && options.symlinks === false ? FileMode.REGULAR_FILE : mode;
-    // the blob streams into the file; it is never held whole in memory
+    // the blob streams into the file; it is never held whole in memory. A link written as
+    // a file holds its target as it is: git never converts it (smudge is for files)
     await worktree.writeContent(path, content, {
       mode: written,
+      ...(written !== mode ? { raw: true } : {}),
       createParents: true,
       ...(options.replaceInTheWay ? { replaceInTheWay: true } : {}),
     });

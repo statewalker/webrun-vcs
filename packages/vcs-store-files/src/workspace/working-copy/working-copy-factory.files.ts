@@ -9,6 +9,7 @@ import type { History } from "@statewalker/vcs-core";
 import type {
   AddWorktreeOptions,
   Checkout,
+  ContentFilterSetup,
   WorkingCopy,
   WorkingCopyFactory,
   WorkingCopyOptions,
@@ -17,7 +18,11 @@ import type {
 
 import { createGitStashStore } from "./stash-store.files.js";
 import { GitWorkingCopy, type WorkingCopyFilesApi } from "./working-copy.files.js";
-import { type ConfigFilesApi, createWorkingCopyConfig } from "./working-copy-config.files.js";
+import {
+  type ConfigFilesApi,
+  createWorkingCopyConfig,
+  type GitConfigOptions,
+} from "./working-copy-config.files.js";
 
 /**
  * Combined files API for all working copy operations
@@ -45,6 +50,15 @@ export interface GitWorkingCopyContext {
 }
 
 /**
+ * What a host adds to the working copies a factory opens: the user's environment (global
+ * configuration and attributes) and its filter drivers. Opt-in: without it only the
+ * repository's own files are read.
+ */
+export interface GitWorkingCopyFactorySetup
+  extends Pick<GitConfigOptions, "environment">,
+    Omit<ContentFilterSetup, "environment"> {}
+
+/**
  * Git-compatible WorkingCopyFactory implementation.
  */
 export class GitWorkingCopyFactory implements WorkingCopyFactory {
@@ -54,6 +68,7 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       repositoryPath: string,
       options: WorkingCopyOptions,
     ) => Promise<GitWorkingCopyContext>,
+    private readonly setup: GitWorkingCopyFactorySetup = {},
   ) {}
 
   /**
@@ -83,7 +98,9 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     });
 
     // 5. Create config
-    const config = await createWorkingCopyConfig(this.files, repositoryPath);
+    const config = await createWorkingCopyConfig(this.files, repositoryPath, undefined, {
+      ...(this.setup.environment ? { environment: this.setup.environment } : {}),
+    });
 
     return new GitWorkingCopy({
       history: context.history,
@@ -92,6 +109,7 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       stash,
       config,
       files: this.files,
+      ...this.setup,
       gitDir: repositoryPath,
     });
   }
@@ -191,7 +209,9 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     });
 
     // Create config
-    const config = await createWorkingCopyConfig(this.files, worktreeGitDir);
+    const config = await createWorkingCopyConfig(this.files, worktreeGitDir, undefined, {
+      ...(this.setup.environment ? { environment: this.setup.environment } : {}),
+    });
 
     return new GitWorkingCopy({
       history: context.history,
@@ -200,6 +220,7 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       stash,
       config,
       files: this.files,
+      ...this.setup,
       gitDir: worktreeGitDir,
     });
   }
@@ -217,6 +238,7 @@ export function createGitWorkingCopyFactory(
     repositoryPath: string,
     options: WorkingCopyOptions,
   ) => Promise<GitWorkingCopyContext>,
+  setup: GitWorkingCopyFactorySetup = {},
 ): WorkingCopyFactory {
-  return new GitWorkingCopyFactory(files, createContext);
+  return new GitWorkingCopyFactory(files, createContext, setup);
 }

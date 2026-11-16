@@ -5,6 +5,7 @@ import {
   getStageState,
   type IndexStatUpdate,
   modeFromWorktree,
+  readCleanContent,
   refreshIndexStats,
   type StageStateValue,
   statUpdateOf,
@@ -477,10 +478,19 @@ export class StatusCommand extends GitCommand<Status> {
           {
             renameLimit: limit,
             onRenameLimit,
+            // the worktree side as git's diff reads it: cleaned (convert_to_git)
             size: async (c, role) =>
-              role === "source" ? blobSize(c.id) : (await worktree.getEntry(c.path))?.size,
+              role === "source"
+                ? blobSize(c.id)
+                : worktree.contentFilter && c.mode !== 0o120000
+                  ? (await readCleanContent(worktree, c.path)).length
+                  : (await worktree.getEntry(c.path))?.size,
             load: (c, role) =>
-              role === "source" ? blob(c.id) : concat(worktree.readContent(c.path)),
+              role === "source"
+                ? blob(c.id)
+                : c.mode !== 0o120000
+                  ? readCleanContent(worktree, c.path)
+                  : concat(worktree.readContent(c.path)),
           },
         );
         for (const pair of pairs) {

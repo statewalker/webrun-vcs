@@ -12,6 +12,8 @@
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import type { WorktreeContentFilter } from "./content-filter.js";
+import { hashCleanedContent, isConvertedMode, smudgeContent } from "./filtered-content.js";
 import { hashWorktreeFile, type NewHasher } from "./hash-worktree-file.js";
 import type {
   Worktree,
@@ -51,6 +53,7 @@ export interface MemoryWorktreeOptions {
  * In-memory Worktree implementation
  */
 export class MemoryWorktree implements Worktree {
+  private filter?: WorktreeContentFilter;
   private readonly rootPath: string;
   private readonly blobs: Blobs;
   private readonly trees: Trees;
@@ -166,6 +169,14 @@ export class MemoryWorktree implements Worktree {
     return undefined;
   }
 
+  get contentFilter(): WorktreeContentFilter | undefined {
+    return this.filter;
+  }
+
+  setContentFilter(filter: WorktreeContentFilter | undefined): void {
+    this.filter = filter;
+  }
+
   async computeHash(path: string): Promise<ObjectId> {
     const file = this.files.get(path);
     if (!file) {
@@ -173,6 +184,10 @@ export class MemoryWorktree implements Worktree {
     }
 
     const { content } = file;
+    if (isConvertedMode(file.mode)) {
+      const cleaned = await hashCleanedContent(this.filter, path, () => [content], this.newHasher);
+      if (cleaned) return cleaned;
+    }
     return hashWorktreeFile(
       path,
       { size: async () => content.length, read: () => [content] },
@@ -207,6 +222,7 @@ export class MemoryWorktree implements Worktree {
     if (options?.overwrite === false && this.files.has(path)) {
       throw new Error(`File already exists: ${path}`);
     }
+    if (!options?.raw) content = await smudgeContent(this.filter, path, content, options?.mode);
 
     // Collect content
     let data: Uint8Array;
@@ -245,6 +261,7 @@ export class MemoryWorktree implements Worktree {
   async remove(path: string, options?: { recursive?: boolean }): Promise<boolean> {
     if (this.files.has(path)) {
       this.files.delete(path);
+      this.filter?.noteRemoved?.(path);
       return true;
     }
 
