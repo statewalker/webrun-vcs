@@ -632,8 +632,8 @@ describe.each(backends)("BlameCommand ($name backend)", ({ factory }) => {
 
       const result = await git.blame().setFilePath("file.txt").call();
 
-      // CR-only should be treated as line endings
-      expect(result.lineCount).toBe(3);
+      // git splits lines at LF only: a CR-only file is one line
+      expect(result.lineCount).toBe(1);
       expect(result.getEntry(1)?.commitId).toBe(commitId);
     });
   });

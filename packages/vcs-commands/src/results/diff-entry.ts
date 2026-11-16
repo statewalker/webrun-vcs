@@ -66,6 +66,21 @@ export interface DiffEntry {
 
   /** Similarity score for RENAME/COPY (0-100) */
   score?: number;
+
+  /**
+   * Reads the old content when it is not the stored blob `oldId` (a file outside the
+   * repository in a `--no-index` diff)
+   */
+  readOld?: () => Promise<Uint8Array>;
+
+  /**
+   * Reads the new content when it is not the stored blob `newId`: a worktree file, cleaned as
+   * `git add` would store it (`newId` is then the id of that content)
+   */
+  readNew?: () => Promise<Uint8Array>;
+
+  /** An unmerged path (index stages 1-3), printed as "* Unmerged path <path>" */
+  unmerged?: boolean;
 }
 
 /**

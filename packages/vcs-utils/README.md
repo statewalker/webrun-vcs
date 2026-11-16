@@ -30,7 +30,7 @@ No peer dependencies. Hashing uses `@noble/hashes`.
 | `@statewalker/vcs-utils/hash/rolling-checksum` | `RollingChecksum`, `JgitRollingHash` and related helpers |
 | `@statewalker/vcs-utils/hash/strong-checksum` | `StrongChecksum` |
 | `@statewalker/vcs-utils/hash/utils` | `bytesToHex`, `hexToBytes` (throws on odd length or a non-hex character) |
-| `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `DeltaError`, `createGitDeltaIndex`, `encodeGitDelta`, `parseGitDelta`, ...), text diff (`RawText`, `RawTextComparator`, `MyersDiff`, `HistogramDiff`, `getAlgorithm`, `MergeAlgorithm`, `merge3Way`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
+| `@statewalker/vcs-utils/diff` | Binary deltas (`createDeltaRanges`, `createFossilLikeRanges`, `createDelta`, `applyDelta`, `deltaToGitFormat`, `applyGitDelta`, `DeltaError`, `createGitDeltaIndex`, `encodeGitDelta`, `parseGitDelta`, ...), text diff (`xdiff`, `unifiedDiff`, `unifiedDiffHunks`, `diffLineCounts`, `userdiffFindFunction`, `mergeLines`, `RawText`, `MyersDiff`, ...), Git patches (`Patch`, `FileHeader`, `PatchApplier`, ...) |
 | `@statewalker/vcs-utils/encoding` | Git varints: `readVarint`, `writeVarint`, `readOfsVarint`, `writeOfsVarint`, `readPackHeader`, `writePackHeader` |
 | `@statewalker/vcs-utils/streams` | `collect`, `toArray`, `concat`, `mapStream`, `toLines`, `toChunks`, `splitStream`, `slice`, `readHeader` (with a required `maxLength`), `readPrefix`, `BufferedByteReader`, streaming request bodies (`requestBody`, `fetchWithRequestBody`, `shouldStreamRequestBody`, `toReadableStream`, ...), port streams (`writeStream`, `readStream`, `createPortStream`, ...) |
 | `@statewalker/vcs-utils/cache` | `LRUCache` |
@@ -185,7 +185,21 @@ for (const edit of MyersDiff.diff(RawTextComparator.DEFAULT, a, b)) {
 }
 ```
 
-`getAlgorithm(SupportedAlgorithm.HISTOGRAM)` returns `HistogramDiff.diff` with the same signature. Histogram is `DEFAULT_ALGORITHM`.
+For text the way git shows it, use the port of git's xdiff. `unifiedDiff` prints the hunks of `git diff` byte for byte: the same changes (myers, minimal, patience or histogram, the indent heuristic), the same hunk grouping (context, inter-hunk context, `-W`), whitespace options (`-w`, `-b`, `--ignore-space-at-eol`, `--ignore-cr-at-eol`, `--ignore-blank-lines`) and function lines in hunk headers, by default or from a builtin diff driver's pattern:
+
+```typescript
+import { unifiedDiff, userdiffFindFunction } from "@statewalker/vcs-utils/diff";
+
+const body = unifiedDiff(before, after, {
+  context: 3,
+  indentHeuristic: true,
+  ignoreWhitespaceChange: true,
+  findFunction: userdiffFindFunction("python"),
+});
+// "@@ -10,7 +10,8 @@ def parse(self, text):\n ..." as bytes
+```
+
+`xdiff` gives the changes themselves, `diffLineCounts` the added and deleted lines of the diffstat, and `xdiffHunks` the changes `git blame` compares with.
 
 Before diffing, check whether the content is binary. Git calls content binary when a NUL byte appears in its first 8000 bytes, and `RawText.isBinary` looks at those bytes only (`RawText.BINARY_PROBE_LENGTH`), so a prefix is enough:
 
@@ -315,7 +329,7 @@ Delta creation is split into two steps. A range generator (`createDeltaRanges`, 
 
 ### The diff, patch and delta code follows JGit
 
-The text diff (`MyersDiff`, `HistogramDiff`, `RawText`, `RawTextComparator`, `Edit`), the patch parser and applier, `applyGitDelta` and the rolling hash follow Eclipse JGit's implementations, so edge cases (whitespace modes, binary hunks, delta limits) behave as JGit does.
+Line diffs, the unified diff and line merges follow git's xdiff (`xdiff`, `unifiedDiff`, `mergeLines`). The generic sequence diff (`MyersDiff`, `RawText`, `RawTextComparator`, `Edit`), the patch parser and applier, `applyGitDelta` and the rolling hash follow Eclipse JGit's implementations, so edge cases (whitespace modes, binary hunks, delta limits) behave as JGit does.
 
 ### Dependencies
 

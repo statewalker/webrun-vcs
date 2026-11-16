@@ -1,18 +1,21 @@
-import type { Commit, ObjectId, PersonIdent, TreeEntry } from "@statewalker/vcs-core";
+import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
-import type { Edit } from "@statewalker/vcs-utils";
 import {
-  DEFAULT_ALGORITHM,
-  type DiffAlgorithm,
-  getAlgorithm,
-  RawText,
-  RawTextComparator,
   type SupportedAlgorithm,
+  type XdiffAlgorithm,
+  type XdiffOptions,
+  xdiffHunks,
 } from "@statewalker/vcs-utils";
 
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
-import { DEFAULT_RENAME_SCORE, SimilarityIndex } from "../rename/index.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import {
+  DEFAULT_RENAME_LIMIT,
+  DEFAULT_RENAME_SCORE,
+  detectRenames,
+  GIT_MAX_SCORE,
+} from "../rename/index.js";
 
 /**
  * A single blame entry - represents authorship of one or more consecutive lines.
@@ -30,6 +33,13 @@ export interface BlameEntry {
   resultStart: number;
   /** Number of lines in this region */
   lineCount: number;
+  /**
+   * The parent version the commit's lines were compared with (`previous` of
+   * `git blame --porcelain`), when the commit had the file in a parent
+   */
+  previous?: { commitId: ObjectId; path: string };
+  /** A boundary commit (a root commit, unless `setShowRoot(true)`): `^` in git's output */
+  boundary?: boolean;
 }
 
 /**
@@ -61,8 +71,13 @@ export interface BlameResult {
   path: string;
   /** Total number of lines in the file */
   lineCount: number;
-  /** Blame entries covering all lines */
+  /**
+   * Blame entries in line order (git's, after coalescing); they cover all lines, or the
+   * line ranges asked for
+   */
   entries: BlameEntry[];
+  /** The blamed file's content at the start commit */
+  content?: Uint8Array;
   /**
    * Get the blame entry for a specific line (1-based).
    *
@@ -87,20 +102,12 @@ export interface BlameResult {
   /**
    * Get the source line number in the original file.
    *
-   * This returns the line number in the source commit where this line originated.
-   * When a file has been modified through history with insertions/deletions,
-   * the source line number may differ from the result line number.
-   *
    * @param line Line number in the result file (1-based)
    * @returns Source line number (1-based), or undefined if out of range
    */
   getSourceLine(line: number): number | undefined;
   /**
    * Get the source path for a specific line.
-   *
-   * This returns the file path in the source commit. When rename tracking
-   * is enabled, this may differ from the result path if the line originated
-   * from a file with a different name.
    *
    * @param line Line number in the result file (1-based)
    * @returns Source path, or undefined if out of range
@@ -109,96 +116,188 @@ export interface BlameResult {
   /**
    * Get detailed tracking information for all lines.
    *
-   * Returns an array of LineTracking objects, one per line in the result file.
-   * Each object contains complete origin information including the commit,
-   * source path, and source line number.
-   *
    * @returns Array of LineTracking objects ordered by result line number
    */
   getLineTracking(): LineTracking[];
 }
 
+/** A version of the file in a commit (`struct blame_origin`) */
+interface Origin {
+  commitId: ObjectId;
+  path: string;
+  blobId: ObjectId;
+  mode: number;
+  /** Lines still suspected on this origin, sorted by `sLno` */
+  suspects: Entry | null;
+  previous?: Origin;
+  guilty: boolean;
+  /** The next origin of the same commit */
+  next: Origin | null;
+  content?: Uint8Array;
+}
+
+/** A run of lines (`struct blame_entry`), 0-based */
+interface Entry {
+  next: Entry | null;
+  suspect: Origin;
+  /** First line in the final file */
+  lno: number;
+  /** First line in the suspect's file */
+  sLno: number;
+  numLines: number;
+}
+
+/** Something with a `next` link: a list head or an entry (`struct blame_entry **`) */
+interface Slot {
+  next: Entry | null;
+}
+
+interface CommitState {
+  commit: Commit;
+  origins: Origin | null;
+  uninteresting: boolean;
+}
+
+const S_IFMT = 0o170000;
+const TREE_MODE = 0o040000;
+const INT_MAX = Number.MAX_SAFE_INTEGER;
+
+/** `reverse_blame`: `head` reversed, ending in `tail` */
+function reverseBlame(head: Entry | null, tail: Entry | null): Entry | null {
+  let h = head;
+  let t = tail;
+  while (h) {
+    const next = h.next;
+    h.next = t;
+    t = h;
+    h = next;
+  }
+  return t;
+}
+
+/** `blame_merge`: two lists sorted by `sLno` merged */
+function blameMerge(list1: Entry | null, list2: Entry | null): Entry | null {
+  if (!list1) return list2;
+  if (!list2) return list1;
+  const head: Slot = { next: null };
+  let tail: Slot = head;
+  let p1: Entry | null = list1;
+  let p2: Entry | null = list2;
+  while (p1 && p2) {
+    if (p1.sLno <= p2.sLno) {
+      tail.next = p1;
+      tail = p1;
+      p1 = p1.next;
+    } else {
+      tail.next = p2;
+      tail = p2;
+      p2 = p2.next;
+    }
+  }
+  tail.next = p1 ?? p2;
+  return head.next;
+}
+
+/** `split_blame_at`: `e` keeps `len` lines, the rest is returned */
+function splitBlameAt(e: Entry, len: number, suspect: Origin): Entry {
+  const n: Entry = {
+    next: null,
+    suspect,
+    lno: e.lno + len,
+    sLno: e.sLno + len,
+    numLines: e.numLines - len,
+  };
+  e.numLines = len;
+  return n;
+}
+
+/** A priority queue of commits: newest committer date first, ties first in, first out */
+class CommitQueue {
+  private heap: Array<{ id: ObjectId; date: number; ctr: number }> = [];
+  private ctr = 0;
+
+  private less(i: number, j: number): boolean {
+    const a = this.heap[i];
+    const b = this.heap[j];
+    if (a.date !== b.date) return a.date > b.date;
+    return a.ctr < b.ctr;
+  }
+
+  put(id: ObjectId, date: number): void {
+    const h = this.heap;
+    h.push({ id, date, ctr: this.ctr++ });
+    let i = h.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!this.less(i, p)) break;
+      [h[i], h[p]] = [h[p], h[i]];
+      i = p;
+    }
+  }
+
+  get(): ObjectId | undefined {
+    const h = this.heap;
+    if (h.length === 0) return undefined;
+    const top = h[0];
+    const last = h.pop();
+    if (h.length > 0 && last) {
+      h[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < h.length && this.less(l, m)) m = l;
+        if (r < h.length && this.less(r, m)) m = r;
+        if (m === i) break;
+        [h[i], h[m]] = [h[m], h[i]];
+        i = m;
+      }
+    }
+    return top.id;
+  }
+}
+
 /**
- * Annotate each line of a file with authorship information.
+ * Annotate each line of a file with the commit that last changed it.
  *
- * Equivalent to `git blame`.
+ * Equivalent to `git blame`, and a port of git's algorithm (`blame.c`): the commits are
+ * visited newest first (committer date); each passes the lines it did not change to the
+ * parents that have the file (found by path, else, following renames, by git's rename
+ * detection), comparing with each parent's version through the same xdiff diff git uses
+ * (`diff.algorithm`, default myers, and `diff.indentHeuristic`, default on); the lines left
+ * are its own. A parent with the same blob takes all lines. Root commits are boundaries
+ * unless `setShowRoot(true)` (`blame.showRoot`).
  *
- * Based on JGit's BlameCommand and BlameGenerator.
- *
- * This command tracks line-by-line history to determine which commit
- * introduced each line in a file. It walks commit history backward,
- * using diff algorithms to trace the origin of each line.
+ * Moves and copies across lines (`-M`, `-C`), `--reverse`, `--ignore-rev` and the mailmap
+ * are not supported.
  *
  * @example
  * ```typescript
- * // Blame a file at HEAD
- * const result = await git.blame()
- *   .setFilePath("src/main.ts")
- *   .call();
- *
- * // Get author of line 42
+ * const result = await git.blame().setFilePath("src/main.ts").call();
  * const author = result.getSourceAuthor(42);
- * console.log(`Line 42 written by: ${author?.name}`);
  *
- * // Blame at a specific commit
- * const result = await git.blame()
- *   .setFilePath("README.md")
- *   .setStartCommit(commitId)
- *   .call();
- *
- * // Iterate over blame entries
- * for (const entry of result.entries) {
- *   console.log(`Lines ${entry.resultStart}-${entry.resultStart + entry.lineCount - 1}: ${entry.commit.author.name}`);
- * }
+ * // `git blame --porcelain -w -L 10,20 README.md`
+ * const blame = await git.blame().setFilePath("README.md").setIgnoreWhitespace(true)
+ *   .setLineRanges([[10, 20]]).call();
+ * process.stdout.write(formatBlamePorcelain(blame));
  * ```
  */
-
-/**
- * Represents a region of the result file that still needs blame attribution.
- * Modeled after JGit's Region class.
- *
- * Regions track both the position in the result file and the current source position
- * (which may differ as we trace back through history due to insertions/deletions).
- */
-interface BlameRegion {
-  /** Position in the result file (1-based) */
-  resultStart: number;
-  /** Position in the current source file being examined (1-based) */
-  sourceStart: number;
-  /** Number of lines in this region */
-  length: number;
-}
-
-/**
- * Represents a candidate commit that may have contributed lines to the result.
- * Modeled after JGit's Candidate class.
- */
-interface BlameCandidate {
-  /** The commit being examined */
-  commit: Commit;
-  /** Commit ID */
-  commitId: ObjectId;
-  /** Current path being tracked */
-  path: string;
-  /** Blob ID of the file in this commit */
-  blobId: ObjectId;
-  /** Content of the file */
-  content: Uint8Array;
-  /** RawText for diff operations */
-  rawText: RawText;
-  /** Regions this candidate is responsible for */
-  regions: BlameRegion[];
-  /** Commit time for priority queue ordering */
-  time: number;
-}
-
 export class BlameCommand extends GitCommand<BlameResult> {
   private filePath?: string;
   private startCommit?: ObjectId;
-  private followRenames = false;
+  private followRenames = true;
   private renameScore = DEFAULT_RENAME_SCORE;
-  private diffAlgorithm: DiffAlgorithm = getAlgorithm(DEFAULT_ALGORITHM);
+  private algorithm?: XdiffAlgorithm;
   private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
+  private ignoreWhitespace = false;
+  private indentHeuristic?: boolean;
+  private showRoot?: boolean;
+  private lineRanges: Array<[number, number]> = [];
+  private diffOptions: Pick<XdiffOptions, "histogramRediff" | "legacyMinimal"> = {};
+  private renameCountLastSpan?: boolean;
+
+  private states = new Map<ObjectId, CommitState>();
 
   /**
    * Set the file path to blame.
@@ -225,10 +324,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   /**
-   * Set whether to follow file renames.
-   *
-   * When enabled, the blame will track lines through renames.
-   * This is more accurate but slower.
+   * Set whether to follow whole-file renames (default true, as git; false is
+   * `--no-follow`).
    *
    * @param follow Whether to follow renames
    */
@@ -250,13 +347,61 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   /**
-   * Set the diff algorithm to use.
+   * Set the diff algorithm (`--diff-algorithm`; default `diff.algorithm`, else myers).
    *
-   * @param algorithm The algorithm to use (default: histogram)
+   * @param algorithm The algorithm to use
    */
-  setAlgorithm(algorithm: SupportedAlgorithm): this {
+  setAlgorithm(algorithm: SupportedAlgorithm | XdiffAlgorithm): this {
     this.checkCallable();
-    this.diffAlgorithm = getAlgorithm(algorithm);
+    this.algorithm = String(algorithm) as XdiffAlgorithm;
+    return this;
+  }
+
+  /** Ignore whitespace when comparing versions (`-w`) */
+  setIgnoreWhitespace(ignore: boolean): this {
+    this.checkCallable();
+    this.ignoreWhitespace = ignore;
+    return this;
+  }
+
+  /** The indent heuristic (default `diff.indentHeuristic`, true) */
+  setIndentHeuristic(on: boolean): this {
+    this.checkCallable();
+    this.indentHeuristic = on;
+    return this;
+  }
+
+  /** Do not treat root commits as boundaries (`--root`; default `blame.showRoot`) */
+  setShowRoot(show: boolean): this {
+    this.checkCallable();
+    this.showRoot = show;
+    return this;
+  }
+
+  /**
+   * Blame only these line ranges (`-L <start>,<end>`, 1-based, inclusive), merged as git
+   * merges overlapping ranges.
+   */
+  setLineRanges(ranges: Array<[number, number]>): this {
+    this.checkCallable();
+    this.lineRanges = ranges.map(([s, e]) => [s, e]);
+    return this;
+  }
+
+  /**
+   * Diff details that changed between git versions: `histogramRediff` (git 2.54+, default
+   * true), `legacyMinimal` (git before 2.5x), and `renameCountLastSpan` (rename scores of
+   * git 2.50+, default true)
+   */
+  setCompatibility(
+    options: Pick<XdiffOptions, "histogramRediff" | "legacyMinimal"> & {
+      renameCountLastSpan?: boolean;
+    },
+  ): this {
+    this.checkCallable();
+    const { renameCountLastSpan, ...diff } = options;
+    this.diffOptions = { ...this.diffOptions, ...diff };
+    if (renameCountLastSpan !== undefined) this.renameCountLastSpan = renameCountLastSpan;
     return this;
   }
 
@@ -279,9 +424,6 @@ export class BlameCommand extends GitCommand<BlameResult> {
   /**
    * Execute the blame command.
    *
-   * Uses a queue-based algorithm similar to JGit's BlameGenerator.
-   * For merge commits, checks all parents to correctly attribute lines.
-   *
    * @returns BlameResult with per-line authorship
    */
   async call(): Promise<BlameResult> {
@@ -291,8 +433,11 @@ export class BlameCommand extends GitCommand<BlameResult> {
     if (!this.filePath) {
       throw new Error("File path must be set");
     }
+    const config = RemoteConfigStore.from(this.workingCopy);
+    this.algorithm ??= algorithmValue(config.value("diff.algorithm")) ?? "myers";
+    this.indentHeuristic ??= boolValue(config.value("diff.indentHeuristic")) ?? true;
+    this.showRoot ??= boolValue(config.value("blame.showRoot")) ?? false;
 
-    // Resolve starting commit
     let startId = this.startCommit;
     if (!startId) {
       const head = await this.refsStore.resolve("HEAD");
@@ -303,776 +448,322 @@ export class BlameCommand extends GitCommand<BlameResult> {
     }
 
     const resultPath = this.filePath;
-    const entries: BlameEntry[] = [];
-
-    // Load the file content at the starting commit
-    const startCommit = await this.commits.load(startId);
-    if (!startCommit) {
+    const start = await this.state(startId);
+    if (!start) {
       throw new RefNotFoundError(`Cannot find commit: ${startId}`);
     }
-    const blobId = await this.getFileBlob(startCommit.tree, resultPath);
-
-    if (!blobId) {
+    const entry = await this.lookup(start.commit.tree, resultPath);
+    if (!entry) {
       throw new Error(`File not found: ${resultPath}`);
     }
-
-    const size = await this.blobs.size(blobId);
+    const size = await this.blobs.size(entry.id);
     if (size > this.bigFileThreshold) {
       throw new Error(
         `${resultPath} is ${size} bytes, larger than bigFileThreshold (${this.bigFileThreshold})`,
       );
     }
+    const finalOrigin = this.getOrigin(startId, resultPath);
+    finalOrigin.blobId = entry.id;
+    finalOrigin.mode = entry.mode;
+    const content = await this.readBlob(entry.id);
+    finalOrigin.content = content;
+    const lineCount = countLines(content);
 
-    // Get file content and count lines
-    const content = await this.collectBlob(blobId);
-    const lineCount = this.countLines(content);
-
-    if (lineCount === 0) {
-      // Empty file
-      return this.createBlameResult(resultPath, 0, []);
+    // the initial entries: the whole file, or the -L ranges (sorted and merged)
+    const ranges = this.ranges(lineCount);
+    let head: Entry | null = null;
+    for (let i = ranges.length - 1; i >= 0; i--) {
+      const [s, e] = ranges[i];
+      head = { next: head, suspect: finalOrigin, lno: s, sLno: s, numLines: e - s };
+    }
+    const final: Slot = { next: null };
+    if (head) {
+      finalOrigin.suspects = head;
+      const queue = new CommitQueue();
+      queue.put(startId, start.commit.committer.timestamp);
+      await this.assignBlame(queue, final);
     }
 
-    // Initialize the candidate queue with the starting commit
-    // Queue is sorted by commit time descending (most recent first)
-    const queue: BlameCandidate[] = [];
-    const seen = new Set<ObjectId>();
-
-    const initialCandidate: BlameCandidate = {
-      commit: startCommit,
-      commitId: startId,
-      path: resultPath,
-      blobId,
-      content,
-      rawText: new RawText(content),
-      regions: [{ resultStart: 1, sourceStart: 1, length: lineCount }],
-      time: startCommit.author.timestamp * 1000,
-    };
-
-    this.pushCandidate(queue, initialCandidate, seen);
-
-    // Track remaining lines to blame
-    let remaining = lineCount;
-
-    // Process candidates until all lines are blamed or queue is empty
-    while (queue.length > 0 && remaining > 0) {
-      const candidate = queue.shift();
-      if (!candidate) break;
-
-      if (candidate.regions.length === 0) {
-        continue;
-      }
-
-      const parentCount = candidate.commit.parents.length;
-
-      if (parentCount === 0) {
-        // Root commit - blame all remaining regions to this commit
-        this.blameRegions(entries, candidate);
-        remaining -= this.countRegionLines(candidate.regions);
-      } else if (parentCount === 1) {
-        // Single parent - process normally
-        const blamed = await this.processOneParent(candidate, queue, seen, entries);
-        remaining -= blamed;
-      } else {
-        // Merge commit - process all parents (JGit's processMerge)
-        const blamed = await this.processMerge(candidate, queue, seen, entries);
-        remaining -= blamed;
-      }
+    // blame_sort_final, blame_coalesce
+    const ents: Entry[] = [];
+    for (let e = final.next; e; e = e.next) ents.push(e);
+    ents.sort((a, b) => a.lno - b.lno);
+    const coalesced: Entry[] = [];
+    for (const e of ents) {
+      const last = coalesced[coalesced.length - 1];
+      if (
+        last &&
+        last.suspect === e.suspect &&
+        last.sLno + last.numLines === e.sLno &&
+        last.lno + last.numLines === e.lno
+      ) {
+        last.numLines += e.numLines;
+      } else coalesced.push({ ...e });
     }
 
-    // Sort entries by result line number
-    entries.sort((a, b) => a.resultStart - b.resultStart);
-
-    // Merge adjacent entries from the same commit and path
-    const mergedEntries = this.mergeAdjacentEntries(entries);
-
-    return this.createBlameResult(resultPath, lineCount, mergedEntries);
-  }
-
-  /**
-   * Process a commit with a single parent.
-   *
-   * @returns Number of lines blamed to this commit
-   */
-  private async processOneParent(
-    candidate: BlameCandidate,
-    queue: BlameCandidate[],
-    seen: Set<ObjectId>,
-    entries: BlameEntry[],
-  ): Promise<number> {
-    const parentId = candidate.commit.parents[0];
-    const parentCommit = await this.commits.load(parentId);
-    if (!parentCommit) {
-      // Parent commit not found - blame all regions to this commit
-      this.blameRegions(entries, candidate);
-      return this.countRegionLines(candidate.regions);
-    }
-
-    // Check if file exists in parent
-    let parentBlobId = await this.getFileBlob(parentCommit.tree, candidate.path);
-    let parentPath = candidate.path;
-
-    // If file doesn't exist in parent and rename following is enabled, search for rename
-    if (!parentBlobId && this.followRenames) {
-      const rename = await this.findRename(
-        parentCommit.tree,
-        candidate.commit.tree,
-        candidate.path,
-        candidate.content,
-      );
-
-      if (rename) {
-        parentBlobId = rename.oldBlobId;
-        parentPath = rename.oldPath;
-      }
-    }
-
-    // A parent version over the threshold is never loaded: treat it as unrelated
-    if (parentBlobId && parentBlobId !== candidate.blobId && (await this.isBig(parentBlobId))) {
-      parentBlobId = undefined;
-    }
-
-    if (!parentBlobId) {
-      // File was introduced in this commit - blame all regions
-      this.blameRegions(entries, candidate);
-      return this.countRegionLines(candidate.regions);
-    }
-
-    // If blob is identical, pass blame to parent without diffing
-    if (parentBlobId === candidate.blobId) {
-      const parentContent = await this.collectBlob(parentBlobId);
-      const parentCandidate: BlameCandidate = {
-        commit: parentCommit,
-        commitId: parentId,
-        path: parentPath,
-        blobId: parentBlobId,
-        content: parentContent,
-        rawText: new RawText(parentContent),
-        regions: candidate.regions,
-        time: parentCommit.author.timestamp * 1000,
-      };
-      this.pushCandidate(queue, parentCandidate, seen);
-      return 0;
-    }
-
-    // Compute diff and split blame
-    const parentContent = await this.collectBlob(parentBlobId);
-    const parentRawText = new RawText(parentContent);
-
-    return this.splitBlame(
-      candidate,
-      parentCommit,
-      parentId,
-      parentPath,
-      parentBlobId,
-      parentContent,
-      parentRawText,
-      queue,
-      seen,
-      entries,
-    );
-  }
-
-  /**
-   * Process a merge commit with multiple parents.
-   * Based on JGit's processMerge() algorithm.
-   *
-   * Key algorithm:
-   * 1. If any parent has identical blob, pass all blame to that parent
-   * 2. Otherwise, for each parent that has the file, compute diff
-   * 3. Lines that match a parent go to that parent's history
-   * 4. Lines that don't match any parent (conflict resolution) are blamed to merge commit
-   *
-   * @returns Number of lines blamed to the merge commit
-   */
-  private async processMerge(
-    candidate: BlameCandidate,
-    queue: BlameCandidate[],
-    seen: Set<ObjectId>,
-    entries: BlameEntry[],
-  ): Promise<number> {
-    const parentCount = candidate.commit.parents.length;
-
-    // Collect parent info
-    interface ParentInfo {
-      commit: Commit;
-      commitId: ObjectId;
-      blobId: ObjectId;
-      path: string;
-      content: Uint8Array;
-      rawText: RawText;
-    }
-
-    const parentInfos: (ParentInfo | null)[] = [];
-
-    // First pass: check all parents for the file
-    for (let pIdx = 0; pIdx < parentCount; pIdx++) {
-      const parentId = candidate.commit.parents[pIdx];
-      const parentCommit = await this.commits.load(parentId);
-      if (!parentCommit) {
-        parentInfos.push(null);
-        continue;
-      }
-
-      let parentBlobId = await this.getFileBlob(parentCommit.tree, candidate.path);
-      let parentPath = candidate.path;
-
-      // Check for rename if file not found
-      if (!parentBlobId && this.followRenames) {
-        const rename = await this.findRename(
-          parentCommit.tree,
-          candidate.commit.tree,
-          candidate.path,
-          candidate.content,
-        );
-        if (rename) {
-          parentBlobId = rename.oldBlobId;
-          parentPath = rename.oldPath;
-        }
-      }
-
-      if (parentBlobId && parentBlobId !== candidate.blobId && (await this.isBig(parentBlobId))) {
-        parentBlobId = undefined;
-      }
-
-      if (parentBlobId) {
-        // If any parent has identical blob, pass all blame to that parent
-        if (parentBlobId === candidate.blobId) {
-          const parentContent = await this.collectBlob(parentBlobId);
-          const parentCandidate: BlameCandidate = {
-            commit: parentCommit,
-            commitId: parentId,
-            path: parentPath,
-            blobId: parentBlobId,
-            content: parentContent,
-            rawText: new RawText(parentContent),
-            regions: candidate.regions,
-            time: parentCommit.author.timestamp * 1000,
-          };
-          this.pushCandidate(queue, parentCandidate, seen);
-          return 0;
-        }
-
-        const parentContent = await this.collectBlob(parentBlobId);
-        parentInfos.push({
-          commit: parentCommit,
-          commitId: parentId,
-          blobId: parentBlobId,
-          path: parentPath,
-          content: parentContent,
-          rawText: new RawText(parentContent),
-        });
-      } else {
-        parentInfos.push(null);
-      }
-    }
-
-    // If no parents have the file, blame everything to this commit
-    const validParents = parentInfos.filter((p): p is ParentInfo => p !== null);
-    if (validParents.length === 0) {
-      this.blameRegions(entries, candidate);
-      return this.countRegionLines(candidate.regions);
-    }
-
-    // Process each parent and split blame
-    // We track which regions have been passed to parents
-    let currentRegions = candidate.regions;
-
-    for (const parentInfo of validParents) {
-      if (currentRegions.length === 0) break;
-
-      // Compute diff between parent and candidate
-      const comparator = RawTextComparator.DEFAULT;
-      const edits = this.diffAlgorithm(comparator, parentInfo.rawText, candidate.rawText);
-
-      // Split regions between parent and candidate
-      const { parentRegions, childRegions } = this.takeBlame(edits, currentRegions);
-
-      // Push parent candidate if it has regions
-      if (parentRegions.length > 0) {
-        const parentCandidate: BlameCandidate = {
-          commit: parentInfo.commit,
-          commitId: parentInfo.commitId,
-          path: parentInfo.path,
-          blobId: parentInfo.blobId,
-          content: parentInfo.content,
-          rawText: parentInfo.rawText,
-          regions: parentRegions,
-          time: parentInfo.commit.author.timestamp * 1000,
-        };
-        this.pushCandidate(queue, parentCandidate, seen);
-      }
-
-      // Remaining regions stay with the merge commit
-      currentRegions = childRegions;
-    }
-
-    // Any remaining regions are blamed to the merge commit
-    // (these are conflict resolution lines)
-    if (currentRegions.length > 0) {
-      const mergeCandidate: BlameCandidate = {
-        ...candidate,
-        regions: currentRegions,
-      };
-      this.blameRegions(entries, mergeCandidate);
-      return this.countRegionLines(currentRegions);
-    }
-
-    return 0;
-  }
-
-  /**
-   * Split blame between a candidate and its parent using diff edits.
-   * Based on JGit's Candidate.takeBlame() method.
-   *
-   * For each line in the child that is unchanged (not covered by an edit),
-   * we need to find where that line came from in the parent. Due to insertions
-   * and deletions, unchanged lines in the child may not be contiguous in the parent.
-   *
-   * @returns Object with regions for parent and regions remaining with child
-   */
-  private takeBlame(
-    edits: Edit[],
-    regions: BlameRegion[],
-  ): { parentRegions: BlameRegion[]; childRegions: BlameRegion[] } {
-    const parentRegions: BlameRegion[] = [];
-    const childRegions: BlameRegion[] = [];
-
-    // Process each region against the edit list
-    // Edits are in terms of 0-based line numbers
-    // Regions use 1-based line numbers
-
-    for (const region of regions) {
-      // Convert to 0-based for comparison with edits
-      const regionStart = region.sourceStart - 1;
-      const regionEnd = regionStart + region.length;
-
-      // Track what parts of this region are covered by edits (changes)
-      // and what parts are unchanged (should go to parent)
-      const changedRanges: Array<{ start: number; end: number }> = [];
-
-      for (const edit of edits) {
-        // Edit's B side (child/new) tells us which lines in the child are different
-        const editStart = edit.beginB;
-        const editEnd = edit.endB;
-
-        // Check if edit overlaps with region
-        if (editEnd <= regionStart || editStart >= regionEnd) {
-          continue; // No overlap
-        }
-
-        // Compute overlap
-        const overlapStart = Math.max(editStart, regionStart);
-        const overlapEnd = Math.min(editEnd, regionEnd);
-
-        if (overlapEnd > overlapStart) {
-          changedRanges.push({ start: overlapStart, end: overlapEnd });
-        }
-      }
-
-      // Sort and merge overlapping changed ranges
-      changedRanges.sort((a, b) => a.start - b.start);
-      const mergedChanges: Array<{ start: number; end: number }> = [];
-      for (const range of changedRanges) {
-        if (
-          mergedChanges.length === 0 ||
-          mergedChanges[mergedChanges.length - 1].end < range.start
-        ) {
-          mergedChanges.push({ ...range });
-        } else {
-          mergedChanges[mergedChanges.length - 1].end = Math.max(
-            mergedChanges[mergedChanges.length - 1].end,
-            range.end,
-          );
-        }
-      }
-
-      // Now split the region: unchanged parts go to parent, changed parts stay with child
-      // For unchanged parts, we need to create separate regions for each contiguous block
-      // in the parent, since mapping through edits may create gaps.
-      let pos = regionStart;
-
-      for (const change of mergedChanges) {
-        // Unchanged part before this change - process line by line to handle non-contiguous mapping
-        if (change.start > pos) {
-          this.addParentRegionsForUnchangedBlock(
-            pos,
-            change.start,
-            region.resultStart,
-            regionStart,
-            edits,
-            parentRegions,
-          );
-        }
-
-        // Changed part stays with child
-        if (change.end > change.start) {
-          childRegions.push({
-            resultStart: region.resultStart + (change.start - regionStart),
-            sourceStart: change.start + 1, // Convert back to 1-based
-            length: change.end - change.start,
-          });
-        }
-
-        pos = change.end;
-      }
-
-      // Remaining unchanged part after last change
-      if (pos < regionEnd) {
-        this.addParentRegionsForUnchangedBlock(
-          pos,
-          regionEnd,
-          region.resultStart,
-          regionStart,
-          edits,
-          parentRegions,
-        );
-      }
-    }
-
-    return { parentRegions, childRegions };
-  }
-
-  /**
-   * Add parent regions for an unchanged block of lines.
-   * Since lines may map to non-contiguous positions in the parent
-   * (due to deletions), we need to create separate regions for each
-   * contiguous block in the parent.
-   */
-  private addParentRegionsForUnchangedBlock(
-    startPos: number,
-    endPos: number,
-    resultStart: number,
-    regionStart: number,
-    edits: Edit[],
-    parentRegions: BlameRegion[],
-  ): void {
-    // Map each line position and group into contiguous regions in the parent
-    let currentParentStart = -1;
-    let currentResultStart = -1;
-    let currentLength = 0;
-    let lastParentPos = -1;
-
-    for (let childPos = startPos; childPos < endPos; childPos++) {
-      const parentPos = this.mapPositionToParent(childPos, edits);
-
-      if (currentLength === 0) {
-        // Start a new region
-        currentParentStart = parentPos;
-        currentResultStart = resultStart + (childPos - regionStart);
-        currentLength = 1;
-        lastParentPos = parentPos;
-      } else if (parentPos === lastParentPos + 1) {
-        // Extend current region (contiguous in parent)
-        currentLength++;
-        lastParentPos = parentPos;
-      } else {
-        // Gap in parent - push current region and start new one
-        parentRegions.push({
-          resultStart: currentResultStart,
-          sourceStart: currentParentStart + 1, // Convert to 1-based
-          length: currentLength,
-        });
-        currentParentStart = parentPos;
-        currentResultStart = resultStart + (childPos - regionStart);
-        currentLength = 1;
-        lastParentPos = parentPos;
-      }
-    }
-
-    // Push final region
-    if (currentLength > 0) {
-      parentRegions.push({
-        resultStart: currentResultStart,
-        sourceStart: currentParentStart + 1, // Convert to 1-based
-        length: currentLength,
+    const entries: BlameEntry[] = [];
+    for (const e of coalesced) {
+      const st = this.states.get(e.suspect.commitId);
+      if (!st) continue;
+      const prev = e.suspect.previous;
+      entries.push({
+        commit: st.commit,
+        commitId: e.suspect.commitId,
+        sourcePath: e.suspect.path,
+        sourceStart: e.sLno + 1,
+        resultStart: e.lno + 1,
+        lineCount: e.numLines,
+        ...(prev ? { previous: { commitId: prev.commitId, path: prev.path } } : {}),
+        boundary: st.uninteresting,
       });
     }
+    return createBlameResult(resultPath, lineCount, entries, content);
   }
 
-  /**
-   * Map a position in the child file back to the corresponding position in the parent.
-   * Takes into account insertions and deletions.
-   *
-   * @param childPos 0-based position in child
-   * @param edits Edit list from diff
-   * @returns 0-based position in parent
-   */
-  private mapPositionToParent(childPos: number, edits: Edit[]): number {
-    let offset = 0;
-
-    for (const edit of edits) {
-      if (edit.endB <= childPos) {
-        // This edit is before our position
-        // Adjust offset: lengthA - lengthB gives the shift
-        const lengthA = edit.endA - edit.beginA;
-        const lengthB = edit.endB - edit.beginB;
-        offset += lengthA - lengthB;
-      } else if (edit.beginB <= childPos) {
-        // Position is within an edit - this shouldn't happen for unchanged lines
-        // but handle gracefully by mapping to edit start in parent
-        return edit.beginA;
+  /** The -L ranges as 0-based half-open ranges, sorted and merged; the whole file otherwise */
+  private ranges(lineCount: number): Array<[number, number]> {
+    if (this.lineRanges.length === 0) return lineCount > 0 ? [[0, lineCount]] : [];
+    const out: Array<[number, number]> = [];
+    for (const [s, e] of this.lineRanges) {
+      let bottom = s;
+      let top = e;
+      if (top < bottom) [bottom, top] = [top, bottom];
+      if (bottom < 1) bottom = 1;
+      if (lineCount < bottom) {
+        throw new Error(`file ${this.filePath} has only ${lineCount} lines`);
       }
+      if (top > lineCount) top = lineCount;
+      out.push([bottom - 1, top]);
     }
-
-    return childPos + offset;
-  }
-
-  /**
-   * Split blame between a candidate and a single parent.
-   *
-   * @returns Number of lines blamed to the candidate
-   */
-  private async splitBlame(
-    candidate: BlameCandidate,
-    parentCommit: Commit,
-    parentId: ObjectId,
-    parentPath: string,
-    parentBlobId: ObjectId,
-    parentContent: Uint8Array,
-    parentRawText: RawText,
-    queue: BlameCandidate[],
-    seen: Set<ObjectId>,
-    entries: BlameEntry[],
-  ): Promise<number> {
-    // Compute diff
-    const comparator = RawTextComparator.DEFAULT;
-    const edits = this.diffAlgorithm(comparator, parentRawText, candidate.rawText);
-
-    if (edits.length === 0) {
-      // No changes (might happen with whitespace-ignoring comparator)
-      const parentCandidate: BlameCandidate = {
-        commit: parentCommit,
-        commitId: parentId,
-        path: parentPath,
-        blobId: parentBlobId,
-        content: parentContent,
-        rawText: parentRawText,
-        regions: candidate.regions,
-        time: parentCommit.author.timestamp * 1000,
-      };
-      this.pushCandidate(queue, parentCandidate, seen);
-      return 0;
+    out.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const merged: Array<[number, number]> = [];
+    for (const r of out) {
+      const last = merged[merged.length - 1];
+      if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+      else merged.push([r[0], r[1]]);
     }
-
-    // Split regions
-    const { parentRegions, childRegions } = this.takeBlame(edits, candidate.regions);
-
-    // Push parent candidate
-    if (parentRegions.length > 0) {
-      const parentCandidate: BlameCandidate = {
-        commit: parentCommit,
-        commitId: parentId,
-        path: parentPath,
-        blobId: parentBlobId,
-        content: parentContent,
-        rawText: parentRawText,
-        regions: parentRegions,
-        time: parentCommit.author.timestamp * 1000,
-      };
-      this.pushCandidate(queue, parentCandidate, seen);
-    }
-
-    // Blame child regions to this commit
-    if (childRegions.length > 0) {
-      const childCandidate: BlameCandidate = {
-        ...candidate,
-        regions: childRegions,
-      };
-      this.blameRegions(entries, childCandidate);
-      return this.countRegionLines(childRegions);
-    }
-
-    return 0;
-  }
-
-  /**
-   * Push a candidate onto the queue, maintaining descending time order.
-   * Handles merging of candidates for the same commit.
-   */
-  private pushCandidate(
-    queue: BlameCandidate[],
-    candidate: BlameCandidate,
-    seen: Set<ObjectId>,
-  ): void {
-    // Check if we already have a candidate for this commit
-    if (seen.has(candidate.commitId)) {
-      // Find and merge with existing candidate
-      const existing = queue.find(
-        (c) => c.commitId === candidate.commitId && c.path === candidate.path,
-      );
-      if (existing) {
-        // Merge regions
-        existing.regions = this.mergeBlameRegions(existing.regions, candidate.regions);
-        return;
-      }
-    }
-
-    seen.add(candidate.commitId);
-
-    // Insert in descending time order
-    let insertIdx = 0;
-    while (insertIdx < queue.length && queue[insertIdx].time > candidate.time) {
-      insertIdx++;
-    }
-    queue.splice(insertIdx, 0, candidate);
-  }
-
-  /**
-   * Merge two region lists, maintaining sorted order by resultStart.
-   */
-  private mergeBlameRegions(a: BlameRegion[], b: BlameRegion[]): BlameRegion[] {
-    const result: BlameRegion[] = [...a, ...b];
-    result.sort((x, y) => x.resultStart - y.resultStart);
-
-    // Merge adjacent regions
-    const merged: BlameRegion[] = [];
-    for (const region of result) {
-      if (merged.length === 0) {
-        merged.push({ ...region });
-      } else {
-        const last = merged[merged.length - 1];
-        if (
-          last.resultStart + last.length === region.resultStart &&
-          last.sourceStart + last.length === region.sourceStart
-        ) {
-          last.length += region.length;
-        } else {
-          merged.push({ ...region });
-        }
-      }
-    }
-
     return merged;
   }
 
-  /**
-   * Blame all regions in a candidate to its commit.
-   */
-  private blameRegions(entries: BlameEntry[], candidate: BlameCandidate): void {
-    for (const region of candidate.regions) {
-      entries.push({
-        commit: candidate.commit,
-        commitId: candidate.commitId,
-        sourcePath: candidate.path,
-        sourceStart: region.sourceStart,
-        resultStart: region.resultStart,
-        lineCount: region.length,
-      });
-    }
-  }
-
-  /**
-   * Count total lines in a list of regions.
-   */
-  private countRegionLines(regions: BlameRegion[]): number {
-    return regions.reduce((sum, r) => sum + r.length, 0);
-  }
-
-  /**
-   * Find a rename candidate for a file that doesn't exist in the parent commit.
-   *
-   * Searches for deleted files in the parent that have similar content to the
-   * file in the current commit.
-   *
-   * @param parentTreeId Tree ID of the parent commit
-   * @param currentTreeId Tree ID of the current commit
-   * @param newPath Path of the file in the current commit
-   * @param newContent Content of the file in the current commit
-   * @returns Rename information if found, undefined otherwise
-   */
-  private async findRename(
-    parentTreeId: ObjectId,
-    currentTreeId: ObjectId,
-    _newPath: string,
-    newContent: Uint8Array,
-  ): Promise<{ oldPath: string; oldBlobId: ObjectId; score: number } | undefined> {
-    // Skip binary files for rename detection
-    if (SimilarityIndex.isBinary(newContent)) {
-      return undefined;
-    }
-
-    // Collect all blob entries from both trees
-    const parentBlobs = new Map<string, TreeEntry>();
-    const currentBlobs = new Map<string, TreeEntry>();
-
-    await this.collectTreeEntries(parentTreeId, "", parentBlobs);
-    await this.collectTreeEntries(currentTreeId, "", currentBlobs);
-
-    // Find files that exist in parent but not in current (potential rename sources)
-    const deletedFiles: Array<{ path: string; entry: TreeEntry }> = [];
-    for (const [path, entry] of parentBlobs) {
-      if (!currentBlobs.has(path)) {
-        deletedFiles.push({ path, entry });
-      }
-    }
-
-    if (deletedFiles.length === 0) {
-      return undefined;
-    }
-
-    // Compute similarity index for the new file
-    const newIndex = SimilarityIndex.create(newContent);
-
-    // Find the best matching deleted file
-    let bestMatch: { path: string; blobId: ObjectId; score: number } | undefined;
-
-    for (const { path: oldPath, entry } of deletedFiles) {
-      if (await this.isBig(entry.id)) continue;
-
-      // Load the old file content
-      const oldContent = await this.collectBlob(entry.id);
-
-      // Skip binary files
-      if (SimilarityIndex.isBinary(oldContent)) {
+  /** git's `assign_blame` */
+  private async assignBlame(queue: CommitQueue, final: Slot): Promise<void> {
+    let commitId = queue.get();
+    while (commitId) {
+      const st = this.states.get(commitId);
+      let suspect = st?.origins ?? null;
+      while (suspect && !suspect.suspects) suspect = suspect.next;
+      if (!st || !suspect) {
+        commitId = queue.get();
         continue;
       }
-
-      // Compute similarity
-      const oldIndex = SimilarityIndex.create(oldContent);
-      const score = newIndex.score(oldIndex);
-
-      // Check if this is a better match than what we have
-      if (score >= this.renameScore && (!bestMatch || score > bestMatch.score)) {
-        bestMatch = {
-          path: oldPath,
-          blobId: entry.id,
-          score,
-        };
+      if (!st.uninteresting) await this.passBlame(suspect, queue);
+      // treat root commit as boundary
+      if (st.commit.parents.length === 0 && !this.showRoot) st.uninteresting = true;
+      // take responsibility for the remaining entries
+      let ent = suspect.suspects;
+      if (ent) {
+        suspect.guilty = true;
+        while (ent.next) ent = ent.next;
+        ent.next = final.next;
+        final.next = suspect.suspects;
+        suspect.suspects = null;
       }
     }
-
-    if (bestMatch) {
-      return {
-        oldPath: bestMatch.path,
-        oldBlobId: bestMatch.blobId,
-        score: bestMatch.score,
-      };
-    }
-
-    return undefined;
   }
 
-  /**
-   * Collect all blob entries from a tree recursively.
-   */
-  private async collectTreeEntries(
-    treeId: ObjectId,
-    prefix: string,
-    entries: Map<string, TreeEntry>,
-  ): Promise<void> {
-    const TREE_MODE = 0o40000;
-
-    for await (const entry of this.trees.loadTree(treeId)) {
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-
-      if (entry.mode === TREE_MODE) {
-        // Recurse into subtree
-        await this.collectTreeEntries(entry.id, path, entries);
-      } else {
-        // Blob entry
-        entries.set(path, entry);
+  /** git's `pass_blame` (without -M/-C) */
+  private async passBlame(origin: Origin, queue: CommitQueue): Promise<void> {
+    const st = this.states.get(origin.commitId);
+    if (!st) return;
+    const parents = st.commit.parents;
+    const n = parents.length;
+    if (n === 0) return;
+    const sgOrigin: Array<Origin | undefined> = new Array(n).fill(undefined);
+    for (let pass = 0; pass < (this.followRenames ? 2 : 1); pass++) {
+      for (let i = 0; i < n; i++) {
+        if (sgOrigin[i]) continue;
+        const parent = await this.state(parents[i]);
+        if (!parent) continue;
+        const porigin = pass
+          ? await this.findRename(parents[i], origin)
+          : await this.findOrigin(parents[i], origin);
+        if (!porigin) continue;
+        if (porigin.blobId === origin.blobId) {
+          this.passWholeBlame(origin, porigin, queue);
+          return;
+        }
+        let same = false;
+        for (let j = 0; j < i; j++) {
+          if (sgOrigin[j] && sgOrigin[j]?.blobId === porigin.blobId) {
+            same = true;
+            break;
+          }
+        }
+        if (!same) sgOrigin[i] = porigin;
       }
     }
+    for (let i = 0; i < n; i++) {
+      const porigin = sgOrigin[i];
+      if (!porigin) continue;
+      if (!origin.previous) origin.previous = porigin;
+      await this.passBlameToParent(origin, porigin, queue);
+      if (!origin.suspects) break;
+    }
+    origin.content = undefined;
+  }
+
+  /** git's `pass_whole_blame` */
+  private passWholeBlame(origin: Origin, porigin: Origin, queue: CommitQueue): void {
+    if (!porigin.content && origin.content) {
+      porigin.content = origin.content;
+      origin.content = undefined;
+    }
+    const suspects = origin.suspects;
+    origin.suspects = null;
+    for (let e = suspects; e; e = e.next) e.suspect = porigin;
+    this.queueBlames(porigin, suspects, queue);
+  }
+
+  /** git's `queue_blames` */
+  private queueBlames(porigin: Origin, sorted: Entry | null, queue: CommitQueue): void {
+    if (porigin.suspects) {
+      porigin.suspects = blameMerge(porigin.suspects, sorted);
+      return;
+    }
+    const st = this.states.get(porigin.commitId);
+    for (let o = st?.origins ?? null; o; o = o.next) {
+      if (o.suspects) {
+        porigin.suspects = sorted;
+        return;
+      }
+    }
+    porigin.suspects = sorted;
+    if (st) queue.put(porigin.commitId, st.commit.committer.timestamp);
+  }
+
+  /** git's `pass_blame_to_parent` */
+  private async passBlameToParent(
+    target: Origin,
+    parent: Origin,
+    queue: CommitQueue,
+  ): Promise<void> {
+    if (!target.suspects) return;
+    const newdest: Slot = { next: null };
+    const src: Slot = { next: target.suspects };
+    const d = { offset: 0, dstq: newdest as Slot, srcq: src as Slot };
+    const fileP = await this.originContent(parent);
+    const fileO = await this.originContent(target);
+    const hunks = xdiffHunks(fileP, fileO, {
+      algorithm: this.algorithm,
+      indentHeuristic: this.indentHeuristic,
+      ignoreWhitespace: this.ignoreWhitespace,
+      ...this.diffOptions,
+    });
+    for (const h of hunks) {
+      blameChunk(d, h.i2, h.i1 - h.i2, h.i2 + h.chg2, parent);
+      d.offset = h.i1 + h.chg1 - (h.i2 + h.chg2);
+    }
+    blameChunk(d, INT_MAX, d.offset, INT_MAX, parent);
+    d.dstq.next = null;
+    target.suspects = src.next;
+    this.queueBlames(parent, newdest.next, queue);
+  }
+
+  /** git's `find_origin`: the parent's version at the same path, of the same kind */
+  private async findOrigin(parentId: ObjectId, origin: Origin): Promise<Origin | undefined> {
+    const parent = this.states.get(parentId);
+    if (!parent) return undefined;
+    for (let o = parent.origins; o; o = o.next) if (o.path === origin.path) return o;
+    const entry = await this.lookup(parent.commit.tree, origin.path);
+    if (!entry || (entry.mode & S_IFMT) !== (origin.mode & S_IFMT)) return undefined;
+    if (entry.id !== origin.blobId && (await this.isBig(entry.id))) return undefined;
+    const porigin = this.getOrigin(parentId, origin.path);
+    porigin.blobId = entry.id;
+    porigin.mode = entry.mode;
+    return porigin;
+  }
+
+  /** git's `find_rename`: a file of the parent the commit's file was renamed from */
+  private async findRename(parentId: ObjectId, origin: Origin): Promise<Origin | undefined> {
+    const parent = this.states.get(parentId);
+    const child = this.states.get(origin.commitId);
+    if (!parent || !child) return undefined;
+    // the path is a rename destination only when added (not a kind change)
+    const inParent = await this.lookup(parent.commit.tree, origin.path);
+    if (inParent) return undefined;
+    const before = new Map<string, { id: ObjectId; mode: number }>();
+    const after = new Map<string, { id: ObjectId; mode: number }>();
+    await this.collectBlobs(parent.commit.tree, "", before);
+    await this.collectBlobs(child.commit.tree, "", after);
+    const sources = [];
+    for (const [path, e] of before) {
+      if (!after.has(path) && !(await this.isBig(e.id))) sources.push({ path, ...e });
+    }
+    if (sources.length === 0) return undefined;
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const limit = intValue(config.value("diff.renameLimit")) ?? DEFAULT_RENAME_LIMIT;
+    const pairs = await detectRenames(
+      sources,
+      [{ path: origin.path, id: origin.blobId, mode: origin.mode }],
+      {
+        renameLimit: limit,
+        minimumScore: Math.round((this.renameScore * GIT_MAX_SCORE) / 100),
+        countLastSpan: this.renameCountLastSpan,
+        size: async (c) => this.blobs.size(c.id),
+        load: async (c) => this.readBlob(c.id),
+      },
+    );
+    const pair = pairs.find((p) => p.to === origin.path);
+    if (!pair) return undefined;
+    const src = before.get(pair.from);
+    if (!src) return undefined;
+    const porigin = this.getOrigin(parentId, pair.from);
+    porigin.blobId = src.id;
+    porigin.mode = src.mode;
+    return porigin;
+  }
+
+  /** git's `get_origin`: the commit's origin for a path, moved to the front, or a new one */
+  private getOrigin(commitId: ObjectId, path: string): Origin {
+    const st = this.states.get(commitId);
+    if (!st) throw new Error(`commit ${commitId} not loaded`);
+    let l: Origin | null = null;
+    for (let o = st.origins; o; l = o, o = o.next) {
+      if (o.path === path) {
+        if (l) {
+          l.next = o.next;
+          o.next = st.origins;
+          st.origins = o;
+        }
+        return o;
+      }
+    }
+    const o: Origin = {
+      commitId,
+      path,
+      blobId: "",
+      mode: 0,
+      suspects: null,
+      guilty: false,
+      next: st.origins,
+    };
+    st.origins = o;
+    return o;
+  }
+
+  private async state(commitId: ObjectId): Promise<CommitState | undefined> {
+    const known = this.states.get(commitId);
+    if (known) return known;
+    const commit = await this.commits.load(commitId).catch(() => undefined);
+    if (!commit) return undefined;
+    const st: CommitState = { commit, origins: null, uninteresting: false };
+    this.states.set(commitId, st);
+    return st;
+  }
+
+  private async originContent(o: Origin): Promise<Uint8Array> {
+    o.content ??= await this.readBlob(o.blobId);
+    return o.content;
   }
 
   /** Whether a blob is over the threshold (from its size, without reading it). */
@@ -1080,203 +771,174 @@ export class BlameCommand extends GitCommand<BlameResult> {
     return (await this.blobs.size(blobId)) > this.bigFileThreshold;
   }
 
-  /**
-   * Collect blob content into a single buffer.
-   */
-  private async collectBlob(blobId: ObjectId): Promise<Uint8Array> {
+  private async readBlob(blobId: ObjectId): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
-    let totalLength = 0;
-
-    const blobContent = await this.blobs.load(blobId);
-    if (blobContent) {
-      for await (const chunk of blobContent) {
+    let total = 0;
+    const content = await this.blobs.load(blobId);
+    if (content) {
+      for await (const chunk of content) {
         chunks.push(chunk);
-        totalLength += chunk.length;
+        total += chunk.length;
       }
     }
-
-    // Combine chunks into single buffer
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const c of chunks) {
+      out.set(c, at);
+      at += c.length;
     }
-
-    return result;
+    return out;
   }
 
-  /**
-   * Get blob ID for a file in a tree.
-   */
-  private async getFileBlob(treeId: ObjectId, path: string): Promise<ObjectId | undefined> {
+  /** The non-tree entry at `path` in a tree */
+  private async lookup(
+    treeId: ObjectId,
+    path: string,
+  ): Promise<{ id: ObjectId; mode: number } | undefined> {
     const parts = path.split("/").filter((p) => p.length > 0);
-    let currentTreeId = treeId;
-
+    let current = treeId;
     for (let i = 0; i < parts.length; i++) {
-      const name = parts[i];
-      const isLast = i === parts.length - 1;
-
-      const entry = await this.trees.getEntry(currentTreeId, name);
-      if (!entry) {
-        return undefined;
-      }
-
-      if (isLast) {
-        return entry.id;
-      }
-
-      // Navigate into subtree
-      currentTreeId = entry.id;
+      const entry = await this.trees.getEntry(current, parts[i]);
+      if (!entry) return undefined;
+      const isTree = (entry.mode & S_IFMT) === TREE_MODE;
+      if (i === parts.length - 1) return isTree ? undefined : { id: entry.id, mode: entry.mode };
+      if (!isTree) return undefined;
+      current = entry.id;
     }
-
     return undefined;
   }
 
-  /**
-   * Count lines in content.
-   *
-   * Recognizes three types of line endings:
-   * - LF (\n) - Unix style
-   * - CRLF (\r\n) - Windows style (counts as one line ending)
-   * - CR (\r) - Classic Mac style (standalone CR without following LF)
-   */
-  private countLines(content: Uint8Array): number {
-    if (content.length === 0) {
-      return 0;
+  private async collectBlobs(
+    treeId: ObjectId,
+    prefix: string,
+    out: Map<string, { id: ObjectId; mode: number }>,
+  ): Promise<void> {
+    for await (const entry of this.trees.loadTree(treeId)) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if ((entry.mode & S_IFMT) === TREE_MODE) await this.collectBlobs(entry.id, path, out);
+      else out.set(path, { id: entry.id, mode: entry.mode });
     }
+  }
+}
 
-    let count = 1;
-    for (let i = 0; i < content.length; i++) {
-      const byte = content[i];
-      if (byte === 0x0a) {
-        // '\n' - LF (Unix) or second byte of CRLF (Windows)
-        count++;
-      } else if (byte === 0x0d) {
-        // '\r' - Check if it's CRLF or standalone CR
-        if (i + 1 < content.length && content[i + 1] === 0x0a) {
-          // CRLF - skip the CR, the LF will be handled in next iteration
-          continue;
+/** git's `blame_chunk`: lines before `tlno` go to the parent, `[tlno, same)` stay */
+function blameChunk(
+  d: { offset: number; dstq: Slot; srcq: Slot },
+  tlno: number,
+  offset: number,
+  same: number,
+  parent: Origin,
+): void {
+  let e = d.srcq.next;
+  let samep: Entry | null = null;
+  let diffp: Entry | null = null;
+  while (e && e.sLno < tlno) {
+    const next: Entry | null = e.next;
+    if (e.sLno + e.numLines > tlno) {
+      const n = splitBlameAt(e, tlno - e.sLno, e.suspect);
+      n.next = diffp;
+      diffp = n;
+    }
+    e.suspect = parent;
+    e.sLno += offset;
+    e.next = samep;
+    samep = e;
+    e = next;
+  }
+  if (samep) {
+    d.dstq.next = reverseBlame(samep, d.dstq.next);
+    d.dstq = samep;
+  }
+  e = reverseBlame(diffp, e);
+  samep = null;
+  diffp = null;
+  while (e && e.sLno < same) {
+    const next: Entry | null = e.next;
+    if (e.sLno + e.numLines > same) {
+      const n = splitBlameAt(e, same - e.sLno, e.suspect);
+      n.next = samep;
+      samep = n;
+    }
+    e.next = diffp;
+    diffp = e;
+    e = next;
+  }
+  d.srcq.next = reverseBlame(diffp, reverseBlame(samep, e));
+  if (diffp) d.srcq = diffp;
+}
+
+/** Lines as git counts them: LF-terminated, an unterminated last line one more */
+function countLines(content: Uint8Array): number {
+  let n = 0;
+  for (let i = 0; i < content.length; i++) if (content[i] === 0x0a) n++;
+  if (content.length > 0 && content[content.length - 1] !== 0x0a) n++;
+  return n;
+}
+
+function boolValue(v: string | undefined): boolean | undefined {
+  if (v === undefined) return undefined;
+  const s = v.trim().toLowerCase();
+  if (s === "" || s === "true" || s === "yes" || s === "on") return true;
+  if (s === "false" || s === "no" || s === "off") return false;
+  const n = Number(s);
+  return Number.isInteger(n) ? n !== 0 : undefined;
+}
+
+function intValue(value: string | undefined): number | undefined {
+  const m = value?.trim().match(/^(-?\d+)([kmg]?)$/i);
+  if (!m) return undefined;
+  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[m[2].toLowerCase()] ?? 1;
+  return Number(m[1]) * unit;
+}
+
+function algorithmValue(v: string | undefined): XdiffAlgorithm | undefined {
+  const s = v?.trim().toLowerCase();
+  if (s === "default") return "myers";
+  return s === "myers" || s === "minimal" || s === "patience" || s === "histogram" ? s : undefined;
+}
+
+/**
+ * Create a BlameResult from entries.
+ */
+function createBlameResult(
+  path: string,
+  lineCount: number,
+  entries: BlameEntry[],
+  content: Uint8Array,
+): BlameResult {
+  const lineToEntry = new Map<number, BlameEntry>();
+  for (const entry of entries) {
+    for (let i = 0; i < entry.lineCount; i++) lineToEntry.set(entry.resultStart + i, entry);
+  }
+  const sourceLine = (line: number): number | undefined => {
+    const entry = lineToEntry.get(line);
+    return entry ? entry.sourceStart + (line - entry.resultStart) : undefined;
+  };
+  return {
+    path,
+    lineCount,
+    entries,
+    content,
+    getEntry: (line) => lineToEntry.get(line),
+    getSourceCommit: (line) => lineToEntry.get(line)?.commit,
+    getSourceAuthor: (line) => lineToEntry.get(line)?.commit.author,
+    getSourceLine: sourceLine,
+    getSourcePath: (line) => lineToEntry.get(line)?.sourcePath,
+    getLineTracking(): LineTracking[] {
+      const tracking: LineTracking[] = [];
+      for (let line = 1; line <= lineCount; line++) {
+        const entry = lineToEntry.get(line);
+        if (entry) {
+          tracking.push({
+            resultLine: line,
+            commit: entry.commit,
+            commitId: entry.commitId,
+            sourcePath: entry.sourcePath,
+            sourceLine: entry.sourceStart + (line - entry.resultStart),
+          });
         }
-        // Standalone CR (classic Mac style)
-        count++;
       }
-    }
-
-    // If file ends with newline (LF or CR), don't count the empty "line" after it
-    const lastByte = content[content.length - 1];
-    if (lastByte === 0x0a || lastByte === 0x0d) {
-      count--;
-    }
-
-    return count;
-  }
-
-  /**
-   * Merge adjacent entries from the same commit and source path.
-   */
-  private mergeAdjacentEntries(entries: BlameEntry[]): BlameEntry[] {
-    if (entries.length <= 1) {
-      return entries;
-    }
-
-    const merged: BlameEntry[] = [];
-    let current = entries[0];
-
-    for (let i = 1; i < entries.length; i++) {
-      const next = entries[i];
-
-      // Check if can merge: same commit, same source path, and adjacent lines
-      if (
-        current.commitId === next.commitId &&
-        current.sourcePath === next.sourcePath &&
-        current.resultStart + current.lineCount === next.resultStart
-      ) {
-        // Merge
-        current = {
-          ...current,
-          lineCount: current.lineCount + next.lineCount,
-        };
-      } else {
-        merged.push(current);
-        current = next;
-      }
-    }
-
-    merged.push(current);
-    return merged;
-  }
-
-  /**
-   * Create a BlameResult from entries.
-   */
-  private createBlameResult(path: string, lineCount: number, entries: BlameEntry[]): BlameResult {
-    // Build line-to-entry index for fast lookups
-    const lineToEntry = new Map<number, BlameEntry>();
-    for (const entry of entries) {
-      for (let i = 0; i < entry.lineCount; i++) {
-        lineToEntry.set(entry.resultStart + i, entry);
-      }
-    }
-
-    /**
-     * Get the source line number for a given result line.
-     * The source line is computed based on the entry's sourceStart and the offset
-     * within the entry.
-     */
-    function getSourceLineForResult(line: number): number | undefined {
-      const entry = lineToEntry.get(line);
-      if (!entry) return undefined;
-      // Compute offset within the entry and add to sourceStart
-      const offset = line - entry.resultStart;
-      return entry.sourceStart + offset;
-    }
-
-    return {
-      path,
-      lineCount,
-      entries,
-
-      getEntry(line: number): BlameEntry | undefined {
-        return lineToEntry.get(line);
-      },
-
-      getSourceCommit(line: number): Commit | undefined {
-        const entry = lineToEntry.get(line);
-        return entry?.commit;
-      },
-
-      getSourceAuthor(line: number): PersonIdent | undefined {
-        const entry = lineToEntry.get(line);
-        return entry?.commit.author;
-      },
-
-      getSourceLine(line: number): number | undefined {
-        return getSourceLineForResult(line);
-      },
-
-      getSourcePath(line: number): string | undefined {
-        const entry = lineToEntry.get(line);
-        return entry?.sourcePath;
-      },
-
-      getLineTracking(): LineTracking[] {
-        const tracking: LineTracking[] = [];
-        for (let line = 1; line <= lineCount; line++) {
-          const entry = lineToEntry.get(line);
-          if (entry) {
-            const offset = line - entry.resultStart;
-            tracking.push({
-              resultLine: line,
-              commit: entry.commit,
-              commitId: entry.commitId,
-              sourcePath: entry.sourcePath,
-              sourceLine: entry.sourceStart + offset,
-            });
-          }
-        }
-        return tracking;
-      },
-    };
-  }
+      return tracking;
+    },
+  };
 }

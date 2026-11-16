@@ -53,7 +53,7 @@ describe.each(backends)("DiffFormatter ($name backend)", ({ factory }) => {
 
     // Check hunk content
     const hunk = diff.hunks[0];
-    expect(hunk.oldStart).toBe(1);
+    expect(hunk.oldStart).toBe(0); // git prints "@@ -0,0 +1,3 @@"
     expect(hunk.oldCount).toBe(0);
     expect(hunk.newStart).toBe(1);
     expect(hunk.newCount).toBe(3);

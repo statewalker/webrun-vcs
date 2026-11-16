@@ -40,6 +40,147 @@ export interface XdiffOptions {
    * and later do (default true; false gives the diff of older git)
    */
   histogramRediff?: boolean;
+  /**
+   * Set aside lines with many matches before a minimal diff too, as git before 2.5x did
+   * (default false: newer git keeps them, and finds the minimal diff)
+   */
+  legacyMinimal?: boolean;
+  /** Ignore whitespace when comparing lines (`-w`, `XDF_IGNORE_WHITESPACE`) */
+  ignoreWhitespace?: boolean;
+  /** Ignore changes in amount of whitespace (`-b`, `XDF_IGNORE_WHITESPACE_CHANGE`) */
+  ignoreWhitespaceChange?: boolean;
+  /** Ignore whitespace at end of line (`--ignore-space-at-eol`) */
+  ignoreWhitespaceAtEol?: boolean;
+  /** Ignore a carriage return at the end of line (`--ignore-cr-at-eol`) */
+  ignoreCrAtEol?: boolean;
+}
+
+/** xdiff's `XDF_IGNORE_WHITESPACE` */
+export const XDF_IGNORE_WHITESPACE = 1 << 1;
+/** xdiff's `XDF_IGNORE_WHITESPACE_CHANGE` */
+export const XDF_IGNORE_WHITESPACE_CHANGE = 1 << 2;
+/** xdiff's `XDF_IGNORE_WHITESPACE_AT_EOL` */
+export const XDF_IGNORE_WHITESPACE_AT_EOL = 1 << 3;
+/** xdiff's `XDF_IGNORE_CR_AT_EOL` */
+export const XDF_IGNORE_CR_AT_EOL = 1 << 4;
+/** xdiff's `XDF_WHITESPACE_FLAGS` */
+export const XDF_WHITESPACE_FLAGS =
+  XDF_IGNORE_WHITESPACE |
+  XDF_IGNORE_WHITESPACE_CHANGE |
+  XDF_IGNORE_WHITESPACE_AT_EOL |
+  XDF_IGNORE_CR_AT_EOL;
+
+/** The `XDF_*` whitespace bits of {@link XdiffOptions} */
+export function whitespaceFlags(options: XdiffOptions): number {
+  return (
+    (options.ignoreWhitespace ? XDF_IGNORE_WHITESPACE : 0) |
+    (options.ignoreWhitespaceChange ? XDF_IGNORE_WHITESPACE_CHANGE : 0) |
+    (options.ignoreWhitespaceAtEol ? XDF_IGNORE_WHITESPACE_AT_EOL : 0) |
+    (options.ignoreCrAtEol ? XDF_IGNORE_CR_AT_EOL : 0)
+  );
+}
+
+/** The `isspace` of git (`sane_ctype`): space, TAB, LF and CR only */
+export function xdlIsSpace(c: number): boolean {
+  return c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d;
+}
+
+/** xdiff's `ends_with_optional_cr`: only an optional CR left before the LF */
+function endsWithOptionalCr(l: Uint8Array, s0: number, s: number, i: number): boolean {
+  const complete = s > s0 && l[s - 1] === 0x0a;
+  let end = s;
+  if (complete) end--;
+  if (end === i) return true;
+  return complete && end === i + 1 && l[i] === 0x0d;
+}
+
+/**
+ * xdiff's `xdl_recmatch`: whether bytes `[a0, a1)` of `l1` and `[b0, b1)` of `l2` are equal
+ * lines under the whitespace `flags`.
+ */
+export function xdlRecmatch(
+  l1: Uint8Array,
+  a0: number,
+  a1: number,
+  l2: Uint8Array,
+  b0: number,
+  b1: number,
+  flags: number,
+): boolean {
+  if (a1 - a0 === b1 - b0) {
+    let k = 0;
+    const n = a1 - a0;
+    while (k < n && l1[a0 + k] === l2[b0 + k]) k++;
+    if (k === n) return true;
+  }
+  if (!(flags & XDF_WHITESPACE_FLAGS)) return false;
+  let i1 = a0;
+  let i2 = b0;
+  if (flags & XDF_IGNORE_WHITESPACE) {
+    for (;;) {
+      while (i1 < a1 && xdlIsSpace(l1[i1])) i1++;
+      while (i2 < b1 && xdlIsSpace(l2[i2])) i2++;
+      if (!(i1 < a1 && i2 < b1)) break;
+      if (l1[i1++] !== l2[i2++]) return false;
+    }
+  } else if (flags & XDF_IGNORE_WHITESPACE_CHANGE) {
+    while (i1 < a1 && i2 < b1) {
+      if (xdlIsSpace(l1[i1]) && xdlIsSpace(l2[i2])) {
+        while (i1 < a1 && xdlIsSpace(l1[i1])) i1++;
+        while (i2 < b1 && xdlIsSpace(l2[i2])) i2++;
+        continue;
+      }
+      if (l1[i1++] !== l2[i2++]) return false;
+    }
+  } else if (flags & XDF_IGNORE_WHITESPACE_AT_EOL) {
+    while (i1 < a1 && i2 < b1 && l1[i1] === l2[i2]) {
+      i1++;
+      i2++;
+    }
+  } else if (flags & XDF_IGNORE_CR_AT_EOL) {
+    while (i1 < a1 && i2 < b1 && l1[i1] === l2[i2]) {
+      i1++;
+      i2++;
+    }
+    return endsWithOptionalCr(l1, a0, a1, i1) && endsWithOptionalCr(l2, b0, b1, i2);
+  }
+  if (i1 < a1) {
+    while (i1 < a1 && xdlIsSpace(l1[i1])) i1++;
+    if (a1 !== i1) return false;
+  }
+  if (i2 < b1) {
+    while (i2 < b1 && xdlIsSpace(l2[i2])) i2++;
+    return b1 === i2;
+  }
+  return true;
+}
+
+/**
+ * xdiff's `xdl_hash_record_with_whitespace` (32-bit): equal hashes for lines
+ * {@link xdlRecmatch} finds equal under `flags`.
+ */
+export function xdlHashRecord(c: Uint8Array, start: number, top: number, flags: number): number {
+  let ha = 5381;
+  const crAtEolOnly = (flags & XDF_WHITESPACE_FLAGS) === XDF_IGNORE_CR_AT_EOL;
+  for (let ptr = start; ptr < top && c[ptr] !== 0x0a; ptr++) {
+    if (crAtEolOnly) {
+      if (c[ptr] === 0x0d && ptr + 1 < top && c[ptr + 1] === 0x0a) continue;
+    } else if (xdlIsSpace(c[ptr])) {
+      const ptr2 = ptr;
+      while (ptr + 1 < top && xdlIsSpace(c[ptr + 1]) && c[ptr + 1] !== 0x0a) ptr++;
+      const atEol = top <= ptr + 1 || c[ptr + 1] === 0x0a;
+      if (flags & XDF_IGNORE_WHITESPACE) {
+        // already handled
+      } else if (flags & XDF_IGNORE_WHITESPACE_CHANGE && !atEol) {
+        ha = (Math.imul(ha, 33) ^ 0x20) | 0;
+      } else if (flags & XDF_IGNORE_WHITESPACE_AT_EOL && !atEol) {
+        for (let p = ptr2; p !== ptr + 1; p++) ha = (Math.imul(ha, 33) ^ c[p]) | 0;
+      }
+      continue;
+    }
+    ha = (Math.imul(ha, 33) ^ c[ptr]) | 0;
+  }
+  return ha;
 }
 
 /**
@@ -84,6 +225,10 @@ export interface XdFlags {
   indentHeuristic: boolean;
   /** git >= 2.54: a histogram group joined while sliding is diffed again */
   histogramRediff?: boolean;
+  /** git before 2.5x: minimal also sets aside lines with many matches */
+  legacyMinimal?: boolean;
+  /** `XDF_*` whitespace bits: lines equal under them share a class */
+  whitespace?: number;
 }
 
 const XDL_KPDIS_RUN = 4;
@@ -114,6 +259,7 @@ function classify(
   l2: ByteLines,
   from2: number,
   n2: number,
+  ws = 0,
 ): { ha1: Int32Array; ha2: Int32Array; len1: number[]; len2: number[] } {
   const ha1 = new Int32Array(n1);
   const ha2 = new Int32Array(n2);
@@ -126,10 +272,24 @@ function classify(
   const pass = (lines: ByteLines, from: number, n: number, ha: Int32Array, first: boolean) => {
     for (let i = 0; i < n; i++) {
       const li = from + i;
-      const h = lines.hash(li);
+      const h = ws
+        ? xdlHashRecord(lines.content, lines.start(li), lines.start(li + 1), ws)
+        : lines.hash(li);
       const head = heads.get(h);
       let c = head ?? -1;
-      while (c >= 0 && !repLines[c].lineEquals(repIdx[c], lines, li)) c = next[c];
+      if (ws) {
+        const bytes = lines.content;
+        const b0 = lines.start(li);
+        const b1 = lines.start(li + 1);
+        while (c >= 0) {
+          const r = repLines[c];
+          const ri = repIdx[c];
+          if (xdlRecmatch(r.content, r.start(ri), r.start(ri + 1), bytes, b0, b1, ws)) break;
+          c = next[c];
+        }
+      } else {
+        while (c >= 0 && !repLines[c].lineEquals(repIdx[c], lines, li)) c = next[c];
+      }
       if (c < 0) {
         c = repLines.length;
         repLines.push(lines);
@@ -258,12 +418,12 @@ export function prepareEnv(
   n2: number,
   flags: XdFlags,
 ): XdEnv {
-  const { ha1, ha2, len1, len2 } = classify(l1, from1, n1, l2, from2, n2);
+  const { ha1, ha2, len1, len2 } = classify(l1, from1, n1, l2, from2, n2, flags.whitespace ?? 0);
   const xdf1 = newFile(l1, from1, n1, ha1);
   const xdf2 = newFile(l2, from2, n2, ha2);
   if (flags.algorithm !== "patience" && flags.algorithm !== "histogram") {
     trimEnds(xdf1, xdf2);
-    cleanupRecords(xdf1, xdf2, len1, len2, flags.algorithm === "minimal");
+    cleanupRecords(xdf1, xdf2, len1, len2, flags.algorithm === "minimal" && !flags.legacyMinimal);
   }
   return { xdf1, xdf2 };
 }
@@ -505,6 +665,7 @@ export function fallBackDiff(
   const sub = doDiff(a.lines, a.from + line1 - 1, count1, b.lines, b.from + line2 - 1, count2, {
     algorithm: "myers",
     indentHeuristic: flags.indentHeuristic,
+    whitespace: flags.whitespace,
   });
   a.changed.set(sub.xdf1.changed.subarray(1, 1 + count1), line1);
   b.changed.set(sub.xdf2.changed.subarray(1, 1 + count2), line2);
@@ -753,6 +914,7 @@ export function changeCompact(xdf: XdFile, xdfo: XdFile, flags: XdFlags): void {
         fallBackDiff(xdf, g.start + 1, g.end - g.start, xdfo, go.start + 1, go.end - go.start, {
           algorithm: "myers",
           indentHeuristic: flags.indentHeuristic,
+          whitespace: flags.whitespace,
         });
       }
     }
@@ -804,5 +966,7 @@ export function xdiff(a: ByteLines, b: ByteLines, options: XdiffOptions = {}): X
     algorithm: options.algorithm ?? "myers",
     indentHeuristic: options.indentHeuristic ?? false,
     histogramRediff: options.histogramRediff ?? true,
+    legacyMinimal: options.legacyMinimal ?? false,
+    whitespace: whitespaceFlags(options),
   });
 }

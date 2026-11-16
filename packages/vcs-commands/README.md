@@ -155,6 +155,25 @@ await git.cherryPick().include(commitId).call();
 await git.revert().include(commitId).setNoCommit(true).call();
 ```
 
+### Diff and blame output as git prints it
+
+```typescript
+// git diff (the index against the worktree), git diff --cached --stat, git diff A B -w -U1
+const patch = await git.diff().callText();
+const stat = await git.diff().setCached(true).callText("stat");
+const ws = await git.diff().setOldTree(a).setNewTree(b)
+  .setOptions({ ignoreWhitespace: true, context: 1 }).callText();
+
+// git blame --porcelain, and the default output
+const blame = await git.blame().setFilePath("src/main.ts").call();
+process.stdout.write(formatBlamePorcelain(blame));
+process.stdout.write(formatBlame(blame));
+```
+
+`callText()` prints the patch, `--stat`, `--numstat`, `--shortstat`, `--name-only` or `--name-status` byte for byte as `git diff` does: `diff --git` headers with mode, rename and `index` lines, quoted paths, "Binary files ... differ", hunks from git's xdiff with function lines (default and `diff=<driver>` builtin patterns), renames (`diff.renames`), and the configuration `git diff` reads (`diff.algorithm`, `diff.indentHeuristic`, `diff.context`, `core.quotePath`, ...). Without trees it compares the index with the worktree (`git diff`); with only an old tree, that tree with the worktree. `formatNoIndexDiff` prints `git diff --no-index` for two files. `call()` still returns the changed paths, with renames only on `setRenames(true)`.
+
+`blame()` runs git's blame algorithm: commits newest first, lines passed to the parents through the same xdiff diff, whole-file renames followed (`setFollowRenames(false)` is `--no-follow`), root commits as boundaries unless `setShowRoot(true)`, `-w` and `-L` ranges. `-M`/`-C`, `--reverse` and ignored revisions are not supported.
+
 ### Big and binary files in diff, merge and blame
 
 ```typescript
