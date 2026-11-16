@@ -1,4 +1,11 @@
-import { isSymbolicRef, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import {
+  type Commit,
+  EMPTY_TREE_ID,
+  isSymbolicRef,
+  type ObjectId,
+  type PersonIdent,
+  type TreeEntry,
+} from "@statewalker/vcs-core";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
@@ -30,7 +37,7 @@ import {
   switchTrees,
 } from "./merge-support.js";
 import { ortMerge, ortResultEntries } from "./ort-merge.js";
-import { patchId } from "./patch-id.js";
+import { type PatchIdTrees, patchId } from "./patch-id.js";
 import { expandCommitId, expandCommitIds } from "./sequencer-pick.js";
 import {
   applyAutostash,
@@ -117,6 +124,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private committer?: PersonIdent;
   private autoStash?: boolean;
   private reapplyCherryPicks = false;
+  /** The commits read by the walks that make the todo list */
+  private loadedCommits = new Map<ObjectId, Commit>();
   /** The flat trees the picks read (each pick's result is the next one's HEAD) */
   private flatTrees?: FlatTreeCache;
   /** Commit subjects, for the todo and done lines */
@@ -590,8 +599,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         ].join("\n"),
       };
     }
-    if (treeId === headTreeId) {
-      // a pick that changes nothing is dropped (git's drop_redundant_commits)
+    const parentTreeId = parentId ? await this.commits.getTree(parentId) : EMPTY_TREE_ID;
+    if (treeId === headTreeId && commit.tree !== parentTreeId) {
+      // a pick that became empty is dropped (git's drop_redundant_commits), and with it the
+      // pick's state; a commit that was empty from the start is kept (allow_empty)
+      await state.removeRef("AUTO_MERGE");
+      output.push(`dropping ${item.id} ${subject} -- patch contents already upstream`);
       return undefined;
     }
     let message = commit.message;
@@ -830,15 +843,19 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    */
   private async commitsToRebase(head: ObjectId, upstream: ObjectId): Promise<ObjectId[]> {
     const upstreamCommits = new Set<ObjectId>();
-    for await (const commitId of this.commits.walkAncestry([upstream])) {
-      upstreamCommits.add(commitId);
+    const walk = [upstream];
+    while (walk.length > 0) {
+      const id = walk.pop() as ObjectId;
+      if (upstreamCommits.has(id)) continue;
+      upstreamCommits.add(id);
+      walk.push(...((await this.loadCommit(id))?.parents ?? []));
     }
     const parents = new Map<ObjectId, ObjectId[]>();
     const stack = [head];
     while (stack.length > 0) {
       const id = stack.pop() as ObjectId;
       if (parents.has(id) || upstreamCommits.has(id)) continue;
-      const commit = await this.commits.load(id);
+      const commit = await this.loadCommit(id);
       if (!commit) continue;
       parents.set(id, commit.parents);
       stack.push(...commit.parents);
@@ -873,7 +890,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   /**
    * The commits of `range` (HEAD's side of `upstream...head`) whose patch-id one of
    * upstream's side has: git's `--cherry-mark` of the todo list (merges and commits that
-   * change nothing never match).
+   * change nothing never match). As git's cherry_pick_list and patch-ids.c: upstream's side
+   * ends at the merge bases (not HEAD's whole history), every commit gets the cheap id of
+   * its diff's headers, and the full patch-id is computed only where those collide.
    */
   private async appliedUpstream(
     head: ObjectId,
@@ -881,40 +900,133 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     range: ObjectId[],
   ): Promise<Set<ObjectId>> {
     const skipped = new Set<ObjectId>();
-    const headSide = new Set<ObjectId>();
-    for await (const id of this.commits.walkAncestry([head])) headSide.add(id);
-    // upstream's side: reachable from upstream, not from HEAD
-    const left: ObjectId[] = [];
-    const seen = new Set<ObjectId>();
-    const stack = [upstream];
-    while (stack.length > 0) {
-      const id = stack.pop() as ObjectId;
-      if (seen.has(id) || headSide.has(id)) continue;
-      seen.add(id);
-      const commit = await this.commits.load(id);
-      if (!commit) continue;
-      left.push(id);
-      stack.push(...commit.parents);
-    }
-    if (left.length === 0) return skipped;
-    const idOf = async (id: ObjectId) => {
-      const commit = await this.commits.load(id);
+    const left = await this.onlyReachableFrom(upstream, head);
+    if (left.length === 0 || range.length === 0) return skipped;
+    // each tree read once: a commit's tree is its child's parent tree
+    const treeEntries = new Map<ObjectId, TreeEntry[]>();
+    const trees: PatchIdTrees = {
+      loadTree: async function* (this: void, id: ObjectId) {
+        let entries = treeEntries.get(id);
+        if (!entries) {
+          entries = [];
+          for await (const e of loadTree(id)) entries.push(e);
+          treeEntries.set(id, entries);
+        }
+        yield* entries;
+      },
+    };
+    const loadTree = (id: ObjectId) => this.trees.loadTree(id);
+    const patchIdOf = async (id: ObjectId, headerOnly: boolean) => {
+      const commit = await this.loadCommit(id);
       if (!commit || commit.parents.length > 1) return undefined;
       const parentTree = commit.parents[0]
-        ? await this.commits.getTree(commit.parents[0])
+        ? (await this.loadCommit(commit.parents[0]))?.tree
         : undefined;
-      return patchId(this.trees, this.blobs, parentTree, commit.tree);
+      return patchId(trees, this.blobs, parentTree, commit.tree, { headerOnly });
     };
-    const upstreamIds = new Set<string>();
-    for (const id of left) {
-      const p = await idOf(id);
-      if (p) upstreamIds.add(p);
-    }
+    const full = new Map<ObjectId, string | undefined>();
+    const fullOf = async (id: ObjectId) => {
+      if (!full.has(id)) full.set(id, await patchIdOf(id, false));
+      return full.get(id);
+    };
+    // HEAD's side by header id
+    const byHeader = new Map<string, ObjectId[]>();
     for (const id of range) {
-      const p = await idOf(id);
-      if (p && upstreamIds.has(p)) skipped.add(id);
+      const header = await patchIdOf(id, true);
+      if (!header) continue;
+      const list = byHeader.get(header) ?? [];
+      list.push(id);
+      byHeader.set(header, list);
+    }
+    if (byHeader.size === 0) return skipped;
+    for (const id of left) {
+      const header = await patchIdOf(id, true);
+      const candidates = header ? byHeader.get(header) : undefined;
+      if (!candidates) continue;
+      const mine = await fullOf(id);
+      if (!mine) continue;
+      for (const c of candidates) {
+        if (!skipped.has(c) && (await fullOf(c)) === mine) skipped.add(c);
+      }
     }
     return skipped;
+  }
+
+  /**
+   * The commits reachable from `tip` and not from `other` (`other..tip`), merges left out,
+   * without walking `other`'s whole history: revision.c's limit_list, newest commit first,
+   * what `other` reaches painted uninteresting, done once every commit still queued is
+   * uninteresting (and a few more, git's slop against clock skew).
+   */
+  private async onlyReachableFrom(tip: ObjectId, other: ObjectId): Promise<ObjectId[]> {
+    interface Node {
+      id: ObjectId;
+      time: number;
+      parents?: ObjectId[];
+      uninteresting: boolean;
+      queued: boolean;
+    }
+    const nodes = new Map<ObjectId, Node>();
+    const queue: Node[] = [];
+    /** The interesting commits still queued */
+    let interesting = 0;
+    const push = async (id: ObjectId, uninteresting: boolean) => {
+      const known = nodes.get(id);
+      if (known) {
+        if (uninteresting) markUninteresting(known);
+        return;
+      }
+      const commit = await this.loadCommit(id);
+      if (!commit) return;
+      const node: Node = { id, time: commit.committer.timestamp, uninteresting, queued: true };
+      nodes.set(id, node);
+      if (!uninteresting) interesting++;
+      // newest first, ties in the order queued (commit_list_insert_by_date)
+      let k = queue.length;
+      while (k > 0 && queue[k - 1].time < node.time) k--;
+      queue.splice(k, 0, node);
+    };
+    // mark_parents_uninteresting: through the commits already walked
+    const markUninteresting = (start: Node) => {
+      const stack = [start];
+      while (stack.length > 0) {
+        const n = stack.pop() as Node;
+        if (n.uninteresting && n !== start) continue;
+        if (!n.uninteresting && n.queued) interesting--;
+        n.uninteresting = true;
+        for (const p of n.parents ?? []) {
+          const pn = nodes.get(p);
+          if (pn && !pn.uninteresting) stack.push(pn);
+        }
+      }
+    };
+    await push(other, true);
+    await push(tip, false);
+    const out: Node[] = [];
+    let slop = 5;
+    while (queue.length > 0) {
+      const node = queue.shift() as Node;
+      node.queued = false;
+      if (!node.uninteresting) interesting--;
+      node.parents = (await this.loadCommit(node.id))?.parents ?? [];
+      if (node.uninteresting) markUninteresting(node);
+      else out.push(node);
+      for (const p of node.parents) await push(p, node.uninteresting);
+      if (interesting === 0) {
+        if (--slop <= 0) break;
+      } else slop = 5;
+    }
+    return out.filter((n) => !n.uninteresting && (n.parents?.length ?? 0) <= 1).map((n) => n.id);
+  }
+
+  /** A commit, read once for the walks that pick the todo list. */
+  private async loadCommit(id: ObjectId): Promise<Commit | undefined> {
+    let commit = this.loadedCommits.get(id);
+    if (!commit) {
+      commit = await this.commits.load(id);
+      if (commit) this.loadedCommits.set(id, commit);
+    }
+    return commit;
   }
 
   private async isAncestor(a: ObjectId, b: ObjectId): Promise<boolean> {

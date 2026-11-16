@@ -2,10 +2,13 @@ import type { ObjectId, Ref } from "@statewalker/vcs-core";
 import { isSymbolicRef } from "@statewalker/vcs-core";
 import type { ResolveUndoRecord } from "@statewalker/vcs-working-tree";
 
+import { ResetRefusedError } from "../errors/command-errors.js";
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { OperationState } from "./merge-support.js";
+import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
 
 /** Names this operation in restore failure messages. */
@@ -70,6 +73,15 @@ export class ResetCommand extends GitCommand<Ref> {
    * - HARD: Move HEAD, reset staging, and reset working tree. DESTRUCTIVE -
    *   uncommitted changes to tracked files are discarded and tracked files
    *   absent from the target commit are deleted from the working tree.
+   * - MERGE: as git's `reset --merge`: index entries that differ from the target take
+   *   its version, worktree files with them; refused (ResetRefusedError) where a file
+   *   with unstaged changes or an untracked file would be lost. Unmerged entries are reset.
+   * - KEEP: as git's `reset --keep`: files that differ between HEAD and the target are
+   *   switched, local changes elsewhere kept; refused where a switched file has local
+   *   changes, and in the middle of a merge.
+   *
+   * Every mode records the old HEAD in ORIG_HEAD and, as git's reset, forgets a merge,
+   * cherry-pick or revert in progress (MERGE_HEAD, CHERRY_PICK_HEAD, ...).
    *
    * @param mode Reset mode
    */
@@ -118,7 +130,38 @@ export class ResetCommand extends GitCommand<Ref> {
     const trackedBefore =
       this.mode === ResetMode.HARD ? await this.collectTrackedPaths() : undefined;
 
-    // Move HEAD/branch
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    // git refuses a soft or keep reset in the middle of a merge (die_if_unmerged_cache)
+    if (this.mode === ResetMode.SOFT || this.mode === ResetMode.KEEP) {
+      let unmerged = false;
+      for await (const entry of this.staging.entries()) if (entry.stage > 0) unmerged = true;
+      if (unmerged || (await state.exists("MERGE_HEAD"))) {
+        throw new ResetRefusedError(
+          `fatal: Cannot do a ${this.mode} reset in the middle of a merge.`,
+        );
+      }
+    }
+    // --merge and --keep: the index and worktree first, refused before anything changes
+    if (this.mode === ResetMode.MERGE || this.mode === ResetMode.KEEP) {
+      const ctx = {
+        workingCopy: this.workingCopy,
+        worktree: this.worktreeAccess,
+        staging: this.staging,
+        blobs: this.blobs,
+        trees: this.trees,
+        commits: this.commits,
+        refs: this.refsStore,
+      };
+      const refused =
+        this.mode === ResetMode.MERGE
+          ? await resetMerge(ctx, targetId, targetRef)
+          : await resetKeep(ctx, headId ?? targetId, targetId, targetRef);
+      if (refused) throw new ResetRefusedError(refused.message, refused.paths);
+    }
+
+    // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's reset_refs)
+    if (headId && state.supported) await state.setRef("ORIG_HEAD", headId);
     await this.moveHead(targetId);
 
     // Reset staging area (for MIXED and HARD)
@@ -130,6 +173,9 @@ export class ResetCommand extends GitCommand<Ref> {
     if (this.mode === ResetMode.HARD) {
       await this.resetWorkingTree(targetId, trackedBefore ?? new Set());
     }
+
+    // git's remove_branch_state: a merge, cherry-pick or revert in progress is forgotten
+    await removeBranchState({ commits: this.commits, refs: this.refsStore }, state);
 
     // Return the updated HEAD ref
     const headRef = await this.refsStore.resolve("HEAD");

@@ -285,8 +285,11 @@ function randomCrissCross(seed: number): Graph {
         files[p] = text(lines);
       } else if (op === 6) files[p] = null;
       else if (op === 7) files[p] = new Uint8Array([0, rng.int(4)]);
-      else if (op === 8) files[`${p}.moved`] = text({ 1: tag });
-      else files[p] = { exec: text({ 3: tag }) };
+      else if (op === 8) {
+        // a rename (the source goes), to a name the other branches may pick as well
+        files[p] = null;
+        files[rng.chance(0.5) ? `${p}.moved` : `${p}.${tag}`] = text({ 1: tag });
+      } else files[p] = { exec: text({ 3: tag }) };
     }
     return files;
   };

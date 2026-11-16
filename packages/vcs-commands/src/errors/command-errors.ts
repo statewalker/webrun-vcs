@@ -42,6 +42,20 @@ export class IncompatibleOptionsError extends GitApiError {
 }
 
 /**
+ * Thrown when git would refuse a reset (`--merge`, `--keep`, a soft or keep reset in the
+ * middle of a merge) before anything is changed: git's message, and the paths it names.
+ */
+export class ResetRefusedError extends GitApiError {
+  readonly paths: string[];
+
+  constructor(message: string, paths: string[] = []) {
+    super(message);
+    this.name = "ResetRefusedError";
+    this.paths = paths;
+  }
+}
+
+/**
  * Thrown when a feature is not yet implemented.
  */
 export class NotImplementedError extends GitApiError {

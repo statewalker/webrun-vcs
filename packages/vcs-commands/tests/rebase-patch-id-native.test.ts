@@ -17,7 +17,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { patchId } from "../src/commands/patch-id.js";
 import { git, INTEROP_IDENT, normalizeState, openOurs, snapshot } from "./merge-native-helpers.js";
-import { buildHistory, type History, text } from "./merge-native-scenarios.js";
+import {
+  buildGraph,
+  buildHistory,
+  type Graph,
+  type History,
+  text,
+} from "./merge-native-scenarios.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -154,5 +160,81 @@ describeGit("rebase drops commits already upstream, as native git", () => {
     const parentTree = run(["rev-parse", "side~1^{tree}"]).toString().trim();
     const tree = run(["rev-parse", "side^{tree}"]).toString().trim();
     expect(await patchId(trees, history.blobs, parentTree, tree)).toBe(native);
+  });
+
+  it("upstream's side ends at the merge base; headers alike, contents not, still picked", async () => {
+    // side: R reverts the change A made before the fork, C makes it again (A is no
+    // upstream commit: C is picked), D is made upstream too (skipped), E has the header
+    // of an upstream commit with another content (picked); upstream merges a branch too
+    const graph: Graph = {
+      base: { f: text(), g: text(), k: "k\n" },
+      steps: [
+        { branch: "main", files: { f: text({ 2: "S" }) }, message: "A" },
+        { branch: "side", from: "main", files: { f: text() }, message: "R" },
+        { branch: "side", files: { f: text({ 2: "S" }) }, message: "C" },
+        { branch: "side", files: { h: "h\n" }, message: "D" },
+        { branch: "side", files: { k: "side\n" }, message: "E" },
+        { branch: "other", from: "main", files: { o: "o\n" }, message: "other" },
+        ...Array.from({ length: 12 }, (_, i) => ({
+          branch: "main",
+          files: { g: text({ 1: `main ${i}` }) },
+          message: `main ${i}`,
+        })),
+        { branch: "main", files: { h: "h\n" }, message: "D upstream" },
+        { branch: "main", files: { k: "main\n" }, message: "E's header upstream" },
+        { branch: "main", merge: "other", files: { o: "o\n" }, message: "merge other" },
+      ],
+      checkout: "side",
+    };
+    const n = counter++;
+    const native = join(root, `native-${n}`);
+    const ours = join(root, `ours-${n}`);
+    for (const dir of [native, ours]) buildGraph(root, dir, graph);
+    const expected = git(root, native, "rebase", "main");
+    const command = (await openOurs(ours)).rebase().setCommitter(INTEROP_IDENT);
+    await command.setUpstreamBranch("main");
+    const result = await command.call();
+    expect(snapshot(root, ours, normalizeState)).toEqual(snapshot(root, native, normalizeState));
+    const warnings = (s: string[]) => s.filter((l) => l.startsWith("warning: skipped"));
+    expect(warnings(result.output ?? [])).toEqual(warnings(expected.stderr.split("\n")));
+    expect(warnings(result.output ?? [])).toHaveLength(1);
+    rmSync(native, { recursive: true, force: true });
+    rmSync(ours, { recursive: true, force: true });
+  });
+
+  it("a pick that becomes empty is dropped (with its AUTO_MERGE), one empty from the start kept", async () => {
+    const change = { f: text({ 2: "S" }) };
+    const cases: { history: History; detach?: boolean }[] = [
+      // upstream has the change and more: the pick becomes empty (no patch-id match)
+      { history: { base: { f: text() }, side: change, main: { ...change, n: "n\n" } } },
+      {
+        history: { base: { f: text() }, side: change, main: { ...change, n: "n\n" } },
+        detach: true,
+      },
+      // a commit that changes nothing is picked as it is
+      { history: { base: { f: text() }, side: {}, sideMore: [{ g: "g\n" }], main: { n: "n\n" } } },
+    ];
+    for (const { history, detach } of cases) {
+      const n = counter++;
+      const native = join(root, `native-${n}`);
+      const ours = join(root, `ours-${n}`);
+      for (const dir of [native, ours]) {
+        buildHistory(root, dir, history);
+        git(root, dir, "checkout", "-q", ...(detach ? ["--detach"] : []), "side");
+      }
+      const expected = git(root, native, "rebase", "main");
+      const command = (await openOurs(ours)).rebase().setCommitter(INTEROP_IDENT);
+      await command.setUpstreamBranch("main");
+      const result = await command.call();
+      expect(snapshot(root, ours, normalizeState)).toEqual(snapshot(root, native, normalizeState));
+      const dropping = (lines: string[]) => lines.filter((l) => l.includes("-- patch contents"));
+      expect(dropping(result.output ?? [])).toEqual(
+        dropping(
+          expected.stderr.split(/[\r\n]/).map((l) => l.replace(/^Rebasing \(\d+\/\d+\)/, "")),
+        ),
+      );
+      rmSync(native, { recursive: true, force: true });
+      rmSync(ours, { recursive: true, force: true });
+    }
   });
 });

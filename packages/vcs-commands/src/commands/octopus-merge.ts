@@ -39,6 +39,13 @@ export interface OctopusOutcome {
   worktree: Map<string, CheckedEntry>;
   /** The conflicts left, staged 1-3 */
   conflicts: OrtConflict[];
+  /**
+   * Per head merged (not already up to date): how much of `output` the script had printed
+   * once it went for that head, and the paths that head changed in the index or worktree.
+   * The script writes the worktree head by head, so a local change in the way stops it at
+   * the first head that touches it.
+   */
+  steps: { output: number; paths: Set<string> }[];
 }
 
 /** What the octopus needs. */
@@ -108,8 +115,21 @@ export async function octopusMerge(
     index: new Map(),
     worktree: new Map(),
     conflicts: [],
+    steps,
     ...extra,
   });
+  const steps: OctopusOutcome["steps"] = [];
+  const changed = (
+    before: Map<string, CheckedEntry>,
+    after: Map<string, CheckedEntry>,
+    extra: Map<string, CheckedEntry> = new Map(),
+  ) => {
+    const paths = new Set<string>();
+    for (const p of new Set([...before.keys(), ...after.keys(), ...extra.keys()])) {
+      if (!same(before.get(p), extra.get(p) ?? after.get(p))) paths.add(p);
+    }
+    return paths;
+  };
   if (indexDiffers.length > 0) {
     output.push(
       "Error: Your local changes to the following files would be overwritten by merge",
@@ -144,6 +164,11 @@ export async function octopusMerge(
         mrc.map((id) => graph.commit(id)),
       )
     ).map((n) => n.id as ObjectId);
+    if (common.length === 0) {
+      // the script's `die` (exit 1): what is merged so far stays, as a merge with conflicts
+      errors.push(`Unable to find common commit with ${head.name}`);
+      return outcome(1, { index, worktree, conflicts });
+    }
     if (common.includes(head.id)) {
       output.push(`Already up to date with ${head.name}`);
       continue;
@@ -151,12 +176,16 @@ export async function octopusMerge(
     if (!nonFf && common.length === 1 && mrc.length === 1 && common[0] === mrc[0]) {
       // the first head is a fast-forward: its tree is the running result
       output.push(`Fast-forwarding to: ${head.name}`);
-      index = await treeOf(head.id);
+      const ff = await treeOf(head.id);
+      steps.push({ output: output.length, paths: changed(index, ff) });
+      index = ff;
       mrc = [head.id];
       continue;
     }
     nonFf = true;
     output.push(`Trying simple merge with ${head.name}`);
+    const step = { output: output.length, paths: new Set<string>() };
+    steps.push(step);
     const bases = await Promise.all(common.map((id) => treeOf(id)));
     const remote = await treeOf(head.id);
     const paths = new Set<string>([...index.keys(), ...remote.keys()]);
@@ -192,6 +221,7 @@ export async function octopusMerge(
         failure = true;
       }
     }
+    step.paths = changed(index, next, worktree);
     index = next;
     mrc = [...mrc, head.id];
   }

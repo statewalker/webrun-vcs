@@ -51,6 +51,8 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { OperationState } from "./merge-support.js";
+import { removeBranchState } from "./sequencer-support.js";
 import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   findInTheWay,
@@ -558,6 +560,11 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       // This handles: commit IDs, tags, remote branches, etc.
       await this.refsStore.set("HEAD", targetId);
     }
+    // git's remove_branch_state: a merge, cherry-pick or revert stopped here is forgotten
+    await removeBranchState(
+      { commits: this.commits, refs: this.refsStore },
+      new OperationState(this.workingCopy.checkout, this.refsStore),
+    );
 
     // The index: forced, the target's tree; else the switched paths take the target's
     // entries (with the stat of the files just written), every other path keeps its own.

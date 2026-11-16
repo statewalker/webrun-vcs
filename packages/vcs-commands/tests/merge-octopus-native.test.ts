@@ -13,7 +13,13 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { FastForwardMode, MergeOperation, MergeStatus } from "../src/index.js";
+import {
+  FastForwardMode,
+  type MergeCommand,
+  MergeOperation,
+  MergeStatus,
+  MergeStrategy,
+} from "../src/index.js";
 import {
   git,
   gitOk,
@@ -47,6 +53,12 @@ interface Options {
   noCommit?: boolean;
   prepare?: (dir: string) => void;
   branch?: string;
+  /** Native git's further options (`--squash`, `-s ours`, ...) */
+  args?: string[];
+  /** The same options set on our command */
+  configure?: (command: MergeCommand) => void;
+  /** Ours throws an error with this text, native git dies with it */
+  throws?: string;
 }
 
 async function compareOctopus(graph: Graph, heads: string[], options: Options = {}) {
@@ -63,6 +75,7 @@ async function compareOctopus(graph: Graph, heads: string[], options: Options = 
     native,
     "merge",
     ...(options.noCommit ? ["--no-commit"] : []),
+    ...(options.args ?? []),
     ...heads,
   );
   const command = (await openOurs(ours))
@@ -71,6 +84,15 @@ async function compareOctopus(graph: Graph, heads: string[], options: Options = 
     .setCommitter(INTEROP_IDENT);
   for (const h of heads) command.include(h);
   if (options.noCommit) command.setCommit(false);
+  options.configure?.(command);
+  if (options.throws) {
+    await expect(command.call()).rejects.toThrow(options.throws);
+    expect(expected.stderr).toContain(options.throws);
+    expect(snapshot(root, ours, normalizeState)).toEqual(snapshot(root, native, normalizeState));
+    rmSync(native, { recursive: true, force: true });
+    rmSync(ours, { recursive: true, force: true });
+    return { result: undefined as never, expected };
+  }
   const result = await command.call();
   expect(evenOut(snapshot(root, ours, normalizeState))).toEqual(
     evenOut(snapshot(root, native, normalizeState)),
@@ -78,7 +100,11 @@ async function compareOctopus(graph: Graph, heads: string[], options: Options = 
   const lines = (text: string) => text.split("\n").filter((l) => OCTOPUS_LINE.test(l));
   expect((result.output ?? []).filter((l) => OCTOPUS_LINE.test(l))).toEqual(lines(expected.stdout));
   if (result.status === MergeStatus.FAILED) {
-    expect(result.message?.split("\n").pop()).toBe(expected.stderr.trim().split("\n").pop());
+    const errors = expected.stderr.trim().split("\n");
+    // the last line before the autostash is applied back
+    expect(result.message?.split("\n").pop()).toBe(
+      errors.filter((l) => !/autostash|git stash/i.test(l)).pop(),
+    );
   }
   rmSync(native, { recursive: true, force: true });
   rmSync(ours, { recursive: true, force: true });
@@ -242,5 +268,269 @@ describeGit("octopus merges against native git", () => {
     expect(git(root, dir, "merge", "--ff-only", "a", "b").stderr).toContain(
       "Not possible to fast-forward",
     );
+  });
+
+  // what git's merge sets up for any head count: squash, strategies, autostash, unrelated
+  // histories, --no-ff, a message given
+
+  const two = () =>
+    branches({ a: { f: text({ 1: "a" }) }, b: { g: text({ 2: "b" }) } }, { h: "m\n" });
+  const lastConflicts = () =>
+    branches(
+      { a: { g: text({ 1: "a" }) }, b: { f: text({ 3: "b" }) } },
+      { f: text({ 3: "main" }) },
+    );
+
+  it("--squash stages the octopus with SQUASH_MSG, HEAD left alone", async () => {
+    const { result } = await compareOctopus(two(), ["a", "b"], {
+      args: ["--squash"],
+      configure: (c) => c.setSquash(true),
+    });
+    expect(result.status).toBe(MergeStatus.MERGED_SQUASHED);
+  });
+
+  it("--squash with a conflict on the last head: SQUASH_MSG and the conflict list", async () => {
+    const { result } = await compareOctopus(lastConflicts(), ["a", "b"], {
+      args: ["--squash"],
+      configure: (c) => c.setSquash(true),
+    });
+    expect(result.status).toBe(MergeStatus.CONFLICTING);
+  });
+
+  it("--squash of heads HEAD already has: nothing to squash", async () => {
+    const graph: Graph = {
+      base: { f: text() },
+      steps: [
+        { branch: "a", files: { f: text({ 1: "a" }) } },
+        { branch: "b", from: "main", files: { g: "g\n" } },
+        { branch: "main", merge: "a" },
+        { branch: "main", merge: "b" },
+      ],
+    };
+    const { result, expected } = await compareOctopus(graph, ["a", "b"], {
+      args: ["--squash"],
+      configure: (c) => c.setSquash(true),
+    });
+    expect(result.output).toEqual([expected.stdout.trim()]);
+  });
+
+  it("--squash with --no-ff is refused", async () => {
+    await compareOctopus(two(), ["a", "b"], {
+      args: ["--squash", "--no-ff"],
+      configure: (c) => c.setSquash(true).setFastForwardMode(FastForwardMode.NO_FF),
+      throws: "options '--squash' and '--no-ff.' cannot be used together",
+    });
+  });
+
+  it("-s ours: HEAD's tree with every head as a parent", async () => {
+    const { result } = await compareOctopus(two(), ["a", "b"], {
+      args: ["-s", "ours"],
+      configure: (c) => c.setStrategy(MergeStrategy.OURS),
+    });
+    expect(result.status).toBe(MergeStatus.MERGED);
+    expect(result.output).toContain("Merge made by the 'ours' strategy.");
+  });
+
+  it("-s ours with heads that contain HEAD still keeps HEAD (no fast-forward)", async () => {
+    const graph = branches({ a: { f: text({ 1: "a" }) }, b: { g: text({ 2: "b" }) } });
+    await compareOctopus(graph, ["a", "b"], {
+      args: ["-s", "ours"],
+      configure: (c) => c.setStrategy(MergeStrategy.OURS),
+    });
+  });
+
+  it("-s ours --no-commit and -s ours --squash", async () => {
+    await compareOctopus(two(), ["a", "b"], {
+      noCommit: true,
+      args: ["-s", "ours"],
+      configure: (c) => c.setStrategy(MergeStrategy.OURS),
+    });
+    await compareOctopus(two(), ["a", "b"], {
+      args: ["-s", "ours", "--squash"],
+      configure: (c) => c.setStrategy(MergeStrategy.OURS).setSquash(true),
+    });
+  });
+
+  it("-s ours with staged changes: the strategy fails, nothing written", async () => {
+    const { result } = await compareOctopus(two(), ["a", "b"], {
+      args: ["-s", "ours"],
+      configure: (c) => c.setStrategy(MergeStrategy.OURS),
+      prepare: (dir) => {
+        put(dir, "h", "staged\n");
+        gitOk(root, dir, "add", "h");
+      },
+    });
+    expect(result.status).toBe(MergeStatus.FAILED);
+  });
+
+  it("-s resolve handles two heads only; theirs is no git strategy", async () => {
+    const { result } = await compareOctopus(two(), ["a", "b"], {
+      args: ["-s", "resolve"],
+      configure: (c) => c.setStrategy(MergeStrategy.RESOLVE),
+      prepare: (dir) => put(dir, "h", "dirty\n"),
+    });
+    expect(result.status).toBe(MergeStatus.FAILED);
+    const theirs = await compareOctopus(two(), ["a", "b"], {
+      args: ["-s", "theirs"],
+      configure: (c) => c.setStrategy(MergeStrategy.THEIRS),
+    });
+    expect(theirs.result.status).toBe(MergeStatus.FAILED);
+    expect(theirs.expected.stderr).toContain("Could not find merge strategy 'theirs'.");
+  });
+
+  it("--no-ff keeps HEAD a parent when the heads contain it", async () => {
+    const graph = branches({ a: { f: text({ 1: "a" }) }, b: { g: text({ 2: "b" }) } });
+    await compareOctopus(graph, ["a", "b"], {
+      args: ["--no-ff"],
+      configure: (c) => c.setFastForwardMode(FastForwardMode.NO_FF),
+    });
+    // without --no-ff HEAD drops out of the parents
+    await compareOctopus(graph, ["a", "b"]);
+  });
+
+  it("a message given, committed and with conflicts", async () => {
+    await compareOctopus(two(), ["a", "b"], {
+      args: ["-m", "octopus by hand"],
+      // a message given is the commit's as it is (git adds the newline)
+      configure: (c) => c.setMessage("octopus by hand\n"),
+    });
+    await compareOctopus(lastConflicts(), ["a", "b"], {
+      args: ["-m", "octopus by hand"],
+      // a message given is the commit's as it is (git adds the newline)
+      configure: (c) => c.setMessage("octopus by hand\n"),
+    });
+  });
+
+  it("--autostash: a dirty file the octopus changes is stashed and applied back", async () => {
+    for (const path of ["f", "h"]) {
+      const { result } = await compareOctopus(two(), ["a", "b"], {
+        args: ["--autostash"],
+        configure: (c) => c.setAutoStash(true),
+        prepare: (dir) => put(dir, path, text({ 9: "dirty" })),
+      });
+      expect(result.status).toBe(MergeStatus.MERGED);
+      expect(result.output).toContain("Applied autostash.");
+    }
+  });
+
+  it("merge.autoStash, and an autostash kept while the octopus stops", async () => {
+    await compareOctopus({ ...two(), config: { "merge.autoStash": "true" } }, ["a", "b"], {
+      prepare: (dir) => put(dir, "f", text({ 9: "dirty" })),
+    });
+    const { result } = await compareOctopus(lastConflicts(), ["a", "b"], {
+      args: ["--autostash"],
+      configure: (c) => c.setAutoStash(true),
+      prepare: (dir) => put(dir, "h", "dirty\n"),
+    });
+    expect(result.status).toBe(MergeStatus.CONFLICTING);
+    expect(result.output).toContain("When finished, apply stashed changes with `git stash pop`");
+    // a given-up octopus applies the autostash back
+    await compareOctopus(
+      branches({ a: { f: text({ 3: "a" }) }, b: { g: text({ 2: "b" }) } }, { f: text({ 3: "m" }) }),
+      ["a", "b"],
+      {
+        args: ["--autostash"],
+        configure: (c) => c.setAutoStash(true),
+        prepare: (dir) => put(dir, "h", "dirty\n"),
+      },
+    );
+  });
+
+  const unrelated = (dir: string) => {
+    gitOk(root, dir, "checkout", "-q", "--orphan", "orph");
+    gitOk(root, dir, "rm", "-rqf", ".");
+    put(dir, "o", "o\n");
+    gitOk(root, dir, "add", "o");
+    gitOk(root, dir, "commit", "-qm", "orphan");
+    gitOk(root, dir, "checkout", "-q", "main");
+  };
+
+  it("unrelated histories are refused, and with --allow-unrelated-histories the octopus stops", async () => {
+    await compareOctopus(two(), ["a", "orph"], {
+      prepare: unrelated,
+      throws: "refusing to merge unrelated histories",
+    });
+    for (const heads of [
+      ["a", "orph"],
+      ["orph", "a"],
+    ]) {
+      const { result } = await compareOctopus(two(), heads, {
+        prepare: unrelated,
+        args: ["--allow-unrelated-histories"],
+        configure: (c) => c.setAllowUnrelatedHistories(true),
+      });
+      expect(result.status).toBe(MergeStatus.CONFLICTING);
+    }
+  });
+
+  it("a two-head merge of unrelated histories: refused, or merged against the empty tree", async () => {
+    await compareOctopus(two(), ["orph"], {
+      prepare: unrelated,
+      throws: "refusing to merge unrelated histories",
+    });
+    const { result } = await compareOctopus(two(), ["orph"], {
+      prepare: unrelated,
+      args: ["--allow-unrelated-histories"],
+      configure: (c) => c.setAllowUnrelatedHistories(true),
+    });
+    expect(result.status).toBe(MergeStatus.MERGED);
+  });
+
+  // local changes and untracked files around an octopus
+
+  it("a dirty file the octopus does not touch is kept", async () => {
+    const { result } = await compareOctopus(two(), ["a", "b"], {
+      prepare: (dir) => put(dir, "h", "MY DIRTY WORK\n"),
+    });
+    expect(result.status).toBe(MergeStatus.MERGED);
+  });
+
+  it("a dirty file the octopus changes refuses it, nothing written", async () => {
+    for (const path of ["f", "g"]) {
+      const { result } = await compareOctopus(two(), ["a", "b"], {
+        prepare: (dir) => put(dir, path, "MY DIRTY WORK\n"),
+      });
+      expect(result.status).toBe(MergeStatus.FAILED);
+    }
+  });
+
+  it("an untracked file where a head adds one refuses it", async () => {
+    for (const graph of [
+      branches({ a: { f: text({ 1: "a" }) }, b: { n: "from b\n" } }, { h: "m\n" }),
+      branches({ a: { n: "from a\n" }, b: { g: text({ 2: "b" }) } }, { h: "m\n" }),
+    ]) {
+      const { result } = await compareOctopus(graph, ["a", "b"], {
+        prepare: (dir) => put(dir, "n", "MY UNTRACKED\n"),
+      });
+      expect(result.status).toBe(MergeStatus.FAILED);
+    }
+  });
+
+  it("conflicts and a give-up with a dirty file and an untracked one kept", async () => {
+    const dirty = (dir: string) => {
+      put(dir, "h", "MY DIRTY WORK\n");
+      put(dir, "u", "MY UNTRACKED\n");
+    };
+    const conflicted = await compareOctopus(lastConflicts(), ["a", "b"], { prepare: dirty });
+    expect(conflicted.result.status).toBe(MergeStatus.CONFLICTING);
+    const gaveUp = await compareOctopus(
+      branches({ a: { f: text({ 3: "a" }) }, b: { g: text({ 2: "b" }) } }, { f: text({ 3: "m" }) }),
+      ["a", "b"],
+      { prepare: dirty },
+    );
+    expect(gaveUp.result.status).toBe(MergeStatus.FAILED);
+  });
+
+  it("-s ours of one head never fast-forwards, not even with --ff-only", async () => {
+    const graph = branches({ a: { f: text({ 1: "a" }) } });
+    await compareOctopus(graph, ["a"], {
+      args: ["-s", "ours"],
+      configure: (c) => c.setStrategy(MergeStrategy.OURS),
+    });
+    await compareOctopus(graph, ["a"], {
+      args: ["-s", "ours", "--ff-only"],
+      configure: (c) =>
+        c.setStrategy(MergeStrategy.OURS).setFastForwardMode(FastForwardMode.FF_ONLY),
+    });
   });
 });

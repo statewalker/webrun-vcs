@@ -19,6 +19,7 @@ import {
   flatTree,
   type MergeRefusal,
   type MergeWriteContext,
+  type OperationState,
   planPathsRestore,
   rewriteIndex,
 } from "./merge-support.js";
@@ -166,8 +167,133 @@ export async function resetMerge(
       },
     ]);
   }
-  if (edits.size > 0) await rewriteIndex(ctx.staging, edits);
+  // unpack-trees writes a new index: no resolve-undo record survives the reset
+  ctx.staging.clearResolveUndo?.();
+  await rewriteIndex(ctx.staging, edits);
   return undefined;
+}
+
+/**
+ * git's `reset --keep <commit>` of the index and the worktree: unpack-trees' `twoway_merge`
+ * from HEAD to the commit with update, then the index reset to the commit (`reset_index`
+ * MIXED). Paths HEAD and the commit agree on keep their worktree file, local changes and
+ * all (a staged change stays as an unstaged one); a path they differ on takes the commit's
+ * version, refused before anything is written where that would lose work: an index entry
+ * that is neither HEAD's nor the commit's ("would be overwritten"), a file with unstaged
+ * changes (`verify_uptodate`), an untracked file in the way (`verify_absent`). HEAD is not
+ * moved. The caller refuses an index with unmerged entries first.
+ */
+export async function resetKeep(
+  ctx: SequencerContext,
+  headId: ObjectId,
+  targetId: ObjectId,
+  label: string,
+): Promise<MergeRefusal | undefined> {
+  const head = await flatTree(ctx.trees, await ctx.commits.getTree(headId));
+  const targetTree = await ctx.commits.getTree(targetId);
+  const target = await flatTree(ctx.trees, targetTree);
+  const index = new Map<string, CheckedEntry>();
+  for await (const entry of ctx.staging.entries()) {
+    if (entry.stage === 0) index.set(entry.path, entry);
+  }
+  const worktree = ctx.worktree;
+  const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const refuse = (message: string, path: string): MergeRefusal => ({
+    message: `error: ${message}\nfatal: Could not reset index file to revision '${label}'.`,
+    paths: [path],
+  });
+  const notUptodate = (path: string) => refuse(`Entry '${path}' not uptodate. Cannot merge.`, path);
+  const changes: string[] = [];
+  const removing = new Set<string>();
+  const paths = [...new Set([...index.keys(), ...head.keys(), ...target.keys()])].sort(
+    compareBytes,
+  );
+  for (const path of paths) {
+    const h = head.get(path);
+    const t = target.get(path);
+    const i = index.get(path);
+    // HEAD and the commit agree: index and worktree stay as they are
+    if (sameEntry(h, t)) continue;
+    if (!sameEntry(i, h)) {
+      // the index has the commit's version already, or a change the reset would lose
+      if (sameEntry(i, t)) continue;
+      return refuse(`Entry '${path}' would be overwritten by merge. Cannot merge.`, path);
+    }
+    if (worktree && i && (await worktreeDiffers(worktree, path, i, trust))) {
+      return notUptodate(path);
+    }
+    if (!t) {
+      removing.add(path);
+    } else if (worktree && !i) {
+      const refusal = await verifyAbsent(worktree, path, t, index, removing, {
+        hard: false,
+        tracked: (p) => index.has(p),
+        trust,
+        refuse,
+        notUptodate,
+      });
+      if (refusal) return refusal;
+    }
+    changes.push(path);
+  }
+
+  if (worktree) {
+    for (const path of removing) {
+      const entry = await worktree.getEntry(path);
+      if (entry && !entry.isDirectory) {
+        await worktree.remove(path);
+        await pruneEmptyParents(worktree, path);
+      }
+    }
+    const writing = new Set(changes.filter((p) => target.has(p)));
+    if (writing.size > 0) {
+      const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
+      await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
+        symlinks: trust?.symlinks ?? true,
+        gitlinks: true,
+        replaceInTheWay: true,
+      });
+    }
+  }
+  // the index is the commit's tree: an entry that holds it already keeps its stat, a file
+  // just written takes the stat it has now
+  const written = new Set(changes);
+  const edits = new Map<string, IndexEntryOptions[]>();
+  for (const path of index.keys()) if (!target.has(path)) edits.set(path, []);
+  for (const [path, t] of target) {
+    if (sameEntry(index.get(path), t) && !written.has(path)) continue;
+    const stats = worktree && written.has(path) ? await worktree.getEntry(path) : undefined;
+    edits.set(path, [
+      {
+        path,
+        objectId: t.objectId,
+        mode: t.mode,
+        ...entryStatOf(stats && !stats.isDirectory ? stats : {}),
+      },
+    ]);
+  }
+  ctx.staging.clearResolveUndo?.();
+  await rewriteIndex(ctx.staging, edits);
+  return undefined;
+}
+
+/**
+ * git's remove_branch_state (a branch switch, a reset): the merge, cherry-pick or revert
+ * stopped before its commit is forgotten (MERGE_HEAD, MERGE_MSG, MERGE_MODE, SQUASH_MSG,
+ * CHERRY_PICK_HEAD, REVERT_HEAD, AUTO_MERGE), its MERGE_AUTOSTASH kept on `refs/stash`.
+ */
+export async function removeBranchState(
+  ctx: Pick<SequencerContext, "commits" | "refs">,
+  state: OperationState,
+): Promise<void> {
+  if (!state.supported) return;
+  await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE", "MERGE_HEAD");
+  await state.remove("SQUASH_MSG", "MERGE_RR", "MERGE_MSG", "MERGE_MODE");
+  const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
+  if (autostash) {
+    await state.remove("MERGE_AUTOSTASH");
+    await saveAutostash(ctx, autostash);
+  }
 }
 
 /** Byte order of paths, as git sorts the index. */
@@ -328,12 +454,13 @@ export function formatGitDate(ident: PersonIdent): string {
 
 /**
  * git's `SQUASH_MSG`: `Squashed commit of the following:` and the commits `src` has that
- * `head` has not, newest first, as `git log` prints them.
+ * `head` has not, newest first, as `git log` prints them. Several heads (an octopus) list
+ * what any of them has.
  */
 export async function squashMessage(
   commits: CommandCommits,
   headId: ObjectId,
-  srcId: ObjectId,
+  srcId: ObjectId | ObjectId[],
 ): Promise<string> {
   const reachable = new Set<ObjectId>();
   const stack = [headId];
@@ -346,7 +473,7 @@ export async function squashMessage(
   }
   const listed: { id: ObjectId; time: number; order: number }[] = [];
   const seen = new Set<ObjectId>();
-  const queue = [srcId];
+  const queue = Array.isArray(srcId) ? [...srcId] : [srcId];
   while (queue.length > 0) {
     const id = queue.shift() as ObjectId;
     if (seen.has(id) || reachable.has(id)) continue;

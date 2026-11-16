@@ -15,6 +15,9 @@ import { readBlob } from "./ort-merge.js";
 const encoder = new TextEncoder();
 const S_IFMT = 0o170000;
 
+/** The trees a patch-id reads (a cache of them serves as well). */
+export type PatchIdTrees = Pick<CommandTrees, "loadTree">;
+
 interface Change {
   path: string;
   old?: { mode: number; id: ObjectId };
@@ -23,7 +26,7 @@ interface Change {
 
 /** The files two trees differ in (diff_tree_oid, recursive), in path order. */
 async function treeChanges(
-  trees: CommandTrees,
+  trees: PatchIdTrees,
   oldTree: ObjectId | undefined,
   newTree: ObjectId | undefined,
   prefix = "",
@@ -94,13 +97,16 @@ const isBinary = (bytes: Uint8Array) => bytes.subarray(0, 8000).includes(0);
 
 /**
  * The patch-id of the change from `parentTree` to `tree` (hex), or undefined when nothing
- * changes.
+ * changes. With `headerOnly` (git's `diff_header_only`), only the files' names and modes
+ * are hashed, no content read: equal patch-ids have equal header ids, so the cheap id sorts
+ * out candidates and the full one is computed only where they collide (patch-ids.c).
  */
 export async function patchId(
-  trees: CommandTrees,
+  trees: PatchIdTrees,
   blobs: Blobs,
   parentTree: ObjectId | undefined,
   tree: ObjectId,
+  options: { headerOnly?: boolean } = {},
 ): Promise<string | undefined> {
   const changes = await treeChanges(trees, parentTree, tree);
   if (changes.length === 0) return undefined;
@@ -126,9 +132,13 @@ export async function patchId(
       str(h, "newmode");
       mode(h, change.new.mode);
     }
-    const a = change.old ? await contentOf(blobs, change.old) : new Uint8Array(0);
-    const b = change.new ? await contentOf(blobs, change.new) : new Uint8Array(0);
-    if (isBinary(a) || isBinary(b)) {
+    const a =
+      change.old && !options.headerOnly ? await contentOf(blobs, change.old) : new Uint8Array(0);
+    const b =
+      change.new && !options.headerOnly ? await contentOf(blobs, change.new) : new Uint8Array(0);
+    if (options.headerOnly) {
+      // only the header
+    } else if (isBinary(a) || isBinary(b)) {
       str(h, change.old?.id ?? "0".repeat(40));
       str(h, change.new?.id ?? "0".repeat(40));
     } else {

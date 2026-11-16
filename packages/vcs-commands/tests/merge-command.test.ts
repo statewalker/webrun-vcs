@@ -1615,9 +1615,10 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
   });
 
   /**
-   * OURS strategy should still fast-forward when possible by default.
+   * OURS strategy never fast-forwards: as git's `-s ours` (NO_FAST_FORWARD), a merge commit
+   * with HEAD's tree even where a fast-forward is possible.
    */
-  it("should fast-forward with OURS strategy when possible", async () => {
+  it("makes a merge commit with OURS strategy where a fast-forward is possible", async () => {
     const { git, workingCopy, repository, initialCommitId } = await createInitializedGit();
 
     // Create branch1 at initial commit
@@ -1641,9 +1642,11 @@ describe.each(backends)("MergeCommand - Merge strategies ($name backend)", ({ fa
       .setStrategy(MergeStrategy.OURS)
       .call();
 
-    // Should still fast-forward since we're behind
-    expect(result.status).toBe(MergeStatus.FAST_FORWARD);
-    expect(result.newHead).toBe(mainHead?.objectId);
+    // a merge commit with HEAD's tree, main as its second parent
+    expect(result.status).toBe(MergeStatus.MERGED);
+    const merged = await repository.commits.load(result.newHead ?? "");
+    expect(merged?.parents).toEqual([initialCommitId, mainHead?.objectId]);
+    expect(merged?.tree).toBe(await loadCommitTree(repository, initialCommitId));
   });
 
   /**
