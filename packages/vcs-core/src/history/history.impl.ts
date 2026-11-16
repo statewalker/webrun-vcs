@@ -9,16 +9,64 @@ import type { SerializationApi } from "../serialization/serialization-api.js";
 import type { DeltaApi } from "../storage/delta/delta-api.js";
 import type { Blobs } from "./blobs/blobs.js";
 import type { Commits } from "./commits/commits.js";
+import { decodeCommitEntries, entriesToCommit } from "./commits/index.js";
 import type { History, HistoryWithOperations } from "./history.js";
 import type { GitObjects } from "./objects/git-objects.js";
 import type { Refs } from "./refs/refs.js";
+import { decodeTagEntries, entriesToTag } from "./tags/index.js";
 import type { Tags } from "./tags/tags.js";
+import { decodeTreeEntries, EMPTY_TREE_ID } from "./trees/index.js";
 import type { Trees } from "./trees/trees.js";
 
 /** The object kernel (and packs) under a history's typed stores, when it has one. */
 export interface HistoryKernel {
   objects?: GitObjects;
   packs?: PackSet;
+}
+
+/**
+ * The ids an object refers to (a commit's tree and parents, a tree's entries, a tag's target,
+ * none for a blob), from a single read of the object; undefined if it is absent.
+ *
+ * Mirrors what probing the typed stores gives: an unreadable object counts as absent (their
+ * `has()` is false), the empty tree exists even when not stored, and an unparsable commit
+ * has no children (`Commits.load` gives undefined), while tree and tag decoding errors are
+ * thrown as `Trees.load` iteration and `Tags.load` throw them.
+ */
+async function readChildIds(objects: GitObjects, oid: string): Promise<string[] | undefined> {
+  let obj: Awaited<ReturnType<GitObjects["get"]>>;
+  try {
+    obj = await objects.get(oid);
+  } catch {
+    obj = undefined;
+  }
+  if (!obj) return oid === EMPTY_TREE_ID ? [] : undefined;
+  const it = obj.content[Symbol.asyncIterator]();
+  const content: AsyncIterable<Uint8Array> = { [Symbol.asyncIterator]: () => it };
+  try {
+    switch (obj.type) {
+      case "commit": {
+        try {
+          const commit = await entriesToCommit(decodeCommitEntries(content));
+          return [commit.tree, ...commit.parents];
+        } catch {
+          return [];
+        }
+      }
+      case "tree": {
+        const ids: string[] = [];
+        for await (const entry of decodeTreeEntries(content)) ids.push(entry.id);
+        return ids;
+      }
+      case "tag":
+        return [(await entriesToTag(decodeTagEntries(content))).object];
+      default:
+        return [];
+    }
+  } finally {
+    // Releases a blob's unread stream, or one a decoder left unfinished.
+    await it.return?.();
+  }
 }
 
 /**
@@ -113,18 +161,30 @@ export class HistoryImpl implements History {
       }
     }
 
-    // BFS from wants
+    // BFS from wants; a head index instead of shift() keeps each dequeue O(1)
     const queue: string[] = [...wants];
+    const objects = this.objects;
 
-    while (queue.length > 0) {
-      const oid = queue.shift();
-      if (!oid) continue;
+    for (let head = 0; head < queue.length; head++) {
+      const oid = queue[head];
 
       if (visited.has(oid) || excludeExpanded.has(oid)) {
         continue;
       }
       visited.add(oid);
 
+      if (objects) {
+        // One read per object: the header gives the type, the same stream is decoded.
+        const children = await readChildIds(objects, oid);
+        if (children === undefined) continue; // absent
+        yield oid;
+        for (const child of children) {
+          if (!visited.has(child) && !excludeExpanded.has(child)) queue.push(child);
+        }
+        continue;
+      }
+
+      // Without an object kernel, probe the typed stores in turn.
       // Check if object exists
       const exists = await this.hasObject(oid);
       if (!exists) continue;
