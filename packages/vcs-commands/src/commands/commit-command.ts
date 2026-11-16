@@ -5,6 +5,7 @@ import type { Worktree } from "@statewalker/vcs-working-tree";
 import {
   EmptyCommitError,
   IncompatibleOptionsError,
+  InvalidArgumentError,
   NoHeadError,
   NoMessageError,
   RefNotFoundError,
@@ -13,6 +14,8 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
+import { OperationState } from "./merge-support.js";
+import { applyAutostash, cleanupMessage } from "./sequencer-support.js";
 
 /**
  * Result of a commit operation.
@@ -283,15 +286,42 @@ export class CommitCommand extends GitCommand<CommitResult> {
       await this.stageTrackedChanges();
     }
 
-    // Check message
-    if (!this.message && !this.amend) {
-      throw new NoMessageError();
-    }
-
     // Check for conflicts
     if (await this.staging.hasConflicts()) {
       const conflictPaths = await this.staging.getConflictedPaths();
-      throw new UnmergedPathsError(conflictPaths);
+      throw new UnmergedPathsError(
+        conflictPaths,
+        [
+          "error: Committing is not possible because you have unmerged files.",
+          "hint: Fix them up in the work tree, and then use 'git add/rm <file>'",
+          "hint: as appropriate to mark resolution and make a commit.",
+          "fatal: Exiting because of an unresolved conflict.",
+        ].join("\n"),
+      );
+    }
+
+    // a merge, cherry-pick or revert in progress (git's whence: MERGE_HEAD,
+    // CHERRY_PICK_HEAD, REVERT_HEAD), and the message it prepared
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
+    const mergeHeads = await this.mergeHeads(state);
+    const pickHead = await state.ref("CHERRY_PICK_HEAD");
+    if (this.amend && mergeHeads.length > 0) {
+      throw new InvalidArgumentError(
+        "amend",
+        true,
+        "fatal: You are in the middle of a merge -- cannot amend.",
+      );
+    }
+    if (!this.message && !this.amend) {
+      const prepared = (await state.read("MERGE_MSG")) ?? (await state.read("SQUASH_MSG"));
+      // as git commit leaves it once the editor accepts it: comments stripped
+      const cleaned = prepared !== undefined ? cleanupMessage(prepared) : "";
+      if (cleaned) this.message = cleaned;
+    }
+
+    // Check message
+    if (!this.message && !this.amend) {
+      throw new NoMessageError();
     }
 
     // Get message (from amend or new)
@@ -330,6 +360,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
         author = previousCommit.author;
       }
     }
+    if (pickHead && !author) {
+      // a cherry-pick keeps the picked commit's author (git's author_message)
+      author = (await this.commits.load(pickHead))?.author;
+    }
 
     if (!author) {
       author = committer ?? defaultIdent;
@@ -359,6 +393,13 @@ export class CommitCommand extends GitCommand<CommitResult> {
         // Initial commit
         parents = [];
       }
+      if (mergeHeads.length > 0) {
+        // a merge commit: HEAD and MERGE_HEAD's commits; reduced to the independent ones
+        // unless MERGE_MODE says no-ff (git's reduce_heads_replace)
+        parents = [...parents, ...mergeHeads.filter((id) => !parents.includes(id))];
+        const mode = (await state.read("MERGE_MODE")) ?? "";
+        if (!/\bno-ff\b/.test(mode)) parents = await this.reduceHeads(parents);
+      }
     }
 
     // Generate tree from staging area
@@ -372,8 +413,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       treeId = await this.staging.writeTree(this.trees);
     }
 
-    // Check for empty commit
-    if (!this.allowEmpty && parents.length > 0) {
+    // Check for empty commit (a merge may record HEAD's tree)
+    if (!this.allowEmpty && parents.length > 0 && mergeHeads.length === 0) {
       const parentCommit = await this.commits.load(parents[0]);
       if (parentCommit && parentCommit.tree === treeId) {
         throw new EmptyCommitError();
@@ -403,8 +444,78 @@ export class CommitCommand extends GitCommand<CommitResult> {
 
     this.setCallable(false);
 
+    // the commit ends what was in progress (git's sequencer_post_commit_cleanup and the
+    // state files cmd_commit unlinks), then applies a merge's autostash
+    await this.cleanupAfterCommit(state);
+
     // Return commit with its ID (like JGit's RevCommit)
     return { ...commit, id: commitId };
+  }
+
+  /** The commits MERGE_HEAD names (one per line), none without a merge in progress. */
+  private async mergeHeads(state: OperationState): Promise<ObjectId[]> {
+    const text = await state.read("MERGE_HEAD");
+    if (text !== undefined) {
+      return text
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => /^[0-9a-f]{40,64}$/.test(l));
+    }
+    const id = await state.ref("MERGE_HEAD");
+    return id ? [id] : [];
+  }
+
+  /** The heads none of the others reaches (git's reduce_heads), in their order. */
+  private async reduceHeads(heads: ObjectId[]): Promise<ObjectId[]> {
+    const out: ObjectId[] = [];
+    for (const head of heads) {
+      let reached = false;
+      for (const other of heads) {
+        if (other === head) continue;
+        if (await this.commits.isAncestor(head, other)) {
+          reached = true;
+          break;
+        }
+      }
+      if (!reached) out.push(head);
+    }
+    return out.length > 0 ? out : heads.slice(0, 1);
+  }
+
+  /**
+   * After the commit: the merge state removed (MERGE_HEAD, MERGE_MSG, MERGE_MODE,
+   * SQUASH_MSG, AUTO_MERGE), a stopped cherry-pick or revert ended (its sequencer state
+   * too once it was the last pick), and MERGE_AUTOSTASH applied back, as `git commit`.
+   */
+  private async cleanupAfterCommit(state: OperationState): Promise<void> {
+    if (!state.supported) return;
+    const picking =
+      (await state.ref("CHERRY_PICK_HEAD")) !== undefined ||
+      (await state.ref("REVERT_HEAD")) !== undefined;
+    await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE", "MERGE_HEAD");
+    await state.remove("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
+    if (picking) {
+      // have_finished_the_last_pick: the todo holds no more than the pick just committed
+      const todo = (await state.read("sequencer/todo")) ?? "";
+      const left = todo.split("\n").filter((l) => l.trim() && !l.trim().startsWith("#"));
+      if (left.length <= 1) await state.remove("sequencer");
+    }
+    const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
+    if (autostash) {
+      await state.remove("MERGE_AUTOSTASH");
+      await applyAutostash(
+        {
+          workingCopy: this.workingCopy,
+          worktree: this.worktreeIterator ?? this.worktreeAccess,
+          staging: this.staging,
+          blobs: this.blobs,
+          trees: this.trees,
+          commits: this.commits,
+          refs: this.refsStore,
+        },
+        autostash,
+      );
+    }
   }
 
   /**

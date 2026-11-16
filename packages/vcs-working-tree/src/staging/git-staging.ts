@@ -9,6 +9,7 @@
 
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, FileMode, type FilesApi } from "@statewalker/vcs-core";
+import type { ResolveUndoRecord } from "./index-extensions.js";
 import { IndexFile, readIndexChecksum } from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion } from "./index-format.js";
 import type {
@@ -296,6 +297,10 @@ export class GitStaging implements Staging {
 
   createBuilder(): IndexBuilder {
     return new GitStagingBuilder(this);
+  }
+
+  recordResolveUndo(records: readonly ResolveUndoRecord[]): void {
+    this.indexFile.recordResolveUndo(records);
   }
 
   createEditor(): IndexEditor {

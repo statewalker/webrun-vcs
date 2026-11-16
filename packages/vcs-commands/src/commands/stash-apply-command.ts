@@ -1,4 +1,5 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { mergeLines } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
@@ -18,7 +19,7 @@ import type { StashApplyResult } from "../results/stash-result.js";
 import { StashApplyStatus } from "../results/stash-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { conflictStyleOf } from "./merge-config.js";
-import { type OrtConflict, ortMerge, ortResultEntries } from "./ort-merge.js";
+import { type OrtConflict, ortMerge, ortResultEntries, readBlob } from "./ort-merge.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { planTreeRestore, type TreeRestorePlan, writeTreeRestorePlan } from "./tree-restore.js";
 import {
@@ -278,15 +279,23 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     if (this.restoreIndex) {
       const stashIndexCommitObj = await this.commits.load(stashIndexCommit);
       const stashIndex = stashIndexCommitObj ? await this.flatTree(stashIndexCommitObj.tree) : base;
-      const indexMerge = await this.mergeFlat(base, ours, stashIndex, ignoreCase);
-      if (indexMerge.conflicts.size > 0) {
-        throw new StashApplyFailedError(
-          stashId,
-          [...indexMerge.conflicts.keys()],
-          "error: conflicts in index. Try without --index.",
-        );
+      // git's has_index: the stash's index differs from its base and from the index
+      const differs = (a: Map<string, CheckedEntry>, b: Map<string, CheckedEntry>) =>
+        a.size !== b.size || [...a].some(([p, e]) => !sameEntry(e, b.get(p)));
+      if (differs(stashIndex, base) && differs(stashIndex, ours)) {
+        // the stash's index change applied to the index as `git apply --cached` applies it
+        const applied = await this.applyCached(base, ours, stashIndex);
+        if (applied.errors.length > 0) {
+          throw new StashApplyFailedError(
+            stashId,
+            applied.failed,
+            [...applied.errors, "error: conflicts in index. Try without --index."].join("\n"),
+          );
+        }
+        restoredIndex = applied.result;
+        // git's reset of the index to HEAD records ORIG_HEAD
+        await this.refsStore.set("ORIG_HEAD", headRef.objectId);
       }
-      restoredIndex = indexMerge.result;
     }
 
     const merge = await this.mergeFlat(base, ours, stashWorking, ignoreCase);
@@ -338,20 +347,24 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       index,
       ignoreCase,
     });
+    // the stashed untracked files (their paths validated before any write); restored
+    // after the merge, as git restores them (`checkout-index --all` of their own index)
+    const untrackedPlan = await this.planUntrackedRestore(stashUntrackedCommit, worktree);
     const refused = overwriteMessage("merge", { local, ...found });
     if (refused) {
+      // a refused merge still restores the untracked files (git's goto restore_untracked)
+      let restoreError = "";
+      try {
+        await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
+      } catch (error) {
+        restoreError = `\n${(error as Error).message}`;
+      }
       throw new StashApplyFailedError(
         stashId,
         [...local, ...found.lostDirs, ...found.untracked],
-        refused,
+        `${refused}${restoreError}`,
       );
     }
-    // the stashed untracked files, checked (leading components too) before any write
-    const untrackedPlan = await this.planUntrackedRestore(
-      stashUntrackedCommit,
-      worktreePlan,
-      worktree,
-    );
 
     // Everything below this line writes.
     // git writes the merge's result through unpack-trees: every file smudged with the
@@ -360,17 +373,6 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       direction: "checkout",
       index: attributesIndexOf([...merge.result].map(([p, e]) => [p, e.objectId] as const)),
     };
-    if (untrackedPlan) {
-      // git restores the untracked files first (`checkout-index` of their own index: the
-      // worktree's attributes, then that index's); they stay untracked
-      await writeTreeRestorePlan(worktree, this.blobs, untrackedPlan, STASH_APPLY, {
-        symlinks: trust.symlinks,
-        attributes: {
-          direction: "checkin",
-          index: attributesIndexOf(untrackedPlan.entries.map((e) => [e.path, e.objectId] as const)),
-        },
-      });
-    }
     // a file a file/directory conflict moves aside goes to `<path>~<side>` first
     for (const conflict of conflicts.values()) {
       if (!conflict.moveFrom) continue;
@@ -440,9 +442,12 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       }
     }
 
-    // merge-ort records the tree it wrote (AUTO_MERGE), clean or not
+    // merge-ort records the tree it wrote (AUTO_MERGE), clean or not; a stash whose
+    // worktree is its base is "Already up to date." (merge_ort_nonrecursive): no merge
     const autoMerge = await ortResultEntries(this.blobs, { ...merge, messages: [] });
-    await this.refsStore.set("AUTO_MERGE", await this.storeFlat(autoMerge));
+    if (stashCommit.tree !== stashHeadCommitObj.tree) {
+      await this.refsStore.set("AUTO_MERGE", await this.storeFlat(autoMerge));
+    }
 
     // the index
     const editor = this.staging.createEditor();
@@ -482,6 +487,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       }
       await editor.finish();
       await this.staging.write();
+      await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
       return {
         status: StashApplyStatus.CONFLICTS,
         stashCommit: stashId,
@@ -505,6 +511,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     }
     await editor.finish();
     await this.staging.write();
+    await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
 
     return {
       status: StashApplyStatus.OK,
@@ -536,7 +543,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
   /**
    * git's ort merge of a stash: `base` (the stash's parent) to `ours` (the current index)
    * and to `theirs` (the stash), with git's labels (`Updated upstream` / `Stashed changes`,
-   * `Version stash was based on` for diff3), shared with `merge` ({@link ortMerge}).
+   * `Stash base` for diff3), shared with `merge` ({@link ortMerge}).
    */
   private async mergeFlat(
     baseIn: Map<string, CheckedEntry>,
@@ -550,11 +557,91 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     const { result, conflicts } = await ortMerge(this.blobs, baseIn, oursIn, theirsIn, {
       oursLabel: "Updated upstream",
       theirsLabel: "Stashed changes",
-      baseLabel: "Version stash was based on",
+      baseLabel: "Stash base",
       style: conflictStyleOf(this.workingCopy),
       ignoreCase,
     });
     return { result, conflicts };
+  }
+
+  /**
+   * `git apply --cached` of the change `from` -> `to` onto `index`: a path the change adds
+   * must not be in the index, a path it deletes or modifies must be there; a deletion needs
+   * the index to hold the deleted version, a modification applies where the index holds
+   * the old version or its edit merges cleanly with the index's (the patch's context
+   * matches). Errors as git's apply reports them.
+   */
+  private async applyCached(
+    from: Map<string, CheckedEntry>,
+    index: Map<string, CheckedEntry>,
+    to: Map<string, CheckedEntry>,
+  ): Promise<{ result: Map<string, CheckedEntry>; errors: string[]; failed: string[] }> {
+    const result = new Map(index);
+    const errors: string[] = [];
+    const failed: string[] = [];
+    const paths = [...new Set([...from.keys(), ...to.keys()])].sort(compareBytes);
+    for (const path of paths) {
+      const b = from.get(path);
+      const t = to.get(path);
+      if (sameEntry(b, t)) continue;
+      const current = index.get(path);
+      if (!b && t) {
+        if (current) {
+          errors.push(`error: ${path}: already exists in index`);
+          failed.push(path);
+        } else result.set(path, t);
+        continue;
+      }
+      if (!current) {
+        errors.push(`error: ${path}: does not exist in index`);
+        failed.push(path);
+        continue;
+      }
+      if (b && !t) {
+        if (current.objectId !== b.objectId) {
+          errors.push(`error: ${path}: patch does not apply`);
+          failed.push(path);
+        } else result.delete(path);
+        continue;
+      }
+      if (!b || !t) continue;
+      // the mode: the patch's new mode where it changes it, else the index's
+      const mode = b.mode !== t.mode ? t.mode : current.mode;
+      if (current.objectId === b.objectId || b.objectId === t.objectId) {
+        result.set(path, {
+          objectId: b.objectId === t.objectId ? current.objectId : t.objectId,
+          mode,
+        });
+        continue;
+      }
+      const merged = mergeLines(
+        await readBlob(this.blobs, b.objectId),
+        await readBlob(this.blobs, current.objectId),
+        await readBlob(this.blobs, t.objectId),
+        { oursLabel: "", theirsLabel: "" },
+      );
+      if (merged.conflicts > 0) {
+        errors.push(`error: ${path}: patch does not apply`);
+        failed.push(path);
+        continue;
+      }
+      result.set(path, { objectId: await this.blobs.store([merged.content]), mode });
+    }
+    // an added path cannot sit beneath a file of the index, nor over a directory of it
+    for (const path of paths) {
+      if (from.has(path) || !to.has(path) || !result.has(path)) continue;
+      const parts = path.split("/");
+      const underFile = parts.slice(1).some((_, k) => result.has(parts.slice(0, k + 1).join("/")));
+      const overDir = [...result.keys()].some((p) => p.startsWith(`${path}/`));
+      if (underFile || overDir) {
+        errors.push(
+          `error: '${path}' appears as both a file and as a directory`,
+          `error: unable to add cache entry for ${path}`,
+        );
+        failed.push(path);
+      }
+    }
+    return { result, errors, failed };
   }
 
   /** Stores a flat path map as a tree. */
@@ -615,7 +702,6 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
    */
   private async planUntrackedRestore(
     untrackedCommitId: ObjectId | undefined,
-    worktreePlan: TreeRestorePlan,
     worktree: Worktree,
   ): Promise<TreeRestorePlan | undefined> {
     if (!this.restoreUntracked || !untrackedCommitId) {
@@ -634,38 +720,68 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       reservedNames: worktree.capabilities?.reservedNames,
     });
 
-    const taken: string[] = [];
-    for (const { path } of plan.entries) {
-      // a file on a leading component: git cannot create the directory, and restores
-      // nothing ("cannot create directory at 'd': File exists")
-      const parts = path.split("/");
-      for (let k = 1; k < parts.length; k++) {
+    return plan;
+  }
+
+  /**
+   * The stashed untracked files written back after the merge, as git's
+   * `checkout-index --all` of their own index writes them (the worktree's attributes, then
+   * that index's; they stay untracked): in index order, a path something already stands at
+   * is skipped (`<path> already exists, no checkout`), a file on a leading component stops
+   * the restore there (`cannot create directory at '<dir>': File exists`). What could not
+   * be restored is reported (thrown) once the rest is written, as git exits with an error
+   * after applying the stash.
+   */
+  private async writeUntracked(
+    plan: TreeRestorePlan | undefined,
+    worktree: Worktree,
+    stashId: ObjectId,
+    symlinks: boolean,
+  ): Promise<void> {
+    if (!plan || plan.entries.length === 0) return;
+    const errors: string[] = [];
+    const failed: string[] = [];
+    const sorted = [...plan.entries].sort((a, b) => compareBytes(a.path, b.path));
+    let stopped = false;
+    for (const entry of sorted) {
+      const parts = entry.path.split("/");
+      for (let k = 1; k < parts.length && !stopped; k++) {
         const prefix = parts.slice(0, k).join("/");
-        const entry = await worktree.getEntry(prefix);
-        if (entry && !entry.isDirectory) {
-          throw new StashApplyFailedError(
-            untrackedCommitId,
-            [prefix],
-            `fatal: cannot create directory at '${prefix}': File exists\nerror: could not restore untracked files from stash`,
-          );
+        const found = await worktree.getEntry(prefix);
+        if (found && !found.isDirectory) {
+          errors.push(`fatal: cannot create directory at '${prefix}': File exists`);
+          failed.push(prefix);
+          stopped = true;
         }
       }
-      // taken by a file on disk (untracked or tracked), or one the merge writes: git's
-      // `checkout-index --all` refuses each such path
-      if (worktreePlan.paths.has(path) || (await worktree.exists(path))) taken.push(path);
-    }
-    if (taken.length > 0) {
-      throw new StashApplyFailedError(
-        untrackedCommitId,
-        taken,
-        [
-          ...taken.map((p) => `${p} already exists, no checkout`),
-          "error: could not restore untracked files from stash",
-        ].join("\n"),
+      if (stopped) break;
+      if (await worktree.exists(entry.path)) {
+        errors.push(`${entry.path} already exists, no checkout`);
+        failed.push(entry.path);
+        continue;
+      }
+      // written one by one: a later path may sit beneath an earlier one's directory
+      await writeTreeRestorePlan(
+        worktree,
+        this.blobs,
+        { ...plan, entries: [entry], gitlinks: [] },
+        STASH_APPLY,
+        {
+          symlinks,
+          attributes: {
+            direction: "checkin",
+            index: attributesIndexOf(plan.entries.map((e) => [e.path, e.objectId] as const)),
+          },
+        },
       );
     }
-
-    return plan;
+    if (errors.length > 0) {
+      throw new StashApplyFailedError(
+        stashId,
+        failed,
+        [...errors, "error: could not restore untracked files from stash"].join("\n"),
+      );
+    }
   }
 
   /**
@@ -717,4 +833,9 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
 
     throw new RefNotFoundError(refName);
   }
+}
+
+/** Byte order of paths, as git sorts an index. */
+function compareBytes(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }

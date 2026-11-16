@@ -257,7 +257,32 @@ export async function ortMerge(
     ] as const) {
       for (const [from, to] of renames) {
         const original = base.get(from);
-        if (!original || other.has(to)) continue;
+        if (!original) continue;
+        if (other.has(to)) {
+          // merge-ort's rename/add: the other side added a file where this one renamed
+          // to. The renamed file (the other side's change of the original merged in) and
+          // the added one meet there as an add/add: stages 2 and 3, no base
+          const renamed = side.get(to);
+          if (base.has(to) || !renamed) continue;
+          const changed = other.get(from);
+          base.delete(from);
+          other.delete(from);
+          if (changed && isRegular(original) && isRegular(changed) && isRegular(renamed)) {
+            const merged = sideIsOurs
+              ? await mergeContents(from, original, renamed, changed, {
+                  base: from,
+                  ours: to,
+                  theirs: from,
+                })
+              : await mergeContents(from, original, changed, renamed, {
+                  base: from,
+                  ours: from,
+                  theirs: to,
+                });
+            side.set(to, { objectId: merged.objectId, mode: merged.mode });
+          }
+          continue;
+        }
         const moved = other.get(from);
         base.delete(from);
         if (moved) {

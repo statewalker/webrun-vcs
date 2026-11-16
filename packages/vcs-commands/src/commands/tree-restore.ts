@@ -248,6 +248,7 @@ async function writePlan(
       ...(attributes ? { attributes } : {}),
       createParents: true,
       ...(options.replaceInTheWay ? { replaceInTheWay: true } : {}),
+      ...(options.discardUntracked ? { discardUntracked: true } : {}),
     });
   }
   // a submodule is an empty directory, as git checks out an unpopulated one
@@ -262,6 +263,11 @@ export interface TreeWriteOptions {
   symlinks?: boolean;
   /** A forced checkout: unlink a file or link standing where a directory must go. */
   replaceInTheWay?: boolean;
+  /**
+   * With `replaceInTheWay`, a directory where a file goes is removed whatever it holds
+   * (`reset --hard`, `checkout -f`); without it, only one holding nothing but ignored files.
+   */
+  discardUntracked?: boolean;
   /** Create an empty directory for each gitlink (submodule). */
   gitlinks?: boolean;
   /**
@@ -271,4 +277,49 @@ export interface TreeWriteOptions {
    * does (`checkout-index`: the worktree's, then the current index's).
    */
   attributes?: ContentAttributesContext | false;
+}
+
+/**
+ * A restore plan of only the paths in `writing`, from a flat path map of a tree (`target`,
+ * whose paths cannot collide, a tree being their source): each path validated as
+ * {@link planTreeRestore} validates it and its blob checked, without walking the tree.
+ * Case collisions are not looked for (plan the whole tree with `ignoreCase` instead).
+ */
+export async function planFlatRestore(
+  blobs: Blobs,
+  target: Map<string, { objectId: ObjectId; mode: number }>,
+  writing: Set<string>,
+  operation: string,
+  options: Omit<TreeRestoreOptions, "ignoreCase" | "writing"> = {},
+): Promise<TreeRestorePlan> {
+  const plan: TreeRestorePlan = { entries: [], paths: new Set(), gitlinks: [], collided: [] };
+  for (const path of [...writing].sort()) {
+    const entry = target.get(path);
+    if (!entry) continue;
+    const top = path.includes("/") ? path.slice(0, path.indexOf("/")) : path;
+    if (
+      !isValidWorktreePath(path, entry.mode, { windows: options.windows === true }) ||
+      options.reservedNames?.some(
+        (name) => top.normalize("NFC").toLowerCase() === name.toLowerCase(),
+      )
+    ) {
+      throw new Error(`${operation} cannot restore ${JSON.stringify(path)}: invalid path`);
+    }
+    const restore = { path, objectId: entry.objectId, mode: entry.mode };
+    plan.paths.add(path);
+    if (entry.mode === FileMode.GITLINK) {
+      plan.gitlinks.push(restore);
+      continue;
+    }
+    if (entry.mode === FileMode.SYMLINK && !options.symlinks) {
+      throw new Error(
+        `${operation} cannot restore ${path}: the worktree cannot create symbolic links`,
+      );
+    }
+    if (!(await blobs.has(entry.objectId))) {
+      throw new Error(`${operation} cannot restore ${path}: blob ${entry.objectId} is missing`);
+    }
+    plan.entries.push(restore);
+  }
+  return plan;
 }

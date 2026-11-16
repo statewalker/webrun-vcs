@@ -37,6 +37,8 @@ import {
   DeleteStagingEntry,
   entryStatOf,
   modeFromWorktree,
+  type ResolveUndoRecord,
+  type StagingEntry,
   UpdateStagingEntry,
   type Worktree,
   wholeSeconds,
@@ -419,9 +421,16 @@ export class AddCommand extends GitCommand<AddResult> {
       });
     }
 
+    // the conflicts: their stages 1-3 by path (adding or removing a path resolves it)
+    const unmerged = new Map<string, StagingEntry[]>();
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage === 0) continue;
+      unmerged.set(entry.path, [...(unmerged.get(entry.path) ?? []), entry]);
+    }
+
     // If update or all mode, check for deleted files in index
     if (this.update || stageDeletions) {
-      const indexedPaths = new Set<string>();
+      const indexedPaths = new Set<string>(unmerged.keys());
       for await (const entry of this.staging.entries()) {
         if (entry.stage === 0) {
           indexedPaths.add(entry.path);
@@ -448,7 +457,7 @@ export class AddCommand extends GitCommand<AddResult> {
 
     // If update mode, filter to only tracked files
     if (this.update) {
-      const trackedPaths = new Set<string>();
+      const trackedPaths = new Set<string>(unmerged.keys());
       for await (const entry of this.staging.entries()) {
         if (entry.stage === 0) {
           trackedPaths.add(entry.path);
@@ -465,16 +474,39 @@ export class AddCommand extends GitCommand<AddResult> {
     // what the worktree's modes can be trusted for (git's core.filemode / core.symlinks)
     const trust = worktreeModeTrust(this.workingCopy, worktree);
     const indexTime = this.staging.getUpdateTime();
+    // git's add_index_entry: a stage-0 entry replaces the path's conflict stages, which
+    // are kept as resolve-undo (record_resolve_undo); a removal takes every stage
+    const resolveUndo: ResolveUndoRecord[] = [];
+    const resolve = (path: string) => {
+      const stages = unmerged.get(path);
+      if (!stages) return;
+      unmerged.delete(path);
+      editor.remove(path);
+      const record: ResolveUndoRecord = {
+        path,
+        modes: [0, 0, 0],
+        objectIds: [undefined, undefined, undefined],
+      };
+      for (const entry of stages) {
+        const k = entry.stage - 1;
+        if (k < 0 || k > 2) continue;
+        record.modes[k] = entry.mode;
+        record.objectIds[k] = entry.objectId;
+      }
+      resolveUndo.push(record);
+    };
 
     for (const file of filesToProcess) {
       if (!file.exists) {
         // File deleted from worktree - remove from index
+        resolve(file.path);
         editor.add(new DeleteStagingEntry(file.path));
         removed.push(file.path);
         continue;
       }
 
       if (this.intentToAdd) {
+        resolve(file.path);
         // Just mark as intent-to-add (placeholder with empty blob)
         const worktreeEntry = await worktree.getEntry(file.path);
         const mode = worktreeEntry?.mode ?? FileMode.REGULAR_FILE;
@@ -520,6 +552,7 @@ export class AddCommand extends GitCommand<AddResult> {
       const stored = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry, {
         onWarning: (message) => warnings.push(message),
       });
+      resolve(file.path);
 
       // Add to staging, with the mode git's ce_mode_from_stat would record
       const indexMode = indexed?.mode;
@@ -530,6 +563,7 @@ export class AddCommand extends GitCommand<AddResult> {
 
     // Apply changes
     await editor.finish();
+    if (resolveUndo.length > 0) this.staging.recordResolveUndo?.(resolveUndo);
 
     // Persist staging changes (required for FileStagingStore)
     await this.staging.write();

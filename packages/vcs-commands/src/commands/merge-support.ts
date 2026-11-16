@@ -20,7 +20,12 @@ import {
 import type { CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import type { OrtConflict } from "./ort-merge.js";
-import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import {
+  planFlatRestore,
+  planTreeRestore,
+  type TreeRestorePlan,
+  writeTreeRestorePlan,
+} from "./tree-restore.js";
 import {
   type CheckedEntry,
   findInTheWay,
@@ -81,6 +86,136 @@ export async function storeFlatTree(
   return store(root);
 }
 
+/**
+ * Stores `target` as a tree, given that `base` is the flat form of the stored tree
+ * `baseTree`: only the directories holding a changed path are stored again, every other
+ * subtree is taken from `baseTree` as it is (what a pick changes is a few paths of a large
+ * tree). Without a base tree the whole map is stored.
+ */
+export async function storeFlatTreeOver(
+  trees: CommandTrees,
+  baseTree: ObjectId | undefined,
+  base: Map<string, CheckedEntry>,
+  target: Map<string, CheckedEntry>,
+): Promise<ObjectId> {
+  if (!baseTree) return storeFlatTree(trees, target);
+  const changes = new Map<string, CheckedEntry | null>();
+  for (const [path, entry] of target) {
+    if (!sameEntry(base.get(path), entry)) changes.set(path, entry);
+  }
+  for (const path of base.keys()) if (!target.has(path)) changes.set(path, null);
+  if (changes.size === 0) return baseTree;
+  const rebuild = async (
+    treeId: ObjectId | undefined,
+    edits: Map<string, CheckedEntry | null>,
+  ): Promise<ObjectId | undefined> => {
+    const entries = new Map<string, { mode: number; id: ObjectId }>();
+    if (treeId) {
+      for await (const e of trees.loadTree(treeId)) entries.set(e.name, { mode: e.mode, id: e.id });
+    }
+    const direct = new Map<string, CheckedEntry | null>();
+    const nested = new Map<string, Map<string, CheckedEntry | null>>();
+    for (const [path, entry] of edits) {
+      const k = path.indexOf("/");
+      if (k < 0) direct.set(path, entry);
+      else {
+        const name = path.slice(0, k);
+        const sub = nested.get(name) ?? new Map<string, CheckedEntry | null>();
+        sub.set(path.slice(k + 1), entry);
+        nested.set(name, sub);
+      }
+    }
+    // removals first (a file `d` making way for `d/x`), then directories, then files
+    for (const [name, entry] of direct) if (!entry) entries.delete(name);
+    for (const [name, sub] of nested) {
+      const current = entries.get(name);
+      const childTree = current?.mode === FileMode.TREE ? current.id : undefined;
+      const id = await rebuild(childTree, sub);
+      if (id) entries.set(name, { mode: FileMode.TREE, id });
+      else if (childTree) entries.delete(name);
+    }
+    for (const [name, entry] of direct) {
+      if (entry) entries.set(name, { mode: entry.mode, id: entry.objectId });
+    }
+    if (entries.size === 0) return undefined;
+    return trees.storeTree([...entries].map(([name, e]) => ({ name, mode: e.mode, id: e.id })));
+  };
+  return (await rebuild(baseTree, changes)) ?? (await trees.storeTree([]));
+}
+
+/**
+ * Flat trees by tree id, for an operation that reads the same trees again and again (a
+ * rebase: each pick's result is the next pick's HEAD, each commit the next one's parent).
+ * Keeps the last few.
+ */
+export class FlatTreeCache {
+  private readonly cache = new Map<ObjectId, Map<string, CheckedEntry>>();
+
+  constructor(
+    private readonly trees: CommandTrees,
+    private readonly size = 8,
+  ) {}
+
+  /** The flat tree (none for no tree); the map is shared, never to be changed. */
+  async get(treeId: ObjectId | undefined): Promise<Map<string, CheckedEntry>> {
+    if (!treeId) return new Map();
+    const hit = this.cache.get(treeId);
+    if (hit) {
+      this.cache.delete(treeId);
+      this.cache.set(treeId, hit);
+      return hit;
+    }
+    const flat = await flatTree(this.trees, treeId);
+    this.put(treeId, flat);
+    return flat;
+  }
+
+  /** Records the flat form of a tree just stored. */
+  put(treeId: ObjectId, flat: Map<string, CheckedEntry>): void {
+    this.cache.delete(treeId);
+    this.cache.set(treeId, flat);
+    while (this.cache.size > this.size) {
+      const oldest = this.cache.keys().next().value as ObjectId;
+      this.cache.delete(oldest);
+    }
+  }
+}
+
+/**
+ * The restore plan of the paths in `writing`, taken from the flat `target` (the tree
+ * `targetTree`): each path validated and its blob checked as {@link planTreeRestore} does,
+ * without walking the whole tree. With `core.ignorecase` the whole tree is planned (case
+ * collisions are found across it).
+ */
+export async function planPathsRestore(
+  ctx: MergeWriteContext,
+  target: Map<string, CheckedEntry>,
+  targetTree: ObjectId | undefined,
+  writing: Set<string>,
+  operation: string,
+): Promise<TreeRestorePlan> {
+  const worktree = ctx.worktree;
+  const options = {
+    symlinks: true,
+    windows: worktree?.capabilities?.windowsPaths === true,
+    reservedNames: worktree?.capabilities?.reservedNames,
+  };
+  if (coreBool(ctx.workingCopy, "ignorecase", false)) {
+    const tree = targetTree ?? (await storeFlatTree(ctx.trees, target));
+    const plan = await planTreeRestore(ctx.trees, ctx.blobs, tree, operation, {
+      ...options,
+      ignoreCase: true,
+      writing,
+    });
+    return {
+      ...plan,
+      entries: plan.entries.filter((e) => writing.has(e.path)),
+      gitlinks: plan.gitlinks.filter((e) => writing.has(e.path)),
+    };
+  }
+  return planFlatRestore(ctx.blobs, target, writing, operation, options);
+}
+
 /** The index: its stage-0 entries by path, and the paths with unmerged entries. */
 export async function readIndex(
   staging: Staging,
@@ -105,22 +240,37 @@ export async function rewriteIndex(
   staging: Staging,
   changes: Map<string, IndexEntryInput[]>,
 ): Promise<void> {
-  const entries: IndexEntryInput[] = [];
+  // the kept entries are in the index's order already: only the changes are sorted, then
+  // both merged (git's order: the paths' bytes, then the stage)
+  const kept: IndexEntryInput[] = [];
   for await (const entry of staging.entries()) {
-    if (!changes.has(entry.path)) entries.push(entry);
+    if (!changes.has(entry.path)) kept.push(entry);
   }
-  for (const list of changes.values()) entries.push(...list);
   const encoder = new TextEncoder();
-  const key = (e: IndexEntryInput) => encoder.encode(e.path);
-  const compare = (a: IndexEntryInput, b: IndexEntryInput) => {
-    const x = key(a);
-    const y = key(b);
-    for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
-    return x.length - y.length || (a.stage ?? 0) - (b.stage ?? 0);
+  const keys = new Map<string, Uint8Array>();
+  const key = (path: string) => {
+    let k = keys.get(path);
+    if (!k) {
+      k = encoder.encode(path);
+      keys.set(path, k);
+    }
+    return k;
   };
-  entries.sort(compare);
+  const compare = (a: IndexEntryInput, b: IndexEntryInput) => {
+    if (a.path === b.path) return (a.stage ?? 0) - (b.stage ?? 0);
+    const x = key(a.path);
+    const y = key(b.path);
+    for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+    return x.length - y.length;
+  };
+  const added = [...changes.values()].flat().sort(compare);
   const builder = staging.createBuilder();
-  for (const entry of entries) builder.add(entry);
+  let a = 0;
+  for (const entry of kept) {
+    while (a < added.length && compare(added[a], entry) < 0) builder.add(added[a++]);
+    builder.add(entry);
+  }
+  while (a < added.length) builder.add(added[a++]);
   await builder.finish();
   await staging.write();
 }
@@ -243,6 +393,8 @@ export async function switchTrees(
     operation: string;
     /** The conflicts to stage */
     conflicts?: Iterable<OrtConflict>;
+    /** `target` stored as a tree already (saves storing it again) */
+    targetTree?: ObjectId;
   },
 ): Promise<MergeRefusal | undefined> {
   const { index } = await readIndex(ctx.staging);
@@ -315,14 +467,15 @@ export async function switchTrees(
       await pruneEmptyParents(worktree, path);
     }
     if (updates.length > 0) {
-      const targetTree = await storeFlatTree(ctx.trees, target);
-      const plan = await planTreeRestore(ctx.trees, ctx.blobs, targetTree, options.operation, {
-        symlinks: true,
-        ignoreCase,
-        windows: worktree.capabilities?.windowsPaths === true,
-        reservedNames: worktree.capabilities?.reservedNames,
-      });
       const writing = new Set(updates);
+      // only the written paths are planned (each validated, its blob checked)
+      const plan = await planPathsRestore(
+        ctx,
+        target,
+        options.targetTree,
+        writing,
+        options.operation,
+      );
       // the attributes of the index the switch leaves (git's o->result)
       const result = new Map<string, ObjectId>();
       for (const [path, entry] of index) result.set(path, entry.objectId);

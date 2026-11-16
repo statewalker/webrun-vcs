@@ -7,7 +7,7 @@ import {
   type IndexEntryOptions,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-
+import { InvalidArgumentError } from "../errors/command-errors.js";
 import {
   InvalidMergeHeadsError,
   MergeFailureReason,
@@ -43,9 +43,11 @@ import {
   cleanupMessage,
   createAutostash,
   resetMerge,
+  saveAutostash,
   squashMessage,
 } from "./sequencer-support.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
+import { pruneEmptyParents } from "./worktree-overwrite-checks.js";
 
 /** What `git merge` is asked to do. */
 export enum MergeOperation {
@@ -324,18 +326,37 @@ export class MergeCommand extends GitCommand<MergeResult> {
       throw new NotFastForwardError("fatal: Not possible to fast-forward, aborting.");
     }
 
+    // git refuses unrelated histories before anything is stashed or written
+    const mergeBases = fastForward ? [] : await this.commits.findMergeBase(headId, srcId);
+    if (!fastForward && mergeBases.length === 0) throw new NoMergeBaseError([headId, srcId]);
+
     // merge.autoStash: local changes stashed away, applied again once the merge is done
     const created: string[] = [];
     if (worktree && (this.autoStash ?? configBool(this.workingCopy, "merge.autoStash", false))) {
+      if (!state.supported) {
+        // the stash could be kept nowhere: refused rather than stranded
+        throw new InvalidArgumentError(
+          "autoStash",
+          true,
+          "merge --autostash needs a checkout that keeps state files (MERGE_AUTOSTASH)",
+        );
+      }
       const autostash = await createAutostash(this.context(worktree), headId);
       if (autostash) {
         await state.write("MERGE_AUTOSTASH", `${autostash}\n`);
         created.push(`Created autostash: ${abbrev(autostash)}`);
       }
     }
-    const result = fastForward
-      ? await this.doFastForward(headId, srcId, head, state, worktree)
-      : await this.doMerge(headId, srcId, srcRef, head, state, worktree);
+    let result: MergeResult;
+    try {
+      result = fastForward
+        ? await this.doFastForward(headId, srcId, head, state, worktree)
+        : await this.doMerge(headId, srcId, srcRef, head, state, worktree, mergeBases);
+    } catch (error) {
+      // nothing is stranded in the autostash: applied back as git's apply_autostash
+      await this.popAutostash(state, worktree).catch(() => undefined);
+      throw error;
+    }
     const output = [...created, ...(result.output ?? [])];
     // a merge stopped for the user (conflicts, --no-commit) keeps the autostash for later
     if (
@@ -425,8 +446,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
     head: Awaited<ReturnType<typeof this.refsStore.get>>,
     state: OperationState,
     worktree: Worktree | undefined,
+    mergeBases: ObjectId[],
   ): Promise<MergeResult> {
-    const mergeBases = await this.commits.findMergeBase(headId, srcId);
     if (mergeBases.length === 0) {
       throw new NoMergeBaseError([headId, srcId]);
     }
@@ -603,7 +624,16 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
     const headId = await this.resolveHead();
     const refused = await resetMerge(this.context(worktree), headId, "HEAD");
-    if (refused) return failed(refused.message, refused.paths);
+    if (refused) {
+      // git has taken MERGE_AUTOSTASH away by now (and dies in the reset): ours is kept on
+      // refs/stash rather than lost
+      const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
+      if (autostash) {
+        await state.remove("MERGE_AUTOSTASH");
+        await saveAutostash(this.context(worktree), autostash);
+      }
+      return failed(refused.message, refused.paths);
+    }
     await state.setRef("ORIG_HEAD", headId);
     await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
     await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
@@ -678,6 +708,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
       }
     }
     if (restaged.size > 0) await rewriteIndex(this.staging, restaged);
+    // a file deleted in what was saved: `reset --hard` wrote it, `stash apply` removed it
+    // again with the directories it leaves empty
+    for (const path of head.keys()) {
+      if (saved.has(path) || (await worktree.getEntry(path))) continue;
+      await pruneEmptyParents(worktree, path);
+    }
   }
 
   private context(worktree: Worktree | undefined) {

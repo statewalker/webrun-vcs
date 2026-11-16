@@ -56,6 +56,51 @@ export async function worktreeDiffers(
   return (await worktree.computeHash(path)) !== entry.objectId;
 }
 
+/**
+ * Whether the worktree file at `path` no longer holds the index entry, a missing file
+ * included: what git's `require_clean_work_tree` and `reset --hard` (`ie_match_stat` after
+ * `lstat`) see as a change, where an overwrite check ({@link worktreeDiffers}) does not.
+ */
+export async function worktreeModified(
+  worktree: Worktree,
+  path: string,
+  entry: CheckedEntry,
+  trust?: WorktreeModeTrust,
+): Promise<boolean> {
+  const current = await worktree.getEntry(path);
+  if (!current) return entry.mode !== FileMode.GITLINK;
+  return worktreeDiffers(worktree, path, entry, trust);
+}
+
+/**
+ * Whether the directory at `dir` holds anything git's `verify_clean_subdirectory` would
+ * lose by replacing it: an untracked file or link that is not ignored, or a nested
+ * repository (a directory with a `.git` that is not a tracked submodule), the directory
+ * itself being one included. `tracked` tells the paths the index keeps track of there.
+ */
+export async function untrackedUnder(
+  worktree: Worktree,
+  dir: string,
+  tracked: (path: string) => boolean,
+): Promise<boolean> {
+  if (!tracked(dir) && (await isNestedRepository(worktree, dir))) return true;
+  for await (const inside of worktree.walk({ pathPrefix: dir, includeDirectories: true })) {
+    if (inside.isDirectory) {
+      // a nested repository is never entered by the walk: it is untracked content itself
+      if (inside.mode === FileMode.GITLINK && !tracked(inside.path)) return true;
+      continue;
+    }
+    if (!tracked(inside.path)) return true;
+  }
+  return false;
+}
+
+/** Whether `dir` holds a `.git` of its own (a nested repository, or what may be one). */
+async function isNestedRepository(worktree: Worktree, dir: string): Promise<boolean> {
+  if (worktree.isRepository) return worktree.isRepository(dir);
+  return worktree.exists(`${dir}/.git`);
+}
+
 /** What stands where an operation writes: untracked files, and directories with some. */
 export interface InTheWay {
   /** Untracked files or links on a written path, or on a leading component of one */
@@ -112,12 +157,9 @@ export async function findInTheWay(
     const entry = await worktree.getEntry(path);
     if (!entry) continue;
     if (entry.isDirectory) {
-      for await (const inside of worktree.walk({ pathPrefix: path })) {
-        if (!tracked(inside.path) && !removes.has(inside.path)) {
-          lostDirs.push(path);
-          break;
-        }
-      }
+      // untracked files and nested repositories there would be lost (git refuses)
+      const keeps = (p: string) => tracked(p) || removes.has(p);
+      if (await untrackedUnder(worktree, path, keeps)) lostDirs.push(path);
       continue;
     }
     if (options.ignoreCase && removingFolded.has(path.toLowerCase())) continue;

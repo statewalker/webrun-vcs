@@ -218,10 +218,13 @@ describeGit("stash apply against native git", () => {
     const { expected, actual } = await bothApply(dir, true);
     expect(expected.ok).toBe(false);
     expect(expected.message).toContain("Try without --index");
-    expect(actual.message).toBe("error: conflicts in index. Try without --index.");
+    // git apply --cached reports the path it could not patch, then the refusal
+    expect(actual.message).toBe(
+      "error: a.txt: patch does not apply\nerror: conflicts in index. Try without --index.",
+    );
   });
 
-  it("restores -u files; refuses before writing when a file stands on a leading component", async () => {
+  it("restores -u files; after the tracked changes, stopping where a file stands on a leading component", async () => {
     const dir = join(root, "r");
     repo(dir);
     writeFileSync(join(dir, "a.txt"), "X\n");
@@ -239,7 +242,8 @@ describeGit("stash apply against native git", () => {
     const refused = await bothApply(blocked);
     expect(refused.expected.ok).toBe(false);
     expect(refused.actual.message).toBe(refused.expected.message);
-    expect(read(join(blocked, "a.txt"))).toBe("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+    // git (2.34+) restores the tracked changes first, then the untracked files
+    expectSameState(blocked, refused.native, ["a.txt", "u.txt", "ud"]);
     expect(read(join(blocked, "ud"))).toBe("precious\n");
   });
 });

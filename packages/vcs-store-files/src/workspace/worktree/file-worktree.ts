@@ -555,6 +555,7 @@ export class FileWorktree implements Worktree {
     // a directory in the way is removed only by a forced checkout (`reset --hard`), as git
     // removes untracked directories where a file must go; never otherwise
     if (existing === "directory" && options?.replaceInTheWay) {
+      if (!options.discardUntracked) await this.assertExpendableDirectory(path);
       await this.files.remove(fullPath);
       if (await this.kindOf(fullPath)) throw new Error(`Cannot replace directory ${path}`);
     } else if (existing === "directory") {
@@ -603,6 +604,24 @@ export class FileWorktree implements Worktree {
           mode === FileMode.EXECUTABLE_FILE ? current | ((current & 0o444) >> 2) : current & ~0o111;
         if (wanted !== current) await this.files.chmod(fullPath, wanted);
       }
+    }
+  }
+
+  /**
+   * Refuses (throws) where removing the directory at `path` would lose work: an untracked
+   * file or link that is not ignored, or a nested repository (git's
+   * `verify_clean_subdirectory`). Ignored files and empty directories are expendable.
+   */
+  private async assertExpendableDirectory(path: string): Promise<void> {
+    const lost = async () => {
+      if ((await this.repositoryState(path)) !== "none") return true;
+      for await (const inside of this.walk({ pathPrefix: path, includeDirectories: true })) {
+        if (!inside.isDirectory || inside.mode === FileMode.GITLINK) return true;
+      }
+      return false;
+    };
+    if (await lost()) {
+      throw new Error(`Updating '${path}' would lose untracked files in it`);
     }
   }
 

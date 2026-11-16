@@ -22,12 +22,12 @@ import {
   abbrev,
   conflictsComment,
   defaultIdent,
-  flatTree,
+  FlatTreeCache,
   indexChanges,
   type MergeWriteContext,
   type OperationState,
   readIndex,
-  storeFlatTree,
+  storeFlatTreeOver,
   subjectOf,
   switchTrees,
 } from "./merge-support.js";
@@ -96,10 +96,15 @@ interface TodoItem {
 
 /** git's sequencer for `cherry-pick` / `revert`. */
 export class PickSequencer {
+  /** The flat trees the picks read (each pick's result is the next one's HEAD) */
+  private readonly flats: FlatTreeCache;
+
   constructor(
     private readonly deps: SequencerDeps,
     private readonly options: PickOptions,
-  ) {}
+  ) {
+    this.flats = new FlatTreeCache(deps.trees);
+  }
 
   private get name(): string {
     return ACTION_NAME[this.options.action];
@@ -177,7 +182,12 @@ export class PickSequencer {
     const headId = await this.headId();
     const headCommit = await deps.commits.load(headId);
     if (!headCommit) throw new RefNotFoundError(headId, "HEAD commit not found");
-    const headTree = await flatTree(deps.trees, headCommit.tree);
+    // with --no-commit the change is merged into the index as it is (git's
+    // write_index_as_tree): each commit's change on top of the previous one's
+    const headTreeId = this.options.noCommit
+      ? await deps.staging.writeTree(deps.trees)
+      : headCommit.tree;
+    const headTree = await this.flats.get(headTreeId);
 
     // a commit is never made on top of staged changes (error_dirty_index)
     const { index } = await readIndex(deps.staging);
@@ -202,10 +212,10 @@ export class PickSequencer {
     } else {
       parentId = commit.parents[0];
     }
-    const parentTree = parentId
-      ? await flatTree(deps.trees, await deps.commits.getTree(parentId))
-      : new Map();
-    const commitTree = await flatTree(deps.trees, commit.tree);
+    const parentTree = await this.flats.get(
+      parentId ? await deps.commits.getTree(parentId) : undefined,
+    );
+    const commitTree = await this.flats.get(commit.tree);
     const subject = subjectOf(commit.message);
     const label = `${abbrev(item.id)} (${subject})`;
     const parentLabel = parentId ? `parent of ${label}` : "(empty tree)";
@@ -222,23 +232,28 @@ export class PickSequencer {
       ignoreCase: coreBool(deps.workingCopy, "ignorecase", false),
     });
     const target = await ortResultEntries(deps.blobs, merge);
+    const treeId = await storeFlatTreeOver(deps.trees, headTreeId, headTree, target);
+    this.flats.put(treeId, target);
     const conflicts = [...merge.conflicts.values()];
     const refused = await switchTrees(deps, headTree, target, {
       action: "merge",
       operation: ACTION_NAME[action],
       conflicts,
+      targetTree: treeId,
     });
     if (refused) {
       return this.fail(`${refused.message}\nfatal: ${ACTION_NAME[action]} failed`);
     }
     output.push(...merge.messages);
-    const treeId = await storeFlatTree(deps.trees, target);
     await deps.state.setRef("AUTO_MERGE", treeId);
     const message = this.messageFor(action, item.id, commit, parentId);
 
     if (conflicts.length > 0) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
-      if (!this.options.noCommit) await deps.state.setRef(HEAD_REF[action], item.id);
+      // git records REVERT_HEAD for a revert -n too (do_pick_commit), never CHERRY_PICK_HEAD
+      if (!this.options.noCommit || action === "revert") {
+        await deps.state.setRef(HEAD_REF[action], item.id);
+      }
       await deps.state.write("MERGE_MSG", `${message}${conflictsComment(paths)}`);
       const advice = this.options.noCommit
         ? [
@@ -266,11 +281,13 @@ export class PickSequencer {
     }
     if (this.options.noCommit) {
       await deps.state.write("MERGE_MSG", message);
+      if (action === "revert") await deps.state.setRef(HEAD_REF[action], item.id);
       return { status: "ok", newHead: headId, picked: [item.id], output };
     }
     if (treeId === headCommit.tree) {
       // nothing to commit: git stops, the pick in progress, for --allow-empty or --skip
-      await deps.state.setRef(HEAD_REF[action], item.id);
+      // (CHERRY_PICK_HEAD only: git records REVERT_HEAD for a revert that conflicts)
+      if (action === "pick") await deps.state.setRef(HEAD_REF[action], item.id);
       await deps.state.write("MERGE_MSG", message);
       return {
         status: "conflicting",
@@ -468,16 +485,17 @@ export class PickSequencer {
   /** The todo, abbreviated ids expanded. */
   private async readTodo(): Promise<TodoItem[]> {
     const text = (await this.deps.state.read("sequencer/todo")) ?? "";
-    const out: TodoItem[] = [];
+    const lines: { action: "pick" | "revert"; id: string }[] = [];
     for (const line of text.split("\n")) {
       const match = /^(pick|p|revert)\s+([0-9a-f]+)/.exec(line.trim());
       if (!match) continue;
-      out.push({
-        action: match[1] === "revert" ? "revert" : "pick",
-        id: await expandCommitId(this.deps, match[2]),
-      });
+      lines.push({ action: match[1] === "revert" ? "revert" : "pick", id: match[2] });
     }
-    return out;
+    const ids = await expandCommitIds(
+      this.deps,
+      lines.map((l) => l.id),
+    );
+    return lines.map((l, k) => ({ action: l.action, id: ids[k] }));
   }
 
   /** Whether a `sequencer/` directory tracks a run of several commits. */
@@ -492,36 +510,99 @@ export class PickSequencer {
 }
 
 /**
- * The full id of an abbreviated commit id (as git writes them in todo lists): the commits
- * reachable from the refs (and HEAD, ORIG_HEAD, the sequencer's head) searched for it.
+ * The full id of an abbreviated commit id (as git writes them in todo lists). See
+ * {@link expandCommitIds}.
  */
 export async function expandCommitId(
   deps: { commits: CommandCommits; refs: CommandRefs; state: OperationState },
   id: string,
 ): Promise<ObjectId> {
-  if (id.length >= 40 && (await deps.commits.has(id))) return id;
-  const starts = new Set<ObjectId>();
-  for (const name of ["HEAD", "ORIG_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"]) {
-    const ref = await deps.refs.resolve(name).catch(() => undefined);
-    if (ref?.objectId) starts.add(ref.objectId);
+  return (await expandCommitIds(deps, [id]))[0];
+}
+
+/**
+ * The full ids of abbreviated commit ids (as git writes them in todo lists): a full id the
+ * store holds is taken as it is; the others are looked up by prefix in the object store
+ * (one pass over its ids for all of them, as git's `get_oid` with commit disambiguation),
+ * and only where that cannot tell (a store that cannot list its ids, an ambiguous prefix)
+ * in the commits reachable from the refs, HEAD, ORIG_HEAD and the sequencer's heads.
+ */
+export async function expandCommitIds(
+  deps: { commits: CommandCommits; refs: CommandRefs; state: OperationState },
+  ids: string[],
+): Promise<ObjectId[]> {
+  const out: (ObjectId | undefined)[] = [];
+  const pending = new Set<string>();
+  for (const id of ids) {
+    if (id.length >= 40 && (await deps.commits.has(id))) out.push(id);
+    else {
+      out.push(undefined);
+      pending.add(id);
+    }
   }
-  for (const file of ["sequencer/head", "rebase-merge/orig-head", "rebase-merge/onto"]) {
-    const value = (await deps.state.read(file))?.trim();
-    if (value && /^[0-9a-f]{40,64}$/.test(value)) starts.add(value);
+  if (pending.size === 0) return out as ObjectId[];
+
+  const resolved = new Map<string, ObjectId>();
+  // the object store's ids, every prefix matched in one pass
+  const matches = new Map<string, ObjectId[]>();
+  const lengths = [...new Set([...pending].map((p) => p.length))];
+  try {
+    for await (const key of deps.commits.keys()) {
+      for (const length of lengths) {
+        const prefix = key.slice(0, length);
+        if (pending.has(prefix)) {
+          const list = matches.get(prefix) ?? [];
+          list.push(key);
+          matches.set(prefix, list);
+        }
+      }
+    }
+  } catch {
+    matches.clear();
   }
-  for await (const entry of deps.refs.list()) {
-    const ref = await deps.refs.resolve(entry.name).catch(() => undefined);
-    if (ref?.objectId) starts.add(ref.objectId);
+  for (const [prefix, list] of matches) {
+    const commits: ObjectId[] = [];
+    for (const key of new Set(list)) {
+      if (await deps.commits.has(key).catch(() => false)) commits.push(key);
+    }
+    if (commits.length === 1) resolved.set(prefix, commits[0]);
   }
-  const seen = new Set<ObjectId>();
-  const stack = [...starts];
-  while (stack.length > 0) {
-    const current = stack.pop() as ObjectId;
-    if (seen.has(current)) continue;
-    seen.add(current);
-    if (current.startsWith(id)) return current;
-    const commit = await deps.commits.load(current).catch(() => undefined);
-    if (commit) stack.push(...commit.parents);
+
+  const unresolved = [...pending].filter((p) => !resolved.has(p));
+  if (unresolved.length > 0) {
+    const starts = new Set<ObjectId>();
+    for (const name of ["HEAD", "ORIG_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"]) {
+      const ref = await deps.refs.resolve(name).catch(() => undefined);
+      if (ref?.objectId) starts.add(ref.objectId);
+    }
+    for (const file of ["sequencer/head", "rebase-merge/orig-head", "rebase-merge/onto"]) {
+      const value = (await deps.state.read(file))?.trim();
+      if (value && /^[0-9a-f]{40,64}$/.test(value)) starts.add(value);
+    }
+    for await (const entry of deps.refs.list()) {
+      const ref = await deps.refs.resolve(entry.name).catch(() => undefined);
+      if (ref?.objectId) starts.add(ref.objectId);
+    }
+    const left = new Set(unresolved);
+    const seen = new Set<ObjectId>();
+    const stack = [...starts];
+    while (stack.length > 0 && left.size > 0) {
+      const current = stack.pop() as ObjectId;
+      if (seen.has(current)) continue;
+      seen.add(current);
+      for (const prefix of left) {
+        if (current.startsWith(prefix)) {
+          resolved.set(prefix, current);
+          left.delete(prefix);
+        }
+      }
+      const commit = await deps.commits.load(current).catch(() => undefined);
+      if (commit) stack.push(...commit.parents);
+    }
   }
-  throw new RefNotFoundError(id, `Cannot resolve commit ${id}`);
+  return ids.map((id, k) => {
+    const found = out[k] ?? resolved.get(id);
+    if (!found) throw new RefNotFoundError(id, `Cannot resolve commit ${id}`);
+    return found;
+  });
 }

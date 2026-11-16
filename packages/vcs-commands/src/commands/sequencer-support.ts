@@ -4,8 +4,13 @@
  * their `--continue` applies, and `SQUASH_MSG`.
  */
 
-import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
-import { entryStatOf, type IndexEntryOptions } from "@statewalker/vcs-working-tree";
+import {
+  FileMode,
+  formatPersonIdent,
+  type ObjectId,
+  type PersonIdent,
+} from "@statewalker/vcs-core";
+import { entryStatOf, type IndexEntryOptions, type Worktree } from "@statewalker/vcs-working-tree";
 
 import type { CommandCommits, CommandRefs } from "../git-command.js";
 import { StashApplyStatus } from "../results/stash-result.js";
@@ -14,17 +19,19 @@ import {
   flatTree,
   type MergeRefusal,
   type MergeWriteContext,
+  planPathsRestore,
   rewriteIndex,
-  storeFlatTree,
 } from "./merge-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
-import { planTreeRestore, writeTreeRestorePlan } from "./tree-restore.js";
+import { writeTreeRestorePlan } from "./tree-restore.js";
 import {
   type CheckedEntry,
   pruneEmptyParents,
+  untrackedUnder,
   worktreeDiffers,
+  worktreeModified,
 } from "./worktree-overwrite-checks.js";
 
 /** What resetting the index and worktree needs. */
@@ -37,10 +44,16 @@ const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
   a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
 
 /**
- * git's `reset --merge <commit>` (and with `hard`, `reset --hard`) of the index and the
- * worktree: unmerged entries and entries that differ from the commit's tree take its
- * version (a file that holds unstaged changes refuses the reset, unless hard); paths the
- * index and the commit agree on keep their worktree file as it is. HEAD is not moved.
+ * git's `reset --merge <commit>` (and with `hard`, the `reset --hard` of `reset_head` that
+ * `rebase --abort`, `--skip` and the autostash run) of the index and the worktree, as
+ * unpack-trees' `oneway_merge` runs it with update: unmerged entries and entries that
+ * differ from the commit's tree take its version; paths the index and the commit agree on
+ * keep their worktree file as it is (with `hard`, a modified or missing file is written
+ * again). Refused before anything is written, with git's plumbing messages, where it
+ * would lose work: a file holding unstaged changes (`verify_uptodate`, not with `hard`),
+ * an untracked file where a file goes or on a leading path of one (`verify_absent`), an
+ * untracked file or nested repository in a directory a file replaces
+ * (`verify_clean_subdirectory`). Ignored files are expendable. HEAD is not moved.
  */
 export async function resetMerge(
   ctx: SequencerContext,
@@ -48,44 +61,71 @@ export async function resetMerge(
   label: string,
   options: { hard?: boolean } = {},
 ): Promise<MergeRefusal | undefined> {
-  const target = await flatTree(ctx.trees, await ctx.commits.getTree(targetId));
+  const targetTree = await ctx.commits.getTree(targetId);
+  const target = await flatTree(ctx.trees, targetTree);
   const index = new Map<string, CheckedEntry>();
   const unmerged = new Set<string>();
+  // what read_index_unmerged leaves of a conflict: its first stage, as a stage-0 entry
+  const conflictEntries = new Map<string, CheckedEntry>();
   for await (const entry of ctx.staging.entries()) {
     if (entry.stage === 0) index.set(entry.path, entry);
-    else unmerged.add(entry.path);
+    else {
+      unmerged.add(entry.path);
+      if (!conflictEntries.has(entry.path)) {
+        conflictEntries.set(entry.path, { objectId: entry.objectId, mode: entry.mode });
+      }
+    }
   }
   const worktree = ctx.worktree;
+  const checked = conflictEntries.size > 0 ? new Map([...index, ...conflictEntries]) : index;
   const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const refuse = (message: string, path: string): MergeRefusal => ({
+    message: `error: ${message}\nfatal: Could not reset index file to revision '${label}'.`,
+    paths: [path],
+  });
+  const notUptodate = (path: string) => refuse(`Entry '${path}' not uptodate. Cannot merge.`, path);
   const changes: string[] = [];
-  const paths = [...new Set([...index.keys(), ...unmerged, ...target.keys()])].sort();
+  /** Paths the reset removes from the index (git's CE_REMOVE in the result) */
+  const removing = new Set<string>();
+  const inIndex = (p: string) => index.has(p) || unmerged.has(p);
+  const paths = [...new Set([...index.keys(), ...unmerged, ...target.keys()])].sort(compareBytes);
   for (const path of paths) {
     const i = index.get(path);
     const t = target.get(path);
     const conflicted = unmerged.has(path);
+    if (!t) {
+      // deleted_entry: a directory standing there keeps what is untracked in it
+      // (a submodule's directory is not touched)
+      const gitlink = i?.mode === FileMode.GITLINK;
+      if (worktree && !gitlink && (await directoryLosesUntracked(worktree, path, inIndex))) {
+        return refuse(`Updating '${path}' would lose untracked files in it`, path);
+      }
+      if (!conflicted && i && !options.hard && worktree) {
+        if (await worktreeDiffers(worktree, path, i, trust)) return notUptodate(path);
+      }
+      removing.add(path);
+      changes.push(path);
+      continue;
+    }
     if (!conflicted && sameEntry(i, t)) {
-      // reset --hard rewrites a modified file too
-      if (options.hard && i && worktree && (await worktreeDiffers(worktree, path, i, trust))) {
+      // reset --hard writes a modified or missing file again
+      if (options.hard && i && worktree && (await worktreeModified(worktree, path, i, trust))) {
         changes.push(path);
       }
       continue;
     }
-    if (!options.hard && worktree) {
-      if (!conflicted && i && (await worktreeDiffers(worktree, path, i, trust))) {
-        return {
-          message: `error: Entry '${path}' not uptodate. Cannot merge.\nfatal: Could not reset index file to revision '${label}'.`,
-          paths: [path],
-        };
-      }
-      if (!conflicted && !i && t) {
-        const entry = await worktree.getEntry(path);
-        if (entry && !entry.isDirectory && !(await worktree.isIgnored(path))) {
-          return {
-            message: `error: Untracked working tree file '${path}' would be overwritten by merge.\nfatal: Could not reset index file to revision '${label}'.`,
-            paths: [path],
-          };
-        }
-      }
+    if (worktree && !i && !conflicted) {
+      // a new path: verify_absent
+      const refusal = await verifyAbsent(worktree, path, t, checked, removing, {
+        hard: options.hard === true,
+        tracked: inIndex,
+        trust,
+        refuse,
+        notUptodate,
+      });
+      if (refusal) return refusal;
+    } else if (worktree && i && !conflicted && !options.hard) {
+      if (await worktreeDiffers(worktree, path, i, trust)) return notUptodate(path);
     }
     changes.push(path);
   }
@@ -93,38 +133,20 @@ export async function resetMerge(
   if (worktree) {
     for (const path of changes) {
       if (target.has(path)) continue;
-      if (await worktree.exists(path)) {
-        const entry = await worktree.getEntry(path);
-        if (!entry?.isDirectory) {
-          await worktree.remove(path);
-          await pruneEmptyParents(worktree, path);
-        }
+      const entry = await worktree.getEntry(path);
+      if (entry && !entry.isDirectory) {
+        await worktree.remove(path);
+        await pruneEmptyParents(worktree, path);
       }
     }
     const writing = new Set(changes.filter((p) => target.has(p)));
     if (writing.size > 0) {
-      const plan = await planTreeRestore(
-        ctx.trees,
-        ctx.blobs,
-        await storeFlatTree(ctx.trees, target),
-        "reset",
-        {
-          symlinks: true,
-          windows: worktree.capabilities?.windowsPaths === true,
-          reservedNames: worktree.capabilities?.reservedNames,
-        },
-      );
-      await writeTreeRestorePlan(
-        worktree,
-        ctx.blobs,
-        {
-          ...plan,
-          entries: plan.entries.filter((e) => writing.has(e.path)),
-          gitlinks: plan.gitlinks.filter((e) => writing.has(e.path)),
-        },
-        "reset",
-        { symlinks: trust?.symlinks ?? true, gitlinks: true, replaceInTheWay: true },
-      );
+      const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
+      await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
+        symlinks: trust?.symlinks ?? true,
+        gitlinks: true,
+        replaceInTheWay: true,
+      });
     }
   }
   const edits = new Map<string, IndexEntryOptions[]>();
@@ -144,8 +166,79 @@ export async function resetMerge(
       },
     ]);
   }
-  await rewriteIndex(ctx.staging, edits);
+  if (edits.size > 0) await rewriteIndex(ctx.staging, edits);
   return undefined;
+}
+
+/** Byte order of paths, as git sorts the index. */
+function compareBytes(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Whether a directory stands at `path` holding untracked content (not a link to one). */
+async function directoryLosesUntracked(
+  worktree: Worktree,
+  path: string,
+  tracked: (p: string) => boolean,
+): Promise<boolean> {
+  const entry = await worktree.getEntry(path);
+  if (!entry?.isDirectory) return false;
+  return untrackedUnder(worktree, path, tracked);
+}
+
+/**
+ * unpack-trees' `verify_absent` for a path the reset adds: an untracked (not ignored) file
+ * or link on a leading path or at the path itself, or a directory there with tracked files
+ * holding local changes or untracked content, refuses the reset.
+ */
+async function verifyAbsent(
+  worktree: Worktree,
+  path: string,
+  t: CheckedEntry,
+  index: Map<string, CheckedEntry>,
+  removing: Set<string>,
+  options: {
+    hard: boolean;
+    /** Paths the index tracks, at any stage (unmerged ones are no untracked files) */
+    tracked: (path: string) => boolean;
+    trust: ReturnType<typeof worktreeModeTrust> | undefined;
+    refuse: (message: string, path: string) => MergeRefusal;
+    notUptodate: (path: string) => MergeRefusal;
+  },
+): Promise<MergeRefusal | undefined> {
+  const overwritten = (p: string) =>
+    options.refuse(`Untracked working tree file '${p}' would be overwritten by merge.`, p);
+  // check_leading_path: the first leading component that is no directory
+  const parts = path.split("/");
+  for (let k = 1; k < parts.length; k++) {
+    const prefix = parts.slice(0, k).join("/");
+    const entry = await worktree.getEntry(prefix);
+    if (!entry) return undefined;
+    if (entry.isDirectory) continue;
+    if (removing.has(prefix) || (await worktree.isIgnored(prefix))) return undefined;
+    return overwritten(prefix);
+  }
+  const entry = await worktree.getEntry(path);
+  if (!entry) return undefined;
+  if (entry.isDirectory) {
+    // a submodule's directory stays as it is
+    if (t.mode === FileMode.GITLINK) return undefined;
+    // verify_clean_subdirectory: the tracked files there unchanged (a conflicted one must
+    // hold its first stage), nothing untracked
+    const under = `${path}/`;
+    for (const [p, i] of index) {
+      if (!p.startsWith(under)) continue;
+      if (!options.hard && (await worktreeDiffers(worktree, p, i, options.trust))) {
+        return options.notUptodate(p);
+      }
+    }
+    if (await untrackedUnder(worktree, path, options.tracked)) {
+      return options.refuse(`Updating '${path}' would lose untracked files in it`, path);
+    }
+    return undefined;
+  }
+  if (await worktree.isIgnored(path)) return undefined;
+  return overwritten(path);
 }
 
 /**
@@ -177,17 +270,25 @@ export async function applyAutostash(ctx: SequencerContext, id: ObjectId): Promi
   } catch {
     // refused: kept in the stash below
   }
+  await saveAutostash(ctx, id);
+  return [
+    "Applying autostash resulted in conflicts.",
+    "Your changes are safe in the stash.",
+    'You can run "git stash pop" or "git stash drop" at any time.',
+  ];
+}
+
+/** An autostash kept on `refs/stash` (git's `save_autostash`), for `git stash pop` later. */
+export async function saveAutostash(
+  ctx: Pick<SequencerContext, "commits" | "refs">,
+  id: ObjectId,
+): Promise<void> {
   const commit = await ctx.commits.load(id);
   await ctx.refs.batch([{ name: STASH_REF, new: id }], {
     ident: commit ? formatPersonIdent(commit.committer) : undefined,
     message: "autostash",
     createReflog: true,
   });
-  return [
-    "Applying autostash resulted in conflicts.",
-    "Your changes are safe in the stash.",
-    'You can run "git stash pop" or "git stash drop" at any time.',
-  ];
 }
 
 /**

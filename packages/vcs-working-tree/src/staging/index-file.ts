@@ -26,7 +26,10 @@ import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils
 import {
   assertWritableIndexExtensions,
   carryIndexExtensions,
+  encodeResolveUndo,
   indexEntriesDigest,
+  parseResolveUndo,
+  type ResolveUndoRecord,
 } from "./index-extensions.js";
 import {
   encodeIndexFile,
@@ -266,6 +269,47 @@ export class IndexFile {
    */
   clearResolveUndo(): void {
     this.extensions = this.extensions.filter((e) => e.signature !== "REUC");
+  }
+
+  /**
+   * Record what a resolution removed (git's `record_resolve_undo`): each record's stages
+   * are set in the path's resolve-undo record (the others it had kept), written with the
+   * index as the `REUC` extension, sorted by path.
+   */
+  recordResolveUndo(records: readonly ResolveUndoRecord[]): void {
+    if (records.length === 0) return;
+    const existing = this.extensions.find((e) => e.signature === "REUC");
+    let list: ResolveUndoRecord[] = [];
+    if (existing) {
+      try {
+        list = parseResolveUndo(existing.data);
+      } catch {
+        list = [];
+      }
+    }
+    const byPath = new Map(list.map((r) => [r.path, r]));
+    for (const record of records) {
+      const before = byPath.get(record.path);
+      const modes = [...(before?.modes ?? [0, 0, 0])] as ResolveUndoRecord["modes"];
+      const objectIds = [
+        ...(before?.objectIds ?? [undefined, undefined, undefined]),
+      ] as ResolveUndoRecord["objectIds"];
+      for (let k = 0; k < 3; k++) {
+        if (record.modes[k] !== 0) {
+          modes[k] = record.modes[k];
+          objectIds[k] = record.objectIds[k];
+        }
+      }
+      byPath.set(record.path, { path: record.path, modes, objectIds });
+    }
+    const sorted = [...byPath.values()].sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+    );
+    const reuc = { signature: "REUC", data: encodeResolveUndo(sorted) };
+    const others = this.extensions.filter((e) => e.signature !== "REUC");
+    // git writes it after the cache-tree
+    const at = others.findIndex((e) => e.signature === "TREE") + 1;
+    this.extensions = [...others.slice(0, at), reuc, ...others.slice(at)];
   }
 
   /**

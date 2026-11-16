@@ -90,6 +90,14 @@ export interface WorktreeWriteOptions {
    */
   replaceInTheWay?: boolean;
   /**
+   * With `replaceInTheWay`: a directory standing where the file goes is removed with
+   * whatever it holds (git's `UNPACK_RESET_OVERWRITE_UNTRACKED`: `reset --hard`,
+   * `checkout -f`). Without it only a directory holding nothing but ignored files and empty
+   * directories is removed; an untracked file or a nested repository in it refuses the
+   * write (thrown), so nothing a caller did not verify as expendable is lost.
+   */
+  discardUntracked?: boolean;
+  /**
    * Write the content as it is, without the worktree's content filter (git's smudge:
    * end-of-line conversion, `ident`, `working-tree-encoding`, filter drivers). By default a
    * regular file is smudged where a filter is installed ({@link Worktree.setContentFilter}).
