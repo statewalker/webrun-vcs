@@ -32,6 +32,7 @@ import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { collect } from "@statewalker/vcs-utils/streams";
 import type {
   IgnoreManager,
+  NestedRepositoryState,
   NewHasher,
   Worktree,
   WorktreeCapabilities,
@@ -465,19 +466,9 @@ export class FileWorktree implements Worktree {
     // check (once per batch), never through a link
     await this.loadIgnoresFor(path, this.batchIgnores ?? new Set<string>());
 
-    // Check if it's a directory
-    let isDir = false;
-    try {
-      const fullPath = joinPath(this.rootPath, path);
-      for await (const _ of this.files.list(fullPath)) {
-        isDir = true;
-        break;
-      }
-    } catch {
-      // Not a directory
-    }
-
-    return this.ignoreManager.isIgnored(path, isDir);
+    // a directory (an empty one too), never a link to one: as git's lstat decides
+    const kind = await this.kindOrError(joinPath(this.rootPath, path));
+    return this.ignoreManager.isIgnored(path, kind === "directory");
   }
 
   // ========== Writing ==========
@@ -656,43 +647,74 @@ export class FileWorktree implements Worktree {
   }
 
   async isRepository(path: string): Promise<boolean> {
+    // anything that might be a repository is one here, so nothing is removed on a guess
+    return (await this.repositoryState(path)) !== "none";
+  }
+
+  /**
+   * Whether the directory at `path` holds a repository of its own, as git's
+   * `is_nonbare_repository_dir` decides: `"repository"`, `"none"`, or `"unknown"` when its
+   * `.git` cannot be checked through this FilesApi (a gitfile or link naming a place
+   * beyond its root, a path reached through a link, an unreadable entry).
+   */
+  async repositoryState(path: string): Promise<NestedRepositoryState> {
     const dotGit = joinPath(this.rootPath, path, ".git");
     const kind = await this.kindOrError(dotGit);
+    if (kind === undefined) return "none";
+    if (kind === "error") return "unknown";
     if (kind === "file") {
-      // a gitdir: file names a repository when its target is one; a target beyond this
-      // FilesApi's root cannot be checked here and is taken as one, so nothing is removed
-      // on a guess
+      // a gitdir: file names a repository when its target is one
       let target: string | undefined;
       try {
         target = await this.readGitfile(dotGit);
       } catch {
-        return true;
+        return "unknown";
       }
-      if (!target) return false;
+      if (!target) return "none";
       const resolved = this.gitfileTarget(path, target);
-      if (resolved === undefined) return true;
-      // any HEAD (a file, or a link as core.preferSymlinkRefs writes it) makes it one,
-      // as git's validate_headref; only a target confirmed to have no HEAD is not. One that
-      // cannot be checked (reached through a link, unreadable) is taken as one, so nothing
-      // is removed on a guess
-      return (await this.kindOrError(joinPath(resolved, "HEAD"))) !== undefined;
+      if (resolved === undefined) return "unknown";
+      // any HEAD (a linked worktree's gitdir has no objects of its own: its commondir has)
+      return this.headState(resolved);
     }
-    // a `.git` link (to a repository elsewhere, which git follows): kept, unless it is
-    // certainly dangling (its target, inside this FilesApi, confirmed absent)
-    if (kind === "symlink") return !(await this.isDanglingLink(dotGit, path));
-    if (kind === "error") return true;
-    if (kind !== "directory") return false;
-    const kindAt = (name: string) => this.kindOrError(joinPath(dotGit, name));
-    // git's is_git_directory: a HEAD (file or link), objects and refs (directories, or links
-    // to them); anything that might be a repository (or cannot be checked) is kept rather
-    // than removed
-    const dirLike = (k: string | undefined) =>
-      k === "directory" || k === "symlink" || k === "error";
-    return (
-      (await kindAt("HEAD")) !== undefined &&
-      dirLike(await kindAt("objects")) &&
-      dirLike(await kindAt("refs"))
-    );
+    if (kind === "symlink") {
+      // a `.git` link (git follows it): its target, when this FilesApi can name it
+      if (await this.isDanglingLink(dotGit, path)) return "none";
+      const bytes = await this.files.readlink?.(dotGit).catch(() => undefined);
+      const resolved = bytes
+        ? this.gitfileTarget(path, new TextDecoder().decode(bytes))
+        : undefined;
+      if (resolved === undefined) return "unknown";
+      const state = await this.headState(resolved);
+      return state === "none" ? "unknown" : state;
+    }
+    if (kind !== "directory") return "none";
+    return this.gitDirectoryState(dotGit);
+  }
+
+  /** Whether the directory at `dir` has a HEAD (file or link): a repository's gitdir. */
+  private async headState(dir: string): Promise<NestedRepositoryState> {
+    const head = await this.kindOrError(joinPath(dir, "HEAD"));
+    if (head === "error") return "unknown";
+    return head === undefined ? "none" : "repository";
+  }
+
+  /**
+   * git's `is_git_directory` for the directory at `dir` (a path in this FilesApi): a HEAD
+   * (a file, or a link as core.preferSymlinkRefs writes it), objects and refs (directories,
+   * or links to them).
+   */
+  private async gitDirectoryState(dir: string): Promise<NestedRepositoryState> {
+    const kindAt = (name: string) => this.kindOrError(joinPath(dir, name));
+    const head = await kindAt("HEAD");
+    if (head === "error") return "unknown";
+    if (head === undefined) return "none";
+    let unknown = false;
+    for (const name of ["objects", "refs"]) {
+      const k = await kindAt(name);
+      if (k === "error" || k === "symlink") unknown = true;
+      else if (k !== "directory") return "none";
+    }
+    return unknown ? "unknown" : "repository";
   }
 
   /**

@@ -51,6 +51,9 @@ export interface WorktreeWalkOptions {
   onUnreadable?: (path: string) => void;
 }
 
+/** Whether a directory holds a repository of its own, as far as the worktree can tell. */
+export type NestedRepositoryState = "repository" | "none" | "unknown";
+
 /** Options for removing a worktree entry. */
 export interface WorktreeRemoveOptions {
   /** Remove a directory with everything in it */
@@ -208,6 +211,13 @@ export interface Worktree {
    * An empty `.git` directory is none.
    */
   isRepository?(path: string): Promise<boolean>;
+
+  /**
+   * Whether the directory at `path` holds a repository of its own: `"unknown"` when that
+   * cannot be checked here (its `.git` names a place beyond the storage's root, or cannot be
+   * read). `isRepository` takes an unknown as a repository.
+   */
+  repositoryState?(path: string): Promise<NestedRepositoryState>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
 

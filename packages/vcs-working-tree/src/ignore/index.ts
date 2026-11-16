@@ -1,4 +1,5 @@
 export * from "../status/status-calculator.impl.js";
+export * from "./git-wildmatch.js";
 export * from "./ignore-manager.impl.js";
 export * from "./ignore-manager.js";
 export * from "./ignore-node.js";

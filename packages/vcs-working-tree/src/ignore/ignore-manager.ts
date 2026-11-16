@@ -50,6 +50,15 @@ export interface IgnoreRule {
    */
   isMatchWithMode(path: string, isDirectory: boolean, pathMatch: boolean): boolean;
 
+  /**
+   * Whether the rule matches the path itself as git's `.gitignore` matching decides
+   * (`match_basename` / `match_pathname` with wildmatch): a pattern without a slash
+   * against the last component, one with a slash against the whole path relative to the
+   * ignore file's directory, a directory-only pattern only against a directory. Directories
+   * above the path are the caller's to check. Absent: `isMatchWithMode(path, dir, true)`.
+   */
+  matchesPath?(path: string, isDirectory: boolean): boolean;
+
   /** Whether this is a negation rule (starts with !) */
   readonly isNegated: boolean;
 

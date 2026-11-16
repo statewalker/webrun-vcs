@@ -956,3 +956,274 @@ describeGit("ignore rules as git check-ignore (nested negations, directory-only 
     });
   }
 });
+
+type Repro2 = {
+  setup: (repo: string, top: string) => void;
+  /** flags (as `parseFlags` reads them, without paths) and path filters */
+  runs: Array<[string, string[]]>;
+  /** ours may keep more than git (a `.git` beyond the root it cannot check), never less */
+  overKeep?: boolean;
+};
+
+const REPROS2: Record<string, Repro2> = {
+  // A: a name-only pattern names the path itself, wherever the name repeats above it
+  "A: `foo` then `!foo/` keeps foo/foo ignored": {
+    runs: [
+      ["-f", []],
+      ["-d", []],
+      ["-X", []],
+    ],
+    setup: (r) => {
+      put(join(r, ".gitignore"), "foo\n!foo/\n");
+      put(join(r, "foo/t"), "t\n");
+      git(r, "add", "-f", ".gitignore", "foo/t");
+      git(r, "commit", "-qm", "c");
+      put(join(r, "foo/foo"), "precious\n");
+      put(join(r, "foo/x/foo"), "precious\n");
+    },
+  },
+  "A: `foo` then `!/foo`, and `a/` then `!/a/`": {
+    runs: [
+      ["-d", []],
+      ["-f", []],
+      ["-Xd", []],
+    ],
+    setup: (r) => {
+      put(join(r, ".gitignore"), "foo\n!/foo\na/\n!/a/\n");
+      commitAll(r);
+      put(join(r, "foo/foo"), "precious\n");
+      put(join(r, "foo/x/foo"), "precious\n");
+      put(join(r, "foo/other"), "o\n");
+      put(join(r, "a/b/a/x"), "precious\n");
+      put(join(r, "a/c"), "c\n");
+    },
+  },
+  // B: a directory-only rule ending in `**` matches only directories
+  "B: `**/[!a]*/` and friends never match files": {
+    runs: [
+      ["-X", []],
+      ["-Xd", []],
+      ["-d", []],
+    ],
+    setup: (r) => {
+      put(join(r, ".gitignore"), "**/[!a]*/\n**/?/\n**/*.[lt]*/\n**/*o*/\n");
+      commitAll(r);
+      put(join(r, "x.log"), "precious\n");
+      put(join(r, "q"), "precious\n");
+      put(join(r, "foo"), "precious\n");
+      put(join(r, "dir.txt/f"), "f\n");
+      put(join(r, "a/b/k"), "k\n");
+    },
+  },
+  // C: a backslash makes the next character literal, as in git's wildmatch
+  "C: escaped wildcards and escaped `#`/`!`": {
+    runs: [
+      ["-d", []],
+      ["-X", []],
+      ["-dx", []],
+    ],
+    setup: (r) => {
+      put(join(r, ".gitignore"), "*.txt\n!\\*.txt\n\\[x\\]\n**/\\#hash\n**/\\!bang\nsp\\ \n");
+      commitAll(r);
+      put(join(r, "x.txt"), "precious\n");
+      put(join(r, "*.txt"), "literal\n");
+      put(join(r, "[x]"), "x\n");
+      put(join(r, "x"), "precious\n");
+      put(join(r, "d/#hash"), "h\n");
+      put(join(r, "d/!bang"), "b\n");
+      put(join(r, "sp "), "s\n");
+    },
+  },
+  // D: a `.git` that cannot be checked here is never removed, not even with -ff
+  "D: a dangling .git link or gitfile beyond the root (-dff keeps it)": {
+    runs: [
+      ["-dff", []],
+      ["-d", []],
+    ],
+    setup: (r) => {
+      put(join(r, ".gitignore"), "*.txt\n");
+      commitAll(r);
+      mkdirSync(join(r, "d"));
+      symlinkSync("/nonexistent/missing", join(r, "d/.git"));
+      put(join(r, "d/x.txt"), "precious\n");
+      put(join(r, "e/.git"), "gitdir: /nonexistent/missing\n");
+      put(join(r, "e/x.txt"), "precious\n");
+    },
+  },
+  "D: the same with -dxff (git removes them; ours keeps what it cannot check)": {
+    runs: [["-dxff", []]],
+    overKeep: true,
+    setup: (r) => {
+      commitAll(r);
+      mkdirSync(join(r, "d"));
+      symlinkSync("/nonexistent/missing", join(r, "d/.git"));
+      put(join(r, "d/x.txt"), "x\n");
+      put(join(r, "e/.git"), "gitdir: /nonexistent/missing\n");
+      put(join(r, "e/x.txt"), "x\n");
+    },
+  },
+  // E: pathspec magic, as git parses it
+  "E: exclude, top, literal, glob and icase pathspec magic": {
+    runs: [
+      ["-f", ["*.txt", ":!keep.txt"]],
+      ["-f", ["*.txt", ":(exclude)keep.txt"]],
+      ["-f", ["*.txt", ":^keep.txt"]],
+      ["-d", ["*.txt", ":!d"]],
+      ["-d", [":!keep.txt"]],
+      ["-d", [":!*.log"]],
+      ["-f", [":/a.txt"]],
+      ["-f", [":(top)b"]],
+      ["-f", [":(literal)*.txt"]],
+      ["-f", [":(glob)*.txt"]],
+      ["-f", [":(glob)**/*.txt"]],
+      ["-f", ["**/y.txt"]],
+      ["-f", [":(icase)KEEP.TXT"]],
+      ["-d", ["./b/../d/"]],
+      ["-d", ["./a.txt"]],
+    ],
+    setup: (r) => {
+      commitAll(r);
+      put(join(r, "keep.txt"), "precious\n");
+      put(join(r, "KEEP.TXT"), "k\n");
+      put(join(r, "a.txt"), "a\n");
+      put(join(r, "*.txt"), "literal\n");
+      put(join(r, "d/keep.txt"), "precious\n");
+      put(join(r, "d/x.txt"), "x\n");
+      put(join(r, "b/y.txt"), "y\n");
+      put(join(r, "b/z.log"), "z\n");
+    },
+  },
+};
+
+describeGit("clean: review repros A-E (native twins)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-repro2-"));
+    home = join(root, "home");
+    tmpl = join(root, "tmpl");
+    mkdirSync(home);
+    mkdirSync(tmpl);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const [name, repro] of Object.entries(REPROS2)) {
+    for (const [flag, paths] of repro.runs) {
+      it(`${name} (${flag}${paths.length ? ` -- ${paths.join(" ")}` : ""})`, async () => {
+        const tops = [join(root, "n"), join(root, "o")];
+        for (const top of tops) {
+          mkdirSync(join(top, "repo"), { recursive: true });
+          git(join(top, "repo"), "init", "-q", "-b", "main");
+          git(join(top, "repo"), "config", "core.excludesFile", "/dev/null");
+          repro.setup(join(top, "repo"), top);
+        }
+        const { L, args } = parseFlags(flag);
+        L.paths = paths;
+        const spec = paths.length ? ["--", ...paths] : [];
+        const dry = git(join(tops[0], "repo"), ...args, "-n", ...spec)
+          .split("\n")
+          .filter(Boolean);
+        git(join(tops[0], "repo"), ...args, "-q", ...spec);
+        const ourDry = await ours(join(tops[1], "repo"), L, true);
+        await ours(join(tops[1], "repo"), L, false);
+        const native = listing(tops[0]).map((p) => p.replace(tops[0], ""));
+        const after = listing(tops[1]).map((p) => p.replace(tops[1], ""));
+        expect(
+          native.filter((p) => !after.includes(p)),
+          "gone in ours, kept by git",
+        ).toEqual([]);
+        if (repro.overKeep) return;
+        expect(after).toEqual(native);
+        const pick = (prefix: string) =>
+          dry
+            .filter((l) => l.startsWith(prefix))
+            .map((l) => l.slice(prefix.length).replace(/^"(.*)"$/, "$1"))
+            .sort();
+        expect([...ourDry.cleaned].sort()).toEqual(pick("Would remove "));
+        expect([...ourDry.skipped].sort()).toEqual(pick("Would skip repository "));
+      });
+    }
+  }
+
+  it("E: paths above the top and attr magic are refused, as git refuses them", async () => {
+    const r = join(root, "r");
+    mkdirSync(r, { recursive: true });
+    git(r, "init", "-q", "-b", "main");
+    commitAll(r);
+    put(join(r, "a.txt"), "a\n");
+    expect(() => git(r, "clean", "-f", "-n", "--", "../x")).toThrow();
+    for (const paths of [["../x"], [":(attr:foo)a.txt"], [":(bogus)a.txt"]]) {
+      const L = parseFlags("-f").L;
+      L.paths = paths;
+      await expect(ours(r, L, true)).rejects.toThrow();
+    }
+  });
+});
+
+describeGit("ignore rules as git check-ignore (review repros A-C)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "check-ignore2-"));
+    home = join(root, "home");
+    tmpl = join(root, "tmpl");
+    mkdirSync(home);
+    mkdirSync(tmpl);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const layouts: Record<string, { ignores: Record<string, string>; files: string[] }> = {
+    "A: repeated names": {
+      ignores: { ".gitignore": "foo\n!foo/\na\n!a/\n" },
+      files: ["foo/foo", "foo/t", "a/a", "b/c/foo/bar/bar", "foo/x/foo", "a/b/a/c"],
+    },
+    "A: dir-only repeated names": {
+      ignores: { ".gitignore": "bar/\n!/bar/\n", "b/.gitignore": "bar\n!bar/\n" },
+      files: ["bar/bar/x", "b/c/foo/bar/bar", "b/bar/bar", "bar/y"],
+    },
+    "B: dir-only rules after **": {
+      ignores: { ".gitignore": "**/[!a]*/\n**/?/\n**/*.[lt]*/\n**/*o*/\n" },
+      files: ["x.log", "q", "foo", "dir.txt/f", "a/b/k", "ab/o/c"],
+    },
+    "C: escapes": {
+      ignores: { ".gitignore": "\\*.txt\n\\[x\\]\n**/\\#hash\n**/\\!bang\nsp\\ \nq\\*\n" },
+      files: ["x.txt", "*.txt", "[x]", "x", "d/#hash", "d/!bang", "sp ", "sp", "q*", "qq"],
+    },
+  };
+  for (const [name, layout] of Object.entries(layouts)) {
+    it(name, async () => {
+      const r = join(root, "repo");
+      mkdirSync(r, { recursive: true });
+      git(r, "init", "-q", "-b", "main");
+      git(r, "config", "core.excludesFile", "/dev/null");
+      for (const [p, content] of Object.entries(layout.ignores)) put(join(r, p), content);
+      for (const f of layout.files) put(join(r, f), "f\n");
+      const files0 = createNodeFilesApi({ rootDir: r });
+      const { history } = await createGitFilesBackend({ files: files0 });
+      const worktree = createFileWorktree({
+        files: files0,
+        rootPath: "",
+        gitDir: ".git",
+        blobs: history.blobs,
+        trees: history.trees,
+      });
+      const ourIgnored: string[] = [];
+      const all: string[] = [];
+      for await (const e of worktree.walk({ includeIgnored: true, includeDirectories: true })) {
+        all.push(e.path);
+        if (e.isIgnored) ourIgnored.push(e.path);
+      }
+      let out = "";
+      try {
+        out = execFileSync("git", ["check-ignore", "--no-index", "-z", "--stdin"], {
+          cwd: r,
+          env: env(),
+          input: `${all.join("\0")}\0`,
+          encoding: "utf8",
+        });
+      } catch (e) {
+        out = String((e as { stdout?: string }).stdout ?? "");
+      }
+      const nativeIgnored = out.split("\0").filter(Boolean).sort();
+      expect(ourIgnored.sort()).toEqual(nativeIgnored);
+    });
+  }
+});

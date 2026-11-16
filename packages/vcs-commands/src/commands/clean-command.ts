@@ -1,5 +1,5 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
-import { directoriesOf, type Worktree } from "@statewalker/vcs-working-tree";
+import { directoriesOf, type Worktree, wildmatch } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
 import { removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
 
@@ -255,7 +255,14 @@ export class CleanCommand extends GitCommand<CleanResult> {
         n.tracked = tracked.has(entry.path);
         n.gitDir = entry.name === ".git" || parent.gitDir;
         if (entry.isDirectory && entry.mode === FileMode.GITLINK) {
-          n.repository = worktree.isRepository ? await worktree.isRepository(entry.path) : true;
+          const state = worktree.repositoryState
+            ? await worktree.repositoryState(entry.path)
+            : worktree.isRepository && !(await worktree.isRepository(entry.path))
+              ? "none"
+              : "unknown";
+          n.repository = state !== "none";
+          // a `.git` that cannot be checked here: never removed, not even with -ff
+          n.unverified = state === "unknown";
         }
         parent.children.push(n);
         nodes.set(entry.path, n);
@@ -296,7 +303,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
     const repositories: string[] = [];
     const remove = (n: CleanNode): boolean => {
       if (n.repository) {
-        if (!this.forceNested) {
+        if (!this.forceNested || n.unverified) {
           skipped.add(n.path);
           return false;
         }
@@ -351,6 +358,8 @@ interface CleanNode {
   gitDir?: boolean;
   /** A directory whose listing failed */
   unreadable?: boolean;
+  /** A `.git` that cannot be checked here (beyond the root, unreadable): kept always */
+  unverified?: boolean;
   /** A nested repository whose content was loaded (the index tracks paths in it) */
   entered?: boolean;
   children: CleanNode[];
@@ -364,7 +373,7 @@ const node = (path: string, directory: boolean): CleanNode => ({
   children: [],
 });
 
-// ============ git's pathspec matching (dir.c match_pathspec_item) ============
+// ============ git's pathspec matching (pathspec.c, dir.c match_pathspec_item) ============
 
 const MATCHED_RECURSIVELY = 1;
 const MATCHED_RECURSIVELY_LEADING_PATHSPEC = 2;
@@ -372,88 +381,127 @@ const MATCHED_FNMATCH = 3;
 const MATCHED_EXACTLY = 4;
 const DO_MATCH_DIRECTORY = 1;
 const DO_MATCH_LEADING_PATHSPEC = 2;
+const DO_MATCH_EXCLUDE = 4;
 
-/** One pathspec element (no magic): its text, literal prefix and glob. */
+/** One pathspec element as git's `init_pathspec_item` parses it. */
 interface PathspecItem {
+  /** The path from the top of the worktree (normalised), without its magic */
   match: string;
+  /** The length of its leading literal part (git's `nowildcard_len`) */
   nowildcardLen: number;
   /** `*` followed by no other wildcard after the literal prefix (git's ONESTAR) */
   oneStar: boolean;
-  /** The part after the literal prefix as a wildmatch without WM_PATHNAME */
-  glob?: RegExp;
+  /** `:(exclude)` / `:!` / `:^`: a path it matches is left out */
+  exclude: boolean;
+  /** `:(glob)`: wildmatch with WM_PATHNAME (`*` stops at `/`, `**` spans directories) */
+  glob: boolean;
+  /** `:(icase)`: case-insensitive */
+  icase: boolean;
+}
+
+/** git's characters that may introduce short pathspec magic (`GIT_PATHSPEC_MAGIC`). */
+const SHORT_MAGIC_CHARS = new Set([..."!\"#%&',-;<=>@_`~^/"]);
+
+/**
+ * The pathspec elements as git's `parse_pathspec` reads them from the top of the worktree:
+ * short magic (`:/` top, `:!` and `:^` exclude) and long magic (`:(top,literal,glob,icase,
+ * exclude)`), the path normalised as `prefix_path` does (`.`, `..`, repeated slashes; above
+ * the top refused), and an implicit `.` when every element excludes.
+ */
+function parsePathspec(paths: string[]): PathspecItem[] {
+  const items = paths.map(parsePathspecItem);
+  if (items.length > 0 && items.every((i) => i.exclude)) {
+    items.push(parsePathspecItem("."));
+  }
+  return items;
+}
+
+function parsePathspecItem(elem: string): PathspecItem {
+  let exclude = false;
+  let literal = false;
+  let glob = false;
+  let icase = false;
+  let rest = elem;
+  if (elem.startsWith(":(")) {
+    const end = elem.indexOf(")");
+    if (end < 0) throw new Error(`Missing ')' at the end of pathspec magic in '${elem}'`);
+    for (const raw of elem.slice(2, end).split(",")) {
+      const name = raw.trim();
+      if (name === "" || name === "top") continue;
+      if (name === "literal") literal = true;
+      else if (name === "glob") glob = true;
+      else if (name === "icase") icase = true;
+      else if (name === "exclude") exclude = true;
+      else if (name.startsWith("attr:") || name === "attr") {
+        throw new Error(`Unsupported pathspec magic 'attr' in '${elem}'`);
+      } else throw new Error(`Invalid pathspec magic '${name}' in '${elem}'`);
+    }
+    rest = elem.slice(end + 1);
+  } else if (elem.startsWith(":")) {
+    let pos = 1;
+    for (; pos < elem.length && elem[pos] !== ":"; pos++) {
+      const ch = elem[pos];
+      if (ch === "!" || ch === "^") exclude = true;
+      else if (ch === "/") {
+        // top: the paths are from the top already
+      } else if (!SHORT_MAGIC_CHARS.has(ch)) break;
+      else throw new Error(`Unimplemented pathspec magic '${ch}' in '${elem}'`);
+    }
+    if (elem[pos] === ":") pos++;
+    rest = elem.slice(pos);
+  }
+  if (literal && glob) throw new Error("'literal' and 'glob' are incompatible");
+  const match = normalizePathspecPath(rest, elem);
+  let nowildcardLen = match.length;
+  if (!literal) {
+    nowildcardLen = 0;
+    while (nowildcardLen < match.length && !isGlobSpecial(match[nowildcardLen])) nowildcardLen++;
+  }
+  const after = match.slice(nowildcardLen + 1);
+  const oneStar =
+    !glob &&
+    nowildcardLen < match.length &&
+    match[nowildcardLen] === "*" &&
+    ![...after].some((c) => isGlobSpecial(c));
+  return { match, nowildcardLen, oneStar, exclude, glob, icase };
 }
 
 const isGlobSpecial = (c: string) => c === "*" || c === "?" || c === "[" || c === "\\";
 
-/** The pathspec elements as git parses them from the top of the worktree. */
-function parsePathspec(paths: string[]): PathspecItem[] {
-  return paths.map((raw) => {
-    let match = raw.replace(/\/{2,}/g, "/");
-    while (match.startsWith("./")) match = match.slice(2);
-    if (match === ".") match = "";
-    let nowildcardLen = 0;
-    while (nowildcardLen < match.length && !isGlobSpecial(match[nowildcardLen])) nowildcardLen++;
-    const rest = match.slice(nowildcardLen + 1);
-    const oneStar =
-      nowildcardLen < match.length &&
-      match[nowildcardLen] === "*" &&
-      ![...rest].some((c) => isGlobSpecial(c));
-    const glob =
-      nowildcardLen < match.length ? wildmatchRegExp(match.slice(nowildcardLen)) : undefined;
-    return { match, nowildcardLen, oneStar, glob };
-  });
-}
-
-/** git's wildmatch without WM_PATHNAME: `*` and `?` match `/` too. */
-function wildmatchRegExp(pattern: string): RegExp {
-  let out = "";
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
-    if (c === "\\" && i + 1 < pattern.length) {
-      out += escapeRegExp(pattern[++i]);
-    } else if (c === "*") out += "[\\s\\S]*";
-    else if (c === "?") out += "[\\s\\S]";
-    else if (c === "[") {
-      let j = i + 1;
-      let negate = false;
-      if (pattern[j] === "!" || pattern[j] === "^") {
-        negate = true;
-        j++;
-      }
-      let body = "";
-      let first = true;
-      while (j < pattern.length && (first || pattern[j] !== "]")) {
-        const ch = pattern[j];
-        if (ch === "\\" && j + 1 < pattern.length) {
-          body += escapeRegExp(pattern[++j]);
-        } else if (ch === "-" && !first && pattern[j + 1] && pattern[j + 1] !== "]") {
-          body += "-";
-        } else body += escapeRegExp(ch);
-        first = false;
-        j++;
-      }
-      if (j >= pattern.length) out += "\\[";
-      else {
-        out += `[${negate ? "^" : ""}${body}]`;
-        i = j;
-      }
-    } else out += escapeRegExp(c);
+/** git's `normalize_path_copy` of a path from the top (trailing slash kept; "." is ""). */
+function normalizePathspecPath(path: string, elem: string): string {
+  const trailing = path.endsWith("/") && path.replace(/\/+$/, "") !== "";
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) throw new Error(`'${elem}' is outside repository`);
+      out.pop();
+    } else out.push(part);
   }
-  return new RegExp(`^${out}$`);
+  const joined = out.join("/");
+  return joined && trailing ? `${joined}/` : joined;
 }
 
-const escapeRegExp = (c: string) => c.replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&");
+/** git's `ps_strncmp` / `ps_strcmp`: equal, case-insensitively for `:(icase)`. */
+const psEqual = (item: PathspecItem, a: string, b: string) =>
+  item.icase ? a.toLowerCase() === b.toLowerCase() : a === b;
 
 /** git's `git_fnmatch` of an element against a name. */
 function pathspecFnmatch(item: PathspecItem, name: string): boolean {
   const prefix = item.nowildcardLen;
-  if (prefix > 0 && name.slice(0, prefix) !== item.match.slice(0, prefix)) return false;
-  const string = name.slice(prefix);
-  if (item.oneStar) {
-    const tail = item.match.slice(prefix + 1);
-    return string.length >= tail.length && string.endsWith(tail);
+  if (prefix > 0 && !psEqual(item, name.slice(0, prefix), item.match.slice(0, prefix))) {
+    return false;
   }
-  return item.glob?.test(string) ?? false;
+  const string = name.slice(prefix);
+  const pattern = item.match.slice(prefix);
+  if (item.oneStar) {
+    const tail = pattern.slice(1);
+    return (
+      string.length >= tail.length && psEqual(item, string.slice(string.length - tail.length), tail)
+    );
+  }
+  return wildmatch(pattern, string, { pathname: item.glob, casefold: item.icase });
 }
 
 /** git's `match_pathspec_item`. */
@@ -462,29 +510,47 @@ function matchPathspecItem(item: PathspecItem, name: string, flags: number): num
   const matchlen = match.length;
   const namelen = name.length;
   if (matchlen === 0) return MATCHED_RECURSIVELY;
-  if (matchlen <= namelen && name.slice(0, matchlen) === match) {
+  if (matchlen <= namelen && psEqual(item, name.slice(0, matchlen), match)) {
     if (matchlen === namelen) return MATCHED_EXACTLY;
     if (match[matchlen - 1] === "/" || name[matchlen] === "/") return MATCHED_RECURSIVELY;
   } else if (
     flags & DO_MATCH_DIRECTORY &&
     match[matchlen - 1] === "/" &&
     namelen === matchlen - 1 &&
-    match.slice(0, namelen) === name
+    psEqual(item, match.slice(0, namelen), name)
   ) {
     return MATCHED_EXACTLY;
   }
   if (item.nowildcardLen < matchlen && pathspecFnmatch(item, name)) return MATCHED_FNMATCH;
-  if (flags & DO_MATCH_LEADING_PATHSPEC) {
+  if (flags & DO_MATCH_LEADING_PATHSPEC && !(flags & DO_MATCH_EXCLUDE)) {
     const offset = name.endsWith("/") ? 1 : 0;
-    if (namelen < matchlen && match[namelen - offset] === "/" && match.slice(0, namelen) === name) {
+    if (
+      namelen < matchlen &&
+      match[namelen - offset] === "/" &&
+      psEqual(item, match.slice(0, namelen), name)
+    ) {
       return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
     }
     const n = item.nowildcardLen;
-    if (n < matchlen && name.slice(0, n) !== match.slice(0, n)) return 0;
+    if (n < matchlen && !psEqual(item, name.slice(0, n), match.slice(0, n))) return 0;
     if (n === matchlen) return 0;
     return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
   }
   return 0;
+}
+
+/** git's `match_pathspec_with_flags`: the best positive match, unless an exclude matches. */
+function matchPathspec(items: PathspecItem[], name: string, flags: number): number {
+  if (items.length === 0) return MATCHED_RECURSIVELY;
+  let positive = 0;
+  for (const item of items) {
+    if (!item.exclude) positive = Math.max(positive, matchPathspecItem(item, name, flags));
+  }
+  if (!positive || !items.some((i) => i.exclude)) return positive;
+  for (const item of items) {
+    if (item.exclude && matchPathspecItem(item, name, flags | DO_MATCH_EXCLUDE)) return 0;
+  }
+  return positive;
 }
 
 // ============ git's directory scan for clean (dir.c read_directory) ============
@@ -529,10 +595,7 @@ class DirectoryScan {
   ) {}
 
   private match(name: string, flags: number): number {
-    if (this.o.pathspec.length === 0) return MATCHED_RECURSIVELY;
-    let best = 0;
-    for (const item of this.o.pathspec) best = Math.max(best, matchPathspecItem(item, name, flags));
-    return best;
+    return matchPathspec(this.o.pathspec, name, flags);
   }
 
   private get hasPathspec(): boolean {
@@ -568,7 +631,7 @@ class DirectoryScan {
     if (!this.hasPathspec) return false;
     for (const item of this.o.pathspec) {
       const len = Math.min(item.nowildcardLen, path.length);
-      if (item.match.slice(0, len) === path.slice(0, len)) return false;
+      if (psEqual(item, item.match.slice(0, len), path.slice(0, len))) return false;
     }
     return true;
   }
@@ -596,7 +659,11 @@ class DirectoryScan {
       if (!matchesHow) return PATH_NONE;
     }
     if (n.repository) {
-      if (this.o.skipNestedGit || matchesHow === MATCHED_RECURSIVELY_LEADING_PATHSPEC) {
+      if (
+        this.o.skipNestedGit ||
+        n.unverified ||
+        matchesHow === MATCHED_RECURSIVELY_LEADING_PATHSPEC
+      ) {
         return PATH_NONE;
       }
       return excluded ? PATH_EXCLUDED : PATH_UNTRACKED;
@@ -660,13 +727,14 @@ class DirectoryScan {
 
   /** git's `common_prefix_len`: the leading directories every element starts with. */
   private commonPrefix(): string {
-    const items = this.o.pathspec;
+    // exclude elements do not count; an icase one has no literal prefix beyond the cwd's
+    const items = this.o.pathspec.filter((item) => !item.exclude);
     if (items.length === 0) return "";
     let max = 0;
     for (let n = 0; n < items.length; n++) {
       let i = 0;
       let len = 0;
-      const itemLen = items[n].nowildcardLen;
+      const itemLen = items[n].icase ? 0 : items[n].nowildcardLen;
       while (i < itemLen && (n === 0 || i < max)) {
         const c = items[n].match[i];
         if (c !== items[0].match[i]) break;
