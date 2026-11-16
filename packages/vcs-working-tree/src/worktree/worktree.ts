@@ -16,6 +16,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import type { WorkingCopy } from "../working-copy.js";
 import type { WorktreeEntry } from "./types.js";
 
 // Re-export types for consumers
@@ -36,6 +37,33 @@ export interface WorktreeWalkOptions {
   ignorePatterns?: string[];
   /** Maximum depth to traverse (undefined = unlimited) */
   maxDepth?: number;
+  /**
+   * Also list and enter a `.git` inside a directory that holds no repository (an empty or
+   * fake `.git` directory, a dangling `.git` link, a gitfile naming no repository), and the
+   * directory itself: what `git clean` removes there. Nested repositories are still not
+   * entered. Off by default (a `.git` is never listed).
+   */
+  enterNonRepositoryGitDirs?: boolean;
+  /**
+   * Called with the path of each directory whose listing failed (unreadable): the walk goes
+   * on without its content, so a caller removing what it lists keeps that directory.
+   */
+  onUnreadable?: (path: string) => void;
+}
+
+/** Whether a directory holds a repository of its own, as far as the worktree can tell. */
+export type NestedRepositoryState = "repository" | "none" | "unknown";
+
+/** Options for removing a worktree entry. */
+export interface WorktreeRemoveOptions {
+  /** Remove a directory with everything in it */
+  recursive?: boolean;
+  /**
+   * Accept `.git` components that name no repository (what
+   * {@link WorktreeWalkOptions.enterNonRepositoryGitDirs} lists); a real repository's
+   * `.git` is still refused
+   */
+  nonRepositoryGitDirs?: boolean;
 }
 
 /**
@@ -152,13 +180,16 @@ export interface Worktree {
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array> | Uint8Array,
     options?: WorktreeWriteOptions,
   ): Promise<void>;
-  remove(path: string, options?: { recursive?: boolean }): Promise<boolean>;
+  remove(path: string, options?: WorktreeRemoveOptions): Promise<boolean>;
   /**
    * Removes the directory at `path` only if it holds nothing at all (git's `rmdir`): no
    * file, link, directory, `.git`, FIFO or ignored file. Returns whether it was removed.
    * Absent: callers fall back to a check through `walk`.
    */
-  removeEmptyDirectory?(path: string): Promise<boolean>;
+  removeEmptyDirectory?(
+    path: string,
+    options?: Pick<WorktreeRemoveOptions, "nonRepositoryGitDirs">,
+  ): Promise<boolean>;
 
   /**
    * The commit checked out in the submodule at `path` (its `HEAD`), read from its `.git`
@@ -167,11 +198,26 @@ export interface Worktree {
   readGitlinkHead?(path: string): Promise<ObjectId | undefined>;
 
   /**
+   * The repository checked out in the submodule at `path`, opened as a working copy (its
+   * own HEAD, index, config and worktree), so its status can be read as git's
+   * `is_submodule_modified` reads it; undefined when it is not populated or its repository
+   * cannot be read here (beyond the storage's root).
+   */
+  openGitlink?(path: string): Promise<WorkingCopy | undefined>;
+
+  /**
    * Whether the directory at `path` holds a repository of its own: a `.git` directory with
    * `HEAD`, `objects` and `refs` (or a `gitdir:` file), as git's `is_nonbare_repository_dir`.
    * An empty `.git` directory is none.
    */
   isRepository?(path: string): Promise<boolean>;
+
+  /**
+   * Whether the directory at `path` holds a repository of its own: `"unknown"` when that
+   * cannot be checked here (its `.git` names a place beyond the storage's root, or cannot be
+   * read). `isRepository` takes an unknown as a repository.
+   */
+  repositoryState?(path: string): Promise<NestedRepositoryState>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
 

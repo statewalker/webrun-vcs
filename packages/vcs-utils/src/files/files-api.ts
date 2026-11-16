@@ -203,6 +203,13 @@ export interface PosixFilesApi extends FilesApi {
    * worktree rooted there must not check out a tree entry of that name (in any case).
    */
   readonly reservedNames?: string[];
+  /**
+   * The real (absolute, platform) directory the storage is rooted at, when it is one (a
+   * local filesystem): an absolute path a repository recorded (a submodule's `gitdir:
+   * /abs/.git/modules/sub`) names a path of this FilesApi when it lies inside it. Absent
+   * where the storage has no such directory (memory, browsers): such paths stay unreadable.
+   */
+  readonly rootDirectory?: string;
   /** Set the permission bits (`mode & 0o777`) of a file; refuses a link */
   chmod?(path: string, mode: number): Promise<void>;
   /**

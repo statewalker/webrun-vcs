@@ -1160,3 +1160,26 @@ describeGit("stash apply follow-ups: gitlinks moved aside, kept edits, wording",
     expect(read(join(dir, "u.txt"))).toBe("local\n");
   });
 });
+
+describeGit("stash apply never pairs empty files as renames (merge-ort)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-empty-rename-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("an empty file moved upstream and modified in the stash: DU at the old path, as git", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    writeFileSync(join(dir, "e.txt"), "");
+    run(dir, "add", "e.txt");
+    run(dir, "commit", "-qm", "empty");
+    writeFileSync(join(dir, "e.txt"), "stashed\n");
+    run(dir, "stash", "-q");
+    mkdirSync(join(dir, "moved"));
+    run(dir, "mv", "e.txt", "moved/e.txt");
+    run(dir, "commit", "-qm", "move");
+    const { expected } = await expectAsNative(dir, ["e.txt", "moved/e.txt"]);
+    expect(expected.ok).toBe(false);
+    expect(status(dir)).toContain("DU e.txt");
+  });
+});

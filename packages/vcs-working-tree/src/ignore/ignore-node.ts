@@ -7,7 +7,7 @@
 
 import type { IgnoreNode, IgnoreRule, MatchResultValue } from "./ignore-manager.js";
 import { MatchResult } from "./ignore-manager.js";
-import { createIgnoreRule } from "./ignore-rule.js";
+import { createIgnoreRule, trimTrailingSpaces } from "./ignore-rule.js";
 
 /**
  * Create an ignore node from optional initial rules.
@@ -30,7 +30,11 @@ class GitIgnoreNode implements IgnoreNode {
   }
 
   parse(content: string): void {
-    const lines = content.split(/\r?\n/);
+    // as git's add_patterns_from_buffer: a line's CR goes, then its unescaped trailing
+    // spaces; empty lines and comments are skipped
+    const lines = content
+      .split("\n")
+      .map((line) => trimTrailingSpaces(line.endsWith("\r") ? line.slice(0, -1) : line));
     let _lineNumber = 1;
 
     for (const line of lines) {
@@ -78,7 +82,10 @@ class GitIgnoreNode implements IgnoreNode {
     // Parse rules in reverse order (later rules have higher priority)
     for (let i = this._rules.length - 1; i >= 0; i--) {
       const rule = this._rules[i];
-      if (rule.isMatchWithMode(entryPath, isDirectory, true)) {
+      const matched = rule.matchesPath
+        ? rule.matchesPath(entryPath, isDirectory)
+        : rule.isMatchWithMode(entryPath, isDirectory, true);
+      if (matched) {
         // Return true if ignoring, false if negated (un-ignoring)
         return !rule.isNegated;
       }

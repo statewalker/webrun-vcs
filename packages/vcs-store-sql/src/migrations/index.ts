@@ -309,6 +309,21 @@ export const migrations: Migration[] = [
       DROP TABLE IF EXISTS vcs_shallow;
     `,
   },
+  {
+    version: 8,
+    name: "staging_meta",
+    // the staging area's own "index time" (the time of its last write), which git's racy
+    // check compares entry mtimes with (SQLStaging.getUpdateTime)
+    up: `
+      CREATE TABLE IF NOT EXISTS staging_meta (
+        name TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      );
+    `,
+    down: `
+      DROP TABLE IF EXISTS staging_meta;
+    `,
+  },
 ];
 
 /**

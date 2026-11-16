@@ -271,19 +271,31 @@ export async function* findUntrackedFiles(
      * holding tracked paths is descended into (git treats it as an ordinary directory)
      */
     hasTrackedUnder?: (dir: string) => boolean;
+    /**
+     * Whether the index has a submodule (gitlink) at a path: its directory is never entered,
+     * populated or not (a deinitialised submodule's leftover files are not untracked)
+     */
+    isGitlink?: (path: string) => boolean;
   } = {},
 ): AsyncIterable<UntrackedFile> {
   const includeIgnored = options.includeIgnored ?? false;
   const ignoredDirs: string[] = [];
   const inIgnoredDir = (path: string) => ignoredDirs.some((dir) => path.startsWith(`${dir}/`));
+  const skippedDirs: string[] = [];
+  const inSkippedDir = (path: string) => skippedDirs.some((dir) => path.startsWith(`${dir}/`));
   const visit = async function* (pathPrefix?: string): AsyncIterable<UntrackedFile> {
     for await (const entry of worktree.walk({
       includeIgnored,
       includeDirectories: true,
       ...(pathPrefix ? { pathPrefix } : {}),
     })) {
+      if (inSkippedDir(entry.path)) continue;
       const ignored = entry.isIgnored || inIgnoredDir(entry.path);
       if (entry.isDirectory) {
+        if (options.isGitlink?.(entry.path)) {
+          skippedDirs.push(entry.path);
+          continue;
+        }
         if (entry.isIgnored) ignoredDirs.push(entry.path);
         if (entry.mode !== FileMode.GITLINK || isTracked(entry.path)) continue;
         if (options.hasTrackedUnder?.(entry.path)) {

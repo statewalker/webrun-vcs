@@ -10,7 +10,12 @@ import type {
   StagingEntry,
   StagingEntryOptions,
 } from "@statewalker/vcs-working-tree";
-import { MergeStage } from "@statewalker/vcs-working-tree";
+import {
+  EntriesAsRead,
+  MergeStage,
+  type RacyCheck,
+  smudgeRacilyClean,
+} from "@statewalker/vcs-working-tree";
 
 /**
  * In-memory staging store implementation.
@@ -23,6 +28,9 @@ import { MergeStage } from "@statewalker/vcs-working-tree";
 export class MemoryStagingStore implements Staging {
   private _entries: StagingEntry[] = [];
   private updateTime: number = Date.now();
+  private racyCheck?: RacyCheck;
+  /** The entries as last read or written: only these are checked for smudging */
+  private readonly asRead = new EntriesAsRead();
 
   // ============ Reading Operations ============
 
@@ -299,12 +307,26 @@ export class MemoryStagingStore implements Staging {
   // ============ Persistence (No-op for in-memory) ============
 
   async read(): Promise<void> {
-    // No-op for in-memory store
+    // nothing to load; the entries are now as read
+    this.asRead.remember(this._entries);
   }
 
   async write(): Promise<void> {
-    // No-op for in-memory store
+    // git's smudging of racily clean entries, against the time of the last write
+    this._entries = await smudgeRacilyClean(this._entries, this.updateTime, this.racyCheck, (e) =>
+      this.asRead.has(e),
+    );
+    this.asRead.remember(this._entries);
     this.updateTime = Date.now();
+  }
+
+  /**
+   * Sets the check every write applies to racily clean entries (git's smudging): an entry
+   * kept from before the write, whose mtime second is not older than the last write and
+   * whose content changed behind a matching stat, is stored with size 0.
+   */
+  setRacyCheck(check: RacyCheck | undefined): void {
+    this.racyCheck = check;
   }
 
   async isOutdated(): Promise<boolean> {
@@ -356,9 +378,14 @@ export class MemoryStagingStore implements Staging {
     });
   }
 
-  /** @internal - Used by builder/editor */
-  _replaceEntries(newEntries: StagingEntry[]): void {
-    this._entries = newEntries;
+  /**
+   * @internal - Used by builder/editor: a write. Entries kept from before it are smudged
+   * when racily clean and changed (against the time of the previous write), as git does.
+   */
+  async _replaceEntries(newEntries: StagingEntry[]): Promise<void> {
+    this._entries = await smudgeRacilyClean(newEntries, this.updateTime, this.racyCheck, (e) =>
+      this.asRead.has(e),
+    );
     this.updateTime = Date.now();
   }
 
@@ -469,7 +496,7 @@ class MemoryStagingBuilder implements IndexBuilder {
     this.validateStages();
 
     // Replace store entries
-    this.store._replaceEntries(this._entries);
+    await this.store._replaceEntries(this._entries);
   }
 
   private validateStages(): void {
@@ -575,7 +602,7 @@ class MemoryStagingEditor implements IndexEditor {
       }
     }
 
-    this.store._replaceEntries(newEntries);
+    await this.store._replaceEntries(newEntries);
   }
 
   private applyConflictResolution(

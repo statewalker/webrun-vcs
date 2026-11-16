@@ -4,9 +4,9 @@ import type { StageStateValue } from "@statewalker/vcs-working-tree";
 /**
  * One column of `git status --porcelain`: `X` (the index against HEAD) or `Y` (the
  * worktree against the index). `" "` unchanged, `M` modified, `T` type changed, `A` added,
- * `D` deleted, `U` unmerged, `?` untracked, `!` ignored.
+ * `D` deleted, `R` renamed, `U` unmerged, `?` untracked, `!` ignored.
  */
-export type StatusCode = " " | "M" | "T" | "A" | "D" | "U" | "?" | "!";
+export type StatusCode = " " | "M" | "T" | "A" | "D" | "R" | "U" | "?" | "!";
 
 /** A side of a path: its mode and object id. */
 export interface StatusSide {
@@ -37,6 +37,20 @@ export interface StatusFileEntry {
   worktreeMode?: number;
   /** A submodule whose checked-out commit differs from the index's (porcelain v2 `SC..`) */
   submoduleCommitChanged?: boolean;
+  /** A submodule with tracked changes inside it (porcelain v2 `S.M.`) */
+  submoduleModified?: boolean;
+  /** A submodule with untracked files inside it (porcelain v2 `S..U`) */
+  submoduleUntracked?: boolean;
+  /**
+   * A renamed path's old path (`R  old -> new`): `index` `R` for a rename in the index
+   * (`head` is then the old path's HEAD entry), `worktree` `R` for a worktree file renamed
+   * to an intent-to-add path (`head` and `staged` are the old path's index entry)
+   */
+  renamedFrom?: string;
+  /** The rename's similarity, in percent (git's `R<score>`) */
+  renameScore?: number;
+  /** An intent-to-add entry (`git add -N`) */
+  intentToAdd?: boolean;
   /** An unmerged path's stages 1-3 (base, ours, theirs) */
   stages?: [StatusSide | undefined, StatusSide | undefined, StatusSide | undefined];
 }
@@ -54,6 +68,19 @@ export interface Status {
   readonly changed: Set<string>;
   /** Files removed from the index (in HEAD, not in the index). */
   readonly removed: Set<string>;
+  /**
+   * Renamed paths, new path to old path: in the index (a removed path paired with an added
+   * one, `R `) or in the worktree (a deleted file paired with an intent-to-add one, ` R`).
+   * Both paths stay in `added`/`removed` (or `missing`) too.
+   */
+  readonly renamed: Map<string, string>;
+  /**
+   * git's warnings about this status, as git's diff prints them: when inexact rename
+   * detection was skipped for too many candidates ("exhaustive rename detection was skipped
+   * due to too many files.", with the rename limit that would be needed). `git status`
+   * itself prints none of them.
+   */
+  readonly warnings: string[];
   /** Files with merge conflicts (unmerged index entries). */
   readonly conflicting: Set<string>;
   /** The kind of each conflict (both modified, deleted by them, ...). */
@@ -95,6 +122,8 @@ export class StatusImpl implements Status {
   readonly ignored: Set<string>;
   readonly conflictingStageState: Map<string, StageStateValue>;
   readonly files: StatusFileEntry[];
+  readonly renamed: Map<string, string>;
+  readonly warnings: string[];
 
   constructor(
     public readonly added: Set<string>,
@@ -108,6 +137,8 @@ export class StatusImpl implements Status {
       ignored?: Set<string>;
       conflictingStageState?: Map<string, StageStateValue>;
       files?: StatusFileEntry[];
+      renamed?: Map<string, string>;
+      warnings?: string[];
     } = {},
   ) {
     this.modified = worktree.modified ?? new Set();
@@ -116,6 +147,8 @@ export class StatusImpl implements Status {
     this.ignored = worktree.ignored ?? new Set();
     this.conflictingStageState = worktree.conflictingStageState ?? new Map();
     this.files = worktree.files ?? [];
+    this.renamed = worktree.renamed ?? new Map();
+    this.warnings = worktree.warnings ?? [];
   }
 
   isClean(): boolean {
@@ -144,6 +177,21 @@ function comparePaths(a: string, b: string): number {
 }
 
 const ZERO_ID = "0".repeat(40);
+
+/**
+ * The submodule field of a porcelain v2 line: `N...` for a path that is no submodule, else
+ * `S` and whether its commit changed (`C`), it has tracked changes (`M`) and untracked files
+ * (`U`) inside, as `SC.U`.
+ */
+export function submoduleToken(e: StatusFileEntry): string {
+  const gitlink = 0o160000;
+  const isSubmodule =
+    e.staged?.mode === gitlink || e.head?.mode === gitlink || e.worktreeMode === gitlink;
+  if (!isSubmodule) return "N...";
+  return `S${e.submoduleCommitChanged ? "C" : "."}${e.submoduleModified ? "M" : "."}${
+    e.submoduleUntracked ? "U" : "."
+  }`;
+}
 const octal = (mode: number | undefined) => (mode ?? 0).toString(8).padStart(6, "0");
 
 /**
@@ -179,7 +227,8 @@ function quotePath(path: string, quoteSpace = false): string {
  * The status as `git status --porcelain` (v1) or `--porcelain=v2` prints it, with
  * `--untracked-files=all` (and the ignored files when the status has them): the changed
  * tracked paths first, then the untracked, then the ignored ones, each in git's path order.
- * Renames are not detected (as `-c status.renames=false`).
+ * A rename is one line at its new path: `R  old -> new` (v1), `2 R. ... R<score> new<TAB>old`
+ * (v2).
  *
  * @example
  * ```typescript
@@ -201,13 +250,30 @@ export function formatStatusPorcelain(status: Status, version: 1 | 2 = 1): strin
   const lines: string[] = [];
   for (const e of tracked) {
     const path = quotePath(e.path, version === 1);
+    const from = e.renamedFrom !== undefined ? quotePath(e.renamedFrom, version === 1) : undefined;
     if (version === 1) {
-      lines.push(`${e.index}${e.worktree} ${path}`);
+      lines.push(`${e.index}${e.worktree} ${from !== undefined ? `${from} -> ` : ""}${path}`);
       continue;
     }
     const xy = `${e.index === " " ? "." : e.index}${e.worktree === " " ? "." : e.worktree}`;
-    const isSubmodule = e.staged?.mode === 0o160000 || e.head?.mode === 0o160000;
-    const sub = isSubmodule ? `S${e.submoduleCommitChanged ? "C" : "."}..` : "N...";
+    const sub = submoduleToken(e);
+    if (from !== undefined) {
+      lines.push(
+        [
+          "2",
+          xy,
+          sub,
+          octal(e.head?.mode),
+          octal(e.staged?.mode),
+          octal(e.worktreeMode),
+          e.head?.id ?? ZERO_ID,
+          e.staged?.id ?? ZERO_ID,
+          `R${e.renameScore ?? 100}`,
+          `${path}\t${from}`,
+        ].join(" "),
+      );
+      continue;
+    }
     if (e.stages) {
       const [s1, s2, s3] = e.stages;
       lines.push(

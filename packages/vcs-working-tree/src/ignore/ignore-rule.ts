@@ -10,6 +10,7 @@
  * - Anchored patterns: /pattern
  */
 
+import { wildmatch } from "./git-wildmatch.js";
 import type { IgnoreRule } from "./ignore-manager.js";
 
 const PATH_SEPARATOR = "/";
@@ -43,6 +44,7 @@ class GitIgnoreRule implements IgnoreRule {
   readonly dirOnly: boolean;
   readonly isEmpty: boolean;
   private matcher: IMatcher;
+  private readonly git: GitPattern | undefined;
 
   constructor(originalPattern: string) {
     if (originalPattern == null) {
@@ -50,58 +52,13 @@ class GitIgnoreRule implements IgnoreRule {
     }
 
     this.pattern = originalPattern;
-    let pattern = originalPattern;
-
-    if (pattern.length === 0) {
-      this.isNegated = false;
-      this.dirOnly = false;
-      this.isEmpty = true;
-      this.matcher = NO_MATCH;
-      return;
-    }
-
-    // Handle negation
-    this.isNegated = pattern.charAt(0) === "!";
-    if (this.isNegated) {
-      pattern = pattern.substring(1);
-      if (pattern.length === 0) {
-        this.dirOnly = false;
-        this.isEmpty = true;
-        this.matcher = NO_MATCH;
-        return;
-      }
-    }
-
-    // Skip comments
-    if (pattern.charAt(0) === "#") {
-      this.dirOnly = false;
-      this.isEmpty = true;
-      this.matcher = NO_MATCH;
-      return;
-    }
-
-    // Handle escaped special characters
-    if (pattern.charAt(0) === "\\" && pattern.length > 1) {
-      const next = pattern.charAt(1);
-      if (next === "!" || next === "#") {
-        pattern = pattern.substring(1);
-      }
-    }
-
-    // Check if directory-only pattern
-    this.dirOnly = isDirectoryPattern(pattern);
-    if (this.dirOnly) {
-      pattern = stripTrailingWhitespace(pattern);
-      pattern = stripTrailing(pattern, PATH_SEPARATOR);
-      if (pattern.length === 0) {
-        this.isEmpty = true;
-        this.matcher = NO_MATCH;
-        return;
-      }
-    }
-
-    this.isEmpty = false;
-    this.matcher = createPathMatcher(pattern, this.dirOnly);
+    this.git = parseGitPattern(originalPattern);
+    const legacy = parseLegacy(originalPattern);
+    this.isNegated = originalPattern.startsWith("!");
+    this.dirOnly = legacy.dirOnly;
+    this.matcher = legacy.matcher;
+    // empty as git reads it: a comment, or nothing left once `!` and a trailing `/` go
+    this.isEmpty = !this.git || this.git.pattern.length === 0;
   }
 
   isMatch(path: string, isDirectory: boolean): boolean {
@@ -114,6 +71,133 @@ class GitIgnoreRule implements IgnoreRule {
     }
     return this.matcher.matchesPath(path, isDirectory, pathMatch);
   }
+
+  matchesPath(path: string, isDirectory: boolean): boolean {
+    if (!this.git || !path) return false;
+    return matchGitPattern(this.git, path.replace(/^\/+/, ""), isDirectory);
+  }
+}
+
+/** JGit's parsing of a pattern (for `isMatch` / `isMatchWithMode`); never throws. */
+function parseLegacy(originalPattern: string): { dirOnly: boolean; matcher: IMatcher } {
+  let pattern = originalPattern;
+  if (pattern.length === 0) return { dirOnly: false, matcher: NO_MATCH };
+  if (pattern.charAt(0) === "!") {
+    pattern = pattern.substring(1);
+    if (pattern.length === 0) return { dirOnly: false, matcher: NO_MATCH };
+  }
+  if (pattern.charAt(0) === "#") return { dirOnly: false, matcher: NO_MATCH };
+  if (pattern.charAt(0) === "\\" && pattern.length > 1) {
+    const next = pattern.charAt(1);
+    if (next === "!" || next === "#") pattern = pattern.substring(1);
+  }
+  const dirOnly = isDirectoryPattern(pattern);
+  if (dirOnly) {
+    pattern = stripTrailingWhitespace(pattern);
+    pattern = stripTrailing(pattern, PATH_SEPARATOR);
+    if (pattern.length === 0) return { dirOnly, matcher: NO_MATCH };
+  }
+  try {
+    return { dirOnly, matcher: createPathMatcher(pattern, dirOnly) };
+  } catch {
+    return { dirOnly, matcher: NO_MATCH };
+  }
+}
+
+// ============ git's pattern matching (dir.c) ============
+
+/** A `.gitignore` line as git's `parse_path_pattern` reads it. */
+interface GitPattern {
+  /** The pattern, without `!` and the trailing `/` */
+  pattern: string;
+  /** The length of its leading literal part (git's `nowildcardlen`) */
+  nowildcardLen: number;
+  /** No slash in it: matched against the last component (`PATTERN_FLAG_NODIR`) */
+  nodir: boolean;
+  /** Ends with `/`: only a directory (`PATTERN_FLAG_MUSTBEDIR`) */
+  mustBeDir: boolean;
+  /** `*literal` (`PATTERN_FLAG_ENDSWITH`) */
+  endsWith: boolean;
+}
+
+const isGlobSpecialChar = (c: string) => c === "*" || c === "?" || c === "[" || c === "\\";
+const simpleLength = (s: string) => {
+  let i = 0;
+  while (i < s.length && !isGlobSpecialChar(s[i])) i++;
+  return i;
+};
+
+/**
+ * git's `trim_trailing_spaces`: trailing spaces go unless escaped with a backslash.
+ *
+ * @example
+ * ```typescript
+ * trimTrailingSpaces("a  "); // "a"
+ * trimTrailingSpaces("a\\ "); // "a\\ "
+ * ```
+ */
+export function trimTrailingSpaces(line: string): string {
+  let lastSpace = -1;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === " ") {
+      if (lastSpace < 0) lastSpace = i;
+    } else if (c === "\\") {
+      i++;
+      if (i >= line.length) return line;
+      lastSpace = -1;
+    } else lastSpace = -1;
+  }
+  return lastSpace >= 0 ? line.slice(0, lastSpace) : line;
+}
+
+/** git's `parse_path_pattern`; undefined for a comment. */
+function parseGitPattern(line: string): GitPattern | undefined {
+  if (line.length === 0 || line.startsWith("#")) return undefined;
+  let p = line;
+  if (p.startsWith("!")) p = p.slice(1);
+  let len = p.length;
+  let mustBeDir = false;
+  if (len && p[len - 1] === "/") {
+    len--;
+    mustBeDir = true;
+  }
+  const pattern = p.slice(0, len);
+  const nodir = !pattern.includes("/");
+  const nowildcardLen = Math.min(simpleLength(p), len);
+  const endsWith = p.startsWith("*") && simpleLength(p.slice(1)) === p.length - 1;
+  return { pattern, nowildcardLen, nodir, mustBeDir, endsWith };
+}
+
+/** git's `match_basename` and `match_pathname` (base: the ignore file's directory). */
+function matchGitPattern(g: GitPattern, path: string, isDirectory: boolean): boolean {
+  if (g.mustBeDir && !isDirectory) return false;
+  const { pattern } = g;
+  const patternlen = pattern.length;
+  if (g.nodir) {
+    const basename = path.slice(path.lastIndexOf("/") + 1);
+    if (g.nowildcardLen === patternlen) return patternlen > 0 && pattern === basename;
+    if (g.endsWith) {
+      const tail = pattern.slice(1);
+      return tail.length <= basename.length && basename.endsWith(tail);
+    }
+    return wildmatch(pattern, basename);
+  }
+  let pat = pattern;
+  let prefix = g.nowildcardLen;
+  if (pat.startsWith("/")) {
+    pat = pat.slice(1);
+    prefix--;
+  }
+  let name = path;
+  if (prefix > 0) {
+    if (prefix > name.length) return false;
+    if (pat.slice(0, prefix) !== name.slice(0, prefix)) return false;
+    pat = pat.slice(prefix);
+    name = name.slice(prefix);
+    if (!pat.length && !name.length) return true;
+  }
+  return wildmatch(pat, name, { pathname: true });
 }
 
 // ============ Pattern State Detection ============
@@ -543,7 +627,9 @@ class NameMatcher implements IMatcher {
           return true; // Has children, so it's a directory
         }
 
-        // For pathMatch, we need exact match - but this is nameOnly so match anywhere
+        // pathMatch: the pattern names the path itself (its last component), as git
+        // matches it; directories above are the caller's to check
+        if (pathMatch) return isLastSegment;
         return true;
       }
     }
@@ -578,12 +664,12 @@ class NameMatcher implements IMatcher {
           }
           return assumeDirectory;
         }
-        // Has more segments, so it's definitely a directory
-        return true;
+        // Has more segments, so it's definitely a directory (pathMatch: not the path itself)
+        return !pathMatch;
       }
 
-      // Regular match at root
-      return true;
+      // Regular match at root (pathMatch: the path itself, a single component)
+      return !pathMatch || segments.length === 1;
     }
 
     // Non-anchored simple pattern - shouldn't reach here for nameOnly=false
@@ -620,7 +706,7 @@ class WildCardMatcher implements IMatcher {
     return this.regex.test(toMatch);
   }
 
-  matchesPath(path: string, assumeDirectory: boolean, _pathMatch: boolean): boolean {
+  matchesPath(path: string, assumeDirectory: boolean, pathMatch: boolean): boolean {
     // Normalize path (remove leading /)
     let p = path;
     if (p.startsWith(PATH_SEPARATOR)) {
@@ -630,6 +716,18 @@ class WildCardMatcher implements IMatcher {
     const segments = p.split(PATH_SEPARATOR).filter((s) => s.length > 0);
     if (segments.length === 0) {
       return false;
+    }
+
+    // git matches a pattern against the path itself: a name-only pattern against its last
+    // component, an anchored one-component pattern against a path of one component, a
+    // directory-only pattern only against a directory. Directories above the path are the
+    // caller's to check (a path inside an excluded directory is excluded; a negated
+    // directory pattern re-includes the directory, never the files below it).
+    if (pathMatch) {
+      if (this.beginning && segments.length !== 1) return false;
+      const last = segments[segments.length - 1];
+      if (!this.regex.test(last)) return false;
+      return !this.dirOnly || assumeDirectory;
     }
 
     // If anchored (starts with /), only match first segment
@@ -674,7 +772,7 @@ class LeadingAsteriskMatcher implements IMatcher {
     return toMatch.endsWith(this.suffix);
   }
 
-  matchesPath(path: string, assumeDirectory: boolean, _pathMatch: boolean): boolean {
+  matchesPath(path: string, assumeDirectory: boolean, pathMatch: boolean): boolean {
     // Normalize path (remove leading /)
     let p = path;
     if (p.startsWith(PATH_SEPARATOR)) {
@@ -684,6 +782,18 @@ class LeadingAsteriskMatcher implements IMatcher {
     const segments = p.split(PATH_SEPARATOR).filter((s) => s.length > 0);
     if (segments.length === 0) {
       return false;
+    }
+
+    // git matches a pattern against the path itself: a name-only pattern against its last
+    // component, an anchored one-component pattern against a path of one component, a
+    // directory-only pattern only against a directory. Directories above the path are the
+    // caller's to check (a path inside an excluded directory is excluded; a negated
+    // directory pattern re-includes the directory, never the files below it).
+    if (pathMatch) {
+      if (this.beginning && segments.length !== 1) return false;
+      const last = segments[segments.length - 1];
+      if (!last.endsWith(this.suffix)) return false;
+      return !this.dirOnly || assumeDirectory;
     }
 
     // If anchored (starts with /), only match first segment
@@ -728,7 +838,7 @@ class TrailingAsteriskMatcher implements IMatcher {
     return toMatch.startsWith(this.prefix);
   }
 
-  matchesPath(path: string, assumeDirectory: boolean, _pathMatch: boolean): boolean {
+  matchesPath(path: string, assumeDirectory: boolean, pathMatch: boolean): boolean {
     // Normalize path (remove leading /)
     let p = path;
     if (p.startsWith(PATH_SEPARATOR)) {
@@ -738,6 +848,18 @@ class TrailingAsteriskMatcher implements IMatcher {
     const segments = p.split(PATH_SEPARATOR).filter((s) => s.length > 0);
     if (segments.length === 0) {
       return false;
+    }
+
+    // git matches a pattern against the path itself: a name-only pattern against its last
+    // component, an anchored one-component pattern against a path of one component, a
+    // directory-only pattern only against a directory. Directories above the path are the
+    // caller's to check (a path inside an excluded directory is excluded; a negated
+    // directory pattern re-includes the directory, never the files below it).
+    if (pathMatch) {
+      if (this.beginning && segments.length !== 1) return false;
+      const last = segments[segments.length - 1];
+      if (!last.startsWith(this.prefix)) return false;
+      return !this.dirOnly || assumeDirectory;
     }
 
     // If anchored (starts with /), only match first segment

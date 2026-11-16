@@ -9,7 +9,12 @@ import {
   StoreNotAvailableError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
-import { DEFAULT_RENAME_SCORE, SimilarityIndex } from "../rename/index.js";
+import {
+  DEFAULT_RENAME_SCORE,
+  detectRenames,
+  type RenameCandidate,
+  SimilarityIndex,
+} from "../rename/index.js";
 import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-result.js";
 import type { StashApplyResult } from "../results/stash-result.js";
 import { StashApplyStatus } from "../results/stash-result.js";
@@ -719,58 +724,33 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
   }
 
   /**
-   * The paths `side` renamed from `base`: a deleted path paired with an added one holding
-   * the same blob, else (text files) the most similar added one scoring at least
-   * {@link DEFAULT_RENAME_SCORE}, as git's rename detection.
+   * The paths `side` renamed from `base`: deleted paths paired with added ones as git's
+   * rename detection pairs them (exact renames, then the best scoring at least 50%,
+   * within the rename limit), shared with `status`.
    */
   private async detectRenames(
     base: Map<string, CheckedEntry>,
     side: Map<string, CheckedEntry>,
   ): Promise<Map<string, string>> {
-    const deleted = [...base.keys()].filter((p) => !side.has(p));
-    const added = new Set([...side.keys()].filter((p) => !base.has(p)));
+    const candidate = (path: string, e: CheckedEntry): RenameCandidate => ({
+      path,
+      mode: e.mode,
+      id: e.objectId,
+    });
+    const deleted = [...base].filter(([p]) => !side.has(p)).map(([p, e]) => candidate(p, e));
+    const added = [...side].filter(([p]) => !base.has(p)).map(([p, e]) => candidate(p, e));
     const renames = new Map<string, string>();
-    if (deleted.length === 0 || added.size === 0) return renames;
-    for (const from of deleted) {
-      const blob = base.get(from)?.objectId;
-      const to = [...added].find((p) => side.get(p)?.objectId === blob);
-      if (to) {
-        renames.set(from, to);
-        added.delete(to);
-      }
-    }
-    // inexact renames, bounded as git's rename limit bounds them
-    const left = deleted.filter((p) => !renames.has(p));
-    if (left.length === 0 || added.size === 0 || left.length * added.size > 1000) return renames;
-    const read = async (e?: CheckedEntry) => {
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of (await this.blobs.load(e?.objectId ?? "")) ?? [])
-        chunks.push(chunk);
-      return concatBytes(chunks);
-    };
-    const candidates = new Map<string, SimilarityIndex>();
-    for (const p of added) {
-      const bytes = await read(side.get(p));
-      if (!SimilarityIndex.isBinary(bytes)) candidates.set(p, SimilarityIndex.create(bytes));
-    }
-    for (const from of left) {
-      const bytes = await read(base.get(from));
-      if (SimilarityIndex.isBinary(bytes)) continue;
-      const index = SimilarityIndex.create(bytes);
-      let best: string | undefined;
-      let bestScore = DEFAULT_RENAME_SCORE - 1;
-      for (const [to, other] of candidates) {
-        const score = index.score(other);
-        if (score > bestScore) {
-          best = to;
-          bestScore = score;
-        }
-      }
-      if (best) {
-        renames.set(from, best);
-        candidates.delete(best);
-      }
-    }
+    if (deleted.length === 0 || added.length === 0) return renames;
+    const pairs = await detectRenames(deleted, added, {
+      // merge-ort never pairs empty files
+      renameEmpty: false,
+      load: async (c) => {
+        const chunks: Uint8Array[] = [];
+        for await (const chunk of (await this.blobs.load(c.id)) ?? []) chunks.push(chunk);
+        return concatBytes(chunks);
+      },
+    });
+    for (const pair of pairs) renames.set(pair.from, pair.to);
     return renames;
   }
 

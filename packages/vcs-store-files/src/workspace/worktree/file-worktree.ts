@@ -32,16 +32,27 @@ import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { collect } from "@statewalker/vcs-utils/streams";
 import type {
   IgnoreManager,
+  NestedRepositoryState,
   NewHasher,
   Worktree,
   WorktreeCapabilities,
   WorktreeCheckoutOptions,
   WorktreeCheckoutResult,
   WorktreeEntry,
+  WorktreeRemoveOptions,
   WorktreeWalkOptions,
   WorktreeWriteOptions,
 } from "@statewalker/vcs-working-tree";
-import { createIgnoreManager, hashWorktreeFile } from "@statewalker/vcs-working-tree";
+import {
+  createIgnoreManager,
+  hashWorktreeFile,
+  MemoryCheckout,
+  MemoryWorkingCopy,
+  type WorkingCopy,
+} from "@statewalker/vcs-working-tree";
+import { createGitFilesBackend } from "../../create-git-files-backend.js";
+import { FileStagingStore } from "../staging/index.js";
+import { createWorkingCopyConfig } from "../working-copy/index.js";
 import { type CaseFolding, probeCaseFolding } from "./probe-case-folding.js";
 
 /**
@@ -221,6 +232,11 @@ export class FileWorktree implements Worktree {
       includeIgnored,
       includeDirectories,
       options?.maxDepth,
+      0,
+      {
+        enterNonRepositoryGitDirs: options?.enterNonRepositoryGitDirs === true,
+        onUnreadable: options?.onUnreadable,
+      },
     );
   }
 
@@ -233,6 +249,9 @@ export class FileWorktree implements Worktree {
     includeDirectories: boolean,
     maxDepth?: number,
     currentDepth = 0,
+    extra: { enterNonRepositoryGitDirs: boolean; onUnreadable?: (path: string) => void } = {
+      enterNonRepositoryGitDirs: false,
+    },
   ): AsyncIterable<WorktreeEntry> {
     if (maxDepth !== undefined && currentDepth > maxDepth) {
       return;
@@ -249,6 +268,8 @@ export class FileWorktree implements Worktree {
         entries.push(entry);
       }
     } catch {
+      // unreadable: its content is unknown (reported, so nothing is removed on a guess)
+      extra.onUnreadable?.(relativePath);
       return;
     }
 
@@ -259,7 +280,10 @@ export class FileWorktree implements Worktree {
       const fullPath = joinPath(dirPath, entry.name);
 
       if (entry.name === ".git") {
-        continue;
+        // the worktree's own repository, or a nested one: never listed; a `.git` in a
+        // directory that holds no repository is listed on request (git clean removes it)
+        if (!extra.enterNonRepositoryGitDirs || relativePath === "") continue;
+        if (await this.isRepository(relativePath)) continue;
       }
 
       // the entry itself: a symbolic link is a file of its own, never descended into
@@ -304,7 +328,9 @@ export class FileWorktree implements Worktree {
         yield worktreeEntry;
       }
 
-      if (isDirectory && !hasGitDir) {
+      const enter =
+        !hasGitDir || (extra.enterNonRepositoryGitDirs && !(await this.isRepository(entryPath)));
+      if (isDirectory && enter) {
         yield* this.walkDirectory(
           loaded,
           files,
@@ -314,6 +340,7 @@ export class FileWorktree implements Worktree {
           includeDirectories,
           maxDepth,
           currentDepth + 1,
+          extra,
         );
       }
     }
@@ -439,19 +466,9 @@ export class FileWorktree implements Worktree {
     // check (once per batch), never through a link
     await this.loadIgnoresFor(path, this.batchIgnores ?? new Set<string>());
 
-    // Check if it's a directory
-    let isDir = false;
-    try {
-      const fullPath = joinPath(this.rootPath, path);
-      for await (const _ of this.files.list(fullPath)) {
-        isDir = true;
-        break;
-      }
-    } catch {
-      // Not a directory
-    }
-
-    return this.ignoreManager.isIgnored(path, isDir);
+    // a directory (an empty one too), never a link to one: as git's lstat decides
+    const kind = await this.kindOrError(joinPath(this.rootPath, path));
+    return this.ignoreManager.isIgnored(path, kind === "directory");
   }
 
   // ========== Writing ==========
@@ -531,8 +548,8 @@ export class FileWorktree implements Worktree {
    * included). A directory is removed only with `recursive`; without it, it is left in
    * place and `false` returned.
    */
-  async remove(path: string, options?: { recursive?: boolean }): Promise<boolean> {
-    assertValidWorktreePath(path, undefined, this.pathRules);
+  async remove(path: string, options?: WorktreeRemoveOptions): Promise<boolean> {
+    await this.assertRemovablePath(path, options?.nonRepositoryGitDirs === true);
     // beneath a link or a file the path is absent (git's has_symlink_or_noent_leading_path)
     if (!this.files.refusesBeyondLinks && (await this.hasLinkOrFileLeading(path))) return false;
     const fullPath = joinPath(this.rootPath, path);
@@ -550,8 +567,11 @@ export class FileWorktree implements Worktree {
    * directory holding anything, a nested repository's `.git` or a FIFO included, stays.
    * Never follows a link: a link (or anything else) at `path` is not removed.
    */
-  async removeEmptyDirectory(path: string): Promise<boolean> {
-    assertValidWorktreePath(path, undefined, this.pathRules);
+  async removeEmptyDirectory(
+    path: string,
+    options?: Pick<WorktreeRemoveOptions, "nonRepositoryGitDirs">,
+  ): Promise<boolean> {
+    await this.assertRemovablePath(path, options?.nonRepositoryGitDirs === true);
     if (!this.files.refusesBeyondLinks && (await this.hasLinkOrFileLeading(path))) return false;
     const fullPath = joinPath(this.rootPath, path);
     const kind = await this.kindOf(fullPath).catch((error: unknown) => {
@@ -565,40 +585,161 @@ export class FileWorktree implements Worktree {
     return this.files.remove(fullPath);
   }
 
+  /**
+   * Refuses a path git's `verify_path` refuses, except (on request) `.git` components that
+   * name no repository: each must be exactly `.git` in a directory {@link isRepository}
+   * finds no repository in (anything it cannot check counts as one).
+   */
+  private async assertRemovablePath(path: string, nonRepositoryGitDirs: boolean): Promise<void> {
+    if (!nonRepositoryGitDirs || !path.split("/").includes(".git")) {
+      assertValidWorktreePath(path, undefined, this.pathRules);
+      return;
+    }
+    const parts = path.split("/");
+    const checked: string[] = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === ".git") {
+        const dir = parts.slice(0, i).join("/");
+        if (i === 0 || (await this.isRepository(dir))) {
+          throw new Error(`Invalid worktree path: ${JSON.stringify(path)}`);
+        }
+        checked.push("_");
+      } else checked.push(parts[i]);
+    }
+    assertValidWorktreePath(checked.join("/"), undefined, this.pathRules);
+  }
+
+  /**
+   * The path in this FilesApi a gitfile's `gitdir:` names: relative to the gitlink's
+   * directory (`../.git/modules/sub`, as git submodule writes it), or absolute (older git,
+   * `--separate-git-dir`) when it lies inside the real directory this FilesApi is rooted at
+   * (`rootDirectory`). Undefined when it lies beyond what this FilesApi can name: outside
+   * its root, or absolute where the root's real directory is unknown.
+   */
+  private gitfileTarget(path: string, target: string): string | undefined {
+    const windows = this.windowsPaths;
+    const absolute = target.startsWith("/") || (windows && /^[A-Za-z]:[\\/]/.test(target));
+    if (!absolute) return resolveDots(joinPath(this.rootPath, path, target));
+    const root = this.rootFiles.rootDirectory;
+    if (!root) return undefined;
+    const slashes = (p: string) => (windows ? p.replace(/\\/g, "/") : p);
+    const realTarget = resolveDots(slashes(target));
+    const realRoot = resolveDots(slashes(root));
+    if (realTarget === undefined || realRoot === undefined) return undefined;
+    const same = (a: string, b: string) =>
+      windows ? a.toLowerCase() === b.toLowerCase() : a === b;
+    const base = realRoot.endsWith("/") ? realRoot.slice(0, -1) : realRoot;
+    if (same(realTarget, base)) return "/";
+    if (!same(realTarget.slice(0, base.length + 1), `${base}/`)) return undefined;
+    return realTarget.slice(base.length);
+  }
+
+  /** The `gitdir:` a `.git` file names, if it is a regular file starting so. */
+  private async readGitfile(dotGit: string): Promise<string | undefined> {
+    // a regular file only: never a link, and never a FIFO (reading one would block)
+    if (this.files.lstat) {
+      if ((await this.files.lstat(dotGit))?.kind !== "file") return undefined;
+    } else if ((await this.files.stats(dotGit))?.kind !== "file") return undefined;
+    return new TextDecoder()
+      .decode(await readFile(this.files, dotGit))
+      .trim()
+      .match(/^gitdir: (.+)$/)?.[1];
+  }
+
   async isRepository(path: string): Promise<boolean> {
+    // anything that might be a repository is one here, so nothing is removed on a guess
+    return (await this.repositoryState(path)) !== "none";
+  }
+
+  /**
+   * Whether the directory at `path` holds a repository of its own, as git's
+   * `is_nonbare_repository_dir` decides: `"repository"`, `"none"`, or `"unknown"` when its
+   * `.git` cannot be checked through this FilesApi (a gitfile or link naming a place
+   * beyond its root, a path reached through a link, an unreadable entry).
+   */
+  async repositoryState(path: string): Promise<NestedRepositoryState> {
     const dotGit = joinPath(this.rootPath, path, ".git");
-    const kind = await this.kindOf(dotGit).catch(() => undefined);
+    const kind = await this.kindOrError(dotGit);
+    if (kind === undefined) return "none";
+    if (kind === "error") return "unknown";
     if (kind === "file") {
-      // a gitdir: file names a repository when its target is one; an absolute target (or
-      // one beyond this FilesApi's root) cannot be checked here and is taken as one, so
-      // nothing is removed on a guess
+      // a gitdir: file names a repository when its target is one
       let target: string | undefined;
       try {
-        target = new TextDecoder()
-          .decode(await readFile(this.files, dotGit))
-          .trim()
-          .match(/^gitdir: (.+)$/)?.[1];
+        target = await this.readGitfile(dotGit);
       } catch {
-        return true;
+        return "unknown";
       }
-      if (!target) return false;
-      if (target.startsWith("/")) return true;
-      const resolved = resolveDots(joinPath(this.rootPath, path, target));
-      if (resolved === undefined) return true;
-      // any HEAD (a file, or a link as core.preferSymlinkRefs writes it) makes it one,
-      // as git's validate_headref; only a target without HEAD is not
-      return (await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) !== undefined;
+      if (!target) return "none";
+      const resolved = this.gitfileTarget(path, target);
+      if (resolved === undefined) return "unknown";
+      // any HEAD (a linked worktree's gitdir has no objects of its own: its commondir has)
+      return this.headState(resolved);
     }
-    if (kind !== "directory") return false;
-    const kindAt = (name: string) => this.kindOf(joinPath(dotGit, name)).catch(() => undefined);
-    // git's is_git_directory: a HEAD (file or link), objects and refs (directories, or links
-    // to them); anything that might be a repository is kept rather than removed
-    const dirLike = (k: string | undefined) => k === "directory" || k === "symlink";
-    return (
-      (await kindAt("HEAD")) !== undefined &&
-      dirLike(await kindAt("objects")) &&
-      dirLike(await kindAt("refs"))
-    );
+    if (kind === "symlink") {
+      // a `.git` link (git follows it): its target, when this FilesApi can name it
+      if (await this.isDanglingLink(dotGit, path)) return "none";
+      const bytes = await this.files.readlink?.(dotGit).catch(() => undefined);
+      const resolved = bytes
+        ? this.gitfileTarget(path, new TextDecoder().decode(bytes))
+        : undefined;
+      if (resolved === undefined) return "unknown";
+      const state = await this.headState(resolved);
+      return state === "none" ? "unknown" : state;
+    }
+    if (kind !== "directory") return "none";
+    return this.gitDirectoryState(dotGit);
+  }
+
+  /** Whether the directory at `dir` has a HEAD (file or link): a repository's gitdir. */
+  private async headState(dir: string): Promise<NestedRepositoryState> {
+    const head = await this.kindOrError(joinPath(dir, "HEAD"));
+    if (head === "error") return "unknown";
+    return head === undefined ? "none" : "repository";
+  }
+
+  /**
+   * git's `is_git_directory` for the directory at `dir` (a path in this FilesApi): a HEAD
+   * (a file, or a link as core.preferSymlinkRefs writes it), objects and refs (directories,
+   * or links to them).
+   */
+  private async gitDirectoryState(dir: string): Promise<NestedRepositoryState> {
+    const kindAt = (name: string) => this.kindOrError(joinPath(dir, name));
+    const head = await kindAt("HEAD");
+    if (head === "error") return "unknown";
+    if (head === undefined) return "none";
+    let unknown = false;
+    for (const name of ["objects", "refs"]) {
+      const k = await kindAt(name);
+      if (k === "error" || k === "symlink") unknown = true;
+      else if (k !== "directory") return "none";
+    }
+    return unknown ? "unknown" : "repository";
+  }
+
+  /**
+   * The repository directory of the gitlink at `path` (in this FilesApi): its `.git`
+   * directory, or the directory its `gitdir:` file names. Undefined when the submodule is
+   * not populated or its repository lies beyond this FilesApi's root; a gitfile naming a
+   * place without a HEAD is git's fatal error.
+   */
+  private async gitlinkDir(path: string): Promise<string | undefined> {
+    const dotGit = joinPath(this.rootPath, path, ".git");
+    const kind = await this.kindOf(dotGit).catch(() => undefined);
+    if (kind === "directory") return dotGit;
+    if (kind !== "file") return undefined;
+    const target = await this.readGitfile(dotGit).catch(() => undefined);
+    if (!target) return undefined;
+    // refused when it climbs above the FilesApi's root or lies outside it
+    const resolved = this.gitfileTarget(path, target);
+    if (resolved === undefined) return undefined;
+    const head = await this.kindOrError(joinPath(resolved, "HEAD"));
+    // confirmed absent: git's fatal error; reached through a link, unreadable or not a
+    // regular file: the submodule cannot be read here (no change reported)
+    if (head === undefined) {
+      throw new Error(`fatal: gitfile does not point to a valid repository: ${path}/.git`);
+    }
+    return head === "file" ? resolved : undefined;
   }
 
   async readGitlinkHead(path: string): Promise<ObjectId | undefined> {
@@ -613,28 +754,8 @@ export class FileWorktree implements Worktree {
         return undefined;
       }
     };
-    const dotGit = joinPath(this.rootPath, path, ".git");
-    const kind = await this.kindOf(dotGit).catch(() => undefined);
-    let gitDir: string;
-    if (kind === "directory") gitDir = dotGit;
-    else if (kind === "file") {
-      const pointer = await text(dotGit);
-      const target = pointer?.match(/^gitdir: (.+)$/)?.[1];
-      if (!target) return undefined;
-      // `gitdir: ../.git/modules/sub` (as git submodule writes it): resolved against the
-      // submodule's directory, refused when it climbs above the FilesApi's root
-      const resolved = resolveDots(
-        target.startsWith("/") ? target : joinPath(this.rootPath, path, target),
-      );
-      // an absolute gitdir, or one beyond this FilesApi's root, cannot be read here: the
-      // submodule's commit is unknown (no change reported); one inside without a HEAD is
-      // git's fatal error, not a clean submodule
-      if (resolved === undefined || target.startsWith("/")) return undefined;
-      if ((await this.kindOf(joinPath(resolved, "HEAD")).catch(() => undefined)) !== "file") {
-        throw new Error(`fatal: gitfile does not point to a valid repository: ${path}/.git`);
-      }
-      gitDir = resolved;
-    } else return undefined;
+    const gitDir = await this.gitlinkDir(path);
+    if (gitDir === undefined) return undefined;
     let head = await text(joinPath(gitDir, "HEAD"));
     for (let depth = 0; head?.startsWith("ref: ") && depth < 5; depth++) {
       const ref = head.slice(5).trim();
@@ -648,6 +769,53 @@ export class FileWorktree implements Worktree {
       head = line?.split(" ")[0];
     }
     return head && /^[0-9a-f]{40,64}$/.test(head) ? head : undefined;
+  }
+
+  /**
+   * The repository checked out at the gitlink `path` (a populated submodule) as a working
+   * copy over the same FilesApi: its objects, refs, index, config and worktree. Undefined
+   * when it is not populated (no git directory with HEAD, objects and refs) or its
+   * repository lies beyond this FilesApi's root.
+   */
+  async openGitlink(path: string): Promise<WorkingCopy | undefined> {
+    const gitDir = await this.gitlinkDir(path);
+    if (gitDir === undefined) return undefined;
+    const kindAt = (name: string) => this.kindOf(joinPath(gitDir, name)).catch(() => undefined);
+    // a HEAD that is a file (or a link, core.preferSymlinkRefs): never a FIFO, which
+    // would block the read
+    const headKind = await kindAt("HEAD");
+    if (
+      (headKind !== "file" && headKind !== "symlink") ||
+      (await kindAt("objects")) !== "directory" ||
+      (await kindAt("refs")) !== "directory"
+    ) {
+      return undefined;
+    }
+    const files = this.rootFiles;
+    const { history } = await createGitFilesBackend({ files, gitDir });
+    const staging = new FileStagingStore(files, joinPath(gitDir, "index"));
+    await staging.read();
+    const config = await createWorkingCopyConfig(
+      {
+        read: async (p) => ((await files.exists(p)) ? readFile(files, p) : undefined),
+        write: (p, content) => files.write(p, [content]),
+      },
+      gitDir,
+    );
+    const worktree = new FileWorktree({
+      files,
+      rootPath: joinPath(this.rootPath, path),
+      gitDir,
+      blobs: history.blobs,
+      trees: history.trees,
+      newHasher: this.newHasher,
+    });
+    return new MemoryWorkingCopy({
+      history,
+      checkout: new MemoryCheckout({ staging }),
+      worktree,
+      config,
+    });
   }
 
   async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {
@@ -820,6 +988,35 @@ export class FileWorktree implements Worktree {
   }
 
   /** What is at `fullPath`: `lstat` where the FilesApi has it, else `stats`. */
+  /**
+   * Whether the link at `link` (the `.git` of the directory `dir`) certainly points nowhere:
+   * its target, relative or absolute inside this FilesApi's root, is confirmed absent. A
+   * target that cannot be checked is not dangling.
+   */
+  private async isDanglingLink(link: string, dir: string): Promise<boolean> {
+    try {
+      const bytes = await this.files.readlink?.(link);
+      if (!bytes) return false;
+      const target = this.gitfileTarget(dir, new TextDecoder().decode(bytes));
+      if (target === undefined) return false;
+      return (await this.kindOrError(target)) === undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The kind of entry at `fullPath`, undefined only when it is confirmed absent, `"error"`
+   * when it cannot be checked (beneath a link, unreadable).
+   */
+  private async kindOrError(fullPath: string): Promise<LinkStats["kind"] | "error" | undefined> {
+    try {
+      return await this.kindOf(fullPath);
+    } catch {
+      return "error";
+    }
+  }
+
   private async kindOf(fullPath: string): Promise<LinkStats["kind"] | undefined> {
     if (this.files.lstat) return (await this.files.lstat(fullPath))?.kind;
     return (await this.files.stats(fullPath))?.kind;
