@@ -5,6 +5,7 @@ import {
   getStageState,
   type IndexStatUpdate,
   modeFromWorktree,
+  readConvertedContent,
   refreshIndexStats,
   type StageStateValue,
   statUpdateOf,
@@ -471,6 +472,18 @@ export class StatusCommand extends GitCommand<Status> {
         for (const [candidate] of destinations) {
           candidate.id = await worktree.computeHash(candidate.path);
         }
+        // the worktree side as git's diff reads it: cleaned (convert_to_git) where a
+        // conversion applies, read once for both its size and its content
+        const cleaned = new Map<string, Promise<Uint8Array | undefined>>();
+        const cleanedOf = (c: RenameCandidate) => {
+          if (c.mode === 0o120000) return Promise.resolve(undefined);
+          let found = cleaned.get(c.path);
+          if (!found) {
+            found = readConvertedContent(worktree, c.path);
+            cleaned.set(c.path, found);
+          }
+          return found;
+        };
         const pairs = await detectRenames(
           sources,
           destinations.map(([c]) => c),
@@ -478,9 +491,15 @@ export class StatusCommand extends GitCommand<Status> {
             renameLimit: limit,
             onRenameLimit,
             size: async (c, role) =>
-              role === "source" ? blobSize(c.id) : (await worktree.getEntry(c.path))?.size,
-            load: (c, role) =>
-              role === "source" ? blob(c.id) : concat(worktree.readContent(c.path)),
+              role === "source"
+                ? blobSize(c.id)
+                : ((await cleanedOf(c))?.length ?? (await worktree.getEntry(c.path))?.size),
+            load: async (c, role) => {
+              if (role === "source") return blob(c.id);
+              const converted = await cleanedOf(c);
+              cleaned.delete(c.path);
+              return converted ?? concat(worktree.readContent(c.path));
+            },
           },
         );
         for (const pair of pairs) {

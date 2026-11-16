@@ -33,11 +33,13 @@
 
 import { EMPTY_BLOB_ID, FileMode } from "@statewalker/vcs-core";
 import {
+  basicStatMatches,
   DeleteStagingEntry,
   entryStatOf,
   modeFromWorktree,
   UpdateStagingEntry,
   type Worktree,
+  wholeSeconds,
 } from "@statewalker/vcs-working-tree";
 import { storeWorktreeFile } from "../core-commands/index.js";
 
@@ -66,6 +68,12 @@ export interface AddResult {
 
   /** Total number of files processed */
   readonly totalProcessed: number;
+
+  /**
+   * The warnings git prints while adding (`core.safecrlf=warn`: "in the working copy of
+   * 'x', LF will be replaced by CRLF the next time Git touches it"), in order
+   */
+  readonly warnings: string[];
 }
 
 /**
@@ -148,6 +156,7 @@ export class AddCommand extends GitCommand<AddResult> {
   private all: boolean | undefined;
   private force = false;
   private intentToAdd = false;
+  private renormalize = false;
   private worktreeIterator: Worktree | undefined;
 
   /**
@@ -263,6 +272,29 @@ export class AddCommand extends GitCommand<AddResult> {
   }
 
   /**
+   * Apply the clean conversion freshly to every tracked file and add it again, whatever its
+   * stat says (`git add --renormalize`): after a change of `.gitattributes` or
+   * `core.autocrlf`, the index takes the line endings the new settings give. CRLF already in
+   * the index does not hold the conversion back. Implies {@link setUpdate} (tracked files
+   * only).
+   *
+   * @param renormalize Whether to renormalise
+   * @returns this for chaining
+   */
+  setRenormalize(renormalize: boolean): this {
+    this.checkCallable();
+    this.renormalize = renormalize;
+    return this;
+  }
+
+  /**
+   * Whether renormalisation is enabled.
+   */
+  isRenormalize(): boolean {
+    return this.renormalize;
+  }
+
+  /**
    * Set a custom working tree iterator.
    *
    * Allows using a custom implementation for filesystem access.
@@ -295,7 +327,7 @@ export class AddCommand extends GitCommand<AddResult> {
     // Determine if we're adding all files
     let addAll: boolean;
     if (this.filepatterns.length === 0) {
-      if (this.update || this.all !== undefined) {
+      if (this.update || this.all !== undefined || this.renormalize) {
         addAll = true;
       } else {
         throw new NoFilepatternError("At least one file pattern is required");
@@ -317,14 +349,20 @@ export class AddCommand extends GitCommand<AddResult> {
       );
     }
 
-    // Whether to stage deletions
-    const stageDeletions = this.update || (this.all !== undefined && this.all);
-
-    // Use addAll pattern if needed
-    const patterns = addAll ? ["."] : this.filepatterns;
-
-    // Process files
-    return this.processFiles(worktree, patterns, stageDeletions);
+    // one worktree batch: the ignore rules, the configuration and the attributes files are
+    // read once for all the files
+    const run = () => {
+      if (this.renormalize) {
+        return this.renormalizeFiles(worktree, addAll ? ["."] : this.filepatterns);
+      }
+      // Whether to stage deletions
+      const stageDeletions = this.update || (this.all !== undefined && this.all);
+      // Use addAll pattern if needed
+      const patterns = addAll ? ["."] : this.filepatterns;
+      // Process files
+      return this.processFiles(worktree, patterns, stageDeletions);
+    };
+    return worktree.batch ? worktree.batch(run) : run();
   }
 
   /**
@@ -350,6 +388,7 @@ export class AddCommand extends GitCommand<AddResult> {
     const added: string[] = [];
     const skipped: string[] = [];
     const removed: string[] = [];
+    const warnings: string[] = [];
 
     // Collect files to process
     const filesToProcess: Array<{
@@ -425,6 +464,7 @@ export class AddCommand extends GitCommand<AddResult> {
     const editor = this.staging.createEditor();
     // what the worktree's modes can be trusted for (git's core.filemode / core.symlinks)
     const trust = worktreeModeTrust(this.workingCopy, worktree);
+    const indexTime = this.staging.getUpdateTime();
 
     for (const file of filesToProcess) {
       if (!file.exists) {
@@ -460,12 +500,29 @@ export class AddCommand extends GitCommand<AddResult> {
         continue;
       }
 
+      // git's add_to_index: a tracked file whose stat still matches its entry (and is not
+      // racily clean) is not read again (nor its line endings checked)
+      const indexed = await this.staging.getEntry(file.path);
+      if (
+        indexed &&
+        !indexed.intentToAdd &&
+        indexTime > 0 &&
+        wholeSeconds(indexed.mtime, indexed.mtimeNs) < wholeSeconds(indexTime) &&
+        modeFromWorktree(worktreeEntry.mode, indexed.mode, trust) === indexed.mode &&
+        basicStatMatches(indexed, worktreeEntry, trust)
+      ) {
+        added.push(file.path);
+        continue;
+      }
+
       // Hash and store content
       // the stat that matched the stored content (a fresh one after a retry)
-      const stored = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry);
+      const stored = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry, {
+        onWarning: (message) => warnings.push(message),
+      });
 
       // Add to staging, with the mode git's ce_mode_from_stat would record
-      const indexMode = (await this.staging.getEntry(file.path))?.mode;
+      const indexMode = indexed?.mode;
       const mode = modeFromWorktree(stored.entry.mode, indexMode, trust);
       editor.add(new UpdateStagingEntry(file.path, stored.id, mode, entryStatOf(stored.entry)));
       added.push(file.path);
@@ -482,6 +539,41 @@ export class AddCommand extends GitCommand<AddResult> {
       skipped,
       removed,
       totalProcessed: added.length + removed.length,
+      warnings,
     };
+  }
+
+  /**
+   * git's `renormalize_tracked_files`: every tracked regular file and link (stage 0) the
+   * patterns match is added again, cleaned with renormalisation.
+   */
+  private async renormalizeFiles(worktree: Worktree, patterns: string[]): Promise<AddResult> {
+    const added: string[] = [];
+    const warnings: string[] = [];
+    const editor = this.staging.createEditor();
+    const trust = worktreeModeTrust(this.workingCopy, worktree);
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage !== 0) continue;
+      const kind = entry.mode & 0o170000;
+      if (kind !== 0o100000 && kind !== 0o120000) continue;
+      if (!matchesPattern(entry.path, patterns)) continue;
+      const worktreeEntry = await worktree.getEntry(entry.path);
+      // git's add_file_to_index dies on a tracked file it cannot stat (the index is left
+      // as it was)
+      if (!worktreeEntry) {
+        throw new Error(`unable to stat '${entry.path}': No such file or directory`);
+      }
+      if (worktreeEntry.isDirectory) continue;
+      const stored = await storeWorktreeFile(this.blobs, worktree, entry.path, worktreeEntry, {
+        renormalize: true,
+        onWarning: (message) => warnings.push(message),
+      });
+      const mode = modeFromWorktree(stored.entry.mode, entry.mode, trust);
+      editor.add(new UpdateStagingEntry(entry.path, stored.id, mode, entryStatOf(stored.entry)));
+      added.push(entry.path);
+    }
+    await editor.finish();
+    await this.staging.write();
+    return { added, skipped: [], removed: [], totalProcessed: added.length, warnings };
   }
 }

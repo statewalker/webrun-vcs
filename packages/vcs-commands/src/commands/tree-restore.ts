@@ -10,7 +10,11 @@
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import {
+  attributesIndexOf,
+  type ContentAttributesContext,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
 
 import type { CommandTrees } from "../git-command.js";
 
@@ -218,6 +222,15 @@ async function writePlan(
   operation: string,
   options: TreeWriteOptions,
 ): Promise<void> {
+  // git's check_updates: every file smudged with the attributes of the index the restore
+  // leaves behind (by default the plan's tree), whatever order they are written in
+  const attributes: ContentAttributesContext | undefined =
+    options.attributes === false
+      ? undefined
+      : (options.attributes ?? {
+          direction: "checkout",
+          index: attributesIndexOf(plan.entries.map((e) => [e.path, e.objectId] as const)),
+        });
   for (const { path, objectId, mode } of plan.entries) {
     const content = await blobs.load(objectId);
     if (!content) {
@@ -227,9 +240,12 @@ async function writePlan(
     // without symlinks (core.symlinks=false) a link is a file holding its target
     const written =
       mode === FileMode.SYMLINK && options.symlinks === false ? FileMode.REGULAR_FILE : mode;
-    // the blob streams into the file; it is never held whole in memory
+    // the blob streams into the file; it is never held whole in memory. A link written as
+    // a file holds its target as it is: git never converts it (smudge is for files)
     await worktree.writeContent(path, content, {
       mode: written,
+      ...(written !== mode ? { raw: true } : {}),
+      ...(attributes ? { attributes } : {}),
       createParents: true,
       ...(options.replaceInTheWay ? { replaceInTheWay: true } : {}),
     });
@@ -248,4 +264,11 @@ export interface TreeWriteOptions {
   replaceInTheWay?: boolean;
   /** Create an empty directory for each gitlink (submodule). */
   gitlinks?: boolean;
+  /**
+   * Where the files' attributes are read: by default the plan's own tree (the index a
+   * `reset --hard` or `clone` leaves, git's GIT_ATTR_CHECKOUT); an operation that writes
+   * part of a tree passes the index it leaves behind; `false` reads them as a path checkout
+   * does (`checkout-index`: the worktree's, then the current index's).
+   */
+  attributes?: ContentAttributesContext | false;
 }

@@ -13,6 +13,10 @@
 
 import type { History, ObjectId } from "@statewalker/vcs-core";
 import type { Checkout } from "../checkout/checkout.js";
+import {
+  type ContentFilterSetup,
+  installContentFilter,
+} from "../convert/install-content-filter.js";
 import type { RepositoryStatus, StatusOptions } from "../status/index.js";
 import type {
   CherryPickState,
@@ -35,7 +39,7 @@ import { MemoryStashStore } from "./stash-store.memory.js";
 /**
  * Options for MemoryWorkingCopy
  */
-export interface MemoryWorkingCopyOptions {
+export interface MemoryWorkingCopyOptions extends ContentFilterSetup {
   /** History interface */
   history: History;
   /** Checkout interface */
@@ -75,6 +79,8 @@ export class MemoryWorkingCopy implements WorkingCopy {
     this.worktree = options.worktree;
     this.stash = options.stash ?? new MemoryStashStore();
     this.config = options.config ?? {};
+    // git's clean / smudge (attributes, core.autocrlf, ...) on the worktree's content
+    installContentFilter(this, options);
   }
 
   /**

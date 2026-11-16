@@ -1,5 +1,8 @@
 // Shared types (canonical source)
 
+// The content filter (git's clean / smudge) a worktree applies
+export * from "./content-filter.js";
+export * from "./filtered-content.js";
 // Stream a worktree file through a hasher (size from stat, one retry)
 export * from "./hash-worktree-file.js";
 // Worktree implementations (memory only - file-based moved to store-files)
