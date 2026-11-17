@@ -15,7 +15,7 @@ import {
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
-import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   type Checkout,
@@ -596,17 +596,20 @@ export class OperationState {
 
   async read(name: string): Promise<string | undefined> {
     const bytes = await this.checkout.readStateFile?.(name);
-    return bytes ? new TextDecoder().decode(bytes) : undefined;
+    // a path in a state file (MERGE_MSG's conflicts) is its bytes, as git writes it
+    return bytes ? decodeGitPath(bytes) : undefined;
   }
 
   async write(name: string, content: string | Uint8Array): Promise<void> {
-    await this.checkout.writeStateFile?.(name, content);
+    const bytes = typeof content === "string" ? encodeGitPath(content) : content;
+    await this.checkout.writeStateFile?.(name, bytes);
   }
 
   /** Appends to a state file (O_APPEND where the checkout can; else a rewrite). */
   async append(name: string, content: string): Promise<void> {
     if (this.checkout.appendStateFile) {
-      await this.checkout.appendStateFile(name, content);
+      // the same bytes `write` would store (escaped bytes as themselves)
+      await this.checkout.appendStateFile(name, encodeGitPath(content));
       return;
     }
     await this.write(name, `${(await this.read(name)) ?? ""}${content}`);

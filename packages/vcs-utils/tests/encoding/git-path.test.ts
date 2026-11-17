@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   compareGitPaths,
   decodeGitPath,
+  decodeGitPatternFile,
   encodeGitPath,
   hasEscapedBytes,
+  unquoteGitPath,
 } from "../../src/encoding/index.js";
 
 const bytes = (...b: number[]) => new Uint8Array(b);
@@ -84,5 +86,35 @@ describe("git path encoding", () => {
       }
     }
     expect([...strings].reverse().sort(compareGitPaths)).toEqual(strings);
+  });
+});
+
+describe("decodeGitPatternFile", () => {
+  it("keeps the bytes of a latin-1 pattern and skips a leading BOM only", () => {
+    expect(decodeGitPatternFile(bytes(0x63, 0x61, 0x66, 0xe9, 0x0a))).toBe("caf\udce9\n");
+    expect(decodeGitPatternFile(bytes(0xef, 0xbb, 0xbf, 0x61, 0x0a, 0xef, 0xbb, 0xbf))).toBe(
+      "a\n\ufeff",
+    );
+    expect(decodeGitPatternFile(utf8("*.log\n!café\n"))).toBe("*.log\n!café\n");
+  });
+});
+
+describe("unquoteGitPath", () => {
+  it("unquotes C escapes, octal escapes as the path's bytes", () => {
+    expect(unquoteGitPath(utf8('"caf\\351.txt" rest'))).toEqual({ path: "caf\udce9.txt", end: 13 });
+    expect(unquoteGitPath(utf8('"caf\\303\\251"'))).toEqual({ path: "café", end: 13 });
+    expect(unquoteGitPath(utf8('"t\\ta\\"b\\\\"'))).toEqual({ path: 't\ta"b\\', end: 11 });
+    expect(unquoteGitPath(utf8('x "a"'), 2)).toEqual({ path: "a", end: 5 });
+  });
+
+  it("refuses what is no quoted string", () => {
+    expect(unquoteGitPath(utf8("plain"))).toBeUndefined();
+    expect(unquoteGitPath(utf8('"open'))).toBeUndefined();
+    expect(unquoteGitPath(utf8('"bad\\q"'))).toBeUndefined();
+    expect(unquoteGitPath(utf8('"\\49"'))).toBeUndefined();
+  });
+
+  it("round-trips a raw latin-1 byte inside quotes", () => {
+    expect(unquoteGitPath(bytes(0x22, 0x61, 0xe9, 0x22))?.path).toBe("a\udce9");
   });
 });

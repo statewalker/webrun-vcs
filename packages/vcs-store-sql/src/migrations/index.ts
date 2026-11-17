@@ -324,6 +324,25 @@ export const migrations: Migration[] = [
       DROP TABLE IF EXISTS staging_meta;
     `,
   },
+  {
+    version: 9,
+    name: "sql_path_escape",
+    // paths are stored escaped (sql-path.ts: U+0001 marks an escape, a U+0001 of the path is
+    // doubled); rows written before held a U+0001 as itself (a lone surrogate could not have
+    // survived the driver), so doubling it is all they need
+    up: `
+      UPDATE staging_entry SET path = replace(path, char(1), char(1) || char(1))
+        WHERE instr(path, char(1)) > 0;
+      UPDATE tree_entry SET name = replace(name, char(1), char(1) || char(1))
+        WHERE instr(name, char(1)) > 0;
+    `,
+    down: `
+      UPDATE staging_entry SET path = replace(path, char(1) || char(1), char(1))
+        WHERE instr(path, char(1)) > 0;
+      UPDATE tree_entry SET name = replace(name, char(1) || char(1), char(1))
+        WHERE instr(name, char(1)) > 0;
+    `,
+  },
 ];
 
 /**

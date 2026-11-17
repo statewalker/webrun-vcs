@@ -9,6 +9,7 @@
  * within a line a later state wins; a macro set to true expands to its states.
  */
 
+import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import {
   type AttributeRule,
   type AttributeSetting,
@@ -142,9 +143,7 @@ class ParseCache {
 }
 
 const textOf = (content: string | Uint8Array) =>
-  typeof content === "string"
-    ? content
-    : new TextDecoder("utf-8", { ignoreBOM: true }).decode(content);
+  typeof content === "string" ? content : decodeGitPatternFile(content);
 
 /** The attribute names the patterns of a list of rules assign (a macro by its name). */
 function namedBy(rules: AttributeRule[]): Set<string> {
@@ -179,7 +178,9 @@ export class AttributesResolver {
     const keyed = typeof content === "object" && !(content instanceof Uint8Array);
     const cacheKey = `${macros ? "m" : "-"}${origin}\0${keyed ? `#${content.key}` : textOf(content)}`;
     const rules = this.cache.get(cacheKey, () =>
-      parseAttributes(textOf(keyed ? content.content : content), {
+      // the bytes themselves: `parseAttributes` skips their one BOM (a decoded string would
+      // lose it here and a second one there)
+      parseAttributes(keyed ? content.content : content, {
         source: origin,
         macrosAllowed: macros,
         onWarning: this.options.onWarning,

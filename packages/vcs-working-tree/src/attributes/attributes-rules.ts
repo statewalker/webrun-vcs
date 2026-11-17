@@ -7,7 +7,11 @@
  * (back to unspecified) or `name=value`.
  */
 
-import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import {
+  decodeGitPath,
+  decodeGitPatternFile,
+  encodeGitPath,
+} from "@statewalker/vcs-utils/encoding";
 import { wildmatch } from "../ignore/git-wildmatch.js";
 
 /**
@@ -277,11 +281,9 @@ export function parseAttributes(
     options.onWarning?.(`ignoring overly large gitattributes file '${options.source ?? ""}'`);
     return [];
   }
-  let text =
-    typeof content === "string"
-      ? content
-      : new TextDecoder("utf-8", { ignoreBOM: true }).decode(content);
-  if (text.startsWith("﻿")) text = text.slice(1);
+  // one BOM is skipped, as git does: by the byte decoder, or here for text handed in
+  let text = typeof content === "string" ? content : decodeGitPatternFile(content);
+  if (typeof content === "string" && text.startsWith("﻿")) text = text.slice(1);
   const rules: AttributeRule[] = [];
   const lines = text.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();

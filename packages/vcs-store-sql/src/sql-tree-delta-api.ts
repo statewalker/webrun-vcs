@@ -20,6 +20,7 @@ import type {
 } from "@statewalker/vcs-core";
 import { parseStructuralDelta } from "@statewalker/vcs-core";
 import type { DatabaseClient } from "./database-client.js";
+import { fromSqlPath, toSqlPath } from "./sql-path.js";
 
 /**
  * SQL-based TreeDeltaApi implementation
@@ -114,7 +115,13 @@ export class SqlTreeDeltaApi implements TreeDeltaApi {
       for (const change of parsed.changes) {
         await tx.execute(
           `INSERT INTO tree_delta_entry (target_id, change_type, name, mode, object_id) VALUES (?, ?, ?, ?, ?)`,
-          [targetId, change.type, change.name, change.mode ?? null, change.objectId ?? null],
+          [
+            targetId,
+            change.type,
+            toSqlPath(change.name),
+            change.mode ?? null,
+            change.objectId ?? null,
+          ],
         );
       }
     });
@@ -205,7 +212,7 @@ export class SqlTreeDeltaApi implements TreeDeltaApi {
 
     const changes: TreeDeltaChange[] = entryRows.map((row) => ({
       type: row.change_type as "add" | "modify" | "delete",
-      name: row.name,
+      name: fromSqlPath(row.name),
       mode: row.mode ?? undefined,
       objectId: row.object_id ?? undefined,
     }));

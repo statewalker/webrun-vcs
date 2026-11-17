@@ -20,6 +20,7 @@ import {
   joinPath,
   readFile,
 } from "@statewalker/vcs-core";
+import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import type {
   IgnoreManager,
@@ -312,7 +313,7 @@ export class FileTreeIterator {
     try {
       if (await this.files.exists(gitignorePath)) {
         const content = await readFile(this.files, gitignorePath);
-        const text = new TextDecoder().decode(content);
+        const text = decodeGitPatternFile(content);
         this.ignoreManager.addIgnoreFile(relativePath, text);
       }
     } catch {
@@ -362,7 +363,7 @@ export class FileTreeIterator {
     try {
       if (await this.files.exists(excludePath)) {
         const content = await readFile(this.files, excludePath);
-        const text = new TextDecoder().decode(content);
+        const text = decodeGitPatternFile(content);
         // Add as global patterns (checked after .gitignore files)
         const patterns = text.split("\n").filter((line) => line.trim() !== "");
         this.ignoreManager.addGlobalPatterns(patterns);
@@ -382,7 +383,7 @@ export class FileTreeIterator {
     try {
       if (await this.files.exists(excludesFilePath)) {
         const content = await readFile(this.files, excludesFilePath);
-        const text = new TextDecoder().decode(content);
+        const text = decodeGitPatternFile(content);
         // Add as global patterns (lowest precedence)
         this.ignoreManager.addGlobalPatterns(text.split("\n").filter((line) => line.trim() !== ""));
       }

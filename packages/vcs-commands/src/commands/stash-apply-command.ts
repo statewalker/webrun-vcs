@@ -1,5 +1,6 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { mergeLines } from "@statewalker/vcs-utils";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
@@ -846,5 +847,5 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
 
 /** Byte order of paths, as git sorts an index. */
 function compareBytes(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+  return compareGitPaths(a, b);
 }

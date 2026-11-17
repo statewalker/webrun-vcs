@@ -28,6 +28,7 @@ import {
   type PosixFilesApi,
   readFile,
 } from "@statewalker/vcs-core";
+import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import { collect } from "@statewalker/vcs-utils/streams";
@@ -1252,7 +1253,7 @@ export class FileWorktree implements Worktree {
         try {
           if ((await this.files.lstat?.(path))?.kind === "symlink") return undefined;
           if (!(await this.files.exists(path))) return undefined;
-          return new TextDecoder().decode(await readFile(this.files, path));
+          return decodeGitPatternFile(await readFile(this.files, path));
         } catch {
           return undefined;
         }
@@ -1297,7 +1298,7 @@ export class FileWorktree implements Worktree {
     try {
       if ((await files.lstat?.(gitignorePath))?.kind !== "symlink") {
         if (await files.exists(gitignorePath)) {
-          text = new TextDecoder().decode(await readFile(files, gitignorePath));
+          text = decodeGitPatternFile(await readFile(files, gitignorePath));
         }
       }
     } catch {
@@ -1313,7 +1314,7 @@ export class FileWorktree implements Worktree {
     try {
       if (await this.files.exists(excludePath)) {
         const content = await readFile(this.files, excludePath);
-        const text = new TextDecoder().decode(content);
+        const text = decodeGitPatternFile(content);
         const patterns = text.split("\n").filter((line) => line.trim() !== "");
         this.ignoreManager.addGlobalPatterns(patterns);
       }
@@ -1326,7 +1327,7 @@ export class FileWorktree implements Worktree {
     try {
       if (await this.files.exists(excludesFilePath)) {
         const content = await readFile(this.files, excludesFilePath);
-        const text = new TextDecoder().decode(content);
+        const text = decodeGitPatternFile(content);
         this.ignoreManager.addGlobalPatterns(text.split("\n").filter((line) => line.trim() !== ""));
       }
     } catch {

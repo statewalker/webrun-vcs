@@ -45,6 +45,8 @@ export * from "./ref-store.js";
 // Storage backend (unified interface)
 export * from "./register-backend.js";
 export * from "./sql-delta-api.js";
+// Paths in TEXT columns
+export * from "./sql-path.js";
 export * from "./sql-storage-backend.js";
 export * from "./sql-tree-delta-api.js";
 export * from "./staging-store.js";

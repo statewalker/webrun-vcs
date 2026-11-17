@@ -200,4 +200,25 @@ describe("Schema Migrations", () => {
       ).rejects.toThrow();
     });
   });
+
+  describe("sql_path_escape (9)", () => {
+    it("doubles the U+0001 old rows held, so they read back as they were", async () => {
+      await initializeSchema(db);
+      await rollbackMigration(db, 8);
+      const mark = String.fromCharCode(1);
+      await db.execute(
+        "INSERT INTO staging_entry (path, stage, mode, object_id) VALUES (?, 0, ?, ?)",
+        [`a${mark}b`, 0o100644, "0".repeat(40)],
+      );
+      await db.execute(
+        "INSERT INTO staging_entry (path, stage, mode, object_id) VALUES (?, 0, ?, ?)",
+        ["plain", 0o100644, "0".repeat(40)],
+      );
+      await initializeSchema(db);
+      const rows = await db.query<{ path: string }>("SELECT path FROM staging_entry ORDER BY path");
+      const { fromSqlPath } = await import("../src/sql-path.js");
+      expect(rows.map((r) => fromSqlPath(r.path))).toEqual([`a${mark}b`, "plain"]);
+      expect(rows[0].path).toBe(`a${mark}${mark}b`);
+    });
+  });
 });

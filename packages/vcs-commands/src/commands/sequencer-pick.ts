@@ -7,6 +7,7 @@
  */
 
 import { type Commit, isSymbolicRef, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
@@ -262,7 +263,7 @@ export class PickSequencer {
     const message = this.messageFor(action, item.id, commit, parentId);
 
     if (conflicts.length > 0 || !merge.clean) {
-      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
+      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       // git records REVERT_HEAD for a revert -n too (do_pick_commit), never CHERRY_PICK_HEAD
       if (!this.options.noCommit || action === "revert") {
         await deps.state.setRef(HEAD_REF[action], item.id);

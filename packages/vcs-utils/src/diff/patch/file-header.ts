@@ -9,8 +9,17 @@
  *   +++ b/file.txt
  */
 
+import { unquoteGitPath } from "../../encoding/index.js";
 import { BinaryHunk } from "./binary-hunk.js";
-import { decode, encodeASCII, isHunkHdr, match, nextLF, parseBase10 } from "./buffer-utils.js";
+import {
+  decode,
+  encodeASCII,
+  isHunkHdr,
+  match,
+  nextLF,
+  parseBase10,
+  readPatchPath,
+} from "./buffer-utils.js";
 import { HunkHeader } from "./hunk-header.js";
 import { ChangeType, PatchType } from "./types.js";
 
@@ -157,44 +166,11 @@ export class FileHeader {
       return -1;
     }
 
-    // Skip "diff --git " prefix (11 bytes)
-    const offset = ptr + 11;
-
-    // Find the paths: "a/path b/path"
-    // Look for space separator between the two paths
-    let aStart = offset;
-
-    // Skip "a/" prefix
-    if (offset + 2 < eol && this.buffer[offset] === 0x61 && this.buffer[offset + 1] === 0x2f) {
-      // 'a', '/'
-      aStart = offset + 2;
-    }
-
-    // Find the space between the two paths
-    let sp = aStart;
-    while (sp < eol && this.buffer[sp] !== 0x20) {
-      // ' '
-      sp++;
-    }
-
-    if (sp >= eol) {
-      // No space found - malformed
-      return eol;
-    }
-
-    // Extract old path
-    this.oldPath = decode(this.buffer, aStart, sp);
-
-    // Skip space and "b/" prefix
-    let bStart = sp + 1;
-    if (bStart + 2 < eol && this.buffer[bStart] === 0x62 && this.buffer[bStart + 1] === 0x2f) {
-      // 'b', '/'
-      bStart += 2;
-    }
-
-    // Extract new path
-    this.newPath = decode(this.buffer, bStart, eol - 1); // -1 to skip newline
-
+    // Skip "diff --git " prefix (11 bytes); the line holds "a/<old> b/<new>"
+    const names = parseGitHeaderNames(this.buffer, ptr + 11, eol - 1);
+    if (!names) return eol;
+    this.oldPath = names.oldPath;
+    this.newPath = names.newPath;
     return eol;
   }
 
@@ -231,16 +207,16 @@ export class FileHeader {
       } else if (match(this.buffer, offset, SIMILARITY_INDEX) >= 0) {
         this.score = this.parsePercentage(offset + SIMILARITY_INDEX.length, eol);
       } else if (match(this.buffer, offset, RENAME_FROM) >= 0) {
-        this.oldPath = decode(this.buffer, offset + RENAME_FROM.length, eol - 1);
+        this.oldPath = readPatchPath(this.buffer, offset + RENAME_FROM.length, eol - 1).path;
         this.changeType = ChangeType.RENAME;
       } else if (match(this.buffer, offset, RENAME_TO) >= 0) {
-        this.newPath = decode(this.buffer, offset + RENAME_TO.length, eol - 1);
+        this.newPath = readPatchPath(this.buffer, offset + RENAME_TO.length, eol - 1).path;
         this.changeType = ChangeType.RENAME;
       } else if (match(this.buffer, offset, COPY_FROM) >= 0) {
-        this.oldPath = decode(this.buffer, offset + COPY_FROM.length, eol - 1);
+        this.oldPath = readPatchPath(this.buffer, offset + COPY_FROM.length, eol - 1).path;
         this.changeType = ChangeType.COPY;
       } else if (match(this.buffer, offset, COPY_TO) >= 0) {
-        this.newPath = decode(this.buffer, offset + COPY_TO.length, eol - 1);
+        this.newPath = readPatchPath(this.buffer, offset + COPY_TO.length, eol - 1).path;
         this.changeType = ChangeType.COPY;
       } else if (match(this.buffer, offset, OLD_NAME) >= 0) {
         // Start of actual diff content
@@ -425,7 +401,7 @@ export class FileHeader {
     // Extract path (skip the marker)
     const pathStart = ptr + markerLength;
     const pathEnd = eol - 1; // Skip newline
-    this.oldPath = decode(this.buffer, pathStart, pathEnd);
+    this.oldPath = readPatchPath(this.buffer, pathStart, pathEnd).path;
     this.newPath = this.oldPath;
     ptr = eol;
 
@@ -646,18 +622,18 @@ export class FileHeader {
       ptr++;
     }
 
-    // Find end of path (tab, newline, or end of buffer)
+    // Find end of path (tab, newline, or end of buffer); a quoted path is unquoted
     let pathEnd = ptr;
     while (pathEnd < end) {
       const c = this.buffer[pathEnd];
-      if (c === 0x09 || c === 0x0a || c === 0x0d) {
-        // Tab, LF, or CR
+      if (c === 0x0a || c === 0x0d) {
+        // LF or CR
         break;
       }
       pathEnd++;
     }
 
-    let path = decode(this.buffer, ptr, pathEnd);
+    let { path } = readPatchPath(this.buffer, ptr, pathEnd, true);
 
     // Strip "a/" or "b/" prefix if present (Git-style in traditional)
     if (path.startsWith("a/") || path.startsWith("b/")) {
@@ -673,4 +649,56 @@ export class FileHeader {
   toString(): string {
     return `FileHeader(${this.changeType}: ${this.oldPath} -> ${this.newPath})`;
   }
+}
+
+/**
+ * The two names of a `diff --git a/<old> b/<new>` line (between `start` and `end`), as git's
+ * `git_header_name` finds them: either may be C-quoted (`"a/caf\\351.txt"`); two unquoted
+ * names split at the space where both halves name the same path (names may hold spaces),
+ * else at the first space (a rename, whose `rename from`/`rename to` lines name the paths).
+ * The `a/` and `b/` prefixes go.
+ */
+function parseGitHeaderNames(
+  buffer: Uint8Array,
+  start: number,
+  end: number,
+): { oldPath: string; newPath: string } | undefined {
+  const strip = (path: string, prefix: string) =>
+    path.startsWith(prefix) ? path.slice(prefix.length) : path;
+  const second = (from: number) => {
+    let i = from;
+    while (i < end && buffer[i] === 0x20) i++;
+    return strip(readPatchPath(buffer, i, end).path, "b/");
+  };
+  if (buffer[start] === 0x22) {
+    const first = readPatchPath(buffer, start, end);
+    if (first.end < end && buffer[first.end] === 0x20) {
+      return { oldPath: strip(first.path, "a/"), newPath: second(first.end) };
+    }
+  }
+  // an unquoted first name and a quoted second one
+  for (let sp = start; sp < end - 1; sp++) {
+    if (buffer[sp] !== 0x20 || buffer[sp + 1] !== 0x22) continue;
+    const quoted = unquoteGitPath(buffer, sp + 1, end);
+    if (quoted && quoted.end === end) {
+      return {
+        oldPath: strip(readPatchPath(buffer, start, sp).path, "a/"),
+        newPath: strip(quoted.path, "b/"),
+      };
+    }
+  }
+  // two unquoted names: where both halves are the same path, else the first space
+  let firstSpace = -1;
+  for (let sp = start; sp < end; sp++) {
+    if (buffer[sp] !== 0x20) continue;
+    if (firstSpace < 0) firstSpace = sp;
+    const oldPath = strip(readPatchPath(buffer, start, sp).path, "a/");
+    const newPath = strip(readPatchPath(buffer, sp + 1, end).path, "b/");
+    if (oldPath === newPath) return { oldPath, newPath };
+  }
+  if (firstSpace < 0) return undefined;
+  return {
+    oldPath: strip(readPatchPath(buffer, start, firstSpace).path, "a/"),
+    newPath: strip(readPatchPath(buffer, firstSpace + 1, end).path, "b/"),
+  };
 }

@@ -2,6 +2,7 @@
  * Installing git's content conversion on a working copy's worktree.
  */
 import type { History } from "@statewalker/vcs-core";
+import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import type { Checkout } from "../checkout/checkout.js";
 import type { WorkingCopyConfig } from "../working-copy.js";
 import type { WorktreeContentFilter } from "../worktree/content-filter.js";
@@ -48,7 +49,7 @@ export function installExcludesFile(
         : xdgConfigPath(env, "ignore");
     if (!path) return undefined;
     const content = await env.readFile(path);
-    return content ? new TextDecoder().decode(content) : undefined;
+    return content ? decodeGitPatternFile(content) : undefined;
   });
 }
 

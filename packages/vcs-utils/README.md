@@ -307,6 +307,17 @@ Git paths are bytes, and a tree or index made elsewhere can name a file `caf\xe9
 
 On a host whose file names are bytes, the Node `FilesApi` (`@statewalker/vcs-utils-node/files`) writes and lists such a name as its original bytes. A host whose names are Unicode text cannot hold it: the browser file system APIs (OPFS, File System Access) take well-formed strings and store U+FFFD for each escaped byte, and the macOS and Windows file systems refuse or rewrite names that are not valid Unicode (Node then reports the error of the write). Trees, the index and commits keep the bytes there too; only the worktree file has another name.
 
+```typescript
+import { decodeGitPatternFile, unquoteGitPath } from "@statewalker/vcs-utils/encoding";
+
+decodeGitPatternFile(gitignoreBytes);                // "caf\udce9.txt\n" for a latin-1 rule
+unquoteGitPath(new TextEncoder().encode('"caf\\351.txt"')); // { path: "caf\udce9.txt", end: 13 }
+```
+
+Pattern files are bytes as well. `.gitignore`, `info/exclude`, `core.excludesFile`, `.gitattributes` and `diff.orderFile` are read through the same escapes (`decodeGitPatternFile` also skips a leading BOM, as git does), so a rule written in latin-1 matches the path bytes git matches: `caf\xe9.txt` or `*\xe9*` ignores `caf\xe9.txt` and never the UTF-8 `café.txt`. `unquoteGitPath` is git's `unquote_c_style`; the patch parser reads C-quoted names (`"a/caf\351.txt"`) with it and raw names (`core.quotePath=false`) as their bytes, so a parsed path is the string trees and the index hold.
+
+Text that commands print holds paths too. `DiffCommand.callText()`, `DiffFormatter.toString()` and `formatStatusPorcelain(status, version, { quotePath: false })` decode their bytes the same way: a byte that is not UTF-8 is an escape, never U+FFFD, so `encodeGitPath(text)` gives git's output bytes, and a path cut from the text is the path itself. A SQL store keeps such names in its TEXT columns escaped (`toSqlPath` in `@statewalker/vcs-store-sql`), because drivers turn lone surrogates into U+FFFD; JSON (the key-value stores) writes them as `\udce9` escapes and reads them back unchanged.
+
 ### RPC over a MessagePort
 
 ```typescript

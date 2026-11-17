@@ -6,6 +6,7 @@
 
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type {
   IndexBuilder,
   IndexEdit,
@@ -23,6 +24,7 @@ import {
   smudgeRacilyClean,
 } from "@statewalker/vcs-working-tree";
 import type { DatabaseClient } from "./database-client.js";
+import { fromSqlPath, toSqlPath } from "./sql-path.js";
 
 /**
  * Database row type for staging entry queries
@@ -47,7 +49,7 @@ interface StagingRow {
  */
 function rowToEntry(row: StagingRow): StagingEntry {
   return {
-    path: row.path,
+    path: fromSqlPath(row.path),
     mode: row.mode,
     objectId: row.object_id,
     stage: row.stage as MergeStageValue,
@@ -60,6 +62,15 @@ function rowToEntry(row: StagingRow): StagingEntry {
     intentToAdd: row.intent_to_add === 1,
     skipWorktree: row.skip_worktree === 1,
   };
+}
+
+/**
+ * The entries of rows in git's order of (path, stage): `ORDER BY path` is that order, but
+ * for a path stored escaped (`toSqlPath`).
+ */
+function rowsToSortedEntries(rows: StagingRow[]): StagingEntry[] {
+  const entries = rows.map(rowToEntry);
+  return entries.sort((a, b) => comparePaths(a.path, b.path) || a.stage - b.stage);
 }
 
 /**
@@ -83,7 +94,7 @@ export class SQLStaging implements Staging {
   async getEntryByStage(path: string, stage: MergeStageValue): Promise<StagingEntry | undefined> {
     const rows = await this.db.query<StagingRow>(
       "SELECT * FROM staging_entry WHERE path = ? AND stage = ?",
-      [path, stage],
+      [toSqlPath(path), stage],
     );
 
     return rows.length > 0 ? rowToEntry(rows[0]) : undefined;
@@ -92,7 +103,7 @@ export class SQLStaging implements Staging {
   async getEntries(path: string): Promise<StagingEntry[]> {
     const rows = await this.db.query<StagingRow>(
       "SELECT * FROM staging_entry WHERE path = ? ORDER BY stage",
-      [path],
+      [toSqlPath(path)],
     );
 
     return rows.map(rowToEntry);
@@ -101,7 +112,7 @@ export class SQLStaging implements Staging {
   async hasEntry(path: string): Promise<boolean> {
     const result = await this.db.query<{ cnt: number }>(
       "SELECT COUNT(*) as cnt FROM staging_entry WHERE path = ?",
-      [path],
+      [toSqlPath(path)],
     );
     return result[0].cnt > 0;
   }
@@ -120,8 +131,8 @@ export class SQLStaging implements Staging {
       [],
     );
 
-    for (const row of rows) {
-      yield rowToEntry(row);
+    for (const entry of rowsToSortedEntries(rows)) {
+      yield entry;
     }
   }
 
@@ -130,11 +141,11 @@ export class SQLStaging implements Staging {
 
     const rows = await this.db.query<StagingRow>(
       "SELECT * FROM staging_entry WHERE path = ? OR path LIKE ? ORDER BY path, stage",
-      [prefix, `${normalizedPrefix}%`],
+      [toSqlPath(prefix), `${toSqlPath(normalizedPrefix)}%`],
     );
 
-    for (const row of rows) {
-      yield rowToEntry(row);
+    for (const entry of rowsToSortedEntries(rows)) {
+      yield entry;
     }
   }
 
@@ -152,8 +163,8 @@ export class SQLStaging implements Staging {
       [],
     );
 
-    for (const row of rows) {
-      yield row.path;
+    for (const path of rows.map((row) => fromSqlPath(row.path)).sort(comparePaths)) {
+      yield path;
     }
   }
 
@@ -210,7 +221,7 @@ export class SQLStaging implements Staging {
       "SELECT DISTINCT path FROM staging_entry WHERE stage > 0 ORDER BY path",
       [],
     );
-    return rows.map((row) => row.path);
+    return rows.map((row) => fromSqlPath(row.path)).sort(comparePaths);
   }
 
   async resolveConflict(
@@ -360,7 +371,7 @@ export class SQLStaging implements Staging {
         await this.db.execute(
           `INSERT INTO staging_entry (path, stage, mode, object_id, size, mtime)
            VALUES (?, ?, ?, ?, 0, 0)`,
-          [path, stage, entry.mode, entry.id],
+          [toSqlPath(path), stage, entry.mode, entry.id],
         );
       }
     }
@@ -382,7 +393,7 @@ export class SQLStaging implements Staging {
     for (let i = 0; i < smudged.length; i++) {
       if (smudged[i] === entries[i]) continue;
       await this.db.execute("UPDATE staging_entry SET size = 0 WHERE path = ? AND stage = ?", [
-        smudged[i].path,
+        toSqlPath(smudged[i].path),
         smudged[i].stage,
       ]);
     }
@@ -537,7 +548,7 @@ class SQLIndexBuilder implements IndexBuilder {
         "SELECT * FROM staging_entry ORDER BY path, stage",
         [],
       );
-      const existingEntries = existingRows.map(rowToEntry);
+      const existingEntries = rowsToSortedEntries(existingRows);
 
       for (const { start, count } of this.keeping) {
         for (let i = 0; i < count; i++) {
@@ -581,7 +592,7 @@ class SQLIndexBuilder implements IndexBuilder {
             ctime, dev, ino, assume_valid, intent_to_add, skip_worktree
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            entry.path,
+            toSqlPath(entry.path),
             entry.stage,
             entry.mode,
             entry.objectId,
@@ -661,7 +672,7 @@ class SQLIndexEditor implements IndexEditor {
       "SELECT * FROM staging_entry ORDER BY path, stage",
       [],
     );
-    const existingEntries = existingRows.map(rowToEntry);
+    const existingEntries = rowsToSortedEntries(existingRows);
 
     const newEntries: StagingEntry[] = [];
 
@@ -727,7 +738,7 @@ class SQLIndexEditor implements IndexEditor {
             ctime, dev, ino, assume_valid, intent_to_add, skip_worktree
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            entry.path,
+            toSqlPath(entry.path),
             entry.stage,
             entry.mode,
             entry.objectId,
@@ -776,16 +787,8 @@ class SQLIndexEditor implements IndexEditor {
  * Compare paths using Git's canonical ordering.
  */
 function comparePaths(a: string, b: string): number {
-  const aLen = a.length;
-  const bLen = b.length;
-  const minLen = Math.min(aLen, bLen);
-
-  for (let i = 0; i < minLen; i++) {
-    const diff = a.charCodeAt(i) - b.charCodeAt(i);
-    if (diff !== 0) return diff;
-  }
-
-  return aLen - bLen;
+  // the order of the paths' bytes (git's), an escaped byte of a non-UTF-8 name included
+  return compareGitPaths(a, b);
 }
 
 /**

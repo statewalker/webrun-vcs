@@ -1,6 +1,7 @@
 import type { ObjectId } from "@statewalker/vcs-core";
-import { compareGitPaths, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { StageStateValue } from "@statewalker/vcs-working-tree";
+import { quoteCStyleBody } from "./quote-path.js";
 
 /**
  * One column of `git status --porcelain`: `X` (the index against HEAD) or `Y` (the
@@ -192,32 +193,24 @@ export function submoduleToken(e: StatusFileEntry): string {
 const octal = (mode: number | undefined) => (mode ?? 0).toString(8).padStart(6, "0");
 
 /**
- * git's quoting of a path in status output (`core.quotePath`, on by default); porcelain v1
- * quotes a path with a space too (`QUOTE_PATH_QUOTE_SP`), v2 does not.
+ * git's quoting of a path in status output (`quote_path`): C-quoted when it needs it, bytes
+ * above 0x7f escaped only with `core.quotePath` (on by default); porcelain v1 puts a path
+ * with a space in quotes too (`QUOTE_PATH_QUOTE_SP`), v2 does not.
  */
-function quotePath(path: string, quoteSpace = false): string {
-  const bytes = encodeGitPath(path);
-  let needs = false;
-  let out = "";
-  for (const b of bytes) {
-    if (b === 0x22 || b === 0x5c) {
-      needs = true;
-      out += `\\${String.fromCharCode(b)}`;
-    } else if (b === 0x09) {
-      needs = true;
-      out += "\\t";
-    } else if (b === 0x0a) {
-      needs = true;
-      out += "\\n";
-    } else if (b === 0x20 && quoteSpace) {
-      needs = true;
-      out += " ";
-    } else if (b < 0x20 || b >= 0x7f) {
-      needs = true;
-      out += `\\${b.toString(8).padStart(3, "0")}`;
-    } else out += String.fromCharCode(b);
-  }
-  return needs ? `"${out}"` : path;
+function quoteStatusPath(path: string, quoteSpace: boolean, quotePathFully: boolean): string {
+  const body = quoteCStyleBody(path, quotePathFully);
+  if (body !== undefined) return `"${body}"`;
+  return quoteSpace && path.includes(" ") ? `"${path}"` : path;
+}
+
+/** Options of {@link formatStatusPorcelain}. */
+export interface StatusPorcelainOptions {
+  /**
+   * `core.quotePath` (default true). Off, bytes above 0x7f are printed as they are: a path
+   * that is no UTF-8 keeps its escaped bytes (`decodeGitPath`), so `encodeGitPath` of the
+   * text gives git's output bytes.
+   */
+  quotePath?: boolean;
 }
 
 /**
@@ -233,7 +226,13 @@ function quotePath(path: string, quoteSpace = false): string {
  * // " M a.txt\nA  b.txt\n?? new.txt\n"
  * ```
  */
-export function formatStatusPorcelain(status: Status, version: 1 | 2 = 1): string {
+export function formatStatusPorcelain(
+  status: Status,
+  version: 1 | 2 = 1,
+  options: StatusPorcelainOptions = {},
+): string {
+  const fully = options.quotePath ?? true;
+  const quotePath = (path: string) => quoteStatusPath(path, version === 1, fully);
   const entries = status.files;
   const tracked = entries
     .filter((e) => e.index !== "?" && e.index !== "!")
@@ -246,8 +245,8 @@ export function formatStatusPorcelain(status: Status, version: 1 | 2 = 1): strin
     .sort((a, b) => comparePaths(a.path, b.path));
   const lines: string[] = [];
   for (const e of tracked) {
-    const path = quotePath(e.path, version === 1);
-    const from = e.renamedFrom !== undefined ? quotePath(e.renamedFrom, version === 1) : undefined;
+    const path = quotePath(e.path);
+    const from = e.renamedFrom !== undefined ? quotePath(e.renamedFrom) : undefined;
     if (version === 1) {
       lines.push(`${e.index}${e.worktree} ${from !== undefined ? `${from} -> ` : ""}${path}`);
       continue;
@@ -305,7 +304,7 @@ export function formatStatusPorcelain(status: Status, version: 1 | 2 = 1): strin
     );
   }
   const mark = version === 1 ? ["??", "!!"] : ["?", "!"];
-  for (const e of untracked) lines.push(`${mark[0]} ${quotePath(e.path, version === 1)}`);
-  for (const e of ignored) lines.push(`${mark[1]} ${quotePath(e.path, version === 1)}`);
+  for (const e of untracked) lines.push(`${mark[0]} ${quotePath(e.path)}`);
+  for (const e of ignored) lines.push(`${mark[1]} ${quotePath(e.path)}`);
   return lines.map((l) => `${l}\n`).join("");
 }
