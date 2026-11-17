@@ -17,6 +17,7 @@ import {
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { DatabaseClient } from "../database-client.js";
 import { fromSqlPath, toSqlPath } from "../sql-path.js";
 import type { SqlNativeTreeStore } from "./types.js";
@@ -305,12 +306,14 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
   /**
    * Find tree entries matching a name pattern
    *
-   * Uses SQL LIKE pattern matching (% for any chars, _ for single char). A name that is no
-   * UTF-8 is stored escaped (`toSqlPath`), as is the pattern, so its literal characters
-   * match it; `_` matches one character of the stored form.
+   * Uses SQL LIKE pattern matching (% for any chars, _ for single char; ASCII letters match
+   * in either case, as LIKE does). A name that is no UTF-8 is stored escaped (`toSqlPath`),
+   * as is the pattern, so its literal characters match it; `_` matches one character of the
+   * stored form.
    *
    * @param namePattern LIKE pattern for entry name (e.g., "%.ts", "src%")
-   * @returns Async iterable of matching entries with their tree IDs
+   * @returns Async iterable of matching entries with their tree IDs, by tree id and then
+   *   by name in git's byte order (`compareGitPaths`), the order of the tree's entries
    */
   async *findByNamePattern(
     namePattern: string,
@@ -328,15 +331,19 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
       [toSqlPath(namePattern)],
     );
 
-    for (const row of rows) {
-      yield {
-        treeId: row.tree_id,
-        entry: {
-          mode: row.mode,
-          name: fromSqlPath(row.name),
-          id: row.object_id,
-        },
-      };
-    }
+    // the stored form sorts an escaped byte (U+0001...) before every other character:
+    // the decoded names give git's byte order
+    const found = rows.map((row) => ({
+      treeId: row.tree_id,
+      entry: { mode: row.mode, name: fromSqlPath(row.name), id: row.object_id },
+    }));
+    found.sort((a, b) =>
+      a.treeId === b.treeId
+        ? compareGitPaths(a.entry.name, b.entry.name)
+        : a.treeId < b.treeId
+          ? -1
+          : 1,
+    );
+    yield* found;
   }
 }

@@ -10,7 +10,15 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -28,7 +36,7 @@ import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
 } from "@statewalker/vcs-utils-node/files";
-import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
+import { type GitContentFilter, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { formatStatusPorcelain, Git } from "../src/index.js";
@@ -438,5 +446,195 @@ describeGit("pattern files and patches with bytes that are no UTF-8, against nat
     expect(msg(native)).toContain(`#\tplain\n#\tx\xe9\n#\t${emoji}\n`);
     expect(msg(twin)).toBe(msg(native));
     for (const d of [native, twin]) rmSync(d, { recursive: true, force: true });
+  });
+});
+
+/** `git check-attr -a` of `paths` (as our commands name them), by path: `name=value`, sorted. */
+function nativeAttrs(dir: string, paths: string[]): Map<string, string[]> {
+  const input = Buffer.concat(
+    paths.map((p) => Buffer.concat([Buffer.from(encodeGitPath(p)), Buffer.from([0])])),
+  );
+  const out = execFileSync("git", ["check-attr", "-a", "-z", "--stdin"], {
+    cwd: dir,
+    env: nativeGitEnv(root),
+    input,
+  });
+  const fields: Buffer[] = [];
+  for (let start = 0; start < out.length; ) {
+    const end = out.indexOf(0, start);
+    fields.push(out.subarray(start, end));
+    start = end + 1;
+  }
+  const result = new Map<string, string[]>(paths.map((p) => [p, []]));
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    const path = decodeGitPath(fields[i]);
+    result
+      .get(path)
+      ?.push(`${fields[i + 1].toString("latin1")}=${fields[i + 2].toString("latin1")}`);
+  }
+  for (const list of result.values()) list.sort();
+  return result;
+}
+
+/** Our attributes of `paths`, as {@link nativeAttrs} lists them. */
+async function ourAttrs(dir: string, paths: string[]): Promise<Map<string, string[]>> {
+  const git = await open(dir);
+  const filter = git.worktree?.contentFilter as GitContentFilter;
+  const result = new Map<string, string[]>();
+  for (const path of paths) {
+    const attrs = await filter.attributes(path);
+    result.set(
+      path,
+      [...attrs].map(([k, v]) => `${k}=${v === true ? "set" : v === false ? "unset" : v}`).sort(),
+    );
+  }
+  return result;
+}
+
+describeGit("literal parts of patterns as bytes, and case folding as git folds it", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "non-utf8-literal-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /**
+   * Rules whose literal parts end or start inside a UTF-8 sequence: `sub/caf\xc3*` (a path
+   * prefix ending with the first byte of é, C3 A9), `*\xa9` (a suffix starting with its last
+   * byte), `/t\xc3*` (anchored). git compares them byte by byte, so they take the UTF-8 é.
+   */
+  const halfRules = "sub/caf\xc3*\n*\xa9\n/t\xc3*\n";
+  const halfFiles = [
+    "sub/caf\xc3\xa9.txt",
+    "sub/cafe.txt",
+    "sub/caf\xe9.txt",
+    "x\xc3\xa9",
+    "x\xe9",
+    "t\xc3\xa4",
+    "sub/t\xc3\xa4",
+    "plain",
+  ];
+
+  function buildRepo(rules: { ignore?: string; attributes?: string }, paths: string[]) {
+    const dir = join(root, `literal-${counter++}`);
+    mkdirSync(dir);
+    gitBytes(dir, "init", "-q", "-b", "main");
+    putRaw(dir, "base", "base\n");
+    gitBytes(dir, "add", "base");
+    gitBytes(dir, "commit", "-q", "-m", "base");
+    if (rules.ignore !== undefined) putRaw(dir, ".gitignore", rules.ignore);
+    if (rules.attributes !== undefined) putRaw(dir, ".gitattributes", rules.attributes);
+    for (const path of paths) putRaw(dir, path, `${path}\n`);
+    return dir;
+  }
+
+  it("ignore rules holding half of a UTF-8 sequence: status --ignored agrees with git", async () => {
+    const dir = buildRepo({ ignore: halfRules }, halfFiles);
+    const expected = gitBytes(dir, "status", "--porcelain", "--ignored", "--untracked-files=all");
+    // git takes the UTF-8 names by their bytes
+    expect(expected.toString("latin1")).toContain('!! "sub/caf\\303\\251.txt"\n');
+    expect(expected.toString("latin1")).toContain('!! "x\\303\\251"\n');
+    expect(expected.toString("latin1")).toContain('!! "t\\303\\244"\n');
+    expect(expected.toString("latin1")).toContain('?? "sub/t\\303\\244"\n');
+    const status = await (await open(dir)).status().setIgnored(true).call();
+    expect(Buffer.from(encodeGitPath(formatStatusPorcelain(status))).toString("latin1")).toBe(
+      expected.toString("latin1"),
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("attribute patterns holding half of a UTF-8 sequence: check-attr agrees with git", async () => {
+    const attributes = "sub/caf\xc3* foo\n*\xa9 bar\n/t\xc3* baz\n";
+    const dir = buildRepo({ attributes }, halfFiles);
+    const paths = halfFiles.map(ours);
+    const expected = nativeAttrs(dir, paths);
+    expect(expected.get(ours("sub/caf\xc3\xa9.txt"))).toEqual(["foo=set"]);
+    expect(expected.get(ours("x\xc3\xa9"))).toEqual(["bar=set"]);
+    expect(expected.get(ours("t\xc3\xa4"))).toEqual(["baz=set"]);
+    expect(await ourAttrs(dir, paths)).toEqual(expected);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("core.ignoreCase folds ASCII only: status --ignored and check-attr agree with git", async () => {
+    // *.LOG takes a.log; É* (C3 89) never takes é (C3 A9): git folds no byte beyond ASCII
+    const ignore = "*.LOG\nBUILD/\n\xc3\x89*\nD/X*\n";
+    const attributes = "*.TXT foo\n\xc3\x89* bar\nD/Y* baz\n";
+    const files = ["a.log", "b.txt", "build/out", "\xc3\xa9x", "\xc3\x89y", "d/x1", "d/y1", "keep"];
+    const dir = buildRepo({ ignore, attributes }, files);
+    gitBytes(dir, "config", "core.ignoreCase", "true");
+    const expected = gitBytes(dir, "status", "--porcelain", "--ignored", "--untracked-files=all");
+    expect(expected.toString("latin1")).toContain("!! a.log\n");
+    expect(expected.toString("latin1")).toContain('?? "\\303\\251x"\n');
+    expect(expected.toString("latin1")).toContain('!! "\\303\\211y"\n');
+    const status = await (await open(dir)).status().setIgnored(true).call();
+    expect(Buffer.from(encodeGitPath(formatStatusPorcelain(status))).toString("latin1")).toBe(
+      expected.toString("latin1"),
+    );
+    const paths = files.map(ours);
+    const attrs = nativeAttrs(dir, paths);
+    expect(attrs.get("b.txt")).toEqual(["foo=set"]);
+    expect(attrs.get(ours("\xc3\xa9x"))).toEqual([]);
+    expect(await ourAttrs(dir, paths)).toEqual(attrs);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describeGit("git directory pointers and configuration values that are no UTF-8", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "non-utf8-gitdir-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("a submodule whose gitdir: names a latin-1 directory: status agrees with git", async () => {
+    const source = join(root, `source-${counter++}`);
+    mkdirSync(source);
+    gitBytes(source, "init", "-q", "-b", "main");
+    putRaw(source, "f", "one\n");
+    gitBytes(source, "add", "f");
+    gitBytes(source, "commit", "-q", "-m", "one");
+    const dir = join(root, `super-${counter++}`);
+    mkdirSync(dir);
+    gitBytes(dir, "init", "-q", "-b", "main");
+    gitBytes(dir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "sub");
+    gitBytes(dir, "commit", "-q", "-m", "add sub");
+    // the submodule's repository moves to a latin-1 name, its gitfile naming it in bytes
+    renameSync(join(dir, ".git", "modules", "sub"), full(dir, ".git/modules/caf\xe9"));
+    putRaw(dir, "sub/.git", "gitdir: ../.git/modules/caf\xe9\n");
+    // a commit in the submodule: the superproject sees it modified
+    putRaw(dir, "sub/f", "two\n");
+    gitBytes(join(dir, "sub"), "commit", "-q", "-am", "two");
+    const expected = gitText(dir, "status", "--porcelain");
+    expect(expected).toBe(" M sub\n");
+    const git = await open(dir);
+    expect(git.worktree?.readGitlinkHead).toBeTypeOf("function");
+    const head = await git.worktree?.readGitlinkHead?.("sub");
+    expect(head).toBe(gitText(join(dir, "sub"), "rev-parse", "HEAD").trim());
+    expect(formatStatusPorcelain(await git.status().call())).toBe(expected);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(source, { recursive: true, force: true });
+  });
+
+  it("a configuration rewrite keeps the bytes of a latin-1 value (core.worktree)", async () => {
+    const dir = join(root, `config-${counter++}`);
+    mkdirSync(dir);
+    gitBytes(dir, "init", "-q", "-b", "main");
+    const before = readFileSync(join(dir, ".git", "config"));
+    writeFileSync(
+      join(dir, ".git", "config"),
+      Buffer.concat([before, raw("[core]\n\tworktree = /srv/caf\xe9\n")]),
+    );
+    const git = await open(dir);
+    const config = git.workingCopy.config as GitWorkingCopyConfig;
+    expect(config.get("core.worktree")).toBe(ours("/srv/caf\xe9"));
+    config.set("user.name", "Someone");
+    await config.save();
+    expect(gitBytes(dir, "config", "--get", "core.worktree").equals(raw("/srv/caf\xe9\n"))).toBe(
+      true,
+    );
+    expect(gitText(dir, "config", "--get", "user.name")).toBe("Someone\n");
+    rmSync(dir, { recursive: true, force: true });
   });
 });

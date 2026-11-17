@@ -56,8 +56,9 @@ export interface IgnoreRule {
    * against the last component, one with a slash against the whole path relative to the
    * ignore file's directory, a directory-only pattern only against a directory. Directories
    * above the path are the caller's to check. Absent: `isMatchWithMode(path, dir, true)`.
+   * With `ignoreCase` (`core.ignoreCase`) ASCII letters match in either case, as in git.
    */
-  matchesPath?(path: string, isDirectory: boolean): boolean;
+  matchesPath?(path: string, isDirectory: boolean, ignoreCase?: boolean): boolean;
 
   /** Whether this is a negation rule (starts with !) */
   readonly isNegated: boolean;
@@ -90,9 +91,10 @@ export interface IgnoreNode {
    *
    * @param entryPath Path relative to this node's directory
    * @param isDirectory Whether the path is a directory
+   * @param ignoreCase Fold ASCII case (`core.ignoreCase`), as git does
    * @returns true if ignored, false if explicitly not ignored, undefined if no match
    */
-  checkIgnored(entryPath: string, isDirectory: boolean): boolean | undefined;
+  checkIgnored(entryPath: string, isDirectory: boolean, ignoreCase?: boolean): boolean | undefined;
 
   /** All rules in this node */
   readonly rules: readonly IgnoreRule[];
@@ -167,6 +169,12 @@ export interface IgnoreManager {
    * checked after every `.gitignore`, in the order first set; `undefined` removes them.
    */
   setExcludeFile?(source: string, content: string | undefined): void;
+
+  /**
+   * Match ASCII letters in either case from now on (`core.ignoreCase`), as git does: `*.TXT`
+   * then ignores `a.txt`, while `É` and `é` stay different bytes.
+   */
+  setIgnoreCase?(ignoreCase: boolean): void;
 
   /**
    * Add global patterns that apply to all paths.

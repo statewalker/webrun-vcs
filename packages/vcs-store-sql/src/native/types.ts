@@ -76,10 +76,12 @@ export interface SqlNativeTreeStore extends Trees {
   /**
    * Find tree entries matching a name pattern
    *
-   * Uses SQL LIKE pattern matching (% for any chars, _ for single char).
+   * Uses SQL LIKE pattern matching (% for any chars, _ for single char; ASCII letters match
+   * in either case).
    *
    * @param namePattern LIKE pattern for entry name (e.g., "%.ts", "src%")
-   * @returns Async iterable of matching entries with their tree IDs
+   * @returns Async iterable of matching entries with their tree IDs, by tree id and then by
+   *   name in git's byte order
    */
   findByNamePattern(
     namePattern: string,

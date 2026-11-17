@@ -78,12 +78,12 @@ class GitIgnoreNode implements IgnoreNode {
     return result ? MatchResult.IGNORED : MatchResult.NOT_IGNORED;
   }
 
-  checkIgnored(entryPath: string, isDirectory: boolean): boolean | undefined {
+  checkIgnored(entryPath: string, isDirectory: boolean, ignoreCase = false): boolean | undefined {
     // Parse rules in reverse order (later rules have higher priority)
     for (let i = this._rules.length - 1; i >= 0; i--) {
       const rule = this._rules[i];
       const matched = rule.matchesPath
-        ? rule.matchesPath(entryPath, isDirectory)
+        ? rule.matchesPath(entryPath, isDirectory, ignoreCase)
         : rule.isMatchWithMode(entryPath, isDirectory, true);
       if (matched) {
         // Return true if ignoring, false if negated (un-ignoring)

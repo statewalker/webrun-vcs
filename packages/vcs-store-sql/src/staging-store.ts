@@ -137,11 +137,16 @@ export class SQLStaging implements Staging {
   }
 
   async *listEntriesUnder(prefix: string): AsyncIterable<StagingEntry> {
-    const normalizedPrefix = prefix.endsWith("/") ? prefix : `${prefix}/`;
+    const dir = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
 
+    // the paths under `dir/` are the range ["dir/", "dir0"): "0" follows "/", and TEXT
+    // compares bytes (BINARY), case-sensitive and with no wildcard, where LIKE would fold
+    // ASCII case and take `_` and `%` for wildcards. The stored form of a path starts with
+    // the stored form of `dir/` (toSqlPath keeps prefixes).
+    const stored = toSqlPath(dir);
     const rows = await this.db.query<StagingRow>(
-      "SELECT * FROM staging_entry WHERE path = ? OR path LIKE ? ORDER BY path, stage",
-      [toSqlPath(prefix), `${toSqlPath(normalizedPrefix)}%`],
+      "SELECT * FROM staging_entry WHERE path = ? OR (path >= ? AND path < ?) ORDER BY path, stage",
+      [toSqlPath(prefix), `${stored}/`, `${stored}0`],
     );
 
     for (const entry of rowsToSortedEntries(rows)) {

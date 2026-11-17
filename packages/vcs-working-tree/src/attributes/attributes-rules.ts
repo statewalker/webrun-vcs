@@ -11,8 +11,10 @@ import {
   decodeGitPath,
   decodeGitPatternFile,
   encodeGitPath,
+  foldAsciiCase,
+  hasEscapedBytes,
 } from "@statewalker/vcs-utils/encoding";
-import { wildmatch } from "../ignore/git-wildmatch.js";
+import { sameBytes, wildmatch, wildmatchBytes } from "../ignore/git-wildmatch.js";
 
 /**
  * The state an attributes line gives an attribute: `true` (set), `false` (unset), `null`
@@ -294,9 +296,12 @@ export function parseAttributes(
   return rules;
 }
 
-/** Compares `a` and `b` over `n` characters, folding ASCII case when asked (`fspathncmp`). */
+/**
+ * Compares `a` and `b`, folding ASCII case when asked (`fspathncmp`: git folds ASCII only,
+ * so `É` and `é` stay different).
+ */
 function sameChars(a: string, b: string, ignoreCase: boolean): boolean {
-  return ignoreCase ? a.toLowerCase() === b.toLowerCase() : a === b;
+  return ignoreCase ? foldAsciiCase(a) === foldAsciiCase(b) : a === b;
 }
 
 /**
@@ -312,6 +317,9 @@ export function attributePatternMatches(
 ): boolean {
   const ignoreCase = options.ignoreCase === true;
   if (pat.mustBeDir && !options.isDirectory) return false;
+  // a pattern holding escaped bytes (half of a UTF-8 sequence) compares as bytes, as in git;
+  // one of UTF-8 text has whole characters in its literal part, where strings agree
+  if (hasEscapedBytes(pat.pattern)) return matchesBytes(pat, path, base, ignoreCase);
   const { pattern } = pat;
   const patternlen = pattern.length;
   if (pat.nodir) {
@@ -354,4 +362,61 @@ export function attributePatternMatches(
     name = name.slice(prefix);
   }
   return wildmatch(pat2, name, { pathname: true, casefold: ignoreCase });
+}
+
+/** {@link attributePatternMatches} of a pattern holding escaped bytes: byte by byte. */
+function matchesBytes(
+  pat: AttributePattern,
+  path: string,
+  base: string,
+  ignoreCase: boolean,
+): boolean {
+  const pattern = encodeGitPath(pat.pattern);
+  const patternlen = pattern.length;
+  const literal = encodeGitPath(pat.pattern.slice(0, pat.nowildcardLen)).length;
+  if (pat.nodir) {
+    const basename = encodeGitPath(path.slice(path.lastIndexOf("/") + 1));
+    if (literal === patternlen) {
+      return (
+        patternlen === basename.length && sameBytes(pattern, 0, basename, 0, patternlen, ignoreCase)
+      );
+    }
+    if (pat.endsWith) {
+      const tail = patternlen - 1;
+      return (
+        tail <= basename.length &&
+        sameBytes(pattern, 1, basename, basename.length - tail, tail, ignoreCase)
+      );
+    }
+    return wildmatchBytes(pattern, basename, { casefold: ignoreCase });
+  }
+  let start = 0;
+  let prefix = literal;
+  if (pattern[0] === 0x2f) {
+    start = 1;
+    prefix--;
+  }
+  const baselen = base.length;
+  if (
+    path.length < baselen + 1 ||
+    (baselen && path[baselen] !== "/") ||
+    !sameChars(path.slice(0, baselen), base, ignoreCase)
+  ) {
+    return false;
+  }
+  const name = encodeGitPath(baselen ? path.slice(baselen + 1) : path);
+  let nameStart = 0;
+  if (prefix > 0) {
+    if (prefix > name.length) return false;
+    if (!sameBytes(pattern, start, name, 0, prefix, ignoreCase)) return false;
+    if (patternlen - start === prefix && name.length === prefix) return true;
+    // keep one byte of the prefix, so the match sees where a component starts
+    prefix--;
+    start += prefix;
+    nameStart = prefix;
+  }
+  return wildmatchBytes(pattern.subarray(start), name.subarray(nameStart), {
+    pathname: true,
+    casefold: ignoreCase,
+  });
 }

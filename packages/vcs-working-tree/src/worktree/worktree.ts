@@ -220,6 +220,13 @@ export interface Worktree {
    */
   setExcludesFileReader?(read: (() => Promise<string | undefined>) | undefined): void;
 
+  /**
+   * Sets how `core.ignoreCase` is read for the ignore rules: with it, rules match ASCII
+   * letters in either case, as in git (`*.TXT` ignores `a.txt`; `É` never matches `é`).
+   * Working copies set it from their configuration.
+   */
+  setIgnoreCaseReader?(read: (() => boolean) | undefined): void;
+
   // ========== Reading ==========
 
   walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry>;

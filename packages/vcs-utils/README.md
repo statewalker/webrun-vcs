@@ -318,6 +318,19 @@ Pattern files are bytes as well. `.gitignore`, `info/exclude`, `core.excludesFil
 
 Text that commands print holds paths too. `DiffCommand.callText()`, `DiffFormatter.toString()` and `formatStatusPorcelain(status, version, { quotePath: false })` decode their bytes the same way: a byte that is not UTF-8 is an escape, never U+FFFD, so `encodeGitPath(text)` gives git's output bytes, and a path cut from the text is the path itself. A SQL store keeps such names in its TEXT columns escaped (`toSqlPath` in `@statewalker/vcs-store-sql`), because drivers turn lone surrogates into U+FFFD; JSON (the key-value stores) writes them as `\udce9` escapes and reads them back unchanged.
 
+```typescript
+import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
+
+foldAsciiCase("README.Md"); // "readme.md"
+foldAsciiCase("\u00c9.TXT"); // "\u00c9.txt": É is no ASCII letter, it stays
+```
+
+Matching compares bytes where git does. The literal prefix and `*suffix` shortcuts of ignore and attribute patterns compare the pattern's bytes with the path's, so a rule holding half of a UTF-8 sequence (`caf\xc3*`, `*\xa9`) takes the UTF-8 `café` as git does; `wildmatch` works on bytes throughout. With `core.ignoreCase` (ignore rules, attributes) and for `:(icase)` pathspecs, case folds as git folds it, ASCII letters only (`foldAsciiCase`: git's `tolower` and `strncasecmp`), so `*.TXT` takes `a.txt` and `É` never takes `é`. The checks that stand in for a case-folding filesystem (`.git` under HFS+/NTFS spellings, checkout collisions, simulated links) keep their own folding.
+
+Files that name git directories are paths too: a `.git` file's `gitdir:` (worktrees and submodules), a `.git` symbolic link's target, `commondir`, and the `gitdir` back-pointer a new worktree gets are read and written as their bytes. A configuration file is read and written the same way, so a value that is no UTF-8 (`core.worktree = /srv/caf\xe9`) keeps its bytes when the file is rewritten.
+
+Ref names are not covered. git's `check_refname_format` allows bytes from 0x80 up, so a branch named in latin-1 is legal there, but here ref names are text: loose and packed refs, reflogs, symbolic refs and the transport's ref advertisements decode them as UTF-8 (a byte that is no UTF-8 becomes U+FFFD), ref-name validation refuses lone surrogates, and the SQL and key-value ref stores keep them as plain text. A repository with such a ref reads that ref under another name.
+
 ### RPC over a MessagePort
 
 ```typescript

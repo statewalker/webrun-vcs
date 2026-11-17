@@ -19,7 +19,7 @@
 
 import { type Blobs, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { type ConflictStyle, mergeLines } from "@statewalker/vcs-utils";
-import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { encodeGitPath, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 
 import {
   detectRenames,
@@ -376,8 +376,9 @@ class OrtMerge {
     this.notes.push({ path, order: this.order++, text });
   }
 
+  /** A name as git's case-insensitive name hashing sees it (`memihash`: ASCII folded) */
   private fold(name: string): string {
-    return this.options.ignoreCase ? name.toLowerCase() : name;
+    return this.options.ignoreCase ? foldAsciiCase(name) : name;
   }
 
   private put(path: string, info: Info): void {

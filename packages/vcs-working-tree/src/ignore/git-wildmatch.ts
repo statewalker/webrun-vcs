@@ -62,9 +62,44 @@ export interface WildmatchOptions {
  */
 export function wildmatch(pattern: string, text: string, options: WildmatchOptions = {}): boolean {
   // a path is its bytes: a name that is no UTF-8 matches byte by byte, as in git
-  const p = encodeGitPath(pattern);
-  const t = encodeGitPath(text);
-  return dowild(p, 0, t, 0, options.pathname === true, options.casefold === true) === MATCH;
+  return wildmatchBytes(encodeGitPath(pattern), encodeGitPath(text), options);
+}
+
+/** {@link wildmatch} of a pattern and a text given as their bytes (`encodeGitPath`). */
+export function wildmatchBytes(
+  pattern: Uint8Array,
+  text: Uint8Array,
+  options: WildmatchOptions = {},
+): boolean {
+  return (
+    dowild(pattern, 0, text, 0, options.pathname === true, options.casefold === true) === MATCH
+  );
+}
+
+/**
+ * Whether `a` from `aStart` and `b` from `bStart` hold the same `n` bytes, ASCII case folded
+ * with `casefold` (git's `fspathncmp` of a pattern's literal part and a path: bytes, so half
+ * of a UTF-8 sequence compares as the byte it is).
+ */
+export function sameBytes(
+  a: Uint8Array,
+  aStart: number,
+  b: Uint8Array,
+  bStart: number,
+  n: number,
+  casefold = false,
+): boolean {
+  if (aStart + n > a.length || bStart + n > b.length) return false;
+  for (let i = 0; i < n; i++) {
+    let x = a[aStart + i];
+    let y = b[bStart + i];
+    if (casefold) {
+      x = lower(x);
+      y = lower(y);
+    }
+    if (x !== y) return false;
+  }
+  return true;
 }
 
 function dowild(

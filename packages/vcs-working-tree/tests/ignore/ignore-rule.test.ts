@@ -680,3 +680,58 @@ describe("IgnoreManager", () => {
     expect(manager.isIgnored("test.log", false)).toBe(false);
   });
 });
+
+describe("byte-exact literal parts and ASCII-only case folding (git's dir.c)", () => {
+  // "café" is caf C3 A9; a pattern holding only C3 (an escaped byte) matches its first half
+  const cafe = "café";
+  const half = "\udcc3";
+  const tail = "\udca9";
+  const matches = (pattern: string, path: string, ignoreCase = false) =>
+    createIgnoreRule(pattern).matchesPath?.(path, false, ignoreCase);
+
+  it("compares a literal prefix holding half of a UTF-8 sequence as bytes", () => {
+    expect(matches(`caf${half}*`, cafe)).toBe(true);
+    expect(matches(`/caf${half}*`, cafe)).toBe(true);
+    expect(matches(`d/caf${half}*`, `d/${cafe}`)).toBe(true);
+    expect(matches(`d/caf${half}*`, "d/cafe")).toBe(false);
+  });
+
+  it("compares a *suffix holding half of a UTF-8 sequence as bytes", () => {
+    expect(matches(`*${tail}`, cafe)).toBe(true);
+    expect(matches(`*${tail}`, `d/${cafe}`)).toBe(true);
+    expect(matches(`*${tail}`, "cafe")).toBe(false);
+  });
+
+  it("matches a literal holding escapes byte for byte", () => {
+    expect(matches(`caf${half}${tail}`, cafe)).toBe(true);
+    expect(matches(`d/caf${half}${tail}`, `d/${cafe}`)).toBe(true);
+    expect(matches("caf\udce9", "caf\udce9")).toBe(true);
+    expect(matches("caf\udce9", cafe)).toBe(false);
+  });
+
+  it("folds ASCII letters only with ignoreCase", () => {
+    expect(matches("*.TXT", "a.txt", true)).toBe(true);
+    expect(matches("*.TXT", "a.txt", false)).toBe(false);
+    expect(matches("README", "readme", true)).toBe(true);
+    expect(matches("Docs/A*", "docs/abc", true)).toBe(true);
+    // É and é are other bytes: git never folds them
+    expect(matches("Été", "été", true)).toBe(false);
+    expect(matches("*É", "xé", true)).toBe(false);
+    expect(matches("d/É*", "d/éx", true)).toBe(false);
+    // the Kelvin sign is not "k"
+    expect(matches("K", "k", true)).toBe(false);
+    // and an escaped pattern folds its ASCII part
+    expect(matches(`CAF${half}*`, cafe, true)).toBe(true);
+  });
+
+  it("the manager applies core.ignoreCase to every source", () => {
+    const manager = createIgnoreManager({ ignoreCase: true });
+    manager.addIgnoreFile("", "*.LOG\n");
+    manager.setExcludeFile?.("info/exclude", "BUILD/\n");
+    expect(manager.isIgnored("x.log", false)).toBe(true);
+    expect(manager.isIgnored("build", true)).toBe(true);
+    manager.setIgnoreCase?.(false);
+    expect(manager.isIgnored("x.log", false)).toBe(false);
+    expect(manager.isIgnored("build", true)).toBe(false);
+  });
+});

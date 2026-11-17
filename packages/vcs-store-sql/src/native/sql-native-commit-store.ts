@@ -363,18 +363,20 @@ export class SqlNativeCommitStoreImpl implements SqlNativeCommitStore {
   /**
    * Search commits by message content
    *
-   * Uses LIKE for substring matching on commit messages.
+   * Uses LIKE for substring matching on commit messages (ASCII case-insensitive). The
+   * substring is literal: its `%`, `_` and backslash are escaped, never wildcards.
    * For more advanced full-text search, use a database with FTS5 support.
    *
    * @param pattern Substring to search for in message (case-insensitive)
    * @returns Async iterable of matching commit IDs
    */
   async *searchMessage(pattern: string): AsyncIterable<ObjectId> {
+    const literal = pattern.replace(/[\\%_]/g, (c) => `\\${c}`);
     const rows = await this.db.query<{ commit_id: string }>(
       `SELECT commit_id FROM vcs_commit
-       WHERE message LIKE ?
+       WHERE message LIKE ? ESCAPE '\\'
        ORDER BY author_timestamp DESC`,
-      [`%${pattern}%`],
+      [`%${literal}%`],
     );
     for (const row of rows) {
       yield row.commit_id;

@@ -6,6 +6,7 @@
  */
 
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import {
   basicStatMatches,
   type StagingEntry,
@@ -177,17 +178,18 @@ export async function findInTheWay(
   const { writes, removes, index } = options;
   const untracked = new Set<string>();
   const lostDirs: string[] = [];
-  // the index by folded path (git's index_file_exists with icase), built only when needed
+  // the index by folded path (git's index_file_exists with icase: memihash and strncasecmp
+  // fold ASCII letters only), built only when needed
   let folded: Map<string, unknown> | undefined;
   const otherCase = (path: string): CheckedEntry | undefined => {
     if (!folded) {
       folded = new Map();
       for (const [p, e] of index) {
-        const key = p.toLowerCase();
+        const key = foldAsciiCase(p);
         if (!folded.has(key)) folded.set(key, e);
       }
     }
-    const entry = folded.get(path.toLowerCase()) as CheckedEntry | undefined;
+    const entry = folded.get(foldAsciiCase(path)) as CheckedEntry | undefined;
     return typeof entry?.mode === "number" ? entry : undefined;
   };
   const icaseExists = async (path: string, current: WorktreeEntry): Promise<boolean> => {
