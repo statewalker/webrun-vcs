@@ -290,7 +290,8 @@ describe("graphs with corrupt records give the answers of a full walk", () => {
     const { history } = await open(dir);
     // the commit store reads the commit itself for the corrupt record
     expect(await history.commits.getParents(ids[12] as string)).toEqual(
-      git(dir, ["rev-parse", `${ids[12]}^@`])
+      // native git reads the parents without the graph (2.5x dies on the corrupt record)
+      git(dir, ["-c", "core.commitGraph=false", "rev-parse", `${ids[12]}^@`])
         .trim()
         .split("\n")
         .filter(Boolean),
