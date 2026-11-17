@@ -10,7 +10,7 @@
  * tree reads with and without the filters.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -269,5 +269,100 @@ describeGit("log -- <path> against native git", () => {
     expect(b.bloomDefinitelyNot).toBe(0);
     expect(a.treeComparisons).toBeLessThan(b.treeComparisons / 5);
     expect(a.treeEntryReads).toBeLessThan(b.treeEntryReads / 5);
+  });
+
+  /** git's version as [major, minor]. */
+  function gitVersion(): [number, number] {
+    const m = /(\d+)\.(\d+)/.exec(git(["--version"]));
+    return m ? [Number(m[1]), Number(m[2])] : [0, 0];
+  }
+
+  it("treats filters of another commitGraph.changedPathsVersion as not there", async () => {
+    const [major, minor] = gitVersion();
+    // the setting is read (and written) by git 2.46 and later
+    if (major === 2 && minor < 46) return;
+    removeGraph();
+    git([
+      "-c",
+      "commitGraph.changedPathsVersion=2",
+      "commit-graph",
+      "write",
+      "--reachable",
+      "--changed-paths",
+    ]);
+    try {
+      git(["config", "commitGraph.changedPathsVersion", "1"]);
+      for (const path of ["src/lib/b.txt", "doc"]) {
+        const { ids, command } = await ours([path]);
+        expect([path, ids]).toEqual([path, native([path])]);
+        const s = command.getStatistics();
+        const n = nativeBloom([path]);
+        expect([path, s.bloomNotPresent, s.bloomMaybe, s.bloomDefinitelyNot]).toEqual([
+          path,
+          n.filter_not_present,
+          n.maybe,
+          n.definitely_not,
+        ]);
+        expect(s.bloomNotPresent).toBeGreaterThan(50);
+      }
+    } finally {
+      git(["config", "--unset", "commitGraph.changedPathsVersion"]);
+    }
+  });
+
+  it("fails as git does on a missing tree or parent", async () => {
+    const saved = dir;
+    dir = join(root, "broken");
+    try {
+      execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+      const write = (content: string) => git(["hash-object", "-w", "--stdin"], {}, content).trim();
+      const commitWith = (files: Record<string, string>, parent?: string) => {
+        const lines = Object.entries(files).map(([p, c]) => `100644 blob ${write(c)}\t${p}`);
+        // one directory level: "d/x" goes into a tree of its own
+        const top = lines.filter((l) => !l.includes("\td/"));
+        const inD = lines.filter((l) => l.includes("\td/")).map((l) => l.replace("\td/", "\t"));
+        if (inD.length)
+          top.push(`040000 tree ${git(["mktree"], {}, `${inD.join("\n")}\n`).trim()}\td`);
+        const tree = git(["mktree"], {}, `${top.join("\n")}\n`).trim();
+        return git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", "c"]).trim();
+      };
+      const c1 = commitWith({ a: "a\n", "d/x": "1\n" });
+      const c2 = commitWith({ a: "a\n", "d/x": "2\n" }, c1);
+      const c3 = commitWith({ a: "3\n", "d/x": "2\n" }, c2);
+      git(["update-ref", "refs/heads/main", c3]);
+      const loose = (id: string) => join(dir, ".git/objects", id.slice(0, 2), id.slice(2));
+      const nativeError = (path: string) => {
+        try {
+          native([path]);
+        } catch (e) {
+          return String((e as { stderr?: string }).stderr);
+        }
+        return "";
+      };
+      const oursError = async (path: string) => {
+        try {
+          await ours([path]);
+        } catch (e) {
+          return (e as Error).message;
+        }
+        return "";
+      };
+
+      const tree = git(["rev-parse", `${c1}:d`]).trim();
+      const treeFile = loose(tree);
+      const treeBytes = readFileSync(treeFile);
+      rmSync(treeFile);
+      // git 2.43 says "unable to read tree <id>", 2.5x "unable to read tree (<id>)"
+      expect(nativeError("d/x")).toMatch(new RegExp(`fatal: unable to read tree \\(?${tree}`));
+      expect(await oursError("d/x")).toBe(`unable to read tree (${tree})`);
+      writeFileSync(treeFile, treeBytes);
+
+      rmSync(loose(c2));
+      const message = `cannot simplify commit ${c3} (because of ${c2})`;
+      expect(nativeError("a")).toContain(`fatal: ${message}`);
+      expect(await oursError("a")).toBe(message);
+    } finally {
+      dir = saved;
+    }
   });
 });

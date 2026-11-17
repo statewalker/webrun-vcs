@@ -280,13 +280,6 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Set dry run mode.
-   *
-   * In dry run mode, refs are not actually updated.
-   *
-   * @param dryRun Whether to do a dry run
-   */
-  /**
    * `--[no-]write-commit-graph`: after the fetch, write a split commit-graph of everything the
    * refs reach, as git does with `fetch.writeCommitGraph` (which this overrides). It needs the
    * repository's files (`setRepositoryFiles`).
@@ -312,6 +305,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     return this;
   }
 
+  /**
+   * Set dry run mode.
+   *
+   * In dry run mode, refs are not actually updated.
+   *
+   * @param dryRun Whether to do a dry run
+   */
   setDryRun(dryRun: boolean): this {
     this.checkCallable();
     this.dryRun = dryRun;

@@ -19,7 +19,7 @@ import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import type { ObjectId } from "../../common/id/index.js";
 import { runSteps, type Steps } from "../../pack/index.js";
-import type { GitObjects } from "../objects/git-objects.js";
+import type { GitObject, GitObjects } from "../objects/git-objects.js";
 import { computeBloomFilter, DEFAULT_BLOOM_FILTER_SETTINGS } from "./bloom-filter.js";
 import type { CommitGraph } from "./commit-graph.js";
 import {
@@ -160,20 +160,26 @@ async function readRaw(
     return undefined;
   }
   if (!obj) return undefined;
-  if (obj.bytes) return { type: obj.type, data: obj.bytes };
+  return { type: obj.type, data: await objectBytes(obj) };
+}
+
+/** An object's bytes: held in memory, or read from its content to the end (which releases it). */
+async function objectBytes(obj: GitObject): Promise<Uint8Array> {
+  if (obj.bytes) return obj.bytes;
   const chunks: Uint8Array[] = [];
   let size = 0;
   for await (const c of obj.content) {
     chunks.push(c);
     size += c.length;
   }
+  if (chunks.length === 1) return chunks[0] as Uint8Array;
   const data = new Uint8Array(size);
   let at = 0;
   for (const c of chunks) {
     data.set(c, at);
     at += c.length;
   }
-  return { type: obj.type, data };
+  return data;
 }
 
 function compareBytes(a: Uint8Array, b: Uint8Array): number {
@@ -819,6 +825,9 @@ const EMPTY = new Uint8Array(0);
 /** How many raw trees `TreeReader` keeps (a commit's diff mostly reads its parent's trees). */
 const TREE_CACHE_SIZE = 4096;
 
+/** The bytes of raw trees `TreeReader` keeps at most (besides the one just read). */
+const TREE_CACHE_BYTES = 64 * 1024 * 1024;
+
 /**
  * Reads raw trees for the filters. Trees are kept as their bytes (the oldest dropped):
  * consecutive commits share most of their trees, which git finds again in its delta
@@ -826,6 +835,7 @@ const TREE_CACHE_SIZE = 4096;
  */
 class TreeReader {
   private readonly cache = new Map<ObjectId, Uint8Array>();
+  private cacheBytes = 0;
   /** Trees read from the object database (for tests) */
   reads = 0;
 
@@ -858,12 +868,9 @@ class TreeReader {
     obj: Awaited<ReturnType<GitObjects["get"]>>,
   ): Uint8Array | Promise<Uint8Array> {
     if (!obj) throw new Error(`unable to read tree ${id}`);
-    if (!obj.bytes) {
-      return readRaw(this.objects, id).then((raw) => {
-        if (!raw) throw new Error(`unable to read tree ${id}`);
-        return this.keep(id, raw.type, raw.data);
-      });
-    }
+    // the content is read to its end (not read again): a loose or packed object's reader
+    // (its file, its pooled inflater) is released when its iterator finishes
+    if (!obj.bytes) return objectBytes(obj).then((data) => this.keep(id, obj.type, data));
     return this.keep(id, obj.type, obj.bytes);
   }
 
@@ -871,8 +878,12 @@ class TreeReader {
     if (type === "commit") return this.tree(parseGraphCommit(data, id).tree);
     if (type !== "tree") throw new Error(`object ${id} is not a tree`);
     this.cache.set(id, data);
-    if (this.cache.size > TREE_CACHE_SIZE) {
-      this.cache.delete(this.cache.keys().next().value as ObjectId);
+    this.cacheBytes += data.length;
+    while (this.cache.size > TREE_CACHE_SIZE || this.cacheBytes > TREE_CACHE_BYTES) {
+      const oldest = this.cache.keys().next().value as ObjectId;
+      if (oldest === id) break;
+      this.cacheBytes -= (this.cache.get(oldest) as Uint8Array).length;
+      this.cache.delete(oldest);
     }
     return data;
   }

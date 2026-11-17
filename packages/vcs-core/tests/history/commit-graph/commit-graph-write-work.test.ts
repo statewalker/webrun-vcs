@@ -166,4 +166,69 @@ describe("commit-graph writing, counted", () => {
     }
     expect(absent).toBeGreaterThanOrEqual(4);
   });
+
+  it("reads a streamed tree (a loose tree over 64 KB) once and to its end", async () => {
+    const { objects, commit } = await repo();
+    const files: Files = {};
+    for (let i = 0; i < 2000; i++)
+      files[`big/entry-with-a-long-name-${i}.txt`] = { content: `${i}` };
+    const first = await commit([], files);
+    files["big/entry-with-a-long-name-7.txt"] = { content: "changed" };
+    const second = await commit([first], files);
+    // objects over 64 KB come without `bytes`, as the loose store streams them; each content
+    // iterator is watched: it must be read to its end (or returned), and never left open
+    const open = new Set<number>();
+    let streamed = 0;
+    let gets = 0;
+    const store: Pick<GitObjects, "get"> = {
+      get: async (id, options) => {
+        gets++;
+        const obj = await objects.get(id, options);
+        if (!obj || obj.size <= 64 * 1024) return obj;
+        const n = ++streamed;
+        const inner = obj.content;
+        return {
+          type: obj.type,
+          size: obj.size,
+          content: {
+            [Symbol.asyncIterator]() {
+              const it = inner[Symbol.asyncIterator]();
+              open.add(n);
+              return {
+                async next() {
+                  const r = await it.next();
+                  if (r.done) open.delete(n);
+                  return r;
+                },
+                async return() {
+                  open.delete(n);
+                  await it.return?.();
+                  return { done: true as const, value: undefined };
+                },
+              };
+            },
+          },
+        };
+      },
+    };
+    const fs = createInMemoryFilesApi();
+    const result = await writeCommitGraphFile({
+      files: fs,
+      objectsDir: OBJECTS,
+      objects: store,
+      commits: [second],
+      changedPaths: true,
+    });
+    expect(result.commits).toBe(2);
+    // the two versions of "big" are streamed, each read once
+    expect(streamed).toBe(2);
+    expect(open.size).toBe(0);
+    expect(gets).toBe((result.reads?.commits ?? 0) + (result.reads?.trees ?? 0));
+    const { graph } = await readCommitGraph(fs, OBJECTS);
+    const filter = graph?.bloomFilterAt(graph.position(second));
+    if (!filter) throw new Error("no filter");
+    expect(
+      bloomMayContainPath(filter.data, "big/entry-with-a-long-name-7.txt", filter.settings),
+    ).toBe(true);
+  });
 });
