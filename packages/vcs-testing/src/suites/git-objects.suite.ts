@@ -10,6 +10,7 @@ import {
   createGitObjects,
   type GitObjects,
   InvalidObjectIdError,
+  listObjectsWithPrefix,
   ObjectIdMismatchError,
   type ObjectTypeString,
   SizeMismatchError,
@@ -181,6 +182,37 @@ export function createGitObjectsTests(
       const listed: string[] = [];
       for await (const id of objects.list()) listed.push(id);
       expect(listed.sort()).toEqual(corpus.map((o) => o.id).sort());
+    });
+
+    it("listPrefix finds the stored ids starting with a prefix (abbreviated ids)", async () => {
+      for (const o of corpus) await objects.put(o.type, body(o).length, [body(o)]);
+      const viaPrefix = async (prefix: string) => {
+        const out: string[] = [];
+        for await (const id of listObjectsWithPrefix(objects, prefix)) out.push(id);
+        return out.sort();
+      };
+      for (const o of corpus) {
+        for (const len of [1, 2, 3, 4, 7, 40]) {
+          const prefix = o.id.slice(0, len);
+          const expected = corpus
+            .map((c) => c.id)
+            .filter((id) => id.startsWith(prefix))
+            .sort();
+          expect(await viaPrefix(prefix), `${o.name} ${prefix}`).toEqual([...new Set(expected)]);
+        }
+      }
+      expect(await viaPrefix("")).toEqual([...new Set(corpus.map((o) => o.id))].sort());
+      // an id no object starts with, and one that is not hex
+      const missing = commit.id.startsWith("0000") ? "ffff" : "0000";
+      expect(await viaPrefix(missing)).toEqual(
+        corpus.filter((o) => o.id.startsWith(missing)).map((o) => o.id),
+      );
+      expect(await viaPrefix("zz")).toEqual([]);
+      if (objects.listPrefix) {
+        const direct: string[] = [];
+        for await (const id of objects.listPrefix(commit.id.slice(0, 4))) direct.push(id);
+        expect(direct).toContain(commit.id);
+      }
     });
 
     it("an absent object: has false, get undefined, getRaw empty, remove false", async () => {

@@ -9,7 +9,7 @@
  */
 
 import { deflate, inflate, slice } from "@statewalker/vcs-utils";
-import type { RawStorage } from "./raw-storage.js";
+import { type RawStorage, rawKeysWithPrefix } from "./raw-storage.js";
 
 /**
  * Options for CompressedRawStorage
@@ -119,6 +119,13 @@ export class CompressedRawStorage implements RawStorage {
    */
   async *keys(): AsyncIterable<string> {
     yield* this.inner.keys();
+  }
+
+  /**
+   * The keys starting with `prefix`, from the underlying store
+   */
+  async *keysWithPrefix(prefix: string): AsyncIterable<string> {
+    yield* rawKeysWithPrefix(this.inner, prefix);
   }
 
   /**

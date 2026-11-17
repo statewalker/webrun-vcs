@@ -5,4 +5,4 @@ export {
 } from "./compressed-raw-storage.js";
 export { MemoryRawStorage } from "./memory-raw-storage.js";
 export * from "./object-removals.js";
-export type { RawStorage, SweepStaleOptions } from "./raw-storage.js";
+export { type RawStorage, rawKeysWithPrefix, type SweepStaleOptions } from "./raw-storage.js";

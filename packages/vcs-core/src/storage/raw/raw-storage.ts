@@ -67,6 +67,14 @@ export interface RawStorage {
   keys(): AsyncIterable<string>;
 
   /**
+   * The keys that start with `prefix`, in no particular order. Optional: a store that can
+   * look a prefix up without listing every key (a KV prefix scan, an SQL range, one fan-out
+   * directory) offers it; callers fall back to filtering `keys()`. Abbreviated object ids
+   * (`git rev-parse 1a2b`) are found through it.
+   */
+  keysWithPrefix?(prefix: string): AsyncIterable<string>;
+
+  /**
    * Get content size for a key
    *
    * Returns the uncompressed content size (actual data size,
@@ -107,6 +115,18 @@ export interface RawStorage {
    * @returns The number of leftovers removed
    */
   sweepStale?(options: SweepStaleOptions): Promise<number>;
+}
+
+/**
+ * The keys of `raw` that start with `prefix`: its `keysWithPrefix` where it has one, else
+ * `keys()` filtered.
+ */
+export async function* rawKeysWithPrefix(raw: RawStorage, prefix: string): AsyncIterable<string> {
+  if (raw.keysWithPrefix) {
+    yield* raw.keysWithPrefix(prefix);
+    return;
+  }
+  for await (const key of raw.keys()) if (key.startsWith(prefix)) yield key;
 }
 
 /** What `sweepStale` removes: leftovers older than `olderThanMs` (0 or less: every leftover not in use). */

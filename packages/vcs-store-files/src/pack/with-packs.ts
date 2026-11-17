@@ -13,6 +13,7 @@ import type { PackSet, StagingBlobStore } from "@statewalker/vcs-core";
 import {
   type GitObject,
   type GitObjects,
+  listObjectsWithPrefix,
   PackError,
   runSteps,
   runStepsAsync,
@@ -157,6 +158,20 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
       const held = await packs.packs();
       yield* packs.list({ packs: held });
       for await (const id of loose.list()) if (!held.some((p) => p.has(id))) yield id;
+    },
+
+    async *listPrefix(prefix) {
+      const held = await packs.packs();
+      const seen = new Set<string>();
+      const packed = packs.listPrefix
+        ? packs.listPrefix(prefix, { packs: held })
+        : packs.list({ packs: held });
+      for await (const id of packed) {
+        if (!id.startsWith(prefix)) continue;
+        seen.add(id);
+        yield id;
+      }
+      for await (const id of listObjectsWithPrefix(loose, prefix)) if (!seen.has(id)) yield id;
     },
 
     async approximateCount() {

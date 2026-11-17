@@ -143,9 +143,34 @@ await git.revParse().setRevision("main@{yesterday}").call(); // main a day ago (
 await git.revParse().setRevision(":/fix typo").call();       // youngest commit whose message matches
 await git.revParse().setRevision("v1.0^{tree}").call();      // peeling: ^{commit|tree|blob|tag|object|}
 await git.revParse().setRevision("HEAD~2:src/a.ts").call();  // a path in a tree; ":2:a.ts" an index stage
+await git.revParse().setRevision("1a2b3c").call();           // an abbreviated id (4 digits or more)
+await git.revParse().setRevision("v1.0-3-g1a2b3c4").call();  // `git describe` output: the commit 1a2b3c4
+await git.revParse().setPrefix("src").setRevision("HEAD:./a.ts").call(); // relative to a subdirectory
 ```
 
-Ref names follow git's dwim rules; `@` is HEAD, `@{-N}` the branch left N switches ago, `<ref>@{<n>}` the reflog's nth entry, `<ref>@{<date>}` the ref at that time, `<rev>^{/<regex>}` and `:/<regex>` search commit messages with POSIX extended regexes (`!-` negates). Where git dies, `RevisionError` carries its line (`fatal: no upstream configured for branch 'x'`, `fatal: HEAD does not point to a branch`, `fatal: log for 'main' only has 2 entries`); `revParse()` also returns git's warnings (`warning: log for 'main' only goes back to ...`). Abbreviated ids and `describe` names are not read.
+Ref names follow git's dwim rules; `@` is HEAD, `@{-N}` the branch left N switches ago, `<ref>@{<n>}` the reflog's nth entry, `<ref>@{<date>}` the ref at that time, `<rev>^{/<regex>}` and `:/<regex>` search commit messages with POSIX extended regexes (`!-` negates). Where git dies, `RevisionError` carries its line (`fatal: no upstream configured for branch 'x'`, `fatal: HEAD does not point to a branch`, `fatal: log for 'main' only has 2 entries`); `revParse()` also returns git's warnings (`warning: log for 'main' only goes back to ...`).
+
+An abbreviated id is looked up as git's `get_short_oid` does it, through the object store's prefix lookup (one loose fan-out directory and a binary search in each pack's idx for the files backend; a prefix scan or key range for the KV and SQL stores). Of several objects sharing the prefix, the one the context needs wins: a committish for `~`, `^`, `^{commit}`, `A..B` and commands that take a commit, a treeish for `<rev>:<path>` and `^{tree}`, else what `core.disambiguate` names (`commit`, `committish`, `tree`, `treeish`, `blob`, `none`). An ambiguity is reported in git's words, its candidates listed as git lists them (tags, commits, trees, blobs), and a ref that is also a short id warns `refname 'x' is ambiguous.` A `describe` name, `<ref>-<n>-g<abbrev>`, reads its abbreviation as a commit (as git 2.5x does, not 2.43, only after a valid ref name and a count). `abbreviateId(workingCopy, id)` abbreviates as git prints ids (`core.abbrev`, auto from the object count, lengthened until unique).
+
+```text
+error: short object ID 1a2b is ambiguous
+hint: The candidates are:
+hint:   1a2b04c tag 2005-04-07 - v1.0
+hint:   1a2b8f1 commit 2005-04-07 - Fix the parser
+hint:   1a2b3e9 tree
+hint:   1a2b77d blob
+fatal: Needed a single revision
+```
+
+Ranges and revision sets are read as `git log` and `git rev-list` read them: `revList()` lists the commits of `a..b`, `a...b` (the symmetric difference, without the merge bases), `^a`, `x^@` (the parents), `x^!` (x without its parents), `x^-<n>` (x without its nth parent) and `--not`; `revParse().addArgument(...)` prints them as `git rev-parse` does (`^<id>` lines for what is excluded):
+
+```typescript
+for await (const c of await git.revList().addRevision("main...feature").call()) console.log(c.id);
+const { entries } = await git.revList().addRevision("v1.0..HEAD").addRevision("^hotfix").resolve();
+const { lines } = await git.revParse().addArgument("main..feature").call(); // [<feature>, "^<main>"]
+```
+
+`revList()` walks with `log()`, so its commits come in `log()`'s order, which is not yet git's date order. Arguments are revisions only, as before git's `--` (a name that resolves to nothing is `fatal: bad revision 'x'`).
 
 ### Log and reset
 

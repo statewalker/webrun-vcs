@@ -409,7 +409,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         );
       }
       autostash = await createAutostash(this.context(worktree), headId);
-      if (autostash) output.push(`Created autostash: ${abbrev(autostash)}`);
+      if (autostash) {
+        output.push(`Created autostash: ${await this.abbreviateObjectId(autostash)}`);
+      }
     }
     const unstash = async () => {
       if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
@@ -461,7 +463,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (skipped.size > 0) {
       for (const id of range) {
         if (skipped.has(id))
-          output.push(`warning: skipped previously applied commit ${abbrev(id)}`);
+          output.push(
+            `warning: skipped previously applied commit ${await this.abbreviateObjectId(id)}`,
+          );
       }
       if (configBool(this.workingCopy, "advice.skippedCherryPicks", true)) {
         output.push(
@@ -517,7 +521,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const todoText = await this.todoText(todo);
     await state.write(
       `${DIR}/git-rebase-todo.backup`,
-      `${todoText}\n# Rebase ${abbrev(onto)}..${abbrev(headId)} onto ${abbrev(onto)} (${todo.length} command${todo.length === 1 ? "" : "s"})\n`,
+      `${todoText}\n# Rebase ${await this.abbreviateObjectId(onto)}..${await this.abbreviateObjectId(headId)} onto ${await this.abbreviateObjectId(onto)} (${todo.length} command${todo.length === 1 ? "" : "s"})\n`,
     );
     await state.write(`${DIR}/git-rebase-todo`, todoText);
     if (autostash) await state.write(`${DIR}/autostash`, `${autostash}\n`);

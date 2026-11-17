@@ -70,6 +70,21 @@ interface GitConfigLike {
    * name one setting (`core.commentChar` and `core.commentString`).
    */
   getLastOf?(keys: string[]): { key: string; value: unknown } | undefined;
+  /**
+   * Optional: every value of a key with the file and line it was read from and its text as
+   * written (undefined for a variable without `=`), as `GitWorkingCopyConfig` gives them.
+   */
+  getAllWithOrigin?(key: string): ConfigValueWhere[];
+}
+
+/** A config value, its text as written and where it was read (see {@link RemoteConfigStore.valuesWithOrigin}). */
+export interface ConfigValueWhere {
+  /** As written; undefined for a variable without `=` (git's NULL value) */
+  text: string | undefined;
+  /** The file as the host names it; absent where the config cannot tell */
+  file?: string;
+  /** The line in that file, from 1 */
+  line?: number;
 }
 
 const GIT_CONFIG_METHODS = [
@@ -394,6 +409,19 @@ export class RemoteConfigStore {
       if (value !== undefined) return value;
     }
     return undefined;
+  }
+
+  /**
+   * Every value of a config variable in the configuration's order with where it was read,
+   * for git's `bad config variable '<key>' in file '<file>' at line <n>`. A config that
+   * cannot tell gives the values alone (`true` for a variable without `=` read as missing).
+   */
+  valuesWithOrigin(key: string): ConfigValueWhere[] {
+    if (this.config.getAllWithOrigin) return this.config.getAllWithOrigin(key);
+    return this.config
+      .getAll(key)
+      .filter((value) => value !== undefined && value !== null)
+      .map((value) => ({ text: value === true ? undefined : String(value) }));
   }
 
   /** Every value of a config variable (`branch.main.merge` may repeat). */

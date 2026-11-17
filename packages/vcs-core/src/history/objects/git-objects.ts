@@ -96,6 +96,13 @@ export interface GitObjects {
   /** Stored object ids (40 lowercase hex), whatever else the store holds. */
   list(): AsyncIterable<ObjectId>;
   /**
+   * The stored ids that start with the lowercase hex `prefix`, each once, in no particular
+   * order: what git's `find_short_object_filename` and `find_short_packed_object` find for an
+   * abbreviated id (one loose fan-out directory, a binary search in each pack's idx). Optional:
+   * `listObjectsWithPrefix` filters `list()` without it.
+   */
+  listPrefix?(prefix: string): AsyncIterable<ObjectId>;
+  /**
    * git's approximate object count, from which abbreviated ids get their length
    * (`odb_count_objects` with `ODB_COUNT_OBJECTS_APPROXIMATE`): the objects in the packs for
    * the files backend (git leaves loose objects out of this estimate), every object for the

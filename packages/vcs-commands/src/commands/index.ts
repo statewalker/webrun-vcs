@@ -41,8 +41,11 @@ export {
 } from "./reflog-messages.js";
 export * from "./remote-command.js";
 export * from "./reset-command.js";
+export * from "./rev-list-command.js";
 export * from "./rev-parse-command.js";
 export * from "./revert-command.js";
+export * from "./revision-range.js";
+export * from "./revision-resolver.js";
 export * from "./rm-command.js";
 export { SequencerOperation } from "./sequencer-pick.js";
 export * from "./stash-apply-command.js";

@@ -129,6 +129,23 @@ export class FileRawStorage implements RawStorage {
     }
   }
 
+  /** The keys starting with `prefix`: one fan-out directory read once it has two characters. */
+  async *keysWithPrefix(prefix: string): AsyncIterable<string> {
+    if (prefix.length < 2) {
+      for await (const key of this.keys()) if (key.startsWith(prefix)) yield key;
+      return;
+    }
+    const fanout = prefix.slice(0, 2);
+    const rest = prefix.slice(2);
+    try {
+      for await (const entry of this.files.list(joinPath(this.basePath, fanout))) {
+        if (entry.kind === "file" && entry.name.startsWith(rest)) yield fanout + entry.name;
+      }
+    } catch {
+      // no such fan-out directory
+    }
+  }
+
   async size(key: string): Promise<number> {
     const path = this.getPath(key);
     const stats = await this.files.stats(path);

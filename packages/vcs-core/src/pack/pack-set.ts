@@ -99,6 +99,12 @@ export interface PackSet {
    * `packs` (a snapshot from `packs()`), exactly those are.
    */
   list(options?: { packs?: readonly Pack[] }): AsyncIterable<ObjectId>;
+  /**
+   * The packed ids starting with the lowercase hex `prefix`, once each: a binary search in
+   * every idx (git's `find_short_packed_object`). Rescans as `list` does unless given `packs`.
+   * Optional for wrappers of a set; `withPacks` filters `list` without it.
+   */
+  listPrefix?(prefix: string, options?: { packs?: readonly Pack[] }): AsyncIterable<ObjectId>;
   /** The packs, in lookup order (newest first), after a rescan within the rate limit. */
   packs(): Promise<readonly Pack[]>;
   /** Installs a pack with `installPack` into the directory and adds it to the set. */
@@ -533,6 +539,24 @@ export async function openPackSet(
           let earlier = false;
           for (let j = 0; j < k && !earlier; j++) earlier = (snapshot[j] as Pack).has(id);
           if (!earlier) yield id;
+        }
+      }
+    },
+    async *listPrefix(prefix, o) {
+      let snapshot = o?.packs;
+      if (!snapshot) {
+        await rescanOnMiss();
+        snapshot = [...packs];
+      }
+      const seen = new Set<ObjectId>();
+      for (const p of snapshot) {
+        const ids = p.idsWithPrefix
+          ? p.idsWithPrefix(prefix)
+          : [...p.ids()].filter((id) => id.startsWith(prefix));
+        for (const id of ids) {
+          if (seen.has(id)) continue;
+          seen.add(id);
+          yield id;
         }
       }
     },

@@ -547,6 +547,14 @@ export function createGitObjects(
       for await (const id of store.list()) if (isId(id)) yield id;
     },
 
+    async *listPrefix(prefix) {
+      if (store.listPrefix) {
+        for await (const id of store.listPrefix(prefix)) if (isId(id)) yield id;
+      } else {
+        for await (const id of store.list()) if (isId(id) && id.startsWith(prefix)) yield id;
+      }
+    },
+
     async approximateCount() {
       let n = 0;
       for await (const id of store.list()) if (isId(id)) n++;

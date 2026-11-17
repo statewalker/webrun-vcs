@@ -12,7 +12,12 @@
  * half the bits of the approximate object count in hex digits, at least 7 (git's
  * `odb_find_abbrev_len`: 7 up to 16383 objects, 8 from 16384, 9 from 65536, 10 from
  * 262144, ...). Each id is then lengthened until no other stored object shares its prefix
- * (it need not be stored itself: a worktree file's id, the null id).
+ * (it need not be stored itself: a worktree file's id, the null id). Stores with a prefix
+ * lookup (`GitObjects.listPrefix`) are asked for the ids sharing the start length only; the
+ * others are listed whole.
+ *
+ * `listObjectsWithPrefix` finds the stored ids an abbreviation names (git's
+ * `repo_for_each_abbrev`), as the revision resolver does for `git rev-parse 1a2b`.
  *
  * @module
  */
@@ -47,6 +52,31 @@ export function parseCoreAbbrev(value: string | undefined): number | undefined {
   return n >= 4 ? Math.min(n, HEX_LENGTH) : undefined;
 }
 
+/** git's `MINIMUM_ABBREV`: an abbreviated id has at least 4 hex digits. */
+export const MINIMUM_ABBREV_LENGTH = 4;
+
+/**
+ * The stored ids that start with `prefix` (lowercase hex), each once: through
+ * `objects.listPrefix` where the store has it, else by filtering `objects.list()`.
+ *
+ * @example
+ * ```typescript
+ * for await (const id of listObjectsWithPrefix(history.objects, "1a2b")) console.log(id);
+ * ```
+ */
+export async function* listObjectsWithPrefix(
+  objects: Pick<GitObjects, "list" | "listPrefix">,
+  prefix: string,
+): AsyncIterable<ObjectId> {
+  const seen = new Set<ObjectId>();
+  const source = objects.listPrefix ? objects.listPrefix(prefix) : objects.list();
+  for await (const id of source) {
+    if (!id.startsWith(prefix) || seen.has(id)) continue;
+    seen.add(id);
+    yield id;
+  }
+}
+
 function commonHexPrefix(a: string, b: string): number {
   let i = 0;
   while (i < HEX_LENGTH && a.charCodeAt(i) === b.charCodeAt(i)) i++;
@@ -74,6 +104,27 @@ export async function findAbbrevLengths(
   }
   if (start === 0 || start >= HEX_LENGTH) {
     for (const id of wanted) out.set(id, HEX_LENGTH);
+    return out;
+  }
+  if (objects.listPrefix) {
+    // every stored id sharing `start` digits with an id is under that prefix
+    const byPrefix = new Map<string, ObjectId[]>();
+    for (const id of wanted) {
+      const prefix = id.slice(0, start);
+      let near = byPrefix.get(prefix);
+      if (!near) {
+        near = [];
+        for await (const other of listObjectsWithPrefix(objects, prefix)) near.push(other);
+        byPrefix.set(prefix, near);
+      }
+      let len = start;
+      for (const other of near) {
+        if (other === id) continue;
+        const common = commonHexPrefix(id, other);
+        if (common !== HEX_LENGTH && common >= len) len = common + 1;
+      }
+      out.set(id, Math.min(len, HEX_LENGTH));
+    }
     return out;
   }
   const all: string[] = [];

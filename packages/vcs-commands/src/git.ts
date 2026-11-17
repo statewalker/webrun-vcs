@@ -38,6 +38,7 @@ import {
   RenameBranchCommand,
   ResetCommand,
   RevertCommand,
+  RevListCommand,
   RevParseCommand,
   RmCommand,
   StashApplyCommand,
@@ -536,6 +537,20 @@ export class Git implements Disposable {
   revParse(): RevParseCommand {
     this.checkClosed();
     return new RevParseCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RevListCommand (`git log` / `git rev-list <revisions>`): commits of ranges and
+   * revision sets (`a..b`, `a...b`, `^a`, `x^@`, `x^!`, `x^-<n>`, `--not`).
+   *
+   * @example
+   * ```typescript
+   * for await (const c of await git.revList().addRevision("main..feat").call()) console.log(c.id);
+   * ```
+   */
+  revList(): RevListCommand {
+    this.checkClosed();
+    return new RevListCommand(this._workingCopy);
   }
 
   // ============ Describe Operations ============
