@@ -5,9 +5,11 @@
  * the deflated stream is staged, and the id is supplied after the last byte.
  * Reads inflate with a pooled inflater that reports the exact end of the zlib
  * stream, so truncation and trailing bytes are errors (git: "garbage at end of
- * loose object").
+ * loose object"). A small object file (at most 64 KiB) is read whole and inflated in one pass
+ * (`inflateWhole`), its content handed out in memory (`GitObject.bytes`); one that is not plainly
+ * sound goes through the streaming read, which reports it as before.
  */
-import { createInflaterPool, deflate } from "@statewalker/vcs-utils/compression";
+import { createInflaterPool, deflate, inflateWhole } from "@statewalker/vcs-utils/compression";
 import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { SizeMismatchError } from "@statewalker/vcs-utils/pack";
@@ -15,6 +17,7 @@ import type { StagingBlobStore } from "../../storage/adapters/staging-blob-store
 import {
   CorruptObjectError,
   DEFAULT_SPOOL_THRESHOLD,
+  type GitObject,
   type GitObjects,
   type GitObjectsOptions,
   InvalidObjectIdError,
@@ -119,6 +122,166 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   return out;
 }
 
+/** Stored files up to this size are read and inflated in one pass (`wholeObject`). */
+const LOOSE_WHOLE_MAX = 64 * 1024;
+/** Objects (header included) inflated at once from a file of at most `PROBE_BYTES` (`smallObject`). */
+const SMALL_MAX = 64 * 1024;
+/** Stored bytes from which a loose object's header is read (`probeHead`). */
+const PROBE_BYTES = 4096;
+/** Objects up to this size are handed out whole; larger ones stream. */
+const WHOLE_MAX = 1024 * 1024;
+
+/**
+ * Receives the start of a loose object (`wholeObject`): its header, at most `MAX_HEADER + 1`
+ * bytes, fits whatever symbol comes next (a match is at most 258 bytes).
+ */
+const headProbe = new Uint8Array(MAX_HEADER + 1 + 258);
+
+/**
+ * A loose object of at most `SMALL_MAX` bytes inflated at once from its whole file (the output
+ * grows: the size is in the header), or undefined (larger, or not plainly sound).
+ */
+function smallObject(stored: Uint8Array): GitObject | undefined {
+  let r: ReturnType<typeof inflateWhole>;
+  try {
+    r = inflateWhole(stored, { maxSize: SMALL_MAX });
+  } catch {
+    return undefined;
+  }
+  if (r.consumed !== stored.length) return undefined;
+  const out = r.data;
+  const nul = out.subarray(0, Math.min(r.length, MAX_HEADER + 1)).indexOf(0);
+  if (nul < 0) return undefined;
+  let header: Header;
+  try {
+    header = parseHeader(out.subarray(0, nul));
+  } catch {
+    return undefined;
+  }
+  if (r.length - nul - 1 !== header.size) return undefined;
+  const bytes = out.subarray(nul + 1, r.length);
+  return { type: header.type, size: header.size, bytes, content: once(bytes) };
+}
+
+/** A loose object's header, read from the start of its file (`probeHead`). */
+interface ProbedHead {
+  header: Header;
+  /** where the content starts in the inflated bytes (after the header's NUL) */
+  bodyAt: number;
+  /**
+   * the whole object when it fit in `headProbe` (its zlib stream ended there): its content copied
+   * out of the shared probe buffer, which a concurrent read may overwrite
+   */
+  whole?: { length: number; consumed: number; body: Uint8Array };
+}
+
+/**
+ * The header of a loose object from the first bytes of its file (a partial inflate), or
+ * undefined if they do not hold a sound one.
+ */
+function probeHead(start: Uint8Array): ProbedHead | undefined {
+  let head: ReturnType<typeof inflateWhole>;
+  try {
+    head = inflateWhole(start, { into: headProbe, partial: true });
+  } catch {
+    return undefined; // corrupt, or the chunk ends inside the header
+  }
+  const nul = headProbe.subarray(0, Math.min(head.length, MAX_HEADER + 1)).indexOf(0);
+  if (nul < 0) return undefined;
+  let header: Header;
+  try {
+    header = parseHeader(headProbe.subarray(0, nul));
+  } catch {
+    return undefined;
+  }
+  return {
+    header,
+    bodyAt: nul + 1,
+    ...(head.ended
+      ? {
+          whole: {
+            length: head.length,
+            consumed: head.consumed,
+            body: headProbe.slice(nul + 1, head.length),
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * A small loose object inflated in one pass from its whole file, into a buffer of the size its
+ * header declares. Undefined when it is not plainly sound (an error, bytes after the zlib
+ * stream, a body longer or shorter than its header says), so the streaming read reports it.
+ */
+function wholeObject(stored: Uint8Array, head: ProbedHead): GitObject | undefined {
+  const { header, bodyAt } = head;
+  const total = bodyAt + header.size;
+  let bytes: Uint8Array;
+  if (head.whole) {
+    // the whole object was in the probe: `stored` is the chunk it was probed from
+    if (head.whole.consumed !== stored.length || head.whole.length !== total) return undefined;
+    bytes = head.whole.body;
+  } else {
+    let r: ReturnType<typeof inflateWhole>;
+    try {
+      r = inflateWhole(stored, { size: total });
+    } catch {
+      return undefined;
+    }
+    if (r.consumed !== stored.length || r.length !== total) return undefined;
+    bytes = r.data.subarray(bodyAt);
+  }
+  return { type: header.type, size: header.size, bytes, content: once(bytes) };
+}
+
+async function* once(b: Uint8Array): AsyncGenerator<Uint8Array> {
+  yield b;
+}
+
+/** The first `n` bytes of `chunks` (all of them if shorter), copied only if they span chunks. */
+function prefix(chunks: Uint8Array[], n: number): Uint8Array {
+  const first = chunks[0] as Uint8Array;
+  if (first.length >= n || chunks.length === 1)
+    return first.length > n ? first.subarray(0, n) : first;
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(Math.min(n, total));
+  let at = 0;
+  for (const c of chunks) {
+    if (at >= out.length) break;
+    const part = c.subarray(0, out.length - at);
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+}
+
+function joined(chunks: Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
+
+/** `chunks`, then what is left of `rest`. */
+async function* replay(
+  chunks: Uint8Array[],
+  rest: AsyncIterator<Uint8Array> | undefined,
+): AsyncGenerator<Uint8Array> {
+  let done = false;
+  try {
+    yield* chunks;
+    if (rest) for (let r = await rest.next(); !r.done; r = await rest.next()) yield r.value;
+    done = true;
+  } finally {
+    if (!done) await rest?.return?.();
+  }
+}
+
 /**
  * Git objects over `store`: SHA-1 ids, zlib loose-object bytes.
  *
@@ -143,12 +306,13 @@ export function createGitObjects(
     id: string,
     state: { absent: boolean },
     retried = false,
+    source: AsyncIterable<Uint8Array> = store.get(id),
   ): AsyncGenerator<Uint8Array> {
     const inflater = pool.acquire();
     let done = false;
     let any = false;
     try {
-      for await (const chunk of store.get(id)) {
+      for await (const chunk of source) {
         for (let off = 0; off < chunk.length; off += INFLATE_SLICE) {
           const slice = chunk.subarray(off, off + INFLATE_SLICE);
           any = true;
@@ -186,11 +350,18 @@ export function createGitObjects(
     }
   }
 
-  async function* raw(id: string, verify: boolean): AsyncGenerator<Uint8Array> {
+  async function* raw(
+    id: string,
+    verify: boolean,
+    source?: AsyncIterable<Uint8Array>,
+  ): AsyncGenerator<Uint8Array> {
     if (!isId(id)) return;
     const hasher = verify ? newHasher() : undefined;
     const state = { absent: false };
-    yield* checkedRaw(inflate(id, state), { hasher, emptyIsAbsent: () => state.absent });
+    yield* checkedRaw(inflate(id, state, false, source), {
+      hasher,
+      emptyIsAbsent: () => state.absent,
+    });
     // An absent object ends the stream with nothing to verify.
     if (hasher && !state.absent) {
       const actual = hex(hasher);
@@ -300,7 +471,55 @@ export function createGitObjects(
 
     async get(id, opts) {
       if (!isId(id)) return undefined;
-      const it = raw(id, opts?.verify === true);
+      const verify = opts?.verify === true;
+      let source: AsyncIterable<Uint8Array> | undefined;
+      if (!verify) {
+        // A small object file is read whole (usually one chunk), inflated in one pass and
+        // handed out whole. Anything else (a larger file, an error, bytes after the stream)
+        // goes through the streaming read below, over the chunks already read, which reports
+        // it as ever.
+        const stored = store.get(id)[Symbol.asyncIterator]();
+        const read: Uint8Array[] = [];
+        let total = 0;
+        let ended = false;
+        const more = async (until: number) => {
+          while (!ended && total < until) {
+            const r = await stored.next();
+            if (r.done) ended = true;
+            else {
+              read.push(r.value);
+              total += r.value.length;
+            }
+          }
+        };
+        // the header from the first bytes (a store may give the zlib header as a chunk of its
+        // own): a large object is not read whole
+        await more(PROBE_BYTES);
+        if (ended && total > 0) {
+          // all of it in hand (most loose objects): inflated at once, its header read after
+          const obj = smallObject(
+            read.length === 1 ? (read[0] as Uint8Array) : joined(read, total),
+          );
+          if (obj) return obj;
+        }
+        const probed =
+          total > 0 && total <= LOOSE_WHOLE_MAX ? prefix(read, PROBE_BYTES) : undefined;
+        const head = probed ? probeHead(probed) : undefined;
+        if (head && head.header.size <= WHOLE_MAX) {
+          await more(LOOSE_WHOLE_MAX + 1);
+          if (ended && total <= LOOSE_WHOLE_MAX) {
+            const all = read.length === 1 ? (read[0] as Uint8Array) : joined(read, total);
+            const obj = wholeObject(
+              all,
+              probed?.length === total ? head : { ...head, whole: undefined },
+            );
+            if (obj) return obj;
+          }
+        }
+        // nothing read (absent, or a concurrent write): the streaming read looks again
+        if (total > 0) source = replay(read, ended ? undefined : stored);
+      }
+      const it = raw(id, verify, source);
       const first = await it.next(); // the header chunk, or the end if absent
       if (first.done) return undefined;
       const { type, size } = parseHeader(first.value.subarray(0, first.value.length - 1));

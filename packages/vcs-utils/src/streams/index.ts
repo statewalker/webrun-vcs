@@ -1,3 +1,4 @@
+export * from "./alloc-bytes.js";
 export * from "./async-iterable.js";
 export * from "./buffered-byte-reader.js";
 export * from "./collect.js";

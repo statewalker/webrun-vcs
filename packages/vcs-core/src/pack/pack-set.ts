@@ -212,6 +212,10 @@ export async function openPackSet(
         `REF_DELTA base ${id} is ${o.size} bytes, over the limit of ${maxObjectSize}`,
       );
     }
+    if (o.bytes) {
+      await o.content[Symbol.asyncIterator]().return?.();
+      return { type: o.type, data: o.bytes };
+    }
     const data = new Uint8Array(o.size);
     let at = 0;
     for await (const c of o.content) {
@@ -335,6 +339,8 @@ export async function openPackSet(
    * fails `get` itself; a failure later marks the copy bad for the next `get`.
    */
   const guarded = async (p: PackFile, id: ObjectId, obj: GitObject): Promise<GitObject> => {
+    // already in memory: nothing left to fail
+    if (obj.bytes) return obj;
     const it = obj.content[Symbol.asyncIterator]();
     let pending: IteratorResult<Uint8Array> | undefined = await it.next();
     let finished = pending.done === true;
@@ -386,7 +392,8 @@ export async function openPackSet(
     if (!isId(id)) return undefined;
     let failed: unknown;
     let vanished = false;
-    for (const p of [...packs]) {
+    // `packs` is replaced, never changed in place: this loop sees one snapshot
+    for (const p of packs) {
       if (!p.has(id)) continue;
       if (isBad(p, id)) {
         failed ??= new PackError(`object ${id}: the copy in pack ${p.packId} is corrupt`);

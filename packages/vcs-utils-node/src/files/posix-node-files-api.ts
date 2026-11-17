@@ -17,7 +17,14 @@
  * own, rooted at the link's target, which the caller opts into.
  */
 
-import { constants as fsConstants, lstatSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+} from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -233,6 +240,16 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     const real = await this.realNoLinks(path);
     const stat = await lstatOrUndefined(real);
     if (!stat?.isFile()) return;
+    const start = options?.start ?? 0;
+    const length = options?.length;
+    if (Math.min(length ?? stat.size, stat.size - start) <= SYNC_READ_MAX) {
+      // small (a loose object, a pack window): read synchronously, as `lstatOrUndefined`
+      const small = readSmallSync(real, start, length);
+      if (small !== LARGE) {
+        if (small?.length) yield small;
+        return;
+      }
+    }
     let handle: fs.FileHandle;
     try {
       handle = await fs.open(real, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
@@ -634,6 +651,47 @@ async function bigintLstatOrUndefined(
   real: string,
 ): Promise<import("node:fs").BigIntStats | undefined> {
   return lstatQuiet(real, true) as import("node:fs").BigIntStats | undefined;
+}
+
+/** Reads of at most this many bytes are synchronous (`readSmallSync`). */
+const SYNC_READ_MAX = 64 * 1024;
+/** `readSmallSync`'s answer for a file that grew past `SYNC_READ_MAX` since it was looked at. */
+const LARGE = Symbol("large");
+
+/**
+ * Bytes [start, start + length) of a small regular file, read synchronously: four async calls
+ * (open, fstat, read, close) through libuv's thread pool cost far more than reading a few
+ * kilobytes from the page cache, which is what reading a loose object or a pack window does.
+ * Opened as `read` opens (no link followed, never blocking on a FIFO) and checked to be a
+ * regular file on the descriptor; undefined when it is not one or cannot be opened.
+ */
+function readSmallSync(
+  real: string,
+  start: number,
+  length: number | undefined,
+): Uint8Array | undefined | typeof LARGE {
+  let fd: number;
+  try {
+    fd = openSync(real, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  } catch {
+    return undefined;
+  }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) return undefined;
+    const end = Math.min(length !== undefined ? start + length : opened.size, opened.size);
+    if (end - start > SYNC_READ_MAX) return LARGE;
+    const buffer = new Uint8Array(Math.max(0, end - start));
+    let got = 0;
+    while (got < buffer.length) {
+      const n = readSync(fd, buffer, got, buffer.length - got, start + got);
+      if (n === 0) break;
+      got += n;
+    }
+    return got < buffer.length ? buffer.subarray(0, got) : buffer;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** `lstat` (synchronous, see {@link bigintLstatOrUndefined}); nothing for a missing path. */

@@ -79,3 +79,33 @@ describe("applyGitDelta (checked)", () => {
     );
   });
 });
+
+describe("applyGitDelta: the result's buffer", () => {
+  const base = new TextEncoder().encode("hello world");
+
+  it("writes a small result into the buffer `allocate` gives, after one pass", () => {
+    let asked = -1;
+    const into = new Uint8Array(64);
+    const out = applyGitDelta(base, delta(...varint(11), ...varint(5), 0x90, 5), 1000, (n) => {
+      asked = n;
+      return into.subarray(0, n);
+    });
+    expect(asked).toBe(5);
+    expect(out.buffer).toBe(into.buffer);
+    expect(new TextDecoder().decode(out)).toBe("hello");
+  });
+
+  it("checks a result over 64 KiB before allocating it", () => {
+    const big = new Uint8Array(0x10000).fill(7);
+    let allocations = 0;
+    // declares one byte more than its instructions produce
+    const bad = delta(...varint(0x10000), ...varint(0x10001), 0x80);
+    expect(() =>
+      applyGitDelta(big, bad, Number.MAX_SAFE_INTEGER, (n) => {
+        allocations++;
+        return new Uint8Array(n);
+      }),
+    ).toThrow(DeltaError);
+    expect(allocations).toBe(0);
+  });
+});

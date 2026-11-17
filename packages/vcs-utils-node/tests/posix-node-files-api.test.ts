@@ -349,4 +349,39 @@ describe("PosixNodeFilesApi caches nothing across calls; a batch view only withi
       expect(readFileSync(join(base, "outside-file"), "utf8")).toBe("o");
     }
   });
+
+  it("reads small files and ranges whole (synchronously), larger ones in 64 KiB chunks", async () => {
+    const files = new PosixNodeFilesApi({ rootDir: root });
+    const small = new Uint8Array(1000).map((_, i) => i & 255);
+    const big = new Uint8Array(200_000).map((_, i) => (i * 7) & 255);
+    writeFileSync(join(root, "small"), small);
+    writeFileSync(join(root, "big"), big);
+    const chunksOf = async (path: string, o?: { start?: number; length?: number }) => {
+      const out: Uint8Array[] = [];
+      for await (const c of files.read(path, o)) out.push(c);
+      return out;
+    };
+    const smallChunks = await chunksOf("/small");
+    expect(smallChunks.length).toBe(1);
+    expect(Buffer.from(smallChunks[0] as Uint8Array).equals(Buffer.from(small))).toBe(true);
+    // a 64 KiB range of a large file (a pack window): one chunk
+    const window = await chunksOf("/big", { start: 65536, length: 65536 });
+    expect(window.length).toBe(1);
+    expect(
+      Buffer.from(window[0] as Uint8Array).equals(Buffer.from(big.subarray(65536, 131072))),
+    ).toBe(true);
+    // past the end, and empty ranges
+    expect(await chunksOf("/small", { start: 990, length: 100 })).toHaveLength(1);
+    expect(await chunksOf("/small", { start: 2000 })).toHaveLength(0);
+    expect(await chunksOf("/small", { start: 10, length: 0 })).toHaveLength(0);
+    const whole = await chunksOf("/big");
+    expect(whole.length).toBe(4);
+    expect(whole.reduce((n, c) => n + c.length, 0)).toBe(big.length);
+    // a link is never followed, a missing file reads as nothing
+    if (process.platform !== "win32") {
+      symlinkSync(join(root, "small"), join(root, "link"));
+      expect(await chunksOf("/link")).toHaveLength(0);
+    }
+    expect(await chunksOf("/missing")).toHaveLength(0);
+  });
 });

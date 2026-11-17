@@ -101,40 +101,121 @@ export async function* decodeCommitEntries(
   input: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
 ): AsyncGenerator<CommitEntry> {
   // keepDelimiter=true preserves trailing "\n" for byte-level round-trip fidelity
-  const rawLines = toLines(input, true);
+  const parser = new CommitLineParser();
+  for await (const rawLine of toLines(input, true)) yield* parser.line(rawLine);
+  yield* parser.end();
+}
 
-  let inGpgSig = false;
-  const gpgSigLines: string[] = [];
-  let messageLines: string[] | undefined;
+/** Shared: `decodeText` only decodes whole texts with it (no state left between calls). */
+const wholeTextDecoder = new TextDecoder();
 
-  for await (const rawLine of rawLines) {
+/**
+ * The text of a whole commit, decoded as `toLines` decodes a stream: a trailing incomplete
+ * UTF-8 sequence is dropped (a streaming decode never flushes it).
+ */
+function decodeText(data: Uint8Array): string {
+  // ending in ASCII (a commit ends in "\n"): nothing is held back, one shared decoder serves
+  if (data.length === 0 || (data[data.length - 1] as number) < 0x80)
+    return wholeTextDecoder.decode(data);
+  return new TextDecoder().decode(data, { stream: true });
+}
+
+/**
+ * Parse a whole commit held in memory: the commit `entriesToCommit(decodeCommitEntries([data]))`
+ * gives, without generators (a rev-walk parses every commit it reads). Throws as it does.
+ */
+export function commitFromBytes(data: Uint8Array): Commit {
+  const text = decodeText(data);
+  const builder = new CommitBuilder();
+  let gpg: string[] | undefined;
+  let at = 0;
+  let messageAt = -1;
+  while (at < text.length) {
+    const nl = text.indexOf("\n", at);
+    const lineEnd = nl < 0 ? text.length : nl;
+    const next = nl < 0 ? text.length : nl + 1;
+    // the line without its "\n" and one "\r" before it
+    const stop = lineEnd > at && text.charCodeAt(lineEnd - 1) === 13 ? lineEnd - 1 : lineEnd;
+    if (gpg) {
+      if (text.charCodeAt(at) === 32 && stop > at) {
+        gpg.push(text.slice(at + 1, stop));
+        at = next;
+        continue;
+      }
+      builder.add({ type: "gpgsig", value: gpg.join("\n") });
+      gpg = undefined;
+    }
+    if (stop === at) {
+      // the empty line: the message follows, raw
+      messageAt = next;
+      break;
+    }
+    const space = text.indexOf(" ", at);
+    if (space >= 0 && space < stop) {
+      const key = text.slice(at, space);
+      const value = text.slice(space + 1, stop);
+      switch (key) {
+        case "tree":
+          builder.add({ type: "tree", value });
+          break;
+        case "parent":
+          builder.add({ type: "parent", value });
+          break;
+        case "author":
+          builder.add({ type: "author", value: parsePersonIdent(value) });
+          break;
+        case "committer":
+          builder.add({ type: "committer", value: parsePersonIdent(value) });
+          break;
+        case "encoding":
+          builder.add({ type: "encoding", value });
+          break;
+        case "gpgsig":
+          gpg = [value];
+          break;
+      }
+    }
+    at = next;
+  }
+  if (gpg) builder.add({ type: "gpgsig", value: gpg.join("\n") });
+  if (messageAt >= 0) builder.add({ type: "message", value: text.slice(messageAt) });
+  return builder.build();
+}
+
+/** The line-by-line state of commit decoding (lines with their "\n"). */
+class CommitLineParser {
+  private inGpgSig = false;
+  private readonly gpgSigLines: string[] = [];
+  private messageLines: string[] | undefined;
+
+  *line(rawLine: string): Generator<CommitEntry> {
     // Strip line terminator for header parsing
     let line = rawLine;
     if (line.endsWith("\n")) line = line.slice(0, -1);
     if (line.endsWith("\r")) line = line.slice(0, -1);
 
     // Continuation line for gpgsig
-    if (inGpgSig) {
+    if (this.inGpgSig) {
       if (line.startsWith(" ")) {
-        gpgSigLines.push(line.substring(1));
-        continue;
+        this.gpgSigLines.push(line.substring(1));
+        return;
       }
       // Non-continuation line ends gpgsig
-      yield { type: "gpgsig", value: gpgSigLines.join("\n") };
-      inGpgSig = false;
-      gpgSigLines.length = 0;
+      yield { type: "gpgsig", value: this.gpgSigLines.join("\n") };
+      this.inGpgSig = false;
+      this.gpgSigLines.length = 0;
     }
 
     // Empty line marks start of message
-    if (line === "" && !messageLines) {
-      messageLines = [];
-    } else if (messageLines) {
+    if (line === "" && !this.messageLines) {
+      this.messageLines = [];
+    } else if (this.messageLines) {
       // Collect raw message lines preserving delimiters
-      messageLines.push(rawLine);
+      this.messageLines.push(rawLine);
     } else {
       // Parse header lines
       const spacePos = line.indexOf(" ");
-      if (spacePos === -1) continue;
+      if (spacePos === -1) return;
 
       const key = line.substring(0, spacePos);
       const value = line.substring(spacePos + 1);
@@ -156,22 +237,24 @@ export async function* decodeCommitEntries(
           yield { type: "encoding", value };
           break;
         case "gpgsig":
-          inGpgSig = true;
-          gpgSigLines.push(value);
+          this.inGpgSig = true;
+          this.gpgSigLines.push(value);
           break;
       }
     }
   }
 
-  // Finalize any ongoing gpgsig
-  if (inGpgSig) {
-    yield { type: "gpgsig", value: gpgSigLines.join("\n") };
-  }
+  *end(): Generator<CommitEntry> {
+    // Finalize any ongoing gpgsig
+    if (this.inGpgSig) {
+      yield { type: "gpgsig", value: this.gpgSigLines.join("\n") };
+    }
 
-  // Extract message — raw lines already include delimiters
-  if (messageLines) {
-    const message = messageLines.join("");
-    yield { type: "message", value: message };
+    // Extract message — raw lines already include delimiters
+    if (this.messageLines) {
+      const message = this.messageLines.join("");
+      yield { type: "message", value: message };
+    }
   }
 }
 
@@ -211,67 +294,76 @@ export function* commitToEntries(commit: Commit): Generator<CommitEntry> {
 export async function entriesToCommit(
   entries: AsyncIterable<CommitEntry> | Iterable<CommitEntry>,
 ): Promise<Commit> {
-  let tree: string | undefined;
-  const parents: string[] = [];
-  let author: Commit["author"] | undefined;
-  let committer: Commit["committer"] | undefined;
-  let encoding: string | undefined;
-  let gpgSignature: string | undefined;
-  let message = "";
+  const builder = new CommitBuilder();
+  for await (const entry of entries) builder.add(entry);
+  return builder.build();
+}
 
-  for await (const entry of entries) {
+class CommitBuilder {
+  private tree: string | undefined;
+  private readonly parents: string[] = [];
+  private author: Commit["author"] | undefined;
+  private committer: Commit["committer"] | undefined;
+  private encoding: string | undefined;
+  private gpgSignature: string | undefined;
+  private message = "";
+
+  add(entry: CommitEntry): void {
     switch (entry.type) {
       case "tree":
-        tree = entry.value;
+        this.tree = entry.value;
         break;
       case "parent":
-        parents.push(entry.value);
+        this.parents.push(entry.value);
         break;
       case "author":
-        author = entry.value;
+        this.author = entry.value;
         break;
       case "committer":
-        committer = entry.value;
+        this.committer = entry.value;
         break;
       case "encoding":
-        encoding = entry.value;
+        this.encoding = entry.value;
         break;
       case "gpgsig":
-        gpgSignature = entry.value;
+        this.gpgSignature = entry.value;
         break;
       case "message":
-        message = entry.value;
+        this.message = entry.value;
         break;
     }
   }
 
-  if (!tree) {
-    throw new Error("Invalid commit: missing tree");
-  }
-  if (!author) {
-    throw new Error("Invalid commit: missing author");
-  }
-  if (!committer) {
-    throw new Error("Invalid commit: missing committer");
-  }
+  build(): Commit {
+    const { tree, author, committer, encoding, gpgSignature } = this;
+    if (!tree) {
+      throw new Error("Invalid commit: missing tree");
+    }
+    if (!author) {
+      throw new Error("Invalid commit: missing author");
+    }
+    if (!committer) {
+      throw new Error("Invalid commit: missing committer");
+    }
 
-  const commit: Commit = {
-    tree,
-    parents,
-    author,
-    committer,
-    message,
-  };
+    const commit: Commit = {
+      tree,
+      parents: this.parents,
+      author,
+      committer,
+      message: this.message,
+    };
 
-  if (encoding) {
-    commit.encoding = encoding;
+    if (encoding) {
+      commit.encoding = encoding;
+    }
+
+    if (gpgSignature) {
+      commit.gpgSignature = gpgSignature;
+    }
+
+    return commit;
   }
-
-  if (gpgSignature) {
-    commit.gpgSignature = gpgSignature;
-  }
-
-  return commit;
 }
 
 /**

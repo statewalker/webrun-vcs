@@ -20,6 +20,14 @@ export interface GitObject {
    * iterator's `return()` to release the read and the pooled inflater.
    */
   content: AsyncIterable<Uint8Array>;
+  /**
+   * The whole content, when the store already holds it in memory (a small object read in one
+   * piece): the bytes `content` yields, for callers that parse a whole object (commits, trees)
+   * without iterating. Reading it does not consume `content`, and the buffer is the caller's
+   * own (never a cached one). It may be a view into a larger buffer: respect `byteOffset` and
+   * `byteLength` rather than reading `bytes.buffer` whole. Absent for a streamed or verified read.
+   */
+  bytes?: Uint8Array;
 }
 
 /**

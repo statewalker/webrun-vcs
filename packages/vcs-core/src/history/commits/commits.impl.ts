@@ -15,6 +15,7 @@ import {
   storeObject,
 } from "../objects/typed-object-access.js";
 import {
+  commitFromBytes,
   commitToEntries,
   decodeCommitEntries,
   encodeCommitEntries,
@@ -85,6 +86,15 @@ class GitCommitStore implements Commits {
       return undefined;
     }
     if (!obj) return undefined;
+    if (obj.bytes) {
+      // in memory already: decoded synchronously (the content needs no release)
+      if (obj.type !== "commit") return undefined;
+      try {
+        return commitFromBytes(obj.bytes);
+      } catch {
+        return undefined;
+      }
+    }
     const it = obj.content[Symbol.asyncIterator]();
     try {
       if (obj.type !== "commit") return undefined;
