@@ -35,11 +35,15 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
+import type { GitObjects } from "@statewalker/vcs-core";
+import { createGitFilesBackend } from "@statewalker/vcs-store-files";
+import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-import type { FsckCommand } from "../src/index.js";
+import { type FsckCommand, Git } from "../src/index.js";
 import { gitOk, openOurs, put } from "./merge-native-helpers.js";
+import { createMockWorktree } from "./mock-worktree-store.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -985,5 +989,163 @@ describeGit("fsck against native git", () => {
       g(dir, "config", "core.bigFileThreshold", value);
       expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
     }
+  });
+
+  it("packs read in one pass: OFS and REF deltas, a blob over 1 MiB, corrupt bases, a tree bad in its pack", async () => {
+    const dir = newRepo();
+    for (let i = 1; i <= 8; i++) {
+      // small changes: long delta chains
+      const lines = Array.from({ length: 300 + i }, (_, k) =>
+        k % 37 === i ? `changed ${i}` : `line ${k}`,
+      );
+      put(dir, "f", `${lines.join("\n")}\n`);
+      put(dir, `d${i % 3}/g`, `${Array.from({ length: 50 + i }, (_, k) => `g ${k}`).join("\n")}\n`);
+      if (i === 4) writeFileSync(join(dir, "big"), noise(1536 * 1024, 7));
+      g(dir, "add", "-A");
+      g(dir, "commit", "-q", "-m", `c${i}`);
+    }
+    const packDir = join(dir, ".git", "objects", "pack");
+    const packFile = () => readdirSync(packDir).find((f) => f.endsWith(".pack")) as string;
+    const git = await openOurs(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    /** `verify-pack -v`: the same listing and status as git's. */
+    const verifyPack = async (expectOutput: boolean) => {
+      const rel = `.git/objects/pack/${packFile().slice(0, -5)}.idx`;
+      const theirs = native(dir, ["verify-pack", "-v", rel]);
+      const ours = await git
+        .verifyPack()
+        .setRepositoryFiles({ files })
+        .addPack(rel)
+        .setVerbose(true)
+        .call();
+      expect(ours.exitCode === 0).toBe(theirs.status === 0);
+      if (expectOutput) expect(ours.output).toBe(theirs.stdout);
+      else expect(ours.output.split("\n").at(-2)).toBe(theirs.stdout.split("\n").at(-2));
+      return theirs.stdout;
+    };
+    const both = async () => {
+      await compare(dir, []);
+      await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    };
+
+    for (const offsets of ["true", "false"]) {
+      g(dir, "-c", `repack.useDeltaBaseOffset=${offsets}`, "repack", "-adfq", "--depth=4");
+      await both();
+      const listing = await verifyPack(true);
+      // whole objects that are a delta's base, and deltas based on deltas
+      const rows = listing
+        .split("\n")
+        .map((l) => l.split(/ +/))
+        .filter((r) => /^[0-9a-f]{40}$/.test(r[0] as string));
+      const bases = new Set(rows.filter((r) => r.length === 7).map((r) => r[6] as string));
+      const base = rows.find((r) => r.length === 5 && bases.has(r[0] as string)) as string[];
+      const deep = rows.find((r) => r.length === 7 && Number(r[5]) >= 2) as string[];
+      expect(base && deep).toBeTruthy();
+      const pack = join(packDir, packFile());
+      const original = readFileSync(pack);
+      for (const row of [base, deep]) {
+        // a byte in the middle of the entry's compressed data: the same entries fail as in
+        // git (git also reports the failed delta bases on the way, which this does not)
+        flipByte(pack, Number(row[4]) + Math.floor(Number(row[3]) / 2));
+        expect(await unpackErrors(dir)).toEqual(unpackErrors(dir, true));
+        await verifyPack(false);
+        writeFileSync(pack, original);
+      }
+    }
+
+    // a tree whose packed copy is corrupt, with a sound loose copy
+    const tree = g(dir, "rev-parse", "HEAD~2^{tree}");
+    const content = spawnSync("git", ["cat-file", "tree", tree], { cwd: dir }).stdout;
+    writeLoose(dir, bytesOf(`tree ${content.length}\0`, content), tree);
+    const row = (await verifyPack(true)).split("\n").find((l) => l.startsWith(tree)) as string;
+    const [, , , size, at] = row.split(/ +/);
+    flipByte(join(packDir, packFile()), Number(at) + Math.floor(Number(size) / 2));
+    expect(await unpackErrors(dir)).toEqual(unpackErrors(dir, true));
+  });
+
+  /** The pack errors of a full fsck (checksums, CRCs, entries that cannot be unpacked). */
+  function unpackErrors(dir: string, native: true): string[];
+  function unpackErrors(dir: string): Promise<string[]>;
+  function unpackErrors(dir: string, nativeGit?: true): string[] | Promise<string[]> {
+    const pick = (text: string) =>
+      text
+        .split("\n")
+        .filter((l) => /^error: (cannot unpack|packed |index CRC|\S+ pack checksum)/.test(l))
+        .sort();
+    if (nativeGit) return pick(native(dir, ["fsck", ...noReferences]).stderr);
+    return openOurs(dir).then(async (git) => {
+      const files = createNodeFilesApi({ rootDir: dir });
+      const r = await git
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(compatibility)
+        .call();
+      return pick(r.errorOutput);
+    });
+  }
+
+  it("--connectivity-only reads no blob, not even to name a dangling one's type", async () => {
+    const dir = newRepo();
+    for (let i = 1; i <= 4; i++) {
+      const lines = Array.from({ length: 200 }, (_, k) => (k === i ? `blob ${i}` : `line ${k}`));
+      commitFiles(dir, { f: `${lines.join("\n")}\n`, [`d/${i}`]: `${i}\n` }, `c${i}`);
+    }
+    // dangling blobs, one a delta of a reachable one, packed with the rest
+    const lines = Array.from({ length: 200 }, (_, k) => (k === 7 ? "dangling" : `line ${k}`));
+    literal(dir, "blob", `${lines.join("\n")}\n`);
+    literal(dir, "blob", "dangling on its own\n");
+    const all = g(dir, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)");
+    const packed = native(
+      dir,
+      ["pack-objects", "-q", ".git/objects/pack/pack"],
+      new TextEncoder().encode(`${all}\n`),
+    );
+    expect(packed.status).toBe(0);
+    g(dir, "prune-packed");
+    expect(readdirSync(join(dir, ".git", "objects")).filter((d) => d.length === 2)).toEqual([]);
+    const theirs = await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    expect(theirs.stdout).toMatch(/^dangling blob /m);
+
+    // the same run over a store that records what it reads
+    const files = createNodeFilesApi({ rootDir: dir });
+    const { history } = await createGitFilesBackend({ files });
+    const store = history.objects as GitObjects;
+    const types: string[] = [];
+    const note = <T extends { type: string } | undefined>(o: T): T => {
+      if (o) types.push(o.type);
+      return o;
+    };
+    const spy = new Proxy(store, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (prop === "get") {
+          return (id: string, o?: { verify?: boolean }) => target.get(id, o).then(note);
+        }
+        if (prop === "getNow" && typeof value === "function") {
+          return (id: string, o?: { verify?: boolean }) => {
+            const r = value.call(target, id, o);
+            return r instanceof Promise ? r.then(note) : note(r);
+          };
+        }
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    Object.defineProperty(history, "objects", { value: spy });
+    const git = Git.fromWorkingCopy(
+      new MemoryWorkingCopy({
+        history,
+        checkout: new MemoryCheckout({ staging: new MemoryStagingStore() }),
+        worktree: createMockWorktree(),
+      }),
+    );
+    const ours = await git
+      .fsck()
+      .setRepositoryFiles({ files })
+      .setCompatibility(compatibility)
+      .setConnectivityOnly(true)
+      .call();
+    expect(ours.output).toBe(theirs.stdout);
+    expect(types.length).toBeGreaterThan(0);
+    expect(types.filter((t) => t === "blob")).toEqual([]);
   });
 });

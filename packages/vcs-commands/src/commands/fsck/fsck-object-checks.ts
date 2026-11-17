@@ -329,20 +329,6 @@ export function treeEntryId(buf: Uint8Array, entry: RawTreeEntry): string {
   return bytesToHex(buf.subarray(entry.idAt, entry.idAt + 20));
 }
 
-/**
- * A name none of fsck's special-name checks can match (`.`, `..`, `.git`, `.gitmodules` and the
- * like under their HFS+ and NTFS spellings): it does not start with a dot and holds no `~`, no
- * backslash and no non-ASCII byte.
- */
-function isPlainName(name: Uint8Array): boolean {
-  if (name[0] === 0x2e) return false;
-  for (let i = 0; i < name.length; i++) {
-    const c = name[i] as number;
-    if (c === 0x7e || c === 0x5c || c >= 0x80) return false;
-  }
-  return true;
-}
-
 /** Whether the 20 id bytes at `at` are all zero (the null id). */
 function isNullIdAt(buf: Uint8Array, at: number): boolean {
   for (let i = at; i < at + 20; i++) if (buf[i] !== 0) return false;
@@ -408,6 +394,68 @@ export function walkTree(buf: Uint8Array): TreeWalk {
   }
 }
 
+/**
+ * A tree's entries as `walkTree` decodes them, without an object per entry: entry `i` has its
+ * mode at `fields[3 * i]`, the offset of its name at `fields[3 * i + 1]` and of its 20 id bytes
+ * at `fields[3 * i + 2]` (the name ends at the NUL before them).
+ */
+export interface TreeEntryTable {
+  count: number;
+  fields: Int32Array;
+  /** The first entry could not be decoded (`init_tree_desc_gently` failed). */
+  initError?: string;
+  /** A later entry could not be decoded: the walk stopped before it. */
+  error?: string;
+}
+
+const NO_FIELDS = new Int32Array(0);
+
+/** `walkTree`, into a table (the walks of fsck's object pass and connectivity walk). */
+export function scanTree(buf: Uint8Array): TreeEntryTable {
+  const len = buf.length;
+  if (len === 0) return { count: 0, fields: NO_FIELDS };
+  // an entry takes at least 24 bytes (a mode digit, a space, a name byte, a NUL and the id);
+  // one more slot for the entry decoded past the last one kept
+  const fields = new Int32Array(3 * (Math.floor(len / 23) + 2));
+  let err = decodeTreeEntryInto(buf, 0, fields, 0);
+  if (err) return { count: 0, fields, initError: err };
+  let count = 0;
+  for (;;) {
+    const next = (fields[3 * count + 2] as number) + 20;
+    if (next > len) return { count, fields, error: "too-short tree file" };
+    if (next >= len) return { count: count + 1, fields };
+    err = decodeTreeEntryInto(buf, next, fields, count + 1);
+    if (err) return { count, fields, error: err };
+    count++;
+  }
+}
+
+/** `decodeTreeEntry` into slot `k` of a `TreeEntryTable`'s fields: undefined, or its error. */
+function decodeTreeEntryInto(
+  buf: Uint8Array,
+  at: number,
+  fields: Int32Array,
+  k: number,
+): string | undefined {
+  const size = buf.length - at;
+  if (size < 23 || buf[at + size - 21] !== NUL) return "too-short tree object";
+  if (buf[at] === SP) return "malformed mode in tree entry";
+  let p = at;
+  let mode = 0;
+  for (;;) {
+    const c = buf[p++];
+    if (c === SP) break;
+    if (c === undefined || c < 0x30 || c > 0x37) return "malformed mode in tree entry";
+    mode = (mode * 8 + (c - 0x30)) & 0xffff;
+  }
+  if (buf[p] === NUL) return "empty filename in tree entry";
+  const nul = indexOf(buf, NUL, p);
+  fields[3 * k] = mode;
+  fields[3 * k + 1] = p;
+  fields[3 * k + 2] = nul + 1;
+  return undefined;
+}
+
 /** git's `canon_mode`: the mode a walk sees. */
 export function canonMode(mode: number): number {
   switch (mode & S_IFMT) {
@@ -436,27 +484,35 @@ function hasPrefix(name: Uint8Array, prefix: Uint8Array): boolean {
 const TREE_UNORDERED = -1;
 const TREE_HAS_DUPS = -2;
 
-/** git's `verify_ordered`, with its stack of file names a later directory may duplicate. */
+/**
+ * git's `verify_ordered` for the names at [s1, e1) and [s2, e2) of `buf`, with its stack of file
+ * names a later directory may duplicate.
+ */
 function verifyOrdered(
+  buf: Uint8Array,
   mode1: number,
-  name1: Uint8Array,
+  s1: number,
+  e1: number,
   mode2: number,
-  name2: Uint8Array,
+  s2: number,
+  e2: number,
   candidates: Uint8Array[],
 ): number {
-  const len = Math.min(name1.length, name2.length);
+  const len = Math.min(e1 - s1, e2 - s2);
   for (let i = 0; i < len; i++) {
-    if (name1[i] !== name2[i])
-      return (name1[i] as number) < (name2[i] as number) ? 0 : TREE_UNORDERED;
+    const a = buf[s1 + i] as number;
+    const b = buf[s2 + i] as number;
+    if (a !== b) return a < b ? 0 : TREE_UNORDERED;
   }
-  let c1 = name1[len] ?? 0;
-  let c2 = name2[len] ?? 0;
+  let c1 = len < e1 - s1 ? (buf[s1 + len] as number) : 0;
+  let c2 = len < e2 - s2 ? (buf[s2 + len] as number) : 0;
   if (!c1 && !c2) return TREE_HAS_DUPS;
   if (!c1 && isDir(mode1)) c1 = SLASH;
   if (!c2 && isDir(mode2)) c2 = SLASH;
   if (!c1 && isLessThanSlash(c2)) {
-    candidates.push(name1);
+    candidates.push(buf.subarray(s1, e1));
   } else if (c2 === SLASH && isLessThanSlash(c1)) {
+    const name2 = buf.subarray(s2, e2);
     for (;;) {
       const fName = candidates.pop();
       if (!fName) break;
@@ -480,7 +536,8 @@ export interface TreeFindings {
 
 /**
  * git's `fsck_tree`. `onDecodeError` receives the tree walker's own error message (git prints
- * it with `error()` before reporting `badTree`).
+ * it with `error()` before reporting `badTree`). `table` is the tree's `scanTree`, when the
+ * caller has it already.
  */
 export function fsckTree(
   buf: Uint8Array,
@@ -488,6 +545,7 @@ export function fsckTree(
   report: FsckReport,
   onDecodeError: (message: string) => void,
   found: TreeFindings,
+  table: TreeEntryTable = scanTree(buf),
 ): number {
   let retval = 0;
   let hasNullSha1 = false;
@@ -504,33 +562,46 @@ export function fsckTree(
   const candidates: Uint8Array[] = [];
 
   if (buf.length === 0) return 0;
-  let entry = decodeTreeEntry(buf, 0);
-  if (typeof entry === "string") {
-    onDecodeError(entry);
+  if (table.initError !== undefined) {
+    onDecodeError(table.initError);
     return report("badTree", "cannot be parsed as a tree");
   }
+  const f = table.fields;
+  // the entries whose next one decoded (or that end the tree), then the one whose next did not
+  const last = table.error === undefined ? table.count - 1 : table.count;
   let oMode = 0;
-  let oName: Uint8Array | undefined;
-  for (;;) {
-    const { mode, name } = entry;
-    hasNullSha1 ||= isNullIdAt(buf, entry.idAt);
-    hasFullPath ||= name.includes(SLASH);
-    hasEmptyName ||= name.length === 0;
-    hasZeroPad ||= buf[entry.at] === ZERO;
-    hasLargeName ||= name.length > types.maxTreeEntryLength;
+  let oStart = -1;
+  let oEnd = -1;
+  for (let i = 0; i <= last; i++) {
+    const mode = f[3 * i] as number;
+    const start = f[3 * i + 1] as number;
+    const idAt = f[3 * i + 2] as number;
+    const end = idAt - 1;
+    hasNullSha1 ||= isNullIdAt(buf, idAt);
+    hasEmptyName ||= end === start;
+    // the entry's mode text starts where the one before ended
+    hasZeroPad ||= buf[i === 0 ? 0 : (f[3 * i - 1] as number) + 20] === ZERO;
+    hasLargeName ||= end - start > types.maxTreeEntryLength;
     // the name checks below can match only a name that starts with a dot, or holds a `~`, a
     // backslash or a non-ASCII byte: most names skip them
-    if (!isPlainName(name)) {
-      const text = dec.decode(name);
+    let plain = buf[start] !== 0x2e;
+    for (let k = start; k < end; k++) {
+      const c = buf[k] as number;
+      if (c === SLASH) hasFullPath = true;
+      else if (c === 0x7e || c === 0x5c || c >= 0x80) plain = false;
+    }
+    if (!plain) {
+      const entryId = () => bytesToHex(buf.subarray(idAt, idAt + 20));
+      const text = dec.decode(buf.subarray(start, end));
       hasDot ||= text === ".";
       hasDotdot ||= text === "..";
       hasDotgit ||= isDotGitComponent(text);
       if (isGitWorktreeFile(text, "gitmodules")) {
-        if (!isLink(mode)) found.gitmodules.push(treeEntryId(buf, entry));
+        if (!isLink(mode)) found.gitmodules.push(entryId());
         else retval += report("gitmodulesSymlink", ".gitmodules is a symbolic link");
       }
       if (isGitWorktreeFile(text, "gitattributes")) {
-        if (!isLink(mode)) found.gitattributes.push(treeEntryId(buf, entry));
+        if (!isLink(mode)) found.gitattributes.push(entryId());
         else retval += report("gitattributesSymlink", ".gitattributes is a symlink");
       }
       if (isLink(mode)) {
@@ -545,7 +616,7 @@ export function fsckTree(
         // git checks only is_ntfs_dotgitmodules there (no HFS+ spelling)
         for (const part of text.split("\\").slice(1)) {
           if (isNtfsGitWorktreeFile(part, "gitmodules")) {
-            if (!isLink(mode)) found.gitmodules.push(treeEntryId(buf, entry));
+            if (!isLink(mode)) found.gitmodules.push(entryId());
             else retval += report("gitmodulesSymlink", ".gitmodules is a symbolic link");
           }
         }
@@ -553,17 +624,8 @@ export function fsckTree(
     }
 
     // update_tree_entry_gently
-    const next = entry.idAt + 20;
-    let decodeError: string | undefined;
-    let nextEntry: RawTreeEntry | undefined;
-    if (next > buf.length) decodeError = "too-short tree file";
-    else if (next < buf.length) {
-      const decoded = decodeTreeEntry(buf, next);
-      if (typeof decoded === "string") decodeError = decoded;
-      else nextEntry = decoded;
-    }
-    if (decodeError) {
-      onDecodeError(decodeError);
+    if (i === table.count) {
+      onDecodeError(table.error as string);
       retval += report("badTree", "cannot be parsed as a tree");
       break;
     }
@@ -583,15 +645,14 @@ export function fsckTree(
         hasBadModes = true;
     }
 
-    if (oName) {
-      const order = verifyOrdered(oMode, oName, mode, name, candidates);
+    if (oStart >= 0) {
+      const order = verifyOrdered(buf, oMode, oStart, oEnd, mode, start, end, candidates);
       if (order === TREE_UNORDERED) notProperlySorted = true;
       else if (order === TREE_HAS_DUPS) hasDupEntries = true;
     }
     oMode = mode;
-    oName = name;
-    if (!nextEntry) break;
-    entry = nextEntry;
+    oStart = start;
+    oEnd = end;
   }
 
   if (hasNullSha1) retval += report("nullSha1", "contains entries pointing to null sha1");
@@ -865,6 +926,19 @@ export interface ParsedCommit {
  * lowercased (git's `get_oid_hex` accepts either case).
  */
 export function parseCommitBuffer(buf: Uint8Array, id: string): ParsedCommit | { error: string } {
+  const links = parseCommitLinks(buf, id);
+  if ("error" in links) return links;
+  return {
+    tree: hexIdAt(buf, links.tree),
+    parents: links.parents.map((at) => hexIdAt(buf, at)),
+  };
+}
+
+/** `parseCommitBuffer` with the ids left in place: where each one's 40 hex digits start. */
+export function parseCommitLinks(
+  buf: Uint8Array,
+  id: string,
+): { tree: number; parents: number[] } | { error: string } {
   const tail = buf.length;
   const treeLen = HEX + 5;
   const parentLen = HEX + 7;
@@ -872,18 +946,35 @@ export function parseCommitBuffer(buf: Uint8Array, id: string): ParsedCommit | {
     return { error: `bogus commit object ${id}` };
   }
   if (parseOidHex(buf, 5) < 0) return { error: `bad tree pointer in commit ${id}` };
-  const tree = dec.decode(buf.subarray(5, 5 + HEX)).toLowerCase();
-  const parents: string[] = [];
+  const parents: number[] = [];
   let p = treeLen + 1;
   while (p + parentLen < tail && startsWith(buf, p, "parent ")) {
     if (tail <= p + parentLen + 1 || parseOidHex(buf, p + 7) < 0 || buf[p + parentLen] !== NL) {
       return { error: `bad parents in commit ${id}` };
     }
-    parents.push(dec.decode(buf.subarray(p + 7, p + 7 + HEX)).toLowerCase());
+    parents.push(p + 7);
     p += parentLen + 1;
   }
-  return { tree, parents };
+  return { tree: 5, parents };
 }
+
+/** The 40 hex digits at `at` (checked by `parseOidHex`), lowercased. */
+export function hexIdAt(buf: Uint8Array, at: number): string {
+  return dec.decode(buf.subarray(at, at + HEX)).toLowerCase();
+}
+
+/** The 20 bytes of the 40 hex digits at `at` (either case, checked), written into `out`. */
+export function rawIdAt(buf: Uint8Array, at: number, out: Uint8Array): Uint8Array {
+  for (let i = 0; i < 20; i++) {
+    const hi = buf[at + 2 * i] as number;
+    const lo = buf[at + 2 * i + 1] as number;
+    out[i] = (nibble(hi) << 4) | nibble(lo);
+  }
+  return out;
+}
+
+/** A hex digit's value (`0-9`, `a-f`, `A-F`). */
+const nibble = (c: number) => (c <= 0x39 ? c - 0x30 : (c | 0x20) - 0x57);
 
 /** A tag as `parse_tag_buffer` reads it, up to the point where it looks the tagged object up. */
 export interface ParsedTag {

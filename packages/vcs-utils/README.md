@@ -16,7 +16,7 @@ The output is byte-compatible with Git: object hashes, zlib streams and pack del
 pnpm add @statewalker/vcs-utils
 ```
 
-No peer dependencies. Hashing uses `@noble/hashes`.
+No peer dependencies. SHA-1 is this package's own (WebAssembly where the runtime compiles it, JavaScript elsewhere); SHA-256 uses `@noble/hashes`.
 
 | Import path | Contents |
 |-------------|----------|
@@ -381,7 +381,7 @@ Line diffs, the unified diff and line merges follow git's xdiff (`xdiff`, `unifi
 
 ### Dependencies
 
-- `@noble/hashes`: incremental SHA-1 and SHA-256 (audited, dependency-free, runs in every JavaScript runtime). The `Hasher` interface keeps it replaceable by a native or WASM implementation.
+- `@noble/hashes`: incremental SHA-256 (audited, dependency-free, runs in every JavaScript runtime). SHA-1 is implemented here (`hash/hasher/sha1-fast.ts`, `sha1-wasm.ts`) behind the same `Hasher` interface.
 - `pako`: partial zlib decompression with byte accounting (see above), and an alternative pure-JS compression set (`createPakoCompression`, whose `deflate` and `inflate` push each chunk through pako's `Deflate` / `Inflate` and yield its output as it comes, never holding a whole stream).
 - `@statewalker/webrun-files-mem`: backs `createInMemoryFilesApi`. The `FilesApi` interface itself is declared in this package (`src/files/files-api.ts`) and matches the one implemented by the `@statewalker/webrun-files*` packages.
 - `@statewalker/webrun-files` is listed in `package.json`, but no source file imports it.

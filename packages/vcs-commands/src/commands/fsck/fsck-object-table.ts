@@ -50,6 +50,7 @@ export interface ObjectLinks {
 }
 
 const HEX = "0123456789abcdef";
+const HEX_CODE = Array.from(HEX, (c) => c.charCodeAt(0));
 /** Hex digit values by char code, -1 for a non-digit. */
 const HEX_VALUE = (() => {
   const t = new Int8Array(128).fill(-1);
@@ -71,23 +72,33 @@ export class ObjectTable {
   private types = new Uint8Array(1024);
   private flagsOf = new Uint8Array(1024);
   /** Object numbers by slot, -1 for an empty slot. */
+  /**
+   * The slots, two words each: the object number (-1 for an empty slot) and its id's key, so a
+   * probe reads one place before comparing ids.
+   */
   private slots = new Int32Array(0);
   private readonly scratch = new Uint8Array(20);
+  /** The char codes `id` builds a string from. */
+  private readonly codes: number[] = new Array(40).fill(0);
   readonly links = new Map<number, ObjectLinks>();
 
   get size(): number {
     return this.n;
   }
 
-  /** The id of object `n`, as hex. */
+  /**
+   * The id of object `n`, as hex: built in one piece, so it is a flat string (hashing or
+   * comparing one built a digit pair at a time first copies it).
+   */
   id(n: number): string {
     const raw = this.raw;
-    let out = "";
-    for (let i = n * 20, end = i + 20; i < end; i++) {
-      const b = raw[i] as number;
-      out += HEX[b >> 4] + HEX[b & 15];
+    const codes = this.codes;
+    for (let i = 0, at = n * 20; i < 20; i++, at++) {
+      const b = raw[at] as number;
+      codes[2 * i] = HEX_CODE[b >> 4] as number;
+      codes[2 * i + 1] = HEX_CODE[b & 15] as number;
     }
-    return out;
+    return String.fromCharCode.apply(null, codes);
   }
 
   type(n: number): ObjType {
@@ -118,19 +129,18 @@ export class ObjectTable {
 
   /** `lookup` for the 20 id bytes at `at` in `buf`. */
   lookupRaw(buf: Uint8Array, at: number): number {
-    const size = this.slots.length;
+    const size = this.slots.length >>> 1;
     if (size === 0) return -1;
     const key = keyOf(buf, at);
     const first = (key >>> 0) & (size - 1);
     const raw = this.raw;
-    const keys = this.keys;
     const slots = this.slots;
     let i = first;
     let n: number;
     for (;;) {
-      n = slots[i] as number;
+      n = slots[2 * i] as number;
       if (n < 0) return -1;
-      if (keys[n] === key) {
+      if (slots[2 * i + 1] === key) {
         let k = 4;
         const o = n * 20;
         while (k < 20 && raw[o + k] === buf[at + k]) k++;
@@ -140,10 +150,17 @@ export class ObjectTable {
       if (i === size) i = 0;
     }
     if (i !== first) {
-      slots[i] = slots[first] as number;
-      slots[first] = n;
+      slots[2 * i] = slots[2 * first] as number;
+      slots[2 * i + 1] = slots[2 * first + 1] as number;
+      slots[2 * first] = n;
+      slots[2 * first + 1] = key;
     }
     return n;
+  }
+
+  /** `lookup` of object `n` itself, for the move to the slot its probe starts from. */
+  touch(n: number): void {
+    this.lookupRaw(this.raw, n * 20);
   }
 
   /** git's `create_object`. */
@@ -154,7 +171,7 @@ export class ObjectTable {
   /** `create` for the 20 id bytes at `at` in `buf`. */
   createRaw(buf: Uint8Array, at: number, type: ObjType): number {
     const n = this.n;
-    if (this.slots.length - 1 <= n * 2) this.grow();
+    if ((this.slots.length >>> 1) - 1 <= n * 2) this.grow();
     if (n >= this.types.length) {
       const cap = this.types.length * 2;
       const raw = new Uint8Array(cap * 20);
@@ -209,7 +226,11 @@ export class ObjectTable {
 
   /** Object numbers in slot order (git's `get_indexed_object` loop). */
   *inSlotOrder(): Iterable<number> {
-    for (const n of this.slots) if (n >= 0) yield n;
+    const slots = this.slots;
+    for (let i = 0; i < slots.length; i += 2) {
+      const n = slots[i] as number;
+      if (n >= 0) yield n;
+    }
   }
 
   /** The bytes of a 40-digit lowercase hex id, in a scratch buffer; undefined if not one. */
@@ -233,20 +254,26 @@ export class ObjectTable {
 
   private grow(): void {
     const old = this.slots;
-    const size = old.length < 32 ? 32 : old.length * 2;
-    const slots = new Int32Array(size).fill(-1);
-    for (const n of old) if (n >= 0) this.insert(n, slots);
+    const oldSize = old.length >>> 1;
+    const size = oldSize < 32 ? 32 : oldSize * 2;
+    const slots = new Int32Array(2 * size).fill(-1);
+    for (let i = 0; i < oldSize; i++) {
+      const n = old[2 * i] as number;
+      if (n >= 0) this.insert(n, slots);
+    }
     this.slots = slots;
   }
 
   private insert(n: number, slots: Int32Array): void {
-    const size = slots.length;
-    let j = ((this.keys[n] as number) >>> 0) & (size - 1);
-    while ((slots[j] as number) >= 0) {
+    const size = slots.length >>> 1;
+    const key = this.keys[n] as number;
+    let j = (key >>> 0) & (size - 1);
+    while ((slots[2 * j] as number) >= 0) {
       j++;
       if (j >= size) j = 0;
     }
-    slots[j] = n;
+    slots[2 * j] = n;
+    slots[2 * j + 1] = key;
   }
 }
 

@@ -34,9 +34,9 @@ const encoder = new TextEncoder();
 
 /**
  * Above this size Web Crypto's native SHA-1 wins even after copying header and
- * content into one buffer (64 MiB: 93 ms against noble's 349 ms on Node 24);
- * below it the async round trip costs more than the hash (100k small objects:
- * noble 443 ms, Web Crypto 3.7 s).
+ * content into one buffer (64 MiB: 93 ms against 349 ms for the portable hasher
+ * of the time, `@noble/hashes`, on Node 24); below it the async round trip costs
+ * more than the hash (100k small objects: 443 ms against Web Crypto's 3.7 s).
  */
 const NATIVE_THRESHOLD = 64 * 1024;
 

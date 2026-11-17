@@ -3,9 +3,13 @@ import {
   type GitObject,
   type GitObjects,
   isSymbolicRef,
+  openPack,
+  type PackFile,
   type PackIndex,
   type Refs,
   readPackIndex,
+  runSteps,
+  type Steps,
 } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
@@ -27,9 +31,12 @@ import {
   fsckCommit,
   fsckTag,
   fsckTree,
-  parseCommitBuffer,
+  hexIdAt,
+  parseCommitLinks,
   parseTagBuffer,
-  walkTree,
+  rawIdAt,
+  scanTree,
+  type TreeEntryTable,
 } from "./fsck-object-checks.js";
 import {
   HAS_OBJ,
@@ -47,7 +54,7 @@ import {
   typeOf,
   USED,
 } from "./fsck-object-table.js";
-import { collect, scanPack, unpackEntry } from "./fsck-pack.js";
+import { checkPack, collect } from "./fsck-pack.js";
 
 /** Exit status bits, as `git fsck` returns them (git 2.43's builtin/fsck.c). */
 export const FSCK_ERROR_OBJECT = 0o1;
@@ -175,7 +182,10 @@ const pathOf = (...parts: string[]) => parts.join("/");
  * from the staging area.
  *
  * Memory holds per object only its type, a few flags and a commit's tree and parents (as git
- * does); contents are read one object at a time.
+ * does), and for a tree checked in full the object numbers of its entries (so the connectivity
+ * walk does not unpack it again); contents are read one object at a time. Packs are checked in
+ * one sequential read each (see `fsck-pack.ts`); `--connectivity-only` inflates no blob (a
+ * dangling one's type comes from its pack entry's header).
  *
  * Not done: the ref database checks of `git refs verify` (git 2.45+), commit-graph,
  * multi-pack-index, bitmap and reverse-index verification, promisor objects, alternates,
@@ -372,6 +382,12 @@ interface RepoPack {
   idxBytes: Uint8Array;
 }
 
+/** An object read whole. */
+interface Whole {
+  type: string;
+  content: Uint8Array;
+}
+
 /** The reflog of one ref: its name as git prints it and its entries, oldest first. */
 interface Reflog {
   name: string;
@@ -404,6 +420,27 @@ class FsckRun {
   private readonly gitattributesDone = new Set<string>();
   private shallow = new Set<string>();
   private packs: RepoPack[] = [];
+  /**
+   * Trees checked in full, as their entries' objects: object number -> start in `kids`, where
+   * the entry count comes first, then `(object << 1) | isTree` per entry (gitlinks left out).
+   * Only for trees whose entries all resolved, in full runs without `--name-objects`, so the
+   * connectivity walk need not read them again (git reads them again: a few bytes per entry
+   * here against unpacking every tree twice).
+   */
+  private readonly treeEntries = new Map<number, number>();
+  private kids = new Int32Array(1 << 12);
+  private kidsLength = 0;
+  /** The tree `walkUsed` decoded last, for `fsckTree` to check without decoding it again. */
+  private lastTree?: { content: Uint8Array; table: TreeEntryTable };
+  /** Whether `walkUsed` records the trees it walks (`treeEntries`). */
+  private readonly recordTrees: boolean;
+  /**
+   * Objects with a copy that failed a check: the connectivity walk reads these from the store
+   * (which may read that copy), never from `treeEntries`.
+   */
+  private readonly badCopy = new Set<string>();
+  /** Where an id parsed from hex is written for a lookup. */
+  private readonly idScratch = new Uint8Array(20);
   private readonly files?: FilesApi;
   private readonly gitDir: string;
 
@@ -415,6 +452,7 @@ class FsckRun {
   ) {
     if (o.nameObjects) this.names = new Map();
     this.showUnreachable = o.unreachable;
+    this.recordTrees = !o.connectivityOnly && !o.nameObjects;
     this.files = o.repository?.files;
     this.gitDir = (o.repository?.gitDir ?? ".git").replace(/\/+$/, "");
   }
@@ -427,7 +465,12 @@ class FsckRun {
     const snapshot = this.o.compatibility === "2.56" ? await this.snapshotRefs() : undefined;
 
     if (this.o.connectivityOnly) {
-      for await (const id of this.storedIds()) this.t.addFlags(this.t.lookupUnknown(id), HAS_OBJ);
+      const t = this.t;
+      await this.forEachStored((raw, at) => {
+        // git's lookup_unknown_object
+        const n = t.lookupRaw(raw, at);
+        t.addFlags(n >= 0 ? n : t.createRaw(raw, at, OBJ_NONE), HAS_OBJ);
+      });
     } else {
       if (this.files) {
         await this.fsckLooseObjects();
@@ -441,7 +484,11 @@ class FsckRun {
     if (snapshot) await this.processSnapshot(snapshot);
     else await this.processRefs();
     await this.processIndexes();
-    await this.checkConnectivity();
+    try {
+      await this.checkConnectivity();
+    } finally {
+      for (const pack of this.opened.values()) pack?.close();
+    }
 
     const out = this.findings.filter((f) => f.stream === "stdout").map((f) => `${f.text}\n`);
     const err = this.findings.filter((f) => f.stream === "stderr").map((f) => `${f.text}\n`);
@@ -536,22 +583,88 @@ class FsckRun {
     if (inflate) this.lastZlibError = `inflate: data stream error (${inflate})`;
   }
 
-  private async readWhole(id: string): Promise<{ type: string; content: Uint8Array } | undefined> {
-    const obj = await this.readObject(id);
-    if (!obj) return undefined;
+  /**
+   * The whole object from the store, without a promise when the store holds it in memory (a
+   * packed object in a loaded window or the base cache: `getNow`).
+   */
+  private readWhole(id: string): Whole | undefined | Promise<Whole | undefined> {
+    this.lastZlibError = undefined;
+    let obj: GitObject | undefined | Promise<GitObject | undefined>;
     try {
-      return { type: obj.type, content: await collect(obj) };
+      obj = this.objects.getNow ? this.objects.getNow(id) : this.objects.get(id);
     } catch (e) {
       this.noteReadError(e);
       return undefined;
     }
+    if (obj instanceof Promise) {
+      return obj.then(
+        (o) => this.wholeOf(o),
+        (e) => {
+          this.noteReadError(e);
+          return undefined;
+        },
+      );
+    }
+    return this.wholeOf(obj);
+  }
+
+  private wholeOf(obj: GitObject | undefined): Whole | undefined | Promise<Whole | undefined> {
+    if (!obj) return undefined;
+    // in memory already (the buffer is ours, and `content` needs no release)
+    if (obj.bytes) return { type: obj.type, content: obj.bytes };
+    return collect(obj).then(
+      (content) => ({ type: obj.type, content }),
+      (e) => {
+        this.noteReadError(e);
+        return undefined;
+      },
+    );
   }
 
   private async storeType(id: string): Promise<string | undefined> {
+    if (this.o.connectivityOnly) {
+      const type = await this.packedType(id);
+      if (type) return type;
+    }
     const obj = await this.readObject(id);
     if (!obj) return undefined;
     await obj.content[Symbol.asyncIterator]().return?.();
     return obj.type;
+  }
+
+  /** The repository's packs, opened to read entry headers (`packedType`). */
+  private readonly opened = new Map<RepoPack, PackFile | undefined>();
+
+  /**
+   * The type of a packed object from its entry header, following a delta's bases through
+   * theirs, as git's `packed_object_info`: nothing is inflated (connectivity-only runs read no
+   * blob). Undefined when the headers do not tell (the object is not packed, a base is
+   * elsewhere, a header is corrupt): the store reads the object then.
+   */
+  private async packedType(id: string): Promise<string | undefined> {
+    const p = this.packs.find((x) => x.idx.has(id));
+    if (!p) return undefined;
+    let pack = this.opened.get(p);
+    if (!this.opened.has(p)) {
+      pack = await openPack(this.files as FilesApi, p.packPath, p.idxPath, {
+        idxBytes: p.idxBytes,
+      }).catch(() => undefined);
+      this.opened.set(p, pack);
+    }
+    if (!pack || p.idx.version < 2) return undefined;
+    try {
+      let at = id;
+      for (let depth = 0; depth <= 4096; depth++) {
+        const e = await pack.entry(at);
+        if (!e) return undefined;
+        if (e.kind <= 4) return TYPE_NAME[e.kind as ObjType];
+        if (!e.baseId || !pack.has(e.baseId)) return undefined;
+        at = e.baseId;
+      }
+    } catch {
+      // a corrupt entry: read through the store
+    }
+    return undefined;
   }
 
   /** git's `has_object`. */
@@ -615,26 +728,63 @@ class FsckRun {
     }
   }
 
-  /** Every stored id: loose ones, then each pack's in idx order (git's for_each_*_object). */
-  private async *storedIds(): AsyncIterable<string> {
+  /**
+   * Every stored id, as its 20 bytes at `at` in `raw` (valid during the call): loose ones, then
+   * each pack's in idx order (git's for_each_*_object). A pack's ids are read from its idx.
+   */
+  private async forEachStored(
+    visit: (raw: Uint8Array, at: number) => void | Promise<void>,
+  ): Promise<void> {
+    const scratch = new Uint8Array(20);
+    // ids listed here are 40 lowercase hex digits
+    const nibble = (c: number) => (c <= 0x39 ? c - 0x30 : c - 0x57);
+    const parsed = (id: string) => {
+      for (let i = 0; i < 20; i++)
+        scratch[i] = (nibble(id.charCodeAt(2 * i)) << 4) | nibble(id.charCodeAt(2 * i + 1));
+      return scratch;
+    };
     if (!this.files) {
       const ids: string[] = [];
       for await (const id of this.objects.list()) ids.push(id);
       ids.sort();
-      yield* ids;
+      for (const id of ids) {
+        const r = visit(parsed(id), 0);
+        if (r) await r;
+      }
       return;
     }
-    for await (const e of this.looseEntries()) if (e.id) yield e.id;
-    for (const p of this.packs) yield* p.idx.listObjects();
+    for await (const e of this.looseEntries()) {
+      if (!e.id) continue;
+      const r = visit(parsed(e.id), 0);
+      if (r) await r;
+    }
+    for (const p of this.packs) {
+      const v2 = p.idx.version > 1;
+      const idsAt = v2 ? 8 + 1024 : 1024 + 4;
+      const stride = v2 ? 20 : 24;
+      for (let i = 0, n = p.idx.objectCount; i < n; i++) {
+        const r = visit(p.idxBytes, idsAt + i * stride);
+        if (r) await r;
+      }
+    }
   }
 
   // ------------------------------------------------------------------------------------------
   // Reading and checking every object
 
-  /** git's `parse_object_buffer`: the object, or undefined (git's errors printed). */
-  private parseObjectBuffer(id: string, type: ObjType, content: Uint8Array): number | undefined {
+  /**
+   * git's `parse_object_buffer`: the object, or undefined (git's errors printed). `raw` holds
+   * the id's 20 bytes at `rawAt`, when the caller has them (an idx).
+   */
+  private parseObjectBuffer(
+    id: string,
+    type: ObjType,
+    content: Uint8Array,
+    raw?: Uint8Array,
+    rawAt = 0,
+  ): number | undefined {
     const t = this.t;
-    const self = t.lookupTyped(id, type);
+    const self = raw ? t.lookupTypedRaw(raw, rawAt, type) : t.lookupTyped(id, type);
     if (typeof self !== "number") {
       this.error(self.error, id);
       return undefined;
@@ -646,24 +796,25 @@ class FsckRun {
     }
     if (t.flags(n) & PARSED) return n;
     if (type === OBJ_COMMIT) {
-      const parsed = parseCommitBuffer(content, id);
+      const parsed = parseCommitLinks(content, id);
       if ("error" in parsed) {
         this.error(parsed.error, id);
         return undefined;
       }
-      const tree = t.lookupTyped(parsed.tree, OBJ_TREE);
+      const raw = this.idScratch;
+      const tree = t.lookupTypedRaw(rawIdAt(content, parsed.tree, raw), 0, OBJ_TREE);
       if (typeof tree !== "number") {
         this.error(tree.error);
-        this.error(`bad tree pointer ${parsed.tree} in commit ${id}`, id);
+        this.error(`bad tree pointer ${hexIdAt(content, parsed.tree)} in commit ${id}`, id);
         return undefined;
       }
       const parents: number[] = [];
       if (!this.shallow.has(id)) {
-        for (const p of parsed.parents) {
-          const parent = t.lookupTyped(p, OBJ_COMMIT);
+        for (const at of parsed.parents) {
+          const parent = t.lookupTypedRaw(rawIdAt(content, at, raw), 0, OBJ_COMMIT);
           if (typeof parent !== "number") {
             this.error(parent.error);
-            this.error(`bad parent ${p} in commit ${id}`, id);
+            this.error(`bad parent ${hexIdAt(content, at)} in commit ${id}`, id);
             return undefined;
           }
           parents.push(parent);
@@ -692,10 +843,15 @@ class FsckRun {
   }
 
   /** git's `parse_object`: an object already parsed, or read from the store and parsed. */
-  private async parseObject(id: string): Promise<number | undefined> {
+  private parseObject(id: string): number | undefined | Promise<number | undefined> {
     const known = this.t.lookup(id);
     if (known >= 0 && this.t.flags(known) & PARSED) return known;
-    const obj = await this.readWhole(id);
+    const obj = this.readWhole(id);
+    if (obj instanceof Promise) return obj.then((o) => this.parseRead(id, o));
+    return this.parseRead(id, obj);
+  }
+
+  private parseRead(id: string, obj: Whole | undefined): number | undefined {
     if (!obj) {
       if (this.lastZlibError) this.error(this.lastZlibError);
       return undefined;
@@ -707,15 +863,17 @@ class FsckRun {
    * git's `fsck_obj_buffer` / the end of `fsck_loose`: parses the object, marks it stored and
    * checks it. Returns nonzero when the object is bad.
    */
-  private async fsckObjBuffer(
+  private fsckObjBuffer(
     id: string,
     type: ObjType,
     content: Uint8Array | undefined,
     unparsable: string,
     size = content?.length ?? 0,
-  ): Promise<number> {
+    raw?: Uint8Array,
+    rawAt = 0,
+  ): number | Promise<number> {
     // no content: a blob streamed past core.bigFileThreshold (git's NULL buffer)
-    const n = this.parseObjectBuffer(id, type, content ?? EMPTY);
+    const n = this.parseObjectBuffer(id, type, content ?? EMPTY, raw, rawAt);
     if (n === undefined) {
       this.errorsFound |= FSCK_ERROR_OBJECT;
       this.error(unparsable, id);
@@ -723,17 +881,34 @@ class FsckRun {
     }
     this.t.clearFlags(n, REACHABLE | SEEN);
     this.t.addFlags(n, HAS_OBJ);
-    return this.fsckObj(n, content, size);
+    return this.fsckObj(n, id, content, size);
   }
 
-  /** git's `fsck_obj`. */
-  private async fsckObj(n: number, content: Uint8Array | undefined, size: number): Promise<number> {
+  /** git's `fsck_obj`: without a promise unless it reports through the store. */
+  private fsckObj(
+    n: number,
+    id: string,
+    content: Uint8Array | undefined,
+    size: number,
+  ): number | Promise<number> {
     const t = this.t;
     if (t.flags(n) & SEEN) return 0;
     t.addFlags(n, SEEN);
-    const id = t.id(n);
+    if (this.walkUsed(n, content ?? EMPTY, this.recordTrees)) {
+      return this.objerror(n, "broken links").then(() => this.fsckObjChecks(n, id, content, size));
+    }
+    return this.fsckObjChecks(n, id, content, size);
+  }
+
+  /** The rest of `fsck_obj`: the object checks, `--root` and `--tags`. */
+  private fsckObjChecks(
+    n: number,
+    id: string,
+    content: Uint8Array | undefined,
+    size: number,
+  ): number | Promise<number> {
+    const t = this.t;
     const type = t.type(n);
-    if (this.walkUsed(n, content ?? EMPTY)) await this.objerror(n, "broken links");
     const err = this.fsckBuffer(id, type, content, size);
     if (err) return err;
     if (type === OBJ_COMMIT && this.o.root && t.links.get(n)?.parents?.length === 0) {
@@ -747,41 +922,74 @@ class FsckRun {
     if (type === OBJ_TAG && this.o.tags) {
       const links = t.links.get(n);
       if (links?.tagged !== undefined) {
-        const tagged = t.id(links.tagged);
-        this.emit({
-          kind: "tagged",
-          stream: "stdout",
-          text: `tagged ${await this.printableType(links.tagged)} ${this.describe(tagged)} (${links.tag}) in ${this.describe(id)}`,
-          objectId: id,
+        const target = links.tagged;
+        return this.printableType(target).then((printable) => {
+          this.emit({
+            kind: "tagged",
+            stream: "stdout",
+            text: `tagged ${printable} ${this.describe(t.id(target))} (${links.tag}) in ${this.describe(id)}`,
+            objectId: id,
+          });
+          return 0;
         });
       }
     }
     return 0;
   }
 
-  /** git's `fsck_walk` with `mark_used`: marks what the object points to as used. */
-  private walkUsed(n: number, content: Uint8Array): number {
+  /** Room in `kids` for `more` values past `kidsLength`. */
+  private reserveKids(more: number): void {
+    const need = this.kidsLength + more;
+    if (need <= this.kids.length) return;
+    let size = this.kids.length * 2;
+    while (size < need) size *= 2;
+    const kids = new Int32Array(size);
+    kids.set(this.kids.subarray(0, this.kidsLength));
+    this.kids = kids;
+  }
+
+  /**
+   * git's `fsck_walk` with `mark_used`: marks what the object points to as used. With `record`,
+   * a tree whose entries all resolve is remembered as its entries' objects (`treeEntries`).
+   */
+  private walkUsed(n: number, content: Uint8Array, record = false): number {
     const t = this.t;
     const type = t.type(n);
     if (type === OBJ_TREE) {
-      const walk = walkTree(content);
+      const walk = scanTree(content);
+      this.lastTree = { content, table: walk };
       if (walk.initError) {
         this.error(walk.initError);
         return -1;
       }
       let res = 0;
-      for (const e of walk.entries) {
-        const mode = canonMode(e.mode);
+      const start = this.kidsLength;
+      if (record) this.reserveKids(1 + walk.count);
+      let at = start + 1;
+      const f = walk.fields;
+      for (let i = 0; i < walk.count; i++) {
+        const mode = canonMode(f[3 * i] as number);
         if (mode === 0o160000) continue;
-        const child = t.lookupTypedRaw(content, e.idAt, mode === 0o040000 ? OBJ_TREE : OBJ_BLOB);
+        const isTree = mode === 0o040000;
+        const child = t.lookupTypedRaw(
+          content,
+          f[3 * i + 2] as number,
+          isTree ? OBJ_TREE : OBJ_BLOB,
+        );
         if (typeof child !== "number") {
           this.error(child.error);
           res ||= 1;
           continue;
         }
         t.addFlags(child, USED);
+        if (record) this.kids[at++] = (child << 1) | (isTree ? 1 : 0);
       }
       if (walk.error) this.error(walk.error);
+      if (record && res === 0 && !walk.error) {
+        this.kids[start] = at - start - 1;
+        this.kidsLength = at;
+        this.treeEntries.set(n, start);
+      }
       return res;
     }
     const links = t.links.get(n);
@@ -807,7 +1015,17 @@ class FsckRun {
     switch (type) {
       case OBJ_TREE: {
         const found = { gitmodules: [] as string[], gitattributes: [] as string[] };
-        const r = fsckTree(content, this.types, report, (m) => this.error(m), found);
+        // the walk just before decoded this tree already
+        const last = this.lastTree;
+        this.lastTree = undefined;
+        const r = fsckTree(
+          content,
+          this.types,
+          report,
+          (m) => this.error(m),
+          found,
+          last?.content === content ? last.table : undefined,
+        );
         for (const g of found.gitmodules) this.gitmodulesFound.add(g);
         for (const g of found.gitattributes) this.gitattributesFound.add(g);
         return r;
@@ -901,7 +1119,9 @@ class FsckRun {
         bigFileThreshold: this.o.bigFileThreshold,
       });
       for (const m of read.errors) this.error(m, e.id);
+      if (read.errors.length > 0) this.badCopy.add(e.id);
       if (!read.object) {
+        this.badCopy.add(e.id);
         if (read.realId)
           this.error(`${read.realId}: hash-path mismatch, found at: ${e.path}`, e.id);
         else this.error(`${e.id}: object corrupt or missing: ${e.path}`, e.id);
@@ -926,18 +1146,26 @@ class FsckRun {
     const files = this.files as FilesApi;
     for (const p of this.packs) {
       let err = 0;
-      const scan = await scanPack(
+      // git prints the pack checksum errors before any entry's output
+      let checksumAt = 0;
+      const result = await checkPack(
         files,
         p.packPath,
         p.idxPath,
-        (m) => this.error(m),
-        (id) => this.readObject(id),
-        { bytes: p.idxBytes, idx: p.idx },
-      );
-      if (scan.failed) err = 1;
-      if (scan.pack) {
-        try {
-          for (const entry of scan.entries) {
+        {
+          error: (m) => this.error(m),
+          opened: () => {
+            checksumAt = this.findings.length;
+          },
+          checksumError: (m) => {
+            this.findings.splice(checksumAt++, 0, {
+              kind: "error",
+              stream: "stderr",
+              text: `error: ${m}`,
+              objectId: undefined,
+            });
+          },
+          entry: (entry, unpacked) => {
             if (p.idx.version > 1 && !entry.crcOk) {
               this.error(
                 `index CRC mismatch for object ${entry.id} from ${p.packPath} at offset ${entry.offset}`,
@@ -945,28 +1173,37 @@ class FsckRun {
               );
               err = 1;
             }
-            const unpacked = await unpackEntry(scan.pack, p.packPath, entry, this.keepBlob);
             if ("error" in unpacked) {
               if (unpacked.zlib) this.error(unpacked.zlib);
               this.error(unpacked.error, entry.id);
+              this.badCopy.add(entry.id);
               err = 1;
-              continue;
+              return;
             }
-            if (
-              (await this.fsckObjBuffer(
-                entry.id,
-                typeOf(unpacked.type),
-                unpacked.content,
-                `${entry.id}: object corrupt or missing`,
-              )) !== 0
-            ) {
-              err = 1;
+            const r = this.fsckObjBuffer(
+              entry.id,
+              typeOf(unpacked.type),
+              unpacked.content,
+              `${entry.id}: object corrupt or missing`,
+              unpacked.content.length,
+              entry.ids,
+              entry.idAt,
+            );
+            if (r instanceof Promise) {
+              return r.then((x) => {
+                if (x !== 0) err = 1;
+              });
             }
-          }
-        } finally {
-          scan.pack.close();
-        }
-      }
+            if (r !== 0) err = 1;
+          },
+        },
+        {
+          externalBase: (id) => this.readObject(id),
+          read: { bytes: p.idxBytes, idx: p.idx },
+          keepBlob: this.keepBlob,
+        },
+      );
+      if (result.failed) err = 1;
       if (err) {
         this.errorsFound |= this.o.compatibility === "2.56" ? FSCK_ERROR_OBJECT : FSCK_ERROR_PACK;
       }
@@ -1028,8 +1265,27 @@ class FsckRun {
     return true;
   }
 
-  /** git's `mark_object`. */
-  private async markObject(
+  /** git's `mark_object`: without a promise when it reports nothing. */
+  private markObject(
+    n: number | undefined,
+    type: ObjType | "any",
+    parent: number | undefined,
+  ): number | Promise<number> {
+    const t = this.t;
+    if (n !== undefined && (type === "any" || parent === undefined || t.type(n) === type)) {
+      const flags = t.flags(n);
+      if (flags & REACHABLE) return 0;
+      if (flags & HAS_OBJ) {
+        t.addFlags(n, REACHABLE);
+        this.pending.push(n);
+        return 0;
+      }
+    }
+    return this.markObjectReporting(n, type, parent);
+  }
+
+  /** `markObject` where it may report: a broken link, a wrong type, an object not stored. */
+  private async markObjectReporting(
     n: number | undefined,
     type: ObjType | "any",
     parent: number | undefined,
@@ -1509,44 +1765,73 @@ class FsckRun {
   // ------------------------------------------------------------------------------------------
   // Connectivity
 
-  /** git's `fsck_walk` with `mark_object` (`traverse_one_object`). */
-  private async traverseOne(n: number): Promise<void> {
+  /**
+   * git's `fsck_walk` with `mark_object` (`traverse_one_object`), for `runSteps`: it yields only
+   * the promises it waits for, so an object whose reads are in memory is walked synchronously.
+   */
+  private *traverseOne(n: number): Steps<void> {
     const t = this.t;
+    if (t.type(n) === OBJ_TREE && t.flags(n) & PARSED) {
+      const start = this.treeEntries.get(n);
+      if (start !== undefined) {
+        if (this.badCopy.size === 0 || !this.badCopy.has(t.id(n))) {
+          // checked in full already: its entries again, as they resolved then
+          const kids = this.kids;
+          for (let i = start + 1, end = start + 1 + (kids[start] as number); i < end; i++) {
+            const v = kids[i] as number;
+            const c = v >> 1;
+            const type = v & 1 ? OBJ_TREE : OBJ_BLOB;
+            t.touch(c); // the lookup git makes moves it in the hash
+            if (!this.markReachable(c, type)) {
+              const r = this.markObject(c, type, n);
+              if (r instanceof Promise) yield r;
+            }
+          }
+          return;
+        }
+      }
+    }
     const id = t.id(n);
     // git's parse_object / repo_parse_commit / parse_tag before walking
     if (t.type(n) === OBJ_NONE || (t.type(n) !== OBJ_BLOB && !(t.flags(n) & PARSED))) {
-      await this.parseObject(id);
+      const r = this.parseObject(id);
+      if (r instanceof Promise) yield r;
     }
     const name = this.names?.get(id);
     switch (t.type(n)) {
       case OBJ_BLOB:
         return;
       case OBJ_TREE: {
-        const obj = await this.readWhole(id);
+        let obj = this.readWhole(id);
+        if (obj instanceof Promise) obj = (yield obj) as Whole | undefined;
         if (!obj) {
           if (this.lastZlibError) this.error(this.lastZlibError);
           this.error(`Could not read ${id}`);
           return;
         }
-        const walk = walkTree(obj.content);
+        const walk = scanTree(obj.content);
         if (walk.initError) {
           this.error(walk.initError);
           return;
         }
         const content = obj.content;
-        for (const e of walk.entries) {
-          const mode = canonMode(e.mode);
+        const f = walk.fields;
+        for (let i = 0; i < walk.count; i++) {
+          const mode = canonMode(f[3 * i] as number);
           if (mode === 0o160000) continue;
           const isTree = mode === 0o040000;
-          const child = t.lookupTypedRaw(content, e.idAt, isTree ? OBJ_TREE : OBJ_BLOB);
+          const idAt = f[3 * i + 2] as number;
+          const child = t.lookupTypedRaw(content, idAt, isTree ? OBJ_TREE : OBJ_BLOB);
           let c: number | undefined;
           if (typeof child === "number") c = child;
           else this.error(child.error);
           if (name !== undefined && c !== undefined) {
-            this.putName(t.id(c), `${name}${decodeGitPath(e.name)}${isTree ? "/" : ""}`);
+            const entryName = content.subarray(f[3 * i + 1] as number, idAt - 1);
+            this.putName(t.id(c), `${name}${decodeGitPath(entryName)}${isTree ? "/" : ""}`);
           }
           if (!this.markReachable(c, isTree ? OBJ_TREE : OBJ_BLOB)) {
-            await this.markObject(c, isTree ? OBJ_TREE : OBJ_BLOB, n);
+            const r = this.markObject(c, isTree ? OBJ_TREE : OBJ_BLOB, n);
+            if (r instanceof Promise) yield r;
           }
         }
         if (walk.error) this.error(walk.error);
@@ -1560,7 +1845,8 @@ class FsckRun {
         const links = t.links.get(n);
         if (!links || links.tree === undefined) return;
         if (name !== undefined) this.putName(t.id(links.tree), `${name}:`);
-        await this.markObject(links.tree, OBJ_TREE, n);
+        const marked = this.markObject(links.tree, OBJ_TREE, n);
+        if (marked instanceof Promise) yield marked;
         const parents = links.parents ?? [];
         let generation = 0;
         let prefixLength = 0;
@@ -1588,7 +1874,8 @@ class FsckRun {
               this.putName(pid, `${name.slice(0, prefixLength)}~${generation + 1}`);
             else this.putName(pid, `${name}^`);
           }
-          await this.markObject(p, OBJ_COMMIT, n);
+          const r = this.markObject(p, OBJ_COMMIT, n);
+          if (r instanceof Promise) yield r;
         }
         return;
       }
@@ -1600,7 +1887,8 @@ class FsckRun {
         }
         if (links?.tagged === undefined) return;
         if (name !== undefined) this.putName(t.id(links.tagged), name);
-        await this.markObject(links.tagged, "any", n);
+        const marked = this.markObject(links.tagged, "any", n);
+        if (marked instanceof Promise) yield marked;
         return;
       }
       default:
@@ -1609,10 +1897,16 @@ class FsckRun {
   }
 
   /** git's `mark_unreachable_referents` (connectivity-only runs). */
-  private async markUnreachableReferents(id: string): Promise<void> {
+  private markUnreachableReferents(raw: Uint8Array, at: number): void | Promise<void> {
     const t = this.t;
-    const n = t.lookup(id);
+    const n = t.lookupRaw(raw, at);
     if (n < 0 || !(t.flags(n) & HAS_OBJ) || t.flags(n) & REACHABLE) return;
+    return this.markReferents(n);
+  }
+
+  private async markReferents(n: number): Promise<void> {
+    const t = this.t;
+    const id = t.id(n);
     if (t.type(n) === OBJ_NONE) {
       const type = typeOf((await this.storeType(id)) ?? "");
       if (type !== OBJ_NONE) t.setType(n, type);
@@ -1631,9 +1925,12 @@ class FsckRun {
   /** git's `check_connectivity`. */
   private async checkConnectivity(): Promise<void> {
     const t = this.t;
-    while (this.pending.length > 0) await this.traverseOne(this.pending.pop() as number);
+    while (this.pending.length > 0) {
+      const r = runSteps(this.traverseOne(this.pending.pop() as number));
+      if (r instanceof Promise) await r;
+    }
     if (this.o.connectivityOnly && (this.o.dangling || this.o.lostFound)) {
-      for await (const id of this.storedIds()) await this.markUnreachableReferents(id);
+      await this.forEachStored((raw, at) => this.markUnreachableReferents(raw, at));
     }
     for (const n of [...t.inSlotOrder()]) {
       const id = t.id(n);
