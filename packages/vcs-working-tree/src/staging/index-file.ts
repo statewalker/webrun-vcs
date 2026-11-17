@@ -22,6 +22,7 @@
  */
 import { readFile } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
 import { type CacheTree, encodeCacheTree, parseCacheTree } from "./cache-tree.js";
 import {
@@ -303,9 +304,7 @@ export class IndexFile {
       }
       byPath.set(record.path, { path: record.path, modes, objectIds });
     }
-    const sorted = [...byPath.values()].sort((a, b) =>
-      a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
-    );
+    const sorted = [...byPath.values()].sort((a, b) => compareGitPaths(a.path, b.path));
     const reuc = { signature: "REUC", data: encodeResolveUndo(sorted) };
     const others = this.extensions.filter((e) => e.signature !== "REUC");
     // git writes it after the cache-tree

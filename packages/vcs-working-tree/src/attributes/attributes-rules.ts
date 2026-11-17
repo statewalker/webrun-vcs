@@ -7,7 +7,7 @@
  * (back to unspecified) or `name=value`.
  */
 
-import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { wildmatch } from "../ignore/git-wildmatch.js";
 
 /**
@@ -86,7 +86,6 @@ function tokenEnd(s: string, i: number): number {
  */
 function unquoteC(s: string, start: number): { value: string; end: number } | undefined {
   const bytes: number[] = [];
-  const encoder = new TextEncoder();
   let i = start + 1;
   while (i < s.length) {
     const c = s[i];
@@ -123,8 +122,10 @@ function unquoteC(s: string, start: number): { value: string; end: number } | un
       }
       return undefined;
     }
-    bytes.push(...encoder.encode(c));
-    i++;
+    // a whole code point: an astral character is two UTF-16 units
+    const ch = String.fromCodePoint(s.codePointAt(i) ?? 0);
+    bytes.push(...encodeGitPath(ch));
+    i += ch.length;
   }
   return undefined;
 }

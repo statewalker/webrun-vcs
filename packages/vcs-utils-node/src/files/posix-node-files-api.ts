@@ -27,7 +27,7 @@ import {
 } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
-import { decodeGitPath, hasEscapedBytes } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   BeyondSymlinkError,
   type LinkStats,
@@ -702,26 +702,35 @@ function readSmallSync(
 }
 
 /**
- * `fs.cp(from, to, { recursive, verbatimSymlinks })`; by hand where a name holds escaped
- * bytes (`fs.cp` takes no Buffer path): directories made, links copied as links, files
- * copied with their mode.
+ * A recursive copy in which links stay links, walked by hand with names read as bytes (so a
+ * child whose name is not UTF-8 is copied as itself; `fs.cp` reads names as strings and takes
+ * no Buffer path). Nothing at the destination is followed: an existing file or link is replaced,
+ * a directory is merged into only when it is a real directory, never through a link. Sources
+ * other than files, directories and links (FIFOs, sockets, devices) are refused. Directory modes
+ * are set once their contents are copied.
  */
 async function copyTree(from: string, to: string): Promise<void> {
-  if (!hasEscapedBytes(from) && !hasEscapedBytes(to)) {
-    await fs.cp(from, to, { recursive: true, verbatimSymlinks: true, dereference: false });
-    return;
-  }
   const stat = await fs.lstat(fsPath(from));
-  if (stat.isSymbolicLink()) {
-    await fs.symlink(await fs.readlink(fsPath(from), { encoding: "buffer" }), fsPath(to));
-  } else if (stat.isDirectory()) {
-    await fs.mkdir(fsPath(to), { recursive: true });
+  const existing = lstatQuiet(to, false) as import("node:fs").Stats | undefined;
+  if (stat.isDirectory()) {
+    if (existing?.isSymbolicLink()) throw new Error(`copy: ${to} is a symbolic link`);
+    if (existing && !existing.isDirectory()) await fs.unlink(fsPath(to));
+    if (!existing?.isDirectory()) await fs.mkdir(fsPath(to));
     for (const name of await fs.readdir(fsPath(from), { encoding: "buffer" })) {
       const child = decodeGitPath(name);
       await copyTree(nodePath.join(from, child), nodePath.join(to, child));
     }
+    await fs.chmod(fsPath(to), stat.mode & 0o777);
+    return;
+  }
+  if (!stat.isSymbolicLink() && !stat.isFile()) throw new Error(`copy: ${from} is not a file`);
+  if (existing?.isDirectory()) throw new Error(`copy: ${to} is a directory`);
+  if (existing) await fs.unlink(fsPath(to));
+  if (stat.isSymbolicLink()) {
+    await fs.symlink(await fs.readlink(fsPath(from), { encoding: "buffer" }), fsPath(to));
   } else {
-    await fs.copyFile(fsPath(from), fsPath(to));
+    // exclusive: a link made at `to` since the unlink is not written through
+    await fs.copyFile(fsPath(from), fsPath(to), fsConstants.COPYFILE_EXCL);
     await fs.chmod(fsPath(to), stat.mode & 0o777);
   }
 }

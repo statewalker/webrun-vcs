@@ -13,7 +13,7 @@
  * - sha1 is 20 raw bytes
  */
 
-import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath, hasEscapedBytes } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { collect, encodeString, toArray } from "@statewalker/vcs-utils/streams";
 import { FileMode } from "../../common/files/index.js";
@@ -110,6 +110,11 @@ function validateEntryName(name: string): void {
   }
   if (name.includes("\0")) {
     throw new Error("Tree entry name cannot contain null bytes");
+  }
+  // only the strings `decodeGitPath` makes stand for bytes; any other lone surrogate would
+  // encode to the same bytes as another name (two entries of one name in a tree)
+  if (hasEscapedBytes(name) && decodeGitPath(encodeGitPath(name)) !== name) {
+    throw new Error("Tree entry name holds a lone surrogate that stands for no byte");
   }
 }
 

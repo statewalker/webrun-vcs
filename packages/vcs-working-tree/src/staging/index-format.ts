@@ -1,6 +1,11 @@
 import { objectIdToBytes } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1, sha1 } from "@statewalker/vcs-utils";
-import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import {
+  compareGitPaths,
+  decodeGitPath,
+  encodeGitPath,
+  hasEscapedBytes,
+} from "@statewalker/vcs-utils/encoding";
 import type { MergeStageValue, StagingEntry } from "./types.js";
 
 /**
@@ -806,6 +811,10 @@ function validatePath(path: string): void {
   }
   if (path.includes("\0")) {
     throw new Error(`Invalid path: ${path} (contains null)`);
+  }
+  // only the strings `decodeGitPath` makes stand for bytes (see `validateEntryName` in trees)
+  if (hasEscapedBytes(path) && decodeGitPath(encodeGitPath(path)) !== path) {
+    throw new Error(`Invalid path: ${JSON.stringify(path)} (lone surrogate)`);
   }
 
   // Check for .git in path components

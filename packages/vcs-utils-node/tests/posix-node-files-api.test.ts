@@ -422,4 +422,43 @@ describe("PosixNodeFilesApi caches nothing across calls; a batch view only withi
     expect(await files.remove(`/${dir}`)).toBe(true);
     expect(await files.exists(`/${dir}`)).toBe(false);
   });
+
+  it("copies a plainly named directory whose children are no valid UTF-8", async () => {
+    if (process.platform !== "linux") return;
+    const files = new PosixNodeFilesApi({ rootDir: root });
+    mkdirSync(join(root, "src"));
+    writeFileSync(Buffer.concat([Buffer.from(join(root, "src/caf")), Buffer.from([0xe9])]), "x");
+    expect(await files.copy("/src", "/dst")).toBe(true);
+    expect(readdirSync(Buffer.from(join(root, "dst")), { encoding: "buffer" })).toEqual([
+      Buffer.from([0x63, 0x61, 0x66, 0xe9]),
+    ]);
+  });
+
+  it("copy never writes through a link at the destination", async () => {
+    if (process.platform === "win32") return;
+    const outside = mkdtempSync(join(tmpdir(), "posix-copy-outside-"));
+    try {
+      const files = new PosixNodeFilesApi({ rootDir: root });
+      writeFileSync(join(outside, "victim"), "keep");
+      await files.write("/file", [enc.encode("new")]);
+      // a file copied onto a link replaces the link
+      symlinkSync(join(outside, "victim"), join(root, "dst"));
+      expect(await files.copy("/file", "/dst")).toBe(true);
+      expect(lstatSync(join(root, "dst")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(root, "dst"), "utf8")).toBe("new");
+      expect(readFileSync(join(outside, "victim"), "utf8")).toBe("keep");
+      // a directory is never merged into a link to a directory
+      await files.write("/dir/child", [enc.encode("c")]);
+      symlinkSync(outside, join(root, "dirlink"));
+      expect(await files.copy("/dir", "/dirlink")).toBe(false);
+      expect(readdirSync(outside)).toEqual(["victim"]);
+      // directory modes are kept
+      chmodSync(join(root, "dir"), 0o750);
+      expect(await files.copy("/dir", "/dir2")).toBe(true);
+      expect(statSync(join(root, "dir2")).mode & 0o777).toBe(0o750);
+      expect(readFileSync(join(root, "dir2/child"), "utf8")).toBe("c");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });
