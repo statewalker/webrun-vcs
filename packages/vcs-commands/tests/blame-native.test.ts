@@ -26,6 +26,7 @@ import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { formatBlame, formatBlamePorcelain, Git } from "../src/index.js";
+import { buildLongHistory } from "./blame-long-history.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -323,4 +324,68 @@ describeGit("git blame against native git", () => {
     expect(mismatches.length).toBe(0);
     expect(compared).toBe((ONLY ? 1 : SEEDS) * 16);
   }, 900_000);
+});
+
+describeGit("git blame against native git on a long history", () => {
+  it("matches git blame on a file edited by 150 commits, renamed and merged", async () => {
+    const dir = join(tmp(), "long");
+    const h = buildLongHistory(dir, tmp(), { commits: 150, lines: 300, seed: 7 });
+    const ours = await open(dir);
+    const mismatches: string[] = [];
+    const cases: Array<{
+      path: string;
+      args: string[];
+      ws?: boolean;
+      ranges?: [number, number][];
+    }> = [
+      { path: h.path, args: [] },
+      { path: h.path, args: ["-w"], ws: true },
+      {
+        path: h.path,
+        args: ["-L", "5,40", "-L", "200,230"],
+        ranges: [
+          [5, 40],
+          [200, 230],
+        ],
+      },
+      { path: h.notes, args: [] },
+    ];
+    for (const c of cases) {
+      const cmd = ours
+        .blame()
+        .setFilePath(c.path)
+        .setStartCommit(h.tip)
+        .setCompatibility(compatibility);
+      if (c.ws) cmd.setIgnoreWhitespace(true);
+      if (c.ranges) cmd.setLineRanges(c.ranges);
+      if (!atLeast(2, 50)) cmd.setAlgorithm("myers");
+      const result = await cmd.call();
+      const autoAbbrev = await result.autoAbbrev?.();
+      const formats: Array<[string[], Uint8Array]> = [
+        [["--porcelain"], formatBlamePorcelain(result)],
+        [[], formatBlame(result, { alwaysWidenAbbrev, autoAbbrev })],
+      ];
+      for (const [formatArgs, mine] of formats) {
+        const res = spawnSync("git", ["blame", ...formatArgs, ...c.args, h.tip, "--", c.path], {
+          cwd: dir,
+          env: nativeGitEnv(tmp()),
+          maxBuffer: 1 << 26,
+        });
+        if (res.status !== 0) throw new Error(String(res.stderr));
+        if (!res.stdout.equals(Buffer.from(mine))) {
+          mismatches.push(`blame ${[...formatArgs, ...c.args, c.path].join(" ")}`);
+        }
+      }
+      // the history is long: the lines come from many commits
+      if (!c.ranges && c.path === h.path) {
+        expect(new Set(result.entries.map((e) => e.commitId)).size).toBeGreaterThan(50);
+        // lines from before both renames and from the side branches of the merges
+        expect(new Set(result.entries.map((e) => e.sourcePath))).toEqual(
+          new Set(["src/main.c", "lib/main.c", "core/main.c"]),
+        );
+        expect(result.entries.some((e) => e.commit.message.startsWith("side"))).toBe(true);
+      }
+    }
+    expect(mismatches).toEqual([]);
+  }, 120_000);
 });

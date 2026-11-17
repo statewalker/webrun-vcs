@@ -94,6 +94,73 @@ function newStream(raw: boolean): ZStream {
   return strm;
 }
 
+/** The fields of pako's inflate state that `inflateReset` sets */
+interface PakoInflateState {
+  strm: ZStream;
+  mode: number;
+  wrap: number;
+  wsize: number;
+  whave: number;
+  wnext: number;
+  total: number;
+  last: number;
+  havedict: number;
+  flags: number;
+  dmax: number;
+  head: unknown;
+  hold: number;
+  bits: number;
+  lencode: Int32Array;
+  lendyn: Int32Array;
+  distcode: Int32Array;
+  distdyn: Int32Array;
+  sane: number;
+  back: number;
+}
+
+/** Mode of a freshly reset pako state (its `HEAD`), read once from a new stream */
+let headMode: number | undefined;
+
+/**
+ * pako's `inflateReset` without its allocations: pako gives a reset state new code tables
+ * (zlib reuses its `codes` array, which every dynamic block fills before reading), and
+ * allocating them is a good part of reading a small object. The same fields are set, the
+ * tables kept; a state of another shape is reset by pako.
+ */
+function resetStream(strm: ZStream): boolean {
+  const state = (strm as unknown as { state?: PakoInflateState }).state;
+  headMode ??= (newStream(false) as unknown as { state: PakoInflateState }).state.mode;
+  if (
+    !state ||
+    state.strm !== strm ||
+    !(state.lendyn instanceof Int32Array) ||
+    !(state.distdyn instanceof Int32Array)
+  ) {
+    return zlibInflateReset(strm) === Z_OK;
+  }
+  state.wsize = 0;
+  state.whave = 0;
+  state.wnext = 0;
+  strm.total_in = 0;
+  strm.total_out = 0;
+  state.total = 0;
+  strm.msg = "";
+  if (state.wrap) strm.adler = state.wrap & 1;
+  state.mode = headMode;
+  state.last = 0;
+  state.havedict = 0;
+  state.flags = -1;
+  state.dmax = 32768;
+  state.head = null;
+  state.hold = 0;
+  state.bits = 0;
+  state.lencode = state.lendyn;
+  state.distcode = state.distdyn;
+  state.sane = 1;
+  state.back = -1;
+  return true;
+}
+
 /**
  * Inflates `chunk` into `buf`, copying produced bytes out. A shared output buffer
  * is safe because pushes are synchronous; returning views of it instead would pin
@@ -149,7 +216,7 @@ export function createInflaterPool(): InflaterPool {
     strm.input = EMPTY;
     strm.next_in = 0;
     strm.avail_in = 0;
-    if (list.length < MAX_IDLE && zlibInflateReset(strm) === Z_OK) list.push(strm);
+    if (list.length < MAX_IDLE && resetStream(strm)) list.push(strm);
     else zlibInflateEnd(strm);
   };
 

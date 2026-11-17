@@ -1,7 +1,10 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
 import {
+  type InternedText,
+  LineInterner,
   type SupportedAlgorithm,
+  whitespaceFlags,
   type XdiffAlgorithm,
   type XdiffOptions,
   xdiffHunks,
@@ -141,7 +144,8 @@ interface Origin {
   guilty: boolean;
   /** The next origin of the same commit */
   next: Origin | null;
-  content?: Uint8Array;
+  /** The blob's lines (split and hashed once), while the origin is compared */
+  lines?: InternedText;
 }
 
 /** A run of lines (`struct blame_entry`), 0-based */
@@ -306,6 +310,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private renameCountLastSpan?: boolean;
 
   private states = new Map<ObjectId, CommitState>();
+  /** Numbers the lines of every version compared, so each is split and hashed once */
+  private interner?: LineInterner;
 
   /**
    * Set the file path to blame.
@@ -474,7 +480,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
     finalOrigin.blobId = entry.id;
     finalOrigin.mode = entry.mode;
     const content = await this.readBlob(entry.id);
-    finalOrigin.content = content;
+    finalOrigin.lines = this.lineInterner().text(content);
     const lineCount = countLines(content);
 
     // the initial entries: the whole file, or the -L ranges (sorted and merged)
@@ -626,14 +632,14 @@ export class BlameCommand extends GitCommand<BlameResult> {
       await this.passBlameToParent(origin, porigin, queue);
       if (!origin.suspects) break;
     }
-    origin.content = undefined;
+    origin.lines = undefined;
   }
 
   /** git's `pass_whole_blame` */
   private passWholeBlame(origin: Origin, porigin: Origin, queue: CommitQueue): void {
-    if (!porigin.content && origin.content) {
-      porigin.content = origin.content;
-      origin.content = undefined;
+    if (!porigin.lines && origin.lines) {
+      porigin.lines = origin.lines;
+      origin.lines = undefined;
     }
     const suspects = origin.suspects;
     origin.suspects = null;
@@ -671,6 +677,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const fileP = await this.originContent(parent);
     const fileO = await this.originContent(target);
     const hunks = xdiffHunks(fileP, fileO, {
+      interner: this.lineInterner(),
       algorithm: this.algorithm,
       indentHeuristic: this.indentHeuristic,
       ignoreWhitespace: this.ignoreWhitespace,
@@ -778,9 +785,17 @@ export class BlameCommand extends GitCommand<BlameResult> {
     return st;
   }
 
-  private async originContent(o: Origin): Promise<Uint8Array> {
-    o.content ??= await this.readBlob(o.blobId);
-    return o.content;
+  private async originContent(o: Origin): Promise<InternedText> {
+    o.lines ??= this.lineInterner().text(await this.readBlob(o.blobId, true));
+    return o.lines;
+  }
+
+  /** The interner every compared version's lines go through (see `passBlameToParent`) */
+  private lineInterner(): LineInterner {
+    this.interner ??= new LineInterner(
+      whitespaceFlags({ ignoreWhitespace: this.ignoreWhitespace }),
+    );
+    return this.interner;
   }
 
   /** Whether a blob is over the threshold (from its size, without reading it). */
@@ -788,7 +803,11 @@ export class BlameCommand extends GitCommand<BlameResult> {
     return (await this.blobs.size(blobId)) > this.bigFileThreshold;
   }
 
-  private async readBlob(blobId: ObjectId): Promise<Uint8Array> {
+  /**
+   * A blob's content; `shared` (for content only read here) takes a single chunk as it
+   * comes (a resolved pack object) instead of copying it
+   */
+  private async readBlob(blobId: ObjectId, shared = false): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let total = 0;
     const content = await this.blobs.load(blobId);
@@ -798,6 +817,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
         total += chunk.length;
       }
     }
+    if (shared && chunks.length === 1) return chunks[0];
     const out = new Uint8Array(total);
     let at = 0;
     for (const c of chunks) {

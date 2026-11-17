@@ -23,6 +23,7 @@
  */
 
 import type { ByteLines } from "./byte-lines.js";
+import type { LineInterner } from "./line-interner.js";
 import { histogramDiff } from "./xdiff-histogram.js";
 import { patienceDiff } from "./xdiff-patience.js";
 
@@ -53,6 +54,11 @@ export interface XdiffOptions {
   ignoreWhitespaceAtEol?: boolean;
   /** Ignore a carriage return at the end of line (`--ignore-cr-at-eol`) */
   ignoreCrAtEol?: boolean;
+  /**
+   * Numbers lines across calls: lines interned once are sorted into classes without
+   * comparing their bytes again (used when its whitespace flags are the diff's)
+   */
+  interner?: LineInterner;
 }
 
 /** xdiff's `XDF_IGNORE_WHITESPACE` */
@@ -229,6 +235,8 @@ export interface XdFlags {
   legacyMinimal?: boolean;
   /** `XDF_*` whitespace bits: lines equal under them share a class */
   whitespace?: number;
+  /** Line numbers shared across calls (see {@link XdiffOptions.interner}) */
+  interner?: LineInterner;
 }
 
 const XDL_KPDIS_RUN = 4;
@@ -260,52 +268,112 @@ function classify(
   from2: number,
   n2: number,
   ws = 0,
-): { ha1: Int32Array; ha2: Int32Array; len1: number[]; len2: number[] } {
+  interner?: LineInterner,
+): { ha1: Int32Array; ha2: Int32Array; len1: Int32Array; len2: Int32Array } {
+  if (interner && interner.whitespace === ws) {
+    return classifyInterned(interner, l1, from1, n1, l2, from2, n2);
+  }
   const ha1 = new Int32Array(n1);
   const ha2 = new Int32Array(n2);
-  const heads = new Map<number, number>();
-  const repLines: ByteLines[] = [];
-  const repIdx: number[] = [];
-  const next: number[] = [];
-  const len1: number[] = [];
-  const len2: number[] = [];
-  const pass = (lines: ByteLines, from: number, n: number, ha: Int32Array, first: boolean) => {
+  // classes are numbered by first appearance, as xdiff numbers its records; a class is found
+  // through an open-addressing table on the line hash (equal lines hash alike)
+  const max = n1 + n2;
+  let bits = 4;
+  while (1 << bits < max * 2) bits++;
+  const mask = (1 << bits) - 1;
+  const table = new Int32Array(1 << bits).fill(-1);
+  const clsHash = new Int32Array(max);
+  const repFile = new Uint8Array(max);
+  const repIdx = new Int32Array(max);
+  const len1 = new Int32Array(max);
+  const len2 = new Int32Array(max);
+  let classes = 0;
+  const files = [l1, l2];
+  for (let f = 0; f < 2; f++) {
+    const lines = f === 0 ? l1 : l2;
+    const from = f === 0 ? from1 : from2;
+    const n = f === 0 ? n1 : n2;
+    const ha = f === 0 ? ha1 : ha2;
+    const counts = f === 0 ? len1 : len2;
+    const bytes = lines.content;
     for (let i = 0; i < n; i++) {
       const li = from + i;
-      const h = ws
-        ? xdlHashRecord(lines.content, lines.start(li), lines.start(li + 1), ws)
-        : lines.hash(li);
-      const head = heads.get(h);
-      let c = head ?? -1;
-      if (ws) {
-        const bytes = lines.content;
-        const b0 = lines.start(li);
-        const b1 = lines.start(li + 1);
-        while (c >= 0) {
-          const r = repLines[c];
+      const b0 = lines.start(li);
+      const b1 = lines.start(li + 1);
+      const h = ws ? xdlHashRecord(bytes, b0, b1, ws) : lines.hash(li);
+      let slot = Math.imul(h, 0x9e3779b1) >>> (32 - bits);
+      let c = table[slot];
+      while (c >= 0) {
+        if (clsHash[c] === h) {
+          const r = files[repFile[c]];
           const ri = repIdx[c];
-          if (xdlRecmatch(r.content, r.start(ri), r.start(ri + 1), bytes, b0, b1, ws)) break;
-          c = next[c];
+          if (
+            ws
+              ? xdlRecmatch(r.content, r.start(ri), r.start(ri + 1), bytes, b0, b1, ws)
+              : r.lineEquals(ri, lines, li)
+          ) {
+            break;
+          }
         }
-      } else {
-        while (c >= 0 && !repLines[c].lineEquals(repIdx[c], lines, li)) c = next[c];
+        slot = (slot + 1) & mask;
+        c = table[slot];
       }
       if (c < 0) {
-        c = repLines.length;
-        repLines.push(lines);
-        repIdx.push(li);
-        next.push(head ?? -1);
-        len1.push(0);
-        len2.push(0);
-        heads.set(h, c);
+        c = classes++;
+        table[slot] = c;
+        clsHash[c] = h;
+        repFile[c] = f;
+        repIdx[c] = li;
       }
-      if (first) len1[c]++;
-      else len2[c]++;
+      counts[c]++;
       ha[i] = c;
     }
-  };
-  pass(l1, from1, n1, ha1, true);
-  pass(l2, from2, n2, ha2, false);
+  }
+  return { ha1, ha2, len1, len2 };
+}
+
+/** {@link classify} by interned line ids: the same classes, numbered alike */
+function classifyInterned(
+  interner: LineInterner,
+  l1: ByteLines,
+  from1: number,
+  n1: number,
+  l2: ByteLines,
+  from2: number,
+  n2: number,
+): { ha1: Int32Array; ha2: Int32Array; len1: Int32Array; len2: Int32Array } {
+  const ids1 = interner.ids(l1);
+  const ids2 = interner.ids(l2);
+  const ha1 = new Int32Array(n1);
+  const ha2 = new Int32Array(n2);
+  const len1 = new Int32Array(n1 + n2);
+  const len2 = new Int32Array(n1 + n2);
+  const { stamps, local, generation } = interner.scratch();
+  let classes = 0;
+  for (let i = 0; i < n1; i++) {
+    const id = ids1[from1 + i];
+    let c: number;
+    if (stamps[id] === generation) c = local[id];
+    else {
+      c = classes++;
+      stamps[id] = generation;
+      local[id] = c;
+    }
+    len1[c]++;
+    ha1[i] = c;
+  }
+  for (let i = 0; i < n2; i++) {
+    const id = ids2[from2 + i];
+    let c: number;
+    if (stamps[id] === generation) c = local[id];
+    else {
+      c = classes++;
+      stamps[id] = generation;
+      local[id] = c;
+    }
+    len2[c]++;
+    ha2[i] = c;
+  }
   return { ha1, ha2, len1, len2 };
 }
 
@@ -356,8 +424,8 @@ function cleanMmatch(action: Uint8Array, i: number, len: number): boolean {
 function cleanupRecords(
   xdf1: XdFile,
   xdf2: XdFile,
-  len1c: number[],
-  len2c: number[],
+  len1c: Int32Array,
+  len2c: Int32Array,
   needMin: boolean,
 ): void {
   const off = xdf1.dstart;
@@ -418,7 +486,16 @@ export function prepareEnv(
   n2: number,
   flags: XdFlags,
 ): XdEnv {
-  const { ha1, ha2, len1, len2 } = classify(l1, from1, n1, l2, from2, n2, flags.whitespace ?? 0);
+  const { ha1, ha2, len1, len2 } = classify(
+    l1,
+    from1,
+    n1,
+    l2,
+    from2,
+    n2,
+    flags.whitespace ?? 0,
+    flags.interner,
+  );
   const xdf1 = newFile(l1, from1, n1, ha1);
   const xdf2 = newFile(l2, from2, n2, ha2);
   if (flags.algorithm !== "patience" && flags.algorithm !== "histogram") {
@@ -666,6 +743,7 @@ export function fallBackDiff(
     algorithm: "myers",
     indentHeuristic: flags.indentHeuristic,
     whitespace: flags.whitespace,
+    interner: flags.interner,
   });
   a.changed.set(sub.xdf1.changed.subarray(1, 1 + count1), line1);
   b.changed.set(sub.xdf2.changed.subarray(1, 1 + count2), line2);
@@ -915,6 +993,7 @@ export function changeCompact(xdf: XdFile, xdfo: XdFile, flags: XdFlags): void {
           algorithm: "myers",
           indentHeuristic: flags.indentHeuristic,
           whitespace: flags.whitespace,
+          interner: flags.interner,
         });
       }
     }
@@ -968,5 +1047,6 @@ export function xdiff(a: ByteLines, b: ByteLines, options: XdiffOptions = {}): X
     histogramRediff: options.histogramRediff ?? true,
     legacyMinimal: options.legacyMinimal ?? false,
     whitespace: whitespaceFlags(options),
+    interner: options.interner,
   });
 }

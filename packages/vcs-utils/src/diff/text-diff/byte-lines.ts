@@ -7,26 +7,77 @@
 
 import { Sequence, type SequenceComparator } from "./sequence.js";
 
+/**
+ * Content that gives the lines of any prefix ending a line: a {@link ByteLines}, or an
+ * `InternedText` that reads its lines on demand.
+ */
+export interface LineSource {
+  readonly content: Uint8Array;
+  /** The first `length` bytes as lines */
+  prefix(length: number): ByteLines;
+}
+
 /** The lines of a byte buffer: split after each LF, the terminator kept with its line. */
-export class ByteLines extends Sequence {
+export class ByteLines extends Sequence implements LineSource {
   /** Start offsets of the lines, plus the content length as the last entry */
   private readonly starts: Int32Array;
+  /** The {@link LineInterner} that numbered these lines, and its ids (see `LineInterner.ids`) */
+  internedBy: object | undefined;
+  internedIds: Int32Array | undefined;
   /** Hash of each line, computed on first use */
   private hashes: Int32Array | undefined;
 
-  constructor(readonly content: Uint8Array) {
+  constructor(
+    readonly content: Uint8Array,
+    starts?: Int32Array,
+    hashes?: Int32Array,
+  ) {
     super();
+    if (starts) {
+      this.starts = starts;
+      this.hashes = hashes;
+      return;
+    }
     let count = 0;
     for (let i = 0; i < content.length; i++) if (content[i] === 0x0a) count++;
     if (content.length > 0 && content[content.length - 1] !== 0x0a) count++;
-    const starts = new Int32Array(count + 1);
+    const out = new Int32Array(count + 1);
     let n = 0;
     if (content.length > 0) {
-      starts[n++] = 0;
-      for (let i = 0; i < content.length - 1; i++) if (content[i] === 0x0a) starts[n++] = i + 1;
+      out[n++] = 0;
+      for (let i = 0; i < content.length - 1; i++) if (content[i] === 0x0a) out[n++] = i + 1;
     }
-    starts[n] = content.length;
-    this.starts = starts;
+    out[n] = content.length;
+    this.starts = out;
+  }
+
+  /**
+   * The first `length` bytes as lines, sharing this sequence's line table and hashes when
+   * `length` ends a line (as a tail trimmed by `trimCommonTail` does).
+   */
+  prefix(length: number): ByteLines {
+    if (length === this.content.length) return this;
+    const starts = this.starts;
+    // the line ending at `length`: binary search in the line starts
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid] < length) lo = mid + 1;
+      else hi = mid;
+    }
+    if (starts[lo] !== length) return new ByteLines(this.content.subarray(0, length));
+    const hashes = this.hashes ?? this.hashAll();
+    const out = new ByteLines(
+      this.content.subarray(0, length),
+      starts.subarray(0, lo + 1),
+      hashes.subarray(0, lo),
+    );
+    if (this.internedIds) {
+      out.internedBy = this.internedBy;
+      out.internedIds = this.internedIds.subarray(0, lo);
+    }
+    return out;
   }
 
   size(): number {
@@ -50,21 +101,22 @@ export class ByteLines extends Sequence {
 
   /** A hash of line `i`, terminator included (equal lines hash alike) */
   hash(i: number): number {
-    let hashes = this.hashes;
-    if (!hashes) {
-      const n = this.size();
-      hashes = new Int32Array(n);
-      const c = this.content;
-      for (let k = 0; k < n; k++) {
-        let h = 5381;
-        for (let p = this.starts[k], end = this.starts[k + 1]; p < end; p++) {
-          h = (Math.imul(h, 33) + c[p]) | 0;
-        }
-        hashes[k] = h;
-      }
-      this.hashes = hashes;
+    return (this.hashes ?? this.hashAll())[i];
+  }
+
+  private hashAll(): Int32Array {
+    const starts = this.starts;
+    const n = starts.length - 1;
+    const hashes = new Int32Array(n);
+    const c = this.content;
+    let p = 0;
+    for (let k = 0; k < n; k++) {
+      let h = 5381;
+      for (const end = starts[k + 1]; p < end; p++) h = (Math.imul(h, 33) + c[p]) | 0;
+      hashes[k] = h;
     }
-    return hashes[i];
+    this.hashes = hashes;
+    return hashes;
   }
 
   /** Whether line `i` and line `j` of `other` hold the same bytes */

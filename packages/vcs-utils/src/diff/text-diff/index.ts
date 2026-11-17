@@ -6,6 +6,7 @@ export * from "./byte-lines.js";
 export * from "./diff-algorithm.js";
 export * from "./edit.js";
 export * from "./hashed-sequence.js";
+export * from "./line-interner.js";
 export * from "./line-merge.js";
 export * from "./myers-diff.js";
 export * from "./raw-text.js";

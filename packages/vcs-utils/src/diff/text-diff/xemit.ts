@@ -19,7 +19,7 @@
  * @module
  */
 
-import { ByteLines } from "./byte-lines.js";
+import { ByteLines, type LineSource } from "./byte-lines.js";
 import {
   diffScript,
   whitespaceFlags,
@@ -365,8 +365,13 @@ export function trimCommonTail(a: Uint8Array, b: Uint8Array): number {
   const smaller = Math.min(a.length, b.length);
   let ap = a.length;
   let bp = b.length;
+  // blocks compared four bytes at a time (a DataView reads unaligned words)
+  const da = new DataView(a.buffer, a.byteOffset, a.length);
+  const db = new DataView(b.buffer, b.byteOffset, b.length);
   outer: while (blk + trimmed <= smaller) {
-    for (let k = 0; k < blk; k++) if (a[ap - blk + k] !== b[bp - blk + k]) break outer;
+    for (let k = 0; k < blk; k += 4) {
+      if (da.getInt32(ap - blk + k) !== db.getInt32(bp - blk + k)) break outer;
+    }
     trimmed += blk;
     ap -= blk;
     bp -= blk;
@@ -411,21 +416,34 @@ export function unifiedDiffHunks(
 /**
  * The changes `xdi_diff` hands to a hunk callback without context, as `git blame` gets
  * them: the common tail trimmed first (`trim_common_tail`), then one change per hunk.
+ *
+ * Either side can be given as a {@link LineSource} (a `ByteLines`, or an `InternedText`
+ * with `options.interner`): a caller diffing one version against several others (as blame
+ * does) splits and hashes its lines once.
  */
 export function xdiffHunks(
-  oldContent: Uint8Array,
-  newContent: Uint8Array,
+  oldContent: Uint8Array | LineSource,
+  newContent: Uint8Array | LineSource,
   options: XdiffOptions = {},
 ): XdiffChange[] {
-  const cut = trimCommonTail(oldContent, newContent);
-  const la = new ByteLines(oldContent.subarray(0, oldContent.length - cut));
-  const lb = new ByteLines(newContent.subarray(0, newContent.length - cut));
+  const a = oldContent instanceof Uint8Array ? oldContent : oldContent.content;
+  const b = newContent instanceof Uint8Array ? newContent : newContent.content;
+  const cut = trimCommonTail(a, b);
+  const la =
+    oldContent instanceof Uint8Array
+      ? new ByteLines(a.subarray(0, a.length - cut))
+      : oldContent.prefix(a.length - cut);
+  const lb =
+    newContent instanceof Uint8Array
+      ? new ByteLines(b.subarray(0, b.length - cut))
+      : newContent.prefix(b.length - cut);
   return diffScript(la, 0, la.size(), lb, 0, lb.size(), {
     algorithm: options.algorithm ?? "myers",
     indentHeuristic: options.indentHeuristic ?? false,
     histogramRediff: options.histogramRediff ?? true,
     legacyMinimal: options.legacyMinimal ?? false,
     whitespace: whitespaceFlags(options),
+    interner: options.interner,
   });
 }
 

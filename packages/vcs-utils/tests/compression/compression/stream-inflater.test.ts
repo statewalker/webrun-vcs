@@ -184,6 +184,37 @@ describe("createInflaterPool: state reuse (JGit InflaterCache)", () => {
     expect(pool.allocated).toBe(8);
   });
 
+  it("a reused state inflates stored, fixed and dynamic blocks one after another", () => {
+    // the reset keeps the dynamic code tables: every kind of block must still decode after
+    // any other, with or without the zlib wrapper
+    const pool = createInflaterPool();
+    const words = Array.from({ length: 3000 }, (_, i) => `w${(i * 7919) % 613} `).join("");
+    const payloads = [
+      enc.encode("short"),
+      enc.encode(words),
+      new Uint8Array(randomBytes(5000)),
+      enc.encode("a".repeat(70000)),
+      enc.encode(words.split("").reverse().join("")),
+    ];
+    for (let round = 0; round < 3; round++) {
+      for (const [k, input] of payloads.entries()) {
+        const level = [0, 1, 9][(k + round) % 3] as 0 | 1 | 9;
+        const raw = (k + round) % 2 === 1;
+        const z = raw ? deflateRawSync(input, { level }) : deflateSync(input, { level });
+        const inf = pool.acquire({ raw });
+        const parts: Uint8Array[] = [];
+        for (const c of chunked(new Uint8Array(z), 997)) {
+          const r = inf.push(c);
+          parts.push(...r.out);
+          if (r.done) break;
+        }
+        inf.end();
+        expect(eq(concat(parts), input)).toBe(true);
+      }
+    }
+    expect(pool.allocated).toBe(2);
+  });
+
   const good = streams[4] ?? new Uint8Array();
   const goodInput = inputs[4] ?? new Uint8Array();
 
