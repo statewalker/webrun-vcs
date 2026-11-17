@@ -1,5 +1,6 @@
 import type { ObjectId, Ref } from "@statewalker/vcs-core";
 import { compareRefNames, isSymbolicRef, isValidBranchName } from "@statewalker/vcs-core";
+import type { WorktreeInfo } from "@statewalker/vcs-working-tree";
 
 import {
   BranchUsedByWorktreeError,
@@ -359,8 +360,10 @@ export class ListBranchCommand extends GitCommand<Ref[]> {
 }
 
 /**
- * Rename a branch. Other worktrees whose HEAD is on it follow the new name (git's
- * `replace_each_worktree_head_symref`).
+ * Rename a branch. Other worktrees whose HEAD is on it follow the new name, with git's
+ * `Branch: renamed <old> to <new>` line in their HEAD reflog (git's
+ * `replace_each_worktree_head_symref`). Refused (`BranchUsedByWorktreeError`) while a
+ * worktree rebases or bisects the branch (`branch refs/heads/x is being rebased at <path>`).
  *
  * Equivalent to `git branch -m`.
  *
@@ -450,6 +453,31 @@ export class RenameBranchCommand extends GitCommand<Ref> {
       throw new RefAlreadyExistsError(newRefName, `Branch '${this.newName}' already exists`);
     }
 
+    // Everything checked before anything changes: git's reject_rebase_or_bisect_branch (a
+    // worktree with a detached HEAD rebasing or bisecting the branch), and the other
+    // worktrees whose HEAD is on it
+    const worktrees = this.workingCopy.worktrees;
+    const others: WorktreeInfo[] = [];
+    if (worktrees) {
+      for (const wt of await worktrees.list()) {
+        if (wt.detached && wt.rebasing === oldRefName) {
+          throw new BranchUsedByWorktreeError(
+            shortBranchName(oldRefName),
+            wt.path,
+            `branch ${oldRefName} is being rebased at ${wt.path}`,
+          );
+        }
+        if (wt.detached && wt.bisecting === oldRefName) {
+          throw new BranchUsedByWorktreeError(
+            shortBranchName(oldRefName),
+            wt.path,
+            `branch ${oldRefName} is being bisected at ${wt.path}`,
+          );
+        }
+        if (!wt.current && !wt.detached && wt.headRef === oldRefName) others.push(wt);
+      }
+    }
+
     // Create new and delete old
     await this.refsStore.set(newRefName, oldRef.objectId);
     await this.refsStore.delete(oldRefName);
@@ -459,15 +487,10 @@ export class RenameBranchCommand extends GitCommand<Ref> {
     if (head && isSymbolicRef(head) && head.target === oldRefName) {
       await this.refsStore.setSymbolic("HEAD", newRefName);
     }
-    // and every other worktree's HEAD on it (git's replace_each_worktree_head_symref)
-    const worktrees = this.workingCopy.worktrees;
-    if (worktrees) {
-      for (const wt of await worktrees.list()) {
-        if (wt.current || wt.bare || wt.headRef !== oldRefName) continue;
-        const other = await worktrees.open(wt);
-        await other.history.refs.setSymbolic("HEAD", newRefName);
-      }
-    }
+    // and every other worktree's HEAD on it, through that worktree's own refs, logged as
+    // git's replace_each_worktree_head_symref logs it
+    const message = `Branch: renamed ${oldRefName} to ${newRefName}`;
+    for (const wt of others) await worktrees?.updateHead(wt, newRefName, { message });
 
     this.setCallable(false);
 

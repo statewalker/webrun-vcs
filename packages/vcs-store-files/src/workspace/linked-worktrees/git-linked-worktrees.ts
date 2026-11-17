@@ -39,7 +39,7 @@ import type {
   WorktreeRepairReport,
 } from "@statewalker/vcs-working-tree";
 
-import { createWorktreeRefs } from "../../refs/index.js";
+import { createFileRefStore, createWorktreeRefs } from "../../refs/index.js";
 import { GitCheckout, type GitCheckoutFilesApi } from "../checkout/index.js";
 import {
   HostPaths,
@@ -82,6 +82,13 @@ export interface GitLinkedWorktreesOptions
   history: History;
   /** Where the FilesApi's root is on the host. Default: the FilesApi's `rootDirectory`. */
   rootPath?: string;
+  /**
+   * The current linked worktree's directory (a FilesApi path, or a host path below the
+   * root), as git takes it from the directory holding the `.git` file it came through.
+   * Only used by {@link GitLinkedWorktrees.openCurrent} when `gitDir/../gitdir` is missing
+   * or empty, so the worktree is not listed; without it such a worktree is refused.
+   */
+  workTree?: string;
 }
 
 /**
@@ -115,6 +122,11 @@ async function readIfFile(files: FilesApi, path: string): Promise<Uint8Array | u
   const kind = (await files.stats(path).catch(() => undefined))?.kind;
   if (kind !== "file") return undefined;
   return tryReadFile(files, path).catch(() => undefined);
+}
+
+/** git's `strbuf_trim`: ASCII white space (space, tab, line feed, carriage return) only. */
+function trimAscii(text: string): string {
+  return text.replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, "");
 }
 
 /** `write_file`'s text: a line end added when missing, an empty text an empty file. */
@@ -207,20 +219,30 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     };
   }
 
+  /**
+   * The reflog settings of a linked worktree: core.logAllRefUpdates, by default true, as
+   * git's `is_bare_repository()` is false inside a linked worktree even when the repository
+   * is bare. `repositoryDefault` is what the repository's own ref store uses (false for a
+   * bare one without the setting).
+   */
   private async reflogSettings(): Promise<{
     logAllRefUpdates: boolean | "always";
+    repositoryDefault: boolean | "always";
     identity: { name: string; email: string };
   }> {
     const config = await this.repositoryConfig();
     const setting = config.get("core.logAllRefUpdates");
-    const logAllRefUpdates =
+    const explicit =
       typeof setting === "string" && setting.toLowerCase() === "always"
         ? "always"
-        : (parseGitBool(setting) ?? !(parseGitBool(config.get("core.bare")) ?? false));
+        : parseGitBool(setting);
+    const logAllRefUpdates = explicit ?? true;
+    const repositoryDefault = explicit ?? !(parseGitBool(config.get("core.bare")) ?? false);
     const name = config.get("user.name");
     const email = config.get("user.email");
     return {
       logAllRefUpdates,
+      repositoryDefault,
       identity: {
         name: typeof name === "string" ? name : "webrun-vcs",
         email: typeof email === "string" ? email : "vcs@localhost",
@@ -234,8 +256,17 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     let refs = this.refsByDir.get(gitDir);
     if (!refs) {
       const { logAllRefUpdates, identity } = await this.reflogSettings();
+      // the repository's refs as this worktree updates them: under the worktree's reflog
+      // setting (a linked worktree of a bare repository logs the branches it moves, as git
+      // runs there as in a non-bare repository), and without the repository's HEAD logging
+      // a branch it points at (this worktree's own HEAD logs it, as git's split_head_update)
+      const common = createFileRefStore(this.files, this.commonDir, {
+        logAllRefUpdates,
+        reflogIdentity: identity,
+        logHeadUpdates: false,
+      });
       refs = createWorktreeRefs({
-        common: this.history.refs,
+        common,
         files: this.files,
         gitDir,
         logAllRefUpdates,
@@ -277,13 +308,13 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       }
       return `refs/heads/${text}`;
     };
-    if ((await this.kind(`${gitDir}/rebase-merge`)) === "directory") {
+    // wt_status_check_rebase: rebase-apply first (an `am` there when it has `applying`)
+    if ((await this.kind(`${gitDir}/rebase-apply`)) !== undefined) {
+      if ((await this.kind(`${gitDir}/rebase-apply/applying`)) === undefined) {
+        out.rebasing = await branchAt(`${gitDir}/rebase-apply/head-name`);
+      }
+    } else if ((await this.kind(`${gitDir}/rebase-merge`)) !== undefined) {
       out.rebasing = await branchAt(`${gitDir}/rebase-merge/head-name`);
-    } else if (
-      (await this.kind(`${gitDir}/rebase-apply`)) === "directory" &&
-      (await this.kind(`${gitDir}/rebase-apply/applying`)) === undefined
-    ) {
-      out.rebasing = await branchAt(`${gitDir}/rebase-apply/head-name`);
     }
     out.bisecting = await branchAt(`${gitDir}/BISECT_START`);
     return out;
@@ -317,7 +348,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       path,
       bare: false,
       current: this.gitDir === admin,
-      ...(locked !== undefined ? { lockReason: locked.trim() } : {}),
+      ...(locked !== undefined ? { lockReason: trimAscii(locked) } : {}),
       ...(await this.headInfo(admin)),
     };
   }
@@ -391,7 +422,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     const target = isAbsoluteGitPath(gitdirPath)
       ? gitdirPath
       : this.paths.normalize(`${this.paths.hostPath(admin)}/${gitdirPath}`);
-    if ((await this.kind(this.fromHost(target))) === undefined) {
+    // a place beyond this storage (outside the FilesApi's root, or written through a path
+    // the root does not match, such as a symbolic link's target) cannot be looked at: it
+    // counts as present, so a live worktree is never pruned
+    const at = this.fromHost(target);
+    if (at !== undefined && (await this.kind(at)) === undefined) {
       const index = await this.files.stats(`${admin}/index`).catch(() => undefined);
       const mtime = index?.lastModified;
       if (mtime === undefined || Math.floor(mtime / 1000) <= expire) {
@@ -441,7 +476,8 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     if (!isAbsoluteGitPath(entry.path)) {
       return `'${admin}/gitdir' file does not contain absolute path to the working tree location`;
     }
-    if (options.missingOk && (await this.kind(this.fromHost(entry.path))) === undefined) {
+    const root = this.fromHost(entry.path);
+    if (options.missingOk && root !== undefined && (await this.kind(root)) === undefined) {
       return undefined;
     }
     if ((await this.kind(this.fromHost(dotGit))) === undefined) return `'${dotGit}' does not exist`;
@@ -454,6 +490,10 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       return `'${entry.path}' does not point back to '${admin}'`;
     }
     return undefined;
+  }
+
+  reachable(entry: WorktreeInfo): boolean {
+    return this.fromHost(entry.path) !== undefined;
   }
 
   async hasSubmodules(entry: WorktreeInfo): Promise<boolean> {
@@ -705,22 +745,54 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
 
   // ----------------------------------------------------------------- working copies
 
-  /** The working copy of the current worktree. */
+  /**
+   * The working copy of the current worktree. Refused for a bare repository (no working
+   * tree), and for a linked worktree that is not listed (its `gitdir` file is missing or
+   * empty) unless the options name its directory (`workTree`, as git takes the directory
+   * holding the `.git` file): its HEAD and index must not be paired with another directory.
+   */
   async openCurrent(): Promise<WorkingCopy> {
     const current = (await this.list()).find((wt) => wt.current);
+    if (current?.bare) throw new Error("this operation must be run in a work tree");
     if (current) return this.open(current);
-    // the current git directory is not listed (its gitdir file is gone): open it anyway
     const id = this.gitDir.slice(this.gitDir.lastIndexOf("/") + 1);
+    const workTree = this.options.workTree;
+    if (workTree === undefined) {
+      throw new Error(
+        `cannot find the working tree of '${this.paths.hostPath(this.gitDir)}': its gitdir file is missing or empty`,
+      );
+    }
     return this.open({
       id,
-      path: this.paths.hostPath(this.mainPath()),
+      path: this.hostPath(workTree),
       bare: false,
       detached: false,
       current: true,
     });
   }
 
+  async updateHead(
+    entry: WorktreeInfo,
+    target: string,
+    log: { message: string; ident?: string },
+  ): Promise<void> {
+    const gitDir = entry.id === undefined ? this.commonDir : this.adminDir(entry.id);
+    const refs = await this.refsOf(gitDir);
+    const old = (await refs.resolve("HEAD").catch(() => undefined))?.objectId;
+    await refs.setSymbolic("HEAD", target);
+    const next = (await refs.resolve(target).catch(() => undefined))?.objectId;
+    if (next === undefined) return;
+    if (gitDir === this.commonDir) {
+      // the repository's own HEAD: logged as its ref store logs (a bare one: not by default)
+      const path = `${gitDir}/logs/HEAD`;
+      const { repositoryDefault } = await this.reflogSettings();
+      if (repositoryDefault === false && (await this.kind(path)) === undefined) return;
+    }
+    await this.appendHeadLog(gitDir, old ?? ZERO_ID, next, log.ident, log.message);
+  }
+
   async open(entry: WorktreeInfo): Promise<WorkingCopy> {
+    if (entry.bare) throw new Error("this operation must be run in a work tree");
     const gitDir = entry.id === undefined ? this.commonDir : this.adminDir(entry.id);
     const root = this.fromHost(entry.path);
     if (root === undefined) throw new Error(`'${entry.path}' is beyond this storage`);

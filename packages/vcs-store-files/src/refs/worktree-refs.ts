@@ -82,9 +82,13 @@ class WorktreeRefs implements Refs {
 
   constructor(private readonly options: WorktreeRefsOptions) {
     this.common = options.common;
+    // HEAD here names a branch of the repository: its old value (compared and logged by a
+    // `noDeref` update of HEAD, as `checkout --detach` or a rebase's start make) is read there
     this.own = createFileRefStore(options.files, options.gitDir, {
       logAllRefUpdates: options.logAllRefUpdates,
       reflogIdentity: options.reflogIdentity,
+      resolveOutside: async (name) =>
+        isPerWorktreeRef(name) ? undefined : (await this.common.resolve(name))?.objectId,
     });
   }
 

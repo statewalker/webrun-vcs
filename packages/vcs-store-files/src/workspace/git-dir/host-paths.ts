@@ -7,6 +7,8 @@
  * paths.hostPath("repo/.git/worktrees/wt"); // "/home/me/src/repo/.git/worktrees/wt"
  * paths.filesPath("/home/me/src/wt/.git"); // "/wt/.git"
  * paths.filesPath("/elsewhere/wt"); // "/elsewhere/wt": beyond the root, as written
+ * paths.inside("/elsewhere/wt"); // false
+ * new HostPaths("/").inside("/elsewhere/wt"); // true: the root `/` holds every path
  * new HostPaths("C:\\Users\\me").hostPath("wt"); // "C:/Users/me/wt"
  * ```
  *
@@ -103,6 +105,12 @@ export class HostPaths {
   /** Whether `hostPath` lies at or below the root (a FilesApi path can name it). */
   inside(hostPath: string): boolean {
     if (this.base === undefined) return false;
-    return this.filesPath(hostPath) !== hostPath || this.same(hostPath, this.base || "/");
+    // the prefix itself is tested: with the root `/` (base `""`) every path keeps its text
+    const target = this.normalize(hostPath);
+    const base = this.base === "" ? "" : this.normalize(this.base).replace(/\/$/, "");
+    if (this.same(target, base || "/")) return true;
+    const prefix = `${base}/`;
+    const head = target.slice(0, prefix.length);
+    return this.windows ? head.toLowerCase() === prefix.toLowerCase() : head === prefix;
   }
 }

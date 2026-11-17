@@ -162,8 +162,31 @@ export interface LinkedWorktrees {
   /** git's `remove_junk`: a failed add's administrative directory and the directory it created. */
   discardCreate(created: CreatedLinkedWorktree, path: string): Promise<void>;
 
-  /** A working copy of `entry` (its HEAD, index and files). */
+  /**
+   * A working copy of `entry` (its HEAD, index and files). Refused for a bare main worktree
+   * and for a worktree beyond this storage ({@link LinkedWorktrees.reachable}).
+   */
   open(entry: WorktreeInfo): Promise<WorkingCopy>;
+
+  /**
+   * Point `entry`'s HEAD at the branch `target` (`ref: <target>`) through that worktree's
+   * own ref store, without opening its working copy, and log it as git's
+   * `refs_update_symref` does (`branch -m` repointing other worktrees): from the id HEAD
+   * resolved to before (the zero id when it no longer resolves) to `target`'s id, when
+   * `target` resolves.
+   */
+  updateHead(
+    entry: WorktreeInfo,
+    target: string,
+    log: { message: string; ident?: string },
+  ): Promise<void>;
+
+  /**
+   * Whether this storage can name `entry`'s directory. One outside the FilesApi's root, or
+   * written through a path the root does not match (a symbolic link's target), cannot be
+   * looked at: it counts as present (never pruned), and `remove` and `move` refuse it.
+   */
+  reachable(entry: WorktreeInfo): boolean;
 
   /** Write `entry`'s lock (`write_file`: a line end added when missing; an empty reason: empty file). */
   lock(entry: WorktreeInfo, reason: string): Promise<void>;

@@ -15,6 +15,16 @@ function refuseLocked(wt: WorktreeInfo, force: number, verb: "move" | "remove"):
   );
 }
 
+/**
+ * A worktree this storage cannot name (outside the FilesApi's root, or written through a
+ * path the root does not match) cannot be checked or changed: refused rather than taken
+ * as missing.
+ */
+function refuseBeyond(worktrees: LinkedWorktrees, wt: WorktreeInfo, verb: "move" | "remove"): void {
+  if (worktrees.reachable(wt)) return;
+  throw new WorktreeError(`cannot ${verb} '${wt.path}': it is beyond this storage`);
+}
+
 /** git's `validate_no_submodules`. */
 async function refuseSubmodules(worktrees: LinkedWorktrees, wt: WorktreeInfo): Promise<void> {
   if (await worktrees.hasSubmodules(wt)) {
@@ -37,7 +47,8 @@ async function refuseSubmodules(worktrees: LinkedWorktrees, wt: WorktreeInfo): P
  * worktree unless forced twice; a worktree whose `.git` file does not point back (a gone
  * directory is fine); unless forced, one with submodules, or with modified, staged or
  * untracked files (git's `status --porcelain --ignore-submodules=none`, ignored files
- * aside). The directory goes, then `.git/worktrees/<id>`, then `.git/worktrees` if empty.
+ * aside); a worktree beyond this storage (outside the FilesApi's root, or reached through a
+ * path the root does not match), which cannot be checked. The directory goes, then `.git/worktrees/<id>`, then `.git/worktrees` if empty.
  */
 export class WorktreeRemoveCommand extends GitCommand<WorktreeInfo> {
   private worktree?: string;
@@ -63,6 +74,7 @@ export class WorktreeRemoveCommand extends GitCommand<WorktreeInfo> {
     const worktrees = requireWorktrees(this.workingCopy, "remove");
     const arg = this.worktree;
     const wt = await findLinkedWorktree(worktrees, arg, "'%s' is a main working tree");
+    refuseBeyond(worktrees, wt, "remove");
     refuseLocked(wt, this.force, "remove");
     const invalid = await worktrees.validate(wt, { missingOk: true });
     if (invalid)
@@ -102,7 +114,7 @@ export class WorktreeRemoveCommand extends GitCommand<WorktreeInfo> {
  * (`WorktreeError`): no such worktree; the main worktree; a destination that exists and is
  * not an empty directory, or where a missing worktree is registered (unless forced);
  * submodules; a locked worktree unless forced twice; a worktree whose `.git` file does not
- * point back. The directory is renamed, then `gitdir` and the worktree's `.git` file name
+ * point back; a worktree beyond this storage. The directory is renamed, then `gitdir` and the worktree's `.git` file name
  * the new place.
  */
 export class WorktreeMoveCommand extends GitCommand<WorktreeInfo> {
@@ -138,6 +150,7 @@ export class WorktreeMoveCommand extends GitCommand<WorktreeInfo> {
     if (this.destination === undefined) throw new WorktreeError("<new-path> is required");
     let destination = this.destination;
     const wt = await findLinkedWorktree(worktrees, this.worktree, "'%s' is a main working tree");
+    refuseBeyond(worktrees, wt, "move");
     const state = await worktrees.pathState(destination);
     if (state === "directory" || state === "empty-directory") {
       const sep = wt.path.lastIndexOf("/");

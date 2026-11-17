@@ -5,8 +5,9 @@
  * and to add additional worktrees to an existing repository.
  */
 
-import type { History } from "@statewalker/vcs-core";
-import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import type { FilesApi, History } from "@statewalker/vcs-core";
+import { decodeGitPath, encodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { normalizePath } from "@statewalker/vcs-utils/files";
 import type {
   AddWorktreeOptions,
   Checkout,
@@ -24,6 +25,7 @@ import {
   parseCommonDir,
   sanitizeRefnameComponent,
 } from "../git-dir/index.js";
+import { openGitLinkedWorktrees } from "../linked-worktrees/index.js";
 import { createGitStashStore } from "./stash-store.files.js";
 import { GitWorkingCopy, type WorkingCopyFilesApi } from "./working-copy.files.js";
 import {
@@ -62,6 +64,16 @@ export interface GitWorkingCopyContext {
   createCheckout: (gitDir: string) => Promise<Checkout>;
   /** Factory function to create the worktree interface */
   createWorktree: (worktreePath: string) => Worktree;
+  /**
+   * The FilesApi the repository is in, naming the same paths as the factory's files. With
+   * it the working copies the factory opens get `worktrees` (`openGitLinkedWorktrees`), and
+   * `addWorktree` returns the new worktree's own working copy: HEAD, index, pseudo refs and
+   * HEAD reflog in `.git/worktrees/<id>`, branches shared (`createWorktreeRefs`). Without
+   * it `addWorktree`'s working copy is built from `createCheckout(worktreeGitDir)` and the
+   * history's refs, so its HEAD is whatever those refs hold: give `files`, or make those
+   * the worktree's own.
+   */
+  files?: FilesApi;
 }
 
 /**
@@ -172,6 +184,11 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     // 5. Create config
     const config = await this.openConfig(repositoryPath);
 
+    // 6. The repository's worktrees, when the context gives its FilesApi
+    const worktrees = context.files
+      ? await this.linkedWorktrees(context, repositoryPath)
+      : undefined;
+
     return new GitWorkingCopy({
       history: context.history,
       checkout,
@@ -181,6 +198,20 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       files: this.files,
       ...this.setup,
       gitDir: repositoryPath,
+      ...(worktrees ? { worktrees } : {}),
+    });
+  }
+
+  /** The worktrees seen from `gitDir`, over the context's FilesApi with this factory's root. */
+  private linkedWorktrees(context: GitWorkingCopyContext, gitDir: string) {
+    const { rootPath: _root, ...setup } = this.setup;
+    return openGitLinkedWorktrees({
+      ...setup,
+      files: context.files as FilesApi,
+      gitDir,
+      history: context.history,
+      // the paths this factory writes: an unknown root stays unknown ("")
+      rootPath: hostRootOf(this.files, this.setup.rootPath) ?? "",
     });
   }
 
@@ -189,23 +220,25 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     return new HostPaths(hostRootOf(this.files, this.setup.rootPath));
   }
 
-  /** The path git writes for `path` (a path in this FilesApi). */
-  private hostPath(path: string): string {
-    return this.paths().hostPath(path);
-  }
-
   /** The path in this FilesApi an absolute host path names (an absolute `commondir`). */
   private filesPath(hostPath: string): string {
     return this.paths().filesPath(hostPath);
   }
 
-  /** The identity of a reflog line written now: `user.name` and `user.email`, else the default. */
-  private async reflogIdent(gitDir: string): Promise<string> {
+  /**
+   * Whether a new worktree's HEAD is logged (core.logAllRefUpdates; by default yes, also in
+   * a bare repository, as git runs in a linked worktree as in a non-bare one), and the
+   * identity of a line written now: `user.name` and `user.email`, else the default.
+   */
+  private async reflogSettings(gitDir: string): Promise<{ log: boolean; ident: string }> {
     const config = await this.openConfig(gitDir, gitDir);
+    const setting = config.get("core.logAllRefUpdates");
+    const always = typeof setting === "string" && setting.toLowerCase() === "always";
+    const log = always || (parseGitBool(setting) ?? true);
     const name = config.get("user.name");
     const email = config.get("user.email");
     const who = `${typeof name === "string" ? name : "webrun-vcs"} <${typeof email === "string" ? email : "vcs@localhost"}>`;
-    return `${who} ${Math.floor(Date.now() / 1000)} +0000`;
+    return { log, ident: `${who} ${Math.floor(Date.now() / 1000)} +0000` };
   }
 
   /**
@@ -218,13 +251,17 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
    * - `.git/worktrees/NAME/gitdir`: the path back to the worktree's `.git` file
    * - `.git/worktrees/NAME/locked`: the lock reason, with `lock`
    * - `.git/worktrees/NAME/logs/HEAD`: the line git's `update-ref` / `symbolic-ref` log for
-   *   the new HEAD (zero id to the commit, no message), when HEAD resolves to a commit
+   *   the new HEAD (zero id to the commit, no message), when HEAD resolves to a commit and
+   *   `core.logAllRefUpdates` is not false
    * - the worktree's `.git` file: `gitdir: /path/to/main/.git/worktrees/NAME`
    *
    * NAME is the worktree directory's name as a ref component (git's
    * `sanitize_refname_component`: `a b` gives `a-b`, `.x` gives `-x`), followed by 1, 2, ... when a worktree of that
    * name exists, as git numbers them. With a known host root the paths are absolute host
    * paths, as git writes them, so native git can use the worktree.
+   *
+   * The working copy returned is the new worktree's own (its HEAD, index and reflog) when
+   * the context gives its FilesApi (`GitWorkingCopyContext.files`).
    *
    * @param history History interface
    * @param gitDir Path to the main .git directory
@@ -275,6 +312,10 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       worktreeName = `${baseName}${counter++}`;
     }
     const worktreeGitDir = `${gitDir}/worktrees/${worktreeName}`;
+    const paths = this.paths();
+    // the paths git writes: host paths with a known root; else the FilesApi paths, made
+    // absolute (a relative one would be read back as relative to the admin directory)
+    const written = (path: string) => (paths.known ? paths.hostPath(path) : normalizePath(path));
 
     // `git worktree add -b` creates the branch first; it stays when the worktree fails
     if (createBranch) await history.refs.set(createBranch.ref, createBranch.objectId);
@@ -303,13 +344,13 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
 
       // Create .git file in worktree pointing to main repo's worktrees/NAME
       // (paths as their bytes: one that is no UTF-8 is written as it is, never as U+FFFD)
-      const gitFile = `gitdir: ${this.hostPath(worktreeGitDir)}\n`;
+      const gitFile = `gitdir: ${written(worktreeGitDir)}\n`;
       await this.files.write(`${worktreePath}/.git`, encodeGitPath(gitFile));
 
       // Create gitdir file in worktrees/NAME pointing back to worktree
       await this.files.write(
         `${worktreeGitDir}/gitdir`,
-        encodeGitPath(`${this.hostPath(`${worktreePath}/.git`)}\n`),
+        encodeGitPath(`${written(`${worktreePath}/.git`)}\n`),
       );
 
       // The repository the worktree belongs to, relative to worktrees/NAME (git writes `../..`)
@@ -319,8 +360,9 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       const headId = head.startsWith("ref: ")
         ? (await history.refs.resolve(head.slice(5)))?.objectId
         : head;
-      if (headId) {
-        const line = `${ZERO_ID} ${headId} ${options.ident ?? (await this.reflogIdent(gitDir))}\n`;
+      const reflog = await this.reflogSettings(gitDir);
+      if (headId && reflog.log) {
+        const line = `${ZERO_ID} ${headId} ${options.ident ?? reflog.ident}\n`;
         await this.files.write(`${worktreeGitDir}/logs/HEAD`, new TextEncoder().encode(line));
       }
 
@@ -339,8 +381,11 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       throw error;
     }
 
-    // Create the working copy using the worktree-specific git directory
+    // The new worktree's own working copy (its HEAD and index), with the repository's worktrees
     const context = await this.createContext(gitDir, {});
+    if (context.files) {
+      return (await this.linkedWorktrees(context, worktreeGitDir)).openCurrent();
+    }
 
     // Create checkout interface for the new worktree
     const checkout = await context.createCheckout(worktreeGitDir);

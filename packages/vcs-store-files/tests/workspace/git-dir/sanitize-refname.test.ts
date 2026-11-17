@@ -61,3 +61,17 @@ describe("HostPaths", () => {
     expect(paths.filesPath("/x")).toBe("/x");
   });
 });
+
+describe("HostPaths with the root /", () => {
+  it("holds every absolute path, so linked worktrees map", () => {
+    const paths = new HostPaths("/");
+    expect(paths.known).toBe(true);
+    expect(paths.hostPath("tmp/repo/.git/worktrees/wt")).toBe("/tmp/repo/.git/worktrees/wt");
+    expect(paths.filesPath("/tmp/wt/.git")).toBe("/tmp/wt/.git");
+    expect(paths.inside("/tmp/wt/.git")).toBe(true);
+    expect(paths.inside("/")).toBe(true);
+    expect(paths.inside("relative/wt")).toBe(false);
+    expect(new HostPaths("C:\\").inside("c:/Users/x")).toBe(true);
+    expect(new HostPaths("/home/me").inside("/home/meet/x")).toBe(false);
+  });
+});

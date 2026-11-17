@@ -20,13 +20,22 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PersonIdent } from "@statewalker/vcs-core";
-import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+import {
+  createFileWorktree,
+  createGitFilesBackend,
+  FileStagingStore,
+  GitCheckout,
+  type GitCheckoutFilesApi,
+  GitWorkingCopyFactory,
+  openGitLinkedWorktrees,
+} from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -743,5 +752,335 @@ describeGit("git worktree, native twins", () => {
       .split("\n");
     expect(wtLog.length).toBe(3);
     expect(readFileSync(join(repo, ".git/logs/HEAD"), "latin1").trim().split("\n").length).toBe(2);
+  });
+});
+
+/** A reflog's lines without their identity: `<old> <new>\t<message>`. */
+function reflog(path: string): string[] {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "latin1")
+    .split("\n")
+    .filter((l) => l !== "")
+    .map((l) => {
+      const tab = l.indexOf("\t");
+      return `${l.slice(0, 81)}${tab < 0 ? "" : l.slice(tab)}`;
+    });
+}
+/** A reflog's ids only (`<old> <new>`): our checkout and rebase write no reflog messages yet. */
+const reflogIds = (path: string) => reflog(path).map((l) => l.slice(0, 81));
+
+describeGit("git worktree: storage roots, bare repositories, renames and HEAD reflogs", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "wt-native2-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  it("a FilesApi rooted at / maps linked worktrees: list, prune and openCurrent", async () => {
+    const base = join(root, "slash");
+    const repo = build(base);
+    run(repo, "worktree", "add", "-q", join(base, "wt"), "feat");
+    const files = createNodeFilesApi({ rootDir: "/" });
+    const gitDir = `${repo.slice(1)}/.git`;
+    const { history } = await createGitFilesBackend({ files, gitDir });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir, history });
+    expect((await worktrees.list()).map((wt) => wt.path)).toEqual([repo, join(base, "wt")]);
+    const wc = await worktrees.openCurrent();
+    const prune = await Git.fromWorkingCopy(wc).worktreePrune().setDryRun(true).call();
+    expect(prune.messages.join("")).toBe(runResult(repo, "worktree", "prune", "-n").stderr);
+    expect(prune.pruned).toEqual([]);
+    const linked = await openGitLinkedWorktrees({
+      files,
+      gitDir: `${gitDir}/worktrees/wt`,
+      history,
+    });
+    const lwc = await linked.openCurrent();
+    expect(await lwc.getCurrentBranch()).toBe("feat");
+    expect((await Git.fromWorkingCopy(lwc).status().call()).isClean()).toBe(true);
+    await Git.fromWorkingCopy(wc).worktreePrune().call();
+    expect(existsSync(join(repo, ".git/worktrees/wt"))).toBe(true);
+  });
+
+  it("worktrees beyond the root (elsewhere, or through a symbolic link) are kept and refused", async () => {
+    // the FilesApi's root is reached through a symbolic link: git writes the real path
+    const real = join(root, "real");
+    mkdirSync(real);
+    const link = join(root, "link");
+    symlinkSync(real, link);
+    const repo = build(join(link, "b"));
+    run(repo, "worktree", "add", "-q", join(link, "b", "wt"), "feat");
+    expect(readFileSync(join(repo, ".git/worktrees/wt/gitdir"), "latin1")).toBe(
+      `${join(real, "b", "wt", ".git")}\n`,
+    );
+    // and one outside the root
+    const outside = join(root, "outside");
+    run(repo, "worktree", "add", "-q", "--detach", join(outside, "out"));
+    const files = createNodeFilesApi({ rootDir: join(link, "b") });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir: "repo/.git", history });
+    const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+    // native git keeps both
+    expect(runResult(repo, "worktree", "prune", "-n", "-v").stderr).toBe("");
+    const dry = await git.worktreePrune().setDryRun(true).setVerbose(true).call();
+    expect(dry.messages).toEqual([]);
+    await git.worktreePrune().call();
+    run(repo, "config", "gc.worktreePruneExpire", "now");
+    const gc = await Git.fromWorkingCopy(
+      await (await openGitLinkedWorktrees({ files, gitDir: "repo/.git", history })).openCurrent(),
+    )
+      .gc()
+      .setPackRefs(false)
+      .call();
+    expect(gc.worktreesPruned).toEqual([]);
+    expect(readdirSync(join(repo, ".git/worktrees")).sort()).toEqual(["out", "wt"]);
+    // remove and move refuse what they cannot check
+    for (const [name, path] of [
+      ["wt", join(real, "b", "wt")],
+      ["out", join(outside, "out")],
+    ]) {
+      put(path, "dirty.txt", "untracked\n");
+      expect(await fatal(() => git.worktreeRemove().setWorktree(name).setForce(2).call())).toBe(
+        `fatal: cannot remove '${path}': it is beyond this storage\n`,
+      );
+      expect(
+        await fatal(() =>
+          git
+            .worktreeMove()
+            .setWorktree(name)
+            .setDestination(join(link, "b", "moved"))
+            .call(),
+        ),
+      ).toBe(`fatal: cannot move '${path}': it is beyond this storage\n`);
+    }
+    expect(readdirSync(join(repo, ".git/worktrees")).sort()).toEqual(["out", "wt"]);
+    expect(existsSync(join(outside, "out", "dirty.txt"))).toBe(true);
+  });
+
+  it("a bare repository: no working copy of its own; its linked worktrees log as git does", async () => {
+    const { native, ours } = twins();
+    for (const base of [native, ours]) {
+      run(base, "clone", "-q", "--bare", "repo", "bare.git");
+      run(join(base, "bare.git"), "worktree", "add", "-q", join(base, "bwt"), "main");
+    }
+    // git status in a bare repository: no work tree
+    const files = createNodeFilesApi({ rootDir: ours });
+    const { history } = await createGitFilesBackend({ files, gitDir: "bare.git" });
+    const bare = await openGitLinkedWorktrees({ files, gitDir: "bare.git", history });
+    expect(await fatal(() => bare.openCurrent())).toBe(
+      runResult(join(native, "bare.git"), "status").stderr,
+    );
+    // a commit in the linked worktree logs its HEAD and the branch (logAllRefUpdates default)
+    put(join(native, "bwt"), "n.txt", "n\n");
+    run(join(native, "bwt"), "add", "n.txt");
+    run(join(native, "bwt"), "commit", "-qm", "in bwt");
+    put(join(ours, "bwt"), "n.txt", "n\n");
+    const linked = await openGitLinkedWorktrees({
+      files,
+      gitDir: "bare.git/worktrees/bwt",
+      history,
+    });
+    const git = Git.fromWorkingCopy(await linked.openCurrent());
+    await git.add().addFilepattern("n.txt").call();
+    await git.commit().setMessage("in bwt\n").setAuthorIdent(IDENT).setCommitterIdent(IDENT).call();
+    expect(run(join(ours, "bwt"), "rev-parse", "HEAD")).toBe(
+      run(join(native, "bwt"), "rev-parse", "HEAD"),
+    );
+    // (our commit writes no reflog message yet: the ids are compared)
+    for (const log of ["worktrees/bwt/logs/HEAD", "logs/refs/heads/main", "logs/HEAD"]) {
+      expect([log, reflogIds(join(ours, "bare.git", log))]).toEqual([
+        log,
+        reflogIds(join(native, "bare.git", log)),
+      ]);
+    }
+    expect(reflog(join(ours, "bare.git/logs/refs/heads/main")).length).toBe(1);
+  });
+
+  it("openCurrent of a linked worktree whose gitdir file is empty: refused unless named", async () => {
+    const base = join(root, "unlisted");
+    const repo = build(base);
+    run(repo, "worktree", "add", "-q", join(base, "wt"), "feat");
+    writeFileSync(join(repo, ".git/worktrees/wt/gitdir"), "");
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const gitDir = "repo/.git/worktrees/wt";
+    const refused = await openGitLinkedWorktrees({ files, gitDir, history });
+    await expect(refused.openCurrent()).rejects.toThrow("gitdir file is missing or empty");
+    // as git, from the directory holding the .git file
+    const named = await openGitLinkedWorktrees({ files, gitDir, history, workTree: "wt" });
+    const git = Git.fromWorkingCopy(await named.openCurrent());
+    const status = await git.status().call();
+    expect(status.isClean()).toBe(true);
+    expect(await (await named.openCurrent()).getCurrentBranch()).toBe("feat");
+    expect(run(join(base, "wt"), "status", "--porcelain")).toBe("");
+  });
+
+  it("branch -m refuses a branch being rebased or bisected elsewhere, and logs the rename", async () => {
+    // rebasing: feat's own commit conflicts with main's
+    const rb = twins();
+    for (const base of [rb.native, rb.ours]) {
+      run(join(base, "repo"), "worktree", "add", "-q", join(base, "w1"), "feat");
+      put(join(base, "w1"), "a.txt", "feat\n");
+      run(join(base, "w1"), "commit", "-qam", "on feat");
+      runResult(join(base, "w1"), "rebase", "main"); // stops on the conflict, HEAD detached
+    }
+    const native = runResult(join(rb.native, "repo"), "branch", "-m", "feat", "f2");
+    const mine = await fatal(async () =>
+      (await open(rb.ours)).git.branchRename().setOldName("feat").setNewName("f2").call(),
+    );
+    expect(norm(mine, rb.ours)).toBe(norm(native.stderr, rb.native));
+    expect(run(join(rb.ours, "repo"), "branch", "--list", "feat").trim()).toBe("feat");
+
+    // bisecting: HEAD detached at the midpoint, BISECT_START names feat
+    const bs = twins();
+    for (const base of [bs.native, bs.ours]) {
+      run(join(base, "repo"), "worktree", "add", "-q", join(base, "w1"), "feat");
+      for (const n of ["1", "2"]) {
+        put(join(base, "w1"), `f${n}.txt`, `${n}\n`);
+        run(join(base, "w1"), "add", ".");
+        run(join(base, "w1"), "commit", "-qm", `f${n}`);
+      }
+      run(join(base, "w1"), "bisect", "start", "feat", "feat~2");
+    }
+    const nb = runResult(join(bs.native, "repo"), "branch", "-m", "feat", "f2");
+    const mb = await fatal(async () =>
+      (await open(bs.ours)).git.branchRename().setOldName("feat").setNewName("f2").call(),
+    );
+    expect(norm(mb, bs.ours)).toBe(norm(nb.stderr, bs.native));
+
+    // the rename: the other worktree's HEAD follows, with git's line in its reflog
+    const rn = twins();
+    for (const base of [rn.native, rn.ours]) {
+      run(join(base, "repo"), "worktree", "add", "-q", join(base, "w1"), "feat");
+    }
+    run(join(rn.native, "repo"), "branch", "-m", "feat", "renamed");
+    await (await open(rn.ours)).git.branchRename().setOldName("feat").setNewName("renamed").call();
+    const log = "repo/.git/worktrees/w1/logs/HEAD";
+    expect(reflog(join(rn.ours, log))).toEqual(reflog(join(rn.native, log)));
+    expect(readFileSync(join(rn.ours, "repo/.git/worktrees/w1/HEAD"), "latin1")).toBe(
+      "ref: refs/heads/renamed\n",
+    );
+  });
+
+  it("checkout --detach and a rebase's start in a linked worktree log HEAD's old id", async () => {
+    const { native, ours } = twins();
+    for (const base of [native, ours]) {
+      run(join(base, "repo"), "worktree", "add", "-q", join(base, "w1"), "feat");
+      put(join(base, "w1"), "a.txt", "feat\n");
+      run(join(base, "w1"), "commit", "-qam", "on feat");
+    }
+    const log = "repo/.git/worktrees/w1/logs/HEAD";
+    const feat = run(join(native, "w1"), "rev-parse", "HEAD").trim();
+    run(join(native, "w1"), "checkout", "-q", "--detach");
+    let wt = await open(ours, "repo/.git/worktrees/w1");
+    await wt.git.checkout().setName(feat).call();
+    expect(reflogIds(join(ours, log))).toEqual(reflogIds(join(native, log)));
+    expect(reflogIds(join(ours, log)).at(-1)).toBe(`${feat} ${feat}`);
+
+    // back on feat (our checkout of a branch logs no HEAD line yet), then a rebase onto
+    // main stops on the conflict: its start logs feat's id to main's
+    run(join(native, "w1"), "checkout", "-q", "feat");
+    await wt.git.checkout().setName("feat").call();
+    runResult(join(native, "w1"), "rebase", "main");
+    wt = await open(ours, "repo/.git/worktrees/w1");
+    await (await wt.git.rebase().setUpstreamBranch("main")).call();
+    const main = run(join(native, "repo"), "rev-parse", "main").trim();
+    expect(reflogIds(join(ours, log)).at(-1)).toBe(`${feat} ${main}`);
+    expect(reflogIds(join(ours, log)).at(-1)).toBe(reflogIds(join(native, log)).at(-1));
+    expect(readFileSync(join(ours, "repo/.git/HEAD"), "latin1")).toBe("ref: refs/heads/main\n");
+  });
+
+  it("checkout -B refuses a branch another worktree uses, unless told to ignore it", async () => {
+    const base = join(root, "checkout-B");
+    const repo = build(base);
+    run(repo, "worktree", "add", "-q", join(base, "w1"), "feat");
+    const { git } = await open(base);
+    // git 2.44 and later: 'feat' is already used by worktree at '<path>'
+    expect(await fatal(() => git.checkout().setName("feat").setCreateBranch(true).call())).toBe(
+      `fatal: 'feat' is already used by worktree at '${join(base, "w1")}'\n`,
+    );
+    expect(run(repo, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("main");
+    await (await open(base)).git
+      .checkout()
+      .setName("feat")
+      .setCreateBranch(true)
+      .setIgnoreOtherWorktrees(true)
+      .call();
+    expect(run(repo, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("feat");
+  });
+
+  it("the factory's addWorktree: the worktree's own working copy, logAllRefUpdates respected", async () => {
+    const base = join(root, "factory");
+    const repo = build(base);
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const at = (p: string) => join(base, p);
+    const factoryFiles = {
+      rootDirectory: base,
+      read: async (p: string) =>
+        existsSync(at(p)) ? new Uint8Array(readFileSync(at(p))) : undefined,
+      write: async (p: string, content: Uint8Array) => {
+        mkdirSync(join(at(p), ".."), { recursive: true });
+        writeFileSync(at(p), content);
+      },
+      exists: async (p: string) => existsSync(at(p)),
+      stats: async (p: string) =>
+        existsSync(at(p)) ? { isDirectory: statSync(at(p)).isDirectory() } : undefined,
+      mkdir: async (p: string) => {
+        mkdirSync(at(p), { recursive: true });
+      },
+      writeFile: async (p: string, content: string) => writeFileSync(at(p), content),
+      remove: async (p: string) => {
+        rmSync(at(p), { recursive: true, force: true });
+        return true;
+      },
+    };
+    const factory = new GitWorkingCopyFactory(factoryFiles, async () => ({
+      history,
+      files,
+      createCheckout: async (gitDir: string) => {
+        const staging = new FileStagingStore(files, `${gitDir}/index`);
+        await staging.read();
+        return new GitCheckout({
+          staging,
+          refs: history.refs,
+          files: factoryFiles as unknown as GitCheckoutFilesApi,
+          gitDir,
+        });
+      },
+      createWorktree: (path: string) =>
+        createFileWorktree({
+          files,
+          rootPath: path,
+          gitDir: "repo/.git",
+          blobs: history.blobs,
+          trees: history.trees,
+        }),
+    }));
+    const main = run(repo, "rev-parse", "main").trim();
+    const wc = await factory.addWorktree(history, "repo/.git", "wt", { branch: "feat" });
+    expect(wc.worktrees).toBeDefined();
+    expect(await wc.getCurrentBranch()).toBe("feat");
+    const git = Git.fromWorkingCopy(wc);
+    put(at("wt"), "n.txt", "n\n");
+    await git.add().addFilepattern("n.txt").call();
+    await git.commit().setMessage("in wt").setAuthorIdent(IDENT).setCommitterIdent(IDENT).call();
+    // only the worktree's branch and HEAD moved
+    expect(run(repo, "rev-parse", "main").trim()).toBe(main);
+    expect(readFileSync(join(repo, ".git/HEAD"), "latin1")).toBe("ref: refs/heads/main\n");
+    expect(readFileSync(join(repo, ".git/worktrees/wt/HEAD"), "latin1")).toBe(
+      "ref: refs/heads/feat\n",
+    );
+    expect(run(at("wt"), "rev-parse", "HEAD").trim()).toBe(run(repo, "rev-parse", "feat").trim());
+    expect(reflog(join(repo, ".git/worktrees/wt/logs/HEAD")).length).toBe(2);
+    expect(
+      (await (await factory.openWorkingCopy("repo", "repo/.git")).worktrees?.list())?.length,
+    ).toBe(2);
+    // core.logAllRefUpdates=false: no HEAD reflog for a new worktree
+    run(repo, "config", "core.logAllRefUpdates", "false");
+    await factory.addWorktree(history, "repo/.git", "wt2", { branch: "main" });
+    expect(existsSync(join(repo, ".git/worktrees/wt2/logs/HEAD"))).toBe(false);
   });
 });

@@ -143,3 +143,93 @@ describe("GitLinkedWorktrees on files", () => {
     expect(names).toEqual(["refs/heads/feat", "refs/heads/main"]);
   });
 });
+
+describe("GitLinkedWorktrees: review fixes", () => {
+  it("a worktree beyond the FilesApi's root is never prunable, and not reachable", async () => {
+    const { files, history } = await repository();
+    // the FilesApi's root is /host on the host: /elsewhere cannot be named
+    const worktrees = await openGitLinkedWorktrees({
+      files,
+      gitDir: "/repo/.git",
+      history,
+      rootPath: "/host",
+    });
+    await files.mkdir("/repo/.git/worktrees/out");
+    await write(files, "/repo/.git/worktrees/out/gitdir", "/elsewhere/out/.git\n");
+    await write(files, "/repo/.git/worktrees/out/HEAD", "ref: refs/heads/feat\n");
+    await write(files, "/repo/.git/worktrees/out/commondir", "../..\n");
+    expect(await worktrees.pruneCheck("out", Number.POSITIVE_INFINITY)).toEqual({
+      gitdirPath: "/elsewhere/out/.git",
+    });
+    const entry = (await worktrees.list()).find((wt) => wt.id === "out");
+    expect(entry?.path).toBe("/elsewhere/out");
+    expect(entry && worktrees.reachable(entry)).toBe(false);
+    await expect(worktrees.open(entry as NonNullable<typeof entry>)).rejects.toThrow(
+      "beyond this storage",
+    );
+    // a missing worktree inside the root is still pruned
+    await files.mkdir("/repo/.git/worktrees/gone");
+    await write(files, "/repo/.git/worktrees/gone/gitdir", "/host/gone/.git\n");
+    expect((await worktrees.pruneCheck("gone", Number.POSITIVE_INFINITY)).reason).toBe(
+      "gitdir file points to non-existent location",
+    );
+  });
+
+  it("openCurrent refuses a bare repository and an unlisted linked worktree", async () => {
+    const { files, history, worktrees } = await repository();
+    await write(files, "/repo/.git/config", "[core]\n\tbare = true\n");
+    const bare = await openGitLinkedWorktrees({ files, gitDir: "/repo/.git", history });
+    await expect(bare.openCurrent()).rejects.toThrow("this operation must be run in a work tree");
+    await write(files, "/repo/.git/config", "[core]\n\tbare = false\n");
+
+    const created = await worktrees.create({ path: "/wt", head: { ref: "refs/heads/feat" } });
+    await worktrees.finishCreate(created.id, false);
+    await write(files, "/wt/a.txt", "a\n");
+    // its gitdir file emptied: not listed, so its directory is unknown
+    await write(files, `/repo/.git/worktrees/${created.id}/gitdir`, "");
+    const gitDir = `/repo/.git/worktrees/${created.id}`;
+    const unlisted = await openGitLinkedWorktrees({ files, gitDir, history });
+    await expect(unlisted.openCurrent()).rejects.toThrow("gitdir file is missing or empty");
+    // the caller names it (git: the directory holding the .git file)
+    const named = await openGitLinkedWorktrees({ files, gitDir, history, workTree: "/wt" });
+    const wc = await named.openCurrent();
+    expect(wc.worktree.getRoot()).toBe("/wt");
+    expect(await wc.getCurrentBranch()).toBe("feat");
+  });
+
+  it("list: the lock reason trimmed of ASCII white space only; rebase-apply before rebase-merge", async () => {
+    const { files, worktrees } = await repository();
+    const created = await worktrees.create({ path: "/wt", head: { ref: "refs/heads/feat" } });
+    const admin = `/repo/.git/worktrees/${created.id}`;
+    await write(files, `${admin}/locked`, "\u00a0on a disk\u00a0\t\r\n");
+    // an `am` in rebase-apply: no rebase, whatever rebase-merge holds (wt_status_check_rebase)
+    await files.mkdir(`${admin}/rebase-apply`);
+    await write(files, `${admin}/rebase-apply/applying`, "");
+    await files.mkdir(`${admin}/rebase-merge`);
+    await write(files, `${admin}/rebase-merge/head-name`, "refs/heads/feat\n");
+    const entry = (await worktrees.list()).find((wt) => wt.id === created.id);
+    expect(entry?.lockReason).toBe("\u00a0on a disk\u00a0");
+    expect(entry?.rebasing).toBeUndefined();
+  });
+
+  it("a noDeref update of the worktree's symbolic HEAD logs the branch's id as old value", async () => {
+    const { files, history, worktrees, commit } = await repository();
+    const created = await worktrees.create({
+      path: "/wt",
+      head: { ref: "refs/heads/feat" },
+      ident: "T <t@e> 5 +0000",
+    });
+    const gitDir = `/repo/.git/worktrees/${created.id}`;
+    const refs = createWorktreeRefs({ common: history.refs, files, gitDir });
+    // `checkout --detach`: HEAD replaced by the id it resolved to, old value checked
+    const r = await refs.batch([{ name: "HEAD", old: commit, new: commit, noDeref: true }], {
+      ident: "T <t@e> 6 +0000",
+      message: "checkout: moving from feat to HEAD",
+    });
+    expect(r.ok).toBe(true);
+    expect(await text(files, `${gitDir}/HEAD`)).toBe(`${commit}\n`);
+    expect((await text(files, `${gitDir}/logs/HEAD`)).split("\n")[1]).toBe(
+      `${commit} ${commit} T <t@e> 6 +0000\tcheckout: moving from feat to HEAD`,
+    );
+  });
+});
