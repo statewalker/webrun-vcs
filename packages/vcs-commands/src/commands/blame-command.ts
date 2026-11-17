@@ -1,7 +1,10 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
 import {
+  type InternedText,
+  LineInterner,
   type SupportedAlgorithm,
+  whitespaceFlags,
   type XdiffAlgorithm,
   type XdiffOptions,
   xdiffHunks,
@@ -17,6 +20,9 @@ import {
   GIT_MAX_SCORE,
 } from "../rename/index.js";
 import { abbrevLengths } from "./core-config.js";
+
+/** Line bytes the interner holds before blame starts a new one (see `setInternerByteLimit`) */
+const DEFAULT_INTERNER_BYTE_LIMIT = 64 * 1024 * 1024;
 
 /**
  * A single blame entry - represents authorship of one or more consecutive lines.
@@ -141,7 +147,8 @@ interface Origin {
   guilty: boolean;
   /** The next origin of the same commit */
   next: Origin | null;
-  content?: Uint8Array;
+  /** The blob's lines (split and hashed once), while the origin is compared */
+  lines?: InternedText;
 }
 
 /** A run of lines (`struct blame_entry`), 0-based */
@@ -299,6 +306,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private algorithm?: XdiffAlgorithm;
   private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
   private ignoreWhitespace = false;
+  private internerByteLimit = DEFAULT_INTERNER_BYTE_LIMIT;
   private indentHeuristic?: boolean;
   private showRoot?: boolean;
   private lineRanges: Array<[number, number]> = [];
@@ -306,6 +314,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private renameCountLastSpan?: boolean;
 
   private states = new Map<ObjectId, CommitState>();
+  /** Numbers the lines of every version compared, so each is split and hashed once */
+  private interner?: LineInterner;
 
   /**
    * Set the file path to blame.
@@ -430,6 +440,20 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   /**
+   * Set how many bytes of distinct lines the line interner may hold (default 64 MiB). The
+   * interner keeps every distinct line it has seen; past this size blame starts a new one for
+   * the versions it reads next, and re-interns a version from the old one when it is compared
+   * with one from the new. The output does not change.
+   *
+   * @param bytes Size in bytes
+   */
+  setInternerByteLimit(bytes: number): this {
+    this.checkCallable();
+    this.internerByteLimit = bytes;
+    return this;
+  }
+
+  /**
    * Execute the blame command.
    *
    * @returns BlameResult with per-line authorship
@@ -474,7 +498,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
     finalOrigin.blobId = entry.id;
     finalOrigin.mode = entry.mode;
     const content = await this.readBlob(entry.id);
-    finalOrigin.content = content;
+    finalOrigin.lines = this.lineInterner().text(content);
     const lineCount = countLines(content);
 
     // the initial entries: the whole file, or the -L ranges (sorted and merged)
@@ -626,14 +650,14 @@ export class BlameCommand extends GitCommand<BlameResult> {
       await this.passBlameToParent(origin, porigin, queue);
       if (!origin.suspects) break;
     }
-    origin.content = undefined;
+    origin.lines = undefined;
   }
 
   /** git's `pass_whole_blame` */
   private passWholeBlame(origin: Origin, porigin: Origin, queue: CommitQueue): void {
-    if (!porigin.content && origin.content) {
-      porigin.content = origin.content;
-      origin.content = undefined;
+    if (!porigin.lines && origin.lines) {
+      porigin.lines = origin.lines;
+      origin.lines = undefined;
     }
     const suspects = origin.suspects;
     origin.suspects = null;
@@ -668,9 +692,15 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const newdest: Slot = { next: null };
     const src: Slot = { next: target.suspects };
     const d = { offset: 0, dstq: newdest as Slot, srcq: src as Slot };
-    const fileP = await this.originContent(parent);
-    const fileO = await this.originContent(target);
+    let fileP = await this.originContent(parent);
+    let fileO = await this.originContent(target);
+    // ids are comparable only within one interner: a version interned before blame started
+    // a new interner is interned again in the current one
+    const interner = this.lineInterner();
+    if (fileP.interner !== interner) fileP = parent.lines = interner.text(fileP.content);
+    if (fileO.interner !== interner) fileO = target.lines = interner.text(fileO.content);
     const hunks = xdiffHunks(fileP, fileO, {
+      interner,
       algorithm: this.algorithm,
       indentHeuristic: this.indentHeuristic,
       ignoreWhitespace: this.ignoreWhitespace,
@@ -778,9 +808,23 @@ export class BlameCommand extends GitCommand<BlameResult> {
     return st;
   }
 
-  private async originContent(o: Origin): Promise<Uint8Array> {
-    o.content ??= await this.readBlob(o.blobId);
-    return o.content;
+  private async originContent(o: Origin): Promise<InternedText> {
+    o.lines ??= this.lineInterner().text(await this.readBlob(o.blobId, true));
+    return o.lines;
+  }
+
+  /**
+   * The interner compared versions' lines go through (see `passBlameToParent`); a new one
+   * once the current one holds more than `internerByteLimit` bytes of lines, so a long walk
+   * does not keep every distinct line it has seen
+   */
+  private lineInterner(): LineInterner {
+    if (!this.interner || this.interner.byteSize > this.internerByteLimit) {
+      this.interner = new LineInterner(
+        whitespaceFlags({ ignoreWhitespace: this.ignoreWhitespace }),
+      );
+    }
+    return this.interner;
   }
 
   /** Whether a blob is over the threshold (from its size, without reading it). */
@@ -788,7 +832,11 @@ export class BlameCommand extends GitCommand<BlameResult> {
     return (await this.blobs.size(blobId)) > this.bigFileThreshold;
   }
 
-  private async readBlob(blobId: ObjectId): Promise<Uint8Array> {
+  /**
+   * A blob's content; `shared` (for content only read here) takes a single chunk as it
+   * comes (a resolved pack object) instead of copying it
+   */
+  private async readBlob(blobId: ObjectId, shared = false): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let total = 0;
     const content = await this.blobs.load(blobId);
@@ -798,6 +846,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
         total += chunk.length;
       }
     }
+    if (shared && chunks.length === 1) return chunks[0];
     const out = new Uint8Array(total);
     let at = 0;
     for (const c of chunks) {
