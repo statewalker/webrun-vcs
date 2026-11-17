@@ -51,7 +51,7 @@ describe("InitCommand", () => {
         .setAllowEmpty(true)
         .call();
 
-      expect(commit.message).toBe("First commit");
+      expect(commit.message).toBe("First commit\n");
       expect(commit.parents.length).toBe(0); // Initial commit has no parents
     });
 
@@ -327,8 +327,8 @@ describe("InitCommand", () => {
       // Verify commits via log
       const commits = await toArray(await git.log().call());
       expect(commits.length).toBe(2);
-      expect(commits[0].message).toBe("Second commit");
-      expect(commits[1].message).toBe("First commit");
+      expect(commits[0].message).toBe("Second commit\n");
+      expect(commits[1].message).toBe("First commit\n");
     });
 
     it("should support branch operations after init", async () => {

@@ -192,10 +192,10 @@ describe.each(backends)("CherryPickCommand ($name backend)", ({ factory }) => {
       commits.push(commit.message);
     }
 
-    expect(commits[0]).toBe("further modify a");
-    expect(commits[1]).toBe("modify a");
-    expect(commits[2]).toBe("create b on side");
-    expect(commits[3]).toBe("create a");
+    expect(commits[0]).toBe("further modify a\n");
+    expect(commits[1]).toBe("modify a\n");
+    expect(commits[2]).toBe("create b on side\n");
+    expect(commits[3]).toBe("create a\n");
   });
 
   /**
@@ -769,7 +769,8 @@ describe.each(backends)(
 
       const newCommit = await repository.commits.load(result.newHead ?? "");
       if (!newCommit) throw new Error("newCommit not found");
-      expect(newCommit.message).toBe(detailedMessage);
+      // (stored as git's `commit -m` stores it: the last line ended)
+      expect(newCommit.message).toBe(`${detailedMessage}\n`);
     });
 
     /**

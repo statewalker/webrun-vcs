@@ -291,7 +291,7 @@ describe("RepositoryController", () => {
       expect(state.branch).toBe("main");
       expect(state.commitCount).toBe(1);
       expect(state.commits).toHaveLength(1);
-      expect(state.commits[0].message).toBe("Initial commit");
+      expect(state.commits[0].message).toBe("Initial commit\n");
       expect(state.headCommitId).toBeTruthy();
     });
   });
@@ -320,7 +320,7 @@ describe("RepositoryController", () => {
       const state = repoModel.getState();
       expect(state.commitCount).toBe(2);
       expect(state.commits).toHaveLength(2);
-      expect(state.commits[0].message).toBe("Add test-file.txt");
+      expect(state.commits[0].message).toBe("Add test-file.txt\n");
     });
 
     it("should update commit count for multiple file additions", async () => {
@@ -345,10 +345,10 @@ describe("RepositoryController", () => {
       // Verify all commits are in history
       const commits = repoModel.getState().commits;
       expect(commits).toHaveLength(4);
-      expect(commits[0].message).toBe("Add file3.txt");
-      expect(commits[1].message).toBe("Add file2.txt");
-      expect(commits[2].message).toBe("Add file1.txt");
-      expect(commits[3].message).toBe("Initial commit");
+      expect(commits[0].message).toBe("Add file3.txt\n");
+      expect(commits[1].message).toBe("Add file2.txt\n");
+      expect(commits[2].message).toBe("Add file1.txt\n");
+      expect(commits[3].message).toBe("Initial commit\n");
     });
 
     it("should update files list when file is added", async () => {
@@ -538,9 +538,9 @@ describe("RepositoryController", () => {
       }
 
       expect(commits).toHaveLength(3);
-      expect(commits[0]).toBe("Add file2.txt");
-      expect(commits[1]).toBe("Add file1.txt");
-      expect(commits[2]).toBe("Initial commit");
+      expect(commits[0]).toBe("Add file2.txt\n");
+      expect(commits[1]).toBe("Add file1.txt\n");
+      expect(commits[2]).toBe("Initial commit\n");
     });
 
     it("should store files in the repository", async () => {

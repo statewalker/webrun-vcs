@@ -127,7 +127,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
 
       // Verify message preserved
       const commits = await toArray(await git.log().setMaxCount(1).call());
-      expect(commits[0].message).toBe("Important fix XYZ");
+      expect(commits[0].message).toBe("Important fix XYZ\n");
     });
   });
 
@@ -148,7 +148,7 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
 
       // Verify broken state
       const commitsBeforeRevert = await toArray(await git.log().call());
-      expect(commitsBeforeRevert[0].message).toBe("Break things");
+      expect(commitsBeforeRevert[0].message).toBe("Break things\n");
 
       // Revert the bad commit
       const result = await git.revert().include(badCommitId).call();
@@ -328,8 +328,8 @@ describe.each(backends)("Porcelain Integration ($name backend)", ({ factory }) =
 
       // Log should show both commits
       const commits = await toArray(await git.log().call());
-      expect(commits[0].message).toBe("Remove b.txt");
-      expect(commits[1].message).toBe("Add three files");
+      expect(commits[0].message).toBe("Remove b.txt\n");
+      expect(commits[1].message).toBe("Add three files\n");
 
       // Diff between the two commits
       const commit0Id = await repository.commits.store(commits[0]);

@@ -10,6 +10,7 @@ import {
 } from "../errors/index.js";
 import { type CommandCommits, GitCommand } from "../git-command.js";
 import { abbrevLengths } from "./core-config.js";
+import { type CleanupMode, tagMessageFromOption } from "./message-cleanup.js";
 
 /**
  * Create a tag (lightweight or annotated).
@@ -53,6 +54,7 @@ export class TagCommand extends GitCommand<Ref> {
   private annotated = false;
   private force = false;
   private signed = false;
+  private cleanupMode?: CleanupMode;
 
   /**
    * Set the tag name.
@@ -66,15 +68,29 @@ export class TagCommand extends GitCommand<Ref> {
   }
 
   /**
-   * Set the tag message.
+   * Set the tag message, as git's `tag -m` takes it: cleaned up as `strip` by default
+   * (comment lines dropped, trailing whitespace and surrounding blank lines dropped, a
+   * final newline), so `"Release"` is stored as `"Release\n"`; see {@link setCleanupMode}.
    *
-   * Setting a message implies an annotated tag.
+   * Setting a message implies an annotated tag, an empty one too.
    *
    * @param message Tag message
    */
   setMessage(message: string): this {
     this.checkCallable();
     this.message = message;
+    return this;
+  }
+
+  /**
+   * How the message is cleaned up (git's `tag --cleanup=<mode>`): `strip` (the default),
+   * `whitespace` (comment lines kept) or `verbatim` (the message as given, no newline
+   * added). `default` and `scissors` are refused, as git refuses them for a tag
+   * (`fatal: Invalid cleanup mode default`).
+   */
+  setCleanupMode(mode: CleanupMode): this {
+    this.checkCallable();
+    this.cleanupMode = mode;
     return this;
   }
 
@@ -183,7 +199,8 @@ export class TagCommand extends GitCommand<Ref> {
     const targetId = this.objectId ?? (await this.resolveHead());
 
     // Determine if we should create annotated tag
-    const createAnnotated = this.annotated || this.message || this.signed;
+    // (an empty message too: git's `tag -m ""` makes an annotated tag)
+    const createAnnotated = this.annotated || this.message !== undefined || this.signed;
 
     let tagObjectId: ObjectId;
 
@@ -207,7 +224,10 @@ export class TagCommand extends GitCommand<Ref> {
         objectType: ObjectType.COMMIT,
         tag: this.name,
         tagger,
-        message: this.message ?? "",
+        message:
+          this.message !== undefined
+            ? tagMessageFromOption(this.message, this.cleanupMode, this.workingCopy)
+            : "",
       };
 
       tagObjectId = await this.tagsStore.storeTag(tag);

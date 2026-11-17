@@ -5,7 +5,7 @@ import { FastForwardMode, isMergeSuccessful, type MergeStrategy } from "../resul
 import type { PullResult } from "../results/pull-result.js";
 import { isRebaseSuccessful, RebaseStatus } from "../results/rebase-result.js";
 import { TransportCommand } from "../transport-command.js";
-import { FetchCommand, type TagOption } from "./fetch-command.js";
+import { FetchCommand, TagOption } from "./fetch-command.js";
 import { MergeBaseGraph } from "./merge-bases.js";
 import { MergeCommand } from "./merge-command.js";
 import { configValue } from "./merge-config.js";
@@ -209,6 +209,10 @@ export class PullCommand extends TransportCommand<PullResult> {
           : this.autoStash === false
             ? ["--no-autostash"]
             : []),
+        ...(this.fastForwardMode ? [`--${this.fastForwardMode}`] : []),
+        ...(this.strategy ? [`--strategy=${this.strategy}`] : []),
+        ...(this.tagOption === TagOption.FETCH_TAGS ? ["--tags"] : []),
+        ...(this.tagOption === TagOption.NO_TAGS ? ["--no-tags"] : []),
         ...(this.remoteGiven || this.remoteBranchName ? [this.remote] : []),
         ...(this.remoteBranchName ? [this.remoteBranchName] : []),
       ].join(" "),

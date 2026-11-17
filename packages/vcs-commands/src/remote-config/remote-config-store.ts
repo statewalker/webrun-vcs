@@ -58,8 +58,18 @@ interface GitConfigLike {
    * position and lines; without it the section's keys are copied and the old one removed.
    */
   renameSection?(oldSection: string, newSection: string): void;
+  /**
+   * Optional: copies a section after itself (git's `git_config_copy_section`), keeping its
+   * lines; without it the section's keys are copied into a new section.
+   */
+  copySection?(oldSection: string, newSection: string): void;
   /** Optional: a config with no backing file has nothing to save. */
   save?(): Promise<void>;
+  /**
+   * Optional: the value set last, in the configuration's order, among several keys that
+   * name one setting (`core.commentChar` and `core.commentString`).
+   */
+  getLastOf?(keys: string[]): { key: string; value: unknown } | undefined;
 }
 
 const GIT_CONFIG_METHODS = [
@@ -152,6 +162,17 @@ class PlainObjectConfig implements GitConfigLike {
     }
   }
 
+  copySection(oldSection: string, newSection: string): void {
+    const [section, ...oldParts] = oldSection.split(".");
+    const oldSub = oldParts.join(".");
+    const newSub = newSection.split(".").slice(1).join(".");
+    for (const key of Object.keys(this.bag)) {
+      if (subsectionOf(key, section) !== oldSub) continue;
+      const name = key.slice(key.lastIndexOf(".") + 1);
+      for (const value of this.getAll(key)) this.add(`${section}.${newSub}.${name}`, value);
+    }
+  }
+
   subsections(section: string): string[] {
     const found = new Set<string>();
     for (const key of Object.keys(this.bag)) {
@@ -227,6 +248,11 @@ export class RemoteConfigStore {
     this.setAll(remote.name, "push", remote.pushRefspecs);
   }
 
+  /** Drop every `[<section> "<subsection>"]` section named `section` (`branch.feat`). */
+  removeSection(section: string): void {
+    this.config.unsetSection(section);
+  }
+
   /** Drop the whole `[remote "<name>"]` section. */
   remove(name: string): void {
     this.config.unsetSection(`remote.${name}`);
@@ -254,6 +280,48 @@ export class RemoteConfigStore {
       if (values.length > 0) this.setAll(newName, variable, values);
     }
     this.config.unsetSection(`remote.${oldName}`);
+  }
+
+  /**
+   * Rename a `<section>.<subsection>` section (`branch.old` to `branch.new`), in place where
+   * the config can (git's `git_config_rename_section`), else by moving its variables.
+   */
+  renameSection(oldSection: string, newSection: string): void {
+    if (this.config.renameSection) {
+      this.config.renameSection(oldSection, newSection);
+      return;
+    }
+    for (const [variable, values] of this.sectionVariables(oldSection)) {
+      this.setValues(`${newSection}.${variable}`, values);
+    }
+    this.config.unsetSection(oldSection);
+  }
+
+  /**
+   * Copy a `<section>.<subsection>` section (`branch.a` to `branch.b`), right after the old
+   * one where the config can (git's `git_config_copy_section`), else by adding its values.
+   */
+  copySection(oldSection: string, newSection: string): void {
+    if (this.config.copySection) {
+      this.config.copySection(oldSection, newSection);
+      return;
+    }
+    for (const [variable, values] of this.sectionVariables(oldSection)) {
+      for (const value of values) this.config.add(`${newSection}.${variable}`, value);
+    }
+  }
+
+  /** The variables of a section and their values, from a config that mirrors its keys. */
+  private sectionVariables(sectionName: string): Map<string, string[]> {
+    const [section = "", ...rest] = sectionName.split(".");
+    const subsection = rest.join(".");
+    const out = new Map<string, string[]>();
+    for (const key of Object.keys(this.config)) {
+      if (subsectionOf(key, section) !== subsection) continue;
+      const variable = key.slice(key.lastIndexOf(".") + 1);
+      if (!out.has(variable)) out.set(variable, this.values(`${sectionName}.${variable}`));
+    }
+    return out;
   }
 
   /** Subsection names of a section (`branch`: the branch names with configuration). */
@@ -307,6 +375,25 @@ export class RemoteConfigStore {
   value(key: string): string | undefined {
     const value = this.config.get(key);
     return value === undefined || value === null ? undefined : String(value);
+  }
+
+  /**
+   * The value set last among keys that name one setting (git reads `core.commentChar` and
+   * `core.commentString` as one variable, the last line wins); a config that cannot tell
+   * the order gives the first key with a value.
+   */
+  lastValueOf(keys: string[]): string | undefined {
+    if (this.config.getLastOf) {
+      const found = this.config.getLastOf(keys);
+      return found === undefined || found.value === undefined || found.value === null
+        ? undefined
+        : String(found.value);
+    }
+    for (const key of keys) {
+      const value = this.value(key);
+      if (value !== undefined) return value;
+    }
+    return undefined;
   }
 
   /** Every value of a config variable (`branch.main.merge` may repeat). */

@@ -71,7 +71,7 @@ describe.each(backends)("TagCommand ($name backend)", ({ factory }) => {
 
       // The tag object should exist
       const tag = await repository.tags?.load(tagId ?? "");
-      expect(tag?.message).toBe("Release version 1.0.0");
+      expect(tag?.message).toBe("Release version 1.0.0\n");
       expect(tag?.tagger?.name).toBe("Release Bot");
     });
 

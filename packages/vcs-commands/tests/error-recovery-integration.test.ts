@@ -144,7 +144,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
 
       // Verify the new commit exists
       const commits = await toArray(await git.log().setMaxCount(1).call());
-      expect(commits[0].message).toBe("Continue after conflict");
+      expect(commits[0].message).toBe("Continue after conflict\n");
     });
   });
 
@@ -351,7 +351,7 @@ describe.each(backends)("Error Recovery Integration ($name backend)", ({ factory
       await git.commit().setMessage("Recovery commit").call();
 
       const commits = await toArray(await git.log().call());
-      expect(commits[0].message).toBe("Recovery commit");
+      expect(commits[0].message).toBe("Recovery commit\n");
       expect(commits.length).toBe(2); // initial + recovery
     });
   });

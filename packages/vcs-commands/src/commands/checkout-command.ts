@@ -40,6 +40,7 @@ import {
   type ObjectId,
   type Ref,
 } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
   entryStatOf,
@@ -56,6 +57,15 @@ import {
   RefNotFoundError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import {
+  guessRemoteBranch,
+  installTracking,
+  planTracking,
+  type TrackingPlan,
+  TrackMode,
+  trackableStart,
+} from "./branch-tracking.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
 import { reflogMessages } from "./reflog-messages.js";
@@ -139,6 +149,35 @@ const sameSide = (a: Side | undefined, b: Side | undefined) =>
   a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
 
 /**
+ * How a new branch tracks its start point, decided before anything is written; the
+ * refusals are thrown where git dies (`create_branch`): a start point `--track` cannot
+ * track before the branch is created, ambiguous remotes after.
+ */
+interface CreateTracking {
+  readonly plan?: TrackingPlan;
+  readonly notABranch?: unknown;
+  readonly ambiguous?: unknown;
+}
+
+/**
+ * What a branch checkout switches to; `logName` names it in HEAD's reflog line. A
+ * `stay` plan (`checkout HEAD`) checks the worktree out but leaves HEAD as it is.
+ */
+type SwitchPlan =
+  | { kind: "branch"; branch: string; targetId: ObjectId; logName: string }
+  | {
+      kind: "create";
+      branch: string;
+      startName: string;
+      targetId: ObjectId;
+      logName: string;
+      tracking: CreateTracking;
+    }
+  | { kind: "orphan"; branch: string; targetId?: undefined; logName: string }
+  | { kind: "detach"; targetId: ObjectId; logName: string }
+  | { kind: "stay"; targetId: ObjectId; logName: string };
+
+/**
  * Command to checkout branches, commits, or paths.
  *
  * Based on JGit's CheckoutCommand. Supports both branch checkout
@@ -156,6 +195,11 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private allPaths = false;
   private stage: CheckoutStage | undefined;
   private ignoreOtherWorktrees = false;
+  private detach = false;
+  private orphanFromEmptyTree = false;
+  private track = TrackMode.DEFAULT;
+  private guess?: boolean;
+  private protectUntracked = false;
 
   /**
    * Set the name of the branch or commit to check out.
@@ -236,6 +280,79 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   setIgnoreOtherWorktrees(ignore: boolean): this {
     this.checkCallable();
     this.ignoreOtherWorktrees = ignore;
+    return this;
+  }
+
+  /**
+   * Detach HEAD at the commit named by {@link setName} (`HEAD` when no name is set), even
+   * when it names a branch (git's `checkout --detach [<commit>]`): HEAD's reflog reads
+   * `checkout: moving from main to HEAD` (or the name as given).
+   *
+   * @param detach Whether to detach HEAD
+   * @returns this for chaining
+   */
+  setDetach(detach: boolean): this {
+    this.checkCallable();
+    this.detach = detach;
+    return this;
+  }
+
+  /**
+   * How a branch created by the checkout tracks its start point (git's `--track`,
+   * `--track=inherit`, `--no-track`); by default as `branch.autoSetupMerge` says, which
+   * tracks a remote-tracking start point (`branch.<name>.remote`, `branch.<name>.merge`).
+   *
+   * @param mode Tracking mode
+   * @returns this for chaining
+   */
+  setTrack(mode: TrackMode): this {
+    this.checkCallable();
+    this.track = mode;
+    return this;
+  }
+
+  /**
+   * Whether a name no ref has is taken for the one remote-tracking branch of that name
+   * (git's `--guess`/`--no-guess`, default `checkout.guess`, true): `checkout dev` with
+   * only `origin/dev` creates `dev` from it, tracking it. With several remotes having it,
+   * `checkout.defaultRemote` picks one, else the checkout is refused (`'dev' matched
+   * multiple (2) remote tracking branches`).
+   *
+   * @param guess Whether to guess
+   * @returns this for chaining
+   */
+  setGuess(guess: boolean): this {
+    this.checkCallable();
+    this.guess = guess;
+    return this;
+  }
+
+  /**
+   * With {@link setOrphan}: the new branch starts from an empty index and worktree, the
+   * tracked files removed as by a switch to an empty tree (git's `switch --orphan`; local
+   * changes to tracked files refuse it, untracked files stay).
+   *
+   * @param empty Whether the orphan starts empty
+   * @returns this for chaining
+   */
+  setOrphanFromEmptyTree(empty: boolean): this {
+    this.checkCallable();
+    this.orphanFromEmptyTree = empty;
+    return this;
+  }
+
+  /**
+   * With {@link setForced}: local changes are thrown away but untracked files in the way
+   * still refuse the switch (git's `switch --discard-changes` without `-f`, a reset that
+   * protects untracked files): `error: Untracked working tree file '<path>' would be
+   * overwritten by merge.`
+   *
+   * @param protect Whether untracked files are kept
+   * @returns this for chaining
+   */
+  setProtectUntracked(protect: boolean): this {
+    this.checkCallable();
+    this.protectUntracked = protect;
     return this;
   }
 
@@ -395,49 +512,20 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    * Checkout a branch or commit.
    */
   private async checkoutBranch(): Promise<CheckoutResult> {
-    if (!this.name) {
-      throw new MissingArgumentError("name", "Branch name is required for checkout");
-    }
+    const switchTo = await this.planSwitch();
+    const { targetId } = switchTo;
+    const branchName =
+      switchTo.kind === "detach" || switchTo.kind === "stay" ? undefined : switchTo.branch;
 
     // git's die_if_checked_out: a branch another worktree has checked out is not switched to
     const worktrees = this.workingCopy.worktrees;
-    if (worktrees && !this.ignoreOtherWorktrees && !this.orphan) {
-      const ref = `refs/heads/${this.name}`;
-      if (this.createBranch) {
-        // `checkout -B`: an existing branch is reset, so not one another worktree uses
-        // (git 2.44+ die_if_switching_to_a_branch_in_use for new_branch_force)
-        if (isValidBranchName(this.name)) await refuseIfCheckedOut(worktrees, ref, true);
-      } else if (isValidBranchName(this.name) && (await this.refsStore.has(ref))) {
+    if (worktrees && !this.ignoreOtherWorktrees && branchName !== undefined) {
+      const ref = `refs/heads/${branchName}`;
+      // (`checkout -B`: an existing branch is reset, so not one another worktree uses, git
+      // 2.44+ die_if_switching_to_a_branch_in_use for new_branch_force)
+      if (switchTo.kind === "create" || switchTo.kind === "branch") {
         await refuseIfCheckedOut(worktrees, ref, true);
       }
-    }
-
-    // Create branch if requested
-    if (this.createBranch) {
-      if (!isValidBranchName(this.name)) {
-        throw new InvalidRefNameError(this.name);
-      }
-      const startPointId = this.startPoint
-        ? await this.resolveCommitId(this.startPoint)
-        : await this.resolveCommitId("HEAD");
-
-      if (!startPointId) {
-        throw new RefNotFoundError(this.startPoint ?? "HEAD");
-      }
-
-      // git's create_branch: "branch: Created from <start>", or "Reset to" an existing one
-      const start = this.startPoint ?? "HEAD";
-      const branchRef = `refs/heads/${this.name}`;
-      const message = (await this.refsStore.has(branchRef))
-        ? reflogMessages.branchReset(start)
-        : reflogMessages.branchCreated(start);
-      await this.refsStore.set(branchRef, startPointId, this.reflogLine(message));
-    }
-
-    // Resolve target
-    const targetId = await this.resolveCommitId(this.name);
-    if (!targetId && !this.orphan) {
-      throw new RefNotFoundError(this.name);
     }
 
     // Get target tree for conflict detection and checkout
@@ -450,7 +538,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // untracked files in the way and an index with unmerged entries. With `setForce`, as
     // `git checkout -f`, the target's tree replaces index and worktree whatever they hold.
     const worktree = this.worktreeAccess;
-    const headId = await this.resolveCommitId("HEAD");
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
     const headTreeId = headId ? await this.commits.getTree(headId) : undefined;
     const head = new Map<string, Side>();
     const target = new Map<string, Side>();
@@ -463,7 +551,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       else unmerged.add(entry.path);
     }
 
-    if (!this.force && !this.orphan && unmerged.size > 0) {
+    // (an orphan branch keeps index and worktree as they are, as git's checkout --orphan;
+    // switch --orphan switches to the empty tree)
+    const keepAll = this.orphan && !this.orphanFromEmptyTree;
+    if (!this.force && !keepAll && unmerged.size > 0) {
       return {
         status: CheckoutStatus.CONFLICTS,
         updated: [],
@@ -483,8 +574,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     const paths = [...new Set([...head.keys(), ...target.keys()])].sort();
-    // (an orphan branch keeps index and worktree as they are, as git's --orphan)
-    for (const path of this.orphan ? [] : paths) {
+    for (const path of keepAll ? [] : paths) {
       const h = head.get(path);
       const t = target.get(path);
       if (!this.force && sameSide(h, t)) continue;
@@ -530,6 +620,36 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       untracked.push(...found.untracked);
       lostDirs.push(...found.lostDirs);
     }
+    // a reset that protects untracked files (switch --discard-changes): unpack-trees'
+    // own messages, one line per path
+    if (worktree && this.force && this.protectUntracked) {
+      const found = await findInTheWay(worktree, {
+        writes: switched.filter((p) => target.has(p)),
+        removes: new Set(switched.filter((p) => !target.has(p))),
+        index,
+        ...(await restoreCaseOptions(worktree, ignoreCase)),
+      });
+      const lines = [
+        ...found.untracked.map((p) => ({
+          p,
+          line: `error: Untracked working tree file '${p}' would be overwritten by merge.`,
+        })),
+        ...found.lostDirs.map((p) => ({
+          p,
+          line: `error: Updating '${p}' would lose untracked files in it`,
+        })),
+      ].sort((a, b) => (a.p < b.p ? -1 : a.p > b.p ? 1 : 0));
+      if (lines.length > 0) {
+        return {
+          status: CheckoutStatus.CONFLICTS,
+          updated: [],
+          removed: [],
+          conflicts: lines.map((l) => l.p),
+          ref: null,
+          message: lines.map((l) => l.line).join("\n"),
+        };
+      }
+    }
     if (local.length + untracked.length + untrackedRemoved.length + lostDirs.length > 0) {
       const message = overwriteMessage("checkout", {
         local,
@@ -553,13 +673,15 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const updated: string[] = [];
     const removed: string[] = [];
     const switching = new Set(switched);
-    if (targetTreeId && worktree) {
-      const plan = await planTreeRestore(this.trees, this.blobs, targetTreeId, CHECKOUT, {
-        symlinks: true,
-        ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
-        windows: worktree.capabilities?.windowsPaths === true,
-        reservedNames: worktree.capabilities?.reservedNames,
-      });
+    if (worktree && (targetTreeId || switched.length > 0 || this.force)) {
+      const plan = targetTreeId
+        ? await planTreeRestore(this.trees, this.blobs, targetTreeId, CHECKOUT, {
+            symlinks: true,
+            ...(await restoreCaseOptions(worktree, ignoreCase)),
+            windows: worktree.capabilities?.windowsPaths === true,
+            reservedNames: worktree.capabilities?.reservedNames,
+          })
+        : undefined;
       for (const path of switched) {
         if (target.has(path)) continue;
         await worktree.remove(path);
@@ -575,7 +697,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           }
         }
       }
-      const only = {
+      const only = plan && {
         ...plan,
         entries: plan.entries.filter((e) => switching.has(e.path)),
         gitlinks: plan.gitlinks.filter((e) => switching.has(e.path)),
@@ -591,54 +713,32 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       }
       // everything in the way was checked above (or the checkout is forced): a file or link
       // where a directory goes, a clean directory where a file goes, are replaced
-      await writeTreeRestorePlan(worktree, this.blobs, only, CHECKOUT, {
-        symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
-        gitlinks: true,
-        replaceInTheWay: true,
-        // a forced checkout overwrites untracked files, as git's checkout -f
-        ...(this.force ? { discardUntracked: true } : {}),
-        attributes: { direction: "checkout", index: attributesIndexOf(result) },
-      });
-      updated.push(...only.entries.map((e) => e.path));
+      if (only) {
+        await writeTreeRestorePlan(worktree, this.blobs, only, CHECKOUT, {
+          symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
+          gitlinks: true,
+          replaceInTheWay: true,
+          // a forced checkout overwrites untracked files, as git's checkout -f
+          ...(this.force && !this.protectUntracked ? { discardUntracked: true } : {}),
+          attributes: { direction: "checkout", index: attributesIndexOf(result) },
+        });
+        updated.push(...only.entries.map((e) => e.path));
+      }
     }
 
-    // Determine if we should use symbolic ref (branch) or detached HEAD (commit/tag)
-    // Check if it's a local branch
-    const isLocalBranch = await this.refsStore.has(`refs/heads/${this.name}`);
-
-    // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
-    // left, or the detached HEAD's full id> to <the name as given>"
-    const log = this.reflogLine(
-      this.hasReflogAction()
-        ? this.reflogAction("checkout")
-        : reflogMessages.checkout(await this.describeHeadForReflog(), this.name),
-    );
-
-    // Decide whether to create symbolic ref or detached HEAD
-    if (this.orphan) {
-      // Orphan branch: symbolic ref to a branch that doesn't exist yet (logged by nothing:
-      // git skips the line of an unborn target)
-      await this.refsStore.setSymbolic("HEAD", `refs/heads/${this.name}`, log);
-    } else if (isLocalBranch) {
-      // Local branch exists: use symbolic ref to the branch
-      await this.refsStore.setSymbolic("HEAD", `refs/heads/${this.name}`, log);
-    } else if (targetId) {
-      // Not a local branch but resolves to a commit: detached HEAD
-      // This handles: commit IDs, tags, remote branches, etc.
-      await this.refsStore.set("HEAD", targetId, log);
-    }
-    // git's remove_branch_state: a merge, cherry-pick or revert stopped here is forgotten
-    await removeBranchState(
-      { commits: this.commits, refs: this.refsStore },
-      new OperationState(this.workingCopy.checkout, this.refsStore),
-    );
-
-    // The index: forced, the target's tree; else the switched paths take the target's
+    // The index (written with the worktree, as git's merge_working_tree, before any ref
+    // moves): forced, the target's tree; else the switched paths take the target's
     // entries (with the stat of the files just written), every other path keeps its own.
     // git's switch writes a new index (unpack-trees): no resolve-undo records survive it
     this.staging.clearResolveUndo?.();
     if (targetTreeId && this.force) {
       await this.staging.readTree(this.trees as any, targetTreeId);
+      await this.staging.write();
+    } else if (this.force && !keepAll) {
+      // forced onto the empty tree (switch --orphan --discard-changes): an empty index
+      const editor = this.staging.createEditor();
+      for (const path of index.keys()) editor.remove(path);
+      await editor.finish();
       await this.staging.write();
     } else if (switched.length > 0) {
       const editor = this.staging.createEditor();
@@ -661,6 +761,46 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     } else {
       await this.staging.write();
     }
+
+    // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
+    // left, or the detached HEAD's full id> to <the name as interpreted: `-` and @{-N}
+    // expanded, the new branch's name>", read before anything moves
+    const log = this.reflogLine(
+      this.hasReflogAction()
+        ? this.reflogAction("checkout")
+        : reflogMessages.checkout(await this.describeHeadForReflog(), switchTo.logName),
+    );
+
+    if (switchTo.kind === "create") {
+      // git's create_branch (after the worktree and the index, as update_refs_for_switch
+      // does it): a start point --track cannot track dies before the branch is made;
+      // "branch: Created from <start>", or "Reset to" an existing one; then its upstream
+      // (ambiguous remotes die once the branch exists)
+      const { tracking } = switchTo;
+      if (tracking.notABranch !== undefined) throw tracking.notABranch;
+      const branchRef = `refs/heads/${switchTo.branch}`;
+      const message = (await this.refsStore.has(branchRef))
+        ? reflogMessages.branchReset(switchTo.startName)
+        : reflogMessages.branchCreated(switchTo.startName);
+      await this.refsStore.set(branchRef, switchTo.targetId, this.reflogLine(message));
+      if (tracking.ambiguous !== undefined) throw tracking.ambiguous;
+      if (tracking.plan) await installTracking(this.workingCopy, switchTo.branch, tracking.plan);
+    }
+
+    if (switchTo.kind === "stay") {
+      // `checkout HEAD`: git's update_refs_for_switch has nothing to do
+    } else if (switchTo.kind === "detach") {
+      // a commit, tag, remote-tracking branch or --detach: HEAD holds the commit itself
+      await this.refsStore.set("HEAD", switchTo.targetId, log);
+    } else {
+      // a branch (an orphan's is unborn: git logs nothing for an unborn target)
+      await this.refsStore.setSymbolic("HEAD", `refs/heads/${switchTo.branch}`, log);
+    }
+    // git's remove_branch_state: a merge, cherry-pick or revert stopped here is forgotten
+    await removeBranchState(
+      { commits: this.commits, refs: this.refsStore },
+      new OperationState(this.workingCopy.checkout, this.refsStore),
+    );
 
     // conditional includes on the branch (includeIf.onbranch:) follow the new HEAD
     const config = this._workingCopy.config as { refresh?: () => Promise<unknown> } | undefined;
@@ -842,7 +982,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   }
 
   /**
-   * Resolve a ref to a tree ID.
+   * Resolve a revision (`HEAD~1`, a branch, a tag, `@{-1}`) to its commit's tree.
    */
   private async resolveTreeId(refName: string): Promise<ObjectId | undefined> {
     const commitId = await this.resolveCommitId(refName);
@@ -851,27 +991,102 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   }
 
   /**
-   * Resolve a ref to a commit ID.
+   * Resolve a revision to a commit, as git's rev parsing does (`resolveRef`), or undefined.
    */
   private async resolveCommitId(refName: string): Promise<ObjectId | undefined> {
-    // Try as branch
-    let ref = await this.refsStore.resolve(`refs/heads/${refName}`);
-    if (ref?.objectId) return ref.objectId;
-
-    // Try as tag
-    ref = await this.refsStore.resolve(`refs/tags/${refName}`);
-    if (ref?.objectId) return ref.objectId;
-
-    // Try as direct ref (HEAD, etc.)
-    ref = await this.refsStore.resolve(refName);
-    if (ref?.objectId) return ref.objectId;
-
-    // Try as commit ID
-    if (await this.commits.has(refName)) {
-      return refName;
+    try {
+      const id = await this.resolveRef(refName);
+      return (await this.commits.has(id)) ? id : undefined;
+    } catch (error) {
+      if (error instanceof RefNotFoundError) return undefined;
+      throw error;
     }
+  }
 
-    return undefined;
+  /**
+   * What a branch checkout switches to (git's `parse_branchname_arg`): a new branch
+   * (`-b`/`-B`, or a name guessed into a remote-tracking branch's local twin), an orphan,
+   * an existing local branch, or a commit HEAD is detached at. `-` is `@{-1}`, and `@{-N}`
+   * is the branch or commit it stands for, which also names the switch in the reflog.
+   */
+  private async planSwitch(): Promise<SwitchPlan> {
+    const given = this.name ?? (this.detach ? "HEAD" : undefined);
+    if (given === undefined) {
+      throw new MissingArgumentError("name", "Branch name is required for checkout");
+    }
+    if (this.orphan || this.createBranch) {
+      if (!isValidBranchName(given)) throw new InvalidRefNameError(given);
+      if (this.orphan) return { kind: "orphan", branch: given, logName: given };
+      // the start point as git's setup_branch_path names it: `-` and @{-N} expanded (the
+      // reflog's "Created from feat", the branch tracked)
+      const startArg = this.startPoint === "-" ? "@{-1}" : (this.startPoint ?? "HEAD");
+      const startName = await this.expandPriorCheckout(startArg);
+      const targetId = await this.resolveCommitId(startName);
+      if (!targetId) throw new RefNotFoundError(this.startPoint ?? startName);
+      return {
+        kind: "create",
+        branch: given,
+        startName,
+        targetId,
+        logName: given,
+        tracking: await this.planCreateTracking(given, startName),
+      };
+    }
+    // git's parse_branchname_arg: `-` is @{-1}; the name a remote-tracking branch is guessed
+    // from is the argument itself, so `-` or @{-N} naming a deleted branch guesses nothing
+    const arg = given === "-" ? "@{-1}" : given;
+    const name = await this.expandPriorCheckout(arg);
+    if (!this.detach && (name === "HEAD" || name === "@")) {
+      // `checkout HEAD`: the worktree is checked out, HEAD left as it is
+      const headId = await this.resolveCommitId("HEAD");
+      if (headId) return { kind: "stay", targetId: headId, logName: "HEAD" };
+    }
+    if (!this.detach && isValidBranchName(name)) {
+      const branch = await this.refsStore.resolve(`refs/heads/${name}`);
+      if (branch?.objectId) {
+        return { kind: "branch", branch: name, targetId: branch.objectId, logName: name };
+      }
+    }
+    const targetId = await this.resolveCommitId(name);
+    if (targetId) return { kind: "detach", targetId, logName: name };
+    // git's dwim of a name no ref has into the remote-tracking branch of that name
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const guess = this.guess ?? parseGitBool(config.value("checkout.guess")) ?? true;
+    if (!this.detach && guess && isValidBranchName(arg)) {
+      const remote = await guessRemoteBranch(this.workingCopy, this.refsStore, arg);
+      const remoteId = remote ? await this.resolveCommitId(remote) : undefined;
+      if (remote && remoteId) {
+        return {
+          kind: "create",
+          branch: arg,
+          startName: remote,
+          targetId: remoteId,
+          logName: arg,
+          tracking: await this.planCreateTracking(arg, remote),
+        };
+      }
+    }
+    throw new RefNotFoundError(given);
+  }
+
+  /**
+   * How the new branch `branch` tracks `startName` (git's dwim_branch_start and
+   * setup_tracking), decided before the switch writes anything; the refusals are kept for
+   * the point git dies at.
+   */
+  private async planCreateTracking(branch: string, startName: string): Promise<CreateTracking> {
+    let startRef: string | undefined;
+    try {
+      startRef = await trackableStart(this.workingCopy, this.refsStore, startName, this.track);
+    } catch (error) {
+      return { notABranch: error };
+    }
+    if (startRef === undefined) return {};
+    try {
+      return { plan: planTracking(this.workingCopy, branch, startRef, this.track) };
+    } catch (error) {
+      return { ambiguous: error };
+    }
   }
 
   /**

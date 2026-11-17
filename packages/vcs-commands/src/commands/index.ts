@@ -1,6 +1,7 @@
 export * from "./add-command.js";
 export * from "./blame-command.js";
 export * from "./branch-command.js";
+export { TrackMode } from "./branch-tracking.js";
 export * from "./checkout-command.js";
 export * from "./cherry-pick-command.js";
 export * from "./clean-command.js";
@@ -27,6 +28,7 @@ export {
   type MergeDriverResult,
   mergeDriversOf,
 } from "./merge-drivers.js";
+export { CleanupMode, stripspace } from "./message-cleanup.js";
 export * from "./pack-refs-command.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";
@@ -48,6 +50,7 @@ export * from "./stash-drop-command.js";
 export * from "./stash-list-command.js";
 export * from "./stash-working-tree.js";
 export * from "./status-command.js";
+export * from "./switch-command.js";
 export * from "./tag-command.js";
 export * from "./worktree-add-command.js";
 export * from "./worktree-list-command.js";

@@ -170,7 +170,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
 
       // Verify release branch has the fix
       const commits = await toArray(await git.log().call());
-      expect(commits[0].message).toBe("Fix critical bug");
+      expect(commits[0].message).toBe("Fix critical bug\n");
 
       // Verify both tags exist
       const tags = await git.tagList().call();
@@ -223,7 +223,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       // Verify hotfix is in main's history
       const commits = await toArray(await git.log().call());
       const messages = commits.map((c) => c.message);
-      expect(messages).toContain("Critical hotfix");
+      expect(messages).toContain("Critical hotfix\n");
 
       // Clean up hotfix branch
       await git.branchDelete().setBranchNames("hotfix/critical").call();
@@ -403,7 +403,7 @@ describe.each(backends)("Workflow Integration ($name backend)", ({ factory }) =>
       // Verify we're back to v3
       commits = await toArray(await git.log().call());
       expect(commits.length).toBe(4);
-      expect(commits[0].message).toBe("Version 3");
+      expect(commits[0].message).toBe("Version 3\n");
     });
 
     it("branch management lifecycle", async () => {

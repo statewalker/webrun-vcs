@@ -24,6 +24,7 @@ import {
   planPathsRestore,
   rewriteIndex,
 } from "./merge-support.js";
+import { stripspace } from "./message-cleanup.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
@@ -438,20 +439,7 @@ export async function saveAutostash(
  * lines at the start and end dropped, a final newline.
  */
 export function cleanupMessage(message: string, commentChar = "#"): string {
-  const out: string[] = [];
-  let blank = false;
-  for (const raw of message.split("\n")) {
-    if (raw.startsWith(commentChar)) continue;
-    const line = raw.replace(/\s+$/, "");
-    if (line === "") {
-      blank = out.length > 0;
-      continue;
-    }
-    if (blank) out.push("");
-    blank = false;
-    out.push(line);
-  }
-  return out.length > 0 ? `${out.join("\n")}\n` : "";
+  return stripspace(message, commentChar);
 }
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

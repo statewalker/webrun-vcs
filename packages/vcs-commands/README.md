@@ -64,7 +64,7 @@ For a Git-compatible on-disk repository, build the `WorkingCopy` from the file-b
 |------|---------|
 | Staging | `add()`, `rm()`, `status()`, `clean()` |
 | Commits | `commit()`, `log()`, `reflog()`, `blame()` |
-| Branches | `branchCreate()`, `branchDelete()`, `branchList()`, `branchRename()`, `checkout()` |
+| Branches | `branchCreate()`, `branchDelete()`, `branchList()`, `branchRename()`, `branchCopy()`, `checkout()`, `switch()` |
 | Tags | `tag()`, `tagDelete()`, `tagList()` |
 | History | `reset()`, `merge()`, `rebase()`, `cherryPick()`, `revert()` |
 | Inspection | `diff()`, `describe()` |
@@ -93,6 +93,8 @@ const commit = await git
 await git.commit().setMessage("Add feature (fixed)").setAmend(true).call();
 ```
 
+A message is taken as git's `-m` takes it: `commit()` ends its last line and cleans it up (`whitespace` by default, or `commit.cleanup`, or `setCleanupMode(CleanupMode.STRIP | VERBATIM | ...)`), so `"Add feature"` is stored as `"Add feature\n"` and the commit gets native git's id. `merge().setMessage()` cleans up the same way; `tag().setMessage()` uses `strip` by default, as `git tag -m` does (comment lines go). A message that cleans up to nothing is refused (`Aborting commit due to empty commit message.`) unless `setAllowEmptyMessage(true)`.
+
 ### Branches and checkout
 
 ```typescript
@@ -109,9 +111,20 @@ for (const ref of branches) console.log(ref.name); // "refs/heads/main", ...
 
 await git.branchDelete().setBranchNames("feature/old").call();
 await git.branchDelete().setBranchNames("feature/abandoned").setForce(true).call();
+
+// git branch -c: the copy gets the branch's reflog and its branch.<name>.* configuration
+await git.branchCopy().setOldName("feature/login").setNewName("feature/login-2").call();
+
+// git switch: branches only; -c/-C, --detach, --orphan, - (the branch before)
+await git.switch().setName("main").call();
+await git.switch().setName("-").call();
+await git.switch().setCreateBranch("topic").setStartPoint("origin/topic").call(); // tracks it
+await git.switch().setName("dev").call(); // only origin/dev exists: creates dev tracking it
+await git.switch().setDetach(true).setName("v1.0.0").call();
+await git.checkout().setDetach(true).call(); // git checkout --detach
 ```
 
-`checkout()` returns a `CheckoutResult` with `status` (`CheckoutStatus.OK`, `CONFLICTS`, ...), `updated`, `removed` and `conflicts`. Use `addPath()` to restore single files and `setForced(true)` to discard local changes.
+`checkout()` returns a `CheckoutResult` with `status` (`CheckoutStatus.OK`, `CONFLICTS`, ...), `updated`, `removed` and `conflicts`. Use `addPath()` to restore single files and `setForced(true)` to discard local changes. A new branch tracks a remote-tracking start point as `branch.autoSetupMerge` says (`setTrack(TrackMode.DIRECT | INHERIT | NONE)` for `--track`, `--track=inherit`, `--no-track`). `switch()` refuses what is not a branch with git's message (`fatal: a branch is expected, got tag 'v1.0.0'` and its hint), and refuses while a merge, rebase, cherry-pick or revert is in progress; it has no `--merge`.
 
 ### Log and reset
 
@@ -322,7 +335,7 @@ A command records options in fields and `call()` acts on them. Running it twice 
 
 ### How refs are resolved
 
-`resolveRef()` tries, in order: the name as given (`refs/heads/main`, `HEAD`), `refs/heads/<name>`, `refs/tags/<name>`, then a full commit id. Names containing `~` or `^` are walked through parents (`HEAD~2`, `HEAD^2`). Annotated tags are peeled to commits. Abbreviated commit ids are not resolved; they fail with `Ref not found: <name>`.
+`resolveRef()` tries, in order: the name as given (`refs/heads/main`, `HEAD`), `refs/heads/<name>`, `refs/tags/<name>`, `refs/remotes/<name>`, `refs/remotes/<name>/HEAD`, then a full commit id. A leading `@{-N}` is the branch (or detached commit) the Nth most recent `checkout: moving from` line of HEAD's reflog left, as git's `interpret_nth_prior_checkout` reads it (`@{-1}~1` works too). Names containing `~` or `^` are walked through parents (`HEAD~2`, `HEAD^2`). Annotated tags are peeled to commits. Abbreviated commit ids are not resolved; they fail with `Ref not found: <name>`.
 
 ### Remote commands use smart HTTP only
 

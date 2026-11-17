@@ -9,6 +9,7 @@ import {
   CleanCommand,
   CloneCommand,
   CommitCommand,
+  CopyBranchCommand,
   CreateBranchCommand,
   DeleteBranchCommand,
   DeleteTagCommand,
@@ -43,6 +44,7 @@ import {
   StashDropCommand,
   StashListCommand,
   StatusCommand,
+  SwitchCommand,
   TagCommand,
   VerifyPackCommand,
   WorktreeAddCommand,
@@ -253,6 +255,22 @@ export class Git implements Disposable {
     return new CheckoutCommand(this._workingCopy);
   }
 
+  /**
+   * Create a SwitchCommand (`git switch`): switch to a branch, create one (`-c`/`-C`),
+   * detach HEAD (`--detach`), or start an orphan branch (`--orphan`).
+   *
+   * @example
+   * ```typescript
+   * await git.switch().setName("feature").call();
+   * await git.switch().setCreateBranch("topic").setName("origin/topic").call();
+   * await git.switch().setName("-").call();
+   * ```
+   */
+  switch(): SwitchCommand {
+    this.checkClosed();
+    return new SwitchCommand(this._workingCopy);
+  }
+
   // ============ Commit Operations ============
 
   /**
@@ -362,6 +380,20 @@ export class Git implements Disposable {
   branchRename(): RenameBranchCommand {
     this.checkClosed();
     return new RenameBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CopyBranchCommand (`git branch -c` / `-C`): a copy of a branch with its
+   * reflog and its `branch.<name>.*` configuration.
+   *
+   * @example
+   * ```typescript
+   * await git.branchCopy().setOldName("feature").setNewName("feature2").call();
+   * ```
+   */
+  branchCopy(): CopyBranchCommand {
+    this.checkClosed();
+    return new CopyBranchCommand(this._workingCopy);
   }
 
   // ============ Tag Operations ============

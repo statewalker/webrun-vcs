@@ -47,9 +47,9 @@ describe.each(backends)("History Operations ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().call());
 
       expect(commits.length).toBe(4); // Initial + 3
-      expect(commits[0].message).toBe("Third");
-      expect(commits[1].message).toBe("Second");
-      expect(commits[2].message).toBe("First");
+      expect(commits[0].message).toBe("Third\n");
+      expect(commits[1].message).toBe("Second\n");
+      expect(commits[2].message).toBe("First\n");
       expect(commits[3].message).toBe("Initial commit");
     });
 
@@ -67,8 +67,8 @@ describe.each(backends)("History Operations ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setMaxCount(3).call());
 
       expect(commits.length).toBe(3);
-      expect(commits[0].message).toBe("Commit 10");
-      expect(commits[2].message).toBe("Commit 8");
+      expect(commits[0].message).toBe("Commit 10\n");
+      expect(commits[2].message).toBe("Commit 8\n");
     });
 
     it("should support skip", async () => {
@@ -85,8 +85,8 @@ describe.each(backends)("History Operations ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setSkip(2).setMaxCount(2).call());
 
       expect(commits.length).toBe(2);
-      expect(commits[0].message).toBe("Commit 3");
-      expect(commits[1].message).toBe("Commit 2");
+      expect(commits[0].message).toBe("Commit 3\n");
+      expect(commits[1].message).toBe("Commit 2\n");
     });
   });
 
@@ -347,9 +347,9 @@ describe.each(backends)("History Operations ($name backend)", ({ factory }) => {
         }
       }
 
-      expect(touchedTrackedFile).toContain("Update tracked file to v2");
-      expect(touchedTrackedFile).toContain("Add tracked file v1");
-      expect(touchedTrackedFile).not.toContain("Add other file");
+      expect(touchedTrackedFile).toContain("Update tracked file to v2\n");
+      expect(touchedTrackedFile).toContain("Add tracked file v1\n");
+      expect(touchedTrackedFile).not.toContain("Add other file\n");
     });
   });
 });

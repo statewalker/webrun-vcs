@@ -60,3 +60,16 @@ export class CloneCheckoutError extends GitApiError {
     this.result = result;
   }
 }
+
+/**
+ * Thrown when `git switch` refuses before anything changes, with git's message: a name
+ * that is not a branch (`fatal: a branch is expected, got commit '...'` and its hint), an
+ * operation in progress, a branch `-c` would create that exists, options that do not go
+ * together.
+ */
+export class SwitchRefusedError extends GitApiError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SwitchRefusedError";
+  }
+}
