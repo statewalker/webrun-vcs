@@ -21,6 +21,9 @@ import {
 } from "../rename/index.js";
 import { abbrevLengths } from "./core-config.js";
 
+/** Line bytes the interner holds before blame starts a new one (see `setInternerByteLimit`) */
+const DEFAULT_INTERNER_BYTE_LIMIT = 64 * 1024 * 1024;
+
 /**
  * A single blame entry - represents authorship of one or more consecutive lines.
  */
@@ -303,6 +306,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private algorithm?: XdiffAlgorithm;
   private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
   private ignoreWhitespace = false;
+  private internerByteLimit = DEFAULT_INTERNER_BYTE_LIMIT;
   private indentHeuristic?: boolean;
   private showRoot?: boolean;
   private lineRanges: Array<[number, number]> = [];
@@ -432,6 +436,20 @@ export class BlameCommand extends GitCommand<BlameResult> {
   setBigFileThreshold(threshold: number): this {
     this.checkCallable();
     this.bigFileThreshold = threshold;
+    return this;
+  }
+
+  /**
+   * Set how many bytes of distinct lines the line interner may hold (default 64 MiB). The
+   * interner keeps every distinct line it has seen; past this size blame starts a new one for
+   * the versions it reads next, and re-interns a version from the old one when it is compared
+   * with one from the new. The output does not change.
+   *
+   * @param bytes Size in bytes
+   */
+  setInternerByteLimit(bytes: number): this {
+    this.checkCallable();
+    this.internerByteLimit = bytes;
     return this;
   }
 
@@ -674,10 +692,15 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const newdest: Slot = { next: null };
     const src: Slot = { next: target.suspects };
     const d = { offset: 0, dstq: newdest as Slot, srcq: src as Slot };
-    const fileP = await this.originContent(parent);
-    const fileO = await this.originContent(target);
+    let fileP = await this.originContent(parent);
+    let fileO = await this.originContent(target);
+    // ids are comparable only within one interner: a version interned before blame started
+    // a new interner is interned again in the current one
+    const interner = this.lineInterner();
+    if (fileP.interner !== interner) fileP = parent.lines = interner.text(fileP.content);
+    if (fileO.interner !== interner) fileO = target.lines = interner.text(fileO.content);
     const hunks = xdiffHunks(fileP, fileO, {
-      interner: this.lineInterner(),
+      interner,
       algorithm: this.algorithm,
       indentHeuristic: this.indentHeuristic,
       ignoreWhitespace: this.ignoreWhitespace,
@@ -790,11 +813,17 @@ export class BlameCommand extends GitCommand<BlameResult> {
     return o.lines;
   }
 
-  /** The interner every compared version's lines go through (see `passBlameToParent`) */
+  /**
+   * The interner compared versions' lines go through (see `passBlameToParent`); a new one
+   * once the current one holds more than `internerByteLimit` bytes of lines, so a long walk
+   * does not keep every distinct line it has seen
+   */
   private lineInterner(): LineInterner {
-    this.interner ??= new LineInterner(
-      whitespaceFlags({ ignoreWhitespace: this.ignoreWhitespace }),
-    );
+    if (!this.interner || this.interner.byteSize > this.internerByteLimit) {
+      this.interner = new LineInterner(
+        whitespaceFlags({ ignoreWhitespace: this.ignoreWhitespace }),
+      );
+    }
     return this.interner;
   }
 

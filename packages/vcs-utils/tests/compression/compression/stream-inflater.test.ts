@@ -2,6 +2,14 @@ import { randomBytes } from "node:crypto";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { deflateRawSync, deflateSync } from "node:zlib";
+import {
+  Z_NO_FLUSH,
+  Z_STREAM_END,
+  ZStream,
+  zlibInflate,
+  zlibInflateInit2,
+  zlibInflateReset,
+} from "pako";
 import { describe, expect, it } from "vitest";
 import {
   CompressionError,
@@ -10,6 +18,7 @@ import {
   decompressBlockPartial,
   InflateError,
   type InflaterPool,
+  resetInflateStream,
   type StreamInflater,
   TruncatedStreamError,
 } from "../../../src/compression/index.js";
@@ -395,3 +404,139 @@ describe("decompressBlockPartial on the push inflater", () => {
 
 /** Keeps the pool type referenced so the export is checked by the typecheck run. */
 export type _PoolType = InflaterPool;
+
+describe("createInflaterPool: the allocation-free reset matches pako's inflateReset", () => {
+  const text = enc.encode(
+    Array.from({ length: 4000 }, (_, i) => `line ${i} ${(i * 7919) % 1000} some text\n`).join(""),
+  );
+
+  /** A pako state that has inflated `data` (dynamic blocks) to its end */
+  function decoded(data: Uint8Array, raw: boolean): ZStream {
+    const strm = new ZStream();
+    expect(zlibInflateInit2(strm, raw ? -15 : 15)).toBe(0);
+    strm.input = data;
+    strm.next_in = 0;
+    strm.avail_in = data.length;
+    strm.output = new Uint8Array(text.length + 16);
+    strm.next_out = 0;
+    strm.avail_out = strm.output.length;
+    expect(zlibInflate(strm, Z_NO_FLUSH)).toBe(Z_STREAM_END);
+    return strm;
+  }
+
+  /** Every scalar field of `obj` (typed arrays, tables, windows and links left out) */
+  function scalars(obj: object): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v === null || (typeof v !== "object" && typeof v !== "function")) out[k] = v;
+    }
+    return out;
+  }
+  const stateOf = (strm: ZStream) => (strm as unknown as { state: object }).state;
+  /**
+   * Sets every scalar field to an unlikely value, the same in every state: a field the reset
+   * leaves alone stays equal across both states, and a field it sets cannot pass by already
+   * holding the reset value (as `back` and `dmax` do after a stream). `mode` keeps its
+   * end-of-stream value, which differs from the reset's: pako refuses a state whose mode is
+   * out of range.
+   */
+  function scramble(obj: object): void {
+    const o = obj as Record<string, unknown>;
+    for (const [i, [k, v]] of Object.entries(o).entries()) {
+      if (k === "mode") continue;
+      if (typeof v === "number" || v === null) o[k] = 7777 + i;
+      else if (typeof v === "boolean") o[k] = !v;
+      else if (typeof v === "string") o[k] = `scrambled ${k}`;
+    }
+  }
+
+  for (const raw of [false, true]) {
+    it(`sets every scalar field pako's reset sets (${raw ? "raw" : "zlib"})`, () => {
+      const data = raw ? deflateRawSync(text, { level: 9 }) : deflateSync(text, { level: 9 });
+      const byPako = decoded(data, raw);
+      const pooled = decoded(data, raw);
+      const decodedFields = { ...scalars(pooled), ...scalars(stateOf(pooled)) };
+      const tables = (stateOf(pooled) as { lendyn: Int32Array }).lendyn;
+      for (const strm of [byPako, pooled]) {
+        scramble(strm);
+        scramble(stateOf(strm));
+      }
+
+      expect(zlibInflateReset(byPako)).toBe(0);
+      expect(resetInflateStream(pooled)).toBe(true);
+
+      // the pooled path ran (it keeps the code tables; pako allocates new ones)
+      expect((stateOf(pooled) as { lendyn: Int32Array }).lendyn).toBe(tables);
+      // the reset changed something, so equal fields below are not just leftovers
+      expect({ ...scalars(pooled), ...scalars(stateOf(pooled)) }).not.toEqual(decodedFields);
+      expect(scalars(pooled)).toEqual(scalars(byPako));
+      expect(scalars(stateOf(pooled))).toEqual(scalars(stateOf(byPako)));
+      expect(Object.keys(stateOf(pooled)).sort()).toEqual(Object.keys(stateOf(byPako)).sort());
+    });
+  }
+});
+
+describe("createInflaterPool: a reused state does not see the previous stream's window", () => {
+  /** Deflate bit writer: fields LSB first, Huffman codes MSB first */
+  class BitWriter {
+    private bytes: number[] = [];
+    private cur = 0;
+    private n = 0;
+    bits(v: number, n: number): void {
+      for (let i = 0; i < n; i++) {
+        this.cur |= ((v >> i) & 1) << this.n;
+        if (++this.n === 8) {
+          this.bytes.push(this.cur);
+          this.cur = 0;
+          this.n = 0;
+        }
+      }
+    }
+    huff(code: number, len: number): void {
+      for (let i = len - 1; i >= 0; i--) this.bits((code >> i) & 1, 1);
+    }
+    done(): Uint8Array {
+      if (this.n) this.bytes.push(this.cur);
+      return new Uint8Array(this.bytes);
+    }
+  }
+
+  /** A final fixed-Huffman block: literal "a", then a 3-byte copy from 5 bytes back */
+  function tooFarBack(raw: boolean): Uint8Array {
+    const w = new BitWriter();
+    w.bits(1, 1); // BFINAL
+    w.bits(1, 2); // BTYPE = fixed
+    w.huff(0x30 + 0x61, 8); // literal 'a'
+    w.huff(1, 7); // length code 257: length 3
+    w.huff(4, 5); // distance code 4: 5-6, one extra bit
+    w.bits(0, 1); // distance 5
+    w.huff(0, 7); // end of block
+    const body = w.done();
+    if (raw) return body;
+    // zlib header (no dictionary, 0x7801 % 31 === 0); the trailer is never reached
+    return concat([new Uint8Array([0x78, 0x01]), body, new Uint8Array(4)]);
+  }
+
+  for (const raw of [false, true]) {
+    it(`fails "invalid distance too far back" after a large stream (${raw ? "raw" : "zlib"})`, () => {
+      const pool = createInflaterPool();
+      const text = enc.encode(
+        Array.from({ length: 5000 }, (_, i) => `line ${i} ${(i * 7919) % 1000} text\n`).join(""),
+      );
+      const big = raw ? deflateRawSync(text, { level: 9 }) : deflateSync(text, { level: 9 });
+      const first = pool.acquire({ raw }).push(big);
+      expect(first.done).toBe(true);
+      expect(eq(concat(first.out), text)).toBe(true);
+
+      // the reused state's window still holds the previous output; reading it would leak
+      expect(() => pool.acquire({ raw }).push(tooFarBack(raw))).toThrow(
+        /invalid distance too far back/,
+      );
+      expect(pool.allocated).toBe(1);
+      // a fresh state agrees
+      expect(() => createInflaterPool().acquire({ raw }).push(tooFarBack(raw))).toThrow(
+        /invalid distance too far back/,
+      );
+    });
+  }
+});

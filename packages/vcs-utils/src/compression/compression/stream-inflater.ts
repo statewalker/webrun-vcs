@@ -126,8 +126,13 @@ let headMode: number | undefined;
  * (zlib reuses its `codes` array, which every dynamic block fills before reading), and
  * allocating them is a good part of reading a small object. The same fields are set, the
  * tables kept; a state of another shape is reset by pako.
+ *
+ * Exported for the test that checks it against pako's own `inflateReset`; not part of the
+ * module's API.
+ *
+ * @internal
  */
-function resetStream(strm: ZStream): boolean {
+export function resetInflateStream(strm: ZStream): boolean {
   const state = (strm as unknown as { state?: PakoInflateState }).state;
   headMode ??= (newStream(false) as unknown as { state: PakoInflateState }).state.mode;
   if (
@@ -216,7 +221,7 @@ export function createInflaterPool(): InflaterPool {
     strm.input = EMPTY;
     strm.next_in = 0;
     strm.avail_in = 0;
-    if (list.length < MAX_IDLE && resetStream(strm)) list.push(strm);
+    if (list.length < MAX_IDLE && resetInflateStream(strm)) list.push(strm);
     else zlibInflateEnd(strm);
   };
 

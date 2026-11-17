@@ -42,6 +42,15 @@ export class LineInterner {
     this.whitespace = whitespace;
   }
 
+  /**
+   * Bytes of the distinct lines interned so far. The interner keeps every line it has seen;
+   * a caller bounding its memory starts a new interner past a size of its choosing (ids of
+   * different interners must never meet in one diff).
+   */
+  get byteSize(): number {
+    return this.used;
+  }
+
   /** The id of each line of `lines` (computed once per sequence and kept with it) */
   ids(lines: ByteLines): Int32Array {
     const known = lines.internedBy === this ? lines.internedIds : undefined;

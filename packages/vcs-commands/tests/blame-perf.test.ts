@@ -173,4 +173,32 @@ describeGit("blame reads and diffs each version once", () => {
     expect(counts["commits.load"]).toBeLessThanOrEqual(h.commits);
     expect(counts["trees.loadTree"] ?? 0).toBe(0);
   }, 60_000);
+
+  it("gives the same blame when the line interner is capped and replaced", async () => {
+    const run = async (ignoreWhitespace: boolean, limit?: number) => {
+      const intern = vi.spyOn(LineInterner.prototype, "intern");
+      try {
+        const git = await openCounted(dir, {});
+        const cmd = git
+          .blame()
+          .setFilePath(h.path)
+          .setStartCommit(h.tip)
+          .setIgnoreWhitespace(ignoreWhitespace);
+        if (limit !== undefined) cmd.setInternerByteLimit(limit);
+        const out = formatBlamePorcelain(await cmd.call());
+        return { out, interners: new Set(intern.mock.contexts).size };
+      } finally {
+        intern.mockRestore();
+      }
+    };
+    for (const ws of [false, true]) {
+      const plain = await run(ws);
+      // a cap far below one version: a new interner for nearly every version read
+      const capped = await run(ws, 256);
+      expect(plain.interners).toBe(1);
+      expect(capped.interners).toBeGreaterThan(10);
+      expect(capped.out.length).toBe(plain.out.length);
+      expect(Buffer.from(capped.out).equals(Buffer.from(plain.out))).toBe(true);
+    }
+  }, 60_000);
 });
