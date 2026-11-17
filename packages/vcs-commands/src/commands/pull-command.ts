@@ -1,3 +1,4 @@
+import type { FilesApi } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 
 import { NoHeadError } from "../errors/index.js";
@@ -51,6 +52,17 @@ export class PullCommand extends TransportCommand<PullResult> {
   private strategy?: MergeStrategy;
   private fastForwardMode?: FastForwardMode;
   private tagOption?: TagOption;
+  private repositoryFiles?: { files: FilesApi; gitDir?: string };
+
+  /**
+   * The files of the repository, for the fetch to write the commit-graph
+   * `fetch.writeCommitGraph` asks for (see `FetchCommand.setRepositoryFiles`).
+   */
+  setRepositoryFiles(repository: { files: FilesApi; gitDir?: string }): this {
+    this.checkCallable();
+    this.repositoryFiles = repository;
+    return this;
+  }
 
   /**
    * Set the remote to pull from.
@@ -262,6 +274,9 @@ export class PullCommand extends TransportCommand<PullResult> {
     }
     if (this.tagOption) {
       fetchCommand.setTagOpt(this.tagOption);
+    }
+    if (this.repositoryFiles) {
+      fetchCommand.setRepositoryFiles(this.repositoryFiles);
     }
 
     const fetchResult = await fetchCommand.call();

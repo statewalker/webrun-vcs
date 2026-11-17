@@ -115,6 +115,8 @@ git push                                        # MANDATORY
 - **`git fsck` in 2.5x**: it runs `git refs verify` unless given `--no-references` (`FsckCommand` matches `fsck --no-references`), and dies under `--connectivity-only` on a corrupt packed object
 - **Missing files in memory**: `createInMemoryFilesApi().read()` of a missing path yields no bytes instead of failing with ENOENT, so `tryReadFile` returns an empty array there; check `stats(path)?.kind === "file"` first when a missing file must read as absent
 - **Commit-graphs and replace refs**: `git commit-graph write` disables replace refs and writes a graph anyway; `git gc` (in-process, replace refs on) writes none, and readers ignore a graph while `refs/replace/` has refs (`commitGraphCompatible`)
+- **Bloom statistics differ by version**: git 2.5x asks a root commit's changed-path filter (`rev_same_tree_as_empty`), 2.43 does not, so trace2 `bloom/statistics` of one `git log -- <path>` differ by one check per root reached (`log-path-native.test.ts` allows for it)
+- **Benchmarking**: measure the built bundles (`dist/`), not sources through tsx: its `keepNames` wraps every function in `__name` and skews profiles of hot closures
 - **Funcname patterns**: `diff.<driver>.xfuncname`/`funcname` and the builtin driver patterns are POSIX regexes; run them through `compilePosixRegex` (vcs-utils `regex/`), never a JavaScript `RegExp` (different semantics, catastrophic backtracking)
 
 ## Self-Maintenance

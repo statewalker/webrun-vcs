@@ -1,7 +1,8 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 // Import from the package root only: vcs-core ships a single runtime file
 // (dist/index.js); its subpaths resolve for types but not at runtime.
-import { isSymbolicRef } from "@statewalker/vcs-core";
+import { type FilesApi, isSymbolicRef } from "@statewalker/vcs-core";
+import { writeCommitGraph } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -18,7 +19,6 @@ import {
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
-
 import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
 import { deleteRefs, RemoteConfigStore } from "../remote-config/index.js";
 import {
@@ -27,6 +27,7 @@ import {
   type TrackingRefUpdate,
 } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 
 /**
  * Tag fetching option.
@@ -90,6 +91,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private thin = true;
   private depth?: number;
   private dryRun = false;
+  private writeCommitGraphOption?: boolean;
+  private repositoryFiles?: { files: FilesApi; gitDir?: string };
   private forceUpdate = false;
   private atomic = false;
   private checkFetchedObjects = false;
@@ -273,6 +276,32 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       throw new InvalidArgumentError("depth", depth, "Depth must be at least 1");
     }
     this.depth = depth;
+    return this;
+  }
+
+  /**
+   * `--[no-]write-commit-graph`: after the fetch, write a split commit-graph of everything the
+   * refs reach, as git does with `fetch.writeCommitGraph` (which this overrides). It needs the
+   * repository's files (`setRepositoryFiles`).
+   */
+  setWriteCommitGraph(write: boolean): this {
+    this.checkCallable();
+    this.writeCommitGraphOption = write;
+    return this;
+  }
+
+  /**
+   * The files of the repository (a files backend), where `fetch.writeCommitGraph` writes the
+   * commit-graph. Without them no graph is written.
+   *
+   * @example
+   * ```typescript
+   * await git.fetch().setRepositoryFiles({ files }).setWriteCommitGraph(true).call();
+   * ```
+   */
+  setRepositoryFiles(repository: { files: FilesApi; gitDir?: string }): this {
+    this.checkCallable();
+    this.repositoryFiles = repository;
     return this;
   }
 
@@ -613,16 +642,52 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       }
     }
 
+    // fetch.c: after the fetch (and its submodules), a split graph of what the refs reach
+    // (write_commit_graph_reachable with COMMIT_GRAPH_WRITE_SPLIT), on --write-commit-graph
+    // or fetch.writeCommitGraph
+    const commitGraphHashes = await this.writeCommitGraphAfterFetch(store, messages);
+
     return {
       uri: remoteUrl,
       advertisedRefs,
       trackingRefUpdates: trackingUpdates,
+      ...(commitGraphHashes ? { commitGraph: commitGraphHashes } : {}),
       defaultBranch: result.defaultBranch,
       bytesReceived: result.packBytes,
       isEmpty: result.isEmpty,
       messages,
       ...(errors.length > 0 ? { errors } : {}),
     };
+  }
+
+  /**
+   * git's write of the commit-graph at the end of a fetch: when `--write-commit-graph` or
+   * `fetch.writeCommitGraph` asks and the repository's files are known, a split layer of the
+   * commits the refs reach (merged with the layers below as `--split` merges them; existing
+   * changed-path filters are kept). Its warnings join `messages` as git prints them. The
+   * layer hashes of the chain written, base first; undefined when nothing was written.
+   */
+  private async writeCommitGraphAfterFetch(
+    store: RemoteConfigStore,
+    messages: string[],
+  ): Promise<string[] | undefined> {
+    const write =
+      this.writeCommitGraphOption ?? configBool(store.value("fetch.writeCommitGraph")) ?? false;
+    const repository = this.repositoryFiles;
+    const history = this._workingCopy.history;
+    if (!write || !repository || !history.objects) return undefined;
+    const environment = hostEnvironmentOf(this._workingCopy);
+    const result = await writeCommitGraph({
+      files: repository.files,
+      gitDir: repository.gitDir,
+      objects: history.objects,
+      refs: history.refs,
+      commitGraph: history.commitGraph,
+      split: true,
+      ...(environment ? { environment } : {}),
+    });
+    for (const warning of result.warnings) messages.push(`warning: ${warning}`);
+    return result.written ? result.hashes : undefined;
   }
 
   /**

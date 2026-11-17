@@ -84,6 +84,11 @@ export interface FetchResult {
   errors?: string[];
   /** Submodule fetch results (if any) */
   submodules?: Map<string, FetchResult>;
+  /**
+   * The layer hashes of the commit-graph chain the fetch wrote (`fetch.writeCommitGraph`,
+   * `--write-commit-graph`), base first; absent when it wrote none
+   */
+  commitGraph?: string[];
 }
 
 /**

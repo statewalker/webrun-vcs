@@ -33,6 +33,21 @@ function hexValue(c: number): number {
 /** git's get_oid_hex at `at`: 40 hex digits (either case), lowercase hex id, or undefined. */
 function oidAt(data: Uint8Array, at: number): ObjectId | undefined {
   if (at + 40 > data.length) return undefined;
+  // the usual case, lowercase digits: the id is those bytes as they are
+  let lower = true;
+  for (let i = at; i < at + 40; i++) {
+    const c = data[i] as number;
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) {
+      lower = false;
+      break;
+    }
+  }
+  if (lower) {
+    return String.fromCharCode.apply(
+      null,
+      data.subarray(at, at + 40) as unknown as number[],
+    ) as ObjectId;
+  }
   const raw = new Uint8Array(20);
   for (let i = 0; i < 20; i++) {
     const hi = hexValue(data[at + 2 * i] as number);
@@ -82,14 +97,20 @@ export function parseCommitDate(data: Uint8Array, start: number): number {
     p++;
   }
   eol = tail;
+  // up to 15 digits fit a double exactly (every date git writes); longer ones as strtoumax
+  let small = 0;
+  let n = 0;
+  while (p + n < eol && n < 16 && isDigit(data[p + n] as number)) {
+    small = small * 10 + ((data[p + n] as number) - 0x30);
+    n++;
+  }
+  if (n === 0) return 0;
+  if (n < 16 && !negative) return small;
   let value = 0n;
-  let digits = false;
   while (p < eol && isDigit(data[p] as number)) {
     value = value * 10n + BigInt((data[p] as number) - 0x30);
-    digits = true;
     p++;
   }
-  if (!digits) return 0;
   const max = (1n << 64n) - 1n;
   if (value > max) value = max;
   if (negative && value !== 0n) value = (1n << 64n) - value;

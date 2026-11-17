@@ -1,4 +1,5 @@
 import {
+  type CommitGraph,
   commitGraphCompatible,
   type FilesApi,
   type GitObject,
@@ -116,6 +117,12 @@ export interface FsckResult {
   output: string;
   /** What git prints on stderr. */
   errorOutput: string;
+  /**
+   * The work behind the result: objects read whole from the store (`objectsRead`; the
+   * sequential pack checks of a full run are not counted) and, in `--connectivity-only` runs,
+   * commits whose tree and parents came from the commit-graph instead (`commitsFromGraph`)
+   */
+  statistics: { objectsRead: number; commitsFromGraph: number };
 }
 
 /** The git version whose output `FsckCommand` reproduces where versions differ. */
@@ -469,6 +476,20 @@ class FsckRun {
   private readonly badCopy = new Set<string>();
   /** Where an id parsed from hex is written for a lookup. */
   private readonly idScratch = new Uint8Array(20);
+  /**
+   * The object `parseObject` read last: the connectivity walk of a tree it parsed walks these
+   * bytes instead of reading the tree again (git's parse_tree reads it once).
+   */
+  private lastRead?: { id: string; obj: Whole };
+  /**
+   * The commit-graph (connectivity-only runs): git's repo_parse_commit takes a commit's tree
+   * and parents from it (parse_commit_in_graph) instead of reading the commit.
+   */
+  private graph?: CommitGraph;
+  /** Commits parsed from the graph: commits not read from the object store */
+  private graphParsed = 0;
+  /** Objects read whole from the store (`readWhole`) */
+  private objectsRead = 0;
   private readonly files?: FilesApi;
   private readonly gitDir: string;
 
@@ -512,6 +533,7 @@ class FsckRun {
     if (snapshot) await this.processSnapshot(snapshot);
     else await this.processRefs();
     await this.processIndexes();
+    if (this.o.connectivityOnly) this.graph = await this.loadCommitGraph();
     try {
       await this.checkConnectivity();
     } finally {
@@ -526,6 +548,7 @@ class FsckRun {
       findings: this.findings,
       output: out.join(""),
       errorOutput: err.join(""),
+      statistics: { objectsRead: this.objectsRead, commitsFromGraph: this.graphParsed },
     };
   }
 
@@ -571,6 +594,56 @@ class FsckRun {
     );
     for (const text of result.messages) this.emit({ kind: "commit-graph", stream: "stderr", text });
     if (result.exitCode !== 0) this.errorsFound |= FSCK_ERROR_COMMIT_GRAPH;
+  }
+
+  /**
+   * The graph git's repo_parse_commit reads commits from: `core.commitGraph` on, a repository
+   * the graph is valid for (no grafts, not shallow; fsck disables replace refs), a graph that
+   * loads. Undefined otherwise: commits are read from the object store.
+   */
+  private async loadCommitGraph(): Promise<CommitGraph | undefined> {
+    const settings = this.o.commitGraph;
+    if (!this.files || !settings.enabled) return undefined;
+    try {
+      if (
+        !(await commitGraphCompatible({
+          files: this.files,
+          gitDir: this.gitDir,
+          useReplaceRefs: false,
+        }))
+      ) {
+        return undefined;
+      }
+      return (await readCommitGraph(this.files, `${this.gitDir}/objects`, settings)).graph;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * git's parse_commit_in_graph for object `n`, a commit not parsed yet: its parents (looked up
+   * first, as fill_commit_in_graph inserts them) and its tree from the graph. False when the
+   * graph does not have it (or names something of another type): the commit is read then.
+   */
+  private parseCommitInGraph(n: number, id: string): boolean {
+    const g = this.graph as CommitGraph;
+    const pos = g.position(id);
+    if (pos < 0) return false;
+    const t = this.t;
+    const parents: number[] = [];
+    if (!this.shallow.has(id)) {
+      for (const pid of g.parentsAt(pos)) {
+        const parent = t.lookupTyped(pid, OBJ_COMMIT);
+        if (typeof parent !== "number") return false;
+        parents.push(parent);
+      }
+    }
+    const tree = t.lookupTyped(g.treeAt(pos), OBJ_TREE);
+    if (typeof tree !== "number") return false;
+    t.links.set(n, { tree, parents });
+    t.addFlags(n, PARSED);
+    this.graphParsed++;
+    return true;
   }
 
   /** Whether HEAD or any ref names an object. */
@@ -669,6 +742,7 @@ class FsckRun {
    */
   private readWhole(id: string): Whole | undefined | Promise<Whole | undefined> {
     this.lastZlibError = undefined;
+    this.objectsRead++;
     let obj: GitObject | undefined | Promise<GitObject | undefined>;
     try {
       obj = this.objects.getNow ? this.objects.getNow(id) : this.objects.get(id);
@@ -936,6 +1010,7 @@ class FsckRun {
       if (this.lastZlibError) this.error(this.lastZlibError);
       return undefined;
     }
+    this.lastRead = { id, obj };
     return this.parseObjectBuffer(id, typeOf(obj.type), obj.content);
   }
 
@@ -1851,6 +1926,8 @@ class FsckRun {
    */
   private *traverseOne(n: number): Steps<void> {
     const t = this.t;
+    // fsck_walk returns at once for a blob (no id to build, nothing to read)
+    if (t.type(n) === OBJ_BLOB) return;
     if (t.type(n) === OBJ_TREE && t.flags(n) & PARSED) {
       const start = this.treeEntries.get(n);
       if (start !== undefined) {
@@ -1873,16 +1950,23 @@ class FsckRun {
     }
     const id = t.id(n);
     // git's parse_object / repo_parse_commit / parse_tag before walking
+    this.lastRead = undefined;
     if (t.type(n) === OBJ_NONE || (t.type(n) !== OBJ_BLOB && !(t.flags(n) & PARSED))) {
-      const r = this.parseObject(id);
-      if (r instanceof Promise) yield r;
+      if (!(t.type(n) === OBJ_COMMIT && this.graph && this.parseCommitInGraph(n, id))) {
+        const r = this.parseObject(id);
+        if (r instanceof Promise) yield r;
+      }
     }
     const name = this.names?.get(id);
     switch (t.type(n)) {
       case OBJ_BLOB:
         return;
       case OBJ_TREE: {
-        let obj = this.readWhole(id);
+        // the tree just parsed, or read now
+        const last = this.lastRead as { id: string; obj: Whole } | undefined;
+        let obj: Whole | undefined | Promise<Whole | undefined> =
+          last !== undefined && last.id === id ? last.obj : this.readWhole(id);
+        this.lastRead = undefined;
         if (obj instanceof Promise) obj = (yield obj) as Whole | undefined;
         if (!obj) {
           if (this.lastZlibError) this.error(this.lastZlibError);

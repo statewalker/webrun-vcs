@@ -1,7 +1,15 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
-import { compareGitPaths, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
-import { directoriesOf, type Worktree, wildmatch } from "@statewalker/vcs-working-tree";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { directoriesOf, type Worktree } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
+import {
+  DO_MATCH_LEADING_PATHSPEC,
+  MATCHED_RECURSIVELY_LEADING_PATHSPEC,
+  matchPathspec,
+  type PathspecItem,
+  parsePathspec,
+  psEqual,
+} from "./pathspec.js";
 import { removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
 
 /**
@@ -373,189 +381,6 @@ const node = (path: string, directory: boolean): CleanNode => ({
   repository: false,
   children: [],
 });
-
-// ============ git's pathspec matching (pathspec.c, dir.c match_pathspec_item) ============
-
-const MATCHED_RECURSIVELY = 1;
-const MATCHED_RECURSIVELY_LEADING_PATHSPEC = 2;
-const MATCHED_FNMATCH = 3;
-const MATCHED_EXACTLY = 4;
-const DO_MATCH_DIRECTORY = 1;
-const DO_MATCH_LEADING_PATHSPEC = 2;
-const DO_MATCH_EXCLUDE = 4;
-
-/** One pathspec element as git's `init_pathspec_item` parses it. */
-interface PathspecItem {
-  /** The path from the top of the worktree (normalised), without its magic */
-  match: string;
-  /** The length of its leading literal part (git's `nowildcard_len`) */
-  nowildcardLen: number;
-  /** `*` followed by no other wildcard after the literal prefix (git's ONESTAR) */
-  oneStar: boolean;
-  /** `:(exclude)` / `:!` / `:^`: a path it matches is left out */
-  exclude: boolean;
-  /** `:(glob)`: wildmatch with WM_PATHNAME (`*` stops at `/`, `**` spans directories) */
-  glob: boolean;
-  /** `:(icase)`: case-insensitive */
-  icase: boolean;
-}
-
-/** git's characters that may introduce short pathspec magic (`GIT_PATHSPEC_MAGIC`). */
-const SHORT_MAGIC_CHARS = new Set([..."!\"#%&',-;<=>@_`~^/"]);
-
-/**
- * The pathspec elements as git's `parse_pathspec` reads them from the top of the worktree:
- * short magic (`:/` top, `:!` and `:^` exclude) and long magic (`:(top,literal,glob,icase,
- * exclude)`), the path normalised as `prefix_path` does (`.`, `..`, repeated slashes; above
- * the top refused), and an implicit `.` when every element excludes.
- */
-function parsePathspec(paths: string[]): PathspecItem[] {
-  const items = paths.map(parsePathspecItem);
-  if (items.length > 0 && items.every((i) => i.exclude)) {
-    items.push(parsePathspecItem("."));
-  }
-  return items;
-}
-
-function parsePathspecItem(elem: string): PathspecItem {
-  let exclude = false;
-  let literal = false;
-  let glob = false;
-  let icase = false;
-  let rest = elem;
-  if (elem.startsWith(":(")) {
-    const end = elem.indexOf(")");
-    if (end < 0) throw new Error(`Missing ')' at the end of pathspec magic in '${elem}'`);
-    for (const raw of elem.slice(2, end).split(",")) {
-      const name = raw.trim();
-      if (name === "" || name === "top") continue;
-      if (name === "literal") literal = true;
-      else if (name === "glob") glob = true;
-      else if (name === "icase") icase = true;
-      else if (name === "exclude") exclude = true;
-      else if (name.startsWith("attr:") || name === "attr") {
-        throw new Error(`Unsupported pathspec magic 'attr' in '${elem}'`);
-      } else throw new Error(`Invalid pathspec magic '${name}' in '${elem}'`);
-    }
-    rest = elem.slice(end + 1);
-  } else if (elem.startsWith(":")) {
-    let pos = 1;
-    for (; pos < elem.length && elem[pos] !== ":"; pos++) {
-      const ch = elem[pos];
-      if (ch === "!" || ch === "^") exclude = true;
-      else if (ch === "/") {
-        // top: the paths are from the top already
-      } else if (!SHORT_MAGIC_CHARS.has(ch)) break;
-      else throw new Error(`Unimplemented pathspec magic '${ch}' in '${elem}'`);
-    }
-    if (elem[pos] === ":") pos++;
-    rest = elem.slice(pos);
-  }
-  if (literal && glob) throw new Error("'literal' and 'glob' are incompatible");
-  const match = normalizePathspecPath(rest, elem);
-  let nowildcardLen = match.length;
-  if (!literal) {
-    nowildcardLen = 0;
-    while (nowildcardLen < match.length && !isGlobSpecial(match[nowildcardLen])) nowildcardLen++;
-  }
-  const after = match.slice(nowildcardLen + 1);
-  const oneStar =
-    !glob &&
-    nowildcardLen < match.length &&
-    match[nowildcardLen] === "*" &&
-    ![...after].some((c) => isGlobSpecial(c));
-  return { match, nowildcardLen, oneStar, exclude, glob, icase };
-}
-
-const isGlobSpecial = (c: string) => c === "*" || c === "?" || c === "[" || c === "\\";
-
-/** git's `normalize_path_copy` of a path from the top (trailing slash kept; "." is ""). */
-function normalizePathspecPath(path: string, elem: string): string {
-  const trailing = path.endsWith("/") && path.replace(/\/+$/, "") !== "";
-  const out: string[] = [];
-  for (const part of path.split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") {
-      if (out.length === 0) throw new Error(`'${elem}' is outside repository`);
-      out.pop();
-    } else out.push(part);
-  }
-  const joined = out.join("/");
-  return joined && trailing ? `${joined}/` : joined;
-}
-
-/**
- * git's `ps_strncmp` / `ps_strcmp`: equal, case-insensitively for `:(icase)` (`strncasecmp`:
- * ASCII letters only, as git folds them).
- */
-const psEqual = (item: PathspecItem, a: string, b: string) =>
-  item.icase ? foldAsciiCase(a) === foldAsciiCase(b) : a === b;
-
-/** git's `git_fnmatch` of an element against a name. */
-function pathspecFnmatch(item: PathspecItem, name: string): boolean {
-  const prefix = item.nowildcardLen;
-  if (prefix > 0 && !psEqual(item, name.slice(0, prefix), item.match.slice(0, prefix))) {
-    return false;
-  }
-  const string = name.slice(prefix);
-  const pattern = item.match.slice(prefix);
-  if (item.oneStar) {
-    const tail = pattern.slice(1);
-    return (
-      string.length >= tail.length && psEqual(item, string.slice(string.length - tail.length), tail)
-    );
-  }
-  return wildmatch(pattern, string, { pathname: item.glob, casefold: item.icase });
-}
-
-/** git's `match_pathspec_item`. */
-function matchPathspecItem(item: PathspecItem, name: string, flags: number): number {
-  const { match } = item;
-  const matchlen = match.length;
-  const namelen = name.length;
-  if (matchlen === 0) return MATCHED_RECURSIVELY;
-  if (matchlen <= namelen && psEqual(item, name.slice(0, matchlen), match)) {
-    if (matchlen === namelen) return MATCHED_EXACTLY;
-    if (match[matchlen - 1] === "/" || name[matchlen] === "/") return MATCHED_RECURSIVELY;
-  } else if (
-    flags & DO_MATCH_DIRECTORY &&
-    match[matchlen - 1] === "/" &&
-    namelen === matchlen - 1 &&
-    psEqual(item, match.slice(0, namelen), name)
-  ) {
-    return MATCHED_EXACTLY;
-  }
-  if (item.nowildcardLen < matchlen && pathspecFnmatch(item, name)) return MATCHED_FNMATCH;
-  if (flags & DO_MATCH_LEADING_PATHSPEC && !(flags & DO_MATCH_EXCLUDE)) {
-    const offset = name.endsWith("/") ? 1 : 0;
-    if (
-      namelen < matchlen &&
-      match[namelen - offset] === "/" &&
-      psEqual(item, match.slice(0, namelen), name)
-    ) {
-      return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
-    }
-    const n = item.nowildcardLen;
-    if (n < matchlen && !psEqual(item, name.slice(0, n), match.slice(0, n))) return 0;
-    if (n === matchlen) return 0;
-    return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
-  }
-  return 0;
-}
-
-/** git's `match_pathspec_with_flags`: the best positive match, unless an exclude matches. */
-function matchPathspec(items: PathspecItem[], name: string, flags: number): number {
-  if (items.length === 0) return MATCHED_RECURSIVELY;
-  let positive = 0;
-  for (const item of items) {
-    if (!item.exclude) positive = Math.max(positive, matchPathspecItem(item, name, flags));
-  }
-  if (!positive || !items.some((i) => i.exclude)) return positive;
-  for (const item of items) {
-    if (item.exclude && matchPathspecItem(item, name, flags | DO_MATCH_EXCLUDE)) return 0;
-  }
-  return positive;
-}
 
 // ============ git's directory scan for clean (dir.c read_directory) ============
 

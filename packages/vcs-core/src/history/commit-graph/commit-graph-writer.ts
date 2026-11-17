@@ -18,7 +18,8 @@ import { createSha1 } from "@statewalker/vcs-utils/hash";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjects } from "../objects/git-objects.js";
+import { runSteps, type Steps } from "../../pack/index.js";
+import type { GitObject, GitObjects } from "../objects/git-objects.js";
 import { computeBloomFilter, DEFAULT_BLOOM_FILTER_SETTINGS } from "./bloom-filter.js";
 import type { CommitGraph } from "./commit-graph.js";
 import {
@@ -118,6 +119,11 @@ export interface WriteCommitGraphFileResult {
   expired: string[];
   /** Messages git prints (warnings) */
   warnings: string[];
+  /**
+   * The objects read to write it: commits parsed from the object store (each at most once),
+   * trees read for the changed-path filters (a tree read lately is not read again)
+   */
+  reads?: { commits: number; trees: number };
 }
 
 /** One commit being written. */
@@ -154,20 +160,26 @@ async function readRaw(
     return undefined;
   }
   if (!obj) return undefined;
-  if (obj.bytes) return { type: obj.type, data: obj.bytes };
+  return { type: obj.type, data: await objectBytes(obj) };
+}
+
+/** An object's bytes: held in memory, or read from its content to the end (which releases it). */
+async function objectBytes(obj: GitObject): Promise<Uint8Array> {
+  if (obj.bytes) return obj.bytes;
   const chunks: Uint8Array[] = [];
   let size = 0;
   for await (const c of obj.content) {
     chunks.push(c);
     size += c.length;
   }
+  if (chunks.length === 1) return chunks[0] as Uint8Array;
   const data = new Uint8Array(size);
   let at = 0;
   for (const c of chunks) {
     data.set(c, at);
     at += c.length;
   }
-  return { type: obj.type, data };
+  return data;
 }
 
 function compareBytes(a: Uint8Array, b: Uint8Array): number {
@@ -250,10 +262,11 @@ export async function writeCommitGraphFile(
     const top = g.top;
     for (let i = 0; i < top.numCommits; i++) oids.push(g.idAt(top.numCommitsInBase + i));
   }
-  for (const id of options.commits) oids.push(id);
+  for (const id of options.commits) oids.push(id.toLowerCase());
 
   // git's close_reachable: add the parents of every commit (a split write stops at the graph)
   const parsed = new Map<ObjectId, GraphCommitData>();
+  const reads = { commits: 0, trees: 0 };
   const graphPos = (id: ObjectId) => (g ? g.position(id) : -1);
   const parse = async (id: ObjectId, useGraph: boolean): Promise<GraphCommitData | undefined> => {
     const known = parsed.get(id);
@@ -263,7 +276,10 @@ export async function writeCommitGraphFile(
       const pos = g.position(id);
       if (pos >= 0) data = graphCommitData(g, pos);
     }
-    data ??= await readCommitData(objects, id);
+    if (!data) {
+      reads.commits++;
+      data = await readCommitData(objects, id);
+    }
     if (data) parsed.set(id, data);
     return data;
   };
@@ -287,15 +303,15 @@ export async function writeCommitGraphFile(
   }
 
   // git's copy_oids_to_commits: sorted, unique; a split write leaves out what the graph has
-  const unique = [...new Set(oids)].map((id) => ({ id, bytes: hexToBytes(id) }));
-  unique.sort((a, b) => compareBytes(a.bytes, b.bytes));
+  // lowercase hex ids sort as their bytes do
+  const unique = [...new Set(oids)].sort();
   let commits: WriteCommit[] = [];
-  for (const { id, bytes } of unique) {
+  for (const id of unique) {
     const pos = graphPos(id);
     if (split && !replace && pos >= 0) continue;
     const data = await parse(id, split === "replace");
     if (!data) throw new Error(`unable to parse commit ${id}`);
-    commits.push({ id, idBytes: bytes, data, graphPos: split ? pos : -1 });
+    commits.push({ id, idBytes: hexToBytes(id), data, graphPos: split ? pos : -1 });
   }
   if (commits.length >= GRAPH_EDGE_LAST_MASK) throw new Error("too many commits to write graph");
   if (commits.length === 0 && !replace) return result();
@@ -424,7 +440,16 @@ export async function writeCommitGraphFile(
   // changed-path filters
   let filters: (Uint8Array | undefined)[] | undefined;
   if (changedPaths) {
-    filters = await computeFilters(commits, gen, objects, bloom, g, options.maxNewFilters);
+    filters = await computeFilters(
+      commits,
+      index,
+      gen,
+      objects,
+      bloom,
+      g,
+      options.maxNewFilters,
+      reads,
+    );
   }
 
   // positions of parents
@@ -467,7 +492,7 @@ export async function writeCommitGraphFile(
       for (let i = 0; i < n; i++) {
         const c = commits[i] as WriteCommit;
         const parents = c.data.parents;
-        w.bytes(hexToBytes(c.data.tree));
+        w.hex(c.data.tree);
         w.u32(parents.length === 0 ? GRAPH_PARENT_NONE : parentPos(c, parents[0] as ObjectId));
         if (parents.length < 2) w.u32(GRAPH_PARENT_NONE);
         else if (parents.length > 2) {
@@ -692,6 +717,7 @@ export async function writeCommitGraphFile(
     hashes,
     expired,
     warnings,
+    reads,
   };
 }
 
@@ -741,11 +767,13 @@ function computeLevels(
 /** The changed-path filters of the commits (git's compute_bloom_filters), in id order. */
 async function computeFilters(
   commits: WriteCommit[],
+  index: Map<ObjectId, number>,
   gen: Float64Array,
   objects: Pick<GitObjects, "get">,
   settings: BloomFilterSettings,
   existing: CommitGraph | undefined,
   maxNewFilters: number | undefined,
+  reads: { commits: number; trees: number },
 ): Promise<(Uint8Array | undefined)[]> {
   const filters: (Uint8Array | undefined)[] = new Array(commits.length);
   // commit_gen_cmp: lower generation first, then older
@@ -759,6 +787,16 @@ async function computeFilters(
   const limit = maxNewFilters !== undefined && maxNewFilters >= 0 ? maxNewFilters : commits.length;
   let computed = 0;
   const trees = new TreeReader(objects);
+  // the parent's tree without reading the parent again: from the commits written, the graph,
+  // or (a parent outside both) the object database
+  const commitTree = async (id: ObjectId): Promise<ObjectId | undefined> => {
+    const i = index.get(id);
+    if (i !== undefined) return (commits[i] as WriteCommit).data.tree;
+    const pos = existing ? existing.position(id) : -1;
+    if (pos >= 0) return (existing as CommitGraph).treeAt(pos);
+    reads.commits++;
+    return (await readCommitData(objects, id))?.tree;
+  };
   for (const i of order) {
     const c = commits[i] as WriteCommit;
     const pos = existing ? existing.position(c.id) : -1;
@@ -772,56 +810,173 @@ async function computeFilters(
     }
     if (computed >= limit) continue;
     const parent = c.data.parents[0];
-    const parentTree = parent ? await trees.commitTree(parent) : undefined;
-    const paths = await changedPaths(trees, parentTree, c.data.tree, settings.maxChangedPaths);
+    const parentTree = parent ? await commitTree(parent) : undefined;
+    const found = changedPaths(trees, parentTree, c.data.tree, settings.maxChangedPaths);
+    const paths = found instanceof Promise ? await found : found;
     filters[i] = paths ? computeBloomFilter(paths, settings) : Uint8Array.of(0xff);
     computed++;
   }
+  reads.trees += trees.reads;
   return filters;
 }
 
-/** A tree entry: raw name bytes, mode, id. */
-interface RawEntry {
-  name: Uint8Array;
-  key: string;
-  mode: number;
-  id: string;
-}
+const EMPTY = new Uint8Array(0);
 
-/** Reads raw trees (and commit trees) for the filters. */
+/** How many raw trees `TreeReader` keeps (a commit's diff mostly reads its parent's trees). */
+const TREE_CACHE_SIZE = 4096;
+
+/** The bytes of raw trees `TreeReader` keeps at most (besides the one just read). */
+const TREE_CACHE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Reads raw trees for the filters. Trees are kept as their bytes (the oldest dropped):
+ * consecutive commits share most of their trees, which git finds again in its delta
+ * base cache. A tree is never decoded: the diff walks its bytes.
+ */
 class TreeReader {
+  private readonly cache = new Map<ObjectId, Uint8Array>();
+  private cacheBytes = 0;
+  /** Trees read from the object database (for tests) */
+  reads = 0;
+
   constructor(private readonly objects: Pick<GitObjects, "get">) {}
 
-  async commitTree(id: ObjectId): Promise<ObjectId | undefined> {
-    const data = await readCommitData(this.objects, id);
-    return data?.tree;
+  /** The tree's bytes, without a promise when cached or held in memory by the store. */
+  tree(id: ObjectId): Uint8Array | Promise<Uint8Array> {
+    // first in, first out: a diff reads the trees of the commit just before it
+    const cached = this.cache.get(id);
+    if (cached) return cached;
+    this.reads++;
+    let obj: ReturnType<GitObjects["get"]> | Awaited<ReturnType<GitObjects["get"]>>;
+    try {
+      const objects = this.objects as Pick<GitObjects, "get" | "getNow">;
+      obj = objects.getNow ? objects.getNow(id) : objects.get(id);
+    } catch {
+      obj = undefined;
+    }
+    if (obj instanceof Promise) {
+      return obj.then(
+        (o) => this.loaded(id, o),
+        () => this.loaded(id, undefined),
+      );
+    }
+    return this.loaded(id, obj);
   }
 
-  async entries(id: ObjectId): Promise<RawEntry[]> {
-    const raw = await readRaw(this.objects, id);
-    if (!raw) throw new Error(`unable to read tree ${id}`);
-    if (raw.type === "commit") {
-      const tree = parseGraphCommit(raw.data, id).tree;
-      return this.entries(tree);
-    }
-    if (raw.type !== "tree") throw new Error(`object ${id} is not a tree`);
-    const out: RawEntry[] = [];
-    const d = raw.data;
-    let p = 0;
-    while (p < d.length) {
-      let mode = 0;
-      while (p < d.length && d[p] !== 0x20) mode = mode * 8 + ((d[p++] as number) - 0x30);
-      p++;
-      const start = p;
-      while (p < d.length && d[p] !== 0) p++;
-      const name = d.subarray(start, p);
-      p++;
-      const id = bytesToHex(d.subarray(p, p + HASH_SIZE));
-      p += HASH_SIZE;
-      out.push({ name, key: latin1(name), mode, id });
-    }
-    return out;
+  private loaded(
+    id: ObjectId,
+    obj: Awaited<ReturnType<GitObjects["get"]>>,
+  ): Uint8Array | Promise<Uint8Array> {
+    if (!obj) throw new Error(`unable to read tree ${id}`);
+    // the content is read to its end (not read again): a loose or packed object's reader
+    // (its file, its pooled inflater) is released when its iterator finishes
+    if (!obj.bytes) return objectBytes(obj).then((data) => this.keep(id, obj.type, data));
+    return this.keep(id, obj.type, obj.bytes);
   }
+
+  private keep(id: ObjectId, type: string, data: Uint8Array): Uint8Array | Promise<Uint8Array> {
+    if (type === "commit") return this.tree(parseGraphCommit(data, id).tree);
+    if (type !== "tree") throw new Error(`object ${id} is not a tree`);
+    this.cache.set(id, data);
+    this.cacheBytes += data.length;
+    while (this.cache.size > TREE_CACHE_SIZE || this.cacheBytes > TREE_CACHE_BYTES) {
+      const oldest = this.cache.keys().next().value as ObjectId;
+      if (oldest === id) break;
+      this.cacheBytes -= (this.cache.get(oldest) as Uint8Array).length;
+      this.cache.delete(oldest);
+    }
+    return data;
+  }
+}
+
+const isTree = (mode: number) => (mode & 0o170000) === 0o040000;
+
+/**
+ * A cursor over a raw tree's entries: `at` is where the current entry starts; `next()` reads
+ * its mode, where its name ends (the NUL, then the id) and moves `at` past it.
+ */
+class Entries {
+  at = 0;
+  mode = 0;
+  name = 0;
+  nul = 0;
+  constructor(readonly d: Uint8Array) {}
+  get done(): boolean {
+    return this.at >= this.d.length;
+  }
+  /** Decodes the entry at `at` (mode, name start, NUL). */
+  read(): void {
+    const d = this.d;
+    let p = this.at;
+    let mode = 0;
+    while (p < d.length && d[p] !== 0x20) mode = mode * 8 + ((d[p++] as number) - 0x30);
+    this.mode = mode;
+    this.name = ++p;
+    while (p < d.length && d[p] !== 0) p++;
+    this.nul = p;
+  }
+  skip(): void {
+    this.at = this.nul + 1 + HASH_SIZE;
+  }
+  nameBytes(): Uint8Array {
+    return this.d.subarray(this.name, this.nul);
+  }
+  id(): ObjectId {
+    return bytesToHex(this.d.subarray(this.nul + 1, this.nul + 1 + HASH_SIZE));
+  }
+}
+
+/**
+ * Whether the entries at the cursors are byte for byte the same (mode, name and id): the
+ * common case, settled in one pass without decoding either. When it returns true both
+ * cursors are past their entries.
+ */
+function sameRawEntry(a: Entries, b: Entries): boolean {
+  const da = a.d;
+  const db = b.d;
+  let pa = a.at;
+  let pb = b.at;
+  const la = da.length;
+  for (;;) {
+    if (pa >= la || pb >= db.length) return false;
+    const c = da[pa] as number;
+    if (c !== db[pb]) return false;
+    pa++;
+    pb++;
+    if (c === 0) break;
+  }
+  if (pa + HASH_SIZE > la || pb + HASH_SIZE > db.length) return false;
+  for (let k = 0; k < HASH_SIZE; k++) if (da[pa + k] !== db[pb + k]) return false;
+  a.at = pa + HASH_SIZE;
+  b.at = pb + HASH_SIZE;
+  return true;
+}
+
+/**
+ * git's base_name_compare of the decoded entries at two cursors: names byte by byte, a
+ * tree's name followed by "/".
+ */
+function compareEntries(a: Entries, b: Entries): number {
+  const ad = a.d;
+  const bd = b.d;
+  let pa = a.name;
+  let pb = b.name;
+  while (pa < a.nul && pb < b.nul) {
+    const d = (ad[pa] as number) - (bd[pb] as number);
+    if (d !== 0) return d;
+    pa++;
+    pb++;
+  }
+  const ca = pa < a.nul ? (ad[pa] as number) : isTree(a.mode) ? 0x2f : 0;
+  const cb = pb < b.nul ? (bd[pb] as number) : isTree(b.mode) ? 0x2f : 0;
+  return ca - cb;
+}
+
+/** Whether the decoded entries at two cursors (of one name) have the same mode and id. */
+function sameModeAndId(a: Entries, b: Entries): boolean {
+  if (a.mode !== b.mode) return false;
+  for (let k = 1; k <= HASH_SIZE; k++) if (a.d[a.nul + k] !== b.d[b.nul + k]) return false;
+  return true;
 }
 
 const latin1 = (b: Uint8Array) => {
@@ -830,19 +985,29 @@ const latin1 = (b: Uint8Array) => {
   return s;
 };
 
-const isTree = (mode: number) => (mode & 0o170000) === 0o040000;
-
 /**
  * The changed paths between two trees with every leading directory (git's diff_tree_oid with
  * `recursive`, then the path map of get_or_compute_bloom_filter); undefined when more than
- * `max` files changed (the "too large" filter).
+ * `max` files changed (the "too large" filter). The trees are walked side by side in git's
+ * tree order over their raw bytes: an entry the same on both sides (most of them) is skipped
+ * after one comparison of its bytes, and only differing subtrees are read.
  */
-async function changedPaths(
+function changedPaths(
   trees: TreeReader,
   from: ObjectId | undefined,
   to: ObjectId,
   max: number,
-): Promise<Uint8Array[] | undefined> {
+): Uint8Array[] | undefined | Promise<Uint8Array[] | undefined> {
+  return runSteps(changedPathsSteps(trees, from, to, max));
+}
+
+/** `changedPaths` for `runSteps`: it yields only for trees not in memory. */
+function* changedPathsSteps(
+  trees: TreeReader,
+  from: ObjectId | undefined,
+  to: ObjectId,
+  max: number,
+): Steps<Uint8Array[] | undefined> {
   const leaves: Uint8Array[] = [];
   const concat = (prefix: Uint8Array, name: Uint8Array) => {
     if (prefix.length === 0) return name;
@@ -853,45 +1018,77 @@ async function changedPaths(
     return out;
   };
   let tooMany = false;
-  const all = async (tree: ObjectId, prefix: Uint8Array) => {
-    for (const e of await trees.entries(tree)) {
-      if (tooMany) return;
-      const path = concat(prefix, e.name);
-      if (isTree(e.mode)) await all(e.id, path);
-      else leaves.push(path);
-      if (leaves.length > max) tooMany = true;
+  const leaf = (path: Uint8Array) => {
+    leaves.push(path);
+    if (leaves.length > max) tooMany = true;
+  };
+  const read = function* (id: ObjectId): Steps<Uint8Array> {
+    const t = trees.tree(id);
+    return t instanceof Promise ? ((yield t) as Uint8Array) : t;
+  };
+  // every file of a tree added or deleted
+  const all = function* (tree: ObjectId, prefix: Uint8Array): Steps<void> {
+    const e = new Entries(yield* read(tree));
+    while (!e.done && !tooMany) {
+      e.read();
+      const path = concat(prefix, e.nameBytes());
+      const sub = isTree(e.mode) ? e.id() : undefined;
+      e.skip();
+      if (sub) yield* all(sub, path);
+      else leaf(path);
     }
   };
-  const diff = async (a: ObjectId | undefined, b: ObjectId | undefined, prefix: Uint8Array) => {
-    if (tooMany) return;
-    const ea = a ? await trees.entries(a) : [];
-    const eb = b ? await trees.entries(b) : [];
-    const byName = new Map<string, { a?: RawEntry; b?: RawEntry }>();
-    for (const e of ea) byName.set(e.key, { a: e });
-    for (const e of eb) {
-      const slot = byName.get(e.key);
-      if (slot) slot.b = e;
-      else byName.set(e.key, { b: e });
-    }
-    for (const { a: x, b: y } of byName.values()) {
-      if (tooMany) return;
-      if (x && y && x.id === y.id && x.mode === y.mode) continue;
-      const name = (x ?? y) as RawEntry;
-      const path = concat(prefix, name.name);
-      const xt = x !== undefined && isTree(x.mode);
-      const yt = y !== undefined && isTree(y.mode);
-      if (xt && yt) {
-        await diff(x.id, y.id, path);
+  // the decoded entry at a cursor, on one side only: a file is a leaf, a tree's files are
+  const one = function* (e: Entries, prefix: Uint8Array): Steps<void> {
+    const path = concat(prefix, e.nameBytes());
+    const sub = isTree(e.mode) ? e.id() : undefined;
+    e.skip();
+    if (sub) yield* all(sub, path);
+    else leaf(path);
+  };
+  const diff = function* (a: ObjectId | undefined, b: ObjectId, prefix: Uint8Array): Steps<void> {
+    const ea = new Entries(a ? yield* read(a) : EMPTY);
+    const eb = new Entries(yield* read(b));
+    while (!tooMany) {
+      if (ea.done) {
+        if (eb.done) break;
+        eb.read();
+        yield* one(eb, prefix);
         continue;
       }
-      // a file (or nothing) against a tree: the tree's files are added or deleted
-      if (xt) await all(x.id, path);
-      if (yt) await all(y.id, path);
-      if ((x && !xt) || (y && !yt)) leaves.push(path);
-      if (leaves.length > max) tooMany = true;
+      if (eb.done) {
+        ea.read();
+        yield* one(ea, prefix);
+        continue;
+      }
+      if (sameRawEntry(ea, eb)) continue;
+      ea.read();
+      eb.read();
+      const cmp = compareEntries(ea, eb);
+      if (cmp < 0) {
+        yield* one(ea, prefix);
+      } else if (cmp > 0) {
+        yield* one(eb, prefix);
+      } else {
+        if (!sameModeAndId(ea, eb)) {
+          if (isTree(ea.mode) && isTree(eb.mode)) {
+            const path = concat(prefix, ea.nameBytes());
+            const subA = ea.id();
+            const subB = eb.id();
+            ea.skip();
+            eb.skip();
+            yield* diff(subA, subB, path);
+            continue;
+          }
+          // same name, both files (a tree sorts apart from a file of its name)
+          leaf(concat(prefix, eb.nameBytes()));
+        }
+        ea.skip();
+        eb.skip();
+      }
     }
   };
-  await diff(from, to, new Uint8Array(0));
+  yield* diff(from, to, EMPTY);
   if (tooMany) return undefined;
   const set = new Map<string, Uint8Array>();
   for (const leaf of leaves) {
@@ -899,7 +1096,8 @@ async function changedPaths(
     let path = leaf;
     for (;;) {
       const key = latin1(path);
-      if (!set.has(key)) set.set(key, path);
+      if (set.has(key)) break;
+      set.set(key, path);
       end = path.lastIndexOf(0x2f);
       if (end <= 0) break;
       path = path.subarray(0, end);
@@ -931,6 +1129,16 @@ class Writer {
   bytes(b: Uint8Array) {
     this.buf.set(b, this.at);
     this.at += b.length;
+  }
+  /** A 40-digit lowercase hex id as its 20 bytes. */
+  hex(id: string) {
+    const buf = this.buf;
+    for (let i = 0; i < 20; i++) {
+      const hi = id.charCodeAt(2 * i);
+      const lo = id.charCodeAt(2 * i + 1);
+      buf[this.at++] =
+        (((hi > 57 ? hi - 87 : hi - 48) << 4) | (lo > 57 ? lo - 87 : lo - 48)) & 0xff;
+    }
   }
 }
 
