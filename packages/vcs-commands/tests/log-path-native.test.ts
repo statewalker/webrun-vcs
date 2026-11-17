@@ -1,0 +1,273 @@
+/**
+ * `git log -- <path>` against native git: history simplification as revision.c does it
+ * (TREESAME commits hidden, a merge followed only to the parent it matches, commits in date
+ * order with ties in queue order), and the changed-path Bloom filters of the commit-graph
+ * asked before trees are compared. The repository is built with `git fast-import` (dates,
+ * merges, a file that becomes a directory, a mode change, a deletion and re-addition, a
+ * symlink, a non-ASCII name); each path's `git log --format=%H` must be what `LogCommand`
+ * yields, without a graph and with one that has filters, and with filters the counts of
+ * git's trace2 `bloom/statistics` must be ours. A last test guards the speed-up by counting
+ * tree reads with and without the filters.
+ */
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { Git, type LogCommand } from "../src/index.js";
+import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+
+const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
+
+/** A fast-import stream: three branches with merges, every kind of change the walk compares. */
+function history(): string {
+  const out: string[] = [];
+  let mark = 0;
+  let time = 1500000000;
+  const data = (s: string) => {
+    out.push(`data ${Buffer.byteLength(s)}\n${s}\n`);
+  };
+  const commit = (
+    ref: string,
+    message: string,
+    changes: string[],
+    opts: { from?: number; merge?: number[]; sameDate?: boolean } = {},
+  ): number => {
+    if (!opts.sameDate) time += 100;
+    out.push(`commit ${ref}\nmark :${++mark}\n`);
+    out.push(`author A U Thor <a@example.com> ${time} +0000\n`);
+    out.push(`committer C O Mitter <c@example.com> ${time} +0000\n`);
+    data(`${message}\n`);
+    if (opts.from) out.push(`from :${opts.from}\n`);
+    for (const m of opts.merge ?? []) out.push(`merge :${m}\n`);
+    for (const c of changes) {
+      if (c.startsWith("D ")) out.push(`${c}\n`);
+      else {
+        const [mode, path, content] = c.split("|") as [string, string, string];
+        out.push(`M ${mode} inline ${path}\n`);
+        data(content);
+      }
+    }
+    out.push("\n");
+    return mark;
+  };
+  const f = (path: string, content: string, mode = "100644") => `${mode}|${path}|${content}`;
+  let main = commit("refs/heads/main", "root", [
+    f("README", "readme\n"),
+    f("src/a.txt", "a0\n"),
+    f("src/lib/b.txt", "b0\n"),
+    f("doc/guide.txt", "g0\n"),
+    f("node", "a file at first\n"),
+  ]);
+  for (let i = 1; i <= 6; i++) {
+    main = commit("refs/heads/main", `main ${i}`, [f(`src/a.txt`, `a${i}\n`)], { from: main });
+  }
+  // a side branch changing src/lib, merged back: the merge matches its second parent there
+  let side = commit("refs/heads/side", "side 1", [f("src/lib/b.txt", "b-side1\n")], {
+    from: main - 3,
+  });
+  side = commit("refs/heads/side", "side 2", [f("src/lib/c.txt", "c-side\n")], { from: side });
+  main = commit("refs/heads/main", "main touches doc", [f("doc/guide.txt", "g1\n")], {
+    from: main,
+  });
+  main = commit("refs/heads/main", "merge side", [], { from: main, merge: [side] });
+  // an evil merge: different from both parents at src/lib/b.txt
+  let topic = commit("refs/heads/topic", "topic 1", [f("src/lib/b.txt", "b-topic\n")], {
+    from: main,
+  });
+  main = commit("refs/heads/main", "main changes b", [f("src/lib/b.txt", "b-main\n")], {
+    from: main,
+  });
+  main = commit("refs/heads/main", "evil merge", [f("src/lib/b.txt", "b-evil\n")], {
+    from: main,
+    merge: [topic],
+  });
+  // a file becomes a directory, a mode change, a symlink, a deletion and re-addition
+  main = commit("refs/heads/main", "node becomes a directory", ["D node", f("node/x", "x\n")], {
+    from: main,
+  });
+  main = commit("refs/heads/main", "make a.txt executable", [f("src/a.txt", "a6\n", "100755")], {
+    from: main,
+  });
+  main = commit("refs/heads/main", "link", [f("src/link", "a.txt", "120000")], { from: main });
+  main = commit("refs/heads/main", "remove doc", ["D doc/guide.txt"], { from: main });
+  main = commit("refs/heads/main", "doc back", [f("doc/guide.txt", "g2\n")], { from: main });
+  main = commit("refs/heads/main", "non-ascii", [f("doc/café.txt", "café\n")], {
+    from: main,
+  });
+  // commits of one date on two branches merged: ties come out in queue order
+  topic = commit("refs/heads/topic", "topic 2", [f("src/a.txt", "a-topic\n")], { from: main });
+  const tie = commit("refs/heads/topic", "topic 3", [f("README", "readme 2\n")], {
+    from: topic,
+    sameDate: false,
+  });
+  main = commit("refs/heads/main", "main same date", [f("src/a.txt", "a-main\n")], {
+    from: main,
+    sameDate: true,
+  });
+  main = commit("refs/heads/main", "merge topic", [f("src/a.txt", "a-merged\n")], {
+    from: main,
+    merge: [tie],
+  });
+  for (let i = 0; i < 40; i++) {
+    main = commit("refs/heads/main", `filler ${i}`, [f(`src/gen/g${i % 7}.txt`, `${i}\n`)], {
+      from: main,
+    });
+  }
+  return out.join("");
+}
+
+const PATHS = [
+  "src/a.txt",
+  "src/lib/b.txt",
+  "src/lib",
+  "src/lib/",
+  "src",
+  "doc/guide.txt",
+  "doc/café.txt",
+  "node",
+  "node/x",
+  "src/link",
+  "README",
+  "src/gen/g3.txt",
+  "missing/path",
+];
+
+describeGit("log -- <path> against native git", () => {
+  let root: string;
+  let dir: string;
+  const env = () => nativeGitEnv(root);
+  const git = (args: string[], extraEnv: Record<string, string> = {}, input?: string) =>
+    execFileSync("git", args, {
+      cwd: dir,
+      env: { ...env(), ...extraEnv },
+      encoding: "utf8",
+      input,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-path-native-"));
+    dir = join(root, "repo");
+    execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+    git(["fast-import", "--quiet"], {}, history());
+    git(["checkout", "-q", "main"]);
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  async function open(): Promise<Git> {
+    const files = createNodeFilesApi({ rootDir: dir });
+    const environment = createNodeGitHostEnvironment({ env: env() });
+    const { history } = await createGitFilesBackend({ files });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history, environment });
+    return Git.fromWorkingCopy(await worktrees.openCurrent());
+  }
+
+  async function ours(
+    paths: string[],
+    configure: (c: LogCommand) => LogCommand = (c) => c,
+  ): Promise<{ ids: string[]; command: LogCommand }> {
+    let command = (await open()).log();
+    for (const p of paths) command = command.addPath(p);
+    command = configure(command);
+    const ids: string[] = [];
+    for await (const c of await command.call()) ids.push(c.id);
+    return { ids, command };
+  }
+
+  const native = (paths: string[], args: string[] = []) =>
+    git(["log", "--format=%H", ...args, "--", ...paths])
+      .split("\n")
+      .filter(Boolean);
+
+  /** git's trace2 bloom statistics of a `git log`. */
+  function nativeBloom(paths: string[], args: string[] = []) {
+    const trace = join(root, "trace2.json");
+    rmSync(trace, { force: true });
+    git(["log", "--format=%H", ...args, "--", ...paths], { GIT_TRACE2_EVENT: trace });
+    const line = readFileSync(trace, "utf8")
+      .split("\n")
+      .find((l) => l.includes('"category":"bloom"') && l.includes('"key":"statistics"'));
+    const value = line ? JSON.parse(line).value : undefined;
+    return typeof value === "string" ? JSON.parse(value) : value;
+  }
+
+  /** Whether native git asks a root commit's filter (rev_same_tree_as_empty; not in 2.43). */
+  function rootFilters(): boolean {
+    const m = /(\d+)\.(\d+)/.exec(git(["--version"]));
+    return !!m && (Number(m[1]) > 2 || Number(m[2]) >= 50);
+  }
+
+  function removeGraph() {
+    rmSync(join(dir, ".git/objects/info/commit-graph"), { force: true });
+    rmSync(join(dir, ".git/objects/info/commit-graphs"), { recursive: true, force: true });
+  }
+
+  it("lists what native git lists, without a commit-graph", async () => {
+    removeGraph();
+    for (const path of PATHS) {
+      expect([path, (await ours([path])).ids]).toEqual([path, native([path])]);
+    }
+    const two = ["src/lib/c.txt", "doc"];
+    expect((await ours(two)).ids).toEqual(native(two));
+    expect((await ours(["src/a.txt"], (c) => c.setFirstParent(true))).ids).toEqual(
+      native(["src/a.txt"], ["--first-parent"]),
+    );
+  });
+
+  it("lists the same with changed-path filters, with git's Bloom statistics", async () => {
+    removeGraph();
+    git(["commit-graph", "write", "--reachable", "--changed-paths"]);
+    for (const path of PATHS) {
+      const { ids, command } = await ours([path]);
+      expect([path, ids]).toEqual([path, native([path])]);
+      const s = command.getStatistics();
+      const n = nativeBloom([path]);
+      const mine = [s.bloomNotPresent, s.bloomMaybe, s.bloomDefinitelyNot, s.bloomFalsePositive];
+      const theirs = [n.filter_not_present, n.maybe, n.definitely_not, n.false_positive];
+      if (rootFilters()) {
+        expect([path, ...mine]).toEqual([path, ...theirs]);
+      } else {
+        // git before 2.5x compares a root commit with the empty tree without its filter: one
+        // check less (a "maybe" or a "definitely not"), all else the same
+        expect([path, s.bloomNotPresent, s.bloomFalsePositive]).toEqual([
+          path,
+          n.filter_not_present,
+          n.false_positive,
+        ]);
+        expect([path, s.bloomMaybe + s.bloomDefinitelyNot]).toEqual([
+          path,
+          n.maybe + n.definitely_not + 1,
+        ]);
+        expect(s.bloomMaybe - n.maybe === 1 || s.bloomDefinitelyNot - n.definitely_not === 1).toBe(
+          true,
+        );
+      }
+    }
+    const two = ["src/lib/c.txt", "doc"];
+    expect((await ours(two)).ids).toEqual(native(two));
+  });
+
+  it("reads far fewer trees with the filters (counted, not timed)", async () => {
+    removeGraph();
+    git(["commit-graph", "write", "--reachable", "--changed-paths"]);
+    const path = "src/lib/b.txt";
+    const withFilters = await ours([path]);
+    const without = await ours([path], (c) => c.setUseBloomFilters(false));
+    expect(withFilters.ids).toEqual(without.ids);
+    const a = withFilters.command.getStatistics();
+    const b = without.command.getStatistics();
+    // every first-parent comparison of a commit that did not touch the path is settled by
+    // its filter: only the few that did (and merges' other parents) read trees
+    expect(a.bloomDefinitelyNot).toBeGreaterThan(50);
+    expect(b.bloomDefinitelyNot).toBe(0);
+    expect(a.treeComparisons).toBeLessThan(b.treeComparisons / 5);
+    expect(a.treeEntryReads).toBeLessThan(b.treeEntryReads / 5);
+  });
+});
