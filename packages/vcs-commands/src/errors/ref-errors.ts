@@ -46,6 +46,23 @@ export class RefNotFoundError extends GitApiError {
 }
 
 /**
+ * Thrown where git dies while interpreting a revision, its message git's `fatal:` line:
+ * `@{upstream}` of a branch without one (`fatal: no upstream configured for branch 'x'`),
+ * `@{u}` on a detached HEAD (`fatal: HEAD does not point to a branch`), `@{push}` that has
+ * no destination, `<ref>@{<n>}` beyond the reflog (`fatal: log for 'x' only has 2 entries`).
+ * Unlike {@link RefNotFoundError}, no command takes it for "not a revision".
+ */
+export class RevisionError extends GitApiError {
+  readonly revision: string;
+
+  constructor(revision: string, message: string) {
+    super(message);
+    this.name = "RevisionError";
+    this.revision = revision;
+  }
+}
+
+/**
  * Thrown when trying to delete the current branch.
  *
  * Based on JGit's CannotDeleteCurrentBranchException.

@@ -522,3 +522,335 @@ export function parseGitDate(text: string): { timestamp: number; tzOffset: strin
   }
   return { timestamp, tzOffset: formatOffset(offset) };
 }
+
+/* ------------------------------------------------------------------ approxidate */
+
+/** git's `struct tm` as `approxidate_str` fills it: local fields, -1 where not seen yet. */
+interface ApproxTm extends Tm {
+  wday: number;
+}
+
+/** `localtime_r`: the local fields of `seconds`. */
+function localtime(seconds: number): ApproxTm {
+  const d = new Date(seconds * 1000);
+  return {
+    year: d.getFullYear() - 1900,
+    mon: d.getMonth(),
+    mday: d.getDate(),
+    hour: d.getHours(),
+    min: d.getMinutes(),
+    sec: d.getSeconds(),
+    wday: d.getDay(),
+  };
+}
+
+/** `mktime`: the local fields as seconds since the epoch, out-of-range fields carried. */
+function mktime(tm: Tm): number {
+  const d = new Date(2000, 0, 1, 0, 0, 0);
+  d.setFullYear(tm.year + 1900, tm.mon, tm.mday);
+  d.setHours(tm.hour, tm.min, tm.sec);
+  return Math.floor(d.getTime() / 1000);
+}
+
+/** git's `update_tm`: the missing fields from `now`, `sec` seconds back; `tm` refilled. */
+function updateTm(tm: ApproxTm, now: ApproxTm, sec: number): number {
+  let back = sec;
+  if (tm.mday < 0) {
+    const offset = tm.mday + 1;
+    if (back === 0 && offset < 0) back = -offset * 24 * 60 * 60;
+    tm.mday = now.mday;
+  }
+  if (tm.mon < 0) tm.mon = now.mon;
+  if (tm.year < 0) {
+    tm.year = now.year;
+    if (tm.mon > now.mon) tm.year--;
+  }
+  const n = mktime(tm) - back;
+  Object.assign(tm, localtime(n));
+  return n;
+}
+
+/** git's `pending_number`: a number seen last is a day, a month or a year. */
+function pendingNumber(tm: ApproxTm, num: { value: number }): void {
+  const number = num.value;
+  if (!number) return;
+  num.value = 0;
+  if (tm.mday < 0 && number < 32) tm.mday = number;
+  else if (tm.mon < 0 && number < 13) tm.mon = number - 1;
+  else if (tm.year < 0) {
+    if (number > 1969 && number < 2100) tm.year = number - 1900;
+    else if (number > 69 && number < 100) tm.year = number;
+    else if (number < 38) tm.year = 100 + number;
+  }
+}
+
+/** git's `date_time`: `hour` o'clock, yesterday's when today's is still to come. */
+function dateTime(tm: ApproxTm, hour: number): void {
+  if (tm.mday < 0 && tm.hour < hour) tm.mday = -2;
+  tm.hour = hour;
+  tm.min = 0;
+  tm.sec = 0;
+}
+
+type Special = (tm: ApproxTm, now: ApproxTm, num: { value: number }) => void;
+
+/** git's `special` words. */
+const SPECIALS: [string, Special][] = [
+  [
+    "yesterday",
+    (tm, now, num) => {
+      num.value = 0;
+      tm.mday = -1;
+      updateTm(tm, now, 24 * 60 * 60);
+    },
+  ],
+  [
+    "noon",
+    (tm, _now, num) => {
+      pendingNumber(tm, num);
+      dateTime(tm, 12);
+    },
+  ],
+  [
+    "midnight",
+    (tm, _now, num) => {
+      pendingNumber(tm, num);
+      dateTime(tm, 0);
+    },
+  ],
+  [
+    "tea",
+    (tm, _now, num) => {
+      pendingNumber(tm, num);
+      dateTime(tm, 17);
+    },
+  ],
+  [
+    "PM",
+    (tm, _now, num) => {
+      let hour = tm.hour;
+      if (num.value) {
+        hour = num.value;
+        tm.min = 0;
+        tm.sec = 0;
+      }
+      num.value = 0;
+      tm.hour = (hour % 12) + 12;
+    },
+  ],
+  [
+    "AM",
+    (tm, _now, num) => {
+      let hour = tm.hour;
+      if (num.value) {
+        hour = num.value;
+        tm.min = 0;
+        tm.sec = 0;
+      }
+      num.value = 0;
+      tm.hour = hour % 12;
+    },
+  ],
+  [
+    "never",
+    (tm, _now, num) => {
+      Object.assign(tm, localtime(0));
+      num.value = 0;
+    },
+  ],
+  [
+    "now",
+    (tm, now, num) => {
+      num.value = 0;
+      updateTm(tm, now, 0);
+    },
+  ],
+  [
+    "today",
+    (tm, now, num) => {
+      if (tm.hour === now.hour && tm.min === now.min && tm.sec === now.sec) dateTime(tm, 0);
+      num.value = 0;
+      tm.mday = -1;
+      updateTm(tm, now, 0);
+    },
+  ],
+];
+
+const NUMBER_NAMES = [
+  "zero",
+  "one",
+  "two",
+  "three",
+  "four",
+  "five",
+  "six",
+  "seven",
+  "eight",
+  "nine",
+  "ten",
+];
+
+const TYPE_LENGTHS: [string, number][] = [
+  ["seconds", 1],
+  ["minutes", 60],
+  ["hours", 60 * 60],
+  ["days", 24 * 60 * 60],
+  ["weeks", 7 * 24 * 60 * 60],
+];
+
+/** git's `approxidate_alpha`: a word; returns where it ends. */
+function approxidateAlpha(
+  s: string,
+  i: number,
+  tm: ApproxTm,
+  now: ApproxTm,
+  num: { value: number },
+  touched: { value: boolean },
+): number {
+  let end = i + 1;
+  while (isAlpha(s[end])) end++;
+  for (let m = 0; m < 12; m++) {
+    if (matchString(s, i, MONTH_NAMES[m] ?? "") >= 3) {
+      tm.mon = m;
+      touched.value = true;
+      return end;
+    }
+  }
+  for (const [name, fn] of SPECIALS) {
+    if (matchString(s, i, name) === name.length) {
+      fn(tm, now, num);
+      touched.value = true;
+      return end;
+    }
+  }
+  if (!num.value) {
+    for (let n = 1; n < 11; n++) {
+      const name = NUMBER_NAMES[n] ?? "";
+      if (matchString(s, i, name) === name.length) {
+        num.value = n;
+        touched.value = true;
+        return end;
+      }
+    }
+    if (matchString(s, i, "last") === 4) {
+      num.value = 1;
+      touched.value = true;
+    }
+    return end;
+  }
+  for (const [type, length] of TYPE_LENGTHS) {
+    if (matchString(s, i, type) >= type.length - 1) {
+      updateTm(tm, now, length * num.value);
+      num.value = 0;
+      touched.value = true;
+      return end;
+    }
+  }
+  for (let w = 0; w < 7; w++) {
+    if (matchString(s, i, WEEKDAY_NAMES[w] ?? "") >= 3) {
+      let n = num.value - 1;
+      num.value = 0;
+      let diff = tm.wday - w;
+      if (diff <= 0) n++;
+      diff += 7 * n;
+      updateTm(tm, now, diff * 24 * 60 * 60);
+      touched.value = true;
+      return end;
+    }
+  }
+  if (matchString(s, i, "months") >= 5) {
+    updateTm(tm, now, 0);
+    let n = tm.mon - num.value;
+    num.value = 0;
+    while (n < 0) {
+      n += 12;
+      tm.year--;
+    }
+    tm.mon = n;
+    touched.value = true;
+    return end;
+  }
+  if (matchString(s, i, "years") >= 4) {
+    updateTm(tm, now, 0);
+    tm.year -= num.value;
+    num.value = 0;
+    touched.value = true;
+    return end;
+  }
+  return end;
+}
+
+/** git's `approxidate_digit`: a number, or a date or time written with numbers. */
+function approxidateDigit(s: string, i: number, tm: ApproxTm, num: { value: number }): number {
+  const { value: number, end } = digitsAt(s, i);
+  if (":./-".includes(s[end] ?? "x") && isDigit(s[end + 1])) {
+    const match = matchMultiNumber(number, s[end] ?? "", s, i, end, tm);
+    if (match) return i + match;
+  }
+  // zero-padding only for small numbers ("Dec 02", never "Dec 0002")
+  if (s[i] !== "0" || end - i <= 2) num.value = toInt(number);
+  return end;
+}
+
+/**
+ * git's `approxidate_careful`: a date as `parse_date` reads it, else git's approximate
+ * forms (`yesterday`, `2.weeks.ago`, `noon`, `last friday`, `3 hours ago`, `Dec 6`), in
+ * local time relative to `now` (seconds, default the current time). `error` is set when
+ * nothing in the text was a date (git then rejects `<ref>@{<text>}`).
+ *
+ * @example
+ * ```typescript
+ * approxidateCareful("1700000000 +0000"); // { timestamp: 1700000000, error: false }
+ * approxidateCareful("2.hours.ago");      // { timestamp: now - 7200, error: false }
+ * approxidateCareful("blah");             // { error: true, ... }
+ * ```
+ */
+export function approxidateCareful(
+  text: string,
+  now: number = Math.floor(Date.now() / 1000),
+): { timestamp: number; error: boolean } {
+  const parsed = parseGitDate(text);
+  if (parsed) return { timestamp: parsed.timestamp, error: false };
+  const nowTm = localtime(now);
+  const tm: ApproxTm = { ...nowTm, year: -1, mon: -1, mday: -1 };
+  const num = { value: 0 };
+  const touched = { value: false };
+  const s = text.split("\0")[0] ?? "";
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (isDigit(c)) {
+      pendingNumber(tm, num);
+      i = approxidateDigit(s, i, tm, num);
+      touched.value = true;
+      continue;
+    }
+    if (isAlpha(c)) {
+      i = approxidateAlpha(s, i, tm, nowTm, num, touched);
+      continue;
+    }
+    i++;
+  }
+  pendingNumber(tm, num);
+  return { timestamp: updateTm(tm, nowTm, 0), error: !touched.value };
+}
+
+const SHORT_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const SHORT_MONTHS = MONTH_NAMES.map((m) => m.slice(0, 3));
+
+/**
+ * A timestamp in git's RFC 2822 date mode (`show_date(..., DATE_RFC2822)`), in the given
+ * offset: `Thu, 7 Apr 2005 22:13:13 +0000`.
+ */
+export function formatRfc2822Date(timestamp: number, tzOffset: string): string {
+  const sign = tzOffset.startsWith("-") ? -1 : 1;
+  const digits = tzOffset.replace(/^[+-]/, "").padStart(4, "0");
+  const minutes = sign * (Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2, 4)));
+  const d = new Date((timestamp + minutes * 60) * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${SHORT_WEEKDAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${SHORT_MONTHS[d.getUTCMonth()]} ` +
+    `${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:` +
+    `${pad(d.getUTCSeconds())} ${formatOffset(minutes)}`
+  );
+}

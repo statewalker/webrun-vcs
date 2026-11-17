@@ -83,6 +83,19 @@ export class TagCommand extends GitCommand<Ref> {
   }
 
   /**
+   * Add a paragraph to the message, as each further `-m` of `git tag` does: joined to the
+   * message so far by a blank line (`-m a -m b` is `"a\n\nb"` before its cleanup). The
+   * first call is {@link setMessage}.
+   *
+   * @param message One paragraph of the tag message
+   */
+  addMessage(message: string): this {
+    this.checkCallable();
+    this.message = this.message === undefined ? message : `${this.message}\n\n${message}`;
+    return this;
+  }
+
+  /**
    * How the message is cleaned up (git's `tag --cleanup=<mode>`): `strip` (the default),
    * `whitespace` (comment lines kept) or `verbatim` (the message as given, no newline
    * added). `default` and `scissors` are refused, as git refuses them for a tag

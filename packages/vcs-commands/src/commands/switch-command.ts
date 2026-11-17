@@ -21,6 +21,7 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   BranchUsedByWorktreeError,
   InvalidRefNameError,
+  RevisionError,
   SwitchRefusedError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -46,7 +47,7 @@ const DETACH_HINT =
  * - `setOrphan(<new>)`: an unborn branch with an empty index and worktree.
  *
  * Refused while a merge, rebase, cherry-pick or revert is in progress (`fatal: cannot
- * switch branch while merging ...`). `--merge` (`-m`) is not supported.
+ * switch branch while merging ...`). `setMerge(true)` (`-m`) carries local changes over.
  */
 export class SwitchCommand extends GitCommand<CheckoutResult> {
   private name?: string;
@@ -59,6 +60,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
   private discardChanges = false;
   private force = false;
   private ignoreOtherWorktrees = false;
+  private merge = false;
 
   /**
    * The branch to switch to; with `-c`/`-C` the start point, with `--detach` the commit.
@@ -160,6 +162,18 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
+  /**
+   * `-m` / `--merge` (git 2.55+): local changes the switch would lose are carried over
+   * through an autostash, conflicts labelled `<branch>` and `local`; see
+   * `CheckoutCommand.setMerge` for the result. Refused with `-f` (`fatal: '-f' cannot be
+   * used with '-m'`) and `--discard-changes`.
+   */
+  setMerge(merge: boolean): this {
+    this.checkCallable();
+    this.merge = merge;
+    return this;
+  }
+
   /** `--ignore-other-worktrees`: switch to a branch another worktree has checked out. */
   setIgnoreOtherWorktrees(ignore: boolean): this {
     this.checkCallable();
@@ -223,7 +237,10 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     // the commit to detach at must name a commit. `-` is @{-1}, and @{-N} is expanded once,
     // the switch itself handed the expanded name
     const arg = this.name === "-" ? "@{-1}" : this.name;
-    const name = arg === undefined ? undefined : await this.expandPriorCheckout(arg);
+    const name =
+      arg === undefined
+        ? undefined
+        : await this.interpretLocalBranch(await this.expandPriorCheckout(arg));
     if (arg !== undefined && name !== undefined) {
       if (created === undefined && !this.detach) {
         await this.checkBranchArgument(arg, name);
@@ -232,19 +249,28 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       }
     }
 
+    // checkout_branch: the options that do not go with --merge
+    if (this.merge && this.force) {
+      throw new SwitchRefusedError("fatal: '-f' cannot be used with '-m'");
+    }
+    if (this.merge && this.discardChanges) {
+      throw new SwitchRefusedError("fatal: '--discard-changes' cannot be used with '--merge'");
+    }
+
     await this.refuseInProgress();
 
     const checkout = new CheckoutCommand(this._workingCopy)
       .setForced(this.force || this.discardChanges)
       .setProtectUntracked(!this.force)
       .setIgnoreOtherWorktrees(this.ignoreOtherWorktrees)
-      .setTrack(this.track);
+      .setTrack(this.track)
+      .setMerge(this.merge);
     if (this.guess !== undefined) checkout.setGuess(this.guess);
     if (this.hasReflogAction()) checkout.setReflogAction(this.reflogAction("checkout"));
     if (this.orphan !== undefined) {
       checkout.setOrphan(true).setOrphanFromEmptyTree(true).setName(this.orphan);
     } else if (newBranch !== undefined) {
-      checkout.setCreateBranch(true).setName(newBranch);
+      checkout.setForceCreateBranch(this.forceCreate).setCreateBranch(true).setName(newBranch);
       if (name !== undefined) checkout.setStartPoint(name);
     } else {
       if (this.detach) checkout.setDetach(true);
@@ -279,8 +305,9 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     try {
       const id = await this.resolveRef(name);
       if (await this.commits.has(id)) commit = id;
-    } catch {
-      // not a revision
+    } catch (error) {
+      // not a revision; where git dies reading it (`@{u}` without upstream), its message
+      if (error instanceof RevisionError) throw error;
     }
     if (commit === undefined) {
       const configured = RemoteConfigStore.from(this.workingCopy).value("checkout.guess");
@@ -298,13 +325,17 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     try {
       const id = await this.resolveRef(name);
       return await this.commits.has(id);
-    } catch {
+    } catch (error) {
+      if (error instanceof RevisionError) throw error;
       return false;
     }
   }
 
   /** git's die_expecting_a_branch: what `name` is, by the ref it dwims to. */
-  private async expectedABranch(name: string): Promise<string> {
+  private async expectedABranch(given: string): Promise<string> {
+    // dwim_ref reads the branch syntax first (`@{u}` is the upstream's ref)
+    const interpreted = await this.revisionResolver().interpretBranchName(given);
+    const name = interpreted?.replace(/^refs\//, "") ?? given;
     const candidates = [
       name,
       `refs/${name}`,
@@ -326,7 +357,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       }
       return `a branch is expected, got '${ref}'`;
     }
-    return `a branch is expected, got commit '${name}'`;
+    return `a branch is expected, got commit '${given}'`;
   }
 
   /** git's die_if_some_operation_in_progress (switch only). */

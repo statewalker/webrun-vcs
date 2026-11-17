@@ -97,6 +97,9 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
   private restoreUntracked = true;
   private strategy = MergeStrategy.RECURSIVE;
   private contentStrategy?: ContentMergeStrategy;
+  private labelOurs = "Updated upstream";
+  private labelTheirs = "Stashed changes";
+  private labelBase = "Stash base";
 
   /**
    * Set the stash reference to apply.
@@ -167,6 +170,25 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
   setIgnoreRepositoryState(_ignore: boolean): this {
     this.checkCallable();
     // Not currently implemented - reserved for future use
+    return this;
+  }
+
+  /**
+   * The conflict markers' labels (git 2.5x's `stash apply --label-ours=<label>`,
+   * `--label-theirs=<label>`, `--label-base=<label>`): default `Updated upstream` (the
+   * current index), `Stashed changes` (the stash) and `Stash base` (diff3's base).
+   *
+   * @example
+   * ```typescript
+   * // as `git checkout -m feat` applies its autostash
+   * await git.stashApply().setStashRef(id).setLabels({ ours: "feat", theirs: "local", base: "main" }).call();
+   * ```
+   */
+  setLabels(labels: { ours?: string; theirs?: string; base?: string }): this {
+    this.checkCallable();
+    if (labels.ours !== undefined) this.labelOurs = labels.ours;
+    if (labels.theirs !== undefined) this.labelTheirs = labels.theirs;
+    if (labels.base !== undefined) this.labelBase = labels.base;
     return this;
   }
 
@@ -564,9 +586,9 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     conflicts: Map<string, MergeConflict>;
   }> {
     const { result, conflicts } = await ortMerge(this.blobs, baseIn, oursIn, theirsIn, {
-      oursLabel: "Updated upstream",
-      theirsLabel: "Stashed changes",
-      baseLabel: "Stash base",
+      oursLabel: this.labelOurs,
+      theirsLabel: this.labelTheirs,
+      baseLabel: this.labelBase,
       style: conflictStyleOf(this.workingCopy),
       ignoreCase,
       ...ortConfigOptions(this.workingCopy, this.worktreeAccess),

@@ -38,6 +38,7 @@ import {
   RenameBranchCommand,
   ResetCommand,
   RevertCommand,
+  RevParseCommand,
   RmCommand,
   StashApplyCommand,
   StashCreateCommand,
@@ -519,6 +520,22 @@ export class Git implements Disposable {
   rm(): RmCommand {
     this.checkClosed();
     return new RmCommand(this._workingCopy);
+  }
+
+  // ============ Revision Operations ============
+
+  /**
+   * Create a RevParseCommand (`git rev-parse --verify <rev>`): the object a revision names.
+   *
+   * @example
+   * ```typescript
+   * const { objectId } = await git.revParse().setRevision("@{u}").call();
+   * const { objectId: blob } = await git.revParse().setRevision("HEAD:README.md").call();
+   * ```
+   */
+  revParse(): RevParseCommand {
+    this.checkClosed();
+    return new RevParseCommand(this._workingCopy);
   }
 
   // ============ Describe Operations ============

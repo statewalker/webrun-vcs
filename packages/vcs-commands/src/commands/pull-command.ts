@@ -321,7 +321,7 @@ export class PullCommand extends TransportCommand<PullResult> {
       .replace(/\.git$/, "");
     const into =
       localBranchName === "main" || localBranchName === "master" ? "" : ` into ${localBranchName}`;
-    mergeCommand.setMessage(`Merge branch '${remoteBranch}' of ${url}${into}\n`);
+    mergeCommand.setMessage(`Merge branch '${remoteBranch}' of ${url}${into}`);
     mergeCommand.setReflogAction(action);
     if (canFastForward) mergeCommand.setFastForwardMode(FastForwardMode.FF_ONLY);
     // run_merge passes --autostash / --no-autostash only when pull has one to give
