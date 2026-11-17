@@ -1181,11 +1181,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   private async isAncestor(a: ObjectId, b: ObjectId): Promise<boolean> {
-    if (a === b) return true;
-    for await (const commitId of this.commits.walkAncestry([b])) {
-      if (commitId === a) return true;
-    }
-    return false;
+    // the store's walk: commit-graph generations cut it short
+    return this.commits.isAncestor(a, b);
   }
 }
 

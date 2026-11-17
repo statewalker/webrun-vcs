@@ -8,6 +8,8 @@
  * - Maintenance: repack(), gc(), FileGcStrategy
  */
 
+// The commit-graph: settings, provider, writeCommitGraph
+export * from "./commit-graph.js";
 // Factory functions
 export * from "./create-git-files-backend.js";
 export * from "./create-git-files-history-with-ops.js";

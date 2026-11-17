@@ -437,9 +437,24 @@ Blobs have no internal structure to parse. They're stored as-is with a Git heade
 | `commit-format.ts` | Serialization/deserialization |
 
 Key algorithms:
-- **walkAncestry**: Breadth-first traversal through parent links
-- **findMergeBase**: Common ancestor detection for three-way merges
-- **isAncestor**: Reachability test between commits
+- **walkAncestry**: Depth-first traversal through parent links
+- **findMergeBase**: git's merge bases (`commit-reach.ts`: `paint_down_to_common`, redundant bases removed), best first
+- **isAncestor**: Reachability test between commits (git's `repo_in_merge_bases`)
+
+With a commit-graph (`createCommits(objects, { commitGraph })`), parents, trees, dates and generation numbers of the commits it has come from the graph, not from the commits (`getHeader`); generations cut ancestry and redundancy walks short. They do so only while `CommitGraph.generationsTrusted`: checked once over the whole graph on first use, it fails for zero topological levels (git before 2.18, which git reads as GENERATION_NUMBER_INFINITY), a corrupt record, or a generation not above a parent's (git 2.43 truncates parent generations past 2^32). Every generation is then Infinity: the walks neither cut nor reorder, and give a full walk's answer. A record that turns out corrupt is read from the commit itself.
+
+#### history/commit-graph/
+
+| File | Purpose |
+|------|---------|
+| `commit-graph-format.ts` | One graph file (layer): chunks, git's load checks and messages |
+| `commit-graph.ts` | `CommitGraph`: a chain of layers, commits by global position |
+| `commit-graph-reader.ts` | `readCommitGraph`: `info/commit-graph` or the split chain |
+| `commit-graph-writer.ts` | `writeCommitGraphFile`: byte-identical to `git commit-graph write` |
+| `commit-graph-verify.ts` | `verifyCommitGraph`: `git commit-graph verify` |
+| `commit-graph-provider.ts` | Lazy loading, `core.commitGraph` and `commitGraphCompatible` (replace refs, grafts, shallow) |
+| `bloom-filter.ts` | Changed-path Bloom filters (murmur3, hash versions 1 and 2) |
+| `graph-commit-parse.ts` | A commit's tree, parents and date as git's `parse_commit_buffer` reads them |
 
 #### history/trees/
 

@@ -34,6 +34,7 @@ import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import { collect } from "@statewalker/vcs-utils/streams";
 import type {
   AttributesIndex,
+  GitHostEnvironment,
   IgnoreManager,
   NestedRepositoryState,
   NewHasher,
@@ -95,6 +96,11 @@ export interface FileWorktreeOptions {
    * (default: SHA-1, `createSha1`).
    */
   newHasher?: NewHasher;
+  /**
+   * The user's environment: a submodule opened with `openGitlink` reads the system and
+   * global config files through it (its commit-graph settings among them), as git does
+   */
+  environment?: GitHostEnvironment;
 }
 
 /**
@@ -122,6 +128,7 @@ export class FileWorktree implements Worktree {
   private readonly gitDir?: string;
   private readonly globalExcludesFile?: string;
   private readonly newHasher: NewHasher;
+  private readonly environment?: GitHostEnvironment;
   private repositoryExcludesLoaded = false;
 
   constructor(options: FileWorktreeOptions) {
@@ -134,6 +141,7 @@ export class FileWorktree implements Worktree {
     this.gitDir = options.gitDir;
     this.globalExcludesFile = options.globalExcludesFile;
     this.newHasher = options.newHasher ?? createSha1;
+    if (options.environment) this.environment = options.environment;
   }
 
   /**
@@ -927,7 +935,8 @@ export class FileWorktree implements Worktree {
       return undefined;
     }
     const files = this.rootFiles;
-    const { history } = await createGitFilesBackend({ files, gitDir });
+    const environment = this.environment ? { environment: this.environment } : {};
+    const { history } = await createGitFilesBackend({ files, gitDir, ...environment });
     const staging = new FileStagingStore(files, joinPath(gitDir, "index"));
     await staging.read();
     const config = await createWorkingCopyConfig(
@@ -936,6 +945,8 @@ export class FileWorktree implements Worktree {
         write: (p, content) => files.write(p, [content]),
       },
       gitDir,
+      undefined,
+      environment,
     );
     const worktree = new FileWorktree({
       files,
@@ -944,6 +955,7 @@ export class FileWorktree implements Worktree {
       blobs: history.blobs,
       trees: history.trees,
       newHasher: this.newHasher,
+      ...environment,
     });
     return new MemoryWorkingCopy({
       history,

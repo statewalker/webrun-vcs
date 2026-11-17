@@ -17,6 +17,7 @@
 
 import type { ObjectId } from "../common/id/object-id.js";
 import type { Blobs } from "../history/blobs/blobs.js";
+import type { CommitGraphProvider } from "../history/commit-graph/commit-graph-provider.js";
 import type { Commits } from "../history/commits/commits.js";
 import type { GitObjects } from "../history/objects/git-objects.js";
 import type { Refs } from "../history/refs/refs.js";
@@ -49,6 +50,8 @@ export interface GitFilesStorageBackendConfig extends BaseBackendConfig {
   objects?: GitObjects;
   /** The installed packs: read by the delta API, and where large received packs are kept */
   packs: PackSet;
+  /** The commit-graph the commit store reads (`History.commitGraph`) */
+  commitGraph?: CommitGraphProvider;
 }
 
 /** Longest chain followed by `getDeltaChain` (git's pack.depth is 50; 4095 is git's maximum). */

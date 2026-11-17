@@ -8,7 +8,9 @@
 import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-core";
 import { joinPath, sweepPackTemporaries } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
+import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { createFilesRefOps } from "./refs/index.js";
@@ -79,6 +81,17 @@ export interface GcOptions {
   packRefs?: boolean;
   /** Repack reachable objects into one pack (`git repack -A -d`). Default true. */
   repack?: boolean;
+  /**
+   * Write the commit-graph of the commits the refs reach at the end, as `git gc` does
+   * (`git commit-graph write --reachable`). Default: the config's `gc.writeCommitGraph`
+   * (true when unset). Not done in a dry run.
+   */
+  writeCommitGraph?: boolean;
+  /**
+   * The user's environment: `gc.writeCommitGraph` and the commit-graph settings are then read
+   * from the system and global config files too.
+   */
+  environment?: GitHostEnvironment;
 }
 
 /**
@@ -112,6 +125,14 @@ export interface GcResult {
   refsPacked: boolean;
   /** What the repack did; null if it did not run or found nothing to pack */
   repack: RepackResult | null;
+  /** Whether a commit-graph was written */
+  commitGraphWritten: boolean;
+  /**
+   * Why writing the commit-graph failed, when it did. git's gc reports the error and still
+   * succeeds (it ignores what write_commit_graph_reachable returns): what the repack and prune
+   * did stands.
+   */
+  commitGraphError?: string;
 }
 
 /**
@@ -129,8 +150,10 @@ export interface GcResult {
  * 5. Prunes the unreachable loose objects older than `pruneExpireMs`.
  * 6. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`, `packed-refs.new`) and `.pack` files without
  *    an `.idx`.
+ * 7. Writes the commit-graph of what the refs reach (`gc.writeCommitGraph`, default true), as
+ *    `git gc` does: `objects/info/commit-graph`, replacing a split chain.
  *
- * In a repository with `extensions.preciousObjects`, only step 3 runs, as `git gc` skips its
+ * In a repository with `extensions.preciousObjects`, only steps 3 and 7 run, as `git gc` skips its
  * repack and prune there. A partial clone (`extensions.partialClone`, a promisor remote) and
  * a repository with `objects/info/alternates` are refused with
  * `UnsupportedRepositoryFormatError` before anything changes.
@@ -163,6 +186,7 @@ export async function gc(options: GcOptions): Promise<GcResult> {
       refsPacked: false,
       repack: null,
       skipped: true,
+      commitGraphWritten: false,
     };
   }
   try {
@@ -208,6 +232,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
       refsPacked,
       repack: null,
       skipped: false,
+      ...(await gcCommitGraph(options, objects)),
     };
   }
 
@@ -224,7 +249,13 @@ async function collect(options: GcOptions): Promise<GcResult> {
   let snapshot: PackSnapshot | undefined;
   if (repacking && packs) snapshot = await snapshotPacks(packs);
   const startedAt = snapshot?.walkStartedAt ?? Date.now();
-  const listed = await listReachableObjects({ files, gitDir, refs: history.refs, objects });
+  const listed = await listReachableObjects({
+    files,
+    gitDir,
+    refs: history.refs,
+    objects,
+    commitGraph: history.commitGraph,
+  });
   const reachable = new Set<string>(listed.map((o) => o.id));
 
   // Step 3: pack refs (reachability does not change)
@@ -296,6 +327,9 @@ async function collect(options: GcOptions): Promise<GcResult> {
     removedOrphanPacks = await sweepOrphanPacks(files, packDir, orphanExpiry);
   }
 
+  // Step 7: the commit-graph (git gc's write_commit_graph_reachable)
+  const commitGraph = await gcCommitGraph(options, objects);
+
   return {
     removedObjects,
     keptRecentObjects,
@@ -307,7 +341,43 @@ async function collect(options: GcOptions): Promise<GcResult> {
     refsPacked,
     repack: repackResult,
     skipped: false,
+    ...commitGraph,
   };
+}
+
+/**
+ * Writes the commit-graph at the end of a gc when `gc.writeCommitGraph` (or the option) asks.
+ * A failure is reported in the result, not thrown, as git's gc goes on after
+ * write_commit_graph_reachable fails: the repack and prune before it are done.
+ */
+async function gcCommitGraph(
+  options: GcOptions,
+  objects: GitObjects,
+): Promise<Pick<GcResult, "commitGraphWritten" | "commitGraphError">> {
+  const { history, files, gitDir = ".git", environment } = options;
+  if (options.dryRun) return { commitGraphWritten: false };
+  try {
+    const enabled =
+      options.writeCommitGraph ??
+      (await readCommitGraphSettings(files, gitDir, { environment })).gcWriteCommitGraph;
+    if (!enabled) return { commitGraphWritten: false };
+    const result = await writeCommitGraph({
+      files,
+      gitDir,
+      objects,
+      refs: history.refs,
+      commitGraph: history.commitGraph ?? history.commits.commitGraph,
+      // git gc writes in-process with replace refs on: none is written while there are any
+      replaceRefs: true,
+      environment,
+    });
+    return { commitGraphWritten: result.written };
+  } catch (error) {
+    return {
+      commitGraphWritten: false,
+      commitGraphError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 /**

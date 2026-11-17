@@ -50,6 +50,15 @@ export interface ListObjectsOptions {
    * objects not listed, missing objects) are skipped.
    */
   includeTags?: Iterable<ObjectId>;
+  /**
+   * A commit's tree, parents and committer time without reading it (the commit-graph:
+   * `Commits.getHeader`, which parses commits outside the graph). Undefined for an id that is
+   * not a commit or not stored. Commits it knows are not read at all, except the wants (read
+   * so that a missing one throws even when a stale graph still lists it).
+   */
+  commitHeader?: (
+    id: ObjectId,
+  ) => Promise<{ tree: ObjectId; parents: ObjectId[]; commitTime: number } | undefined>;
 }
 
 /** One listed object, as `git rev-list --objects` prints it. */
@@ -111,9 +120,18 @@ export async function* listObjects(
       throw e;
     });
 
+  const fromHeader = async (id: ObjectId): Promise<CommitInfo | undefined> => {
+    if (!options.commitHeader) return undefined;
+    const h = await options.commitHeader(id).catch(() => undefined);
+    return h ? { tree: h.tree, parents: h.parents, time: h.commitTime } : undefined;
+  };
+
   const parseCommit = async (id: ObjectId, required: boolean): Promise<CommitInfo | undefined> => {
-    let c = commits.get(id);
-    if (c) return c;
+    let c = commits.get(id) ?? (await fromHeader(id));
+    if (c) {
+      commits.set(id, c);
+      return c;
+    }
     const o = required ? await read(id) : await tryRead(id);
     if (!o) return undefined;
     if (o.type !== "commit") throw new Error(`object ${id} is a ${o.type}, not a commit`);
@@ -182,6 +200,14 @@ export async function* listObjects(
   const start = async (tip: ObjectId, uninteresting: boolean) => {
     let id = tip;
     for (;;) {
+      // a want is read (a missing one throws, though a stale commit-graph still lists it)
+      const known = commits.get(id) ?? (uninteresting ? await fromHeader(id) : undefined);
+      if (known) {
+        if (uninteresting) set(id, UNINTERESTING);
+        commits.set(id, known);
+        await enqueue(id, uninteresting);
+        return;
+      }
       const o = uninteresting ? await tryRead(id) : await read(id);
       if (!o) return;
       if (uninteresting) set(id, UNINTERESTING);

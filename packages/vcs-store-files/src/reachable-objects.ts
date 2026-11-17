@@ -19,7 +19,14 @@
  * changing anything; `git update-index --no-split-index` turns it back into one file.
  */
 
-import type { FilesApi, GitObjects, ListedObject, ObjectId, Refs } from "@statewalker/vcs-core";
+import type {
+  CommitGraphProvider,
+  FilesApi,
+  GitObjects,
+  ListedObject,
+  ObjectId,
+  Refs,
+} from "@statewalker/vcs-core";
 import { isSymbolicRef, joinPath, listObjects } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { parseIndexFile, parseResolveUndo } from "@statewalker/vcs-working-tree";
@@ -40,6 +47,11 @@ export interface ReachabilityRoots {
   refs: Refs;
   /** The objects, to drop roots that are not stored (a reflog entry already pruned). */
   objects: Pick<GitObjects, "has" | "get">;
+  /**
+   * The commit-graph: the walk takes the trees and parents of the commits it has from it
+   * instead of reading them, as git's reachability walk does.
+   */
+  commitGraph?: CommitGraphProvider;
 }
 
 /**
@@ -146,7 +158,21 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
   if (wants.length === 0) return listed;
   // the parents of shallow commits are not there (git's grafts): not walked
   const shallow = (await roots.refs.getShallow?.()) ?? [];
-  for await (const o of listObjects(roots.objects, { wants, shallow })) listed.push(o);
+  const graph = await roots.commitGraph?.get().catch(() => undefined);
+  const commitHeader = graph
+    ? async (id: ObjectId) => {
+        const pos = graph.position(id);
+        if (pos < 0) return undefined;
+        return {
+          tree: graph.treeAt(pos),
+          parents: graph.parentsAt(pos),
+          commitTime: graph.commitTimeAt(pos),
+        };
+      }
+    : undefined;
+  for await (const o of listObjects(roots.objects, { wants, shallow, commitHeader })) {
+    listed.push(o);
+  }
   return listed;
 }
 

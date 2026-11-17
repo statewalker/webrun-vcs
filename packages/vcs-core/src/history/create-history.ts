@@ -27,6 +27,7 @@ import { rawStorageStaging } from "../storage/adapters/staging-blob-store.js";
 import { MemoryRawStorage } from "../storage/raw/memory-raw-storage.js";
 import { createBlobs } from "./blobs/blobs.impl.js";
 import type { Blobs } from "./blobs/blobs.js";
+import type { CommitGraphProvider } from "./commit-graph/commit-graph-provider.js";
 import { createCommits } from "./commits/commits.impl.js";
 import type { Commits } from "./commits/commits.js";
 import { HistoryImpl, HistoryWithOperationsImpl } from "./history.impl.js";
@@ -58,6 +59,8 @@ export interface HistoryStoresConfig {
   objects?: GitObjects;
   /** The installed packs, for backends that keep packs */
   packs?: PackSet;
+  /** The commit-graph the commit store reads, for backends over git's files */
+  commitGraph?: CommitGraphProvider;
 }
 
 /**
@@ -80,6 +83,9 @@ export interface HistoryComponentsConfig {
 
   /** The installed packs `objects` reads, for backends that keep packs (the files backend). */
   packs?: PackSet;
+
+  /** The repository's commit-graph, which the commit store reads (the files backend). */
+  commitGraph?: CommitGraphProvider;
 }
 
 /**
@@ -106,6 +112,7 @@ export function createHistoryFromStores(config: HistoryStoresConfig): History {
   return new HistoryImpl(config.blobs, config.trees, config.commits, config.tags, config.refs, {
     objects: config.objects,
     packs: config.packs,
+    commitGraph: config.commitGraph,
   });
 }
 
@@ -129,7 +136,7 @@ export function createHistoryFromStores(config: HistoryStoresConfig): History {
 export function createHistoryFromComponents(config: HistoryComponentsConfig): History {
   const blobs = createBlobs(config.objects);
   const trees = createTrees(config.objects);
-  const commits = createCommits(config.objects);
+  const commits = createCommits(config.objects, { commitGraph: config.commitGraph });
   const tags = createTags(config.objects);
 
   const given = config.refs as Partial<Refs> & { type?: unknown };
@@ -151,6 +158,7 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
     refs,
     objects: config.objects,
     packs: config.packs,
+    commitGraph: config.commitGraph,
   });
 }
 
@@ -301,13 +309,17 @@ export function createMemoryHistoryWithOperations(
  * ```
  */
 export function createGitFilesHistory(config: GitFilesStorageBackendConfig): HistoryWithOperations {
-  const { blobs, trees, commits, tags, refs, objects, packs } = config;
+  const { blobs, trees, commits, tags, refs, objects, packs, commitGraph } = config;
 
   // The delta view of the installed packs (deltas are written by repack)
   const delta = new PackSetDeltaApi(packs);
 
   // Create base History for serialization API
-  const history = new HistoryImpl(blobs, trees, commits, tags, refs, { objects, packs });
+  const history = new HistoryImpl(blobs, trees, commits, tags, refs, {
+    objects,
+    packs,
+    commitGraph,
+  });
   const serialization = new DefaultSerializationApi({ history });
 
   // Git-files backend capabilities
@@ -335,7 +347,7 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
     async () => {
       // nothing to release: pack reads close when their streams end
     },
-    { objects, packs },
+    { objects, packs, commitGraph },
   );
 }
 

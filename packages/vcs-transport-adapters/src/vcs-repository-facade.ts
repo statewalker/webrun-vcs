@@ -211,10 +211,23 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   }
 
   /**
-   * A commit's parents and committer time (upload-pack walks the graph with it).
+   * A commit's parents and committer time (upload-pack walks the graph with it), from the
+   * commit-graph where the store has one. Without `checkExists` a commit the graph has is not
+   * looked up in the object store (git's default for upload-pack walks); with it, a commit only
+   * a stale graph lists (pruned since) is absent, as with git's GIT_COMMIT_GRAPH_PARANOIA:
+   * receive-pack asks so for the object's type and its connectivity.
    */
-  async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
-    const commit = await this.history.commits.load(oid);
+  async getCommitInfo(
+    oid: string,
+    options: { checkExists?: boolean } = {},
+  ): Promise<CommitGraphInfo | undefined> {
+    const commits = this.history.commits;
+    if (commits.getHeader) {
+      // from the commit-graph when it has the commit (nothing is read)
+      const h = await commits.getHeader(oid, { checkExists: options.checkExists });
+      return h ? { parents: h.parents, time: h.commitTime, tree: h.tree } : undefined;
+    }
+    const commit = await commits.load(oid);
     if (!commit) return undefined;
     return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
   }

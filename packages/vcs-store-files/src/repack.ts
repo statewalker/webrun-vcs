@@ -40,7 +40,7 @@ const OBJECT_ID = /^[0-9a-f]{40}$/;
 /** The repository a repack works on: the fields of `createGitFilesBackend`'s result. */
 export interface RepackTarget {
   /** The repository's refs (`history.refs`): every ref is a root. */
-  history: Pick<History, "refs">;
+  history: Pick<History, "refs" | "commitGraph">;
   /** The object kernel (packs first, then loose objects). */
   objects: GitObjects;
   /** The installed packs: the new pack is installed here, replaced ones are removed. */
@@ -177,6 +177,7 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     gitDir: options.gitDir,
     refs: options.history.refs,
     objects: options.objects,
+    commitGraph: options.history.commitGraph,
   });
   return repackListed(options, listed, snapshot);
 }

@@ -58,5 +58,6 @@ export async function createGitFilesHistoryFromFiles(
     refs: history.refs,
     objects,
     packs,
+    commitGraph: history.commitGraph,
   });
 }

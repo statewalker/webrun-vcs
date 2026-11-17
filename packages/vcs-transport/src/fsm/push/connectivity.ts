@@ -297,7 +297,9 @@ export class PushConnectivity {
   private async info(oid: string): Promise<CommitGraphInfo | null> {
     let info = this.commitInfo.get(oid);
     if (info === undefined) {
-      info = (await this.repository.getCommitInfo?.(oid)) ?? null;
+      // a commit only a stale commit-graph lists is missing here (git checks connectivity with
+      // the objects themselves)
+      info = (await this.repository.getCommitInfo?.(oid, { checkExists: true })) ?? null;
       this.commitInfo.set(oid, info);
     }
     return info;
