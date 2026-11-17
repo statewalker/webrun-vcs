@@ -227,6 +227,34 @@ export function createTreeStoreTests(name: string, factory: TreeStoreFactory): v
       });
     });
 
+    describe("Names that are no UTF-8", () => {
+      // names as trees hold them (`decodeGitPath`): each byte outside UTF-8 is U+DC00 + byte
+      const blob = "ce013625030ba8dba906f756967f9e9ca394464a";
+      const named: TreeEntry[] = [
+        { mode: FileMode.TREE, name: "\udcff", id: EMPTY_TREE_ID },
+        { mode: FileMode.REGULAR_FILE, name: "caf\udce9.txt", id: blob },
+        { mode: FileMode.REGULAR_FILE, name: "café.txt", id: blob },
+        { mode: FileMode.REGULAR_FILE, name: "a\u0001b", id: blob },
+      ];
+
+      it("stores them under git's id and loads them back in byte order", async () => {
+        // printf '...\tcaf\xe9.txt\n...' | git mktree --missing
+        const id = await ctx.treeStore.store(named);
+        expect(id).toBe("4ae3dafc4dea7b7cd33ff9f15713b739bf32f43a");
+        const loaded = await collectEntries(await ctx.treeStore.load(id));
+        expect(loaded.map((e) => e.name)).toEqual([
+          "a\u0001b",
+          "café.txt",
+          "caf\udce9.txt",
+          "\udcff",
+        ]);
+        // a tree rebuilt from what the store gives back has the same id
+        expect(await ctx.treeStore.store(loaded)).toBe(id);
+        expect((await ctx.treeStore.getEntry(id, "caf\udce9.txt"))?.id).toBe(blob);
+        expect((await ctx.treeStore.getEntry(id, "\udcff"))?.mode).toBe(FileMode.TREE);
+      });
+    });
+
     describe("File Modes", () => {
       it("preserves file mode for regular files", async () => {
         const entries: TreeEntry[] = [

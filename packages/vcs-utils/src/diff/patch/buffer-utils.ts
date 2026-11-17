@@ -7,6 +7,8 @@
  * Based on JGit's RawParseUtils.java
  */
 
+import { decodeGitPath, unquoteGitPath } from "../../encoding/index.js";
+
 /**
  * Check if the buffer contains a specific pattern at the given offset
  *
@@ -108,6 +110,29 @@ export function isHunkHdr(buffer: Uint8Array, offset: number, end: number): numb
  */
 export function decode(buffer: Uint8Array, start: number, end: number): string {
   return new TextDecoder("utf-8").decode(buffer.slice(start, end));
+}
+
+/**
+ * A path of a patch line, as git's `find_name` reads it: C-quoted when it starts with `"`
+ * (`"caf\\351.txt"`), else its bytes up to `end` (or the first tab, with `stopAtTab`). A
+ * path's bytes that are no UTF-8 stay them ({@link decodeGitPath}), so the path names the
+ * same file as in git.
+ *
+ * @returns The path and the offset after it
+ */
+export function readPatchPath(
+  buffer: Uint8Array,
+  start: number,
+  end: number,
+  stopAtTab = false,
+): { path: string; end: number } {
+  if (buffer[start] === 0x22) {
+    const quoted = unquoteGitPath(buffer, start, end);
+    if (quoted) return quoted;
+  }
+  let stop = start;
+  while (stop < end && !(stopAtTab && buffer[stop] === 0x09)) stop++;
+  return { path: decodeGitPath(buffer.subarray(start, stop)), end: stop };
 }
 
 /**

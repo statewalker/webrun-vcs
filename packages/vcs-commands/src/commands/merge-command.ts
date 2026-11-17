@@ -1,5 +1,6 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { DEFAULT_BIG_FILE_THRESHOLD, FileMode, isSymbolicRef } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
@@ -681,7 +682,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const message = this.message ?? (await this.defaultMessage(mergeName));
 
     if (conflicts.length > 0 || merge?.clean === false) {
-      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
+      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       if (this.squash) {
         await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, srcId));
         await state.write("MERGE_MSG", conflictsComment(paths, true));
@@ -825,7 +826,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       await state.write("MERGE_MODE", this.ffMode() === FastForwardMode.NO_FF ? "no-ff" : "");
     };
     if (outcome.status === 1) {
-      const paths = [...new Set(outcome.conflicts.map((c) => c.stagePath))].sort();
+      const paths = [...new Set(outcome.conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       if (this.squash) {
         await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, remoteIds));
         await state.write("MERGE_MSG", conflictsComment(paths, true));

@@ -10,6 +10,7 @@ import {
   type ObjectId,
   type PersonIdent,
 } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { entryStatOf, type IndexEntryOptions, type Worktree } from "@statewalker/vcs-working-tree";
 
 import type { CommandCommits, CommandRefs } from "../git-command.js";
@@ -307,7 +308,7 @@ export async function removeBranchState(
 
 /** Byte order of paths, as git sorts the index. */
 function compareBytes(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+  return compareGitPaths(a, b);
 }
 
 /** Whether a directory stands at `path` holding untracked content (not a link to one). */

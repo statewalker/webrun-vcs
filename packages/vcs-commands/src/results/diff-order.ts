@@ -17,11 +17,11 @@
  * @module
  */
 
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { wildmatch } from "@statewalker/vcs-working-tree";
 
 /** The patterns of an order file (git's `prepare_order`) */
 export function parseOrderFile(content: Uint8Array): string[] {
-  const decoder = new TextDecoder();
   const patterns: string[] = [];
   let start = 0;
   while (start < content.length) {
@@ -29,7 +29,8 @@ export function parseOrderFile(content: Uint8Array): string[] {
     while (end < content.length && content[end] !== 0x0a) end++;
     // an empty line or a comment
     if (content[start] !== 0x0a && content[start] !== 0x23) {
-      patterns.push(decoder.decode(content.subarray(start, end)));
+      // a line is bytes, as the paths it matches (a pattern that is no UTF-8 stays its bytes)
+      patterns.push(decodeGitPath(content.subarray(start, end)));
     }
     start = end < content.length ? end + 1 : end;
   }

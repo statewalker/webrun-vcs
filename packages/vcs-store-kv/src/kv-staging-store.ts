@@ -6,6 +6,7 @@
 
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type {
   IndexBuilder,
   IndexEditor,
@@ -70,16 +71,8 @@ function entryKey(path: string, stage: number): string {
  * Compare paths using Git's canonical ordering.
  */
 function comparePaths(a: string, b: string): number {
-  const aLen = a.length;
-  const bLen = b.length;
-  const minLen = Math.min(aLen, bLen);
-
-  for (let i = 0; i < minLen; i++) {
-    const diff = a.charCodeAt(i) - b.charCodeAt(i);
-    if (diff !== 0) return diff;
-  }
-
-  return aLen - bLen;
+  // the order of the paths' bytes (git's), an escaped byte of a non-UTF-8 name included
+  return compareGitPaths(a, b);
 }
 
 /**

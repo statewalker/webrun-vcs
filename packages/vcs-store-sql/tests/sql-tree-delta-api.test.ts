@@ -211,3 +211,19 @@ describe("SqlTreeDeltaApi", () => {
     expect(chain?.baseIds).toEqual([baseId]);
   });
 });
+
+describe("SqlTreeDeltaApi with names that are no UTF-8", () => {
+  it("loads a changed name with its escaped bytes", async () => {
+    const db = await SqlJsAdapter.create();
+    const api = new SqlTreeDeltaApi(db);
+    const changes: TreeDeltaChange[] = [
+      // the byte 0xe9 of a latin-1 name, as trees hold it (`decodeGitPath`)
+      { type: "add", name: "caf\udce9.txt", mode: 0o100644, objectId: oid("file1") },
+      { type: "delete", name: "\udcff\u0001" },
+    ];
+    await api.deltifyTree(oid("t"), oid("b"), toStream(createDelta(oid("b"), changes)));
+    const loaded = await api.loadDeltaChanges(oid("t"));
+    expect(loaded?.changes.map((c) => c.name).sort()).toEqual(["caf\udce9.txt", "\udcff\u0001"]);
+    await db.close();
+  });
+});

@@ -1,6 +1,6 @@
 import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
 import { ByteSink, type XdiffAlgorithm } from "@statewalker/vcs-utils";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   collectChunks,
   compareWithWorktree,
@@ -326,9 +326,17 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     return (await this.collect(this.renames ?? false)).entries;
   }
 
-  /** Execute the diff and print it as `git diff` does, in the given format. */
+  /**
+   * Execute the diff and print it as `git diff` does, in the given format.
+   *
+   * The output is bytes; the text decodes them as paths decode ({@link decodeGitPath}):
+   * UTF-8, and each byte that is no UTF-8 (a path printed raw with `core.quotePath=false`,
+   * or file content in another encoding) as the lone surrogate U+DC00 + byte, never U+FFFD.
+   * So `encodeGitPath(await callText())` is exactly {@link callBytes}, and a path cut from
+   * the text is the path's string as trees and the index hold it.
+   */
   async callText(format: DiffOutputFormat = "patch"): Promise<string> {
-    return new TextDecoder().decode(await this.callBytes(format));
+    return decodeGitPath(await this.callBytes(format));
   }
 
   /** {@link callText} as bytes (file content that is not UTF-8 kept as it is). */

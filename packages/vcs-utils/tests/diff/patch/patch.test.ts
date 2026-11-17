@@ -389,3 +389,64 @@ mode 100644,100755..100755
     });
   });
 });
+
+describe("Patch paths that are quoted or no UTF-8", () => {
+  const parse = (...parts: (string | number[])[]) => {
+    const chunks = parts.map((p) =>
+      typeof p === "string" ? new TextEncoder().encode(p) : new Uint8Array(p),
+    );
+    const buffer = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of chunks) {
+      buffer.set(c, at);
+      at += c.length;
+    }
+    const patch = new Patch();
+    patch.parse(buffer);
+    return patch.getFiles();
+  };
+  const hunk = "@@ -1 +1 @@\n-a\n+b\n";
+
+  it("unquotes C-quoted names (octal escapes as the bytes)", () => {
+    const [file] = parse(
+      'diff --git "a/caf\\351.txt" "b/caf\\351.txt"\n',
+      "index 1111111..2222222 100644\n",
+      '--- "a/caf\\351.txt"\n',
+      '+++ "b/caf\\351.txt"\n',
+      hunk,
+    );
+    expect(file.oldPath).toBe("caf\udce9.txt");
+    expect(file.newPath).toBe("caf\udce9.txt");
+  });
+
+  it("reads raw bytes (core.quotePath=false) and names with spaces", () => {
+    const [raw, spaced] = parse(
+      "diff --git a/caf",
+      [0xe9],
+      ".txt b/caf",
+      [0xe9],
+      ".txt\nindex 1111111..2222222 100644\n--- a/caf",
+      [0xe9],
+      ".txt\n+++ b/caf",
+      [0xe9],
+      `.txt\n${hunk}`,
+      "diff --git a/x b/y z b/x b/y z\nindex 1111111..2222222 100644\n",
+      `--- a/x b/y z\n+++ b/x b/y z\n${hunk}`,
+    );
+    expect(raw.oldPath).toBe("caf\udce9.txt");
+    expect(raw.newPath).toBe("caf\udce9.txt");
+    expect(spaced.oldPath).toBe("x b/y z");
+    expect(spaced.newPath).toBe("x b/y z");
+  });
+
+  it("unquotes rename lines and a quoted name after an unquoted one", () => {
+    const [file] = parse(
+      'diff --git a/old "b/n\\351w"\n',
+      "similarity index 90%\n",
+      "rename from old\n",
+      'rename to "n\\351w"\n',
+    );
+    expect(file.oldPath).toBe("old");
+    expect(file.newPath).toBe("n\udce9w");
+  });
+});

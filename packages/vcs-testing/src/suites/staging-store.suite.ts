@@ -588,6 +588,46 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
         expect(await ctx.stagingStore.hasEntry("папка/файл.txt")).toBe(true);
       });
 
+      it("keeps paths that are no UTF-8, in byte order", async () => {
+        // paths as the index holds them (`decodeGitPath`): a byte outside UTF-8 is U+DC00 + byte
+        const builder = ctx.stagingStore.createBuilder();
+        builder.add(createEntry("dir\udcff/x.txt", { objectId: fakeObjectId("x") }));
+        builder.add(createEntry("caf\udce9.txt", { objectId: fakeObjectId("latin1") }));
+        builder.add(createEntry("café.txt", { objectId: fakeObjectId("utf8") }));
+        builder.add(createEntry("a\u0001b", { objectId: fakeObjectId("ctl") }));
+        await builder.finish();
+        await ctx.stagingStore.write();
+        await ctx.stagingStore.read();
+
+        const paths = (await collectEntries(ctx.stagingStore.entries())).map((e) => e.path);
+        expect(paths).toEqual(["a\u0001b", "café.txt", "caf\udce9.txt", "dir\udcff/x.txt"]);
+        expect((await ctx.stagingStore.getEntry("caf\udce9.txt"))?.objectId).toBe(
+          fakeObjectId("latin1"),
+        );
+        expect(await ctx.stagingStore.hasEntry("a\u0001b")).toBe(true);
+        const under = await collectEntries(ctx.stagingStore.entries({ prefix: "dir\udcff" }));
+        expect(under.map((e) => e.path)).toEqual(["dir\udcff/x.txt"]);
+
+        // an edit finds its entry
+        const editor = ctx.stagingStore.createEditor();
+        editor.add({
+          path: "caf\udce9.txt",
+          apply: (entry) => (entry ? { ...entry, size: 7 } : undefined),
+        });
+        await editor.finish();
+        expect((await ctx.stagingStore.getEntry("caf\udce9.txt"))?.size).toBe(7);
+
+        if (ctx.trees) {
+          // the tree written from the index reads back into the same entries
+          const treeId = await ctx.stagingStore.writeTree(ctx.trees);
+          await ctx.stagingStore.clear();
+          await ctx.stagingStore.readTree(ctx.trees, treeId);
+          const back = (await collectEntries(ctx.stagingStore.entries())).map((e) => e.path);
+          expect(back).toEqual(paths);
+          expect(await ctx.stagingStore.writeTree(ctx.trees)).toBe(treeId);
+        }
+      });
+
       it("handles paths with special characters", async () => {
         const builder = ctx.stagingStore.createBuilder();
         builder.add(createEntry("file-name_test.txt"));

@@ -144,3 +144,75 @@ export function compareGitPaths(a: string, b: string): number {
   }
   return a.length - b.length;
 }
+
+/**
+ * A file of patterns or paths (`.gitignore`, `info/exclude`, `core.excludesFile`,
+ * `.gitattributes`) as git reads it: bytes, so a pattern written in latin-1 matches the
+ * same path bytes it matches in git. A leading UTF-8 BOM is skipped (git's
+ * `skip_utf8_bom`); the rest decodes through {@link decodeGitPath}.
+ *
+ * @example
+ * ```typescript
+ * decodeGitPatternFile(new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a])); // "caf\udce9\n"
+ * ```
+ */
+export function decodeGitPatternFile(bytes: Uint8Array): string {
+  const bom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+  return decodeGitPath(bom ? bytes.subarray(3) : bytes);
+}
+
+const C_ESCAPES: Record<number, number> = {
+  97: 0x07, // a
+  98: 0x08, // b
+  102: 0x0c, // f
+  110: 0x0a, // n
+  114: 0x0d, // r
+  116: 0x09, // t
+  118: 0x0b, // v
+  92: 0x5c, // \
+  34: 0x22, // "
+};
+
+/**
+ * git's `unquote_c_style`: the C-quoted path that starts with `"` at `start` of `bytes`, as
+ * a string ({@link decodeGitPath}, so octal escapes of a name that is no UTF-8 stay its
+ * bytes), and the offset after the closing quote. Undefined when no valid quoted string
+ * starts there.
+ *
+ * @example
+ * ```typescript
+ * unquoteGitPath(new TextEncoder().encode('"caf\\351.txt" rest'), 0);
+ * // { path: "caf\udce9.txt", end: 13 }
+ * ```
+ */
+export function unquoteGitPath(
+  bytes: Uint8Array,
+  start = 0,
+  end = bytes.length,
+): { path: string; end: number } | undefined {
+  if (bytes[start] !== 0x22) return undefined;
+  const out: number[] = [];
+  let i = start + 1;
+  const isOctal = (k: number, hi: number) => k < end && bytes[k] >= 0x30 && bytes[k] <= hi;
+  while (i < end) {
+    const c = bytes[i];
+    if (c === 0x22) return { path: decodeGitPath(new Uint8Array(out)), end: i + 1 };
+    if (c !== 0x5c) {
+      out.push(c);
+      i++;
+      continue;
+    }
+    i++;
+    if (i >= end) return undefined;
+    const e = bytes[i];
+    const simple = C_ESCAPES[e];
+    if (simple !== undefined) {
+      out.push(simple);
+      i++;
+    } else if (isOctal(i, 0x33) && isOctal(i + 1, 0x37) && isOctal(i + 2, 0x37)) {
+      out.push(((bytes[i] - 0x30) << 6) | ((bytes[i + 1] - 0x30) << 3) | (bytes[i + 2] - 0x30));
+      i += 3;
+    } else return undefined;
+  }
+  return undefined;
+}

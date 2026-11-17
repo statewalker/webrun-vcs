@@ -6,6 +6,7 @@ import {
   type PersonIdent,
   type TreeEntry,
 } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
@@ -605,7 +606,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (conflicts.length > 0 || !merge.clean) output.push(...merge.messages);
     await state.setRef("AUTO_MERGE", treeId);
     if (conflicts.length > 0 || !merge.clean) {
-      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort();
+      const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       const message = commit.message.endsWith("\n") ? commit.message : `${commit.message}\n`;
       await this.stopAt(state, item.id, commit.message, commit.author);
       await state.setRef("REBASE_HEAD", item.id);

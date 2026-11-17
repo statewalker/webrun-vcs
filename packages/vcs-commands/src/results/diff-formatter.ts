@@ -5,6 +5,7 @@
 
 import { type Blobs, DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
 import { ByteSink, type SupportedAlgorithm, type XdiffAlgorithm } from "@statewalker/vcs-utils";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import { ChangeType, type DiffEntry } from "./diff-entry.js";
 import {
@@ -234,13 +235,14 @@ export class DiffFormatter {
 
   /**
    * The file's part of the diff as text: exactly git's output (LF-terminated lines), or
-   * without the file headers when `includeHeaders` is false.
+   * without the file headers when `includeHeaders` is false. Bytes that are no UTF-8 decode
+   * as paths do (`decodeGitPath`), so `encodeGitPath` of the text gives the bytes back.
    *
    * @param diff The content diff to stringify
    * @returns Unified diff string
    */
   toString(diff: FileContentDiff): string {
-    const text = decoder.decode(diff.patch);
+    const text = decodeGitPath(diff.patch);
     if (this.includeHeaders) return text;
     const at = text.search(/^(@@ |Binary files )/m);
     return at < 0 ? "" : text.slice(at);

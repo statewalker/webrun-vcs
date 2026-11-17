@@ -9,6 +9,7 @@
  * within a line a later state wins; a macro set to true expands to its states.
  */
 
+import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import {
   type AttributeRule,
   type AttributeSetting,
@@ -142,9 +143,7 @@ class ParseCache {
 }
 
 const textOf = (content: string | Uint8Array) =>
-  typeof content === "string"
-    ? content
-    : new TextDecoder("utf-8", { ignoreBOM: true }).decode(content);
+  typeof content === "string" ? content : decodeGitPatternFile(content);
 
 /** The attribute names the patterns of a list of rules assign (a macro by its name). */
 function namedBy(rules: AttributeRule[]): Set<string> {

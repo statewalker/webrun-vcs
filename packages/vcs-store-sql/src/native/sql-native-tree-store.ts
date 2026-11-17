@@ -18,6 +18,7 @@ import {
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
 import type { DatabaseClient } from "../database-client.js";
+import { fromSqlPath, toSqlPath } from "../sql-path.js";
 import type { SqlNativeTreeStore } from "./types.js";
 
 /**
@@ -117,7 +118,7 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
         const entry = entryArray[i];
         await tx.execute(
           "INSERT INTO tree_entry (tree_fk, position, mode, name, object_id) VALUES (?, ?, ?, ?, ?)",
-          [treeFk, i, entry.mode, entry.name, entry.id],
+          [treeFk, i, entry.mode, toSqlPath(entry.name), entry.id],
         );
       }
     });
@@ -161,7 +162,7 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
       for (const entry of entries) {
         yield {
           mode: entry.mode,
-          name: entry.name,
+          name: fromSqlPath(entry.name),
           id: entry.object_id,
         };
       }
@@ -196,7 +197,7 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
       object_id: string;
     }>("SELECT mode, name, object_id FROM tree_entry WHERE tree_fk = ? AND name = ?", [
       treeFk,
-      name,
+      toSqlPath(name),
     ]);
 
     if (entries.length === 0) {
@@ -205,7 +206,7 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
 
     return {
       mode: entries[0].mode,
-      name: entries[0].name,
+      name: fromSqlPath(entries[0].name),
       id: entries[0].object_id,
     };
   }
@@ -304,7 +305,9 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
   /**
    * Find tree entries matching a name pattern
    *
-   * Uses SQL LIKE pattern matching (% for any chars, _ for single char).
+   * Uses SQL LIKE pattern matching (% for any chars, _ for single char). A name that is no
+   * UTF-8 is stored escaped (`toSqlPath`), as is the pattern, so its literal characters
+   * match it; `_` matches one character of the stored form.
    *
    * @param namePattern LIKE pattern for entry name (e.g., "%.ts", "src%")
    * @returns Async iterable of matching entries with their tree IDs
@@ -322,7 +325,7 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
        INNER JOIN tree_entry te ON te.tree_fk = t.id
        WHERE te.name LIKE ?
        ORDER BY t.tree_id, te.name`,
-      [namePattern],
+      [toSqlPath(namePattern)],
     );
 
     for (const row of rows) {
@@ -330,7 +333,7 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
         treeId: row.tree_id,
         entry: {
           mode: row.mode,
-          name: row.name,
+          name: fromSqlPath(row.name),
           id: row.object_id,
         },
       };
