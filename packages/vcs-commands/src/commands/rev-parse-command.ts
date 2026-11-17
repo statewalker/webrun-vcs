@@ -106,6 +106,8 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     }
     if (objectId === undefined) {
       const lines = [...resolver.warnings, "fatal: Needed a single revision"];
+      // a symmetric difference with a side that is no commit printed both sides first
+      if (printed.length > 0) throw new RevisionError(this.revision, lines.join("\n"), printed);
       throw new RefNotFoundError(this.revision, lines.join("\n"));
     }
     return { objectId, warnings: resolver.warnings, lines: [] };
@@ -130,7 +132,16 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
         throw error;
       }
       if (id === undefined) {
-        // git prints the argument as a path, then finds no such path and dies
+        // git prints the argument as a path, finds no such path and, before it dies, reads
+        // it again quietly (maybe_die_on_misspelt_object_name): what it prints regardless of
+        // GET_OID_QUIETLY (`error: object x is a tree, not a commit`) comes out twice
+        if (!(arg.startsWith(":") && !/^[A-Za-z0-9]/.test(arg.slice(1)))) {
+          try {
+            await resolver.resolve(arg, { quiet: true });
+          } catch {
+            // git exits quietly where this read dies
+          }
+        }
         throw new RevisionError(
           arg,
           [...resolver.warnings, unknownRevisionMessage(arg)].join("\n"),
@@ -147,7 +158,11 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     };
   }
 
-  /** git's `try_difference`: `a..b` prints b and ^a; `a...b` prints b, a and ^ each merge base. */
+  /**
+   * git's `try_difference`: `a..b` prints b and ^a; `a...b` prints b, a and ^ each merge base.
+   * A symmetric difference with a side that is no commit has printed b and a when git finds
+   * that (`error: object x is a tree, not a commit`) and gives up on it.
+   */
   private async tryDifference(
     resolver: RevisionResolver,
     arg: string,
@@ -166,14 +181,13 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     if (start === undefined) return false;
     const stop = await resolver.resolve(endName, { hint: "committish" });
     if (stop === undefined) return false;
-    const out = [stop, symmetric ? start : `^${start}`];
+    lines.push(stop, symmetric ? start : `^${start}`);
     if (symmetric) {
-      const a = await resolver.peelTags(start);
-      const b = await resolver.peelTags(stop);
-      if (a.type !== "commit" || b.type !== "commit") return false;
-      for (const base of await this.mergeBases(a.id, b.id)) out.push(`^${base}`);
+      const a = await resolver.commitReference(start);
+      const b = a === undefined ? undefined : await resolver.commitReference(stop);
+      if (a === undefined || b === undefined) return false;
+      for (const base of await this.mergeBases(a, b)) lines.push(`^${base}`);
     }
-    lines.push(...out);
     return true;
   }
 
@@ -212,9 +226,9 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     const name = arg.slice(0, mark);
     const id = await resolver.resolve(name, { hint: "committish" });
     if (id === undefined) return false;
-    const commit = await resolver.peelTags(id);
-    if (commit.type !== "commit") return false;
-    const parents = (await resolver.parentsOf(commit.id)) ?? [];
+    const commit = await resolver.commitReference(id);
+    if (commit === undefined) return false;
+    const parents = (await resolver.parentsOf(commit)) ?? [];
     if (excludeParent && excludeParent > parents.length) return false;
     if (includeRev) lines.push(id);
     parents.forEach((p, i) => {

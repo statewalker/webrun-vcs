@@ -22,9 +22,15 @@ import { revisionMergeBases } from "./rev-parse-command.js";
 import { type ParsedRevisionArgs, parseRevisionArgs } from "./revision-range.js";
 
 /**
- * Commits reachable from the included revisions and not from the excluded ones, newest
- * first, as `git log <revisions>` lists them. Without revisions it lists HEAD's history; with
- * only exclusions (`^main`) it lists nothing, as git does.
+ * Commits reachable from the included revisions and not from the excluded ones, the set
+ * `git log <revisions> --` lists. It reads its arguments as `git log` does, not as
+ * `git rev-list` does: without revisions (or with nothing but `--not`, which names none) it
+ * lists HEAD's history, where `git rev-list` prints its usage; with only exclusions (`^main`)
+ * it lists nothing, as git does.
+ *
+ * The order is {@link LogCommand}'s walk, not yet git's: with several included revisions or
+ * merges in the range it can differ from `git log`'s date order (a plain walk without paths
+ * is not git's `limit_list`), so compare the commits as a set where the order matters.
  *
  * Throws `RevisionError` with git's lines for an argument that names nothing
  * (`fatal: bad revision 'x'`, as `git log x --`).
@@ -85,7 +91,8 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.setCallable(false);
     const log = new LogCommand(this._workingCopy);
     for (const configure of this.configure) configure(log);
-    if (this.revisions.length > 0) {
+    // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none
+    if (this.revisions.some((revision) => revision !== "--not")) {
       const { entries } = await this.resolve();
       const resolver = this.revisionResolver();
       let included = 0;

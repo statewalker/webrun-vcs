@@ -16,7 +16,8 @@
  * n = 1) is x without its nth parent; `--not` flips the sense of the arguments after it.
  * Revisions in a range are read as committishes, as are the others where the command asks
  * (`committish`, as `git log` does). The arguments are revisions only, as before git's `--`:
- * one that names nothing fails with git's `fatal: bad revision '<arg>'`.
+ * one that names nothing fails with git's `fatal: bad revision '<arg>'`, and a lone `..` is
+ * `HEAD..HEAD` (without `--` git would take it for the parent directory).
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
@@ -97,8 +98,9 @@ async function handleRevisionArg(
   options: RevisionArgOptions,
   out: RevisionArgEntry[],
 ): Promise<boolean> {
-  // just ".." is the parent directory's pathspec, not a range
-  if (arg === "..") return false;
+  // just "..": git takes it for the parent directory's pathspec unless `--` follows the
+  // revisions; these arguments are read as if it did (REVARG_CANNOT_BE_FILENAME), so it is
+  // HEAD..HEAD, as `git log .. --` reads it
   const dotdot = await handleDotdot(resolver, arg, exclude, options, out);
   if (dotdot) return true;
 
@@ -159,27 +161,26 @@ async function handleDotdot(
   if (b === undefined) return false;
   const aType = await resolver.objectType(a);
   const bType = await resolver.objectType(b);
-  if (aType === undefined || bType === undefined) throw dotdotMissing(arg, symmetric);
+  if (aType === undefined || bType === undefined) throw dotdotMissing(resolver, arg, symmetric);
   if (!symmetric) {
     out.push({ id: a, exclude: !exclude, name: aName }, { id: b, exclude, name: bName });
     return true;
   }
-  const ac = await resolver.peelTags(a);
-  const bc = await resolver.peelTags(b);
-  if (ac.type !== "commit" || bc.type !== "commit") throw dotdotMissing(arg, symmetric);
-  for (const base of await options.mergeBases(ac.id, bc.id))
-    out.push({ id: base, exclude: !exclude });
+  // lookup_commit_reference of each side: git names the first that is no commit
+  const ac = await resolver.commitReference(a);
+  const bc = ac === undefined ? undefined : await resolver.commitReference(b);
+  if (ac === undefined || bc === undefined) throw dotdotMissing(resolver, arg, symmetric);
+  for (const base of await options.mergeBases(ac, bc)) out.push({ id: base, exclude: !exclude });
   out.push({ id: a, exclude, name: aName }, { id: b, exclude, name: bName });
   return true;
 }
 
-function dotdotMissing(arg: string, symmetric: boolean): RevisionError {
-  return new RevisionError(
-    arg,
-    symmetric
-      ? `fatal: Invalid symmetric difference expression ${arg}`
-      : `fatal: Invalid revision range ${arg}`,
-  );
+/** git's `dotdot_missing`, after what the resolver printed (`error: object x is a tree, ...`). */
+function dotdotMissing(resolver: RevisionResolver, arg: string, symmetric: boolean): RevisionError {
+  const fatal = symmetric
+    ? `fatal: Invalid symmetric difference expression ${arg}`
+    : `fatal: Invalid revision range ${arg}`;
+  return new RevisionError(arg, [...resolver.warnings, fatal].join("\n"));
 }
 
 /**

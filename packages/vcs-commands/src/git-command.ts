@@ -22,7 +22,11 @@ import {
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-import { abbrevLengths, worktreeModeTrust } from "./commands/core-config.js";
+import {
+  createIdAbbreviator,
+  type IdAbbreviator,
+  worktreeModeTrust,
+} from "./commands/core-config.js";
 import {
   authorIdentOf,
   committerIdentOf,
@@ -442,8 +446,24 @@ export abstract class GitCommand<T> {
       staging: () => this.staging,
       workingCopy: this._workingCopy,
       objects: this._workingCopy.history?.objects,
-      abbreviate: (ids) => abbrevLengths(this._workingCopy, ids),
+      abbreviate: (ids) => this.idAbbreviator().lengths(ids),
     });
+  }
+
+  private abbreviator?: IdAbbreviator;
+
+  /**
+   * This command's id abbreviator: the objects are counted once for git's automatic length,
+   * however many ids the command prints (see {@link createIdAbbreviator}).
+   */
+  protected idAbbreviator(): IdAbbreviator {
+    this.abbreviator ??= createIdAbbreviator(this._workingCopy);
+    return this.abbreviator;
+  }
+
+  /** `id` abbreviated as git prints it, through {@link idAbbreviator}. */
+  protected abbreviateObjectId(id: ObjectId): Promise<string> {
+    return this.idAbbreviator().abbreviate(id);
   }
 
   /**

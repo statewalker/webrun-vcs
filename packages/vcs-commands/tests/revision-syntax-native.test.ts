@@ -740,6 +740,8 @@ async function expectSameLog(repo: string, cases: string[][]): Promise<void> {
     }
     // the commits compared as a set: LogCommand's walk without paths is not in git's
     // date order (a known gap of LogCommand, not of the revision arguments)
+    // TODO: compare in order once LogCommand's plain walk follows git's limit_list /
+    // date-ordered walk (the pending log-command.ts change); RevListCommand documents it
     const sorted = (out: string) => out.split("\n").filter(Boolean).sort().join("\n");
     expect([args, { ...ours, out: sorted(ours.out) }]).toEqual([
       args,
@@ -1039,6 +1041,130 @@ describeGit("revision ranges and sets, native rev-parse and log", () => {
       // git names the worktree's absolute path, which ours does not know
       const err = n.stderr.replace(/ at '[^']*'\n$/, "\n");
       expect([rev, ours]).toEqual([rev, { status: n.status, out: n.stdout, err }]);
+    }
+  });
+});
+
+/** `git rev-parse --verify <rev>` by native git and ours, stdout printed before a death included. */
+async function expectSameVerify(repo: string, revs: string[]): Promise<void> {
+  const git = await open(repo);
+  for (const rev of revs) {
+    const n = spawnSync("git", ["rev-parse", "--verify", rev], {
+      cwd: repo,
+      env: envAt(),
+      encoding: "latin1",
+    });
+    let ours: { status: number; out: string; err: string };
+    try {
+      const r = await git.revParse().setRevision(rev).call();
+      ours = { status: 0, out: `${r.objectId}\n`, err: r.warnings.map((w) => `${w}\n`).join("") };
+    } catch (error) {
+      const output = error instanceof RevisionError ? error.output : [];
+      ours = {
+        status: 128,
+        out: output.map((l) => `${l}\n`).join(""),
+        err: `${(error as Error).message}\n`,
+      };
+    }
+    expect([rev, ours]).toEqual([rev, { status: n.status, out: n.stdout, err: n.stderr }]);
+  }
+}
+
+describeGit("revision arguments: --not alone, .., non-commits, core.disambiguate", () => {
+  let repo = "";
+  let blob = "";
+  let tree = "";
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "revision-args-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+    repo = buildRanges(join(root, "base"));
+    blob = run(repo, undefined, "rev-parse", "main:a.txt").trim();
+    tree = run(repo, undefined, "rev-parse", "main^{tree}").trim();
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  it("log: --not alone falls back to HEAD; .. is HEAD..HEAD as before --", async () => {
+    await expectSameLog(repo, [
+      ["--not"],
+      ["--not", "--not"],
+      [".."],
+      ["..", "feat"],
+      ["--not", ".."],
+      ["...", "side"],
+    ]);
+  });
+
+  it("log: a symmetric difference or an ancestor of a tree or blob says it is no commit", async () => {
+    await expectSameLog(repo, [
+      ["main...main^{tree}"],
+      ["main^{tree}...main"],
+      [`main...${blob.slice(0, 7)}~0`],
+      [`${blob.slice(0, 7)}~0`],
+      [`${tree}^`],
+      ["main^{tree}^!"],
+      [`${blob}^@`],
+      ["main..main^{tree}"],
+    ]);
+  });
+
+  it("rev-parse: lookup_commit_reference's error for a side or a parent that is no commit", async () => {
+    await expectSameRevParse(repo, [
+      ["main...main^{tree}"],
+      ["main^{tree}...main"],
+      ["va...main^{tree}"],
+      ["main", "feat...main^{tree}"],
+      ["main^{tree}^!"],
+      [`${blob}^!`],
+      [`${blob.slice(0, 7)}^@`],
+      ["main^{tree}^-"],
+      ["main^{tree}~0"],
+      [`${blob.slice(0, 7)}~0`],
+      [`^${tree.slice(0, 7)}^`],
+      ["main", "main^{tree}~1"],
+      ["main..main^{tree}"],
+    ]);
+  });
+
+  it("rev-parse --verify: the error, and a symmetric difference's sides printed first", async () => {
+    await expectSameVerify(repo, [
+      "main...main^{tree}",
+      "va...main^{tree}",
+      "main^{tree}^!",
+      `${blob.slice(0, 7)}^@`,
+      `${blob.slice(0, 7)}~0`,
+      `${blob}~0`,
+      `${tree.slice(0, 7)}^`,
+      "main^{tree}^0",
+    ]);
+  });
+
+  it("core.disambiguate that git does not know dies with the file and line", async () => {
+    const config = join(repo, ".git", "config");
+    const original = readFileSync(config, "latin1");
+    const revs = ["HEAD", "main~1", blob.slice(0, 7), "main..feat"];
+    try {
+      for (const value of ["foo", "", "yes", "1", "Commit", "none"]) {
+        run(repo, undefined, "config", "core.disambiguate", value);
+        await expectSameVerify(repo, revs);
+      }
+      // a variable without `=` (missing value), after a valid one: the first bad one dies
+      writeFileSync(config, `${original}[core]\n\tdisambiguate = commit\n\tdisambiguate\n`);
+      await expectSameVerify(repo, revs);
+      writeFileSync(
+        config,
+        `${original}[core]\n\tdisambiguate = bad ; comment\n\tdisambiguate = commit\n`,
+      );
+      await expectSameVerify(repo, revs);
+      // the global file, named as git names it
+      writeFileSync(config, original);
+      writeFileSync(join(home, ".gitconfig"), "[core]\n# first\n disambiguate=Nope\n");
+      await expectSameVerify(repo, revs);
+    } finally {
+      writeFileSync(config, original);
+      rmSync(join(home, ".gitconfig"), { force: true });
     }
   });
 });

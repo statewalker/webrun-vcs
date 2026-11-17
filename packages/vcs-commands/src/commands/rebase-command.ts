@@ -22,7 +22,7 @@ import { GitCommand } from "../git-command.js";
 import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-result.js";
 import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
-import { abbreviateId, coreBool, worktreeModeTrust } from "./core-config.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { localTimezoneOffset } from "./git-ident.js";
 import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
@@ -410,7 +410,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       autostash = await createAutostash(this.context(worktree), headId);
       if (autostash) {
-        output.push(`Created autostash: ${await abbreviateId(this.workingCopy, autostash)}`);
+        output.push(`Created autostash: ${await this.abbreviateObjectId(autostash)}`);
       }
     }
     const unstash = async () => {
@@ -464,7 +464,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       for (const id of range) {
         if (skipped.has(id))
           output.push(
-            `warning: skipped previously applied commit ${await abbreviateId(this.workingCopy, id)}`,
+            `warning: skipped previously applied commit ${await this.abbreviateObjectId(id)}`,
           );
       }
       if (configBool(this.workingCopy, "advice.skippedCherryPicks", true)) {
@@ -521,7 +521,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const todoText = await this.todoText(todo);
     await state.write(
       `${DIR}/git-rebase-todo.backup`,
-      `${todoText}\n# Rebase ${await abbreviateId(this.workingCopy, onto)}..${await abbreviateId(this.workingCopy, headId)} onto ${await abbreviateId(this.workingCopy, onto)} (${todo.length} command${todo.length === 1 ? "" : "s"})\n`,
+      `${todoText}\n# Rebase ${await this.abbreviateObjectId(onto)}..${await this.abbreviateObjectId(headId)} onto ${await this.abbreviateObjectId(onto)} (${todo.length} command${todo.length === 1 ? "" : "s"})\n`,
     );
     await state.write(`${DIR}/git-rebase-todo`, todoText);
     if (autostash) await state.write(`${DIR}/autostash`, `${autostash}\n`);

@@ -104,6 +104,9 @@ type ShortOid =
   | { status: "ambiguous" }
   | { status: "invalid" };
 
+/** The values git's `core.disambiguate` takes (`set_disambiguate_hint_config`). */
+const DISAMBIGUATE_HINTS = ["none", "commit", "committish", "tree", "treeish", "blob"];
+
 const HEX_DIGIT = /^[0-9a-fA-F]$/;
 const isHexDigit = (c: string | undefined) => c !== undefined && HEX_DIGIT.test(c);
 
@@ -170,6 +173,7 @@ export class RevisionResolver {
    */
   cwdPrefix = "";
   private config?: RemoteConfigStore;
+  private disambiguateChecked = false;
   /** Refs read while resolving one revision (`HEAD~3` reads HEAD once) */
   private readonly refCache = new Map<string, Promise<{ id: ObjectId; ref: string } | undefined>>();
 
@@ -184,6 +188,7 @@ export class RevisionResolver {
    * @throws RevisionError where git dies (an `@{u}` without upstream, a reflog too short)
    */
   async resolve(name: string, options: ResolveOptions = {}): Promise<ObjectId | undefined> {
+    this.checkDisambiguateConfig(name);
     const direct = await this.oid1(name, options);
     if (direct !== undefined) return direct;
     if (name.startsWith(":")) {
@@ -352,7 +357,7 @@ export class RevisionResolver {
   private async parent(name: string, idx: number, quiet?: boolean): Promise<ObjectId | undefined> {
     const id = await this.oid1(name, { hint: "committish", quiet });
     if (id === undefined) return undefined;
-    const commitId = await this.peelToType(id, "commit");
+    const commitId = await this.commitReference(id);
     if (commitId === undefined) return undefined;
     if (idx === 0) return commitId;
     const commit = await this.sources.commits.load(commitId);
@@ -367,7 +372,7 @@ export class RevisionResolver {
   ): Promise<ObjectId | undefined> {
     const id = await this.oid1(name, { hint: "committish", quiet });
     if (id === undefined) return undefined;
-    let commitId = await this.peelToType(id, "commit");
+    let commitId = await this.commitReference(id);
     for (let i = 0; commitId !== undefined && i < generation; i++) {
       const commit = await this.sources.commits.load(commitId);
       commitId = commit?.parents[0];
@@ -491,9 +496,12 @@ export class RevisionResolver {
       let shown = base;
       if (len === 0) shown = found.ref.startsWith("refs/heads/") ? found.ref.slice(11) : "HEAD";
       if (atTime) {
-        this.warnings.push(
-          `warning: log for '${shown}' only goes back to ${formatRfc2822Date(read.cutoffTime, read.cutoffTz)}`,
-        );
+        // GET_OID_QUIETLY keeps this one to itself
+        if (!flags.quiet) {
+          this.warnings.push(
+            `warning: log for '${shown}' only goes back to ${formatRfc2822Date(read.cutoffTime, read.cutoffTz)}`,
+          );
+        }
       } else if (!(nth === read.cutoffCount && read.id !== ZERO_ID)) {
         throw this.fatal(str, `log for '${shown}' only has ${read.cutoffCount} entries`);
       }
@@ -778,6 +786,21 @@ export class RevisionResolver {
     return { id: current, type: "tag" };
   }
 
+  /**
+   * git's `lookup_commit_reference`: the commit `id` is or its tags end at; for another
+   * object git's `error: object <id> is a <type>, not a commit` (printed whether the caller
+   * is quiet or not, as git prints it) and undefined; undefined, silently, for an object
+   * the repository lacks.
+   */
+  async commitReference(id: ObjectId): Promise<ObjectId | undefined> {
+    const peeled = await this.peelTags(id);
+    if (peeled.type === "commit") return peeled.id;
+    if (peeled.type !== undefined) {
+      this.warnings.push(`error: object ${peeled.id} is a ${peeled.type}, not a commit`);
+    }
+    return undefined;
+  }
+
   /** The parents of a commit, undefined when it cannot be read. */
   async parentsOf(id: ObjectId): Promise<ObjectId[] | undefined> {
     return (await safe(() => this.sources.commits.load(id)))?.parents;
@@ -1015,6 +1038,35 @@ export class RevisionResolver {
       }
     }
     return [...found].sort();
+  }
+
+  /**
+   * git's `set_disambiguate_hint_config` as its config loading runs it, before any revision
+   * is read: every value of `core.disambiguate` in the configuration's order, git dying at
+   * the first it does not know (`error: unknown hint type for 'core.disambiguate': foo` or,
+   * for a variable without `=`, `error: missing value for 'core.disambiguate'`, then
+   * `fatal: bad config variable 'core.disambiguate' in file '<file>' at line <n>`). The file
+   * is named as the configuration knows it (`.git/config` for a repository opened at
+   * `.git`); a value with no file (set in memory) dies as git's command-line config does.
+   * Checked once per resolver; native git dies on loading its config in every command,
+   * here only commands that read a revision do.
+   */
+  private checkDisambiguateConfig(name: string): void {
+    if (this.disambiguateChecked) return;
+    this.disambiguateChecked = true;
+    const key = "core.disambiguate";
+    for (const { text, file, line } of this.remoteConfig().valuesWithOrigin(key)) {
+      if (text !== undefined && DISAMBIGUATE_HINTS.includes(text.toLowerCase())) continue;
+      const error =
+        text === undefined
+          ? `error: missing value for '${key}'`
+          : `error: unknown hint type for '${key}': ${text}`;
+      const fatal =
+        file !== undefined && line !== undefined
+          ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
+          : `fatal: unable to parse '${key}' from command-line config`;
+      throw new RevisionError(name, [...this.warnings, error, fatal].join("\n"));
+    }
   }
 
   /** `core.disambiguate` (git's `default_disambiguate_hint`); "none" and unset are no hint. */

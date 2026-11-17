@@ -183,7 +183,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const reader = new ChainReader(this, env, this.options, followIncludes);
     const base: ConfigEntry[] = [];
     if (env) {
-      const hostSource = (path: string): ConfigSource => ({ read: env.readFile, path });
+      const hostSource = (path: string): ConfigSource => ({ read: env.readFile, path, host: true });
       if (env.systemConfig) await reader.readFile(hostSource(env.systemConfig), base, 0);
       if (env.globalConfig) {
         // $GIT_CONFIG_GLOBAL replaces both global files
@@ -259,7 +259,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (this.resolvedCache) return this.resolvedCache;
     const out: ConfigEntry[] = [...this.baseEntries];
     const emitted = new Set<string>();
-    for (const line of this.lines) {
+    for (const [index, line] of this.lines.entries()) {
       const section = sectionOfLine(line);
       if (section !== undefined && this.removedSections.has(section)) continue;
       const key = keyOfLine(line);
@@ -274,6 +274,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
             key,
             value:
               line.kind === "entry" ? line.value : (line as { inlineValue?: unknown }).inlineValue,
+            origin: {
+              file: originName(this.configPath),
+              line: index + 1,
+              text: writtenValueOfLine(line),
+            },
           });
         }
       }
@@ -336,6 +341,23 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     return this.resolved()
       .filter((e) => e.key === canonical)
       .map((e) => e.value);
+  }
+
+  /**
+   * Every value of a key in the chain's order, as {@link getAll}, each with the file and line
+   * it was read from and its text as written: for git's
+   * `fatal: bad config variable '<key>' in file '<file>' at line <n>`.
+   */
+  getAllWithOrigin(key: string): ConfigValueOrigin[] {
+    const canonical = canonicalizeKey(key);
+    if (!canonical) return [];
+    return this.resolved()
+      .filter((e) => e.key === canonical)
+      .map((e) =>
+        e.origin
+          ? { value: e.value, text: e.origin.text, file: e.origin.file, line: e.origin.line }
+          : { value: e.value, text: e.value === true ? undefined : String(e.value) },
+      );
   }
 
   /**
@@ -858,13 +880,42 @@ export interface GitConfigOptions {
 interface ConfigEntry {
   key: string;
   value: unknown;
+  /** Where it was read (absent for a value set in memory and not saved yet) */
+  origin?: { file: string; line: number; text: string | undefined };
+}
+
+/**
+ * One value of a key with where it was read, as {@link GitWorkingCopyConfig.getAllWithOrigin}
+ * gives it: what git names in `bad config variable '<key>' in file '<file>' at line <n>`.
+ */
+export interface ConfigValueOrigin {
+  /** The value as {@link GitWorkingCopyConfig.get} reads it (booleans and numbers converted) */
+  value: unknown;
+  /**
+   * The value as written, unquoted and unescaped but not converted (`yes` stays `yes`);
+   * undefined for a variable written without `=` (git's NULL value: "missing value")
+   */
+  text: string | undefined;
+  /** The file, as the host or the files API names it; absent for a value set in memory */
+  file?: string;
+  /** Its line in that file, from 1 */
+  line?: number;
 }
 
 /** A config file and how to read it. */
 interface ConfigSource {
   read(path: string): Promise<Uint8Array | undefined>;
   path: string;
+  /** Read through the host's environment (a host path), not the repository's files API */
+  host?: boolean;
 }
+
+/**
+ * A file's name as git prints it in a config error: a host path as it is; a path of the
+ * repository's files API (rooted at the top of the worktree, where git runs) without its
+ * leading `/` (`.git/config`).
+ */
+const originName = (path: string, host?: boolean) => (host ? path : path.replace(/^\/+/, ""));
 
 /** git's `MAX_INCLUDE_DEPTH`. */
 const MAX_INCLUDE_DEPTH = 10;
@@ -902,12 +953,20 @@ class ChainReader {
     }
     if (!content) return;
     const { lines } = parseConfigText(decodeGitPatternFile(content));
-    for (const line of lines) {
+    for (const [index, line] of lines.entries()) {
       const key = keyOfLine(line);
       if (key === undefined) continue;
       const value =
         line.kind === "entry" ? line.value : line.kind === "section" ? line.inlineValue : undefined;
-      out.push({ key, value });
+      out.push({
+        key,
+        value,
+        origin: {
+          file: originName(source.path, source.host),
+          line: index + 1,
+          text: writtenValueOfLine(line),
+        },
+      });
       if (this.followIncludes && isIncludeKey(key)) {
         await this.include(key, value, source, out, depth + 1);
       }
@@ -941,12 +1000,12 @@ class ChainReader {
     const env = this.env;
     if (value.startsWith("~")) {
       const expanded = expandUserPath(value, env);
-      return expanded && env ? { read: env.readFile, path: expanded } : undefined;
+      return expanded && env ? { read: env.readFile, path: expanded, host: true } : undefined;
     }
     if (value.startsWith("/")) {
-      return env ? { read: env.readFile, path: value } : undefined;
+      return env ? { read: env.readFile, path: value, host: true } : undefined;
     }
-    return { read: from.read, path: `${dirOf(from.path)}${value}` };
+    return { read: from.read, path: `${dirOf(from.path)}${value}`, host: from.host };
   }
 
   private gitDirPath(): string {
@@ -1230,15 +1289,46 @@ function stripComment(text: string): string {
 }
 
 /**
+ * The value of a variable line as written (unquoted, unescaped, its comment dropped, not
+ * converted); undefined for a line that is no variable or has no `=`.
+ */
+function writtenValueOfLine(line: ConfigLine): string | undefined {
+  const body =
+    line.kind === "entry"
+      ? line.text.trim()
+      : line.kind === "section"
+        ? parseSectionHeader(line.text.trim())?.rest
+        : undefined;
+  if (body === undefined) return undefined;
+  const eq = body.indexOf("=");
+  return eq < 0 ? undefined : parseValueText(body.slice(eq + 1));
+}
+
+/**
  * Parse a config value: unquote, unescape, drop an unquoted trailing comment,
  * then apply git's boolean spellings and a lossless number conversion.
  */
 function parseValue(input: string): unknown {
+  const text = parseValueText(input);
+  const lower = text.toLowerCase();
+  if (lower === "true" || lower === "yes" || lower === "on") return true;
+  if (lower === "false" || lower === "no" || lower === "off") return false;
+
+  // Lossless only: the number must serialise back to the identical text.
+  if (text !== "") {
+    const num = Number(text);
+    if (Number.isFinite(num) && String(num) === text) return num;
+  }
+
+  return text;
+}
+
+/** A config value unquoted and unescaped, an unquoted trailing comment dropped. */
+function parseValueText(input: string): string {
   const raw = input.replace(/^[ \t]+/, ""); // whitespace after "=" is not part of the value
   let out = "";
   let end = 0; // length of `out` up to the last significant character
   let quoted = false;
-  let hadQuotes = false;
 
   for (let i = 0; i < raw.length; i++) {
     const char = raw[i];
@@ -1247,7 +1337,6 @@ function parseValue(input: string): unknown {
 
     if (char === '"') {
       quoted = !quoted;
-      hadQuotes = true;
       continue;
     }
 
@@ -1263,20 +1352,7 @@ function parseValue(input: string): unknown {
     if (quoted || !/\s/.test(char)) end = out.length;
   }
 
-  const text = out.slice(0, end);
-  if (hadQuotes && text === "") return "";
-
-  const lower = text.toLowerCase();
-  if (lower === "true" || lower === "yes" || lower === "on") return true;
-  if (lower === "false" || lower === "no" || lower === "off") return false;
-
-  // Lossless only: the number must serialise back to the identical text.
-  if (text !== "") {
-    const num = Number(text);
-    if (Number.isFinite(num) && String(num) === text) return num;
-  }
-
-  return text;
+  return out.slice(0, end);
 }
 
 /* ----------------------------------------------------------- serializing */
