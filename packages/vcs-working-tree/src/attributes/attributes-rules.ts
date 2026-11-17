@@ -7,6 +7,7 @@
  * (back to unspecified) or `name=value`.
  */
 
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { wildmatch } from "../ignore/git-wildmatch.js";
 
 /**
@@ -90,7 +91,8 @@ function unquoteC(s: string, start: number): { value: string; end: number } | un
   while (i < s.length) {
     const c = s[i];
     if (c === '"') {
-      return { value: new TextDecoder().decode(new Uint8Array(bytes)), end: i + 1 };
+      // octal escapes of a name that is no UTF-8 stay its bytes (`decodeGitPath`)
+      return { value: decodeGitPath(new Uint8Array(bytes)), end: i + 1 };
     }
     if (c === "\\") {
       i++;

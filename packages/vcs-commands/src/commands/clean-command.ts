@@ -1,4 +1,5 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { directoriesOf, type Worktree, wildmatch } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
 import { removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
@@ -562,11 +563,7 @@ const PATH_UNTRACKED = 3;
 
 /** git's byte order of names (`name_compare`). */
 function compareNames(a: string, b: string): number {
-  const ea = new TextEncoder().encode(a);
-  const eb = new TextEncoder().encode(b);
-  const n = Math.min(ea.length, eb.length);
-  for (let i = 0; i < n; i++) if (ea[i] !== eb[i]) return ea[i] - eb[i];
-  return ea.length - eb.length;
+  return compareGitPaths(a, b);
 }
 
 /**

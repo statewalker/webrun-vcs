@@ -1,5 +1,6 @@
 import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
 import { ByteSink, type XdiffAlgorithm } from "@statewalker/vcs-utils";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   collectChunks,
   compareWithWorktree,
@@ -145,11 +146,7 @@ const encoder = new TextEncoder();
 
 /** git's path order: bytes, as `strcmp` */
 function compareBytes(a: string, b: string): number {
-  const ea = encoder.encode(a);
-  const eb = encoder.encode(b);
-  const n = Math.min(ea.length, eb.length);
-  for (let i = 0; i < n; i++) if (ea[i] !== eb[i]) return ea[i] - eb[i];
-  return ea.length - eb.length;
+  return compareGitPaths(a, b);
 }
 
 function boolValue(v: string | undefined): boolean | undefined {

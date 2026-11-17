@@ -8,6 +8,7 @@
 
 import { type Blobs, compareTreeEntries, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1, type Hasher, unifiedDiffHunks } from "@statewalker/vcs-utils";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import type { CommandTrees } from "../git-command.js";
 import { readBlob } from "./ort-merge.js";
@@ -108,7 +109,7 @@ export async function patchId(
   const sum = new Uint8Array(20);
   for (const change of changes) {
     const h = createSha1();
-    const oldPath = removeSpace(encoder.encode(change.path));
+    const oldPath = removeSpace(encodeGitPath(change.path));
     const newPath = oldPath;
     str(h, "diff--git");
     str(h, "a/");

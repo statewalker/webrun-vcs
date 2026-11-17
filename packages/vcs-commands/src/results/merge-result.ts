@@ -116,7 +116,10 @@ export interface MergeResult {
   readonly conflicts?: string[];
   /** Paths that failed (for FAILED status) */
   readonly failingPaths?: Map<string, MergeFailureReason>;
-  /** Informational message; for FAILED, git's error (what `git merge` prints on stderr) */
+  /**
+   * Informational message; for FAILED, git's error (what `git merge` prints on stderr); for an
+   * octopus left with conflicts, what git-merge-one-file printed on stderr
+   */
   readonly message?: string;
   /**
    * What `git merge` prints on stdout, line by line, without the diffstat:

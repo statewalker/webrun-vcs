@@ -27,7 +27,7 @@ import {
 } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
-
+import { decodeGitPath, hasEscapedBytes } from "@statewalker/vcs-utils/encoding";
 import {
   BeyondSymlinkError,
   type LinkStats,
@@ -36,7 +36,7 @@ import {
 import { listInPathOrder } from "@statewalker/webrun-files";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
 
-import { replaceFile, writeBatched } from "./replace-file.js";
+import { fsPath, replaceFile, writeBatched } from "./replace-file.js";
 
 /** What `NodeFilesApi` takes and yields (webrun-files' own types). */
 type ListOptions = Parameters<NodeFilesApi["list"]>[1];
@@ -194,7 +194,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
         let made = false;
         for (let attempt = 0; attempt < 2 && !made && !stat; attempt++) {
           try {
-            await fs.mkdir(current);
+            await fs.mkdir(fsPath(current));
             made = true;
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -252,7 +252,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     }
     let handle: fs.FileHandle;
     try {
-      handle = await fs.open(real, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      handle = await fs.open(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     } catch {
       return;
     }
@@ -303,14 +303,14 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     const tmp = nodePath.join(nodePath.dirname(real), tmpName());
     let handle: fs.FileHandle;
     try {
-      handle = await fs.open(tmp, "wx", 0o666);
+      handle = await fs.open(fsPath(tmp), "wx", 0o666);
     } catch (error) {
       // a directory the batch cache vouched for is gone: check the path afresh, once
       if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !this.verified) throw error;
       this.verified.clear();
       await this.realNoLinks(path);
       await this.mkdirs(nodePath.dirname(real), path);
-      handle = await fs.open(tmp, "wx", 0o666);
+      handle = await fs.open(fsPath(tmp), "wx", 0o666);
     }
     let done = false;
     try {
@@ -324,7 +324,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     } finally {
       if (!done) {
         await handle.close().catch(() => {});
-        await fs.rm(tmp, { force: true }).catch(() => {});
+        await fs.rm(fsPath(tmp), { force: true }).catch(() => {});
       }
     }
   }
@@ -340,7 +340,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     await this.mkdirs(nodePath.dirname(real), path);
     let handle: fs.FileHandle;
     try {
-      handle = await fs.open(real, "wx", 0o666);
+      handle = await fs.open(fsPath(real), "wx", 0o666);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
       throw error;
@@ -354,7 +354,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     } finally {
       if (!done) {
         await handle.close().catch(() => {});
-        await fs.unlink(real).catch(() => {});
+        await fs.unlink(fsPath(real)).catch(() => {});
       }
     }
   }
@@ -378,14 +378,14 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | O_NOFOLLOW;
     let handle: fs.FileHandle;
     try {
-      handle = await fs.open(real, flags, 0o666);
+      handle = await fs.open(fsPath(real), flags, 0o666);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       // a missing directory: created (never through a link), then once more
       this.verified?.clear();
       await this.realNoLinks(path);
       await this.mkdirs(nodePath.dirname(real), path);
-      handle = await fs.open(real, flags, 0o666);
+      handle = await fs.open(fsPath(real), flags, 0o666);
     }
     try {
       await writeBatched(handle, content);
@@ -419,15 +419,22 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   /** A directory's direct entries, read without following links. */
   private async children(virtualDir: string): Promise<FileInfo[]> {
     const dir = nodePath.resolve(this.root, ...this.segments(virtualDir));
-    let entries: import("node:fs").Dirent[];
+    let entries: import("node:fs").Dirent<Buffer>[];
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      // names as bytes: one that is no valid UTF-8 keeps them (decodeGitPath's escapes)
+      entries = await fs.readdir(fsPath(dir), { withFileTypes: true, encoding: "buffer" });
     } catch {
       return [];
     }
     const prefix = virtualDir === "/" ? "" : virtualDir;
     const infos: FileInfo[] = [];
-    for (const entry of entries) {
+    for (const dirent of entries) {
+      const name = decodeGitPath(dirent.name);
+      const entry = {
+        name,
+        isFile: () => dirent.isFile(),
+        isDirectory: () => dirent.isDirectory(),
+      };
       if (entry.isFile() && TMP_NAME.test(entry.name)) continue;
       const entryPath = `${prefix}/${entry.name}`;
       // Dirent reports the entry itself: a link to a directory is not a directory
@@ -478,8 +485,8 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     this.verified?.clear();
     const stat = await lstatOrUndefined(real);
     if (!stat) return false;
-    if (stat.isDirectory()) await fs.rm(real, { recursive: true, force: true });
-    else await fs.unlink(real);
+    if (stat.isDirectory()) await fs.rm(fsPath(real), { recursive: true, force: true });
+    else await fs.unlink(fsPath(real));
     return true;
   }
 
@@ -490,7 +497,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       const stat = await lstatOrUndefined(real);
       if (!stat?.isDirectory()) return false;
       this.verified?.clear();
-      await fs.rmdir(real);
+      await fs.rmdir(fsPath(real));
       return true;
     } catch (error) {
       const code = (error as { code?: string }).code;
@@ -509,7 +516,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     this.verified?.clear();
     try {
       await this.mkdirs(nodePath.dirname(to), target);
-      await fs.rename(from, to);
+      await fs.rename(fsPath(from), fsPath(to));
       return true;
     } catch (error) {
       if (error instanceof BeyondSymlinkError) throw error;
@@ -524,7 +531,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     if (!(await lstatOrUndefined(from))) return false;
     try {
       await this.mkdirs(nodePath.dirname(to), target);
-      await fs.cp(from, to, { recursive: true, verbatimSymlinks: true, dereference: false });
+      await copyTree(from, to);
       return true;
     } catch (error) {
       if (error instanceof BeyondSymlinkError) throw error;
@@ -541,12 +548,12 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    */
   async chmod(path: string, mode: number): Promise<void> {
     const real = await this.realNoLinks(path);
-    if ((await fs.lstat(real)).isSymbolicLink()) {
+    if ((await fs.lstat(fsPath(real))).isSymbolicLink()) {
       throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
     }
     let handle: fs.FileHandle;
     try {
-      handle = await fs.open(real, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      handle = await fs.open(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "ELOOP") {
@@ -554,10 +561,10 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       }
       if (code !== "EACCES" && code !== "EPERM") this.forgetOn(error);
       // no read permission (chmod needs none): lstat again just before a path chmod
-      if ((await fs.lstat(real)).isSymbolicLink()) {
+      if ((await fs.lstat(fsPath(real))).isSymbolicLink()) {
         throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
       }
-      await fs.chmod(real, mode & 0o777);
+      await fs.chmod(fsPath(real), mode & 0o777);
       return;
     }
     try {
@@ -579,8 +586,8 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     if (!(await lstatOrUndefined(real))?.isSymbolicLink()) return undefined;
     let target: string;
     try {
-      target = await fs.realpath(real);
-      if (!(await fs.stat(target)).isDirectory()) return undefined;
+      target = decodeGitPath(await fs.realpath(fsPath(real), { encoding: "buffer" }));
+      if (!(await fs.stat(fsPath(target))).isDirectory()) return undefined;
     } catch {
       return undefined;
     }
@@ -595,7 +602,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   private async symlinkImpl(target: Uint8Array, path: string): Promise<void> {
     const real = await this.realNoLinks(path);
     await this.mkdirs(nodePath.dirname(real), path);
-    await fs.symlink(Buffer.from(target), real);
+    await fs.symlink(Buffer.from(target), fsPath(real));
   }
 
   /** The entry itself; `BeyondSymlinkError` beneath a link, never "absent". */
@@ -628,7 +635,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   async readlink(path: string): Promise<Uint8Array | undefined> {
     const real = await this.realNoLinks(path);
     try {
-      return new Uint8Array(await fs.readlink(real, { encoding: "buffer" }));
+      return new Uint8Array(await fs.readlink(fsPath(real), { encoding: "buffer" }));
     } catch {
       return undefined;
     }
@@ -672,7 +679,7 @@ function readSmallSync(
 ): Uint8Array | undefined | typeof LARGE {
   let fd: number;
   try {
-    fd = openSync(real, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    fd = openSync(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   } catch {
     return undefined;
   }
@@ -694,6 +701,31 @@ function readSmallSync(
   }
 }
 
+/**
+ * `fs.cp(from, to, { recursive, verbatimSymlinks })`; by hand where a name holds escaped
+ * bytes (`fs.cp` takes no Buffer path): directories made, links copied as links, files
+ * copied with their mode.
+ */
+async function copyTree(from: string, to: string): Promise<void> {
+  if (!hasEscapedBytes(from) && !hasEscapedBytes(to)) {
+    await fs.cp(from, to, { recursive: true, verbatimSymlinks: true, dereference: false });
+    return;
+  }
+  const stat = await fs.lstat(fsPath(from));
+  if (stat.isSymbolicLink()) {
+    await fs.symlink(await fs.readlink(fsPath(from), { encoding: "buffer" }), fsPath(to));
+  } else if (stat.isDirectory()) {
+    await fs.mkdir(fsPath(to), { recursive: true });
+    for (const name of await fs.readdir(fsPath(from), { encoding: "buffer" })) {
+      const child = decodeGitPath(name);
+      await copyTree(nodePath.join(from, child), nodePath.join(to, child));
+    }
+  } else {
+    await fs.copyFile(fsPath(from), fsPath(to));
+    await fs.chmod(fsPath(to), stat.mode & 0o777);
+  }
+}
+
 /** `lstat` (synchronous, see {@link bigintLstatOrUndefined}); nothing for a missing path. */
 async function lstatOrUndefined(real: string): Promise<import("node:fs").Stats | undefined> {
   return lstatQuiet(real, false) as import("node:fs").Stats | undefined;
@@ -704,7 +736,7 @@ function lstatQuiet(
   bigint: boolean,
 ): import("node:fs").Stats | import("node:fs").BigIntStats | undefined {
   try {
-    return lstatSync(real, { bigint, throwIfNoEntry: false });
+    return lstatSync(fsPath(real), { bigint, throwIfNoEntry: false });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return undefined;

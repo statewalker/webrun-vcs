@@ -384,4 +384,42 @@ describe("PosixNodeFilesApi caches nothing across calls; a batch view only withi
     }
     expect(await chunksOf("/missing")).toHaveLength(0);
   });
+
+  it("names that are no valid UTF-8 are their bytes on disk (decodeGitPath's escapes)", async () => {
+    if (process.platform !== "linux") return;
+    const files = new PosixNodeFilesApi({ rootDir: root });
+    // latin-1 caf\xe9.txt in a directory d\xff, as git paths carry them
+    const dir = "d\udcff";
+    const name = "caf\udce9.txt";
+    await files.write(`/${dir}/${name}`, [enc.encode("latin-1\n")]);
+    const onDisk = (p: string) =>
+      Buffer.from(
+        join(root, p).replace(/[\udc80-\udcff]/g, (c) =>
+          String.fromCharCode(c.charCodeAt(0) - 0xdc00),
+        ),
+        "latin1",
+      );
+    expect(readdirSync(Buffer.from(root), { encoding: "buffer" })).toEqual([
+      Buffer.from([0x64, 0xff]),
+    ]);
+    expect(readFileSync(onDisk(`${dir}/${name}`), "utf8")).toBe("latin-1\n");
+    const listed = [];
+    for await (const info of files.list("/", { recursive: true })) listed.push(info.path);
+    expect(listed).toEqual([`/${dir}`, `/${dir}/${name}`]);
+    expect((await files.stats(`/${dir}/${name}`))?.kind).toBe("file");
+    const chunks = await collectAll(files.read(`/${dir}/${name}`));
+    expect(Buffer.concat(chunks).toString("utf8")).toBe("latin-1\n");
+    await files.chmod(`/${dir}/${name}`, 0o755);
+    expect(statSync(onDisk(`${dir}/${name}`)).mode & 0o777).toBe(0o755);
+    await files.symlink(enc.encode(name), `/${dir}/l\udce9nk`);
+    expect((await files.lstat(`/${dir}/l\udce9nk`))?.kind).toBe("symlink");
+    expect(await files.copy(`/${dir}`, "/c\udcf6py")).toBe(true);
+    expect(readFileSync(onDisk(`c\udcf6py/${name}`), "utf8")).toBe("latin-1\n");
+    expect(statSync(onDisk(`c\udcf6py/${name}`)).mode & 0o777).toBe(0o755);
+    expect(lstatSync(onDisk("c\udcf6py/l\udce9nk")).isSymbolicLink()).toBe(true);
+    expect(await files.move(`/${dir}/${name}`, `/${dir}/n\udce9w`)).toBe(true);
+    expect(readFileSync(onDisk(`${dir}/n\udce9w`), "utf8")).toBe("latin-1\n");
+    expect(await files.remove(`/${dir}`)).toBe(true);
+    expect(await files.exists(`/${dir}`)).toBe(false);
+  });
 });

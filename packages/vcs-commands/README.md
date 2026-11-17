@@ -176,7 +176,7 @@ A conflicted path is shown as `git diff` shows it: the combined diff of "ours" a
 
 `blame()` runs git's blame algorithm: commits newest first, lines passed to the parents through the same xdiff diff, whole-file renames followed (`setFollowRenames(false)` is `--no-follow`), root commits as boundaries unless `setShowRoot(true)`, `-w` and `-L` ranges. `-M`/`-C`, `--reverse` and ignored revisions are not supported. For git's id width in the default output, pass `formatBlame(blame, { autoAbbrev: await blame.autoAbbrev?.() })`.
 
-Remaining differences from `git diff`: paths that are not valid UTF-8 are not supported (paths are strings in core and the stores), and `diff.noprefix`, `diff.mnemonicPrefix`, `diff.orderFile`, textconv drivers and `submodule.<name>.ignore` are not read.
+Remaining differences from `git diff`: `diff.noprefix`, `diff.mnemonicPrefix`, `diff.orderFile`, textconv drivers and `submodule.<name>.ignore` are not read.
 
 ### Big and binary files in diff, merge and blame
 

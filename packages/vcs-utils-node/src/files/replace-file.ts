@@ -7,6 +7,8 @@
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 
+import { encodeGitPath, hasEscapedBytes } from "@statewalker/vcs-utils/encoding";
+
 /** Windows refuses to replace a file another process holds open; such holds are brief. */
 const WIN32_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 const WIN32_RETRIES = 7;
@@ -34,6 +36,17 @@ export interface ReplaceFileOptions {
 }
 
 /**
+ * A path as Node's fs takes it. Paths are strings here, and a file name that is no valid
+ * UTF-8 (a git path such as latin-1 `caf\xe9.txt`) carries its bytes as `decodeGitPath`'s
+ * escapes, which a string path would write as U+FFFD: such a path goes as its bytes (a
+ * Buffer), so on a host whose names are bytes (Linux) the name is the original one. Other
+ * paths go as they are.
+ */
+export function fsPath(path: string): string | Buffer {
+  return hasEscapedBytes(path) ? Buffer.from(encodeGitPath(path)) : path;
+}
+
+/**
  * Moves `tmp` over `target`. Normally a rename, so readers see the old file or the new one.
  * On Windows a rename refused because the file is open elsewhere is retried for about a
  * second. A rename refused because `target` is a mount point or on another device (EBUSY,
@@ -47,7 +60,8 @@ export async function replaceFile(
   target: string,
   options: ReplaceFileOptions = {},
 ): Promise<void> {
-  const rename = options.rename ?? fs.rename;
+  const rename =
+    options.rename ?? ((from: string, to: string) => fs.rename(fsPath(from), fsPath(to)));
   const win32 = (options.platform ?? process.platform) === "win32";
   let delay = options.retryDelayMs ?? 10;
   for (let attempt = 0; ; attempt++) {
@@ -63,7 +77,7 @@ export async function replaceFile(
       }
       if (code && (win32 ? WIN32_COPY_CODES : COPY_CODES).has(code)) {
         await copyInto(tmp, target);
-        await fs.rm(tmp, { force: true }).catch(() => {});
+        await fs.rm(fsPath(tmp), { force: true }).catch(() => {});
         return;
       }
       throw error;
@@ -73,9 +87,9 @@ export async function replaceFile(
 
 /** Overwrites `target` in place with `source`; a link at `target` is refused (ELOOP). */
 async function copyInto(source: string, target: string): Promise<void> {
-  const from = await fs.open(source, "r");
+  const from = await fs.open(fsPath(source), "r");
   try {
-    const to = await fs.open(target, fsConstants.O_RDWR | O_NOFOLLOW);
+    const to = await fs.open(fsPath(target), fsConstants.O_RDWR | O_NOFOLLOW);
     try {
       const buffer = new Uint8Array(COPY_CHUNK);
       let position = 0;

@@ -35,6 +35,7 @@ import {
   writeHunks,
   type XdiffAlgorithm,
 } from "@statewalker/vcs-utils";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
@@ -549,8 +550,8 @@ export function pprintRename(a: string, b: string, quote = true): string {
   if (qa !== undefined || qb !== undefined) {
     return `${quotePath(a, quote)} => ${quotePath(b, quote)}`;
   }
-  const ea = encoder.encode(a);
-  const eb = encoder.encode(b);
+  const ea = encodeGitPath(a);
+  const eb = encodeGitPath(b);
   const lenA = ea.length;
   const lenB = eb.length;
   let pfx = 0;
@@ -572,8 +573,7 @@ export function pprintRename(a: string, b: string, quote = true): string {
   }
   const aMid = Math.max(0, lenA - pfx - sfx);
   const bMid = Math.max(0, lenB - pfx - sfx);
-  const dec = (arr: Uint8Array, s: number, e: number) =>
-    new TextDecoder().decode(arr.subarray(s, e));
+  const dec = (arr: Uint8Array, s: number, e: number) => decodeGitPath(arr.subarray(s, e));
   let out = "";
   if (pfx + sfx) out += `${dec(ea, 0, pfx)}{`;
   out += `${dec(ea, pfx, pfx + aMid)} => ${dec(eb, pfx, pfx + bMid)}`;
@@ -896,9 +896,12 @@ export function contentSide(
   };
 }
 
-/** Bytes for a string (diff output pieces are UTF-8) */
+/**
+ * Bytes for a string (diff output pieces are UTF-8; a path's escaped bytes, unquoted with
+ * `core.quotePath=false`, are written as the bytes they stand for)
+ */
 export function utf8(s: string): Uint8Array {
-  return encoder.encode(s);
+  return encodeGitPath(s);
 }
 
 /** A file of a `--no-index` diff: its path as given, content, and mode (default 100644) */

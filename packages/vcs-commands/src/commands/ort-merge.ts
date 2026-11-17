@@ -19,6 +19,7 @@
 
 import { type Blobs, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { type ConflictStyle, mergeLines } from "@statewalker/vcs-utils";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import {
   detectRenames,
@@ -238,10 +239,10 @@ function dirDigests(tree: Map<string, CheckedEntry>): Map<string, string> {
   return out;
 }
 
-/** git's strhash (FNV-1, 32 bits) over the UTF-8 bytes of a string. */
+/** git's strhash (FNV-1, 32 bits) over the bytes of a path. */
 function strhash(text: string): number {
   let hash = 0x811c9dc5;
-  for (const byte of new TextEncoder().encode(text)) {
+  for (const byte of encodeGitPath(text)) {
     hash = (Math.imul(hash, 0x01000193) ^ byte) >>> 0;
   }
   return hash;

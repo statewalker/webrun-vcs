@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  ContentMergeStrategy,
   FastForwardMode,
   type MergeCommand,
   MergeOperation,
@@ -30,7 +31,13 @@ import {
   type Snapshot,
   snapshot,
 } from "./merge-native-helpers.js";
-import { buildGraph, type Graph, text } from "./merge-native-scenarios.js";
+import {
+  buildGraph,
+  type FileSpec,
+  type Files,
+  type Graph,
+  text,
+} from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -99,6 +106,11 @@ async function compareOctopus(graph: Graph, heads: string[], options: Options = 
   );
   const lines = (text: string) => text.split("\n").filter((l) => OCTOPUS_LINE.test(l));
   expect((result.output ?? []).filter((l) => OCTOPUS_LINE.test(l))).toEqual(lines(expected.stdout));
+  if (result.status === MergeStatus.CONFLICTING) {
+    // git-merge-one-file's stderr, its temporary names evened out
+    const even = (t: string) => t.replace(/\.merge_file_\w{6}/g, ".merge_file_X").trim();
+    expect(even(result.message ?? "")).toBe(even(expected.stderr));
+  }
   if (result.status === MergeStatus.FAILED) {
     const errors = expected.stderr.trim().split("\n");
     // the last line before the autostash is applied back
@@ -112,10 +124,7 @@ async function compareOctopus(graph: Graph, heads: string[], options: Options = 
 }
 
 /** main, and branches a, b, c off it with their changes; main's own change on top. */
-function branches(
-  changes: Record<string, Record<string, string | null>>,
-  main?: Record<string, string | null>,
-): Graph {
+function branches(changes: Record<string, Files>, main?: Files): Graph {
   return {
     base: { f: text(), g: text(), h: text() },
     steps: [
@@ -532,5 +541,78 @@ describeGit("octopus merges against native git", () => {
       configure: (c) =>
         c.setStrategy(MergeStrategy.OURS).setFastForwardMode(FastForwardMode.FF_ONLY),
     });
+  });
+
+  it("conflict styles: diff3 and zdiff3 label all three sides with temporary names", async () => {
+    const lastHead = (style: string, edit: Record<number, string>) => ({
+      ...branches(
+        { a: { g: text({ 1: "a" }) }, b: { f: text({ 3: "b", ...edit }) } },
+        { f: text({ 3: "main", ...edit }) },
+      ),
+      config: { "merge.conflictStyle": style },
+    });
+    await compareOctopus(lastHead("diff3", {}), ["a", "b"]);
+    await compareOctopus(lastHead("zdiff3", { 4: "x" }), ["a", "b"]);
+    // the same file merged with every head, the last one conflicting
+    const sameFile = {
+      ...branches(
+        { a: { f: text({ 1: "a" }) }, b: { f: text({ 9: "b" }) }, c: { f: text({ 5: "c" }) } },
+        { f: text({ 5: "main" }) },
+      ),
+      config: { "merge.conflictStyle": "diff3" },
+    };
+    const { result } = await compareOctopus(sameFile, ["a", "b", "c"]);
+    expect(result.status).toBe(MergeStatus.CONFLICTING);
+    // added in both: the base is the empty blob's temporary file
+    const added = {
+      ...branches({ a: { g: text({ 1: "a" }) }, b: { x: "b\n" } }, { x: "m\n", e: "" }),
+      config: { "merge.conflictStyle": "diff3" },
+    };
+    await compareOctopus(added, ["a", "b"]);
+  });
+
+  it("binary files: git merge-file refuses them, ours stays in the worktree", async () => {
+    const bytes = (...b: number[]) => new Uint8Array([0, 1, 2, 3, ...b]);
+    const graph = branches(
+      { a: { g: text({ 1: "a" }) }, b: { bin: bytes(98) } },
+      { bin: bytes(109) },
+    );
+    graph.base.bin = bytes();
+    const { result, expected } = await compareOctopus(graph, ["a", "b"]);
+    expect(result.status).toBe(MergeStatus.CONFLICTING);
+    expect(expected.stderr).toMatch(/^error: Cannot merge binary files: \.merge_file_\w{6}$/m);
+    // only the base binary, and a binary with a mode change
+    const baseOnly = branches({ a: { g: text({ 1: "a" }) }, b: { bin: "b\n" } }, { bin: "m\n" });
+    baseOnly.base.bin = bytes();
+    await compareOctopus(baseOnly, ["a", "b"]);
+    const mode = branches(
+      { a: { g: text({ 1: "a" }) }, b: { bin: { exec: "b\u0000\n" } } },
+      { bin: "m\u0000\n" },
+    );
+    mode.base.bin = bytes();
+    await compareOctopus(mode, ["a", "b"]);
+  });
+
+  it("git-merge-one-file reads no attributes and no -X: marker size, union, theirs", async () => {
+    const graph = branches(
+      { a: { g: text({ 1: "a" }) }, b: { f: text({ 3: "b" }), "d/u": text({ 3: "b" }) } },
+      { f: text({ 3: "main" }), "d/u": text({ 3: "main" }) },
+    );
+    graph.base[".gitattributes"] = "f conflict-marker-size=10\nd/u merge=union\n";
+    graph.base["d/u"] = text();
+    await compareOctopus(graph, ["a", "b"]);
+    await compareOctopus(graph, ["a", "b"], {
+      args: ["-X", "theirs"],
+      configure: (c) => c.setContentMergeStrategy(ContentMergeStrategy.THEIRS),
+    });
+  });
+
+  it("the last head deletes, links or changes the mode of a file main changed", async () => {
+    const last = (theirs: FileSpec, ours: FileSpec) =>
+      branches({ a: { g: text({ 1: "a" }) }, b: { f: theirs } }, { f: ours });
+    await compareOctopus(last(null, text({ 3: "main" })), ["a", "b"]);
+    await compareOctopus(last({ link: "b" }, { link: "m" }), ["a", "b"]);
+    await compareOctopus(last({ exec: text({ 3: "b" }) }, text({ 9: "main" })), ["a", "b"]);
+    await compareOctopus(last({ exec: text({ 3: "b" }) }, text({ 3: "main" })), ["a", "b"]);
   });
 });

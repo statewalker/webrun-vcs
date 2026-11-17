@@ -1,5 +1,6 @@
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode, type FilesApi } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type {
   CacheTree,
   IndexBuilder,
@@ -724,16 +725,8 @@ class RemoveStages implements StagingEdit {
  * Paths are compared byte-by-byte.
  */
 function comparePaths(a: string, b: string): number {
-  const aLen = a.length;
-  const bLen = b.length;
-  const minLen = Math.min(aLen, bLen);
-
-  for (let i = 0; i < minLen; i++) {
-    const diff = a.charCodeAt(i) - b.charCodeAt(i);
-    if (diff !== 0) return diff;
-  }
-
-  return aLen - bLen;
+  // the order of the paths' bytes (an escaped byte of a non-UTF-8 name included)
+  return compareGitPaths(a, b);
 }
 
 /**
