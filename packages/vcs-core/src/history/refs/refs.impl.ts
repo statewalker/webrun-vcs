@@ -8,13 +8,13 @@ import {
   type BatchResult,
   batchBySingleRef,
   isUpdatableRefName,
-  logsByDefault,
   planRefBatch,
   planReflog,
   type RefCommand,
   type RefLogOptions,
   type ReflogLine,
-  symrefReflogLine,
+  type SymbolicRefLogOptions,
+  symrefReflogWrites,
 } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import { RefStorage } from "./ref-types.js";
@@ -161,15 +161,17 @@ export class MemoryRefs implements Refs {
    * Set a symbolic reference; with a `log` message, `name`'s reflog records it as git's
    * create_symref does (see {@link Refs.setSymbolic}).
    */
-  setSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void> {
+  setSymbolic(name: string, target: string, log?: SymbolicRefLogOptions): Promise<void> {
     return this.exclusive(async () => {
       const old = log ? (await this.resolve(name).catch(() => undefined))?.objectId : undefined;
       this.refs.set(name, { type: "symbolic", target });
-      const line = symrefReflogLine(old, (await this.resolve(target))?.objectId, log);
-      if (!line) return;
-      const lines = this.logs.get(name);
-      if (lines) lines.push(line);
-      else if (logsByDefault(name)) this.logs.set(name, [line]);
+      const next = log ? (await this.resolve(target))?.objectId : undefined;
+      for (const w of symrefReflogWrites(name, old, next, log)) {
+        if (w.op !== "append") continue;
+        const lines = this.logs.get(name);
+        if (lines) lines.push(w.line);
+        else if (w.create) this.logs.set(name, [w.line]);
+      }
     });
   }
 

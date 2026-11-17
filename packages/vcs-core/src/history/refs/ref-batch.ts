@@ -40,6 +40,13 @@ export interface RefCommand {
    * ```
    */
   reflog?: OwnReflogLine[];
+  /**
+   * This update's reflog message, in place of the batch's (git gives each update of a
+   * transaction its own: an atomic `git fetch` logs `storing head` for a new branch and
+   * `fast-forward` for another in the same transaction). Also used for the lines of the
+   * refs that record the update (`HEAD`).
+   */
+  message?: string;
 }
 
 /** A reflog line a {@link RefCommand} brings; without `ident`, the batch's identity. */
@@ -90,6 +97,20 @@ export interface RefLogOptions {
   message?: string;
 }
 
+/**
+ * The reflog of a symbolic ref set with {@link Refs.setSymbolic}: git's `create_symref`
+ * line (`message`, `ident`), or the lines given.
+ */
+export interface SymbolicRefLogOptions extends RefLogOptions {
+  /**
+   * The lines to write, oldest first, in place of the create_symref line (git's
+   * `ref_transaction_update_reflog`: `git remote rename` carries a symbolic ref's log over
+   * to its new name). The log is created whatever the ref's name; a line without `ident`
+   * takes `ident` (or the store's default identity).
+   */
+  reflog?: OwnReflogLine[];
+}
+
 /** Reflog details for stores that keep a reflog; others ignore them. */
 export interface BatchOptions extends RefLogOptions {
   /**
@@ -131,6 +152,8 @@ export interface PlannedRefUpdate {
   reflogAlso: string[];
   /** The command's own reflog lines ({@link RefCommand.reflog}), written instead of the default one. */
   reflog?: OwnReflogLine[];
+  /** The command's own message ({@link RefCommand.message}), in place of the batch's. */
+  message?: string;
 }
 
 export type RefBatchPlan =
@@ -256,6 +279,7 @@ export async function planRefBatch(
       newValue: c.new,
       reflogAlso,
       ...(c.reflog ? { reflog: c.reflog.map(sanitizeOwnLine) } : {}),
+      ...(c.message !== undefined ? { message: c.message } : {}),
     });
   }
 
@@ -420,7 +444,7 @@ export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = 
       oldId: u.oldValue ?? ZERO_ID,
       newId: u.newValue ?? ZERO_ID,
       ident,
-      message,
+      message: u.message !== undefined ? u.message.replace(/\s+/g, " ").trim() : message,
     };
     if (u.newValue === null) writes.push({ op: "drop", name: u.name });
     else if (u.reflog) {
@@ -453,6 +477,42 @@ export function defaultReflogIdent(): string {
  */
 export function logsByDefault(name: string): boolean {
   return name === "HEAD" || LOGGED_BY_DEFAULT.some((prefix) => name.startsWith(prefix));
+}
+
+/**
+ * The reflog writes of a symbolic ref `name` set with `log` (see
+ * {@link Refs.setSymbolic}): the lines `log.reflog` gives (the log created whatever the
+ * name; malformed lines skipped), else git's create_symref line ({@link symrefReflogLine}), logged when `name`'s log
+ * exists or git logs `name` by default. Empty when nothing is logged.
+ *
+ * @example
+ * ```typescript
+ * for (const w of symrefReflogWrites("HEAD", oldId, featId, { message: "checkout: ..." })) {
+ *   // append w.line to w.name's log (creating it when w.create allows)
+ * }
+ * ```
+ */
+export function symrefReflogWrites(
+  name: string,
+  old: ObjectId | undefined,
+  next: ObjectId | undefined,
+  log: SymbolicRefLogOptions | undefined,
+): ReflogWrite[] {
+  if (log?.reflog) {
+    const ident = log.ident ?? defaultReflogIdent();
+    // a line without object ids or with a malformed identity is not written
+    return log.reflog.filter(validOwnLine).map((own) => {
+      const line = sanitizeOwnLine(own);
+      return {
+        op: "append",
+        name,
+        line: { ...line, ident: line.ident ?? ident },
+        create: true,
+      };
+    });
+  }
+  const line = symrefReflogLine(old, next, log);
+  return line ? [{ op: "append", name, line, create: logsByDefault(name) }] : [];
 }
 
 /**

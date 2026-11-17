@@ -36,6 +36,7 @@ import type {
   Refs,
   RefUpdateResult,
   SymbolicRef,
+  SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
 import { isSymbolicRef } from "@statewalker/vcs-core";
 import { appendByRewrite, joinPath } from "@statewalker/vcs-utils/files";
@@ -139,7 +140,7 @@ class WorktreeRefs implements Refs {
     }
   }
 
-  setSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void> {
+  setSymbolic(name: string, target: string, log?: SymbolicRefLogOptions): Promise<void> {
     return this.store(name).setSymbolic(name, target, log);
   }
 

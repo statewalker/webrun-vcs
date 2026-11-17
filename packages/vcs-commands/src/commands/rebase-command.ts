@@ -774,10 +774,23 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     return { status: RebaseStatus.ABORTED, newHead: origHead, output };
   }
 
+  /**
+   * git's `require_clean_work_tree(<action>)` on this command's working copy, without
+   * rebasing: the refusal (`cannot <action>: You have unstaged changes.` ...), or undefined
+   * when the tree is clean or HEAD is unborn. `git pull --rebase` checks it before fetching,
+   * as `pull with rebase`.
+   */
+  async checkCleanWorkTree(action = "rebase"): Promise<RebaseResult | undefined> {
+    const headId = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    if (!headId) return undefined;
+    return this.uncleanWorktree(headId, this.worktreeAccess, action);
+  }
+
   /** Refuses as git's require_clean_work_tree: unstaged, then staged changes. */
   private async uncleanWorktree(
     headId: ObjectId,
     worktree: Worktree | undefined,
+    action = "rebase",
   ): Promise<RebaseResult | undefined> {
     const { index, unmerged } = await readIndex(this.staging);
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
@@ -801,9 +814,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
     }
     if (staged.length === 0 && unstaged.length === 0) return undefined;
-    const lines = ["error: cannot rebase: You have unstaged changes."];
+    const lines = [`error: cannot ${action}: You have unstaged changes.`];
     if (unstaged.length === 0)
-      lines[0] = "error: cannot rebase: Your index contains uncommitted changes.";
+      lines[0] = `error: cannot ${action}: Your index contains uncommitted changes.`;
     else if (staged.length > 0)
       lines.push("error: additionally, your index contains uncommitted changes.");
     lines.push("error: Please commit or stash them.");

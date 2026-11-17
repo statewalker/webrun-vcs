@@ -590,3 +590,329 @@ describeGit("reflog lines of clone, fetch and pull, native twins", () => {
     ]);
   });
 });
+
+/** The native git's version as [major, minor]. */
+function nativeVersion(): [number, number] {
+  const m = /(\d+)\.(\d+)/.exec(run(root, "--version")) ?? ["", "0", "0"];
+  return [Number(m[1]), Number(m[2])];
+}
+const nativeAtLeast = (major: number, minor: number) => {
+  const [a, b] = nativeVersion();
+  return a > major || (a === major && b >= minor);
+};
+
+describeGit("reflog lines of merge --abort, tags and one command's clock, native twins", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "reflog-native-more-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  it("merge --abort: git's reset --merge logs `reset: moving to HEAD`", async () => {
+    const t = twins();
+    const nat = join(t.native, "repo");
+    expect(runMayFail(nat, "merge", "-q", "conf")).not.toBe(0);
+    run(nat, "merge", "--abort");
+    const git = await open(t.ours);
+    const merge = () => git.merge().setAuthor(IDENT).setCommitter(IDENT);
+    expect((await merge().include("conf").call()).status).toBe(MergeStatus.CONFLICTING);
+    expect((await merge().setOperation(MergeOperation.ABORT).call()).status).toBe(
+      MergeStatus.ABORTED,
+    );
+    expectSameReflogs(t);
+    expect(messages(t.ours, "logs/HEAD").at(-1)).toBe("reset: moving to HEAD");
+    // HEAD moved where it is: the branch logs no line for it (git's no-op update)
+    expect(messages(t.ours, "logs/refs/heads/main").at(-1)).toBe("commit: c2");
+  });
+
+  it("tag of a tree, a blob and a tag object: git's create_reflog_msg wording", async () => {
+    const t = twins();
+    for (const base of [t.native, t.ours]) {
+      run(join(base, "repo"), "config", "core.logAllRefUpdates", "always");
+    }
+    const nat = join(t.native, "repo");
+    const tree = run(nat, "rev-parse", "HEAD^{tree}").trim();
+    const blob = run(nat, "rev-parse", "HEAD:a.txt").trim();
+    run(nat, "tag", "-a", "-m", "annotated", "ann");
+    const tagObject = run(nat, "rev-parse", "ann").trim();
+    run(nat, "tag", "tt", tree);
+    run(nat, "tag", "tb", blob);
+    run(nat, "tag", "to", tagObject);
+    run(nat, "tag", "tc", "feat");
+    // our twin gets the annotated tag natively (same id), then tags as native git does
+    run(join(t.ours, "repo"), "tag", "-a", "-m", "annotated", "ann");
+    const git = await open(t.ours);
+    await git.tag().setName("tt").setObjectId(tree).call();
+    await git.tag().setName("tb").setObjectId(blob).call();
+    await git.tag().setName("to").setObjectId(tagObject).call();
+    await git
+      .tag()
+      .setName("tc")
+      .setObjectId(run(nat, "rev-parse", "feat").trim())
+      .call();
+    expectSameReflogs(t);
+    expect(messages(t.ours, "logs/refs/tags/tt")[0]).toMatch(/^tag: tagging \w+ \(tree object\)$/);
+    expect(messages(t.ours, "logs/refs/tags/tb")[0]).toMatch(/\(blob object\)$/);
+    expect(messages(t.ours, "logs/refs/tags/to")[0]).toMatch(/\(other tag object\)$/);
+  });
+
+  it("a rebase's finish logs the branch and HEAD at one time (the clock read once)", async () => {
+    const t = twins();
+    const repo = join(t.ours, "repo");
+    run(repo, "config", "user.name", IDENT.name);
+    run(repo, "config", "user.email", IDENT.email);
+    // no committer variables: the time is the clock's, which moves a second per read
+    const files = createNodeFilesApi({ rootDir: t.ours });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const worktrees = await openGitLinkedWorktrees({
+      files,
+      gitDir: "repo/.git",
+      history,
+      environment: { readFile: async () => undefined },
+    });
+    const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+    await git.checkout().setName("x").call();
+    const realNow = Date.now;
+    let tick = realNow();
+    Date.now = () => {
+      tick += 1000;
+      return tick;
+    };
+    try {
+      const rebase = await git.rebase().setCommitter(IDENT).setUpstreamBranch("main");
+      expect((await rebase.call()).status).toBe(RebaseStatus.OK);
+    } finally {
+      Date.now = realNow;
+    }
+    const time = (log: string) => {
+      const last =
+        readFileSync(join(repo, ".git", log), "latin1")
+          .trim()
+          .split("\n")
+          .at(-1) ?? "";
+      return / (\d+) [+-]\d{4}\t/.exec(last)?.[1];
+    };
+    expect(messages(t.ours, "logs/refs/heads/x").at(-1)).toMatch(/^rebase \(finish\): /);
+    expect(messages(t.ours, "logs/HEAD").at(-1)).toMatch(/^rebase \(finish\): returning/);
+    expect(time("logs/refs/heads/x")).toBeDefined();
+    expect(time("logs/HEAD")).toBe(time("logs/refs/heads/x"));
+  });
+});
+
+describeGit(
+  "reflog lines of fetch --atomic, followRemoteHEAD, pull --rebase and remote rename, native twins",
+  () => {
+    let backend: NativeGitHttpBackend;
+    const originalFetch = globalThis.fetch;
+
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "reflog-net-more-"));
+      home = join(root, "home");
+      mkdirSync(home);
+      backend = nativeGitHttpBackend(root, home);
+      globalThis.fetch = backend.fetch;
+    });
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      backend?.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    /** The upstream `work` (main and dev at `base`), published as the bare `src.git`. */
+    function upstream(): { work: string; src: string } {
+      const work = join(root, "work");
+      const src = join(root, "src.git");
+      run(root, "init", "-q", "-b", "main", work);
+      put(work, "a.txt", "a\n");
+      run(work, "add", ".");
+      run(work, "commit", "-qm", "base");
+      run(work, "branch", "dev");
+      run(root, "clone", "-q", "--bare", work, src);
+      return { work, src };
+    }
+    const publish = (work: string, src: string, ...refs: string[]) =>
+      run(work, "push", "-q", "--force", src, ...refs);
+    const commitIn = (work: string, message: string) =>
+      run(work, "commit", "-q", "--allow-empty", "-m", message);
+
+    /** Both reflog sets, the clone's URL (a path natively, ours over HTTP) evened out. */
+    function expectSame(native: string, ours: string, src: string): void {
+      const url = new RegExp(
+        `(${src.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|${URL.replace(/\./g, "\\.")})`,
+        "g",
+      );
+      const n = reflogs(join(native, ".git"), native, url);
+      const o = reflogs(join(ours, ".git"), ours, url);
+      expect(Object.keys(o).sort()).toEqual(Object.keys(n).sort());
+      for (const name of Object.keys(n)) expect([name, o[name]]).toEqual([name, n[name]]);
+    }
+
+    async function openPlain(dir: string): Promise<Git> {
+      const files = createNodeFilesApi({ rootDir: dir });
+      const { history } = await createGitFilesBackend({ files });
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: ".git",
+        history,
+        environment,
+      });
+      return Git.fromWorkingCopy(await worktrees.openCurrent());
+    }
+
+    /** `native` cloned by native git, `ours` by native git too with the HTTP URL as its remote. */
+    function clones(src: string): { native: string; ours: string } {
+      const native = join(root, "native");
+      const ours = join(root, "ours");
+      run(root, "clone", "-q", src, native);
+      run(root, "clone", "-q", src, ours);
+      run(ours, "config", "remote.origin.url", URL);
+      return { native, ours };
+    }
+
+    it("fetch --atomic: a new branch and a fast-forward, each logged with its own message", async () => {
+      const { work, src } = upstream();
+      const { native, ours } = clones(src);
+      commitIn(work, "upstream 1");
+      run(work, "checkout", "-q", "-b", "nb");
+      commitIn(work, "new branch");
+      run(work, "checkout", "-q", "main");
+      publish(work, src, "main", "nb");
+      run(native, "fetch", "--atomic", "origin");
+      await (await openPlain(ours)).fetch().setRemote("origin").setAtomic(true).call();
+      expectSame(native, ours, src);
+      const last = (name: string) => {
+        const line =
+          readFileSync(join(ours, ".git", name), "latin1")
+            .trim()
+            .split("\n")
+            .at(-1) ?? "";
+        return line.slice(line.indexOf("\t") + 1);
+      };
+      expect(last("logs/refs/remotes/origin/nb")).toBe("fetch --atomic origin: storing head");
+      expect(last("logs/refs/remotes/origin/main")).toBe("fetch --atomic origin: fast-forward");
+    });
+
+    it("fetch.followRemoteHEAD: refs/remotes/origin/HEAD logged `fetch` (git 2.48+)", async (ctx) => {
+      if (!nativeAtLeast(2, 48)) ctx.skip(); // older git has no followRemoteHEAD
+      const { work, src } = upstream();
+      const { native, ours } = clones(src);
+      commitIn(work, "upstream 1");
+      publish(work, src, "main");
+      run(src, "symbolic-ref", "HEAD", "refs/heads/dev");
+      // always: the remote's new HEAD followed, `<old> <new> fetch`
+      for (const base of [native, ours])
+        run(base, "config", "remote.origin.followRemoteHEAD", "always");
+      run(native, "fetch", "origin");
+      await (await openPlain(ours)).fetch().setRemote("origin").call();
+      expectSame(native, ours, src);
+      // create (the default): a missing HEAD made, `0000 <id> fetch`
+      for (const base of [native, ours]) {
+        run(base, "config", "--unset", "remote.origin.followRemoteHEAD");
+        run(base, "remote", "set-head", "-d", "origin");
+      }
+      run(native, "fetch", "origin");
+      await (await openPlain(ours)).fetch().setRemote("origin").call();
+      expectSame(native, ours, src);
+      const head = readFileSync(join(ours, ".git/logs/refs/remotes/origin/HEAD"), "latin1");
+      expect(head).toMatch(/^0{40} [0-9a-f]{40} [^\t]+\tfetch\n$/);
+    });
+
+    it("pull --rebase on a dirty tree: refused before fetching, as git", async () => {
+      const { work, src } = upstream();
+      const { native, ours } = clones(src);
+      commitIn(work, "upstream 1");
+      publish(work, src, "main");
+      for (const base of [native, ours]) put(base, "a.txt", "dirty\n");
+      const nativeRun = spawnSync("git", ["pull", "--rebase"], {
+        cwd: native,
+        env: nativeGitEnv(home),
+        encoding: "latin1",
+      });
+      expect(nativeRun.status).not.toBe(0);
+      const result = await (await openPlain(ours)).pull().setRebase(true).call();
+      expect(result.successful).toBe(false);
+      expect(result.rebaseUsed).toBe(true);
+      expect(result.fetchResult).toBeUndefined();
+      expect(result.rebaseResult?.status).toBe(RebaseStatus.UNCOMMITTED_CHANGES);
+      expect(`${result.rebaseResult?.message}\n`).toBe(nativeRun.stderr);
+      // nothing fetched on either side
+      for (const base of [native, ours]) {
+        expect(run(base, "rev-parse", "origin/main")).toBe(run(base, "rev-parse", "main"));
+      }
+      expectSame(native, ours, src);
+      // the index dirty too
+      for (const base of [native, ours]) run(base, "add", "a.txt");
+      const staged = spawnSync("git", ["pull", "--rebase"], {
+        cwd: native,
+        env: nativeGitEnv(home),
+        encoding: "latin1",
+      });
+      const mine = await (await openPlain(ours)).pull().setRebase(true).call();
+      expect(`${mine.rebaseResult?.message}\n`).toBe(staged.stderr);
+    });
+
+    it("pull --rebase --autostash, rebase.autoStash and pull.rebase: fast-forwards over a dirty tree", async () => {
+      const { work, src } = upstream();
+      const { native, ours } = clones(src);
+      put(work, "x.txt", "x\n");
+      run(work, "add", ".");
+      run(work, "commit", "-qm", "up1");
+      publish(work, src, "main");
+      for (const base of [native, ours]) put(base, "a.txt", "dirty\n");
+      run(native, "pull", "--rebase", "--autostash");
+      const first = await (await openPlain(ours)).pull().setRebase(true).setAutoStash(true).call();
+      expect(first.successful).toBe(true);
+      expect(first.rebaseUsed).toBe(true);
+      expect(first.rebaseResult?.status).toBe(RebaseStatus.FAST_FORWARD);
+      expectSame(native, ours, src);
+      expect(readFileSync(join(ours, "a.txt"), "latin1")).toBe("dirty\n");
+
+      // rebase.autoStash: no --autostash on the command line, none in the message
+      commitIn(work, "up2");
+      publish(work, src, "main");
+      for (const base of [native, ours]) run(base, "config", "rebase.autoStash", "true");
+      run(native, "pull", "--rebase");
+      await (await openPlain(ours)).pull().setRebase(true).call();
+      expectSame(native, ours, src);
+
+      // pull.rebase=true: a rebasing pull, logged `pull: ...` (no --rebase given)
+      commitIn(work, "up3");
+      publish(work, src, "main");
+      for (const base of [native, ours]) run(base, "config", "pull.rebase", "true");
+      run(native, "pull");
+      const third = await (await openPlain(ours)).pull().call();
+      expect(third.rebaseUsed).toBe(true);
+      expectSame(native, ours, src);
+      expect(readFileSync(join(ours, "a.txt"), "latin1")).toBe("dirty\n");
+      const head = readFileSync(join(ours, ".git/logs/HEAD"), "latin1").trim().split("\n");
+      expect(head.slice(-3).map((l) => l.slice(l.indexOf("\t") + 1))).toEqual([
+        "pull --rebase --autostash: Fast-forward",
+        "pull --rebase: Fast-forward",
+        "pull: Fast-forward",
+      ]);
+    });
+
+    it("remote rename: the remote HEAD's log carried over, with git 2.5x's rename line", async () => {
+      const { src } = upstream();
+      const { native, ours } = clones(src);
+      run(native, "remote", "rename", "origin", "up");
+      await (await openPlain(ours)).remoteRename().setOldName("origin").setNewName("up").call();
+      const log = "logs/refs/remotes/up/HEAD";
+      const lines = readFileSync(join(ours, ".git", log), "latin1")
+        .trim()
+        .split("\n");
+      expect(lines.map((l) => l.slice(l.indexOf("\t") + 1))).toEqual([
+        `clone: from ${src}`,
+        "remote: renamed refs/remotes/origin/HEAD to refs/remotes/up/HEAD",
+      ]);
+      expect(lines[1]).toMatch(/^0{40} 0{40} Interop Tester <interop@example\.com> /);
+      expect(existsSync(join(ours, ".git/logs/refs/remotes/origin"))).toBe(false);
+      // git before 2.50 re-created the symref with a fresh log (`0000 <id>`) instead and
+      // logged every moved ref, so the twins are compared on 2.5x only
+      if (nativeAtLeast(2, 50)) expectSame(native, ours, src);
+    });
+  },
+);

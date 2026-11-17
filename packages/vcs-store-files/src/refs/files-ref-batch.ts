@@ -29,10 +29,10 @@ import type {
   PlannedRefUpdate,
   Ref,
   RefCommand,
-  RefLogOptions,
   ReflogDeleteOptions,
   RefRejection,
   SymbolicRef,
+  SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
 import {
   compareRefNames,
@@ -41,6 +41,7 @@ import {
   planRefBatch,
   ReflogEntryNotFoundError,
   RefStorage,
+  symrefReflogWrites,
 } from "@statewalker/vcs-core";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import { parseReflogLine } from "./reflog-reader.js";
@@ -205,7 +206,7 @@ export interface FilesRefOps {
    * `name`'s reflog gets git's create_symref line: the id `name` resolved to before (zeros
    * if none) to the id `target` resolves to, nothing when `target` does not resolve.
    */
-  writeSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void>;
+  writeSymbolic(name: string, target: string, log?: SymbolicRefLogOptions): Promise<void>;
   /**
    * Delete a ref whatever its value, loose and packed, as a batch delete does: under
    * `<name>.lock` and then `packed-refs.lock`, in one pass. Removes its reflog. False if
@@ -466,7 +467,8 @@ export function createFilesRefOps(
       try {
         const old = current(u) ?? ZERO_ID;
         const next = u.newValue ?? ZERO_ID;
-        const line = enc.encode(`${old} ${next} ${ident}${message ? `\t${message}` : ""}\n`);
+        const text = u.message !== undefined ? normalizeMessage(u.message) : message;
+        const line = enc.encode(`${old} ${next} ${ident}${text ? `\t${text}` : ""}\n`);
         if (u.newValue === null) {
           if (await files.exists(`logs/${u.name}`)) await removeAndPrune(`logs/${u.name}`);
           if (o.skipReflog) continue;
@@ -843,18 +845,28 @@ export function createFilesRefOps(
     }
   }
 
-  async function writeSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void> {
+  async function writeSymbolic(
+    name: string,
+    target: string,
+    log?: SymbolicRefLogOptions,
+  ): Promise<void> {
     // git's create_symref: the old value is what `name` resolved to before the write
     const old =
-      log?.message !== undefined ? await resolveId(name).catch(() => undefined) : undefined;
+      log?.message !== undefined && !log.reflog
+        ? await resolveId(name).catch(() => undefined)
+        : undefined;
     await writeLoose(name, `ref: ${target}\n`);
-    if (log?.message === undefined) return;
-    const next = await resolveId(target).catch(() => undefined);
-    if (next === undefined) return; // an unborn target: git logs nothing
-    const message = normalizeMessage(log.message);
-    const line = `${old ?? ZERO_ID} ${next} ${log.ident ?? defaultIdent()}${message ? `\t${message}` : ""}\n`;
-    // after the commit, as git's files_create_symref: the ref stands without its line
-    await appendLog(name, enc.encode(line)).catch(() => {});
+    if (!log || (log.message === undefined && !log.reflog)) return;
+    // an unborn target: git logs nothing
+    const next = log.reflog ? undefined : await resolveId(target).catch(() => undefined);
+    const ident = log.ident ?? defaultIdent();
+    for (const w of symrefReflogWrites(name, old, next, { ...log, ident })) {
+      if (w.op !== "append") continue;
+      const { oldId, newId, message } = w.line;
+      const line = `${oldId} ${newId} ${w.line.ident}${message ? `\t${message}` : ""}\n`;
+      // after the commit, as git's files_create_symref: the ref stands without its line
+      await appendLog(name, enc.encode(line), w.create && Boolean(log.reflog)).catch(() => {});
+    }
   }
 
   async function removeRef(name: string): Promise<boolean> {

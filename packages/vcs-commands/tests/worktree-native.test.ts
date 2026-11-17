@@ -137,6 +137,16 @@ const legacyColumns = () => {
   const [major, minor] = gitVersion();
   return major < 2 || (major === 2 && minor < 53);
 };
+/**
+ * Older git (2.43) set up a new worktree's HEAD in a child process run there, which logs it
+ * even when called from a bare repository; 2.5x writes it from the calling repository
+ * (`refs_update_ref` on the worktree's refs). The cut is placed at 2.50, between the two
+ * versions tested.
+ */
+const headLoggedInNewWorktree = () => {
+  const [major, minor] = gitVersion();
+  return major < 2 || (major === 2 && minor < 50);
+};
 /** Wording that changed after 2.43, as current git words it. */
 const currentWording = (text: string) =>
   text
@@ -1138,6 +1148,17 @@ describeGit("git worktree from inside a bare repository, native twins", () => {
     run(nb, "worktree", "add", "-q", join(native, "w1"), "feat");
     run(nb, "worktree", "add", "-q", "-b", "topic", join(native, "w2"), "main");
     run(nb, "worktree", "add", "-q", "--detach", join(native, "w3"), "main");
+    if (headLoggedInNewWorktree()) {
+      // older git wrote the new HEAD from a child process inside the new worktree, which
+      // logs it (`0000... <id>`); 2.5x writes it from the bare repository: unlogged
+      for (const name of ["w1", "w2", "w3"]) {
+        const log = join(nb, "worktrees", name, "logs", "HEAD");
+        const lines = readFileSync(log, "latin1").split("\n");
+        if (/^0{40} [0-9a-f]{40} [^\t]*$/.test(lines[0] ?? "")) lines.shift();
+        if (lines.join("") === "") rmSync(join(nb, "worktrees", name, "logs"), { recursive: true });
+        else writeFileSync(log, lines.join("\n"), "latin1");
+      }
+    }
     await git.worktreeAdd().setPath(join(ours, "w1")).setCommitish("feat").setIdent(IDENT).call();
     await git
       .worktreeAdd()

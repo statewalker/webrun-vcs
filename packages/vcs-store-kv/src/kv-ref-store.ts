@@ -17,21 +17,26 @@ import type {
   Ref,
   RefCommand,
   RefEntry,
+  RefLogOptions,
   ReflogDeleteOptions,
   ReflogLine,
   ReflogReader,
+  ReflogWrite,
   Refs,
   RefUpdateResult,
   SymbolicRef,
+  SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
 import {
   compareRefNames,
   createReflogReaderOf,
   deleteReflogLine,
+  isUpdatableRefName,
   planRefBatch,
   planReflog,
   ReflogEntryNotFoundError,
   RefStorage,
+  symrefReflogWrites,
 } from "@statewalker/vcs-core";
 import type { KVStore } from "./kv-store.js";
 
@@ -138,6 +143,18 @@ function toRef(name: string, value: string | undefined): Ref | SymbolicRef | und
   return { name, objectId: value, storage: RefStorage.LOOSE, peeled: false };
 }
 
+/** The id `name` resolves to in a snapshot (through symbolic refs), if any. */
+function resolveIn(refs: Snapshot, name: string): ObjectId | undefined {
+  let at = name;
+  for (let i = 0; i < MAX_SYMREF_READS; i++) {
+    const value = refs.get(at);
+    if (value === undefined) return undefined;
+    if (!value.startsWith(SYMREF_PREFIX)) return value;
+    at = value.slice(SYMREF_PREFIX.length);
+  }
+  return undefined;
+}
+
 /**
  * KV-based Refs: all refs in one root value, every write one compare-and-swap.
  *
@@ -232,7 +249,20 @@ export class KVRefStore implements Refs {
     }
   }
 
-  async set(refName: string, objectId: ObjectId): Promise<void> {
+  /**
+   * Point `refName` at `objectId`; with a reflog line (`log`), as a one-ref batch that logs
+   * it as git does (see {@link Refs.set}).
+   */
+  async set(refName: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
+    if (log && isUpdatableRefName(refName)) {
+      const r = await this.batch([{ name: refName, new: objectId, noDeref: true }], log);
+      if (!r.ok) {
+        throw new Error(
+          `cannot update ${refName}: ${r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", ")}`,
+        );
+      }
+      return;
+    }
     await this.update(
       async (refs) => {
         refs.set(refName, objectId);
@@ -244,16 +274,26 @@ export class KVRefStore implements Refs {
     );
   }
 
-  async setSymbolic(refName: string, target: string): Promise<void> {
+  /**
+   * Point `refName` at `target`; with a `log` message, `refName`'s reflog records it as
+   * git's create_symref does (see {@link Refs.setSymbolic}).
+   */
+  async setSymbolic(refName: string, target: string, log?: SymbolicRefLogOptions): Promise<void> {
+    let writes: ReflogWrite[] = [];
+    let committed = 0;
     await this.update(
-      async (refs) => {
+      async (refs, seq) => {
+        const old = log ? resolveIn(refs, refName) : undefined;
         refs.set(refName, `${SYMREF_PREFIX}${target}`);
+        writes = symrefReflogWrites(refName, old, log ? resolveIn(refs, target) : undefined, log);
+        committed = seq;
         return { result: undefined, write: true };
       },
       () => {
         throw new Error(`Could not update ${refName}: too many concurrent writers`);
       },
     );
+    if (writes.length > 0) await this.applyReflogWrites(writes, committed);
   }
 
   async remove(refName: string): Promise<boolean> {
@@ -316,7 +356,12 @@ export class KVRefStore implements Refs {
     seq: number,
     options?: BatchOptions,
   ): Promise<void> {
-    for (const w of planReflog(updates, options)) {
+    await this.applyReflogWrites(planReflog(updates, options), seq);
+  }
+
+  /** Reflog writes of root write `seq` (see {@link writeReflogs}). */
+  private async applyReflogWrites(writes: ReflogWrite[], seq: number): Promise<void> {
+    for (const w of writes) {
       const key = `${REFLOG_PREFIX}${w.name}`;
       try {
         for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {

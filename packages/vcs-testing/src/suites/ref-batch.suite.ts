@@ -63,6 +63,7 @@ export function createRefBatchTests(
   const itSym = options.symbolicRefs === false ? it.skip : it;
   const itMultiSym = multi && options.symbolicRefs !== false ? it : it.skip;
   const itLog = options.reflog ? it : it.skip;
+  const itLogSym = options.reflog && options.symbolicRefs !== false ? it : it.skip;
   const IDENT = "A U Thor <author@example.com> 1700000000 +0000";
   const Z = "0".repeat(40);
   describe(`Refs.batch [${name}]`, () => {
@@ -383,6 +384,84 @@ export function createRefBatchTests(
         "aaa2>aaa3:direct",
       ]);
       expect(await logOf("HEAD")).toEqual(["aaa1>aaa2:via HEAD", "aaa2>aaa3:direct"]);
+    });
+
+    itLog("set with a reflog line logs it, with its message and identity", async () => {
+      await refs.set("refs/heads/a", oid(1), {
+        ident: IDENT,
+        message: "branch: Created from HEAD",
+      });
+      await refs.set("refs/heads/a", oid(2), { ident: IDENT, message: "commit: second" });
+      expect(await refs.resolve("refs/heads/a")).toMatchObject({ objectId: oid(2) });
+      expect(await logOf("refs/heads/a")).toEqual([
+        `${Z.slice(-4)}>aaa1:branch: Created from HEAD`,
+        "aaa1>aaa2:commit: second",
+      ]);
+      const last = await (await refs.getReflog?.("refs/heads/a"))?.getLastEntry();
+      expect(last?.who).toMatchObject({ name: "A U Thor", email: "author@example.com" });
+      // a ref outside the default set gets no new log (refs/tags/, as git's logAllRefUpdates)
+      await refs.set("refs/tags/t", oid(1), { ident: IDENT, message: "tag" });
+      expect(await logOf("refs/tags/t")).toEqual([]);
+    });
+
+    itLogSym(
+      "set with a reflog line through a symbolic HEAD logs the branch and HEAD",
+      async () => {
+        await refs.set("refs/heads/main", oid(1), { ident: IDENT, message: "init" });
+        await refs.setSymbolic("HEAD", "refs/heads/main");
+        await refs.set("refs/heads/main", oid(2), { ident: IDENT, message: "commit: two" });
+        expect(await logOf("refs/heads/main")).toEqual([
+          `${Z.slice(-4)}>aaa1:init`,
+          "aaa1>aaa2:commit: two",
+        ]);
+        expect(await logOf("HEAD")).toEqual(["aaa1>aaa2:commit: two"]);
+      },
+    );
+
+    itLogSym("setSymbolic with a message logs as git's create_symref", async () => {
+      await refs.set("refs/heads/main", oid(1), { ident: IDENT, message: "init" });
+      await refs.set("refs/heads/feat", oid(2), { ident: IDENT, message: "init" });
+      // from nothing: zeros to the target's id
+      await refs.setSymbolic("HEAD", "refs/heads/main", { ident: IDENT, message: "clone: x" });
+      // re-pointed: the old resolved id to the new one
+      await refs.setSymbolic("HEAD", "refs/heads/feat", {
+        ident: IDENT,
+        message: "checkout: moving from main to feat",
+      });
+      // without a message: nothing
+      await refs.setSymbolic("HEAD", "refs/heads/main");
+      // an unborn target: no line (git skips it)
+      await refs.setSymbolic("HEAD", "refs/heads/none", { ident: IDENT, message: "unborn" });
+      expect(await refs.get("HEAD")).toMatchObject({ target: "refs/heads/none" });
+      expect(await logOf("HEAD")).toEqual([
+        `${Z.slice(-4)}>aaa1:clone: x`,
+        "aaa1>aaa2:checkout: moving from main to feat",
+      ]);
+      const last = await (await refs.getReflog?.("HEAD"))?.getLastEntry();
+      expect(last?.who).toMatchObject({ name: "A U Thor", email: "author@example.com" });
+      // a remote's HEAD symref is logged too (refs/remotes/ is in the default set)
+      await refs.setSymbolic("refs/remotes/origin/HEAD", "refs/heads/feat", {
+        ident: IDENT,
+        message: "fetch",
+      });
+      expect(await logOf("refs/remotes/origin/HEAD")).toEqual([`${Z.slice(-4)}>aaa2:fetch`]);
+    });
+
+    itMulti("a command's own message replaces the batch's for its line", async () => {
+      if (!options.reflog) return;
+      await seed(["refs/remotes/o/b", oid(1)]);
+      const r = await refs.batch(
+        [
+          { name: "refs/remotes/o/a", old: null, new: oid(1), message: "fetch: storing head" },
+          { name: "refs/remotes/o/b", old: oid(1), new: oid(2), message: "fetch: fast-forward" },
+          { name: "refs/remotes/o/c", old: null, new: oid(3) },
+        ],
+        { ident: IDENT, message: "batch" },
+      );
+      expect(r.ok).toBe(true);
+      expect(await logOf("refs/remotes/o/a")).toEqual([`${Z.slice(-4)}>aaa1:fetch: storing head`]);
+      expect((await logOf("refs/remotes/o/b")).at(-1)).toBe("aaa1>aaa2:fetch: fast-forward");
+      expect(await logOf("refs/remotes/o/c")).toEqual([`${Z.slice(-4)}>aaa3:batch`]);
     });
 
     itLog(

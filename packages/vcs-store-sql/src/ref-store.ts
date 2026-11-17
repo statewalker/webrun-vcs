@@ -9,18 +9,23 @@ import {
   type BatchResult,
   createReflogReaderOf,
   deleteReflogLine,
+  isUpdatableRefName,
   type ObjectId,
   planRefBatch,
   planReflog,
   type Ref,
   type RefCommand,
+  type RefLogOptions,
   type ReflogDeleteOptions,
   ReflogEntryNotFoundError,
   type ReflogReader,
+  type ReflogWrite,
   RefStorage,
   type Refs,
   type RefUpdateResult,
   type SymbolicRef,
+  type SymbolicRefLogOptions,
+  symrefReflogWrites,
 } from "@statewalker/vcs-core";
 import type { DatabaseClient } from "./database-client.js";
 
@@ -50,6 +55,41 @@ function prefixUpperBound(prefix: string): string {
   const chars = [...prefix];
   const last = chars.pop() ?? "";
   return chars.join("") + String.fromCodePoint((last.codePointAt(0) ?? 0) + 1);
+}
+
+/**
+ * Reflog writes inside a transaction: a dropped log's rows deleted, a line appended
+ * (to a log that exists, or one `create` allows).
+ */
+async function writeReflog(tx: DatabaseClient, writes: ReflogWrite[]): Promise<void> {
+  for (const w of writes) {
+    if (w.op === "drop") {
+      await tx.execute("DELETE FROM vcs_reflog WHERE name = ?", [w.name]);
+      continue;
+    }
+    const { name, line, create } = w;
+    if (!create) {
+      const rows = await tx.query("SELECT 1 FROM vcs_reflog WHERE name = ? LIMIT 1", [name]);
+      if (rows.length === 0) continue;
+    }
+    await tx.execute(
+      "INSERT INTO vcs_reflog (name, old_id, new_id, ident, message) VALUES (?, ?, ?, ?, ?)",
+      [name, line.oldId, line.newId, line.ident, line.message],
+    );
+  }
+}
+
+/** The id `name` resolves to through symbolic refs, read with `client`. */
+async function resolveId(client: DatabaseClient, name: string): Promise<ObjectId | undefined> {
+  let current = name;
+  for (let depth = 0; depth < MAX_SYMBOLIC_REF_DEPTH; depth++) {
+    const rows = await client.query<RefRow>("SELECT * FROM vcs_ref WHERE name = ?", [current]);
+    const row = rows[0];
+    if (!row) return undefined;
+    if (row.target == null) return row.object_id ?? undefined;
+    current = row.target;
+  }
+  return undefined;
 }
 
 function rowToRef(row: RefRow): Ref | SymbolicRef {
@@ -141,21 +181,7 @@ export class SQLRefStore implements Refs {
           );
         }
       }
-      for (const w of planReflog(plan.updates, options)) {
-        if (w.op === "drop") {
-          await tx.execute("DELETE FROM vcs_reflog WHERE name = ?", [w.name]);
-          continue;
-        }
-        const { name, line, create } = w;
-        if (!create) {
-          const rows = await tx.query("SELECT 1 FROM vcs_reflog WHERE name = ? LIMIT 1", [name]);
-          if (rows.length === 0) continue;
-        }
-        await tx.execute(
-          "INSERT INTO vcs_reflog (name, old_id, new_id, ident, message) VALUES (?, ?, ?, ?, ?)",
-          [name, line.oldId, line.newId, line.ident, line.message],
-        );
-      }
+      await writeReflog(tx, planReflog(plan.updates, options));
       return { ok: true, rejected: [] };
     });
   }
@@ -288,9 +314,19 @@ export class SQLRefStore implements Refs {
   }
 
   /**
-   * Set a ref to point to an object ID.
+   * Set a ref to point to an object ID; with a reflog line (`log`), as a one-ref batch
+   * that logs it as git does (see {@link Refs.set}).
    */
-  async set(refName: string, objectId: ObjectId): Promise<void> {
+  async set(refName: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
+    if (log && isUpdatableRefName(refName)) {
+      const r = await this.batch([{ name: refName, new: objectId, noDeref: true }], log);
+      if (!r.ok) {
+        throw new Error(
+          `cannot update ${refName}: ${r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", ")}`,
+        );
+      }
+      return;
+    }
     const now = Date.now();
     await this.db.execute(
       `INSERT INTO vcs_ref (name, object_id, target, storage, updated_at)
@@ -306,19 +342,29 @@ export class SQLRefStore implements Refs {
   }
 
   /**
-   * Set a symbolic ref.
+   * Set a symbolic ref; with a `log` message, `refName`'s reflog records it as git's
+   * create_symref does (see {@link Refs.setSymbolic}), in the same transaction.
    */
-  async setSymbolic(refName: string, target: string): Promise<void> {
-    const now = Date.now();
-    await this.db.execute(
-      `INSERT INTO vcs_ref (name, object_id, target, storage, updated_at)
-       VALUES (?, NULL, ?, ?, ?)
-       ON CONFLICT(name) DO UPDATE SET
-         object_id = NULL,
-         target = excluded.target,
-         updated_at = excluded.updated_at`,
-      [refName, target, RefStorage.LOOSE, now],
-    );
+  async setSymbolic(refName: string, target: string, log?: SymbolicRefLogOptions): Promise<void> {
+    const write = (client: DatabaseClient) =>
+      client.execute(
+        `INSERT INTO vcs_ref (name, object_id, target, storage, updated_at)
+         VALUES (?, NULL, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET
+           object_id = NULL,
+           target = excluded.target,
+           updated_at = excluded.updated_at`,
+        [refName, target, RefStorage.LOOSE, Date.now()],
+      );
+    if (log?.message === undefined && !log?.reflog) {
+      await write(this.db);
+      return;
+    }
+    await this.db.transaction(async (tx) => {
+      const old = await resolveId(tx, refName);
+      await write(tx);
+      await writeReflog(tx, symrefReflogWrites(refName, old, await resolveId(tx, target), log));
+    });
   }
 
   /**

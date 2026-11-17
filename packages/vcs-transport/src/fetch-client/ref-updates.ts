@@ -286,8 +286,15 @@ export async function applyRefUpdates(
     return;
   }
   if (options.atomic) {
-    // one batch, one message: the first ref's (git's transaction logs each ref its own)
-    const result = await refStore.batch(writes.map(command), logOf(writes[0] as FetchRefUpdate));
+    // one batch, each ref logged with its own message, as git's transaction logs it
+    const { message: _first, ...batchOptions } = logOf(writes[0] as FetchRefUpdate);
+    const result = await refStore.batch(
+      writes.map((u) => {
+        const message = logOf(u).message;
+        return { ...command(u), ...(message !== undefined ? { message } : {}) };
+      }),
+      batchOptions,
+    );
     if (!result.ok) {
       const reasons = new Map(result.rejected.map((r) => [r.name, r.reason]));
       for (const u of writes) reject(u, reasons.get(u.localRef) ?? "atomic transaction failed");

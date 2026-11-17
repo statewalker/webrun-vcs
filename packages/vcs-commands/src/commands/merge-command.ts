@@ -48,7 +48,7 @@ import {
 import { octopusMerge } from "./octopus-merge.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
-import { reflogMessages } from "./reflog-messages.js";
+import { reflogMessages, updateHead } from "./reflog-messages.js";
 import {
   applyAutostash,
   cleanupMessage,
@@ -960,6 +960,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
       return failed(refused.message, refused.paths);
     }
     await state.setRef("ORIG_HEAD", headId);
+    // `git reset --merge` moves HEAD where it is: "reset: moving to HEAD" (git's merge sets
+    // GIT_REFLOG_ACTION only after the abort, so a caller's action reads "<action>: updating HEAD")
+    const message = this.hasReflogAction()
+      ? `${this.reflogAction("merge")}: updating HEAD`
+      : reflogMessages.reset("HEAD");
+    await updateHead(this.refsStore, headId, this.reflogLine(message));
     await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
     await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
     return {

@@ -559,8 +559,16 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       const head = "id" in options.head ? options.head.id : `ref: ${options.head.ref}`;
       await this.writeText(`${admin}/HEAD`, `${head}\n`);
       await this.writeText(`${admin}/commondir`, "../..\n");
-      // update-ref / symbolic-ref log the new HEAD: no message, from the zero id
-      if (headId) await this.appendHeadLog(admin, ZERO_ID, headId, options.ident, "");
+      // update-ref / symbolic-ref log the new HEAD: no message, from the zero id. git 2.5x
+      // writes it in the calling process, so the calling repository's core.logAllRefUpdates
+      // default decides: from a bare repository itself (no setting) nothing is logged, from
+      // one of its linked worktrees (not bare to git) it is
+      const settings = await this.reflogSettings();
+      const callerLogs =
+        this.gitDir === this.commonDir ? settings.repositoryDefault : settings.logAllRefUpdates;
+      if (headId && callerLogs !== false) {
+        await this.appendHeadLog(admin, ZERO_ID, headId, options.ident, "");
+      }
     } catch (error) {
       await this.discardCreate(created, path).catch(() => undefined);
       throw error;

@@ -46,10 +46,11 @@ export function parseGitDate(text: string): { timestamp: number; tzOffset: strin
  * The identity and time of a reflog line written now, as git's `git_committer_info` builds
  * it: `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL` / `GIT_COMMITTER_DATE` (the host
  * environment's `committer`, on the working copy's configuration), else `user.name` /
- * `user.email` and the clock. Undefined when neither names anyone: the ref store's own
- * identity is used then.
+ * `user.email` and the clock (`now`, in seconds, when the caller read it once for all its
+ * lines, as git reads its default date once per process). Undefined when neither names
+ * anyone: the ref store's own identity is used then.
  */
-export function committerIdent(workingCopy: WorkingCopy): PersonIdent | undefined {
+export function committerIdent(workingCopy: WorkingCopy, now?: number): PersonIdent | undefined {
   const env = (workingCopy.config as { environment?: GitHostEnvironment } | undefined)?.environment
     ?.committer;
   const config = workingCopy.config ? RemoteConfigStore.from(workingCopy) : undefined;
@@ -60,21 +61,22 @@ export function committerIdent(workingCopy: WorkingCopy): PersonIdent | undefine
   return {
     name: name ?? "webrun-vcs",
     email: email ?? "vcs@localhost",
-    timestamp: date?.timestamp ?? Math.floor(Date.now() / 1000),
+    timestamp: date?.timestamp ?? now ?? Math.floor(Date.now() / 1000),
     tzOffset: date?.tzOffset ?? localOffset(),
   };
 }
 
 /**
  * A reflog line's options: `message`, with `who` as its identity (a commit's committer),
- * else {@link committerIdent}.
+ * else {@link committerIdent} at `now` (seconds; the clock when omitted).
  */
 export function reflogLine(
   workingCopy: WorkingCopy,
   message: string,
   who?: PersonIdent,
+  now?: number,
 ): RefLogOptions {
-  const ident = who ?? committerIdent(workingCopy);
+  const ident = who ?? committerIdent(workingCopy, now);
   return { message, ...(ident ? { ident: formatPersonIdent(ident) } : {}) };
 }
 

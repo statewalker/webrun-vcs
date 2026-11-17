@@ -233,7 +233,12 @@ export class TagCommand extends GitCommand<Ref> {
 
     // git's create_reflog_msg; refs/tags/ is logged only with core.logAllRefUpdates=always
     // or an existing reflog
-    const log = await tagReflogMessage(this.workingCopy, this.commits, targetId);
+    const log = await tagReflogMessage(
+      this.workingCopy,
+      { commits: this.commits, trees: this.trees, blobs: this.blobs, tags: this.tagsStore },
+      targetId,
+      this.hasReflogAction() ? this.reflogAction("tag") : undefined,
+    );
     await this.refsStore.set(refName, tagObjectId, this.reflogLine(log));
 
     this.setCallable(false);
@@ -331,16 +336,36 @@ export class ListTagCommand extends GitCommand<Ref[]> {
   }
 }
 
-/** `tag: tagging <abbrev> (<subject>, <YYYY-MM-DD>)` for the commit tagged (git's tag.c). */
+/**
+ * git's create_reflog_msg (builtin/tag.c): `tag: tagging <abbrev> (<what>)`, or
+ * `<GIT_REFLOG_ACTION> (<what>)` when an action is set. `<what>` is the commit's
+ * `<subject>, <YYYY-MM-DD>`, else `tree object`, `blob object`, `other tag object`, or
+ * `object of unknown type`.
+ */
 async function tagReflogMessage(
   workingCopy: WorkingCopy,
-  commits: CommandCommits,
+  stores: {
+    commits: CommandCommits;
+    trees: { has(id: ObjectId): Promise<boolean> };
+    blobs: { has(id: ObjectId): Promise<boolean> };
+    tags?: { has(id: ObjectId): Promise<boolean> };
+  },
   target: ObjectId,
+  action?: string,
 ): Promise<string> {
+  const has = async (store: { has(id: ObjectId): Promise<boolean> } | undefined) =>
+    (await store?.has(target).catch(() => false)) ?? false;
+  const commit = await stores.commits.load(target).catch(() => undefined);
+  let what: string;
+  if (commit) {
+    const date = new Date(commit.committer.timestamp * 1000).toISOString().slice(0, 10);
+    what = `${commitSubject(commit.message)}, ${date}`;
+  } else if (await has(stores.trees)) what = "tree object";
+  else if (await has(stores.blobs)) what = "blob object";
+  else if (await has(stores.tags)) what = "other tag object";
+  else what = "object of unknown type";
+  if (action !== undefined) return `${action} (${what})`;
   const abbrev = (await abbrevLengths(workingCopy, [target])).get(target) ?? 7;
-  const commit = await commits.load(target).catch(() => undefined);
-  const date = commit ? new Date(commit.committer.timestamp * 1000).toISOString().slice(0, 10) : "";
-  const what = commit ? `${commitSubject(commit.message)}, ${date}` : "object of unknown type";
   return `tag: tagging ${target.slice(0, abbrev)} (${what})`;
 }
 

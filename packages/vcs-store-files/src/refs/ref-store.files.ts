@@ -18,6 +18,7 @@ import type {
   Refs,
   RefUpdateResult,
   SymbolicRef,
+  SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
 import { isUpdatableRefName, SYMREF_PREFIX } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
@@ -176,8 +177,8 @@ export class FileRefStore implements Refs {
    * or on a D/F conflict. With a `log` message, the ref's reflog records the change as git's
    * create_symref does (see `Refs.setSymbolic`).
    */
-  async setSymbolic(refName: string, target: string, log?: RefLogOptions): Promise<void> {
-    if (log?.message === undefined) {
+  async setSymbolic(refName: string, target: string, log?: SymbolicRefLogOptions): Promise<void> {
+    if (log?.message === undefined && !log?.reflog) {
       await this.ops.writeLoose(refName, `${SYMREF_PREFIX}${target}\n`);
       return;
     }

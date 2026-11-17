@@ -12,7 +12,13 @@
  */
 
 import type { ObjectId } from "../../common/index.js";
-import type { BatchOptions, BatchResult, RefCommand, RefLogOptions } from "./ref-batch.js";
+import type {
+  BatchOptions,
+  BatchResult,
+  RefCommand,
+  RefLogOptions,
+  SymbolicRefLogOptions,
+} from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import type { ReflogDeleteOptions } from "./reflog-lines.js";
 import type { ReflogEntry, ReflogReader } from "./reflog-types.js";
@@ -108,11 +114,14 @@ export interface Refs {
    * logged when `target` does not resolve (an unborn branch). `git checkout <branch>` is
    * `setSymbolic("HEAD", "refs/heads/<branch>", { message: "checkout: moving from a to b" })`.
    *
+   * With `log.reflog`, those lines are written instead (the log created whatever the name),
+   * as `git remote rename` carries a symbolic ref's log over.
+   *
    * @param name Reference name
    * @param target Target reference name
    * @param log The reflog line's message and identity; without a message nothing is logged
    */
-  setSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void>;
+  setSymbolic(name: string, target: string, log?: SymbolicRefLogOptions): Promise<void>;
 
   /**
    * Remove a reference

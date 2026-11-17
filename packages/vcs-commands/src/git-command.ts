@@ -164,6 +164,8 @@ export abstract class GitCommand<T> {
   private callable = true;
   private racyCheckInstalled = false;
   private reflogActionOverride?: string;
+  /** The time of this command's reflog lines, read once (git's ident_default_date). */
+  private reflogClock?: number;
 
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
@@ -193,10 +195,14 @@ export abstract class GitCommand<T> {
 
   /**
    * A reflog line's options: `message` with `who` (a commit's committer) as its identity,
-   * else git's committer ident from the environment and configuration.
+   * else git's committer ident from the environment and configuration, at the time this
+   * command first asked for a line.
    */
   protected reflogLine(message: string, who?: PersonIdent): RefLogOptions {
-    return reflogLine(this._workingCopy, message, who);
+    // the clock is read once per command: a rebase's finish logs the branch and HEAD at
+    // one time, as git's process reads its default date once
+    this.reflogClock ??= Math.floor(Date.now() / 1000);
+    return reflogLine(this._workingCopy, message, who, this.reflogClock);
   }
 
   // ============ Store Accessors ============
