@@ -1,3 +1,4 @@
+import { crc32 as zlibCrc32 } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { CRC32, crc32 } from "../../../src/hash/crc32/crc32.js";
 
@@ -80,6 +81,30 @@ describe("crc32", () => {
       cloned.update(new Uint8Array([7, 8, 9]));
 
       expect(calc.getValue()).not.toBe(cloned.getValue());
+    });
+  });
+
+  describe("slicing by 8", () => {
+    const data = new Uint8Array(5000);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 2654435761) >>> 24;
+
+    it("matches zlib's CRC-32 for every length and offset around the 8-byte steps", () => {
+      for (let start = 0; start < 9; start++) {
+        for (let n = 0; n < 300; n++) {
+          const bytes = data.subarray(start, start + n);
+          expect(crc32(bytes)).toBe(zlibCrc32(bytes));
+        }
+      }
+      expect(crc32(data)).toBe(zlibCrc32(data));
+    });
+
+    it("gives the same value however the input is split", () => {
+      const want = zlibCrc32(data);
+      for (const step of [1, 3, 7, 8, 9, 64, 1000]) {
+        const calc = new CRC32();
+        for (let i = 0; i < data.length; i += step) calc.update(data.subarray(i, i + step));
+        expect(calc.getValue()).toBe(want);
+      }
     });
   });
 });

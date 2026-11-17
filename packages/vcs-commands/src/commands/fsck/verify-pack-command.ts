@@ -1,7 +1,7 @@
 import type { FilesApi } from "@statewalker/vcs-core";
 
 import { GitCommand } from "../../git-command.js";
-import { scanPack, unpackEntry } from "./fsck-pack.js";
+import { checkPack, type PackScanEntry, type UnpackedEntry } from "./fsck-pack.js";
 
 /** One object of a pack, as `git verify-pack -v` lists it. */
 export interface VerifyPackObject {
@@ -145,6 +145,8 @@ export class VerifyPackCommand extends GitCommand<VerifyPackResult> {
   }
 }
 
+const noBlob = () => false;
+
 async function verifyOnePack(
   files: FilesApi,
   packPath: string,
@@ -159,66 +161,83 @@ async function verifyOnePack(
     chainLengths: [],
     errors,
   };
-  const scan = await scanPack(files, packPath, idxPath, (m) => errors.push(`error: ${m}`));
-  const pack = scan.pack;
-  if (!pack) return report;
-  let ok = !scan.failed;
-  try {
-    const depthOf = new Map<string, number>();
-    const baseOf = new Map<string, string | undefined>();
-    for (const entry of scan.entries) {
-      if (!entry.crcOk) {
-        errors.push(
-          `error: index CRC mismatch for object ${entry.id} from ${packPath} at offset ${entry.offset}`,
-        );
-        ok = false;
-      }
-      const stored = await pack.entry(entry.id);
-      const unpacked = await unpackEntry(pack, packPath, entry, () => false);
-      if (!stored || "error" in unpacked) {
-        errors.push(`error: ${"error" in unpacked ? unpacked.error : `cannot read ${entry.id}`}`);
-        ok = false;
-        continue;
-      }
-      baseOf.set(entry.id, stored.baseId);
-      report.objects.push({
-        id: entry.id,
-        type: unpacked.type,
-        size: stored.size,
-        sizeInPack: entry.sizeInPack,
-        offset: entry.offset,
-        baseId: stored.baseId,
-      });
+  const depthOf = new Map<string, number>();
+  const baseOf = new Map<string, string | undefined>();
+  let ok = true;
+  let checksumAt = 0;
+  const add = (
+    entry: PackScanEntry,
+    unpacked: UnpackedEntry,
+    stored: { size: number; baseId?: string } | undefined,
+  ): void => {
+    if (!stored || "error" in unpacked) {
+      errors.push(`error: ${"error" in unpacked ? unpacked.error : `cannot read ${entry.id}`}`);
+      ok = false;
+      return;
     }
-    // delta depths: a delta of a whole object is 1, a delta of a delta one more
-    const depth = (id: string): number => {
-      const stack: string[] = [];
-      let at = id;
-      while (!depthOf.has(at)) {
-        const base = baseOf.get(at);
-        if (base === undefined) depthOf.set(at, 0);
-        else if (!baseOf.has(base)) depthOf.set(at, 1);
-        else {
-          stack.push(at);
-          at = base;
+    baseOf.set(entry.id, stored.baseId);
+    report.objects.push({
+      id: entry.id,
+      type: unpacked.type,
+      size: stored.size,
+      sizeInPack: entry.sizeInPack,
+      offset: entry.offset,
+      baseId: stored.baseId,
+    });
+  };
+  const result = await checkPack(
+    files,
+    packPath,
+    idxPath,
+    {
+      error: (m) => errors.push(`error: ${m}`),
+      opened: () => {
+        checksumAt = errors.length;
+      },
+      // git prints them before any entry's errors
+      checksumError: (m) => errors.splice(checksumAt++, 0, `error: ${m}`),
+      entry: (entry, unpacked, pack) => {
+        if (!entry.crcOk) {
+          errors.push(
+            `error: index CRC mismatch for object ${entry.id} from ${packPath} at offset ${entry.offset}`,
+          );
+          ok = false;
         }
+        // the header as the pack's read found it; `entry` reads it (with its errors) otherwise
+        if (entry.head) return add(entry, unpacked, entry.head);
+        return pack.entry(entry.id).then((stored) => add(entry, unpacked, stored));
+      },
+    },
+    { keepBlob: noBlob },
+  );
+  if (!result.opened) return report;
+  if (result.failed) ok = false;
+  // delta depths: a delta of a whole object is 1, a delta of a delta one more
+  const depth = (id: string): number => {
+    const stack: string[] = [];
+    let at = id;
+    while (!depthOf.has(at)) {
+      const base = baseOf.get(at);
+      if (base === undefined) depthOf.set(at, 0);
+      else if (!baseOf.has(base)) depthOf.set(at, 1);
+      else {
+        stack.push(at);
+        at = base;
       }
-      let d = depthOf.get(at) as number;
-      for (let x = stack.pop(); x !== undefined; x = stack.pop()) depthOf.set(x, ++d);
-      return depthOf.get(id) as number;
-    };
-    for (const o of report.objects) {
-      if (o.baseId === undefined) {
-        report.nonDelta++;
-        continue;
-      }
-      o.depth = depth(o.id);
-      report.chainLengths[o.depth - 1] = (report.chainLengths[o.depth - 1] ?? 0) + 1;
     }
-    for (let i = 0; i < report.chainLengths.length; i++) report.chainLengths[i] ??= 0;
-  } finally {
-    pack.close();
+    let d = depthOf.get(at) as number;
+    for (let x = stack.pop(); x !== undefined; x = stack.pop()) depthOf.set(x, ++d);
+    return depthOf.get(id) as number;
+  };
+  for (const o of report.objects) {
+    if (o.baseId === undefined) {
+      report.nonDelta++;
+      continue;
+    }
+    o.depth = depth(o.id);
+    report.chainLengths[o.depth - 1] = (report.chainLengths[o.depth - 1] ?? 0) + 1;
   }
+  for (let i = 0; i < report.chainLengths.length; i++) report.chainLengths[i] ??= 0;
   report.ok = ok;
   return report;
 }

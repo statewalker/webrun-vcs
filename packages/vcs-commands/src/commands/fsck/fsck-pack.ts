@@ -5,26 +5,41 @@
  *  - the idx's own SHA-1 (`Packfile index for <pack> hash mismatch`);
  *  - the pack's SHA-1 over everything before its trailer (`<pack> pack checksum mismatch`) and
  *    the trailer against the checksum the idx records (`... pack checksum does not match its
- *    index`), in one streaming pass that also computes each entry's CRC-32;
- *  - then entry by entry in pack order: the CRC-32 the idx records (`index CRC mismatch for
- *    object <id> from <pack> at offset <n>`), the entry unpacked (`cannot unpack <id> from
- *    <pack> at offset <n>`) and re-hashed (`packed <id> from <pack> is corrupt`).
+ *    index`);
+ *  - entry by entry in pack order: the CRC-32 the idx records (`index CRC mismatch for object
+ *    <id> from <pack> at offset <n>`), the entry unpacked (`cannot unpack <id> from <pack> at
+ *    offset <n>`) and re-hashed (`packed <id> from <pack> is corrupt`).
  *
- * Only the idx (git maps it too) and one object at a time are held; delta bases go through the
- * pack's bounded base cache.
+ * All of it in one sequential read of the pack, as `index-pack` reads one: each entry's bytes
+ * feed the pack's SHA-1 and the entry's CRC-32, and are inflated there, once, and the object is
+ * hashed in one call (`sha1Of`). A delta is applied to its base from a byte-bounded cache of
+ * the objects unpacked before it (16 MiB): in pack order a delta's base comes before it, and
+ * close to it, so this nearly always hits. Whatever this fast path does not handle as it stands
+ * (a REF_DELTA, a base not cached, an object over 1 MiB, an entry the pack's reader would find
+ * through a corrupt part of the idx, an entry that fails in any way) is read through the pack's
+ * own reader (`PackFile.getNow`), the reader the checks used before, so failures carry the
+ * same messages and verdicts. The checksum errors, known at the end of the read, are reported
+ * through `checksumError`, for the caller to place before the entries' output as git prints
+ * them.
+ *
+ * Only the idx (git maps it too), the cache and one entry at a time are held.
  */
 
 import {
+  DeltaBaseCache,
   type FilesApi,
   type GitObject,
   ObjectIdMismatchError,
+  type ObjectTypeString,
   openPack,
   type PackFile,
   type PackIndex,
   readPackIndex,
 } from "@statewalker/vcs-core";
+import { inflateWhole } from "@statewalker/vcs-utils/compression";
+import { applyGitDelta } from "@statewalker/vcs-utils/diff";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { createSha1, Sha1, sha1Of } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 /** One entry of a pack, in pack order. */
@@ -35,16 +50,57 @@ export interface PackScanEntry {
   sizeInPack: number;
   /** False when its CRC-32 is not the one the idx records (v2 idx only). */
   crcOk: boolean;
+  /** The idx's bytes, holding the id's 20 bytes at `idAt`. */
+  ids: Uint8Array;
+  idAt: number;
+  /**
+   * The entry's header (v2 idx only, and only when it is sound: otherwise `PackFile.entry`
+   * reads it, with its errors): its kind (1-4, 6 OFS_DELTA, 7 REF_DELTA), the size it declares
+   * and a delta's base.
+   */
+  head?: { kind: number; size: number; baseId?: string };
 }
 
-/** A pack opened for checking. */
-export interface PackScan {
-  /** The entries in pack order. */
-  entries: PackScanEntry[];
-  /** The pack, to read objects and entries from; undefined when it could not be opened. */
-  pack?: PackFile;
-  /** Whether a check failed (idx or pack checksum). */
+/** An object unpacked from a pack: its type and content, or what went wrong (git's texts). */
+export type UnpackedEntry =
+  | { type: string; content: Uint8Array }
+  | {
+      error: string;
+      corrupt: boolean;
+      /** The zlib error git prints first (`inflate: data stream error (...)`), if any. */
+      zlib?: string;
+    };
+
+/** What `checkPack` reports, as it goes. */
+export interface PackCheckHooks {
+  /** An error found before the entries are read (the idx), in git's `error()` text. */
+  error(message: string): void;
+  /** The pack is open: its entries and checksums are read next. */
+  opened?(): void;
+  /**
+   * A pack checksum error, found once every entry has been read; git prints it before any
+   * entry's output.
+   */
+  checksumError(message: string): void;
+  /** One entry, in pack order: unpacked and hashed, or what went wrong; `pack` reads more. */
+  entry(entry: PackScanEntry, unpacked: UnpackedEntry, pack: PackFile): void | Promise<void>;
+}
+
+export interface PackCheckOptions {
+  /** Resolves REF_DELTA bases outside the pack. */
+  externalBase?: (id: string) => Promise<GitObject | undefined>;
+  /** The idx, when the caller has read it already. */
+  read?: { bytes: Uint8Array; idx: PackIndex };
+  /** Whether a blob's content is wanted (otherwise its entry's `content` is empty). */
+  keepBlob: (id: string) => boolean;
+}
+
+/** What `checkPack` found. */
+export interface PackCheckResult {
+  /** Whether a check of the idx or the pack as a whole failed. */
   failed: boolean;
+  /** Whether the pack could be opened (its entries were read only then). */
+  opened: boolean;
 }
 
 async function readAll(files: FilesApi, path: string): Promise<Uint8Array> {
@@ -64,42 +120,60 @@ async function readAll(files: FilesApi, path: string): Promise<Uint8Array> {
   return out;
 }
 
+const TYPES: (ObjectTypeString | undefined)[] = [undefined, "commit", "tree", "blob", "tag"];
+/** Bytes of an entry kept for its header: the longest is a REF_DELTA's (at most 10 + 20). */
+const HEAD_MAX = 32;
+/** `openPack`'s defaults: the largest object, and zlib's largest expansion. */
+const MAX_OBJECT_SIZE = 2 ** 30;
+const MAX_EXPANSION = 1032;
+/** The pack reader's deepest delta chain. */
+const MAX_CHAIN = 4095;
 /**
- * Checks the idx and pack checksums and the entries' CRC-32s, reporting failures through
- * `error` (git's `error()` texts). `externalBase` resolves delta bases outside the pack; `read`
- * is the idx when the caller has read it already.
+ * Objects and deltas above this size, and entries whose compressed bytes are longer, go
+ * through the pack's reader (which streams large objects through the hash).
  */
-export async function scanPack(
+const FAST_MAX = 1024 * 1024;
+/**
+ * Bytes of recently unpacked objects kept as delta bases. In pack order a delta's base is
+ * nearly always among the last few hundred objects (repacks choose bases within a window of
+ * recent candidates), so this is far less than git's 96 MiB delta_base_cache: a base that is
+ * not kept is read through the pack's reader, which has that budget.
+ */
+const BASE_CACHE_BYTES = 16 * 2 ** 20;
+const EMPTY = new Uint8Array(0);
+
+/**
+ * Checks one pack: the idx's checksum first, then, in one read of the pack, its checksums and
+ * every entry (see the module comment). `hooks.entry` gets each entry as it is unpacked.
+ */
+export async function checkPack(
   files: FilesApi,
   packPath: string,
   idxPath: string,
-  error: (message: string) => void,
-  externalBase?: (id: string) => Promise<GitObject | undefined>,
-  read?: { bytes: Uint8Array; idx: PackIndex },
-): Promise<PackScan> {
+  hooks: PackCheckHooks,
+  options: PackCheckOptions,
+): Promise<PackCheckResult> {
   let failed = false;
   let idxBytes: Uint8Array;
   let idx: PackIndex;
+  const read = options.read;
   try {
     // the idx as the caller read it, or read here: once either way
     idxBytes = read?.bytes ?? (await readAll(files, idxPath));
     idx = read?.idx ?? readPackIndex(idxBytes);
   } catch {
-    error(`packfile ${packPath} index not opened`);
-    return { entries: [], failed: true };
+    hooks.error(`packfile ${packPath} index not opened`);
+    return { failed: true, opened: false };
   }
   // verify_pack_index
-  const idxSum = bytesToHex(
-    createSha1()
-      .update(idxBytes.subarray(0, idxBytes.length - 20))
-      .digest(),
-  );
-  if (idxSum !== bytesToHex(idxBytes.subarray(idxBytes.length - 20))) {
-    error(`Packfile index for ${packPath} hash mismatch`);
+  const idxSum = new Sha1().update(idxBytes.subarray(0, idxBytes.length - 20)).digest();
+  if (!sameBytes(idxSum, 0, idxBytes, idxBytes.length - 20)) {
+    hooks.error(`Packfile index for ${packPath} hash mismatch`);
     failed = true;
   }
 
-  let pack: PackFile | undefined;
+  const externalBase = options.externalBase;
+  let pack: PackFile;
   try {
     pack = await openPack(files, packPath, idxPath, {
       idxBytes,
@@ -112,75 +186,387 @@ export async function scanPack(
         : undefined,
     });
   } catch {
-    error(`packfile ${packPath} cannot be accessed`);
-    return { entries: [], failed: true };
+    hooks.error(`packfile ${packPath} cannot be accessed`);
+    return { failed: true, opened: false };
   }
 
-  const stats = await files.stats(packPath);
-  const packLength = stats?.size ?? 0;
-  const trailerAt = packLength - 20;
-  const raw: { id: string; offset: number; crc?: number }[] = [];
-  for (const e of idx.entries()) raw.push({ id: e.id, offset: e.offset, crc: e.crc32 });
-  raw.sort((a, b) => a.offset - b.offset);
-  const n = raw.length;
-  const crcOk = new Uint8Array(n).fill(1);
+  hooks.opened?.();
+  try {
+    const stats = await files.stats(packPath);
+    const packLength = stats?.size ?? 0;
+    const trailerAt = packLength - 20;
 
-  // One pass: the pack's SHA-1 and each entry's CRC-32
-  const sha = createSha1();
-  const trailer = new Uint8Array(20);
-  let pos = 0;
-  let k = 0;
-  let crc = new CRC32();
-  const entryEnd = (i: number) => (i + 1 < n ? (raw[i + 1]?.offset as number) : trailerAt);
-  while (k < n && entryEnd(k) <= (raw[k]?.offset as number)) k++;
-  for await (const chunk of files.read(packPath)) {
-    let at = 0;
-    while (at < chunk.length) {
-      if (pos >= trailerAt) {
-        const take = Math.min(chunk.length - at, packLength - pos);
-        trailer.set(chunk.subarray(at, at + take), pos - trailerAt);
-        pos += take;
-        at += take;
-        continue;
+    // the entries in pack order, with where each one's id is in the idx
+    const v2 = idx.version > 1;
+    const idsAt = v2 ? 8 + 1024 : 1024 + 4;
+    const idStride = v2 ? 20 : 24;
+    const count = idx.objectCount;
+    const lookups = idLookups(idxBytes, v2, count);
+    const ids = hexIds(idxBytes, idsAt, idStride, count);
+    const crcAt = idsAt + count * 20;
+    const offAt = v2 ? crcAt + count * 4 : 1024;
+    const offStride = v2 ? 4 : 24;
+    const largeAt = offAt + count * 4;
+    const raw: { id: string; offset: number; crc?: number; idAt: number; fast: boolean }[] = [];
+    for (let pos = 0; pos < count; pos++) {
+      // read as `PackIndex.entries()` reads them
+      let offset = u32(idxBytes, offAt + pos * offStride);
+      if (v2 && offset & 0x80000000) {
+        const at = largeAt + (offset & 0x7fffffff) * 8;
+        offset = u32(idxBytes, at) * 0x100000000 + u32(idxBytes, at + 4);
       }
-      const limit = Math.min(chunk.length - at, trailerAt - pos);
-      let take = limit;
-      if (k < n) {
-        const start = raw[k]?.offset as number;
-        if (pos < start) take = Math.min(take, start - pos);
-        else take = Math.min(take, entryEnd(k) - pos);
-      }
-      const part = chunk.subarray(at, at + take);
-      sha.update(part);
-      if (k < n && pos >= (raw[k]?.offset as number)) {
-        crc.update(part);
-        if (pos + take === entryEnd(k)) {
-          const want = raw[k]?.crc;
-          if (want !== undefined && crc.getValue() !== want) crcOk[k] = 0;
-          crc = new CRC32();
-          k++;
+      raw.push({
+        id: ids(pos),
+        offset,
+        crc: v2 ? u32(idxBytes, crcAt + pos * 4) : undefined,
+        idAt: idsAt + pos * idStride,
+        // the fast path reads only entries the pack's reader finds without an idx error: in a
+        // sound fan-out bucket, at a 32-bit offset past the pack header
+        fast: lookups(pos) && offset >= 12,
+      });
+    }
+    raw.sort((a, b) => a.offset - b.offset);
+    const n = raw.length;
+    const entryEnd = (i: number) => (i + 1 < n ? (raw[i + 1]?.offset as number) : trailerAt);
+
+    const keepBlob = options.keepBlob;
+    const cache = new DeltaBaseCache(BASE_CACHE_BYTES).scope();
+    /** each entry's delta depth (0 for a whole object), as the fast path resolved it */
+    const depth = new Uint16Array(n);
+    let deltaScratch = new Uint8Array(64 * 1024);
+
+    /**
+     * The entry `k` unpacked from its bytes `bytes` (header included), or undefined when the
+     * pack's reader has to read it.
+     */
+    const unpackFast = (
+      k: number,
+      head: ParsedHead,
+      bytes: Uint8Array,
+    ): { type: ObjectTypeString; data: Uint8Array } | undefined => {
+      if (head.size > FAST_MAX) return undefined;
+      const stream = bytes.subarray(head.dataAt);
+      let type: ObjectTypeString;
+      let data: Uint8Array;
+      if (head.kind <= 4) {
+        type = TYPES[head.kind] as ObjectTypeString;
+        data = new Uint8Array(head.size);
+        if (!inflateInto(stream, data)) return undefined;
+      } else if (head.kind === 6) {
+        const b = head.base;
+        if ((depth[b] as number) >= MAX_CHAIN) return undefined;
+        const base = cache.get((raw[b] as { offset: number }).offset);
+        if (!base) return undefined;
+        if (deltaScratch.length < head.size) deltaScratch = new Uint8Array(head.size);
+        const delta = deltaScratch.subarray(0, head.size);
+        if (!inflateInto(stream, delta)) return undefined;
+        try {
+          data = applyGitDelta(base.data, delta, MAX_OBJECT_SIZE);
+        } catch {
+          return undefined;
         }
+        type = base.type;
+        depth[k] = (depth[b] as number) + 1;
+      } else {
+        return undefined;
       }
-      pos += take;
-      at += take;
+      if (!hashesTo(type, data, idxBytes, (raw[k] as { idAt: number }).idAt)) return undefined;
+      cache.put((raw[k] as { offset: number }).offset, { type, data });
+      return { type, data };
+    };
+
+    /** Entry `k`, its bytes read (or undefined when they were not kept): to `hooks.entry`. */
+    const visit = (k: number, bytes: Uint8Array | undefined): void | Promise<void> => {
+      const e = raw[k] as (typeof raw)[number];
+      const head = v2 && bytes && e.fast ? parseEntryHead(bytes, raw, k, entryEnd(k)) : undefined;
+      const entry: PackScanEntry = {
+        id: e.id,
+        offset: e.offset,
+        sizeInPack: entryEnd(k) - e.offset,
+        crcOk,
+        ids: idxBytes,
+        idAt: e.idAt,
+        head:
+          head &&
+          (head.baseId === undefined
+            ? { kind: head.kind, size: head.size }
+            : { kind: head.kind, size: head.size, baseId: head.baseId }),
+      };
+      const fast = head && bytes ? unpackFast(k, head, bytes) : undefined;
+      if (fast) {
+        const content = fast.type === "blob" && !keepBlob(e.id) ? EMPTY : fast.data;
+        return hooks.entry(entry, { type: fast.type, content }, pack);
+      }
+      const slow = unpackEntry(pack, packPath, entry, keepBlob);
+      if (slow instanceof Promise) return slow.then((u) => hooks.entry(entry, u, pack));
+      return hooks.entry(entry, slow, pack);
+    };
+
+    // One pass: the pack's SHA-1, each entry's CRC-32 and bytes
+    const sha = new Sha1();
+    const trailer = new Uint8Array(20);
+    let at = 0;
+    let k = 0;
+    let crc = new CRC32();
+    let crcOk = true;
+    /** The bytes of the entry being read, when it spans chunks (and is not too long to keep). */
+    let pending = new Uint8Array(64 * 1024);
+    let pendingLength = 0;
+    let keep = false;
+    // entries the read skips (spanning nothing, at the start): through the reader, in order
+    for (; k < n && entryEnd(k) <= (raw[k]?.offset as number); k++) {
+      crcOk = true;
+      const r = visit(k, undefined);
+      if (r instanceof Promise) await r;
+    }
+    const startEntry = () => {
+      if (k >= n) return;
+      const span = entryEnd(k) - (raw[k]?.offset as number);
+      keep = span <= FAST_MAX + HEAD_MAX;
+      pendingLength = 0;
+      if (keep && pending.length < span) pending = new Uint8Array(span);
+    };
+    startEntry();
+    for await (const chunk of files.read(packPath)) {
+      // the pack's SHA-1 covers everything before the trailer
+      const hashed = Math.min(chunk.length, Math.max(0, trailerAt - at));
+      if (hashed > 0) sha.update(hashed === chunk.length ? chunk : chunk.subarray(0, hashed));
+      let c = 0;
+      while (c < chunk.length) {
+        if (at >= trailerAt) {
+          const take = Math.min(chunk.length - c, packLength - at);
+          if (take <= 0) break;
+          trailer.set(chunk.subarray(c, c + take), at - trailerAt);
+          at += take;
+          c += take;
+          continue;
+        }
+        let take = Math.min(chunk.length - c, trailerAt - at);
+        const inEntry = k < n && at >= (raw[k]?.offset as number);
+        if (k < n) {
+          const start = raw[k]?.offset as number;
+          if (at < start) take = Math.min(take, start - at);
+          else take = Math.min(take, entryEnd(k) - at);
+        }
+        const part = chunk.subarray(c, c + take);
+        at += take;
+        c += take;
+        if (!inEntry) continue;
+        crc.update(part);
+        const done = at === entryEnd(k);
+        let bytes: Uint8Array | undefined;
+        if (keep) {
+          if (done && pendingLength === 0) {
+            bytes = part; // the whole entry is in this chunk
+          } else {
+            pending.set(part, pendingLength);
+            pendingLength += part.length;
+            if (done) bytes = pending.subarray(0, pendingLength);
+          }
+        }
+        if (!done) continue;
+        const want = raw[k]?.crc;
+        crcOk = want === undefined || crc.getValue() === want;
+        crc = new CRC32();
+        const r = visit(k, bytes);
+        if (r instanceof Promise) await r;
+        k++;
+        startEntry();
+      }
+    }
+    // entries the read did not reach (a pack shorter than its idx says): through the reader
+    for (; k < n; k++) {
+      crcOk = true;
+      const r = visit(k, undefined);
+      if (r instanceof Promise) await r;
+    }
+    if (!sameBytes(sha.digest(), 0, trailer, 0)) {
+      hooks.checksumError(`${packPath} pack checksum mismatch`);
+      failed = true;
+    }
+    if (!sameBytes(idx.packChecksum, 0, trailer, 0)) {
+      hooks.checksumError(`${packPath} pack checksum does not match its index`);
+      failed = true;
+    }
+  } finally {
+    pack.close();
+  }
+  return { failed, opened: true };
+}
+
+/** A big-endian 32-bit word (as `PackIndex` reads one: bytes past the end read as 0). */
+function u32(b: Uint8Array, at: number): number {
+  return (
+    (((b[at] as number) << 24) |
+      ((b[at + 1] as number) << 16) |
+      ((b[at + 2] as number) << 8) |
+      (b[at + 3] as number)) >>>
+    0
+  );
+}
+
+const HEX_DIGITS = new TextEncoder().encode("0123456789abcdef");
+
+/**
+ * The idx's ids as hex strings, by position: decoded in one piece and sliced, so each is a
+ * flat string (hashing or comparing one does not first copy it, as it would a string built a
+ * digit pair at a time).
+ */
+function hexIds(
+  idx: Uint8Array,
+  idsAt: number,
+  stride: number,
+  n: number,
+): (pos: number) => string {
+  const text = new Uint8Array(n * 40);
+  for (let i = 0; i < n; i++) {
+    for (let k = 0, at = idsAt + i * stride, o = i * 40; k < 20; k++, o += 2) {
+      const b = (idx[at + k] as number) ?? 0;
+      text[o] = HEX_DIGITS[b >> 4] as number;
+      text[o + 1] = HEX_DIGITS[b & 15] as number;
     }
   }
-  if (bytesToHex(sha.digest()) !== bytesToHex(trailer)) {
-    error(`${packPath} pack checksum mismatch`);
-    failed = true;
-  }
-  if (bytesToHex(idx.packChecksum) !== bytesToHex(trailer)) {
-    error(`${packPath} pack checksum does not match its index`);
-    failed = true;
-  }
+  const all = new TextDecoder().decode(text);
+  return (pos) => all.slice(pos * 40, pos * 40 + 40);
+}
 
-  const entries: PackScanEntry[] = raw.map((e, i) => ({
-    id: e.id,
-    offset: e.offset,
-    sizeInPack: entryEnd(i) - e.offset,
-    crcOk: crcOk[i] === 1,
-  }));
-  return { entries, pack, failed };
+/**
+ * For each idx position, whether `PackFile` finds the id there without an error: its fan-out
+ * bucket (the id's first byte) is sorted and holds only its own ids (what a lookup checks
+ * before searching it), the position is inside that bucket, and the offset is a 32-bit one
+ * (a 64-bit offset is checked against its table when read).
+ */
+function idLookups(idx: Uint8Array, v2: boolean, n: number): (pos: number) => boolean {
+  const view = new DataView(idx.buffer, idx.byteOffset, idx.byteLength);
+  const fanAt = v2 ? 8 : 0;
+  const idsAt = v2 ? 8 + 1024 : 1024 + 4;
+  const stride = v2 ? 20 : 24;
+  const offAt = 8 + 1024 + n * 24;
+  const fan = (b: number) => (b < 0 ? 0 : view.getUint32(fanAt + b * 4));
+  const sound = new Uint8Array(256);
+  for (let b = 0; b < 256; b++) {
+    const from = fan(b - 1);
+    const to = fan(b);
+    let ok = from <= to && to <= n;
+    for (let i = from; ok && i < to; i++) {
+      const at = idsAt + i * stride;
+      if (idx[at] !== b) ok = false;
+      else if (i > from) {
+        let c = 0;
+        for (let j = 1; j < 20 && c === 0; j++)
+          c = (idx[at + j] as number) - (idx[at - stride + j] as number);
+        if (c <= 0) ok = false;
+      }
+    }
+    sound[b] = ok ? 1 : 0;
+  }
+  return (pos) => {
+    const b = idx[idsAt + pos * stride] as number;
+    if (!sound[b] || pos < fan(b - 1) || pos >= fan(b)) return false;
+    return !v2 || !(view.getUint32(offAt + pos * 4) & 0x80000000);
+  };
+}
+
+/** Inflates the zlib stream at the start of `input` into exactly `out`; false if it fails. */
+function inflateInto(input: Uint8Array, out: Uint8Array): boolean {
+  try {
+    return inflateWhole(input, { into: out }).length === out.length;
+  } catch {
+    return false;
+  }
+}
+
+function sameBytes(a: Uint8Array, at: number, b: Uint8Array, bt: number): boolean {
+  for (let i = 0; i < 20; i++) if (a[at + i] !== b[bt + i]) return false;
+  return true;
+}
+
+/** Where `hashesTo` writes an object's `"<type> <size>\0"` header (it runs synchronously). */
+const header = new Uint8Array(32);
+
+/** Whether `content` as `type` hashes to the 20 id bytes at `idAt` in `ids`. */
+function hashesTo(type: string, content: Uint8Array, ids: Uint8Array, idAt: number): boolean {
+  let n = 0;
+  for (let i = 0; i < type.length; i++) header[n++] = type.charCodeAt(i);
+  header[n++] = 0x20;
+  const size = String(content.length);
+  for (let i = 0; i < size.length; i++) header[n++] = size.charCodeAt(i);
+  header[n++] = 0;
+  return sameBytes(sha1Of(header.subarray(0, n), content), 0, ids, idAt);
+}
+
+/** An entry's header: kind, declared size, where its data starts, a delta's base. */
+interface ParsedHead {
+  kind: number;
+  size: number;
+  /** offset of the zlib stream from the entry's start */
+  dataAt: number;
+  /** an OFS_DELTA's base entry (its index in pack order) */
+  base: number;
+  baseId?: string;
+}
+
+/**
+ * The header of entry `k` (its first bytes in `h`, the entry ending at `end`), as
+ * `PackFile.entry` parses it; undefined when it is not sound in every way `entry` checks (then
+ * `entry` reads it and raises its error).
+ */
+function parseEntryHead(
+  h: Uint8Array,
+  raw: { id: string; offset: number }[],
+  k: number,
+  end: number,
+): ParsedHead | undefined {
+  const offset = (raw[k] as { offset: number }).offset;
+  const len = Math.min(h.length, HEAD_MAX);
+  let p = 0;
+  if (p >= len) return undefined;
+  let b = h[p++] as number;
+  const kind = (b >> 4) & 7;
+  let size = b & 0x0f;
+  let mul = 16;
+  while (b & 0x80) {
+    if (p >= len) return undefined;
+    b = h[p++] as number;
+    size += (b & 0x7f) * mul;
+    mul *= 128;
+    if (mul > 2 ** 53) return undefined;
+  }
+  if (size > MAX_OBJECT_SIZE) return undefined;
+  let baseId: string | undefined;
+  let base = -1;
+  if (kind === 6) {
+    if (p >= len) return undefined;
+    b = h[p++] as number;
+    let back = b & 0x7f;
+    while (b & 0x80) {
+      if (p >= len) return undefined;
+      b = h[p++] as number;
+      back = (back + 1) * 128 + (b & 0x7f);
+      if (back > offset) break;
+    }
+    const baseOffset = offset - back;
+    if (back === 0 || baseOffset < 12) return undefined;
+    // the entry starting there (entries are sorted by offset)
+    let lo = 0;
+    let hi = k;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((raw[mid] as { offset: number }).offset < baseOffset) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo >= k || (raw[lo] as { offset: number }).offset !== baseOffset) return undefined;
+    base = lo;
+    baseId = (raw[lo] as { id: string }).id;
+  } else if (kind === 7) {
+    if (p + 20 > len) return undefined;
+    baseId = bytesToHex(h.subarray(p, p + 20));
+    p += 20;
+  } else if (kind < 1 || kind > 4) {
+    return undefined;
+  }
+  if (size > (end - (offset + p)) * MAX_EXPANSION + 1024) return undefined;
+  return { kind, size, dataAt: p, base, baseId };
 }
 
 /** The whole content of an object read from a store. */
@@ -206,59 +592,106 @@ export async function collect(obj: GitObject): Promise<Uint8Array> {
   return out;
 }
 
-/** An object unpacked from a pack: its type and content, or what went wrong (git's texts). */
-export type UnpackedEntry =
-  | { type: string; content: Uint8Array }
-  | {
-      error: string;
-      corrupt: boolean;
-      /** The zlib error git prints first (`inflate: data stream error (...)`), if any. */
-      zlib?: string;
-    };
-
 /**
- * Unpacks and re-hashes one entry. `keep` says whether the content is wanted (trees, commits
- * and tags always are; a blob only when asked, otherwise it is streamed through the hash).
+ * Unpacks and re-hashes one entry through the pack's reader. A blob's content is kept only
+ * when `keepBlob` says so.
+ *
+ * Synchronous while the entry (and its delta bases) are in loaded windows or the base cache:
+ * the object comes whole from `getNow` and is hashed in one call. A large whole object streams
+ * (asynchronously) through the hash.
  */
-export async function unpackEntry(
+export function unpackEntry(
   pack: PackFile,
   packPath: string,
   entry: PackScanEntry,
   keepBlob: (id: string) => boolean,
-): Promise<UnpackedEntry> {
+): UnpackedEntry | Promise<UnpackedEntry> {
+  let obj: GitObject | undefined | Promise<GitObject | undefined>;
   try {
-    const obj = await pack.get(entry.id, { verify: true });
-    if (!obj) return { error: cannotUnpack(entry, packPath), corrupt: false };
-    if (obj.type === "blob" && !keepBlob(entry.id)) {
-      for await (const _ of obj.content) {
-        // hashed as it streams
-      }
-      return { type: obj.type, content: new Uint8Array(0) };
-    }
-    const parts: Uint8Array[] = [];
-    let n = 0;
+    obj = pack.getNow(entry.id);
+  } catch (e) {
+    return unpackError(entry, packPath, e);
+  }
+  if (obj instanceof Promise) {
+    return obj.then(
+      (o) => hashEntry(o, packPath, entry, keepBlob),
+      (e) => unpackError(entry, packPath, e),
+    );
+  }
+  return hashEntry(obj, packPath, entry, keepBlob);
+}
+
+function hashEntry(
+  obj: GitObject | undefined,
+  packPath: string,
+  entry: PackScanEntry,
+  keepBlob: (id: string) => boolean,
+): UnpackedEntry | Promise<UnpackedEntry> {
+  if (!obj) return { error: cannotUnpack(entry, packPath), corrupt: false };
+  const bytes = obj.bytes;
+  if (!bytes) return streamEntry(obj, packPath, entry, keepBlob);
+  if (objectIdOf(obj.type, bytes) !== entry.id) {
+    return { error: `packed ${entry.id} from ${packPath} is corrupt`, corrupt: true };
+  }
+  return { type: obj.type, content: obj.type === "blob" && !keepBlob(entry.id) ? EMPTY : bytes };
+}
+
+/** A large object (or one whose stream is broken): streamed through the hash. */
+async function streamEntry(
+  obj: GitObject,
+  packPath: string,
+  entry: PackScanEntry,
+  keepBlob: (id: string) => boolean,
+): Promise<UnpackedEntry> {
+  const keep = obj.type !== "blob" || keepBlob(entry.id);
+  const h = createSha1().update(enc.encode(`${obj.type} ${obj.size}\0`));
+  const parts: Uint8Array[] = [];
+  let n = 0;
+  try {
     for await (const c of obj.content) {
-      parts.push(c);
+      h.update(c);
+      if (keep) parts.push(c);
       n += c.length;
     }
-    const content = new Uint8Array(n);
-    let o = 0;
-    for (const p of parts) {
-      content.set(p, o);
-      o += p.length;
-    }
-    return { type: obj.type, content };
   } catch (e) {
-    if (e instanceof ObjectIdMismatchError) {
-      return { error: `packed ${entry.id} from ${packPath} is corrupt`, corrupt: true };
-    }
-    const inflate = /: inflate failed: (.*)$/.exec(e instanceof Error ? e.message : "")?.[1];
-    return {
-      error: cannotUnpack(entry, packPath),
-      corrupt: false,
-      zlib: inflate ? `inflate: data stream error (${inflate})` : undefined,
-    };
+    return unpackError(entry, packPath, e);
   }
+  if (bytesToHex(h.digest()) !== entry.id) {
+    return { error: `packed ${entry.id} from ${packPath} is corrupt`, corrupt: true };
+  }
+  if (!keep) return { type: obj.type, content: EMPTY };
+  const content = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) {
+    content.set(p, o);
+    o += p.length;
+  }
+  return { type: obj.type, content };
+}
+
+function unpackError(entry: PackScanEntry, packPath: string, e: unknown): UnpackedEntry {
+  if (e instanceof ObjectIdMismatchError) {
+    return { error: `packed ${entry.id} from ${packPath} is corrupt`, corrupt: true };
+  }
+  const inflate = /: inflate failed: (.*)$/.exec(e instanceof Error ? e.message : "")?.[1];
+  return {
+    error: cannotUnpack(entry, packPath),
+    corrupt: false,
+    zlib: inflate ? `inflate: data stream error (${inflate})` : undefined,
+  };
+}
+
+const enc = new TextEncoder();
+
+/** The git object id of `content` as `type`: SHA-1 over its header and content, as hex. */
+function objectIdOf(type: string, content: Uint8Array): string {
+  let n = 0;
+  for (let i = 0; i < type.length; i++) header[n++] = type.charCodeAt(i);
+  header[n++] = 0x20;
+  const size = String(content.length);
+  for (let i = 0; i < size.length; i++) header[n++] = size.charCodeAt(i);
+  header[n++] = 0;
+  return bytesToHex(sha1Of(header.subarray(0, n), content));
 }
 
 function cannotUnpack(entry: PackScanEntry, packPath: string): string {
