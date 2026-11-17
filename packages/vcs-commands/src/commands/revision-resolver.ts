@@ -26,8 +26,8 @@
  */
 
 import type { Commit, ObjectId, Refs } from "@statewalker/vcs-core";
-import { isSymbolicRef } from "@statewalker/vcs-core";
-import { compilePosixRegex } from "@statewalker/vcs-utils";
+import { isSymbolicRef, isValidRefName } from "@statewalker/vcs-core";
+import { compilePosixRegex, parseGitBool } from "@statewalker/vcs-utils";
 import type { Staging, WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { RevisionError } from "../errors/index.js";
@@ -61,6 +61,19 @@ type ObjectType = "commit" | "tree" | "blob" | "tag";
 
 const ZERO_ID = "0000000000000000000000000000000000000000";
 const HEX_ID = /^[0-9a-fA-F]{40}$/;
+
+/** git's `object_name_msg` advice after a 40-hex name that is also a ref. */
+const OBJECT_NAME_ADVICE = [
+  "Git normally never creates a ref that ends with 40 hex characters",
+  "because it will be ignored when you just specify 40-hex. These refs",
+  "may be created by mistake. For example,",
+  "",
+  "  git switch -c $br $(git rev-parse ...)",
+  "",
+  'where "$br" is somehow empty and a 40-hex ref is created. Please',
+  "examine these refs and maybe delete them. Turn this message off by",
+  'running "git config set advice.objectNameWarning false"',
+].join("\n");
 
 /** git's `ref_rev_parse_rules`. */
 const REV_PARSE_RULES = [
@@ -104,6 +117,8 @@ export class RevisionResolver {
   /** What git prints while resolving: `warning: ...` and `error: ...` lines */
   readonly warnings: string[] = [];
   private config?: RemoteConfigStore;
+  /** Refs read while resolving one revision (`HEAD~3` reads HEAD once) */
+  private readonly refCache = new Map<string, Promise<{ id: ObjectId; ref: string } | undefined>>();
 
   constructor(
     private readonly sources: RevisionSources,
@@ -183,7 +198,7 @@ export class RevisionResolver {
     const src = merges[0] ?? "";
     let dst = applyRefspecs(config.configuredFetchRefspecs(remote), src);
     if (dst === undefined && remote === ".") {
-      const found = await this.dwimRefAll(src);
+      const found = await this.dwimRefAll(src, false);
       dst = found.length === 1 ? found[0]?.ref : src;
     }
     if (dst === undefined) {
@@ -326,11 +341,19 @@ export class RevisionResolver {
 
   // ------------------------------------------------------------------ get_oid_basic
 
-  /** git's `get_oid_basic`: an object id, a ref, `<ref>@{<n>|<date>}`, `@{-N}`. */
+  /**
+   * git's `get_oid_basic`: an object id (taken as it is, whether the repository has the
+   * object or not), a ref, `<ref>@{<n>|<date>}`, `@{-N}`.
+   */
   private async basic(str: string): Promise<ObjectId | undefined> {
     if (HEX_ID.test(str)) {
-      const id = str.toLowerCase();
-      return (await this.objectType(id)) ? id : undefined;
+      // warn_on_object_refname_ambiguity: a ref spelled as the 40-hex
+      if (this.warnAmbiguousRefs() && (await this.dwimRefAll(str)).length > 0) {
+        this.warnings.push(`warning: refname '${str}' is ambiguous.`);
+        const advice = parseGitBool(this.remoteConfig().value("advice.objectNameWarning"));
+        if (advice !== false) this.warnings.push(OBJECT_NAME_ADVICE);
+      }
+      return str.toLowerCase();
     }
     let len = str.length;
     let at = 0;
@@ -366,11 +389,15 @@ export class RevisionResolver {
       }
     }
 
-    let found: { id: ObjectId; ref: string } | undefined;
-    if (len === 0 && reflogLen > 0) found = (await this.dwimRefAll("HEAD"))[0];
-    else if (reflogLen > 0) found = await this.dwimLog(base);
-    else found = (await this.dwimRefAll(base))[0];
+    let all: { id: ObjectId; ref: string }[];
+    if (len === 0 && reflogLen > 0) all = await this.dwimRefAll("HEAD");
+    else if (reflogLen > 0) all = await this.dwimLog(base);
+    else all = await this.dwimRefAll(base);
+    const found = all[0];
     if (!found) return undefined;
+    // warn_ambiguous_refs: more than one rule found a ref (or a log)
+    if (all.length > 1 && this.warnAmbiguousRefs())
+      this.warnings.push(`warning: refname '${base}' is ambiguous.`);
     if (reflogLen === 0) return found.id;
 
     const spec = str.slice(at + 2, at + 2 + reflogLen);
@@ -426,8 +453,17 @@ export class RevisionResolver {
     for (const entry of entries) {
       const timestamp = entry.who.timestamp;
       if (timestamp <= atTime || cnt === 0) {
-        if (ooid !== ZERO_ID) id = entry.newId;
-        else if (timestamp === atTime) id = entry.newId;
+        const date = formatRfc2822Date(timestamp, entry.who.tzOffset);
+        if (ooid !== ZERO_ID) {
+          id = entry.newId;
+          if (ooid !== entry.newId) {
+            this.warnings.push(`warning: log for ref ${ref} has gap after ${date}`);
+          }
+        } else if (timestamp === atTime) {
+          id = entry.newId;
+        } else if (entry.newId !== id) {
+          this.warnings.push(`warning: log for ref ${ref} unexpectedly ended on ${date}`);
+        }
         return {
           id,
           missing: false,
@@ -459,31 +495,50 @@ export class RevisionResolver {
     };
   }
 
-  /** git's `repo_dwim_ref`: every ref the rules find for `name` (its branch syntax read). */
-  private async dwimRefAll(name: string): Promise<{ id: ObjectId; ref: string }[]> {
+  /**
+   * git's `repo_dwim_ref` (`expand_ref`): every ref the rules find for `name` (its branch
+   * syntax read), git's `warn_ambiguous_refs` making it try them all. A name the rules
+   * make into no valid ref name (`check_refname_format`: `HEAD:a.txt`, `a..b`) is never
+   * looked up; a symref that points nowhere is `warning: ignoring dangling symref <ref>`.
+   */
+  private async dwimRefAll(name: string, warn = true): Promise<{ id: ObjectId; ref: string }[]> {
     const substituted = (await this.substituteBranchName(name)) ?? name;
     const found: { id: ObjectId; ref: string }[] = [];
-    for (const rule of REV_PARSE_RULES) {
-      const full = rule(substituted);
-      if (!isRefLike(full)) continue;
+    const all = this.warnAmbiguousRefs();
+    for (const full of candidateRefs(substituted)) {
       const resolved = await this.resolveRef(full);
-      if (resolved) found.push(resolved);
+      if (resolved) {
+        found.push(resolved);
+        if (!all) break;
+      } else if (warn && full !== "HEAD" && (await this.danglingSymref(full))) {
+        this.warnings.push(`warning: ignoring dangling symref ${full}`);
+      }
     }
     return found;
   }
 
-  /** git's `repo_dwim_log`: the first ref the rules find for `name` that has a reflog. */
-  private async dwimLog(name: string): Promise<{ id: ObjectId; ref: string } | undefined> {
+  /**
+   * git's `repo_dwim_log`: every ref the rules find for `name` that has a reflog (its own,
+   * or that of the ref it points to), the first one's value and log first.
+   */
+  private async dwimLog(name: string): Promise<{ id: ObjectId; ref: string }[]> {
     const substituted = (await this.substituteBranchName(name)) ?? name;
-    for (const rule of REV_PARSE_RULES) {
-      const full = rule(substituted);
-      if (!isRefLike(full)) continue;
+    const found: { id: ObjectId; ref: string }[] = [];
+    for (const full of candidateRefs(substituted)) {
       const resolved = await this.resolveRef(full);
       if (!resolved) continue;
-      if (await this.hasReflog(full)) return { id: resolved.id, ref: full };
-      if (resolved.ref !== full && (await this.hasReflog(resolved.ref))) return resolved;
+      if (await this.hasReflog(full)) found.push({ id: resolved.id, ref: full });
+      else if (resolved.ref !== full && (await this.hasReflog(resolved.ref))) found.push(resolved);
+      else continue;
+      if (!this.warnAmbiguousRefs()) break;
     }
-    return undefined;
+    return found;
+  }
+
+  /** Whether `name` is a symbolic ref (a chain of them) that ends at no ref. */
+  private async danglingSymref(name: string): Promise<boolean> {
+    const value = await safe(() => this.sources.refs.get(name));
+    return value !== undefined && isSymbolicRef(value);
   }
 
   private async hasReflog(ref: string): Promise<boolean> {
@@ -492,11 +547,24 @@ export class RevisionResolver {
 
   /** A ref and the ref its symbolic chain ends at, resolved (`refs_resolve_ref_unsafe`). */
   private async resolveRef(name: string): Promise<{ id: ObjectId; ref: string } | undefined> {
-    const resolved = await this.sources.refs.resolve(name);
+    const cached = this.refCache.get(name);
+    if (cached) return cached;
+    const promise = this.lookupRef(name);
+    this.refCache.set(name, promise);
+    return promise;
+  }
+
+  private async lookupRef(name: string): Promise<{ id: ObjectId; ref: string } | undefined> {
+    const first = await safe(() => this.sources.refs.get(name));
+    if (!first) return undefined;
+    if (!isSymbolicRef(first)) {
+      return first.objectId ? { id: first.objectId, ref: name } : undefined;
+    }
+    const resolved = await safe(() => this.sources.refs.resolve(name));
     if (!resolved?.objectId) return undefined;
-    let ref = name;
+    let ref = first.target;
     for (let i = 0; i < 10; i++) {
-      const value = await this.sources.refs.get(ref);
+      const value = await safe(() => this.sources.refs.get(ref));
       if (!value || !isSymbolicRef(value)) break;
       ref = value.target;
     }
@@ -621,6 +689,22 @@ export class RevisionResolver {
     return undefined;
   }
 
+  /**
+   * git's `deref_tag` as `lookup_commit_reference` uses it: tags followed; the object
+   * they end at and its type (undefined when the repository lacks it).
+   */
+  async peelTags(id: ObjectId): Promise<{ id: ObjectId; type: ObjectType | undefined }> {
+    let current = id;
+    for (let i = 0; i < 64; i++) {
+      const type = await this.objectType(current);
+      if (type !== "tag") return { id: current, type };
+      const next = (await this.sources.tags?.load(current))?.object;
+      if (next === undefined) return { id: current, type };
+      current = next;
+    }
+    return { id: current, type: "tag" };
+  }
+
   /** git's `deref_tag`: tags followed to what they point at. */
   private async derefTags(id: ObjectId): Promise<ObjectId | undefined> {
     let current: ObjectId | undefined = id;
@@ -633,16 +717,27 @@ export class RevisionResolver {
     return undefined;
   }
 
-  /** git's `get_tree_entry`: the object at `path` in a tree (the tree itself for ""). */
+  /**
+   * git's `get_tree_entry` / `find_tree_entry`: the object at `path` in a tree (the tree
+   * itself for ""). Components are matched exactly: an empty one (`/a`, `d//b`) names
+   * nothing, and a trailing `/` only follows a directory (`d/` is d, `a.txt/` nothing).
+   */
   private async treeEntry(tree: ObjectId, path: string): Promise<ObjectId | undefined> {
-    const parts = path.split("/").filter((p) => p !== "");
+    if (path === "") return tree;
     let current = tree;
-    for (const part of parts) {
-      const entry = await this.sources.trees.getEntry(current, part);
+    let rest = path;
+    for (;;) {
+      const slash = rest.indexOf("/");
+      const name = slash < 0 ? rest : rest.slice(0, slash);
+      if (name === "") return undefined;
+      const entry = await safe(() => this.sources.trees.getEntry(current, name));
       if (!entry) return undefined;
+      if (slash < 0) return entry.id;
+      if ((entry.mode & 0o170000) !== 0o040000) return undefined;
+      rest = rest.slice(slash + 1);
+      if (rest === "") return entry.id;
       current = entry.id;
     }
-    return current;
   }
 
   /** `:<n>:<path>`: the index entry of `path` at `stage`. */
@@ -751,6 +846,11 @@ export class RevisionResolver {
     return this.config;
   }
 
+  /** `core.warnAmbiguousRefs` (default true): every dwim rule tried, ambiguity warned. */
+  private warnAmbiguousRefs(): boolean {
+    return parseGitBool(this.remoteConfig().value("core.warnAmbiguousRefs")) ?? true;
+  }
+
   private fatal(revision: string, message: string): RevisionError {
     return new RevisionError(revision, `fatal: ${message}`);
   }
@@ -762,6 +862,20 @@ function interpretEmptyAt(name: string, at: number): boolean {
   const next = name.indexOf("@", 1);
   if (next >= 0 && name[next + 1] !== "{") return false;
   return (next < 0 ? name.length : next) === 1;
+}
+
+/**
+ * The full names git's `ref_rev_parse_rules` make of `name`, those its ref lookup would
+ * read: valid ref names (`check_refname_format`, one level allowed) that are `refs/...` or
+ * a root ref like `HEAD`.
+ */
+function candidateRefs(name: string): string[] {
+  const out: string[] = [];
+  for (const rule of REV_PARSE_RULES) {
+    const full = rule(name);
+    if (isRefLike(full) && isValidRefName(full, { allowOneLevel: true })) out.push(full);
+  }
+  return out;
 }
 
 /** Whether git's ref lookup takes `name` as a ref (`refs/...` or a root ref like `HEAD`). */

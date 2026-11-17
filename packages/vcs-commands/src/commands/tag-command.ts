@@ -91,7 +91,8 @@ export class TagCommand extends GitCommand<Ref> {
    */
   addMessage(message: string): this {
     this.checkCallable();
-    this.message = this.message === undefined ? message : `${this.message}\n\n${message}`;
+    // git's parse_msg_arg: "\n\n" before the next -m only after a non-empty one
+    this.message = !this.message ? message : `${this.message}\n\n${message}`;
     return this;
   }
 

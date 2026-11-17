@@ -270,6 +270,19 @@ describeGit("switch -m, checkout -m/-b/-B, merge -m, several -m, --discard-chang
     run(t.native, "checkout", "-q", "-m", "main");
     await (await open(t.ours)).checkout().setName("main").setMerge(true).call();
     expectSame(t);
+    // an untracked d.txt where feat writes one: refused, HEAD stays, the local change kept
+    // (git 2.55+ stashes it, fails the switch again and applies the stash back)
+    both(t, (repo) => put(repo, "d.txt", "untracked d\n"));
+    const n = attempt(t.native, "checkout", "-m", "feat");
+    expect(n.status).not.toBe(0);
+    const result = await (await open(t.ours)).checkout().setName("feat").setMerge(true).call();
+    expect(result.status).toBe(CheckoutStatus.CONFLICTS);
+    expect(result.ref).toBeNull();
+    const ours = result.message ?? "";
+    expect(ours.endsWith("\nApplied autostash.")).toBe(true);
+    // (git 2.43 merged in place and died on the untracked file with its own line)
+    if (autostashGit) expect(n.stderr.trimEnd()).toBe(ours);
+    expectSame(t);
   });
 
   it("checkout -b refuses an existing branch; setForceCreateBranch is -B", async () => {
@@ -389,5 +402,99 @@ describeGit("switch -m, checkout -m/-b/-B, merge -m, several -m, --discard-chang
     const r = await (await open(t.ours)).switch().setName("feat").setDiscardChanges(true).call();
     expect(r.status).toBe(CheckoutStatus.OK);
     expectSame(t);
+  });
+
+  itAutostash(
+    "checkout -m: a failure after the autostash keeps the changes (directory in place of a file)",
+    async () => {
+      const t = twins();
+      both(t, (repo) => {
+        rmSync(join(repo, "b.txt"));
+        put(repo, "b.txt/x", "in a directory\n");
+        put(repo, "a.txt", "L\n2\n3\n");
+      });
+      const n = attempt(t.native, "checkout", "-m", "feat");
+      expect(n.status).toBe(0);
+      const result = await (await open(t.ours)).checkout().setName("feat").setMerge(true).call();
+      expect(result.status).toBe(CheckoutStatus.CONFLICTS);
+      expect(result.conflicts).toEqual(["a.txt"]);
+      expect(n.stderr).toContain(result.message ?? "<none>");
+      expectSame(t);
+      expect(run(t.ours, "stash", "list")).toBe(run(t.native, "stash", "list"));
+    },
+  );
+
+  itAutostash("checkout -m from a detached HEAD: the base label is core.abbrev long", async () => {
+    const t = twins();
+    both(t, (repo) => {
+      run(repo, "config", "merge.conflictStyle", "diff3");
+      run(repo, "config", "core.abbrev", "12");
+      run(repo, "checkout", "-q", "--detach", "main");
+      put(repo, "a.txt", "L\n2\n3\n");
+    });
+    expect(attempt(t.native, "checkout", "-m", "feat").status).toBe(0);
+    await (await open(t.ours)).checkout().setName("feat").setMerge(true).call();
+    const main = run(t.ours, "rev-parse", "main").trim();
+    expect(readFileSync(join(t.ours, "a.txt"), "latin1")).toContain(
+      `||||||| ${main.slice(0, 12)}\n`,
+    );
+    expectSame(t);
+  });
+
+  it("checkout -m with -f is refused as git refuses it", async () => {
+    const t = twins();
+    const git = await open(t.ours);
+    expect(
+      await refusal(() => git.checkout().setName("feat").setMerge(true).setForced(true).call()),
+    ).toBe(nativeRefusal(t.native, "checkout", "-m", "-f", "feat"));
+    expectSame(t);
+  });
+
+  it("checkout -b <existing> <bad start>: the start point is refused first", async () => {
+    const t = twins();
+    const git = await open(t.ours);
+    for (const branch of ["feat", "fresh"]) {
+      expect(
+        await refusal(() =>
+          git.checkout().setCreateBranch(true).setName(branch).setStartPoint("nope").call(),
+        ),
+      ).toBe(nativeRefusal(t.native, "checkout", "-b", branch, "nope"));
+    }
+    // a tree as start point: the existing branch first, then the non-commit
+    expect(
+      await refusal(() =>
+        git.checkout().setCreateBranch(true).setName("feat").setStartPoint("HEAD^{tree}").call(),
+      ),
+    ).toBe(nativeRefusal(t.native, "checkout", "-b", "feat", "HEAD^{tree}"));
+    expect(
+      await refusal(() =>
+        git.checkout().setCreateBranch(true).setName("fresh").setStartPoint("HEAD^{tree}").call(),
+      ),
+    ).toBe(nativeRefusal(t.native, "checkout", "-b", "fresh", "HEAD^{tree}"));
+    expectSame(t);
+  });
+
+  it('several -m: an empty first -m adds no blank line (-m "" -m b)', async () => {
+    const t = twins();
+    both(t, (repo) => put(repo, "a.txt", "1\n2\n3\n5\n"));
+    run(t.native, "commit", "-qam", "", "-m", "Second");
+    const git = await open(t.ours);
+    await git.add().addFilepattern("a.txt").call();
+    await git.commit().addMessage("").addMessage("Second").call();
+    expectSame(t);
+    run(t.native, "merge", "-q", "--no-ff", "-m", "", "-m", "Merged", "side");
+    await (await open(t.ours))
+      .merge()
+      .include("side")
+      .setFastForwardMode(FastForwardMode.NO_FF)
+      .addMessage("")
+      .addMessage("Merged")
+      .call();
+    expectSame(t);
+    run(t.native, "tag", "-m", "", "-m", "Tagged", "rel");
+    await (await open(t.ours)).tag().setName("rel").addMessage("").addMessage("Tagged").call();
+    expectSame(t);
+    expect(run(t.ours, "cat-file", "tag", "rel")).toBe(run(t.native, "cat-file", "tag", "rel"));
+    expect(run(t.ours, "log", "--format=%B", "-2")).toBe(run(t.native, "log", "--format=%B", "-2"));
   });
 });

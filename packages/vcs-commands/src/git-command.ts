@@ -34,7 +34,7 @@ import {
 import { reflogLine } from "./commands/reflog-messages.js";
 import { RevisionResolver } from "./commands/revision-resolver.js";
 
-import { NoHeadError, RefNotFoundError } from "./errors/index.js";
+import { NoHeadError, NotACommitError, RefNotFoundError } from "./errors/index.js";
 
 /**
  * Extended Trees interface with legacy method names for command compatibility.
@@ -460,16 +460,30 @@ export abstract class GitCommand<T> {
   }
 
   /**
-   * Resolve a revision (see {@link resolveRevision}) to a commit: tags are peeled; a name
-   * that ends at a tree or a blob gives that object.
+   * Resolve a revision (see {@link resolveRevision}) to a commit, as git's
+   * `lookup_commit_reference` does: tags are peeled, and a revision that ends at a tree, a
+   * blob or a missing object is refused with git's lines, `error: object <id> is a tree,
+   * not a commit` (not for a missing object) and `fatal` (by default reset's `fatal: Could
+   * not parse object '<name>'.`).
    *
    * @param name Ref name, commit ID, or any revision expression
+   * @param fatal The command's last line for a revision that names no commit
    * @returns ObjectId of the resolved commit
    * @throws RefNotFoundError if it cannot be resolved
+   * @throws NotACommitError if it names something else
    * @throws RevisionError where git dies (no upstream, reflog too short)
    */
-  protected async resolveRef(name: string): Promise<ObjectId> {
-    return this.peelToCommit(await this.resolveRevision(name));
+  protected async resolveRef(
+    name: string,
+    fatal: (name: string) => string = (n) => `fatal: Could not parse object '${n}'.`,
+  ): Promise<ObjectId> {
+    const id = await this.resolveRevision(name);
+    const peeled = await this.revisionResolver().peelTags(id);
+    if (peeled.type === "commit") return peeled.id;
+    const lines = peeled.type
+      ? [`error: object ${peeled.id} is a ${peeled.type}, not a commit`, fatal(name)]
+      : [fatal(name)];
+    throw new NotACommitError(name, peeled.id, peeled.type, lines.join("\n"));
   }
 
   /**
@@ -513,33 +527,6 @@ export abstract class GitCommand<T> {
       if (--remaining === 0) return rest.slice(0, to) + name.slice(match[0].length);
     }
     return name;
-  }
-
-  /**
-   * Peel an object ID to a commit (follows tag objects).
-   */
-  private async peelToCommit(objectId: ObjectId): Promise<ObjectId> {
-    // If it's already a commit, return it
-    if (await this.commits.has(objectId)) {
-      return objectId;
-    }
-
-    // Try to load as tag and get target
-    const tags = this.tagsStore;
-    if (tags) {
-      try {
-        const tag = await tags.load(objectId);
-        if (tag) {
-          // Recursively peel
-          return this.peelToCommit(tag.object);
-        }
-      } catch {
-        // Not a tag
-      }
-    }
-
-    // Return as-is (might be a tree or blob in some contexts)
-    return objectId;
   }
 
   /**

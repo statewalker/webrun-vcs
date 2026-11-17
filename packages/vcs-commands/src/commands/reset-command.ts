@@ -1,9 +1,9 @@
-import type { ObjectId, Ref } from "@statewalker/vcs-core";
-import type { ResolveUndoRecord } from "@statewalker/vcs-working-tree";
+import type { Blobs, ObjectId, Ref } from "@statewalker/vcs-core";
+import type { ResolveUndoRecord, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
 import { ResetRefusedError } from "../errors/command-errors.js";
 import { RefNotFoundError } from "../errors/ref-errors.js";
-import { GitCommand } from "../git-command.js";
+import { type CommandTrees, GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
@@ -191,15 +191,15 @@ export class ResetCommand extends GitCommand<Ref> {
    */
   private async resetPaths(): Promise<Ref> {
     // For path reset, we reset the staging entries to match the ref
+    // git's parse_tree_indirect: any tree-ish (`HEAD^{tree}` too)
     const targetRef = this.ref ?? "HEAD";
-    const targetId = await this.resolveRef(targetRef);
-
-    // Load target commit's tree
-    const targetCommit = await this.commits.load(targetId);
-    if (!targetCommit) {
-      throw new RefNotFoundError(targetId, "Target commit not found");
+    const treeId = await this.revisionResolver().peelToType(
+      await this.resolveRevision(targetRef),
+      "tree",
+    );
+    if (treeId === undefined) {
+      throw new RefNotFoundError(targetRef, `fatal: Could not parse object '${targetRef}'.`);
     }
-    const treeId = targetCommit.tree;
 
     // Reset each path in staging
     const editor = this.staging.createEditor();
@@ -272,32 +272,11 @@ export class ResetCommand extends GitCommand<Ref> {
     if (!commit) {
       throw new RefNotFoundError(targetId, "Target commit not found");
     }
-
-    // Plan the whole restore first. Anything unrestorable then fails while the
-    // working tree is still untouched, instead of half-way through rewriting it.
-    const plan = await planTreeRestore(this.trees, this.blobs, commit.tree, RESET_HARD, {
-      symlinks: true,
-      ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
-      windows: worktree.capabilities?.windowsPaths === true,
-      reservedNames: worktree.capabilities?.reservedNames,
-    });
-
-    // Delete the files that were tracked but are not in the target tree first, as git's
-    // unpack-trees does: a tracked file or symlink `d` then makes way for `d/x`, and is
-    // never written beneath or through.
-    for (const path of trackedBefore) {
-      if (plan.paths.has(path)) continue;
-      await worktree.remove(path);
-    }
-
-    // a forced checkout: a file or link where a directory must go is unlinked, never
-    // written through; links are written as links where the worktree has them
-    await writeTreeRestorePlan(worktree, this.blobs, plan, RESET_HARD, {
-      symlinks: worktreeModeTrust(this.workingCopy, worktree).symlinks,
-      replaceInTheWay: true,
-      // git's reset --hard overwrites untracked files (UNPACK_RESET_OVERWRITE_UNTRACKED)
-      discardUntracked: true,
-    });
+    await restoreWorktreeHard(
+      { trees: this.trees, blobs: this.blobs, workingCopy: this.workingCopy, worktree },
+      commit.tree,
+      trackedBefore,
+    );
   }
 
   /**
@@ -363,4 +342,43 @@ export class ResetCommand extends GitCommand<Ref> {
 
     return undefined;
   }
+}
+
+/**
+ * The working tree half of `git reset --hard` (unpack-trees `oneway_merge` with `update`):
+ * `treeId` written over the worktree, the paths of `trackedBefore` it lacks deleted first.
+ * Untracked files in the way are overwritten, as git's reset does. The restore is planned
+ * in full before any file is touched.
+ */
+export async function restoreWorktreeHard(
+  deps: { trees: CommandTrees; blobs: Blobs; workingCopy: WorkingCopy; worktree: Worktree },
+  treeId: ObjectId,
+  trackedBefore: Set<string>,
+): Promise<void> {
+  const { trees, blobs, workingCopy, worktree } = deps;
+  // Plan the whole restore first. Anything unrestorable then fails while the
+  // working tree is still untouched, instead of half-way through rewriting it.
+  const plan = await planTreeRestore(trees, blobs, treeId, RESET_HARD, {
+    symlinks: true,
+    ...(await restoreCaseOptions(worktree, coreBool(workingCopy, "ignorecase", false))),
+    windows: worktree.capabilities?.windowsPaths === true,
+    reservedNames: worktree.capabilities?.reservedNames,
+  });
+
+  // Delete the files that were tracked but are not in the target tree first, as git's
+  // unpack-trees does: a tracked file or symlink `d` then makes way for `d/x`, and is
+  // never written beneath or through.
+  for (const path of trackedBefore) {
+    if (plan.paths.has(path)) continue;
+    await worktree.remove(path);
+  }
+
+  // a forced checkout: a file or link where a directory must go is unlinked, never
+  // written through; links are written as links where the worktree has them
+  await writeTreeRestorePlan(worktree, blobs, plan, RESET_HARD, {
+    symlinks: worktreeModeTrust(workingCopy, worktree).symlinks,
+    replaceInTheWay: true,
+    // git's reset --hard overwrites untracked files (UNPACK_RESET_OVERWRITE_UNTRACKED)
+    discardUntracked: true,
+  });
 }

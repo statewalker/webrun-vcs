@@ -154,7 +154,8 @@ export async function step06CheckoutBranches(): Promise<void> {
   High-level:
     git.checkout()
       .setName(branchName)         // Branch to checkout
-      .setCreateBranch(true)       // Create if doesn't exist
+      .setCreateBranch(true)       // Create (-b; refused if it exists)
+      // .setForceCreateBranch(true) // Create, or reset if it exists (-B)
       .setStartPoint(commitId)     // Starting point for new branch
       .call()
 

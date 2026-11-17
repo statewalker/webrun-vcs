@@ -3,6 +3,7 @@ import type { Staging } from "@statewalker/vcs-working-tree";
 
 import { NoHeadError, RefNotFoundError, StoreNotAvailableError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { abbrevLengths } from "./core-config.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
@@ -276,7 +277,12 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
         : undefined;
 
     // Build commit messages
-    const abbrev = headRef.objectId.substring(0, 7);
+    // git's find_unique_abbrev (core.abbrev, unique in the repository)
+    const head = headRef.objectId;
+    const abbrev = head.substring(
+      0,
+      (await abbrevLengths(this.workingCopy, [head])).get(head) ?? 7,
+    );
     const shortMessage = headCommit.message.split("\n")[0];
 
     // git's do_create_stash: the index and untracked commits' messages end in a line end

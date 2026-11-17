@@ -17,7 +17,7 @@ import {
   NoMergeBaseError,
   NotFastForwardError,
 } from "../errors/merge-errors.js";
-import { NoHeadError, RefNotFoundError } from "../errors/ref-errors.js";
+import { NoHeadError, NotACommitError, RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
 import {
   ContentMergeStrategy,
@@ -253,7 +253,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
    */
   addMessage(message: string): this {
     this.checkCallable();
-    this.message = this.message === undefined ? message : `${this.message}\n\n${message}`;
+    // git's option_parse_message: "\n\n" before the next -m only after a non-empty one
+    this.message = !this.message ? message : `${this.message}\n\n${message}`;
     return this;
   }
 
@@ -390,12 +391,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
 
     // Resolve merge source
     let srcRef = this.includes[0];
-    let srcId = await this.resolveRef(srcRef);
+    let srcId = await this.mergeHeadOf(srcRef);
     if (this.includes.length > 1) {
       // several heads: the independent ones besides HEAD (git's reduce_heads); two or more
       // are an octopus, one a merge of that head
       const named: { id: ObjectId; name: string }[] = [];
-      for (const name of this.includes) named.push({ id: await this.resolveRef(name), name });
+      for (const name of this.includes) named.push({ id: await this.mergeHeadOf(name), name });
       const candidates = [{ id: headId, name: "HEAD" }, ...named].filter(
         (c, k, all) => all.findIndex((x) => x.id === c.id) === k,
       );
@@ -1298,6 +1299,26 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private async isAncestor(commitA: ObjectId, commitB: ObjectId): Promise<boolean> {
     // the store's walk (git's repo_in_merge_bases): commit-graph generations cut it short
     return this.commits.isAncestor(commitA, commitB);
+  }
+
+  /**
+   * The commit a head to merge names (git's `get_merge_parent`, `peel_to_type` commit): a
+   * tree or a blob is `error: <name>: expected commit type, but the object dereferences to
+   * tree type` and `merge: <name> - not something we can merge`.
+   */
+  private async mergeHeadOf(name: string): Promise<ObjectId> {
+    try {
+      return await this.resolveRef(name);
+    } catch (error) {
+      if (!(error instanceof NotACommitError)) throw error;
+      const lines = error.objectType
+        ? [
+            `error: ${name}: expected commit type, but the object dereferences to ${error.objectType} type`,
+          ]
+        : [];
+      lines.push(`merge: ${name} - not something we can merge`);
+      throw new NotACommitError(name, error.objectId, error.objectType, lines.join("\n"));
+    }
   }
 }
 

@@ -14,7 +14,7 @@ import {
   InvalidMainlineParentError,
   MultipleParentsNotAllowedError,
 } from "../errors/merge-errors.js";
-import { RefNotFoundError } from "../errors/ref-errors.js";
+import { NotACommitError, RefNotFoundError } from "../errors/ref-errors.js";
 import type { CommandCommits, CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool } from "./core-config.js";
 import { authorIdentOf, committerIdentOf } from "./git-ident.js";
@@ -147,7 +147,7 @@ export class PickSequencer {
       );
     }
     const ids: ObjectId[] = [];
-    for (const name of names) ids.push(await this.deps.resolve(name));
+    for (const name of names) ids.push(await this.resolvePick(name));
     const todo = ids.map((id) => ({ action: this.options.action, id }));
     const headId = await this.headId();
     if (todo.length > 1) {
@@ -158,6 +158,22 @@ export class PickSequencer {
         await state.write("sequencer/opts", "[options]\n\tno-commit = true\n");
     }
     return this.run(todo, todo.length > 1);
+  }
+
+  /**
+   * The commit a name to pick or revert names; a tree or a blob is git's `error: <name>:
+   * can't cherry-pick a tree` (revision walk), a missing object `fatal: bad object <id>`.
+   */
+  private async resolvePick(name: string): Promise<ObjectId> {
+    try {
+      return await this.deps.resolve(name);
+    } catch (error) {
+      if (!(error instanceof NotACommitError)) throw error;
+      const message = error.objectType
+        ? `error: ${name}: can't cherry-pick a ${error.objectType}\nfatal: ${this.name} failed`
+        : `fatal: bad object ${name}`;
+      throw new NotACommitError(name, error.objectId, error.objectType, message);
+    }
   }
 
   /** Picks `todo` in order; `sequenced`: a `sequencer/` directory tracks the progress. */

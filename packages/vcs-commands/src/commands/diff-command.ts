@@ -1054,7 +1054,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private async resolveTreeId(refOrId: string): Promise<ObjectId> {
     let id: ObjectId;
     try {
-      id = await this.resolveRef(refOrId);
+      id = await this.resolveRevision(refOrId);
     } catch (e) {
       if (/^[0-9a-f]{40}$/.test(refOrId) && (await this.isTree(refOrId))) return refOrId;
       if (refOrId === "HEAD") throw new NoHeadError("HEAD cannot be resolved");
@@ -1063,15 +1063,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       }
       throw e;
     }
-    let commit: { tree: ObjectId } | undefined;
-    try {
-      commit = await this.commits.load(id);
-    } catch {
-      commit = undefined;
-    }
-    if (commit) return commit.tree;
-    // a tag peeled to a tree
-    if (await this.isTree(id)) return id;
+    // a commit's tree, a tree, or a tag of either
+    const tree = await this.revisionResolver().peelToType(id, "tree");
+    if (tree !== undefined) return tree;
     throw new RefNotFoundError(refOrId, `bad revision '${refOrId}'`);
   }
 

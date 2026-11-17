@@ -21,13 +21,14 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   BranchUsedByWorktreeError,
   InvalidRefNameError,
+  NotACommitError,
   RevisionError,
   SwitchRefusedError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { endOfSymbolicChain, guessRemoteBranch, TrackMode } from "./branch-tracking.js";
-import { CheckoutCommand, type CheckoutResult } from "./checkout-command.js";
+import { CheckoutCommand, type CheckoutResult, nonCommitSwitchError } from "./checkout-command.js";
 import { OperationState } from "./merge-support.js";
 
 /** git's hint after `a branch is expected` (advice.suggestDetachingHead). */
@@ -244,7 +245,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     if (arg !== undefined && name !== undefined) {
       if (created === undefined && !this.detach) {
         await this.checkBranchArgument(arg, name);
-      } else if (!(await this.namesCommit(name))) {
+      } else if (!(await this.namesCommit(arg, name))) {
         throw new SwitchRefusedError(`fatal: invalid reference: ${arg}`);
       }
     }
@@ -303,9 +304,10 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     if (isValidBranchName(name) && (await this.refsStore.has(`refs/heads/${name}`))) return;
     let commit: string | undefined;
     try {
-      const id = await this.resolveRef(name);
-      if (await this.commits.has(id)) commit = id;
+      commit = await this.resolveRef(name);
     } catch (error) {
+      // a tree or a blob: git's switch_branches refusal
+      if (error instanceof NotACommitError) throw nonCommitSwitchError(arg, error);
       // not a revision; where git dies reading it (`@{u}` without upstream), its message
       if (error instanceof RevisionError) throw error;
     }
@@ -320,12 +322,16 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     throw new SwitchRefusedError(`fatal: ${await this.expectedABranch(name)}\n${DETACH_HINT}`);
   }
 
-  /** Whether `name` (`@{-N}` expanded) is a revision that names a commit. */
-  private async namesCommit(name: string): Promise<boolean> {
+  /**
+   * Whether `name` (`@{-N}` expanded) is a revision that names a commit; one that names a
+   * tree, a blob or a missing object is refused as git's switch_branches refuses it.
+   */
+  private async namesCommit(arg: string, name: string): Promise<boolean> {
     try {
-      const id = await this.resolveRef(name);
-      return await this.commits.has(id);
+      await this.resolveRef(name);
+      return true;
     } catch (error) {
+      if (error instanceof NotACommitError) throw nonCommitSwitchError(arg, error);
       if (error instanceof RevisionError) throw error;
       return false;
     }

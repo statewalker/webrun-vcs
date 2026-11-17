@@ -13,7 +13,7 @@
 
 import type { ObjectId } from "@statewalker/vcs-core";
 
-import { MissingArgumentError, RefNotFoundError } from "../errors/index.js";
+import { MissingArgumentError, RefNotFoundError, RevisionError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 
 /** What {@link RevParseCommand} found. */
@@ -47,7 +47,16 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     this.setCallable(false);
     if (this.revision === undefined) throw new MissingArgumentError("revision");
     const resolver = this.revisionResolver();
-    const objectId = await resolver.resolve(this.revision);
+    let objectId: ObjectId | undefined;
+    try {
+      objectId = await resolver.resolve(this.revision);
+    } catch (error) {
+      // what git printed before it died comes first
+      if (error instanceof RevisionError && resolver.warnings.length > 0) {
+        throw new RevisionError(this.revision, [...resolver.warnings, error.message].join("\n"));
+      }
+      throw error;
+    }
     if (objectId === undefined) {
       const lines = [...resolver.warnings, "fatal: Needed a single revision"];
       throw new RefNotFoundError(this.revision, lines.join("\n"));

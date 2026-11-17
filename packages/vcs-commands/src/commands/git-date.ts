@@ -315,7 +315,15 @@ const noDate = (tm: Tm) =>
 const maybeIso8601 = (tm: Tm) => tm.hour === -1 && tm.min === 0 && tm.sec === 0;
 
 /** git's `match_multi_number`: `num<c>num2[<c>num3]`, a time or a date; 0 when neither. */
-function matchMultiNumber(num: number, c: string, s: string, start: number, at: number, tm: Tm) {
+function matchMultiNumber(
+  num: number,
+  c: string,
+  s: string,
+  start: number,
+  at: number,
+  tm: Tm,
+  nowArg = 0,
+) {
   let end = at;
   const second = strtol(s, end + 1);
   const num2 = second.value;
@@ -333,7 +341,8 @@ function matchMultiNumber(num: number, c: string, s: string, start: number, at: 
     if (s[end] === "." && isDigit(s[end + 1]) && isDateKnown(tm)) end = strtol(s, end + 1).end;
     return end - start;
   }
-  const now = Math.floor(Date.now() / 1000);
+  // parse_date passes 0 (the current time), approxidate its own now
+  const now = nowArg || Math.floor(Date.now() / 1000);
   const refuseFuture = gmtime(now);
   const [n1, n2, n3] = [toInt(num), toInt(num2), toInt(num3)];
   if (num > 70) {
@@ -528,11 +537,22 @@ export function parseGitDate(text: string): { timestamp: number; tzOffset: strin
 /** git's `struct tm` as `approxidate_str` fills it: local fields, -1 where not seen yet. */
 interface ApproxTm extends Tm {
   wday: number;
+  /** `tm_isdst`: 1 in summer time, 0 outside it (what `localtime_r` gave last) */
+  isdst: number;
 }
 
-/** `localtime_r`: the local fields of `seconds`. */
+/** The standard and the summer offsets (seconds east of UTC) of the year `seconds` is in. */
+function yearOffsets(seconds: number): { std: number; dst: number } {
+  const year = new Date(seconds * 1000).getUTCFullYear();
+  const jan = localOffsetAt(Date.UTC(year, 0, 1) / 1000);
+  const jul = localOffsetAt(Date.UTC(year, 6, 1) / 1000);
+  return { std: Math.min(jan, jul), dst: Math.max(jan, jul) };
+}
+
+/** `localtime_r`: the local fields of `seconds`, `tm_isdst` included. */
 function localtime(seconds: number): ApproxTm {
   const d = new Date(seconds * 1000);
+  const { std, dst } = yearOffsets(seconds);
   return {
     year: d.getFullYear() - 1900,
     mon: d.getMonth(),
@@ -541,15 +561,28 @@ function localtime(seconds: number): ApproxTm {
     min: d.getMinutes(),
     sec: d.getSeconds(),
     wday: d.getDay(),
+    isdst: dst !== std && localOffsetAt(seconds) === dst ? 1 : 0,
   };
 }
 
-/** `mktime`: the local fields as seconds since the epoch, out-of-range fields carried. */
-function mktime(tm: Tm): number {
-  const d = new Date(2000, 0, 1, 0, 0, 0);
-  d.setFullYear(tm.year + 1900, tm.mon, tm.mday);
-  d.setHours(tm.hour, tm.min, tm.sec);
-  return Math.floor(d.getTime() / 1000);
+/**
+ * glibc's `mktime`: the local fields as seconds since the epoch, out-of-range fields
+ * carried. `tm_isdst` is honoured as glibc honours it: a time on the other side of a
+ * summer-time change from what `isdst` says is read in the offset `isdst` names (git's
+ * approxidate keeps now's `tm_isdst`, so "june" asked in November is an hour off).
+ */
+function mktime(tm: ApproxTm): number {
+  const d = new Date(0);
+  d.setUTCFullYear(tm.year + 1900, tm.mon, tm.mday);
+  d.setUTCHours(tm.hour, tm.min, tm.sec);
+  const wall = Math.floor(d.getTime() / 1000);
+  const t = mktimeLocal(wall);
+  if (tm.isdst < 0) return t;
+  const { std, dst } = yearOffsets(t);
+  if (std === dst) return t;
+  const actual = localOffsetAt(t) === dst ? 1 : 0;
+  if (actual === (tm.isdst > 0 ? 1 : 0)) return t;
+  return wall - (tm.isdst > 0 ? dst : std);
 }
 
 /** git's `update_tm`: the missing fields from `now`, `sec` seconds back; `tm` refilled. */
@@ -781,10 +814,16 @@ function approxidateAlpha(
 }
 
 /** git's `approxidate_digit`: a number, or a date or time written with numbers. */
-function approxidateDigit(s: string, i: number, tm: ApproxTm, num: { value: number }): number {
+function approxidateDigit(
+  s: string,
+  i: number,
+  tm: ApproxTm,
+  num: { value: number },
+  now: number,
+): number {
   const { value: number, end } = digitsAt(s, i);
   if (":./-".includes(s[end] ?? "x") && isDigit(s[end + 1])) {
-    const match = matchMultiNumber(number, s[end] ?? "", s, i, end, tm);
+    const match = matchMultiNumber(number, s[end] ?? "", s, i, end, tm, now);
     if (match) return i + match;
   }
   // zero-padding only for small numbers ("Dec 02", never "Dec 0002")
@@ -821,7 +860,7 @@ export function approxidateCareful(
     const c = s[i];
     if (isDigit(c)) {
       pendingNumber(tm, num);
-      i = approxidateDigit(s, i, tm, num);
+      i = approxidateDigit(s, i, tm, num, now);
       touched.value = true;
       continue;
     }

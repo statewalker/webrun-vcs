@@ -63,6 +63,35 @@ export class RevisionError extends GitApiError {
 }
 
 /**
+ * Thrown where a command needs a commit and the revision names something else: a tree, a
+ * blob, a tag of one, or an object the repository does not have (git's
+ * `lookup_commit_reference` failing). The message is git's, as the command prints it:
+ * `error: object <id> is a tree, not a commit` and the command's `fatal:` line
+ * (`fatal: Could not parse object 'HEAD^{tree}'.` for reset, `fatal: not a valid branch
+ * point: 'HEAD:a'` for branch).
+ */
+export class NotACommitError extends GitApiError {
+  readonly revision: string;
+  /** The object the revision ends at (tags peeled) */
+  readonly objectId: string;
+  /** Its type, undefined when the repository does not have it */
+  readonly objectType: "tree" | "blob" | "tag" | undefined;
+
+  constructor(
+    revision: string,
+    objectId: string,
+    objectType: "tree" | "blob" | "tag" | undefined,
+    message: string,
+  ) {
+    super(message);
+    this.name = "NotACommitError";
+    this.revision = revision;
+    this.objectId = objectId;
+    this.objectType = objectType;
+  }
+}
+
+/**
  * Thrown when trying to delete the current branch.
  *
  * Based on JGit's CannotDeleteCurrentBranchException.

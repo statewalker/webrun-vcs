@@ -163,7 +163,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    */
   async setUpstreamBranch(upstream: string): Promise<this> {
     this.checkCallable();
-    this.upstreamCommit = await this.resolveRef(upstream);
+    this.upstreamCommit = await this.resolveRef(upstream, (n) => `fatal: invalid upstream '${n}'`);
     this.upstreamCommitName = upstream;
     return this;
   }

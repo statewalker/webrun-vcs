@@ -132,7 +132,7 @@ export class CreateBranchCommand extends GitCommand<Ref> {
 
     // Resolve start point
     const targetId = this.startPoint
-      ? await this.resolveRef(this.startPoint)
+      ? await this.resolveRef(this.startPoint, (n) => `fatal: not a valid branch point: '${n}'`)
       : await this.resolveHead();
 
     // git's create_branch: "branch: Created from <start>", "branch: Reset to <start>" (-f);

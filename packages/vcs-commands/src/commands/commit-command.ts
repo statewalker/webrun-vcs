@@ -127,10 +127,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   addMessage(message: string): this {
     this.checkCallable();
-    this.message =
-      this.message === undefined
-        ? message
-        : `${this.message}${this.message.endsWith("\n") ? "" : "\n"}\n${message}`;
+    // git's opt_parse_m: a newline before the next -m only when the buffer holds something
+    this.message = !this.message
+      ? message
+      : `${this.message}${this.message.endsWith("\n") ? "" : "\n"}\n${message}`;
     return this;
   }
 
