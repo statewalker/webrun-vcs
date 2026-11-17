@@ -33,6 +33,7 @@ import type {
   CreateLinkedWorktreeOptions,
   LinkedWorktrees,
   WorkingCopy,
+  WorktreeAdmin,
   WorktreeInfo,
   WorktreePathState,
   WorktreePruneCheck,
@@ -769,6 +770,22 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       detached: false,
       current: true,
     });
+  }
+
+  /**
+   * `git worktree` from the current git directory ({@link LinkedWorktrees.openAdmin}): a
+   * bare repository gives its history and configuration, without a working copy; a
+   * worktree gives its working copy ({@link openCurrent}).
+   */
+  async openAdmin(): Promise<WorktreeAdmin> {
+    const current = (await this.list()).find((wt) => wt.current);
+    // the current working copy (open() gives every one its worktrees)
+    if (!current?.bare) return (await this.openCurrent()) as WorkingCopy & WorktreeAdmin;
+    const config = await createWorkingCopyConfig(this.configFiles(), this.commonDir, undefined, {
+      ...(this.options.environment ? { environment: this.options.environment } : {}),
+      gitDirPath: this.paths.hostPath(this.commonDir),
+    });
+    return { history: this.history, config, worktrees: this };
   }
 
   async updateHead(

@@ -3,7 +3,9 @@ import type {
   Commit,
   Commits,
   ObjectId,
+  PersonIdent,
   Ref,
+  RefLogOptions,
   Refs,
   SymbolicRef,
   Tag,
@@ -21,6 +23,7 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import { worktreeModeTrust } from "./commands/core-config.js";
+import { reflogLine } from "./commands/reflog-messages.js";
 
 import { NoHeadError, RefNotFoundError } from "./errors/index.js";
 
@@ -160,9 +163,40 @@ export abstract class GitCommand<T> {
   protected readonly _workingCopy: WorkingCopy;
   private callable = true;
   private racyCheckInstalled = false;
+  private reflogActionOverride?: string;
 
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
+  }
+
+  /**
+   * The action named in the reflog lines this command writes, in place of its own (git's
+   * `GIT_REFLOG_ACTION`): `git pull` runs its merge as `pull`, so the line reads
+   * `pull: Fast-forward`. Each command uses it where git does: as the whole message of
+   * `checkout`, as the prefix of `commit`, `merge`, `fetch`, `rebase`, `cherry-pick`.
+   */
+  setReflogAction(action: string): this {
+    this.checkCallable();
+    this.reflogActionOverride = action;
+    return this;
+  }
+
+  /** The reflog action set with {@link setReflogAction}, else `fallback`. */
+  protected reflogAction(fallback: string): string {
+    return this.reflogActionOverride ?? fallback;
+  }
+
+  /** Whether {@link setReflogAction} named an action. */
+  protected hasReflogAction(): boolean {
+    return this.reflogActionOverride !== undefined;
+  }
+
+  /**
+   * A reflog line's options: `message` with `who` (a commit's committer) as its identity,
+   * else git's committer ident from the environment and configuration.
+   */
+  protected reflogLine(message: string, who?: PersonIdent): RefLogOptions {
+    return reflogLine(this._workingCopy, message, who);
   }
 
   // ============ Store Accessors ============

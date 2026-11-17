@@ -51,6 +51,7 @@ export interface NodeGitHostEnvironment {
   systemConfig?: string;
   systemAttributes?: string;
   globalConfig?: string;
+  committer?: { name?: string; email?: string; date?: string };
 }
 
 /**
@@ -89,7 +90,8 @@ function envBool(value: string | undefined): boolean {
 
 /**
  * The user's git environment read from the process (`HOME`, `XDG_CONFIG_HOME`,
- * `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`), files
+ * `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, and
+ * `GIT_COMMITTER_NAME` / `_EMAIL` / `_DATE` for the reflog identity), files
  * read by absolute path. The system files default to `/etc/gitconfig` and
  * `/etc/gitattributes`.
  *
@@ -112,6 +114,11 @@ export function createNodeGitHostEnvironment(
     ? undefined
     : (options.systemAttributes ?? "/etc/gitattributes");
   const globalConfig = options.globalConfig ?? env.GIT_CONFIG_GLOBAL;
+  const committer = {
+    ...(env.GIT_COMMITTER_NAME !== undefined ? { name: env.GIT_COMMITTER_NAME } : {}),
+    ...(env.GIT_COMMITTER_EMAIL !== undefined ? { email: env.GIT_COMMITTER_EMAIL } : {}),
+    ...(env.GIT_COMMITTER_DATE !== undefined ? { date: env.GIT_COMMITTER_DATE } : {}),
+  };
   return {
     readFile: async (path: string) => {
       try {
@@ -128,5 +135,6 @@ export function createNodeGitHostEnvironment(
     ...(systemConfig ? { systemConfig } : {}),
     ...(systemAttributes ? { systemAttributes } : {}),
     ...(globalConfig ? { globalConfig } : {}),
+    ...(Object.keys(committer).length > 0 ? { committer } : {}),
   };
 }

@@ -25,8 +25,26 @@
  * is on the host.
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
-import type { WorkingCopy } from "../working-copy.js";
+import type { History, ObjectId } from "@statewalker/vcs-core";
+import type { WorkingCopy, WorkingCopyConfig } from "../working-copy.js";
+
+/**
+ * What `git worktree` works with: the repository's history (its refs, the current
+ * worktree's HEAD among them) and configuration, and its worktrees; no working tree of its
+ * own. From a bare repository this is all there is (git runs `worktree add/list/prune/lock/
+ * unlock/remove/move/repair` there); from a worktree, its working copy serves.
+ *
+ * @example
+ * ```typescript
+ * const admin = await worktrees.openAdmin(); // works in a bare repository too
+ * const list = await admin.worktrees.list(); // the main one `bare: true`
+ * ```
+ */
+export interface WorktreeAdmin {
+  readonly history: History;
+  readonly config: WorkingCopyConfig;
+  readonly worktrees: LinkedWorktrees;
+}
 
 /** A worktree as git's `get_worktrees` describes it. */
 export interface WorktreeInfo {
@@ -167,6 +185,13 @@ export interface LinkedWorktrees {
    * and for a worktree beyond this storage ({@link LinkedWorktrees.reachable}).
    */
   open(entry: WorktreeInfo): Promise<WorkingCopy>;
+
+  /**
+   * The current worktree's repository as `git worktree` needs it ({@link WorktreeAdmin}):
+   * for a bare repository its history and configuration, without a working copy (no
+   * working tree is made up at the git directory); otherwise the current working copy.
+   */
+  openAdmin(): Promise<WorktreeAdmin>;
 
   /**
    * Point `entry`'s HEAD at the branch `target` (`ref: <target>`) through that worktree's

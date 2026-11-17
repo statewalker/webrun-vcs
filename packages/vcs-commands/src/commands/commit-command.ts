@@ -1,5 +1,4 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { isSymbolicRef } from "@statewalker/vcs-core";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
@@ -15,6 +14,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
 import { OperationState } from "./merge-support.js";
+import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash, cleanupMessage } from "./sequencer-support.js";
 
 /**
@@ -432,15 +432,24 @@ export class CommitCommand extends GitCommand<CommitResult> {
 
     const commitId = await this.commits.store(commit);
 
-    // Update HEAD/branch ref
-    const head = await this.refsStore.get("HEAD");
-    if (head && isSymbolicRef(head)) {
-      // HEAD points to a branch - update the branch
-      await this.refsStore.set(head.target, commitId);
-    } else {
-      // Detached HEAD - update HEAD directly
-      await this.refsStore.set("HEAD", commitId);
-    }
+    // Update HEAD/branch ref, with git's reflog line in the branch's log and HEAD's
+    // (builtin/commit.c: initial, amend, merge, cherry-pick, else plain)
+    const initial = !(await this.refsStore.resolve("HEAD"))?.objectId;
+    const kind: CommitReflogKind = initial
+      ? "initial"
+      : this.amend
+        ? "amend"
+        : mergeHeads.length > 0
+          ? "merge"
+          : pickHead
+            ? "cherry-pick"
+            : undefined;
+    const action = this.hasReflogAction() ? this.reflogAction("commit") : undefined;
+    await updateHead(
+      this.refsStore,
+      commitId,
+      this.reflogLine(reflogMessages.commit(kind, finalMessage, action), committer),
+    );
 
     this.setCallable(false);
 

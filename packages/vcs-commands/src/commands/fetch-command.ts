@@ -77,6 +77,8 @@ export enum TagOption {
  */
 export class FetchCommand extends TransportCommand<FetchResult> {
   private remote = "origin";
+  /** Whether the remote was named (it is then in the reflog action, as on git's command line). */
+  private remoteGiven = false;
   private refSpecs: string[] = [];
   private removeDeletedRefs?: boolean;
   private pruneTags?: boolean;
@@ -106,6 +108,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   setRemote(remote: string): this {
     this.checkCallable();
     this.remote = remote;
+    this.remoteGiven = true;
     return this;
   }
 
@@ -532,7 +535,15 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       force: this.forceUpdate,
       dryRun: this.dryRun,
       onProgress: this.progressMessageCallback,
-      reflogMessage: `fetch: ${remoteUrl}`,
+      // git's "fetch <args>: <what>" per ref; the action from the remote and refspecs named
+      reflogAction: this.reflogAction(
+        [
+          "fetch",
+          ...(this.remoteGiven || this.refSpecs.length > 0 ? [this.remote] : []),
+          ...this.refSpecs,
+        ].join(" "),
+      ),
+      reflogIdent: this.reflogLine("").ident,
     });
 
     const advertisedRefs = new Map<string, ObjectId>();

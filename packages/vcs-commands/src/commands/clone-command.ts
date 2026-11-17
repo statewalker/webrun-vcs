@@ -19,6 +19,7 @@ import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js"
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
+import { reflogMessages } from "./reflog-messages.js";
 import { checkoutFreshTree } from "./tree-restore.js";
 
 /** Names the clone's checkout in failure messages. */
@@ -476,8 +477,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       deepenSince: this.shallowSince,
       deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
       onProgress: this.progressMessageCallback,
-      reflogMessage: `clone: from ${this.uri}`,
+      // git's write_remote_refs: one initial transaction, no reflog
+      skipReflog: true,
     });
+    const cloneLog = this.reflogLine(reflogMessages.clone(this.uri));
     const trackingUpdates: TrackingRefUpdate[] = result.refUpdates.map(toTrackingRefUpdate);
 
     // Set up HEAD and default branch.
@@ -507,7 +510,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         id = target;
       }
       if (id) {
-        await this.refsStore.set("HEAD", id);
+        await this.refsStore.set("HEAD", id, cloneLog);
         headCommit = id;
         if (!this.bare && !this.noCheckout) checkoutId = id;
       }
@@ -515,13 +518,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       // The local branch starts at the tracking ref the clone just wrote
       const localRef = `refs/heads/${defaultBranch}`;
       const tip = await this.refsStore.resolve(`refs/remotes/${this.remoteName}/${defaultBranch}`);
+      // HEAD names the default branch, born or not (an empty remote's unborn HEAD); then
+      // the branch is written through it, logged "clone: from <url>" in both reflogs
+      await this.refsStore.setSymbolic("HEAD", localRef);
       if (tip?.objectId) {
-        await this.refsStore.set(localRef, tip.objectId);
+        await this.refsStore.set(localRef, tip.objectId, cloneLog);
         headCommit = tip.objectId;
         if (!this.noCheckout) checkoutId = tip.objectId;
       }
-      // HEAD names the default branch, born or not (an empty remote's unborn HEAD)
-      await this.refsStore.setSymbolic("HEAD", localRef);
       // git's install_branch_config: the branch tracks its remote counterpart
       if (tip?.objectId || result.isEmpty) checkedOutBranch = defaultBranch;
     } else if (this.bare || this.mirror) {
@@ -540,7 +544,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (!this.bare && remoteHead) {
       const target = `refs/remotes/${this.remoteName}/${remoteHead}`;
       if ((await this.refsStore.resolve(target))?.objectId) {
-        await this.refsStore.setSymbolic(`refs/remotes/${this.remoteName}/HEAD`, target);
+        await this.refsStore.setSymbolic(`refs/remotes/${this.remoteName}/HEAD`, target, cloneLog);
       }
     }
 

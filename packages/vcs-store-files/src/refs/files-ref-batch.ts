@@ -29,6 +29,7 @@ import type {
   PlannedRefUpdate,
   Ref,
   RefCommand,
+  RefLogOptions,
   ReflogDeleteOptions,
   RefRejection,
   SymbolicRef,
@@ -199,6 +200,12 @@ export interface FilesRefOps {
    * `RefUpdateRejectedError` with nothing changed.
    */
   writeLoose(name: string, content: string): Promise<void>;
+  /**
+   * Point `name` at `target` (`ref: <target>` through `writeLoose`). With a `log` message,
+   * `name`'s reflog gets git's create_symref line: the id `name` resolved to before (zeros
+   * if none) to the id `target` resolves to, nothing when `target` does not resolve.
+   */
+  writeSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void>;
   /**
    * Delete a ref whatever its value, loose and packed, as a batch delete does: under
    * `<name>.lock` and then `packed-refs.lock`, in one pass. Removes its reflog. False if
@@ -452,21 +459,9 @@ export function createFilesRefOps(
     o: BatchOptions,
     strict = false,
   ): Promise<void> {
-    const ident =
-      o.ident ?? `${identity.name} <${identity.email}> ${Math.floor(Date.now() / 1000)} +0000`;
+    const ident = o.ident ?? defaultIdent();
     const message = normalizeMessage(o.message);
-    const append = async (name: string, line: Uint8Array, force = false) => {
-      const path = `logs/${name}`;
-      if (!force && !autocreateReflog(name) && !(await files.exists(path))) return;
-      try {
-        await files.append(path, line);
-      } catch (error) {
-        // an empty directory where the log goes is removed, as git's log_ref_setup does
-        if ((error as { code?: string })?.code !== "EISDIR") throw error;
-        await files.removeEmptyDir(path);
-        await files.append(path, line);
-      }
-    };
+    const append = appendLog;
     for (const u of updates) {
       try {
         const old = current(u) ?? ZERO_ID;
@@ -474,6 +469,9 @@ export function createFilesRefOps(
         const line = enc.encode(`${old} ${next} ${ident}${message ? `\t${message}` : ""}\n`);
         if (u.newValue === null) {
           if (await files.exists(`logs/${u.name}`)) await removeAndPrune(`logs/${u.name}`);
+          if (o.skipReflog) continue;
+        } else if (o.skipReflog) {
+          continue; // git's initial transaction (clone): the refs are stored unlogged
         } else if (u.reflog) {
           // the command's own lines (a renamed ref's log), in place of this update's line
           for (const own of u.reflog) {
@@ -495,6 +493,26 @@ export function createFilesRefOps(
         }
         // after the commit: the ref update stands without its reflog line
       }
+    }
+  }
+  /** The identity of a line written without one: the configured name and email, now. */
+  function defaultIdent(): string {
+    return `${identity.name} <${identity.email}> ${Math.floor(Date.now() / 1000)} +0000`;
+  }
+  /**
+   * Append `line` to `name`'s reflog: created when git would create it (or with `force`),
+   * else only appended to an existing log.
+   */
+  async function appendLog(name: string, line: Uint8Array, force = false): Promise<void> {
+    const path = `logs/${name}`;
+    if (!force && !autocreateReflog(name) && !(await files.exists(path))) return;
+    try {
+      await files.append(path, line);
+    } catch (error) {
+      // an empty directory where the log goes is removed, as git's log_ref_setup does
+      if ((error as { code?: string })?.code !== "EISDIR") throw error;
+      await files.removeEmptyDir(path);
+      await files.append(path, line);
     }
   }
   /**
@@ -825,6 +843,20 @@ export function createFilesRefOps(
     }
   }
 
+  async function writeSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void> {
+    // git's create_symref: the old value is what `name` resolved to before the write
+    const old =
+      log?.message !== undefined ? await resolveId(name).catch(() => undefined) : undefined;
+    await writeLoose(name, `ref: ${target}\n`);
+    if (log?.message === undefined) return;
+    const next = await resolveId(target).catch(() => undefined);
+    if (next === undefined) return; // an unborn target: git logs nothing
+    const message = normalizeMessage(log.message);
+    const line = `${old ?? ZERO_ID} ${next} ${log.ident ?? defaultIdent()}${message ? `\t${message}` : ""}\n`;
+    // after the commit, as git's files_create_symref: the ref stands without its line
+    await appendLog(name, enc.encode(line)).catch(() => {});
+  }
+
   async function removeRef(name: string): Promise<boolean> {
     const r = await lock(name, refLockTimeout);
     if (r === "held") throw new RefUpdateRejectedError([{ name, reason: "locked" }]);
@@ -905,6 +937,7 @@ export function createFilesRefOps(
     packRefs,
     sweepTemporaries,
     writeLoose,
+    writeSymbolic,
     removeRef,
     deleteReflogEntry,
   };

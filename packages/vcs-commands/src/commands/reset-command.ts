@@ -1,5 +1,4 @@
 import type { ObjectId, Ref } from "@statewalker/vcs-core";
-import { isSymbolicRef } from "@statewalker/vcs-core";
 import type { ResolveUndoRecord } from "@statewalker/vcs-working-tree";
 
 import { ResetRefusedError } from "../errors/command-errors.js";
@@ -8,6 +7,7 @@ import { GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
+import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 
@@ -162,7 +162,11 @@ export class ResetCommand extends GitCommand<Ref> {
 
     // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's reset_refs)
     if (headId && state.supported) await state.setRef("ORIG_HEAD", headId);
-    await this.moveHead(targetId);
+    // git's set_reflog_message: "reset: moving to <rev>", or "<action>: updating HEAD"
+    const message = this.hasReflogAction()
+      ? `${this.reflogAction("reset")}: updating HEAD`
+      : reflogMessages.reset(targetRef);
+    await updateHead(this.refsStore, targetId, this.reflogLine(message));
 
     // Reset staging area (for MIXED and HARD)
     if (this.mode === ResetMode.MIXED || this.mode === ResetMode.HARD) {
@@ -229,21 +233,6 @@ export class ResetCommand extends GitCommand<Ref> {
 
     const headRef = await this.refsStore.resolve("HEAD");
     return headRef as Ref;
-  }
-
-  /**
-   * Move HEAD (and branch if applicable) to target commit.
-   */
-  private async moveHead(targetId: ObjectId): Promise<void> {
-    const head = await this.refsStore.get("HEAD");
-
-    if (head && isSymbolicRef(head)) {
-      // HEAD points to a branch - update the branch
-      await this.refsStore.set(head.target, targetId);
-    } else {
-      // Detached HEAD - update HEAD directly
-      await this.refsStore.set("HEAD", targetId);
-    }
   }
 
   /**

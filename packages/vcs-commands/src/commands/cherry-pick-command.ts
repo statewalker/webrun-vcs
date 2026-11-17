@@ -193,6 +193,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         favor: favorOf(this.contentStrategy),
         oursLabel: this.ourCommitName,
         committer: this.committer,
+        reflogAction: this.reflogAction(this.reflogPrefix.replace(/:$/, "")),
       },
     );
     switch (this.operation) {

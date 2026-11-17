@@ -30,6 +30,7 @@ import type {
   ObjectId,
   Ref,
   RefCommand,
+  RefLogOptions,
   ReflogDeleteOptions,
   ReflogReader,
   Refs,
@@ -127,10 +128,10 @@ class WorktreeRefs implements Refs {
     yield* entries;
   }
 
-  async set(name: string, objectId: ObjectId): Promise<void> {
-    if (isPerWorktreeRef(name)) return this.own.set(name, objectId);
+  async set(name: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
+    if (isPerWorktreeRef(name)) return this.own.set(name, objectId, log);
     // a batch, so the worktree's HEAD logs an update of the branch it points at
-    const result = await this.batch([{ name, new: objectId, noDeref: true }]);
+    const result = await this.batch([{ name, new: objectId, noDeref: true }], log);
     if (!result.ok) {
       throw new Error(
         `cannot update ${name}: ${result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ")}`,
@@ -138,8 +139,8 @@ class WorktreeRefs implements Refs {
     }
   }
 
-  setSymbolic(name: string, target: string): Promise<void> {
-    return this.store(name).setSymbolic(name, target);
+  setSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void> {
+    return this.store(name).setSymbolic(name, target, log);
   }
 
   remove(name: string): Promise<boolean> {

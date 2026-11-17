@@ -31,6 +31,12 @@ export * from "./pull-command.js";
 export * from "./push-command.js";
 export * from "./rebase-command.js";
 export * from "./reflog-command.js";
+export {
+  committerIdent,
+  parseGitDate,
+  reflogMessages,
+  reflogSubject,
+} from "./reflog-messages.js";
 export * from "./remote-command.js";
 export * from "./reset-command.js";
 export * from "./revert-command.js";

@@ -1,5 +1,5 @@
 import type { History } from "@statewalker/vcs-core";
-import type { Checkout, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
+import type { Checkout, WorkingCopy, Worktree, WorktreeAdmin } from "@statewalker/vcs-working-tree";
 
 import {
   AddCommand,
@@ -54,6 +54,7 @@ import {
   WorktreeRepairCommand,
   WorktreeUnlockCommand,
 } from "./commands/index.js";
+import { worktreeAdminWorkingCopy } from "./commands/worktree-support.js";
 
 /**
  * Main entry point for high-level Git operations.
@@ -118,6 +119,24 @@ export class Git implements Disposable {
    */
   static fromWorkingCopy(workingCopy: WorkingCopy): Git {
     return new Git(workingCopy);
+  }
+
+  /**
+   * A Git facade for `git worktree` from a repository that may be bare: the `worktree*()`
+   * commands (add, list, prune, lock, unlock, remove, move, repair) work as native git runs
+   * them inside a bare repository; commands that need a working tree refuse with `this
+   * operation must be run in a work tree`.
+   *
+   * @example
+   * ```typescript
+   * const worktrees = await openGitLinkedWorktrees({ files, gitDir: "bare.git", history });
+   * const git = Git.fromWorktreeAdmin(await worktrees.openAdmin());
+   * await git.worktreeAdd().setPath("../wt").setNewBranch("topic").call();
+   * console.log((await git.worktreeList().call()).output); // "<path>  (bare)" first
+   * ```
+   */
+  static fromWorktreeAdmin(admin: WorktreeAdmin): Git {
+    return new Git(worktreeAdminWorkingCopy(admin));
   }
 
   /**

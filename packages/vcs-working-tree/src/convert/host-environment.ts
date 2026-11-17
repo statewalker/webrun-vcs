@@ -23,6 +23,13 @@ export interface GitHostEnvironment {
   globalConfig?: string;
   /** The system attributes file (`$(prefix)/etc/gitattributes`); not read when absent */
   systemAttributes?: string;
+  /**
+   * git's committer variables (`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`,
+   * `GIT_COMMITTER_DATE`), as `git_committer_info` reads them ahead of `user.name`,
+   * `user.email` and the clock: the identity and time of the reflog lines commands write.
+   * `date` in git's raw form (`1700000000 +0000`, also `@1700000000 +0000`).
+   */
+  committer?: { name?: string; email?: string; date?: string };
 }
 
 const join = (dir: string, name: string) =>

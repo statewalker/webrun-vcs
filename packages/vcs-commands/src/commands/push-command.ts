@@ -442,7 +442,8 @@ export class PushCommand extends TransportCommand<PushResult> {
         const local = tracking(update.remoteRef);
         if (!local) continue;
         if (update.newOid === ZERO_OBJECT_ID) await history.refs.remove(local);
-        else await history.refs.set(local, update.newOid);
+        // git's update_tracking_ref: "update by push"
+        else await history.refs.set(local, update.newOid, this.reflogLine("update by push"));
       }
     }
 

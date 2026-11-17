@@ -1,5 +1,4 @@
 import {
-  formatPersonIdent,
   isSymbolicRef,
   isValidBranchName,
   type ObjectId,
@@ -281,8 +280,9 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     return isValidBranchName(name) && (await this.refsStore.has(`refs/heads/${name}`));
   }
 
+  /** The identity set, else git's committer ident (environment, configuration). */
   private ident(): string | undefined {
-    return this.who ? formatPersonIdent(this.who) : undefined;
+    return this.reflogLine("", this.who).ident;
   }
 
   /** `git branch [--force] <new> <start>`, with git's reflog line. */

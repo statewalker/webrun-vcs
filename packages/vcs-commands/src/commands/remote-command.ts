@@ -752,7 +752,8 @@ export class RemoteSetHeadCommand extends TransportCommand<string | undefined> {
       throw new RefNotFoundError(target, `Not a valid ref: ${target}`);
     }
     const previous = await this.refsStore.get(`${top}HEAD`);
-    await this.refsStore.setSymbolic(`${top}HEAD`, target);
+    // git's `create_symref(..., "remote set-head")`: logged in the symbolic ref's reflog
+    await this.refsStore.setSymbolic(`${top}HEAD`, target, this.reflogLine("remote set-head"));
     if (this.auto)
       this.messages.push(reportSetHeadAuto(remote, target.slice(top.length), previous));
     const store = RemoteConfigStore.from(this.workingCopy);

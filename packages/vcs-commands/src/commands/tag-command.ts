@@ -1,5 +1,6 @@
 import type { AnnotatedTag, ObjectId, PersonIdent, Ref } from "@statewalker/vcs-core";
 import { compareRefNames, isValidTagName, ObjectType } from "@statewalker/vcs-core";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import {
   InvalidTagNameError,
@@ -7,7 +8,8 @@ import {
   RefNotFoundError,
   StoreNotAvailableError,
 } from "../errors/index.js";
-import { GitCommand } from "../git-command.js";
+import { type CommandCommits, GitCommand } from "../git-command.js";
+import { abbrevLengths } from "./core-config.js";
 
 /**
  * Get current timezone offset as string (+HHMM or -HHMM).
@@ -229,7 +231,10 @@ export class TagCommand extends GitCommand<Ref> {
       tagObjectId = targetId;
     }
 
-    await this.refsStore.set(refName, tagObjectId);
+    // git's create_reflog_msg; refs/tags/ is logged only with core.logAllRefUpdates=always
+    // or an existing reflog
+    const log = await tagReflogMessage(this.workingCopy, this.commits, targetId);
+    await this.refsStore.set(refName, tagObjectId, this.reflogLine(log));
 
     this.setCallable(false);
 
@@ -324,4 +329,27 @@ export class ListTagCommand extends GitCommand<Ref[]> {
 
     return tags;
   }
+}
+
+/** `tag: tagging <abbrev> (<subject>, <YYYY-MM-DD>)` for the commit tagged (git's tag.c). */
+async function tagReflogMessage(
+  workingCopy: WorkingCopy,
+  commits: CommandCommits,
+  target: ObjectId,
+): Promise<string> {
+  const abbrev = (await abbrevLengths(workingCopy, [target])).get(target) ?? 7;
+  const commit = await commits.load(target).catch(() => undefined);
+  const date = commit ? new Date(commit.committer.timestamp * 1000).toISOString().slice(0, 10) : "";
+  const what = commit ? `${commitSubject(commit.message)}, ${date}` : "object of unknown type";
+  return `tag: tagging ${target.slice(0, abbrev)} (${what})`;
+}
+
+/** git's find_commit_subject: the first paragraph (whitespace collapses in the reflog). */
+function commitSubject(message: string): string {
+  const lines = message.split("\n");
+  let start = 0;
+  while (start < lines.length && lines[start]?.trim() === "") start++;
+  const out: string[] = [];
+  for (let i = start; i < lines.length && lines[i]?.trim() !== ""; i++) out.push(lines[i] ?? "");
+  return out.join(" ");
 }

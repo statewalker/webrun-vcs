@@ -33,7 +33,13 @@
  * ```
  */
 
-import { FileMode, isValidBranchName, type ObjectId, type Ref } from "@statewalker/vcs-core";
+import {
+  FileMode,
+  isSymbolicRef,
+  isValidBranchName,
+  type ObjectId,
+  type Ref,
+} from "@statewalker/vcs-core";
 import {
   attributesIndexOf,
   entryStatOf,
@@ -52,6 +58,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
+import { reflogMessages } from "./reflog-messages.js";
 import { removeBranchState } from "./sequencer-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
@@ -60,7 +67,7 @@ import {
   pruneEmptyParents,
   worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
-import { refuseIfCheckedOut } from "./worktree-support.js";
+import { refuseIfCheckedOut, shortBranchName } from "./worktree-support.js";
 
 /** Names a branch checkout in failure messages. */
 const CHECKOUT = "checkout";
@@ -368,6 +375,16 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     };
   }
 
+  /**
+   * HEAD as git's checkout names the side it leaves: the branch (short name, also an unborn
+   * one), else the full id of the detached HEAD, else `(invalid)`.
+   */
+  private async describeHeadForReflog(): Promise<string> {
+    const head = await this.refsStore.get("HEAD");
+    if (head && isSymbolicRef(head)) return shortBranchName(head.target);
+    return head?.objectId ?? "(invalid)";
+  }
+
   /** Whether an untracked (not ignored) file or link is at `path`. */
   private async untrackedFileAt(worktree: Worktree, path: string): Promise<boolean> {
     const entry = await worktree.getEntry(path);
@@ -408,7 +425,13 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         throw new RefNotFoundError(this.startPoint ?? "HEAD");
       }
 
-      await this.refsStore.set(`refs/heads/${this.name}`, startPointId);
+      // git's create_branch: "branch: Created from <start>", or "Reset to" an existing one
+      const start = this.startPoint ?? "HEAD";
+      const branchRef = `refs/heads/${this.name}`;
+      const message = (await this.refsStore.has(branchRef))
+        ? reflogMessages.branchReset(start)
+        : reflogMessages.branchCreated(start);
+      await this.refsStore.set(branchRef, startPointId, this.reflogLine(message));
     }
 
     // Resolve target
@@ -583,17 +606,26 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // Check if it's a local branch
     const isLocalBranch = await this.refsStore.has(`refs/heads/${this.name}`);
 
+    // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
+    // left, or the detached HEAD's full id> to <the name as given>"
+    const log = this.reflogLine(
+      this.hasReflogAction()
+        ? this.reflogAction("checkout")
+        : reflogMessages.checkout(await this.describeHeadForReflog(), this.name),
+    );
+
     // Decide whether to create symbolic ref or detached HEAD
     if (this.orphan) {
-      // Orphan branch: symbolic ref to a branch that doesn't exist yet
-      await this.refsStore.setSymbolic("HEAD", `refs/heads/${this.name}`);
+      // Orphan branch: symbolic ref to a branch that doesn't exist yet (logged by nothing:
+      // git skips the line of an unborn target)
+      await this.refsStore.setSymbolic("HEAD", `refs/heads/${this.name}`, log);
     } else if (isLocalBranch) {
       // Local branch exists: use symbolic ref to the branch
-      await this.refsStore.setSymbolic("HEAD", `refs/heads/${this.name}`);
+      await this.refsStore.setSymbolic("HEAD", `refs/heads/${this.name}`, log);
     } else if (targetId) {
       // Not a local branch but resolves to a commit: detached HEAD
       // This handles: commit IDs, tags, remote branches, etc.
-      await this.refsStore.set("HEAD", targetId);
+      await this.refsStore.set("HEAD", targetId, log);
     }
     // git's remove_branch_state: a merge, cherry-pick or revert stopped here is forgotten
     await removeBranchState(

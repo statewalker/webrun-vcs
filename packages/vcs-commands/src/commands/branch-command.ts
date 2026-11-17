@@ -1,5 +1,11 @@
-import type { ObjectId, Ref } from "@statewalker/vcs-core";
-import { compareRefNames, isSymbolicRef, isValidBranchName } from "@statewalker/vcs-core";
+import type { ObjectId, OwnReflogLine, Ref, Refs } from "@statewalker/vcs-core";
+import {
+  compareRefNames,
+  formatPersonIdent,
+  isSymbolicRef,
+  isValidBranchName,
+} from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorktreeInfo } from "@statewalker/vcs-working-tree";
 
 import {
@@ -11,7 +17,9 @@ import {
   RefNotFoundError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { ListBranchMode } from "../types.js";
+import { reflogMessages } from "./reflog-messages.js";
 import { shortBranchName, worktreeUsingBranch } from "./worktree-support.js";
 
 /**
@@ -127,7 +135,14 @@ export class CreateBranchCommand extends GitCommand<Ref> {
       ? await this.resolveRef(this.startPoint)
       : await this.resolveHead();
 
-    await this.refsStore.set(refName, targetId);
+    // git's create_branch: "branch: Created from <start>", "branch: Reset to <start>" (-f);
+    // without a start point, cmd_branch names the branch checked out (`HEAD` when detached)
+    const current = await this.getCurrentBranch();
+    const start = this.startPoint ?? (current ? current.replace(/^refs\/heads\//, "") : "HEAD");
+    const message = exists
+      ? reflogMessages.branchReset(start)
+      : reflogMessages.branchCreated(start);
+    await this.refsStore.set(refName, targetId, this.reflogLine(message));
 
     this.setCallable(false);
 
@@ -478,23 +493,59 @@ export class RenameBranchCommand extends GitCommand<Ref> {
       }
     }
 
-    // Create new and delete old
-    await this.refsStore.set(newRefName, oldRef.objectId);
-    await this.refsStore.delete(oldRefName);
+    // As git's files_copy_or_rename_ref: the old ref deleted (HEAD on it logs `<id> 0`), its
+    // reflog carried over to the new ref with a `<id> <id>` line; then HEAD follows
+    const message = reflogMessages.branchRenamed(oldRefName, newRefName);
+    const log = this.reflogLine(message);
+    const id = oldRef.objectId;
+    const carried = await reflogLinesOfRef(this.refsStore, oldRefName);
+    // (no log to carry: the new ref gets one only where git creates logs of branches,
+    // core.logAllRefUpdates, false by default in a bare repository)
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const setting = config.value("core.logAllRefUpdates");
+    const logAll =
+      setting?.trim().toLowerCase() === "always" ||
+      (parseGitBool(setting) ?? !(parseGitBool(config.value("core.bare")) ?? false));
+    const ownLines = [...carried, { oldId: id, newId: id, message, ...log }];
+    const created = await this.refsStore.batch(
+      [
+        {
+          name: newRefName,
+          old: null,
+          new: id,
+          ...(carried.length > 0 || logAll ? { reflog: ownLines } : {}),
+        },
+      ],
+      log,
+    );
+    if (!created.ok) {
+      throw new RefAlreadyExistsError(newRefName, `Branch '${this.newName}' already exists`);
+    }
+    const head = await this.refsStore.get("HEAD");
+    const onHead = head && isSymbolicRef(head) && head.target === oldRefName;
+    await this.refsStore.batch([{ name: oldRefName, new: null }], log);
 
     // Update HEAD if it was pointing to old branch
-    const head = await this.refsStore.get("HEAD");
-    if (head && isSymbolicRef(head) && head.target === oldRefName) {
-      await this.refsStore.setSymbolic("HEAD", newRefName);
-    }
+    if (onHead) await this.refsStore.setSymbolic("HEAD", newRefName, log);
     // and every other worktree's HEAD on it, through that worktree's own refs, logged as
     // git's replace_each_worktree_head_symref logs it
-    const message = `Branch: renamed ${oldRefName} to ${newRefName}`;
-    for (const wt of others) await worktrees?.updateHead(wt, newRefName, { message });
+    for (const wt of others) await worktrees?.updateHead(wt, newRefName, { ...log, message });
 
     this.setCallable(false);
 
     const ref = await this.refsStore.get(newRefName);
     return ref as Ref;
   }
+}
+
+/** A reflog's lines, oldest first, as a batch carries them to another ref. */
+async function reflogLinesOfRef(refs: Refs, name: string): Promise<OwnReflogLine[]> {
+  const log = await refs.getReflog?.(name);
+  if (!log) return [];
+  return (await log.getReverseEntries()).reverse().map((entry) => ({
+    oldId: entry.oldId,
+    newId: entry.newId,
+    ident: formatPersonIdent(entry.who),
+    message: entry.comment,
+  }));
 }

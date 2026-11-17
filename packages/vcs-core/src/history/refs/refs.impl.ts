@@ -7,10 +7,14 @@ import {
   type BatchOptions,
   type BatchResult,
   batchBySingleRef,
+  isUpdatableRefName,
+  logsByDefault,
   planRefBatch,
   planReflog,
   type RefCommand,
+  type RefLogOptions,
   type ReflogLine,
+  symrefReflogLine,
 } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import { RefStorage } from "./ref-types.js";
@@ -137,18 +141,35 @@ export class MemoryRefs implements Refs {
   /**
    * Set a direct reference
    */
-  set(name: string, objectId: ObjectId): Promise<void> {
-    return this.exclusive(() => {
-      this.refs.set(name, { type: "direct", objectId });
+  set(name: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
+    return this.exclusive(async () => {
+      if (!log || !isUpdatableRefName(name)) {
+        this.refs.set(name, { type: "direct", objectId });
+        return;
+      }
+      // with a reflog line: a one-ref batch, as the files store writes it
+      const r = await this.applyBatch([{ name, new: objectId, noDeref: true }], log);
+      if (!r.ok) {
+        throw new Error(
+          `cannot update ${name}: ${r.rejected.map((x) => `${x.name}: ${x.reason}`).join(", ")}`,
+        );
+      }
     });
   }
 
   /**
-   * Set a symbolic reference
+   * Set a symbolic reference; with a `log` message, `name`'s reflog records it as git's
+   * create_symref does (see {@link Refs.setSymbolic}).
    */
-  setSymbolic(name: string, target: string): Promise<void> {
-    return this.exclusive(() => {
+  setSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void> {
+    return this.exclusive(async () => {
+      const old = log ? (await this.resolve(name).catch(() => undefined))?.objectId : undefined;
       this.refs.set(name, { type: "symbolic", target });
+      const line = symrefReflogLine(old, (await this.resolve(target))?.objectId, log);
+      if (!line) return;
+      const lines = this.logs.get(name);
+      if (lines) lines.push(line);
+      else if (logsByDefault(name)) this.logs.set(name, [line]);
     });
   }
 

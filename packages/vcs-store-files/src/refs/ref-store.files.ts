@@ -12,6 +12,7 @@ import type {
   ObjectId,
   Ref,
   RefCommand,
+  RefLogOptions,
   ReflogDeleteOptions,
   ReflogReader,
   Refs,
@@ -163,19 +164,24 @@ export class FileRefStore implements Refs {
    * `RefUpdateRejectedError` (`code` "ELOCKED" when the lock stays held past
    * `refLockTimeoutMs`) with the ref unchanged.
    */
-  async set(refName: string, objectId: ObjectId): Promise<void> {
+  async set(refName: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
     if (!isUpdatableRefName(refName)) return this.ops.writeLoose(refName, `${objectId}\n`);
-    const r = await this.ops.batch([{ name: refName, new: objectId, noDeref: true }]);
+    const r = await this.ops.batch([{ name: refName, new: objectId, noDeref: true }], log);
     if (!r.ok) throw new RefUpdateRejectedError(r.rejected);
   }
 
   /**
    * Set a symbolic ref: `ref: <target>` written into `<ref>.lock` and renamed over the
    * ref. Throws `RefUpdateRejectedError` with the ref unchanged when the lock stays held
-   * or on a D/F conflict.
+   * or on a D/F conflict. With a `log` message, the ref's reflog records the change as git's
+   * create_symref does (see `Refs.setSymbolic`).
    */
-  async setSymbolic(refName: string, target: string): Promise<void> {
-    await this.ops.writeLoose(refName, `${SYMREF_PREFIX}${target}\n`);
+  async setSymbolic(refName: string, target: string, log?: RefLogOptions): Promise<void> {
+    if (log?.message === undefined) {
+      await this.ops.writeLoose(refName, `${SYMREF_PREFIX}${target}\n`);
+      return;
+    }
+    await this.ops.writeSymbolic(refName, target, log);
   }
 
   /**

@@ -1,9 +1,7 @@
+import type { ObjectId } from "@statewalker/vcs-core";
+
 import { NoHeadError } from "../errors/index.js";
-import {
-  type FastForwardMode,
-  isMergeSuccessful,
-  type MergeStrategy,
-} from "../results/merge-result.js";
+import { FastForwardMode, isMergeSuccessful, type MergeStrategy } from "../results/merge-result.js";
 import type { PullResult } from "../results/pull-result.js";
 import { isRebaseSuccessful } from "../results/rebase-result.js";
 import { TransportCommand } from "../transport-command.js";
@@ -42,6 +40,8 @@ import { RebaseCommand } from "./rebase-command.js";
  */
 export class PullCommand extends TransportCommand<PullResult> {
   private remote = "origin";
+  /** Whether the remote was named (it is then in the reflog action). */
+  private remoteGiven = false;
   private remoteBranchName?: string;
   private rebase = false;
   private strategy?: MergeStrategy;
@@ -58,6 +58,7 @@ export class PullCommand extends TransportCommand<PullResult> {
   setRemote(remote: string): this {
     this.checkCallable();
     this.remote = remote;
+    this.remoteGiven = true;
     return this;
   }
 
@@ -181,10 +182,21 @@ export class PullCommand extends TransportCommand<PullResult> {
     // Build refspec
     const refspec = `refs/heads/${remoteBranch}:refs/remotes/${this.remote}/${remoteBranch}`;
 
+    // git's GIT_REFLOG_ACTION for everything the pull writes: "pull" and its arguments
+    const action = this.reflogAction(
+      [
+        "pull",
+        ...(this.rebase ? ["--rebase"] : []),
+        ...(this.remoteGiven || this.remoteBranchName ? [this.remote] : []),
+        ...(this.remoteBranchName ? [this.remoteBranchName] : []),
+      ].join(" "),
+    );
+
     // Execute fetch
     const fetchCommand = new FetchCommand(this._workingCopy);
     fetchCommand.setRemote(this.remote);
     fetchCommand.setRefSpecs(refspec);
+    fetchCommand.setReflogAction(action);
 
     if (this.credentials) {
       fetchCommand.setCredentials(this.credentials);
@@ -232,9 +244,16 @@ export class PullCommand extends TransportCommand<PullResult> {
     }
 
     // `git pull --rebase`: the branch rebased onto what was fetched
-    if (this.rebase) {
+    // (one that only fast-forwards is a `merge --ff-only`, as git's pull runs it)
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    const canFastForward =
+      this.rebase &&
+      headId !== undefined &&
+      (await this.reaches(trackingRefResolved.objectId, headId));
+    if (this.rebase && !canFastForward) {
       const rebaseResult = await new RebaseCommand(this._workingCopy)
         .setUpstream(trackingRefResolved.objectId)
+        .setReflogAction(action)
         .call();
       return {
         fetchResult,
@@ -255,11 +274,13 @@ export class PullCommand extends TransportCommand<PullResult> {
     const into =
       localBranchName === "main" || localBranchName === "master" ? "" : ` into ${localBranchName}`;
     mergeCommand.setMessage(`Merge branch '${remoteBranch}' of ${url}${into}\n`);
+    mergeCommand.setReflogAction(action);
+    if (canFastForward) mergeCommand.setFastForwardMode(FastForwardMode.FF_ONLY);
 
     if (this.strategy) {
       mergeCommand.setStrategy(this.strategy);
     }
-    if (this.fastForwardMode) {
+    if (this.fastForwardMode && !canFastForward) {
       mergeCommand.setFastForwardMode(this.fastForwardMode);
     }
 
@@ -272,5 +293,20 @@ export class PullCommand extends TransportCommand<PullResult> {
       rebaseUsed: false,
       fetchedFrom: this.remote,
     };
+  }
+
+  /** Whether `tip` reaches `id` through its parents (or is it). */
+  private async reaches(tip: ObjectId, id: ObjectId): Promise<boolean> {
+    const seen = new Set<ObjectId>();
+    const queue = [tip];
+    while (queue.length > 0) {
+      const next = queue.pop() as ObjectId;
+      if (next === id) return true;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      const commit = await this.commits.load(next).catch(() => undefined);
+      if (commit) queue.push(...commit.parents);
+    }
+    return false;
   }
 }

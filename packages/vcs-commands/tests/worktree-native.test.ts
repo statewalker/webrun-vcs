@@ -766,7 +766,7 @@ function reflog(path: string): string[] {
       return `${l.slice(0, 81)}${tab < 0 ? "" : l.slice(tab)}`;
     });
 }
-/** A reflog's ids only (`<old> <new>`): our checkout and rebase write no reflog messages yet. */
+/** A reflog's ids only (`<old> <new>`): for lines whose messages name different arguments. */
 const reflogIds = (path: string) => reflog(path).map((l) => l.slice(0, 81));
 
 describeGit("git worktree: storage roots, bare repositories, renames and HEAD reflogs", () => {
@@ -888,11 +888,10 @@ describeGit("git worktree: storage roots, bare repositories, renames and HEAD re
     expect(run(join(ours, "bwt"), "rev-parse", "HEAD")).toBe(
       run(join(native, "bwt"), "rev-parse", "HEAD"),
     );
-    // (our commit writes no reflog message yet: the ids are compared)
     for (const log of ["worktrees/bwt/logs/HEAD", "logs/refs/heads/main", "logs/HEAD"]) {
-      expect([log, reflogIds(join(ours, "bare.git", log))]).toEqual([
+      expect([log, reflog(join(ours, "bare.git", log))]).toEqual([
         log,
-        reflogIds(join(native, "bare.git", log)),
+        reflog(join(native, "bare.git", log)),
       ]);
     }
     expect(reflog(join(ours, "bare.git/logs/refs/heads/main")).length).toBe(1);
@@ -979,8 +978,9 @@ describeGit("git worktree: storage roots, bare repositories, renames and HEAD re
     expect(reflogIds(join(ours, log))).toEqual(reflogIds(join(native, log)));
     expect(reflogIds(join(ours, log)).at(-1)).toBe(`${feat} ${feat}`);
 
-    // back on feat (our checkout of a branch logs no HEAD line yet), then a rebase onto
-    // main stops on the conflict: its start logs feat's id to main's
+    // (native `checkout --detach` logs "moving from feat to HEAD", ours names the id: the
+    // ids are compared) back on feat, then a rebase onto main stops on the conflict: its
+    // start logs feat's id to main's
     run(join(native, "w1"), "checkout", "-q", "feat");
     await wt.git.checkout().setName("feat").call();
     runResult(join(native, "w1"), "rebase", "main");
@@ -988,7 +988,15 @@ describeGit("git worktree: storage roots, bare repositories, renames and HEAD re
     await (await wt.git.rebase().setUpstreamBranch("main")).call();
     const main = run(join(native, "repo"), "rev-parse", "main").trim();
     expect(reflogIds(join(ours, log)).at(-1)).toBe(`${feat} ${main}`);
-    expect(reflogIds(join(ours, log)).at(-1)).toBe(reflogIds(join(native, log)).at(-1));
+    expect(reflog(join(ours, log)).slice(-2)).toEqual(reflog(join(native, log)).slice(-2));
+    expect(
+      reflog(join(ours, log))
+        .slice(-2)
+        .map((l) => l.slice(82)),
+    ).toEqual([
+      "checkout: moving from <id> to feat".replace("<id>", feat),
+      "rebase (start): checkout main",
+    ]);
     expect(readFileSync(join(ours, "repo/.git/HEAD"), "latin1")).toBe("ref: refs/heads/main\n");
   });
 
@@ -1082,5 +1090,111 @@ describeGit("git worktree: storage roots, bare repositories, renames and HEAD re
     run(repo, "config", "core.logAllRefUpdates", "false");
     await factory.addWorktree(history, "repo/.git", "wt2", { branch: "main" });
     expect(existsSync(join(repo, ".git/worktrees/wt2/logs/HEAD"))).toBe(false);
+  });
+});
+
+describeGit("git worktree from inside a bare repository, native twins", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "wt-bare-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Our Git for `git worktree` in the bare repository `base/bare.git`. */
+  async function openBare(base: string) {
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: "bare.git" });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir: "bare.git", history });
+    return Git.fromWorktreeAdmin(await worktrees.openAdmin());
+  }
+  /** The bare repository's administrative files, `base` written `<base>`. */
+  const bareAdmin = (base: string) =>
+    snapshot(join(base, "bare.git", "worktrees"), base, (p) => p.endsWith("/index"));
+
+  it("clone --bare, then add, list, lock, prune, unlock and remove as native git does there", async () => {
+    const { native, ours } = twins();
+    for (const base of [native, ours]) run(base, "clone", "-q", "--bare", "repo", "bare.git");
+    const nb = join(native, "bare.git");
+    const git = await openBare(ours);
+    const compare = (label: string) => {
+      expect([label, bareAdmin(ours)]).toEqual([label, bareAdmin(native)]);
+      for (const name of ["w1", "w2", "w3"]) {
+        expect([label, name, workFiles(ours, name)]).toEqual([
+          label,
+          name,
+          workFiles(native, name),
+        ]);
+      }
+      expect([label, existsSync(join(ours, "bare.git/logs"))]).toEqual([
+        label,
+        existsSync(join(nb, "logs")),
+      ]);
+    };
+
+    // add: a branch, a new branch, a detached HEAD
+    run(nb, "worktree", "add", "-q", join(native, "w1"), "feat");
+    run(nb, "worktree", "add", "-q", "-b", "topic", join(native, "w2"), "main");
+    run(nb, "worktree", "add", "-q", "--detach", join(native, "w3"), "main");
+    await git.worktreeAdd().setPath(join(ours, "w1")).setCommitish("feat").setIdent(IDENT).call();
+    await git
+      .worktreeAdd()
+      .setPath(join(ours, "w2"))
+      .setNewBranch("topic")
+      .setCommitish("main")
+      .setIdent(IDENT)
+      .call();
+    await git
+      .worktreeAdd()
+      .setPath(join(ours, "w3"))
+      .setDetach(true)
+      .setCommitish("main")
+      .setIdent(IDENT)
+      .call();
+    compare("add");
+    expect(run(join(ours, "w2"), "rev-parse", "topic")).toBe(
+      run(join(native, "w2"), "rev-parse", "topic"),
+    );
+
+    // list: the bare main worktree first, `(bare)`, in each format
+    const legacy = legacyColumns();
+    const nativeList = (...args: string[]) => norm(run(nb, "worktree", "list", ...args), native);
+    const ourList = (out: string) => norm(out, ours);
+    expect(ourList((await git.worktreeList().setLegacyColumns(legacy).call()).output)).toBe(
+      nativeList(),
+    );
+    expect(
+      ourList(
+        (await git.worktreeList().setFormat("verbose").setLegacyColumns(legacy).call()).output,
+      ),
+    ).toBe(nativeList("-v"));
+    expect(ourList((await git.worktreeList().setFormat("porcelain").call()).output)).toBe(
+      nativeList("--porcelain"),
+    );
+    expect(nativeList()).toContain("(bare)");
+
+    // lock with a reason; a gone worktree pruned, the locked one kept
+    run(nb, "worktree", "lock", "--reason", "on a stick", join(native, "w1"));
+    await git.worktreeLock().setWorktree(join(ours, "w1")).setReason("on a stick").call();
+    compare("lock");
+    for (const base of [native, ours]) rmSync(join(base, "w3"), { recursive: true });
+    run(nb, "worktree", "prune");
+    await git.worktreePrune().call();
+    compare("prune");
+
+    // unlock, then remove
+    run(nb, "worktree", "unlock", join(native, "w1"));
+    await git.worktreeUnlock().setWorktree(join(ours, "w1")).call();
+    run(nb, "worktree", "remove", join(native, "w2"));
+    await git.worktreeRemove().setWorktree(join(ours, "w2")).call();
+    compare("remove");
+    expect(ourList((await git.worktreeList().setFormat("porcelain").call()).output)).toBe(
+      nativeList("--porcelain"),
+    );
+
+    // what needs a working tree is still refused there, as git refuses it
+    expect(await fatal(() => git.status().call())).toBe(runResult(nb, "status").stderr);
   });
 });

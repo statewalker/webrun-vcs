@@ -252,10 +252,25 @@ export async function planRefUpdates(
 export async function applyRefUpdates(
   updates: FetchRefUpdate[],
   refStore: RefStore,
-  options: { atomic?: boolean; message?: string } = {},
+  options: {
+    atomic?: boolean;
+    message?: string;
+    reflogAction?: string;
+    ident?: string;
+    skipReflog?: boolean;
+  } = {},
 ): Promise<void> {
   const writes = updates.filter((u) => u.status !== "rejected" && u.status !== "up-to-date");
   if (writes.length === 0) return;
+  // git's update_local_ref: "<action>: <what>" per ref, else the one message given
+  const logOf = (u: FetchRefUpdate) => ({
+    message:
+      options.reflogAction !== undefined
+        ? `${options.reflogAction}: ${fetchReflogWhat(u)}`
+        : options.message,
+    ...(options.ident !== undefined ? { ident: options.ident } : {}),
+    ...(options.skipReflog ? { skipReflog: true } : {}),
+  });
   const command = (u: FetchRefUpdate) => ({
     name: u.localRef,
     old: u.oldOid ?? null,
@@ -271,7 +286,8 @@ export async function applyRefUpdates(
     return;
   }
   if (options.atomic) {
-    const result = await refStore.batch(writes.map(command), { message: options.message });
+    // one batch, one message: the first ref's (git's transaction logs each ref its own)
+    const result = await refStore.batch(writes.map(command), logOf(writes[0] as FetchRefUpdate));
     if (!result.ok) {
       const reasons = new Map(result.rejected.map((r) => [r.name, r.reason]));
       for (const u of writes) reject(u, reasons.get(u.localRef) ?? "atomic transaction failed");
@@ -279,9 +295,24 @@ export async function applyRefUpdates(
     return;
   }
   for (const u of writes) {
-    const result = await refStore.batch([command(u)], { message: options.message });
+    const result = await refStore.batch([command(u)], logOf(u));
     if (!result.ok) reject(u, result.rejected[0]?.reason ?? "rejected");
   }
+}
+
+/**
+ * What git's fetch logs for an accepted update (update_local_ref, after `<action>: `): a
+ * changed tag `updating tag`; a new ref `storing tag`, `storing head` or `storing ref` by
+ * the remote ref's name; else `fast-forward` or `forced-update`.
+ */
+export function fetchReflogWhat(update: FetchRefUpdate): string {
+  if (update.oldOid && update.localRef.startsWith("refs/tags/")) return "updating tag";
+  if (update.status === "new") {
+    if (update.remoteRef.startsWith("refs/tags/")) return "storing tag";
+    if (update.remoteRef.startsWith("refs/heads/")) return "storing head";
+    return "storing ref";
+  }
+  return update.status === "fast-forward" ? "fast-forward" : "forced-update";
 }
 
 /**

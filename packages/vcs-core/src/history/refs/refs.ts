@@ -12,7 +12,7 @@
  */
 
 import type { ObjectId } from "../../common/index.js";
-import type { BatchOptions, BatchResult, RefCommand } from "./ref-batch.js";
+import type { BatchOptions, BatchResult, RefCommand, RefLogOptions } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import type { ReflogDeleteOptions } from "./reflog-lines.js";
 import type { ReflogEntry, ReflogReader } from "./reflog-types.js";
@@ -95,16 +95,24 @@ export interface Refs {
    *
    * @param name Reference name
    * @param objectId Object ID to point to
+   * @param log The reflog line's message and identity, on a store that keeps reflogs
    */
-  set(name: string, objectId: ObjectId): Promise<void>;
+  set(name: string, objectId: ObjectId, log?: RefLogOptions): Promise<void>;
 
   /**
    * Set a symbolic reference
    *
+   * With a `log` message, a store that keeps reflogs logs the change in `name`'s reflog as
+   * git's `create_symref` does: from the id `name` resolved to before (zeros when it did
+   * not) to the id `target` resolves to, also when the two are the same id; nothing is
+   * logged when `target` does not resolve (an unborn branch). `git checkout <branch>` is
+   * `setSymbolic("HEAD", "refs/heads/<branch>", { message: "checkout: moving from a to b" })`.
+   *
    * @param name Reference name
    * @param target Target reference name
+   * @param log The reflog line's message and identity; without a message nothing is logged
    */
-  setSymbolic(name: string, target: string): Promise<void>;
+  setSymbolic(name: string, target: string, log?: RefLogOptions): Promise<void>;
 
   /**
    * Remove a reference

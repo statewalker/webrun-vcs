@@ -96,6 +96,15 @@ export interface FetchClientOptions {
   onProgress?: (message: string) => void;
   /** Reflog message of the ref updates */
   reflogMessage?: string;
+  /**
+   * The action of git's per-ref reflog messages, in place of `reflogMessage`: `fetch origin`
+   * logs `fetch origin: fast-forward`, `storing head`, `forced-update` (git's update_local_ref)
+   */
+  reflogAction?: string;
+  /** The identity of the reflog lines (`Name <email> 1700000000 +0000`) */
+  reflogIdent?: string;
+  /** Log none of the ref updates (`git clone` stores the remote's refs unlogged) */
+  skipReflog?: boolean;
 }
 
 /** Refspecs chosen from the remote refs (a clone of the remote HEAD's branch, a tag). */
@@ -421,6 +430,9 @@ export async function fetchFromConnection(
     await applyRefUpdates(result.refUpdates, refStore, {
       atomic: options.atomic,
       message: options.reflogMessage,
+      reflogAction: options.reflogAction,
+      ident: options.reflogIdent,
+      skipReflog: options.skipReflog,
     });
   }
   return result;
