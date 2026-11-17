@@ -1,12 +1,15 @@
 /**
  * Reading objects from one installed pack, as git's packfile.c and JGit's Pack do:
  *
- *  - open: the whole `.idx` (v2, or v1) is read and validated — magic and version, monotonic
- *    fan-out, exact length (the 64-bit offset table included), its own SHA-1, ids strictly sorted
- *    and inside their fan-out buckets, every large-offset index inside the 64-bit table — and the
+ *  - open: the whole `.idx` (v2, or v1) is read and checked as git's check_packed_git_idx
+ *    checks it — magic and version, monotonic fan-out, a length that fits its tables — and the
  *    pack's trailer must be the pack checksum the idx records (an idx of another pack with the
- *    same object count passes every other check);
- *  - lookup: fan-out range, then binary search over the sorted ids;
+ *    same object count passes every other check). Its own SHA-1 and the structure of every
+ *    entry (git's verify_pack_index) are checked only when asked (`verifyIndex`: fsck and
+ *    verify-pack paths, an idx just written);
+ *  - lookup: fan-out range, then binary search over the sorted ids. A bucket's ids are checked
+ *    (sorted, inside the bucket) the first time a lookup searches it, and a 64-bit offset index
+ *    when it is read, so a corrupt idx fails with `PackError`, not with wrong data;
  *  - a small entry (an object or a delta of at most 64 KiB) is read from the 64 KiB pack window
  *    holding its start, without looking up where it ends: the one-pass inflater
  *    (`inflateWhole`) stops at the end of its zlib stream, as git's unpack_entry does (an entry
@@ -21,10 +24,12 @@
  *  - a whole object of at most 1 MiB read in one piece is inflated in one pass straight into its
  *    result and handed out whole (`GitObject.bytes`); larger ones stream from the inflater;
  *  - delta chains are walked down (iteratively) to a whole object or a cached one, then patched
- *    upwards with `applyGitDelta`, through a byte-bounded base cache (git's delta_base_cache)
- *    that keeps checkpoints spread along the chain; the steps in between are written into two
- *    buffers of the read, in turn;
- *  - callers always receive copies, never cached buffers;
+ *    upwards with `applyGitDelta`, through a byte-bounded base cache (git's delta_base_cache):
+ *    as git's unpack_entry, the bases on the way are cached (carved from the cache's slabs) and
+ *    the object asked for is not, so it is handed over without a copy; when the budget holds
+ *    fewer objects than the chain has steps, only checkpoints spread along the chain are
+ *    cached, and the steps in between are written into two buffers of the read, in turn;
+ *  - callers never receive a buffer the cache holds: a cached object asked for is copied;
  *  - a REF_DELTA base outside the pack resolves through `externalBase`, with the ids being
  *    resolved on this path (`visiting`), so a cycle across packs fails instead of recursing;
  *  - zlib and format errors raise `PackError`; storage errors pass through unchanged.
@@ -77,6 +82,7 @@ export interface Pack {
   readonly packId: string;
   /** objects in the pack */
   readonly count: number;
+  /** Whether the idx lists `id` (false also when its fan-out bucket is corrupt: `get` fails). */
   has(id: ObjectId): boolean;
   /** The ids in idx order (sorted). */
   ids(): Iterable<ObjectId>;
@@ -111,7 +117,7 @@ export interface PackGetOptions {
 }
 
 export interface OpenPackOptions {
-  /** Bytes of resolved delta bases kept across reads (git's core.deltaBaseCacheLimit). Default 16 MiB. */
+  /** Bytes of resolved delta bases kept across reads (git's core.deltaBaseCacheLimit). Default 96 MiB, as git's. */
   baseCacheBytes?: number;
   /** A cache shared with other packs (a pack set's); `baseCacheBytes` is then ignored. */
   baseCache?: DeltaBaseCache;
@@ -119,6 +125,13 @@ export interface OpenPackOptions {
   maxObjectSize?: number;
   /** Resolves REF_DELTA bases outside the pack (another pack, a loose object). */
   externalBase?: PackExternalBase;
+  /**
+   * Check the whole idx at open, its own SHA-1 included (git's verify_pack_index, run by fsck
+   * and verify-pack), as for an idx just written. Without it, open checks what git's
+   * check_packed_git_idx checks (header, fan-out, length) and lookups check the rest as they
+   * use it (`PackFile.verifyIndex` checks it all later).
+   */
+  verifyIndex?: boolean;
 }
 
 /** Counters, for tests and diagnostics. */
@@ -131,6 +144,10 @@ export interface PackStats {
   readonly cachedEntriesBytes: number;
   /** the most bytes the base cache ever held */
   readonly peakCachedBytes: number;
+  /** idx fan-out buckets whose ids were checked (by lookups, or all by `verifyIndex`) */
+  readonly idxBucketsChecked: number;
+  /** whether the whole idx was checked, its SHA-1 included */
+  readonly idxVerified: boolean;
 }
 
 /** A pack opened by `openPack`: `Pack`, plus its paths and counters. */
@@ -150,6 +167,11 @@ export interface PackFile extends Pack {
   ): GitObject | undefined | Promise<GitObject | undefined>;
   /** Drops this pack's objects from the base cache. */
   close(): void;
+  /**
+   * Checks the whole idx, its own SHA-1 included (git's verify_pack_index, as fsck and
+   * verify-pack run it): rejects with `PackError` if it is corrupt.
+   */
+  verifyIndex(): Promise<void>;
 }
 
 const TYPES: (ObjectTypeString | undefined)[] = [undefined, "commit", "tree", "blob", "tag"];
@@ -301,12 +323,34 @@ function copyOf(b: Uint8Array): Uint8Array {
 /** Delta instructions are inflated here (grown as needed), then read once. */
 const deltaScratch = new Uint8Array(OPEN_MAX);
 
-/** An entry of the delta base cache, and the map (of its scope) that lists it. */
+/** An entry of the delta base cache: its key, the map (of its scope) that lists it, LRU links. */
 interface CachedBase<K> {
   readonly key: K;
   readonly value: ResolvedObject;
   readonly map: Map<K, CachedBase<K>>;
+  /** the slab `value.data` was carved from (`DeltaBaseCache.alloc`), if any */
+  readonly slab: Slab | undefined;
+  prev: CachedBase<unknown> | undefined;
+  next: CachedBase<unknown> | undefined;
+  linked: boolean;
 }
+
+/** A slab of `DeltaBaseCache.alloc`: how many cached entries live in it. */
+interface Slab {
+  live: number;
+}
+
+/** git's default core.deltaBaseCacheLimit. */
+export const DEFAULT_DELTA_BASE_CACHE_LIMIT = 96 * 2 ** 20;
+
+/** Bytes of a slab the cache carves small bases from. */
+const SLAB_SIZE = 64 * 1024;
+/** Largest base carved from a slab. */
+const SLAB_MAX = 16 * 1024;
+/** Budgets below this allocate every base on its own (a slab would take a large share). */
+const SLABS_FROM = 16 * SLAB_SIZE;
+/** V8 keeps typed arrays this small in its heap: such a buffer is never a slab view. */
+const ON_HEAP_MAX = 64;
 
 /** One pack's view of a shared `DeltaBaseCache`: entries keyed by pack offset. */
 export interface DeltaBaseCacheScope {
@@ -321,24 +365,84 @@ export interface DeltaBaseCacheScope {
  * One cache can serve every pack of a set, so the budget is the set's, not each pack's. A pack
  * reads it through its own `scope()` (numeric keys, no strings built per lookup); `get` and
  * `put` key entries by string (object ids, for unpacking).
+ *
+ * Bases a pack resolves are allocated by `alloc`: small ones are carved from 64 KiB slabs
+ * (a fresh `Uint8Array` costs a backing store and garbage-collector bookkeeping, more than
+ * applying a small delta). A slab is never reused, so a carved buffer is never overwritten
+ * while anyone still reads it; the garbage collector frees a slab once nothing views it. The
+ * budget counts what the entries really keep alive: a whole slab while any entry lives in it,
+ * else each buffer's length.
  */
 export class DeltaBaseCache {
-  private readonly lru = new Set<CachedBase<unknown>>();
+  /** least recently used first */
+  private head: CachedBase<unknown> | undefined;
+  private tail: CachedBase<unknown> | undefined;
   private readonly byKey = new Map<string, CachedBase<string>>();
+  private readonly slabs = new WeakMap<ArrayBufferLike, Slab>();
+  private slab: ArrayBuffer | undefined;
+  private slabUsed = 0;
   private held = 0;
   private peak = 0;
+  private allocated = 0;
+  private slabCount = 0;
+  private hitCount = 0;
   constructor(readonly limit: number) {}
+  /** bytes the cache holds, by its accounting */
   get bytes(): number {
     return this.held;
   }
   get peakBytes(): number {
     return this.peak;
   }
-  /** bytes the entries really hold (tests check it equals `bytes`) */
+  /** buffers `alloc` created on their own (not carved from a slab), for tests */
+  get ownAllocations(): number {
+    return this.allocated;
+  }
+  /** slabs `alloc` created, for tests */
+  get slabsCreated(): number {
+    return this.slabCount;
+  }
+  /** lookups that found an entry, for tests */
+  get hits(): number {
+    return this.hitCount;
+  }
+  /** bytes the entries really keep alive, counted from the entries (tests check it equals `bytes`) */
   get entriesBytes(): number {
     let n = 0;
-    for (const e of this.lru) n += e.value.data.length;
+    const seen = new Set<Slab>();
+    for (let e = this.head; e; e = e.next) {
+      if (!e.slab) n += e.value.data.length;
+      else if (!seen.has(e.slab)) {
+        seen.add(e.slab);
+        n += SLAB_SIZE;
+      }
+    }
     return n;
+  }
+  /** entries held, for tests */
+  get size(): number {
+    let n = 0;
+    for (let e = this.head; e; e = e.next) n++;
+    return n;
+  }
+  /**
+   * A zeroed buffer for a base about to be `put`: a view into one of the cache's slabs when
+   * small, else its own.
+   */
+  alloc(size: number): Uint8Array {
+    if (size > SLAB_MAX || size <= ON_HEAP_MAX || this.limit < SLABS_FROM) {
+      this.allocated++;
+      return new Uint8Array(size);
+    }
+    if (!this.slab || this.slabUsed + size > SLAB_SIZE) {
+      this.slab = new ArrayBuffer(SLAB_SIZE);
+      this.slabs.set(this.slab, { live: 0 });
+      this.slabUsed = 0;
+      this.slabCount++;
+    }
+    const out = new Uint8Array(this.slab, this.slabUsed, size);
+    this.slabUsed += (size + 7) & ~7;
+    return out;
   }
   get(key: string): ResolvedObject | undefined {
     return this.find(this.byKey, key);
@@ -363,28 +467,62 @@ export class DeltaBaseCache {
   }
 
   private find<K>(map: Map<K, CachedBase<K>>, key: K): ResolvedObject | undefined {
-    const e = map.get(key);
+    const e = map.get(key) as CachedBase<unknown> | undefined;
     if (!e) return undefined;
-    this.lru.delete(e as CachedBase<unknown>);
-    this.lru.add(e as CachedBase<unknown>);
+    this.hitCount++;
+    if (e !== this.tail) {
+      this.unlink(e);
+      this.append(e);
+    }
     return e.value;
   }
   private add<K>(map: Map<K, CachedBase<K>>, key: K, value: ResolvedObject): void {
-    if (value.data.length > this.limit || map.has(key)) return;
-    const e: CachedBase<K> = { key, value, map };
+    const length = value.data.length;
+    if (map.has(key)) return;
+    const slab =
+      length > ON_HEAP_MAX && length <= SLAB_MAX ? this.slabs.get(value.data.buffer) : undefined;
+    const e: CachedBase<K> = {
+      key,
+      value,
+      map,
+      slab,
+      prev: undefined,
+      next: undefined,
+      linked: false,
+    };
     map.set(key, e);
-    this.lru.add(e as CachedBase<unknown>);
-    this.held += value.data.length;
-    for (const x of this.lru) {
-      if (this.held <= this.limit) break;
-      this.remove(x);
-    }
-    this.peak = Math.max(this.peak, this.held);
+    this.append(e as CachedBase<unknown>);
+    if (!slab) this.held += length;
+    else if (slab.live++ === 0) this.held += SLAB_SIZE;
+    // As git's add_delta_base_cache: the others are evicted, least recently used first, until
+    // the cache is within its limit, and the entry just added always stays, even alone over
+    // the limit (a limit of 0 keeps the most recent base, a large base is kept alone).
+    while (this.held > this.limit && this.head && this.head !== e) this.remove(this.head);
+    if (this.held > this.peak) this.peak = this.held;
   }
   private remove<K>(e: CachedBase<K>): void {
-    if (!this.lru.delete(e as CachedBase<unknown>)) return;
-    this.held -= e.value.data.length;
+    if (!e.linked) return;
+    this.unlink(e as CachedBase<unknown>);
+    if (!e.slab) this.held -= e.value.data.length;
+    else if (--e.slab.live === 0) this.held -= SLAB_SIZE;
     if (e.map.get(e.key) === e) e.map.delete(e.key);
+  }
+  private append(e: CachedBase<unknown>): void {
+    e.prev = this.tail;
+    e.next = undefined;
+    if (this.tail) this.tail.next = e;
+    else this.head = e;
+    this.tail = e;
+    e.linked = true;
+  }
+  private unlink(e: CachedBase<unknown>): void {
+    if (e.prev) e.prev.next = e.next;
+    else this.head = e.next;
+    if (e.next) e.next.prev = e.prev;
+    else this.tail = e.prev;
+    e.prev = undefined;
+    e.next = undefined;
+    e.linked = false;
   }
 }
 
@@ -418,7 +556,12 @@ interface IdxTable {
   offsetOf(i: number): number;
   /** the entry's CRC-32 (v2 only) */
   crcOf(i: number): number | undefined;
+  /** The position of `id`, -1 if absent; `PackError` if its fan-out bucket is corrupt. */
   find(id: ObjectId): number;
+  /** Checks the whole idx (git's verify_pack_index); `PackError` if it is corrupt. */
+  verify(): Promise<void>;
+  /** The checks run so far. */
+  checks(): { bucketsChecked: number; verified: boolean };
 }
 
 /** The value of each hex digit (lowercase only, as object ids), -1 for any other code. */
@@ -442,8 +585,16 @@ function parseId(id: unknown, out: Uint8Array): boolean {
   return true;
 }
 
-/** Parses and validates an `.idx` v2 or v1 (git's check_packed_git_idx). */
-function parseIdx(idx: Uint8Array, idxPath: string, sum: Uint8Array): IdxTable {
+/**
+ * Parses an `.idx` v2 or v1 with git's check_packed_git_idx: magic and version, a monotonic
+ * fan-out, and a length that fits the tables (a v2 idx holds up to one 64-bit offset per
+ * object, in whole 8-byte entries). The rest is checked when used, so a corrupt idx fails with `PackError`,
+ * never with wrong data or a read outside it: a fan-out bucket's ids are checked (sorted,
+ * inside the bucket) the first time a lookup searches it, a 64-bit offset index when it is
+ * read. `verify` checks everything at once (git's verify_pack_index), the idx's own SHA-1
+ * included.
+ */
+function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
   if (idx.length < 1024 + 40) throw new PackError(`${idxPath}: idx too short`);
   const iv = new DataView(idx.buffer, idx.byteOffset, idx.byteLength);
   const v2 = iv.getUint32(0) === IDX_MAGIC;
@@ -465,36 +616,37 @@ function parseIdx(idx: Uint8Array, idxPath: string, sum: Uint8Array): IdxTable {
   const offAt = v2 ? crcAt + n * 4 : 1024;
   const offStride = v2 ? 4 : 24;
   const largeAt = v2 ? offAt + n * 4 : 0;
+  /** 64-bit offsets the idx holds, by its length */
   let large = 0;
   if (v2) {
     if (idx.length < largeAt + 40) throw new PackError(`${idxPath}: idx truncated`);
-    for (let i = 0; i < n; i++) if (iv.getUint32(offAt + i * 4) & 0x80000000) large++;
-    if (idx.length !== largeAt + large * 8 + 40)
+    const extra = idx.length - largeAt - 40;
+    // git allows n - 1 (the first entry, at offset 12, is never one); one per entry here
+    if (extra % 8 !== 0 || extra > n * 8)
       throw new PackError(`${idxPath}: idx length does not match its tables`);
+    large = extra / 8;
   } else if (idx.length !== 1024 + n * 24 + 40) {
     throw new PackError(`${idxPath}: idx length does not match its object count`);
   }
-  for (let i = 0; i < n; i++) {
-    if (v2) {
-      const v = iv.getUint32(offAt + i * 4);
-      if (v & 0x80000000 && (v & 0x7fffffff) >= large)
-        throw new PackError(`${idxPath}: entry ${i} points past the large-offset table`);
-    }
-    const at = idsAt + i * idStride;
-    const first = idx[at] as number;
-    const bucketStart = first ? fan(first - 1) : 0;
-    if (i < bucketStart || i >= fan(first))
-      throw new PackError(`${idxPath}: id ${i} is outside its fan-out bucket`);
-    if (i > 0) {
-      let c = 0;
-      for (let k = 0; k < 20 && c === 0; k++)
-        c = (idx[at + k] as number) - (idx[at - idStride + k] as number);
-      if (c <= 0) throw new PackError(`${idxPath}: ids not strictly sorted at ${i}`);
-    }
-  }
-  if (hex(sum) !== hex(idx.subarray(idx.length - 20)))
-    throw new PackError(`${idxPath}: idx checksum mismatch`);
   const packId = hex(idx.subarray(idx.length - 40, idx.length - 20));
+
+  /** Checks the ids of fan-out bucket `b` (positions [from, to)): sorted, each starting with `b`. */
+  const checkBucket = (b: number, from: number, to: number): void => {
+    for (let i = from; i < to; i++) {
+      const at = idsAt + i * idStride;
+      if (idx[at] !== b) throw new PackError(`${idxPath}: id ${i} is outside its fan-out bucket`);
+      if (i > from) {
+        let c = 0;
+        for (let k = 1; k < 20 && c === 0; k++)
+          c = (idx[at + k] as number) - (idx[at - idStride + k] as number);
+        if (c <= 0) throw new PackError(`${idxPath}: ids not strictly sorted at ${i}`);
+      }
+    }
+  };
+  /** The buckets a lookup has searched (checked): 1 per bucket. */
+  const checked = new Uint8Array(256);
+  let bucketsChecked = 0;
+  let verified = false;
   /** The last id `find` looked up, and its position. */
   let lastId: string | undefined;
   let lastFound = -1;
@@ -507,6 +659,8 @@ function parseIdx(idx: Uint8Array, idxPath: string, sum: Uint8Array): IdxTable {
       const v = iv.getUint32(offAt + i * offStride);
       if (!v2 || !(v & 0x80000000)) return v;
       const li = v & 0x7fffffff;
+      if (li >= large)
+        throw new PackError(`${idxPath}: entry ${i} points past the large-offset table`);
       return iv.getUint32(largeAt + li * 8) * 2 ** 32 + iv.getUint32(largeAt + li * 8 + 4);
     },
     crcOf: (i) => (v2 ? iv.getUint32(crcAt + i * 4) : undefined),
@@ -518,6 +672,11 @@ function parseIdx(idx: Uint8Array, idxPath: string, sum: Uint8Array): IdxTable {
       const b = key[0] as number;
       let lo = b ? fan(b - 1) : 0;
       let hi = fan(b);
+      if (checked[b] === 0) {
+        checkBucket(b, lo, hi);
+        checked[b] = 1;
+        bucketsChecked++;
+      }
       let found = -1;
       while (lo < hi) {
         const mid = (lo + hi) >>> 1;
@@ -535,6 +694,34 @@ function parseIdx(idx: Uint8Array, idxPath: string, sum: Uint8Array): IdxTable {
       lastFound = found;
       return found;
     },
+    async verify() {
+      // git's verify_pack_index: the idx's own SHA-1, then every entry
+      const sum = await sha1(idx.subarray(0, idx.length - 20));
+      if (hex(sum) !== hex(idx.subarray(idx.length - 20)))
+        throw new PackError(`${idxPath}: idx checksum mismatch`);
+      if (v2) {
+        let held = 0;
+        for (let i = 0; i < n; i++) {
+          const v = iv.getUint32(offAt + i * 4);
+          if (!(v & 0x80000000)) continue;
+          held++;
+          if ((v & 0x7fffffff) >= large)
+            throw new PackError(`${idxPath}: entry ${i} points past the large-offset table`);
+        }
+        if (held !== large) throw new PackError(`${idxPath}: idx length does not match its tables`);
+      }
+      for (let b = 0, from = 0; b < 256; b++) {
+        const to = fan(b);
+        if (checked[b] === 0) {
+          checkBucket(b, from, to);
+          checked[b] = 1;
+          bucketsChecked++;
+        }
+        from = to;
+      }
+      verified = true;
+    },
+    checks: () => ({ bucketsChecked, verified }),
   };
 }
 
@@ -554,18 +741,16 @@ export async function openPack(
   idxPath: string,
   options: OpenPackOptions = {},
 ): Promise<PackFile> {
-  const cache = options.baseCache ?? new DeltaBaseCache(options.baseCacheBytes ?? 16 * 2 ** 20);
+  const cache =
+    options.baseCache ??
+    new DeltaBaseCache(options.baseCacheBytes ?? DEFAULT_DELTA_BASE_CACHE_LIMIT);
   const cacheLimit = cache.limit;
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
 
   const idx = await readAll(files, idxPath);
-  // the idx's own checksum: by Web Crypto where there is one (a large idx takes milliseconds
-  // in JavaScript), checked after the tables
-  const t = parseIdx(
-    idx,
-    idxPath,
-    idx.length >= 20 ? await sha1(idx.subarray(0, idx.length - 20)) : new Uint8Array(20),
-  );
+  // git's check_packed_git_idx; the rest of the idx is checked as lookups use it
+  const t = parseIdx(idx, idxPath);
+  if (options.verifyIndex) await t.verify();
   const n = t.count;
   const packId = t.packId;
   const stats = await files.stats(packPath);
@@ -585,10 +770,26 @@ export async function openPack(
   // git's reverse index: offsets in pack order and, for each, its position in the idx
   let sorted: Float64Array | undefined;
   let perm: Uint32Array | undefined;
+  /**
+   * Every entry's offset, in idx order (for the two tables below, each built once). A bad
+   * offset (a large-offset index outside its table) is remembered: every later read that needs
+   * an extent fails with the same `PackError` without reading the whole idx again.
+   */
+  let offsetsError: unknown;
+  const allOffsets = (): Float64Array => {
+    if (offsetsError) throw offsetsError;
+    const o = new Float64Array(n);
+    try {
+      for (let i = 0; i < n; i++) o[i] = t.offsetOf(i);
+    } catch (e) {
+      offsetsError = e;
+      throw e;
+    }
+    return o;
+  };
   const revIndex = (): Float64Array => {
     if (!sorted) {
-      const s = new Float64Array(n);
-      for (let i = 0; i < n; i++) s[i] = t.offsetOf(i);
+      const s = allOffsets();
       s.sort(); // numeric, without a comparator: a typed array's own sort
       sorted = s;
     }
@@ -597,8 +798,7 @@ export async function openPack(
   /** For each entry in pack order, its position in the idx (built when first needed). */
   const permutation = (): Uint32Array => {
     if (!perm) {
-      const offs = new Float64Array(n);
-      for (let i = 0; i < n; i++) offs[i] = t.offsetOf(i);
+      const offs = allOffsets();
       const order = new Uint32Array(n);
       for (let i = 0; i < n; i++) order[i] = i;
       order.sort((a, b) => (offs[a] as number) - (offs[b] as number));
@@ -1001,11 +1201,12 @@ export async function openPack(
       const e = l.e;
       const type = TYPES[e.kind];
       if (type) {
+        // a base below a delta: cached (`chain` holds at least the delta asked for)
         const data =
-          (l.data && inflateLoaded(l as LoadedEntry & { data: Uint8Array })) ||
+          (l.data && inflateLoaded(l as LoadedEntry & { data: Uint8Array }, cache.alloc(e.size))) ||
           ((yield l.data ? reinflate(l) : inflateAll(e)) as Uint8Array);
         base = { type, data };
-        if (chain.length) cachePut(cur, base);
+        cachePut(cur, base);
         break;
       }
       chain.push(l);
@@ -1031,9 +1232,14 @@ export async function openPack(
         );
       break;
     }
-    // Checkpoints, not every step: caching each object on the way would let the top of the last
-    // chain evict everything else. The cache's slots are spread evenly along this chain (and the
-    // object asked for is kept), so the next request into the chain stops at a nearby checkpoint.
+    // The bases on the way up are cached, as git's unpack_entry caches each base it resolved;
+    // the object asked for is not (git hands it over and keeps its base), so it goes to the
+    // caller without a copy. When the budget holds fewer objects of this size than the chain
+    // has steps, caching each one would let the top of the last chain evict everything else:
+    // the cache's slots are then spread evenly along the chain (checkpoints), so the next
+    // request into it stops at a nearby one. They are counted from the top: the base of the
+    // object asked for is always cached (the cache keeps its most recent entry even under a
+    // limit of 0, as git's), so reading a chain upwards applies one or two deltas per object.
     let data = base.data;
     const slots = Math.max(1, Math.floor(cacheLimit / Math.max(1, data.length)));
     const stride = Math.max(1, Math.ceil(chain.length / slots));
@@ -1046,15 +1252,20 @@ export async function openPack(
       if (scratch[turn].length < size) scratch[turn] = new Uint8Array(Math.max(size, 1024));
       return scratch[turn].subarray(0, size);
     };
-    const own = (size: number) => new Uint8Array(size);
+    const forCache = (size: number) => cache.alloc(size);
     for (let k = chain.length - 1; k >= 0; k--) {
       const l = chain[k] as LoadedEntry;
-      const keep = k === 0 || (chain.length - k) % stride === 0;
+      const keep = k > 0 && (k - 1) % stride === 0;
       let d = inflateDelta(l);
       if (d instanceof Promise) d = (yield d) as Uint8Array;
       try {
         // the result's declared size is checked before it is allocated
-        data = applyGitDelta(data, d, maxObjectSize, keep ? own : intoScratch);
+        data = applyGitDelta(
+          data,
+          d,
+          maxObjectSize,
+          k === 0 ? allocBytes : keep ? forCache : intoScratch,
+        );
       } catch (err) {
         if (err instanceof DeltaError)
           throw new PackError(`${packPath}: delta at ${l.e.offset}: ${err.message}`);
@@ -1131,8 +1342,8 @@ export async function openPack(
     const type = TYPES[l.e.kind];
     if (!type) {
       const r = yield* resolve(offset, new Set([...(o?.visiting ?? []), id]), l);
-      // the result may be cached: copy it
-      return whole(id, r.type, copyOf(r.data), verify);
+      // never cached: the caller's own
+      return whole(id, r.type, r.data, verify);
     }
     let data: Uint8Array | undefined;
     for (;;) {
@@ -1190,13 +1401,28 @@ export async function openPack(
       get peakCachedBytes() {
         return cache.peakBytes;
       },
+      get idxBucketsChecked() {
+        return t.checks().bucketsChecked;
+      },
+      get idxVerified() {
+        return t.checks().verified;
+      },
     },
+    verifyIndex: () => t.verify(),
     close: () => {
       cached.drop();
       closed = true;
       windows.drop(loaded);
     },
-    has: (id) => t.find(id) >= 0,
+    has(id) {
+      try {
+        return t.find(id) >= 0;
+      } catch (e) {
+        // a corrupt fan-out bucket holds no usable copy; `get` raises its error
+        if (e instanceof PackError) return false;
+        throw e;
+      }
+    },
     *ids() {
       for (let i = 0; i < n; i++) yield hex(t.idAt(i));
     },

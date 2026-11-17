@@ -70,7 +70,9 @@ class GitCommitStore implements Commits {
     // (a has() check first would read and inflate the object twice).
     let obj: Awaited<ReturnType<GitObjects["get"]>>;
     try {
-      obj = await this.objects.get(id);
+      // without a promise when the object is in memory (a loaded pack window)
+      const read = this.objects.getNow ? this.objects.getNow(id) : this.objects.get(id);
+      obj = read instanceof Promise ? await read : read;
     } catch {
       return undefined;
     }

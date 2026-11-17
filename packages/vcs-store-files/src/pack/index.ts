@@ -3,4 +3,5 @@
  * first, then the loose objects. Pack reading, writing and installing live in vcs-core.
  */
 
+export * from "./delta-base-cache-limit.js";
 export * from "./with-packs.js";

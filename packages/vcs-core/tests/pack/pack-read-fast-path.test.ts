@@ -169,7 +169,7 @@ describe("openPack: delta chains", () => {
   const { data: C, d: dBC } = extend(B, "plus C\n");
   const { data: D, d: dCD } = extend(C, "plus D\n");
 
-  it("resolves deltas of deltas, OFS and REF mixed, and serves the result from the base cache", async () => {
+  it("resolves deltas of deltas, OFS and REF mixed, and serves its bases from the base cache", async () => {
     const files = createInMemoryFilesApi();
     const { pack } = await open(files, [
       { kind: 3, data: A },
@@ -181,16 +181,20 @@ describe("openPack: delta chains", () => {
     expect(d?.type).toBe("blob");
     expect(same(d?.bytes as Uint8Array, D)).toBe(true);
     expect(pack.stats.inflations).toBe(4); // the base and three deltas
-    // asked again: the cached result, copied
+    // asked again: as git, the object asked for was handed over, not cached; its base C was,
+    // so one delta is applied
     const again = await pack.get(oidOf("blob", D));
-    expect(pack.stats.inflations).toBe(4);
+    expect(pack.stats.inflations).toBe(5);
     expect(same(again?.bytes as Uint8Array, D)).toBe(true);
     again?.bytes?.fill(0);
     expect(same((await pack.get(oidOf("blob", D)))?.bytes as Uint8Array, D)).toBe(true);
-    // C resolves from the cached checkpoints below it, not from A
+    // C, a base on the way, is served from the cache (copied: zeroing it changes nothing)
     const before = pack.stats.inflations;
-    expect(same((await pack.get(oidOf("blob", C)))?.bytes as Uint8Array, C)).toBe(true);
-    expect(pack.stats.inflations - before).toBeLessThanOrEqual(1);
+    const c = await pack.get(oidOf("blob", C));
+    expect(same(c?.bytes as Uint8Array, C)).toBe(true);
+    expect(pack.stats.inflations - before).toBe(0);
+    c?.bytes?.fill(0);
+    expect(same((await pack.get(oidOf("blob", D)))?.bytes as Uint8Array, D)).toBe(true);
     for (const [data, id] of [
       [A, oidOf("blob", A)],
       [B, oidOf("blob", B)],
