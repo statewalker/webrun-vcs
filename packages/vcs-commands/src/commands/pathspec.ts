@@ -30,8 +30,9 @@ export interface PathspecItem {
   /** `:(icase)`: case-insensitive */
   icase: boolean;
   /**
-   * `match` holds the path's bytes, one character each (see {@link treePathspec}); its
-   * lengths count bytes, and names are matched as their bytes ({@link pathspecName})
+   * `match` holds the path's bytes, one character each ({@link pathspecItemBytes}, as
+   * `parsePathspec` and {@link treePathspec} hold every element); its lengths count bytes,
+   * and names are matched as their bytes ({@link pathspecName})
    */
   bytes?: boolean;
   /**
@@ -133,7 +134,22 @@ export function parsePathspec(paths: string[]): PathspecItem[] {
   if (items.length > 0 && items.every((i) => i.exclude)) {
     items.push(parsePathspecItem("."));
   }
-  return items;
+  // held as bytes: git matches names byte by byte, so an element may cut a character
+  return items.map(pathspecItemBytes);
+}
+
+/**
+ * The element with its path as bytes, one character each (`bytes`): its lengths then count
+ * bytes, as git's do, and it matches names as their bytes ({@link pathspecName}).
+ */
+export function pathspecItemBytes(item: PathspecItem): PathspecItem {
+  if (item.bytes) return item;
+  return {
+    ...item,
+    match: byteString(item.match),
+    nowildcardLen: byteString(item.match.slice(0, item.nowildcardLen)).length,
+    bytes: true,
+  };
 }
 
 export function parsePathspecItem(elem: string, options: PathspecParseOptions = {}): PathspecItem {
@@ -290,16 +306,19 @@ function gitFnmatch(item: PathspecItem, pattern: string, string: string, prefix:
 }
 
 /**
- * A path as an element matches it: as it is, or as its bytes (one character each) for an
- * element held as bytes (`:(prefix:N)`).
+ * A path as an element held as bytes ({@link pathspecItemBytes}) matches it: its bytes, one
+ * character each, as git compares them (an escaped byte as that byte).
  */
-export const pathspecName = (item: PathspecItem, name: string) =>
-  item.bytes ? byteString(name) : name;
+export const pathspecName = (name: string) => byteString(name);
 
-/** git's `match_pathspec_item`. */
-function matchPathspecItem(item: PathspecItem, path: string, flags: number): number {
+/**
+ * git's `match_pathspec_item`, in byte space: the element as its bytes and the name as its
+ * bytes, so an element that cuts a character matches as in git (`:(icase)` folds ASCII only).
+ */
+function matchPathspecItem(element: PathspecItem, path: string, flags: number): number {
+  const item = pathspecItemBytes(element);
   const { match } = item;
-  const name = pathspecName(item, path);
+  const name = pathspecName(path);
   const matchlen = match.length;
   const namelen = name.length;
   // the prefix of `:(prefix:N)` (bytes) compares exactly, even under icase (dir.c)
@@ -419,16 +438,7 @@ export interface TreePathspec {
 
 /** The elements as `tree_entry_interesting` matches them. */
 export function treePathspec(items: PathspecItem[]): TreePathspec {
-  const byteItems = items.map((item) =>
-    item.bytes
-      ? item
-      : {
-          ...item,
-          match: byteString(item.match),
-          nowildcardLen: byteString(item.match.slice(0, item.nowildcardLen)).length,
-          bytes: true,
-        },
-  );
+  const byteItems = items.map(pathspecItemBytes);
   const elements = items.map((item): TreePathspecElement => {
     const match = item.bytes ? latin1Bytes(item.match) : encodeGitPath(item.match);
     const nowildcardLen = item.bytes

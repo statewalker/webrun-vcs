@@ -34,6 +34,7 @@ import {
   type GitCheckoutFilesApi,
   GitWorkingCopyConfig,
 } from "@statewalker/vcs-store-files";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -1276,4 +1277,194 @@ describeGit("clean -- :(prefix:N) counts bytes, as git", () => {
       expect([spec, mine]).toEqual([spec, theirs]);
     });
   }
+});
+
+describeGit("clean -- pathspecs match bytes, as git (cut characters, raw names)", () => {
+  let root = "";
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-bytes-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const b = (...parts: Array<string | number[] | Buffer>) =>
+    Buffer.concat(parts.map((p) => (typeof p === "string" ? Buffer.from(p) : Buffer.from(p))));
+  // Ä is c3 84, ä c3 a4, 日 e6 97 a5, 本 e6 9c ac
+  const NAMES = [
+    b("Ä"),
+    b("Äx"),
+    b("ä"),
+    b("A/Ä"),
+    b("A/b"),
+    b("a/Ä.log"),
+    b("日本.txt"),
+    b("日本/x"),
+    b("日x"),
+    b([0x6e, 0xff]),
+    b("q/", [0xfe], "/f"),
+    b("Ä.log"),
+  ];
+
+  /** The worktree below `top` as hex names (raw bytes: readdir as buffers). */
+  function rawListing(top: string): string[] {
+    const out: string[] = [];
+    const walk = (rel: Buffer) => {
+      const abs = Buffer.concat([Buffer.from(`${top}/`), rel]);
+      for (const name of readdirSync(abs, { encoding: "buffer" })) {
+        const p = rel.length ? Buffer.concat([rel, Buffer.from("/"), name]) : name;
+        if (p.toString() === ".git") continue;
+        const st = lstatSync(Buffer.concat([Buffer.from(`${top}/`), p]));
+        out.push(st.isDirectory() ? `${p.toString("hex")}/` : p.toString("hex"));
+        if (st.isDirectory()) walk(p);
+      }
+    };
+    walk(Buffer.alloc(0));
+    return out.sort();
+  }
+
+  function setup(dir: string, names: Buffer[]) {
+    execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+    writeFileSync(join(dir, ".gitignore"), "*.log\n日*\n");
+    for (const name of names) {
+      const abs = Buffer.concat([Buffer.from(`${dir}/`), name]);
+      const slash = abs.lastIndexOf(0x2f);
+      mkdirSync(abs.subarray(0, slash), { recursive: true });
+      writeFileSync(abs, "x\n");
+    }
+  }
+
+  /** Native `git clean` with raw-byte pathspecs (argv bytes through the shell's printf). */
+  function nativeClean(dir: string, flags: string[], specs: Buffer[]): string[] {
+    const octal = (x: Buffer) => [...x].map((c) => `\\${c.toString(8).padStart(3, "0")}`).join("");
+    const args = specs.map((x) => `"$(printf '${octal(x)}')"`).join(" ");
+    const out = execFileSync(
+      "sh",
+      ["-c", `git -c core.quotePath=false clean ${flags.join(" ")} -- ${args}`],
+      { cwd: dir, env: env() },
+    );
+    const lines: string[] = [];
+    let start = 0;
+    for (let i = 0; i < out.length; i++) {
+      if (out[i] !== 0x0a) continue;
+      const line = out.subarray(start, i);
+      start = i + 1;
+      const prefix = Buffer.from(flags.includes("-n") ? "Would remove " : "Removing ");
+      if (line.subarray(0, prefix.length).equals(prefix))
+        lines.push(decodeGitPath(new Uint8Array(line.subarray(prefix.length))));
+    }
+    return lines.sort();
+  }
+
+  async function oursClean(
+    dir: string,
+    o: { x: boolean; X: boolean; dryRun: boolean },
+    specs: Buffer[],
+  ): Promise<string[]> {
+    const files = createNodeFilesApi({ rootDir: dir });
+    const { history } = await createGitFilesBackend({ files });
+    const { openGitLinkedWorktrees } = await import("@statewalker/vcs-store-files");
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history });
+    const result = await Git.fromWorkingCopy(await worktrees.openCurrent())
+      .clean()
+      .setDryRun(o.dryRun)
+      .setCleanDirectories(true)
+      .setIgnore(!o.x)
+      .setIgnoredOnly(o.X)
+      .setPaths(new Set(specs.map((x) => decodeGitPath(new Uint8Array(x)))))
+      .call();
+    return [...result.cleaned].sort();
+  }
+
+  const MODES: Array<[string, { x: boolean; X: boolean }]> = [
+    ["-d -x", { x: true, X: false }],
+    ["-d -X", { x: false, X: true }],
+  ];
+
+  /** Both twins: the dry run lists git's paths, and the real run leaves git's worktree. */
+  async function compare(label: string, names: Buffer[], specs: Buffer[]) {
+    for (const [flagName, mode] of MODES) {
+      const flags = flagName.split(" ");
+      const n = join(root, "n");
+      const o = join(root, "o");
+      try {
+        setup(n, names);
+        setup(o, names);
+        const theirs = nativeClean(n, ["-n", ...flags], specs);
+        const mine = await oursClean(o, { ...mode, dryRun: true }, specs);
+        expect([label, flagName, mine]).toEqual([label, flagName, theirs]);
+        nativeClean(n, ["-f", ...flags], specs);
+        await oursClean(o, { ...mode, dryRun: false }, specs);
+        expect([label, flagName, rawListing(o)]).toEqual([label, flagName, rawListing(n)]);
+      } finally {
+        rmSync(n, { recursive: true, force: true });
+        rmSync(o, { recursive: true, force: true });
+      }
+    }
+  }
+
+  const CASES: Array<[string, Buffer[]]> = [
+    // the data-loss case: git keeps Ä (c3 84) under an exclude that cuts it
+    ["exclude *\\x84", [b(":(exclude)*", [0x84]), b(".")]],
+    ["*\\x84", [b("*", [0x84])]],
+    ["?\\x84", [b("?", [0x84])]],
+    ["A/\\xc3*", [b("A/", [0xc3], "*")]],
+    ["\\xc3*", [b([0xc3], "*")]],
+    ["icase a/\\xc3*", [b(":(icase)a/", [0xc3], "*")]],
+    ["icase ä (no fold beyond ASCII)", [b(":(icase)ä")]],
+    ["icase,exclude 日 + cut 本", [b(":(icase,exclude)日", [0xe6, 0x9c], "*"), b(".")]],
+    ["glob **/\\xc3?", [b(":(glob)**/", [0xc3], "?")]],
+    ["glob A/*\\x84", [b(":(glob)A/*", [0x84])]],
+    ["literal \\xe6\\x97", [b(":(literal)", [0xe6, 0x97])]],
+    ["\\xe6\\x97*", [b([0xe6, 0x97], "*")]],
+    ["raw name n\\xff", [b([0x6e, 0xff])]],
+    ["raw dir q/\\xfe", [b("q/", [0xfe])]],
+    ["exclude raw q/*", [b(":!q/*"), b(":!", [0x6e], "*")]],
+    ["[\\xc3]\\x84", [b("[", [0xc3], "]", [0x84])]],
+  ];
+
+  for (const [label, specs] of CASES) {
+    it(`clean -- ${label}`, async () => {
+      await compare(label, NAMES, specs);
+    });
+  }
+
+  it("matches git on random raw-byte names and pathspecs that cut them", async () => {
+    const r = rng(4242);
+    const pick = <T>(xs: readonly T[]) => xs[Math.floor(r() * xs.length)];
+    const SEGMENTS = [b("Ä"), b("ä"), b("A"), b("a"), b("日本"), b([0xff]), b([0xc3]), b("x")];
+    for (let round = 0; round < 40; round++) {
+      const names: Buffer[] = [];
+      for (let i = 0; i < 6; i++) {
+        const segs = Array.from({ length: 1 + Math.floor(r() * 2) }, () => pick(SEGMENTS));
+        const dir = r() < 0.3 ? [pick(SEGMENTS), b("/")] : [];
+        names.push(Buffer.concat([...dir, ...segs, r() < 0.3 ? b(".log") : b("")]));
+      }
+      // drop names that are a directory of another (a file and a directory of one name)
+      const unique = names.filter(
+        (n, i) =>
+          names.findIndex((m) => m.equals(n)) === i &&
+          !names.some(
+            (m) =>
+              m.length > n.length && m.subarray(0, n.length + 1).equals(Buffer.concat([n, b("/")])),
+          ),
+      );
+      const source = pick(unique);
+      const cut = source.subarray(0, 1 + Math.floor(r() * source.length));
+      const magic = pick([
+        "",
+        ":(exclude)",
+        ":(icase)",
+        ":(glob)",
+        ":(icase,exclude)",
+        ":(literal)",
+      ]);
+      const tail = pick(["*", "", "?", "*.log"]);
+      const specs = [b(magic, cut, tail)];
+      if (magic.includes("exclude")) specs.push(b("."));
+      await compare(
+        `round ${round}: ${specs.map((x) => x.toString("hex")).join(" ")}`,
+        unique,
+        specs,
+      );
+    }
+  });
 });

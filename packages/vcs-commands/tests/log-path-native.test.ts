@@ -14,6 +14,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
@@ -380,6 +381,67 @@ describeGit("log -- <path> against native git", () => {
       }
       expect(native(["."])).toHaveLength(1);
       await expect(ours([""])).rejects.toThrow("empty string is not a valid pathspec");
+    } finally {
+      dir = saved;
+    }
+  });
+
+  it("matches paths that are no UTF-8 by their bytes, as git does", async () => {
+    const saved = dir;
+    dir = join(root, "raw-names");
+    try {
+      execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+      // a stream with raw name bytes (n\xffx, d\xfe/f) and a UTF-8 neighbour; each commit
+      // continues the branch
+      const parts: Buffer[] = [];
+      let time = 1500000000;
+      const commit = (message: string, path: Buffer, content: string) => {
+        time += 100;
+        parts.push(Buffer.from(`commit refs/heads/main\n`));
+        parts.push(Buffer.from(`committer C O Mitter <c@example.com> ${time} +0000\n`));
+        parts.push(Buffer.from(`data ${message.length}\n${message}\n`));
+        parts.push(Buffer.from("M 100644 inline "), path, Buffer.from("\n"));
+        parts.push(Buffer.from(`data ${content.length}\n${content}\n\n`));
+      };
+      const nx = Buffer.from([0x6e, 0xff, 0x78]);
+      const df = Buffer.from([0x64, 0xfe, 0x2f, 0x66]);
+      commit("root", Buffer.from("README"), "r\n");
+      commit("nx 1", nx, "1\n");
+      commit("df 1", df, "1\n");
+      commit("other", Buffer.from("n\u00ffx"), "u\n");
+      commit("nx 2", nx, "2\n");
+      commit("df 2", df, "2\n");
+      execFileSync("git", ["fast-import", "--quiet"], {
+        cwd: dir,
+        env: env(),
+        input: Buffer.concat(parts),
+      });
+      git(["checkout", "-q", "main"]);
+      // native git takes the raw bytes through the shell (argv cannot carry them from Node)
+      const octal = (b: Buffer) =>
+        [...b].map((x) => `\\${x.toString(8).padStart(3, "0")}`).join("");
+      const nativeRaw = (path: Buffer) =>
+        execFileSync("sh", ["-c", `git log --format=%H -- "$(printf '${octal(path)}')"`], {
+          cwd: dir,
+          env: env(),
+          encoding: "utf8",
+        })
+          .split("\n")
+          .filter(Boolean);
+      const cases = [
+        nx,
+        Buffer.concat([Buffer.from(":(literal)"), nx]),
+        Buffer.from([0x64, 0xfe]),
+        df,
+        Buffer.concat([Buffer.from(":(literal)"), df]),
+        Buffer.from("n\u00ffx"),
+      ];
+      for (const path of cases) {
+        const expected = nativeRaw(path);
+        expect(expected.length).toBeGreaterThan(0);
+        const label = path.toString("hex");
+        expect([label, (await ours([decodeGitPath(path)])).ids]).toEqual([label, expected]);
+      }
     } finally {
       dir = saved;
     }

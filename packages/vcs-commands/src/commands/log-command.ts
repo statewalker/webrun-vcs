@@ -11,6 +11,7 @@ import {
   parseGraphCommit,
 } from "@statewalker/vcs-core";
 import { OrderedMap } from "@statewalker/vcs-utils";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import {
@@ -748,7 +749,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     return {
       ...treePathspec(items),
       literal: plain
-        ? items.map((i) => pathParts(i.match).map((part) => NAME_ENCODER.encode(part)))
+        ? items.map((i) => pathParts(i.match).map((part) => encodeGitPath(part)))
         : undefined,
     };
   }
@@ -987,7 +988,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (!entries) throw new GitApiError(`unable to read tree (${id})`);
       const parts: Uint8Array[] = [];
       for await (const e of entries) {
-        parts.push(NAME_ENCODER.encode(`${e.mode.toString(8)} ${e.name}\0`), hexToBytes(e.id));
+        parts.push(
+          NAME_ENCODER.encode(`${e.mode.toString(8)} `),
+          encodeGitPath(e.name),
+          new Uint8Array(1),
+          hexToBytes(e.id),
+        );
       }
       return concatBytes(parts);
     }
