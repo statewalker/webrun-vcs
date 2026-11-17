@@ -14,6 +14,7 @@ export * from "./pack-index-reader.js";
 export * from "./pack-index-writer.js";
 export * from "./pack-set.js";
 export * from "./random-access-delta.js";
+export * from "./run-steps.js";
 export * from "./types.js";
 export * from "./unpack-objects.js";
 export * from "./write-pack.js";

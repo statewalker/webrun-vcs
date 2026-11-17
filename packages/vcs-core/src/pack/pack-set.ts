@@ -32,6 +32,7 @@ import {
   type PackFile,
   type ResolvedObject,
 } from "./pack-file.js";
+import { runSteps, runStepsAsync, type Steps } from "./run-steps.js";
 
 export interface OpenPackSetOptions {
   /** Bytes of resolved delta bases kept across reads, for the whole set. Default 16 MiB. */
@@ -77,6 +78,15 @@ export interface PackSet {
    * `verify`, the end of the content throws `ObjectIdMismatchError` if it hashes to another id.
    */
   get(id: ObjectId, options?: { verify?: boolean }): Promise<GitObject | undefined>;
+  /**
+   * `get`, without a promise when no I/O is needed (the copy is in a loaded window or the base
+   * cache): the object or undefined, else a promise of it. Errors are thrown as `get` rejects
+   * with them. Optional: a wrapper of a set may leave it out (callers then use `get`).
+   */
+  getNow?(
+    id: ObjectId,
+    options?: { verify?: boolean },
+  ): GitObject | undefined | Promise<GitObject | undefined>;
   /** The object's entry as stored in the first pack holding a sound copy (for reuse). */
   entry(id: ObjectId): Promise<PackedEntry | undefined>;
   /**
@@ -338,11 +348,12 @@ export async function openPackSet(
    * Reads the first chunk before handing the object out, so a stream broken from its start
    * fails `get` itself; a failure later marks the copy bad for the next `get`.
    */
-  const guarded = async (p: PackFile, id: ObjectId, obj: GitObject): Promise<GitObject> => {
+  function* guarded(p: PackFile, id: ObjectId, obj: GitObject): Steps<GitObject> {
     // already in memory: nothing left to fail
     if (obj.bytes) return obj;
     const it = obj.content[Symbol.asyncIterator]();
-    let pending: IteratorResult<Uint8Array> | undefined = await it.next();
+    let pending: IteratorResult<Uint8Array> | undefined =
+      (yield it.next()) as IteratorResult<Uint8Array>;
     let finished = pending.done === true;
     // A custom iterator, not a generator: `return()` must close the inner read (the pack file
     // and the pooled inflater) even before the first `next()`, which a generator's `finally`
@@ -375,7 +386,7 @@ export async function openPackSet(
       },
     };
     return { ...obj, content: { [Symbol.asyncIterator]: () => iterator } };
-  };
+  }
 
   /**
    * The first sound copy of `id`. A copy that fails before `get` returns (a corrupt header, a
@@ -384,12 +395,18 @@ export async function openPackSet(
    * dropped, and the miss then rescans whatever the rate limit: the pack was removed by a
    * repack, which installed its replacement first.
    */
-  async function lookup(
+  const lookup = (
     id: ObjectId,
     o: { verify?: boolean; visiting?: ReadonlySet<ObjectId> },
     rescan: boolean,
-  ): Promise<GitObject | undefined> {
-    if (!isId(id)) return undefined;
+  ): Promise<GitObject | undefined> => runStepsAsync(lookupSteps(id, o, rescan));
+  /** `lookup`, synchronous while the copy it reads is in memory (`PackFile.getNow`). */
+  function* lookupSteps(
+    id: ObjectId,
+    o: { verify?: boolean; visiting?: ReadonlySet<ObjectId> },
+    rescan: boolean,
+  ): Steps<GitObject | undefined> {
+    // no pack holds what is not an id (`has` parses it): checked only before a rescan
     let failed: unknown;
     let vanished = false;
     // `packs` is replaced, never changed in place: this loop sees one snapshot
@@ -400,10 +417,11 @@ export async function openPackSet(
         continue;
       }
       try {
-        const obj = await p.get(id, o);
-        if (obj) return await guarded(p, id, obj);
+        let obj = p.getNow(id, o);
+        if (obj instanceof Promise) obj = (yield obj) as GitObject | undefined;
+        if (obj) return yield* guarded(p, id, obj);
       } catch (e) {
-        if (!(await files.exists(p.packPath))) {
+        if (!((yield files.exists(p.packPath)) as boolean)) {
           drop(p);
           vanished = true;
           continue;
@@ -414,7 +432,9 @@ export async function openPackSet(
       }
     }
     if (failed) throw failed;
-    if (rescan && (await (vanished ? refresh() : rescanOnMiss()))) return lookup(id, o, false);
+    if (!isId(id)) return undefined;
+    if (rescan && ((yield vanished ? refresh() : rescanOnMiss()) as boolean))
+      return yield* lookupSteps(id, o, false);
     return undefined;
   }
 
@@ -485,6 +505,7 @@ export async function openPackSet(
       return false;
     },
     get: (id, o) => lookup(id, { verify: o?.verify }, true),
+    getNow: (id, o) => runSteps(lookupSteps(id, { verify: o?.verify }, true)),
     entry: (id) => findEntry(id, true),
     async *list(o) {
       // an id is yielded by the first pack holding it: no set of every id

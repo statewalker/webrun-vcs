@@ -10,7 +10,13 @@
  */
 
 import type { PackSet, StagingBlobStore } from "@statewalker/vcs-core";
-import { type GitObject, type GitObjects, PackError } from "@statewalker/vcs-core";
+import {
+  type GitObject,
+  type GitObjects,
+  PackError,
+  runStepsAsync,
+  type Steps,
+} from "@statewalker/vcs-core";
 
 const OID = /^[0-9a-f]{40}$/;
 const isId = (id: unknown): id is string => typeof id === "string" && OID.test(id);
@@ -83,24 +89,25 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
    * raised only when there is none. A copy failing later in its stream is marked bad by the
    * set, so the next read goes loose.
    */
-  const lookup = async (
-    id: string,
-    options?: { verify?: boolean },
-  ): Promise<GitObject | undefined> => {
-    if (!isId(id)) return loose.get(id, options);
+  const lookup = (id: string, options?: { verify?: boolean }): Promise<GitObject | undefined> =>
+    runStepsAsync(lookupSteps(id, options));
+  /** `lookup`, without a promise until one is needed: none for a packed object in memory. */
+  function* lookupSteps(id: string, options?: { verify?: boolean }): Steps<GitObject | undefined> {
+    // what is not an id is in no pack (the set finds none), and goes to the loose store as is
     let failed: unknown;
     try {
-      const packed = await packs.get(id, options);
+      let packed = packs.getNow ? packs.getNow(id, options) : packs.get(id, options);
+      if (packed instanceof Promise) packed = (yield packed) as GitObject | undefined;
       if (packed) return packed;
     } catch (e) {
       if (!(e instanceof PackError)) throw e;
       failed = e;
     }
-    const obj = await loose.get(id, options);
+    const obj = (yield loose.get(id, options)) as GitObject | undefined;
     if (obj) return obj;
     if (failed) throw failed;
     return undefined;
-  };
+  }
 
   return {
     put: (type, size, content) => loose.put(type, size, content),

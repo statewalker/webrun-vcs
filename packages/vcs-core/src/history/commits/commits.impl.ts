@@ -7,7 +7,7 @@
 
 import type { ObjectId } from "../../common/id/index.js";
 import { objectRemovalEpoch } from "../../storage/raw/object-removals.js";
-import type { GitObjects } from "../objects/git-objects.js";
+import type { GitObject, GitObjects } from "../objects/git-objects.js";
 import {
   hasObjectOfType,
   objectHeader,
@@ -66,17 +66,6 @@ class GitCommitStore implements Commits {
     }
     // the count before the read: a removal while reading leaves the entry to be checked
     const epoch = objectRemovalEpoch();
-    const commit = await this.read(id);
-    if (commit) {
-      this.cache.set(id, { commit: copyCommit(commit), epoch });
-      if (this.cache.size > MAX_CACHED_COMMITS) {
-        this.cache.delete(this.cache.keys().next().value as ObjectId);
-      }
-    }
-    return commit;
-  }
-
-  private async read(id: ObjectId): Promise<Commit | undefined> {
     // One read: the header says whether it is a commit, the same stream is decoded
     // (a has() check first would read and inflate the object twice).
     let obj: Awaited<ReturnType<GitObjects["get"]>>;
@@ -86,15 +75,19 @@ class GitCommitStore implements Commits {
       return undefined;
     }
     if (!obj) return undefined;
-    if (obj.bytes) {
-      // in memory already: decoded synchronously (the content needs no release)
-      if (obj.type !== "commit") return undefined;
-      try {
-        return commitFromBytes(obj.bytes);
-      } catch {
-        return undefined;
+    // in memory already: decoded without another await
+    const commit = obj.bytes ? fromBytes(obj.type, obj.bytes) : await this.readStream(obj);
+    if (commit) {
+      this.cache.set(id, { commit: copyCommit(commit), epoch });
+      if (this.cache.size > MAX_CACHED_COMMITS) {
+        this.cache.delete(this.cache.keys().next().value as ObjectId);
       }
     }
+    return commit;
+  }
+
+  /** A commit object that is not in memory, decoded from its stream. */
+  private async readStream(obj: GitObject): Promise<Commit | undefined> {
     const it = obj.content[Symbol.asyncIterator]();
     try {
       if (obj.type !== "commit") return undefined;
@@ -230,6 +223,16 @@ class GitCommitStore implements Commits {
 const MAX_CACHED_COMMITS = 10_000;
 
 /** A copy a caller may change without reaching the cache. */
+/** The commit in `bytes`, or undefined if it is not a commit or does not parse. */
+function fromBytes(type: string, bytes: Uint8Array): Commit | undefined {
+  if (type !== "commit") return undefined;
+  try {
+    return commitFromBytes(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
 function copyCommit(c: Commit): Commit {
   return { ...c, parents: [...c.parents], author: { ...c.author }, committer: { ...c.committer } };
 }

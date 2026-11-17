@@ -306,3 +306,32 @@ describe("openPack: corrupt small entries", () => {
     await expect(bytesOf(await pack.get(oidOf("blob", data)))).rejects.toBeInstanceOf(PackError);
   });
 });
+
+describe("openPack: getNow, without a promise when nothing is read", () => {
+  it("answers with a promise before the window is loaded and with the object after", async () => {
+    const files = createInMemoryFilesApi();
+    const blobs = Array.from({ length: 5 }, (_, i) => text(20, `now ${i}`));
+    const base = text(200, "now base");
+    const { data: top, d: topDelta } = extend(base, "now tail\n");
+    const { pack } = await open(files, [
+      ...blobs.map((data) => ({ kind: 3, data })),
+      { kind: 3, data: base },
+      { kind: 6, data: topDelta, baseIdx: 5 },
+    ]);
+    const first = pack.getNow(oidOf("blob", blobs[0] as Uint8Array));
+    expect(first).toBeInstanceOf(Promise);
+    expect(same((await first)?.bytes as Uint8Array, blobs[0] as Uint8Array)).toBe(true);
+    for (const b of blobs) {
+      const o = pack.getNow(oidOf("blob", b));
+      expect(o).not.toBeInstanceOf(Promise);
+      expect(same((o as { bytes: Uint8Array }).bytes, b)).toBe(true);
+    }
+    // a delta whose chain is in the loaded window resolves at once too
+    const resolved = pack.getNow(oidOf("blob", top));
+    expect(resolved).not.toBeInstanceOf(Promise);
+    expect(same((resolved as { bytes: Uint8Array }).bytes, top)).toBe(true);
+    expect(pack.getNow(oidOf("blob", text(1, "absent")))).toBeUndefined();
+    // `get` gives the same objects, as promises
+    expect(same((await pack.get(oidOf("blob", top)))?.bytes as Uint8Array, top)).toBe(true);
+  });
+});

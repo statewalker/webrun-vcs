@@ -51,18 +51,21 @@ export function parsePersonIdent(str: string): PersonIdent {
 
   // After > comes " timestamp timezone"
   const rest = str.substring(emailEnd + 1).trim();
-  const parts = rest.split(" ");
+  // the first two words of `rest.split(" ")`
+  const space = rest.indexOf(" ");
 
-  if (parts.length < 2) {
+  if (space < 0) {
     throw new Error(`Invalid person ident format (missing timestamp/timezone): ${str}`);
   }
 
-  const timestamp = parseInt(parts[0], 10);
+  const first = rest.substring(0, space);
+  const timestamp = parseInt(first, 10);
   if (Number.isNaN(timestamp)) {
-    throw new Error(`Invalid timestamp in person ident: ${parts[0]}`);
+    throw new Error(`Invalid timestamp in person ident: ${first}`);
   }
 
-  const tzOffset = parts[1];
+  const next = rest.indexOf(" ", space + 1);
+  const tzOffset = next < 0 ? rest.substring(space + 1) : rest.substring(space + 1, next);
   if (!isValidTimezone(tzOffset)) {
     throw new Error(`Invalid timezone in person ident: ${tzOffset}`);
   }

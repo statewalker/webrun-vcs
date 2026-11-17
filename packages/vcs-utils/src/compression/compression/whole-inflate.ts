@@ -7,13 +7,17 @@
  * size is usually known (a pack entry's header gives it), so the decoder is one loop over
  * the input writing straight into the result:
  *
- *  - Huffman codes up to 9 bits are decoded with one table lookup, longer ones bit by bit
- *    from the canonical code (as zlib's puff.c);
- *  - code sets are checked as zlib's inflate_table checks them (over-subscribed, incomplete
- *    except for a single code, a missing end-of-block code), and so are stored block lengths,
- *    distances, repeat codes and the zlib header;
- *  - the Adler-32 trailer is checked, so a stream decodes to exactly what zlib decodes or
- *    fails as zlib fails.
+ *  - Huffman tables are built as zlib's `inflate_table` builds them (a root table indexed by
+ *    the next 9 bits, 6 for distances, and sub-tables for longer codes), into typed arrays
+ *    allocated once; it refuses the same code sets (over-subscribed, incomplete except for a
+ *    single one-bit code);
+ *  - the decoding loop is zlib's `inflate_fast` while at least 8 input bytes are left, with
+ *    the output bound checked per symbol instead of reserving 258 bytes (small objects
+ *    decoded into a buffer of their exact size would otherwise never take it), and zlib's
+ *    one-symbol-at-a-time `inflate` steps near the end of the input, which pull bytes only as
+ *    a code needs them;
+ *  - stored block lengths, distances, repeat codes, the zlib header and the Adler-32 trailer
+ *    are checked, so a stream decodes to exactly what zlib decodes or fails where zlib fails.
  *
  * Errors: `InflateError` for corrupt data, `TruncatedStreamError` when the input ends inside
  * the stream, `InflateOverflowError` when the output would not fit.
@@ -59,157 +63,323 @@ export interface WholeInflateResult {
 /** Thrown by `grow` to stop a `partial` inflate, caught by `inflateWhole`. */
 const STOP = Symbol("stop");
 
+/*
+ * A table entry is `bits | op << 8 | val << 16`, as zlib's `code`:
+ *  - op 0: a literal (`val`), or a code length symbol in the code length table;
+ *  - op 16 + n: a length or distance base (`val`) followed by n extra bits;
+ *  - op 1..15: in a root table, a link to the sub-table at `val` indexed by op more bits;
+ *  - op 96: end of block; op 64: an invalid code.
+ * `bits` is what the entry's code takes (the root bits for a link).
+ */
+const OP_BASE = 16;
+const OP_EOB = 96;
+const OP_BAD = 64;
+
+/** Length bases and ops, for symbols 257..287 (286 and 287 are invalid). */
 const LBASE = new Uint16Array([
   3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
-  163, 195, 227, 258,
+  163, 195, 227, 258, 0, 0,
 ]);
-const LEXT = new Uint8Array([
-  0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+const LOP = new Uint8Array([
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  17,
+  17,
+  17,
+  17,
+  18,
+  18,
+  18,
+  18,
+  19,
+  19,
+  19,
+  19,
+  20,
+  20,
+  20,
+  20,
+  21,
+  21,
+  21,
+  21,
+  16,
+  OP_BAD,
+  OP_BAD,
 ]);
+/** Distance bases and ops, for symbols 0..31 (30 and 31 are invalid). */
 const DBASE = new Uint16Array([
   1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
-  3073, 4097, 6145, 8193, 12289, 16385, 24577,
+  3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
 ]);
-const DEXT = new Uint8Array([
-  0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+const DOP = new Uint8Array([
+  16,
+  16,
+  16,
+  16,
+  17,
+  17,
+  18,
+  18,
+  19,
+  19,
+  20,
+  20,
+  21,
+  21,
+  22,
+  22,
+  23,
+  23,
+  24,
+  24,
+  25,
+  25,
+  26,
+  26,
+  27,
+  27,
+  28,
+  28,
+  29,
+  29,
+  OP_BAD,
+  OP_BAD,
 ]);
 /** Order of the code length code lengths. */
 const CLORDER = new Uint8Array([16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]);
 
-/** Most bits resolved by one table lookup. */
-const FAST_BITS = 9;
-const FAST_SIZE = 1 << FAST_BITS;
+/** Table entries without their bits, by symbol: code length symbols, literal/lengths, distances. */
+const CODE_ENTRY = new Int32Array(19);
+for (let s = 0; s < 19; s++) CODE_ENTRY[s] = s << 16;
+const LIT_ENTRY = new Int32Array(288);
+for (let s = 0; s < 288; s++)
+  LIT_ENTRY[s] =
+    s < 256
+      ? s << 16
+      : s === 256
+        ? OP_EOB << 8
+        : ((LOP[s - 257] as number) << 8) | ((LBASE[s - 257] as number) << 16);
+const DIST_ENTRY = new Int32Array(32);
+for (let s = 0; s < 32; s++)
+  DIST_ENTRY[s] = ((DOP[s] as number) << 8) | ((DBASE[s] as number) << 16);
 
-/** `REV9[c]`: the 9-bit `c` with its bits reversed. */
-const REV9 = new Uint16Array(FAST_SIZE);
-for (let c = 0; c < FAST_SIZE; c++) {
-  let r = 0;
-  for (let k = 0; k < FAST_BITS; k++) r |= ((c >> k) & 1) << (FAST_BITS - 1 - k);
-  REV9[c] = r;
-}
-
-/** A canonical Huffman code: counts per length and symbols in code order, plus a lookup table. */
-interface Huffman {
-  count: Uint16Array;
-  symbol: Uint16Array;
-  /**
-   * By the next `bits` input bits: symbol << 4 | code length; 0 for the prefix of a longer
-   * code, or of no code.
-   */
-  fast: Int32Array;
-  /** `(1 << bits) - 1`, bits = min(FAST_BITS, longest code) */
-  mask: number;
-}
-
-const newHuffman = (symbols: number): Huffman => ({
-  count: new Uint16Array(16),
-  symbol: new Uint16Array(symbols),
-  fast: new Int32Array(FAST_SIZE),
-  mask: 0,
-});
+/** zlib's ENOUGH_LENS and ENOUGH_DISTS: the largest tables for root bits 9 and 6. */
+const ENOUGH_LENS = 852;
+const ENOUGH_DISTS = 592;
 
 const offs = new Uint16Array(16);
-const nextCode = new Uint16Array(16);
+const work = new Uint16Array(288);
 
 /**
- * Builds `h` from code lengths `lens[from, from + n)`. Returns false for a set zlib refuses:
- * over-subscribed, or incomplete unless `single` allows a lone one-bit code (literal/length
- * and distance codes, as zlib).
+ * A code set as the table builder takes it: `count[len]` codes of each length and `syms`, the
+ * `n` symbols with a code (lengths in `lens[from + sym]`), in symbol order. The reader of a
+ * dynamic block header fills it as it decodes the lengths, so the builder never scans the
+ * symbols without a code.
  */
-function build(h: Huffman, lens: Uint8Array, from: number, n: number, single: boolean): boolean {
-  const { count, symbol, fast } = h;
+interface CodeSet {
+  count: Uint16Array;
+  syms: Uint16Array;
+  n: number;
+}
+
+const newCodeSet = (symbols: number): CodeSet => ({
+  count: new Uint16Array(16),
+  syms: new Uint16Array(symbols),
+  n: 0,
+});
+
+/** Fills `set` from the code lengths `lens[from, from + n)`. */
+function countLengths(set: CodeSet, lens: Uint8Array, from: number, n: number): CodeSet {
+  const { count, syms } = set;
   count.fill(0);
-  for (let s = 0; s < n; s++) count[lens[from + s] as number]++;
-  count[0] = 0;
-  let max = 15;
-  while (max > 0 && count[max] === 0) max--;
-  const bits = Math.max(1, Math.min(FAST_BITS, max));
-  const size = 1 << bits;
-  h.mask = size - 1;
-  if (max === 0) {
-    fast.fill(0, 0, size);
-    return true; // no codes at all: any use of the code fails
+  let k = 0;
+  for (let s = 0; s < n; s++) {
+    const len = lens[from + s] as number;
+    if (len !== 0) {
+      count[len]++;
+      syms[k++] = s;
+    }
   }
+  set.n = k;
+  return set;
+}
+
+/**
+ * zlib's `inflate_table`: builds the decoding table for the code set `set` (consuming its
+ * counts) into `table` and returns its root bits (`root` or fewer), or -1 for a set zlib
+ * refuses: over-subscribed, or incomplete unless it is a lone one-bit code (literal/length and
+ * distance codes only, `entries` other than `CODE_ENTRY`).
+ */
+function buildTable(
+  entries: Int32Array,
+  set: CodeSet,
+  lens: Uint8Array,
+  from: number,
+  table: Int32Array,
+  root: number,
+): number {
+  const { count, syms } = set;
+  let max = 15;
+  while (max >= 1 && count[max] === 0) max--;
+  if (root > max) root = max;
+  if (max === 0) {
+    // no codes at all: every lookup is an invalid code of one bit (a code length 0 in the code length table)
+    table[0] = 1 | (OP_BAD << 8);
+    table[1] = 1 | (OP_BAD << 8);
+    return 1;
+  }
+  let min = 1;
+  while (min < max && count[min] === 0) min++;
+  if (root < min) root = min;
   let left = 1;
   for (let len = 1; len <= 15; len++) {
     left <<= 1;
     left -= count[len] as number;
-    if (left < 0) return false; // over-subscribed
+    if (left < 0) return -1; // over-subscribed
   }
-  if (left > 0) {
-    if (!single || max !== 1) return false; // incomplete
-    fast.fill(0, 0, size); // entries no code reaches stay invalid
-  }
+  if (left > 0 && (entries === CODE_ENTRY || max !== 1)) return -1; // incomplete
+  // the symbols by code length, then symbol order: the order of their canonical codes
   offs[1] = 0;
   for (let len = 1; len < 15; len++) offs[len + 1] = (offs[len] as number) + (count[len] as number);
-  // canonical codes: by length, then symbol order
-  let code = 0;
-  for (let len = 1; len <= 15; len++) {
-    nextCode[len] = code;
-    code = (code + (count[len] as number)) << 1;
+  for (let i = 0; i < set.n; i++) {
+    const s = syms[i] as number;
+    work[offs[lens[from + s] as number]++ as number] = s;
   }
-  for (let s = 0; s < n; s++) {
-    const len = lens[from + s] as number;
-    if (len === 0) continue;
-    symbol[offs[len]++ as number] = s;
-    const c = nextCode[len]++ as number;
-    if (len <= bits) {
-      // deflate sends codes most significant bit first: the table is indexed by reversed codes
-      const r = (REV9[c] as number) >> (FAST_BITS - len);
-      const entry = (s << 4) | len;
-      for (let i = r; i < size; i += 1 << len) fast[i] = entry;
-    } else {
-      // the prefix of a longer code: decoded bit by bit (a complete code reaches every entry,
-      // so the table needs no clearing)
-      fast[(REV9[c >> (len - bits)] as number) >> (FAST_BITS - bits)] = 0;
+  let huff = 0; // the current code, bit-reversed
+  let sym = 0;
+  let len = min;
+  let next = 0; // the table being filled, as an offset in `table`
+  let curr = root; // its index bits
+  let drop = 0; // the bits dropped before indexing it
+  let low = -1; // the root entry its codes share
+  let used = 1 << root;
+  const mask = used - 1;
+  const enough = entries === LIT_ENTRY ? ENOUGH_LENS : ENOUGH_DISTS;
+  for (;;) {
+    const here = (entries[work[sym] as number] as number) | (len - drop);
+    // every entry whose low bits are the code, in a table of `curr` bits
+    const incr = 1 << (len - drop);
+    let fill = 1 << curr;
+    const size = fill;
+    const at = next + (huff >>> drop);
+    do {
+      fill -= incr;
+      table[at + fill] = here;
+    } while (fill !== 0);
+    // the next code, bit-reversed: clear the ones above the highest zero below `len`, set it
+    const zeros = ~huff & ((1 << len) - 1);
+    if (zeros === 0) huff = 0;
+    else {
+      const inc = 1 << (31 - Math.clz32(zeros));
+      huff = (huff & (inc - 1)) | inc;
+    }
+    sym++;
+    if (--count[len] === 0) {
+      if (len === max) break;
+      do len++;
+      while (count[len] === 0);
+    }
+    // a code longer than the root, not under the current root entry: a new sub-table
+    if (len > root && (huff & mask) !== low) {
+      if (drop === 0) drop = root;
+      next += size;
+      curr = len - drop;
+      left = 1 << curr;
+      while (curr + drop < max) {
+        left -= count[curr + drop] as number;
+        if (left <= 0) break;
+        curr++;
+        left <<= 1;
+      }
+      used += 1 << curr;
+      if (used > enough) return -1; // cannot happen for a set that passed the checks above
+      low = huff & mask;
+      table[low] = root | (curr << 8) | (next << 16);
     }
   }
-  return true;
+  // an incomplete set (a lone one-bit code): the one entry no code reaches is invalid
+  if (huff !== 0) table[next + huff] = (len - drop) | (OP_BAD << 8);
+  return root;
 }
 
-const fixedLit = newHuffman(288);
-const fixedDist = newHuffman(32);
+const fixedLit = new Int32Array(512);
+const fixedDist = new Int32Array(32);
 {
   const l = new Uint8Array(288);
   l.fill(8, 0, 144);
   l.fill(9, 144, 256);
   l.fill(7, 256, 280);
   l.fill(8, 280, 288);
-  build(fixedLit, l, 0, 288, true);
+  buildTable(LIT_ENTRY, countLengths(newCodeSet(288), l, 0, 288), l, 0, fixedLit, 9);
   // 32 codes of 5 bits, as zlib's table: 30 and 31 decode, and are refused as distances
-  build(fixedDist, new Uint8Array(32).fill(5), 0, 32, true);
+  const d = new Uint8Array(32).fill(5);
+  buildTable(DIST_ENTRY, countLengths(newCodeSet(32), d, 0, 32), d, 0, fixedDist, 5);
 }
-const dynLit = newHuffman(288);
-const dynDist = newHuffman(30);
-const clCode = newHuffman(19);
+const dynLit = new Int32Array(ENOUGH_LENS);
+const dynDist = new Int32Array(ENOUGH_DISTS);
+const clTable = new Int32Array(128);
 const lengths = new Uint8Array(286 + 30);
 const clLens = new Uint8Array(19);
+const clSet = newCodeSet(19);
+const litSet = newCodeSet(286);
+const distSet = newCodeSet(30);
 
-/** Adler-32 of `b[from, to)`. */
+/** Whether a `Uint32Array` reads bytes little-endian (the word-wise Adler-32 assumes it). */
+const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+
+/** Words summed before the 16-bit lanes of `adler32`'s sums could overflow: 255 * 22 * 23 / 2 < 2^16. */
+const ADLER_WORDS = 22;
+
+/**
+ * Adler-32 of `b[from, to)`. Long runs are summed four bytes at a time: a word's even and odd
+ * bytes in two 16-bit lanes each, with running sums of those sums for the weighted half.
+ */
 function adler32(b: Uint8Array, from: number, to: number): number {
   let a = 1;
   let s = 0;
-  for (let i = from; i < to; ) {
-    // at most 5552 bytes before the sums are reduced (zlib's NMAX): they stay below 2^32
-    const n = Math.min(to, i + 5552);
-    for (const n8 = n - 8; i <= n8; i += 8) {
+  let i = from;
+  if (to - from >= 256 && LITTLE_ENDIAN) {
+    // bytes up to a 4-byte boundary of the buffer, then words
+    const base = b.byteOffset;
+    for (; ((base + i) & 3) !== 0; i++) {
       a += b[i] as number;
       s += a;
-      a += b[i + 1] as number;
-      s += a;
-      a += b[i + 2] as number;
-      s += a;
-      a += b[i + 3] as number;
-      s += a;
-      a += b[i + 4] as number;
-      s += a;
-      a += b[i + 5] as number;
-      s += a;
-      a += b[i + 6] as number;
-      s += a;
-      a += b[i + 7] as number;
-      s += a;
     }
+    const words = (to - i) >> 2;
+    const w = new Uint32Array(b.buffer, base + i, words);
+    for (let k = 0; k < words; ) {
+      const n = Math.min(words, k + ADLER_WORDS);
+      const bytes = (n - k) << 2;
+      let even = 0; // bytes 0 and 2 of each word, in the low and high lanes
+      let odd = 0; // bytes 1 and 3
+      let even2 = 0; // the sum of `even` after each word
+      let odd2 = 0;
+      for (; k < n; k++) {
+        const x = w[k] as number;
+        even = (even + (x & 0xff00ff)) | 0;
+        odd = (odd + ((x >>> 8) & 0xff00ff)) | 0;
+        even2 = (even2 + even) | 0;
+        odd2 = (odd2 + odd) | 0;
+      }
+      // byte j of the block adds (bytes - j) * b[j] to s: 4 * (words left) per word, less
+      // its place in the word
+      const sum2 = (even2 & 0xffff) + (even2 >>> 16) + (odd2 & 0xffff) + (odd2 >>> 16);
+      const placed = (odd & 0xffff) + 2 * (even >>> 16) + 3 * (odd >>> 16);
+      s = (s + bytes * a + 4 * sum2 - placed) % 65521;
+      a = (a + (even & 0xffff) + (even >>> 16) + (odd & 0xffff) + (odd >>> 16)) % 65521;
+    }
+    i += words << 2;
+  }
+  while (i < to) {
+    // at most 5552 bytes before the sums are reduced (zlib's NMAX): they stay below 2^32
+    const n = Math.min(to, i + 5552);
     for (; i < n; i++) {
       a += b[i] as number;
       s += a;
@@ -221,144 +391,144 @@ function adler32(b: Uint8Array, from: number, to: number): number {
 }
 
 /**
- * The bit reader of the rare paths (block headers, codes longer than the lookup table): the
- * hot loop keeps its position in locals and hands it over here and back.
+ * The bit reader's state, handed between `inflateWhole` (which keeps it in locals) and
+ * `readDynamicTables`. `hold` keeps up to 30 bits, the next one lowest.
  */
-const rd: { input: Uint8Array; pos: number; end: number; bb: number; bc: number } = {
-  input: new Uint8Array(0),
-  pos: 0,
-  end: 0,
-  bb: 0,
-  bc: 0,
-};
+const rd = { pos: 0, hold: 0, bits: 0, litBits: 0, distBits: 0 };
 
-function rdBits(n: number): number {
-  if (rd.bc < n) {
-    while (rd.bc <= 24 && rd.pos < rd.end) {
-      rd.bb |= (rd.input[rd.pos++] as number) << rd.bc;
-      rd.bc += 8;
-    }
-    if (rd.bc < n) throw new TruncatedStreamError();
+/**
+ * Reads a dynamic block's header from `input` at `rd` and builds `dynLit` and `dynDist`
+ * (root bits in `rd.litBits`, `rd.distBits`), as zlib's TABLE, LENLENS and CODELENS states.
+ */
+function readDynamicTables(input: Uint8Array, end: number): void {
+  let pos = rd.pos;
+  let hold = rd.hold;
+  let bits = rd.bits;
+  while (bits < 14) {
+    if (pos >= end) throw new TruncatedStreamError();
+    hold |= (input[pos++] as number) << bits;
+    bits += 8;
   }
-  const v = rd.bb & ((1 << n) - 1);
-  rd.bb >>>= n;
-  rd.bc -= n;
-  return v;
-}
-
-/** The next symbol of `h`, or -1 for an invalid code. */
-function rdDecode(h: Huffman): number {
-  if (rd.bc < 15) {
-    while (rd.bc <= 24 && rd.pos < rd.end) {
-      rd.bb |= (rd.input[rd.pos++] as number) << rd.bc;
-      rd.bc += 8;
-    }
-  }
-  const entry = h.fast[rd.bb & h.mask] as number;
-  if (entry !== 0 && (entry & 15) <= rd.bc) {
-    rd.bb >>>= entry & 15;
-    rd.bc -= entry & 15;
-    return entry >> 4;
-  }
-  // a code longer than the table, or none: the canonical code, bit by bit (puff.c)
-  let code = 0;
-  let first = 0;
-  let index = 0;
-  for (let len = 1; len <= 15; len++) {
-    code |= rdBits(1);
-    const count = h.count[len] as number;
-    if (code - count < first) return h.symbol[index + (code - first)] as number;
-    index += count;
-    first += count;
-    first <<= 1;
-    code <<= 1;
-  }
-  return -1;
-}
-
-/** Reads a dynamic block's code lengths and builds `dynLit` and `dynDist` from them. */
-function readDynamicTables(): void {
-  const nlen = rdBits(5) + 257;
-  const ndist = rdBits(5) + 1;
-  const ncode = rdBits(4) + 4;
+  const nlen = (hold & 31) + 257;
+  const ndist = ((hold >> 5) & 31) + 1;
+  const ncode = ((hold >> 10) & 15) + 4;
+  hold >>= 14;
+  bits -= 14;
   if (nlen > 286 || ndist > 30)
     throw new InflateError("inflate failed: too many length or distance symbols");
   clLens.fill(0);
-  for (let k = 0; k < ncode; k++) clLens[CLORDER[k] as number] = rdBits(3);
-  if (!build(clCode, clLens, 0, 19, false))
-    throw new InflateError("inflate failed: invalid code lengths set");
+  for (let k = 0; k < ncode; k++) {
+    if (bits < 3) {
+      if (pos >= end) throw new TruncatedStreamError();
+      hold |= (input[pos++] as number) << bits;
+      bits += 8;
+    }
+    clLens[CLORDER[k] as number] = hold & 7;
+    hold >>= 3;
+    bits -= 3;
+  }
+  const clBits = buildTable(CODE_ENTRY, countLengths(clSet, clLens, 0, 19), clLens, 0, clTable, 7);
+  if (clBits < 0) throw new InflateError("inflate failed: invalid code lengths set");
+  const clMask = (1 << clBits) - 1;
   const total = nlen + ndist;
-  // the code length symbols, with the reader in locals (handed to `rdDecode` for long codes)
-  const input = rd.input;
-  const end = rd.end;
-  const clFast = clCode.fast;
-  const clMask = clCode.mask;
-  let pos = rd.pos;
-  let bb = rd.bb;
-  let bc = rd.bc;
+  // the lengths, and the code sets they make (counts, and the symbols with a code)
+  const litCount = litSet.count;
+  const litSyms = litSet.syms;
+  const distCount = distSet.count;
+  const distSyms = distSet.syms;
+  litCount.fill(0);
+  distCount.fill(0);
+  let nl = 0;
+  let nd = 0;
+  // Only lengths other than 0 are written to `lengths` (the builder reads no other); `prev`
+  // is the last length, for a repeat of it.
+  let prev = 0;
   for (let k = 0; k < total; ) {
-    if (bc < 14) {
-      while (bc <= 24 && pos < end) {
-        bb |= (input[pos++] as number) << bc;
-        bc += 8;
-      }
+    // a code and its extra bits take at most 14 bits: refilled at once while 2 bytes are left,
+    // else byte by byte as zlib pulls them
+    if (bits < 14 && pos + 2 <= end) {
+      hold |= ((input[pos] as number) << bits) | ((input[pos + 1] as number) << (bits + 8));
+      pos += 2;
+      bits += 16;
     }
-    let sym: number;
-    const entry = clFast[bb & clMask] as number;
-    if (entry !== 0 && (entry & 15) <= bc) {
-      bb >>>= entry & 15;
-      bc -= entry & 15;
-      sym = entry >> 4;
-    } else {
-      rd.pos = pos;
-      rd.bb = bb;
-      rd.bc = bc;
-      sym = rdDecode(clCode);
-      pos = rd.pos;
-      bb = rd.bb;
-      bc = rd.bc;
+    let here = clTable[hold & clMask] as number;
+    while ((here & 255) > bits) {
+      if (pos >= end) throw new TruncatedStreamError();
+      hold |= (input[pos++] as number) << bits;
+      bits += 8;
+      here = clTable[hold & clMask] as number;
     }
+    const cb = here & 255;
+    const sym = here >> 16;
     if (sym < 16) {
-      if (sym < 0) throw new InflateError("inflate failed: invalid code lengths set");
-      lengths[k++] = sym;
+      hold >>= cb;
+      bits -= cb;
+      prev = sym;
+      if (sym !== 0) {
+        lengths[k] = sym;
+        if (k < nlen) {
+          litCount[sym]++;
+          litSyms[nl++] = k;
+        } else {
+          distCount[sym]++;
+          distSyms[nd++] = k - nlen;
+        }
+      }
+      k++;
       continue;
     }
-    // a repeat: 2, 3 or 7 more bits (refilled above to 14 bits or the input's end)
+    // a repeat: the code and 2, 3 or 7 more bits
     const extra = sym === 16 ? 2 : sym === 17 ? 3 : 7;
-    if (bc < extra) {
-      while (bc <= 24 && pos < end) {
-        bb |= (input[pos++] as number) << bc;
-        bc += 8;
-      }
-      if (bc < extra) throw new TruncatedStreamError();
+    while (bits < cb + extra) {
+      if (pos >= end) throw new TruncatedStreamError();
+      hold |= (input[pos++] as number) << bits;
+      bits += 8;
     }
-    const n = bb & ((1 << extra) - 1);
-    bb >>>= extra;
-    bc -= extra;
-    let value = 0;
-    let repeat: number;
+    hold >>= cb;
+    bits -= cb;
+    let repeat = hold & ((1 << extra) - 1);
+    hold >>= extra;
+    bits -= extra;
     if (sym === 16) {
       if (k === 0) throw new InflateError("inflate failed: invalid bit length repeat");
-      value = lengths[k - 1] as number;
-      repeat = 3 + n;
-    } else if (sym === 17) {
-      repeat = 3 + n;
+      repeat += 3;
     } else {
-      repeat = 11 + n;
+      prev = 0;
+      repeat += sym === 17 ? 3 : 11;
     }
     if (k + repeat > total) throw new InflateError("inflate failed: invalid bit length repeat");
-    lengths.fill(value, k, k + repeat);
-    k += repeat;
+    if (prev !== 0) {
+      for (const to = k + repeat; k < to; k++) {
+        lengths[k] = prev;
+        if (k < nlen) {
+          litCount[prev]++;
+          litSyms[nl++] = k;
+        } else {
+          distCount[prev]++;
+          distSyms[nd++] = k - nlen;
+        }
+      }
+    } else k += repeat;
   }
+  litSet.n = nl;
+  distSet.n = nd;
   rd.pos = pos;
-  rd.bb = bb;
-  rd.bc = bc;
-  if (lengths[256] === 0)
-    throw new InflateError("inflate failed: invalid code -- missing end-of-block");
-  if (!build(dynLit, lengths, 0, nlen, true))
-    throw new InflateError("inflate failed: invalid literal/lengths set");
-  if (!build(dynDist, lengths, nlen, ndist, true))
-    throw new InflateError("inflate failed: invalid distances set");
+  rd.hold = hold;
+  rd.bits = bits;
+  // the end-of-block code has a length: symbol 256 is listed (in order, after any lower one)
+  let eob = false;
+  for (let i = nl - 1; i >= 0; i--) {
+    const sym = litSyms[i] as number;
+    if (sym <= 256) {
+      eob = sym === 256;
+      break;
+    }
+  }
+  if (!eob) throw new InflateError("inflate failed: invalid code -- missing end-of-block");
+  rd.litBits = buildTable(LIT_ENTRY, litSet, lengths, 0, dynLit, 9);
+  if (rd.litBits < 0) throw new InflateError("inflate failed: invalid literal/lengths set");
+  rd.distBits = buildTable(DIST_ENTRY, distSet, lengths, nlen, dynDist, 6);
+  if (rd.distBits < 0) throw new InflateError("inflate failed: invalid distances set");
 }
 
 /**
@@ -370,6 +540,22 @@ function grow(out: Uint8Array, op: number, n: number, limit: number, partial: bo
   const next = new Uint8Array(Math.min(limit, Math.max(op + n, out.length * 2)));
   next.set(out.subarray(0, op));
   return next;
+}
+
+/** Copies the `len` bytes `dist` back to `op` (the regions may overlap). */
+function copyMatch(out: Uint8Array, op: number, dist: number, len: number): void {
+  let from = op - dist;
+  if (dist >= len) {
+    if (len > 12) {
+      out.copyWithin(op, from, from + len);
+      return;
+    }
+  } else if (dist === 1) {
+    out.fill(out[from] as number, op, op + len);
+    return;
+  }
+  const to = op + len;
+  while (op < to) out[op++] = out[from++] as number;
 }
 
 /**
@@ -414,241 +600,289 @@ export function inflateWhole(
   if (cmf >> 4 > 7) throw new InflateError("inflate failed: invalid window size");
   if (flg & 0x20) throw new InflateError("inflate failed: the stream needs a preset dictionary");
 
-  rd.input = input;
-  rd.pos = 2;
-  rd.end = end;
-  rd.bb = 0;
-  rd.bc = 0;
+  // the fast loop runs while 8 input bytes are left: a length/distance pair takes at most 48
+  // bits, and the loop's refills read no further than that
+  const fastEnd = end - 8;
+  let pos = 2;
+  let hold = 0;
+  let bits = 0;
   try {
     for (let last = 0; !last; ) {
-      last = rdBits(1);
-      const type = rdBits(2);
+      while (bits < 3) {
+        if (pos >= end) throw new TruncatedStreamError();
+        hold |= (input[pos++] as number) << bits;
+        bits += 8;
+      }
+      last = hold & 1;
+      const type = (hold >> 1) & 3;
+      hold >>= 3;
+      bits -= 3;
       if (type === 0) {
         // stored: from the next byte boundary, LEN and its complement, then LEN bytes
-        rd.bb >>>= rd.bc & 7;
-        rd.bc -= rd.bc & 7;
-        const len = rdBits(16);
-        const nlen = rdBits(16);
-        if (len !== (~nlen & 0xffff))
+        hold >>= bits & 7;
+        bits -= bits & 7;
+        while (bits < 32) {
+          if (pos >= end) throw new TruncatedStreamError();
+          hold |= (input[pos++] as number) << bits;
+          bits += 8;
+        }
+        // the 32 bits are whole bytes read for them alone: the buffer is empty after them
+        const len = hold & 0xffff;
+        if (len !== ((~hold >>> 16) & 0xffff))
           throw new InflateError("inflate failed: invalid stored block lengths");
+        hold = 0;
+        bits = 0;
         if (op + len > cap) {
           out = grow(out, op, len, growable ? limit : cap, partial);
           cap = out.length;
         }
-        // bytes still in the bit buffer go first (whole bytes: it is byte aligned)
-        let k = 0;
-        for (; k < len && rd.bc >= 8; k++) {
-          out[op++] = rd.bb & 255;
-          rd.bb >>>= 8;
-          rd.bc -= 8;
-        }
-        const rest = len - k;
-        if (rd.pos + rest > end) throw new TruncatedStreamError();
-        out.set(input.subarray(rd.pos, rd.pos + rest), op);
-        op += rest;
-        rd.pos += rest;
+        if (pos + len > end) throw new TruncatedStreamError();
+        out.set(input.subarray(pos, pos + len), op);
+        op += len;
+        pos += len;
         continue;
       }
-      let lit: Huffman;
-      let dist: Huffman;
+      let lcode: Int32Array;
+      let dcode: Int32Array;
+      let lmask: number;
+      let dmask: number;
       if (type === 1) {
-        lit = fixedLit;
-        dist = fixedDist;
+        lcode = fixedLit;
+        dcode = fixedDist;
+        lmask = 511;
+        dmask = 31;
       } else if (type === 2) {
-        readDynamicTables();
-        lit = dynLit;
-        dist = dynDist;
+        rd.pos = pos;
+        rd.hold = hold;
+        rd.bits = bits;
+        readDynamicTables(input, end);
+        pos = rd.pos;
+        hold = rd.hold;
+        bits = rd.bits;
+        lcode = dynLit;
+        dcode = dynDist;
+        lmask = (1 << rd.litBits) - 1;
+        dmask = (1 << rd.distBits) - 1;
       } else {
         throw new InflateError("inflate failed: invalid block type");
       }
-      // the hot loop: the reader's state in locals
-      const litFast = lit.fast;
-      const litMask = lit.mask;
-      const distFast = dist.fast;
-      const distMask = dist.mask;
-      let pos = rd.pos;
-      let bb = rd.bb;
-      let bc = rd.bc;
       block: for (;;) {
-        // The fast region (inflate_fast's): with 16 input bytes and 258 bytes of output room
-        // left, no symbol can run out of either, so they are not checked per byte.
-        while (pos + 16 <= end && op + 258 <= cap) {
-          if (bc < 16) {
-            bb |= ((input[pos] as number) << bc) | ((input[pos + 1] as number) << (bc + 8));
+        // zlib's inflate_fast, while enough input is left that no refill can run out of it
+        // and the output has room for a literal (a match's room is checked by its length)
+        while (pos < fastEnd && op < cap) {
+          if (bits < 15) {
+            hold |= ((input[pos] as number) << bits) | ((input[pos + 1] as number) << (bits + 8));
             pos += 2;
-            bc += 16;
+            bits += 16;
           }
-          let entry = litFast[bb & litMask] as number;
-          if (entry === 0) break; // a long code: the checked loop below
-          bb >>>= entry & 15;
-          bc -= entry & 15;
-          const sym = entry >> 4;
-          if (sym < 256) {
-            out[op++] = sym;
-            continue;
+          let here = lcode[hold & lmask] as number;
+          let n = here & 255;
+          hold >>= n;
+          bits -= n;
+          let o = (here >> 8) & 255;
+          if (o !== 0) {
+            if (o < OP_BASE) {
+              // a code longer than the root: its sub-table
+              here = lcode[(here >> 16) + (hold & ((1 << o) - 1))] as number;
+              n = here & 255;
+              hold >>= n;
+              bits -= n;
+              o = (here >> 8) & 255;
+            }
+            if (o !== 0) {
+              if ((o & OP_BASE) === 0) {
+                if (o & 32) break block; // end of block
+                throw new InflateError("inflate failed: invalid literal/length code");
+              }
+              let len = here >> 16;
+              o &= 15;
+              if (o !== 0) {
+                if (bits < o) {
+                  hold |= (input[pos++] as number) << bits;
+                  bits += 8;
+                }
+                len += hold & ((1 << o) - 1);
+                hold >>= o;
+                bits -= o;
+              }
+              if (bits < 15) {
+                hold |=
+                  ((input[pos] as number) << bits) | ((input[pos + 1] as number) << (bits + 8));
+                pos += 2;
+                bits += 16;
+              }
+              here = dcode[hold & dmask] as number;
+              n = here & 255;
+              hold >>= n;
+              bits -= n;
+              o = (here >> 8) & 255;
+              if ((o & OP_BASE) === 0) {
+                if (o & OP_BAD) throw new InflateError("inflate failed: invalid distance code");
+                here = dcode[(here >> 16) + (hold & ((1 << o) - 1))] as number;
+                n = here & 255;
+                hold >>= n;
+                bits -= n;
+                o = (here >> 8) & 255;
+                if ((o & OP_BASE) === 0)
+                  throw new InflateError("inflate failed: invalid distance code");
+              }
+              let dist = here >> 16;
+              o &= 15;
+              if (o !== 0) {
+                if (bits < o) {
+                  hold |= (input[pos++] as number) << bits;
+                  bits += 8;
+                  if (bits < o) {
+                    hold |= (input[pos++] as number) << bits;
+                    bits += 8;
+                  }
+                }
+                dist += hold & ((1 << o) - 1);
+                hold >>= o;
+                bits -= o;
+              }
+              if (dist > op)
+                throw new InflateError("inflate failed: invalid distance too far back");
+              if (op + len > cap) {
+                out = grow(out, op, len, growable ? limit : cap, partial);
+                cap = out.length;
+              }
+              copyMatch(out, op, dist, len);
+              op += len;
+              continue;
+            }
           }
-          if (sym === 256) break block;
-          const li = sym - 257;
-          if (li >= 29) throw new InflateError("inflate failed: invalid literal/length code");
-          if (bc < 16) {
-            bb |= ((input[pos] as number) << bc) | ((input[pos + 1] as number) << (bc + 8));
-            pos += 2;
-            bc += 16;
-          }
-          let len = LBASE[li] as number;
-          const lx = LEXT[li] as number;
-          len += bb & ((1 << lx) - 1);
-          bb >>>= lx;
-          bc -= lx;
-          if (bc < 16) {
-            bb |= ((input[pos] as number) << bc) | ((input[pos + 1] as number) << (bc + 8));
-            pos += 2;
-            bc += 16;
-          }
-          entry = distFast[bb & distMask] as number;
-          let ds: number;
-          if (entry !== 0) {
-            bb >>>= entry & 15;
-            bc -= entry & 15;
-            ds = entry >> 4;
-          } else {
-            rd.pos = pos;
-            rd.bb = bb;
-            rd.bc = bc;
-            ds = rdDecode(dist);
-            pos = rd.pos;
-            bb = rd.bb;
-            bc = rd.bc;
-          }
-          if (ds < 0 || ds >= 30) throw new InflateError("inflate failed: invalid distance code");
-          if (bc < 16) {
-            bb |= ((input[pos] as number) << bc) | ((input[pos + 1] as number) << (bc + 8));
-            pos += 2;
-            bc += 16;
-          }
-          const dx = DEXT[ds] as number;
-          const d = (DBASE[ds] as number) + (bb & ((1 << dx) - 1));
-          bb >>>= dx;
-          bc -= dx;
-          if (d > op) throw new InflateError("inflate failed: invalid distance too far back");
-          let from = op - d;
-          if (d >= len && len > 12) {
-            out.copyWithin(op, from, from + len);
-            op += len;
-          } else {
-            while (len-- > 0) out[op++] = out[from++] as number;
-          }
+          out[op++] = here >> 16;
         }
-        // one symbol, every bound checked
-        if (bc < 15) {
-          while (bc <= 24 && pos < end) {
-            bb |= (input[pos++] as number) << bc;
-            bc += 8;
-          }
+        // one symbol as zlib's inflate takes it: bytes pulled only as the code needs them
+        let here = lcode[hold & lmask] as number;
+        while ((here & 255) > bits) {
+          if (pos >= end) throw new TruncatedStreamError();
+          hold |= (input[pos++] as number) << bits;
+          bits += 8;
+          here = lcode[hold & lmask] as number;
         }
-        let sym: number;
-        let entry = litFast[bb & litMask] as number;
-        if (entry !== 0 && (entry & 15) <= bc) {
-          bb >>>= entry & 15;
-          bc -= entry & 15;
-          sym = entry >> 4;
-        } else {
-          rd.pos = pos;
-          rd.bb = bb;
-          rd.bc = bc;
-          sym = rdDecode(lit);
+        let o = (here >> 8) & 255;
+        if (o !== 0 && o < OP_BASE) {
+          here = subEntry(lcode, here, input, end, pos, hold, bits);
           pos = rd.pos;
-          bb = rd.bb;
-          bc = rd.bc;
+          hold = rd.hold;
+          bits = rd.bits;
+          o = (here >> 8) & 255;
         }
-        if (sym < 256) {
-          if (sym < 0) throw new InflateError("inflate failed: invalid literal/length code");
+        hold >>= here & 255;
+        bits -= here & 255;
+        if (o === 0) {
           if (op >= cap) {
             out = grow(out, op, 1, growable ? limit : cap, partial);
             cap = out.length;
           }
-          out[op++] = sym;
+          out[op++] = here >> 16;
           continue;
         }
-        if (sym === 256) break;
-        const li = sym - 257;
-        if (li >= 29) throw new InflateError("inflate failed: invalid literal/length code");
-        // length extra bits (at most 5), then the distance code (at most 15 bits)
-        let len = LBASE[li] as number;
-        const lx = LEXT[li] as number;
-        if (bc < 20) {
-          while (bc <= 24 && pos < end) {
-            bb |= (input[pos++] as number) << bc;
-            bc += 8;
+        if ((o & OP_BASE) === 0) {
+          if (o & 32) break; // end of block
+          throw new InflateError("inflate failed: invalid literal/length code");
+        }
+        let len = here >> 16;
+        o &= 15;
+        if (o !== 0) {
+          while (bits < o) {
+            if (pos >= end) throw new TruncatedStreamError();
+            hold |= (input[pos++] as number) << bits;
+            bits += 8;
           }
+          len += hold & ((1 << o) - 1);
+          hold >>= o;
+          bits -= o;
         }
-        if (lx) {
-          if (bc < lx) throw new TruncatedStreamError();
-          len += bb & ((1 << lx) - 1);
-          bb >>>= lx;
-          bc -= lx;
+        here = dcode[hold & dmask] as number;
+        while ((here & 255) > bits) {
+          if (pos >= end) throw new TruncatedStreamError();
+          hold |= (input[pos++] as number) << bits;
+          bits += 8;
+          here = dcode[hold & dmask] as number;
         }
-        let ds: number;
-        entry = distFast[bb & distMask] as number;
-        if (entry !== 0 && (entry & 15) <= bc) {
-          bb >>>= entry & 15;
-          bc -= entry & 15;
-          ds = entry >> 4;
-        } else {
-          rd.pos = pos;
-          rd.bb = bb;
-          rd.bc = bc;
-          ds = rdDecode(dist);
+        o = (here >> 8) & 255;
+        if (o !== 0 && o < OP_BASE) {
+          here = subEntry(dcode, here, input, end, pos, hold, bits);
           pos = rd.pos;
-          bb = rd.bb;
-          bc = rd.bc;
+          hold = rd.hold;
+          bits = rd.bits;
+          o = (here >> 8) & 255;
         }
-        if (ds < 0 || ds >= 30) throw new InflateError("inflate failed: invalid distance code");
-        let d = DBASE[ds] as number;
-        const dx = DEXT[ds] as number;
-        if (dx) {
-          if (bc < dx) {
-            while (bc <= 24 && pos < end) {
-              bb |= (input[pos++] as number) << bc;
-              bc += 8;
-            }
-            if (bc < dx) throw new TruncatedStreamError();
+        hold >>= here & 255;
+        bits -= here & 255;
+        if (o & OP_BAD) throw new InflateError("inflate failed: invalid distance code");
+        let dist = here >> 16;
+        o &= 15;
+        if (o !== 0) {
+          while (bits < o) {
+            if (pos >= end) throw new TruncatedStreamError();
+            hold |= (input[pos++] as number) << bits;
+            bits += 8;
           }
-          d += bb & ((1 << dx) - 1);
-          bb >>>= dx;
-          bc -= dx;
+          dist += hold & ((1 << o) - 1);
+          hold >>= o;
+          bits -= o;
         }
-        if (d > op) throw new InflateError("inflate failed: invalid distance too far back");
+        if (dist > op) throw new InflateError("inflate failed: invalid distance too far back");
         if (op + len > cap) {
           out = grow(out, op, len, growable ? limit : cap, partial);
           cap = out.length;
         }
-        let from = op - d;
-        if (d >= len && len > 12) {
-          out.copyWithin(op, from, from + len);
-          op += len;
-        } else {
-          while (len-- > 0) out[op++] = out[from++] as number;
-        }
+        copyMatch(out, op, dist, len);
+        op += len;
       }
-      rd.pos = pos;
-      rd.bb = bb;
-      rd.bc = bc;
     }
     // the Adler-32 trailer, from the next byte boundary
-    rd.bb >>>= rd.bc & 7;
-    rd.bc -= rd.bc & 7;
-    const check = ((rdBits(8) << 24) | (rdBits(8) << 16) | (rdBits(8) << 8) | rdBits(8)) >>> 0;
+    hold >>= bits & 7;
+    bits -= bits & 7;
+    let check = 0;
+    for (let k = 0; k < 4; k++) {
+      if (bits < 8) {
+        if (pos >= end) throw new TruncatedStreamError();
+        hold |= (input[pos++] as number) << bits;
+        bits += 8;
+      }
+      check = check * 256 + (hold & 255);
+      hold >>= 8;
+      bits -= 8;
+    }
     if (check !== adler32(out, 0, op))
       throw new InflateError("inflate failed: incorrect data check");
-    return { data: out, length: op, consumed: rd.pos - (rd.bc >> 3), ended: true };
+    return { data: out, length: op, consumed: pos - (bits >> 3), ended: true };
   } catch (e) {
     if (e === STOP) return { data: out, length: op, consumed: -1, ended: false };
     throw e;
-  } finally {
-    // the reader keeps no reference to the caller's input
-    rd.input = EMPTY;
   }
 }
 
-const EMPTY = new Uint8Array(0);
+/**
+ * The sub-table entry under the root entry `link`, pulling input bytes until the whole code
+ * is in the buffer; leaves the reader in `rd` with the root bits dropped.
+ */
+function subEntry(
+  table: Int32Array,
+  link: number,
+  input: Uint8Array,
+  end: number,
+  pos: number,
+  hold: number,
+  bits: number,
+): number {
+  const rootBits = link & 255;
+  const o = (link >> 8) & 255;
+  const at = link >> 16;
+  let here = table[at + ((hold & ((1 << (rootBits + o)) - 1)) >> rootBits)] as number;
+  while (rootBits + (here & 255) > bits) {
+    if (pos >= end) throw new TruncatedStreamError();
+    hold |= (input[pos++] as number) << bits;
+    bits += 8;
+    here = table[at + ((hold & ((1 << (rootBits + o)) - 1)) >> rootBits)] as number;
+  }
+  rd.pos = pos;
+  rd.hold = hold >> rootBits;
+  rd.bits = bits - rootBits;
+  return here;
+}
