@@ -1,0 +1,14 @@
+---
+"@statewalker/vcs-utils": minor
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-store-files": patch
+"@statewalker/vcs-working-tree": patch
+"@statewalker/vcs-commands": minor
+---
+
+**Faster object reads and `log`; `log` walks as git's revision.c also without paths.**
+
+- **vcs-core:** the pack read path does less per object: `PackFile.getNow`/`get` are plain functions (no generator per read; a delta resolution is a small state machine that runs synchronously while its entries are in loaded windows and finishes through I/O otherwise), the entry header is parsed without a closure, whole objects hand out a one-chunk content object instead of an async generator, a delta's cycle set and `visiting` set are built only when a REF_DELTA needs them, and the scratch buffers of a chain are the pack's (copied out when a resolution waits). Idx lookups use a second fan-out level by the ids' second byte, built as each bucket is checked (idx files of 4096 objects or more), and a pair table to parse hex ids; `PackStats.idCompares` counts the ids compared. The pack set and `withPacks` return an in-memory object without a generator. The tree, commit and commit-graph-writer caches evict through `OrderedMap` (a `Map`'s `keys().next()` walks every deleted slot: microseconds per eviction).
+- **vcs-utils:** `OrderedMap` (insertion-ordered map with a constant-time oldest entry, for FIFO/LRU caches); `bytesToHex` builds an object id as one flat string.
+- **vcs-commands:** `LogCommand` routes every log, with or without paths, through one port of git's walk (get_revision_1 streaming, limit_list with excluded commits), so `log ^X`, ranges, `--since`/`--until`, `-n`, `--skip`, `--first-parent`, `--author`, `--merges`/`--no-merges` list git's commits in git's order (date order, clock skew included; shallow commits have no parents). The walk keeps commits in typed arrays (`RevTable`, a few dozen bytes each) and reaches commit-graph commits by position; commits outside the graph are read once (`parseGraphCommit`, then decoded whole only if shown). `LogPathStatistics.commitsWalked`/`walkTableBytes`. Pathspecs match raw tree entries as bytes (`treeEntryInteresting(ps, tree, start, end, mode, base)`), with each element's pattern bytes prepared once. `:(attr:...)` pathspec magic in `log` (git's match_pathspec_attrs, worktree then index attributes) and `:(prefix:N)` for every pathspec; other commands still refuse `attr`.
+- **vcs-store-files**, **vcs-working-tree:** read through the faster paths (`withPacks.getNow`, the attributes parse cache on `OrderedMap`).

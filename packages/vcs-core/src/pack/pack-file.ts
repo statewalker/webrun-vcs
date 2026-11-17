@@ -53,7 +53,6 @@ import type { ObjectId } from "../common/id/index.js";
 import { type GitObject, ObjectIdMismatchError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { PackError } from "./index-pack.js";
-import { runSteps, runStepsAsync, type Steps } from "./run-steps.js";
 
 /** Pack entry kinds: 1–4 whole objects (commit, tree, blob, tag), 6 OFS_DELTA, 7 REF_DELTA. */
 export type PackedEntryKind = 1 | 2 | 3 | 4 | 6 | 7;
@@ -156,6 +155,8 @@ export interface PackStats {
   readonly idxBucketsChecked: number;
   /** whether the whole idx was checked, its SHA-1 included */
   readonly idxVerified: boolean;
+  /** ids compared by lookups (a second fan-out level keeps it to a few per lookup) */
+  readonly idCompares: number;
 }
 
 /** A pack opened by `openPack`: `Pack`, plus its paths and counters. */
@@ -286,6 +287,30 @@ const windows = new PackWindowCache(32 * 2 ** 20);
 
 async function* once(b: Uint8Array): AsyncGenerator<Uint8Array> {
   yield b;
+}
+
+/**
+ * The content of an object held whole: its one chunk, once (as `once`, without an async
+ * generator per object read).
+ */
+class OnceContent implements AsyncIterableIterator<Uint8Array> {
+  private data: Uint8Array | undefined;
+  constructor(data: Uint8Array) {
+    this.data = data;
+  }
+  [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array> {
+    return this;
+  }
+  next(): Promise<IteratorResult<Uint8Array>> {
+    const data = this.data;
+    if (data === undefined) return Promise.resolve({ done: true, value: undefined });
+    this.data = undefined;
+    return Promise.resolve({ done: false, value: data });
+  }
+  return(): Promise<IteratorResult<Uint8Array>> {
+    this.data = undefined;
+    return Promise.resolve({ done: true, value: undefined });
+  }
 }
 
 /** Content whose read fails with `err` (a whole object whose stream is broken). */
@@ -551,8 +576,51 @@ interface EntryHead {
   size: number;
   dataStart: number;
   end: number;
-  baseOffset?: number;
-  baseId?: ObjectId;
+  baseOffset: number | undefined;
+  baseId: ObjectId | undefined;
+}
+
+/** What a delta resolution waits for (`Resolution.wait`). */
+const WAIT_NONE = 0;
+/** the entry at `cur` (read from the pack) */
+const WAIT_ENTRY = 1;
+/** the data of the whole object at `cur` (`loaded`), the base of the chain */
+const WAIT_BASE = 2;
+/** a REF_DELTA base outside the pack */
+const WAIT_EXTERNAL = 3;
+/** the instructions of the delta at step `k` of the walk up */
+const WAIT_DELTA = 4;
+
+/** Scratch buffers of a pack up to this size are kept between reads. */
+const SCRATCH_KEEP = 1024 * 1024;
+
+/** The state of one delta resolution, advanced by `advance` (synchronously while it can). */
+interface Resolution {
+  /** the delta asked for */
+  readonly offset: number;
+  readonly id: ObjectId;
+  /** the ids the caller is resolving (cycle detection across packs), `id` excluded */
+  readonly visiting: ReadonlySet<ObjectId> | undefined;
+  /** the entry at `offset`, loaded by the caller (used once) */
+  first: LoadedEntry | undefined;
+  /** the deltas walked down, the one asked for first */
+  chain: LoadedEntry[];
+  /** offsets visited, from the first REF_DELTA step on */
+  seen: Set<number> | undefined;
+  /** the entry the walk down is at */
+  cur: number;
+  wait: number;
+  /** the entry at `cur`, when loaded */
+  loaded: LoadedEntry | undefined;
+  base: ResolvedObject | undefined;
+  /** the step of the walk up (-2 before it starts) */
+  k: number;
+  /** the result so far on the way up */
+  data: Uint8Array;
+  /** every `stride`-th step is cached */
+  stride: number;
+  /** the inflated instructions of step `k`, when awaited */
+  delta: Uint8Array | undefined;
 }
 
 /** The validated `.idx`: accessors over its bytes. */
@@ -570,29 +638,42 @@ interface IdxTable {
   withPrefix(prefix: string): number[];
   /** Checks the whole idx (git's verify_pack_index); `PackError` if it is corrupt. */
   verify(): Promise<void>;
-  /** The checks run so far. */
-  checks(): { bucketsChecked: number; verified: boolean };
+  /** The checks run so far, and the ids lookups compared. */
+  checks(): { bucketsChecked: number; verified: boolean; compares: number };
 }
 
-/** The value of each hex digit (lowercase only, as object ids), -1 for any other code. */
-const HEX_VALUE = new Int8Array(128).fill(-1);
-for (let c = 0; c < 10; c++) HEX_VALUE[48 + c] = c;
-for (let c = 0; c < 6; c++) HEX_VALUE[97 + c] = 10 + c;
+/** Idx files listing this many objects get a second fan-out level (`parseIdx`). */
+const SUB_FANOUT_FROM = 4096;
+
+/**
+ * The byte each pair of lowercase hex digits stands for, indexed by the two char codes
+ * (`hi << 8 | lo`); -1 for any other pair. One lookup per byte: parsing ids is a large part of a
+ * lookup.
+ */
+const HEX_PAIR: Int16Array = (() => {
+  const table = new Int16Array(65536).fill(-1);
+  const digits = "0123456789abcdef";
+  for (let a = 0; a < 16; a++)
+    for (let b = 0; b < 16; b++)
+      table[(digits.charCodeAt(a) << 8) | digits.charCodeAt(b)] = a * 16 + b;
+  return table;
+})();
 /** The id being looked up, as bytes (lookups are synchronous: one buffer serves all). */
 const idKey = new Uint8Array(20);
 
 /** Writes the 40-digit lowercase hex `id` into `out` as 20 bytes; false if it is not an id. */
 function parseId(id: unknown, out: Uint8Array): boolean {
   if (typeof id !== "string" || id.length !== 40) return false;
+  let bad = 0;
   for (let k = 0; k < 20; k++) {
     const hi = id.charCodeAt(2 * k);
     const lo = id.charCodeAt(2 * k + 1);
-    const h = hi < 128 ? (HEX_VALUE[hi] as number) : -1;
-    const l = lo < 128 ? (HEX_VALUE[lo] as number) : -1;
-    if (h < 0 || l < 0) return false;
-    out[k] = (h << 4) | l;
+    // a code above 255 is no hex digit: it lands on a pair that is not one either
+    const v = (HEX_PAIR[((hi << 8) | lo) & 0xffff] as number) | ((hi | lo) >> 8 ? -1 : 0);
+    bad |= v;
+    out[k] = v;
   }
-  return true;
+  return bad >= 0;
 }
 
 /**
@@ -640,8 +721,20 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
   }
   const packId = hex(idx.subarray(idx.length - 40, idx.length - 20));
 
-  /** Checks the ids of fan-out bucket `b` (positions [from, to)): sorted, each starting with `b`. */
+  /**
+   * A second fan-out level, by the ids' second byte, built for each bucket as it is checked:
+   * `sub[b * 257 + c]` is the first position in bucket `b` whose id's second byte is `c` or
+   * more (`c` = 256: the bucket's end). A lookup then searches a few ids, not the bucket.
+   * Small idx files (whose buckets are a few ids) do without it.
+   */
+  const sub = n >= SUB_FANOUT_FROM ? new Uint32Array(256 * 257) : undefined;
+  /**
+   * Checks the ids of fan-out bucket `b` (positions [from, to)): sorted, each starting with
+   * `b`; and fills its second-level fan-out.
+   */
   const checkBucket = (b: number, from: number, to: number): void => {
+    const row = b * 257;
+    let c2 = 0;
     for (let i = from; i < to; i++) {
       const at = idsAt + i * idStride;
       if (idx[at] !== b) throw new PackError(`${idxPath}: id ${i} is outside its fan-out bucket`);
@@ -651,12 +744,18 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
           c = (idx[at + k] as number) - (idx[at - idStride + k] as number);
         if (c <= 0) throw new PackError(`${idxPath}: ids not strictly sorted at ${i}`);
       }
+      if (sub) {
+        const second = idx[at + 1] as number;
+        while (c2 <= second) sub[row + c2++] = i;
+      }
     }
+    if (sub) while (c2 <= 256) sub[row + c2++] = to;
   };
   /** The buckets a lookup has searched (checked): 1 per bucket. */
   const checked = new Uint8Array(256);
   let bucketsChecked = 0;
   let verified = false;
+  let compares = 0;
   /** The last id `find` looked up, and its position. */
   let lastId: string | undefined;
   let lastFound = -1;
@@ -680,19 +779,32 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
       const key = idKey;
       if (!parseId(id, key)) return -1;
       const b = key[0] as number;
-      let lo = b ? fan(b - 1) : 0;
-      let hi = fan(b);
       if (checked[b] === 0) {
-        checkBucket(b, lo, hi);
+        checkBucket(b, b ? fan(b - 1) : 0, fan(b));
         checked[b] = 1;
         bucketsChecked++;
       }
+      // the bucket's ids are checked: the second fan-out level narrows it to the second byte
+      let lo: number;
+      let hi: number;
+      let from: number;
+      if (sub) {
+        const row = b * 257 + (key[1] as number);
+        lo = sub[row] as number;
+        hi = sub[row + 1] as number;
+        from = 2;
+      } else {
+        lo = b ? fan(b - 1) : 0;
+        hi = fan(b);
+        from = 1;
+      }
       let found = -1;
       while (lo < hi) {
+        compares++;
         const mid = (lo + hi) >>> 1;
         const at = idsAt + mid * idStride;
         let c = 0;
-        for (let k = 0; k < 20 && c === 0; k++) c = (idx[at + k] as number) - (key[k] as number);
+        for (let k = from; k < 20 && c === 0; k++) c = (idx[at + k] as number) - (key[k] as number);
         if (c === 0) {
           found = mid;
           break;
@@ -780,7 +892,7 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
       }
       verified = true;
     },
-    checks: () => ({ bucketsChecked, verified }),
+    checks: () => ({ bucketsChecked, verified, compares }),
   };
 }
 
@@ -970,19 +1082,21 @@ export async function openPack(
     return bytes.subarray(start - from, start + length - from);
   };
 
+  const headTruncated = (offset: number) =>
+    new PackError(`${packPath}: entry header at ${offset} truncated`);
   /** Parses the entry header at `offset` from `h`, the pack's bytes from `offset` on. */
   const parseHead = (offset: number, end: number, h: Uint8Array): EntryHead => {
+    // no closure, no allocation but the result: this runs once per entry read
+    const hl = h.length;
     let p = 0;
-    const byte = () => {
-      if (p >= h.length) throw new PackError(`${packPath}: entry header at ${offset} truncated`);
-      return h[p++] as number;
-    };
-    let b = byte();
+    if (hl === 0) throw headTruncated(offset);
+    let b = h[p++] as number;
     const kind = (b >> 4) & 7;
     let size = b & 0x0f;
     let mul = 16;
     while (b & 0x80) {
-      b = byte();
+      if (p >= hl) throw headTruncated(offset);
+      b = h[p++] as number;
       size += (b & 0x7f) * mul;
       mul *= 128;
       if (mul > 2 ** 53) throw new PackError(`${packPath}: entry size at ${offset} overflows`);
@@ -992,12 +1106,23 @@ export async function openPack(
         `${packPath}: entry at ${offset} declares ${size} bytes, over the limit of ${maxObjectSize}`,
       );
     }
-    const e: EntryHead = { offset, kind, size, dataStart: 0, end };
+    // one shape for every entry (the delta fields are set below when present)
+    const e: EntryHead = {
+      offset,
+      kind,
+      size,
+      dataStart: 0,
+      end,
+      baseOffset: undefined,
+      baseId: undefined,
+    };
     if (kind === OFS_DELTA) {
-      b = byte();
+      if (p >= hl) throw headTruncated(offset);
+      b = h[p++] as number;
       let back = b & 0x7f;
       while (b & 0x80) {
-        b = byte();
+        if (p >= hl) throw headTruncated(offset);
+        b = h[p++] as number;
         back = (back + 1) * 128 + (b & 0x7f);
         if (back > offset) break;
       }
@@ -1232,64 +1357,133 @@ export async function openPack(
   const cacheGet = (offset: number) => cached.get(offset);
   const cachePut = (offset: number, v: ResolvedObject) => cached.put(offset, v);
 
+  // Results of a chain's steps neither cached nor returned are written into two buffers of the
+  // pack, in turn (a result never overwrites its base), instead of a new buffer per step. A
+  // resolution that must wait (I/O) in the middle of its walk up copies its current result out
+  // of them first (`advance`), so another read can use them meanwhile. Buffers above
+  // `SCRATCH_KEEP` are not kept.
+  let scratch0 = EMPTY;
+  let scratch1 = EMPTY;
+  let turn = 0;
+  const intoScratch = (size: number): Uint8Array => {
+    turn ^= 1;
+    let b = turn ? scratch1 : scratch0;
+    if (b.length < size) {
+      b = new Uint8Array(Math.max(size, 1024));
+      if (size > SCRATCH_KEEP) return b;
+      if (turn) scratch1 = b;
+      else scratch0 = b;
+    }
+    return b.subarray(0, size);
+  };
+  const isScratch = (b: Uint8Array) =>
+    (b.buffer === scratch0.buffer && scratch0.length > 0) ||
+    (b.buffer === scratch1.buffer && scratch1.length > 0);
+  const forCache = (size: number) => cache.alloc(size);
+
   /**
-   * Resolves the delta at `offset`: walk down to a base, patch upwards, cache checkpoints.
-   * Iterative, and synchronous wherever the entries are in loaded windows.
+   * Advances the resolution `s` of a delta (walk down to a base, patch upwards, cache
+   * checkpoints) as far as it can without waiting: its result, or a promise to wait for, whose
+   * value is handed to the next call (`v`). Synchronous wherever the entries are in loaded
+   * windows; `finishResolve` drives it through I/O.
    */
-  function* resolve(
-    offset: number,
-    visiting: ReadonlySet<ObjectId>,
-    first?: LoadedEntry,
-  ): Steps<ResolvedObject> {
-    const chain: LoadedEntry[] = [];
-    const seen = new Set<number>();
-    let cur = offset;
-    let base: ResolvedObject | undefined;
-    for (;;) {
-      if (seen.has(cur)) throw new PackError(`${packPath}: delta cycle at ${cur}`);
-      seen.add(cur);
-      if (chain.length > MAX_CHAIN)
-        throw new PackError(`${packPath}: delta chain deeper than ${MAX_CHAIN} at ${offset}`);
-      const hit = cur === offset && first ? undefined : cacheGet(cur);
-      if (hit) {
-        base = hit;
+  const advance = (s: Resolution, v?: unknown): ResolvedObject | Promise<unknown> => {
+    switch (s.wait) {
+      case WAIT_ENTRY:
+        s.loaded = v as LoadedEntry;
+        break;
+      case WAIT_BASE: {
+        const l = s.loaded as LoadedEntry;
+        s.loaded = undefined;
+        s.base = { type: TYPES[l.e.kind] as ObjectTypeString, data: v as Uint8Array };
+        cachePut(s.cur, s.base);
         break;
       }
-      let l = cur === offset && first ? first : loadEntry(cur);
-      if (l instanceof Promise) l = (yield l) as LoadedEntry;
+      case WAIT_EXTERNAL: {
+        const base = v as ResolvedObject | undefined;
+        const baseId = (s.chain[s.chain.length - 1] as LoadedEntry).e.baseId as ObjectId;
+        if (!base) throw new PackError(`${packPath}: REF_DELTA base ${baseId} not found`);
+        if (base.data.length > maxObjectSize)
+          throw new PackError(
+            `${packPath}: REF_DELTA base ${baseId} is ${base.data.length} bytes, over the limit of ${maxObjectSize}`,
+          );
+        s.base = base;
+        break;
+      }
+      case WAIT_DELTA:
+        s.delta = v as Uint8Array;
+        break;
+    }
+    s.wait = WAIT_NONE;
+    const chain = s.chain;
+    // the walk down: from the delta asked for to a whole object, a cached one, or an external base
+    while (!s.base) {
+      let l = s.loaded;
+      const cur = s.cur;
+      if (l === undefined) {
+        // OFS_DELTA bases lie strictly before their delta: only a REF_DELTA step can come back
+        // to an entry, and from the first one on the offsets visited are remembered
+        if (s.seen) {
+          if (s.seen.has(cur)) throw new PackError(`${packPath}: delta cycle at ${cur}`);
+          s.seen.add(cur);
+        }
+        if (chain.length > MAX_CHAIN)
+          throw new PackError(`${packPath}: delta chain deeper than ${MAX_CHAIN} at ${s.offset}`);
+        if (s.first) {
+          l = s.first;
+          s.first = undefined;
+        } else {
+          const hit = cacheGet(cur);
+          if (hit) {
+            s.base = hit;
+            break;
+          }
+          const x = loadEntry(cur);
+          if (x instanceof Promise) {
+            s.wait = WAIT_ENTRY;
+            return x;
+          }
+          l = x;
+        }
+      }
+      s.loaded = undefined;
       const e = l.e;
       const type = TYPES[e.kind];
       if (type) {
         // a base below a delta: cached (`chain` holds at least the delta asked for)
         const data =
-          (l.data && inflateLoaded(l as LoadedEntry & { data: Uint8Array }, cache.alloc(e.size))) ||
-          ((yield l.data ? reinflate(l) : inflateAll(e)) as Uint8Array);
-        base = { type, data };
-        cachePut(cur, base);
-        break;
+          l.data && inflateLoaded(l as LoadedEntry & { data: Uint8Array }, cache.alloc(e.size));
+        if (data) {
+          s.base = { type, data };
+          cachePut(cur, s.base);
+          break;
+        }
+        s.loaded = l;
+        s.wait = WAIT_BASE;
+        return l.data ? reinflate(l) : inflateAll(e);
       }
       chain.push(l);
       if (e.baseOffset !== undefined) {
-        cur = e.baseOffset;
+        s.cur = e.baseOffset;
         continue;
       }
       const baseId = e.baseId as ObjectId;
       const i = t.find(baseId);
       if (i >= 0) {
-        cur = t.offsetOf(i);
+        if (!s.seen) {
+          s.seen = new Set();
+          for (const c of chain) s.seen.add(c.e.offset);
+        }
+        s.cur = t.offsetOf(i);
         continue;
       }
-      if (visiting.has(baseId))
+      if (baseId === s.id || s.visiting?.has(baseId))
         throw new PackError(`${packPath}: REF_DELTA cycle through ${baseId}`);
-      base = (yield Promise.resolve(
-        options.externalBase?.(baseId, new Set([...visiting, baseId])),
-      )) as ResolvedObject | undefined;
-      if (!base) throw new PackError(`${packPath}: REF_DELTA base ${baseId} not found`);
-      if (base.data.length > maxObjectSize)
-        throw new PackError(
-          `${packPath}: REF_DELTA base ${baseId} is ${base.data.length} bytes, over the limit of ${maxObjectSize}`,
-        );
-      break;
+      const visiting = new Set(s.visiting ?? []);
+      visiting.add(s.id);
+      visiting.add(baseId);
+      s.wait = WAIT_EXTERNAL;
+      return Promise.resolve(options.externalBase?.(baseId, visiting));
     }
     // The bases on the way up are cached, as git's unpack_entry caches each base it resolved;
     // the object asked for is not (git hands it over and keeps its base), so it goes to the
@@ -1299,28 +1493,33 @@ export async function openPack(
     // request into it stops at a nearby one. They are counted from the top: the base of the
     // object asked for is always cached (the cache keeps its most recent entry even under a
     // limit of 0, as git's), so reading a chain upwards applies one or two deltas per object.
-    let data = base.data;
-    const slots = Math.max(1, Math.floor(cacheLimit / Math.max(1, data.length)));
-    const stride = Math.max(1, Math.ceil(chain.length / slots));
-    // Results neither cached nor returned are written into two buffers of this read, in turn
-    // (a result never overwrites its base), instead of a new buffer per step.
-    const scratch: [Uint8Array, Uint8Array] = [EMPTY, EMPTY];
-    let turn = 0;
-    const intoScratch = (size: number): Uint8Array => {
-      turn ^= 1;
-      if (scratch[turn].length < size) scratch[turn] = new Uint8Array(Math.max(size, 1024));
-      return scratch[turn].subarray(0, size);
-    };
-    const forCache = (size: number) => cache.alloc(size);
-    for (let k = chain.length - 1; k >= 0; k--) {
+    const base = s.base;
+    if (s.k === -2) {
+      s.data = base.data;
+      const slots = Math.max(1, Math.floor(cacheLimit / Math.max(1, s.data.length)));
+      s.stride = Math.max(1, Math.ceil(chain.length / slots));
+      s.k = chain.length - 1;
+    }
+    for (; s.k >= 0; s.k--) {
+      const k = s.k;
       const l = chain[k] as LoadedEntry;
-      const keep = k > 0 && (k - 1) % stride === 0;
-      let d = inflateDelta(l);
-      if (d instanceof Promise) d = (yield d) as Uint8Array;
+      let d = s.delta;
+      s.delta = undefined;
+      if (d === undefined) {
+        const x = inflateDelta(l);
+        if (x instanceof Promise) {
+          // the scratch buffers are the pack's: another read may use them while this one waits
+          if (isScratch(s.data)) s.data = s.data.slice();
+          s.wait = WAIT_DELTA;
+          return x;
+        }
+        d = x;
+      }
+      const keep = k > 0 && (k - 1) % s.stride === 0;
       try {
         // the result's declared size is checked before it is allocated
-        data = applyGitDelta(
-          data,
+        s.data = applyGitDelta(
+          s.data,
           d,
           maxObjectSize,
           k === 0 ? allocBytes : keep ? forCache : intoScratch,
@@ -1330,10 +1529,45 @@ export async function openPack(
           throw new PackError(`${packPath}: delta at ${l.e.offset}: ${err.message}`);
         throw err;
       }
-      if (keep) cachePut(l.e.offset, { type: base.type, data });
+      if (keep) cachePut(l.e.offset, { type: base.type, data: s.data });
     }
-    return { type: base.type, data };
-  }
+    return { type: base.type, data: s.data };
+  };
+  /** `advance` through I/O, to the end. */
+  const finishResolve = async (
+    s: Resolution,
+    pending: Promise<unknown>,
+  ): Promise<ResolvedObject> => {
+    let r: ResolvedObject | Promise<unknown> = pending;
+    while (r instanceof Promise) r = advance(s, await r);
+    return r;
+  };
+  /** Resolves the delta `first` at `offset`: the result, or a promise of it after I/O. */
+  const resolve = (
+    offset: number,
+    id: ObjectId,
+    visiting: ReadonlySet<ObjectId> | undefined,
+    first: LoadedEntry,
+  ): ResolvedObject | Promise<ResolvedObject> => {
+    const s: Resolution = {
+      offset,
+      id,
+      visiting,
+      first,
+      chain: [],
+      seen: undefined,
+      cur: offset,
+      wait: WAIT_NONE,
+      loaded: undefined,
+      base: undefined,
+      k: -2,
+      data: EMPTY,
+      stride: 1,
+      delta: undefined,
+    };
+    const r = advance(s);
+    return r instanceof Promise ? finishResolve(s, r) : r;
+  };
 
   async function* verified(
     id: ObjectId,
@@ -1385,8 +1619,14 @@ export async function openPack(
     return crc.getValue();
   };
 
-  /** `get`, synchronous while every entry it reads is in a loaded window or the cache. */
-  function* getSteps(id: ObjectId, o?: PackGetOptions): Steps<GitObject | undefined> {
+  /**
+   * `get`, synchronous while every entry it reads is in a loaded window or the cache: the object
+   * (or undefined), else a promise of it once the reads it waits for are done.
+   */
+  const getNow = (
+    id: ObjectId,
+    o?: PackGetOptions,
+  ): GitObject | undefined | Promise<GitObject | undefined> => {
     const i = t.find(id);
     if (i < 0) return undefined;
     const offset = t.offsetOf(i);
@@ -1396,40 +1636,50 @@ export async function openPack(
       // never hand out the cached buffer
       return whole(id, hit.type, copyOf(hit.data), verify);
     }
-    let l = loadEntry(offset);
-    if (l instanceof Promise) l = (yield l) as LoadedEntry;
+    const l = loadEntry(offset);
+    if (l instanceof Promise) return l.then((x) => fromEntry(id, o, offset, x));
+    return fromEntry(id, o, offset, l);
+  };
+
+  /** The object whose entry `l` (at `offset`) is loaded. */
+  const fromEntry = (
+    id: ObjectId,
+    o: PackGetOptions | undefined,
+    offset: number,
+    l: LoadedEntry,
+  ): GitObject | Promise<GitObject> => {
+    const verify = o?.verify === true;
     const type = TYPES[l.e.kind];
     if (!type) {
-      const r = yield* resolve(offset, new Set([...(o?.visiting ?? []), id]), l);
+      const r = resolve(offset, id, o?.visiting, l);
       // never cached: the caller's own
+      if (r instanceof Promise) return r.then((x) => whole(id, x.type, x.data, verify));
       return whole(id, r.type, r.data, verify);
     }
-    let data: Uint8Array | undefined;
-    for (;;) {
-      const e = l.e;
-      if (!l.data || e.size > WHOLE_MAX) {
-        // large whole objects stream, never materialised
-        const content = inflate(e);
-        return {
-          type,
-          size: e.size,
-          content: verify ? verified(id, type, e.size, content) : content,
-        };
-      }
-      try {
-        data = inflateLoaded(l as LoadedEntry & { data: Uint8Array }, allocBytes(e.size));
-      } catch (err) {
-        // as the streamed read: a broken stream fails the content, not the lookup
-        if (!(err instanceof PackError)) throw err;
-        return { type, size: e.size, content: failing(err) };
-      }
-      if (data) break;
-      // read open, its stream ran past the window: again, with its extent
-      const x = reload(l);
-      l = x instanceof Promise ? ((yield x) as LoadedEntry) : x;
+    const e = l.e;
+    if (!l.data || e.size > WHOLE_MAX) {
+      // large whole objects stream, never materialised
+      const content = inflate(e);
+      return {
+        type,
+        size: e.size,
+        content: verify ? verified(id, type, e.size, content) : content,
+      };
     }
-    return whole(id, type, data, verify);
-  }
+    let data: Uint8Array | undefined;
+    try {
+      data = inflateLoaded(l as LoadedEntry & { data: Uint8Array }, allocBytes(e.size));
+    } catch (err) {
+      // as the streamed read: a broken stream fails the content, not the lookup
+      if (!(err instanceof PackError)) throw err;
+      return { type, size: e.size, content: failing(err) };
+    }
+    if (data) return whole(id, type, data, verify);
+    // read open, its stream ran past the window: again, with its extent
+    const x = reload(l);
+    if (x instanceof Promise) return x.then((r) => fromEntry(id, o, offset, r));
+    return fromEntry(id, o, offset, x);
+  };
 
   /** A whole object in memory: `bytes`, unless the read is verified (the stream's end checks). */
   const whole = (
@@ -1440,7 +1690,7 @@ export async function openPack(
   ): GitObject =>
     verify
       ? { type, size: data.length, content: verified(id, type, data.length, once(data)) }
-      : { type, size: data.length, bytes: data, content: once(data) };
+      : { type, size: data.length, bytes: data, content: new OnceContent(data) };
 
   return {
     packId,
@@ -1465,6 +1715,9 @@ export async function openPack(
       },
       get idxVerified() {
         return t.checks().verified;
+      },
+      get idCompares() {
+        return t.checks().compares;
       },
     },
     verifyIndex: () => t.verify(),
@@ -1535,7 +1788,13 @@ export async function openPack(
         },
       };
     },
-    get: (id, o) => runStepsAsync(getSteps(id, o)),
-    getNow: (id, o) => runSteps(getSteps(id, o)),
+    get(id, o) {
+      try {
+        return Promise.resolve(getNow(id, o));
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    },
+    getNow,
   };
 }

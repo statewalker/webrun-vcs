@@ -12,6 +12,7 @@
  * write, the whole chain) are deleted when not modified after `expireTime`.
  */
 
+import { OrderedMap } from "@statewalker/vcs-utils";
 import type { FilesApi, PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { atomicFilesOver, joinPath } from "@statewalker/vcs-utils/files";
 import { createSha1 } from "@statewalker/vcs-utils/hash";
@@ -834,7 +835,7 @@ const TREE_CACHE_BYTES = 64 * 1024 * 1024;
  * base cache. A tree is never decoded: the diff walks its bytes.
  */
 class TreeReader {
-  private readonly cache = new Map<ObjectId, Uint8Array>();
+  private readonly cache = new OrderedMap<ObjectId, Uint8Array>();
   private cacheBytes = 0;
   /** Trees read from the object database (for tests) */
   reads = 0;
@@ -880,7 +881,7 @@ class TreeReader {
     this.cache.set(id, data);
     this.cacheBytes += data.length;
     while (this.cache.size > TREE_CACHE_SIZE || this.cacheBytes > TREE_CACHE_BYTES) {
-      const oldest = this.cache.keys().next().value as ObjectId;
+      const oldest = this.cache.oldestKey() as ObjectId;
       if (oldest === id) break;
       this.cacheBytes -= (this.cache.get(oldest) as Uint8Array).length;
       this.cache.delete(oldest);

@@ -11,7 +11,7 @@
  * `--no-merges`) and pathspecs with wildcards, a trailing slash and exclusions.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -349,4 +349,285 @@ describeGit("log <revs> -- <pathspec> with exclusions against native git (fuzzed
       }
     }, 120_000);
   }
+});
+
+/** Pathspec forms that cannot use the changed-path filters, or name entries by pattern. */
+const PATHSPEC_FORMS: string[][] = [
+  [":(icase)D/X"],
+  [":(icase)A"],
+  [":(glob)d/**"],
+  [":(glob)**/z"],
+  [":(glob)d/*"],
+  [":(literal)d/*"],
+  [":(literal)d/x"],
+  ["**/z"],
+  ["d/?"],
+  ["d/[xy]"],
+  ["[ab]"],
+  [":(icase,glob)D/*"],
+  ["d", ":!d/y"],
+  [":(exclude)a"],
+  [":^b", "d"],
+  [":!d/e/*"],
+];
+
+describeGit("log <revs> [-- <pathspec forms>] against native git (fuzzed)", () => {
+  let root: string;
+  const env = () => nativeGitEnv(root);
+  const gitIn = (dir: string, args: string[], input?: string) =>
+    execFileSync("git", args, {
+      cwd: dir,
+      env: env(),
+      encoding: "utf8",
+      input,
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-plain-fuzz-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  async function open(dir: string): Promise<Git> {
+    const files = createNodeFilesApi({ rootDir: dir });
+    const environment = createNodeGitHostEnvironment({ env: env() });
+    const { history } = await createGitFilesBackend({ files });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history, environment });
+    return Git.fromWorkingCopy(await worktrees.openCurrent());
+  }
+
+  function build(seed: number): { dir: string; ids: string[]; dates: number[] } {
+    const dir = join(root, `repo-${seed}`);
+    execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+    const { stream, dates, count } = randomHistory(seed, COMMITS);
+    const marks = join(root, `marks-${seed}`);
+    gitIn(dir, ["fast-import", "--quiet", `--export-marks=${marks}`], stream);
+    const byMark = new Map<number, string>();
+    for (const line of readFileSync(marks, "utf8").split("\n")) {
+      const m = /^:(\d+) ([0-9a-f]{40})$/.exec(line);
+      if (m) byMark.set(Number(m[1]), m[2] as string);
+    }
+    const ids: string[] = [];
+    for (let mark = 1; mark <= count; mark++) ids.push(byMark.get(mark) as string);
+    gitIn(dir, ["update-ref", "refs/heads/main", ids[ids.length - 1] as string]);
+    gitIn(dir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    return { dir, ids, dates };
+  }
+
+  /** A query of the fuzz above, with its pathspec replaced (none: a plain `git log`). */
+  function variant(r: ReturnType<typeof rng>, ids: string[], dates: number[], plain: boolean) {
+    const q = randomQuery(r, ids, dates);
+    // half of the plain queries stream (no excluded commit)
+    if (plain && r.chance(0.5)) q.revs = q.revs.filter((x) => !x.exclude);
+    if (q.revs.every((x) => x.exclude)) q.revs.push({ id: r.pick(ids), exclude: false });
+    q.paths = plain ? [] : r.pick(PATHSPEC_FORMS);
+    return q;
+  }
+
+  function nativeLog(dir: string, q: Query): string[] {
+    const revs = q.revs.map((x) => (x.exclude ? `^${x.id}` : x.id));
+    const paths = q.paths.length > 0 ? ["--", ...q.paths] : [];
+    return gitIn(dir, ["log", "--format=%H", ...q.args, ...revs, ...paths])
+      .split("\n")
+      .filter(Boolean);
+  }
+
+  async function ourLog(git: Git, q: Query): Promise<string[]> {
+    let command = git.log();
+    for (const x of q.revs) command = x.exclude ? command.not(x.id) : command.add(x.id);
+    // every form through addPath, `:!` and `:(exclude)` included
+    for (const p of q.paths) command = command.addPath(p);
+    command = q.configure(command);
+    const out: string[] = [];
+    for await (const c of await command.call()) out.push(c.id);
+    return out;
+  }
+
+  const label = (q: Query, ids: string[]) =>
+    [
+      ...q.args,
+      ...q.revs.map((x) => `${x.exclude ? "^" : ""}c${ids.indexOf(x.id) + 1}`),
+      ...(q.paths.length > 0 ? ["--", ...q.paths] : []),
+    ].join(" ");
+
+  for (const seed of SEEDS) {
+    it(`seed ${seed}: plain and pattern-limited logs list git's commits in git's order`, async () => {
+      const { dir, ids, dates } = build(seed);
+      const r = rng(seed * 104729);
+      const queries = [
+        ...Array.from({ length: 40 }, () => variant(r, ids, dates, true)),
+        ...Array.from({ length: 40 }, () => variant(r, ids, dates, false)),
+      ];
+      for (const graph of [false, true]) {
+        if (graph) gitIn(dir, ["commit-graph", "write", "--reachable", "--changed-paths"]);
+        const git = await open(dir);
+        for (const q of queries) {
+          const theirs = nativeLog(dir, q);
+          const mine = await ourLog(git, q);
+          expect([graph, label(q, ids), mine]).toEqual([graph, label(q, ids), theirs]);
+        }
+      }
+    }, 120_000);
+  }
+});
+
+/** `:(attr:...)` and `:(prefix:N)` elements, matched against the worktree's attributes. */
+const ATTR_FORMS: string[][] = [
+  [":(attr:text)"],
+  [":(attr:-text)"],
+  [":(attr:!text)"],
+  [":(attr:foo=bar)"],
+  [":(attr:foo=nested)d"],
+  [":(attr:foo=baz)"],
+  [":(attr:diff=c)"],
+  [":(attr:eol=lf -text)d"],
+  [":(attr:!foo)"],
+  [":(glob,attr:foo)**/x"],
+  [":(attr:text)", ":(attr:foo=bar)"],
+  ["d", ":(exclude,attr:foo=bar)"],
+  [":(attr:!foo eol=lf)", ":!b"],
+  [":(prefix:2)d/x"],
+  [":(prefix:2)d/*"],
+  [":(prefix:1)d*"],
+  [":(prefix:0)*/z"],
+];
+
+const ATTRIBUTES = [
+  "a text",
+  "d/* -text foo=bar",
+  "d/e/** diff=c",
+  "p/q !text foo=baz",
+  "* eol=lf",
+  "",
+].join("\n");
+
+describeGit("log -- :(attr:...) / :(prefix:N) against native git (fuzzed)", () => {
+  let root: string;
+  const env = () => nativeGitEnv(root);
+  const gitIn = (dir: string, args: string[], input?: string) =>
+    execFileSync("git", args, {
+      cwd: dir,
+      env: env(),
+      encoding: "utf8",
+      input,
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-attr-fuzz-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const seed of SEEDS.slice(0, 2)) {
+    it(`seed ${seed}: attribute and prefix magic selects git's commits`, async () => {
+      const dir = join(root, `repo-${seed}`);
+      execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+      const { stream, dates, count } = randomHistory(seed, COMMITS);
+      const marks = join(root, `marks-${seed}`);
+      gitIn(dir, ["fast-import", "--quiet", `--export-marks=${marks}`], stream);
+      const byMark = new Map<number, string>();
+      for (const line of readFileSync(marks, "utf8").split("\n")) {
+        const m = /^:(\d+) ([0-9a-f]{40})$/.exec(line);
+        if (m) byMark.set(Number(m[1]), m[2] as string);
+      }
+      const ids: string[] = [];
+      for (let mark = 1; mark <= count; mark++) ids.push(byMark.get(mark) as string);
+      gitIn(dir, ["update-ref", "refs/heads/main", ids[ids.length - 1] as string]);
+      gitIn(dir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+      // the worktree's attributes (not committed): what git's match_pathspec_attrs reads
+      writeFileSync(join(dir, ".gitattributes"), ATTRIBUTES);
+      mkdirSync(join(dir, "d"), { recursive: true });
+      writeFileSync(join(dir, "d", ".gitattributes"), "x foo=nested\n");
+
+      const files = createNodeFilesApi({ rootDir: dir });
+      const environment = createNodeGitHostEnvironment({ env: env() });
+      const { history } = await createGitFilesBackend({ files });
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: ".git",
+        history,
+        environment,
+      });
+      const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+      const r = rng(seed * 15485863);
+      for (let i = 0; i < 50; i++) {
+        const q = randomQuery(r, ids, dates);
+        // most without excluded commits: longer lists
+        if (r.chance(0.6)) q.revs = q.revs.filter((x) => !x.exclude);
+        if (q.revs.every((x) => x.exclude)) q.revs.push({ id: r.pick(ids), exclude: false });
+        q.paths = r.pick(ATTR_FORMS);
+        const revs = q.revs.map((x) => (x.exclude ? `^${x.id}` : x.id));
+        const theirs = gitIn(dir, ["log", "--format=%H", ...q.args, ...revs, "--", ...q.paths])
+          .split("\n")
+          .filter(Boolean);
+        let command = git.log();
+        for (const x of q.revs) command = x.exclude ? command.not(x.id) : command.add(x.id);
+        for (const p of q.paths) command = command.addPath(p);
+        const mine: string[] = [];
+        for await (const c of await q.configure(command).call()) mine.push(c.id);
+        const label = [...q.args, ...q.paths].join(" ");
+        expect([label, mine]).toEqual([label, theirs]);
+      }
+    }, 120_000);
+  }
+});
+
+describeGit("log keeps a few dozen bytes per commit it walks", () => {
+  let root: string;
+  const env = () => nativeGitEnv(root);
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-table-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it("a 3000-commit history: git's order, and the walk's table stays compact", async () => {
+    const dir = join(root, "repo");
+    execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+    const out: string[] = [];
+    for (let i = 1; i <= 3000; i++) {
+      const t = 1500000000 + i * 60 - (i % 7 === 0 ? 500 : 0); // some clock skew
+      out.push(`commit refs/heads/main\nmark :${i}\n`);
+      out.push(`committer C O Mitter <c@example.com> ${t} +0000\n`);
+      out.push(`data 4\nc${String(i % 100).padStart(2, "0")}\n`);
+      if (i > 1) out.push(`from :${i - 1}\n`);
+      out.push(`M 100644 inline f${i % 13}\ndata 5\nv${String(i).padStart(4, "0")}\n\n`);
+    }
+    execFileSync("git", ["fast-import", "--quiet"], { cwd: dir, env: env(), input: out.join("") });
+    for (const graph of [false, true]) {
+      if (graph) {
+        execFileSync("git", ["commit-graph", "write", "--reachable"], { cwd: dir, env: env() });
+      }
+      const files = createNodeFilesApi({ rootDir: dir });
+      const environment = createNodeGitHostEnvironment({ env: env() });
+      const { history } = await createGitFilesBackend({ files });
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: ".git",
+        history,
+        environment,
+      });
+      const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+      for (const paths of [[], ["f3"]]) {
+        const theirs = execFileSync("git", ["log", "--format=%H", "--", ...paths], {
+          cwd: dir,
+          env: env(),
+          encoding: "utf8",
+          maxBuffer: 1 << 26,
+        })
+          .split("\n")
+          .filter(Boolean);
+        const command = git.log();
+        for (const p of paths) command.addPath(p);
+        const mine: string[] = [];
+        for await (const c of await command.call()) mine.push(c.id);
+        expect([graph, paths, mine]).toEqual([graph, paths, theirs]);
+        const s = command.getStatistics();
+        expect(s.commitsWalked).toBe(3000);
+        // typed arrays grown by doubling (and one slot per graph commit): no object per commit
+        expect((s.walkTableBytes as number) / 3000).toBeLessThan(48);
+      }
+    }
+  }, 120_000);
 });
