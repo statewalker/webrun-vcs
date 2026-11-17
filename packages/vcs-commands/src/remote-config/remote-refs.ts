@@ -72,11 +72,13 @@ export async function moveRefs(
   if (direct.length > 0) {
     const commands = [
       ...direct.map(({ move, id }) => ({ name: move.from, old: id, new: null })),
+      // git's REF_SKIP_CREATE_REFLOG: a new name gets only the lines carried over (none
+      // for a ref that had no log), never a line of its own
       ...direct.map(({ move, id }) => ({
         name: move.to,
         old: null,
         new: id,
-        ...(move.reflog ? { reflog: move.reflog } : {}),
+        reflog: move.reflog ?? [],
       })),
     ];
     const result = await refs.batch(commands);
@@ -92,7 +94,12 @@ export async function moveRefs(
   }
   for (const { move, target } of symbolic) {
     if (await refs.has(move.to)) throw new Error(`Cannot update refs: ${move.to} exists`);
-    await refs.setSymbolic(move.to, symbolicTarget(target));
+    // the symbolic ref's log carried over too (git's ref_transaction_update_reflog)
+    await refs.setSymbolic(
+      move.to,
+      symbolicTarget(target),
+      move.reflog ? { reflog: move.reflog } : undefined,
+    );
     await refs.remove(move.from);
   }
 }

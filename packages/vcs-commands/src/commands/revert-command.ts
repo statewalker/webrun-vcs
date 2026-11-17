@@ -191,6 +191,7 @@ export class RevertCommand extends GitCommand<RevertResult> {
         favor: favorOf(this.contentStrategy),
         oursLabel: this.ourCommitName,
         committer: this.committer,
+        reflogAction: this.reflogAction(this.reflogPrefix.replace(/:$/, "")),
       },
     );
     switch (this.operation) {

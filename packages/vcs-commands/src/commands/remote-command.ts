@@ -28,6 +28,8 @@ import {
 } from "../remote-config/index.js";
 import { TransportCommand } from "../transport-command.js";
 
+const ZERO_ID = "0".repeat(40);
+
 export type { RemoteConfig };
 
 /**
@@ -353,13 +355,17 @@ export class RemoteRenameCommand extends GitCommand<RemoteRenameResult> {
 
     // the refs first: a refused batch (a name conflict) leaves everything as it was
     if (refspecsNeedUpdate) {
+      const renameLine = this.reflogLine("");
       const moves = [];
       for await (const ref of this.refsStore.list(oldTop)) {
         const to = renamed(ref.name);
         const reflog: OwnReflogLine[] = [];
-        const id = isSymbolicRef(ref) ? undefined : ref.objectId;
-        const log = id ? await this.refsStore.getReflog?.(ref.name) : undefined;
-        if (log && id) {
+        const symbolic = isSymbolicRef(ref);
+        const id = symbolic ? undefined : ref.objectId;
+        // git's rename_one_reflog: a ref with a log takes it along, plus git's line (the
+        // committer's); a symbolic ref has no id of its own there, so its line is zeros
+        const log = id || symbolic ? await this.refsStore.getReflog?.(ref.name) : undefined;
+        if (log) {
           for (const entry of (await log.getReverseEntries()).reverse()) {
             reflog.push({
               oldId: entry.oldId,
@@ -369,8 +375,9 @@ export class RemoteRenameCommand extends GitCommand<RemoteRenameResult> {
             });
           }
           reflog.push({
-            oldId: id,
-            newId: id,
+            oldId: id ?? ZERO_ID,
+            newId: id ?? ZERO_ID,
+            ...(renameLine.ident !== undefined ? { ident: renameLine.ident } : {}),
             message: `remote: renamed ${ref.name} to ${to}`,
           });
         }
@@ -752,7 +759,8 @@ export class RemoteSetHeadCommand extends TransportCommand<string | undefined> {
       throw new RefNotFoundError(target, `Not a valid ref: ${target}`);
     }
     const previous = await this.refsStore.get(`${top}HEAD`);
-    await this.refsStore.setSymbolic(`${top}HEAD`, target);
+    // git's `create_symref(..., "remote set-head")`: logged in the symbolic ref's reflog
+    await this.refsStore.setSymbolic(`${top}HEAD`, target, this.reflogLine("remote set-head"));
     if (this.auto)
       this.messages.push(reportSetHeadAuto(remote, target.slice(top.length), previous));
     const store = RemoteConfigStore.from(this.workingCopy);

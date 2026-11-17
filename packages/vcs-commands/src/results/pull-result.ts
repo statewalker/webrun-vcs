@@ -8,11 +8,17 @@ import type { RebaseResult } from "./rebase-result.js";
  * Based on JGit's PullResult.
  */
 export interface PullResult {
-  /** Result of the fetch phase */
-  fetchResult: FetchResult;
-  /** Result of the merge phase (if applicable) */
+  /**
+   * Result of the fetch phase; undefined when a rebasing pull refused a dirty tree before
+   * fetching (`rebaseResult` then holds git's refusal, `UNCOMMITTED_CHANGES`)
+   */
+  fetchResult?: FetchResult;
+  /** Result of the merge phase (if applicable; also the fast-forward of a rebasing pull) */
   mergeResult?: MergeResult;
-  /** The rebase's result (`setRebase(true)`: `git pull --rebase`) */
+  /**
+   * The rebase's result (`git pull --rebase`, or pull.rebase); a pull that only
+   * fast-forwards reports `FAST_FORWARD` here (git runs `merge --ff-only` for it)
+   */
   rebaseResult?: RebaseResult;
   /** Whether rebase was used instead of merge */
   rebaseUsed: boolean;

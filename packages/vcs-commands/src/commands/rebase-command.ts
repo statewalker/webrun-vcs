@@ -4,6 +4,7 @@ import {
   isSymbolicRef,
   type ObjectId,
   type PersonIdent,
+  type RefLogOptions,
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
@@ -42,6 +43,7 @@ import {
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { type PatchIdTrees, patchId } from "./patch-id.js";
+import { reflogMessages } from "./reflog-messages.js";
 import { expandCommitId, expandCommitIds } from "./sequencer-pick.js";
 import {
   applyAutostash,
@@ -407,7 +409,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         return { status: RebaseStatus.FAILED, message: refused.message, output };
       }
       await state.setRef("ORIG_HEAD", headId);
-      await this.finishBranch(headName, onto);
+      // as git's rebase: HEAD detached at upstream ("(start)"), then the branch moved
+      await this.refsStore.set("HEAD", onto, this.startLog());
+      await this.finishBranch(headName, onto, onto);
       await unstash();
       return { status: RebaseStatus.FAST_FORWARD, newHead: onto, output };
     }
@@ -485,7 +489,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     );
     await state.write(`${DIR}/git-rebase-todo`, todoText);
     if (autostash) await state.write(`${DIR}/autostash`, `${autostash}\n`);
-    await this.refsStore.set("HEAD", onto);
+    await this.refsStore.set("HEAD", onto, this.startLog());
     return this.processTodo(state, worktree, output);
   }
 
@@ -535,7 +539,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // done: the branch takes the new commits, HEAD attached to it again
     const headName = (await state.read(`${DIR}/head-name`))?.trim() ?? "detached HEAD";
     const newHead = await this.resolveHead();
-    await this.finishBranch(headName, newHead);
+    const onto = (await state.read(`${DIR}/onto`))?.trim() ?? newHead;
+    await this.finishBranch(headName, newHead, onto);
     const autostash = (await state.read(`${DIR}/autostash`))?.trim();
     await state.remove(DIR);
     if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
@@ -636,7 +641,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (item.action === RebaseAction.REWORD && this.interactiveHandler) {
       message = this.interactiveHandler.modifyCommitMessage(message);
     }
-    const newId = await this.commitOnto(headId, treeId, commit.author, message);
+    const newId = await this.commitOnto(headId, treeId, commit.author, message, item.action);
     await this.rewritten(state, item.id, newId);
     if (item.action === RebaseAction.EDIT) {
       return { status: RebaseStatus.EDIT, newHead: newId, currentCommit: item.id };
@@ -700,7 +705,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           (await state.read(`${DIR}/message`)) ??
           commit?.message ??
           "";
-        const newId = await this.commitOnto(headId, treeId, author, cleanupMessage(text));
+        const newId = await this.commitOnto(
+          headId,
+          treeId,
+          author,
+          cleanupMessage(text),
+          "continue",
+        );
         await this.rewritten(state, id, newId);
         await state.removeRef("AUTO_MERGE");
       }
@@ -755,7 +766,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         message: `${refused.message.replace(/\nfatal: .*$/, "")}\nfatal: could not move back to ${origHead}`,
       };
     }
-    await this.finishBranch(headName, origHead);
+    await this.finishBranch(headName, origHead, undefined, true);
     const autostash = (await state.read(`${DIR}/autostash`))?.trim();
     await state.removeRef("REBASE_HEAD", "AUTO_MERGE");
     await state.remove("MERGE_MSG", DIR);
@@ -763,10 +774,23 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     return { status: RebaseStatus.ABORTED, newHead: origHead, output };
   }
 
+  /**
+   * git's `require_clean_work_tree(<action>)` on this command's working copy, without
+   * rebasing: the refusal (`cannot <action>: You have unstaged changes.` ...), or undefined
+   * when the tree is clean or HEAD is unborn. `git pull --rebase` checks it before fetching,
+   * as `pull with rebase`.
+   */
+  async checkCleanWorkTree(action = "rebase"): Promise<RebaseResult | undefined> {
+    const headId = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    if (!headId) return undefined;
+    return this.uncleanWorktree(headId, this.worktreeAccess, action);
+  }
+
   /** Refuses as git's require_clean_work_tree: unstaged, then staged changes. */
   private async uncleanWorktree(
     headId: ObjectId,
     worktree: Worktree | undefined,
+    action = "rebase",
   ): Promise<RebaseResult | undefined> {
     const { index, unmerged } = await readIndex(this.staging);
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
@@ -790,9 +814,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
     }
     if (staged.length === 0 && unstaged.length === 0) return undefined;
-    const lines = ["error: cannot rebase: You have unstaged changes."];
+    const lines = [`error: cannot ${action}: You have unstaged changes.`];
     if (unstaged.length === 0)
-      lines[0] = "error: cannot rebase: Your index contains uncommitted changes.";
+      lines[0] = `error: cannot ${action}: Your index contains uncommitted changes.`;
     else if (staged.length > 0)
       lines.push("error: additionally, your index contains uncommitted changes.");
     lines.push("error: Please commit or stash them.");
@@ -803,16 +827,32 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     };
   }
 
+  /** A commit made on the detached HEAD, logged `rebase (<step>): <subject>`. */
   private async commitOnto(
     parent: ObjectId,
     tree: ObjectId,
     author: PersonIdent,
     message: string,
+    step: string,
   ): Promise<ObjectId> {
     const committer = this.committer ?? defaultIdent();
     const id = await this.commits.store({ tree, parents: [parent], author, committer, message });
-    await this.refsStore.set("HEAD", id);
+    const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
+    await this.refsStore.set(
+      "HEAD",
+      id,
+      this.reflogLine(reflogMessages.pick(action, message), this.committer),
+    );
     return id;
+  }
+
+  /** HEAD detached at upstream: `rebase (start): checkout <upstream as given>`. */
+  private startLog(): RefLogOptions {
+    const onto = this.upstreamCommitName ?? this.upstreamCommit ?? "";
+    return this.reflogLine(
+      reflogMessages.rebaseStart(this.reflogAction("rebase"), onto),
+      this.committer,
+    );
   }
 
   private async rewritten(state: OperationState, from: ObjectId, to: ObjectId): Promise<void> {
@@ -820,13 +860,41 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.append(`${DIR}/rewritten-list`, `${from} ${to}\n`);
   }
 
-  /** The branch rebased moves to `id` and HEAD is attached to it again. */
-  private async finishBranch(headName: string, id: ObjectId): Promise<void> {
+  /**
+   * The branch rebased moves to `id` and HEAD is attached to it again, logged as git's
+   * move_to_original_branch: `rebase (finish): <branch> onto <onto>` for the branch,
+   * `rebase (finish): returning to <branch>` for HEAD; an abort logs both
+   * `rebase (abort): returning to <branch>`. A detached rebase leaves HEAD where it is.
+   */
+  private async finishBranch(
+    headName: string,
+    id: ObjectId,
+    onto: ObjectId | undefined,
+    abort = false,
+  ): Promise<void> {
+    const action = this.reflogAction("rebase");
     if (headName.startsWith("refs/")) {
-      await this.refsStore.set(headName, id);
-      await this.refsStore.setSymbolic("HEAD", headName);
+      const headLog = this.reflogLine(
+        abort
+          ? reflogMessages.rebaseAbort(action, headName)
+          : reflogMessages.rebaseFinishHead(action, headName),
+        this.committer,
+      );
+      const branchLog = abort
+        ? headLog
+        : this.reflogLine(
+            reflogMessages.rebaseFinishBranch(action, headName, onto ?? id),
+            this.committer,
+          );
+      await this.refsStore.set(headName, id, branchLog);
+      await this.refsStore.setSymbolic("HEAD", headName, headLog);
     } else {
-      await this.refsStore.set("HEAD", id);
+      // git's abort of a detached rebase: HEAD back at orig-head ("rebase (abort): returning
+      // to <id>"); a finished one stays where the picks left it
+      const log = abort
+        ? this.reflogLine(reflogMessages.rebaseAbort(action, id), this.committer)
+        : undefined;
+      await this.refsStore.set("HEAD", id, log);
     }
   }
 

@@ -1,8 +1,9 @@
-import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import type { Staging } from "@statewalker/vcs-working-tree";
 
 import { NoHeadError, RefNotFoundError, StoreNotAvailableError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
 
@@ -293,7 +294,10 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const abbrev = headRef.objectId.substring(0, 7);
     const shortMessage = headCommit.message.split("\n")[0];
 
-    const indexMsg = this.formatMessage(this.indexMessage, branch, abbrev, shortMessage);
+    // git's do_create_stash: the index and untracked commits' messages end in a line end
+    // ("index on %s\n"), the stash commit's does not
+    const withEol = (text: string) => (text.endsWith("\n") ? text : `${text}\n`);
+    const indexMsg = withEol(this.formatMessage(this.indexMessage, branch, abbrev, shortMessage));
     // git: `stash push -m <msg>` is "On <branch>: <msg>"
     const workingMsg =
       this.customMessage !== undefined
@@ -312,7 +316,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     // Create untracked commit if needed (no parents)
     let untrackedCommit: ObjectId | undefined;
     if (untrackedTree) {
-      const untrackedMsg = this.formatMessage(MSG_UNTRACKED, branch, abbrev, shortMessage);
+      const untrackedMsg = withEol(this.formatMessage(MSG_UNTRACKED, branch, abbrev, shortMessage));
       untrackedCommit = await this.commits.store({
         tree: untrackedTree,
         parents: [],
@@ -339,10 +343,16 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
 
     // `git stash create` (no ref): the stash commit only, nothing else changes
     if (!this.ref) return stashCommit;
-    await this.updateStashRef(this.ref, stashCommit, workingMsg, author);
+    await this.updateStashRef(this.ref, stashCommit, workingMsg, this.author);
 
     // Reset the index and the working directory, as git stash push does
     await provider.resetHard({ ...untrackedOptions, keepIndex: this.keepIndex, indexTree });
+    // git stash push runs `git reset --hard`: HEAD's reflog says "reset: moving to HEAD"
+    await updateHead(
+      this.refsStore,
+      headRef.objectId,
+      this.reflogLine(reflogMessages.reset("HEAD"), this.author),
+    );
 
     return stashCommit;
   }
@@ -404,11 +414,11 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     ref: string,
     commitId: ObjectId,
     message: string,
-    who: PersonIdent,
+    who: PersonIdent | undefined,
   ): Promise<void> {
+    // the identity: the one set, else git's committer ident (environment, configuration)
     const result = await this.refsStore.batch([{ name: ref, new: commitId }], {
-      ident: formatPersonIdent(who),
-      message,
+      ...this.reflogLine(message, who),
       createReflog: true,
     });
     if (!result.ok) {

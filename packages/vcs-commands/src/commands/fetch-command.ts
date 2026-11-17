@@ -77,6 +77,8 @@ export enum TagOption {
  */
 export class FetchCommand extends TransportCommand<FetchResult> {
   private remote = "origin";
+  /** Whether the remote was named (it is then in the reflog action, as on git's command line). */
+  private remoteGiven = false;
   private refSpecs: string[] = [];
   private removeDeletedRefs?: boolean;
   private pruneTags?: boolean;
@@ -89,6 +91,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private depth?: number;
   private dryRun = false;
   private forceUpdate = false;
+  private atomic = false;
   private checkFetchedObjects = false;
   private initialBranch?: string;
   private shallowSince?: Date;
@@ -106,6 +109,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   setRemote(remote: string): this {
     this.checkCallable();
     this.remote = remote;
+    this.remoteGiven = true;
     return this;
   }
 
@@ -302,6 +306,16 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   setForceUpdate(force: boolean): this {
     this.checkCallable();
     this.forceUpdate = force;
+    return this;
+  }
+
+  /**
+   * Update the local refs in one transaction, all or none (`git fetch --atomic`). Each ref
+   * is still logged with its own reflog message, as git's transaction logs it.
+   */
+  setAtomic(atomic: boolean): this {
+    this.checkCallable();
+    this.atomic = atomic;
     return this;
   }
 
@@ -530,9 +544,19 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
       unshallow: this.unshallow || undefined,
       force: this.forceUpdate,
+      atomic: this.atomic || undefined,
       dryRun: this.dryRun,
       onProgress: this.progressMessageCallback,
-      reflogMessage: `fetch: ${remoteUrl}`,
+      // git's "fetch <args>: <what>" per ref; the action from the remote and refspecs named
+      reflogAction: this.reflogAction(
+        [
+          "fetch",
+          ...(this.atomic ? ["--atomic"] : []),
+          ...(this.remoteGiven || this.refSpecs.length > 0 ? [this.remote] : []),
+          ...this.refSpecs,
+        ].join(" "),
+      ),
+      reflogIdent: this.reflogLine("").ident,
     });
 
     const advertisedRefs = new Map<string, ObjectId>();
@@ -623,7 +647,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const target = baremirror ? `refs/heads/${headName}` : `refs/remotes/${remote}/${headName}`;
     if (!baremirror && !(await this.refsStore.resolve(target))?.objectId) return;
     const previous = await this.refsStore.get(name);
-    if (!createOnly || !previous) await this.refsStore.setSymbolic(name, target);
+    // refs_update_symref_extended(..., "fetch", ...): logged with the literal "fetch"
+    if (!createOnly || !previous) {
+      await this.refsStore.setSymbolic(name, target, this.reflogLine("fetch"));
+    }
     if (follow.mode !== "warn" || follow.noWarnBranch === headName || !previous) return;
     // warn_set_head
     const prefix = `refs/remotes/${remote}/`;

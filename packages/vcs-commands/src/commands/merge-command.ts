@@ -48,6 +48,7 @@ import {
 import { octopusMerge } from "./octopus-merge.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
+import { reflogMessages, updateHead } from "./reflog-messages.js";
 import {
   applyAutostash,
   cleanupMessage,
@@ -568,7 +569,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
         output,
       };
     }
-    await this.updateHead(head, srcId);
+    await this.updateHead(head, srcId, "Fast-forward");
     return {
       status: MergeStatus.FAST_FORWARD,
       newHead: srcId,
@@ -727,7 +728,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
 
     const newCommitId = await this.storeCommit(treeId, [headId, srcId], message);
-    await this.updateHead(head, newCommitId);
+    await this.updateHead(head, newCommitId, reflogMessages.mergeMade(this.strategyName()));
     // the commit ends the merge: git's remove_merge_branch_state
     await state.removeRef("AUTO_MERGE");
     output.push(`Merge made by the '${this.strategyName()}' strategy.`);
@@ -863,7 +864,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const keepHead = !headSubsumed || this.ffMode() === FastForwardMode.NO_FF;
     const parents = [...(keepHead ? [headId] : []), ...remoteIds];
     const newCommitId = await this.storeCommit(treeId, parents, message);
-    await this.updateHead(head, newCommitId);
+    await this.updateHead(head, newCommitId, reflogMessages.mergeMade(strategy));
     output.push(`Merge made by the '${strategy}' strategy.`);
     return { status: MergeStatus.MERGED, newHead: newCommitId, mergedCommits, output };
   }
@@ -928,7 +929,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
       this.message ?? (await state.read("MERGE_MSG")) ?? `Merge commit '${mergeHead}'\n`,
     );
     const newCommitId = await this.storeCommit(treeId, [headId, ...heads], message);
-    await this.updateHead(head, newCommitId);
+    // `git merge --continue` is `git commit`: "commit (merge): <subject>"
+    await this.updateHead(head, newCommitId, undefined, reflogMessages.commit("merge", message));
     await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
     await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
     return {
@@ -958,6 +960,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
       return failed(refused.message, refused.paths);
     }
     await state.setRef("ORIG_HEAD", headId);
+    // `git reset --merge` moves HEAD where it is: "reset: moving to HEAD" (git's merge sets
+    // GIT_REFLOG_ACTION only after the abort, so a caller's action reads "<action>: updating HEAD")
+    const message = this.hasReflogAction()
+      ? `${this.reflogAction("merge")}: updating HEAD`
+      : reflogMessages.reset("HEAD");
+    await updateHead(this.refsStore, headId, this.reflogLine(message));
     await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
     await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
     return {
@@ -1159,12 +1167,24 @@ export class MergeCommand extends GitCommand<MergeResult> {
     return this.commits.store(commit);
   }
 
+  /**
+   * HEAD (its branch, when attached) moved to `id`, logged as git's merge logs it:
+   * `<action>: <outcome>`, the action being `merge <names as given>` (`pull` for a pull);
+   * or with `message` as it is.
+   */
   private async updateHead(
     head: Awaited<ReturnType<typeof this.refsStore.get>>,
     id: ObjectId,
+    outcome: string | undefined,
+    message?: string,
   ): Promise<void> {
-    if (head && isSymbolicRef(head)) await this.refsStore.set(head.target, id);
-    else await this.refsStore.set("HEAD", id);
+    const action = this.reflogAction(reflogMessages.mergeAction(this.includes));
+    const log = this.reflogLine(
+      message ?? reflogMessages.merge(action, outcome ?? ""),
+      this.committer,
+    );
+    if (head && isSymbolicRef(head)) await this.refsStore.set(head.target, id, log);
+    else await this.refsStore.set("HEAD", id, log);
   }
 
   /** How git's merge message names what is merged: `branch 'x'`, `tag 'v1'`, ... */

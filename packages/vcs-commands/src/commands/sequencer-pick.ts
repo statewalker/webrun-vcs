@@ -6,7 +6,7 @@
  * `--continue`, `--skip` or `--abort` what we started and the other way round.
  */
 
-import { type Commit, isSymbolicRef, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 
@@ -37,6 +37,7 @@ import {
 } from "./merge-support.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
+import { reflogLine, reflogMessages, updateHead } from "./reflog-messages.js";
 import { cleanupMessage, resetMerge } from "./sequencer-support.js";
 
 /** What the sequencer does with each commit. */
@@ -88,6 +89,8 @@ export interface PickOptions {
   oursLabel?: string;
   /** The committer (and a revert's author); default `Unknown` now */
   committer?: PersonIdent;
+  /** The action of the picks' reflog lines (default `cherry-pick` / `revert`) */
+  reflogAction?: string;
 }
 
 const ACTION_NAME = { pick: "cherry-pick", revert: "revert" } as const;
@@ -319,12 +322,15 @@ export class PickSequencer {
       };
     }
     const committer = this.options.committer ?? defaultIdent();
+    const commitMessage = action === "pick" ? commit.message : message;
     const newHead = await this.commit(
       treeId,
       [headId],
       action === "pick" ? commit.author : committer,
       committer,
-      action === "pick" ? commit.message : message,
+      commitMessage,
+      // the sequencer's update_head_with_reflog: "cherry-pick: <subject>", "revert: ..."
+      reflogMessages.pick(this.options.reflogAction ?? ACTION_NAME[action], commitMessage),
     );
     return { status: "ok", newHead, picked: [item.id], output };
   }
@@ -363,6 +369,9 @@ export class PickSequencer {
         action === "pick" ? commit.author : committer,
         committer,
         message,
+        // `--continue` commits as `git commit` does: "commit (cherry-pick): <subject>" (a
+        // revert is no whence of git commit: "commit: <subject>")
+        reflogMessages.commit(action === "pick" ? "cherry-pick" : undefined, message),
       );
       // the commit ends the stopped pick (git commit's remove_merge_branch_state)
       await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE");
@@ -386,7 +395,8 @@ export class PickSequencer {
     const headId = await this.headId();
     const refused = await resetMerge(this.deps, headId, "HEAD");
     if (refused) return this.fail(refused.message);
-    // git reset --merge records ORIG_HEAD
+    // git reset --merge <HEAD's id> records ORIG_HEAD, and HEAD's reflog line
+    await this.moveHead(headId, reflogMessages.reset(headId));
     await state.setRef("ORIG_HEAD", headId);
     await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD");
     await state.remove("MERGE_MSG");
@@ -408,6 +418,8 @@ export class PickSequencer {
       }
       const refused = await resetMerge(this.deps, headId, "HEAD");
       if (refused) return this.fail(refused.message);
+      // git's rollback_single_pick: `reset --merge <HEAD's id>`
+      await this.moveHead(headId, reflogMessages.reset(headId));
       await state.setRef("ORIG_HEAD", headId);
       await this.removeState();
       return { status: "ok", newHead: headId, picked: [], output: [] };
@@ -426,7 +438,8 @@ export class PickSequencer {
     }
     const refused = await resetMerge(this.deps, origHead, origHead);
     if (refused) return this.fail(refused.message);
-    await this.moveHead(origHead);
+    // git's reset_merge(<sequencer/head>): `reset --merge <id>`
+    await this.moveHead(origHead, reflogMessages.reset(origHead));
     await state.setRef("ORIG_HEAD", headId);
     await this.removeState();
     return { status: "ok", newHead: origHead, picked: [], output: [] };
@@ -468,16 +481,20 @@ export class PickSequencer {
     author: PersonIdent,
     committer: PersonIdent,
     message: string,
+    reflogMessage: string,
   ): Promise<ObjectId> {
     const id = await this.deps.commits.store({ tree, parents, author, committer, message });
-    await this.moveHead(id);
+    await this.moveHead(id, reflogMessage);
     return id;
   }
 
-  private async moveHead(id: ObjectId): Promise<void> {
-    const head = await this.deps.refs.get("HEAD");
-    if (head && isSymbolicRef(head)) await this.deps.refs.set(head.target, id);
-    else await this.deps.refs.set("HEAD", id);
+  /** HEAD (its branch, when attached) moved to `id`, with `message` in the reflogs. */
+  private async moveHead(id: ObjectId, message: string): Promise<void> {
+    await updateHead(
+      this.deps.refs,
+      id,
+      reflogLine(this.deps.workingCopy, message, this.options.committer),
+    );
   }
 
   private async headId(): Promise<ObjectId> {

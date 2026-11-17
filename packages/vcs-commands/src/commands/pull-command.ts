@@ -1,13 +1,12 @@
+import { parseGitBool } from "@statewalker/vcs-utils";
+
 import { NoHeadError } from "../errors/index.js";
-import {
-  type FastForwardMode,
-  isMergeSuccessful,
-  type MergeStrategy,
-} from "../results/merge-result.js";
+import { FastForwardMode, isMergeSuccessful, type MergeStrategy } from "../results/merge-result.js";
 import type { PullResult } from "../results/pull-result.js";
-import { isRebaseSuccessful } from "../results/rebase-result.js";
+import { isRebaseSuccessful, RebaseStatus } from "../results/rebase-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { FetchCommand, type TagOption } from "./fetch-command.js";
+import { MergeBaseGraph } from "./merge-bases.js";
 import { MergeCommand } from "./merge-command.js";
 import { configValue } from "./merge-config.js";
 import { RebaseCommand } from "./rebase-command.js";
@@ -34,7 +33,7 @@ import { RebaseCommand } from "./rebase-command.js";
  *   .setRemoteBranchName("develop")
  *   .call();
  *
- * // Pull with rebase (not yet implemented)
+ * // Pull with rebase (`git pull --rebase`; without the option, pull.rebase decides)
  * const result = await git.pull()
  *   .setRebase(true)
  *   .call();
@@ -42,8 +41,13 @@ import { RebaseCommand } from "./rebase-command.js";
  */
 export class PullCommand extends TransportCommand<PullResult> {
   private remote = "origin";
+  /** Whether the remote was named (it is then in the reflog action). */
+  private remoteGiven = false;
   private remoteBranchName?: string;
-  private rebase = false;
+  /** `--rebase` / `--no-rebase`; undefined: branch.<name>.rebase, then pull.rebase */
+  private rebase?: boolean;
+  /** `--autostash` / `--no-autostash`; undefined: pull.autoStash, then rebase.autoStash */
+  private autoStash?: boolean;
   private strategy?: MergeStrategy;
   private fastForwardMode?: FastForwardMode;
   private tagOption?: TagOption;
@@ -58,6 +62,7 @@ export class PullCommand extends TransportCommand<PullResult> {
   setRemote(remote: string): this {
     this.checkCallable();
     this.remote = remote;
+    this.remoteGiven = true;
     return this;
   }
 
@@ -89,9 +94,9 @@ export class PullCommand extends TransportCommand<PullResult> {
   }
 
   /**
-   * Set whether to use rebase instead of merge.
-   *
-   * Note: Rebase is not yet implemented.
+   * Set whether to use rebase instead of merge (`--rebase` / `--no-rebase`). Without it the
+   * configuration decides, as in git: `branch.<name>.rebase`, else `pull.rebase`, else merge.
+   * Only this option puts `--rebase` in the reflog lines (git's are the command line's).
    *
    * @param rebase Whether to use rebase
    */
@@ -102,10 +107,22 @@ export class PullCommand extends TransportCommand<PullResult> {
   }
 
   /**
-   * Whether rebase mode is enabled.
+   * Whether rebase mode was requested with {@link setRebase} (the configuration aside).
    */
   isRebase(): boolean {
-    return this.rebase;
+    return this.rebase ?? false;
+  }
+
+  /**
+   * Stash local changes away and apply them again after the pull (`--autostash` /
+   * `--no-autostash`). Default `pull.autoStash`, then for a rebase `rebase.autoStash` (a
+   * merge reads `merge.autoStash` itself). A rebasing pull without it refuses a dirty tree
+   * before fetching, as git's `require_clean_work_tree("pull with rebase")`.
+   */
+  setAutoStash(autoStash: boolean): this {
+    this.checkCallable();
+    this.autoStash = autoStash;
+    return this;
   }
 
   /**
@@ -181,10 +198,48 @@ export class PullCommand extends TransportCommand<PullResult> {
     // Build refspec
     const refspec = `refs/heads/${remoteBranch}:refs/remotes/${this.remote}/${remoteBranch}`;
 
+    // git's GIT_REFLOG_ACTION for everything the pull writes: "pull" and its command-line
+    // arguments (a rebase or autostash the configuration asks for is not among them)
+    const action = this.reflogAction(
+      [
+        "pull",
+        ...(this.rebase === true ? ["--rebase"] : this.rebase === false ? ["--no-rebase"] : []),
+        ...(this.autoStash === true
+          ? ["--autostash"]
+          : this.autoStash === false
+            ? ["--no-autostash"]
+            : []),
+        ...(this.remoteGiven || this.remoteBranchName ? [this.remote] : []),
+        ...(this.remoteBranchName ? [this.remoteBranchName] : []),
+      ].join(" "),
+    );
+
+    // git's pull.c: the option, else the configuration
+    const rebase = this.rebase ?? this.configRebase(localBranchName);
+    const pullAutoStash = this.autoStash ?? parseGitBool(this.config("pull.autoStash"));
+    const autoStash = rebase
+      ? (pullAutoStash ?? parseGitBool(this.config("rebase.autoStash")) ?? false)
+      : pullAutoStash;
+    if (rebase && !autoStash) {
+      // require_clean_work_tree("pull with rebase"), before anything is fetched
+      const refusal = await new RebaseCommand(this._workingCopy).checkCleanWorkTree(
+        "pull with rebase",
+      );
+      if (refusal) {
+        return {
+          rebaseResult: refusal,
+          successful: false,
+          rebaseUsed: true,
+          fetchedFrom: this.remote,
+        };
+      }
+    }
+
     // Execute fetch
     const fetchCommand = new FetchCommand(this._workingCopy);
     fetchCommand.setRemote(this.remote);
     fetchCommand.setRefSpecs(refspec);
+    fetchCommand.setReflogAction(action);
 
     if (this.credentials) {
       fetchCommand.setCredentials(this.credentials);
@@ -232,9 +287,17 @@ export class PullCommand extends TransportCommand<PullResult> {
     }
 
     // `git pull --rebase`: the branch rebased onto what was fetched
-    if (this.rebase) {
+    // (one that only fast-forwards is a `merge --ff-only --autostash`, as git's pull runs it)
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    const canFastForward =
+      rebase &&
+      headId !== undefined &&
+      (await this.canFastForward(headId, trackingRefResolved.objectId));
+    if (rebase && !canFastForward) {
       const rebaseResult = await new RebaseCommand(this._workingCopy)
         .setUpstream(trackingRefResolved.objectId)
+        .setReflogAction(action)
+        .setAutoStash(autoStash === true)
         .call();
       return {
         fetchResult,
@@ -255,22 +318,74 @@ export class PullCommand extends TransportCommand<PullResult> {
     const into =
       localBranchName === "main" || localBranchName === "master" ? "" : ` into ${localBranchName}`;
     mergeCommand.setMessage(`Merge branch '${remoteBranch}' of ${url}${into}\n`);
+    mergeCommand.setReflogAction(action);
+    if (canFastForward) mergeCommand.setFastForwardMode(FastForwardMode.FF_ONLY);
+    // run_merge passes --autostash / --no-autostash only when pull has one to give
+    if (autoStash !== undefined) mergeCommand.setAutoStash(autoStash);
 
     if (this.strategy) {
       mergeCommand.setStrategy(this.strategy);
     }
-    if (this.fastForwardMode) {
+    if (this.fastForwardMode && !canFastForward) {
       mergeCommand.setFastForwardMode(this.fastForwardMode);
     }
 
     const mergeResult = await mergeCommand.call();
+    const successful = isMergeSuccessful(mergeResult.status);
 
+    if (canFastForward) {
+      // a rebasing pull still reports a rebase: the fast-forward it made instead
+      return {
+        fetchResult,
+        mergeResult,
+        rebaseResult: successful
+          ? { status: RebaseStatus.FAST_FORWARD, newHead: mergeResult.newHead }
+          : { status: RebaseStatus.FAILED, message: mergeResult.message },
+        successful,
+        rebaseUsed: true,
+        fetchedFrom: this.remote,
+      };
+    }
     return {
       fetchResult,
       mergeResult,
-      successful: isMergeSuccessful(mergeResult.status),
+      successful,
       rebaseUsed: false,
       fetchedFrom: this.remote,
     };
+  }
+
+  private config(key: string): string | undefined {
+    return configValue(this._workingCopy, key);
+  }
+
+  /**
+   * git's config_get_rebase: `branch.<name>.rebase`, else `pull.rebase`; any value other
+   * than false (`true`, `merges`, `interactive`) rebases.
+   */
+  private configRebase(branch: string): boolean {
+    for (const key of [`branch.${branch}.rebase`, "pull.rebase"]) {
+      const value = this.config(key);
+      if (value === undefined) continue;
+      return parseGitBool(value) ?? true;
+    }
+    return false;
+  }
+
+  /**
+   * git's get_can_ff: whether `head` is a merge base of itself and `upstream` (an ancestor
+   * of it), by git's date-ordered paint walk, which stops once the sides meet.
+   */
+  private async canFastForward(head: string, upstream: string): Promise<boolean> {
+    if (head === upstream) return true;
+    const graph = new MergeBaseGraph({
+      load: async (id) => {
+        const commit = await this.commits.load(id).catch(() => undefined);
+        return commit ? { parents: commit.parents, date: commit.committer.timestamp } : undefined;
+      },
+      tree: async () => new Map(),
+    });
+    const bases = await graph.mergeBases(graph.commit(head), graph.commit(upstream));
+    return bases.some((b) => b.id === head);
   }
 }

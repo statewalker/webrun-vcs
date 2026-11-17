@@ -6,13 +6,40 @@
  * @module
  */
 
-import type { LinkedWorktrees, WorkingCopy, WorktreeInfo } from "@statewalker/vcs-working-tree";
+import type {
+  LinkedWorktrees,
+  WorkingCopy,
+  WorktreeAdmin,
+  WorktreeInfo,
+} from "@statewalker/vcs-working-tree";
 
 import {
   BranchUsedByWorktreeError,
   WorktreeError,
   WorktreesUnsupportedError,
 } from "../errors/index.js";
+
+/**
+ * A working copy for the `git worktree` commands from a {@link WorktreeAdmin}: the admin's
+ * working copy when it has one, else (a bare repository) its history, configuration and
+ * worktrees, with every part of a working tree (index, files, stash, HEAD helpers) refused
+ * as git refuses them there: `this operation must be run in a work tree`.
+ */
+export function worktreeAdminWorkingCopy(admin: WorktreeAdmin): WorkingCopy {
+  if ("checkout" in admin) return admin as WorkingCopy;
+  const refuse = (): never => {
+    throw new WorktreeError("this operation must be run in a work tree");
+  };
+  const base = { history: admin.history, config: admin.config, worktrees: admin.worktrees };
+  return new Proxy(base, {
+    get(target, key, receiver) {
+      if (key in target) return Reflect.get(target, key, receiver);
+      if (typeof key === "symbol" || key === "then") return undefined;
+      return refuse();
+    },
+    has: (target, key) => key in target,
+  }) as unknown as WorkingCopy;
+}
 
 /** The working copy's worktrees, or WorktreesUnsupportedError for a backend without them. */
 export function requireWorktrees(workingCopy: WorkingCopy, operation: string): LinkedWorktrees {

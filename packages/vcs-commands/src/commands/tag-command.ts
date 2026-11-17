@@ -1,5 +1,6 @@
 import type { AnnotatedTag, ObjectId, PersonIdent, Ref } from "@statewalker/vcs-core";
 import { compareRefNames, isValidTagName, ObjectType } from "@statewalker/vcs-core";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import {
   InvalidTagNameError,
@@ -7,7 +8,8 @@ import {
   RefNotFoundError,
   StoreNotAvailableError,
 } from "../errors/index.js";
-import { GitCommand } from "../git-command.js";
+import { type CommandCommits, GitCommand } from "../git-command.js";
+import { abbrevLengths } from "./core-config.js";
 
 /**
  * Get current timezone offset as string (+HHMM or -HHMM).
@@ -229,7 +231,15 @@ export class TagCommand extends GitCommand<Ref> {
       tagObjectId = targetId;
     }
 
-    await this.refsStore.set(refName, tagObjectId);
+    // git's create_reflog_msg; refs/tags/ is logged only with core.logAllRefUpdates=always
+    // or an existing reflog
+    const log = await tagReflogMessage(
+      this.workingCopy,
+      { commits: this.commits, trees: this.trees, blobs: this.blobs, tags: this.tagsStore },
+      targetId,
+      this.hasReflogAction() ? this.reflogAction("tag") : undefined,
+    );
+    await this.refsStore.set(refName, tagObjectId, this.reflogLine(log));
 
     this.setCallable(false);
 
@@ -324,4 +334,47 @@ export class ListTagCommand extends GitCommand<Ref[]> {
 
     return tags;
   }
+}
+
+/**
+ * git's create_reflog_msg (builtin/tag.c): `tag: tagging <abbrev> (<what>)`, or
+ * `<GIT_REFLOG_ACTION> (<what>)` when an action is set. `<what>` is the commit's
+ * `<subject>, <YYYY-MM-DD>`, else `tree object`, `blob object`, `other tag object`, or
+ * `object of unknown type`.
+ */
+async function tagReflogMessage(
+  workingCopy: WorkingCopy,
+  stores: {
+    commits: CommandCommits;
+    trees: { has(id: ObjectId): Promise<boolean> };
+    blobs: { has(id: ObjectId): Promise<boolean> };
+    tags?: { has(id: ObjectId): Promise<boolean> };
+  },
+  target: ObjectId,
+  action?: string,
+): Promise<string> {
+  const has = async (store: { has(id: ObjectId): Promise<boolean> } | undefined) =>
+    (await store?.has(target).catch(() => false)) ?? false;
+  const commit = await stores.commits.load(target).catch(() => undefined);
+  let what: string;
+  if (commit) {
+    const date = new Date(commit.committer.timestamp * 1000).toISOString().slice(0, 10);
+    what = `${commitSubject(commit.message)}, ${date}`;
+  } else if (await has(stores.trees)) what = "tree object";
+  else if (await has(stores.blobs)) what = "blob object";
+  else if (await has(stores.tags)) what = "other tag object";
+  else what = "object of unknown type";
+  if (action !== undefined) return `${action} (${what})`;
+  const abbrev = (await abbrevLengths(workingCopy, [target])).get(target) ?? 7;
+  return `tag: tagging ${target.slice(0, abbrev)} (${what})`;
+}
+
+/** git's find_commit_subject: the first paragraph (whitespace collapses in the reflog). */
+function commitSubject(message: string): string {
+  const lines = message.split("\n");
+  let start = 0;
+  while (start < lines.length && lines[start]?.trim() === "") start++;
+  const out: string[] = [];
+  for (let i = start; i < lines.length && lines[i]?.trim() !== ""; i++) out.push(lines[i] ?? "");
+  return out.join(" ");
 }
