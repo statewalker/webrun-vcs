@@ -342,7 +342,7 @@ describe("GitWorkingCopyConfig <-> native git", () => {
     it("an integer must fit git's int, with its unit (git_parse_int: ERANGE)", async () => {
       const values = [
         "2147483648",
-        "-2147483648",
+        "-2147483649",
         "4294967296",
         "0x80000000",
         "2g",

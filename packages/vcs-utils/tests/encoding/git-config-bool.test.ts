@@ -41,7 +41,7 @@ describe("parseGitBool (git_config_bool)", () => {
   it("an integer must fit git's int, with its unit (git_parse_int: ERANGE)", () => {
     for (const text of [
       "2147483648",
-      "-2147483648",
+      "-2147483649",
       "4294967296",
       "0x80000000",
       "020000000000",
@@ -55,7 +55,10 @@ describe("parseGitBool (git_config_bool)", () => {
     }
     expect(parseGitBool(1.5)).toBeUndefined();
     expect(parseGitBool(2147483648)).toBeUndefined();
-    expect(parseGitBool(-2147483648)).toBeUndefined();
+    expect(parseGitBool(-2147483649)).toBeUndefined();
+    // INT_MIN fits an int: git 2.5x accepts it (2.43 refused it, an off-by-one since fixed)
+    expect(parseGitBool(-2147483648)).toBe(true);
+    expect(parseGitBool("-2147483648")).toBe(true);
     expect(parseGitBool(Number.POSITIVE_INFINITY)).toBeUndefined();
     for (const text of ["2147483647", "-2147483647", "1g", "0x7fffffff", "017777777777"]) {
       expect([text, parseGitBool(text)]).toEqual([text, true]);

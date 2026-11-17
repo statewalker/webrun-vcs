@@ -17,8 +17,9 @@
  * `false`/`no`/`off` match in any case; anything else must be an integer as `git_parse_int`
  * reads it (leading whitespace, a sign, decimal, `0x` hex or `0` octal digits, an optional
  * `k`/`m`/`g` unit), true when it is not zero. The integer must fit git's `int` with the unit
- * applied: its magnitude at most 2147483647 on either side (`git_parse_signed` checks the
- * negative side against `-max`, so `-2147483648` is refused too, as are `2g` and `1.5`).
+ * applied: within the range of an `int` (`2g` and `1.5` are refused). `-2147483648` itself is
+ * accepted, as git 2.5x accepts it (git 2.43's `git_parse_signed` still refused it: an
+ * off-by-one since fixed).
  *
  * @module
  */
@@ -27,6 +28,7 @@ const INTEGER = /^[ \t\n\v\f\r]*[+-]?(?:0[xX]([0-9a-fA-F]+)|([0-9]+))([kKmMgG]?)
 
 /** git's `int` limit: `git_parse_int` refuses a magnitude above it (ERANGE). */
 const INT_MAX = 2147483647;
+const INT_MIN = -2147483648;
 
 const UNIT_FACTOR: Record<string, bigint> = {
   "": 1n,
@@ -47,7 +49,9 @@ export function parseGitBool(value: unknown): boolean | undefined {
   if (typeof value === "number") {
     // the config reader hands `k = 1.5` over as the number 1.5; git refuses it, and any
     // integer outside its `int`
-    return Number.isInteger(value) && Math.abs(value) <= INT_MAX ? value !== 0 : undefined;
+    return Number.isInteger(value) && value >= INT_MIN && value <= INT_MAX
+      ? value !== 0
+      : undefined;
   }
   const text = String(value);
   if (text === "") return false;
@@ -64,6 +68,7 @@ export function parseGitBool(value: unknown): boolean | undefined {
   const magnitude =
     BigInt(m[1] !== undefined ? `0x${digits}` : octal ? `0o${digits.slice(1)}` : digits) *
     UNIT_FACTOR[m[3].toLowerCase()];
-  if (magnitude > BigInt(INT_MAX)) return undefined; // ERANGE: git refuses it
+  const negative = text.trimStart().startsWith("-");
+  if (magnitude > (negative ? -BigInt(INT_MIN) : BigInt(INT_MAX))) return undefined; // ERANGE
   return magnitude !== 0n;
 }
