@@ -60,6 +60,7 @@ import {
   pruneEmptyParents,
   worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
+import { refuseIfCheckedOut } from "./worktree-support.js";
 
 /** Names a branch checkout in failure messages. */
 const CHECKOUT = "checkout";
@@ -147,6 +148,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private paths: string[] = [];
   private allPaths = false;
   private stage: CheckoutStage | undefined;
+  private ignoreOtherWorktrees = false;
 
   /**
    * Set the name of the branch or commit to check out.
@@ -211,6 +213,21 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   setForced(force: boolean): this {
     this.checkCallable();
     this.force = force;
+    return this;
+  }
+
+  /**
+   * Check out a branch even when another worktree has it checked out (git's
+   * `--ignore-other-worktrees`). Without it such a checkout is refused with
+   * `BranchUsedByWorktreeError` ("'x' is already used by worktree at '<path>'"), where the
+   * backend keeps linked worktrees (`WorkingCopy.worktrees`).
+   *
+   * @param ignore Whether to ignore other worktrees
+   * @returns this for chaining
+   */
+  setIgnoreOtherWorktrees(ignore: boolean): this {
+    this.checkCallable();
+    this.ignoreOtherWorktrees = ignore;
     return this;
   }
 
@@ -362,6 +379,15 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private async checkoutBranch(): Promise<CheckoutResult> {
     if (!this.name) {
       throw new MissingArgumentError("name", "Branch name is required for checkout");
+    }
+
+    // git's die_if_checked_out: a branch another worktree has checked out is not switched to
+    const worktrees = this.workingCopy.worktrees;
+    if (worktrees && !this.ignoreOtherWorktrees && !this.createBranch && !this.orphan) {
+      const ref = `refs/heads/${this.name}`;
+      if (isValidBranchName(this.name) && (await this.refsStore.has(ref))) {
+        await refuseIfCheckedOut(worktrees, ref, true);
+      }
     }
 
     // Create branch if requested

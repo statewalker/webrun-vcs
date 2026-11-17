@@ -14,6 +14,7 @@
 
 import type { History, ObjectId } from "@statewalker/vcs-core";
 import type { Checkout } from "./checkout/checkout.js";
+import type { LinkedWorktrees } from "./linked-worktrees/index.js";
 import type { RepositoryStatus, StatusOptions } from "./status/index.js";
 import type { RepositoryStateValue, StateCapabilities } from "./working-copy/repository-state.js";
 import type { Worktree } from "./worktree/index.js";
@@ -211,6 +212,12 @@ export interface WorkingCopy {
   /** Working copy local configuration */
   readonly config: WorkingCopyConfig;
 
+  /**
+   * The repository's worktrees (main and linked, `git worktree`), where the backend keeps
+   * them; undefined for a backend without linked worktrees.
+   */
+  readonly worktrees?: LinkedWorktrees;
+
   // ============ HEAD Management ============
 
   /**
@@ -329,6 +336,11 @@ export interface AddWorktreeOptions {
    * git's default reason, `added with --lock`, a string is the reason itself.
    */
   lock?: boolean | string;
+  /**
+   * The identity of the new HEAD's reflog line (`Name <email> 1700000000 +0000`). Default:
+   * `user.name` / `user.email` of the repository's configuration, at the current time.
+   */
+  ident?: string;
 }
 
 /**

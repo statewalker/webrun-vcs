@@ -42,3 +42,13 @@ export * from "./stash-list-command.js";
 export * from "./stash-working-tree.js";
 export * from "./status-command.js";
 export * from "./tag-command.js";
+export * from "./worktree-add-command.js";
+export * from "./worktree-list-command.js";
+export * from "./worktree-lock-command.js";
+export * from "./worktree-prune-command.js";
+export * from "./worktree-remove-command.js";
+export * from "./worktree-repair-command.js";
+export {
+  parseExpiry,
+  type WorktreeExpiry,
+} from "./worktree-support.js";

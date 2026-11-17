@@ -1,6 +1,8 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import { WorktreePruneCommand } from "./worktree-prune-command.js";
 
 /**
  * Result of garbage collection
@@ -14,6 +16,11 @@ export interface GCCommandResult {
   refsPacked: boolean;
   /** Duration of the GC operation in milliseconds */
   durationMs: number;
+  /**
+   * The linked worktrees whose administrative files were pruned (`git worktree prune
+   * --expire <gc.worktreePruneExpire>`, default `3.months.ago`), where the backend keeps them.
+   */
+  worktreesPruned: string[];
 }
 
 /**
@@ -131,6 +138,15 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       refsPacked = true;
     }
 
+    // git gc prunes the administrative files of gone worktrees (gc.worktreePruneExpire)
+    const worktreesPruned: string[] = [];
+    if (this.workingCopy.worktrees) {
+      const expire =
+        RemoteConfigStore.from(this.workingCopy).value("gc.worktreePruneExpire") ?? "3.months.ago";
+      const { pruned } = await new WorktreePruneCommand(this.workingCopy).setExpire(expire).call();
+      for (const p of pruned) worktreesPruned.push(p.id);
+    }
+
     // Note: Full GC requires Repository.gc which provides access to
     // GCController with collectGarbage(). This command provides the
     // interface but full implementation requires Repository access.
@@ -150,6 +166,7 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       bytesFreed,
       refsPacked,
       durationMs: Date.now() - startTime,
+      worktreesPruned,
     };
   }
 }

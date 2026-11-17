@@ -5,7 +5,7 @@ import {
   type RefspecResolver,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
-import { entryStatOf, type Worktree } from "@statewalker/vcs-working-tree";
+import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CloneCheckoutError,
@@ -19,7 +19,7 @@ import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js"
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
-import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
+import { checkoutFreshTree } from "./tree-restore.js";
 
 /** Names the clone's checkout in failure messages. */
 const CLONE = "clone";
@@ -672,40 +672,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const commit = await this.commits.load(commitId).catch(() => undefined);
     if (!commit) return [];
     const worktree = this.bare ? undefined : this.worktreeAccess;
-    if (!worktree) {
-      await this.staging.readTree(this.trees, commit.tree);
-      await this.staging.write();
-      return [];
-    }
-
-    // every path checked (verify_path, collisions) before the first file is written
-    const plan = await planTreeRestore(this.trees, this.blobs, commit.tree, CLONE, {
-      symlinks: true,
-      ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
-      windows: worktree.capabilities?.windowsPaths === true,
-      reservedNames: worktree.capabilities?.reservedNames,
-    });
-    const symlinks = this.symlinksEnabled(worktree);
-    await writeTreeRestorePlan(worktree, this.blobs, plan, CLONE, { symlinks, gitlinks: true });
-
-    // the index records what was written (the worktree's stat of each file, a link's
-    // own when the worktree can lstat): native git then sees the files unchanged
-    await this.staging.readTree(this.trees, commit.tree);
-    const editor = this.staging.createEditor();
-    for (const { path, objectId, mode } of plan.entries) {
-      const stats = await worktree.getEntry(path);
-      if (stats) {
-        editor.upsert({
-          path,
-          objectId,
-          mode,
-          ...entryStatOf(stats),
-        });
-      }
-    }
-    await editor.finish();
-    await this.staging.write();
-    return plan.collided;
+    return checkoutFreshTree(
+      {
+        trees: this.trees,
+        blobs: this.blobs,
+        staging: this.staging,
+        worktree,
+        symlinks: worktree ? this.symlinksEnabled(worktree) : false,
+        ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      },
+      commit.tree,
+      CLONE,
+    );
   }
 
   /** Whether symlinks are written as links: the worktree can, and `core.symlinks` allows. */

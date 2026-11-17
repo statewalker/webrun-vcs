@@ -43,6 +43,14 @@ import {
   StashListCommand,
   StatusCommand,
   TagCommand,
+  WorktreeAddCommand,
+  WorktreeListCommand,
+  WorktreeLockCommand,
+  WorktreeMoveCommand,
+  WorktreePruneCommand,
+  WorktreeRemoveCommand,
+  WorktreeRepairCommand,
+  WorktreeUnlockCommand,
 } from "./commands/index.js";
 
 /**
@@ -910,6 +918,66 @@ export class Git implements Disposable {
   }
 
   // ============ Lifecycle ============
+
+  // ============ Worktrees ============
+
+  /**
+   * Add a linked worktree (`git worktree add`).
+   *
+   * Needs a backend that keeps linked worktrees (`WorkingCopy.worktrees`); others throw
+   * `WorktreesUnsupportedError`, as every `worktree*()` command does.
+   *
+   * @example
+   * ```typescript
+   * await git.worktreeAdd().setPath("../hotfix").setNewBranch("hotfix").call();
+   * ```
+   */
+  worktreeAdd(): WorktreeAddCommand {
+    this.checkClosed();
+    return new WorktreeAddCommand(this._workingCopy);
+  }
+
+  /** List the worktrees (`git worktree list`). */
+  worktreeList(): WorktreeListCommand {
+    this.checkClosed();
+    return new WorktreeListCommand(this._workingCopy);
+  }
+
+  /** Prune the administrative files of gone worktrees (`git worktree prune`). */
+  worktreePrune(): WorktreePruneCommand {
+    this.checkClosed();
+    return new WorktreePruneCommand(this._workingCopy);
+  }
+
+  /** Lock a linked worktree (`git worktree lock`). */
+  worktreeLock(): WorktreeLockCommand {
+    this.checkClosed();
+    return new WorktreeLockCommand(this._workingCopy);
+  }
+
+  /** Unlock a linked worktree (`git worktree unlock`). */
+  worktreeUnlock(): WorktreeUnlockCommand {
+    this.checkClosed();
+    return new WorktreeUnlockCommand(this._workingCopy);
+  }
+
+  /** Remove a linked worktree (`git worktree remove`). */
+  worktreeRemove(): WorktreeRemoveCommand {
+    this.checkClosed();
+    return new WorktreeRemoveCommand(this._workingCopy);
+  }
+
+  /** Move a linked worktree (`git worktree move`). */
+  worktreeMove(): WorktreeMoveCommand {
+    this.checkClosed();
+    return new WorktreeMoveCommand(this._workingCopy);
+  }
+
+  /** Repair the links between worktrees and the repository (`git worktree repair`). */
+  worktreeRepair(): WorktreeRepairCommand {
+    this.checkClosed();
+    return new WorktreeRepairCommand(this._workingCopy);
+  }
 
   /**
    * Close the Git instance.

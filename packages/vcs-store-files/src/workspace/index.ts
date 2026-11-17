@@ -1,6 +1,7 @@
 // File-based workspace implementations
 export * from "./checkout/index.js";
 export * from "./git-dir/index.js";
+export * from "./linked-worktrees/index.js";
 export * from "./staging/index.js";
 export * from "./transformation/index.js";
 export * from "./working-copy/index.js";

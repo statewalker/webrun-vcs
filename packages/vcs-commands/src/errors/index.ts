@@ -10,3 +10,4 @@ export * from "./remote-errors.js";
 export * from "./stash-errors.js";
 export * from "./tag-errors.js";
 export * from "./transport-errors.js";
+export * from "./worktree-errors.js";

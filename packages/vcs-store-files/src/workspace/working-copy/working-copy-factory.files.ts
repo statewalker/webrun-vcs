@@ -17,7 +17,13 @@ import type {
   Worktree,
 } from "@statewalker/vcs-working-tree";
 
-import { isAbsoluteGitPath, parseCommonDir } from "../git-dir/index.js";
+import {
+  HostPaths,
+  hostRootOf,
+  isAbsoluteGitPath,
+  parseCommonDir,
+  sanitizeRefnameComponent,
+} from "../git-dir/index.js";
 import { createGitStashStore } from "./stash-store.files.js";
 import { GitWorkingCopy, type WorkingCopyFilesApi } from "./working-copy.files.js";
 import {
@@ -25,6 +31,8 @@ import {
   createWorkingCopyConfig,
   type GitConfigOptions,
 } from "./working-copy-config.files.js";
+
+const ZERO_ID = "0000000000000000000000000000000000000000";
 
 /**
  * Combined files API for all working copy operations
@@ -93,7 +101,7 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
    */
   private async openConfig(gitDir: string, commonDir?: string) {
     const common = commonDir ?? (await this.commonDirOf(gitDir));
-    const root = this.hostRoot()?.base;
+    const root = this.paths().root;
     const gitDirPath =
       root !== undefined && !gitDir.startsWith("/")
         ? `${root}/${gitDir.replace(/^\.\//, "")}`
@@ -176,63 +184,28 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     });
   }
 
-  /**
-   * Where this FilesApi's root is on the host (`rootPath`, else its `rootDirectory`), without
-   * trailing slashes (`""` for `/`); undefined when unknown. A Windows root (`C:\\Users\\x`, a
-   * UNC `\\\\server\\share`) is written with forward slashes, as Git for Windows writes paths
-   * (`C:/Users/x`).
-   */
-  private hostRoot(): { base: string; windows: boolean } | undefined {
-    const root = this.setup.rootPath ?? (this.files as { rootDirectory?: unknown }).rootDirectory;
-    if (typeof root !== "string" || root === "") return undefined;
-    const windows = /^[A-Za-z]:/.test(root) || root.startsWith("\\");
-    const slashed = windows ? root.replace(/\\/g, "/") : root;
-    return { base: slashed.replace(/\/+$/, ""), windows };
+  /** Where this FilesApi's root is on the host (`rootPath`, else its `rootDirectory`). */
+  private paths(): HostPaths {
+    return new HostPaths(hostRootOf(this.files, this.setup.rootPath));
   }
 
-  /**
-   * The path git writes for `path` (a path in this FilesApi): absolute on the host when the
-   * FilesApi's root is known (`rootPath`, else its `rootDirectory`), as git writes a
-   * worktree's real paths; else `path` itself.
-   */
+  /** The path git writes for `path` (a path in this FilesApi). */
   private hostPath(path: string): string {
-    const root = this.hostRoot();
-    if (root === undefined) return path;
-    const inner = path
-      .split("/")
-      .filter((p) => p !== "" && p !== ".")
-      .join("/");
-    return inner === "" ? root.base || "/" : `${root.base}/${inner}`;
+    return this.paths().hostPath(path);
   }
 
-  /**
-   * The path in this FilesApi an absolute host path names (an absolute `commondir`): the
-   * part below the FilesApi's root on the host, as `FileWorktree` maps an absolute gitfile
-   * target. Returned as written when the root is unknown or the path lies outside it: such a
-   * repository is beyond what this FilesApi can name, and reading it fails as a missing one.
-   */
+  /** The path in this FilesApi an absolute host path names (an absolute `commondir`). */
   private filesPath(hostPath: string): string {
-    const root = this.hostRoot();
-    if (root === undefined) return hostPath;
-    // `.` and `..` resolved, separators collapsed (a leading `//`, a UNC root, kept)
-    const normalize = (path: string) => {
-      const slashed = root.windows ? path.replace(/\\/g, "/") : path;
-      const lead = /^\/*/.exec(slashed)?.[0] ?? "";
-      const parts: string[] = [];
-      for (const part of slashed.slice(lead.length).split("/")) {
-        if (part === "..") parts.pop();
-        else if (part !== "." && part !== "") parts.push(part);
-      }
-      return `${lead.length >= 2 && root.windows ? "//" : lead ? "/" : ""}${parts.join("/")}`;
-    };
-    const target = normalize(hostPath);
-    const base = root.base === "" ? "" : normalize(root.base).replace(/\/$/, "");
-    const same = (a: string, b: string) =>
-      root.windows ? a.toLowerCase() === b.toLowerCase() : a === b;
-    if (same(target, base)) return "/";
-    const prefix = `${base}/`;
-    if (!same(target.slice(0, prefix.length), prefix)) return hostPath;
-    return `/${target.slice(prefix.length)}`;
+    return this.paths().filesPath(hostPath);
+  }
+
+  /** The identity of a reflog line written now: `user.name` and `user.email`, else the default. */
+  private async reflogIdent(gitDir: string): Promise<string> {
+    const config = await this.openConfig(gitDir, gitDir);
+    const name = config.get("user.name");
+    const email = config.get("user.email");
+    const who = `${typeof name === "string" ? name : "webrun-vcs"} <${typeof email === "string" ? email : "vcs@localhost"}>`;
+    return `${who} ${Math.floor(Date.now() / 1000)} +0000`;
   }
 
   /**
@@ -244,9 +217,12 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
    * - `.git/worktrees/NAME/commondir`: `../..`, the repository the worktree belongs to
    * - `.git/worktrees/NAME/gitdir`: the path back to the worktree's `.git` file
    * - `.git/worktrees/NAME/locked`: the lock reason, with `lock`
+   * - `.git/worktrees/NAME/logs/HEAD`: the line git's `update-ref` / `symbolic-ref` log for
+   *   the new HEAD (zero id to the commit, no message), when HEAD resolves to a commit
    * - the worktree's `.git` file: `gitdir: /path/to/main/.git/worktrees/NAME`
    *
-   * NAME is the worktree directory's name, followed by 1, 2, ... when a worktree of that
+   * NAME is the worktree directory's name as a ref component (git's
+   * `sanitize_refname_component`: `a b` gives `a-b`, `.x` gives `-x`), followed by 1, 2, ... when a worktree of that
    * name exists, as git numbers them. With a known host root the paths are absolute host
    * paths, as git writes them, so native git can use the worktree.
    *
@@ -287,8 +263,13 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       head = headRef.objectId;
     }
 
-    // Extract worktree name from path; numbered when taken, as git's add_worktree does
-    const baseName = worktreePath.split("/").filter(Boolean).pop() || "worktree";
+    // The path's last component, made a ref component as git does
+    // (sanitize_refname_component); numbered when taken, as git's add_worktree does
+    const lastComponent = worktreePath.split("/").filter(Boolean).pop() || "worktree";
+    const baseName = sanitizeRefnameComponent(lastComponent);
+    if (baseName === "" || baseName.includes("/")) {
+      throw new Error(`invalid path '${worktreePath}'`);
+    }
     let worktreeName = baseName;
     for (let counter = 1; await this.files.exists(`${gitDir}/worktrees/${worktreeName}`); ) {
       worktreeName = `${baseName}${counter++}`;
@@ -333,6 +314,15 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
 
       // The repository the worktree belongs to, relative to worktrees/NAME (git writes `../..`)
       await this.files.write(`${worktreeGitDir}/commondir`, encodeGitPath("../..\n"));
+
+      // git's update-ref / symbolic-ref of the new HEAD log it: no message, from the zero id
+      const headId = head.startsWith("ref: ")
+        ? (await history.refs.resolve(head.slice(5)))?.objectId
+        : head;
+      if (headId) {
+        const line = `${ZERO_ID} ${headId} ${options.ident ?? (await this.reflogIdent(gitDir))}\n`;
+        await this.files.write(`${worktreeGitDir}/logs/HEAD`, new TextEncoder().encode(line));
+      }
 
       // Set up HEAD in worktrees/NAME. Written plainly, as git's `worktree add` writes the
       // new worktree's HEAD (write_file): worktrees/NAME was created just above and no other

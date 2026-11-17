@@ -1,0 +1,11 @@
+---
+"@statewalker/vcs-working-tree": minor
+"@statewalker/vcs-store-files": minor
+"@statewalker/vcs-commands": minor
+---
+
+**`git worktree` as git does it: add, list, prune, lock, unlock, remove, move, repair.**
+
+- **vcs-commands:** `git.worktreeAdd()` (`-b`/`-B`, `--detach`, `--force` once or twice, `--lock --reason`, `--orphan`, `--no-checkout`, the branch named after the path, `--orphan` inferred in an empty repository; checks the files and index out as git's `reset --hard`, with ORIG_HEAD and git's reflog lines), `worktreeList()` (default, `-v`, `--porcelain`, `-z`, `--expire`; byte for byte as git 2.53+, `setLegacyColumns` for older git), `worktreePrune()` (`-n`, `-v`, `--expire`, duplicates), `worktreeLock()` / `worktreeUnlock()`, `worktreeRemove()` (refuses dirty, untracked, locked and submodule worktrees unless forced), `worktreeMove()` and `worktreeRepair()`, with git's refusals and messages (`WorktreeError`). A backend without linked worktrees gives `WorktreesUnsupportedError`. Other commands respect worktrees: `branch -d/-D` and `branch -f` refuse a branch another worktree uses (`BranchUsedByWorktreeError`, git's message), `branch -m` moves other worktrees' HEAD along, `checkout` refuses a branch checked out elsewhere unless `setIgnoreOtherWorktrees(true)`, and `gc` prunes gone worktrees after `gc.worktreePruneExpire` (default `3.months.ago`; `GCCommandResult.worktreesPruned`). Clone's checkout is shared as `checkoutFreshTree`.
+- **vcs-working-tree:** `LinkedWorktrees` (the storage side of `git worktree`) and `WorkingCopy.worktrees` (optional; `MemoryWorkingCopy` takes it as an option). `AddWorktreeOptions.ident` sets the reflog identity.
+- **vcs-store-files:** `openGitLinkedWorktrees` keeps worktrees as git's `worktree.c` does (`should_prune_worktree`, `validate_worktree`, `find_worktree`, repair) and opens a working copy of any of them (`openCurrent`, `open`). `createWorktreeRefs` gives a linked worktree its own HEAD, pseudo refs, `refs/bisect|worktree|rewritten/` and HEAD reflog, the branches shared, so commands run in a linked worktree move its HEAD, not the main one's. `sanitizeRefnameComponent` and `HostPaths` are exported. `GitWorkingCopyFactory.addWorktree` names the admin directory as git's `sanitize_refname_component` does and writes the HEAD reflog line git writes on add.
