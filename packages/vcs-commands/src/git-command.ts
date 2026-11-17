@@ -434,7 +434,12 @@ export abstract class GitCommand<T> {
    * @returns ObjectId of the resolved ref
    * @throws RefNotFoundError if ref cannot be resolved
    */
-  protected async resolveRef(refName: string): Promise<ObjectId> {
+  protected async resolveRef(name: string): Promise<ObjectId> {
+    // git's interpret_nth_prior_checkout: `@{-N}` is the branch (or commit) left N
+    // checkouts ago
+    const refName = await this.expandPriorCheckout(name);
+    if (refName.startsWith("@{-")) throw new RefNotFoundError(name);
+
     // Handle relative refs like HEAD~1, HEAD^
     if (refName.includes("~") || refName.includes("^")) {
       return this.resolveRelativeRef(refName);
@@ -460,12 +465,48 @@ export abstract class GitCommand<T> {
       return this.peelToCommit(tagRef.objectId);
     }
 
+    // Try as remote-tracking branch (git's dwim rules: refs/remotes/<name>, then its HEAD)
+    for (const candidate of [`refs/remotes/${refName}`, `refs/remotes/${refName}/HEAD`]) {
+      const remoteRef = await this.refsStore.resolve(candidate);
+      if (remoteRef?.objectId) return this.peelToCommit(remoteRef.objectId);
+    }
+
     // Try as direct commit ID
     if (await this.commits.has(refName)) {
       return refName;
     }
 
-    throw new RefNotFoundError(refName);
+    throw new RefNotFoundError(name);
+  }
+
+  /**
+   * git's `interpret_nth_prior_checkout`: the name a leading `@{-N}` stands for, the
+   * branch (or detached commit) the Nth most recent `checkout: moving from <x> to <y>`
+   * line of HEAD's reflog left, followed by the rest of `name` (`@{-1}~2` is `main~2`).
+   * A name without it, or an `@{-N}` the reflog cannot answer, is returned as given.
+   *
+   * @example
+   * ```typescript
+   * await this.expandPriorCheckout("@{-1}"); // "feat" after `checkout feat` + `checkout main`
+   * ```
+   */
+  protected async expandPriorCheckout(name: string): Promise<string> {
+    const match = /^@\{-(\d+)\}/.exec(name);
+    if (!match) return name;
+    const nth = Number.parseInt(match[1] ?? "0", 10);
+    if (!(nth > 0)) return name;
+    const log = await this.refsStore.getReflog?.("HEAD");
+    if (!log) return name;
+    let remaining = nth;
+    for (const entry of await log.getReverseEntries()) {
+      const prefix = "checkout: moving from ";
+      if (!entry.comment.startsWith(prefix)) continue;
+      const rest = entry.comment.slice(prefix.length);
+      const to = rest.indexOf(" to ");
+      if (to < 0) continue;
+      if (--remaining === 0) return rest.slice(0, to) + name.slice(match[0].length);
+    }
+    return name;
   }
 
   /**

@@ -563,6 +563,37 @@ describe("GitWorkingCopyConfig", () => {
       expect(files.text(PATH)).toBe('[remote "b"]\n\turl = one\n');
     });
 
+    it("copySection puts a copy of the section's lines right after it (git branch -c)", async () => {
+      files.set(
+        PATH,
+        '[branch "feat"]\n\t# a comment\n\tdescription = feat desc\n\n[branch "cur"]\n\tremote = origin\n[core]\n\tbare = false\n',
+      );
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.copySection("branch.feat", "branch.cur");
+      config.copySection("branch.core", "branch.none");
+      expect(config.get("branch.cur.description")).toBe("feat desc");
+      expect(config.get("branch.cur.remote")).toBe("origin");
+      expect(config.get("branch.feat.description")).toBe("feat desc");
+
+      await config.save();
+      expect(files.text(PATH)).toBe(
+        '[branch "feat"]\n\t# a comment\n\tdescription = feat desc\n\n[branch "cur"]\n\t# a comment\n\tdescription = feat desc\n\n[branch "cur"]\n\tremote = origin\n[core]\n\tbare = false\n',
+      );
+    });
+
+    it("copySection of the last section, and of a value changed before the save", async () => {
+      files.set(PATH, '[branch "a"]\n\tmerge = refs/heads/a\n');
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.set("branch.a.merge", "refs/heads/x");
+      config.copySection("branch.a", "branch.b");
+      await config.save();
+      expect(files.text(PATH)).toBe(
+        '[branch "a"]\n\tmerge = refs/heads/x\n[branch "b"]\n\tmerge = refs/heads/x\n',
+      );
+    });
+
     it("lists subsections of a section", async () => {
       files.set(
         PATH,

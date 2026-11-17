@@ -432,6 +432,30 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
+   * The options as git's reflog action spells the command line (`GIT_REFLOG_ACTION` is
+   * `fetch` and its arguments), in a fixed order since our options have none:
+   * `--atomic --force --prune --prune-tags --tags --depth=<n> --unshallow --append
+   * --no-write-fetch-head --refmap=<spec>` (and their `--no-` forms where set to false).
+   */
+  private commandLineOptions(): string[] {
+    const flag = (value: boolean | undefined, name: string) =>
+      value === true ? [`--${name}`] : value === false ? [`--no-${name}`] : [];
+    return [
+      ...(this.atomic ? ["--atomic"] : []),
+      ...(this.forceUpdate ? ["--force"] : []),
+      ...flag(this.removeDeletedRefs, "prune"),
+      ...flag(this.pruneTags, "prune-tags"),
+      ...(this.tagOptionSet && this.tagOption === TagOption.FETCH_TAGS ? ["--tags"] : []),
+      ...(this.tagOptionSet && this.tagOption === TagOption.NO_TAGS ? ["--no-tags"] : []),
+      ...(this.depth !== undefined ? [`--depth=${this.depth}`] : []),
+      ...(this.unshallow ? ["--unshallow"] : []),
+      ...(this.appendFetchHead ? ["--append"] : []),
+      ...(this.writeFetchHead ? [] : ["--no-write-fetch-head"]),
+      ...(this.refmap ?? []).map((spec) => `--refmap=${spec}`),
+    ];
+  }
+
+  /**
    * Execute the fetch operation.
    *
    * Runs the transport's fetch client (git's fetch-pack): the local refs are offered as
@@ -547,11 +571,12 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       atomic: this.atomic || undefined,
       dryRun: this.dryRun,
       onProgress: this.progressMessageCallback,
-      // git's "fetch <args>: <what>" per ref; the action from the remote and refspecs named
+      // git's "fetch <args>: <what>" per ref; the action from the options, the remote and
+      // the refspecs given (git's argv)
       reflogAction: this.reflogAction(
         [
           "fetch",
-          ...(this.atomic ? ["--atomic"] : []),
+          ...this.commandLineOptions(),
           ...(this.remoteGiven || this.refSpecs.length > 0 ? [this.remote] : []),
           ...this.refSpecs,
         ].join(" "),

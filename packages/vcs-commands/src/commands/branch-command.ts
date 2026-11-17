@@ -257,6 +257,16 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
       deleted.push(refName);
     }
 
+    // git's delete_branch_config: a deleted branch's `[branch "<name>"]` section goes too
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const configured = new Set(config.subsections("branch"));
+    const sections = deleted
+      .filter((r) => r.startsWith("refs/heads/"))
+      .map((r) => shortBranchName(r))
+      .filter((name) => configured.has(name));
+    for (const name of sections) config.removeSection(`branch.${name}`);
+    if (sections.length > 0) await config.save();
+
     return deleted;
   }
 
@@ -502,10 +512,7 @@ export class RenameBranchCommand extends GitCommand<Ref> {
     // (no log to carry: the new ref gets one only where git creates logs of branches,
     // core.logAllRefUpdates, false by default in a bare repository)
     const config = RemoteConfigStore.from(this.workingCopy);
-    const setting = config.value("core.logAllRefUpdates");
-    const logAll =
-      setting?.trim().toLowerCase() === "always" ||
-      (parseGitBool(setting) ?? !(parseGitBool(config.value("core.bare")) ?? false));
+    const logAll = logsBranches(config);
     const ownLines = [...carried, { oldId: id, newId: id, message, ...log }];
     const created = await this.refsStore.batch(
       [
@@ -531,11 +538,162 @@ export class RenameBranchCommand extends GitCommand<Ref> {
     // git's replace_each_worktree_head_symref logs it
     for (const wt of others) await worktrees?.updateHead(wt, newRefName, { ...log, message });
 
+    // git's copy_or_rename_branch: the branch's configuration follows it
+    // (git_config_rename_section of branch.<old> to branch.<new>)
+    const oldShort = shortBranchName(oldRefName);
+    if (oldShort !== this.newName) {
+      config.renameSection(`branch.${oldShort}`, `branch.${this.newName}`);
+      await config.save();
+    }
+
     this.setCallable(false);
 
     const ref = await this.refsStore.get(newRefName);
     return ref as Ref;
   }
+}
+
+/**
+ * Copy a branch: the new branch at the old one's commit, with a copy of its reflog and of
+ * its configuration (`branch.<old>.*`), as git's `branch -c` (`files_copy_or_rename_ref`
+ * with copy, `git_config_copy_section`). HEAD stays where it is, also when the branch
+ * copied is the current one. Its reflog gets `Branch: copied refs/heads/<old> to
+ * refs/heads/<new>`.
+ *
+ * Equivalent to `git branch -c [<old>] <new>` (`-C` with `setForce`).
+ *
+ * @example
+ * ```typescript
+ * await git.branchCopy().setNewName("feature-backup").call(); // the current branch
+ * await git.branchCopy().setOldName("feature").setNewName("feature2").call();
+ * ```
+ */
+export class CopyBranchCommand extends GitCommand<Ref> {
+  private oldName?: string;
+  private newName?: string;
+  private force = false;
+
+  /** The branch to copy (default: the current one). */
+  setOldName(oldName: string): this {
+    this.checkCallable();
+    this.oldName = oldName;
+    return this;
+  }
+
+  /** The new branch's name. */
+  setNewName(newName: string): this {
+    this.checkCallable();
+    this.newName = newName;
+    return this;
+  }
+
+  /** Overwrite a branch of the new name (`-C`); never one a worktree has checked out. */
+  setForce(force: boolean): this {
+    this.checkCallable();
+    this.force = force;
+    return this;
+  }
+
+  /**
+   * @returns the new branch
+   * @throws InvalidRefNameError for an invalid new name
+   * @throws RefNotFoundError when the branch to copy does not exist (`fatal: no branch
+   *   named 'x'`, or `fatal: no commit on branch 'x' yet` for the current, unborn one)
+   * @throws RefAlreadyExistsError when the new branch exists, without `setForce`
+   * @throws BranchUsedByWorktreeError when it is checked out in a worktree
+   */
+  async call(): Promise<Ref> {
+    this.checkCallable();
+    this.setCallable(false);
+    if (!this.newName) throw new InvalidRefNameError("", "New branch name is required");
+    if (!isValidBranchName(this.newName)) {
+      throw new InvalidRefNameError(
+        this.newName,
+        `fatal: '${this.newName}' is not a valid branch name`,
+      );
+    }
+    const current = await this.getCurrentBranch();
+    let oldRefName: string;
+    if (this.oldName) {
+      oldRefName = this.oldName.startsWith("refs/") ? this.oldName : `refs/heads/${this.oldName}`;
+    } else if (current) {
+      oldRefName = current;
+    } else {
+      throw new RefNotFoundError("HEAD", "fatal: cannot copy the current branch while not on any");
+    }
+    const oldShort = shortBranchName(oldRefName);
+    const newRefName = `refs/heads/${this.newName}`;
+    const oldRef = await this.refsStore.get(oldRefName);
+    const id = oldRef && !isSymbolicRef(oldRef) ? oldRef.objectId : undefined;
+    if (!id) {
+      throw new RefNotFoundError(
+        oldRefName,
+        current === oldRefName
+          ? `fatal: no commit on branch '${oldShort}' yet`
+          : `fatal: no branch named '${oldShort}'`,
+      );
+    }
+
+    // validate_new_branchname (validate_branchname when copying a branch onto itself)
+    if (newRefName !== oldRefName && (await this.refsStore.has(newRefName))) {
+      if (!this.force) {
+        throw new RefAlreadyExistsError(
+          newRefName,
+          `fatal: a branch named '${this.newName}' already exists`,
+        );
+      }
+      const worktrees = this.workingCopy.worktrees;
+      const user = worktrees
+        ? await worktreeUsingBranch(worktrees, newRefName)
+        : current === newRefName
+          ? { path: "." }
+          : undefined;
+      if (user) {
+        throw new BranchUsedByWorktreeError(
+          this.newName,
+          user.path,
+          `fatal: cannot force update the branch '${this.newName}' used by worktree at '${user.path}'`,
+        );
+      }
+    }
+
+    // files_copy_or_rename_ref with copy: the old reflog copied over the new one's, then
+    // the new ref written with an `<id> <id>` line (HEAD logs it only when on the new ref)
+    const message = reflogMessages.branchCopied(oldRefName, newRefName);
+    const log = this.reflogLine(message);
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const carried = await reflogLinesOfRef(this.refsStore, oldRefName);
+    const line = { oldId: id, newId: id, message, ...log };
+    if (newRefName === oldRefName) {
+      // copied onto itself: one `<id> <id>` line (also HEAD's, when on it)
+      await this.refsStore.batch([{ name: newRefName, new: id, reflog: [line] }], log);
+    } else if (carried.length > 0 || logsBranches(config)) {
+      // the new branch's own log is replaced: a branch -C overwrites goes first
+      if (await this.refsStore.has(newRefName)) {
+        await this.refsStore.batch([{ name: newRefName, new: null }], log);
+      }
+      await this.refsStore.batch([{ name: newRefName, new: id, reflog: [...carried, line] }], log);
+    } else {
+      await this.refsStore.set(newRefName, id, log);
+    }
+
+    // git_config_copy_section(branch.<old>, branch.<new>), unless the names are the same
+    if (oldShort !== this.newName) {
+      config.copySection(`branch.${oldShort}`, `branch.${this.newName}`);
+      await config.save();
+    }
+
+    return (await this.refsStore.get(newRefName)) as Ref;
+  }
+}
+
+/** Whether git creates reflogs of branches (core.logAllRefUpdates; off in a bare repository). */
+function logsBranches(config: RemoteConfigStore): boolean {
+  const setting = config.value("core.logAllRefUpdates");
+  return (
+    setting?.trim().toLowerCase() === "always" ||
+    (parseGitBool(setting) ?? !(parseGitBool(config.value("core.bare")) ?? false))
+  );
 }
 
 /** A reflog's lines, oldest first, as a batch carries them to another ref. */

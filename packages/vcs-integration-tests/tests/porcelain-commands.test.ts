@@ -48,7 +48,7 @@ describe.each(backends)("Porcelain Commands ($name backend)", ({ factory }) => {
       // Create commit
       const commit = await git.commit().setMessage("Initial commit").call();
 
-      expect(commit.message).toBe("Initial commit");
+      expect(commit.message).toBe("Initial commit\n");
       expect(commit.tree).toMatch(/^[0-9a-f]{40}$/);
     });
 
@@ -243,8 +243,8 @@ describe.each(backends)("Porcelain Commands ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().call());
 
       expect(commits.length).toBe(3); // Initial + 2
-      expect(commits[0].message).toBe("Commit 2");
-      expect(commits[1].message).toBe("Commit 1");
+      expect(commits[0].message).toBe("Commit 2\n");
+      expect(commits[1].message).toBe("Commit 1\n");
     });
 
     it("should support maxCount in log", async () => {

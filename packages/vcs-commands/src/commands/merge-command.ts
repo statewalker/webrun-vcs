@@ -44,6 +44,12 @@ import {
   treeDelta,
   writeIndexAsTree,
 } from "./merge-support.js";
+import {
+  type CleanupMode,
+  cleanupWith,
+  commitCleanupMode,
+  commitMessageFromOption,
+} from "./message-cleanup.js";
 import { octopusMerge } from "./octopus-merge.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
@@ -120,6 +126,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private squash = false;
   private commit = true;
   private message?: string;
+  private cleanupMode?: CleanupMode;
   private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
   private operation = MergeOperation.MERGE;
   private author?: PersonIdent;
@@ -224,13 +231,26 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
-   * Set the merge commit message (default git's: `Merge branch 'feature'`).
+   * Set the merge commit message (default git's: `Merge branch 'feature'`), as git's
+   * `merge -m` takes it: cleaned up as a commit message (`whitespace`, which ends the last
+   * line, unless {@link setCleanupMode} or `commit.cleanup` says otherwise; `verbatim`
+   * stores it as given, without a newline added, unlike `commit -m`).
    *
    * @param message Commit message
    */
   setMessage(message: string): this {
     this.checkCallable();
     this.message = message;
+    return this;
+  }
+
+  /**
+   * How the merge commit's message is cleaned up (git's `merge --cleanup=<mode>`; default
+   * `commit.cleanup`, else `whitespace`, as without an editor).
+   */
+  setCleanupMode(mode: CleanupMode): this {
+    this.checkCallable();
+    this.cleanupMode = mode;
     return this;
   }
 
@@ -732,7 +752,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     }
 
-    const newCommitId = await this.storeCommit(treeId, [headId, srcId], message);
+    const newCommitId = await this.storeCommit(treeId, [headId, srcId], this.cleanup(message));
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(this.strategyName()));
     // the commit ends the merge: git's remove_merge_branch_state
     await state.removeRef("AUTO_MERGE");
@@ -868,7 +888,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // finish_automerge: HEAD a parent unless the heads contain it, or with --no-ff
     const keepHead = !headSubsumed || this.ffMode() === FastForwardMode.NO_FF;
     const parents = [...(keepHead ? [headId] : []), ...remoteIds];
-    const newCommitId = await this.storeCommit(treeId, parents, message);
+    const newCommitId = await this.storeCommit(treeId, parents, this.cleanup(message));
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(strategy));
     output.push(`Merge made by the '${strategy}' strategy.`);
     return { status: MergeStatus.MERGED, newHead: newCommitId, mergedCommits, output };
@@ -930,9 +950,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const headId = await this.resolveHead();
     const head = await this.refsStore.get("HEAD");
     const treeId = await this.staging.writeTree(this.trees);
-    const message = cleanupMessage(
-      this.message ?? (await state.read("MERGE_MSG")) ?? `Merge commit '${mergeHead}'\n`,
-    );
+    // a message given is `git commit -m`'s; MERGE_MSG is taken as an editor leaves it
+    const message =
+      this.message !== undefined
+        ? commitMessageFromOption(this.message, this.cleanupMode, this.workingCopy)
+        : cleanupMessage((await state.read("MERGE_MSG")) ?? `Merge commit '${mergeHead}'\n`);
     const newCommitId = await this.storeCommit(treeId, [headId, ...heads], message);
     // `git merge --continue` is `git commit`: "commit (merge): <subject>"
     await this.updateHead(head, newCommitId, undefined, reflogMessages.commit("merge", message));
@@ -1163,6 +1185,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
       default:
         return "ort";
     }
+  }
+
+  /** git's `cleanup_message` of a merge commit's message (prepare_to_commit, no editor). */
+  private cleanup(message: string): string {
+    const mode = commitCleanupMode(this.workingCopy, this.cleanupMode);
+    return cleanupWith(this.workingCopy, message, mode);
   }
 
   private async storeCommit(tree: ObjectId, parents: ObjectId[], message: string) {

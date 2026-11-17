@@ -47,8 +47,8 @@ describe.each(backends)("Phase 1 Integration Workflow ($name backend)", ({ facto
     // === STEP 2: Verify log shows commits ===
     let commits = await toArray(await git.log().call());
     expect(commits.length).toBe(3); // Initial + 2 new commits
-    expect(commits[0].message).toBe("Fix: Authentication bug");
-    expect(commits[1].message).toBe("Feature: Add user authentication");
+    expect(commits[0].message).toBe("Fix: Authentication bug\n");
+    expect(commits[1].message).toBe("Feature: Add user authentication\n");
     expect(commits[2].message).toBe("Initial commit");
 
     // === STEP 3: Create branches ===
@@ -86,7 +86,7 @@ describe.each(backends)("Phase 1 Integration Workflow ($name backend)", ({ facto
     // Log should now show 2 commits
     commits = await toArray(await git.log().call());
     expect(commits.length).toBe(2);
-    expect(commits[0].message).toBe("Feature: Add user authentication");
+    expect(commits[0].message).toBe("Feature: Add user authentication\n");
 
     // === STEP 6: Reset back to original ===
     // Reset to the tag (which still points to commit2)
@@ -119,8 +119,8 @@ describe.each(backends)("Phase 1 Integration Workflow ($name backend)", ({ facto
     // Log on feature branch
     let commits = await toArray(await git.log().call());
     expect(commits.length).toBe(3);
-    expect(commits[0].message).toBe("Feature commit");
-    expect(commits[1].message).toBe("Main commit 1");
+    expect(commits[0].message).toBe("Feature commit\n");
+    expect(commits[1].message).toBe("Main commit 1\n");
 
     // Switch back to main
     await repository.refs.setSymbolic("HEAD", "refs/heads/main");
@@ -128,7 +128,7 @@ describe.each(backends)("Phase 1 Integration Workflow ($name backend)", ({ facto
     // Log on main
     commits = await toArray(await git.log().call());
     expect(commits.length).toBe(3);
-    expect(commits[0].message).toBe("Main commit 2");
+    expect(commits[0].message).toBe("Main commit 2\n");
   });
 
   it("should support tag workflow", async () => {
@@ -167,7 +167,7 @@ describe.each(backends)("Phase 1 Integration Workflow ($name backend)", ({ facto
     // Log should show only commits up to v1.0.0
     const commits = await toArray(await git.log().call());
     expect(commits.length).toBe(2); // Initial + Release 1.0.0
-    expect(commits[0].message).toBe("Release 1.0.0");
+    expect(commits[0].message).toBe("Release 1.0.0\n");
   });
 
   it("should support branch cleanup", async () => {
@@ -217,14 +217,14 @@ describe.each(backends)("Phase 1 Integration Workflow ($name backend)", ({ facto
     // Get last 5
     commits = await toArray(await git.log().setMaxCount(5).call());
     expect(commits.length).toBe(5);
-    expect(commits[0].message).toBe("Commit 10");
-    expect(commits[4].message).toBe("Commit 6");
+    expect(commits[0].message).toBe("Commit 10\n");
+    expect(commits[4].message).toBe("Commit 6\n");
 
     // Skip 3, get next 3
     commits = await toArray(await git.log().setSkip(3).setMaxCount(3).call());
     expect(commits.length).toBe(3);
-    expect(commits[0].message).toBe("Commit 7");
-    expect(commits[2].message).toBe("Commit 5");
+    expect(commits[0].message).toBe("Commit 7\n");
+    expect(commits[2].message).toBe("Commit 5\n");
   });
 });
 

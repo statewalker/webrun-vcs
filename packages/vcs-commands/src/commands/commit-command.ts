@@ -15,6 +15,12 @@ import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
 import { withoutCrud } from "./git-ident.js";
 import { OperationState } from "./merge-support.js";
+import {
+  CleanupMode,
+  cleanupWith,
+  commitCleanupMode,
+  commitMessageFromOption,
+} from "./message-cleanup.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash, cleanupMessage } from "./sequencer-support.js";
 
@@ -90,15 +96,41 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private onlyPaths: string[] = [];
   private all = false;
   private worktreeIterator: Worktree | undefined;
+  private cleanupMode?: CleanupMode;
+  private allowEmptyMessage = false;
 
   /**
-   * Set the commit message.
+   * Set the commit message, as git's `commit -m` takes it: its last line is ended and it is
+   * cleaned up (`whitespace` by default, see {@link setCleanupMode}), so `"Fix"` is stored
+   * as `"Fix\n"` and the commit gets native git's id.
    *
    * @param message Commit message
    */
   setMessage(message: string): this {
     this.checkCallable();
     this.message = message;
+    return this;
+  }
+
+  /**
+   * How the message is cleaned up (git's `--cleanup=<mode>`; default `commit.cleanup`, else
+   * `default`, which without an editor is `whitespace`: trailing whitespace and surrounding
+   * blank lines dropped, blank runs collapsed). `strip` also drops comment lines;
+   * `verbatim` keeps the message as given (with its last line ended, as `-m` does).
+   */
+  setCleanupMode(mode: CleanupMode): this {
+    this.checkCallable();
+    this.cleanupMode = mode;
+    return this;
+  }
+
+  /**
+   * Allow a message that is empty after its cleanup (git's `--allow-empty-message`);
+   * without it such a commit is refused: `Aborting commit due to empty commit message.`
+   */
+  setAllowEmptyMessage(allow: boolean): this {
+    this.checkCallable();
+    this.allowEmptyMessage = allow;
     return this;
   }
 
@@ -314,20 +346,27 @@ export class CommitCommand extends GitCommand<CommitResult> {
         "fatal: You are in the middle of a merge -- cannot amend.",
       );
     }
-    if (!this.message && !this.amend) {
+    let message = this.message;
+    const given = message !== undefined;
+    if (message === undefined && !this.amend) {
       const prepared = (await state.read("MERGE_MSG")) ?? (await state.read("SQUASH_MSG"));
       // as git commit leaves it once the editor accepts it: comments stripped
       const cleaned = prepared !== undefined ? cleanupMessage(prepared) : "";
-      if (cleaned) this.message = cleaned;
+      if (cleaned) message = cleaned;
     }
 
     // Check message
-    if (!this.message && !this.amend) {
+    if (message === undefined && !this.amend) {
       throw new NoMessageError();
     }
 
-    // Get message (from amend or new)
-    let finalMessage = this.message;
+    // Get message (from amend or new): a message given is git's `-m` (its line ended, then
+    // cleaned up); one prepared by a merge or pick was cleaned up above
+    const cleanup = commitCleanupMode(this.workingCopy, this.cleanupMode);
+    let finalMessage =
+      given && message !== undefined
+        ? commitMessageFromOption(message, this.cleanupMode, this.workingCopy)
+        : message;
     let previousCommit: Commit | undefined;
 
     if (this.amend) {
@@ -336,13 +375,20 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (!previousCommit) {
         throw new NoHeadError("Cannot amend: HEAD commit not found");
       }
-      if (!finalMessage) {
-        finalMessage = previousCommit.message;
+      if (finalMessage === undefined) {
+        // `--amend --no-edit`: the amended commit's message, cleaned up as any other
+        finalMessage = cleanupWith(this.workingCopy, previousCommit.message, cleanup);
       }
     }
 
-    if (!finalMessage) {
-      throw new NoMessageError();
+    // git's message_is_empty: nothing but whitespace and sign-offs (any text, verbatim)
+    if (
+      finalMessage === undefined ||
+      (!this.allowEmptyMessage &&
+        (cleanup !== CleanupMode.VERBATIM || finalMessage.length === 0) &&
+        isEmptyMessage(finalMessage))
+    ) {
+      throw new NoMessageError("Aborting commit due to empty commit message.");
     }
 
     // The author (git's determine_author_info): the one given; else an amended commit's or
@@ -650,4 +696,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // Get worktree from WorkingCopy
     return this.worktreeAccess;
   }
+}
+
+/** git's `rest_is_empty`: only whitespace and `Signed-off-by:` lines. */
+function isEmptyMessage(message: string): boolean {
+  return message
+    .split("\n")
+    .every((line) => line.startsWith("Signed-off-by: ") || /^[ \t\r]*$/.test(line));
 }

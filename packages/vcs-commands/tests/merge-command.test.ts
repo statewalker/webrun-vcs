@@ -247,7 +247,7 @@ describe.each(backends)("MergeCommand ($name backend)", ({ factory }) => {
 
       const mergeCommit = await repository.commits.load(result.newHead ?? "");
       if (!mergeCommit) throw new Error("mergeCommit not found");
-      expect(mergeCommit.message).toBe("Custom merge message");
+      expect(mergeCommit.message).toBe("Custom merge message\n");
     });
   });
 

@@ -53,7 +53,7 @@ describe.each(backends)("CommitCommand ($name backend)", ({ factory }) => {
 
     const commit = await git.commit().setMessage("Test commit").setAllowEmpty(true).call();
 
-    expect(commit.message).toBe("Test commit");
+    expect(commit.message).toBe("Test commit\n");
     expect(commit.parents.length).toBe(1); // Has parent from initial commit
   });
 
@@ -64,7 +64,7 @@ describe.each(backends)("CommitCommand ($name backend)", ({ factory }) => {
     // Create initial commit
     const commit = await git.commit().setMessage("Initial commit").setAllowEmpty(true).call();
 
-    expect(commit.message).toBe("Initial commit");
+    expect(commit.message).toBe("Initial commit\n");
     expect(commit.parents.length).toBe(0);
   });
 
@@ -121,7 +121,7 @@ describe.each(backends)("CommitCommand ($name backend)", ({ factory }) => {
     // Second empty commit with allowEmpty
     const commit = await git.commit().setMessage("Empty commit").setAllowEmpty(true).call();
 
-    expect(commit.message).toBe("Empty commit");
+    expect(commit.message).toBe("Empty commit\n");
   });
 
   it("should fail when amending on initial commit (no prior commit)", async () => {
@@ -154,7 +154,7 @@ describe.each(backends)("CommitCommand ($name backend)", ({ factory }) => {
       .setAllowEmpty(true)
       .call();
 
-    expect(amended.message).toBe("Amended message");
+    expect(amended.message).toBe("Amended message\n");
     // Author should be preserved from original
     expect(amended.author.name).toBe("Original Author");
     // Parents should be same as original commit's parents
@@ -170,7 +170,7 @@ describe.each(backends)("CommitCommand ($name backend)", ({ factory }) => {
     // Amend without new message
     const amended = await git.commit().setAmend(true).setAllowEmpty(true).call();
 
-    expect(amended.message).toBe("Keep this message");
+    expect(amended.message).toBe("Keep this message\n");
   });
 
   it("should not be callable twice", async () => {
@@ -235,9 +235,9 @@ describe.each(backends)("CommitCommand with Log ($name backend)", ({ factory }) 
 
     // Should see all commits (including initial)
     expect(commits.length).toBe(4);
-    expect(commits[0].message).toBe("Third");
-    expect(commits[1].message).toBe("Second");
-    expect(commits[2].message).toBe("First");
+    expect(commits[0].message).toBe("Third\n");
+    expect(commits[1].message).toBe("Second\n");
+    expect(commits[2].message).toBe("First\n");
     expect(commits[3].message).toBe("Initial commit");
   });
 });
@@ -576,7 +576,7 @@ describe.each(backends)("CommitCommand with --all flag ($name backend)", ({ fact
       .setWorktree(worktree)
       .call();
 
-    expect(commit.message).toBe("commit all changes");
+    expect(commit.message).toBe("commit all changes\n");
 
     // Verify both files were updated in the commit
     const headRef = await repository.refs.resolve("HEAD");
@@ -614,7 +614,7 @@ describe.each(backends)("CommitCommand with --all flag ($name backend)", ({ fact
       .setWorktree(worktree)
       .call();
 
-    expect(commit.message).toBe("delete file1");
+    expect(commit.message).toBe("delete file1\n");
 
     // Verify file1 was removed from the tree
     const headRef = await repository.refs.resolve("HEAD");

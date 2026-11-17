@@ -37,8 +37,8 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().call());
 
       expect(commits.length).toBe(3);
-      expect(commits[0].message).toBe("Third");
-      expect(commits[1].message).toBe("Second");
+      expect(commits[0].message).toBe("Third\n");
+      expect(commits[1].message).toBe("Second\n");
       expect(commits[2].message).toBe("Initial commit");
     });
 
@@ -52,8 +52,8 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setMaxCount(2).call());
 
       expect(commits.length).toBe(2);
-      expect(commits[0].message).toBe("Fourth");
-      expect(commits[1].message).toBe("Third");
+      expect(commits[0].message).toBe("Fourth\n");
+      expect(commits[1].message).toBe("Third\n");
     });
 
     it("should skip commits with setSkip", async () => {
@@ -66,8 +66,8 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setSkip(1).call());
 
       expect(commits.length).toBe(3);
-      expect(commits[0].message).toBe("Third");
-      expect(commits[1].message).toBe("Second");
+      expect(commits[0].message).toBe("Third\n");
+      expect(commits[1].message).toBe("Second\n");
       expect(commits[2].message).toBe("Initial commit");
     });
 
@@ -82,8 +82,8 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setSkip(1).setMaxCount(2).call());
 
       expect(commits.length).toBe(2);
-      expect(commits[0].message).toBe("Fourth");
-      expect(commits[1].message).toBe("Third");
+      expect(commits[0].message).toBe("Fourth\n");
+      expect(commits[1].message).toBe("Third\n");
     });
 
     it("should start from specific commit", async () => {
@@ -99,7 +99,7 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().add(secondId).call());
 
       expect(commits.length).toBe(2);
-      expect(commits[0].message).toBe("Second");
+      expect(commits[0].message).toBe("Second\n");
       expect(commits[1].message).toBe("Initial commit");
     });
 
@@ -194,7 +194,7 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       );
 
       expect(commits.length).toBe(1);
-      expect(commits[0].message).toBe("Recent commit");
+      expect(commits[0].message).toBe("Recent commit\n");
     });
 
     it("should filter commits by setUntil", async () => {
@@ -235,7 +235,7 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       );
 
       // Should include old commit and initial commit
-      expect(commits.some((c) => c.message === "Old commit")).toBe(true);
+      expect(commits.some((c) => c.message === "Old commit\n")).toBe(true);
       expect(commits.every((c) => c.message !== "Recent commit")).toBe(true);
     });
 
@@ -290,8 +290,8 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       );
 
       // Should include "Very old" and "Middle" but not "Recent"
-      expect(commits.some((c) => c.message === "Very old")).toBe(true);
-      expect(commits.some((c) => c.message === "Middle")).toBe(true);
+      expect(commits.some((c) => c.message === "Very old\n")).toBe(true);
+      expect(commits.some((c) => c.message === "Middle\n")).toBe(true);
       expect(commits.every((c) => c.message !== "Recent")).toBe(true);
     });
   });
@@ -317,7 +317,7 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setAuthorFilter("alice").call());
 
       expect(commits.length).toBe(1);
-      expect(commits[0].message).toBe("By Alice");
+      expect(commits[0].message).toBe("By Alice\n");
     });
 
     it("should filter by author email", async () => {
@@ -340,7 +340,7 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setAuthorFilter("bob@example.com").call());
 
       expect(commits.length).toBe(1);
-      expect(commits[0].message).toBe("By Bob");
+      expect(commits[0].message).toBe("By Bob\n");
     });
 
     it("should filter by committer", async () => {
@@ -363,7 +363,7 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().setCommitterFilter("carol").call());
 
       expect(commits.length).toBe(1);
-      expect(commits[0].message).toBe("Committed by Carol");
+      expect(commits[0].message).toBe("Committed by Carol\n");
     });
   });
 
@@ -402,17 +402,17 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
 
       // Get all commits
       const allCommits = await toArray(await git.log().all().call());
-      expect(allCommits.some((c) => c.message === "merge s0 with m1")).toBe(true);
-      expect(allCommits.some((c) => c.message === "s0")).toBe(true);
-      expect(allCommits.some((c) => c.message === "m1")).toBe(true);
-      expect(allCommits.some((c) => c.message === "m0")).toBe(true);
+      expect(allCommits.some((c) => c.message === "merge s0 with m1\n")).toBe(true);
+      expect(allCommits.some((c) => c.message === "s0\n")).toBe(true);
+      expect(allCommits.some((c) => c.message === "m1\n")).toBe(true);
+      expect(allCommits.some((c) => c.message === "m0\n")).toBe(true);
 
       // Only merge commits
       const mergeCommits = await toArray(
         await git.log().setRevFilter(RevFilter.ONLY_MERGES).call(),
       );
       expect(mergeCommits.length).toBe(1);
-      expect(mergeCommits[0].message).toBe("merge s0 with m1");
+      expect(mergeCommits[0].message).toBe("merge s0 with m1\n");
     });
 
     it("should exclude merge commits with NO_MERGES filter", async () => {
@@ -455,9 +455,9 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       // Should not contain the merge commit
       expect(nonMergeCommits.every((c) => c.message !== "merge s0 with m1")).toBe(true);
       // Should contain the non-merge commits
-      expect(nonMergeCommits.some((c) => c.message === "m1")).toBe(true);
-      expect(nonMergeCommits.some((c) => c.message === "s0")).toBe(true);
-      expect(nonMergeCommits.some((c) => c.message === "m0")).toBe(true);
+      expect(nonMergeCommits.some((c) => c.message === "m1\n")).toBe(true);
+      expect(nonMergeCommits.some((c) => c.message === "s0\n")).toBe(true);
+      expect(nonMergeCommits.some((c) => c.message === "m0\n")).toBe(true);
     });
   });
 
@@ -503,8 +503,8 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       expect(rangeCommits.length).toBe(3);
 
       const messages = rangeCommits.map((c) => c.message);
-      expect(messages).toContain("commit c");
-      expect(messages).toContain("commit d");
+      expect(messages).toContain("commit c\n");
+      expect(messages).toContain("commit d\n");
 
       // Should not include B or Initial
       expect(messages.every((m) => m !== "commit b")).toBe(true);
@@ -529,8 +529,8 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().not(baseId).call());
 
       expect(commits.length).toBe(2);
-      expect(commits[0].message).toBe("Feature 2");
-      expect(commits[1].message).toBe("Feature 1");
+      expect(commits[0].message).toBe("Feature 2\n");
+      expect(commits[1].message).toBe("Feature 1\n");
       // Base and Initial should be excluded
       expect(commits.every((c) => c.message !== "Base")).toBe(true);
       expect(commits.every((c) => c.message !== "Initial commit")).toBe(true);
@@ -554,7 +554,7 @@ describe.each(backends)("LogCommand ($name backend)", ({ factory }) => {
       const commits = await toArray(await git.log().not(c1Id).not(c2Id).call());
 
       expect(commits.length).toBe(1);
-      expect(commits[0].message).toBe("C3");
+      expect(commits[0].message).toBe("C3\n");
     });
   });
 

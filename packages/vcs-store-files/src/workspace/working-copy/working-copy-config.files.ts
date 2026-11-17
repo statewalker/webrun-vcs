@@ -473,6 +473,72 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   }
 
   /**
+   * Copy a section, as git's `git_config_copy_section` (`git branch -c`): after every
+   * `[branch "old"]` section a `[branch "new"]` one holding a copy of its lines (variables,
+   * comments and blank lines as they are), the old one kept. A section already named
+   * `new` is kept too, so its variables and the copied ones add up.
+   *
+   * @param oldSection `section.subsection`, e.g. `branch.feat`
+   * @param newSection the copy's name, e.g. `branch.feat2`
+   *
+   * @example
+   * ```typescript
+   * config.copySection("branch.feat", "branch.feat2");
+   * await config.save();
+   * ```
+   */
+  copySection(oldSection: string, newSection: string): void {
+    const from = canonicalizeSection(oldSection);
+    const to = canonicalizeSection(newSection);
+    if (from === to || this.removedSections.has(from)) return;
+    this.resolvedCache = undefined;
+    const renamed = (key: string) => `${to}${key.slice(from.length)}`;
+    const copied = new Map<string, unknown[]>();
+    const copyOf = (key: string, value: unknown) => {
+      const values = copied.get(key);
+      if (values) values.push(value);
+      else copied.set(key, [value]);
+    };
+    const out: ConfigLine[] = [];
+    let copy: ConfigLine[] | undefined;
+    for (const line of this.lines) {
+      if (line.kind === "section" && copy) {
+        out.push(...copy);
+        copy = undefined;
+      }
+      out.push(line);
+      if (line.kind === "section" && line.section === from) {
+        copy = [{ kind: "section", section: to, text: formatSectionHeader(to) }];
+        if (line.inlineKey !== undefined) {
+          const key = renamed(line.inlineKey);
+          copy.push({ kind: "entry", section: to, key, value: line.inlineValue, text: "" });
+          copyOf(key, line.inlineValue);
+          this.dirtyKeys.add(key);
+        }
+      } else if (copy && line.kind === "entry") {
+        const key = renamed(line.key);
+        copy.push({ ...line, section: to, key });
+        copyOf(key, line.value);
+        if (this.dirtyKeys.has(line.key)) this.dirtyKeys.add(key);
+      } else if (copy) {
+        copy.push(line);
+      }
+    }
+    if (copy) out.push(...copy);
+    this.lines = out;
+    // the values: what the section had (also not saved yet), after what `new` had
+    for (const key of [...this.values.keys()]) {
+      if (sectionOfKey(key) !== from) continue;
+      const newKey = renamed(key);
+      const current = this.values.get(key) ?? [];
+      const fromFile = copied.get(newKey);
+      if (!fromFile || this.dirtyKeys.has(key)) this.dirtyKeys.add(newKey);
+      this.values.set(newKey, [...(this.values.get(newKey) ?? []), ...current]);
+      this.mirror(newKey);
+    }
+  }
+
+  /**
    * List the subsection names present for a section, e.g. the remote names for
    * `subsections("remote")`.
    */
