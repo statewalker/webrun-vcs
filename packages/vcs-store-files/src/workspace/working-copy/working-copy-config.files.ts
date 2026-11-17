@@ -142,6 +142,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (options.environment) this.environment = options.environment;
   }
 
+  /** The git directory as the host names it ({@link GitConfigOptions.gitDirPath}), when given */
+  get hostGitDir(): string | undefined {
+    return this.options.gitDirPath;
+  }
+
   /**
    * Load configuration from file, replacing any previously loaded state.
    *

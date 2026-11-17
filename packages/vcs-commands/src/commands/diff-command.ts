@@ -1,10 +1,12 @@
 import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
 import { ByteSink, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 import {
+  collectChunks,
   compareWithWorktree,
   expandUserPath,
   type GitHostEnvironment,
   readCleanContent,
+  smudgeContent,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 
@@ -73,14 +75,15 @@ export interface DiffTextOptions
    */
   noPrefix?: boolean;
   /**
-   * `--default-prefix`: `a/` and `b/` (`diff.srcPrefix` / `diff.dstPrefix` when set),
-   * whatever `diff.noprefix` and `diff.mnemonicPrefix` say; it wins over `noPrefix`, and
-   * `srcPrefix` / `dstPrefix` still apply on top
+   * `--default-prefix`: `a/` and `b/`, whatever `diff.noprefix`, `diff.mnemonicPrefix`,
+   * `diff.srcPrefix` and `diff.dstPrefix` say; it wins over `noPrefix`, and `srcPrefix` /
+   * `dstPrefix` still apply on top
    */
   defaultPrefix?: boolean;
   /**
    * `-O<orderfile>`: show the files in the order of the file's glob patterns (default
-   * `diff.orderFile`); a relative path is read in the worktree, from its root
+   * `diff.orderFile`); a relative path is read from the worktree's root, through the host
+   * environment when it leaves the worktree (`../x`)
    */
   orderFile?: string;
   /**
@@ -203,8 +206,10 @@ const algorithmValue = (v: string | undefined): XdiffAlgorithm | undefined => {
  * index against the worktree, `c/` and `w/` for a commit against it, `c/` and `i/` for
  * `--cached`, and `a/` and `b/` between two trees. Textconv runs through the runner the host
  * registers with `installTextconvRunner` (running a command is not portable); without one no
- * textconv applies, as `git diff --no-textconv`. A relative order file is read in the
- * worktree, from its root.
+ * textconv applies, as `git diff --no-textconv`; it reads a blob as checkout writes it
+ * (smudged) and a worktree file as it is, as git's `prepare_temp_file`. A relative order
+ * file is read from the worktree's root (one outside it, `../x`, through the host
+ * environment).
  *
  * As git: a conflicted path is, in `git diff`, the combined diff (`diff --cc`) of stages 2
  * and 3 against the worktree file, printed before the other files (in the other formats, an
@@ -349,7 +354,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             status: "M",
             old: contentSide(entry.oldPath ?? "", 0, NULL_ID, async () => new Uint8Array(0)),
           }
-        : diffEntryToPair(entry, this.blobs);
+        : this.withTextconvInputs(diffEntryToPair(entry, this.blobs), entry);
       if (entry.unmerged) unmerged.add(pair);
       pairs.push(pair);
     }
@@ -433,12 +438,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     // combine-diff.c's grab_blob: a gitlink's or a deleted side's content is not converted
     const textconv = driver?.textconv;
     const stage = async (e: StageEntry) => {
-      const content = await blobSide(this.blobs, c.path, e.mode, e.objectId).read();
+      const side = blobSide(this.blobs, c.path, e.mode, e.objectId);
       const convert = textconv && (e.mode & S_IFMT) !== GITLINK && e.objectId !== NULL_ID;
       return {
         id: e.objectId,
         mode: e.mode,
-        content: convert ? await textconv(content, c.path) : content,
+        content: convert
+          ? await textconv(await this.smudged(c.path, e.mode, side.read), c.path)
+          : await side.read(),
       };
     };
     // the file as git reads it for the result: its real mode (canon_mode), cleaned content
@@ -452,9 +459,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       } else {
         const kind = file.mode & S_IFMT;
         mode = kind === 0o120000 ? 0o120000 : file.mode & 0o111 ? 0o100755 : 0o100644;
-        content = await readCleanContent(worktree, c.path);
-        // a symbolic link's target is not converted
-        if (textconv && kind !== 0o120000) content = await textconv(content, c.path);
+        // a symbolic link's target is not converted; textconv reads the file as it is
+        content =
+          textconv && kind !== 0o120000
+            ? await textconv(await collectChunks(worktree.readContent(c.path)), c.path)
+            : await readCleanContent(worktree, c.path);
       }
     }
     const lengths = options.abbrevLengths;
@@ -475,6 +484,40 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         abbreviate: (id) =>
           id.slice(0, options.fullIndex ? 40 : (lengths?.get(id) ?? options.abbrev ?? 7)),
       },
+    );
+  }
+
+  /**
+   * The textconv input of a pair's sides, as git's `prepare_temp_file` writes it: a blob
+   * smudged as checkout would write it (`convert_to_working_tree`), a worktree file's bytes
+   * as they are (the entry's `readNew`, which reads it cleaned)
+   */
+  private withTextconvInputs(pair: DiffFilePair, entry: DiffEntry): DiffFilePair {
+    const worktree = this.worktreeAccess;
+    if (!worktree) return pair;
+    const blob = (side: DiffFilePair["old"]) =>
+      side && { ...side, readTextconvInput: () => this.smudged(side.path, side.mode, side.read) };
+    const raw = (side: DiffFilePair["new"]) =>
+      side && {
+        ...side,
+        readTextconvInput: () => collectChunks(worktree.readContent(side.path)),
+      };
+    return {
+      ...pair,
+      old: entry.readOld ? pair.old : blob(pair.old),
+      new: entry.readNew ? raw(pair.new) : blob(pair.new),
+    };
+  }
+
+  /** A blob's content as checkout writes it to the worktree (the worktree's smudge filter) */
+  private async smudged(
+    path: string,
+    mode: number,
+    read: () => Promise<Uint8Array>,
+  ): Promise<Uint8Array> {
+    const content = await read();
+    return collectChunks(
+      await smudgeContent(this.worktreeAccess?.contentFilter, path, content, mode),
     );
   }
 
@@ -539,9 +582,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       src = "";
       dst = "";
     }
+    // `--default-prefix` resets `diff.srcPrefix` / `diff.dstPrefix` too (git-diff(1))
     if (options.defaultPrefix) {
-      src = configSrc ?? "a/";
-      dst = configDst ?? "b/";
+      src = "a/";
+      dst = "b/";
     }
     if (options.srcPrefix !== undefined) src = options.srcPrefix;
     if (options.dstPrefix !== undefined) dst = options.dstPrefix;
@@ -554,9 +598,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const configured = this.config.value("diff.orderFile");
     const environment = (this.workingCopy.config as { environment?: GitHostEnvironment })
       ?.environment;
-    const orderFile =
-      this.textOptions.orderFile ??
-      (configured ? expandUserPath(configured, environment) : undefined);
+    // git reads the configuration first: a path it cannot expand fails even with -O
+    const expanded = configured ? expandUserPath(configured, environment) : undefined;
+    if (configured && expanded === undefined) {
+      throw new Error(`failed to expand user dir in: '${configured}'`);
+    }
+    const orderFile = this.textOptions.orderFile ?? expanded;
     if (!orderFile || entries.length === 0) return entries;
     const content = await this.readOrderFile(orderFile, environment);
     if (!content) throw new Error(`failed to read orderfile '${orderFile}'`);
@@ -564,14 +611,25 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     return orderByPatterns(entries, parseOrderFile(content), (e) => e.newPath ?? e.oldPath ?? "");
   }
 
-  /** An order file: a relative path in the worktree, an absolute one through the host */
+  /**
+   * An order file, read as git reads it from its current directory (the worktree's root;
+   * the git directory without a worktree): an absolute path through the host; a relative
+   * one in the worktree, or through the host from the worktree's (the git directory's) host
+   * path when it leaves the worktree (`..`) or there is no worktree
+   */
   private async readOrderFile(
     path: string,
     environment: GitHostEnvironment | undefined,
   ): Promise<Uint8Array | undefined> {
     if (path.startsWith("/")) return environment?.readFile(path);
     const worktree = this.worktreeAccess;
-    if (!worktree) return environment?.readFile(path);
+    if (!worktree || path.split("/").includes("..")) {
+      const base = worktree
+        ? (worktree as { hostPath?: string }).hostPath
+        : (this.workingCopy.config as { hostGitDir?: string }).hostGitDir;
+      if (!base) return worktree ? undefined : environment?.readFile(path);
+      return environment?.readFile(resolveHostPath(base, path));
+    }
     try {
       const entry = await worktree.getEntry(path);
       if (!entry || entry.isDirectory) return undefined;
@@ -1062,4 +1120,15 @@ export function formatDiffEntry(entry: DiffEntry): string {
     case ChangeType.COPY:
       return `C${entry.score ?? 0}\t${entry.oldPath}\t${entry.newPath}`;
   }
+}
+
+/** `path` relative to the host directory `base`, its `.` and `..` segments resolved */
+function resolveHostPath(base: string, path: string): string {
+  const parts = base.replace(/\/+$/, "").split("/");
+  for (const part of path.split("/")) {
+    if (part === "..") {
+      if (parts.length > 1) parts.pop();
+    } else if (part !== "." && part !== "") parts.push(part);
+  }
+  return parts.join("/") || "/";
 }

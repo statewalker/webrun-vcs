@@ -48,6 +48,12 @@ export interface DiffSideSpec {
   /** The content (a symbolic link: its target; a submodule: "Subproject commit <id>\n") */
   read(): Promise<Uint8Array>;
   /**
+   * The bytes a textconv command reads, as git's `prepare_temp_file` writes them: a stored
+   * blob as checkout would write it (smudged), a worktree file as it is (not cleaned);
+   * default {@link read}
+   */
+  readTextconvInput?(): Promise<Uint8Array>;
+  /**
    * Whether `id` is known as git knows a stored object's (default true); false for content
    * hashed here, a worktree file or a file outside the repository (git's `oid_valid` unset):
    * the diffstat then compares the contents even when the ids are equal
@@ -198,6 +204,11 @@ class LoadedSide {
   read(): Promise<Uint8Array> {
     this.content ??= this.spec ? this.spec.read() : Promise.resolve(new Uint8Array(0));
     return this.content;
+  }
+
+  /** The bytes textconv converts ({@link DiffSideSpec.readTextconvInput}) */
+  textconvInput(): Promise<Uint8Array> {
+    return this.spec?.readTextconvInput ? this.spec.readTextconvInput() : this.read();
   }
 
   /** `diff_filespec_is_binary` */
@@ -409,8 +420,12 @@ async function builtinDiff(
   }
   const driver = one.driver?.findFunction ? one.driver : two.driver;
   const algorithm = oneDriver?.algorithm ?? options.algorithm;
-  const textOne = textconvOne ? await textconvOne(await one.read(), pathOne) : await one.read();
-  const textTwo = textconvTwo ? await textconvTwo(await two.read(), pathTwo) : await two.read();
+  const textOne = textconvOne
+    ? await textconvOne(await one.textconvInput(), pathOne)
+    : await one.read();
+  const textTwo = textconvTwo
+    ? await textconvTwo(await two.textconvInput(), pathTwo)
+    : await two.read();
   const result = unifiedDiffHunks(textOne, textTwo, {
     ...options,
     algorithm,

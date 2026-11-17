@@ -31,7 +31,12 @@ import {
   GitWorkingCopyConfig,
 } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { MemoryWorkingCopy, type WorkingCopy } from "@statewalker/vcs-working-tree";
+import {
+  type FilterDriverRegistry,
+  type GitHostEnvironment,
+  MemoryWorkingCopy,
+  type WorkingCopy,
+} from "@statewalker/vcs-working-tree";
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
@@ -127,7 +132,11 @@ const nodeTextconv: TextconvRunner = async ({ command, path, content }) => {
 };
 
 /** Our working copy over a repository native git made in `dir`. */
-async function open(dir: string): Promise<{ git: Git; workingCopy: WorkingCopy }> {
+async function open(
+  dir: string,
+  extra: { drivers?: FilterDriverRegistry; environment?: GitHostEnvironment } = {},
+): Promise<{ git: Git; workingCopy: WorkingCopy }> {
+  const { drivers, environment } = extra;
   const files = createNodeFilesApi({ rootDir: dir });
   const { history } = await createGitFilesBackend({ files });
   const io = {
@@ -140,7 +149,11 @@ async function open(dir: string): Promise<{ git: Git; workingCopy: WorkingCopy }
     },
     write: async (path: string, content: Uint8Array) => writeFileSync(join(dir, path), content),
   };
-  const config = new GitWorkingCopyConfig(io, ".git/config");
+  const config = new GitWorkingCopyConfig(
+    io,
+    ".git/config",
+    environment ? { environment } : undefined,
+  );
   await config.load();
   const staging = new FileStagingStore(files, ".git/index");
   await staging.read();
@@ -162,7 +175,13 @@ async function open(dir: string): Promise<{ git: Git; workingCopy: WorkingCopy }
     blobs: history.blobs,
     trees: history.trees,
   });
-  const workingCopy = new MemoryWorkingCopy({ history, checkout, worktree, config });
+  const workingCopy = new MemoryWorkingCopy({
+    history,
+    checkout,
+    worktree,
+    config,
+    ...(drivers ? { filterDrivers: drivers } : {}),
+  });
   return { git: Git.fromWorkingCopy(workingCopy), workingCopy };
 }
 
@@ -436,6 +455,47 @@ describeGit("git diff configuration against native git", () => {
     }
   });
 
+  it("quotes a prefix that needs it with its path, as git's quote_two_c_style", async () => {
+    const dir = join(tmp(), "prefix-quote");
+    buildConflict(dir, "f.txt");
+    put(dir, "plain.txt", "plain\n");
+    run(dir, "add", "plain.txt");
+    put(dir, "plain.txt", "plain changed\n");
+    const prefixes: Array<[string, string]> = [
+      ["ä/", 'q"/'],
+      ["tab\t/", "b/"],
+      ["a/", "b/"],
+    ];
+    for (const quotePathValue of ["true", "false"]) {
+      run(dir, "config", "core.quotePath", quotePathValue);
+      const { git } = await open(dir);
+      for (const [src, dst] of prefixes) {
+        for (const cached of [false, true]) {
+          const make = () => (cached ? git.diff().setCached(true) : git.diff());
+          const ours = Buffer.from(
+            await make().setOptions({ srcPrefix: src, dstPrefix: dst }).callBytes("patch"),
+          );
+          const theirs = nativeOut(dir, [
+            "diff",
+            ...(cached ? ["--cached"] : []),
+            `--src-prefix=${src}`,
+            `--dst-prefix=${dst}`,
+          ]);
+          expect(ours.toString(), `${src} ${dst} ${quotePathValue}`).toBe(theirs.toString());
+        }
+      }
+    }
+    expect(
+      nativeOut(dir, [
+        "-c",
+        "core.quotePath=true",
+        "diff",
+        "--src-prefix=ä/",
+        '--dst-prefix=q"/',
+      ]).toString(),
+    ).toContain('diff --git "\\303\\244/plain.txt" "q\\"/plain.txt"');
+  });
+
   it(`matches the order file on ${SEEDS} random repositories`, async () => {
     const mismatches: string[] = [];
     const patternPool = [
@@ -493,6 +553,64 @@ describeGit("git diff configuration against native git", () => {
     expect(native(dir, ["diff", "-Onope.txt"]).status).toBe(128);
     await expect(git.diff().setOptions({ orderFile: "nope.txt" }).callText()).rejects.toThrow(
       "failed to read orderfile 'nope.txt'",
+    );
+  });
+
+  it("reads a relative order file outside the worktree from the worktree's root, as git", async () => {
+    const parent = join(tmp(), "order-up");
+    const dir = join(parent, "repo");
+    const { a, b } = buildRepo(dir, 11, false);
+    put(parent, "up.ord", "*.c\nren\n*.txt\n");
+    // the host as git sees it: files by their absolute paths
+    const environment: GitHostEnvironment = {
+      readFile: async (path) => {
+        try {
+          return new Uint8Array(readFileSync(path));
+        } catch {
+          return undefined;
+        }
+      },
+    };
+    for (const viaConfig of [false, true]) {
+      if (viaConfig) run(dir, "config", "diff.orderFile", "../up.ord");
+      const { git } = await open(dir, { environment });
+      const options: DiffTextOptions = viaConfig ? {} : { orderFile: "../up.ord" };
+      const ours = Buffer.from(
+        await git
+          .diff()
+          .setOldTree(a)
+          .setNewTree(b)
+          .setOptions({ ...versionOptions, ...options })
+          .callBytes("name-only"),
+      );
+      const theirs = nativeOut(dir, [
+        "diff",
+        "--name-only",
+        ...(viaConfig ? [] : ["-O../up.ord"]),
+        a,
+        b,
+      ]);
+      expect(ours.toString()).toBe(theirs.toString());
+    }
+    // without a host to read it through, the file is missing
+    run(dir, "config", "--unset", "diff.orderFile");
+    await expect(
+      (await open(dir)).git.diff().setOptions({ orderFile: "../up.ord" }).callText(),
+    ).rejects.toThrow("failed to read orderfile '../up.ord'");
+  });
+
+  it("fails on diff.orderFile=~/x without a home directory, as git does", async () => {
+    const dir = join(tmp(), "order-nohome");
+    buildRepo(dir, 13, false);
+    run(dir, "config", "diff.orderFile", "~/x");
+    const env: NodeJS.ProcessEnv = { ...nativeGitEnv(tmp()) };
+    delete env.HOME;
+    const res = spawnSync("git", ["diff", "-Oorder.txt"], { cwd: dir, env, encoding: "utf8" });
+    expect(res.status).toBe(128);
+    expect(res.stderr).toContain("fatal: failed to expand user dir in: '~/x'");
+    const { git } = await open(dir, { environment: { readFile: async () => undefined } });
+    await expect(git.diff().setOptions({ orderFile: "order.txt" }).callText()).rejects.toThrow(
+      "failed to expand user dir in: '~/x'",
     );
   });
 
@@ -573,6 +691,78 @@ describeGit("git diff configuration against native git", () => {
       const theirs = nativeOut(dir, ["diff", ...(off ? ["--no-textconv"] : [])]);
       expect(ours.toString()).toBe(theirs.toString());
       expect(theirs.toString()).toContain(off ? "side two" : "SIDE TWO");
+    }
+  });
+
+  it("runs textconv on a blob as checkout writes it and on a worktree file as it is (eol)", async () => {
+    const dir = join(tmp(), "textconv-eol");
+    mkdirSync(dir, { recursive: true });
+    run(dir, "init", "-q", "-b", "main");
+    put(dir, ".gitattributes", "*.t diff=c text eol=crlf\n");
+    run(dir, "config", "diff.c.textconv", "cat");
+    put(dir, "f.t", "one\ntwo\nthree\n");
+    run(dir, "add", "-A");
+    run(dir, "commit", "-q", "-m", "A");
+    const a = run(dir, "rev-parse", "HEAD");
+    put(dir, "f.t", "one\r\nTwo\r\nthree\r\n");
+    run(dir, "commit", "-q", "-am", "B");
+    const b = run(dir, "rev-parse", "HEAD");
+    put(dir, "f.t", "one\r\nTWO\r\nthree\r\n");
+    run(dir, "add", "-A");
+    put(dir, "f.t", "one\r\nTWO\r\nthree\r\nfour\n");
+    const { git, workingCopy } = await open(dir);
+    installTextconvRunner(workingCopy, nodeTextconv);
+    for (const [mode, modeArgs, make] of modes(a, b)) {
+      const ours = Buffer.from(await make(git).setOptions(versionOptions).callBytes("patch"));
+      const theirs = nativeOut(dir, ["diff", ...modeArgs]);
+      expect(ours.toString(), mode).toBe(theirs.toString());
+      expect(theirs.toString(), mode).toContain("\r\n");
+    }
+    // the combined diff of a conflicted path: its stages smudged, the file as it is
+    const conflict = join(tmp(), "textconv-eol-conflict");
+    buildConflict(conflict, "f.t", "*.t diff=c text eol=crlf\n");
+    run(conflict, "config", "diff.c.textconv", "cat");
+    const merged = await open(conflict);
+    installTextconvRunner(merged.workingCopy, nodeTextconv);
+    const ours = Buffer.from(await merged.git.diff().callBytes("patch"));
+    const theirs = nativeOut(conflict, ["diff"]);
+    expect(ours.toString()).toBe(theirs.toString());
+    expect(theirs.toString()).toContain("side two\r\n");
+  });
+
+  it("runs textconv on a blob through the smudge filter and on a worktree file uncleaned", async () => {
+    const dir = join(tmp(), "textconv-filter");
+    mkdirSync(dir, { recursive: true });
+    run(dir, "init", "-q", "-b", "main");
+    put(dir, ".gitattributes", "*.f filter=up diff=c\n");
+    run(dir, "config", "filter.up.clean", "tr a-z A-Z");
+    run(dir, "config", "filter.up.smudge", "tr A-Z a-z");
+    run(dir, "config", "diff.c.textconv", "cat");
+    put(dir, "f.f", "one\ntwo\nthree\n");
+    run(dir, "add", "-A");
+    run(dir, "commit", "-q", "-m", "A");
+    const a = run(dir, "rev-parse", "HEAD");
+    put(dir, "f.f", "one\nzwei\nthree\n");
+    run(dir, "commit", "-q", "-am", "B");
+    const b = run(dir, "rev-parse", "HEAD");
+    put(dir, "f.f", "one\ndeux\nthree\n");
+    run(dir, "add", "-A");
+    put(dir, "f.f", "one\ndos\nthree\n");
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    const drivers = {
+      up: {
+        clean: async (c: Uint8Array) => enc.encode(dec.decode(c).toUpperCase()),
+        smudge: async (c: Uint8Array) => enc.encode(dec.decode(c).toLowerCase()),
+      },
+    };
+    const { git, workingCopy } = await open(dir, { drivers });
+    installTextconvRunner(workingCopy, nodeTextconv);
+    for (const [mode, modeArgs, make] of modes(a, b)) {
+      const ours = Buffer.from(await make(git).setOptions(versionOptions).callBytes("patch"));
+      const theirs = nativeOut(dir, ["diff", ...modeArgs]);
+      expect(ours.toString(), mode).toBe(theirs.toString());
+      expect(theirs.toString(), mode).not.toContain("THREE");
     }
   });
 });

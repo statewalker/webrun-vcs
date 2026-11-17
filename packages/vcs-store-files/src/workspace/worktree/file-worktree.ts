@@ -454,6 +454,17 @@ export class FileWorktree implements Worktree {
     }
   }
 
+  /**
+   * The worktree's root as the host names it (an absolute path on Node), from the FilesApi's
+   * `rootDirectory`; undefined when the FilesApi does not say
+   */
+  get hostPath(): string | undefined {
+    const root = this.rootFiles.rootDirectory;
+    if (!root) return undefined;
+    const sub = this.rootPath.replace(/^\/+|\/+$/g, "");
+    return sub ? `${root.replace(/\/+$/, "")}/${sub}` : root;
+  }
+
   get contentFilter(): WorktreeContentFilter | undefined {
     return this.filter;
   }
