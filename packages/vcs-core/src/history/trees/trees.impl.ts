@@ -129,6 +129,11 @@ class GitTreeStore implements Trees {
       });
     }
     if (!obj) return undefined;
+    if (obj.bytes) {
+      // in memory already: decoded at once (the content needs no release)
+      if (obj.type !== "tree") return undefined;
+      return this.decoded(id, obj.bytes, epoch);
+    }
     const it = obj.content[Symbol.asyncIterator]();
     if (obj.type !== "tree") {
       await it.return?.();
@@ -150,6 +155,10 @@ class GitTreeStore implements Trees {
         at += chunk.length;
       }
     }
+    return this.decoded(id, bytes, epoch);
+  }
+
+  private decoded(id: ObjectId, bytes: Uint8Array, epoch: number): readonly TreeEntry[] {
     const entries = decodeTreeBytes(bytes);
     this.forget(id);
     this.remember(id, entries, epoch);

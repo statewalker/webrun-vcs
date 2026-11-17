@@ -33,6 +33,7 @@ export * from "./stream-inflater.js";
 // Re-export types
 export * from "./types.js";
 export * from "./utils.js";
+export * from "./whole-inflate.js";
 
 // Current implementations (default to web-based)
 let _deflate: DeflateFunction = deflateWeb;
