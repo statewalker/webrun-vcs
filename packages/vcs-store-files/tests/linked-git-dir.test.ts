@@ -189,7 +189,9 @@ describe.skipIf(!hasGit || process.platform !== "linux")(
         expect(git(base, "status", "--porcelain", "-uall")).toBe("?? sub/");
         const files = createNodeFilesApi({ rootDir: base });
         const worktree = createFileWorktree({ files, rootPath: "", gitDir: ".git" } as never);
-        expect(await worktree.repositoryState("sub")).not.toBe("none");
+        const state = await worktree.repositoryState?.("sub");
+        expect(state).toBeDefined();
+        expect(state).not.toBe("none");
       } finally {
         rmSync(base, { recursive: true, force: true });
       }
