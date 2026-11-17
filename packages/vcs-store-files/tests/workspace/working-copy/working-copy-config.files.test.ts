@@ -657,4 +657,56 @@ describe("GitWorkingCopyConfig", () => {
       expect((await files.read(PATH))?.[0]).toBe(0x5b);
     });
   });
+
+  describe("section edits as git's config.c makes them", () => {
+    it("renameSection onto an existing section renames in place; values read in file order", async () => {
+      files.set(PATH, '[branch "feat"]\n\tremote = a\n[branch "main2"]\n\tremote = b\n');
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.renameSection("branch.feat", "branch.main2");
+      expect(config.getAll("branch.main2.remote")).toEqual(["a", "b"]);
+      expect(config.get("branch.main2.remote")).toBe("b");
+      await config.save();
+      expect(files.text(PATH)).toBe(
+        '[branch "main2"]\n\tremote = a\n[branch "main2"]\n\tremote = b\n',
+      );
+    });
+
+    it("copySection leaves a header-line variable behind; renameSection moves it to its own line", async () => {
+      files.set(PATH, '[branch "feat"] rebase = true\n\tremote = o\n');
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.copySection("branch.feat", "branch.f2");
+      expect(config.get("branch.f2.rebase")).toBeUndefined();
+      config.renameSection("branch.feat", "branch.f3");
+      await config.save();
+      expect(files.text(PATH)).toBe(
+        '[branch "f3"]\n\trebase = true\n\tremote = o\n[branch "f2"]\n\tremote = o\n',
+      );
+    });
+
+    it("unsetSection drops the section's comments and blank lines; headers match as written", async () => {
+      files.set(
+        PATH,
+        '[branch "feat"]\n\tremote = o\n# about feat\n\n[Branch "feat"]\n\trebase = true\n[core]\n\tx = 1\n',
+      );
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.unsetSection("branch.feat");
+      expect(config.get("branch.feat.remote")).toBeUndefined();
+      expect(config.get("branch.feat.rebase")).toBe(true);
+      await config.save();
+      expect(files.text(PATH)).toBe('[Branch "feat"]\n\trebase = true\n[core]\n\tx = 1\n');
+    });
+
+    it("getLastOf: the key set last among several", async () => {
+      files.set(PATH, "[core]\n\tcommentString = //\n\tcommentChar = %\n");
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      expect(config.getLastOf(["core.commentChar", "core.commentString"])).toEqual({
+        key: "core.commentchar",
+        value: "%",
+      });
+    });
+  });
 });

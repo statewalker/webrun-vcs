@@ -752,7 +752,20 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     }
 
-    const newCommitId = await this.storeCommit(treeId, [headId, srcId], this.cleanup(message));
+    const cleaned = this.cleanup(message);
+    if (cleaned.length === 0) {
+      // git's prepare_to_commit: abort_commit, the merge left for `git commit`
+      await this.writeMergeState(state, srcId, `${message}\n`);
+      return {
+        status: MergeStatus.FAILED,
+        newHead: headId,
+        mergeBase: baseId,
+        mergedCommits: [headId, srcId],
+        message: EMPTY_MERGE_MESSAGE,
+        output,
+      };
+    }
+    const newCommitId = await this.storeCommit(treeId, [headId, srcId], cleaned);
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(this.strategyName()));
     // the commit ends the merge: git's remove_merge_branch_state
     await state.removeRef("AUTO_MERGE");
@@ -888,7 +901,19 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // finish_automerge: HEAD a parent unless the heads contain it, or with --no-ff
     const keepHead = !headSubsumed || this.ffMode() === FastForwardMode.NO_FF;
     const parents = [...(keepHead ? [headId] : []), ...remoteIds];
-    const newCommitId = await this.storeCommit(treeId, parents, this.cleanup(message));
+    const cleaned = this.cleanup(message);
+    if (cleaned.length === 0) {
+      // git's prepare_to_commit: abort_commit, the merge left for `git commit`
+      await writeState(`${message}\n`);
+      return {
+        status: MergeStatus.FAILED,
+        newHead: headId,
+        mergedCommits,
+        message: EMPTY_MERGE_MESSAGE,
+        output,
+      };
+    }
+    const newCommitId = await this.storeCommit(treeId, parents, cleaned);
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(strategy));
     output.push(`Merge made by the '${strategy}' strategy.`);
     return { status: MergeStatus.MERGED, newHead: newCommitId, mergedCommits, output };
@@ -1270,6 +1295,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
     return false;
   }
 }
+
+/** git's abort_commit after a message that cleans up to nothing (MERGE_HEAD etc. kept). */
+const EMPTY_MERGE_MESSAGE =
+  "error: Empty commit message.\nNot committing merge; use 'git commit' to complete the merge.";
 
 /** A refused merge: git's message, nothing changed. */
 function failed(message: string, paths: string[] = []): MergeResult {

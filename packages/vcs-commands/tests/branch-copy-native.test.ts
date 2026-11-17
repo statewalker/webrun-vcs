@@ -194,4 +194,59 @@ describeGit("git branch -c / -C, and the configuration of -m and -d, native twin
     expect(config).toContain('[branch "trunk"]\n\tremote = origin\n');
     expect(config).not.toContain("feat");
   });
+
+  it("sections as git's config.c edits them: an existing target, header-line variables, comments, case", async () => {
+    const extra =
+      '[branch "feat"]\n\tremote = origin\n\tmerge = refs/heads/feat\n# comment\n\n' +
+      '[core]\n\tx = 1\n[branch "feat"]\n\tdescription = d\n' +
+      '[Branch "feat"] rebase = true\n[branch "Feat"]\n\tremote = up\n' +
+      '[branch "feat2"]\n\tmerge = refs/heads/old\n[branch "main2"]\n\tremote = stale\n';
+    const cases: [string[], (git: Git) => Promise<unknown>][] = [
+      [
+        ["-C", "feat", "feat2"],
+        (git) => git.branchCopy().setOldName("feat").setNewName("feat2").setForce(true).call(),
+      ],
+      [
+        ["-m", "feat", "main2"],
+        (git) => git.branchRename().setOldName("feat").setNewName("main2").call(),
+      ],
+      [["-D", "feat"], (git) => git.branchDelete().setBranchNames("feat").setForce(true).call()],
+    ];
+    for (const [args, ours] of cases) {
+      const t = twins();
+      for (const repo of [t.native, t.ours]) {
+        writeFileSync(
+          join(repo, ".git/config"),
+          readFileSync(join(repo, ".git/config"), "latin1") + extra,
+        );
+      }
+      run(t.native, ["branch", ...args]);
+      await ours(await open(t.ours));
+      expect([args, readFileSync(join(t.ours, ".git/config"), "latin1")]).toEqual([
+        args,
+        readFileSync(join(t.native, ".git/config"), "latin1"),
+      ]);
+      // a renamed section and one already of that name read in file order
+      if (args[0] === "-m") {
+        for (const key of ["branch.main2.remote", "branch.main2.merge"]) {
+          expect(run(t.ours, ["config", "--get-all", key])).toBe(
+            run(t.native, ["config", "--get-all", key]),
+          );
+        }
+      }
+    }
+    // a variable on the header line moves to a line of its own when renamed, and is not copied
+    const t = twins();
+    for (const repo of [t.native, t.ours]) {
+      writeFileSync(
+        join(repo, ".git/config"),
+        `${readFileSync(join(repo, ".git/config"), "latin1")}[branch "feat"] rebase = true\n\tremote = o\n`,
+      );
+    }
+    run(t.native, ["branch", "-c", "feat", "f2"]);
+    run(t.native, ["branch", "-m", "feat", "f3"]);
+    await (await open(t.ours)).branchCopy().setOldName("feat").setNewName("f2").call();
+    await (await open(t.ours)).branchRename().setOldName("feat").setNewName("f3").call();
+    expectSame(t);
+  });
 });

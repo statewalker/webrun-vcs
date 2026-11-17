@@ -65,6 +65,11 @@ interface GitConfigLike {
   copySection?(oldSection: string, newSection: string): void;
   /** Optional: a config with no backing file has nothing to save. */
   save?(): Promise<void>;
+  /**
+   * Optional: the value set last, in the configuration's order, among several keys that
+   * name one setting (`core.commentChar` and `core.commentString`).
+   */
+  getLastOf?(keys: string[]): { key: string; value: unknown } | undefined;
 }
 
 const GIT_CONFIG_METHODS = [
@@ -370,6 +375,25 @@ export class RemoteConfigStore {
   value(key: string): string | undefined {
     const value = this.config.get(key);
     return value === undefined || value === null ? undefined : String(value);
+  }
+
+  /**
+   * The value set last among keys that name one setting (git reads `core.commentChar` and
+   * `core.commentString` as one variable, the last line wins); a config that cannot tell
+   * the order gives the first key with a value.
+   */
+  lastValueOf(keys: string[]): string | undefined {
+    if (this.config.getLastOf) {
+      const found = this.config.getLastOf(keys);
+      return found === undefined || found.value === undefined || found.value === null
+        ? undefined
+        : String(found.value);
+    }
+    for (const key of keys) {
+      const value = this.value(key);
+      if (value !== undefined) return value;
+    }
+    return undefined;
   }
 
   /** Every value of a config variable (`branch.main.merge` may repeat). */

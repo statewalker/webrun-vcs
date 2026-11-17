@@ -339,6 +339,20 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   }
 
   /**
+   * The value set last, in the chain's order, among `keys` (git reads `core.commentChar`
+   * and `core.commentString` as one setting: the last line of either wins), with the key
+   * it was set under.
+   */
+  getLastOf(keys: string[]): { key: string; value: unknown } | undefined {
+    const wanted = new Set(keys.map((k) => canonicalizeKey(k)).filter((k) => k !== undefined));
+    const all = this.resolved();
+    for (let i = all.length - 1; i >= 0; i--) {
+      if (wanted.has(all[i].key)) return { key: all[i].key, value: all[i].value };
+    }
+    return undefined;
+  }
+
+  /**
    * Every value of a key in this file only (not the global files, includes or
    * `config.worktree`), in file order: what a rewrite of the key here starts from.
    */
@@ -408,6 +422,17 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
    */
   unsetSection(section: string): void {
     const canonical = canonicalizeSection(section);
+    if (this.editsLinesOf([canonical])) {
+      // git's remove_section: from each header naming the section to the next header,
+      // every line goes (comments and blank lines too)
+      let removing = false;
+      this.lines = this.lines.filter((line) => {
+        if (line.kind === "section") removing = headerNames(line.text, canonical) > 0;
+        return !removing;
+      });
+      this.reparseSections([canonical]);
+      return;
+    }
     this.removedSections.add(canonical);
     this.resolvedCache = undefined;
     for (const key of [...this.values.keys()]) {
@@ -439,6 +464,40 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (from === to) return;
     this.resolvedCache = undefined;
     const renamed = (key: string) => `${to}${key.slice(from.length)}`;
+    if (this.editsLinesOf([from, to])) {
+      // git's rename_section: each header naming the section (as written, case and all)
+      // is rewritten where it stands; a section already named `new` stays as it is, its
+      // values and the renamed ones read in file order. A variable on the header line moves
+      // to a line of its own.
+      let inside = false;
+      this.lines = this.lines.flatMap((line): ConfigLine[] => {
+        if (line.kind === "section") {
+          const offset = headerNames(line.text, from);
+          inside = offset > 0;
+          if (!inside) return [line];
+          const header: ConfigLine = {
+            kind: "section",
+            section: to,
+            text: formatSectionHeader(to),
+          };
+          if (line.inlineKey === undefined) return [header];
+          const rest = line.text.slice(offset);
+          const key = renamed(line.inlineKey);
+          return [
+            header,
+            { kind: "entry", section: to, key, value: line.inlineValue, text: `\t${rest}` },
+          ];
+        }
+        if (inside && line.kind === "entry") {
+          const moved: ConfigLine = { ...line, section: to, key: renamed(line.key) };
+          this.moveIncluded(line, moved);
+          return [moved];
+        }
+        return [line];
+      });
+      this.reparseSections([from, to]);
+      return;
+    }
     if (this.removedSections.delete(to)) {
       // the lines of a removed section of the new name go now, before ours take its name
       this.lines = this.lines.filter((line) => sectionOfLine(line) !== to);
@@ -493,6 +552,31 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (from === to || this.removedSections.has(from)) return;
     this.resolvedCache = undefined;
     const renamed = (key: string) => `${to}${key.slice(from.length)}`;
+    if (this.editsLinesOf([from, to])) {
+      // git's copy_section: after each section whose header names `old` (as written), a
+      // `[branch "new"]` header and a copy of the lines after the old header; a variable
+      // written on the old header line is not copied
+      const out: ConfigLine[] = [];
+      let copy: ConfigLine[] | undefined;
+      for (const line of this.lines) {
+        if (line.kind === "section") {
+          if (copy) out.push(...copy);
+          copy = undefined;
+          out.push(line);
+          if (headerNames(line.text, from) > 0) {
+            copy = [{ kind: "section", section: to, text: formatSectionHeader(to) }];
+          }
+          continue;
+        }
+        out.push(line);
+        if (!copy) continue;
+        copy.push(line.kind === "entry" ? { ...line, section: to, key: renamed(line.key) } : line);
+      }
+      if (copy) out.push(...copy);
+      this.lines = out;
+      this.reparseSections([to]);
+      return;
+    }
     const copied = new Map<string, unknown[]>();
     const copyOf = (key: string, value: unknown) => {
       const values = copied.get(key);
@@ -536,6 +620,47 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       this.values.set(newKey, [...(this.values.get(newKey) ?? []), ...current]);
       this.mirror(newKey);
     }
+  }
+
+  /**
+   * Whether a section operation on `sections` can work on the file's lines alone, as git's
+   * does on the file: the file is loaded and none of their values was changed or removed
+   * since (those are only in the values, and are handled by key).
+   */
+  private editsLinesOf(sections: string[]): boolean {
+    if (!this.loaded) return false;
+    for (const section of sections) {
+      if (this.removedSections.has(section)) return false;
+      for (const key of this.dirtyKeys) if (sectionOfKey(key) === section) return false;
+    }
+    return true;
+  }
+
+  /** The values of the keys of `sections`, read again from the lines (in file order). */
+  private reparseSections(sections: string[]): void {
+    const affected = new Set(sections);
+    this.resolvedCache = undefined;
+    for (const key of [...this.values.keys()]) {
+      if (!affected.has(sectionOfKey(key))) continue;
+      this.values.delete(key);
+      this.unmirror(key);
+    }
+    for (const line of this.lines) {
+      const key = keyOfLine(line);
+      if (key === undefined || !affected.has(sectionOfKey(key))) continue;
+      this.appendParsed(
+        key,
+        line.kind === "entry" ? line.value : (line as { inlineValue?: unknown }).inlineValue,
+      );
+    }
+  }
+
+  /** An include directive's entries follow its line when the line is replaced. */
+  private moveIncluded(from: ConfigLine, to: ConfigLine): void {
+    const entries = this.includedEntries.get(from);
+    if (!entries) return;
+    this.includedEntries.delete(from);
+    this.includedEntries.set(to, entries);
   }
 
   /**
@@ -921,6 +1046,41 @@ function canonicalizeSection(section: string): string {
   const dot = section.indexOf(".");
   if (dot < 0) return section.toLowerCase();
   return `${section.slice(0, dot).toLowerCase()}.${section.slice(dot + 1)}`;
+}
+
+/**
+ * git's `section_name_match`: where a header line naming the section `name`
+ * (`branch.feat`) ends, the whitespace after it included, or 0 when it names another one.
+ * The header is matched as written, case and all (`[Branch "feat"]` is not `branch.feat`).
+ */
+function headerNames(text: string, name: string): number {
+  const isSpace = (c: string | undefined) =>
+    c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\v" || c === "\f";
+  let i = 0;
+  while (isSpace(text[i])) i++;
+  if (text[i] !== "[") return 0;
+  let j = 0;
+  let dot = false;
+  for (i++; i < text.length && text[i] !== "]"; i++) {
+    if (!dot && isSpace(text[i])) {
+      dot = true;
+      if (name[j++] !== ".") break;
+      for (i++; isSpace(text[i]); i++);
+      if (text[i] !== '"') break;
+      continue;
+    }
+    if (text[i] === "\\" && dot) i++;
+    else if (text[i] === '"' && dot) {
+      for (i++; isSpace(text[i]); i++);
+      break;
+    }
+    if (text[i] !== name[j++]) break;
+  }
+  if (text[i] === "]" && j === name.length) {
+    for (i++; isSpace(text[i]); i++);
+    return i;
+  }
+  return 0;
 }
 
 function keyOfLine(line: ConfigLine): string | undefined {

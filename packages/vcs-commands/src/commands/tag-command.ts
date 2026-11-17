@@ -72,7 +72,7 @@ export class TagCommand extends GitCommand<Ref> {
    * (comment lines dropped, trailing whitespace and surrounding blank lines dropped, a
    * final newline), so `"Release"` is stored as `"Release\n"`; see {@link setCleanupMode}.
    *
-   * Setting a message implies an annotated tag.
+   * Setting a message implies an annotated tag, an empty one too.
    *
    * @param message Tag message
    */
@@ -83,9 +83,10 @@ export class TagCommand extends GitCommand<Ref> {
   }
 
   /**
-   * How the message is cleaned up (git's `tag --cleanup=<mode>`): `strip` (the default,
-   * also for `default`), `whitespace` (comment lines kept) or `verbatim` (the message as
-   * given, no newline added). `scissors` is refused, as git refuses it for a tag.
+   * How the message is cleaned up (git's `tag --cleanup=<mode>`): `strip` (the default),
+   * `whitespace` (comment lines kept) or `verbatim` (the message as given, no newline
+   * added). `default` and `scissors` are refused, as git refuses them for a tag
+   * (`fatal: Invalid cleanup mode default`).
    */
   setCleanupMode(mode: CleanupMode): this {
     this.checkCallable();
@@ -198,7 +199,8 @@ export class TagCommand extends GitCommand<Ref> {
     const targetId = this.objectId ?? (await this.resolveHead());
 
     // Determine if we should create annotated tag
-    const createAnnotated = this.annotated || this.message || this.signed;
+    // (an empty message too: git's `tag -m ""` makes an annotated tag)
+    const createAnnotated = this.annotated || this.message !== undefined || this.signed;
 
     let tagObjectId: ObjectId;
 

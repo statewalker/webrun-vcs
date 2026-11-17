@@ -10,8 +10,8 @@
  * `strip` (comment lines go) unless `--cleanup`, and `verbatim` adds no newline; a stash
  * message is stored as given after `On <branch>: `.
  */
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -21,7 +21,14 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { CleanupMode, Git, NoMessageError, stripspace } from "../src/index.js";
+import {
+  CleanupMode,
+  FastForwardMode,
+  Git,
+  MergeStatus,
+  NoMessageError,
+  stripspace,
+} from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -156,7 +163,8 @@ describeGit("message cleanup of -m, native twins", () => {
     ];
     for (const [name, options, message, mode] of cases) {
       run(t.native, "tag", "-a", ...options, "-m", message, name);
-      const command = git.tag().setName(name).setAnnotated(true).setMessage(message);
+      // (a message alone makes the tag annotated, an empty one too)
+      const command = git.tag().setName(name).setMessage(message);
       if (mode) command.setCleanupMode(mode);
       await command.call();
       expectSameObject(t, name);
@@ -182,5 +190,114 @@ describeGit("message cleanup of -m, native twins", () => {
     expect(stripspace("a \n\u000b\n")).toBe("a \n\u000b\n");
     expect(stripspace("")).toBe("");
     expect(stripspace("\n \n")).toBe("");
+  });
+
+  it("tag --cleanup=default is refused, as git's tag knows no such mode", async () => {
+    const t = twins();
+    const r = spawnSync("git", ["tag", "-a", "--cleanup=default", "-m", "x", "tg"], {
+      cwd: t.native,
+      env: nativeGitEnv(home),
+      encoding: "latin1",
+    });
+    expect(r.status).toBe(128);
+    await expect(
+      (await open(t.ours))
+        .tag()
+        .setName("tg")
+        .setMessage("x")
+        .setCleanupMode(CleanupMode.DEFAULT)
+        .call(),
+    ).rejects.toThrow(r.stderr.trimEnd());
+  });
+
+  it("commit: core.commentChar=auto picks a character no line starts with; the last of core.commentString / core.commentChar wins", async () => {
+    const t = twins();
+    const git = await open(t.ours);
+    for (const repo of [t.native, t.ours]) {
+      run(repo, "config", "core.commentChar", "auto");
+      run(repo, "config", "commit.cleanup", "strip");
+    }
+    for (const message of ["#foo\nbar", "a\n;b\n#c", "x\n# y\n"]) {
+      run(t.native, "commit", "-q", "--allow-empty", "-m", message);
+      await git.commit().setAllowEmpty(true).setMessage(message).call();
+      expectSameObject(t, "HEAD");
+    }
+    // git reads both keys as one variable: the line set last wins (2.43 knows only commentChar)
+    for (const repo of [t.native, t.ours]) {
+      run(repo, "config", "--unset", "core.commentChar");
+      run(repo, "config", "core.commentString", ";");
+      run(repo, "config", "core.commentChar", "#");
+    }
+    run(t.native, "commit", "-q", "--allow-empty", "-m", "a\n;b\n#c");
+    await (await open(t.ours)).commit().setAllowEmpty(true).setMessage("a\n;b\n#c").call();
+    expectSameObject(t, "HEAD");
+  });
+
+  it("commit of a prepared MERGE_MSG: the comment character and commit.cleanup", async () => {
+    const t = twins();
+    const prepared = "subject\n; semi\n# hash\n\n";
+    for (const repo of [t.native, t.ours]) {
+      run(repo, "checkout", "-q", "-b", "side");
+      run(repo, "commit", "-q", "--allow-empty", "-m", "s");
+      run(repo, "checkout", "-q", "main");
+      run(repo, "commit", "-q", "--allow-empty", "-m", "m");
+      run(repo, "config", "core.commentChar", ";");
+      run(repo, "merge", "-q", "--no-commit", "side");
+      writeFileSync(join(repo, ".git/MERGE_MSG"), prepared);
+    }
+    // as git's commit once an editor accepts the message (no status comments)
+    run(t.native, "-c", "core.editor=true", "commit", "-q", "--no-status");
+    await (await open(t.ours)).commit().call();
+    expectSameObject(t, "HEAD");
+    for (const repo of [t.native, t.ours]) {
+      run(repo, "reset", "-q", "--hard", "HEAD~1");
+      run(repo, "config", "commit.cleanup", "whitespace");
+      run(repo, "merge", "-q", "--no-commit", "side");
+      writeFileSync(join(repo, ".git/MERGE_MSG"), prepared);
+    }
+    run(t.native, "-c", "core.editor=true", "commit", "-q", "--no-status");
+    await (await open(t.ours)).commit().call();
+    expectSameObject(t, "HEAD");
+  });
+
+  it("merge -m with a message that cleans up to nothing: refused, the merge left for commit", async () => {
+    for (const threeWay of [false, true]) {
+      const t = twins();
+      for (const repo of [t.native, t.ours]) {
+        run(repo, "checkout", "-q", "-b", "side");
+        writeFileSync(join(repo, "s.txt"), "s\n");
+        run(repo, "add", ".");
+        run(repo, "commit", "-q", "-m", "s");
+        run(repo, "checkout", "-q", "main");
+        if (threeWay) run(repo, "commit", "-q", "--allow-empty", "-m", "m");
+      }
+      const r = spawnSync("git", ["merge", "--no-ff", "-m", "", "side"], {
+        cwd: t.native,
+        env: nativeGitEnv(home),
+        encoding: "latin1",
+      });
+      expect(r.status).toBe(1);
+      const result = await (await open(t.ours))
+        .merge()
+        .include("side")
+        .setFastForwardMode(FastForwardMode.NO_FF)
+        .setMessage("")
+        .call();
+      expect(result.status).toBe(MergeStatus.FAILED);
+      expect(result.message).toBe(r.stderr.trimEnd());
+      const state = (repo: string) => ({
+        head: run(repo, "rev-parse", "HEAD"),
+        index: run(repo, "ls-files", "-s"),
+        status: run(repo, "status", "--porcelain"),
+        files: ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE", "ORIG_HEAD"].map((f) =>
+          existsSync(join(repo, ".git", f)) ? readFileSync(join(repo, ".git", f), "latin1") : null,
+        ),
+      });
+      expect(state(t.ours)).toEqual(state(t.native));
+      // `git commit` concludes it
+      run(t.native, "commit", "-q", "-m", "done");
+      await (await open(t.ours)).commit().setMessage("done").call();
+      expectSameObject(t, "HEAD");
+    }
   });
 });

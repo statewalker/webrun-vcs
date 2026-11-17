@@ -446,4 +446,121 @@ describeGit("git switch, native twins", () => {
     );
     expectSame(t);
   });
+
+  it("- and @{-N} as a start point: expanded for the reflog and for tracking", async () => {
+    const t = twins();
+    for (const repo of [t.native, t.ours]) {
+      run(repo, "checkout", "-q", "feat");
+      run(repo, "checkout", "-q", "main");
+    }
+    run(t.native, "switch", "-q", "-c", "x", "-");
+    await (await open(t.ours)).switch().setCreateBranch("x").setStartPoint("-").call();
+    expectSame(t);
+    expect(readFileSync(join(t.ours, ".git/logs/refs/heads/x"), "latin1")).toContain(
+      "\tbranch: Created from feat\n",
+    );
+    run(t.native, "checkout", "-q", "-b", "y", "-");
+    await (await open(t.ours))
+      .checkout()
+      .setCreateBranch(true)
+      .setName("y")
+      .setStartPoint("-")
+      .call();
+    run(t.native, "checkout", "-q", "-b", "z", "@{-2}");
+    await (await open(t.ours))
+      .checkout()
+      .setCreateBranch(true)
+      .setName("z")
+      .setStartPoint("@{-2}")
+      .call();
+    expectSame(t);
+    // the branch @{-1} names is tracked: branch.autoSetupMerge=always, and --track
+    for (const repo of [t.native, t.ours]) run(repo, "config", "branch.autoSetupMerge", "always");
+    run(t.native, "switch", "-q", "-c", "w", "@{-1}");
+    await (await open(t.ours)).switch().setCreateBranch("w").setStartPoint("@{-1}").call();
+    run(t.native, "switch", "-q", "--track", "-c", "v", "-");
+    await (await open(t.ours))
+      .switch()
+      .setCreateBranch("v")
+      .setStartPoint("-")
+      .setTrack(TrackMode.DIRECT)
+      .call();
+    expectSame(t);
+    expect(readFileSync(join(t.ours, ".git/config"), "latin1")).toContain(
+      '[branch "v"]\n\tremote = .\n\tmerge = refs/heads/z\n',
+    );
+  });
+
+  it("--track a start point that is no branch: refused where git dies, no branch created", async () => {
+    const t = twins();
+    const git = await open(t.ours);
+    // the worktree and the index are switched, then git dies before the branch is made
+    expect(
+      await refusal(() =>
+        git.switch().setCreateBranch("x").setStartPoint("v1").setTrack(TrackMode.DIRECT).call(),
+      ),
+    ).toBe(nativeRefusal(t.native, "switch", "-c", "x", "--track", "v1"));
+    expectSame(t);
+    for (const repo of [t.native, t.ours]) run(repo, "reset", "-q", "--hard");
+    const reopened = await open(t.ours);
+    expect(
+      await refusal(() =>
+        reopened
+          .checkout()
+          .setCreateBranch(true)
+          .setName("x")
+          .setStartPoint("v1")
+          .setTrack(TrackMode.DIRECT)
+          .call(),
+      ),
+    ).toBe(nativeRefusal(t.native, "checkout", "-b", "x", "--track", "v1"));
+    expectSame(t);
+    // a detached HEAD as the start point
+    for (const repo of [t.native, t.ours]) run(repo, "checkout", "-q", "-f", "--detach", "main");
+    const detached = await open(t.ours);
+    expect(
+      await refusal(() => detached.switch().setCreateBranch("x").setTrack(TrackMode.DIRECT).call()),
+    ).toBe(nativeRefusal(t.native, "switch", "--track", "-c", "x"));
+    expectSame(t);
+  });
+
+  it("- and @{-N} naming a deleted branch are not guessed into a remote-tracking branch", async () => {
+    const t = twins();
+    for (const repo of [t.native, t.ours]) {
+      run(repo, "checkout", "-q", "dev");
+      run(repo, "checkout", "-q", "main");
+      run(repo, "branch", "-q", "-D", "dev");
+    }
+    const git = await open(t.ours);
+    expect(await refusal(() => git.switch().setName("-").call())).toBe(
+      nativeRefusal(t.native, "switch", "-"),
+    );
+    expect(await refusal(() => git.switch().setName("@{-1}").call())).toBe(
+      nativeRefusal(t.native, "switch", "@{-1}"),
+    );
+    // checkout: git takes `-` for a path then ("error: pathspec '-' did not match ...")
+    expect(attempt(t.native, "checkout", "-").status).toBe(1);
+    expect(await refusal(() => git.checkout().setName("-").call())).toContain("-");
+    expectSame(t);
+  });
+
+  it("--no-track without -c names the branch too; checkout HEAD leaves HEAD alone", async () => {
+    const t = twins();
+    run(t.native, "switch", "-q", "--no-track", "origin/topic");
+    await (await open(t.ours)).switch().setName("origin/topic").setTrack(TrackMode.NONE).call();
+    expectSame(t);
+    const git = await open(t.ours);
+    expect(
+      await refusal(() =>
+        git.switch().setDetach(true).setName("main").setTrack(TrackMode.NONE).call(),
+      ),
+    ).toBe(nativeRefusal(t.native, "switch", "--detach", "--no-track", "main"));
+    expect(await refusal(() => git.switch().setCreateBranch("x").setOrphan("o").call())).toBe(
+      nativeRefusal(t.native, "switch", "-c", "x", "--orphan", "o"),
+    );
+    // `checkout HEAD`: nothing moves, no reflog line
+    run(t.native, "checkout", "-q", "HEAD");
+    await (await open(t.ours)).checkout().setName("HEAD").call();
+    expectSame(t);
+  });
 });

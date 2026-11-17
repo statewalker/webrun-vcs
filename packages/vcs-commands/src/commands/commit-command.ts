@@ -20,9 +20,10 @@ import {
   cleanupWith,
   commitCleanupMode,
   commitMessageFromOption,
+  preparedMessageCleanup,
 } from "./message-cleanup.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
-import { applyAutostash, cleanupMessage } from "./sequencer-support.js";
+import { applyAutostash } from "./sequencer-support.js";
 
 /**
  * Result of a commit operation.
@@ -350,8 +351,12 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const given = message !== undefined;
     if (message === undefined && !this.amend) {
       const prepared = (await state.read("MERGE_MSG")) ?? (await state.read("SQUASH_MSG"));
-      // as git commit leaves it once the editor accepts it: comments stripped
-      const cleaned = prepared !== undefined ? cleanupMessage(prepared) : "";
+      // as git commit leaves it once the editor accepts it: comments stripped, or as
+      // setCleanupMode / commit.cleanup say, with core.commentChar's character
+      const cleaned =
+        prepared !== undefined
+          ? preparedMessageCleanup(this.workingCopy, prepared, this.cleanupMode)
+          : "";
       if (cleaned) message = cleaned;
     }
 
@@ -365,7 +370,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const cleanup = commitCleanupMode(this.workingCopy, this.cleanupMode);
     let finalMessage =
       given && message !== undefined
-        ? commitMessageFromOption(message, this.cleanupMode, this.workingCopy)
+        ? commitMessageFromOption(message, this.cleanupMode, this.workingCopy, true)
         : message;
     let previousCommit: Commit | undefined;
 
@@ -377,7 +382,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       }
       if (finalMessage === undefined) {
         // `--amend --no-edit`: the amended commit's message, cleaned up as any other
-        finalMessage = cleanupWith(this.workingCopy, previousCommit.message, cleanup);
+        finalMessage = cleanupWith(this.workingCopy, previousCommit.message, cleanup, true);
       }
     }
 

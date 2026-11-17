@@ -207,19 +207,30 @@ export async function endOfSymbolicChain(refs: Refs, name: string): Promise<stri
 }
 
 /**
- * git's `setup_tracking`: `branch.<name>.remote` and `branch.<name>.merge` (and
- * `branch.<name>.rebase` as `branch.autoSetupRebase` asks) for a new branch that starts at
- * the branch `startRef` (a full ref name, see {@link trackableStart}), as `mode` and
- * `branch.autoSetupMerge` say. The configuration is saved.
- *
- * @returns the upstream set up (`origin/topic`, a local `main`), or undefined when none
+ * The upstream configuration {@link planTracking} decided on: `branch.<name>.remote` (none
+ * for a local start, written as `.`), `.merge` and whether `.rebase` is set.
  */
-export async function setupTracking(
+export interface TrackingPlan {
+  readonly remote: string | undefined;
+  readonly merges: string[];
+  readonly rebase: boolean;
+}
+
+/**
+ * git's `setup_tracking` up to the point it writes: what a new branch that starts at the
+ * branch `startRef` (a full ref name, see {@link trackableStart}) tracks, as `mode` and
+ * `branch.autoSetupMerge` say. Nothing is written; {@link installTracking} does that.
+ *
+ * @returns the plan, or undefined when nothing is tracked
+ * @throws RefNotFoundError when several remotes fetch into `startRef` (git's `not
+ *   tracking: ambiguous information for ref '<ref>'`)
+ */
+export function planTracking(
   workingCopy: WorkingCopy,
   newBranch: string,
   startRef: string,
   mode: TrackMode,
-): Promise<string | undefined> {
+): TrackingPlan | undefined {
   const config = RemoteConfigStore.from(workingCopy);
   const track = effectiveTrack(config, mode);
   if (track === "never") return undefined;
@@ -258,17 +269,49 @@ export async function setupTracking(
 
   // install_branch_config_multiple_remotes: never a branch as its own upstream
   if (!remote && merges.some((m) => m === `refs/heads/${newBranch}`)) return undefined;
-  config.setValue(`branch.${newBranch}.remote`, remote ?? ".");
-  config.setValues(`branch.${newBranch}.merge`, merges);
   const autoRebase = (config.value("branch.autoSetupRebase") ?? "never").toLowerCase();
-  const rebasing =
+  const rebase =
     autoRebase === "always" ||
     (autoRebase === "local" && remote === undefined) ||
     (autoRebase === "remote" && remote !== undefined);
-  if (rebasing) config.setValue(`branch.${newBranch}.rebase`, "true");
-  await config.save();
+  return { remote, merges, rebase };
+}
 
-  const first = merges[0] ?? startRef;
+/**
+ * Write a {@link TrackingPlan} as `branch.<newBranch>.*` and save the configuration.
+ *
+ * @returns the upstream set up (`origin/topic`, a local `main`)
+ */
+export async function installTracking(
+  workingCopy: WorkingCopy,
+  newBranch: string,
+  plan: TrackingPlan,
+): Promise<string> {
+  const config = RemoteConfigStore.from(workingCopy);
+  const { remote, merges } = plan;
+  config.setValue(`branch.${newBranch}.remote`, remote ?? ".");
+  config.setValues(`branch.${newBranch}.merge`, merges);
+  if (plan.rebase) config.setValue(`branch.${newBranch}.rebase`, "true");
+  await config.save();
+  const first = merges[0] ?? "";
   const short = first.replace(/^refs\/heads\//, "");
   return remote && remote !== "." ? `${remote}/${short}` : short;
+}
+
+/**
+ * git's `setup_tracking`: `branch.<name>.remote` and `branch.<name>.merge` (and
+ * `branch.<name>.rebase` as `branch.autoSetupRebase` asks) for a new branch that starts at
+ * the branch `startRef` (a full ref name, see {@link trackableStart}), as `mode` and
+ * `branch.autoSetupMerge` say. The configuration is saved.
+ *
+ * @returns the upstream set up (`origin/topic`, a local `main`), or undefined when none
+ */
+export async function setupTracking(
+  workingCopy: WorkingCopy,
+  newBranch: string,
+  startRef: string,
+  mode: TrackMode,
+): Promise<string | undefined> {
+  const plan = planTracking(workingCopy, newBranch, startRef, mode);
+  return plan ? installTracking(workingCopy, newBranch, plan) : undefined;
 }

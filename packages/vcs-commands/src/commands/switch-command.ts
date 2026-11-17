@@ -130,8 +130,9 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
 
   /**
    * `--track` (`TrackMode.DIRECT`), `--track=inherit`, `--no-track` (`TrackMode.NONE`).
-   * `--track` without `-c` names the new branch after the remote-tracking branch
-   * (`origin/topic` creates `topic`).
+   * Any of them without `-c` names the new branch after the remote-tracking branch, as git
+   * does (`origin/topic` creates `topic`, untracked with `--no-track`; `main` is refused,
+   * `missing branch name; try -c`).
    */
   setTrack(mode: TrackMode): this {
     this.checkCallable();
@@ -171,9 +172,10 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     this.setCallable(false);
     const trackGiven = this.track !== TrackMode.DEFAULT;
 
-    // checkout_main: --track without -c names the branch after the remote one
+    // checkout_main: --track (and --no-track) without -c names the branch after the
+    // remote one
     let newBranch = this.newBranch;
-    if (trackGiven && this.track !== TrackMode.NONE && newBranch === undefined && !this.orphan) {
+    if (trackGiven && newBranch === undefined && !this.orphan) {
       if (this.name === undefined)
         throw new SwitchRefusedError("fatal: --track needs a branch name");
       const rest = this.name.replace(/^refs\//, "").replace(/^remotes\//, "");
@@ -184,11 +186,10 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       newBranch = rest.slice(slash + 1);
     }
 
-    // the options that do not go together (die_for_incompatible_opt3, checkout_branch)
+    // the options that do not go together (checkout_main, checkout_branch)
     if (newBranch !== undefined && this.orphan !== undefined) {
-      const option = this.forceCreate ? "-C" : "-c";
       throw new SwitchRefusedError(
-        `fatal: options '${option}' and '--orphan' cannot be used together`,
+        "fatal: options '-c', '-C', and '--orphan' cannot be used together",
       );
     }
     if (this.detach && (newBranch !== undefined || this.orphan !== undefined)) {
@@ -219,11 +220,16 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     }
 
     // `<branch>`: a local branch, a name guessed into one, else refused; a start point or
-    // the commit to detach at must name a commit
-    if (created === undefined && !this.detach && this.name !== undefined) {
-      await this.checkBranchArgument(this.name);
-    } else if (this.name !== undefined && !(await this.namesCommit(this.name))) {
-      throw new SwitchRefusedError(`fatal: invalid reference: ${this.name}`);
+    // the commit to detach at must name a commit. `-` is @{-1}, and @{-N} is expanded once,
+    // the switch itself handed the expanded name
+    const arg = this.name === "-" ? "@{-1}" : this.name;
+    const name = arg === undefined ? undefined : await this.expandPriorCheckout(arg);
+    if (arg !== undefined && name !== undefined) {
+      if (created === undefined && !this.detach) {
+        await this.checkBranchArgument(arg, name);
+      } else if (!(await this.namesCommit(name))) {
+        throw new SwitchRefusedError(`fatal: invalid reference: ${arg}`);
+      }
     }
 
     await this.refuseInProgress();
@@ -239,10 +245,10 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       checkout.setOrphan(true).setOrphanFromEmptyTree(true).setName(this.orphan);
     } else if (newBranch !== undefined) {
       checkout.setCreateBranch(true).setName(newBranch);
-      if (this.name !== undefined) checkout.setStartPoint(this.name);
+      if (name !== undefined) checkout.setStartPoint(name);
     } else {
       if (this.detach) checkout.setDetach(true);
-      if (this.name !== undefined) checkout.setName(this.name);
+      if (name !== undefined) checkout.setName(name);
     }
     try {
       return await checkout.call();
@@ -263,10 +269,11 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
    * git's `parse_branchname_arg` and `die_expecting_a_branch` for `git switch <name>`: a
    * local branch (also as `-` / `@{-N}`) passes, as does a name `--guess` turns into a new
    * branch; a commit is refused with git's message and hint; anything else is an invalid
-   * reference.
+   * reference. `arg` is the argument (`-` as @{-1}), `name` it with @{-N} expanded; only
+   * the argument itself is guessed into a remote-tracking branch, so `-` naming a deleted
+   * branch is an invalid reference.
    */
-  private async checkBranchArgument(given: string): Promise<void> {
-    const name = await this.expandPriorCheckout(given === "-" ? "@{-1}" : given);
+  private async checkBranchArgument(arg: string, name: string): Promise<void> {
     if (isValidBranchName(name) && (await this.refsStore.has(`refs/heads/${name}`))) return;
     let commit: string | undefined;
     try {
@@ -278,18 +285,18 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     if (commit === undefined) {
       const configured = RemoteConfigStore.from(this.workingCopy).value("checkout.guess");
       const guess = this.guess ?? parseGitBool(configured) ?? true;
-      if (guess && isValidBranchName(name)) {
-        if (await guessRemoteBranch(this.workingCopy, this.refsStore, name)) return;
+      if (guess && isValidBranchName(arg)) {
+        if (await guessRemoteBranch(this.workingCopy, this.refsStore, arg)) return;
       }
-      throw new SwitchRefusedError(`fatal: invalid reference: ${name}`);
+      throw new SwitchRefusedError(`fatal: invalid reference: ${arg}`);
     }
     throw new SwitchRefusedError(`fatal: ${await this.expectedABranch(name)}\n${DETACH_HINT}`);
   }
 
-  /** Whether `name` (`-` and `@{-N}` expanded) is a revision that names a commit. */
+  /** Whether `name` (`@{-N}` expanded) is a revision that names a commit. */
   private async namesCommit(name: string): Promise<boolean> {
     try {
-      const id = await this.resolveRef(name === "-" ? "@{-1}" : name);
+      const id = await this.resolveRef(name);
       return await this.commits.has(id);
     } catch {
       return false;
