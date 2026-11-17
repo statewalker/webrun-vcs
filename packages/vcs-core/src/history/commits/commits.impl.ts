@@ -222,7 +222,6 @@ class GitCommitStore implements Commits {
 /** Parsed commits the store keeps at most. */
 const MAX_CACHED_COMMITS = 10_000;
 
-/** A copy a caller may change without reaching the cache. */
 /** The commit in `bytes`, or undefined if it is not a commit or does not parse. */
 function fromBytes(type: string, bytes: Uint8Array): Commit | undefined {
   if (type !== "commit") return undefined;
@@ -233,6 +232,7 @@ function fromBytes(type: string, bytes: Uint8Array): Commit | undefined {
   }
 }
 
+/** A copy a caller may change without reaching the cache. */
 function copyCommit(c: Commit): Commit {
   return { ...c, parents: [...c.parents], author: { ...c.author }, committer: { ...c.committer } };
 }

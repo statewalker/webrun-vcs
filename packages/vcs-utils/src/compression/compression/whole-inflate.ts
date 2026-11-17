@@ -392,7 +392,8 @@ function adler32(b: Uint8Array, from: number, to: number): number {
 
 /**
  * The bit reader's state, handed between `inflateWhole` (which keeps it in locals) and
- * `readDynamicTables`. `hold` keeps up to 30 bits, the next one lowest.
+ * `readDynamicTables`. `hold` keeps up to 30 bits, the next one lowest (32 only briefly for a
+ * stored block's LEN/NLEN, which is read with `& 0xffff` and `>>> 16` and then dropped).
  */
 const rd = { pos: 0, hold: 0, bits: 0, litBits: 0, distBits: 0 };
 
