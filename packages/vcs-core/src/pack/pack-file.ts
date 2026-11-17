@@ -289,7 +289,7 @@ function copyOf(b: Uint8Array): Uint8Array {
 }
 
 /** Delta instructions are inflated here (grown as needed), then read once. */
-let deltaScratch = new Uint8Array(64 * 1024);
+const deltaScratch = new Uint8Array(OPEN_MAX);
 
 /** An entry of the delta base cache, and the map (of its scope) that lists it. */
 interface CachedBase<K> {
@@ -890,9 +890,12 @@ export async function openPack(
   /** A delta's instructions: inflated into a reused buffer when synchronous, read once by `applyGitDelta`. */
   const inflateDelta = (l: LoadedEntry): Uint8Array | Promise<Uint8Array> => {
     if (!l.data) return inflateAll(l.e);
-    if (l.e.size > deltaScratch.length)
-      deltaScratch = new Uint8Array(Math.max(l.e.size, deltaScratch.length * 2));
-    const into = deltaScratch.subarray(0, l.e.size);
+    // the shared buffer stays at `OPEN_MAX`: a larger delta gets a buffer of its own, so one big
+    // read does not keep megabytes allocated for the life of the process
+    const into =
+      l.e.size <= deltaScratch.length
+        ? deltaScratch.subarray(0, l.e.size)
+        : new Uint8Array(l.e.size);
     // awaited before it is applied, the fallback gets a buffer of its own, not the shared one
     return inflateLoaded(l as LoadedEntry & { data: Uint8Array }, into) ?? reinflate(l);
   };

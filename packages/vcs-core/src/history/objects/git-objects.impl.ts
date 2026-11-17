@@ -13,7 +13,6 @@ import { createInflaterPool, deflate, inflateWhole } from "@statewalker/vcs-util
 import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { SizeMismatchError } from "@statewalker/vcs-utils/pack";
-import { allocBytes } from "@statewalker/vcs-utils/streams";
 import type { StagingBlobStore } from "../../storage/adapters/staging-blob-store.js";
 import {
   CorruptObjectError,
@@ -169,8 +168,11 @@ interface ProbedHead {
   header: Header;
   /** where the content starts in the inflated bytes (after the header's NUL) */
   bodyAt: number;
-  /** the whole object when it fit in `headProbe` (its zlib stream ended there) */
-  whole?: { length: number; consumed: number };
+  /**
+   * the whole object when it fit in `headProbe` (its zlib stream ended there): its content copied
+   * out of the shared probe buffer, which a concurrent read may overwrite
+   */
+  whole?: { length: number; consumed: number; body: Uint8Array };
 }
 
 /**
@@ -195,7 +197,15 @@ function probeHead(start: Uint8Array): ProbedHead | undefined {
   return {
     header,
     bodyAt: nul + 1,
-    ...(head.ended ? { whole: { length: head.length, consumed: head.consumed } } : {}),
+    ...(head.ended
+      ? {
+          whole: {
+            length: head.length,
+            consumed: head.consumed,
+            body: headProbe.slice(nul + 1, head.length),
+          },
+        }
+      : {}),
   };
 }
 
@@ -211,8 +221,7 @@ function wholeObject(stored: Uint8Array, head: ProbedHead): GitObject | undefine
   if (head.whole) {
     // the whole object was in the probe: `stored` is the chunk it was probed from
     if (head.whole.consumed !== stored.length || head.whole.length !== total) return undefined;
-    bytes = allocBytes(header.size);
-    bytes.set(headProbe.subarray(bodyAt, total));
+    bytes = head.whole.body;
   } else {
     let r: ReturnType<typeof inflateWhole>;
     try {
