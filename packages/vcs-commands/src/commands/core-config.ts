@@ -12,17 +12,17 @@ import {
   type ObjectId,
   parseCoreAbbrev,
 } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorkingCopy, Worktree, WorktreeModeTrust } from "@statewalker/vcs-working-tree";
 
 import { RemoteConfigStore } from "../remote-config/index.js";
 
-/** A git boolean (`true`/`yes`/`on`/`1`, `false`/`no`/`off`/`0`), else `fallback`. */
+/**
+ * A git boolean (`git_config_bool`: a key with no `=` is true, an empty value false), else
+ * `fallback`.
+ */
 export function coreBool(workingCopy: WorkingCopy, name: string, fallback: boolean): boolean {
-  const value = RemoteConfigStore.from(workingCopy).value(`core.${name}`)?.trim().toLowerCase();
-  if (value === undefined) return fallback;
-  if (["false", "no", "off", "0"].includes(value)) return false;
-  if (["true", "yes", "on", "1", ""].includes(value)) return true;
-  return fallback;
+  return parseGitBool(RemoteConfigStore.from(workingCopy).value(`core.${name}`)) ?? fallback;
 }
 
 /**

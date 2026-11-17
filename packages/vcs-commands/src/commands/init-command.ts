@@ -13,6 +13,7 @@ import {
   resolveLinkedGitDir,
 } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils";
 import {
   createMemoryCheckout,
   type Staging,
@@ -443,12 +444,12 @@ async function setCoreValue(
 ): Promise<void> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of files.read(configPath)) chunks.push(chunk);
-  const text = new TextDecoder().decode(concatChunks(chunks));
+  const text = decodeGitPath(concatChunks(chunks));
   const existing = new RegExp(`^(\\s*${key}\\s*=\\s*)\\S+`, "mi");
   const updated = existing.test(text)
     ? text.replace(existing, `$1${value}`)
     : text.replace(/^\[core\]\s*$/m, `[core]\n\t${key} = ${value}`);
-  await files.write(configPath, [new TextEncoder().encode(updated)]);
+  await files.write(configPath, [encodeGitPath(updated)]);
 }
 
 function concatChunks(chunks: Uint8Array[]): Uint8Array {

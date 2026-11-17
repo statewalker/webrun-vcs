@@ -122,4 +122,27 @@ describe("path queries take paths literally, case-sensitive and in byte order", 
     expect(found).toEqual(["cafz", "caf\u00e9", "caf\udce9"]);
     await db.close();
   });
+
+  it("findByNamePattern sorts a subtree as its name plus '/', the tree's own entry order", async () => {
+    const db = await SqlJsAdapter.create();
+    await initializeSchema(db);
+    const { trees } = createSqlNativeStores(db);
+    const sub = await trees.store([{ mode: 0o100644, name: "f", id: BLOB }]);
+    // "a.b" (2e) and "a-b" (2d) sort before the subtree "a" ("a/", 2f); "a0" (30) after it
+    const treeId = await trees.store([
+      { mode: 0o100644, name: "a0", id: BLOB },
+      { mode: 0o40000, name: "a", id: sub },
+      { mode: 0o100644, name: "a.b", id: BLOB },
+      { mode: 0o100644, name: "a-b", id: BLOB },
+    ]);
+    const stored: string[] = [];
+    for await (const entry of (await trees.load(treeId)) ?? []) stored.push(entry.name);
+    const found: string[] = [];
+    for await (const result of trees.findByNamePattern("a%")) {
+      if (result.treeId === treeId) found.push(result.entry.name);
+    }
+    expect(found).toEqual(["a-b", "a.b", "a", "a0"]);
+    expect(found).toEqual(stored);
+    await db.close();
+  });
 });

@@ -16,6 +16,7 @@
  */
 
 import type { ObjectId, Refs } from "@statewalker/vcs-core";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type {
   Checkout,
   CheckoutCherryPickState,
@@ -489,15 +490,14 @@ export class GitCheckout implements Checkout {
     try {
       const content = await this.files.read(path);
       if (!content) return undefined;
-      return new TextDecoder().decode(content);
+      return decodeGitPath(content); // bytes survive: FETCH_HEAD URLs, MERGE_MSG in latin-1
     } catch {
       return undefined;
     }
   }
 
   private async writeFile(path: string, content: string): Promise<void> {
-    const encoder = new TextEncoder();
-    await this.files.write(path, [encoder.encode(content)]);
+    await this.files.write(path, [encodeGitPath(content)]);
   }
 
   private async removeFile(path: string): Promise<void> {

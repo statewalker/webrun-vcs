@@ -745,4 +745,22 @@ describe("byte-exact literal parts and ASCII-only case folding (git's dir.c)", (
     expect(manager.isIgnored("x.log", false)).toBe(false);
     expect(manager.isIgnored("build", true)).toBe(false);
   });
+
+  it("with core.ignoreCase a directory's .gitignore applies to its path in any ASCII case", () => {
+    // git compares a pattern's base directory with fspathncmp
+    const manager = createIgnoreManager({ ignoreCase: true });
+    manager.addIgnoreFile("Docs", "*.tmp\n/Only\n");
+    expect(manager.isIgnored("docs/a.tmp", false)).toBe(true);
+    expect(manager.isIgnored("DOCS/sub/b.tmp", false)).toBe(true);
+    expect(manager.isIgnored("docs/only", false)).toBe(true);
+    // not a prefix match: "Docsx" is another directory
+    expect(manager.isIgnored("docsx/a.tmp", false)).toBe(false);
+    // the Kelvin sign is not "k": only ASCII folds
+    manager.addIgnoreFile("K", "*.tmp\n");
+    expect(manager.isIgnored("\u212a/a.tmp", false)).toBe(false);
+    expect(manager.isIgnored("k/a.tmp", false)).toBe(true);
+    manager.setIgnoreCase?.(false);
+    expect(manager.isIgnored("docs/a.tmp", false)).toBe(false);
+    expect(manager.isIgnored("Docs/a.tmp", false)).toBe(true);
+  });
 });

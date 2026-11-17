@@ -17,6 +17,7 @@ import type {
   Worktree,
 } from "@statewalker/vcs-working-tree";
 
+import { isAbsoluteGitPath, parseCommonDir } from "../git-dir/index.js";
 import { createGitStashStore } from "./stash-store.files.js";
 import { GitWorkingCopy, type WorkingCopyFilesApi } from "./working-copy.files.js";
 import {
@@ -33,6 +34,11 @@ export interface WorkingCopyFactoryFilesApi extends WorkingCopyFilesApi, ConfigF
   mkdir(path: string): Promise<void>;
   /** Write content to a file */
   writeFile(path: string, content: string): Promise<void>;
+  /**
+   * Remove a file or a directory with its contents. `addWorktree` uses it to drop the
+   * transient `locked` file and, when it fails, what it created.
+   */
+  remove(path: string): Promise<unknown>;
 }
 
 /**
@@ -87,10 +93,10 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
    */
   private async openConfig(gitDir: string, commonDir?: string) {
     const common = commonDir ?? (await this.commonDirOf(gitDir));
-    const root = this.setup.rootPath ?? (this.files as { rootDirectory?: unknown }).rootDirectory;
+    const root = this.hostRoot()?.base;
     const gitDirPath =
-      typeof root === "string" && root !== "" && !gitDir.startsWith("/")
-        ? `${root.replace(/\/+$/, "")}/${gitDir.replace(/^\.\//, "")}`
+      root !== undefined && !gitDir.startsWith("/")
+        ? `${root}/${gitDir.replace(/^\.\//, "")}`
         : gitDir;
     const options: GitConfigOptions = {
       ...(this.setup.environment ? { environment: this.setup.environment } : {}),
@@ -115,9 +121,11 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
 
   /** git's `commondir`: the repository a linked worktree's git directory belongs to. */
   private async commonDirOf(gitDir: string): Promise<string> {
-    const text = (await this.readText(`${gitDir}/commondir`))?.trim();
+    const content = await this.readText(`${gitDir}/commondir`);
+    // only the line end is stripped (get_common_dir_noenv)
+    const text = content === undefined ? undefined : parseCommonDir(content);
     if (!text) return gitDir;
-    if (text.startsWith("/")) return text;
+    if (isAbsoluteGitPath(text)) return this.filesPath(text);
     // relative to the worktree's git directory
     const parts = gitDir.split("/").filter((p) => p !== "" && p !== ".");
     for (const part of text.split("/")) {
@@ -169,18 +177,78 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
   }
 
   /**
+   * Where this FilesApi's root is on the host (`rootPath`, else its `rootDirectory`), without
+   * trailing slashes (`""` for `/`); undefined when unknown. A Windows root (`C:\\Users\\x`, a
+   * UNC `\\\\server\\share`) is written with forward slashes, as Git for Windows writes paths
+   * (`C:/Users/x`).
+   */
+  private hostRoot(): { base: string; windows: boolean } | undefined {
+    const root = this.setup.rootPath ?? (this.files as { rootDirectory?: unknown }).rootDirectory;
+    if (typeof root !== "string" || root === "") return undefined;
+    const windows = /^[A-Za-z]:/.test(root) || root.startsWith("\\");
+    const slashed = windows ? root.replace(/\\/g, "/") : root;
+    return { base: slashed.replace(/\/+$/, ""), windows };
+  }
+
+  /**
+   * The path git writes for `path` (a path in this FilesApi): absolute on the host when the
+   * FilesApi's root is known (`rootPath`, else its `rootDirectory`), as git writes a
+   * worktree's real paths; else `path` itself.
+   */
+  private hostPath(path: string): string {
+    const root = this.hostRoot();
+    if (root === undefined) return path;
+    const inner = path
+      .split("/")
+      .filter((p) => p !== "" && p !== ".")
+      .join("/");
+    return inner === "" ? root.base || "/" : `${root.base}/${inner}`;
+  }
+
+  /**
+   * The path in this FilesApi an absolute host path names (an absolute `commondir`): the
+   * part below the FilesApi's root on the host, as `FileWorktree` maps an absolute gitfile
+   * target. Returned as written when the root is unknown or the path lies outside it: such a
+   * repository is beyond what this FilesApi can name, and reading it fails as a missing one.
+   */
+  private filesPath(hostPath: string): string {
+    const root = this.hostRoot();
+    if (root === undefined) return hostPath;
+    // `.` and `..` resolved, separators collapsed (a leading `//`, a UNC root, kept)
+    const normalize = (path: string) => {
+      const slashed = root.windows ? path.replace(/\\/g, "/") : path;
+      const lead = /^\/*/.exec(slashed)?.[0] ?? "";
+      const parts: string[] = [];
+      for (const part of slashed.slice(lead.length).split("/")) {
+        if (part === "..") parts.pop();
+        else if (part !== "." && part !== "") parts.push(part);
+      }
+      return `${lead.length >= 2 && root.windows ? "//" : lead ? "/" : ""}${parts.join("/")}`;
+    };
+    const target = normalize(hostPath);
+    const base = root.base === "" ? "" : normalize(root.base).replace(/\/$/, "");
+    const same = (a: string, b: string) =>
+      root.windows ? a.toLowerCase() === b.toLowerCase() : a === b;
+    if (same(target, base)) return "/";
+    const prefix = `${base}/`;
+    if (!same(target.slice(0, prefix.length), prefix)) return hostPath;
+    return `/${target.slice(prefix.length)}`;
+  }
+
+  /**
    * Create additional worktree for existing repository.
    *
-   * Similar to `git worktree add`.
+   * Like `git worktree add --no-checkout`: the files are not checked out and no index is
+   * written. The administrative directory holds what git writes there:
+   * - `.git/worktrees/NAME/HEAD`: the worktree's branch or detached commit
+   * - `.git/worktrees/NAME/commondir`: `../..`, the repository the worktree belongs to
+   * - `.git/worktrees/NAME/gitdir`: the path back to the worktree's `.git` file
+   * - `.git/worktrees/NAME/locked`: the lock reason, with `lock`
+   * - the worktree's `.git` file: `gitdir: /path/to/main/.git/worktrees/NAME`
    *
-   * Git Worktree Structure:
-   * - Main repo .git/worktrees/NAME/ contains:
-   *   - HEAD: Current branch/commit for this worktree
-   *   - index: Staging area
-   *   - gitdir: Path back to worktree's .git file
-   *   - config: Per-worktree config (optional)
-   * - Worktree .git is a file containing:
-   *   gitdir: /path/to/main/.git/worktrees/NAME
+   * NAME is the worktree directory's name, followed by 1, 2, ... when a worktree of that
+   * name exists, as git numbers them. With a known host root the paths are absolute host
+   * paths, as git writes them, so native git can use the worktree.
    *
    * @param history History interface
    * @param gitDir Path to the main .git directory
@@ -193,56 +261,92 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     worktreePath: string,
     options: AddWorktreeOptions = {},
   ): Promise<WorkingCopy> {
-    const { branch, commit, force = false } = options;
+    const { branch, commit, force = false, lock } = options;
 
-    // Extract worktree name from path
-    const worktreeName = worktreePath.split("/").pop() || "worktree";
-    const worktreeGitDir = `${gitDir}/worktrees/${worktreeName}`;
-
-    // Create worktree directory
-    await this.files.mkdir(worktreePath);
-
-    // Create worktrees directory in main repo
-    await this.files.mkdir(`${gitDir}/worktrees`);
-    await this.files.mkdir(worktreeGitDir);
-
-    // Create .git file in worktree pointing to main repo's worktrees/NAME
-    // (paths as their bytes: one that is no UTF-8 is written as it is, never as U+FFFD)
-    const gitFile = `gitdir: ${worktreeGitDir}\n`;
-    await this.files.write(`${worktreePath}/.git`, encodeGitPath(gitFile));
-
-    // Create gitdir file in worktrees/NAME pointing back to worktree
-    await this.files.write(`${worktreeGitDir}/gitdir`, encodeGitPath(`${worktreePath}/.git\n`));
-
-    // Set up HEAD in worktrees/NAME. Written plainly, as git's `worktree add` writes the
-    // new worktree's HEAD (write_file): worktrees/NAME was created just above and no other
-    // writer knows it yet. Later HEAD updates go through that worktree's ref store (locked).
+    // What HEAD names, checked before anything is written (git resolves the commit-ish and
+    // refuses a missing branch before add_worktree creates a directory)
+    let head: string;
+    let createBranch: { ref: string; objectId: string } | undefined;
     if (commit) {
-      // Detached HEAD
-      await this.files.writeFile(`${worktreeGitDir}/HEAD`, `${commit}\n`);
+      head = commit; // detached HEAD
     } else if (branch) {
-      // Create branch if it doesn't exist (when force is true) or use existing
       const branchRef = branch.startsWith("refs/") ? branch : `refs/heads/${branch}`;
-      await this.files.writeFile(`${worktreeGitDir}/HEAD`, `ref: ${branchRef}\n`);
-
-      // If branch doesn't exist, create it pointing to current HEAD
-      const existingRef = await history.refs.get(branchRef);
-      if (!existingRef && force) {
-        const headRef = await history.refs.resolve("HEAD");
-        if (headRef?.objectId) {
-          await history.refs.set(branchRef, headRef.objectId);
+      head = `ref: ${branchRef}`;
+      if (!(await history.refs.get(branchRef))) {
+        if (!force) {
+          throw new Error(`Branch '${branch}' does not exist. Use force: true to create it.`);
         }
-      } else if (!existingRef && !force) {
-        throw new Error(`Branch '${branch}' does not exist. Use force: true to create it.`);
+        // created pointing at the current HEAD (an unborn HEAD leaves the branch unborn)
+        const headRef = await history.refs.resolve("HEAD");
+        if (headRef?.objectId) createBranch = { ref: branchRef, objectId: headRef.objectId };
       }
     } else {
       // Default: detached HEAD at current commit
       const headRef = await history.refs.resolve("HEAD");
-      if (headRef?.objectId) {
-        await this.files.writeFile(`${worktreeGitDir}/HEAD`, `${headRef.objectId}\n`);
-      } else {
-        throw new Error("Cannot add worktree: repository has no commits.");
+      if (!headRef?.objectId) throw new Error("Cannot add worktree: repository has no commits.");
+      head = headRef.objectId;
+    }
+
+    // Extract worktree name from path; numbered when taken, as git's add_worktree does
+    const baseName = worktreePath.split("/").filter(Boolean).pop() || "worktree";
+    let worktreeName = baseName;
+    for (let counter = 1; await this.files.exists(`${gitDir}/worktrees/${worktreeName}`); ) {
+      worktreeName = `${baseName}${counter++}`;
+    }
+    const worktreeGitDir = `${gitDir}/worktrees/${worktreeName}`;
+
+    // `git worktree add -b` creates the branch first; it stays when the worktree fails
+    if (createBranch) await history.refs.set(createBranch.ref, createBranch.objectId);
+
+    // On a failure from here on, what this call created goes (git's junk_git_dir and
+    // junk_work_tree): the admin directory, and the worktree directory unless it existed
+    const worktreeExisted = await this.files.exists(worktreePath);
+    let created = false;
+    try {
+      // Create worktree directory
+      await this.files.mkdir(worktreePath);
+      created = true;
+
+      // Create worktrees/NAME in main repo. Locked while it is set up, as git does: with
+      // the reason `lock` gives, else "initializing", dropped at the end
+      await this.files.mkdir(`${gitDir}/worktrees`);
+      await this.files.mkdir(worktreeGitDir);
+      const reason = lock === true ? "added with --lock" : lock || undefined;
+      const kept = lock !== undefined && lock !== false;
+      // git's write_file: a line end only when the text has none (an empty reason: empty file)
+      const lockText = reason === undefined ? "" : reason.endsWith("\n") ? reason : `${reason}\n`;
+      await this.files.write(
+        `${worktreeGitDir}/locked`,
+        encodeGitPath(kept ? lockText : "initializing\n"),
+      );
+
+      // Create .git file in worktree pointing to main repo's worktrees/NAME
+      // (paths as their bytes: one that is no UTF-8 is written as it is, never as U+FFFD)
+      const gitFile = `gitdir: ${this.hostPath(worktreeGitDir)}\n`;
+      await this.files.write(`${worktreePath}/.git`, encodeGitPath(gitFile));
+
+      // Create gitdir file in worktrees/NAME pointing back to worktree
+      await this.files.write(
+        `${worktreeGitDir}/gitdir`,
+        encodeGitPath(`${this.hostPath(`${worktreePath}/.git`)}\n`),
+      );
+
+      // The repository the worktree belongs to, relative to worktrees/NAME (git writes `../..`)
+      await this.files.write(`${worktreeGitDir}/commondir`, encodeGitPath("../..\n"));
+
+      // Set up HEAD in worktrees/NAME. Written plainly, as git's `worktree add` writes the
+      // new worktree's HEAD (write_file): worktrees/NAME was created just above and no other
+      // writer knows it yet. Later HEAD updates go through that worktree's ref store (locked).
+      await this.files.writeFile(`${worktreeGitDir}/HEAD`, `${head}\n`);
+
+      // `git worktree add --lock [--reason]` leaves the lock in place
+      if (!kept) await this.files.remove(`${worktreeGitDir}/locked`);
+    } catch (error) {
+      if (created) {
+        await this.files.remove(worktreeGitDir).catch(() => undefined);
+        if (!worktreeExisted) await this.files.remove(worktreePath).catch(() => undefined);
       }
+      throw error;
     }
 
     // Create the working copy using the worktree-specific git directory

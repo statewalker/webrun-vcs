@@ -3,6 +3,7 @@ import { DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
 import {
   type InternedText,
   LineInterner,
+  parseGitBool,
   type SupportedAlgorithm,
   whitespaceFlags,
   type XdiffAlgorithm,
@@ -941,14 +942,8 @@ function countLines(content: Uint8Array): number {
   return n;
 }
 
-function boolValue(v: string | undefined): boolean | undefined {
-  if (v === undefined) return undefined;
-  const s = v.trim().toLowerCase();
-  if (s === "" || s === "true" || s === "yes" || s === "on") return true;
-  if (s === "false" || s === "no" || s === "off") return false;
-  const n = Number(s);
-  return Number.isInteger(n) ? n !== 0 : undefined;
-}
+/** A git boolean (`git_config_bool`), undefined when unset or not one. */
+const boolValue = (v: string | undefined): boolean | undefined => parseGitBool(v);
 
 function intValue(value: string | undefined): number | undefined {
   const m = value?.trim().match(/^(-?\d+)([kmg]?)$/i);

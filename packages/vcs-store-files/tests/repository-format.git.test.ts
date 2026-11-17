@@ -8,10 +8,12 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GcOrchestrator } from "@statewalker/vcs-core";
+import { createInMemoryFilesApi, GcOrchestrator } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  assertNoAlternates,
+  checkRepositoryFormat,
   createGitFilesBackend,
   FileGcStrategy,
   gc,
@@ -194,6 +196,32 @@ describe("a repository with alternates (git clone --shared)", () => {
     await expect(orchestrator.run({ pruneExpireMs: 0 })).rejects.toThrow(/alternates/);
     expect(stored(dir)).toEqual(before);
     expect(before.has(orphan)).toBe(true);
+  });
+
+  it("reads objects/info/alternates as bytes: a latin-1 path counts, comments do not", async () => {
+    const files = createInMemoryFilesApi();
+    const alternates = ".git/objects/info/alternates";
+    await files.write(alternates, [new TextEncoder().encode("# none here\n\n")]);
+    await expect(assertNoAlternates(files)).resolves.toBeUndefined();
+    await files.write(alternates, [new Uint8Array([0x2f, 0x63, 0x61, 0x66, 0xe9, 0x0a])]);
+    await expect(assertNoAlternates(files)).rejects.toThrow(/alternates/);
+  });
+});
+
+describe("format extensions read as git_config_bool", () => {
+  const configOf = (entries: Record<string, unknown>) => ({
+    get: (key: string) => entries[key],
+    listKeys: (prefix = "") => Object.keys(entries).filter((k) => k.startsWith(prefix)),
+  });
+
+  it("an empty value is false, a key with no `=` true, integers count", () => {
+    const format = (value: unknown) =>
+      checkRepositoryFormat(configOf({ "extensions.worktreeconfig": value })).worktreeConfig;
+    expect(format("")).toBe(false);
+    expect(format(true)).toBe(true);
+    expect(format("0x1")).toBe(true);
+    expect(format(0)).toBe(false);
+    expect(() => format("maybe")).toThrow(/bad boolean config value/);
   });
 });
 

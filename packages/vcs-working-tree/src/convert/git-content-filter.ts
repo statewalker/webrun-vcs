@@ -12,6 +12,7 @@
  */
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import {
@@ -136,16 +137,12 @@ function configKeys(config: WorkingCopyConfig | undefined, prefix: string): stri
   return Object.keys(config).filter((k) => k.toLowerCase().startsWith(prefix));
 }
 
-/** A git boolean value, or undefined when it is not one. */
+/**
+ * A git boolean value (`git_config_bool`), or undefined when it is not one: a key with no
+ * `=` (the boolean `true`) is true, an empty value false.
+ */
 export function gitBool(value: unknown): boolean | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  const text = String(value).trim().toLowerCase();
-  if (["true", "yes", "on", ""].includes(text)) return true;
-  if (["false", "no", "off"].includes(text)) return false;
-  if (/^-?\d+$/.test(text)) return Number(text) !== 0;
-  return undefined;
+  return parseGitBool(value);
 }
 
 const str = (value: unknown) =>

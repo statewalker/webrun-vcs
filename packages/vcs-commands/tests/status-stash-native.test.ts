@@ -299,6 +299,24 @@ describeGit("status against native git", () => {
     await expectStatusAsNative(dir);
   });
 
+  it("core.filemode as git_config_bool reads it: an empty value is false, a bare key true", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    chmodSync(join(dir, "a.txt"), 0o755);
+    // `filemode =`: false, so the executable bit is not trusted and the file is clean
+    run(dir, "config", "core.filemode", "");
+    expect(run(dir, "config", "--bool", "core.filemode")).toBe("false");
+    expect((await expectStatusAsNative(dir)).isClean()).toBe(true);
+    // `filemode` with no `=`: true, so the executable bit counts again
+    run(dir, "config", "--unset", "core.filemode");
+    writeFileSync(
+      join(dir, ".git/config"),
+      `${readFileSync(join(dir, ".git/config"), "utf8")}[core]\n\tfilemode\n`,
+    );
+    expect(run(dir, "config", "--bool", "core.filemode")).toBe("true");
+    expect((await expectStatusAsNative(dir)).modified).toEqual(new Set(["a.txt"]));
+  });
+
   it("core.symlinks=false: a link checked out as a file holding its target is clean", async () => {
     const dir = join(root, "r");
     repo(dir);

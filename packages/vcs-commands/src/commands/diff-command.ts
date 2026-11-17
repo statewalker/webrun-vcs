@@ -1,5 +1,5 @@
 import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
-import { ByteSink, type XdiffAlgorithm } from "@statewalker/vcs-utils";
+import { ByteSink, parseGitBool, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   collectChunks,
@@ -149,14 +149,8 @@ function compareBytes(a: string, b: string): number {
   return compareGitPaths(a, b);
 }
 
-function boolValue(v: string | undefined): boolean | undefined {
-  if (v === undefined) return undefined;
-  const s = v.trim().toLowerCase();
-  if (s === "" || s === "true" || s === "yes" || s === "on") return true;
-  if (s === "false" || s === "no" || s === "off") return false;
-  const n = Number(s);
-  return Number.isInteger(n) ? n !== 0 : undefined;
-}
+/** A git boolean (`git_config_bool`), undefined when unset or not one. */
+const boolValue = (v: string | undefined): boolean | undefined => parseGitBool(v);
 
 function intValue(value: string | undefined): number | undefined {
   const m = value?.trim().match(/^(-?\d+)([kmg]?)$/i);

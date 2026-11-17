@@ -11,6 +11,7 @@ import {
   decodeGitPath,
   decodeGitPatternFile,
   encodeGitPath,
+  parseGitBool,
 } from "@statewalker/vcs-utils/encoding";
 import {
   expandUserPath,
@@ -682,10 +683,7 @@ const dirOf = (path: string) => {
   return slash >= 0 ? path.slice(0, slash + 1) : "";
 };
 
-const isTrue = (value: unknown) =>
-  value === true ||
-  (typeof value === "number" && value !== 0) ||
-  (typeof value === "string" && ["true", "yes", "on", "1"].includes(value.toLowerCase()));
+const isTrue = (value: unknown) => parseGitBool(value) === true;
 
 /** `include.path` or `includeif.<condition>.path`. */
 function isIncludeKey(key: string): boolean {

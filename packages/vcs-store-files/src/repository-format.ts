@@ -17,6 +17,7 @@
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
+import { decodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
 
 import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
@@ -254,7 +255,7 @@ export async function assertNoAlternates(
 ): Promise<void> {
   const path = `${gitDir.replace(/\/+$/, "")}/objects/info/alternates`;
   if ((await files.stats(path))?.kind !== "file") return;
-  const text = new TextDecoder().decode(await readFile(files, path));
+  const text = decodeGitPath(await readFile(files, path));
   const used = text.split("\n").some((line) => line.trim() !== "" && !line.startsWith("#"));
   if (used) {
     throw new UnsupportedRepositoryFormatError(
@@ -279,13 +280,8 @@ function configInt(value: unknown, key: string): number {
 
 /** git_config_bool: true/false spellings, numbers, and an empty value as false. */
 function configBool(value: unknown, key: string): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  if (value === "") return false;
-  if (typeof value === "string") {
-    const parsed = parseGitInt(value);
-    if (parsed !== undefined) return parsed !== 0;
-  }
+  const parsed = parseGitBool(value);
+  if (parsed !== undefined) return parsed;
   throw new UnsupportedRepositoryFormatError(
     `bad boolean config value '${String(value)}' for '${key}'`,
   );

@@ -15,6 +15,7 @@ import {
   joinPath,
   openPackSet,
 } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
 import { skipPacked, withPacks } from "./pack/with-packs.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
@@ -167,14 +168,6 @@ export async function createGitFilesBackend(
   return { history, objects, packs, looseStorage, files, gitDir };
 }
 
-/** A git boolean as the config parser returns it (`""` and `0` are false); else undefined. */
-function gitBoolean(value: unknown): boolean | undefined {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  if (value === "") return false;
-  return undefined;
-}
-
 /**
  * The reflog settings of the repository's config, as git reads them: core.logAllRefUpdates
  * (a boolean or "always"), defaulting to true unless core.bare is true; user.name and
@@ -198,7 +191,7 @@ async function readReflogConfig(
   const logAllRefUpdates =
     typeof setting === "string" && setting.toLowerCase() === "always"
       ? "always"
-      : (gitBoolean(setting) ?? !(gitBoolean(config.get("core.bare")) ?? false));
+      : (parseGitBool(setting) ?? !(parseGitBool(config.get("core.bare")) ?? false));
   const name = config.get("user.name");
   const email = config.get("user.email");
   const identity =

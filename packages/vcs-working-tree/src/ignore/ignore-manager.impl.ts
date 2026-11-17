@@ -12,6 +12,8 @@
  * when it is set again, so a reread file never leaves its old rules behind.
  */
 
+import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
+
 import type { IgnoreManager, IgnoreNode, MatchResultValue } from "./ignore-manager.js";
 import { MatchResult } from "./ignore-manager.js";
 import { createIgnoreNode } from "./ignore-node.js";
@@ -185,13 +187,17 @@ class GitIgnoreManagerImpl implements IgnoreManager {
   }
 
   /**
-   * Check if a path is under a directory.
+   * Check if a path is under a directory. With `core.ignoreCase` the directory part
+   * compares with ASCII case folded, as git's `fspathncmp` does.
    */
   private isUnderDirectory(path: string, dirPath: string): boolean {
     if (dirPath === "" || dirPath === ".") {
       return true;
     }
-    return path === dirPath || path.startsWith(`${dirPath}/`);
+    const [p, d] = this.ignoreCase
+      ? [foldAsciiCase(path), foldAsciiCase(dirPath)]
+      : [path, dirPath];
+    return p === d || p.startsWith(`${d}/`);
   }
 
   /**
