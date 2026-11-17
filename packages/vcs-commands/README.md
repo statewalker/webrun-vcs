@@ -70,7 +70,7 @@ For a Git-compatible on-disk repository, build the `WorkingCopy` from the file-b
 | Inspection | `diff()`, `describe()` |
 | Remotes | `fetch()`, `push()`, `pull()`, `clone()`, `lsRemote()`, `remoteAdd()`, `remoteRemove()`, `remoteList()`, `remoteSetUrl()` |
 | Stash | `stashCreate()`, `stashApply()`, `stashDrop()`, `stashList()` |
-| Maintenance | `gc()`, `packRefs()` |
+| Maintenance | `gc()`, `packRefs()`, `fsck()`, `verifyPack()` |
 | Static | `Git.fromWorkingCopy(wc)`, `Git.init()` |
 | Components | `workingCopy`, `history`, `checkoutState`, `worktree` |
 
@@ -261,6 +261,20 @@ await git.tag().setName("v0.9.0").setObjectId(commitId).call();
 const tags = await git.tagList().call(); // Ref[]
 await git.tagDelete().setTags("v0.9.0").call();
 ```
+
+### Checking a repository: fsck and verify-pack
+
+```typescript
+const result = await git.fsck().setRepositoryFiles({ files }).setUnreachable(true).call();
+process.stdout.write(result.output); // "dangling commit 1234…", "missing blob 5678…"
+process.stderr.write(result.errorOutput); // "error in tree 9abc…: duplicateEntries: …"
+process.exitCode = result.exitCode; // git's bits: 1 objects, 2 reachability, 4 packs, 8 refs
+
+const packs = await git.verifyPack().setRepositoryFiles({ files })
+  .addPack(".git/objects/pack/pack-1234….idx").setVerbose(true).call();
+```
+
+`fsck()` prints what `git fsck` prints, in git's order: the object checks use git's message ids and severities (`fsck.<msg-id>` config, `setStrict`), and `missing`, `dangling` and `unreachable` objects come out in the order of git's object hash table. With `setRepositoryFiles` it also reads loose objects from their files and verifies packs (checksums, CRC-32s, hashes); without it, it checks the objects of `history.objects` (memory, KV and SQL stores). By default it reproduces `git fsck --no-references` of git 2.45 and later (HEAD's own checks moved to `git refs verify`, which is not implemented); `setCompatibility("2.43")` reproduces git 2.43, HEAD checks included.
 
 ### Errors
 

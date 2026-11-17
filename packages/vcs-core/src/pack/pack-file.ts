@@ -132,6 +132,8 @@ export interface OpenPackOptions {
    * use it (`PackFile.verifyIndex` checks it all later).
    */
   verifyIndex?: boolean;
+  /** The idx file's bytes, when the caller has read them already (not read again). */
+  idxBytes?: Uint8Array;
 }
 
 /** Counters, for tests and diagnostics. */
@@ -747,7 +749,7 @@ export async function openPack(
   const cacheLimit = cache.limit;
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
 
-  const idx = await readAll(files, idxPath);
+  const idx = options.idxBytes ?? (await readAll(files, idxPath));
   // git's check_packed_git_idx; the rest of the idx is checked as lookups use it
   const t = parseIdx(idx, idxPath);
   if (options.verifyIndex) await t.verify();

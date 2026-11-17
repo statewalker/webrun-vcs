@@ -15,6 +15,7 @@ import {
   DescribeCommand,
   DiffCommand,
   FetchCommand,
+  FsckCommand,
   GarbageCollectCommand,
   InitCommand,
   ListBranchCommand,
@@ -43,6 +44,7 @@ import {
   StashListCommand,
   StatusCommand,
   TagCommand,
+  VerifyPackCommand,
   WorktreeAddCommand,
   WorktreeListCommand,
   WorktreeLockCommand,
@@ -510,6 +512,38 @@ export class Git implements Disposable {
   gc(): GarbageCollectCommand {
     this.checkClosed();
     return new GarbageCollectCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an FsckCommand that verifies the connectivity and validity of the objects
+   * (`git fsck`).
+   *
+   * @example
+   * ```typescript
+   * const result = await git.fsck().setRepositoryFiles({ files }).call();
+   * if (result.exitCode !== 0) console.error(result.errorOutput);
+   * ```
+   */
+  fsck(): FsckCommand {
+    this.checkClosed();
+    return new FsckCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a VerifyPackCommand that verifies pack files (`git verify-pack`).
+   *
+   * @example
+   * ```typescript
+   * const result = await git.verifyPack()
+   *   .setRepositoryFiles({ files })
+   *   .addPack(".git/objects/pack/pack-1234.idx")
+   *   .setVerbose(true)
+   *   .call();
+   * ```
+   */
+  verifyPack(): VerifyPackCommand {
+    this.checkClosed();
+    return new VerifyPackCommand(this._workingCopy);
   }
 
   /**

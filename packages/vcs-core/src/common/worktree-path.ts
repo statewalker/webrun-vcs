@@ -105,7 +105,32 @@ export function isGitWorktreeFile(component: string, file: GitWorktreeFile): boo
   return isNtfsDotGeneric(component, file, GIT_FILES[file]);
 }
 
-function isDotGit(component: string): boolean {
+/**
+ * Whether a path component names one of the files git reads from the worktree under a
+ * spelling NTFS folds to it, ignoring HFS+ (git's `is_ntfs_dot*`, as fsck checks the parts of a
+ * name after a backslash).
+ *
+ * @example
+ * ```typescript
+ * isNtfsGitWorktreeFile("GITMOD~1", "gitmodules"); // true
+ * isNtfsGitWorktreeFile(".gitmodules ", "gitmodules"); // true
+ * ```
+ */
+export function isNtfsGitWorktreeFile(component: string, file: GitWorktreeFile): boolean {
+  return isNtfsDotGeneric(component, file, GIT_FILES[file]);
+}
+
+/**
+ * Whether a path component names `.git` under any spelling HFS+ or NTFS folds to it (git's
+ * `is_hfs_dotgit` / `is_ntfs_dotgit`, a `\\` ending an NTFS name).
+ *
+ * @example
+ * ```typescript
+ * isDotGitComponent(".GIT. "); // true
+ * isDotGitComponent("git~1"); // true
+ * ```
+ */
+export function isDotGitComponent(component: string): boolean {
   if (foldAsciiCase(component.replace(HFS_IGNORABLE, "")) === ".git") return true;
   // git's is_ntfs_dotgit ends a name at a backslash on every platform
   return component.split("\\").some((part) => NTFS_DOTGIT.test(part));
@@ -147,7 +172,7 @@ export function isValidWorktreePath(
   const components = path.split("/");
   for (const component of components) {
     if (component === "" || component === "." || component === "..") return false;
-    if (isDotGit(component)) return false;
+    if (isDotGitComponent(component)) return false;
     if (mode === SYMLINK_MODE && isGitWorktreeFile(component, "gitmodules")) return false;
   }
   return true;

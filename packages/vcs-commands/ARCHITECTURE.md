@@ -71,7 +71,7 @@ GitCommand<T> (abstract base)
 │   ├── StashDropCommand
 │   ├── StashListCommand
 │   ├── BlameCommand, CleanCommand, DescribeCommand, ReflogCommand
-│   ├── GarbageCollectCommand, PackRefsCommand
+│   ├── GarbageCollectCommand, PackRefsCommand, FsckCommand, VerifyPackCommand
 │   ├── RemoteAddCommand, RemoteRemoveCommand, RemoteListCommand, RemoteSetUrlCommand
 │   └── ...
 └── TransportCommand<T> (extends GitCommand)

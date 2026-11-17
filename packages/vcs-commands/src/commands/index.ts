@@ -10,6 +10,7 @@ export * from "./describe-command.js";
 export * from "./diff-command.js";
 export * from "./diff-textconv.js";
 export * from "./fetch-command.js";
+export * from "./fsck/index.js";
 export * from "./gc-command.js";
 export * from "./init-command.js";
 export * from "./log-command.js";
