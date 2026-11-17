@@ -401,7 +401,8 @@ describe("openPackSet: corrupt packs are skipped and recorded", () => {
     }
     const set = await openPackSet(files, PACK_DIR);
     expect(set.skipped).toEqual([]);
-    await expect(set.get(`aa${"1".repeat(38)}`)).rejects.toBeInstanceOf(PackError);
+    // a pack set misses (and rescans), as git: a bucket it cannot search holds nothing
+    expect(await set.get(`aa${"1".repeat(38)}`)).toBeUndefined();
     expect(await set.has(`aa${"1".repeat(38)}`)).toBe(false);
   });
 
@@ -728,6 +729,7 @@ describe("PackSet: rescans the directory on a miss", () => {
 describe("the delta base cache", () => {
   // Random reads of a 50-deep chain with a cache of 4 objects: 660 inflations against 1326
   // without a cache. Caching every step instead of spaced checkpoints gives 949 (prototype 13).
+  // A budget of 0 still keeps the most recent base, as git's: fewer than 1326.
   it("halves the inflations of random reads over a deep chain, within its budget", async () => {
     const files = createInMemoryFilesApi();
     const big = noise(64 * 1024, 3);
@@ -764,11 +766,15 @@ describe("the delta base cache", () => {
         expect((await content(o)).length).toBe(o?.size);
       }
       inflations.push(reader.stats.inflations);
-      expect(reader.stats.peakCachedBytes).toBeLessThanOrEqual(cache);
+      // as git's, the most recent base stays even alone over the budget (here 0)
+      expect(reader.stats.peakCachedBytes).toBeLessThanOrEqual(Math.max(cache, big.length + 50));
       expect(reader.stats.cachedBytes).toBe(reader.stats.cachedEntriesBytes);
       if (cache > 0) expect(reader.stats.peakCachedBytes).toBeGreaterThan(0);
     }
-    expect((inflations[0] as number) * 2).toBeLessThanOrEqual(inflations[1] as number);
+    // without any cache, each read inflates its whole chain: 1 + 2 + ... + 51
+    const uncached = (51 * 52) / 2;
+    expect((inflations[0] as number) * 2).toBeLessThanOrEqual(uncached);
+    expect(inflations[1] as number).toBeLessThan(uncached);
   });
 });
 
@@ -1388,5 +1394,135 @@ describe("P2.6 review: freshen and old packs", () => {
       return path === paths(r.packId).pack && s ? { ...s, lastModified: undefined } : s;
     };
     expect(await set.freshen(Aid)).toBe(true);
+  });
+});
+
+describe("review of #130: a corrupt idx bucket does not block the rescan", () => {
+  const one = `aa${"1".repeat(38)}`;
+  const two = `aa${"2".repeat(38)}`;
+  const sound = `bb${"3".repeat(38)}`;
+  /** Pack A: two ids swapped in bucket 0xaa (re-checksummed), one id in a sound bucket. */
+  async function packWithBadBucket(files: FilesApi) {
+    const raw = await writeRaw(
+      files,
+      [
+        { kind: 3, data: enc.encode("one\n") },
+        { kind: 3, data: enc.encode("two\n") },
+        { kind: 3, data: enc.encode("sound\n") },
+      ],
+      [one, two, sound],
+    );
+    const idx = raw.idx.slice();
+    const at = 8 + 1024;
+    const first = idx.slice(at, at + 20);
+    idx.copyWithin(at, at + 20, at + 40);
+    idx.set(first, at + 20);
+    idx.set(
+      createSha1()
+        .update(idx.subarray(0, idx.length - 20))
+        .digest(),
+      idx.length - 20,
+    );
+    await files.write(raw.idxPath, [idx]);
+    return raw;
+  }
+
+  it("an object of that bucket installed in a newer pack is found by the rescan", async () => {
+    const files = createInMemoryFilesApi();
+    await packWithBadBucket(files);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
+    const three = `aa${"3".repeat(38)}`;
+    await writeRaw(files, [{ kind: 3, data: enc.encode("three\n") }], [three]);
+    expect(dec.decode(await content(await set.get(three)))).toBe("three\n");
+    expect(await set.has(three)).toBe(true);
+  });
+
+  it("an absent id of that bucket is reported absent, not as an error", async () => {
+    const files = createInMemoryFilesApi();
+    await packWithBadBucket(files);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
+    const absent = `aa${"4".repeat(38)}`;
+    expect(await set.get(absent)).toBeUndefined();
+    expect(await set.has(absent)).toBe(false);
+    // the ids the bucket really holds cannot be read from it: absent too, as git's lookup
+    expect(await set.get(one)).toBeUndefined();
+  });
+
+  it("an object the pack holds in a sound bucket is still read", async () => {
+    const files = createInMemoryFilesApi();
+    await packWithBadBucket(files);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
+    await set.get(`aa${"4".repeat(38)}`); // the corrupt bucket searched first
+    expect(dec.decode(await content(await set.get(sound)))).toBe("sound\n");
+    expect(await set.has(sound)).toBe(true);
+  });
+});
+
+describe("review of #130: an install checks the idx it installs", () => {
+  it("a failed check refuses the pack and leaves the set unchanged", async () => {
+    const files = createInMemoryFilesApi();
+    await install(files, [{ kind: 3, data: A }]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
+    const before = (await set.packs()).map((p) => p.packId);
+    // the idx is damaged as it lands (its checksum): the lazy open passes, the check does not
+    const move = files.move.bind(files);
+    files.move = async (from, to) => {
+      const ok = await move(from, to);
+      if (ok && to.endsWith(".idx")) {
+        const idx = await collect(files.read(to));
+        await files.write(to, [flipAt(idx, idx.length - 1)]);
+      }
+      return ok;
+    };
+    const bytes = pack([{ kind: 3, data: B }]);
+    await expect(set.install(chunks(bytes))).rejects.toThrow(/idx checksum mismatch/);
+    const name = `pack-${bytesToHex(bytes.subarray(bytes.length - 20))}`;
+    expect(set.skipped.map((s) => s.pack)).toEqual([name]);
+    // refused as a scan refuses a corrupt pack: later scans do not open it lazily
+    expect(await set.refresh()).toBe(false);
+    expect((await set.packs()).map((p) => p.packId)).toEqual(before);
+    expect(await set.has(Bid)).toBe(false);
+  });
+
+  it("an install sharing a scan's unverified open still checks the idx", async () => {
+    const files = createInMemoryFilesApi();
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: Number.POSITIVE_INFINITY });
+    const bytes = pack([{ kind: 3, data: A }]);
+    const r = await installPack(files, PACK_DIR, chunks(bytes));
+    const p = paths(r.packId);
+    const idx = await collect(files.read(p.idx));
+    await files.write(p.idx, [flipAt(idx, idx.length - 1)]);
+    // the scan's open is held while it reads the idx
+    const reading = deferred();
+    const release = deferred();
+    let held = false;
+    const read = files.read.bind(files);
+    files.read = (path, o) => {
+      if (path !== p.idx || held) return read(path, o);
+      held = true;
+      return (async function* () {
+        reading.resolve();
+        await release.promise;
+        yield* read(path, o);
+      })();
+    };
+    const scan = set.refresh();
+    await reading.promise;
+    // installPack keeps the copy already there; the install then shares the scan's open
+    const installed = set.install(chunks(bytes));
+    const outcome = installed.then(
+      () => "installed",
+      (e: unknown) => e,
+    );
+    await new Promise((res) => setTimeout(res, 50));
+    release.resolve();
+    await scan;
+    const e = await outcome;
+    expect(e).toBeInstanceOf(PackError);
+    expect(String(e)).toMatch(/idx checksum mismatch/);
+    expect(await set.packs()).toEqual([]);
+    expect(set.skipped.map((s) => s.pack)).toEqual([`pack-${r.packId}`]);
+    await set.refresh();
+    expect(await set.packs()).toEqual([]);
   });
 });

@@ -272,4 +272,79 @@ describe("a corrupt idx fails with PackError when used, never with wrong data", 
     const pack = await openPack(files, packPath, idxPath);
     await expect(pack.get(ids[0] as string)).rejects.toBeInstanceOf(PackError);
   });
+
+  it("one bad large offset fails every read that needs an extent, each time", async () => {
+    const files = createInMemoryFilesApi();
+    const ids = [`10${"1".repeat(38)}`, `20${"2".repeat(38)}`];
+    const { packPath, idxPath, idx } = await rawPack(files, ids);
+    const bad = idx.slice();
+    // the second entry's offset names entry 7 of a large-offset table that has none
+    new DataView(bad.buffer).setUint32(ID_AT + 2 * 20 + 2 * 4 + 4, 0x8000_0007);
+    await files.write(idxPath, [resum(bad)]);
+    const pack = await openPack(files, packPath, idxPath);
+    await expect(pack.get(ids[1] as string)).rejects.toThrow(/past the large-offset table/);
+    // the first entry's own offset is sound, but its extent needs every offset
+    for (let k = 0; k < 3; k++) {
+      await expect(pack.entry(ids[0] as string)).rejects.toThrow(/past the large-offset table/);
+    }
+  });
+});
+
+describe("review of #130: the delta base cache admits an entry over its limit, as git's", () => {
+  it("with a limit of 0, reading a chain upwards applies O(depth) deltas, not O(depth^2)", async () => {
+    const files = createInMemoryFilesApi();
+    const depth = 40;
+    const { versions, entries, ids } = chain(depth);
+    const { packPath, idxPath } = await install(files, entries);
+    const cache = new DeltaBaseCache(0);
+    const pack = await openPack(files, packPath, idxPath, { baseCache: cache });
+    for (let i = 0; i <= depth; i++) {
+      const o = await pack.get(ids[i] as string);
+      expect(same(o?.bytes as Uint8Array, versions[i] as Uint8Array), `v${i}`).toBe(true);
+      // the most recent base stays, alone
+      expect(cache.size).toBeLessThanOrEqual(1);
+    }
+    // v0: 1; v1: base and delta, the base kept; then the delta below and the delta asked for
+    expect(pack.stats.inflations).toBe(1 + 2 + 2 * (depth - 1));
+    // without that base: 1 + 2 + ... + (depth + 1)
+    expect(pack.stats.inflations).toBeLessThan(((depth + 1) * (depth + 2)) / 2);
+  });
+
+  it("keeps a single base over the limit alone; the next base evicts it", () => {
+    const cache = new DeltaBaseCache(1000);
+    const scope = cache.scope();
+    scope.put(1, { type: "blob", data: cache.alloc(500) });
+    scope.put(2, { type: "blob", data: cache.alloc(4000) });
+    expect(cache.size).toBe(1);
+    expect(scope.get(1)).toBeUndefined();
+    expect(scope.get(2)?.data.length).toBe(4000);
+    expect(cache.bytes).toBe(4000);
+    expect(cache.bytes).toBe(cache.entriesBytes);
+    scope.put(3, { type: "blob", data: cache.alloc(3000) });
+    expect(cache.size).toBe(1);
+    expect(scope.get(2)).toBeUndefined();
+    expect(scope.get(3)?.data.length).toBe(3000);
+    expect(cache.bytes).toBe(3000);
+    // a small base then fits under the limit alone: the large one goes
+    scope.put(4, { type: "blob", data: cache.alloc(200) });
+    expect(scope.get(3)).toBeUndefined();
+    expect(cache.bytes).toBe(200);
+  });
+
+  it("never hands the cached base to the caller, under a limit of 0", async () => {
+    const files = createInMemoryFilesApi();
+    const { versions, entries, ids } = chain(3);
+    const { packPath, idxPath } = await install(files, entries);
+    const cache = new DeltaBaseCache(0);
+    const pack = await openPack(files, packPath, idxPath, { baseCache: cache });
+    await pack.get(ids[2] as string); // v1 is cached
+    const hit = await pack.get(ids[1] as string);
+    hit?.bytes?.fill(0);
+    const top = await pack.get(ids[2] as string);
+    expect(same(top?.bytes as Uint8Array, versions[2] as Uint8Array)).toBe(true);
+    top?.bytes?.fill(0);
+    expect(
+      same((await pack.get(ids[3] as string))?.bytes as Uint8Array, versions[3] as Uint8Array),
+    ).toBe(true);
+  });
 });

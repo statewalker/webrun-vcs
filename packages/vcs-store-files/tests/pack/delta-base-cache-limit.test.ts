@@ -75,8 +75,9 @@ describe("readDeltaBaseCacheLimit", () => {
     };
     // the default (96 MiB) keeps the bases of the two deltas' chains
     expect(await peakAfterReads()).toBeGreaterThan(0);
-    // a budget below any object keeps nothing
+    // a budget below any object keeps only the most recent base, alone, as git's (and in a
+    // buffer of its own: the default budget carves bases from 64 KiB slabs)
     git(dir, ["config", "core.deltaBaseCacheLimit", "16"]);
-    expect(await peakAfterReads()).toBe(0);
+    expect(await peakAfterReads()).toBe(lines.length + 3);
   });
 });

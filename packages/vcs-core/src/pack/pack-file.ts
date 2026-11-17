@@ -478,7 +478,7 @@ export class DeltaBaseCache {
   }
   private add<K>(map: Map<K, CachedBase<K>>, key: K, value: ResolvedObject): void {
     const length = value.data.length;
-    if (length > this.limit || map.has(key)) return;
+    if (map.has(key)) return;
     const slab =
       length > ON_HEAP_MAX && length <= SLAB_MAX ? this.slabs.get(value.data.buffer) : undefined;
     const e: CachedBase<K> = {
@@ -494,8 +494,10 @@ export class DeltaBaseCache {
     this.append(e as CachedBase<unknown>);
     if (!slab) this.held += length;
     else if (slab.live++ === 0) this.held += SLAB_SIZE;
-    // never the entry just added: it costs at most the limit (a slab is far below it)
-    while (this.held > this.limit && this.head) this.remove(this.head);
+    // As git's add_delta_base_cache: the others are evicted, least recently used first, until
+    // the cache is within its limit, and the entry just added always stays, even alone over
+    // the limit (a limit of 0 keeps the most recent base, a large base is kept alone).
+    while (this.held > this.limit && this.head && this.head !== e) this.remove(this.head);
     if (this.held > this.peak) this.peak = this.held;
   }
   private remove<K>(e: CachedBase<K>): void {
@@ -768,10 +770,26 @@ export async function openPack(
   // git's reverse index: offsets in pack order and, for each, its position in the idx
   let sorted: Float64Array | undefined;
   let perm: Uint32Array | undefined;
+  /**
+   * Every entry's offset, in idx order (for the two tables below, each built once). A bad
+   * offset (a large-offset index outside its table) is remembered: every later read that needs
+   * an extent fails with the same `PackError` without reading the whole idx again.
+   */
+  let offsetsError: unknown;
+  const allOffsets = (): Float64Array => {
+    if (offsetsError) throw offsetsError;
+    const o = new Float64Array(n);
+    try {
+      for (let i = 0; i < n; i++) o[i] = t.offsetOf(i);
+    } catch (e) {
+      offsetsError = e;
+      throw e;
+    }
+    return o;
+  };
   const revIndex = (): Float64Array => {
     if (!sorted) {
-      const s = new Float64Array(n);
-      for (let i = 0; i < n; i++) s[i] = t.offsetOf(i);
+      const s = allOffsets();
       s.sort(); // numeric, without a comparator: a typed array's own sort
       sorted = s;
     }
@@ -780,8 +798,7 @@ export async function openPack(
   /** For each entry in pack order, its position in the idx (built when first needed). */
   const permutation = (): Uint32Array => {
     if (!perm) {
-      const offs = new Float64Array(n);
-      for (let i = 0; i < n; i++) offs[i] = t.offsetOf(i);
+      const offs = allOffsets();
       const order = new Uint32Array(n);
       for (let i = 0; i < n; i++) order[i] = i;
       order.sort((a, b) => (offs[a] as number) - (offs[b] as number));
@@ -1220,7 +1237,9 @@ export async function openPack(
     // caller without a copy. When the budget holds fewer objects of this size than the chain
     // has steps, caching each one would let the top of the last chain evict everything else:
     // the cache's slots are then spread evenly along the chain (checkpoints), so the next
-    // request into it stops at a nearby one.
+    // request into it stops at a nearby one. They are counted from the top: the base of the
+    // object asked for is always cached (the cache keeps its most recent entry even under a
+    // limit of 0, as git's), so reading a chain upwards applies one or two deltas per object.
     let data = base.data;
     const slots = Math.max(1, Math.floor(cacheLimit / Math.max(1, data.length)));
     const stride = Math.max(1, Math.ceil(chain.length / slots));
@@ -1236,7 +1255,7 @@ export async function openPack(
     const forCache = (size: number) => cache.alloc(size);
     for (let k = chain.length - 1; k >= 0; k--) {
       const l = chain[k] as LoadedEntry;
-      const keep = k > 0 && (chain.length - k) % stride === 0;
+      const keep = k > 0 && (k - 1) % stride === 0;
       let d = inflateDelta(l);
       if (d instanceof Promise) d = (yield d) as Uint8Array;
       try {

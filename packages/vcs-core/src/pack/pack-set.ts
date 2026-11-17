@@ -242,20 +242,24 @@ export async function openPackSet(
     return { type: o.type, data };
   };
 
-  /** Opens a pack; concurrent opens of the same name share one promise. */
-  const open = (name: string, verifyIndex = false): Promise<PackFile> => {
+  /**
+   * Opens a pack; concurrent opens of the same name share one promise. The open checks what
+   * git's check_packed_git_idx checks; the rest of the idx is checked as lookups use it.
+   */
+  const open = (name: string): Promise<PackFile> => {
     let pending = opening.get(name);
     if (!pending) {
       pending = openPack(files, `${dir}/${name}.pack`, `${dir}/${name}.idx`, {
         baseCache,
         maxObjectSize,
         externalBase,
-        verifyIndex,
       }).finally(() => opening.delete(name));
       opening.set(name, pending);
     }
     return pending;
   };
+  /** packs an install refused after opening them: a scan sharing that open does not add them */
+  const rejected = new WeakSet<PackFile>();
 
   const scan = async (): Promise<boolean> => {
     const started = removals;
@@ -294,7 +298,8 @@ export async function openPackSet(
         // an idx without its pack is ignored (a pack being removed, or not fully installed)
         if (!(await files.exists(`${dir}/${name}.pack`))) continue;
         const p = await open(name);
-        if (skip(name) || byName.has(name)) continue; // removed, or added by install
+        // removed, added by install, or refused by the install that shared this open
+        if (skip(name) || byName.has(name) || rejected.has(p)) continue;
         byName.set(name, p);
         added.push(p);
         refused.delete(name);
@@ -416,13 +421,15 @@ export async function openPackSet(
     let vanished = false;
     // `packs` is replaced, never changed in place: this loop sees one snapshot
     for (const p of packs) {
-      // only held ids are marked bad
+      // `has` is false for an id in a corrupt idx bucket: a pack that cannot say it holds `id`
+      // does not stop the rescan, and only held ids are marked bad (`find` remembers the id it
+      // searched last, so `getNow` does not search again)
+      if (!p.has(id)) continue;
       if (isBad(p, id)) {
         failed ??= new PackError(`object ${id}: the copy in pack ${p.packId} is corrupt`);
         continue;
       }
       try {
-        // undefined when the pack does not hold `id`; a corrupt idx bucket throws `PackError`
         let obj = p.getNow(id, o);
         if (obj instanceof Promise) obj = (yield obj) as GitObject | undefined;
         if (obj) return yield* guarded(p, id, obj);
@@ -537,8 +544,27 @@ export async function openPackSet(
       const r = await installPack(files, dir, source, { maxObjectSize, ...o });
       const name = `pack-${r.packId}`;
       if (!byName.has(name)) {
-        // an idx just written is checked whole, as index-pack does
-        const p = await open(name, true);
+        // taken before the open, as a scan does: the pack is retried once its files change
+        const sig = await signature(name);
+        // an idx just written is checked whole, as index-pack does. The open may be one a
+        // scan started (unverified): it is shared, and the idx checked after it.
+        let p: PackFile | undefined;
+        try {
+          p = await open(name);
+          await p.verifyIndex();
+        } catch (e) {
+          // refused as a scan refuses a pack it cannot open: the set is left as it was (a
+          // scan that shared the open and added the pack meanwhile loses it again), and the
+          // files stay (they may be a copy installed before, which other readers use)
+          if (p) {
+            rejected.add(p);
+            if (byName.get(name) === p) drop(p);
+            else p.close();
+          }
+          record(name, e);
+          if (e instanceof PackError) refused.set(name, sig);
+          throw e;
+        }
         if (!byName.has(name)) {
           byName.set(name, p);
           packs = [p, ...packs];
