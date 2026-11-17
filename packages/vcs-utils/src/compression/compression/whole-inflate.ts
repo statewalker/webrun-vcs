@@ -43,8 +43,10 @@ export interface WholeInflateOptions {
   /** Without `into` or `size`: the most bytes the output may grow to. Default 1 GiB. */
   maxSize?: number;
   /**
-   * Stop, without an error, at the first symbol that does not fit the output (`ended` false):
-   * to read the start of a stream, such as an object header, without inflating all of it.
+   * Stop, without an error, once the output is full (`ended` false), as zlib does with a full
+   * output buffer: the part of a stored block or a match that fits is written first, so the
+   * output holds the first `length` bytes of the stream. To read the start of a stream, such
+   * as an object header, without inflating all of it.
    */
   partial?: boolean;
 }
@@ -534,10 +536,15 @@ function readDynamicTables(input: Uint8Array, end: number): void {
 
 /**
  * A copy of `out[0, op)` in a buffer with room for `n` more bytes, at most `limit` bytes long.
+ * In a `partial` inflate, `n` bytes that do not fit get a buffer of `limit` bytes (`out` itself
+ * when it is that long already): the caller writes what fits and stops.
  * (Not a closure of `inflateWhole`: its locals stay in registers.)
  */
 function grow(out: Uint8Array, op: number, n: number, limit: number, partial: boolean): Uint8Array {
-  if (op + n > limit) throw partial ? STOP : new InflateOverflowError();
+  if (op + n > limit) {
+    if (!partial) throw new InflateOverflowError();
+    if (out.length >= limit) return out;
+  }
   const next = new Uint8Array(Math.min(limit, Math.max(op + n, out.length * 2)));
   next.set(out.subarray(0, op));
   return next;
@@ -636,6 +643,14 @@ export function inflateWhole(
         if (op + len > cap) {
           out = grow(out, op, len, growable ? limit : cap, partial);
           cap = out.length;
+          if (op + len > cap) {
+            // partial: the part of the block that fits, as zlib copies it before it stops
+            const room = cap - op;
+            if (pos + room > end) throw new TruncatedStreamError();
+            out.set(input.subarray(pos, pos + room), op);
+            op = cap;
+            throw STOP;
+          }
         }
         if (pos + len > end) throw new TruncatedStreamError();
         out.set(input.subarray(pos, pos + len), op);
@@ -747,6 +762,12 @@ export function inflateWhole(
               if (op + len > cap) {
                 out = grow(out, op, len, growable ? limit : cap, partial);
                 cap = out.length;
+                if (op + len > cap) {
+                  // partial: the part of the match that fits
+                  copyMatch(out, op, dist, cap - op);
+                  op = cap;
+                  throw STOP;
+                }
               }
               copyMatch(out, op, dist, len);
               op += len;
@@ -777,6 +798,7 @@ export function inflateWhole(
           if (op >= cap) {
             out = grow(out, op, 1, growable ? limit : cap, partial);
             cap = out.length;
+            if (op >= cap) throw STOP;
           }
           out[op++] = here >> 16;
           continue;
@@ -831,6 +853,12 @@ export function inflateWhole(
         if (op + len > cap) {
           out = grow(out, op, len, growable ? limit : cap, partial);
           cap = out.length;
+          if (op + len > cap) {
+            // partial: the part of the match that fits
+            copyMatch(out, op, dist, cap - op);
+            op = cap;
+            throw STOP;
+          }
         }
         copyMatch(out, op, dist, len);
         op += len;

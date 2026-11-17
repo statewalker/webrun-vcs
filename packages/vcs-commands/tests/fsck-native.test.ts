@@ -20,10 +20,12 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -32,6 +34,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync, inflateSync } from "node:zlib";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -557,5 +560,299 @@ describeGit("fsck against native git", () => {
     expect(bad.exitCode).toBe(1);
     expect(theirs.status).not.toBe(0);
     expect(bad.output.split("\n").at(-2)).toBe(theirs.stdout.split("\n").at(-2));
+  });
+
+  /** Writes a loose object file as given: `raw` deflated (or `stored` as is), named `id`. */
+  function writeLoose(dir: string, raw: Uint8Array, id?: string, stored?: Uint8Array): string {
+    const name = id ?? createHash("sha1").update(raw).digest("hex");
+    mkdirSync(join(dir, ".git", "objects", name.slice(0, 2)), { recursive: true });
+    writeFileSync(looseFile(dir, name), stored ?? deflateSync(raw));
+    return name;
+  }
+  const bytesOf = (...parts: (string | Uint8Array)[]) =>
+    Buffer.concat(parts.map((p) => (typeof p === "string" ? Buffer.from(p) : p)));
+
+  /** Deterministic bytes zlib cannot compress: stored blocks. */
+  function noise(n: number, seed: number): Uint8Array {
+    const out = new Uint8Array(n);
+    let x = seed >>> 0 || 1;
+    for (let i = 0; i < n; i++) {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      out[i] = x & 255;
+    }
+    return out;
+  }
+
+  it("loose binary blobs (stored zlib blocks) of many sizes in a clean repository", async () => {
+    const dir = newRepo();
+    const sizes = [1, 20, 31, 32, 33, 100, 4096, 65535, 65536, 70000, 300000];
+    for (const [i, size] of sizes.entries()) {
+      writeFileSync(join(dir, `bin${i}.dat`), noise(size, i + 1));
+    }
+    g(dir, "add", "-A");
+    g(dir, "commit", "-q", "-m", "binaries");
+    // and one not reachable, written by git as well
+    const loose = literal(dir, "blob", noise(80000, 99));
+    const r = await compare(dir, []);
+    expect(r).toEqual({ stdout: `dangling blob ${loose}\n`, stderr: "", exit: 0 });
+    // zlib stores them: the start of each file is a stored block longer than the header
+    for (let i = 0; i < sizes.length; i++) {
+      const id = g(dir, "rev-parse", `HEAD:bin${i}.dat`);
+      const data = inflateSync(readFileSync(looseFile(dir, id)));
+      expect(data.length).toBeGreaterThan(sizes[i] as number);
+    }
+  });
+
+  it("blobs above core.bigFileThreshold are streamed: verdicts and messages as git's check_stream_oid", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    g(dir, "config", "core.bigFileThreshold", "1k");
+    const body = noise(2000, 5);
+    const z = (raw: Uint8Array) => new Uint8Array(deflateSync(raw));
+    const good = bytesOf("blob 2000\0", body);
+    writeLoose(dir, good);
+    // a stream shorter than declared: git does not compare the length when streaming. (The
+    // sizes are above glibc's largest mmap threshold, 32 MiB: inflated whole, git's buffer is
+    // then fresh zeroed pages; a smaller one holds whatever malloc reused.)
+    writeLoose(dir, bytesOf("blob 40000000\0", body));
+    // ... and does when it is named after the declared size
+    const shortRaw = bytesOf("blob 40000001\0", body);
+    writeLoose(
+      dir,
+      shortRaw,
+      createHash("sha1")
+        .update(bytesOf(shortRaw, new Uint8Array(40000001 - body.length)))
+        .digest("hex"),
+    );
+    // bytes after the stream, a cut stream, a corrupt checksum, content hashing elsewhere
+    const g2 = bytesOf("blob 2001\0", body, "x");
+    writeLoose(dir, g2, undefined, bytesOf(z(g2), "xyz"));
+    const t2 = bytesOf("blob 2002\0", body, "xy");
+    writeLoose(dir, t2, undefined, z(t2).subarray(0, -30));
+    const c2 = bytesOf("blob 2003\0", body, "xyz");
+    const corrupt = z(c2);
+    corrupt[corrupt.length - 2] = (corrupt[corrupt.length - 2] as number) ^ 1;
+    writeLoose(dir, c2, undefined, corrupt);
+    writeLoose(dir, good, "1".repeat(40));
+    // a 23-byte file declaring 8 GB: streamed, it hashes to its name
+    writeLoose(dir, bytesOf("blob 8000000000\0"));
+    const r = await compare(dir, []);
+    expect(r.stderr).toContain("(expected 1111111111111111111111111111111111111111)");
+    expect(r.stderr).toContain("garbage at end of loose object");
+    expect(r.stderr).not.toContain("unable to unpack contents");
+    expect(r.exit).toBe(1);
+    // the same objects whole (default threshold): git's zeroed buffer for the short ones
+    g(dir, "config", "--unset", "core.bigFileThreshold");
+    const whole = await compare(dir, []);
+    expect(whole.stderr).toContain("hash-path mismatch");
+    expect(whole.stderr).toContain("unable to unpack contents");
+  });
+
+  it("a declared size larger than the stream: git's verdict without allocating it", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    // a blob below the threshold and a commit: inflated whole into git's zeroed buffer
+    writeLoose(dir, bytesOf("blob 40000000\0hello"));
+    writeLoose(dir, bytesOf("commit 50000000\0tree 1234\n"));
+    // a truncated zip bomb: 16 MiB of zeros, half the stream, declaring 400 MB
+    const bomb = deflateSync(new Uint8Array(16 << 20), { level: 9 });
+    writeLoose(
+      dir,
+      bytesOf("blob 400000000\0"),
+      "2".repeat(40),
+      bytesOf(
+        deflateSync(bytesOf("blob 400000000\0")).subarray(0, 2),
+        bomb.subarray(2, bomb.length >> 1),
+      ),
+    );
+    const start = performance.now();
+    const r = await compare(dir, []);
+    expect(performance.now() - start).toBeLessThan(20000);
+    expect(r.stderr).toContain("hash-path mismatch");
+    expect(r.exit).toBe(1);
+  });
+
+  it("a symbolic ref that resolves to nothing is an invalid sha1 pointer", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    g(dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+    g(dir, "symbolic-ref", "refs/heads/alias", "refs/heads/nothere");
+    g(dir, "symbolic-ref", "refs/heads/chain", "refs/heads/alias");
+    const r = await compare(dir, []);
+    expect(r.stderr).toContain(
+      "error: refs/remotes/origin/HEAD: invalid sha1 pointer 0000000000000000000000000000000000000000",
+    );
+    expect(r.exit).toBe(2);
+    g(dir, "pack-refs", "--all");
+    await compare(dir, []);
+    // the 2.45+ snapshot and the 2.43 walk both report them
+    const files = createNodeFilesApi({ rootDir: dir });
+    for (const version of ["2.43", "2.56"] as const) {
+      const ours = await (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(version)
+        .call();
+      expect(ours.errorOutput).toContain("error: refs/heads/chain: invalid sha1 pointer");
+      expect(ours.exitCode & 2).toBe(2);
+    }
+  });
+
+  it("tree modes are read in 16 bits, as git's unsigned short", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    const blob = g(dir, "rev-parse", "HEAD:a");
+    // 1100644 is 100644, 1040000 is 40000 (a tree), 3100755 is 100755
+    const sub = g(dir, "rev-parse", "HEAD^{tree}");
+    const tree = literal(
+      dir,
+      "tree",
+      treeBytes([
+        ["1100644", "a", blob],
+        ["1040000", "d", sub],
+        ["3100755", "x", blob],
+      ]),
+    );
+    const c = literal(
+      dir,
+      "commit",
+      `tree ${tree}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n`,
+    );
+    g(dir, "update-ref", "refs/heads/odd", c);
+    const r = await compare(dir, []);
+    expect(r.stderr).not.toContain("badFilemode");
+    // ordering sees the truncated mode: "d" as a directory sorts after "d.txt"
+    const unsorted = literal(
+      dir,
+      "tree",
+      treeBytes([
+        ["1040000", "d", sub],
+        ["100644", "d.txt", blob],
+      ]),
+    );
+    const c2 = literal(
+      dir,
+      "commit",
+      `tree ${unsorted}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n`,
+    );
+    g(dir, "update-ref", "refs/heads/odd2", c2);
+    const r2 = await compare(dir, []);
+    expect(r2.stderr).toContain("treeNotSorted");
+  });
+
+  it("a .gitmodules blob starting with a UTF-8 BOM is not parsed (gitmodulesParse)", async () => {
+    const dir = newRepo();
+    const text = '[submodule "s"]\n\tpath = s\n\turl = https://example.com/s\n';
+    const bom = literal(dir, "blob", bytesOf(Buffer.from([0xef, 0xbb, 0xbf]), text));
+    const plain = literal(dir, "blob", text);
+    const tree = literal(dir, "tree", treeBytes([["100644", ".gitmodules", bom]]));
+    const tree2 = literal(dir, "tree", treeBytes([["100644", ".gitmodules", plain]]));
+    const c = literal(
+      dir,
+      "commit",
+      `tree ${tree}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n`,
+    );
+    const c2 = literal(
+      dir,
+      "commit",
+      `tree ${tree2}\nparent ${c}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n`,
+    );
+    g(dir, "update-ref", "refs/heads/main", c2);
+    const r = await compare(dir, []);
+    expect(r.stderr).toContain(
+      `warning in blob ${bom}: gitmodulesParse: could not parse gitmodules blob`,
+    );
+    expect(r.stderr).not.toContain(plain);
+    expect(r.exit).toBe(0);
+  });
+
+  it("after a backslash only NTFS spellings of .gitmodules count, not HFS+ ones", async () => {
+    const dir = newRepo();
+    const bad = literal(dir, "blob", "[not a config\n");
+    const bad2 = literal(dir, "blob", "[not a config either\n");
+    // U+200C is ignorable to HFS+ only; GITMOD~1 is the NTFS short name
+    const tree = literal(
+      dir,
+      "tree",
+      treeBytes([
+        ["100644", "a\\.git\u200cmodules", bad],
+        ["100644", "b\\GITMOD~1", bad2],
+      ]),
+    );
+    const c = literal(
+      dir,
+      "commit",
+      `tree ${tree}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n`,
+    );
+    g(dir, "update-ref", "refs/heads/main", c);
+    const r = await compare(dir, []);
+    // only the blob under the NTFS name is parsed
+    expect(r.stderr).toContain(`warning in blob ${bad2}: gitmodulesParse`);
+    expect(r.stderr).not.toContain(bad);
+  });
+
+  it("HEAD is followed to the end of its symbolic ref chain (2.43)", async () => {
+    const dir = newRepo();
+    const C = commitFiles(dir, { a: "a\n" }, "one");
+    g(dir, "update-ref", "refs/remotes/origin/x", C);
+    g(dir, "symbolic-ref", "refs/heads/alias", "refs/remotes/origin/x");
+    g(dir, "symbolic-ref", "HEAD", "refs/heads/alias");
+    // HEAD's commit is reachable only through HEAD once main is gone
+    g(dir, "update-ref", "-d", "refs/heads/main");
+    const files = createNodeFilesApi({ rootDir: dir });
+    const ours = async () =>
+      (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility("2.43")
+        .setReflogs(false)
+        .call();
+    // the chain ends in a remote ref: strange
+    await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+    let r = await ours();
+    expect(r.errorOutput).toBe("error: HEAD points to something strange (refs/remotes/origin/x)\n");
+    expect(r.exitCode).toBe(8);
+    expect(r.output).toBe("");
+    // ... and git still takes what HEAD resolves to as a root: a commit only a pseudo ref names
+    const D = commitFiles(dir, { b: "b\n" }, "two");
+    g(dir, "update-ref", "refs/remotes/origin/x", C);
+    writeFileSync(join(dir, ".git", "OTHER_HEAD"), `${D}\n`);
+    writeFileSync(join(dir, ".git", "refs", "heads", "alias"), "ref: OTHER_HEAD\n");
+    await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+    r = await ours();
+    expect(r.errorOutput).toBe("error: HEAD points to something strange (OTHER_HEAD)\n");
+    expect(r.output).toBe("");
+    // a chain ending in a branch is fine
+    g(dir, "symbolic-ref", "refs/heads/alias", "refs/heads/main2");
+    g(dir, "update-ref", "refs/heads/main2", C);
+    r = await ours();
+    expect(r.errorOutput).toBe("");
+    expect(r.exitCode).toBe(0);
+    await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+  });
+
+  it("a tag's gpgsig header is an extra header in 2.43 only", async () => {
+    const dir = newRepo();
+    const C = commitFiles(dir, { a: "a\n" }, "one");
+    const tag = literal(
+      dir,
+      "tag",
+      `object ${C}\ntype commit\ntag v1\ntagger A <a@x> 1 +0000\ngpgsig -----BEGIN-----\n x\n -----END-----\n\nmsg\n`,
+    );
+    g(dir, "update-ref", "refs/tags/v1", tag);
+    g(dir, "config", "fsck.extraHeaderEntry", "error");
+    const r = await compare(dir, []);
+    expect(r.exit).toBe(compatibility === "2.43" ? 1 : 0);
+    const files = createNodeFilesApi({ rootDir: dir });
+    for (const version of ["2.43", "2.56"] as const) {
+      const ours = await (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(version)
+        .call();
+      expect(ours.errorOutput.includes("extraHeaderEntry")).toBe(version === "2.43");
+    }
   });
 });

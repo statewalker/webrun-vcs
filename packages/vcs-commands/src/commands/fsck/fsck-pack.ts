@@ -66,7 +66,8 @@ async function readAll(files: FilesApi, path: string): Promise<Uint8Array> {
 
 /**
  * Checks the idx and pack checksums and the entries' CRC-32s, reporting failures through
- * `error` (git's `error()` texts). `externalBase` resolves delta bases outside the pack.
+ * `error` (git's `error()` texts). `externalBase` resolves delta bases outside the pack; `read`
+ * is the idx when the caller has read it already.
  */
 export async function scanPack(
   files: FilesApi,
@@ -74,13 +75,15 @@ export async function scanPack(
   idxPath: string,
   error: (message: string) => void,
   externalBase?: (id: string) => Promise<GitObject | undefined>,
+  read?: { bytes: Uint8Array; idx: PackIndex },
 ): Promise<PackScan> {
   let failed = false;
   let idxBytes: Uint8Array;
   let idx: PackIndex;
   try {
-    idxBytes = await readAll(files, idxPath);
-    idx = readPackIndex(idxBytes);
+    // the idx as the caller read it, or read here: once either way
+    idxBytes = read?.bytes ?? (await readAll(files, idxPath));
+    idx = read?.idx ?? readPackIndex(idxBytes);
   } catch {
     error(`packfile ${packPath} index not opened`);
     return { entries: [], failed: true };
@@ -99,6 +102,7 @@ export async function scanPack(
   let pack: PackFile | undefined;
   try {
     pack = await openPack(files, packPath, idxPath, {
+      idxBytes,
       externalBase: externalBase
         ? async (id) => {
             const obj = await externalBase(id);

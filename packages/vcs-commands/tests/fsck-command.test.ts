@@ -4,6 +4,7 @@
  * And git's object checks and message severities on their own.
  */
 
+import { deflateSync } from "node:zlib";
 import type { GitObjects, History, Refs } from "@statewalker/vcs-core";
 import {
   createKvObjectStores,
@@ -23,10 +24,13 @@ import {
   SQLStaging,
 } from "@statewalker/vcs-store-sql";
 import { SqlJsAdapter } from "@statewalker/vcs-store-sql/adapters/sql-js";
+import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { Staging } from "@statewalker/vcs-working-tree";
 import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
-
+import { readLooseObject } from "../src/commands/fsck/fsck-loose.js";
 import {
   FsckMessageTypes,
   fsckCommit,
@@ -144,10 +148,13 @@ for (const { name, create } of backends) {
       const { git } = await repo();
       const r = await git.fsck().call();
       expect(r).toMatchObject({ exitCode: 0, output: "", errorOutput: "" });
-      const all = await (await create()).git.fsck().setRoot(true).call();
+      const all = await (await create()).git.fsck().setRoot(true).setCompatibility("2.43").call();
       // a store without HEAD, as git with a missing .git/HEAD
       expect(all.errorOutput).toBe("error: invalid HEAD\nnotice: No default references\n");
       expect(all.exitCode).toBe(8);
+      // git 2.45+ leaves HEAD to `refs verify`: the default checks only what refs point to
+      const plain = await (await create()).git.fsck().call();
+      expect(plain).toMatchObject({ exitCode: 0, errorOutput: "notice: No default references\n" });
     });
 
     it("lists dangling and unreachable objects, and roots", async () => {
@@ -299,5 +306,66 @@ describe("fsck object checks", () => {
       "warning: badFilemode: contains bad file modes",
       "error: treeNotSorted: not properly sorted",
     ]);
+  });
+});
+
+describe("fsck reading loose object files", () => {
+  const z = (text: string | Uint8Array, cut?: number) => {
+    const raw = typeof text === "string" ? enc.encode(text) : text;
+    const d = new Uint8Array(deflateSync(raw, { level: 9 }));
+    return cut === undefined ? d : d.subarray(0, cut);
+  };
+  const header = (h: string, body: Uint8Array) => {
+    const out = new Uint8Array(h.length + body.length);
+    out.set(enc.encode(h));
+    out.set(body, h.length);
+    return out;
+  };
+  const read = async (data: Uint8Array, id = "a".repeat(40), bigFileThreshold?: number) => {
+    const files = createInMemoryFilesApi({ "/o": data });
+    return readLooseObject(files, "/o", id, { bigFileThreshold });
+  };
+
+  it("a streamed blob longer than declared is corrupt (git loops forever there)", async () => {
+    const r = await read(z(header("blob 1500\0", new Uint8Array(2000).fill(7))), undefined, 1024);
+    expect(r.errors).toEqual([`corrupt loose object '${"a".repeat(40)}'`]);
+  });
+
+  it("a truncated zip bomb declaring 1 TiB is refused quickly, streamed or whole", async () => {
+    const zeros = new Uint8Array(64 << 20);
+    const bomb = z(header("blob 1099511627776\0", zeros));
+    const cut = bomb.subarray(0, bomb.length >> 1);
+    const start = performance.now();
+    // a blob: streamed, in bounded pieces
+    const blob = await read(cut);
+    expect(blob.errors).toEqual([`corrupt loose object '${"a".repeat(40)}'`]);
+    // a commit: inflated whole, into a buffer no larger than the stream can fill
+    const commitBomb = z(header("commit 1099511627776\0", zeros));
+    const commit = await read(commitBomb.subarray(0, commitBomb.length >> 1));
+    expect(commit.errors).toEqual([
+      `corrupt loose object '${"a".repeat(40)}'`,
+      "unable to unpack contents of /o",
+    ]);
+    // a whole bomb declaring 10 bytes stops at the 11th
+    const small = await read(z(header("blob 10\0", zeros)));
+    expect(small.errors).toEqual([
+      `corrupt loose object '${"a".repeat(40)}'`,
+      "unable to unpack contents of /o",
+    ]);
+    expect(performance.now() - start).toBeLessThan(10000);
+  });
+
+  it("an incompressible blob (stored zlib blocks) reads whole and hashes to its name", async () => {
+    const body = new Uint8Array(70000).map((_, i) => (i * 2654435761) >>> 24);
+    const raw = header(`blob ${body.length}\0`, body);
+    const id = bytesToHex(createSha1().update(raw).digest());
+    for (const level of [0, 9]) {
+      const r = await read(new Uint8Array(deflateSync(raw, { level })), id);
+      expect(r.errors).toEqual([]);
+      expect(r.object?.size).toBe(body.length);
+      // streamed past a lower threshold: no content, as git's NULL buffer
+      const s = await read(new Uint8Array(deflateSync(raw, { level })), id, 1000);
+      expect(s).toEqual({ errors: [], object: { type: "blob", size: body.length } });
+    }
   });
 });

@@ -13,8 +13,21 @@
  *    Z_BUF_ERROR);
  *  - content that hashes to another id than the file's name is `hash-path mismatch`.
  *
- * The object is read whole, one at a time (git maps the file and inflates it whole too, except
- * blobs above core.bigFileThreshold).
+ * Blobs above `core.bigFileThreshold` are streamed as git's `check_stream_oid` streams them:
+ * hashed as they inflate, never held whole. git does not compare the length read with the
+ * declared size there, so a stream that ends early is fine when it hashes to the file's name;
+ * otherwise it is `hash mismatch for <path> (expected <id>)`. A zlib error, a cut stream or bytes
+ * after it are reported without `unable to unpack contents`. (A stream longer than declared
+ * makes git 2.43 and 2.56 loop forever there; it is `corrupt loose object` here.)
+ *
+ * Other objects are inflated whole, one at a time (git maps the file and inflates it whole
+ * too), into one buffer of the declared size, or of what zlib can produce from the file (1032
+ * bytes per input byte) when that is less: a hostile header cannot allocate more. git inflates into a buffer of the declared size and hashes all
+ * of it, so a stream that ends early hashes as its bytes followed by what the buffer held:
+ * zeros for a buffer malloc maps fresh (above glibc's mmap threshold, at most 32 MiB),
+ * whatever was reused below. Zeros are hashed here (`hash-path mismatch`), without being
+ * allocated, for declared sizes up to 1 GiB (above that git takes as long or dies out of
+ * memory; it is `corrupt loose object` here).
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
@@ -30,6 +43,15 @@ import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 /** git's MAX_HEADER_LEN */
 const MAX_HEADER_LEN = 32;
+/** git's default `core.bigFileThreshold` (512 MiB). */
+export const DEFAULT_BIG_FILE_THRESHOLD = 512 * 1024 * 1024;
+/** The most bytes a deflate stream yields per input byte. */
+const MAX_DEFLATE_RATIO = 1032;
+/** The largest declared size whose missing tail is hashed as git's zeroed buffer. */
+const MAX_ZERO_PADDING = 2 ** 30;
+/** Input slice per push when streaming: at most ~1 MiB of output each. */
+const STREAM_SLICE = 1024;
+const ZEROS = new Uint8Array(64 * 1024);
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
@@ -37,8 +59,11 @@ const dec = new TextDecoder();
 export interface LooseRead {
   /** Messages git prints with `error()`, in order (without the `error: ` prefix). */
   errors: string[];
-  /** The type and content, when the object could be read and hashes to its name. */
-  object?: { type: string; content: Uint8Array };
+  /**
+   * The type, size and content, when the object could be read and hashes to its name. A blob
+   * above `core.bigFileThreshold` is streamed: no content (as git's NULL buffer).
+   */
+  object?: { type: string; size: number; content?: Uint8Array };
   /** The id the content hashes to, when it was read whole but hashes to another id. */
   realId?: string;
 }
@@ -95,11 +120,18 @@ async function readFile(files: FilesApi, path: string): Promise<Uint8Array | und
   return out;
 }
 
+/** Options of `readLooseObject`. */
+export interface LooseReadOptions {
+  /** `core.bigFileThreshold`: larger blobs are streamed (default 512 MiB). */
+  bigFileThreshold?: number;
+}
+
 /** Reads the loose object `id` stored at `path`, as `read_loose_object` does. */
 export async function readLooseObject(
   files: FilesApi,
   path: string,
   id: string,
+  options: LooseReadOptions = {},
 ): Promise<LooseRead> {
   const errors: string[] = [];
   const data = await readFile(files, path);
@@ -141,17 +173,26 @@ export async function readLooseObject(
   const size = Number(match[2]);
   const headerLength = nul + 1;
 
-  // unpack_loose_rest
+  if (type === "blob" && size > (options.bigFileThreshold ?? DEFAULT_BIG_FILE_THRESHOLD)) {
+    const streamed = checkStreamOid(data, headerLength, size, path, id);
+    if (streamed.length > 0) return { errors: streamed };
+    return { errors, object: { type, size } };
+  }
+
+  // unpack_loose_rest: into one buffer of the declared size, or of what zlib can produce from
+  // the file if that is less (its pages are mapped as the output reaches them, as git's)
+  const total = headerLength + size;
   let content: Uint8Array;
   try {
-    const r = inflateWhole(data, { size: headerLength + size });
+    const r = inflateWhole(data, {
+      size: Math.min(total, data.length * MAX_DEFLATE_RATIO + MAX_HEADER_LEN),
+    });
     if (r.consumed < data.length) {
       errors.push(`garbage at end of loose object '${id}'`);
       errors.push(`unable to unpack contents of ${path}`);
       return { errors };
     }
-    // a stream that ends early leaves the rest of git's buffer zeroed
-    content = r.data.subarray(headerLength, headerLength + size);
+    content = r.data.subarray(headerLength, Math.max(headerLength, r.length));
   } catch (e) {
     const zlib = zlibErrorMessage(e);
     if (zlib) errors.push(zlib);
@@ -160,12 +201,64 @@ export async function readLooseObject(
     return { errors };
   }
 
-  const realId = bytesToHex(
-    createSha1()
-      .update(enc.encode(`${type} ${size}\0`))
-      .update(content)
-      .digest(),
-  );
+  // a stream that ends early leaves the rest of git's buffer as malloc gave it: zeros here
+  const missing = size - content.length;
+  if (missing > 0 && size > MAX_ZERO_PADDING) {
+    errors.push(`corrupt loose object '${id}'`);
+    errors.push(`unable to unpack contents of ${path}`);
+    return { errors };
+  }
+  const hasher = createSha1()
+    .update(enc.encode(`${type} ${size}\0`))
+    .update(content);
+  for (let left = missing; left > 0; left -= ZEROS.length) {
+    hasher.update(left >= ZEROS.length ? ZEROS : ZEROS.subarray(0, left));
+  }
+  const realId = bytesToHex(hasher.digest());
   if (realId !== id) return { errors, realId };
-  return { errors, object: { type, content } };
+  if (missing > 0) {
+    const padded = new Uint8Array(size);
+    padded.set(content);
+    content = padded;
+  }
+  return { errors, object: { type, size, content } };
+}
+
+/**
+ * git's `check_stream_oid` for a blob above `core.bigFileThreshold`: the errors it prints, none
+ * when the stream hashes to `id`. Output is hashed as it inflates, in bounded pieces.
+ */
+function checkStreamOid(
+  data: Uint8Array,
+  headerLength: number,
+  size: number,
+  path: string,
+  id: string,
+): string[] {
+  const hasher = createSha1();
+  const inflater = createInflater();
+  let produced = 0;
+  const limit = headerLength + size;
+  let end = -1;
+  try {
+    for (let at = 0; at < data.length && end < 0; at += STREAM_SLICE) {
+      const slice = data.subarray(at, Math.min(data.length, at + STREAM_SLICE));
+      const { out, done, consumed } = inflater.push(slice);
+      for (const chunk of out) {
+        produced += chunk.length;
+        // git reads at most the declared size; past it, it loops (corrupt here)
+        if (produced > limit) throw new InflateOverflowError();
+        hasher.update(chunk);
+      }
+      if (done) end = at + consumed;
+    }
+    if (end < 0) throw new TruncatedStreamError();
+  } catch (e) {
+    inflater.abort();
+    const zlib = zlibErrorMessage(e);
+    return [...(zlib ? [zlib] : []), `corrupt loose object '${id}'`];
+  }
+  if (end < data.length) return [`garbage at end of loose object '${id}'`];
+  if (bytesToHex(hasher.digest()) !== id) return [`hash mismatch for ${path} (expected ${id})`];
+  return [];
 }

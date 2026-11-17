@@ -9,7 +9,12 @@
  * other inputs than the checks do, and fsck reports both.
  */
 
-import { isDotGitComponent, isGitWorktreeFile, isValidRefName } from "@statewalker/vcs-core";
+import {
+  isDotGitComponent,
+  isGitWorktreeFile,
+  isNtfsGitWorktreeFile,
+  isValidRefName,
+} from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 import type { FsckMessageTypes, FsckMsgId } from "./fsck-msg-ids.js";
@@ -35,6 +40,7 @@ const S_IFLNK = 0o120000;
 const S_IFGITLINK = 0o160000;
 
 const dec = new TextDecoder();
+const decKeepBom = new TextDecoder("utf-8", { ignoreBOM: true });
 const isDigit = (c: number | undefined) => c !== undefined && c >= 0x30 && c <= 0x39;
 const isHexDigit = (c: number | undefined) =>
   c !== undefined &&
@@ -208,8 +214,16 @@ export function fsckCommit(buf: Uint8Array, report: FsckReport): number {
 
 const TYPE_NAMES = ["commit", "tree", "blob", "tag"];
 
-/** git's `fsck_tag_standalone`. Returns nonzero when an error was reported. */
-export function fsckTag(buf: Uint8Array, report: FsckReport): number {
+/**
+ * git's `fsck_tag_standalone`. Returns nonzero when an error was reported. With `gpgsig` (git
+ * 2.45+, the default) a `gpgsig` or `gpgsig-sha256` header after the tagger is skipped; git
+ * 2.43 counts it as an extra header (`extraHeaderEntry`, ignored unless configured).
+ */
+export function fsckTag(
+  buf: Uint8Array,
+  report: FsckReport,
+  options: { gpgsig?: boolean } = {},
+): number {
   const headers = verifyHeaders(buf, report);
   if (headers.stop) return headers.value || -1;
   const end = buf.length;
@@ -259,7 +273,14 @@ export function fsckTag(buf: Uint8Array, report: FsckReport): number {
     ret = ident.value;
     p = ident.next;
   }
-  const gpg = startsWith(buf, p, "gpgsig ") ? 7 : startsWith(buf, p, "gpgsig-sha256 ") ? 14 : 0;
+  const gpg =
+    options.gpgsig === false
+      ? 0
+      : startsWith(buf, p, "gpgsig ")
+        ? 7
+        : startsWith(buf, p, "gpgsig-sha256 ")
+          ? 14
+          : 0;
   if (p < end && gpg) {
     p += gpg;
     eol = indexOf(buf, NL, p);
@@ -293,13 +314,39 @@ export function fsckTag(buf: Uint8Array, report: FsckReport): number {
 
 /** One tree entry as git's tree walker decodes it. */
 export interface RawTreeEntry {
-  /** The mode as written (`TREE_DESC_RAW_MODES`). */
+  /** The mode as written (`TREE_DESC_RAW_MODES`), in 16 bits as git keeps it. */
   mode: number;
   /** The name's bytes. */
   name: Uint8Array;
-  id: string;
+  /** Offset of the entry's 20 id bytes in the tree (`treeEntryId` gives the hex). */
+  idAt: number;
   /** Offset of the entry's mode text in the tree. */
   at: number;
+}
+
+/** The id of a tree entry, as hex. */
+export function treeEntryId(buf: Uint8Array, entry: RawTreeEntry): string {
+  return bytesToHex(buf.subarray(entry.idAt, entry.idAt + 20));
+}
+
+/**
+ * A name none of fsck's special-name checks can match (`.`, `..`, `.git`, `.gitmodules` and the
+ * like under their HFS+ and NTFS spellings): it does not start with a dot and holds no `~`, no
+ * backslash and no non-ASCII byte.
+ */
+function isPlainName(name: Uint8Array): boolean {
+  if (name[0] === 0x2e) return false;
+  for (let i = 0; i < name.length; i++) {
+    const c = name[i] as number;
+    if (c === 0x7e || c === 0x5c || c >= 0x80) return false;
+  }
+  return true;
+}
+
+/** Whether the 20 id bytes at `at` are all zero (the null id). */
+function isNullIdAt(buf: Uint8Array, at: number): boolean {
+  for (let i = at; i < at + 20; i++) if (buf[i] !== 0) return false;
+  return true;
 }
 
 /**
@@ -316,13 +363,14 @@ function decodeTreeEntry(buf: Uint8Array, at: number): RawTreeEntry | string {
     const c = buf[p++];
     if (c === SP) break;
     if (c === undefined || c < 0x30 || c > 0x37) return "malformed mode in tree entry";
-    mode = mode * 8 + (c - 0x30);
+    // git reads the mode into an unsigned int and keeps it in an unsigned short: the low 16
+    // bits (1100644 is 100644)
+    mode = (mode * 8 + (c - 0x30)) & 0xffff;
   }
   if (buf[p] === NUL) return "empty filename in tree entry";
   const nul = indexOf(buf, NUL, p);
   const name = buf.subarray(p, nul);
-  const id = bytesToHex(buf.subarray(nul + 1, nul + 21));
-  return { mode, name, id, at };
+  return { mode, name, idAt: nul + 1, at };
 }
 
 /** A tree walk: the entries decoded before an error, and that error (git's message). */
@@ -346,7 +394,7 @@ export function walkTree(buf: Uint8Array): TreeWalk {
   let entry = decodeTreeEntry(buf, at);
   if (typeof entry === "string") return { entries, initError: entry };
   for (;;) {
-    const next = entry.at + (indexOf(buf, NUL, entry.at) - entry.at) + 21;
+    const next = entry.idAt + 20;
     if (next > buf.length) return { entries, error: "too-short tree file" };
     at = next;
     if (at >= buf.length) {
@@ -464,44 +512,48 @@ export function fsckTree(
   let oMode = 0;
   let oName: Uint8Array | undefined;
   for (;;) {
-    const { mode, name, id } = entry;
-    const text = dec.decode(name);
-    hasNullSha1 ||= id === "0000000000000000000000000000000000000000";
+    const { mode, name } = entry;
+    hasNullSha1 ||= isNullIdAt(buf, entry.idAt);
     hasFullPath ||= name.includes(SLASH);
     hasEmptyName ||= name.length === 0;
-    hasDot ||= text === ".";
-    hasDotdot ||= text === "..";
-    hasDotgit ||= isDotGitComponent(text);
     hasZeroPad ||= buf[entry.at] === ZERO;
     hasLargeName ||= name.length > types.maxTreeEntryLength;
-
-    if (isGitWorktreeFile(text, "gitmodules")) {
-      if (!isLink(mode)) found.gitmodules.push(id);
-      else retval += report("gitmodulesSymlink", ".gitmodules is a symbolic link");
-    }
-    if (isGitWorktreeFile(text, "gitattributes")) {
-      if (!isLink(mode)) found.gitattributes.push(id);
-      else retval += report("gitattributesSymlink", ".gitattributes is a symlink");
-    }
-    if (isLink(mode)) {
-      if (isGitWorktreeFile(text, "gitignore")) {
-        retval += report("gitignoreSymlink", ".gitignore is a symlink");
+    // the name checks below can match only a name that starts with a dot, or holds a `~`, a
+    // backslash or a non-ASCII byte: most names skip them
+    if (!isPlainName(name)) {
+      const text = dec.decode(name);
+      hasDot ||= text === ".";
+      hasDotdot ||= text === "..";
+      hasDotgit ||= isDotGitComponent(text);
+      if (isGitWorktreeFile(text, "gitmodules")) {
+        if (!isLink(mode)) found.gitmodules.push(treeEntryId(buf, entry));
+        else retval += report("gitmodulesSymlink", ".gitmodules is a symbolic link");
       }
-      if (isGitWorktreeFile(text, "mailmap")) {
-        retval += report("mailmapSymlink", ".mailmap is a symlink");
+      if (isGitWorktreeFile(text, "gitattributes")) {
+        if (!isLink(mode)) found.gitattributes.push(treeEntryId(buf, entry));
+        else retval += report("gitattributesSymlink", ".gitattributes is a symlink");
       }
-    }
-    if (text.includes("\\")) {
-      for (const part of text.split("\\").slice(1)) {
-        if (isGitWorktreeFile(part, "gitmodules")) {
-          if (!isLink(mode)) found.gitmodules.push(id);
-          else retval += report("gitmodulesSymlink", ".gitmodules is a symbolic link");
+      if (isLink(mode)) {
+        if (isGitWorktreeFile(text, "gitignore")) {
+          retval += report("gitignoreSymlink", ".gitignore is a symlink");
+        }
+        if (isGitWorktreeFile(text, "mailmap")) {
+          retval += report("mailmapSymlink", ".mailmap is a symlink");
+        }
+      }
+      if (text.includes("\\")) {
+        // git checks only is_ntfs_dotgitmodules there (no HFS+ spelling)
+        for (const part of text.split("\\").slice(1)) {
+          if (isNtfsGitWorktreeFile(part, "gitmodules")) {
+            if (!isLink(mode)) found.gitmodules.push(treeEntryId(buf, entry));
+            else retval += report("gitmodulesSymlink", ".gitmodules is a symbolic link");
+          }
         }
       }
     }
 
     // update_tree_entry_gently
-    const next = indexOf(buf, NUL, entry.at) + 21;
+    const next = entry.idAt + 20;
     let decodeError: string | undefined;
     let nextEntry: RawTreeEntry | undefined;
     if (next > buf.length) decodeError = "too-short tree file";
@@ -576,7 +628,8 @@ export function fsckBlob(
   let ret = 0;
   if (kinds.gitmodules) {
     if (!buf) return report("gitmodulesLarge", ".gitmodules too large to parse");
-    const entries = parseGitmodulesConfig(dec.decode(buf));
+    // git's config parser skips a UTF-8 BOM only in files, not in a blob: kept, it is refused
+    const entries = parseGitmodulesConfig(decKeepBom.decode(buf));
     if (!entries) {
       ret |= report("gitmodulesParse", "could not parse gitmodules blob");
     } else {

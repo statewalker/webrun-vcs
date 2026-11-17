@@ -49,18 +49,45 @@ export interface ObjectLinks {
   tag?: string;
 }
 
+const HEX = "0123456789abcdef";
+/** Hex digit values by char code, -1 for a non-digit. */
+const HEX_VALUE = (() => {
+  const t = new Int8Array(128).fill(-1);
+  for (let i = 0; i < 16; i++) t[HEX.charCodeAt(i)] = i;
+  return t;
+})();
+
+/**
+ * The table. Ids are kept as their 20 bytes, in one growing buffer by object number (not as
+ * strings, nor in a second map): a lookup probes the slots and compares bytes, so a tree's
+ * entries are looked up straight from the tree's bytes.
+ */
 export class ObjectTable {
-  /** Ids by object number, in creation order. */
-  readonly ids: string[] = [];
+  private n = 0;
+  /** The ids' bytes, 20 per object number. */
+  private raw = new Uint8Array(20 * 1024);
+  /** Each id's first four bytes as git's `hash_obj` reads them. */
+  private keys = new Int32Array(1024);
   private types = new Uint8Array(1024);
   private flagsOf = new Uint8Array(1024);
   /** Object numbers by slot, -1 for an empty slot. */
   private slots = new Int32Array(0);
-  private readonly byId = new Map<string, number>();
+  private readonly scratch = new Uint8Array(20);
   readonly links = new Map<number, ObjectLinks>();
 
   get size(): number {
-    return this.ids.length;
+    return this.n;
+  }
+
+  /** The id of object `n`, as hex. */
+  id(n: number): string {
+    const raw = this.raw;
+    let out = "";
+    for (let i = n * 20, end = i + 20; i < end; i++) {
+      const b = raw[i] as number;
+      out += HEX[b >> 4] + HEX[b & 15];
+    }
+    return out;
   }
 
   type(n: number): ObjType {
@@ -85,37 +112,68 @@ export class ObjectTable {
 
   /** git's `lookup_object`: the object or -1, moved to the slot its probe started from. */
   lookup(id: string): number {
-    const n = this.byId.get(id);
-    if (n === undefined) return -1;
+    const raw = this.parse(id);
+    return raw ? this.lookupRaw(raw, 0) : -1;
+  }
+
+  /** `lookup` for the 20 id bytes at `at` in `buf`. */
+  lookupRaw(buf: Uint8Array, at: number): number {
     const size = this.slots.length;
-    const first = slotOf(id, size);
+    if (size === 0) return -1;
+    const key = keyOf(buf, at);
+    const first = (key >>> 0) & (size - 1);
+    const raw = this.raw;
+    const keys = this.keys;
+    const slots = this.slots;
     let i = first;
-    while (this.slots[i] !== n) {
+    let n: number;
+    for (;;) {
+      n = slots[i] as number;
+      if (n < 0) return -1;
+      if (keys[n] === key) {
+        let k = 4;
+        const o = n * 20;
+        while (k < 20 && raw[o + k] === buf[at + k]) k++;
+        if (k === 20) break;
+      }
       i++;
       if (i === size) i = 0;
     }
     if (i !== first) {
-      this.slots[i] = this.slots[first] as number;
-      this.slots[first] = n;
+      slots[i] = slots[first] as number;
+      slots[first] = n;
     }
     return n;
   }
 
   /** git's `create_object`. */
   create(id: string, type: ObjType): number {
-    const n = this.ids.length;
+    return this.createRaw(this.parseOrThrow(id), 0, type);
+  }
+
+  /** `create` for the 20 id bytes at `at` in `buf`. */
+  createRaw(buf: Uint8Array, at: number, type: ObjType): number {
+    const n = this.n;
     if (this.slots.length - 1 <= n * 2) this.grow();
     if (n >= this.types.length) {
-      const types = new Uint8Array(this.types.length * 2);
+      const cap = this.types.length * 2;
+      const raw = new Uint8Array(cap * 20);
+      raw.set(this.raw);
+      this.raw = raw;
+      const keys = new Int32Array(cap);
+      keys.set(this.keys);
+      this.keys = keys;
+      const types = new Uint8Array(cap);
       types.set(this.types);
       this.types = types;
-      const flags = new Uint8Array(this.flagsOf.length * 2);
+      const flags = new Uint8Array(cap);
       flags.set(this.flagsOf);
       this.flagsOf = flags;
     }
-    this.ids.push(id);
-    this.byId.set(id, n);
+    this.raw.set(buf.subarray(at, at + 20), n * 20);
+    this.keys[n] = keyOf(buf, at);
     this.types[n] = type;
+    this.n = n + 1;
     this.insert(n, this.slots);
     return n;
   }
@@ -125,15 +183,22 @@ export class ObjectTable {
    * exists with another type (`object_as_type`'s message).
    */
   lookupTyped(id: string, type: ObjType): number | { error: string } {
-    const n = this.lookup(id);
-    if (n < 0) return this.create(id, type);
+    return this.lookupTypedRaw(this.parseOrThrow(id), 0, type);
+  }
+
+  /** `lookupTyped` for the 20 id bytes at `at` in `buf`. */
+  lookupTypedRaw(buf: Uint8Array, at: number, type: ObjType): number | { error: string } {
+    const n = this.lookupRaw(buf, at);
+    if (n < 0) return this.createRaw(buf, at, type);
     const have = this.types[n] as ObjType;
     if (have === type) return n;
     if (have === OBJ_NONE) {
       this.types[n] = type;
       return n;
     }
-    return { error: `object ${id} is a ${TYPE_NAME[have]}, not a ${TYPE_NAME[type]}` };
+    return {
+      error: `object ${this.id(n)} is a ${TYPE_NAME[have]}, not a ${TYPE_NAME[type]}`,
+    };
   }
 
   /** git's `lookup_unknown_object`. */
@@ -147,6 +212,25 @@ export class ObjectTable {
     for (const n of this.slots) if (n >= 0) yield n;
   }
 
+  /** The bytes of a 40-digit lowercase hex id, in a scratch buffer; undefined if not one. */
+  private parse(id: string): Uint8Array | undefined {
+    if (id.length !== 40) return undefined;
+    const out = this.scratch;
+    for (let i = 0; i < 20; i++) {
+      const hi = HEX_VALUE[id.charCodeAt(2 * i)] ?? -1;
+      const lo = HEX_VALUE[id.charCodeAt(2 * i + 1)] ?? -1;
+      if (hi < 0 || lo < 0) return undefined;
+      out[i] = (hi << 4) | lo;
+    }
+    return out;
+  }
+
+  private parseOrThrow(id: string): Uint8Array {
+    const raw = this.parse(id);
+    if (!raw) throw new Error(`not an object id: ${id}`);
+    return raw;
+  }
+
   private grow(): void {
     const old = this.slots;
     const size = old.length < 32 ? 32 : old.length * 2;
@@ -157,7 +241,7 @@ export class ObjectTable {
 
   private insert(n: number, slots: Int32Array): void {
     const size = slots.length;
-    let j = slotOf(this.ids[n] as string, size);
+    let j = ((this.keys[n] as number) >>> 0) & (size - 1);
     while ((slots[j] as number) >= 0) {
       j++;
       if (j >= size) j = 0;
@@ -166,11 +250,12 @@ export class ObjectTable {
   }
 }
 
-/** git's `hash_obj`: the id's first four bytes as a little-endian unsigned int, masked. */
-function slotOf(id: string, size: number): number {
-  const b0 = parseInt(id.slice(0, 2), 16);
-  const b1 = parseInt(id.slice(2, 4), 16);
-  const b2 = parseInt(id.slice(4, 6), 16);
-  const b3 = parseInt(id.slice(6, 8), 16);
-  return ((b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0) & (size - 1);
+/** git's `hash_obj` before the mask: the id's first four bytes as a little-endian int. */
+function keyOf(buf: Uint8Array, at: number): number {
+  return (
+    (buf[at] as number) |
+    ((buf[at + 1] as number) << 8) |
+    ((buf[at + 2] as number) << 16) |
+    ((buf[at + 3] as number) << 24)
+  );
 }

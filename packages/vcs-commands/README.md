@@ -274,7 +274,7 @@ const packs = await git.verifyPack().setRepositoryFiles({ files })
   .addPack(".git/objects/pack/pack-1234….idx").setVerbose(true).call();
 ```
 
-`fsck()` prints what `git fsck` prints, in git's order: the object checks use git's message ids and severities (`fsck.<msg-id>` config, `setStrict`), and `missing`, `dangling` and `unreachable` objects come out in the order of git's object hash table. With `setRepositoryFiles` it also reads loose objects from their files and verifies packs (checksums, CRC-32s, hashes); without it, it checks the objects of `history.objects` (memory, KV and SQL stores). `setCompatibility("2.56")` reproduces the output of git 2.45 and later where it differs from 2.43.
+`fsck()` prints what `git fsck` prints, in git's order: the object checks use git's message ids and severities (`fsck.<msg-id>` config, `setStrict`), and `missing`, `dangling` and `unreachable` objects come out in the order of git's object hash table. With `setRepositoryFiles` it also reads loose objects from their files and verifies packs (checksums, CRC-32s, hashes); without it, it checks the objects of `history.objects` (memory, KV and SQL stores). By default it reproduces `git fsck --no-references` of git 2.45 and later (HEAD's own checks moved to `git refs verify`, which is not implemented); `setCompatibility("2.43")` reproduces git 2.43, HEAD checks included.
 
 ### Errors
 

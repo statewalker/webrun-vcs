@@ -281,3 +281,86 @@ describe("inflateWhole on a code set zlib accepts oddly", () => {
     expect(() => inflateWhole(z, { maxSize: 1000 })).toThrow(TruncatedStreamError);
   });
 });
+
+describe("inflateWhole partial: the part of a block or match that fits", () => {
+  it("copies the start of a stored block longer than the output, as zlib does", () => {
+    // incompressible content: zlib stores it, so the header is the start of a stored block
+    const r = rng(7);
+    for (const n of [10, 31, 32, 33, 100, 5000, 65535, 65536, 70000, 200000]) {
+      const body = new Uint8Array(n);
+      for (let i = 0; i < n; i++) body[i] = Math.floor(r() * 256);
+      const raw = new Uint8Array([...new TextEncoder().encode(`blob ${n}\0`), ...body]);
+      for (const opts of [{ level: 0 }, {}]) {
+        const z = new Uint8Array(deflateSync(raw, opts));
+        const probe = new Uint8Array(32);
+        const got = inflateWhole(z, { into: probe, partial: true });
+        const want = Math.min(32, raw.length);
+        expect(got.length, `n ${n}`).toBe(want);
+        expect(got.ended, `n ${n}`).toBe(raw.length <= 32);
+        expect(
+          Buffer.from(probe.subarray(0, want)).equals(Buffer.from(raw.subarray(0, want))),
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("fills a growable buffer up to maxSize with the start of a stored block", () => {
+    const raw = new Uint8Array(1000).map((_, i) => (i * 7919) & 255);
+    const z = new Uint8Array(deflateSync(raw, { level: 0 }));
+    const got = inflateWhole(z, { maxSize: 600, partial: true });
+    expect(got).toMatchObject({ length: 600, ended: false, consumed: -1 });
+    expect(Buffer.from(got.data.subarray(0, 600)).equals(Buffer.from(raw.subarray(0, 600)))).toBe(
+      true,
+    );
+    // without partial, the overflow is still an error
+    expect(() => inflateWhole(z, { maxSize: 600 })).toThrow(InflateOverflowError);
+    expect(() => inflateWhole(z, { size: 999 })).toThrow(InflateOverflowError);
+  });
+
+  it("copies the start of a match longer than the output", () => {
+    // "abc" then a long run: one literal triple then matches of 258
+    const raw = new TextEncoder().encode(`abc${"abc".repeat(400)}`);
+    const z = new Uint8Array(deflateSync(raw));
+    for (const cut of [4, 5, 32, 100, 259, 1000]) {
+      const got = inflateWhole(z, { into: new Uint8Array(cut), partial: true });
+      expect(got.length).toBe(cut);
+      expect(new TextDecoder().decode(got.data.subarray(0, cut))).toBe(
+        new TextDecoder().decode(raw.subarray(0, cut)),
+      );
+    }
+  });
+
+  it("stops after a truncated stored block only when the part that fits is there", () => {
+    const raw = new Uint8Array(500).map((_, i) => (i * 31) & 255);
+    const z = new Uint8Array(deflateSync(raw, { level: 0 }));
+    // zlib header (2) + block header (1) + LEN/NLEN (4) + 40 bytes of the block
+    const cutInput = z.subarray(0, 7 + 40);
+    expect(inflateWhole(cutInput, { into: new Uint8Array(32), partial: true }).length).toBe(32);
+    expect(() => inflateWhole(cutInput, { into: new Uint8Array(64), partial: true })).toThrow(
+      TruncatedStreamError,
+    );
+  });
+
+  it("gives exactly the prefix node zlib produces, for every output length shorter than the stream", () => {
+    const r = rng(20261118);
+    for (let round = 0; round < 600; round++) {
+      const { opts } = deflaters[round % deflaters.length] as { opts: object };
+      const raw = sample(r, 1 + Math.floor(r() ** 2 * 80000));
+      const z = new Uint8Array(deflateSync(raw, opts));
+      // a truncated input too: zlib's sync flush gives what the bytes there inflate to
+      const input = r() < 0.5 ? z : z.subarray(0, 2 + Math.floor(r() * (z.length - 2)));
+      const want = new Uint8Array(inflateSync(input, { finishFlush: constants.Z_SYNC_FLUSH }));
+      if (want.length === 0) continue;
+      for (let k = 0; k < 3; k++) {
+        const cut = Math.floor(r() * want.length);
+        const got = inflateWhole(input, { into: new Uint8Array(cut), partial: true });
+        expect(got.length, `round ${round} cut ${cut}`).toBe(cut);
+        expect(got.ended, `round ${round}`).toBe(false);
+        expect(
+          Buffer.from(got.data.subarray(0, cut)).equals(Buffer.from(want.subarray(0, cut))),
+          `round ${round} cut ${cut}`,
+        ).toBe(true);
+      }
+    }
+  });
+});

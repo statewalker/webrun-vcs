@@ -106,6 +106,21 @@ export function isGitWorktreeFile(component: string, file: GitWorktreeFile): boo
 }
 
 /**
+ * Whether a path component names one of the files git reads from the worktree under a
+ * spelling NTFS folds to it, ignoring HFS+ (git's `is_ntfs_dot*`, as fsck checks the parts of a
+ * name after a backslash).
+ *
+ * @example
+ * ```typescript
+ * isNtfsGitWorktreeFile("GITMOD~1", "gitmodules"); // true
+ * isNtfsGitWorktreeFile(".gitmodules ", "gitmodules"); // true
+ * ```
+ */
+export function isNtfsGitWorktreeFile(component: string, file: GitWorktreeFile): boolean {
+  return isNtfsDotGeneric(component, file, GIT_FILES[file]);
+}
+
+/**
  * Whether a path component names `.git` under any spelling HFS+ or NTFS folds to it (git's
  * `is_hfs_dotgit` / `is_ntfs_dotgit`, a `\\` ending an NTFS name).
  *

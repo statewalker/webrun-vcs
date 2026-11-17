@@ -19,7 +19,7 @@ import {
 
 import { GitCommand } from "../../git-command.js";
 import { configValue } from "../merge-config.js";
-import { readLooseObject } from "./fsck-loose.js";
+import { DEFAULT_BIG_FILE_THRESHOLD, readLooseObject } from "./fsck-loose.js";
 import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId } from "./fsck-msg-ids.js";
 import {
   canonMode,
@@ -120,6 +120,15 @@ const PACK_IDX = /^pack-[0-9a-f]{40}\.idx$/;
 /** Refs one worktree has of its own (git's `is_per_worktree_ref`). */
 const PER_WORKTREE = /^(?:refs\/(?:bisect|worktree|rewritten)\/|[A-Z_]+$)/;
 const dec = new TextDecoder();
+const EMPTY = new Uint8Array(0);
+
+/** A git size setting (`git_config_ulong`: digits and a k, m or g unit), undefined if not one. */
+function sizeValue(value: string | undefined): number | undefined {
+  const m = value?.trim().match(/^(\d+)([kmg]?)$/i);
+  if (!m) return undefined;
+  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[(m[2] as string).toLowerCase()] ?? 1;
+  return Number(m[1]) * unit;
+}
 
 /** A path within the repository's files, as git prints it (`.git/objects/ab/cd...`). */
 const pathOf = (...parts: string[]) => parts.join("/");
@@ -127,9 +136,9 @@ const pathOf = (...parts: string[]) => parts.join("/");
 /**
  * Verify the connectivity and validity of the objects in the repository.
  *
- * Equivalent to `git fsck`, after git's `builtin/fsck.c` and `fsck.c` (2.43): every stored
- * object is read and checked (git's message ids, severities and texts, `fsck.<msg-id>` config
- * and `--strict`), then everything reachable from the refs, the reflogs, the index (its
+ * Equivalent to `git fsck --no-references`, after git's `builtin/fsck.c` and `fsck.c` (2.56 by
+ * default, 2.43 with `setCompatibility`): every stored object is read and checked (git's
+ * message ids, severities and texts, `fsck.<msg-id>` config and `--strict`), then everything reachable from the refs, the reflogs, the index (its
  * entries, cache-tree and resolve-undo), the HEADs of linked worktrees and the stash is
  * walked, and objects that are missing, dangling or (with `--unreachable`) unreachable are
  * listed in git's order.
@@ -166,7 +175,7 @@ export class FsckCommand extends GitCommand<FsckResult> {
   private _root = false;
   private _tags = false;
   private _lostFound = false;
-  private _compatibility: FsckCompatibility = "2.43";
+  private _compatibility: FsckCompatibility = "2.56";
   private _repository?: FsckRepositoryFiles;
   private readonly _messageTypes: [string, string][] = [];
 
@@ -238,14 +247,19 @@ export class FsckCommand extends GitCommand<FsckResult> {
   }
 
   /**
-   * Which git's output to reproduce where versions differ (default `2.43`):
-   *  - `2.43`: refs are read after the objects; `notice: HEAD points to an unborn branch`,
-   *    `HEAD points to something strange` and `detached HEAD points at nothing` are reported; an
+   * Which git's output to reproduce where versions differ (default `2.56`):
+   *  - `2.56` (the default) is `git fsck --no-references` of git 2.45+: the refs and worktree
+   *    HEADs are read (and created in the object hash) before the objects, then their reflogs;
+   *    HEAD itself is not checked (`HEAD points to an unborn branch`, `HEAD points to something
+   *    strange`, `detached HEAD points at nothing` and `invalid HEAD` moved to git's
+   *    `refs verify`, which is not implemented, and which plain `git fsck` runs first); an
+   *    unparsable object is `<id>: object corrupt or missing`; a bad pack sets bit 1; a tag's
+   *    `gpgsig` header after the tagger is not an extra header;
+   *  - `2.43`: refs are read after the objects; HEAD and the HEADs of linked worktrees are
+   *    checked (`notice: HEAD points to an unborn branch`, `HEAD points to something strange`,
+   *    `detached HEAD points at nothing`, following symbolic refs to the end of the chain); an
    *    object that cannot be parsed is `<id>: object could not be parsed: <path>`; a bad pack
-   *    sets exit bit 4 (`FSCK_ERROR_PACK`);
-   *  - `2.56`: the refs and worktree HEADs are read (and created in the object hash) before the
-   *    objects, then their reflogs; HEAD is not checked (git's `refs verify` does that); an
-   *    unparsable object is `<id>: object corrupt or missing`; a bad pack sets bit 1.
+   *    sets exit bit 4 (`FSCK_ERROR_PACK`); a tag's `gpgsig` header is an `extraHeaderEntry`.
    */
   setCompatibility(version: FsckCompatibility): this {
     this.checkCallable();
@@ -293,6 +307,9 @@ export class FsckCommand extends GitCommand<FsckResult> {
       lostFound: this._lostFound,
       compatibility: this._compatibility,
       repository: this._repository,
+      bigFileThreshold:
+        sizeValue(configValue(this.workingCopy, "core.bigFileThreshold")) ??
+        DEFAULT_BIG_FILE_THRESHOLD,
     });
     return run.run();
   }
@@ -316,6 +333,8 @@ interface RunOptions {
   lostFound: boolean;
   compatibility: FsckCompatibility;
   repository?: FsckRepositoryFiles;
+  /** `core.bigFileThreshold`: larger loose blobs are streamed */
+  bigFileThreshold: number;
 }
 
 /** A pack of the repository, with its idx read (for `has_object_pack`). */
@@ -323,6 +342,8 @@ interface RepoPack {
   packPath: string;
   idxPath: string;
   idx: PackIndex;
+  /** The idx file, read once for the listing, the checks and the open */
+  idxBytes: Uint8Array;
 }
 
 /** The reflog of one ref: its name as git prints it and its entries, oldest first. */
@@ -429,14 +450,14 @@ class FsckRun {
   private async printableType(n: number): Promise<string> {
     const type = this.t.type(n);
     if (type !== OBJ_NONE) return TYPE_NAME[type];
-    const stored = await this.storeType(this.t.ids[n] as string);
+    const stored = await this.storeType(this.t.id(n));
     return stored ?? "unknown";
   }
 
   /** git's `objerror`. */
   private async objerror(n: number, message: string): Promise<void> {
     this.errorsFound |= FSCK_ERROR_OBJECT;
-    const id = this.t.ids[n] as string;
+    const id = this.t.id(n);
     const type = await this.printableType(n);
     this.emit({
       kind: "error",
@@ -535,8 +556,9 @@ class FsckRun {
       const stats = await files.stats(packPath);
       if (stats?.kind !== "file") continue;
       try {
-        const idx = readPackIndex(await readAll(files, idxPath));
-        found.push({ packPath, idxPath, idx, mtime: stats.lastModified ?? 0 });
+        const idxBytes = await readAll(files, idxPath);
+        const idx = readPackIndex(idxBytes);
+        found.push({ packPath, idxPath, idx, idxBytes, mtime: stats.lastModified ?? 0 });
       } catch {
         // git does not list a pack whose idx cannot be opened
       }
@@ -660,10 +682,12 @@ class FsckRun {
   private async fsckObjBuffer(
     id: string,
     type: ObjType,
-    content: Uint8Array,
+    content: Uint8Array | undefined,
     unparsable: string,
+    size = content?.length ?? 0,
   ): Promise<number> {
-    const n = this.parseObjectBuffer(id, type, content);
+    // no content: a blob streamed past core.bigFileThreshold (git's NULL buffer)
+    const n = this.parseObjectBuffer(id, type, content ?? EMPTY);
     if (n === undefined) {
       this.errorsFound |= FSCK_ERROR_OBJECT;
       this.error(unparsable, id);
@@ -671,18 +695,18 @@ class FsckRun {
     }
     this.t.clearFlags(n, REACHABLE | SEEN);
     this.t.addFlags(n, HAS_OBJ);
-    return this.fsckObj(n, content);
+    return this.fsckObj(n, content, size);
   }
 
   /** git's `fsck_obj`. */
-  private async fsckObj(n: number, content: Uint8Array): Promise<number> {
+  private async fsckObj(n: number, content: Uint8Array | undefined, size: number): Promise<number> {
     const t = this.t;
     if (t.flags(n) & SEEN) return 0;
     t.addFlags(n, SEEN);
-    const id = t.ids[n] as string;
+    const id = t.id(n);
     const type = t.type(n);
-    if (this.walkUsed(n, content)) await this.objerror(n, "broken links");
-    const err = this.fsckBuffer(id, type, content);
+    if (this.walkUsed(n, content ?? EMPTY)) await this.objerror(n, "broken links");
+    const err = this.fsckBuffer(id, type, content, size);
     if (err) return err;
     if (type === OBJ_COMMIT && this.o.root && t.links.get(n)?.parents?.length === 0) {
       this.emit({
@@ -695,7 +719,7 @@ class FsckRun {
     if (type === OBJ_TAG && this.o.tags) {
       const links = t.links.get(n);
       if (links?.tagged !== undefined) {
-        const tagged = t.ids[links.tagged] as string;
+        const tagged = t.id(links.tagged);
         this.emit({
           kind: "tagged",
           stream: "stdout",
@@ -721,7 +745,7 @@ class FsckRun {
       for (const e of walk.entries) {
         const mode = canonMode(e.mode);
         if (mode === 0o160000) continue;
-        const child = t.lookupTyped(e.id, mode === 0o040000 ? OBJ_TREE : OBJ_BLOB);
+        const child = t.lookupTypedRaw(content, e.idAt, mode === 0o040000 ? OBJ_TREE : OBJ_BLOB);
         if (typeof child !== "number") {
           this.error(child.error);
           res ||= 1;
@@ -743,8 +767,15 @@ class FsckRun {
   }
 
   /** git's `fsck_buffer`: the object checks of `fsck.c`. */
-  private fsckBuffer(id: string, type: ObjType, content: Uint8Array): number {
+  private fsckBuffer(
+    id: string,
+    type: ObjType,
+    buffer: Uint8Array | undefined,
+    size: number,
+  ): number {
     const report = this.reporter(id, TYPE_NAME[type]);
+    if (type === OBJ_BLOB) return this.fsckBlobOf(id, buffer, size, report);
+    const content = buffer ?? EMPTY;
     switch (type) {
       case OBJ_TREE: {
         const found = { gitmodules: [] as string[], gitattributes: [] as string[] };
@@ -756,9 +787,7 @@ class FsckRun {
       case OBJ_COMMIT:
         return fsckCommit(content, report);
       case OBJ_TAG:
-        return fsckTag(content, report);
-      case OBJ_BLOB:
-        return this.fsckBlobOf(id, content, content.length, report);
+        return fsckTag(content, report, { gpgsig: this.o.compatibility !== "2.43" });
       default:
         return report("unknownType", `unknown type '${type}' (internal fsck error)`);
     }
@@ -833,7 +862,9 @@ class FsckRun {
         }
         continue;
       }
-      const read = await readLooseObject(files, e.path, e.id);
+      const read = await readLooseObject(files, e.path, e.id, {
+        bigFileThreshold: this.o.bigFileThreshold,
+      });
       for (const m of read.errors) this.error(m, e.id);
       if (!read.object) {
         if (read.realId)
@@ -849,6 +880,7 @@ class FsckRun {
         this.o.compatibility === "2.56"
           ? `${e.id}: object corrupt or missing`
           : `${e.id}: object could not be parsed: ${e.path}`,
+        read.object.size,
       );
       if (r > 0) this.errorsFound |= FSCK_ERROR_OBJECT;
     }
@@ -865,6 +897,7 @@ class FsckRun {
         p.idxPath,
         (m) => this.error(m),
         (id) => this.readObject(id),
+        { bytes: p.idxBytes, idx: p.idx },
       );
       if (scan.failed) err = 1;
       if (scan.pack) {
@@ -945,6 +978,21 @@ class FsckRun {
   // ------------------------------------------------------------------------------------------
   // Roots: refs, HEADs, reflogs, index files
 
+  /**
+   * `markObject` where it needs no await: an object of the expected type that is reachable
+   * already, or stored (then queued). False, with nothing done, otherwise.
+   */
+  private markReachable(n: number | undefined, type: ObjType): boolean {
+    const t = this.t;
+    if (n === undefined || t.type(n) !== type) return false;
+    const flags = t.flags(n);
+    if (flags & REACHABLE) return true;
+    if (!(flags & HAS_OBJ)) return false;
+    t.addFlags(n, REACHABLE);
+    this.pending.push(n);
+    return true;
+  }
+
   /** git's `mark_object`. */
   private async markObject(
     n: number | undefined,
@@ -957,8 +1005,8 @@ class FsckRun {
       this.emit({
         kind: "broken-link",
         stream: "stdout",
-        text: `broken link from ${(await this.printableType(p)).padStart(7)} ${this.describe(t.ids[p] as string)}`,
-        objectId: t.ids[p],
+        text: `broken link from ${(await this.printableType(p)).padStart(7)} ${this.describe(t.id(p))}`,
+        objectId: t.id(p),
       });
       this.emit({
         kind: "broken-link",
@@ -974,9 +1022,9 @@ class FsckRun {
     if (t.flags(n) & REACHABLE) return 0;
     t.addFlags(n, REACHABLE);
     if (!(t.flags(n) & HAS_OBJ)) {
-      const id = t.ids[n] as string;
+      const id = t.id(n);
       if (parent !== undefined && !(await this.hasObject(id))) {
-        const pid = t.ids[parent] as string;
+        const pid = t.id(parent);
         this.emit({
           kind: "broken-link",
           stream: "stdout",
@@ -1029,6 +1077,18 @@ class FsckRun {
     }
   }
 
+  /**
+   * What a listed ref resolves to, or the null id when it does not resolve (a dangling or too
+   * deep symbolic ref: git's `for_each_rawref` passes those with a null id).
+   */
+  private async resolvedId(name: string): Promise<string> {
+    try {
+      return (await this.stores.refs.resolve(name))?.objectId || ZERO_ID;
+    } catch {
+      return ZERO_ID;
+    }
+  }
+
   /** git's `get_default_heads`. */
   private async processRefs(): Promise<void> {
     const refs = this.stores.refs;
@@ -1036,8 +1096,8 @@ class FsckRun {
     for await (const ref of refs.list("refs/")) listed.push(ref.name);
     listed.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     for (const name of [...new Set(listed)]) {
-      const resolved = await refs.resolve(name);
-      if (resolved?.objectId) await this.handleRef(name, resolved.objectId);
+      // a symbolic ref that resolves to nothing is the null id to git (`invalid sha1 pointer`)
+      await this.handleRef(name, await this.resolvedId(name));
     }
 
     for (const wt of await this.worktrees()) {
@@ -1072,10 +1132,7 @@ class FsckRun {
     const listed: string[] = [];
     for await (const ref of refs.list("refs/")) listed.push(ref.name);
     listed.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    for (const name of [...new Set(listed)]) {
-      const resolved = await refs.resolve(name);
-      if (resolved?.objectId) await snapshotRef(name, resolved.objectId);
-    }
+    for (const name of [...new Set(listed)]) await snapshotRef(name, await this.resolvedId(name));
     for (const wt of await this.worktrees()) {
       const id = await this.headId(wt);
       if (id && id !== ZERO_ID) await snapshotRef(wt.headName, id);
@@ -1140,47 +1197,58 @@ class FsckRun {
     return list;
   }
 
+  /**
+   * Where the symbolic ref chain from `target` ends, as git's `resolve_ref_unsafe` follows it:
+   * the last name and its id (none when that ref does not exist), or undefined when the chain
+   * is deeper than git's SYMREF_MAXDEPTH (5).
+   */
+  private async followChain(target: string): Promise<{ name: string; id?: string } | undefined> {
+    let name = target;
+    for (let depth = 1; ; depth++) {
+      const value = await this.stores.refs.get(name);
+      if (!value) return { name };
+      if (!isSymbolicRef(value)) return { name, id: value.objectId };
+      if (depth >= 5) return undefined;
+      name = value.target;
+    }
+  }
+
   /** git's `fsck_head_link` and the HEAD of a worktree as a root. */
   private async headLink(wt: WorktreeState): Promise<void> {
     const name = wt.headName;
     let target: string | undefined;
     let id: string | undefined;
+    const invalid = () => {
+      this.errorsFound |= FSCK_ERROR_REFS;
+      this.error(`invalid ${name}`);
+    };
+    let symref: string | undefined;
     if (wt.current) {
       const head = await this.stores.refs.get("HEAD");
-      if (!head) {
-        this.errorsFound |= FSCK_ERROR_REFS;
-        this.error(`invalid ${name}`);
-        return;
-      }
-      if (isSymbolicRef(head)) {
-        target = head.target;
-        id = (await this.stores.refs.resolve(target))?.objectId;
-      } else {
-        id = head.objectId;
-      }
+      if (!head) return invalid();
+      if (isSymbolicRef(head)) symref = head.target;
+      else id = head.objectId;
     } else {
       const text = (
         await readText(this.files as FilesApi, pathOf(wt.dir as string, "HEAD"))
       )?.trim();
-      if (!text) {
-        this.errorsFound |= FSCK_ERROR_REFS;
-        this.error(`invalid ${name}`);
-        return;
-      }
-      if (text.startsWith("ref:")) {
-        target = text.slice(4).trim();
-        id = (await this.stores.refs.resolve(target))?.objectId;
-      } else if (OID.test(text.slice(0, 40))) {
-        id = text.slice(0, 40);
-      } else {
-        this.errorsFound |= FSCK_ERROR_REFS;
-        this.error(`invalid ${name}`);
-        return;
-      }
+      if (!text) return invalid();
+      if (text.startsWith("ref:")) symref = text.slice(4).trim();
+      else if (OID.test(text.slice(0, 40))) id = text.slice(0, 40);
+      else return invalid();
+    }
+    if (symref !== undefined) {
+      // the whole chain: HEAD -> refs/heads/alias -> refs/remotes/origin/x points at the last
+      const end = await this.followChain(symref);
+      if (!end) return invalid();
+      target = end.name;
+      id = end.id;
     }
     if (target !== undefined && !target.startsWith("refs/heads/")) {
       this.errorsFound |= FSCK_ERROR_REFS;
       this.error(`${name} points to something strange (${target})`);
+      // git still takes what HEAD resolves to as a root
+      if (id && id !== ZERO_ID) await this.handleRef(name, id);
       return;
     }
     if (!id || id === ZERO_ID) {
@@ -1370,7 +1438,7 @@ class FsckRun {
   /** git's `fsck_walk` with `mark_object` (`traverse_one_object`). */
   private async traverseOne(n: number): Promise<void> {
     const t = this.t;
-    const id = t.ids[n] as string;
+    const id = t.id(n);
     // git's parse_object / repo_parse_commit / parse_tag before walking
     if (t.type(n) === OBJ_NONE || (t.type(n) !== OBJ_BLOB && !(t.flags(n) & PARSED))) {
       await this.parseObject(id);
@@ -1391,18 +1459,21 @@ class FsckRun {
           this.error(walk.initError);
           return;
         }
+        const content = obj.content;
         for (const e of walk.entries) {
           const mode = canonMode(e.mode);
           if (mode === 0o160000) continue;
           const isTree = mode === 0o040000;
-          const child = t.lookupTyped(e.id, isTree ? OBJ_TREE : OBJ_BLOB);
+          const child = t.lookupTypedRaw(content, e.idAt, isTree ? OBJ_TREE : OBJ_BLOB);
           let c: number | undefined;
           if (typeof child === "number") c = child;
           else this.error(child.error);
           if (name !== undefined && c !== undefined) {
-            this.putName(e.id, `${name}${decodeGitPath(e.name)}${isTree ? "/" : ""}`);
+            this.putName(t.id(c), `${name}${decodeGitPath(e.name)}${isTree ? "/" : ""}`);
           }
-          await this.markObject(c, isTree ? OBJ_TREE : OBJ_BLOB, n);
+          if (!this.markReachable(c, isTree ? OBJ_TREE : OBJ_BLOB)) {
+            await this.markObject(c, isTree ? OBJ_TREE : OBJ_BLOB, n);
+          }
         }
         if (walk.error) this.error(walk.error);
         return;
@@ -1414,7 +1485,7 @@ class FsckRun {
         }
         const links = t.links.get(n);
         if (!links || links.tree === undefined) return;
-        if (name !== undefined) this.putName(t.ids[links.tree] as string, `${name}:`);
+        if (name !== undefined) this.putName(t.id(links.tree), `${name}:`);
         await this.markObject(links.tree, OBJ_TREE, n);
         const parents = links.parents ?? [];
         let generation = 0;
@@ -1437,7 +1508,7 @@ class FsckRun {
         let counter = 0;
         for (const p of parents) {
           if (name !== undefined) {
-            const pid = t.ids[p] as string;
+            const pid = t.id(p);
             if (counter++) this.putName(pid, `${name}^${counter}`);
             else if (generation > 0)
               this.putName(pid, `${name.slice(0, prefixLength)}~${generation + 1}`);
@@ -1454,7 +1525,7 @@ class FsckRun {
           return;
         }
         if (links?.tagged === undefined) return;
-        if (name !== undefined) this.putName(t.ids[links.tagged] as string, name);
+        if (name !== undefined) this.putName(t.id(links.tagged), name);
         await this.markObject(links.tagged, "any", n);
         return;
       }
@@ -1491,7 +1562,7 @@ class FsckRun {
       for await (const id of this.storedIds()) await this.markUnreachableReferents(id);
     }
     for (const n of [...t.inSlotOrder()]) {
-      const id = t.ids[n] as string;
+      const id = t.id(n);
       const flags = t.flags(n);
       if (flags & REACHABLE) {
         if (flags & HAS_OBJ || this.inPack(id)) continue;
