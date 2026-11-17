@@ -94,8 +94,10 @@ export function quotePath(path: string, quotePathFully = true): string {
   return body === undefined ? path : `"${body}"`;
 }
 
-/** git's `quote_two`: `prefix` and `path`, both inside the quotes when the path needs them */
+/**
+ * git's `quote_two_c_style`: `prefix` and `path` as they are, or both escaped inside one pair
+ * of quotes when either needs quoting
+ */
 export function quoteTwo(prefix: string, path: string, quotePathFully = true): string {
-  const body = quoteCStyleBody(path, quotePathFully);
-  return body === undefined ? `${prefix}${path}` : `"${prefix}${body}"`;
+  return quotePath(`${prefix}${path}`, quotePathFully);
 }
