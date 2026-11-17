@@ -221,9 +221,9 @@ describe("GitWorkingCopyFactory", () => {
 
       await factory.addWorktree(history, "/repo/.git", "/new-worktree");
 
-      expect(mockFiles.writeFile).toHaveBeenCalledWith(
+      expect(mockFiles.write).toHaveBeenCalledWith(
         "/new-worktree/.git",
-        "gitdir: /repo/.git/worktrees/new-worktree\n",
+        new TextEncoder().encode("gitdir: /repo/.git/worktrees/new-worktree\n"),
       );
     });
 
@@ -232,9 +232,9 @@ describe("GitWorkingCopyFactory", () => {
 
       await factory.addWorktree(history, "/repo/.git", "/new-worktree");
 
-      expect(mockFiles.writeFile).toHaveBeenCalledWith(
+      expect(mockFiles.write).toHaveBeenCalledWith(
         "/repo/.git/worktrees/new-worktree/gitdir",
-        "/new-worktree/.git\n",
+        new TextEncoder().encode("/new-worktree/.git\n"),
       );
     });
 
@@ -325,6 +325,36 @@ describe("GitWorkingCopyFactory", () => {
       expect(wc.history).toBeDefined();
       expect(wc.checkout).toBeDefined();
       expect(wc.worktree).toBeDefined();
+    });
+  });
+
+  describe("paths that are no UTF-8", () => {
+    const latin1 = (text: string) => new Uint8Array([...text].map((c) => c.charCodeAt(0)));
+
+    it("addWorktree writes the gitdir: file and the back-pointer as the path's bytes", async () => {
+      const history = createMockHistory({ path: "/repo/.git" });
+
+      await factory.addWorktree(history, "/repo/.git", "/caf\udce9");
+
+      expect(mockFiles.write).toHaveBeenCalledWith(
+        "/caf\udce9/.git",
+        latin1("gitdir: /repo/.git/worktrees/caf\xe9\n"),
+      );
+      expect(mockFiles.write).toHaveBeenCalledWith(
+        "/repo/.git/worktrees/caf\udce9/gitdir",
+        latin1("/caf\xe9/.git\n"),
+      );
+    });
+
+    it("reads commondir as bytes: a latin-1 repository path names its config", async () => {
+      const gitDir = "/wt/.git/worktrees/x";
+      (mockFiles.read as Mock).mockImplementation(async (path: string) =>
+        path === `${gitDir}/commondir` ? latin1("/srv/caf\xe9/.git\n") : undefined,
+      );
+
+      await factory.openWorkingCopy("/wt", gitDir);
+
+      expect(mockFiles.read).toHaveBeenCalledWith("/srv/caf\udce9/.git/config");
     });
   });
 });

@@ -8,6 +8,11 @@
  */
 
 import {
+  decodeGitPath,
+  decodeGitPatternFile,
+  encodeGitPath,
+} from "@statewalker/vcs-utils/encoding";
+import {
   expandUserPath,
   type GitHostEnvironment,
   type WorkingCopyConfig,
@@ -122,6 +127,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   private readonly mirroredKeys: Set<string> = new Set();
   private trailingNewline = true;
   private loaded = false;
+  /** whether the file began with a UTF-8 BOM: git keeps it when it rewrites the file */
+  private bom = false;
   /** Entries of the system and global files (with their includes), lowest first */
   private baseEntries: ConfigEntry[] = [];
   /** Entries of `config.worktree`, when `extensions.worktreeConfig` is set */
@@ -154,7 +161,15 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
    */
   async load(): Promise<void> {
     const content = await this.files.read(this.configPath);
-    const text = content ? new TextDecoder().decode(content) : "";
+    // bytes, as git reads them: a value that is no UTF-8 (a latin-1 path) keeps its bytes
+    // through a rewrite of the file; a leading BOM is skipped, as git skips it
+    this.bom =
+      !!content &&
+      content.length >= 3 &&
+      content[0] === 0xef &&
+      content[1] === 0xbb &&
+      content[2] === 0xbf;
+    const text = content ? decodeGitPatternFile(content) : "";
     this.adoptText(text);
     this.loaded = true;
     await this.loadChain();
@@ -286,7 +301,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (!this.loaded) await this.mergeIntoExistingFile();
 
     const content = this.serializeGitConfig();
-    await this.files.write(this.configPath, new TextEncoder().encode(content));
+    const body = encodeGitPath(content);
+    await this.files.write(this.configPath, this.bom ? withBom(body) : body);
 
     // Re-adopt the line structure we just wrote (keeping the in-memory values,
     // which are authoritative) so a following save() is stable.
@@ -696,7 +712,7 @@ class ChainReader {
       content = undefined;
     }
     if (!content) return;
-    const { lines } = parseConfigText(new TextDecoder().decode(content));
+    const { lines } = parseConfigText(decodeGitPatternFile(content));
     for (const line of lines) {
       const key = keyOfLine(line);
       if (key === undefined) continue;
@@ -762,7 +778,7 @@ class ChainReader {
       const files = (this.config as unknown as { files: ConfigFilesApi }).files;
       const head = await files.read(`${dirOf(this.configPath())}HEAD`).catch(() => undefined);
       if (!head) return undefined;
-      const text = new TextDecoder().decode(head).trim();
+      const text = decodeGitPath(head).trim();
       return text.startsWith("ref: ") ? text.slice(5).trim() : undefined;
     })().catch(() => undefined);
     return this.branch;
@@ -1099,4 +1115,12 @@ export async function createWorkingCopyConfig(
   const config = new GitWorkingCopyConfig(files, configPath, options);
   await config.load();
   return config;
+}
+
+/** `body` after a UTF-8 BOM. */
+function withBom(body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(body.length + 3);
+  out.set([0xef, 0xbb, 0xbf]);
+  out.set(body, 3);
+  return out;
 }

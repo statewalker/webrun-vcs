@@ -22,6 +22,8 @@ import { createIgnoreNode } from "./ignore-node.js";
 export interface GitIgnoreManagerOptions {
   /** Global patterns that apply to all paths */
   globalPatterns?: string[];
+  /** Match ASCII letters in either case (`core.ignoreCase`); default false */
+  ignoreCase?: boolean;
 }
 
 /**
@@ -51,7 +53,11 @@ class GitIgnoreManagerImpl implements IgnoreManager {
   /** Named exclude files (`info/exclude`, `core.excludesFile`), in precedence order */
   private excludeNodes = new Map<string, IgnoreNode>();
 
+  /** `core.ignoreCase`: rules match ASCII letters in either case */
+  private ignoreCase: boolean;
+
   constructor(options?: GitIgnoreManagerOptions) {
+    this.ignoreCase = options?.ignoreCase === true;
     this.globalNode = createIgnoreNode();
     if (options?.globalPatterns) {
       this.globalNode.parse(options.globalPatterns.join("\n"));
@@ -84,7 +90,7 @@ class GitIgnoreManagerImpl implements IgnoreManager {
       // Only check if this path is under this directory
       if (this.isUnderDirectory(normalizedPath, dirNode.path)) {
         const relativePath = this.getRelativePath(normalizedPath, dirNode.path);
-        const result = dirNode.node.checkIgnored(relativePath, isDirectory);
+        const result = dirNode.node.checkIgnored(relativePath, isDirectory, this.ignoreCase);
 
         if (result !== undefined) {
           return result ? MatchResult.IGNORED : MatchResult.NOT_IGNORED;
@@ -98,12 +104,12 @@ class GitIgnoreManagerImpl implements IgnoreManager {
       source === "info/exclude" ? 0 : source === "core.excludesFile" ? 1 : 2;
     const sources = [...this.excludeNodes.keys()].sort((a, b) => rank(a) - rank(b));
     for (const node of sources.map((source) => this.excludeNodes.get(source) as IgnoreNode)) {
-      const result = node.checkIgnored(normalizedPath, isDirectory);
+      const result = node.checkIgnored(normalizedPath, isDirectory, this.ignoreCase);
       if (result !== undefined) return result ? MatchResult.IGNORED : MatchResult.NOT_IGNORED;
     }
 
     // Check global patterns
-    const globalResult = this.globalNode.checkIgnored(normalizedPath, isDirectory);
+    const globalResult = this.globalNode.checkIgnored(normalizedPath, isDirectory, this.ignoreCase);
     if (globalResult !== undefined) {
       return globalResult ? MatchResult.IGNORED : MatchResult.NOT_IGNORED;
     }
@@ -148,6 +154,10 @@ class GitIgnoreManagerImpl implements IgnoreManager {
       path: normalizedDir,
       node,
     });
+  }
+
+  setIgnoreCase(ignoreCase: boolean): void {
+    this.ignoreCase = ignoreCase;
   }
 
   addGlobalPatterns(patterns: string[]): void {

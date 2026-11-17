@@ -5,13 +5,17 @@
  * loudly, never as an empty repository.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createInMemoryFilesApi, createSymlinkFilesApi } from "@statewalker/vcs-core";
-import { createGitFilesBackend } from "@statewalker/vcs-store-files";
-import { openRepositoryFiles, PosixNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { createFileWorktree, createGitFilesBackend } from "@statewalker/vcs-store-files";
+import {
+  createNodeFilesApi,
+  openRepositoryFiles,
+  PosixNodeFilesApi,
+} from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const env = {
@@ -141,3 +145,56 @@ describe.skipIf(!hasGit || process.platform === "win32")("openRepositoryFiles", 
     }
   });
 });
+
+describe.skipIf(!hasGit || process.platform !== "linux")(
+  "a symlinked .git whose target is no UTF-8",
+  () => {
+    it("resolves the link target as its bytes (a latin-1 directory name)", async () => {
+      const base = mkdtempSync(join(tmpdir(), "linked-git-latin1-"));
+      try {
+        git(base, "init", "-q", "--initial-branch=main", "work");
+        const work = join(base, "work");
+        git(work, "commit", "-q", "--allow-empty", "-m", "first");
+        const head = git(work, "rev-parse", "HEAD");
+        // the repository moves to "caf\xe9-git" (latin-1) in the worktree; .git links to it
+        const target = Buffer.from("caf\xe9-git", "latin1");
+        renameSync(join(work, ".git"), Buffer.concat([Buffer.from(`${work}/`), target]));
+        symlinkSync(target, join(work, ".git"));
+        const files = new PosixNodeFilesApi({ rootDir: work });
+        const { history } = await createGitFilesBackend({ files });
+        expect((await history.refs.resolve("HEAD"))?.objectId).toBe(head);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+  },
+);
+
+describe.skipIf(!hasGit || process.platform !== "linux")(
+  "a nested repository whose .git links to a directory named in latin-1",
+  () => {
+    it("is a repository, not a dangling link (as git sees it)", async () => {
+      const base = mkdtempSync(join(tmpdir(), "nested-latin1-"));
+      try {
+        git(base, "init", "-q", "--initial-branch=main", ".");
+        mkdirSync(join(base, "sub"));
+        git(join(base, "sub"), "init", "-q", "--initial-branch=main", ".");
+        writeFileSync(join(base, "sub", "f"), "x\n");
+        git(join(base, "sub"), "add", "f");
+        git(join(base, "sub"), "commit", "-q", "-m", "m");
+        const target = Buffer.from("caf\xe9-git", "latin1");
+        renameSync(join(base, "sub", ".git"), Buffer.concat([Buffer.from(`${base}/sub/`), target]));
+        symlinkSync(target, join(base, "sub", ".git"));
+        // git sees one untracked nested repository, not its files
+        expect(git(base, "status", "--porcelain", "-uall")).toBe("?? sub/");
+        const files = createNodeFilesApi({ rootDir: base });
+        const worktree = createFileWorktree({ files, rootPath: "", gitDir: ".git" } as never);
+        const state = await worktree.repositoryState?.("sub");
+        expect(state).toBeDefined();
+        expect(state).not.toBe("none");
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+  },
+);

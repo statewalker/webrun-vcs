@@ -10,7 +10,8 @@
  * - Anchored patterns: /pattern
  */
 
-import { wildmatch } from "./git-wildmatch.js";
+import { encodeGitPath, foldAsciiCase, hasEscapedBytes } from "@statewalker/vcs-utils/encoding";
+import { sameBytes, wildmatch, wildmatchBytes } from "./git-wildmatch.js";
 import type { IgnoreRule } from "./ignore-manager.js";
 
 const PATH_SEPARATOR = "/";
@@ -72,9 +73,9 @@ class GitIgnoreRule implements IgnoreRule {
     return this.matcher.matchesPath(path, isDirectory, pathMatch);
   }
 
-  matchesPath(path: string, isDirectory: boolean): boolean {
+  matchesPath(path: string, isDirectory: boolean, ignoreCase = false): boolean {
     if (!this.git || !path) return false;
-    return matchGitPattern(this.git, path.replace(/^\/+/, ""), isDirectory);
+    return matchGitPattern(this.git, path.replace(/^\/+/, ""), isDirectory, ignoreCase);
   }
 }
 
@@ -118,6 +119,13 @@ interface GitPattern {
   mustBeDir: boolean;
   /** `*literal` (`PATTERN_FLAG_ENDSWITH`) */
   endsWith: boolean;
+  /**
+   * The pattern's bytes when it holds escaped bytes (half of a UTF-8 sequence, say): git
+   * compares its literal parts byte by byte, which strings cannot do for such a pattern
+   */
+  bytes?: Uint8Array;
+  /** The byte length of the literal part, with {@link bytes} */
+  nowildcardBytes?: number;
 }
 
 const isGlobSpecialChar = (c: string) => c === "*" || c === "?" || c === "[" || c === "\\";
@@ -166,22 +174,42 @@ function parseGitPattern(line: string): GitPattern | undefined {
   const nodir = !pattern.includes("/");
   const nowildcardLen = Math.min(simpleLength(p), len);
   const endsWith = p.startsWith("*") && simpleLength(p.slice(1)) === p.length - 1;
-  return { pattern, nowildcardLen, nodir, mustBeDir, endsWith };
+  if (!hasEscapedBytes(pattern)) return { pattern, nowildcardLen, nodir, mustBeDir, endsWith };
+  const bytes = encodeGitPath(pattern);
+  const nowildcardBytes = encodeGitPath(pattern.slice(0, nowildcardLen)).length;
+  return { pattern, nowildcardLen, nodir, mustBeDir, endsWith, bytes, nowildcardBytes };
 }
 
-/** git's `match_basename` and `match_pathname` (base: the ignore file's directory). */
-function matchGitPattern(g: GitPattern, path: string, isDirectory: boolean): boolean {
+/**
+ * git's `match_basename` and `match_pathname` (base: the ignore file's directory), ASCII
+ * case folded with `ignoreCase` (`core.ignoreCase`: `fspathncmp`, `WM_CASEFOLD`).
+ *
+ * A pattern of UTF-8 text compares as strings: its literal part is whole characters, so a
+ * string prefix or suffix of the path is the byte prefix or suffix git compares. A pattern
+ * holding escaped bytes compares as bytes, as git does, so `caf\xc3*` takes `café`
+ * (`caf\xc3\xa9`).
+ */
+function matchGitPattern(
+  g: GitPattern,
+  path: string,
+  isDirectory: boolean,
+  ignoreCase: boolean,
+): boolean {
   if (g.mustBeDir && !isDirectory) return false;
+  if (g.bytes) return matchGitPatternBytes(g, g.bytes, path, ignoreCase);
+  const fold = ignoreCase ? foldAsciiCase : (s: string) => s;
   const { pattern } = g;
   const patternlen = pattern.length;
   if (g.nodir) {
     const basename = path.slice(path.lastIndexOf("/") + 1);
-    if (g.nowildcardLen === patternlen) return patternlen > 0 && pattern === basename;
+    if (g.nowildcardLen === patternlen) {
+      return patternlen > 0 && fold(pattern) === fold(basename);
+    }
     if (g.endsWith) {
       const tail = pattern.slice(1);
-      return tail.length <= basename.length && basename.endsWith(tail);
+      return tail.length <= basename.length && fold(basename).endsWith(fold(tail));
     }
-    return wildmatch(pattern, basename);
+    return wildmatch(pattern, basename, { casefold: ignoreCase });
   }
   let pat = pattern;
   let prefix = g.nowildcardLen;
@@ -192,12 +220,58 @@ function matchGitPattern(g: GitPattern, path: string, isDirectory: boolean): boo
   let name = path;
   if (prefix > 0) {
     if (prefix > name.length) return false;
-    if (pat.slice(0, prefix) !== name.slice(0, prefix)) return false;
+    if (fold(pat.slice(0, prefix)) !== fold(name.slice(0, prefix))) return false;
     pat = pat.slice(prefix);
     name = name.slice(prefix);
     if (!pat.length && !name.length) return true;
   }
-  return wildmatch(pat, name, { pathname: true });
+  return wildmatch(pat, name, { pathname: true, casefold: ignoreCase });
+}
+
+/** {@link matchGitPattern} of a pattern holding escaped bytes: byte by byte, as git. */
+function matchGitPatternBytes(
+  g: GitPattern,
+  pattern: Uint8Array,
+  path: string,
+  ignoreCase: boolean,
+): boolean {
+  const patternlen = pattern.length;
+  const literal = g.nowildcardBytes ?? 0;
+  if (g.nodir) {
+    const basename = encodeGitPath(path.slice(path.lastIndexOf("/") + 1));
+    if (literal === patternlen) {
+      return (
+        patternlen === basename.length && sameBytes(pattern, 0, basename, 0, patternlen, ignoreCase)
+      );
+    }
+    if (g.endsWith) {
+      const tail = patternlen - 1;
+      return (
+        tail <= basename.length &&
+        sameBytes(pattern, 1, basename, basename.length - tail, tail, ignoreCase)
+      );
+    }
+    return wildmatchBytes(pattern, basename, { casefold: ignoreCase });
+  }
+  let start = 0;
+  let prefix = literal;
+  if (pattern[0] === 0x2f) {
+    start = 1;
+    prefix--;
+  }
+  const name = encodeGitPath(path);
+  let nameStart = 0;
+  if (prefix > 0) {
+    if (prefix > name.length) return false;
+    if (!sameBytes(pattern, start, name, 0, prefix, ignoreCase)) return false;
+    start += prefix;
+    nameStart = prefix;
+    if (start === patternlen && nameStart === name.length) return true;
+  }
+  return wildmatchBytes(pattern.subarray(start), name.subarray(nameStart), {
+    pathname: true,
+    casefold: ignoreCase,
+  });
 }
 
 // ============ Pattern State Detection ============

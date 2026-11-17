@@ -8,7 +8,12 @@ import type { WorkingCopyConfig } from "../working-copy.js";
 import type { WorktreeContentFilter } from "../worktree/content-filter.js";
 import type { Worktree } from "../worktree/worktree.js";
 import type { FilterDriverRegistry } from "./filter-driver.js";
-import { configValue, createGitContentFilter, GitContentFilter } from "./git-content-filter.js";
+import {
+  configValue,
+  createGitContentFilter,
+  GitContentFilter,
+  gitBool,
+} from "./git-content-filter.js";
 import { expandUserPath, type GitHostEnvironment, xdgConfigPath } from "./host-environment.js";
 
 /** How a working copy sets up its worktree's content conversion. */
@@ -27,16 +32,21 @@ export interface ContentFilterSetup {
 }
 
 /**
- * Lets the worktree read the global excludes file as git does: `core.excludesFile` from the
- * configuration chain (`~/` in the home), else `$XDG_CONFIG_HOME/git/ignore`, through the
- * host's environment. Without an environment nothing is read (the worktree's own
- * `globalExcludesFile` option, if any, still applies).
+ * Lets the worktree read `core.ignoreCase` for its ignore rules, and the global excludes file
+ * as git does: `core.excludesFile` from the configuration chain (`~/` in the home), else
+ * `$XDG_CONFIG_HOME/git/ignore`, through the host's environment. Without an environment no
+ * excludes file is read (the worktree's own `globalExcludesFile` option, if any, still
+ * applies).
  */
 export function installExcludesFile(
   parts: { worktree: Worktree; config?: WorkingCopyConfig },
   environment?: GitHostEnvironment,
 ): void {
   const { worktree, config } = parts;
+  // the ignore rules fold ASCII case with core.ignoreCase, as git's do
+  if (config) {
+    worktree?.setIgnoreCaseReader?.(() => gitBool(configValue(config, "core.ignorecase")) ?? false);
+  }
   if (!worktree?.setExcludesFileReader) return;
   const env =
     environment ?? (config as { environment?: GitHostEnvironment } | undefined)?.environment;

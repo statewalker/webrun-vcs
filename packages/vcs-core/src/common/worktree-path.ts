@@ -24,6 +24,8 @@
  * elsewhere.
  */
 
+import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
+
 /** Code points HFS+ ignores when comparing names (git's `next_hfs_char`). */
 const HFS_IGNORABLE = /[‌-‏‪-‮⁪-⁯﻿]/g;
 
@@ -60,7 +62,7 @@ function onlySpacesAndPeriods(name: string, i: number): boolean {
  * fallback short name NTFS makes from a hash (`<prefix>~1` to `~9`).
  */
 function isNtfsDotGeneric(name: string, dotName: string, shortPrefix: string): boolean {
-  const lower = name.toLowerCase();
+  const lower = foldAsciiCase(name); // strncasecmp: ASCII letters only
   if (lower.startsWith(`.${dotName}`)) return onlySpacesAndPeriods(name, dotName.length + 1);
   if (lower.startsWith(dotName.slice(0, 6)) && name[6] === "~" && /^[1-4]$/.test(name[7] ?? "")) {
     return onlySpacesAndPeriods(name, 8);
@@ -80,7 +82,7 @@ function isNtfsDotGeneric(name: string, dotName: string, shortPrefix: string): b
       return false;
     } else if (c.charCodeAt(0) & 0x80) {
       return false;
-    } else if (c.toLowerCase() !== shortPrefix[i]) {
+    } else if (foldAsciiCase(c) !== shortPrefix[i]) {
       return false;
     }
   }
@@ -98,12 +100,13 @@ function isNtfsDotGeneric(name: string, dotName: string, shortPrefix: string): b
  * ```
  */
 export function isGitWorktreeFile(component: string, file: GitWorktreeFile): boolean {
-  if (component.replace(HFS_IGNORABLE, "").toLowerCase() === `.${file}`) return true;
+  // is_hfs_dot_generic folds ASCII only (any other code point ends the match)
+  if (foldAsciiCase(component.replace(HFS_IGNORABLE, "")) === `.${file}`) return true;
   return isNtfsDotGeneric(component, file, GIT_FILES[file]);
 }
 
 function isDotGit(component: string): boolean {
-  if (component.replace(HFS_IGNORABLE, "").toLowerCase() === ".git") return true;
+  if (foldAsciiCase(component.replace(HFS_IGNORABLE, "")) === ".git") return true;
   // git's is_ntfs_dotgit ends a name at a backslash on every platform
   return component.split("\\").some((part) => NTFS_DOTGIT.test(part));
 }

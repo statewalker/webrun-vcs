@@ -216,3 +216,20 @@ export function unquoteGitPath(
   }
   return undefined;
 }
+
+/**
+ * `path` with ASCII letters lowered and every other character kept: git's case folding of
+ * paths and patterns (`tolower` of its `sane_ctype`, `strncasecmp` in the C locale), which
+ * leaves bytes beyond ASCII alone. `"É.TXT"` folds to `"É.txt"`, never to `"é.txt"` as
+ * `toLowerCase` would; an escaped byte stays the same escape.
+ *
+ * @example
+ * ```typescript
+ * foldAsciiCase("README.Md"); // "readme.md"
+ * foldAsciiCase("K"); // "K" (the Kelvin sign: toLowerCase makes it "k")
+ * ```
+ */
+export function foldAsciiCase(path: string): string {
+  if (!/[A-Z]/.test(path)) return path;
+  return path.replace(/[A-Z]+/g, (s) => s.toLowerCase());
+}

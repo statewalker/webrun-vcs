@@ -5,6 +5,7 @@ import {
   decodeGitPath,
   decodeGitPatternFile,
   encodeGitPath,
+  foldAsciiCase,
   hasEscapedBytes,
   unquoteGitPath,
 } from "../../src/encoding/index.js";
@@ -116,5 +117,18 @@ describe("unquoteGitPath", () => {
 
   it("round-trips a raw latin-1 byte inside quotes", () => {
     expect(unquoteGitPath(bytes(0x22, 0x61, 0xe9, 0x22))?.path).toBe("a\udce9");
+  });
+});
+
+describe("foldAsciiCase", () => {
+  it("lowers ASCII letters only, as git's tolower and strncasecmp do", () => {
+    expect(foldAsciiCase("README.Md")).toBe("readme.md");
+    expect(foldAsciiCase("plain")).toBe("plain");
+    // beyond ASCII nothing folds: not É, not the Kelvin sign (toLowerCase makes it "k")
+    expect(foldAsciiCase("\u00c9.TXT")).toBe("\u00c9.txt");
+    expect(foldAsciiCase("\u212a")).toBe("\u212a");
+    expect(foldAsciiCase("\u0130X")).toBe("\u0130x");
+    // an escaped byte stays the same escape
+    expect(foldAsciiCase("CAF\udcc9")).toBe("caf\udcc9");
   });
 });

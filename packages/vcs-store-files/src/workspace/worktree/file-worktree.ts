@@ -28,7 +28,7 @@ import {
   type PosixFilesApi,
   readFile,
 } from "@statewalker/vcs-core";
-import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import { collect } from "@statewalker/vcs-utils/streams";
@@ -103,6 +103,8 @@ export class FileWorktree implements Worktree {
   private filter?: WorktreeContentFilter;
   /** Reads the global excludes file when no `globalExcludesFile` was given */
   private excludesReader?: () => Promise<string | undefined>;
+  /** Reads `core.ignoreCase` for the ignore rules (set by the working copy) */
+  private ignoreCaseReader?: () => boolean;
   private readonly rootFiles: WorktreeFilesApi;
   /** The FilesApi of the batch in progress (`withLstatCache` view), if any */
   private scoped?: WorktreeFilesApi;
@@ -478,6 +480,10 @@ export class FileWorktree implements Worktree {
     this.excludesReader = read;
   }
 
+  setIgnoreCaseReader(read: (() => boolean) | undefined): void {
+    this.ignoreCaseReader = read;
+  }
+
   /** A file of the git directory (`info/attributes`), never through a symbolic link. */
   async readGitDirFile(path: string): Promise<Uint8Array | undefined> {
     if (!this.gitDir) return undefined;
@@ -771,8 +777,8 @@ export class FileWorktree implements Worktree {
     if (this.files.lstat) {
       if ((await this.files.lstat(dotGit))?.kind !== "file") return undefined;
     } else if ((await this.files.stats(dotGit))?.kind !== "file") return undefined;
-    return new TextDecoder()
-      .decode(await readFile(this.files, dotGit))
+    // the path as its bytes: a gitdir that is no UTF-8 names the same directory
+    return decodeGitPath(await readFile(this.files, dotGit))
       .trim()
       .match(/^gitdir: (.+)$/)?.[1];
   }
@@ -811,9 +817,7 @@ export class FileWorktree implements Worktree {
       // a `.git` link (git follows it): its target, when this FilesApi can name it
       if (await this.isDanglingLink(dotGit, path)) return "none";
       const bytes = await this.files.readlink?.(dotGit).catch(() => undefined);
-      const resolved = bytes
-        ? this.gitfileTarget(path, new TextDecoder().decode(bytes))
-        : undefined;
+      const resolved = bytes ? this.gitfileTarget(path, decodeGitPath(bytes)) : undefined;
       if (resolved === undefined) return "unknown";
       const state = await this.headState(resolved);
       return state === "none" ? "unknown" : state;
@@ -880,7 +884,7 @@ export class FileWorktree implements Worktree {
         if (this.files.lstat) {
           if ((await this.files.lstat(full))?.kind !== "file") return undefined;
         } else if ((await this.files.stats(full))?.kind !== "file") return undefined;
-        return new TextDecoder().decode(await readFile(this.files, full)).trim();
+        return decodeGitPath(await readFile(this.files, full)).trim();
       } catch {
         return undefined;
       }
@@ -1137,7 +1141,8 @@ export class FileWorktree implements Worktree {
     try {
       const bytes = await this.files.readlink?.(link);
       if (!bytes) return false;
-      const target = this.gitfileTarget(dir, new TextDecoder().decode(bytes));
+      // the target as bytes, as `repositoryState` reads it (a name that is no UTF-8)
+      const target = this.gitfileTarget(dir, decodeGitPath(bytes));
       if (target === undefined) return false;
       return (await this.kindOrError(target)) === undefined;
     } catch {
@@ -1248,6 +1253,15 @@ export class FileWorktree implements Worktree {
    * ignore check where the ignore manager can replace them, so a change is always seen.
    */
   private async loadRepositoryExcludes(): Promise<void> {
+    if (this.ignoreCaseReader) {
+      let ignoreCase = false;
+      try {
+        ignoreCase = this.ignoreCaseReader();
+      } catch {
+        // an unreadable configuration: case-sensitive, git's default
+      }
+      this.ignoreManager.setIgnoreCase?.(ignoreCase);
+    }
     if (this.ignoreManager.setExcludeFile) {
       const read = async (path: string) => {
         try {

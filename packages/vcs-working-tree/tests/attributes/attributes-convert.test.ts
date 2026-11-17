@@ -283,3 +283,32 @@ describe("attributes: a leading BOM", () => {
     expect(matchesC(parseAttributes("\ufeffc.txt foo\n"))).toBe(true);
   });
 });
+
+describe("attribute patterns: byte-exact literal parts, ASCII-only case folding", () => {
+  const cafe = "caf\u00e9";
+  const match = (p: string, path: string, base = "", ignoreCase = false) =>
+    attributePatternMatches(parseAttributePattern(p), path, base, { ignoreCase });
+
+  it("compares a literal prefix or suffix holding half of a UTF-8 sequence as bytes", () => {
+    expect(match("caf\udcc3*", cafe)).toBe(true);
+    expect(match("/caf\udcc3*", cafe)).toBe(true);
+    expect(match("d/caf\udcc3*", `d/${cafe}`)).toBe(true);
+    expect(match("caf\udcc3*", `sub/${cafe}`, "sub")).toBe(true);
+    expect(match("/caf\udcc3*", `sub/${cafe}`, "sub")).toBe(true);
+    expect(match("*\udca9", cafe)).toBe(true);
+    expect(match("*\udca9", "cafe")).toBe(false);
+    expect(match("caf\udcc3\udca9", cafe)).toBe(true);
+    expect(match("d/caf\udcc3\udca9", `d/${cafe}`)).toBe(true);
+    expect(match("caf\udce9", cafe)).toBe(false);
+  });
+
+  it("folds ASCII letters only with ignoreCase (fspathncmp, WM_CASEFOLD)", () => {
+    expect(match("README", "readme", "", true)).toBe(true);
+    expect(match("D/*.TXT", "d/x.txt", "", true)).toBe(true);
+    expect(match("x.txt", "SUB/x.txt", "sub", true)).toBe(true);
+    expect(match("\u00c9t\u00e9", "\u00e9t\u00e9", "", true)).toBe(false);
+    expect(match("*\u00c9", "x\u00e9", "", true)).toBe(false);
+    expect(match("d/\u00c9", "d/\u00e9", "", true)).toBe(false);
+    expect(match("\u212a", "k", "", true)).toBe(false);
+  });
+});

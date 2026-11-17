@@ -6,6 +6,7 @@
  */
 
 import type { History } from "@statewalker/vcs-core";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type {
   AddWorktreeOptions,
   Checkout,
@@ -108,7 +109,8 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
 
   private async readText(path: string): Promise<string | undefined> {
     const content = await this.files.read(path).catch(() => undefined);
-    return content ? new TextDecoder().decode(content) : undefined;
+    // `commondir` and HEAD as their bytes (a path that is no UTF-8 keeps them)
+    return content ? decodeGitPath(content) : undefined;
   }
 
   /** git's `commondir`: the repository a linked worktree's git directory belongs to. */
@@ -205,11 +207,12 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     await this.files.mkdir(worktreeGitDir);
 
     // Create .git file in worktree pointing to main repo's worktrees/NAME
+    // (paths as their bytes: one that is no UTF-8 is written as it is, never as U+FFFD)
     const gitFile = `gitdir: ${worktreeGitDir}\n`;
-    await this.files.writeFile(`${worktreePath}/.git`, gitFile);
+    await this.files.write(`${worktreePath}/.git`, encodeGitPath(gitFile));
 
     // Create gitdir file in worktrees/NAME pointing back to worktree
-    await this.files.writeFile(`${worktreeGitDir}/gitdir`, `${worktreePath}/.git\n`);
+    await this.files.write(`${worktreeGitDir}/gitdir`, encodeGitPath(`${worktreePath}/.git\n`));
 
     // Set up HEAD in worktrees/NAME. Written plainly, as git's `worktree add` writes the
     // new worktree's HEAD (write_file): worktrees/NAME was created just above and no other

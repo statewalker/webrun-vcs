@@ -1,5 +1,5 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import { directoriesOf, type Worktree, wildmatch } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
 import { removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
@@ -484,9 +484,12 @@ function normalizePathspecPath(path: string, elem: string): string {
   return joined && trailing ? `${joined}/` : joined;
 }
 
-/** git's `ps_strncmp` / `ps_strcmp`: equal, case-insensitively for `:(icase)`. */
+/**
+ * git's `ps_strncmp` / `ps_strcmp`: equal, case-insensitively for `:(icase)` (`strncasecmp`:
+ * ASCII letters only, as git folds them).
+ */
 const psEqual = (item: PathspecItem, a: string, b: string) =>
-  item.icase ? a.toLowerCase() === b.toLowerCase() : a === b;
+  item.icase ? foldAsciiCase(a) === foldAsciiCase(b) : a === b;
 
 /** git's `git_fnmatch` of an element against a name. */
 function pathspecFnmatch(item: PathspecItem, name: string): boolean {

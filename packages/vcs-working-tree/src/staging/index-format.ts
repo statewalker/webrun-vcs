@@ -4,6 +4,7 @@ import {
   compareGitPaths,
   decodeGitPath,
   encodeGitPath,
+  foldAsciiCase,
   hasEscapedBytes,
 } from "@statewalker/vcs-utils/encoding";
 import type { MergeStageValue, StagingEntry } from "./types.js";
@@ -820,7 +821,7 @@ function validatePath(path: string): void {
   // Check for .git in path components
   const components = path.split("/");
   for (const comp of components) {
-    if (comp.toLowerCase() === ".git") {
+    if (foldAsciiCase(comp) === ".git") {
       throw new Error(`Invalid path: ${path} (contains .git)`);
     }
   }

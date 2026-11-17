@@ -5,6 +5,7 @@
  * path in a composed FilesApi the repository stores then use.
  */
 
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   createMountedFilesApi,
   createSubtreeFilesApi,
@@ -52,7 +53,8 @@ async function followLink(files: PosixFilesApi, path: string): Promise<FilesApi 
   if (stats?.kind !== "symlink") return undefined;
   const opened = await files.openLinkTarget?.(path);
   if (opened) return opened;
-  const target = new TextDecoder().decode((await files.readlink?.(path)) ?? new Uint8Array());
+  // the target as its bytes (decodeGitPath), so one that is no UTF-8 names its directory
+  const target = decodeGitPath((await files.readlink?.(path)) ?? new Uint8Array());
   const resolved = resolveTarget(path, target);
   if (resolved && (await files.lstat(resolved))?.kind === "directory") {
     return createSubtreeFilesApi(files, resolved);
