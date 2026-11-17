@@ -29,20 +29,6 @@ export interface CommitResult extends Commit {
 }
 
 /**
- * Get current timezone offset as string (+HHMM or -HHMM).
- */
-function getTimezoneOffset(): string {
-  const offset = new Date().getTimezoneOffset();
-  const sign = offset <= 0 ? "+" : "-";
-  const absOffset = Math.abs(offset);
-  const hours = Math.floor(absOffset / 60)
-    .toString()
-    .padStart(2, "0");
-  const minutes = (absOffset % 60).toString().padStart(2, "0");
-  return `${sign}${hours}${minutes}`;
-}
-
-/**
  * Create a commit from staged changes.
  *
  * Equivalent to `git commit`.
@@ -92,6 +78,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private message?: string;
   private author?: PersonIdent;
   private committer?: PersonIdent;
+  /** `--author=<name> <email>`: dated when the commit is made */
+  private authorName?: { name: string; email: string };
+  /** A committer named without a date, dated when the commit is made */
+  private committerName?: { name: string; email: string };
+  private resetAuthor = false;
   private amend = false;
   private allowEmpty = false;
   private parents: ObjectId[] = [];
@@ -118,12 +109,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   setAuthor(name: string, email: string): this {
     this.checkCallable();
-    this.author = {
-      name,
-      email,
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: getTimezoneOffset(),
-    };
+    // git's --author: the name and email; the date is the amended commit's, the picked
+    // commit's, else GIT_AUTHOR_DATE or now
+    this.author = undefined;
+    this.authorName = { name, email };
     return this;
   }
 
@@ -134,6 +123,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   setAuthorIdent(author: PersonIdent): this {
     this.checkCallable();
+    this.authorName = undefined;
     this.author = author;
     return this;
   }
@@ -146,12 +136,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   setCommitter(name: string, email: string): this {
     this.checkCallable();
-    this.committer = {
-      name,
-      email,
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: getTimezoneOffset(),
-    };
+    // dated as git dates the committer: GIT_COMMITTER_DATE, else now
+    this.committer = undefined;
+    this.committerName = { name, email };
     return this;
   }
 
@@ -162,7 +149,21 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   setCommitterIdent(committer: PersonIdent): this {
     this.checkCallable();
+    this.committerName = undefined;
     this.committer = committer;
+    return this;
+  }
+
+  /**
+   * `--reset-author`: an amended commit, or the commit that concludes a cherry-pick, is
+   * authored as a new one (the author resolved as git resolves it, dated now) instead of
+   * keeping the earlier commit's author.
+   *
+   * @param reset Whether to reset the author
+   */
+  setResetAuthor(reset: boolean): this {
+    this.checkCallable();
+    this.resetAuthor = reset;
     return this;
   }
 
@@ -343,34 +344,29 @@ export class CommitCommand extends GitCommand<CommitResult> {
       throw new NoMessageError();
     }
 
-    // Determine author and committer
-    const defaultIdent: PersonIdent = {
-      name: "Unknown",
-      email: "unknown@example.com",
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: getTimezoneOffset(),
-    };
-
+    // The author (git's determine_author_info): the one given; else an amended commit's or
+    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
+    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
+    // user.*, GIT_AUTHOR_DATE or now)
     let author = this.author;
-    let committer = this.committer;
-
-    if (this.amend && previousCommit) {
-      // Keep original author when amending unless explicitly set
-      if (!author) {
-        author = previousCommit.author;
-      }
-    }
-    if (pickHead && !author) {
-      // a cherry-pick keeps the picked commit's author (git's author_message)
-      author = (await this.commits.load(pickHead))?.author;
-    }
-
     if (!author) {
-      author = committer ?? defaultIdent;
+      const kept = this.resetAuthor
+        ? undefined
+        : this.amend && previousCommit
+          ? previousCommit.author
+          : pickHead
+            ? (await this.commits.load(pickHead))?.author
+            : undefined;
+      if (kept) author = this.authorName ? { ...kept, ...this.authorName } : kept;
+      else if (this.authorName) author = this.datedIdent("author", this.authorName);
+      else author = this.resolveAuthor(this.committer ?? this.committerName);
     }
-    if (!committer) {
-      committer = author;
-    }
+    // the committer: always resolved (GIT_COMMITTER_*, committer.*, user.*), unless given
+    const committer =
+      this.committer ??
+      (this.committerName
+        ? this.datedIdent("committer", this.committerName)
+        : this.resolveCommitter(author));
 
     // Determine parents
     let parents: ObjectId[];

@@ -11,7 +11,6 @@ import {
   collectTreeBytes,
   FileMode,
   type ObjectId,
-  type PersonIdent,
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
@@ -880,24 +879,6 @@ export async function switchTrees(
 export function conflictsComment(paths: string[], unclean = paths.length > 0): string {
   if (!unclean) return "";
   return `\n# Conflicts:\n${paths.map((p) => `#\t${p}\n`).join("")}`;
-}
-
-/** The current timezone offset as git writes it (`+HHMM`). */
-export function timezoneOffset(): string {
-  const offset = new Date().getTimezoneOffset();
-  const sign = offset <= 0 ? "+" : "-";
-  const abs = Math.abs(offset);
-  return `${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}${String(abs % 60).padStart(2, "0")}`;
-}
-
-/** An identity for commits made without one set: `Unknown` now. */
-export function defaultIdent(): PersonIdent {
-  return {
-    name: "Unknown",
-    email: "unknown@example.com",
-    timestamp: Math.floor(Date.now() / 1000),
-    tzOffset: timezoneOffset(),
-  };
 }
 
 /** The commit's first line (git's subject, as in `<abbrev> (<subject>)`). */

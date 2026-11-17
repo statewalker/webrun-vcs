@@ -12,20 +12,6 @@ import { type CommandCommits, GitCommand } from "../git-command.js";
 import { abbrevLengths } from "./core-config.js";
 
 /**
- * Get current timezone offset as string (+HHMM or -HHMM).
- */
-function getTimezoneOffset(): string {
-  const offset = new Date().getTimezoneOffset();
-  const sign = offset <= 0 ? "+" : "-";
-  const absOffset = Math.abs(offset);
-  const hours = Math.floor(absOffset / 60)
-    .toString()
-    .padStart(2, "0");
-  const minutes = (absOffset % 60).toString().padStart(2, "0");
-  return `${sign}${hours}${minutes}`;
-}
-
-/**
  * Create a tag (lightweight or annotated).
  *
  * Equivalent to `git tag`.
@@ -62,6 +48,8 @@ export class TagCommand extends GitCommand<Ref> {
   private message?: string;
   private objectId?: ObjectId;
   private tagger?: PersonIdent;
+  /** A tagger named without a date, dated when the tag is made */
+  private taggerName?: { name: string; email: string };
   private annotated = false;
   private force = false;
   private signed = false;
@@ -124,12 +112,9 @@ export class TagCommand extends GitCommand<Ref> {
    */
   setTagger(name: string, email: string): this {
     this.checkCallable();
-    this.tagger = {
-      name,
-      email,
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: getTimezoneOffset(),
-    };
+    // dated as git dates a tagger: GIT_COMMITTER_DATE, else now
+    this.tagger = undefined;
+    this.taggerName = { name, email };
     return this;
   }
 
@@ -140,6 +125,7 @@ export class TagCommand extends GitCommand<Ref> {
    */
   setTaggerIdent(tagger: PersonIdent): this {
     this.checkCallable();
+    this.taggerName = undefined;
     this.tagger = tagger;
     return this;
   }
@@ -210,12 +196,11 @@ export class TagCommand extends GitCommand<Ref> {
         );
       }
 
-      const tagger = this.tagger ?? {
-        name: "Unknown",
-        email: "unknown@example.com",
-        timestamp: Math.floor(Date.now() / 1000),
-        tzOffset: getTimezoneOffset(),
-      };
+      // git's tagger: git_committer_info(IDENT_STRICT) (GIT_COMMITTER_*, committer.*,
+      // user.*), unless given
+      const tagger =
+        this.tagger ??
+        (this.taggerName ? this.datedIdent("committer", this.taggerName) : this.resolveCommitter());
 
       const tag: AnnotatedTag = {
         object: targetId,

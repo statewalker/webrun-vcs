@@ -12,6 +12,7 @@ export * from "./diff-textconv.js";
 export * from "./fetch-command.js";
 export * from "./fsck/index.js";
 export * from "./gc-command.js";
+export * from "./git-ident.js";
 export * from "./init-command.js";
 export * from "./log-command.js";
 export * from "./ls-remote-command.js";
@@ -33,7 +34,6 @@ export * from "./rebase-command.js";
 export * from "./reflog-command.js";
 export {
   committerIdent,
-  parseGitDate,
   reflogMessages,
   reflogSubject,
 } from "./reflog-messages.js";

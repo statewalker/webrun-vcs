@@ -18,52 +18,24 @@ import {
   type RefLogOptions,
   type Refs,
 } from "@statewalker/vcs-core";
-import type { GitHostEnvironment, WorkingCopy } from "@statewalker/vcs-working-tree";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
-import { RemoteConfigStore } from "../remote-config/index.js";
-
-/** The local timezone offset as git writes it (`+HHMM`). */
-function localOffset(): string {
-  const offset = new Date().getTimezoneOffset();
-  const sign = offset <= 0 ? "+" : "-";
-  const abs = Math.abs(offset);
-  return `${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}${String(abs % 60).padStart(2, "0")}`;
-}
-
-/**
- * A date in git's raw form, `<seconds> <+-HHMM>` (also `@<seconds> <+-HHMM>`, and seconds
- * alone for UTC), as `GIT_COMMITTER_DATE` usually carries it. Other forms git parses
- * (RFC 2822, ISO 8601) are read through `Date.parse`, in UTC. Undefined when unreadable.
- */
-export function parseGitDate(text: string): { timestamp: number; tzOffset: string } | undefined {
-  const raw = /^@?(\d+)(?:\s+([+-]\d{4}))?$/.exec(text.trim());
-  if (raw) return { timestamp: Number(raw[1]), tzOffset: raw[2] ?? "+0000" };
-  const ms = Date.parse(text);
-  return Number.isNaN(ms) ? undefined : { timestamp: Math.floor(ms / 1000), tzOffset: "+0000" };
-}
+import { findIdent, hostEnvironmentOf, identConfigOf } from "./git-ident.js";
 
 /**
  * The identity and time of a reflog line written now, as git's `git_committer_info` builds
- * it: `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL` / `GIT_COMMITTER_DATE` (the host
- * environment's `committer`, on the working copy's configuration), else `user.name` /
- * `user.email` and the clock (`now`, in seconds, when the caller read it once for all its
- * lines, as git reads its default date once per process). Undefined when neither names
- * anyone: the ref store's own identity is used then.
+ * it (not strict): `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL` / `GIT_COMMITTER_DATE` (the
+ * host environment's `committer`, on the working copy's configuration), else
+ * `committer.name` / `committer.email`, `user.name` / `user.email` and the clock (`now`, in
+ * seconds, when the caller read it once for all its lines, as git reads its default date
+ * once per process). Undefined when neither names anyone: the ref store's own identity is
+ * used then.
  */
 export function committerIdent(workingCopy: WorkingCopy, now?: number): PersonIdent | undefined {
-  const env = (workingCopy.config as { environment?: GitHostEnvironment } | undefined)?.environment
-    ?.committer;
-  const config = workingCopy.config ? RemoteConfigStore.from(workingCopy) : undefined;
-  const name = env?.name ?? config?.value("user.name");
-  const email = env?.email ?? config?.value("user.email");
-  const date = env?.date !== undefined ? parseGitDate(env.date) : undefined;
-  if (name === undefined && email === undefined && date === undefined) return undefined;
-  return {
-    name: name ?? "webrun-vcs",
-    email: email ?? "vcs@localhost",
-    timestamp: date?.timestamp ?? now ?? Math.floor(Date.now() / 1000),
-    tzOffset: date?.tzOffset ?? localOffset(),
-  };
+  return findIdent("committer", hostEnvironmentOf(workingCopy), identConfigOf(workingCopy), {
+    now,
+    strict: false,
+  });
 }
 
 /**

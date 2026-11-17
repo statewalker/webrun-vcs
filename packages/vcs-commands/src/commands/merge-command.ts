@@ -32,7 +32,6 @@ import { ortConfigOptions } from "./merge-drivers.js";
 import {
   abbrev,
   conflictsComment,
-  defaultIdent,
   flatTree,
   indexChanges,
   indexChangesFromTree,
@@ -279,14 +278,20 @@ export class MergeCommand extends GitCommand<MergeResult> {
     return this;
   }
 
-  /** The author of the merge commit (default: the committer, else `Unknown`). */
+  /**
+   * The author of the merge commit (default: resolved as git resolves it, from
+   * `GIT_AUTHOR_*`, `author.*`, `user.*`).
+   */
   setAuthor(author: PersonIdent): this {
     this.checkCallable();
     this.author = author;
     return this;
   }
 
-  /** The committer of the merge commit (default: the author, else `Unknown`). */
+  /**
+   * The committer of the merge commit (default: resolved as git resolves it, from
+   * `GIT_COMMITTER_*`, `committer.*`, `user.*`).
+   */
   setCommitter(committer: PersonIdent): this {
     this.checkCallable();
     this.committer = committer;
@@ -1161,8 +1166,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   private async storeCommit(tree: ObjectId, parents: ObjectId[], message: string) {
-    const author = this.author ?? this.committer ?? defaultIdent();
-    const committer = this.committer ?? author;
+    // git's merge commit: the author and the committer as git resolves them (GIT_AUTHOR_* /
+    // GIT_COMMITTER_*, author.* / committer.*, user.*), unless given
+    const author = this.author ?? this.resolveAuthor(this.committer);
+    const committer = this.committer ?? this.resolveCommitter(author);
     const commit: Commit = { tree, parents, author, committer, message };
     return this.commits.store(commit);
   }

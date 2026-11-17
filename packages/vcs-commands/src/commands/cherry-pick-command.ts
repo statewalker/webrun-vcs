@@ -158,7 +158,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
     return this;
   }
 
-  /** The committer of the commits made (default `Unknown`, now). */
+  /** The committer of the commits made (default: resolved as git resolves it). */
   setCommitter(committer: PersonIdent): this {
     this.checkCallable();
     this.committer = committer;

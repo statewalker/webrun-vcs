@@ -117,9 +117,10 @@ function twins(empty = false): { native: string; ours: string } {
   return { native, ours };
 }
 
-/** git's committer variables, as a Node host reads them from the environment. */
+/** git's author and committer variables, as a Node host reads them from the environment. */
 const environment = {
   readFile: async () => undefined,
+  author: { name: IDENT.name, email: IDENT.email, date: "1112911993 +0000" },
   committer: { name: IDENT.name, email: IDENT.email, date: "1112911993 +0000" },
 };
 
@@ -587,6 +588,85 @@ describeGit("reflog lines of clone, fetch and pull, native twins", () => {
     expect(head.slice(-2).map((l) => l.slice(l.indexOf("\t") + 1))).toEqual([
       "pull: Fast-forward",
       "pull --rebase: Fast-forward",
+    ]);
+  });
+
+  /** HEAD's commit as `cat-file -p` shows it, the clone's URL (fmt-merge-msg's) evened out. */
+  const headObject = (repo: string, src: string) =>
+    run(repo, "cat-file", "-p", "HEAD")
+      .split(src.replace(/\.git$/, ""))
+      .join("<url>")
+      .split(URL.replace(/\.git$/, ""))
+      .join("<url>");
+
+  it("pull: a merge commit (local and upstream commits), its author and committer git's", async () => {
+    const { work, src } = upstream();
+    const native = join(root, "native");
+    const ours = join(root, "ours");
+    run(root, "clone", "-q", src, native);
+    run(root, "clone", "-q", src, ours);
+    run(ours, "config", "remote.origin.url", URL);
+    commitIn(work, "upstream 1");
+    publish(work, src, "main");
+    for (const repo of [native, ours]) {
+      put(repo, "local.txt", "local\n");
+      run(repo, "add", "local.txt");
+      run(repo, "commit", "-qm", "local");
+    }
+
+    run(native, "-c", "pull.rebase=false", "-c", "core.editor=true", "pull");
+    const result = await (await openPlain(ours)).pull().call();
+    expect(result.successful).toBe(true);
+    // the merge commit's identities and message; its id differs (the URL in the message)
+    expect(headObject(ours, src)).toBe(headObject(native, src));
+    const merges = [native, ours].map((repo) => run(repo, "rev-parse", "HEAD").trim());
+    const url = new RegExp(
+      `(${src.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|${URL.replace(/\./g, "\\.")})`,
+      "g",
+    );
+    const logs = [native, ours].map((repo, i) => {
+      const all = reflogs(join(repo, ".git"), repo, url);
+      for (const name of Object.keys(all)) all[name] = all[name].split(merges[i]).join("<merge>");
+      return all;
+    });
+    expect(logs[1]).toEqual(logs[0]);
+    const head = readFileSync(join(ours, ".git/logs/HEAD"), "latin1").trim().split("\n");
+    expect(head.at(-1)?.slice(head.at(-1)?.indexOf("\t") ?? 0)).toBe(
+      "\tpull: Merge made by the 'ort' strategy.",
+    );
+  });
+
+  it("pull --rebase over local commits: the picks and the finish logged as git's", async () => {
+    const { work, src } = upstream();
+    const native = join(root, "native");
+    const ours = join(root, "ours");
+    run(root, "clone", "-q", src, native);
+    run(root, "clone", "-q", src, ours);
+    run(ours, "config", "remote.origin.url", URL);
+    commitIn(work, "upstream 1");
+    publish(work, src, "main");
+    for (const repo of [native, ours]) {
+      put(repo, "local.txt", "local\n");
+      run(repo, "add", "local.txt");
+      run(repo, "commit", "-qm", "local 1");
+      put(repo, "local.txt", "local\nmore\n");
+      run(repo, "commit", "-qam", "local 2");
+    }
+
+    run(native, "pull", "--rebase");
+    const result = await (await openPlain(ours)).pull().setRebase(true).call();
+    expect(result.successful).toBe(true);
+    expectSame(native, ours, src);
+    // the rebased commits are the same commits
+    expect(run(ours, "rev-parse", "HEAD")).toBe(run(native, "rev-parse", "HEAD"));
+    const head = readFileSync(join(ours, ".git/logs/HEAD"), "latin1").trim().split("\n");
+    expect(
+      head.slice(-4).map((l) => l.slice(l.indexOf("\t") + 1).replace(/[0-9a-f]{40}/, "<id>")),
+    ).toEqual([
+      "pull --rebase (start): checkout <id>",
+      "pull --rebase (pick): local 1",
+      "pull --rebase (pick): local 2",
+      "pull --rebase (finish): returning to refs/heads/main",
     ]);
   });
 });
