@@ -17,7 +17,7 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
-import { skipPacked, withPacks } from "./pack/with-packs.js";
+import { readDeltaBaseCacheLimit, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
 import { readRepositoryFormat } from "./repository-format.js";
@@ -142,6 +142,8 @@ export async function createGitFilesBackend(
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
     freshenMaxAgeMs,
+    // git's core.deltaBaseCacheLimit (96 MiB when unset)
+    baseCacheBytes: await readDeltaBaseCacheLimit(files, gitDir),
   });
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);

@@ -1,0 +1,13 @@
+---
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-store-files": minor
+---
+
+**Delta base cache and idx open as git does them: faster packed reads, rev-walks and repository opens.**
+
+On a repacked 5000-commit repository (depth 50, files backend), reading 2000 packed blobs takes about two thirds of the time it took, a rev-walk about 90%, and opening a repository about half. Object bytes, read errors and the streaming of large objects are unchanged.
+
+- **Delta base cache (vcs-core):** as git's `unpack_entry`, the bases a read resolves on its way up a delta chain are cached and the object asked for is not: it is handed to the caller without a copy (a cached object asked for is still copied, so callers never hold a buffer the cache holds). Small bases are carved from 64 KiB slabs owned by the cache instead of each getting its own `Uint8Array`; a slab is never reused, and the budget counts a whole slab while any entry lives in it. The LRU is an intrusive list. The default budget is git's `core.deltaBaseCacheLimit` default, 96 MiB (was 16 MiB, which made a random read workload evict bases it needed again). `DeltaBaseCache` gains `alloc`, `hits`, `ownAllocations`, `slabsCreated` and `size`; `DEFAULT_DELTA_BASE_CACHE_LIMIT` is exported. Reading the same delta twice now costs one delta step instead of a copy.
+- **idx open (vcs-core):** `openPack` checks what git's `check_packed_git_idx` checks (header, monotonic fan-out, a length that fits the tables) and no longer hashes the whole idx or walks every entry. A fan-out bucket's ids are checked (sorted, inside the bucket) the first time a lookup searches it, and a 64-bit offset index when it is read, so a corrupt idx fails with `PackError` when used, never with another object's bytes. `openPack(..., { verifyIndex: true })` and `PackFile.verifyIndex()` run git's `verify_pack_index` (the SHA-1 and every entry); `PackSet.install` uses it for the idx it just wrote. Behaviour change: an idx whose only fault is its own checksum, or whose ids are out of order, now opens as git opens it (the pack is no longer skipped); a lookup into a broken bucket raises `PackError` and `has` answers false for it. `PackStats` gains `idxBucketsChecked` and `idxVerified`.
+- **Commit reads (vcs-core):** `GitObjects.getNow` (optional) returns an object without a promise when it is in memory; the commit store uses it. Returning the cached commit without a copy was measured and left out: the copy is under the noise of a rev-walk.
+- **vcs-store-files:** the backend honours `core.deltaBaseCacheLimit` (`readDeltaBaseCacheLimit`, git's size syntax: `96m`, `512k`, hex, octal), and `withPacks` implements `getNow`.

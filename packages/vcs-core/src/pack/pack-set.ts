@@ -25,6 +25,7 @@ import {
   PackError,
 } from "./index-pack.js";
 import {
+  DEFAULT_DELTA_BASE_CACHE_LIMIT,
   DeltaBaseCache,
   openPack,
   type Pack,
@@ -35,7 +36,10 @@ import {
 import { runSteps, runStepsAsync, type Steps } from "./run-steps.js";
 
 export interface OpenPackSetOptions {
-  /** Bytes of resolved delta bases kept across reads, for the whole set. Default 16 MiB. */
+  /**
+   * Bytes of resolved delta bases kept across reads, for the whole set (git's
+   * core.deltaBaseCacheLimit). Default 96 MiB, as git's.
+   */
   baseCacheBytes?: number;
   /** Largest object accepted, by its header, by delta results and for external bases. Default 1 GiB. */
   maxObjectSize?: number;
@@ -137,7 +141,7 @@ export async function openPackSet(
   /** how long freshen trusts a pack it saw: capped, as a write it skips is never retried */
   const freshenTrust = Math.min(rescanInterval, 1000);
   const freshenMaxAge = options.freshenMaxAgeMs ?? 60 * 60 * 1000;
-  const baseCache = new DeltaBaseCache(options.baseCacheBytes ?? 16 * 2 ** 20);
+  const baseCache = new DeltaBaseCache(options.baseCacheBytes ?? DEFAULT_DELTA_BASE_CACHE_LIMIT);
   let packs: PackFile[] = [];
   const byName = new Map<string, PackFile>();
   /** opens in flight, shared by scans and installs of the same pack */
@@ -239,13 +243,14 @@ export async function openPackSet(
   };
 
   /** Opens a pack; concurrent opens of the same name share one promise. */
-  const open = (name: string): Promise<PackFile> => {
+  const open = (name: string, verifyIndex = false): Promise<PackFile> => {
     let pending = opening.get(name);
     if (!pending) {
       pending = openPack(files, `${dir}/${name}.pack`, `${dir}/${name}.idx`, {
         baseCache,
         maxObjectSize,
         externalBase,
+        verifyIndex,
       }).finally(() => opening.delete(name));
       opening.set(name, pending);
     }
@@ -411,12 +416,13 @@ export async function openPackSet(
     let vanished = false;
     // `packs` is replaced, never changed in place: this loop sees one snapshot
     for (const p of packs) {
-      if (!p.has(id)) continue;
+      // only held ids are marked bad
       if (isBad(p, id)) {
         failed ??= new PackError(`object ${id}: the copy in pack ${p.packId} is corrupt`);
         continue;
       }
       try {
+        // undefined when the pack does not hold `id`; a corrupt idx bucket throws `PackError`
         let obj = p.getNow(id, o);
         if (obj instanceof Promise) obj = (yield obj) as GitObject | undefined;
         if (obj) return yield* guarded(p, id, obj);
@@ -531,7 +537,8 @@ export async function openPackSet(
       const r = await installPack(files, dir, source, { maxObjectSize, ...o });
       const name = `pack-${r.packId}`;
       if (!byName.has(name)) {
-        const p = await open(name);
+        // an idx just written is checked whole, as index-pack does
+        const p = await open(name, true);
         if (!byName.has(name)) {
           byName.set(name, p);
           packs = [p, ...packs];

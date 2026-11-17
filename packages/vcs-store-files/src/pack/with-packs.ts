@@ -14,6 +14,7 @@ import {
   type GitObject,
   type GitObjects,
   PackError,
+  runSteps,
   runStepsAsync,
   type Steps,
 } from "@statewalker/vcs-core";
@@ -142,6 +143,8 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
     },
 
     get: lookup,
+
+    getNow: (id, options) => runSteps(lookupSteps(id, options)),
 
     async has(id) {
       if (!isId(id)) return loose.has(id);

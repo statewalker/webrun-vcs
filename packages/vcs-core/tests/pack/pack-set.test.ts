@@ -333,8 +333,25 @@ describe("openPackSet: corrupt packs are skipped and recorded", () => {
     return set;
   }
 
-  it("an idx whose checksum is wrong", async () => {
-    await withBadIdx(async (idx) => flipAt(idx, idx.length - 1));
+  it("an idx whose checksum is wrong opens, as git opens it; verifyIndex refuses it", async () => {
+    // git's check_packed_git_idx does not hash the idx: only fsck and verify-pack do
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [
+      { kind: 3, data: A },
+      { kind: 6, data: dAB, baseIdx: 0 },
+    ]);
+    const p = paths(r.packId);
+    const idx = await collect(files.read(p.idx));
+    await files.write(p.idx, [flipAt(idx, idx.length - 1)]);
+    const set = await openPackSet(files, PACK_DIR);
+    expect(set.skipped).toEqual([]);
+    expect(await content(await set.get(Bid, { verify: true }))).toEqual(B);
+    const pack = (await openPack(files, p.pack, p.idx)) as PackFile;
+    expect(pack.stats.idxVerified).toBe(false);
+    await expect(pack.verifyIndex()).rejects.toThrow(/idx checksum mismatch/);
+    await expect(openPack(files, p.pack, p.idx, { verifyIndex: true })).rejects.toBeInstanceOf(
+      PackError,
+    );
   });
 
   it("a truncated idx", async () => {
@@ -372,9 +389,20 @@ describe("openPackSet: corrupt packs are skipped and recorded", () => {
       idx.length - 20,
     );
     await files.write(raw.idxPath, [idx]);
-    await expect(openPack(files, raw.packPath, raw.idxPath)).rejects.toBeInstanceOf(PackError);
+    await expect(
+      openPack(files, raw.packPath, raw.idxPath, { verifyIndex: true }),
+    ).rejects.toBeInstanceOf(PackError);
+    // opened as git opens it, the bucket is checked when a lookup first searches it: an error,
+    // never the other object's content
+    const pack = await openPack(files, raw.packPath, raw.idxPath);
+    for (const id of [`aa${"1".repeat(38)}`, `aa${"2".repeat(38)}`]) {
+      await expect(pack.get(id)).rejects.toThrow(/ids not strictly sorted/);
+      expect(pack.has(id)).toBe(false);
+    }
     const set = await openPackSet(files, PACK_DIR);
-    expect(set.skipped.map((s) => s.pack)).toEqual([`pack-${raw.packId}`]);
+    expect(set.skipped).toEqual([]);
+    await expect(set.get(`aa${"1".repeat(38)}`)).rejects.toBeInstanceOf(PackError);
+    expect(await set.has(`aa${"1".repeat(38)}`)).toBe(false);
   });
 
   it("an idx without its pack is ignored, not reported", async () => {
@@ -443,7 +471,7 @@ describe("openPack: hostile and broken entries fail with PackError", () => {
     expect((await content(await ok.get(id))).length).toBe(8 * MiB);
   });
 
-  it("large offsets decode; a large-offset index outside the table is refused at open", async () => {
+  it("large offsets decode; a large-offset index outside the table is refused when read", async () => {
     const files = createInMemoryFilesApi();
     const data = enc.encode("big offset\n");
     const r = await install(files, [{ kind: 3, data }]);
@@ -465,7 +493,11 @@ describe("openPack: hostile and broken entries fail with PackError", () => {
       "big offset\n",
     );
     await files.write("/other/bad-large.idx", [rebuild(7)]);
-    await expect(openPack(files, p.pack, "/other/bad-large.idx")).rejects.toBeInstanceOf(PackError);
+    await expect(
+      openPack(files, p.pack, "/other/bad-large.idx", { verifyIndex: true }),
+    ).rejects.toBeInstanceOf(PackError);
+    const bad = await openPack(files, p.pack, "/other/bad-large.idx");
+    await expect(bad.get(oidOf("blob", data))).rejects.toThrow(/past the large-offset table/);
   });
 
   it("an idx naming a pack with another object count is refused", async () => {
@@ -533,10 +565,13 @@ describe("openPack: idx version 1", () => {
     const e = await set.entry(Bid);
     expect(e?.crc32).toBe(crc32(built.bytes.subarray(built.offsets[1], built.ends[1])));
     expect(await collect(e?.raw() ?? [])).toEqual(compressBlockPako(dAB));
-    // a v1 idx with a flipped checksum is skipped too
+    // a v1 idx with a flipped checksum opens (as git), and verifyIndex refuses it
     const idx = await collect(files.read(p.idx));
     await files.write(p.idx, [flipAt(idx, idx.length - 1)]);
-    expect((await openPackSet(files, PACK_DIR)).skipped.length).toBe(1);
+    expect((await openPackSet(files, PACK_DIR)).skipped).toEqual([]);
+    await expect(openPack(files, p.pack, p.idx, { verifyIndex: true })).rejects.toThrow(
+      /idx checksum mismatch/,
+    );
   });
 });
 
@@ -867,7 +902,7 @@ describe("review of P2.3: packs seen while they are written", () => {
     const files = createInMemoryFilesApi();
     const r = await install(files, [{ kind: 3, data: A }]);
     const idx = await collect(files.read(paths(r.packId).idx));
-    await files.write(paths(r.packId).idx, [flipAt(idx, idx.length - 1)]);
+    await files.write(paths(r.packId).idx, [idx.subarray(0, idx.length - 1)]);
     const set = await openPackSet(files, PACK_DIR);
     let idxReads = 0;
     const read = files.read.bind(files);

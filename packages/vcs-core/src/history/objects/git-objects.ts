@@ -82,6 +82,15 @@ export interface GitObjects {
    * `ObjectIdMismatchError` if the bytes hash to another id.
    */
   get(id: ObjectId, options?: { verify?: boolean }): Promise<GitObject | undefined>;
+  /**
+   * `get`, without a promise when no I/O is needed (a packed object in a loaded window or the
+   * delta base cache): the object or undefined, else a promise of it. Errors are thrown as
+   * `get` rejects with them. Optional: callers fall back to `get`.
+   */
+  getNow?(
+    id: ObjectId,
+    options?: { verify?: boolean },
+  ): GitObject | undefined | Promise<GitObject | undefined>;
   /** Whether the object is stored; false for anything that is not an id. */
   has(id: ObjectId): Promise<boolean>;
   /** Stored object ids (40 lowercase hex), whatever else the store holds. */
