@@ -448,6 +448,10 @@ function factoryFiles(base: string) {
       mkdirSync(at(p), { recursive: true });
     },
     writeFile: async (p: string, content: string) => writeFileSync(at(p), content),
+    remove: async (p: string) => {
+      rmSync(at(p), { recursive: true, force: true });
+      return true;
+    },
   };
 }
 
@@ -735,11 +739,10 @@ describeGit("linked worktrees the factory adds, next to git worktree add", () =>
     const out: Record<string, string> = {};
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isFile()) continue;
+      // only the worktree's path: the name elsewhere (the branch in HEAD) stays as written
       out[entry.name] = readFileSync(join(dir, entry.name), "latin1")
-        .split(base)
-        .join("<base>")
-        .split(name)
-        .join("<name>");
+        .split(`${base}/${name}`)
+        .join("<base>/<name>");
     }
     return out;
   };
@@ -776,9 +779,14 @@ describeGit("linked worktrees the factory adds, next to git worktree add", () =>
       lock: "kept",
     });
 
-    const native = adminFiles(base, "w-theirs");
-    expect(adminFiles(base, "w-ours")).toEqual(native);
-    expect(Object.keys(native).sort()).toEqual(["HEAD", "commondir", "gitdir", "locked"]);
+    const { HEAD: nativeHead, ...native } = adminFiles(base, "w-theirs");
+    const { HEAD: ourHead, ...mine } = adminFiles(base, "w-ours");
+    expect(mine).toEqual(native);
+    expect([nativeHead, ourHead]).toEqual([
+      "ref: refs/heads/w-theirs\n",
+      "ref: refs/heads/w-ours\n",
+    ]);
+    expect(Object.keys(native).sort()).toEqual(["commondir", "gitdir", "locked"]);
     expect(bytes(join(base, "w-ours"), ".git").split(base).join("<base>")).toBe(
       bytes(join(base, "w-theirs"), ".git")
         .split(base)
@@ -807,5 +815,89 @@ describeGit("linked worktrees the factory adds, next to git worktree add", () =>
     );
     expect(String((theirs.config as GitWorkingCopyConfig).get("test.marker"))).toBe("shared");
     expect(String((ours.config as GitWorkingCopyConfig).get("test.marker"))).toBe("shared");
+  });
+
+  it("a failing add leaves nothing behind: the retry gets the plain name", async () => {
+    const base = join(root, "wt-junk");
+    mkdirSync(base);
+    const repo = join(base, "repo");
+    mkdirSync(repo);
+    run(repo, "init", "-q", "-b", "main");
+    put(repo, "a.txt", "a\n");
+    run(repo, "add", ".");
+    run(repo, "commit", "-qm", "c1");
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const wcFactory = factory(base, "repo");
+
+    // a missing branch is refused before anything is written
+    await expect(
+      wcFactory.addWorktree(history, "repo/.git", "wt", { branch: "missing" }),
+    ).rejects.toThrow("Branch 'missing' does not exist");
+    expect(existsSync(join(repo, ".git", "worktrees"))).toBe(false);
+    expect(existsSync(join(base, "wt"))).toBe(false);
+
+    // a write that fails removes the admin directory and the worktree directory it created
+    const failing = factoryFiles(base);
+    const failingFactory = new GitWorkingCopyFactory(
+      {
+        ...failing,
+        writeFile: async () => {
+          throw new Error("disk full");
+        },
+      },
+      async () => {
+        throw new Error("never reached");
+      },
+    );
+    await expect(failingFactory.addWorktree(history, "repo/.git", "wt")).rejects.toThrow(
+      "disk full",
+    );
+    expect(readdirSync(join(repo, ".git", "worktrees"))).toEqual([]);
+    expect(existsSync(join(base, "wt"))).toBe(false);
+    // a directory that was there before stays (git's junk_work_tree is only what it made)
+    mkdirSync(join(base, "kept"));
+    await expect(failingFactory.addWorktree(history, "repo/.git", "kept")).rejects.toThrow(
+      "disk full",
+    );
+    expect(readdirSync(join(repo, ".git", "worktrees"))).toEqual([]);
+    expect(existsSync(join(base, "kept"))).toBe(true);
+    rmSync(join(base, "kept"), { recursive: true });
+
+    // the retry takes worktrees/wt, and git lists the worktree once, unlocked
+    run(repo, "branch", "present");
+    await wcFactory.addWorktree(history, "repo/.git", "wt", { branch: "present" });
+    expect(readdirSync(join(repo, ".git", "worktrees"))).toEqual(["wt"]);
+    expect(existsSync(join(repo, ".git", "worktrees", "wt", "locked"))).toBe(false);
+    const list = run(repo, "worktree", "list", "--porcelain");
+    expect(list.split(`worktree ${join(base, "wt")}\n`).length).toBe(2);
+    expect(list).not.toContain("locked");
+    expect(run(join(base, "wt"), "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("present");
+  });
+
+  it("the lock reason as git's write_file writes it: a line end only when missing", async () => {
+    const base = join(root, "wt-lock-text");
+    mkdirSync(base);
+    const repo = join(base, "repo");
+    mkdirSync(repo);
+    run(repo, "init", "-q", "-b", "main");
+    put(repo, "a.txt", "a\n");
+    run(repo, "add", ".");
+    run(repo, "commit", "-qm", "c1");
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const cases: Array<[string, string | true, string[]]> = [
+      ["empty", "", ["--reason", ""]],
+      ["newline", "x\n", ["--reason", "x\n"]],
+      ["plain", "x", ["--reason", "x"]],
+      ["default", true, []],
+    ];
+    for (const [name, lock, args] of cases) {
+      run(repo, "worktree", "add", "-q", "--no-checkout", "--lock", ...args, `../n-${name}`);
+      await factory(base, "repo").addWorktree(history, "repo/.git", `o-${name}`, { lock });
+      const locked = (n: string) =>
+        readFileSync(join(repo, ".git", "worktrees", n, "locked"), "latin1");
+      expect([name, locked(`o-${name}`)]).toEqual([name, locked(`n-${name}`)]);
+    }
   });
 });

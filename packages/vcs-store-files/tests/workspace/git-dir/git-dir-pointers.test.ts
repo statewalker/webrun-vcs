@@ -41,7 +41,18 @@ describe("linked-worktree pointer files, as git reads them", () => {
     expect(isAbsoluteGitPath("C:/repo/.git")).toBe(true);
     expect(isAbsoluteGitPath("c:\\repo\\.git")).toBe(true);
     expect(isAbsoluteGitPath("../..")).toBe(false);
-    expect(isAbsoluteGitPath("C:repo")).toBe(false);
+    expect(isAbsoluteGitPath("C:repo")).toBe(true); // drive-relative: has_dos_drive_prefix
     expect(isAbsoluteGitPath("repo/C:/x")).toBe(false);
+  });
+
+  it("absolute as Git for Windows decides: a backslash, a UNC path, any drive prefix", () => {
+    expect(isAbsoluteGitPath("\\repo\\.git")).toBe(true);
+    expect(isAbsoluteGitPath("\\\\server\\share\\repo.git")).toBe(true);
+    expect(isAbsoluteGitPath("//server/share/repo.git")).toBe(true);
+    expect(isAbsoluteGitPath("C:repo")).toBe(true);
+    expect(isAbsoluteGitPath("z:")).toBe(true);
+    expect(isAbsoluteGitPath("1:repo")).toBe(false);
+    expect(isAbsoluteGitPath("repo\\C:")).toBe(false);
+    expect(isAbsoluteGitPath("..\\..")).toBe(false);
   });
 });

@@ -338,5 +338,37 @@ describe("GitWorkingCopyConfig <-> native git", () => {
         expect([key, parseGitBool(config.get(key))]).toEqual([key, native]);
       }
     });
+
+    it("an integer must fit git's int, with its unit (git_parse_int: ERANGE)", async () => {
+      const values = [
+        "2147483648",
+        "-2147483648",
+        "4294967296",
+        "0x80000000",
+        "2g",
+        "2048m",
+        "2097152k",
+        "9223372036854775807",
+        "1.5",
+        "2147483647",
+        "-2147483647",
+        "1g",
+        "0x7fffffff",
+      ];
+      const lines = values.map((v, i) => `\tk${i} = ${v}`);
+      await fs.writeFile(path.join(repoDir, ".git/config"), `[t]\n${lines.join("\n")}\n`);
+      const config = openConfig();
+      await config.load();
+      const refused = new Set(values.slice(0, 9));
+      for (const [i, value] of values.entries()) {
+        const key = `t.k${i}`;
+        const native = await git(["config", "--bool", key], repoDir).then(
+          (out) => out === "true",
+          () => undefined,
+        );
+        expect([value, native]).toEqual([value, refused.has(value) ? undefined : true]);
+        expect([value, parseGitBool(config.get(key))]).toEqual([value, native]);
+      }
+    });
   });
 });

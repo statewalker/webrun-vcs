@@ -55,11 +55,13 @@ export function parseWorktreeGitdir(text: string): string {
 }
 
 /**
- * Whether git takes `path` as absolute: it starts with `/`, or with a drive letter and a
- * slash or backslash (`C:/`, `C:\`), as Git for Windows writes them. Tested on every
- * platform, as `includeIf.gitdir:` patterns are, so a repository moved between hosts never
- * has such a path joined onto another.
+ * Whether git takes `path` as absolute, as Git for Windows decides (`is_absolute_path`): it
+ * starts with a slash or a backslash (which covers a UNC path, two backslashes, a server and
+ * a share), or has a DOS drive prefix (`has_dos_drive_prefix`): `C:/`, `C:` with a backslash,
+ * and also the drive-relative `C:repo`, which names a place on drive C and is never joined
+ * onto another directory. Tested on every platform, as `includeIf.gitdir:` patterns are, so
+ * a repository moved between hosts never has such a path joined onto another.
  */
 export function isAbsoluteGitPath(path: string): boolean {
-  return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
+  return path.startsWith("/") || path.startsWith("\\") || /^[A-Za-z]:/.test(path);
 }

@@ -37,4 +37,31 @@ describe("parseGitBool (git_config_bool)", () => {
     expect(parseGitBool(null)).toBeUndefined();
     expect(parseGitBool(Number.NaN)).toBeUndefined();
   });
+
+  it("an integer must fit git's int, with its unit (git_parse_int: ERANGE)", () => {
+    for (const text of [
+      "2147483648",
+      "-2147483648",
+      "4294967296",
+      "0x80000000",
+      "020000000000",
+      "2g",
+      "2048m",
+      "2097152k",
+      "9223372036854775807",
+      "99999999999999999999999",
+    ]) {
+      expect([text, parseGitBool(text)]).toEqual([text, undefined]);
+    }
+    expect(parseGitBool(1.5)).toBeUndefined();
+    expect(parseGitBool(2147483648)).toBeUndefined();
+    expect(parseGitBool(-2147483648)).toBeUndefined();
+    expect(parseGitBool(Number.POSITIVE_INFINITY)).toBeUndefined();
+    for (const text of ["2147483647", "-2147483647", "1g", "0x7fffffff", "017777777777"]) {
+      expect([text, parseGitBool(text)]).toEqual([text, true]);
+    }
+    expect(parseGitBool(2147483647)).toBe(true);
+    expect(parseGitBool(-2147483647)).toBe(true);
+    expect(parseGitBool("0g")).toBe(false);
+  });
 });
