@@ -58,11 +58,38 @@
       }
     },
     {
-      "includes": ["packages/vcs-testing-gitea/**", "packages/vcs-utils-node/src/**"],
+      "includes": [
+        "packages/vcs-testing-gitea/**",
+        "packages/vcs-utils-node/src/files/posix-node-files-api.ts",
+        "packages/vcs-utils-node/src/files/replace-file.ts"
+      ],
       "linter": {
         "rules": {
           "correctness": {
             "noNodejsModules": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/vcs-utils-node/src/files/git-host-environment.ts"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noNodejsModules": "off"
+          },
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "node:fs": "Read files through a FilesApi; node:fs is for the Node FilesApi only",
+                  "node:fs/promises": "Read files through a FilesApi; node:fs is for the Node FilesApi only",
+                  "fs": "Read files through a FilesApi; node:fs is for the Node FilesApi only",
+                  "fs/promises": "Read files through a FilesApi; node:fs is for the Node FilesApi only"
+                }
+              }
+            }
           }
         }
       }
