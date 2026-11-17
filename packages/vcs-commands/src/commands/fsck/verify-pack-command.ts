@@ -205,7 +205,13 @@ async function verifyOnePack(
         }
         // the header as the pack's read found it; `entry` reads it (with its errors) otherwise
         if (entry.head) return add(entry, unpacked, entry.head);
-        return pack.entry(entry.id).then((stored) => add(entry, unpacked, stored));
+        return pack.entry(entry.id).then(
+          (stored) => add(entry, unpacked, stored),
+          (error: unknown) => {
+            errors.push(`error: ${error instanceof Error ? error.message : String(error)}`);
+            ok = false;
+          },
+        );
       },
     },
     { keepBlob: noBlob },

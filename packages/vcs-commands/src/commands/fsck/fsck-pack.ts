@@ -15,7 +15,7 @@
  * hashed in one call (`sha1Of`). A delta is applied to its base from a byte-bounded cache of
  * the objects unpacked before it (16 MiB): in pack order a delta's base comes before it, and
  * close to it, so this nearly always hits. Whatever this fast path does not handle as it stands
- * (a REF_DELTA, a base not cached, an object over 1 MiB, an entry the pack's reader would find
+ * (a REF_DELTA, a base not cached, an object or delta over 1 MiB, an entry the pack's reader would find
  * through a corrupt part of the idx, an entry that fails in any way) is read through the pack's
  * own reader (`PackFile.getNow`), the reader the checks used before, so failures carry the
  * same messages and verdicts. The checksum errors, known at the end of the read, are reported
@@ -130,7 +130,8 @@ const MAX_EXPANSION = 1032;
 const MAX_CHAIN = 4095;
 /**
  * Objects and deltas above this size, and entries whose compressed bytes are longer, go
- * through the pack's reader (which streams large objects through the hash).
+ * through the pack's reader (which streams large objects through the hash). A smaller delta
+ * whose result is larger (up to `MAX_EXPANSION` times) is applied here, bounded as git bounds it.
  */
 const FAST_MAX = 1024 * 1024;
 /**

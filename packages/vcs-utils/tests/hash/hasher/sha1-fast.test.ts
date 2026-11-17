@@ -85,4 +85,15 @@ describe("Sha1", () => {
       vi.resetModules();
     }
   });
+
+  it("is single-use: update or digest after digest throws", () => {
+    const h = new Sha1().update(input(10));
+    h.digest();
+    expect(() => h.digest()).toThrow(/digest called twice/);
+    expect(() => h.update(input(1))).toThrow(/update after digest/);
+    // a clone taken before stays usable
+    const a = new Sha1().update(input(100));
+    const b = a.clone();
+    expect(bytesToHex(a.digest())).toBe(bytesToHex(b.digest()));
+  });
 });

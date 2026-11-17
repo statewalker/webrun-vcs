@@ -432,6 +432,9 @@ function blocks(s: Int32Array, p: Uint8Array, at: number, end: number): void {
 }
 
 /** An incremental SHA-1: `update` any number of times, then `digest` once. */
+/** The largest piece `update` hashes in one go (larger inputs are fed in pieces). */
+const UPDATE_PIECE = 2 ** 30;
+
 export class Sha1 {
   private readonly s = new Int32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]);
   /** a partial block carried between `update` calls */
@@ -439,8 +442,17 @@ export class Sha1 {
   private used = 0;
   /** bytes hashed so far */
   private length = 0;
+  private done = false;
 
   update(data: Uint8Array): this {
+    if (this.done) throw new Error("Sha1: update after digest");
+    // offsets below stay under 2^31, where the bitwise arithmetic is exact
+    if (data.length > UPDATE_PIECE) {
+      for (let at = 0; at < data.length; at += UPDATE_PIECE) {
+        this.update(data.subarray(at, Math.min(at + UPDATE_PIECE, data.length)));
+      }
+      return this;
+    }
     const n = data.length;
     this.length += n;
     let at = 0;
@@ -464,6 +476,8 @@ export class Sha1 {
 
   /** The 20-byte digest. The hasher is spent afterwards. */
   digest(): Uint8Array {
+    if (this.done) throw new Error("Sha1: digest called twice");
+    this.done = true;
     const buf = this.buf;
     let used = this.used;
     buf[used++] = 0x80;
@@ -524,7 +538,8 @@ const NOTHING = new Uint8Array(0);
 export function sha1Of(head: Uint8Array, body: Uint8Array = NOTHING): Uint8Array {
   const n = head.length + body.length;
   // the message, the 0x80 byte and the 64-bit length, in whole blocks
-  const padded = ((n + 9 + 63) >>> 6) << 6;
+  // plain arithmetic: a body of 2 GiB or more must not wrap past the capacity check
+  const padded = Math.ceil((n + 9) / 64) * 64;
   const wasm = sha1Wasm();
   if (!wasm || padded > wasm.capacity) return new Sha1().update(head).update(body).digest();
   const input = wasm.input;
