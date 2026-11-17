@@ -82,7 +82,22 @@ export interface DiffDriver {
   findFunction?: FindFunction;
   /** `diff.<name>.algorithm` */
   algorithm?: XdiffAlgorithm;
+  /** The driver's name (`diff=<name>`) */
+  name?: string;
+  /** `diff.<name>.textconv`: the command git would run to turn the content into text */
+  textconvCommand?: string;
+  /** `diff.<name>.cachetextconv` (output is the same with or without the cache) */
+  cacheTextconv?: boolean;
+  /**
+   * Turns a side's content into the text the patch compares (git's `fill_textconv`): set
+   * when textconv is allowed and the host can run `textconvCommand`. A side converted this
+   * way is never binary.
+   */
+  textconv?: TextconvFunction;
 }
+
+/** A textconv conversion: the text of `content`, the content of the file `path` */
+export type TextconvFunction = (content: Uint8Array, path: string) => Promise<Uint8Array>;
 
 /** Options of the diff output */
 export interface DiffOutputOptions
@@ -135,11 +150,18 @@ export function diffDriverOf(
   const binary = boolValue(config?.(`diff.${name}.binary`));
   const algorithm = config?.(`diff.${name}.algorithm`) as XdiffAlgorithm | undefined;
   const findFunction = userdiffFindFunction(name, config);
-  if (binary === undefined && !algorithm && !findFunction) return undefined;
+  const textconvCommand = config?.(`diff.${name}.textconv`);
+  const cacheTextconv = boolValue(config?.(`diff.${name}.cachetextconv`));
+  if (binary === undefined && !algorithm && !findFunction && textconvCommand === undefined) {
+    return undefined;
+  }
   return {
+    name,
     ...(binary !== undefined ? { binary } : {}),
     ...(algorithm ? { algorithm } : {}),
     ...(findFunction ? { findFunction } : {}),
+    ...(textconvCommand !== undefined ? { textconvCommand } : {}),
+    ...(cacheTextconv !== undefined ? { cacheTextconv } : {}),
   };
 }
 
@@ -211,6 +233,17 @@ function hasNul(content: Uint8Array): boolean {
 
 function octal6(mode: number): string {
   return mode.toString(8).padStart(6, "0");
+}
+
+/**
+ * The driver a side's content is read with (`diff_filespec_load_driver`): a regular file's;
+ * an absent side, a symbolic link and a submodule take the default driver
+ */
+function contentDriver(
+  spec: DiffSideSpec | undefined,
+  driver: DiffDriver | undefined,
+): DiffDriver | undefined {
+  return spec && (spec.mode & S_IFMT) === 0o100000 ? driver : undefined;
 }
 
 async function driverOf(
@@ -310,8 +343,8 @@ async function builtinDiff(
   const other = pathTwo !== name ? pathTwo : undefined;
   const oneDriver = await driverOf(options, pathOne);
   const twoDriver = pathTwo === pathOne ? oneDriver : await driverOf(options, pathTwo);
-  const one = new LoadedSide(pair.old, oneDriver);
-  const two = new LoadedSide(pair.new, twoDriver);
+  const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver));
+  const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver));
   const meta = metainfo(pair, one, two, name, other, options);
   let mustShow = meta.mustShow;
 
@@ -347,8 +380,13 @@ async function builtinDiff(
     report.newLabel = undefined;
   }
 
+  // a side with a textconv driver (git's get_textconv: valid sides only) is text
+  const textconvOne = one.driver?.textconv;
+  const textconvTwo = two.driver?.textconv;
   const binary =
-    !options.text && ((await one.isBinary(threshold)) || (await two.isBinary(threshold)));
+    !options.text &&
+    ((!textconvOne && (await one.isBinary(threshold))) ||
+      (!textconvTwo && (await two.isBinary(threshold))));
   if (binary) {
     if (report) report.binary = true;
     // ids name the contents: equal ids, equal contents; an absent side is empty
@@ -369,9 +407,11 @@ async function builtinDiff(
     sink.text(header);
     header = "";
   }
-  const driver = oneDriver?.findFunction ? oneDriver : twoDriver;
+  const driver = one.driver?.findFunction ? one.driver : two.driver;
   const algorithm = oneDriver?.algorithm ?? options.algorithm;
-  const result = unifiedDiffHunks(await one.read(), await two.read(), {
+  const textOne = textconvOne ? await textconvOne(await one.read(), pathOne) : await one.read();
+  const textTwo = textconvTwo ? await textconvTwo(await two.read(), pathTwo) : await two.read();
+  const result = unifiedDiffHunks(textOne, textTwo, {
     ...options,
     algorithm,
     indentHeuristic: options.indentHeuristic ?? true,
@@ -433,8 +473,8 @@ export async function computeDiffstat(
     const pathOne = nameA;
     const oneDriver = await driverOf(options, pathOne);
     const twoDriver = nameB === nameA ? oneDriver : await driverOf(options, nameB);
-    const one = new LoadedSide(pair.old, oneDriver);
-    const two = new LoadedSide(pair.new, twoDriver);
+    const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver));
+    const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver));
     // git's may_differ: both ids known and equal, or the contents are compared
     const mayDiffer = !(
       one.valid &&
@@ -443,7 +483,8 @@ export async function computeDiffstat(
       two.spec?.idValid !== false &&
       one.id === two.id
     );
-    if (!options.text && ((await one.isBinary(threshold)) || (await two.isBinary(threshold)))) {
+    // builtin_diffstat: `--text` does not apply, binary files count bytes
+    if ((await one.isBinary(threshold)) || (await two.isBinary(threshold))) {
       file.isBinary = true;
       if (mayDiffer) {
         file.added = await two.size(threshold);

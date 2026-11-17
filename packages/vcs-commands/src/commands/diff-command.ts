@@ -2,6 +2,8 @@ import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
 import { ByteSink, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 import {
   compareWithWorktree,
+  expandUserPath,
+  type GitHostEnvironment,
   readCleanContent,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -13,6 +15,7 @@ import { DEFAULT_RENAME_LIMIT, detectRenames, scorePercent } from "../rename/ind
 import { writeCombinedDiff } from "../results/combined-diff.js";
 import { ChangeType, type DiffEntry } from "../results/diff-entry.js";
 import { diffEntryToPair } from "../results/diff-formatter.js";
+import { orderByPatterns, parseOrderFile } from "../results/diff-order.js";
 import {
   blobSide,
   computeDiffstat,
@@ -31,6 +34,7 @@ import {
 } from "../results/diff-output.js";
 import { quotePath } from "../results/quote-path.js";
 import { abbrevLengths, worktreeModeTrust } from "./core-config.js";
+import { textconvRunnerOf } from "./diff-textconv.js";
 import { readSubmoduleDirt } from "./status-command.js";
 
 /** The output formats of {@link DiffCommand.callText} */
@@ -63,7 +67,43 @@ export interface DiffTextOptions
    * older git)
    */
   namesFromContents?: boolean;
+  /**
+   * `--no-prefix`: no `a/` and `b/` prefixes (default `diff.noprefix`); `srcPrefix` and
+   * `dstPrefix` still apply on top, as if given after it
+   */
+  noPrefix?: boolean;
+  /**
+   * `--default-prefix`: `a/` and `b/` (`diff.srcPrefix` / `diff.dstPrefix` when set),
+   * whatever `diff.noprefix` and `diff.mnemonicPrefix` say; it wins over `noPrefix`, and
+   * `srcPrefix` / `dstPrefix` still apply on top
+   */
+  defaultPrefix?: boolean;
+  /**
+   * `-O<orderfile>`: show the files in the order of the file's glob patterns (default
+   * `diff.orderFile`); a relative path is read in the worktree, from its root
+   */
+  orderFile?: string;
+  /**
+   * `--textconv` / `--no-textconv`: run `diff.<driver>.textconv` on both sides of a patch
+   * (default true, as `git diff`); it takes a runner registered with
+   * `installTextconvRunner`, without one no textconv applies
+   */
+  textconv?: boolean;
 }
+
+/** What a diff compares, for `diff.mnemonicPrefix` */
+type DiffSides = "trees" | "cached" | "commit-worktree" | "index-worktree";
+
+/** git's mnemonic prefixes (`diff_set_mnemonic_prefix`) of each comparison */
+const MNEMONIC_PREFIXES: Record<DiffSides, [string, string] | undefined> = {
+  // builtin_diff_tree sets none: builtin_diff's own fallback, a/ and b/
+  trees: undefined,
+  // run_diff_index
+  cached: ["c/", "i/"],
+  "commit-worktree": ["c/", "w/"],
+  // run_diff_files
+  "index-worktree": ["i/", "w/"],
+};
 
 /** One side of a path in a tree, the index or the worktree */
 interface Side {
@@ -154,9 +194,17 @@ const algorithmValue = (v: string | undefined): XdiffAlgorithm | undefined => {
  * `--numstat`, `--shortstat`, `--name-only`, `--name-status`), byte for byte, reading
  * `diff.algorithm`, `diff.indentHeuristic`, `diff.context`, `diff.interHunkContext`,
  * `diff.renames`, `diff.renameLimit`, `diff.statNameWidth`, `diff.statGraphWidth`,
- * `core.quotePath`, `core.bigFileThreshold`, `core.abbrev`, `diff.ignoreSubmodules` and the
- * `diff` attribute's drivers (`diff.<driver>.xfuncname`, `.funcname`, `.binary`,
- * `.algorithm`, builtin drivers).
+ * `core.quotePath`, `core.bigFileThreshold`, `core.abbrev`, `diff.ignoreSubmodules`,
+ * `diff.noprefix`, `diff.mnemonicPrefix`, `diff.srcPrefix`, `diff.dstPrefix`,
+ * `diff.orderFile` and the `diff` attribute's drivers (`diff.<driver>.xfuncname`,
+ * `.funcname`, `.binary`, `.algorithm`, `.textconv`, `.cachetextconv`, builtin drivers).
+ *
+ * The prefixes follow git's porcelain: `diff.mnemonicPrefix` gives `i/` and `w/` for the
+ * index against the worktree, `c/` and `w/` for a commit against it, `c/` and `i/` for
+ * `--cached`, and `a/` and `b/` between two trees. Textconv runs through the runner the host
+ * registers with `installTextconvRunner` (running a command is not portable); without one no
+ * textconv applies, as `git diff --no-textconv`. A relative order file is read in the
+ * worktree, from its root.
  *
  * As git: a conflicted path is, in `git diff`, the combined diff (`diff --cc`) of stages 2
  * and 3 against the worktree file, printed before the other files (in the other formats, an
@@ -174,6 +222,9 @@ const algorithmValue = (v: string | undefined): XdiffAlgorithm | undefined => {
  *
  * // `git diff -U1 -w`
  * const patch = await git.diff().setOptions({ context: 1, ignoreWhitespace: true }).callText();
+ *
+ * // `git diff --no-prefix -O order.txt --no-textconv`
+ * await git.diff().setOptions({ noPrefix: true, orderFile: "order.txt", textconv: false }).callText();
  * ```
  */
 export class DiffCommand extends GitCommand<DiffEntry[]> {
@@ -284,8 +335,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
-    const { entries, combined } = await this.collect(renames, format === "patch");
+    const collected = await this.collect(renames, format === "patch");
+    const { combined } = collected;
+    const entries = await this.ordered(collected.entries);
     const options = this.outputOptions();
+    Object.assign(options, this.prefixes());
     const pairs: DiffFilePair[] = [];
     const unmerged = new Set<DiffFilePair>();
     for (const entry of entries) {
@@ -375,11 +429,18 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     options: DiffOutputOptions,
   ): Promise<void> {
     const worktree = this.worktreeAccess;
-    const stage = async (e: StageEntry) => ({
-      id: e.objectId,
-      mode: e.mode,
-      content: await blobSide(this.blobs, c.path, e.mode, e.objectId).read(),
-    });
+    const driver = await options.driver?.(c.path);
+    // combine-diff.c's grab_blob: a gitlink's or a deleted side's content is not converted
+    const textconv = driver?.textconv;
+    const stage = async (e: StageEntry) => {
+      const content = await blobSide(this.blobs, c.path, e.mode, e.objectId).read();
+      const convert = textconv && (e.mode & S_IFMT) !== GITLINK && e.objectId !== NULL_ID;
+      return {
+        id: e.objectId,
+        mode: e.mode,
+        content: convert ? await textconv(content, c.path) : content,
+      };
+    };
     // the file as git reads it for the result: its real mode (canon_mode), cleaned content
     let mode = 0;
     let content: Uint8Array = new Uint8Array(0);
@@ -392,9 +453,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         const kind = file.mode & S_IFMT;
         mode = kind === 0o120000 ? 0o120000 : file.mode & 0o111 ? 0o100755 : 0o100644;
         content = await readCleanContent(worktree, c.path);
+        // a symbolic link's target is not converted
+        if (textconv && kind !== 0o120000) content = await textconv(content, c.path);
       }
     }
-    const driver = await options.driver?.(c.path);
     const lengths = options.abbrevLengths;
     writeCombinedDiff(
       sink,
@@ -405,7 +467,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       },
       {
         ...options,
-        ...(driver?.binary !== undefined ? { binary: driver.binary } : {}),
+        ...(textconv
+          ? { binary: false }
+          : driver?.binary !== undefined
+            ? { binary: driver.binary }
+            : {}),
         abbreviate: (id) =>
           id.slice(0, options.fullIndex ? 40 : (lengths?.get(id) ?? options.abbrev ?? 7)),
       },
@@ -442,6 +508,87 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     return RemoteConfigStore.from(this.workingCopy);
   }
 
+  /** What this diff compares */
+  private get sides(): DiffSides {
+    if (this.newTree) return "trees";
+    if (this.cached) return "cached";
+    if (!this.worktreeAccess) return "trees";
+    return this.oldTree ? "commit-worktree" : "index-worktree";
+  }
+
+  /**
+   * The path prefixes, as git sets them: `diff.noprefix`, else `diff.srcPrefix` /
+   * `diff.dstPrefix` (default `a/`, `b/`) unless `diff.mnemonicPrefix`; then the options;
+   * a prefix left unset takes the comparison's mnemonic one, else `a/` / `b/`.
+   */
+  private prefixes(): { srcPrefix: string; dstPrefix: string } {
+    const get = (key: string) => this.config.value(key);
+    const configSrc = get("diff.srcPrefix");
+    const configDst = get("diff.dstPrefix");
+    let src: string | undefined;
+    let dst: string | undefined;
+    if (boolValue(get("diff.noprefix"))) {
+      src = "";
+      dst = "";
+    } else if (!boolValue(get("diff.mnemonicPrefix"))) {
+      src = configSrc ?? "a/";
+      dst = configDst ?? "b/";
+    }
+    const options = this.textOptions;
+    if (options.noPrefix) {
+      src = "";
+      dst = "";
+    }
+    if (options.defaultPrefix) {
+      src = configSrc ?? "a/";
+      dst = configDst ?? "b/";
+    }
+    if (options.srcPrefix !== undefined) src = options.srcPrefix;
+    if (options.dstPrefix !== undefined) dst = options.dstPrefix;
+    const mnemonic = MNEMONIC_PREFIXES[this.sides];
+    return { srcPrefix: src ?? mnemonic?.[0] ?? "a/", dstPrefix: dst ?? mnemonic?.[1] ?? "b/" };
+  }
+
+  /** The entries in the order of `-O<orderfile>` / `diff.orderFile` (diffcore_order) */
+  private async ordered(entries: DiffEntry[]): Promise<DiffEntry[]> {
+    const configured = this.config.value("diff.orderFile");
+    const environment = (this.workingCopy.config as { environment?: GitHostEnvironment })
+      ?.environment;
+    const orderFile =
+      this.textOptions.orderFile ??
+      (configured ? expandUserPath(configured, environment) : undefined);
+    if (!orderFile || entries.length === 0) return entries;
+    const content = await this.readOrderFile(orderFile, environment);
+    if (!content) throw new Error(`failed to read orderfile '${orderFile}'`);
+    // the path git orders a pair by: its second side's (`pair_pathtwo`)
+    return orderByPatterns(entries, parseOrderFile(content), (e) => e.newPath ?? e.oldPath ?? "");
+  }
+
+  /** An order file: a relative path in the worktree, an absolute one through the host */
+  private async readOrderFile(
+    path: string,
+    environment: GitHostEnvironment | undefined,
+  ): Promise<Uint8Array | undefined> {
+    if (path.startsWith("/")) return environment?.readFile(path);
+    const worktree = this.worktreeAccess;
+    if (!worktree) return environment?.readFile(path);
+    try {
+      const entry = await worktree.getEntry(path);
+      if (!entry || entry.isDirectory) return undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of worktree.readContent(path)) chunks.push(chunk);
+      const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The output options: the setters', else the configuration's */
   private outputOptions(): DiffOutputOptions {
     const config = this.config;
@@ -456,13 +603,25 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         }
       | undefined;
     const drivers = new Map<string, Promise<DiffDriver | undefined>>();
+    const runner =
+      (this.textOptions.textconv ?? true) ? textconvRunnerOf(this.workingCopy) : undefined;
+    const withTextconv = (found: DiffDriver | undefined): DiffDriver | undefined => {
+      const command = found?.textconvCommand;
+      if (!found || !runner || command === undefined) return found;
+      const name = found.name ?? "";
+      const cache = found.cacheTextconv ?? false;
+      return {
+        ...found,
+        textconv: (content, path) => runner({ driver: name, command, path, content, cache }),
+      };
+    };
     const driver = filter?.attributes
       ? (path: string) => {
           let found = drivers.get(path);
           if (!found) {
             found = (async () => {
               const attrs = await filter.attributes?.(path, ["diff"]);
-              return diffDriverOf(attrs?.get("diff"), get);
+              return withTextconv(diffDriverOf(attrs?.get("diff"), get));
             })();
             drivers.set(path, found);
           }
@@ -473,6 +632,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       stat: _stat,
       renameCountLastSpan: _span,
       namesFromContents: _names,
+      noPrefix: _noPrefix,
+      defaultPrefix: _defaultPrefix,
+      orderFile: _orderFile,
+      textconv: _textconv,
       ...text
     } = this.textOptions;
     return {
