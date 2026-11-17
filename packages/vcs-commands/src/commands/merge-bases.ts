@@ -11,7 +11,9 @@
  * With a commit-graph that has corrected commit dates the queue is ordered by generation
  * first, as git's `compare_commits_by_gen_then_commit_date` (commits outside the graph and
  * virtual ones have generation Infinity), and the redundancy check skips commits whose
- * generation shows they cannot reach the base checked.
+ * generation shows they cannot reach the base checked. A graph whose generations cannot be
+ * trusted (`CommitGraph.generationsTrusted`: zero levels, a corrupt record, generations not
+ * above the parents') gives every commit generation Infinity, as git reads a zero generation.
  */
 
 import type { Commits, ObjectId } from "@statewalker/vcs-core";
@@ -67,8 +69,11 @@ export function commitsBaseSource(
       return commit ? { parents: commit.parents, date: commit.committer.timestamp } : undefined;
     },
     tree,
-    generationOrder: async () =>
-      (await commits.commitGraph?.get().catch(() => undefined))?.correctedDates ?? false,
+    generationOrder: async () => {
+      const graph = await commits.commitGraph?.get().catch(() => undefined);
+      // generations the graph does not trust are Infinity: the queue is then by date
+      return (graph?.generationsTrusted && graph.correctedDates) ?? false;
+    },
   };
 }
 

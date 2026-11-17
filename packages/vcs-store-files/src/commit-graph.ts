@@ -24,6 +24,7 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { readAllRefs } from "./refs/index.js";
 import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
@@ -54,7 +55,9 @@ function configInt(value: unknown): number | undefined {
 }
 
 /**
- * The commit-graph settings in `<gitDir>/config`, defaulting as git's prepare_repo_settings:
+ * The commit-graph settings of the configuration chain, defaulting as git's
+ * prepare_repo_settings: the system and global files when `environment` is given (as working
+ * copies read them), then `<gitDir>/config` with its includes. Defaults:
  * `core.commitGraph` true, `commitGraph.generationVersion` 2, `commitGraph.changedPathsVersion`
  * -1 (0 when `commitGraph.readChangedPaths` is false), `core.useReplaceRefs` true,
  * `gc.writeCommitGraph` true, `fetch.writeCommitGraph` false.
@@ -68,6 +71,7 @@ function configInt(value: unknown): number | undefined {
 export async function readCommitGraphSettings(
   files: FilesApi,
   gitDir = ".git",
+  options: { environment?: GitHostEnvironment } = {},
 ): Promise<RepositoryCommitGraphSettings> {
   const config = await createWorkingCopyConfig(
     {
@@ -75,6 +79,8 @@ export async function readCommitGraphSettings(
       write: (path, content) => files.write(path, [content]),
     },
     gitDir,
+    undefined,
+    options.environment ? { environment: options.environment } : {},
   );
   const bool = (key: string, fallback: boolean) => parseGitBool(config.get(key)) ?? fallback;
   const readChangedPaths = bool("commitGraph.readChangedPaths", true);
@@ -107,11 +113,13 @@ export function createFilesCommitGraphProvider(options: {
   files: FilesApi;
   gitDir?: string;
   refs?: Pick<Refs, "list">;
+  /** The user's environment: the global and system config files are read too */
+  environment?: GitHostEnvironment;
 }): CommitGraphProvider {
-  const { files, refs } = options;
+  const { files, refs, environment } = options;
   const gitDir = options.gitDir ?? ".git";
   return createCommitGraphProvider(async () => {
-    const settings = await readCommitGraphSettings(files, gitDir);
+    const settings = await readCommitGraphSettings(files, gitDir, { environment });
     return loadRepositoryCommitGraph({ files, gitDir, refs, settings });
   });
 }
@@ -153,6 +161,8 @@ export interface WriteCommitGraphOptions {
    * (with `core.useReplaceRefs`). `git commit-graph write` ignores them (the default here).
    */
   replaceRefs?: boolean;
+  /** The user's environment: the global and system config files are read too */
+  environment?: GitHostEnvironment;
 }
 
 /**
@@ -173,7 +183,9 @@ export async function writeCommitGraph(
   const { files, objects, refs } = options;
   const gitDir = options.gitDir ?? ".git";
   const objectsDir = joinPath(gitDir, "objects");
-  const settings = await readCommitGraphSettings(files, gitDir);
+  const settings = await readCommitGraphSettings(files, gitDir, {
+    environment: options.environment,
+  });
   const none = (warnings: string[] = []): WriteCommitGraphFileResult => ({
     written: false,
     commits: 0,

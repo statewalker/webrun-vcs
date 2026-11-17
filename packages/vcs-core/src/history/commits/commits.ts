@@ -54,7 +54,8 @@ export interface CommitHeader {
   commitTime: number;
   /**
    * The commit-graph's generation (corrected commit date, or topological level for a graph
-   * without generation data v2); Infinity when the commit is not in the graph
+   * without generation data v2); Infinity when the commit is not in the graph or the graph's
+   * generations are not trusted (`CommitGraph.generationsTrusted`)
    */
   generation: number;
 }
@@ -114,8 +115,13 @@ export interface Commits extends ObjectStorage<Commit> {
   /**
    * The commit's tree, parents, committer time and generation: from the commit-graph when it
    * has the commit (the commit is not read), else parsed. Undefined when the commit is missing.
+   * With `checkExists`, a commit the graph has is also looked up in the object store (git's
+   * GIT_COMMIT_GRAPH_PARANOIA), so a stale graph does not report a pruned commit as present.
    */
-  getHeader?(commitId: ObjectId): Promise<CommitHeader | undefined>;
+  getHeader?(
+    commitId: ObjectId,
+    options?: { checkExists?: boolean },
+  ): Promise<CommitHeader | undefined>;
 
   /**
    * The commit-graph this store reads (stores over a git repository's files), if any.

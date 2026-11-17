@@ -217,8 +217,10 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
     const commits = this.history.commits;
     if (commits.getHeader) {
-      // from the commit-graph when it has the commit (nothing is read)
-      const h = await commits.getHeader(oid);
+      // from the commit-graph when it has the commit (nothing is read); a commit only a stale
+      // graph lists (pruned since) is absent, as with git's GIT_COMMIT_GRAPH_PARANOIA:
+      // receive-pack takes this answer for the object's type and its connectivity
+      const h = await commits.getHeader(oid, { checkExists: true });
       return h ? { parents: h.parents, time: h.commitTime, tree: h.tree } : undefined;
     }
     const commit = await commits.load(oid);

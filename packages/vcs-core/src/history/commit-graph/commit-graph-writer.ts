@@ -662,6 +662,23 @@ export async function writeCommitGraphFile(
       if (keep.has(e.name)) continue;
       if (await files.remove(e.path)) expired.push(e.path);
     }
+    // git's mark_commit_graphs sets the mtime of the layers merged away to now, so a later
+    // write keeps them until --expire-time passes it: the FilesApi has no utime, so the file
+    // is copied and the copy renamed over it (a new file, of the current time)
+    for (const name of touched) {
+      const path = joinPath(dir, name);
+      if (keep.has(name) || expired.includes(path)) continue;
+      if ((await files.stats(path))?.kind !== "file") continue;
+      const tmp = joinPath(dir, `tmp_graph_${randomSuffix()}`);
+      try {
+        if (!(await files.copy(path, tmp))) continue;
+        await chmod(files, tmp, 0o444);
+        await files.move(tmp, path);
+      } catch {
+        // the mtime only delays the expiry
+        await files.remove(tmp).catch(() => false);
+      }
+    }
   }
 
   return {

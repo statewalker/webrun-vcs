@@ -58,7 +58,7 @@ class GitCommitStore implements Commits {
     this.commitGraph = options.commitGraph;
   }
 
-  /** The commit-graph, loaded on first use; undefined when there is none. */
+  /** The commit-graph, loaded on first use; undefined when there is none (or it failed to load). */
   private graph(): CommitGraph | undefined | Promise<CommitGraph | undefined> {
     const provider = this.commitGraph;
     if (!provider) return undefined;
@@ -66,34 +66,53 @@ class GitCommitStore implements Commits {
     return now === null ? provider.get().catch(() => undefined) : now;
   }
 
-  /** The header of a commit the graph has, or undefined (not in it, or a corrupt record). */
+  /**
+   * The header of a commit the graph has, or undefined (not in it, or a corrupt record: the
+   * graph's generations are then no longer trusted). The generation is read when asked for,
+   * so a header used for its tree or parents does not check the graph's generations.
+   */
   private fromGraph(graph: CommitGraph, id: ObjectId): CommitHeader | undefined {
     const pos = graph.position(id);
     if (pos < 0) return undefined;
     try {
-      return {
+      const header = {
         tree: graph.treeAt(pos),
         parents: graph.parentsAt(pos),
         commitTime: graph.commitTimeAt(pos),
-        generation: graph.generationAt(pos),
       };
+      return Object.defineProperty(header, "generation", {
+        enumerable: true,
+        get: () => graph.walkGenerationAt(pos),
+      }) as CommitHeader;
     } catch (e) {
       // git dies on a corrupt graph; the commit itself is read instead
-      if (e instanceof CommitGraphCorruptError) return undefined;
+      if (e instanceof CommitGraphCorruptError) {
+        graph.distrustGenerations();
+        return undefined;
+      }
       throw e;
     }
   }
 
   /**
    * The commit's tree, parents, committer time and generation: from the commit-graph when it
-   * has the commit (nothing is read), else from the commit (generation Infinity).
+   * has the commit (nothing is read), else from the commit (generation Infinity). With
+   * `checkExists`, a commit the graph has must also be in the object store (git's
+   * GIT_COMMIT_GRAPH_PARANOIA): a graph left over after its commits were pruned does not make
+   * them present.
    */
-  async getHeader(id: ObjectId): Promise<CommitHeader | undefined> {
+  async getHeader(
+    id: ObjectId,
+    options: { checkExists?: boolean } = {},
+  ): Promise<CommitHeader | undefined> {
     const g = this.graph();
     const graph = g instanceof Promise ? await g : g;
     if (graph) {
       const header = this.fromGraph(graph, id);
-      if (header) return header;
+      if (header) {
+        if (options.checkExists && !(await this.objects.has(id))) return undefined;
+        return header;
+      }
     }
     const commit = await this.load(id);
     if (!commit) return undefined;
@@ -114,14 +133,19 @@ class GitCommitStore implements Commits {
     try {
       return graph.parentsAt(pos);
     } catch (e) {
-      if (e instanceof CommitGraphCorruptError) return undefined;
+      if (e instanceof CommitGraphCorruptError) {
+        graph.distrustGenerations();
+        return undefined;
+      }
       throw e;
     }
   }
 
   /**
    * The header as the reachability walks read it: without a promise for a commit the loaded
-   * graph has (no tree id decoded), else from the commit.
+   * graph has (no tree id decoded), else from the commit. Generations come from the graph only
+   * while it trusts them (`CommitGraph.generationsTrusted`, checked before the first one is
+   * used), else they are Infinity: the walks then neither cut nor reorder.
    */
   private readonly reach = (
     id: ObjectId,
@@ -134,10 +158,11 @@ class GitCommitStore implements Commits {
           return {
             parents: graph.parentsAt(pos),
             date: graph.commitTimeAt(pos),
-            generation: graph.generationAt(pos),
+            generation: graph.walkGenerationAt(pos),
           };
         } catch (e) {
           if (!(e instanceof CommitGraphCorruptError)) throw e;
+          graph.distrustGenerations();
         }
       }
     }
@@ -145,6 +170,20 @@ class GitCommitStore implements Commits {
       h ? { parents: h.parents, date: h.commitTime, generation: h.generation } : undefined,
     );
   };
+
+  /**
+   * Runs a reachability walk; when the graph stopped trusting its generations during it (a
+   * corrupt record met on the way), runs it again without them, so no cutoff taken on
+   * generations read before is kept.
+   */
+  private async withGraph<T>(walk: (graph: CommitGraph | undefined) => Promise<T>): Promise<T> {
+    const g = this.graph();
+    const graph = g instanceof Promise ? await g : g;
+    const trusted = graph?.generationsTrusted ?? false;
+    const result = await walk(graph);
+    if (graph && trusted && !graph.generationsTrusted) return walk(graph);
+    return result;
+  }
 
   // ============ New Commits Interface ============
 
@@ -279,11 +318,11 @@ class GitCommitStore implements Commits {
    * has corrected commit dates the walk is ordered by generation, as git orders it.
    */
   async findMergeBase(commitA: ObjectId, commitB: ObjectId): Promise<ObjectId[]> {
-    const g = this.graph();
-    const graph = g instanceof Promise ? await g : g;
-    return getMergeBases(this.reach, commitA, [commitB], {
-      correctedDates: graph?.correctedDates ?? false,
-    });
+    return this.withGraph((graph) =>
+      getMergeBases(this.reach, commitA, [commitB], {
+        correctedDates: (graph?.generationsTrusted && graph.correctedDates) ?? false,
+      }),
+    );
   }
 
   /**
@@ -313,10 +352,8 @@ class GitCommitStore implements Commits {
    * Check if commitA is ancestor of commitB
    */
   async isAncestor(ancestorId: ObjectId, descendantId: ObjectId): Promise<boolean> {
-    const g = this.graph();
-    if (g instanceof Promise) await g;
     // git's repo_in_merge_bases: the generations of commit-graph commits cut the walk short
-    return isAncestorOf(this.reach, ancestorId, descendantId);
+    return this.withGraph(() => isAncestorOf(this.reach, ancestorId, descendantId));
   }
 }
 

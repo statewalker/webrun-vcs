@@ -53,7 +53,8 @@ export interface ListObjectsOptions {
   /**
    * A commit's tree, parents and committer time without reading it (the commit-graph:
    * `Commits.getHeader`, which parses commits outside the graph). Undefined for an id that is
-   * not a commit or not stored. Commits it knows are not read at all.
+   * not a commit or not stored. Commits it knows are not read at all, except the wants (read
+   * so that a missing one throws even when a stale graph still lists it).
    */
   commitHeader?: (
     id: ObjectId,
@@ -199,7 +200,8 @@ export async function* listObjects(
   const start = async (tip: ObjectId, uninteresting: boolean) => {
     let id = tip;
     for (;;) {
-      const known = commits.get(id) ?? (await fromHeader(id));
+      // a want is read (a missing one throws, though a stale commit-graph still lists it)
+      const known = commits.get(id) ?? (uninteresting ? await fromHeader(id) : undefined);
       if (known) {
         if (uninteresting) set(id, UNINTERESTING);
         commits.set(id, known);

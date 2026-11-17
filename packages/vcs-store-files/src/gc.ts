@@ -8,6 +8,7 @@
 import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-core";
 import { joinPath, sweepPackTemporaries } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
@@ -86,6 +87,11 @@ export interface GcOptions {
    * (true when unset). Not done in a dry run.
    */
   writeCommitGraph?: boolean;
+  /**
+   * The user's environment: `gc.writeCommitGraph` and the commit-graph settings are then read
+   * from the system and global config files too.
+   */
+  environment?: GitHostEnvironment;
 }
 
 /**
@@ -121,6 +127,12 @@ export interface GcResult {
   repack: RepackResult | null;
   /** Whether a commit-graph was written */
   commitGraphWritten: boolean;
+  /**
+   * Why writing the commit-graph failed, when it did. git's gc reports the error and still
+   * succeeds (it ignores what write_commit_graph_reachable returns): what the repack and prune
+   * did stands.
+   */
+  commitGraphError?: string;
 }
 
 /**
@@ -220,7 +232,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
       refsPacked,
       repack: null,
       skipped: false,
-      commitGraphWritten: await gcCommitGraph(options, objects),
+      ...(await gcCommitGraph(options, objects)),
     };
   }
 
@@ -316,7 +328,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
   }
 
   // Step 7: the commit-graph (git gc's write_commit_graph_reachable)
-  const commitGraphWritten = await gcCommitGraph(options, objects);
+  const commitGraph = await gcCommitGraph(options, objects);
 
   return {
     removedObjects,
@@ -329,27 +341,43 @@ async function collect(options: GcOptions): Promise<GcResult> {
     refsPacked,
     repack: repackResult,
     skipped: false,
-    commitGraphWritten,
+    ...commitGraph,
   };
 }
 
-/** Writes the commit-graph at the end of a gc when `gc.writeCommitGraph` (or the option) asks. */
-async function gcCommitGraph(options: GcOptions, objects: GitObjects): Promise<boolean> {
-  const { history, files, gitDir = ".git" } = options;
-  if (options.dryRun) return false;
-  const enabled =
-    options.writeCommitGraph ?? (await readCommitGraphSettings(files, gitDir)).gcWriteCommitGraph;
-  if (!enabled) return false;
-  const result = await writeCommitGraph({
-    files,
-    gitDir,
-    objects,
-    refs: history.refs,
-    commitGraph: history.commitGraph ?? history.commits.commitGraph,
-    // git gc writes in-process with replace refs on: none is written while there are any
-    replaceRefs: true,
-  });
-  return result.written;
+/**
+ * Writes the commit-graph at the end of a gc when `gc.writeCommitGraph` (or the option) asks.
+ * A failure is reported in the result, not thrown, as git's gc goes on after
+ * write_commit_graph_reachable fails: the repack and prune before it are done.
+ */
+async function gcCommitGraph(
+  options: GcOptions,
+  objects: GitObjects,
+): Promise<Pick<GcResult, "commitGraphWritten" | "commitGraphError">> {
+  const { history, files, gitDir = ".git", environment } = options;
+  if (options.dryRun) return { commitGraphWritten: false };
+  try {
+    const enabled =
+      options.writeCommitGraph ??
+      (await readCommitGraphSettings(files, gitDir, { environment })).gcWriteCommitGraph;
+    if (!enabled) return { commitGraphWritten: false };
+    const result = await writeCommitGraph({
+      files,
+      gitDir,
+      objects,
+      refs: history.refs,
+      commitGraph: history.commitGraph ?? history.commits.commitGraph,
+      // git gc writes in-process with replace refs on: none is written while there are any
+      replaceRefs: true,
+      environment,
+    });
+    return { commitGraphWritten: result.written };
+  } catch (error) {
+    return {
+      commitGraphWritten: false,
+      commitGraphError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 /**

@@ -8,7 +8,13 @@
  * - All objects (including blobs) stored with Git headers for format compatibility
  */
 
-import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-core";
+import type {
+  CommitGraphProvider,
+  FilesApi,
+  GitObjects,
+  History,
+  PackSet,
+} from "@statewalker/vcs-core";
 import {
   createGitObjects,
   createHistoryFromComponents,
@@ -17,10 +23,11 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
 import { readDeltaBaseCacheLimit, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
-import { createFileRefStore } from "./refs/ref-store.files.js";
+import { createFileRefStore, type FileRefStore } from "./refs/ref-store.files.js";
 import { readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
@@ -64,6 +71,12 @@ export interface GitFilesBackendOptions {
   logAllRefUpdates?: boolean | "always";
   /** Reflog name and email; read from `user.name` / `user.email` in the config when omitted. */
   reflogIdentity?: { name: string; email: string };
+  /**
+   * The user's environment (`createNodeGitHostEnvironment` on Node): the commit-graph
+   * settings (`core.commitGraph`, `commitGraph.*`) are then read from the system and global
+   * config files too, as git reads them. Absent, only the repository's config is read.
+   */
+  environment?: GitHostEnvironment;
 }
 
 /**
@@ -164,7 +177,13 @@ export async function createGitFilesBackend(
   if (create) await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
   // the commit-graph (objects/info/commit-graph or its split chain), read on first use
-  const commitGraph = createFilesCommitGraphProvider({ files, gitDir, refs: refStore });
+  const commitGraph = createFilesCommitGraphProvider({
+    files,
+    gitDir,
+    refs: refStore,
+    environment: options.environment,
+  });
+  invalidateOnCompatibilityChange(refStore, commitGraph);
   const history = createHistoryFromComponents({
     objects,
     refs: refStore,
@@ -173,6 +192,34 @@ export async function createGitFilesBackend(
   });
 
   return { history, objects, packs, looseStorage, files, gitDir };
+}
+
+/**
+ * Forgets the loaded commit-graph when this ref store changes what decides whether it may be
+ * used (git's commit_graph_compatible): the `shallow` file or a ref under `refs/replace/`. The
+ * next walk loads it again (or finds it unusable). Changes made by another process (native
+ * `git replace`, a `git fetch --depth`) are not seen until `commitGraph.invalidate()`.
+ */
+function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: CommitGraphProvider) {
+  const replace = (name: string) => name.startsWith("refs/replace/");
+  const after = async <T>(change: Promise<T>, touches: boolean): Promise<T> => {
+    try {
+      return await change;
+    } finally {
+      if (touches) commitGraph.invalidate();
+    }
+  };
+  const { setShallow, set, setSymbolic, remove, compareAndSwap, batch } = refs;
+  refs.setShallow = (...args) => after(setShallow.apply(refs, args), true);
+  refs.set = (...args) => after(set.apply(refs, args), replace(args[0]));
+  refs.setSymbolic = (...args) => after(setSymbolic.apply(refs, args), replace(args[0]));
+  refs.remove = (...args) => after(remove.apply(refs, args), replace(args[0]));
+  refs.compareAndSwap = (...args) => after(compareAndSwap.apply(refs, args), replace(args[0]));
+  refs.batch = (...args) =>
+    after(
+      batch.apply(refs, args),
+      args[0].some((c) => replace(c.name)),
+    );
 }
 
 /**

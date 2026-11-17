@@ -6,7 +6,10 @@
  * whose generation is not lower than its own, so a walk looking for `x` skips every commit of
  * a generation below `x`'s. Commits outside the graph have generation Infinity (git's
  * GENERATION_NUMBER_INFINITY); the graph is closed under parents, so a commit in it never
- * reaches one outside it.
+ * reaches one outside it. The cutoffs and the early exits hold only when every commit's
+ * generation is above its parents': a source over a graph that is not so (see
+ * `CommitGraph.generationsTrusted`) gives every commit generation Infinity, and the walks are
+ * then full walks in date order.
  */
 
 import type { ObjectId } from "../../common/id/index.js";

@@ -441,7 +441,7 @@ Key algorithms:
 - **findMergeBase**: git's merge bases (`commit-reach.ts`: `paint_down_to_common`, redundant bases removed), best first
 - **isAncestor**: Reachability test between commits (git's `repo_in_merge_bases`)
 
-With a commit-graph (`createCommits(objects, { commitGraph })`), parents, trees, dates and generation numbers of the commits it has come from the graph, not from the commits (`getHeader`); generations cut ancestry and redundancy walks short.
+With a commit-graph (`createCommits(objects, { commitGraph })`), parents, trees, dates and generation numbers of the commits it has come from the graph, not from the commits (`getHeader`); generations cut ancestry and redundancy walks short. They do so only while `CommitGraph.generationsTrusted`: checked once over the whole graph on first use, it fails for zero topological levels (git before 2.18, which git reads as GENERATION_NUMBER_INFINITY), a corrupt record, or a generation not above a parent's (git 2.43 truncates parent generations past 2^32). Every generation is then Infinity: the walks neither cut nor reorder, and give a full walk's answer. A record that turns out corrupt is read from the commit itself.
 
 #### history/commit-graph/
 

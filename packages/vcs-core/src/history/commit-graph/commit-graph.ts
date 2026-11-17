@@ -123,6 +123,80 @@ export class CommitGraph {
     return top.topoLevel(0) !== 0;
   }
 
+  /**
+   * Whether walks may cut and order by this graph's generations. git reads a stored generation
+   * of 0 (graphs of git before 2.18 wrote zero levels) as GENERATION_NUMBER_INFINITY and skips
+   * generation cutoffs without `generationNumbersEnabled`; a corrupt record makes git die. Here
+   * the whole graph is checked once, on first use: generations are trusted only when
+   * `generationNumbersEnabled`, every record decodes, no generation is 0 and every commit's
+   * generation is above its parents' (what the cutoffs rely on: a graph git 2.43 wrote for
+   * dates past 2^34 is not). Otherwise walks treat every generation as Infinity: no cutoff,
+   * date order, always the right answer.
+   */
+  get generationsTrusted(): boolean {
+    this.trusted ??= this.checkGenerations();
+    return this.trusted;
+  }
+
+  /** Stops walks from using this graph's generations (a record turned out corrupt). */
+  distrustGenerations(): void {
+    this.trusted = false;
+  }
+
+  /**
+   * The generation walks use at `pos`: the stored one while `generationsTrusted`, else
+   * Infinity (git's GENERATION_NUMBER_INFINITY).
+   */
+  walkGenerationAt(pos: number): number {
+    return this.generationsTrusted ? this.generationAt(pos) : Number.POSITIVE_INFINITY;
+  }
+
+  private trusted?: boolean;
+
+  private checkGenerations(): boolean {
+    if (!this.generationNumbersEnabled) return false;
+    const gens = new Float64Array(this.size);
+    try {
+      for (const layer of this.layers) {
+        for (let local = 0; local < layer.numCommits; local++) {
+          const g = this.layerGeneration(layer, local);
+          if (!(g > 0)) return false;
+          gens[layer.numCommitsInBase + local] = g;
+        }
+      }
+      // parentPositionsAt without its arrays: every edge, in range and below its child
+      for (const layer of this.layers) {
+        const total = layer.numCommits + layer.numCommitsInBase;
+        const edges = layer.extraEdges;
+        const edgeCount = edges ? Math.floor(edges.size / 4) : 0;
+        const below = (p: number, g: number) => p < total && (gens[p] as number) < g;
+        for (let local = 0; local < layer.numCommits; local++) {
+          const g = gens[layer.numCommitsInBase + local] as number;
+          const at = layer.dataOffset(local) + HASH_SIZE;
+          const first = layer.u32(at);
+          if (first === GRAPH_PARENT_NONE) continue;
+          if (!below(first, g)) return false;
+          const second = layer.u32(at + 4);
+          if (second === GRAPH_PARENT_NONE) continue;
+          if (!(second & GRAPH_EXTRA_EDGES_NEEDED)) {
+            if (!below(second, g)) return false;
+            continue;
+          }
+          for (let edge = (second & GRAPH_EDGE_LAST_MASK) >>> 0; ; edge++) {
+            if (!edges || edge >= edgeCount) return false;
+            const value = layer.u32(edges.offset + 4 * edge);
+            if (!below((value & GRAPH_EDGE_LAST_MASK) >>> 0, g)) return false;
+            if (value & GRAPH_LAST_EDGE) break;
+          }
+        }
+      }
+    } catch (e) {
+      if (e instanceof CommitGraphCorruptError) return false;
+      throw e;
+    }
+    return true;
+  }
+
   /** The changed-path settings of the topmost layer that has filters (git's get_bloom_filter_settings). */
   get bloomSettings(): BloomFilterSettings | undefined {
     for (let i = this.layers.length - 1; i >= 0; i--) {
@@ -284,10 +358,13 @@ export class CommitGraph {
     return pos < 0 ? undefined : this.commitAt(pos);
   }
 
-  /** The generation of `id`, or Infinity when the graph does not have it (git's GENERATION_NUMBER_INFINITY). */
+  /**
+   * The generation walks use for `id` (`walkGenerationAt`), or Infinity when the graph does not
+   * have it (git's GENERATION_NUMBER_INFINITY).
+   */
   generationOf(id: ObjectId): number {
     const pos = this.position(id);
-    return pos < 0 ? Number.POSITIVE_INFINITY : this.generationAt(pos);
+    return pos < 0 ? Number.POSITIVE_INFINITY : this.walkGenerationAt(pos);
   }
 
   /** The changed-path filter at global position `pos` and its settings, when its layer has filters. */

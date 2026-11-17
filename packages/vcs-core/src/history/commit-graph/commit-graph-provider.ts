@@ -38,7 +38,10 @@ export const DEFAULT_COMMIT_GRAPH_SETTINGS: CommitGraphSettings = {
 
 /** The graph a commit store reads, loaded on first use. */
 export interface CommitGraphProvider {
-  /** The graph, loading it the first time; undefined when there is none or it is not used. */
+  /**
+   * The graph, loading it the first time; undefined when there is none, it is not used or it
+   * failed to load (a failure is remembered until `invalidate`, not retried on each use).
+   */
   get(): Promise<CommitGraph | undefined>;
   /** The graph if loaded already: undefined when there is none, null when not loaded yet. */
   current(): CommitGraph | undefined | null;
@@ -47,7 +50,8 @@ export interface CommitGraphProvider {
 }
 
 /**
- * A provider over a loader, which runs at most once until `invalidate`.
+ * A provider over a loader, which runs at most once until `invalidate`. A loader that throws
+ * counts as no graph (git goes on without one), passed to `onError` once.
  *
  * @example
  * ```typescript
@@ -57,6 +61,7 @@ export interface CommitGraphProvider {
  */
 export function createCommitGraphProvider(
   load: () => Promise<CommitGraph | undefined>,
+  onError?: (error: unknown) => void,
 ): CommitGraphProvider {
   let loaded: CommitGraph | undefined | null = null;
   let pending: Promise<CommitGraph | undefined> | undefined;
@@ -75,8 +80,12 @@ export function createCommitGraphProvider(
             return graph;
           },
           (error) => {
-            if (at === generation) pending = undefined;
-            throw error;
+            if (at === generation) {
+              loaded = undefined;
+              pending = undefined;
+            }
+            onError?.(error);
+            return undefined;
           },
         );
       }
