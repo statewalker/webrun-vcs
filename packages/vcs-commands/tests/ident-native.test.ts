@@ -728,9 +728,11 @@ describeGit("identities as git resolves them: guesses, empty values, refusals", 
 
   it("an email key set anywhere, even empty, stops the email: <>", async () => {
     const t = twins();
+    // identities only: both dates pinned, so the twins never straddle a second boundary
+    const dates = { GIT_AUTHOR_DATE: "1700000000 +0000", GIT_COMMITTER_DATE: "1700000500 +0100" };
     const commit = async (message: string) => {
-      git(t.native, envOf(NONE), "commit", "-q", "--allow-empty", "-m", message);
-      await (await open(t.ours, envOf({ ...NONE, EMAIL: "em@example.com" })))
+      git(t.native, envOf({ ...NONE, ...dates }), "commit", "-q", "--allow-empty", "-m", message);
+      await (await open(t.ours, envOf({ ...NONE, ...dates, EMAIL: "em@example.com" })))
         .commit()
         .setAllowEmpty(true)
         .setMessage(`${message}\n`)
