@@ -17,7 +17,6 @@ import {
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { DatabaseClient } from "../database-client.js";
 import { fromSqlPath, toSqlPath } from "../sql-path.js";
 import type { SqlNativeTreeStore } from "./types.js";
@@ -313,7 +312,8 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
    *
    * @param namePattern LIKE pattern for entry name (e.g., "%.ts", "src%")
    * @returns Async iterable of matching entries with their tree IDs, by tree id and then
-   *   by name in git's byte order (`compareGitPaths`), the order of the tree's entries
+   *   by name in git's tree-entry order (`compareTreeEntries`: bytes, a subtree's name
+   *   compared as `name/`), the order of the tree's entries
    */
   async *findByNamePattern(
     namePattern: string,
@@ -331,18 +331,14 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
       [toSqlPath(namePattern)],
     );
 
-    // the stored form sorts an escaped byte (U+0001...) before every other character:
-    // the decoded names give git's byte order
+    // the stored form sorts an escaped byte (U+0001...) before every other character, and
+    // SQL knows nothing of the `/` git puts after a subtree's name: sorted here instead
     const found = rows.map((row) => ({
       treeId: row.tree_id,
       entry: { mode: row.mode, name: fromSqlPath(row.name), id: row.object_id },
     }));
     found.sort((a, b) =>
-      a.treeId === b.treeId
-        ? compareGitPaths(a.entry.name, b.entry.name)
-        : a.treeId < b.treeId
-          ? -1
-          : 1,
+      a.treeId === b.treeId ? compareTreeEntries(a.entry, b.entry) : a.treeId < b.treeId ? -1 : 1,
     );
     yield* found;
   }

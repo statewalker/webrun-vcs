@@ -14,6 +14,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -726,3 +727,85 @@ describeGit(
     }, 600_000);
   },
 );
+
+describeGit("linked worktrees the factory adds, next to git worktree add", () => {
+  /** The files of `.git/worktrees/<name>` (reflogs aside), with host paths and names evened out. */
+  const adminFiles = (base: string, name: string) => {
+    const dir = join(base, "repo", ".git", "worktrees", name);
+    const out: Record<string, string> = {};
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      out[entry.name] = readFileSync(join(dir, entry.name), "latin1")
+        .split(base)
+        .join("<base>")
+        .split(name)
+        .join("<name>");
+    }
+    return out;
+  };
+
+  it("writes HEAD, commondir, gitdir and locked as git does, and each git uses the other's", async () => {
+    const base = join(root, "wt-admin");
+    mkdirSync(base);
+    const repo = join(base, "repo");
+    mkdirSync(repo);
+    run(repo, "init", "-q", "-b", "main");
+    put(repo, "a.txt", "a\n");
+    run(repo, "add", ".");
+    run(repo, "commit", "-qm", "c1");
+    run(repo, "config", "test.marker", "shared");
+    run(repo, "branch", "w-ours");
+    run(repo, "branch", "w-theirs");
+    // our addWorktree checks nothing out: git's --no-checkout
+    run(
+      repo,
+      "worktree",
+      "add",
+      "-q",
+      "--no-checkout",
+      "--lock",
+      "--reason",
+      "kept",
+      "../w-theirs",
+      "w-theirs",
+    );
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const ours = await factory(base, "repo").addWorktree(history, "repo/.git", "w-ours", {
+      branch: "w-ours",
+      lock: "kept",
+    });
+
+    const native = adminFiles(base, "w-theirs");
+    expect(adminFiles(base, "w-ours")).toEqual(native);
+    expect(Object.keys(native).sort()).toEqual(["HEAD", "commondir", "gitdir", "locked"]);
+    expect(bytes(join(base, "w-ours"), ".git").split(base).join("<base>")).toBe(
+      bytes(join(base, "w-theirs"), ".git")
+        .split(base)
+        .join("<base>")
+        .split("w-theirs")
+        .join("w-ours"),
+    );
+
+    // native git works in our worktree: it finds the repository, lists the worktree locked
+    const wt = join(base, "w-ours");
+    expect(run(wt, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("w-ours");
+    expect(run(wt, "config", "test.marker").trim()).toBe("shared");
+    expect(run(wt, "rev-parse", "--git-common-dir").trim()).toBe(join(repo, ".git"));
+    const list = run(repo, "worktree", "list", "--porcelain");
+    expect(list).toContain(
+      `worktree ${wt}\nHEAD ${run(repo, "rev-parse", "HEAD").trim()}\nbranch refs/heads/w-ours\nlocked kept\n`,
+    );
+    run(wt, "reset", "-q", "--hard");
+    expect(bytes(wt, "a.txt")).toBe(JSON.stringify("a\n"));
+    expect(run(wt, "status", "--porcelain")).toBe("");
+
+    // and ours works in git's: the config through its commondir
+    const theirs = await factory(base, "repo").openWorkingCopy(
+      "w-theirs",
+      "repo/.git/worktrees/w-theirs",
+    );
+    expect(String((theirs.config as GitWorkingCopyConfig).get("test.marker"))).toBe("shared");
+    expect(String((ours.config as GitWorkingCopyConfig).get("test.marker"))).toBe("shared");
+  });
+});

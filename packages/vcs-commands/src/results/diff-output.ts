@@ -35,7 +35,7 @@ import {
   writeHunks,
   type XdiffAlgorithm,
 } from "@statewalker/vcs-utils";
-import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
 
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
@@ -172,13 +172,8 @@ export function diffDriverOf(
   };
 }
 
-function boolValue(v: string | undefined): boolean | undefined {
-  if (v === undefined) return undefined;
-  const s = v.trim().toLowerCase();
-  if (s === "" || s === "true" || s === "yes" || s === "on" || s === "1") return true;
-  if (s === "false" || s === "no" || s === "off" || s === "0") return false;
-  return undefined;
-}
+/** A git boolean (`git_config_bool`), undefined when unset or not one. */
+const boolValue = (v: string | undefined): boolean | undefined => parseGitBool(v);
 
 /** A side as the diff reads it: its content and binary state, read once */
 class LoadedSide {

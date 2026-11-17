@@ -16,6 +16,7 @@ function createMockFilesApi(): WorkingCopyFactoryFilesApi {
   return {
     readFile: vi.fn().mockResolvedValue(undefined),
     fileExists: vi.fn().mockResolvedValue(false),
+    exists: vi.fn().mockResolvedValue(false),
     readDir: vi.fn().mockResolvedValue([]),
     stat: vi.fn().mockResolvedValue(undefined),
     mkdir: vi.fn().mockResolvedValue(undefined),
@@ -355,6 +356,70 @@ describe("GitWorkingCopyFactory", () => {
       await factory.openWorkingCopy("/wt", gitDir);
 
       expect(mockFiles.read).toHaveBeenCalledWith("/srv/caf\udce9/.git/config");
+    });
+  });
+
+  describe("the administrative directory, as git worktree add writes it", () => {
+    const written = (path: string) => {
+      const call = (mockFiles.write as Mock).mock.calls.find(([p]) => p === path);
+      return call ? new TextDecoder().decode(call[1] as Uint8Array) : undefined;
+    };
+
+    it("writes commondir as ../.., and no locked file unless asked", async () => {
+      await factory.addWorktree(createMockHistory(), "/repo/.git", "/wt");
+      expect(written("/repo/.git/worktrees/wt/commondir")).toBe("../..\n");
+      expect(written("/repo/.git/worktrees/wt/locked")).toBeUndefined();
+    });
+
+    it("lock: git's default reason, or the given one", async () => {
+      await factory.addWorktree(createMockHistory(), "/repo/.git", "/a", { lock: true });
+      await factory.addWorktree(createMockHistory(), "/repo/.git", "/b", { lock: "on a USB disk" });
+      expect(written("/repo/.git/worktrees/a/locked")).toBe("added with --lock\n");
+      expect(written("/repo/.git/worktrees/b/locked")).toBe("on a USB disk\n");
+    });
+
+    it("numbers the name when worktrees/NAME is taken", async () => {
+      const taken = new Set(["/repo/.git/worktrees/wt", "/repo/.git/worktrees/wt1"]);
+      (mockFiles.exists as Mock).mockImplementation(async (p: string) => taken.has(p));
+      await factory.addWorktree(createMockHistory(), "/repo/.git", "/elsewhere/wt");
+      expect(written("/elsewhere/wt/.git")).toBe("gitdir: /repo/.git/worktrees/wt2\n");
+      expect(written("/repo/.git/worktrees/wt2/gitdir")).toBe("/elsewhere/wt/.git\n");
+    });
+
+    it("writes host paths when the FilesApi's root is known", async () => {
+      const rooted = new GitWorkingCopyFactory(
+        Object.assign(mockFiles, { rootDirectory: "/home/me/" }),
+        mockCreateContext,
+      );
+      await rooted.addWorktree(createMockHistory(), "repo/.git", "wt");
+      expect(written("wt/.git")).toBe("gitdir: /home/me/repo/.git/worktrees/wt\n");
+      expect(written("repo/.git/worktrees/wt/gitdir")).toBe("/home/me/wt/.git\n");
+      expect(written("repo/.git/worktrees/wt/commondir")).toBe("../..\n");
+    });
+  });
+
+  describe("commondir, as get_common_dir_noenv reads it", () => {
+    const openWith = async (commondir: string) => {
+      const gitDir = "/wt/.git/worktrees/x";
+      (mockFiles.read as Mock).mockImplementation(async (path: string) =>
+        path === `${gitDir}/commondir` ? new TextEncoder().encode(commondir) : undefined,
+      );
+      await factory.openWorkingCopy("/wt", gitDir);
+      return (mockFiles.read as Mock).mock.calls.map(([p]) => p as string);
+    };
+
+    it("strips only the line end: a trailing blank is part of the path", async () => {
+      expect(await openWith("/srv/repo.git \r\n")).toContain("/srv/repo.git /config");
+    });
+
+    it("a relative commondir is resolved against the worktree's git directory", async () => {
+      expect(await openWith("../..\n")).toContain("/wt/.git/config");
+    });
+
+    it("a Windows drive path is absolute, never joined onto the git directory", async () => {
+      const read = await openWith("C:/repos/main/.git\n");
+      expect(read).toContain("C:/repos/main/.git/config");
+      expect(read.some((p) => p.includes("worktrees/x/C:"))).toBe(false);
     });
   });
 });

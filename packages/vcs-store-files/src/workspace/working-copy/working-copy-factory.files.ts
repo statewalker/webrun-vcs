@@ -17,6 +17,7 @@ import type {
   Worktree,
 } from "@statewalker/vcs-working-tree";
 
+import { isAbsoluteGitPath, parseCommonDir } from "../git-dir/index.js";
 import { createGitStashStore } from "./stash-store.files.js";
 import { GitWorkingCopy, type WorkingCopyFilesApi } from "./working-copy.files.js";
 import {
@@ -115,9 +116,11 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
 
   /** git's `commondir`: the repository a linked worktree's git directory belongs to. */
   private async commonDirOf(gitDir: string): Promise<string> {
-    const text = (await this.readText(`${gitDir}/commondir`))?.trim();
+    const content = await this.readText(`${gitDir}/commondir`);
+    // only the line end is stripped (get_common_dir_noenv)
+    const text = content === undefined ? undefined : parseCommonDir(content);
     if (!text) return gitDir;
-    if (text.startsWith("/")) return text;
+    if (isAbsoluteGitPath(text)) return text;
     // relative to the worktree's git directory
     const parts = gitDir.split("/").filter((p) => p !== "" && p !== ".");
     for (const part of text.split("/")) {
@@ -169,18 +172,35 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
   }
 
   /**
+   * The path git writes for `path` (a path in this FilesApi): absolute on the host when the
+   * FilesApi's root is known (`rootPath`, else its `rootDirectory`), as git writes a
+   * worktree's real paths; else `path` itself.
+   */
+  private hostPath(path: string): string {
+    const root = this.setup.rootPath ?? (this.files as { rootDirectory?: unknown }).rootDirectory;
+    if (typeof root !== "string" || root === "") return path;
+    const inner = path
+      .split("/")
+      .filter((p) => p !== "" && p !== ".")
+      .join("/");
+    const base = root.replace(/[\\/]+$/, "");
+    return inner === "" ? base || "/" : `${base}/${inner}`;
+  }
+
+  /**
    * Create additional worktree for existing repository.
    *
-   * Similar to `git worktree add`.
+   * Like `git worktree add --no-checkout`: the files are not checked out and no index is
+   * written. The administrative directory holds what git writes there:
+   * - `.git/worktrees/NAME/HEAD`: the worktree's branch or detached commit
+   * - `.git/worktrees/NAME/commondir`: `../..`, the repository the worktree belongs to
+   * - `.git/worktrees/NAME/gitdir`: the path back to the worktree's `.git` file
+   * - `.git/worktrees/NAME/locked`: the lock reason, with `lock`
+   * - the worktree's `.git` file: `gitdir: /path/to/main/.git/worktrees/NAME`
    *
-   * Git Worktree Structure:
-   * - Main repo .git/worktrees/NAME/ contains:
-   *   - HEAD: Current branch/commit for this worktree
-   *   - index: Staging area
-   *   - gitdir: Path back to worktree's .git file
-   *   - config: Per-worktree config (optional)
-   * - Worktree .git is a file containing:
-   *   gitdir: /path/to/main/.git/worktrees/NAME
+   * NAME is the worktree directory's name, followed by 1, 2, ... when a worktree of that
+   * name exists, as git numbers them. With a known host root the paths are absolute host
+   * paths, as git writes them, so native git can use the worktree.
    *
    * @param history History interface
    * @param gitDir Path to the main .git directory
@@ -193,10 +213,14 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     worktreePath: string,
     options: AddWorktreeOptions = {},
   ): Promise<WorkingCopy> {
-    const { branch, commit, force = false } = options;
+    const { branch, commit, force = false, lock } = options;
 
-    // Extract worktree name from path
-    const worktreeName = worktreePath.split("/").pop() || "worktree";
+    // Extract worktree name from path; numbered when taken, as git's add_worktree does
+    const baseName = worktreePath.split("/").filter(Boolean).pop() || "worktree";
+    let worktreeName = baseName;
+    for (let counter = 1; await this.files.exists(`${gitDir}/worktrees/${worktreeName}`); ) {
+      worktreeName = `${baseName}${counter++}`;
+    }
     const worktreeGitDir = `${gitDir}/worktrees/${worktreeName}`;
 
     // Create worktree directory
@@ -208,11 +232,23 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
 
     // Create .git file in worktree pointing to main repo's worktrees/NAME
     // (paths as their bytes: one that is no UTF-8 is written as it is, never as U+FFFD)
-    const gitFile = `gitdir: ${worktreeGitDir}\n`;
+    const gitFile = `gitdir: ${this.hostPath(worktreeGitDir)}\n`;
     await this.files.write(`${worktreePath}/.git`, encodeGitPath(gitFile));
 
     // Create gitdir file in worktrees/NAME pointing back to worktree
-    await this.files.write(`${worktreeGitDir}/gitdir`, encodeGitPath(`${worktreePath}/.git\n`));
+    await this.files.write(
+      `${worktreeGitDir}/gitdir`,
+      encodeGitPath(`${this.hostPath(`${worktreePath}/.git`)}\n`),
+    );
+
+    // The repository the worktree belongs to, relative to worktrees/NAME (git writes `../..`)
+    await this.files.write(`${worktreeGitDir}/commondir`, encodeGitPath("../..\n"));
+
+    // `git worktree add --lock [--reason]` leaves the lock in place
+    if (lock !== undefined && lock !== false) {
+      const reason = lock === true ? "added with --lock" : lock;
+      await this.files.write(`${worktreeGitDir}/locked`, encodeGitPath(`${reason}\n`));
+    }
 
     // Set up HEAD in worktrees/NAME. Written plainly, as git's `worktree add` writes the
     // new worktree's HEAD (write_file): worktrees/NAME was created just above and no other

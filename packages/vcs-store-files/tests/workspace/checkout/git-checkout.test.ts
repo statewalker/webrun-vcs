@@ -159,3 +159,33 @@ describe("GitCheckout state files survive a crash mid-write", () => {
     expect(removed).toEqual([".git/rebase-merge/msgnum"]);
   });
 });
+
+describe("GitCheckout FETCH_HEAD keeps bytes that are no UTF-8", () => {
+  it("a latin-1 URL read and appended to stays those bytes", async () => {
+    const base = createInMemoryFilesApi();
+    const co = new GitCheckout({
+      staging: createMemoryGitStaging(),
+      refs: new MemoryRefs(),
+      files: {
+        read: async (path) => ((await base.exists(path)) ? readFile(base, path) : undefined),
+        stats: async (path) => {
+          const s = await base.stats(path);
+          return s ? { isDirectory: s.kind === "directory" } : undefined;
+        },
+        write: (path, content) => base.write(path, content),
+        mkdir: (path) => base.mkdir(path),
+      } as GitCheckoutFilesApi,
+      gitDir: ".git",
+    });
+    const id = "a".repeat(40);
+    // "/srv/caf\xe9" as git writes it from a latin-1 remote URL
+    const line = [...new TextEncoder().encode(`${id}\t\tbranch 'main' of /srv/caf`), 0xe9, 0x0a];
+    await base.write(".git/FETCH_HEAD", [new Uint8Array(line)]);
+    const text = await co.readFetchHead();
+    expect(text).toBe(`${id}\t\tbranch 'main' of /srv/caf\udce9\n`);
+    await co.writeFetchHead(`${id}\tnot-for-merge\ttag 'v1' of /srv/caf\udce9\n`, { append: true });
+    const bytes = await readFile(base, ".git/FETCH_HEAD");
+    expect(bytes.filter((b) => b === 0xe9).length).toBe(2);
+    expect(bytes.includes(0xef)).toBe(false); // no U+FFFD (EF BF BD)
+  });
+});

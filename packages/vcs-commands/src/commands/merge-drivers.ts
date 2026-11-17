@@ -14,6 +14,7 @@
  * ```
  */
 
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
 import { configBool, configValue } from "./merge-config.js";
@@ -124,11 +125,12 @@ export function ortConfigOptions(
   if (renames !== undefined && renames !== "copies" && renames !== "copy") {
     if (!configBool(workingCopy, renamesKey, true)) out.renames = false;
   }
-  const dirRenames = configValue(workingCopy, "merge.directoryRenames")?.trim().toLowerCase();
-  if (dirRenames !== undefined) {
-    if (["false", "no", "off", "0"].includes(dirRenames)) out.directoryRenames = "false";
-    else if (["true", "yes", "on", "1", ""].includes(dirRenames)) out.directoryRenames = "true";
-    else if (dirRenames === "conflict") out.directoryRenames = "conflict";
+  const dirRenamesValue = configValue(workingCopy, "merge.directoryRenames");
+  if (dirRenamesValue !== undefined) {
+    const dirRenames = parseGitBool(dirRenamesValue);
+    if (dirRenames === false) out.directoryRenames = "false";
+    else if (dirRenames === true) out.directoryRenames = "true";
+    else if (dirRenamesValue.toLowerCase() === "conflict") out.directoryRenames = "conflict";
   }
   const limit =
     configValue(workingCopy, "merge.renameLimit") ?? configValue(workingCopy, "diff.renameLimit");

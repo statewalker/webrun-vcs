@@ -15,6 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { type ConfigFilesApi, GitWorkingCopyConfig } from "@statewalker/vcs-store-files";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -302,6 +303,40 @@ describe("GitWorkingCopyConfig <-> native git", () => {
         "https://example.com/x.git",
       );
       expect(await git(["remote"], scratchDir)).toBe("origin");
+    });
+  });
+
+  describe("booleans, as git_config_bool reads them", () => {
+    it("a key with no `=` is true, an empty value false, and integers count", async () => {
+      const lines = [
+        "\tbare",
+        "\tempty =",
+        '\tquotedEmpty = ""',
+        "\tyes = YES",
+        "\toff = Off",
+        "\thex = 0x10",
+        "\thexZero = 0x0",
+        "\toctal = 010",
+        "\tunit = 1k",
+        "\tzeroUnit = 0k",
+        "\tplus = +3",
+        "\tminusZero = -0",
+        '\tleadingBlank = " 1"',
+        '\tspacedTrue = " true"',
+        "\tnotOctal = 09",
+        "\tgarbage = maybe",
+      ];
+      await fs.writeFile(path.join(repoDir, ".git/config"), `[t]\n${lines.join("\n")}\n`);
+      const config = openConfig();
+      await config.load();
+      for (const line of lines) {
+        const key = `t.${line.trim().split(/[ =]/)[0]}`;
+        const native = await git(["config", "--bool", key], repoDir).then(
+          (out) => out === "true",
+          () => undefined,
+        );
+        expect([key, parseGitBool(config.get(key))]).toEqual([key, native]);
+      }
     });
   });
 });

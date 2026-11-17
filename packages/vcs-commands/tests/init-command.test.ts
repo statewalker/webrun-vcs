@@ -239,6 +239,24 @@ describe("InitCommand", () => {
       const config = new TextDecoder().decode(await collect(files.read("repo.git/config")));
       expect(config).toMatch(/bare = true/);
     });
+
+    it("keeps bytes that are no UTF-8 when it sets core.bare in the config", async () => {
+      const files = createInMemoryFilesApi();
+      // a config line in latin-1 (a template's, say): "# caf\xe9" stays those bytes
+      const write = files.write.bind(files);
+      files.write = async (path, content) => {
+        if (path.replace(/^\/+/, "") !== "repo.git/config") return write(path, content);
+        const bytes = await collect(content as AsyncIterable<Uint8Array>);
+        const head = new TextDecoder().decode(bytes);
+        if (head.includes("caf")) return write(path, [bytes]);
+        return write(path, [bytes, new Uint8Array([0x23, 0x20, 0x63, 0x61, 0x66, 0xe9, 0x0a])]);
+      };
+      await Git.init().setFilesApi(files).setDirectory("repo.git").setBare(true).call();
+
+      const config = await collect(files.read("repo.git/config"));
+      expect(new TextDecoder().decode(config)).toMatch(/bare = true/);
+      expect([...config.slice(-7)]).toEqual([0x23, 0x20, 0x63, 0x61, 0x66, 0xe9, 0x0a]);
+    });
   });
 
   describe("Custom staging store", () => {

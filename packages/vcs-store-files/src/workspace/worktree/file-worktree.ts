@@ -57,6 +57,7 @@ import {
   type WorkingCopy,
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
+import { parseGitfile } from "../git-dir/index.js";
 import { FileStagingStore } from "../staging/index.js";
 import { createWorkingCopyConfig } from "../working-copy/index.js";
 import { type CaseFolding, probeCaseFolding } from "./probe-case-folding.js";
@@ -777,10 +778,9 @@ export class FileWorktree implements Worktree {
     if (this.files.lstat) {
       if ((await this.files.lstat(dotGit))?.kind !== "file") return undefined;
     } else if ((await this.files.stats(dotGit))?.kind !== "file") return undefined;
-    // the path as its bytes: a gitdir that is no UTF-8 names the same directory
-    return decodeGitPath(await readFile(this.files, dotGit))
-      .trim()
-      .match(/^gitdir: (.+)$/)?.[1];
+    // the path as its bytes: a gitdir that is no UTF-8 names the same directory; only the
+    // line end is stripped (read_gitfile_gently)
+    return parseGitfile(decodeGitPath(await readFile(this.files, dotGit)));
   }
 
   async isRepository(path: string): Promise<boolean> {

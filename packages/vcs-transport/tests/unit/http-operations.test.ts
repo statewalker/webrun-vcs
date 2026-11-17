@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RepositoryFacade } from "../../src/api/repository-facade.js";
 import type { RefStore } from "../../src/context/process-context.js";
 import { fetch as fetchPack } from "../../src/operations/fetch.js";
+import { authorizationHeader } from "../../src/operations/http-auth.js";
 import { lsRemote } from "../../src/operations/ls-remote.js";
 import { push } from "../../src/operations/push.js";
 import { createMockRefStore, createMockRepository } from "../helpers/test-protocol.js";
@@ -392,5 +393,21 @@ describe("fetch: a failed import", () => {
     ).rejects.toThrow(/store unavailable/);
     expect(local.updates).toEqual([]);
     expect(cancelled).toBe(true);
+  });
+});
+
+describe("authorizationHeader: Basic auth over the credentials' bytes", () => {
+  const decoded = (header: string) =>
+    Uint8Array.from(atob(header.slice("Basic ".length)), (c) => c.charCodeAt(0));
+
+  it("UTF-8 for any character, where btoa alone throws above U+00FF", () => {
+    const header = authorizationHeader({ username: "Иван", password: "pässword" });
+    expect(new TextDecoder().decode(decoded(header))).toBe("Иван:pässword");
+  });
+
+  it("a byte that was no UTF-8 in the config (a lone surrogate) goes out as that byte", () => {
+    const header = authorizationHeader({ username: "caf\udce9", password: "x" });
+    expect([...decoded(header)]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x3a, 0x78]);
+    expect(authorizationHeader({ token: "t" })).toBe(`Basic ${btoa("x-access-token:t")}`);
   });
 });

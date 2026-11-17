@@ -17,6 +17,7 @@ import {
   type TagMode,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
+import { parseGitBool } from "@statewalker/vcs-utils";
 
 import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
 import { deleteRefs, RemoteConfigStore } from "../remote-config/index.js";
@@ -919,13 +920,7 @@ function parseFollowRemoteHead(
 }
 
 /** A git boolean config value; undefined when unset or not a boolean. */
-function configBool(value: string | undefined): boolean | undefined {
-  if (value === undefined) return undefined;
-  const v = value.trim().toLowerCase();
-  if (v === "true" || v === "yes" || v === "on" || v === "1") return true;
-  if (v === "false" || v === "no" || v === "off" || v === "0" || v === "") return false;
-  return undefined;
-}
+const configBool = (value: string | undefined): boolean | undefined => parseGitBool(value);
 
 /** git's refname_match: `ref` (`main`, `heads/main`, `refs/heads/main`) names `fullName`. */
 function refNameMatches(ref: string, fullName: string): boolean {

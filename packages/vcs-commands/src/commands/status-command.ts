@@ -1,4 +1,5 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   compareWithWorktree,
   findUntrackedFiles,
@@ -60,12 +61,15 @@ const isGitlink = (mode: number | undefined) => mode === FileMode.GITLINK;
 /** A git boolean, `copies`/`copy` (rename detection on) or undefined when not one. */
 function renamesValue(value: string | undefined): boolean | undefined {
   if (value === undefined) return undefined;
-  const v = value.trim().toLowerCase();
-  if (v === "" || v === "copies" || v === "copy") return true;
-  if (["true", "yes", "on"].includes(v)) return true;
-  if (["false", "no", "off"].includes(v)) return false;
-  const n = Number(v);
-  return Number.isInteger(n) ? n !== 0 : undefined;
+  const v = value.toLowerCase();
+  if (v === "copies" || v === "copy") return true;
+  return parseGitBool(value);
+}
+
+/** `status.showUntrackedFiles` says `no` (or a false boolean: `false`, an empty value). */
+function isShowUntrackedOff(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  return value.toLowerCase() === "no" || parseGitBool(value) === false;
 }
 
 /** A git integer (`1000`, `2k`), or undefined when not one. */
@@ -114,9 +118,7 @@ export async function readSubmoduleDirt(
   if (!inner) return {};
   const showUntracked =
     !ignoreUntracked &&
-    !["no", "false", "off", "0"].includes(
-      RemoteConfigStore.from(inner).value("status.showUntrackedFiles")?.trim().toLowerCase() ?? "",
-    );
+    !isShowUntrackedOff(RemoteConfigStore.from(inner).value("status.showUntrackedFiles"));
   const status = await new StatusCommand(inner)
     .setRenames(false)
     .setUntracked(showUntracked)

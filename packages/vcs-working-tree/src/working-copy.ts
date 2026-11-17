@@ -324,6 +324,11 @@ export interface AddWorktreeOptions {
   commit?: ObjectId;
   /** Force creation even if branch exists elsewhere */
   force?: boolean;
+  /**
+   * Keep the new worktree locked (`git worktree add --lock [--reason <text>]`): `true` writes
+   * git's default reason, `added with --lock`, a string is the reason itself.
+   */
+  lock?: boolean | string;
 }
 
 /**
