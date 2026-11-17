@@ -17,6 +17,7 @@ import {
   type ContentFilterSetup,
   installContentFilter,
 } from "../convert/install-content-filter.js";
+import type { LinkedWorktrees } from "../linked-worktrees/index.js";
 import type { RepositoryStatus, StatusOptions } from "../status/index.js";
 import type {
   CherryPickState,
@@ -50,6 +51,8 @@ export interface MemoryWorkingCopyOptions extends ContentFilterSetup {
   stash?: StashStore;
   /** Optional configuration */
   config?: WorkingCopyConfig;
+  /** The repository's worktrees, when the backend keeps them (`git worktree`) */
+  worktrees?: LinkedWorktrees;
 }
 
 /**
@@ -72,6 +75,7 @@ export class MemoryWorkingCopy implements WorkingCopy {
   readonly worktree: Worktree;
   readonly stash: StashStore;
   readonly config: WorkingCopyConfig;
+  readonly worktrees?: LinkedWorktrees;
 
   constructor(options: MemoryWorkingCopyOptions) {
     this.history = options.history;
@@ -79,6 +83,7 @@ export class MemoryWorkingCopy implements WorkingCopy {
     this.worktree = options.worktree;
     this.stash = options.stash ?? new MemoryStashStore();
     this.config = options.config ?? {};
+    if (options.worktrees) this.worktrees = options.worktrees;
     // git's clean / smudge (attributes, core.autocrlf, ...) on the worktree's content
     installContentFilter(this, options);
   }

@@ -13,6 +13,8 @@ import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
+  entryStatOf,
+  type Staging,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 
@@ -368,4 +370,59 @@ export async function planFlatRestore(
     plan.entries.push(restore);
   }
   return plan;
+}
+
+/** What {@link checkoutFreshTree} writes into. */
+export interface FreshCheckoutTarget {
+  trees: CommandTrees;
+  blobs: Blobs;
+  staging: Staging;
+  /** None for a bare repository: only the index is written. */
+  worktree?: Worktree;
+  /** Whether links are written as links (`core.symlinks` and the worktree allow it). */
+  symlinks: boolean;
+  /** `core.ignorecase`. */
+  ignoreCase: boolean;
+}
+
+/**
+ * A tree checked out into an empty worktree and index, as `git clone` and
+ * `git worktree add` do it: every path checked first (verify_path, collisions), then the
+ * files written (links where the worktree makes them, an empty directory per submodule),
+ * then the index with each file's stat data, so native git sees the files unchanged.
+ *
+ * @returns The paths that collided (ignoreCase), as git warns about them.
+ */
+export async function checkoutFreshTree(
+  target: FreshCheckoutTarget,
+  treeId: ObjectId,
+  operation: string,
+): Promise<string[]> {
+  const { trees, blobs, staging, worktree } = target;
+  if (!worktree) {
+    await staging.readTree(trees, treeId);
+    await staging.write();
+    return [];
+  }
+  const plan = await planTreeRestore(trees, blobs, treeId, operation, {
+    symlinks: true,
+    ...(await restoreCaseOptions(worktree, target.ignoreCase)),
+    windows: worktree.capabilities?.windowsPaths === true,
+    reservedNames: worktree.capabilities?.reservedNames,
+  });
+  await writeTreeRestorePlan(worktree, blobs, plan, operation, {
+    symlinks: target.symlinks,
+    gitlinks: true,
+  });
+  // the index records what was written (the worktree's stat of each file, a link's own
+  // when the worktree can lstat)
+  await staging.readTree(trees, treeId);
+  const editor = staging.createEditor();
+  for (const { path, objectId, mode } of plan.entries) {
+    const stats = await worktree.getEntry(path);
+    if (stats) editor.upsert({ path, objectId, mode, ...entryStatOf(stats) });
+  }
+  await editor.finish();
+  await staging.write();
+  return plan.collided;
 }

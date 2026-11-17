@@ -71,6 +71,20 @@ export interface FilesRefBatchOptions {
    * user.email). Defaults to `webrun-vcs <vcs@localhost>`.
    */
   reflogIdentity?: { name: string; email: string };
+  /**
+   * The id of a ref this store does not hold, where a symbolic ref of this store points
+   * at it: a linked worktree's HEAD (`.git/worktrees/<id>/HEAD`) naming a branch of the
+   * repository. Read while planning and as the old value (compared, and logged) of a
+   * `noDeref` update of that symbolic ref, as git resolves it through the worktree's
+   * combined ref store. Undefined: the ref does not exist.
+   */
+  resolveOutside?: (name: string) => Promise<ObjectId | undefined>;
+  /**
+   * Whether HEAD's reflog records an update of the branch HEAD points at (git's
+   * split_head_update). Default true. False for the repository's refs as a linked worktree
+   * updates them: that worktree's own HEAD records the update, the repository's does not.
+   */
+  logHeadUpdates?: boolean;
 }
 
 interface PackedEntry {
@@ -307,6 +321,19 @@ export function createFilesRefOps(
     const e = packed.get(name);
     return e ? { name, objectId: e.id, storage: RefStorage.PACKED, peeled: false } : undefined;
   }
+  /** `readRef`, falling back to `options.resolveOutside` for a ref this store does not hold. */
+  async function readRefOrOutside(
+    name: string,
+    packed: Map<string, PackedEntry>,
+    read: ReadLoose = readLoose,
+  ): Promise<Ref | SymbolicRef | undefined> {
+    const own = await readRef(name, packed, read);
+    if (own || !options.resolveOutside) return own;
+    const id = await options.resolveOutside(name);
+    return id === undefined
+      ? undefined
+      : { name, objectId: id, storage: RefStorage.PACKED, peeled: false };
+  }
   async function deref(name: string, read: ReadLoose = readLoose): Promise<string> {
     let current = name;
     for (let i = 0; i < MAX_SYMREF_READS; i++) {
@@ -455,7 +482,9 @@ export function createFilesRefOps(
             const ownLine = `${own.oldId} ${own.newId} ${who}${text ? `\t${text}` : ""}\n`;
             await append(u.name, enc.encode(ownLine), true);
           }
-        } else if (old !== u.newValue) {
+        } else if (old !== u.newValue || (u.current && "target" in u.current)) {
+          // a symbolic ref replaced by an id is written, so logged, even at the same id
+          // (git's REF_NEEDS_COMMIT for a symref: `checkout --detach` logs `<id> <id>`)
           await append(u.name, line, o.createReflog === true);
         }
         for (const n of u.reflogAlso) await append(n, line);
@@ -667,7 +696,7 @@ export function createFilesRefOps(
   /** The id `name` resolves to (through symbolic refs), as `old` is compared with it. */
   async function resolveId(name: string): Promise<ObjectId | undefined> {
     const packed = await readPacked();
-    const ref = await readRef(await deref(name), packed);
+    const ref = await readRefOrOutside(await deref(name), packed);
     return ref && "objectId" in ref ? ref.objectId : undefined;
   }
 
@@ -737,7 +766,7 @@ export function createFilesRefOps(
     const packed = await readPacked();
     const read = onceEach();
     const plan = await planRefBatch(commands, {
-      read: (name) => readRef(name, packed, read),
+      read: (name) => readRefOrOutside(name, packed, read),
       hasChildren: async (name) => {
         for (const k of packed.keys()) if (k.startsWith(`${name}/`)) return true;
         for await (const p of files.list(name)) if (!p.endsWith(".lock")) return true;
@@ -747,6 +776,9 @@ export function createFilesRefOps(
     if (!plan.ok) return fail(plan.rejected);
     const updates: Update[] = plan.updates.map((u, i) => ({
       ...u,
+      ...(options.logHeadUpdates === false && u.name !== "HEAD"
+        ? { reflogAlso: u.reflogAlso.filter((n) => n !== "HEAD") }
+        : {}),
       old: commands[i]?.old,
       noDeref: commands[i]?.noDeref === true,
     }));

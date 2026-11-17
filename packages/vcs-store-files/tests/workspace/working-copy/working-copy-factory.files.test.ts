@@ -381,6 +381,22 @@ describe("GitWorkingCopyFactory", () => {
       expect(written("/repo/.git/worktrees/b/locked")).toBe("on a USB disk\n");
     });
 
+    it("names the admin directory as git's sanitize_refname_component does", async () => {
+      await factory.addWorktree(createMockHistory(), "/repo/.git", "/x/a b.lock");
+      expect(written("/x/a b.lock/.git")).toBe("gitdir: /repo/.git/worktrees/a-b\n");
+      await factory.addWorktree(createMockHistory(), "/repo/.git", "/y/.hidden");
+      expect(written("/y/.hidden/.git")).toBe("gitdir: /repo/.git/worktrees/-hidden\n");
+    });
+
+    it("logs the new HEAD as git's update-ref does: from the zero id, no message", async () => {
+      await factory.addWorktree(createMockHistory({ headCommit: "abc123" }), "/repo/.git", "/wt", {
+        ident: "T <t@e> 5 +0000",
+      });
+      expect(written("/repo/.git/worktrees/wt/logs/HEAD")).toBe(
+        `${"0".repeat(40)} abc123 T <t@e> 5 +0000\n`,
+      );
+    });
+
     it("numbers the name when worktrees/NAME is taken", async () => {
       const taken = new Set(["/repo/.git/worktrees/wt", "/repo/.git/worktrees/wt1"]);
       (mockFiles.exists as Mock).mockImplementation(async (p: string) => taken.has(p));

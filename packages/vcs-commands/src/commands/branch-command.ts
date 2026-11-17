@@ -1,7 +1,9 @@
 import type { ObjectId, Ref } from "@statewalker/vcs-core";
 import { compareRefNames, isSymbolicRef, isValidBranchName } from "@statewalker/vcs-core";
+import type { WorktreeInfo } from "@statewalker/vcs-working-tree";
 
 import {
+  BranchUsedByWorktreeError,
   CannotDeleteCurrentBranchError,
   InvalidRefNameError,
   NotMergedError,
@@ -10,11 +12,14 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { ListBranchMode } from "../types.js";
+import { shortBranchName, worktreeUsingBranch } from "./worktree-support.js";
 
 /**
  * Create a new branch.
  *
- * Equivalent to `git branch <name>`.
+ * Equivalent to `git branch <name>`. With `setForce`, an existing branch some worktree has
+ * checked out is refused (`BranchUsedByWorktreeError`: `cannot force update the branch 'x'
+ * used by worktree at '<path>'`), where the backend keeps linked worktrees.
  *
  * Based on JGit's CreateBranchCommand.
  *
@@ -100,8 +105,21 @@ export class CreateBranchCommand extends GitCommand<Ref> {
     const refName = `refs/heads/${this.name}`;
 
     // Check if already exists
-    if (!this.force && (await this.refsStore.has(refName))) {
+    const exists = await this.refsStore.has(refName);
+    if (!this.force && exists) {
       throw new RefAlreadyExistsError(refName, `Branch '${this.name}' already exists`);
+    }
+    // git's validate_new_branchname: a branch a worktree has checked out is not force-moved
+    const worktrees = this.workingCopy.worktrees;
+    if (exists && worktrees) {
+      const user = await worktreeUsingBranch(worktrees, refName);
+      if (user) {
+        throw new BranchUsedByWorktreeError(
+          this.name,
+          user.path,
+          `cannot force update the branch '${this.name}' used by worktree at '${user.path}'`,
+        );
+      }
     }
 
     // Resolve start point
@@ -122,6 +140,11 @@ export class CreateBranchCommand extends GitCommand<Ref> {
  * Delete branches.
  *
  * Equivalent to `git branch -d` or `git branch -D`.
+ *
+ * Where the backend keeps linked worktrees (`WorkingCopy.worktrees`), a branch any worktree
+ * has checked out (or is rebasing or bisecting) is refused, as git's `branch_checked_out`:
+ * `cannot delete branch 'x' used by worktree at '<path>'` (`BranchUsedByWorktreeError`;
+ * `CannotDeleteCurrentBranchError` with that message for this worktree's own branch).
  *
  * Based on JGit's DeleteBranchCommand.
  *
@@ -184,9 +207,18 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
 
     const currentBranch = await this.getCurrentBranch();
     const deleted: string[] = [];
+    const worktrees = this.workingCopy.worktrees;
 
     for (const name of this.branchNames) {
       const refName = name.startsWith("refs/") ? name : `refs/heads/${name}`;
+
+      // git's branch_checked_out: no worktree's branch is deleted (this one's included)
+      const user = worktrees ? await worktreeUsingBranch(worktrees, refName) : undefined;
+      if (user) {
+        const message = `cannot delete branch '${shortBranchName(refName)}' used by worktree at '${user.path}'`;
+        if (user.current) throw new CannotDeleteCurrentBranchError(name, message);
+        throw new BranchUsedByWorktreeError(shortBranchName(refName), user.path, message);
+      }
 
       // Cannot delete current branch
       if (currentBranch === refName) {
@@ -328,7 +360,10 @@ export class ListBranchCommand extends GitCommand<Ref[]> {
 }
 
 /**
- * Rename a branch.
+ * Rename a branch. Other worktrees whose HEAD is on it follow the new name, with git's
+ * `Branch: renamed <old> to <new>` line in their HEAD reflog (git's
+ * `replace_each_worktree_head_symref`). Refused (`BranchUsedByWorktreeError`) while a
+ * worktree rebases or bisects the branch (`branch refs/heads/x is being rebased at <path>`).
  *
  * Equivalent to `git branch -m`.
  *
@@ -418,6 +453,31 @@ export class RenameBranchCommand extends GitCommand<Ref> {
       throw new RefAlreadyExistsError(newRefName, `Branch '${this.newName}' already exists`);
     }
 
+    // Everything checked before anything changes: git's reject_rebase_or_bisect_branch (a
+    // worktree with a detached HEAD rebasing or bisecting the branch), and the other
+    // worktrees whose HEAD is on it
+    const worktrees = this.workingCopy.worktrees;
+    const others: WorktreeInfo[] = [];
+    if (worktrees) {
+      for (const wt of await worktrees.list()) {
+        if (wt.detached && wt.rebasing === oldRefName) {
+          throw new BranchUsedByWorktreeError(
+            shortBranchName(oldRefName),
+            wt.path,
+            `branch ${oldRefName} is being rebased at ${wt.path}`,
+          );
+        }
+        if (wt.detached && wt.bisecting === oldRefName) {
+          throw new BranchUsedByWorktreeError(
+            shortBranchName(oldRefName),
+            wt.path,
+            `branch ${oldRefName} is being bisected at ${wt.path}`,
+          );
+        }
+        if (!wt.current && !wt.detached && wt.headRef === oldRefName) others.push(wt);
+      }
+    }
+
     // Create new and delete old
     await this.refsStore.set(newRefName, oldRef.objectId);
     await this.refsStore.delete(oldRefName);
@@ -427,6 +487,10 @@ export class RenameBranchCommand extends GitCommand<Ref> {
     if (head && isSymbolicRef(head) && head.target === oldRefName) {
       await this.refsStore.setSymbolic("HEAD", newRefName);
     }
+    // and every other worktree's HEAD on it, through that worktree's own refs, logged as
+    // git's replace_each_worktree_head_symref logs it
+    const message = `Branch: renamed ${oldRefName} to ${newRefName}`;
+    for (const wt of others) await worktrees?.updateHead(wt, newRefName, { message });
 
     this.setCallable(false);
 

@@ -14,6 +14,7 @@ import type {
   Checkout,
   CherryPickState,
   ContentFilterSetup,
+  LinkedWorktrees,
   MergeState,
   RebaseState,
   RevertState,
@@ -66,6 +67,8 @@ export interface GitWorkingCopyOptions extends ContentFilterSetup {
   files: WorkingCopyFilesApi;
   /** Git directory path */
   gitDir: string;
+  /** The repository's worktrees (`git worktree`), when the host gives them */
+  worktrees?: LinkedWorktrees;
 }
 
 /**
@@ -82,6 +85,7 @@ export class GitWorkingCopy implements WorkingCopy {
   readonly worktree: Worktree;
   readonly stash: StashStore;
   readonly config: WorkingCopyConfig;
+  readonly worktrees?: LinkedWorktrees;
 
   private readonly files: WorkingCopyFilesApi;
   private readonly gitDir: string;
@@ -94,6 +98,7 @@ export class GitWorkingCopy implements WorkingCopy {
     this.config = options.config;
     this.files = options.files;
     this.gitDir = options.gitDir;
+    if (options.worktrees) this.worktrees = options.worktrees;
     // git's clean / smudge (attributes, core.autocrlf, ...) on the worktree's content
     installContentFilter(this, options);
   }
