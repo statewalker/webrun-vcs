@@ -1,4 +1,4 @@
-import { constants, deflateSync } from "node:zlib";
+import { constants, deflateSync, inflateSync } from "node:zlib";
 import { inflate as pakoInflate } from "pako";
 import { describe, expect, it } from "vitest";
 import {
@@ -174,5 +174,110 @@ describe("inflateWhole", () => {
     const bad = small.slice();
     bad[bad.length - 1] = (bad[bad.length - 1] as number) ^ 1;
     expect(() => inflateWhole(bad, { into: probe, partial: true })).toThrow(InflateError);
+  });
+});
+
+describe("inflateWhole differential fuzz against node zlib", () => {
+  /** node zlib's verdict, as inflateWhole's error classes: "ok", "truncated" or "corrupt" */
+  function zlibVerdict(z: Uint8Array): { kind: string; out?: Uint8Array } {
+    try {
+      return { kind: "ok", out: new Uint8Array(inflateSync(z)) };
+    } catch (e) {
+      return { kind: (e as { code?: string }).code === "Z_BUF_ERROR" ? "truncated" : "corrupt" };
+    }
+  }
+
+  function wholeVerdict(
+    z: Uint8Array,
+    options: Parameters<typeof inflateWhole>[1],
+  ): { kind: string; out?: Uint8Array; consumed?: number; ended?: boolean } {
+    try {
+      const r = inflateWhole(z, options);
+      return {
+        kind: "ok",
+        out: r.data.subarray(0, r.length),
+        consumed: r.consumed,
+        ended: r.ended,
+      };
+    } catch (e) {
+      if (e instanceof InflateOverflowError) return { kind: "overflow" };
+      if (e instanceof TruncatedStreamError) return { kind: "truncated" };
+      if (e instanceof InflateError) return { kind: "corrupt" };
+      throw e;
+    }
+  }
+
+  /** A stream to inflate: zlib's output damaged by flips, cuts or a random byte, or random data. */
+  function damagedStream(r: () => number, round: number): Uint8Array {
+    const { opts } = deflaters[round % deflaters.length] as { opts: object };
+    let z = new Uint8Array(deflateSync(sample(r, Math.floor(r() ** 2 * 3000)), opts));
+    const damage = Math.floor(r() * 6);
+    if (damage === 1 || damage === 4) {
+      for (let k = 1 + Math.floor(r() * 3); k > 0; k--) {
+        const at = 2 + Math.floor(r() * (z.length - 2));
+        z[at] = (z[at] as number) ^ (1 << Math.floor(r() * 8));
+      }
+    }
+    if (damage === 2 || damage === 4) z = z.subarray(0, Math.floor(r() * z.length));
+    if (damage === 3) {
+      // a block header or code lengths, most likely
+      z[2 + Math.floor(r() * Math.min(z.length - 2, 64))] = Math.floor(r() * 256);
+    }
+    if (damage === 5) {
+      // a valid zlib header and random bits: random block types and code sets
+      z = new Uint8Array(2 + Math.floor(r() * 200));
+      z[0] = 0x78;
+      z[1] = 0x9c;
+      for (let i = 2; i < z.length; i++) z[i] = Math.floor(r() * 256);
+    }
+    return z;
+  }
+
+  it("decodes the same bytes, or fails as zlib fails (truncated or corrupt), for 4000 seeded streams", () => {
+    const r = rng(20261117);
+    const seen = { ok: 0, truncated: 0, corrupt: 0 };
+    for (let round = 0; round < 4000; round++) {
+      const z = damagedStream(r, round);
+      const want = zlibVerdict(z);
+      const got = wholeVerdict(z, { maxSize: 1 << 22 });
+      expect(got.kind, `round ${round}`).toBe(want.kind);
+      seen[want.kind as keyof typeof seen]++;
+      if (want.out) {
+        expect(
+          Buffer.from(got.out as Uint8Array).equals(Buffer.from(want.out)),
+          `round ${round}`,
+        ).toBe(true);
+        // the same stream into an exact buffer, a short one, and a short one read partially
+        const n = want.out.length;
+        expect(wholeVerdict(z, { size: n }).out?.length, `round ${round}`).toBe(n);
+        if (n > 0) {
+          const cut = Math.floor(r() * n);
+          expect(wholeVerdict(z, { size: cut }).kind, `round ${round}`).toBe("overflow");
+          const part = wholeVerdict(z, { into: new Uint8Array(cut), partial: true });
+          expect(part.kind, `round ${round}`).toBe("ok");
+          expect(part.ended, `round ${round}`).toBe(false);
+          expect(
+            Buffer.from(part.out as Uint8Array).equals(
+              Buffer.from(want.out.subarray(0, part.out?.length)),
+            ),
+            `round ${round}`,
+          ).toBe(true);
+        }
+      }
+    }
+    // every outcome is exercised
+    expect(seen.ok).toBeGreaterThan(400);
+    expect(seen.truncated).toBeGreaterThan(400);
+    expect(seen.corrupt).toBeGreaterThan(400);
+  });
+});
+
+describe("inflateWhole on a code set zlib accepts oddly", () => {
+  it("reads a code length code without codes as zlib does: lengths of 0, one bit each, until the input ends", () => {
+    // a dynamic block whose 4 code length code lengths are all 0: zlib's table then decodes
+    // every bit as a length of 0, and the input runs out before the 258 lengths
+    const z = Uint8Array.from([0x78, 0x9c, 0xad, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    expect(() => inflateSync(z)).toThrow(/unexpected end of file/);
+    expect(() => inflateWhole(z, { maxSize: 1000 })).toThrow(TruncatedStreamError);
   });
 });

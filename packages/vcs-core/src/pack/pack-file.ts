@@ -48,6 +48,7 @@ import type { ObjectId } from "../common/id/index.js";
 import { type GitObject, ObjectIdMismatchError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { PackError } from "./index-pack.js";
+import { runSteps, runStepsAsync, type Steps } from "./run-steps.js";
 
 /** Pack entry kinds: 1–4 whole objects (commit, tree, blob, tag), 6 OFS_DELTA, 7 REF_DELTA. */
 export type PackedEntryKind = 1 | 2 | 3 | 4 | 6 | 7;
@@ -138,6 +139,15 @@ export interface PackFile extends Pack {
   readonly idxPath: string;
   readonly stats: PackStats;
   get(id: ObjectId, options?: PackGetOptions): Promise<GitObject | undefined>;
+  /**
+   * `get`, without a promise when no I/O is needed (the entries are in loaded windows or the
+   * base cache): the object or undefined, else a promise of it. Errors are thrown as `get`
+   * rejects with them.
+   */
+  getNow(
+    id: ObjectId,
+    options?: PackGetOptions,
+  ): GitObject | undefined | Promise<GitObject | undefined>;
   /** Drops this pack's objects from the base cache. */
   close(): void;
 }
@@ -485,6 +495,9 @@ function parseIdx(idx: Uint8Array, idxPath: string, sum: Uint8Array): IdxTable {
   if (hex(sum) !== hex(idx.subarray(idx.length - 20)))
     throw new PackError(`${idxPath}: idx checksum mismatch`);
   const packId = hex(idx.subarray(idx.length - 40, idx.length - 20));
+  /** The last id `find` looked up, and its position. */
+  let lastId: string | undefined;
+  let lastFound = -1;
   return {
     version: v2 ? 2 : 1,
     count: n,
@@ -498,21 +511,29 @@ function parseIdx(idx: Uint8Array, idxPath: string, sum: Uint8Array): IdxTable {
     },
     crcOf: (i) => (v2 ? iv.getUint32(crcAt + i * 4) : undefined),
     find(id) {
+      // a pack set asks `has` and then `get` for the same id: the second lookup is free
+      if (id === lastId) return lastFound;
       const key = idKey;
       if (!parseId(id, key)) return -1;
       const b = key[0] as number;
       let lo = b ? fan(b - 1) : 0;
       let hi = fan(b);
+      let found = -1;
       while (lo < hi) {
         const mid = (lo + hi) >>> 1;
         const at = idsAt + mid * idStride;
         let c = 0;
         for (let k = 0; k < 20 && c === 0; k++) c = (idx[at + k] as number) - (key[k] as number);
-        if (c === 0) return mid;
+        if (c === 0) {
+          found = mid;
+          break;
+        }
         if (c < 0) lo = mid + 1;
         else hi = mid;
       }
-      return -1;
+      lastId = id;
+      lastFound = found;
+      return found;
     },
   };
 }
@@ -956,11 +977,11 @@ export async function openPack(
    * Resolves the delta at `offset`: walk down to a base, patch upwards, cache checkpoints.
    * Iterative, and synchronous wherever the entries are in loaded windows.
    */
-  const resolve = async (
+  function* resolve(
     offset: number,
     visiting: ReadonlySet<ObjectId>,
     first?: LoadedEntry,
-  ): Promise<ResolvedObject> => {
+  ): Steps<ResolvedObject> {
     const chain: LoadedEntry[] = [];
     const seen = new Set<number>();
     let cur = offset;
@@ -976,13 +997,13 @@ export async function openPack(
         break;
       }
       let l = cur === offset && first ? first : loadEntry(cur);
-      if (l instanceof Promise) l = await l;
+      if (l instanceof Promise) l = (yield l) as LoadedEntry;
       const e = l.e;
       const type = TYPES[e.kind];
       if (type) {
         const data =
           (l.data && inflateLoaded(l as LoadedEntry & { data: Uint8Array })) ||
-          (l.data ? await reinflate(l) : await inflateAll(e));
+          ((yield l.data ? reinflate(l) : inflateAll(e)) as Uint8Array);
         base = { type, data };
         if (chain.length) cachePut(cur, base);
         break;
@@ -1000,7 +1021,9 @@ export async function openPack(
       }
       if (visiting.has(baseId))
         throw new PackError(`${packPath}: REF_DELTA cycle through ${baseId}`);
-      base = await options.externalBase?.(baseId, new Set([...visiting, baseId]));
+      base = (yield Promise.resolve(
+        options.externalBase?.(baseId, new Set([...visiting, baseId])),
+      )) as ResolvedObject | undefined;
       if (!base) throw new PackError(`${packPath}: REF_DELTA base ${baseId} not found`);
       if (base.data.length > maxObjectSize)
         throw new PackError(
@@ -1028,7 +1051,7 @@ export async function openPack(
       const l = chain[k] as LoadedEntry;
       const keep = k === 0 || (chain.length - k) % stride === 0;
       let d = inflateDelta(l);
-      if (d instanceof Promise) d = await d;
+      if (d instanceof Promise) d = (yield d) as Uint8Array;
       try {
         // the result's declared size is checked before it is allocated
         data = applyGitDelta(data, d, maxObjectSize, keep ? own : intoScratch);
@@ -1040,7 +1063,7 @@ export async function openPack(
       if (keep) cachePut(l.e.offset, { type: base.type, data });
     }
     return { type: base.type, data };
-  };
+  }
 
   async function* verified(
     id: ObjectId,
@@ -1091,6 +1114,52 @@ export async function openPack(
     }
     return crc.getValue();
   };
+
+  /** `get`, synchronous while every entry it reads is in a loaded window or the cache. */
+  function* getSteps(id: ObjectId, o?: PackGetOptions): Steps<GitObject | undefined> {
+    const i = t.find(id);
+    if (i < 0) return undefined;
+    const offset = t.offsetOf(i);
+    const verify = o?.verify === true;
+    const hit = cacheGet(offset);
+    if (hit) {
+      // never hand out the cached buffer
+      return whole(id, hit.type, copyOf(hit.data), verify);
+    }
+    let l = loadEntry(offset);
+    if (l instanceof Promise) l = (yield l) as LoadedEntry;
+    const type = TYPES[l.e.kind];
+    if (!type) {
+      const r = yield* resolve(offset, new Set([...(o?.visiting ?? []), id]), l);
+      // the result may be cached: copy it
+      return whole(id, r.type, copyOf(r.data), verify);
+    }
+    let data: Uint8Array | undefined;
+    for (;;) {
+      const e = l.e;
+      if (!l.data || e.size > WHOLE_MAX) {
+        // large whole objects stream, never materialised
+        const content = inflate(e);
+        return {
+          type,
+          size: e.size,
+          content: verify ? verified(id, type, e.size, content) : content,
+        };
+      }
+      try {
+        data = inflateLoaded(l as LoadedEntry & { data: Uint8Array }, allocBytes(e.size));
+      } catch (err) {
+        // as the streamed read: a broken stream fails the content, not the lookup
+        if (!(err instanceof PackError)) throw err;
+        return { type, size: e.size, content: failing(err) };
+      }
+      if (data) break;
+      // read open, its stream ran past the window: again, with its extent
+      const x = reload(l);
+      l = x instanceof Promise ? ((yield x) as LoadedEntry) : x;
+    }
+    return whole(id, type, data, verify);
+  }
 
   /** A whole object in memory: `bytes`, unless the read is verified (the stream's end checks). */
   const whole = (
@@ -1178,49 +1247,7 @@ export async function openPack(
         },
       };
     },
-    async get(id, o) {
-      const i = t.find(id);
-      if (i < 0) return undefined;
-      const offset = t.offsetOf(i);
-      const verify = o?.verify === true;
-      const hit = cacheGet(offset);
-      if (hit) {
-        // never hand out the cached buffer
-        return whole(id, hit.type, copyOf(hit.data), verify);
-      }
-      let l = loadEntry(offset);
-      if (l instanceof Promise) l = await l;
-      const type = TYPES[l.e.kind];
-      if (!type) {
-        const r = await resolve(offset, new Set([...(o?.visiting ?? []), id]), l);
-        // the result may be cached: copy it
-        return whole(id, r.type, copyOf(r.data), verify);
-      }
-      let data: Uint8Array | undefined;
-      for (;;) {
-        const e = l.e;
-        if (!l.data || e.size > WHOLE_MAX) {
-          // large whole objects stream, never materialised
-          const content = inflate(e);
-          return {
-            type,
-            size: e.size,
-            content: verify ? verified(id, type, e.size, content) : content,
-          };
-        }
-        try {
-          data = inflateLoaded(l as LoadedEntry & { data: Uint8Array }, allocBytes(e.size));
-        } catch (err) {
-          // as the streamed read: a broken stream fails the content, not the lookup
-          if (!(err instanceof PackError)) throw err;
-          return { type, size: e.size, content: failing(err) };
-        }
-        if (data) break;
-        // read open, its stream ran past the window: again, with its extent
-        const x = reload(l);
-        l = x instanceof Promise ? await x : x;
-      }
-      return whole(id, type, data, verify);
-    },
+    get: (id, o) => runStepsAsync(getSteps(id, o)),
+    getNow: (id, o) => runSteps(getSteps(id, o)),
   };
 }

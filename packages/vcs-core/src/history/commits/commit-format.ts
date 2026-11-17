@@ -126,7 +126,14 @@ function decodeText(data: Uint8Array): string {
  */
 export function commitFromBytes(data: Uint8Array): Commit {
   const text = decodeText(data);
-  const builder = new CommitBuilder();
+  // the fields as `CommitBuilder` collects them (a repeated header: the last one)
+  let tree: string | undefined;
+  const parents: string[] = [];
+  let author: Commit["author"] | undefined;
+  let committer: Commit["committer"] | undefined;
+  let encoding: string | undefined;
+  let gpgSignature: string | undefined;
+  let message = "";
   let gpg: string[] | undefined;
   let at = 0;
   let messageAt = -1;
@@ -142,7 +149,7 @@ export function commitFromBytes(data: Uint8Array): Commit {
         at = next;
         continue;
       }
-      builder.add({ type: "gpgsig", value: gpg.join("\n") });
+      gpgSignature = gpg.join("\n");
       gpg = undefined;
     }
     if (stop === at) {
@@ -152,34 +159,45 @@ export function commitFromBytes(data: Uint8Array): Commit {
     }
     const space = text.indexOf(" ", at);
     if (space >= 0 && space < stop) {
-      const key = text.slice(at, space);
-      const value = text.slice(space + 1, stop);
-      switch (key) {
-        case "tree":
-          builder.add({ type: "tree", value });
+      // the key, by its length and first letter before comparing it
+      const keyLength = space - at;
+      const from = space + 1;
+      switch (text.charCodeAt(at)) {
+        case 116: // t
+          if (keyLength === 4 && text.startsWith("tree", at)) tree = text.slice(from, stop);
           break;
-        case "parent":
-          builder.add({ type: "parent", value });
+        case 112: // p
+          if (keyLength === 6 && text.startsWith("parent", at))
+            parents.push(text.slice(from, stop));
           break;
-        case "author":
-          builder.add({ type: "author", value: parsePersonIdent(value) });
+        case 97: // a
+          if (keyLength === 6 && text.startsWith("author", at))
+            author = parsePersonIdent(text.slice(from, stop));
           break;
-        case "committer":
-          builder.add({ type: "committer", value: parsePersonIdent(value) });
+        case 99: // c
+          if (keyLength === 9 && text.startsWith("committer", at))
+            committer = parsePersonIdent(text.slice(from, stop));
           break;
-        case "encoding":
-          builder.add({ type: "encoding", value });
+        case 101: // e
+          if (keyLength === 8 && text.startsWith("encoding", at)) encoding = text.slice(from, stop);
           break;
-        case "gpgsig":
-          gpg = [value];
+        case 103: // g
+          if (keyLength === 6 && text.startsWith("gpgsig", at)) gpg = [text.slice(from, stop)];
           break;
       }
     }
     at = next;
   }
-  if (gpg) builder.add({ type: "gpgsig", value: gpg.join("\n") });
-  if (messageAt >= 0) builder.add({ type: "message", value: text.slice(messageAt) });
-  return builder.build();
+  if (gpg) gpgSignature = gpg.join("\n");
+  if (messageAt >= 0) message = text.slice(messageAt);
+  // as `CommitBuilder.build`
+  if (!tree) throw new Error("Invalid commit: missing tree");
+  if (!author) throw new Error("Invalid commit: missing author");
+  if (!committer) throw new Error("Invalid commit: missing committer");
+  const commit: Commit = { tree, parents, author, committer, message };
+  if (encoding) commit.encoding = encoding;
+  if (gpgSignature) commit.gpgSignature = gpgSignature;
+  return commit;
 }
 
 /** The line-by-line state of commit decoding (lines with their "\n"). */
