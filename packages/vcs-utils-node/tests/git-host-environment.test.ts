@@ -51,4 +51,25 @@ describe("createNodeGitHostEnvironment", () => {
     const bytes = await env.readFile("package.json");
     expect(new TextDecoder().decode(bytes)).toContain("@statewalker/vcs-utils-node");
   });
+
+  it("carries git's author and committer variables and $EMAIL", () => {
+    const env = createNodeGitHostEnvironment({
+      env: {
+        GIT_AUTHOR_NAME: "A",
+        GIT_AUTHOR_EMAIL: "a@example.com",
+        GIT_AUTHOR_DATE: "@1700000000 +0100",
+        GIT_COMMITTER_NAME: "C",
+        EMAIL: "me@example.com",
+      },
+    });
+    expect(env.author).toEqual({ name: "A", email: "a@example.com", date: "@1700000000 +0100" });
+    expect(env.committer).toEqual({ name: "C" });
+    expect(env.defaultEmail).toBe("me@example.com");
+    const none = createNodeGitHostEnvironment({ env: {} });
+    expect([none.author, none.committer, none.defaultEmail]).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
 });

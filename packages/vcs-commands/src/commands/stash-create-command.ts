@@ -8,20 +8,6 @@ import { STASH_REF } from "./stash-list-command.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
 
 /**
- * Get timezone offset string in Git format (+HHMM or -HHMM).
- */
-function getTimezoneOffset(): string {
-  const offset = new Date().getTimezoneOffset();
-  const sign = offset <= 0 ? "+" : "-";
-  const absOffset = Math.abs(offset);
-  const hours = Math.floor(absOffset / 60)
-    .toString()
-    .padStart(2, "0");
-  const minutes = (absOffset % 60).toString().padStart(2, "0");
-  return `${sign}${hours}${minutes}`;
-}
-
-/**
  * Default message format for index commit.
  */
 const MSG_INDEX = "index on {0}: {1} {2}";
@@ -223,7 +209,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   }
 
   /**
-   * Set the author/committer identity for the stash commits.
+   * Set the author/committer identity for the stash commits (default: each resolved as git
+   * resolves it).
    *
    * @param author The author identity
    */
@@ -259,13 +246,11 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     }
     const branch = await this.getCurrentBranchName();
 
-    // Get author/committer
-    const author: PersonIdent = this.author ?? {
-      name: "Unknown",
-      email: "unknown@example.com",
-      timestamp: Math.floor(Date.now() / 1000),
-      tzOffset: getTimezoneOffset(),
-    };
+    // git's stash commits (commit_tree without an author): the author and the committer as
+    // git resolves them (GIT_AUTHOR_* / GIT_COMMITTER_*, author.* / committer.*, user.*),
+    // unless one identity is given for both
+    const author: PersonIdent = this.author ?? this.resolveAuthor();
+    const committer: PersonIdent = this.author ?? this.resolveCommitter(author);
 
     // Determine trees to stash
     const provider = this.workingTreeProvider ?? this.defaultProvider();
@@ -309,7 +294,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       tree: indexTree,
       parents: [headRef.objectId],
       author,
-      committer: author,
+      committer,
       message: indexMsg,
     });
 
@@ -321,7 +306,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
         tree: untrackedTree,
         parents: [],
         author,
-        committer: author,
+        committer,
         message: untrackedMsg,
       });
     }
@@ -337,7 +322,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       tree: workingTree,
       parents,
       author,
-      committer: author,
+      committer,
       message: workingMsg,
     });
 

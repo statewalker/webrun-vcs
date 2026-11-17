@@ -23,6 +23,14 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import { worktreeModeTrust } from "./commands/core-config.js";
+import {
+  authorIdentOf,
+  committerIdentOf,
+  hostEnvironmentOf,
+  type IdentRole,
+  resolveIdentDate,
+  withoutCrud,
+} from "./commands/git-ident.js";
 import { reflogLine } from "./commands/reflog-messages.js";
 
 import { NoHeadError, RefNotFoundError } from "./errors/index.js";
@@ -199,10 +207,54 @@ export abstract class GitCommand<T> {
    * command first asked for a line.
    */
   protected reflogLine(message: string, who?: PersonIdent): RefLogOptions {
-    // the clock is read once per command: a rebase's finish logs the branch and HEAD at
-    // one time, as git's process reads its default date once
+    return reflogLine(this._workingCopy, message, who, this.clock());
+  }
+
+  /**
+   * The clock of this command's identities and reflog lines, in seconds: read once per
+   * command (a rebase's finish logs the branch and HEAD at one time, as git's process reads
+   * its default date once), and again where git resets it ({@link resetClock}).
+   */
+  protected clock(): number {
     this.reflogClock ??= Math.floor(Date.now() / 1000);
-    return reflogLine(this._workingCopy, message, who, this.reflogClock);
+    return this.reflogClock;
+  }
+
+  /**
+   * git's `reset_ident_date()`: the clock read again, for the commit about to be made and
+   * the lines after it (the sequencer does this before each pick).
+   */
+  protected resetClock(): number {
+    this.reflogClock = Math.floor(Date.now() / 1000);
+    return this.reflogClock;
+  }
+
+  /**
+   * The committer of a commit (or tagger of a tag) this command makes, as git resolves it
+   * (`resolveCommitterIdent`): `GIT_COMMITTER_*`, `committer.*`, `user.*`, the clock;
+   * `fallback`'s name and email (an identity given explicitly) where git would guess them;
+   * never `fallback`'s date.
+   */
+  protected resolveCommitter(fallback?: Pick<PersonIdent, "name" | "email">): PersonIdent {
+    return committerIdentOf(this._workingCopy, { now: this.clock(), fallback });
+  }
+
+  /**
+   * The author of a commit this command makes, as git resolves it (`resolveAuthorIdent`):
+   * `GIT_AUTHOR_*`, `author.*`, `user.*`, the clock; `fallback`'s name and email where git
+   * would guess them.
+   */
+  protected resolveAuthor(fallback?: Pick<PersonIdent, "name" | "email">): PersonIdent {
+    return authorIdentOf(this._workingCopy, { now: this.clock(), fallback });
+  }
+
+  /**
+   * An identity named explicitly (`--author=<who>`), dated as git dates `role` now; its
+   * name and email without crud, as git writes them.
+   */
+  protected datedIdent(role: IdentRole, who: { name: string; email: string }): PersonIdent {
+    const date = resolveIdentDate(role, hostEnvironmentOf(this._workingCopy), this.clock());
+    return { name: withoutCrud(who.name), email: withoutCrud(who.email), ...date };
   }
 
   // ============ Store Accessors ============

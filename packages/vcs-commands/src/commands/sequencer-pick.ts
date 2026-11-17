@@ -17,13 +17,13 @@ import {
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import type { CommandCommits, CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool } from "./core-config.js";
+import { authorIdentOf, committerIdentOf } from "./git-ident.js";
 import { UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
   abbrev,
   conflictsComment,
-  defaultIdent,
   FlatTreeCache,
   indexChangesFromTree,
   type MergeWriteContext,
@@ -87,7 +87,10 @@ export interface PickOptions {
   favor?: "ours" | "theirs" | "union";
   /** The label of HEAD in conflict markers (default `HEAD`) */
   oursLabel?: string;
-  /** The committer (and a revert's author); default `Unknown` now */
+  /**
+   * The committer (default: resolved as git resolves it, `GIT_COMMITTER_*`, `committer.*`,
+   * `user.*`); also a revert's author when nobody is configured
+   */
   committer?: PersonIdent;
   /** The action of the picks' reflog lines (default `cherry-pick` / `revert`) */
   reflogAction?: string;
@@ -106,6 +109,8 @@ interface TodoItem {
 export class PickSequencer {
   /** The flat trees the picks read (each pick's result is the next one's HEAD) */
   private readonly flats: FlatTreeCache;
+  /** The clock of this run's identities and reflog lines, read again for each commit */
+  private clock?: number;
 
   constructor(
     private readonly deps: SequencerDeps,
@@ -321,12 +326,12 @@ export class PickSequencer {
         ].join("\n"),
       };
     }
-    const committer = this.options.committer ?? defaultIdent();
+    const committer = this.committer();
     const commitMessage = action === "pick" ? commit.message : message;
     const newHead = await this.commit(
       treeId,
       [headId],
-      action === "pick" ? commit.author : committer,
+      action === "pick" ? commit.author : this.revertAuthor(committer),
       committer,
       commitMessage,
       // the sequencer's update_head_with_reflog: "cherry-pick: <subject>", "revert: ..."
@@ -360,13 +365,13 @@ export class PickSequencer {
           `The previous ${ACTION_NAME[action]} is now empty, possibly due to conflict resolution.`,
         );
       }
-      const committer = this.options.committer ?? defaultIdent();
+      const committer = this.committer();
       const fallback = this.messageFor(action, stopped, commit, commit.parents[0]);
       const message = cleanupMessage((await state.read("MERGE_MSG")) ?? fallback);
       newHead = await this.commit(
         treeId,
         [newHead],
-        action === "pick" ? commit.author : committer,
+        action === "pick" ? commit.author : this.revertAuthor(committer),
         committer,
         message,
         // `--continue` commits as `git commit` does: "commit (cherry-pick): <subject>" (a
@@ -475,6 +480,25 @@ export class PickSequencer {
     return `Revert "${subject}"\n\n${reverting}\n`;
   }
 
+  /**
+   * The committer of the commit a pick is about to make: the one given, else resolved as
+   * git's `git_committer_info`. The clock is read again first, as git's `try_to_commit`
+   * calls `reset_ident_date()` before each commit; the pick's reflog line keeps that time.
+   */
+  private committer(): PersonIdent {
+    this.clock = Math.floor(Date.now() / 1000);
+    return this.options.committer ?? committerIdentOf(this.deps.workingCopy, { now: this.clock });
+  }
+
+  /**
+   * A revert's author: resolved as git's `git_author_info` (`GIT_AUTHOR_*`, `author.*`,
+   * `user.*`), the committer's name when nobody is configured. (A pick keeps its author.)
+   */
+  private revertAuthor(committer: PersonIdent): PersonIdent {
+    this.clock ??= Math.floor(Date.now() / 1000);
+    return authorIdentOf(this.deps.workingCopy, { now: this.clock, fallback: committer });
+  }
+
   private async commit(
     tree: ObjectId,
     parents: ObjectId[],
@@ -490,10 +514,11 @@ export class PickSequencer {
 
   /** HEAD (its branch, when attached) moved to `id`, with `message` in the reflogs. */
   private async moveHead(id: ObjectId, message: string): Promise<void> {
+    this.clock ??= Math.floor(Date.now() / 1000);
     await updateHead(
       this.deps.refs,
       id,
-      reflogLine(this.deps.workingCopy, message, this.options.committer),
+      reflogLine(this.deps.workingCopy, message, this.options.committer, this.clock),
     );
   }
 

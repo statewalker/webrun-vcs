@@ -58,10 +58,32 @@ export interface GitStashStoreOptions {
   getHead: () => Promise<ObjectId | undefined>;
   /** Function to get current branch name */
   getBranch: () => Promise<string | undefined>;
-  /** Identity of stash commits and reflog lines (the time is taken at each push) */
+  /**
+   * The author and committer of each push's commits, asked at each push; the committer is
+   * also the identity of its reflog line. vcs-commands' `stashCreate()` resolves them as
+   * git does (`GIT_*`, `author.*` / `committer.*`, `user.*`); this store cannot, so a caller
+   * that wants git's identities passes them here. Default: {@link author}, else
+   * {@link DEFAULT_STASH_IDENT}, dated now in the local offset.
+   */
+  identity?: (role: "author" | "committer") => PersonIdent;
+  /** One identity of stash commits and reflog lines (the time is taken at each push) */
   author?: Omit<PersonIdent, "timestamp">;
   /** `core.filemode` / `core.symlinks`; defaults to what the worktree can represent */
   trust?: WorktreeModeTrust;
+}
+
+/**
+ * The identity of the stashes nobody gave an identity for: the one vcs-commands and the ref
+ * stores use when nobody is configured.
+ */
+export const DEFAULT_STASH_IDENT = { name: "webrun-vcs", email: "vcs@localhost" } as const;
+
+/** The local timezone offset at `seconds` as git writes it (`+HHMM`). */
+function localOffset(seconds: number): string {
+  const minutes = -new Date(seconds * 1000).getTimezoneOffset();
+  const abs = Math.abs(minutes);
+  const hhmm = `${String(Math.floor(abs / 60)).padStart(2, "0")}${String(abs % 60).padStart(2, "0")}`;
+  return `${minutes < 0 ? "-" : "+"}${hhmm}`;
 }
 
 /**
@@ -73,7 +95,8 @@ export class GitStashStore implements StashStore {
   private readonly worktree: Worktree;
   private readonly getHead: () => Promise<ObjectId | undefined>;
   private readonly getBranch: () => Promise<string | undefined>;
-  private readonly defaultAuthor: Omit<PersonIdent, "timestamp">;
+  private readonly defaultAuthor?: Omit<PersonIdent, "timestamp">;
+  private readonly identity?: (role: "author" | "committer") => PersonIdent;
   private readonly trust?: WorktreeModeTrust;
 
   constructor(options: GitStashStoreOptions) {
@@ -83,11 +106,8 @@ export class GitStashStore implements StashStore {
     this.getHead = options.getHead;
     this.getBranch = options.getBranch;
     this.trust = options.trust;
-    this.defaultAuthor = options.author ?? {
-      name: "Git Stash",
-      email: "stash@localhost",
-      tzOffset: "+0000",
-    };
+    this.defaultAuthor = options.author;
+    this.identity = options.identity;
   }
 
   private get refs(): Refs {
@@ -129,10 +149,7 @@ export class GitStashStore implements StashStore {
     }
 
     const branch = (await this.getBranch()) ?? "(no branch)";
-    const author: PersonIdent = {
-      ...this.defaultAuthor,
-      timestamp: Math.floor(Date.now() / 1000),
-    };
+    const { author, committer } = this.identities();
     const headCommit = await this.history.commits.load(head).catch(() => undefined);
     const subject = headCommit?.message.split("\n")[0] ?? "";
     const onHead = `${branch}: ${head.slice(0, 7)} ${subject}`;
@@ -144,7 +161,7 @@ export class GitStashStore implements StashStore {
       tree: indexTree,
       parents: [head],
       author,
-      committer: author,
+      committer,
       message: `index on ${onHead}\n`,
     });
 
@@ -161,7 +178,7 @@ export class GitStashStore implements StashStore {
           tree: untracked.treeId,
           parents: [],
           author,
-          committer: author,
+          committer,
           message: `untracked files on ${onHead}\n`,
         }),
       );
@@ -174,14 +191,14 @@ export class GitStashStore implements StashStore {
       tree: worktreeTree,
       parents,
       author,
-      committer: author,
+      committer,
       message: `${stashMessage}\n`,
     });
 
     // 5. refs/stash and its reflog line, under refs/stash.lock (git's update_ref with
     //    REF_FORCE_CREATE_REFLOG and no old-value check)
     const result = await this.refs.batch([{ name: STASH_REF, new: stashCommitId }], {
-      ident: formatPersonIdent(author),
+      ident: formatPersonIdent(committer),
       message: stashMessage,
       createReflog: true,
     });
@@ -189,6 +206,18 @@ export class GitStashStore implements StashStore {
     if (!result.ok) throw new RefUpdateRejectedError(result.rejected);
 
     return stashCommitId;
+  }
+
+  /** The author and committer of a push now (see {@link GitStashStoreOptions.identity}). */
+  private identities(): { author: PersonIdent; committer: PersonIdent } {
+    if (this.identity) {
+      return { author: this.identity("author"), committer: this.identity("committer") };
+    }
+    const timestamp = Math.floor(Date.now() / 1000);
+    const who: PersonIdent = this.defaultAuthor
+      ? { ...this.defaultAuthor, timestamp }
+      : { ...DEFAULT_STASH_IDENT, timestamp, tzOffset: localOffset(timestamp) };
+    return { author: who, committer: who };
   }
 
   /** The source the stash trees are built from (shared with `git.stashCreate()`). */

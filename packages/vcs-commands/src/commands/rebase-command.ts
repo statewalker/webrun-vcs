@@ -23,13 +23,13 @@ import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-resul
 import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { localTimezoneOffset } from "./git-ident.js";
 import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
   abbrev,
   conflictsComment,
-  defaultIdent,
   FlatTreeCache,
   flatTree,
   indexChanges,
@@ -131,6 +131,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private preserveMerges = false;
   private interactiveHandler?: InteractiveHandler;
   private committer?: PersonIdent;
+  /** `--committer-date-is-author-date` (kept in `rebase-merge/cdate_is_adate`) */
+  private committerDateIsAuthorDate = false;
+  /** `--ignore-date` / `--reset-author-date` (kept in `rebase-merge/ignore_date`) */
+  private ignoreDate = false;
   private autoStash?: boolean;
   private reapplyCherryPicks = false;
   /** The commits read by the walks that make the todo list */
@@ -292,10 +296,35 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     return this;
   }
 
-  /** The committer of the rebased commits (default `Unknown`, now). */
+  /**
+   * The committer of the rebased commits (default: resolved as git resolves it,
+   * `GIT_COMMITTER_*`, `committer.*`, `user.*`). The picks keep their authors.
+   */
   setCommitter(committer: PersonIdent): this {
     this.checkCallable();
     this.committer = committer;
+    return this;
+  }
+
+  /**
+   * `--committer-date-is-author-date`: each rebased commit's committer date is its author
+   * date. Like git, it implies `--force-rebase`: a branch already on its upstream is
+   * rebased all the same.
+   */
+  setCommitterDateIsAuthorDate(value: boolean): this {
+    this.checkCallable();
+    this.committerDateIsAuthorDate = value;
+    return this;
+  }
+
+  /**
+   * `--ignore-date` (`--reset-author-date`): each rebased commit's author date is the
+   * current time (git's `ignore_author_date`: the clock, not `GIT_AUTHOR_DATE`). Implies
+   * `--force-rebase`, as in git.
+   */
+  setIgnoreDate(value: boolean): this {
+    this.checkCallable();
+    this.ignoreDate = value;
     return this;
   }
 
@@ -386,8 +415,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
     };
 
-    // HEAD already contains upstream: nothing to do
-    if (await this.isAncestor(onto, headId)) {
+    // HEAD already contains upstream: nothing to do (unless forced, as the date options do)
+    const forced = this.committerDateIsAuthorDate || this.ignoreDate;
+    if (!forced && (await this.isAncestor(onto, headId))) {
       const branch = headName.replace(/^refs\/heads\//, "");
       output.push(`Current branch ${branch} is up to date.`);
       await unstash();
@@ -479,6 +509,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/interactive`, "");
     await state.write(`${DIR}/drop_redundant_commits`, "");
     await state.write(`${DIR}/no-reschedule-failed-exec`, "");
+    if (this.committerDateIsAuthorDate) await state.write(`${DIR}/cdate_is_adate`, "");
+    if (this.ignoreDate) await state.write(`${DIR}/ignore_date`, "");
     await state.write(`${DIR}/end`, `${todo.length}\n`);
     await state.write(`${DIR}/msgnum`, "0\n");
     await state.write(`${DIR}/done`, "");
@@ -641,7 +673,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (item.action === RebaseAction.REWORD && this.interactiveHandler) {
       message = this.interactiveHandler.modifyCommitMessage(message);
     }
-    const newId = await this.commitOnto(headId, treeId, commit.author, message, item.action);
+    const newId = await this.commitOnto(state, headId, treeId, commit.author, message, item.action);
     await this.rewritten(state, item.id, newId);
     if (item.action === RebaseAction.EDIT) {
       return { status: RebaseStatus.EDIT, newHead: newId, currentCommit: item.id };
@@ -699,13 +731,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         const author =
           parseAuthorScript((await state.read(`${DIR}/author-script`)) ?? "") ??
           commit?.author ??
-          defaultIdent();
+          this.resolveAuthor();
         const text =
           (await state.read("MERGE_MSG")) ??
           (await state.read(`${DIR}/message`)) ??
           commit?.message ??
           "";
         const newId = await this.commitOnto(
+          state,
           headId,
           treeId,
           author,
@@ -829,13 +862,28 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
 
   /** A commit made on the detached HEAD, logged `rebase (<step>): <subject>`. */
   private async commitOnto(
+    state: OperationState,
     parent: ObjectId,
     tree: ObjectId,
-    author: PersonIdent,
+    picked: PersonIdent,
     message: string,
     step: string,
   ): Promise<ObjectId> {
-    const committer = this.committer ?? defaultIdent();
+    // git's try_to_commit: reset_ident_date() first, so each pick is committed (and its
+    // reflog line written) at its own time
+    this.resetClock();
+    // the pick keeps its author; the committer is resolved as git's git_committer_info
+    let author = picked;
+    let committer = this.committer ?? this.resolveCommitter();
+    // git's try_to_commit: --ignore-date dates the author now (the clock, local offset),
+    // --committer-date-is-author-date gives the committer the author's date
+    if (await state.exists(`${DIR}/ignore_date`)) {
+      const now = this.clock();
+      author = { ...author, timestamp: now, tzOffset: localTimezoneOffset(now) };
+    }
+    if (await state.exists(`${DIR}/cdate_is_adate`)) {
+      committer = { ...committer, timestamp: author.timestamp, tzOffset: author.tzOffset };
+    }
     const id = await this.commits.store({ tree, parents: [parent], author, committer, message });
     const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
     await this.refsStore.set(

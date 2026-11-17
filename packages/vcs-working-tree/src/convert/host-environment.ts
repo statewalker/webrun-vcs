@@ -27,9 +27,22 @@ export interface GitHostEnvironment {
    * git's committer variables (`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`,
    * `GIT_COMMITTER_DATE`), as `git_committer_info` reads them ahead of `user.name`,
    * `user.email` and the clock: the identity and time of the reflog lines commands write.
-   * `date` in git's raw form (`1700000000 +0000`, also `@1700000000 +0000`).
+   * Also the committer of the commits commands make and the tagger of their tags. `date`
+   * in any form git's `parse_date` reads (`1700000000 +0000`, `@1700000000`, RFC 2822,
+   * ISO 8601).
    */
   committer?: { name?: string; email?: string; date?: string };
+  /**
+   * git's author variables (`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`), as
+   * `git_author_info` reads them ahead of `author.*`, `user.*` and the clock: the author of
+   * the commits commands make. `date` in any form git's `parse_date` reads.
+   */
+  author?: { name?: string; email?: string; date?: string };
+  /**
+   * `$EMAIL`: the email of an identity configured nowhere else (git's `ident_default_email`,
+   * read after `user.email`). git then guesses `user@host`; a portable host does not.
+   */
+  defaultEmail?: string;
 }
 
 const join = (dir: string, name: string) =>

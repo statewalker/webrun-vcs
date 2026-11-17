@@ -18,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MergeOperation, RebaseOperation, SequencerOperation } from "../src/index.js";
 import {
   git,
+  INTEROP_AUTHOR_ENV,
   INTEROP_IDENT,
   normalizeState,
   openOurs,
@@ -401,7 +402,8 @@ describeGit("dirty fuzz against native git", () => {
         : git(root, native, "cherry-pick", "side");
       if (process.env.DEBUG) console.log("NATIVE", nr.status, nr.stdout, nr.stderr);
       try {
-        const g = await openOurs(ours);
+        // a revert's author resolved as native git's (GIT_AUTHOR_*)
+        const g = await openOurs(ours, INTEROP_AUTHOR_ENV);
         const rr = revert
           ? await g.revert().include("HEAD").setCommitter(INTEROP_IDENT).call()
           : await g.cherryPick().include("side").setCommitter(INTEROP_IDENT).call();

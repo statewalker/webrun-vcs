@@ -156,7 +156,10 @@ export class RevertCommand extends GitCommand<RevertResult> {
     return this;
   }
 
-  /** The author and committer of the commits made (default `Unknown`, now). */
+  /**
+   * The committer of the commits made, and their author when nobody is configured (default:
+   * both resolved as git resolves them).
+   */
   setCommitter(committer: PersonIdent): this {
     this.checkCallable();
     this.committer = committer;
