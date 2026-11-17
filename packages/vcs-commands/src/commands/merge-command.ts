@@ -17,7 +17,7 @@ import {
   NoMergeBaseError,
   NotFastForwardError,
 } from "../errors/merge-errors.js";
-import { NoHeadError, RefNotFoundError } from "../errors/ref-errors.js";
+import { NoHeadError, NotACommitError, RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
 import {
   ContentMergeStrategy,
@@ -245,6 +245,20 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
+   * Add a paragraph to the message, as each further `-m` of `git merge` does: joined to
+   * the message so far by a blank line (`-m a -m b` is `"a\n\nb"` before its cleanup).
+   * The first call is {@link setMessage}.
+   *
+   * @param message One paragraph of the merge commit message
+   */
+  addMessage(message: string): this {
+    this.checkCallable();
+    // git's option_parse_message: "\n\n" before the next -m only after a non-empty one
+    this.message = !this.message ? message : `${this.message}\n\n${message}`;
+    return this;
+  }
+
+  /**
    * How the merge commit's message is cleaned up (git's `merge --cleanup=<mode>`; default
    * `commit.cleanup`, else `whitespace`, as without an editor).
    */
@@ -377,12 +391,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
 
     // Resolve merge source
     let srcRef = this.includes[0];
-    let srcId = await this.resolveRef(srcRef);
+    let srcId = await this.mergeHeadOf(srcRef);
     if (this.includes.length > 1) {
       // several heads: the independent ones besides HEAD (git's reduce_heads); two or more
       // are an octopus, one a merge of that head
       const named: { id: ObjectId; name: string }[] = [];
-      for (const name of this.includes) named.push({ id: await this.resolveRef(name), name });
+      for (const name of this.includes) named.push({ id: await this.mergeHeadOf(name), name });
       const candidates = [{ id: headId, name: "HEAD" }, ...named].filter(
         (c, k, all) => all.findIndex((x) => x.id === c.id) === k,
       );
@@ -714,8 +728,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
         await state.write("MERGE_MSG", conflictsComment(paths, true));
         output.push("Squash commit -- not updating HEAD");
       } else {
-        const text = message.endsWith("\n") ? message : `${message}\n`;
-        await this.writeMergeState(state, srcId, `${text}${conflictsComment(paths, true)}`);
+        await this.writeMergeState(
+          state,
+          srcId,
+          `${this.stateMessage(message)}${conflictsComment(paths, true)}`,
+        );
       }
       output.push("Automatic merge failed; fix conflicts and then commit the result.");
       return {
@@ -741,7 +758,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     }
     if (!this.commit) {
-      await this.writeMergeState(state, srcId, message);
+      await this.writeMergeState(state, srcId, this.stateMessage(message));
       output.push("Automatic merge went well; stopped before committing as requested");
       return {
         status: MergeStatus.MERGED_NOT_COMMITTED,
@@ -755,7 +772,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const cleaned = this.cleanup(message);
     if (cleaned.length === 0) {
       // git's prepare_to_commit: abort_commit, the merge left for `git commit`
-      await this.writeMergeState(state, srcId, `${message}\n`);
+      await this.writeMergeState(state, srcId, this.stateMessage(message));
       return {
         status: MergeStatus.FAILED,
         newHead: headId,
@@ -871,8 +888,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
         await state.write("MERGE_MSG", conflictsComment(paths, true));
         output.push("Squash commit -- not updating HEAD");
       } else {
-        const text = message.endsWith("\n") ? message : `${message}\n`;
-        await writeState(`${text}${conflictsComment(paths, true)}`);
+        await writeState(`${this.stateMessage(message)}${conflictsComment(paths, true)}`);
       }
       output.push("Automatic merge failed; fix conflicts and then commit the result.");
       return {
@@ -893,7 +909,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       return { status: MergeStatus.MERGED_SQUASHED, newHead: headId, mergedCommits, output };
     }
     if (!this.commit) {
-      await writeState(message);
+      await writeState(this.stateMessage(message));
       output.push("Automatic merge went well; stopped before committing as requested");
       return { status: MergeStatus.MERGED_NOT_COMMITTED, newHead: headId, mergedCommits, output };
     }
@@ -904,7 +920,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const cleaned = this.cleanup(message);
     if (cleaned.length === 0) {
       // git's prepare_to_commit: abort_commit, the merge left for `git commit`
-      await writeState(`${message}\n`);
+      await writeState(this.stateMessage(message));
       return {
         status: MergeStatus.FAILED,
         newHead: headId,
@@ -1190,6 +1206,15 @@ export class MergeCommand extends GitCommand<MergeResult> {
     };
   }
 
+  /**
+   * MERGE_MSG's text before any conflicts hint (git's `write_merge_state`): the message as
+   * given with a newline added, always (`-m "x\n"` gives `x` and a blank line), or git's
+   * default message (already one line ended).
+   */
+  private stateMessage(message: string): string {
+    return this.message !== undefined ? `${this.message}\n` : message;
+  }
+
   /** MERGE_HEAD, MERGE_MSG and MERGE_MODE of a merge stopped before its commit. */
   private async writeMergeState(
     state: OperationState,
@@ -1274,6 +1299,26 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private async isAncestor(commitA: ObjectId, commitB: ObjectId): Promise<boolean> {
     // the store's walk (git's repo_in_merge_bases): commit-graph generations cut it short
     return this.commits.isAncestor(commitA, commitB);
+  }
+
+  /**
+   * The commit a head to merge names (git's `get_merge_parent`, `peel_to_type` commit): a
+   * tree or a blob is `error: <name>: expected commit type, but the object dereferences to
+   * tree type` and `merge: <name> - not something we can merge`.
+   */
+  private async mergeHeadOf(name: string): Promise<ObjectId> {
+    try {
+      return await this.resolveRef(name);
+    } catch (error) {
+      if (!(error instanceof NotACommitError)) throw error;
+      const lines = error.objectType
+        ? [
+            `error: ${name}: expected commit type, but the object dereferences to ${error.objectType} type`,
+          ]
+        : [];
+      lines.push(`merge: ${name} - not something we can merge`);
+      throw new NotACommitError(name, error.objectId, error.objectType, lines.join("\n"));
+    }
   }
 }
 

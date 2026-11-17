@@ -248,8 +248,8 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
   /** The commit `name` names (`lookup_commit_reference_by_name`), else undefined. */
   private async commitOf(name: string): Promise<ObjectId | undefined> {
     try {
-      const id = await this.resolveRef(name);
-      return (await this.commits.has(id)) ? id : undefined;
+      // a tree, a blob or a missing object is no commit either (git's "invalid reference")
+      return await this.resolveRef(name);
     } catch {
       return undefined;
     }

@@ -400,13 +400,13 @@ describeGit("octopus merges against native git", () => {
   it("a message given, committed and with conflicts", async () => {
     await compareOctopus(two(), ["a", "b"], {
       args: ["-m", "octopus by hand"],
-      // a message given is the commit's as it is (git adds the newline)
-      configure: (c) => c.setMessage("octopus by hand\n"),
+      // a message given is git's -m: cleaned up for the commit, a newline added in MERGE_MSG
+      configure: (c) => c.setMessage("octopus by hand"),
     });
     await compareOctopus(lastConflicts(), ["a", "b"], {
       args: ["-m", "octopus by hand"],
-      // a message given is the commit's as it is (git adds the newline)
-      configure: (c) => c.setMessage("octopus by hand\n"),
+      // a message given is git's -m: cleaned up for the commit, a newline added in MERGE_MSG
+      configure: (c) => c.setMessage("octopus by hand"),
     });
   });
 

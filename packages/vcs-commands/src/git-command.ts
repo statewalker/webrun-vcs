@@ -32,8 +32,9 @@ import {
   withoutCrud,
 } from "./commands/git-ident.js";
 import { reflogLine } from "./commands/reflog-messages.js";
+import { RevisionResolver } from "./commands/revision-resolver.js";
 
-import { NoHeadError, RefNotFoundError } from "./errors/index.js";
+import { NoHeadError, NotACommitError, RefNotFoundError } from "./errors/index.js";
 
 /**
  * Extended Trees interface with legacy method names for command compatibility.
@@ -428,55 +429,74 @@ export abstract class GitCommand<T> {
   }
 
   /**
-   * Resolve a ref name to its ObjectId.
-   *
-   * @param refName Ref name, commit ID, or commit-ish
-   * @returns ObjectId of the resolved ref
-   * @throws RefNotFoundError if ref cannot be resolved
+   * A resolver for git's revision syntax over this command's stores (see
+   * {@link RevisionResolver}); its `warnings` hold what git would print.
    */
-  protected async resolveRef(name: string): Promise<ObjectId> {
-    // git's interpret_nth_prior_checkout: `@{-N}` is the branch (or commit) left N
-    // checkouts ago
-    const refName = await this.expandPriorCheckout(name);
-    if (refName.startsWith("@{-")) throw new RefNotFoundError(name);
+  protected revisionResolver(): RevisionResolver {
+    return new RevisionResolver({
+      refs: this.refsStore,
+      commits: this.commits,
+      trees: this.trees,
+      blobs: this.blobs,
+      tags: this.tagsStore,
+      staging: () => this.staging,
+      workingCopy: this._workingCopy,
+    });
+  }
 
-    // Handle relative refs like HEAD~1, HEAD^
-    if (refName.includes("~") || refName.includes("^")) {
-      return this.resolveRelativeRef(refName);
-    }
+  /**
+   * The object a revision names, as git's `get_oid` finds it: refs by git's rules, object
+   * ids, `@`, `@{-N}`, `@{u}`, `@{push}`, `<ref>@{<n>}`, `<ref>@{<date>}`, `~`, `^`,
+   * `^{<type>}`, `^{/<regex>}`, `:/<regex>`, `<rev>:<path>`, `:<n>:<path>`. An annotated
+   * tag is returned as the tag object.
+   *
+   * @throws RefNotFoundError if it names nothing
+   * @throws RevisionError where git dies (no upstream, reflog too short)
+   */
+  protected async resolveRevision(name: string): Promise<ObjectId> {
+    const id = await this.revisionResolver().resolve(name);
+    if (id === undefined) throw new RefNotFoundError(name);
+    return id;
+  }
 
-    // Try as direct ref first
-    const ref = await this.refsStore.resolve(refName);
-    if (ref?.objectId) {
-      // Peel tag objects to commits
-      return this.peelToCommit(ref.objectId);
-    }
+  /**
+   * Resolve a revision (see {@link resolveRevision}) to a commit, as git's
+   * `lookup_commit_reference` does: tags are peeled, and a revision that ends at a tree, a
+   * blob or a missing object is refused with git's lines, `error: object <id> is a tree,
+   * not a commit` (not for a missing object) and `fatal` (by default reset's `fatal: Could
+   * not parse object '<name>'.`).
+   *
+   * @param name Ref name, commit ID, or any revision expression
+   * @param fatal The command's last line for a revision that names no commit
+   * @returns ObjectId of the resolved commit
+   * @throws RefNotFoundError if it cannot be resolved
+   * @throws NotACommitError if it names something else
+   * @throws RevisionError where git dies (no upstream, reflog too short)
+   */
+  protected async resolveRef(
+    name: string,
+    fatal: (name: string) => string = (n) => `fatal: Could not parse object '${n}'.`,
+  ): Promise<ObjectId> {
+    const id = await this.resolveRevision(name);
+    const peeled = await this.revisionResolver().peelTags(id);
+    if (peeled.type === "commit") return peeled.id;
+    const lines = peeled.type
+      ? [`error: object ${peeled.id} is a ${peeled.type}, not a commit`, fatal(name)]
+      : [fatal(name)];
+    throw new NotACommitError(name, peeled.id, peeled.type, lines.join("\n"));
+  }
 
-    // Try as branch name
-    const branchRef = await this.refsStore.resolve(`refs/heads/${refName}`);
-    if (branchRef?.objectId) {
-      return branchRef.objectId;
-    }
-
-    // Try as tag name
-    const tagRef = await this.refsStore.resolve(`refs/tags/${refName}`);
-    if (tagRef?.objectId) {
-      // Peel tag objects to commits
-      return this.peelToCommit(tagRef.objectId);
-    }
-
-    // Try as remote-tracking branch (git's dwim rules: refs/remotes/<name>, then its HEAD)
-    for (const candidate of [`refs/remotes/${refName}`, `refs/remotes/${refName}/HEAD`]) {
-      const remoteRef = await this.refsStore.resolve(candidate);
-      if (remoteRef?.objectId) return this.peelToCommit(remoteRef.objectId);
-    }
-
-    // Try as direct commit ID
-    if (await this.commits.has(refName)) {
-      return refName;
-    }
-
-    throw new RefNotFoundError(name);
+  /**
+   * git's `setup_branch_path` (`INTERPRET_BRANCH_LOCAL`): the local branch a name's branch
+   * syntax stands for (`loc@{u}` is `main` when loc tracks main with `remote = .`), else
+   * the name as given.
+   *
+   * @throws RevisionError where git dies reading it (`@{u}` without an upstream)
+   */
+  protected async interpretLocalBranch(name: string): Promise<string> {
+    if (!name.includes("@")) return name;
+    const value = await this.revisionResolver().interpretBranchName(name);
+    return value?.startsWith("refs/heads/") ? value.slice("refs/heads/".length) : name;
   }
 
   /**
@@ -507,80 +527,6 @@ export abstract class GitCommand<T> {
       if (--remaining === 0) return rest.slice(0, to) + name.slice(match[0].length);
     }
     return name;
-  }
-
-  /**
-   * Resolve a relative ref like HEAD~1 or HEAD^2.
-   */
-  private async resolveRelativeRef(ref: string): Promise<ObjectId> {
-    // Parse the ref
-    const match = ref.match(/^([^~^]+)((?:[~^]\d*)+)$/);
-    if (!match) {
-      throw new RefNotFoundError(ref);
-    }
-
-    const baseRef = match[1];
-    const modifiers = match[2];
-
-    let commitId = await this.resolveRef(baseRef);
-
-    // Process each modifier
-    const modifierMatch = modifiers.matchAll(/([~^])(\d*)/g);
-    for (const m of modifierMatch) {
-      const type = m[1];
-      const count = m[2] ? parseInt(m[2], 10) : 1;
-
-      if (type === "~") {
-        // ~N means follow first parent N times
-        for (let i = 0; i < count; i++) {
-          const commit = await this.commits.load(commitId);
-          if (!commit || commit.parents.length === 0) {
-            throw new RefNotFoundError(ref, `Cannot resolve ${ref}: no parent`);
-          }
-          commitId = commit.parents[0];
-        }
-      } else if (type === "^") {
-        // ^N means follow Nth parent
-        const commit = await this.commits.load(commitId);
-        if (!commit) {
-          throw new RefNotFoundError(ref, `Cannot resolve ${ref}: commit not found`);
-        }
-        const parentIndex = count > 0 ? count - 1 : 0;
-        if (commit.parents.length <= parentIndex) {
-          throw new RefNotFoundError(ref, `Cannot resolve ${ref}: no parent ${count}`);
-        }
-        commitId = commit.parents[parentIndex];
-      }
-    }
-
-    return commitId;
-  }
-
-  /**
-   * Peel an object ID to a commit (follows tag objects).
-   */
-  private async peelToCommit(objectId: ObjectId): Promise<ObjectId> {
-    // If it's already a commit, return it
-    if (await this.commits.has(objectId)) {
-      return objectId;
-    }
-
-    // Try to load as tag and get target
-    const tags = this.tagsStore;
-    if (tags) {
-      try {
-        const tag = await tags.load(objectId);
-        if (tag) {
-          // Recursively peel
-          return this.peelToCommit(tag.object);
-        }
-      } catch {
-        // Not a tag
-      }
-    }
-
-    // Return as-is (might be a tree or blob in some contexts)
-    return objectId;
   }
 
   /**

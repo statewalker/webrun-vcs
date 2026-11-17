@@ -51,13 +51,18 @@ import {
 import {
   InvalidRefNameError,
   MissingArgumentError,
+  NoHeadError,
+  NotACommitError,
   NotADirectoryError,
   PathNotFoundInTreeError,
   PathNotInIndexError,
+  RefAlreadyExistsError,
   RefNotFoundError,
+  SwitchRefusedError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
+import { StashApplyStatus } from "../results/index.js";
 import {
   guessRemoteBranch,
   installTracking,
@@ -66,10 +71,14 @@ import {
   TrackMode,
   trackableStart,
 } from "./branch-tracking.js";
-import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { abbrevLengths, coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
 import { reflogMessages } from "./reflog-messages.js";
+import { restoreWorktreeHard } from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
+import { StashApplyCommand } from "./stash-apply-command.js";
+import { StashCreateCommand } from "./stash-create-command.js";
+import { STASH_REF } from "./stash-list-command.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   findInTheWay,
@@ -78,6 +87,24 @@ import {
   worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
 import { refuseIfCheckedOut, shortBranchName } from "./worktree-support.js";
+
+/** git's `apply_save_autostash_oid` advice when the autostash conflicts. */
+const AUTOSTASH_CONFLICT_ADVICE = [
+  "Your local changes are stashed, however applying them",
+  "resulted in conflicts.  You can either resolve the conflicts",
+  'and then discard the stash with "git stash drop", or, if you',
+  'do not want to resolve them now, run "git reset --hard" and',
+  'apply the local changes later by running "git stash pop".',
+].join("\n");
+
+/**
+ * The name git's `switch_branches` gives the target (`new_branch_info->name`), which
+ * labels the autostash: the branch, the name as given for a detached HEAD, the start point
+ * of a branch being created.
+ */
+function autostashLabel(plan: SwitchPlan): string {
+  return plan.kind === "create" ? plan.startName : plan.logName;
+}
 
 /** Names a branch checkout in failure messages. */
 const CHECKOUT = "checkout";
@@ -186,6 +213,7 @@ type SwitchPlan =
 export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private name: string | undefined;
   private createBranch = false;
+  private forceCreateBranch = false;
   private orphan = false;
   private force = false;
   // biome-ignore lint/correctness/noUnusedPrivateClassMembers: JGit compatibility - will be used for branch reset
@@ -200,6 +228,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private track = TrackMode.DEFAULT;
   private guess?: boolean;
   private protectUntracked = false;
+  private merge = false;
+  /** Set by a `merge` checkout the two-way merge refused: what the autostash needs */
+  private autostashSwitch?: { label: string; base: string };
 
   /**
    * Set the name of the branch or commit to check out.
@@ -222,7 +253,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    * If true, a new branch with setName() will be created at setStartPoint()
    * (or HEAD if not specified) and checked out.
    *
-   * Equivalent to `git checkout -b <name>`.
+   * Equivalent to `git checkout -b <name>`: refused when the branch exists
+   * (`RefAlreadyExistsError`, "fatal: a branch named 'x' already exists"); use
+   * {@link setForceCreateBranch} (`-B`) to reset an existing branch instead.
    *
    * @param createBranch Whether to create a new branch
    * @returns this for chaining
@@ -230,6 +263,22 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   setCreateBranch(createBranch: boolean): this {
     this.checkCallable();
     this.createBranch = createBranch;
+    if (!createBranch) this.forceCreateBranch = false;
+    return this;
+  }
+
+  /**
+   * Create the branch named by setName(), or reset it to the start point when it exists,
+   * and check it out (git's `checkout -B <name> [<start-point>]`; "branch: Reset to
+   * <start>" in its reflog). Implies {@link setCreateBranch}.
+   *
+   * @param force Whether to create or reset the branch
+   * @returns this for chaining
+   */
+  setForceCreateBranch(force: boolean): this {
+    this.checkCallable();
+    this.forceCreateBranch = force;
+    if (force) this.createBranch = true;
     return this;
   }
 
@@ -270,7 +319,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   /**
    * Check out a branch even when another worktree has it checked out (git's
    * `--ignore-other-worktrees`). Without it such a checkout, and resetting such a branch
-   * with `setCreateBranch` (`checkout -B`, as git 2.44 and later refuse it), is refused with
+   * with `setForceCreateBranch` (`checkout -B`, as git 2.44 and later refuse it), is refused with
    * `BranchUsedByWorktreeError` ("'x' is already used by worktree at '<path>'"), where the
    * backend keeps linked worktrees (`WorkingCopy.worktrees`).
    *
@@ -353,6 +402,34 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   setProtectUntracked(protect: boolean): this {
     this.checkCallable();
     this.protectUntracked = protect;
+    return this;
+  }
+
+  /**
+   * `-m` / `--merge` (git 2.55+): when local changes stand in the way of the switch, they
+   * are carried over as git does it, through an autostash. The changes are stashed, the
+   * switch made from a clean index and worktree, and the stash applied on top with the
+   * conflict labels `<target>` (the new branch's side) and `local` (the changes). Clean,
+   * the result is `OK` with message `Applied autostash.` (staged changes come back
+   * unstaged, new files staged, as `git stash apply` leaves them). With conflicts the
+   * switch is still made: status `CONFLICTS` with `ref` set (HEAD's new value), the
+   * conflicted paths at stages 1-3 with conflict markers, the changes kept as `stash@{0}`
+   * ("autostash while switching to '<target>'"), and git's advice as the message.
+   *
+   * @example
+   * ```typescript
+   * const result = await git.checkout().setName("feature").setMerge(true).call();
+   * if (result.status === CheckoutStatus.CONFLICTS && result.ref) {
+   *   // switched; resolve result.conflicts, then `git stash drop`
+   * }
+   * ```
+   *
+   * @param merge Whether to merge local changes into the switch
+   * @returns this for chaining
+   */
+  setMerge(merge: boolean): this {
+    this.checkCallable();
+    this.merge = merge;
     return this;
   }
 
@@ -445,7 +522,159 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const run = () =>
       this.allPaths || this.paths.length > 0 ? this.checkoutPaths() : this.checkoutBranch();
     const worktree = this.worktreeAccess;
-    return worktree?.batch ? worktree.batch(run) : run();
+    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    const autostash = this.autostashSwitch;
+    if (autostash) {
+      const done = await this.switchWithAutostash(autostash.label, autostash.base);
+      if (done) return done;
+    }
+    return result;
+  }
+
+  /**
+   * git 2.55+'s `checkout -m` / `switch -m` (`switch_branches` with `merge`): the local
+   * changes are stashed (`git stash create "autostash while switching to '<target>'"`),
+   * index and worktree reset to HEAD, the switch made, then the stash applied with the
+   * labels git gives it (`<target>` for the new branch's side, `local` for the changes,
+   * the branch left, or its abbreviated commit, for the base). A conflicting apply leaves
+   * the conflicts in the index and worktree and keeps the changes as a stash entry
+   * (`stash@{0}`, "autostash while switching to '<target>'"). Undefined when there was
+   * nothing to stash (the refusal stands).
+   */
+  private async switchWithAutostash(
+    label: string,
+    base: string,
+  ): Promise<CheckoutResult | undefined> {
+    const message = `autostash while switching to '${label}'`;
+    const stashId = await new StashCreateCommand(this._workingCopy)
+      .setRef(null)
+      .setMessage(message)
+      .call();
+    if (stashId === undefined) return undefined;
+    // from here on the changes live only in the stash: whatever happens to the switch, the
+    // stash is applied or stored (git applies it after merge_working_tree, failed or not)
+    let switched: CheckoutResult | undefined;
+    let failure: { error: unknown } | undefined;
+    try {
+      // create_autostash's reset_working_tree(HARD): index and worktree back to HEAD
+      await this.resetHardToHead();
+      // the switch again, now from a clean index and worktree
+      switched = await this.copy().call();
+    } catch (error) {
+      failure = { error };
+    }
+    const applied = await this.applySaveAutostash(stashId, message, label, base);
+    if (failure) {
+      // git returns the switch's failure once the stash is applied or stored
+      const { error } = failure;
+      if (error instanceof Error) error.message = `${error.message}\n${applied.message}`;
+      throw error;
+    }
+    if (!switched) throw new Error("unreachable: checkout without a result");
+    if (switched.status !== CheckoutStatus.OK) {
+      // the switch refused (untracked files in the way): HEAD stays, the changes are back
+      return {
+        ...switched,
+        conflicts: [...switched.conflicts, ...applied.conflicts],
+        message: [switched.message ?? "", applied.message].join("\n"),
+      };
+    }
+    if (applied.conflicts.length > 0 || applied.conflicted) {
+      return {
+        status: CheckoutStatus.CONFLICTS,
+        updated: switched.updated,
+        removed: switched.removed,
+        conflicts: applied.conflicts,
+        ref: switched.ref,
+        message: applied.message,
+      };
+    }
+    return { ...switched, message: applied.message };
+  }
+
+  /**
+   * git's `apply_save_autostash_oid`: the stash applied (`Applied autostash.`), else
+   * stored as `stash@{0}` with `message`, with git's advice for a conflicting apply or
+   * `error: could not apply autostash; your changes are safe in the stash`.
+   */
+  private async applySaveAutostash(
+    stashId: ObjectId,
+    message: string,
+    ours: string,
+    base: string,
+  ): Promise<{ message: string; conflicts: string[]; conflicted: boolean }> {
+    let status: StashApplyStatus = StashApplyStatus.FAILED;
+    let conflicts: string[] = [];
+    try {
+      const apply = await new StashApplyCommand(this._workingCopy)
+        .setStashRef(stashId)
+        .setLabels({ ours, theirs: "local", base })
+        .call();
+      status = apply.status;
+      conflicts = [...(apply.conflicts ?? [])].sort();
+    } catch {
+      // git's do_stash_apply: any other exit status is STASH_APPLY_ERROR
+      status = StashApplyStatus.FAILED;
+    }
+    if (status === StashApplyStatus.OK) {
+      return { message: "Applied autostash.", conflicts: [], conflicted: false };
+    }
+    // git stash store -m <message> -q <stash>
+    await this.refsStore.batch([{ name: STASH_REF, new: stashId }], {
+      ...this.reflogLine(message),
+      createReflog: true,
+    });
+    if (status === StashApplyStatus.CONFLICTS) {
+      return { message: AUTOSTASH_CONFLICT_ADVICE, conflicts, conflicted: true };
+    }
+    return {
+      message: "error: could not apply autostash; your changes are safe in the stash",
+      conflicts: [],
+      conflicted: false,
+    };
+  }
+
+  /**
+   * `reset --hard` to HEAD without touching a ref (git's `reset_working_tree` with
+   * `RESET_WORKING_TREE_HARD`, the oid HEAD's own): the index read from HEAD's tree, the
+   * worktree rewritten from it, tracked files HEAD lacks deleted.
+   */
+  private async resetHardToHead(): Promise<void> {
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    if (!headId) throw new NoHeadError("could not determine HEAD revision");
+    const treeId = await this.commits.getTree(headId);
+    if (!treeId) throw new RefNotFoundError(headId, `unable to read tree (${headId})`);
+    const trackedBefore = new Set<string>();
+    for await (const entry of this.staging.entries()) trackedBefore.add(entry.path);
+    await this.staging.readTree(this.trees, treeId);
+    await this.staging.write();
+    const worktree = this.worktreeAccess;
+    if (worktree) {
+      await restoreWorktreeHard(
+        { trees: this.trees, blobs: this.blobs, workingCopy: this.workingCopy, worktree },
+        treeId,
+        trackedBefore,
+      );
+    }
+  }
+
+  /** This checkout's settings on a new command (without `merge`). */
+  private copy(): CheckoutCommand {
+    const copy = new CheckoutCommand(this._workingCopy)
+      .setCreateBranch(this.createBranch)
+      .setForceCreateBranch(this.forceCreateBranch)
+      .setOrphan(this.orphan)
+      .setIgnoreOtherWorktrees(this.ignoreOtherWorktrees)
+      .setDetach(this.detach)
+      .setTrack(this.track)
+      .setOrphanFromEmptyTree(this.orphanFromEmptyTree)
+      .setProtectUntracked(this.protectUntracked);
+    if (this.createBranch) copy.setCreateBranch(true);
+    if (this.name !== undefined) copy.setName(this.name);
+    if (this.startPoint !== undefined) copy.setStartPoint(this.startPoint);
+    if (this.guess !== undefined) copy.setGuess(this.guess);
+    if (this.hasReflogAction()) copy.setReflogAction(this.reflogAction("checkout"));
+    return copy;
   }
 
   /**
@@ -512,7 +741,22 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    * Checkout a branch or commit.
    */
   private async checkoutBranch(): Promise<CheckoutResult> {
-    const switchTo = await this.planSwitch();
+    // parse_branchname_arg and validate_new_branchname first, then checkout_branch's
+    // option checks, then switch_branches' refusal of a non-commit
+    let plan: SwitchPlan | SwitchRefusedError;
+    try {
+      plan = await this.planSwitch();
+    } catch (error) {
+      if (!(error instanceof SwitchRefusedError && NON_COMMIT_SWITCH.test(error.message))) {
+        throw error;
+      }
+      plan = error;
+    }
+    if (this.merge && this.force) {
+      throw new SwitchRefusedError("fatal: '-f' cannot be used with '-m'");
+    }
+    if (plan instanceof SwitchRefusedError) throw plan;
+    const switchTo = plan;
     const { targetId } = switchTo;
     const branchName =
       switchTo.kind === "detach" || switchTo.kind === "stay" ? undefined : switchTo.branch;
@@ -649,6 +893,24 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           message: lines.map((l) => l.line).join("\n"),
         };
       }
+    }
+    // git 2.55+ `checkout -m`: a two-way merge that fails (local changes, untracked files
+    // in the way) falls back to an autostash, run by call() outside this worktree batch;
+    // with nothing to stash the refusal stands
+    const refused = local.length + untracked.length + untrackedRemoved.length + lostDirs.length;
+    if (this.merge && headId && refused > 0) {
+      const left = await this.getCurrentBranch();
+      // the base's label: the branch left, else its commit uniquely abbreviated
+      // (strbuf_add_unique_abbrev, DEFAULT_ABBREV)
+      const abbrev = left?.startsWith("refs/heads/")
+        ? undefined
+        : (await abbrevLengths(this.workingCopy, [headId])).get(headId);
+      this.autostashSwitch = {
+        label: autostashLabel(switchTo),
+        base: left?.startsWith("refs/heads/")
+          ? shortBranchName(left)
+          : headId.slice(0, abbrev ?? 7),
+      };
     }
     if (local.length + untracked.length + untrackedRemoved.length + lostDirs.length > 0) {
       const message = overwriteMessage("checkout", {
@@ -985,20 +1247,31 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    * Resolve a revision (`HEAD~1`, a branch, a tag, `@{-1}`) to its commit's tree.
    */
   private async resolveTreeId(refName: string): Promise<ObjectId | undefined> {
-    const commitId = await this.resolveCommitId(refName);
-    if (!commitId) return undefined;
-    return this.commits.getTree(commitId);
+    let id: ObjectId;
+    try {
+      id = await this.resolveRevision(refName);
+    } catch (error) {
+      if (error instanceof RefNotFoundError) return undefined;
+      throw error;
+    }
+    // git's parse_tree_indirect: a commit, a tree, or a tag of either
+    return this.revisionResolver().peelToType(id, "tree");
   }
 
   /**
-   * Resolve a revision to a commit, as git's rev parsing does (`resolveRef`), or undefined.
+   * Resolve a revision to a commit, as git's rev parsing does (`resolveRef`), or undefined
+   * when it names nothing. One that names a tree, a blob or a missing object is refused as
+   * git's checkout refuses it (see {@link nonCommitSwitchError}), named `given`.
    */
-  private async resolveCommitId(refName: string): Promise<ObjectId | undefined> {
+  private async resolveCommitId(
+    refName: string,
+    given: string = refName,
+  ): Promise<ObjectId | undefined> {
     try {
-      const id = await this.resolveRef(refName);
-      return (await this.commits.has(id)) ? id : undefined;
+      return await this.resolveRef(refName);
     } catch (error) {
       if (error instanceof RefNotFoundError) return undefined;
+      if (error instanceof NotACommitError) throw nonCommitSwitchError(given, error);
       throw error;
     }
   }
@@ -1018,11 +1291,34 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       if (!isValidBranchName(given)) throw new InvalidRefNameError(given);
       if (this.orphan) return { kind: "orphan", branch: given, logName: given };
       // the start point as git's setup_branch_path names it: `-` and @{-N} expanded (the
-      // reflog's "Created from feat", the branch tracked)
+      // reflog's "Created from feat", the branch tracked). git's parse_branchname_arg reads
+      // it before validate_new_branchname looks at the branch: a start point that names
+      // nothing dies first, one that names a tree after the branch check
       const startArg = this.startPoint === "-" ? "@{-1}" : (this.startPoint ?? "HEAD");
       const startName = await this.expandPriorCheckout(startArg);
-      const targetId = await this.resolveCommitId(startName);
-      if (!targetId) throw new RefNotFoundError(this.startPoint ?? startName);
+      let targetId: ObjectId | undefined;
+      let nonCommit: unknown;
+      try {
+        targetId = await this.resolveCommitId(startName, this.startPoint ?? startName);
+      } catch (error) {
+        if (!(error instanceof SwitchRefusedError)) throw error;
+        nonCommit = error;
+      }
+      if (!targetId && nonCommit === undefined) {
+        if (this.startPoint === undefined) throw new RefNotFoundError(startName);
+        throw new RefNotFoundError(
+          this.startPoint,
+          `fatal: '${this.startPoint}' is not a commit and a branch '${given}' cannot be created from it`,
+        );
+      }
+      // validate_new_branchname: `-b` refuses an existing branch, `-B` resets it
+      if (!this.forceCreateBranch && (await this.refsStore.has(`refs/heads/${given}`))) {
+        throw new RefAlreadyExistsError(
+          `refs/heads/${given}`,
+          `fatal: a branch named '${given}' already exists`,
+        );
+      }
+      if (!targetId) throw nonCommit;
       return {
         kind: "create",
         branch: given,
@@ -1035,7 +1331,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // git's parse_branchname_arg: `-` is @{-1}; the name a remote-tracking branch is guessed
     // from is the argument itself, so `-` or @{-N} naming a deleted branch guesses nothing
     const arg = given === "-" ? "@{-1}" : given;
-    const name = await this.expandPriorCheckout(arg);
+    const name = await this.interpretLocalBranch(await this.expandPriorCheckout(arg));
     if (!this.detach && (name === "HEAD" || name === "@")) {
       // `checkout HEAD`: the worktree is checked out, HEAD left as it is
       const headId = await this.resolveCommitId("HEAD");
@@ -1047,7 +1343,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         return { kind: "branch", branch: name, targetId: branch.objectId, logName: name };
       }
     }
-    const targetId = await this.resolveCommitId(name);
+    const targetId = await this.resolveCommitId(name, given);
     if (targetId) return { kind: "detach", targetId, logName: name };
     // git's dwim of a name no ref has into the remote-tracking branch of that name
     const config = RemoteConfigStore.from(this.workingCopy);
@@ -1107,4 +1403,21 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       }
     }
   }
+}
+
+/** The refusals of {@link nonCommitSwitchError}. */
+const NON_COMMIT_SWITCH = /^fatal: (Cannot switch branch to a non-commit|unable to read tree) /;
+
+/**
+ * git's checkout of a revision that names no commit (`switch_branches`, 2.56): a tree is
+ * `fatal: Cannot switch branch to a non-commit '<given>'`, a blob or a missing object
+ * `fatal: unable to read tree (<id>)` (git 2.43 said `fatal: reference is not a tree:
+ * <given>` there).
+ */
+export function nonCommitSwitchError(given: string, error: NotACommitError): SwitchRefusedError {
+  return new SwitchRefusedError(
+    error.objectType === "tree"
+      ? `fatal: Cannot switch branch to a non-commit '${given}'`
+      : `fatal: unable to read tree (${error.objectId})`,
+  );
 }

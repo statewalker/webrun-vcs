@@ -114,6 +114,27 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
+   * Add a paragraph to the message, as each further `-m` of `git commit` does: the
+   * message so far gets its last line ended and a blank line, then this one (`-m a -m b`
+   * is `"a\n\nb\n"`). The first call is {@link setMessage}.
+   *
+   * @example
+   * ```typescript
+   * await git.commit().addMessage("Subject").addMessage("Body paragraph.").call();
+   * ```
+   *
+   * @param message One paragraph of the commit message
+   */
+  addMessage(message: string): this {
+    this.checkCallable();
+    // git's opt_parse_m: a newline before the next -m only when the buffer holds something
+    this.message = !this.message
+      ? message
+      : `${this.message}${this.message.endsWith("\n") ? "" : "\n"}\n${message}`;
+    return this;
+  }
+
+  /**
    * How the message is cleaned up (git's `--cleanup=<mode>`; default `commit.cleanup`, else
    * `default`, which without an editor is `whitespace`: trailing whitespace and surrounding
    * blank lines dropped, blank runs collapsed). `strip` also drops comment lines;

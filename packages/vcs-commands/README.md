@@ -93,7 +93,7 @@ const commit = await git
 await git.commit().setMessage("Add feature (fixed)").setAmend(true).call();
 ```
 
-A message is taken as git's `-m` takes it: `commit()` ends its last line and cleans it up (`whitespace` by default, or `commit.cleanup`, or `setCleanupMode(CleanupMode.STRIP | VERBATIM | ...)`), so `"Add feature"` is stored as `"Add feature\n"` and the commit gets native git's id. `merge().setMessage()` cleans up the same way; `tag().setMessage()` uses `strip` by default, as `git tag -m` does (comment lines go). A message that cleans up to nothing is refused (`Aborting commit due to empty commit message.`) unless `setAllowEmptyMessage(true)`.
+A message is taken as git's `-m` takes it: `commit()` ends its last line and cleans it up (`whitespace` by default, or `commit.cleanup`, or `setCleanupMode(CleanupMode.STRIP | VERBATIM | ...)`), so `"Add feature"` is stored as `"Add feature\n"` and the commit gets native git's id. `merge().setMessage()` cleans up the same way; `tag().setMessage()` uses `strip` by default, as `git tag -m` does (comment lines go). A message that cleans up to nothing is refused (`Aborting commit due to empty commit message.`) unless `setAllowEmptyMessage(true)`. Several `-m` are `addMessage()` calls on `commit()`, `merge()` and `tag()`: each adds a paragraph after a blank line (`git commit -m Subject -m Body` is `commit().addMessage("Subject").addMessage("Body")`). `merge().setCommit(false)` writes `MERGE_MSG` as git does: the message given plus a newline (before any conflicts hint).
 
 ### Branches and checkout
 
@@ -103,8 +103,10 @@ import { ListBranchMode } from "@statewalker/vcs-commands";
 await git.branchCreate().setName("feature/login").setStartPoint("main").call();
 await git.checkout().setName("feature/login").call();
 
-// Create and switch in one step (git checkout -b)
+// Create and switch in one step (git checkout -b; refused when the branch exists)
 await git.checkout().setName("feature/new").setCreateBranch(true).call();
+// git checkout -B: create, or reset an existing branch to the start point
+await git.checkout().setName("feature/new").setForceCreateBranch(true).setStartPoint("main").call();
 
 const branches = await git.branchList().setListMode(ListBranchMode.ALL).call();
 for (const ref of branches) console.log(ref.name); // "refs/heads/main", ...
@@ -122,9 +124,28 @@ await git.switch().setCreateBranch("topic").setStartPoint("origin/topic").call()
 await git.switch().setName("dev").call(); // only origin/dev exists: creates dev tracking it
 await git.switch().setDetach(true).setName("v1.0.0").call();
 await git.checkout().setDetach(true).call(); // git checkout --detach
+// git switch -m: local changes carried over (git 2.55+'s autostash; conflicts labelled
+// "feature" / "local", the changes kept as stash@{0} when they conflict)
+await git.switch().setName("feature").setMerge(true).call();
 ```
 
-`checkout()` returns a `CheckoutResult` with `status` (`CheckoutStatus.OK`, `CONFLICTS`, ...), `updated`, `removed` and `conflicts`. Use `addPath()` to restore single files and `setForced(true)` to discard local changes. A new branch tracks a remote-tracking start point as `branch.autoSetupMerge` says (`setTrack(TrackMode.DIRECT | INHERIT | NONE)` for `--track`, `--track=inherit`, `--no-track`). `switch()` refuses what is not a branch with git's message (`fatal: a branch is expected, got tag 'v1.0.0'` and its hint), and refuses while a merge, rebase, cherry-pick or revert is in progress; it has no `--merge`.
+`checkout()` returns a `CheckoutResult` with `status` (`CheckoutStatus.OK`, `CONFLICTS`, ...), `updated`, `removed` and `conflicts`. Use `addPath()` to restore single files and `setForced(true)` to discard local changes. A new branch tracks a remote-tracking start point as `branch.autoSetupMerge` says (`setTrack(TrackMode.DIRECT | INHERIT | NONE)` for `--track`, `--track=inherit`, `--no-track`). `switch()` refuses what is not a branch with git's message (`fatal: a branch is expected, got tag 'v1.0.0'` and its hint), and refuses while a merge, rebase, cherry-pick or revert is in progress. `setMerge(true)` (`-m`, on `checkout()` too) carries local changes over as git 2.55+ does: when the switch would lose them they are stashed, the switch made, and the stash applied with the labels `<target>` and `local`; a clean apply gives `OK` with the message `Applied autostash.`, a conflicting one gives `CONFLICTS` with `ref` set (the switch was made), the conflicts in the index and worktree and the changes kept as `stash@{0}`.
+
+### Revisions
+
+Every command that takes a revision (`checkout`, `switch`, `reset`, `merge`, `rebase`, `branchCreate`, `diff`, `cherryPick`, `revert`, ...) reads it as git's `get_oid` does, and `revParse()` resolves one as `git rev-parse --verify`:
+
+```typescript
+await git.revParse().setRevision("@{u}").call();             // the upstream (branch.<b>.remote/.merge)
+await git.revParse().setRevision("feature@{push}").call();   // where push would go (push.default, pushRemote)
+await git.revParse().setRevision("HEAD@{2}").call();         // HEAD two moves ago
+await git.revParse().setRevision("main@{yesterday}").call(); // main a day ago (git's approxidate)
+await git.revParse().setRevision(":/fix typo").call();       // youngest commit whose message matches
+await git.revParse().setRevision("v1.0^{tree}").call();      // peeling: ^{commit|tree|blob|tag|object|}
+await git.revParse().setRevision("HEAD~2:src/a.ts").call();  // a path in a tree; ":2:a.ts" an index stage
+```
+
+Ref names follow git's dwim rules; `@` is HEAD, `@{-N}` the branch left N switches ago, `<ref>@{<n>}` the reflog's nth entry, `<ref>@{<date>}` the ref at that time, `<rev>^{/<regex>}` and `:/<regex>` search commit messages with POSIX extended regexes (`!-` negates). Where git dies, `RevisionError` carries its line (`fatal: no upstream configured for branch 'x'`, `fatal: HEAD does not point to a branch`, `fatal: log for 'main' only has 2 entries`); `revParse()` also returns git's warnings (`warning: log for 'main' only goes back to ...`). Abbreviated ids and `describe` names are not read.
 
 ### Log and reset
 

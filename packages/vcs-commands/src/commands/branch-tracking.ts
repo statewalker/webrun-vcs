@@ -90,7 +90,21 @@ function sourceForTracking(config: RemoteConfigStore, remote: string, dst: strin
  * `src` onto.
  */
 function trackingForSource(config: RemoteConfigStore, remote: string, src: string) {
-  const specs = fetchSpecs(config, remote);
+  return applyRefspecs(config.configuredFetchRefspecs(remote), src);
+}
+
+/**
+ * git's `apply_refspecs`: the destination the refspecs map the ref `src` onto (the first
+ * that matches it, a wildcard's `*` carried over), undefined when none does or a negative
+ * refspec excludes it.
+ *
+ * @example
+ * ```typescript
+ * applyRefspecs(["+refs/heads/*:refs/remotes/origin/*"], "refs/heads/main"); // "refs/remotes/origin/main"
+ * ```
+ */
+export function applyRefspecs(specStrings: string[], src: string): string | undefined {
+  const specs = specStrings.map((spec) => parseRefSpec(spec));
   if (specs.some((n) => n.negative && matchSource(n, src))) return undefined;
   for (const spec of specs) {
     if (spec.negative || !spec.source || !spec.destination) continue;

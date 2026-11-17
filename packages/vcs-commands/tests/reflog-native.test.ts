@@ -229,7 +229,7 @@ describeGit("reflog lines, native twins", () => {
     await git.checkout().setName("main").call();
     await git.checkout().setCreateBranch(true).setName("nb").call();
     await git.checkout().setCreateBranch(true).setName("nb2").setStartPoint("feat").call();
-    await git.checkout().setCreateBranch(true).setName("nb").setStartPoint("behind").call();
+    await git.checkout().setForceCreateBranch(true).setName("nb").setStartPoint("behind").call();
     expectSameReflogs(t);
     expect(messages(t.ours, "logs/HEAD").slice(-8)).toEqual([
       "checkout: moving from main to feat",

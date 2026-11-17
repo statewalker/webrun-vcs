@@ -30,6 +30,8 @@ export function nativeGitEnv(home: string): Record<string, string> {
     GIT_CONFIG_VALUE_0: "false",
     GIT_CONFIG_KEY_1: "gc.auto",
     GIT_CONFIG_VALUE_1: "0",
+    // the local timezone ours reads (Node's Date): native git must read dates in the same one
+    ...(process.env.TZ !== undefined ? { TZ: process.env.TZ } : {}),
     // a git build run from outside its install (another version) finds its helpers here
     ...(process.env.GIT_EXEC_PATH ? { GIT_EXEC_PATH: process.env.GIT_EXEC_PATH } : {}),
   };

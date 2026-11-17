@@ -1016,14 +1016,14 @@ describeGit("git worktree: storage roots, bare repositories, renames and HEAD re
     run(repo, "worktree", "add", "-q", join(base, "w1"), "feat");
     const { git } = await open(base);
     // git 2.44 and later: 'feat' is already used by worktree at '<path>'
-    expect(await fatal(() => git.checkout().setName("feat").setCreateBranch(true).call())).toBe(
-      `fatal: 'feat' is already used by worktree at '${join(base, "w1")}'\n`,
-    );
+    expect(
+      await fatal(() => git.checkout().setName("feat").setForceCreateBranch(true).call()),
+    ).toBe(`fatal: 'feat' is already used by worktree at '${join(base, "w1")}'\n`);
     expect(run(repo, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("main");
     await (await open(base)).git
       .checkout()
       .setName("feat")
-      .setCreateBranch(true)
+      .setForceCreateBranch(true)
       .setIgnoreOtherWorktrees(true)
       .call();
     expect(run(repo, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("feat");

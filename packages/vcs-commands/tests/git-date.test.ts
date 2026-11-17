@@ -363,3 +363,42 @@ describe("parseGitDate: git's parse_date", () => {
     );
   });
 });
+
+describe("approxidateCareful across summer time (git keeps now's tm_isdst)", () => {
+  const savedTz = process.env.TZ;
+  afterEach(() => {
+    if (savedTz === undefined) delete process.env.TZ;
+    else process.env.TZ = savedTz;
+  });
+  const at = (y: number, m: number, d: number, h: number) => Date.UTC(y, m, d, h) / 1000;
+
+  it("a winter now reads summer dates in standard time (an hour off, as git)", async () => {
+    process.env.TZ = "America/Los_Angeles";
+    const { approxidateCareful } = await import("../src/commands/git-date.js");
+    // 2026-11-17 12:00 PST
+    const now = at(2026, 10, 17, 20);
+    expect(approxidateCareful("june", now).timestamp).toBe(at(2026, 5, 17, 20));
+    expect(approxidateCareful("10/11/2026", now).timestamp).toBe(at(2026, 9, 11, 20));
+    expect(approxidateCareful("1 month ago", now).timestamp).toBe(at(2026, 9, 17, 20));
+    expect(approxidateCareful("march 10 noon", now).timestamp).toBe(at(2026, 2, 10, 20));
+    expect(approxidateCareful("january 5", now).timestamp).toBe(at(2026, 0, 5, 20));
+    expect(approxidateCareful("2.hours.ago", now).timestamp).toBe(now - 7200);
+  });
+
+  it("a summer now reads winter dates in summer time", async () => {
+    process.env.TZ = "America/Los_Angeles";
+    const { approxidateCareful } = await import("../src/commands/git-date.js");
+    // 2026-07-01 12:00 PDT
+    const now = at(2026, 6, 1, 19);
+    expect(approxidateCareful("december 1", now).timestamp).toBe(at(2025, 11, 1, 19));
+    expect(approxidateCareful("june 3", now).timestamp).toBe(at(2026, 5, 3, 19));
+  });
+
+  it("dates written with numbers refuse the future relative to the given now", async () => {
+    process.env.TZ = "America/Los_Angeles";
+    const { approxidateCareful } = await import("../src/commands/git-date.js");
+    // 2026-01-01 12:00 PST: 6/1/2026 is months ahead, so it is read as 6 January
+    const now = at(2026, 0, 1, 20);
+    expect(approxidateCareful("6/1/2026", now).timestamp).toBe(at(2026, 0, 6, 20));
+  });
+});
