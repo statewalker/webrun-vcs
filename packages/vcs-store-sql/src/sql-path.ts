@@ -5,7 +5,10 @@
  * byte), and SQL drivers turn those into U+FFFD: the name, and the id of a tree rebuilt from
  * it, would be lost. So a lone surrogate is stored as U+0001 and its four hex digits, and a
  * U+0001 of the path as two of them. Every other character stays as it is, so a UTF-8 path
- * is stored unchanged (no migration: rows written before read back the same), a prefix of a
+ * is stored unchanged (rows written before read back the same; migration 9 doubles the rare
+ * U+0001 they held in `staging_entry` and `tree_entry`; `tree_delta_entry`, made outside
+ * the migrations, is not rewritten, so an old delta row holding a U+0001 reads back
+ * differently), a prefix of a
  * path is stored as a prefix of the stored path (`LIKE 'dir/%'` still works), and
  * `ORDER BY` keeps git's byte order for every path without either character.
  *

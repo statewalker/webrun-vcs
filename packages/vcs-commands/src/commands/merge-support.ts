@@ -608,7 +608,8 @@ export class OperationState {
   /** Appends to a state file (O_APPEND where the checkout can; else a rewrite). */
   async append(name: string, content: string): Promise<void> {
     if (this.checkout.appendStateFile) {
-      await this.checkout.appendStateFile(name, content);
+      // the same bytes `write` would store (escaped bytes as themselves)
+      await this.checkout.appendStateFile(name, encodeGitPath(content));
       return;
     }
     await this.write(name, `${(await this.read(name)) ?? ""}${content}`);

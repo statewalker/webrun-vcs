@@ -281,8 +281,9 @@ export function parseAttributes(
     options.onWarning?.(`ignoring overly large gitattributes file '${options.source ?? ""}'`);
     return [];
   }
+  // one BOM is skipped, as git does: by the byte decoder, or here for text handed in
   let text = typeof content === "string" ? content : decodeGitPatternFile(content);
-  if (text.startsWith("﻿")) text = text.slice(1);
+  if (typeof content === "string" && text.startsWith("﻿")) text = text.slice(1);
   const rules: AttributeRule[] = [];
   const lines = text.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();

@@ -178,7 +178,9 @@ export class AttributesResolver {
     const keyed = typeof content === "object" && !(content instanceof Uint8Array);
     const cacheKey = `${macros ? "m" : "-"}${origin}\0${keyed ? `#${content.key}` : textOf(content)}`;
     const rules = this.cache.get(cacheKey, () =>
-      parseAttributes(textOf(keyed ? content.content : content), {
+      // the bytes themselves: `parseAttributes` skips their one BOM (a decoded string would
+      // lose it here and a second one there)
+      parseAttributes(keyed ? content.content : content, {
         source: origin,
         macrosAllowed: macros,
         onWarning: this.options.onWarning,

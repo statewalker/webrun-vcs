@@ -266,3 +266,20 @@ describe("GitContentFilter: where a smudge reads attributes", () => {
     });
   });
 });
+
+describe("attributes: a leading BOM", () => {
+  const matchesC = (rules: ReturnType<typeof parseAttributes>) => {
+    const rule = rules[0];
+    if (rule?.kind !== "pattern") throw new Error("expected a pattern rule");
+    return attributePatternMatches(rule.pattern, "c.txt", "");
+  };
+
+  it("skips one BOM, as git does: a second one stays in the pattern", () => {
+    const bom = [0xef, 0xbb, 0xbf];
+    const line = [...new TextEncoder().encode("c.txt foo\n")];
+    expect(matchesC(parseAttributes(new Uint8Array([...bom, ...line])))).toBe(true);
+    expect(matchesC(parseAttributes(new Uint8Array([...bom, ...bom, ...line])))).toBe(false);
+    // text handed in loses its one BOM too
+    expect(matchesC(parseAttributes("\ufeffc.txt foo\n"))).toBe(true);
+  });
+});
