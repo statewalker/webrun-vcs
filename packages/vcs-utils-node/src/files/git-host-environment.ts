@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 
 import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 
-import { PosixNodeFilesApi } from "./posix-node-files-api.js";
+import { NodeFilesApi } from "@statewalker/webrun-files-node";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
 export interface NodeGitHostEnvironmentOptions {
@@ -53,20 +53,31 @@ export interface NodeGitHostEnvironment {
   globalConfig?: string;
 }
 
-/** One Node FilesApi per file-system root: `/`, or a Windows drive such as `C:/`. */
+/**
+ * One Node FilesApi per file-system root: `/`, a Windows drive such as `C:/`, or a UNC share
+ * such as `//server/share`. It is the plain `NodeFilesApi`, which follows symbolic links (a
+ * linked `~/.gitconfig`, macOS's `/etc` -> `/private/etc`), as git's reads of these files do.
+ */
 const hostRoots = new Map<string, FilesApi>();
 
-/** The host FilesApi that holds an absolute path, and the path inside it. */
-function hostFiles(path: string): [FilesApi, string] {
-  const drive = /^[A-Za-z]:[\\/]/.exec(path);
-  const root = drive ? `${path.slice(0, 2)}/` : "/";
-  const relative = drive ? path.slice(3).replaceAll("\\", "/") : path;
+/**
+ * The host FilesApi that holds a path, and the path inside it. A relative path is read from
+ * the current directory, as git's `fopen` reads it.
+ */
+function hostFiles(path: string, windows = process.platform === "win32"): [FilesApi, string] {
+  let full = path.replaceAll("\\", "/");
+  const absolute = full.startsWith("/") || /^[A-Za-z]:\//.test(full);
+  if (!absolute) full = `${process.cwd().replaceAll("\\", "/").replace(/\/$/, "")}/${full}`;
+  const unc = windows ? /^\/\/[^/]+\/[^/]+/.exec(full) : null;
+  const drive = /^[A-Za-z]:\//.exec(full);
+  const prefix = unc ? unc[0] : drive ? full.slice(0, 2) : "";
+  const root = `${prefix.toUpperCase()}/`;
   let files = hostRoots.get(root);
   if (!files) {
-    files = new PosixNodeFilesApi({ rootDir: root });
+    files = new NodeFilesApi({ rootDir: unc ? prefix : root });
     hostRoots.set(root, files);
   }
-  return [files, relative];
+  return [files, full.slice(prefix.length)];
 }
 
 /** git's `git_env_bool`: set to anything but a false value. */
