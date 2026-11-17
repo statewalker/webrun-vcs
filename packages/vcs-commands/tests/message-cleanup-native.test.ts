@@ -56,6 +56,15 @@ function build(base: string): string {
   return repo;
 }
 
+/** Native git is 2.50 or newer (the 2.5x behaviour this package follows). */
+const gitAtLeast250 = (() => {
+  if (!nativeGitAvailable()) return false;
+  const m = /git version (\d+)\.(\d+)/.exec(
+    execFileSync("git", ["--version"], { encoding: "utf8" }),
+  );
+  return !!m && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 50));
+})();
+
 let counter = 0;
 function twins(): { native: string; ours: string } {
   const n = counter++;
@@ -212,16 +221,31 @@ describeGit("message cleanup of -m, native twins", () => {
 
   it("commit: core.commentChar=auto picks a character no line starts with; the last of core.commentString / core.commentChar wins", async () => {
     const t = twins();
-    const git = await open(t.ours);
     for (const repo of [t.native, t.ours]) {
       run(repo, "config", "core.commentChar", "auto");
       run(repo, "config", "commit.cleanup", "strip");
     }
-    for (const message of ["#foo\nbar", "a\n;b\n#c", "x\n# y\n"]) {
-      run(t.native, "commit", "-q", "--allow-empty", "-m", message);
+    // opened after the config is written, so the commit reads it
+    const git = await open(t.ours);
+    // git 2.5x leaves trailing comment lines out when it picks the character (the cutoff
+    // of ignored_log_message_bytes), so "#c" and "# y" are stripped; 2.43 looked at every
+    // line and kept them. We follow 2.5x: older git is checked against 2.5x's bytes.
+    const cases: [string, string][] = [
+      ["#foo\nbar", "#foo\nbar\n"],
+      ["a\n;b\n#c", "a\n;b\n"],
+      ["x\n# y\n", "x\n"],
+    ];
+    for (const [message, stored] of cases) {
       await git.commit().setAllowEmpty(true).setMessage(message).call();
-      expectSameObject(t, "HEAD");
+      if (gitAtLeast250) {
+        run(t.native, "commit", "-q", "--allow-empty", "-m", message);
+        expectSameObject(t, "HEAD");
+      } else {
+        const body = run(t.ours, "cat-file", "commit", "HEAD");
+        expect(body.slice(body.indexOf("\n\n") + 2)).toBe(stored);
+      }
     }
+    if (!gitAtLeast250) return;
     // git reads both keys as one variable: the line set last wins (2.43 knows only commentChar)
     for (const repo of [t.native, t.ours]) {
       run(repo, "config", "--unset", "core.commentChar");
