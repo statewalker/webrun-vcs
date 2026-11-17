@@ -869,6 +869,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     message: string,
     step: string,
   ): Promise<ObjectId> {
+    // git's try_to_commit: reset_ident_date() first, so each pick is committed (and its
+    // reflog line written) at its own time
+    this.resetClock();
     // the pick keeps its author; the committer is resolved as git's git_committer_info
     let author = picked;
     let committer = this.committer ?? this.resolveCommitter();

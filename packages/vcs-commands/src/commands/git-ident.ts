@@ -15,16 +15,21 @@
  *
  * - the name and email: `GIT_AUTHOR_*` / `GIT_COMMITTER_*` (the host environment's `author` /
  *   `committer`), then `author.name` / `committer.name` (and `.email`), then `user.name` /
- *   `user.email`, then `$EMAIL` for the email (the host environment's `defaultEmail`);
+ *   `user.email`, then `$EMAIL` for the email (the host environment's `defaultEmail`). A
+ *   variable set to an empty string counts; an empty `author.*` / `committer.*` does not.
+ *   Any `*.email` key in the configuration, even empty, even the other role's, stops the
+ *   email there: `user.email`, else empty (`<>`). Likewise `*.name` for the name;
  * - with `user.useConfigOnly`, a commit or tag refuses an identity the configuration does not
  *   give, with git's message ({@link IdentityUnknownError});
+ * - a commit or tag refuses an empty name and a name of crud only ({@link InvalidIdentError});
  * - the date: `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` in any form {@link parseGitDate} reads,
  *   else the clock with the local timezone offset.
  *
  * Where git would ask the system (the user's full name from passwd, `user@host`), a portable
- * host knows nothing: the command's other identity is used when it was given one explicitly
- * (a commit with only `setAuthor` is committed by that author, as before), else
- * {@link DEFAULT_IDENT}, the identity the ref stores write in reflogs. Never "Unknown".
+ * host knows nothing: the name or email of the command's other identity is used when it was
+ * given one explicitly (a commit with only `setAuthor` is committed by that author, dated
+ * now), else {@link DEFAULT_IDENT}'s, the identity the ref stores write in reflogs. Never
+ * "Unknown", and never an error where git fails to guess.
  */
 
 import type { PersonIdent } from "@statewalker/vcs-core";
@@ -33,6 +38,9 @@ import type { GitHostEnvironment, WorkingCopy } from "@statewalker/vcs-working-t
 
 import { GitApiError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
+import { localTimezoneOffset, parseGitDate } from "./git-date.js";
+
+export { localTimezoneOffset, parseGitDate } from "./git-date.js";
 
 /** The identity of a commit nobody is configured for (the ref stores' reflog identity). */
 export const DEFAULT_IDENT = { name: "webrun-vcs", email: "vcs@localhost" } as const;
@@ -50,16 +58,35 @@ export interface ResolveIdentOptions {
   /** The clock, in seconds, when the variables give no date (default: now) */
   now?: number;
   /**
-   * The identity used when neither the environment nor the configuration names anyone (a
-   * command's other, explicitly given identity: its name, email and, unless the variables
-   * give a date, its date); {@link DEFAULT_IDENT} now otherwise
+   * The name and email used where git would ask the system (the full name from passwd,
+   * `user@host`): a command's other, explicitly given identity; {@link DEFAULT_IDENT}
+   * otherwise. Never its date: the date is the variables' or the clock's.
    */
-  fallback?: Pick<PersonIdent, "name" | "email"> & Partial<PersonIdent>;
+  fallback?: Pick<PersonIdent, "name" | "email">;
   /**
    * git's `IDENT_STRICT` (default true, as for commits and tags): `user.useConfigOnly`
-   * refuses an identity the configuration does not give. Reflog lines are not strict.
+   * refuses an identity the configuration does not give, and an empty name or one of crud
+   * only is refused ({@link InvalidIdentError}). Reflog lines are not strict.
    */
   strict?: boolean;
+}
+
+/** git's `ident_env_hint`: what git prints before refusing an identity it had to look for. */
+function identEnvHint(role: IdentRole): string[] {
+  return [
+    `${role === "author" ? "Author" : "Committer"} identity unknown`,
+    "",
+    "*** Please tell me who you are.",
+    "",
+    "Run",
+    "",
+    '  git config --global user.email "you@example.com"',
+    '  git config --global user.name "Your Name"',
+    "",
+    "to set your account's default identity.",
+    "Omit --global to set the identity only in this repository.",
+    "",
+  ];
 }
 
 /**
@@ -70,24 +97,36 @@ export class IdentityUnknownError extends GitApiError {
   readonly role: IdentRole;
   constructor(role: IdentRole, what: "name" | "email") {
     super(
-      [
-        `${role === "author" ? "Author" : "Committer"} identity unknown`,
-        "",
-        "*** Please tell me who you are.",
-        "",
-        "Run",
-        "",
-        '  git config --global user.email "you@example.com"',
-        '  git config --global user.name "Your Name"',
-        "",
-        "to set your account's default identity.",
-        "Omit --global to set the identity only in this repository.",
-        "",
-        `fatal: no ${what} was given and auto-detection is disabled`,
-      ].join("\n"),
+      [...identEnvHint(role), `fatal: no ${what} was given and auto-detection is disabled`].join(
+        "\n",
+      ),
     );
     this.name = "IdentityUnknownError";
     this.role = role;
+  }
+}
+
+/**
+ * git's refusal of a name a commit or tag may not carry (`IDENT_STRICT`): an empty one
+ * (`empty ident name (for <email>) not allowed`, after the hint when the name came from
+ * `user.name`), or one of crud only (`name consists only of disallowed characters: <name>`).
+ */
+export class InvalidIdentError extends GitApiError {
+  readonly role: IdentRole;
+  readonly reason: "empty" | "crud";
+  /**
+   * @param detail the email (for an empty name) or the name (crud only), as given
+   * @param hint whether git prints its hint first (the name came from the default)
+   */
+  constructor(role: IdentRole, reason: "empty" | "crud", detail: string, hint: boolean) {
+    const fatal =
+      reason === "empty"
+        ? `fatal: empty ident name (for <${detail}>) not allowed`
+        : `fatal: name consists only of disallowed characters: ${detail}`;
+    super([...(hint ? identEnvHint(role) : []), fatal].join("\n"));
+    this.name = "InvalidIdentError";
+    this.role = role;
+    this.reason = reason;
   }
 }
 
@@ -99,205 +138,6 @@ export class InvalidDateError extends GitApiError {
     this.name = "InvalidDateError";
     this.date = date;
   }
-}
-
-/** A timezone offset in minutes as git writes it (`+HHMM`). */
-function formatOffset(minutes: number): string {
-  const sign = minutes < 0 ? "-" : "+";
-  const abs = Math.abs(minutes);
-  return `${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}${String(abs % 60).padStart(2, "0")}`;
-}
-
-/**
- * The local timezone offset at `timestamp` (seconds; default now) as git writes it
- * (`+HHMM`): `Date#getTimezoneOffset`, which every JavaScript host has.
- */
-export function localTimezoneOffset(timestamp?: number): string {
-  const date = timestamp === undefined ? new Date() : new Date(timestamp * 1000);
-  return formatOffset(-date.getTimezoneOffset());
-}
-
-const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
-/** git's `timezone_names`: the offset in hours, and whether it is a summer time (+1 hour). */
-const ZONES: Record<string, [number, boolean]> = {
-  IDLW: [-12, false],
-  NT: [-11, false],
-  CAT: [-10, false],
-  HST: [-10, false],
-  HDT: [-10, true],
-  YST: [-9, false],
-  YDT: [-9, true],
-  PST: [-8, false],
-  PDT: [-8, true],
-  MST: [-7, false],
-  MDT: [-7, true],
-  CST: [-6, false],
-  CDT: [-6, true],
-  EST: [-5, false],
-  EDT: [-5, true],
-  AST: [-4, false],
-  ADT: [-4, true],
-  WAT: [-1, false],
-  GMT: [0, false],
-  UTC: [0, false],
-  Z: [0, false],
-  WET: [0, false],
-  BST: [0, true],
-  CET: [1, false],
-  MET: [1, false],
-  MEWT: [1, false],
-  MEST: [1, true],
-  CEST: [1, true],
-  MESZ: [1, true],
-  FWT: [1, false],
-  FST: [1, true],
-  EET: [2, false],
-  EEST: [2, true],
-  WAST: [7, false],
-  WADT: [7, true],
-  CCT: [8, false],
-  JST: [9, false],
-  EAST: [10, false],
-  EADT: [10, true],
-  GST: [10, false],
-  NZT: [12, false],
-  NZST: [12, false],
-  NZDT: [12, true],
-  IDLE: [12, false],
-};
-
-/**
- * A date as git's `parse_date` reads `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE`, undefined
- * when unreadable (git dies: `invalid date format`).
- *
- * @example
- * ```typescript
- * parseGitDate("1700000000 +0100");                // { timestamp: 1700000000, tzOffset: "+0100" }
- * parseGitDate("@1700000000");                     // the local offset at that time
- * parseGitDate("Tue, 14 Nov 2023 23:13:20 +0100"); // RFC 2822: its offset kept
- * parseGitDate("2023-11-14T23:13:20+01:00");       // ISO 8601: its offset kept
- * parseGitDate("2023-11-14 23:13:20");             // local time, the local offset
- * ```
- *
- * The forms: git's raw `<seconds> <+-HHMM>` (also `@<seconds> ...`); seconds alone (nine
- * digits or more, with `@` or without) in the local offset at that time, as git's
- * `match_digit` and `mktime` give it; and dates with a time: RFC 2822, ISO 8601 (`T` or a
- * space, fractions ignored), git's own `Tue Nov 14 23:13:20 2023 +0100`, `YYYY.MM.DD`,
- * `MM/DD/YYYY`, `DD.MM.YYYY`, with an offset (`+HHMM`, `+HH:MM`, `+HH`), a zone name (`UTC`,
- * `Z`, `CET`, `PST`, ...) or neither (the local time and its offset).
- */
-export function parseGitDate(text: string): { timestamp: number; tzOffset: string } | undefined {
-  const trimmed = text.trim();
-  const raw = /^@?(\d+)\s+([+-])(\d{2})(\d{2})$/.exec(trimmed);
-  if (raw) {
-    return { timestamp: Number(raw[1]), tzOffset: `${raw[2]}${raw[3]}${raw[4]}` };
-  }
-
-  let year: number | undefined;
-  let month: number | undefined;
-  let day: number | undefined;
-  let time: [number, number, number] | undefined;
-  let offset: number | undefined;
-  let epoch: number | undefined;
-  let pm: boolean | undefined;
-  const numbers: number[] = [];
-
-  let rest = trimmed;
-  /** The token `pattern` matches at the start of what is left, consumed. */
-  const take = (pattern: RegExp): RegExpExecArray | null => {
-    const m = pattern.exec(rest);
-    if (m) rest = rest.slice(m[0].length);
-    return m;
-  };
-  while (rest.length > 0) {
-    const word = take(/^[A-Za-z]+/);
-    if (word) {
-      const lower = word[0].toLowerCase();
-      const zone = ZONES[word[0].toUpperCase()];
-      if (lower.length >= 3 && MONTHS.some((name) => lower.startsWith(name))) {
-        month = MONTHS.findIndex((name) => lower.startsWith(name)) + 1;
-      } else if (lower.length >= 3 && WEEKDAYS.some((name) => lower.startsWith(name))) {
-        // the weekday says nothing git uses
-      } else if (zone) {
-        offset = (zone[0] + (zone[1] ? 1 : 0)) * 60;
-      } else if (lower === "am" || lower === "pm") {
-        pm = lower === "pm";
-      } else if (lower !== "t") {
-        return undefined;
-      }
-      continue;
-    }
-    const clock = take(/^(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,]\d+)?)?/);
-    if (clock) {
-      time = [Number(clock[1]), Number(clock[2]), Number(clock[3] ?? 0)];
-      continue;
-    }
-    const ymd = take(/^(\d{4})([-./])(\d{1,2})\2(\d{1,2})(?!\d)/);
-    if (ymd) {
-      [year, month, day] = [Number(ymd[1]), Number(ymd[3]), Number(ymd[4])];
-      continue;
-    }
-    const dmy = take(/^(\d{1,2})([./-])(\d{1,2})\2(\d{4})(?!\d)/);
-    if (dmy) {
-      // git: `MM/DD/YYYY` with slashes, `DD.MM.YYYY` (and `DD-MM-YYYY`) otherwise
-      const [a, b] = [Number(dmy[1]), Number(dmy[3])];
-      [month, day] = dmy[2] === "/" ? [a, b] : [b, a];
-      year = Number(dmy[4]);
-      continue;
-    }
-    // an offset follows a time or the seconds: `+HHMM`, `+HH:MM`, `+HH`
-    const tz =
-      time !== undefined || epoch !== undefined ? take(/^([+-])(\d{2})(?::?(\d{2}))?(?!\d)/) : null;
-    if (tz) {
-      const minutes = Number(tz[2]) * 60 + Number(tz[3] ?? 0);
-      offset = tz[1] === "-" ? -minutes : minutes;
-      continue;
-    }
-    const digits = take(/^\d+/);
-    if (digits) {
-      const value = Number(digits[0]);
-      // git's match_digit: nine digits or more are seconds since the epoch
-      if (value >= 100000000 && year === undefined && time === undefined) epoch = value;
-      else numbers.push(value);
-      continue;
-    }
-    if (!take(/^(?:[\s,@]+|[-./])/)) return undefined;
-  }
-
-  if (epoch !== undefined) {
-    if (time !== undefined || year !== undefined || numbers.length > 0) return undefined;
-    return {
-      timestamp: epoch,
-      tzOffset: offset !== undefined ? formatOffset(offset) : localTimezoneOffset(epoch),
-    };
-  }
-  // the day and year of `14 Nov 2023` and `Nov 14 2023`
-  for (const value of numbers) {
-    if (value > 31 && year === undefined) year = value;
-    else if (value >= 1 && value <= 31 && day === undefined) day = value;
-    else if (year === undefined) year = value;
-    else return undefined;
-  }
-  if (year === undefined || month === undefined || day === undefined || time === undefined) {
-    return undefined;
-  }
-  let [hour, minute, second] = time;
-  if (pm !== undefined && hour <= 12) hour = (hour % 12) + (pm ? 12 : 0);
-  if (year < 100) year += year < 70 ? 2000 : 1900;
-  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 24 || minute > 59 || second > 60) {
-    return undefined;
-  }
-  if (offset !== undefined) {
-    const utc = Date.UTC(year, month - 1, day, hour, minute, second) / 1000;
-    return { timestamp: utc - offset * 60, tzOffset: formatOffset(offset) };
-  }
-  // no offset: the local time, in the local offset of that date (git's mktime)
-  const local = new Date(year, month - 1, day, hour, minute, second);
-  return {
-    timestamp: Math.floor(local.getTime() / 1000),
-    tzOffset: formatOffset(-local.getTimezoneOffset()),
-  };
 }
 
 /** git's `crud`: what `strbuf_addstr_without_crud` trims from the ends of a name or email. */
@@ -315,16 +155,80 @@ export function withoutCrud(text: string): string {
   return text.slice(start, end).replace(/[<>\n]/g, "");
 }
 
-/** The configuration's value, set and not empty. */
-function configured(config: IdentConfig | undefined, key: string): string | undefined {
-  const value = config?.value(key);
-  return value === undefined || value === "" ? undefined : value;
+/** git's `has_non_crud`: whether anything but crud is left of a name. */
+const hasNonCrud = (text: string) => [...text].some((c) => !isCrud(c));
+
+/**
+ * The name and email git's `fmt_ident` finds for `role` before it asks the system, and the
+ * date of the variables. A field left undefined is one git would guess (the full name from
+ * passwd, `user@host`): the caller fills it.
+ */
+interface IdentFields {
+  name: string | undefined;
+  email: string | undefined;
+  date: Pick<PersonIdent, "timestamp" | "tzOffset"> | undefined;
 }
 
 /**
- * git's `fmt_ident` for `role`: the identity named by the environment and the
- * configuration, undefined when neither names anyone (no name, email or date): a caller
- * then decides (the reflog's store identity, a command's fallback).
+ * git's `fmt_ident(getenv(GIT_<ROLE>_NAME), getenv(GIT_<ROLE>_EMAIL), ..., GIT_<ROLE>_DATE)`
+ * up to the guesses, with its refusals in its order when strict: no email or name given
+ * under `user.useConfigOnly`, an empty name, a name of crud only; then an unreadable date.
+ * `guessed.email` stands for git's guessed email in the empty-name message.
+ */
+function identFields(
+  role: IdentRole,
+  environment: GitHostEnvironment | undefined,
+  config: IdentConfig | undefined,
+  strict: boolean,
+  guessed: { name: string; email: string },
+): IdentFields {
+  const vars = environment?.[role];
+  const value = (key: string) => config?.value(key);
+  // git's ident_config_given: any of the *.email (*.name) keys, even empty, even the other
+  // role's
+  const given = (field: "name" | "email") =>
+    ["user", "author", "committer"].some((section) => value(`${section}.${field}`) !== undefined);
+  const configOnly = strict && parseGitBool(value("user.useConfigOnly")) === true;
+
+  // the email: GIT_<ROLE>_EMAIL (even empty), <role>.email (unless empty), then
+  // ident_default_email: user.email, empty when any *.email key is set, else $EMAIL, else
+  // the guess
+  let email = vars?.email ?? (value(`${role}.email`) || undefined);
+  if (email === undefined) {
+    if (configOnly && !given("email")) throw new IdentityUnknownError(role, "email");
+    if (given("email")) email = value("user.email") ?? "";
+    else if (environment?.defaultEmail) email = environment.defaultEmail.trim();
+  }
+
+  // the name: GIT_<ROLE>_NAME (even empty), <role>.name (unless empty), then
+  // ident_default_name: user.name, empty when any *.name key is set, else the guess
+  let name = vars?.name ?? (value(`${role}.name`) || undefined);
+  let usingDefault = false;
+  if (name === undefined) {
+    if (configOnly && !given("name")) throw new IdentityUnknownError(role, "name");
+    usingDefault = true;
+    if (given("name")) name = value("user.name") ?? "";
+  }
+  if (name === "") {
+    // git: refused when strict, the login name otherwise (ours: the guess)
+    if (strict) throw new InvalidIdentError(role, "empty", email ?? guessed.email, usingDefault);
+    name = undefined;
+  }
+  if (strict && name !== undefined && !hasNonCrud(name)) {
+    throw new InvalidIdentError(role, "crud", name, false);
+  }
+
+  const dateText = vars?.date !== undefined && vars.date !== "" ? vars.date : undefined;
+  const date = dateText !== undefined ? parseGitDate(dateText) : undefined;
+  if (dateText !== undefined && !date) throw new InvalidDateError(dateText);
+  return { name, email, date };
+}
+
+/**
+ * git's `fmt_ident` for `role` (not strict unless asked): the identity named by the
+ * environment and the configuration, undefined when neither names anyone (no name, email
+ * or date): a caller then decides (the reflog's store identity). A field git would guess
+ * from the system is {@link DEFAULT_IDENT}'s.
  */
 export function findIdent(
   role: IdentRole,
@@ -332,40 +236,27 @@ export function findIdent(
   config: IdentConfig | undefined,
   options: Omit<ResolveIdentOptions, "fallback"> = {},
 ): PersonIdent | undefined {
-  const vars = environment?.[role];
-  const roleName = configured(config, `${role}.name`);
-  const roleEmail = configured(config, `${role}.email`);
-  const userName = configured(config, "user.name");
-  const userEmail = configured(config, "user.email");
-  const name = vars?.name ?? roleName ?? userName;
-  const email = vars?.email ?? roleEmail ?? userEmail ?? environment?.defaultEmail;
-  const dateText = vars?.date !== undefined && vars.date !== "" ? vars.date : undefined;
-  if (options.strict !== false && parseGitBool(config?.value("user.useConfigOnly")) === true) {
-    // git's ident_config_given: any of the six variables counts as given
-    const mailGiven =
-      [roleEmail, userEmail, configured(config, `${other(role)}.email`)].some(Boolean) ||
-      vars?.email !== undefined;
-    const nameGiven =
-      [roleName, userName, configured(config, `${other(role)}.name`)].some(Boolean) ||
-      vars?.name !== undefined;
-    if (!mailGiven) throw new IdentityUnknownError(role, "email");
-    if (!nameGiven) {
-      throw new IdentityUnknownError(role, "name");
-    }
+  const fields = identFields(role, environment, config, options.strict !== false, DEFAULT_IDENT);
+  if (fields.name === undefined && fields.email === undefined && fields.date === undefined) {
+    return undefined;
   }
-  if (name === undefined && email === undefined && dateText === undefined) return undefined;
-  const date = dateText !== undefined ? parseGitDate(dateText) : undefined;
-  if (dateText !== undefined && !date) throw new InvalidDateError(dateText);
-  const timestamp = date?.timestamp ?? options.now ?? Math.floor(Date.now() / 1000);
-  return {
-    name: withoutCrud(name ?? DEFAULT_IDENT.name),
-    email: withoutCrud(email ?? DEFAULT_IDENT.email),
-    timestamp,
-    tzOffset: date?.tzOffset ?? localTimezoneOffset(timestamp),
-  };
+  return identOf(fields, DEFAULT_IDENT, options.now);
 }
 
-const other = (role: IdentRole): IdentRole => (role === "author" ? "committer" : "author");
+/** The identity of `fields`, the guessed ones `guessed`'s, dated by the variables or now. */
+function identOf(
+  fields: IdentFields,
+  guessed: { name: string; email: string },
+  now: number | undefined,
+): PersonIdent {
+  const timestamp = fields.date?.timestamp ?? now ?? Math.floor(Date.now() / 1000);
+  return {
+    name: withoutCrud(fields.name ?? guessed.name),
+    email: withoutCrud(fields.email ?? guessed.email),
+    timestamp,
+    tzOffset: fields.date?.tzOffset ?? localTimezoneOffset(timestamp),
+  };
+}
 
 function resolveIdent(
   role: IdentRole,
@@ -373,28 +264,14 @@ function resolveIdent(
   config: IdentConfig | undefined,
   options: ResolveIdentOptions,
 ): PersonIdent {
-  const found = findIdent(role, environment, config, options);
-  const vars = environment?.[role];
-  const named =
-    vars?.name !== undefined ||
-    vars?.email !== undefined ||
-    configured(config, `${role}.name`) !== undefined ||
-    configured(config, `${role}.email`) !== undefined ||
-    configured(config, "user.name") !== undefined ||
-    configured(config, "user.email") !== undefined ||
-    environment?.defaultEmail !== undefined;
-  if (found && named) return found;
-  // nobody named: the command's other identity (its date too, unless the variables give
-  // one), else the store's
-  const who: Partial<PersonIdent> = options.fallback ?? DEFAULT_IDENT;
-  if (found) return { ...found, name: who.name ?? found.name, email: who.email ?? found.email };
-  const timestamp = who.timestamp ?? options.now ?? Math.floor(Date.now() / 1000);
-  return {
-    name: who.name ?? DEFAULT_IDENT.name,
-    email: who.email ?? DEFAULT_IDENT.email,
-    timestamp,
-    tzOffset: who.tzOffset ?? localTimezoneOffset(timestamp),
+  // where git would guess (passwd, user@host): the command's other identity, else ours;
+  // only its name and email, never its date
+  const guessed = {
+    name: options.fallback?.name ?? DEFAULT_IDENT.name,
+    email: options.fallback?.email ?? DEFAULT_IDENT.email,
   };
+  const fields = identFields(role, environment, config, options.strict !== false, guessed);
+  return identOf(fields, guessed, options.now);
 }
 
 /**

@@ -13,6 +13,7 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
+import { withoutCrud } from "./git-ident.js";
 import { OperationState } from "./merge-support.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash, cleanupMessage } from "./sequencer-support.js";
@@ -357,8 +358,15 @@ export class CommitCommand extends GitCommand<CommitResult> {
           : pickHead
             ? (await this.commits.load(pickHead))?.author
             : undefined;
-      if (kept) author = this.authorName ? { ...kept, ...this.authorName } : kept;
-      else if (this.authorName) author = this.datedIdent("author", this.authorName);
+      if (kept) {
+        author = this.authorName
+          ? {
+              ...kept,
+              name: withoutCrud(this.authorName.name),
+              email: withoutCrud(this.authorName.email),
+            }
+          : kept;
+      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
       else author = this.resolveAuthor(this.committer ?? this.committerName);
     }
     // the committer: always resolved (GIT_COMMITTER_*, committer.*, user.*), unless given

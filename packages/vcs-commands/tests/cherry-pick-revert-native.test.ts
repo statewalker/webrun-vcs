@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CherryPickStatus, RevertStatus, SequencerOperation } from "../src/index.js";
 import {
   git,
+  INTEROP_AUTHOR_ENV,
   INTEROP_IDENT,
   normalizeState,
   openOurs,
@@ -57,7 +58,8 @@ async function oursPickOp(dir: string, operation: SequencerOperation) {
 }
 
 async function oursRevert(dir: string, commits: string[], operation?: SequencerOperation) {
-  const command = (await openOurs(dir)).revert().setCommitter(INTEROP_IDENT);
+  // the revert's author resolved as native git's (GIT_AUTHOR_*), not dated by the committer
+  const command = (await openOurs(dir, INTEROP_AUTHOR_ENV)).revert().setCommitter(INTEROP_IDENT);
   for (const c of commits) command.include(c);
   if (operation) command.setOperation(operation);
   return command.call();

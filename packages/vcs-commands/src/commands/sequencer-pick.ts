@@ -109,7 +109,7 @@ interface TodoItem {
 export class PickSequencer {
   /** The flat trees the picks read (each pick's result is the next one's HEAD) */
   private readonly flats: FlatTreeCache;
-  /** The clock of this run's identities, read once */
+  /** The clock of this run's identities and reflog lines, read again for each commit */
   private clock?: number;
 
   constructor(
@@ -481,11 +481,12 @@ export class PickSequencer {
   }
 
   /**
-   * The committer of the commits this run makes: the one given, else resolved as git's
-   * `git_committer_info` (the clock read once per run).
+   * The committer of the commit a pick is about to make: the one given, else resolved as
+   * git's `git_committer_info`. The clock is read again first, as git's `try_to_commit`
+   * calls `reset_ident_date()` before each commit; the pick's reflog line keeps that time.
    */
   private committer(): PersonIdent {
-    this.clock ??= Math.floor(Date.now() / 1000);
+    this.clock = Math.floor(Date.now() / 1000);
     return this.options.committer ?? committerIdentOf(this.deps.workingCopy, { now: this.clock });
   }
 

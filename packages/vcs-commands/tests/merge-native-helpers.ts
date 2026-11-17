@@ -27,7 +27,7 @@ import {
   GitWorkingCopyConfig,
 } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
+import { type GitHostEnvironment, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { Git } from "../src/index.js";
 import { nativeGitEnv } from "./native-git-http-backend.js";
@@ -38,6 +38,19 @@ export const INTEROP_IDENT: PersonIdent = {
   email: "interop@example.com",
   timestamp: 1112911993,
   tzOffset: "+0000",
+};
+
+/**
+ * nativeGitEnv's author variables as a host gives them: the author our commands resolve
+ * (a revert's) is native git's, dated as native git dates it.
+ */
+export const INTEROP_AUTHOR_ENV: GitHostEnvironment = {
+  readFile: async () => undefined,
+  author: {
+    name: INTEROP_IDENT.name,
+    email: INTEROP_IDENT.email,
+    date: `${INTEROP_IDENT.timestamp} ${INTEROP_IDENT.tzOffset}`,
+  },
 };
 
 /** Native git in `cwd`: status, stdout, stderr (GIT_EDITOR is `true`). */
@@ -71,8 +84,11 @@ export function put(dir: string, path: string, content: string | Uint8Array): vo
   writeFileSync(full, content);
 }
 
-/** Our working copy over a repository native git made in `dir`. */
-export async function openOurs(dir: string): Promise<Git> {
+/**
+ * Our working copy over a repository native git made in `dir`; with `environment`, git's
+ * variables as a host gives them (e.g. {@link INTEROP_AUTHOR_ENV}).
+ */
+export async function openOurs(dir: string, environment?: GitHostEnvironment): Promise<Git> {
   const files = createNodeFilesApi({ rootDir: dir });
   const { history } = await createGitFilesBackend({ files });
   const io = {
@@ -85,7 +101,7 @@ export async function openOurs(dir: string): Promise<Git> {
     },
     write: async (path: string, content: Uint8Array) => writeFileSync(join(dir, path), content),
   };
-  const config = new GitWorkingCopyConfig(io, ".git/config");
+  const config = new GitWorkingCopyConfig(io, ".git/config", environment ? { environment } : {});
   await config.load();
   const staging = new FileStagingStore(files, ".git/index");
   await staging.read();

@@ -178,7 +178,67 @@ describe("GitStashStore", () => {
       expect(content).toBeDefined();
       // git's line: <old> <new> <ident>\t<message>, the message "On <branch>: <message>"
       expect(content).toMatch(
-        /^0{40} [0-9a-f]{40} Git Stash <stash@localhost> \d+ \+0000\tOn main: My stash\n$/,
+        /^0{40} [0-9a-f]{40} webrun-vcs <vcs@localhost> \d+ [+-]\d{4}\tOn main: My stash\n$/,
+      );
+    });
+
+    it("dates the default identity in the local offset", async () => {
+      const id = await stash.push("Local");
+      const commit = await repository.commits.loadCommit(id);
+      const minutes = -new Date(commit.committer.timestamp * 1000).getTimezoneOffset();
+      const sign = minutes < 0 ? "-" : "+";
+      const abs = Math.abs(minutes);
+      const offset = `${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}${String(abs % 60).padStart(2, "0")}`;
+      expect(commit.author).toEqual(commit.committer);
+      expect(commit.committer).toMatchObject({
+        name: "webrun-vcs",
+        email: "vcs@localhost",
+        tzOffset: offset,
+      });
+    });
+
+    it("takes the author and committer from the identity option, at each push", async () => {
+      const asked: string[] = [];
+      let clock = 1700000000;
+      const withIdentity = new GitStashStore({
+        history: repository,
+        staging: createMockStaging([createStagingEntry("file.txt", "blob-1")]),
+        worktree: createMockWorktree(
+          [createWorktreeEntry("file.txt")],
+          new Map([["file.txt", "blob-1"]]),
+        ),
+        getHead: async () => headCommitId,
+        getBranch: async () => "main",
+        identity: (role) => {
+          asked.push(role);
+          return role === "author"
+            ? { name: "Ann", email: "ann@x", timestamp: clock++, tzOffset: "+0200" }
+            : { name: "Cid", email: "cid@x", timestamp: clock++, tzOffset: "-0700" };
+        },
+      });
+      const id = await withIdentity.push({ message: "Mine", includeUntracked: true });
+      expect(asked).toEqual(["author", "committer"]);
+      const commit = await repository.commits.loadCommit(id);
+      expect(commit.author).toEqual({
+        name: "Ann",
+        email: "ann@x",
+        timestamp: 1700000000,
+        tzOffset: "+0200",
+      });
+      expect(commit.committer).toEqual({
+        name: "Cid",
+        email: "cid@x",
+        timestamp: 1700000001,
+        tzOffset: "-0700",
+      });
+      // the index and untracked commits too
+      for (const parent of commit.parents.slice(1)) {
+        const made = await repository.commits.loadCommit(parent);
+        expect([made.author.name, made.committer.name]).toEqual(["Ann", "Cid"]);
+      }
+      // the reflog line: the committer
+      expect(await gitFiles.text(".git/logs/refs/stash")).toMatch(
+        /^0{40} [0-9a-f]{40} Cid <cid@x> 1700000001 -0700\tOn main: Mine\n$/,
       );
     });
 
