@@ -13,8 +13,16 @@ import {
 import { OrderedMap } from "@statewalker/vcs-utils";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
+import {
+  AttributesResolver,
+  type ContentAttributesContext,
+  expandUserPath,
+  xdgConfigPath,
+} from "@statewalker/vcs-working-tree";
+
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   ALL_ENTRIES_NOT_INTERESTING,
@@ -29,6 +37,9 @@ import {
   treeEntryInteresting,
   treePathspec,
 } from "./pathspec.js";
+
+/** git log reads no index: the in-tree attributes files are the worktree's only. */
+const NO_INDEX = { attributesBlob: () => undefined };
 
 /**
  * Result of a log command iteration.
@@ -902,27 +913,68 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * The attributes `treeEntryInteresting` asks for (an `:(attr)` element): read as git's
-   * match_pathspec_attrs reads them, from the worktree's `.gitattributes` first, then the
-   * index's (git_check_attr, check-in direction).
+   * The attributes `treeEntryInteresting` asks for (an `:(attr)` element), read as git's
+   * match_pathspec_attrs reads them in `git log`: the check-in direction (the worktree's
+   * `.gitattributes` first, then the index's) with no index read, so only the worktree's
+   * files count, below `$GIT_DIR/info/attributes` and over `core.attributesFile` and the
+   * system file. A bare repository has no in-tree files (git 2.56 reads none without
+   * `attr.tree`): only the files outside the tree.
    */
   private async loadAttributes(ps: TreePathspec): Promise<void> {
     const attributes = ps.attributes;
     const path = attributes?.pending;
     if (!attributes || path === undefined) return;
     attributes.pending = undefined;
-    const filter = this.worktreeAccess?.contentFilter as
+    // a bare repository's working copy refuses its worktree: asked without touching it
+    const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
+    if (!worktree) {
+      attributes.values.set(path, await this.bareAttributes().get(path, attributes.names));
+      return;
+    }
+    const filter = worktree.contentFilter as
       | {
           attributes?(
             path: string,
             names: readonly string[],
-            direction?: "checkin",
+            direction?: ContentAttributesContext,
           ): Promise<Map<string, PathspecAttributeValue>>;
         }
       | undefined;
     if (!filter?.attributes)
       throw new GitApiError("pathspec magic 'attr' needs the attributes of a worktree");
-    attributes.values.set(path, await filter.attributes(path, attributes.names, "checkin"));
+    attributes.values.set(
+      path,
+      await filter.attributes(path, attributes.names, { direction: "checkin", index: NO_INDEX }),
+    );
+  }
+
+  private bareResolver?: AttributesResolver;
+
+  /** The attributes of a bare repository: builtin, system, global and `info/attributes`. */
+  private bareAttributes(): AttributesResolver {
+    if (this.bareResolver) return this.bareResolver;
+    const environment = hostEnvironmentOf(this._workingCopy);
+    const gitDir = (this._workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
+    const read = (file: string | undefined) =>
+      file && environment ? environment.readFile(file).catch(() => undefined) : undefined;
+    this.bareResolver = new AttributesResolver(
+      {
+        system: async () => read(environment?.systemAttributes),
+        global: async () => {
+          const configured = configValue(this._workingCopy, "core.attributesFile");
+          return read(
+            configured
+              ? expandUserPath(configured, environment)
+              : xdgConfigPath(environment, "attributes"),
+          );
+        },
+        info: async () =>
+          read(gitDir ? `${gitDir.replace(/\/+$/, "")}/info/attributes` : undefined),
+        inTree: async () => undefined,
+      },
+      { ignoreCase: configBool(this._workingCopy, "core.ignoreCase", false) },
+    );
+    return this.bareResolver;
   }
 
   /** A tree's raw bytes; git's "unable to read tree" when it is missing. */

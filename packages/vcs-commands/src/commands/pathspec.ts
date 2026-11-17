@@ -4,7 +4,7 @@
  * pruned tree diffs of `git log -- <pathspec>`).
  */
 
-import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import { wildmatch, wildmatchBytes } from "@statewalker/vcs-working-tree";
 
 export const MATCHED_RECURSIVELY = 1;
@@ -29,12 +29,15 @@ export interface PathspecItem {
   glob: boolean;
   /** `:(icase)`: case-insensitive */
   icase: boolean;
-  /** `match` holds the path's bytes, one character each (see {@link treePathspec}) */
+  /**
+   * `match` holds the path's bytes, one character each (see {@link treePathspec}); its
+   * lengths count bytes, and names are matched as their bytes ({@link pathspecName})
+   */
   bytes?: boolean;
   /**
-   * `:(prefix:N)`: the first N characters of `match` are a literal prefix (git's
-   * `item->prefix`, set when a pathspec is handed to another command); `match` is then taken
-   * as written, not normalised.
+   * `:(prefix:N)`: the first N bytes of the path are a literal prefix (git's `item->prefix`,
+   * set when a pathspec is handed to another command); `match` is then taken as written,
+   * not normalised, and held as bytes (`bytes`), so N may end inside a character as in git.
    */
   prefix?: number;
   /** `:(attr:...)`: the attributes a matching path must have (only where a caller allows it) */
@@ -156,10 +159,7 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
       const word = elem.slice(pos, pos + len);
       pos = next;
       if (word.startsWith("prefix:")) {
-        // strtol, to the end of the word
-        if (!/^\s*[-+]?\d+$/.test(word.slice(7)))
-          throw new Error("invalid parameter for pathspec magic 'prefix'");
-        prefix = Number.parseInt(word.slice(7), 10);
+        prefix = parsePrefixMagic(word.slice(7));
         continue;
       }
       if (word.startsWith("attr:")) {
@@ -195,8 +195,9 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
     rest = elem.slice(pos);
   }
   if (literal && glob) throw new Error("'literal' and 'glob' are incompatible");
-  // with prefix magic the path is taken as written (git's init_pathspec_item)
-  const match = prefix >= 0 ? rest : normalizePathspecPath(rest, elem);
+  // with prefix magic the path is taken as written (git's init_pathspec_item), and its
+  // lengths are bytes: the prefix may end inside a character
+  const match = prefix >= 0 ? byteString(rest) : normalizePathspecPath(rest, elem);
   if (prefix > match.length) throw new Error(`error initializing pathspec_item '${elem}'`);
   let nowildcardLen = match.length;
   if (!literal) {
@@ -217,9 +218,25 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
     exclude,
     glob,
     icase,
-    ...(prefix >= 0 ? { prefix } : {}),
+    ...(prefix >= 0 ? { prefix, bytes: true } : {}),
     ...(attr ? { attr } : {}),
   };
+}
+
+/**
+ * git's `strtol(pos + 7, &endptr, 10)` of `prefix:<n>`, which must use up the word: leading
+ * blanks and a sign allowed, no digits at all read as 0 (only for an empty number), the value
+ * clamped to a `long` and kept as an `int`. A negative prefix is no prefix magic.
+ */
+function parsePrefixMagic(text: string): number {
+  if (text === "") return 0;
+  if (!/^[ \t\n\v\f\r]*[-+]?\d+$/.test(text))
+    throw new Error("invalid parameter for pathspec magic 'prefix'");
+  let n = BigInt(text.trim());
+  const LONG_MAX = (1n << 63n) - 1n;
+  if (n > LONG_MAX) n = LONG_MAX;
+  else if (n < -LONG_MAX - 1n) n = -LONG_MAX - 1n;
+  return Number(BigInt.asIntN(32, n));
 }
 
 const isGlobSpecial = (c: string) => c === "*" || c === "?" || c === "[" || c === "\\";
@@ -267,15 +284,25 @@ function gitFnmatch(item: PathspecItem, pattern: string, string: string, prefix:
       string.length >= tail.length && psEqual(item, string.slice(string.length - tail.length), tail)
     );
   }
-  return wildmatch(pattern, string, { pathname: item.glob, casefold: item.icase });
+  const options = { pathname: item.glob, casefold: item.icase };
+  if (item.bytes) return wildmatchBytes(latin1Bytes(pattern), latin1Bytes(string), options);
+  return wildmatch(pattern, string, options);
 }
 
+/**
+ * A path as an element matches it: as it is, or as its bytes (one character each) for an
+ * element held as bytes (`:(prefix:N)`).
+ */
+export const pathspecName = (item: PathspecItem, name: string) =>
+  item.bytes ? byteString(name) : name;
+
 /** git's `match_pathspec_item`. */
-function matchPathspecItem(item: PathspecItem, name: string, flags: number): number {
+function matchPathspecItem(item: PathspecItem, path: string, flags: number): number {
   const { match } = item;
+  const name = pathspecName(item, path);
   const matchlen = match.length;
   const namelen = name.length;
-  // the prefix of `:(prefix:N)` compares exactly, even under icase (dir.c)
+  // the prefix of `:(prefix:N)` (bytes) compares exactly, even under icase (dir.c)
   if (item.prefix && item.icase && name.slice(0, item.prefix) !== match.slice(0, item.prefix))
     return 0;
   if (matchlen === 0) return MATCHED_RECURSIVELY;
@@ -362,6 +389,8 @@ export interface TreePathspecElement {
   wildmatch: { pathname: boolean; casefold: boolean };
   /** `:(attr:...)` requirements */
   attr: AttrMatch[] | undefined;
+  /** `:(prefix:N)`: its first N bytes compare case-sensitively even under icase (0: none) */
+  prefix: number;
 }
 
 /**
@@ -390,15 +419,21 @@ export interface TreePathspec {
 
 /** The elements as `tree_entry_interesting` matches them. */
 export function treePathspec(items: PathspecItem[]): TreePathspec {
-  const byteItems = items.map((item) => ({
-    ...item,
-    match: utf8Latin1(item.match),
-    nowildcardLen: utf8Latin1(item.match.slice(0, item.nowildcardLen)).length,
-    bytes: true,
-  }));
+  const byteItems = items.map((item) =>
+    item.bytes
+      ? item
+      : {
+          ...item,
+          match: byteString(item.match),
+          nowildcardLen: byteString(item.match.slice(0, item.nowildcardLen)).length,
+          bytes: true,
+        },
+  );
   const elements = items.map((item): TreePathspecElement => {
-    const match = UTF8.encode(item.match);
-    const nowildcardLen = UTF8.encode(item.match.slice(0, item.nowildcardLen)).length;
+    const match = item.bytes ? latin1Bytes(item.match) : encodeGitPath(item.match);
+    const nowildcardLen = item.bytes
+      ? item.nowildcardLen
+      : encodeGitPath(item.match.slice(0, item.nowildcardLen)).length;
     return {
       match,
       nowildcardLen,
@@ -409,6 +444,7 @@ export function treePathspec(items: PathspecItem[]): TreePathspec {
       tail: match.subarray(nowildcardLen),
       wildmatch: { pathname: item.glob, casefold: item.icase },
       attr: item.attr,
+      prefix: item.prefix && item.prefix > 0 ? item.prefix : 0,
     };
   });
   const names = [...new Set(items.flatMap((i) => (i.attr ?? []).map((a) => a.name)))];
@@ -421,8 +457,6 @@ export function treePathspec(items: PathspecItem[]): TreePathspec {
   };
 }
 
-const UTF8_DECODER = new TextDecoder();
-
 /**
  * git's `interesting:` label of `do_match`: an element with attributes matches a file only if
  * the file has them (`match_pathspec_attrs`); every directory is interesting then.
@@ -431,8 +465,8 @@ function interesting(ps: TreePathspec, el: TreePathspecElement, mode: number, re
   if (!el.attr) return result;
   never = ENTRY_NOT_INTERESTING;
   if (isDirMode(mode)) return ENTRY_INTERESTING;
-  const path =
-    UTF8_DECODER.decode(baseBytes) + UTF8_DECODER.decode(nameBytes.subarray(nameStart, nameEnd));
+  // the path as the worktree names it: bytes that are no UTF-8 kept apart (surrogateescape)
+  const path = decodeGitPath(baseBytes) + decodeGitPath(nameBytes.subarray(nameStart, nameEnd));
   const attributes = ps.attributes as NonNullable<TreePathspec["attributes"]>;
   const values = attributes.values.get(path);
   if (!values) {
@@ -454,13 +488,18 @@ function interesting(ps: TreePathspec, el: TreePathspecElement, mode: number, re
   return ENTRY_INTERESTING;
 }
 
-const UTF8 = new TextEncoder();
-
-/** A string's UTF-8 bytes, one character each. */
-export function utf8Latin1(s: string): string {
+/** A path's git bytes (`encodeGitPath`: escaped bytes as they were), one character each. */
+export function byteString(s: string): string {
   // biome-ignore lint/suspicious/noControlCharactersInRegex: ASCII fast path
   if (/^[\x00-\x7f]*$/.test(s)) return s;
-  return latin1String(UTF8.encode(s));
+  return latin1String(encodeGitPath(s));
+}
+
+/** A string of one character per byte as its bytes. */
+function latin1Bytes(s: string): Uint8Array {
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
 }
 
 /** Bytes as a string of one character per byte. */
@@ -552,9 +591,21 @@ function matchEntry(el: TreePathspecElement, from: number, mode: number): boolea
   return m === 0;
 }
 
-/** git's `basecmp` (the elements are from the top: no prefix). */
-const basecmp = (el: TreePathspecElement, len: number) =>
-  strncmpBytes(baseBytes, 0, baseBytes.length, el.match, 0, el.match.length, len, el.icase);
+/**
+ * git's `basecmp`: `strncmp`, or under icase the first `item->prefix` bytes exactly and the
+ * rest case-insensitively.
+ */
+function basecmp(el: TreePathspecElement, len: number): number {
+  const baseEnd = baseBytes.length;
+  const matchEnd = el.match.length;
+  if (el.icase && el.prefix > 0) {
+    const n = len > el.prefix ? el.prefix : len;
+    const r = strncmpBytes(baseBytes, 0, baseEnd, el.match, 0, matchEnd, n, false);
+    if (r) return r;
+    return strncmpBytes(baseBytes, n, baseEnd, el.match, n, matchEnd, len - n, true);
+  }
+  return strncmpBytes(baseBytes, 0, baseEnd, el.match, 0, matchEnd, len, el.icase);
+}
 
 /** git's `match_dir_prefix`: the base lies at or below the element. */
 function matchDirPrefix(el: TreePathspecElement, matchlen: number): boolean {
@@ -718,10 +769,10 @@ export function treeEntryInteresting(
  * without a trailing "/"; undefined when that is empty (no filter can be used then).
  */
 export function bloomPathOf(item: PathspecItem): string | undefined {
-  const match = item.bytes ? item.match : utf8Latin1(item.match);
+  const match = item.bytes ? item.match : byteString(item.match);
   let len = item.bytes
     ? item.nowildcardLen
-    : utf8Latin1(item.match.slice(0, item.nowildcardLen)).length;
+    : byteString(item.match.slice(0, item.nowildcardLen)).length;
   if (len !== match.length) {
     while (len > 0 && match[len - 1] !== "/") len--;
   }

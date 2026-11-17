@@ -631,3 +631,295 @@ describeGit("log keeps a few dozen bytes per commit it walks", () => {
     }
   }, 120_000);
 });
+
+/**
+ * Paths whose bytes matter: two directories that differ in case only, a non-ASCII directory
+ * and names (two bytes per "Ä"), and names that are no UTF-8 (raw bytes 0xfe and 0xff).
+ */
+const BYTE_FILES: Uint8Array[] = ["a", "d/x", "D/X", "Ä/x", "Ä/y", "Äb", "q/r", "bad1"].map((p) =>
+  new TextEncoder().encode(p),
+);
+BYTE_FILES.push(Uint8Array.of(0x6e, 0xff, 0x78), Uint8Array.of(0x6e, 0xfe, 0x78));
+
+/** A path in a fast-import stream: quoted, every byte outside printable ASCII in octal. */
+function quoteFastImportPath(bytes: Uint8Array): string {
+  let out = '"';
+  for (const b of bytes) {
+    if (b >= 0x20 && b < 0x7f && b !== 0x22 && b !== 0x5c) out += String.fromCharCode(b);
+    else out += `\\${b.toString(8).padStart(3, "0")}`;
+  }
+  return `${out}"`;
+}
+
+/** A random history over {@link BYTE_FILES} (each commit states its whole tree). */
+function randomByteHistory(seed: number, count: number): string {
+  const r = rng(seed);
+  const out: string[] = [];
+  const trees: Map<number, string>[] = [new Map()];
+  let time = 1500000000;
+  const data = (s: string) => out.push(`data ${Buffer.byteLength(s)}\n${s}\n`);
+  for (let mark = 1; mark <= count; mark++) {
+    const parents: number[] = [];
+    if (mark > 1) {
+      parents.push(r.chance(0.7) ? mark - 1 : 1 + r.int(mark - 1));
+      if (mark > 3 && r.chance(0.25)) {
+        const second = 1 + r.int(mark - 1);
+        if (second !== parents[0]) parents.push(second);
+      }
+    }
+    const tree = new Map(trees[parents[0] ?? 0] as Map<number, string>);
+    if (parents.length > 1 && r.chance(0.5)) {
+      for (const [f, v] of trees[parents[1] as number] as Map<number, string>) {
+        if (r.chance(0.5)) tree.set(f, v);
+      }
+    }
+    const changes = 1 + r.int(2);
+    for (let i = 0; i < changes; i++) {
+      const f = r.int(BYTE_FILES.length);
+      if (tree.has(f) && r.chance(0.15)) tree.delete(f);
+      else tree.set(f, `${f} ${mark} ${i}\n`);
+    }
+    trees.push(tree);
+    time += r.chance(0.2) ? -(50 + r.int(300)) : 10 + r.int(100);
+    out.push(`commit refs/heads/main\nmark :${mark}\n`);
+    out.push(`committer C O Mitter <c@example.com> ${time} +0000\n`);
+    data(`commit ${mark}\n`);
+    if (parents.length > 0) out.push(`from :${parents[0]}\n`);
+    if (parents.length > 1) out.push(`merge :${parents[1]}\n`);
+    out.push("deleteall\n");
+    for (const [f, content] of tree) {
+      out.push(`M 100644 inline ${quoteFastImportPath(BYTE_FILES[f] as Uint8Array)}\n`);
+      data(content);
+    }
+    out.push("\n");
+  }
+  return out.join("");
+}
+
+/**
+ * Attribute magic with the root `.gitattributes` only in the index (git log reads no index:
+ * those rules do not count), the worktree's `d/.gitattributes`, `info/attributes`,
+ * `core.attributesFile` and names that are no UTF-8; `:(icase,prefix:N)` (the prefix stays
+ * case-sensitive) and `:(prefix:N)` counting bytes, also inside a character.
+ */
+const BYTE_FORMS: string[][] = [
+  [":(attr:foo)"],
+  [":(attr:!foo)"],
+  [":(attr:-foo)"],
+  [":(attr:foo=v)"],
+  [":(attr:foo=w)"],
+  [":(attr:binary)"],
+  [":(attr:-text)"],
+  [":(attr:info)"],
+  [":(attr:glob)"],
+  [":(attr:raw=ff)"],
+  [":(attr:raw=fe)"],
+  [":(attr:!raw)"],
+  ["Ä", ":(exclude,attr:info)"],
+  [":(icase,prefix:2)D/x"],
+  [":(icase,prefix:2)d/X"],
+  [":(icase,prefix:1)D/x"],
+  [":(icase,prefix:0)D/x"],
+  [":(icase)D/x"],
+  [":(icase,prefix:2)D/*"],
+  [":(icase,prefix:1)d*"],
+  [":(prefix:3)Ä/*"],
+  [":(prefix:2)Ä/*"],
+  [":(prefix:1)Ä*"],
+  [":(prefix:1)Äb"],
+  [":(prefix:3)Ä/x"],
+  [":(prefix:4)Ä/x"],
+  [":(icase,prefix:1)Ä/X"],
+  [":(icase,prefix:3)Ä/X"],
+  [":(prefix:)Ä/y"],
+  [":(prefix:-1)Ä/./y"],
+  [":(prefix:+2)d/x"],
+  [":(prefix: 2)D/X"],
+  // strtol's long, kept as an int: 2^32 + 2 is 2, LONG_MIN is 0
+  [":(prefix:4294967298)d/x"],
+  [":(prefix:-99999999999999999999)d/x"],
+];
+
+describeGit("log -- :(attr) / :(icase,prefix) / multibyte :(prefix) against native git", () => {
+  let root: string;
+  const env = () => nativeGitEnv(root);
+  const gitIn = (dir: string, args: string[], input?: string | Buffer) =>
+    execFileSync("git", args, {
+      cwd: dir,
+      env: env(),
+      encoding: "utf8",
+      input,
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-byte-fuzz-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const seed of SEEDS.slice(0, 2)) {
+    it(`seed ${seed}: index-only attributes, icase prefixes and byte prefixes as git`, async () => {
+      const dir = join(root, `repo-${seed}`);
+      execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+      gitIn(dir, ["fast-import", "--quiet"], randomByteHistory(seed, COMMITS));
+      gitIn(dir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+      // the root .gitattributes staged only: git log does not read the index
+      const staged = gitIn(
+        dir,
+        ["hash-object", "-w", "--stdin"],
+        "d/* foo\nÄ/* foo=v\nbad* foo=w\nq/* binary\n",
+      ).trim();
+      gitIn(dir, ["update-index", "--add", "--cacheinfo", `100644,${staged},.gitattributes`]);
+      mkdirSync(join(dir, "d"), { recursive: true });
+      writeFileSync(join(dir, "d", ".gitattributes"), "x -foo\n");
+      writeFileSync(join(root, `global-${seed}`), "D/* glob\n");
+      gitIn(dir, ["config", "core.attributesFile", join(root, `global-${seed}`)]);
+      // a rule per raw name (decoded to U+FFFD the two would be one name)
+      mkdirSync(join(dir, ".git", "info"), { recursive: true });
+      writeFileSync(
+        join(dir, ".git", "info", "attributes"),
+        Buffer.concat([
+          Buffer.from("Äb info\nq/r -text\n"),
+          Buffer.from([0x6e, 0xff, 0x78]),
+          Buffer.from(" raw=ff\n"),
+          Buffer.from([0x6e, 0xfe, 0x78]),
+          Buffer.from(" raw=fe\n"),
+        ]),
+      );
+      const ids = gitIn(dir, ["rev-list", "--all"]).split("\n").filter(Boolean);
+
+      for (const graph of [false, true]) {
+        if (graph) gitIn(dir, ["commit-graph", "write", "--reachable", "--changed-paths"]);
+        const files = createNodeFilesApi({ rootDir: dir });
+        const environment = createNodeGitHostEnvironment({ env: env() });
+        const { history } = await createGitFilesBackend({ files });
+        const worktrees = await openGitLinkedWorktrees({
+          files,
+          gitDir: ".git",
+          history,
+          environment,
+        });
+        const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+        const r = rng(seed * 7919 + (graph ? 1 : 0));
+        const queries: string[][] = [...BYTE_FORMS];
+        for (let i = 0; i < 20; i++) queries.push(r.pick(BYTE_FORMS));
+        for (const paths of queries) {
+          const revs = r.chance(0.5) ? ["--all"] : [r.pick(ids)];
+          const args: string[] = [];
+          const firstParent = r.chance(0.2);
+          if (firstParent) args.push("--first-parent");
+          const max = r.chance(0.2) ? 1 + r.int(4) : undefined;
+          if (max !== undefined) args.push(`--max-count=${max}`);
+          const theirs = gitIn(dir, ["log", "--format=%H", ...args, ...revs, "--", ...paths])
+            .split("\n")
+            .filter(Boolean);
+          let command = git.log();
+          if (revs[0] === "--all") command = command.all();
+          else command = command.add(revs[0] as string);
+          for (const p of paths) command = command.addPath(p);
+          if (firstParent) command = command.setFirstParent(true);
+          if (max !== undefined) command = command.setMaxCount(max);
+          const mine: string[] = [];
+          for await (const c of await command.call()) mine.push(c.id);
+          const label = [graph, ...args, ...paths].join(" ");
+          expect([label, mine]).toEqual([label, theirs]);
+        }
+      }
+    }, 120_000);
+  }
+});
+
+describeGit("log -- :(attr) in a bare repository reads no in-tree attributes (git 2.56)", () => {
+  let root: string;
+  const env = () => nativeGitEnv(root);
+  const gitIn = (dir: string, args: string[], input?: string) =>
+    execFileSync("git", args, { cwd: dir, env: env(), encoding: "utf8", input });
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-attr-bare-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it("only builtin, global and info/attributes count; HEAD's .gitattributes does not", async () => {
+    const work = join(root, "work");
+    const bare = join(root, "bare.git");
+    execFileSync("git", ["init", "-q", "-b", "main", work], { env: env() });
+    writeFileSync(join(work, ".gitattributes"), "x foo\n");
+    for (let i = 0; i < 4; i++) {
+      writeFileSync(join(work, i % 2 ? "x" : "y"), `${i}\n`);
+      gitIn(work, ["add", "-A"]);
+      gitIn(work, ["commit", "-q", "-m", `c${i}`]);
+    }
+    execFileSync("git", ["clone", "-q", "--bare", work, bare], { env: env() });
+    mkdirSync(join(bare, "info"), { recursive: true });
+    writeFileSync(join(bare, "info", "attributes"), "y foo\n");
+
+    const files = createNodeFilesApi({ rootDir: bare });
+    const environment = createNodeGitHostEnvironment({ env: env() });
+    const { history } = await createGitFilesBackend({ files, gitDir: "." });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".", history, environment });
+    const git = Git.fromWorktreeAdmin(await worktrees.openAdmin());
+    const ours = async (paths: string[]) => {
+      let command = git.log();
+      for (const p of paths) command = command.addPath(p);
+      const out: string[] = [];
+      for await (const c of await command.call()) out.push(c.id);
+      return out;
+    };
+    const log = (paths: string[]) =>
+      gitIn(bare, ["log", "--format=%H", "--", ...paths])
+        .split("\n")
+        .filter(Boolean);
+    // git 2.56 (attr.tree unset): what info/attributes names, as `log -- y` lists it
+    expect(await ours([":(attr:foo)"])).toEqual(log(["y"]));
+    expect(await ours([":(attr:!foo)"])).toEqual(log(["x", ".gitattributes"]));
+    const version = /(\d+)\.(\d+)/.exec(gitIn(root, ["--version"])) ?? [];
+    // git 2.43 still read HEAD's attributes in a bare repository
+    if (Number(version[1]) > 2 || Number(version[2]) >= 50) {
+      for (const paths of [[":(attr:foo)"], [":(attr:!foo)"], [":(attr:-foo)"]]) {
+        expect(await ours(paths)).toEqual(log(paths));
+      }
+    }
+  });
+});
+
+describeGit("log -- :(prefix:<n>) refuses what git refuses", () => {
+  let root: string;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-prefix-bad-"));
+    execFileSync("git", ["init", "-q", "-b", "main", root], { env: nativeGitEnv(root) });
+    execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "c"], {
+      cwd: root,
+      env: nativeGitEnv(root),
+    });
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it.each([":(prefix:abc)a", ":(prefix: )a", ":(prefix:2x)a", ":(prefix:+)a"])(
+    "%s: invalid parameter for pathspec magic 'prefix'",
+    async (spec) => {
+      let stderr = "";
+      try {
+        execFileSync("git", ["log", "--", spec], {
+          cwd: root,
+          env: nativeGitEnv(root),
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (e) {
+        stderr = String((e as { stderr?: Buffer }).stderr);
+      }
+      expect(stderr).toContain("invalid parameter for pathspec magic 'prefix'");
+      const files = createNodeFilesApi({ rootDir: root });
+      const { history } = await createGitFilesBackend({ files });
+      const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history });
+      const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+      await expect(
+        (async () => {
+          for await (const _ of await git.log().addPath(spec).call()) {
+            // nothing: the pathspec is refused first
+          }
+        })(),
+      ).rejects.toThrow("invalid parameter for pathspec magic 'prefix'");
+    },
+  );
+});

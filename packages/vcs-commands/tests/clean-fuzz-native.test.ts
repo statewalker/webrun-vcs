@@ -1227,3 +1227,53 @@ describeGit("ignore rules as git check-ignore (review repros A-C)", () => {
     });
   }
 });
+
+describeGit("clean -- :(prefix:N) counts bytes, as git", () => {
+  let root = "";
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-prefix-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const SPECS = [
+    ":(prefix:3)Ä/*",
+    ":(prefix:2)Ä/*",
+    ":(prefix:1)Ä*",
+    ":(prefix:1)Äb",
+    ":(prefix:3)Ä/x",
+    ":(icase,prefix:1)Ä/X",
+    ":(icase,prefix:2)D/x",
+    ":(icase,prefix:2)d/X",
+    ":(icase,prefix:0)D/x",
+    ":(icase,prefix:1)d*",
+    ":(prefix:)Äb",
+    ":(prefix:-1)Ä/./y",
+    ":(prefix:+2)d/x",
+  ];
+
+  for (const spec of SPECS) {
+    it(`clean -n -d -- '${spec}' removes git's paths`, async () => {
+      const dir = join(root, "repo");
+      execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+      for (const p of ["Ä/x", "Ä/y", "Äb", "Äc/z", "d/x", "D/X", "d/y"])
+        put(join(dir, p), `${p}\n`);
+      const theirs = git(dir, "-c", "core.quotePath=false", "clean", "-n", "-d", "--", spec)
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => l.replace(/^Would remove /, ""))
+        .sort();
+      const files = createNodeFilesApi({ rootDir: dir });
+      const { history } = await createGitFilesBackend({ files });
+      const { openGitLinkedWorktrees } = await import("@statewalker/vcs-store-files");
+      const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history });
+      const ours = await Git.fromWorkingCopy(await worktrees.openCurrent())
+        .clean()
+        .setDryRun(true)
+        .setCleanDirectories(true)
+        .setPaths(new Set([spec]))
+        .call();
+      const mine = [...ours.cleaned].sort();
+      expect([spec, mine]).toEqual([spec, theirs]);
+    });
+  }
+});
