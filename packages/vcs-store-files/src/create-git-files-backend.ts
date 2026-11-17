@@ -17,6 +17,7 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
+import { createFilesCommitGraphProvider } from "./commit-graph.js";
 import { readDeltaBaseCacheLimit, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore } from "./refs/ref-store.files.js";
@@ -91,7 +92,8 @@ export interface GitFilesBackendResult {
  * 2. openPackSet over objects/pack, read through withPacks (packs first, then loose)
  * 3. FileRawStorage over the same loose files, for gc and repack
  * 4. FileRefStore (Refs)
- * 5. Composed into History via createHistoryFromComponents()
+ * 5. The commit-graph provider (`objects/info/commit-graph`, read on first use as git does)
+ * 6. Composed into History via createHistoryFromComponents()
  *
  * The repository's format is checked first, as git does (`readRepositoryFormat`): a
  * `core.repositoryformatversion` above 1, an unknown version-1 extension, or one we do not
@@ -161,10 +163,13 @@ export async function createGitFilesBackend(
   // HEAD as git init writes it (create_symref): `ref: …` into HEAD.lock, renamed over HEAD
   if (create) await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
+  // the commit-graph (objects/info/commit-graph or its split chain), read on first use
+  const commitGraph = createFilesCommitGraphProvider({ files, gitDir, refs: refStore });
   const history = createHistoryFromComponents({
     objects,
     refs: refStore,
     packs,
+    commitGraph,
   });
 
   return { history, objects, packs, looseStorage, files, gitDir };

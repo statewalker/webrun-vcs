@@ -9,7 +9,7 @@
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 
 import type { CommandCommits, CommandTrees } from "../git-command.js";
-import { type BaseNode, MergeBaseGraph } from "./merge-bases.js";
+import { type BaseNode, commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { abbrev, flatTree, prunedFlatTrees } from "./merge-support.js";
 import {
   type OrtMergeOptions,
@@ -53,13 +53,11 @@ export async function mergeBaseTree(
   options: Omit<OrtMergeOptions, "oursLabel" | "theirsLabel" | "baseLabel">,
 ): Promise<MergeBaseTree> {
   if (bases.length === 0) return emptyBase();
-  const graph = new MergeBaseGraph({
-    load: async (id) => {
-      const commit = await ctx.commits.load(id);
-      return commit ? { parents: commit.parents, date: commit.committer.timestamp } : undefined;
-    },
-    tree: async (id) => flatTree(ctx.trees, await ctx.commits.getTree(id)),
-  });
+  const graph = new MergeBaseGraph(
+    commitsBaseSource(ctx.commits, async (id) =>
+      flatTree(ctx.trees, await ctx.commits.getTree(id)),
+    ),
+  );
   // all the merge bases, in git's order (the list given may hold only the best one)
   const ordered = await graph.mergeBases(graph.commit(h1), graph.commit(h2));
   const nodes = ordered.length > 0 ? ordered : bases.map((id) => graph.commit(id));

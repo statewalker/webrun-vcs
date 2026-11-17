@@ -7,6 +7,7 @@
 
 import type { ObjectId } from "../../common/index.js";
 import type { PersonIdent } from "../../common/person/person-ident.js";
+import type { CommitGraphProvider } from "../commit-graph/commit-graph-provider.js";
 import type { ObjectStorage } from "../objects/index.js";
 
 /**
@@ -38,6 +39,24 @@ export interface Commit {
   encoding?: string;
   /** GPG signature (optional) */
   gpgSignature?: string;
+}
+
+/**
+ * What history walks read of a commit: its tree, parents and committer time, and its
+ * generation number when the commit-graph has it.
+ */
+export interface CommitHeader {
+  /** ObjectId of the root tree */
+  tree: ObjectId;
+  /** Parent commit ObjectIds */
+  parents: ObjectId[];
+  /** Committer time, seconds since the epoch */
+  commitTime: number;
+  /**
+   * The commit-graph's generation (corrected commit date, or topological level for a graph
+   * without generation data v2); Infinity when the commit is not in the graph
+   */
+  generation: number;
 }
 
 /**
@@ -91,6 +110,17 @@ export interface Commits extends ObjectStorage<Commit> {
    * @returns Array of parent commit IDs (empty for root commits)
    */
   getParents(commitId: ObjectId): Promise<ObjectId[]>;
+
+  /**
+   * The commit's tree, parents, committer time and generation: from the commit-graph when it
+   * has the commit (the commit is not read), else parsed. Undefined when the commit is missing.
+   */
+  getHeader?(commitId: ObjectId): Promise<CommitHeader | undefined>;
+
+  /**
+   * The commit-graph this store reads (stores over a git repository's files), if any.
+   */
+  readonly commitGraph?: CommitGraphProvider;
 
   /**
    * Get tree ID for a commit

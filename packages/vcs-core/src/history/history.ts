@@ -27,6 +27,7 @@ import type { PackSet } from "../pack/pack-set.js";
 import type { SerializationApi } from "../serialization/serialization-api.js";
 import type { DeltaApi } from "../storage/delta/delta-api.js";
 import type { Blobs } from "./blobs/blobs.js";
+import type { CommitGraphProvider } from "./commit-graph/commit-graph-provider.js";
 import type { Commits } from "./commits/commits.js";
 import type { GitObjects } from "./objects/git-objects.js";
 import type { Refs } from "./refs/refs.js";
@@ -96,6 +97,13 @@ export interface History {
    * are kept here instead of being unpacked (git's `transfer.unpackLimit`).
    */
   readonly packs?: PackSet;
+
+  /**
+   * The repository's commit-graph (`objects/info/commit-graph` or a split chain), for backends
+   * over git's files: the commit store reads parents, trees, dates and generation numbers from
+   * it; `writeCommitGraph` and gc invalidate it after writing.
+   */
+  readonly commitGraph?: CommitGraphProvider;
 
   /**
    * Initialize the history store

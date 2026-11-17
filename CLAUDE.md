@@ -113,6 +113,8 @@ git push                                        # MANDATORY
 - **Gitea oracle**: `GITEA=1 pnpm --filter @statewalker/vcs-testing-gitea test` runs a real Gitea (test infra; Node APIs allowed in that package via a biome override)
 - **Sorted directory listings**: Node `fs.readdir`, and so FilesApi `list`, returns names sorted, so git behaviour that depends on filesystem order (readdir order of loose objects, reflogs) cannot be reproduced; tests sort such output
 - **`git fsck` in 2.5x**: it runs `git refs verify` unless given `--no-references` (`FsckCommand` matches `fsck --no-references`), and dies under `--connectivity-only` on a corrupt packed object
+- **Missing files in memory**: `createInMemoryFilesApi().read()` of a missing path yields no bytes instead of failing with ENOENT, so `tryReadFile` returns an empty array there; check `stats(path)?.kind === "file"` first when a missing file must read as absent
+- **Commit-graphs and replace refs**: `git commit-graph write` disables replace refs and writes a graph anyway; `git gc` (in-process, replace refs on) writes none, and readers ignore a graph while `refs/replace/` has refs (`commitGraphCompatible`)
 - **Funcname patterns**: `diff.<driver>.xfuncname`/`funcname` and the builtin driver patterns are POSIX regexes; run them through `compilePosixRegex` (vcs-utils `regex/`), never a JavaScript `RegExp` (different semantics, catastrophic backtracking)
 
 ## Self-Maintenance

@@ -6,7 +6,7 @@ import type { PullResult } from "../results/pull-result.js";
 import { isRebaseSuccessful, RebaseStatus } from "../results/rebase-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { FetchCommand, TagOption } from "./fetch-command.js";
-import { MergeBaseGraph } from "./merge-bases.js";
+import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { MergeCommand } from "./merge-command.js";
 import { configValue } from "./merge-config.js";
 import { RebaseCommand } from "./rebase-command.js";
@@ -382,13 +382,7 @@ export class PullCommand extends TransportCommand<PullResult> {
    */
   private async canFastForward(head: string, upstream: string): Promise<boolean> {
     if (head === upstream) return true;
-    const graph = new MergeBaseGraph({
-      load: async (id) => {
-        const commit = await this.commits.load(id).catch(() => undefined);
-        return commit ? { parents: commit.parents, date: commit.committer.timestamp } : undefined;
-      },
-      tree: async () => new Map(),
-    });
+    const graph = new MergeBaseGraph(commitsBaseSource(this.commits, async () => new Map()));
     const bases = await graph.mergeBases(graph.commit(head), graph.commit(upstream));
     return bases.some((b) => b.id === head);
   }

@@ -1,4 +1,5 @@
 import {
+  commitGraphCompatible,
   type FilesApi,
   type GitObject,
   type GitObjects,
@@ -6,10 +7,13 @@ import {
   openPack,
   type PackFile,
   type PackIndex,
+  parseGraphCommit,
   type Refs,
+  readCommitGraph,
   readPackIndex,
   runSteps,
   type Steps,
+  verifyCommitGraph,
 } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
@@ -22,7 +26,7 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../../git-command.js";
-import { configValue } from "../merge-config.js";
+import { configBool, configValue } from "../merge-config.js";
 import { DEFAULT_BIG_FILE_THRESHOLD, readLooseObject } from "./fsck-loose.js";
 import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId } from "./fsck-msg-ids.js";
 import {
@@ -61,6 +65,8 @@ export const FSCK_ERROR_OBJECT = 0o1;
 export const FSCK_ERROR_REACHABLE = 0o2;
 export const FSCK_ERROR_PACK = 0o4;
 export const FSCK_ERROR_REFS = 0o10;
+/** `git commit-graph verify` failed (git's ERROR_COMMIT_GRAPH). */
+export const FSCK_ERROR_COMMIT_GRAPH = 0o20;
 
 /** What one line of fsck's output reports. */
 export type FsckFindingKind =
@@ -81,7 +87,9 @@ export type FsckFindingKind =
   /** anything else git prints with `error()` (corrupt objects and packs, bad refs) */
   | "error"
   /** `notice: ...` and `bad sha1 file: ...` */
-  | "notice";
+  | "notice"
+  /** what `git commit-graph verify` prints (fsck runs it unless `core.commitGraph` is false) */
+  | "commit-graph";
 
 /** One line of output, as git prints it, with what it is about. */
 export interface FsckFinding {
@@ -187,7 +195,11 @@ const pathOf = (...parts: string[]) => parts.join("/");
  * one sequential read each (see `fsck-pack.ts`); `--connectivity-only` inflates no blob (a
  * dangling one's type comes from its pack entry's header).
  *
- * Not done: the ref database checks of `git refs verify` (git 2.45+), commit-graph,
+ * Over a files repository the commit-graph is verified as git's fsck runs `git commit-graph
+ * verify` (unless `core.commitGraph` is false): its messages follow the rest on stderr and a
+ * failure sets exit bit 16 (`FSCK_ERROR_COMMIT_GRAPH`).
+ *
+ * Not done: the ref database checks of `git refs verify` (git 2.45+),
  * multi-pack-index, bitmap and reverse-index verification, promisor objects, alternates,
  * `fsck.skipList`, and explicit `<object>` heads.
  *
@@ -346,6 +358,14 @@ export class FsckCommand extends GitCommand<FsckResult> {
       compatibility: this._compatibility,
       repository: this._repository,
       bigFileThreshold,
+      commitGraph: {
+        enabled: configBool(this.workingCopy, "core.commitGraph", true),
+        generationVersion:
+          intValue(configValue(this.workingCopy, "commitGraph.generationVersion")) ?? 2,
+        changedPathsVersion:
+          intValue(configValue(this.workingCopy, "commitGraph.changedPathsVersion")) ??
+          (configBool(this.workingCopy, "commitGraph.readChangedPaths", true) ? -1 : 0),
+      },
     });
     return run.run();
   }
@@ -371,6 +391,14 @@ interface RunOptions {
   repository?: FsckRepositoryFiles;
   /** `core.bigFileThreshold`: larger loose blobs are streamed */
   bigFileThreshold: number;
+  /** `core.commitGraph` and the graph read settings, for `git commit-graph verify` */
+  commitGraph: { enabled: boolean; generationVersion: number; changedPathsVersion: number };
+}
+
+/** A git integer setting (decimal), undefined when unset or not a number. */
+function intValue(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\s*[-+]?\d+\s*$/.test(value)) return undefined;
+  return Number.parseInt(value, 10);
 }
 
 /** A pack of the repository, with its idx read (for `has_object_pack`). */
@@ -489,6 +517,7 @@ class FsckRun {
     } finally {
       for (const pack of this.opened.values()) pack?.close();
     }
+    await this.verifyCommitGraph();
 
     const out = this.findings.filter((f) => f.stream === "stdout").map((f) => `${f.text}\n`);
     const err = this.findings.filter((f) => f.stream === "stderr").map((f) => `${f.text}\n`);
@@ -498,6 +527,57 @@ class FsckRun {
       output: out.join(""),
       errorOutput: err.join(""),
     };
+  }
+
+  /**
+   * git's fsck runs `git commit-graph verify --object-dir <objects>` when `core.commitGraph`
+   * is on: its stderr follows, and a failure sets ERROR_COMMIT_GRAPH.
+   */
+  private async verifyCommitGraph(): Promise<void> {
+    const settings = this.o.commitGraph;
+    if (!this.files || !settings.enabled) return;
+    const objects = this.objects;
+    const objectsDir = `${this.gitDir}/objects`;
+    // fsck itself loads the graph when it parses the commit of a ref (parse_object looks it
+    // up there first; fsck disables replace refs): what loading prints comes once from fsck
+    if (
+      (await this.hasRefs()) &&
+      (await commitGraphCompatible({
+        files: this.files,
+        gitDir: this.gitDir,
+        useReplaceRefs: false,
+      }))
+    ) {
+      const read = await readCommitGraph(this.files, objectsDir, settings);
+      for (const d of read.diagnostics) {
+        this.emit({ kind: "commit-graph", stream: "stderr", text: `${d.level}: ${d.message}` });
+      }
+    }
+    const result = await verifyCommitGraph(
+      this.files,
+      objectsDir,
+      async (id) => {
+        try {
+          const o = await objects.get(id);
+          if (!o) return undefined;
+          const data = o.bytes ?? (await collect(o));
+          if (o.type !== "commit") return undefined;
+          return parseGraphCommit(data, id);
+        } catch {
+          return undefined;
+        }
+      },
+      { settings },
+    );
+    for (const text of result.messages) this.emit({ kind: "commit-graph", stream: "stderr", text });
+    if (result.exitCode !== 0) this.errorsFound |= FSCK_ERROR_COMMIT_GRAPH;
+  }
+
+  /** Whether HEAD or any ref names an object. */
+  private async hasRefs(): Promise<boolean> {
+    const refs = this.stores.refs;
+    for await (const ref of refs.list("refs/")) if (!isSymbolicRef(ref)) return true;
+    return (await refs.resolve("HEAD").catch(() => undefined))?.objectId !== undefined;
   }
 
   // ------------------------------------------------------------------------------------------

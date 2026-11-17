@@ -7,6 +7,8 @@
 
 import type { ObjectId } from "../../common/id/index.js";
 import { objectRemovalEpoch } from "../../storage/raw/object-removals.js";
+import { type CommitGraph, CommitGraphCorruptError } from "../commit-graph/commit-graph.js";
+import type { CommitGraphProvider } from "../commit-graph/commit-graph-provider.js";
 import type { GitObject, GitObjects } from "../objects/git-objects.js";
 import {
   hasObjectOfType,
@@ -21,7 +23,17 @@ import {
   encodeCommitEntries,
   entriesToCommit,
 } from "./commit-format.js";
-import type { AncestryOptions, Commit, Commits } from "./commits.js";
+import { getMergeBases, isAncestorOf, type ReachCommit } from "./commit-reach.js";
+import type { AncestryOptions, Commit, CommitHeader, Commits } from "./commits.js";
+
+/** Options of `createCommits`. */
+export interface CommitsOptions {
+  /**
+   * The repository's commit-graph: parents, trees, commit times and generation numbers of the
+   * commits it has are read from it instead of from the commits (git's parse_commit_in_graph).
+   */
+  commitGraph?: CommitGraphProvider;
+}
 
 /**
  * Git commit store implementation
@@ -37,7 +49,102 @@ class GitCommitStore implements Commits {
    */
   private readonly cache = new Map<ObjectId, { commit: Commit; epoch: number }>();
 
-  constructor(private readonly objects: GitObjects) {}
+  readonly commitGraph?: CommitGraphProvider;
+
+  constructor(
+    private readonly objects: GitObjects,
+    options: CommitsOptions = {},
+  ) {
+    this.commitGraph = options.commitGraph;
+  }
+
+  /** The commit-graph, loaded on first use; undefined when there is none. */
+  private graph(): CommitGraph | undefined | Promise<CommitGraph | undefined> {
+    const provider = this.commitGraph;
+    if (!provider) return undefined;
+    const now = provider.current();
+    return now === null ? provider.get().catch(() => undefined) : now;
+  }
+
+  /** The header of a commit the graph has, or undefined (not in it, or a corrupt record). */
+  private fromGraph(graph: CommitGraph, id: ObjectId): CommitHeader | undefined {
+    const pos = graph.position(id);
+    if (pos < 0) return undefined;
+    try {
+      return {
+        tree: graph.treeAt(pos),
+        parents: graph.parentsAt(pos),
+        commitTime: graph.commitTimeAt(pos),
+        generation: graph.generationAt(pos),
+      };
+    } catch (e) {
+      // git dies on a corrupt graph; the commit itself is read instead
+      if (e instanceof CommitGraphCorruptError) return undefined;
+      throw e;
+    }
+  }
+
+  /**
+   * The commit's tree, parents, committer time and generation: from the commit-graph when it
+   * has the commit (nothing is read), else from the commit (generation Infinity).
+   */
+  async getHeader(id: ObjectId): Promise<CommitHeader | undefined> {
+    const g = this.graph();
+    const graph = g instanceof Promise ? await g : g;
+    if (graph) {
+      const header = this.fromGraph(graph, id);
+      if (header) return header;
+    }
+    const commit = await this.load(id);
+    if (!commit) return undefined;
+    return {
+      tree: commit.tree,
+      parents: commit.parents,
+      commitTime: commit.committer.timestamp,
+      generation: Number.POSITIVE_INFINITY,
+    };
+  }
+
+  /** The parents of a commit the loaded graph has (no promise), or undefined. */
+  private graphParents(id: ObjectId): ObjectId[] | undefined {
+    const graph = this.commitGraph?.current();
+    if (!graph) return undefined;
+    const pos = graph.position(id);
+    if (pos < 0) return undefined;
+    try {
+      return graph.parentsAt(pos);
+    } catch (e) {
+      if (e instanceof CommitGraphCorruptError) return undefined;
+      throw e;
+    }
+  }
+
+  /**
+   * The header as the reachability walks read it: without a promise for a commit the loaded
+   * graph has (no tree id decoded), else from the commit.
+   */
+  private readonly reach = (
+    id: ObjectId,
+  ): ReachCommit | undefined | Promise<ReachCommit | undefined> => {
+    const graph = this.commitGraph?.current();
+    if (graph) {
+      const pos = graph.position(id);
+      if (pos >= 0) {
+        try {
+          return {
+            parents: graph.parentsAt(pos),
+            date: graph.commitTimeAt(pos),
+            generation: graph.generationAt(pos),
+          };
+        } catch (e) {
+          if (!(e instanceof CommitGraphCorruptError)) throw e;
+        }
+      }
+    }
+    return this.getHeader(id).then((h) =>
+      h ? { parents: h.parents, date: h.commitTime, generation: h.generation } : undefined,
+    );
+  };
 
   // ============ New Commits Interface ============
 
@@ -113,16 +220,16 @@ class GitCommitStore implements Commits {
    * Get parent commit IDs
    */
   async getParents(id: ObjectId): Promise<ObjectId[]> {
-    const commit = await this.load(id);
-    return commit?.parents ?? [];
+    const g = this.graph();
+    if (g instanceof Promise) await g;
+    return this.graphParents(id) ?? (await this.getHeader(id))?.parents ?? [];
   }
 
   /**
    * Get tree ID for a commit
    */
   async getTree(id: ObjectId): Promise<ObjectId | undefined> {
-    const commit = await this.load(id);
-    return commit?.tree;
+    return (await this.getHeader(id))?.tree;
   }
 
   /**
@@ -154,7 +261,8 @@ class GitCommitStore implements Commits {
       yield id;
       count++;
 
-      const parents = await this.getParents(id);
+      // without a promise for a commit the loaded graph has
+      const parents = this.graphParents(id) ?? (await this.getParents(id));
       if (options.firstParentOnly && parents.length > 0) {
         stack.push(parents[0]);
       } else {
@@ -166,22 +274,16 @@ class GitCommitStore implements Commits {
   }
 
   /**
-   * Find merge base (common ancestor)
+   * The merge bases of two commits, as `git merge-base --all` lists them (git's
+   * repo_get_merge_bases): best first, none for unrelated histories. With a commit-graph that
+   * has corrected commit dates the walk is ordered by generation, as git orders it.
    */
   async findMergeBase(commitA: ObjectId, commitB: ObjectId): Promise<ObjectId[]> {
-    const ancestorsA = new Set<ObjectId>();
-
-    for await (const id of this.walkAncestry(commitA)) {
-      ancestorsA.add(id);
-    }
-
-    for await (const id of this.walkAncestry(commitB)) {
-      if (ancestorsA.has(id)) {
-        return [id];
-      }
-    }
-
-    return [];
+    const g = this.graph();
+    const graph = g instanceof Promise ? await g : g;
+    return getMergeBases(this.reach, commitA, [commitB], {
+      correctedDates: graph?.correctedDates ?? false,
+    });
   }
 
   /**
@@ -211,13 +313,10 @@ class GitCommitStore implements Commits {
    * Check if commitA is ancestor of commitB
    */
   async isAncestor(ancestorId: ObjectId, descendantId: ObjectId): Promise<boolean> {
-    if (ancestorId === descendantId) return true;
-    for await (const id of this.walkAncestry(descendantId)) {
-      if (id === ancestorId) {
-        return true;
-      }
-    }
-    return false;
+    const g = this.graph();
+    if (g instanceof Promise) await g;
+    // git's repo_in_merge_bases: the generations of commit-graph commits cut the walk short
+    return isAncestorOf(this.reach, ancestorId, descendantId);
   }
 }
 
@@ -243,8 +342,9 @@ function copyCommit(c: Commit): Commit {
  * Create a Commits instance backed by GitObjects
  *
  * @param objects GitObjects implementation to use for persistence
+ * @param options The commit-graph to read, if any
  * @returns Commits instance
  */
-export function createCommits(objects: GitObjects): Commits {
-  return new GitCommitStore(objects);
+export function createCommits(objects: GitObjects, options: CommitsOptions = {}): Commits {
+  return new GitCommitStore(objects, options);
 }

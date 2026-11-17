@@ -1148,4 +1148,70 @@ describeGit("fsck against native git", () => {
     expect(types.length).toBeGreaterThan(0);
     expect(types.filter((t) => t === "blob")).toEqual([]);
   });
+
+  /** The offset of a chunk of a commit-graph file (its table of contents). */
+  function chunkOffset(bytes: Uint8Array, id: string): number {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let i = 0; i < (bytes[6] as number); i++) {
+      const at = 8 + 12 * i;
+      if (new TextDecoder().decode(bytes.subarray(at, at + 4)) === id) {
+        return Number(view.getBigUint64(at + 4));
+      }
+    }
+    throw new Error(`no ${id} chunk`);
+  }
+
+  it("the commit-graph is verified as `git commit-graph verify` (exit bit 16)", async () => {
+    const dir = newRepo();
+    for (let i = 0; i < 4; i++) commitFiles(dir, { [`f${i}`]: `${i}\n` }, `c${i}`);
+    g(dir, "checkout", "-q", "-b", "side", "HEAD~2");
+    commitFiles(dir, { s: "s\n" }, "side");
+    g(dir, "checkout", "-q", "main");
+    g(dir, "merge", "-q", "--no-edit", "side");
+    g(dir, "commit-graph", "write", "--reachable");
+    expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
+    const file = join(dir, ".git", "objects", "info", "commit-graph");
+    const sound = readFileSync(file);
+    // a date in the commit data: the checksum and the date are reported
+    flipByte(file, chunkOffset(sound, "CDAT") + 20 + 15, 0x01);
+    let r = await compare(dir, []);
+    expect(r.exit).toBe(16);
+    expect(r.stderr).toContain(
+      "the commit-graph file has incorrect checksum and is likely corrupt",
+    );
+    expect(r.stderr).toMatch(/commit date for commit [0-9a-f]{40} in commit-graph is \d+ != \d+/);
+    // a parent position: the parent is reported
+    writeFileSync(file, sound);
+    flipByte(file, chunkOffset(sound, "CDAT") + 20 + 3, 0x01);
+    r = await compare(dir, []);
+    expect(r.stderr).toMatch(
+      /commit-graph parent for [0-9a-f]{40} is [0-9a-f]{40} != [0-9a-f]{40}/,
+    );
+    // a bad signature: the graph does not load
+    writeFileSync(file, sound);
+    flipByte(file, 0, 0x01);
+    r = await compare(dir, []);
+    expect(r.stderr).toContain("error: commit-graph signature");
+    expect(r.exit).toBe(16);
+    // core.commitGraph=false: not verified
+    g(dir, "config", "core.commitGraph", "false");
+    expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
+    g(dir, "config", "core.commitGraph", "true");
+    // a split chain with a missing layer
+    writeFileSync(file, sound);
+    rmSync(file);
+    g(dir, "commit-graph", "write", "--reachable", "--split");
+    commitFiles(dir, { t: "t\n" }, "top");
+    g(dir, "commit-graph", "write", "--reachable", "--split=no-merge");
+    const chain = readFileSync(
+      join(dir, ".git/objects/info/commit-graphs/commit-graph-chain"),
+      "utf8",
+    );
+    expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
+    const top = chain.trim().split("\n")[1] as string;
+    rmSync(join(dir, `.git/objects/info/commit-graphs/graph-${top}.graph`));
+    r = await compare(dir, []);
+    expect(r.stderr).toContain("error: one or more commit-graph chain files could not be loaded");
+    expect(r.exit).toBe(16);
+  });
 });

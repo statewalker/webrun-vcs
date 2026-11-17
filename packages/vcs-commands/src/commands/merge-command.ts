@@ -1272,27 +1272,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
    * Check if commitA is an ancestor of commitB.
    */
   private async isAncestor(commitA: ObjectId, commitB: ObjectId): Promise<boolean> {
-    if (commitA === commitB) return true;
-    const visited = new Set<ObjectId>();
-    const queue: ObjectId[] = [commitB];
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (current === undefined) break;
-      if (visited.has(current)) continue;
-      visited.add(current);
-      if (current === commitA) return true;
-      try {
-        const commit = await this.commits.load(current);
-        if (commit) {
-          for (const parent of commit.parents) {
-            if (!visited.has(parent)) queue.push(parent);
-          }
-        }
-      } catch {
-        // Commit not found - continue
-      }
-    }
-    return false;
+    // the store's walk (git's repo_in_merge_bases): commit-graph generations cut it short
+    return this.commits.isAncestor(commitA, commitB);
   }
 }
 

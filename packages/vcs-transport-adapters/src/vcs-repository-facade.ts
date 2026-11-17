@@ -211,10 +211,17 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   }
 
   /**
-   * A commit's parents and committer time (upload-pack walks the graph with it).
+   * A commit's parents and committer time (upload-pack walks the graph with it), from the
+   * commit-graph where the store has one.
    */
   async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
-    const commit = await this.history.commits.load(oid);
+    const commits = this.history.commits;
+    if (commits.getHeader) {
+      // from the commit-graph when it has the commit (nothing is read)
+      const h = await commits.getHeader(oid);
+      return h ? { parents: h.parents, time: h.commitTime, tree: h.tree } : undefined;
+    }
+    const commit = await commits.load(oid);
     if (!commit) return undefined;
     return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
   }

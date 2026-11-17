@@ -101,7 +101,7 @@ for await (const id of history.commits.walkAncestry(head!.objectId, { limit: 20 
   console.log(id.slice(0, 7), c?.message.split("\n")[0]);
 }
 
-const bases = await history.commits.findMergeBase(commitA, commitB); // ObjectId[]
+const bases = await history.commits.findMergeBase(commitA, commitB); // ObjectId[], as `git merge-base --all`
 const isAnc = await history.commits.isAncestor(commitA, commitB);
 
 for await (const ref of history.refs.list("refs/heads/")) {
@@ -111,6 +111,8 @@ for await (const ref of history.refs.list("refs/heads/")) {
 // Atomic update: succeeds only if the ref still points at expectedOldId
 const result = await history.refs.compareAndSwap("refs/heads/main", expectedOldId, newId);
 ```
+
+Over a git repository's files (`createGitFilesBackend` in `@statewalker/vcs-store-files`), these walks read the repository's commit-graph (`objects/info/commit-graph`, or a split chain) for the commits it has, as git does, and parse only the others. `readCommitGraph`, `writeCommitGraphFile` and `verifyCommitGraph` read, write and check the files themselves.
 
 ### Update several refs at once
 

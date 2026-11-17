@@ -9,6 +9,7 @@ import type { PackSet } from "../pack/pack-set.js";
 import type { SerializationApi } from "../serialization/serialization-api.js";
 import type { DeltaApi } from "../storage/delta/delta-api.js";
 import type { Blobs } from "./blobs/blobs.js";
+import type { CommitGraphProvider } from "./commit-graph/commit-graph-provider.js";
 import type { Commits } from "./commits/commits.js";
 import type { CollectReachableOptions, History, HistoryWithOperations } from "./history.js";
 import { CorruptObjectError, type GitObjects } from "./objects/git-objects.js";
@@ -21,6 +22,7 @@ import type { Trees } from "./trees/trees.js";
 export interface HistoryKernel {
   objects?: GitObjects;
   packs?: PackSet;
+  commitGraph?: CommitGraphProvider;
 }
 
 /** A gitlink: a submodule's commit, which lives in another repository and is not walked. */
@@ -168,10 +170,12 @@ export class HistoryImpl implements History {
   ) {
     this.objects = kernel.objects;
     this.packs = kernel.packs;
+    this.commitGraph = kernel.commitGraph;
   }
 
   readonly objects?: GitObjects;
   readonly packs?: PackSet;
+  readonly commitGraph?: CommitGraphProvider;
 
   async initialize(): Promise<void> {
     if (this.initialized) return;

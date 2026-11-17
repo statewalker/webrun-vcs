@@ -7,9 +7,14 @@
  * git paints both sides down a queue ordered by committer date (ties in insertion order),
  * collects the commits reached from both in the order they come out, drops the ones reachable
  * from another, and sorts the rest by date (stable).
+ *
+ * With a commit-graph that has corrected commit dates the queue is ordered by generation
+ * first, as git's `compare_commits_by_gen_then_commit_date` (commits outside the graph and
+ * virtual ones have generation Infinity), and the redundancy check skips commits whose
+ * generation shows they cannot reach the base checked.
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
+import type { Commits, ObjectId } from "@statewalker/vcs-core";
 
 import type { CheckedEntry } from "./worktree-overwrite-checks.js";
 
@@ -21,6 +26,8 @@ export interface BaseNode {
   key: string;
   /** Committer date (git's `commit->date`; 0 for a virtual commit) */
   date: number;
+  /** The commit-graph generation (Infinity outside the graph and for a virtual commit) */
+  generation: number;
   /** The parents, loaded on demand for a real commit */
   parents(): Promise<BaseNode[]>;
   /** The commit's tree as a flat map */
@@ -29,10 +36,40 @@ export interface BaseNode {
 
 /** What {@link MergeBaseGraph} reads of real commits. */
 export interface MergeBaseSource {
-  /** The commit's parents and committer timestamp, undefined when missing */
-  load(id: ObjectId): Promise<{ parents: ObjectId[]; date: number } | undefined>;
+  /**
+   * The commit's parents and committer timestamp (and commit-graph generation, Infinity when
+   * absent), undefined when missing
+   */
+  load(
+    id: ObjectId,
+  ): Promise<{ parents: ObjectId[]; date: number; generation?: number } | undefined>;
   /** The flat tree of a commit */
   tree(id: ObjectId): Promise<Map<string, CheckedEntry>>;
+  /** Whether generations are corrected commit dates (the queue is then ordered by them) */
+  generationOrder?(): Promise<boolean>;
+}
+
+/**
+ * A source over a commit store: headers from the commit-graph where it has the commit (no
+ * commit is read), the queue ordered as git orders it with that graph.
+ */
+export function commitsBaseSource(
+  commits: Commits,
+  tree: (id: ObjectId) => Promise<Map<string, CheckedEntry>>,
+): MergeBaseSource {
+  return {
+    load: async (id) => {
+      if (commits.getHeader) {
+        const h = await commits.getHeader(id).catch(() => undefined);
+        return h ? { parents: h.parents, date: h.commitTime, generation: h.generation } : undefined;
+      }
+      const commit = await commits.load(id).catch(() => undefined);
+      return commit ? { parents: commit.parents, date: commit.committer.timestamp } : undefined;
+    },
+    tree,
+    generationOrder: async () =>
+      (await commits.commitGraph?.get().catch(() => undefined))?.correctedDates ?? false,
+  };
 }
 
 const PARENT1 = 1;
@@ -44,6 +81,7 @@ const RESULT = 8;
 export class MergeBaseGraph {
   private readonly nodes = new Map<string, BaseNode>();
   private virtuals = 0;
+  private byGeneration?: boolean;
 
   constructor(private readonly source: MergeBaseSource) {}
 
@@ -51,17 +89,23 @@ export class MergeBaseGraph {
   commit(id: ObjectId): BaseNode {
     const known = this.nodes.get(id);
     if (known) return known;
-    let loaded: Promise<{ parents: ObjectId[]; date: number } | undefined> | undefined;
+    let loaded:
+      | Promise<{ parents: ObjectId[]; date: number; generation?: number } | undefined>
+      | undefined;
     const load = () => {
       loaded ??= this.source.load(id);
       return loaded;
     };
     let date = 0;
+    let generation = Number.POSITIVE_INFINITY;
     const node: BaseNode = {
       id,
       key: id,
       get date() {
         return date;
+      },
+      get generation() {
+        return generation;
       },
       parents: async () => ((await load())?.parents ?? []).map((p) => this.commit(p)),
       tree: () => this.source.tree(id),
@@ -69,6 +113,7 @@ export class MergeBaseGraph {
     // the date is needed synchronously by the queue: read before the node is queued
     (node as { ready?: Promise<void> }).ready = load().then((c) => {
       date = c?.date ?? 0;
+      generation = c?.generation ?? Number.POSITIVE_INFINITY;
     });
     this.nodes.set(id, node);
     return node;
@@ -79,6 +124,7 @@ export class MergeBaseGraph {
     const node: BaseNode = {
       key: `virtual:${this.virtuals++}`,
       date: 0,
+      generation: Number.POSITIVE_INFINITY,
       parents: async () => parents,
       tree: async () => tree,
     };
@@ -104,8 +150,13 @@ export class MergeBaseGraph {
     // a priority queue by date (newest first), ties in insertion order (git's prio_queue)
     type Item = { node: BaseNode; ctr: number };
     const heap: Item[] = [];
-    const before = (a: Item, b: Item) =>
-      a.node.date > b.node.date || (a.node.date === b.node.date && a.ctr < b.ctr);
+    const byGeneration = this.byGeneration === true;
+    const before = (a: Item, b: Item) => {
+      if (byGeneration && a.node.generation !== b.node.generation) {
+        return a.node.generation > b.node.generation;
+      }
+      return a.node.date > b.node.date || (a.node.date === b.node.date && a.ctr < b.ctr);
+    };
     // how many queued entries each commit has, and how many entries are not stale
     const queued = new Map<string, number>();
     let nonStale = 0;
@@ -176,8 +227,15 @@ export class MergeBaseGraph {
     return result;
   }
 
-  /** Whether `node` is reachable from one of `from` (git's redundancy check). */
+  /**
+   * Whether `node` is reachable from one of `from` (git's redundancy check). A commit whose
+   * generation is below `node`'s (or equal and finite) cannot reach it and is not walked.
+   */
   private async reachable(node: BaseNode, from: BaseNode[]): Promise<boolean> {
+    await this.ready(node);
+    const target = node.generation;
+    const cannotReach = (n: BaseNode) =>
+      n.generation < target || (n.generation === target && Number.isFinite(target));
     const seen = new Set<string>();
     const stack = [...from];
     while (stack.length > 0) {
@@ -187,7 +245,8 @@ export class MergeBaseGraph {
       if (n !== node && n.key === node.key) return true;
       for (const p of await n.parents()) {
         if (p.key === node.key) return true;
-        stack.push(p);
+        await this.ready(p);
+        if (!seen.has(p.key) && !cannotReach(p)) stack.push(p);
       }
     }
     return false;
@@ -201,6 +260,7 @@ export class MergeBaseGraph {
   /** git's repo_get_merge_bases_many(one, twos) (`git merge-base --all one twos...`). */
   async mergeBasesMany(one: BaseNode, twos: BaseNode[]): Promise<BaseNode[]> {
     if (twos.some((two) => two.key === one.key)) return [one];
+    this.byGeneration ??= (await this.source.generationOrder?.()) ?? false;
     const flags = new Map<string, number>();
     const list = await this.paintDownToCommon(one, twos, flags);
     const byDate = (nodes: BaseNode[]) => nodes.map((n, i) => ({ n, i }));

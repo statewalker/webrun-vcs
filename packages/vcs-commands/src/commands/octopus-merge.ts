@@ -15,7 +15,7 @@ import { type ConflictStyle, mergeLines } from "@statewalker/vcs-utils";
 
 import type { CommandCommits, CommandTrees } from "../git-command.js";
 import { isBinaryContent } from "../rename/index.js";
-import { MergeBaseGraph } from "./merge-bases.js";
+import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { flatTree } from "./merge-support.js";
 import { type OrtConflict, readBlob } from "./ort-merge.js";
 import type { CheckedEntry } from "./worktree-overwrite-checks.js";
@@ -138,13 +138,11 @@ export async function octopusMerge(
     );
     return outcome(2);
   }
-  const graph = new MergeBaseGraph({
-    load: async (id) => {
-      const commit = await ctx.commits.load(id);
-      return commit ? { parents: commit.parents, date: commit.committer.timestamp } : undefined;
-    },
-    tree: async (id) => flatTree(ctx.trees, await ctx.commits.getTree(id)),
-  });
+  const graph = new MergeBaseGraph(
+    commitsBaseSource(ctx.commits, async (id) =>
+      flatTree(ctx.trees, await ctx.commits.getTree(id)),
+    ),
+  );
   const treeOf = async (id: ObjectId) => flatTree(ctx.trees, await ctx.commits.getTree(id));
   let mrc: ObjectId[] = [headId];
   let index = await treeOf(headId);

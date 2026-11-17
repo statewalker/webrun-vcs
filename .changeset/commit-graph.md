@@ -1,0 +1,16 @@
+---
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-store-files": minor
+"@statewalker/vcs-commands": minor
+"@statewalker/vcs-transport-adapters": patch
+---
+
+**Commit-graphs: read, written and verified as git does, and used by history walks.**
+
+On a 5000-commit repository with a graph, a walk of every commit takes 3.5 ms instead of 49 ms, a merge base of distant commits 3 to 5 ms instead of 41 to 48 ms, and an ancestor check about 2 ms instead of 40 ms, level with `git rev-list` and `git merge-base` over the same graph.
+
+- **vcs-core (`history/commit-graph`):** `readCommitGraph` loads `objects/info/commit-graph` or the split chain in `info/commit-graphs/` as git's `commit-graph.c` does (header, chunk table, OIDF, OIDL, CDAT, EDGE, GDA2/GDO2, BIDX/BDAT, BASE; git's checks and messages on load; a broken chain kept up to its last good layer). `CommitGraph` gives each commit's parents, tree, date, topological level and generation (corrected commit date with GDA2) without reading the commit; `bloomMayContainPath` queries its changed-path filters. `writeCommitGraphFile` writes files byte-identical to `git commit-graph write` (`--append`, `--split[=no-merge|replace]`, `--size-multiple`, `--max-commits`, `--expire-time`, `--[no-]changed-paths` with murmur3 hash versions 1 and 2, `--max-new-filters`; GDA2 unless `commitGraph.generationVersion=1`; the filters of an existing graph kept). `verifyCommitGraph` is `git commit-graph verify`. `loadRepositoryCommitGraph` and `commitGraphCompatible` follow git's `prepare_commit_graph`: no graph with `core.commitGraph=false`, replace refs, grafts or a shallow repository.
+- **vcs-core (commits):** `createCommits(objects, { commitGraph })`; `Commits.getHeader` (tree, parents, commit time, generation) and `getParents`, `getTree` and `walkAncestry` read the graph for the commits it has and parse the others (a stale graph is fine). `findMergeBase` is now git 2.56's merge-base (`paint_down_to_common` over a queue ordered by generation then date, with its side-exhaustion exit in the graph; redundant bases removed), returning every merge base, best first, as `git merge-base --all` (it returned the first common ancestor of a depth-first walk). `isAncestor` and the redundancy check skip commits whose generation shows they cannot reach the commit sought. `getMergeBases` and `isAncestorOf` (`commit-reach.ts`) are exported. `History.commitGraph` is the provider; `listObjects` takes a `commitHeader` lookup.
+- **vcs-store-files:** the files backend reads the repository's graph on first use. `writeCommitGraph` is `git commit-graph write --reachable` (or from given commits) in a repository; `readCommitGraphSettings` reads the config. `gc` writes the graph at the end when `gc.writeCommitGraph` is true (the default), as `git gc`, and its reachability walk reads commits from the graph.
+- **vcs-commands:** `fsck` verifies the commit-graph as git's fsck runs `git commit-graph verify` (exit bit 16, `FSCK_ERROR_COMMIT_GRAPH`). merge, rebase, pull, octopus and merge-ort's virtual bases use the store's walks and the graph's generations (the merge-base queue ordered by generation when the graph has corrected dates, as git orders it).
+- **vcs-transport-adapters:** upload-pack and receive-pack walks read commits from the graph.
