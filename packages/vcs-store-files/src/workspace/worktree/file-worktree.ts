@@ -1141,7 +1141,8 @@ export class FileWorktree implements Worktree {
     try {
       const bytes = await this.files.readlink?.(link);
       if (!bytes) return false;
-      const target = this.gitfileTarget(dir, new TextDecoder().decode(bytes));
+      // the target as bytes, as `repositoryState` reads it (a name that is no UTF-8)
+      const target = this.gitfileTarget(dir, decodeGitPath(bytes));
       if (target === undefined) return false;
       return (await this.kindOrError(target)) === undefined;
     } catch {

@@ -127,6 +127,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   private readonly mirroredKeys: Set<string> = new Set();
   private trailingNewline = true;
   private loaded = false;
+  /** whether the file began with a UTF-8 BOM: git keeps it when it rewrites the file */
+  private bom = false;
   /** Entries of the system and global files (with their includes), lowest first */
   private baseEntries: ConfigEntry[] = [];
   /** Entries of `config.worktree`, when `extensions.worktreeConfig` is set */
@@ -161,6 +163,12 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const content = await this.files.read(this.configPath);
     // bytes, as git reads them: a value that is no UTF-8 (a latin-1 path) keeps its bytes
     // through a rewrite of the file; a leading BOM is skipped, as git skips it
+    this.bom =
+      !!content &&
+      content.length >= 3 &&
+      content[0] === 0xef &&
+      content[1] === 0xbb &&
+      content[2] === 0xbf;
     const text = content ? decodeGitPatternFile(content) : "";
     this.adoptText(text);
     this.loaded = true;
@@ -293,7 +301,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (!this.loaded) await this.mergeIntoExistingFile();
 
     const content = this.serializeGitConfig();
-    await this.files.write(this.configPath, encodeGitPath(content));
+    const body = encodeGitPath(content);
+    await this.files.write(this.configPath, this.bom ? withBom(body) : body);
 
     // Re-adopt the line structure we just wrote (keeping the in-memory values,
     // which are authoritative) so a following save() is stable.
@@ -1106,4 +1115,12 @@ export async function createWorkingCopyConfig(
   const config = new GitWorkingCopyConfig(files, configPath, options);
   await config.load();
   return config;
+}
+
+/** `body` after a UTF-8 BOM. */
+function withBom(body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(body.length + 3);
+  out.set([0xef, 0xbb, 0xbf]);
+  out.set(body, 3);
+  return out;
 }

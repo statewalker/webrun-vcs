@@ -123,8 +123,9 @@ function dowild(
       case 0x5c: {
         // backslash: the next character literally
         pi++;
+        // not folded, as in git's wildmatch.c (it folds the pattern character before the
+        // switch, then reads the escaped one raw): under casefold `\\A` matches nothing
         pCh = at(p, pi);
-        if (casefold) pCh = lower(pCh);
         if (tCh !== pCh) return NOMATCH;
         continue;
       }

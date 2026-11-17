@@ -724,6 +724,17 @@ describe("byte-exact literal parts and ASCII-only case folding (git's dir.c)", (
     expect(matches(`CAF${half}*`, cafe, true)).toBe(true);
   });
 
+  it("does not fold a backslash-escaped letter (git's wildmatch reads it raw)", () => {
+    // as git check-ignore with core.ignorecase=true: it lowers the text, so an escaped
+    // upper-case letter matches neither case
+    expect(matches("x\\A", "xa", true)).toBe(false);
+    expect(matches("x\\A", "xA", true)).toBe(false);
+    expect(matches("*\\X", "qX", true)).toBe(false);
+    // an escaped lower-case letter still matches both cases of the text
+    expect(matches("x\\a", "xA", true)).toBe(true);
+    expect(matches("x\\a", "xa", true)).toBe(true);
+  });
+
   it("the manager applies core.ignoreCase to every source", () => {
     const manager = createIgnoreManager({ ignoreCase: true });
     manager.addIgnoreFile("", "*.LOG\n");

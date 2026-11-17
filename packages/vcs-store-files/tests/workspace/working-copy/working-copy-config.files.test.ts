@@ -599,4 +599,31 @@ describe("GitWorkingCopyConfig", () => {
       expect(config.get("core.bare")).toBe(false);
     });
   });
+
+  describe("a leading BOM", () => {
+    it("is skipped when read and kept when the file is rewritten, as git keeps it", async () => {
+      const bom = new Uint8Array([0xef, 0xbb, 0xbf]);
+      const body = new TextEncoder().encode("[core]\n\tbare = false\n");
+      const withBom = new Uint8Array(bom.length + body.length);
+      withBom.set(bom);
+      withBom.set(body, bom.length);
+      await files.write(PATH, withBom);
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      expect(config.get("core.bare")).toBe(false);
+      config.set("foo.bar", "baz");
+      await config.save();
+      const saved = (await files.read(PATH)) ?? new Uint8Array();
+      expect([...saved.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+      expect(saved[3]).toBe(0x5b); // "[": one BOM, not two
+      expect(new TextDecoder().decode(saved)).toContain("bar = baz");
+      // a file without one gets none
+      files.set(PATH, "[core]\n\tbare = false\n");
+      const plain = new GitWorkingCopyConfig(files, PATH);
+      await plain.load();
+      plain.set("foo.bar", "baz");
+      await plain.save();
+      expect((await files.read(PATH))?.[0]).toBe(0x5b);
+    });
+  });
 });
