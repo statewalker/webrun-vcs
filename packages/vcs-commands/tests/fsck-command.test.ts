@@ -368,4 +368,39 @@ describe("fsck reading loose object files", () => {
       expect(s).toEqual({ errors: [], object: { type: "blob", size: body.length } });
     }
   });
+
+  const idOf = (raw: Uint8Array) => bytesToHex(createSha1().update(raw).digest());
+
+  it("a stream that ended within the 32-byte header read is kept to its declared size", async () => {
+    const r = await read(z(enc.encode("blob 2\0abcdefgh")), idOf(enc.encode("blob 2\0ab")));
+    expect(r.errors).toEqual([]);
+    expect(new TextDecoder().decode(r.object?.content)).toBe("ab");
+    // bytes after such a stream are still garbage
+    const tail = new Uint8Array([...z(enc.encode("blob 2\0abcd")), 0]);
+    expect((await read(tail, idOf(enc.encode("blob 2\0ab")))).errors).toEqual([
+      `garbage at end of loose object '${idOf(enc.encode("blob 2\0ab"))}'`,
+      "unable to unpack contents of /o",
+    ]);
+    // a stream that goes past the header read is corrupt
+    const long = await read(
+      z(enc.encode(`blob 2\0${"c".repeat(40)}`)),
+      idOf(enc.encode("blob 2\0cc")),
+    );
+    expect(long.errors[0]).toMatch(/^corrupt loose object/);
+  });
+
+  it("a short blob whose zero tail hashes to its name keeps its content unpadded", async () => {
+    const size = 1 << 20;
+    const padded = new Uint8Array(`blob ${size}\0`.length + size);
+    padded.set(enc.encode(`blob ${size}\0hello`));
+    const r = await read(z(enc.encode(`blob ${size}\0hello`)), idOf(padded));
+    expect(r.errors).toEqual([]);
+    expect(r.object?.size).toBe(size);
+    expect(r.object?.content?.length).toBe(5);
+    // a commit is padded: the checks parse its zeros
+    const commit = new Uint8Array(`commit 64\0`.length + 64);
+    commit.set(enc.encode("commit 64\0tree "));
+    const c = await read(z(enc.encode("commit 64\0tree ")), idOf(commit));
+    expect(c.object?.content?.length).toBe(64);
+  });
 });

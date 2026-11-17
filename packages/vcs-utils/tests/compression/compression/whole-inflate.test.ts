@@ -269,7 +269,7 @@ describe("inflateWhole differential fuzz against node zlib", () => {
     expect(seen.ok).toBeGreaterThan(400);
     expect(seen.truncated).toBeGreaterThan(400);
     expect(seen.corrupt).toBeGreaterThan(400);
-  });
+  }, 30_000); // ~1 s alone, more under the whole monorepo's parallel test run
 });
 
 describe("inflateWhole on a code set zlib accepts oddly", () => {
@@ -361,6 +361,57 @@ describe("inflateWhole partial: the part of a block or match that fits", () => {
           `round ${round} cut ${cut}`,
         ).toBe(true);
       }
+    }
+  });
+});
+
+describe("inflateWhole partial: input that ends where the output fills", () => {
+  it("returns the full buffer, as zlib does (Z_OK), when the input ends exactly at the fill point", () => {
+    const r = rng(20261119);
+    let checked = 0;
+    for (let round = 0; round < 300; round++) {
+      const { opts } = deflaters[round % deflaters.length] as { opts: object };
+      const raw = sample(r, 1 + Math.floor(r() ** 2 * 20000));
+      const z = new Uint8Array(deflateSync(raw, opts));
+      // the shortest input whose sync-flushed output reaches `cut` bytes
+      const cut = 1 + Math.floor(r() * raw.length);
+      let lo = 2;
+      let hi = z.length;
+      const reach = (n: number) =>
+        new Uint8Array(inflateSync(z.subarray(0, n), { finishFlush: constants.Z_SYNC_FLUSH }))
+          .length >= cut;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (reach(mid)) hi = mid;
+        else lo = mid + 1;
+      }
+      const input = z.subarray(0, lo);
+      const got = inflateWhole(input, { into: new Uint8Array(cut), partial: true });
+      expect(got.length, `round ${round}`).toBe(cut);
+      expect(
+        Buffer.from(got.data.subarray(0, cut)).equals(Buffer.from(raw.subarray(0, cut))),
+        `round ${round}`,
+      ).toBe(true);
+      if (lo < z.length) checked++;
+    }
+    expect(checked).toBeGreaterThan(100);
+  });
+
+  it("stops on a literal stream cut right after the byte that fills the output", () => {
+    // fixed Huffman literals: the input ends inside the code after the 32nd byte
+    const raw = new TextEncoder().encode("blob 40\0abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+    const z = new Uint8Array(deflateSync(raw, { strategy: constants.Z_FIXED }));
+    for (let n = 2; n < z.length; n++) {
+      const part = new Uint8Array(
+        inflateSync(z.subarray(0, n), { finishFlush: constants.Z_SYNC_FLUSH }),
+      );
+      if (part.length < 32) continue;
+      const got = inflateWhole(z.subarray(0, n), { into: new Uint8Array(32), partial: true });
+      expect(got).toMatchObject({ length: 32, ended: false });
+      // without partial, the same input is a truncated stream
+      expect(() => inflateWhole(z.subarray(0, n), { size: raw.length })).toThrow(
+        TruncatedStreamError,
+      );
     }
   });
 });

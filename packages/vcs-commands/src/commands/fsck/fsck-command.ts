@@ -122,12 +122,36 @@ const PER_WORKTREE = /^(?:refs\/(?:bisect|worktree|rewritten)\/|[A-Z_]+$)/;
 const dec = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
-/** A git size setting (`git_config_ulong`: digits and a k, m or g unit), undefined if not one. */
-function sizeValue(value: string | undefined): number | undefined {
-  const m = value?.trim().match(/^(\d+)([kmg]?)$/i);
-  if (!m) return undefined;
-  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[(m[2] as string).toLowerCase()] ?? 1;
-  return Number(m[1]) * unit;
+/** A config value git dies on (`bad numeric config value`), as `call` reports it. */
+export class FsckConfigError extends Error {
+  override name = "FsckConfigError";
+}
+
+/**
+ * A git size setting as `git_config_ulong` parses it: `strtoumax` (leading blanks, an optional
+ * `+`, decimal, `0x` hex or `0` octal) then an optional k, m or g. Undefined when unset; a value
+ * git dies on throws `FsckConfigError` with git's message.
+ */
+function sizeValue(key: string, value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const bad = (why: string) =>
+    new FsckConfigError(`bad numeric config value '${value}' for '${key.toLowerCase()}': ${why}`);
+  if (value.includes("-")) throw bad("invalid unit");
+  const m = /^[ \t\n\v\f\r]*\+?(?:(0[xX])([0-9a-fA-F]+)|(0[0-7]*)|([1-9][0-9]*))(.*)$/s.exec(value);
+  if (!m) throw bad("invalid unit");
+  const digits = m[2] ?? m[3] ?? (m[4] as string);
+  const n =
+    m[2] !== undefined
+      ? BigInt(`0x${digits}`)
+      : m[3] !== undefined
+        ? BigInt(`0o${digits}`)
+        : BigInt(digits);
+  const unit = ({ "": 1n, k: 1024n, m: 1024n ** 2n, g: 1024n ** 3n } as Record<string, bigint>)[
+    (m[5] as string).toLowerCase()
+  ];
+  if (unit === undefined) throw bad("invalid unit");
+  if (n * unit > 2n ** 64n - 1n) throw bad("out of range");
+  return Number(n * unit);
 }
 
 /** A path within the repository's files, as git prints it (`.git/objects/ab/cd...`). */
@@ -293,6 +317,10 @@ export class FsckCommand extends GitCommand<FsckResult> {
       if (value !== undefined) types.set(id, value);
     }
     for (const [id, type] of this._messageTypes) types.set(id, type);
+    // git dies on a bad value when it reads the config, before it checks anything
+    const bigFileThreshold =
+      sizeValue("core.bigFileThreshold", configValue(this.workingCopy, "core.bigFileThreshold")) ??
+      DEFAULT_BIG_FILE_THRESHOLD;
     const objects = this.workingCopy.history.objects;
     if (!objects) throw new Error("fsck needs the object store (history.objects)");
     const stores: RunStores = { refs: this.refsStore, staging: () => this.staging };
@@ -307,9 +335,7 @@ export class FsckCommand extends GitCommand<FsckResult> {
       lostFound: this._lostFound,
       compatibility: this._compatibility,
       repository: this._repository,
-      bigFileThreshold:
-        sizeValue(configValue(this.workingCopy, "core.bigFileThreshold")) ??
-        DEFAULT_BIG_FILE_THRESHOLD,
+      bigFileThreshold,
     });
     return run.run();
   }
@@ -349,6 +375,8 @@ interface RepoPack {
 /** The reflog of one ref: its name as git prints it and its entries, oldest first. */
 interface Reflog {
   name: string;
+  /** The file it was read from, as git prints it (none when read through the refs store) */
+  path?: string;
   entries: { oldId: string; newId: string; timestamp: number }[];
 }
 
@@ -804,6 +832,13 @@ class FsckRun {
     if (!gitmodules && !gitattributes) return 0;
     if (gitmodules) this.gitmodulesDone.add(id);
     if (gitattributes) this.gitattributesDone.add(id);
+    if (gitmodules && content && content.length < size) {
+      // a loose blob whose stream ended early: git parses its zeros too (`.gitattributes` is
+      // read up to the first NUL, the same with them or without)
+      const padded = new Uint8Array(size);
+      padded.set(content);
+      content = padded;
+    }
     return fsckBlob(content, size, { gitmodules, gitattributes }, report);
   }
 
@@ -1078,12 +1113,12 @@ class FsckRun {
   }
 
   /**
-   * What a listed ref resolves to, or the null id when it does not resolve (a dangling or too
-   * deep symbolic ref: git's `for_each_rawref` passes those with a null id).
+   * What a listed ref resolves to, or the null id when it does not resolve (a dangling symbolic
+   * ref, or one deeper than git's 5 reads: git's `for_each_rawref` passes those with a null id).
    */
   private async resolvedId(name: string): Promise<string> {
     try {
-      return (await this.stores.refs.resolve(name))?.objectId || ZERO_ID;
+      return (await this.followChain(name, 0))?.id || ZERO_ID;
     } catch {
       return ZERO_ID;
     }
@@ -1160,6 +1195,11 @@ class FsckRun {
 
   private async processReflogs(wt: WorktreeState): Promise<void> {
     for (const log of await this.reflogs(wt)) {
+      // git 2.43's reflog iterator resolves each ref first and skips one deeper than 5 reads
+      if (this.o.compatibility === "2.43" && log.path && (await this.tooDeep(wt, log.name))) {
+        this.error(`bad ref for ${log.path}`);
+        continue;
+      }
       for (const e of log.entries) {
         await this.handleReflogOid(log.name, e.oldId, 0);
         await this.handleReflogOid(log.name, e.newId, e.timestamp);
@@ -1167,14 +1207,39 @@ class FsckRun {
     }
   }
 
-  /** What a worktree's HEAD resolves to, if anything. */
+  /** What a worktree's HEAD resolves to, if anything (within git's 5 reads, HEAD's included). */
   private async headId(wt: WorktreeState): Promise<string | undefined> {
-    const refs = this.stores.refs;
-    if (wt.current) return (await refs.resolve("HEAD"))?.objectId;
+    if (wt.current) {
+      const head = await this.stores.refs.get("HEAD");
+      if (!head) return undefined;
+      if (!isSymbolicRef(head)) return head.objectId;
+      return (await this.followChain(head.target, 1))?.id;
+    }
     const text = (await readText(this.files as FilesApi, pathOf(wt.dir as string, "HEAD")))?.trim();
     if (!text) return undefined;
-    if (text.startsWith("ref:")) return (await refs.resolve(text.slice(4).trim()))?.objectId;
+    if (text.startsWith("ref:")) return (await this.followChain(text.slice(4).trim(), 1))?.id;
     return OID.test(text.slice(0, 40)) ? text.slice(0, 40) : undefined;
+  }
+
+  /**
+   * Whether the ref of the reflog `logName` is a symbolic ref chain deeper than git's 5 reads
+   * (`resolve_ref_unsafe` fails: git 2.43 prints `bad ref for <log>`; a missing ref is fine).
+   */
+  private async tooDeep(wt: WorktreeState, logName: string): Promise<boolean> {
+    try {
+      if (logName === "HEAD" && wt.current) {
+        const head = await this.stores.refs.get("HEAD");
+        return !!head && isSymbolicRef(head) && !(await this.followChain(head.target, 1));
+      }
+      if (logName.startsWith("worktrees/")) {
+        if (!wt.dir || !logName.endsWith("/HEAD") || logName.split("/").length !== 3) return false;
+        const text = (await readText(this.files as FilesApi, pathOf(wt.dir, "HEAD")))?.trim();
+        return !!text?.startsWith("ref:") && !(await this.followChain(text.slice(4).trim(), 1));
+      }
+      return !(await this.followChain(logName, 0));
+    } catch {
+      return false;
+    }
   }
 
   /** The main worktree, then the linked ones (`.git/worktrees/<id>`). */
@@ -1200,15 +1265,19 @@ class FsckRun {
   /**
    * Where the symbolic ref chain from `target` ends, as git's `resolve_ref_unsafe` follows it:
    * the last name and its id (none when that ref does not exist), or undefined when the chain
-   * is deeper than git's SYMREF_MAXDEPTH (5).
+   * takes more than git's SYMREF_MAXDEPTH (5) reads in all. `reads` is how many were made
+   * before `target` (1 when HEAD, read first, points at it).
    */
-  private async followChain(target: string): Promise<{ name: string; id?: string } | undefined> {
+  private async followChain(
+    target: string,
+    reads: number,
+  ): Promise<{ name: string; id?: string } | undefined> {
     let name = target;
-    for (let depth = 1; ; depth++) {
+    for (let read = reads + 1; ; read++) {
       const value = await this.stores.refs.get(name);
       if (!value) return { name };
       if (!isSymbolicRef(value)) return { name, id: value.objectId };
-      if (depth >= 5) return undefined;
+      if (read >= 5) return undefined;
       name = value.target;
     }
   }
@@ -1239,7 +1308,8 @@ class FsckRun {
     }
     if (symref !== undefined) {
       // the whole chain: HEAD -> refs/heads/alias -> refs/remotes/origin/x points at the last
-      const end = await this.followChain(symref);
+      // HEAD itself was the first of git's 5 reads
+      const end = await this.followChain(symref, 1);
       if (!end) return invalid();
       target = end.name;
       id = end.id;
@@ -1287,7 +1357,11 @@ class FsckRun {
       };
       await walk(base, "");
       for (const f of found) {
-        logs.push({ name: prefix + f.name, entries: parseReflog(await readText(files, f.path)) });
+        logs.push({
+          name: prefix + f.name,
+          path: pathOf(base, f.name),
+          entries: parseReflog(await readText(files, f.path)),
+        });
       }
     };
     if (wt.current) {

@@ -46,7 +46,8 @@ export interface WholeInflateOptions {
    * Stop, without an error, once the output is full (`ended` false), as zlib does with a full
    * output buffer: the part of a stored block or a match that fits is written first, so the
    * output holds the first `length` bytes of the stream. To read the start of a stream, such
-   * as an object header, without inflating all of it.
+   * as an object header, without inflating all of it. Input that runs out once the output is
+   * full is a stop too, not `TruncatedStreamError`: zlib returns the full buffer (Z_OK) then.
    */
   partial?: boolean;
 }
@@ -883,6 +884,10 @@ export function inflateWhole(
     return { data: out, length: op, consumed: pos - (bits >> 3), ended: true };
   } catch (e) {
     if (e === STOP) return { data: out, length: op, consumed: -1, ended: false };
+    // zlib stops at a full output whatever comes next: input that ends there is no error
+    if (partial && e instanceof TruncatedStreamError && op >= (growable ? limit : cap)) {
+      return { data: out, length: op, consumed: -1, ended: false };
+    }
     throw e;
   }
 }

@@ -855,4 +855,135 @@ describeGit("fsck against native git", () => {
       expect(ours.errorOutput.includes("extraHeaderEntry")).toBe(version === "2.43");
     }
   });
+
+  /** Our fsck in one compatibility mode, on the repository's files. */
+  async function oursIn(
+    dir: string,
+    version: "2.43" | "2.56",
+    configure: (c: FsckCommand) => FsckCommand = (c) => c,
+  ) {
+    const files = createNodeFilesApi({ rootDir: dir });
+    return configure(
+      (await openOurs(dir)).fsck().setRepositoryFiles({ files }).setCompatibility(version),
+    ).call();
+  }
+
+  const sha1Hex = (text: string) => createHash("sha1").update(text).digest("hex");
+
+  /** `refs/heads/<from>` -> ... -> `refs/heads/<to>` as symbolic ref files, `<to>` at `id`. */
+  function refChain(dir: string, prefix: string, length: number, id: string): void {
+    const heads = join(dir, ".git", "refs", "heads");
+    writeFileSync(join(heads, `${prefix}${length}`), `${id}\n`);
+    for (let i = length - 1; i >= 1; i--) {
+      writeFileSync(join(heads, `${prefix}${i}`), `ref: refs/heads/${prefix}${i + 1}\n`);
+    }
+  }
+
+  it("HEAD resolves in at most 5 reads, HEAD's own included (2.43: invalid HEAD past them)", async () => {
+    const dir = newRepo();
+    const C = commitFiles(dir, { a: "a\n" }, "one");
+    // r1 -> r2 -> r3 -> r4 -> r5 (direct): each listed ref resolves in 5 reads or fewer
+    refChain(dir, "r", 5, C);
+    g(dir, "update-ref", "-d", "refs/heads/main");
+    // HEAD -> r2 -> ... -> r5: 5 reads, fine
+    writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/r2\n");
+    expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
+    for (const version of ["2.43", "2.56"] as const) {
+      const r = await oursIn(dir, version);
+      expect([r.errorOutput, r.exitCode]).toEqual(["", 0]);
+    }
+    // HEAD -> r1 -> ... -> r5: 6 reads, one too many
+    writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/r1\n");
+    await compare(dir, []);
+    await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+    let r = await oursIn(dir, "2.43");
+    // git 2.43's reflog iterator does not resolve HEAD either: its reflog is skipped
+    expect(r.errorOutput).toBe("error: invalid HEAD\nerror: bad ref for .git/logs/HEAD\n");
+    expect(r.exitCode).toBe(8);
+    r = await oursIn(dir, "2.43", (c) => c.setReflogs(false));
+    expect([r.errorOutput, r.exitCode]).toEqual(["error: invalid HEAD\n", 8]);
+    // 2.45+ checks HEAD's link no more (git refs verify does): an unresolved HEAD is no root
+    r = await oursIn(dir, "2.56");
+    expect([r.errorOutput, r.exitCode]).toEqual(["", 0]);
+  });
+
+  it("a listed symbolic ref deeper than 5 reads is an invalid sha1 pointer, its reflog a bad ref (2.43)", async () => {
+    const dir = newRepo();
+    const C = commitFiles(dir, { a: "a\n" }, "one");
+    // r1 -> ... -> r6 (direct): r1 takes 6 reads, r2 takes 5
+    refChain(dir, "r", 6, C);
+    mkdirSync(join(dir, ".git", "logs", "refs", "heads"), { recursive: true });
+    for (const name of ["r1", "r2"]) {
+      writeFileSync(
+        join(dir, ".git", "logs", "refs", "heads", name),
+        `${"0".repeat(40)} ${C} A <a@x> 1700000000 +0000\tx\n`,
+      );
+    }
+    const pointer =
+      "error: refs/heads/r1: invalid sha1 pointer 0000000000000000000000000000000000000000\n";
+    const r = await compare(dir, []);
+    expect(r.exit).toBe(2);
+    await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+    let ours = await oursIn(dir, "2.43");
+    expect(ours.errorOutput).toBe(`${pointer}error: bad ref for .git/logs/refs/heads/r1\n`);
+    expect(ours.exitCode).toBe(2);
+    ours = await oursIn(dir, "2.56");
+    expect([ours.errorOutput, ours.exitCode]).toEqual([pointer, 2]);
+    for (const version of ["2.43", "2.56"] as const) {
+      ours = await oursIn(dir, version, (c) => c.setReflogs(false));
+      expect([ours.errorOutput, ours.exitCode]).toEqual([pointer, 2]);
+    }
+    // HEAD -> r2 -> ... -> r6: 6 reads, no root in the 2.45+ snapshot and nothing printed
+    writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/r2\n");
+    ours = await oursIn(dir, "2.56");
+    expect([ours.errorOutput, ours.exitCode]).toEqual([pointer, 2]);
+  });
+
+  it("a stream longer than its declared size: kept to the size when it all fit in the 32-byte header read", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    // git's unpack_loose_rest copies at most the declared size from the header buffer, and
+    // zlib, at the end of the stream already, says Z_STREAM_END: a fine (dangling) blob
+    const fine = writeLoose(dir, bytesOf("blob 2\0abcdefgh"), sha1Hex("blob 2\0ab"));
+    // 32 bytes inflated in all: still in the header buffer
+    const edge = writeLoose(dir, bytesOf(`blob 3\0${"x".repeat(25)}`), sha1Hex("blob 3\0xxx"));
+    // 33 and more: the rest of the stream does not fit the declared size, corrupt
+    const over = writeLoose(dir, bytesOf(`blob 3\0${"y".repeat(26)}`), sha1Hex("blob 3\0yyy"));
+    const far = writeLoose(dir, bytesOf(`blob 3\0${"q".repeat(40)}`), sha1Hex("blob 3\0qqq"));
+    // a commit cut to its size is parsed as such
+    const cut = writeLoose(dir, bytesOf("commit 5\0tree x\nmore"), sha1Hex("commit 5\0tree "));
+    const r = await compare(dir, []);
+    expect(r.stdout).toContain(`dangling blob ${fine}`);
+    expect(r.stdout).toContain(`dangling blob ${edge}`);
+    expect(r.stderr).toContain(`error: corrupt loose object '${over}'`);
+    expect(r.stderr).toContain(`error: corrupt loose object '${far}'`);
+    expect(r.stderr).toContain(`error: bogus commit object ${cut}`);
+    expect(r.exit).toBe(1);
+  });
+
+  it("an invalid core.bigFileThreshold is fatal, with git's message", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    for (const [value, why] of [
+      ["abc", "invalid unit"],
+      ["5k ", "invalid unit"],
+      ["-1", "invalid unit"],
+      ["0x", "invalid unit"],
+      ["99999999999999999999", "out of range"],
+    ] as const) {
+      g(dir, "config", "core.bigFileThreshold", value);
+      const theirs = native(dir, ["fsck", ...noReferences]);
+      expect(theirs.status).toBe(128);
+      const message = `bad numeric config value '${value}' for 'core.bigfilethreshold'`;
+      expect(theirs.stderr).toContain(`fatal: ${message}`);
+      for (const version of ["2.43", "2.56"] as const) {
+        await expect(oursIn(dir, version)).rejects.toThrow(`${message}: ${why}`);
+      }
+    }
+    // what git takes: blanks before, any case of the unit, hex and octal
+    for (const value of [" 5k", "1K", "0x10m", "010", "+3g"]) {
+      g(dir, "config", "core.bigFileThreshold", value);
+      expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
+    }
+  });
 });

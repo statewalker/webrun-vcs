@@ -21,13 +21,20 @@
  * makes git 2.43 and 2.56 loop forever there; it is `corrupt loose object` here.)
  *
  * Other objects are inflated whole, one at a time (git maps the file and inflates it whole
- * too), into one buffer of the declared size, or of what zlib can produce from the file (1032
- * bytes per input byte) when that is less: a hostile header cannot allocate more. git inflates into a buffer of the declared size and hashes all
- * of it, so a stream that ends early hashes as its bytes followed by what the buffer held:
- * zeros for a buffer malloc maps fresh (above glibc's mmap threshold, at most 32 MiB),
- * whatever was reused below. Zeros are hashed here (`hash-path mismatch`), without being
- * allocated, for declared sizes up to 1 GiB (above that git takes as long or dies out of
- * memory; it is `corrupt loose object` here).
+ * too), into a buffer that grows as the output comes, up to the declared size or what zlib can
+ * produce from the file (1032 bytes per input byte) when that is less: a hostile header
+ * allocates nothing up front, and a stream that inflates further is `corrupt loose object`.
+ * One exception, as git's `unpack_loose_rest`: when the whole stream fit in the 32-byte header
+ * buffer, git copies at most the declared size of it and zlib, already at its end, reports
+ * success, so bytes past the declared size are dropped and the object can be fine.
+ *
+ * git inflates into a buffer of the declared size and hashes all of it, so a stream that ends
+ * early hashes as its bytes followed by what the buffer held: zeros for a buffer malloc maps
+ * fresh (above glibc's mmap threshold, at most 32 MiB), whatever was reused below. Zeros are
+ * hashed here in 64 KiB pieces for declared sizes up to 1 GiB (above that git takes as long or
+ * dies out of memory; it is `corrupt loose object` here). When they hash to the file's name, a
+ * blob's content is returned without them (shorter than its size); a tree, commit or tag is
+ * padded to its size, as the checks parse it with its zeros, as git does.
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
@@ -61,7 +68,8 @@ export interface LooseRead {
   errors: string[];
   /**
    * The type, size and content, when the object could be read and hashes to its name. A blob
-   * above `core.bigFileThreshold` is streamed: no content (as git's NULL buffer).
+   * above `core.bigFileThreshold` is streamed: no content (as git's NULL buffer). A blob whose
+   * stream ended early has content shorter than `size`: the rest is zeros.
    */
   object?: { type: string; size: number; content?: Uint8Array };
   /** The id the content hashes to, when it was read whole but hashes to another id. */
@@ -142,9 +150,12 @@ export async function readLooseObject(
 
   // unpack_loose_header: inflate into MAX_HEADER_LEN bytes
   let head: Uint8Array;
+  // where the stream ended when all of it fit in the header buffer (zlib's Z_STREAM_END there)
+  let endedAt = -1;
   try {
     const r = inflateWhole(data, { into: new Uint8Array(MAX_HEADER_LEN), partial: true });
     head = r.data.subarray(0, r.length);
+    if (r.ended) endedAt = r.consumed;
   } catch (e) {
     // zlib stops once the 32 bytes are out, even if the stream is cut short after them
     const start = e instanceof TruncatedStreamError ? inflatedStart(data) : undefined;
@@ -179,20 +190,30 @@ export async function readLooseObject(
     return { errors, object: { type, size } };
   }
 
-  // unpack_loose_rest: into one buffer of the declared size, or of what zlib can produce from
-  // the file if that is less (its pages are mapped as the output reaches them, as git's)
+  // unpack_loose_rest
   const total = headerLength + size;
   let content: Uint8Array;
   try {
-    const r = inflateWhole(data, {
-      size: Math.min(total, data.length * MAX_DEFLATE_RATIO + MAX_HEADER_LEN),
-    });
-    if (r.consumed < data.length) {
+    let consumed: number;
+    if (endedAt >= 0) {
+      // the whole stream is in the header buffer: git copies at most `size` bytes of it and
+      // zlib, at its end already, says Z_STREAM_END, so bytes past the declared size are dropped
+      consumed = endedAt;
+      content = head.subarray(headerLength, Math.min(head.length, total));
+    } else {
+      // a buffer that grows as the output comes, up to the declared size or what zlib can
+      // produce from the file if that is less: a hostile header allocates nothing up front
+      const r = inflateWhole(data, {
+        maxSize: Math.min(total, data.length * MAX_DEFLATE_RATIO + MAX_HEADER_LEN),
+      });
+      consumed = r.consumed;
+      content = r.data.subarray(headerLength, Math.max(headerLength, r.length));
+    }
+    if (consumed < data.length) {
       errors.push(`garbage at end of loose object '${id}'`);
       errors.push(`unable to unpack contents of ${path}`);
       return { errors };
     }
-    content = r.data.subarray(headerLength, Math.max(headerLength, r.length));
   } catch (e) {
     const zlib = zlibErrorMessage(e);
     if (zlib) errors.push(zlib);
@@ -201,7 +222,8 @@ export async function readLooseObject(
     return { errors };
   }
 
-  // a stream that ends early leaves the rest of git's buffer as malloc gave it: zeros here
+  // a stream that ends early leaves the rest of git's buffer as malloc gave it: zeros here,
+  // hashed in pieces, never allocated for a blob (its content is shorter than `size` then)
   const missing = size - content.length;
   if (missing > 0 && size > MAX_ZERO_PADDING) {
     errors.push(`corrupt loose object '${id}'`);
@@ -216,7 +238,8 @@ export async function readLooseObject(
   }
   const realId = bytesToHex(hasher.digest());
   if (realId !== id) return { errors, realId };
-  if (missing > 0) {
+  if (missing > 0 && type !== "blob") {
+    // the checks parse a tree, commit or tag with its zeros (git's buffer is that long too)
     const padded = new Uint8Array(size);
     padded.set(content);
     content = padded;
