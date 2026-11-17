@@ -313,6 +313,22 @@ export class SqlRawStore implements RawStorage {
     for (const row of rows) yield row.key;
   }
 
+  /** The keys starting with `prefix`: a range over the key column (`prefix <= key < next`). */
+  async *keysWithPrefix(prefix: string): AsyncIterable<string> {
+    if (prefix === "") {
+      yield* this.keys();
+      return;
+    }
+    await this.ensureInitialized();
+    const last = prefix.charCodeAt(prefix.length - 1);
+    const upper = prefix.slice(0, -1) + String.fromCharCode(last + 1);
+    const rows = await this.db.query<{ key: string }>(
+      `SELECT key FROM ${this.tableName} WHERE key >= ? AND key < ?`,
+      [prefix, upper],
+    );
+    for (const row of rows) if (row.key.startsWith(prefix)) yield row.key;
+  }
+
   /**
    * @returns Content size in bytes, or -1 if key not found
    */

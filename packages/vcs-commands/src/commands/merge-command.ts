@@ -26,11 +26,10 @@ import {
   MergeStatus,
   MergeStrategy,
 } from "../results/merge-result.js";
-import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { abbreviateId, coreBool, worktreeModeTrust } from "./core-config.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
-  abbrev,
   conflictsComment,
   flatTree,
   indexChanges,
@@ -523,7 +522,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       const autostash = await createAutostash(this.context(worktree), headId);
       if (autostash) {
         await state.write("MERGE_AUTOSTASH", `${autostash}\n`);
-        created.push(`Created autostash: ${abbrev(autostash)}`);
+        created.push(`Created autostash: ${await abbreviateId(this.workingCopy, autostash)}`);
       }
     }
     let result: MergeResult;
@@ -577,7 +576,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
     state: OperationState,
     worktree: Worktree | undefined,
   ): Promise<MergeResult> {
-    const output = [`Updating ${abbrev(headId)}..${abbrev(srcId)}`];
+    const output = [
+      `Updating ${await abbreviateId(this.workingCopy, headId)}..${await abbreviateId(this.workingCopy, srcId)}`,
+    ];
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
     const srcTreeId = await this.commits.getTree(srcId);
     const srcTree = await flatTree(this.trees, srcTreeId);

@@ -1526,3 +1526,44 @@ describe("review of #130: an install checks the idx it installs", () => {
     expect(await set.packs()).toEqual([]);
   });
 });
+
+describe("prefix lookups (abbreviated ids)", () => {
+  /** Many small blobs in two packs, one blob in both. */
+  async function twoPacks() {
+    const files = createInMemoryFilesApi();
+    const blobs = Array.from({ length: 300 }, (_, i) => enc.encode(`blob ${i}\n`));
+    await install(
+      files,
+      blobs.slice(0, 160).map((data) => ({ kind: 3, data })),
+    );
+    await install(
+      files,
+      blobs.slice(150).map((data) => ({ kind: 3, data })),
+    );
+    return { files, ids: blobs.map((b) => oidOf("blob", b)) };
+  }
+
+  it("Pack.idsWithPrefix and PackSet.listPrefix find what a scan of the ids finds", async () => {
+    const { files, ids } = await twoPacks();
+    const set = await openPackSet(files, PACK_DIR);
+    const packs = await set.packs();
+    for (const id of ids) {
+      for (const len of [1, 2, 3, 4, 5, 40]) {
+        const prefix = id.slice(0, len);
+        const expected = [...new Set(ids.filter((x) => x.startsWith(prefix)))].sort();
+        const listed: string[] = [];
+        for await (const x of set.listPrefix?.(prefix) ?? []) listed.push(x);
+        expect(listed.sort(), prefix).toEqual(expected);
+        for (const p of packs) {
+          const all = [...p.ids()].filter((x) => x.startsWith(prefix));
+          expect(p.idsWithPrefix?.(prefix), prefix).toEqual(all);
+        }
+      }
+    }
+    for (const p of packs) {
+      expect(p.idsWithPrefix?.("")).toEqual([...p.ids()]);
+      expect(p.idsWithPrefix?.("xyz")).toEqual([]);
+      expect(p.idsWithPrefix?.("A1")).toEqual([]);
+    }
+  });
+});

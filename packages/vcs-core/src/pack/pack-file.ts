@@ -87,6 +87,12 @@ export interface Pack {
   /** The ids in idx order (sorted). */
   ids(): Iterable<ObjectId>;
   /**
+   * The ids starting with the lowercase hex `prefix`, in idx order: a binary search in the
+   * idx (git's `find_short_packed_object`), none for a prefix that is not hex. Optional for
+   * other implementations; `PackSet.listPrefix` filters `ids()` without it.
+   */
+  idsWithPrefix?(prefix: string): ObjectId[];
+  /**
    * The object, or undefined if the pack does not hold `id`. With `verify`, the content is
    * re-hashed and its end throws `ObjectIdMismatchError` if it hashes to another id.
    */
@@ -560,6 +566,8 @@ interface IdxTable {
   crcOf(i: number): number | undefined;
   /** The position of `id`, -1 if absent; `PackError` if its fan-out bucket is corrupt. */
   find(id: ObjectId): number;
+  /** The positions of the ids starting with the hex `prefix`, in order. */
+  withPrefix(prefix: string): number[];
   /** Checks the whole idx (git's verify_pack_index); `PackError` if it is corrupt. */
   verify(): Promise<void>;
   /** The checks run so far. */
@@ -695,6 +703,55 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
       lastId = id;
       lastFound = found;
       return found;
+    },
+    withPrefix(prefix) {
+      if (!/^[0-9a-f]{0,40}$/.test(prefix)) return [];
+      // the prefix as bytes, an odd last digit as the high nibble of its byte
+      const key = new Uint8Array(20);
+      for (let i = 0; i < prefix.length; i++) {
+        const v = HEX_VALUE[prefix.charCodeAt(i)] as number;
+        key[i >> 1] |= i & 1 ? v : v << 4;
+      }
+      const whole = prefix.length >> 1;
+      const odd = prefix.length & 1;
+      /** <0, 0 or >0 as the id at `pos` sorts before, under or after the prefix */
+      const cmp = (pos: number): number => {
+        const at = idsAt + pos * idStride;
+        for (let k = 0; k < whole; k++) {
+          const c = (idx[at + k] as number) - (key[k] as number);
+          if (c !== 0) return c;
+        }
+        if (odd) return ((idx[at + whole] as number) & 0xf0) - (key[whole] as number);
+        return 0;
+      };
+      let lo = 0;
+      let hi = n;
+      let firstBucket = 0;
+      let lastBucket = 255;
+      if (prefix.length >= 2) {
+        firstBucket = lastBucket = key[0] as number;
+      } else if (prefix.length === 1) {
+        firstBucket = key[0] as number;
+        lastBucket = firstBucket | 0x0f;
+      }
+      lo = firstBucket ? fan(firstBucket - 1) : 0;
+      hi = fan(lastBucket);
+      for (let b = firstBucket; b <= lastBucket; b++) {
+        if (checked[b] === 0) {
+          checkBucket(b, b ? fan(b - 1) : 0, fan(b));
+          checked[b] = 1;
+          bucketsChecked++;
+        }
+      }
+      const end = hi;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (cmp(mid) < 0) lo = mid + 1;
+        else hi = mid;
+      }
+      const out: number[] = [];
+      for (let i = lo; i < end && cmp(i) === 0; i++) out.push(i);
+      return out;
     },
     async verify() {
       // git's verify_pack_index: the idx's own SHA-1, then every entry
@@ -1427,6 +1484,9 @@ export async function openPack(
     },
     *ids() {
       for (let i = 0; i < n; i++) yield hex(t.idAt(i));
+    },
+    idsWithPrefix(prefix) {
+      return t.withPrefix(prefix).map((i) => hex(t.idAt(i)));
     },
     async entry(id) {
       const i = t.find(id);

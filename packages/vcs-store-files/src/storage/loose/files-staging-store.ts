@@ -212,6 +212,22 @@ export function filesStagingStore(
       }
     },
 
+    async *listPrefix(prefix) {
+      if (prefix.length < 2) {
+        for await (const id of this.list()) if (id.startsWith(prefix)) yield id;
+        return;
+      }
+      const fanout = prefix.slice(0, 2);
+      const dir = joinPath(objectsDir, fanout);
+      if (!FANOUT.test(fanout) || (await files.stats(dir))?.kind !== "directory") return;
+      const rest = prefix.slice(2);
+      const names: string[] = [];
+      for await (const f of files.list(dir)) {
+        if (f.kind === "file" && REST.test(f.name) && f.name.startsWith(rest)) names.push(f.name);
+      }
+      for (const name of names.sort()) yield fanout + name;
+    },
+
     async sweepStaged(olderThanMs) {
       if ((await files.stats(objectsDir))?.kind !== "directory") return 0;
       const cutoff = Date.now() - olderThanMs;

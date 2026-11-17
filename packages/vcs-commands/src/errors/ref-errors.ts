@@ -54,11 +54,17 @@ export class RefNotFoundError extends GitApiError {
  */
 export class RevisionError extends GitApiError {
   readonly revision: string;
+  /**
+   * What git printed on stdout before it died (`git rev-parse a ^b nope` prints the ids of
+   * `a` and `^b`, then `nope` as a path, then dies); usually empty
+   */
+  readonly output: string[];
 
-  constructor(revision: string, message: string) {
+  constructor(revision: string, message: string, output: string[] = []) {
     super(message);
     this.name = "RevisionError";
     this.revision = revision;
+    this.output = output;
   }
 }
 

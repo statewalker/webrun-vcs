@@ -291,6 +291,19 @@ export class KvRawStore implements RawStorage {
     }
   }
 
+  /** The keys starting with `prefix`, through the KV store's prefix scan. */
+  async *keysWithPrefix(prefix: string): AsyncIterable<string> {
+    const dataPrefix = this.dataKey("");
+    for await (const fullKey of this.kv.list(this.dataKey(prefix))) {
+      yield fullKey.substring(dataPrefix.length);
+    }
+    const manifestPrefix = this.manifestKey("");
+    for await (const fullKey of this.kv.list(this.manifestKey(prefix))) {
+      const key = fullKey.substring(manifestPrefix.length);
+      if (!(await this.kv.has(this.dataKey(key)))) yield key;
+    }
+  }
+
   async size(key: string): Promise<number> {
     const m = await this.manifest(key);
     if (m) return m.size;

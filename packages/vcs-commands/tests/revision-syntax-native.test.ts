@@ -5,6 +5,7 @@
  * `@{<date>}` lookups land between them for both.
  */
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { approxidateCareful } from "../src/commands/git-date.js";
-import { Git, ResetMode } from "../src/index.js";
+import { Git, ResetMode, RevisionError } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -565,6 +566,479 @@ describeGit("approxidate against native git, one timezone for both", () => {
         );
         expect([zone, text, ours.has(native)]).toEqual([zone, text, true]);
       }
+    }
+  });
+});
+
+// ---------------------------------------------------------------- abbreviated ids (P4.25)
+
+/** git's object id of `type` with `body` (SHA-1 of the header and the bytes). */
+const objectId = (type: string, body: Buffer) =>
+  createHash("sha1").update(`${type} ${body.length}\0`).update(body).digest("hex");
+
+/** The first `make(i)` whose id (as `type`) starts with `prefix`. */
+function craft(type: string, prefix: string, make: (i: number) => Buffer): Buffer {
+  for (let i = 0; ; i++) {
+    const body = make(i);
+    if (objectId(type, body).startsWith(prefix)) return body;
+  }
+}
+
+const IDENT = "Interop Tester <interop@example.com> 1112911993 +0000";
+
+/**
+ * Objects whose ids share prefixes with a repository's: for `P` (main's commit) a blob, a
+ * tree, a tag and a second commit; for `Q` (main's tree) a blob; for `R` (main's first
+ * commit) a blob; two blobs sharing six digits. Each crafted object is written by native git
+ * (`hash-object`, `mktree`, `commit-tree`, `mktag`) and checked against the id computed here.
+ */
+function craftCollisions(repo: string, tag: string): Record<string, string> {
+  const git = (input: string | Buffer, ...args: string[]) =>
+    execFileSync("git", args, { cwd: repo, env: envAt(), input, encoding: "latin1" }).trim();
+  const head = git("", "rev-parse", "main");
+  const tree = git("", "rev-parse", "main^{tree}");
+  const first = git("", "rev-list", "--max-parents=0", "main");
+  const blobA = git("", "rev-parse", "main:a.txt");
+  const P = head.slice(0, 4);
+  const Q = tree.slice(0, 4);
+  const R = first.slice(0, 4);
+  const blob = (prefix: string, salt: string) => {
+    const body = craft("blob", prefix, (i) => Buffer.from(`${salt} ${i}\n`));
+    const id = git(body, "hash-object", "-w", "--stdin");
+    expect(id.startsWith(prefix)).toBe(true);
+    return id;
+  };
+  const out: Record<string, string> = { P, Q, R, head, tree, first };
+  out.blobP = blob(P, `blob-p-${tag}`);
+  out.blobQ = blob(Q, `blob-q-${tag}`);
+  out.blobR = blob(R, `blob-r-${tag}`);
+  // a tree: one entry, its name varied
+  const oid = Buffer.from(blobA, "hex");
+  const treeBody = craft("tree", P, (i) =>
+    Buffer.concat([Buffer.from(`100644 f-${tag}-${i}\0`), oid]),
+  );
+  const name = treeBody.subarray(7, treeBody.indexOf(0)).toString();
+  out.treeP = git(`100644 blob ${blobA}\t${name}\n`, "mktree");
+  expect(out.treeP.startsWith(P)).toBe(true);
+  // a commit: main's tree and parent, its message varied
+  const commitBody = craft("commit", P, (i) =>
+    Buffer.from(
+      `tree ${tree}\nparent ${head}\nauthor ${IDENT}\ncommitter ${IDENT}\n\ncrafted ${tag} ${i}\n`,
+    ),
+  );
+  const msg = commitBody.toString().split("\n\n")[1]?.trim() ?? "";
+  out.commitP = git("", "commit-tree", tree, "-p", head, "-m", msg);
+  expect(out.commitP.startsWith(P)).toBe(true);
+  // an annotated tag of the first commit, its message varied
+  const tagBody = craft("tag", P, (i) =>
+    Buffer.from(
+      `object ${first}\ntype commit\ntag crafted-${tag}\ntagger ${IDENT}\n\nmessage ${i}\n`,
+    ),
+  );
+  out.tagP = git(tagBody, "mktag");
+  expect(out.tagP.startsWith(P)).toBe(true);
+  // two blobs sharing six digits (a birthday search)
+  const seen = new Map<string, Buffer>();
+  for (let i = 0; ; i++) {
+    const body = Buffer.from(`pair-${tag} ${i}\n`);
+    const key = objectId("blob", body).slice(0, 6);
+    const other = seen.get(key);
+    if (other) {
+      out.pairA = git(other, "hash-object", "-w", "--stdin");
+      out.pairB = git(body, "hash-object", "-w", "--stdin");
+      out.S = key;
+      break;
+    }
+    seen.set(key, body);
+  }
+  return out;
+}
+
+/**
+ * main: c1 (a.txt), c2 (d/b.txt, d/e/c.txt), m (a merge of side: s1, s2); tags v1
+ * (lightweight, at c2) and va (annotated, at c1); feat from c2 with f1.
+ */
+function buildRanges(base: string): string {
+  mkdirSync(base, { recursive: true });
+  run(base, undefined, "init", "-q", "-b", "main", "r");
+  const repo = join(base, "r");
+  put(repo, "a.txt", "a\n");
+  run(repo, undefined, "add", ".");
+  run(repo, undefined, "commit", "-qm", "c1");
+  run(repo, undefined, "tag", "-a", "-m", "annotated", "va");
+  put(repo, "d/b.txt", "b\n");
+  put(repo, "d/e/c.txt", "c\n");
+  run(repo, undefined, "add", ".");
+  run(repo, 9, "commit", "-qm", "c2");
+  run(repo, undefined, "tag", "v1");
+  run(repo, undefined, "checkout", "-q", "-b", "feat");
+  put(repo, "f.txt", "f\n");
+  run(repo, undefined, "add", ".");
+  run(repo, 8, "commit", "-qm", "f1");
+  run(repo, undefined, "checkout", "-q", "-b", "side", "v1");
+  put(repo, "s.txt", "s1\n");
+  run(repo, undefined, "add", ".");
+  run(repo, 7, "commit", "-qm", "s1");
+  put(repo, "s.txt", "s2\n");
+  run(repo, 6, "commit", "-qam", "s2");
+  run(repo, undefined, "checkout", "-q", "main");
+  put(repo, "a.txt", "a\nmain\n");
+  run(repo, 5, "commit", "-qam", "c3");
+  run(repo, 4, "merge", "-q", "--no-ff", "-m", "m", "side");
+  return repo;
+}
+
+/** `git rev-parse <args>` (no --verify) by native git and ours: status, stdout, stderr. */
+async function expectSameRevParse(repo: string, cases: string[][]): Promise<void> {
+  const git = await open(repo);
+  for (const args of cases) {
+    const n = spawnSync("git", ["rev-parse", ...args], {
+      cwd: repo,
+      env: envAt(),
+      encoding: "latin1",
+    });
+    let ours: { status: number; out: string; err: string };
+    try {
+      const command = git.revParse();
+      for (const arg of args) command.addArgument(arg);
+      const r = await command.call();
+      ours = {
+        status: 0,
+        out: r.lines.map((l) => `${l}\n`).join(""),
+        err: r.warnings.map((w) => `${w}\n`).join(""),
+      };
+    } catch (error) {
+      const output = error instanceof RevisionError ? error.output : [];
+      ours = {
+        status: 128,
+        out: output.map((l) => `${l}\n`).join(""),
+        err: `${(error as Error).message}\n`,
+      };
+    }
+    expect([args, ours]).toEqual([args, { status: n.status, out: n.stdout, err: n.stderr }]);
+  }
+}
+
+/** `git log --format=%H <args>` by native git and ours (`revList`). */
+async function expectSameLog(repo: string, cases: string[][]): Promise<void> {
+  const git = await open(repo);
+  for (const args of cases) {
+    const n = spawnSync("git", ["log", "--format=%H", ...args, "--"], {
+      cwd: repo,
+      env: envAt(),
+      encoding: "latin1",
+    });
+    let ours: { status: number; out: string; err: string };
+    try {
+      const command = git.revList();
+      for (const arg of args) command.addRevision(arg);
+      const ids: string[] = [];
+      for await (const c of await command.call()) ids.push(c.id);
+      ours = { status: 0, out: ids.map((id) => `${id}\n`).join(""), err: "" };
+    } catch (error) {
+      ours = { status: 128, out: "", err: `${(error as Error).message}\n` };
+    }
+    // the commits compared as a set: LogCommand's walk without paths is not in git's
+    // date order (a known gap of LogCommand, not of the revision arguments)
+    const sorted = (out: string) => out.split("\n").filter(Boolean).sort().join("\n");
+    expect([args, { ...ours, out: sorted(ours.out) }]).toEqual([
+      args,
+      { status: n.status, out: sorted(n.stdout), err: n.stderr },
+    ]);
+  }
+}
+
+describeGit("abbreviated object ids and describe names, native rev-parse --verify", () => {
+  let repo = "";
+  let ids: Record<string, string> = {};
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "revision-abbrev-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+    repo = buildRanges(join(root, "base"));
+    ids = craftCollisions(repo, "loose");
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+  const setConfig = (key: string, value?: string) => {
+    if (value === undefined)
+      spawnSync("git", ["config", "--unset", key], { cwd: repo, env: envAt() });
+    else run(repo, undefined, "config", key, value);
+  };
+  /** Every object's id at 4 to 8 digits, in both cases, and whole. */
+  const everyAbbreviation = () => {
+    const all = run(
+      repo,
+      undefined,
+      "cat-file",
+      "--batch-all-objects",
+      "--batch-check=%(objectname)",
+    )
+      .trim()
+      .split("\n");
+    const revs: string[] = [];
+    for (const id of all) {
+      for (const len of [4, 5, 6, 7, 8]) revs.push(id.slice(0, len));
+      revs.push(id.slice(0, 6).toUpperCase(), id);
+    }
+    return revs;
+  };
+  const crafted = () => {
+    const { P, Q, R, S } = ids;
+    return [
+      P,
+      P.toUpperCase(),
+      `${P}^{commit}`,
+      `${P}^{tree}`,
+      `${P}^{blob}`,
+      `${P}^{tag}`,
+      `${P}^{}`,
+      `${P}~0`,
+      `${P}^`,
+      `${P}:a.txt`,
+      Q,
+      `${Q}^{tree}`,
+      `${Q}:a.txt`,
+      `${Q}:`,
+      `${Q}~0`,
+      R,
+      `${R}~0`,
+      `${R}^{commit}`,
+      `${R}:a.txt`,
+      S,
+      S.slice(0, 4),
+      `${S}^{blob}`,
+      "abc",
+      "0000",
+      "ffffffff",
+      `${ids.head.slice(0, 39)}`,
+      `${ids.head.slice(0, 12)}x`,
+    ];
+  };
+  /**
+   * git 2.5x reads `<x>-g<abbrev>` as describe output only when `<x>` is a ref name,
+   * a dash and digits (`ref_and_count_parts_valid`); 2.43 takes any `-g<abbrev>`.
+   */
+  const strictDescribe = () =>
+    spawnSync("git", ["rev-parse", "-q", "--verify", `zz-g${ids.head.slice(0, 7)}`], {
+      cwd: repo,
+      env: envAt(),
+    }).status !== 0;
+  const describeNames = () => {
+    const { R, head, first } = ids;
+    const lenient = [
+      `v1-g${head.slice(0, 7)}`,
+      `v1-xx-g${head.slice(0, 7)}`,
+      `-1-g${head.slice(0, 7)}`,
+      `v1[x-1-g${head.slice(0, 7)}`,
+    ];
+    return [
+      ...(strictDescribe() ? lenient : []),
+      `v1-1-g${head.slice(0, 7)}`,
+      `va-0-g${first.slice(0, 5)}`,
+      `junk-12-g${head.slice(0, 8)}`,
+      `refs/tags/v1-3-g${head.slice(0, 6)}`,
+      `v1-1-g${R}`,
+      `v1-1-g${ids.P}`,
+      `v1-1-g${ids.blobQ.slice(0, 8)}`,
+      `v1-1-g${head.slice(0, 3)}`,
+      `v1-1-g${head.slice(0, 7)}~1`,
+      `v1-1-g${head.slice(0, 7)}^{tree}`,
+      `v1-1-g${head.slice(0, 7)}:a.txt`,
+    ];
+  };
+
+  it("every object's abbreviations, loose", async () => {
+    await expectSameResolution(repo, everyAbbreviation());
+  });
+
+  it("colliding prefixes: the type the context needs, git's error and candidate list", async () => {
+    await expectSameResolution(repo, crafted());
+  });
+
+  it("core.disambiguate: commit, committish, tree, treeish, blob, none", async () => {
+    for (const value of ["commit", "committish", "tree", "treeish", "blob", "none", "Tree"]) {
+      setConfig("core.disambiguate", value);
+      await expectSameResolution(repo, crafted());
+    }
+    setConfig("core.disambiguate");
+  });
+
+  it("core.abbrev lengthens the candidates' abbreviations", async () => {
+    for (const value of ["4", "10", "auto"]) {
+      setConfig("core.abbrev", value);
+      await expectSameResolution(repo, [ids.P, ids.S.slice(0, 4), `${ids.Q}~0`]);
+    }
+    setConfig("core.abbrev");
+  });
+
+  it("describe names: <ref>-<n>-g<abbrev> read as a commit", async () => {
+    await expectSameResolution(repo, describeNames());
+  });
+
+  it("a ref that is also a short id warns; refs win over short ids", async () => {
+    run(repo, undefined, "branch", ids.R, "feat");
+    run(repo, undefined, "tag", ids.head.slice(0, 6), "v1");
+    await expectSameResolution(repo, [
+      ids.R,
+      `${ids.R}~1`,
+      `${ids.R}@{0}`,
+      ids.head.slice(0, 6),
+      ids.head.slice(0, 7),
+    ]);
+    setConfig("core.warnAmbiguousRefs", "false");
+    await expectSameResolution(repo, [ids.R, ids.head.slice(0, 6)]);
+    setConfig("core.warnAmbiguousRefs");
+    run(repo, undefined, "branch", "-D", ids.R);
+    run(repo, undefined, "tag", "-d", ids.head.slice(0, 6));
+  });
+
+  it("packed objects (idx prefix search), with loose collisions added after the pack", async () => {
+    let n = 0;
+    for (const id of Object.values(ids)) {
+      if (id.length === 40) run(repo, undefined, "update-ref", `refs/keep/k${n++}`, id);
+    }
+    run(repo, undefined, "repack", "-a", "-d", "-q");
+    run(repo, undefined, "prune-packed");
+    const more = craftCollisions(repo, "after-pack");
+    await expectSameResolution(repo, everyAbbreviation());
+    await expectSameResolution(repo, crafted());
+    await expectSameResolution(repo, [more.P, more.S, `${more.P}^{commit}`, `${more.Q}:a.txt`]);
+    await expectSameResolution(repo, describeNames());
+  });
+});
+
+describeGit("revision ranges and sets, native rev-parse and log", () => {
+  let repo = "";
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "revision-ranges-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+    repo = buildRanges(join(root, "base"));
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+  const short = (rev: string) => run(repo, undefined, "rev-parse", "--short", rev).trim();
+
+  it("rev-parse prints ranges, exclusions and parent shorthands as git does", async () => {
+    await expectSameRevParse(repo, [
+      ["main..feat"],
+      ["feat..main"],
+      ["feat...main"],
+      ["main...feat"],
+      ["..feat"],
+      ["feat.."],
+      ["feat..."],
+      ["...feat"],
+      ["^main"],
+      ["main", "^feat", "side"],
+      ["HEAD^!"],
+      ["HEAD^@"],
+      ["HEAD^-"],
+      ["HEAD^-1"],
+      ["HEAD^-2"],
+      ["HEAD^-3"],
+      ["v1^!"],
+      ["va^@"],
+      ["va..v1"],
+      ["va...feat"],
+      [`${short("feat")}..${short("main")}`],
+      ["main~2^!"],
+      ["nope..main"],
+      ["nope"],
+      ["main..nope"],
+      ["HEAD~1^@", "^side"],
+    ]);
+  });
+
+  it("log lists ranges, symmetric differences, --not and parent shorthands as git does", async () => {
+    await expectSameLog(repo, [
+      [],
+      ["main"],
+      ["main..feat"],
+      ["feat..main"],
+      ["feat...main"],
+      ["main...feat"],
+      ["..feat"],
+      ["feat.."],
+      ["^feat", "main"],
+      ["^main"],
+      ["main", "--not", "feat"],
+      ["main", "--not", "feat", "--not", "side"],
+      ["--not", "^feat", "main"],
+      ["HEAD^!"],
+      ["HEAD^@"],
+      ["HEAD^-"],
+      ["HEAD^-2"],
+      ["main^-1", "feat"],
+      ["side^@", "^v1"],
+      ["va..main"],
+      ["v1...va"],
+      [`${short("side")}...${short("feat")}`],
+      ["nope"],
+      ["nope..main"],
+      ["HEAD^-x"],
+      ["HEAD^-0"],
+    ]);
+  });
+
+  it("rev-parse --verify prints a range or parent shorthand, then needs a single revision", async () => {
+    const git = await open(repo);
+    for (const rev of ["main..feat", "feat...main", "HEAD^!", "HEAD^@", "HEAD^-2", "nope..main"]) {
+      const n = spawnSync("git", ["rev-parse", "--verify", rev], {
+        cwd: repo,
+        env: envAt(),
+        encoding: "latin1",
+      });
+      let ours: { status: number; out: string; err: string };
+      try {
+        const r = await git.revParse().setRevision(rev).call();
+        ours = { status: 0, out: `${r.objectId}\n`, err: "" };
+      } catch (error) {
+        const output = error instanceof RevisionError ? error.output : [];
+        ours = {
+          status: 128,
+          out: output.map((l) => `${l}\n`).join(""),
+          err: `${(error as Error).message}\n`,
+        };
+      }
+      expect([rev, ours]).toEqual([rev, { status: n.status, out: n.stdout, err: n.stderr }]);
+    }
+  });
+
+  it("<rev>:./<path> and <rev>:../<path> relative to the current directory", async () => {
+    const sub = join(repo, "d", "e");
+    const git = await open(repo);
+    for (const rev of [
+      "HEAD:./c.txt",
+      "HEAD:../b.txt",
+      "HEAD:../../a.txt",
+      "HEAD:./",
+      "HEAD:../",
+      ":./c.txt",
+      ":../b.txt",
+      "HEAD:c.txt",
+      "HEAD:.//c.txt",
+      "HEAD:./../e/./c.txt",
+      "HEAD:../../../x",
+    ]) {
+      const n = spawnSync("git", ["rev-parse", "--verify", rev], {
+        cwd: sub,
+        env: envAt(),
+        encoding: "latin1",
+      });
+      let ours: { status: number; out: string; err: string };
+      try {
+        const r = await git.revParse().setPrefix("d/e").setRevision(rev).call();
+        ours = { status: 0, out: `${r.objectId}\n`, err: "" };
+      } catch (error) {
+        ours = { status: 128, out: "", err: `${(error as Error).message}\n` };
+      }
+      // git names the worktree's absolute path, which ours does not know
+      const err = n.stderr.replace(/ at '[^']*'\n$/, "\n");
+      expect([rev, ours]).toEqual([rev, { status: n.status, out: n.stdout, err }]);
     }
   });
 });

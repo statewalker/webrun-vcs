@@ -55,6 +55,10 @@ export class MemoryRawStorage implements RawStorage {
     yield* this.data.keys();
   }
 
+  async *keysWithPrefix(prefix: string): AsyncIterable<string> {
+    for (const key of [...this.data.keys()]) if (key.startsWith(prefix)) yield key;
+  }
+
   async size(key: string): Promise<number> {
     const chunks = this.data.get(key);
     if (!chunks) return -1;

@@ -22,7 +22,7 @@ import {
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-import { worktreeModeTrust } from "./commands/core-config.js";
+import { abbrevLengths, worktreeModeTrust } from "./commands/core-config.js";
 import {
   authorIdentOf,
   committerIdentOf,
@@ -32,7 +32,7 @@ import {
   withoutCrud,
 } from "./commands/git-ident.js";
 import { reflogLine } from "./commands/reflog-messages.js";
-import { RevisionResolver } from "./commands/revision-resolver.js";
+import { type ResolveOptions, RevisionResolver } from "./commands/revision-resolver.js";
 
 import { NoHeadError, NotACommitError, RefNotFoundError } from "./errors/index.js";
 
@@ -441,6 +441,8 @@ export abstract class GitCommand<T> {
       tags: this.tagsStore,
       staging: () => this.staging,
       workingCopy: this._workingCopy,
+      objects: this._workingCopy.history?.objects,
+      abbreviate: (ids) => abbrevLengths(this._workingCopy, ids),
     });
   }
 
@@ -453,8 +455,8 @@ export abstract class GitCommand<T> {
    * @throws RefNotFoundError if it names nothing
    * @throws RevisionError where git dies (no upstream, reflog too short)
    */
-  protected async resolveRevision(name: string): Promise<ObjectId> {
-    const id = await this.revisionResolver().resolve(name);
+  protected async resolveRevision(name: string, options?: ResolveOptions): Promise<ObjectId> {
+    const id = await this.revisionResolver().resolve(name, options);
     if (id === undefined) throw new RefNotFoundError(name);
     return id;
   }
@@ -477,7 +479,8 @@ export abstract class GitCommand<T> {
     name: string,
     fatal: (name: string) => string = (n) => `fatal: Could not parse object '${n}'.`,
   ): Promise<ObjectId> {
-    const id = await this.resolveRevision(name);
+    // a commit is wanted: an abbreviation is read as a committish (repo_get_oid_committish)
+    const id = await this.resolveRevision(name, { hint: "committish" });
     const peeled = await this.revisionResolver().peelTags(id);
     if (peeled.type === "commit") return peeled.id;
     const lines = peeled.type

@@ -21,12 +21,23 @@
  * `@{-N}`; `[<branch>]@{upstream}` / `@{u}`; `[<branch>]@{push}`; `[<ref>]@{<n>}` and
  * `[<ref>]@{<date>}` (git's approxidate); `<rev>~<n>`, `<rev>^<n>`; `<rev>^{<type>}`,
  * `<rev>^{}`, `<rev>^{/<regex>}`; `:/<regex>` (with git's `!-` and `!!`); `<rev>:<path>`;
- * `:<path>` and `:<n>:<path>`. Regexes are POSIX extended ones run as glibc runs them
- * (`compilePosixRegex`). Not supported: abbreviated object ids and `git describe` names.
+ * `:<path>` and `:<n>:<path>` (`./` and `../` paths relative to {@link cwdPrefix}); abbreviated
+ * object ids (`get_short_oid`: at least 4 hex digits, disambiguated by the type the context
+ * needs or `core.disambiguate`, with git's `error: short object ID ... is ambiguous` and its
+ * candidate list); `git describe` names (`<tag>-<n>-g<abbrev>`, the abbreviation read as a
+ * commit). Regexes are POSIX extended ones run as glibc runs them (`compilePosixRegex`).
+ *
+ * Revision ranges and sets (`a..b`, `a...b`, `^a`, `a^@`, `a^!`, `a^-<n>`) are read by
+ * `parseRevisionArgs` (`revision-range.ts`) on top of this resolver.
  */
 
-import type { Commit, ObjectId, Refs } from "@statewalker/vcs-core";
-import { isSymbolicRef, isValidRefName } from "@statewalker/vcs-core";
+import type { Commit, GitObjects, ObjectId, PersonIdent, Refs } from "@statewalker/vcs-core";
+import {
+  isSymbolicRef,
+  isValidRefName,
+  listObjectsWithPrefix,
+  MINIMUM_ABBREV_LENGTH,
+} from "@statewalker/vcs-core";
 import { compilePosixRegex, parseGitBool } from "@statewalker/vcs-utils";
 import type { Staging, WorkingCopy } from "@statewalker/vcs-working-tree";
 
@@ -49,8 +60,20 @@ export interface RevisionSources {
   blobs: { has(id: ObjectId): Promise<boolean> };
   tags?: {
     has(id: ObjectId): Promise<boolean>;
-    load(id: ObjectId): Promise<{ object: ObjectId } | undefined>;
+    load(
+      id: ObjectId,
+    ): Promise<{ object: ObjectId; tag?: string; tagger?: PersonIdent } | undefined>;
   };
+  /**
+   * The object store, for abbreviated ids (its `listPrefix`, else `list`); without it the
+   * typed stores' `keys()` are listed
+   */
+  objects?: Pick<GitObjects, "list" | "listPrefix">;
+  /**
+   * The lengths git abbreviates ids to (`repo_find_unique_abbrev` with `core.abbrev`), for
+   * the candidates of an ambiguous short id; 7 digits without it
+   */
+  abbreviate?: (ids: ObjectId[]) => Promise<Map<ObjectId, number>>;
   /** The index, for `:<path>` (undefined where there is none) */
   staging?: () => Staging | undefined;
   /** The configuration (`branch.*`, `remote.*`, `push.default`) */
@@ -58,6 +81,31 @@ export interface RevisionSources {
 }
 
 type ObjectType = "commit" | "tree" | "blob" | "tag";
+
+/**
+ * The type a context needs of an abbreviated id (git's `GET_OID_COMMIT`, `GET_OID_COMMITTISH`,
+ * `GET_OID_TREE`, `GET_OID_TREEISH`, `GET_OID_BLOB`; `core.disambiguate`'s values but "none"):
+ * of several objects sharing the prefix, the one that is (or peels to) such an object wins.
+ */
+export type DisambiguateHint = "commit" | "committish" | "tree" | "treeish" | "blob";
+
+/** How {@link RevisionResolver.resolve} reads a revision. */
+export interface ResolveOptions {
+  /** The type the caller needs (`git log` and `A..B` want committishes); default none */
+  hint?: DisambiguateHint;
+  /** git's `GET_OID_QUIETLY`: no `error:` lines for an ambiguous short id */
+  quiet?: boolean;
+}
+
+/** git's `get_short_oid` result. */
+type ShortOid =
+  | { status: "found"; id: ObjectId }
+  | { status: "missing" }
+  | { status: "ambiguous" }
+  | { status: "invalid" };
+
+const HEX_DIGIT = /^[0-9a-fA-F]$/;
+const isHexDigit = (c: string | undefined) => c !== undefined && HEX_DIGIT.test(c);
 
 const ZERO_ID = "0000000000000000000000000000000000000000";
 const HEX_ID = /^[0-9a-fA-F]{40}$/;
@@ -116,6 +164,11 @@ interface Interpreted {
 export class RevisionResolver {
   /** What git prints while resolving: `warning: ...` and `error: ...` lines */
   readonly warnings: string[] = [];
+  /**
+   * The current directory below the top of the worktree (git's `prefix`, `d/sub/` or ""),
+   * against which `<rev>:./<path>`, `<rev>:../<path>` and `:./<path>` are read
+   */
+  cwdPrefix = "";
   private config?: RemoteConfigStore;
   /** Refs read while resolving one revision (`HEAD~3` reads HEAD once) */
   private readonly refCache = new Map<string, Promise<{ id: ObjectId; ref: string } | undefined>>();
@@ -130,8 +183,8 @@ export class RevisionResolver {
    *
    * @throws RevisionError where git dies (an `@{u}` without upstream, a reflog too short)
    */
-  async resolve(name: string): Promise<ObjectId | undefined> {
-    const direct = await this.oid1(name);
+  async resolve(name: string, options: ResolveOptions = {}): Promise<ObjectId | undefined> {
+    const direct = await this.oid1(name, options);
     if (direct !== undefined) return direct;
     if (name.startsWith(":")) {
       if (name.length > 2 && name[1] === "/") {
@@ -143,7 +196,7 @@ export class RevisionResolver {
         stage = Number(name[1]);
         path = name.slice(3);
       }
-      return this.indexEntry(normalizeRelative(path), stage);
+      return this.indexEntry(this.relativePath(path, name), stage);
     }
     // <tree-ish>:<path>, the first `:` outside `@{...}` / `^{...}`
     let depth = 0;
@@ -155,11 +208,11 @@ export class RevisionResolver {
       } else if (depth > 0 && c === "}") {
         depth--;
       } else if (depth === 0 && c === ":") {
-        const treeish = await this.oid1(name.slice(0, i));
+        const treeish = await this.oid1(name.slice(0, i), { ...options, hint: "treeish" });
         if (treeish === undefined) return undefined;
         const tree = await this.peelToType(treeish, "tree");
         if (tree === undefined) return undefined;
-        return this.treeEntry(tree, normalizeRelative(name.slice(i + 1)));
+        return this.treeEntry(tree, this.relativePath(name.slice(i + 1), name));
       }
     }
     return undefined;
@@ -270,7 +323,7 @@ export class RevisionResolver {
   // ------------------------------------------------------------------ get_oid_1
 
   /** git's `get_oid_1`: `~<n>` / `^<n>`, then `^{...}`, then a ref or an object id. */
-  private async oid1(name: string): Promise<ObjectId | undefined> {
+  private async oid1(name: string, flags: ResolveOptions = {}): Promise<ObjectId | undefined> {
     let cp = name.length - 1;
     while (cp >= 0 && (name[cp] ?? "") >= "0" && (name[cp] ?? "") <= "9") cp--;
     const suffix = cp >= 0 ? name[cp] : undefined;
@@ -280,16 +333,24 @@ export class RevisionResolver {
       if (!Number.isSafeInteger(num) || num > 2147483647) return undefined;
       if (num === 0 && cp === name.length - 1) num = 1;
       const base = name.slice(0, cp);
-      return suffix === "^" ? this.parent(base, num) : this.nthAncestor(base, num);
+      return suffix === "^"
+        ? this.parent(base, num, flags.quiet)
+        : this.nthAncestor(base, num, flags.quiet);
     }
-    const peeled = await this.peelOnion(name);
+    const peeled = await this.peelOnion(name, flags);
     if (peeled !== undefined) return peeled;
-    return this.basic(name);
+    const basic = await this.basic(name, flags);
+    if (basic !== undefined) return basic;
+    // describe output, "SOMETHING-gXXXX"
+    const described = await this.describeName(name);
+    if (described !== undefined) return described;
+    const short = await this.shortOid(name, flags);
+    return short.status === "found" ? short.id : undefined;
   }
 
   /** git's `get_parent`: `<rev>^<n>` (`^0` the commit itself). */
-  private async parent(name: string, idx: number): Promise<ObjectId | undefined> {
-    const id = await this.oid1(name);
+  private async parent(name: string, idx: number, quiet?: boolean): Promise<ObjectId | undefined> {
+    const id = await this.oid1(name, { hint: "committish", quiet });
     if (id === undefined) return undefined;
     const commitId = await this.peelToType(id, "commit");
     if (commitId === undefined) return undefined;
@@ -299,8 +360,12 @@ export class RevisionResolver {
   }
 
   /** git's `get_nth_ancestor`: `<rev>~<n>`, first parents. */
-  private async nthAncestor(name: string, generation: number): Promise<ObjectId | undefined> {
-    const id = await this.oid1(name);
+  private async nthAncestor(
+    name: string,
+    generation: number,
+    quiet?: boolean,
+  ): Promise<ObjectId | undefined> {
+    const id = await this.oid1(name, { hint: "committish", quiet });
     if (id === undefined) return undefined;
     let commitId = await this.peelToType(id, "commit");
     for (let i = 0; commitId !== undefined && i < generation; i++) {
@@ -311,7 +376,7 @@ export class RevisionResolver {
   }
 
   /** git's `peel_onion`: `<rev>^{<type>}`, `<rev>^{}`, `<rev>^{/<regex>}`. */
-  private async peelOnion(name: string): Promise<ObjectId | undefined> {
+  private async peelOnion(name: string, flags: ResolveOptions): Promise<ObjectId | undefined> {
     if (name.length < 4 || !name.endsWith("}")) return undefined;
     let sp = name.length - 1;
     for (; sp >= 0; sp--) if (name[sp] === "{" && sp > 0 && name[sp - 1] === "^") break;
@@ -326,7 +391,10 @@ export class RevisionResolver {
     else if (spec.startsWith("}")) expected = "none";
     else if (spec.startsWith("/")) expected = "commit";
     else return undefined;
-    const outer = await this.oid1(name.slice(0, sp - 1));
+    // the type wanted decides an abbreviation; other peels fall back to core.disambiguate
+    const hint: DisambiguateHint | undefined =
+      expected === "commit" ? "committish" : expected === "tree" ? "treeish" : undefined;
+    const outer = await this.oid1(name.slice(0, sp - 1), { quiet: flags.quiet, hint });
     if (outer === undefined) return undefined;
     if (expected === "none") return this.derefTags(outer);
     const id = expected === "any" ? outer : await this.peelToType(outer, expected, name);
@@ -345,7 +413,7 @@ export class RevisionResolver {
    * git's `get_oid_basic`: an object id (taken as it is, whether the repository has the
    * object or not), a ref, `<ref>@{<n>|<date>}`, `@{-N}`.
    */
-  private async basic(str: string): Promise<ObjectId | undefined> {
+  private async basic(str: string, flags: ResolveOptions = {}): Promise<ObjectId | undefined> {
     if (HEX_ID.test(str)) {
       // warn_on_object_refname_ambiguity: a ref spelled as the 40-hex
       if (this.warnAmbiguousRefs() && (await this.dwimRefAll(str)).length > 0) {
@@ -395,8 +463,13 @@ export class RevisionResolver {
     else all = await this.dwimRefAll(base);
     const found = all[0];
     if (!found) return undefined;
-    // warn_ambiguous_refs: more than one rule found a ref (or a log)
-    if (all.length > 1 && this.warnAmbiguousRefs())
+    // warn_ambiguous_refs: more than one rule found a ref (or a log), or the name is also an
+    // abbreviated object id
+    if (
+      this.warnAmbiguousRefs() &&
+      !flags.quiet &&
+      (all.length > 1 || (await this.shortOid(base, { quiet: true })).status === "found")
+    )
       this.warnings.push(`warning: refname '${base}' is ambiguous.`);
     if (reflogLen === 0) return found.id;
 
@@ -705,6 +778,11 @@ export class RevisionResolver {
     return { id: current, type: "tag" };
   }
 
+  /** The parents of a commit, undefined when it cannot be read. */
+  async parentsOf(id: ObjectId): Promise<ObjectId[] | undefined> {
+    return (await safe(() => this.sources.commits.load(id)))?.parents;
+  }
+
   /** git's `deref_tag`: tags followed to what they point at. */
   private async derefTags(id: ObjectId): Promise<ObjectId | undefined> {
     let current: ObjectId | undefined = id;
@@ -839,6 +917,173 @@ export class RevisionResolver {
     return undefined;
   }
 
+  // ------------------------------------------------------------------ short ids
+
+  /**
+   * git's `get_short_oid`: the one stored object whose id starts with `name` (4 to 40 hex
+   * digits, any case). Of several, the one the hint (`flags.hint`, else `core.disambiguate`)
+   * accepts, when it accepts exactly one. An ambiguity is reported, unless quiet, as git
+   * reports it: `error: short object ID <prefix> is ambiguous` and `hint:` lines listing the
+   * candidates (tags, commits, trees, blobs; by id within a type), only those the hint accepts
+   * when it accepts several.
+   */
+  private async shortOid(name: string, flags: ResolveOptions = {}): Promise<ShortOid> {
+    if (name.length < MINIMUM_ABBREV_LENGTH || name.length > 40 || !/^[0-9a-fA-F]+$/.test(name)) {
+      return { status: "invalid" };
+    }
+    const prefix = name.toLowerCase();
+    const candidates = await this.objectsWithPrefix(prefix);
+    if (candidates.length === 0) return { status: "missing" };
+    const hint = flags.hint ?? this.defaultHint();
+    let status: ShortOid;
+    let listedHint = hint;
+    if (candidates.length === 1) {
+      status = { status: "found", id: candidates[0] as ObjectId };
+    } else if (hint === undefined) {
+      status = { status: "ambiguous" };
+    } else {
+      const accepted: ObjectId[] = [];
+      for (const id of candidates) if (await this.satisfies(id, hint)) accepted.push(id);
+      if (accepted.length === 1) status = { status: "found", id: accepted[0] as ObjectId };
+      else {
+        status = { status: "ambiguous" };
+        // none accepted: git lists them all (it drops the hint)
+        if (accepted.length === 0) listedHint = undefined;
+      }
+    }
+    if (status.status === "ambiguous" && !flags.quiet) {
+      await this.reportAmbiguous(prefix, candidates, listedHint);
+    }
+    return status;
+  }
+
+  /** git's `show_ambiguous_object` for each candidate, sorted as `sort_ambiguous` sorts them. */
+  private async reportAmbiguous(
+    prefix: string,
+    candidates: ObjectId[],
+    hint: DisambiguateHint | undefined,
+  ): Promise<void> {
+    const typed: { id: ObjectId; type: ObjectType | undefined }[] = [];
+    for (const id of candidates) typed.push({ id, type: await this.objectType(id) });
+    // tags, commits, trees, blobs (git's type % 4); by id within a type
+    const rank = (t: ObjectType | undefined) =>
+      t === "tag" ? 0 : t === "commit" ? 1 : t === "tree" ? 2 : t === "blob" ? 3 : -1;
+    typed.sort((a, b) =>
+      rank(a.type) !== rank(b.type) ? rank(a.type) - rank(b.type) : a.id < b.id ? -1 : 1,
+    );
+    const shown: typeof typed = [];
+    for (const c of typed)
+      if (hint === undefined || (await this.satisfies(c.id, hint))) shown.push(c);
+    const lengths =
+      (await safe(async () => this.sources.abbreviate?.(shown.map((c) => c.id)))) ?? undefined;
+    const lines = [`error: short object ID ${prefix} is ambiguous`, "hint: The candidates are:"];
+    for (const { id, type } of shown) {
+      const hash = id.slice(0, lengths?.get(id) ?? 7);
+      let line: string;
+      if (type === "commit") {
+        const commit = await safe(() => this.sources.commits.load(id));
+        line = commit
+          ? `${hash} commit ${shortDate(commit.author.timestamp, commit.author.tzOffset)} - ${formatSubject(commit.message)}`
+          : `${hash} commit  - `;
+      } else if (type === "tag") {
+        const tag = await safe(async () => this.sources.tags?.load(id));
+        line =
+          tag?.tag !== undefined
+            ? `${hash} tag ${shortDate(tag.tagger?.timestamp ?? 0, "+0000")} - ${tag.tag}`
+            : `${hash} [bad tag, could not parse it]`;
+      } else if (type === "tree" || type === "blob") {
+        line = `${hash} ${type}`;
+      } else {
+        line = `${hash} [bad object]`;
+      }
+      lines.push(`hint:   ${line}`);
+    }
+    this.warnings.push(lines.join("\n"));
+  }
+
+  /** The stored ids that start with `prefix` (git's `repo_for_each_abbrev`), sorted. */
+  private async objectsWithPrefix(prefix: string): Promise<ObjectId[]> {
+    const found = new Set<ObjectId>();
+    const { objects } = this.sources;
+    if (objects) {
+      for await (const id of listObjectsWithPrefix(objects, prefix)) found.add(id);
+    } else {
+      const { commits, trees, blobs, tags } = this.sources;
+      for (const store of [commits, trees, blobs, tags] as { keys?(): AsyncIterable<ObjectId> }[]) {
+        if (!store?.keys) continue;
+        for await (const id of store.keys()) if (id.startsWith(prefix)) found.add(id);
+      }
+    }
+    return [...found].sort();
+  }
+
+  /** `core.disambiguate` (git's `default_disambiguate_hint`); "none" and unset are no hint. */
+  private defaultHint(): DisambiguateHint | undefined {
+    const value = this.remoteConfig().value("core.disambiguate")?.toLowerCase();
+    switch (value) {
+      case "commit":
+      case "committish":
+      case "tree":
+      case "treeish":
+      case "blob":
+        return value;
+      default:
+        return undefined;
+    }
+  }
+
+  /** git's `disambiguate_<hint>_only`: whether the object is, or peels to, what `hint` wants. */
+  private async satisfies(id: ObjectId, hint: DisambiguateHint): Promise<boolean> {
+    const type = await this.objectType(id);
+    switch (hint) {
+      case "commit":
+        return type === "commit";
+      case "tree":
+        return type === "tree";
+      case "blob":
+        return type === "blob";
+      case "committish":
+      case "treeish": {
+        const wanted = (t: ObjectType | undefined) =>
+          t === "commit" || (hint === "treeish" && t === "tree");
+        if (wanted(type)) return true;
+        if (type !== "tag") return false;
+        return wanted((await this.peelTags(id)).type);
+      }
+    }
+  }
+
+  /**
+   * git's `get_describe_name`: `<ref>-<count>-g<abbrev>`, the abbreviation read quietly as a
+   * commit, when what precedes `-g` is a valid ref name, a dash and (hex) digits.
+   */
+  private async describeName(name: string): Promise<ObjectId | undefined> {
+    for (let cp = name.length - 1; cp >= 2; cp--) {
+      const ch = name[cp];
+      if (isHexDigit(ch)) continue;
+      if (ch === "g" && name[cp - 1] === "-" && refAndCountPartsValid(name, cp - 1)) {
+        const short = await this.shortOid(name.slice(cp + 1), { hint: "commit", quiet: true });
+        return short.status === "found" ? short.id : undefined;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * git's `resolve_relative_path`: a path starting with `./` or `../` read against
+   * {@link cwdPrefix} and normalized; other paths as given.
+   *
+   * @throws RevisionError with git's message for a path outside the worktree
+   */
+  private relativePath(path: string, revision: string): string {
+    if (!path.startsWith("./") && !path.startsWith("../")) return path;
+    const normalized = normalizePath(this.cwdPrefix + path);
+    if (normalized === undefined) {
+      throw new RevisionError(revision, `fatal: '${path}' is outside repository`);
+    }
+    return normalized;
+  }
+
   // ------------------------------------------------------------------ helpers
 
   private remoteConfig(): RemoteConfigStore {
@@ -883,11 +1128,63 @@ function isRefLike(name: string): boolean {
   return name.startsWith("refs/") || /^[A-Z_]+$/.test(name);
 }
 
-/** git's `resolve_relative_path` at the top of the worktree: `./a` is `a`. */
-function normalizeRelative(path: string): string {
-  let out = path;
-  while (out.startsWith("./")) out = out.slice(2);
-  return out;
+/**
+ * git's `normalize_path_copy`: `//` collapsed, `.` components dropped, `..` taking the
+ * component before it away; undefined when it climbs above the top. A trailing `/` stays.
+ */
+function normalizePath(path: string): string | undefined {
+  const out: string[] = [];
+  const parts = path.split("/");
+  const trailing = parts.length > 1 && parts[parts.length - 1] === "";
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) return undefined;
+      out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  const joined = out.join("/");
+  return trailing && joined !== "" ? `${joined}/` : joined;
+}
+
+/**
+ * git's `ref_and_count_parts_valid`: `name[len]` is the `-` before `g`; before it come hex
+ * digits (at least one), a `-`, and a valid ref name (one level allowed).
+ */
+function refAndCountPartsValid(name: string, len: number): boolean {
+  if (!isHexDigit(name[len - 1])) return false;
+  let cp = len - 2;
+  for (; cp > 0; cp--) {
+    if (name[cp] === "-") break;
+    if (!isHexDigit(name[cp])) return false;
+  }
+  if (cp < 0 || name[cp] !== "-") return false;
+  return isValidRefName(name.slice(0, cp), { allowOneLevel: true });
+}
+
+/** git's `DATE_SHORT`: the day `timestamp` falls on in the zone `tz` (`+HHMM`). */
+function shortDate(timestamp: number, tz: string): string {
+  const m = /^([+-])(\d\d)(\d\d)$/.exec(tz);
+  const offset = m ? (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) * 60 : 0;
+  const d = new Date((timestamp + offset) * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+/** git's `format_subject` (`%s`): the first paragraph, its lines joined with a space. */
+function formatSubject(message: string): string {
+  const lines = message.split("\n");
+  let i = 0;
+  while (i < lines.length && (lines[i] ?? "").trim() === "") i++;
+  const out: string[] = [];
+  for (; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (line.trim() === "") break;
+    out.push(line.replace(/\s+$/, ""));
+  }
+  return out.join(" ");
 }
 
 async function safe<T>(fn: () => Promise<T>): Promise<T | undefined> {

@@ -47,6 +47,21 @@ export function worktreeModeTrust(workingCopy: WorkingCopy, worktree: Worktree):
 }
 
 /**
+ * `id` abbreviated as git prints it (`repo_find_unique_abbrev(id, DEFAULT_ABBREV)`): to
+ * `core.abbrev` digits (auto: from the approximate object count, at least 7), lengthened until
+ * no other stored object shares them.
+ *
+ * @example
+ * ```typescript
+ * output.push(`Created autostash: ${await abbreviateId(workingCopy, stashId)}`);
+ * ```
+ */
+export async function abbreviateId(workingCopy: WorkingCopy, id: ObjectId): Promise<string> {
+  const length = (await abbrevLengths(workingCopy, [id])).get(id) ?? DEFAULT_ABBREV_LENGTH;
+  return id.slice(0, length);
+}
+
+/**
  * The lengths git abbreviates `ids` to (`repo_find_unique_abbrev` with `DEFAULT_ABBREV`):
  * from `minLength`, else `core.abbrev` (auto: from the approximate object count), lengthened
  * until unique among the stored objects. Without an object store, the start length (7 for

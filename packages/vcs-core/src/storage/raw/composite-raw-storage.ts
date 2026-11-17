@@ -10,7 +10,7 @@
  * hold uncompressed objects, the object kernel stores zlib.
  */
 
-import type { RawStorage } from "./raw-storage.js";
+import { type RawStorage, rawKeysWithPrefix } from "./raw-storage.js";
 
 /**
  * RawStorage that reads from primary + fallbacks, writes to primary only
@@ -88,6 +88,21 @@ export class CompositeRawStorage implements RawStorage {
 
     for (const fallback of this.fallbacks) {
       for await (const key of fallback.keys()) {
+        if (!seen.has(key)) {
+          seen.add(key);
+          yield key;
+        }
+      }
+    }
+  }
+
+  /**
+   * The keys starting with `prefix` from primary and fallbacks, deduplicated
+   */
+  async *keysWithPrefix(prefix: string): AsyncIterable<string> {
+    const seen = new Set<string>();
+    for (const store of [this.primary, ...this.fallbacks]) {
+      for await (const key of rawKeysWithPrefix(store, prefix)) {
         if (!seen.has(key)) {
           seen.add(key);
           yield key;

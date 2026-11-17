@@ -9,7 +9,7 @@
  * kernel uses; the upstream type is assignable to it.
  */
 import { timestampedId, timestampOfId } from "@statewalker/vcs-utils";
-import type { RawStorage, SweepStaleOptions } from "../raw/raw-storage.js";
+import { type RawStorage, rawKeysWithPrefix, type SweepStaleOptions } from "../raw/raw-storage.js";
 
 /**
  * Content written to temporary storage so it can be read twice: once to learn
@@ -54,6 +54,11 @@ export interface StagingBlobStore {
   remove(id: string): Promise<boolean>;
   /** Every stored key (the kernel keeps only object ids). */
   list(): AsyncIterable<string>;
+  /**
+   * The stored keys that start with `prefix` (abbreviated object ids). Optional: without it
+   * the kernel filters `list()`.
+   */
+  listPrefix?(prefix: string): AsyncIterable<string>;
   /**
    * Remove what interrupted writes left behind (temporaries of a crashed
    * process) once older than `olderThanMs`. Optional; gc calls it when present.
@@ -118,6 +123,9 @@ function prefixedRawStorage(raw: RawStorage, prefix: string): RawStorage {
     async *keys() {
       for await (const key of raw.keys())
         if (key.startsWith(prefix)) yield key.slice(prefix.length);
+    },
+    async *keysWithPrefix(p) {
+      for await (const key of rawKeysWithPrefix(raw, prefix + p)) yield key.slice(prefix.length);
     },
     size: (key) => raw.size(prefix + key),
   };
@@ -191,6 +199,9 @@ function rawStorageQuarantine(
     },
     async *list() {
       yield* written;
+    },
+    async *listPrefix(p) {
+      for (const id of [...written]) if (id.startsWith(p)) yield id;
     },
   };
 
@@ -451,6 +462,7 @@ export function rawStorageStaging(
     has: (id) => raw.has(id),
     remove: (id) => raw.remove(id),
     list: () => raw.keys(),
+    listPrefix: (prefix) => rawKeysWithPrefix(raw, prefix),
     sweepStale: (o) => sweepStaleRawStaging(raw, o),
     beginQuarantine: async () => rawStorageQuarantine(raw, options),
   };
