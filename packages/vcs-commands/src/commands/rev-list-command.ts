@@ -28,9 +28,8 @@ import { type ParsedRevisionArgs, parseRevisionArgs } from "./revision-range.js"
  * lists HEAD's history, where `git rev-list` prints its usage; with only exclusions (`^main`)
  * it lists nothing, as git does.
  *
- * The order is {@link LogCommand}'s walk, not yet git's: with several included revisions or
- * merges in the range it can differ from `git log`'s date order (a plain walk without paths
- * is not git's `limit_list`), so compare the commits as a set where the order matters.
+ * The commits come in `git log`'s order: {@link LogCommand}'s walk is git's (newest commit
+ * date first, `limit_list` when revisions are excluded).
  *
  * Throws `RevisionError` with git's lines for an argument that names nothing
  * (`fatal: bad revision 'x'`, as `git log x --`).

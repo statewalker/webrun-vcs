@@ -94,11 +94,19 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
   const lookup = (id: string, options?: { verify?: boolean }): Promise<GitObject | undefined> =>
     runStepsAsync(lookupSteps(id, options));
   /** `lookup`, without a promise until one is needed: none for a packed object in memory. */
-  function* lookupSteps(id: string, options?: { verify?: boolean }): Steps<GitObject | undefined> {
+  function* lookupSteps(
+    id: string,
+    options?: { verify?: boolean },
+    first?: { value: GitObject | undefined | Promise<GitObject | undefined> } | { error: unknown },
+  ): Steps<GitObject | undefined> {
     // what is not an id is in no pack (the set finds none), and goes to the loose store as is
     let failed: unknown;
     try {
-      let packed = packs.getNow ? packs.getNow(id, options) : packs.get(id, options);
+      let packed: GitObject | undefined | Promise<GitObject | undefined>;
+      if (first) {
+        if ("error" in first) throw first.error;
+        packed = first.value;
+      } else packed = packs.getNow ? packs.getNow(id, options) : packs.get(id, options);
       if (packed instanceof Promise) packed = (yield packed) as GitObject | undefined;
       if (packed) return packed;
     } catch (e) {
@@ -145,7 +153,18 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
 
     get: lookup,
 
-    getNow: (id, options) => runSteps(lookupSteps(id, options)),
+    getNow(id, options) {
+      // a packed object in memory needs no generator
+      if (!packs.getNow) return runSteps(lookupSteps(id, options));
+      let packed: GitObject | undefined | Promise<GitObject | undefined>;
+      try {
+        packed = packs.getNow(id, options);
+      } catch (error) {
+        return runSteps(lookupSteps(id, options, { error }));
+      }
+      if (packed !== undefined && !(packed instanceof Promise)) return packed;
+      return runSteps(lookupSteps(id, options, { value: packed }));
+    },
 
     async has(id) {
       if (!isId(id)) return loose.has(id);

@@ -4,6 +4,7 @@
  * Wraps GitObjects with tree serialization/deserialization.
  */
 
+import { OrderedMap } from "@statewalker/vcs-utils";
 import type { ObjectId } from "../../common/id/index.js";
 import { objectRemovalEpoch } from "../../storage/raw/object-removals.js";
 import {
@@ -35,7 +36,7 @@ class GitTreeStore implements Trees {
    * a hit read before the last removal anywhere (`objectRemovalEpoch`) is checked with
    * `objects.has` first. Bounded by the entries held.
    */
-  private readonly cache = new Map<ObjectId, CachedTree>();
+  private readonly cache = new OrderedMap<ObjectId, CachedTree>();
   private cachedEntries = 0;
   /** Reads in flight, by tree id */
   private readonly reading = new Map<ObjectId, Promise<readonly TreeEntry[] | undefined>>();
@@ -177,7 +178,7 @@ class GitTreeStore implements Trees {
     this.cache.set(id, { entries, epoch });
     this.cachedEntries += entries.length;
     while (this.cachedEntries > this.maxCachedEntries) {
-      const oldest = this.cache.keys().next().value as ObjectId;
+      const oldest = this.cache.oldestKey() as ObjectId;
       this.cachedEntries -= this.cache.get(oldest)?.entries.length ?? 0;
       this.cache.delete(oldest);
     }

@@ -4,20 +4,33 @@ import {
   bloomKey,
   type Commit,
   type CommitGraph,
+  commitFromBytes,
   EMPTY_TREE_ID,
   type GitObject,
   type ObjectId,
+  parseGraphCommit,
 } from "@statewalker/vcs-core";
+import { OrderedMap } from "@statewalker/vcs-utils";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
+
+import {
+  AttributesResolver,
+  type ContentAttributesContext,
+  expandUserPath,
+  xdgConfigPath,
+} from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   ALL_ENTRIES_NOT_INTERESTING,
   bloomPathOf,
   ENTRY_NOT_INTERESTING,
-  latin1String,
+  NEED_ATTRIBUTES,
+  type PathspecAttributeValue,
   type PathspecItem,
   parsePathspecItem,
   pathspecForbidsBloom,
@@ -25,6 +38,9 @@ import {
   treeEntryInteresting,
   treePathspec,
 } from "./pathspec.js";
+
+/** git log reads no index: the in-tree attributes files are the worktree's only. */
+const NO_INDEX = { attributesBlob: () => undefined };
 
 /**
  * Result of a log command iteration.
@@ -54,6 +70,10 @@ export interface LogPathStatistics {
   treeComparisons: number;
   /** Tree entries looked up for those comparisons (each reads its tree, or finds it cached) */
   treeEntryReads: number;
+  /** Commits the walk met (parsed, or seen as a parent) */
+  commitsWalked?: number;
+  /** Bytes the walk's table of commits takes (a few dozen per commit met) */
+  walkTableBytes?: number;
 }
 
 /**
@@ -126,7 +146,6 @@ export enum RevFilter {
  */
 export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private startCommits: ObjectId[] = [];
-  private excludeCommits: ObjectId[] = [];
   /** The commits given, included and excluded, in the order given (git's pending list) */
   private readonly pending: { id: ObjectId; exclude: boolean }[] = [];
   private paths: string[] = [];
@@ -149,6 +168,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     treeComparisons: 0,
     treeEntryReads: 0,
   };
+  /** The commits of the last walk (for its statistics). */
+  private lastWalk: RevTable | undefined;
 
   /**
    * Add a starting commit for the log.
@@ -250,7 +271,6 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   not(commit: ObjectId): this {
     this.checkCallable();
-    this.excludeCommits.push(commit);
     this.pending.push({ id: commit, exclude: true });
     return this;
   }
@@ -336,7 +356,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   /** What the path-limited walk did so far (see {@link LogPathStatistics}). */
   getStatistics(): LogPathStatistics {
-    return { ...this.statistics };
+    return {
+      ...this.statistics,
+      commitsWalked: this.lastWalk?.size ?? 0,
+      walkTableBytes: this.lastWalk?.bytes ?? 0,
+    };
   }
 
   /**
@@ -350,7 +374,6 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   addRange(since: ObjectId, until: ObjectId): this {
     this.checkCallable();
-    this.excludeCommits.push(since);
     this.startCommits.push(until);
     this.pending.push({ id: since, exclude: true }, { id: until, exclude: false });
     return this;
@@ -376,12 +399,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       starts = [headId];
     }
 
-    if (this.paths.length === 0 && this.excludePaths.length === 0) return this.walkCommits(starts);
     const pending = [...this.pending];
     if (this.startCommits.length === 0) {
       for (const id of starts) pending.push({ id, exclude: false });
     }
-    return this.walkPathLimited(pending);
+    return this.walk(pending);
   }
 
   /**
@@ -398,87 +420,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * Walk commits and yield them.
-   */
-  private async *walkCommits(starts: ObjectId[]): AsyncIterable<LogResult> {
-    let count = 0;
-    let skipped = 0;
-
-    // Build set of excluded commits (including their ancestors)
-    const excludedSet = await this.buildExcludedSet();
-
-    for await (const commitId of this.commits.walkAncestry(starts, {
-      firstParentOnly: this.firstParentOnly,
-    })) {
-      // Skip excluded commits
-      if (excludedSet.has(commitId)) {
-        continue;
-      }
-
-      const commit = await this.commits.load(commitId);
-      if (!commit) {
-        continue;
-      }
-
-      // RevFilter - ONLY_MERGES or NO_MERGES
-      if (this.revFilter === RevFilter.ONLY_MERGES) {
-        // Only include merge commits (more than one parent)
-        if (commit.parents.length <= 1) {
-          continue;
-        }
-      } else if (this.revFilter === RevFilter.NO_MERGES) {
-        // Exclude merge commits
-        if (commit.parents.length > 1) {
-          continue;
-        }
-      }
-
-      // Date filtering - since (after)
-      if (this.sinceTime !== undefined && commit.committer.timestamp < this.sinceTime) {
-        // Commits are in reverse chronological order, so we can stop early
-        break;
-      }
-
-      // Date filtering - until (before)
-      if (this.untilTime !== undefined && commit.committer.timestamp > this.untilTime) {
-        continue;
-      }
-
-      // Author filtering
-      if (this.authorPattern !== undefined && !this.matchesAuthor(commit)) {
-        continue;
-      }
-
-      // Committer filtering
-      if (this.committerPattern !== undefined && !this.matchesCommitter(commit)) {
-        continue;
-      }
-
-      // Skip first N commits
-      if (skipped < this.skip) {
-        skipped++;
-        continue;
-      }
-
-      // Check max count
-      if (this.maxCount !== undefined && count >= this.maxCount) {
-        break;
-      }
-
-      count++;
-      yield { ...commit, id: commitId };
-    }
-  }
-
-  /**
-   * The walk of `git log -- <pathspec>`, ported from git's revision.c. Commits come out newest
-   * first by committer date (equal dates in the order they were queued), and history is
-   * simplified as try_to_simplify_commit does it: a commit is compared with each parent at
-   * the paths; one that matches a relevant parent ("TREESAME") is not shown, and only that
-   * parent is walked further. A root commit is shown when it has any of the paths. Before
-   * comparing a commit with its first parent, the commit-graph's changed-path Bloom filter of
-   * the commit is asked (check_maybe_different_in_bloom_filter): when it says no path
-   * changed, no tree is read.
+   * The walk of `git log`, ported from git's revision.c. Commits come out newest first by
+   * committer date (equal dates in the order they were queued). With a pathspec, history is
+   * simplified as try_to_simplify_commit does it: a commit is compared with each parent at the
+   * paths; one that matches a relevant parent ("TREESAME") is not shown, and only that parent
+   * is walked further. A root commit is shown when it has any of the paths. Before comparing a
+   * commit with its first parent, the commit-graph's changed-path Bloom filter of the commit
+   * is asked (check_maybe_different_in_bloom_filter): when it says no path changed, no tree is
+   * read. Without a pathspec nothing is simplified (git's `revs->prune` is off).
    *
    * Without excluded commits the walk streams (get_revision_1). With some (`not`,
    * `addRange`), it is limited first as limit_list does it: one date-ordered queue holds the
@@ -486,166 +435,181 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * taken, a commit's relevance is judged with what is marked so far, `--since` marks older
    * commits UNINTERESTING, and the walk stops once only uninteresting commits are left
    * (still_interesting); what is shown is filtered by the final marks.
+   *
+   * The commits met are held in a `RevTable` (typed arrays, a few dozen bytes each); commits
+   * the commit-graph has are reached by their graph positions, without building their ids.
    */
-  private async *walkPathLimited(
-    pending: { id: ObjectId; exclude: boolean }[],
-  ): AsyncIterable<LogResult> {
-    const graph = await this.commits.commitGraph?.get().catch(() => undefined);
-    const pathspec = this.pathspec();
-    const bloom = this.useBloomFilters ? this.bloomKeys(graph, pathspec.items) : undefined;
+  private async *walk(pending: { id: ObjectId; exclude: boolean }[]): AsyncIterable<LogResult> {
+    const prune = this.paths.length > 0 || this.excludePaths.length > 0;
+    // a shallow commit has no parents (git's shallow grafts); the graph is off then
+    const shallowIds = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
+    const shallow = new Set(shallowIds);
+    const graph =
+      shallow.size > 0 ? undefined : await this.commits.commitGraph?.get().catch(() => undefined);
+    const pathspec = prune ? this.pathspec() : undefined;
+    const bloom =
+      pathspec && this.useBloomFilters ? this.bloomKeys(graph, pathspec.items) : undefined;
     const bloomVersion = bloom ? this.changedPathsVersion() : -1;
-    const fast = pathspec.literal;
+    const fast = pathspec?.literal;
     const firstParentOnly = this.firstParentOnly;
+    const t = new RevTable(graph);
+    this.lastWalk = t;
+    /** Raw commits read by `parse` (no graph), kept until shown: read once, not twice. */
+    const raw = new Map<number, Uint8Array>();
 
-    const commits = new Map<ObjectId, RevCommit>();
-    const lookup = (id: ObjectId): RevCommit => {
-      let c = commits.get(id);
-      if (!c) {
-        c = { id, flags: 0, parsed: false, tree: "", date: 0, pos: -1, parents: undefined };
-        commits.set(id, c);
-      }
-      return c;
-    };
     /** git's parse_commit: tree, parents and date, from the graph when it has the commit */
-    const parse = async (c: RevCommit): Promise<boolean> => {
-      if (c.parsed) return true;
-      let parents: ObjectId[] | undefined;
-      const pos = graph ? graph.position(c.id) : -1;
-      if (graph && pos >= 0) {
+    const parse = async (n: number): Promise<boolean> => {
+      if (t.parsed(n)) return true;
+      const gpos = t.gpos[n] as number;
+      if (graph && gpos >= 0) {
+        let parents: number[] | undefined;
+        let date = 0;
         try {
-          c.tree = graph.treeAt(pos);
-          c.date = graph.commitTimeAt(pos);
-          parents = graph.parentsAt(pos);
-          c.pos = pos;
+          date = graph.commitTimeAt(gpos);
+          parents = graph.parentPositionsAt(gpos);
         } catch {
           // a corrupt record: the commit is read instead
           parents = undefined;
         }
+        if (parents) {
+          t.setParsed(n, date, true, undefined, parents.length);
+          for (let k = 0; k < parents.length; k++)
+            t.setParent(n, k, t.lookupPos(parents[k] as number));
+          return true;
+        }
       }
-      if (!parents) {
-        const commit = await this.commits.load(c.id).catch(() => undefined);
-        if (!commit) return false;
-        c.tree = commit.tree;
-        c.date = commit.committer.timestamp;
-        c.pos = -1;
-        parents = commit.parents;
-      }
-      c.parents = parents.map(lookup);
-      c.parsed = true;
+      const id = t.idOf(n);
+      const header = await this.readCommitHeader(id);
+      if (!header) return false;
+      const parents = shallow.has(id) ? [] : header.parents;
+      t.setParsed(n, header.date, false, header.tree, parents.length);
+      for (let k = 0; k < parents.length; k++) t.setParent(n, k, t.lookup(parents[k] as ObjectId));
+      if (header.raw) raw.set(n, header.raw);
       return true;
     };
+    const relevant = (n: number) => (t.flag(n) & (UNINTERESTING | BOTTOM)) !== UNINTERESTING;
     /** git's mark_parents_uninteresting: through the parents known (parsed) so far */
-    const markParentsUninteresting = (c: RevCommit): void => {
-      const stack: RevCommit[] = [];
-      const markOne = (p: RevCommit) => {
-        if (p.flags & UNINTERESTING) return;
-        p.flags |= UNINTERESTING;
-        if (p.parents) for (const q of p.parents) stack.push(q);
+    const markParentsUninteresting = (n: number): void => {
+      const stack: number[] = [];
+      const markOne = (p: number) => {
+        if (t.flag(p) & UNINTERESTING) return;
+        t.mark(p, UNINTERESTING);
+        for (let k = 0, c = t.parentCount(p); k < c; k++) stack.push(t.parent(p, k));
       };
-      for (const p of c.parents ?? []) markOne(p);
-      for (let p = stack.pop(); p; p = stack.pop()) markOne(p);
+      for (let k = 0, c = t.parentCount(n); k < c; k++) markOne(t.parent(n, k));
+      for (let p = stack.pop(); p !== undefined; p = stack.pop()) markOne(p);
     };
-    const differs = (from: ObjectId | undefined, c: RevCommit, nth: number) =>
+    const differs = (from: ObjectId | undefined, n: number, nth: number) =>
       this.differsAtPaths(
         from,
-        c.tree,
-        pathspec,
+        t.treeOf(n),
+        pathspec as TreePathspec,
         fast,
         nth === 0 ? bloom : undefined,
         bloomVersion,
         graph,
-        c.pos,
+        t.bloomPos(n),
       );
     /** git's try_to_simplify_commit (prune, dense, simplify_history, no show_pulls) */
-    const simplify = async (c: RevCommit): Promise<void> => {
-      const parents = c.parents as RevCommit[];
-      if (parents.length === 0) {
-        if (!(await differs(undefined, c, 0))) c.flags |= TREESAME;
+    const simplify = async (n: number): Promise<void> => {
+      if (!prune) return;
+      const count = t.parentCount(n);
+      if (count === 0) {
+        if (!(await differs(undefined, n, 0))) t.mark(n, TREESAME);
         return;
       }
       let relevantParents = 0;
       let relevantChange = false;
       let irrelevantChange = false;
-      for (let nth = 0; nth < parents.length; nth++) {
-        const p = parents[nth] as RevCommit;
+      for (let nth = 0; nth < count; nth++) {
+        const p = t.parent(n, nth);
         if (relevant(p)) relevantParents++;
         if (nth === 1 && firstParentOnly) break;
         if (!(await parse(p))) {
-          throw new GitApiError(`cannot simplify commit ${c.id} (because of ${p.id})`);
+          throw new GitApiError(`cannot simplify commit ${t.idOf(n)} (because of ${t.idOf(p)})`);
         }
-        if (!(await differs(p.tree, c, nth))) {
+        if (!(await differs(t.treeOf(p), n, nth))) {
           // a merge with an irrelevant side that brought the whole change keeps its others
           if (!relevant(p)) continue;
-          c.parents = [p];
-          c.flags |= TREESAME;
+          t.keepOnlyParent(n, p);
+          t.mark(n, TREESAME);
           return;
         }
         if (relevant(p)) relevantChange = true;
         else irrelevantChange = true;
       }
-      if (relevantParents ? !relevantChange : !irrelevantChange) c.flags |= TREESAME;
+      if (relevantParents ? !relevantChange : !irrelevantChange) t.mark(n, TREESAME);
     };
     /** git's process_parents */
-    const processParents = async (c: RevCommit, queue: CommitQueue<RevCommit>): Promise<void> => {
-      if (c.flags & ADDED) return;
-      c.flags |= ADDED;
-      if (c.flags & UNINTERESTING) {
-        for (const p of c.parents ?? []) {
-          p.flags |= UNINTERESTING;
+    const processParents = async (n: number, queue: CommitQueue<number>): Promise<void> => {
+      if (t.flag(n) & ADDED) return;
+      t.mark(n, ADDED);
+      if (t.flag(n) & UNINTERESTING) {
+        for (let k = 0, c = t.parentCount(n); k < c; k++) {
+          const p = t.parent(n, k);
+          t.mark(p, UNINTERESTING);
           if (!(await parse(p))) continue;
-          if (p.parents?.length) markParentsUninteresting(p);
-          if (p.flags & SEEN) continue;
-          p.flags |= SEEN;
-          queue.put(p, p.date);
+          if (t.parentCount(p) > 0) markParentsUninteresting(p);
+          if (t.flag(p) & SEEN) continue;
+          t.mark(p, SEEN);
+          queue.put(p, t.date(p));
         }
         return;
       }
-      await simplify(c);
-      for (const p of c.parents as RevCommit[]) {
+      await simplify(n);
+      for (let k = 0, c = t.parentCount(n); k < c; k++) {
+        const p = t.parent(n, k);
         if (!(await parse(p))) {
-          throw new GitApiError(`Failed to traverse parents of commit ${c.id}`);
+          throw new GitApiError(`Failed to traverse parents of commit ${t.idOf(n)}`);
         }
-        if (!(p.flags & SEEN)) {
-          p.flags |= SEEN;
-          queue.put(p, p.date);
+        if (!(t.flag(p) & SEEN)) {
+          t.mark(p, SEEN);
+          queue.put(p, t.date(p));
         }
         if (firstParentOnly) break;
       }
     };
     /** git's get_commit_action (no parent rewriting: TREESAME commits are never shown) */
-    const shown = async (c: RevCommit): Promise<Commit | undefined> => {
-      if (c.flags & (UNINTERESTING | TREESAME)) return undefined;
-      if (this.untilTime !== undefined && c.date > this.untilTime) return undefined;
-      const n = (c.parents as RevCommit[]).length;
-      if (this.revFilter === RevFilter.ONLY_MERGES && n < 2) return undefined;
-      if (this.revFilter === RevFilter.NO_MERGES && n > 1) return undefined;
-      const commit = await this.commits.load(c.id);
+    const shown = async (n: number): Promise<LogResult | undefined> => {
+      const bytes = raw.get(n);
+      if (bytes) raw.delete(n);
+      if (t.flag(n) & (UNINTERESTING | TREESAME)) return undefined;
+      if (this.untilTime !== undefined && t.date(n) > this.untilTime) return undefined;
+      const parents = t.parentCount(n);
+      if (this.revFilter === RevFilter.ONLY_MERGES && parents < 2) return undefined;
+      if (this.revFilter === RevFilter.NO_MERGES && parents > 1) return undefined;
+      const id = t.idOf(n);
+      const commit = bytes ? decodeCommit(bytes) : await this.commits.load(id);
       if (!commit) return undefined;
       if (this.authorPattern !== undefined && !this.matchesAuthor(commit)) return undefined;
       if (this.committerPattern !== undefined && !this.matchesCommitter(commit)) return undefined;
-      return commit;
+      return { ...commit, id };
     };
 
     // prepare_revision_walk: the flags of every argument first, then handle_commit in order
-    for (const e of pending) if (e.exclude) lookup(e.id).flags |= UNINTERESTING | BOTTOM;
-    const list: RevCommit[] = [];
+    for (const e of pending) {
+      if (!e.exclude) continue;
+      const n = t.lookup(e.id);
+      t.mark(n, UNINTERESTING | BOTTOM);
+    }
+    const list: number[] = [];
     let limited = false;
     for (const e of pending) {
-      const c = lookup(e.id);
-      if (!(await parse(c))) continue;
-      if (c.flags & UNINTERESTING) {
-        markParentsUninteresting(c);
+      const n = t.lookup(e.id);
+      if (!(await parse(n))) continue;
+      if (t.flag(n) & UNINTERESTING) {
+        markParentsUninteresting(n);
         limited = true;
       }
-      if (!(c.flags & SEEN)) {
-        c.flags |= SEEN;
-        list.push(c);
+      if (!(t.flag(n) & SEEN)) {
+        t.mark(n, SEEN);
+        list.push(n);
       }
     }
     // commit_list_sort_by_date (stable), then into the date queue in that order
-    list.sort((a, b) => b.date - a.date);
-    const queue = new CommitQueue<RevCommit>();
-    for (const c of list) queue.put(c, c.date);
+    list.sort((a, b) => t.date(b) - t.date(a));
+    const queue = new CommitQueue<number>();
+    for (const n of list) queue.put(n, t.date(n));
 
     let count = 0;
     let skipped = 0;
@@ -654,33 +618,36 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     if (!limited) {
       if (none) return;
       // get_revision_1, streaming
-      for (let c = queue.get(); c; c = queue.get()) {
+      for (let n = queue.get(); n !== undefined; n = queue.get()) {
         // --since: older commits are dropped without walking their parents (max_age)
-        if (this.sinceTime !== undefined && c.date < this.sinceTime) continue;
-        await processParents(c, queue);
-        const commit = await shown(c);
+        if (this.sinceTime !== undefined && t.date(n) < this.sinceTime) {
+          raw.delete(n);
+          continue;
+        }
+        await processParents(n, queue);
+        const commit = await shown(n);
         if (!commit) continue;
         if (skipped < this.skip) {
           skipped++;
           continue;
         }
-        yield { ...commit, id: c.id };
+        yield commit;
         if (this.maxCount !== undefined && ++count >= this.maxCount) return;
       }
       return;
     }
 
     // limit_list
-    const newlist: RevCommit[] = [];
+    const newlist: number[] = [];
     let date = Number.POSITIVE_INFINITY;
     let slop = SLOP;
-    let interestingCache: RevCommit | undefined;
+    let interestingCache = -1;
     /** git's everybody_uninteresting */
     const everybodyUninteresting = (): boolean => {
-      if (interestingCache && !(interestingCache.flags & UNINTERESTING)) return false;
-      for (const c of queue.items()) {
-        if (c.flags & UNINTERESTING) continue;
-        interestingCache = c;
+      if (interestingCache >= 0 && !(t.flag(interestingCache) & UNINTERESTING)) return false;
+      for (const n of queue.items()) {
+        if (t.flag(n) & UNINTERESTING) continue;
+        interestingCache = n;
         return false;
       }
       return true;
@@ -688,36 +655,75 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     /** git's still_interesting */
     const stillInteresting = (): number => {
       const head = queue.peek();
-      if (!head) return 0;
-      if (date <= head.date) return SLOP;
+      if (head === undefined) return 0;
+      if (date <= t.date(head)) return SLOP;
       if (!everybodyUninteresting()) return SLOP;
       return slop - 1;
     };
-    for (let c = queue.get(); c; c = queue.get()) {
-      if (c === interestingCache) interestingCache = undefined;
-      if (this.sinceTime !== undefined && c.date < this.sinceTime) c.flags |= UNINTERESTING;
-      await processParents(c, queue);
-      if (c.flags & UNINTERESTING) {
-        markParentsUninteresting(c);
+    for (let n = queue.get(); n !== undefined; n = queue.get()) {
+      // what is shown is read again at the end: a limited walk does not keep raw commits
+      raw.delete(n);
+      if (n === interestingCache) interestingCache = -1;
+      if (this.sinceTime !== undefined && t.date(n) < this.sinceTime) t.mark(n, UNINTERESTING);
+      await processParents(n, queue);
+      if (t.flag(n) & UNINTERESTING) {
+        markParentsUninteresting(n);
         slop = stillInteresting();
         if (slop) continue;
         break;
       }
-      if (this.untilTime !== undefined && c.date > this.untilTime) continue;
-      date = c.date;
-      newlist.push(c);
+      if (this.untilTime !== undefined && t.date(n) > this.untilTime) continue;
+      date = t.date(n);
+      newlist.push(n);
     }
+    raw.clear();
     if (none) return;
-    for (const c of newlist) {
-      const commit = await shown(c);
+    for (const n of newlist) {
+      const commit = await shown(n);
       if (!commit) continue;
       if (skipped < this.skip) {
         skipped++;
         continue;
       }
-      yield { ...commit, id: c.id };
+      yield commit;
       if (this.maxCount !== undefined && ++count >= this.maxCount) return;
     }
+  }
+
+  /**
+   * The tree, parents and date of a commit (git's parse_commit_buffer), from its raw bytes
+   * when the store gives them (kept in `raw` to be decoded whole if the commit is shown),
+   * else from the commit store; undefined when it is missing or not a commit.
+   */
+  private async readCommitHeader(
+    id: ObjectId,
+  ): Promise<{ tree: ObjectId; parents: ObjectId[]; date: number; raw?: Uint8Array } | undefined> {
+    const objects = this._workingCopy.history?.objects;
+    if (objects) {
+      let obj: GitObject | undefined;
+      let failed = false;
+      try {
+        const now = objects.getNow ? objects.getNow(id) : objects.get(id);
+        obj = now instanceof Promise ? await now : now;
+      } catch {
+        obj = undefined;
+        failed = true;
+      }
+      if (!obj && !failed) return undefined;
+      if (obj?.bytes && obj.type === "commit") {
+        try {
+          const header = parseGraphCommit(obj.bytes, id);
+          return { ...header, raw: obj.bytes };
+        } catch {
+          // read as the commit store reads it
+        }
+      } else if (obj) {
+        await obj.content[Symbol.asyncIterator]().return?.();
+      }
+    }
+    const commit = await this.commits.load(id).catch(() => undefined);
+    if (!commit) return undefined;
+    return { tree: commit.tree, parents: commit.parents, date: commit.committer.timestamp };
   }
 
   /**
@@ -726,16 +732,25 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * element's path components when all are plain paths (no wildcard, no magic, no trailing
    * slash): those are compared by looking their entries up, without a tree diff.
    */
-  private pathspec(): TreePathspec & { literal: string[][] | undefined } {
-    const items: PathspecItem[] = this.paths.map(parsePathspecItem);
-    for (const p of this.excludePaths) items.push({ ...parsePathspecItem(p), exclude: true });
-    if (items.every((i) => i.exclude)) items.push(parsePathspecItem("."));
+  private pathspec(): TreePathspec & { literal: Uint8Array[][] | undefined } {
+    const parse = (p: string) => parsePathspecItem(p, { attr: true });
+    const items: PathspecItem[] = this.paths.map(parse);
+    for (const p of this.excludePaths) items.push({ ...parse(p), exclude: true });
+    if (items.every((i) => i.exclude)) items.push(parse("."));
     const plain = items.every(
-      (i) => !i.exclude && !i.icase && i.nowildcardLen === i.match.length && !i.match.endsWith("/"),
+      (i) =>
+        !i.exclude &&
+        !i.icase &&
+        !i.attr &&
+        i.prefix === undefined &&
+        i.nowildcardLen === i.match.length &&
+        !i.match.endsWith("/"),
     );
     return {
       ...treePathspec(items),
-      literal: plain ? items.map((i) => pathParts(i.match)) : undefined,
+      literal: plain
+        ? items.map((i) => pathParts(i.match).map((part) => encodeGitPath(part)))
+        : undefined,
     };
   }
 
@@ -783,7 +798,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     from: ObjectId | undefined,
     to: ObjectId,
     pathspec: TreePathspec,
-    literal: string[][] | undefined,
+    literal: Uint8Array[][] | undefined,
     bloom: { settings: BloomFilterSettings; keys: number[][][] } | undefined,
     bloomVersion: number,
     graph: CommitGraph | undefined,
@@ -828,7 +843,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         }
       }
     } else {
-      differs = await this.treesDiffer(from, to, pathspec, "");
+      differs = await this.treesDiffer(from, to, pathspec, EMPTY_TREE);
     }
     if (maybe && !differs) stats.bloomFalsePositive++;
     return differs;
@@ -844,7 +859,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     a: ObjectId | undefined,
     b: ObjectId | undefined,
     ps: TreePathspec,
-    base: string,
+    base: Uint8Array,
   ): Promise<boolean> {
     this.statistics.treeEntryReads++;
     // git reads the parent's tree, then the commit's
@@ -852,28 +867,34 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const db = b ? await this.requireTree(b) : EMPTY_TREE;
     const ca = new RawEntries(da);
     const cb = new RawEntries(db);
-    const skip = (c: RawEntries) => {
+    // entries are matched where they lie in the tree's bytes: no name is decoded; an `:(attr)`
+    // element waits for the attributes of a path, then the entry is matched again
+    const skip = (c: RawEntries): Promise<void> | undefined => {
       while (!c.done) {
         c.read();
-        const r = treeEntryInteresting(ps, c.name, c.mode, base);
+        const r = treeEntryInteresting(ps, c.d, c.nameStart, c.nul, c.mode, base);
+        if (r === NEED_ATTRIBUTES) return this.loadAttributes(ps).then(() => skip(c));
         if (r === ALL_ENTRIES_NOT_INTERESTING) {
           c.at = c.d.length;
-          return;
+          return undefined;
         }
-        if (r !== ENTRY_NOT_INTERESTING) return;
+        if (r !== ENTRY_NOT_INTERESTING) return undefined;
         c.next();
       }
+      return undefined;
     };
     for (;;) {
-      skip(ca);
-      skip(cb);
+      const sa = skip(ca);
+      if (sa) await sa;
+      const sb = skip(cb);
+      if (sb) await sb;
       if (ca.done && cb.done) return false;
       const cmp = ca.done ? 1 : cb.done ? -1 : ca.compare(cb);
       if (cmp === 0) {
         const same = ca.mode === cb.mode && ca.sameId(cb);
         if (!same) {
           if (!isTreeMode(ca.mode) || !isTreeMode(cb.mode)) return true;
-          if (await this.treesDiffer(ca.id(), cb.id(), ps, `${base}${ca.name}/`)) return true;
+          if (await this.treesDiffer(ca.id(), cb.id(), ps, ca.below(base))) return true;
         }
         ca.next();
         cb.next();
@@ -885,11 +906,76 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       const sub = one.id();
       const below =
         cmp < 0
-          ? await this.treesDiffer(sub, undefined, ps, `${base}${one.name}/`)
-          : await this.treesDiffer(undefined, sub, ps, `${base}${one.name}/`);
+          ? await this.treesDiffer(sub, undefined, ps, one.below(base))
+          : await this.treesDiffer(undefined, sub, ps, one.below(base));
       if (below) return true;
       one.next();
     }
+  }
+
+  /**
+   * The attributes `treeEntryInteresting` asks for (an `:(attr)` element), read as git's
+   * match_pathspec_attrs reads them in `git log`: the check-in direction (the worktree's
+   * `.gitattributes` first, then the index's) with no index read, so only the worktree's
+   * files count, below `$GIT_DIR/info/attributes` and over `core.attributesFile` and the
+   * system file. A bare repository has no in-tree files (git 2.56 reads none without
+   * `attr.tree`): only the files outside the tree.
+   */
+  private async loadAttributes(ps: TreePathspec): Promise<void> {
+    const attributes = ps.attributes;
+    const path = attributes?.pending;
+    if (!attributes || path === undefined) return;
+    attributes.pending = undefined;
+    // a bare repository's working copy refuses its worktree: asked without touching it
+    const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
+    if (!worktree) {
+      attributes.values.set(path, await this.bareAttributes().get(path, attributes.names));
+      return;
+    }
+    const filter = worktree.contentFilter as
+      | {
+          attributes?(
+            path: string,
+            names: readonly string[],
+            direction?: ContentAttributesContext,
+          ): Promise<Map<string, PathspecAttributeValue>>;
+        }
+      | undefined;
+    if (!filter?.attributes)
+      throw new GitApiError("pathspec magic 'attr' needs the attributes of a worktree");
+    attributes.values.set(
+      path,
+      await filter.attributes(path, attributes.names, { direction: "checkin", index: NO_INDEX }),
+    );
+  }
+
+  private bareResolver?: AttributesResolver;
+
+  /** The attributes of a bare repository: builtin, system, global and `info/attributes`. */
+  private bareAttributes(): AttributesResolver {
+    if (this.bareResolver) return this.bareResolver;
+    const environment = hostEnvironmentOf(this._workingCopy);
+    const gitDir = (this._workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
+    const read = (file: string | undefined) =>
+      file && environment ? environment.readFile(file).catch(() => undefined) : undefined;
+    this.bareResolver = new AttributesResolver(
+      {
+        system: async () => read(environment?.systemAttributes),
+        global: async () => {
+          const configured = configValue(this._workingCopy, "core.attributesFile");
+          return read(
+            configured
+              ? expandUserPath(configured, environment)
+              : xdgConfigPath(environment, "attributes"),
+          );
+        },
+        info: async () =>
+          read(gitDir ? `${gitDir.replace(/\/+$/, "")}/info/attributes` : undefined),
+        inTree: async () => undefined,
+      },
+      { ignoreCase: configBool(this._workingCopy, "core.ignoreCase", false) },
+    );
+    return this.bareResolver;
   }
 
   /** A tree's raw bytes; git's "unable to read tree" when it is missing. */
@@ -902,7 +988,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (!entries) throw new GitApiError(`unable to read tree (${id})`);
       const parts: Uint8Array[] = [];
       for await (const e of entries) {
-        parts.push(NAME_ENCODER.encode(`${e.mode.toString(8)} ${e.name}\0`), hexToBytes(e.id));
+        parts.push(
+          NAME_ENCODER.encode(`${e.mode.toString(8)} `),
+          encodeGitPath(e.name),
+          new Uint8Array(1),
+          hexToBytes(e.id),
+        );
       }
       return concatBytes(parts);
     }
@@ -916,12 +1007,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private async differsAtPath(
     a: ObjectId | undefined,
     b: ObjectId | undefined,
-    parts: string[],
+    parts: Uint8Array[],
     i: number,
   ): Promise<boolean> {
     // the whole tree (`.`, `:/`): a root commit compares with the empty tree, as in git
     if (parts.length === 0) return (a ?? EMPTY_TREE_ID) !== (b ?? EMPTY_TREE_ID);
-    const name = parts[i] as string;
+    const name = parts[i] as Uint8Array;
     const ea = a ? await this.entryOf(a, name) : undefined;
     const eb = b ? await this.entryOf(b, name) : undefined;
     if (!ea && !eb) return false;
@@ -939,17 +1030,17 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   private async entryOf(
     tree: ObjectId,
-    name: string,
+    name: Uint8Array,
   ): Promise<{ id: ObjectId; mode: number } | undefined> {
     this.statistics.treeEntryReads++;
     const raw = await this.rawTree(tree);
-    if (raw === null) return this.trees.getEntry(tree, name);
+    if (raw === null) return this.trees.getEntry(tree, NAME_DECODER.decode(name));
     if (raw === undefined) throw new GitApiError(`unable to read tree (${tree})`);
-    return findRawEntry(raw, NAME_ENCODER.encode(name));
+    return findRawEntry(raw, name);
   }
 
   /** Raw trees read lately, most recently used last: a commit's trees are its child's parent trees. */
-  private readonly rawTrees = new Map<ObjectId, Uint8Array>();
+  private readonly rawTrees = new OrderedMap<ObjectId, Uint8Array>();
   private rawTreeBytes = 0;
 
   /** The raw bytes of a tree; undefined when it is missing, null without a raw object store. */
@@ -983,29 +1074,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.rawTrees.set(id, bytes);
     this.rawTreeBytes += bytes.length;
     while (this.rawTrees.size > RAW_TREE_CACHE || this.rawTreeBytes > RAW_TREE_CACHE_BYTES) {
-      const oldest = this.rawTrees.keys().next().value as ObjectId;
+      const oldest = this.rawTrees.oldestKey() as ObjectId;
       if (oldest === id) break;
       this.rawTreeBytes -= (this.rawTrees.get(oldest) as Uint8Array).length;
       this.rawTrees.delete(oldest);
     }
     return bytes;
-  }
-
-  /**
-   * Build set of commits to exclude.
-   */
-  private async buildExcludedSet(): Promise<Set<ObjectId>> {
-    if (this.excludeCommits.length === 0) {
-      return new Set();
-    }
-
-    const excluded = new Set<ObjectId>();
-    for await (const commitId of this.commits.walkAncestry(this.excludeCommits, {
-      firstParentOnly: false,
-    })) {
-      excluded.add(commitId);
-    }
-    return excluded;
   }
 
   /**
@@ -1030,6 +1104,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 const isTreeMode = (mode: number) => (mode & 0o170000) === 0o040000;
 
 const NAME_ENCODER = new TextEncoder();
+const NAME_DECODER = new TextDecoder();
 
 /** Raw trees a path-limited walk keeps. */
 const RAW_TREE_CACHE = 512;
@@ -1049,22 +1124,194 @@ const TREESAME = 1 << 5;
 /** How many extra uninteresting commits limit_list looks at (git's SLOP). */
 const SLOP = 5;
 
-/** A commit as revision.c holds it: flags, and once parsed its tree, date and parents. */
-interface RevCommit {
-  id: ObjectId;
-  flags: number;
-  parsed: boolean;
-  tree: ObjectId;
-  /** Committer date (seconds) */
-  date: number;
-  /** Position in the commit-graph, or -1 */
-  pos: number;
-  /** The parents once parsed; simplification may leave only the one followed */
-  parents: RevCommit[] | undefined;
+/**
+ * The commits a walk meets, as revision.c's object table holds them: flags, and once parsed
+ * the date, the parents and (outside the commit-graph) the tree. Each commit is a number
+ * indexing typed arrays, a few dozen bytes per commit instead of an object with its id, tree
+ * and parent array. Commits the graph has are found by graph position (`lookupPos`), their
+ * ids and trees read from the graph when needed; others by id.
+ */
+class RevTable {
+  /** commits held */
+  size = 0;
+  /** revision.c flags (UNINTERESTING, SEEN, ...) */
+  flags = new Uint8Array(INITIAL_REVS);
+  /** committer dates (seconds) */
+  private dates = new Float64Array(INITIAL_REVS);
+  /** position in the commit-graph, -1 for a commit it does not have */
+  gpos = new Int32Array(INITIAL_REVS);
+  /** where the parents start in `pool`, once parsed */
+  private parentAt = new Int32Array(INITIAL_REVS);
+  /** how many parents, -1 before the commit is parsed */
+  private parents = new Int32Array(INITIAL_REVS);
+  /** every parsed commit's parents, in turn */
+  private pool = new Int32Array(INITIAL_REVS);
+  private poolUsed = 0;
+  /** ids known without the graph (looked up by id), by commit */
+  private readonly ids: (ObjectId | undefined)[] = [];
+  /** trees of commits parsed outside the graph, by commit */
+  private readonly trees: (ObjectId | undefined)[] = [];
+  /** commits outside the graph, by id */
+  private readonly byId = new Map<ObjectId, number>();
+  /** commit + 1 by graph position (0: not met yet) */
+  private readonly byPos: Int32Array | undefined;
+
+  constructor(private readonly graph: CommitGraph | undefined) {
+    this.byPos = graph ? new Int32Array(graph.size) : undefined;
+  }
+
+  /** Bytes the table's arrays take (the ids and trees kept besides them not counted). */
+  get bytes(): number {
+    return (
+      this.flags.byteLength +
+      this.dates.byteLength +
+      this.gpos.byteLength +
+      this.parentAt.byteLength +
+      this.parents.byteLength +
+      this.pool.byteLength +
+      (this.byPos?.byteLength ?? 0)
+    );
+  }
+
+  /** The commit `id`, added when first met (git's lookup_commit). */
+  lookup(id: ObjectId): number {
+    const known = this.byId.get(id);
+    if (known !== undefined) return known;
+    const pos = this.graph ? this.graph.position(id) : -1;
+    if (pos >= 0) {
+      const n = this.lookupPos(pos);
+      this.ids[n] = id;
+      return n;
+    }
+    const n = this.add(-1);
+    this.ids[n] = id;
+    this.byId.set(id, n);
+    return n;
+  }
+
+  /** The commit at graph position `pos`, added when first met. */
+  lookupPos(pos: number): number {
+    const byPos = this.byPos as Int32Array;
+    const known = (byPos[pos] as number) - 1;
+    if (known >= 0) return known;
+    const n = this.add(pos);
+    byPos[pos] = n + 1;
+    return n;
+  }
+
+  idOf(n: number): ObjectId {
+    return this.ids[n] ?? (this.graph as CommitGraph).idAt(this.gpos[n] as number);
+  }
+
+  flag(n: number): number {
+    return this.flags[n] as number;
+  }
+
+  mark(n: number, flags: number): void {
+    this.flags[n] = (this.flags[n] as number) | flags;
+  }
+
+  parsed(n: number): boolean {
+    return (this.parents[n] as number) >= 0;
+  }
+
+  date(n: number): number {
+    return this.dates[n] as number;
+  }
+
+  /** The tree of a parsed commit. */
+  treeOf(n: number): ObjectId {
+    if ((this.flags[n] as number) & GRAPH_PARSED)
+      return (this.graph as CommitGraph).treeAt(this.gpos[n] as number);
+    return this.trees[n] as ObjectId;
+  }
+
+  /** The graph position of a commit parsed from the graph (its Bloom filter), else -1. */
+  bloomPos(n: number): number {
+    return (this.flags[n] as number) & GRAPH_PARSED ? (this.gpos[n] as number) : -1;
+  }
+
+  /** Records a commit as parsed, with room for `count` parents (`setParent`). */
+  setParsed(
+    n: number,
+    date: number,
+    fromGraph: boolean,
+    tree: ObjectId | undefined,
+    count: number,
+  ): void {
+    this.dates[n] = date;
+    if (fromGraph) this.mark(n, GRAPH_PARSED);
+    else this.trees[n] = tree;
+    if (this.poolUsed + count > this.pool.length) {
+      const grown = new Int32Array(Math.max(this.pool.length * 2, this.poolUsed + count));
+      grown.set(this.pool);
+      this.pool = grown;
+    }
+    this.parentAt[n] = this.poolUsed;
+    this.parents[n] = count;
+    this.poolUsed += count;
+  }
+
+  setParent(n: number, k: number, p: number): void {
+    this.pool[(this.parentAt[n] as number) + k] = p;
+  }
+
+  /** The parents of a parsed commit (0 before it is parsed). */
+  parentCount(n: number): number {
+    return Math.max(0, this.parents[n] as number);
+  }
+
+  parent(n: number, k: number): number {
+    return this.pool[(this.parentAt[n] as number) + k] as number;
+  }
+
+  /** Simplification keeps only parent `p` (git rewrites `commit->parents`). */
+  keepOnlyParent(n: number, p: number): void {
+    this.pool[this.parentAt[n] as number] = p;
+    this.parents[n] = 1;
+  }
+
+  private add(pos: number): number {
+    const n = this.size++;
+    if (n === this.flags.length) this.grow();
+    this.gpos[n] = pos;
+    this.parents[n] = -1;
+    return n;
+  }
+
+  private grow(): void {
+    const size = this.flags.length * 2;
+    const flags = new Uint8Array(size);
+    flags.set(this.flags);
+    this.flags = flags;
+    const dates = new Float64Array(size);
+    dates.set(this.dates);
+    this.dates = dates;
+    const gpos = new Int32Array(size);
+    gpos.set(this.gpos);
+    this.gpos = gpos;
+    const parentAt = new Int32Array(size);
+    parentAt.set(this.parentAt);
+    this.parentAt = parentAt;
+    const parents = new Int32Array(size);
+    parents.set(this.parents);
+    this.parents = parents;
+  }
 }
 
-/** git's relevant_commit: not UNINTERESTING, or an excluded commit given (BOTTOM). */
-const relevant = (c: RevCommit) => (c.flags & (UNINTERESTING | BOTTOM)) !== UNINTERESTING;
+/** Commits a `RevTable` has room for before it first grows. */
+const INITIAL_REVS = 1024;
+/** `RevTable` flag: parsed from the commit-graph (its tree and Bloom filter are there). */
+const GRAPH_PARSED = 1 << 6;
+
+/** A commit read whole, as the commit store decodes it; undefined if it does not parse. */
+function decodeCommit(bytes: Uint8Array): Commit | undefined {
+  try {
+    return commitFromBytes(bytes);
+  } catch {
+    return undefined;
+  }
+}
 
 function concatBytes(chunks: Uint8Array[]): Uint8Array {
   if (chunks.length === 1) return chunks[0] as Uint8Array;
@@ -1175,14 +1422,14 @@ class CommitQueue<T> {
 
 /**
  * A cursor over a raw tree's entries for the pruned diff: `read()` decodes the entry at `at`
- * (mode, name as one character per byte), `next()` moves past it.
+ * (its mode, where its name starts and ends), `next()` moves past it. Names stay bytes.
  */
 class RawEntries {
   at = 0;
   mode = 0;
-  name = "";
-  private nameStart = 0;
-  private nul = 0;
+  nameStart = 0;
+  /** where the name ends (its NUL; the id follows) */
+  nul = 0;
   constructor(readonly d: Uint8Array) {}
   get done(): boolean {
     return this.at >= this.d.length;
@@ -1196,13 +1443,21 @@ class RawEntries {
     this.nameStart = ++p;
     while (p < d.length && d[p] !== 0) p++;
     this.nul = p;
-    this.name = latin1String(d.subarray(this.nameStart, p));
   }
   next(): void {
     this.at = this.nul + 21;
   }
   id(): ObjectId {
     return bytesToHex(this.d.subarray(this.nul + 1, this.nul + 21));
+  }
+  /** The base of the entries below this one (a directory): `base`, its name and "/". */
+  below(base: Uint8Array): Uint8Array {
+    const length = this.nul - this.nameStart;
+    const out = new Uint8Array(base.length + length + 1);
+    out.set(base);
+    out.set(this.d.subarray(this.nameStart, this.nul), base.length);
+    out[base.length + length] = 0x2f;
+    return out;
   }
   sameId(other: RawEntries): boolean {
     for (let k = 1; k <= 20; k++) {
@@ -1212,15 +1467,17 @@ class RawEntries {
   }
   /** git's base_name_compare of the names: a tree's name is followed by "/". */
   compare(other: RawEntries): number {
-    const a = this.name;
-    const b = other.name;
-    const n = Math.min(a.length, b.length);
+    const a = this.d;
+    const b = other.d;
+    const la = this.nul - this.nameStart;
+    const lb = other.nul - other.nameStart;
+    const n = Math.min(la, lb);
     for (let i = 0; i < n; i++) {
-      const d = a.charCodeAt(i) - b.charCodeAt(i);
+      const d = (a[this.nameStart + i] as number) - (b[other.nameStart + i] as number);
       if (d !== 0) return d;
     }
-    const ca = n < a.length ? a.charCodeAt(n) : isTreeMode(this.mode) ? 0x2f : 0;
-    const cb = n < b.length ? b.charCodeAt(n) : isTreeMode(other.mode) ? 0x2f : 0;
+    const ca = n < la ? (a[this.nameStart + n] as number) : isTreeMode(this.mode) ? 0x2f : 0;
+    const cb = n < lb ? (b[other.nameStart + n] as number) : isTreeMode(other.mode) ? 0x2f : 0;
     return ca - cb;
   }
 }

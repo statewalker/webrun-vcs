@@ -5,6 +5,7 @@
  * Provides graph traversal operations for commit history.
  */
 
+import { OrderedMap } from "@statewalker/vcs-utils";
 import type { ObjectId } from "../../common/id/index.js";
 import { objectRemovalEpoch } from "../../storage/raw/object-removals.js";
 import { type CommitGraph, CommitGraphCorruptError } from "../commit-graph/commit-graph.js";
@@ -53,7 +54,7 @@ class GitCommitStore implements Commits {
    * before the last object removal anywhere (`objectRemovalEpoch`: gc, a repack, a discarded
    * quarantine) is checked with `objects.has` first, so a pruned commit is not served.
    */
-  private readonly cache = new Map<ObjectId, { commit: Commit; epoch: number }>();
+  private readonly cache = new OrderedMap<ObjectId, { commit: Commit; epoch: number }>();
 
   readonly commitGraph?: CommitGraphProvider;
 
@@ -271,7 +272,7 @@ class GitCommitStore implements Commits {
     if (commit) {
       this.cache.set(id, { commit: copyCommit(commit), epoch });
       if (this.cache.size > MAX_CACHED_COMMITS) {
-        this.cache.delete(this.cache.keys().next().value as ObjectId);
+        this.cache.delete(this.cache.oldestKey() as ObjectId);
       }
     }
     return commit;

@@ -1,5 +1,5 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { directoriesOf, type Worktree } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
 import {
@@ -8,6 +8,8 @@ import {
   matchPathspec,
   type PathspecItem,
   parsePathspec,
+  pathspecItemBytes,
+  pathspecName,
   psEqual,
 } from "./pathspec.js";
 import { removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
@@ -454,9 +456,10 @@ class DirectoryScan {
   /** git's `simplify_away`: no element's literal prefix can lead to `path`. */
   private simplifyAway(path: string): boolean {
     if (!this.hasPathspec) return false;
+    const name = pathspecName(path);
     for (const item of this.o.pathspec) {
-      const len = Math.min(item.nowildcardLen, path.length);
-      if (psEqual(item, item.match.slice(0, len), path.slice(0, len))) return false;
+      const len = Math.min(item.nowildcardLen, name.length);
+      if (psEqual(item, item.match.slice(0, len), name.slice(0, len))) return false;
     }
     return true;
   }
@@ -553,7 +556,8 @@ class DirectoryScan {
   /** git's `common_prefix_len`: the leading directories every element starts with. */
   private commonPrefix(): string {
     // exclude elements do not count; an icase one has no literal prefix beyond the cwd's
-    const items = this.o.pathspec.filter((item) => !item.exclude);
+    // (compared as bytes: the elements are held as their bytes)
+    const items = this.o.pathspec.filter((item) => !item.exclude).map(pathspecItemBytes);
     if (items.length === 0) return "";
     let max = 0;
     for (let n = 0; n < items.length; n++) {
@@ -571,7 +575,9 @@ class DirectoryScan {
         if (!max) break;
       }
     }
-    return items[0].match.slice(0, max);
+    // whole names (it ends at a "/"): the path as the worktree names it
+    const bytes = items[0].match.slice(0, max);
+    return decodeGitPath(Uint8Array.from(bytes, (c) => c.charCodeAt(0)));
   }
 
   /** git's `correct_untracked_entries`, after sorting both lists. */

@@ -19,7 +19,16 @@ import {
   type PackFile,
   writePackIdx,
 } from "../../src/pack/index.js";
-import { buildPack, chunks, collect, type Entry, extend, oidOf } from "./pack-builder.js";
+import {
+  buildPack,
+  chunks,
+  collect,
+  copyAll,
+  delta,
+  type Entry,
+  extend,
+  oidOf,
+} from "./pack-builder.js";
 
 const enc = new TextEncoder();
 const PACK_DIR = "/objects/pack";
@@ -348,3 +357,86 @@ describe("review of #130: the delta base cache admits an entry over its limit, a
     ).toBe(true);
   });
 });
+
+describe("P4.24: lookups narrowed by a second fan-out level, resolutions through I/O", () => {
+  it("an idx of thousands of ids compares about one id per lookup", async () => {
+    const files = createInMemoryFilesApi();
+    const blobs = Array.from({ length: 6000 }, (_, i) => enc.encode(`blob ${i}\n`));
+    const { packPath, idxPath } = await install(
+      files,
+      blobs.map((data) => ({ kind: 3, data })),
+    );
+    const pack = await openPack(files, packPath, idxPath);
+    for (const b of blobs) expect(pack.has(oidOf("blob", b))).toBe(true);
+    // a bucket of ~23 ids takes ~5 comparisons by binary search; its second level leaves ~1
+    expect(pack.stats.idCompares).toBeLessThan(2 * blobs.length);
+    const before = pack.stats.idCompares;
+    for (let i = 0; i < 500; i++)
+      expect(pack.has(oidOf("blob", enc.encode(`absent ${i}\n`)))).toBe(false);
+    expect(pack.stats.idCompares - before).toBeLessThan(2 * 500);
+    // every id still found by `get`, the objects intact
+    const some = blobs.filter((_, i) => i % 97 === 0);
+    for (const b of some) {
+      const o = await pack.get(oidOf("blob", b));
+      expect(same(o?.bytes as Uint8Array, b)).toBe(true);
+    }
+  });
+
+  it("two chains resolved at once, each waiting for windows, under a tiny base cache", async () => {
+    const STEPS = 40;
+    // deltas spread over many 64 KiB windows by incompressible blobs: each resolution waits
+    // in the middle of its walk up, while the other uses the pack's scratch buffers
+    let seed = 7;
+    const noise = (n: number) =>
+      Uint8Array.from({ length: n }, () => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed >> 16;
+      });
+    const entries: Entry[] = [];
+    const versions: Uint8Array[][] = [[text(150, "chain a")], [text(150, "chain b")]];
+    const at: number[] = [];
+    for (const v of versions) {
+      at.push(entries.length);
+      entries.push({ kind: 3, data: v[0] as Uint8Array });
+    }
+    const hex = (n: number) => Buffer.from(noise(n)).toString("hex");
+    for (let step = 1; step <= STEPS; step++) {
+      entries.push({ kind: 3, data: noise(20 * 1024) });
+      for (let c = 0; c < 2; c++) {
+        const chainVersions = versions[c] as Uint8Array[];
+        // deltas of ~2 KiB compressed: some of them cross a window boundary
+        const tail = `step ${step} ${hex(1500)}\n`;
+        const { data, d } = extendLong(chainVersions[step - 1] as Uint8Array, tail);
+        chainVersions.push(data);
+        entries.push({ kind: 6, data: d, baseIdx: at[c] as number });
+        at[c] = entries.length - 1;
+      }
+    }
+    const files = createInMemoryFilesApi();
+    const { packPath, idxPath } = await install(files, entries);
+    {
+      // a budget below one version: only the base of each read is cached, the rest is scratch
+      const pack = await openPack(files, packPath, idxPath, { baseCacheBytes: 1024 });
+      const asked: Uint8Array[] = [];
+      for (let k = STEPS; k > 0; k -= 3)
+        asked.push(versions[0]?.[k] as Uint8Array, versions[1]?.[k] as Uint8Array);
+      const got = await Promise.all(asked.map((v) => pack.get(oidOf("blob", v))));
+      for (let i = 0; i < asked.length; i++)
+        expect([i, same(got[i]?.bytes as Uint8Array, asked[i] as Uint8Array)]).toEqual([i, true]);
+    }
+  });
+});
+
+/** `extend` for a tail of any length: inserts of at most 127 bytes each. */
+function extendLong(base: Uint8Array, tail: string) {
+  const t = enc.encode(tail);
+  const data = new Uint8Array(base.length + t.length);
+  data.set(base);
+  data.set(t, base.length);
+  const ops = [...copyAll(base.length)];
+  for (let i = 0; i < t.length; i += 127) {
+    const piece = t.subarray(i, i + 127);
+    ops.push(piece.length, ...piece);
+  }
+  return { data, d: delta(base.length, data.length, ops) };
+}

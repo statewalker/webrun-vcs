@@ -35,6 +35,12 @@ import {
 } from "./pack-file.js";
 import { runSteps, runStepsAsync, type Steps } from "./run-steps.js";
 
+/** Where `lookupSteps` resumes: at pack `at` of `packs`, with what its `getNow` gave. */
+type Resume = { packs: readonly PackFile[]; at: number } & (
+  | { value: GitObject | undefined | Promise<GitObject | undefined> }
+  | { error: unknown }
+);
+
 export interface OpenPackSetOptions {
   /**
    * Bytes of resolved delta bases kept across reads, for the whole set (git's
@@ -166,8 +172,11 @@ export async function openPackSet(
     modified === undefined || now - modified <= freshenMaxAge;
   /** copies found corrupt, per pack */
   const bad = new WeakMap<PackFile, Set<ObjectId>>();
-  const isBad = (p: PackFile, id: ObjectId) => bad.get(p)?.has(id) ?? false;
+  /** copies ever marked bad (none: no lookup in `bad`) */
+  let badMarks = 0;
+  const isBad = (p: PackFile, id: ObjectId) => badMarks !== 0 && (bad.get(p)?.has(id) ?? false);
   const markBad = (p: PackFile, id: ObjectId) => {
+    badMarks++;
     let s = bad.get(p);
     if (!s) {
       s = new Set();
@@ -421,22 +430,30 @@ export async function openPackSet(
     id: ObjectId,
     o: { verify?: boolean; visiting?: ReadonlySet<ObjectId> },
     rescan: boolean,
+    resume?: Resume,
   ): Steps<GitObject | undefined> {
     // no pack holds what is not an id (`has` parses it): checked only before a rescan
     let failed: unknown;
     let vanished = false;
     // `packs` is replaced, never changed in place: this loop sees one snapshot
-    for (const p of packs) {
+    const snapshot = resume?.packs ?? packs;
+    for (let k = resume?.at ?? 0; k < snapshot.length; k++) {
+      const p = snapshot[k] as PackFile;
+      const resumed = resume !== undefined && k === resume.at;
       // `has` is false for an id in a corrupt idx bucket: a pack that cannot say it holds `id`
       // does not stop the rescan, and only held ids are marked bad (`find` remembers the id it
       // searched last, so `getNow` does not search again)
-      if (!p.has(id)) continue;
-      if (isBad(p, id)) {
+      if (!resumed && !p.has(id)) continue;
+      if (!resumed && isBad(p, id)) {
         failed ??= new PackError(`object ${id}: the copy in pack ${p.packId} is corrupt`);
         continue;
       }
       try {
-        let obj = p.getNow(id, o);
+        let obj: GitObject | undefined | Promise<GitObject | undefined>;
+        if (resumed) {
+          if ("error" in resume) throw resume.error;
+          obj = resume.value;
+        } else obj = p.getNow(id, o);
         if (obj instanceof Promise) obj = (yield obj) as GitObject | undefined;
         if (obj) return yield* guarded(p, id, obj);
       } catch (e) {
@@ -524,7 +541,26 @@ export async function openPackSet(
       return false;
     },
     get: (id, o) => lookup(id, { verify: o?.verify }, true),
-    getNow: (id, o) => runSteps(lookupSteps(id, { verify: o?.verify }, true)),
+    getNow(id, o) {
+      // the common case without a generator: the first pack holding `id` has it in memory
+      const snapshot = packs;
+      const opts = { verify: o?.verify };
+      for (let k = 0; k < snapshot.length; k++) {
+        const p = snapshot[k] as PackFile;
+        if (!p.has(id)) continue;
+        if (isBad(p, id)) break;
+        let resume: Resume;
+        try {
+          const obj = p.getNow(id, opts);
+          if (obj !== undefined && !(obj instanceof Promise) && obj.bytes) return obj;
+          resume = { packs: snapshot, at: k, value: obj };
+        } catch (error) {
+          resume = { packs: snapshot, at: k, error };
+        }
+        return runSteps(lookupSteps(id, opts, true, resume));
+      }
+      return runSteps(lookupSteps(id, opts, true));
+    },
     entry: (id) => findEntry(id, true),
     async *list(o) {
       // an id is yielded by the first pack holding it: no set of every id

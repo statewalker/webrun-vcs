@@ -9,6 +9,7 @@
  * within a line a later state wins; a macro set to true expands to its states.
  */
 
+import { OrderedMap } from "@statewalker/vcs-utils";
 import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import {
   type AttributeRule,
@@ -123,7 +124,7 @@ function stackOf(frames: Frame[]): Stack {
  * so a long-lived resolver does not keep every version of every file.
  */
 class ParseCache {
-  private readonly entries = new Map<string, Frame["rules"]>();
+  private readonly entries = new OrderedMap<string, Frame["rules"]>();
   get(key: string, parse: () => AttributeRule[]): AttributeRule[] {
     const hit = this.entries.get(key);
     if (hit) {
@@ -135,7 +136,7 @@ class ParseCache {
     const rules = parse();
     this.entries.set(key, rules);
     if (this.entries.size > 1024) {
-      const first = this.entries.keys().next().value;
+      const first = this.entries.oldestKey();
       if (first !== undefined) this.entries.delete(first);
     }
     return rules;

@@ -50,7 +50,24 @@ const HEX_PAIRS: string[] = Array.from({ length: 256 }, (_, b) => b.toString(16)
  * @returns Hexadecimal string (lowercase)
  */
 export function bytesToHex(bytes: Uint8Array): string {
+  const n = bytes.length;
+  if (n === 20) {
+    // an object id: one flat string from its 40 char codes. Concatenating pairs builds a rope
+    // of 20 pieces that is flattened again (copied) the first time the id is hashed or read.
+    const codes = ID_CODES;
+    for (let i = 0; i < 20; i++) {
+      const b = bytes[i] as number;
+      codes[2 * i] = HEX_CODES[b >> 4] as number;
+      codes[2 * i + 1] = HEX_CODES[b & 15] as number;
+    }
+    return String.fromCharCode.apply(null, codes);
+  }
   let out = "";
-  for (let i = 0; i < bytes.length; i++) out += HEX_PAIRS[bytes[i]];
+  for (let i = 0; i < n; i++) out += HEX_PAIRS[bytes[i]];
   return out;
 }
+
+/** The char codes of "0" to "f". */
+const HEX_CODES = Uint8Array.from("0123456789abcdef", (c) => c.charCodeAt(0));
+/** The char codes of the id `bytesToHex` is converting (it never awaits: one array serves all). */
+const ID_CODES: number[] = new Array(40).fill(0);
