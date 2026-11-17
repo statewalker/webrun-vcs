@@ -658,6 +658,10 @@ const HEX_PAIR: Int16Array = (() => {
       table[(digits.charCodeAt(a) << 8) | digits.charCodeAt(b)] = a * 16 + b;
   return table;
 })();
+/** One lowercase hex digit's value by char code; -1 for any other code (prefix searches). */
+const HEX_VALUE = new Int8Array(128).fill(-1);
+for (let c = 0; c < 10; c++) HEX_VALUE[48 + c] = c;
+for (let c = 0; c < 6; c++) HEX_VALUE[97 + c] = 10 + c;
 /** The id being looked up, as bytes (lookups are synchronous: one buffer serves all). */
 const idKey = new Uint8Array(20);
 

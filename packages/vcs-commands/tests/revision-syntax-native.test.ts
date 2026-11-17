@@ -540,6 +540,11 @@ describeGit("approxidate against native git, one timezone for both", () => {
   });
 
   it("dates across a summer-time change (rev-parse --since), as git reads them", () => {
+    // git before 2.5x took "noon" back a day whenever the hour now was before 12, even after a
+    // day was given ("march 10 noon" read as march 9 after local midnight); 2.5x's date_time
+    // does so only without a day, as ours: older git is not compared on such forms
+    const version = /(\d+)\.(\d+)/.exec(execFileSync("git", ["--version"], { encoding: "utf8" }));
+    const newGit = !!version && (Number(version[1]) > 2 || Number(version[2]) >= 50);
     for (const zone of ["America/Los_Angeles", "Europe/Berlin", "UTC"]) {
       process.env.TZ = zone;
       for (const text of [
@@ -555,6 +560,7 @@ describeGit("approxidate against native git, one timezone for both", () => {
         "yesterday",
         "last friday",
       ]) {
+        if (!newGit && text === "march 10 noon") continue;
         const before = Math.floor(Date.now() / 1000);
         const native = execFileSync("git", ["rev-parse", `--since=${text}`], {
           env: { ...nativeGitEnv(root || tmpdir()), TZ: zone },
@@ -738,15 +744,8 @@ async function expectSameLog(repo: string, cases: string[][]): Promise<void> {
     } catch (error) {
       ours = { status: 128, out: "", err: `${(error as Error).message}\n` };
     }
-    // the commits compared as a set: LogCommand's walk without paths is not in git's
-    // date order (a known gap of LogCommand, not of the revision arguments)
-    // TODO: compare in order once LogCommand's plain walk follows git's limit_list /
-    // date-ordered walk (the pending log-command.ts change); RevListCommand documents it
-    const sorted = (out: string) => out.split("\n").filter(Boolean).sort().join("\n");
-    expect([args, { ...ours, out: sorted(ours.out) }]).toEqual([
-      args,
-      { status: n.status, out: sorted(n.stdout), err: n.stderr },
-    ]);
+    // in git's order: LogCommand walks as git's revision.c does
+    expect([args, ours]).toEqual([args, { status: n.status, out: n.stdout, err: n.stderr }]);
   }
 }
 
