@@ -634,7 +634,10 @@ export async function writeCommitGraphFile(
   }
 
   // expire: layers dropped from the chain (all of them after a single-file write)
-  const expireTime = options.expireTime ?? now();
+  // one clock read: the layers merged away count as modified now (git's mark_commit_graphs),
+  // and the default expire time is that same now, so they are always expired as in git
+  const nowMs = now();
+  const expireTime = options.expireTime ?? nowMs;
   const touched = new Set<string>();
   if (split) {
     for (let i = numAfter - 1; i < numBefore; i++) {
@@ -651,7 +654,6 @@ export async function writeCommitGraphFile(
   }
   const dir = joinPath(objectsDir, COMMIT_GRAPHS_DIR);
   if ((await files.stats(dir))?.kind === "directory") {
-    const nowMs = now();
     for await (const e of files.list(dir)) {
       if (e.kind !== "file") continue;
       const mtime = touched.has(e.name)
@@ -664,7 +666,9 @@ export async function writeCommitGraphFile(
     }
     // git's mark_commit_graphs sets the mtime of the layers merged away to now, so a later
     // write keeps them until --expire-time passes it: the FilesApi has no utime, so the file
-    // is copied and the copy renamed over it (a new file, of the current time)
+    // is copied and the copy renamed over it (a new file, of the current time). A copy a crash
+    // leaves behind is not swept later, as git sweeps none of its own `tmp_graph_*` files
+    // (expire_commit_graphs removes `.graph` files only; prune cleans objects/pack only)
     for (const name of touched) {
       const path = joinPath(dir, name);
       if (keep.has(name) || expired.includes(path)) continue;

@@ -12,10 +12,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DefaultSerializationApi } from "@statewalker/vcs-core";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
+import { checkConnectivity } from "@statewalker/vcs-transport";
 import { VcsRepositoryFacade } from "@statewalker/vcs-transport-adapters";
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { commitsBaseSource, MergeBaseGraph } from "../src/commands/merge-bases.js";
+import { Git } from "../src/index.js";
 import { nativeGitEnv } from "./native-git-http-backend.js";
 
 const dirs: string[] = [];
@@ -204,7 +209,103 @@ describe("the transport facade over a stale commit-graph", () => {
       history,
       serialization: new DefaultSerializationApi({ history }),
     });
-    expect(await facade.getCommitInfo(ids[2] as string)).toBeUndefined();
+    expect(await facade.getCommitInfo(ids[2] as string, { checkExists: true })).toBeUndefined();
     expect((await facade.getCommitInfo(ids[1] as string))?.parents).toEqual([ids[0]]);
+    // upload-pack's walks read the graph unchecked, as git does by default
+    expect((await facade.getCommitInfo(ids[2] as string))?.parents).toEqual([ids[1]]);
+  });
+
+  it("receive-pack's connectivity check finds a parent only the stale graph lists missing", async () => {
+    const { dir, ids } = dagRepo([
+      { parents: [], date: 1000 },
+      { parents: [0], date: 2000 },
+      { parents: [1], date: 3000 },
+    ]);
+    git(dir, ["commit-graph", "write", "--reachable"]);
+    git(dir, ["update-ref", "-d", "refs/heads/c2"]);
+    git(dir, ["reflog", "expire", "--expire=now", "--all"]);
+    git(dir, ["-c", "gc.writeCommitGraph=false", "gc", "-q", "--prune=now"]);
+    // a pushed commit whose parent is the pruned c2 (its tree is c1's, present)
+    const tree = git(dir, ["rev-parse", `${ids[1]}^{tree}`]).trim();
+    const pushed = git(
+      dir,
+      ["hash-object", "-w", "-t", "commit", "--stdin"],
+      `tree ${tree}\nparent ${ids[2]}\nauthor A <a@example.com> 4000 +0000\n` +
+        `committer C <c@example.com> 4000 +0000\n\npushed\n`,
+    ).trim();
+    const { history } = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: dir }),
+    });
+    expect((await history.commitGraph?.get())?.has(ids[2] as string)).toBe(true);
+    const facade = new VcsRepositoryFacade({
+      history,
+      serialization: new DefaultSerializationApi({ history }),
+    });
+    expect(await checkConnectivity(facade, [pushed], [ids[1] as string])).toMatchObject({
+      ok: false,
+      missing: ids[2],
+    });
+  });
+});
+
+describe("commitsBaseSource over a graph written during the walk", () => {
+  it("reads every header of one merge-base computation through one graph", async () => {
+    const { dir, ids } = dagRepo([
+      { parents: [], date: 1000 },
+      { parents: [0], date: 2000 },
+      { parents: [1], date: 3000 },
+      { parents: [1], date: 3500 },
+    ]);
+    git(dir, ["commit-graph", "write", "--stdin-commits"], `${ids[1]}\n`);
+    const { history } = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: dir }),
+    });
+    const commits = history.commits;
+    let readers = 0;
+    const counted = Object.create(commits, {
+      headerReader: {
+        value: async () => {
+          readers++;
+          const reader = await commits.headerReader?.();
+          // a graph of all commits is written and loaded once the reader is taken
+          git(dir, ["commit-graph", "write", "--reachable"]);
+          commits.commitGraph?.invalidate();
+          expect((await commits.commitGraph?.get())?.size).toBe(4);
+          return reader;
+        },
+      },
+      getHeader: {
+        value: () => {
+          throw new Error("read outside the source's graph");
+        },
+      },
+    });
+    const graph = new MergeBaseGraph(commitsBaseSource(counted, async () => new Map()));
+    const bases = await graph.mergeBases(
+      graph.commit(ids[2] as string),
+      graph.commit(ids[3] as string),
+    );
+    expect(bases.map((b) => b.id)).toEqual([ids[1]]);
+    expect(readers).toBe(1);
+  });
+});
+
+describe("InitCommand with the host's environment", () => {
+  it("honours a global core.commitGraph=false for the repository it opens", async () => {
+    const { dir } = dagRepo([
+      { parents: [], date: 1000 },
+      { parents: [0], date: 2000 },
+    ]);
+    git(dir, ["commit-graph", "write", "--reachable"]);
+    const globalConfig = join(tempDir(), "gitconfig");
+    writeFileSync(globalConfig, "[core]\n\tcommitGraph = false\n");
+    const environment = createNodeGitHostEnvironment({
+      env: { HOME: tempDir(), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: globalConfig },
+    });
+    const files = createNodeFilesApi({ rootDir: dir });
+    const withGlobal = await Git.init().setFilesApi(files).setEnvironment(environment).call();
+    expect(await withGlobal.repository.commitGraph?.get()).toBeUndefined();
+    const without = await Git.init().setFilesApi(files).call();
+    expect(await without.repository.commitGraph?.get()).toBeDefined();
   });
 });

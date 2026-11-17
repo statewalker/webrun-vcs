@@ -23,8 +23,14 @@ import {
   encodeCommitEntries,
   entriesToCommit,
 } from "./commit-format.js";
-import { getMergeBases, isAncestorOf, type ReachCommit } from "./commit-reach.js";
-import type { AncestryOptions, Commit, CommitHeader, Commits } from "./commits.js";
+import { getMergeBases, isAncestorOf, type ReachSource } from "./commit-reach.js";
+import type {
+  AncestryOptions,
+  Commit,
+  CommitHeader,
+  CommitHeaderReader,
+  Commits,
+} from "./commits.js";
 
 /** Options of `createCommits`. */
 export interface CommitsOptions {
@@ -106,7 +112,18 @@ class GitCommitStore implements Commits {
     options: { checkExists?: boolean } = {},
   ): Promise<CommitHeader | undefined> {
     const g = this.graph();
-    const graph = g instanceof Promise ? await g : g;
+    return this.headerIn(g instanceof Promise ? await g : g, id, options);
+  }
+
+  /**
+   * The header from `graph` when it has the commit, else from the object store (generation
+   * Infinity): never from another graph the provider loaded since.
+   */
+  private async headerIn(
+    graph: CommitGraph | undefined,
+    id: ObjectId,
+    options: { checkExists?: boolean } = {},
+  ): Promise<CommitHeader | undefined> {
     if (graph) {
       const header = this.fromGraph(graph, id);
       if (header) {
@@ -121,6 +138,21 @@ class GitCommitStore implements Commits {
       parents: commit.parents,
       commitTime: commit.committer.timestamp,
       generation: Number.POSITIVE_INFINITY,
+    };
+  }
+
+  /**
+   * A header reader bound to the graph loaded now: every read of it uses that one graph (or
+   * none), so a walk does not mix generations of a graph and the one written while it runs.
+   */
+  async headerReader(): Promise<CommitHeaderReader> {
+    const g = this.graph();
+    const graph = g instanceof Promise ? await g : g;
+    return {
+      getHeader: (id, options) => this.headerIn(graph, id, options),
+      get correctedDates() {
+        return (graph?.generationsTrusted && graph.correctedDates) ?? false;
+      },
     };
   }
 
@@ -142,46 +174,57 @@ class GitCommitStore implements Commits {
   }
 
   /**
-   * The header as the reachability walks read it: without a promise for a commit the loaded
-   * graph has (no tree id decoded), else from the commit. Generations come from the graph only
-   * while it trusts them (`CommitGraph.generationsTrusted`, checked before the first one is
-   * used), else they are Infinity: the walks then neither cut nor reorder.
+   * The header as a reachability walk reads it, over the one graph the walk captured: without
+   * a promise for a commit that graph has (no tree id decoded), else from the object store
+   * (generation Infinity), never through the provider, which may hold a newer graph by then.
+   * Generations come from the graph only while it trusts them (`CommitGraph.generationsTrusted`,
+   * checked before the first one is used), else they are Infinity: the walks then neither cut
+   * nor reorder.
    */
-  private readonly reach = (
-    id: ObjectId,
-  ): ReachCommit | undefined | Promise<ReachCommit | undefined> => {
-    const graph = this.commitGraph?.current();
-    if (graph) {
-      const pos = graph.position(id);
-      if (pos >= 0) {
-        try {
-          return {
-            parents: graph.parentsAt(pos),
-            date: graph.commitTimeAt(pos),
-            generation: graph.walkGenerationAt(pos),
-          };
-        } catch (e) {
-          if (!(e instanceof CommitGraphCorruptError)) throw e;
-          graph.distrustGenerations();
+  private reachIn(graph: CommitGraph | undefined): ReachSource {
+    return (id) => {
+      if (graph) {
+        const pos = graph.position(id);
+        if (pos >= 0) {
+          try {
+            return {
+              parents: graph.parentsAt(pos),
+              date: graph.commitTimeAt(pos),
+              generation: graph.walkGenerationAt(pos),
+            };
+          } catch (e) {
+            if (!(e instanceof CommitGraphCorruptError)) throw e;
+            graph.distrustGenerations();
+          }
         }
       }
-    }
-    return this.getHeader(id).then((h) =>
-      h ? { parents: h.parents, date: h.commitTime, generation: h.generation } : undefined,
-    );
-  };
+      return this.load(id).then((c) =>
+        c
+          ? {
+              parents: c.parents,
+              date: c.committer.timestamp,
+              generation: Number.POSITIVE_INFINITY,
+            }
+          : undefined,
+      );
+    };
+  }
 
   /**
-   * Runs a reachability walk; when the graph stopped trusting its generations during it (a
-   * corrupt record met on the way), runs it again without them, so no cutoff taken on
+   * Runs a reachability walk over one graph, captured once (a graph written and loaded while
+   * the walk runs is not mixed in); when the graph stopped trusting its generations during it
+   * (a corrupt record met on the way), runs it again without them, so no cutoff taken on
    * generations read before is kept.
    */
-  private async withGraph<T>(walk: (graph: CommitGraph | undefined) => Promise<T>): Promise<T> {
+  private async withGraph<T>(
+    walk: (reach: ReachSource, graph: CommitGraph | undefined) => Promise<T>,
+  ): Promise<T> {
     const g = this.graph();
     const graph = g instanceof Promise ? await g : g;
     const trusted = graph?.generationsTrusted ?? false;
-    const result = await walk(graph);
-    if (graph && trusted && !graph.generationsTrusted) return walk(graph);
+    const reach = this.reachIn(graph);
+    const result = await walk(reach, graph);
+    if (graph && trusted && !graph.generationsTrusted) return walk(reach, graph);
     return result;
   }
 
@@ -318,8 +361,8 @@ class GitCommitStore implements Commits {
    * has corrected commit dates the walk is ordered by generation, as git orders it.
    */
   async findMergeBase(commitA: ObjectId, commitB: ObjectId): Promise<ObjectId[]> {
-    return this.withGraph((graph) =>
-      getMergeBases(this.reach, commitA, [commitB], {
+    return this.withGraph((reach, graph) =>
+      getMergeBases(reach, commitA, [commitB], {
         correctedDates: (graph?.generationsTrusted && graph.correctedDates) ?? false,
       }),
     );
@@ -353,7 +396,7 @@ class GitCommitStore implements Commits {
    */
   async isAncestor(ancestorId: ObjectId, descendantId: ObjectId): Promise<boolean> {
     // git's repo_in_merge_bases: the generations of commit-graph commits cut the walk short
-    return this.withGraph(() => isAncestorOf(this.reach, ancestorId, descendantId));
+    return this.withGraph((reach) => isAncestorOf(reach, ancestorId, descendantId));
   }
 }
 

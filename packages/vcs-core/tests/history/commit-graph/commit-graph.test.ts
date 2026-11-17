@@ -285,6 +285,36 @@ describe("split chains", () => {
       "error: one or more commit-graph chain files could not be loaded",
     ]);
   });
+
+  it("expires the layers merged away without an expire time, however slow the clock ticks", async () => {
+    const r = await repo();
+    let tip = await r.commit([], 1);
+    const write = async (split: true | "no-merge" | "replace", now?: () => number) =>
+      writeCommitGraphFile({
+        files: r.files,
+        objectsDir: OBJECTS,
+        objects: r.objects,
+        commits: [tip],
+        existing: await readCommitGraph(r.files, OBJECTS),
+        split,
+        now,
+      });
+    await write(true);
+    tip = await r.commit([tip], 2);
+    const two = await write("no-merge");
+    expect(two.hashes).toHaveLength(2);
+    // every clock read lands in a later second (git reads time(NULL) once for the expiry,
+    // after mark_commit_graphs set the merged-away layers' mtime)
+    let t = Date.now() + 60_000;
+    const replaced = await write("replace", () => {
+      t += 1500;
+      return t;
+    });
+    expect(replaced.expired).toHaveLength(2);
+    const names: string[] = [];
+    for await (const e of r.files.list(`${OBJECTS}/info/commit-graphs`)) names.push(e.name);
+    expect(names.sort()).toEqual(["commit-graph-chain", `graph-${replaced.hashes[0]}.graph`]);
+  });
 });
 
 /** A commit read from the object store, as verify compares it. */

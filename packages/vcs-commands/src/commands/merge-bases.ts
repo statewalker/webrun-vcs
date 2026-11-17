@@ -16,7 +16,7 @@
  * above the parents') gives every commit generation Infinity, as git reads a zero generation.
  */
 
-import type { Commits, ObjectId } from "@statewalker/vcs-core";
+import type { CommitHeaderReader, Commits, ObjectId } from "@statewalker/vcs-core";
 
 import type { CheckedEntry } from "./worktree-overwrite-checks.js";
 
@@ -53,27 +53,32 @@ export interface MergeBaseSource {
 
 /**
  * A source over a commit store: headers from the commit-graph where it has the commit (no
- * commit is read), the queue ordered as git orders it with that graph.
+ * commit is read), the queue ordered as git orders it with that graph. The source reads one
+ * graph for its whole life (the one loaded at its first read): a graph written while a merge
+ * base is computed does not mix its generations with the old one's.
  */
 export function commitsBaseSource(
   commits: Commits,
   tree: (id: ObjectId) => Promise<Map<string, CheckedEntry>>,
 ): MergeBaseSource {
+  let reader: Promise<CommitHeaderReader | undefined> | undefined;
+  const pinned = () => {
+    reader ??= commits.headerReader?.().catch(() => undefined) ?? Promise.resolve(undefined);
+    return reader;
+  };
   return {
     load: async (id) => {
-      if (commits.getHeader) {
-        const h = await commits.getHeader(id).catch(() => undefined);
+      const r = await pinned();
+      if (r) {
+        const h = await r.getHeader(id).catch(() => undefined);
         return h ? { parents: h.parents, date: h.commitTime, generation: h.generation } : undefined;
       }
       const commit = await commits.load(id).catch(() => undefined);
       return commit ? { parents: commit.parents, date: commit.committer.timestamp } : undefined;
     },
     tree,
-    generationOrder: async () => {
-      const graph = await commits.commitGraph?.get().catch(() => undefined);
-      // generations the graph does not trust are Infinity: the queue is then by date
-      return (graph?.generationsTrusted && graph.correctedDates) ?? false;
-    },
+    // generations the graph does not trust are Infinity: the queue is then by date
+    generationOrder: async () => (await pinned())?.correctedDates ?? false,
   };
 }
 

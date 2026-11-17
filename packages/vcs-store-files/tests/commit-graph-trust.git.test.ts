@@ -21,7 +21,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCommitGraphProvider } from "@statewalker/vcs-core";
+import {
+  createCommitGraphProvider,
+  createCommits,
+  loadRepositoryCommitGraph,
+} from "@statewalker/vcs-core";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
@@ -340,6 +344,57 @@ describe("a stale graph", () => {
     expect((await history.commits.getHeader?.(ids[1] as string, { checkExists: true }))?.tree).toBe(
       git(dir, ["rev-parse", `${ids[1]}^{tree}`]).trim(),
     );
+  });
+});
+
+describe("a graph written and loaded while a walk runs", () => {
+  /**
+   * Twenty linear commits, a graph over c0..c9 loaded; a commit store whose object reads
+   * (commits outside that graph) write a graph of all twenty with native git and load it after
+   * `swapAfter` reads, while the walk is on its way.
+   */
+  async function swappingStore(swapAfter: number) {
+    const { dir, ids } = dagRepo(linear(Array.from({ length: 20 }, (_, i) => 1000 * (i + 1))));
+    git(dir, ["commit-graph", "write", "--stdin-commits"], `${ids[9]}\n`);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const { objects } = await open(dir);
+    const provider = createCommitGraphProvider(() =>
+      loadRepositoryCommitGraph({ files, gitDir: ".git" }),
+    );
+    expect((await provider.get())?.size).toBe(10);
+    let reads = 0;
+    // `getNow` left out so every read goes through `get`, where the graph is swapped
+    const hooked = new Proxy(objects, {
+      get(target, prop, receiver) {
+        if (prop === "getNow") return undefined;
+        if (prop === "get") {
+          return async (id: string) => {
+            if (++reads === swapAfter) {
+              git(dir, ["commit-graph", "write", "--reachable"]);
+              provider.invalidate();
+              expect((await provider.get())?.size).toBe(20);
+            }
+            return target.get(id);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as typeof objects;
+    return { ids, commits: createCommits(hooked, { commitGraph: provider }) };
+  }
+
+  it("isAncestor keeps the graph it started with", async () => {
+    const { ids, commits } = await swappingStore(1);
+    expect(await commits.isAncestor(ids[14] as string, ids[19] as string)).toBe(true);
+  });
+
+  it("findMergeBase keeps the graph it started with", async () => {
+    const { ids, commits } = await swappingStore(1);
+    expect(await commits.findMergeBase(ids[14] as string, ids[19] as string)).toEqual([ids[14]]);
+    const again = await swappingStore(2);
+    const [c12, c19] = [again.ids[12] as string, again.ids[19] as string];
+    expect(await again.commits.findMergeBase(c19, c12)).toEqual([c12]);
   });
 });
 

@@ -16,6 +16,7 @@ import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils";
 import {
   createMemoryCheckout,
+  type GitHostEnvironment,
   type Staging,
   type WorkingCopy,
   type Worktree,
@@ -70,6 +71,7 @@ export class InitCommand {
   private stagingStore?: Staging;
   private worktreeEnabled = false;
   private worktreeStore?: Worktree;
+  private environment?: GitHostEnvironment;
   private callable = true;
 
   /**
@@ -202,6 +204,21 @@ export class InitCommand {
   }
 
   /**
+   * Set the user's environment (`createNodeGitHostEnvironment` on Node): the repository then
+   * reads the system and global config files too, as git does, for its commit-graph settings
+   * (`core.commitGraph`, `commitGraph.*`, `gc.writeCommitGraph`), and the commands run on the
+   * result for identities and global excludes. Without it only the repository's config is read.
+   *
+   * @param environment The host's environment
+   * @returns this for method chaining
+   */
+  setEnvironment(environment: GitHostEnvironment): this {
+    this.checkCallable();
+    this.environment = environment;
+    return this;
+  }
+
+  /**
    * Set a custom worktree store.
    *
    * Alternative to setWorktree(true) when you need custom worktree configuration.
@@ -253,6 +270,7 @@ export class InitCommand {
           gitDir,
           create,
           defaultBranch: this.initialBranch,
+          ...(this.environment ? { environment: this.environment } : {}),
         });
       if (fresh && this.bare && dir !== ".") {
         // The directory layout writes `core.bare = true` only for a gitDir of "."; set it
@@ -306,6 +324,7 @@ export class InitCommand {
           blobs: history.blobs,
           trees: history.trees,
           gitDir,
+          ...(this.environment ? { environment: this.environment } : {}),
         });
     }
 
@@ -325,7 +344,9 @@ export class InitCommand {
       staging: staging as unknown as Staging,
       worktree: worktree as unknown as Worktree,
       stash: {} as never, // Stash not available for newly init'd repos
-      config: {} as never, // Config not set for newly init'd repos
+      // Config not set for newly init'd repos; the host's environment, when given, is read
+      // from it by the commands (identities, dates)
+      config: (this.environment ? { environment: this.environment } : {}) as never,
       checkout,
       async getHead() {
         const ref = await history.refs.resolve("HEAD");

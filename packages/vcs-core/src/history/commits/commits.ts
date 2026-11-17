@@ -61,6 +61,23 @@ export interface CommitHeader {
 }
 
 /**
+ * Headers read over one commit-graph (`Commits.headerReader`): commits that graph has come from
+ * it, others from the object store with generation Infinity.
+ */
+export interface CommitHeaderReader {
+  /** As `Commits.getHeader`, over the reader's graph. */
+  getHeader(
+    commitId: ObjectId,
+    options?: { checkExists?: boolean },
+  ): Promise<CommitHeader | undefined>;
+  /**
+   * Whether the generations are corrected commit dates the graph trusts (git orders its
+   * merge-base queue by them then)
+   */
+  readonly correctedDates: boolean;
+}
+
+/**
  * Commit ancestry traversal options
  */
 export interface AncestryOptions {
@@ -122,6 +139,13 @@ export interface Commits extends ObjectStorage<Commit> {
     commitId: ObjectId,
     options?: { checkExists?: boolean },
   ): Promise<CommitHeader | undefined>;
+
+  /**
+   * A reader of headers bound to the commit-graph loaded now (see {@link CommitHeaderReader}):
+   * a walk that reads many headers takes one, so all its reads see the same graph even when a
+   * new one is written and loaded while it runs.
+   */
+  headerReader?(): Promise<CommitHeaderReader>;
 
   /**
    * The commit-graph this store reads (stores over a git repository's files), if any.

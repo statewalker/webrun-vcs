@@ -219,10 +219,20 @@ export interface RepositoryFacade {
    * "not our ref" check, `ok_to_give_up` in negotiation, and shallow fetches
    * (`deepen`, `deepen-relative`, `deepen-since`, `deepen-not`, unshallow).
    *
+   * A facade may answer from a commit-graph without looking the commit up in the object store
+   * (git's default): a graph left over after the commit was pruned then still lists it. With
+   * `checkExists` the commit must also be in the object store (git's
+   * GIT_COMMIT_GRAPH_PARANOIA); receive-pack asks so where a missing commit changes the answer
+   * (the type of a new tip, the connectivity of what was pushed).
+   *
    * @param oid - Object ID
+   * @param options - `checkExists`: answer only for a commit in the object store
    * @returns The commit's graph data, or undefined
    */
-  getCommitInfo?(oid: string): Promise<CommitGraphInfo | undefined>;
+  getCommitInfo?(
+    oid: string,
+    options?: { checkExists?: boolean },
+  ): Promise<CommitGraphInfo | undefined>;
 
   /**
    * Checks if an object is reachable from other objects.

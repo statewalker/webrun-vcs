@@ -971,7 +971,7 @@ async function objectType(ctx: ProcessContext, oid: string): Promise<string | un
   const repository = pushView(ctx);
   if (repository.getObjectType) return repository.getObjectType(oid);
   if (repository.getCommitInfo) {
-    if (await repository.getCommitInfo(oid)) return "commit";
+    if (await repository.getCommitInfo(oid, { checkExists: true })) return "commit";
     return (await repository.has(oid)) ? "other" : undefined;
   }
   return (await repository.has(oid)) ? "unknown" : undefined;

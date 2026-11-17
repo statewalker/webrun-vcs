@@ -309,13 +309,17 @@ export function createMemoryHistoryWithOperations(
  * ```
  */
 export function createGitFilesHistory(config: GitFilesStorageBackendConfig): HistoryWithOperations {
-  const { blobs, trees, commits, tags, refs, objects, packs } = config;
+  const { blobs, trees, commits, tags, refs, objects, packs, commitGraph } = config;
 
   // The delta view of the installed packs (deltas are written by repack)
   const delta = new PackSetDeltaApi(packs);
 
   // Create base History for serialization API
-  const history = new HistoryImpl(blobs, trees, commits, tags, refs, { objects, packs });
+  const history = new HistoryImpl(blobs, trees, commits, tags, refs, {
+    objects,
+    packs,
+    commitGraph,
+  });
   const serialization = new DefaultSerializationApi({ history });
 
   // Git-files backend capabilities
@@ -343,7 +347,7 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
     async () => {
       // nothing to release: pack reads close when their streams end
     },
-    { objects, packs },
+    { objects, packs, commitGraph },
   );
 }
 
