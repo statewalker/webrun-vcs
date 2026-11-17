@@ -16,8 +16,10 @@
  * then the 20-byte tree id when valid; the subtrees follow, ordered by name length first and
  * then by bytes (`subtree_name_cmp`).
  */
+
 import { FileMode, type ObjectId, objectIdToBytes, type Trees } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 /** One directory of a cache-tree. */
 export interface CacheTree {
@@ -29,13 +31,10 @@ export interface CacheTree {
   subtrees: { name: string; tree: CacheTree }[];
 }
 
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-
 /** git's `subtree_name_cmp`: shorter names first, then bytes. */
 function compareSubtreeNames(a: string, b: string): number {
-  const x = enc.encode(a);
-  const y = enc.encode(b);
+  const x = encodeGitPath(a);
+  const y = encodeGitPath(b);
   if (x.length !== y.length) return x.length - y.length;
   for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i];
   return 0;
@@ -161,7 +160,7 @@ export function cacheTreeFullyValid(tree: CacheTree): boolean {
 export function encodeCacheTree(tree: CacheTree): Uint8Array {
   const parts: Uint8Array[] = [];
   const write = (name: string, node: CacheTree) => {
-    parts.push(enc.encode(`${name}\0${node.entryCount} ${node.subtrees.length}\n`));
+    parts.push(encodeGitPath(`${name}\0${node.entryCount} ${node.subtrees.length}\n`));
     if (node.entryCount >= 0 && node.id) parts.push(objectIdToBytes(node.id));
     for (const sub of node.subtrees) write(sub.name, sub.tree);
   };
@@ -184,8 +183,8 @@ export function parseCacheTree(data: Uint8Array): CacheTree {
     const nul = data.indexOf(0, at);
     const nl = nul < 0 ? -1 : data.indexOf(10, nul);
     if (nul < 0 || nl < 0) throw new Error("TREE extension: truncated node");
-    const name = dec.decode(data.subarray(at, nul));
-    const m = /^(-?\d+) (\d+)$/.exec(dec.decode(data.subarray(nul + 1, nl)));
+    const name = decodeGitPath(data.subarray(at, nul));
+    const m = /^(-?\d+) (\d+)$/.exec(decodeGitPath(data.subarray(nul + 1, nl)));
     if (!m) throw new Error("TREE extension: bad node header");
     at = nl + 1;
     const tree: CacheTree = { entryCount: Number(m[1]), subtrees: [] };

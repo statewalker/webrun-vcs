@@ -7,11 +7,13 @@
  * Where:
  * - mode is octal digits (no leading zeros except for trees which use 40000)
  * - SP is a space (0x20)
- * - name is UTF-8 encoded filename
+ * - name is the file name's bytes (UTF-8 as a rule, but any bytes: `decodeGitPath` keeps
+ *   the ones that are no valid UTF-8, `encodeGitPath` writes them back)
  * - NUL is null byte (0x00)
  * - sha1 is 20 raw bytes
  */
 
+import { decodeGitPath, encodeGitPath, hasEscapedBytes } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { collect, encodeString, toArray } from "@statewalker/vcs-utils/streams";
 import { FileMode } from "../../common/files/index.js";
@@ -38,8 +40,7 @@ function encodeMode(mode: number): Uint8Array {
  * Parse file mode from octal ASCII bytes
  */
 function parseMode(bytes: Uint8Array): number {
-  const decoder = new TextDecoder();
-  const str = decoder.decode(bytes);
+  const str = new TextDecoder().decode(bytes);
   return parseInt(str, 8);
 }
 
@@ -66,11 +67,10 @@ export function compareTreeEntries(
   a: Pick<TreeEntry, "name" | "mode">,
   b: Pick<TreeEntry, "name" | "mode">,
 ): number {
-  const encoder = new TextEncoder();
   return compareTreeEntryNames(
-    encoder.encode(a.name),
+    encodeGitPath(a.name),
     isTreeMode(a.mode),
-    encoder.encode(b.name),
+    encodeGitPath(b.name),
     isTreeMode(b.mode),
   );
 }
@@ -111,6 +111,11 @@ function validateEntryName(name: string): void {
   if (name.includes("\0")) {
     throw new Error("Tree entry name cannot contain null bytes");
   }
+  // only the strings `decodeGitPath` makes stand for bytes; any other lone surrogate would
+  // encode to the same bytes as another name (two entries of one name in a tree)
+  if (hasEscapedBytes(name) && decodeGitPath(encodeGitPath(name)) !== name) {
+    throw new Error("Tree entry name holds a lone surrogate that stands for no byte");
+  }
 }
 
 /**
@@ -126,11 +131,10 @@ export async function* encodeTreeEntries(
   entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>,
 ): AsyncGenerator<Uint8Array> {
   // Collect and sort entries (each name encoded once)
-  const encoder = new TextEncoder();
   const collected: { entry: TreeEntry; name: Uint8Array; tree: boolean }[] = [];
   for await (const entry of entries) {
     validateEntryName(entry.name);
-    collected.push({ entry, name: encoder.encode(entry.name), tree: isTreeMode(entry.mode) });
+    collected.push({ entry, name: encodeGitPath(entry.name), tree: isTreeMode(entry.mode) });
   }
   collected.sort((a, b) => compareTreeEntryNames(a.name, a.tree, b.name, b.tree));
 
@@ -168,11 +172,10 @@ export async function computeTreeSize(
   entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>,
 ): Promise<number> {
   let size = 0;
-  const encoder = new TextEncoder();
 
   for await (const entry of entries) {
     const mode = encodeMode(entry.mode);
-    const name = encoder.encode(entry.name);
+    const name = encodeGitPath(entry.name);
     size += mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH;
   }
 
@@ -207,8 +210,6 @@ export async function* decodeTreeEntries(
   yield* decodeTreeBytes(buffer);
 }
 
-const nameDecoder = new TextDecoder();
-
 /**
  * Decode a whole tree's bytes (without header) at once.
  *
@@ -224,7 +225,7 @@ export function decodeTreeBytes(buffer: Uint8Array): TreeEntry[] {
     const nullPos = buffer.indexOf(NULL, spacePos + 1);
     if (nullPos < 0 || nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) break;
     const mode = parseModeAt(buffer, offset, spacePos);
-    const name = nameDecoder.decode(buffer.subarray(spacePos + 1, nullPos));
+    const name = decodeGitPath(buffer.subarray(spacePos + 1, nullPos));
     // A decoded tree may come from a remote. Its names become worktree paths, and
     // the FilesApi resolves `..` (webrun-files 0.12), so refuse what git fsck refuses.
     validateEntryName(name);
@@ -288,7 +289,6 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
   const sorted = [...entries].sort(compareTreeEntries);
 
   // Calculate total size
-  const encoder = new TextEncoder();
   let totalSize = 0;
   const encodedEntries: {
     mode: Uint8Array;
@@ -298,7 +298,7 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
 
   for (const entry of sorted) {
     const mode = encodeMode(entry.mode);
-    const name = encoder.encode(entry.name);
+    const name = encodeGitPath(entry.name);
     const id = objectIdToBytes(entry.id);
 
     encodedEntries.push({ mode, name, id });
@@ -337,7 +337,6 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
  */
 export function* parseTree(data: Uint8Array): Generator<TreeEntry> {
   let offset = 0;
-  const decoder = new TextDecoder();
 
   while (offset < data.length) {
     // Find space after mode
@@ -363,7 +362,7 @@ export function* parseTree(data: Uint8Array): Generator<TreeEntry> {
       throw new Error("Invalid tree format: no null after name");
     }
 
-    const name = decoder.decode(data.subarray(offset, nullPos));
+    const name = decodeGitPath(data.subarray(offset, nullPos));
     offset = nullPos + 1;
 
     // Read object ID

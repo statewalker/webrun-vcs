@@ -14,6 +14,7 @@ import { type Blobs, EMPTY_BLOB_ID, type ObjectId } from "@statewalker/vcs-core"
 import { type ConflictStyle, mergeLines } from "@statewalker/vcs-utils";
 
 import type { CommandCommits, CommandTrees } from "../git-command.js";
+import { isBinaryContent } from "../rename/index.js";
 import { MergeBaseGraph } from "./merge-bases.js";
 import { flatTree } from "./merge-support.js";
 import { type OrtConflict, readBlob } from "./ort-merge.js";
@@ -312,19 +313,44 @@ async function mergeOneFile(
       return leave();
     }
     const nO = tempName();
-    const merged = mergeLines(
-      o ? await readBlob(ctx.blobs, o.objectId) : new Uint8Array(0),
-      await readBlob(ctx.blobs, a.objectId),
-      await readBlob(ctx.blobs, b.objectId),
-      {
-        oursLabel: n1,
-        baseLabel: nO,
-        theirsLabel: n2,
-        style: ctx.style,
-        algorithm: "myers",
-        level: "zealous-alnum",
-      },
-    );
+    const contents = {
+      ours: await readBlob(ctx.blobs, a.objectId),
+      base: o ? await readBlob(ctx.blobs, o.objectId) : new Uint8Array(0),
+      theirs: await readBlob(ctx.blobs, b.objectId),
+    };
+    // `git merge-file` reads its three files in order and stops at the first binary one
+    // ("Cannot merge binary files: <its temporary name>"), leaving ours in the worktree
+    const binary = (
+      [
+        [contents.ours, n1],
+        [contents.base, nO],
+        [contents.theirs, n2],
+      ] as const
+    ).find(([content]) => isBinaryContent(content));
+    if (binary) {
+      errors.push(`error: Cannot merge binary files: ${binary[1]}`);
+      let msg = "content conflict";
+      if (m2 !== m3) msg = `${msg}, permissions conflict: ${m1}->${m2},${m3}`;
+      errors.push(`ERROR: ${msg} in ${path}`);
+      conflicts.push({
+        stagePath: path,
+        mode: a.mode,
+        ...(o ? { base: o } : {}),
+        ours: a,
+        theirs: b,
+        tree: a,
+      });
+      worktree.set(path, a);
+      return false;
+    }
+    const merged = mergeLines(contents.base, contents.ours, contents.theirs, {
+      oursLabel: n1,
+      baseLabel: nO,
+      theirsLabel: n2,
+      style: ctx.style,
+      algorithm: "myers",
+      level: "zealous-alnum",
+    });
     const objectId = await ctx.blobs.store([merged.content]);
     // the worktree file: ours (its mode), holding the merge's result
     const result = { objectId, mode: a.mode };

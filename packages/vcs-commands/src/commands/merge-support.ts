@@ -15,6 +15,7 @@ import {
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   type Checkout,
@@ -516,12 +517,11 @@ export async function rewriteIndex(
   for (const entry of await indexEntryList(staging)) {
     if (!changes.has(entry.path)) kept.push(entry);
   }
-  const encoder = new TextEncoder();
   const keys = new Map<string, Uint8Array>();
   const key = (path: string) => {
     let k = keys.get(path);
     if (!k) {
-      k = encoder.encode(path);
+      k = encodeGitPath(path);
       keys.set(path, k);
     }
     return k;

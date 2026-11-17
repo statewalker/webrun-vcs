@@ -13,6 +13,7 @@
  */
 
 import { ByteSink } from "@statewalker/vcs-utils";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { BlameEntry, BlameResult } from "../commands/blame-command.js";
 import { displayWidth } from "./diff-output.js";
 import { quotePath } from "./quote-path.js";
@@ -54,8 +55,6 @@ export interface BlameFormatOptions {
    */
   alwaysWidenAbbrev?: boolean;
 }
-
-const encoder = new TextEncoder();
 
 /** The commit's subject as `find_commit_subject` finds it: its first non-blank line */
 function subjectOf(message: string, id: string): string {
@@ -178,7 +177,7 @@ export function formatBlame(result: BlameResult, options: BlameFormatOptions = {
     const marks = e.boundary && !options.blankBoundary ? 1 : 0;
     if (maxMarks < marks) maxMarks = marks;
     if (e.sourcePath !== result.path) showName = true;
-    const len = encoder.encode(e.sourcePath).length;
+    const len = encodeGitPath(e.sourcePath).length;
     if (longestFile < len) longestFile = len;
     if (!seen.has(e.commitId)) {
       seen.add(e.commitId);
@@ -215,7 +214,7 @@ export function formatBlame(result: BlameResult, options: BlameFormatOptions = {
       }
       line += hex.slice(0, Math.min(length, 40));
       if (showName) {
-        const pad = Math.max(0, longestFile - encoder.encode(e.sourcePath).length);
+        const pad = Math.max(0, longestFile - encodeGitPath(e.sourcePath).length);
         line += ` ${e.sourcePath}${" ".repeat(pad)}`;
       }
       if (options.showNumber) {

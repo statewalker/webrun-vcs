@@ -6,6 +6,7 @@
  * add, modify, delete of individual tree entries.
  */
 
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { TreeEntry } from "../../history/trees/tree-entry.js";
 import { compareTreeEntries } from "../../history/trees/tree-format.js";
 import type { StructuralTreeDelta, TreeDeltaChange } from "./tree-delta-api.js";
@@ -120,7 +121,7 @@ export function applyStructuralTreeDelta(
  *   For each change:
  *     [1 byte]  change type (0=add, 1=modify, 2=delete)
  *     [2 bytes] name length (big-endian uint16)
- *     [N bytes] name (UTF-8)
+ *     [N bytes] name (its bytes, `encodeGitPath`)
  *     If add or modify:
  *       [4 bytes] mode (big-endian uint32)
  *       [2 bytes] objectId length (big-endian uint16)
@@ -146,7 +147,7 @@ export function serializeStructuralDelta(delta: StructuralTreeDelta): Uint8Array
     const typeMap = { add: 0, modify: 1, delete: 2 } as const;
     parts.push(new Uint8Array([typeMap[change.type]]));
 
-    const nameBytes = encoder.encode(change.name);
+    const nameBytes = encodeGitPath(change.name);
     const nameHeader = new Uint8Array(2);
     new DataView(nameHeader.buffer).setUint16(0, nameBytes.length, false);
     parts.push(nameHeader, nameBytes);
@@ -205,7 +206,7 @@ export function parseStructuralDelta(data: Uint8Array): StructuralTreeDelta {
 
     const nameLen = view.getUint16(pos, false);
     pos += 2;
-    const name = decoder.decode(data.subarray(pos, pos + nameLen));
+    const name = decodeGitPath(data.subarray(pos, pos + nameLen));
     pos += nameLen;
 
     if (type === "add" || type === "modify") {

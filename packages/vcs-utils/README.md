@@ -293,6 +293,20 @@ const text = await readText(files, "/docs/readme.txt");
 
 For a disk-backed `FilesApi` in Node.js, use `createNodeFilesApi()` from `@statewalker/vcs-utils-node/files`.
 
+### Paths that are not UTF-8
+
+```typescript
+import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+
+const name = decodeGitPath(new Uint8Array([0x63, 0x61, 0x66, 0xe9])); // "caf\udce9"
+encodeGitPath(name);                    // the four bytes again
+["caf\udce9", "café"].sort(compareGitPaths); // ["café", "caf\udce9"]: git's byte order
+```
+
+Git paths are bytes, and a tree or index made elsewhere can name a file `caf\xe9.txt` (latin-1). Paths are strings in this code, so trees, the index and diff output read and write them through this pair: valid UTF-8 decodes as usual, and each byte that is not part of a valid UTF-8 sequence becomes a lone surrogate U+DC80..U+DCFF (Python's `surrogateescape`). A UTF-8 path is the same string as before; a name that is not keeps its bytes when written back, so tree and index ids do not change, and it is printed as git prints it (`"caf\351.txt"` with `core.quotePath`). `compareGitPaths` sorts as git does (by bytes) without encoding paths that differ in plain characters.
+
+On a host whose file names are bytes, the Node `FilesApi` (`@statewalker/vcs-utils-node/files`) writes and lists such a name as its original bytes. A host whose names are Unicode text cannot hold it: the browser file system APIs (OPFS, File System Access) take well-formed strings and store U+FFFD for each escaped byte, and the macOS and Windows file systems refuse or rewrite names that are not valid Unicode (Node then reports the error of the write). Trees, the index and commits keep the bytes there too; only the worktree file has another name.
+
 ### RPC over a MessagePort
 
 ```typescript

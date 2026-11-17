@@ -19,6 +19,7 @@
  * @module
  */
 
+import { encodeGitPath } from "../../encoding/index.js";
 import { ByteLines, type LineSource } from "./byte-lines.js";
 import {
   diffScript,
@@ -504,8 +505,9 @@ export class ByteSink {
     this.size += bytes.length;
   }
 
+  /** Text as UTF-8; a path's escaped bytes (`decodeGitPath`) as the bytes they stand for. */
   text(s: string): void {
-    this.push(encoder.encode(s));
+    this.push(encodeGitPath(s));
   }
 
   get length(): number {

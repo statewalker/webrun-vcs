@@ -13,7 +13,7 @@
  * @module
  */
 
-const encoder = new TextEncoder();
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 /** `cq_lookup` of quote.c: the escape letter, 1 for an octal escape, -1 for none */
 function lookup(ch: number): number | string {
@@ -57,7 +57,7 @@ export function quoteCStyleBody(
   path: string | Uint8Array,
   quotePathFully = true,
 ): string | undefined {
-  const bytes = typeof path === "string" ? encoder.encode(path) : path;
+  const bytes = typeof path === "string" ? encodeGitPath(path) : path;
   let needs = false;
   for (const b of bytes) {
     if (mustQuote(b, quotePathFully)) {
@@ -70,7 +70,7 @@ export function quoteCStyleBody(
   let run: number[] = [];
   const flush = () => {
     if (run.length > 0) {
-      out += new TextDecoder().decode(new Uint8Array(run));
+      out += decodeGitPath(new Uint8Array(run));
       run = [];
     }
   };

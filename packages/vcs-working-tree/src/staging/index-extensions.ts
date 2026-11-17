@@ -27,8 +27,10 @@
  * `keepExisting`) clears them, which covers our reset. Our commit does not
  * rewrite the index, so it leaves them until the next read-tree or reset.
  */
+
 import { objectIdToBytes } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { IndexExtension } from "./index-format.js";
 import type { StagingEntry } from "./types.js";
 
@@ -69,10 +71,9 @@ export function assertWritableIndexExtensions(extensions: readonly IndexExtensio
  */
 export function indexEntriesDigest(entries: readonly StagingEntry[]): string {
   const hasher = createSha1();
-  const enc = new TextEncoder();
   for (const e of entries) {
     hasher.update(
-      enc.encode(`${e.path}\0${e.stage} ${e.mode} ${e.objectId} ${e.intentToAdd ? 1 : 0}\n`),
+      encodeGitPath(`${e.path}\0${e.stage} ${e.mode} ${e.objectId} ${e.intentToAdd ? 1 : 0}\n`),
     );
   }
   return bytesToHex(hasher.digest());
@@ -126,13 +127,12 @@ export interface ResolveUndoRecord {
  * modes as NUL-terminated ASCII, then a 20-byte id for each nonzero mode.
  */
 export function parseResolveUndo(data: Uint8Array): ResolveUndoRecord[] {
-  const dec = new TextDecoder();
   const records: ResolveUndoRecord[] = [];
   let at = 0;
   const field = (): string => {
     const nul = data.indexOf(0, at);
     if (nul < 0) throw new Error("REUC extension: truncated record");
-    const s = dec.decode(data.subarray(at, nul));
+    const s = decodeGitPath(data.subarray(at, nul));
     at = nul + 1;
     return s;
   };
@@ -157,10 +157,9 @@ export function parseResolveUndo(data: Uint8Array): ResolveUndoRecord[] {
 
 /** Encode resolve-undo records as a `REUC` payload. */
 export function encodeResolveUndo(records: readonly ResolveUndoRecord[]): Uint8Array {
-  const enc = new TextEncoder();
   const parts: Uint8Array[] = [];
   for (const r of records) {
-    parts.push(enc.encode(`${r.path}\0${r.modes.map((m) => m.toString(8)).join("\0")}\0`));
+    parts.push(encodeGitPath(`${r.path}\0${r.modes.map((m) => m.toString(8)).join("\0")}\0`));
     r.modes.forEach((m, i) => {
       const id = r.objectIds[i];
       if (m === 0) return;

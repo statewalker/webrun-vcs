@@ -6,6 +6,7 @@
  */
 
 import { EMPTY_BLOB_ID, type ObjectId } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   estimateSimilarity,
   GIT_DEFAULT_RENAME_SCORE,
@@ -198,11 +199,7 @@ const byPath = (a: RenameCandidate, b: RenameCandidate) => compareBytes(a.path, 
 
 /** git's path order (bytes, as `strcmp`). */
 function compareBytes(a: string, b: string): number {
-  const ea = new TextEncoder().encode(a);
-  const eb = new TextEncoder().encode(b);
-  const n = Math.min(ea.length, eb.length);
-  for (let i = 0; i < n; i++) if (ea[i] !== eb[i]) return ea[i] - eb[i];
-  return ea.length - eb.length;
+  return compareGitPaths(a, b);
 }
 
 /** git keeps this many best sources per destination (`NUM_CANDIDATE_PER_DST`). */

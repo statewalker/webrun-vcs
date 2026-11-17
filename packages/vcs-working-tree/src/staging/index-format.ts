@@ -1,5 +1,11 @@
 import { objectIdToBytes } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1, sha1 } from "@statewalker/vcs-utils";
+import {
+  compareGitPaths,
+  decodeGitPath,
+  encodeGitPath,
+  hasEscapedBytes,
+} from "@statewalker/vcs-utils/encoding";
 import type { MergeStageValue, StagingEntry } from "./types.js";
 
 /**
@@ -261,17 +267,21 @@ function parseEntry(
     offset += bytesRead;
 
     // Read null-terminated path suffix
-    const { value: suffix, nextOffset: pathEnd } = readNullTerminated(data, offset);
+    const { bytes: suffix, nextOffset: pathEnd } = readNullTerminated(data, offset);
     offset = pathEnd;
 
-    // Reconstruct path: prefix from previous + suffix
-    const prefixLen = previousPath.length - toRemove;
+    // Reconstruct path: prefix from previous + suffix (counted in bytes)
+    const previous = encodeGitPath(previousPath);
+    const prefixLen = previous.length - toRemove;
     if (prefixLen < 0) {
       throw new Error(
-        `Invalid path compression: removing ${toRemove} from ${previousPath.length} bytes`,
+        `Invalid path compression: removing ${toRemove} from ${previous.length} bytes`,
       );
     }
-    path = previousPath.substring(0, prefixLen) + suffix;
+    const whole = new Uint8Array(prefixLen + suffix.length);
+    whole.set(previous.subarray(0, prefixLen));
+    whole.set(suffix, prefixLen);
+    path = decodeGitPath(whole);
   } else {
     // Version 2/3: uncompressed path
     if (nameLength === NAME_MASK) {
@@ -282,7 +292,7 @@ function parseEntry(
     } else {
       // Short path
       const pathBytes = data.subarray(offset, offset + nameLength);
-      path = new TextDecoder().decode(pathBytes);
+      path = decodeGitPath(pathBytes);
       offset += nameLength;
 
       // Skip null terminator
@@ -519,16 +529,8 @@ export async function serializeIndexFile(
  * Compare paths using Git's canonical ordering.
  */
 function comparePaths(a: string, b: string): number {
-  const aLen = a.length;
-  const bLen = b.length;
-  const minLen = Math.min(aLen, bLen);
-
-  for (let i = 0; i < minLen; i++) {
-    const diff = a.charCodeAt(i) - b.charCodeAt(i);
-    if (diff !== 0) return diff;
-  }
-
-  return aLen - bLen;
+  // the order of the paths' bytes (an escaped byte of a non-UTF-8 name included)
+  return compareGitPaths(a, b);
 }
 
 /**
@@ -540,8 +542,6 @@ function comparePaths(a: string, b: string): number {
  * entries a command replaced are encoded afresh. Entries are never changed in place.
  */
 const encodedEntries = new WeakMap<StagingEntry, { version: IndexVersion; bytes: Uint8Array }>();
-
-const pathEncoder = new TextEncoder();
 
 /**
  * Lets `copy`, a new entry object built from `source` (an index builder copies the entries
@@ -583,7 +583,7 @@ function serializeEntry(
     const known = encodedEntries.get(entry);
     if (known && known.version === version) return known.bytes;
   }
-  const pathBytes = pathEncoder.encode(entry.path);
+  const pathBytes = encodeGitPath(entry.path);
   // only an entry with an extended flag carries the word ("reduce extended entries")
   const hasExtended = hasExtendedFlags(entry);
 
@@ -622,7 +622,7 @@ function serializeEntryV4(
 ): Uint8Array {
   // Find common prefix
   let commonLen = 0;
-  const prevBytes = new TextEncoder().encode(previousPath);
+  const prevBytes = encodeGitPath(previousPath);
   const minLen = Math.min(pathBytes.length, prevBytes.length);
 
   while (commonLen < minLen && pathBytes[commonLen] === prevBytes[commonLen]) {
@@ -781,16 +781,16 @@ function encodeVarint(value: number): Uint8Array {
 function readNullTerminated(
   data: Uint8Array,
   offset: number,
-): { value: string; nextOffset: number } {
+): { value: string; bytes: Uint8Array; nextOffset: number } {
   let end = offset;
   while (end < data.length && data[end] !== 0) {
     end++;
   }
 
   const bytes = data.subarray(offset, end);
-  const value = new TextDecoder().decode(bytes);
+  const value = decodeGitPath(bytes);
 
-  return { value, nextOffset: end + 1 }; // +1 to skip null
+  return { value, bytes, nextOffset: end + 1 }; // +1 to skip null
 }
 
 /**
@@ -811,6 +811,10 @@ function validatePath(path: string): void {
   }
   if (path.includes("\0")) {
     throw new Error(`Invalid path: ${path} (contains null)`);
+  }
+  // only the strings `decodeGitPath` makes stand for bytes (see `validateEntryName` in trees)
+  if (hasEscapedBytes(path) && decodeGitPath(encodeGitPath(path)) !== path) {
+    throw new Error(`Invalid path: ${JSON.stringify(path)} (lone surrogate)`);
   }
 
   // Check for .git in path components

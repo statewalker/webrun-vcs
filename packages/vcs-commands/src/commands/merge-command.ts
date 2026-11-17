@@ -839,6 +839,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
         status: MergeStatus.CONFLICTING,
         mergedCommits,
         conflicts: paths,
+        // what git-merge-one-file printed on stderr (`ERROR: content conflict in f`, ...)
+        ...(outcome.errors.length > 0 ? { message: outcome.errors.join("\n") } : {}),
         output,
       };
     }

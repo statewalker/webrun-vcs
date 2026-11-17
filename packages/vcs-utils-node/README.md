@@ -35,6 +35,7 @@ Paths are resolved against `rootDir`; a path whose `..` would leave it is refuse
 
 - `write` streams (webrun-files-node 0.11): the chunks go to a temporary file beside the target as they arrive, and the temporary is renamed over the target once complete. Storing a large object does not hold it in memory, and readers see the old file or the new one, never a partial one; a source that fails leaves the old file in place. `list` hides the temporaries.
 - `createExclusive` is `open(path, "wx")` (`O_CREAT | O_EXCL`), after creating the parent directories, so the operating system decides who takes a lock. Lock files (`<ref>.lock`, `packed-refs.lock`, `index.lock`, `gc.pid`) go through `atomicFilesOver(files, gitDir)` from `@statewalker/vcs-utils/files`, which uses it: a lock excludes every other process on the machine, a running `git` included, and every other `FilesApi` instance over the same directory. If another process removes the lock's (empty) directory between the `mkdir` and the `open`, `atomicFilesOver` retries, as git's `raceproof_create_file` does.
+- File names are bytes on Linux: a path holding `decodeGitPath` escapes (a git path that is not UTF-8, such as latin-1 `caf\xe9.txt`) goes to the operating system as its bytes (a `Buffer`), and `list` reads names as bytes, so such a name round-trips. A plain UTF-8 path goes as a string, as before.
 - `move` is a `rename(2)`, atomic on one filesystem, and a `FilesApi` rooted at `/` accepts absolute paths.
 
 ### Dependencies

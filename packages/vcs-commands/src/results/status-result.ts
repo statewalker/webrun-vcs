@@ -1,4 +1,5 @@
 import type { ObjectId } from "@statewalker/vcs-core";
+import { compareGitPaths, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { StageStateValue } from "@statewalker/vcs-working-tree";
 
 /**
@@ -167,13 +168,9 @@ export class StatusImpl implements Status {
   }
 }
 
-/** git's byte order of paths (UTF-8 code units, as `strcmp`). */
+/** git's byte order of paths (their bytes, as `strcmp`). */
 function comparePaths(a: string, b: string): number {
-  const ea = new TextEncoder().encode(a);
-  const eb = new TextEncoder().encode(b);
-  const n = Math.min(ea.length, eb.length);
-  for (let i = 0; i < n; i++) if (ea[i] !== eb[i]) return ea[i] - eb[i];
-  return ea.length - eb.length;
+  return compareGitPaths(a, b);
 }
 
 const ZERO_ID = "0".repeat(40);
@@ -199,7 +196,7 @@ const octal = (mode: number | undefined) => (mode ?? 0).toString(8).padStart(6, 
  * quotes a path with a space too (`QUOTE_PATH_QUOTE_SP`), v2 does not.
  */
 function quotePath(path: string, quoteSpace = false): string {
-  const bytes = new TextEncoder().encode(path);
+  const bytes = encodeGitPath(path);
   let needs = false;
   let out = "";
   for (const b of bytes) {

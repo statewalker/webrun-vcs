@@ -6,12 +6,12 @@
  * classes), and a backslash makes the next character literal.
  */
 
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+
 const MATCH = 0;
 const NOMATCH = 1;
 const ABORT_ALL = -1;
 const ABORT_TO_STARSTAR = -2;
-
-const encoder = new TextEncoder();
 
 const isGlobSpecial = (c: number) =>
   c === 0x2a /* * */ || c === 0x3f /* ? */ || c === 0x5b /* [ */ || c === 0x5c; /* \ */
@@ -61,8 +61,9 @@ export interface WildmatchOptions {
  * ```
  */
 export function wildmatch(pattern: string, text: string, options: WildmatchOptions = {}): boolean {
-  const p = encoder.encode(pattern);
-  const t = encoder.encode(text);
+  // a path is its bytes: a name that is no UTF-8 matches byte by byte, as in git
+  const p = encodeGitPath(pattern);
+  const t = encodeGitPath(text);
   return dowild(p, 0, t, 0, options.pathname === true, options.casefold === true) === MATCH;
 }
 

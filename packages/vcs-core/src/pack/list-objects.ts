@@ -17,6 +17,7 @@
  * Memory is a map of flags per visited id and the parsed parents of walked commits; objects are
  * read one at a time and never kept.
  */
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
@@ -397,7 +398,7 @@ function* treeEntries(
     const nul = data.indexOf(0, sp);
     if (sp < 0 || nul < 0 || nul + 21 > data.length) throw new Error("malformed tree");
     const mode = dec.decode(data.subarray(p, sp));
-    const name = dec.decode(data.subarray(sp + 1, nul));
+    const name = decodeGitPath(data.subarray(sp + 1, nul));
     const id = bytesToHex(data.subarray(nul + 1, nul + 21));
     p = nul + 21;
     const kind = mode === "40000" ? "tree" : mode === "160000" ? "gitlink" : "blob";
