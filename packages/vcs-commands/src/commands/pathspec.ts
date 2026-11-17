@@ -51,6 +51,12 @@ export function parsePathspec(paths: string[]): PathspecItem[] {
 }
 
 export function parsePathspecItem(elem: string): PathspecItem {
+  if (elem === "") {
+    // git's parse_pathspec
+    throw new Error(
+      "empty string is not a valid pathspec. please use . instead if you meant to match all paths",
+    );
+  }
   let exclude = false;
   let literal = false;
   let glob = false;

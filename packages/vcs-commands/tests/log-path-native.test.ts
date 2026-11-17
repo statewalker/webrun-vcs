@@ -365,4 +365,23 @@ describeGit("log -- <path> against native git", () => {
       dir = saved;
     }
   });
+
+  it("hides an empty root for `.` and `:/`, and refuses an empty pathspec, as git does", async () => {
+    const saved = dir;
+    dir = join(root, "empty-root");
+    try {
+      execFileSync("git", ["init", "-q", "-b", "main", dir], { env: env() });
+      git(["commit", "-q", "--allow-empty", "-m", "root"]);
+      writeFileSync(join(dir, "a"), "a\n");
+      git(["add", "a"]);
+      git(["commit", "-q", "-m", "a"]);
+      for (const path of [".", ":/", "*"]) {
+        expect([path, (await ours([path])).ids]).toEqual([path, native([path])]);
+      }
+      expect(native(["."])).toHaveLength(1);
+      await expect(ours([""])).rejects.toThrow("empty string is not a valid pathspec");
+    } finally {
+      dir = saved;
+    }
+  });
 });

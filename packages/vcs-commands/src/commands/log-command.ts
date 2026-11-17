@@ -4,6 +4,7 @@ import {
   bloomKey,
   type Commit,
   type CommitGraph,
+  EMPTY_TREE_ID,
   type GitObject,
   type ObjectId,
 } from "@statewalker/vcs-core";
@@ -918,7 +919,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     parts: string[],
     i: number,
   ): Promise<boolean> {
-    if (parts.length === 0) return a !== b;
+    // the whole tree (`.`, `:/`): a root commit compares with the empty tree, as in git
+    if (parts.length === 0) return (a ?? EMPTY_TREE_ID) !== (b ?? EMPTY_TREE_ID);
     const name = parts[i] as string;
     const ea = a ? await this.entryOf(a, name) : undefined;
     const eb = b ? await this.entryOf(b, name) : undefined;
