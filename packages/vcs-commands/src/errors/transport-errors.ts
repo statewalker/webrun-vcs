@@ -66,3 +66,18 @@ export class NonFastForwardError extends PushRejectedException {
     this.name = "NonFastForwardError";
   }
 }
+
+/**
+ * Error thrown when a fetch would write a branch a worktree has checked out (git's
+ * check_not_current_branch, without `--update-head-ok`): nothing is fetched. The message is
+ * git's: `fatal: refusing to fetch into branch '<ref>' checked out at '<path>'`.
+ */
+export class FetchIntoCheckedOutBranchError extends GitApiError {
+  constructor(
+    readonly refName: string,
+    readonly worktreePath: string,
+  ) {
+    super(`fatal: refusing to fetch into branch '${refName}' checked out at '${worktreePath}'`);
+    this.name = "FetchIntoCheckedOutBranchError";
+  }
+}

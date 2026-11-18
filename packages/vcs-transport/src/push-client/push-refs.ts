@@ -6,6 +6,8 @@
 
 import type { RemoteRef } from "../fetch-client/index.js";
 import { ZERO_OID } from "../protocol/index.js";
+import type { AbbrevLengths } from "../summary/index.js";
+import { pushStatusParts } from "./push-status.js";
 
 /** A refspec could not be resolved (git's push dies before it connects to send anything). */
 export class PushRefspecError extends Error {
@@ -40,6 +42,11 @@ export interface PushRefUpdate {
   remoteRef: string;
   /** The local ref pushed (full name); undefined for a delete or an object id */
   localRef?: string;
+  /**
+   * The source as git names it in its report when it is no local ref the refspec matched:
+   * `HEAD` (also for `@`), or the object name as written (`HEAD~1`, an id)
+   */
+  source?: string;
   /** The remote's value in its advertisement ({@link ZERO_OID}: absent): the command's old id */
   oldOid: string;
   /** The value pushed ({@link ZERO_OID}: a delete) */
@@ -81,6 +88,8 @@ export interface LocalRefState {
 export interface MatchedPushRef {
   remoteRef: string;
   localRef?: string;
+  /** The source as written when it is no local ref matched (`HEAD`, `HEAD~1`, an id) */
+  source?: string;
   newOid: string;
   oldOid: string;
   force: boolean;
@@ -210,6 +219,8 @@ export async function matchPushRefs(
     // what the source resolves to as a ref (git's resolve_ref_unsafe of its name): a ref name,
     // HEAD's branch, "HEAD" when detached; undefined for an object name
     let srcRef: string | undefined;
+    // the source as git's report names it (try_explicit_object_name's alloc_ref(name))
+    let source: string | undefined;
     if (!p.src) {
       newOid = ZERO_OID;
     } else {
@@ -224,6 +235,7 @@ export async function matchPushRefs(
         newOid = local.head.oid;
         localRef = local.head.target;
         srcRef = local.head.target ?? "HEAD";
+        source = "HEAD";
       } else {
         const oid =
           OID_PATTERN.test(p.src) && (await local.hasObject?.(p.src))
@@ -231,6 +243,7 @@ export async function matchPushRefs(
             : await local.resolveRevision?.(p.src);
         if (!oid) throw new PushRefspecError(`src refspec ${p.src} does not match any`);
         newOid = oid;
+        source = p.src;
       }
     }
     // the destination
@@ -261,7 +274,14 @@ export async function matchPushRefs(
       }
     }
     link(
-      { remoteRef, localRef, newOid, oldOid: remote.get(remoteRef) ?? ZERO_OID, force: p.force },
+      {
+        remoteRef,
+        localRef,
+        ...(source !== undefined ? { source } : {}),
+        newOid,
+        oldOid: remote.get(remoteRef) ?? ZERO_OID,
+        force: p.force,
+      },
       true,
     );
   }
@@ -384,6 +404,7 @@ export async function setPushStatus(
     const update: PushRefUpdate = {
       remoteRef: m.remoteRef,
       localRef: m.localRef,
+      ...(m.source !== undefined ? { source: m.source } : {}),
       oldOid: m.oldOid,
       newOid: m.newOid,
       force,
@@ -425,42 +446,18 @@ export async function setPushStatus(
   return updates;
 }
 
-/** git's status column for an update (`print_one_push_status`). */
-export function pushSummary(update: PushRefUpdate): string {
-  const abbrev = (oid: string) => oid.slice(0, 7);
-  switch (update.status) {
-    case "up-to-date":
-      return "[up to date]";
-    case "rejected-nonfastforward":
-      return "[rejected] (non-fast-forward)";
-    case "rejected-fetch-first":
-      return "[rejected] (fetch first)";
-    case "rejected-needs-force":
-      return "[rejected] (needs force)";
-    case "rejected-already-exists":
-      return "[rejected] (already exists)";
-    case "rejected-stale":
-      return "[rejected] (stale info)";
-    case "rejected-nodelete":
-      return "[rejected] (remote does not support deleting refs)";
-    case "atomic-push-failed":
-      return "[rejected] (atomic push failed)";
-    case "remote-rejected":
-      return `[remote rejected] (${update.message ?? "failed"})`;
-    case "remote-failure":
-      return "[remote failure] (remote failed to report status)";
-    case "ok":
-      if (update.newOid === ZERO_OID) return "[deleted]";
-      if (update.oldOid === ZERO_OID) {
-        if (update.remoteRef.startsWith("refs/tags/")) return "[new tag]";
-        if (update.remoteRef.startsWith("refs/heads/")) return "[new branch]";
-        return "[new reference]";
-      }
-      if (update.forced) {
-        return `+ ${abbrev(update.oldOid)}...${abbrev(update.newOid)} (forced update)`;
-      }
-      return `${abbrev(update.oldOid)}..${abbrev(update.newOid)}`;
+/**
+ * git's status column for an update (`print_one_push_status`), with its reason in
+ * parentheses (`[rejected] (fetch first)`) and a `+ ` before a forced update; ids abbreviated
+ * by `lengths` (git's find_unique_abbrev under `core.abbrev`), 7 digits without.
+ */
+export function pushSummary(update: PushRefUpdate, lengths?: AbbrevLengths): string {
+  const parts = pushStatusParts(update, lengths);
+  if (update.status === "ok" && parts.flag === "+") {
+    return `+ ${parts.summary} (${parts.message})`;
   }
+  if (update.status === "ok" || update.status === "up-to-date") return parts.summary;
+  return parts.message !== undefined ? `${parts.summary} (${parts.message})` : parts.summary;
 }
 
 /** Whether a status is a success (`ok`, `up-to-date`). */

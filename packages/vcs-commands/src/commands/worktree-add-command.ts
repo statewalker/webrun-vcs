@@ -390,7 +390,8 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     const refs = workingCopy.history.refs;
     const staging = workingCopy.checkout.staging;
     const headId = orphan ? undefined : (await refs.resolve("HEAD"))?.objectId;
-    const commit = headId ? await workingCopy.history.commits.load(headId) : undefined;
+    // read through replace refs, as git's reset reads HEAD (the repository's objects and refs/replace)
+    const commit = headId ? await this.commits.load(headId) : undefined;
     if (!commit || !headId) {
       // an unborn branch: the index is the empty tree
       await staging.clear();
@@ -402,7 +403,7 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
       {
         // the new worktree's history shares the repository's objects
         trees: this.trees,
-        blobs: workingCopy.history.blobs,
+        blobs: this.blobs,
         staging,
         worktree,
         symlinks: worktreeModeTrust(workingCopy, worktree).symlinks,

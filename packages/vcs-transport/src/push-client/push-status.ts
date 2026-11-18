@@ -1,0 +1,182 @@
+/**
+ * The report of a push as git prints it on stderr (transport.c `transport_print_push_status`):
+ * `To <url>`, then one line per ref, ` <flag> <summary> <from> -> <to> (<reason>)`, the
+ * summary column `transport_summary_width` wide.
+ *
+ * @example
+ * ```typescript
+ * const result = await push({ url, repository, refStore, refspecs: ["main"] });
+ * process.stderr.write(formatPushStatus(result, { dest: url }).map((l) => `${l}\n`).join(""));
+ * // To https://example.com/repo.git
+ * //    1a2b3c4..5d6e7f8  main -> main
+ * ```
+ */
+
+import { anonymizeUrl } from "../fetch-client/index.js";
+import { ZERO_OID } from "../protocol/index.js";
+import {
+  type AbbrevLengths,
+  abbreviate,
+  padSummary,
+  prettifyRefName,
+  transportSummaryWidth,
+} from "../summary/index.js";
+import type { PushRefUpdate } from "./push-refs.js";
+
+/** One ref's line, as git's `print_ref_status` takes it. */
+export interface PushStatusParts {
+  /** `=` up to date, ` ` fast-forward, `+` forced, `*` new, `-` deleted, `!` refused */
+  flag: string;
+  /** The status column: `[new branch]`, `1a2b3c4..5d6e7f8`, `[rejected]`, … */
+  summary: string;
+  /** The local side (`from -> to`); undefined where git prints the remote ref alone */
+  from?: string;
+  /** The reason in parentheses: `non-fast-forward`, `forced update`, the server's reason */
+  message?: string;
+}
+
+/**
+ * The flag, summary, local side and reason of an update, as git's `print_one_push_report` and
+ * `print_ok_ref_status` choose them; ids abbreviated by `lengths` (7 digits without).
+ */
+export function pushStatusParts(update: PushRefUpdate, lengths?: AbbrevLengths): PushStatusParts {
+  const deletion = update.newOid === ZERO_OID;
+  // the local side: the ref pushed, else the source as written (`HEAD`, `HEAD~1`, an id),
+  // a delete's "(delete)" (alloc_delete_ref)
+  const peer = update.source ?? update.localRef ?? (deletion ? "(delete)" : update.newOid);
+  const rejected = (message: string): PushStatusParts => ({
+    flag: "!",
+    summary: "[rejected]",
+    from: peer,
+    message,
+  });
+  switch (update.status) {
+    case "up-to-date":
+      return { flag: "=", summary: "[up to date]", from: peer };
+    case "rejected-nonfastforward":
+      return rejected("non-fast-forward");
+    case "rejected-fetch-first":
+      return rejected("fetch first");
+    case "rejected-needs-force":
+      return rejected("needs force");
+    case "rejected-already-exists":
+      return rejected("already exists");
+    case "rejected-stale":
+      return rejected("stale info");
+    case "atomic-push-failed":
+      return rejected("atomic push failed");
+    case "rejected-nodelete":
+      return { flag: "!", summary: "[rejected]", message: "remote does not support deleting refs" };
+    case "remote-rejected":
+      return {
+        flag: "!",
+        summary: "[remote rejected]",
+        ...(deletion ? {} : { from: peer }),
+        message: update.message ?? "failed",
+      };
+    case "remote-failure":
+      return {
+        flag: "!",
+        summary: "[remote failure]",
+        ...(deletion ? {} : { from: peer }),
+        message: "remote failed to report status",
+      };
+    case "ok": {
+      if (deletion) return { flag: "-", summary: "[deleted]" };
+      if (update.oldOid === ZERO_OID) {
+        const name = update.remoteRef;
+        const summary = name.startsWith("refs/tags/")
+          ? "[new tag]"
+          : name.startsWith("refs/heads/")
+            ? "[new branch]"
+            : "[new reference]";
+        return { flag: "*", summary, from: peer };
+      }
+      const range = (dots: string) =>
+        `${abbreviate(update.oldOid, lengths)}${dots}${abbreviate(update.newOid, lengths)}`;
+      if (update.forced) {
+        return { flag: "+", summary: range("..."), from: peer, message: "forced update" };
+      }
+      return { flag: " ", summary: range(".."), from: peer };
+    }
+  }
+}
+
+/**
+ * The ids `transport_summary_width` measures: each advertised ref's value and what it is
+ * pushed to ({@link ZERO_OID} when not pushed), then each new remote ref's absent old value
+ * and its new one.
+ */
+export function pushSummaryIds(
+  remoteRefs: readonly { name: string; oid?: string }[],
+  updates: readonly PushRefUpdate[],
+): string[] {
+  const byRef = new Map(updates.map((u) => [u.remoteRef, u]));
+  const ids: string[] = [];
+  const advertised = new Set<string>();
+  for (const r of remoteRefs) {
+    if (!r.oid || r.name.endsWith("^{}") || advertised.has(r.name)) continue;
+    advertised.add(r.name);
+    ids.push(r.oid, byRef.get(r.name)?.newOid ?? ZERO_OID);
+  }
+  for (const u of updates) if (!advertised.has(u.remoteRef)) ids.push(u.oldOid, u.newOid);
+  return ids;
+}
+
+/** Options of {@link formatPushStatus}. */
+export interface FormatPushStatusOptions {
+  /** The remote as given (`To <dest>`, its user and password left out) */
+  dest: string;
+  /** Also the refs already up to date (`git push -v`) */
+  verbose?: boolean;
+}
+
+/** What {@link formatPushStatus} reads of a push result. */
+export interface PushStatusSource {
+  /** The refs the remote advertised */
+  remoteRefs: readonly { name: string; oid?: string }[];
+  /** The updates, with their statuses */
+  updates: readonly PushRefUpdate[];
+  /** The abbreviated lengths of the ids (`PushClientResult.abbrevLengths`) */
+  abbrevLengths?: AbbrevLengths;
+  /** The summary column's width (`PushClientResult.summaryWidth`) */
+  summaryWidth?: number;
+}
+
+/**
+ * The lines git prints on stderr for a push (`transport_print_push_status`): `To <dest>` and
+ * the refs, those pushed first, then those refused, each group in the remote's order (the
+ * advertised refs, then the new ones); `Everything up-to-date` when nothing was pushed or
+ * refused. Without `verbose`, refs already up to date are left out.
+ */
+export function formatPushStatus(
+  result: PushStatusSource,
+  options: FormatPushStatusOptions,
+): string[] {
+  const lengths = result.abbrevLengths;
+  const width =
+    result.summaryWidth ??
+    transportSummaryWidth(pushSummaryIds(result.remoteRefs, result.updates), lengths);
+  const order = new Map<string, number>();
+  for (const r of result.remoteRefs) if (!order.has(r.name)) order.set(r.name, order.size);
+  const sorted = result.updates
+    .map((u, i) => ({ u, key: order.get(u.remoteRef) ?? order.size + i }))
+    .sort((a, b) => a.key - b.key)
+    .map((e) => e.u);
+  const lines: string[] = [];
+  const print = (u: PushRefUpdate) => {
+    if (lines.length === 0) lines.push(`To ${anonymizeUrl(options.dest)}`);
+    const p = pushStatusParts(u, lengths);
+    const to = prettifyRefName(u.remoteRef);
+    let line = ` ${p.flag} ${padSummary(p.summary, width)} `;
+    line += p.from !== undefined ? `${prettifyRefName(p.from)} -> ${to}` : to;
+    if (p.message !== undefined) line += ` (${p.message})`;
+    lines.push(line);
+  };
+  if (options.verbose) for (const u of sorted) if (u.status === "up-to-date") print(u);
+  for (const u of sorted) if (u.status === "ok") print(u);
+  for (const u of sorted) if (u.status !== "ok" && u.status !== "up-to-date") print(u);
+  // push.c: nothing pushed and nothing refused
+  if (!result.updates.some((u) => u.status !== "up-to-date")) lines.push("Everything up-to-date");
+  return lines;
+}

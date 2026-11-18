@@ -39,6 +39,14 @@ export interface ListObjectsOptions {
    */
   shallow?: Iterable<ObjectId>;
   /**
+   * Commit grafts (`info/grafts`): a grafted commit's parents walked as well as the ones it
+   * records, as gc keeps both (`git repack --keep-true-parents` packs the real parents, `git
+   * prune` walks the grafted ones). A grafted parent is required as a recorded one is (git's
+   * repack dies on a missing one); a shallow commit's graft is ignored (the shallow file
+   * overrides it).
+   */
+  grafts?: ReadonlyMap<ObjectId, readonly ObjectId[]>;
+  /**
    * Called for each tree and blob below the boundary (the trees of the uninteresting commits
    * met, and tree haves), with its path: the receiver's objects, bases for a thin pack.
    */
@@ -107,7 +115,15 @@ export async function* listObjects(
   const set = (id: ObjectId, f: number) => flags.set(id, (flags.get(id) ?? 0) | f);
   const commits = new Map<ObjectId, CommitInfo>();
   const shallow = new Set(options.shallow ?? []);
-  const parentsOf = (id: ObjectId, c: CommitInfo) => (shallow.has(id) ? [] : c.parents);
+  const grafts = options.grafts;
+  const parentsOf = (id: ObjectId, c: CommitInfo): ObjectId[] => {
+    // a shallow commit has no parents, whatever its graft says (register_shallow)
+    if (shallow.has(id)) return [];
+    const grafted = grafts?.get(id);
+    if (!grafted) return c.parents;
+    const extra = grafted.filter((p) => !c.parents.includes(p));
+    return extra.length > 0 ? [...c.parents, ...extra] : c.parents;
+  };
 
   const read = async (id: ObjectId): Promise<{ type: ObjectTypeString; data: Uint8Array }> => {
     const o = await objects.get(id);

@@ -1452,4 +1452,47 @@ describeGit("fsck against native git", () => {
     g(dir, "config", "advice.graftFileDeprecated", "false");
     expect((await compare(dir, [])).stderr).not.toContain("hint:");
   });
+
+  it("grafts apply to the reachability walk: a grafted-away parent is dangling", async () => {
+    const dir = newRepo();
+    const one = commitFiles(dir, { a: "a\n" }, "one");
+    const two = commitFiles(dir, { b: "b\n" }, "two");
+    const three = commitFiles(dir, { c: "c\n" }, "three");
+    // three's parent is one: two (and its tree and blob) are reachable from nothing
+    writeFileSync(join(dir, ".git", "info", "grafts"), `${three} ${one}\n`);
+    const r = await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+    expect(r.stdout).toContain(`dangling commit ${two}`);
+    await compare(dir, ["--no-reflogs", "--unreachable"], (c) =>
+      c.setReflogs(false).setUnreachable(true),
+    );
+    await compare(dir, ["--no-reflogs", "--connectivity-only"], (c) =>
+      c.setReflogs(false).setConnectivityOnly(true),
+    );
+    g(dir, "repack", "-adq");
+    await compare(dir, ["--no-reflogs", "--unreachable"], (c) =>
+      c.setReflogs(false).setUnreachable(true),
+    );
+    await compare(dir, ["--no-reflogs", "--connectivity-only"], (c) =>
+      c.setReflogs(false).setConnectivityOnly(true),
+    );
+    // a root made by a graft, a bad line, a graft parent that is missing
+    const missing = "1".repeat(40);
+    writeFileSync(
+      join(dir, ".git", "info", "grafts"),
+      `# comment\n${two}\nnot a graft\n${three} ${missing}\n`,
+    );
+    await compare(dir, ["--no-reflogs", "--root"], (c) => c.setReflogs(false).setRoot(true));
+  });
+
+  it("replace refs do not change fsck's walk (fsck turns them off)", async () => {
+    const dir = newRepo();
+    const one = commitFiles(dir, { a: "a\n" }, "one");
+    commitFiles(dir, { b: "b\n" }, "two");
+    g(dir, "checkout", "-q", "-b", "side", one);
+    const side = commitFiles(dir, { s: "s\n" }, "side");
+    g(dir, "checkout", "-q", "main");
+    g(dir, "branch", "-q", "-D", "side");
+    g(dir, "replace", "HEAD", side);
+    await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+  });
 });

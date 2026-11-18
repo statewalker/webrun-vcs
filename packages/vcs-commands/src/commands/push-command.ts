@@ -1,8 +1,10 @@
+import { parseCoreAbbrev } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
   expandFromSource,
   type ForceWithLease,
+  formatPushStatus,
   mapRejectReason,
   matchSource,
   type PushCommandResult,
@@ -432,6 +434,7 @@ export class PushCommand extends TransportCommand<PushResult> {
         messages.push(message);
         this.progressMessageCallback?.(message);
       },
+      abbrev: parseCoreAbbrev(RemoteConfigStore.from(this._workingCopy).value("core.abbrev")) ?? -1,
     });
 
     // git updates the remote-tracking refs of what the server accepted, and of what it had
@@ -465,6 +468,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       bytesSent: result.bytesSent,
       objectCount: result.packObjects,
       messages,
+      display: formatPushStatus(result, { dest: remoteUrl }),
     };
   }
 

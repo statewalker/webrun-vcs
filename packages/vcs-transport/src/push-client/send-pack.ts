@@ -13,7 +13,9 @@ import {
   readSidebandPack,
 } from "../fetch-client/index.js";
 import { encodeFlush, encodePacketLine, TransportError, ZERO_OID } from "../protocol/index.js";
+import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import type { ReceivePackConnection } from "./connection.js";
+import { pushSummaryIds } from "./push-status.js";
 import { resolveRevision } from "./revision.js";
 
 const OID = /^[0-9a-f]{40}$/;
@@ -74,6 +76,12 @@ export interface PushClientOptions {
   quiet?: boolean;
   /** Progress and hook messages from the server (side-band channel 2) */
   onProgress?: (message: string) => void;
+  /**
+   * `core.abbrev` as `parseCoreAbbrev` of vcs-core reads it: the length the summaries'
+   * ids start from (-1, the default, for git's automatic length; 40 for full ids). Each is
+   * lengthened until unique among the local objects (`RepositoryFacade.abbrevLengths`).
+   */
+  abbrev?: number;
 }
 
 /** What a push did. */
@@ -94,6 +102,13 @@ export interface PushClientResult {
   packBytes: number;
   /** Bytes of the whole request (commands, options, pack) */
   bytesSent: number;
+  /**
+   * The abbreviated length of each id the summaries show (git's find_unique_abbrev under
+   * `core.abbrev`, against the local objects)
+   */
+  abbrevLengths: AbbrevLengths;
+  /** git's `transport_summary_width` of the push: the width of the status column */
+  summaryWidth: number;
 }
 
 /**
@@ -114,6 +129,25 @@ export interface PushClientResult {
  * does not support, and on transport and protocol errors; refused refs are in the result.
  */
 export async function pushToConnection(
+  connection: ReceivePackConnection,
+  options: PushClientOptions,
+): Promise<PushClientResult> {
+  const result = await sendPack(connection, options);
+  // the summaries as git prints them once the push is done: ids abbreviated against the
+  // local objects, the column as wide as the longest pair
+  const ids = pushSummaryIds(result.remoteRefs, result.updates);
+  for (const u of result.updates) ids.push(u.oldOid, u.newOid);
+  const lengths = await abbrevLengthsOf(options.repository, ids, options.abbrev ?? -1);
+  for (const u of result.updates) u.summary = pushSummary(u, lengths);
+  result.abbrevLengths = lengths;
+  result.summaryWidth = transportSummaryWidth(
+    pushSummaryIds(result.remoteRefs, result.updates),
+    lengths,
+  );
+  return result;
+}
+
+async function sendPack(
   connection: ReceivePackConnection,
   options: PushClientOptions,
 ): Promise<PushClientResult> {
@@ -210,6 +244,8 @@ export async function pushToConnection(
     packObjects: 0,
     packBytes: 0,
     bytesSent: 0,
+    abbrevLengths: new Map(),
+    summaryWidth: transportSummaryWidth([]),
   };
   if (toSend.length === 0 || options.dryRun) {
     result.ok = updates.every((u) => isPushSuccess(u.status));

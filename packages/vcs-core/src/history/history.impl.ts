@@ -228,6 +228,7 @@ export class HistoryImpl implements History {
     const visited = new Set<string>();
     const strict = options.missing === "throw";
     const shallow = new Set(options.shallow ?? []);
+    const grafts = options.grafts;
     const known = options.known ?? new Set<string>();
     const verifyBlobs = options.verifyBlobs ?? strict;
     // When strict, an object referred to by a reachable one must be stored, unless the
@@ -313,8 +314,17 @@ export class HistoryImpl implements History {
       }
       yield oid;
       // a commit's children are its tree, then its parents
-      if (shallow.has(oid)) enqueue(oid, children.slice(0, 1), children.slice(1));
-      else enqueue(oid, children);
+      if (shallow.has(oid)) {
+        // the shallow file overrides a graft (register_shallow): no grafted parents
+        enqueue(oid, children.slice(0, 1), children.slice(1));
+      } else {
+        // a grafted commit's grafted parents besides its recorded ones (repack keeps the true
+        // parents, prune walks the grafted ones); required as parents are (git dies: "Could
+        // not read <id>", "Failed to traverse parents of commit <id>")
+        const grafted = grafts?.get(oid);
+        const extra = grafted?.filter((id) => !children.includes(id));
+        enqueue(oid, extra?.length ? [...children, ...extra] : children);
+      }
     }
   }
 

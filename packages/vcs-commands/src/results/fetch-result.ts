@@ -78,6 +78,13 @@ export interface FetchResult {
    */
   messages: string[];
   /**
+   * The ref lines git prints on stderr (`From <url>`, ` * [new branch]  main -> origin/main`,
+   * `   1a2b3c4..5d6e7f8  dev  -> origin/dev`, ` - [deleted]  (none) -> origin/gone`), ids
+   * abbreviated as git's find_unique_abbrev under `core.abbrev`, the columns as wide as git
+   * makes them; empty when no ref changed
+   */
+  display?: string[];
+  /**
    * What failed without stopping the fetch (a refused prune), where git reports an error
    * and exits 1; absent when nothing failed
    */

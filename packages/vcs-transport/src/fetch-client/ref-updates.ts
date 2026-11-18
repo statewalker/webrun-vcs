@@ -5,6 +5,7 @@
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import type { RefSpec } from "../protocol/index.js";
+import { type AbbrevLengths, abbreviate } from "../summary/index.js";
 import { expandFromSource, matchSource, parseRefSpec } from "../utils/index.js";
 import type { RemoteRef } from "./connection.js";
 
@@ -33,11 +34,22 @@ export interface FetchRefUpdate {
   newOid: string;
   status: FetchRefStatus;
   /**
-   * Why a ref was rejected: `non-fast-forward`, `would clobber existing tag`, or the ref
-   * store's refusal (`mismatch` when the ref changed meanwhile, `locked`, …).
+   * Why a ref was rejected: `non-fast-forward`, `would clobber existing tag`, or, when the
+   * ref store refused the write, git's `unable to update local ref` (the store's own reason
+   * in {@link storeError}).
    */
   reason?: string;
-  /** How git prints it: `[new branch]`, `[new tag]`, `abc1234..def5678`, `+ abc1234...def5678`, `[rejected]`, `[up to date]` */
+  /**
+   * The ref store's refusal of the write (`mismatch` when the ref changed meanwhile,
+   * `locked`, …): the update was accepted, and its {@link summary} is the one it was
+   * accepted with (git prints it with `!` and `(unable to update local ref)`).
+   */
+  storeError?: string;
+  /**
+   * How git prints it: `[new branch]`, `[new tag]`, `abc1234..def5678`, `+ abc1234...def5678`,
+   * `[tag update]` (a forced tag), `[rejected]`, `[up to date]`; ids as long as git's
+   * find_unique_abbrev makes them under `core.abbrev`
+   */
   summary: string;
 }
 
@@ -94,7 +106,7 @@ export function mapRefs(
     if (/^[0-9a-f]{40}$/.test(spec.source)) {
       add({
         remoteRef: spec.source,
-        localRef: spec.destination ?? undefined,
+        localRef: localRefOf(spec.destination),
         oid: spec.source,
         force: spec.force,
         refspec: index,
@@ -105,7 +117,7 @@ export function mapRefs(
     if (!ref?.oid || excluded(ref.name)) continue;
     add({
       remoteRef: ref.name,
-      localRef: spec.destination ?? undefined,
+      localRef: localRefOf(spec.destination),
       oid: ref.oid,
       force: spec.force,
       refspec: index,
@@ -150,6 +162,17 @@ export function refPrefixes(refspecs: readonly string[]): string[] {
   return [...prefixes];
 }
 
+/**
+ * git's get_local_ref: the local ref a refspec's destination names (`main` is
+ * `refs/heads/main`, `tags/v1` is `refs/tags/v1`); none for an empty destination.
+ */
+function localRefOf(destination: string | null | undefined): string | undefined {
+  if (!destination) return undefined;
+  if (destination.startsWith("refs/")) return destination;
+  if (/^(heads|tags|remotes)\//.test(destination)) return `refs/${destination}`;
+  return `refs/heads/${destination}`;
+}
+
 function dwimCandidates(name: string): string[] {
   return [
     name,
@@ -175,6 +198,11 @@ function dwimRef(spec: RefSpec, byName: Map<string, RemoteRef>): RemoteRef | und
 export interface PlanOptions {
   /** Every update may be a non-fast-forward (git fetch --force) */
   force?: boolean;
+  /**
+   * The abbreviated length of each id in the summaries (git's find_unique_abbrev under
+   * `core.abbrev`; see `abbrevLengthsOf`); 7 digits for an id not there
+   */
+  lengths?: AbbrevLengths;
 }
 
 /**
@@ -197,7 +225,8 @@ export async function planRefUpdates(
     const force = options.force || p.force;
     const base = { remoteRef: p.remoteRef, localRef: p.localRef, oldOid, newOid: p.oid };
     if (!oldOid) {
-      const kind = p.localRef.startsWith("refs/tags/")
+      // update_local_ref names it after the remote ref, "more likely to follow a standard layout"
+      const kind = p.remoteRef.startsWith("refs/tags/")
         ? "tag"
         : p.remoteRef.startsWith("refs/heads/")
           ? "branch"
@@ -209,11 +238,12 @@ export async function planRefUpdates(
       updates.push({ ...base, status: "up-to-date", summary: "[up to date]" });
       continue;
     }
-    const range = `${oldOid.slice(0, 7)}...${p.oid.slice(0, 7)}`;
+    const lengths = options.lengths;
+    const range = `${abbreviate(oldOid, lengths)}...${abbreviate(p.oid, lengths)}`;
     if (p.localRef.startsWith("refs/tags/")) {
       updates.push(
         force
-          ? { ...base, status: "forced", summary: `+ ${range}` }
+          ? { ...base, status: "forced", summary: "[tag update]" }
           : {
               ...base,
               status: "rejected",
@@ -228,7 +258,7 @@ export async function planRefUpdates(
       updates.push({
         ...base,
         status: "fast-forward",
-        summary: `${oldOid.slice(0, 7)}..${p.oid.slice(0, 7)}`,
+        summary: `${abbreviate(oldOid, lengths)}..${abbreviate(p.oid, lengths)}`,
       });
     } else if (force) {
       updates.push({ ...base, status: "forced", summary: `+ ${range}` });
@@ -276,10 +306,12 @@ export async function applyRefUpdates(
     old: u.oldOid ?? null,
     new: u.newOid,
   });
-  const reject = (u: FetchRefUpdate, reason: string) => {
+  // git's update_local_ref when s_update_ref fails: the summary the update was accepted
+  // with, its fail code `!` and "unable to update local ref"
+  const reject = (u: FetchRefUpdate, storeError: string) => {
     u.status = "rejected";
-    u.reason = reason;
-    u.summary = "[rejected]";
+    u.reason = "unable to update local ref";
+    u.storeError = storeError;
   };
   if (!refStore.batch) {
     for (const u of writes) await refStore.update(u.localRef, u.newOid);

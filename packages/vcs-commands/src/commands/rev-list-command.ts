@@ -40,6 +40,14 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private readonly mixed: string[] = [];
   private committish = true;
   private readonly configure: ((log: LogCommand) => void)[] = [];
+  /** The log that walks for this command, once called */
+  private log?: LogCommand;
+
+  /** What git prints while reading replace refs and grafts (see GitCommand). */
+  override async replacementMessages(): Promise<string[]> {
+    const own = await super.replacementMessages();
+    return own.length > 0 || !this.log ? own : this.log.replacementMessages();
+  }
 
   /** A revision argument: `HEAD`, `^v1`, `a..b`, `a...b`, `x^@`, `x^!`, `x^-2`, or `--not`. */
   addRevision(revision: string): this {
@@ -107,7 +115,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     const resolver = this.revisionResolver();
     const options = {
       committish: this.committish,
-      mergeBases: (a: string, b: string) => revisionMergeBases(this.commits, a, b),
+      mergeBases: (a: string, b: string) => revisionMergeBases(this.walkCommits, a, b),
     };
     const parsed: ParsedRevisionArgs = await parseRevisionArgs(resolver, this.revisions, options);
     if (this.mixed.length === 0) return { ...parsed, paths: [] };
@@ -128,6 +136,9 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.checkCallable();
     this.setCallable(false);
     const log = new LogCommand(this._workingCopy);
+    this.log = log;
+    if (this.useReplaceRefsOverride !== undefined)
+      log.setUseReplaceRefs(this.useReplaceRefsOverride);
     for (const configure of this.configure) configure(log);
     // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none
     const named = (args: string[]) => args.some((arg) => arg !== "--not" && arg !== "--");

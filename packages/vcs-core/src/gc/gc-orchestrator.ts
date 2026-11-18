@@ -9,6 +9,7 @@
  */
 
 import type { ObjectId } from "../common/id/index.js";
+import { readGraftParents } from "../history/commits/index.js";
 import type { History } from "../history/history.js";
 import type { CompactResult, GcStrategy, StorageStats } from "./gc-strategy.js";
 
@@ -46,6 +47,12 @@ export interface GcRunOptions {
    * off risks no data loss; it only reports such corruption later, as `git gc` does.
    */
   verifyBlobs?: boolean;
+  /**
+   * Reads the grafts file in place of the repository's `info/grafts` (git's `GIT_GRAFT_FILE`;
+   * `graftFileReader(environment)` makes one): what its grafts reach is kept, as native gc
+   * run with that variable keeps it. Omit to read `info/grafts` (`refs.readGrafts`).
+   */
+  readGraftFile?: () => Promise<string | undefined>;
 }
 
 /** Default `GcRunOptions.pruneExpireMs`: two weeks, git's `gc.pruneExpire`. */
@@ -119,13 +126,14 @@ export class GcOrchestrator {
     } = options;
 
     // Step 1: Collect the roots
-    const { roots, shallow } = await this.collectRoots();
+    const { roots, shallow, grafts } = await this.collectRoots(options.readGraftFile);
 
     // Step 2: Walk reachable objects; a missing or corrupt one throws before anything changes
     const reachable = new Set<ObjectId>();
     for await (const oid of this.history.collectReachableObjects(roots, new Set(), {
       missing: "throw",
       shallow,
+      grafts,
       verifyBlobs: options.verifyBlobs ?? true,
     })) {
       reachable.add(oid);
@@ -141,6 +149,7 @@ export class GcOrchestrator {
         // too; it may lead to objects that are gone (ignore_missing_links)
         for await (const oid of this.history.collectReachableObjects(recent, new Set(), {
           shallow,
+          grafts,
           known: reachable,
         })) {
           if (unreachable.delete(oid)) keptRecentObjects++;
@@ -190,9 +199,15 @@ export class GcOrchestrator {
    * too), the old and new ids of the reflog entries of those refs and HEAD, and what the
    * strategy adds (`GcStrategy.collectRoots`); and the shallow commits, from the refs and the
    * strategy. Roots that are not stored are skipped by the walk (a reflog may name objects
-   * pruned long ago, git ignores a broken ref).
+   * pruned long ago, git ignores a broken ref). And the grafts (`info/grafts`, or the file
+   * `readGraftFile` reads): a grafted commit's grafted parents are walked as well as its
+   * recorded ones, as git's gc keeps both; a shallow commit's graft is overridden.
    */
-  private async collectRoots(): Promise<{ roots: Set<ObjectId>; shallow: Set<ObjectId> }> {
+  private async collectRoots(readGraftFile?: () => Promise<string | undefined>): Promise<{
+    roots: Set<ObjectId>;
+    shallow: Set<ObjectId>;
+    grafts: Map<ObjectId, ObjectId[]>;
+  }> {
     const refs = this.history.refs;
     const roots = new Set<ObjectId>();
     const add = (id: ObjectId | undefined) => {
@@ -212,7 +227,8 @@ export class GcOrchestrator {
     const extra = await this.strategy.collectRoots?.();
     for (const id of extra?.roots ?? []) add(id);
     for (const id of extra?.shallow ?? []) shallow.add(id);
-    return { roots, shallow };
+    const grafts = await readGraftParents(refs, readGraftFile);
+    return { roots, shallow, grafts };
   }
 
   /**

@@ -6,7 +6,14 @@
 import type { PackImportResult, RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import { INFINITE_DEPTH } from "../fsm/index.js";
-import { encodeDelim, encodeFlush, encodePacketLine, TransportError } from "../protocol/index.js";
+import {
+  encodeDelim,
+  encodeFlush,
+  encodePacketLine,
+  TransportError,
+  ZERO_OID,
+} from "../protocol/index.js";
+import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import { parseRefSpec } from "../utils/index.js";
 import { Completeness } from "./completeness.js";
 import type { RemoteRef, UploadPackConnection } from "./connection.js";
@@ -69,9 +76,15 @@ export interface FetchClientOptions {
   /**
    * Called once the remote refs are listed and mapped, before any object is fetched or ref
    * written: where `git fetch --prune` deletes the stale remote-tracking refs, so a
-   * renamed remote branch (`foo` to `foo/bar`) does not conflict with the old one.
+   * renamed remote branch (`foo` to `foo/bar`) does not conflict with the old one. `refMap`
+   * is git's ref map so far (get_ref_map): the refs the refspecs took, then the opportunistic
+   * updates of those, each with the local ref it writes (where fetch refuses to update a
+   * branch a worktree has checked out).
    */
-  beforeFetch?: (remoteRefs: readonly RemoteRef[]) => Promise<void>;
+  beforeFetch?: (
+    remoteRefs: readonly RemoteRef[],
+    refMap: readonly { remoteRef: string; localRef?: string }[],
+  ) => Promise<void>;
   /** Tag following; default `auto` */
   tags?: TagMode;
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
@@ -105,6 +118,12 @@ export interface FetchClientOptions {
   reflogIdent?: string;
   /** Log none of the ref updates (`git clone` stores the remote's refs unlogged) */
   skipReflog?: boolean;
+  /**
+   * `core.abbrev` as `parseCoreAbbrev` of vcs-core reads it: the length the summaries'
+   * ids start from (-1, the default, for git's automatic length; 40 for full ids). Each is
+   * lengthened until unique among the local objects (`RepositoryFacade.abbrevLengths`).
+   */
+  abbrev?: number;
 }
 
 /** Refspecs chosen from the remote refs (a clone of the remote HEAD's branch, a tag). */
@@ -137,6 +156,12 @@ export interface FetchClientResult {
   /** Tags created by auto-follow (also in `refUpdates`) */
   followedTags: string[];
   /**
+   * The followed tags found in the fetched history (git's backfill_tags), not those of
+   * objects fetched or already here (which git lists with the refspecs' refs): git reports
+   * their lines last
+   */
+  backfilledTags: string[];
+  /**
    * Tags auto-follow would have created but could not fetch: annotated tags of fetched
    * objects whose tag objects did not come with the pack, over a connection that allows no
    * second request (protocol v0 over a duplex: upload-pack ends after the pack)
@@ -152,6 +177,16 @@ export interface FetchClientResult {
   packBytes: number;
   /** Negotiation counters, summed over the packs */
   stats: NegotiationStats;
+  /**
+   * The abbreviated length of each id the summaries show (git's find_unique_abbrev under
+   * `core.abbrev`, against the local objects once the pack is in)
+   */
+  abbrevLengths: AbbrevLengths;
+  /**
+   * git's `transport_summary_width` of the fetch's ref map: the width of the summary column
+   * (see `formatFetchDisplay`)
+   */
+  summaryWidth: number;
 }
 
 /** A remote ref a fetch took (see {@link FetchClientResult.fetched}). */
@@ -260,12 +295,15 @@ export async function fetchFromConnection(
       refspec,
     })),
     followedTags: [],
+    backfilledTags: [],
     tagsNotFollowed: [],
     shallow: { before: shallowBefore, after: shallowBefore },
     imports: [],
     packObjects: 0,
     packBytes: 0,
     stats: { rounds: 0, haves: 0 },
+    abbrevLengths: new Map(),
+    summaryWidth: transportSummaryWidth([]),
   };
 
   // git's opportunistic update: the refs the refspecs took (not `--tags`), mapped through
@@ -282,7 +320,7 @@ export async function fetchFromConnection(
         .map(({ refspec: _refspec, ...p }) => p)
     : [];
 
-  if (options.beforeFetch) await options.beforeFetch(remoteRefs);
+  if (options.beforeFetch) await options.beforeFetch(remoteRefs, [...planned, ...opportunistic]);
 
   const source = negotiatorSource(repository);
   // what is complete here: reachable from the local refs (git's mark_complete), not merely
@@ -407,15 +445,40 @@ export async function fetchFromConnection(
   }
 
   result.shallow.after = shallow;
+  // the summaries' ids, abbreviated against the objects here now (the pack is in): each
+  // update's old and new value, and what transport_summary_width measures of git's ref map,
+  // the refs the refspecs (and the configured ones) took and the tags of objects fetched or
+  // here, each with its remote value and its (null) new one
+  const inRefMap = [
+    ...planned,
+    ...opportunistic,
+    ...followed.filter((p) => tagsOfTips.has(p.remoteRef)),
+  ];
+  const widthIds = inRefMap.flatMap((p) => [p.oid, ZERO_OID]);
+  const abbrevIds = [...widthIds];
+  for (const p of [...planned, ...followed, ...opportunistic]) {
+    abbrevIds.push(p.oid);
+    if (p.localRef) {
+      const old = await refStore.get(p.localRef);
+      if (old) abbrevIds.push(old);
+    }
+  }
+  const lengths = await abbrevLengthsOf(repository, abbrevIds, options.abbrev ?? -1);
+  result.abbrevLengths = lengths;
+  result.summaryWidth = transportSummaryWidth(widthIds, lengths);
   result.refUpdates = await planRefUpdates(
     [...planned, ...followed, ...opportunistic],
     repository,
     refStore,
     {
       force: options.force,
+      lengths,
     },
   );
   result.followedTags = followed.map((p) => p.localRef as string);
+  result.backfilledTags = followed
+    .filter((p) => !tagsOfTips.has(p.remoteRef))
+    .map((p) => p.localRef as string);
   // each group by name, as find_non_local_tags lists them (a sorted string list)
   const byName = [...followed].sort((a, b) =>
     a.remoteRef < b.remoteRef ? -1 : a.remoteRef > b.remoteRef ? 1 : 0,

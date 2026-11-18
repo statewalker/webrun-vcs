@@ -23,9 +23,9 @@ import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-resul
 import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
-import { localTimezoneOffset } from "./git-ident.js";
+import { hostEnvironmentOf, localTimezoneOffset } from "./git-ident.js";
 import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
-import { configBool, conflictStyleOf } from "./merge-config.js";
+import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
   conflictsComment,
@@ -42,6 +42,7 @@ import {
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { type PatchIdTrees, patchId } from "./patch-id.js";
+import { formatCommitPretty, loadRefDecorations, type RefDecorations } from "./pretty-format.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { expandCommitId, expandCommitIds } from "./sequencer-pick.js";
 import {
@@ -96,6 +97,11 @@ const DIR = "rebase-merge";
 interface TodoItem {
   action: RebaseAction;
   id: ObjectId;
+  /**
+   * The line's text after the id (`# <subject>`, as `rebase.instructionFormat` made it, or as
+   * the todo file has it): written back unchanged, and what `Could not apply` names
+   */
+  rest?: string;
 }
 
 /** git's quoting of a value in `author-script` (`'...'`, a quote as `'\''`). */
@@ -142,6 +148,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private flatTrees?: FlatTreeCache;
   /** Commit subjects, for the todo and done lines */
   private readonly subjects = new Map<ObjectId, string>();
+  /** The refs' decorations, for `%d` in rebase.instructionFormat (loaded once) */
+  private decorations?: RefDecorations;
+  /** What loading the decorations printed (`warning: invalid replace ref <name>`) */
+  private decorationWarnings: string[] = [];
 
   /**
    * Set the upstream commit to rebase onto.
@@ -518,6 +528,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/msgnum`, "0\n");
     await state.write(`${DIR}/done`, "");
     const todoText = await this.todoText(todo);
+    // load_ref_decorations' warnings, printed while the todo list is made
+    output.push(...this.decorationWarnings.splice(0));
     await state.write(
       `${DIR}/git-rebase-todo.backup`,
       `${todoText}\n# Rebase ${await this.abbreviateObjectId(onto)}..${await this.abbreviateObjectId(headId)} onto ${await this.abbreviateObjectId(onto)} (${todo.length} command${todo.length === 1 ? "" : "s"})\n`,
@@ -663,8 +675,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           'hint: "git add/rm <conflicted_files>", then run "git rebase --continue".',
           'hint: You can instead skip this commit: run "git rebase --skip".',
           'hint: To abort and get back to the state before "git rebase", run "git rebase --abort".',
-          // the todo line's rest as git 2.5x writes it (`# <subject>`)
-          `Could not apply ${short}... # ${subject}`,
+          // the todo line's rest (`# <subject>`, or as `rebase.instructionFormat` made it)
+          `Could not apply ${short}... ${item.rest ?? (await this.instructionText(item.id))}`,
         ].join("\n"),
       };
     }
@@ -955,15 +967,65 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private async todoText(todo: TodoItem[]): Promise<string> {
     let out = "";
     for (const item of todo) {
-      let subject = this.subjects.get(item.id);
-      if (subject === undefined) {
-        subject = subjectOf((await this.commits.load(item.id))?.message ?? "");
-        this.subjects.set(item.id, subject);
-      }
-      // git 2.5x's make_script with its default `rebase.instructionFormat` (`# %s`)
-      out += `${item.action} ${item.id} # ${subject}\n`;
+      item.rest ??= await this.instructionText(item.id);
+      out += `${item.action} ${item.id}${item.rest ? ` ${item.rest}` : ""}\n`;
     }
     return out;
+  }
+
+  /**
+   * The text after a pick's id, as git 2.5x's sequencer_make_script writes it: the commit
+   * through `rebase.instructionFormat` (default `# %s`; a format that does not start with
+   * `#` gets `# ` before it), `%h` unabbreviated (its pretty context has abbrev 0), trailing
+   * blanks dropped.
+   */
+  private async instructionText(id: ObjectId): Promise<string> {
+    let format = configValue(this.workingCopy, "rebase.instructionFormat") ?? "";
+    if (format === "") format = "# %s";
+    if (!format.startsWith("#")) format = `# ${format}`;
+    if (format === "# %s") {
+      let subject = this.subjects.get(id);
+      if (subject === undefined) {
+        subject = subjectOf((await this.commits.load(id))?.message ?? "");
+        this.subjects.set(id, subject);
+      }
+      return `# ${subject}`;
+    }
+    const commit = await this.commits.load(id);
+    if (!commit) return format;
+    // %d and friends: the refs decorate the commits (load_ref_decorations, no filter)
+    if (this.decorations === undefined && /%[-+ ]?(?:[dD]|\(decorate)/.test(format)) {
+      this.decorations = await this.refDecorations();
+    }
+    // the list goes through the todo editing's stripspace: no trailing blanks
+    const text = await formatCommitPretty(format, commit, id, {
+      now: this.clock(),
+      ...(this.decorations ? { decorations: this.decorations } : {}),
+    });
+    return text.replace(/[ \t]+$/, "");
+  }
+
+  /**
+   * The decorations git's sequencer shows for `%d` (load_ref_decorations without a filter):
+   * every ref, HEAD, the grafted and shallow commits, the objects replace refs replace.
+   */
+  private async refDecorations(): Promise<RefDecorations> {
+    const replacements = await this.objectReplacements();
+    const shallow = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
+    const environment = hostEnvironmentOf(this._workingCopy);
+    const objects = this._workingCopy.history?.objects;
+    const tags = this.tagsStore;
+    return loadRefDecorations({
+      refs: this.refsStore,
+      ...(tags ? { tags } : {}),
+      ...(environment?.replaceRefBase !== undefined
+        ? { replaceRefBase: environment.replaceRefBase }
+        : {}),
+      useReplaceRefs: this.useReplaceRefs(),
+      grafted: new Set([...(replacements?.grafts.keys() ?? []), ...shallow]),
+      ...(objects ? { hasObject: (id: ObjectId) => objects.has(id) } : {}),
+      onWarning: (message) => this.decorationWarnings.push(message),
+    });
   }
 
   private async readTodoFile(state: OperationState, name: string): Promise<TodoItem[]> {
@@ -980,17 +1042,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       f: RebaseAction.FIXUP,
       fixup: RebaseAction.FIXUP,
     };
-    const lines: { action: RebaseAction; id: string }[] = [];
+    const lines: { action: RebaseAction; id: string; rest: string }[] = [];
     for (const line of text.split("\n")) {
-      const match = /^(\w+)\s+([0-9a-f]{4,64})/.exec(line.trim());
+      // the rest of the line kept as written (trailing blanks included), as git's parse_insn_line
+      const match = /^(\w+)[ \t]+([0-9a-f]{4,64})(?:[ \t]+(.*))?$/.exec(line.trimStart());
       if (!match || !actions[match[1]]) continue;
-      lines.push({ action: actions[match[1]], id: match[2] });
+      lines.push({ action: actions[match[1]], id: match[2], rest: match[3] ?? "" });
     }
     const ids = await expandCommitIds(
       { commits: this.commits, refs: this.refsStore, state },
       lines.map((l) => l.id),
     );
-    return lines.map((l, k) => ({ action: l.action, id: ids[k] }));
+    return lines.map((l, k) => ({ action: l.action, id: ids[k], rest: l.rest }));
   }
 
   /**

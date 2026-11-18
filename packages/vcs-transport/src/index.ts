@@ -7,4 +7,5 @@ export * from "./fsm/index.js";
 export * from "./operations/index.js";
 export * from "./protocol/index.js";
 export * from "./push-client/index.js";
+export * from "./summary/index.js";
 export * from "./utils/index.js";

@@ -86,6 +86,11 @@ export interface RepackOptions extends RepackTarget {
   unpackUnreachable?: boolean;
   /** The expiry of `unpackUnreachable` (git's gc.pruneExpire). Default two weeks. */
   unpackUnreachableExpireMs?: number;
+  /**
+   * Reads the grafts file in place of `info/grafts` (git's `GIT_GRAFT_FILE`;
+   * `graftFileReader(environment)` makes one): what its grafts reach is packed.
+   */
+  readGraftFile?: () => Promise<string | undefined>;
 }
 
 /**
@@ -178,6 +183,7 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     refs: options.history.refs,
     objects: options.objects,
     commitGraph: options.history.commitGraph,
+    ...(options.readGraftFile ? { readGraftFile: options.readGraftFile } : {}),
   });
   return repackListed(options, listed, snapshot);
 }

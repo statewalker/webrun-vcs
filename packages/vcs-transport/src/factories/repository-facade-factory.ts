@@ -13,6 +13,7 @@
 import {
   createHistoryFromComponents,
   DefaultSerializationApi,
+  findAbbrevLengths,
   type History,
   type HistoryWithOperations,
   type ObjectQuarantine,
@@ -239,6 +240,14 @@ function createRepositoryFacadeFromHistory(
         }
       }
       return found;
+    },
+
+    async abbrevLengths(ids: readonly string[], minLength: number): Promise<Map<string, number>> {
+      if (!history.objects) {
+        const fixed = minLength < 0 ? 7 : minLength === 0 ? 40 : Math.min(minLength, 40);
+        return new Map(ids.map((id) => [id, fixed]));
+      }
+      return findAbbrevLengths(history.objects, ids, minLength);
     },
 
     async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {

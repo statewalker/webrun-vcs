@@ -281,6 +281,14 @@ export interface RepositoryFacade {
   resolvePrefix?(prefix: string): Promise<string[]>;
 
   /**
+   * The abbreviated length of each id as git's find_unique_abbrev gives it: from `minLength`
+   * (`core.abbrev`; -1 for the automatic length of the repository's size) up to where no
+   * other local object shares the prefix. Fetch and push summaries abbreviate with it;
+   * without it they use `minLength` (7 for automatic).
+   */
+  abbrevLengths?(ids: readonly string[], minLength: number): Promise<Map<string, number>>;
+
+  /**
    * Whether the repository has no working tree. receive-pack refuses to update the checked
    * out branch of a non-bare repository (git's `receive.denyCurrentBranch`). Absent: bare.
    */

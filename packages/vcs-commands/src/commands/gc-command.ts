@@ -56,6 +56,11 @@ export interface GCCommandResult {
  */
 export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   private _packRefs = true;
+
+  /** git's fsck and gc read the objects as stored, never through replace refs. */
+  protected override readsReplacedObjects(): boolean {
+    return false;
+  }
   private _aggressive = false;
   private _expire?: Date;
 

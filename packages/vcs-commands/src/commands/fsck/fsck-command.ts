@@ -9,6 +9,7 @@ import {
   openPack,
   type PackFile,
   type PackIndex,
+  parseGraftFile,
   parseGraphCommit,
   type Refs,
   readCommitGraph,
@@ -19,6 +20,7 @@ import {
   verifyCommitGraph,
 } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { readFile } from "@statewalker/vcs-utils/files";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import {
   type CacheTree,
@@ -246,6 +248,11 @@ const pathOf = (...parts: string[]) => parts.join("/");
  */
 export class FsckCommand extends GitCommand<FsckResult> {
   private _strict = false;
+
+  /** git's fsck and gc read the objects as stored, never through replace refs. */
+  protected override readsReplacedObjects(): boolean {
+    return false;
+  }
   private _connectivityOnly = false;
   private _dangling = true;
   private _unreachable = false;
@@ -502,6 +509,13 @@ class FsckRun {
   private readonly gitattributesFound = new Set<string>();
   private readonly gitattributesDone = new Set<string>();
   private shallow = new Set<string>();
+  /**
+   * The commit grafts of `info/grafts` (git's parse_commit_buffer gives a grafted commit those
+   * parents, its own not looked up), and what reading them reported, printed when the first
+   * commit is parsed
+   */
+  private grafts?: Map<string, string[]>;
+  private graftErrors: string[] = [];
   private packs: RepoPack[] = [];
   /**
    * Trees checked in full, as their entries' objects: object number -> start in `kids`, where
@@ -589,6 +603,7 @@ class FsckRun {
     }
     const refs = this.stores.refs;
     this.shallow = new Set((await refs.getShallow?.()) ?? []);
+    await this.readGrafts();
     if (this.files) this.packs = await this.listPacks();
     // git 2.45+: the refs are snapshotted before the objects are read
     const snapshot = this.o.compatibility === "2.56" ? await this.snapshotRefs() : undefined;
@@ -832,6 +847,37 @@ class FsckRun {
     t.addFlags(n, PARSED);
     this.graphParsed++;
     return true;
+  }
+
+  /**
+   * git's prepare_commit_graft for fsck: `info/grafts` read (fsck applies grafts, as every
+   * parse_commit does; replace refs it turns off), its bad lines kept to be reported.
+   */
+  private async readGrafts(): Promise<void> {
+    if (!this.files) return;
+    const path = pathOf(this.gitDir, "info", "grafts");
+    try {
+      if ((await this.files.stats(path))?.kind !== "file") return;
+      const text = new TextDecoder().decode(await readFile(this.files, path));
+      const { grafts, messages } = parseGraftFile(text);
+      if (grafts.size > 0) this.grafts = grafts;
+      this.graftErrors = messages;
+    } catch {
+      // unreadable: no grafts (git warns and goes on)
+    }
+  }
+
+  /** The grafted parents of commit `id`; undefined when not grafted (or shallow). */
+  private graftedParents(id: string): string[] | undefined {
+    if (!this.grafts || this.shallow.has(id)) return undefined;
+    return this.grafts.get(id);
+  }
+
+  /** The grafts file's errors (`error: bad graft data: <line>`), once. */
+  private reportGraftErrors(): void {
+    const errors = this.graftErrors;
+    this.graftErrors = [];
+    for (const text of errors) this.emit({ kind: "error", stream: "stderr", text });
   }
 
   /** Whether HEAD or any ref names an object. */
@@ -1172,6 +1218,7 @@ class FsckRun {
     if (t.flags(n) & PARSED) return n;
     if (type === OBJ_COMMIT) {
       if (this.graftsHint) this.adviseGrafts();
+      if (this.graftErrors.length > 0) this.reportGraftErrors();
       const parsed = parseCommitLinks(content, id);
       if ("error" in parsed) {
         this.error(parsed.error, id);
@@ -1185,7 +1232,18 @@ class FsckRun {
         return undefined;
       }
       const parents: number[] = [];
-      if (!this.shallow.has(id)) {
+      const grafted = this.graftedParents(id);
+      if (grafted) {
+        for (const p of grafted) {
+          const parent = t.lookupTyped(p, OBJ_COMMIT);
+          if (typeof parent !== "number") {
+            this.error(parent.error);
+            this.error(`bad graft parent ${p} in commit ${id}`, id);
+            return undefined;
+          }
+          parents.push(parent);
+        }
+      } else if (!this.shallow.has(id)) {
         for (const at of parsed.parents) {
           const parent = t.lookupTypedRaw(rawIdAt(content, at, raw), 0, OBJ_COMMIT);
           if (typeof parent !== "number") {
@@ -2345,6 +2403,8 @@ class FsckRun {
     const tree = kids[s + 1] as number;
     const have = t.type(tree);
     if (have !== OBJ_NONE && have !== OBJ_TREE) return false;
+    // a grafted commit is read as any other (its parents are not the ones scanned)
+    if (this.grafts?.has(t.id(n))) return false;
     const shallow = this.shallow.size > 0 && this.shallow.has(t.id(n));
     if (!shallow) {
       for (let i = s + 2; i <= s + count; i++) {
@@ -2354,6 +2414,7 @@ class FsckRun {
       }
     }
     if (this.graftsHint) this.adviseGrafts();
+    if (this.graftErrors.length > 0) this.reportGraftErrors();
     // parse_object's lookup, then parse_object_buffer's
     t.touch(n);
     t.setType(n, OBJ_COMMIT);

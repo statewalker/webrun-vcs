@@ -13,10 +13,13 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CorruptObjectError, GcOrchestrator } from "@statewalker/vcs-core";
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import { CorruptObjectError, GcOrchestrator, graftFileReader } from "@statewalker/vcs-core";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
-import { createGitFilesBackend, FileGcStrategy, gc } from "../src/index.js";
+import { createGitFilesBackend, FileGcStrategy, gc, repack } from "../src/index.js";
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -537,5 +540,145 @@ describe("GcOrchestrator with verifyBlobs off", () => {
     // the reachable (if corrupt) blob is never pruned; only the unreachable orphan goes
     expect(after.has(blob)).toBe(true);
     expect(after.has(orphan)).toBe(false);
+  });
+});
+
+/**
+ * A repository whose old history only a graft reaches: an orphan commit (with its own blob)
+ * that no ref, reflog or index names, made the parent of main's root by `info/grafts`.
+ */
+function graftedHistory(): { dir: string; old: string; oldBlob: string; trueParent?: string } {
+  const dir = repo(3);
+  const oldBlob = hashObject(dir, "only in the grafted history\n");
+  const tree = git(dir, ["mktree"], `100644 blob ${oldBlob}\told.txt\n`).trim();
+  const old = git(dir, ["commit-tree", "-m", "old history", tree]).trim();
+  const root = git(dir, ["rev-list", "--max-parents=0", "main"]).trim();
+  writeFileSync(join(dir, ".git/info/grafts"), `${root} ${old}\n`);
+  return { dir, old, oldBlob };
+}
+
+describe("gc keeps the objects grafts reach, as native git", () => {
+  it("GcOrchestrator: a commit only a graft names, and its tree and blob", async () => {
+    const { dir, old, oldBlob } = graftedHistory();
+    const { ours, native } = await check(dir);
+    for (const id of [old, oldBlob]) {
+      expect(native.has(id), `native keeps ${id}`).toBe(true);
+      expect(ours.has(id), `ours keeps ${id}`).toBe(true);
+    }
+  });
+
+  it("gc(): a commit only a graft names, and the true parent a graft hides", async () => {
+    const { dir, old, oldBlob } = graftedHistory();
+    // c2's graft drops c1 from its parents: repack --keep-true-parents keeps c1 all the same
+    const c1 = git(dir, ["rev-parse", "main~1"]).trim();
+    const c0 = git(dir, ["rev-parse", "main~2"]).trim();
+    const c2 = git(dir, ["rev-parse", "main"]).trim();
+    writeFileSync(
+      join(dir, ".git/info/grafts"),
+      `${readFileSync(join(dir, ".git/info/grafts"), "utf8")}${c2} ${c0}\n`,
+    );
+    expireReflogs(dir);
+    const native = nativeGcKeeps(dir);
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: dir }) });
+    await gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 });
+    fsck(dir);
+    const ours = stored(dir);
+    for (const id of [old, oldBlob, c1]) {
+      expect(native.has(id), `native keeps ${id}`).toBe(true);
+      expect(ours.has(id), `ours keeps ${id}`).toBe(true);
+    }
+    for (const id of native) expect(ours.has(id), `${id} native gc keeps is kept`).toBe(true);
+    // exactly what native gc keeps
+    expect(ours).toEqual(native);
+  });
+
+  it("GIT_GRAFT_FILE: gc(), GcOrchestrator and repack keep what its grafts reach", async () => {
+    const { dir, old, oldBlob } = graftedHistory();
+    // the grafts live outside the repository; info/grafts names nothing
+    const graftFile = join(tempDir("gc-graft-file-"), "grafts");
+    writeFileSync(graftFile, readFileSync(join(dir, ".git/info/grafts")));
+    rmSync(join(dir, ".git/info/grafts"));
+    expireReflogs(dir);
+    const env = { ...GIT_ENV, GIT_GRAFT_FILE: graftFile };
+    const environment = createNodeGitHostEnvironment({ env });
+    // native gc run with the variable keeps the grafted history; without it, prunes it
+    const copy = tempDir("gc-graft-file-native-");
+    cpSync(dir, copy, { recursive: true });
+    execFileSync("git", ["gc", "--quiet", "--prune=now"], { cwd: copy, env });
+    const native = stored(copy);
+    expect(native.has(old) && native.has(oldBlob)).toBe(true);
+    expect(nativeGcKeeps(dir).has(old)).toBe(false);
+
+    // gc() given the environment
+    const a = tempDir("gc-graft-file-a-");
+    cpSync(dir, a, { recursive: true });
+    const backendA = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: a }) });
+    await gc({ history: backendA.history, files: backendA.files, pruneExpireMs: 0, environment });
+    expect(stored(a)).toEqual(native);
+
+    // GcOrchestrator on a backend opened with the environment (refs.readGrafts reads the file)
+    const b = tempDir("gc-graft-file-b-");
+    cpSync(dir, b, { recursive: true });
+    const backendB = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: b }),
+      environment,
+    });
+    await new GcOrchestrator(backendB.history, new FileGcStrategy(backendB)).run({
+      pruneExpireMs: 0,
+    });
+    for (const id of [old, oldBlob]) expect(stored(b).has(id), `kept ${id}`).toBe(true);
+    expect(stored(b)).toEqual(new Set([...native].filter((id) => stored(dir).has(id))));
+
+    // GcOrchestrator given the reader explicitly, on a backend without the environment
+    const c = tempDir("gc-graft-file-c-");
+    cpSync(dir, c, { recursive: true });
+    const backendC = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: c }) });
+    await new GcOrchestrator(backendC.history, new FileGcStrategy(backendC)).run({
+      pruneExpireMs: 0,
+      readGraftFile: graftFileReader(environment),
+    });
+    expect(stored(c)).toEqual(stored(b));
+
+    // repack -a -d given the reader packs the grafted history
+    const d = tempDir("gc-graft-file-d-");
+    cpSync(dir, d, { recursive: true });
+    const backendD = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: d }) });
+    const packed = await repack({ ...backendD, readGraftFile: graftFileReader(environment) });
+    expect(packed?.objectCount).toBe(native.size);
+    fsck(a);
+    fsck(b);
+  });
+
+  it("a shallow commit's graft is overridden: what only it reaches is pruned, as native", async () => {
+    // main's root becomes shallow; its graft (to an orphan history) no longer counts
+    const { dir, old, oldBlob } = graftedHistory();
+    // (main~2: the graft makes `old` the root rev-list would name)
+    const root = git(dir, ["rev-parse", "main~2"]).trim();
+    expect(git(dir, ["rev-parse", "main~3"]).trim()).toBe(old);
+    writeFileSync(join(dir, ".git/shallow"), `${root}\n`);
+    expireReflogs(dir);
+    const native = nativeGcKeeps(dir);
+    expect(native.has(old) || native.has(oldBlob)).toBe(false);
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: dir }) });
+    await gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 });
+    expect(stored(dir)).toEqual(native);
+  });
+
+  it("a graft naming a missing parent aborts gc with nothing pruned, as native gc dies", async () => {
+    const dir = repo(3);
+    const tip = git(dir, ["rev-parse", "main"]).trim();
+    writeFileSync(join(dir, ".git/info/grafts"), `${tip} ${"1".repeat(40)}\n`);
+    hashObject(dir, "an unreachable blob\n");
+    const before = stored(dir);
+    const native = spawnSync("git", ["gc", "--quiet", "--prune=now"], { cwd: dir, env: GIT_ENV });
+    expect(native.status).not.toBe(0);
+    expect(native.stderr.toString()).toContain(`Could not read ${"1".repeat(40)}`);
+    expect(stored(dir)).toEqual(before);
+    await expect(ourGc(dir)).rejects.toThrow(/missing/);
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: dir }) });
+    await expect(
+      gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 }),
+    ).rejects.toThrow();
+    expect(stored(dir)).toEqual(before);
   });
 });
