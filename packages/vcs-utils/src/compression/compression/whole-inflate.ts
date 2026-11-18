@@ -10,7 +10,7 @@
  *  - Huffman tables are zlib's `inflate_table` tables (a root table indexed by the next 9 bits,
  *    6 for distances, and sub-tables for longer codes), in typed arrays allocated once; it
  *    refuses the same code sets (over-subscribed, incomplete except for a single one-bit code).
- *    For a small object, building them costs as much as decoding: the header's reader sorts
+ *    For a small object, building them costs as much as decoding: the header's reader buckets
  *    the symbols by code length as it decodes the lengths, and the root table is filled by
  *    doubling (see `buildTable`);
  *  - the decoding loop is zlib's `inflate_fast` while at least 8 input bytes are left, with
