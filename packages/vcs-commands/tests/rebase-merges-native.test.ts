@@ -15,7 +15,12 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { RebaseOperation, type RebaseResult, RebaseStatus } from "../src/index.js";
+import {
+  type RebaseCommand,
+  RebaseOperation,
+  type RebaseResult,
+  RebaseStatus,
+} from "../src/index.js";
 import {
   git,
   gitOk,
@@ -48,7 +53,11 @@ function modernTodo(): boolean {
  */
 function normalize(name: string, text: string): string {
   if (name === "rebase-merge/message") {
-    return normalizeState(name, text.replace(/(#\t.*\n)\n$/, "$1"));
+    // and the blank line 2.43 writes after the message, and the sign-off of --signoff
+    // (2.43 writes the commit's own message, 2.5x the message picked, signed off)
+    return normalizeState(name, text.replace(/(#\t.*\n)\n$/, "$1"))
+      .replace(/\n\n$/, "\n")
+      .replace(/\n\nSigned-off-by: .*\n$/, "\n");
   }
   return normalizeState(name, text);
 }
@@ -57,6 +66,7 @@ function normalize(name: string, text: string): string {
 type Step =
   | { commit: string; files: Record<string, string>; message?: string }
   | { merge: string; into: string; message?: string; resolve?: Record<string, string> }
+  | { octopus: string[]; into: string; message?: string; resolve?: Record<string, string> }
   | { branch: string; from: string };
 
 /** Builds the steps on `main` (`base` first): the same repository every time. */
@@ -76,9 +86,35 @@ function build(dir: string, steps: Step[], checkout: string): void {
       run(
         "commit",
         "-q",
+        "--allow-empty",
         "-m",
         step.message ?? `${step.commit}: ${Object.keys(step.files).join(" ")}`,
       );
+    } else if ("octopus" in step) {
+      run("checkout", "-q", step.into);
+      const message = step.message ?? `Merge ${step.octopus.join(" ")} into ${step.into}`;
+      const r = git(
+        root,
+        dir,
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-edit",
+        "-m",
+        message,
+        ...step.octopus,
+      );
+      if (r.status !== 0) {
+        // an octopus that conflicts is made by hand: the heads' files, then the resolution
+        run("reset", "-q", "--hard");
+        for (const head of step.octopus) run("checkout", "-q", head, "--", ".");
+        for (const [path, content] of Object.entries(step.resolve ?? {})) put(dir, path, content);
+        run("add", "-A");
+        const tree = run("write-tree").trim();
+        const parents = ["HEAD", ...step.octopus].flatMap((p) => ["-p", p]);
+        const id = run("commit-tree", tree, ...parents, "-m", message).trim();
+        run("reset", "-q", "--hard", id);
+      }
     } else {
       run("checkout", "-q", step.into);
       const message = step.message ?? `Merge branch '${step.merge}' into ${step.into}`;
@@ -130,6 +166,22 @@ async function ours(
 
 function expectSame(native: string, mine: string, label: string) {
   expect(snapshot(root, mine, normalize), label).toEqual(snapshot(root, native, normalize));
+  expect(refs(mine), `${label}: refs`).toBe(refs(native));
+}
+
+/**
+ * expectSame for an octopus's conflict: git-merge-one-file's markers name temporary files
+ * (`.merge_file_XXXXXX`), evened out.
+ */
+function expectSameOctopus(native: string, mine: string, label: string) {
+  const even = (dir: string) => {
+    const shot = snapshot(root, dir, normalize);
+    for (const [k, v] of Object.entries(shot.files)) {
+      shot.files[k] = v.replace(/\.merge_file_\w{6}/g, ".merge_file_X");
+    }
+    return shot;
+  };
+  expect(even(mine), label).toEqual(even(native));
   expect(refs(mine), `${label}: refs`).toBe(refs(native));
 }
 
@@ -346,5 +398,305 @@ describeGit("rebase --rebase-merges, native twins", () => {
       expect(continued.status, continued.message).toBe(RebaseStatus.OK);
       expectSame(byNative, byOurs, `continued (swap ${swap})`);
     }
+  });
+  /**
+   * Every HEAD reflog line's id and message (the octopus logs as git's merge); git 2.43 logs
+   * a recreated merge `rebase (pick)`, 2.5x `rebase (merge)`.
+   */
+  const reflog = (dir: string) => {
+    const text = gitOk(root, dir, "reflog", "--format=%H %gs", "HEAD");
+    return modernTodo() ? text : text.replace(/ rebase \(merge\): /g, " rebase (pick): ");
+  };
+
+  /** Ours with the command set up by `configure` (the upstream is main). */
+  async function oursWith(
+    dir: string,
+    configure: (command: RebaseCommand) => void,
+  ): Promise<RebaseResult> {
+    const command = (await openOurs(dir)).rebase().setCommitter(INTEROP_IDENT);
+    configure(command);
+    await command.setUpstreamBranch("main");
+    return command.call();
+  }
+
+  /** Two side branches merged at once into topic (an octopus), main moved on. */
+  const octopus = (resolve?: Record<string, string>, conflict?: "first" | "last"): Step[] => [
+    { branch: "s1", from: "main" },
+    { branch: "s2", from: "main" },
+    { branch: "topic", from: "main" },
+    {
+      commit: "s1",
+      files: { "s1.txt": "s1\n", ...(conflict === "first" ? { "a.txt": "s1\n" } : {}) },
+    },
+    {
+      commit: "s2",
+      files: { "s2.txt": "s2\n", ...(conflict === "last" ? { "a.txt": "s2\n" } : {}) },
+    },
+    { commit: "topic", files: { "t.txt": "t\n", ...(conflict ? { "a.txt": "t\n" } : {}) } },
+    {
+      octopus: ["s1", "s2"],
+      into: "topic",
+      message: "Merge s1 and s2",
+      ...(resolve ? { resolve } : {}),
+    },
+    { commit: "topic", files: { "t2.txt": "t2\n" } },
+    { commit: "main", files: { "m.txt": "m\n" } },
+  ];
+
+  /**
+   * The octopus twins without the side branches: both git versions label the heads from the
+   * merge's message then (2.5x by a branch that points at a head)
+   */
+  const octopusTwins = (steps: Step[]) => {
+    const dirs = twins(steps);
+    for (const dir of [dirs.native, dirs.ours]) gitOk(root, dir, "branch", "-D", "s1", "s2");
+    return dirs;
+  };
+
+  /** What git's merge prints on stdout for an octopus (our `output`). */
+  const octopusLines = (stdout: string) =>
+    stdout
+      .split(/[\r\n]/)
+      .filter((l) =>
+        /^(Trying|Simple merge|Auto-merging|Automated merge|Should not|Merge made|Automatic merge failed)/.test(
+          l,
+        ),
+      );
+
+  it("an octopus merge: recreated by git's octopus strategy, ORIG_HEAD and reflog as git's", async () => {
+    const { native, ours: mine } = octopusTwins(octopus());
+    const expected = git(root, native, "rebase", "-r", "main");
+    expect(expected.status, expected.stderr).toBe(0);
+    const result = await ours(mine);
+    expect(result.status, result.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "octopus");
+    expect(gitOk(root, mine, "log", "--format=%H %P %s", "topic")).toBe(
+      gitOk(root, native, "log", "--format=%H %P %s", "topic"),
+    );
+    expect(reflog(mine)).toBe(reflog(native));
+    expect(result.output).toEqual(octopusLines(expected.stdout));
+  });
+
+  it("an octopus whose last head conflicts: stop as git's merge leaves it, continue", async () => {
+    const { native, ours: mine } = octopusTwins(octopus({ "a.txt": "all\n" }, "last"));
+    const expected = git(root, native, "rebase", "-r", "main");
+    expect(expected.status).toBe(1);
+    const result = await ours(mine);
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    const stop = (s: string) =>
+      s.split(/[\r\n]/).filter((l) => /^(Could not apply|ERROR|fatal)/.test(l));
+    expect(stop(result.message ?? "")).toEqual(stop(expected.stderr));
+    expect(result.output).toEqual(octopusLines(expected.stdout));
+    expectSameOctopus(native, mine, "stopped at the octopus");
+    for (const dir of [native, mine]) {
+      writeFileSync(join(dir, "a.txt"), "resolved\n");
+      gitOk(root, dir, "add", "a.txt");
+    }
+    expect(git(root, native, "rebase", "--continue").status).toBe(0);
+    const continued = await ours(mine, RebaseOperation.CONTINUE);
+    expect(continued.status, continued.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
+    expect(gitOk(root, mine, "log", "--format=%H %P %s", "topic")).toBe(
+      gitOk(root, native, "log", "--format=%H %P %s", "topic"),
+    );
+  });
+
+  it("an octopus that gives up (an earlier head conflicts): stop, then skip", async () => {
+    const { native, ours: mine } = octopusTwins(octopus({ "a.txt": "all\n" }, "first"));
+    const expected = git(root, native, "rebase", "-r", "main");
+    expect(expected.status).toBe(1);
+    const result = await ours(mine);
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expect(result.output).toContain("Should not be doing an octopus.");
+    const stop = (s: string) =>
+      s.split(/[\r\n]/).filter((l) => /^(Could not apply|ERROR|fatal|Merge with)/.test(l));
+    expect(stop(result.message ?? "")).toEqual(stop(expected.stderr));
+    expect(result.output).toEqual(octopusLines(expected.stdout));
+    expectSame(native, mine, "gave up");
+    expect(git(root, native, "rebase", "--skip").status).toBe(0);
+    const skipped = await ours(mine, RebaseOperation.SKIP);
+    expect(skipped.status, skipped.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "skipped");
+  });
+
+  it("a branch on upstream with merges since: rebased (linearized, or rebuilt with -r)", async () => {
+    const steps: Step[] = [
+      { branch: "side", from: "main" },
+      { branch: "topic", from: "main" },
+      { commit: "side", files: { "s.txt": "s\n" } },
+      { commit: "topic", files: { "t.txt": "t\n" } },
+      { merge: "side", into: "topic" },
+      { commit: "topic", files: { "t2.txt": "t2\n" } },
+    ];
+    for (const mode of [false, true]) {
+      const { native, ours: mine } = twins(steps);
+      const expected = git(root, native, "rebase", ...(mode ? ["-r"] : []), "main");
+      expect(expected.status, expected.stderr).toBe(0);
+      expect(expected.stdout).not.toContain("is up to date");
+      const result = await ours(mine, RebaseOperation.BEGIN, mode);
+      expect(result.status, result.message).toBe(RebaseStatus.OK);
+      expectSame(native, mine, `merges since upstream (-r ${mode})`);
+      expect(gitOk(root, mine, "log", "--format=%H %P %s", "topic")).toBe(
+        gitOk(root, native, "log", "--format=%H %P %s", "topic"),
+      );
+      expect(reflog(mine)).toBe(reflog(native));
+    }
+  });
+
+  it("a linear branch on upstream is up to date: the message, detached too", async () => {
+    const steps: Step[] = [
+      { branch: "topic", from: "main" },
+      { commit: "topic", files: { "t.txt": "t\n" } },
+    ];
+    for (const detach of [false, true]) {
+      const { native, ours: mine } = twins(steps);
+      if (detach) for (const dir of [native, mine]) gitOk(root, dir, "checkout", "-q", "--detach");
+      const expected = git(root, native, "rebase", "main");
+      expect(expected.status, expected.stderr).toBe(0);
+      const result = await ours(mine, RebaseOperation.BEGIN, false);
+      expect(result.status).toBe(RebaseStatus.UP_TO_DATE);
+      expect(result.output).toEqual([expected.stdout.trim()]);
+      expectSame(native, mine, `up to date (detached ${detach})`);
+    }
+  });
+
+  it("MERGE_MSG of a merge skipped (already in HEAD) goes with the next pick's commit", async () => {
+    // rebase-cousins: the merge of main's commit finds it in HEAD already
+    const base: Step[] = [
+      { branch: "topic", from: "main" },
+      { commit: "main", files: { "m1.txt": "m1\n" } },
+      { commit: "topic", files: { "t.txt": "t\n" } },
+      { merge: "main", into: "topic", message: "Merge main into topic" },
+    ];
+    for (const last of [true, false]) {
+      const steps: Step[] = [
+        ...base,
+        ...(last ? [{ commit: "topic", files: { "t2.txt": "t2\n" } }] : []),
+        { commit: "main", files: { "m2.txt": "m2\n" } },
+      ];
+      const { native, ours: mine } = twins(steps);
+      const expected = git(root, native, "rebase", "--rebase-merges=rebase-cousins", "main");
+      expect(expected.status, expected.stderr).toBe(0);
+      const result = await ours(mine, RebaseOperation.BEGIN, "rebase-cousins");
+      expect(result.status, result.message).toBe(RebaseStatus.OK);
+      expectSame(native, mine, `skipped merge (a pick after it: ${last})`);
+    }
+  });
+
+  it("--skip: the stopped commit maps to HEAD, REBASE_HEAD kept after the last command", async () => {
+    // two picks that conflict with main: skip the first (stop at the second), skip that too
+    const steps: Step[] = [
+      { branch: "topic", from: "main" },
+      { commit: "topic", files: { "a.txt": "t1\n" } },
+      { commit: "topic", files: { "a.txt": "t2\n" } },
+      { commit: "main", files: { "a.txt": "main\n" } },
+    ];
+    const { native, ours: mine } = twins(steps);
+    expect(git(root, native, "rebase", "main").status).toBe(1);
+    expect((await ours(mine, RebaseOperation.BEGIN, false)).status).toBe(RebaseStatus.STOPPED);
+    expectSame(native, mine, "stopped");
+    for (const label of ["skipped the first", "skipped the last"]) {
+      git(root, native, "rebase", "--skip");
+      await ours(mine, RebaseOperation.SKIP);
+      expectSame(native, mine, label);
+    }
+  });
+
+  it("--signoff: each pick signed off as git signs it, forced on a branch up to date", async () => {
+    const messages = [
+      "plain",
+      "with trailers\n\nAcked-by: Someone <s@example.com>",
+      "already signed\n\nSigned-off-by: Interop Tester <interop@example.com>",
+      "signed earlier\n\nSigned-off-by: Interop Tester <interop@example.com>\nAcked-by: X <x@y>",
+    ];
+    const picks: Step[] = messages.map((message, k) => ({
+      commit: "topic",
+      files: { [`t${k}.txt`]: `${k}\n` },
+      message,
+    }));
+    for (const moved of [true, false]) {
+      const steps: Step[] = [
+        { branch: "topic", from: "main" },
+        ...picks,
+        ...(moved ? [{ commit: "main", files: { "m.txt": "m\n" } }] : []),
+      ];
+      const { native, ours: mine } = twins(steps);
+      const expected = git(root, native, "rebase", "--signoff", "main");
+      expect(expected.status, expected.stderr).toBe(0);
+      const result = await oursWith(mine, (c) => c.setSignoff(true));
+      expect(result.status, result.message).toBe(RebaseStatus.OK);
+      expectSame(native, mine, `signoff (main moved: ${moved})`);
+      expect(gitOk(root, mine, "log", "--format=%H %B", "topic")).toBe(
+        gitOk(root, native, "log", "--format=%H %B", "topic"),
+      );
+      if (!moved) {
+        expect(result.output).toContain("Current branch topic is up to date, rebase forced.");
+      }
+    }
+  });
+
+  it("--signoff with --rebase-merges: picks signed off and never fast-forwarded, a stop", async () => {
+    const { native, ours: mine } = twins(simpleStop);
+    expect(git(root, native, "rebase", "-r", "--signoff", "main").status).toBe(1);
+    const result = await oursWith(mine, (c) => c.setRebaseMerges(true).setSignoff(true));
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expectSame(native, mine, "stopped");
+    // git 2.43 commits the resolved pick with the commit's own message (no sign-off)
+    if (!modernTodo()) return;
+    for (const dir of [native, mine]) {
+      writeFileSync(join(dir, "a.txt"), "resolved\n");
+      gitOk(root, dir, "add", "a.txt");
+    }
+    expect(git(root, native, "rebase", "--continue").status).toBe(0);
+    expect((await ours(mine, RebaseOperation.CONTINUE)).status).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
+    expect(gitOk(root, mine, "log", "--format=%H %P %B", "topic")).toBe(
+      gitOk(root, native, "log", "--format=%H %P %B", "topic"),
+    );
+  });
+
+  it("--signoff with --rebase-merges on upstream already: nothing fast-forwarded", async () => {
+    const steps: Step[] = [
+      { branch: "side", from: "main" },
+      { branch: "topic", from: "main" },
+      { commit: "side", files: { "s.txt": "s\n" } },
+      { commit: "topic", files: { "t.txt": "t\n" } },
+      { merge: "side", into: "topic" },
+    ];
+    const { native, ours: mine } = twins(steps);
+    const expected = git(root, native, "rebase", "-r", "--signoff", "main");
+    expect(expected.status, expected.stderr).toBe(0);
+    const result = await oursWith(mine, (c) => c.setRebaseMerges(true).setSignoff(true));
+    expect(result.status, result.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "signed off");
+    expect(gitOk(root, mine, "log", "--format=%H %P %B", "topic")).toBe(
+      gitOk(root, native, "log", "--format=%H %P %B", "topic"),
+    );
+    expect(reflog(mine)).toBe(reflog(native));
+  });
+
+  it("an empty commit says so in the todo and done (` # empty`)", async () => {
+    const steps: Step[] = [
+      { branch: "topic", from: "main" },
+      { commit: "topic", files: {}, message: "nothing" },
+      { commit: "topic", files: { "a.txt": "topic\n" } },
+      { commit: "main", files: { "a.txt": "main\n" } },
+    ];
+    const { native, ours: mine } = twins(steps);
+    expect(git(root, native, "rebase", "main").status).toBe(1);
+    expect((await ours(mine, RebaseOperation.BEGIN, false)).status).toBe(RebaseStatus.STOPPED);
+    expectSame(native, mine, "stopped after the empty pick");
+    expect(rebaseMerge(mine, "done")).toContain(" # empty\n");
+  });
+
+  it("rebase.rebaseMerges with an unknown mode dies as git does", async () => {
+    const { native, ours: mine } = twins(simple, "topic", { "rebase.rebaseMerges": "bogus" });
+    const expected = git(root, native, "rebase", "--rebase-merges", "main");
+    expect(expected.status).toBe(128);
+    const result = await ours(mine);
+    expect(result.status).toBe(RebaseStatus.FAILED);
+    expect(result.message).toBe(expected.stderr.trim());
+    expect(result.message).toBe("fatal: Unknown rebase-merges mode: bogus");
+    expectSame(native, mine, "refused");
   });
 });

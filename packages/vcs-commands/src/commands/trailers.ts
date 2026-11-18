@@ -245,16 +245,16 @@ function unfoldValue(value: string): string {
   return trim(out);
 }
 
-/** The block of `message` and its items (trailer.c's parse_trailers, no `---` divider). */
-function parseTrailers(
+/**
+ * trailer.c's trailer_block_get (no `---` divider): where the block is and its lines, a
+ * continuation (a line starting with a blank) joined to the trailer before it.
+ */
+function trailerBlock(
   message: string,
-  options: TrailerFormatOptions,
   config: Required<TrailerConfig>,
-): { start: number; end: number; items: TrailerItem[] } {
+): { start: number; end: number; lines: string[] } {
   const end = message.length - ignoredBytes(message, message.length, config.commentString);
   const start = trailerBlockStart(message, end, config);
-  // trailer_block_get: the lines, a continuation (a line starting with a blank) joined to
-  // the trailer before it
   const lines: string[] = [];
   let lastIsTrailer = false;
   for (let i = start; i < end; ) {
@@ -268,6 +268,63 @@ function parseTrailers(
     lines.push(line);
     lastIsTrailer = findSeparator(line, 0, config.separators) >= 1;
   }
+  return { start, end, lines };
+}
+
+/** The configuration with git's defaults. */
+function withDefaults(trailerConfig: TrailerConfig): Required<TrailerConfig> {
+  return {
+    separators: trailerConfig.separators || ":",
+    commentString: trailerConfig.commentString || "#",
+    items: trailerConfig.items ?? [],
+  };
+}
+
+/**
+ * sequencer.c's append_signoff (no footer to ignore, no dedup): `sob` (`Signed-off-by:
+ * <ident>` and a line end) appended to `message`, after a blank line unless the message
+ * ends with a trailer block; nothing appended when the block's last line is `sob` already
+ * (has_conforming_footer), or when the message is `sob` alone.
+ *
+ * @example
+ * ```typescript
+ * appendSignoff("Fix\n", "Signed-off-by: A <a@b>\n");
+ * // "Fix\n\nSigned-off-by: A <a@b>\n"
+ * ```
+ */
+export function appendSignoff(
+  message: string,
+  sob: string,
+  trailerConfig: TrailerConfig = {},
+): string {
+  // strbuf_complete_line
+  let out = message.length > 0 && !message.endsWith("\n") ? `${message}\n` : message;
+  let footer: 0 | 1 | 2 | 3;
+  if (out === sob) footer = 3;
+  else {
+    const { lines } = trailerBlock(out, withDefaults(trailerConfig));
+    let found = 0;
+    lines.forEach((line, k) => {
+      if (line.startsWith(sob)) found = k + 1;
+    });
+    footer = lines.length === 0 ? 0 : found === lines.length ? 3 : found ? 2 : 1;
+  }
+  if (footer === 0) {
+    if (out.length === 0) out = "\n\n";
+    else if (out.length === 1) out += "\n";
+    else if (out[out.length - 2] !== "\n") out += "\n";
+  }
+  if (footer !== 3) out += sob;
+  return out;
+}
+
+/** The block of `message` and its items (trailer.c's parse_trailers, no `---` divider). */
+function parseTrailers(
+  message: string,
+  options: TrailerFormatOptions,
+  config: Required<TrailerConfig>,
+): { start: number; end: number; items: TrailerItem[] } {
+  const { start, end, lines } = trailerBlock(message, config);
   const items: TrailerItem[] = [];
   for (const trailer of lines) {
     if (trailer.startsWith(config.commentString)) continue;
@@ -300,11 +357,7 @@ export function appendTrailers(
   options: TrailerFormatOptions = {},
   trailerConfig: TrailerConfig = {},
 ): string {
-  const config: Required<TrailerConfig> = {
-    separators: trailerConfig.separators || ":",
-    commentString: trailerConfig.commentString || "#",
-    items: trailerConfig.items ?? [],
-  };
+  const config = withDefaults(trailerConfig);
   const block = parseTrailers(message, options, config);
   const filtered = options.keys !== undefined;
   if (
