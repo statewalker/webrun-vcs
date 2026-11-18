@@ -3,6 +3,8 @@ import type { Checkout, WorkingCopy, Worktree, WorktreeAdmin } from "@statewalke
 
 import {
   AddCommand,
+  AmCommand,
+  ApplyCommand,
   BisectCommand,
   BisectLogCommand,
   BisectNextCommand,
@@ -26,6 +28,7 @@ import {
   DescribeCommand,
   DiffCommand,
   FetchCommand,
+  FormatPatchCommand,
   FsckCommand,
   GarbageCollectCommand,
   InitCommand,
@@ -723,6 +726,47 @@ export class Git implements Disposable {
   diff(): DiffCommand {
     this.checkClosed();
     return new DiffCommand(this._workingCopy);
+  }
+
+  // ============ Patch Operations ============
+
+  /**
+   * `git apply`: applies patches to the worktree and/or the index.
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, errors } = await git.apply().addPatch(patchBytes).setIndex(true).call();
+   * ```
+   */
+  apply(): ApplyCommand {
+    this.checkClosed();
+    return new ApplyCommand(this._workingCopy);
+  }
+
+  /**
+   * `git format-patch`: commits as emails.
+   *
+   * @example
+   * ```typescript
+   * const { patches } = await git.formatPatch().addRevision("main..topic").call();
+   * ```
+   */
+  /**
+   * `git am`: applies patches from mailboxes, one commit per mail.
+   *
+   * @example
+   * ```typescript
+   * await git.am().addMbox(mbox).call();
+   * ```
+   */
+  am(): AmCommand {
+    this.checkClosed();
+    return new AmCommand(this._workingCopy);
+  }
+
+  formatPatch(): FormatPatchCommand {
+    this.checkClosed();
+    return new FormatPatchCommand(this._workingCopy);
   }
 
   // ============ Remote Operations ============

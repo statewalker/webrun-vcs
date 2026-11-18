@@ -106,11 +106,32 @@ export async function patchId(
 ): Promise<string | undefined> {
   const changes = await treeChanges(trees, parentTree, tree);
   if (changes.length === 0) return undefined;
+  return patchIdOfChanges(blobs, changes, options);
+}
+
+/** A changed file for {@link patchIdOfChanges}; `oldPath` differs from `path` for a rename. */
+export interface PatchIdChange {
+  path: string;
+  oldPath?: string;
+  old?: { mode: number; id: ObjectId };
+  new?: { mode: number; id: ObjectId };
+}
+
+/**
+ * The patch-id of a list of changed files as the diff queue has them (renames and copies
+ * found by the caller, as `git format-patch --base` finds them).
+ */
+export async function patchIdOfChanges(
+  blobs: Blobs,
+  changes: PatchIdChange[],
+  options: { headerOnly?: boolean } = {},
+): Promise<string> {
   const sum = new Uint8Array(20);
   for (const change of changes) {
     const h = createSha1();
-    const oldPath = removeSpace(encodeGitPath(change.path));
-    const newPath = oldPath;
+    const newPath = removeSpace(encodeGitPath(change.path));
+    const oldPath =
+      change.oldPath !== undefined ? removeSpace(encodeGitPath(change.oldPath)) : newPath;
     str(h, "diff--git");
     str(h, "a/");
     h.update(oldPath);

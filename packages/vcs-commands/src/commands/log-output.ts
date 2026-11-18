@@ -47,6 +47,7 @@ import {
   type RefDecorations,
   wrapText,
 } from "./pretty-format.js";
+import { appendSignoff } from "./trailers.js";
 
 /** How `git log` treats merges in its diffs (`--diff-merges=<mode>`, `-m`, `-c`, `--cc`). */
 export type LogDiffMerges = "off" | "first-parent" | "separate" | "combined" | "dense-combined";
@@ -149,6 +150,30 @@ export interface LogOutputOptions {
   localTzOffset?: (time: number) => number;
   /** The local zone's name at a time, for `%Z` of `format-local:` (default `Intl`'s) */
   localTzName?: (time: number) => string;
+  /** `git format-patch`'s mail settings (with the `email` or `mboxrd` format) */
+  mail?: LogMailOptions;
+}
+
+/** What `git format-patch` adds to the `email` format (log-tree.c, pretty.c). */
+export interface LogMailOptions {
+  /** The subject's start (`fmt_output_email_subject`), e.g. `Subject: [PATCH 1/3] ` */
+  subject?: (id: ObjectId) => string;
+  /** `Message-ID`, `In-Reply-To` and `References` lines after the `From <id>` line */
+  threadHeaders?: (id: ObjectId) => string;
+  /** Headers after the subject (`format.headers`, `To:`, `Cc:`), each with its LF */
+  afterSubject?: string;
+  /** `--zero-commit`: an all-zero id on the `From` line */
+  zeroCommit?: boolean;
+  /** `-k`: the subject kept as it is (its lines not joined) */
+  preserveSubject?: boolean;
+  /** `--signoff`: this `Signed-off-by: ...` line (with LF) appended, unless already there */
+  signoff?: string;
+  /** `--from=<ident>`: the `From:` header's ident (the author moves to an in-body From) */
+  from?: { name: string; email: string };
+  /** `--force-in-body-from` */
+  forceInBodyFrom?: boolean;
+  /** `format.encodeEmailHeaders` (default true): RFC 2047 for non-ASCII subjects */
+  encodeHeaders?: boolean;
 }
 
 /** A commit the walk shows, with the parents it is shown with (rewritten under `--graph`). */
@@ -434,6 +459,21 @@ function addRfc2047(sb: string, text: string, address: boolean): string {
     i += len;
   }
   return `${out}?=`;
+}
+
+/** The `From:` header of the email format (pp_user_info): RFC 2047 or quoted as needed. */
+export function mailFromHeader(name: string, email: string): string {
+  let max = 78;
+  let out = "From: ";
+  if (needsRfc2047(name)) {
+    out += addRfc2047(out, name, true);
+    max = 76;
+  } else if ([...name].some((c) => RFC822_SPECIALS.includes(c))) {
+    const quoted = `"${name.replace(/["\\]/g, (c) => `\\${c}`)}"`;
+    out += wrapText(quoted, -6, 1, max);
+  } else out += wrapText(name, -6, 1, max);
+  if (max < lastLineLength(out) + 2 + bytesOf(email).length + 1) out += "\n";
+  return `${out} <${email}>\n`;
 }
 
 /** The parts of a commit as git's pretty printer reads them. */
@@ -990,8 +1030,12 @@ export class LogPrinter {
     if (this.graph) this.out.text(this.graph.showCommit());
     const isMail = fmt === "email" || fmt === "mboxrd";
     if (isMail) {
-      this.out.text(`From ${entry.id} Mon Sep 17 00:00:00 2001\n`);
+      const mail = this.options.mail;
+      const shownId = mail?.zeroCommit ? "0".repeat(entry.id.length) : entry.id;
+      this.out.text(`From ${shownId} Mon Sep 17 00:00:00 2001\n`);
       this.out.text(this.oneline());
+      const thread = mail?.threadHeaders?.(entry.id);
+      if (thread) this.out.text(thread);
     } else if (fmt !== "user") {
       if (fmt !== "oneline") this.out.text("commit ");
       this.out.text(await this.abbrevId(entry.id, this.abbrevCommit));
@@ -1007,6 +1051,8 @@ export class LogPrinter {
     let notes: string | undefined;
     if (this.showNotes) notes = await this.notesText(entry.id, fmt === "user");
     let msg = await this.prettyPrint(entry, notes ?? "");
+    if (isMail && this.options.mail?.signoff)
+      msg = appendSignoff(msg, this.options.mail.signoff, {}, true);
     if (fmt !== "user" && notes) {
       if (isMail) {
         msg += this.shownDashes ? "\n" : "---\n";
@@ -1076,6 +1122,8 @@ export class LogPrinter {
     }
     const isMail = fmt === "email" || fmt === "mboxrd";
     const indent = fmt === "oneline" || isMail ? 0 : 4;
+    const mail = isMail ? this.options.mail : undefined;
+    const inBody: string[] = [];
     let sb = "";
     // pp_header
     if (fmt === "raw") {
@@ -1087,7 +1135,7 @@ export class LogPrinter {
         sb += "\n";
       }
       if (fmt !== "oneline") {
-        sb = this.userInfo(sb, "Author", idents.author, isMail);
+        sb = this.userInfo(sb, "Author", idents.author, isMail, inBody);
         if (fmt === "full" || fmt === "fuller") {
           sb = this.userInfo(sb, "Commit", idents.committer, false);
         }
@@ -1106,19 +1154,23 @@ export class LogPrinter {
         }
         parts.push(trimmed);
       }
-      const title = parts.join(" ");
+      const title = parts.join(mail?.preserveSubject ? "\n" : " ");
       if (fmt === "oneline") sb += `${title}\n`;
       else {
-        sb += "Subject: [PATCH] ";
-        if (needsRfc2047(title)) sb += addRfc2047(sb, title, false);
+        sb += mail?.subject ? mail.subject(entry.id) : "Subject: [PATCH] ";
+        if ((mail?.encodeHeaders ?? true) && needsRfc2047(title))
+          sb += addRfc2047(sb, title, false);
         else sb += wrapText(title, -lastLineLength(sb), 1, 78);
         sb += "\n";
-        // need_8bit_cte: a body (after the header) with a byte above 0x7f
-        if (hasNonAscii(parsed.body)) {
+        // need_8bit_cte: a body (after the header) with a byte above 0x7f, or an in-body
+        // header with one
+        if (hasNonAscii(parsed.body) || inBody.some(hasNonAscii)) {
           sb +=
             "MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n";
         }
+        if (mail?.afterSubject) sb += mail.afterSubject;
         sb += "\n";
+        if (inBody.length) sb += `${inBody.join("")}\n`;
       }
     }
     const beginningOfBody = sb.length;
@@ -1151,9 +1203,24 @@ export class LogPrinter {
   }
 
   /** pretty.c's pp_user_info */
-  private userInfo(sb: string, what: string, ident: PersonIdent, mail: boolean): string {
-    const { name, email } = this.mapped(ident);
+  private userInfo(
+    sb: string,
+    what: string,
+    ident: PersonIdent,
+    mail: boolean,
+    inBody: string[] = [],
+  ): string {
+    let { name, email } = this.mapped(ident);
     let out = sb;
+    const from = mail ? this.options.mail?.from : undefined;
+    if (
+      from &&
+      (this.options.mail?.forceInBodyFrom || from.email !== email || from.name !== name)
+    ) {
+      inBody.push(`From: ${name} <${email}>\n`);
+      name = from.name;
+      email = from.email;
+    }
     if (mail) {
       let max = 78;
       out += "From: ";

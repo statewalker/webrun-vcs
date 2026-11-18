@@ -281,7 +281,7 @@ function withDefaults(trailerConfig: TrailerConfig): Required<TrailerConfig> {
 }
 
 /**
- * sequencer.c's append_signoff (no footer to ignore, no dedup): `sob` (`Signed-off-by:
+ * sequencer.c's append_signoff (no footer to ignore; `dedup` is APPEND_SIGNOFF_DEDUP): `sob` (`Signed-off-by:
  * <ident>` and a line end) appended to `message`, after a blank line unless the message
  * ends with a trailer block; nothing appended when the block's last line is `sob` already
  * (has_conforming_footer), or when the message is `sob` alone.
@@ -296,6 +296,7 @@ export function appendSignoff(
   message: string,
   sob: string,
   trailerConfig: TrailerConfig = {},
+  dedup = false,
 ): string {
   // strbuf_complete_line
   let out = message.length > 0 && !message.endsWith("\n") ? `${message}\n` : message;
@@ -314,7 +315,8 @@ export function appendSignoff(
     else if (out.length === 1) out += "\n";
     else if (out[out.length - 2] !== "\n") out += "\n";
   }
-  if (footer !== 3) out += sob;
+  // APPEND_SIGNOFF_DEDUP: not added again when the footer has it anywhere
+  if (footer !== 3 && !(dedup && footer === 2)) out += sob;
   return out;
 }
 
