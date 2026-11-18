@@ -12,8 +12,8 @@ import {
   parseGraphCommit,
   replacementOf,
 } from "@statewalker/vcs-core";
-import { OrderedMap } from "@statewalker/vcs-utils";
-import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { ByteSink, OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import {
@@ -29,13 +29,25 @@ import {
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import { writeCombinedDiff } from "../results/combined-diff.js";
+import { quotePath } from "../results/quote-path.js";
 import { attributesSourceResolver } from "./attributes-source.js";
+import { DiffCommand, type DiffTextOptions } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import {
+  type LogOutputEntry,
+  type LogOutputHost,
+  type LogOutputOptions,
+  LogPrinter,
+} from "./log-output.js";
+import { Mailmap } from "./mailmap.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   ALL_ENTRIES_NOT_INTERESTING,
   bloomPathOf,
   ENTRY_NOT_INTERESTING,
+  matchPathspec,
   NEED_ATTRIBUTES,
   type PathspecAttributeValue,
   type PathspecItem,
@@ -45,6 +57,18 @@ import {
   treeEntryInteresting,
   treePathspec,
 } from "./pathspec.js";
+import { loadRefDecorations } from "./pretty-format.js";
+
+const NULL_OBJECT_ID = "0".repeat(40);
+
+/** What {@link LogCommand.callBytes} asks of the walk. */
+interface OutputWalk {
+  /** `--topo-order` (and `--graph`) */
+  topo: boolean;
+  /** `--graph`: parents rewritten past the commits not shown */
+  rewrite: boolean;
+  entries: LogOutputEntry[];
+}
 
 /** git log reads no index: the in-tree attributes files are the worktree's only. */
 const NO_INDEX = { attributesBlob: () => undefined };
@@ -177,6 +201,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   };
   /** The commits of the last walk (for its statistics). */
   private lastWalk: RevTable | undefined;
+  /** Set while {@link callBytes} collects the walk for its output */
+  private outputWalk: OutputWalk | undefined;
 
   /**
    * Add a starting commit for the log.
@@ -418,9 +444,21 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   private async getAllRefs(): Promise<ObjectId[]> {
     const ids: ObjectId[] = [];
+    const tags = this.tagsStore;
     for await (const ref of this.refsStore.list()) {
       if ("objectId" in ref && ref.objectId) {
-        ids.push(ref.objectId);
+        // an annotated tag is walked from the commit it tags (git peels it)
+        let id = ref.objectId;
+        for (
+          let depth = 0;
+          depth < 32 && tags && (await tags.has(id).catch(() => false));
+          depth++
+        ) {
+          const tag = await tags.load(id).catch(() => undefined);
+          if (!tag) break;
+          id = tag.object;
+        }
+        ids.push(id);
       }
     }
     return ids;
@@ -584,10 +622,18 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
     };
     /** git's get_commit_action (no parent rewriting: TREESAME commits are never shown) */
-    const shown = async (n: number): Promise<LogResult | undefined> => {
+    const shown = async (n: number, rewrite = false): Promise<LogResult | undefined> => {
       const bytes = raw.get(n);
       if (bytes) raw.delete(n);
-      if (t.flag(n) & (UNINTERESTING | TREESAME)) return undefined;
+      if (t.flag(n) & UNINTERESTING) return undefined;
+      if (t.flag(n) & TREESAME) {
+        // with parents rewritten, a merge of two relevant lines ties the topology together
+        if (!rewrite) return undefined;
+        let relevantParents = 0;
+        for (let k = 0, c = t.parentCount(n); k < c; k++)
+          if (relevant(t.parent(n, k))) relevantParents++;
+        if (relevantParents < 2) return undefined;
+      }
       if (this.untilTime !== undefined && t.date(n) > this.untilTime) return undefined;
       const parents = t.parentCount(n);
       if (this.revFilter === RevFilter.ONLY_MERGES && parents < 2) return undefined;
@@ -631,7 +677,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     let skipped = 0;
     // git's -n 0 reads nothing more in a streaming walk; a limited walk is done before
     const none = this.maxCount !== undefined && this.maxCount <= 0;
-    if (!limited) {
+    const output = this.outputWalk;
+    if (!limited && !output) {
       if (none) return;
       // get_revision_1, streaming
       for (let n = queue.get(); n !== undefined; n = queue.get()) {
@@ -693,6 +740,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       newlist.push(n);
     }
     raw.clear();
+    if (output) {
+      await this.finishOutputWalk(output, t, newlist, shown, relevant);
+      return;
+    }
     if (none) return;
     for (const n of newlist) {
       const commit = await shown(n);
@@ -704,6 +755,472 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       yield commit;
       if (this.maxCount !== undefined && ++count >= this.maxCount) return;
     }
+  }
+
+  /**
+   * The walk's commits for `git log`'s output (git's limited walk, then
+   * sort_in_topological_order when asked, then get_commit_action and rewrite_parents): the
+   * commits shown in order, with their parents as shown.
+   */
+  private async finishOutputWalk(
+    output: OutputWalk,
+    t: RevTable,
+    newlist: number[],
+    shown: (n: number, rewrite?: boolean) => Promise<LogResult | undefined>,
+    relevant: (n: number) => boolean,
+  ): Promise<void> {
+    let order = newlist;
+    if (output.topo) {
+      // sort_in_topological_order (REV_SORT_IN_GRAPH_ORDER: a LIFO of the ready commits)
+      const indegree = new Map<number, number>();
+      for (const n of newlist) indegree.set(n, 1);
+      for (const n of newlist) {
+        for (let k = 0, c = t.parentCount(n); k < c; k++) {
+          const p = t.parent(n, k);
+          const d = indegree.get(p);
+          if (d) indegree.set(p, d + 1);
+        }
+      }
+      const stack: number[] = [];
+      for (const n of newlist) if (indegree.get(n) === 1) stack.push(n);
+      stack.reverse();
+      order = [];
+      for (let n = stack.pop(); n !== undefined; n = stack.pop()) {
+        for (let k = 0, c = t.parentCount(n); k < c; k++) {
+          const p = t.parent(n, k);
+          const d = indegree.get(p);
+          if (!d) continue;
+          indegree.set(p, d - 1);
+          if (d - 1 === 1) stack.push(p);
+        }
+        indegree.set(n, 0);
+        order.push(n);
+      }
+    }
+    const firstParentOnly = this.firstParentOnly;
+    /** revision.c's one_relevant_parent */
+    const oneRelevantParent = (n: number): number | undefined => {
+      const c = t.parentCount(n);
+      if (c === 0) return undefined;
+      if (firstParentOnly || c === 1) return t.parent(n, 0);
+      let found: number | undefined;
+      for (let k = 0; k < c; k++) {
+        const p = t.parent(n, k);
+        if (!relevant(p)) continue;
+        if (found !== undefined) return undefined;
+        found = p;
+      }
+      return found;
+    };
+    /** revision.c's rewrite_one: the parent shown in place of `p`; undefined to drop it */
+    const rewriteOne = (start: number): number | undefined => {
+      let p = start;
+      for (;;) {
+        if (t.flag(p) & UNINTERESTING) return p;
+        if (!(t.flag(p) & TREESAME)) return p;
+        if (t.parentCount(p) === 0) return undefined;
+        const next = oneRelevantParent(p);
+        if (next === undefined) return p;
+        p = next;
+      }
+    };
+    const prune = this.paths.length > 0 || this.excludePaths.length > 0;
+    for (const n of order) {
+      const commit = await shown(n, output.rewrite && prune);
+      if (!commit) continue;
+      let parents = commit.parents;
+      if (output.rewrite && prune) {
+        const ids: ObjectId[] = [];
+        for (let k = 0, c = t.parentCount(n); k < c; k++) {
+          const p = rewriteOne(t.parent(n, k));
+          if (p === undefined) continue;
+          const id = t.idOf(p);
+          // remove_duplicate_parents
+          if (!ids.includes(id)) ids.push(id);
+        }
+        parents = ids;
+      }
+      const { id, ...rest } = commit;
+      output.entries.push({ id, commit: rest, parents });
+    }
+  }
+
+  /**
+   * The log printed as `git log <options>` prints it to a pipe (no colors, no pager): the
+   * walk set up by this command (start points, ranges, paths, `-n`, `--skip`, filters), each
+   * commit in the format asked for, with the graph and the diffs asked for. See
+   * {@link LogOutputOptions}.
+   *
+   * @example
+   * ```typescript
+   * await git.log().setMaxCount(2).callText({ pretty: "format:%h %s" });
+   * // "1a2b3c4 Second\n5d6e7f8 First"
+   * ```
+   */
+  async callText(options: LogOutputOptions = {}): Promise<string> {
+    return decodeGitPath(await this.callBytes(options));
+  }
+
+  /** {@link callText} as bytes (messages and file contents that are not UTF-8 kept as they are). */
+  async callBytes(options: LogOutputOptions = {}): Promise<Uint8Array> {
+    const host = this.outputHost();
+    const paths = [...this.paths];
+    const printer = new LogPrinter(host, options, {
+      interesting: (id) => shownIds.has(id),
+      firstParentOnly: this.firstParentOnly,
+      paths: this.excludePaths.length > 0 ? [...paths, ...this.excludePaths] : paths,
+    });
+    const follow = !printer.alwaysShowHeader;
+    const graph = !!options.graph;
+    const topo = graph || !!options.topoOrder;
+    const maxCount = this.maxCount;
+    const skip = this.skip;
+    // --follow walks every commit: its path changes as it goes
+    if (follow) this.paths = [];
+    const shownIds = new Set<ObjectId>();
+    let entries: LogOutputEntry[];
+    if (topo) {
+      this.outputWalk = { topo, rewrite: graph, entries: [] };
+      for await (const _ of await this.call()) {
+        // the output walk collects its commits
+      }
+      entries = this.outputWalk.entries;
+      this.outputWalk = undefined;
+      for (const e of entries) shownIds.add(e.id);
+      entries = entries.slice(skip);
+      if (maxCount !== undefined && !follow) entries = entries.slice(0, Math.max(maxCount, 0));
+      if (maxCount !== undefined && maxCount <= 0) entries = [];
+    } else {
+      if (follow) this.maxCount = undefined;
+      entries = [];
+      for await (const c of await this.call()) {
+        const { id, ...commit } = c;
+        entries.push({ id, commit, parents: c.parents });
+      }
+      if (follow) this.maxCount = maxCount;
+    }
+    if (options.reverse) entries.reverse();
+    await printer.start();
+    if (graph) {
+      const parentsOf = new Map(entries.map((e) => [e.id, e.parents]));
+      printer.useGraph((id) => parentsOf.get(id) ?? []);
+    }
+    let count = 0;
+    for (let k = 0; k < entries.length; k++) {
+      const e = entries[k] as LogOutputEntry;
+      const lookahead = entries.slice(k + 1, k + 3).map((x) => x.id);
+      const shown = await printer.showCommit(e, lookahead);
+      if (shown && follow && maxCount !== undefined && ++count >= maxCount) break;
+    }
+    if (follow) this.paths = paths;
+    return printer.result();
+  }
+
+  /** What the log printer reads of the repository. */
+  private outputHost(): LogOutputHost {
+    const config = RemoteConfigStore.from(this._workingCopy);
+    const abbreviator = this.idAbbreviator();
+    const abbrevs = new Map<string, string>();
+    let notesMaps: Promise<{ ref: string; notes: Map<ObjectId, ObjectId> }[]> | undefined;
+    let mailmap: Promise<Mailmap> | undefined;
+    return {
+      config: (key) => config.value(key),
+      configAll: (key) => config.values(key),
+      configNames: (section) => {
+        const prefix = `${section.toLowerCase()}.`;
+        const names = new Set<string>();
+        for (const key of Object.keys(this._workingCopy.config ?? {})) {
+          const parts = key.split(".");
+          if (parts.length === 2 && key.toLowerCase().startsWith(prefix))
+            names.add(parts[1] as string);
+        }
+        return [...names];
+      },
+      abbreviate: async (id, minLength) => {
+        const key = `${id}:${minLength ?? ""}`;
+        let short = abbrevs.get(key);
+        if (short === undefined) {
+          if (minLength === undefined) short = await abbreviator.abbreviate(id);
+          else
+            short = id.slice(0, (await abbreviator.lengths([id], minLength)).get(id) ?? minLength);
+          abbrevs.set(key, short);
+        }
+        return short;
+      },
+      rawCommit: async (id) => {
+        const bytes = await this.readObjectBytes(id);
+        return bytes ? decodeGitPath(bytes) : undefined;
+      },
+      decorations: async (options) => {
+        const replacements = await this.objectReplacements();
+        const shallow = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
+        const environment = hostEnvironmentOf(this._workingCopy);
+        const objects = this._workingCopy.history?.objects;
+        const tags = this.tagsStore;
+        return loadRefDecorations({
+          refs: this.refsStore,
+          ...(tags ? { tags } : {}),
+          ...(environment?.replaceRefBase !== undefined
+            ? { replaceRefBase: environment.replaceRefBase }
+            : {}),
+          useReplaceRefs: this.useReplaceRefs(),
+          grafted: new Set([...(replacements?.grafts.keys() ?? []), ...shallow]),
+          ...(objects ? { hasObject: (id: ObjectId) => objects.has(id) } : {}),
+          logOptions: {
+            decorate: options.decorate,
+            ...(options.decorateRefs ? { decorateRefs: options.decorateRefs } : {}),
+            ...(options.decorateRefsExclude
+              ? { decorateRefsExclude: options.decorateRefsExclude }
+              : {}),
+            ...(options.clearDecorations ? { clearDecorations: true } : {}),
+            config,
+          },
+        });
+      },
+      notes: async (id) => {
+        notesMaps ??= this.loadNotes(config);
+        const out: { ref: string; text: string }[] = [];
+        for (const { ref, notes } of await notesMaps) {
+          const blob = notes.get(id);
+          if (!blob) continue;
+          const bytes = await this.readBlob(blob);
+          if (bytes) out.push({ ref, text: decodeGitPath(bytes) });
+        }
+        return out;
+      },
+      mailmap: () => {
+        mailmap ??= this.loadMailmap(config);
+        return mailmap;
+      },
+      diff: async (entry, parent, formats, options) => {
+        const diff = new DiffCommand(this._workingCopy)
+          .setOldTree(parent ?? EMPTY_TREE_ID)
+          .setNewTree(entry.id);
+        if (options.statWidth !== undefined) {
+          diff.setOptions({
+            ...this.diffOptions,
+            stat: { ...this.diffOptions.stat, width: options.statWidth },
+          });
+        } else diff.setOptions(this.diffOptions);
+        if (!options.fullDiff && options.follow === undefined) {
+          const spec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
+          if (spec.length > 0) diff.setPathspec(spec);
+        }
+        return diff.callFormats(formats, options.follow);
+      },
+      combinedDiff: (entry, options) => this.combinedDiff(entry, options),
+    };
+  }
+
+  private diffOptions: DiffTextOptions = {};
+
+  /** Options of the diffs {@link callBytes} prints (context, algorithm, `--stat` widths...) */
+  setDiffOptions(options: DiffTextOptions): this {
+    this.checkCallable();
+    this.diffOptions = { ...this.diffOptions, ...options };
+    return this;
+  }
+
+  /** An object's content as stored (undefined when missing) */
+  private async readObjectBytes(id: ObjectId): Promise<Uint8Array | undefined> {
+    const objects = this._workingCopy.history?.objects;
+    if (!objects) return undefined;
+    try {
+      const obj = await objects.get(id);
+      if (!obj) return undefined;
+      if (obj.bytes) return obj.bytes;
+      const chunks: Uint8Array[] = [];
+      for await (const c of obj.content) chunks.push(c);
+      return concatBytes(chunks);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readBlob(id: ObjectId): Promise<Uint8Array | undefined> {
+    try {
+      const content = await this.blobs.load(id);
+      if (!content) return undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const c of content) chunks.push(c);
+      return concatBytes(chunks);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The blobs of a tree, by path (empty for a missing tree) */
+  private async flatTree(
+    tree: ObjectId,
+    prefix = "",
+    out = new Map<string, { mode: number; id: ObjectId }>(),
+  ): Promise<Map<string, { mode: number; id: ObjectId }>> {
+    if (tree === EMPTY_TREE_ID) return out;
+    for await (const entry of this.trees.loadTree(tree)) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if ((entry.mode & 0o170000) === 0o040000) await this.flatTree(entry.id, path, out);
+      else out.set(path, { mode: entry.mode, id: entry.id });
+    }
+    return out;
+  }
+
+  /**
+   * combine-diff.c's diff_tree_combined for a merge: the paths that differ from every
+   * parent (within the pathspec), each as a combined diff of the trees.
+   */
+  private async combinedDiff(
+    entry: LogOutputEntry,
+    options: { dense: boolean; names?: "name-only" | "name-status"; patch: boolean },
+  ): Promise<{ paths: number; names: Uint8Array; patch: Uint8Array }> {
+    const { dense } = options;
+    const result = await this.flatTree(entry.commit.tree);
+    const parents: Map<string, { mode: number; id: ObjectId }>[] = [];
+    for (const p of entry.parents) {
+      const commit = await this.commits.load(p);
+      parents.push(commit ? await this.flatTree(commit.tree) : new Map());
+    }
+    const spec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
+    const items = spec.map((p) => parsePathspecItem(p));
+    if (items.length > 0 && items.every((i) => i.exclude)) items.push(parsePathspecItem("."));
+    const all = new Set<string>(result.keys());
+    for (const m of parents) for (const k of m.keys()) all.add(k);
+    const differs = (a?: { mode: number; id: ObjectId }, b?: { mode: number; id: ObjectId }) =>
+      !a || !b ? a !== b : a.id !== b.id || a.mode !== b.mode;
+    const paths = [...all]
+      .filter((path) => items.length === 0 || matchPathspec(items, path, 0) > 0)
+      .filter((path) => parents.every((m) => differs(m.get(path), result.get(path))))
+      .sort((a, b) => {
+        const ea = encodeGitPath(a);
+        const eb = encodeGitPath(b);
+        for (let i = 0; i < ea.length && i < eb.length; i++) {
+          if (ea[i] !== eb[i]) return (ea[i] as number) - (eb[i] as number);
+        }
+        return ea.length - eb.length;
+      });
+    const sink = new ByteSink();
+    const quote =
+      parseGitBool(RemoteConfigStore.from(this._workingCopy).value("core.quotePath")) ?? true;
+    const names = new ByteSink();
+    if (options.names) {
+      for (const path of paths) {
+        if (options.names === "name-status") {
+          const r = result.get(path);
+          for (const m of parents) names.text(!m.get(path) ? "A" : !r ? "D" : "M");
+          names.text("\t");
+        }
+        names.text(`${quotePath(path, quote)}\n`);
+      }
+    }
+    if (paths.length === 0 || !options.patch) {
+      return { paths: paths.length, names: names.bytes(), patch: sink.bytes() };
+    }
+    const ids = new Set<string>([NULL_OBJECT_ID]);
+    for (const path of paths) {
+      const r = result.get(path);
+      if (r) ids.add(r.id);
+      for (const m of parents) {
+        const e = m.get(path);
+        if (e) ids.add(e.id);
+      }
+    }
+    const lengths = await this.idAbbreviator().lengths(ids);
+    const read = async (e?: { mode: number; id: ObjectId }) => {
+      if (!e) return new Uint8Array(0);
+      if ((e.mode & 0o170000) === 0o160000) return encodeGitPath(`Subproject commit ${e.id}\n`);
+      return (await this.readBlob(e.id)) ?? new Uint8Array(0);
+    };
+    const context = Number(RemoteConfigStore.from(this._workingCopy).value("diff.context") ?? 3);
+    for (const path of paths) {
+      const r = result.get(path);
+      const sides = [];
+      for (const m of parents) {
+        const e = m.get(path);
+        sides.push({ id: e?.id ?? NULL_OBJECT_ID, mode: e?.mode ?? 0, content: await read(e) });
+      }
+      writeCombinedDiff(
+        sink,
+        {
+          path,
+          parents: sides,
+          result: { id: r?.id ?? NULL_OBJECT_ID, mode: r?.mode ?? 0, content: await read(r) },
+        },
+        {
+          dense,
+          workingTreeFile: false,
+          context: this.diffOptions.context ?? (Number.isFinite(context) ? context : 3),
+          abbreviate: (id) => id.slice(0, lengths.get(id) ?? 7),
+          quotePath: quote,
+        },
+      );
+    }
+    return { paths: paths.length, names: names.bytes(), patch: sink.bytes() };
+  }
+
+  /** The display notes refs (`core.notesRef`, else refs/notes/commits; `notes.displayRef`) */
+  private async loadNotes(
+    config: RemoteConfigStore,
+  ): Promise<{ ref: string; notes: Map<ObjectId, ObjectId> }[]> {
+    const refs = [config.value("core.notesRef") ?? "refs/notes/commits"];
+    for (const r of config.values("notes.displayRef")) {
+      const name = r.startsWith("refs/") ? r : `refs/notes/${r}`;
+      if (!refs.includes(name)) refs.push(name);
+    }
+    const out: { ref: string; notes: Map<ObjectId, ObjectId> }[] = [];
+    for (const ref of refs) {
+      const resolved = await this.refsStore.resolve(ref).catch(() => undefined);
+      const id = resolved?.objectId;
+      if (!id) continue;
+      const commit = await this.commits.load(id).catch(() => undefined);
+      if (!commit) continue;
+      const notes = new Map<ObjectId, ObjectId>();
+      // a notes tree: <hex> blobs, fanned out under two-digit directories
+      const walk = async (tree: ObjectId, prefix: string): Promise<void> => {
+        for await (const e of this.trees.loadTree(tree)) {
+          const name = prefix + e.name;
+          if ((e.mode & 0o170000) === 0o040000) {
+            if (/^[0-9a-f]{2}$/.test(e.name) && name.length < 40) await walk(e.id, name);
+          } else if (/^[0-9a-f]{40}$/.test(name)) notes.set(name, e.id);
+        }
+      };
+      await walk(commit.tree, "");
+      out.push({ ref, notes });
+    }
+    return out;
+  }
+
+  /** mailmap.c's read_mailmap: `.mailmap` (not in a bare repository), `mailmap.blob`, `mailmap.file` */
+  private async loadMailmap(config: RemoteConfigStore): Promise<Mailmap> {
+    const map = new Mailmap();
+    const worktree = this.worktreeAccess;
+    const bare = parseGitBool(config.value("core.bare")) ?? !worktree;
+    if (!bare && worktree) {
+      try {
+        const entry = await worktree.getEntry(".mailmap");
+        if (entry && !entry.isDirectory && (entry.mode & 0o170000) !== 0o120000) {
+          const chunks: Uint8Array[] = [];
+          for await (const c of worktree.readContent(".mailmap")) chunks.push(c);
+          map.read(decodeGitPath(concatBytes(chunks)));
+        }
+      } catch {
+        // no .mailmap
+      }
+    }
+    const blobName = config.value("mailmap.blob") ?? (bare ? "HEAD:.mailmap" : undefined);
+    if (blobName) {
+      const id = await this.revisionResolver()
+        .resolve(blobName)
+        .catch(() => undefined);
+      const bytes = id ? await this.readBlob(id) : undefined;
+      if (bytes) map.read(decodeGitPath(bytes));
+    }
+    const file = config.value("mailmap.file");
+    if (file) {
+      const environment = hostEnvironmentOf(this._workingCopy);
+      const path = expandUserPath(file, environment);
+      const bytes = path ? await environment?.readFile(path).catch(() => undefined) : undefined;
+      if (bytes) map.read(decodeGitPath(bytes));
+    }
+    return map;
   }
 
   /**

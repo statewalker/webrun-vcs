@@ -7,6 +7,7 @@ export * from "./cherry-pick-command.js";
 export * from "./clean-command.js";
 export * from "./clone-command.js";
 export * from "./commit-command.js";
+export * from "./date-format.js";
 export * from "./describe-command.js";
 export * from "./diff-command.js";
 export * from "./diff-textconv.js";
@@ -17,7 +18,10 @@ export * from "./git-describe.js";
 export * from "./git-ident.js";
 export * from "./init-command.js";
 export * from "./log-command.js";
+export * from "./log-graph.js";
+export * from "./log-output.js";
 export * from "./ls-remote-command.js";
+export * from "./mailmap.js";
 export * from "./merge-command.js";
 export {
   createMergeDriver,

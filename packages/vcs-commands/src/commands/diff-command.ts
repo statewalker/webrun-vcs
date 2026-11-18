@@ -1,4 +1,4 @@
-import type { FileModeValue, ObjectId } from "@statewalker/vcs-core";
+import { EMPTY_TREE_ID, type FileModeValue, type ObjectId } from "@statewalker/vcs-core";
 import { ByteSink, parseGitBool, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
@@ -38,6 +38,7 @@ import {
 import { quotePath } from "../results/quote-path.js";
 import { abbrevLengths, worktreeModeTrust } from "./core-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
+import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
 import { readSubmoduleDirt } from "./status-command.js";
 
 /** The output formats of {@link DiffCommand.callText} */
@@ -228,6 +229,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private newTree?: string;
   private cached = false;
   private pathFilter?: string;
+  private pathspecItems?: PathspecItem[];
   private renames?: boolean;
   private renameLimit?: number;
   private textOptions: DiffTextOptions = {};
@@ -286,6 +288,19 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
+   * Limit the comparison to a pathspec, as `git diff -- <pathspec>...` (and `git log -p --
+   * <pathspec>`) does: paths from the top, with wildcards and magic (see `LogCommand.addPath`).
+   */
+  setPathspec(paths: string[]): this {
+    this.checkCallable();
+    this.pathspecItems = paths.map((p) => parsePathspecItem(p));
+    if (this.pathspecItems.length > 0 && this.pathspecItems.every((i) => i.exclude)) {
+      this.pathspecItems.push(parsePathspecItem("."));
+    }
+    return this;
+  }
+
+  /**
    * Detect renames (`-M`, `--no-renames`). Default: off for `call()` (each path as added and
    * deleted), `diff.renames` (default on) for `callText()`.
    */
@@ -340,6 +355,65 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
     const collected = await this.collect(renames, format === "patch");
+    const sink = new ByteSink();
+    await this.writeFormats(sink, [format], collected);
+    return sink.bytes();
+  }
+
+  /**
+   * Several formats of one comparison in the order git's `diff_flush` prints them (`git log
+   * --stat -p`): `--name-only`/`--name-status`, then `--numstat`, `--stat`, `--shortstat`,
+   * then the patch, after a blank line when something came before it. Undefined when
+   * nothing differs (git's empty diff queue, which `git log` shows no diff for).
+   *
+   * `follow` is `--follow`'s path: the comparison is limited to it, and when it is added, a
+   * file it was renamed from is looked for among the other side's paths (tree-diff.c's
+   * try_to_follow_renames); `followPath` is then the path followed from there on.
+   */
+  async callFormats(
+    formats: DiffOutputFormat[],
+    follow?: string,
+  ): Promise<{ bytes?: Uint8Array; followPath?: string }> {
+    this.checkCallable();
+    this.setCallable(false);
+    const config = this.config;
+    const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
+    let followPath = follow;
+    let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
+    if (follow !== undefined) {
+      const spec = this.pathspecItems;
+      this.pathspecItems = [parsePathspecItem(`:(literal)${follow}`)];
+      collected = await this.collect(false, false);
+      const only = collected.entries[0];
+      if (collected.entries.length === 1 && only?.changeType === ChangeType.ADD) {
+        this.pathspecItems = spec;
+        const all = await this.collect(true, false);
+        const renamed = all.entries.find(
+          (e) =>
+            (e.changeType === ChangeType.RENAME || e.changeType === ChangeType.COPY) &&
+            e.newPath === follow,
+        );
+        if (renamed) {
+          collected = { entries: [renamed], combined: [] };
+          followPath = renamed.oldPath;
+        }
+      }
+    } else collected = await this.collect(renames, formats.includes("patch"));
+    if (collected.entries.length === 0 && collected.combined.length === 0) {
+      return followPath !== undefined ? { followPath } : {};
+    }
+    const sink = new ByteSink();
+    await this.writeFormats(sink, formats, collected);
+    return { bytes: sink.bytes(), ...(followPath !== undefined ? { followPath } : {}) };
+  }
+
+  /** The formats of the collected comparison, in diff_flush's order */
+  private async writeFormats(
+    sink: ByteSink,
+    formats: DiffOutputFormat[],
+    collected: { entries: DiffEntry[]; combined: CombinedEntry[] },
+  ): Promise<void> {
+    const config = this.config;
     const { combined } = collected;
     const entries = await this.ordered(collected.entries);
     const options = this.outputOptions();
@@ -358,72 +432,84 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       pairs.push(pair);
     }
     const quote = options.quotePath;
-    const sink = new ByteSink();
-    switch (format) {
-      case "patch": {
-        // index lines abbreviate as git does (core.abbrev, the repository's size, uniqueness)
-        if (!options.fullIndex) {
-          const ids = new Set<string>();
+    const order: DiffOutputFormat[] = [
+      "name-only",
+      "name-status",
+      "numstat",
+      "stat",
+      "shortstat",
+      "patch",
+    ];
+    let separator = false;
+    for (const format of order) {
+      if (!formats.includes(format)) continue;
+      if (format === "patch" && separator) sink.text("\n");
+      separator = true;
+      switch (format) {
+        case "patch": {
+          // index lines abbreviate as git does (core.abbrev, the repository's size, uniqueness)
+          if (!options.fullIndex) {
+            const ids = new Set<string>();
+            for (const pair of pairs) {
+              if (unmerged.has(pair)) continue;
+              ids.add(pair.old?.id ?? NULL_ID);
+              ids.add(pair.new?.id ?? NULL_ID);
+            }
+            for (const c of combined) {
+              ids.add(c.ours.objectId);
+              ids.add(c.theirs.objectId);
+              ids.add(NULL_ID);
+            }
+            options.abbrevLengths = await abbrevLengths(this.workingCopy, ids);
+          }
+          // git prints the combined diffs of conflicted paths as it finds them, before the rest
+          for (const c of combined) await this.writeCombined(sink, c, options);
           for (const pair of pairs) {
-            if (unmerged.has(pair)) continue;
-            ids.add(pair.old?.id ?? NULL_ID);
-            ids.add(pair.new?.id ?? NULL_ID);
+            if (unmerged.has(pair)) {
+              sink.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
+            } else await writePairPatch(sink, pair, options);
           }
-          for (const c of combined) {
-            ids.add(c.ours.objectId);
-            ids.add(c.theirs.objectId);
-            ids.add(NULL_ID);
+          break;
+        }
+        case "name-only":
+          sink.text(
+            formatNameOnly(await this.shownNames(pairs, unmerged, options), { quotePath: quote }),
+          );
+          break;
+        case "name-status":
+          for (const pair of await this.shownNames(pairs, unmerged, options)) {
+            if (unmerged.has(pair)) {
+              sink.text(`U\t${quotePath(pair.new?.path ?? pair.old?.path ?? "", quote)}\n`);
+            } else sink.text(formatNameStatus([pair], { quotePath: quote }));
           }
-          options.abbrevLengths = await abbrevLengths(this.workingCopy, ids);
+          break;
+        default: {
+          const files = [];
+          for (const pair of pairs) {
+            if (unmerged.has(pair)) {
+              const name = pair.new?.path ?? pair.old?.path ?? "";
+              files.push({
+                name,
+                isRenamed: false,
+                isBinary: false,
+                isUnmerged: true,
+                added: 0,
+                deleted: 0,
+              });
+            } else files.push(...(await computeDiffstat([pair], options)));
+          }
+          const statOptions: DiffstatOptions = {
+            nameWidth: intValue(config.value("diff.statNameWidth")),
+            graphWidth: intValue(config.value("diff.statGraphWidth")),
+            ...this.textOptions.stat,
+            quotePath: quote,
+          };
+          if (format === "stat") sink.text(formatStat(files, statOptions));
+          else if (format === "numstat") sink.text(formatNumstat(files, { quotePath: quote }));
+          else sink.text(formatShortstat(files));
         }
-        // git prints the combined diffs of conflicted paths as it finds them, before the rest
-        for (const c of combined) await this.writeCombined(sink, c, options);
-        for (const pair of pairs) {
-          if (unmerged.has(pair)) {
-            sink.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
-          } else await writePairPatch(sink, pair, options);
-        }
-        break;
-      }
-      case "name-only":
-        sink.text(
-          formatNameOnly(await this.shownNames(pairs, unmerged, options), { quotePath: quote }),
-        );
-        break;
-      case "name-status":
-        for (const pair of await this.shownNames(pairs, unmerged, options)) {
-          if (unmerged.has(pair)) {
-            sink.text(`U\t${quotePath(pair.new?.path ?? pair.old?.path ?? "", quote)}\n`);
-          } else sink.text(formatNameStatus([pair], { quotePath: quote }));
-        }
-        break;
-      default: {
-        const files = [];
-        for (const pair of pairs) {
-          if (unmerged.has(pair)) {
-            const name = pair.new?.path ?? pair.old?.path ?? "";
-            files.push({
-              name,
-              isRenamed: false,
-              isBinary: false,
-              isUnmerged: true,
-              added: 0,
-              deleted: 0,
-            });
-          } else files.push(...(await computeDiffstat([pair], options)));
-        }
-        const statOptions: DiffstatOptions = {
-          nameWidth: intValue(config.value("diff.statNameWidth")),
-          graphWidth: intValue(config.value("diff.statGraphWidth")),
-          ...this.textOptions.stat,
-          quotePath: quote,
-        };
-        if (format === "stat") sink.text(formatStat(files, statOptions));
-        else if (format === "numstat") sink.text(formatNumstat(files, { quotePath: quote }));
-        else sink.text(formatShortstat(files));
       }
     }
-    return sink.bytes();
   }
 
   /** The combined diff (`diff --cc`) of a conflicted path: stages 2 and 3 against the file */
@@ -796,7 +882,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   private matches(path: string): boolean {
-    return !this.pathFilter || path.startsWith(this.pathFilter);
+    if (this.pathFilter && !path.startsWith(this.pathFilter)) return false;
+    return !this.pathspecItems || matchPathspec(this.pathspecItems, path, 0) > 0;
   }
 
   /**
@@ -930,6 +1017,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    */
   private async treeSide(refOrId: string, implicitHead = false): Promise<Map<string, Side>> {
     const out = new Map<string, Side>();
+    // the empty tree (a root commit's parent side), which a store need not hold
+    if (refOrId === EMPTY_TREE_ID) return out;
     let treeId: ObjectId;
     try {
       treeId = await this.resolveTreeId(refOrId);
