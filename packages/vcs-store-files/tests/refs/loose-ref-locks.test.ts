@@ -113,3 +113,35 @@ describe("set, setSymbolic and remove take <ref>.lock", () => {
     }
   });
 });
+
+describe("a ref another process creates while this one reads it", () => {
+  it("is missing or has its new value, never an empty (broken) ref", async () => {
+    // Another process renames refs/stash.lock over refs/stash just after this one found
+    // refs/stash missing. Asked only after an empty read whether the file was there, the
+    // reader saw the new file and took the missing ref for an empty one: "refs/stash is
+    // broken" while three processes pushed their first stash at once.
+    const base = await repo();
+    let created = false;
+    const files = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "stats") {
+          return async (path: string) => {
+            const stats = await target.stats(path);
+            if (!created && path === "/.git/refs/stash" && !stats) {
+              created = true;
+              await target.write(path, [new TextEncoder().encode(`${oid(1)}\n`)]);
+            }
+            return stats;
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as FilesApi;
+    const refs = new FileRefStore(files, "/.git");
+
+    await refs.set("refs/stash", oid(2));
+    expect(created).toBe(true);
+    expect(await text(base, "/.git/refs/stash")).toBe(`${oid(2)}\n`);
+  });
+});
