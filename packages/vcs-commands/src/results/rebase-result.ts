@@ -94,6 +94,21 @@ export enum RebaseAction {
 
   /** `merge [-C <commit> | -c <commit>] <label> [# <oneline>]` (`--rebase-merges`) */
   MERGE = "merge",
+
+  /** `exec <command>`: the command run by the exec handler (git runs it in a shell) */
+  EXEC = "exec",
+
+  /** `break`: the rebase stops here (`git rebase --continue` goes on) */
+  BREAK = "break",
+
+  /** `drop <commit>`: the commit left out */
+  DROP = "drop",
+
+  /** `noop`: nothing (the list of a rebase with nothing to pick) */
+  NOOP = "noop",
+
+  /** `update-ref <ref>`: the ref moved to HEAD at the end of the rebase (`--update-refs`) */
+  UPDATE_REF = "update-ref",
 }
 
 /**
@@ -110,6 +125,15 @@ export interface RebaseTodoLine {
 
   /** Short message of the commit */
   shortMessage: string;
+
+  /**
+   * The argument of a command without a commit (`exec <command>`, `label <name>`,
+   * `reset <label>`, `update-ref <ref>`); `commit` is then empty
+   */
+  argument?: string;
+
+  /** `fixup -C` (`"C"`) or `fixup -c` (`"c"`) */
+  fixupFlag?: "C" | "c";
 }
 
 /**
