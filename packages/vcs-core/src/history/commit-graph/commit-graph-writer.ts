@@ -22,6 +22,7 @@ import type { ObjectId } from "../../common/id/index.js";
 import { readPackIndex } from "../../pack/pack-index-reader.js";
 import { scanPackObjects } from "../../pack/pack-order-scan.js";
 import type { GitObject, GitObjects } from "../objects/git-objects.js";
+import { canonTreeMode } from "../trees/index.js";
 import { computeBloomFilter, DEFAULT_BLOOM_FILTER_SETTINGS } from "./bloom-filter.js";
 import type { CommitGraph } from "./commit-graph.js";
 import {
@@ -1165,7 +1166,8 @@ class Entries {
     let p = this.at;
     let mode = 0;
     while (p < d.length && d[p] !== 0x20) mode = mode * 8 + ((d[p++] as number) - 0x30);
-    this.mode = mode;
+    // the mode as git's tree walk reads it (canon_mode): 100664 is 100644
+    this.mode = canonTreeMode(mode);
     this.name = ++p;
     while (p < d.length && d[p] !== 0) p++;
     this.nul = p;

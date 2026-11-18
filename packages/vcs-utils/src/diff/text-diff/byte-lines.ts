@@ -114,20 +114,8 @@ export class ByteLines extends Sequence implements LineSource {
     const n = starts.length - 1;
     const hashes = new Int32Array(n);
     const c = this.content;
-    // four bytes at a time (a hash only ever compared with others of this function: lines
-    // are told apart by their bytes, the hash only groups them)
-    const words = new DataView(c.buffer, c.byteOffset, c.byteLength);
-    for (let k = 0; k < n; k++) {
-      let p = starts[k];
-      const end = starts[k + 1];
-      let h = end - p;
-      for (; p + 4 <= end; p += 4) {
-        h = Math.imul(h ^ words.getInt32(p, true), 0x5bd1e995);
-        h ^= h >>> 13;
-      }
-      for (; p < end; p++) h = Math.imul(h ^ c[p], 0x01000193);
-      hashes[k] = h ^ (h >>> 16);
-    }
+    const words = lineWords(c);
+    for (let k = 0; k < n; k++) hashes[k] = hashLine(c, starts[k], starts[k + 1], words);
     this.hashes = hashes;
     return hashes;
   }
@@ -142,6 +130,92 @@ export class ByteLines extends Sequence implements LineSource {
     const b = other.content;
     for (let k = 0; k < len; k++) if (a[a0 + k] !== b[b0 + k]) return false;
     return true;
+  }
+}
+
+/** A view for reading `content` four bytes at a time, as {@link hashLine} takes it */
+export function lineWords(content: Uint8Array): DataView {
+  return new DataView(content.buffer, content.byteOffset, content.byteLength);
+}
+
+/** The seed of {@link hashLine} */
+const LINE_SEED = 0x9747b28c | 0;
+
+/**
+ * The hash of the line `content[start, end)`, terminator included: the one hash of exact
+ * lines everywhere (`ByteLines.hash`, `InternedText`, `LineInterner`; {@link LineHasher}
+ * gives the same), so equal lines hash alike whichever reads them. Four bytes at a time; the
+ * hash only groups lines, which are told apart by their bytes. `words` is
+ * {@link lineWords} of `content`, made once per buffer.
+ */
+export function hashLine(
+  content: Uint8Array,
+  start: number,
+  end: number,
+  words: DataView = lineWords(content),
+): number {
+  let p = start;
+  let h = LINE_SEED;
+  for (; p + 4 <= end; p += 4) {
+    h = Math.imul(h ^ words.getInt32(p, true), 0x5bd1e995);
+    h ^= h >>> 13;
+  }
+  for (; p < end; p++) h = Math.imul(h ^ content[p], 0x01000193);
+  h ^= end - start;
+  return h ^ (h >>> 16);
+}
+
+/**
+ * Finds and hashes lines in one pass, front to back: `next(start)` gives the
+ * {@link hashLine} of the line starting at `start` and sets `end` past its LF (or to the
+ * content's length). Reads four bytes at a time until a word holds the LF, so short lines
+ * cost no native call each (as an `indexOf` per line would).
+ *
+ * @example
+ * ```typescript
+ * const hasher = new LineHasher(content);
+ * for (let p = 0; p < content.length; p = hasher.end) console.log(hasher.next(p));
+ * ```
+ */
+export class LineHasher {
+  /** Where the line the last `next` read ends (after its LF) */
+  end = 0;
+  private readonly words: DataView;
+
+  constructor(readonly content: Uint8Array) {
+    this.words = lineWords(content);
+  }
+
+  /** The {@link hashLine} of the line starting at `start`; sets {@link end} */
+  next(start: number): number {
+    const c = this.content;
+    const words = this.words;
+    const len = c.length;
+    let p = start;
+    let h = LINE_SEED;
+    // whole words while none holds an LF (a zero byte of `x ^ 0x0a0a0a0a`)
+    while (p + 4 <= len) {
+      const x = words.getInt32(p, true);
+      const y = x ^ 0x0a0a0a0a;
+      if (((y - 0x01010101) & ~y & 0x80808080) !== 0) break;
+      h = Math.imul(h ^ x, 0x5bd1e995);
+      h ^= h >>> 13;
+      p += 4;
+    }
+    // the LF is within the next four bytes (or the content ends there)
+    let e = p;
+    while (e < len && c[e] !== 0x0a) e++;
+    if (e < len) e++;
+    // a line ending with the word hashes it as a word, as hashLine does
+    if (p + 4 === e) {
+      h = Math.imul(h ^ words.getInt32(p, true), 0x5bd1e995);
+      h ^= h >>> 13;
+      p = e;
+    }
+    for (; p < e; p++) h = Math.imul(h ^ c[p], 0x01000193);
+    h ^= e - start;
+    this.end = e;
+    return h ^ (h >>> 16);
   }
 }
 

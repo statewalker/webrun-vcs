@@ -4,6 +4,7 @@ import {
   bloomKey,
   type Commit,
   type CommitGraph,
+  canonTreeMode,
   commitFromBytes,
   EMPTY_TREE_ID,
   type GitObject,
@@ -12,7 +13,7 @@ import {
   parseGraphCommit,
   replacementOf,
 } from "@statewalker/vcs-core";
-import { ByteSink, OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
+import { ByteSink, OrderedMap, parseGitBool, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
@@ -30,7 +31,7 @@ import {
 import { GitApiError, IncompatibleOptionsError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
-import { writeCombinedDiff } from "../results/combined-diff.js";
+import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
 import { quotePath } from "../results/quote-path.js";
 import { attributesSourceResolver } from "./attributes-source.js";
 import { DiffCommand, type DiffTextOptions } from "./diff-command.js";
@@ -1220,7 +1221,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     for await (const entry of this.trees.loadTree(tree)) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       if ((entry.mode & 0o170000) === 0o040000) await this.flatTree(entry.id, path, out);
-      else out.set(path, { mode: entry.mode, id: entry.id });
+      // the mode as git's tree walk reads it (canon_mode)
+      else out.set(path, { mode: canonTreeMode(entry.mode), id: entry.id });
     }
     return out;
   }
@@ -1314,7 +1316,23 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if ((e.mode & 0o170000) === 0o160000) return encodeGitPath(`Subproject commit ${e.id}\n`);
       return (await this.readBlob(e.id)) ?? new Uint8Array(0);
     };
-    const context = Number(RemoteConfigStore.from(this._workingCopy).value("diff.context") ?? 3);
+    const config = RemoteConfigStore.from(this._workingCopy);
+    const context = Number(config.value("diff.context") ?? 3);
+    // combine-diff.c diffs each parent with the xpparam flags of the diff options
+    // (opt->xdl_opts): the algorithm, the indent heuristic, the whitespace flags
+    const d = this.diffOptions;
+    const xdiffOptions = {
+      algorithm: d.algorithm ?? configAlgorithm(config.value("diff.algorithm")) ?? "myers",
+      indentHeuristic:
+        d.indentHeuristic ?? parseGitBool(config.value("diff.indentHeuristic")) ?? true,
+      histogramRediff: d.histogramRediff,
+      legacyMinimal: d.legacyMinimal,
+      ignoreWhitespace: d.ignoreWhitespace,
+      ignoreWhitespaceChange: d.ignoreWhitespaceChange,
+      ignoreWhitespaceAtEol: d.ignoreWhitespaceAtEol,
+      ignoreCrAtEol: d.ignoreCrAtEol,
+      ignoreBlankLines: d.ignoreBlankLines,
+    } satisfies CombinedDiffOptions;
     for (const path of paths) {
       const r = result.get(path);
       const sides = [];
@@ -1330,6 +1348,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           result: { id: r?.id ?? NULL_OBJECT_ID, mode: r?.mode ?? 0, content: await read(r) },
         },
         {
+          ...xdiffOptions,
           dense,
           workingTreeFile: false,
           context: this.diffOptions.context ?? (Number.isFinite(context) ? context : 3),
@@ -1811,7 +1830,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const ea = a ? await this.entryOf(a, name) : undefined;
     const eb = b ? await this.entryOf(b, name) : undefined;
     if (!ea && !eb) return false;
-    if (ea && eb && ea.id === eb.id && ea.mode === eb.mode) return false;
+    if (ea && eb && ea.id === eb.id && canonTreeMode(ea.mode) === canonTreeMode(eb.mode)) {
+      return false;
+    }
     if (i === parts.length - 1) return true;
     const ta = ea && isTreeMode(ea.mode) ? ea.id : undefined;
     const tb = eb && isTreeMode(eb.mode) ? eb.id : undefined;
@@ -2253,7 +2274,8 @@ class RawEntries {
     let p = this.at;
     let mode = 0;
     while (p < d.length && d[p] !== 0x20) mode = mode * 8 + ((d[p++] as number) - 0x30);
-    this.mode = mode;
+    // the mode as git's tree walk reads it (canon_mode): 100664 is 100644
+    this.mode = canonTreeMode(mode);
     this.nameStart = ++p;
     while (p < d.length && d[p] !== 0) p++;
     this.nul = p;
@@ -2294,4 +2316,11 @@ class RawEntries {
     const cb = n < lb ? (b[other.nameStart + n] as number) : isTreeMode(other.mode) ? 0x2f : 0;
     return ca - cb;
   }
+}
+
+/** `diff.algorithm` as diff.c's parse_algorithm_value reads it (undefined: not one) */
+function configAlgorithm(v: string | undefined): XdiffAlgorithm | undefined {
+  const s = v?.trim().toLowerCase();
+  if (s === "default") return "myers";
+  return s === "myers" || s === "minimal" || s === "patience" || s === "histogram" ? s : undefined;
 }

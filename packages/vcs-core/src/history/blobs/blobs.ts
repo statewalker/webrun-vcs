@@ -91,8 +91,11 @@ export interface BlobRead {
   /** Size in bytes */
   size: number;
   /**
-   * The whole content when the store holds it in memory (a small object read in one piece);
-   * the caller's own buffer. `content` then needs no release.
+   * The whole content when the store holds it in memory (a small object read in one piece).
+   * `content` then needs no release. Read-only: a `Blobs` that keeps recent contents (as the
+   * shared blob cache of a `git log -p` does) hands the same buffer to every reader, and diffs
+   * remember the lines of buffers they split by buffer (`unifiedDiffHunks`), so a caller that wants
+   * to change the bytes copies them first.
    */
   bytes?: Uint8Array;
   /**

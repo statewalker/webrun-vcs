@@ -52,6 +52,31 @@ function isTreeMode(mode: number): boolean {
 }
 
 /**
+ * A tree entry's mode as git's tree walks see it (`canon_mode`): a regular file is 100644 or
+ * 100755 by its owner's execute bit, whatever other bits are stored (older git wrote 100664),
+ * and a mode of no known type reads as a gitlink. Tree comparisons (diffs, history
+ * simplification, changed-path filters) compare these.
+ *
+ * @example
+ * ```typescript
+ * canonTreeMode(0o100664); // 0o100644
+ * canonTreeMode(0o100775); // 0o100755
+ * ```
+ */
+export function canonTreeMode(mode: number): number {
+  switch (mode & 0o170000) {
+    case 0o100000:
+      return mode & 0o100 ? 0o100755 : 0o100644;
+    case 0o120000:
+      return 0o120000;
+    case 0o040000:
+      return 0o040000;
+    default:
+      return 0o160000;
+  }
+}
+
+/**
  * Compare tree entries in git's canonical tree order.
  *
  * ```typescript
@@ -266,7 +291,7 @@ function parseModeAt(buffer: Uint8Array, start: number, end: number): number {
 export class TreeEntryCursor {
   /** Whether the walk is past the last entry */
   done = false;
-  /** The entry's mode */
+  /** The entry's mode as git's walks see it ({@link canonTreeMode}, not as stored) */
   mode = 0;
   private nameStart = 0;
   private nameEnd = 0;
@@ -316,7 +341,7 @@ export class TreeEntryCursor {
     return ac - bc;
   }
 
-  /** Whether `other` (an entry of the same name) has this entry's mode and id */
+  /** Whether `other` (an entry of the same name) has this entry's mode (canonical) and id */
   sameAs(other: TreeEntryCursor): boolean {
     if (this.mode !== other.mode) return false;
     const a = this.bytes;
@@ -338,7 +363,7 @@ export class TreeEntryCursor {
     if (nullPos < 0 || nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) {
       throw new Error("Invalid tree format: truncated entry");
     }
-    this.mode = parseModeAt(buffer, offset, spacePos);
+    this.mode = canonTreeMode(parseModeAt(buffer, offset, spacePos));
     this.nameStart = spacePos + 1;
     this.nameEnd = nullPos;
     this.end = nullPos + 1 + OBJECT_ID_LENGTH;

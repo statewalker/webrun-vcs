@@ -384,7 +384,8 @@ export function trimCommonTail(a: Uint8Array, b: Uint8Array): number {
 /**
  * The hunks of the unified diff of two files, as `git diff` finds them (`xdi_diff`:
  * the common tail trimmed without context, the xdiff script, blank-line changes marked
- * ignorable, `xdl_emit_diff`).
+ * ignorable, `xdl_emit_diff`). The lines of each buffer are remembered for its next diff,
+ * so the buffers must not be changed after the call.
  */
 export function unifiedDiffHunks(
   oldContent: Uint8Array,
@@ -399,7 +400,10 @@ export function unifiedDiffHunks(
 /**
  * The lines of buffers diffed lately, by buffer: a caller that diffs one buffer against two
  * others (`git log -p` diffs a version with its parent's, then that one with its own parent's)
- * splits and hashes its lines once. Held weakly: kept while the buffer is.
+ * splits and hashes its lines once. Held weakly: kept while the buffer is. The lines are
+ * those of the buffer when first diffed, so buffers passed to a diff must not be changed
+ * afterwards (blob contents are read-only; see `BlobRead.bytes`); a caller that reuses a
+ * buffer for other content passes a fresh one, or a `ByteLines` it builds itself.
  */
 const linesByContent = new WeakMap<Uint8Array, ByteLines>();
 

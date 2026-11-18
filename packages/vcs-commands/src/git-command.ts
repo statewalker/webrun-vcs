@@ -216,11 +216,11 @@ const GRAFT_FILE_ADVICE = [
 /** Trees the commands sharing reads keep (see `GitCommand.shareReadsOf`). */
 const SHARED_TREES = 1024;
 /** Bytes of blob content the commands sharing reads keep, and the largest blob kept */
-const SHARED_BLOB_BYTES = 32 * 2 ** 20;
-const SHARED_BLOB_MAX = 2 ** 20;
+export const SHARED_BLOB_BYTES = 32 * 2 ** 20;
+export const SHARED_BLOB_MAX = 2 ** 20;
 
 /** Blob contents kept for the commands sharing reads, most recently used last */
-interface SharedBlobs {
+export interface SharedBlobs {
   recent: OrderedMap<ObjectId, Uint8Array>;
   bytes: number;
 }
@@ -230,7 +230,7 @@ interface SharedBlobs {
  * version as the new side of one commit's diff and again as the old side of the next. The
  * bytes handed out are shared between the readers, never to be changed.
  */
-function sharingBlobs(blobs: Blobs, shared: SharedBlobs): Blobs {
+export function sharingBlobs(blobs: Blobs, shared: SharedBlobs): Blobs {
   const open = async (id: ObjectId): Promise<BlobRead | undefined> => {
     const known = shared.recent.get(id);
     if (known) {
@@ -240,13 +240,17 @@ function sharingBlobs(blobs: Blobs, shared: SharedBlobs): Blobs {
     }
     const blob = await blobs.open?.(id);
     if (blob?.bytes && blob.size <= SHARED_BLOB_MAX) {
+      // another open of the same id may have kept it while this one read: hand out that copy
+      const kept = shared.recent.get(id);
+      if (kept) return { size: kept.length, bytes: kept, content: single(kept) };
       shared.recent.set(id, blob.bytes);
-      shared.bytes += blob.size;
-      while (shared.bytes > SHARED_BLOB_BYTES) {
+      shared.bytes += blob.bytes.length;
+      while (shared.bytes > SHARED_BLOB_BYTES && shared.recent.size > 0) {
         const oldest = shared.recent.oldestKey() as ObjectId;
         shared.bytes -= shared.recent.get(oldest)?.length ?? 0;
         shared.recent.delete(oldest);
       }
+      if (shared.recent.size === 0) shared.bytes = 0;
     }
     return blob;
   };

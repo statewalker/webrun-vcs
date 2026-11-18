@@ -22,7 +22,7 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { Git } from "../src/index.js";
+import { type DiffTextOptions, Git } from "../src/index.js";
 import { put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
@@ -178,5 +178,130 @@ describeGit("git log over trees that change shape, native", () => {
     const loose = [...lists].filter(([path]) => /objects\/[0-9a-f]{2}$/.test(path));
     expect(loose.length).toBeGreaterThan(0);
     for (const [path, count] of loose) expect([path, count]).toEqual([path, 1]);
+  });
+});
+
+describeGit("git log --cc and tree modes, native", () => {
+  let dir: string;
+
+  /** The diff options of `args` as `setDiffOptions` takes them */
+  const diffOptionsOf = (args: string[]): DiffTextOptions => {
+    const o: DiffTextOptions = {};
+    for (const a of args) {
+      if (a === "-w") o.ignoreWhitespace = true;
+      else if (a === "-b") o.ignoreWhitespaceChange = true;
+      else if (a === "--ignore-space-at-eol") o.ignoreWhitespaceAtEol = true;
+      else if (a === "--ignore-cr-at-eol") o.ignoreCrAtEol = true;
+      else if (a === "--ignore-blank-lines") o.ignoreBlankLines = true;
+      else if (a === "--no-indent-heuristic") o.indentHeuristic = false;
+      else if (a.startsWith("--diff-algorithm=")) {
+        o.algorithm = a.slice("--diff-algorithm=".length) as DiffTextOptions["algorithm"];
+      }
+    }
+    return o;
+  };
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-cc-native-"));
+    dir = join(root, "repo");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    const block = (name: string) => `${name} {\n  one\n  two\n}\n\n`;
+    put(dir, "f", "a\nb\nc\nd\ne\n");
+    put(dir, "g", `${block("x")}${block("y")}${block("z")}`);
+    put(dir, "h", "1\n2\n3\n4\n5\nx\n7\n8\n9\n10\n11\n12\n");
+    put(dir, "i", "}\nf {\n    z\nf {\n}\nx\n  x\n");
+    put(dir, "other", "o\n");
+    commit(dir, "base");
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    put(dir, "f", "a\nb\nc\nD\ne\n");
+    put(dir, "other", "o\nside\n");
+    commit(dir, "side");
+    git(dir, ["checkout", "-q", "main"]);
+    put(dir, "f", "a\nb  \nc\nd\ne\n");
+    put(dir, "other", "main\no\n");
+    commit(dir, "main");
+    git(dir, ["merge", "-q", "--no-commit", "side"]);
+    put(dir, "other", "main\no\nside\n");
+    // whitespace-only changes against both parents, a CR, a blank line
+    put(dir, "f", " a\nb\nc\r\nD\n\ne\n");
+    // g, h and i are the same blob in both parents: the merge alone changes them, where the
+    // indent heuristic and the slide of an inserted line decide the hunks
+    put(dir, "g", `${block("x")}${block("new")}${block("y")}${block("z")}`);
+    put(dir, "h", "1\n2\n3\n4\n5\nx\nx\n7\n8\n9\n10\n11\n12\n");
+    // the indent heuristic moves this insertion up a line (git diffs with it by default)
+    put(dir, "i", "}\nf {\n    z\nf {\nf {\n\nf {\n}\nx\n  x\n");
+    commit(dir, "merge");
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const CASES: string[][] = [
+    ["--cc"],
+    ["-c"],
+    ["--cc", "-w"],
+    ["--cc", "-b"],
+    ["--cc", "--ignore-space-at-eol"],
+    ["--cc", "--ignore-cr-at-eol"],
+    ["--cc", "--ignore-blank-lines"],
+    ["-c", "-w"],
+    ["--cc", "--no-indent-heuristic"],
+    ["--cc", "--diff-algorithm=patience"],
+    ["--cc", "--diff-algorithm=histogram"],
+  ];
+  for (const args of CASES) {
+    it(`prints log -p ${args.join(" ")} of a merge as git does`, async () => {
+      const { g } = await openCounting(dir);
+      const native = git(dir, ["log", "-p", "-1", ...args]);
+      const ours = Buffer.from(
+        await g
+          .log()
+          .setMaxCount(1)
+          .setDiffOptions(diffOptionsOf(args))
+          .callBytes({ patch: true, ...(args[0] === "-c" ? { c: true } : { cc: true }) }),
+      );
+      expect(ours.toString()).toBe(native.toString());
+    });
+  }
+
+  it("compares tree entry modes canonically, as git does (100664 is 100644)", async () => {
+    // a tree with a 100664 entry (older git wrote group-writable modes): the same blob under
+    // 100644 in the next tree is no change to git
+    const run = (args: string[], input: string) => {
+      const env = { ...nativeGitEnv(root), GIT_AUTHOR_DATE: `${clock} +0000` };
+      const r = spawnSync("git", args, {
+        cwd: dir,
+        input,
+        env: { ...env, GIT_COMMITTER_DATE: env.GIT_AUTHOR_DATE },
+      });
+      if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+      return r.stdout.toString().trim();
+    };
+    const blob = run(["hash-object", "-w", "--stdin"], "group writable\n");
+    const other = run(["hash-object", "-w", "--stdin"], "other\n");
+    const t1 = run(["mktree"], `100664 blob ${blob}\tfile\n100664 blob ${other}\tchanged\n`);
+    const t2 = run(
+      ["mktree"],
+      `100644 blob ${blob}\tfile\n100755 blob ${other}\tchanged\n100644 blob ${other}\tnew\n`,
+    );
+    for (const format of ["name-status", "patch", "stat"] as const) {
+      const native = git(dir, ["diff", `--${format === "patch" ? "patch" : format}`, t1, t2]);
+      const { g } = await openCounting(dir);
+      const ours = await g.diff().setOldTree(t1).setNewTree(t2).callBytes(format);
+      expect(Buffer.from(ours).toString()).toBe(native.toString());
+    }
+    // and a log over commits of those trees
+    const c1 = run(["commit-tree", t1, "-m", "664"], "");
+    const c2 = run(["commit-tree", t2, "-p", c1, "-m", "644"], "");
+    const native = git(dir, ["log", "--stat", "-p", c2]);
+    const { g } = await openCounting(dir);
+    const ours = await g.log().add(c2).callBytes({ stat: true, patch: true });
+    expect(Buffer.from(ours).toString()).toBe(native.toString());
+    // limited to the file: the commit that only rewrote its mode to 100644 is TREESAME
+    const nativeLimited = git(dir, ["log", "--oneline", c2, "--", "file"]);
+    const { g: g2 } = await openCounting(dir);
+    const limited = await g2.log().add(c2).addPath("file").callBytes({ oneline: true });
+    expect(Buffer.from(limited).toString()).toBe(nativeLimited.toString());
   });
 });

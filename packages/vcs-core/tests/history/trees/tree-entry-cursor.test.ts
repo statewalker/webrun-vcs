@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  canonTreeMode,
   compareTreeEntries,
   createMemoryHistory,
   decodeTreeBytes,
@@ -106,5 +107,29 @@ describe("Trees.raw and Trees.entries", () => {
     expect(await history.trees.raw?.(blob)).toBeUndefined();
     expect(await history.trees.entries?.(blob)).toBeUndefined();
     expect(await history.trees.raw?.(id(9))).toBeUndefined();
+  });
+});
+
+describe("canonTreeMode", () => {
+  it("gives the modes git's tree walks read (canon_mode)", () => {
+    expect(canonTreeMode(0o100644)).toBe(0o100644);
+    expect(canonTreeMode(0o100664)).toBe(0o100644);
+    expect(canonTreeMode(0o100600)).toBe(0o100644);
+    expect(canonTreeMode(0o100775)).toBe(0o100755);
+    expect(canonTreeMode(0o100700)).toBe(0o100755);
+    expect(canonTreeMode(0o120777)).toBe(0o120000);
+    expect(canonTreeMode(0o40755)).toBe(0o40000);
+    expect(canonTreeMode(0o160000)).toBe(0o160000);
+    expect(canonTreeMode(0o0)).toBe(0o160000);
+  });
+
+  it("is the mode a cursor reads, so 100664 and 100644 on one blob are the same entry", () => {
+    const a = new TreeEntryCursor(serializeTree([{ mode: 0o100664, name: "f", id: id(1) }]));
+    const b = new TreeEntryCursor(serializeTree([{ mode: 0o100644, name: "f", id: id(1) }]));
+    expect(a.mode).toBe(0o100644);
+    expect(a.sameAs(b)).toBe(true);
+    const x = new TreeEntryCursor(serializeTree([{ mode: 0o100775, name: "f", id: id(1) }]));
+    expect(x.mode).toBe(0o100755);
+    expect(x.sameAs(b)).toBe(false);
   });
 });
