@@ -9,11 +9,11 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 
 import type { OperationState } from "../merge-support.js";
-import { parsePathspecItem } from "../pathspec.js";
 import {
   BisectDie,
   type BisectGraph,
   type BisectNode,
+  type BisectPending,
   estimateBisectSteps,
   FIND_BISECTION_ALL,
   FIND_BISECTION_FIRST_PARENT_ONLY,
@@ -21,7 +21,7 @@ import {
   managedSkipped,
   UNINTERESTING,
 } from "./bisect-graph.js";
-import { sqDequoteToArgv, sqQuoteArgv } from "./bisect-quote.js";
+import { sqDequoteToArgv, sqQuoteArgv, strbufRtrim, strbufTrim } from "./bisect-quote.js";
 
 /** bisect.h's enum bisect_error. */
 export enum BisectCode {
@@ -76,25 +76,33 @@ export interface BisectContext {
   resolve(rev: string): Promise<ObjectId | undefined>;
   /** git's lookup_commit_reference: the commit an object peels to, undefined when none */
   peelCommit(id: ObjectId): Promise<ObjectId | undefined>;
-  /** `%s` of the commit */
+  /** The object a tag peels to (git's deref_tag) and its type; undefined when missing */
+  peelObject(id: ObjectId): Promise<{ id: ObjectId; type: string } | undefined>;
+  /**
+   * `%s` of the commit without re-encoding (git's format_commit_message with no output
+   * encoding): the message's bytes as they are, decoded as paths decode
+   */
   subject(id: ObjectId): Promise<string>;
   /** `git show --stat --summary --no-abbrev-commit --diff-merges=first-parent <id>` */
   showCommit(id: ObjectId): Promise<string>;
   /** git's repo_get_merge_bases_many, in git's order */
   mergeBasesMany(one: ObjectId, twos: ObjectId[]): Promise<ObjectId[]>;
-  /** The commits a range argument names, in `git log` order (skip ranges) */
-  revRange(arg: string): Promise<ObjectId[]>;
+  /**
+   * The pending list a revision argument with `..` gives (setup_revisions of `bisect skip`):
+   * throws {@link BisectDie} (or a RevisionError) where git dies on it
+   */
+  rangePending(arg: string): Promise<BisectPending[]>;
   /** git's check_refname_format */
   validRefName(name: string): boolean;
   isBare(): boolean;
   /**
-   * git's `checkout [-q] [--ignore-other-worktrees] <name> --`: false when it failed (what
-   * it printed on stderr in `stderr`)
+   * git's `checkout [-q] [--ignore-other-worktrees] <name> --`: false when it failed, what
+   * it printed on stdout and stderr
    */
   checkout(
     name: string,
     options: { quiet: boolean; ignoreOtherWorktrees?: boolean },
-  ): Promise<{ ok: boolean; stderr?: string }>;
+  ): Promise<{ ok: boolean; stdout?: string; stderr?: string }>;
   runHandler?: BisectRunHandler;
 }
 
@@ -412,6 +420,12 @@ export class BisectEngine {
 
   // ============ the bisection ============
 
+  /** What a checkout git runs as a child printed (the child shares git's stdout and stderr). */
+  private checkoutOutput(done: { stdout?: string; stderr?: string }): void {
+    if (done.stdout) this.print(done.stdout);
+    if (done.stderr) this.printErr(done.stderr);
+  }
+
   /** bisect.c's bisect_checkout */
   private async checkoutCandidate(rev: ObjectId, noCheckout: boolean): Promise<number> {
     await this.ctx.setRef("BISECT_EXPECTED_REV", rev);
@@ -420,7 +434,7 @@ export class BisectEngine {
       await this.ctx.setRef("BISECT_HEAD", rev);
     } else {
       const done = await this.ctx.checkout(rev, { quiet: true });
-      if (done.stderr) this.printErr(done.stderr);
+      this.checkoutOutput(done);
       if (!done.ok) return BisectCode.FAILED;
     }
     this.print(`[${rev}] ${await this.ctx.subject(rev)}\n`);
@@ -431,7 +445,7 @@ export class BisectEngine {
     const text = (await this.read("BISECT_NAMES")) ?? "";
     const out: string[] = [];
     for (const raw of readLines(text)) {
-      const line = raw.trim();
+      const line = strbufTrim(raw);
       const { argv, ok } = sqDequoteToArgv(line);
       if (!ok) throw new BisectDie(`Badly quoted content in file '.git/BISECT_NAMES': ${line}`);
       out.push(...argv);
@@ -443,7 +457,8 @@ export class BisectEngine {
     const bad = this.currentBad as ObjectId;
     const expected = await this.ctx.state.ref("BISECT_EXPECTED_REV");
     if (expected === bad) {
-      const goods = [...this.goodRevs].sort().join(" ");
+      // join_oid_array_hex: the good ids as read_bisect_refs read them (refname order)
+      const goods = this.goodRevs.join(" ");
       if (this.termBad === "bad" && this.termGood === "good") {
         this.printErr(
           `The merge base ${bad} is bad.\nThis means the bug has been fixed between ${bad} and [${goods}].\n`,
@@ -477,7 +492,7 @@ export class BisectEngine {
       if (mb === bad) return this.handleBadMergeBase();
       if (goods.has(mb)) continue;
       if (skipped.has(mb)) {
-        const goodHex = [...this.goodRevs].sort().join(" ");
+        const goodHex = this.goodRevs.join(" ");
         this.warning(
           `the merge base between ${bad} and [${goodHex}] must be skipped.\n` +
             `So we cannot be sure the first '${this.termBad}' commit is between ${mb} and ${bad}.\n` +
@@ -503,6 +518,8 @@ export class BisectEngine {
       ...this.goodRevs.map((id) => ({ id, exclude: false })),
     ];
     const walked = await this.ctx.graph.walk(pending);
+    // check_ancestors cleans up from the bad and good commits (clear_commit_marks_many)
+    this.ctx.graph.clearCommitMarks([this.currentBad, ...this.goodRevs]);
     let res: number = BisectCode.OK;
     if (walked.length > 0) res = await this.checkMergeBases(noCheckout);
     if (!res) await this.write("BISECT_ANCESTORS_OK", "");
@@ -533,7 +550,7 @@ export class BisectEngine {
     if (res) return res;
 
     const bad = this.currentBad as ObjectId;
-    const paths = (await this.readBisectPaths()).map((p) => parsePathspecItem(p));
+    const paths = await this.readBisectPaths();
     const pending = [
       { id: bad, exclude: false },
       ...this.goodRevs.map((id) => ({ id, exclude: true })),
@@ -572,6 +589,9 @@ export class BisectEngine {
         ? `Bisecting: ${nr} revision left to test after this ${stepsMsg}\n`
         : `Bisecting: ${nr} revisions left to test after this ${stepsMsg}\n`,
     );
+    // only here does git clean up every commit's flags (repo_clear_commit_marks); the other
+    // ways out keep the flags the walks left
+    this.ctx.graph.clearMarks();
     return this.checkoutCandidate(rev, noCheckout);
   }
 
@@ -587,12 +607,15 @@ export class BisectEngine {
       const name = ref.name.slice("refs/bisect/".length);
       if (name.startsWith(`${terms.good}-`)) pending.push({ id: ref.id, exclude: true });
     }
+    // prepare_revs: SEEN and ADDED of the walk before cleared, the other flags kept
+    this.ctx.graph.resetRevisionWalk();
     const walked = await this.ctx.graph.walk(pending);
     let text = "# only skipped commits left to test\n";
     for (const n of walked) {
       if (n.flags & UNINTERESTING) continue;
       text += `# possible first '${terms.bad}' commit: [${n.id}] ${await this.ctx.subject(n.id)}\n`;
     }
+    this.ctx.graph.resetRevisionWalk();
     await this.append("BISECT_LOG", text);
     return 0;
   }
@@ -706,10 +729,10 @@ export class BisectEngine {
     let startHead: string;
     if (!(await this.emptyOrMissing("BISECT_START"))) {
       // reset to the rev from where we started
-      startHead = ((await this.read("BISECT_START")) ?? "").trim();
+      startHead = strbufTrim((await this.read("BISECT_START")) ?? "");
       if (!noCheckout) {
         const done = await this.ctx.checkout(startHead, { quiet: false });
-        if (done.stderr) this.printErr(done.stderr);
+        this.checkoutOutput(done);
         if (!done.ok) {
           return this.error(
             `checking out '${startHead}' failed. Try 'git bisect start <valid-branch>'.`,
@@ -787,7 +810,12 @@ export class BisectEngine {
         return BisectCode.FAILED;
       }
       const commit = await this.ctx.peelCommit(id);
-      if (!commit) throw new BisectDie(`Bad rev input (not a commit): ${arg}`);
+      if (!commit) {
+        // lookup_commit_reference's object_as_type complains first
+        const peeled = await this.ctx.peelObject(id);
+        if (peeled) this.error(`object ${peeled.id} is a ${peeled.type}, not a commit`);
+        throw new BisectDie(`Bad rev input (not a commit): ${arg}`);
+      }
       revs.push(commit);
     }
     const expected = await this.ctx.state.ref("BISECT_EXPECTED_REV");
@@ -803,12 +831,25 @@ export class BisectEngine {
     return this.autoNext(terms);
   }
 
-  /** builtin/bisect.c's bisect_skip: ranges become the commits they name */
+  /**
+   * builtin/bisect.c's bisect_skip: ranges become the commits they name, each by a revision
+   * walk in this process. Deliberately as git does it (a quirk of git 2.43 and 2.5x): the walk
+   * runs over the commits the bisection walks next, and reset_revision_walk clears only SEEN
+   * and ADDED, so the UNINTERESTING and BOTTOM flags of the range stay. When
+   * check_ancestors does not run after it (BISECT_ANCESTORS_OK is there), the bisection walk
+   * starts with them: `skip c7..c2` on a linear c1..c8 bisected as `start c8 c1` leaves
+   * c7 and its ancestors uninteresting, and c8 is the first bad commit.
+   */
   async skip(terms: Terms, args: string[]): Promise<number> {
     const argvState = ["skip"];
     for (const arg of args) {
-      if (arg.includes("..")) argvState.push(...(await this.ctx.revRange(arg)));
-      else argvState.push(arg);
+      if (arg.includes("..")) {
+        const pending = await this.ctx.rangePending(arg);
+        for (const n of await this.ctx.graph.walk(pending)) {
+          if (!(n.flags & UNINTERESTING)) argvState.push(n.id);
+        }
+        this.ctx.graph.resetRevisionWalk();
+      } else argvState.push(arg);
     }
     return this.state(terms, argvState);
   }
@@ -821,7 +862,7 @@ export class BisectEngine {
       // git 2.5x: a missing file reads as nothing (no checkout, no word), an empty one is
       // "We are not bisecting."
       if (text === "") this.print("We are not bisecting.\n");
-      branch = (text ?? "").trimEnd();
+      branch = strbufRtrim(text ?? "");
     } else {
       const id = await this.ctx.resolve(`${commit}^{commit}`);
       if (!id) return this.error(`'${commit}' is not a valid commit`);
@@ -829,7 +870,7 @@ export class BisectEngine {
     }
     if (branch.length > 0 && !(await this.ctx.refExists("BISECT_HEAD"))) {
       const done = await this.ctx.checkout(branch, { quiet, ignoreOtherWorktrees: true });
-      if (done.stderr) this.printErr(done.stderr);
+      this.checkoutOutput(done);
       if (!done.ok) {
         this.error(
           `could not check out original HEAD '${branch}'. Try 'git bisect reset <commit>'.`,
@@ -873,7 +914,8 @@ export class BisectEngine {
     if (p.startsWith("git bisect")) p = p.slice("git bisect".length);
     else if (p.startsWith("git-bisect")) p = p.slice("git-bisect".length);
     else return 0;
-    if (!/^[ \t\n\v\f\r]/.test(p)) return 0;
+    // git's isspace: space, tab, LF and CR (sane_ctype), not VT or FF
+    if (!/^[ \t\n\r]/.test(p)) return 0;
     p = p.replace(/^[ \t]+/, "");
     const wordEnd = p.search(/[ \t]/);
     const word = wordEnd < 0 ? p : p.slice(0, wordEnd);
@@ -1009,7 +1051,7 @@ export class BisectEngine {
   async readResetWhenFound(): Promise<ResetWhenFound | "invalid"> {
     const text = await this.read("BISECT_RESET_WHEN_FOUND");
     if (!text) return undefined;
-    const value = text.trim();
+    const value = strbufTrim(text);
     if (value === "original" || value === "found") return value;
     this.error(`invalid value for '--reset-when-found': '${value}'`);
     return "invalid";

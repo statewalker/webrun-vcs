@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -20,15 +21,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   type BisectResult,
   estimateBisectSteps,
+  type LogOutputOptions,
   skipAwayIndex,
   sqDequoteToArgv,
   sqQuoteArgv,
+  strbufRtrim,
+  strbufTrim,
 } from "../src/index.js";
 import { gitOk, openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
@@ -61,9 +66,10 @@ function run(
   const r = spawnSync("git", args, {
     cwd: dir,
     env: { ...nativeGitEnv(root), GIT_EDITOR: "true", ...extra },
-    encoding: "utf8",
   });
-  return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  // decoded as ours is: bytes that are no UTF-8 as lone surrogates
+  const text = (bytes: Buffer | null) => (bytes ? decodeGitPath(new Uint8Array(bytes)) : "");
+  return { status: r.status ?? 1, stdout: text(r.stdout), stderr: text(r.stderr) };
 }
 
 function ok(dir: string, args: string[], extra: Record<string, string> = {}): string {
@@ -267,20 +273,16 @@ function canon(text: string, terms: string[]): string {
   for (const t of terms) out = out.replaceAll(`'${t}'`, t);
   out = out.replace(/^(# )?status: waiting for .*$/gm, "$1status: <waiting>");
   out = out.replace(
-    /( is the first \S+ commit\n)commit [0-9a-f]{40}\n(.*\n)*?(?=bisect found|$)/g,
+    // (2.43's diff-tree shows nothing for a commit without parents)
+    /( is the first \S+ commit\n)(commit [0-9a-f]{40}\n(.*\n)*?)?(?=bisect found|$)/g,
     "$1<show>\n",
   );
   return out;
 }
 
-/** What git checkout says on stderr (git bisect's checkouts), which ours does not print. */
+/** Stderr as compared: the usage git prints differs by version. */
 function bisectStderr(text: string): string {
-  // the usage git prints differs by version
-  const usage = modern() ? text : text.replace(/\nusage: [\s\S]*$/, "\n");
-  return usage
-    .split("\n")
-    .filter((l) => !/^(Already on|Switched to|Previous HEAD position|HEAD is now at)/.test(l))
-    .join("\n");
+  return modern() ? text : text.replace(/\nusage: [\s\S]*$/, "\n");
 }
 
 /** What is compared between the twins after each step. */
@@ -337,7 +339,7 @@ async function step(
     `${where}\n${ours.stderr}\n--- native stderr\n${native.stderr}`,
   ).toBe(canon(native.stdout, terms));
   expect(ours.exitCode, `${where}: ${ours.stderr} / ${native.stderr}`).toBe(native.status);
-  if (options.compareStderr) {
+  if (options.compareStderr ?? true) {
     expect(bisectStderr(canon(ours.stderr, terms))).toBe(bisectStderr(canon(native.stderr, terms)));
   }
   expect(stateOf(b, terms), where).toEqual(stateOf(a, terms));
@@ -807,6 +809,340 @@ describeGit("git bisect against native git", () => {
     await step(a, b, ["start", "main", "main~9"], terms);
     await step(a, b, ["reset"], terms);
   }, 60_000);
+
+  /** A linear history c1..c<n> (tagged), each commit adding f<k>.txt, dated a minute apart. */
+  function linearHistory(dir: string, n: number, extra: Record<string, string> = {}): void {
+    ok(root, ["init", "-q", "-b", "main", dir]);
+    for (let k = 1; k <= n; k++) {
+      const time = 1_600_000_000 + k * 60;
+      put(dir, `f${k}.txt`, `${k}\n`);
+      ok(dir, ["add", "-A"]);
+      ok(dir, ["commit", "-q", "-m", `c${k}`], {
+        GIT_AUTHOR_DATE: `${time} +0000`,
+        GIT_COMMITTER_DATE: `${time} +0000`,
+        ...extra,
+      });
+      ok(dir, ["tag", `c${k}`]);
+    }
+  }
+
+  function linearTwins(n: number): { a: string; b: string } {
+    const a = join(root, `l${++counter}-a`);
+    const b = join(root, `l${counter}-b`);
+    linearHistory(a, n);
+    linearHistory(b, n);
+    return { a, b };
+  }
+
+  it("bisects a shallow clone (shallow commits have no parents)", async () => {
+    const src = join(root, `shallow-src${++counter}`);
+    linearHistory(src, 12);
+    const a = join(root, `sh${counter}-a`);
+    const b = join(root, `sh${counter}-b`);
+    for (const dir of [a, b]) ok(root, ["clone", "-q", "--depth", "6", `file://${src}`, dir]);
+    expect(readFileSync(join(a, ".git", "shallow"), "utf8").trim()).toBe(
+      ok(src, ["rev-parse", "c7"]).trim(),
+    );
+    const terms = ["bad", "good"];
+    let { native } = await step(a, b, ["start", "main", "main~4"], terms);
+    for (let k = 0; k < 10 && native.status === 0 && CANDIDATE.test(native.stdout); k++) {
+      ({ native } = await step(a, b, ["bad"], terms));
+    }
+    expect(native.stdout).toContain("is the first");
+    await step(a, b, ["log"], terms);
+    // the branch has an upstream: the checkout reports how they compare
+    const { native: reset } = await step(a, b, ["reset"], terms);
+    expect(reset.stdout).toContain("Your branch is up to date with 'origin/main'.");
+    // the merge base of a shallow commit and a good one the bad one does not reach
+    ok(a, ["checkout", "-q", "-b", "side", "main~3"]);
+    ok(b, ["checkout", "-q", "-b", "side", "main~3"]);
+    for (const dir of [a, b]) {
+      put(dir, "side.txt", "side\n");
+      ok(dir, ["add", "-A"]);
+      ok(dir, ["commit", "-q", "-m", "side"], {
+        GIT_AUTHOR_DATE: "1600009000 +0000",
+        GIT_COMMITTER_DATE: "1600009000 +0000",
+      });
+      ok(dir, ["checkout", "-q", "main"]);
+    }
+    ({ native } = await step(a, b, ["start", "main", "side"], terms));
+    for (let k = 0; k < 10 && native.status === 0 && CANDIDATE.test(native.stdout); k++) {
+      ({ native } = await step(a, b, ["good"], terms));
+    }
+    await step(a, b, ["reset"], terms);
+    // a good commit of an unrelated history: the walks reach the shallow commit, which
+    // has no parents to read
+    for (const dir of [a, b]) {
+      const tree = ok(dir, ["rev-parse", "main~5^{tree}"]).trim();
+      const lone = ok(dir, ["commit-tree", tree, "-m", "lone"], {
+        GIT_AUTHOR_DATE: "1600009500 +0000",
+        GIT_COMMITTER_DATE: "1600009500 +0000",
+      }).trim();
+      ok(dir, ["branch", "lone", lone]);
+    }
+    const c9 = ok(a, ["rev-parse", "main~3"]).trim();
+    ({ native } = await step(a, b, ["start", "main", "lone"], terms));
+    for (let k = 0; k < 10 && native.status === 0 && CANDIDATE.test(native.stdout); k++) {
+      ({ native } = await step(a, b, [reaches(a, c9, underTest(a)) ? "bad" : "good"], terms));
+    }
+    await step(a, b, ["reset"], terms);
+    ({ native } = await step(a, b, ["start", "main", "lone", "--", "f8.txt", "f7.txt"], terms));
+    for (let k = 0; k < 10 && native.status === 0 && CANDIDATE.test(native.stdout); k++) {
+      ({ native } = await step(a, b, ["bad"], terms));
+    }
+    await step(a, b, ["reset"], terms);
+  }, 60_000);
+
+  it("shows the first bad commit as git show does (format, dates, mailmap, notes, encodings)", async () => {
+    const make = (dir: string) => {
+      ok(root, ["init", "-q", "-b", "main", dir]);
+      let time = 1_550_000_000;
+      const dated = () => {
+        time += 60;
+        return { GIT_AUTHOR_DATE: `${time} +0100`, GIT_COMMITTER_DATE: `${time} +0100` };
+      };
+      put(dir, "a.txt", "one\ntwo\nthree\nfour\nfive\nsix\n");
+      put(dir, "gone.txt", "gone\n");
+      put(dir, "run.sh", "echo\n");
+      ok(dir, ["add", "-A"]);
+      ok(dir, ["commit", "-q", "-m", "root"], dated());
+      // a rename, a deletion, a creation and a mode change in one commit
+      ok(dir, ["mv", "a.txt", "b.txt"]);
+      ok(dir, ["rm", "-q", "gone.txt"]);
+      put(dir, "new dir/café.txt", "new\n");
+      chmodSync(join(dir, "run.sh"), 0o755);
+      ok(dir, ["add", "-A"]);
+      ok(dir, ["commit", "-q", "-m", "many\n\nbody line"], dated());
+      // a message stored in ISO-8859-1 (shown in UTF-8)
+      put(dir, "c.txt", "c\n");
+      ok(dir, ["add", "-A"]);
+      writeFileSync(join(dir, ".git", "MSG"), Buffer.from("caf\xe9 latin1\n", "latin1"));
+      ok(dir, ["-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-q", "-F", ".git/MSG"], dated());
+      put(dir, "d.txt", "d\n");
+      ok(dir, ["add", "-A"]);
+      ok(dir, ["commit", "-q", "-m", "tip"], dated());
+      ok(dir, ["notes", "add", "-m", "a note", "HEAD~2"], dated());
+      put(dir, ".mailmap", "Mapped Name <mapped@example.com> <author@example.com>\n");
+    };
+    const a = join(root, `show${++counter}-a`);
+    const b = join(root, `show${counter}-b`);
+    make(a);
+    make(b);
+    const terms = ["bad", "good"];
+    const configs: string[][] = [
+      [],
+      ["log.date", "iso"],
+      ["format.pretty", "fuller"],
+      ["log.mailmap", "false"],
+    ];
+    for (const culprit of ["main~2", "main~1"]) {
+      for (const [key, value] of configs) {
+        if (key) for (const dir of [a, b]) ok(dir, ["config", key, value as string]);
+        const id = ok(a, ["rev-parse", culprit]).trim();
+        let { native } = await step(a, b, ["start", "main", "main~3"], terms);
+        for (let k = 0; k < 10 && native.status === 0 && CANDIDATE.test(native.stdout); k++) {
+          ({ native } = await step(a, b, [reaches(a, id, underTest(a)) ? "bad" : "good"], terms));
+        }
+        expect(native.stdout).toContain(`${id} is the first`);
+        await step(a, b, ["reset"], terms);
+        if (key) for (const dir of [a, b]) ok(dir, ["config", "--unset", key]);
+      }
+    }
+  }, 120_000);
+
+  it("prints git log's --summary lines", async () => {
+    const dir = join(root, `summary${++counter}`);
+    ok(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "a.txt", "one\ntwo\nthree\nfour\nfive\nsix\n");
+    put(dir, "gone.txt", "gone\n");
+    put(dir, "run.sh", "echo\n");
+    put(dir, "keep.txt", "keep\n");
+    ok(dir, ["add", "-A"]);
+    ok(dir, ["commit", "-q", "-m", "root"]);
+    mkdirSync(join(dir, "sub"));
+    ok(dir, ["mv", "a.txt", "sub/b.txt"]);
+    ok(dir, ["rm", "-q", "gone.txt"]);
+    put(dir, "new\tfile.txt", "new\n");
+    chmodSync(join(dir, "run.sh"), 0o755);
+    put(dir, "keep.txt", "kept\n");
+    ok(dir, ["add", "-A"]);
+    ok(dir, ["commit", "-q", "-m", "changes"]);
+    // a merge: its summary against the first parent with combined diffs
+    ok(dir, ["checkout", "-q", "-b", "side", "HEAD~1"]);
+    put(dir, "side.txt", "side\n");
+    ok(dir, ["add", "-A"]);
+    ok(dir, ["commit", "-q", "-m", "side"]);
+    ok(dir, ["checkout", "-q", "main"]);
+    ok(dir, ["merge", "-q", "--no-ff", "--no-edit", "-m", "merge", "side"]);
+    const git = await openOurs(dir, ourEnv());
+    const cases: [string[], LogOutputOptions][] = [
+      [[], {}],
+      [["--stat"], { stat: true }],
+      [["-p"], { patch: true }],
+      [["--name-status"], { nameStatus: true }],
+      [["--cc"], { cc: true }],
+      [["-m", "--stat"], { m: true, stat: true }],
+      [["--diff-merges=first-parent"], { diffMerges: "first-parent" }],
+    ];
+    for (const [extra, options] of cases) {
+      const native = ok(dir, ["log", "--summary", ...extra]);
+      const ours = await git.log().callText({ summary: true, ...options });
+      expect(ours, extra.join(" ")).toBe(native);
+    }
+  }, 60_000);
+
+  it("bisects limited to nested paths and pathspec magic (pruned tree comparisons)", async () => {
+    const make = (dir: string) => {
+      ok(root, ["init", "-q", "-b", "main", dir]);
+      for (let k = 1; k <= 24; k++) {
+        const time = 1_620_000_000 + k * 60;
+        const area = ["src/core/deep", "src/ui", "doc", "src/core"][k % 4] as string;
+        put(dir, `${area}/f${k}.txt`, `${k}\n`);
+        if (k % 5 === 0) put(dir, "src/core/deep/shared.txt", `${k}\n`);
+        ok(dir, ["add", "-A"]);
+        ok(dir, ["commit", "-q", "-m", `c${k}`], {
+          GIT_AUTHOR_DATE: `${time} +0000`,
+          GIT_COMMITTER_DATE: `${time} +0000`,
+        });
+      }
+    };
+    const a = join(root, `paths${++counter}-a`);
+    const b = join(root, `paths${counter}-b`);
+    make(a);
+    make(b);
+    const terms = ["bad", "good"];
+    for (const [spec, culprit] of [
+      [["src/core/deep"], "main~6"],
+      [["src/core/*.txt"], "main~9"],
+      [[":(exclude)doc"], "main~4"],
+      [["src/core/deep/shared.txt", "src/ui"], "main~10"],
+    ] as const) {
+      const id = ok(a, ["rev-parse", culprit]).trim();
+      let { native } = await step(a, b, ["start", "main", "main~23", "--", ...spec], terms);
+      for (let k = 0; k < 20 && native.status === 0 && CANDIDATE.test(native.stdout); k++) {
+        ({ native } = await step(a, b, [reaches(a, id, underTest(a)) ? "bad" : "good"], terms));
+      }
+      await step(a, b, ["reset"], terms);
+    }
+  }, 120_000);
+
+  it("keeps the flags a skipped range leaves, as git does (stale UNINTERESTING)", async () => {
+    const { a, b } = linearTwins(8);
+    const terms = ["bad", "good"];
+    await step(a, b, ["start", "c8", "c1"], terms);
+    const { native, ours } = await step(a, b, ["skip", "c7..c2"], terms);
+    // git's own quirk: c8 is declared the first bad commit
+    const c8 = ok(a, ["rev-parse", "c8"]).trim();
+    expect(native.stdout).toContain(`${c8} is the first`);
+    expect(ours.firstBad).toBe(c8);
+    await step(a, b, ["reset"], terms);
+    // without BISECT_ANCESTORS_OK the flags are cleared by check_ancestors
+    await step(a, b, ["start", "c8", "c1"], terms);
+    rmSync(join(a, ".git", "BISECT_ANCESTORS_OK"));
+    rmSync(join(b, ".git", "BISECT_ANCESTORS_OK"));
+    await step(a, b, ["skip", "c7..c2"], terms);
+    await step(a, b, ["skip", "c3...c5", "c6"], terms);
+    await step(a, b, ["log"], terms);
+    await step(a, b, ["reset"], terms);
+  }, 60_000);
+
+  it("prints what git checkout prints for the bisection's checkouts", async () => {
+    const { a, b } = linearTwins(8);
+    const terms = ["bad", "good"];
+    // a local change the checkouts keep (f1.txt is the same in every commit): `M\t<path>`
+    // on stdout where the checkout is not quiet
+    for (const dir of [a, b]) writeFileSync(join(dir, "f1.txt"), "changed\n");
+    await step(a, b, ["start", "c7", "c1"], terms);
+    // started again: back to the branch, then on
+    await step(a, b, ["start", "c7", "c2"], terms);
+    // a commit made at the detached HEAD, left behind by the reset
+    for (const dir of [a, b]) {
+      put(dir, "lost.txt", "lost\n");
+      ok(dir, ["add", "lost.txt"]);
+      ok(dir, ["commit", "-q", "-m", "lost"], {
+        GIT_AUTHOR_DATE: "1600010000 +0000",
+        GIT_COMMITTER_DATE: "1600010000 +0000",
+      });
+    }
+    const { native: left } = await step(a, b, ["reset"], terms);
+    expect(left.stdout).toBe("M\tf1.txt\n");
+    expect(left.stderr).toContain("Warning: you are leaving 1 commit behind");
+    // on the branch during the bisection: the reset finds it there; a reset to a commit
+    // from a branch gives the detached HEAD advice
+    await step(a, b, ["start", "c7", "c1"], terms);
+    for (const dir of [a, b]) ok(dir, ["checkout", "-q", "main"]);
+    await step(a, b, ["reset"], terms);
+    await step(a, b, ["start", "c7", "c1"], terms);
+    for (const dir of [a, b]) ok(dir, ["checkout", "-q", "main"]);
+    const { native } = await step(a, b, ["reset", "c5"], terms);
+    expect(native.stderr).toContain("Note: switching to 'c5'.");
+    for (const dir of [a, b]) ok(dir, ["checkout", "-q", "main"]);
+  }, 60_000);
+
+  it("prints subjects that are not UTF-8 as git does (bytes as stored)", async () => {
+    const make = (dir: string) => {
+      ok(root, ["init", "-q", "-b", "main", dir]);
+      ok(dir, ["config", "i18n.commitEncoding", "ISO-8859-1"]);
+      for (let k = 1; k <= 6; k++) {
+        const time = 1_630_000_000 + k * 60;
+        put(dir, `f${k}.txt`, `${k}\n`);
+        ok(dir, ["add", "-A"]);
+        writeFileSync(join(dir, ".git", "MSG"), Buffer.from(`c${k} caf\xe9\n`, "latin1"));
+        ok(dir, ["commit", "-q", "-F", ".git/MSG"], {
+          GIT_AUTHOR_DATE: `${time} +0000`,
+          GIT_COMMITTER_DATE: `${time} +0000`,
+        });
+      }
+    };
+    const a = join(root, `enc${++counter}-a`);
+    const b = join(root, `enc${counter}-b`);
+    make(a);
+    make(b);
+    const native = spawnSync("git", ["bisect", "start", "main", "main~5"], {
+      cwd: a,
+      env: { ...nativeGitEnv(root), GIT_EDITOR: "true" },
+    });
+    const git = await openOurs(b, ourEnv());
+    const ours = await git.bisect().setArguments(["start", "main", "main~5"]).call();
+    expect(Buffer.from(ours.stdoutBytes).equals(native.stdout)).toBe(true);
+    expect(native.stdout.includes(Buffer.from("caf\xe9", "latin1"))).toBe(true);
+    const log = (dir: string) => readFileSync(join(dir, ".git", "BISECT_LOG"));
+    expect(log(b).equals(log(a))).toBe(true);
+    await step(a, b, ["bad"], ["bad", "good"]);
+    expect(log(b).equals(log(a))).toBe(true);
+    await step(a, b, ["reset"], ["bad", "good"]);
+  }, 60_000);
+
+  it("parses its options and dies on bad revisions as git does", async () => {
+    const { a, b } = linearTwins(8);
+    const terms = ["bad", "good"];
+    await step(a, b, ["--foo"], terms);
+    await step(a, b, ["-x"], terms);
+    if (modern()) {
+      await step(a, b, ["help"], terms);
+      await step(a, b, ["-h"], terms);
+    }
+    await step(a, b, ["start", "c8", "c1"], terms);
+    await step(a, b, ["skip", "nope..c2"], terms);
+    await step(a, b, ["skip", "c7..c5", "nope"], terms);
+    await step(a, b, ["good", "HEAD^{tree}"], terms);
+    await step(a, b, ["skip", "HEAD^{tree}"], terms);
+    await step(a, b, ["--", "good"], terms);
+    await step(a, b, ["reset"], terms);
+    // git's isspace has no VT: the line is no command, as git reads it
+    const c8 = ok(a, ["rev-parse", "c8"]).trim();
+    const c1 = ok(a, ["rev-parse", "c1"]).trim();
+    const c5 = ok(a, ["rev-parse", "c5"]).trim();
+    const log = `git bisect start '${c8}' '${c1}'\ngit bisect\vgood ${c5}\n`;
+    const file = join(root, `replay-vt-${counter}.log`);
+    writeFileSync(file, log);
+    await step(a, b, ["replay", file], terms, { configure: (cmd) => cmd.setLogText(log) });
+    await step(a, b, ["reset"], terms);
+    // the typed commands refuse raw arguments
+    const git = await openOurs(b, ourEnv());
+    expect(() => git.bisectNext().setArguments(["next"])).toThrow(/builds its own arguments/);
+    expect(() => git.bisectState("bad").setArguments(["good"])).toThrow(/builds its own/);
+  }, 60_000);
 });
 
 describe("bisect quoting", () => {
@@ -816,6 +1152,14 @@ describe("bisect quoting", () => {
     expect(quoted).toBe(" 'main' 'it'\\''s' 'a'\\!'b' '' 'x y'");
     expect(sqDequoteToArgv(quoted.trim())).toEqual({ argv, ok: true });
     expect(sqDequoteToArgv("'a' b")).toEqual({ argv: ["a"], ok: false });
+  });
+
+  it("splits words at git's isspace (no VT, no FF) and trims as strbuf_trim", () => {
+    expect(sqDequoteToArgv("'a'\t'b'")).toEqual({ argv: ["a", "b"], ok: true });
+    expect(sqDequoteToArgv("'a'\v'b'")).toEqual({ argv: [], ok: false });
+    expect(sqDequoteToArgv("'a'\f'b'")).toEqual({ argv: [], ok: false });
+    expect(strbufTrim(" \t\r\nmain\v\n")).toBe("main\v");
+    expect(strbufRtrim(" main \n")).toBe(" main");
   });
 });
 

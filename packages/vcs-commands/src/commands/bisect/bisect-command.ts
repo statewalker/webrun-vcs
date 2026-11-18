@@ -18,21 +18,25 @@
  * ```
  */
 
-import { EMPTY_TREE_ID, isSymbolicRef, isValidRefName, type ObjectId } from "@statewalker/vcs-core";
+import { isSymbolicRef, isValidRefName, type ObjectId } from "@statewalker/vcs-core";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
+import { InvalidArgumentError, RevisionError } from "../../errors/index.js";
 import { GitCommand } from "../../git-command.js";
-import { ChangeType } from "../../results/diff-entry.js";
-import { pprintRename } from "../../results/diff-output.js";
-import { quotePath } from "../../results/quote-path.js";
 import { CheckoutCommand, CheckoutStatus } from "../checkout-command.js";
 import { DiffCommand } from "../diff-command.js";
+import { LogCommand } from "../log-command.js";
 import { commitsBaseSource, MergeBaseGraph } from "../merge-bases.js";
 import { configBool, configValue } from "../merge-config.js";
-import { flatTree, OperationState } from "../merge-support.js";
-import { matchPathspec, type PathspecItem } from "../pathspec.js";
+import { OperationState } from "../merge-support.js";
 import { formatCommitPretty } from "../pretty-format.js";
-import { RevListCommand } from "../rev-list-command.js";
-import { formatGitDate } from "../sequencer-support.js";
+import {
+  handleRevisionArg,
+  type RevisionArgEntry,
+  unknownRevisionMessage,
+} from "../revision-range.js";
+import { shortenUnambiguousRef } from "../worktree-list-command.js";
+import { gitCheckout } from "./bisect-checkout.js";
 import {
   BISECT_USAGE,
   BisectCode,
@@ -41,14 +45,21 @@ import {
   type BisectRunHandler,
   isBisectSuccess,
 } from "./bisect-engine.js";
-import { BisectDie, BisectGraph } from "./bisect-graph.js";
+import { BisectDie, BisectGraph, type BisectGraphSource } from "./bisect-graph.js";
 
 /** What a `git bisect` command did. */
 export interface BisectResult {
   /** git's exit status (0 also when the first bad commit is found or a merge base is checked out) */
   exitCode: number;
-  /** What git prints on stdout, byte for byte */
+  /**
+   * What git prints on stdout, decoded as paths decode ({@link decodeGitPath}): the subjects
+   * git prints without re-encoding them (`[<id>] <subject>`) keep bytes that are no UTF-8
+   * as lone surrogates, so `encodeGitPath(stdout)` is git's output byte for byte
+   * ({@link stdoutBytes})
+   */
   stdout: string;
+  /** git's stdout as bytes */
+  stdoutBytes: Uint8Array;
   /** What git prints on stderr (its `error:`, `warning:` and `fatal:` lines, and checkout's) */
   stderr: string;
   /** git's bisect result code (bisect.h's enum bisect_error) */
@@ -59,24 +70,45 @@ export interface BisectResult {
   firstBad?: ObjectId;
 }
 
-const lineText = (text: string) => (text.length === 0 || text.endsWith("\n") ? text : `${text}\n`);
+/** The subcommands of cmd_bisect's OPT_SUBCOMMANDs. */
+const SUBCOMMANDS = new Set([
+  "reset",
+  "terms",
+  "start",
+  "next",
+  "log",
+  "replay",
+  "skip",
+  "visualize",
+  "view",
+  "run",
+]);
 
 /**
  * `git bisect <subcommand> <args>...` as git's `cmd_bisect` dispatches it: `start`, `bad`,
  * `good`, `new`, `old`, a custom term, `skip`, `next`, `reset`, `terms`, `log`, `replay`,
- * `run`. The typed commands ({@link BisectStartCommand}, ...) build these arguments.
- * `visualize` is not run (it starts gitk or `git log`).
+ * `run`, `help`, and git's options before them (`-h`, `--`, `--end-of-options`). The typed
+ * commands ({@link BisectStartCommand}, ...) build these arguments. `visualize` is not run
+ * (it starts gitk or `git log`).
  */
 export class BisectCommand extends GitCommand<BisectResult> {
   protected args: string[] = [];
   private runHandler?: BisectRunHandler;
   private logText?: string;
 
-  /** The arguments after `git bisect`. */
+  /**
+   * The arguments after `git bisect`. A typed command that builds its own arguments
+   * refuses them ({@link BisectStartCommand} takes them as the arguments after `start`).
+   */
   setArguments(args: string[]): this {
     this.checkCallable();
-    this.args = [...args];
+    this.acceptArguments([...args]);
     return this;
+  }
+
+  /** Where {@link setArguments} puts the arguments. */
+  protected acceptArguments(args: string[]): void {
+    this.args = args;
   }
 
   /** Runs the command of `bisect run` (git runs it with the shell); see {@link BisectRunHandler}. */
@@ -112,20 +144,31 @@ export class BisectCommand extends GitCommand<BisectResult> {
         else if (mode && (await engine.resetWhenFound(mode))) res = BisectCode.FAILED;
       }
     } catch (error) {
+      res = BisectCode.FAILED;
       if (error instanceof BisectUsage) {
-        res = BisectCode.FAILED;
-        exitCode = 129;
-        engine.printErr(`fatal: ${error.message}\n\n${usageText()}\n\n`);
+        // parse-options: usage_msg_opt (fatal:), an unknown option (error:), `help`, `-h`
+        exitCode = error.kind === "help-stdout" ? 0 : 129;
+        if (error.kind === "help-stdout") {
+          engine.print(`${usageText()}\n\n`);
+          res = BisectCode.OK;
+        } else if (error.kind === "help") engine.printErr(`${usageText()}\n\n`);
+        else if (error.kind === "option")
+          engine.printErr(`error: ${error.message}\n${usageText()}\n\n`);
+        else engine.printErr(`fatal: ${error.message}\n\n${usageText()}\n\n`);
       } else if (error instanceof BisectDie) {
-        res = BisectCode.FAILED;
         exitCode = 128;
         engine.printErr(`fatal: ${error.message}\n`);
+      } else if (error instanceof RevisionError) {
+        // where git's revision machinery dies (its lines are `fatal:` ones already)
+        exitCode = 128;
+        engine.printErr(error.message.endsWith("\n") ? error.message : `${error.message}\n`);
       } else throw error;
     }
     const { stdout, stderr } = engine.output;
     return {
       exitCode: exitCode ?? (isBisectSuccess(res) ? 0 : -res & 0xff),
       stdout,
+      stdoutBytes: encodeGitPath(stdout),
       stderr,
       code: res,
       ...(engine.candidate ? { candidate: engine.candidate } : {}),
@@ -133,20 +176,43 @@ export class BisectCommand extends GitCommand<BisectResult> {
     };
   }
 
-  /** builtin/bisect.c's cmd_bisect and its subcommands */
-  private async dispatch(engine: BisectEngine, argv: string[]): Promise<number> {
+  /** builtin/bisect.c's cmd_bisect (its parse_options first) and its subcommands */
+  private async dispatch(engine: BisectEngine, args: string[]): Promise<number> {
+    // parse_options with PARSE_OPT_SUBCOMMAND_OPTIONAL: no option of its own, so the first
+    // option is an error; `--` and `--end-of-options` end them
+    const first = args[0] ?? "";
+    const at = first === "--" || first === "--end-of-options" ? 1 : 0;
+    if (at === 0 && first.startsWith("-") && first.length > 1) {
+      if (first === "-h") throw new BisectUsage("help-stdout", "");
+      if (first.startsWith("--")) {
+        throw new BisectUsage("option", `unknown option \`${first.slice(2)}'`);
+      }
+      throw new BisectUsage("option", `unknown switch \`${first[1]}'`);
+    }
+    const argv = args.slice(at);
     const [sub, ...rest] = argv;
     const terms = { bad: "bad", good: "good" };
+    if (sub === undefined) throw new BisectUsage("fatal", "need a command");
+    if (!SUBCOMMANDS.has(sub)) {
+      if (sub === "help") throw new BisectUsage("help", "");
+      if (!(await engine.getTerms(terms, true))) return engine.error("no terms defined");
+      if (
+        (await engine.checkAndSetTerms(terms, sub)) ||
+        !(sub === terms.good || sub === terms.bad)
+      ) {
+        throw new BisectUsage("fatal", `unknown command: '${sub}'`);
+      }
+      return engine.state(terms, argv);
+    }
     switch (sub) {
-      case "reset":
+      case "reset": {
         if (rest.length > 1) {
           return engine.error("'git bisect reset' requires either no argument or a commit");
         }
-        {
-          const res = await engine.reset(rest[0], false);
-          if (res) return res;
-          return engine.cleanState();
-        }
+        const res = await engine.reset(rest[0], false);
+        if (res) return res;
+        return engine.cleanState();
+      }
       case "terms":
         if (rest.length > 1) return engine.error("'git bisect terms' requires 0 or 1 argument");
         return engine.terms(terms, rest[0]);
@@ -164,26 +230,13 @@ export class BisectCommand extends GitCommand<BisectResult> {
       case "skip":
         if (!(await engine.getTerms(terms, true))) return engine.error("no terms defined");
         return engine.skip(terms, rest);
-      case "visualize":
-      case "view":
-        throw new BisectDie("'git bisect visualize' is not supported");
       case "run":
         if (rest.length === 0) return engine.error("'git bisect run' failed: no command provided.");
         if (!(await engine.getTerms(terms, true))) return engine.error("no terms defined");
         return engine.run(terms, rest);
-      case undefined:
-        throw new BisectUsage("need a command");
-      default: {
-        if (sub === "help") throw new BisectUsage("help");
-        if (!(await engine.getTerms(terms, true))) return engine.error("no terms defined");
-        if (
-          (await engine.checkAndSetTerms(terms, sub)) ||
-          !(sub === terms.good || sub === terms.bad)
-        ) {
-          throw new BisectUsage(`unknown command: '${sub}'`);
-        }
-        return engine.state(terms, argv);
-      }
+      default:
+        // visualize, view
+        throw new BisectDie("'git bisect visualize' is not supported");
     }
   }
 
@@ -192,38 +245,57 @@ export class BisectCommand extends GitCommand<BisectResult> {
     const refs = this.refsStore;
     const state = new OperationState(this.workingCopy.checkout, refs);
     const commits = this.walkCommits;
-    const trees = this.trees;
-    const flats = new Map<ObjectId, Promise<Map<string, { objectId: ObjectId; mode: number }>>>();
-    const flat = (tree: ObjectId) => {
-      let found = flats.get(tree);
-      if (!found) {
-        found = flatTree(trees, tree);
-        flats.set(tree, found);
-        if (flats.size > 64) flats.delete(flats.keys().next().value as ObjectId);
-      }
-      return found;
+    // a shallow commit has no parents (git's shallow grafts), here as in `git log`
+    let shallowRead: Promise<Set<ObjectId>> | undefined;
+    const shallow = () => {
+      shallowRead ??= (async () =>
+        new Set((await refs.getShallow?.().catch(() => undefined)) ?? []))();
+      return shallowRead;
     };
-    const graph = new BisectGraph({
+    // the paths compared as LogCommand's history simplification compares them: a pruned tree
+    // diff, equal subtrees and paths outside the pathspec skipped, its trees cached
+    const comparers = new Map<string, LogCommand>();
+    const source: BisectGraphSource = {
       header: async (id) => {
         const commit = await commits.load(id).catch(() => undefined);
-        return commit
-          ? { tree: commit.tree, parents: commit.parents, date: commit.committer.timestamp }
-          : undefined;
+        if (!commit) return undefined;
+        const parents = (await shallow()).has(id) ? [] : commit.parents;
+        return { tree: commit.tree, parents, date: commit.committer.timestamp };
       },
-      differs: async (from, to, paths: PathspecItem[]) => {
-        const a = from ? await flat(from) : new Map();
-        const b = await flat(to);
-        for (const [path, entry] of b) {
-          const old = a.get(path);
-          if (old && old.objectId === entry.objectId && old.mode === entry.mode) continue;
-          if (matchPathspec(paths, path, 0)) return true;
+      differs: (from, to, paths) => {
+        const key = paths.join("\0");
+        let log = comparers.get(key);
+        if (!log) {
+          log = new LogCommand(this._workingCopy);
+          for (const p of paths) log.addPath(p);
+          comparers.set(key, log);
         }
-        for (const path of a.keys()) {
-          if (!b.has(path) && matchPathspec(paths, path, 0)) return true;
-        }
-        return false;
+        return log.pathsDiffer(from, to);
       },
-    });
+    };
+    const graph = new BisectGraph(source);
+    const mergeBaseGraph = async () => {
+      const base = commitsBaseSource(commits, async () => new Map());
+      const cut = await shallow();
+      if (cut.size === 0) return new MergeBaseGraph(base);
+      // no commit-graph generations with shallow commits (git turns the graph off)
+      return new MergeBaseGraph({
+        load: async (id) => {
+          const found = await base.load(id);
+          return found && { parents: cut.has(id) ? [] : found.parents, date: found.date };
+        },
+        tree: base.tree,
+        generationOrder: async () => false,
+      });
+    };
+    const mergeBasesMany = async (one: ObjectId, twos: ObjectId[]) => {
+      const g = await mergeBaseGraph();
+      const bases = await g.mergeBasesMany(
+        g.commit(one),
+        twos.map((t) => g.commit(t)),
+      );
+      return bases.map((n) => n.id).filter((id): id is ObjectId => id !== undefined);
+    };
     const resolver = () => this.revisionResolver();
     const resolve = async (rev: string) => {
       try {
@@ -232,14 +304,19 @@ export class BisectCommand extends GitCommand<BisectResult> {
         return undefined;
       }
     };
-    const peelCommit = async (id: ObjectId) => {
+    const peelObject = async (id: ObjectId) => {
       try {
         const peeled = await resolver().peelTags(id);
-        return peeled.type === "commit" ? peeled.id : undefined;
+        return peeled.type ? { id: peeled.id, type: peeled.type as string } : undefined;
       } catch {
         return undefined;
       }
     };
+    const peelCommit = async (id: ObjectId) => {
+      const peeled = await peelObject(id);
+      return peeled?.type === "commit" ? peeled.id : undefined;
+    };
+    const subject = (id: ObjectId) => this.rawSubject(id);
     return {
       state,
       graph,
@@ -270,27 +347,25 @@ export class BisectCommand extends GitCommand<BisectResult> {
       },
       resolve,
       peelCommit,
-      subject: async (id) => {
-        const commit = await commits.load(id);
-        return commit ? formatCommitPretty("%s", commit, id) : "";
-      },
+      peelObject,
+      subject,
       showCommit: (id) => this.showCommit(id),
-      mergeBasesMany: async (one, twos) => {
-        const g = new MergeBaseGraph(commitsBaseSource(commits, async () => new Map()));
-        const bases = await g.mergeBasesMany(
-          g.commit(one),
-          twos.map((t) => g.commit(t)),
+      mergeBasesMany,
+      rangePending: async (arg) => {
+        // setup_revisions(2, argv + i - 1): the argument alone, no `--` after it
+        const out: RevisionArgEntry[] = [];
+        const done = await handleRevisionArg(
+          resolver(),
+          arg,
+          false,
+          { mergeBases: (a, b) => mergeBasesMany(a, [b]) },
+          out,
+          false,
         );
-        return bases.map((n) => n.id).filter((id): id is ObjectId => id !== undefined);
-      },
-      revRange: async (arg) => {
-        const ids: ObjectId[] = [];
-        for await (const commit of await new RevListCommand(this._workingCopy)
-          .addRevision(arg)
-          .call()) {
-          ids.push(commit.id);
+        if (done === false) {
+          throw new BisectDie(unknownRevisionMessage(arg).replace(/^fatal: /, ""));
         }
-        return ids;
+        return out.map((e) => ({ id: e.id, exclude: e.exclude }));
       },
       validRefName: (name) => isValidRefName(name),
       isBare: () => {
@@ -301,87 +376,163 @@ export class BisectCommand extends GitCommand<BisectResult> {
           return true;
         }
       },
-      checkout: async (name, options) => {
-        const command = new CheckoutCommand(this._workingCopy).setName(name);
-        if (options.ignoreOtherWorktrees) command.setIgnoreOtherWorktrees(true);
-        try {
-          const result = await command.call();
-          if (result.status === CheckoutStatus.OK) return { ok: true };
-          return { ok: false, stderr: lineText(result.message ?? "") };
-        } catch (error) {
-          return {
-            ok: false,
-            stderr: lineText(error instanceof Error ? error.message : String(error)),
-          };
-        }
-      },
+      checkout: (name, options) =>
+        gitCheckout(
+          {
+            checkout: async (target, ignoreOtherWorktrees) => {
+              const command = new CheckoutCommand(this._workingCopy).setName(target);
+              if (ignoreOtherWorktrees) command.setIgnoreOtherWorktrees(true);
+              try {
+                const result = await command.call();
+                if (result.status === CheckoutStatus.OK) return { ok: true };
+                return { ok: false, message: result.message ?? "" };
+              } catch (error) {
+                return {
+                  ok: false,
+                  message: error instanceof Error ? error.message : String(error),
+                };
+              }
+            },
+            head: async () => {
+              const head = await refs.get("HEAD").catch(() => undefined);
+              const id = (await refs.resolve("HEAD").catch(() => undefined))?.objectId;
+              const path = head && isSymbolicRef(head) ? head.target : undefined;
+              return { ...(path ? { path } : {}), ...(id ? { id } : {}) };
+            },
+            localChanges: (commit) =>
+              new DiffCommand(this._workingCopy)
+                .setOldTree(commit)
+                .setRenames(false)
+                .callText("name-status"),
+            abbreviate: (id) => this.abbreviateObjectId(id),
+            subject: (id) => this.onelineSubject(id),
+            commits: source,
+            refCommits: async () => {
+              const out: ObjectId[] = [];
+              for await (const ref of refs.list("refs/")) {
+                const id =
+                  "objectId" in ref && ref.objectId
+                    ? ref.objectId
+                    : (await refs.resolve(ref.name).catch(() => undefined))?.objectId;
+                const commit = id ? await peelCommit(id) : undefined;
+                if (commit) out.push(commit);
+              }
+              return out;
+            },
+            config: (key) => configValue(this._workingCopy, key),
+            upstreamOf: (branch) =>
+              resolver()
+                .upstreamOf(branch)
+                .catch(() => undefined),
+            pushOf: (branch) =>
+              resolver()
+                .pushOf(branch)
+                .catch(() => undefined),
+            refCommit: async (ref) => {
+              const id = (await refs.resolve(ref).catch(() => undefined))?.objectId;
+              return id ? peelCommit(id) : undefined;
+            },
+            shortenRef: (ref) => shortenUnambiguousRef(refs, ref),
+          },
+          name,
+          options,
+        ),
     };
   }
 
   /**
+   * The commit's `%s` as git's format_commit_message gives it without an output encoding
+   * (bisect.c's `[%H] %s`, the `# bad: [<id>] <subject>` lines of BISECT_LOG): the message's
+   * bytes as stored, not re-encoded, decoded as paths decode.
+   */
+  private async rawSubject(id: ObjectId): Promise<string> {
+    const commit = await this.walkCommits.load(id).catch(() => undefined);
+    if (!commit) return "";
+    let message = commit.message;
+    const bytes = await this.rawObject(id);
+    if (bytes) {
+      const text = decodeGitPath(bytes);
+      const at = text.indexOf("\n\n");
+      message = at < 0 ? "" : text.slice(at + 2);
+    }
+    return formatCommitPretty("%s", { ...commit, message }, id);
+  }
+
+  /**
+   * The subject CMIT_FMT_ONELINE shows (pp_commit_easy): the message in the log output
+   * encoding (`i18n.logOutputEncoding`, else `i18n.commitEncoding`, else UTF-8). A message
+   * already in that encoding is printed as stored; another is shown in UTF-8 (the only other
+   * output encoding supported).
+   */
+  private async onelineSubject(id: ObjectId): Promise<string> {
+    const commit = await this.walkCommits.load(id).catch(() => undefined);
+    if (!commit) return "";
+    const canon = (charset: string) => charset.toLowerCase().replace(/^utf-?8$/, "utf-8");
+    const output =
+      configValue(this._workingCopy, "i18n.logOutputEncoding") ??
+      configValue(this._workingCopy, "i18n.commitEncoding") ??
+      "UTF-8";
+    if (canon(output) === canon(commit.encoding ?? "UTF-8")) return this.rawSubject(id);
+    return formatCommitPretty("%s", commit, id);
+  }
+
+  /** An object's content as stored (undefined when missing or without a raw store) */
+  private async rawObject(id: ObjectId): Promise<Uint8Array | undefined> {
+    const objects = this._workingCopy.history?.objects;
+    if (!objects) return undefined;
+    try {
+      const obj = await objects.get(id);
+      if (!obj) return undefined;
+      if (obj.bytes) return obj.bytes;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const c of obj.content) {
+        chunks.push(c);
+        size += c.length;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * git's show_commit: `git show --stat --summary --no-abbrev-commit
-   * --diff-merges=first-parent <id>` (no decorations, as without a terminal).
+   * --diff-merges=first-parent <id>`, printed as `git log` prints that one commit (no
+   * decorations, as without a terminal): the configuration's format, dates, mailmap and notes
+   * apply as they apply to `git show`.
    */
   private async showCommit(id: ObjectId): Promise<string> {
-    const commit = await this.walkCommits.load(id);
-    if (!commit) throw new BisectDie(`unable to start 'show' for object '${id}'`);
-    let out = `commit ${id}\n`;
-    if (commit.parents.length > 1) {
-      const abbrevs: string[] = [];
-      for (const p of commit.parents) abbrevs.push(await this.abbreviateObjectId(p));
-      out += `Merge: ${abbrevs.join(" ")}\n`;
+    try {
+      const bytes = await new LogCommand(this._workingCopy).add(id).setMaxCount(1).callBytes({
+        stat: true,
+        summary: true,
+        abbrevCommit: false,
+        diffMerges: "first-parent",
+      });
+      return decodeGitPath(bytes);
+    } catch (error) {
+      if (error instanceof BisectDie) throw error;
+      throw new BisectDie(`unable to start 'show' for object '${id}'`);
     }
-    out += `Author: ${commit.author.name} <${commit.author.email}>\n`;
-    out += `Date:   ${formatGitDate(commit.author)}\n\n`;
-    out += mediumBody(commit.message);
-    const old = commit.parents[0] ?? EMPTY_TREE_ID;
-    const stat = await new DiffCommand(this._workingCopy)
-      .setOldTree(old)
-      .setNewTree(id)
-      .callText("stat");
-    const renames = configValue(this._workingCopy, "diff.renames");
-    const entries = await new DiffCommand(this._workingCopy)
-      .setOldTree(old)
-      .setNewTree(id)
-      .setRenames(
-        configBool(this._workingCopy, "diff.renames", true) ||
-          renames === "copies" ||
-          renames === "copy",
-      )
-      .call();
-    const quote = configBool(this._workingCopy, "core.quotePath", true);
-    let summary = "";
-    const mode6 = (mode: number | undefined) => (mode ?? 0).toString(8).padStart(6, "0");
-    for (const e of entries) {
-      switch (e.changeType) {
-        case ChangeType.DELETE:
-          summary += ` delete mode ${mode6(e.oldMode)} ${quotePath(e.oldPath ?? "", quote)}\n`;
-          break;
-        case ChangeType.ADD:
-          summary += ` create mode ${mode6(e.newMode)} ${quotePath(e.newPath ?? "", quote)}\n`;
-          break;
-        case ChangeType.RENAME:
-        case ChangeType.COPY: {
-          const kind = e.changeType === ChangeType.RENAME ? "rename" : "copy";
-          summary += ` ${kind} ${pprintRename(e.oldPath ?? "", e.newPath ?? "", quote)} (${e.score ?? 0}%)\n`;
-          if (e.oldMode && e.newMode && e.oldMode !== e.newMode) {
-            summary += ` mode change ${mode6(e.oldMode)} => ${mode6(e.newMode)}\n`;
-          }
-          break;
-        }
-        default:
-          if (e.oldMode && e.newMode && e.oldMode !== e.newMode) {
-            summary += ` mode change ${mode6(e.oldMode)} => ${mode6(e.newMode)} ${quotePath(e.newPath ?? "", quote)}\n`;
-          }
-      }
-    }
-    const diff = stat + summary;
-    return diff ? `${out}\n${diff}` : out;
   }
 }
 
-/** Where git prints its usage (`usage_msg_opt`): exit status 129. */
-class BisectUsage extends Error {}
+/** Where git's parse_options prints its usage: `fatal:` (usage_msg_opt), an unknown option (`error:`), `help`, `-h`. */
+class BisectUsage extends Error {
+  constructor(
+    readonly kind: "fatal" | "option" | "help" | "help-stdout",
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 function usageText(): string {
   return BISECT_USAGE.map((line, i) => {
@@ -390,36 +541,13 @@ function usageText(): string {
   }).join("\n");
 }
 
-/**
- * pretty.c's CMIT_FMT_MEDIUM body: each line indented by four (tabs expanded to eight
- * columns), leading blank lines dropped, the end trimmed.
- */
-function mediumBody(message: string): string {
-  const lines = message.split("\n");
-  let out = "";
-  let first = true;
-  for (const line of lines) {
-    if (/^\s*$/.test(line)) {
-      if (first) continue;
-      out += "    \n";
-      continue;
-    }
-    first = false;
-    let col = 0;
-    let expanded = "";
-    for (const c of line) {
-      if (c === "\t") {
-        const n = 8 - (col % 8);
-        expanded += " ".repeat(n);
-        col += n;
-      } else {
-        expanded += c;
-        col++;
-      }
-    }
-    out += `    ${expanded}\n`;
-  }
-  return `${out.replace(/\s+$/, "")}\n`;
+/** A typed command's refusal of raw arguments. */
+function refuseArguments(command: string, args: string[]): never {
+  throw new InvalidArgumentError(
+    "arguments",
+    args,
+    `${command} builds its own arguments; use git.bisect().setArguments() for raw ones`,
+  );
 }
 
 /**
@@ -429,6 +557,11 @@ function mediumBody(message: string): string {
  */
 export class BisectStartCommand extends BisectCommand {
   private readonly paths: string[] = [];
+
+  /** {@link setArguments}: the arguments after `start` (before the paths added). */
+  protected override acceptArguments(args: string[]): void {
+    this.args = args;
+  }
 
   /** An argument as given on git's command line (options, revisions, `--`, paths). */
   addArgument(arg: string): this {
@@ -485,6 +618,11 @@ export class BisectStartCommand extends BisectCommand {
  * checked out, or the first bad commit shown.
  */
 export class BisectStateCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectStateCommand", args);
+  }
+
   private term = "bad";
   private readonly revisions: string[] = [];
 
@@ -509,6 +647,11 @@ export class BisectStateCommand extends BisectCommand {
 
 /** `git bisect skip [(<rev>|<range>)...]`: commits that cannot be tested. */
 export class BisectSkipCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectSkipCommand", args);
+  }
+
   private readonly revisions: string[] = [];
 
   /** A revision or a range (`a..b`) to skip */
@@ -525,6 +668,11 @@ export class BisectSkipCommand extends BisectCommand {
 
 /** `git bisect next`: the next candidate checked out. */
 export class BisectNextCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectNextCommand", args);
+  }
+
   protected override arguments(): string[] {
     return ["next"];
   }
@@ -532,6 +680,11 @@ export class BisectNextCommand extends BisectCommand {
 
 /** `git bisect reset [<commit>]`: the bisection ends, the original branch (or `commit`) checked out. */
 export class BisectResetCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectResetCommand", args);
+  }
+
   private commit?: string;
 
   /** The commit to check out instead of the branch the bisection started on */
@@ -548,6 +701,11 @@ export class BisectResetCommand extends BisectCommand {
 
 /** `git bisect terms [--term-good | --term-bad]` */
 export class BisectTermsCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectTermsCommand", args);
+  }
+
   private option?: string;
 
   /** `--term-good` / `--term-old` / `--term-bad` / `--term-new` */
@@ -564,6 +722,11 @@ export class BisectTermsCommand extends BisectCommand {
 
 /** `git bisect log`: the bisection's log (its stdout). */
 export class BisectLogCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectLogCommand", args);
+  }
+
   protected override arguments(): string[] {
     return ["log"];
   }
@@ -571,6 +734,11 @@ export class BisectLogCommand extends BisectCommand {
 
 /** `git bisect replay <logfile>`, over the log's text. */
 export class BisectReplayCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectReplayCommand", args);
+  }
+
   private name = "BISECT_LOG";
 
   /** The log to replay (as `git bisect log` printed it), and the name errors give it */
@@ -591,6 +759,11 @@ export class BisectReplayCommand extends BisectCommand {
  * first bad commit is found.
  */
 export class BisectRunCommand extends BisectCommand {
+  /** Refused: the command builds its own arguments. */
+  protected override acceptArguments(args: string[]): void {
+    refuseArguments("BisectRunCommand", args);
+  }
+
   private command: string[] = [];
 
   /** The command and its arguments */

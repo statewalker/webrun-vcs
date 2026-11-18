@@ -38,6 +38,7 @@ import {
   formatNumstat,
   formatShortstat,
   formatStat,
+  formatSummary,
   writePairPatch,
 } from "../results/diff-output.js";
 import { quotePath } from "../results/quote-path.js";
@@ -52,6 +53,7 @@ export type DiffOutputFormat =
   | "stat"
   | "numstat"
   | "shortstat"
+  | "summary"
   | "name-only"
   | "name-status";
 
@@ -506,12 +508,25 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       "numstat",
       "stat",
       "shortstat",
+      "summary",
       "patch",
     ];
     let separator = false;
     for (const format of order) {
       if (!formats.includes(format)) continue;
       if (format === "patch" && separator) sink.text("\n");
+      // diff_flush: an empty summary (is_summary_empty) prints nothing and asks no separator
+      if (format === "summary") {
+        const text = formatSummary(
+          pairs.filter((p) => !unmerged.has(p)),
+          quote,
+        );
+        if (text) {
+          sink.text(text);
+          separator = true;
+        }
+        continue;
+      }
       separator = true;
       switch (format) {
         case "patch": {

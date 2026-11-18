@@ -14,8 +14,6 @@
 
 import type { ObjectId } from "@statewalker/vcs-core";
 
-import type { PathspecItem } from "../pathspec.js";
-
 /** revision.c's object flags, as the bisection reads them. */
 export const UNINTERESTING = 1 << 0;
 export const TREESAME = 1 << 1;
@@ -43,8 +41,11 @@ export class BisectNode {
 export interface BisectGraphSource {
   /** The commit's tree, parents and committer date; undefined when missing. */
   header(id: ObjectId): Promise<{ tree: ObjectId; parents: ObjectId[]; date: number } | undefined>;
-  /** Whether trees `from` (undefined: the empty tree) and `to` differ at the paths. */
-  differs(from: ObjectId | undefined, to: ObjectId, paths: PathspecItem[]): Promise<boolean>;
+  /**
+   * Whether trees `from` (undefined: the empty tree) and `to` differ at the pathspec `paths`
+   * (git's rev_compare_tree).
+   */
+  differs(from: ObjectId | undefined, to: ObjectId, paths: readonly string[]): Promise<boolean>;
 }
 
 /** A revision argument: the commit and whether it is excluded (`^<rev>`). */
@@ -140,9 +141,41 @@ export class BisectGraph {
     return true;
   }
 
-  /** git's clear_commit_marks over every commit read (ALL_REV_FLAGS). */
+  /** git's repo_clear_commit_marks(ALL_REV_FLAGS): every commit read loses its flags. */
   clearMarks(): void {
     for (const node of this.nodes.values()) node.flags = 0;
+  }
+
+  /**
+   * git's clear_commit_marks_many(ALL_REV_FLAGS): the flags of the commits and, through the
+   * parents as they are now (rewritten ones too), of each ancestor that still has a flag.
+   */
+  clearCommitMarks(ids: readonly ObjectId[]): void {
+    const stack: BisectNode[] = [];
+    const clearOne = (start: BisectNode) => {
+      let n: BisectNode | undefined = start;
+      while (n) {
+        if (!n.flags) return;
+        n.flags = 0;
+        const parents: BisectNode[] = n.parents;
+        if (parents.length === 0) return;
+        for (let k = 1; k < parents.length; k++) {
+          const p = parents[k] as BisectNode;
+          if (p.flags) stack.push(p);
+        }
+        n = parents[0];
+      }
+    };
+    for (const id of ids) clearOne(this.lookup(id));
+    for (let n = stack.pop(); n; n = stack.pop()) clearOne(n);
+  }
+
+  /**
+   * git's reset_revision_walk: SEEN and ADDED cleared on every commit, the other flags
+   * (UNINTERESTING, BOTTOM, TREESAME) left as the walk set them.
+   */
+  resetRevisionWalk(): void {
+    for (const node of this.nodes.values()) node.flags &= ~(SEEN | ADDED);
   }
 
   /**
@@ -151,12 +184,15 @@ export class BisectGraph {
    * walk left them (a commit taken may be marked UNINTERESTING later). With `paths`, each
    * interesting commit is simplified as try_to_simplify_commit does it (dense, history
    * simplification), its parents rewritten to the one it is TREESAME to.
+   *
+   * The walk starts from the flags the commits have: as in git, nothing is cleared before
+   * it. The caller clears them where git does ({@link clearMarks}, {@link clearCommitMarks},
+   * {@link resetRevisionWalk}), so flags git leaves behind stay for the next walk.
    */
   async walk(
     pending: BisectPending[],
-    options: { paths?: PathspecItem[]; firstParent?: boolean } = {},
+    options: { paths?: readonly string[]; firstParent?: boolean } = {},
   ): Promise<BisectNode[]> {
-    this.clearMarks();
     const paths = options.paths ?? [];
     const prune = paths.length > 0;
     const firstParentOnly = options.firstParent === true;

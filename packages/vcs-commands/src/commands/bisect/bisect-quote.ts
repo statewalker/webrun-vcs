@@ -24,8 +24,22 @@ export function sqQuoteArgv(argv: readonly string[]): string {
   return argv.map((arg) => ` ${sqQuote(arg)}`).join("");
 }
 
-const isSpace = (c: string | undefined) =>
-  c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\v" || c === "\f";
+/** git's isspace (sane_ctype's GIT_SPACE): space, tab, LF and CR; not VT or FF. */
+const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r";
+
+/** git's strbuf_rtrim: the trailing spaces (git's isspace) removed. */
+export function strbufRtrim(text: string): string {
+  let end = text.length;
+  while (end > 0 && isSpace(text[end - 1])) end--;
+  return text.slice(0, end);
+}
+
+/** git's strbuf_trim: the leading and trailing spaces (git's isspace) removed. */
+export function strbufTrim(text: string): string {
+  let start = 0;
+  while (start < text.length && isSpace(text[start])) start++;
+  return strbufRtrim(text.slice(start));
+}
 
 /**
  * git's sq_dequote_to_strvec: the words of a line of single-quoted words. `ok` is false
