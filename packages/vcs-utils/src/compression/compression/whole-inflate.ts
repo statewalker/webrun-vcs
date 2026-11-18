@@ -7,15 +7,19 @@
  * size is usually known (a pack entry's header gives it), so the decoder is one loop over
  * the input writing straight into the result:
  *
- *  - Huffman tables are built as zlib's `inflate_table` builds them (a root table indexed by
- *    the next 9 bits, 6 for distances, and sub-tables for longer codes), into typed arrays
- *    allocated once; it refuses the same code sets (over-subscribed, incomplete except for a
- *    single one-bit code);
+ *  - Huffman tables are zlib's `inflate_table` tables (a root table indexed by the next 9 bits,
+ *    6 for distances, and sub-tables for longer codes), in typed arrays allocated once; it
+ *    refuses the same code sets (over-subscribed, incomplete except for a single one-bit code).
+ *    For a small object, building them costs as much as decoding: the header's reader buckets
+ *    the symbols by code length as it decodes the lengths, and the root table is filled by
+ *    doubling (see `buildTable`);
  *  - the decoding loop is zlib's `inflate_fast` while at least 8 input bytes are left, with
  *    the output bound checked per symbol instead of reserving 258 bytes (small objects
  *    decoded into a buffer of their exact size would otherwise never take it), and zlib's
  *    one-symbol-at-a-time `inflate` steps near the end of the input, which pull bytes only as
- *    a code needs them;
+ *    a code needs them. Its bit buffer is refilled with four bytes at once, without a branch,
+ *    to at least 24 bits (libdeflate's refill, in a 32-bit int): enough for two literals of a
+ *    root table, which it decodes per refill, or for a length code and its extra bits;
  *  - stored block lengths, distances, repeat codes, the zlib header and the Adler-32 trailer
  *    are checked, so a stream decodes to exactly what zlib decodes or fails where zlib fails.
  *
@@ -177,40 +181,32 @@ for (let s = 0; s < 32; s++)
 const ENOUGH_LENS = 852;
 const ENOUGH_DISTS = 592;
 
-const offs = new Uint16Array(16);
-const work = new Uint16Array(288);
-
 /**
- * A code set as the table builder takes it: `count[len]` codes of each length and `syms`, the
- * `n` symbols with a code (lengths in `lens[from + sym]`), in symbol order. The reader of a
- * dynamic block header fills it as it decodes the lengths, so the builder never scans the
- * symbols without a code.
+ * A code set as the table builder takes it: `count[len]` codes of each length, and the symbols
+ * with a code of length `len` in symbol order at `syms[len * stride ...]` (the order of their
+ * canonical codes). The reader of a dynamic block header fills it as it decodes the lengths, so
+ * the builder neither scans the symbols without a code nor sorts them.
  */
 interface CodeSet {
   count: Uint16Array;
   syms: Uint16Array;
-  n: number;
+  stride: number;
 }
 
 const newCodeSet = (symbols: number): CodeSet => ({
   count: new Uint16Array(16),
-  syms: new Uint16Array(symbols),
-  n: 0,
+  syms: new Uint16Array(16 * symbols),
+  stride: symbols,
 });
 
-/** Fills `set` from the code lengths `lens[from, from + n)`. */
-function countLengths(set: CodeSet, lens: Uint8Array, from: number, n: number): CodeSet {
-  const { count, syms } = set;
+/** Fills `set` from the code lengths `lens[0, n)`. */
+function countLengths(set: CodeSet, lens: Uint8Array, n: number): CodeSet {
+  const { count, syms, stride } = set;
   count.fill(0);
-  let k = 0;
   for (let s = 0; s < n; s++) {
-    const len = lens[from + s] as number;
-    if (len !== 0) {
-      count[len]++;
-      syms[k++] = s;
-    }
+    const len = lens[s] as number;
+    if (len !== 0) syms[len * stride + count[len]++] = s;
   }
-  set.n = k;
   return set;
 }
 
@@ -218,17 +214,14 @@ function countLengths(set: CodeSet, lens: Uint8Array, from: number, n: number): 
  * zlib's `inflate_table`: builds the decoding table for the code set `set` (consuming its
  * counts) into `table` and returns its root bits (`root` or fewer), or -1 for a set zlib
  * refuses: over-subscribed, or incomplete unless it is a lone one-bit code (literal/length and
- * distance codes only, `entries` other than `CODE_ENTRY`).
+ * distance codes only, `entries` other than `CODE_ENTRY`). The table is the one zlib builds,
+ * filled another way: codes up to the root bits go in by length, each written once into the
+ * first `2^len` entries, which are then doubled (copied above themselves) for the next length,
+ * as libdeflate does, instead of one write per entry a code covers; longer codes get zlib's
+ * sub-tables.
  */
-function buildTable(
-  entries: Int32Array,
-  set: CodeSet,
-  lens: Uint8Array,
-  from: number,
-  table: Int32Array,
-  root: number,
-): number {
-  const { count, syms } = set;
+function buildTable(entries: Int32Array, set: CodeSet, table: Int32Array, root: number): number {
+  const { count, syms, stride } = set;
   let max = 15;
   while (max >= 1 && count[max] === 0) max--;
   if (root > max) root = max;
@@ -248,67 +241,81 @@ function buildTable(
     if (left < 0) return -1; // over-subscribed
   }
   if (left > 0 && (entries === CODE_ENTRY || max !== 1)) return -1; // incomplete
-  // the symbols by code length, then symbol order: the order of their canonical codes
-  offs[1] = 0;
-  for (let len = 1; len < 15; len++) offs[len + 1] = (offs[len] as number) + (count[len] as number);
-  for (let i = 0; i < set.n; i++) {
-    const s = syms[i] as number;
-    work[offs[lens[from + s] as number]++ as number] = s;
-  }
+  // A complete code leaves no root entry unwritten: each is under a code of at most `root`
+  // bits (written, then doubled with the rest) or gets the link to a sub-table below; what the
+  // doubling copies from entries not yet written (stale ones of an earlier table) is
+  // overwritten.
   let huff = 0; // the current code, bit-reversed
-  let sym = 0;
   let len = min;
-  let next = 0; // the table being filled, as an offset in `table`
-  let curr = root; // its index bits
-  let drop = 0; // the bits dropped before indexing it
-  let low = -1; // the root entry its codes share
-  let used = 1 << root;
-  const mask = used - 1;
-  const enough = entries === LIT_ENTRY ? ENOUGH_LENS : ENOUGH_DISTS;
   for (;;) {
-    const here = (entries[work[sym] as number] as number) | (len - drop);
-    // every entry whose low bits are the code, in a table of `curr` bits
-    const incr = 1 << (len - drop);
-    let fill = 1 << curr;
-    const size = fill;
-    const at = next + (huff >>> drop);
-    do {
-      fill -= incr;
-      table[at + fill] = here;
-    } while (fill !== 0);
-    // the next code, bit-reversed: clear the ones above the highest zero below `len`, set it
-    const zeros = ~huff & ((1 << len) - 1);
-    if (zeros === 0) huff = 0;
-    else {
-      const inc = 1 << (31 - Math.clz32(zeros));
-      huff = (huff & (inc - 1)) | inc;
-    }
-    sym++;
-    if (--count[len] === 0) {
-      if (len === max) break;
-      do len++;
-      while (count[len] === 0);
-    }
-    // a code longer than the root, not under the current root entry: a new sub-table
-    if (len > root && (huff & mask) !== low) {
-      if (drop === 0) drop = root;
-      next += size;
-      curr = len - drop;
-      left = 1 << curr;
-      while (curr + drop < max) {
-        left -= count[curr + drop] as number;
-        if (left <= 0) break;
-        curr++;
-        left <<= 1;
+    for (let at = len * stride, e = at + (count[len] as number); at < e; at++) {
+      table[huff] = (entries[syms[at] as number] as number) | len;
+      // the next code, bit-reversed: clear the ones above the highest zero below `len`, set it
+      const zeros = ~huff & ((1 << len) - 1);
+      if (zeros === 0) huff = 0;
+      else {
+        const inc = 1 << (31 - Math.clz32(zeros));
+        huff = (huff & (inc - 1)) | inc;
       }
-      used += 1 << curr;
-      if (used > enough) return -1; // cannot happen for a set that passed the checks above
-      low = huff & mask;
-      table[low] = root | (curr << 8) | (next << 16);
     }
+    if (len === root) break;
+    // the first 2^len entries, decoded by `len` bits, copied for the next bit
+    const span = 1 << len;
+    if (span >= 32) table.copyWithin(span, 0, span);
+    else for (let k = 0; k < span; k++) table[span + k] = table[k] as number;
+    len++;
+  }
+  if (max > root) {
+    // codes longer than the root, as zlib places them
+    const mask = (1 << root) - 1;
+    const enough = entries === LIT_ENTRY ? ENOUGH_LENS : ENOUGH_DISTS;
+    let low = -1; // the root entry the current sub-table's codes share
+    let next = 0; // the current sub-table, as an offset in `table`
+    let curr = root; // its index bits
+    let used = 1 << root;
+    len = root + 1;
+    while (count[len] === 0) len++;
+    let at = len * stride;
+    for (;;) {
+      if ((huff & mask) !== low) {
+        // not under the current root entry: a new sub-table, as large as the codes under the
+        // same root bits need
+        next += 1 << curr;
+        curr = len - root;
+        left = 1 << curr;
+        while (curr + root < max) {
+          left -= count[curr + root] as number;
+          if (left <= 0) break;
+          curr++;
+          left <<= 1;
+        }
+        used += 1 << curr;
+        if (used > enough) return -1; // cannot happen for a set that passed the checks above
+        low = huff & mask;
+        table[low] = root | (curr << 8) | (next << 16);
+      }
+      const here = (entries[syms[at++] as number] as number) | (len - root);
+      // every entry whose low bits are the code, in a sub-table of `curr` bits
+      const incr = 1 << (len - root);
+      const size = 1 << curr;
+      for (let k = huff >>> root; k < size; k += incr) table[next + k] = here;
+      const zeros = ~huff & ((1 << len) - 1);
+      if (zeros === 0) huff = 0;
+      else {
+        const inc = 1 << (31 - Math.clz32(zeros));
+        huff = (huff & (inc - 1)) | inc;
+      }
+      if (--count[len] === 0) {
+        if (len === max) break;
+        do len++;
+        while (count[len] === 0);
+        at = len * stride;
+      }
+    }
+    return root;
   }
   // an incomplete set (a lone one-bit code): the one entry no code reaches is invalid
-  if (huff !== 0) table[next + huff] = (len - drop) | (OP_BAD << 8);
+  if (huff !== 0) table[huff] = len | (OP_BAD << 8);
   return root;
 }
 
@@ -320,10 +327,10 @@ const fixedDist = new Int32Array(32);
   l.fill(9, 144, 256);
   l.fill(7, 256, 280);
   l.fill(8, 280, 288);
-  buildTable(LIT_ENTRY, countLengths(newCodeSet(288), l, 0, 288), l, 0, fixedLit, 9);
+  buildTable(LIT_ENTRY, countLengths(newCodeSet(288), l, 288), fixedLit, 9);
   // 32 codes of 5 bits, as zlib's table: 30 and 31 decode, and are refused as distances
   const d = new Uint8Array(32).fill(5);
-  buildTable(DIST_ENTRY, countLengths(newCodeSet(32), d, 0, 32), d, 0, fixedDist, 5);
+  buildTable(DIST_ENTRY, countLengths(newCodeSet(32), d, 32), fixedDist, 5);
 }
 const dynLit = new Int32Array(ENOUGH_LENS);
 const dynDist = new Int32Array(ENOUGH_DISTS);
@@ -341,14 +348,15 @@ const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const ADLER_WORDS = 22;
 
 /**
- * Adler-32 of `b[from, to)`. Long runs are summed four bytes at a time: a word's even and odd
- * bytes in two 16-bit lanes each, with running sums of those sums for the weighted half.
+ * Adler-32 of `b[from, to)`. Runs of 32 bytes or more (the size of a small commit already pays
+ * for the word view) are summed four bytes at a time: a word's even and odd bytes in two 16-bit
+ * lanes each, with running sums of those sums for the weighted half.
  */
 function adler32(b: Uint8Array, from: number, to: number): number {
   let a = 1;
   let s = 0;
   let i = from;
-  if (to - from >= 256 && LITTLE_ENDIAN) {
+  if (to - from >= 32 && LITTLE_ENDIAN) {
     // bytes up to a 4-byte boundary of the buffer, then words
     const base = b.byteOffset;
     for (; ((base + i) & 3) !== 0; i++) {
@@ -395,8 +403,9 @@ function adler32(b: Uint8Array, from: number, to: number): number {
 
 /**
  * The bit reader's state, handed between `inflateWhole` (which keeps it in locals) and
- * `readDynamicTables`. `hold` keeps up to 30 bits, the next one lowest (32 only briefly for a
- * stored block's LEN/NLEN, which is read with `& 0xffff` and `>>> 16` and then dropped).
+ * `readDynamicTables`. `hold` keeps `bits` bits, the next one lowest, and zeros above them (up
+ * to 32 bits: a stored block's LEN/NLEN, read with `& 0xffff` and `>>> 16`, and the fast loop's
+ * refills, which clear the bits above `bits` again when the loop ends).
  */
 const rd = { pos: 0, hold: 0, bits: 0, litBits: 0, distBits: 0 };
 
@@ -431,7 +440,7 @@ function readDynamicTables(input: Uint8Array, end: number): void {
     hold >>= 3;
     bits -= 3;
   }
-  const clBits = buildTable(CODE_ENTRY, countLengths(clSet, clLens, 0, 19), clLens, 0, clTable, 7);
+  const clBits = buildTable(CODE_ENTRY, countLengths(clSet, clLens, 19), clTable, 7);
   if (clBits < 0) throw new InflateError("inflate failed: invalid code lengths set");
   const clMask = (1 << clBits) - 1;
   const total = nlen + ndist;
@@ -442,10 +451,9 @@ function readDynamicTables(input: Uint8Array, end: number): void {
   const distSyms = distSet.syms;
   litCount.fill(0);
   distCount.fill(0);
-  let nl = 0;
-  let nd = 0;
-  // Only lengths other than 0 are written to `lengths` (the builder reads no other); `prev`
-  // is the last length, for a repeat of it.
+  lengths[256] = 0;
+  // Only lengths other than 0 are written to `lengths`, and only symbol 256's is read back (the
+  // end-of-block code must have one); `prev` is the last length, for a repeat of it.
   let prev = 0;
   for (let k = 0; k < total; ) {
     // a code and its extra bits take at most 14 bits: refilled at once while 2 bytes are left,
@@ -470,13 +478,8 @@ function readDynamicTables(input: Uint8Array, end: number): void {
       prev = sym;
       if (sym !== 0) {
         lengths[k] = sym;
-        if (k < nlen) {
-          litCount[sym]++;
-          litSyms[nl++] = k;
-        } else {
-          distCount[sym]++;
-          distSyms[nd++] = k - nlen;
-        }
+        if (k < nlen) litSyms[sym * 286 + litCount[sym]++] = k;
+        else distSyms[sym * 30 + distCount[sym]++] = k - nlen;
       }
       k++;
       continue;
@@ -504,34 +507,19 @@ function readDynamicTables(input: Uint8Array, end: number): void {
     if (prev !== 0) {
       for (const to = k + repeat; k < to; k++) {
         lengths[k] = prev;
-        if (k < nlen) {
-          litCount[prev]++;
-          litSyms[nl++] = k;
-        } else {
-          distCount[prev]++;
-          distSyms[nd++] = k - nlen;
-        }
+        if (k < nlen) litSyms[prev * 286 + litCount[prev]++] = k;
+        else distSyms[prev * 30 + distCount[prev]++] = k - nlen;
       }
     } else k += repeat;
   }
-  litSet.n = nl;
-  distSet.n = nd;
   rd.pos = pos;
   rd.hold = hold;
   rd.bits = bits;
-  // the end-of-block code has a length: symbol 256 is listed (in order, after any lower one)
-  let eob = false;
-  for (let i = nl - 1; i >= 0; i--) {
-    const sym = litSyms[i] as number;
-    if (sym <= 256) {
-      eob = sym === 256;
-      break;
-    }
-  }
-  if (!eob) throw new InflateError("inflate failed: invalid code -- missing end-of-block");
-  rd.litBits = buildTable(LIT_ENTRY, litSet, lengths, 0, dynLit, 9);
+  if (lengths[256] === 0)
+    throw new InflateError("inflate failed: invalid code -- missing end-of-block");
+  rd.litBits = buildTable(LIT_ENTRY, litSet, dynLit, 9);
   if (rd.litBits < 0) throw new InflateError("inflate failed: invalid literal/lengths set");
-  rd.distBits = buildTable(DIST_ENTRY, distSet, lengths, nlen, dynDist, 6);
+  rd.distBits = buildTable(DIST_ENTRY, distSet, dynDist, 6);
   if (rd.distBits < 0) throw new InflateError("inflate failed: invalid distances set");
 }
 
@@ -561,6 +549,15 @@ function copyMatch(out: Uint8Array, op: number, dist: number, len: number): void
     }
   } else if (dist === 1) {
     out.fill(out[from] as number, op, op + len);
+    return;
+  } else if (len >= 32 && dist >= 8) {
+    // the pattern doubles with each copy
+    const to = op + len;
+    while (op < to) {
+      const n = Math.min(op - from, to - op);
+      out.copyWithin(op, from, from + n);
+      op += n;
+    }
     return;
   }
   const to = op + len;
@@ -685,98 +682,119 @@ export function inflateWhole(
       }
       block: for (;;) {
         // zlib's inflate_fast, while enough input is left that no refill can run out of it
-        // and the output has room for a literal (a match's room is checked by its length)
+        // and the output has room for a literal (a match's room is checked by its length).
+        // A refill ORs the next four bytes in above the bits held (cleared first: the arithmetic
+        // shifts below copy the top bit down) and counts the whole bytes that fit, so `bits` is
+        // at least 24 after it and the bits above `bits` are the next input bits, up to 32. (Signed
+        // shifts keep `hold` a 32-bit int to the JIT; unsigned ones make it a double.)
         while (pos < fastEnd && op < cap) {
-          if (bits < 15) {
-            hold |= ((input[pos] as number) << bits) | ((input[pos + 1] as number) << (bits + 8));
-            pos += 2;
-            bits += 16;
-          }
+          hold =
+            (hold & ~(-1 << bits)) |
+            (((input[pos] as number) |
+              ((input[pos + 1] as number) << 8) |
+              ((input[pos + 2] as number) << 16) |
+              ((input[pos + 3] as number) << 24)) <<
+              bits);
+          pos += (31 - bits) >> 3;
+          bits |= 24;
           let here = lcode[hold & lmask] as number;
+          if ((here & 0xff00) === 0) {
+            // a literal from the root table (at most 9 bits): another fits in what is left
+            let n = here & 255;
+            hold >>= n;
+            bits -= n;
+            out[op++] = here >> 16;
+            here = lcode[hold & lmask] as number;
+            n = here & 255;
+            if ((here & 0xff00) !== 0 || op >= cap) continue;
+            hold >>= n;
+            bits -= n;
+            out[op++] = here >> 16;
+            continue;
+          }
           let n = here & 255;
           hold >>= n;
           bits -= n;
           let o = (here >> 8) & 255;
-          if (o !== 0) {
-            if (o < OP_BASE) {
-              // a code longer than the root: its sub-table
-              here = lcode[(here >> 16) + (hold & ((1 << o) - 1))] as number;
-              n = here & 255;
-              hold >>= n;
-              bits -= n;
-              o = (here >> 8) & 255;
-            }
-            if (o !== 0) {
-              if ((o & OP_BASE) === 0) {
-                if (o & 32) break block; // end of block
-                throw new InflateError("inflate failed: invalid literal/length code");
-              }
-              let len = here >> 16;
-              o &= 15;
-              if (o !== 0) {
-                if (bits < o) {
-                  hold |= (input[pos++] as number) << bits;
-                  bits += 8;
-                }
-                len += hold & ((1 << o) - 1);
-                hold >>= o;
-                bits -= o;
-              }
-              if (bits < 15) {
-                hold |=
-                  ((input[pos] as number) << bits) | ((input[pos + 1] as number) << (bits + 8));
-                pos += 2;
-                bits += 16;
-              }
-              here = dcode[hold & dmask] as number;
-              n = here & 255;
-              hold >>= n;
-              bits -= n;
-              o = (here >> 8) & 255;
-              if ((o & OP_BASE) === 0) {
-                if (o & OP_BAD) throw new InflateError("inflate failed: invalid distance code");
-                here = dcode[(here >> 16) + (hold & ((1 << o) - 1))] as number;
-                n = here & 255;
-                hold >>= n;
-                bits -= n;
-                o = (here >> 8) & 255;
-                if ((o & OP_BASE) === 0)
-                  throw new InflateError("inflate failed: invalid distance code");
-              }
-              let dist = here >> 16;
-              o &= 15;
-              if (o !== 0) {
-                if (bits < o) {
-                  hold |= (input[pos++] as number) << bits;
-                  bits += 8;
-                  if (bits < o) {
-                    hold |= (input[pos++] as number) << bits;
-                    bits += 8;
-                  }
-                }
-                dist += hold & ((1 << o) - 1);
-                hold >>= o;
-                bits -= o;
-              }
-              if (dist > op)
-                throw new InflateError("inflate failed: invalid distance too far back");
-              if (op + len > cap) {
-                out = grow(out, op, len, growable ? limit : cap, partial);
-                cap = out.length;
-                if (op + len > cap) {
-                  // partial: the part of the match that fits
-                  copyMatch(out, op, dist, cap - op);
-                  op = cap;
-                  throw STOP;
-                }
-              }
-              copyMatch(out, op, dist, len);
-              op += len;
+          if (o < OP_BASE) {
+            // a code longer than the root: its sub-table
+            here = lcode[(here >> 16) + (hold & ((1 << o) - 1))] as number;
+            n = here & 255;
+            hold >>= n;
+            bits -= n;
+            o = (here >> 8) & 255;
+            if (o === 0) {
+              out[op++] = here >> 16;
               continue;
             }
           }
-          out[op++] = here >> 16;
+          if ((o & OP_BASE) === 0) {
+            if (o & 32) {
+              hold &= ~(-1 << bits);
+              break block; // end of block
+            }
+            throw new InflateError("inflate failed: invalid literal/length code");
+          }
+          let len = here >> 16;
+          o &= 15;
+          if (o !== 0) {
+            len += hold & ((1 << o) - 1);
+            hold >>= o;
+            bits -= o;
+          }
+          // the distance code (at most 15 bits) and its extra bits (13), which may need a byte
+          hold =
+            (hold & ~(-1 << bits)) |
+            (((input[pos] as number) |
+              ((input[pos + 1] as number) << 8) |
+              ((input[pos + 2] as number) << 16) |
+              ((input[pos + 3] as number) << 24)) <<
+              bits);
+          pos += (31 - bits) >> 3;
+          bits |= 24;
+          here = dcode[hold & dmask] as number;
+          n = here & 255;
+          hold >>= n;
+          bits -= n;
+          o = (here >> 8) & 255;
+          if ((o & OP_BASE) === 0) {
+            if (o & OP_BAD) throw new InflateError("inflate failed: invalid distance code");
+            here = dcode[(here >> 16) + (hold & ((1 << o) - 1))] as number;
+            n = here & 255;
+            hold >>= n;
+            bits -= n;
+            o = (here >> 8) & 255;
+            if ((o & OP_BASE) === 0)
+              throw new InflateError("inflate failed: invalid distance code");
+          }
+          let dist = here >> 16;
+          o &= 15;
+          if (o !== 0) {
+            if (bits < o) {
+              // above `bits`, the shifts left copies of the top bit where the byte's last bits go
+              hold = (hold & ~(-1 << bits)) | ((input[pos++] as number) << bits);
+              bits += 8;
+            }
+            dist += hold & ((1 << o) - 1);
+            hold >>= o;
+            bits -= o;
+          }
+          if (dist > op) throw new InflateError("inflate failed: invalid distance too far back");
+          if (op + len > cap) {
+            hold &= ~(-1 << bits);
+            out = grow(out, op, len, growable ? limit : cap, partial);
+            cap = out.length;
+            if (op + len > cap) {
+              // partial: the part of the match that fits
+              copyMatch(out, op, dist, cap - op);
+              op = cap;
+              throw STOP;
+            }
+          }
+          copyMatch(out, op, dist, len);
+          op += len;
         }
+        hold &= ~(-1 << bits);
         // one symbol as zlib's inflate takes it: bytes pulled only as the code needs them
         let here = lcode[hold & lmask] as number;
         while ((here & 255) > bits) {

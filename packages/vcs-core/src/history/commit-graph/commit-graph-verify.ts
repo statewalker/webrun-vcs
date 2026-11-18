@@ -23,10 +23,13 @@ import type { GraphCommitData } from "./graph-commit-parse.js";
 
 /**
  * How `verifyCommitGraph` reads a commit from the object database (no graph): its data, or a
- * promise of it (a source that has the commit in memory answers without one).
+ * promise of it (a source that has the commit in memory answers without one). `note` adds a
+ * line to the verification's messages where the read happens, for what git prints while it
+ * parses the commit (the grafts file's deprecation hint, on the first one).
  */
 export type VerifyCommitSource = (
   id: ObjectId,
+  note: (line: string) => void,
 ) => GraphCommitData | undefined | Promise<GraphCommitData | undefined>;
 
 /** The outcome of a verification, as `git commit-graph verify` ends. */
@@ -135,10 +138,13 @@ async function verifyLayer(
 
   let seenGenZero: ObjectId | undefined;
   let seenGenNonZero: ObjectId | undefined;
+  const note = (line: string) => {
+    messages.push(line);
+  };
   for (let i = 0; i < layer.numCommits; i++) {
     const pos = base + i;
     const id = g.idAt(pos);
-    const read = readCommit(id);
+    const read = readCommit(id, note);
     const odb = read instanceof Promise ? await read : read;
     if (!odb) {
       report(`failed to parse commit ${id} from object database for commit-graph`);

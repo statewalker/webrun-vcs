@@ -144,7 +144,10 @@ export interface FsckResult {
 
 /** What a run keeps in memory from the reads in pack order (`FsckCommand.setMemoryLimits`). */
 export interface FsckMemoryLimits {
-  /** Tree entries and commit links kept for the walk (4 bytes each): 32 Mi by default. */
+  /**
+   * Tree entries and commit links kept for the walk (4 bytes each), in all: those of the
+   * pack-order scan and of the trees the walk records. 32 Mi by default; 0 keeps none.
+   */
   links?: number;
   /** Commits kept for the commit-graph verification: 256 Ki by default. */
   graphCommits?: number;
@@ -206,6 +209,21 @@ function sizeValue(key: string, value: string | undefined): number | undefined {
 
 /** A path within the repository's files, as git prints it (`.git/objects/ab/cd...`). */
 const pathOf = (...parts: string[]) => parts.join("/");
+
+/**
+ * Whether git's parse_commit_buffer reads past a commit's tree line (to its grafts): the data
+ * is longer than `tree <40 hex digits>\n`, starts with it, and the digits are hex.
+ */
+function treeLineSound(data: Uint8Array): boolean {
+  if (data.length <= 46 || data[45] !== 0x0a) return false;
+  for (let i = 0; i < 5; i++) if (data[i] !== "tree ".charCodeAt(i)) return false;
+  for (let i = 5; i < 45; i++) {
+    const c = data[i] as number;
+    if (!((c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66) || (c >= 0x41 && c <= 0x46)))
+      return false;
+  }
+  return true;
+}
 
 /**
  * Verify the connectivity and validity of the objects in the repository.
@@ -530,7 +548,7 @@ class FsckRun {
   private readonly usedTable: TreeEntryTable = { count: 0, fields: new Int32Array(0) };
   /** The table the connectivity walk decodes each tree into. */
   private readonly walkTable: TreeEntryTable = { count: 0, fields: new Int32Array(0) };
-  private kids = new Int32Array(1 << 12);
+  private kids = new Int32Array(0);
   private kidsLength = 0;
   /** The tree `walkUsed` decoded last, for `fsckTree` to check without decoding it again. */
   private lastTree?: { content: Uint8Array; table: TreeEntryTable };
@@ -596,7 +614,8 @@ class FsckRun {
   async run(): Promise<FsckResult> {
     if (this.files && this.o.graftsAdvice) {
       const grafts = pathOf(this.gitDir, "info", "grafts");
-      this.graftsHint = (await this.files.stats(grafts).catch(() => undefined))?.kind === "file";
+      this.graftsFile = (await this.files.stats(grafts).catch(() => undefined))?.kind === "file";
+      this.graftsHint = this.graftsFile;
     }
     if (this.files && this.o.commitGraph.enabled && (await this.hasCommitGraphFile())) {
       this.graphCommits = new Map();
@@ -708,19 +727,35 @@ class FsckRun {
       }
       return undefined;
     };
+    // The verification is a process of its own, which reads the grafts file again (and gives
+    // its hint again) when it parses its first commit: parse_commit_buffer looks the commit's
+    // grafts up once the tree line is read, so not for a commit that is missing, of another
+    // type, or without a sound tree line.
+    let childGrafts = this.graftsFile;
+    const reachGrafts = (note: (line: string) => void, data?: Uint8Array) => {
+      if (!childGrafts || (data && !treeLineSound(data))) return;
+      childGrafts = false;
+      for (const line of this.graftsHintLines()) note(line);
+    };
     const result = await verifyCommitGraph(
       this.files,
       objectsDir,
-      (id) => {
+      (id, note) => {
         const from = packs.length > 1 ? packOf(id) : undefined;
         if (from && from !== packs.find((p) => p.idx.has(id))) {
           // not the copy kept (the newest pack's): that pack's own
-          return this.readPackedCommit(from, id);
+          return this.readPackedCommit(from, id, (data) => reachGrafts(note, data));
         }
         const kept = this.graphCommits?.get(id);
-        if (kept) return kept;
-        const parse = (o: GitObject | undefined, data: Uint8Array) =>
-          o?.type === "commit" ? parseGraphCommit(data, id) : undefined;
+        if (kept) {
+          reachGrafts(note);
+          return kept;
+        }
+        const parse = (o: GitObject | undefined, data: Uint8Array) => {
+          if (o?.type !== "commit") return undefined;
+          reachGrafts(note, data);
+          return parseGraphCommit(data, id);
+        };
         const slow = async (o: GitObject | undefined | Promise<GitObject | undefined>) => {
           try {
             const obj = await o;
@@ -745,13 +780,22 @@ class FsckRun {
     if (result.exitCode !== 0) this.errorsFound |= FSCK_ERROR_COMMIT_GRAPH;
   }
 
-  /** Commit `id` as pack `p` holds it, unchecked, for the commit-graph verification. */
-  private async readPackedCommit(p: RepoPack, id: string): Promise<GraphCommitData | undefined> {
+  /**
+   * Commit `id` as pack `p` holds it, unchecked, for the commit-graph verification; `parsing`
+   * sees its data before it is parsed.
+   */
+  private async readPackedCommit(
+    p: RepoPack,
+    id: string,
+    parsing: (data: Uint8Array) => void,
+  ): Promise<GraphCommitData | undefined> {
     try {
       const pack = await this.openRepoPack(p);
       const obj = await pack?.get(id);
       if (obj?.type !== "commit") return undefined;
-      return parseGraphCommit(await collect(obj), id);
+      const data = await collect(obj);
+      parsing(data);
+      return parseGraphCommit(data, id);
     } catch {
       return undefined;
     }
@@ -896,6 +940,8 @@ class FsckRun {
 
   /** Whether the grafts file's deprecation hint is still to be printed (`adviseGrafts`). */
   private graftsHint = false;
+  /** Whether `<GIT_DIR>/info/grafts` is a file and `advice.graftFileDeprecated` is on. */
+  private graftsFile = false;
 
   /**
    * git's read_graft_file, when the first commit is parsed (prepare_commit_graft): the hint
@@ -904,6 +950,12 @@ class FsckRun {
   private adviseGrafts(): void {
     if (!this.graftsHint) return;
     this.graftsHint = false;
+    for (const text of this.graftsHintLines())
+      this.emit({ kind: "notice", stream: "stderr", text });
+  }
+
+  /** The grafts file's deprecation hint, as each version words it. */
+  private graftsHintLines(): string[] {
     const v243 = this.o.compatibility === "2.43";
     const blank = v243 ? "hint: " : "hint:";
     const lines = [
@@ -918,7 +970,7 @@ class FsckRun {
         ? 'hint: "git config advice.graftFileDeprecated false"'
         : 'hint: "git config set advice.graftFileDeprecated false"',
     ];
-    for (const text of lines) this.emit({ kind: "notice", stream: "stderr", text });
+    return lines;
   }
 
   /** git's `error()`: `error: <message>` on stderr. */
@@ -1430,15 +1482,22 @@ class FsckRun {
     this.treeStart[n] = start + 1;
   }
 
-  /** Room in `kids` for `more` values past `kidsLength`. */
-  private reserveKids(more: number): void {
+  /**
+   * Room in `kids` for `more` values past `kidsLength`, within what `linksKept` leaves after
+   * `scanKids` (the limit is the two together); false past it. The array grows by doubling up
+   * to that limit, never past it.
+   */
+  private reserveKids(more: number): boolean {
     const need = this.kidsLength + more;
-    if (need <= this.kids.length) return;
-    let size = this.kids.length * 2;
+    const limit = this.o.linksKept - this.scanKidsLength;
+    if (need > limit) return false;
+    if (need <= this.kids.length) return true;
+    let size = Math.max(this.kids.length * 2, 1 << 12);
     while (size < need) size *= 2;
-    const kids = new Int32Array(size);
+    const kids = new Int32Array(Math.min(size, limit));
     kids.set(this.kids.subarray(0, this.kidsLength));
     this.kids = kids;
+    return true;
   }
 
   /**
@@ -1458,8 +1517,7 @@ class FsckRun {
       let res = 0;
       const start = this.kidsLength;
       // past the limit the walk reads the tree again
-      if (record && start + 1 + walk.count > this.o.linksKept) record = false;
-      if (record) this.reserveKids(1 + walk.count);
+      if (record && !this.reserveKids(1 + walk.count)) record = false;
       let at = start + 1;
       const f = walk.fields;
       for (let i = 0; i < walk.count; i++) {
@@ -2277,7 +2335,9 @@ class FsckRun {
     const claimed = new Uint8Array(t.size);
     for (const n of loose) claimed[n] = 1;
     this.scanAt = new Int32Array(t.size);
-    this.scanKids = new Int32Array(Math.min(1 << 16, Math.max(16, this.o.linksKept)));
+    this.scanKids = new Int32Array(
+      Math.max(0, Math.min(1 << 16, this.o.linksKept - this.kidsLength)),
+    );
     const withCommits = !this.graph;
     const keepCommits = this.graphCommits !== undefined;
     /** objects whose copy the commit-graph verification reads is decided (an earlier pack's) */
@@ -2377,15 +2437,18 @@ class FsckRun {
     return true;
   }
 
-  /** Room in `scanKids` for `more` values, within `linksKept`; false past it. */
+  /**
+   * Room in `scanKids` for `more` values, within what `linksKept` leaves after `kids` (the
+   * limit is the two together); false past it.
+   */
   private reserveScanKids(more: number): boolean {
     const need = this.scanKidsLength + more;
+    const limit = this.o.linksKept - this.kidsLength;
+    if (need > limit) return false;
     if (need <= this.scanKids.length) return true;
-    if (need > this.o.linksKept) return false;
-    let size = this.scanKids.length * 2;
+    let size = Math.max(this.scanKids.length * 2, 16);
     while (size < need) size *= 2;
-    size = Math.min(size, Math.max(need, this.o.linksKept));
-    const kids = new Int32Array(size);
+    const kids = new Int32Array(Math.min(size, limit));
     kids.set(this.scanKids.subarray(0, this.scanKidsLength));
     this.scanKids = kids;
     return true;

@@ -258,6 +258,21 @@ describeGit("fsck reads in pack order: REF_DELTA packs, memory bounds, the graph
     }
   });
 
+  it("keeps no links with a links limit of 0, and never more than a small limit", async () => {
+    for (const connectivityOnly of [true, false]) {
+      const native = nativeFsck(connectivityOnly ? ["--connectivity-only"] : []);
+      for (const links of [0, 1, 7, 16, 40]) {
+        const bounded = await ours((c) =>
+          c.setConnectivityOnly(connectivityOnly).setMemoryLimits({ links }),
+        );
+        expect(bounded.output).toBe(native.stdout);
+        expect(bounded.exitCode).toBe(native.status);
+        if (links === 0) expect(bounded.statistics.linksKept).toBe(0);
+        else expect(bounded.statistics.linksKept).toBeLessThanOrEqual(links);
+      }
+    }
+  });
+
   it("verifies the commit-graph against the copy git reads: from its most recently used pack", async () => {
     const copy = join(root, "forged");
     execFileSync("git", ["init", "-q", "-b", "main", copy], { env: nativeGitEnv(root) });
