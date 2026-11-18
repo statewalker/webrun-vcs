@@ -97,6 +97,7 @@ export function installContentFilter(
       worktree,
       staging: parts.checkout.staging,
       blobs: parts.history.blobs,
+      trees: parts.history.trees,
       ...(parts.config ? { config: parts.config } : {}),
       ...(setup.filterDrivers ? { drivers: setup.filterDrivers } : {}),
       ...(setup.environment ? { environment: setup.environment } : {}),

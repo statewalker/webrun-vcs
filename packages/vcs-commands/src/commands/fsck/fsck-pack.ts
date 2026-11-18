@@ -26,21 +26,29 @@
  */
 
 import {
-  DeltaBaseCache,
+  PACK_SCAN_MAX as FAST_MAX,
   type FilesApi,
   type GitObject,
+  PACK_ENTRY_HEAD_MAX as HEAD_MAX,
+  packIdxLookups as idLookups,
+  inflateExactly as inflateInto,
+  PACK_MAX_CHAIN as MAX_CHAIN,
+  PACK_MAX_OBJECT_SIZE as MAX_OBJECT_SIZE,
   ObjectIdMismatchError,
   type ObjectTypeString,
   openPack,
   type PackFile,
   type PackIndex,
+  type ScannedEntryHead as ParsedHead,
+  packEntryOrder,
+  parsePackEntryHead as parseEntryHead,
   readPackIndex,
 } from "@statewalker/vcs-core";
-import { inflateWhole } from "@statewalker/vcs-utils/compression";
 import { applyGitDelta } from "@statewalker/vcs-utils/diff";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
 import { createSha1, Sha1, sha1Of } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
+import { allocBytes } from "@statewalker/vcs-utils/streams";
 
 /** One entry of a pack, in pack order. */
 export interface PackScanEntry {
@@ -121,19 +129,6 @@ async function readAll(files: FilesApi, path: string): Promise<Uint8Array> {
 }
 
 const TYPES: (ObjectTypeString | undefined)[] = [undefined, "commit", "tree", "blob", "tag"];
-/** Bytes of an entry kept for its header: the longest is a REF_DELTA's (at most 10 + 20). */
-const HEAD_MAX = 32;
-/** `openPack`'s defaults: the largest object, and zlib's largest expansion. */
-const MAX_OBJECT_SIZE = 2 ** 30;
-const MAX_EXPANSION = 1032;
-/** The pack reader's deepest delta chain. */
-const MAX_CHAIN = 4095;
-/**
- * Objects and deltas above this size, and entries whose compressed bytes are longer, go
- * through the pack's reader (which streams large objects through the hash). A smaller delta
- * whose result is larger (up to `MAX_EXPANSION` times) is applied here, bounded as git bounds it.
- */
-const FAST_MAX = 1024 * 1024;
 /**
  * Bytes of recently unpacked objects kept as delta bases. In pack order a delta's base is
  * nearly always among the last few hundred objects (repacks choose bases within a window of
@@ -205,33 +200,38 @@ export async function checkPack(
     const lookups = idLookups(idxBytes, v2, count);
     const ids = hexIds(idxBytes, idsAt, idStride, count);
     const crcAt = idsAt + count * 20;
-    const offAt = v2 ? crcAt + count * 4 : 1024;
-    const offStride = v2 ? 4 : 24;
-    const largeAt = offAt + count * 4;
-    const raw: { id: string; offset: number; crc?: number; idAt: number; fast: boolean }[] = [];
-    for (let pos = 0; pos < count; pos++) {
-      // read as `PackIndex.entries()` reads them
-      let offset = u32(idxBytes, offAt + pos * offStride);
-      if (v2 && offset & 0x80000000) {
-        const at = largeAt + (offset & 0x7fffffff) * 8;
-        offset = u32(idxBytes, at) * 0x100000000 + u32(idxBytes, at + 4);
-      }
-      raw.push({
-        id: ids(pos),
-        offset,
-        crc: v2 ? u32(idxBytes, crcAt + pos * 4) : undefined,
-        idAt: idsAt + pos * idStride,
-        // the fast path reads only entries the pack's reader finds without an idx error: in a
-        // sound fan-out bucket, at a 32-bit offset past the pack header
-        fast: lookups(pos) && offset >= 12,
-      });
-    }
-    raw.sort((a, b) => a.offset - b.offset);
-    const n = raw.length;
-    const entryEnd = (i: number) => (i + 1 < n ? (raw[i + 1]?.offset as number) : trailerAt);
+    // in pack order (sorted by offset): each entry's idx position and offset
+    const { order, sorted } = packEntryOrder(idxBytes, v2, count);
+    const n = count;
+    const offsetOf = (k: number) => sorted[k] as number;
+    const posOf = (k: number) => order[k] as number;
+    const entryEnd = (i: number) => (i + 1 < n ? (sorted[i + 1] as number) : trailerAt);
+    // the fast path reads only entries the pack's reader finds without an idx error: in a
+    // sound fan-out bucket, at a 32-bit offset past the pack header
+    const fastAt = (k: number) => lookups(posOf(k)) && offsetOf(k) >= 12;
+    const crcAtK = (k: number) => (v2 ? u32(idxBytes, crcAt + posOf(k) * 4) : undefined);
+    const idAtK = (k: number) => idsAt + posOf(k) * idStride;
 
     const keepBlob = options.keepBlob;
-    const cache = new DeltaBaseCache(BASE_CACHE_BYTES).scope();
+    // The objects unpacked last, by entry, as delta bases: in pack order, the oldest dropped
+    // first once they hold more than BASE_CACHE_BYTES (`queue` lists them, oldest first).
+    const kept: (Uint8Array | undefined)[] = new Array(count);
+    const keptType = new Uint8Array(count);
+    const queue = new Int32Array(count);
+    let qHead = 0;
+    let qTail = 0;
+    let keptBytes = 0;
+    const keepBase = (k: number, type: ObjectTypeString, data: Uint8Array) => {
+      kept[k] = data;
+      keptType[k] = TYPES.indexOf(type);
+      queue[qTail++] = k;
+      keptBytes += data.length;
+      while (keptBytes > BASE_CACHE_BYTES && qHead < qTail - 1) {
+        const old = queue[qHead++] as number;
+        keptBytes -= (kept[old] as Uint8Array).length;
+        kept[old] = undefined;
+      }
+    };
     /** each entry's delta depth (0 for a whole object), as the fast path resolved it */
     const depth = new Uint16Array(n);
     let deltaScratch = new Uint8Array(64 * 1024);
@@ -251,42 +251,47 @@ export async function checkPack(
       let data: Uint8Array;
       if (head.kind <= 4) {
         type = TYPES[head.kind] as ObjectTypeString;
-        data = new Uint8Array(head.size);
+        // small objects carved from shared slabs (a buffer of its own costs a microsecond)
+        data = allocBytes(head.size);
         if (!inflateInto(stream, data)) return undefined;
       } else if (head.kind === 6) {
         const b = head.base;
         if ((depth[b] as number) >= MAX_CHAIN) return undefined;
-        const base = cache.get((raw[b] as { offset: number }).offset);
-        if (!base) return undefined;
+        const baseData = kept[b];
+        if (!baseData) return undefined;
         if (deltaScratch.length < head.size) deltaScratch = new Uint8Array(head.size);
         const delta = deltaScratch.subarray(0, head.size);
         if (!inflateInto(stream, delta)) return undefined;
         try {
-          data = applyGitDelta(base.data, delta, MAX_OBJECT_SIZE);
+          data = applyGitDelta(baseData, delta, MAX_OBJECT_SIZE, allocBytes);
         } catch {
           return undefined;
         }
-        type = base.type;
+        type = TYPES[keptType[b] as number] as ObjectTypeString;
         depth[k] = (depth[b] as number) + 1;
       } else {
         return undefined;
       }
-      if (!hashesTo(type, data, idxBytes, (raw[k] as { idAt: number }).idAt)) return undefined;
-      cache.put((raw[k] as { offset: number }).offset, { type, data });
+      if (!hashesTo(type, data, idxBytes, idAtK(k))) return undefined;
+      keepBase(k, type, data);
       return { type, data };
     };
 
     /** Entry `k`, its bytes read (or undefined when they were not kept): to `hooks.entry`. */
     const visit = (k: number, bytes: Uint8Array | undefined): void | Promise<void> => {
-      const e = raw[k] as (typeof raw)[number];
-      const head = v2 && bytes && e.fast ? parseEntryHead(bytes, raw, k, entryEnd(k)) : undefined;
+      const offset = offsetOf(k);
+      const head =
+        v2 && bytes && fastAt(k)
+          ? parseEntryHead(bytes, sorted, k, entryEnd(k), (b) => ids(posOf(b)))
+          : undefined;
+      const id = ids(posOf(k));
       const entry: PackScanEntry = {
-        id: e.id,
-        offset: e.offset,
-        sizeInPack: entryEnd(k) - e.offset,
+        id,
+        offset,
+        sizeInPack: entryEnd(k) - offset,
         crcOk,
         ids: idxBytes,
-        idAt: e.idAt,
+        idAt: idAtK(k),
         head:
           head &&
           (head.baseId === undefined
@@ -295,7 +300,7 @@ export async function checkPack(
       };
       const fast = head && bytes ? unpackFast(k, head, bytes) : undefined;
       if (fast) {
-        const content = fast.type === "blob" && !keepBlob(e.id) ? EMPTY : fast.data;
+        const content = fast.type === "blob" && !keepBlob(id) ? EMPTY : fast.data;
         return hooks.entry(entry, { type: fast.type, content }, pack);
       }
       const slow = unpackEntry(pack, packPath, entry, keepBlob);
@@ -315,14 +320,14 @@ export async function checkPack(
     let pendingLength = 0;
     let keep = false;
     // entries the read skips (spanning nothing, at the start): through the reader, in order
-    for (; k < n && entryEnd(k) <= (raw[k]?.offset as number); k++) {
+    for (; k < n && entryEnd(k) <= offsetOf(k); k++) {
       crcOk = true;
       const r = visit(k, undefined);
       if (r instanceof Promise) await r;
     }
     const startEntry = () => {
       if (k >= n) return;
-      const span = entryEnd(k) - (raw[k]?.offset as number);
+      const span = entryEnd(k) - offsetOf(k);
       keep = span <= FAST_MAX + HEAD_MAX;
       pendingLength = 0;
       if (keep && pending.length < span) pending = new Uint8Array(span);
@@ -343,9 +348,9 @@ export async function checkPack(
           continue;
         }
         let take = Math.min(chunk.length - c, trailerAt - at);
-        const inEntry = k < n && at >= (raw[k]?.offset as number);
+        const inEntry = k < n && at >= offsetOf(k);
         if (k < n) {
-          const start = raw[k]?.offset as number;
+          const start = offsetOf(k);
           if (at < start) take = Math.min(take, start - at);
           else take = Math.min(take, entryEnd(k) - at);
         }
@@ -366,7 +371,7 @@ export async function checkPack(
           }
         }
         if (!done) continue;
-        const want = raw[k]?.crc;
+        const want = crcAtK(k);
         crcOk = want === undefined || crc.getValue() === want;
         crc = new CRC32();
         const r = visit(k, bytes);
@@ -431,52 +436,6 @@ function hexIds(
   return (pos) => all.slice(pos * 40, pos * 40 + 40);
 }
 
-/**
- * For each idx position, whether `PackFile` finds the id there without an error: its fan-out
- * bucket (the id's first byte) is sorted and holds only its own ids (what a lookup checks
- * before searching it), the position is inside that bucket, and the offset is a 32-bit one
- * (a 64-bit offset is checked against its table when read).
- */
-function idLookups(idx: Uint8Array, v2: boolean, n: number): (pos: number) => boolean {
-  const view = new DataView(idx.buffer, idx.byteOffset, idx.byteLength);
-  const fanAt = v2 ? 8 : 0;
-  const idsAt = v2 ? 8 + 1024 : 1024 + 4;
-  const stride = v2 ? 20 : 24;
-  const offAt = 8 + 1024 + n * 24;
-  const fan = (b: number) => (b < 0 ? 0 : view.getUint32(fanAt + b * 4));
-  const sound = new Uint8Array(256);
-  for (let b = 0; b < 256; b++) {
-    const from = fan(b - 1);
-    const to = fan(b);
-    let ok = from <= to && to <= n;
-    for (let i = from; ok && i < to; i++) {
-      const at = idsAt + i * stride;
-      if (idx[at] !== b) ok = false;
-      else if (i > from) {
-        let c = 0;
-        for (let j = 1; j < 20 && c === 0; j++)
-          c = (idx[at + j] as number) - (idx[at - stride + j] as number);
-        if (c <= 0) ok = false;
-      }
-    }
-    sound[b] = ok ? 1 : 0;
-  }
-  return (pos) => {
-    const b = idx[idsAt + pos * stride] as number;
-    if (!sound[b] || pos < fan(b - 1) || pos >= fan(b)) return false;
-    return !v2 || !(view.getUint32(offAt + pos * 4) & 0x80000000);
-  };
-}
-
-/** Inflates the zlib stream at the start of `input` into exactly `out`; false if it fails. */
-function inflateInto(input: Uint8Array, out: Uint8Array): boolean {
-  try {
-    return inflateWhole(input, { into: out }).length === out.length;
-  } catch {
-    return false;
-  }
-}
-
 function sameBytes(a: Uint8Array, at: number, b: Uint8Array, bt: number): boolean {
   for (let i = 0; i < 20; i++) if (a[at + i] !== b[bt + i]) return false;
   return true;
@@ -494,80 +453,6 @@ function hashesTo(type: string, content: Uint8Array, ids: Uint8Array, idAt: numb
   for (let i = 0; i < size.length; i++) header[n++] = size.charCodeAt(i);
   header[n++] = 0;
   return sameBytes(sha1Of(header.subarray(0, n), content), 0, ids, idAt);
-}
-
-/** An entry's header: kind, declared size, where its data starts, a delta's base. */
-interface ParsedHead {
-  kind: number;
-  size: number;
-  /** offset of the zlib stream from the entry's start */
-  dataAt: number;
-  /** an OFS_DELTA's base entry (its index in pack order) */
-  base: number;
-  baseId?: string;
-}
-
-/**
- * The header of entry `k` (its first bytes in `h`, the entry ending at `end`), as
- * `PackFile.entry` parses it; undefined when it is not sound in every way `entry` checks (then
- * `entry` reads it and raises its error).
- */
-function parseEntryHead(
-  h: Uint8Array,
-  raw: { id: string; offset: number }[],
-  k: number,
-  end: number,
-): ParsedHead | undefined {
-  const offset = (raw[k] as { offset: number }).offset;
-  const len = Math.min(h.length, HEAD_MAX);
-  let p = 0;
-  if (p >= len) return undefined;
-  let b = h[p++] as number;
-  const kind = (b >> 4) & 7;
-  let size = b & 0x0f;
-  let mul = 16;
-  while (b & 0x80) {
-    if (p >= len) return undefined;
-    b = h[p++] as number;
-    size += (b & 0x7f) * mul;
-    mul *= 128;
-    if (mul > 2 ** 53) return undefined;
-  }
-  if (size > MAX_OBJECT_SIZE) return undefined;
-  let baseId: string | undefined;
-  let base = -1;
-  if (kind === 6) {
-    if (p >= len) return undefined;
-    b = h[p++] as number;
-    let back = b & 0x7f;
-    while (b & 0x80) {
-      if (p >= len) return undefined;
-      b = h[p++] as number;
-      back = (back + 1) * 128 + (b & 0x7f);
-      if (back > offset) break;
-    }
-    const baseOffset = offset - back;
-    if (back === 0 || baseOffset < 12) return undefined;
-    // the entry starting there (entries are sorted by offset)
-    let lo = 0;
-    let hi = k;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if ((raw[mid] as { offset: number }).offset < baseOffset) lo = mid + 1;
-      else hi = mid;
-    }
-    if (lo >= k || (raw[lo] as { offset: number }).offset !== baseOffset) return undefined;
-    base = lo;
-    baseId = (raw[lo] as { id: string }).id;
-  } else if (kind === 7) {
-    if (p + 20 > len) return undefined;
-    baseId = bytesToHex(h.subarray(p, p + 20));
-    p += 20;
-  } else if (kind < 1 || kind > 4) {
-    return undefined;
-  }
-  if (size > (end - (offset + p)) * MAX_EXPANSION + 1024) return undefined;
-  return { kind, size, dataAt: p, base, baseId };
 }
 
 /** The whole content of an object read from a store. */
@@ -685,7 +570,7 @@ function unpackError(entry: PackScanEntry, packPath: string, e: unknown): Unpack
 const enc = new TextEncoder();
 
 /** The git object id of `content` as `type`: SHA-1 over its header and content, as hex. */
-function objectIdOf(type: string, content: Uint8Array): string {
+export function objectIdOf(type: string, content: Uint8Array): string {
   let n = 0;
   for (let i = 0; i < type.length; i++) header[n++] = type.charCodeAt(i);
   header[n++] = 0x20;

@@ -54,6 +54,7 @@ export interface NodeGitHostEnvironment {
   committer?: { name?: string; email?: string; date?: string };
   author?: { name?: string; email?: string; date?: string };
   defaultEmail?: string;
+  attrSource?: string;
 }
 
 /**
@@ -94,7 +95,8 @@ function envBool(value: string | undefined): boolean {
  * The user's git environment read from the process (`HOME`, `XDG_CONFIG_HOME`,
  * `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, and
  * `GIT_COMMITTER_NAME` / `_EMAIL` / `_DATE` for the committer and the reflog identity,
- * `GIT_AUTHOR_NAME` / `_EMAIL` / `_DATE` for the author, `EMAIL` for git's `$EMAIL`), files
+ * `GIT_AUTHOR_NAME` / `_EMAIL` / `_DATE` for the author, `EMAIL` for git's `$EMAIL`,
+ * `GIT_ATTR_SOURCE` for the tree attributes are read from), files
  * read by absolute path. The system files default to `/etc/gitconfig` and
  * `/etc/gitattributes`.
  *
@@ -146,5 +148,6 @@ export function createNodeGitHostEnvironment(
     ...(Object.keys(committer).length > 0 ? { committer } : {}),
     ...(Object.keys(author).length > 0 ? { author } : {}),
     ...(env.EMAIL ? { defaultEmail: env.EMAIL } : {}),
+    ...(env.GIT_ATTR_SOURCE !== undefined ? { attrSource: env.GIT_ATTR_SOURCE } : {}),
   };
 }

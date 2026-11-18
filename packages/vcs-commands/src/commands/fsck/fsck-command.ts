@@ -4,6 +4,7 @@ import {
   type FilesApi,
   type GitObject,
   type GitObjects,
+  type GraphCommitData,
   isSymbolicRef,
   openPack,
   type PackFile,
@@ -14,9 +15,11 @@ import {
   readPackIndex,
   runSteps,
   type Steps,
+  scanPackObjects,
   verifyCommitGraph,
 } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import {
   type CacheTree,
   parseCacheTree,
@@ -59,7 +62,7 @@ import {
   typeOf,
   USED,
 } from "./fsck-object-table.js";
-import { checkPack, collect } from "./fsck-pack.js";
+import { checkPack, collect, objectIdOf } from "./fsck-pack.js";
 
 /** Exit status bits, as `git fsck` returns them (git 2.43's builtin/fsck.c). */
 export const FSCK_ERROR_OBJECT = 0o1;
@@ -120,10 +123,33 @@ export interface FsckResult {
   /**
    * The work behind the result: objects read whole from the store (`objectsRead`; the
    * sequential pack checks of a full run are not counted) and, in `--connectivity-only` runs,
-   * commits whose tree and parents came from the commit-graph instead (`commitsFromGraph`)
+   * commits whose tree and parents came from the commit-graph instead (`commitsFromGraph`).
+   * A `--connectivity-only` run unpacks the commits and trees of each pack in one read in
+   * pack order first (`objectsScanned` of them); `objectsRead` counts the objects the walk
+   * takes from that read as well, once each, as it counts those it reads from the store.
+   * What is kept in memory from the reads in pack order is bounded (`setMemoryLimits`):
+   * `linksKept` tree entries and commit links (the walk reads the others from the store) and
+   * `graphCommitsKept` commits for the commit-graph verification (it reads the others).
    */
-  statistics: { objectsRead: number; commitsFromGraph: number };
+  statistics: {
+    objectsRead: number;
+    commitsFromGraph: number;
+    objectsScanned: number;
+    linksKept: number;
+    graphCommitsKept: number;
+  };
 }
+
+/** What a run keeps in memory from the reads in pack order (`FsckCommand.setMemoryLimits`). */
+export interface FsckMemoryLimits {
+  /** Tree entries and commit links kept for the walk (4 bytes each): 32 Mi by default. */
+  links?: number;
+  /** Commits kept for the commit-graph verification: 256 Ki by default. */
+  graphCommits?: number;
+}
+
+const DEFAULT_LINKS_KEPT = 32 * 1024 * 1024;
+const DEFAULT_GRAPH_COMMITS_KEPT = 256 * 1024;
 
 /** The git version whose output `FsckCommand` reproduces where versions differ. */
 export type FsckCompatibility = "2.43" | "2.56";
@@ -229,6 +255,7 @@ export class FsckCommand extends GitCommand<FsckResult> {
   private _tags = false;
   private _lostFound = false;
   private _compatibility: FsckCompatibility = "2.56";
+  private _limits: FsckMemoryLimits = {};
   private _repository?: FsckRepositoryFiles;
   private readonly _messageTypes: [string, string][] = [];
 
@@ -320,6 +347,18 @@ export class FsckCommand extends GitCommand<FsckResult> {
     return this;
   }
 
+  /**
+   * Bounds what the run keeps from its reads in pack order (the trees and commits a full run
+   * checks, the commits and trees a `--connectivity-only` run unpacks first, the commits the
+   * commit-graph verification compares): past them the objects are read from the store again
+   * when needed. The output is the same whatever the limits.
+   */
+  setMemoryLimits(limits: FsckMemoryLimits): this {
+    this.checkCallable();
+    this._limits = { ...limits };
+    return this;
+  }
+
   /** `fsck.<msg-id>=<type>` for this run (`error`, `warn` or `ignore`), after the config's. */
   setMessageType(msgId: string, type: string): this {
     this.checkCallable();
@@ -365,6 +404,9 @@ export class FsckCommand extends GitCommand<FsckResult> {
       compatibility: this._compatibility,
       repository: this._repository,
       bigFileThreshold,
+      linksKept: Math.max(0, this._limits.links ?? DEFAULT_LINKS_KEPT),
+      graphCommitsKept: Math.max(0, this._limits.graphCommits ?? DEFAULT_GRAPH_COMMITS_KEPT),
+      graftsAdvice: configBool(this.workingCopy, "advice.graftFileDeprecated", true),
       commitGraph: {
         enabled: configBool(this.workingCopy, "core.commitGraph", true),
         generationVersion:
@@ -398,6 +440,12 @@ interface RunOptions {
   repository?: FsckRepositoryFiles;
   /** `core.bigFileThreshold`: larger loose blobs are streamed */
   bigFileThreshold: number;
+  /** `advice.graftFileDeprecated` (on by default) */
+  graftsAdvice: boolean;
+  /** Tree entries and commit links kept from the reads in pack order, at most */
+  linksKept: number;
+  /** Commits kept for the commit-graph verification, at most */
+  graphCommitsKept: number;
   /** `core.commitGraph` and the graph read settings, for `git commit-graph verify` */
   commitGraph: { enabled: boolean; generationVersion: number; changedPathsVersion: number };
 }
@@ -460,9 +508,14 @@ class FsckRun {
    * the entry count comes first, then `(object << 1) | isTree` per entry (gitlinks left out).
    * Only for trees whose entries all resolved, in full runs without `--name-objects`, so the
    * connectivity walk need not read them again (git reads them again: a few bytes per entry
-   * here against unpacking every tree twice).
+   * here against unpacking every tree twice). Indexed by object number, holding start + 1 (0 for
+   * a tree not recorded).
    */
-  private readonly treeEntries = new Map<number, number>();
+  private treeStart = new Int32Array(0);
+  /** The table `walkUsed` decodes each tree into (one tree at a time). */
+  private readonly usedTable: TreeEntryTable = { count: 0, fields: new Int32Array(0) };
+  /** The table the connectivity walk decodes each tree into. */
+  private readonly walkTable: TreeEntryTable = { count: 0, fields: new Int32Array(0) };
   private kids = new Int32Array(1 << 12);
   private kidsLength = 0;
   /** The tree `walkUsed` decoded last, for `fsckTree` to check without decoding it again. */
@@ -490,6 +543,26 @@ class FsckRun {
   private graphParsed = 0;
   /** Objects read whole from the store (`readWhole`) */
   private objectsRead = 0;
+  /** Objects the pack-order scan of a connectivity-only run unpacked. */
+  private objectsScanned = 0;
+  /**
+   * What the pack-order scan (`scanPacks`) found of each commit and tree it unpacked: object
+   * number -> start + 1 in `scanKids` (0 for an object not scanned). At the start
+   * `(count << 2) | type`, then a tree's entries as `(object << 1) | isTree` (gitlinks left
+   * out), or a commit's tree and parents. Only objects whose every link names an object the
+   * table holds, so the walk replays the lookups git makes on them in its own order.
+   */
+  private scanAt = new Int32Array(0);
+  /**
+   * Commits as `git commit-graph verify` compares them with the graph, by id, kept from the
+   * reads in pack order (the object pass of a full run, the scan of a connectivity-only one)
+   * when the repository has a commit-graph: the verification then reads only the others.
+   */
+  private graphCommits?: Map<string, GraphCommitData | null>;
+  /** Commits `graphCommits` holds (its `null`s left out). */
+  private graphCommitsKept = 0;
+  private scanKids = new Int32Array(0);
+  private scanKidsLength = 0;
   private readonly files?: FilesApi;
   private readonly gitDir: string;
 
@@ -507,18 +580,38 @@ class FsckRun {
   }
 
   async run(): Promise<FsckResult> {
+    if (this.files && this.o.graftsAdvice) {
+      const grafts = pathOf(this.gitDir, "info", "grafts");
+      this.graftsHint = (await this.files.stats(grafts).catch(() => undefined))?.kind === "file";
+    }
+    if (this.files && this.o.commitGraph.enabled && (await this.hasCommitGraphFile())) {
+      this.graphCommits = new Map();
+    }
     const refs = this.stores.refs;
     this.shallow = new Set((await refs.getShallow?.()) ?? []);
     if (this.files) this.packs = await this.listPacks();
     // git 2.45+: the refs are snapshotted before the objects are read
     const snapshot = this.o.compatibility === "2.56" ? await this.snapshotRefs() : undefined;
 
+    /** connectivity-only: each pack's objects by idx position, and the loose ones */
+    let packed: Int32Array[] | undefined;
+    let loose: number[] | undefined;
     if (this.o.connectivityOnly) {
       const t = this.t;
-      await this.forEachStored((raw, at) => {
+      const scan = this.files !== undefined && !this.names && this.packs.length > 0;
+      if (scan) {
+        packed = this.packs.map((p) => new Int32Array(p.idx.objectCount));
+        loose = [];
+      }
+      await this.forEachStored((raw, at, pack, pos) => {
         // git's lookup_unknown_object
-        const n = t.lookupRaw(raw, at);
-        t.addFlags(n >= 0 ? n : t.createRaw(raw, at, OBJ_NONE), HAS_OBJ);
+        let n = t.lookupRaw(raw, at);
+        if (n < 0) n = t.createRaw(raw, at, OBJ_NONE);
+        t.addFlags(n, HAS_OBJ);
+        if (packed) {
+          if (pack < 0) loose?.push(n);
+          else (packed[pack] as Int32Array)[pos] = n;
+        }
       });
     } else {
       if (this.files) {
@@ -534,12 +627,13 @@ class FsckRun {
     else await this.processRefs();
     await this.processIndexes();
     if (this.o.connectivityOnly) this.graph = await this.loadCommitGraph();
+    if (packed) await this.scanPacks(packed, loose ?? []);
     try {
       await this.checkConnectivity();
+      await this.verifyCommitGraph();
     } finally {
       for (const pack of this.opened.values()) pack?.close();
     }
-    await this.verifyCommitGraph();
 
     const out = this.findings.filter((f) => f.stream === "stdout").map((f) => `${f.text}\n`);
     const err = this.findings.filter((f) => f.stream === "stderr").map((f) => `${f.text}\n`);
@@ -548,7 +642,13 @@ class FsckRun {
       findings: this.findings,
       output: out.join(""),
       errorOutput: err.join(""),
-      statistics: { objectsRead: this.objectsRead, commitsFromGraph: this.graphParsed },
+      statistics: {
+        objectsRead: this.objectsRead,
+        commitsFromGraph: this.graphParsed,
+        objectsScanned: this.objectsScanned,
+        linksKept: this.kidsLength + this.scanKidsLength,
+        graphCommitsKept: this.graphCommitsKept,
+      },
     };
   }
 
@@ -576,16 +676,50 @@ class FsckRun {
         this.emit({ kind: "commit-graph", stream: "stderr", text: `${d.level}: ${d.message}` });
       }
     }
+    // git's `git commit-graph verify` reads each commit (in the graph's order) from the first
+    // pack of its most-recently-used list that has it: a commit in several packs is read from
+    // the one the commit before it came from, when that one has it too
+    const packs = this.packs;
+    const mru = [...packs];
+    const packOf = (id: string): RepoPack | undefined => {
+      for (let i = 0; i < mru.length; i++) {
+        const p = mru[i] as RepoPack;
+        if (!p.idx.has(id)) continue;
+        if (i > 0) {
+          mru.splice(i, 1);
+          mru.unshift(p);
+        }
+        return p;
+      }
+      return undefined;
+    };
     const result = await verifyCommitGraph(
       this.files,
       objectsDir,
-      async (id) => {
+      (id) => {
+        const from = packs.length > 1 ? packOf(id) : undefined;
+        if (from && from !== packs.find((p) => p.idx.has(id))) {
+          // not the copy kept (the newest pack's): that pack's own
+          return this.readPackedCommit(from, id);
+        }
+        const kept = this.graphCommits?.get(id);
+        if (kept) return kept;
+        const parse = (o: GitObject | undefined, data: Uint8Array) =>
+          o?.type === "commit" ? parseGraphCommit(data, id) : undefined;
+        const slow = async (o: GitObject | undefined | Promise<GitObject | undefined>) => {
+          try {
+            const obj = await o;
+            if (!obj) return undefined;
+            return parse(obj, obj.bytes ?? (await collect(obj)));
+          } catch {
+            return undefined;
+          }
+        };
         try {
-          const o = await objects.get(id);
-          if (!o) return undefined;
-          const data = o.bytes ?? (await collect(o));
-          if (o.type !== "commit") return undefined;
-          return parseGraphCommit(data, id);
+          // without a promise when the store has the commit in memory
+          const o = objects.getNow ? objects.getNow(id) : objects.get(id);
+          if (o instanceof Promise || (o && !o.bytes)) return slow(o);
+          return o ? parse(o, o.bytes as Uint8Array) : undefined;
         } catch {
           return undefined;
         }
@@ -594,6 +728,54 @@ class FsckRun {
     );
     for (const text of result.messages) this.emit({ kind: "commit-graph", stream: "stderr", text });
     if (result.exitCode !== 0) this.errorsFound |= FSCK_ERROR_COMMIT_GRAPH;
+  }
+
+  /** Commit `id` as pack `p` holds it, unchecked, for the commit-graph verification. */
+  private async readPackedCommit(p: RepoPack, id: string): Promise<GraphCommitData | undefined> {
+    try {
+      const pack = await this.openRepoPack(p);
+      const obj = await pack?.get(id);
+      if (obj?.type !== "commit") return undefined;
+      return parseGraphCommit(await collect(obj), id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Whether the objects directory has a commit-graph file or chain. */
+  private async hasCommitGraphFile(): Promise<boolean> {
+    const files = this.files as FilesApi;
+    const info = pathOf(this.gitDir, "objects", "info");
+    try {
+      if ((await files.stats(pathOf(info, "commit-graph")))?.kind === "file") return true;
+      return (await files.stats(pathOf(info, "commit-graphs")))?.kind === "directory";
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A commit read in pack order, kept for the commit-graph verification (`graphCommits`), when
+   * this is the copy the verification reads (git's repo_read_object_file: the first pack in
+   * pack order that has it, unchecked): the callers pass each pack's copies in that order and
+   * `skipGraphCommit` for a copy they could not unpack. At most `graphCommitsKept` of them.
+   */
+  private keepGraphCommit(id: string, content: Uint8Array): void {
+    const map = this.graphCommits;
+    if (!map || this.graphCommitsKept >= this.o.graphCommitsKept || map.has(id)) return;
+    try {
+      map.set(id, parseGraphCommit(content, id));
+      this.graphCommitsKept++;
+    } catch {
+      // read again (and failed again) by the verification
+      map.set(id, null);
+    }
+  }
+
+  /** A copy `keepGraphCommit` cannot take: the verification reads the object from the store. */
+  private skipGraphCommit(id: string): void {
+    const map = this.graphCommits;
+    if (map && !map.has(id)) map.set(id, null);
   }
 
   /**
@@ -627,18 +809,24 @@ class FsckRun {
    */
   private parseCommitInGraph(n: number, id: string): boolean {
     const g = this.graph as CommitGraph;
-    const pos = g.position(id);
-    if (pos < 0) return false;
     const t = this.t;
+    const pos = g.positionOfBytes(t.idBytes(n));
+    if (pos < 0) return false;
     const parents: number[] = [];
     if (!this.shallow.has(id)) {
-      for (const pid of g.parentsAt(pos)) {
-        const parent = t.lookupTyped(pid, OBJ_COMMIT);
+      for (const pp of g.parentPositionsAt(pos)) {
+        const [layer, local] = g.locate(pp);
+        const parent = t.lookupTypedRaw(
+          layer.bytes,
+          layer.oidLookup.offset + 20 * local,
+          OBJ_COMMIT,
+        );
         if (typeof parent !== "number") return false;
         parents.push(parent);
       }
     }
-    const tree = t.lookupTyped(g.treeAt(pos), OBJ_TREE);
+    const [layer, local] = g.locate(pos);
+    const tree = t.lookupTypedRaw(layer.bytes, layer.dataOffset(local), OBJ_TREE);
     if (typeof tree !== "number") return false;
     t.links.set(n, { tree, parents });
     t.addFlags(n, PARSED);
@@ -658,6 +846,33 @@ class FsckRun {
 
   private emit(finding: FsckFinding): void {
     this.findings.push(finding);
+  }
+
+  /** Whether the grafts file's deprecation hint is still to be printed (`adviseGrafts`). */
+  private graftsHint = false;
+
+  /**
+   * git's read_graft_file, when the first commit is parsed (prepare_commit_graft): the hint
+   * that `<GIT_DIR>/info/grafts` is deprecated, once, as each version words it.
+   */
+  private adviseGrafts(): void {
+    if (!this.graftsHint) return;
+    this.graftsHint = false;
+    const v243 = this.o.compatibility === "2.43";
+    const blank = v243 ? "hint: " : "hint:";
+    const lines = [
+      "hint: Support for <GIT_DIR>/info/grafts is deprecated",
+      "hint: and will be removed in a future Git version.",
+      blank,
+      'hint: Please use "git replace --convert-graft-file"',
+      "hint: to convert the grafts into replace refs.",
+      blank,
+      "hint: Turn this message off by running",
+      v243
+        ? 'hint: "git config advice.graftFileDeprecated false"'
+        : 'hint: "git config set advice.graftFileDeprecated false"',
+    ];
+    for (const text of lines) this.emit({ kind: "notice", stream: "stderr", text });
   }
 
   /** git's `error()`: `error: <message>` on stderr. */
@@ -789,6 +1004,17 @@ class FsckRun {
   /** The repository's packs, opened to read entry headers (`packedType`). */
   private readonly opened = new Map<RepoPack, PackFile | undefined>();
 
+  /** Pack `p`, opened once (undefined when it cannot be). */
+  private async openRepoPack(p: RepoPack): Promise<PackFile | undefined> {
+    if (!this.opened.has(p)) {
+      const pack = await openPack(this.files as FilesApi, p.packPath, p.idxPath, {
+        idxBytes: p.idxBytes,
+      }).catch(() => undefined);
+      this.opened.set(p, pack);
+    }
+    return this.opened.get(p);
+  }
+
   /**
    * The type of a packed object from its entry header, following a delta's bases through
    * theirs, as git's `packed_object_info`: nothing is inflated (connectivity-only runs read no
@@ -798,13 +1024,7 @@ class FsckRun {
   private async packedType(id: string): Promise<string | undefined> {
     const p = this.packs.find((x) => x.idx.has(id));
     if (!p) return undefined;
-    let pack = this.opened.get(p);
-    if (!this.opened.has(p)) {
-      pack = await openPack(this.files as FilesApi, p.packPath, p.idxPath, {
-        idxBytes: p.idxBytes,
-      }).catch(() => undefined);
-      this.opened.set(p, pack);
-    }
+    const pack = await this.openRepoPack(p);
     if (!pack || p.idx.version < 2) return undefined;
     try {
       let at = id;
@@ -887,7 +1107,7 @@ class FsckRun {
    * each pack's in idx order (git's for_each_*_object). A pack's ids are read from its idx.
    */
   private async forEachStored(
-    visit: (raw: Uint8Array, at: number) => void | Promise<void>,
+    visit: (raw: Uint8Array, at: number, pack: number, pos: number) => void | Promise<void>,
   ): Promise<void> {
     const scratch = new Uint8Array(20);
     // ids listed here are 40 lowercase hex digits
@@ -902,22 +1122,23 @@ class FsckRun {
       for await (const id of this.objects.list()) ids.push(id);
       ids.sort();
       for (const id of ids) {
-        const r = visit(parsed(id), 0);
+        const r = visit(parsed(id), 0, -1, -1);
         if (r) await r;
       }
       return;
     }
     for await (const e of this.looseEntries()) {
       if (!e.id) continue;
-      const r = visit(parsed(e.id), 0);
+      const r = visit(parsed(e.id), 0, -1, -1);
       if (r) await r;
     }
-    for (const p of this.packs) {
+    for (let k = 0; k < this.packs.length; k++) {
+      const p = this.packs[k] as RepoPack;
       const v2 = p.idx.version > 1;
       const idsAt = v2 ? 8 + 1024 : 1024 + 4;
       const stride = v2 ? 20 : 24;
       for (let i = 0, n = p.idx.objectCount; i < n; i++) {
-        const r = visit(p.idxBytes, idsAt + i * stride);
+        const r = visit(p.idxBytes, idsAt + i * stride, k, i);
         if (r) await r;
       }
     }
@@ -950,6 +1171,7 @@ class FsckRun {
     }
     if (t.flags(n) & PARSED) return n;
     if (type === OBJ_COMMIT) {
+      if (this.graftsHint) this.adviseGrafts();
       const parsed = parseCommitLinks(content, id);
       if ("error" in parsed) {
         this.error(parsed.error, id);
@@ -996,13 +1218,61 @@ class FsckRun {
     return n;
   }
 
-  /** git's `parse_object`: an object already parsed, or read from the store and parsed. */
+  /**
+   * git's `parse_object`: an object already parsed, or read from the store with its hash
+   * checked (`hash mismatch <id>`, and undefined, when its bytes hash to another id: the copy
+   * the store reads first, packed before loose, as git's) and parsed. The roots (refs, the
+   * cache-tree, resolve-undo) and the objects the walk meets untyped (reflog entries in
+   * connectivity-only runs) are parsed this way, trees again each time; the walk reads typed objects unchecked
+   * (`parseAs`, git's repo_parse_commit, parse_tree and parse_tag).
+   */
   private parseObject(id: string): number | undefined | Promise<number | undefined> {
     const known = this.t.lookup(id);
-    if (known >= 0 && this.t.flags(known) & PARSED) return known;
+    // a tree is read again: git frees each tree's buffer once checked or walked (parsed = 0)
+    if (known >= 0 && this.t.flags(known) & PARSED && this.t.type(known) !== OBJ_TREE) {
+      return known;
+    }
     const obj = this.readWhole(id);
-    if (obj instanceof Promise) return obj.then((o) => this.parseRead(id, o));
+    if (obj instanceof Promise) return obj.then((o) => this.parseVerified(id, o));
+    return this.parseVerified(id, obj);
+  }
+
+  /**
+   * `parseRead` once the bytes hash to `id` (git's check_object_signature). Hashed here, not by
+   * the store: a verified read would mark the copy bad there, and git reads it again as it is.
+   */
+  private parseVerified(id: string, obj: Whole | undefined): number | undefined {
+    if (obj && objectIdOf(obj.type, obj.content) !== id) {
+      this.error(`hash mismatch ${id}`, id);
+      return undefined;
+    }
     return this.parseRead(id, obj);
+  }
+
+  /**
+   * git's repo_parse_commit and parse_tag of object `n`, a commit or a tag not parsed yet: read
+   * without a hash check, `Could not read <id>` when that fails and `Object <id> not a <type>`
+   * when the store holds another type.
+   */
+  private parseAs(n: number, id: string): void | Promise<void> {
+    const obj = this.readWhole(id);
+    if (obj instanceof Promise) return obj.then((o) => this.parseAsRead(n, id, o));
+    this.parseAsRead(n, id, obj);
+  }
+
+  private parseAsRead(n: number, id: string, obj: Whole | undefined): void {
+    const want = this.t.type(n);
+    if (!obj) {
+      if (this.lastZlibError) this.error(this.lastZlibError);
+      this.error(`Could not read ${id}`);
+      return;
+    }
+    if (typeOf(obj.type) !== want) {
+      this.error(`Object ${id} not a ${TYPE_NAME[want]}`);
+      return;
+    }
+    this.lastRead = { id, obj };
+    this.parseObjectBuffer(id, want, obj.content);
   }
 
   private parseRead(id: string, obj: Whole | undefined): number | undefined {
@@ -1092,6 +1362,16 @@ class FsckRun {
     return 0;
   }
 
+  /** Records that tree `n`'s entries start at `start` in `kids` (`treeStart` holds start + 1). */
+  private setTreeStart(n: number, start: number): void {
+    if (n >= this.treeStart.length) {
+      const grown = new Int32Array(Math.max(1024, this.t.size * 2, n + 1));
+      grown.set(this.treeStart);
+      this.treeStart = grown;
+    }
+    this.treeStart[n] = start + 1;
+  }
+
   /** Room in `kids` for `more` values past `kidsLength`. */
   private reserveKids(more: number): void {
     const need = this.kidsLength + more;
@@ -1111,7 +1391,7 @@ class FsckRun {
     const t = this.t;
     const type = t.type(n);
     if (type === OBJ_TREE) {
-      const walk = scanTree(content);
+      const walk = scanTree(content, this.usedTable);
       this.lastTree = { content, table: walk };
       if (walk.initError) {
         this.error(walk.initError);
@@ -1119,6 +1399,8 @@ class FsckRun {
       }
       let res = 0;
       const start = this.kidsLength;
+      // past the limit the walk reads the tree again
+      if (record && start + 1 + walk.count > this.o.linksKept) record = false;
       if (record) this.reserveKids(1 + walk.count);
       let at = start + 1;
       const f = walk.fields;
@@ -1143,7 +1425,7 @@ class FsckRun {
       if (record && res === 0 && !walk.error) {
         this.kids[start] = at - start - 1;
         this.kidsLength = at;
-        this.treeEntries.set(n, start);
+        this.setTreeStart(n, start);
       }
       return res;
     }
@@ -1332,9 +1614,12 @@ class FsckRun {
               if (unpacked.zlib) this.error(unpacked.zlib);
               this.error(unpacked.error, entry.id);
               this.badCopy.add(entry.id);
+              // the verification reads this copy (git does not check its hash there)
+              this.skipGraphCommit(entry.id);
               err = 1;
               return;
             }
+            if (unpacked.type === "commit") this.keepGraphCommit(entry.id, unpacked.content);
             const r = this.fsckObjBuffer(
               entry.id,
               typeOf(unpacked.type),
@@ -1921,6 +2206,173 @@ class FsckRun {
   // Connectivity
 
   /**
+   * The pack-order scan of a connectivity-only run (`scanPackObjects`): the commits (unless a
+   * commit-graph gives them) and trees of each pack, unpacked in one read and kept as the
+   * objects they link to (`scanAt`). An object is taken from the first pack that holds it,
+   * as the store reads it, and never when it is loose too (the store may read that copy); a
+   * pack that cannot be read leaves its objects to the walk's reads. At most `linksKept`
+   * links are kept: the scan stops there, and the walk reads the rest from the store.
+   */
+  private async scanPacks(packed: Int32Array[], loose: number[]): Promise<void> {
+    const files = this.files as FilesApi;
+    const t = this.t;
+    const claimed = new Uint8Array(t.size);
+    for (const n of loose) claimed[n] = 1;
+    this.scanAt = new Int32Array(t.size);
+    this.scanKids = new Int32Array(Math.min(1 << 16, Math.max(16, this.o.linksKept)));
+    const withCommits = !this.graph;
+    const keepCommits = this.graphCommits !== undefined;
+    /** objects whose copy the commit-graph verification reads is decided (an earlier pack's) */
+    const decided = keepCommits ? new Uint8Array(t.size) : undefined;
+    let full = false;
+    for (let k = 0; k < this.packs.length && !full; k++) {
+      const p = this.packs[k] as RepoPack;
+      const ns = packed[k] as Int32Array;
+      try {
+        this.objectsScanned += await scanPackObjects(
+          files,
+          p.packPath,
+          p.idxBytes,
+          p.idx,
+          (type) => type === OBJ_TREE || (type === OBJ_COMMIT && (withCommits || keepCommits)),
+          (pos, type, content) => {
+            const n = ns[pos] as number;
+            if (type === OBJ_COMMIT && decided && !decided[n]) {
+              decided[n] = 1;
+              const at = p.idx.version > 1 ? 8 + 1024 + pos * 20 : 1024 + 4 + pos * 24;
+              this.keepGraphCommit(bytesToHex(p.idxBytes.subarray(at, at + 20)), content);
+            }
+            if (type === OBJ_COMMIT && !withCommits) return;
+            if (claimed[n]) return;
+            claimed[n] = 1;
+            if (!this.recordScanned(n, type, content)) {
+              full = true;
+              return false;
+            }
+          },
+        );
+      } catch {
+        // the walk reads what this pack holds through the store
+      }
+      for (let i = 0; i < ns.length; i++) {
+        claimed[ns[i] as number] = 1;
+        if (decided) decided[ns[i] as number] = 1;
+      }
+    }
+  }
+
+  /**
+   * `scanAt` for object `n`, a commit or a tree, from its content. False when it does not fit
+   * in `linksKept` (nothing recorded).
+   */
+  private recordScanned(n: number, type: number, content: Uint8Array): boolean {
+    const t = this.t;
+    const start = this.scanKidsLength;
+    let at = start + 1;
+    if (type === OBJ_TREE) {
+      // the entries as `scanTree` decodes them, for a tree it decodes without an error (any
+      // other is left to the walk, which reports it)
+      const len = content.length;
+      if (len > 0 && (len < 23 || content[len - 21] !== 0)) return true;
+      if (!this.reserveScanKids(1 + Math.floor(len / 23))) return false;
+      const kids = this.scanKids;
+      let p = 0;
+      while (p < len) {
+        if (len - p < 23 || content[p] === 0x20) return true;
+        let mode = 0;
+        for (;;) {
+          const c = content[p++] as number;
+          if (c === 0x20) break;
+          if (c < 0x30 || c > 0x37) return true;
+          mode = (mode * 8 + (c - 0x30)) & 0xffff;
+        }
+        if (content[p] === 0) return true;
+        while (p < len && content[p] !== 0) p++;
+        if (p + 21 > len) return true;
+        const idAt = p + 1;
+        p = idAt + 20;
+        const format = mode & 0o170000;
+        // gitlinks are not walked (canon_mode makes every other format one)
+        if (format !== 0o100000 && format !== 0o120000 && format !== 0o040000) continue;
+        const c = t.peekRaw(content, idAt);
+        if (c < 0) return true;
+        kids[at++] = (c << 1) | (format === 0o040000 ? 1 : 0);
+      }
+    } else {
+      const parsed = parseCommitLinks(content, "");
+      if ("error" in parsed) return true;
+      if (!this.reserveScanKids(2 + parsed.parents.length)) return false;
+      const kids = this.scanKids;
+      const raw = this.idScratch;
+      const tree = t.peekRaw(rawIdAt(content, parsed.tree, raw), 0);
+      if (tree < 0) return true;
+      kids[at++] = tree;
+      for (const p of parsed.parents) {
+        const c = t.peekRaw(rawIdAt(content, p, raw), 0);
+        if (c < 0) return true;
+        kids[at++] = c;
+      }
+    }
+    this.scanKids[start] = ((at - start - 1) << 2) | type;
+    this.scanKidsLength = at;
+    this.scanAt[n] = start + 1;
+    return true;
+  }
+
+  /** Room in `scanKids` for `more` values, within `linksKept`; false past it. */
+  private reserveScanKids(more: number): boolean {
+    const need = this.scanKidsLength + more;
+    if (need <= this.scanKids.length) return true;
+    if (need > this.o.linksKept) return false;
+    let size = this.scanKids.length * 2;
+    while (size < need) size *= 2;
+    size = Math.min(size, Math.max(need, this.o.linksKept));
+    const kids = new Int32Array(size);
+    kids.set(this.scanKids.subarray(0, this.scanKidsLength));
+    this.scanKids = kids;
+    return true;
+  }
+
+  /**
+   * git's parse of commit `n` from what the scan kept (`scanAt` start `s`): the lookups
+   * `parse_commit_buffer` makes, in its order. False, with nothing done, when one of them would
+   * fail (an object of another type): the walk then reads the commit as it reads any other.
+   */
+  private parseScannedCommit(n: number, s: number): boolean {
+    const t = this.t;
+    const kids = this.scanKids;
+    const count = (kids[s] as number) >> 2;
+    const tree = kids[s + 1] as number;
+    const have = t.type(tree);
+    if (have !== OBJ_NONE && have !== OBJ_TREE) return false;
+    const shallow = this.shallow.size > 0 && this.shallow.has(t.id(n));
+    if (!shallow) {
+      for (let i = s + 2; i <= s + count; i++) {
+        const p = kids[i] as number;
+        const pt = t.type(p);
+        if (p === tree || (pt !== OBJ_NONE && pt !== OBJ_COMMIT)) return false;
+      }
+    }
+    if (this.graftsHint) this.adviseGrafts();
+    // parse_object's lookup, then parse_object_buffer's
+    t.touch(n);
+    t.setType(n, OBJ_COMMIT);
+    this.objectsRead++;
+    t.lookupTypedN(tree, OBJ_TREE);
+    const parents: number[] = [];
+    if (!shallow) {
+      for (let i = s + 2; i <= s + count; i++) {
+        const p = kids[i] as number;
+        t.lookupTypedN(p, OBJ_COMMIT);
+        parents.push(p);
+      }
+    }
+    t.links.set(n, { tree, parents });
+    t.addFlags(n, PARSED);
+    return true;
+  }
+
+  /**
    * git's `fsck_walk` with `mark_object` (`traverse_one_object`), for `runSteps`: it yields only
    * the promises it waits for, so an object whose reads are in memory is walked synchronously.
    */
@@ -1929,8 +2381,8 @@ class FsckRun {
     // fsck_walk returns at once for a blob (no id to build, nothing to read)
     if (t.type(n) === OBJ_BLOB) return;
     if (t.type(n) === OBJ_TREE && t.flags(n) & PARSED) {
-      const start = this.treeEntries.get(n);
-      if (start !== undefined) {
+      const start = n < this.treeStart.length ? (this.treeStart[n] as number) - 1 : -1;
+      if (start >= 0) {
         if (this.badCopy.size === 0 || !this.badCopy.has(t.id(n))) {
           // checked in full already: its entries again, as they resolved then
           const kids = this.kids;
@@ -1948,12 +2400,37 @@ class FsckRun {
         }
       }
     }
+    // what the pack-order scan kept of it, when it holds an object of the type the walk expects
+    // (an object met untyped is parse_object's, which checks its hash: read from the store)
+    const s = n < this.scanAt.length ? (this.scanAt[n] as number) - 1 : -1;
+    let scanned = false;
+    if (s >= 0 && !(t.flags(n) & PARSED)) {
+      const kids = this.scanKids;
+      const head = kids[s] as number;
+      const have = t.type(n);
+      if ((head & 3) === OBJ_TREE && have === OBJ_TREE) {
+        const rest = this.walkScannedTree(n, s);
+        if (rest) yield* rest;
+        return;
+      }
+      if ((head & 3) === OBJ_COMMIT && have === OBJ_COMMIT) {
+        scanned = this.parseScannedCommit(n, s);
+      }
+    }
     const id = t.id(n);
-    // git's parse_object / repo_parse_commit / parse_tag before walking
     this.lastRead = undefined;
-    if (t.type(n) === OBJ_NONE || (t.type(n) !== OBJ_BLOB && !(t.flags(n) & PARSED))) {
+    if (t.type(n) === OBJ_NONE) {
+      // fsck_walk's parse_object, hash-checked
+      const r = this.parseObject(id);
+      if (r instanceof Promise) yield r;
+    } else if (
+      !scanned &&
+      (t.type(n) === OBJ_COMMIT || t.type(n) === OBJ_TAG) &&
+      !(t.flags(n) & PARSED)
+    ) {
+      // repo_parse_commit (from the commit-graph when it has the commit) / parse_tag
       if (!(t.type(n) === OBJ_COMMIT && this.graph && this.parseCommitInGraph(n, id))) {
-        const r = this.parseObject(id);
+        const r = this.parseAs(n, id);
         if (r instanceof Promise) yield r;
       }
     }
@@ -1968,12 +2445,18 @@ class FsckRun {
           last !== undefined && last.id === id ? last.obj : this.readWhole(id);
         this.lastRead = undefined;
         if (obj instanceof Promise) obj = (yield obj) as Whole | undefined;
+        // git's parse_tree
         if (!obj) {
           if (this.lastZlibError) this.error(this.lastZlibError);
           this.error(`Could not read ${id}`);
           return;
         }
-        const walk = scanTree(obj.content);
+        if (obj.type !== "tree") {
+          this.error(`Object ${id} not a tree`);
+          return;
+        }
+        t.addFlags(n, PARSED);
+        const walk = scanTree(obj.content, this.walkTable);
         if (walk.initError) {
           this.error(walk.initError);
           return;
@@ -2002,10 +2485,8 @@ class FsckRun {
         return;
       }
       case OBJ_COMMIT: {
-        if (!(t.flags(n) & PARSED)) {
-          this.error(`Could not read ${id}`);
-          return;
-        }
+        // the parse reported why it failed
+        if (!(t.flags(n) & PARSED)) return;
         const links = t.links.get(n);
         if (!links || links.tree === undefined) return;
         if (name !== undefined) this.putName(t.id(links.tree), `${name}:`);
@@ -2045,10 +2526,7 @@ class FsckRun {
       }
       case OBJ_TAG: {
         const links = t.links.get(n);
-        if (!(t.flags(n) & PARSED)) {
-          this.error(`Could not read ${id}`);
-          return;
-        }
+        if (!(t.flags(n) & PARSED)) return;
         if (links?.tagged === undefined) return;
         if (name !== undefined) this.putName(t.id(links.tagged), name);
         const marked = this.markObject(links.tagged, "any", n);
@@ -2057,6 +2535,52 @@ class FsckRun {
       }
       default:
         this.error(`Unknown object type for ${this.describe(id)}`);
+    }
+  }
+
+  /**
+   * The walk of tree `n` from what the scan kept (`scanAt` start `s`): parse_object's lookup
+   * and parse, then the tree's entries, looked up in order and marked. Synchronous while every
+   * entry is marked without a report; the steps for the rest otherwise.
+   */
+  private walkScannedTree(n: number, s: number): Steps<void> | undefined {
+    const t = this.t;
+    const kids = this.scanKids;
+    t.touch(n);
+    t.setType(n, OBJ_TREE);
+    t.addFlags(n, PARSED);
+    this.objectsRead++;
+    for (let i = s + 1, end = s + 1 + ((kids[s] as number) >> 2); i < end; i++) {
+      const v = kids[i] as number;
+      const type = v & 1 ? OBJ_TREE : OBJ_BLOB;
+      const child = t.lookupTypedN(v >> 1, type);
+      if (typeof child === "number" && this.markReachable(child, type)) continue;
+      return this.walkScannedRest(n, s, i, child);
+    }
+    return undefined;
+  }
+
+  /** `walkScannedTree` from entry `i` on, whose lookup gave `child`. */
+  private *walkScannedRest(
+    n: number,
+    s: number,
+    i: number,
+    child: number | { error: string },
+  ): Steps<void> {
+    const t = this.t;
+    const kids = this.scanKids;
+    for (const end = s + 1 + ((kids[s] as number) >> 2); ; ) {
+      const type = (kids[i] as number) & 1 ? OBJ_TREE : OBJ_BLOB;
+      let c: number | undefined;
+      if (typeof child === "number") c = child;
+      else this.error(child.error);
+      if (!this.markReachable(c, type)) {
+        const r = this.markObject(c, type, n);
+        if (r instanceof Promise) yield r;
+      }
+      if (++i >= end) return;
+      const v = kids[i] as number;
+      child = t.lookupTypedN(v >> 1, v & 1 ? OBJ_TREE : OBJ_BLOB);
     }
   }
 
@@ -2079,9 +2603,15 @@ class FsckRun {
     if (type === OBJ_TREE) {
       const obj = await this.readWhole(id);
       if (!obj) return;
+      if (obj.type !== "tree") {
+        // git's parse_tree
+        this.error(`Object ${id} not a tree`);
+        return;
+      }
       this.walkUsed(n, obj.content);
     } else if (type === OBJ_COMMIT || type === OBJ_TAG) {
-      if (!(t.flags(n) & PARSED)) await this.parseObject(id);
+      // repo_parse_commit / parse_tag: no hash check
+      if (!(t.flags(n) & PARSED)) await this.parseAs(n, id);
       if (t.flags(n) & PARSED) this.walkUsed(n, new Uint8Array(0));
     }
   }
@@ -2089,8 +2619,28 @@ class FsckRun {
   /** git's `check_connectivity`. */
   private async checkConnectivity(): Promise<void> {
     const t = this.t;
-    while (this.pending.length > 0) {
-      const r = runSteps(this.traverseOne(this.pending.pop() as number));
+    const pending = this.pending;
+    const scanAt = this.scanAt;
+    while (pending.length > 0) {
+      const n = pending.pop() as number;
+      // fsck_walk returns at once for a blob
+      if (t.type(n) === OBJ_BLOB) continue;
+      // a tree the scan kept, walked without steps while it needs no await
+      const s = n < scanAt.length ? (scanAt[n] as number) - 1 : -1;
+      if (
+        s >= 0 &&
+        ((this.scanKids[s] as number) & 3) === OBJ_TREE &&
+        !(t.flags(n) & PARSED) &&
+        t.type(n) === OBJ_TREE
+      ) {
+        const rest = this.walkScannedTree(n, s);
+        if (rest) {
+          const r = runSteps(rest);
+          if (r instanceof Promise) await r;
+        }
+        continue;
+      }
+      const r = runSteps(this.traverseOne(n));
       if (r instanceof Promise) await r;
     }
     if (this.o.connectivityOnly && (this.o.dangling || this.o.lostFound)) {

@@ -5,6 +5,7 @@
  */
 
 import {
+  type CommitGraphPrefetch,
   type CommitGraphProvider,
   type CommitGraphSettings,
   type CommitGraphSplitStrategy,
@@ -163,6 +164,8 @@ export interface WriteCommitGraphOptions {
   replaceRefs?: boolean;
   /** The user's environment: the global and system config files are read too */
   environment?: GitHostEnvironment;
+  /** When the changed-path filters' trees are unpacked in pack order first (tuning) */
+  prefetch?: CommitGraphPrefetch;
 }
 
 /**
@@ -227,6 +230,7 @@ export async function writeCommitGraph(
       maxNewFilters: options.maxNewFilters ?? settings.maxNewFilters,
       generationVersion: settings.generationVersion,
       changedPathsVersion: settings.changedPathsVersion,
+      prefetch: options.prefetch,
     });
   } finally {
     options.commitGraph?.invalidate();

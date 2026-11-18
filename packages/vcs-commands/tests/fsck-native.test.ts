@@ -34,7 +34,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deflateSync, inflateSync } from "node:zlib";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
 import type { GitObjects } from "@statewalker/vcs-core";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
@@ -1213,5 +1213,243 @@ describeGit("fsck against native git", () => {
     r = await compare(dir, []);
     expect(r.stderr).toContain("error: one or more commit-graph chain files could not be loaded");
     expect(r.exit).toBe(16);
+  });
+
+  /**
+   * Every object of `dir` as `{ id, type, data }`, its loose files and packs removed: the
+   * repository's objects are then written again as the test forges them.
+   */
+  function takeObjects(dir: string): { id: string; type: string; data: Buffer }[] {
+    const list = native(dir, [
+      "cat-file",
+      "--batch-all-objects",
+      "--batch-check=%(objectname) %(objecttype)",
+    ]).stdout;
+    const objects = list
+      .trim()
+      .split("\n")
+      .map((l) => {
+        const [id, type] = l.split(" ") as [string, string];
+        return { id, type, data: spawnSync("git", ["cat-file", type, id], { cwd: dir }).stdout };
+      });
+    const od = join(dir, ".git", "objects");
+    for (const d of readdirSync(od)) {
+      if (d.length === 2 || d === "pack") rmSync(join(od, d), { recursive: true, force: true });
+    }
+    return objects;
+  }
+
+  /**
+   * Writes a pack and its idx of `entries` under the ids given, whatever their bytes hash to:
+   * whole objects (`type`, `data`) and OFS_DELTAs on an earlier entry (`ofs`, `delta`).
+   */
+  function forgedPack(
+    dir: string,
+    entries: (
+      | { id: string; type: string; data: Buffer }
+      | { id: string; ofs: number; delta: Buffer }
+    )[],
+  ): void {
+    const kinds: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+    const header = (kind: number, size: number) => {
+      const out: number[] = [];
+      let b = (kind << 4) | (size & 15);
+      let rest = Math.floor(size / 16);
+      while (rest > 0) {
+        out.push(b | 0x80);
+        b = rest & 0x7f;
+        rest = Math.floor(rest / 128);
+      }
+      out.push(b);
+      return Buffer.from(out);
+    };
+    const head = Buffer.alloc(12);
+    head.write("PACK");
+    head.writeUInt32BE(2, 4);
+    head.writeUInt32BE(entries.length, 8);
+    const parts: Buffer[] = [head];
+    const rows: { id: string; at: number; crc: number }[] = [];
+    let at = 12;
+    for (const e of entries) {
+      let raw: Buffer;
+      if ("type" in e) {
+        raw = Buffer.concat([header(kinds[e.type] as number, e.data.length), deflateSync(e.data)]);
+      } else {
+        let back = at - (rows[e.ofs] as { at: number }).at;
+        const ofs = [back & 0x7f];
+        back = Math.floor(back / 128);
+        while (back > 0) {
+          back--;
+          ofs.unshift(0x80 | (back & 0x7f));
+          back = Math.floor(back / 128);
+        }
+        raw = Buffer.concat([header(6, e.delta.length), Buffer.from(ofs), deflateSync(e.delta)]);
+      }
+      rows.push({ id: e.id, at, crc: crc32(raw) >>> 0 });
+      parts.push(raw);
+      at += raw.length;
+    }
+    const body = Buffer.concat(parts);
+    const sum = createHash("sha1").update(body).digest();
+    const sorted = [...rows].sort((a, b) => (a.id < b.id ? -1 : 1));
+    const fan = Buffer.alloc(1024);
+    for (let i = 0; i < 256; i++) {
+      fan.writeUInt32BE(
+        sorted.filter((r) => Number.parseInt(r.id.slice(0, 2), 16) <= i).length,
+        i * 4,
+      );
+    }
+    const crcs = Buffer.alloc(4 * sorted.length);
+    const offs = Buffer.alloc(4 * sorted.length);
+    sorted.forEach((r, i) => {
+      crcs.writeUInt32BE(r.crc, 4 * i);
+      offs.writeUInt32BE(r.at, 4 * i);
+    });
+    const idxBody = Buffer.concat([
+      Buffer.from([0xff, 0x74, 0x4f, 0x63, 0, 0, 0, 2]),
+      fan,
+      ...sorted.map((r) => Buffer.from(r.id, "hex")),
+      crcs,
+      offs,
+      sum,
+    ]);
+    const packDir = join(dir, ".git", "objects", "pack");
+    mkdirSync(packDir, { recursive: true });
+    const name = sum.toString("hex");
+    writeFileSync(join(packDir, `pack-${name}.pack`), Buffer.concat([body, sum]));
+    writeFileSync(
+      join(packDir, `pack-${name}.idx`),
+      Buffer.concat([idxBody, createHash("sha1").update(idxBody).digest()]),
+    );
+  }
+
+  /** A history with nested trees and an index (with its cache-tree) native git wrote. */
+  function nestedRepo(): string {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n", "d/x": "x\n", "d/e/y": "y\n" }, "one");
+    commitFiles(dir, { a: "a2\n", "d/x": "x2\n" }, "two");
+    return dir;
+  }
+  const both = async (dir: string) => {
+    await compare(dir, []);
+    await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+  };
+
+  it("parse_object checks the hash of what it reads: refs, reflog entries, the cache-tree", async () => {
+    // a packed subtree holding another tree's bytes (reached from the cache-tree)
+    let dir = nestedRepo();
+    const sub = g(dir, "rev-parse", "HEAD:d");
+    const other = g(dir, "rev-parse", "HEAD:d/e");
+    let objects = takeObjects(dir);
+    const otherData = (objects.find((o) => o.id === other) as { data: Buffer }).data;
+    forgedPack(
+      dir,
+      objects.map((o) => (o.id === sub ? { ...o, data: otherData } : o)),
+    );
+    let r = await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    expect(r.stderr).toContain(`error: hash mismatch ${sub}`);
+    expect(r.stderr).toContain(`error: ${sub}: invalid sha1 pointer in cache-tree of .git/index`);
+    await compare(dir, []);
+
+    // the same tree loose and sound too: the packed copy is read first, as git reads it
+    const sound = spawnSync("git", ["cat-file", "tree", sub], { cwd: dir }).stdout;
+    writeLoose(dir, bytesOf(`tree ${sound.length}\0`, sound), sub);
+    await both(dir);
+
+    // a commit only a reflog names, holding another commit's bytes
+    dir = nestedRepo();
+    const c3 = commitFiles(dir, { a: "a3\n" }, "three");
+    g(dir, "reset", "-q", "--hard", "HEAD~1");
+    const c2 = g(dir, "rev-parse", "HEAD");
+    objects = takeObjects(dir);
+    const c2Data = (objects.find((o) => o.id === c2) as { data: Buffer }).data;
+    forgedPack(
+      dir,
+      objects.map((o) => (o.id === c3 ? { ...o, data: c2Data } : o)),
+    );
+    r = await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    expect(r.stderr).toContain(`error: hash mismatch ${c3}`);
+    expect(r.stderr).toContain(`error: Unknown object type for ${c3}`);
+    await compare(dir, []);
+
+    // the commit a branch names, holding its parent's bytes
+    dir = nestedRepo();
+    const tip = g(dir, "rev-parse", "HEAD");
+    const parent = g(dir, "rev-parse", "HEAD~1");
+    objects = takeObjects(dir);
+    const parentData = (objects.find((o) => o.id === parent) as { data: Buffer }).data;
+    forgedPack(
+      dir,
+      objects.map((o) => (o.id === tip ? { ...o, data: parentData } : o)),
+    );
+    r = await compare(dir, []);
+    expect(r.stderr).toContain(`error: refs/heads/main: invalid sha1 pointer ${tip}`);
+    await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+  });
+
+  it("the walk reads typed objects as git's parse_tree and parse_commit: Object <id> not a <type>", async () => {
+    // a tree's id whose entry is an OFS_DELTA on a blob (so a blob)
+    let dir = nestedRepo();
+    const sub = g(dir, "rev-parse", "HEAD:d");
+    const blob = g(dir, "rev-parse", "HEAD:a");
+    const objects = takeObjects(dir);
+    const tree = objects.find((o) => o.id === sub) as { data: Buffer };
+    const base = objects.find((o) => o.id === blob) as { data: Buffer };
+    const entries: Parameters<typeof forgedPack>[1] = objects.filter((o) => o.id !== sub);
+    const at = entries.findIndex((o) => o.id === blob);
+    // a delta inserting the tree's bytes whole
+    const varint = (n: number) => {
+      const out: number[] = [];
+      do {
+        let b = n & 0x7f;
+        n = Math.floor(n / 128);
+        if (n) b |= 0x80;
+        out.push(b);
+      } while (n);
+      return Buffer.from(out);
+    };
+    const inserts: Buffer[] = [];
+    for (let i = 0; i < tree.data.length; i += 127) {
+      const chunk = tree.data.subarray(i, i + 127);
+      inserts.push(Buffer.from([chunk.length]), chunk);
+    }
+    entries.push({
+      id: sub,
+      ofs: at,
+      delta: Buffer.concat([varint(base.data.length), varint(tree.data.length), ...inserts]),
+    });
+    forgedPack(dir, entries);
+    const r = await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    expect(r.stderr).toContain(`error: Object ${sub} not a tree`);
+    await compare(dir, []);
+
+    // a tree entry naming a commit as a blob, a commit whose parent is a blob
+    dir = nestedRepo();
+    const t = g(dir, "rev-parse", "HEAD:d");
+    const b = g(dir, "rev-parse", "HEAD:a");
+    const bad = literal(
+      dir,
+      "tree",
+      bytesOf("100644 f\0", Buffer.from(t, "hex"), "40000 g\0", Buffer.from(b, "hex")),
+    );
+    const c = literal(
+      dir,
+      "commit",
+      `tree ${bad}\nparent ${b}\nauthor A <a@x> 1 +0000\ncommitter C <c@x> 1 +0000\n\nm\n`,
+    );
+    g(dir, "update-ref", "refs/heads/bad", c);
+    const w = await compare(dir, ["--connectivity-only"], (x) => x.setConnectivityOnly(true));
+    expect(w.stderr).toContain(`error: Object ${b} not a commit`);
+    await compare(dir, []);
+  });
+
+  it("a grafts file: the deprecation hint, as each version words it", async () => {
+    const dir = nestedRepo();
+    writeFileSync(join(dir, ".git", "info", "grafts"), `${g(dir, "rev-parse", "HEAD")}\n`);
+    const r = await compare(dir, []);
+    expect(r.stderr).toContain("hint: Support for <GIT_DIR>/info/grafts is deprecated");
+    await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    g(dir, "config", "advice.graftFileDeprecated", "false");
+    expect((await compare(dir, [])).stderr).not.toContain("hint:");
   });
 });

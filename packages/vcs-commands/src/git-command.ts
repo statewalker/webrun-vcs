@@ -16,12 +16,14 @@ import type {
 } from "@statewalker/vcs-core";
 import { isSymbolicRef } from "@statewalker/vcs-core";
 import {
+  type AttributesSourceResolver,
   basicStatMatches,
   compareWithWorktree,
   type Staging,
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
+import { attributesSourceResolver } from "./commands/attributes-source.js";
 import {
   configLoadError,
   createIdAbbreviator,
@@ -193,6 +195,26 @@ export abstract class GitCommand<T> {
 
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
+    this.installAttributesSource();
+  }
+
+  /**
+   * Lets git's content filter resolve an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`)
+   * with git's revision syntax over this repository.
+   */
+  private installAttributesSource(): void {
+    let worktree: Worktree | undefined;
+    try {
+      worktree = this._workingCopy.worktree;
+    } catch {
+      // a bare repository's working copy refuses its worktree
+      return;
+    }
+    const filter = worktree?.contentFilter as
+      | { setAttributesSourceResolver?: (resolve: AttributesSourceResolver) => void }
+      | undefined;
+    if (!filter?.setAttributesSourceResolver || !this._workingCopy.history) return;
+    filter.setAttributesSourceResolver(attributesSourceResolver(() => this.revisionResolver()));
   }
 
   /**
