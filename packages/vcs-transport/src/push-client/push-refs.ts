@@ -6,6 +6,8 @@
 
 import type { RemoteRef } from "../fetch-client/index.js";
 import { ZERO_OID } from "../protocol/index.js";
+import type { AbbrevLengths } from "../summary/index.js";
+import { pushStatusParts } from "./push-status.js";
 
 /** A refspec could not be resolved (git's push dies before it connects to send anything). */
 export class PushRefspecError extends Error {
@@ -425,42 +427,18 @@ export async function setPushStatus(
   return updates;
 }
 
-/** git's status column for an update (`print_one_push_status`). */
-export function pushSummary(update: PushRefUpdate): string {
-  const abbrev = (oid: string) => oid.slice(0, 7);
-  switch (update.status) {
-    case "up-to-date":
-      return "[up to date]";
-    case "rejected-nonfastforward":
-      return "[rejected] (non-fast-forward)";
-    case "rejected-fetch-first":
-      return "[rejected] (fetch first)";
-    case "rejected-needs-force":
-      return "[rejected] (needs force)";
-    case "rejected-already-exists":
-      return "[rejected] (already exists)";
-    case "rejected-stale":
-      return "[rejected] (stale info)";
-    case "rejected-nodelete":
-      return "[rejected] (remote does not support deleting refs)";
-    case "atomic-push-failed":
-      return "[rejected] (atomic push failed)";
-    case "remote-rejected":
-      return `[remote rejected] (${update.message ?? "failed"})`;
-    case "remote-failure":
-      return "[remote failure] (remote failed to report status)";
-    case "ok":
-      if (update.newOid === ZERO_OID) return "[deleted]";
-      if (update.oldOid === ZERO_OID) {
-        if (update.remoteRef.startsWith("refs/tags/")) return "[new tag]";
-        if (update.remoteRef.startsWith("refs/heads/")) return "[new branch]";
-        return "[new reference]";
-      }
-      if (update.forced) {
-        return `+ ${abbrev(update.oldOid)}...${abbrev(update.newOid)} (forced update)`;
-      }
-      return `${abbrev(update.oldOid)}..${abbrev(update.newOid)}`;
+/**
+ * git's status column for an update (`print_one_push_status`), with its reason in
+ * parentheses (`[rejected] (fetch first)`) and a `+ ` before a forced update; ids abbreviated
+ * by `lengths` (git's find_unique_abbrev under `core.abbrev`), 7 digits without.
+ */
+export function pushSummary(update: PushRefUpdate, lengths?: AbbrevLengths): string {
+  const parts = pushStatusParts(update, lengths);
+  if (update.status === "ok" && parts.flag === "+") {
+    return `+ ${parts.summary} (${parts.message})`;
   }
+  if (update.status === "ok" || update.status === "up-to-date") return parts.summary;
+  return parts.message !== undefined ? `${parts.summary} (${parts.message})` : parts.summary;
 }
 
 /** Whether a status is a success (`ok`, `up-to-date`). */

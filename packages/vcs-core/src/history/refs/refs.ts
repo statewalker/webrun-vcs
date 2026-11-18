@@ -181,6 +181,15 @@ export interface Refs {
   getShallow?(): Promise<ObjectId[]>;
 
   /**
+   * The text of the repository's grafts file (git's `info/grafts`: `<commit> <parent>...`
+   * per line, deprecated in favour of replace refs); undefined when there is none. History
+   * walks read commits with these parents (see `loadObjectReplacements`).
+   *
+   * Optional: a store without it has no grafts.
+   */
+  readGrafts?(): Promise<string | undefined>;
+
+  /**
    * Replace the shallow commits (an empty list makes the repository complete again: git
    * removes the `shallow` file). With `expected` (the list the caller read), a store whose
    * shallow commits changed meanwhile refuses the write, as git's

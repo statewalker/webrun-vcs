@@ -48,6 +48,13 @@ export interface GitHostEnvironment {
    * read after `user.email`). git then guesses `user@host`; a portable host does not.
    */
   defaultEmail?: string;
+  /**
+   * `$GIT_NO_REPLACE_OBJECTS` is set (to anything): replace refs are not applied, as with
+   * `core.useReplaceRefs=false` (git's `disable_replace_refs`)
+   */
+  noReplaceObjects?: boolean;
+  /** `$GIT_REPLACE_REF_BASE`: where replace refs live (default `refs/replace/`) */
+  replaceRefBase?: string;
 }
 
 const join = (dir: string, name: string) =>

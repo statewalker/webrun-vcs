@@ -8,7 +8,9 @@ import {
   EMPTY_TREE_ID,
   type GitObject,
   type ObjectId,
+  type ObjectReplacements,
   parseGraphCommit,
+  replacementOf,
 } from "@statewalker/vcs-core";
 import { OrderedMap } from "@statewalker/vcs-utils";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -449,8 +451,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // a shallow commit has no parents (git's shallow grafts); the graph is off then
     const shallowIds = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
     const shallow = new Set(shallowIds);
+    // replace refs and grafts (git's parse_commit applies both; no commit-graph then)
+    const replacements = await this.objectReplacements();
     const graph =
-      shallow.size > 0 ? undefined : await this.commits.commitGraph?.get().catch(() => undefined);
+      shallow.size > 0 || replacements
+        ? undefined
+        : await this.commits.commitGraph?.get().catch(() => undefined);
     const pathspec = prune ? this.pathspec() : undefined;
     const bloom =
       pathspec && this.useBloomFilters ? this.bloomKeys(graph, pathspec.items) : undefined;
@@ -484,7 +490,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         }
       }
       const id = t.idOf(n);
-      const header = await this.readCommitHeader(id);
+      const header = await this.readCommitHeader(id, replacements);
       if (!header) return false;
       const parents = shallow.has(id) ? [] : header.parents;
       t.setParsed(n, header.date, false, header.tree, parents.length);
@@ -584,8 +590,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (this.revFilter === RevFilter.ONLY_MERGES && parents < 2) return undefined;
       if (this.revFilter === RevFilter.NO_MERGES && parents > 1) return undefined;
       const id = t.idOf(n);
-      const commit = bytes ? decodeCommit(bytes) : await this.commits.load(id);
+      const commit = bytes ? decodeCommit(bytes) : await this.walkCommits.load(id);
       if (!commit) return undefined;
+      const grafted = bytes ? replacements?.grafts.get(id) : undefined;
+      if (grafted) commit.parents = [...grafted];
       if (this.authorPattern !== undefined && !this.matchesAuthor(commit)) return undefined;
       if (this.committerPattern !== undefined && !this.matchesCommitter(commit)) return undefined;
       return { ...commit, id };
@@ -702,7 +710,15 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   private async readCommitHeader(
     id: ObjectId,
+    replacements?: ObjectReplacements,
   ): Promise<{ tree: ObjectId; parents: ObjectId[]; date: number; raw?: Uint8Array } | undefined> {
+    if (replacements) {
+      // the replacement's content read in place of the commit's; its grafted parents
+      const read = replacementOf(replacements.replace, id);
+      const header = await this.readCommitHeader(read);
+      const grafted = replacements.grafts.get(id);
+      return header && grafted ? { ...header, parents: [...grafted] } : header;
+    }
     const objects = this._workingCopy.history?.objects;
     if (objects) {
       let obj: GitObject | undefined;

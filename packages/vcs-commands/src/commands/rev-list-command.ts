@@ -107,7 +107,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     const resolver = this.revisionResolver();
     const options = {
       committish: this.committish,
-      mergeBases: (a: string, b: string) => revisionMergeBases(this.commits, a, b),
+      mergeBases: (a: string, b: string) => revisionMergeBases(this.walkCommits, a, b),
     };
     const parsed: ParsedRevisionArgs = await parseRevisionArgs(resolver, this.revisions, options);
     if (this.mixed.length === 0) return { ...parsed, paths: [] };
@@ -128,6 +128,8 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.checkCallable();
     this.setCallable(false);
     const log = new LogCommand(this._workingCopy);
+    if (this.useReplaceRefsOverride !== undefined)
+      log.setUseReplaceRefs(this.useReplaceRefsOverride);
     for (const configure of this.configure) configure(log);
     // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none
     const named = (args: string[]) => args.some((arg) => arg !== "--not" && arg !== "--");

@@ -189,7 +189,7 @@ describe("planRefUpdates (git's update_local_ref)", () => {
       );
     expect((await plan(true)).map((u) => [u.status, u.summary])).toEqual([
       ["forced", `+ ${A.slice(0, 7)}...${B.slice(0, 7)}`],
-      ["forced", `+ ${D.slice(0, 7)}...${T.slice(0, 7)}`],
+      ["forced", "[tag update]"],
     ]);
     expect((await plan(false, { force: true })).map((u) => u.status)).toEqual(["forced", "forced"]);
     expect((await plan(false)).map((u) => u.reason)).toEqual([

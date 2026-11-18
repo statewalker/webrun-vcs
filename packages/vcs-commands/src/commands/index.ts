@@ -30,6 +30,7 @@ export {
 } from "./merge-drivers.js";
 export { CleanupMode, stripspace } from "./message-cleanup.js";
 export * from "./pack-refs-command.js";
+export * from "./pretty-format.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";
 export * from "./rebase-command.js";

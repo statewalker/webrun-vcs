@@ -25,7 +25,7 @@ import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { localTimezoneOffset } from "./git-ident.js";
 import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
-import { configBool, conflictStyleOf } from "./merge-config.js";
+import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
   conflictsComment,
@@ -42,6 +42,7 @@ import {
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { type PatchIdTrees, patchId } from "./patch-id.js";
+import { formatCommitPretty } from "./pretty-format.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { expandCommitId, expandCommitIds } from "./sequencer-pick.js";
 import {
@@ -96,6 +97,11 @@ const DIR = "rebase-merge";
 interface TodoItem {
   action: RebaseAction;
   id: ObjectId;
+  /**
+   * The line's text after the id (`# <subject>`, as `rebase.instructionFormat` made it, or as
+   * the todo file has it): written back unchanged, and what `Could not apply` names
+   */
+  rest?: string;
 }
 
 /** git's quoting of a value in `author-script` (`'...'`, a quote as `'\''`). */
@@ -663,8 +669,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           'hint: "git add/rm <conflicted_files>", then run "git rebase --continue".',
           'hint: You can instead skip this commit: run "git rebase --skip".',
           'hint: To abort and get back to the state before "git rebase", run "git rebase --abort".',
-          // the todo line's rest as git 2.5x writes it (`# <subject>`)
-          `Could not apply ${short}... # ${subject}`,
+          // the todo line's rest (`# <subject>`, or as `rebase.instructionFormat` made it)
+          `Could not apply ${short}... ${item.rest ?? (await this.instructionText(item.id))}`,
         ].join("\n"),
       };
     }
@@ -955,15 +961,35 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private async todoText(todo: TodoItem[]): Promise<string> {
     let out = "";
     for (const item of todo) {
-      let subject = this.subjects.get(item.id);
-      if (subject === undefined) {
-        subject = subjectOf((await this.commits.load(item.id))?.message ?? "");
-        this.subjects.set(item.id, subject);
-      }
-      // git 2.5x's make_script with its default `rebase.instructionFormat` (`# %s`)
-      out += `${item.action} ${item.id} # ${subject}\n`;
+      item.rest ??= await this.instructionText(item.id);
+      out += `${item.action} ${item.id}${item.rest ? ` ${item.rest}` : ""}\n`;
     }
     return out;
+  }
+
+  /**
+   * The text after a pick's id, as git 2.5x's sequencer_make_script writes it: the commit
+   * through `rebase.instructionFormat` (default `# %s`; a format that does not start with
+   * `#` gets `# ` before it), `%h` unabbreviated (its pretty context has abbrev 0), trailing
+   * blanks dropped.
+   */
+  private async instructionText(id: ObjectId): Promise<string> {
+    let format = configValue(this.workingCopy, "rebase.instructionFormat") ?? "";
+    if (format === "") format = "# %s";
+    if (!format.startsWith("#")) format = `# ${format}`;
+    if (format === "# %s") {
+      let subject = this.subjects.get(id);
+      if (subject === undefined) {
+        subject = subjectOf((await this.commits.load(id))?.message ?? "");
+        this.subjects.set(id, subject);
+      }
+      return `# ${subject}`;
+    }
+    const commit = await this.commits.load(id);
+    if (!commit) return format;
+    // the list goes through the todo editing's stripspace: no trailing blanks
+    const text = await formatCommitPretty(format, commit, id, { now: this.clock() });
+    return text.replace(/[ \t]+$/, "");
   }
 
   private async readTodoFile(state: OperationState, name: string): Promise<TodoItem[]> {
@@ -980,17 +1006,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       f: RebaseAction.FIXUP,
       fixup: RebaseAction.FIXUP,
     };
-    const lines: { action: RebaseAction; id: string }[] = [];
+    const lines: { action: RebaseAction; id: string; rest: string }[] = [];
     for (const line of text.split("\n")) {
-      const match = /^(\w+)\s+([0-9a-f]{4,64})/.exec(line.trim());
+      // the rest of the line kept as written (trailing blanks included), as git's parse_insn_line
+      const match = /^(\w+)[ \t]+([0-9a-f]{4,64})(?:[ \t]+(.*))?$/.exec(line.trimStart());
       if (!match || !actions[match[1]]) continue;
-      lines.push({ action: actions[match[1]], id: match[2] });
+      lines.push({ action: actions[match[1]], id: match[2], rest: match[3] ?? "" });
     }
     const ids = await expandCommitIds(
       { commits: this.commits, refs: this.refsStore, state },
       lines.map((l) => l.id),
     );
-    return lines.map((l, k) => ({ action: l.action, id: ids[k] }));
+    return lines.map((l, k) => ({ action: l.action, id: ids[k], rest: l.rest }));
   }
 
   /**

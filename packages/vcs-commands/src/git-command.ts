@@ -14,7 +14,14 @@ import type {
   TreeEntry,
   Trees,
 } from "@statewalker/vcs-core";
-import { isSymbolicRef } from "@statewalker/vcs-core";
+import {
+  createReplacedCommits,
+  hasReplacements,
+  isSymbolicRef,
+  type LoadedObjectReplacements,
+  loadObjectReplacements,
+} from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   type AttributesSourceResolver,
   basicStatMatches,
@@ -45,13 +52,13 @@ import {
   type WorktreeLookup,
 } from "./commands/revision-filenames.js";
 import { type ResolveOptions, RevisionResolver } from "./commands/revision-resolver.js";
-
 import {
   InvalidConfigError,
   NoHeadError,
   NotACommitError,
   RefNotFoundError,
 } from "./errors/index.js";
+import { RemoteConfigStore } from "./remote-config/index.js";
 
 /**
  * Extended Trees interface with legacy method names for command compatibility.
@@ -189,6 +196,11 @@ export abstract class GitCommand<T> {
   protected readonly _workingCopy: WorkingCopy;
   private callable = true;
   private racyCheckInstalled = false;
+  /** `--no-replace-objects` (false) or not given (undefined: config and environment decide) */
+  protected useReplaceRefsOverride?: boolean;
+  /** The commits as history walks read them (see {@link walkCommits}), made once */
+  private walkCommitsView?: CommandCommits;
+  private replacementsLoad?: Promise<LoadedObjectReplacements | undefined>;
   private reflogActionOverride?: string;
   /** The time of this command's reflog lines, read once (git's ident_default_date). */
   private reflogClock?: number;
@@ -325,6 +337,58 @@ export abstract class GitCommand<T> {
       throw new Error("WorkingCopy.history is required for commands");
     }
     return wrapCommits(this._workingCopy.history.commits as unknown as Commits);
+  }
+
+  /**
+   * Whether replace refs apply to this command's history walks: `false` is git's
+   * `--no-replace-objects`. Unset, `core.useReplaceRefs` (default true) decides, and
+   * `GIT_NO_REPLACE_OBJECTS` in the host environment turns them off.
+   */
+  setUseReplaceRefs(use: boolean): this {
+    this.checkCallable();
+    this.useReplaceRefsOverride = use;
+    return this;
+  }
+
+  /** Whether replace refs apply (see {@link setUseReplaceRefs}). */
+  protected useReplaceRefs(): boolean {
+    if (this.useReplaceRefsOverride !== undefined) return this.useReplaceRefsOverride;
+    if (hostEnvironmentOf(this._workingCopy)?.noReplaceObjects) return false;
+    const value = this._workingCopy.config
+      ? RemoteConfigStore.from(this._workingCopy).value("core.useReplaceRefs")
+      : undefined;
+    return parseGitBool(value) ?? true;
+  }
+
+  /**
+   * The commits as git's history walks read them (log, rev-list, merge bases, `HEAD~2`): an
+   * object replaced by `refs/replace/<id>` read as its replacement, a commit in `info/grafts`
+   * with its grafted parents (see `createReplacedCommits`). Without replace refs or grafts it
+   * reads as {@link commits}.
+   */
+  protected get walkCommits(): CommandCommits {
+    this.walkCommitsView ??= createReplacedCommits(this.commits, () =>
+      this.objectReplacements(),
+    ) as CommandCommits;
+    return this.walkCommitsView;
+  }
+
+  /**
+   * The replace refs and grafts this command's history walks apply, read once; undefined
+   * when there are none (or they cannot be read).
+   */
+  protected objectReplacements(): Promise<LoadedObjectReplacements | undefined> {
+    if (!this.replacementsLoad) {
+      const replaceRefBase = hostEnvironmentOf(this._workingCopy)?.replaceRefBase;
+      this.replacementsLoad = loadObjectReplacements({
+        refs: this.refsStore,
+        useReplaceRefs: this.useReplaceRefs(),
+        ...(replaceRefBase ? { replaceRefBase } : {}),
+      })
+        .then((r) => (hasReplacements(r) ? r : undefined))
+        .catch(() => undefined);
+    }
+    return this.replacementsLoad;
   }
 
   /**
@@ -487,7 +551,7 @@ export abstract class GitCommand<T> {
   protected revisionResolver(): RevisionResolver {
     return new RevisionResolver({
       refs: this.refsStore,
-      commits: this.commits,
+      commits: this.walkCommits,
       trees: this.trees,
       blobs: this.blobs,
       tags: this.tagsStore,

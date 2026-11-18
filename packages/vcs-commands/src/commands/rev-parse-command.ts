@@ -260,7 +260,7 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
   }
 
   private mergeBases(a: ObjectId, b: ObjectId): Promise<ObjectId[]> {
-    return revisionMergeBases(this.commits, a, b);
+    return revisionMergeBases(this.walkCommits, a, b);
   }
 }
 

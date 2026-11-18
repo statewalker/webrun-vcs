@@ -5,5 +5,6 @@
 
 export * from "./connection.js";
 export * from "./push-refs.js";
+export * from "./push-status.js";
 export * from "./revision.js";
 export * from "./send-pack.js";

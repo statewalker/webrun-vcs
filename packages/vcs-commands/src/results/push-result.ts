@@ -69,6 +69,13 @@ export interface PushResult {
   objectCount: number;
   /** Server messages */
   messages: string[];
+  /**
+   * The report git prints on stderr (`To <url>`, ` * [new branch]  main -> main`,
+   * `   1a2b3c4..5d6e7f8  main -> main`, ` ! [rejected]  main -> main (fetch first)`,
+   * `Everything up-to-date`), ids abbreviated as git's find_unique_abbrev under
+   * `core.abbrev`, the status column `transport_summary_width` wide
+   */
+  display?: string[];
 }
 
 /**

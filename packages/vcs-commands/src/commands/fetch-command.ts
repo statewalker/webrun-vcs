@@ -1,15 +1,19 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 // Import from the package root only: vcs-core ships a single runtime file
 // (dist/index.js); its subpaths resolve for types but not at runtime.
-import { type FilesApi, isSymbolicRef } from "@statewalker/vcs-core";
+import { type FilesApi, isSymbolicRef, parseCoreAbbrev } from "@statewalker/vcs-core";
 import { writeCommitGraph } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
   expandFromDestination,
   type FetchClientResult,
+  type FetchDisplayEntry,
   type FetchHeadEntry,
   type FetchRefUpdate,
+  fetchRefcolWidth,
+  fetchUpdateDisplay,
+  formatFetchDisplay,
   formatFetchHead,
   matchDestination,
   matchSource,
@@ -17,6 +21,8 @@ import {
   type RefSpec,
   type TagMode,
   fetch as transportFetch,
+  transportSummaryWidth,
+  ZERO_OID,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
@@ -611,6 +617,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         ].join(" "),
       ),
       reflogIdent: this.reflogLine("").ident,
+      abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
     });
 
     const advertisedRefs = new Map<string, ObjectId>();
@@ -619,19 +626,20 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     }
     trackingUpdates.push(...result.refUpdates.map(toTrackingRefUpdate));
 
+    const entries = await this.fetchHeadEntries(result, {
+      given: given.length,
+      merge: mergeRefs,
+      // explicit refspecs (and the HEAD of an unconfigured remote) are all to merge;
+      // configured ones only when the first names one ref and no upstream is set
+      explicit: !useConfig,
+      firstIsExact: given.length > 0 && !parseRefSpec(given[0]).wildcard,
+      hasMerge: upstream !== undefined,
+    });
     if (writesFetchHead && checkout?.writeFetchHead) {
-      const entries = await this.fetchHeadEntries(result, {
-        given: given.length,
-        merge: mergeRefs,
-        // explicit refspecs (and the HEAD of an unconfigured remote) are all to merge;
-        // configured ones only when the first names one ref and no upstream is set
-        explicit: !useConfig,
-        firstIsExact: given.length > 0 && !parseRefSpec(given[0]).wildcard,
-        hasMerge: upstream !== undefined,
-      });
       // after the truncation above, every fetch adds its lines
       await checkout.writeFetchHead(formatFetchHead(entries, remoteUrl), { append: true });
     }
+    const display = await this.displayLines(remoteUrl, trackingUpdates, result, entries);
 
     if (followHead) {
       // git: "way too many cases where this can go wrong ... fail silently"
@@ -656,8 +664,89 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       bytesReceived: result.packBytes,
       isEmpty: result.isEmpty,
       messages,
+      display,
       ...(errors.length > 0 ? { errors } : {}),
     };
+  }
+
+  /**
+   * The lines git prints on stderr for the refs (fetch.c display_ref_update, full format):
+   * `From <url>`, the pruned refs (their summary column as wide as their own ids need), then
+   * the refs written or refused, in git's order: those to merge, the others the refspecs and
+   * tag following took, the opportunistic updates, the tags found in the fetched history;
+   * a ref fetched only into `FETCH_HEAD` as ` * branch <ref> -> FETCH_HEAD`. Refs already up
+   * to date are left out (git shows them with `-v`).
+   */
+  private async displayLines(
+    url: string,
+    tracking: readonly TrackingRefUpdate[],
+    result: FetchClientResult,
+    entries: readonly { remoteRef: string; notForMerge: boolean }[],
+  ): Promise<string[]> {
+    const fetchedLocal = new Set(result.fetched.map((f) => f.localRef).filter((l) => l));
+    const backfilled = new Set(result.backfilledTags);
+    // refcol_width, once for every line: the ref map's refs written to a local ref (not the
+    // backfilled tags, not the pruned refs)
+    const refcolWidth = fetchRefcolWidth(
+      result.refUpdates
+        .filter((u) => !backfilled.has(u.localRef))
+        .map((u) => ({
+          remote: u.remoteRef,
+          local: u.localRef,
+          oldOid: u.oldOid,
+          newOid: u.newOid,
+        })),
+    );
+    // the prune's lines come first, with their own summary width (transport_summary_width of
+    // the stale refs: each one's absent old value and its value here)
+    const lines: string[] = [];
+    const pruned = tracking.filter((u) => u.status === RefUpdateStatus.DELETED);
+    if (pruned.length > 0) {
+      const ids = pruned.flatMap((u) => [ZERO_OID, u.oldObjectId ?? ZERO_OID]);
+      const width = transportSummaryWidth(ids, await this.idAbbreviator().lengths(ids));
+      const prunedEntries = pruned.map((u) => ({
+        code: "-",
+        summary: "[deleted]",
+        remote: "(none)",
+        local: u.localRef,
+      }));
+      lines.push(...formatFetchDisplay(prunedEntries, { url, summaryWidth: width, refcolWidth }));
+    }
+    const shown: FetchDisplayEntry[] = [];
+    const toMerge = new Set(entries.filter((e) => !e.notForMerge).map((e) => e.remoteRef));
+    const byLocal = new Map(result.refUpdates.map((u) => [u.localRef, u]));
+    const taken = new Set<string>();
+    const lineOf = (u: FetchRefUpdate | undefined) => {
+      if (!u || taken.has(u.localRef)) return;
+      taken.add(u.localRef);
+      const entry = fetchUpdateDisplay(u);
+      if (entry) shown.push(entry);
+    };
+    for (const merge of [true, false]) {
+      for (const f of result.fetched) {
+        if (toMerge.has(f.remoteRef) !== merge) continue;
+        if (f.localRef) {
+          if (!backfilled.has(f.localRef)) lineOf(byLocal.get(f.localRef));
+        } else if (
+          (this.writeFetchHead || this.dryRun) &&
+          // add_merge_config marks a ref the refspecs took already; only one they did not
+          // take gets an entry of its own
+          !result.fetched.some((o) => o.localRef && o.remoteRef === f.remoteRef)
+        ) {
+          shown.push({
+            code: "*",
+            summary: fetchHeadKind(f.remoteRef),
+            remote: f.remoteRef,
+            local: "FETCH_HEAD",
+          });
+        }
+      }
+    }
+    for (const u of result.refUpdates) if (!fetchedLocal.has(u.localRef)) lineOf(u);
+    for (const tag of result.backfilledTags) lineOf(byLocal.get(tag));
+    const main = formatFetchDisplay(shown, { url, summaryWidth: result.summaryWidth, refcolWidth });
+    // the URL line once, before whichever line comes first
+    return lines.length > 0 ? [...lines, ...main.slice(1)] : main;
   }
 
   /**
@@ -970,6 +1059,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     }
     return found.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
+}
+
+/** fetch.c's kind of a ref fetched into `FETCH_HEAD` only: `branch`, `tag`, … (`branch` else). */
+function fetchHeadKind(name: string): string {
+  if (name.startsWith("refs/tags/")) return "tag";
+  if (name.startsWith("refs/remotes/")) return "remote-tracking branch";
+  return "branch";
 }
 
 /** The transport's tag mode for a {@link TagOption}. */

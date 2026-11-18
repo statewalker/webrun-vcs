@@ -5,6 +5,7 @@
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import type { RefSpec } from "../protocol/index.js";
+import { type AbbrevLengths, abbreviate } from "../summary/index.js";
 import { expandFromSource, matchSource, parseRefSpec } from "../utils/index.js";
 import type { RemoteRef } from "./connection.js";
 
@@ -37,7 +38,11 @@ export interface FetchRefUpdate {
    * store's refusal (`mismatch` when the ref changed meanwhile, `locked`, …).
    */
   reason?: string;
-  /** How git prints it: `[new branch]`, `[new tag]`, `abc1234..def5678`, `+ abc1234...def5678`, `[rejected]`, `[up to date]` */
+  /**
+   * How git prints it: `[new branch]`, `[new tag]`, `abc1234..def5678`, `+ abc1234...def5678`,
+   * `[tag update]` (a forced tag), `[rejected]`, `[up to date]`; ids as long as git's
+   * find_unique_abbrev makes them under `core.abbrev`
+   */
   summary: string;
 }
 
@@ -175,6 +180,11 @@ function dwimRef(spec: RefSpec, byName: Map<string, RemoteRef>): RemoteRef | und
 export interface PlanOptions {
   /** Every update may be a non-fast-forward (git fetch --force) */
   force?: boolean;
+  /**
+   * The abbreviated length of each id in the summaries (git's find_unique_abbrev under
+   * `core.abbrev`; see `abbrevLengthsOf`); 7 digits for an id not there
+   */
+  lengths?: AbbrevLengths;
 }
 
 /**
@@ -197,7 +207,8 @@ export async function planRefUpdates(
     const force = options.force || p.force;
     const base = { remoteRef: p.remoteRef, localRef: p.localRef, oldOid, newOid: p.oid };
     if (!oldOid) {
-      const kind = p.localRef.startsWith("refs/tags/")
+      // update_local_ref names it after the remote ref, "more likely to follow a standard layout"
+      const kind = p.remoteRef.startsWith("refs/tags/")
         ? "tag"
         : p.remoteRef.startsWith("refs/heads/")
           ? "branch"
@@ -209,11 +220,12 @@ export async function planRefUpdates(
       updates.push({ ...base, status: "up-to-date", summary: "[up to date]" });
       continue;
     }
-    const range = `${oldOid.slice(0, 7)}...${p.oid.slice(0, 7)}`;
+    const lengths = options.lengths;
+    const range = `${abbreviate(oldOid, lengths)}...${abbreviate(p.oid, lengths)}`;
     if (p.localRef.startsWith("refs/tags/")) {
       updates.push(
         force
-          ? { ...base, status: "forced", summary: `+ ${range}` }
+          ? { ...base, status: "forced", summary: "[tag update]" }
           : {
               ...base,
               status: "rejected",
@@ -228,7 +240,7 @@ export async function planRefUpdates(
       updates.push({
         ...base,
         status: "fast-forward",
-        summary: `${oldOid.slice(0, 7)}..${p.oid.slice(0, 7)}`,
+        summary: `${abbreviate(oldOid, lengths)}..${abbreviate(p.oid, lengths)}`,
       });
     } else if (force) {
       updates.push({ ...base, status: "forced", summary: `+ ${range}` });

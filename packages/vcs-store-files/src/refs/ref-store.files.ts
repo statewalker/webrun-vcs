@@ -54,6 +54,7 @@ export interface FileRefStoreOptions extends FilesRefBatchOptions {
  */
 /** git's shallow file, relative to the git directory */
 const SHALLOW_FILE = "shallow";
+const GRAFTS_FILE = "info/grafts";
 
 export class FileRefStore implements Refs {
   private readonly ops: FilesRefOps;
@@ -82,6 +83,17 @@ export class FileRefStore implements Refs {
       .split("\n")
       .filter((line) => /^[0-9a-f]{40}$/.test(line))
       .sort();
+  }
+
+  /** The `info/grafts` file's text; undefined when there is none. */
+  async readGrafts(): Promise<string | undefined> {
+    if (!(await this.atomic.exists(GRAFTS_FILE))) return undefined;
+    const decoder = new TextDecoder();
+    let text = "";
+    for await (const chunk of this.atomic.read(GRAFTS_FILE)) {
+      text += decoder.decode(chunk, { stream: true });
+    }
+    return text + decoder.decode();
   }
 
   /**
