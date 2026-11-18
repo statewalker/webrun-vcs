@@ -6,7 +6,7 @@
  * @module
  */
 
-import { ByteLines } from "./byte-lines.js";
+import { ByteLines, LineHasher } from "./byte-lines.js";
 import { xdlHashRecord, xdlRecmatch } from "./xdiff.js";
 
 /**
@@ -190,6 +190,8 @@ export class InternedText {
   private end = 0;
   /** All lines, for an interner with whitespace flags */
   private full: ByteLines | undefined;
+  /** Finds and hashes the lines (as `ByteLines` hashes them) */
+  private hasher: LineHasher | undefined;
 
   constructor(
     readonly interner: LineInterner,
@@ -237,14 +239,13 @@ export class InternedText {
     let { starts, hashes, ids, n } = this;
     let cap = hashes.length;
     let p = this.end;
+    this.hasher ??= new LineHasher(content);
+    const hasher = this.hasher;
     while (p < length && p < len) {
       const b0 = p;
-      let h = 5381;
-      let ch: number;
-      do {
-        ch = content[p++];
-        h = (Math.imul(h, 33) + ch) | 0;
-      } while (ch !== 0x0a && p < len);
+      // the hash ByteLines gives (hashLine): the interner groups lines by it
+      const h = hasher.next(p);
+      p = hasher.end;
       if (n === cap) {
         cap = Math.max(cap * 2, Math.ceil((n * len) / p) + 16);
         const s2 = new Int32Array(cap + 1);

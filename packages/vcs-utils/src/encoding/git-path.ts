@@ -64,7 +64,7 @@ export function decodeGitPath(bytes: Uint8Array): string {
   }
   if (ascii) {
     // short names (the common case) without a decoder
-    if (bytes.length <= 64) return String.fromCharCode(...bytes);
+    if (bytes.length <= 64) return String.fromCharCode.apply(null, bytes as unknown as number[]);
     return fatalDecoder.decode(bytes);
   }
   try {

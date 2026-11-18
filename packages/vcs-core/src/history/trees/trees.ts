@@ -66,6 +66,25 @@ export interface Trees extends ObjectStorage<Tree> {
   getEntry(treeId: ObjectId, name: string): Promise<TreeEntry | undefined>;
 
   /**
+   * The tree's entries in their stored order as one array, without a copy per read: shared
+   * with the store's cache, never to be changed. Undefined if it is absent or not a tree.
+   * Optional: `load` gives fresh copies one by one.
+   *
+   * @example
+   * ```typescript
+   * const entries = (await trees.entries?.(treeId)) ?? (await toArray(await trees.load(treeId)));
+   * ```
+   */
+  entries?(id: ObjectId): Promise<readonly TreeEntry[] | undefined>;
+
+  /**
+   * The tree's content as stored (git's tree format, without the object header), for a walk
+   * that decodes only what it needs (`TreeEntryCursor`): shared with the store's cache, never
+   * to be changed. Undefined if it is absent or not a tree. Optional.
+   */
+  raw?(id: ObjectId): Promise<Uint8Array | undefined>;
+
+  /**
    * Get the well-known empty tree ID
    *
    * The empty tree has a fixed SHA-1 hash that can be computed

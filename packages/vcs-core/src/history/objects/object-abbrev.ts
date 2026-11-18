@@ -23,7 +23,7 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjects } from "./git-objects.js";
+import type { GitObjects, ListPrefixOptions } from "./git-objects.js";
 
 /** git's `FALLBACK_DEFAULT_ABBREV` */
 export const DEFAULT_ABBREV_LENGTH = 7;
@@ -67,9 +67,10 @@ export const MINIMUM_ABBREV_LENGTH = 4;
 export async function* listObjectsWithPrefix(
   objects: Pick<GitObjects, "list" | "listPrefix">,
   prefix: string,
+  options?: ListPrefixOptions,
 ): AsyncIterable<ObjectId> {
   const seen = new Set<ObjectId>();
-  const source = objects.listPrefix ? objects.listPrefix(prefix) : objects.list();
+  const source = objects.listPrefix ? objects.listPrefix(prefix, options) : objects.list();
   for await (const id of source) {
     if (!id.startsWith(prefix) || seen.has(id)) continue;
     seen.add(id);
@@ -85,12 +86,14 @@ function commonHexPrefix(a: string, b: string): number {
 
 /**
  * The abbreviated length of each id (`repo_find_unique_abbrev`), from `minLength` (-1, the
- * default, for git's automatic length; 0 or 40 and more for full ids).
+ * default, for git's automatic length; 0 or 40 and more for full ids). `options.cache` is
+ * handed to the store's prefix lookups (see `GitObjects.listPrefix`).
  */
 export async function findAbbrevLengths(
   objects: GitObjects,
   ids: Iterable<ObjectId>,
   minLength = -1,
+  options?: ListPrefixOptions,
 ): Promise<Map<ObjectId, number>> {
   const wanted = [...new Set(ids)];
   const out = new Map<ObjectId, number>();
@@ -114,7 +117,9 @@ export async function findAbbrevLengths(
       let near = byPrefix.get(prefix);
       if (!near) {
         near = [];
-        for await (const other of listObjectsWithPrefix(objects, prefix)) near.push(other);
+        for await (const other of listObjectsWithPrefix(objects, prefix, options)) {
+          near.push(other);
+        }
         byPrefix.set(prefix, near);
       }
       let len = start;

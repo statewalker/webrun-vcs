@@ -6,6 +6,8 @@
 import { describe, expect, it } from "vitest";
 import {
   ByteLines,
+  hashLine,
+  LineHasher,
   LineInterner,
   whitespaceFlags,
   type XdiffAlgorithm,
@@ -118,5 +120,49 @@ describe("LineInterner", () => {
     // trim_common_tail keeps up to 1 KiB of the tail: far fewer lines than the files hold
     expect(interner.count).toBeLessThan(200);
     expect(interner.count).toBeGreaterThan(3);
+  });
+
+  it("hashes lines as ByteLines does, so interned text diffs against plain content", () => {
+    // an InternedText on one side and plain bytes or ByteLines on the other: equal lines must
+    // hash alike whichever reads them, or they land in different classes
+    for (let seed = 1; seed <= 30; seed++) {
+      const r = prng(seed * 7919);
+      let lines = Array.from(
+        { length: 20 + Math.floor(r() * 200) },
+        () => TOKENS[Math.floor(r() * TOKENS.length)],
+      );
+      const a = text(lines, true);
+      lines = edit(r, lines);
+      const b = text(lines, r() < 0.8);
+      const plain = xdiffHunks(a, b);
+      expect(xdiffHunks(new LineInterner().text(a), b)).toEqual(plain);
+      expect(xdiffHunks(a, new LineInterner().text(b))).toEqual(plain);
+      const interner = new LineInterner();
+      expect(xdiffHunks(interner.text(a), new ByteLines(b), { interner })).toEqual(plain);
+      const shared = new LineInterner();
+      expect(xdiffHunks(new ByteLines(a), shared.text(b), { interner: shared })).toEqual(plain);
+      expect(xdiffHunks(shared.text(a), b, { interner: shared })).toEqual(plain);
+    }
+  });
+
+  it("finds and hashes lines in one pass as ByteLines hashes them", () => {
+    for (let seed = 1; seed <= 50; seed++) {
+      const r = prng(seed);
+      // lines of every length around the four-byte words, LFs anywhere in a word
+      const bytes = new Uint8Array(Math.floor(r() * 300));
+      for (let i = 0; i < bytes.length; i++) bytes[i] = r() < 0.15 ? 0x0a : 0x20 + (i % 90);
+      const lines = new ByteLines(bytes);
+      const hasher = new LineHasher(bytes);
+      let p = 0;
+      for (let i = 0; i < lines.size(); i++) {
+        expect(p).toBe(lines.start(i));
+        const h = hasher.next(p);
+        expect(hasher.end).toBe(lines.start(i + 1));
+        expect(h).toBe(lines.hash(i));
+        expect(h).toBe(hashLine(bytes, lines.start(i), lines.start(i + 1)));
+        p = hasher.end;
+      }
+      expect(p).toBe(bytes.length);
+    }
   });
 });

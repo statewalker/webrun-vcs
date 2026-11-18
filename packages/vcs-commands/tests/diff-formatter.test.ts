@@ -336,6 +336,9 @@ function countingBlobs(blobs: Blobs) {
       }
     })();
   };
+  // reads counted through `load`: the probe then takes `size` and `load`, not the store's
+  // single read (`open`, which hands over bytes held in memory whole)
+  wrapped.open = undefined;
   return { blobs: wrapped, state };
 }
 

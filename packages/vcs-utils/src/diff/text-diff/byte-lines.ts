@@ -38,17 +38,22 @@ export class ByteLines extends Sequence implements LineSource {
       this.hashes = hashes;
       return;
     }
-    let count = 0;
-    for (let i = 0; i < content.length; i++) if (content[i] === 0x0a) count++;
-    if (content.length > 0 && content[content.length - 1] !== 0x0a) count++;
-    const out = new Int32Array(count + 1);
-    let n = 0;
-    if (content.length > 0) {
-      out[n++] = 0;
-      for (let i = 0; i < content.length - 1; i++) if (content[i] === 0x0a) out[n++] = i + 1;
-    }
-    out[n] = content.length;
-    this.starts = out;
+    this.starts = lineStarts(content);
+  }
+
+  /** The start offsets of the lines, plus the content length as the last entry (shared) */
+  get lineStarts(): Int32Array {
+    return this.starts;
+  }
+
+  /** The hash of each line (see {@link hash}), computed on first use (shared) */
+  get lineHashes(): Int32Array {
+    return this.hashes ?? this.hashAll();
+  }
+
+  /** Whether the line hashes are computed already */
+  get hashed(): boolean {
+    return this.hashes !== undefined;
   }
 
   /**
@@ -109,12 +114,8 @@ export class ByteLines extends Sequence implements LineSource {
     const n = starts.length - 1;
     const hashes = new Int32Array(n);
     const c = this.content;
-    let p = 0;
-    for (let k = 0; k < n; k++) {
-      let h = 5381;
-      for (const end = starts[k + 1]; p < end; p++) h = (Math.imul(h, 33) + c[p]) | 0;
-      hashes[k] = h;
-    }
+    const words = lineWords(c);
+    for (let k = 0; k < n; k++) hashes[k] = hashLine(c, starts[k], starts[k + 1], words);
     this.hashes = hashes;
     return hashes;
   }
@@ -132,6 +133,92 @@ export class ByteLines extends Sequence implements LineSource {
   }
 }
 
+/** A view for reading `content` four bytes at a time, as {@link hashLine} takes it */
+export function lineWords(content: Uint8Array): DataView {
+  return new DataView(content.buffer, content.byteOffset, content.byteLength);
+}
+
+/** The seed of {@link hashLine} */
+const LINE_SEED = 0x9747b28c | 0;
+
+/**
+ * The hash of the line `content[start, end)`, terminator included: the one hash of exact
+ * lines everywhere (`ByteLines.hash`, `InternedText`, `LineInterner`; {@link LineHasher}
+ * gives the same), so equal lines hash alike whichever reads them. Four bytes at a time; the
+ * hash only groups lines, which are told apart by their bytes. `words` is
+ * {@link lineWords} of `content`, made once per buffer.
+ */
+export function hashLine(
+  content: Uint8Array,
+  start: number,
+  end: number,
+  words: DataView = lineWords(content),
+): number {
+  let p = start;
+  let h = LINE_SEED;
+  for (; p + 4 <= end; p += 4) {
+    h = Math.imul(h ^ words.getInt32(p, true), 0x5bd1e995);
+    h ^= h >>> 13;
+  }
+  for (; p < end; p++) h = Math.imul(h ^ content[p], 0x01000193);
+  h ^= end - start;
+  return h ^ (h >>> 16);
+}
+
+/**
+ * Finds and hashes lines in one pass, front to back: `next(start)` gives the
+ * {@link hashLine} of the line starting at `start` and sets `end` past its LF (or to the
+ * content's length). Reads four bytes at a time until a word holds the LF, so short lines
+ * cost no native call each (as an `indexOf` per line would).
+ *
+ * @example
+ * ```typescript
+ * const hasher = new LineHasher(content);
+ * for (let p = 0; p < content.length; p = hasher.end) console.log(hasher.next(p));
+ * ```
+ */
+export class LineHasher {
+  /** Where the line the last `next` read ends (after its LF) */
+  end = 0;
+  private readonly words: DataView;
+
+  constructor(readonly content: Uint8Array) {
+    this.words = lineWords(content);
+  }
+
+  /** The {@link hashLine} of the line starting at `start`; sets {@link end} */
+  next(start: number): number {
+    const c = this.content;
+    const words = this.words;
+    const len = c.length;
+    let p = start;
+    let h = LINE_SEED;
+    // whole words while none holds an LF (a zero byte of `x ^ 0x0a0a0a0a`)
+    while (p + 4 <= len) {
+      const x = words.getInt32(p, true);
+      const y = x ^ 0x0a0a0a0a;
+      if (((y - 0x01010101) & ~y & 0x80808080) !== 0) break;
+      h = Math.imul(h ^ x, 0x5bd1e995);
+      h ^= h >>> 13;
+      p += 4;
+    }
+    // the LF is within the next four bytes (or the content ends there)
+    let e = p;
+    while (e < len && c[e] !== 0x0a) e++;
+    if (e < len) e++;
+    // a line ending with the word hashes it as a word, as hashLine does
+    if (p + 4 === e) {
+      h = Math.imul(h ^ words.getInt32(p, true), 0x5bd1e995);
+      h ^= h >>> 13;
+      p = e;
+    }
+    for (; p < e; p++) h = Math.imul(h ^ c[p], 0x01000193);
+    h ^= e - start;
+    this.end = e;
+    return h ^ (h >>> 16);
+  }
+}
+
 /** Compares whole lines, terminators included: `a` and `a\n`, `a\n` and `a\r\n` differ. */
 export const BYTE_LINES_COMPARATOR: SequenceComparator<ByteLines> = {
   equals(a, ai, b, bi) {
@@ -141,3 +228,25 @@ export const BYTE_LINES_COMPARATOR: SequenceComparator<ByteLines> = {
     return seq.hash(index);
   },
 };
+
+/**
+ * The start of each line of `content` (split after each LF), then its length; `indexOf` finds
+ * the LFs (a native scan, several times faster than a loop over the bytes).
+ */
+function lineStarts(content: Uint8Array): Int32Array {
+  const len = content.length;
+  if (len === 0) return new Int32Array(1);
+  let out = new Int32Array((len >> 5) + 2);
+  let n = 0;
+  out[n++] = 0;
+  for (let i = content.indexOf(0x0a); i >= 0 && i < len - 1; i = content.indexOf(0x0a, i + 1)) {
+    if (n + 1 >= out.length) {
+      const grown = new Int32Array(out.length * 2);
+      grown.set(out);
+      out = grown;
+    }
+    out[n++] = i + 1;
+  }
+  out[n++] = len;
+  return out.length === n ? out : out.subarray(0, n);
+}

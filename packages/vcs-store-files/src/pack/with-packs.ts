@@ -181,7 +181,7 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
       for await (const id of loose.list()) if (!held.some((p) => p.has(id))) yield id;
     },
 
-    async *listPrefix(prefix) {
+    async *listPrefix(prefix, options) {
       const held = await packs.packs();
       const seen = new Set<string>();
       const packed = packs.listPrefix
@@ -192,7 +192,24 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
         seen.add(id);
         yield id;
       }
-      for await (const id of listObjectsWithPrefix(loose, prefix)) if (!seen.has(id)) yield id;
+      const cache = options?.cache;
+      if (!cache || prefix.length < 2) {
+        for await (const id of listObjectsWithPrefix(loose, prefix)) if (!seen.has(id)) yield id;
+        return;
+      }
+      // the loose objects of the fan-out directory, listed once while the caller keeps the
+      // cache (git's odb_loose_cache)
+      const key = `loose:${prefix.slice(0, 2)}`;
+      let listed = cache.get(key) as Promise<string[]> | undefined;
+      if (!listed) {
+        listed = (async () => {
+          const ids: string[] = [];
+          for await (const id of listObjectsWithPrefix(loose, prefix.slice(0, 2))) ids.push(id);
+          return ids;
+        })();
+        cache.set(key, listed);
+      }
+      for (const id of await listed) if (id.startsWith(prefix) && !seen.has(id)) yield id;
     },
 
     async approximateCount() {

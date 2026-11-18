@@ -1,4 +1,5 @@
 import type {
+  BlobRead,
   Blobs,
   Commit,
   Commits,
@@ -214,6 +215,65 @@ const GRAFT_FILE_ADVICE = [
  */
 /** Trees the commands sharing reads keep (see `GitCommand.shareReadsOf`). */
 const SHARED_TREES = 1024;
+/** Bytes of blob content the commands sharing reads keep, and the largest blob kept */
+export const SHARED_BLOB_BYTES = 32 * 2 ** 20;
+export const SHARED_BLOB_MAX = 2 ** 20;
+
+/** Blob contents kept for the commands sharing reads, most recently used last */
+export interface SharedBlobs {
+  recent: OrderedMap<ObjectId, Uint8Array>;
+  bytes: number;
+}
+
+/**
+ * `blobs` keeping the small blobs it reads in `shared` a while: `git log -p` reads a file's
+ * version as the new side of one commit's diff and again as the old side of the next. The
+ * bytes handed out are shared between the readers, never to be changed.
+ */
+export function sharingBlobs(blobs: Blobs, shared: SharedBlobs): Blobs {
+  const open = async (id: ObjectId): Promise<BlobRead | undefined> => {
+    const known = shared.recent.get(id);
+    if (known) {
+      shared.recent.delete(id);
+      shared.recent.set(id, known);
+      return { size: known.length, bytes: known, content: single(known) };
+    }
+    const blob = await blobs.open?.(id);
+    if (blob?.bytes && blob.size <= SHARED_BLOB_MAX) {
+      // another open of the same id may have kept it while this one read: hand out that copy
+      const kept = shared.recent.get(id);
+      if (kept) return { size: kept.length, bytes: kept, content: single(kept) };
+      shared.recent.set(id, blob.bytes);
+      shared.bytes += blob.bytes.length;
+      while (shared.bytes > SHARED_BLOB_BYTES && shared.recent.size > 0) {
+        const oldest = shared.recent.oldestKey() as ObjectId;
+        shared.bytes -= shared.recent.get(oldest)?.length ?? 0;
+        shared.recent.delete(oldest);
+      }
+      if (shared.recent.size === 0) shared.bytes = 0;
+    }
+    return blob;
+  };
+  return overlayMethods(blobs, {
+    open,
+    load: async (id: ObjectId) => {
+      const blob = await open(id);
+      if (!blob) return undefined;
+      return blob.bytes ? single(blob.bytes) : blob.content;
+    },
+    size: async (id: ObjectId) => {
+      const blob = await open(id);
+      if (!blob) return -1;
+      if (!blob.bytes) await blob.content[Symbol.asyncIterator]().return?.();
+      return blob.size;
+    },
+  });
+}
+
+/** One chunk as a stream */
+async function* single(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+  yield bytes;
+}
 
 export abstract class GitCommand<T> {
   protected readonly _workingCopy: WorkingCopy;
@@ -421,8 +481,18 @@ export abstract class GitCommand<T> {
    * unless this command reads the objects as stored ({@link readsReplacedObjects}).
    */
   protected get blobs(): Blobs {
-    return this.readsReplacedObjects() ? this.views().blobs : this.storedBlobs;
+    const blobs = this.readsReplacedObjects() ? this.views().blobs : this.storedBlobs;
+    const shared = this.sharedBlobs;
+    if (!shared || !blobs.open) return blobs;
+    if (this.sharedBlobsView?.of !== blobs) {
+      this.sharedBlobsView = { of: blobs, view: sharingBlobs(blobs, shared) };
+    }
+    return this.sharedBlobsView.view;
   }
+
+  /** Blob contents read lately by the commands sharing reads ({@link shareReadsOf}) */
+  private sharedBlobs?: SharedBlobs;
+  private sharedBlobsView?: { of: Blobs; view: Blobs };
 
   /**
    * Access tree storage: a tree replaced by `refs/replace/<id>` reads as its replacement,
@@ -792,8 +862,18 @@ export abstract class GitCommand<T> {
    * however many ids the command prints (see {@link createIdAbbreviator}).
    */
   protected idAbbreviator(): IdAbbreviator {
-    this.abbreviator ??= createIdAbbreviator(this._workingCopy);
+    this.abbreviator ??= createIdAbbreviator(this._workingCopy, {
+      cacheListings: this.writesNoObjects(),
+    });
     return this.abbreviator;
+  }
+
+  /**
+   * Whether this command stores no objects while it abbreviates ids: its abbreviator then
+   * lists each loose fan-out directory once (see `IdAbbreviatorOptions.cacheListings`).
+   */
+  protected writesNoObjects(): boolean {
+    return false;
   }
 
   /**
@@ -806,6 +886,8 @@ export abstract class GitCommand<T> {
     this.abbreviator = source.idAbbreviator();
     source.sharedTrees ??= new OrderedMap();
     this.sharedTrees = source.sharedTrees;
+    source.sharedBlobs ??= { recent: new OrderedMap(), bytes: 0 };
+    this.sharedBlobs = source.sharedBlobs;
     return this;
   }
 
@@ -816,7 +898,13 @@ export abstract class GitCommand<T> {
    * A tree's entries through the replacements (`trees.loadTree`), kept a while for the
    * commands that share reads: one commit's tree is the next one's parent tree.
    */
-  protected async treeEntries(id: ObjectId): Promise<TreeEntry[]> {
+  protected async treeEntries(id: ObjectId): Promise<readonly TreeEntry[]> {
+    const trees = this.trees;
+    // a store that caches decoded trees hands them out as they are (no copy per read)
+    if (trees.entries) {
+      // a missing tree reads as empty, as `loadTree` yields nothing for it
+      return (await trees.entries(id)) ?? [];
+    }
     const cache = this.sharedTrees;
     const known = cache?.get(id);
     if (known) {

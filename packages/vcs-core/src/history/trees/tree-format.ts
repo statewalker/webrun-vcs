@@ -52,6 +52,31 @@ function isTreeMode(mode: number): boolean {
 }
 
 /**
+ * A tree entry's mode as git's tree walks see it (`canon_mode`): a regular file is 100644 or
+ * 100755 by its owner's execute bit, whatever other bits are stored (older git wrote 100664),
+ * and a mode of no known type reads as a gitlink. Tree comparisons (diffs, history
+ * simplification, changed-path filters) compare these.
+ *
+ * @example
+ * ```typescript
+ * canonTreeMode(0o100664); // 0o100644
+ * canonTreeMode(0o100775); // 0o100755
+ * ```
+ */
+export function canonTreeMode(mode: number): number {
+  switch (mode & 0o170000) {
+    case 0o100000:
+      return mode & 0o100 ? 0o100755 : 0o100644;
+    case 0o120000:
+      return 0o120000;
+    case 0o040000:
+      return 0o040000;
+    default:
+      return 0o160000;
+  }
+}
+
+/**
  * Compare tree entries in git's canonical tree order.
  *
  * ```typescript
@@ -248,6 +273,101 @@ function parseModeAt(buffer: Uint8Array, start: number, end: number): number {
     mode = mode * 8 + digit;
   }
   return end > start ? mode : Number.NaN;
+}
+
+/**
+ * A walk over a tree's stored bytes that decodes only what it is asked for, as git's
+ * `tree_desc`: entries the same on both sides of a comparison are told apart from their
+ * bytes (name, mode, id), without a string or an entry object made for them. A name is
+ * decoded and checked as {@link decodeTreeBytes} does it.
+ *
+ * @example
+ * ```typescript
+ * for (const c = new TreeEntryCursor(bytes); !c.done; c.next()) {
+ *   if (c.isTree) console.log(c.name(), c.id());
+ * }
+ * ```
+ */
+export class TreeEntryCursor {
+  /** Whether the walk is past the last entry */
+  done = false;
+  /** The entry's mode as git's walks see it ({@link canonTreeMode}, not as stored) */
+  mode = 0;
+  private nameStart = 0;
+  private nameEnd = 0;
+  private end = 0;
+
+  constructor(readonly bytes: Uint8Array) {
+    this.parse(0);
+  }
+
+  /** Moves to the next entry */
+  next(): void {
+    this.parse(this.end);
+  }
+
+  /** Whether the entry is a subtree */
+  get isTree(): boolean {
+    return (this.mode & 0o170000) === FileMode.TREE;
+  }
+
+  /** The entry's name, decoded and checked as `decodeTreeBytes` does */
+  name(): string {
+    const name = decodeGitPath(this.bytes.subarray(this.nameStart, this.nameEnd));
+    validateEntryName(name);
+    return name;
+  }
+
+  /** The entry's object id */
+  id(): string {
+    return bytesToHex(this.bytes.subarray(this.nameEnd + 1, this.end));
+  }
+
+  /** git's `base_name_compare` of this entry's name with `other`'s */
+  compare(other: TreeEntryCursor): number {
+    const a = this.bytes;
+    const b = other.bytes;
+    const as = this.nameStart;
+    const bs = other.nameStart;
+    const alen = this.nameEnd - as;
+    const blen = other.nameEnd - bs;
+    const len = alen < blen ? alen : blen;
+    for (let i = 0; i < len; i++) {
+      const diff = a[as + i] - b[bs + i];
+      if (diff !== 0) return diff;
+    }
+    const ac = alen > len ? a[as + len] : this.isTree ? 0x2f : 0;
+    const bc = blen > len ? b[bs + len] : other.isTree ? 0x2f : 0;
+    return ac - bc;
+  }
+
+  /** Whether `other` (an entry of the same name) has this entry's mode (canonical) and id */
+  sameAs(other: TreeEntryCursor): boolean {
+    if (this.mode !== other.mode) return false;
+    const a = this.bytes;
+    const b = other.bytes;
+    const ai = this.nameEnd + 1;
+    const bi = other.nameEnd + 1;
+    for (let k = 0; k < OBJECT_ID_LENGTH; k++) if (a[ai + k] !== b[bi + k]) return false;
+    return true;
+  }
+
+  private parse(offset: number): void {
+    const buffer = this.bytes;
+    if (offset >= buffer.length) {
+      this.done = true;
+      return;
+    }
+    const spacePos = buffer.indexOf(SPACE, offset);
+    const nullPos = spacePos < 0 ? -1 : buffer.indexOf(NULL, spacePos + 1);
+    if (nullPos < 0 || nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) {
+      throw new Error("Invalid tree format: truncated entry");
+    }
+    this.mode = canonTreeMode(parseModeAt(buffer, offset, spacePos));
+    this.nameStart = spacePos + 1;
+    this.nameEnd = nullPos;
+    this.end = nullPos + 1 + OBJECT_ID_LENGTH;
+  }
 }
 
 /**

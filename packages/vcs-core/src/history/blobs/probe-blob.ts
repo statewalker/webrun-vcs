@@ -10,7 +10,7 @@
 import { RawText } from "@statewalker/vcs-utils/diff";
 import { readPrefix } from "@statewalker/vcs-utils/streams";
 import type { ObjectId } from "../../common/index.js";
-import type { Blobs } from "./blobs.js";
+import type { BlobRead, Blobs } from "./blobs.js";
 
 /** git's `core.bigFileThreshold`: larger blobs are binary to diff and merge, and never deltified. */
 export const DEFAULT_BIG_FILE_THRESHOLD = 50 * 2 ** 20;
@@ -62,6 +62,7 @@ export async function probeBlob(
   options: ProbeBlobOptions = {},
 ): Promise<BlobProbe> {
   const threshold = options.bigFileThreshold ?? DEFAULT_BIG_FILE_THRESHOLD;
+  if (blobs.open) return probeOpened(await blobs.open(id), id, threshold, options);
   const size = await blobs.size(id);
   if (size < 0) throw new Error(`Blob not found: ${id}`);
   if (size > threshold) return { size, binary: true, big: true };
@@ -77,6 +78,40 @@ export async function probeBlob(
     return { size, binary: RawText.isBinary(head), big: false };
   }
   return readTextOnce(content, size);
+}
+
+/** `probeBlob` over one read of the blob (`Blobs.open`). */
+async function probeOpened(
+  blob: BlobRead | undefined,
+  id: ObjectId,
+  threshold: number,
+  options: ProbeBlobOptions,
+): Promise<BlobProbe> {
+  if (!blob) throw new Error(`Blob not found: ${id}`);
+  const { size, bytes } = blob;
+  const release = async () => {
+    if (!bytes) await blob.content[Symbol.asyncIterator]().return?.();
+  };
+  if (size > threshold) {
+    await release();
+    return { size, binary: true, big: true };
+  }
+  if (bytes) {
+    const binary = RawText.isBinary(bytes.subarray(0, RawText.BINARY_PROBE_LENGTH));
+    if (binary || !options.loadText) return { size, binary, big: false };
+    return { size, binary, big: false, content: bytes };
+  }
+  if (size === 0) {
+    await release();
+    return options.loadText
+      ? { size, binary: false, big: false, content: new Uint8Array(0) }
+      : { size, binary: false, big: false };
+  }
+  if (!options.loadText) {
+    const head = await readPrefix(blob.content, RawText.BINARY_PROBE_LENGTH);
+    return { size, binary: RawText.isBinary(head), big: false };
+  }
+  return readTextOnce(blob.content, size);
 }
 
 /**

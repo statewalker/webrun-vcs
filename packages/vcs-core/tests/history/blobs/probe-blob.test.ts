@@ -24,6 +24,9 @@ function counting(blobs: Blobs) {
       }
     })();
   };
+  // reads counted through `load`: the probe then takes `size` and `load`, not the store's
+  // single read (`open`, covered below)
+  wrapped.open = undefined;
   return { blobs: wrapped, state };
 }
 
@@ -145,5 +148,76 @@ describe("probeBlob with loadText: a binary blob is never allocated whole", () =
     // object adds zlib's 32 KiB window, nothing near the blob's 20 MiB
     expect(largestByProbe).toBe(8000);
     expect(largest).toBeLessThanOrEqual(64 * 1024);
+  });
+});
+
+describe("probeBlob over the store's single read (Blobs.open)", () => {
+  /** The store's blobs, counting the calls of each read */
+  function calls(blobs: Blobs) {
+    const count = { open: 0, size: 0, load: 0 };
+    const wrapped: Blobs = Object.create(blobs);
+    wrapped.open = async (id) => {
+      count.open++;
+      return blobs.open?.(id);
+    };
+    wrapped.size = async (id) => {
+      count.size++;
+      return blobs.size(id);
+    };
+    wrapped.load = async (id) => {
+      count.load++;
+      return blobs.load(id);
+    };
+    return { blobs: wrapped, count };
+  }
+
+  it("takes size and content from one read of the object", async () => {
+    const history = createMemoryHistory();
+    const data = new TextEncoder().encode("line of text\n".repeat(1000));
+    const id = await history.blobs.store([data], data.length);
+    const { blobs, count } = calls(history.blobs);
+    const probe = await probeBlob(blobs, id, { loadText: true });
+    expect(probe.size).toBe(data.length);
+    expect(probe.binary).toBe(false);
+    expect(probe.content && Buffer.from(probe.content).equals(Buffer.from(data))).toBe(true);
+    expect(count).toEqual({ open: 1, size: 0, load: 0 });
+  });
+
+  it("finds a NUL in the first 8000 bytes, and none past them", async () => {
+    const history = createMemoryHistory();
+    const early = new Uint8Array(20_000).fill(0x61);
+    early[7999] = 0;
+    const late = new Uint8Array(20_000).fill(0x61);
+    late[8000] = 0;
+    const earlyId = await history.blobs.store([early], early.length);
+    const lateId = await history.blobs.store([late], late.length);
+    const { blobs } = calls(history.blobs);
+    expect(await probeBlob(blobs, earlyId, { loadText: true })).toEqual({
+      size: 20_000,
+      binary: true,
+      big: false,
+    });
+    const text = await probeBlob(blobs, lateId);
+    expect(text).toEqual({ size: 20_000, binary: false, big: false });
+  });
+
+  it("calls a blob over the threshold big, and a missing one an error", async () => {
+    const history = createMemoryHistory();
+    const data = new TextEncoder().encode("text\n".repeat(1000));
+    const id = await history.blobs.store([data], data.length);
+    expect(await probeBlob(history.blobs, id, { bigFileThreshold: 1000 })).toEqual({
+      size: data.length,
+      binary: true,
+      big: true,
+    });
+    await expect(probeBlob(history.blobs, "0".repeat(40))).rejects.toThrow(/not found/);
+  });
+
+  it("reads nothing for a tree id: not a blob", async () => {
+    const history = createMemoryHistory();
+    const tree = await history.trees.store([]);
+    expect(await history.blobs.open?.(tree)).toBeUndefined();
+    expect(await history.blobs.size(tree)).toBe(-1);
+    expect(await history.blobs.load(tree)).toBeUndefined();
   });
 });

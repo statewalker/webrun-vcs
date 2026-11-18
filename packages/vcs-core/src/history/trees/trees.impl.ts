@@ -38,6 +38,9 @@ class GitTreeStore implements Trees {
    */
   private readonly cache = new OrderedMap<ObjectId, CachedTree>();
   private cachedEntries = 0;
+  /** Stored contents by id (`raw`), most recently used last, bounded by their bytes */
+  private readonly rawCache = new OrderedMap<ObjectId, { bytes: Uint8Array; epoch: number }>();
+  private rawBytes = 0;
   /** Reads in flight, by tree id */
   private readonly reading = new Map<ObjectId, Promise<readonly TreeEntry[] | undefined>>();
 
@@ -74,6 +77,12 @@ class GitTreeStore implements Trees {
     const entries = await this.read(id);
     if (!entries) return undefined;
     return copies(entries);
+  }
+
+  /** The entries as stored and cached, shared (see `Trees.entries`). */
+  entries(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
+    if (id === EMPTY_TREE_ID) return Promise.resolve(NO_ENTRIES);
+    return this.read(id);
   }
 
   /**
@@ -117,9 +126,15 @@ class GitTreeStore implements Trees {
   private async readStored(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
     // the count before the read: a removal while reading leaves the entry to be checked
     const epoch = objectRemovalEpoch();
+    const bytes = await this.readBytes(id);
+    return bytes ? this.decoded(id, bytes, epoch) : undefined;
+  }
+
+  /** The tree's stored content, read whole; undefined if absent or not a tree. */
+  private async readBytes(id: ObjectId): Promise<Uint8Array | undefined> {
     let obj: Awaited<ReturnType<GitObjects["get"]>>;
     try {
-      obj = await this.objects.get(id);
+      obj = await (this.objects.getNow ? this.objects.getNow(id) : this.objects.get(id));
     } catch (e) {
       if (e instanceof InvalidObjectIdError) return undefined;
       // a stored object whose header cannot be read: as `has` reports it
@@ -131,9 +146,8 @@ class GitTreeStore implements Trees {
     }
     if (!obj) return undefined;
     if (obj.bytes) {
-      // in memory already: decoded at once (the content needs no release)
-      if (obj.type !== "tree") return undefined;
-      return this.decoded(id, obj.bytes, epoch);
+      // in memory already (the content needs no release)
+      return obj.type === "tree" ? obj.bytes : undefined;
     }
     const it = obj.content[Symbol.asyncIterator]();
     if (obj.type !== "tree") {
@@ -146,17 +160,44 @@ class GitTreeStore implements Trees {
       chunks.push(r.value);
       size += r.value.length;
     }
-    let bytes: Uint8Array;
-    if (chunks.length === 1) bytes = chunks[0];
-    else {
-      bytes = new Uint8Array(size);
-      let at = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, at);
-        at += chunk.length;
-      }
+    if (chunks.length === 1) return chunks[0];
+    const bytes = new Uint8Array(size);
+    let at = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, at);
+      at += chunk.length;
     }
-    return this.decoded(id, bytes, epoch);
+    return bytes;
+  }
+
+  /** The stored content (see `Trees.raw`), kept a while as the decoded entries are. */
+  async raw(id: ObjectId): Promise<Uint8Array | undefined> {
+    if (id === EMPTY_TREE_ID) return NO_BYTES;
+    const hit = this.rawCache.get(id);
+    if (hit) {
+      this.rawCache.delete(id);
+      this.rawCache.set(id, hit);
+      if (hit.epoch === objectRemovalEpoch()) return hit.bytes;
+      if (await this.objects.has(id)) {
+        hit.epoch = objectRemovalEpoch();
+        return hit.bytes;
+      }
+      this.rawCache.delete(id);
+      this.rawBytes -= hit.bytes.length;
+    }
+    const epoch = objectRemovalEpoch();
+    const bytes = await this.readBytes(id);
+    if (!bytes || bytes.length > MAX_RAW_BYTES) return bytes;
+    const known = this.rawCache.get(id);
+    if (known) this.rawBytes -= known.bytes.length;
+    this.rawCache.set(id, { bytes, epoch });
+    this.rawBytes += bytes.length;
+    while (this.rawBytes > MAX_RAW_BYTES) {
+      const oldest = this.rawCache.oldestKey() as ObjectId;
+      this.rawBytes -= this.rawCache.get(oldest)?.bytes.length ?? 0;
+      this.rawCache.delete(oldest);
+    }
+    return bytes;
   }
 
   private decoded(id: ObjectId, bytes: Uint8Array, epoch: number): readonly TreeEntry[] {
@@ -247,6 +288,15 @@ interface CachedTree {
   readonly entries: readonly TreeEntry[];
   epoch: number;
 }
+
+/** Stored tree contents `raw` keeps at most (about 8 MB) */
+const MAX_RAW_BYTES = 8 * 2 ** 20;
+
+/** The empty tree's content */
+const NO_BYTES = new Uint8Array(0);
+
+/** The empty tree's entries */
+const NO_ENTRIES: readonly TreeEntry[] = Object.freeze([]);
 
 /** Decoded entries the cache holds at most, across trees (about 10 MB). */
 const DEFAULT_MAX_CACHED_ENTRIES = 100_000;

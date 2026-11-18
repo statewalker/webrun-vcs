@@ -287,30 +287,59 @@ function classify(
   const repIdx = new Int32Array(max);
   const len1 = new Int32Array(max);
   const len2 = new Int32Array(max);
+  // the lines the files share byte for byte at their start and end: a line of the second
+  // file there has the class of its twin in the first, which is classified already (and no
+  // class is new there, so the numbering is the one of a full scan)
+  const { head, tail } = ws === 0 ? sharedEnds(l1, from1, n1, l2, from2, n2) : NO_SHARED;
   let classes = 0;
-  const files = [l1, l2];
+  const w1 = wordsOf(l1.content);
+  const w2 = wordsOf(l2.content);
   for (let f = 0; f < 2; f++) {
     const lines = f === 0 ? l1 : l2;
+    const wf = f === 0 ? w1 : w2;
     const from = f === 0 ? from1 : from2;
     const n = f === 0 ? n1 : n2;
     const ha = f === 0 ? ha1 : ha2;
     const counts = f === 0 ? len1 : len2;
     const bytes = lines.content;
-    for (let i = 0; i < n; i++) {
+    const starts = lines.lineStarts;
+    // all of a file's hashes, kept with its lines for its next diff
+    const hashes = ws ? undefined : lines.lineHashes;
+    let i = 0;
+    let to = n;
+    if (f === 1) {
+      for (; i < head; i++) {
+        const c = ha1[i];
+        counts[c]++;
+        ha[i] = c;
+      }
+      to = n - tail;
+      for (let k = to; k < n; k++) {
+        const c = ha1[k - n + n1];
+        counts[c]++;
+        ha[k] = c;
+      }
+    }
+    for (; i < to; i++) {
       const li = from + i;
-      const b0 = lines.start(li);
-      const b1 = lines.start(li + 1);
-      const h = ws ? xdlHashRecord(bytes, b0, b1, ws) : lines.hash(li);
+      const b0 = starts[li];
+      const b1 = starts[li + 1];
+      let h: number;
+      if (hashes) h = hashes[li];
+      else h = xdlHashRecord(bytes, b0, b1, ws);
       let slot = Math.imul(h, 0x9e3779b1) >>> (32 - bits);
       let c = table[slot];
       while (c >= 0) {
         if (clsHash[c] === h) {
-          const r = files[repFile[c]];
+          const r = repFile[c] === 0 ? l1 : l2;
+          const rs = r.lineStarts;
           const ri = repIdx[c];
-          if (
-            ws
-              ? xdlRecmatch(r.content, r.start(ri), r.start(ri + 1), bytes, b0, b1, ws)
-              : r.lineEquals(ri, lines, li)
+          if (ws) {
+            if (xdlRecmatch(r.content, rs[ri], rs[ri + 1], bytes, b0, b1, ws)) break;
+          } else if (
+            rs[ri + 1] - rs[ri] === b1 - b0 &&
+            commonPrefix(r.content, repFile[c] === 0 ? w1 : w2, rs[ri], bytes, wf, b0, b1 - b0) ===
+              b1 - b0
           ) {
             break;
           }
@@ -330,6 +359,101 @@ function classify(
     }
   }
   return { ha1, ha2, len1, len2 };
+}
+
+const NO_SHARED = { head: 0, tail: 0 };
+
+/** A buffer as 32-bit words (unaligned reads) */
+function wordsOf(bytes: Uint8Array): DataView {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+/**
+ * How many of the `max` bytes at `a[i..]` and `b[j..]` are the same, from the start; `da`
+ * and `db` are the buffers' {@link wordsOf}.
+ */
+function commonPrefix(
+  a: Uint8Array,
+  da: DataView,
+  i: number,
+  b: Uint8Array,
+  db: DataView,
+  j: number,
+  max: number,
+): number {
+  let p = 0;
+  if (max >= 16) {
+    // four bytes at a time
+    while (p + 4 <= max && da.getInt32(i + p) === db.getInt32(j + p)) p += 4;
+  }
+  while (p < max && a[i + p] === b[j + p]) p++;
+  return p;
+}
+
+/** How many of the `max` bytes before `a[end1]` and `b[end2]` are the same, from the end */
+function commonSuffix(
+  a: Uint8Array,
+  da: DataView,
+  end1: number,
+  b: Uint8Array,
+  db: DataView,
+  end2: number,
+  max: number,
+): number {
+  let q = 0;
+  if (max >= 16) {
+    while (q + 4 <= max && da.getInt32(end1 - q - 4) === db.getInt32(end2 - q - 4)) q += 4;
+  }
+  while (q < max && a[end1 - 1 - q] === b[end2 - 1 - q]) q++;
+  return q;
+}
+
+/**
+ * The lines two ranges share byte for byte at their start (`head`) and their end (`tail`),
+ * each a whole line in both (an unterminated line only when it ends both ranges), the two
+ * never overlapping in either range.
+ */
+function sharedEnds(
+  l1: ByteLines,
+  from1: number,
+  n1: number,
+  l2: ByteLines,
+  from2: number,
+  n2: number,
+): { head: number; tail: number } {
+  const s1 = l1.lineStarts;
+  const s2 = l2.lineStarts;
+  const c1 = l1.content;
+  const c2 = l2.content;
+  const a0 = s1[from1];
+  const b0 = s2[from2];
+  const len1 = s1[from1 + n1] - a0;
+  const len2 = s2[from2 + n2] - b0;
+  const min = len1 < len2 ? len1 : len2;
+  const w1 = wordsOf(c1);
+  const w2 = wordsOf(c2);
+  const p = commonPrefix(c1, w1, a0, c2, w2, b0, min);
+  // a line within the common bytes, ending in LF there, starts and ends alike in both
+  let head = 0;
+  while (head < n1 && head < n2) {
+    const end = s1[from1 + head + 1] - a0;
+    if (end > p || c1[a0 + end - 1] !== 0x0a) break;
+    head++;
+  }
+  const headBytes = s1[from1 + head] - a0;
+  const limit = min - headBytes;
+  const q = commonSuffix(c1, w1, a0 + len1, c2, w2, b0 + len2, limit);
+  // a line starting within the common bytes (its LF before it common too, or at the start
+  // of the second range)
+  let tail = 0;
+  while (tail < n1 - head && tail < n2 - head) {
+    const start = s1[from1 + n1 - 1 - tail] - a0;
+    const other = start - len1 + len2;
+    if (start < len1 - q) break;
+    if (start === len1 - q && other > 0 && c2[b0 + other - 1] !== 0x0a) break;
+    tail++;
+  }
+  return { head, tail };
 }
 
 /** {@link classify} by interned line ids: the same classes, numbered alike */
