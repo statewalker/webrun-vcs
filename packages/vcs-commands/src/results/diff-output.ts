@@ -838,6 +838,50 @@ export function formatNameStatus(
 }
 
 /**
+ * `--summary` (diff.c's diff_summary for each pair): ` create mode 100644 <path>`, ` delete
+ * mode ...`, ` rename <a => b> (<n>%)` and ` copy ...` (then their mode change), ` mode change
+ * 100644 => 100755 <path>`; empty when nothing is to be said (git's is_summary_empty).
+ */
+export function formatSummary(pairs: DiffFilePair[], quote = true): string {
+  const mode6 = (mode: number) => mode.toString(8).padStart(6, "0");
+  const modeChange = (p: DiffFilePair, showName: boolean) => {
+    const a = p.old?.mode ?? 0;
+    const b = p.new?.mode ?? 0;
+    if (!a || !b || a === b) return "";
+    const name = showName ? ` ${quotePath(p.new?.path ?? "", quote)}` : "";
+    return ` mode change ${mode6(a)} => ${mode6(b)}${name}\n`;
+  };
+  const fileModeName = (what: string, side: DiffSideSpec | undefined) =>
+    side?.mode
+      ? ` ${what} mode ${mode6(side.mode)} ${quotePath(side.path, quote)}\n`
+      : ` ${what} ${quotePath(side?.path ?? "", quote)}\n`;
+  let out = "";
+  for (const p of pairs) {
+    switch (p.status) {
+      case "D":
+        out += fileModeName("delete", p.old);
+        break;
+      case "A":
+        out += fileModeName("create", p.new);
+        break;
+      case "R":
+      case "C": {
+        const kind = p.status === "R" ? "rename" : "copy";
+        const names = pprintRename(p.old?.path ?? "", p.new?.path ?? "", quote);
+        out += ` ${kind} ${names} (${p.score ?? 0}%)\n`;
+        out += modeChange(p, false);
+        break;
+      }
+      default:
+        // a rewrite (a broken pair, `-B`) has a score
+        if (p.score) out += ` rewrite ${quotePath(p.new?.path ?? "", quote)} (${p.score}%)\n`;
+        out += modeChange(p, !p.score);
+    }
+  }
+  return out;
+}
+
+/**
  * A side whose content is a stored blob (a submodule's: "Subproject commit <id>\n", as git
  * shows a gitlink). The probe reads a text blob once and keeps it for {@link DiffSideSpec.read}.
  */

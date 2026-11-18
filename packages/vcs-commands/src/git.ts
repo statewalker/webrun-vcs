@@ -3,6 +3,16 @@ import type { Checkout, WorkingCopy, Worktree, WorktreeAdmin } from "@statewalke
 
 import {
   AddCommand,
+  BisectCommand,
+  BisectLogCommand,
+  BisectNextCommand,
+  BisectReplayCommand,
+  BisectResetCommand,
+  BisectRunCommand,
+  BisectSkipCommand,
+  BisectStartCommand,
+  BisectStateCommand,
+  BisectTermsCommand,
   BlameCommand,
   CheckoutCommand,
   CherryPickCommand,
@@ -883,6 +893,97 @@ export class Git implements Disposable {
   rebase(): RebaseCommand {
     this.checkClosed();
     return new RebaseCommand(this._workingCopy);
+  }
+
+  // ============ Bisect Operations ============
+
+  /**
+   * `git bisect <args>...` as git dispatches it (`start`, `bad`, `good`, a term, `skip`,
+   * `next`, `reset`, `terms`, `log`, `replay`, `run`).
+   *
+   * @example
+   * ```typescript
+   * const step = await git.bisect().setArguments(["start", "main", "v1.0"]).call();
+   * ```
+   */
+  bisect(): BisectCommand {
+    this.checkClosed();
+    return new BisectCommand(this._workingCopy);
+  }
+
+  /**
+   * `git bisect start`: a bisection between a bad and good revisions.
+   *
+   * @example
+   * ```typescript
+   * await git.bisectStart().setBad("main").addGood("v1.0").call();
+   * ```
+   */
+  bisectStart(): BisectStartCommand {
+    this.checkClosed();
+    return new BisectStartCommand(this._workingCopy);
+  }
+
+  /**
+   * `git bisect <term> [<rev>...]` (`bad`, `good`, `new`, `old` or a custom term).
+   *
+   * @example
+   * ```typescript
+   * const step = await git.bisectState("good").call(); // HEAD is good
+   * ```
+   */
+  bisectState(term: string): BisectStateCommand {
+    this.checkClosed();
+    return new BisectStateCommand(this._workingCopy).setTerm(term);
+  }
+
+  /** `git bisect skip [(<rev>|<range>)...]` */
+  bisectSkip(): BisectSkipCommand {
+    this.checkClosed();
+    return new BisectSkipCommand(this._workingCopy);
+  }
+
+  /** `git bisect next` */
+  bisectNext(): BisectNextCommand {
+    this.checkClosed();
+    return new BisectNextCommand(this._workingCopy);
+  }
+
+  /** `git bisect reset [<commit>]` */
+  bisectReset(): BisectResetCommand {
+    this.checkClosed();
+    return new BisectResetCommand(this._workingCopy);
+  }
+
+  /** `git bisect terms [--term-good | --term-bad]` */
+  bisectTerms(): BisectTermsCommand {
+    this.checkClosed();
+    return new BisectTermsCommand(this._workingCopy);
+  }
+
+  /** `git bisect log` */
+  bisectLog(): BisectLogCommand {
+    this.checkClosed();
+    return new BisectLogCommand(this._workingCopy);
+  }
+
+  /** `git bisect replay`, over a log's text */
+  bisectReplay(): BisectReplayCommand {
+    this.checkClosed();
+    return new BisectReplayCommand(this._workingCopy);
+  }
+
+  /**
+   * `git bisect run <cmd>...`, the command run through a host hook.
+   *
+   * @example
+   * ```typescript
+   * await git.bisectRun().setCommand(["make", "test"]).setRunHandler(async () => 0).call();
+   * ```
+   */
+  bisectRun(): BisectRunCommand {
+    this.checkClosed();
+    return new BisectRunCommand(this._workingCopy);
   }
 
   // ============ Stash Operations ============

@@ -292,6 +292,22 @@ export class RevisionResolver {
   }
 
   /**
+   * The remote `git push` pushes `branch` to (git's `pushremote_for_branch`):
+   * `branch.<name>.pushRemote`, `remote.pushDefault`, `branch.<name>.remote`, the one
+   * configured remote, else `origin`.
+   */
+  pushRemoteOf(branch: string): string {
+    const config = this.remoteConfig();
+    return (
+      config.value(`branch.${branch}.pushRemote`) ??
+      config.value("remote.pushDefault") ??
+      config.value(`branch.${branch}.remote`) ??
+      (config.configuredNames().length === 1 ? config.configuredNames()[0] : "origin") ??
+      "origin"
+    );
+  }
+
+  /**
    * The ref `@{push}` of `branch` names (git's `branch_get_push`): where `git push` would
    * push it, as the remote-tracking ref that follows it; the current branch when undefined.
    *
@@ -302,12 +318,7 @@ export class RevisionResolver {
     if (name === undefined) throw this.fatal(revision, "HEAD does not point to a branch");
     const config = this.remoteConfig();
     const refname = `refs/heads/${name}`;
-    const remote =
-      config.value(`branch.${name}.pushRemote`) ??
-      config.value("remote.pushDefault") ??
-      config.value(`branch.${name}.remote`) ??
-      (config.configuredNames().length === 1 ? config.configuredNames()[0] : "origin") ??
-      "origin";
+    const remote = this.pushRemoteOf(name);
     const trackingFor = (dst: string) => {
       const tracking = applyRefspecs(config.configuredFetchRefspecs(remote), dst);
       if (tracking === undefined) {

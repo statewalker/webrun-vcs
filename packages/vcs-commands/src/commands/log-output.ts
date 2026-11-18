@@ -98,6 +98,11 @@ export interface LogOutputOptions {
   stat?: boolean;
   /** `--shortstat` */
   shortstat?: boolean;
+  /**
+   * `--summary`: the files created and deleted, renamed and copied (with their similarity),
+   * and the mode changes (diff.c's diff_summary)
+   */
+  summary?: boolean;
   /** `--numstat` */
   numstat?: boolean;
   /** `--name-only` */
@@ -660,6 +665,7 @@ export class LogPrinter {
     if (options.numstat) formats.push("numstat");
     if (options.stat) formats.push("stat");
     if (options.shortstat) formats.push("shortstat");
+    if (options.summary) formats.push("summary");
     if (options.patch) formats.push("patch");
     // revs->diff: decided from the formats asked for before the merges' default patch
     const userDiff = !options.noPatch && formats.length > 0;
@@ -894,7 +900,10 @@ export class LogPrinter {
       }
     }
     // find_paths_generic prints the stat of the diff against the first parent as it scans
-    const stats = this.formats.filter((f) => f === "numstat" || f === "stat" || f === "shortstat");
+    // (STAT_FORMAT_MASK: the summary too)
+    const stats = this.formats.filter(
+      (f) => f === "numstat" || f === "stat" || f === "shortstat" || f === "summary",
+    );
     const follow = this.follow && this.followPath !== undefined ? this.followPath : undefined;
     const first = this.diffParents(entry)[0];
     if (stats.length > 0 && first) {
@@ -950,7 +959,9 @@ export class LogPrinter {
     this.out.bytes(result.names);
     const needsep =
       names !== undefined ||
-      this.formats.some((f) => f === "stat" || f === "numstat" || f === "shortstat");
+      this.formats.some(
+        (f) => f === "stat" || f === "numstat" || f === "shortstat" || f === "summary",
+      );
     if (patch) {
       if (needsep) this.out.text(`${this.padding()}\n`);
       this.out.bytes(prefixLines(result.patch, this.padding(), combinedBare));

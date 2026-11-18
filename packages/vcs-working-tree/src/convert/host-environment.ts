@@ -64,6 +64,11 @@ export interface GitHostEnvironment {
    * (see `graftFileReader` of vcs-core)
    */
   graftFile?: string;
+  /**
+   * `$GIT_PRINT_SHA1_ELLIPSIS` is `yes` (any case): abbreviated ids are followed by `...`
+   * where git's `print_sha1_ellipsis` asks for it (checkout's "HEAD is now at <abbrev>...")
+   */
+  printSha1Ellipsis?: boolean;
 }
 
 const join = (dir: string, name: string) =>

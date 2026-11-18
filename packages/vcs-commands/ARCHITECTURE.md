@@ -211,6 +211,7 @@ Each command lives in its own file following the pattern `<name>-command.ts`:
 | `checkout-command.ts` | CheckoutCommand | Switch branches/restore files |
 | `merge-command.ts` | MergeCommand | Merge branches |
 | `rebase-command.ts` | RebaseCommand | Rebase commits |
+| `bisect/` | BisectCommand, BisectStartCommand, ... | `git bisect`: the engine (`bisect-engine.ts`), the walk and `find_bisection` (`bisect-graph.ts`) |
 | `reset-command.ts` | ResetCommand | Reset HEAD position |
 | `fetch-command.ts` | FetchCommand | Fetch from remote |
 | `push-command.ts` | PushCommand | Push to remote |

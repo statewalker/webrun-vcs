@@ -58,6 +58,7 @@ export interface NodeGitHostEnvironment {
   noReplaceObjects?: boolean;
   replaceRefBase?: string;
   graftFile?: string;
+  printSha1Ellipsis?: boolean;
 }
 
 /**
@@ -103,9 +104,9 @@ function envBool(value: string | undefined): boolean {
  * `GIT_COMMITTER_NAME` / `_EMAIL` / `_DATE` for the committer and the reflog identity,
  * `GIT_AUTHOR_NAME` / `_EMAIL` / `_DATE` for the author, `EMAIL` for git's `$EMAIL`,
  * `GIT_ATTR_SOURCE` for the tree attributes are read from, `GIT_NO_REPLACE_OBJECTS` and
- * `GIT_REPLACE_REF_BASE` for replace refs, `GIT_GRAFT_FILE` for the grafts file), files
- * read by absolute path. The system files default to `/etc/gitconfig` and
- * `/etc/gitattributes`.
+ * `GIT_REPLACE_REF_BASE` for replace refs, `GIT_GRAFT_FILE` for the grafts file,
+ * `GIT_PRINT_SHA1_ELLIPSIS` for the `...` after abbreviated ids), files read by absolute
+ * path. The system files default to `/etc/gitconfig` and `/etc/gitattributes`.
  *
  * @example
  * ```typescript
@@ -161,5 +162,7 @@ export function createNodeGitHostEnvironment(
     // set but empty is a base too (git: every ref is then a candidate replace ref)
     ...(env.GIT_REPLACE_REF_BASE !== undefined ? { replaceRefBase: env.GIT_REPLACE_REF_BASE } : {}),
     ...(env.GIT_GRAFT_FILE !== undefined ? { graftFile: env.GIT_GRAFT_FILE } : {}),
+    // git's print_sha1_ellipsis: "yes" in any case
+    ...(env.GIT_PRINT_SHA1_ELLIPSIS?.toLowerCase() === "yes" ? { printSha1Ellipsis: true } : {}),
   };
 }

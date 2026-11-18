@@ -694,6 +694,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (!commit) return undefined;
       const grafted = bytes ? replacements?.grafts.get(id) : undefined;
       if (grafted) commit.parents = [...grafted];
+      // a shallow commit is shown without parents (its diff against the empty tree)
+      if (shallow.has(id)) commit.parents = [];
       if (this.authorPattern !== undefined && !this.matchesAuthor(commit)) return undefined;
       if (this.committerPattern !== undefined && !this.matchesCommitter(commit)) return undefined;
       return { ...commit, id };
@@ -1516,6 +1518,20 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       keys.push(vec);
     }
     return { settings, keys };
+  }
+
+  private comparedPathspec?: TreePathspec & { literal: Uint8Array[][] | undefined };
+
+  /**
+   * Whether trees `from` (undefined: the empty tree) and `to` differ at the paths added
+   * ({@link addPath}, {@link excludePath}): the pruned tree comparison of this walk's
+   * history simplification (git's rev_compare_tree, no Bloom filter asked), for the walks of
+   * other commands (`git bisect`). Trees read are cached as the walk's are.
+   */
+  async pathsDiffer(from: ObjectId | undefined, to: ObjectId): Promise<boolean> {
+    this.comparedPathspec ??= this.pathspec();
+    const ps = this.comparedPathspec;
+    return this.differsAtPaths(from, to, ps, ps.literal, undefined, -1, undefined, -1);
   }
 
   /**

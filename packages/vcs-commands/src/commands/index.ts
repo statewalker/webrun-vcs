@@ -1,4 +1,5 @@
 export * from "./add-command.js";
+export * from "./bisect/index.js";
 export * from "./blame-command.js";
 export * from "./branch-command.js";
 export { TrackMode } from "./branch-tracking.js";

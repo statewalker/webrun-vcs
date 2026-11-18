@@ -38,6 +38,7 @@ import {
   formatNumstat,
   formatShortstat,
   formatStat,
+  formatSummary,
   writePairPatch,
 } from "../results/diff-output.js";
 import { quotePath } from "../results/quote-path.js";
@@ -52,6 +53,7 @@ export type DiffOutputFormat =
   | "stat"
   | "numstat"
   | "shortstat"
+  | "summary"
   | "name-only"
   | "name-status";
 
@@ -180,10 +182,11 @@ function abbrevOption(value: number | undefined): number | undefined {
   return Math.min(40, Math.max(4, Math.trunc(value)));
 }
 
-function renamesValue(value: string | undefined): boolean | undefined {
+/** `diff.renames` as git_config_rename reads it: `copies`/`copy` detect copies too. */
+function renamesValue(value: string | undefined): boolean | "copies" | undefined {
   if (value === undefined) return undefined;
   const v = value.trim().toLowerCase();
-  if (v === "copies" || v === "copy") return true;
+  if (v === "copies" || v === "copy") return "copies";
   return boolValue(v);
 }
 
@@ -506,12 +509,42 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       "numstat",
       "stat",
       "shortstat",
+      "summary",
       "patch",
     ];
+    // run_diff_files prints the combined diff (`diff --cc`) of a conflicted path as it finds
+    // it, before diff_flush prints any format of the rest
+    if (combined.length > 0 && formats.includes("patch")) {
+      // combine-diff.c's index lines take DEFAULT_ABBREV, whatever --abbrev says
+      let combinedLengths: ReadonlyMap<string, number> | undefined;
+      if (!options.fullIndex) {
+        const ids = new Set<string>([NULL_ID]);
+        for (const c of combined) {
+          ids.add(c.ours.objectId);
+          ids.add(c.theirs.objectId);
+        }
+        combinedLengths = await this.idAbbreviator().lengths(ids);
+      }
+      for (const c of combined) await this.writeCombined(sink, c, options, combinedLengths);
+    }
+    // diff_flush of an empty queue prints nothing
+    if (pairs.length === 0) return;
     let separator = false;
     for (const format of order) {
       if (!formats.includes(format)) continue;
       if (format === "patch" && separator) sink.text("\n");
+      // diff_flush: an empty summary (is_summary_empty) prints nothing and asks no separator
+      if (format === "summary") {
+        const text = formatSummary(
+          pairs.filter((p) => !unmerged.has(p)),
+          quote,
+        );
+        if (text) {
+          sink.text(text);
+          separator = true;
+        }
+        continue;
+      }
       separator = true;
       switch (format) {
         case "patch": {
@@ -526,18 +559,6 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             // `--abbrev=<n>`: at least n digits
             options.abbrevLengths = await this.idAbbreviator().lengths(ids, options.abbrev);
           }
-          // combine-diff.c's index lines take DEFAULT_ABBREV, whatever --abbrev says
-          let combinedLengths: ReadonlyMap<string, number> | undefined;
-          if (combined.length > 0 && !options.fullIndex) {
-            const ids = new Set<string>([NULL_ID]);
-            for (const c of combined) {
-              ids.add(c.ours.objectId);
-              ids.add(c.theirs.objectId);
-            }
-            combinedLengths = await this.idAbbreviator().lengths(ids);
-          }
-          // git prints the combined diffs of conflicted paths as it finds them, before the rest
-          for (const c of combined) await this.writeCombined(sink, c, options, combinedLengths);
           for (const pair of pairs) {
             if (unmerged.has(pair)) {
               sink.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
@@ -878,7 +899,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * against the worktree, as `diff-files` does).
    */
   private async collect(
-    renames: boolean,
+    renames: boolean | "copies",
     patch = false,
   ): Promise<{ entries: DiffEntry[]; combined: CombinedEntry[] }> {
     const worktree = this.worktreeAccess;
@@ -926,7 +947,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       newSide = await this.treeSide("HEAD", true);
     }
     const entries = this.pairUp(oldSide, newSide, unmerged);
-    if (renames) await this.detectRenames(entries);
+    if (renames) await this.detectRenames(entries, renames === "copies");
     return { entries, combined };
   }
 
@@ -1024,9 +1045,16 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     return entries;
   }
 
-  /** git's `diffcore_rename` over the added and deleted paths */
-  private async detectRenames(entries: DiffEntry[]): Promise<void> {
-    const sources = entries.filter((e) => e.changeType === ChangeType.DELETE);
+  /**
+   * git's `diffcore_rename` over the added and deleted paths; `copies` (DIFF_DETECT_COPY,
+   * `diff.renames=copies`): the modified paths are sources too, which stay (copied only)
+   */
+  private async detectRenames(entries: DiffEntry[], copies = false): Promise<void> {
+    const sources = entries.filter(
+      (e) =>
+        e.changeType === ChangeType.DELETE ||
+        (copies && e.changeType === ChangeType.MODIFY && !e.unmerged),
+    );
     const destinations = entries.filter((e) => e.changeType === ChangeType.ADD);
     if (sources.length === 0 || destinations.length === 0) return;
     const byPath = new Map<string, DiffEntry>();
@@ -1050,11 +1078,17 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const limit =
       this.renameLimit ?? intValue(this.config.value("diff.renameLimit")) ?? DEFAULT_RENAME_LIMIT;
     const pairs = await detectRenames(
-      sources.map((e) => ({ path: e.oldPath ?? "", mode: e.oldMode ?? 0, id: e.oldId ?? "" })),
+      sources.map((e) => ({
+        path: e.oldPath ?? "",
+        mode: e.oldMode ?? 0,
+        id: e.oldId ?? "",
+        ...(e.changeType === ChangeType.MODIFY ? { kept: true } : {}),
+      })),
       destinations.map((e) => ({ path: e.newPath ?? "", mode: e.newMode ?? 0, id: e.newId ?? "" })),
       {
         renameLimit: limit,
         countLastSpan: this.textOptions.renameCountLastSpan,
+        copies,
         size: async (c, role) => {
           const e = byPath.get(`${role === "source" ? "s" : "d"}:${c.path}`);
           if (role === "destination" && e?.readNew) return (await e.readNew()).length;
@@ -1076,8 +1110,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       const src = byPath.get(`s:${pair.from}`);
       const dst = byPath.get(`d:${pair.to}`);
       if (!src || !dst) continue;
-      drop.add(src);
-      dst.changeType = ChangeType.RENAME;
+      // a deleted source taken by a rename or copy is no deletion any more
+      if (src.changeType === ChangeType.DELETE) drop.add(src);
+      dst.changeType = pair.copy ? ChangeType.COPY : ChangeType.RENAME;
       dst.oldPath = src.oldPath;
       dst.oldId = src.oldId;
       dst.oldMode = src.oldMode;
