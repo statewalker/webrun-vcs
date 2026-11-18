@@ -241,7 +241,8 @@ export class FileStagingStore implements Staging {
   }
 
   setCacheTree(tree: CacheTree | undefined): void {
-    this.indexFile.setCacheTree(tree);
+    // the entries it describes: later edits before the write invalidate their paths
+    this.indexFile.setCacheTree(tree, this._entries);
   }
 
   getCacheTree(): CacheTree | undefined {
@@ -266,9 +267,7 @@ export class FileStagingStore implements Staging {
 
     // Build tree from stage 0 entries only
     // an intent-to-add entry is no part of the tree (git's update_one skips it)
-    const stage0 = this._entries.filter(
-      (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
-    );
+    const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED && !e.intentToAdd);
     // the directories the cache-tree has valid keep their trees, as git's write-tree
     // (`cache_tree_update`): a tree primed by a reset keeps its stored modes (100664)
     return this.buildTreeRecursive(trees, stage0, "", this.getCacheTree());

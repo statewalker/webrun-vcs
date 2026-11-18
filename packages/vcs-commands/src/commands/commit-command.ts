@@ -1,5 +1,5 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import { IndexChangedError, type IndexEntry, type Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   EmptyCommitError,
@@ -493,6 +493,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
 
     // Generate tree from staging area
+    // an index another writer replaced since this instance read it is refused, as every
+    // index write refuses it: its stale entries are not committed
+    if (await this.staging.isOutdated()) throw new IndexChangedError("index");
     let treeId: ObjectId;
 
     if (this.onlyPaths.length > 0 && parents.length > 0) {
@@ -502,8 +505,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // Normal mode: use full staging area; as git's prepare_index, the index is written
       // again with a fully valid cache-tree (cache_tree_update, which keeps the valid nodes:
       // a stored subtree no edit touched stays the one stored)
-      // (an index another writer replaced since it was read is not overwritten)
-      treeId = await writeIndexAsTree(this.staging, this.trees, { keepChangedIndex: true });
+      treeId = await writeIndexAsTree(this.staging, this.trees);
     }
 
     // Check for empty commit (a merge may record HEAD's tree)
@@ -643,8 +645,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // Collect staging entries for onlyPaths
     const onlyPathSet = new Set(this.onlyPaths);
     const stagingEntriesMap = new Map<string, { objectId: ObjectId; mode: number }>();
+    // the index as it is, given back once the tree is written (flags and stat included)
+    const saved: IndexEntry[] = [];
 
     for await (const entry of this.staging.entries()) {
+      saved.push(entry);
       if (onlyPathSet.has(entry.path) && entry.stage === 0) {
         stagingEntriesMap.set(entry.path, {
           objectId: entry.objectId,
@@ -673,7 +678,14 @@ export class CommitCommand extends GitCommand<CommitResult> {
     await builder.finish();
 
     // Now write tree from staging
-    return await this.staging.writeTree(this.trees);
+    try {
+      return await this.staging.writeTree(this.trees);
+    } finally {
+      // the temporary index goes: later writes keep the index's own entries untouched
+      const restore = this.staging.createBuilder();
+      for (const entry of saved) restore.add(entry);
+      await restore.finish();
+    }
   }
 
   /**

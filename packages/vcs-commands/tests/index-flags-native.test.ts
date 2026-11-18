@@ -447,7 +447,8 @@ describeGit(
       expect(gitOk(root, ours, "write-tree")).toBe(gitOk(root, native, "write-tree"));
 
       gitOk(root, native, "commit", "-q", "-m", "c1");
-      await g
+      // native write-tree above rewrote the index: a fresh instance commits it
+      await (await openOurs(ours))
         .commit()
         .setMessage("c1")
         .setAuthorIdent(INTEROP_IDENT)
@@ -483,10 +484,14 @@ describeGit(
       buildModes(dir);
       gitOk(root, dir, "checkout", "-q", "-b", "side");
       put(dir, "keep/y", "side\n");
-      gitOk(root, dir, "commit", "-q", "-a", "-m", "side");
+      // `git add <file>`, not `commit -a`: a racy re-add of every entry would invalidate the
+      // cache-tree of old/ (its 100664 tree) or not, by the clock
+      gitOk(root, dir, "add", "keep/y");
+      gitOk(root, dir, "commit", "-q", "-m", "side");
       gitOk(root, dir, "checkout", "-q", "main");
       put(dir, "f", "main\n");
-      gitOk(root, dir, "commit", "-q", "-a", "-m", "main");
+      gitOk(root, dir, "add", "f");
+      gitOk(root, dir, "commit", "-q", "-m", "main");
     }
 
     const commands: [
@@ -544,3 +549,135 @@ describeGit(
     }
   },
 );
+
+describeGit("intent-to-add, rm, a stale index and rebase over flagged entries, as git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "index-flags-more-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** a, d/x, d/y committed on main */
+  function buildPlain(dir: string): void {
+    gitOk(root, root, "init", "-q", "-b", "main", dir);
+    put(dir, "a", "a\n");
+    put(dir, "d/x", "x\n");
+    put(dir, "d/y", "y\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "c0");
+  }
+
+  it("an intent-to-add entry with skip-worktree is no part of the tree (update_one)", async () => {
+    const native = join(root, "ita-n");
+    const ours = join(root, "ita-o");
+    for (const dir of [native, ours]) {
+      buildPlain(dir);
+      put(dir, "d/new", "new\n");
+      gitOk(root, dir, "add", "-N", "d/new");
+      gitOk(root, dir, "update-index", "--skip-worktree", "d/new");
+      put(dir, "a", "changed\n");
+      gitOk(root, dir, "add", "a");
+    }
+    gitOk(root, native, "commit", "-q", "-m", "c1");
+    const g = await openOurs(ours);
+    await g
+      .commit()
+      .setMessage("c1")
+      .setAuthorIdent(INTEROP_IDENT)
+      .setCommitterIdent(INTEROP_IDENT)
+      .call();
+    expect(gitOk(root, native, "ls-tree", "-r", "--name-only", "HEAD").trim()).toBe("a\nd/x\nd/y");
+    expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(gitOk(root, native, "rev-parse", "HEAD"));
+    // the directory above the intent-to-add entry stays invalid, as git leaves it
+    expect(await treeExtension(ours)).toBe(await treeExtension(native));
+    expect(await cacheTreeProblems(ours)).toEqual([]);
+    expect(gitOk(root, ours, "ls-files", "-s", "-v")).toBe(
+      gitOk(root, native, "ls-files", "-s", "-v"),
+    );
+  });
+
+  it("rm leaves the other entries as they are: flags and stat data", async () => {
+    const native = join(root, "rm-n");
+    const ours = join(root, "rm-o");
+    for (const dir of [native, ours]) {
+      buildPlain(dir);
+      put(dir, "b", "b\n");
+      put(dir, "c", "c\n");
+      gitOk(root, dir, "add", "b", "c");
+      gitOk(root, dir, "commit", "-q", "-m", "c1");
+      put(dir, "n", "intent\n");
+      gitOk(root, dir, "add", "-N", "n");
+      gitOk(root, dir, "update-index", "--skip-worktree", "b");
+      gitOk(root, dir, "update-index", "--assume-unchanged", "c");
+    }
+    const statOf = async (dir: string) => {
+      const parsed = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+      return parsed.entries
+        .filter((e) => e.path !== "d/x")
+        .map((e) => `${e.path} ${e.mtime} ${e.mtimeNs ?? 0} ${e.size} ${e.ino ?? 0}`);
+    };
+    const before = await statOf(ours);
+    gitOk(root, native, "rm", "-q", "--cached", "d/x");
+    const g = await openOurs(ours);
+    await g.rm().addFilepattern("d/x").setCached(true).call();
+    expect(gitOk(root, ours, "ls-files", "-s", "-v")).toBe(
+      gitOk(root, native, "ls-files", "-s", "-v"),
+    );
+    expect(await statOf(ours)).toEqual(before);
+    expect(gitOk(root, ours, "diff-files", "--name-status")).toBe(
+      gitOk(root, native, "diff-files", "--name-status"),
+    );
+    expect(gitOk(root, ours, "write-tree")).toBe(gitOk(root, native, "write-tree"));
+    expect(await cacheTreeProblems(ours)).toEqual([]);
+  });
+
+  it("commit refuses an index another writer replaced since it was read", async () => {
+    const dir = join(root, "stale");
+    buildPlain(dir);
+    const g = await openOurs(dir);
+    put(dir, "a", "native\n");
+    gitOk(root, dir, "add", "a");
+    const head = gitOk(root, dir, "rev-parse", "HEAD");
+    await expect(
+      g
+        .commit()
+        .setMessage("stale")
+        .setAuthorIdent(INTEROP_IDENT)
+        .setCommitterIdent(INTEROP_IDENT)
+        .call(),
+    ).rejects.toThrow(/index changed on disk/);
+    expect(gitOk(root, dir, "rev-parse", "HEAD")).toBe(head);
+    expect(gitOk(root, dir, "diff", "--cached", "--name-only").trim()).toBe("a");
+  });
+
+  it("rebase goes on over a dirty assume-unchanged file (require_clean_work_tree)", async () => {
+    const build = (dir: string) => {
+      buildPlain(dir);
+      gitOk(root, dir, "checkout", "-q", "-b", "side");
+      put(dir, "d/x", "side\n");
+      gitOk(root, dir, "add", "d/x");
+      gitOk(root, dir, "commit", "-q", "-m", "side");
+      gitOk(root, dir, "checkout", "-q", "main");
+      put(dir, "d/y", "main\n");
+      gitOk(root, dir, "add", "d/y");
+      gitOk(root, dir, "commit", "-q", "-m", "main");
+      gitOk(root, dir, "update-index", "--assume-unchanged", "a");
+      put(dir, "a", "dirty\n");
+    };
+    const native = join(root, "rebase-n");
+    const ours = join(root, "rebase-o");
+    build(native);
+    build(ours);
+    const r = git(root, native, "rebase", "-q", "side");
+    expect(r.status).toBe(0);
+    const g = await openOurs(ours, INTEROP_AUTHOR_ENV);
+    const command = g.rebase().setCommitter(INTEROP_IDENT);
+    await command.setUpstreamBranch("side");
+    const result = await command.call();
+    expect(result.status).not.toBe("uncommitted-changes");
+    expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(gitOk(root, native, "rev-parse", "HEAD"));
+    expect(readFileSync(join(ours, "a"), "utf8")).toBe(readFileSync(join(native, "a"), "utf8"));
+    expect(gitOk(root, ours, "ls-files", "-s", "-v")).toBe(
+      gitOk(root, native, "ls-files", "-s", "-v"),
+    );
+  });
+});

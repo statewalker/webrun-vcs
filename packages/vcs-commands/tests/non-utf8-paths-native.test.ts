@@ -169,7 +169,8 @@ describeGit("paths that are no valid UTF-8, against native git", () => {
     expect(listing(twin)).toBe(listing(native));
     expect(gitText(twin, "ls-files")).toContain('"n\\351w/f\\374.txt"');
     expect(gitText(twin, "write-tree")).toBe(gitText(native, "write-tree"));
-    const commit = await git
+    // native write-tree above rewrote the index: a fresh instance commits it
+    const commit = await (await openOurs(twin))
       .commit()
       .setMessage("latin-1 names")
       .setAuthorIdent(INTEROP_IDENT)

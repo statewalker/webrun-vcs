@@ -366,7 +366,7 @@ export async function verifyCacheTree(
 ): Promise<string[]> {
   const problems: string[] = [];
   if (!tree) return problems;
-  const inTree = entries.filter((e) => e.stage === 0 && !(e.intentToAdd && !e.skipWorktree));
+  const inTree = entries.filter((e) => e.stage === 0 && !e.intentToAdd);
   const flatten = async (id: ObjectId, prefix: string, out: string[]): Promise<boolean> => {
     const list = await trees.load(id);
     if (!list) return false;

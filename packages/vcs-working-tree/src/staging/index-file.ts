@@ -203,6 +203,8 @@ export class IndexFile {
   private entriesKept: readonly StagingEntry[] | undefined;
   /** A cache-tree computed for the entries of the next write (see `setCacheTree`). */
   private pendingCacheTree: CacheTree | undefined;
+  /** The entries `pendingCacheTree` describes, when given: the write invalidates what changed since. */
+  private pendingEntries: readonly StagingEntry[] | undefined;
   /** Why the last read refused the index; writes refuse it too until a read succeeds. */
   private refused: Error | undefined;
   /**
@@ -319,11 +321,15 @@ export class IndexFile {
 
   /**
    * Write `tree` as the `TREE` extension with the next `write` (git's cache-tree after
-   * `unpack_trees` or `write_index_as_tree`), replacing what was read. It must describe the
-   * entries that write is given; a valid root whose count disagrees with them is dropped.
+   * `unpack_trees` or `write_index_as_tree`), replacing what was read. It describes
+   * `entries` (the index when it is set); the write invalidates each path whose entries
+   * changed since, as git's index edits invalidate it. Without `entries` it must describe
+   * the entries that write is given; a valid root whose count disagrees with them is dropped.
    */
-  setCacheTree(tree: CacheTree | undefined): void {
+  setCacheTree(tree: CacheTree | undefined, entries?: readonly StagingEntry[]): void {
     this.pendingCacheTree = tree;
+    // a copy: the caller's list may be edited in place
+    this.pendingEntries = tree && entries ? entries.slice() : undefined;
   }
 
   /**
@@ -359,8 +365,11 @@ export class IndexFile {
     let extensions = carryIndexExtensions(this.extensions, entries, changed);
     // without a cache-tree computed for these entries, the one read or last written goes on
     // with each changed path invalid (git keeps the nodes no edit touched valid)
-    const tree = this.pendingCacheTree ?? (changed ? this.cacheTree(entries) : undefined);
+    let tree = this.pendingCacheTree;
+    if (tree && this.pendingEntries) invalidateChangedPaths(tree, this.pendingEntries, entries);
+    else if (!tree && changed) tree = this.cacheTree(entries);
     this.pendingCacheTree = undefined;
+    this.pendingEntries = undefined;
     if (tree && describesEntries(tree, entries)) {
       // git writes the cache-tree first
       extensions = [
@@ -385,7 +394,7 @@ function describesEntries(tree: CacheTree, entries: readonly StagingEntry[]): bo
   let count = 0;
   for (const e of entries) {
     if (e.stage !== 0) return false;
-    if (!(e.intentToAdd && !e.skipWorktree)) count++;
+    if (!e.intentToAdd) count++;
   }
   return count === tree.entryCount;
 }

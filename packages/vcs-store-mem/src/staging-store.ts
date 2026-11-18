@@ -224,9 +224,7 @@ export class MemoryStagingStore implements Staging {
     }
 
     // an intent-to-add entry is no part of the tree (git's update_one skips it)
-    const stage0 = this._entries.filter(
-      (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
-    );
+    const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED && !e.intentToAdd);
     return this.buildTreeRecursive(trees, stage0, "");
   }
 

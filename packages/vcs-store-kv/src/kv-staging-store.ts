@@ -332,7 +332,7 @@ export class KVStaging implements Staging {
     const entries: StagingEntry[] = [];
     for await (const entry of this.listEntries()) {
       // an intent-to-add entry is no part of the tree (git's update_one skips it)
-      if (entry.stage === MergeStage.MERGED && !(entry.intentToAdd && !entry.skipWorktree)) {
+      if (entry.stage === MergeStage.MERGED && !entry.intentToAdd) {
         entries.push(entry);
       }
     }

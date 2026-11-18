@@ -362,6 +362,8 @@ export async function flaggedEntryDiffers(
   if (!current) return false;
   if (current.isDirectory) return entry.mode !== FileMode.GITLINK;
   if (entry.mode === FileMode.GITLINK) return false;
+  // an intent-to-add entry never matches its file (ie_match_stat: DATA_CHANGED)
+  if (entry.intentToAdd) return true;
   if ((current.mode === FileMode.SYMLINK) !== (entry.mode === FileMode.SYMLINK)) return true;
   if (
     trust?.executable &&
@@ -371,10 +373,10 @@ export async function flaggedEntryDiffers(
     return true;
   }
   if (!basicStatMatches(entry, current, trust)) return true;
+  // an index without a timestamp (0) has no racy entry (git's is_racy_stat)
   const racy =
     indexTime === undefined ||
-    indexTime <= 0 ||
-    wholeSeconds(entry.mtime, entry.mtimeNs) >= wholeSeconds(indexTime);
+    (indexTime > 0 && wholeSeconds(entry.mtime, entry.mtimeNs) >= wholeSeconds(indexTime));
   return racy && (await worktree.computeHash(path)) !== entry.objectId;
 }
 

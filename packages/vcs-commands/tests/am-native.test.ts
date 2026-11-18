@@ -497,7 +497,11 @@ describeGit("git am as native git", () => {
   it("advises --allow-empty on --continue and fails --abort as git", async () => {
     const pair = twins();
     const path = join(root, `m${counter++}`);
-    writeFileSync(path, "From: A <a@x>\nSubject: no patch\n\nbody only\n");
+    // with a Date: header (without one, git am dates the commit by the wall clock)
+    writeFileSync(
+      path,
+      "From: A <a@x>\nSubject: no patch\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nbody only\n",
+    );
     const bytes = readFileSync(path);
     await compare(pair, [path], (c) => c.addMbox(bytes, path), "empty patch");
     await compare(pair, ["--continue"], (c) => c.setResume("continue"), "continue empty");

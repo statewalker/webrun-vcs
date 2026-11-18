@@ -24,6 +24,7 @@ import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
 import { conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
+import { updateIndexCacheTree } from "./merge-support.js";
 import { type OrtConflict, ortMerge, ortResultEntries } from "./ort-merge.js";
 import { STASH_REF } from "./stash-list-command.js";
 import {
@@ -488,7 +489,9 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     }
 
     // the index: unpack-trees staged the merge's paths (then unstaged them, without --index),
-    // so their directories in the cache-tree go invalid, as each path git staged
+    // so their directories in the cache-tree go invalid, as each path git staged; the edits
+    // below invalidate the paths they change as well (IndexFile diffs the entries this
+    // cache-tree describes with the ones written)
     const cached = this.staging.getCacheTree?.();
     if (cached && this.staging.setCacheTree && changed.length > 0) {
       const tree = copyCacheTree(cached);
@@ -548,14 +551,18 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         if (entry) await stage(path, entry, 0);
         else editor.remove(path);
       }
+      await editor.finish();
+      // reset_tree's unpack-trees ends with cache_tree_update: the invalid directories
+      // computed from the index (fully valid)
+      await updateIndexCacheTree(this.staging, this.trees);
     } else {
       // the index keeps its entries, plus the files the stash adds (git stages them)
       for (const path of changed) {
         const result = merge.result.get(path);
         if (result && !ours.has(path)) await stage(path, result, 0);
       }
+      await editor.finish();
     }
-    await editor.finish();
     await this.staging.write();
     await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
 
