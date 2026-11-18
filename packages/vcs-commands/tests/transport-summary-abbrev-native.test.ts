@@ -374,7 +374,11 @@ describeGit(
   () => {
     let backend: NativeGitHttpBackend;
     const originalFetch = globalThis.fetch;
-    /** git 2.5x: a refused update skips FETCH_HEAD and set_head (2.43 writes FETCH_HEAD) */
+    /**
+     * git 2.48+ follows the remote HEAD on a fetch (remote.<name>.followRemoteHEAD, set_head,
+     * which a refused update skips); 2.43 never does. FETCH_HEAD gets its lines after a refusal
+     * in both (not with --atomic)
+     */
     const modern = /git version 2\.(5\d|[6-9]\d)/.test(run(process.cwd(), ["--version"]));
 
     beforeEach(() => {
@@ -566,6 +570,116 @@ describeGit(
       await (await open(ours)).fetch().setRemote("origin").call();
       expect(head(ours)).toBe("refs/remotes/origin/same");
       if (modern) expect(head(native)).toBe(head(ours));
+    });
+
+    const allRefs = (dir: string) =>
+      run(dir, ["for-each-ref", "--format=%(refname) %(objectname) %(symref)"]);
+    /** Every object id in a repository (loose and packed), sorted. */
+    const objectIds = (dir: string) =>
+      run(dir, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])
+        .split("\n")
+        .filter(Boolean)
+        .sort();
+
+    it("--atomic --prune and a refused update: the stale ref stays (prune is in the transaction)", async () => {
+      const { src, native, ours } = setup(true);
+      const nativeOut = spawnSync("git", ["fetch", "--atomic", "--prune", "origin"], {
+        cwd: native,
+        env: nativeGitEnv(home),
+        encoding: "latin1",
+      });
+      expect(nativeOut.status).toBe(1);
+      const result = await (await open(ours))
+        .fetch()
+        .setRemote("origin")
+        .setAtomic(true)
+        .setRemoveDeletedRefs(true)
+        .call();
+      expect(run(native, ["rev-parse", "--verify", "-q", "refs/remotes/origin/gone"])).not.toBe("");
+      expect(allRefs(ours)).toBe(allRefs(native));
+      // the prune's line is printed all the same, as prune_refs prints it (git 2.5x prints
+      // the lines after a refusal with a summary width of 0, 2.43 padded them)
+      const even = (lines: string[]) => (modern ? lines : lines.map((l) => l.replace(/ +/g, " ")));
+      expect(even(fromLine(result.display ?? [], src))).toEqual(even(refLines(nativeOut.stderr)));
+      // without --atomic the stale ref is pruned first, on its own
+      spawnSync("git", ["fetch", "--prune", "origin"], { cwd: native, env: nativeGitEnv(home) });
+      await (await open(ours)).fetch().setRemote("origin").setRemoveDeletedRefs(true).call();
+      expect(allRefs(native)).not.toContain("refs/remotes/origin/gone");
+      expect(allRefs(ours)).toBe(allRefs(native));
+    });
+
+    it("--atomic and a ref store failure (a D/F conflict): accepted lines, git's error, no ref, no remote HEAD", async () => {
+      const { src, native, ours } = setup();
+      const bare = join(root, "src.git");
+      // `same` becomes `same/x` upstream: refs/remotes/origin/same/x cannot be created here
+      const main = run(bare, ["rev-parse", "refs/heads/main"]).trim();
+      run(bare, ["update-ref", "-d", "refs/heads/same"]);
+      run(bare, ["update-ref", "refs/heads/same/x", main]);
+      run(bare, ["symbolic-ref", "HEAD", "refs/heads/feature/a-rather-long-branch-name"]);
+      for (const dir of [native, ours]) {
+        run(dir, ["config", "remote.origin.followRemoteHEAD", "always"]);
+        execFileSync("sh", ["-c", "echo stale > .git/FETCH_HEAD"], { cwd: dir });
+      }
+      const nativeOut = spawnSync("git", ["fetch", "--atomic", "origin"], {
+        cwd: native,
+        env: nativeGitEnv(home),
+        encoding: "latin1",
+      });
+      expect(nativeOut.status).not.toBe(0);
+      const result = await (await open(ours)).fetch().setRemote("origin").setAtomic(true).call();
+      const nativeLines = refLines(nativeOut.stderr);
+      expect(nativeLines.some((l) => l.includes("[new branch]"))).toBe(true);
+      expect(nativeLines.some((l) => l.startsWith(" !"))).toBe(false);
+      expect(fromLine(result.display ?? [], src)).toEqual(nativeLines);
+      // git 2.43 said `cannot lock ref '<ref>': ` before the refs code's words
+      const nativeErrors = nativeOut.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("error: "))
+        .map((l) => l.replace(/^error: cannot lock ref '[^']*': /, "error: "));
+      expect(nativeErrors).toEqual([
+        "error: 'refs/remotes/origin/same' exists; cannot create 'refs/remotes/origin/same/x'",
+      ]);
+      expect((result.errors ?? []).map((e) => `error: ${e}`)).toEqual(nativeErrors);
+      // nothing written, the remote HEAD not followed, FETCH_HEAD left truncated
+      expect(allRefs(ours)).toBe(allRefs(native));
+      expect(fetchHead(ours, src)).toBe(fetchHead(native, src));
+    });
+
+    it("a refused update makes no second round trip: tags of objects here come with the tips", async () => {
+      const { src, native, ours } = setup(true);
+      const work = join(root, "work");
+      const bare = join(root, "src.git");
+      // an annotated tag of a commit both clones have: include-tag does not send it
+      run(work, ["tag", "-a", "-m", "old", "oldtag", "HEAD~3"]);
+      run(work, ["push", "-q", bare, "refs/tags/oldtag"]);
+      const nativeOut = spawnSync("git", ["fetch", "origin"], {
+        cwd: native,
+        env: { ...nativeGitEnv(home), GIT_TRACE_PACKET: "1" },
+        encoding: "latin1",
+      });
+      expect(nativeOut.status).toBe(1);
+      const nativeRounds = nativeOut.stderr
+        .split("\n")
+        .filter((l) => /> command=fetch$/.test(l)).length;
+      let rounds = 0;
+      const counting = globalThis.fetch;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, { ...init, duplex: "half" } as RequestInit);
+        const body = Buffer.from(await request.clone().arrayBuffer());
+        if (body.includes("command=fetch")) rounds++;
+        return counting(request);
+      }) as typeof globalThis.fetch;
+      try {
+        await (await open(ours)).fetch().setRemote("origin").call();
+      } finally {
+        globalThis.fetch = counting;
+      }
+      expect(nativeRounds).toBe(1);
+      expect(rounds).toBe(nativeRounds);
+      expect(allRefs(ours)).toBe(allRefs(native));
+      expect(allRefs(ours)).toContain("refs/tags/oldtag");
+      expect(objectIds(ours)).toEqual(objectIds(native));
+      expect(fetchHead(ours, src)).toBe(fetchHead(native, src));
     });
   },
 );

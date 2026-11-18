@@ -5,6 +5,7 @@ import {
   type GitObject,
   type GitObjects,
   type GraphCommitData,
+  graftFileBaseDir,
   graftFileReader,
   isSymbolicRef,
   openPack,
@@ -434,7 +435,18 @@ export class FsckCommand extends GitCommand<FsckResult> {
       linksKept: Math.max(0, this._limits.links ?? DEFAULT_LINKS_KEPT),
       graphCommitsKept: Math.max(0, this._limits.graphCommits ?? DEFAULT_GRAPH_COMMITS_KEPT),
       graftsAdvice: configBool(this.workingCopy, "advice.graftFileDeprecated", true),
-      readGraftFile: graftFileReader(hostEnvironmentOf(this.workingCopy)),
+      readGraftFile: graftFileReader(
+        hostEnvironmentOf(this.workingCopy),
+        this._repository
+          ? {
+              files: this._repository.files,
+              dir: graftFileBaseDir(
+                this._repository.gitDir ?? ".git",
+                configBool(this.workingCopy, "core.bare", false) || undefined,
+              ),
+            }
+          : this.graftFileBase(),
+      ),
       commitGraph: {
         enabled: configBool(this.workingCopy, "core.commitGraph", true),
         generationVersion:

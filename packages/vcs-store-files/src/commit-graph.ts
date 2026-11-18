@@ -14,6 +14,7 @@ import {
   DEFAULT_COMMIT_GRAPH_SETTINGS,
   type FilesApi,
   type GitObjects,
+  graftFileBaseDir,
   graftFileReader,
   isSymbolicRef,
   joinPath,
@@ -122,7 +123,7 @@ export function createFilesCommitGraphProvider(options: {
   const gitDir = options.gitDir ?? ".git";
   return createCommitGraphProvider(async () => {
     const settings = await readCommitGraphSettings(files, gitDir, { environment });
-    const readGraftFile = graftFileReader(environment);
+    const readGraftFile = graftFileReader(environment, { files, dir: graftFileBaseDir(gitDir) });
     return loadRepositoryCommitGraph({
       files,
       gitDir,
@@ -216,7 +217,10 @@ export async function writeCommitGraph(
       gitDir,
       refs,
       useReplaceRefs: (options.replaceRefs ?? false) && settings.useReplaceRefs,
-      readGraftFile: graftFileReader(options.environment),
+      readGraftFile: graftFileReader(options.environment, {
+        files,
+        dir: graftFileBaseDir(gitDir),
+      }),
     }))
   ) {
     return none();

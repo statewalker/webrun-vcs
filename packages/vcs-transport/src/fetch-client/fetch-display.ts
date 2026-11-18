@@ -65,6 +65,11 @@ export function fetchUpdateDisplay(
         detail: "forced update",
       };
     case "rejected":
+      if (update.aborted && update.accepted) {
+        // an atomic transaction that failed as a whole: git prints the accepted line, then
+        // the transaction's error
+        return fetchUpdateDisplay({ ...update, status: update.accepted }, verbose);
+      }
       if (update.storeError !== undefined) {
         // accepted, then refused by the store: the accepted summary, git's fail detail
         return {

@@ -137,27 +137,104 @@ export async function readGraftParents(
 }
 
 /**
- * The reader of the grafts file an environment names (git's `GIT_GRAFT_FILE`), for
- * {@link readGraftParents} and `LoadObjectReplacementsOptions.readGraftFile`; undefined when
- * the environment names none (then `info/grafts` is read). Set but empty, there is no grafts
- * file; a file that cannot be read gives no grafts, as git warns and goes on.
+ * Where a relative `GIT_GRAFT_FILE` is read from: git opens it after its setup has changed
+ * to the top of the worktree (to the git directory in a bare repository), so a relative
+ * path names a file there, not in the process's current directory. `dir` is that directory:
+ * a path in `files` when given (the repository's FilesApi), else a host path read through
+ * the environment. See {@link graftFileBaseDir}.
+ */
+export interface GraftFileBase {
+  /** The worktree top (the git directory when bare), in `files` or on the host */
+  dir: string;
+  /** The FilesApi `dir` is in; absent: `dir` is a host path */
+  files?: { read(path: string): AsyncIterable<Uint8Array> } & {
+    stats(path: string): Promise<{ kind: string } | undefined | null>;
+  };
+}
+
+/**
+ * The directory a relative `GIT_GRAFT_FILE` is read from for the git directory `gitDir`: the
+ * worktree top (the directory holding `.git`), or `gitDir` itself in a bare repository
+ * (`bare`; by default a git directory not named `.git` is taken as bare).
  *
  * @example
  * ```typescript
- * await gc({ ...backend, readGraftFile: graftFileReader(environment) });
+ * graftFileBaseDir(".git"); // ""
+ * graftFileBaseDir("/srv/repo.git"); // "/srv/repo.git"
+ * ```
+ */
+export function graftFileBaseDir(gitDir: string, bare?: boolean): string {
+  const trimmed = gitDir.replace(/\/+$/, "");
+  const at = trimmed.lastIndexOf("/");
+  const name = trimmed.slice(at + 1);
+  if (bare ?? name !== ".git") return trimmed;
+  return at < 0 ? "" : at === 0 ? "/" : trimmed.slice(0, at);
+}
+
+/** `relative` resolved against `dir` (`..` taken out); undefined when it climbs above a root. */
+function resolveBelow(dir: string, relative: string): string | undefined {
+  const absolute = dir.startsWith("/");
+  const parts: string[] = [];
+  for (const part of `${dir}/${relative}`.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (parts.length === 0) return undefined;
+      parts.pop();
+    } else parts.push(part);
+  }
+  return `${absolute ? "/" : ""}${parts.join("/")}`;
+}
+
+/**
+ * The reader of the grafts file an environment names (git's `GIT_GRAFT_FILE`), for
+ * {@link readGraftParents} and `LoadObjectReplacementsOptions.readGraftFile`; undefined when
+ * the environment names none (then `info/grafts` is read). Set but empty, there is no grafts
+ * file; a file that cannot be read gives no grafts, as git warns and goes on. A relative path
+ * is read from `base` (the worktree top, see {@link GraftFileBase}), as git reads it; without
+ * a base, the environment reads it (from the process's current directory).
+ *
+ * @example
+ * ```typescript
+ * await gc({
+ *   ...backend,
+ *   readGraftFile: graftFileReader(environment, { files, dir: graftFileBaseDir(".git") }),
+ * });
  * ```
  */
 export function graftFileReader(
   environment:
     | { graftFile?: string; readFile(path: string): Promise<Uint8Array | undefined> }
     | undefined,
+  base?: GraftFileBase,
 ): (() => Promise<string | undefined>) | undefined {
   const graftFile = environment?.graftFile;
   if (environment === undefined || graftFile === undefined) return undefined;
+  const decode = (bytes: Uint8Array | undefined) =>
+    bytes === undefined ? undefined : new TextDecoder().decode(bytes);
   return async () => {
     if (!graftFile) return undefined;
-    const bytes = await environment.readFile(graftFile).catch(() => undefined);
-    return bytes === undefined ? undefined : new TextDecoder().decode(bytes);
+    const relative = !graftFile.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(graftFile);
+    if (!relative || base === undefined) {
+      return decode(await environment.readFile(graftFile).catch(() => undefined));
+    }
+    const path = resolveBelow(base.dir, graftFile);
+    if (path === undefined) return undefined;
+    const files = base.files;
+    if (!files) return decode(await environment.readFile(path).catch(() => undefined));
+    try {
+      if ((await files.stats(path))?.kind !== "file") return undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of files.read(path)) chunks.push(chunk);
+      const bytes = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+      let at = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, at);
+        at += chunk.length;
+      }
+      return decode(bytes);
+    } catch {
+      return undefined;
+    }
   };
 }
 

@@ -58,7 +58,11 @@ export interface GitHostEnvironment {
    * every ref is a candidate replace ref, as in git
    */
   replaceRefBase?: string;
-  /** `$GIT_GRAFT_FILE`: the grafts file read in place of `info/grafts` (read with readFile) */
+  /**
+   * `$GIT_GRAFT_FILE`: the grafts file read in place of `info/grafts`, as given; a relative
+   * path names a file in the worktree top (the git directory when bare), where git reads it
+   * (see `graftFileReader` of vcs-core)
+   */
   graftFile?: string;
 }
 

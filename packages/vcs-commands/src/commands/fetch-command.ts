@@ -639,18 +639,20 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       opportunisticRefspecs: opportunistic.length > 0 ? opportunistic : undefined,
       // fetch.c do_fetch: a branch a worktree has checked out is not fetched into (the
       // whole fetch dies first, unless --update-head-ok); stale refs are pruned before
-      // anything is fetched, with command-line refspecs by those, else by the configured ones
+      // anything is fetched, with command-line refspecs by those, else by the configured ones.
+      // With --atomic, prune_refs queues the deletions into the one transaction: a refused
+      // update or a failed commit leaves the stale refs too
       beforeFetch: async (remoteRefs, refMap) => {
         // check_not_current_branch over git's ref map: the refs the refspecs took and their
         // opportunistic updates, not every advertised ref the configured refspecs would map
         if (!this.updateHeadOk) await this.refuseCheckedOutBranch(refMap);
-        if (prune) {
-          const names = new Set(remoteRefs.filter((r) => r.oid).map((r) => r.name));
-          const pruneSpecs = (fromConfig ? configured : explicitSpecs).map((s) => parseRefSpec(s));
-          trackingUpdates.push(
-            ...(await this.pruneDeletedRefs(names, pruneSpecs, messages, errors)),
-          );
-        }
+        if (!prune) return;
+        const names = new Set(remoteRefs.filter((r) => r.oid).map((r) => r.name));
+        const pruneSpecs = (fromConfig ? configured : explicitSpecs).map((s) => parseRefSpec(s));
+        const defer = this.atomic && !this.dryRun;
+        const pruned = await this.pruneDeletedRefs(names, pruneSpecs, messages, errors, defer);
+        trackingUpdates.push(...pruned);
+        return defer ? { deletes: pruned.map((u) => u.localRef) } : undefined;
       },
       missingRefsOk: useConfig,
       tags: toTagMode(this.effectiveTagOption()),
@@ -681,6 +683,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       if (ref.oid) advertisedRefs.set(ref.name, ref.oid);
     }
     trackingUpdates.push(...result.refUpdates.map(toTrackingRefUpdate));
+    // a failed --atomic transaction: git's error after the ref lines
+    if (result.refTransactionError !== undefined) errors.push(result.refTransactionError);
 
     const entries = await this.fetchHeadEntries(result, {
       given: given.length,
@@ -695,9 +699,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // cleanup, past set_head (git 2.48+): the remote HEAD is not followed. FETCH_HEAD has its
     // lines all the same (append_fetch_head writes each as the refs are stored), except with
     // --atomic, where they wait for commit_fetch_head, which a refused or failed update skips:
-    // FETCH_HEAD stays as truncated
-    const refused = refusedUpdate(result);
+    // FETCH_HEAD stays as truncated. A failed --atomic transaction (the ref store refused it)
+    // jumps to the cleanup as well, past set_head; without --atomic the fetch goes on
     const atomicFailed = this.atomic && result.refUpdates.some((u) => u.status === "rejected");
+    const refused = refusedUpdate(result) || atomicFailed;
     if (writesFetchHead && checkout?.writeFetchHead && !atomicFailed) {
       // after the truncation above, every fetch adds its lines
       await checkout.writeFetchHead(formatFetchHead(entries, remoteUrl), { append: true });
@@ -1089,7 +1094,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
    * refspecs map from remote refs (all of the matching refspecs: overlapping ones count
    * together), none of which the remote has, unless a negative refspec excludes it or it is
    * a symbolic ref. They are deleted (reflogs too) in one batch, logged `fetch: prune`, and
-   * reported as deleted; a dry run reports them only. The symbolic refs left dangling are
+   * reported as deleted; a dry run reports them only, `defer` leaves the deletion to the
+   * --atomic transaction. The symbolic refs left dangling are
    * named in `messages` as git does. A refused delete does not stop the fetch: as in git
    * (which then exits 1), the error goes into `errors` and nothing is reported deleted.
    */
@@ -1098,6 +1104,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     specs: RefSpec[],
     messages: string[],
     errors: string[],
+    /** Leave the deletion to the caller (the --atomic transaction) */
+    defer = false,
   ): Promise<TrackingRefUpdate[]> {
     const negative = specs.filter((s) => s.negative && s.source);
     const mapping = specs.filter((s) => !s.negative && s.source && s.destination);
@@ -1121,7 +1129,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     if (stale.length === 0) return [];
     // refs_warn_dangling_symrefs: listed before the deletion, as the targets go
     const dangling = await this.danglingSymrefs(new Set(stale.map((r) => r.name)));
-    if (!this.dryRun) {
+    if (!this.dryRun && !defer) {
       try {
         await deleteRefs(
           this.refsStore,

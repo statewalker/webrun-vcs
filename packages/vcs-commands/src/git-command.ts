@@ -19,6 +19,8 @@ import {
   createReplacedCommits,
   createReplacedTags,
   createReplacedTrees,
+  type GraftFileBase,
+  graftFileBaseDir,
   graftFileReader,
   hasReplacements,
   isSymbolicRef,
@@ -448,6 +450,20 @@ export abstract class GitCommand<T> {
     return parseGitBool(value) ?? true;
   }
 
+  /**
+   * Where a relative `GIT_GRAFT_FILE` is read from: the worktree top (the git directory when
+   * `core.bare`), as the host names it (the working copy's `hostGitDir`), where git's setup
+   * has changed to before opening the file; undefined when the host path is unknown.
+   */
+  protected graftFileBase(): GraftFileBase | undefined {
+    const gitDir = (this._workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
+    if (gitDir === undefined) return undefined;
+    const bare = this._workingCopy.config
+      ? parseGitBool(RemoteConfigStore.from(this._workingCopy).value("core.bare"))
+      : undefined;
+    return { dir: graftFileBaseDir(gitDir, bare) };
+  }
+
   /** The commits as git's history walks read them: {@link commits}. */
   protected get walkCommits(): CommandCommits {
     return this.commits;
@@ -471,7 +487,7 @@ export abstract class GitCommand<T> {
       const replaceRefBase = environment?.replaceRefBase;
       // GIT_GRAFT_FILE: that file is read in place of info/grafts (an empty one is a grafts
       // file all the same: git gives its deprecation advice)
-      const readGraftFile = graftFileReader(environment);
+      const readGraftFile = graftFileReader(environment, this.graftFileBase());
       this.replacementsLoad = loadObjectReplacements({
         refs: this.refsStore,
         useReplaceRefs: this.useReplaceRefs(),

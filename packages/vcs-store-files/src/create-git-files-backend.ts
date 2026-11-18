@@ -18,6 +18,7 @@ import type {
 import {
   createGitObjects,
   createHistoryFromComponents,
+  graftFileBaseDir,
   graftFileReader,
   joinPath,
   openPackSet,
@@ -176,8 +177,12 @@ export async function createGitFilesBackend(
     reflogIdentity: options.reflogIdentity ?? reflog.identity,
   });
   // GIT_GRAFT_FILE: the environment's grafts file is the one read (gc, repack and the
-  // walks keep and follow its grafts), in place of info/grafts
-  const readGraftFile = graftFileReader(options.environment);
+  // walks keep and follow its grafts), in place of info/grafts; a relative one from the
+  // worktree top (the git directory when bare), where git's setup has changed to
+  const readGraftFile = graftFileReader(options.environment, {
+    files,
+    dir: graftFileBaseDir(gitDir),
+  });
   if (readGraftFile) refStore.readGrafts = readGraftFile;
   // HEAD as git init writes it (create_symref): `ref: …` into HEAD.lock, renamed over HEAD
   if (create) await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);

@@ -6,7 +6,12 @@
  */
 
 import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-core";
-import { graftFileReader, joinPath, sweepPackTemporaries } from "@statewalker/vcs-core";
+import {
+  graftFileBaseDir,
+  graftFileReader,
+  joinPath,
+  sweepPackTemporaries,
+} from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
@@ -256,7 +261,9 @@ async function collect(options: GcOptions): Promise<GcResult> {
   let snapshot: PackSnapshot | undefined;
   if (repacking && packs) snapshot = await snapshotPacks(packs);
   const startedAt = snapshot?.walkStartedAt ?? Date.now();
-  const readGraftFile = options.readGraftFile ?? graftFileReader(options.environment);
+  const readGraftFile =
+    options.readGraftFile ??
+    graftFileReader(options.environment, { files, dir: graftFileBaseDir(gitDir) });
   const listed = await listReachableObjects({
     files,
     gitDir,
