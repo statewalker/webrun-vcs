@@ -526,8 +526,10 @@ export function writeCombinedDiff(
 ): void {
   const context = options.context ?? 3;
   const numParent = elem.parents.length;
-  const resultDeleted = !elem.result.mode;
-  const result = resultDeleted ? new Uint8Array(0) : elem.result.content;
+  // a worktree file that is gone has no lines (result_deleted); a path a merge commit
+  // deletes is compared as an empty blob, its parents' lines all lost
+  const resultDeleted = !elem.result.mode && options.workingTreeFile !== false;
+  const result = !elem.result.mode ? new Uint8Array(0) : elem.result.content;
   const modeDiffers = elem.parents.some((p) => p.mode !== elem.result.mode);
   const binary =
     options.binary ??

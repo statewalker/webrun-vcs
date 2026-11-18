@@ -931,3 +931,175 @@ describeGit("git log review fixes, native", () => {
     expect(failures.slice(0, 6).join("\n\n")).toBe("");
   }, 120000);
 });
+
+describeGit("git log follow-up review fixes, native", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-followup-native-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const commitAll = (dir: string, message: string, args: string[] = []) => {
+    clock += 3600;
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-q", "-m", message, ...args]);
+  };
+  const lines = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => `${from + i}\n`).join("");
+
+  /** root; side changes f; main changes g; merge; side appends to g; `merge -X ours side` */
+  function buildMerges(dir: string): void {
+    git(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "f", "a\n");
+    put(dir, "g", "a\n");
+    commitAll(dir, "root");
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    put(dir, "f", "side\n");
+    commitAll(dir, "side-f");
+    git(dir, ["checkout", "-q", "main"]);
+    put(dir, "g", "main\n");
+    commitAll(dir, "main-g");
+    clock += 3600;
+    git(dir, ["merge", "-q", "-m", "merge1", "side"]);
+    git(dir, ["checkout", "-q", "side"]);
+    put(dir, "g", "a\nmore\n");
+    commitAll(dir, "side-g");
+    git(dir, ["checkout", "-q", "main"]);
+    clock += 3600;
+    git(dir, ["merge", "-q", "-X", "ours", "-m", "merge2", "side"]);
+  }
+
+  it("--full-diff runs every commit's diff, --first-parent diffs merges against the first parent", async () => {
+    const dir = join(root, "full-diff");
+    buildMerges(dir);
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      ["--diff-merges=first-parent", "--full-diff", "--oneline", "--", "f"],
+      ["--diff-merges=first-parent", "--full-diff", "--stat", "--oneline", "--", "f"],
+      ["-m", "--full-history", "--full-diff", "--oneline", "--", "f"],
+      ["-m", "--full-diff", "--oneline", "--", "g"],
+      ["--full-diff", "--oneline", "--", "f"],
+      ["--oneline", "-m", "--stat", "--first-parent", "--", "f"],
+      ["--oneline", "-m", "--stat", "--first-parent", "--", "g"],
+      ["--oneline", "--diff-merges=separate", "-p", "--first-parent"],
+      ["--oneline", "-m", "-p", "--first-parent", "--full-diff", "--", "f"],
+      ["--oneline", "-c", "--first-parent"],
+      ["--oneline", "--diff-merges=off", "-p", "--first-parent"],
+    ]);
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("--first-parent --graph keeps a lane for a merge's parent the walk never reaches", async () => {
+    const dir = join(root, "first-parent-lane");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "g", "a\n");
+    commitAll(dir, "root");
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    put(dir, "f", "side\n");
+    commitAll(dir, "side-f");
+    put(dir, "h", "x\n");
+    commitAll(dir, "side-h");
+    git(dir, ["checkout", "-q", "main"]);
+    put(dir, "g", "main\n");
+    commitAll(dir, "main-g");
+    clock += 3600;
+    git(dir, ["merge", "-q", "-m", "merge1", "side"]);
+    put(dir, "f", "side\nmore\n");
+    commitAll(dir, "main-f");
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      ["--format=%s%n%an", "--graph", "--first-parent", "--full-history", "--", "f"],
+      ["--format=%s%n%an", "--graph", "--first-parent", "-m", "--", "f"],
+      ["--format=%s%n%an", "--graph", "--first-parent", "--", "f"],
+      ["--format=%s%n%an", "--graph", "--first-parent", "-p", "--", "f"],
+      ["--format=%s%n%an", "--graph", "--first-parent", "--no-merges", "--", "f"],
+      ["--oneline", "--graph", "--first-parent", "--full-history", "--", "h"],
+    ]);
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("combined diffs: deleted paths' hunks, default index abbreviations, --follow through parents", async () => {
+    const dir = join(root, "combined");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "a.txt", lines(1, 20));
+    put(dir, "c.txt", `${lines(1, 20)}extra\n`);
+    commitAll(dir, "root");
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    put(dir, "c.txt", `head\n${lines(1, 20)}extra\n`);
+    commitAll(dir, "side edits c");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["mv", "c.txt", "f.txt"]);
+    commitAll(dir, "rename c to f");
+    // the first parent finds the rename: nothing of the merge is shown
+    git(dir, ["checkout", "-q", "side"]);
+    put(dir, "c.txt", `head2\n${lines(1, 20)}extra\n`);
+    commitAll(dir, "side edits c again");
+    clock += 3600;
+    git(dir, ["merge", "-q", "--no-commit", "main"]);
+    put(dir, "f.txt", `evil\n${lines(1, 20)}extra\n`);
+    commitAll(dir, "merge main into side");
+    const renamed = revParse(dir, "HEAD");
+    // the last parent finds a copy (MC)
+    git(dir, ["checkout", "-q", "main"]);
+    put(dir, "g.txt", `${lines(1, 20)}g\n`);
+    commitAll(dir, "copy a to g");
+    git(dir, ["checkout", "-q", "-b", "side2", "main~1"]);
+    put(dir, "s2.txt", "s2\n");
+    commitAll(dir, "side2");
+    git(dir, ["checkout", "-q", "-b", "m2", "main"]);
+    clock += 3600;
+    git(dir, ["merge", "-q", "--no-commit", "side2"]);
+    put(dir, "g.txt", `${lines(1, 20)}g\nevil\n`);
+    commitAll(dir, "merge side2");
+    const copied = revParse(dir, "HEAD");
+    // merges that delete paths both parents changed (or agree on)
+    git(dir, ["checkout", "-q", "-b", "del1", "main"]);
+    put(dir, "x.txt", "d1\n");
+    put(dir, "y.txt", "same\n");
+    commitAll(dir, "x1");
+    git(dir, ["checkout", "-q", "-b", "del2", "main"]);
+    put(dir, "x.txt", "d2\n");
+    put(dir, "y.txt", "same\n");
+    commitAll(dir, "x2");
+    git(dir, ["checkout", "-q", "del1"]);
+    clock += 3600;
+    spawnSync("git", ["merge", "-q", "del2"], { cwd: dir, env: env() });
+    git(dir, ["rm", "-q", "x.txt", "y.txt"]);
+    commitAll(dir, "merge deleting x and y");
+    const deleted = revParse(dir, "HEAD");
+    const g = await openOurs(dir);
+    const followCases = [
+      ["--follow", "-c", "--oneline", "-n", "1", renamed, "--", "f.txt"],
+      ["--follow", "--cc", "--stat", "--oneline", "-n", "1", renamed, "--", "f.txt"],
+      ["--follow", "-c", "--name-status", "--oneline", "-n", "1", renamed, "--", "f.txt"],
+      ["--follow", "-c", "--name-status", "--oneline", copied, "--", "g.txt"],
+      ["--follow", "-c", "--oneline", copied, "--", "g.txt"],
+      ["--follow", "--cc", "--oneline", copied, "--", "g.txt"],
+    ];
+    const failures = await compareCases(dir, g, [
+      // git 2.43 follows the first parent's path on past the merge
+      ...(modernGit() ? followCases : followCases.slice(3)),
+      ["-c", "--oneline", "-n", "1", deleted],
+      ["--cc", "--oneline", "-n", "1", deleted],
+      ["--cc", "--stat", "--oneline", "-n", "1", deleted],
+      ["--cc", "--abbrev=4", "--oneline", "-n", "1", deleted],
+      ["-c", "--abbrev=12", "-n", "2", copied],
+      ["--cc", "-p", "--abbrev=5", "--oneline", "-n", "2", copied],
+      ["-m", "-p", "--abbrev=4", "--oneline", "-n", "1", copied],
+    ]);
+    // git diff of a conflict: the combined diffs keep the default length, the rest clamps
+    git(dir, ["checkout", "-q", "-b", "conflict", "del1~1"]);
+    clock += 3600;
+    spawnSync("git", ["merge", "-q", "del2"], { cwd: dir, env: env() });
+    put(dir, "a.txt", `${lines(1, 20)}dirty\n`);
+    for (const abbrev of [0, 2, 4, 12, 99]) {
+      const native = git(dir, ["diff", `--abbrev=${abbrev}`]);
+      const mine = Buffer.from(
+        await (await openOurs(dir)).diff().setOptions({ abbrev }).callBytes("patch"),
+      );
+      if (!native.includes("diff --cc x.txt")) failures.push("no conflict in git diff");
+      if (!mine.equals(native))
+        failures.push(`git diff --abbrev=${abbrev}\n${firstDifference(native, mine)}`);
+    }
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+});

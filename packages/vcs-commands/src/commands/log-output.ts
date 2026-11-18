@@ -21,7 +21,10 @@
  * A commit with an `encoding` header is shown in UTF-8 (git's default `i18n.logOutputEncoding`);
  * another output encoding is not supported. One quirk of git is not reproduced: where its C
  * code takes a user format's output as a NUL-terminated string under `--graph`, a `%x00`
- * can cut what git prints; the whole text is printed here.
+ * can cut what git prints; the whole text is printed here. Combined diffs (`-c`, `--cc`)
+ * compare each path with the same path in every parent: git's per-parent rename detection
+ * there (find_paths_generic under `diff.renames`, which pairs a merge's path with the file a
+ * parent has it under) is not reproduced, but for the one path `--follow` follows.
  *
  * @module
  */
@@ -30,6 +33,7 @@ import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { encodeGitPath, gitCharWidth } from "@statewalker/vcs-utils/encoding";
 
 import { InvalidArgumentError } from "../errors/index.js";
+import { ChangeType } from "../results/diff-entry.js";
 import { type DateMode, DEFAULT_DATE_MODE, parseDateMode, showDate } from "./date-format.js";
 import type { DiffOutputFormat, DiffTextOptions } from "./diff-command.js";
 import { LogGraph } from "./log-graph.js";
@@ -57,7 +61,8 @@ export interface LogOutputOptions {
   abbrevCommit?: boolean;
   /**
    * `--abbrev=<n>` (default `core.abbrev`, automatic): at least n digits (4 to 40, as git
-   * clamps it), in the commits' ids and in the diffs' `index` lines
+   * clamps it), in the commits' ids and in the diffs' `index` lines (combined diffs keep the
+   * default length, as git's do)
    */
   abbrev?: number;
   /** `--no-abbrev`: full ids everywhere */
@@ -171,14 +176,18 @@ export interface LogOutputHost {
   /**
    * The diff of a commit against a parent (the empty tree for none): undefined bytes when
    * nothing differs; `follow` the path followed, `followPath` the path to follow in the
-   * parent
+   * parent, `followChange` set when it was found as a rename or a copy
    */
   diff(
     entry: LogOutputEntry,
     parent: ObjectId | undefined,
     formats: DiffOutputFormat[],
     options: { statWidth?: number; follow?: string; fullDiff?: boolean; abbrev?: number },
-  ): Promise<{ bytes?: Uint8Array; followPath?: string }>;
+  ): Promise<{
+    bytes?: Uint8Array;
+    followPath?: string;
+    followChange?: ChangeType.RENAME | ChangeType.COPY;
+  }>;
   /**
    * The combined diff of a merge (`-c`, `--cc`): the paths that differ from every parent,
    * `names` as `--name-only` / `--name-status` list them (undefined for neither), `patch`
@@ -193,7 +202,8 @@ export interface LogOutputHost {
       follow?: string;
       /** With `follow`: the path each parent has it under (a rename or copy found) */
       parentPaths?: string[];
-      abbrev?: number;
+      /** With `parentPaths`: `R` or `C` for a parent whose path was found as a rename or copy */
+      parentStatus?: (string | undefined)[];
     },
   ): Promise<{ paths: number; names: Uint8Array; patch: Uint8Array }>;
 }
@@ -675,7 +685,12 @@ export class LogPrinter {
       diffMerges = mDefault;
       mergesNeedDiff = false;
     }
-    if (diffMerges === undefined && walk.firstParentOnly) diffMerges = "first-parent";
+    // log_setup_revisions_tweak's diff_merges_default_to_first_parent: under --first-parent a
+    // merge's separate diff (the default, -m, --diff-merges=separate) is against the first
+    // parent only
+    if (walk.firstParentOnly && (diffMerges === undefined || diffMerges === "separate")) {
+      diffMerges = "first-parent";
+    }
     if ((implyPatch || mergesNeedDiff) && formats.length === 0) formats.push("patch");
     // --name-only and --name-status turn the other formats off (diff_setup_done)
     const names = formats.find((f) => f === "name-only" || f === "name-status");
@@ -690,7 +705,8 @@ export class LogPrinter {
     const followPath = followPathOf(walk.paths, options.follow === true);
     this.follow = (options.follow ?? bool(host.config("log.follow")) ?? false) && !!followPath;
     if (this.follow) this.followPath = followPath;
-    this.allNeedDiff = userDiff || implyPatch || this.follow;
+    // revision.c: --full-diff sets revs->diff too
+    this.allNeedDiff = userDiff || implyPatch || this.follow || !!options.fullDiff;
   }
 
   /** Whether commits not shown (their diff empty) do not count (`--follow`) */
@@ -897,13 +913,25 @@ export class LogPrinter {
         : undefined;
     const patch = this.formats.includes("patch");
     const parents = this.diffParents(entry);
-    // --follow: each parent's diff looks for the file it was renamed or copied from
+    // --follow: find_paths_generic diffs the parents in order with one set of options, whose
+    // pathspec try_to_follow_renames moves to the file a parent renamed or copied: the next
+    // parents' diffs then list that path, not the one followed, and intersect_paths keeps
+    // nothing; a rename or copy only the last parent finds is shown
     let parentPaths: string[] | undefined;
+    let parentStatus: (string | undefined)[] | undefined;
     if (follow !== undefined) {
       parentPaths = [];
-      for (const p of parents) {
-        const r = await this.host.diff(entry, p, [], { follow });
+      parentStatus = [];
+      for (let k = 0; k < parents.length; k++) {
+        const r = await this.host.diff(entry, parents[k], [], { follow });
+        if (r.followChange === undefined) {
+          parentPaths.push(follow);
+          parentStatus.push(undefined);
+          continue;
+        }
+        if (k + 1 < parents.length) return;
         parentPaths.push(r.followPath ?? follow);
+        parentStatus.push(r.followChange === ChangeType.COPY ? "C" : "R");
       }
     }
     const result = await this.host.combinedDiff(
@@ -914,7 +942,7 @@ export class LogPrinter {
         patch,
         ...(follow !== undefined ? { follow } : {}),
         ...(parentPaths ? { parentPaths } : {}),
-        ...this.diffAbbrev(),
+        ...(parentStatus ? { parentStatus } : {}),
       },
     );
     if (!result.paths) return;

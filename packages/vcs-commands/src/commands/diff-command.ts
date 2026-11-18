@@ -62,6 +62,12 @@ export interface DiffTextOptions
   algorithm?: XdiffAlgorithm;
   /** `--indent-heuristic` / `--no-indent-heuristic` (default `diff.indentHeuristic`, true) */
   indentHeuristic?: boolean;
+  /**
+   * `--abbrev=<n>`: the `index` lines' ids at least n digits, clamped as git clamps it (below
+   * 4, 0 too, is 4; above 40 is 40); the combined diffs of conflicted paths ignore it, as
+   * git's do
+   */
+  abbrev?: number;
   /** `--stat=...` widths (default width 80, as git without a terminal) */
   stat?: DiffstatOptions;
   /**
@@ -163,6 +169,15 @@ function intValue(value: string | undefined): number | undefined {
   if (!m) return undefined;
   const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[m[2].toLowerCase()] ?? 1;
   return Number(m[1]) * unit;
+}
+
+/**
+ * `git diff --abbrev=<n>` as revision.c's handle_revision_opt takes it (before diff.c sees
+ * it; setup_revisions copies it to the diff options): below 4 (0 too) is 4, above 40 is 40
+ */
+function abbrevOption(value: number | undefined): number | undefined {
+  if (value === undefined || Number.isNaN(value)) return undefined;
+  return Math.min(40, Math.max(4, Math.trunc(value)));
 }
 
 function renamesValue(value: string | undefined): boolean | undefined {
@@ -373,17 +388,23 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    *
    * `follow` is `--follow`'s path: the comparison is limited to it, and when it is added, a
    * file it was renamed from is looked for among the other side's paths (tree-diff.c's
-   * try_to_follow_renames); `followPath` is then the path followed from there on.
+   * try_to_follow_renames); `followPath` is then the path followed from there on, and
+   * `followChange` whether it was a rename or a copy.
    */
   async callFormats(
     formats: DiffOutputFormat[],
     follow?: string,
-  ): Promise<{ bytes?: Uint8Array; followPath?: string }> {
+  ): Promise<{
+    bytes?: Uint8Array;
+    followPath?: string;
+    followChange?: ChangeType.RENAME | ChangeType.COPY;
+  }> {
     this.checkCallable();
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
     let followPath = follow;
+    let followChange: ChangeType.RENAME | ChangeType.COPY | undefined;
     let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
     if (follow !== undefined) {
       const spec = this.pathspecItems;
@@ -396,15 +417,18 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         if (found) {
           collected = { entries: [found], combined: [] };
           followPath = found.oldPath;
+          followChange = found.changeType as ChangeType.RENAME | ChangeType.COPY;
         }
       }
     } else collected = await this.collect(renames, formats.includes("patch"));
-    if (collected.entries.length === 0 && collected.combined.length === 0) {
-      return followPath !== undefined ? { followPath } : {};
-    }
+    const followed = {
+      ...(followPath !== undefined ? { followPath } : {}),
+      ...(followChange !== undefined ? { followChange } : {}),
+    };
+    if (collected.entries.length === 0 && collected.combined.length === 0) return followed;
     const sink = new ByteSink();
     await this.writeFormats(sink, formats, collected);
-    return { bytes: sink.bytes(), ...(followPath !== undefined ? { followPath } : {}) };
+    return { bytes: sink.bytes(), ...followed };
   }
 
   /**
@@ -499,19 +523,21 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
               ids.add(pair.old?.id ?? NULL_ID);
               ids.add(pair.new?.id ?? NULL_ID);
             }
+            // `--abbrev=<n>`: at least n digits
+            options.abbrevLengths = await this.idAbbreviator().lengths(ids, options.abbrev);
+          }
+          // combine-diff.c's index lines take DEFAULT_ABBREV, whatever --abbrev says
+          let combinedLengths: ReadonlyMap<string, number> | undefined;
+          if (combined.length > 0 && !options.fullIndex) {
+            const ids = new Set<string>([NULL_ID]);
             for (const c of combined) {
               ids.add(c.ours.objectId);
               ids.add(c.theirs.objectId);
-              ids.add(NULL_ID);
             }
-            // `--abbrev=<n>`: at least n digits
-            options.abbrevLengths = await this.idAbbreviator().lengths(
-              ids,
-              this.textOptions.abbrev,
-            );
+            combinedLengths = await this.idAbbreviator().lengths(ids);
           }
           // git prints the combined diffs of conflicted paths as it finds them, before the rest
-          for (const c of combined) await this.writeCombined(sink, c, options);
+          for (const c of combined) await this.writeCombined(sink, c, options, combinedLengths);
           for (const pair of pairs) {
             if (unmerged.has(pair)) {
               sink.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
@@ -565,6 +591,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     sink: ByteSink,
     c: CombinedEntry,
     options: DiffOutputOptions,
+    lengths: ReadonlyMap<string, number> | undefined,
   ): Promise<void> {
     const worktree = this.worktreeAccess;
     const driver = await options.driver?.(c.path);
@@ -599,7 +626,6 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             : await readCleanContent(worktree, c.path);
       }
     }
-    const lengths = options.abbrevLengths;
     writeCombinedDiff(
       sink,
       {
@@ -614,8 +640,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           : driver?.binary !== undefined
             ? { binary: driver.binary }
             : {}),
-        abbreviate: (id) =>
-          id.slice(0, options.fullIndex ? 40 : (lengths?.get(id) ?? options.abbrev ?? 7)),
+        abbreviate: (id) => id.slice(0, options.fullIndex ? 40 : (lengths?.get(id) ?? 7)),
       },
     );
   }
@@ -827,8 +852,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       defaultPrefix: _defaultPrefix,
       orderFile: _orderFile,
       textconv: _textconv,
+      abbrev: _abbrev,
       ...text
     } = this.textOptions;
+    const abbrev = abbrevOption(this.textOptions.abbrev);
     return {
       context: intValue(get("diff.context")) ?? 3,
       interHunkContext: intValue(get("diff.interHunkContext")) ?? 0,
@@ -837,6 +864,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         ? { bigFileThreshold: intValue(get("core.bigFileThreshold")) }
         : {}),
       ...text,
+      ...(abbrev !== undefined ? { abbrev } : {}),
       algorithm: text.algorithm ?? algorithmValue(get("diff.algorithm")) ?? "myers",
       indentHeuristic: text.indentHeuristic ?? boolValue(get("diff.indentHeuristic")) ?? true,
       ...(driver ? { driver } : {}),

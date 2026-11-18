@@ -68,6 +68,11 @@ interface OutputWalk {
   /** `--graph`: parents rewritten past the commits not shown */
   rewrite: boolean;
   entries: LogOutputEntry[];
+  /**
+   * Parents the walk never reached (`--first-parent` walks only first parents) that git's
+   * get_commit_action would show: the graph counts them as interesting
+   */
+  unwalkedShown?: Set<ObjectId>;
 }
 
 /** git log reads no index: the in-tree attributes files are the worktree's only. */
@@ -812,7 +817,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     raw.clear();
     if (output) {
-      await this.finishOutputWalk(output, t, newlist, shown, relevant);
+      await this.finishOutputWalk(output, t, newlist, shown, relevant, parse);
       return;
     }
     if (none) return;
@@ -839,6 +844,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     newlist: number[],
     shown: (n: number, rewrite?: boolean) => Promise<LogResult | undefined>,
     relevant: (n: number) => boolean,
+    parse: (n: number) => Promise<boolean>,
   ): Promise<void> {
     let order = newlist;
     if (output.topo) {
@@ -896,6 +902,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
     };
     const prune = this.paths.length > 0 || this.excludePaths.length > 0;
+    /** Rewritten parents the walk never reached (only with `--first-parent`) */
+    const unwalked = new Set<number>();
     for (const n of order) {
       const commit = await shown(n, output.rewrite && prune);
       if (!commit) continue;
@@ -909,6 +917,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         for (let k = 0, c = t.parentCount(n); k < c; k++) {
           const p = rewriteOne(t.parent(n, k));
           if (p === undefined) continue;
+          if (!(t.flag(p) & SEEN)) unwalked.add(p);
           const id = t.idOf(p);
           // remove_duplicate_parents
           if (!ids.includes(id)) ids.push(id);
@@ -917,6 +926,15 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
       const { id, ...rest } = commit;
       output.entries.push({ id, commit: rest, parents, ...(savedParents ? { savedParents } : {}) });
+    }
+    // graph.c's graph_is_interesting asks get_commit_action about a parent: one the walk
+    // never reached has no TREESAME or SHOWN flag, so only the filters can hide it (with
+    // `--first-parent` a merge whose first parent was rewritten away keeps a lane for it)
+    if (unwalked.size > 0) {
+      output.unwalkedShown = new Set();
+      for (const p of unwalked) {
+        if ((await parse(p)) && (await shown(p))) output.unwalkedShown.add(t.idOf(p));
+      }
     }
   }
 
@@ -952,7 +970,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const pathspec = [...paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
     if (paths.length === 0 && this.excludePaths.length > 0) pathspec.push(".");
     const printer = new LogPrinter(host, options, {
-      interesting: (id) => shownIds.has(id),
+      interesting: (id) => shownIds.has(id) || unwalkedShown.has(id),
       firstParentOnly: this.firstParentOnly,
       paths: pathspec,
     });
@@ -966,6 +984,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // --follow walks every commit: its path changes as it goes
     if (follow) this.paths = [];
     const shownIds = new Set<ObjectId>();
+    const unwalkedShown = new Set<ObjectId>();
     let entries: LogOutputEntry[];
     if (topo) {
       this.outputWalk = { topo, rewrite: graph, entries: [] };
@@ -973,6 +992,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         // the output walk collects its commits
       }
       entries = this.outputWalk.entries;
+      for (const id of this.outputWalk.unwalkedShown ?? []) unwalkedShown.add(id);
       this.outputWalk = undefined;
       for (const e of entries) shownIds.add(e.id);
       entries = entries.slice(skip);
@@ -1019,7 +1039,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const abbrevs = new Map<string, string>();
     let notesMaps: Promise<{ ref: string; notes: Map<ObjectId, ObjectId> }[]> | undefined;
     let mailmap: Promise<Mailmap> | undefined;
-    const trees = new Map<ObjectId, Promise<ObjectId>>();
+    const trees = new OrderedMap<ObjectId, Promise<ObjectId>>();
     /** A commit's tree, as the walk parsed it (replace refs and grafts honoured) */
     const treeOf = (id: ObjectId): Promise<ObjectId> => {
       let tree = trees.get(id);
@@ -1030,7 +1050,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           return header.tree;
         })();
         trees.set(id, tree);
-        if (trees.size > 4096) trees.delete(trees.keys().next().value as ObjectId);
+        if (trees.size > 4096) trees.deleteOldest();
       }
       return tree;
     };
@@ -1192,7 +1212,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       patch: boolean;
       follow?: string;
       parentPaths?: string[];
-      abbrev?: number;
+      parentStatus?: (string | undefined)[];
     },
   ): Promise<{ paths: number; names: Uint8Array; patch: Uint8Array }> {
     const { dense } = options;
@@ -1242,8 +1262,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         if (options.names === "name-status") {
           const r = result.get(path);
           parents.forEach((m, k) => {
-            const renamed = options.parentPaths !== undefined && options.parentPaths[k] !== path;
-            names.text(renamed ? "R" : !sideOf(m, k, path) ? "A" : !r ? "D" : "M");
+            const found = options.parentStatus?.[k];
+            names.text(found ?? (!sideOf(m, k, path) ? "A" : !r ? "D" : "M"));
           });
           names.text("\t");
         }
@@ -1262,7 +1282,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         if (e) ids.add(e.id);
       });
     }
-    const lengths = await this.idAbbreviator().lengths(ids, options.abbrev);
+    // combine-diff.c's index lines take DEFAULT_ABBREV, whatever --abbrev says
+    const lengths = await this.idAbbreviator().lengths(ids);
     const read = async (e?: { mode: number; id: ObjectId }) => {
       if (!e) return new Uint8Array(0);
       if ((e.mode & 0o170000) === 0o160000) return encodeGitPath(`Subproject commit ${e.id}\n`);
@@ -1287,7 +1308,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           dense,
           workingTreeFile: false,
           context: this.diffOptions.context ?? (Number.isFinite(context) ? context : 3),
-          abbreviate: (id) => id.slice(0, lengths.get(id) ?? 7),
+          abbreviate: (id) => id.slice(0, this.diffOptions.fullIndex ? 40 : (lengths.get(id) ?? 7)),
           quotePath: quote,
         },
       );
