@@ -61,13 +61,14 @@ export function overlayObjects(top: GitObjects, base: GitObjects): GitObjects {
       }
       for await (const id of base.list()) if (!seen.has(id)) yield id;
     },
-    async *listPrefix(prefix) {
+    async *listPrefix(prefix, options) {
       const seen = new Set<string>();
       for await (const id of listObjectsWithPrefix(top, prefix)) {
         seen.add(id);
         yield id;
       }
-      for await (const id of listObjectsWithPrefix(base, prefix)) if (!seen.has(id)) yield id;
+      for await (const id of listObjectsWithPrefix(base, prefix, options))
+        if (!seen.has(id)) yield id;
     },
     async approximateCount() {
       return ((await top.approximateCount?.()) ?? 0) + ((await base.approximateCount?.()) ?? 0);

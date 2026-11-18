@@ -364,11 +364,18 @@ export function overlayMethods<T extends object>(
   target: T,
   overrides: Partial<Record<keyof T, unknown>>,
 ): T {
+  // each method bound once (a read of a store's method is a hot path)
+  const bound = new Map<PropertyKey, { of: unknown; fn: unknown }>();
   return new Proxy(target, {
     get(t, prop) {
       if (Object.hasOwn(overrides, prop)) return overrides[prop as keyof T];
       const value = Reflect.get(t, prop, t);
-      return typeof value === "function" ? value.bind(t) : value;
+      if (typeof value !== "function") return value;
+      const known = bound.get(prop);
+      if (known && known.of === value) return known.fn;
+      const fn = value.bind(t);
+      bound.set(prop, { of: value, fn });
+      return fn;
     },
     has(t, prop) {
       return Object.hasOwn(overrides, prop) || Reflect.has(t, prop);
@@ -501,6 +508,8 @@ export function createReplacedTrees<T extends Trees>(
   const overrides: Partial<Trees> = {
     load: async (id) => trees.load(await read(id)),
     getEntry: async (treeId, name) => trees.getEntry(await read(treeId), name),
+    ...(trees.entries ? { entries: async (id: ObjectId) => trees.entries?.(await read(id)) } : {}),
+    ...(trees.raw ? { raw: async (id: ObjectId) => trees.raw?.(await read(id)) } : {}),
   };
   return overlayMethods(trees, overrides as Partial<T>);
 }
@@ -521,6 +530,7 @@ export function createReplacedBlobs<B extends Blobs>(
   const overrides: Partial<Blobs> = {
     load: async (id) => blobs.load(await read(id)),
     size: async (id) => blobs.size(await read(id)),
+    ...(blobs.open ? { open: async (id: ObjectId) => blobs.open?.(await read(id)) } : {}),
   };
   return overlayMethods(blobs, overrides as Partial<B>);
 }

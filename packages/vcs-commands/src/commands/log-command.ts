@@ -968,6 +968,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   /** {@link callText} as bytes (messages and file contents that are not UTF-8 kept as they are). */
   async callBytes(options: LogOutputOptions = {}): Promise<Uint8Array> {
+    // one operation for the worktree: its attributes files (diff drivers) and configuration
+    // are read once for every commit's diff, as git keeps its attribute stack
+    const worktree = this.worktreeAccess;
+    if (worktree?.batch) return worktree.batch(() => this.printLog(options));
+    return this.printLog(options);
+  }
+
+  private async printLog(options: LogOutputOptions): Promise<Uint8Array> {
     // revision.c's setup_revisions: the graph cannot be reversed
     if (options.graph && options.reverse) {
       throw new IncompatibleOptionsError(
@@ -1161,6 +1169,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   private diffOptions: DiffTextOptions = {};
+
+  /** `log` stores no objects: its abbreviations read each loose fan-out directory once */
+  protected override writesNoObjects(): boolean {
+    return true;
+  }
 
   /** Options of the diffs {@link callBytes} prints (context, algorithm, `--stat` widths...) */
   setDiffOptions(options: DiffTextOptions): this {

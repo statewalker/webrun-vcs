@@ -71,6 +71,35 @@ export interface Blobs extends ObjectStorage<BlobContent> {
    * @returns Size in bytes, or -1 if blob not found
    */
   size(id: ObjectId): Promise<number>;
+
+  /**
+   * The blob's size and content from one read of the object (where `size` then `load` read
+   * its header, and for a packed delta resolve it, once each). Undefined if it is absent or
+   * not a blob. Optional: `probeBlob` falls back to `size` and `load` without it.
+   *
+   * @example
+   * ```typescript
+   * const blob = await blobs.open?.(id);
+   * if (blob) console.log(blob.size, blob.bytes ?? (await collect(blob.content)));
+   * ```
+   */
+  open?(id: ObjectId): Promise<BlobRead | undefined>;
+}
+
+/** A blob read once (see `Blobs.open`). */
+export interface BlobRead {
+  /** Size in bytes */
+  size: number;
+  /**
+   * The whole content when the store holds it in memory (a small object read in one piece);
+   * the caller's own buffer. `content` then needs no release.
+   */
+  bytes?: Uint8Array;
+  /**
+   * The content, single-use: consume it, or call its iterator's `return()` to release the
+   * read (not needed when `bytes` is given).
+   */
+  content: BlobContent;
 }
 
 /**

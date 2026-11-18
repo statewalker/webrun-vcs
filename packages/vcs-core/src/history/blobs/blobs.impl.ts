@@ -6,15 +6,19 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjects } from "../objects/git-objects.js";
+import {
+  CorruptObjectError,
+  type GitObject,
+  type GitObjects,
+  InvalidObjectIdError,
+} from "../objects/git-objects.js";
 import {
   hasObjectOfType,
-  loadTypedObject,
   objectHeader,
   removeObject,
   storeObject,
 } from "../objects/typed-object-access.js";
-import type { Blobs } from "./blobs.js";
+import type { BlobRead, Blobs } from "./blobs.js";
 
 /**
  * Git blob store implementation
@@ -41,26 +45,42 @@ class GitBlobStore implements Blobs {
    * Returns undefined if blob doesn't exist.
    */
   async load(id: ObjectId): Promise<AsyncIterable<Uint8Array> | undefined> {
-    if (!(await this.has(id))) {
-      return undefined;
-    }
-    const self = this;
-    return (async function* () {
-      yield* self.loadContent(id);
-    })();
+    const blob = await this.read(id);
+    if (!blob) return undefined;
+    if (blob.bytes) return single(blob.bytes);
+    return blob.content;
   }
 
   /**
-   * Load blob content (internal implementation)
+   * The blob from one read of the object: its size, and its content (in memory when the
+   * store holds it so). Undefined if absent or not a blob; an object that is stored but
+   * whose header cannot be read throws `CorruptObjectError`, as `has` reports it.
    */
-  private async *loadContent(id: ObjectId): AsyncGenerator<Uint8Array> {
-    const { content, release } = await loadTypedObject(this.objects, id, "blob");
+  open(id: ObjectId): Promise<BlobRead | undefined> {
+    return this.read(id);
+  }
+
+  /** `open`, which `load` and `size` read through (a view overriding `open` keeps them) */
+  private async read(id: ObjectId): Promise<BlobRead | undefined> {
+    let obj: GitObject | undefined;
     try {
-      yield* content;
-    } catch (err) {
-      await release();
-      throw err;
+      obj = await (this.objects.getNow ? this.objects.getNow(id) : this.objects.get(id));
+    } catch (e) {
+      if (e instanceof InvalidObjectIdError) return undefined;
+      if (e instanceof CorruptObjectError) throw e;
+      const reason = e instanceof Error ? `: ${e.message}` : "";
+      throw new CorruptObjectError(`object ${id} is stored but cannot be read${reason}`, {
+        cause: e,
+      });
     }
+    if (!obj) return undefined;
+    if (obj.type !== "blob") {
+      if (!obj.bytes) await obj.content[Symbol.asyncIterator]().return?.();
+      return undefined;
+    }
+    return obj.bytes
+      ? { size: obj.size, bytes: obj.bytes, content: obj.content }
+      : { size: obj.size, content: obj.content };
   }
 
   /**
@@ -100,15 +120,16 @@ class GitBlobStore implements Blobs {
    * Get blob size in bytes
    */
   async size(id: ObjectId): Promise<number> {
-    if (!(await this.objects.has(id))) {
-      return -1;
-    }
-    const header = await objectHeader(this.objects, id);
-    if (header?.type !== "blob") {
-      return -1;
-    }
-    return header.size;
+    const blob = await this.read(id);
+    if (!blob) return -1;
+    if (!blob.bytes) await blob.content[Symbol.asyncIterator]().return?.();
+    return blob.size;
   }
+}
+
+/** One chunk as a stream */
+async function* single(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+  yield bytes;
 }
 
 export function createBlobs(objects: GitObjects): Blobs {

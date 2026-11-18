@@ -246,8 +246,7 @@ class LoadedSide {
 
 function hasNul(content: Uint8Array): boolean {
   const n = Math.min(content.length, FIRST_FEW_BYTES);
-  for (let i = 0; i < n; i++) if (content[i] === 0) return true;
-  return false;
+  return (n === content.length ? content : content.subarray(0, n)).indexOf(0) >= 0;
 }
 
 function octal6(mode: number): string {

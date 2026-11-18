@@ -391,6 +391,33 @@ export function unifiedDiffHunks(
   newContent: Uint8Array,
   options: UnifiedDiffOptions = {},
 ): UnifiedDiffResult {
+  const { la, lb, script } = emitScript(oldContent, newContent, options);
+  const hunks = script.length > 0 ? emitHunks(la, lb, script, options) : [];
+  return { old: la, new: lb, hunks };
+}
+
+/**
+ * The lines of buffers diffed lately, by buffer: a caller that diffs one buffer against two
+ * others (`git log -p` diffs a version with its parent's, then that one with its own parent's)
+ * splits and hashes its lines once. Held weakly: kept while the buffer is.
+ */
+const linesByContent = new WeakMap<Uint8Array, ByteLines>();
+
+function linesOf(content: Uint8Array): ByteLines {
+  let lines = linesByContent.get(content);
+  if (!lines) {
+    lines = new ByteLines(content);
+    linesByContent.set(content, lines);
+  }
+  return lines;
+}
+
+/** The lines and the script `unifiedDiffHunks` emits its hunks from */
+function emitScript(
+  oldContent: Uint8Array,
+  newContent: Uint8Array,
+  options: UnifiedDiffOptions,
+): { la: ByteLines; lb: ByteLines; script: XdiffEmitChange[] } {
   let a = oldContent;
   let b = newContent;
   const context = options.context ?? 3;
@@ -399,8 +426,8 @@ export function unifiedDiffHunks(
     a = a.subarray(0, a.length - cut);
     b = b.subarray(0, b.length - cut);
   }
-  const la = new ByteLines(a);
-  const lb = new ByteLines(b);
+  const la = linesOf(a);
+  const lb = linesOf(b);
   const ws = whitespaceFlags(options);
   const script: XdiffEmitChange[] = diffScript(la, 0, la.size(), lb, 0, lb.size(), {
     algorithm: options.algorithm ?? "myers",
@@ -410,8 +437,7 @@ export function unifiedDiffHunks(
     whitespace: ws,
   });
   if (script.length > 0 && options.ignoreBlankLines) markIgnorableLines(script, la, lb, ws);
-  const hunks = script.length > 0 ? emitHunks(la, lb, script, options) : [];
-  return { old: la, new: lb, hunks };
+  return { la, lb, script };
 }
 
 /**
@@ -557,21 +583,46 @@ export function formatHunkHeader(hunk: EmittedHunk): Uint8Array {
 
 /** Writes hunks as git prints them: headers, lines, and the "\ No newline" marker */
 export function writeHunks(sink: ByteSink, result: UnifiedDiffResult): void {
+  const oldLines = result.old;
+  const newLines = result.new;
+  const oldStarts = oldLines.lineStarts;
+  const newStarts = newLines.lineStarts;
+  const oldBytes = oldLines.content;
+  const newBytes = newLines.content;
   for (const hunk of result.hunks) {
     sink.push(formatHunkHeader(hunk));
+    // the hunk's lines in one buffer: its size first, then each line with its marker
+    let size = 0;
     for (const line of hunk.lines) {
-      const lines = line.kind === "-" ? result.old : result.new;
-      const rec = lines.line(line.index);
-      sink.push(line.kind === " " ? SPACE : line.kind === "-" ? MINUS : PLUS);
-      sink.push(rec);
-      if (rec.length > 0 && rec[rec.length - 1] !== 0x0a) sink.push(NO_NEWLINE);
+      const starts = line.kind === "-" ? oldStarts : newStarts;
+      const bytes = line.kind === "-" ? oldBytes : newBytes;
+      const end = starts[line.index + 1];
+      const len = end - starts[line.index];
+      size += 1 + len;
+      if (len > 0 && bytes[end - 1] !== 0x0a) size += NO_NEWLINE.length;
     }
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const line of hunk.lines) {
+      const minus = line.kind === "-";
+      const starts = minus ? oldStarts : newStarts;
+      const bytes = minus ? oldBytes : newBytes;
+      const start = starts[line.index];
+      const end = starts[line.index + 1];
+      out[at++] = minus ? 0x2d : line.kind === "+" ? 0x2b : 0x20;
+      if (end - start < 64) for (let k = start; k < end; k++) out[at++] = bytes[k];
+      else {
+        out.set(bytes.subarray(start, end), at);
+        at += end - start;
+      }
+      if (end > start && bytes[end - 1] !== 0x0a) {
+        out.set(NO_NEWLINE, at);
+        at += NO_NEWLINE.length;
+      }
+    }
+    sink.push(out);
   }
 }
-
-const SPACE = encoder.encode(" ");
-const MINUS = encoder.encode("-");
-const PLUS = encoder.encode("+");
 
 /**
  * The body of the unified diff of two files (hunk headers and lines, no file headers), as
@@ -596,13 +647,19 @@ export function diffLineCounts(
   newContent: Uint8Array,
   options: UnifiedDiffOptions = {},
 ): { added: number; deleted: number } {
-  const { hunks } = unifiedDiffHunks(oldContent, newContent, {
-    ...options,
-    functionContext: false,
-    findFunction: noFunc,
-  });
+  const opts = { ...options, functionContext: false, findFunction: noFunc, funcNames: false };
+  const { la, lb, script } = emitScript(oldContent, newContent, opts);
   let added = 0;
   let deleted = 0;
+  if (!options.ignoreBlankLines) {
+    // every change is emitted whole: its lines are the hunks' `-` and `+` lines
+    for (const c of script) {
+      added += c.chg2;
+      deleted += c.chg1;
+    }
+    return { added, deleted };
+  }
+  const hunks = script.length > 0 ? emitHunks(la, lb, script, opts) : [];
   for (const h of hunks) {
     for (const l of h.lines) {
       if (l.kind === "+") added++;

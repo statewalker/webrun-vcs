@@ -251,6 +251,101 @@ function parseModeAt(buffer: Uint8Array, start: number, end: number): number {
 }
 
 /**
+ * A walk over a tree's stored bytes that decodes only what it is asked for, as git's
+ * `tree_desc`: entries the same on both sides of a comparison are told apart from their
+ * bytes (name, mode, id), without a string or an entry object made for them. A name is
+ * decoded and checked as {@link decodeTreeBytes} does it.
+ *
+ * @example
+ * ```typescript
+ * for (const c = new TreeEntryCursor(bytes); !c.done; c.next()) {
+ *   if (c.isTree) console.log(c.name(), c.id());
+ * }
+ * ```
+ */
+export class TreeEntryCursor {
+  /** Whether the walk is past the last entry */
+  done = false;
+  /** The entry's mode */
+  mode = 0;
+  private nameStart = 0;
+  private nameEnd = 0;
+  private end = 0;
+
+  constructor(readonly bytes: Uint8Array) {
+    this.parse(0);
+  }
+
+  /** Moves to the next entry */
+  next(): void {
+    this.parse(this.end);
+  }
+
+  /** Whether the entry is a subtree */
+  get isTree(): boolean {
+    return (this.mode & 0o170000) === FileMode.TREE;
+  }
+
+  /** The entry's name, decoded and checked as `decodeTreeBytes` does */
+  name(): string {
+    const name = decodeGitPath(this.bytes.subarray(this.nameStart, this.nameEnd));
+    validateEntryName(name);
+    return name;
+  }
+
+  /** The entry's object id */
+  id(): string {
+    return bytesToHex(this.bytes.subarray(this.nameEnd + 1, this.end));
+  }
+
+  /** git's `base_name_compare` of this entry's name with `other`'s */
+  compare(other: TreeEntryCursor): number {
+    const a = this.bytes;
+    const b = other.bytes;
+    const as = this.nameStart;
+    const bs = other.nameStart;
+    const alen = this.nameEnd - as;
+    const blen = other.nameEnd - bs;
+    const len = alen < blen ? alen : blen;
+    for (let i = 0; i < len; i++) {
+      const diff = a[as + i] - b[bs + i];
+      if (diff !== 0) return diff;
+    }
+    const ac = alen > len ? a[as + len] : this.isTree ? 0x2f : 0;
+    const bc = blen > len ? b[bs + len] : other.isTree ? 0x2f : 0;
+    return ac - bc;
+  }
+
+  /** Whether `other` (an entry of the same name) has this entry's mode and id */
+  sameAs(other: TreeEntryCursor): boolean {
+    if (this.mode !== other.mode) return false;
+    const a = this.bytes;
+    const b = other.bytes;
+    const ai = this.nameEnd + 1;
+    const bi = other.nameEnd + 1;
+    for (let k = 0; k < OBJECT_ID_LENGTH; k++) if (a[ai + k] !== b[bi + k]) return false;
+    return true;
+  }
+
+  private parse(offset: number): void {
+    const buffer = this.bytes;
+    if (offset >= buffer.length) {
+      this.done = true;
+      return;
+    }
+    const spacePos = buffer.indexOf(SPACE, offset);
+    const nullPos = spacePos < 0 ? -1 : buffer.indexOf(NULL, spacePos + 1);
+    if (nullPos < 0 || nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) {
+      throw new Error("Invalid tree format: truncated entry");
+    }
+    this.mode = parseModeAt(buffer, offset, spacePos);
+    this.nameStart = spacePos + 1;
+    this.nameEnd = nullPos;
+    this.end = nullPos + 1 + OBJECT_ID_LENGTH;
+  }
+}
+
+/**
  * Serialize tree entries to bytes via streaming internals
  *
  * @param entries Tree entries (any order, will be sorted)

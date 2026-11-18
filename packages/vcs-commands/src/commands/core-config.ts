@@ -122,6 +122,16 @@ export async function abbrevLengths(
   return createIdAbbreviator(workingCopy).lengths(ids, minLength);
 }
 
+/** Options of {@link createIdAbbreviator} */
+export interface IdAbbreviatorOptions {
+  /**
+   * Keep the store's listings for the abbreviator's life (each loose fan-out directory read
+   * once, as git's `odb_loose_cache`): for commands that write no objects while they
+   * abbreviate, such as `log` and `diff`.
+   */
+  cacheListings?: boolean;
+}
+
 /** Abbreviates ids for one command or operation; see {@link createIdAbbreviator}. */
 export interface IdAbbreviator {
   /** `id` abbreviated as git prints it (see {@link abbreviateId}) */
@@ -145,8 +155,12 @@ export interface IdAbbreviator {
  * output.push(`Updating ${await abbrev.abbreviate(head)}..${await abbrev.abbreviate(src)}`);
  * ```
  */
-export function createIdAbbreviator(workingCopy: WorkingCopy): IdAbbreviator {
+export function createIdAbbreviator(
+  workingCopy: WorkingCopy,
+  options: IdAbbreviatorOptions = {},
+): IdAbbreviator {
   let autoLength: Promise<number> | undefined;
+  const listings = options.cacheListings ? { cache: new Map<string, unknown>() } : undefined;
   const lengths = async (
     ids: Iterable<ObjectId>,
     minLength?: number,
@@ -159,7 +173,7 @@ export function createIdAbbreviator(workingCopy: WorkingCopy): IdAbbreviator {
         autoLength ??= countObjects(objects).then(autoAbbrevLength);
         start = await autoLength;
       }
-      return findAbbrevLengths(objects, ids, start);
+      return findAbbrevLengths(objects, ids, start, listings);
     }
     const fixed = start < 0 ? DEFAULT_ABBREV_LENGTH : start === 0 ? 40 : Math.min(start, 40);
     return new Map([...ids].map((id) => [id, fixed]));

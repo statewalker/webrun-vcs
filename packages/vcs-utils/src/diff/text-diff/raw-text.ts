@@ -196,13 +196,8 @@ export class RawText extends Sequence {
    * @returns true if the content appears to be binary
    */
   static isBinary(raw: Uint8Array, length?: number): boolean {
-    const len = Math.min(length ?? raw.length, RawText.BINARY_PROBE_LENGTH);
-    for (let ptr = 0; ptr < len && ptr < raw.length; ptr++) {
-      if (raw[ptr] === 0) {
-        // NUL byte
-        return true;
-      }
-    }
-    return false;
+    const len = Math.min(length ?? raw.length, RawText.BINARY_PROBE_LENGTH, raw.length);
+    // a NUL byte, found by the native scan
+    return (len === raw.length ? raw : raw.subarray(0, len)).indexOf(0) >= 0;
   }
 }

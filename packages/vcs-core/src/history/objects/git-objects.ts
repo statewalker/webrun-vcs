@@ -42,6 +42,12 @@ export interface GitObject {
  * const obj = await objects.get(id); // { type: "blob", size: 6, content }
  * ```
  */
+/** Options of `GitObjects.listPrefix` */
+export interface ListPrefixOptions {
+  /** Listings the store may keep and reuse while the caller holds this map */
+  cache?: Map<string, unknown>;
+}
+
 export interface GitObjects {
   /**
    * Store an object in one pass over `content`: frame, hash, deflate and stage
@@ -107,8 +113,12 @@ export interface GitObjects {
    * order: what git's `find_short_object_filename` and `find_short_packed_object` find for an
    * abbreviated id (one loose fan-out directory, a binary search in each pack's idx). Optional:
    * `listObjectsWithPrefix` filters `list()` without it.
+   *
+   * `options.cache` lets the store keep listings made for one operation (the loose objects
+   * of a fan-out directory, read once as git's `odb_loose_cache`): the caller makes the map,
+   * and objects stored after a listing was kept may not be found through it.
    */
-  listPrefix?(prefix: string): AsyncIterable<ObjectId>;
+  listPrefix?(prefix: string, options?: ListPrefixOptions): AsyncIterable<ObjectId>;
   /**
    * git's approximate object count, from which abbreviated ids get their length
    * (`odb_count_objects` with `ODB_COUNT_OBJECTS_APPROXIMATE`): the objects in the packs for

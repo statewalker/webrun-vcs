@@ -1,4 +1,10 @@
-import { EMPTY_TREE_ID, type FileModeValue, type ObjectId } from "@statewalker/vcs-core";
+import {
+  EMPTY_TREE_ID,
+  type FileModeValue,
+  type ObjectId,
+  type TreeEntry,
+  TreeEntryCursor,
+} from "@statewalker/vcs-core";
 import { ByteSink, parseGitBool, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
@@ -343,6 +349,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.checkCallable();
     this.renameLimit = limit;
     return this;
+  }
+
+  /** `diff` stores no objects: its abbreviations read each loose fan-out directory once */
+  protected override writesNoObjects(): boolean {
+    return true;
   }
 
   /** Text output options: context, algorithm, whitespace, `--stat` widths, ... */
@@ -1164,6 +1175,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const newSide = new Map<string, Side>();
     const treeOf = async (ref: string, implicit: boolean): Promise<ObjectId | undefined> => {
       if (ref === EMPTY_TREE_ID) return undefined;
+      // a tree's full id (as `git log -p` passes its commits' trees): read at once, its
+      // entries kept for the comparison
+      const trees = this.trees;
+      if (/^[0-9a-f]{40}$/.test(ref)) {
+        const known = trees.raw ? trees.raw(ref) : trees.entries?.(ref);
+        if (known && (await known)) return ref;
+      }
       try {
         return await this.resolveTreeId(ref);
       } catch (e) {
@@ -1177,6 +1195,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     return [oldSide, newSide];
   }
 
+  /**
+   * tree-diff.c's walk of two trees in their stored order (git's `base_name_compare`): an
+   * entry the same on both sides is skipped, two subtrees of one name are compared in turn,
+   * and anything else is listed on its side (a subtree as its blobs).
+   */
   private async diffTreeSides(
     a: ObjectId | undefined,
     b: ObjectId | undefined,
@@ -1185,39 +1208,100 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     newSide: Map<string, Side>,
   ): Promise<void> {
     if (a === b) return;
-    const TREE_MODE = 0o40000;
-    const read = async (tree: ObjectId | undefined) => {
-      const out = new Map<string, { mode: number; id: ObjectId }>();
-      if (tree === undefined || tree === EMPTY_TREE_ID) return out;
-      for (const e of await this.treeEntries(tree)) out.set(e.name, { mode: e.mode, id: e.id });
-      return out;
-    };
-    const ea = await read(a);
-    const eb = await read(b);
-    const isTree = (e: { mode: number }) => (e.mode & S_IFMT) === TREE_MODE;
-    const add = async (
-      e: { mode: number; id: ObjectId },
-      path: string,
-      side: Map<string, Side>,
-    ) => {
-      if (isTree(e)) await this.collectTreeEntries(e.id, path, side);
-      else side.set(path, { mode: e.mode, id: e.id });
-    };
-    for (const [name, x] of ea) {
-      const path = prefix ? `${prefix}/${name}` : name;
-      const y = eb.get(name);
-      if (y && x.id === y.id && x.mode === y.mode) continue;
-      if (y && isTree(x) && isTree(y)) {
-        await this.diffTreeSides(x.id, y.id, path, oldSide, newSide);
-        continue;
+    if (this.trees.raw) return this.diffRawTrees(a, b, prefix, oldSide, newSide);
+    const ea = a === undefined || a === EMPTY_TREE_ID ? [] : await this.treeEntries(a);
+    const eb = b === undefined || b === EMPTY_TREE_ID ? [] : await this.treeEntries(b);
+    let i = 0;
+    let j = 0;
+    while (i < ea.length || j < eb.length) {
+      const x = ea[i];
+      const y = eb[j];
+      const order =
+        x === undefined
+          ? 1
+          : y === undefined
+            ? -1
+            : compareEntryNames(x.name, isTreeMode(x.mode), y.name, isTreeMode(y.mode));
+      if (order < 0) {
+        const e = x as TreeEntry;
+        await this.addSide(e, prefix ? `${prefix}/${e.name}` : e.name, oldSide);
+        i++;
+      } else if (order > 0) {
+        const e = y as TreeEntry;
+        await this.addSide(e, prefix ? `${prefix}/${e.name}` : e.name, newSide);
+        j++;
+      } else {
+        const xe = x as TreeEntry;
+        const ye = y as TreeEntry;
+        i++;
+        j++;
+        if (xe.id === ye.id && xe.mode === ye.mode) continue;
+        const path = prefix ? `${prefix}/${xe.name}` : xe.name;
+        if (isTreeMode(xe.mode) && isTreeMode(ye.mode)) {
+          await this.diffTreeSides(xe.id, ye.id, path, oldSide, newSide);
+          continue;
+        }
+        await this.addSide(xe, path, oldSide);
+        await this.addSide(ye, path, newSide);
       }
-      await add(x, path, oldSide);
-      if (y) await add(y, path, newSide);
     }
-    for (const [name, y] of eb) {
-      if (ea.has(name)) continue;
-      await add(y, prefix ? `${prefix}/${name}` : name, newSide);
+  }
+
+  /**
+   * {@link diffTreeSides} over the trees' stored bytes: an entry the same on both sides is
+   * passed over without being decoded (a missing tree reads as empty, as `treeEntries` has it)
+   */
+  private async diffRawTrees(
+    a: ObjectId | undefined,
+    b: ObjectId | undefined,
+    prefix: string,
+    oldSide: Map<string, Side>,
+    newSide: Map<string, Side>,
+  ): Promise<void> {
+    if (a === b) return;
+    const trees = this.trees;
+    const read = async (id: ObjectId | undefined) =>
+      id === undefined || id === EMPTY_TREE_ID ? NO_BYTES : ((await trees.raw?.(id)) ?? NO_BYTES);
+    const x = new TreeEntryCursor(await read(a));
+    const y = new TreeEntryCursor(await read(b));
+    const pathOf = (name: string) => (prefix ? `${prefix}/${name}` : name);
+    while (!x.done || !y.done) {
+      const order = x.done ? 1 : y.done ? -1 : x.compare(y);
+      if (order < 0) {
+        await this.addRawSide(x, pathOf(x.name()), oldSide);
+        x.next();
+      } else if (order > 0) {
+        await this.addRawSide(y, pathOf(y.name()), newSide);
+        y.next();
+      } else {
+        if (!x.sameAs(y)) {
+          const path = pathOf(x.name());
+          if (x.isTree && y.isTree) await this.diffRawTrees(x.id(), y.id(), path, oldSide, newSide);
+          else {
+            await this.addRawSide(x, path, oldSide);
+            await this.addRawSide(y, path, newSide);
+          }
+        }
+        x.next();
+        y.next();
+      }
     }
+  }
+
+  /** The entry a cursor is on, on one side: a blob as itself, a subtree as its blobs */
+  private async addRawSide(
+    c: TreeEntryCursor,
+    path: string,
+    side: Map<string, Side>,
+  ): Promise<void> {
+    if (c.isTree) await this.collectTreeEntries(c.id(), path, side);
+    else side.set(path, { mode: c.mode, id: c.id() });
+  }
+
+  /** A tree entry on one side: a blob as itself, a subtree as its blobs */
+  private async addSide(e: TreeEntry, path: string, side: Map<string, Side>): Promise<void> {
+    if (isTreeMode(e.mode)) await this.collectTreeEntries(e.id, path, side);
+    else side.set(path, { mode: e.mode, id: e.id });
   }
 
   /**
@@ -1410,4 +1494,27 @@ function resolveHostPath(base: string, path: string): string {
     } else if (part !== "." && part !== "") parts.push(part);
   }
   return parts.join("/") || "/";
+}
+
+/** The empty tree's content */
+const NO_BYTES = new Uint8Array(0);
+
+/** Whether a tree entry's mode is a subtree's */
+function isTreeMode(mode: number): boolean {
+  return (mode & S_IFMT) === 0o40000;
+}
+
+/**
+ * git's `base_name_compare` over names as trees hold them (decoded as {@link decodeGitPath}
+ * decodes them): byte order, a subtree's name compared as if it ended in `/`.
+ */
+function compareEntryNames(a: string, aTree: boolean, b: string, bTree: boolean): number {
+  const n = a.length < b.length ? a.length : b.length;
+  for (let k = 0; k < n; k++) {
+    if (a.charCodeAt(k) !== b.charCodeAt(k)) return compareGitPaths(a, b);
+  }
+  // past the common part: the next character's code orders as its first byte would
+  const ca = a.length > n ? a.charCodeAt(n) : aTree ? 0x2f : 0;
+  const cb = b.length > n ? b.charCodeAt(n) : bTree ? 0x2f : 0;
+  return ca - cb;
 }
