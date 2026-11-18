@@ -28,7 +28,8 @@ import {
   textToLatin1,
 } from "../apply/latin1.js";
 import { coreBool } from "../core-config.js";
-import { parseGitDate } from "../git-date.js";
+import { localTimezoneOffset, parseGitDate } from "../git-date.js";
+import { withoutCrud } from "../git-ident.js";
 import { configValue, conflictStyleOf } from "../merge-config.js";
 import { ortConfigOptions } from "../merge-drivers.js";
 import {
@@ -48,6 +49,12 @@ import { updateHead } from "../reflog-messages.js";
 import { resetMerge } from "../sequencer-support.js";
 import { appendSignoff } from "../trailers.js";
 import { mailinfo, mailsplit } from "./mailinfo.js";
+import {
+  type AmPatchFormat,
+  detectPatchFormat,
+  hgPatchToMail,
+  stgitPatchToMail,
+} from "./patch-format.js";
 
 const DIR = "rebase-apply";
 
@@ -124,7 +131,9 @@ function sqDequoteAll(s: string): string[] {
  * ```
  */
 export class AmCommand extends GitCommand<AmResult> {
-  private mboxes: string[] = [];
+  private mboxes: { content: string; name?: string }[] = [];
+  private patchFormat?: AmPatchFormat;
+  private fixedClock?: number;
   private resume?: Resume;
   private threeWay?: boolean;
   private signoff = false;
@@ -143,10 +152,39 @@ export class AmCommand extends GitCommand<AmResult> {
   private out = "";
   private err = "";
 
-  /** A mailbox (mbox) to apply, in order. */
-  addMbox(mbox: Uint8Array | string): this {
-    this.mboxes.push(typeof mbox === "string" ? textToLatin1(mbox) : bytesToLatin1(mbox));
+  /**
+   * A mailbox (mbox) to apply, in order. `name` is its file's name as git shows it in
+   * messages (the file argument); a named file's format is detected (from the first one)
+   * and it must not be empty, while one without a name reads as standard input (an mbox).
+   */
+  addMbox(mbox: Uint8Array | string, name?: string): this {
+    const content = typeof mbox === "string" ? textToLatin1(mbox) : bytesToLatin1(mbox);
+    this.mboxes.push({ content, ...(name !== undefined ? { name } : {}) });
     return this;
+  }
+
+  /**
+   * `--patch-format=<format>`: mbox, mboxrd, stgit or hg (Mercurial); detected from the
+   * first named mailbox when not given. An StGit series (`stgit-series`) names its patch
+   * files, which a command given contents cannot open: it is refused.
+   */
+  setPatchFormat(format: AmPatchFormat): this {
+    this.patchFormat = format;
+    return this;
+  }
+
+  /**
+   * The clock (seconds since the epoch) for the dates git takes from it: the author date of
+   * `--ignore-date` or of a mail without a `Date:` header, the committer date and the reflog
+   * lines (default: the system clock).
+   */
+  setClock(seconds: number): this {
+    this.fixedClock = seconds;
+    return this;
+  }
+
+  protected override clock(): number {
+    return this.fixedClock ?? super.clock();
   }
 
   /** `--continue`/`--resolved`, `--allow-empty`, `--skip`, `--abort`, `--quit`. */
@@ -333,11 +371,50 @@ export class AmCommand extends GitCommand<AmResult> {
     const threeway = this.threeWay ?? bool("am.threeWay") ?? false;
     const keepCr = this.keepCr ?? bool("am.keepcr") ?? false;
     const messageId = this.messageId ?? bool("am.messageid") ?? false;
-    const mails: string[] = [];
-    for (const mbox of this.mboxes.length ? this.mboxes : [""]) {
-      mails.push(...mailsplit(mbox, { keepCr, mboxrd: this.mboxrd }));
+    // detect_patch_format: standard input is a mailbox, a file is looked at
+    const first = this.mboxes[0];
+    const format =
+      this.patchFormat ??
+      (this.mboxrd
+        ? "mboxrd"
+        : first?.name !== undefined
+          ? detectPatchFormat(first.content)
+          : "mbox");
+    if (!format) {
+      this.err += "Patch format detection failed.\n";
+      throw new AmStop(128);
     }
     await state.removeRef("REBASE_HEAD");
+    const mails: string[] = [];
+    const failSplit = (error: string): never => {
+      this.err += `error: ${error}\n`;
+      this.fatal("Failed to split patches.");
+    };
+    const inputs = this.mboxes.length ? this.mboxes : [{ content: "" }];
+    if (format === "mbox" || format === "mboxrd") {
+      for (const mbox of inputs) {
+        // mailsplit: an empty file is an error, empty standard input is not
+        if (mbox.name !== undefined && /^[ \t\n\v\f\r]*$/.test(mbox.content)) {
+          this.err += `error: empty mbox: '${mbox.name}'\n`;
+          failSplit(`cannot split patches from ${mbox.name}`);
+        }
+        mails.push(...mailsplit(mbox.content, { keepCr, mboxrd: format === "mboxrd" }));
+      }
+    } else if (format === "stgit-series") {
+      failSplit("Only one StGIT patch series can be applied at once");
+    } else {
+      for (const mbox of inputs) {
+        if (format === "stgit") mails.push(stgitPatchToMail(mbox.content));
+        else {
+          const r = hgPatchToMail(mbox.content);
+          if ("error" in r) {
+            this.err += `error: ${r.error}\n`;
+            failSplit(`could not parse patch '${mbox.name ?? "-"}'`);
+          }
+          mails.push((r as { mail: string }).mail);
+        }
+      }
+    }
     let n = 0;
     for (const mail of mails) await this.write(String(++n).padStart(4, "0"), mail);
     await this.writeText("threeway", threeway ? "t" : "f");
@@ -436,7 +513,17 @@ export class AmCommand extends GitCommand<AmResult> {
     return indexChangesFromTree(index, this.trees, tree);
   }
 
-  private dieUserResolve(patchEmptyAndClean: boolean): never {
+  /** `die_user_resolve`: the advice, then the stop. */
+  private async dieUserResolve(): Promise<never> {
+    const bool = (k: string) => {
+      const v = configValue(this.workingCopy, k)?.toLowerCase();
+      return v === undefined ? undefined : ["true", "yes", "on", "1", ""].includes(v);
+    };
+    const patchEmptyAndClean =
+      bool("advice.amWorkDir") !== false &&
+      (await this.patchIsEmpty()) &&
+      (await this.indexHasChanges()).length === 0;
+    if (bool("advice.mergeConflict") === false && !this.legacyMessages) throw new AmStop(128);
     const lines = [
       'When you have resolved this problem, run "git am --continue".',
       'If you prefer to skip this patch, run "git am --skip" instead.',
@@ -527,7 +614,7 @@ export class AmCommand extends GitCommand<AmResult> {
           this.say(`Creating an empty commit: ${this.firstLine(msg)}`);
         } else {
           this.out += "Patch is empty.\n";
-          this.dieUserResolve((await this.indexHasChanges()).length === 0);
+          await this.dieUserResolve();
         }
       }
       if (!toKeep) {
@@ -546,7 +633,7 @@ export class AmCommand extends GitCommand<AmResult> {
         if (status) {
           this.out += `Patch failed at ${name} ${this.firstLine(msg)}\n`;
           this.err += "hint: Use 'git am --show-current-patch=diff' to see the failed patch\n";
-          this.dieUserResolve(false);
+          await this.dieUserResolve();
         }
       }
       await this.doCommit(st);
@@ -724,29 +811,55 @@ export class AmCommand extends GitCommand<AmResult> {
     }
     const a = st.author as { name: string; email: string; date: string };
     if (!a.name) this.fatal(`empty ident name (for <${a.email}>) not allowed`);
-    let author: PersonIdent;
-    const parsed = this.ignoreDate ? undefined : parseGitDate(a.date);
-    if (!this.ignoreDate && a.date && !parsed) this.fatal(`invalid date format: ${a.date}`);
-    const name = latin1ToPath(a.name);
-    const email = latin1ToPath(a.email);
-    if (parsed) author = { name, email, timestamp: parsed.timestamp, tzOffset: parsed.tzOffset };
-    else author = this.datedIdent("author", { name, email });
+    if (!withoutCrud(a.name)) this.fatal(`name consists only of disallowed characters: ${a.name}`);
+    // fmt_ident: crud trimmed; no date (--ignore-date, a mail without Date:) is now, not
+    // GIT_AUTHOR_DATE
+    const date = this.ignoreDate ? "" : a.date;
+    const parsed = date ? parseGitDate(date) : undefined;
+    if (date && !parsed) this.fatal(`invalid date format: ${date}`);
+    const now = this.clock();
+    let author: PersonIdent = {
+      name: withoutCrud(a.name),
+      email: withoutCrud(a.email),
+      ...(parsed ?? { timestamp: now, tzOffset: localTimezoneOffset(now) }),
+    };
     let committer = this.resolveCommitter();
     if (this.committerDateIsAuthorDate)
       committer = { ...committer, timestamp: author.timestamp, tzOffset: author.tzOffset };
-    const msg = latin1ToPath(st.msg as string);
+    // commit_tree's ensure_utf8: bytes that are not UTF-8 read as Latin-1
+    let msg = st.msg as string;
+    if (isUtf8Encoding(configValue(this.workingCopy, "i18n.commitEncoding"))) {
+      const fixed = [author.name, author.email, msg].map(ensureUtf8);
+      const committerFixed = [committer.name, committer.email].map((v) =>
+        ensureUtf8(pathToLatin1(v)),
+      );
+      if ([...fixed, ...committerFixed].some((f) => f.changed)) {
+        this.err +=
+          "Warning: commit message did not conform to UTF-8.\nYou may want to amend it after fixing the message, or set the config\nvariable i18n.commitEncoding to the encoding your project uses.\n";
+      }
+      author = { ...author, name: (fixed[0] as Fixed).text, email: (fixed[1] as Fixed).text };
+      msg = (fixed[2] as Fixed).text;
+      committer = {
+        ...committer,
+        name: latin1ToPath((committerFixed[0] as Fixed).text),
+        email: latin1ToPath((committerFixed[1] as Fixed).text),
+      };
+    }
+    author = { ...author, name: latin1ToPath(author.name), email: latin1ToPath(author.email) };
+    const message = latin1ToPath(msg);
     const id = await this.commits.store({
       tree,
       parents: head ? [head] : [],
       author,
       committer,
-      message: msg,
+      message,
     });
     const action = this.reflogAction("am");
     await updateHead(
       this.refsStore,
       id,
-      this.reflogLine(`${action}: ${this.firstLine(msg)}`, committer),
+      // the subject as the mail had it, before commit_tree's UTF-8 fixup
+      this.reflogLine(`${action}: ${latin1ToPath(this.firstLine(st.msg as string))}`, committer),
     );
   }
 
@@ -760,14 +873,14 @@ export class AmCommand extends GitCommand<AmResult> {
       } else {
         this.out +=
           "No changes - did you forget to use 'git add'?\nIf there is nothing left to stage, chances are that something else\nalready introduced the same changes; you might want to skip this patch.\n";
-        this.dieUserResolve(false);
+        await this.dieUserResolve();
       }
     }
     const { unmerged } = await readIndex(this.staging);
     if (unmerged.length) {
       this.out +=
         "You still have unmerged paths in your index.\nYou should 'git add' each file with resolved conflicts to mark them as such.\nYou might run `git rm` on a file to accept \"deleted by them\" for it.\n";
-      this.dieUserResolve(false);
+      await this.dieUserResolve();
     }
     await this.doCommit(st);
     await this.next(st);
@@ -786,14 +899,20 @@ export class AmCommand extends GitCommand<AmResult> {
       return this.result(0);
     }
     const orig = await state.ref("ORIG_HEAD");
+    // clean_index: the index and worktree reset to HEAD, then moved to ORIG_HEAD (a two-way
+    // merge that keeps local changes it does not touch); unpack-trees' error, then the stop
+    const cleanFailed = (message: string): never => {
+      this.err += `${message.replace(/\nfatal: Could not reset index file to revision '[^\n]*'\.$/, "")}\n`;
+      this.fatal("failed to clean index");
+    };
+    if (head) {
+      const refused = await resetMerge(this.sequencerContext(), head, "HEAD", { reset: true });
+      if (refused) cleanFailed(refused.message);
+    }
     const target = orig ?? head;
-    if (target) {
-      const refused = await resetMerge(
-        this.sequencerContext(),
-        target,
-        orig ? "ORIG_HEAD" : "HEAD",
-      );
-      if (refused) this.fatal(refused.message);
+    if (target && target !== head) {
+      const refused = await resetMerge(this.sequencerContext(), target, "ORIG_HEAD");
+      if (refused) cleanFailed(refused.message);
     }
     if (orig) await updateHead(this.refsStore, orig, this.reflogLine("am --abort"));
     await state.remove(DIR);
@@ -826,6 +945,69 @@ interface AmState {
   applyOpts: string[];
   author?: { name: string; email: string; date: string };
   msg?: string;
+}
+
+interface Fixed {
+  text: string;
+  changed: boolean;
+}
+
+/** `is_encoding_utf8` of `i18n.commitEncoding` (unset is UTF-8). */
+function isUtf8Encoding(encoding: string | undefined): boolean {
+  return encoding === undefined || /^utf-?8$/i.test(encoding);
+}
+
+/**
+ * commit.c's `ensure_utf8` of a binary string: each byte that starts no valid UTF-8
+ * sequence (`has_invalid_utf8`: overlong forms, surrogates and non-characters included)
+ * read as Latin-1.
+ */
+export function ensureUtf8(text: string): Fixed {
+  const max = [0x7f, 0x7ff, 0xffff, 0x10ffff];
+  let out = "";
+  let changed = false;
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c0 = text.charCodeAt(i);
+    if (c0 < 0x80) {
+      out += text[i++];
+      continue;
+    }
+    let c = c0;
+    let bytes = 0;
+    while (c & 0x40) {
+      c = (c << 1) & 0xff;
+      bytes++;
+    }
+    let valid = bytes >= 1 && bytes <= 3 && n - i - 1 >= bytes;
+    if (valid) {
+      let cp = (c & 0x7f) >> bytes;
+      for (let k = 1; k <= bytes; k++) {
+        const b = text.charCodeAt(i + k);
+        cp = (cp << 6) | (b & 0x3f);
+        if ((b & 0xc0) !== 0x80) valid = false;
+      }
+      if (
+        valid &&
+        (cp < (max[bytes - 1] as number) + 1 ||
+          cp > (max[bytes] as number) ||
+          (cp & 0x1ff800) === 0xd800 ||
+          (cp & 0xfffe) === 0xfffe ||
+          (cp >= 0xfdd0 && cp <= 0xfdef))
+      )
+        valid = false;
+    }
+    if (valid) {
+      out += text.slice(i, i + bytes + 1);
+      i += bytes + 1;
+    } else {
+      out += String.fromCharCode(0xc0 + (c0 >> 6), 0x80 + (c0 & 0x3f));
+      changed = true;
+      i++;
+    }
+  }
+  return { text: out, changed };
 }
 
 class AmStop extends Error {

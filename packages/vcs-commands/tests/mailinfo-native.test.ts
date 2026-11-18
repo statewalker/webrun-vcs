@@ -123,4 +123,53 @@ describeGit("mailinfo and mailsplit as native git", () => {
       void latin1ToBytes;
     }
   });
+
+  it("converts charsets as iconv does, failing where it fails", () => {
+    const mail = (charset: string, body: Buffer, header = "") =>
+      Buffer.concat([
+        Buffer.from(
+          `From: A <a@x>\nSubject: ${header}charsets\nContent-Type: text/plain; charset=${charset}\n\n`,
+        ),
+        body,
+        Buffer.from(`\n${PATCH}`),
+      ]);
+    const latin = Buffer.from([0x62, 0xe9, 0x80, 0x93, 0x9f, 0xff, 0x0a]);
+    const cases: [string, Buffer][] = [
+      ["ISO-8859-1", latin],
+      ["latin1", latin],
+      ["windows-1252", Buffer.from([0x62, 0xe9, 0x80, 0x93, 0x0a])],
+      ["us-ascii", latin],
+      ["us-ascii", Buffer.from("plain ascii\n")],
+      ["bogus-charset", Buffer.from("text\n")],
+      ["UTF-8", latin],
+      ["shift_jis", Buffer.from([0x82, 0xa0, 0x0a])],
+      ["shift_jis", Buffer.from([0x82, 0x0a])],
+      ["koi8-r", Buffer.from([0xc1, 0xc2, 0x0a])],
+    ];
+    for (const [charset, body] of cases) {
+      for (const header of ["", "=?ISO-8859-1?q?h=E9=80?= "]) {
+        const m = mail(charset, body, header);
+        const dir = mkdtempSync(join(root, "cs-"));
+        const r = spawnSync("git", ["mailinfo", join(dir, "msg"), join(dir, "patch")], {
+          input: m,
+          env: nativeGitEnv(root),
+          cwd: root,
+        });
+        const ours = mailinfo(bytesToLatin1(m));
+        const label = `${charset} ${JSON.stringify(header)} ${body.toString("hex")}`;
+        expect({ label, failed: ours.failed, errors: ours.errors }).toEqual({
+          label,
+          failed: r.status !== 0,
+          errors: r.stderr.toString(),
+        });
+        if (r.status === 0) {
+          expect({ label, info: ours.info, msg: ours.msg }).toEqual({
+            label,
+            info: bytesToLatin1(r.stdout),
+            msg: bytesToLatin1(readFileSync(join(dir, "msg"))),
+          });
+        }
+      }
+    }
+  });
 });

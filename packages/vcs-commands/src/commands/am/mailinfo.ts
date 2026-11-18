@@ -326,10 +326,47 @@ function isFormatPatchSeparator(line: string): boolean {
   return line.slice(45) === SAMPLE.slice(45);
 }
 
-/** A charset's bytes as UTF-8 (TextDecoder); undefined when the charset is unknown. */
+const LATIN1 = new Set([
+  "iso-8859-1",
+  "iso8859-1",
+  "iso_8859-1",
+  "iso88591",
+  "latin1",
+  "latin-1",
+  "l1",
+  "cp819",
+  "ibm819",
+  "iso-ir-100",
+  "csisolatin1",
+]);
+const ASCII = new Set([
+  "us-ascii",
+  "ascii",
+  "us",
+  "ansi_x3.4-1968",
+  "iso646-us",
+  "iso-ir-6",
+  "cp367",
+  "ibm367",
+  "csascii",
+  "646",
+]);
+
+/**
+ * `reencode_string_len` (iconv) of a charset's bytes to UTF-8: undefined when the charset
+ * is unknown or the bytes are not valid in it. ISO-8859-1 is Latin-1 (TextDecoder's label
+ * would be windows-1252) and US-ASCII refuses bytes above 0x7f, as iconv does. UTF-7 is
+ * not supported (TextDecoder has no decoder for it): it fails as an unknown charset.
+ */
 function reencode(bytes: string, charset: string): string | undefined {
+  const name = charset.toLowerCase();
+  if (LATIN1.has(name)) return bytesToLatin1(new TextEncoder().encode(bytes));
+  if (ASCII.has(name)) {
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: the bytes above ASCII
+    return /[^\x00-\x7f]/.test(bytes) ? undefined : bytes;
+  }
   try {
-    const text = new TextDecoder(charset.toLowerCase(), { fatal: false }).decode(
+    const text = new TextDecoder(name, { fatal: true, ignoreBOM: true }).decode(
       latin1ToBytes(bytes),
     );
     return bytesToLatin1(new TextEncoder().encode(text));

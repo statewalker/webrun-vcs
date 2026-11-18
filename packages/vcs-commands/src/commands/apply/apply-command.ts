@@ -26,7 +26,7 @@ import {
   type ApplyIO,
 } from "./apply-engine.js";
 import type { ApplyVerbosity } from "./apply-parse.js";
-import { isGitlink, isLink, S_IFDIR, type WsErrorAction } from "./apply-types.js";
+import { isGitlink, isLink, S_IFDIR, S_IFGITLINK, type WsErrorAction } from "./apply-types.js";
 import {
   bytesToLatin1,
   latin1ToBytes,
@@ -91,7 +91,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
   private unsafePaths = false;
   private intentToAdd = false;
   private nul = false;
-  private whitespace?: string;
+  private whitespace: string[] = [];
   private ignoreWhitespace?: boolean;
   private context?: number;
   private strip?: number;
@@ -236,9 +236,13 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
     return this;
   }
 
-  /** `--whitespace=<action>`: nowarn, warn, fix (strip), error, error-all. */
+  /**
+   * `--whitespace=<action>`: nowarn, warn, fix (strip), error, error-all. As with git's
+   * repeated option, the last action wins, but an `error-all` before it still reports
+   * every whitespace error.
+   */
   setWhitespace(action: string): this {
-    this.whitespace = action;
+    this.whitespace.push(action);
     return this;
   }
 
@@ -348,9 +352,15 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
             path: string,
             names?: readonly string[],
           ) => Promise<Map<string, true | false | string | undefined>>;
-          checkin?: (
-            path: string,
-          ) => Promise<{ apply(c: Uint8Array): Promise<Uint8Array> } | undefined>;
+          checkin?: (path: string) => Promise<
+            | {
+                apply(
+                  c: Uint8Array,
+                  options?: { keepCrlf?: boolean; renormalize?: boolean },
+                ): Promise<Uint8Array>;
+              }
+            | undefined
+          >;
         }
       | undefined;
 
@@ -377,7 +387,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
 
     const toPath = latin1ToPath;
     const engine: ApplyEngine = new ApplyEngine(
-      this.makeIO(worktree, trust, filter),
+      this.makeIO(worktree, trust, filter, this.worktreeAccess),
       (name) => {
         const e = indexEntries?.get(name);
         return e
@@ -394,6 +404,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
         return whitespaceRuleOf(attr, configRule);
       },
       (pattern, text) => wildmatch(toPath(pattern), toPath(text)),
+      () => indexEntries?.keys() ?? [],
     );
     engine.legacyMessages = this.legacyMessages;
     engine.quotePathFully = coreBool(this.workingCopy, "quotePath", true);
@@ -436,12 +447,11 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
     engine.mergeVariant = this.mergeVariant;
     if (this.nul) engine.lineTermination = "\0";
     if (this.context !== undefined) engine.pContext = this.context;
-    if (this.whitespace !== undefined) {
+    for (const option of this.whitespace) {
       engine.whitespaceOptionGiven = true;
-      const action = parseWhitespaceAction(this.whitespace);
+      const action = parseWhitespaceAction(option);
       // an option parse error: usage status
-      if (!action)
-        return { ...fatal(`unrecognized whitespace option '${this.whitespace}'`), status: 129 };
+      if (!action) return { ...fatal(`unrecognized whitespace option '${option}'`), status: 129 };
       engine.wsErrorAction = action.action;
       if (action.all) engine.squelchWhitespaceErrors = 0;
     }
@@ -522,11 +532,19 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
     trust: { executable?: boolean; symlinks?: boolean },
     filter:
       | {
-          checkin?: (
-            path: string,
-          ) => Promise<{ apply(c: Uint8Array): Promise<Uint8Array> } | undefined>;
+          checkin?: (path: string) => Promise<
+            | {
+                apply(
+                  c: Uint8Array,
+                  options?: { keepCrlf?: boolean; renormalize?: boolean },
+                ): Promise<Uint8Array>;
+              }
+            | undefined
+          >;
         }
       | undefined,
+    /** Where rejects go: the worktree, `--cached` or not */
+    rejectWorktree: Worktree | undefined,
   ): ApplyIO {
     const blobs = this.blobs;
     const toPath = latin1ToPath;
@@ -560,14 +578,18 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
         const st = await lstat(name);
         return st ? { mode: st.mode } : undefined;
       },
-      readWorktree: async (name, mode) => {
+      readWorktree: async (name, mode, keepCrlf) => {
         if (!worktree) return undefined;
         try {
           const path = toPath(name);
           let bytes: Uint8Array = await readAll(worktree.readContent(path));
           if (!isLink(mode)) {
             const conversion = await filter?.checkin?.(path);
-            if (conversion) bytes = await conversion.apply(bytes);
+            if (conversion)
+              bytes = await conversion.apply(
+                bytes,
+                keepCrlf ? { keepCrlf: true } : { renormalize: true },
+              );
           }
           return bytesToLatin1(bytes);
         } catch {
@@ -584,11 +606,14 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
         }
         return false;
       },
+      // create_ce_mode: a directory stages as a gitlink
       modeFromStat: (_name, entry, stMode) =>
-        modeFromWorktree(stMode, entry?.mode, {
-          executable: trust.executable !== false,
-          symlinks: trust.symlinks !== false,
-        }),
+        (stMode & 0o170000) === S_IFDIR
+          ? S_IFGITLINK
+          : modeFromWorktree(stMode, entry?.mode, {
+              executable: trust.executable !== false,
+              symlinks: trust.symlinks !== false,
+            }),
       matchesIndex: async (name, entry) => {
         if (!worktree) return true;
         const st = await lstat(name);
@@ -602,6 +627,15 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
       },
       checkout: async (name, entry) => {
         if (!worktree) return false;
+        // checkout_entry of a submodule that is not populated: its empty directory
+        if (isGitlink(entry.mode)) {
+          try {
+            await worktree.mkdir(toPath(name), { recursive: true });
+            return true;
+          } catch {
+            return false;
+          }
+        }
         const content = await blobs.load(entry.oid);
         if (!content) return false;
         try {
@@ -656,13 +690,25 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
         });
         return { content: bytesToLatin1(merged.content), conflicts: merged.conflicts };
       },
-      removeWorktree: async (name, _mode, rmdirEmpty) => {
-        if (!worktree) return;
+      removeWorktree: async (name, mode, rmdirEmpty) => {
+        if (!worktree) return undefined;
         const path = toPath(name);
-        try {
-          await worktree.remove(path, isGitlink(_mode) ? { recursive: false } : undefined);
-        } catch {
-          // remove_or_warn only warns
+        // remove_or_warn: rmdir a gitlink, unlink anything else; a missing path is fine
+        if (isGitlink(mode)) {
+          const st = await lstat(name);
+          if (st) {
+            if ((st.mode & 0o170000) !== S_IFDIR)
+              return `unable to rmdir '${name}': Not a directory`;
+            if (!(await worktree.removeEmptyDirectory?.(path).catch(() => false)))
+              return `unable to rmdir '${name}': Directory not empty`;
+          }
+        } else {
+          try {
+            await worktree.remove(path);
+          } catch (error) {
+            if ((error as { code?: string })?.code !== "ENOENT")
+              return `unable to unlink '${name}': ${strerror(error)}`;
+          }
         }
         if (rmdirEmpty && worktree.removeEmptyDirectory) {
           let at = path.lastIndexOf("/");
@@ -672,6 +718,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
             at = dir.lastIndexOf("/");
           }
         }
+        return undefined;
       },
       createWorktree: async (name, mode, content) => {
         if (!worktree) return undefined;
@@ -696,7 +743,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
             const st = await lstat(name);
             if (st && (st.mode & 0o170000) === S_IFDIR) {
               if (!(await worktree.removeEmptyDirectory?.(path).catch(() => false)))
-                return `unable to write file '${name}' mode ${mode.toString(8)}: File exists`;
+                return `unable to write file '${name}' mode ${mode.toString(8)}: Directory not empty`;
             }
             await worktree.writeContent(path, bytes, {
               mode: fileMode,
@@ -706,12 +753,12 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
           }
           return undefined;
         } catch (error) {
-          return `unable to write file '${name}' mode ${mode.toString(8)}: ${(error as Error).message}`;
+          return `unable to write file '${name}' mode ${mode.toString(8)}: ${strerror(error)}`;
         }
       },
       writeReject: async (name, content) => {
-        if (!worktree) return;
-        await worktree.writeContent(toPath(name), latin1ToBytes(content), {
+        if (!rejectWorktree) return;
+        await rejectWorktree.writeContent(toPath(name), latin1ToBytes(content), {
           mode: FileMode.REGULAR_FILE,
           raw: true,
         });
@@ -730,6 +777,31 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
       verifyPath: (name, mode) => isValidWorktreePath(toPath(name), mode),
     };
   }
+}
+
+const ERRNO_TEXT: Record<string, string> = {
+  ENOENT: "No such file or directory",
+  ENOTDIR: "Not a directory",
+  EEXIST: "File exists",
+  EISDIR: "Is a directory",
+  EACCES: "Permission denied",
+  EPERM: "Operation not permitted",
+  ENOSPC: "No space left on device",
+  EROFS: "Read-only file system",
+  ELOOP: "Too many levels of symbolic links",
+  ENAMETOOLONG: "File name too long",
+  ENOTEMPTY: "Directory not empty",
+  EINVAL: "Invalid argument",
+  EIO: "Input/output error",
+};
+
+/** `strerror(errno)` of a failed file operation (its `code`), else its message. */
+function strerror(error: unknown): string {
+  const code = (error as { code?: unknown })?.code;
+  if (typeof code === "string" && ERRNO_TEXT[code]) return ERRNO_TEXT[code] as string;
+  const message = (error as Error)?.message ?? String(error);
+  const m = /^(E[A-Z]+)\b/.exec(message);
+  return (m && ERRNO_TEXT[m[1] as string]) || message;
 }
 
 /** `parse_whitespace_option`. */

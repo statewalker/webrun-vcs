@@ -176,8 +176,8 @@ async function compareApply(
   g.close();
   const ours: Run = { status: r.exitCode, stdout: r.output, stderr: r.errors };
   expect({ label, ...ours }).toEqual({ label, ...native });
-  expect(snapshot(pair.ours)).toBe(snapshot(pair.native));
-  expect(gitOk(pair.ours, "ls-files", "-s")).toBe(gitOk(pair.native, "ls-files", "-s"));
+  expect(snapshot(pair.ours), label).toBe(snapshot(pair.native));
+  expect(gitOk(pair.ours, "ls-files", "-s"), label).toBe(gitOk(pair.native, "ls-files", "-s"));
   // the stat data we wrote: native sees the same files as changed or not
   expect(gitOk(pair.ours, "status", "--porcelain")).toBe(
     gitOk(pair.native, "status", "--porcelain"),
@@ -626,6 +626,264 @@ describeGit("git apply as native git", () => {
       );
     }
   }, 180_000);
+
+  it("refuses an index with a path as both a file and a directory", async () => {
+    const base: Setup = (d) => {
+      put(d, "a.txt", "a\n");
+      put(d, "dir/f", "f\n");
+      gitOk(d, "add", "-A");
+      gitOk(d, "commit", "-qm", "base");
+    };
+    const under =
+      "diff --git a/a.txt/x b/a.txt/x\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt/x\n@@ -0,0 +1 @@\n+x\n";
+    const over =
+      "diff --git a/dir b/dir\nnew file mode 100644\n--- /dev/null\n+++ b/dir\n@@ -0,0 +1 @@\n+d\n";
+    const rename =
+      "diff --git a/a.txt b/a.txt/y\nsimilarity index 100%\nrename from a.txt\nrename to a.txt/y\n";
+    const swap = `diff --git a/a.txt b/a.txt\ndeleted file mode 100644\n--- a/a.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n${under}`;
+    for (const [label, patch] of [
+      ["under", under],
+      ["over", over],
+      ["rename", rename],
+      ["swap", swap],
+    ] as const) {
+      for (const args of [["--cached"], ["--cached", "-N"], ["--index"]]) {
+        await compareApply(
+          twins(base),
+          patch,
+          { args, configure: (c) => configureArgs(c, args) },
+          `${label} ${args}`,
+        );
+      }
+      // --index with the parent file gone from the worktree only
+      await compareApply(
+        twins((d) => {
+          base(d);
+          rmSync(join(d, "a.txt"));
+        }),
+        patch,
+        { args: ["--index"], configure: (c) => c.setIndex(true) },
+        `${label} --index without a.txt`,
+      );
+    }
+  }, 180_000);
+
+  it("reads the old file keeping CRLF when the patch context has CRLF", async () => {
+    const crlf = "a\r\nb\r\nc\r\n";
+    const crlfPatch = "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\r\n-b\r\n+B\r\n c\r\n";
+    const lfPatch = "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+    const withAttributes =
+      (attributes: string): Setup =>
+      (d) => {
+        put(d, "f", crlf);
+        gitOk(d, "add", "-A");
+        gitOk(d, "commit", "-qm", "base");
+        put(d, ".gitattributes", attributes);
+        gitOk(d, "add", ".gitattributes");
+        gitOk(d, "commit", "-qm", "attributes");
+      };
+    for (const attributes of ["* text eol=lf\n", "* text=auto\n", "* text eol=crlf\n"]) {
+      for (const [label, patch] of [
+        ["crlf", crlfPatch],
+        ["lf", lfPatch],
+      ] as const) {
+        for (const args of [[], ["--check"]]) {
+          await compareApply(
+            twins(withAttributes(attributes)),
+            patch,
+            { args, configure: (c) => configureArgs(c, args) },
+            `${attributes.trim()} ${label} ${args}`,
+          );
+        }
+      }
+    }
+  }, 180_000);
+
+  it("applies submodule patches as native git does", async () => {
+    const a = "1111111111111111111111111111111111111111";
+    const b = "2222222222222222222222222222222222222222";
+    const bump = `diff --git a/sub b/sub\nindex 1111111..2222222 160000\n--- a/sub\n+++ b/sub\n@@ -1 +1 @@\n-Subproject commit ${a}\n+Subproject commit ${b}\n`;
+    const remove = `diff --git a/sub b/sub\ndeleted file mode 160000\nindex 1111111..0000000\n--- a/sub\n+++ /dev/null\n@@ -1 +0,0 @@\n-Subproject commit ${a}\n`;
+    const toFile = `${remove}diff --git a/sub b/sub\nnew file mode 100644\nindex 0000000..f2ad6c7\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+c\n`;
+    const add = `diff --git a/sub2 b/sub2\nnew file mode 160000\nindex 0000000..2222222\n--- /dev/null\n+++ b/sub2\n@@ -0,0 +1 @@\n+Subproject commit ${b}\n`;
+    const corrupt = `diff --git a/sub2 b/sub2\nnew file mode 160000\nindex 0000000..2222222\n--- /dev/null\n+++ b/sub2\n@@ -0,0 +1 @@\n+Subproject commit nothex\n`;
+    const withSub =
+      (worktree: "empty" | "populated" | "absent"): Setup =>
+      (d) => {
+        put(d, "f", "f\n");
+        gitOk(d, "add", "f");
+        gitOk(d, "update-index", "--add", "--cacheinfo", `160000,${a},sub`);
+        gitOk(d, "commit", "-qm", "base");
+        if (worktree === "empty") mkdirSync(join(d, "sub"));
+        if (worktree === "populated") {
+          mkdirSync(join(d, "sub"));
+          gitOk(join(d, "sub"), "init", "-q");
+          put(join(d, "sub"), "s", "s\n");
+        }
+      };
+    for (const worktree of ["empty", "populated", "absent"] as const) {
+      for (const [label, patch] of [
+        ["bump", bump],
+        ["remove", remove],
+        ["to file", toFile],
+        ["add", add],
+        ["corrupt", corrupt],
+      ] as const) {
+        for (const args of [[], ["--index"], ["--cached"], ["-3"], ["-R"], ["--check"]]) {
+          await compareApply(
+            twins(withSub(worktree)),
+            patch,
+            { args, configure: (c) => configureArgs(c, args) },
+            `${worktree} ${label} ${args}`,
+          );
+        }
+      }
+    }
+  }, 300_000);
+
+  it("reports messages as git's vreportf, binary hunk errors and rejects with --cached", async () => {
+    const base: Setup = (d) => {
+      put(d, "f", "a\r\nb\r\nc\r\n");
+      put(d, "g", lines(3));
+      put(d, "bin", Buffer.from([0, 1, 2, 3]));
+      gitOk(d, "add", "-A");
+      gitOk(d, "commit", "-qm", "base");
+    };
+    const long = `${lines(400, "a long line of context that does not match anything")}`;
+    const cases: [string, string, string[]][] = [
+      // control characters in the searched text become '?'
+      [
+        "control",
+        "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\r\n-x\u0001\u001b\r\n+B\r\n c\r\n",
+        ["-v"],
+      ],
+      // the message cut at 4096 bytes
+      [
+        "long",
+        `--- a/g\n+++ b/g\n@@ -1,401 +1,401 @@\n${long
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => ` ${l}\n`)
+          .join("")}-x\n+y\n`,
+        ["-v"],
+      ],
+      ["control name", "--- a/x\u0002y\n+++ b/x\u0002y\n@@ -1 +1 @@\n-a\n+b\n", []],
+    ];
+    for (const [label, patch, args] of cases) {
+      await compareApply(
+        twins(base),
+        patch,
+        { args, configure: (c) => configureArgs(c, args) },
+        label,
+      );
+    }
+    // binary hunks: a bad base85 character, a bad zlib stream, a wrong length
+    const encode85 = (data: number[]) => {
+      const en =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+      const out: string[] = [];
+      for (let i = 0; i < data.length; i += 52) {
+        const chunk = data.slice(i, i + 52);
+        let line =
+          chunk.length <= 26
+            ? String.fromCharCode(64 + chunk.length)
+            : String.fromCharCode(96 + chunk.length - 26);
+        for (let j = 0; j < chunk.length; j += 4) {
+          let acc = 0;
+          for (let k = 0; k < 4; k++) acc = acc * 256 + (chunk[j + k] ?? 0);
+          let group = "";
+          for (let k = 0; k < 5; k++) {
+            group = en[acc % 85] + group;
+            acc = Math.floor(acc / 85);
+          }
+          line += group;
+        }
+        out.push(line);
+      }
+      return out.join("\n");
+    };
+    const binary = (size: number, body: string) =>
+      `diff --git a/bin b/bin\nindex 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644\nGIT binary patch\nliteral ${size}\n${body}\n\nliteral 0\nHcmV?d00001\n\n`;
+    const binCases: [string, string][] = [
+      [
+        "base85",
+        binary(4, `${encode85([0x78, 0x9c, 1, 2, 3, 4, 5, 6])}`.replace(/^(.{3})./, '$1"')),
+      ],
+      [
+        "base85 nul",
+        binary(4, `${encode85([0x78, 0x9c, 1, 2, 3, 4, 5, 6])}`.replace(/^(.{3})./, "$1\u0000")),
+      ],
+      ["zlib header", binary(4, encode85([0x78, 0x9d, 1, 2, 3, 4, 5, 6]))],
+      ["zlib block", binary(4, encode85([0x78, 0x9c, 0xff, 0xff, 0xff, 0xff, 0, 0]))],
+      ["truncated", binary(4, encode85([0x78, 0x9c, 0x63, 0x60]))],
+      [
+        "length",
+        binary(
+          9,
+          encode85([0x78, 0x9c, 0x63, 0x60, 0x60, 0x64, 0x62, 0x06, 0x00, 0x00, 0x0d, 0x00, 0x07]),
+        ),
+      ],
+    ];
+    for (const [label, patch] of binCases) {
+      await compareApply(twins(base), patch, { args: [], configure: (c) => c }, label);
+      await compareApply(
+        twins(base),
+        patch,
+        { args: [], file: true, configure: (c) => c },
+        `${label} file`,
+      );
+    }
+    // --whitespace=error-all, then fix: every error is still reported
+    const ws = "--- a/g\n+++ b/g\n@@ -3 +3,7 @@\n line 3\n+a \n+b \n+c \n+d \n+e \n+f \n";
+    await compareApply(twins(base), ws, {
+      args: ["--whitespace=error-all", "--whitespace=fix"],
+      configure: (c) => c.setWhitespace("error-all").setWhitespace("fix"),
+    });
+    await compareApply(twins(base), ws, {
+      args: ["--whitespace=error-all", "--whitespace=warn"],
+      configure: (c) => c.setWhitespace("error-all").setWhitespace("warn"),
+    });
+    // --cached --reject: the applied hunks go to the index, the rejects to the worktree
+    const partly =
+      "--- a/g\n+++ b/g\n@@ -1,2 +1,2 @@\n-line 1\n+one\n line 2\n@@ -2,2 +2,2 @@\n line 2\n-nope\n+three\n";
+    await compareApply(twins(base), partly, {
+      args: ["--cached", "--reject"],
+      configure: (c) => c.setCached(true).setReject(true),
+    });
+  }, 180_000);
+
+  it("applies thousands of hunks at offsets, in linear time", async () => {
+    const n = 20000;
+    const base = lines(n);
+    const changed = base
+      .split(/(?<=\n)/)
+      .map((l, i) => (i % 20 === 10 ? `changed ${i}\n` : i % 40 === 5 ? "" : l))
+      .join("");
+    const { patch } = nativeDiff(
+      (d) => put(d, "big.txt", base),
+      (d) => put(d, "big.txt", changed),
+    );
+    // the target drifted: lines added at the top, some hunks' context changed
+    const drifted = `${lines(3, "top")}${base
+      .split(/(?<=\n)/)
+      .map((l, i) => (i % 2000 === 11 ? `drift ${i}\n` : l))
+      .join("")}`;
+    const target: Setup = (d) => {
+      put(d, "big.txt", drifted);
+      gitOk(d, "add", "-A");
+      gitOk(d, "commit", "-qm", "drifted");
+    };
+    for (const args of [[], ["--reject"], ["-C1"], ["--index", "-C1"]]) {
+      const started = performance.now();
+      await compareApply(
+        twins(target),
+        patch,
+        { args, configure: (c) => configureArgs(c, args) },
+        `big ${args}`,
+      );
+      expect(performance.now() - started).toBeLessThan(60_000);
+    }
+  }, 300_000);
 });
 
 /** Our command configured as native `git apply <args>`. */
@@ -645,6 +903,7 @@ function configureArgs(c: ApplyCommand, args: string[]): ApplyCommand {
     else if (a === "--3way" || a === "-3") c.setThreeWay(true);
     else if (a === "--unidiff-zero") c.setUnidiffZero(true);
     else if (a === "--recount") c.setRecount(true);
+    else if (a === "-N") c.setIntentToAdd(true);
     else if (a.startsWith("-C")) c.setContext(Number(a.slice(2)));
     else if (a.startsWith("-p")) c.setStrip(Number(a.slice(2)));
     else if (a.startsWith("--whitespace=")) c.setWhitespace(a.slice(13));

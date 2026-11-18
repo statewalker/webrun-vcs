@@ -37,6 +37,15 @@ export interface FormatPatchResult {
 /** Thrown where git dies (`fatal: ...`). */
 export class FormatPatchError extends Error {}
 
+/** Whether a version string (`2.56.0`, `2.43.0.windows.1`) is at least `major.minor`. */
+function gitVersionAtLeast(version: string, major: number, minor: number): boolean {
+  const m = /^(\d+)\.(\d+)/.exec(version);
+  if (!m) return true;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  return a > major || (a === major && b >= minor);
+}
+
 const MAIL_DEFAULT_WRAP = 72;
 
 /**
@@ -279,7 +288,9 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
 
   /**
    * The default signature: git's version string (`git_version_string`). Defaults to
-   * "2.56.0", the git this port follows; set it to match another git.
+   * "2.56.0", the git this port follows; set it to match another git. It also picks the
+   * cover letter's `From:` with `--from`: the given ident dated at the epoch from 2.54 on,
+   * the committer (and the commit date) before.
    */
   setVersionString(version: string): this {
     this.versionString = version;
@@ -345,6 +356,21 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     if (cfgCover !== undefined)
       configCover = cfgCover.toLowerCase() === "auto" ? "auto" : bool(cfgCover) ? "on" : "off";
     const encodeHeaders = bool(this.config("format.encodeEmailHeaders")) ?? true;
+    // get_log_output_encoding
+    const outputEncoding =
+      this.config("i18n.logOutputEncoding") || this.config("i18n.commitEncoding") || "UTF-8";
+    // format.noprefix (diff.noprefix is ignored)
+    const noPrefixCfg = this.config("format.noprefix");
+    let noPrefix = false;
+    if (noPrefixCfg !== undefined) {
+      const v = noPrefixCfg.toLowerCase();
+      if (["true", "yes", "on", "1", ""].includes(v)) noPrefix = true;
+      else if (["false", "no", "off", "0"].includes(v)) noPrefix = false;
+      else
+        throw new FormatPatchError(
+          `bad boolean config value '${noPrefixCfg}' for 'format.noprefix'`,
+        );
+    }
     const outDir = this.stdout
       ? undefined
       : (this.outputDirectory ?? this.config("format.outputDirectory"));
@@ -510,7 +536,12 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       const log = new LogCommand(this.workingCopy)
         .add(id)
         .setMaxCount(1)
-        .setDiffOptions({ stat: { width: MAIL_DEFAULT_WRAP }, binaryPatch: !this.noBinary });
+        .setDiffOptions({
+          stat: { width: MAIL_DEFAULT_WRAP },
+          binaryPatch: !this.noBinary,
+          ignoreConfigNoPrefix: true,
+          ...(noPrefix ? { noPrefix: true } : {}),
+        });
       const bytes = await log.callBytes({
         pretty: this.stdout && bool(this.config("format.mboxrd")) ? "mboxrd" : "email",
         stat: !this.noStat,
@@ -531,6 +562,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
           ...(fromIdent ? { from: fromIdent } : {}),
           forceInBodyFrom: this.forceInBodyFrom,
           encodeHeaders,
+          outputEncoding,
         },
       });
       const parts: Uint8Array[] = [];
@@ -714,11 +746,16 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         break;
       }
     }
-    const who = mail.from ?? { name: mail.committer.name, email: mail.committer.email };
+    // git 2.54 and later: the --from ident (no date: the epoch); before, the committer's
+    const fromIdent = gitVersionAtLeast(this.versionString, 2, 54) ? mail.from : undefined;
+    const who = fromIdent ?? { name: mail.committer.name, email: mail.committer.email };
+    const date = fromIdent
+      ? { timestamp: 0, tzOffset: "+0000" }
+      : { timestamp: mail.committer.timestamp, tzOffset: mail.committer.tzOffset };
     let text = `From ${mail.zeroCommit ? "0".repeat(40) : head} Mon Sep 17 00:00:00 2001\n`;
     text += mail.thread;
-    text += mailFromHeader(who.name, who.email);
-    text += `Date: ${showDate(mail.committer.timestamp, mail.committer.tzOffset, { type: "rfc2822", local: false })}\n`;
+    text += mailFromHeader(who.name, who.email, { encodeHeaders: mail.encodeHeaders });
+    text += `Date: ${showDate(date.timestamp, date.tzOffset, { type: "rfc2822", local: false })}\n`;
     text += `${mail.subject}*** SUBJECT HERE ***\n`;
     if (eightBit)
       text +=
@@ -727,10 +764,11 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     text += "\n*** BLURB HERE ***\n\n";
     // shortlog: authors in byte order, their subjects oldest first, wrapped at 72
     const byAuthor = new Map<string, string[]>();
-    for (const c of commits) {
+    for (const [k, c] of commits.entries()) {
       if (!c) continue;
-      const name = c.author.name;
-      let subject = subjectLine(c.message);
+      const utf8 = await this.utf8AuthorAndMessage(list[k] as ObjectId, c);
+      const name = utf8.name;
+      let subject = subjectLine(utf8.message);
       if (subject.startsWith("[PATCH")) {
         const eob = subject.indexOf("]");
         if (eob >= 0) subject = subject.slice(eob + 1).replace(/^[ \t]+/, "");
@@ -756,15 +794,66 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     return new TextEncoder().encode(text);
   }
 
+  /** The commit as stored (its fields encoded again when the store has no raw bytes). */
   private async rawCommitBytes(id: ObjectId): Promise<Uint8Array> {
-    const objects = this.workingCopy.history?.objects as
-      | { load?(id: string): Promise<AsyncIterable<Uint8Array> | undefined> }
-      | undefined;
+    const objects = this.workingCopy.history?.objects;
+    try {
+      const obj = await objects?.get(id);
+      if (obj) {
+        if (obj.bytes) return obj.bytes;
+        const chunks: Uint8Array[] = [];
+        for await (const c of obj.content) chunks.push(c);
+        return concat(chunks);
+      }
+    } catch {
+      // fall back to the parsed commit
+    }
     const commit = await this.commits.load(id);
-    void objects;
-    return new TextEncoder().encode(
-      `${commit?.author.name ?? ""}${commit?.author.email ?? ""}${commit?.committer.name ?? ""}${commit?.committer.email ?? ""}${commit?.message ?? ""}`,
+    return encodeGitPath(
+      `author ${commit?.author.name ?? ""} <${commit?.author.email ?? ""}>\ncommitter ${commit?.committer.name ?? ""} <${commit?.committer.email ?? ""}>\n\n${commit?.message ?? ""}`,
     );
+  }
+
+  /**
+   * The author name and message of a commit in UTF-8 (the cover letter's encoding): from its
+   * `encoding` header when it has one (logmsg_reencode), as stored when that fails.
+   */
+  private async utf8AuthorAndMessage(
+    id: ObjectId,
+    commit: { author: { name: string }; message: string },
+  ): Promise<{ name: string; message: string }> {
+    const raw = await this.rawCommitBytes(id);
+    let end = 0;
+    let encoding: string | undefined;
+    let authorLine: Uint8Array | undefined;
+    for (;;) {
+      const nl = raw.indexOf(0x0a, end);
+      if (nl < 0 || nl === end) break;
+      const line = raw.subarray(end, nl);
+      const text = decodeGitPath(line);
+      if (text.startsWith("encoding ")) encoding = text.slice(9);
+      if (text.startsWith("author ")) authorLine = line.subarray(7);
+      end = nl + 1;
+    }
+    const stored = { name: commit.author.name, message: commit.message };
+    if (!encoding || /^utf-?8$/i.test(encoding)) return stored;
+    const decode = (bytes: Uint8Array): string | undefined => {
+      if (/^(iso[-_]?8859-1|latin-?1|l1)$/i.test(encoding as string)) {
+        let out = "";
+        for (const b of bytes) out += String.fromCharCode(b);
+        return out;
+      }
+      try {
+        return new TextDecoder(encoding, { fatal: true }).decode(bytes);
+      } catch {
+        return undefined;
+      }
+    };
+    const message = decode(raw.subarray(end + 1));
+    const ident = authorLine ? decode(authorLine) : undefined;
+    const name = ident?.replace(/ ?<[^>]*>.*$/s, "");
+    if (message === undefined) return stored;
+    return { name: name ?? stored.name, message };
   }
 
   /** `--stat --summary` of two trees, as format-patch's cover letter shows them. */

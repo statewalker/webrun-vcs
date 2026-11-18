@@ -5,7 +5,7 @@
  * guesses and complains about (with git's messages) follows apply.c line by line.
  */
 
-import { decompressBlock } from "@statewalker/vcs-utils";
+import { createInflater } from "@statewalker/vcs-utils";
 
 import {
   BINARY_DELTA,
@@ -292,12 +292,45 @@ export class ApplyParser {
   stdout = "";
 
   error(message: string): number {
-    if (this.verbosity > -1) this.stderr += `error: ${message}\n`;
+    if (this.verbosity > -1) this.stderr += vreportf("error: ", message);
     return -1;
   }
 
   warning(message: string): void {
-    if (this.verbosity > -1) this.stderr += `warning: ${message}\n`;
+    if (this.verbosity > -1) this.stderr += vreportf("warning: ", message);
+  }
+
+  /**
+   * `inflate_it`: the data inflated into exactly `size` bytes, undefined otherwise; a
+   * corrupt stream reports zlib's error as `git_inflate` does.
+   */
+  private inflateIt(data: Uint8Array, size: number): Uint8Array | undefined {
+    const inflater = createInflater();
+    let out: Uint8Array[];
+    let done: boolean;
+    try {
+      ({ out, done } = inflater.push(data));
+    } catch (error) {
+      const message = (error as Error).message ?? "";
+      if (message.includes("preset dictionary"))
+        this.error("inflate: needs dictionary (no message)");
+      else if (message.startsWith("inflate failed: "))
+        this.error(`inflate: data stream error (${message.slice(16)})`);
+      return undefined;
+    } finally {
+      inflater.abort();
+    }
+    if (!done) return undefined;
+    let total = 0;
+    for (const o of out) total += o.length;
+    if (total !== size) return undefined;
+    const result = new Uint8Array(total);
+    let at = 0;
+    for (const o of out) {
+      result.set(o, at);
+      at += o.length;
+    }
+    return result;
   }
 
   /** "at <file>:<line>" (git 2.46+) or "<legacy> <line>" ("on line 5", "at line 5"). */
@@ -934,17 +967,16 @@ export class ApplyParser {
       else if (c >= 97 && c <= 122) byteLength = c - 97 + 27;
       else return corrupt();
       if (max < byteLength || byteLength <= max - 4) return corrupt();
-      if (!decode85(data, buf, at + 1, byteLength)) return corrupt();
+      const bad = decode85(data, buf, at + 1, byteLength);
+      if (bad !== undefined) {
+        this.error(bad);
+        return corrupt();
+      }
       at += llen;
       size -= llen;
     }
-    let inflated: Uint8Array | undefined;
-    try {
-      inflated = await decompressBlock(new Uint8Array(data));
-    } catch {
-      inflated = undefined;
-    }
-    if (!inflated || inflated.length !== origlen) return corrupt();
+    const inflated = this.inflateIt(new Uint8Array(data), origlen);
+    if (!inflated) return corrupt();
     state.at = at;
     state.size = size;
     const frag = emptyFragment();
@@ -1128,9 +1160,12 @@ const DE85: Int16Array = (() => {
   return table;
 })();
 
-/** base85.c's `decode_85`: appends `len` decoded bytes to `out`; false on bad data. */
-function decode85(out: number[], buf: string, at: number, len: number): boolean {
+/** base85.c's `decode_85`: appends `len` decoded bytes to `out`; its error on bad data. */
+function decode85(out: number[], buf: string, at: number, len: number): string | undefined {
   let i = at;
+  // a NUL ends the message (vsnprintf's %c, then vreportf stops at it)
+  const alphabet = (ch: number) =>
+    `invalid base85 alphabet ${Number.isNaN(ch) ? "\0" : String.fromCharCode(ch)}`;
   while (len) {
     let acc = 0;
     let cnt = 4;
@@ -1138,16 +1173,15 @@ function decode85(out: number[], buf: string, at: number, len: number): boolean 
     do {
       const ch = buf.charCodeAt(i++);
       de = DE85[ch & 0xff] ?? 0;
-      if (Number.isNaN(ch) || --de < 0) return false;
+      if (Number.isNaN(ch) || --de < 0) return alphabet(ch);
       acc = acc * 85 + de;
     } while (--cnt);
     const ch = buf.charCodeAt(i++);
     de = DE85[ch & 0xff] ?? 0;
-    if (Number.isNaN(ch) || --de < 0) return false;
-    if (0xffffffff / 85 < acc) return false;
-    acc *= 85;
-    if (0xffffffff - de < acc) return false;
-    acc += de;
+    if (Number.isNaN(ch) || --de < 0) return alphabet(ch);
+    if (0xffffffff / 85 < acc || 0xffffffff - de < acc * 85)
+      return `invalid base85 sequence ${buf.slice(i - 5, i)}`;
+    acc = acc * 85 + de;
     cnt = len < 4 ? len : 4;
     len -= cnt;
     do {
@@ -1155,7 +1189,21 @@ function decode85(out: number[], buf: string, at: number, len: number): boolean 
       out.push(acc & 0xff);
     } while (--cnt);
   }
-  return true;
+  return undefined;
+}
+
+/**
+ * usage.c's `vreportf`: the prefixed message cut at a NUL and at 4095 bytes, control
+ * characters but tab and newline shown as `?`, ended by a newline.
+ */
+export function vreportf(prefix: string, message: string): string {
+  let msg = prefix + message;
+  const nul = msg.indexOf("\0", prefix.length);
+  if (nul >= 0) msg = msg.slice(0, nul);
+  if (msg.length > 4095) msg = msg.slice(0, 4095);
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: git's iscntrl
+  msg = msg.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "?");
+  return `${msg}\n`;
 }
 
 export { latin1ToBytes };

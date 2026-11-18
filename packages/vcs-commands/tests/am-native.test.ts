@@ -313,4 +313,204 @@ describeGit("git am as native git", () => {
     });
     await compare(pair, [mbox], (c) => c.addMbox(bytes), "dirty index");
   }, 120_000);
+
+  it("detects patch formats and refuses what git refuses", async () => {
+    const file = (name: string, content: string | Buffer) => {
+      const path = join(root, `${name}-${counter++}`);
+      writeFileSync(path, content);
+      return path;
+    };
+    const diff =
+      "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-line 1\n+one\n line 2\n";
+    const inputs: [string, string | Buffer][] = [
+      ["empty", ""],
+      ["blank", "\n\n"],
+      ["plain diff", diff],
+      ["not mail", "\n\nnot a mail\nfoo\n"],
+      [
+        "hg",
+        `# HG changeset patch\n# User Hg User <hg@example.com>\n# Date 1700000000 -3600\n# Node ID 0123\nHg subject\n\nHg body.\n\n${diff}`,
+      ],
+      [
+        "hg bad date",
+        `# HG changeset patch\n# User Hg <hg@x>\n# Date 1700000000 x\nsubj\n\n${diff}`,
+      ],
+      [
+        "stgit",
+        `Stgit subject\n\nAuthor: Stg User <stg@example.com>\nDate: Tue, 14 Nov 2023 10:00:00 +0000\n\nStgit body\n---\n${diff}`,
+      ],
+      ["mail headers", `X-Foo: bar\nSubject: header only\nFrom: H <h@x>\n\nbody\n---\n${diff}`],
+    ];
+    for (const [label, content] of inputs) {
+      const path = file(label.replace(/ /g, "-"), content);
+      await compare(twins(), [path], (c) => c.addMbox(Buffer.from(content), path), label);
+    }
+    // --patch-format given: an empty mbox file fails to split
+    const empty = file("empty-mbox", "");
+    await compare(
+      twins(),
+      ["--patch-format=mbox", empty],
+      (c) => c.addMbox(Buffer.alloc(0), empty).setPatchFormat("mbox"),
+      "empty mbox",
+    );
+    // standard input: an mbox, empty or not
+    for (const [label, content] of [
+      ["stdin empty", ""],
+      ["stdin plain diff", diff],
+    ] as const) {
+      const pair = twins();
+      const native = spawnSync("git", ["am"], {
+        cwd: pair.native,
+        env: envOf(),
+        input: content,
+        encoding: "utf8",
+      });
+      const g = await open(pair.ours);
+      const r = await g.am().setLegacyMessages(!modern).addMbox(content).call();
+      g.close();
+      expect({ label, status: r.exitCode, stdout: r.output, stderr: r.errors }).toEqual({
+        label,
+        status: native.status,
+        stdout: native.stdout,
+        stderr: native.stderr,
+      });
+      expect(snapshot(pair.ours)).toBe(snapshot(pair.native));
+    }
+  }, 120_000);
+
+  it("commits authors, dates and 8-bit messages as git does", async () => {
+    const patch =
+      "---\n a.txt | 2 +-\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-line 1\n+one\n line 2\n";
+    const mails: [string, Buffer, string[]][] = [
+      // crud around the name and the email
+      [
+        "crud",
+        Buffer.from(
+          `From: ";Jo, Doe;" <:jo@x:>\nSubject: crud\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nbody\n${patch}`,
+        ),
+        [],
+      ],
+      [
+        "only crud",
+        Buffer.from(
+          `From: ";;" <jo@x>\nSubject: crud\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nbody\n${patch}`,
+        ),
+        [],
+      ],
+      // 8-bit without a charset: the commit's bytes made UTF-8 as Latin-1
+      [
+        "8bit",
+        Buffer.concat([
+          Buffer.from(
+            "From: Ren\xe9 <r@x>\nSubject: caf\xe9 \xc3\xa9\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nna\xefve \xed\xa0\x80 \xef\xbf\xbe body\n",
+            "latin1",
+          ),
+          Buffer.from(patch),
+        ]),
+        [],
+      ],
+      // a charset that does not convert
+      [
+        "bad charset",
+        Buffer.from(
+          `From: A <a@x>\nSubject: s\nContent-Type: text/plain; charset=us-ascii\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nb\xe9\n${patch}`,
+          "latin1",
+        ),
+        [],
+      ],
+    ];
+    for (const [label, mail, args] of mails) {
+      const path = join(root, `m${counter++}`);
+      writeFileSync(path, mail);
+      await compare(twins(), [...args, path], (c) => c.addMbox(mail, path), label);
+    }
+    // --ignore-date and a mail without Date: the clock, not GIT_AUTHOR_DATE
+    for (const [label, mail, args] of [
+      [
+        "ignore date",
+        `From: A <a@x>\nSubject: s\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nb\n${patch}`,
+        ["--ignore-date"],
+      ],
+      ["no date", `From: A <a@x>\nSubject: s\n\nb\n${patch}`, []],
+      [
+        "no date, committer date",
+        `From: A <a@x>\nSubject: s\n\nb\n${patch}`,
+        ["--committer-date-is-author-date"],
+      ],
+    ] as const) {
+      const path = join(root, `m${counter++}`);
+      writeFileSync(path, mail);
+      const pair = twins();
+      const native = git(pair.native, ["am", ...args, path]);
+      expect(native.status, native.stderr).toBe(0);
+      const now = Number(gitOk(pair.native, ["log", "-1", "--format=%at"]).trim());
+      const g = await open(pair.ours);
+      let cmd = g.am().addMbox(mail, path).setClock(now);
+      const given: readonly string[] = args;
+      if (given.includes("--ignore-date")) cmd = cmd.setIgnoreDate(true);
+      if (given.includes("--committer-date-is-author-date"))
+        cmd = cmd.setCommitterDateIsAuthorDate(true);
+      const r = await cmd.call();
+      g.close();
+      expect({ label, status: r.exitCode, stderr: r.errors }).toEqual({
+        label,
+        status: 0,
+        stderr: native.stderr,
+      });
+      expect(gitOk(pair.ours, ["rev-parse", "HEAD"]), label).toBe(
+        gitOk(pair.native, ["rev-parse", "HEAD"]),
+      );
+    }
+  }, 120_000);
+
+  it("advises --allow-empty on --continue and fails --abort as git", async () => {
+    const pair = twins();
+    const path = join(root, `m${counter++}`);
+    writeFileSync(path, "From: A <a@x>\nSubject: no patch\n\nbody only\n");
+    const bytes = readFileSync(path);
+    await compare(pair, [path], (c) => c.addMbox(bytes, path), "empty patch");
+    await compare(pair, ["--continue"], (c) => c.setResume("continue"), "continue empty");
+    await compare(pair, ["--allow-empty"], (c) => c.setResume("allow-empty"), "allow empty");
+    // --abort with an untracked file where ORIG_HEAD has one
+    const mbox = series();
+    const mboxBytes = readFileSync(mbox);
+    const drift = (repo: string) => {
+      put(repo, "a.txt", lines(20).replace("line 18\n", "LINE 18\n"));
+      gitOk(repo, ["commit", "-qam", "drift"]);
+    };
+    const stuck = twins(drift);
+    await compare(stuck, [mbox], (c) => c.addMbox(mboxBytes), "stop at 3");
+    for (const repo of [stuck.native, stuck.ours]) put(repo, "b.txt", "untracked\n");
+    await compare(stuck, ["--abort"], (c) => c.setResume("abort"), "abort refused");
+  }, 120_000);
+
+  it("applies a submodule bump", async () => {
+    const a = "1111111111111111111111111111111111111111";
+    const b = "2222222222222222222222222222222222222222";
+    const withSub = (repo: string) => {
+      gitOk(repo, ["update-index", "--add", "--cacheinfo", `160000,${a},sub`]);
+      gitOk(repo, ["commit", "-qm", "add sub"]);
+    };
+    const mail = `From: A <a@x>\nSubject: bump sub\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nbody\n---\n sub | 2 +-\n\ndiff --git a/sub b/sub\nindex 1111111..2222222 160000\n--- a/sub\n+++ b/sub\n@@ -1 +1 @@\n-Subproject commit ${a}\n+Subproject commit ${b}\n`;
+    const path = join(root, `m${counter++}`);
+    writeFileSync(path, mail);
+    for (const [label, setup] of [
+      ["absent", withSub],
+      [
+        "empty dir",
+        (repo: string) => {
+          withSub(repo);
+          mkdirSync(join(repo, "sub"));
+        },
+      ],
+    ] as const) {
+      await compare(twins(setup), [path], (c) => c.addMbox(mail, path), `sub ${label}`);
+      await compare(
+        twins(setup),
+        ["-3", path],
+        (c) => c.addMbox(mail, path).setThreeWay(true),
+        `sub -3 ${label}`,
+      );
+    }
+  }, 120_000);
 });

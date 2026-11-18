@@ -29,6 +29,8 @@ interface Line {
   len: number;
   hash: number;
   flag: number;
+  /** The line itself (lines of a {@link Target} only) */
+  text?: string;
 }
 
 interface Image {
@@ -74,6 +76,124 @@ function removeLastLine(img: Image): void {
 
 const isSpaceAt = (s: string, i: number) => isGitSpace(s.charCodeAt(i));
 
+/**
+ * The lines of a target image in a gap buffer: replacing lines costs the distance from
+ * the previous replacement, not the size of the image, so hunks applied in order make
+ * the whole patch linear (git's `update_image` moves the rest of the image each time).
+ */
+class LineTable {
+  private items: (Line | undefined)[];
+  private gapStart: number;
+  private gapEnd: number;
+
+  constructor(lines: Line[]) {
+    this.items = lines;
+    this.gapStart = lines.length;
+    this.gapEnd = lines.length;
+  }
+
+  get length(): number {
+    return this.items.length - (this.gapEnd - this.gapStart);
+  }
+
+  at(i: number): Line {
+    return (
+      i < this.gapStart ? this.items[i] : this.items[i + this.gapEnd - this.gapStart]
+    ) as Line;
+  }
+
+  /** Replaces `remove` lines at `at` with `insert`. */
+  splice(at: number, remove: number, insert: Line[]): void {
+    const items = this.items;
+    if (at < this.gapStart) {
+      while (this.gapStart > at) items[--this.gapEnd] = items[--this.gapStart];
+    } else {
+      while (this.gapStart < at) items[this.gapStart++] = items[this.gapEnd++];
+    }
+    for (let i = 0; i < remove; i++) items[this.gapEnd + i] = undefined;
+    this.gapEnd += remove;
+    if (this.gapEnd - this.gapStart < insert.length) {
+      const gap = insert.length + (this.length >> 1) + 16;
+      const grown: (Line | undefined)[] = new Array(this.length + gap);
+      for (let i = 0; i < this.gapStart; i++) grown[i] = items[i];
+      const tail = items.length - this.gapEnd;
+      for (let i = 0; i < tail; i++) grown[grown.length - tail + i] = items[this.gapEnd + i];
+      this.gapEnd = grown.length - tail;
+      this.items = grown;
+    }
+    for (const line of insert) this.items[this.gapStart++] = line;
+  }
+}
+
+/** The image a patch is applied to (`struct image` of the preimage file). */
+class Target {
+  lines: LineTable;
+  private text: string | undefined;
+
+  constructor(buf: string, lineTable: boolean) {
+    const lines: Line[] = [];
+    if (lineTable) {
+      let cp = 0;
+      while (cp < buf.length) {
+        const nl = buf.indexOf("\n", cp);
+        const next = nl < 0 ? buf.length : nl + 1;
+        lines.push({
+          len: next - cp,
+          hash: hashLine(buf, cp, next - cp),
+          flag: 0,
+          text: buf.slice(cp, next),
+        });
+        cp = next;
+      }
+    }
+    this.lines = new LineTable(lines);
+    this.text = buf;
+  }
+
+  /** The whole content. */
+  get buf(): string {
+    if (this.text === undefined) {
+      const parts: string[] = [];
+      for (let i = 0; i < this.lines.length; i++) parts.push(this.lines.at(i).text as string);
+      this.text = parts.join("");
+    }
+    return this.text;
+  }
+
+  /** Replaces the content, without a line table (a binary or merged result). */
+  set buf(content: string) {
+    this.text = content;
+    this.lines = new LineTable([]);
+  }
+
+  lineText(i: number): string {
+    return this.lines.at(i).text as string;
+  }
+
+  /**
+   * Whether the content from line `lno` on starts with `s` (`exact`: is `s`), git's
+   * `memcmp` of the preimage at the line's offset.
+   */
+  textStartsWith(lno: number, s: string, exact: boolean): boolean {
+    let pos = 0;
+    const n = this.lines.length;
+    for (let i = lno; i < n; i++) {
+      if (pos >= s.length) return !exact;
+      const t = this.lineText(i);
+      const rest = s.length - pos;
+      if (t.length > rest) return !exact && t.slice(0, rest) === s.slice(pos);
+      if (!s.startsWith(t, pos)) return false;
+      pos += t.length;
+    }
+    return pos === s.length;
+  }
+
+  replaceLines(at: number, remove: number, insert: Line[]): void {
+    this.lines.splice(at, remove, insert);
+    this.text = undefined;
+  }
+}
+
 /** An index entry as the applier sees it (stage 0 unless said otherwise). */
 export interface ApplyIndexEntry {
   mode: number;
@@ -86,8 +206,12 @@ export interface ApplyIndexEntry {
 export interface ApplyIO {
   /** lstat of a worktree path: its mode (S_IFREG|perm, S_IFLNK, S_IFDIR), none when absent */
   lstat(name: string): Promise<{ mode: number } | undefined>;
-  /** The worktree file's content as git would stage it (a link: its target) */
-  readWorktree(name: string, mode: number): Promise<string | undefined>;
+  /**
+   * The worktree file's content as git would stage it (a link: its target); `keepCrlf`
+   * skips the line-ending conversion (`CONV_EOL_KEEP_CRLF`), otherwise CRLF in the index
+   * does not hold it back (`CONV_EOL_RENORMALIZE`)
+   */
+  readWorktree(name: string, mode: number, keepCrlf: boolean): Promise<string | undefined>;
   /** Whether a leading directory of the path is a symlink in the worktree */
   hasSymlinkLeadingPath(name: string): Promise<boolean>;
   /** The mode git would stage for the worktree file (`ce_mode_from_stat`) */
@@ -110,7 +234,11 @@ export interface ApplyIO {
     theirs: string,
     variant: "ours" | "theirs" | "union" | undefined,
   ): Promise<{ content: string; conflicts: number; binary?: boolean } | undefined>;
-  removeWorktree(name: string, mode: number, rmdirEmpty: boolean): Promise<void>;
+  /**
+   * Removes a worktree file (a gitlink: its directory when empty) and, with `rmdirEmpty`,
+   * the directories it leaves empty (`remove_or_warn`, `remove_path`); a warning on failure
+   */
+  removeWorktree(name: string, mode: number, rmdirEmpty: boolean): Promise<string | undefined>;
   /** Writes a worktree file (smudged), creating directories; an error message on failure */
   createWorktree(name: string, mode: number, content: string): Promise<string | undefined>;
   writeReject(name: string, content: string): Promise<void>;
@@ -179,8 +307,65 @@ export class ApplyEngine extends ApplyParser {
     private readonly indexOf: (name: string) => ApplyIndexEntry | undefined,
     private readonly wsRuleOfName: (name: string) => Promise<number>,
     private readonly wildmatch: (pattern: string, text: string) => boolean,
+    /** The names of the stage-0 index entries (for the file/directory checks) */
+    private readonly indexNames: () => Iterable<string> = () => [],
   ) {
     super();
+  }
+
+  private sortedIndexNames?: string[];
+
+  /** Whether the name is an entry of the index as changed so far (at the stage). */
+  private hasIndexName(name: string, stage: number): boolean {
+    const changed = this.indexChanges.get(name);
+    if (changed) return changed.some((e) => (e.stage ?? 0) === stage);
+    return stage === 0 && this.indexOf(name) !== undefined;
+  }
+
+  /**
+   * `check_file_directory_conflict` of `add_index_entry` without `ADD_CACHE_OK_TO_REPLACE`:
+   * whether an entry (at the stage) of the index as changed so far is below the name
+   * (`has_file_name`) or one of its leading directories (`has_dir_name`).
+   */
+  private fileDirectoryConflict(name: string, stage: number): boolean {
+    for (let at = name.lastIndexOf("/"); at > 0; at = name.lastIndexOf("/", at - 1)) {
+      if (this.hasIndexName(name.slice(0, at), stage)) return true;
+    }
+    const prefix = `${name}/`;
+    for (const [n, entries] of this.indexChanges) {
+      if (n.startsWith(prefix) && entries.some((e) => (e.stage ?? 0) === stage)) return true;
+    }
+    if (stage !== 0) return false;
+    if (!this.sortedIndexNames) {
+      this.sortedIndexNames = [...this.indexNames()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    }
+    const names = this.sortedIndexNames;
+    let lo = 0;
+    let hi = names.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((names[mid] as string) < prefix) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; i < names.length && (names[i] as string).startsWith(prefix); i++) {
+      if (!this.indexChanges.has(names[i] as string)) return true;
+    }
+    return false;
+  }
+
+  /** `add_index_entry(..., ADD_CACHE_OK_TO_ADD)` of entries at one name; 0 or -1. */
+  private addIndexEntries(
+    name: string,
+    entries: (ApplyIndexEntry & { stat?: Record<string, number> })[],
+  ): number {
+    for (const e of entries) {
+      if (this.fileDirectoryConflict(name, e.stage ?? 0)) {
+        this.error(`'${name}' appears as both a file and as a directory`);
+        return this.error(`unable to add cache entry for ${name}`);
+      }
+    }
+    this.setIndex(name, entries);
+    return 0;
   }
 
   private indexEntry(name: string): ApplyIndexEntry | undefined {
@@ -213,6 +398,8 @@ export class ApplyEngine extends ApplyParser {
         ctx++;
       }
       if (preimage.lines.length <= ctx) {
+        // dropped from the buffer (git copies nothing for it)
+        post = post.slice(0, insertPos) + post.slice(insertPos + line.len);
         reduced++;
         continue;
       }
@@ -231,38 +418,34 @@ export class ApplyEngine extends ApplyParser {
   }
 
   private lineByLineFuzzyMatch(
-    img: Image,
+    img: Target,
     preimage: Image,
     postimage: Image,
-    current: number,
     currentLno: number,
     preimageLimit: number,
   ): boolean {
-    let imgoff = 0;
     let preoff = 0;
     let i = 0;
+    const matched: string[] = [];
     for (; i < preimageLimit; i++) {
       const prelen = (preimage.lines[i] as Line).len;
-      const imglen = (img.lines[currentLno + i] as Line).len;
-      if (!fuzzyMatchLines(img.buf, current + imgoff, imglen, preimage.buf, preoff, prelen))
-        return false;
-      imgoff += imglen;
+      const t = img.lineText(currentLno + i);
+      if (!fuzzyMatchLines(t, 0, t.length, preimage.buf, preoff, prelen)) return false;
+      matched.push(t);
       preoff += prelen;
     }
     const preimageEof = preoff;
     for (; i < preimage.lines.length; i++) preoff += (preimage.lines[i] as Line).len;
     for (let b = preimageEof; b < preoff; b++) if (!isSpaceAt(preimage.buf, b)) return false;
-    const fixed =
-      img.buf.slice(current, current + imgoff) + preimage.buf.slice(preimageEof, preoff);
+    const fixed = matched.join("") + preimage.buf.slice(preimageEof, preoff);
     this.updatePrePostImages(preimage, postimage, fixed);
     return true;
   }
 
   private matchFragment(
-    img: Image,
+    img: Target,
     preimage: Image,
     postimage: Image,
-    current: number,
     currentLno: number,
     wsRule: number,
     matchBeginning: boolean,
@@ -277,14 +460,11 @@ export class ApplyEngine extends ApplyParser {
     } else return false;
     if (matchBeginning && currentLno) return false;
     for (let i = 0; i < preimageLimit; i++) {
-      const il = img.lines[currentLno + i] as Line;
+      const il = img.lines.at(currentLno + i);
       if (il.flag & LINE_PATCHED || (preimage.lines[i] as Line).hash !== il.hash) return false;
     }
     if (preimageLimit === preimage.lines.length) {
-      const fits = matchEnd
-        ? current + preimage.buf.length === img.buf.length
-        : current + preimage.buf.length <= img.buf.length;
-      if (fits && img.buf.startsWith(preimage.buf, current)) return true;
+      if (img.textStartsWith(currentLno, preimage.buf, matchEnd)) return true;
     } else {
       let end = 0;
       for (let i = 0; i < preimageLimit; i++) end += (preimage.lines[i] as Line).len;
@@ -293,29 +473,19 @@ export class ApplyEngine extends ApplyParser {
       if (b === end) return false;
     }
     if (this.wsIgnoreChange) {
-      return this.lineByLineFuzzyMatch(
-        img,
-        preimage,
-        postimage,
-        current,
-        currentLno,
-        preimageLimit,
-      );
+      return this.lineByLineFuzzyMatch(img, preimage, postimage, currentLno, preimageLimit);
     }
     if (this.wsErrorAction !== "fix") return false;
     let fixed = "";
     let orig = 0;
-    let target = current;
     let i = 0;
     for (; i < preimageLimit; i++) {
       const oldlen = (preimage.lines[i] as Line).len;
-      const tgtlen = (img.lines[currentLno + i] as Line).len;
       const a = wsFixCopy(preimage.buf.slice(orig, orig + oldlen), wsRule).text;
-      const b = wsFixCopy(img.buf.slice(target, target + tgtlen), wsRule).text;
+      const b = wsFixCopy(img.lineText(currentLno + i), wsRule).text;
       fixed += a;
       if (a !== b) return false;
       orig += oldlen;
-      target += tgtlen;
     }
     for (; i < preimage.lines.length; i++) {
       const oldlen = (preimage.lines[i] as Line).len;
@@ -329,7 +499,7 @@ export class ApplyEngine extends ApplyParser {
   }
 
   private findPos(
-    img: Image,
+    img: Target,
     preimage: Image,
     postimage: Image,
     line: number,
@@ -337,56 +507,35 @@ export class ApplyEngine extends ApplyParser {
     matchBeginning: boolean,
     matchEnd: boolean,
   ): number {
-    if (
-      this.allowOverlap &&
-      matchBeginning &&
-      matchEnd &&
-      img.lines.length - preimage.lines.length !== 0
-    )
+    const nr = img.lines.length;
+    if (this.allowOverlap && matchBeginning && matchEnd && nr - preimage.lines.length !== 0)
       matchBeginning = false;
     if (matchBeginning) line = 0;
-    else if (matchEnd) line = img.lines.length - preimage.lines.length;
-    if (line < 0 || line > img.lines.length) line = img.lines.length;
-    let current = 0;
-    for (let i = 0; i < line; i++) current += (img.lines[i] as Line).len;
-    let backwards = current;
+    else if (matchEnd) line = nr - preimage.lines.length;
+    if (line < 0 || line > nr) line = nr;
     let backwardsLno = line;
-    let forwards = current;
     let forwardsLno = line;
     let currentLno = line;
     for (let i = 0; ; i++) {
       if (
-        this.matchFragment(
-          img,
-          preimage,
-          postimage,
-          current,
-          currentLno,
-          wsRule,
-          matchBeginning,
-          matchEnd,
-        )
+        this.matchFragment(img, preimage, postimage, currentLno, wsRule, matchBeginning, matchEnd)
       )
         return currentLno;
       for (;;) {
-        if (backwardsLno === 0 && forwardsLno === img.lines.length) return -1;
+        if (backwardsLno === 0 && forwardsLno === nr) return -1;
         if (i & 1) {
           if (backwardsLno === 0) {
             i++;
             continue;
           }
           backwardsLno--;
-          backwards -= (img.lines[backwardsLno] as Line).len;
-          current = backwards;
           currentLno = backwardsLno;
         } else {
-          if (forwardsLno === img.lines.length) {
+          if (forwardsLno === nr) {
             i++;
             continue;
           }
-          forwards += (img.lines[forwardsLno] as Line).len;
           forwardsLno++;
-          current = forwards;
           currentLno = forwardsLno;
         }
         break;
@@ -394,24 +543,32 @@ export class ApplyEngine extends ApplyParser {
     }
   }
 
-  private updateImage(img: Image, appliedPos: number, preimage: Image, postimage: Image): void {
+  private updateImage(img: Target, appliedPos: number, preimage: Image, postimage: Image): void {
     let preimageLimit = preimage.lines.length;
     if (preimageLimit > img.lines.length - appliedPos)
       preimageLimit = img.lines.length - appliedPos;
-    let appliedAt = 0;
-    for (let i = 0; i < appliedPos; i++) appliedAt += (img.lines[i] as Line).len;
-    let removeCount = 0;
-    for (let i = 0; i < preimageLimit; i++) removeCount += (img.lines[appliedPos + i] as Line).len;
-    img.buf = img.buf.slice(0, appliedAt) + postimage.buf + img.buf.slice(appliedAt + removeCount);
-    const inserted = postimage.lines.map((l) => ({
-      ...l,
-      flag: this.allowOverlap ? l.flag : l.flag | LINE_PATCHED,
-    }));
-    img.lines.splice(appliedPos, preimageLimit, ...inserted);
+    const inserted: Line[] = [];
+    let off = 0;
+    for (const l of postimage.lines) {
+      inserted.push({
+        len: l.len,
+        hash: l.hash,
+        flag: this.allowOverlap ? l.flag : l.flag | LINE_PATCHED,
+        text: postimage.buf.slice(off, off + l.len),
+      });
+      off += l.len;
+    }
+    // the postimage's bytes past its lines (none unless its lines were cut) stay with it
+    if (off < postimage.buf.length) {
+      const last = inserted[inserted.length - 1];
+      if (last) last.text += postimage.buf.slice(off);
+      else inserted.push({ len: 0, hash: 0, flag: LINE_PATCHED, text: postimage.buf.slice(off) });
+    }
+    img.replaceLines(appliedPos, preimageLimit, inserted);
   }
 
   private applyOneFragment(
-    img: Image,
+    img: Target,
     frag: FilePatch["fragments"][number],
     inaccurateEof: boolean,
     wsRule: number,
@@ -550,7 +707,7 @@ export class ApplyEngine extends ApplyParser {
     return appliedPos < 0;
   }
 
-  private applyBinaryFragment(img: Image, patch: FilePatch): number {
+  private applyBinaryFragment(img: Target, patch: FilePatch): number {
     let fragment = patch.fragments[0];
     const name = patch.newName ?? patch.oldName;
     if (!fragment) return this.error(`missing binary patch data for '${name}'`);
@@ -565,7 +722,6 @@ export class ApplyEngine extends ApplyParser {
       try {
         const out = decodeGitBinaryDelta(latin1ToBytes(img.buf), latin1ToBytes(fragment.patch));
         img.buf = bytesToLatin1(out);
-        img.lines = [];
         return 0;
       } catch {
         return -1;
@@ -573,13 +729,12 @@ export class ApplyEngine extends ApplyParser {
     }
     if (fragment.binaryMethod === BINARY_LITERAL) {
       img.buf = fragment.patch;
-      img.lines = [];
       return 0;
     }
     return -1;
   }
 
-  private async applyBinary(img: Image, patch: FilePatch): Promise<number> {
+  private async applyBinary(img: Target, patch: FilePatch): Promise<number> {
     const name = patch.oldName ?? patch.newName;
     const hex = /^[0-9a-f]{40}$/;
     if (!hex.test(patch.oldOidPrefix) || !hex.test(patch.newOidPrefix))
@@ -595,7 +750,6 @@ export class ApplyEngine extends ApplyParser {
     }
     if (/^0+$/.test(patch.newOidPrefix)) {
       img.buf = "";
-      img.lines = [];
       return 0;
     }
     if (await this.io.hasObject(patch.newOidPrefix)) {
@@ -605,7 +759,6 @@ export class ApplyEngine extends ApplyParser {
           `the necessary postimage ${patch.newOidPrefix} for '${name}' cannot be read`,
         );
       img.buf = result;
-      img.lines = [];
     } else {
       if (this.applyBinaryFragment(img, patch))
         return this.error(`binary patch does not apply to '${name}'`);
@@ -618,7 +771,7 @@ export class ApplyEngine extends ApplyParser {
     return 0;
   }
 
-  private async applyFragments(img: Image, patch: FilePatch): Promise<number> {
+  private async applyFragments(img: Target, patch: FilePatch): Promise<number> {
     const name = patch.oldName ?? patch.newName;
     if (patch.isBinary) return this.applyBinary(img, patch);
     let nth = 0;
@@ -666,6 +819,7 @@ export class ApplyEngine extends ApplyParser {
     out: { buf: string },
     entry: ApplyIndexEntry | undefined,
     stMode: number,
+    patch: FilePatch,
     name: string | null,
     expectedMode: number,
   ): Promise<number> {
@@ -685,7 +839,7 @@ export class ApplyEngine extends ApplyParser {
       }
       if (await this.io.hasSymlinkLeadingPath(name))
         return this.error(`reading from '${name}' beyond a symbolic link`);
-      const data = await this.io.readWorktree(name, stMode);
+      const data = await this.io.readWorktree(name, stMode, patch.crlfInOld);
       if (data === undefined) return this.error(`failed to read ${name}`);
       out.buf = data;
     }
@@ -696,7 +850,7 @@ export class ApplyEngine extends ApplyParser {
     patch: FilePatch,
     stMode: number,
     entry: ApplyIndexEntry | undefined,
-  ): Promise<Image | undefined> {
+  ): Promise<Target | undefined> {
     const { previous, gone } = this.previousPatch(patch);
     if (gone) {
       this.error(`path ${patch.oldName} has been renamed/deleted`);
@@ -705,14 +859,21 @@ export class ApplyEngine extends ApplyParser {
     const out = { buf: "" };
     if (previous) out.buf = previous.result ?? "";
     else {
-      const status = await this.loadPatchTarget(out, entry, stMode, patch.oldName, patch.oldMode);
+      const status = await this.loadPatchTarget(
+        out,
+        entry,
+        stMode,
+        patch,
+        patch.oldName,
+        patch.oldMode,
+      );
       if (status < 0) return undefined;
       if (status === 1) patch.fragments = [];
     }
-    return prepareImage(out.buf, !patch.isBinary);
+    return new Target(out.buf, !patch.isBinary);
   }
 
-  private async loadCurrent(patch: FilePatch): Promise<Image | undefined> {
+  private async loadCurrent(patch: FilePatch): Promise<Target | undefined> {
     const name = patch.newName as string;
     const entry = this.indexEntry(name);
     if (!entry) {
@@ -732,13 +893,20 @@ export class ApplyEngine extends ApplyParser {
       return undefined;
     }
     const out = { buf: "" };
-    const status = await this.loadPatchTarget(out, entry, st?.mode ?? 0, name, patch.newMode);
+    const status = await this.loadPatchTarget(
+      out,
+      entry,
+      st?.mode ?? 0,
+      patch,
+      name,
+      patch.newMode,
+    );
     if (status) return undefined;
-    return prepareImage(out.buf, !patch.isBinary);
+    return new Target(out.buf, !patch.isBinary);
   }
 
   private async tryThreeway(
-    image: Image,
+    image: Target,
     patch: FilePatch,
     stMode: number,
     entry: ApplyIndexEntry | undefined,
@@ -764,10 +932,10 @@ export class ApplyEngine extends ApplyParser {
     }
     if (this.verbosity > -1 && patch.directToThreeway)
       this.stderr += "Performing three-way merge...\n";
-    const tmp = prepareImage(pre, true);
+    const tmp = new Target(pre, true);
     if ((await this.applyFragments(tmp, patch)) < 0) return -1;
     const postOid = await this.io.writeBlob(tmp.buf);
-    let ours: Image | undefined;
+    let ours: Target | undefined;
     if (patch.isNew) {
       ours = await this.loadCurrent(patch);
       if (!ours) return this.error(`cannot read the current contents of '${patch.newName}'`);
@@ -800,7 +968,6 @@ export class ApplyEngine extends ApplyParser {
       image.buf = merged.content;
       status = merged.conflicts > 0 ? 1 : 0;
     }
-    image.lines = [];
     if (status) {
       patch.conflictedThreeway = true;
       patch.threewayStage = [patch.isNew ? null : preOid, ourOid, postOid];
@@ -1127,22 +1294,23 @@ export class ApplyEngine extends ApplyParser {
   private async removeFile(patch: FilePatch, rmdirEmpty: boolean): Promise<number> {
     const name = patch.oldName as string;
     if (this.updateIndex && !this.itaOnly) this.setIndex(name, []);
-    if (!this.cached) await this.io.removeWorktree(name, patch.oldMode, rmdirEmpty);
+    if (!this.cached) {
+      const warning = await this.io.removeWorktree(name, patch.oldMode, rmdirEmpty);
+      if (warning) this.warning(warning);
+    }
     return 0;
   }
 
   private async addIndexFile(name: string, mode: number, buf: string): Promise<number> {
     if (this.itaOnly) {
-      this.setIndex(name, [
+      return this.addIndexEntries(name, [
         { mode, oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", intentToAdd: true },
       ]);
-      return 0;
     }
     if (isGitlink(mode)) {
       const m = /^Subproject commit ([0-9a-f]{40})/.exec(buf);
       if (!m) return this.error(`corrupt patch for submodule ${name}`);
-      this.setIndex(name, [{ mode, oid: m[1] as string }]);
-      return 0;
+      return this.addIndexEntries(name, [{ mode, oid: m[1] as string }]);
     }
     let stat: Record<string, number> | undefined;
     if (!this.cached) {
@@ -1151,8 +1319,7 @@ export class ApplyEngine extends ApplyParser {
         return this.error(`unable to stat newly created file '${name}': No such file or directory`);
     }
     const oid = await this.io.writeBlob(buf);
-    this.setIndex(name, [{ mode, oid, ...(stat ? { stat } : {}) }]);
-    return 0;
+    return this.addIndexEntries(name, [{ mode, oid, ...(stat ? { stat } : {}) }]);
   }
 
   private async createFile(patch: FilePatch): Promise<number> {
@@ -1173,8 +1340,9 @@ export class ApplyEngine extends ApplyParser {
       patch.threewayStage.forEach((oid, i) => {
         if (oid) entries.push({ mode: m, oid, stage: i + 1 });
       });
-      this.setIndex(name, entries);
-      return 0;
+      // remove_file_from_index, then each stage added
+      this.setIndex(name, []);
+      return this.addIndexEntries(name, entries);
     }
     if (this.checkIndex || (this.itaOnly && patch.isNew > 0))
       return this.addIndexFile(name, mode, buf);

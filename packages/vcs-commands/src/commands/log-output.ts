@@ -30,7 +30,7 @@
  */
 
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { encodeGitPath, gitCharWidth } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath, gitCharWidth } from "@statewalker/vcs-utils/encoding";
 
 import { InvalidArgumentError } from "../errors/index.js";
 import { ChangeType } from "../results/diff-entry.js";
@@ -172,8 +172,15 @@ export interface LogMailOptions {
   from?: { name: string; email: string };
   /** `--force-in-body-from` */
   forceInBodyFrom?: boolean;
-  /** `format.encodeEmailHeaders` (default true): RFC 2047 for non-ASCII subjects */
+  /** `format.encodeEmailHeaders` (default true): RFC 2047 for non-ASCII subjects and names */
   encodeHeaders?: boolean;
+  /**
+   * The mail's character set (`i18n.logOutputEncoding`, else `i18n.commitEncoding`, else
+   * UTF-8): the commit converted to it (kept as stored when it is in it already), named in
+   * `Content-Type` and the RFC 2047 words. Conversions are to UTF-8 and ISO-8859-1 only; a
+   * commit that cannot be converted is shown as stored, as git shows it when iconv fails.
+   */
+  outputEncoding?: string;
 }
 
 /** A commit the walk shows, with the parents it is shown with (rewritten under `--graph`). */
@@ -420,12 +427,14 @@ function lastLineLength(sb: string): number {
   return bytesOf(sb.slice(nl + 1)).length;
 }
 
-/** pretty.c's add_rfc2047 (the encoding UTF-8) */
-function addRfc2047(sb: string, text: string, address: boolean): string {
+/** pretty.c's add_rfc2047 */
+function addRfc2047(sb: string, text: string, address: boolean, encoding = "UTF-8"): string {
   const max = 76;
   let lineLen = lastLineLength(sb);
-  let out = "=?UTF-8?q?";
-  lineLen += 5 + 5;
+  let out = `=?${encoding}?q?`;
+  lineLen += encoding.length + 5;
+  // mbs_chrlen: UTF-8 sequences are one character, any other encoding goes byte by byte
+  const utf8 = isUtf8(encoding);
   const bytes = bytesOf(text);
   const special = (ch: number) => {
     if (ch >= 0x80 || ch < 0x20 || ch === 0x7f) return true;
@@ -437,7 +446,7 @@ function addRfc2047(sb: string, text: string, address: boolean): string {
   for (let i = 0; i < bytes.length; ) {
     const lead = bytes[i] as number;
     let len = 1;
-    if (lead >= 0xc0) {
+    if (utf8 && lead >= 0xc0) {
       const want = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
       let ok = i + want <= bytes.length;
       for (let k = 1; ok && k < want; k++) ok = ((bytes[i + k] as number) & 0xc0) === 0x80;
@@ -446,8 +455,8 @@ function addRfc2047(sb: string, text: string, address: boolean): string {
     const isSpecial = len > 1 || special(lead);
     const encodedLen = isSpecial ? 3 * len : 1;
     if (lineLen + encodedLen + 2 > max) {
-      out += "?=\n =?UTF-8?q?";
-      lineLen = 5 + 5 + 1;
+      out += `?=\n =?${encoding}?q?`;
+      lineLen = encoding.length + 5 + 1;
     }
     for (let k = 0; k < len; k++) {
       const b = bytes[i + k] as number;
@@ -461,12 +470,19 @@ function addRfc2047(sb: string, text: string, address: boolean): string {
   return `${out}?=`;
 }
 
-/** The `From:` header of the email format (pp_user_info): RFC 2047 or quoted as needed. */
-export function mailFromHeader(name: string, email: string): string {
+/**
+ * The `From:` header of the email format (pp_user_info): RFC 2047 (unless
+ * `format.encodeEmailHeaders` is off) or quoted as needed.
+ */
+export function mailFromHeader(
+  name: string,
+  email: string,
+  options: { encodeHeaders?: boolean; encoding?: string } = {},
+): string {
   let max = 78;
   let out = "From: ";
-  if (needsRfc2047(name)) {
-    out += addRfc2047(out, name, true);
+  if ((options.encodeHeaders ?? true) && needsRfc2047(name)) {
+    out += addRfc2047(out, name, true, options.encoding);
     max = 76;
   } else if ([...name].some((c) => RFC822_SPECIALS.includes(c))) {
     const quoted = `"${name.replace(/["\\]/g, (c) => `\\${c}`)}"`;
@@ -517,27 +533,55 @@ function decodeCharset(bytes: Uint8Array, charset: string): string | undefined {
   }
 }
 
+/** utf8.c's same_encoding */
+const sameEncoding = (a: string, b: string) =>
+  (isUtf8(a) && isUtf8(b)) || a.toLowerCase() === b.toLowerCase();
+
 /**
- * pretty.c's repo_logmsg_reencode into UTF-8 (`i18n.logOutputEncoding`, `i18n.commitEncoding`
- * default): a commit with an `encoding` header is converted from it and the header dropped
- * (an `encoding UTF-8` header too); one whose bytes do not convert (or names a character set
- * this host does not know) is kept as it is, header and all, as git keeps it when iconv
- * fails. Undefined when nothing changes.
+ * pretty.c's repo_logmsg_reencode into the output encoding (UTF-8 by default: git's
+ * `i18n.logOutputEncoding`, `i18n.commitEncoding` default): a commit with an `encoding`
+ * header (UTF-8 without one) is converted from it, then the header dropped when the output
+ * is UTF-8 (an `encoding UTF-8` header too) or naming the output encoding; one already in
+ * the output encoding keeps its bytes. One whose bytes do not convert (or with a character
+ * set this host cannot convert) is kept as it is, header and all, as git keeps it when
+ * iconv fails. Undefined when nothing changes.
  */
-function reencodeCommit(raw: string, parsed: ParsedCommit): string | undefined {
+function reencodeCommit(
+  raw: string,
+  parsed: ParsedCommit,
+  outputEncoding = "UTF-8",
+): string | undefined {
   const at = parsed.headerLines.findIndex((l) => l.startsWith("encoding "));
-  if (at < 0) return undefined;
-  const charset = (parsed.headerLines[at] as string).slice(9).replace(/\n$/, "");
+  const charset =
+    at < 0 ? undefined : (parsed.headerLines[at] as string).slice(9).replace(/\n$/, "");
+  const use = charset ?? "UTF-8";
   let text = raw;
-  if (!isUtf8(charset)) {
-    const decoded = decodeCharset(encodeGitPath(raw), charset);
+  if (sameEncoding(use, outputEncoding)) {
+    if (charset === undefined) return undefined;
+  } else {
+    const decoded = isUtf8(use)
+      ? decodeCharset(encodeGitPath(raw), "UTF-8")
+      : decodeCharset(encodeGitPath(raw), use);
     if (decoded === undefined) return undefined;
-    text = decoded;
+    if (isUtf8(outputEncoding)) text = decoded;
+    else if (LATIN1.test(outputEncoding)) {
+      const bytes = new Uint8Array(decoded.length);
+      for (let i = 0; i < decoded.length; i++) {
+        const c = decoded.charCodeAt(i);
+        if (c > 0xff) return undefined;
+        bytes[i] = c;
+      }
+      text = decodeGitPath(bytes);
+    } else return undefined;
   }
-  // replace_encoding_header: the first `encoding ` line of the header removed
+  // replace_encoding_header: the first `encoding ` line of the header removed (UTF-8) or
+  // naming the output encoding
   const lines = linesOf(text);
   const k = lines.findIndex((l, i) => l.startsWith("encoding ") && i < parsed.headerLines.length);
-  if (k >= 0) lines.splice(k, 1);
+  if (k >= 0) {
+    if (isUtf8(outputEncoding)) lines.splice(k, 1);
+    else lines[k] = `encoding ${outputEncoding}\n`;
+  }
   return lines.join("");
 }
 
@@ -1091,7 +1135,11 @@ export class LogPrinter {
     let parsed = parseRaw(stored);
     // the message and the idents in UTF-8 (logmsg_reencode); the idents read from the
     // converted header then
-    const reencoded = reencodeCommit(stored, parsed);
+    const reencoded = reencodeCommit(
+      stored,
+      parsed,
+      fmt === "email" || fmt === "mboxrd" ? this.options.mail?.outputEncoding : undefined,
+    );
     if (reencoded !== undefined) parsed = parseRaw(reencoded);
     // the idents as the (converted) header has them: bytes that are no UTF-8 kept
     const author = parsed.headerLines.find((l) => l.startsWith("author "));
@@ -1159,14 +1207,13 @@ export class LogPrinter {
       else {
         sb += mail?.subject ? mail.subject(entry.id) : "Subject: [PATCH] ";
         if ((mail?.encodeHeaders ?? true) && needsRfc2047(title))
-          sb += addRfc2047(sb, title, false);
+          sb += addRfc2047(sb, title, false, mail?.outputEncoding ?? "UTF-8");
         else sb += wrapText(title, -lastLineLength(sb), 1, 78);
         sb += "\n";
         // need_8bit_cte: a body (after the header) with a byte above 0x7f, or an in-body
         // header with one
         if (hasNonAscii(parsed.body) || inBody.some(hasNonAscii)) {
-          sb +=
-            "MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n";
+          sb += `MIME-Version: 1.0\nContent-Type: text/plain; charset=${mail?.outputEncoding ?? "UTF-8"}\nContent-Transfer-Encoding: 8bit\n`;
         }
         if (mail?.afterSubject) sb += mail.afterSubject;
         sb += "\n";
@@ -1222,17 +1269,10 @@ export class LogPrinter {
       email = from.email;
     }
     if (mail) {
-      let max = 78;
-      out += "From: ";
-      if (needsRfc2047(name)) {
-        out += addRfc2047(out, name, true);
-        max = 76;
-      } else if ([...name].some((c) => RFC822_SPECIALS.includes(c))) {
-        const quoted = `"${name.replace(/["\\]/g, (c) => `\\${c}`)}"`;
-        out += wrapText(quoted, -6, 1, max);
-      } else out += wrapText(name, -6, 1, max);
-      if (max < lastLineLength(out) + 2 + bytesOf(email).length + 1) out += "\n";
-      out += ` <${email}>\n`;
+      out += mailFromHeader(name, email, {
+        encodeHeaders: this.options.mail?.encodeHeaders ?? true,
+        encoding: this.options.mail?.outputEncoding ?? "UTF-8",
+      });
     } else {
       out += `${what}: `;
       if (this.format.fmt === "fuller") out += "    ";

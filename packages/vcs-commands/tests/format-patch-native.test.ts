@@ -26,6 +26,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { type FormatPatchCommand, Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { gitAtLeast } from "./native-git-working-copy.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -322,5 +323,107 @@ describeGit("git format-patch as native git", () => {
       expect(ours).toEqual(nativeFiles);
       rmSync(join(repo, dir), { recursive: true });
     }
+  }, 120_000);
+
+  it("reads format.noprefix, encodeEmailHeaders and the output encoding as git", async () => {
+    const repo = join(root, `enc${counter++}`);
+    mkdirSync(repo, { recursive: true });
+    gitOk(repo, ["init", "-q", "-b", "main"]);
+    put(repo, "a.txt", "a\n");
+    gitOk(repo, ["add", "-A"]);
+    const who = { GIT_AUTHOR_NAME: "José Núñez", GIT_AUTHOR_EMAIL: "jose@example.com" };
+    gitOk(repo, ["commit", "-qm", "base"], { ...who, GIT_AUTHOR_DATE: "1700000000 +0100" });
+    put(repo, "a.txt", "b\n");
+    gitOk(repo, ["commit", "-qam", "Café crème über alles\n\nBody with naïve text.\n"], {
+      ...who,
+      GIT_AUTHOR_DATE: "1700000100 +0100",
+    });
+    // a commit stored in ISO-8859-1, with its encoding header
+    put(repo, "a.txt", "c\n");
+    put(
+      join(root, "."),
+      `latin-msg-${counter}`,
+      Buffer.from("Latin s\xe9 subject\n\nCaf\xe9 body.\n", "latin1"),
+    );
+    gitOk(
+      repo,
+      [
+        "-c",
+        "i18n.commitEncoding=ISO-8859-1",
+        "commit",
+        "-qa",
+        "-F",
+        join(root, `latin-msg-${counter}`),
+      ],
+      { GIT_AUTHOR_NAME: "Ann", GIT_AUTHOR_EMAIL: "ann@x", GIT_AUTHOR_DATE: "1700000200 +0000" },
+    );
+    const compareBytes = async (
+      args: string[],
+      configure: (c: FormatPatchCommand) => FormatPatchCommand,
+      label: string,
+    ) => {
+      const native = git(repo, ["format-patch", "--stdout", ...args]);
+      if (native.status !== 0) throw new Error(native.stderr);
+      const g = await open(repo);
+      const r = await configure(
+        g
+          .formatPatch()
+          .setStdout(true)
+          .setVersionString(version)
+          .setMessageIdTime(() => 1),
+      ).call();
+      g.close();
+      expect({ label, text: normalise(Buffer.from(r.output).toString("latin1")) }).toEqual({
+        label,
+        text: normalise(native.stdout.toString("latin1")),
+      });
+    };
+    const settings: [string, string][][] = [
+      [],
+      [["diff.noprefix", "true"]],
+      [["format.noprefix", "true"]],
+      // diff.srcPrefix: git 2.45 and later
+      ...(gitAtLeast(`git version ${version}`, 2, 45)
+        ? [
+            [
+              ["diff.noprefix", "true"],
+              ["diff.srcPrefix", "SRC/"],
+            ] as [string, string][],
+          ]
+        : []),
+      [["format.encodeEmailHeaders", "false"]],
+      [["i18n.commitEncoding", "ISO-8859-1"]],
+      [["i18n.logOutputEncoding", "ISO-8859-1"]],
+      [
+        ["i18n.commitEncoding", "ISO-8859-1"],
+        ["i18n.logOutputEncoding", "UTF-8"],
+      ],
+      [
+        ["i18n.logOutputEncoding", "ISO-8859-1"],
+        ["format.encodeEmailHeaders", "false"],
+      ],
+    ];
+    for (const set of settings) {
+      for (const [k, v] of set) gitOk(repo, ["config", k, v]);
+      await compareBytes(["-3"], (c) => c.setMaxCount(3), `${JSON.stringify(set)}`);
+      for (const [k] of set) gitOk(repo, ["config", "--unset", k]);
+    }
+    // the cover letter with --from (git 2.54 and later: that ident, dated at the epoch)
+    await compareBytes(
+      ["-2", "--cover-letter", "--from=Séndér <s@x>"],
+      (c) => c.setMaxCount(2).setCoverLetter(true).setFrom("Séndér <s@x>"),
+      "cover --from=ident",
+    );
+    await compareBytes(
+      ["-2", "--cover-letter", "--from"],
+      (c) => c.setMaxCount(2).setCoverLetter(true).setFrom(true),
+      "cover --from",
+    );
+    gitOk(repo, ["config", "format.encodeEmailHeaders", "false"]);
+    await compareBytes(
+      ["-2", "--cover-letter", "--from=Séndér <s@x>"],
+      (c) => c.setMaxCount(2).setCoverLetter(true).setFrom("Séndér <s@x>"),
+      "cover --from, no encoded headers",
+    );
   }, 120_000);
 });

@@ -57,13 +57,18 @@ const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
  * an untracked file where a file goes or on a leading path of one (`verify_absent`), an
  * untracked file or nested repository in a directory a file replaces
  * (`verify_clean_subdirectory`). Ignored files are expendable. HEAD is not moved.
+ *
+ * With `reset` (unpack-trees' `UNPACK_RESET_PROTECT_UNTRACKED`, as `am --abort` cleans the
+ * index): entries that differ from the commit take its version without the up-to-date
+ * check, entries that agree keep their worktree file, untracked files are still protected.
  */
 export async function resetMerge(
   ctx: SequencerContext,
   targetId: ObjectId,
   label: string,
-  options: { hard?: boolean } = {},
+  options: { hard?: boolean; reset?: boolean } = {},
 ): Promise<MergeRefusal | undefined> {
+  const checkUptodate = !options.hard && !options.reset;
   const targetTree = await ctx.commits.getTree(targetId);
   const target = await flatTree(ctx.trees, targetTree);
   const index = new Map<string, CheckedEntry>();
@@ -104,7 +109,7 @@ export async function resetMerge(
       if (worktree && !gitlink && (await directoryLosesUntracked(worktree, path, inIndex))) {
         return refuse(`Updating '${path}' would lose untracked files in it`, path);
       }
-      if (!conflicted && i && !options.hard && worktree) {
+      if (!conflicted && i && checkUptodate && worktree) {
         if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
       }
       removing.add(path);
@@ -134,7 +139,7 @@ export async function resetMerge(
         notUptodate,
       });
       if (refusal) return refusal;
-    } else if (worktree && i && !conflicted && !options.hard) {
+    } else if (worktree && i && !conflicted && checkUptodate) {
       if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
     }
     changes.push(path);
