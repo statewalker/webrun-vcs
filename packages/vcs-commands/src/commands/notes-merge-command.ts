@@ -2,6 +2,7 @@ import type { ObjectId } from "@statewalker/vcs-core";
 import { mergeLines } from "@statewalker/vcs-utils";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { collectChunks } from "@statewalker/vcs-working-tree";
+import type { CommandRefs } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type NotesResult, NotesSubcommand } from "./notes-command.js";
 import {
@@ -114,9 +115,8 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     return this;
   }
 
-  async call(): Promise<NotesMergeResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesMergeResult> {
+    await this.resolveGitDir();
     const doMerge = this.strategy !== undefined || (!this.doCommit && !this.doAbort);
     if (Number(doMerge) + Number(this.doCommit) + Number(this.doAbort) !== 1) {
       throw new NotesError("cannot mix --commit, --abort or -s/--strategy");
@@ -129,8 +129,24 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     return this.merge();
   }
 
+  /** The git directory as git_path names it: `.git`, a linked worktree's absolute. */
+  private gitDirShown = ".git";
+
+  /**
+   * git_path's directory: `.git` in the main worktree (git found it there), the absolute
+   * path of the administrative directory (`.git/worktrees/<id>`, as the `.git` file names
+   * it) in a linked one.
+   */
+  private async resolveGitDir(): Promise<void> {
+    const current = (await this.workingCopy.worktrees?.list().catch(() => undefined))?.find(
+      (w) => w.current,
+    );
+    const host = (this.workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
+    if (current?.id !== undefined && host) this.gitDirShown = host;
+  }
+
   private gitPath(name: string): string {
-    return `.git/${name}`;
+    return `${this.gitDirShown}/${name}`;
   }
 
   private get checkout() {
@@ -219,10 +235,9 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     const output = run.output;
     const errors = run.errors;
     if (result >= 0) {
-      const current = await readRef(ctx, notesRef);
-      if (current !== resultId) {
-        await updateNotesRef(ctx, notesRef, resultId, msg);
-      }
+      // even when the ref already holds the result ("Already up to date."): an unchanged
+      // ref gets no reflog line, a symbolic ref the REF_LOG_ONLY line of the update through it
+      await updateNotesRef(ctx, notesRef, resultId, msg);
       return {
         exitCode: 0,
         output: output.join(""),
@@ -233,17 +248,10 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
       };
     }
     await this.refsStore.set("NOTES_MERGE_PARTIAL", resultId);
-    const existing = await this.refsStore.get("NOTES_MERGE_REF").catch(() => undefined);
-    if (existing && "target" in existing && existing.target === notesRef) {
-      // find_shared_symref: the worktree whose NOTES_MERGE_REF points at the ref, by its
-      // path as git prints it (absolute). Only this worktree's NOTES_MERGE_REF is read (the
-      // other worktrees' pseudo refs are not reachable here); a working copy that keeps no
-      // linked worktrees has no path to print, and says `.`.
-      const wt = (await this.workingCopy.worktrees?.list().catch(() => undefined))?.find(
-        (w) => w.current,
-      );
+    const busy = await this.findSharedSymref(notesRef);
+    if (busy !== undefined) {
       const error = new NotesError(
-        `a notes merge into ${notesRef} is already in-progress at ${wt?.path ?? "."}`,
+        `a notes merge into ${notesRef} is already in-progress at ${busy}`,
       );
       error.output = output.join("");
       error.errors = errors.join("");
@@ -331,14 +339,31 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
    * symbolic link followed, as `stat` follows it: the content of the file it points at)
    * stored as a blob as `git add` stores it, through the clean conversion of its path
    * (`core.autocrlf`, `text`/`eol`/`filter` attributes of `.git/NOTES_MERGE_WORKTREE/<name>`).
+   * What `stat` refuses dies as git dies (a dangling link, a loop of links); a directory is
+   * no file index_path stores (git's `does not have a commit checked out`, then `Failed to
+   * write blob object`).
    */
   private async storeResolvedNote(name: string, errors: string[]): Promise<ObjectId> {
     const path = `${this.gitPath(WORKTREE)}/${name}`;
-    const bytes = await this.readFollowingLinks(path);
-    if (bytes === undefined) {
-      throw new NotesError(`Failed to stat '${path}': No such file or directory`);
+    const read = await this.readFollowingLinks(`${WORKTREE}/${name}`);
+    if ("error" in read) {
+      switch (read.error) {
+        case "loop":
+          throw new NotesError(`Failed to stat '${path}': Too many levels of symbolic links`);
+        case "directory":
+          errors.push(`error: '${path}' does not have a commit checked out\n`);
+          throw new NotesError(`Failed to write blob object from '${path}'`);
+        case "other":
+          errors.push(`error: ${path}: unsupported file type\n`);
+          throw new NotesError(`Failed to write blob object from '${path}'`);
+        default:
+          throw new NotesError(`Failed to stat '${path}': No such file or directory`);
+      }
     }
-    const conversion = await this.worktreeAccess?.contentFilter?.checkin(path);
+    const bytes = read.bytes;
+    const conversion = await this.worktreeAccess?.contentFilter?.checkin(
+      `.git/${WORKTREE}/${name}`,
+    );
     const cleaned = conversion
       ? await conversion.apply(bytes, {
           write: true,
@@ -349,13 +374,49 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
   }
 
   /**
-   * The content of the file at `path` (under `.git/`, or in the worktree), symbolic links
-   * followed as `stat`/`open` follow them: the FilesApi never follows a link, so a link the
-   * worktree reports (`.git/` inside it) is read, and its target, relative to the link's
-   * directory, read in turn. Undefined when nothing is there (a dangling link); a link to an
-   * absolute path (outside what the FilesApi reaches) also reads as undefined.
+   * The content of the file at `name` in git's directory, symbolic links followed as `stat`
+   * and `open` follow them (40 at most, then a loop): through the checkout's `lstat` of
+   * its own directory (the real git directory, also in a linked worktree where `.git` is a
+   * file), a relative target taken from the link's directory, an absolute one from the
+   * host path of the git directory. Else, for a checkout that cannot `lstat`, links the
+   * worktree reports under `.git/`.
    */
-  private async readFollowingLinks(path: string): Promise<Uint8Array | undefined> {
+  private async readFollowingLinks(
+    name: string,
+  ): Promise<{ bytes: Uint8Array } | { error: "missing" | "loop" | "directory" | "other" }> {
+    const checkout = this.checkout;
+    if (!checkout.lstatStateFile) {
+      const bytes = await this.readThroughWorktree(`.git/${name}`);
+      return bytes ? { bytes } : { error: "missing" };
+    }
+    const host = (this.workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
+    let current = name;
+    for (let hops = 0; ; hops++) {
+      const stat = await checkout.lstatStateFile(current).catch(() => undefined);
+      if (!stat) return { error: "missing" };
+      if (stat.kind === "directory" || stat.kind === "other") return { error: stat.kind };
+      if (stat.kind === "file") {
+        const bytes = await checkout.readStateFile?.(current);
+        return bytes ? { bytes } : { error: "missing" };
+      }
+      if (hops >= 40) return { error: "loop" };
+      const target = stat.target ?? "";
+      let next: string | undefined;
+      if (target.startsWith("/")) {
+        next = host ? relativeTo(host, target) : undefined;
+      } else {
+        next = normalizeRelative(`${current.slice(0, current.lastIndexOf("/") + 1)}${target}`);
+      }
+      if (next === undefined) return { error: "missing" };
+      current = next;
+    }
+  }
+
+  /**
+   * A file read through the worktree's view of `.git/` (the main worktree's), a link the
+   * worktree reports followed, relative to its directory; undefined when nothing is there.
+   */
+  private async readThroughWorktree(path: string): Promise<Uint8Array | undefined> {
     const worktree = this.worktreeAccess;
     let current = path;
     for (let hops = 0; hops < 40; hops++) {
@@ -363,16 +424,11 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
       if (entry && (entry.mode & 0o170000) === 0o120000 && worktree) {
         const target = decodeGitPath(await collectChunks(worktree.readContent(current)));
         if (target.startsWith("/")) return undefined;
-        const dir = current.slice(0, current.lastIndexOf("/") + 1);
-        const parts: string[] = [];
-        for (const part of `${dir}${target}`.split("/")) {
-          if (part === "" || part === ".") continue;
-          if (part === "..") {
-            if (parts.length === 0) return undefined;
-            parts.pop();
-          } else parts.push(part);
-        }
-        current = parts.join("/");
+        const next = normalizeRelative(
+          `${current.slice(0, current.lastIndexOf("/") + 1)}${target}`,
+        );
+        if (next === undefined || next.startsWith("../")) return undefined;
+        current = next;
         continue;
       }
       if (current.startsWith(".git/")) {
@@ -384,11 +440,51 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     return undefined;
   }
 
+  /**
+   * worktree.c's find_shared_symref(worktrees, "NOTES_MERGE_REF", ref): the path (as git
+   * prints it) of the first worktree, the main one first, whose NOTES_MERGE_REF is a
+   * symbolic ref resolving to `ref` (through every link of the chain), read from each
+   * worktree's refs (`LinkedWorktrees.refsOf`, else its opened working copy's); bare
+   * worktrees are skipped, and so are those whose refs cannot be read. A working copy that keeps no linked
+   * worktrees reads its own NOTES_MERGE_REF only, and has no path to print but `.`.
+   */
+  private async findSharedSymref(ref: string): Promise<string | undefined> {
+    const worktrees = this.workingCopy.worktrees;
+    const list = await worktrees?.list().catch(() => undefined);
+    if (!worktrees || !list) {
+      return (await this.mergeRefTarget(this.refsStore)) === ref ? "." : undefined;
+    }
+    for (const wt of list) {
+      if (wt.bare) continue;
+      let refs: Pick<CommandRefs, "get"> | undefined = this.refsStore;
+      if (!wt.current) {
+        const read = worktrees.refsOf
+          ? worktrees.refsOf(wt)
+          : worktrees.open(wt).then((copy) => copy.history.refs);
+        refs = await read
+          .then((r) => r as unknown as Pick<CommandRefs, "get">)
+          .catch(() => undefined);
+      }
+      if (refs && (await this.mergeRefTarget(refs)) === ref) return wt.path;
+    }
+    return undefined;
+  }
+
+  /** The ref a worktree's NOTES_MERGE_REF resolves to, when it is a symbolic ref. */
+  private async mergeRefTarget(refs: Pick<CommandRefs, "get">): Promise<string | undefined> {
+    const first = await refs.get("NOTES_MERGE_REF").catch(() => undefined);
+    if (!first || !("target" in first) || typeof first.target !== "string") return undefined;
+    return this.symrefTarget("NOTES_MERGE_REF", refs);
+  }
+
   /** refs_resolve_refdup of a symbolic ref: the name it ends at. */
-  private async symrefTarget(name: string): Promise<string | undefined> {
+  private async symrefTarget(
+    name: string,
+    refs: Pick<CommandRefs, "get"> = this.refsStore,
+  ): Promise<string | undefined> {
     let current = name;
     for (let depth = 0; depth < 8; depth++) {
-      const ref = await this.refsStore.get(current).catch(() => undefined);
+      const ref = await refs.get(current).catch(() => undefined);
       if (!ref) return depth === 0 ? undefined : current;
       if (!("target" in ref) || typeof ref.target !== "string") return current;
       current = ref.target;
@@ -648,4 +744,25 @@ function isValidRefName(name: string): boolean {
   return (
     parts.length >= 2 && parts.every((c) => c !== "" && !c.startsWith(".") && !c.endsWith("."))
   );
+}
+
+/** A relative path with `.` and `x/..` folded away; leading `..` kept (undefined when empty). */
+function normalizeRelative(path: string): string | undefined {
+  const parts: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === ".." && parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+    else parts.push(part);
+  }
+  return parts.length > 0 ? parts.join("/") : undefined;
+}
+
+/** The absolute host path `target` relative to the absolute directory `dir`. */
+function relativeTo(dir: string, target: string): string | undefined {
+  const from = dir.split("/").filter((p) => p !== "" && p !== ".");
+  const to = normalizeRelative(target)?.split("/") ?? [];
+  if (to.includes("..")) return undefined;
+  let common = 0;
+  while (common < from.length && common < to.length && from[common] === to[common]) common++;
+  return normalizeRelative([...from.slice(common).map(() => ".."), ...to.slice(common)].join("/"));
 }

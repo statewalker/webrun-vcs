@@ -153,6 +153,12 @@ async function treeOfTreeish(ctx: NotesContext, id: ObjectId): Promise<ObjectId 
   return undefined;
 }
 
+/** refs.c's expand_ref check: `name` is a symbolic ref that resolves to nothing. */
+async function isDanglingSymref(ctx: NotesContext, name: string): Promise<boolean> {
+  const ref = await ctx.refs.get(name).catch(() => undefined);
+  return ref !== undefined && "target" in ref && typeof ref.target === "string";
+}
+
 /** The id a ref holds (symbolic refs followed), undefined when it holds none. */
 export async function readRef(ctx: NotesContext, name: string): Promise<ObjectId | undefined> {
   const ref = await ctx.refs.resolve(name).catch(() => undefined);
@@ -161,12 +167,18 @@ export async function readRef(ctx: NotesContext, name: string): Promise<ObjectId
 
 /**
  * init_notes: the notes tree of `ref` (empty when it names nothing, or with `empty`);
- * a writable tree's ref must be a ref.
+ * a writable tree's ref must be a ref. A symbolic ref pointing at nothing reads as no
+ * notes, with git's `ignoring dangling symref <ref>` in `warnings` (repo_get_oid's).
  */
 export async function initNotes(
   ctx: NotesContext,
   ref: string,
-  options: { combine?: CombineNotes; writable?: boolean; empty?: boolean } = {},
+  options: {
+    combine?: CombineNotes;
+    writable?: boolean;
+    empty?: boolean;
+    warnings?: string[];
+  } = {},
 ): Promise<NotesHandle> {
   const combine = options.combine ?? combineNotesConcatenate;
   const handle = (tree: NotesTree): NotesHandle => ({
@@ -176,7 +188,12 @@ export async function initNotes(
   });
   if (options.empty) return handle(await NotesTree.load(ctx, undefined, combine));
   const id = (await readRef(ctx, ref)) ?? (await ctx.resolve(ref));
-  if (!id) return handle(await NotesTree.load(ctx, undefined, combine));
+  if (!id) {
+    if (options.warnings && ref !== "HEAD" && (await isDanglingSymref(ctx, ref))) {
+      options.warnings.push(`ignoring dangling symref ${ref}`);
+    }
+    return handle(await NotesTree.load(ctx, undefined, combine));
+  }
   if (options.writable && !(await readRef(ctx, ref))) {
     throw new NotesError(`Cannot use notes ref ${ref}`);
   }

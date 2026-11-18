@@ -1071,4 +1071,275 @@ describeGit("git notes, native twins", () => {
     );
     expect(gitOk(t.ours, "cat-file", "-p", "HEAD")).toBe(gitOk(t.native, "cat-file", "-p", "HEAD"));
   });
+
+  /** A linked worktree `../wt` (detached) of each twin, opened as ours at its git directory. */
+  function linkedTwins(t: { native: string; ours: string }): { native: string; ours: string } {
+    for (const repo of [t.native, t.ours])
+      build(repo, "worktree", "add", "-q", "--detach", "../wt");
+    return { native: join(t.native, "../wt"), ours: join(t.ours, "../wt") };
+  }
+
+  async function openLinked(repo: string, env: Env = {}): Promise<Git> {
+    const files = createNodeFilesApi({ rootDir: join(repo, "..") });
+    const environment = createNodeGitHostEnvironment({ env: envOf(env) });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git" });
+    const worktrees = await openGitLinkedWorktrees({
+      files,
+      gitDir: "repo/.git/worktrees/wt",
+      history,
+      environment,
+    });
+    return Git.fromWorkingCopy(await worktrees.openCurrent());
+  }
+
+  /** The twins' paths in what native git printed, as ours prints them. */
+  const asOurs = (t: { native: string; ours: string }, r: Run): Run => ({
+    ...r,
+    stdout: r.stdout.replaceAll(join(t.native, ".."), join(t.ours, "..")),
+    stderr: r.stderr.replaceAll(join(t.native, ".."), join(t.ours, "..")),
+  });
+
+  it("merge 'Already up to date' through a symbolic ref logs on the symref, not on the ref", async () => {
+    const t = twins((repo) => {
+      const r = (...a: string[]) => {
+        const x = spawnSync("git", a, { cwd: repo, env: envOf(), encoding: "utf8" });
+        if (x.status !== 0) throw new Error(x.stderr);
+      };
+      r("notes", "--ref", "real", "add", "-m", "r", "HEAD");
+      r("update-ref", "refs/notes/other", "refs/notes/real");
+      r("notes", "--ref", "real", "add", "-f", "-m", "r2", "HEAD");
+      r("symbolic-ref", "refs/notes/commits", "refs/notes/real");
+    });
+    const logs = (repo: string) => readFileSync(join(repo, ".git/logs/refs/notes/commits"), "utf8");
+    const before = logs(t.native);
+    const n = await step(t, ["notes", "merge", "other"], (g) =>
+      g.notes().merge().setRemoteRef("other").call(),
+    );
+    expect(n.stdout).toBe("Already up to date.\n");
+    const added = logs(t.native).slice(before.length);
+    expect(added).toMatch(/^([0-9a-f]{40}) \1 .*\tnotes: Merged notes from refs\/notes\/other/);
+    // the plain ref: unchanged, no reflog line
+    const real = readFileSync(join(t.native, ".git/logs/refs/notes/real"), "utf8");
+    await step(t, ["notes", "--ref", "real", "merge", "other"], (g) =>
+      g.notes("real").merge().setRemoteRef("other").call(),
+    );
+    expect(readFileSync(join(t.native, ".git/logs/refs/notes/real"), "utf8")).toBe(real);
+  });
+
+  it("the editor's template of tags of tags and trees, and of a tag whose target is missing", async () => {
+    const t = twins((repo) => {
+      const r = (...a: string[]) => {
+        const x = spawnSync("git", a, { cwd: repo, env: nativeGitEnv(home), encoding: "utf8" });
+        if (x.status !== 0) throw new Error(x.stderr);
+        return x.stdout.trim();
+      };
+      const literal = (content: string) => {
+        const x = spawnSync("git", ["hash-object", "-t", "tag", "-w", "--literally", "--stdin"], {
+          cwd: repo,
+          env: nativeGitEnv(home),
+          input: content,
+          encoding: "utf8",
+        });
+        if (x.status !== 0) throw new Error(x.stderr);
+        return x.stdout.trim();
+      };
+      r("tag", "-a", "-m", "one", "t1", "HEAD~1");
+      r("tag", "-a", "-m", "two", "t2", "t1");
+      r("tag", "-a", "-m", "of a tree", "tt", "HEAD^{tree}");
+      r("tag", "-a", "-m", "of a tag of a tree", "tt2", "tt");
+      const tagger = "tagger T <t@example.com> 1700000000 +0100\n\n";
+      const t1 = r("rev-parse", "t1");
+      const nonl = literal(`object ${t1}\ntype tag\ntag nonl\n${tagger}no newline`);
+      r("update-ref", "refs/tags/nonl", nonl);
+      const missing = "1234567890123456789012345678901234567890";
+      const gone = literal(`object ${missing}\ntype commit\ntag gone\n${tagger}gone\n`);
+      r("update-ref", "refs/tags/gone", gone);
+    });
+    const capture = join(root, "capture2.sh");
+    writeFileSync(
+      capture,
+      `#!/bin/sh\ncp "$1" "${join(root, "editmsg2")}"\nprintf 'note of %s\\n' "$NOTE_OBJECT" >> "$1"\n`,
+    );
+    chmodSync(capture, 0o755);
+    for (const object of ["t2", "tt", "tt2", "nonl"]) {
+      let seen = "";
+      await step(
+        t,
+        ["notes", "add", "-f", object],
+        (g) =>
+          g
+            .notes()
+            .add()
+            .setForce(true)
+            .setObject(object)
+            .setEditor((text) => {
+              seen = text;
+              return `${text}note of ${object}\n`;
+            })
+            .call(),
+        { env: { GIT_EDITOR: capture, NOTE_OBJECT: object }, label: `template of ${object}` },
+      );
+      const expected = readFileSync(join(root, "editmsg2"), "utf8");
+      expect(seen, object).toBe(expected.replace(/note of .*\n$/, ""));
+      if (object === "tt") {
+        const id = gitOk(t.native, "rev-parse", "tt").trim();
+        expect(expected).toContain(`# tree ${id}\n`);
+      }
+    }
+    const n = await step(
+      t,
+      ["notes", "add", "-f", "gone"],
+      (g) => g.notes().add().setForce(true).setObject("gone").call(),
+      { env: { GIT_EDITOR: ":" } },
+    );
+    expect(n.stderr).toContain(
+      "error: could not read object 1234567890123456789012345678901234567890\n",
+    );
+    expect(n.stderr).toContain("fatal: failed to finish 'show' for object '");
+  });
+
+  it("merge --commit in a linked worktree: links followed in its git directory, what stat refuses", async () => {
+    const t = twins(mergeSetup);
+    const w = linkedTwins(t);
+    const both = async (args: string[], run: (g: Git) => Promise<NotesResult | string>) => {
+      const n = git(w.native, args);
+      const mine = await ours(async () => run(await openLinked(t.ours)));
+      if (!n.stderr.includes("does not have a commit checked out")) {
+        mine.stderr = mine.stderr.replace(/^error: '.*' does not have a commit checked out\n/m, "");
+      }
+      expect(mine, args.join(" ")).toEqual(asOurs(t, n));
+      expect(state(t.ours), `${args.join(" ")}: state`).toBe(state(t.native));
+      return n;
+    };
+    const merged = await both(["notes", "merge", "other"], (g) =>
+      g.notes().merge().setRemoteRef("other").call(),
+    );
+    expect(merged.stderr).toContain(
+      `Fix conflicts in ${join(t.native, ".git/worktrees/wt/NOTES_MERGE_WORKTREE")} and commit`,
+    );
+    const head = build(t.native, "rev-parse", "HEAD").trim();
+    const entry = (repo: string) => join(repo, ".git/worktrees/wt/NOTES_MERGE_WORKTREE", head);
+    const replace = (make: (path: string) => void) => {
+      for (const repo of [t.native, t.ours]) {
+        rmSync(entry(repo), { recursive: true, force: true });
+        make(entry(repo));
+      }
+    };
+    const commit = () =>
+      both(["notes", "merge", "--commit"], (g) => g.notes().merge().setCommit(true).call());
+    replace((p) => symlinkSync("nowhere", p));
+    expect((await commit()).stderr).toContain("': No such file or directory\n");
+    replace((p) => symlinkSync(head, p));
+    expect((await commit()).stderr).toContain("': Too many levels of symbolic links\n");
+    replace((p) => mkdirSync(p));
+    // (git 2.5x says why index_path refused the directory; 2.43 does not)
+    expect((await commit()).stderr).toContain("fatal: Failed to write blob object from '");
+    // a link out of the worktree's git directory, into the common one
+    for (const repo of [t.native, t.ours]) writeFileSync(join(repo, ".git/target.txt"), "linked\n");
+    replace((p) => symlinkSync("../../../target.txt", p));
+    expect((await commit()).status).toBe(0);
+    expect(gitOk(t.native, "notes", "show", "HEAD")).toBe("linked\n");
+    expect(gitOk(t.ours, "ls-tree", "-r", "refs/notes/commits")).toBe(
+      gitOk(t.native, "ls-tree", "-r", "refs/notes/commits"),
+    );
+  });
+
+  it("a dangling notes symref: git's warning, once, from each command that reads the notes", async () => {
+    const t = twins();
+    const dangle = () => {
+      for (const repo of [t.native, t.ours]) {
+        build(repo, "update-ref", "-d", "refs/notes/missing");
+        build(repo, "symbolic-ref", "refs/notes/commits", "refs/notes/missing");
+      }
+    };
+    for (const repo of [t.native, t.ours]) {
+      spawnSync("git", ["notes", "--ref", "other", "add", "-m", "o", "HEAD~1"], {
+        cwd: repo,
+        env: envOf(),
+      });
+    }
+    const cases: [string[], (g: Git) => Promise<NotesResult | string>, string?][] = [
+      [["notes", "list"], (g) => g.notes().list().call()],
+      [["notes", "list", "HEAD"], (g) => g.notes().list().setObject("HEAD").call()],
+      [["notes", "show"], (g) => g.notes().show().call()],
+      [["notes", "add", "-m", "x"], (g) => g.notes().add().addMessage("x").call()],
+      [["notes", "append", "-m", "x"], (g) => g.notes().append().addMessage("x").call()],
+      [["notes", "copy", "HEAD~1", "HEAD"], (g) => g.notes().copy().setFrom("HEAD~1").call()],
+      [["notes", "remove", "HEAD"], (g) => g.notes().remove().addObjects("HEAD").call()],
+      [["notes", "prune", "-v"], (g) => g.notes().prune().setVerbose(true).call()],
+      [["notes", "get-ref"], (g) => g.notes().getRef().call()],
+      [["notes", "merge", "other"], (g) => g.notes().merge().setRemoteRef("other").call()],
+      [
+        ["notes", "copy", "--stdin"],
+        (g) => g.notes().copy().setStdin("HEAD~1 HEAD\n").call(),
+        "HEAD~1 HEAD\n",
+      ],
+    ];
+    for (const [args, run, input] of cases) {
+      dangle();
+      const n = await step(t, args, run, input ? { input } : {});
+      const warnings = n.stderr.split("warning: ignoring dangling symref refs/notes/commits\n");
+      expect(warnings.length, args.join(" ")).toBe(args[1] === "get-ref" ? 1 : 2);
+    }
+  });
+
+  it("prune refuses a repository with alternates, as gc does", async () => {
+    const t = twins();
+    for (const repo of [t.native, t.ours]) {
+      const alt = join(repo, "../alt");
+      build(join(repo, ".."), "init", "-q", "-b", "main", "alt");
+      put(alt, "x.txt", "alt\n");
+      build(alt, "add", ".");
+      build(alt, "commit", "-qm", "alt");
+      writeFileSync(join(repo, ".git/objects/info/alternates"), `${join(alt, ".git/objects")}\n`);
+      const borrowed = build(alt, "rev-parse", "HEAD").trim();
+      const r = spawnSync("git", ["notes", "add", "-m", "of a borrowed commit", borrowed], {
+        cwd: repo,
+        env: envOf(),
+        encoding: "utf8",
+      });
+      if (r.status !== 0) throw new Error(r.stderr);
+    }
+    const n = git(t.native, ["notes", "prune", "-v"]);
+    expect(n).toEqual({ status: 0, stdout: "", stderr: "" });
+    const mine = await ours(async () =>
+      (await open(t.ours)).notes().prune().setVerbose(true).call(),
+    );
+    expect(mine).toEqual({
+      status: 128,
+      stdout: "",
+      stderr:
+        "fatal: cannot prune notes in a repository with alternates (objects/info/alternates): " +
+        "the objects it borrows are not read\n",
+    });
+    expect(state(t.ours)).toBe(state(t.native));
+  });
+
+  it("a notes merge in progress in another worktree, and the linked worktree's paths", async () => {
+    const t = twins(mergeSetup);
+    const w = linkedTwins(t);
+    const n1 = git(w.native, ["notes", "merge", "other"]);
+    const m1 = await ours(async () =>
+      (await openLinked(t.ours)).notes().merge().setRemoteRef("other").call(),
+    );
+    expect(m1).toEqual(asOurs(t, n1));
+    // the main worktree: the linked one's NOTES_MERGE_REF names the ref
+    const n2 = git(t.native, ["notes", "merge", "other"]);
+    expect(n2.status).toBe(128);
+    expect(n2.stderr).toContain(
+      `fatal: a notes merge into refs/notes/commits is already in-progress at ${w.native}\n`,
+    );
+    const m2 = await ours(async () =>
+      (await open(t.ours)).notes().merge().setRemoteRef("other").call(),
+    );
+    expect(m2).toEqual(asOurs(t, n2));
+    expect(state(t.ours)).toBe(state(t.native));
+    // -v --abort in the linked worktree prints its directory too
+    const n3 = git(w.native, ["notes", "merge", "-v", "--abort"]);
+    const m3 = await ours(async () =>
+      (await openLinked(t.ours)).notes().merge().setVerbosity(3).setAbort(true).call(),
+    );
+    expect(n3.stdout).toContain(join(t.native, ".git/worktrees/wt/NOTES_MERGE_WORKTREE"));
+    expect(m3).toEqual(asOurs(t, n3));
+  });
 });

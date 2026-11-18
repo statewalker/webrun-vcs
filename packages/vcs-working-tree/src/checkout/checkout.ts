@@ -112,6 +112,14 @@ export interface CheckoutConfig {
   list(section?: string): AsyncIterable<{ key: string; value: string }>;
 }
 
+/** What {@link Checkout.lstatStateFile} finds at a path of git's directory. */
+export interface StateFileStat {
+  /** A file, a directory, a symbolic link, or anything else (a FIFO, socket, device) */
+  readonly kind: "file" | "directory" | "symlink" | "other";
+  /** A symbolic link's target, as stored */
+  readonly target?: string;
+}
+
 /**
  * Checkout interface - mutable local state
  *
@@ -177,6 +185,13 @@ export interface Checkout {
    * without these keeps no state a merge, cherry-pick, revert or rebase can resume from.
    */
   readStateFile?(name: string): Promise<Uint8Array | undefined>;
+  /**
+   * What is at a path of git's directory (named as {@link readStateFile} names it; `..`
+   * climbs out of the directory), a final symbolic link not followed (`lstat`): its kind,
+   * and for a link its target as stored (`readlink`). Undefined when nothing is there.
+   * Optional: a checkout without it cannot tell a link from what it points at.
+   */
+  lstatStateFile?(name: string): Promise<StateFileStat | undefined>;
   /** Writes a state file (as git writes them: in place, parent directories created). */
   writeStateFile?(name: string, content: Uint8Array | string): Promise<void>;
   /**

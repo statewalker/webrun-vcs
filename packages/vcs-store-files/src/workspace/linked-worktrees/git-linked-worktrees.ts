@@ -26,7 +26,12 @@
 import type { FilesApi, History, ObjectId, Refs } from "@statewalker/vcs-core";
 import { createHistoryFromStores, isSymbolicRef } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { appendByRewrite, normalizePath, tryReadFile } from "@statewalker/vcs-utils/files";
+import {
+  appendByRewrite,
+  normalizePath,
+  type PosixFilesApi,
+  tryReadFile,
+} from "@statewalker/vcs-utils/files";
 import type {
   ContentFilterSetup,
   CreatedLinkedWorktree,
@@ -252,7 +257,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   }
 
   /** The refs a worktree's git directory sees (the repository's own for the main worktree). */
-  private async refsOf(gitDir: string): Promise<Refs> {
+  async refsOf(entry: WorktreeInfo): Promise<Refs> {
+    return this.refsOfDir(entry.id === undefined ? this.commonDir : this.adminDir(entry.id));
+  }
+
+  private async refsOfDir(gitDir: string): Promise<Refs> {
     if (gitDir === this.commonDir) return this.history.refs;
     let refs = this.refsByDir.get(gitDir);
     if (!refs) {
@@ -288,7 +297,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       bisecting?: string;
     } = { detached: false };
     try {
-      const refs = await this.refsOf(gitDir);
+      const refs = await this.refsOfDir(gitDir);
       const head = await refs.get("HEAD");
       if (head && isSymbolicRef(head)) {
         out.headRef = head.target;
@@ -802,7 +811,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     log: { message: string; ident?: string },
   ): Promise<void> {
     const gitDir = entry.id === undefined ? this.commonDir : this.adminDir(entry.id);
-    const refs = await this.refsOf(gitDir);
+    const refs = await this.refsOfDir(gitDir);
     const old = (await refs.resolve("HEAD").catch(() => undefined))?.objectId;
     await refs.setSymbolic("HEAD", target);
     const next = (await refs.resolve(target).catch(() => undefined))?.objectId;
@@ -821,7 +830,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     const gitDir = entry.id === undefined ? this.commonDir : this.adminDir(entry.id);
     const root = this.fromHost(entry.path);
     if (root === undefined) throw new Error(`'${entry.path}' is beyond this storage`);
-    const refs = await this.refsOf(gitDir);
+    const refs = await this.refsOfDir(gitDir);
     const base = this.history;
     const history =
       refs === base.refs
@@ -910,6 +919,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
 
   private checkoutFiles(): GitCheckoutFilesApi {
     const files = this.files;
+    const posix = files as PosixFilesApi;
     return {
       read: (path: string) => readIfFile(files, path),
       exists: (path: string) => files.exists(path),
@@ -928,6 +938,8 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       },
       ...(files.createExclusive ? { createExclusive: files.createExclusive.bind(files) } : {}),
       ...(files.append ? { append: files.append.bind(files) } : {}),
+      ...(posix.lstat ? { lstat: posix.lstat.bind(posix) } : {}),
+      ...(posix.readlink ? { readlink: posix.readlink.bind(posix) } : {}),
       list: (path: string) => files.list(path),
     } as unknown as GitCheckoutFilesApi;
   }

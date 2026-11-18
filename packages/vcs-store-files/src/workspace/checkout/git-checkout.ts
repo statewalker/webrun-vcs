@@ -28,6 +28,7 @@ import type {
   CheckoutStash,
   HeadValue,
   Staging,
+  StateFileStat,
 } from "@statewalker/vcs-working-tree";
 import type { CherryPickStateFilesApi } from "../working-copy/cherry-pick-state-reader.js";
 import type { MergeStateFilesApi } from "../working-copy/merge-state-reader.js";
@@ -46,6 +47,10 @@ export interface GitCheckoutFilesApi
    * Write content to a file
    */
   write(path: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>): Promise<void>;
+  /** What is at a path, a final symbolic link not followed (PosixFilesApi's `lstat`). */
+  lstat?(path: string): Promise<{ kind: "file" | "directory" | "symlink" | "other" } | undefined>;
+  /** A symbolic link's target (PosixFilesApi's `readlink`). */
+  readlink?(path: string): Promise<Uint8Array | undefined>;
   /**
    * Create directory
    */
@@ -377,12 +382,55 @@ export class GitCheckout implements Checkout {
 
   // ========== Operation state files ==========
 
+  /**
+   * The path of `name` in the git directory; a name climbing out of it (`..`) normalised,
+   * undefined when it climbs above the root of the files.
+   */
+  private statePath(name: string): string | undefined {
+    if (!name.split("/").includes("..")) return `${this.gitDir}/${name}`;
+    const parts: string[] = [];
+    for (const part of `${this.gitDir}/${name}`.split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part !== "..") parts.push(part);
+      else if (parts.length > 0) parts.pop();
+      else return undefined;
+    }
+    return parts.join("/");
+  }
+
   /** A file under the git directory (`MERGE_MSG`, `sequencer/todo`, ...). */
   async readStateFile(name: string): Promise<Uint8Array | undefined> {
+    const path = this.statePath(name);
+    if (path === undefined) return undefined;
     try {
-      const stats = await this.files.stats(`${this.gitDir}/${name}`);
+      const stats = await this.files.stats(path);
       if (stats?.isDirectory) return undefined;
-      return (await this.files.read(`${this.gitDir}/${name}`)) ?? undefined;
+      return (await this.files.read(path)) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * What is at `name` in the git directory, a final symbolic link not followed: through
+   * the files' `lstat`/`readlink` where they have them (a PosixFilesApi), else as `stats`
+   * sees it.
+   */
+  async lstatStateFile(name: string): Promise<StateFileStat | undefined> {
+    const path = this.statePath(name);
+    if (path === undefined) return undefined;
+    const files = this.files;
+    try {
+      if (files.lstat) {
+        const stats = await files.lstat(path);
+        if (!stats) return undefined;
+        if (stats.kind !== "symlink") return { kind: stats.kind };
+        const target = await files.readlink?.(path);
+        return { kind: "symlink", ...(target ? { target: decodeGitPath(target) } : {}) };
+      }
+      const stats = await files.stats(path);
+      if (!stats) return undefined;
+      return { kind: stats.isDirectory ? "directory" : "file" };
     } catch {
       return undefined;
     }

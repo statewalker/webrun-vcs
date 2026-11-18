@@ -93,10 +93,36 @@ export abstract class NotesSubcommand<T> extends GitCommand<T> {
     return this.notesContext();
   }
 
+  /**
+   * git's warnings printed before what the subcommand prints to its standard error (the
+   * `ignoring dangling symref` of init_notes's repo_get_oid of the notes ref).
+   */
+  protected warnings: string[] = [];
+
+  /** The subcommand itself; {@link call} adds the {@link warnings} to what it printed. */
+  protected abstract execute(): Promise<T>;
+
+  async call(): Promise<T> {
+    this.checkCallable();
+    this.setCallable(false);
+    const prefix = () => this.warnings.map((w) => `warning: ${w}\n`).join("");
+    try {
+      const result = await this.execute();
+      if (this.warnings.length > 0 && typeof result === "object" && result !== null) {
+        const r = result as unknown as NotesResult;
+        r.errors = `${prefix()}${r.errors}`;
+      }
+      return result;
+    } catch (error) {
+      if (error instanceof NotesError) error.errors = `${prefix()}${error.errors}`;
+      throw error;
+    }
+  }
+
   /** builtin/notes.c's init_notes_check: the notes tree, refused outside of refs/notes/. */
   protected async initCheck(subcommand: string, writable: boolean): Promise<NotesHandle> {
     const ref = this.notesRef();
-    const t = await initNotes(this.ctx, ref, { writable });
+    const t = await initNotes(this.ctx, ref, { writable, warnings: this.warnings });
     if (!ref.startsWith("refs/notes/")) {
       throw new NotesError(`refusing to ${subcommand} notes in ${ref} (outside of refs/notes/)`);
     }
@@ -141,9 +167,7 @@ export class NotesListCommand extends NotesSubcommand<NotesListResult> {
     return this;
   }
 
-  async call(): Promise<NotesListResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesListResult> {
     const t = await this.initCheck("list", false);
     if (this.object !== undefined) {
       const object = await this.resolveObject(this.object);
@@ -351,12 +375,13 @@ abstract class NotesMessageCommand<T> extends NotesSubcommand<T> {
     text += `\n${comment}\n${comment} ${NOTE_TEMPLATE}\n${comment}\n`;
     // write_commented_object: `git show --stat --no-notes <object>`, commented
     const shown = await this.showObject(object);
-    if (shown === undefined) {
+    if (shown === undefined || "error" in shown) {
       const error = new NotesError(`failed to finish 'show' for object '${object}'`);
-      error.errors = `${errors.join("")}fatal: bad object ${object}\n`;
+      const why = shown ? `error: ${shown.error}\n` : `fatal: bad object ${object}\n`;
+      error.errors = `${errors.join("")}${why}`;
       throw error;
     }
-    text += commentedLines(decodeGitPath(shown), comment);
+    text += commentedLines(decodeGitPath(shown.bytes), comment);
     let edited: string;
     try {
       edited = this.editor ? await this.editor(text) : text;
@@ -371,75 +396,91 @@ abstract class NotesMessageCommand<T> extends NotesSubcommand<T> {
    * What `git show --stat --no-notes <id>` prints to a pipe (builtin/log.c's cmd_show): a
    * commit as `git log` shows it (with its `--stat`, a merge's against its first parent), a
    * tag's header (`tag <name>`, `Tagger:`/`Date:`) and message and then the object it tags,
-   * a tree's `tree <id>` and its names (directories with a `/`), a blob's content.
-   * Undefined when there is no such object (git's `fatal: bad object <id>`).
+   * a tree's `tree <name>` (the name given to show: `id`, also for a tree reached through
+   * tags) and its names (directories with a `/`), a blob's content. Whatever follows a tag
+   * starts with a newline (`rev.shown_one`), except a blob. Undefined when there is no such
+   * object (git's `fatal: bad object <id>`); `error` when a tag's target cannot be read (git's
+   * `error: could not read object <target>`, show failing).
    */
-  protected async showObject(id: ObjectId, depth = 0): Promise<Uint8Array | undefined> {
-    const objects = this.workingCopy.history?.objects;
-    const obj = await objects?.get(id).catch(() => undefined);
-    let type = obj?.type;
-    let bytes: Uint8Array | undefined;
-    if (obj) {
-      if (obj.bytes) {
-        bytes = obj.bytes;
-        await obj.content[Symbol.asyncIterator]().return?.();
-      } else {
-        const chunks: Uint8Array[] = [];
-        for await (const c of obj.content) chunks.push(c);
-        bytes = concat(chunks);
-      }
-    } else if (!objects) {
-      // typed stores without the object kernel
-      if (await this.commits.has(id).catch(() => false)) type = "commit";
-      else if (await this.trees.has(id).catch(() => false)) type = "tree";
-      else if (await this.blobs.has(id).catch(() => false)) {
-        type = "blob";
-        bytes = await readNoteBytes(this.blobs, id);
+  protected async showObject(
+    id: ObjectId,
+  ): Promise<{ bytes: Uint8Array } | { error: string } | undefined> {
+    const resolver = this.revisionResolver();
+    let type = await resolver.objectType(id);
+    if (type === undefined) return undefined;
+    const parts: Uint8Array[] = [];
+    const done = () => ({ bytes: concat(parts) });
+    let current = id;
+    let shownOne = false;
+    const separator = () => {
+      if (shownOne) parts.push(encodeGitPath("\n"));
+    };
+    for (let depth = 0; depth < 64; depth++) {
+      switch (type) {
+        case "blob":
+          parts.push((await readNoteBytes(this.blobs, current)) ?? new Uint8Array());
+          return done();
+        case "tree": {
+          separator();
+          let out = `tree ${id}\n\n`;
+          for await (const e of this.trees.loadTree(current)) {
+            out += `${e.name}${(e.mode & 0o170000) === 0o040000 ? "/" : ""}\n`;
+          }
+          parts.push(encodeGitPath(out));
+          return done();
+        }
+        case "commit":
+          // log_tree_commit's separator: a commit shown after a tag starts a new entry
+          separator();
+          parts.push(
+            await new LogCommand(this.workingCopy)
+              .add(current)
+              .setMaxCount(1)
+              .callBytes({ stat: true, notes: false, diffMerges: "dense-combined" }),
+          );
+          return done();
+        case "tag": {
+          const raw = await this.readTagText(current);
+          if (raw === undefined) return { error: `could not read object ${current}` };
+          separator();
+          let name = "";
+          let target = "";
+          let header = "";
+          let offset = 0;
+          while (offset < raw.length && raw[offset] !== "\n") {
+            let end = raw.indexOf("\n", offset);
+            end = end < 0 ? raw.length : end + 1;
+            const line = raw.slice(offset, end).replace(/\n$/, "");
+            if (line.startsWith("object ")) target = line.slice(7);
+            else if (line.startsWith("tag ")) name = line.slice(4);
+            else if (line.startsWith("tagger ")) header += this.tagger(line.slice(7));
+            offset = end;
+          }
+          parts.push(encodeGitPath(`tag ${name}\n${header}${raw.slice(offset)}`));
+          shownOne = true;
+          type = await resolver.objectType(target);
+          if (type === undefined) return { error: `could not read object ${target}` };
+          current = target;
+          break;
+        }
+        default:
+          return undefined;
       }
     }
-    switch (type) {
-      case "commit":
-        return new LogCommand(this.workingCopy)
-          .add(id)
-          .setMaxCount(1)
-          .callBytes({ stat: true, notes: false, diffMerges: "dense-combined" });
-      case "blob":
-        return bytes ?? new Uint8Array();
-      case "tree": {
-        let out = `tree ${id}\n\n`;
-        for await (const e of this.trees.loadTree(id)) {
-          out += `${e.name}${(e.mode & 0o170000) === 0o040000 ? "/" : ""}\n`;
-        }
-        return encodeGitPath(out);
-      }
-      case "tag": {
-        if (!bytes || depth > 32) return undefined;
-        const raw = decodeGitPath(bytes);
-        let name = "";
-        let target = "";
-        let header = "";
-        let offset = 0;
-        while (offset < raw.length && raw[offset] !== "\n") {
-          let end = raw.indexOf("\n", offset);
-          end = end < 0 ? raw.length : end + 1;
-          const line = raw.slice(offset, end).replace(/\n$/, "");
-          if (line.startsWith("object ")) target = line.slice(7);
-          else if (line.startsWith("tag ")) name = line.slice(4);
-          else if (line.startsWith("tagger ")) header += this.tagger(line.slice(7));
-          offset = end;
-        }
-        const head = encodeGitPath(`tag ${name}\n${header}${raw.slice(offset)}`);
-        const rest = await this.showObject(target, depth + 1);
-        if (rest === undefined) return undefined;
-        // log_tree_commit's separator: a commit shown after the tag starts a new entry
-        const sep = (await this.commits.has(target).catch(() => false))
-          ? encodeGitPath("\n")
-          : new Uint8Array();
-        return concat([head, sep, rest]);
-      }
-      default:
-        return undefined;
+    return undefined;
+  }
+
+  /** The content of a tag object as stored, undefined when it cannot be read. */
+  private async readTagText(id: ObjectId): Promise<string | undefined> {
+    const obj = await this.workingCopy.history?.objects?.get(id).catch(() => undefined);
+    if (obj?.type !== "tag") return undefined;
+    if (obj.bytes) {
+      await obj.content[Symbol.asyncIterator]().return?.();
+      return decodeGitPath(obj.bytes);
     }
+    const chunks: Uint8Array[] = [];
+    for await (const c of obj.content) chunks.push(c);
+    return decodeGitPath(concat(chunks));
   }
 
   /** builtin/log.c's show_tagger: `Tagger:` and `Date:` lines as `git show` prints them. */
@@ -525,9 +566,7 @@ export class NotesAddCommand extends NotesMessageCommand<NotesResult> {
     return this;
   }
 
-  async call(): Promise<NotesResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesResult> {
     const errors: string[] = [];
     const d = await this.noteData();
     const objectRef = this.object ?? "HEAD";
@@ -579,9 +618,7 @@ export class NotesAddCommand extends NotesMessageCommand<NotesResult> {
  * object's note (after the separator, a blank line by default), or its note when it has none.
  */
 export class NotesAppendCommand extends NotesMessageCommand<NotesResult> {
-  async call(): Promise<NotesResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesResult> {
     return this.appendEdit(false, await this.noteData(), []);
   }
 }
@@ -591,9 +628,7 @@ export class NotesAppendCommand extends NotesMessageCommand<NotesResult> {
  * result removes it.
  */
 export class NotesEditCommand extends NotesMessageCommand<NotesResult> {
-  async call(): Promise<NotesResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesResult> {
     return this.appendEdit(true, await this.noteData(), []);
   }
 }
@@ -644,9 +679,7 @@ export class NotesCopyCommand extends NotesSubcommand<NotesResult> {
     return this;
   }
 
-  async call(): Promise<NotesResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesResult> {
     if (this.stdin !== undefined || this.forRewrite !== undefined) return this.fromStdin();
     if (this.from === undefined) throw new NotesError("too few arguments");
     const errors: string[] = [];
@@ -689,7 +722,9 @@ export class NotesCopyCommand extends NotesSubcommand<NotesResult> {
     if (this.forRewrite !== undefined && !rewrite) {
       return { exitCode: 0, output: "", errors: errors.map((e) => `${e}\n`).join("") };
     }
-    const t = rewrite ? undefined : await initNotes(ctx, this.notesRef(), { writable: true });
+    const t = rewrite
+      ? undefined
+      : await initNotes(ctx, this.notesRef(), { writable: true, warnings: this.warnings });
     const lines = (this.stdin ?? "").split("\n");
     if (lines[lines.length - 1] === "") lines.pop();
     const out = errors.map((e) => `${e}\n`);
@@ -731,9 +766,7 @@ export class NotesShowCommand extends NotesSubcommand<NotesShowResult> {
     return this;
   }
 
-  async call(): Promise<NotesShowResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesShowResult> {
     const object = await this.resolveObject(this.object ?? "HEAD");
     const t = await this.initCheck("show", false);
     const note = await t.tree.get(object);
@@ -775,9 +808,7 @@ export class NotesRemoveCommand extends NotesSubcommand<NotesResult> {
     return this;
   }
 
-  async call(): Promise<NotesResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesResult> {
     const t = await this.initCheck("remove", true);
     const errors: string[] = [];
     let retval = 0;
@@ -828,10 +859,9 @@ export class NotesPruneCommand extends NotesSubcommand<NotesPruneResult> {
     return this;
   }
 
-  async call(): Promise<NotesPruneResult> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<NotesPruneResult> {
     const t = await this.initCheck("prune", true);
+    await this.refuseAlternates();
     const missing = await t.tree.unreachableObjects((id) => this.objectExists(id));
     let output = "";
     for (const id of missing) {
@@ -840,6 +870,34 @@ export class NotesPruneCommand extends NotesSubcommand<NotesPruneResult> {
     }
     if (!this.dryRun) await commitNotes(this.ctx, t, "Notes removed by 'git notes prune'");
     return { exitCode: 0, output, errors: "", pruned: missing };
+  }
+
+  /**
+   * Refuses, as gc, repack and prune refuse (vcs-store-files' assertNoAlternates), a
+   * repository that borrows objects through `objects/info/alternates`: the objects only an
+   * alternate holds are not read, so their notes would look like notes of missing objects
+   * and be pruned. The file is looked for in the common directory (a linked worktree's
+   * `commondir` followed).
+   */
+  private async refuseAlternates(): Promise<void> {
+    const checkout = this.workingCopy.checkout;
+    if (!checkout.readStateFile) return;
+    const link = await checkout.readStateFile("commondir").catch(() => undefined);
+    const commondir = link ? decodeGitPath(link).trim() : "";
+    const base = commondir === "" || commondir.startsWith("/") ? "" : `${commondir}/`;
+    const bytes = await checkout
+      .readStateFile(`${base}objects/info/alternates`)
+      .catch(() => undefined);
+    if (!bytes) return;
+    const used = decodeGitPath(bytes)
+      .split("\n")
+      .some((line) => line.trim() !== "" && !line.startsWith("#"));
+    if (used) {
+      throw new NotesError(
+        "cannot prune notes in a repository with alternates (objects/info/alternates): " +
+          "the objects it borrows are not read",
+      );
+    }
   }
 
   /** odb_has_object: one typeless lookup where the store has its object kernel. */
@@ -855,9 +913,7 @@ export class NotesPruneCommand extends NotesSubcommand<NotesPruneResult> {
 
 /** `git notes get-ref`: the notes ref used. */
 export class NotesGetRefCommand extends NotesSubcommand<string> {
-  async call(): Promise<string> {
-    this.checkCallable();
-    this.setCallable(false);
+  protected async execute(): Promise<string> {
     return this.notesRef();
   }
 }

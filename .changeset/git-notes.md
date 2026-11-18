@@ -2,6 +2,7 @@
 "@statewalker/vcs-commands": minor
 "@statewalker/vcs-working-tree": minor
 "@statewalker/vcs-utils-node": minor
+"@statewalker/vcs-store-files": minor
 ---
 
 **`git notes` as git does it, and notes carried over by `commit --amend` and `rebase`.**
@@ -10,3 +11,4 @@
 - **Notes rewriting:** `commit --amend` (unless `setNoPostRewrite(true)`) and the sequencer's amends copy the amended commit's notes to the new one, and a finished `rebase` copies the notes along `rewritten-list` (`git notes copy --for-rewrite=rebase`), in the refs of `notes.rewriteRef` (no default: nothing is copied) or `GIT_NOTES_REWRITE_REF`, combined as `notes.rewriteMode` / `GIT_NOTES_REWRITE_MODE` say (`concatenate` by default, `overwrite`, `cat_sort_uniq`, `ignore`), unless `notes.rewrite.<amend|rebase>` is false.
 - **`git log` notes:** read through `NotesTree` (any fanout); the display refs are git's: the default notes ref, then `GIT_NOTES_DISPLAY_REF` or `notes.displayRef` (globs expanded; a plain name is taken as it is, as git takes it), and `LogOutputOptions.notesRefs` for `--notes=<ref>` (alone, only those refs; with `notes: true`, after the default ones).
 - **vcs-working-tree / vcs-utils-node:** `GitHostEnvironment` carries `notesRef`, `notesDisplayRef`, `notesRewriteRef` and `notesRewriteMode`, which `createNodeGitHostEnvironment` reads from `GIT_NOTES_REF`, `GIT_NOTES_DISPLAY_REF`, `GIT_NOTES_REWRITE_REF` and `GIT_NOTES_REWRITE_MODE`.
+- **vcs-working-tree / vcs-store-files:** `Checkout.lstatStateFile(name)` (optional) tells what is at a path of git's directory without following a final symbolic link, with a link's target (the files checkout through its PosixFilesApi `lstat`/`readlink`; state names may climb out of the directory with `..`), so `notes merge --commit` follows links in a linked worktree's own git directory; `LinkedWorktrees.refsOf(entry)` (optional) reads a worktree's refs (its HEAD and pseudo refs) from its administrative directory alone, for git's `find_shared_symref` across worktrees.
