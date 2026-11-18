@@ -5,7 +5,7 @@
  *
  * @example
  * ```typescript
- * const files = { prefix: "", exists: (p) => worktree.exists(p), inWorktree: true };
+ * const files = { prefix: "", exists: (p) => lstatExists(lookup, p), inWorktree: true };
  * // a revision that is also a file: git's "both revision and filename"
  * const message = await verifyNonFilename(files, "a.txt");
  * if (message) throw new RevisionError("a.txt", message);
@@ -28,8 +28,80 @@ export interface ArgumentFiles {
   readonly inWorktree: boolean;
   /** The current directory below the top (`sub/` or ""), git's `prefix` */
   readonly prefix: string;
-  /** Whether something is at `path` (from the top), as git's `lstat` finds it */
+  /**
+   * Whether git's `lstat` of `path`, read from the top as written (`..`, `.`, a trailing
+   * slash and all), finds something: see {@link lstatExists}
+   */
   exists(path: string): Promise<boolean>;
+}
+
+/** The entries of a worktree as {@link lstatExists} reads them, links not followed. */
+export interface WorktreeLookup {
+  /** What is at `path` (from the top, no `.` or `..`, no link among its parents), or undefined */
+  kind(path: string): Promise<"file" | "directory" | "symlink" | undefined>;
+  /** The target of the link at `path` */
+  readlink(path: string): Promise<string | undefined>;
+  /** The top of the worktree as the host names it (`/home/u/repo`), when there is one */
+  readonly hostPath?: string;
+}
+
+/** The kernel's limit on links followed in one lookup (`ELOOP`). */
+const MAX_LINKS = 40;
+
+/**
+ * Whether `lstat(path)` succeeds with the current directory at the top of the worktree, as
+ * the kernel resolves the path: each component but the last must be a directory (a link is
+ * followed to its target, relative to the directory holding it), `..` steps up from where
+ * the components led (out of a linked directory, out of the worktree and back in through
+ * its own name), a trailing slash asks for a directory (following a last link); the last
+ * component is not followed. Outside the worktree only the directories above it are known;
+ * any other path there reads as absent (git would look on disk).
+ *
+ * @example
+ * ```typescript
+ * await lstatExists(lookup, "a.txt/"); // false: a file is no directory
+ * await lstatExists(lookup, "lnk/c.txt"); // true when lnk links to a directory holding c.txt
+ * ```
+ */
+export async function lstatExists(lookup: WorktreeLookup, path: string): Promise<boolean> {
+  // the worktree's top as host path components; without one a name no path can spell
+  const top = lookup.hostPath?.split("/").filter((p) => p !== "") ?? ["\0worktree"];
+  const queue = path.split("/").filter((p) => p !== "");
+  if (queue.length === 0 && !path.startsWith("/")) return false;
+  // a trailing slash: the path must name a directory, through a last link too
+  if (path.endsWith("/")) queue.push(".");
+  let at = path.startsWith("/") ? [] : [...top];
+  let links = 0;
+  const inside = (abs: string[]) =>
+    abs.length >= top.length && top.every((part, i) => abs[i] === part);
+  const above = (abs: string[]) =>
+    abs.length < top.length && abs.every((part, i) => top[i] === part);
+  while (queue.length > 0) {
+    const part = queue.shift() as string;
+    if (part === ".") continue;
+    if (part === "..") {
+      at.pop();
+      continue;
+    }
+    const next = [...at, part];
+    let kind: "file" | "directory" | "symlink" | undefined;
+    if (inside(next)) kind = await lookup.kind(next.slice(top.length).join("/"));
+    else if (above(next)) kind = "directory";
+    else return false;
+    if (kind === undefined) return false;
+    if (queue.length === 0) return true;
+    if (kind === "file") return false;
+    if (kind === "symlink") {
+      if (++links > MAX_LINKS) return false;
+      const target = await lookup.readlink(next.slice(top.length).join("/"));
+      if (!target) return false;
+      queue.unshift(...target.split("/").filter((p) => p !== ""));
+      if (target.startsWith("/")) at = [];
+      continue;
+    }
+    at = next;
+  }
+  return true;
 }
 
 const isGlobSpecial = (c: string) => c === "*" || c === "?" || c === "[" || c === "\\";
@@ -53,8 +125,8 @@ export function looksLikePathspec(arg: string): boolean {
 
 /**
  * git's `check_filename`: whether `arg` names something in the worktree, read against the
- * prefix (`:/x` from the top, `:/` the top itself; `:!x` and `:^x` as `x`). A path that
- * climbs out of the worktree exists only as the worktree's parents themselves (`..`).
+ * prefix (`:/x` from the top, `:/` the top itself; `:!x` and `:^x` as `x`), looked up as
+ * git's `lstat` looks it up (see {@link lstatExists}).
  */
 export async function checkFilename(files: ArgumentFiles, arg: string): Promise<boolean> {
   let path = arg;
@@ -67,20 +139,7 @@ export async function checkFilename(files: ArgumentFiles, arg: string): Promise<
     path = path.slice(2);
     if (path === "") return true;
   }
-  const parts: string[] = [];
-  let above = 0;
-  for (const part of `${prefix}${path}`.split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") {
-      if (parts.length > 0) parts.pop();
-      else above++;
-      continue;
-    }
-    if (above > 0) return false;
-    parts.push(part);
-  }
-  if (above > 0) return true;
-  return files.exists(parts.join("/"));
+  return files.exists(path.startsWith("/") ? path : `${prefix}${path}`);
 }
 
 /**

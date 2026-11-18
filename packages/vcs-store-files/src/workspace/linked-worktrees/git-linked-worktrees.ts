@@ -857,10 +857,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       worktree,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
-      coreAbbrev: () => {
-        const value = config?.get("core.abbrev");
-        return typeof value === "string" ? value : undefined;
-      },
+      coreAbbrev: () => config?.get("core.abbrev"),
     });
     const configOptions: GitConfigOptions = {
       ...(this.options.environment ? { environment: this.options.environment } : {}),

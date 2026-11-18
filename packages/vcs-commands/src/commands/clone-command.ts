@@ -20,6 +20,7 @@ import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { reflogMessages } from "./reflog-messages.js";
+import { isValidRemoteName } from "./remote-command.js";
 import { checkoutFreshTree } from "./tree-restore.js";
 
 /** Names the clone's checkout in failure messages. */
@@ -380,6 +381,13 @@ export class CloneCommand extends TransportCommand<CloneResult> {
 
     if (!this.uri) {
       throw new InvalidRemoteError("", "URI must be specified for clone");
+    }
+    if (!isValidRemoteName(this.remoteName)) {
+      throw new InvalidArgumentError(
+        "remote",
+        this.remoteName,
+        `'${this.remoteName}' is not a valid remote name`,
+      );
     }
 
     // Determine clone branch strategy

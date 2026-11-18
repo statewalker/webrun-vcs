@@ -182,7 +182,7 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       worktree: worktree,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
-      coreAbbrev: () => configString(config, "core.abbrev"),
+      coreAbbrev: () => config.get("core.abbrev"),
     });
 
     // 6. The repository's worktrees, when the context gives its FilesApi
@@ -404,7 +404,7 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       worktree: worktree,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
-      coreAbbrev: () => configString(config, "core.abbrev"),
+      coreAbbrev: () => config.get("core.abbrev"),
     });
 
     return new GitWorkingCopy({
@@ -435,10 +435,4 @@ export function createGitWorkingCopyFactory(
   setup: GitWorkingCopyFactorySetup = {},
 ): WorkingCopyFactory {
   return new GitWorkingCopyFactory(files, createContext, setup);
-}
-
-/** A configuration value as a string (a key without `=` reads as unset). */
-function configString(config: { get(key: string): unknown }, key: string): string | undefined {
-  const value = config.get(key);
-  return typeof value === "string" ? value : undefined;
 }

@@ -37,7 +37,11 @@ import {
   withoutCrud,
 } from "./commands/git-ident.js";
 import { reflogLine } from "./commands/reflog-messages.js";
-import type { ArgumentFiles } from "./commands/revision-filenames.js";
+import {
+  type ArgumentFiles,
+  lstatExists,
+  type WorktreeLookup,
+} from "./commands/revision-filenames.js";
 import { type ResolveOptions, RevisionResolver } from "./commands/revision-resolver.js";
 
 import {
@@ -396,36 +400,33 @@ export abstract class GitCommand<T> {
   abstract call(): Promise<T>;
 
   /**
-   * Verify the command hasn't been called yet.
+   * Verify the command hasn't been called yet, and that the configuration loads as git
+   * loads it (see {@link checkConfigOnLoad}). Every `call()` starts here, before it reads or
+   * writes anything, so a command git would refuse to start changes nothing.
    * @throws Error if command was already executed
+   * @throws InvalidConfigError if git would die loading the configuration
    */
   protected checkCallable(): void {
     if (!this.callable) {
       throw new Error(`Command ${this.constructor.name} has already been called`);
     }
+    this.checkConfigOnLoad();
   }
 
-  /**
-   * Mark command as no longer callable. Commands do this as they start, so this is where
-   * the configuration is checked as git checks it on loading it (see
-   * {@link checkConfigOnLoad}).
-   */
+  /** Mark command as no longer callable (or callable again). */
   protected setCallable(value: boolean): void {
     this.callable = value;
-    if (!value) this.checkConfigOnLoad();
   }
-
-  private configChecked = false;
 
   /**
    * What every git command dies on before it runs, `status` included: configuration git's
    * `git_default_config` refuses (an unknown `core.disambiguate`, see {@link configLoadError}).
+   * Checked each time, so a setter run before the configuration changed does not excuse
+   * the `call()` after it.
    *
    * @throws InvalidConfigError with git's `error:` and `fatal:` lines
    */
   protected checkConfigOnLoad(): void {
-    if (this.configChecked) return;
-    this.configChecked = true;
     const failure = configLoadError(this._workingCopy);
     if (failure) throw new InvalidConfigError(failure.key, failure.message);
   }
@@ -503,10 +504,30 @@ export abstract class GitCommand<T> {
     }
     if (!worktree) return {};
     const host = (worktree as { hostPath?: string }).hostPath;
+    const wt = worktree;
+    const lookup: WorktreeLookup = {
+      kind: async (path) => {
+        const entry = await wt.getEntry(path).catch(() => undefined);
+        if (!entry) return undefined;
+        if ((entry.mode & 0o170000) === 0o120000) return "symlink";
+        return entry.isDirectory ? "directory" : "file";
+      },
+      readlink: async (path) => {
+        try {
+          const chunks: Uint8Array[] = [];
+          for await (const chunk of wt.readContent(path)) chunks.push(chunk);
+          return new TextDecoder().decode(concatBytes(chunks));
+        } catch {
+          return undefined;
+        }
+      },
+      ...(host !== undefined ? { hostPath: host } : {}),
+    };
     return {
+      // git's lstat of the path as written, from the top (links among its parents followed)
       fileExists: async (path) => {
         try {
-          return await worktree.exists(path);
+          return await lstatExists(lookup, path);
         } catch {
           return false;
         }
@@ -626,4 +647,16 @@ export abstract class GitCommand<T> {
   protected async getRef(refName: string): Promise<Ref | SymbolicRef | undefined> {
     return this.refsStore.get(refName);
   }
+}
+
+/** `chunks` as one array. */
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
 }

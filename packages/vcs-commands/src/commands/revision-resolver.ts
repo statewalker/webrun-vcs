@@ -1186,10 +1186,8 @@ export class RevisionResolver {
    */
   private async onDisk(path: string): Promise<boolean> {
     const exists = this.sources.fileExists;
-    if (!exists) return false;
-    const normalized = normalizePath(path);
-    if (normalized === undefined) return false;
-    return exists(normalized.replace(/\/$/, ""));
+    // git's file_exists: lstat of the path as written (`a.txt/` is no file)
+    return exists ? exists(path) : false;
   }
 
   /** git's `diagnose_invalid_oid_path`: `<objectName>:<filename>` named nothing. */

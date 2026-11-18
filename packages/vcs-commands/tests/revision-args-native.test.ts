@@ -6,7 +6,7 @@
  * compared, from the top and from a subdirectory.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -97,6 +97,17 @@ async function expectSameLog(cases: string[][]): Promise<void> {
       ours = { status: 128, out: "", err: `${(error as Error).message}\n` };
     }
     expect([args, ours]).toEqual([args, { status: n.status, out: n.stdout, err: n.stderr }]);
+  }
+}
+
+/** What ours throws for `git log <arg>`, if anything. */
+async function revisionOrPathError(arg: string): Promise<string | undefined> {
+  try {
+    const command = (await open()).revList().addArgument(arg);
+    for await (const _ of await command.call());
+    return undefined;
+  } catch (error) {
+    return (error as Error).message;
   }
 }
 
@@ -191,5 +202,50 @@ describeGit("revision or path: git's verify_filename and its diagnoses", () => {
       ["main^@"],
       ["*.txt"],
     ]);
+  });
+
+  it("paths looked up as git's lstat: trailing slashes, '..', links to directories", async () => {
+    symlinkSync("d/e", join(repo, "lnk"));
+    symlinkSync("a.txt", join(repo, "flnk"));
+    try {
+      const cases = [
+        ["a.txt/"],
+        ["d/"],
+        ["d/e/"],
+        ["nope/../a.txt"],
+        ["d/../a.txt"],
+        ["lnk/c.txt"],
+        ["lnk/"],
+        ["lnk"],
+        ["lnk/../a.txt"],
+        ["lnk/../e/c.txt"],
+        ["flnk"],
+        ["flnk/"],
+        ["../r/a.txt"],
+        ["../r/nope"],
+        ["../nothere"],
+        [".."],
+        ["./a.txt"],
+        [`${repo}/a.txt`],
+        ["HEAD:a.txt/"],
+        ["HEAD:u.txt/"],
+        ["main", "a.txt/"],
+      ];
+      await expectSameRevParse(cases);
+      await expectSameRevParse([["../../lnk/c.txt"], ["../c.txt/"], ["c.txt/"]], "d/e");
+      // paths that leave the worktree (and come back, or are absolute) pass verify_filename;
+      // git's pathspec then reads them on its own terms, not compared here
+      const escaping = (arg: string) => arg.startsWith("..") || arg.startsWith("/");
+      await expectSameLog(cases.filter(([arg]) => !escaping(arg)));
+      for (const [arg] of cases.filter(([a]) => escaping(a))) {
+        const n = spawnSync("git", ["log", arg], { cwd: repo, env: nativeGitEnv(home) });
+        const message = (await revisionOrPathError(arg)) ?? "";
+        const refused = /ambiguous argument|no such path/;
+        expect([arg, refused.test(message)]).toEqual([arg, refused.test(String(n.stderr))]);
+      }
+    } finally {
+      unlinkSync(join(repo, "lnk"));
+      unlinkSync(join(repo, "flnk"));
+    }
   });
 });

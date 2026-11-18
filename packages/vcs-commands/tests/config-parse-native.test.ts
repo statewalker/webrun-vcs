@@ -12,6 +12,7 @@ import {
   appendFileSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -30,7 +31,7 @@ import {
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { Git } from "../src/index.js";
+import { Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -67,6 +68,16 @@ function repoWith(extra: string): string {
   run(repo, "commit", "-qm", "c1");
   appendFileSync(join(repo, ".git", "config"), extra);
   return repo;
+}
+
+/** Every file under `dir` (`.git` included) with its content, for "nothing was written". */
+function snapshotTree(dir: string, base = dir, out: Record<string, string> = {}) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) snapshotTree(path, base, out);
+    else out[path.slice(base.length + 1)] = readFileSync(path, "latin1");
+  }
+  return out;
 }
 
 /** What our configuration lists, as `git config --local --list --show-origin -z` prints it. */
@@ -212,6 +223,106 @@ describeGit("config parsing as git's config.c", () => {
         message = `${(error as Error).message}\n`;
       }
       expect([args, message]).toEqual([args, n.stderr]);
+    }
+  });
+
+  it("a bad core.disambiguate stops writing commands before they write anything", async () => {
+    const repo = repoWith("");
+    run(repo, "checkout", "-qb", "feat");
+    writeFileSync(join(repo, "b.txt"), "b\n");
+    run(repo, "add", ".");
+    run(repo, "commit", "-qm", "c2");
+    run(repo, "checkout", "-q", "main");
+    writeFileSync(join(repo, "a.txt"), "dirty\n");
+    appendFileSync(join(repo, ".git", "config"), "[core]\n\tdisambiguate = foo\n");
+    const git = Git.fromWorkingCopy(await openCopy(repo));
+    const before = snapshotTree(repo);
+    for (const [args, call] of [
+      [["commit", "-qam", "m"], () => git.commit().setAll(true).setMessage("m").call()],
+      [["tag", "t1"], () => git.tag().setName("t1").call()],
+      [["merge", "feat"], () => git.merge().include("feat").call()],
+      [["rebase", "feat"], () => git.rebase().setUpstreamName("feat").call()],
+      [["cherry-pick", "feat"], () => git.cherryPick().include("feat").call()],
+      [["stash"], () => git.stashCreate().call()],
+      [["branch", "x"], () => git.branchCreate().setName("x").call()],
+      [
+        ["reset", "--hard", "feat"],
+        () => git.reset().setRef("feat").setMode(ResetMode.HARD).call(),
+      ],
+      [["checkout", "feat"], () => git.checkout().setName("feat").call()],
+    ] as const) {
+      const n = native(repo, ...args);
+      expect([args, n.status]).toEqual([args, 128]);
+      let message = "";
+      try {
+        await call();
+      } catch (error) {
+        message = `${(error as Error).message}\n`;
+      }
+      expect([args, message]).toEqual([args, n.stderr]);
+      expect([args, snapshotTree(repo)]).toEqual([args, before]);
+    }
+  });
+
+  it("\\v and \\f are no blanks, a NUL ends a value, a variable before any section", async () => {
+    const repo = repoWith("");
+    const config = join(repo, ".git", "config");
+    const original = readFileSync(config, "latin1");
+    for (const text of [
+      // a value keeps \v and \f at its ends; a line starting with one is refused
+      `${original}[t]\n\tx = a\vb\f\n\ty = \f\n`,
+      `${original}\v[t]\n`,
+      `${original}[t]\n\v\tx = 1\n`,
+      `${original}[t\f]\n`,
+      // git reads a value as a C string: it ends at the NUL
+      `${original}[t]\n\tv = a\0b\n\tw = x\n\tq = "c\0d"\n`,
+      // listed under its bare name, out of reach of any key with a section
+      `top = 1\ncont = a \\\nb\n${original}`,
+    ]) {
+      writeFileSync(config, text, "latin1");
+      const n = native(repo, "config", "--local", "--list", "--show-origin", "-z");
+      let ours = "";
+      let status = 0;
+      try {
+        ours = ourList(await openCopy(repo));
+      } catch (error) {
+        status = 128;
+        ours = `fatal: ${(error as Error).message}\n`;
+      }
+      const theirs = n.status === 0 ? n.stdout : n.stderr;
+      expect([JSON.stringify(text), status, ours]).toEqual([
+        JSON.stringify(text),
+        n.status,
+        theirs,
+      ]);
+    }
+    writeFileSync(config, `top = 1\n${original}`, "latin1");
+    const wc = await openCopy(repo);
+    expect((wc.config as unknown as GitWorkingCopyConfig).get("top")).toBeUndefined();
+    expect(native(repo, "config", "top").status).toBe(1);
+  });
+
+  it("core.abbrev written as a number or a boolean sets the stash store's ids", async () => {
+    for (const value of ["12", "false", "no", "auto"]) {
+      const repo = repoWith(`[core]\n\tabbrev = ${value}\n`);
+      writeFileSync(join(repo, "a.txt"), "dirty\n");
+      const short = run(repo, "rev-parse", "--short", "HEAD").trim();
+      // the working copy's own stash (GitStashStore.push), as the stash command's
+      const wc = await openCopy(repo);
+      await wc.stash.push();
+      const subjects = [
+        run(repo, "log", "-1", "--format=%s", "refs/stash"),
+        run(repo, "log", "-1", "--format=%s", "refs/stash^2"),
+        run(repo, "stash", "list"),
+      ];
+      expect([value, subjects]).toEqual([
+        value,
+        [
+          `WIP on main: ${short} c1\n`,
+          `index on main: ${short} c1\n`,
+          `stash@{0}: WIP on main: ${short} c1\n`,
+        ],
+      ]);
     }
   });
 });

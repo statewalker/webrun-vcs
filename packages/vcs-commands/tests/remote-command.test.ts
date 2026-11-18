@@ -94,6 +94,18 @@ describe.each(backends)("RemoteAddCommand ($name backend)", ({ factory }) => {
         "Remote URI must be specified",
       );
     });
+
+    it("refuses a name git's valid_remote_name refuses, writing nothing", async () => {
+      const workingCopy = await createTestWorkingCopy();
+      const git = Git.fromWorkingCopy(workingCopy);
+
+      for (const name of ["a b", "x\ny", "bad..name"]) {
+        await expect(git.remoteAdd().setName(name).setUri("https://h/r").call()).rejects.toThrow(
+          `'${name}' is not a valid remote name`,
+        );
+      }
+      expect(await git.remoteList().call()).toEqual([]);
+    });
   });
 
   describe("getters", () => {
