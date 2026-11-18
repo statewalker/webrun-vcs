@@ -77,3 +77,40 @@ describe("formatCommitPretty: git's bytes and spaces", () => {
     expect(await formatCommitPretty("%w(10,1,2)%b", commit, id)).toBe(" The body.\n");
   });
 });
+
+describe("formatCommitPretty: trailers, describe, source, count", () => {
+  const signed = {
+    ...commit,
+    message: "Subject\n\nBody.\n\nSigned-off-by: A <a@example.com>\nReviewed-by: B\n  folded\n",
+  };
+
+  it("expands %(trailers) with git's options", async () => {
+    expect(await formatCommitPretty("%(trailers)", signed, id)).toBe(
+      "Signed-off-by: A <a@example.com>\nReviewed-by: B\n  folded\n",
+    );
+    expect(
+      await formatCommitPretty("%(trailers:unfold,valueonly,separator=%x2C )", signed, id),
+    ).toBe("A <a@example.com>, B folded");
+    expect(await formatCommitPretty("%(trailers:key=reviewed-by:,keyonly)", signed, id)).toBe(
+      "Reviewed-by\n",
+    );
+    // an option git does not know: the placeholder kept as written
+    expect(await formatCommitPretty("%(trailers:nope)", signed, id)).toBe("%(trailers:nope)");
+  });
+
+  it("keeps %S and %(describe) without a source or describer; %(count) needs a walk", async () => {
+    expect(await formatCommitPretty("%S|%(describe)", commit, id)).toBe("%S|%(describe)");
+    expect(await formatCommitPretty("%S", commit, id, { source: "main" })).toBe("main");
+    const describe = async (_id: string, options: { tags?: boolean; abbrev?: number }) =>
+      `v1-2-g${options.tags ? "t" : ""}${options.abbrev ?? "a"}`;
+    expect(await formatCommitPretty("%(describe:tags,abbrev=2)", commit, id, { describe })).toBe(
+      "v1-2-gt4",
+    );
+    await expect(formatCommitPretty("%(count)", commit, id)).rejects.toThrow(
+      "%(count) is not supported by this command",
+    );
+    expect(
+      await formatCommitPretty("%(count)/%(total)", commit, id, { count: { nr: 3, total: 12 } }),
+    ).toBe("03/12");
+  });
+});

@@ -21,9 +21,11 @@
  * written, as git's sequencer keeps it), `%gd %gD %gs %gn %gN %ge %gE` (the reflog entry
  * given, else empty), colors (`%Cred`, `%C(...)`: written only with `color`, or `always,`),
  * padding (`%<(N)`, `%>(N)`, `%><(N)`, `%>>(N)`, the `|` column forms, `trunc`, `ltrunc`,
- * `mtrunc`), wrapping (`%w(width,indent1,indent2)`), and the `%+`, `%-` and `% ` magic. A
- * placeholder git does not know, or one this does not support (`%(trailers)`,
- * `%(describe)`, `%S`), is kept as written, as git keeps an unknown one.
+ * `mtrunc`), wrapping (`%w(width,indent1,indent2)`), the `%+`, `%-` and `% ` magic,
+ * `%(trailers[:options])` (trailer.c's block detection and formatting, with the
+ * {@link TrailerConfig} given), `%(describe[:options])` (with the describer given), `%S`
+ * (the source given) and git 2.5x's `%(count)`/`%(total)`. A placeholder git does not
+ * know is kept as written, as git keeps an unknown one.
  *
  * @module
  */
@@ -31,12 +33,14 @@
 import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { gitCharWidth } from "@statewalker/vcs-utils/encoding";
 import { formatRfc2822Date } from "./git-date.js";
+import type { DescribeOptions } from "./git-describe.js";
 import {
   createRefDecorationFilter,
   decorateFullRefs,
   type RefDecorationFilterOptions,
 } from "./ref-decoration-filter.js";
 import { formatGitDate } from "./sequencer-support.js";
+import { appendTrailers, type TrailerConfig, type TrailerFormatOptions } from "./trailers.js";
 
 /** What a format reads of the commit besides its fields. */
 export interface PrettyFormatOptions {
@@ -62,6 +66,28 @@ export interface PrettyFormatOptions {
   reflog?: { selector?: string; shortSelector?: string; message?: string; ident?: PersonIdent };
   /** Whether colors are written (git's want_color; default false, as without a terminal) */
   color?: boolean;
+  /**
+   * `%(trailers)`: the trailer configuration (`trailer.separators`, `trailer.<name>.key`,
+   * the comment prefix; see {@link trailerConfigOf}); default git's (`:`, `#`, no items)
+   */
+  trailers?: TrailerConfig;
+  /**
+   * `%(describe)`: git describe of a commit (see {@link createDescriber}); without, the
+   * placeholder is kept as written
+   */
+  describe?: (id: ObjectId, options: DescribeOptions) => Promise<string>;
+  /**
+   * `%S`: the name on the command line the commit was reached from (`git log --source`, or
+   * a `%S` in log's format); without, `%S` is kept as written, as git keeps it without a
+   * revision walk's sources
+   */
+  source?: string;
+  /**
+   * `%(count)` and `%(total)` (git 2.5x): the walk's number of this commit and the count
+   * (`git log` gives 0 and 0, `format-patch` the patch numbers); without, git's "not
+   * supported by this command"
+   */
+  count?: { nr: number; total: number };
 }
 
 /** One name a commit is decorated with (log-tree.c's name_decoration). */
@@ -817,6 +843,52 @@ function parsePadding(fmt: string, at: number, st: FormatState): number {
   return close - at + 1;
 }
 
+/**
+ * pretty.c's match_placeholder_arg_value: `<name>` or `<name>=<value>` at `at`, followed by
+ * `,` (taken) or `)` (left); the value runs to the next `,` or `)`.
+ */
+function matchArgValue(
+  fmt: string,
+  at: number,
+  name: string,
+): { value?: string; end: number } | undefined {
+  if (!fmt.startsWith(name, at)) return undefined;
+  let p = at + name.length;
+  let value: string | undefined;
+  if (fmt[p] === "=") {
+    let e = p + 1;
+    while (e < fmt.length && fmt[e] !== "," && fmt[e] !== ")") e++;
+    value = fmt.slice(p + 1, e);
+    p = e;
+  } else if (fmt[p] !== "," && fmt[p] !== ")") return undefined;
+  if (fmt[p] === ",") return { ...(value !== undefined ? { value } : {}), end: p + 1 };
+  if (fmt[p] === ")") return { ...(value !== undefined ? { value } : {}), end: p };
+  return undefined;
+}
+
+/** git_parse_maybe_bool: true/yes/on, false/no/off, "" (false), a number; else -1. */
+function parseMaybeBool(value: string): boolean | undefined {
+  const v = value.toLowerCase();
+  if (v === "true" || v === "yes" || v === "on") return true;
+  if (v === "false" || v === "no" || v === "off" || v === "") return false;
+  const n = /^([+-]?\d+)([kmg]?)$/.exec(v);
+  if (n) return Number(n[1]) !== 0;
+  return undefined;
+}
+
+/** pretty.c's match_placeholder_bool_arg: `<name>` (true) or `<name>=<bool>`. */
+function matchBoolArg(
+  fmt: string,
+  at: number,
+  name: string,
+): { value: boolean; end: number } | undefined {
+  const arg = matchArgValue(fmt, at, name);
+  if (!arg) return undefined;
+  if (arg.value === undefined) return { value: true, end: arg.end };
+  const value = parseMaybeBool(arg.value);
+  return value === undefined ? undefined : { value, end: arg.end };
+}
+
 /** The commit and what the format reads besides it. */
 interface FormatContext {
   commit: PrettyCommit;
@@ -1002,6 +1074,114 @@ async function formatOne(
     }
     if (fmt[i] !== ")") return 0;
     st.sb += formatDecorations(options.decorations, id, opts);
+    return i - at + 1;
+  }
+  if (fmt.startsWith("(describe", at)) {
+    let i = at + 9;
+    const describeOptions: { tags?: boolean; abbrev?: number; match: string[]; exclude: string[] } =
+      { match: [], exclude: [] };
+    if (fmt[i] === ":") {
+      i++;
+      // parse_describe_args: the options it knows, up to the first it does not
+      for (;;) {
+        const tagsArg = matchBoolArg(fmt, i, "tags");
+        if (tagsArg) {
+          describeOptions.tags = tagsArg.value;
+          i = tagsArg.end;
+          continue;
+        }
+        const abbrevArg = matchArgValue(fmt, i, "abbrev");
+        if (abbrevArg) {
+          if (abbrevArg.value === undefined || !/^[+-]?\d+$/.test(abbrevArg.value)) return 0;
+          let n = Number.parseInt(abbrevArg.value, 10);
+          // parse_opt_abbrev_cb: at least 4 (MINIMUM_ABBREV), at most the hash's length
+          if (n && n < 4) n = 4;
+          else if (n > 40) n = 40;
+          describeOptions.abbrev = n;
+          i = abbrevArg.end;
+          continue;
+        }
+        const listArg = matchArgValue(fmt, i, "exclude") ?? matchArgValue(fmt, i, "match");
+        if (listArg) {
+          if (!listArg.value) return 0;
+          (fmt.startsWith("exclude", i) ? describeOptions.exclude : describeOptions.match).push(
+            listArg.value,
+          );
+          i = listArg.end;
+          continue;
+        }
+        break;
+      }
+    }
+    if (fmt[i] !== ")" || !options.describe) return 0;
+    const out = await options.describe(id, {
+      ...(describeOptions.tags !== undefined ? { tags: describeOptions.tags } : {}),
+      ...(describeOptions.abbrev !== undefined ? { abbrev: describeOptions.abbrev } : {}),
+      ...(describeOptions.match.length ? { match: describeOptions.match } : {}),
+      ...(describeOptions.exclude.length ? { exclude: describeOptions.exclude } : {}),
+    });
+    st.sb += out.replace(/[ \t\n\r]+$/, "");
+    return i - at + 1;
+  }
+  if (fmt.startsWith("(count)", at) || fmt.startsWith("(total)", at)) {
+    const name = fmt.slice(at, at + 7);
+    if (!options.count)
+      throw new PrettyFormatError(`fatal: %${name} is not supported by this command`);
+    const { nr, total } = options.count;
+    st.sb +=
+      name === "(count)" ? String(nr).padStart(String(Math.abs(total)).length, "0") : String(total);
+    return 7;
+  }
+  if (c === "S") {
+    if (options.source === undefined || options.source === "") return 0;
+    st.sb += options.source;
+    return 1;
+  }
+  if (fmt.startsWith("(trailers", at)) {
+    let i = at + 9;
+    const trailerOptions: TrailerFormatOptions & { keys?: string[] } = {};
+    if (fmt[i] === ":") {
+      i++;
+      // format_set_trailers_options
+      for (;;) {
+        if (fmt[i] === ")") break;
+        const key = matchArgValue(fmt, i, "key");
+        if (key) {
+          if (key.value === undefined) return 0;
+          trailerOptions.keys = [...(trailerOptions.keys ?? []), key.value];
+          trailerOptions.onlyTrailers = true;
+          i = key.end;
+          continue;
+        }
+        const separator = matchArgValue(fmt, i, "separator");
+        if (separator) {
+          trailerOptions.separator = expandStringArg(separator.value ?? "");
+          i = separator.end;
+          continue;
+        }
+        const kvSeparator = matchArgValue(fmt, i, "key_value_separator");
+        if (kvSeparator) {
+          trailerOptions.keyValueSeparator = expandStringArg(kvSeparator.value ?? "");
+          i = kvSeparator.end;
+          continue;
+        }
+        const flag = (
+          [
+            ["only", "onlyTrailers"],
+            ["unfold", "unfold"],
+            ["keyonly", "keyOnly"],
+            ["valueonly", "valueOnly"],
+          ] as const
+        ).find(([name]) => matchBoolArg(fmt, i, name));
+        if (!flag) return 0;
+        const arg = matchBoolArg(fmt, i, flag[0]) as { value: boolean; end: number };
+        trailerOptions[flag[1]] = arg.value;
+        i = arg.end;
+      }
+    }
+    if (fmt[i] !== ")") return 0;
+    const start = skipBlankLines(commit.message, 0);
+    st.sb = appendTrailers(st.sb, commit.message.slice(start), trailerOptions, options.trailers);
     return i - at + 1;
   }
   switch (c) {

@@ -85,6 +85,15 @@ export enum RebaseAction {
 
   /** Comment line (ignored) */
   COMMENT = "comment",
+
+  /** `label <name>`: `refs/rewritten/<name>` set to HEAD (`--rebase-merges`) */
+  LABEL = "label",
+
+  /** `reset <label>`: HEAD and the worktree moved to a label (`--rebase-merges`) */
+  RESET = "reset",
+
+  /** `merge [-C <commit> | -c <commit>] <label> [# <oneline>]` (`--rebase-merges`) */
+  MERGE = "merge",
 }
 
 /**
