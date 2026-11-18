@@ -142,19 +142,19 @@ describe("PosixNodeFilesApi batch view with maxAgeMs (review of P4.36)", () => {
 
   it("checks a verified directory again once it is older than maxAgeMs", async () => {
     const view = new PosixNodeFilesApi({ rootDir: root }).withLstatCache({ maxAgeMs: 1000 });
-    const start = Date.now();
-    vi.spyOn(Date, "now").mockReturnValue(start);
+    const start = performance.now();
+    vi.spyOn(performance, "now").mockReturnValue(start);
     await view.write("/objects/ab/one", [enc.encode("1")]);
     // the fan-out directory replaced by a link behind the view's back
     rmSync(join(root, "objects/ab"), { recursive: true });
     mkdirSync(join(root, "elsewhere"));
     symlinkSync(join(root, "elsewhere"), join(root, "objects/ab"));
     // within maxAgeMs it is trusted (followed, as git follows links in objects/)
-    vi.spyOn(Date, "now").mockReturnValue(start + 500);
+    vi.spyOn(performance, "now").mockReturnValue(start + 500);
     await view.write("/objects/ab/two", [enc.encode("2")]);
     expect(readFileSync(join(root, "elsewhere/two"), "utf8")).toBe("2");
     // then looked at again, and refused
-    vi.spyOn(Date, "now").mockReturnValue(start + 1500);
+    vi.spyOn(performance, "now").mockReturnValue(start + 1500);
     await expect(view.write("/objects/ab/three", [enc.encode("3")])).rejects.toThrow(
       BeyondSymlinkError,
     );

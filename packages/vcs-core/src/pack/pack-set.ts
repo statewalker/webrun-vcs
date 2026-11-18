@@ -197,7 +197,11 @@ export async function openPackSet(
       const mtimes = `${p.packPath.replace(/\.pack$/, "")}.mtimes`;
       c = files.stats(mtimes).then(
         (st) => st !== undefined,
-        () => false,
+        // unknown: treat as cruft (the object is written loose) and ask again next time
+        () => {
+          cruft.delete(p);
+          return true;
+        },
       );
       cruft.set(p, c);
     }

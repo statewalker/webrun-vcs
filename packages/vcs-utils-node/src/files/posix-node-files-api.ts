@@ -148,7 +148,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   /** Drops the batch cache once it is older than its `maxAgeMs`. */
   private expireVerified(): void {
     if (this.verifiedMaxAge === undefined || !this.verified) return;
-    const now = Date.now();
+    const now = performance.now(); // monotonic: a stepped wall clock must not extend the window
     if (this.verified.size === 0) this.verifiedSince = now;
     else if (now - this.verifiedSince > this.verifiedMaxAge) {
       this.verified.clear();
