@@ -46,6 +46,17 @@ export interface FetchRefUpdate {
    */
   storeError?: string;
   /**
+   * The status the update was accepted with before the ref store refused the write (set
+   * with {@link storeError})
+   */
+  accepted?: Exclude<FetchRefStatus, "rejected">;
+  /**
+   * Refused because the one transaction of an atomic fetch failed (set with
+   * {@link storeError}): git prints the line it was accepted with, then the transaction's
+   * error (`FetchClientResult.refTransactionError`)
+   */
+  aborted?: boolean;
+  /**
    * How git prints it: `[new branch]`, `[new tag]`, `abc1234..def5678`, `+ abc1234...def5678`,
    * `[tag update]` (a forced tag), `[rejected]`, `[up to date]`; ids as long as git's
    * find_unique_abbrev makes them under `core.abbrev`
@@ -276,22 +287,33 @@ export async function planRefUpdates(
 
 /**
  * Writes the accepted updates: each in its own `RefStore.batch` with its old value checked
- * (git's fetch, a ref changed meanwhile is rejected), or all in one batch with `atomic`.
+ * (git's fetch, a ref changed meanwhile is rejected), or all in one batch with `atomic` (none
+ * when an update was refused already), the stale refs of a prune (`deletes`, atomic only)
+ * deleted in the same batch.
  * Updates the store refuses become `rejected`. Stores without `batch` get `update` calls.
+ * Returns git's error when the atomic transaction failed (see
+ * `FetchClientResult.refTransactionError`), else undefined.
  */
 export async function applyRefUpdates(
   updates: FetchRefUpdate[],
   refStore: RefStore,
   options: {
     atomic?: boolean;
+    /** Refs to delete in the atomic transaction (git's prune_refs, logged `fetch: prune`) */
+    deletes?: readonly string[];
     message?: string;
     reflogAction?: string;
     ident?: string;
     skipReflog?: boolean;
   } = {},
-): Promise<void> {
+): Promise<string | undefined> {
+  // git's fetch --atomic: a ref refused before the transaction (non-fast-forward, a tag it
+  // would clobber) aborts it, nothing is written, no stale ref deleted (the other lines
+  // still read as accepted)
+  if (options.atomic && updates.some((u) => u.status === "rejected")) return undefined;
   const writes = updates.filter((u) => u.status !== "rejected" && u.status !== "up-to-date");
-  if (writes.length === 0) return;
+  const deletes = options.atomic ? (options.deletes ?? []) : [];
+  if (writes.length === 0 && deletes.length === 0) return undefined;
   // git's update_local_ref: "<action>: <what>" per ref, else the one message given
   const logOf = (u: FetchRefUpdate) => ({
     message:
@@ -309,34 +331,88 @@ export async function applyRefUpdates(
   // git's update_local_ref when s_update_ref fails: the summary the update was accepted
   // with, its fail code `!` and "unable to update local ref"
   const reject = (u: FetchRefUpdate, storeError: string) => {
+    if (u.status !== "rejected") u.accepted = u.status;
     u.status = "rejected";
     u.reason = "unable to update local ref";
     u.storeError = storeError;
   };
   if (!refStore.batch) {
     for (const u of writes) await refStore.update(u.localRef, u.newOid);
-    return;
+    // the zero id deletes, as in a push command
+    for (const name of deletes) await refStore.update(name, ZERO_OID);
+    return undefined;
   }
   if (options.atomic) {
-    // one batch, each ref logged with its own message, as git's transaction logs it
-    const { message: _first, ...batchOptions } = logOf(writes[0] as FetchRefUpdate);
+    // one batch, each ref logged with its own message, as git's transaction logs it; the
+    // stale refs first, as prune_refs queues them before the updates
+    const batchOptions = {
+      ...(options.ident !== undefined ? { ident: options.ident } : {}),
+      ...(options.skipReflog ? { skipReflog: true } : {}),
+    };
     const result = await refStore.batch(
-      writes.map((u) => {
-        const message = logOf(u).message;
-        return { ...command(u), ...(message !== undefined ? { message } : {}) };
-      }),
+      [
+        ...deletes.map((name) => ({ name, new: null, message: "fetch: prune" })),
+        ...writes.map((u) => {
+          const message = logOf(u).message;
+          return { ...command(u), ...(message !== undefined ? { message } : {}) };
+        }),
+      ],
       batchOptions,
     );
-    if (!result.ok) {
-      const reasons = new Map(result.rejected.map((r) => [r.name, r.reason]));
-      for (const u of writes) reject(u, reasons.get(u.localRef) ?? "atomic transaction failed");
+    if (result.ok) return undefined;
+    const reasons = new Map(result.rejected.map((r) => [r.name, r.reason]));
+    for (const u of writes) {
+      reject(u, reasons.get(u.localRef) ?? "atomic transaction failed");
+      u.aborted = true;
     }
-    return;
+    return transactionError(writes, result.rejected, refStore);
   }
   for (const u of writes) {
     const result = await refStore.batch([command(u)], logOf(u));
     if (!result.ok) reject(u, result.rejected[0]?.reason ?? "rejected");
   }
+  return undefined;
+}
+
+const ZERO_OID = "0000000000000000000000000000000000000000";
+
+/**
+ * The error git's ref transaction reports when an atomic fetch's commit fails: for a name
+ * conflict, refs.c refs_verify_refnames_available's words for the first update (by name)
+ * that conflicts with a ref here (`'<ref>' exists; cannot create '<name>'`; a ref the same
+ * transaction deletes still counts, as in git's do_fetch) or with another update (`cannot process '<name>' and '<other>' at
+ * the same time`); for a ref changed meanwhile, the files backend's `cannot lock ref`.
+ * git 2.43 put `cannot lock ref '<name>': ` before a name conflict too; this is 2.5x's text.
+ */
+async function transactionError(
+  writes: readonly FetchRefUpdate[],
+  rejected: readonly { name: string; reason: string }[],
+  refStore: RefStore,
+): Promise<string> {
+  const existing = new Set<string>();
+  for (const [name] of await refStore.listAll()) existing.add(name);
+  const names = writes.map((u) => u.localRef).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const extras = new Set(names);
+  for (const name of names) {
+    for (let at = name.indexOf("/"); at >= 0; at = name.indexOf("/", at + 1)) {
+      const dir = name.slice(0, at);
+      if (existing.has(dir)) return `'${dir}' exists; cannot create '${name}'`;
+      if (extras.has(dir)) return `cannot process '${name}' and '${dir}' at the same time`;
+    }
+    const below = (set: Iterable<string>) =>
+      [...set].filter((n) => n.startsWith(`${name}/`)).sort((a, b) => (a < b ? -1 : 1))[0];
+    const here = below(existing);
+    if (here !== undefined) return `'${here}' exists; cannot create '${name}'`;
+    const other = below(extras);
+    if (other !== undefined) return `cannot process '${name}' and '${other}' at the same time`;
+  }
+  const first = rejected[0];
+  const update = writes.find((u) => u.localRef === first?.name);
+  if (first?.reason === "mismatch" && update) {
+    const now = (await refStore.get(update.localRef)) ?? ZERO_OID;
+    return `cannot lock ref '${update.localRef}': is at ${now} but expected ${update.oldOid ?? ZERO_OID}`;
+  }
+  return `cannot lock ref '${first?.name ?? names[0]}': ${first?.reason ?? "transaction failed"}`;
 }
 
 /**

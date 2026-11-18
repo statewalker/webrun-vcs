@@ -69,7 +69,10 @@ const hostRoots = new Map<string, FilesApi>();
 
 /**
  * The host FilesApi that holds a path, and the path inside it. A relative path is read from
- * the current directory, as git's `fopen` reads it.
+ * the process's current directory. That is not where git reads one from: git opens its files
+ * after its setup has changed to the worktree top (the git directory when bare), so callers
+ * that know the repository resolve a relative path there first (a relative `GIT_GRAFT_FILE`:
+ * `graftFileReader` of vcs-core with its base).
  */
 function hostFiles(path: string, windows = process.platform === "win32"): [FilesApi, string] {
   let full = path.replaceAll("\\", "/");

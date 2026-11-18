@@ -5,6 +5,8 @@ import {
   type GitObject,
   type GitObjects,
   type GraphCommitData,
+  graftFileBaseDir,
+  graftFileReader,
   isSymbolicRef,
   openPack,
   type PackFile,
@@ -32,6 +34,7 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../../git-command.js";
+import { hostEnvironmentOf } from "../git-ident.js";
 import { configBool, configValue } from "../merge-config.js";
 import { DEFAULT_BIG_FILE_THRESHOLD, readLooseObject } from "./fsck-loose.js";
 import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId } from "./fsck-msg-ids.js";
@@ -432,6 +435,18 @@ export class FsckCommand extends GitCommand<FsckResult> {
       linksKept: Math.max(0, this._limits.links ?? DEFAULT_LINKS_KEPT),
       graphCommitsKept: Math.max(0, this._limits.graphCommits ?? DEFAULT_GRAPH_COMMITS_KEPT),
       graftsAdvice: configBool(this.workingCopy, "advice.graftFileDeprecated", true),
+      readGraftFile: graftFileReader(
+        hostEnvironmentOf(this.workingCopy),
+        this._repository
+          ? {
+              files: this._repository.files,
+              dir: graftFileBaseDir(
+                this._repository.gitDir ?? ".git",
+                configBool(this.workingCopy, "core.bare", false) || undefined,
+              ),
+            }
+          : this.graftFileBase(),
+      ),
       commitGraph: {
         enabled: configBool(this.workingCopy, "core.commitGraph", true),
         generationVersion:
@@ -467,6 +482,11 @@ interface RunOptions {
   bigFileThreshold: number;
   /** `advice.graftFileDeprecated` (on by default) */
   graftsAdvice: boolean;
+  /**
+   * The grafts file's text, read in place of `info/grafts` (git's `GIT_GRAFT_FILE`);
+   * undefined when that file does not exist. Unset: `info/grafts` is read.
+   */
+  readGraftFile?: () => Promise<string | undefined>;
   /** Tree entries and commit links kept from the reads in pack order, at most */
   linksKept: number;
   /** Commits kept for the commit-graph verification, at most */
@@ -534,6 +554,10 @@ class FsckRun {
    */
   private grafts?: Map<string, string[]>;
   private graftErrors: string[] = [];
+  /** The grafts file's errors, as every process that reads the file prints them */
+  private graftErrorLines: string[] = [];
+  /** Whether there is a grafts file (`info/grafts`, or the one `GIT_GRAFT_FILE` names) */
+  private graftFileExists = false;
   private packs: RepoPack[] = [];
   /**
    * Trees checked in full, as their entries' objects: object number -> start in `kids`, where
@@ -612,11 +636,9 @@ class FsckRun {
   }
 
   async run(): Promise<FsckResult> {
-    if (this.files && this.o.graftsAdvice) {
-      const grafts = pathOf(this.gitDir, "info", "grafts");
-      this.graftsFile = (await this.files.stats(grafts).catch(() => undefined))?.kind === "file";
-      this.graftsHint = this.graftsFile;
-    }
+    this.graftFileExists = (await this.graftFileText()) !== undefined;
+    this.graftsFile = this.graftFileExists && this.o.graftsAdvice;
+    this.graftsHint = this.graftsFile;
     if (this.files && this.o.commitGraph.enabled && (await this.hasCommitGraphFile())) {
       this.graphCommits = new Map();
     }
@@ -693,7 +715,6 @@ class FsckRun {
   private async verifyCommitGraph(): Promise<void> {
     const settings = this.o.commitGraph;
     if (!this.files || !settings.enabled) return;
-    const objects = this.objects;
     const objectsDir = `${this.gitDir}/objects`;
     // fsck itself loads the graph when it parses the commit of a ref (parse_object looks it
     // up there first; fsck disables replace refs): what loading prints comes once from fsck
@@ -703,6 +724,7 @@ class FsckRun {
         files: this.files,
         gitDir: this.gitDir,
         useReplaceRefs: false,
+        readGraftFile: () => this.graftFileText(),
       }))
     ) {
       const read = await readCommitGraph(this.files, objectsDir, settings);
@@ -731,53 +753,83 @@ class FsckRun {
     // its hint again) when it parses its first commit: parse_commit_buffer looks the commit's
     // grafts up once the tree line is read, so not for a commit that is missing, of another
     // type, or without a sound tree line.
-    let childGrafts = this.graftsFile;
+    // Once read, a grafted commit reads with its grafted parents, and the commits it grafts
+    // lose the parents they were given from the graph (register_commit_graft unparses them):
+    // their graph parent lists read as empty.
+    let childGrafts = this.graftFileExists;
+    let graftsRead = false;
     const reachGrafts = (note: (line: string) => void, data?: Uint8Array) => {
       if (!childGrafts || (data && !treeLineSound(data))) return;
       childGrafts = false;
-      for (const line of this.graftsHintLines()) note(line);
+      graftsRead = true;
+      if (this.graftsFile) for (const line of this.graftsHintLines()) note(line);
+      for (const line of this.graftErrorLines) note(line);
+    };
+    const grafted = (data: GraphCommitData | undefined, id: string) => {
+      const parents = graftsRead && data ? this.graftedParents(id) : undefined;
+      return parents && data ? { ...data, parents } : data;
     };
     const result = await verifyCommitGraph(
       this.files,
       objectsDir,
       (id, note) => {
-        const from = packs.length > 1 ? packOf(id) : undefined;
-        if (from && from !== packs.find((p) => p.idx.has(id))) {
-          // not the copy kept (the newest pack's): that pack's own
-          return this.readPackedCommit(from, id, (data) => reachGrafts(note, data));
-        }
-        const kept = this.graphCommits?.get(id);
-        if (kept) {
-          reachGrafts(note);
-          return kept;
-        }
-        const parse = (o: GitObject | undefined, data: Uint8Array) => {
-          if (o?.type !== "commit") return undefined;
-          reachGrafts(note, data);
-          return parseGraphCommit(data, id);
-        };
-        const slow = async (o: GitObject | undefined | Promise<GitObject | undefined>) => {
-          try {
-            const obj = await o;
-            if (!obj) return undefined;
-            return parse(obj, obj.bytes ?? (await collect(obj)));
-          } catch {
-            return undefined;
-          }
-        };
-        try {
-          // without a promise when the store has the commit in memory
-          const o = objects.getNow ? objects.getNow(id) : objects.get(id);
-          if (o instanceof Promise || (o && !o.bytes)) return slow(o);
-          return o ? parse(o, o.bytes as Uint8Array) : undefined;
-        } catch {
-          return undefined;
-        }
+        const read = this.readVerifiedCommit(id, note, packs, packOf, reachGrafts);
+        return read instanceof Promise ? read.then((d) => grafted(d, id)) : grafted(read, id);
       },
-      { settings },
+      {
+        settings,
+        ...(this.grafts
+          ? {
+              ungraphedParents: (id: string) => graftsRead && this.graftedParents(id) !== undefined,
+            }
+          : {}),
+      },
     );
     for (const text of result.messages) this.emit({ kind: "commit-graph", stream: "stderr", text });
     if (result.exitCode !== 0) this.errorsFound |= FSCK_ERROR_COMMIT_GRAPH;
+  }
+
+  /** Commit `id` as `git commit-graph verify` reads it from the object database. */
+  private readVerifiedCommit(
+    id: string,
+    note: (line: string) => void,
+    packs: RepoPack[],
+    packOf: (id: string) => RepoPack | undefined,
+    reachGrafts: (note: (line: string) => void, data?: Uint8Array) => void,
+  ): GraphCommitData | undefined | Promise<GraphCommitData | undefined> {
+    const objects = this.objects;
+    const from = packs.length > 1 ? packOf(id) : undefined;
+    if (from && from !== packs.find((p) => p.idx.has(id))) {
+      // not the copy kept (the newest pack's): that pack's own
+      return this.readPackedCommit(from, id, (data) => reachGrafts(note, data));
+    }
+    const kept = this.graphCommits?.get(id);
+    if (kept) {
+      reachGrafts(note);
+      return kept;
+    }
+    const parse = (o: GitObject | undefined, data: Uint8Array) => {
+      if (o?.type !== "commit") return undefined;
+      reachGrafts(note, data);
+      return parseGraphCommit(data, id);
+    };
+    const slow = async (o: GitObject | undefined | Promise<GitObject | undefined>) => {
+      try {
+        const obj = await o;
+        if (!obj) return undefined;
+        return parse(obj, obj.bytes ?? (await collect(obj)));
+      } catch {
+        return undefined;
+      }
+    };
+    try {
+      // without a promise when the store has the commit in memory
+      const o = objects.getNow ? objects.getNow(id) : objects.get(id);
+      if (o instanceof Promise || (o && !o.bytes)) return slow(o);
+      return o ? parse(o, o.bytes as Uint8Array) : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -851,6 +903,7 @@ class FsckRun {
           files: this.files,
           gitDir: this.gitDir,
           useReplaceRefs: false,
+          readGraftFile: () => this.graftFileText(),
         }))
       ) {
         return undefined;
@@ -894,22 +947,40 @@ class FsckRun {
   }
 
   /**
-   * git's prepare_commit_graft for fsck: `info/grafts` read (fsck applies grafts, as every
-   * parse_commit does; replace refs it turns off), its bad lines kept to be reported.
+   * git's prepare_commit_graft for fsck: the grafts file read (`info/grafts`, or the file
+   * `GIT_GRAFT_FILE` names; fsck applies grafts, as every parse_commit does; replace refs it
+   * turns off), its bad lines kept to be reported.
    */
   private async readGrafts(): Promise<void> {
-    if (!this.files) return;
-    const path = pathOf(this.gitDir, "info", "grafts");
-    try {
-      if ((await this.files.stats(path))?.kind !== "file") return;
-      const text = new TextDecoder().decode(await readFile(this.files, path));
-      const { grafts, messages } = parseGraftFile(text);
-      if (grafts.size > 0) this.grafts = grafts;
-      this.graftErrors = messages;
-    } catch {
-      // unreadable: no grafts (git warns and goes on)
-    }
+    const text = await this.graftFileText();
+    if (text === undefined) return;
+    const { grafts, messages } = parseGraftFile(text);
+    if (grafts.size > 0) this.grafts = grafts;
+    this.graftErrors = messages;
+    this.graftErrorLines = messages;
   }
+
+  /**
+   * The grafts file's text (git's repo_get_graft_file: `GIT_GRAFT_FILE`, else
+   * `<GIT_DIR>/info/grafts`), read once; undefined when there is none or it cannot be read
+   * (git warns and goes on).
+   */
+  private graftFileText(): Promise<string | undefined> {
+    if (!this.graftText) {
+      const read = this.o.readGraftFile;
+      const files = this.files;
+      const path = pathOf(this.gitDir, "info", "grafts");
+      this.graftText = (async () => {
+        if (read) return read();
+        if (!files || (await files.stats(path))?.kind !== "file") return undefined;
+        return new TextDecoder().decode(await readFile(files, path));
+      })().catch(() => undefined);
+    }
+    return this.graftText;
+  }
+
+  /** The grafts file's text once read (see graftFileText). */
+  private graftText?: Promise<string | undefined>;
 
   /** The grafted parents of commit `id`; undefined when not grafted (or shallow). */
   private graftedParents(id: string): string[] | undefined {

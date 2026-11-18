@@ -31,6 +31,11 @@
 import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { gitCharWidth } from "@statewalker/vcs-utils/encoding";
 import { formatRfc2822Date } from "./git-date.js";
+import {
+  createRefDecorationFilter,
+  decorateFullRefs,
+  type RefDecorationFilterOptions,
+} from "./ref-decoration-filter.js";
 import { formatGitDate } from "./sequencer-support.js";
 
 /** What a format reads of the commit besides its fields. */
@@ -72,6 +77,8 @@ export interface RefDecorations {
   get(id: ObjectId): readonly RefDecoration[] | undefined;
   /** The branch HEAD names (`refs/heads/main`); undefined when detached */
   headBranch?: string;
+  /** Full ref names are shown (`log.decorate=full`, `--decorate=full`); short ones by default */
+  fullRefs?: boolean;
 }
 
 /** Options of {@link loadRefDecorations}. */
@@ -92,6 +99,17 @@ export interface LoadRefDecorationsOptions {
    * sequencer loads them)
    */
   logFilter?: boolean;
+  /**
+   * `git log`'s decoration options and settings (see `createRefDecorationFilter`):
+   * `--decorate-refs`, `--decorate-refs-exclude`, `--clear-decorations`, and the
+   * configuration's `log.excludeDecoration`, `log.initialDecorationSet` and `log.decorate`
+   * (`full`: full ref names). Given, the refs are filtered as `git log` filters them, as with
+   * `logFilter`.
+   */
+  logOptions?: Omit<RefDecorationFilterOptions, "replaceRefBase"> & {
+    /** `--decorate=short|full` (default `log.decorate`, else short) */
+    decorate?: "short" | "full";
+  };
   /** Where replace refs live (default `refs/replace/`); their originals read `replaced` */
   replaceRefBase?: string;
   /** Whether replace refs apply (default true); off, they decorate nothing */
@@ -123,14 +141,14 @@ export async function loadRefDecorations(
     else map.set(id, [decoration]);
   };
   const replaceBase = options.replaceRefBase ?? "refs/replace/";
-  const include = ["HEAD", "refs/heads/", "refs/tags/", "refs/remotes/", "refs/stash", replaceBase];
-  const included = (name: string) =>
-    !options.logFilter ||
-    include.some((p) =>
-      p.endsWith("/")
-        ? name.startsWith(p) || name === p.slice(0, -1)
-        : name === p || name.startsWith(`${p}/`),
-    );
+  const logOptions = options.logOptions;
+  const included =
+    options.logFilter || logOptions
+      ? createRefDecorationFilter({ ...logOptions, replaceRefBase: replaceBase })
+      : () => true;
+  const fullRefs = logOptions?.decorate
+    ? logOptions.decorate === "full"
+    : decorateFullRefs(logOptions?.config);
   const typeOf = (name: string): RefDecoration["type"] => {
     if (name === "HEAD") return "head";
     if (name.startsWith("refs/heads/")) return "local";
@@ -184,7 +202,11 @@ export async function loadRefDecorations(
   }
   await decorateRef("HEAD", (await options.refs.resolve("HEAD"))?.objectId);
   for (const id of options.grafted ?? []) add(id, { type: "grafted", name: "grafted" });
-  return { get: (id) => map.get(id), ...(headBranch?.startsWith("refs/") ? { headBranch } : {}) };
+  return {
+    get: (id) => map.get(id),
+    ...(headBranch?.startsWith("refs/") ? { headBranch } : {}),
+    ...(fullRefs ? { fullRefs } : {}),
+  };
 }
 
 /** git's prettify_refname: `refs/heads/`, `refs/tags/`, `refs/remotes/` dropped. */
@@ -219,8 +241,10 @@ function formatDecorations(
     if (d === current) continue;
     out += prefix;
     if (tag && d.type === "tag") out += tag;
-    out += prettifyRefName(d.name);
-    if (current && d.type === "head") out += pointer + prettifyRefName(current.name);
+    // show_name: full names with --decorate=full
+    const show = (name: string) => (decorations?.fullRefs ? name : prettifyRefName(name));
+    out += show(d.name);
+    if (current && d.type === "head") out += pointer + show(current.name);
     prefix = separator;
   }
   return out + suffix;

@@ -35,7 +35,13 @@ import {
   writeHunks,
   type XdiffAlgorithm,
 } from "@statewalker/vcs-utils";
-import { decodeGitPath, encodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
+import {
+  decodeGitPath,
+  encodeGitPath,
+  gitCharWidthAt,
+  gitStrWidth,
+  parseGitBool,
+} from "@statewalker/vcs-utils/encoding";
 
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
@@ -582,31 +588,45 @@ function printName(file: DiffstatFile, quote: boolean): string {
   return quotePath(file.name, quote);
 }
 
-/** Display width of a name (`utf8_strwidth`, wide East Asian characters as two columns) */
+/**
+ * Display width of a name, as git's utf8_strwidth measures it (git 2.56's character widths:
+ * wide East Asian characters and emoji two columns, combining marks none; a name that is not
+ * valid UTF-8 its byte count)
+ */
 export function displayWidth(s: string): number {
-  let w = 0;
-  for (const ch of s) w += charWidth(ch.codePointAt(0) ?? 0);
-  return w;
+  let ascii = true;
+  let width = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0x7f) {
+      ascii = false;
+      break;
+    }
+    if (c >= 0x20) width++;
+  }
+  return ascii ? width : gitStrWidth(encodeGitPath(s));
 }
 
-function charWidth(cp: number): number {
-  if (cp === 0) return 0;
-  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
-  if (cp >= 0x300 && cp <= 0x36f) return 0;
-  if (
-    (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
-    (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) ||
-    (cp >= 0xfe30 && cp <= 0xfe4f) ||
-    (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) ||
-    (cp >= 0x1f300 && cp <= 0x1f64f) ||
-    (cp >= 0x20000 && cp <= 0x3fffd)
-  ) {
-    return 2;
+/**
+ * git's show_stats "scales" a name too wide for `width` columns: leading characters dropped
+ * (diff.c's utf8_ish_width steps, byte by byte through what is not UTF-8) until the rest fits
+ * in `width - 3`, then up to its first slash when it has one, behind a `...` prefix.
+ */
+function shortenName(name: string, width: number): { prefix: string; name: string; len: number } {
+  let nameLen = displayWidth(name);
+  if (width >= nameLen) return { prefix: "", name, len: width };
+  const len = Math.max(0, width - 3);
+  const bytes = encodeGitPath(name);
+  let at = 0;
+  while (nameLen > len && at < bytes.length) {
+    const [w, next] = gitCharWidthAt(bytes, at);
+    nameLen -= w;
+    at = next;
   }
-  return 1;
+  let rest = bytes.subarray(at);
+  const slash = rest.indexOf(0x2f);
+  if (slash >= 0) rest = rest.subarray(slash);
+  return { prefix: "...", name: decodeGitPath(rest), len };
 }
 
 function decimalWidth(n: number): number {
@@ -698,24 +718,10 @@ export function formatStat(files: DiffstatFile[], options: DiffstatOptions = {})
     const deleted = file.deleted;
     if (!isInteresting(file) && added + deleted === 0) continue;
     let name = names.get(file) ?? printName(file, quote);
-    let prefix = "";
-    let len = nameWidth;
-    let nameLen = displayWidth(name);
-    if (nameWidth < nameLen) {
-      prefix = "...";
-      len -= 3;
-      if (len < 0) len = 0;
-      const chars = [...name];
-      let k = 0;
-      while (nameLen > len && k < chars.length) {
-        const cp = chars[k].codePointAt(0) ?? 0;
-        nameLen -= charWidth(cp) || (cp < 0x20 ? 0 : 1);
-        k++;
-      }
-      name = chars.slice(k).join("");
-      const slash = name.indexOf("/");
-      if (slash >= 0) name = name.slice(slash);
-    }
+    const shortened = shortenName(name, nameWidth);
+    const prefix = shortened.prefix;
+    const len = shortened.len;
+    name = shortened.name;
     const padding = Math.max(0, len - displayWidth(name));
     const pad = " ".repeat(padding);
     if (file.isBinary) {

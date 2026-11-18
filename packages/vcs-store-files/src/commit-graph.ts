@@ -14,6 +14,8 @@ import {
   DEFAULT_COMMIT_GRAPH_SETTINGS,
   type FilesApi,
   type GitObjects,
+  graftFileBaseDir,
+  graftFileReader,
   isSymbolicRef,
   joinPath,
   loadRepositoryCommitGraph,
@@ -121,7 +123,14 @@ export function createFilesCommitGraphProvider(options: {
   const gitDir = options.gitDir ?? ".git";
   return createCommitGraphProvider(async () => {
     const settings = await readCommitGraphSettings(files, gitDir, { environment });
-    return loadRepositoryCommitGraph({ files, gitDir, refs, settings });
+    const readGraftFile = graftFileReader(environment, { files, dir: graftFileBaseDir(gitDir) });
+    return loadRepositoryCommitGraph({
+      files,
+      gitDir,
+      refs,
+      settings,
+      ...(readGraftFile ? { readGraftFile } : {}),
+    });
   });
 }
 
@@ -162,7 +171,10 @@ export interface WriteCommitGraphOptions {
    * (with `core.useReplaceRefs`). `git commit-graph write` ignores them (the default here).
    */
   replaceRefs?: boolean;
-  /** The user's environment: the global and system config files are read too */
+  /**
+   * The user's environment: the global and system config files are read too, and the grafts
+   * file it names (`GIT_GRAFT_FILE`) in place of `info/grafts`
+   */
   environment?: GitHostEnvironment;
   /** When the changed-path filters' trees are unpacked in pack order first (tuning) */
   prefetch?: CommitGraphPrefetch;
@@ -205,6 +217,10 @@ export async function writeCommitGraph(
       gitDir,
       refs,
       useReplaceRefs: (options.replaceRefs ?? false) && settings.useReplaceRefs,
+      readGraftFile: graftFileReader(options.environment, {
+        files,
+        dir: graftFileBaseDir(gitDir),
+      }),
     }))
   ) {
     return none();

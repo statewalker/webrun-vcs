@@ -38,7 +38,10 @@ import { crc32, deflateSync, inflateSync } from "node:zlib";
 import type { GitObjects } from "@statewalker/vcs-core";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { MemoryCheckout, MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type FsckCommand, Git } from "../src/index.js";
@@ -1509,5 +1512,57 @@ describeGit("fsck against native git", () => {
     g(dir, "branch", "-q", "-D", "side");
     g(dir, "replace", "HEAD", side);
     await compare(dir, ["--no-reflogs"], (c) => c.setReflogs(false));
+  });
+
+  it("GIT_GRAFT_FILE names the grafts file fsck reads (and its commit-graph verification)", async () => {
+    const dir = newRepo();
+    const one = commitFiles(dir, { a: "a\n" }, "one");
+    const two = commitFiles(dir, { b: "b\n" }, "two");
+    const three = commitFiles(dir, { c: "c\n" }, "three");
+    // info/grafts says nothing; the file GIT_GRAFT_FILE names makes `two` unreachable
+    writeFileSync(join(dir, ".git", "info", "grafts"), `${two} ${one}\n`);
+    const file = join(root, `grafts-${n++}`);
+    writeFileSync(file, `${three} ${one}\nnot a graft\n`);
+    const env = { ...nativeGitEnv(root), GIT_GRAFT_FILE: file };
+    const environment = createNodeGitHostEnvironment({ env });
+    const run = async (args: string[], configure: (c: FsckCommand) => FsckCommand = (c) => c) => {
+      const r = spawnSync("git", ["fsck", ...noReferences, ...args], { cwd: dir, env });
+      const theirs = {
+        status: r.status ?? 1,
+        stdout: r.stdout.toString(),
+        stderr: r.stderr.toString(),
+      };
+      const files = createNodeFilesApi({ rootDir: dir });
+      const ours = await configure(
+        (await openOurs(dir, environment))
+          .fsck()
+          .setRepositoryFiles({ files })
+          .setCompatibility(compatibility),
+      ).call();
+      expect(normalizeOrder(normalize(ours.output))).toEqual(
+        normalizeOrder(normalize(theirs.stdout)),
+      );
+      expect(normalize(ours.errorOutput).sort()).toEqual(normalize(theirs.stderr).sort());
+      expect(normalizeExit(ours.exitCode)).toBe(normalizeExit(theirs.status));
+      return ours;
+    };
+    const r = await run(["--no-reflogs"], (c) => c.setReflogs(false));
+    expect(r.output).toContain(`dangling commit ${two}`);
+    expect(r.errorOutput).toContain("error: bad graft data: not a graft");
+    await run(["--no-reflogs", "--connectivity-only"], (c) =>
+      c.setReflogs(false).setConnectivityOnly(true),
+    );
+    // a commit-graph written while no grafts file applies: git's verification (and fsck's own
+    // load of the graph) sees the file GIT_GRAFT_FILE names, not the missing info/grafts
+    rmSync(join(dir, ".git", "info", "grafts"));
+    g(dir, "commit-graph", "write", "--reachable");
+    const hints = (s: string) => s.split("hint: Support for <GIT_DIR>/info/grafts").length - 1;
+    expect(hints((await run(["--no-reflogs"], (c) => c.setReflogs(false))).errorOutput)).toBe(2);
+    // GIT_GRAFT_FILE naming no file: no grafts at all, though info/grafts has some
+    writeFileSync(join(dir, ".git", "info", "grafts"), `${three} ${one}\n`);
+    rmSync(file);
+    const none = await run(["--no-reflogs"], (c) => c.setReflogs(false));
+    expect(none.output).not.toContain("dangling");
+    expect(none.errorOutput).not.toContain("hint:");
   });
 });

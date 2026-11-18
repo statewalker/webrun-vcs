@@ -2,7 +2,8 @@
  * The commit-graph a repository uses, loaded once and on demand as git's
  * `prepare_commit_graph`: not at all when `core.commitGraph` is false, nor when the graph
  * cannot describe the history git would walk (`commit_graph_compatible`): replace refs (with
- * `core.useReplaceRefs`), grafts in `info/grafts`, or a shallow repository (a `shallow` file).
+ * `core.useReplaceRefs`), grafts in `info/grafts` (or the file `GIT_GRAFT_FILE` names), or a
+ * shallow repository (a `shallow` file).
  */
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
@@ -111,6 +112,12 @@ export interface CommitGraphRepository {
   refs?: Pick<Refs, "list">;
   /** `core.useReplaceRefs` (default true) */
   useReplaceRefs?: boolean;
+  /**
+   * The grafts file's text, read in place of `<gitDir>/info/grafts` (git's `GIT_GRAFT_FILE`,
+   * see `graftFileReader`); undefined when that file does not exist. Omit to read
+   * `info/grafts`.
+   */
+  readGraftFile?: () => Promise<string | undefined>;
 }
 
 const OID40 = /^[0-9a-fA-F]{40}/;
@@ -118,8 +125,8 @@ const GRAFT_LINE = /^[0-9a-fA-F]{40}(\s[0-9a-fA-F]{40})*$/;
 
 /**
  * git's commit_graph_compatible: false with replace refs (`refs/replace/<id>`, unless replace
- * refs are off), with a graft in `info/grafts`, or in a shallow repository (a `shallow` file,
- * even an empty one).
+ * refs are off), with a graft in the grafts file (`info/grafts`, or the file `GIT_GRAFT_FILE`
+ * names: `readGraftFile`), or in a shallow repository (a `shallow` file, even an empty one).
  *
  * @example
  * ```typescript
@@ -133,9 +140,13 @@ export async function commitGraphCompatible(repo: CommitGraphRepository): Promis
       if (OID40.test(ref.name.slice("refs/replace/".length))) return false;
     }
   }
-  const grafts = await readGraphFile(files, joinPath(gitDir, "info", "grafts"));
+  const grafts = repo.readGraftFile
+    ? await repo.readGraftFile().catch(() => undefined)
+    : await readGraphFile(files, joinPath(gitDir, "info", "grafts")).then((bytes) =>
+        bytes ? new TextDecoder().decode(bytes) : undefined,
+      );
   if (grafts) {
-    for (const raw of new TextDecoder().decode(grafts).split("\n")) {
+    for (const raw of grafts.split("\n")) {
       const line = raw.trimEnd();
       if (line === "" || line.startsWith("#")) continue;
       if (GRAFT_LINE.test(line)) return false;

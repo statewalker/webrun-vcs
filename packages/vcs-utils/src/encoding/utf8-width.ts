@@ -139,3 +139,85 @@ export function gitCharWidth(cp: number): number {
   if (inTable(cp, DOUBLE_WIDTH)) return 2;
   return 1;
 }
+
+/**
+ * The code point of the UTF-8 sequence at `bytes[at]` and its length, as git's
+ * pick_one_utf8_char reads it; undefined when the bytes there are not valid UTF-8 (overlong
+ * forms, surrogates, U+FFFE and U+FFFF, past U+10FFFF, a truncated sequence) or at a NUL.
+ */
+function pickOneUtf8Char(bytes: Uint8Array, at: number): [number, number] | undefined {
+  const s0 = bytes[at] as number;
+  const s1 = bytes[at + 1] ?? 0;
+  const s2 = bytes[at + 2] ?? 0;
+  const s3 = bytes[at + 3] ?? 0;
+  if (s0 < 0x80) return [s0, 1];
+  if ((s0 & 0xe0) === 0xc0) {
+    if ((s1 & 0xc0) !== 0x80 || (s0 & 0xfe) === 0xc0) return undefined;
+    return [((s0 & 0x1f) << 6) | (s1 & 0x3f), 2];
+  }
+  if ((s0 & 0xf0) === 0xe0) {
+    if (
+      (s1 & 0xc0) !== 0x80 ||
+      (s2 & 0xc0) !== 0x80 ||
+      (s0 === 0xe0 && (s1 & 0xe0) === 0x80) ||
+      (s0 === 0xed && (s1 & 0xe0) === 0xa0) ||
+      (s0 === 0xef && s1 === 0xbf && (s2 & 0xfe) === 0xbe)
+    ) {
+      return undefined;
+    }
+    return [((s0 & 0x0f) << 12) | ((s1 & 0x3f) << 6) | (s2 & 0x3f), 3];
+  }
+  if ((s0 & 0xf8) === 0xf0) {
+    if (
+      (s1 & 0xc0) !== 0x80 ||
+      (s2 & 0xc0) !== 0x80 ||
+      (s3 & 0xc0) !== 0x80 ||
+      (s0 === 0xf0 && (s1 & 0xf0) === 0x80) ||
+      (s0 === 0xf4 && s1 > 0x8f) ||
+      s0 > 0xf4
+    ) {
+      return undefined;
+    }
+    return [((s0 & 0x07) << 18) | ((s1 & 0x3f) << 12) | ((s2 & 0x3f) << 6) | (s3 & 0x3f), 4];
+  }
+  return undefined;
+}
+
+/**
+ * The columns the bytes `bytes` take, as git's utf8_strwidth measures them: the sum of each
+ * character's {@link gitCharWidth}, control characters counting none; bytes that are not
+ * valid UTF-8 make it their count instead (git falls back to `strlen`).
+ *
+ * @example
+ * ```typescript
+ * gitStrWidth(new TextEncoder().encode("中文.txt")); // 8
+ * ```
+ */
+export function gitStrWidth(bytes: Uint8Array): number {
+  let width = 0;
+  for (let i = 0; i < bytes.length; ) {
+    const picked = pickOneUtf8Char(bytes, i);
+    if (!picked) return bytes.length;
+    const w = gitCharWidth(picked[0]);
+    if (w > 0) width += w;
+    i += picked[1];
+  }
+  return width;
+}
+
+/**
+ * The columns of the character at `bytes[at]` and where the next one starts, as git's
+ * diff.c utf8_ish_width steps through a name it shortens: a byte that is not valid UTF-8 is
+ * one column (and one byte), a control character none.
+ *
+ * @example
+ * ```typescript
+ * const [width, next] = gitCharWidthAt(bytes, 0);
+ * ```
+ */
+export function gitCharWidthAt(bytes: Uint8Array, at: number): [number, number] {
+  const picked = pickOneUtf8Char(bytes, at);
+  if (!picked) return [1, at + 1];
+  const w = gitCharWidth(picked[0]);
+  return [w < 0 ? 0 : w, at + picked[1]];
+}

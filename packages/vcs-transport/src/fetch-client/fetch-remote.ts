@@ -79,12 +79,15 @@ export interface FetchClientOptions {
    * renamed remote branch (`foo` to `foo/bar`) does not conflict with the old one. `refMap`
    * is git's ref map so far (get_ref_map): the refs the refspecs took, then the opportunistic
    * updates of those, each with the local ref it writes (where fetch refuses to update a
-   * branch a worktree has checked out).
+   * branch a worktree has checked out). With `atomic`, it may return the stale refs instead
+   * of deleting them (`deletes`): they are deleted in the fetch's one ref transaction, as
+   * git's prune_refs queues them into the `--atomic` transaction, so a refused update or a
+   * failed transaction leaves them too.
    */
   beforeFetch?: (
     remoteRefs: readonly RemoteRef[],
     refMap: readonly { remoteRef: string; localRef?: string }[],
-  ) => Promise<void>;
+  ) => Promise<{ deletes?: string[] } | undefined>;
   /** Tag following; default `auto` */
   tags?: TagMode;
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
@@ -187,6 +190,12 @@ export interface FetchClientResult {
    * (see `formatFetchDisplay`)
    */
   summaryWidth: number;
+  /**
+   * Why the one ref transaction of an `atomic` fetch failed, in git's words (the error it
+   * prints after the ref lines: `'refs/remotes/origin/a' exists; cannot create
+   * 'refs/remotes/origin/a/b'`); nothing was written. Absent otherwise.
+   */
+  refTransactionError?: string;
 }
 
 /** A remote ref a fetch took (see {@link FetchClientResult.fetched}). */
@@ -217,8 +226,10 @@ export interface FetchedRef {
  * answer is written to the shallow file (`refStore.setShallow`) once the pack is in.
  *
  * Tags (`auto`): `include-tag` asks the server to send the tags of what it sends; tags whose
- * objects are then here are created. Remote tags that point at objects here but whose tag
- * objects are missing (a server that ignores `include-tag`) are fetched in a second round.
+ * objects are then here are created. The tags of objects already here are wanted with the
+ * tips (git's find_non_local_tags). Remote tags of fetched objects whose tag objects did not
+ * come (a server that ignores `include-tag`) are fetched in a second round, unless an update
+ * was refused (git's backfill_tags, which a refusal skips).
  *
  * Throws on protocol and transport errors; rejected refs are in the result, not thrown.
  */
@@ -320,7 +331,10 @@ export async function fetchFromConnection(
         .map(({ refspec: _refspec, ...p }) => p)
     : [];
 
-  if (options.beforeFetch) await options.beforeFetch(remoteRefs, [...planned, ...opportunistic]);
+  const before = options.beforeFetch
+    ? await options.beforeFetch(remoteRefs, [...planned, ...opportunistic])
+    : undefined;
+  const deletes = (options.atomic && before?.deletes) || [];
 
   const source = negotiatorSource(repository);
   // what is complete here: reachable from the local refs (git's mark_complete), not merely
@@ -389,9 +403,30 @@ export async function fetchFromConnection(
 
   // wants: the selected tips not here yet (all of them when deepening: their history changes)
   const wants: string[] = [];
+  const wanted = new Set<string>();
   for (const p of planned) {
-    if (wants.includes(p.oid)) continue;
-    if (deepen || !(await complete.isComplete(p.oid))) wants.push(p.oid);
+    if (wanted.has(p.oid)) continue;
+    if (deepen || !(await complete.isComplete(p.oid))) {
+      wants.push(p.oid);
+      wanted.add(p.oid);
+    }
+  }
+  // find_non_local_tags puts the tags of objects fetched or already here into the ref map
+  // before the fetch: their tag objects come in the same round (a tag of a commit here is
+  // not sent by include-tag), not in a second one
+  if (autoTags) {
+    const mapped = new Set(planned.map((p) => p.localRef));
+    for (const ref of remoteRefs) {
+      const oid = ref.oid;
+      if (!oid || !tagsOfTips.has(ref.name) || mapped.has(ref.name) || wanted.has(oid)) {
+        continue;
+      }
+      if (await refStore.get(ref.name)) continue;
+      if (!(await complete.isComplete(oid))) {
+        wants.push(oid);
+        wanted.add(oid);
+      }
+    }
   }
   if (wants.length > 0) {
     await runFetchPack(wants, {
@@ -426,9 +461,20 @@ export async function fetchFromConnection(
         backfill.push(ref);
       }
     }
-    if (backfill.length > 0 && !connection.stateless && connection.version !== 2) {
+    // fetch.c do_fetch: a refused update (non-fast-forward, a tag it would clobber) ends the
+    // fetch before backfill_tags: git makes no second round trip for them
+    const refused =
+      backfill.length > 0 &&
+      (
+        await planRefUpdates([...planned, ...followed, ...opportunistic], repository, refStore, {
+          force: options.force,
+        })
+      ).some((u) => u.status === "rejected");
+    if (refused || backfill.length === 0) {
+      // nothing to backfill, or a refusal: the tags found in the fetched history are left
+    } else if (!connection.stateless && connection.version !== 2) {
       result.tagsNotFollowed = backfill.map((r) => r.name);
-    } else if (backfill.length > 0) {
+    } else {
       const backfillWants = [...new Set(backfill.map((r) => r.oid as string))];
       await runFetchPack(backfillWants, {});
       for (const ref of backfill) {
@@ -475,6 +521,20 @@ export async function fetchFromConnection(
       lengths,
     },
   );
+  // fetch.c do_fetch: a ref update refused (update_local_ref: a non-fast-forward, a tag it
+  // would clobber) ends the fetch before backfill_tags: the tags found in the fetched
+  // history are neither written nor listed in FETCH_HEAD
+  if (result.refUpdates.some((u) => u.status === "rejected")) {
+    const dropped = new Set(
+      followed.filter((p) => !tagsOfTips.has(p.remoteRef)).map((p) => p.localRef),
+    );
+    if (dropped.size > 0) {
+      result.refUpdates = result.refUpdates.filter((u) => !dropped.has(u.localRef));
+      for (let i = followed.length - 1; i >= 0; i--) {
+        if (dropped.has((followed[i] as PlannedRef).localRef)) followed.splice(i, 1);
+      }
+    }
+  }
   result.followedTags = followed.map((p) => p.localRef as string);
   result.backfilledTags = followed
     .filter((p) => !tagsOfTips.has(p.remoteRef))
@@ -490,13 +550,15 @@ export async function fetchFromConnection(
     }
   }
   if (!options.dryRun) {
-    await applyRefUpdates(result.refUpdates, refStore, {
+    const failure = await applyRefUpdates(result.refUpdates, refStore, {
       atomic: options.atomic,
+      deletes,
       message: options.reflogMessage,
       reflogAction: options.reflogAction,
       ident: options.reflogIdent,
       skipReflog: options.skipReflog,
     });
+    if (failure !== undefined) result.refTransactionError = failure;
   }
   return result;
 }

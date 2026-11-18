@@ -81,7 +81,10 @@ export interface FetchResult {
    * The ref lines git prints on stderr (`From <url>`, ` * [new branch]  main -> origin/main`,
    * `   1a2b3c4..5d6e7f8  dev  -> origin/dev`, ` - [deleted]  (none) -> origin/gone`), ids
    * abbreviated as git's find_unique_abbrev under `core.abbrev`, the columns as wide as git
-   * makes them; empty when no ref changed
+   * makes them; empty when no ref changed. With `setVerbose(true)` (`-v`) the refs already up
+   * to date have their ` = [up to date]` lines too; with `fetch.output=compact` a shared tail
+   * of the names is `*`; with `setPorcelain(true)` (`--porcelain`, on stdout) these are
+   * `<flag> <old-id> <new-id> <local-ref>` lines without the `From` line.
    */
   display?: string[];
   /**

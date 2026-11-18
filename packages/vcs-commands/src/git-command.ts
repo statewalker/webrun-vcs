@@ -19,6 +19,9 @@ import {
   createReplacedCommits,
   createReplacedTags,
   createReplacedTrees,
+  type GraftFileBase,
+  graftFileBaseDir,
+  graftFileReader,
   hasReplacements,
   isSymbolicRef,
   type LoadedObjectReplacements,
@@ -447,6 +450,20 @@ export abstract class GitCommand<T> {
     return parseGitBool(value) ?? true;
   }
 
+  /**
+   * Where a relative `GIT_GRAFT_FILE` is read from: the worktree top (the git directory when
+   * `core.bare`), as the host names it (the working copy's `hostGitDir`), where git's setup
+   * has changed to before opening the file; undefined when the host path is unknown.
+   */
+  protected graftFileBase(): GraftFileBase | undefined {
+    const gitDir = (this._workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
+    if (gitDir === undefined) return undefined;
+    const bare = this._workingCopy.config
+      ? parseGitBool(RemoteConfigStore.from(this._workingCopy).value("core.bare"))
+      : undefined;
+    return { dir: graftFileBaseDir(gitDir, bare) };
+  }
+
   /** The commits as git's history walks read them: {@link commits}. */
   protected get walkCommits(): CommandCommits {
     return this.commits;
@@ -468,21 +485,14 @@ export abstract class GitCommand<T> {
     if (!this.replacementsLoad) {
       const environment = hostEnvironmentOf(this._workingCopy);
       const replaceRefBase = environment?.replaceRefBase;
-      const graftFile = environment?.graftFile;
+      // GIT_GRAFT_FILE: that file is read in place of info/grafts (an empty one is a grafts
+      // file all the same: git gives its deprecation advice)
+      const readGraftFile = graftFileReader(environment, this.graftFileBase());
       this.replacementsLoad = loadObjectReplacements({
         refs: this.refsStore,
         useReplaceRefs: this.useReplaceRefs(),
         ...(replaceRefBase !== undefined ? { replaceRefBase } : {}),
-        ...(graftFile !== undefined && environment
-          ? {
-              readGraftFile: async () => {
-                const bytes = graftFile
-                  ? await environment.readFile(graftFile).catch(() => undefined)
-                  : undefined;
-                return bytes ? new TextDecoder().decode(bytes) : undefined;
-              },
-            }
-          : {}),
+        ...(readGraftFile ? { readGraftFile } : {}),
       }).catch(() => undefined);
     }
     return this.replacementsLoad;

@@ -7,13 +7,17 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import type { Git, LogResult } from "../src/index.js";
+import { Git, type LogResult } from "../src/index.js";
 import { git, gitOk, normalizeState, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
@@ -422,6 +426,34 @@ describeGit("replace ref names, grafts file and their messages, native twins", (
     const lines: string[] = [];
     for await (const c of await ours.call()) lines.push(line(c));
     expect(lines).toEqual(native.split("\n").filter((l) => l !== ""));
+  });
+
+  it("a relative GIT_GRAFT_FILE names a file in the worktree top, also run from a subdirectory", async () => {
+    const { dir, ids } = repo();
+    // git opens it after its setup has changed to the worktree top: the top's file counts,
+    // not the one in the directory git is run from, nor the process's current directory
+    mkdirSync(join(dir, "sub"));
+    writeFileSync(join(dir, "rel-grafts"), `${ids.four} ${ids.one}\n`);
+    writeFileSync(join(dir, "sub", "rel-grafts"), `${ids.four}\n`);
+    const env = { ...nativeGitEnv(root), GIT_GRAFT_FILE: "rel-grafts" };
+    const native = spawnSync("git", ["log", `--format=${FORMAT}`, "main"], {
+      cwd: join(dir, "sub"),
+      env,
+      encoding: "utf8",
+    }).stdout;
+    const expected = native.split("\n").filter((l) => l !== "");
+    expect(expected.some((l) => l.includes(" two"))).toBe(false);
+    const environment = createNodeGitHostEnvironment({ env });
+    const files = createNodeFilesApi({ rootDir: dir });
+    // the working copy knows its git directory on the host (log), the backend its files
+    const { history } = await createGitFilesBackend({ files, environment });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history, environment });
+    const ours = Git.fromWorkingCopy(await worktrees.openCurrent());
+    const lines: string[] = [];
+    for await (const c of await ours.log().call()) lines.push(line(c));
+    expect(lines).toEqual(expected);
+    // the backend's own walks (rev-list through history.refs.readGrafts) read the same file
+    expect(await history.refs.readGrafts?.()).toBe(`${ids.four} ${ids.one}\n`);
   });
 
   it("a shallow commit has no parents even when info/grafts gives it some", async () => {
