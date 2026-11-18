@@ -67,6 +67,7 @@ For a Git-compatible on-disk repository, build the `WorkingCopy` from the file-b
 | Branches | `branchCreate()`, `branchDelete()`, `branchList()`, `branchRename()`, `branchCopy()`, `checkout()`, `switch()` |
 | Tags | `tag()`, `tagDelete()`, `tagList()` |
 | History | `reset()`, `merge()`, `rebase()`, `cherryPick()`, `revert()` |
+| Bisect | `bisect()`, `bisectStart()`, `bisectState(term)`, `bisectSkip()`, `bisectNext()`, `bisectReset()`, `bisectTerms()`, `bisectLog()`, `bisectReplay()`, `bisectRun()` |
 | Inspection | `diff()`, `describe()` |
 | Remotes | `fetch()`, `push()`, `pull()`, `clone()`, `lsRemote()`, `remoteAdd()`, `remoteRemove()`, `remoteList()`, `remoteSetUrl()` |
 | Stash | `stashCreate()`, `stashApply()`, `stashDrop()`, `stashList()` |
@@ -213,6 +214,24 @@ await git.rebase().setOperation(RebaseOperation.ABORT).call();
 await git.cherryPick().include(commitId).call();
 await git.revert().include(commitId).setNoCommit(true).call();
 ```
+
+### Bisect
+
+```typescript
+// git bisect start main v1.0, then answer for each candidate checked out
+let step = await git.bisectStart().setBad("main").addGood("v1.0").call();
+while (step.exitCode === 0 && step.candidate && !step.firstBad) {
+  step = await git.bisectState((await testsPass()) ? "good" : "bad").call();
+}
+console.log(step.stdout); // "<id> is the first 'bad' commit" and git show --stat --summary
+await git.bisectReset().call();
+
+// git bisect run ./test.sh: the host runs the command (0 good, 125 skip, 1-127 bad)
+await git.bisectStart().setBad("main").addGood("v1.0").call();
+await git.bisectRun().setCommand(["./test.sh"]).setRunHandler(async ({ commit }) => runTests(commit)).call();
+```
+
+The bisect commands run git 2.5x's `builtin/bisect.c` and `bisect.c`: the weights and the halfway choice of `find_bisection` (`--first-parent` too), skipped commits and git's pseudo-random choice away from them, the merge-base checks ("a merge base must be tested", "The merge base ... is bad"), path-limited bisection (history simplification as git's walk does it), the state files (`BISECT_START`, `BISECT_LOG`, `BISECT_TERMS`, `BISECT_NAMES`, `BISECT_ANCESTORS_OK`, `BISECT_FIRST_PARENT`, `BISECT_RUN`, `BISECT_EXPECTED_REV`, `BISECT_HEAD` for `--no-checkout`) and the refs `refs/bisect/*` byte for byte, so native git and these commands continue each other's bisection. Each command returns `stdout` and `stderr` as git prints them and git's `exitCode`; `bisect()` takes git's arguments as given (`["start", "--term-new=broken", "main", "v1"]`). `bisectReplay().setLog(text)` replays a log's text. Not done: `visualize`, and the stderr of the checkouts git runs (`Switched to branch ...`).
 
 ### Diff and blame output as git prints it
 
