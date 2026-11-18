@@ -44,6 +44,16 @@ import {
 import { Mailmap } from "./mailmap.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
+  addRefsByGlob,
+  addRefsFromColonSep,
+  defaultNotesRef,
+  expandNotesRef,
+  initNotes,
+  type NotesHandle,
+  notesEnvironmentOf,
+} from "./notes-support.js";
+import { combineNotesIgnore } from "./notes-tree.js";
+import {
   ALL_ENTRIES_NOT_INTERESTING,
   bloomPathOf,
   ENTRY_NOT_INTERESTING,
@@ -965,7 +975,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         "options '--graph' and '--reverse' cannot be used together",
       );
     }
-    const host = this.outputHost();
+    const host = this.outputHost(options);
     const paths = [...this.paths];
     // the pathspec as git holds it: the excluded paths as `:(exclude)` elements, `.` when
     // every element excludes
@@ -1035,11 +1045,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /** What the log printer reads of the repository. */
-  private outputHost(): LogOutputHost {
+  private outputHost(options: LogOutputOptions = {}): LogOutputHost {
     const config = RemoteConfigStore.from(this._workingCopy);
     const abbreviator = this.idAbbreviator();
     const abbrevs = new Map<string, string>();
-    let notesMaps: Promise<{ ref: string; notes: Map<ObjectId, ObjectId> }[]> | undefined;
+    let notesTrees: Promise<NotesHandle[]> | undefined;
     let mailmap: Promise<Mailmap> | undefined;
     const trees = new OrderedMap<ObjectId, Promise<ObjectId>>();
     /** A commit's tree, as the walk parsed it (replace refs and grafts honoured) */
@@ -1113,10 +1123,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         });
       },
       notes: async (id) => {
-        notesMaps ??= this.loadNotes(config);
+        notesTrees ??= this.loadNotes(config, options);
         const out: { ref: string; text: string }[] = [];
-        for (const { ref, notes } of await notesMaps) {
-          const blob = notes.get(id);
+        for (const { ref, tree } of await notesTrees) {
+          const blob = await tree.get(id);
           if (!blob) continue;
           const bytes = await this.readBlob(blob);
           if (bytes) out.push({ ref, text: decodeGitPath(bytes) });
@@ -1318,34 +1328,32 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     return { paths: paths.length, names: names.bytes(), patch: sink.bytes() };
   }
 
-  /** The display notes refs (`core.notesRef`, else refs/notes/commits; `notes.displayRef`) */
+  /**
+   * notes.c's load_display_notes: the default notes ref (`GIT_NOTES_REF`, `core.notesRef`,
+   * `refs/notes/commits`) and `GIT_NOTES_DISPLAY_REF` (else `notes.displayRef`), globs
+   * expanded, unless only `--notes=<ref>` refs are asked for; then those refs.
+   */
   private async loadNotes(
     config: RemoteConfigStore,
-  ): Promise<{ ref: string; notes: Map<ObjectId, ObjectId> }[]> {
-    const refs = [config.value("core.notesRef") ?? "refs/notes/commits"];
-    for (const r of config.values("notes.displayRef")) {
-      const name = r.startsWith("refs/") ? r : `refs/notes/${r}`;
-      if (!refs.includes(name)) refs.push(name);
+    options: LogOutputOptions,
+  ): Promise<NotesHandle[]> {
+    const ctx = this.notesContext();
+    const extra = options.notesRefs ?? [];
+    const refs: string[] = [];
+    if (options.notes === true || extra.length === 0) {
+      refs.push(defaultNotesRef(this._workingCopy));
+      const env = notesEnvironmentOf(this._workingCopy).notesDisplayRef;
+      if (env !== undefined) await addRefsFromColonSep(ctx, refs, env);
+      else for (const r of config.values("notes.displayRef")) await addRefsByGlob(ctx, refs, r);
     }
-    const out: { ref: string; notes: Map<ObjectId, ObjectId> }[] = [];
+    for (const r of extra) await addRefsByGlob(ctx, refs, expandNotesRef(r));
+    const out: NotesHandle[] = [];
     for (const ref of refs) {
-      const resolved = await this.refsStore.resolve(ref).catch(() => undefined);
-      const id = resolved?.objectId;
-      if (!id) continue;
-      const commit = await this.commits.load(id).catch(() => undefined);
-      if (!commit) continue;
-      const notes = new Map<ObjectId, ObjectId>();
-      // a notes tree: <hex> blobs, fanned out under two-digit directories
-      const walk = async (tree: ObjectId, prefix: string): Promise<void> => {
-        for await (const e of this.trees.loadTree(tree)) {
-          const name = prefix + e.name;
-          if ((e.mode & 0o170000) === 0o040000) {
-            if (/^[0-9a-f]{2}$/.test(e.name) && name.length < 40) await walk(e.id, name);
-          } else if (/^[0-9a-f]{40}$/.test(name)) notes.set(name, e.id);
-        }
-      };
-      await walk(commit.tree, "");
-      out.push({ ref, notes });
+      try {
+        out.push(await initNotes(ctx, ref, { combine: combineNotesIgnore }));
+      } catch {
+        // a ref that holds no tree-ish: git dies there, the log shows the others
+      }
     }
     return out;
   }

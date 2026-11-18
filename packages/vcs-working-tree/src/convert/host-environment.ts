@@ -69,6 +69,14 @@ export interface GitHostEnvironment {
    * where git's `print_sha1_ellipsis` asks for it (checkout's "HEAD is now at <abbrev>...")
    */
   printSha1Ellipsis?: boolean;
+  /** `$GIT_NOTES_REF`: the notes ref of `git notes` and of `git log` (over `core.notesRef`) */
+  notesRef?: string;
+  /** `$GIT_NOTES_DISPLAY_REF`: the notes refs `git log` shows (colon-separated globs) */
+  notesDisplayRef?: string;
+  /** `$GIT_NOTES_REWRITE_REF`: the notes refs rewritten commits carry notes over in */
+  notesRewriteRef?: string;
+  /** `$GIT_NOTES_REWRITE_MODE`: how such a note combines with one there */
+  notesRewriteMode?: string;
 }
 
 const join = (dir: string, name: string) =>

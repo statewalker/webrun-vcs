@@ -34,6 +34,7 @@ import {
   LogCommand,
   LsRemoteCommand,
   MergeCommand,
+  NotesCommands,
   PackRefsCommand,
   PullCommand,
   PushCommand,
@@ -406,6 +407,23 @@ export class Git implements Disposable {
   branchCopy(): CopyBranchCommand {
     this.checkClosed();
     return new CopyBranchCommand(this._workingCopy);
+  }
+
+  // ============ Notes Operations ============
+
+  /**
+   * The `git notes` subcommands (list, add, append, edit, copy, show, remove, prune,
+   * get-ref, merge), on `ref` when given (`git notes --ref=<ref>`).
+   *
+   * @example
+   * ```typescript
+   * await git.notes().add().addMessage("Reviewed").call();
+   * const { output } = await git.notes("review").show().setObject("HEAD~1").call();
+   * ```
+   */
+  notes(ref?: string): NotesCommands {
+    this.checkClosed();
+    return new NotesCommands(this._workingCopy, ref);
   }
 
   // ============ Tag Operations ============
