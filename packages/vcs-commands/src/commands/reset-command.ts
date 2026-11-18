@@ -1,5 +1,12 @@
 import type { Blobs, ObjectId, Ref } from "@statewalker/vcs-core";
-import type { ResolveUndoRecord, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
+import {
+  cacheTreeOfTree,
+  copyCacheTree,
+  invalidateCacheTreePath,
+  type ResolveUndoRecord,
+  type WorkingCopy,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
 
 import { ResetRefusedError } from "../errors/command-errors.js";
 import { RefNotFoundError } from "../errors/ref-errors.js";
@@ -287,13 +294,22 @@ export class ResetCommand extends GitCommand<Ref> {
     if (commit) {
       if (this.mode !== ResetMode.MIXED) {
         await this.staging.readTree(this.trees, commit.tree);
+        await this.primeCacheTree(commit.tree);
         await this.staging.write();
         return;
       }
       // git's reset --mixed edits the index in place (read_from_tree): the resolve-undo
       // records stay, and the conflict stages it removes are recorded as well
       const unmerged = new Map<string, ResolveUndoRecord>();
+      // read_from_tree edits the index entry by entry: the cache-tree keeps its nodes, those
+      // of the paths it changes invalid (not primed, as a hard reset's is)
+      const cached = this.staging.getCacheTree?.();
+      const before = new Map<string, string>();
       for await (const entry of this.staging.entries()) {
+        before.set(
+          entry.path,
+          `${before.has(entry.path) ? "u" : ""}${entry.mode} ${entry.objectId}`,
+        );
         if (entry.stage < 1 || entry.stage > 3) continue;
         let record = unmerged.get(entry.path);
         if (!record) {
@@ -309,8 +325,29 @@ export class ResetCommand extends GitCommand<Ref> {
       }
       await this.staging.readTree(this.trees, commit.tree, { keepResolveUndo: true });
       if (unmerged.size > 0) this.staging.recordResolveUndo?.([...unmerged.values()]);
+      if (cached && this.staging.setCacheTree) {
+        const tree = copyCacheTree(cached);
+        for await (const entry of this.staging.entries()) {
+          if (before.get(entry.path) !== `${entry.mode} ${entry.objectId}`) {
+            invalidateCacheTreePath(tree, entry.path);
+          }
+          before.delete(entry.path);
+        }
+        for (const path of before.keys()) invalidateCacheTreePath(tree, path);
+        this.staging.setCacheTree(tree);
+      }
       await this.staging.write();
     }
+  }
+
+  /**
+   * git's `prime_cache_tree` after a hard reset: the index's cache-tree is the
+   * target tree's, every directory valid with the tree stored there (a tree holding 100664
+   * modes is kept, so a write-tree of the unchanged index gives it back).
+   */
+  private async primeCacheTree(treeId: ObjectId): Promise<void> {
+    if (!this.staging.setCacheTree) return;
+    this.staging.setCacheTree(await cacheTreeOfTree(this.trees, treeId));
   }
 
   /**

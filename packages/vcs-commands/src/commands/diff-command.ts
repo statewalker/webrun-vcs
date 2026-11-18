@@ -1,5 +1,4 @@
 import {
-  canonTreeMode,
   EMPTY_TREE_ID,
   type FileModeValue,
   type ObjectId,
@@ -1236,8 +1235,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         const ye = y as TreeEntry;
         i++;
         j++;
-        // tree-diff.c compares the modes its walk reads: canonical (100664 is 100644)
-        if (xe.id === ye.id && canonTreeMode(xe.mode) === canonTreeMode(ye.mode)) continue;
+        // tree-diff.c compares the modes its walk reads: canonical, as the tree store reads
+        // them (100664 is 100644)
+        if (xe.id === ye.id && xe.mode === ye.mode) continue;
         const path = prefix ? `${prefix}/${xe.name}` : xe.name;
         if (isTreeMode(xe.mode) && isTreeMode(ye.mode)) {
           await this.diffTreeSides(xe.id, ye.id, path, oldSide, newSide);
@@ -1303,7 +1303,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   /** A tree entry on one side: a blob as itself, a subtree as its blobs */
   private async addSide(e: TreeEntry, path: string, side: Map<string, Side>): Promise<void> {
     if (isTreeMode(e.mode)) await this.collectTreeEntries(e.id, path, side);
-    else side.set(path, { mode: canonTreeMode(e.mode), id: e.id });
+    else side.set(path, { mode: e.mode, id: e.id });
   }
 
   /**
@@ -1463,8 +1463,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       if ((entry.mode & S_IFMT) === TREE_MODE) {
         await this.collectTreeEntries(entry.id, path, entries);
       } else {
-        // the mode as git's tree walk reads it (canon_mode)
-        entries.set(path, { mode: canonTreeMode(entry.mode), id: entry.id });
+        // the mode as git's tree walk reads it (canon_mode), as the tree store reads it
+        entries.set(path, { mode: entry.mode, id: entry.id });
       }
     }
   }

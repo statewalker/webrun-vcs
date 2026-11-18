@@ -7,6 +7,7 @@
  */
 
 import {
+  canonTreeMode,
   compareTreeEntries,
   computeTreeSize,
   encodeObjectHeader,
@@ -161,7 +162,8 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
 
       for (const entry of entries) {
         yield {
-          mode: entry.mode,
+          // as git's tree walks read it (100664 as 100644)
+          mode: canonTreeMode(entry.mode),
           name: fromSqlPath(entry.name),
           id: entry.object_id,
         };
@@ -205,7 +207,7 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
     }
 
     return {
-      mode: entries[0].mode,
+      mode: canonTreeMode(entries[0].mode),
       name: fromSqlPath(entries[0].name),
       id: entries[0].object_id,
     };

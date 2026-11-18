@@ -17,8 +17,16 @@
  * then by bytes (`subtree_name_cmp`).
  */
 
-import { FileMode, type ObjectId, objectIdToBytes, type Trees } from "@statewalker/vcs-core";
-import { bytesToHex } from "@statewalker/vcs-utils";
+import {
+  collectTreeBytes,
+  FileMode,
+  type ObjectId,
+  objectIdToBytes,
+  type TreeEntry,
+  type Trees,
+  treeModesRewritten,
+} from "@statewalker/vcs-core";
+import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 /** One directory of a cache-tree. */
@@ -67,33 +75,80 @@ export async function cacheTreeOfTree(
 
 /**
  * The cache-tree of an index that holds exactly the stored tree `treeId`, from `previous`
- * (the index's cache-tree before, the paths that changed invalidated): a valid node whose
- * tree is still the one there is kept without reading it, as `cache_tree_update` keeps the
- * valid nodes and computes the others. Only the trees under invalid nodes are read.
+ * (the index's cache-tree before, the paths that changed invalidated; none: every node
+ * computed): a valid node whose tree is still the one there is kept without reading it, as
+ * `cache_tree_update` keeps the valid nodes and computes the others. Only the trees under
+ * invalid nodes are read.
+ *
+ * A node computed is the tree the index's entries make, whose modes are canonical: where the
+ * stored tree holds other modes (100664), that is another tree, valid only when it is stored
+ * (git's `WRITE_TREE_REPAIR`) and invalid otherwise, as its parents are.
  */
 export async function updateCacheTree(
-  trees: Pick<Trees, "load">,
+  trees: Pick<Trees, "load" | "has" | "entries">,
   treeId: ObjectId,
   previous: CacheTree | undefined,
 ): Promise<CacheTree> {
-  if (!previous) return cacheTreeOfTree(trees, treeId);
-  if (previous.entryCount >= 0 && previous.id === treeId) return copyCacheTree(previous);
-  const entries = await trees.load(treeId);
-  if (!entries) throw new Error(`tree ${treeId} not found`);
+  if (previous && previous.entryCount >= 0 && previous.id === treeId) {
+    return copyCacheTree(previous);
+  }
+  const entries = await treeEntriesOf(trees, treeId);
   const node: CacheTree = { entryCount: 0, id: treeId, subtrees: [] };
   const dirs: { name: string; id: ObjectId }[] = [];
-  for await (const entry of entries) {
+  for (const entry of entries) {
     if (entry.mode === FileMode.TREE) dirs.push({ name: entry.name, id: entry.id });
     else node.entryCount++;
   }
+  let valid = true;
+  let changed = treeModesRewritten(entries) ?? entries.length > 0;
+  const ids = new Map<string, ObjectId>();
   for (const dir of dirs) {
-    const before = previous.subtrees.find((s) => s.name === dir.name)?.tree;
+    const before = previous?.subtrees.find((s) => s.name === dir.name)?.tree;
     const tree = await updateCacheTree(trees, dir.id, before);
-    node.entryCount += tree.entryCount;
+    if (tree.entryCount < 0 || !tree.id) valid = false;
+    else {
+      node.entryCount += tree.entryCount;
+      ids.set(dir.name, tree.id);
+      if (tree.id !== dir.id) changed = true;
+    }
     node.subtrees.push({ name: dir.name, tree });
   }
   node.subtrees.sort((a, b) => compareSubtreeNames(a.name, b.name));
+  if (valid && changed) {
+    const id = await canonicalTreeId(
+      entries.map((e) => (e.mode === FileMode.TREE ? { ...e, id: ids.get(e.name) ?? e.id } : e)),
+    );
+    if (id !== treeId) {
+      if (await trees.has(id)) node.id = id;
+      else valid = false;
+    }
+  }
+  if (!valid) {
+    node.entryCount = -1;
+    node.id = undefined;
+  }
   return node;
+}
+
+/** The entries of tree `treeId` (modes canonical), shared where the store gives them so. */
+async function treeEntriesOf(
+  trees: Pick<Trees, "load" | "entries">,
+  treeId: ObjectId,
+): Promise<readonly TreeEntry[]> {
+  const shared = await trees.entries?.(treeId);
+  if (shared) return shared;
+  const loaded = await trees.load(treeId);
+  if (!loaded) throw new Error(`tree ${treeId} not found`);
+  const out: TreeEntry[] = [];
+  for await (const entry of loaded) out.push(entry);
+  return out;
+}
+
+/** The id of the tree `entries` make (not stored). */
+async function canonicalTreeId(entries: readonly TreeEntry[]): Promise<ObjectId> {
+  const bytes = await collectTreeBytes(entries);
+  const hasher = createSha1().update(new TextEncoder().encode(`tree ${bytes.length}\0`));
+  return bytesToHex(hasher.update(bytes).digest());
 }
 
 /** A deep copy, to change without touching `tree`. */

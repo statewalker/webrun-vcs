@@ -214,14 +214,18 @@ export class GitStaging implements Staging {
     const stage0 = this._entries.filter(
       (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
     );
-    return this.buildTreeRecursive(trees, stage0, "");
+    // the directories the cache-tree has valid keep their trees, as git's write-tree
+    // (`cache_tree_update`): a tree primed by a reset keeps its stored modes (100664)
+    return this.buildTreeRecursive(trees, stage0, "", this.getCacheTree());
   }
 
   private async buildTreeRecursive(
     trees: Trees,
     entries: IndexEntry[],
     prefix: string,
+    cached?: CacheTree,
   ): Promise<ObjectId> {
+    if (cached && cached.entryCount >= 0 && cached.id) return cached.id;
     const treeEntries: TreeEntry[] = [];
     const subdirs = new Map<string, IndexEntry[]>();
 
@@ -250,7 +254,12 @@ export class GitStaging implements Staging {
     // Recursively build subdirectories
     for (const [dirName, dirEntries] of subdirs) {
       const subPrefix = prefix ? `${prefix}/${dirName}` : dirName;
-      const subtreeId = await this.buildTreeRecursive(trees, dirEntries, subPrefix);
+      const subtreeId = await this.buildTreeRecursive(
+        trees,
+        dirEntries,
+        subPrefix,
+        cached?.subtrees.find((s) => s.name === dirName)?.tree,
+      );
       treeEntries.push({
         name: dirName,
         mode: FileMode.TREE,

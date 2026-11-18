@@ -9,7 +9,7 @@
  * is straightforward - load from source, store to destination.
  */
 
-import type { History, ObjectId } from "@statewalker/vcs-core";
+import { decodeTreeBytes, type History, type ObjectId } from "@statewalker/vcs-core";
 import type { SqlNativeStores } from "./native/types.js";
 
 /**
@@ -78,8 +78,10 @@ export async function importToNative(
         // Skip if already exists
         if (await nativeStores.trees.has(id)) continue;
 
-        // Load entries from Git store
-        const entries = await gitStores.trees.load(id);
+        // Load entries from Git store, modes as stored (`load` reads them canonical, which
+        // would store another tree)
+        const raw = await gitStores.trees.raw?.(id);
+        const entries = raw ? decodeTreeBytes(raw) : await gitStores.trees.load(id);
         if (!entries) throw new Error(`Tree not found: ${id}`);
         await nativeStores.trees.store(entries);
         count++;

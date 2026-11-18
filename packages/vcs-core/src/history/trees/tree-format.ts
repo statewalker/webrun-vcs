@@ -238,10 +238,27 @@ export async function* decodeTreeEntries(
 /**
  * Decode a whole tree's bytes (without header) at once.
  *
+ * Modes are as stored, unless `canonicalModes` asks for them as git's tree walks read
+ * them ({@link canonTreeMode}): 100664 reads as 100644. Readers of a tree's entries (the
+ * tree store's `load`/`entries`) read canonical modes; what must keep the stored bytes (a
+ * tree re-encoded, fsck) reads the raw ones.
+ *
+ * @example
+ * ```typescript
+ * decodeTreeBytes(bytes)[0].mode; // 0o100664, as stored
+ * decodeTreeBytes(bytes, { canonicalModes: true })[0].mode; // 0o100644
+ * ```
+ *
  * @param buffer Serialized tree content
+ * @param options `canonicalModes`: modes as git's walks see them
  * @returns Tree entries in stored order
  */
-export function decodeTreeBytes(buffer: Uint8Array): TreeEntry[] {
+export function decodeTreeBytes(
+  buffer: Uint8Array,
+  options?: { canonicalModes?: boolean },
+): TreeEntry[] {
+  const canonical = options?.canonicalModes === true;
+  let rewritten = false;
   const out: TreeEntry[] = [];
   let offset = 0;
   while (offset < buffer.length) {
@@ -249,7 +266,11 @@ export function decodeTreeBytes(buffer: Uint8Array): TreeEntry[] {
     if (spacePos < 0) break;
     const nullPos = buffer.indexOf(NULL, spacePos + 1);
     if (nullPos < 0 || nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) break;
-    const mode = parseModeAt(buffer, offset, spacePos);
+    const stored = parseModeAt(buffer, offset, spacePos);
+    // a malformed mode (NaN) stays as read
+    const mode = canonical && !Number.isNaN(stored) ? canonTreeMode(stored) : stored;
+    // a mode read otherwise than written (100664, a zero-padded 040000)
+    if (canonical && (mode !== stored || buffer[offset] === 0x30)) rewritten = true;
     const name = decodeGitPath(buffer.subarray(spacePos + 1, nullPos));
     // A decoded tree may come from a remote. Its names become worktree paths, and
     // the FilesApi resolves `..` (webrun-files 0.12), so refuse what git fsck refuses.
@@ -261,7 +282,32 @@ export function decodeTreeBytes(buffer: Uint8Array): TreeEntry[] {
   if (offset < buffer.length) {
     throw new Error("Invalid tree format: truncated entry");
   }
+  if (rewritten) NON_CANONICAL.add(out);
+  else if (canonical) DECODED_CANONICAL.add(out);
   return out;
+}
+
+/** Entry lists `decodeTreeBytes` read with canonical modes from a tree written so */
+const DECODED_CANONICAL = new WeakSet<readonly TreeEntry[]>();
+
+/** Entry lists `decodeTreeBytes` read with canonical modes from a tree written otherwise */
+const NON_CANONICAL = new WeakSet<readonly TreeEntry[]>();
+
+/**
+ * Whether `entries`, as `decodeTreeBytes` read them with `canonicalModes` (the tree store's
+ * `entries`), came from a tree whose modes were written otherwise (100664, a zero-padded
+ * 040000): encoding them again makes another tree, as git's cache-tree computes it.
+ * Undefined for a list it did not decode (unknown).
+ *
+ * @example
+ * ```typescript
+ * const entries = decodeTreeBytes(bytes, { canonicalModes: true });
+ * treeModesRewritten(entries); // true for a tree that holds a 100664 blob
+ * ```
+ */
+export function treeModesRewritten(entries: readonly TreeEntry[]): boolean | undefined {
+  if (NON_CANONICAL.has(entries)) return true;
+  return DECODED_CANONICAL.has(entries) ? false : undefined;
 }
 
 /** The octal mode in `buffer[start, end)`, as parseInt(text, 8) reads it. */
