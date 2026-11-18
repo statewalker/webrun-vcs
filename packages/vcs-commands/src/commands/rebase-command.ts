@@ -524,8 +524,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
     const ontoTreeId = await this.commits.getTree(onto);
     const ontoTree = await flatTree(this.trees, ontoTreeId);
-    // nothing of HEAD's to replay: HEAD moves to upstream
-    if (await this.isAncestor(headId, onto)) {
+    // HEAD moved to upstream with nothing replayed: HEAD detached at upstream ("(start)"),
+    // then the branch moved, as git's rebase does for an empty (noop) todo
+    const moveToOnto = async (status: RebaseStatus): Promise<RebaseResult> => {
       const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
         action: "checkout",
         operation: "rebase",
@@ -536,12 +537,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         return { status: RebaseStatus.FAILED, message: refused.message, output };
       }
       await state.setRef("ORIG_HEAD", headId);
-      // as git's rebase: HEAD detached at upstream ("(start)"), then the branch moved
       await this.refsStore.set("HEAD", onto, this.startLog());
       await this.finishBranch(headName, onto, onto);
       await unstash();
-      return { status: RebaseStatus.FAST_FORWARD, newHead: onto, output };
-    }
+      return { status, newHead: onto, output };
+    };
+    // nothing of HEAD's to replay: HEAD moves to upstream
+    if (await this.isAncestor(headId, onto)) return moveToOnto(RebaseStatus.FAST_FORWARD);
 
     // `--rebase-merges` (else `rebase.rebaseMerges`, a boolean or a cousins mode)
     let rebaseMerges = this.rebaseMerges;
@@ -557,10 +559,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // the commits to pick: HEAD's, not upstream's, merges dropped (kept with
     // --rebase-merges), oldest first
     const range = await this.commitsToRebase(headId, onto, !!rebaseMerges);
-    if (range.length === 0) {
-      await unstash();
-      return { status: RebaseStatus.UP_TO_DATE, newHead: headId, output };
-    }
+    // only merges since upstream (dropped without --rebase-merges): git's todo is a `noop`,
+    // and the branch still moves to upstream
+    if (range.length === 0) return moveToOnto(RebaseStatus.OK);
     // commits whose change upstream has already (`--cherry-mark`): left out, with git's
     // warnings (`make_script`), unless --reapply-cherry-picks
     const skipped = this.reapplyCherryPicks

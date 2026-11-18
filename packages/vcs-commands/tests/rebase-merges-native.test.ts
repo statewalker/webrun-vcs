@@ -543,6 +543,26 @@ describeGit("rebase --rebase-merges, native twins", () => {
     }
   });
 
+  it("only merges since upstream, upstream moved on: a noop todo, the branch moved to upstream", async () => {
+    const steps: Step[] = [
+      { branch: "topic", from: "main" },
+      { commit: "main", files: { "m1.txt": "m1\n" } },
+      { merge: "main", into: "topic" },
+      { commit: "main", files: { "m2.txt": "m2\n" } },
+    ];
+    const { native, ours: mine } = twins(steps);
+    const expected = git(root, native, "rebase", "main");
+    expect(expected.status, expected.stderr).toBe(0);
+    expect(expected.stdout).not.toContain("is up to date");
+    const result = await ours(mine, RebaseOperation.BEGIN, false);
+    expect(result.status, result.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "only merges since upstream");
+    expect(gitOk(root, mine, "rev-parse", "topic", "ORIG_HEAD")).toBe(
+      gitOk(root, native, "rev-parse", "topic", "ORIG_HEAD"),
+    );
+    expect(reflog(mine)).toBe(reflog(native));
+  });
+
   it("a linear branch on upstream is up to date: the message, detached too", async () => {
     const steps: Step[] = [
       { branch: "topic", from: "main" },
