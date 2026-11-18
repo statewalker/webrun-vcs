@@ -410,22 +410,49 @@ export interface TreeEntryTable {
 
 const NO_FIELDS = new Int32Array(0);
 
-/** `walkTree`, into a table (the walks of fsck's object pass and connectivity walk). */
-export function scanTree(buf: Uint8Array): TreeEntryTable {
+/**
+ * `walkTree`, into a table (the walks of fsck's object pass and connectivity walk). With
+ * `reuse`, the table and its fields are that table's, overwritten (grown when too short): a
+ * walk that decodes one tree at a time allocates nothing per tree.
+ */
+export function scanTree(buf: Uint8Array, reuse?: TreeEntryTable): TreeEntryTable {
   const len = buf.length;
-  if (len === 0) return { count: 0, fields: NO_FIELDS };
+  const out: TreeEntryTable = reuse ?? { count: 0, fields: NO_FIELDS };
+  out.count = 0;
+  out.initError = undefined;
+  out.error = undefined;
+  if (len === 0) {
+    if (!reuse) out.fields = NO_FIELDS;
+    return out;
+  }
   // an entry takes at least 24 bytes (a mode digit, a space, a name byte, a NUL and the id);
   // one more slot for the entry decoded past the last one kept
-  const fields = new Int32Array(3 * (Math.floor(len / 23) + 2));
+  const need = 3 * (Math.floor(len / 23) + 2);
+  if (out.fields.length < need) out.fields = new Int32Array(reuse ? Math.max(need, 3 * 64) : need);
+  const fields = out.fields;
   let err = decodeTreeEntryInto(buf, 0, fields, 0);
-  if (err) return { count: 0, fields, initError: err };
+  if (err) {
+    out.initError = err;
+    return out;
+  }
   let count = 0;
   for (;;) {
     const next = (fields[3 * count + 2] as number) + 20;
-    if (next > len) return { count, fields, error: "too-short tree file" };
-    if (next >= len) return { count: count + 1, fields };
+    if (next > len) {
+      out.count = count;
+      out.error = "too-short tree file";
+      return out;
+    }
+    if (next >= len) {
+      out.count = count + 1;
+      return out;
+    }
     err = decodeTreeEntryInto(buf, next, fields, count + 1);
-    if (err) return { count, fields, error: err };
+    if (err) {
+      out.count = count;
+      out.error = err;
+      return out;
+    }
     count++;
   }
 }

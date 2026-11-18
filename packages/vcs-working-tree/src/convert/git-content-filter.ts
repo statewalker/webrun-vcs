@@ -11,7 +11,7 @@
  * file it writes, as git's `check_updates` reads `o->result`.
  */
 
-import type { Blobs, ObjectId } from "@statewalker/vcs-core";
+import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
@@ -19,8 +19,13 @@ import {
   type AttributesContent,
   AttributesMemo,
   AttributesResolver,
+  type AttributesSourceResolver,
   type AttributesSources,
+  type AttributesSourceTree,
   type AttributeValue,
+  attributesSourceSetting,
+  readTreeAttributesFile,
+  resolveAttributesSource,
 } from "../attributes/index.js";
 import type { Staging } from "../staging/staging.js";
 import type { WorkingCopyConfig } from "../working-copy.js";
@@ -105,6 +110,13 @@ export interface GitContentFilterOptions {
   staging?: Staging;
   /** The blobs the index names */
   blobs?: Blobs;
+  /** The trees, for an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`) */
+  trees?: Pick<Trees, "getEntry">;
+  /**
+   * Resolves the tree-ish of an attribute source (git's revision syntax); without one only a
+   * full object id names a tree (see {@link GitContentFilter.setAttributesSourceResolver})
+   */
+  resolveAttributesSource?: AttributesSourceResolver;
   /** The configuration (`core.*`, `filter.*`); read afresh on every conversion */
   config?: WorkingCopyConfig;
   /** The user's environment (global attributes); default: the configuration's `environment` */
@@ -333,6 +345,8 @@ interface Scope {
     global?: Promise<AttributesContent>;
     info?: Promise<AttributesContent>;
   };
+  /** The attribute source's tree, resolved once (undefined: none applies) */
+  source?: Promise<AttributesSourceTree | undefined>;
 }
 
 /**
@@ -366,6 +380,7 @@ export class GitContentFilter implements WorktreeContentFilter {
   private settingsCache?: ConversionSettings;
   /** The operation in progress ({@link batch}) */
   private scope?: Scope;
+  private sourceResolver?: AttributesSourceResolver;
 
   constructor(private readonly options: GitContentFilterOptions) {
     this.resolver = new AttributesResolver(
@@ -376,6 +391,46 @@ export class GitContentFilter implements WorktreeContentFilter {
         ...(options.onWarning ? { onWarning: options.onWarning } : {}),
       },
     );
+  }
+
+  /**
+   * Sets how the tree-ish of an attribute source is resolved (the commands set git's revision
+   * syntax over the repository); it applies from the next operation on.
+   */
+  setAttributesSourceResolver(resolve: AttributesSourceResolver | undefined): void {
+    this.sourceResolver = resolve;
+  }
+
+  /**
+   * The tree the in-tree attributes files are read from (`$GIT_ATTR_SOURCE`, else
+   * `attr.tree`), resolved once per scope; undefined when none applies.
+   *
+   * @throws AttributesSourceError when `$GIT_ATTR_SOURCE` names nothing
+   */
+  private attributesSource(scope: Scope): Promise<AttributesSourceTree | undefined> {
+    scope.source ??= (async () => {
+      const setting = attributesSourceSetting(
+        this.environment?.attrSource,
+        configValue(this.options.config, "attr.tree"),
+      );
+      if (!setting) return undefined;
+      return resolveAttributesSource(
+        setting,
+        this.sourceResolver ?? this.options.resolveAttributesSource,
+      );
+    })();
+    return scope.source;
+  }
+
+  /** The attributes file `path` of the attribute source's tree. */
+  private async sourceAttributes(
+    source: AttributesSourceTree,
+    path: string,
+  ): Promise<AttributesContent> {
+    const { trees, blobs } = this.options;
+    if (!trees || !blobs) return undefined;
+    const found = await readTreeAttributesFile(trees, blobs, source.tree, path);
+    return found ? { key: `blob:${found.id}`, content: found.content } : undefined;
   }
 
   /** The configuration's conversion settings, read afresh. */
@@ -477,6 +532,9 @@ export class GitContentFilter implements WorktreeContentFilter {
       ...this.outerSources(scope),
       inTree: async (dir) => {
         const path = dir ? `${dir}/.gitattributes` : ".gitattributes";
+        // an attribute source replaces the worktree's and the index's files, either way
+        const source = await this.attributesSource(scope);
+        if (source) return this.sourceAttributes(source, path);
         if (context.direction === "checkout") {
           return (await fromIndex(path)) ?? (await fromWorktree(path));
         }

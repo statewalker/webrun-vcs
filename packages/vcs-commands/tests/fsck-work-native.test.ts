@@ -130,4 +130,49 @@ describeGit("fsck --connectivity-only, counted", () => {
       rmSync(join(dir, ".git/objects/info/commit-graph"), { force: true });
     }
   });
+
+  /** The pack's objects by type (`cat-file --batch-all-objects`). */
+  function packed(): Record<string, number> {
+    const count: Record<string, number> = {};
+    for (const t of git(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"])
+      .split("\n")
+      .filter(Boolean))
+      count[t] = (count[t] ?? 0) + 1;
+    return count;
+  }
+
+  it("unpacks each commit and tree of the pack once, in one read in pack order", async () => {
+    rmSync(join(dir, ".git/objects/info/commit-graph"), { force: true });
+    const ours = await compare();
+    const count = packed();
+    // the scan unpacks no blob; the walk takes every commit and tree from it, none from the store
+    expect(ours.statistics.objectsScanned).toBe((count.commit ?? 0) + (count.tree ?? 0));
+    const reach = reachable();
+    expect(ours.statistics.objectsRead).toBe((reach.commit ?? 0) + (reach.tree ?? 0));
+  });
+
+  it("keeps the commits the commit-graph verification compares from the same read", async () => {
+    git(["commit-graph", "write", "--reachable"]);
+    try {
+      const ours = await compare();
+      const count = packed();
+      expect(ours.statistics.objectsScanned).toBe((count.commit ?? 0) + (count.tree ?? 0));
+    } finally {
+      rmSync(join(dir, ".git/objects/info/commit-graph"), { force: true });
+    }
+  });
+
+  it("a full run reads only the objects refs name through the store", async () => {
+    const ours = await (await openOurs(dir))
+      .fsck()
+      .setRepositoryFiles({ files: createNodeFilesApi({ rootDir: dir }) })
+      .call();
+    expect(ours.output).toBe(git(["fsck", "--no-progress"]));
+    // the object pass reads every object in pack order; the walk reads none again
+    const tips = new Set(
+      git(["for-each-ref", "--format=%(objectname)"]).split("\n").filter(Boolean),
+    );
+    expect(ours.statistics.objectsRead).toBe(tips.size);
+    expect(ours.statistics.objectsScanned).toBe(0);
+  });
 });

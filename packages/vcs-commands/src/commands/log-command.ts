@@ -16,13 +16,18 @@ import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import {
   AttributesResolver,
+  type AttributesSourceTree,
+  attributesSourceSetting,
   type ContentAttributesContext,
   expandUserPath,
+  readTreeAttributesFile,
+  resolveAttributesSource,
   xdgConfigPath,
 } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { attributesSourceResolver } from "./attributes-source.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
@@ -918,8 +923,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * match_pathspec_attrs reads them in `git log`: the check-in direction (the worktree's
    * `.gitattributes` first, then the index's) with no index read, so only the worktree's
    * files count, below `$GIT_DIR/info/attributes` and over `core.attributesFile` and the
-   * system file. A bare repository has no in-tree files (git 2.56 reads none without
-   * `attr.tree`): only the files outside the tree.
+   * system file; with an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`) the in-tree files
+   * are its tree's. A bare repository has no in-tree files without one (git 2.56 reads none
+   * without `attr.tree`): only the files outside the tree.
    */
   private async loadAttributes(ps: TreePathspec): Promise<void> {
     const attributes = ps.attributes;
@@ -951,13 +957,17 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   private bareResolver?: AttributesResolver;
 
-  /** The attributes of a bare repository: builtin, system, global and `info/attributes`. */
+  /**
+   * The attributes of a bare repository: builtin, system, global and `info/attributes`, and
+   * the in-tree files of an attribute source.
+   */
   private bareAttributes(): AttributesResolver {
     if (this.bareResolver) return this.bareResolver;
     const environment = hostEnvironmentOf(this._workingCopy);
     const gitDir = (this._workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
     const read = (file: string | undefined) =>
       file && environment ? environment.readFile(file).catch(() => undefined) : undefined;
+    let source: Promise<AttributesSourceTree | undefined> | undefined;
     this.bareResolver = new AttributesResolver(
       {
         system: async () => read(environment?.systemAttributes),
@@ -971,7 +981,29 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         },
         info: async () =>
           read(gitDir ? `${gitDir.replace(/\/+$/, "")}/info/attributes` : undefined),
-        inTree: async () => undefined,
+        // only from an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`)
+        inTree: async (dir) => {
+          source ??= (async () => {
+            const setting = attributesSourceSetting(
+              environment?.attrSource,
+              configValue(this._workingCopy, "attr.tree"),
+            );
+            if (!setting) return undefined;
+            return resolveAttributesSource(
+              setting,
+              attributesSourceResolver(() => this.revisionResolver()),
+            );
+          })();
+          const found = await source;
+          if (!found) return undefined;
+          const file = await readTreeAttributesFile(
+            this.trees,
+            this.blobs,
+            found.tree,
+            dir ? `${dir}/.gitattributes` : ".gitattributes",
+          );
+          return file ? { key: `blob:${file.id}`, content: file.content } : undefined;
+        },
       },
       { ignoreCase: configBool(this._workingCopy, "core.ignoreCase", false) },
     );

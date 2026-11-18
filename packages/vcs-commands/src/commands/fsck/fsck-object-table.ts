@@ -59,9 +59,10 @@ const HEX_VALUE = (() => {
 })();
 
 /**
- * The table. Ids are kept as their 20 bytes, in one growing buffer by object number (not as
- * strings, nor in a second map): a lookup probes the slots and compares bytes, so a tree's
- * entries are looked up straight from the tree's bytes.
+ * The table. Ids are kept as their 20 bytes (never as strings): in the slots, so a probe
+ * compares an id where it reads the slot, and by object number. A tree's entries are looked
+ * up straight from the tree's bytes; a lookup of an object the run holds already (the walk
+ * replaying git's lookups) goes to its slot without probing (`slotOf`).
  */
 export class ObjectTable {
   private n = 0;
@@ -69,14 +70,18 @@ export class ObjectTable {
   private raw = new Uint8Array(20 * 1024);
   /** Each id's first four bytes as git's `hash_obj` reads them. */
   private keys = new Int32Array(1024);
+  /** Each object's slot. */
+  private slotOf = new Int32Array(1024);
   private types = new Uint8Array(1024);
   private flagsOf = new Uint8Array(1024);
-  /** Object numbers by slot, -1 for an empty slot. */
   /**
-   * The slots, two words each: the object number (-1 for an empty slot) and its id's key, so a
-   * probe reads one place before comparing ids.
+   * The slots, `SLOT` words each: the object number (-1 for an empty slot), then its id's 20
+   * bytes (the first word is the key `hash_obj` reads), so a probe compares an id without
+   * reading the object's own record: one place in memory per slot probed.
    */
   private slots = new Int32Array(0);
+  /** `slots` as bytes. */
+  private slotBytes = new Uint8Array(0);
   private readonly scratch = new Uint8Array(20);
   /** The char codes `id` builds a string from. */
   private readonly codes: number[] = new Array(40).fill(0);
@@ -99,6 +104,11 @@ export class ObjectTable {
       codes[2 * i + 1] = HEX_CODE[b & 15] as number;
     }
     return String.fromCharCode.apply(null, codes);
+  }
+
+  /** The 20 bytes of object `n`'s id (a view, valid until the next object is created). */
+  idBytes(n: number): Uint8Array {
+    return this.raw.subarray(n * 20, n * 20 + 20);
   }
 
   type(n: number): ObjType {
@@ -129,38 +139,82 @@ export class ObjectTable {
 
   /** `lookup` for the 20 id bytes at `at` in `buf`. */
   lookupRaw(buf: Uint8Array, at: number): number {
-    const size = this.slots.length >>> 1;
+    const i = this.probe(buf, at);
+    if (i < 0) return -1;
+    const n = this.slots[SLOT * i] as number;
+    this.moveFirst(n, i);
+    return n;
+  }
+
+  /** git's move of a found object to the slot its probe started from: `n` is in slot `i`. */
+  private moveFirst(n: number, i: number): void {
+    const slots = this.slots;
+    const first = ((this.keys[n] as number) >>> 0) & (slots.length / SLOT - 1);
+    if (i === first) return;
+    // swap the two slots
+    const a = SLOT * i;
+    const b = SLOT * first;
+    for (let w = 0; w < SLOT; w++) {
+      const x = slots[a + w] as number;
+      slots[a + w] = slots[b + w] as number;
+      slots[b + w] = x;
+    }
+    this.slotOf[n] = first;
+    const other = slots[a] as number;
+    if (other >= 0) this.slotOf[other] = i;
+  }
+
+  /** The slot holding the id at `at` in `buf`, or -1. */
+  private probe(buf: Uint8Array, at: number): number {
+    const slots = this.slots;
+    const size = slots.length / SLOT;
     if (size === 0) return -1;
     const key = keyOf(buf, at);
-    const first = (key >>> 0) & (size - 1);
-    const raw = this.raw;
-    const slots = this.slots;
-    let i = first;
-    let n: number;
-    for (;;) {
-      n = slots[2 * i] as number;
-      if (n < 0) return -1;
-      if (slots[2 * i + 1] === key) {
+    const bytes = this.slotBytes;
+    for (let i = (key >>> 0) & (size - 1); ; ) {
+      const b = SLOT * i;
+      if ((slots[b] as number) < 0) return -1;
+      if (slots[b + 1] === key) {
         let k = 4;
-        const o = n * 20;
-        while (k < 20 && raw[o + k] === buf[at + k]) k++;
-        if (k === 20) break;
+        const o = 4 * b + 4;
+        while (k < 20 && bytes[o + k] === buf[at + k]) k++;
+        if (k === 20) return i;
       }
       i++;
       if (i === size) i = 0;
     }
-    if (i !== first) {
-      slots[2 * i] = slots[2 * first] as number;
-      slots[2 * i + 1] = slots[2 * first + 1] as number;
-      slots[2 * first] = n;
-      slots[2 * first + 1] = key;
+  }
+
+  /**
+   * The object whose id is the 20 bytes at `at` in `buf`, or -1, without moving it (a lookup
+   * git does not make: the layout stays as git's lookups leave it).
+   */
+  peekRaw(buf: Uint8Array, at: number): number {
+    const i = this.probe(buf, at);
+    return i < 0 ? -1 : (this.slots[SLOT * i] as number);
+  }
+
+  /**
+   * `lookupTyped` of object `n` (the move its lookup makes included): `n`, typed `type` if it
+   * had no type yet, or `{ error }` when it has another type.
+   */
+  lookupTypedN(n: number, type: ObjType): number | { error: string } {
+    this.moveFirst(n, this.slotOf[n] as number);
+    const have = this.types[n] as ObjType;
+    if (have === type) return n;
+    if (have === OBJ_NONE) {
+      this.types[n] = type;
+      return n;
     }
-    return n;
+    return {
+      error: `object ${this.id(n)} is a ${TYPE_NAME[have]}, not a ${TYPE_NAME[type]}`,
+    };
   }
 
   /** `lookup` of object `n` itself, for the move to the slot its probe starts from. */
   touch(n: number): void {
-    this.lookupRaw(this.raw, n * 20);
+    // the probe would find it in its slot: no need to probe
+    this.moveFirst(n, this.slotOf[n] as number);
   }
 
   /** git's `create_object`. */
@@ -171,7 +225,7 @@ export class ObjectTable {
   /** `create` for the 20 id bytes at `at` in `buf`. */
   createRaw(buf: Uint8Array, at: number, type: ObjType): number {
     const n = this.n;
-    if ((this.slots.length >>> 1) - 1 <= n * 2) this.grow();
+    if (this.slots.length / SLOT - 1 <= n * 2) this.grow();
     if (n >= this.types.length) {
       const cap = this.types.length * 2;
       const raw = new Uint8Array(cap * 20);
@@ -186,12 +240,15 @@ export class ObjectTable {
       const flags = new Uint8Array(cap);
       flags.set(this.flagsOf);
       this.flagsOf = flags;
+      const slotOf = new Int32Array(cap);
+      slotOf.set(this.slotOf);
+      this.slotOf = slotOf;
     }
     this.raw.set(buf.subarray(at, at + 20), n * 20);
     this.keys[n] = keyOf(buf, at);
     this.types[n] = type;
     this.n = n + 1;
-    this.insert(n, this.slots);
+    this.insert(n, this.slots, this.slotBytes, this.raw, n * 20);
     return n;
   }
 
@@ -227,7 +284,7 @@ export class ObjectTable {
   /** Object numbers in slot order (git's `get_indexed_object` loop). */
   *inSlotOrder(): Iterable<number> {
     const slots = this.slots;
-    for (let i = 0; i < slots.length; i += 2) {
+    for (let i = 0; i < slots.length; i += SLOT) {
       const n = slots[i] as number;
       if (n >= 0) yield n;
     }
@@ -254,28 +311,46 @@ export class ObjectTable {
 
   private grow(): void {
     const old = this.slots;
-    const oldSize = old.length >>> 1;
+    const oldBytes = this.slotBytes;
+    const oldSize = old.length / SLOT;
     const size = oldSize < 32 ? 32 : oldSize * 2;
-    const slots = new Int32Array(2 * size).fill(-1);
+    const slots = new Int32Array(SLOT * size);
+    for (let i = 0; i < slots.length; i += SLOT) slots[i] = -1;
+    const bytes = new Uint8Array(slots.buffer);
+    // in slot order, as git's grow_object_hash re-inserts them
     for (let i = 0; i < oldSize; i++) {
-      const n = old[2 * i] as number;
-      if (n >= 0) this.insert(n, slots);
+      const n = old[SLOT * i] as number;
+      if (n >= 0) this.insert(n, slots, bytes, oldBytes, 4 * SLOT * i + 4);
     }
     this.slots = slots;
+    this.slotBytes = bytes;
   }
 
-  private insert(n: number, slots: Int32Array): void {
-    const size = slots.length >>> 1;
+  /** Puts object `n`, whose id is the 20 bytes at `at` in `id`, in its slot. */
+  private insert(
+    n: number,
+    slots: Int32Array,
+    bytes: Uint8Array,
+    id: Uint8Array,
+    at: number,
+  ): void {
+    const size = slots.length / SLOT;
     const key = this.keys[n] as number;
     let j = (key >>> 0) & (size - 1);
-    while ((slots[2 * j] as number) >= 0) {
+    while ((slots[SLOT * j] as number) >= 0) {
       j++;
       if (j >= size) j = 0;
     }
-    slots[2 * j] = n;
-    slots[2 * j + 1] = key;
+    slots[SLOT * j] = n;
+    this.slotOf[n] = j;
+    bytes.set(id.subarray(at, at + 20), 4 * SLOT * j + 4);
+    // the key as a number (whatever the platform's byte order), for a probe to compare first
+    slots[SLOT * j + 1] = key;
   }
 }
+
+/** Words per slot: the object number and its id's five words. */
+const SLOT = 6;
 
 /** git's `hash_obj` before the mask: the id's first four bytes as a little-endian int. */
 function keyOf(buf: Uint8Array, at: number): number {

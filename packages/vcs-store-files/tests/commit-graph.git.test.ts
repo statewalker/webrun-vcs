@@ -270,6 +270,24 @@ describe("writing commit-graphs as native git", () => {
     await expectSameAsNative(dir, []);
   });
 
+  it("--changed-paths over a packed history: its trees unpacked in pack order, once", async () => {
+    const dir = fastImportRepo(1100);
+    git(dir, ["repack", "-adq"]);
+    const native = tempDir();
+    const ours = tempDir();
+    cpSync(dir, native, { recursive: true });
+    cpSync(dir, ours, { recursive: true });
+    git(native, ["commit-graph", "write", "--reachable", "--changed-paths"]);
+    const result = await ourWrite(ours, { changedPaths: true });
+    expect(graphFiles(ours)).toEqual(graphFiles(native));
+    // every tree of the pack unpacked by the one read; none read through the store
+    const trees = git(dir, ["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"])
+      .split("\n")
+      .filter((t) => t === "tree").length;
+    expect(result.reads?.treesScanned).toBe(trees);
+    expect(result.reads?.trees).toBe(0);
+  });
+
   it.skipIf(version < 246)("commitGraph.changedPathsVersion=2 (git 2.46+)", async () => {
     const dir = smallRepo();
     git(dir, ["config", "commitGraph.changedPathsVersion", "2"]);
