@@ -599,7 +599,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
     output.push("Fast-forward");
     if (this.squash) {
-      await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, srcId));
+      await state.write(
+        "SQUASH_MSG",
+        await squashMessage(this.commits, headId, srcId, (id) => this.abbreviateObjectId(id)),
+      );
       output.push("Squash commit -- not updating HEAD");
       return {
         status: MergeStatus.FAST_FORWARD_SQUASHED,
@@ -656,7 +659,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
       // several merge bases: merge-ort's virtual merge base, built in memory
       const base = await mergeBaseTree(
-        { commits: this.commits, trees: this.trees, blobs: this.blobs },
+        {
+          commits: this.commits,
+          trees: this.trees,
+          blobs: this.blobs,
+          abbreviate: (id) => this.abbreviateObjectId(id),
+        },
         headId,
         srcId,
         mergeBases,
@@ -725,7 +733,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
     if (conflicts.length > 0 || merge?.clean === false) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       if (this.squash) {
-        await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, srcId));
+        await state.write(
+          "SQUASH_MSG",
+          await squashMessage(this.commits, headId, srcId, (id) => this.abbreviateObjectId(id)),
+        );
         await state.write("MERGE_MSG", conflictsComment(paths, true));
         output.push("Squash commit -- not updating HEAD");
       } else {
@@ -745,7 +756,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     }
     if (this.squash) {
-      await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, srcId));
+      await state.write(
+        "SQUASH_MSG",
+        await squashMessage(this.commits, headId, srcId, (id) => this.abbreviateObjectId(id)),
+      );
       output.push(
         "Squash commit -- not updating HEAD",
         "Automatic merge went well; stopped before committing as requested",
@@ -885,7 +899,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
     if (outcome.status === 1) {
       const paths = [...new Set(outcome.conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       if (this.squash) {
-        await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, remoteIds));
+        await state.write(
+          "SQUASH_MSG",
+          await squashMessage(this.commits, headId, remoteIds, (id) => this.abbreviateObjectId(id)),
+        );
         await state.write("MERGE_MSG", conflictsComment(paths, true));
         output.push("Squash commit -- not updating HEAD");
       } else {
@@ -902,7 +919,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     }
     if (this.squash) {
-      await state.write("SQUASH_MSG", await squashMessage(this.commits, headId, remoteIds));
+      await state.write(
+        "SQUASH_MSG",
+        await squashMessage(this.commits, headId, remoteIds, (id) => this.abbreviateObjectId(id)),
+      );
       output.push(
         "Squash commit -- not updating HEAD",
         "Automatic merge went well; stopped before committing as requested",

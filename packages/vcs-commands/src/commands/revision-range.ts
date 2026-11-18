@@ -78,8 +78,8 @@ export async function parseRevisionArgs(
       not = !not;
       continue;
     }
-    const ok = await handleRevisionArg(resolver, arg, not, options, entries);
-    if (!ok) {
+    const ok = await handleRevisionArg(resolver, arg, not, options, entries, true);
+    if (ok === false) {
       // revisions given apart from paths (after them comes `--`): git's `bad revision`
       throw new RevisionError(
         arg,
@@ -90,24 +90,31 @@ export async function parseRevisionArgs(
   return { entries, warnings: resolver.warnings };
 }
 
-/** git's `handle_revision_arg_1`; false where git returns -1. */
-async function handleRevisionArg(
+/**
+ * git's `handle_revision_arg_1`: the entries `arg` names appended to `out`; false where git
+ * returns -1, else the name git's `verify_non_filename` checks when no `--` follows the
+ * revisions (the whole `a..b`, a plain revision without its `^`, `^!` or `^-<n>`; none for
+ * `x^@`).
+ * `cantBeFilename` is git's `REVARG_CANNOT_BE_FILENAME` (the revisions are followed by
+ * `--`): a lone `..` is then `HEAD..HEAD`, otherwise the parent directory's pathspec.
+ */
+export async function handleRevisionArg(
   resolver: RevisionResolver,
   arg: string,
   exclude: boolean,
   options: RevisionArgOptions,
   out: RevisionArgEntry[],
-): Promise<boolean> {
-  // just "..": git takes it for the parent directory's pathspec unless `--` follows the
-  // revisions; these arguments are read as if it did (REVARG_CANNOT_BE_FILENAME), so it is
-  // HEAD..HEAD, as `git log .. --` reads it
+  cantBeFilename: boolean,
+): Promise<false | { verifyName?: string }> {
+  if (!cantBeFilename && arg === "..") return false;
   const dotdot = await handleDotdot(resolver, arg, exclude, options, out);
-  if (dotdot) return true;
+  if (dotdot) return { verifyName: arg };
 
   let rest = arg;
   let mark = rest.indexOf("^@");
   if (mark >= 0 && mark + 2 === rest.length) {
-    if (await addParentsOnly(resolver, rest.slice(0, mark), exclude, 0, out)) return true;
+    // git returns before verify_non_filename here
+    if (await addParentsOnly(resolver, rest.slice(0, mark), exclude, 0, out)) return {};
   }
   mark = rest.indexOf("^!");
   if (mark >= 0 && mark + 2 === rest.length) {
@@ -137,7 +144,7 @@ async function handleRevisionArg(
   const id = await resolver.resolve(rest, { hint });
   if (id === undefined) return false;
   out.push({ id, exclude: local, name: rest });
-  return true;
+  return { verifyName: rest };
 }
 
 /** git's `handle_dotdot`: `a..b` and `a...b`; false when `arg` is none or a side names nothing. */

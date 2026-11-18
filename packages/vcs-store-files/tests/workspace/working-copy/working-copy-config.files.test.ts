@@ -392,8 +392,13 @@ describe("GitWorkingCopyConfig", () => {
       expect(config.get("remote.up.stream.url")).toBeUndefined();
     });
 
-    it("tolerates extra whitespace around the header parts", async () => {
+    it("refuses whitespace after `[` or before `]`, as git does", async () => {
+      // git: "fatal: bad config line 1 in file ..." (only blanks between the name and `"`)
       files.set(PATH, '[ remote   "origin" ]\n\turl = https://example.com/x.git\n');
+      await expect(new GitWorkingCopyConfig(files, PATH).load()).rejects.toThrow(
+        `bad config line 1 in file ${PATH.replace(/^\/+/, "")}`,
+      );
+      files.set(PATH, '[remote   "origin"]\n\turl = https://example.com/x.git\n');
       const config = new GitWorkingCopyConfig(files, PATH);
       await config.load();
 
@@ -707,6 +712,114 @@ describe("GitWorkingCopyConfig", () => {
         key: "core.commentchar",
         value: "%",
       });
+    });
+  });
+
+  describe("names git's parser reads back (git_config_parse_key)", () => {
+    it("refuses keys git refuses, with git's message, and writes nothing", async () => {
+      files.set(PATH, "[core]\n\tbare = false\n");
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      for (const [key, message] of [
+        ["bare", "key does not contain a section: bare"],
+        [".x", "key does not contain a section: .x"],
+        ["core.", "key does not contain variable name: core."],
+        ["core.bad_name", "invalid key: core.bad_name"],
+        ["core.1x", "invalid key: core.1x"],
+        ["a b.c", "invalid key: a b.c"],
+        ["a.b\nc.d", "invalid key (newline): a.b\nc.d"],
+        ["remote.a\0b.url", "invalid key: remote.a\0b.url"],
+      ] as const) {
+        expect(() => config.set(key, "v")).toThrow(message);
+        expect(() => config.add(key, "v")).toThrow(message);
+      }
+      expect(() => config.set("t.v", "a\0b")).toThrow("invalid value (NUL): t.v");
+      await config.save();
+      expect(files.text(PATH)).toBe("[core]\n\tbare = false\n");
+    });
+
+    it("accepts what git accepts: dashes, any subsection, an empty one", async () => {
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      config.set("core.x-y", "1");
+      config.set("a.b.c-", "2");
+      config.set('remote.we "ird\\.url', "3");
+      config.set("remote..url", "4");
+      await config.save();
+      const reloaded = await reload(config);
+      expect(reloaded.get("core.x-y")).toBe(1);
+      expect(reloaded.get("a.b.c-")).toBe(2);
+      expect(reloaded.get('remote.we "ird\\.url')).toBe(3);
+      expect(reloaded.get("remote..url")).toBe(4);
+      expect(reloaded.get("remote.url")).toBeUndefined();
+    });
+
+    it("refuses to rename or copy a section to a name git's parser would refuse", async () => {
+      files.set(PATH, '[remote "origin"]\n\turl = u\n');
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      for (const name of ["bad name.x", "remote.a\nb", "", ".x"]) {
+        expect(() => config.renameSection("remote.origin", name)).toThrow(
+          `invalid section name: ${name}`,
+        );
+        expect(() => config.copySection("remote.origin", name)).toThrow(
+          `invalid section name: ${name}`,
+        );
+      }
+      await config.save();
+      expect(files.text(PATH)).toBe('[remote "origin"]\n\turl = u\n');
+    });
+  });
+
+  describe("reading as git's parser", () => {
+    it("\\v and \\f are no blanks: kept in values, refused where a blank may stand", async () => {
+      files.set(PATH, "[t]\n\tx = a\vb\f\n");
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      expect(config.get("t.x")).toBe("a\vb\f");
+      for (const text of ["\v[t]\n", "[t]\n\f\tx = 1\n", "[t\v]\n"]) {
+        files.set(PATH, text);
+        await expect(new GitWorkingCopyConfig(files, PATH).load()).rejects.toThrow(
+          /bad config line/,
+        );
+      }
+    });
+
+    it("a value ends at a NUL, as git's C string does", async () => {
+      files.set(PATH, '[t]\n\tv = a\0b\n\tq = "c\0d"\n');
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      expect(config.get("t.v")).toBe("a");
+      expect(config.get("t.q")).toBe("c");
+    });
+
+    it("a variable before any section is listed by its bare name and kept", async () => {
+      files.set(PATH, "top = 1\n[core]\n\tbare = false\n");
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      expect(config.listWithOrigin().map((e) => [e.key, e.text, e.line])).toEqual([
+        ["top", "1", 1],
+        ["core.bare", "false", 3],
+      ]);
+      expect(config.get("top")).toBeUndefined();
+      config.set("core.bare", true);
+      await config.save();
+      expect(files.text(PATH)).toBe("top = 1\n[core]\n\tbare = true\n");
+    });
+
+    it("reads a key in constant time: get over many keys is not quadratic", async () => {
+      const n = 20000;
+      const lines = ["[big]"];
+      for (let i = 0; i < n; i++) lines.push(`\tk${i} = ${i}`);
+      files.set(PATH, `${lines.join("\n")}\n`);
+      const config = new GitWorkingCopyConfig(files, PATH);
+      await config.load();
+      const start = performance.now();
+      for (let i = 0; i < n; i++) expect(config.get(`big.k${i}`)).toBe(i);
+      config.set("big.k0", "changed");
+      expect(config.get("big.k0")).toBe("changed");
+      // linear: well under a second; the quadratic scans took tens of seconds
+      expect(performance.now() - start).toBeLessThan(3000);
     });
   });
 });

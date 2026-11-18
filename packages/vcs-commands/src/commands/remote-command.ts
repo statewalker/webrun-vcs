@@ -129,6 +129,14 @@ export class RemoteAddCommand extends GitCommand<RemoteConfig> {
     if (store.isConfigured(this.name) || (await this.hasTrackingRefs(this.name))) {
       throw new RemoteAlreadyExistsError(this.name);
     }
+    // git dies before it writes `remote.<name>.url`: a name with a newline would break the file
+    if (!isValidRemoteName(this.name)) {
+      throw new InvalidArgumentError(
+        "name",
+        this.name,
+        `'${this.name}' is not a valid remote name`,
+      );
+    }
 
     const config: RemoteConfig = {
       name: this.name,
@@ -473,7 +481,7 @@ function matchesPattern(pattern: string, name: string): boolean {
 }
 
 /** git's valid_remote_name: `refs/remotes/<name>/test` is a valid ref name. */
-function isValidRemoteName(name: string): boolean {
+export function isValidRemoteName(name: string): boolean {
   return name.length > 0 && isValidRefName(`refs/remotes/${name}/test`);
 }
 

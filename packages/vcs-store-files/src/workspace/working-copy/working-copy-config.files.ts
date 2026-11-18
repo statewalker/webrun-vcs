@@ -22,6 +22,33 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 /**
+ * Thrown where git refuses a config file (`fatal: bad config line <n> in file <file>`): an
+ * unknown escape (`\x`), a quote still open at the end of a line, a header or variable
+ * name git does not accept. The line follows git's count: a value continued with a
+ * backslash ends on the last of its lines.
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   await config.load();
+ * } catch (error) {
+ *   if (error instanceof ConfigParseError) console.error(`fatal: ${error.message}`);
+ * }
+ * ```
+ */
+export class ConfigParseError extends Error {
+  constructor(
+    /** The file as git names it (`.git/config`, or a host path) */
+    readonly file: string,
+    /** The line git names, from 1 */
+    readonly line: number,
+  ) {
+    super(`bad config line ${line} in file ${file}`);
+    this.name = "ConfigParseError";
+  }
+}
+
+/**
  * Files API subset needed for config operations
  */
 export interface ConfigFilesApi {
@@ -30,14 +57,24 @@ export interface ConfigFilesApi {
 }
 
 /**
- * A single physical line of the config file.
+ * A line of the config file: one physical line, or the physical lines of a variable whose
+ * value runs on with backslashes at their ends (its `text` then holds them joined by `\n`).
  *
  * The parsed line list is what makes `save()` non-destructive: lines that were
  * not touched are written back verbatim, so comments, blank lines, key order
  * and hand-written formatting survive a round-trip.
  */
 type ConfigLine =
-  | { kind: "text"; text: string }
+  | {
+      kind: "text";
+      text: string;
+      /**
+       * A variable written before any section header: git lists it under its bare name
+       * (`git config --list` shows `top=1`) but no key with a section reaches it, and
+       * git's commands warn `key does not contain a section`. Kept as text otherwise.
+       */
+      topLevel?: { key: string; value: unknown; written: string | undefined };
+    }
   | {
       kind: "section";
       text: string;
@@ -45,8 +82,18 @@ type ConfigLine =
       /** Canonical key of a variable written on the same line as the header. */
       inlineKey?: string;
       inlineValue?: unknown;
+      /** Its value as written (see {@link writtenValueOfLine}) */
+      inlineWritten?: string;
     }
-  | { kind: "entry"; text: string; section: string; key: string; value: unknown };
+  | {
+      kind: "entry";
+      text: string;
+      section: string;
+      key: string;
+      value: unknown;
+      /** The value as written: unquoted and unescaped, not converted; none without `=` */
+      written?: string;
+    };
 
 /**
  * Git-compatible working copy configuration.
@@ -64,9 +111,11 @@ type ConfigLine =
  * and spaces; when a key has more than three parts, the first part is the
  * section, the last is the name and everything between is the subsection.
  *
- * {@link set}, {@link add}, {@link unset} reject a key without a section,
- * because git config has no way to represent a variable outside a section;
- * {@link get} simply returns `undefined` for one.
+ * {@link set}, {@link add}, {@link unset} reject a key git's `git_config_parse_key`
+ * rejects (no section, a name not of letters, digits and `-` starting with a letter, a
+ * newline in the subsection), with git's message, so nothing is written that git's parser
+ * would refuse; {@link get} simply returns `undefined` for a key without a section (a
+ * variable written before any header is only listed, as git lists it).
  *
  * ## Multiple values
  *
@@ -259,9 +308,21 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (this.resolvedCache) return this.resolvedCache;
     const out: ConfigEntry[] = [...this.baseEntries];
     const emitted = new Set<string>();
-    for (const [index, line] of this.lines.entries()) {
+    // the physical line a variable ends on: what git names as its line
+    let lineEnd = 0;
+    for (const line of this.lines) {
+      lineEnd += physicalLines(line);
       const section = sectionOfLine(line);
       if (section !== undefined && this.removedSections.has(section)) continue;
+      if (line.kind === "text" && line.topLevel) {
+        const { key, value, written } = line.topLevel;
+        out.push({
+          key,
+          value,
+          origin: { file: originName(this.configPath), line: lineEnd, text: written },
+        });
+        continue;
+      }
       const key = keyOfLine(line);
       if (key !== undefined) {
         if (this.dirtyKeys.has(key) || !this.values.has(key)) {
@@ -276,7 +337,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
               line.kind === "entry" ? line.value : (line as { inlineValue?: unknown }).inlineValue,
             origin: {
               file: originName(this.configPath),
-              line: index + 1,
+              line: lineEnd,
               text: writtenValueOfLine(line),
             },
           });
@@ -285,14 +346,37 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       const included = this.includedEntries.get(line);
       if (included) out.push(...included);
     }
+    const inLines = new Set<string>();
+    for (const line of this.lines) {
+      const key = keyOfLine(line);
+      if (key !== undefined) inLines.add(key);
+    }
     for (const [key, values] of this.values) {
       if (emitted.has(key)) continue;
-      if (!this.dirtyKeys.has(key) && this.lines.some((l) => keyOfLine(l) === key)) continue;
+      if (!this.dirtyKeys.has(key) && inLines.has(key)) continue;
       for (const value of values) out.push({ key, value });
     }
     out.push(...this.overlayEntries);
     this.resolvedCache = out;
     return out;
+  }
+
+  /** The chain's values by key, built from {@link resolved} when it changes. */
+  private resolvedIndex?: { of: ConfigEntry[]; byKey: Map<string, ConfigEntry[]> };
+
+  /** Every value of `key` (canonical) in the chain's order, without a scan of the chain. */
+  private entriesOf(key: string): ConfigEntry[] {
+    const all = this.resolved();
+    if (this.resolvedIndex?.of !== all) {
+      const byKey = new Map<string, ConfigEntry[]>();
+      for (const entry of all) {
+        const list = byKey.get(entry.key);
+        if (list) list.push(entry);
+        else byKey.set(entry.key, [entry]);
+      }
+      this.resolvedIndex = { of: all, byKey };
+    }
+    return this.resolvedIndex.byKey.get(key) ?? [];
   }
 
   /**
@@ -307,12 +391,17 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (!this.loaded) await this.mergeIntoExistingFile();
 
     const content = this.serializeGitConfig();
+    // never write what git (or the next load here) would refuse to read
+    const check = parseConfigText(content);
+    if (check.errorLine !== undefined) {
+      throw new ConfigParseError(originName(this.configPath), check.errorLine);
+    }
     const body = encodeGitPath(content);
     await this.files.write(this.configPath, this.bom ? withBom(body) : body);
 
     // Re-adopt the line structure we just wrote (keeping the in-memory values,
     // which are authoritative) so a following save() is stable.
-    const parsed = parseConfigText(content);
+    const parsed = check;
     this.lines = parsed.lines;
     this.trailingNewline = parsed.trailingNewline;
     this.dirtyKeys.clear();
@@ -327,9 +416,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   get(key: string): unknown {
     const canonical = canonicalizeKey(key);
     if (!canonical) return undefined;
-    const all = this.resolved();
-    for (let i = all.length - 1; i >= 0; i--) if (all[i].key === canonical) return all[i].value;
-    return undefined;
+    const entries = this.entriesOf(canonical);
+    return entries.length > 0 ? entries[entries.length - 1].value : undefined;
   }
 
   /**
@@ -338,9 +426,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   getAll(key: string): unknown[] {
     const canonical = canonicalizeKey(key);
     if (!canonical) return [];
-    return this.resolved()
-      .filter((e) => e.key === canonical)
-      .map((e) => e.value);
+    return this.entriesOf(canonical).map((e) => e.value);
   }
 
   /**
@@ -351,13 +437,37 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   getAllWithOrigin(key: string): ConfigValueOrigin[] {
     const canonical = canonicalizeKey(key);
     if (!canonical) return [];
-    return this.resolved()
-      .filter((e) => e.key === canonical)
-      .map((e) =>
-        e.origin
-          ? { value: e.value, text: e.origin.text, file: e.origin.file, line: e.origin.line }
-          : { value: e.value, text: e.value === true ? undefined : String(e.value) },
-      );
+    return this.entriesOf(canonical).map((e) =>
+      e.origin
+        ? { value: e.value, text: e.origin.text, file: e.origin.file, line: e.origin.line }
+        : { value: e.value, text: e.value === true ? undefined : String(e.value) },
+    );
+  }
+
+  /**
+   * Every value of the chain in its order with its key, as `git config --list --show-origin`
+   * lists them: the text as written (undefined for a variable without `=`), the file and
+   * the line it was read from (the last line of a value continued with backslashes).
+   *
+   * @example
+   * ```typescript
+   * for (const { key, text, file } of config.listWithOrigin()) {
+   *   console.log(`file:${file}\t${text === undefined ? key : `${key}=${text}`}`);
+   * }
+   * ```
+   */
+  listWithOrigin(): (ConfigValueOrigin & { key: string })[] {
+    return this.resolved().map((e) =>
+      e.origin
+        ? {
+            key: e.key,
+            value: e.value,
+            text: e.origin.text,
+            file: e.origin.file,
+            line: e.origin.line,
+          }
+        : { key: e.key, value: e.value, text: e.value === true ? undefined : String(e.value) },
+    );
   }
 
   /**
@@ -398,10 +508,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   /**
    * Set a configuration value, replacing all existing values of the key.
    *
-   * @throws TypeError if the key has no section part
+   * @throws TypeError where git's `git_config_parse_key` refuses the key (git's message)
    */
   set(key: string, value: unknown): void {
     const canonical = requireCanonicalKey(key);
+    requireStorableValue(key, value);
     this.values.set(canonical, [value]);
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
@@ -412,10 +523,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
    * Append a value to a key, keeping the values already set (git's
    * `config --add`).
    *
-   * @throws TypeError if the key has no section part
+   * @throws TypeError where git's `git_config_parse_key` refuses the key (git's message)
    */
   add(key: string, value: unknown): void {
     const canonical = requireCanonicalKey(key);
+    requireStorableValue(key, value);
     const values = this.values.get(canonical);
     if (values) values.push(value);
     else this.values.set(canonical, [value]);
@@ -427,7 +539,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   /**
    * Remove all values of a key.
    *
-   * @throws TypeError if the key has no section part
+   * @throws TypeError where git's `git_config_parse_key` refuses the key (git's message)
    */
   unset(key: string): void {
     const canonical = requireCanonicalKey(key);
@@ -482,7 +594,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
    */
   renameSection(oldSection: string, newSection: string): void {
     const from = canonicalizeSection(oldSection);
-    const to = canonicalizeSection(newSection);
+    const to = requireSectionName(newSection);
     if (from === to) return;
     this.resolvedCache = undefined;
     const renamed = (key: string) => `${to}${key.slice(from.length)}`;
@@ -507,7 +619,14 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
           const key = renamed(line.inlineKey);
           return [
             header,
-            { kind: "entry", section: to, key, value: line.inlineValue, text: `\t${rest}` },
+            {
+              kind: "entry",
+              section: to,
+              key,
+              value: line.inlineValue,
+              written: line.inlineWritten,
+              text: `\t${rest}`,
+            },
           ];
         }
         if (inside && line.kind === "entry") {
@@ -570,7 +689,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
    */
   copySection(oldSection: string, newSection: string): void {
     const from = canonicalizeSection(oldSection);
-    const to = canonicalizeSection(newSection);
+    const to = requireSectionName(newSection);
     if (from === to || this.removedSections.has(from)) return;
     this.resolvedCache = undefined;
     const renamed = (key: string) => `${to}${key.slice(from.length)}`;
@@ -617,7 +736,14 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
         copy = [{ kind: "section", section: to, text: formatSectionHeader(to) }];
         if (line.inlineKey !== undefined) {
           const key = renamed(line.inlineKey);
-          copy.push({ kind: "entry", section: to, key, value: line.inlineValue, text: "" });
+          copy.push({
+            kind: "entry",
+            section: to,
+            key,
+            value: line.inlineValue,
+            written: line.inlineWritten,
+            text: "",
+          });
           copyOf(key, line.inlineValue);
           this.dirtyKeys.add(key);
         }
@@ -704,6 +830,9 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
    */
   private adoptText(text: string): void {
     const parsed = parseConfigText(text);
+    if (parsed.errorLine !== undefined) {
+      throw new ConfigParseError(originName(this.configPath), parsed.errorLine);
+    }
     this.lines = parsed.lines;
     this.trailingNewline = parsed.trailingNewline;
     this.dirtyKeys.clear();
@@ -952,8 +1081,17 @@ class ChainReader {
       content = undefined;
     }
     if (!content) return;
-    const { lines } = parseConfigText(decodeGitPatternFile(content));
-    for (const [index, line] of lines.entries()) {
+    const { lines, errorLine } = parseConfigText(decodeGitPatternFile(content));
+    const file = originName(source.path, source.host);
+    if (errorLine !== undefined) throw new ConfigParseError(file, errorLine);
+    let lineEnd = 0;
+    for (const line of lines) {
+      lineEnd += physicalLines(line);
+      if (line.kind === "text" && line.topLevel) {
+        const { key, value, written } = line.topLevel;
+        out.push({ key, value, origin: { file, line: lineEnd, text: written } });
+        continue;
+      }
       const key = keyOfLine(line);
       if (key === undefined) continue;
       const value =
@@ -962,8 +1100,8 @@ class ChainReader {
         key,
         value,
         origin: {
-          file: originName(source.path, source.host),
-          line: index + 1,
+          file,
+          line: lineEnd,
           text: writtenValueOfLine(line),
         },
       });
@@ -1072,27 +1210,66 @@ class ChainReader {
 
 /**
  * Normalise a key to its canonical form: the section and name parts are
- * lower-cased, the subsection (everything between them) keeps its case.
+ * lower-cased, the subsection (everything between the first and the last dot) keeps its
+ * case, an empty one included (`remote..url` is `[remote ""]`).
  *
  * @returns undefined when the key has no section part
  */
 function canonicalizeKey(key: string): string | undefined {
-  const parts = key.split(".");
-  if (parts.length < 2) return undefined;
-  const section = parts[0].toLowerCase();
-  const name = parts[parts.length - 1].toLowerCase();
-  const subsection = parts.slice(1, -1).join(".");
-  return subsection ? `${section}.${subsection}.${name}` : `${section}.${name}`;
+  const first = key.indexOf(".");
+  const last = key.lastIndexOf(".");
+  if (first <= 0 || last === key.length - 1) return undefined;
+  const section = key.slice(0, first).toLowerCase();
+  const name = key.slice(last + 1).toLowerCase();
+  if (first === last) return `${section}.${name}`;
+  return `${section}.${key.slice(first + 1, last)}.${name}`;
 }
 
+/** C's `isalnum` or `-`: git's `iskeychar`. */
+const isAsciiKeyChar = (c: string) =>
+  (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c === "-";
+
+/**
+ * git's `git_config_parse_key`: the key's canonical form, or git's error. The section
+ * (before the first dot) and the name (after the last) are letters, digits and `-`, the
+ * name starting with a letter; the subsection between them may hold anything but a newline
+ * (and NUL, which a C string cannot hold). What passes is what git's parser reads back.
+ *
+ * @throws TypeError with git's message: `key does not contain a section: <key>`,
+ * `key does not contain variable name: <key>`, `invalid key: <key>`,
+ * `invalid key (newline): <key>`
+ */
 function requireCanonicalKey(key: string): string {
-  const canonical = canonicalizeKey(key);
-  if (!canonical) {
-    throw new TypeError(
-      `Invalid git config key "${key}": a key must have a section, e.g. "core.bare" or "remote.origin.url"`,
-    );
+  const last = key.lastIndexOf(".");
+  if (last <= 0) throw new TypeError(`key does not contain a section: ${key}`);
+  if (last === key.length - 1) throw new TypeError(`key does not contain variable name: ${key}`);
+  let dot = false;
+  for (let i = 0; i < key.length; i++) {
+    const c = key[i];
+    if (c === ".") dot = true;
+    if (!dot || i > last) {
+      if (!isAsciiKeyChar(c) || (i === last + 1 && !isAlpha(c))) {
+        throw new TypeError(`invalid key: ${key}`);
+      }
+    } else if (c === "\n") {
+      throw new TypeError(`invalid key (newline): ${key}`);
+    } else if (c === "\0") {
+      throw new TypeError(`invalid key: ${key}`);
+    }
   }
-  return canonical;
+  return canonicalizeKey(key) as string;
+}
+
+/**
+ * A value git can hold: a C string ends at NUL, so a value with one would read back cut
+ * short (git's parser truncates there).
+ *
+ * @throws TypeError `invalid value (NUL): <key>`
+ */
+function requireStorableValue(key: string, value: unknown): void {
+  if (typeof value === "string" && value.includes("\0")) {
+    throw new TypeError(`invalid value (NUL): ${key}`);
+  }
 }
 
 /** `section.subsection` (or `section`) part of a canonical key. */
@@ -1108,13 +1285,29 @@ function canonicalizeSection(section: string): string {
 }
 
 /**
+ * git's `section_name_is_ok` for the name a section is renamed or copied to, canonical: not
+ * empty, letters, digits and `-` before the first dot. A newline (or NUL) in the
+ * subsection is refused too, where git would write a header its own parser refuses.
+ *
+ * @throws TypeError `invalid section name: <name>`
+ */
+function requireSectionName(section: string): string {
+  const dot = section.indexOf(".");
+  const base = dot < 0 ? section : section.slice(0, dot);
+  const sub = dot < 0 ? "" : section.slice(dot + 1);
+  if (base === "" || [...base].some((c) => !isAsciiKeyChar(c)) || /[\n\0]/.test(sub)) {
+    throw new TypeError(`invalid section name: ${section}`);
+  }
+  return canonicalizeSection(section);
+}
+
+/**
  * git's `section_name_match`: where a header line naming the section `name`
  * (`branch.feat`) ends, the whitespace after it included, or 0 when it names another one.
  * The header is matched as written, case and all (`[Branch "feat"]` is not `branch.feat`).
  */
 function headerNames(text: string, name: string): number {
-  const isSpace = (c: string | undefined) =>
-    c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\v" || c === "\f";
+  const isSpace = isConfigSpace;
   let i = 0;
   while (isSpace(text[i])) i++;
   if (text[i] !== "[") return 0;
@@ -1156,136 +1349,321 @@ function sectionOfLine(line: ConfigLine): string | undefined {
 
 /* --------------------------------------------------------------- parsing */
 
+/** What {@link parseConfigText} gives: the logical lines, and git's error, if it has one. */
+interface ParsedConfig {
+  lines: ConfigLine[];
+  trailingNewline: boolean;
+  /**
+   * The line git's `bad config line <n>` names, where git refuses the file (an unknown
+   * escape, an unterminated quote, a bad header or variable name); the lines before it are
+   * parsed, the rest kept as text
+   */
+  errorLine?: number;
+}
+
+/** One header or variable git's parser reads, and the physical lines (from 0) it spans. */
+type ConfigItem =
+  | { kind: "section"; section: string; start: number; end: number }
+  | { kind: "entry"; name: string; written: string | undefined; start: number; end: number };
+
+/** git's `isspace` (`sane_ctype`): space, tab, newline and carriage return, not `\v` or `\f` */
+const isConfigSpace = (c: string | undefined) =>
+  c === " " || c === "\t" || c === "\n" || c === "\r";
+const isAlpha = (c: string) => (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+/** git's `iskeychar`: alphanumeric or `-` */
+const isKeyChar = (c: string) => isAlpha(c) || (c >= "0" && c <= "9") || c === "-";
+
+/** git's `config_source` reading a string: `get_next_char` with its line counter. */
+class ConfigCursor {
+  private pos = 0;
+  /** git's `linenr`: from 1, one more for each newline read and for each read at the end */
+  linenr = 1;
+  /** The physical line (from 0) of the next character */
+  physical = 0;
+  /** The physical line of the character read last */
+  last = 0;
+  eof = false;
+
+  constructor(private readonly text: string) {}
+
+  next(): string {
+    if (this.pos >= this.text.length) {
+      this.eof = true;
+      this.linenr++;
+      this.last = this.physical;
+      return "\n";
+    }
+    let c = this.text[this.pos++];
+    // DOS line ends: `\r\n` reads as `\n`, a lone `\r` as itself
+    if (c === "\r" && this.text[this.pos] === "\n") {
+      this.pos++;
+      c = "\n";
+    }
+    this.last = this.physical;
+    if (c === "\n") {
+      this.linenr++;
+      this.physical++;
+    }
+    return c;
+  }
+}
+
 /**
- * Parse git config text into physical lines.
- *
- * Format:
+ * git's `git_parse_source` over a whole file: its headers and variables, each with the
+ * physical lines it spans (a value continued with a backslash at the end of a line runs on
+ * to the next), and the line git's `bad config line <n>` names when git refuses the file.
+ */
+function scanConfig(text: string): { items: ConfigItem[]; errorLine?: number } {
+  const cs = new ConfigCursor(text);
+  const items: ConfigItem[] = [];
+  let comment = false;
+  for (;;) {
+    const start = cs.physical;
+    const c = cs.next();
+    if (c === "\n") {
+      if (cs.eof) return { items };
+      comment = false;
+      continue;
+    }
+    if (comment || isConfigSpace(c)) continue;
+    if (c === "#" || c === ";") {
+      comment = true;
+      continue;
+    }
+    if (c === "[") {
+      const section = readSectionHeader(cs);
+      if (section === undefined || section === "") return { items, errorLine: cs.linenr };
+      items.push({ kind: "section", section, start, end: cs.last });
+      continue;
+    }
+    if (!isAlpha(c)) return { items, errorLine: cs.linenr };
+    // get_value: the name, blanks, then `=` and the value or the end of the line
+    let name = c.toLowerCase();
+    let d = cs.next();
+    while (!cs.eof && isKeyChar(d)) {
+      name += d.toLowerCase();
+      d = cs.next();
+    }
+    while (d === " " || d === "\t") d = cs.next();
+    let written: string | undefined;
+    if (d !== "\n") {
+      if (d !== "=") return { items, errorLine: cs.linenr };
+      written = readConfigValue(cs);
+      if (written === undefined) return { items, errorLine: cs.linenr };
+      // git hands the value on as a C string: it ends at the first NUL
+      const nul = written.indexOf("\0");
+      if (nul >= 0) written = written.slice(0, nul);
+    }
+    items.push({ kind: "entry", name, written, start, end: cs.last });
+  }
+}
+
+/**
+ * git's `get_base_var` / `get_extended_base_var` after the `[`: `section`, `section.sub`
+ * (lower-cased) or `section "sub"` (the subsection's case kept, a backslash escaping the
+ * next character, `"]` closing it); undefined where git refuses it.
+ */
+function readSectionHeader(cs: ConfigCursor): string | undefined {
+  let name = "";
+  for (;;) {
+    let c = cs.next();
+    if (cs.eof) return undefined;
+    if (c === "]") return name;
+    if (isConfigSpace(c)) {
+      do {
+        if (c === "\n") {
+          cs.linenr--;
+          return undefined;
+        }
+        c = cs.next();
+      } while (isConfigSpace(c));
+      if (c !== '"') return undefined;
+      name += ".";
+      for (;;) {
+        let s = cs.next();
+        if (s === "\n") {
+          cs.linenr--;
+          return undefined;
+        }
+        if (s === '"') break;
+        if (s === "\\") {
+          s = cs.next();
+          if (s === "\n") {
+            cs.linenr--;
+            return undefined;
+          }
+        }
+        name += s;
+      }
+      return cs.next() === "]" ? name : undefined;
+    }
+    if (!isKeyChar(c) && c !== ".") return undefined;
+    name += c.toLowerCase();
+  }
+}
+
+/**
+ * git's `parse_value`, after the `=`: blanks around the value dropped, `"..."` keeping them
+ * (and `#`, `;`), `\n` `\t` `\b` `\"` `\\` unescaped, a backslash at the end of a line
+ * joining the next one, an unquoted `#` or `;` starting a comment; undefined (git refuses
+ * the line) for another escape or a quote still open at the end of the line.
+ */
+function readConfigValue(cs: ConfigCursor): string | undefined {
+  let quote = false;
+  let comment = false;
+  let trimLength = 0;
+  let value = "";
+  for (;;) {
+    let c = cs.next();
+    if (c === "\n") {
+      if (quote) {
+        cs.linenr--;
+        return undefined;
+      }
+      return trimLength ? value.slice(0, trimLength) : value;
+    }
+    if (comment) continue;
+    if (isConfigSpace(c) && !quote) {
+      if (!trimLength) trimLength = value.length;
+      if (value.length) value += c;
+      continue;
+    }
+    if (!quote && (c === ";" || c === "#")) {
+      comment = true;
+      continue;
+    }
+    trimLength = 0;
+    if (c === "\\") {
+      c = cs.next();
+      switch (c) {
+        case "\n":
+          continue;
+        case "t":
+          c = "\t";
+          break;
+        case "b":
+          c = "\b";
+          break;
+        case "n":
+          c = "\n";
+          break;
+        case "\\":
+        case '"':
+          break;
+        default:
+          return undefined;
+      }
+      value += c;
+      continue;
+    }
+    if (c === '"') {
+      quote = !quote;
+      continue;
+    }
+    value += c;
+  }
+}
+
+/**
+ * Parse git config text into logical lines: a physical line, or the lines a variable
+ * continued with a backslash spans (joined with `\n`, so they are written back as they
+ * were). Format:
  * ```ini
  * # comment
  * [section]
- *     key = value
+ *     key = value ; comment
+ *     long = "first \
+ *             second"
  * [section "subsection"]
  *     key = value
  * ```
+ * Where git refuses the file the lines from the bad one on are kept as text (see
+ * {@link ParsedConfig.errorLine}).
  */
-function parseConfigText(text: string): { lines: ConfigLine[]; trailingNewline: boolean } {
+function parseConfigText(text: string): ParsedConfig {
   const raw = text.split("\n");
   let trailingNewline = false;
   if (raw.length > 0 && raw[raw.length - 1] === "") {
     raw.pop();
     trailingNewline = true;
   }
+  const { items, errorLine } = scanConfig(text);
+  const lastLine = Math.max(0, raw.length - 1);
+
+  // the items of each group of physical lines (an item's lines, and those of the items
+  // that start on its last line)
+  const groups: { start: number; end: number; items: ConfigItem[] }[] = [];
+  for (const item of items) {
+    const end = Math.min(item.end, lastLine);
+    const group = groups[groups.length - 1];
+    if (group && item.start <= group.end) {
+      group.items.push(item);
+      group.end = Math.max(group.end, end);
+    } else {
+      groups.push({ start: item.start, end: Math.max(end, item.start), items: [item] });
+    }
+  }
 
   const lines: ConfigLine[] = [];
   let section = "";
-
-  for (const text of raw) {
-    const trimmed = text.trim();
-
-    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) {
-      lines.push({ kind: "text", text });
-      continue;
+  let next = 0;
+  for (const group of groups) {
+    for (; next < group.start && next < raw.length; next++) {
+      lines.push({ kind: "text", text: raw[next] });
     }
-
-    if (trimmed.startsWith("[")) {
-      const header = parseSectionHeader(trimmed);
-      if (header) {
-        section = header.section;
-        const line: ConfigLine = { kind: "section", text, section };
-        // git allows a variable on the same line as the section header.
-        const inline = header.rest ? parseEntry(header.rest) : undefined;
-        if (inline) {
-          line.inlineKey = `${section}.${inline.name}`;
-          line.inlineValue = inline.value;
-        }
-        lines.push(line);
-        continue;
+    const groupText = raw.slice(group.start, group.end + 1).join("\n");
+    next = group.end + 1;
+    let header: Extract<ConfigLine, { kind: "section" }> | undefined;
+    let entry: Extract<ConfigItem, { kind: "entry" }> | undefined;
+    for (const item of group.items) {
+      if (item.kind === "section") {
+        section = item.section;
+        header = { kind: "section", text: groupText, section };
+        entry = undefined;
+      } else {
+        entry = item;
       }
-      lines.push({ kind: "text", text });
-      continue;
     }
-
-    const entry = section ? parseEntry(trimmed) : undefined;
-    if (entry) {
+    if (header) {
+      // git allows a variable on the same line as the section header
+      if (entry) {
+        header.inlineKey = `${section}.${entry.name}`;
+        header.inlineValue = convertValue(entry.written);
+        header.inlineWritten = entry.written;
+      }
+      lines.push(header);
+    } else if (entry && section) {
       lines.push({
         kind: "entry",
-        text,
+        text: groupText,
         section,
         key: `${section}.${entry.name}`,
-        value: entry.value,
+        value: convertValue(entry.written),
+        written: entry.written,
       });
-      continue;
+    } else if (entry) {
+      // a variable before any section: kept verbatim, listed under its bare name as git does
+      lines.push({
+        kind: "text",
+        text: groupText,
+        topLevel: { key: entry.name, value: convertValue(entry.written), written: entry.written },
+      });
+    } else {
+      lines.push({ kind: "text", text: groupText });
     }
-
-    // Unparseable (or outside any section): keep it verbatim.
-    lines.push({ kind: "text", text });
   }
+  for (; next < raw.length; next++) lines.push({ kind: "text", text: raw[next] });
 
-  return { lines, trailingNewline };
+  return errorLine === undefined
+    ? { lines, trailingNewline }
+    : { lines, trailingNewline, errorLine };
 }
 
-const SECTION_NAME_CHAR = /[A-Za-z0-9.-]/;
-const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9-]*$/;
-
-/**
- * Parse `[section]`, `[section.subsection]` or `[section "subsection"]`.
- *
- * The subsection of the quoted form keeps its case and may contain any
- * character (escaped with a backslash where needed); the dotted form is
- * lower-cased, as git does.
- */
-function parseSectionHeader(trimmed: string): { section: string; rest: string } | undefined {
-  let i = 1; // skip "["
-  while (i < trimmed.length && /\s/.test(trimmed[i])) i++;
-
-  const nameStart = i;
-  while (i < trimmed.length && SECTION_NAME_CHAR.test(trimmed[i])) i++;
-  const name = trimmed.slice(nameStart, i);
-  if (!name) return undefined;
-
-  while (i < trimmed.length && /\s/.test(trimmed[i])) i++;
-
-  let subsection: string | undefined;
-  if (trimmed[i] === '"') {
-    i++;
-    let value = "";
-    while (i < trimmed.length && trimmed[i] !== '"') {
-      if (trimmed[i] === "\\" && i + 1 < trimmed.length) i++;
-      value += trimmed[i];
-      i++;
-    }
-    if (trimmed[i] !== '"') return undefined; // unterminated
-    i++;
-    subsection = value;
-    while (i < trimmed.length && /\s/.test(trimmed[i])) i++;
-  }
-
-  if (trimmed[i] !== "]") return undefined;
-  i++;
-
-  const section =
-    subsection !== undefined ? `${name.toLowerCase()}.${subsection}` : name.toLowerCase();
-  return { section, rest: trimmed.slice(i).trim() };
-}
-
-/**
- * Parse a `name = value` line. A name with no `=` is boolean true, as in git.
- */
-function parseEntry(trimmed: string): { name: string; value: unknown } | undefined {
-  const eq = trimmed.indexOf("=");
-  if (eq < 0) {
-    const name = stripComment(trimmed).trim();
-    if (!VARIABLE_NAME.test(name)) return undefined;
-    return { name: name.toLowerCase(), value: true };
-  }
-  const name = trimmed.slice(0, eq).trim();
-  if (!VARIABLE_NAME.test(name)) return undefined;
-  return { name: name.toLowerCase(), value: parseValue(trimmed.slice(eq + 1)) };
-}
-
-function stripComment(text: string): string {
-  const at = text.search(/[#;]/);
-  return at < 0 ? text : text.slice(0, at);
+/** The number of physical lines a logical line spans. */
+function physicalLines(line: ConfigLine): number {
+  let n = 1;
+  for (let i = line.text.indexOf("\n"); i >= 0; i = line.text.indexOf("\n", i + 1)) n++;
+  return n;
 }
 
 /**
@@ -1293,23 +1671,17 @@ function stripComment(text: string): string {
  * converted); undefined for a line that is no variable or has no `=`.
  */
 function writtenValueOfLine(line: ConfigLine): string | undefined {
-  const body =
-    line.kind === "entry"
-      ? line.text.trim()
-      : line.kind === "section"
-        ? parseSectionHeader(line.text.trim())?.rest
-        : undefined;
-  if (body === undefined) return undefined;
-  const eq = body.indexOf("=");
-  return eq < 0 ? undefined : parseValueText(body.slice(eq + 1));
+  if (line.kind === "entry") return line.written;
+  if (line.kind === "section") return line.inlineWritten;
+  return undefined;
 }
 
 /**
- * Parse a config value: unquote, unescape, drop an unquoted trailing comment,
- * then apply git's boolean spellings and a lossless number conversion.
+ * A value as {@link GitWorkingCopyConfig.get} gives it: `true` for a variable without `=`,
+ * git's boolean spellings as booleans, a lossless number conversion.
  */
-function parseValue(input: string): unknown {
-  const text = parseValueText(input);
+function convertValue(text: string | undefined): unknown {
+  if (text === undefined) return true;
   const lower = text.toLowerCase();
   if (lower === "true" || lower === "yes" || lower === "on") return true;
   if (lower === "false" || lower === "no" || lower === "off") return false;
@@ -1321,38 +1693,6 @@ function parseValue(input: string): unknown {
   }
 
   return text;
-}
-
-/** A config value unquoted and unescaped, an unquoted trailing comment dropped. */
-function parseValueText(input: string): string {
-  const raw = input.replace(/^[ \t]+/, ""); // whitespace after "=" is not part of the value
-  let out = "";
-  let end = 0; // length of `out` up to the last significant character
-  let quoted = false;
-
-  for (let i = 0; i < raw.length; i++) {
-    const char = raw[i];
-
-    if (!quoted && (char === "#" || char === ";")) break;
-
-    if (char === '"') {
-      quoted = !quoted;
-      continue;
-    }
-
-    if (char === "\\" && i + 1 < raw.length) {
-      i++;
-      const escaped = raw[i];
-      out += escaped === "n" ? "\n" : escaped === "t" ? "\t" : escaped === "b" ? "\b" : escaped; // \\ , \" and anything else: the character itself
-      end = out.length;
-      continue;
-    }
-
-    out += char;
-    if (quoted || !/\s/.test(char)) end = out.length;
-  }
-
-  return out.slice(0, end);
 }
 
 /* ----------------------------------------------------------- serializing */

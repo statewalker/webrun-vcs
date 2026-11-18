@@ -44,6 +44,7 @@ import type { Staging, WorkingCopy } from "@statewalker/vcs-working-tree";
 import { RevisionError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { applyRefspecs } from "./branch-tracking.js";
+import { configLoadError } from "./core-config.js";
 import { approxidateCareful, formatRfc2822Date } from "./git-date.js";
 
 /** The stores a revision is read from. */
@@ -78,6 +79,14 @@ export interface RevisionSources {
   staging?: () => Staging | undefined;
   /** The configuration (`branch.*`, `remote.*`, `push.default`) */
   workingCopy: WorkingCopy;
+  /**
+   * Whether something is at `path` (from the top of the worktree) in the worktree, as git's
+   * `lstat` finds it; for git's diagnostics of a misspelt `<rev>:<path>` and `:<path>`
+   * (`exists on disk, but not in ...`) and `check_filename`. Absent: nothing is
+   */
+  fileExists?: (path: string) => Promise<boolean>;
+  /** The top of the worktree as the host names it, for `'x' is outside repository at '<dir>'` */
+  worktreeHostPath?: string;
 }
 
 type ObjectType = "commit" | "tree" | "blob" | "tag";
@@ -95,6 +104,13 @@ export interface ResolveOptions {
   hint?: DisambiguateHint;
   /** git's `GET_OID_QUIETLY`: no `error:` lines for an ambiguous short id */
   quiet?: boolean;
+  /**
+   * git's `GET_OID_ONLY_TO_DIE` (`maybe_die_on_misspelt_object_name`): a `<rev>:<path>` or
+   * `:<path>` that names nothing dies with git's diagnosis (`path 'x' does not exist in
+   * 'HEAD'`, `path 'x' exists on disk, but not in the index`, ...); `:/<text>` is not
+   * searched
+   */
+  onlyToDie?: boolean;
 }
 
 /** git's `get_short_oid` result. */
@@ -103,9 +119,6 @@ type ShortOid =
   | { status: "missing" }
   | { status: "ambiguous" }
   | { status: "invalid" };
-
-/** The values git's `core.disambiguate` takes (`set_disambiguate_hint_config`). */
-const DISAMBIGUATE_HINTS = ["none", "commit", "committish", "tree", "treeish", "blob"];
 
 const HEX_DIGIT = /^[0-9a-fA-F]$/;
 const isHexDigit = (c: string | undefined) => c !== undefined && HEX_DIGIT.test(c);
@@ -192,7 +205,7 @@ export class RevisionResolver {
     const direct = await this.oid1(name, options);
     if (direct !== undefined) return direct;
     if (name.startsWith(":")) {
-      if (name.length > 2 && name[1] === "/") {
+      if (!options.onlyToDie && name.length > 2 && name[1] === "/") {
         return this.oneline(name.slice(2), await this.allRefCommits());
       }
       let stage = 0;
@@ -201,7 +214,12 @@ export class RevisionResolver {
         stage = Number(name[1]);
         path = name.slice(3);
       }
-      return this.indexEntry(this.relativePath(path, name), stage);
+      const resolved = this.relativePath(path, name);
+      const found = await this.indexEntry(resolved, stage);
+      if (found === undefined && options.onlyToDie && name.length > 1 && name[1] !== "/") {
+        await this.diagnoseIndexPath(name, stage, resolved);
+      }
+      return found;
     }
     // <tree-ish>:<path>, the first `:` outside `@{...}` / `^{...}`
     let depth = 0;
@@ -213,11 +231,19 @@ export class RevisionResolver {
       } else if (depth > 0 && c === "}") {
         depth--;
       } else if (depth === 0 && c === ":") {
-        const treeish = await this.oid1(name.slice(0, i), { ...options, hint: "treeish" });
-        if (treeish === undefined) return undefined;
+        const objectName = name.slice(0, i);
+        const treeish = await this.oid1(objectName, { ...options, hint: "treeish" });
+        if (treeish === undefined) {
+          if (options.onlyToDie) this.die(name, `fatal: invalid object name '${objectName}'.`);
+          return undefined;
+        }
+        const filename = this.relativePath(name.slice(i + 1), name);
         const tree = await this.peelToType(treeish, "tree");
-        if (tree === undefined) return undefined;
-        return this.treeEntry(tree, this.relativePath(name.slice(i + 1), name));
+        const found = tree === undefined ? undefined : await this.treeEntry(tree, filename);
+        if (found === undefined && options.onlyToDie) {
+          await this.diagnoseTreePath(name, objectName, tree, filename);
+        }
+        return found;
       }
     }
     return undefined;
@@ -842,7 +868,11 @@ export class RevisionResolver {
   }
 
   /** `:<n>:<path>`: the index entry of `path` at `stage`. */
-  private async indexEntry(path: string, stage: number): Promise<ObjectId | undefined> {
+  private indexEntry(path: string, stage: number): Promise<ObjectId | undefined> {
+    return this.indexEntryAt(path, stage);
+  }
+
+  private async indexEntryAt(path: string, stage: number): Promise<ObjectId | undefined> {
     let staging: Staging | undefined;
     try {
       staging = this.sources.staging?.();
@@ -1042,31 +1072,14 @@ export class RevisionResolver {
 
   /**
    * git's `set_disambiguate_hint_config` as its config loading runs it, before any revision
-   * is read: every value of `core.disambiguate` in the configuration's order, git dying at
-   * the first it does not know (`error: unknown hint type for 'core.disambiguate': foo` or,
-   * for a variable without `=`, `error: missing value for 'core.disambiguate'`, then
-   * `fatal: bad config variable 'core.disambiguate' in file '<file>' at line <n>`). The file
-   * is named as the configuration knows it (`.git/config` for a repository opened at
-   * `.git`); a value with no file (set in memory) dies as git's command-line config does.
-   * Checked once per resolver; native git dies on loading its config in every command,
-   * here only commands that read a revision do.
+   * is read (see {@link configLoadError}). Commands check it when they start, as every git
+   * command does; checked here too, once per resolver, for a resolver used on its own.
    */
   private checkDisambiguateConfig(name: string): void {
     if (this.disambiguateChecked) return;
     this.disambiguateChecked = true;
-    const key = "core.disambiguate";
-    for (const { text, file, line } of this.remoteConfig().valuesWithOrigin(key)) {
-      if (text !== undefined && DISAMBIGUATE_HINTS.includes(text.toLowerCase())) continue;
-      const error =
-        text === undefined
-          ? `error: missing value for '${key}'`
-          : `error: unknown hint type for '${key}': ${text}`;
-      const fatal =
-        file !== undefined && line !== undefined
-          ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
-          : `fatal: unable to parse '${key}' from command-line config`;
-      throw new RevisionError(name, [...this.warnings, error, fatal].join("\n"));
-    }
+    const failure = configLoadError(this.sources.workingCopy);
+    if (failure) throw new RevisionError(name, [...this.warnings, failure.message].join("\n"));
   }
 
   /** `core.disambiguate` (git's `default_disambiguate_hint`); "none" and unset are no hint. */
@@ -1131,9 +1144,102 @@ export class RevisionResolver {
     if (!path.startsWith("./") && !path.startsWith("../")) return path;
     const normalized = normalizePath(this.cwdPrefix + path);
     if (normalized === undefined) {
-      throw new RevisionError(revision, `fatal: '${path}' is outside repository`);
+      // prefix_path's die: the worktree named as the host names it
+      const top = this.sources.worktreeHostPath;
+      const at = top === undefined ? "" : ` at '${top}'`;
+      const error = new RevisionError(revision, `fatal: '${path}' is outside repository${at}`);
+      this.diagnoses.add(error);
+      throw error;
     }
     return normalized;
+  }
+
+  /**
+   * git's `maybe_die_on_misspelt_object_name`: `name` read again quietly with
+   * `GET_OID_ONLY_TO_DIE`, for its better diagnosis of a `<rev>:<path>` or `:<path>` that
+   * names nothing (thrown); where git's read just fails (or dies of something it would not
+   * print quietly) this returns, for the caller's general message.
+   *
+   * @throws RevisionError with git's diagnosis (`fatal: path 'x' does not exist in 'HEAD'`,
+   *   `fatal: '../x' is outside repository at '/repo'`, ...)
+   */
+  async dieOnMisspeltObjectName(name: string): Promise<void> {
+    try {
+      await this.resolve(name, { quiet: true, onlyToDie: true });
+    } catch (error) {
+      if (error instanceof RevisionError && this.diagnoses.has(error)) throw error;
+    }
+  }
+
+  /** The errors {@link dieOnMisspeltObjectName} passes on. */
+  private readonly diagnoses = new WeakSet<RevisionError>();
+
+  private die(revision: string, message: string): never {
+    const error = new RevisionError(revision, [...this.warnings, message].join("\n"));
+    this.diagnoses.add(error);
+    throw error;
+  }
+
+  /**
+   * Whether something is at `path` on disk, from the top of the worktree: git's `file_exists`
+   * runs after setup moved to the top, whatever the current directory was.
+   */
+  private async onDisk(path: string): Promise<boolean> {
+    const exists = this.sources.fileExists;
+    // git's file_exists: lstat of the path as written (`a.txt/` is no file)
+    return exists ? exists(path) : false;
+  }
+
+  /** git's `diagnose_invalid_oid_path`: `<objectName>:<filename>` named nothing. */
+  private async diagnoseTreePath(
+    name: string,
+    objectName: string,
+    tree: ObjectId | undefined,
+    filename: string,
+  ): Promise<never> {
+    if (await this.onDisk(filename)) {
+      this.die(name, `fatal: path '${filename}' exists on disk, but not in '${objectName}'`);
+    }
+    const fullname = `${this.cwdPrefix}${filename}`;
+    if (tree !== undefined && (await this.treeEntry(tree, fullname)) !== undefined) {
+      this.die(
+        name,
+        `fatal: path '${fullname}' exists, but not '${filename}'\n` +
+          `hint: Did you mean '${objectName}:${fullname}' aka '${objectName}:./${filename}'?`,
+      );
+    }
+    this.die(name, `fatal: path '${filename}' does not exist in '${objectName}'`);
+  }
+
+  /** git's `diagnose_invalid_index_path`: `:<stage>:<filename>` named nothing. */
+  private async diagnoseIndexPath(name: string, stage: number, filename: string): Promise<never> {
+    const stageOf = async (path: string): Promise<number | undefined> => {
+      for (const n of [0, 1, 2, 3] as const) {
+        if ((await this.indexEntryAt(path, n)) !== undefined) return n;
+      }
+      return undefined;
+    };
+    const atStage = await stageOf(filename);
+    if (atStage !== undefined) {
+      this.die(
+        name,
+        `fatal: path '${filename}' is in the index, but not at stage ${stage}\n` +
+          `hint: Did you mean ':${atStage}:${filename}'?`,
+      );
+    }
+    const fullname = `${this.cwdPrefix}${filename}`;
+    const fullStage = await stageOf(fullname);
+    if (fullStage !== undefined) {
+      this.die(
+        name,
+        `fatal: path '${fullname}' is in the index, but not '${filename}'\n` +
+          `hint: Did you mean ':${fullStage}:${fullname}' aka ':${fullStage}:./${filename}'?`,
+      );
+    }
+    if (await this.onDisk(filename)) {
+      this.die(name, `fatal: path '${filename}' exists on disk, but not in the index`);
+    }
+    this.die(name, `fatal: path '${filename}' does not exist (neither on disk nor in the index)`);
   }
 
   // ------------------------------------------------------------------ helpers

@@ -850,12 +850,14 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       blobs: history.blobs,
       trees: history.trees,
     });
+    let config: Awaited<ReturnType<typeof createWorkingCopyConfig>> | undefined;
     const stash = createGitStashStore({
       history,
       staging,
       worktree,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
+      coreAbbrev: () => config?.get("core.abbrev"),
     });
     const configOptions: GitConfigOptions = {
       ...(this.options.environment ? { environment: this.options.environment } : {}),
@@ -868,7 +870,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
         return text?.startsWith("ref: ") ? text.slice(5).trim() : undefined;
       };
     }
-    const config = await createWorkingCopyConfig(
+    config = await createWorkingCopyConfig(
       this.configFiles(),
       this.commonDir,
       undefined,

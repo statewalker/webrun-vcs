@@ -19,6 +19,7 @@
 import { GitCommand } from "../git-command.js";
 import { LogCommand, type LogResult } from "./log-command.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
+import { parseRevisionAndPathArgs, type RevisionAndPathArgs } from "./revision-filenames.js";
 import { type ParsedRevisionArgs, parseRevisionArgs } from "./revision-range.js";
 
 /**
@@ -36,6 +37,7 @@ import { type ParsedRevisionArgs, parseRevisionArgs } from "./revision-range.js"
  */
 export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private readonly revisions: string[] = [];
+  private readonly mixed: string[] = [];
   private committish = true;
   private readonly configure: ((log: LogCommand) => void)[] = [];
 
@@ -43,6 +45,26 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   addRevision(revision: string): this {
     this.checkCallable();
     this.revisions.push(revision);
+    return this;
+  }
+
+  /**
+   * An argument of `git log <args>` as given on its command line, revisions and paths mixed
+   * (after the revisions of {@link addRevision}): `--` separates them; without it each
+   * revision must not also name a file (`fatal: ambiguous argument 'x': both revision and
+   * filename`), and from the first argument that is no revision on all are paths that must
+   * exist (`fatal: path 'x' does not exist in 'HEAD'`, `fatal: ambiguous argument 'x':
+   * unknown revision or path not in the working tree.`, ...), as git checks them.
+   *
+   * @example
+   * ```typescript
+   * // git log main a.txt
+   * await git.revList().addArgument("main").addArgument("a.txt").call();
+   * ```
+   */
+  addArgument(arg: string): this {
+    this.checkCallable();
+    this.mixed.push(arg);
     return this;
   }
 
@@ -77,12 +99,29 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     return this;
   }
 
-  /** The revisions read: what is included and excluded, in git's pending order. */
-  async resolve(): Promise<ParsedRevisionArgs> {
-    return parseRevisionArgs(this.revisionResolver(), this.revisions, {
+  /**
+   * The revisions read: what is included and excluded, in git's pending order, and the
+   * paths among the arguments of {@link addArgument}.
+   */
+  async resolve(): Promise<RevisionAndPathArgs> {
+    const resolver = this.revisionResolver();
+    const options = {
       committish: this.committish,
-      mergeBases: (a, b) => revisionMergeBases(this.commits, a, b),
-    });
+      mergeBases: (a: string, b: string) => revisionMergeBases(this.commits, a, b),
+    };
+    const parsed: ParsedRevisionArgs = await parseRevisionArgs(resolver, this.revisions, options);
+    if (this.mixed.length === 0) return { ...parsed, paths: [] };
+    const more = await parseRevisionAndPathArgs(
+      resolver,
+      this.mixed,
+      this.argumentFiles(),
+      options,
+    );
+    return {
+      entries: [...parsed.entries, ...more.entries],
+      warnings: resolver.warnings,
+      paths: more.paths,
+    };
   }
 
   async call(): Promise<AsyncIterable<LogResult>> {
@@ -91,8 +130,11 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     const log = new LogCommand(this._workingCopy);
     for (const configure of this.configure) configure(log);
     // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none
-    if (this.revisions.some((revision) => revision !== "--not")) {
-      const { entries } = await this.resolve();
+    const named = (args: string[]) => args.some((arg) => arg !== "--not" && arg !== "--");
+    if (named(this.revisions) || named(this.mixed)) {
+      const { entries, paths } = await this.resolve();
+      for (const path of paths) log.addPath(path);
+      const revised = entries.length > 0 || this.revisions.some((r) => r !== "--not");
       const resolver = this.revisionResolver();
       let included = 0;
       for (const entry of entries) {
@@ -105,7 +147,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
           included++;
         }
       }
-      if (included === 0) return empty();
+      if (included === 0 && revised) return empty();
     }
     return log.call();
   }

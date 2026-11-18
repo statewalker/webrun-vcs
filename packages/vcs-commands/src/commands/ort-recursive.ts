@@ -10,7 +10,7 @@ import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 
 import type { CommandCommits, CommandTrees } from "../git-command.js";
 import { type BaseNode, commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
-import { abbrev, flatTree, prunedFlatTrees } from "./merge-support.js";
+import { flatTree, prunedFlatTrees } from "./merge-support.js";
 import {
   type OrtMergeOptions,
   type OrtMergeResult,
@@ -37,6 +37,11 @@ export interface VirtualBaseContext {
   commits: CommandCommits;
   trees: CommandTrees;
   blobs: Blobs;
+  /**
+   * A single merge base's label: git's `strbuf_add_unique_abbrev(..., DEFAULT_ABBREV)`
+   * (the command's `abbreviateObjectId`)
+   */
+  abbreviate: (id: ObjectId) => Promise<string>;
 }
 
 /**
@@ -74,7 +79,8 @@ async function mergedBases(
 ): Promise<MergeBaseTree> {
   const [first, ...rest] = bases;
   if (!first) return emptyBase();
-  const label = rest.length > 0 ? "merged common ancestors" : abbrev(first.id ?? "");
+  const label =
+    rest.length > 0 ? "merged common ancestors" : first.id ? await ctx.abbreviate(first.id) : "";
   if (rest.length === 0 && first.id) {
     // one real commit: its stored tree
     const treeId = await ctx.commits.getTree(first.id);

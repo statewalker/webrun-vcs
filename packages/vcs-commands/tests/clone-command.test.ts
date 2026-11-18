@@ -400,6 +400,15 @@ describe.each(backends)("CloneCommand ($name backend)", ({ factory }) => {
         "Depth must be at least 1",
       );
     });
+
+    it("refuses a remote name git's valid_remote_name refuses, before fetching", async () => {
+      const workingCopy = await createTestWorkingCopy();
+      const git = Git.fromWorkingCopy(workingCopy);
+
+      await expect(
+        git.clone().setURI("http://example.com/repo.git").setRemote("a\nb").call(),
+      ).rejects.toThrow("'a\nb' is not a valid remote name");
+    });
   });
 
   describe("bare clone", () => {

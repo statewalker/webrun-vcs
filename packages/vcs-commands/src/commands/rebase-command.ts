@@ -28,7 +28,6 @@ import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
-  abbrev,
   conflictsComment,
   FlatTreeCache,
   flatTree,
@@ -479,7 +478,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const commit = await this.commits.load(id);
       steps.push({
         action: RebaseAction.PICK,
-        commit: abbrev(id),
+        commit: await this.abbreviateObjectId(id),
         shortMessage: subjectOf(commit?.message ?? ""),
       });
     }
@@ -601,7 +600,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const parentId = commit.parents[0];
     const parentTreeId = parentId ? await this.commits.getTree(parentId) : undefined;
     const subject = subjectOf(commit.message);
-    const label = `${abbrev(item.id)} (${subject})`;
+    // short_commit_name: repo_find_unique_abbrev with DEFAULT_ABBREV
+    const short = await this.abbreviateObjectId(item.id);
+    const label = `${short} (${subject})`;
     const baseLabel = parentId ? `parent of ${label}` : "(empty tree)";
     // the trees as merge-ort reads them: what all three hold alike is never read
     const merge = await mergeStoredTrees(
@@ -657,12 +658,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         currentCommit: item.id,
         conflicts: [...new Set(merge.conflicts.keys())].sort(),
         message: [
-          `error: could not apply ${abbrev(item.id)}... ${subject}`,
+          `error: could not apply ${short}... ${subject}`,
           "hint: Resolve all conflicts manually, mark them as resolved with",
           'hint: "git add/rm <conflicted_files>", then run "git rebase --continue".',
           'hint: You can instead skip this commit: run "git rebase --skip".',
           'hint: To abort and get back to the state before "git rebase", run "git rebase --abort".',
-          `Could not apply ${abbrev(item.id)}... ${subject}`,
+          // the todo line's rest as git 2.5x writes it (`# <subject>`)
+          `Could not apply ${short}... # ${subject}`,
         ].join("\n"),
       };
     }
@@ -958,7 +960,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         subject = subjectOf((await this.commits.load(item.id))?.message ?? "");
         this.subjects.set(item.id, subject);
       }
-      out += `${item.action} ${item.id} ${subject}\n`;
+      // git 2.5x's make_script with its default `rebase.instructionFormat` (`# %s`)
+      out += `${item.action} ${item.id} # ${subject}\n`;
     }
     return out;
   }
