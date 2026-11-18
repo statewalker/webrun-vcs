@@ -1,5 +1,11 @@
-import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { IndexChangedError, type IndexEntry, type Worktree } from "@statewalker/vcs-working-tree";
+import {
+  type Commit,
+  FileMode,
+  type ObjectId,
+  type PersonIdent,
+  type TreeEntry,
+} from "@statewalker/vcs-core";
+import type { Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   EmptyCommitError,
@@ -14,7 +20,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
 import { withoutCrud } from "./git-ident.js";
-import { OperationState, writeIndexAsTree } from "./merge-support.js";
+import { OperationState, updateIndexCacheTree, writeIndexAsTree } from "./merge-support.js";
 import {
   CleanupMode,
   cleanupWith,
@@ -271,11 +277,20 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
-   * Set paths to commit (--only mode).
+   * Set paths to commit (`git commit --only <paths>`, git's partial commit).
    *
-   * When set, only the specified paths are taken from the staging area.
-   * All other paths are taken from the parent commit's tree. This allows
-   * partial commits without affecting unstaged changes to other files.
+   * As git's `prepare_index`: the paths the given ones name in the index or in HEAD (a path
+   * names itself and everything under it, "." everything) are taken from the worktree, as
+   * `git add` would take them (cleaned by the content filters; a file gone is removed, an
+   * intent-to-add entry gets the file's content, a conflicted path is resolved to the
+   * file), into the index and into a temporary index made from HEAD. The commit records
+   * the temporary index: HEAD's tree with only these paths changed, whatever else is
+   * staged. The index keeps its other staged changes and is written with the named paths
+   * updated once the commit is made (nothing changes when the commit fails). A
+   * skip-worktree path keeps its HEAD version. A given path neither the index nor HEAD
+   * knows fails with git's "error: pathspec '<path>' did not match any file(s) known to
+   * git"; a partial commit during a merge, a cherry-pick or a rebase is refused. Other
+   * unmerged paths do not stop it (they stay unmerged in the index).
    *
    * Cannot be combined with setAll().
    *
@@ -348,14 +363,19 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   async call(): Promise<CommitResult> {
     this.checkCallable();
+    // the index as it is now: one another writer replaced is read again (git reads the
+    // index at its start), unless this instance holds unwritten edits (refused)
+    await this.readCurrentIndex();
+    const partial = this.onlyPaths.length > 0;
 
     // Handle --all flag: auto-stage modified tracked files
     if (this.all) {
       await this.stageTrackedChanges();
     }
 
-    // Check for conflicts
-    if (await this.staging.hasConflicts()) {
+    // Check for conflicts (a partial commit records HEAD and the named paths: other
+    // unmerged paths stay in the index, as git's)
+    if (!partial && (await this.staging.hasConflicts())) {
       const conflictPaths = await this.staging.getConflictedPaths();
       throw new UnmergedPathsError(
         conflictPaths,
@@ -380,6 +400,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
         "fatal: You are in the middle of a merge -- cannot amend.",
       );
     }
+    // a partial commit: the paths named, from the index and HEAD (git's list_paths)
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    const partialPaths = partial
+      ? await this.listPartialPaths(state, mergeHeads, headId)
+      : undefined;
     let message = this.message;
     const given = message !== undefined;
     if (message === undefined && !this.amend) {
@@ -493,21 +518,60 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
 
     // Generate tree from staging area
-    // an index another writer replaced since this instance read it is refused, as every
-    // index write refuses it: its stale entries are not committed
-    if (await this.staging.isOutdated()) throw new IndexChangedError("index");
     let treeId: ObjectId;
 
-    if (this.onlyPaths.length > 0 && parents.length > 0) {
-      // --only mode: combine parent tree with specified paths from staging
-      treeId = await this.buildOnlyTree(parents[0]);
+    if (partialPaths) {
+      // a partial commit: HEAD's tree with the named paths as the worktree has them; the
+      // index gets them too, written once the commit is made (git rolls it back otherwise)
+      treeId = await this.preparePartialCommit(partialPaths, headId);
+      let made: CommitResult;
+      try {
+        made = await this.finishCommit(treeId, parents, mergeHeads, pickHead, {
+          author,
+          committer,
+          finalMessage,
+          state,
+          amendedId,
+        });
+      } catch (error) {
+        await this.staging.read();
+        throw error;
+      }
+      // the real index, with a cache-tree made valid as git's cache_tree_update before
+      // write_locked_index (none while it holds conflicts)
+      await updateIndexCacheTree(this.staging, this.trees);
+      await this.staging.write();
+      return made;
     } else {
       // Normal mode: use full staging area; as git's prepare_index, the index is written
       // again with a fully valid cache-tree (cache_tree_update, which keeps the valid nodes:
       // a stored subtree no edit touched stays the one stored)
       treeId = await writeIndexAsTree(this.staging, this.trees);
     }
+    return this.finishCommit(treeId, parents, mergeHeads, pickHead, {
+      author,
+      committer,
+      finalMessage,
+      state,
+      amendedId,
+    });
+  }
 
+  /** The commit of `treeId` made, HEAD moved to it, and what was in progress ended. */
+  private async finishCommit(
+    treeId: ObjectId,
+    parents: ObjectId[],
+    mergeHeads: ObjectId[],
+    pickHead: ObjectId | undefined,
+    info: {
+      author: PersonIdent;
+      committer: PersonIdent;
+      finalMessage: string;
+      state: OperationState;
+      amendedId: ObjectId | undefined;
+    },
+  ): Promise<CommitResult> {
+    const { author, committer, finalMessage, state, amendedId } = info;
     // Check for empty commit (a merge may record HEAD's tree)
     if (!this.allowEmpty && parents.length > 0 && mergeHeads.length === 0) {
       const parentCommit = await this.commits.load(parents[0]);
@@ -629,96 +693,169 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
-   * Build tree for --only mode.
-   *
-   * Combines parent tree with specified paths from staging area.
-   *
-   * @param parentCommitId Parent commit ID
-   * @returns Tree ObjectId
+   * The paths a partial commit takes (git's `list_paths`): those of the index (any stage)
+   * and of HEAD's tree the given paths name, each with whether its index entry is
+   * skip-worktree. Refused during a merge, a cherry-pick or a rebase (git's whence), and
+   * when a given path names nothing known (`report_path_error`).
    */
-  private async buildOnlyTree(parentCommitId: ObjectId): Promise<ObjectId> {
-    const parentCommit = await this.commits.load(parentCommitId);
-    if (!parentCommit) {
-      throw new RefNotFoundError(parentCommitId, "Parent commit not found");
+  private async listPartialPaths(
+    state: OperationState,
+    mergeHeads: ObjectId[],
+    headId: ObjectId | undefined,
+  ): Promise<Map<string, boolean>> {
+    if (mergeHeads.length > 0) {
+      throw new InvalidArgumentError(
+        "only",
+        this.onlyPaths,
+        "fatal: cannot do a partial commit during a merge.",
+      );
+    }
+    const pick = await state.ref("CHERRY_PICK_HEAD");
+    if (pick) {
+      // sequencer_determine_whence: a rebase stopped at this pick, else a cherry-pick
+      const rebasing =
+        (await state.read("rebase-merge/head-name")) !== undefined &&
+        (await state.ref("REBASE_HEAD")) === pick;
+      throw new InvalidArgumentError(
+        "only",
+        this.onlyPaths,
+        `fatal: cannot do a partial commit during a ${rebasing ? "rebase" : "cherry-pick"}.`,
+      );
     }
 
-    // Collect staging entries for onlyPaths
-    const onlyPathSet = new Set(this.onlyPaths);
-    const stagingEntriesMap = new Map<string, { objectId: ObjectId; mode: number }>();
-    // the index as it is, given back once the tree is written (flags and stat included)
-    const saved: IndexEntry[] = [];
-
-    for await (const entry of this.staging.entries()) {
-      saved.push(entry);
-      if (onlyPathSet.has(entry.path) && entry.stage === 0) {
-        stagingEntriesMap.set(entry.path, {
-          objectId: entry.objectId,
-          mode: entry.mode,
-        });
+    const patterns = this.onlyPaths;
+    const matched = new Set<string>();
+    const matches = (path: string): boolean => {
+      let any = false;
+      for (const pattern of patterns) {
+        if (pattern === "." || path === pattern || path.startsWith(`${pattern}/`)) {
+          matched.add(pattern);
+          any = true;
+        }
       }
+      return any;
+    };
+    const paths = new Map<string, boolean>();
+    for await (const entry of this.staging.entries()) {
+      if (!matches(entry.path)) continue;
+      paths.set(entry.path, (paths.get(entry.path) ?? false) || entry.skipWorktree === true);
     }
-
-    // Create builder and populate with filtered tree
-    const builder = this.staging.createBuilder();
-
-    // Walk parent tree and add entries NOT in onlyPaths
-    await this.addTreeFiltered(builder, parentCommit.tree, "", onlyPathSet);
-
-    // Add staging entries for onlyPaths
-    for (const [path, { objectId, mode }] of stagingEntriesMap) {
-      builder.add({
-        path,
-        mode,
-        objectId,
-        size: 0,
-        mtime: Date.now(),
-      });
+    if (headId) {
+      const head = await this.commits.load(headId);
+      if (head) await this.collectTreePaths(head.tree, "", matches, paths);
     }
+    const unmatched = patterns.filter((p) => !matched.has(p));
+    if (unmatched.length > 0) {
+      throw new InvalidArgumentError(
+        "only",
+        unmatched,
+        unmatched
+          .map((p) => `error: pathspec '${p}' did not match any file(s) known to git`)
+          .join("\n"),
+      );
+    }
+    return paths;
+  }
 
-    await builder.finish();
-
-    // Now write tree from staging
-    try {
-      return await this.staging.writeTree(this.trees);
-    } finally {
-      // the temporary index goes: later writes keep the index's own entries untouched
-      const restore = this.staging.createBuilder();
-      for (const entry of saved) restore.add(entry);
-      await restore.finish();
+  /** The files of a tree the given paths name, added to `paths` (not skip-worktree). */
+  private async collectTreePaths(
+    treeId: ObjectId,
+    prefix: string,
+    matches: (path: string) => boolean,
+    paths: Map<string, boolean>,
+  ): Promise<void> {
+    for await (const entry of this.trees.loadTree(treeId)) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.mode === FileMode.TREE) {
+        // only directories a given path can name something in
+        const inside = this.onlyPaths.some(
+          (p) => p === "." || p === path || p.startsWith(`${path}/`) || path.startsWith(`${p}/`),
+        );
+        if (inside) await this.collectTreePaths(entry.id, path, matches, paths);
+      } else if (matches(path) && !paths.has(path)) {
+        paths.set(path, false);
+      }
     }
   }
 
   /**
-   * Recursively walk tree and add entries to builder, excluding specified paths.
+   * git's partial commit (`prepare_index`, `add_remove_files`): the named paths (but the
+   * skip-worktree ones) are taken from the worktree into the index, in memory (the caller
+   * writes it once the commit is made), and HEAD's tree with them is the tree committed.
    */
-  private async addTreeFiltered(
-    builder: ReturnType<typeof this.staging.createBuilder>,
-    treeId: ObjectId,
-    prefix: string,
-    excludePaths: Set<string>,
-  ): Promise<void> {
-    for await (const entry of this.trees.loadTree(treeId)) {
-      const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+  private async preparePartialCommit(
+    paths: Map<string, boolean>,
+    headId: ObjectId | undefined,
+  ): Promise<ObjectId> {
+    const taken = [...paths].filter(([, skipWorktree]) => !skipWorktree).map(([path]) => path);
+    if (taken.length > 0) {
+      const worktree = this.getWorktreeIterator();
+      if (!worktree) {
+        throw new StoreNotAvailableError(
+          "Worktree",
+          "Working tree iterator required for a partial commit. " +
+            "Ensure WorkingCopy has worktree or call setWorktreeStore().",
+        );
+      }
+      // add_to_index of each existing file (ignored or not), remove_file_from_index of
+      // each one gone
+      const add = new AddCommand(this._workingCopy);
+      for (const path of taken) add.addFilepattern(path);
+      add.setForce(true);
+      add.setWriteIndex(false);
+      add.setWorktreeStore(worktree);
+      await add.call();
+    }
 
-      // Check if this is a tree (directory)
-      const isTree = (entry.mode & 0o170000) === 0o040000;
+    // the temporary index: HEAD's tree with the same paths as the index now has them
+    const edits = new Map<string, { mode: number; id: ObjectId } | null>();
+    for (const path of taken) {
+      const entry = await this.staging.getEntry(path);
+      edits.set(
+        path,
+        entry && !entry.intentToAdd ? { mode: entry.mode, id: entry.objectId } : null,
+      );
+    }
+    const head = headId ? await this.commits.load(headId) : undefined;
+    if (headId && !head) throw new RefNotFoundError(headId, "HEAD commit not found");
+    return (await this.editTree(head?.tree, [...edits])) ?? this.trees.store([]);
+  }
 
-      if (isTree) {
-        // Recursively process subtree
-        await this.addTreeFiltered(builder, entry.id, fullPath, excludePaths);
-      } else {
-        // Only add if not in excluded paths
-        if (!excludePaths.has(fullPath)) {
-          builder.add({
-            path: fullPath,
-            mode: entry.mode,
-            objectId: entry.id,
-            size: 0,
-            mtime: Date.now(),
-          });
-        }
+  /**
+   * A tree with the given files set (or removed, for null), only the directories on their
+   * paths stored again; undefined when nothing is left in it.
+   */
+  private async editTree(
+    treeId: ObjectId | undefined,
+    edits: Array<[string, { mode: number; id: ObjectId } | null]>,
+  ): Promise<ObjectId | undefined> {
+    const entries = new Map<string, TreeEntry>();
+    if (treeId) {
+      for await (const entry of this.trees.loadTree(treeId)) entries.set(entry.name, entry);
+    }
+    const subdirs = new Map<string, Array<[string, { mode: number; id: ObjectId } | null]>>();
+    for (const [path, edit] of edits) {
+      const slash = path.indexOf("/");
+      if (slash >= 0) {
+        const dir = path.slice(0, slash);
+        const list = subdirs.get(dir) ?? [];
+        list.push([path.slice(slash + 1), edit]);
+        subdirs.set(dir, list);
+      } else if (edit) {
+        entries.set(path, { name: path, mode: edit.mode, id: edit.id });
+      } else if (entries.get(path)?.mode !== FileMode.TREE) {
+        entries.delete(path);
       }
     }
+    for (const [dir, list] of subdirs) {
+      const existing = entries.get(dir);
+      const base = existing?.mode === FileMode.TREE ? existing.id : undefined;
+      const id = await this.editTree(base, list);
+      if (id) entries.set(dir, { name: dir, mode: FileMode.TREE, id });
+      else if (base) entries.delete(dir);
+    }
+    if (entries.size === 0) return undefined;
+    return this.trees.store([...entries.values()]);
   }
 
   /**

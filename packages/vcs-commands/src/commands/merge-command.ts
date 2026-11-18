@@ -339,6 +339,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
   async call(): Promise<MergeResult> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run(worktree);
     return worktree?.batch ? worktree.batch(run) : run();

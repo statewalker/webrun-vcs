@@ -160,6 +160,7 @@ export class AddCommand extends GitCommand<AddResult> {
   private intentToAdd = false;
   private renormalize = false;
   private worktreeIterator: Worktree | undefined;
+  private writeIndex = true;
 
   /**
    * Add a path to a file/directory whose content should be added.
@@ -311,6 +312,19 @@ export class AddCommand extends GitCommand<AddResult> {
   }
 
   /**
+   * Whether the index is written at the end (the default). Without, the staging area is
+   * only updated in memory and the caller writes it: git commit's partial commit
+   * (`add_remove_files`), whose index is written only once the commit is made.
+   *
+   * @internal
+   */
+  setWriteIndex(write: boolean): this {
+    this.checkCallable();
+    this.writeIndex = write;
+    return this;
+  }
+
+  /**
    * Execute the add command.
    *
    * @returns Result with lists of added, skipped, and removed paths
@@ -320,6 +334,10 @@ export class AddCommand extends GitCommand<AddResult> {
   async call(): Promise<AddResult> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
 
     // Validate options - update and all are mutually exclusive
     if (this.update && this.all !== undefined) {
@@ -506,6 +524,10 @@ export class AddCommand extends GitCommand<AddResult> {
       }
 
       if (this.intentToAdd) {
+        // git's add_to_index with ADD_CACHE_NEW_ONLY: a path with a stage-0 entry (tracked,
+        // or already intent-to-add) is left as it is; a conflicted one (no stage 0) has its
+        // stages replaced by the intent-to-add entry, as git does
+        if (await this.staging.getEntry(file.path)) continue;
         resolve(file.path);
         // Just mark as intent-to-add (placeholder with empty blob)
         const worktreeEntry = await worktree.getEntry(file.path);
@@ -566,7 +588,7 @@ export class AddCommand extends GitCommand<AddResult> {
     if (resolveUndo.length > 0) this.staging.recordResolveUndo?.(resolveUndo);
 
     // Persist staging changes (required for FileStagingStore)
-    await this.staging.write();
+    if (this.writeIndex) await this.staging.write();
 
     return {
       added,

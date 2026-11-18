@@ -45,6 +45,8 @@ export class FileStagingStore implements Staging {
   private racyCheck?: RacyCheck;
   /** The entries as last read or written (others were set in this session: up to date) */
   private asRead = new Set<StagingEntry>();
+  /** Whether the entries or extensions changed since they were last read or written */
+  private unwritten = false;
   private version: IndexVersion = INDEX_VERSION_2;
   private readonly indexFile: IndexFile;
 
@@ -233,14 +235,17 @@ export class FileStagingStore implements Staging {
   }
 
   recordResolveUndo(records: readonly ResolveUndoRecord[]): void {
+    this.unwritten = true;
     this.indexFile.recordResolveUndo(records);
   }
 
   clearResolveUndo(): void {
+    this.unwritten = true;
     this.indexFile.clearResolveUndo();
   }
 
   setCacheTree(tree: CacheTree | undefined): void {
+    this.unwritten = true;
     // the entries it describes: later edits before the write invalidate their paths
     this.indexFile.setCacheTree(tree, this._entries);
   }
@@ -254,6 +259,7 @@ export class FileStagingStore implements Staging {
   }
 
   async clear(): Promise<void> {
+    this.unwritten = true;
     this._entries = [];
   }
 
@@ -339,6 +345,7 @@ export class FileStagingStore implements Staging {
     treeId: ObjectId,
     options?: { keepResolveUndo?: boolean; keepMatching?: boolean | "flags" },
   ): Promise<void> {
+    this.unwritten = true;
     const before = this._entries;
     this._entries = [];
     // a whole tree replaces the index: git's read-tree and unpack-trees drop resolve-undo
@@ -382,6 +389,7 @@ export class FileStagingStore implements Staging {
 
   async read(): Promise<void> {
     const read = await this.indexFile.read();
+    this.unwritten = false;
     if (!read) {
       // No index file - start empty
       this._entries = [];
@@ -404,6 +412,7 @@ export class FileStagingStore implements Staging {
       (entry) => this.asRead.has(entry),
     );
     await this.indexFile.write(this._entries);
+    this.unwritten = false;
     this.asRead = new Set(this._entries);
     this.updateTime = await this.indexMtime();
   }
@@ -420,6 +429,10 @@ export class FileStagingStore implements Staging {
     } catch {
       return 0;
     }
+  }
+
+  hasUnwrittenChanges(): boolean {
+    return this.unwritten;
   }
 
   async isOutdated(): Promise<boolean> {
@@ -494,6 +507,7 @@ export class FileStagingStore implements Staging {
 
   /** @internal - Used by builder/editor */
   _replaceEntries(newEntries: StagingEntry[]): void {
+    this.unwritten = true;
     this._entries = newEntries;
   }
 
@@ -517,6 +531,7 @@ export class FileStagingStore implements Staging {
 
   /** @internal - Set index version */
   _setVersion(version: IndexVersion): void {
+    this.unwritten = true;
     this.version = version;
   }
 }
@@ -553,8 +568,12 @@ class FileStagingBuilder implements IndexBuilder {
       size: options.size ?? 0,
       mtime: options.mtime ?? Date.now(),
       ctime: options.ctime,
+      mtimeNs: options.mtimeNs,
+      ctimeNs: options.ctimeNs,
       dev: options.dev,
       ino: options.ino,
+      uid: options.uid,
+      gid: options.gid,
       assumeValid: options.assumeValid,
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,

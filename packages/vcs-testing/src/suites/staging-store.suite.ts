@@ -494,6 +494,26 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
         expect(entry?.intentToAdd).toBe(true);
         expect(entry?.skipWorktree).toBe(true);
       });
+
+      it("preserves the whole stat data through a builder copy", async () => {
+        const stat = { mtimeNs: 123, ctime: 5000, ctimeNs: 456, uid: 7, gid: 8 };
+        const builder = ctx.stagingStore.createBuilder();
+        builder.add({ ...createEntry("file.txt"), ...stat });
+        await builder.finish();
+        // the entry given again as a copy (as an index rewritten around other paths)
+        const entry = await ctx.stagingStore.getEntry("file.txt");
+        if (!entry) throw new Error("file.txt missing");
+        // a store that keeps no such stat data (KV, SQL rows) has nothing to lose
+        if (entry.mtimeNs === undefined) return;
+        const again = ctx.stagingStore.createBuilder();
+        again.add({ ...entry });
+        await again.finish();
+        const copied = await ctx.stagingStore.getEntry("file.txt");
+        expect(copied?.mtimeNs).toBe(123);
+        expect(copied?.ctimeNs).toBe(456);
+        expect(copied?.uid).toBe(7);
+        expect(copied?.gid).toBe(8);
+      });
     });
 
     describe("Tree Operations", () => {

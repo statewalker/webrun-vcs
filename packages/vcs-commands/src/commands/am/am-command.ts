@@ -292,6 +292,10 @@ export class AmCommand extends GitCommand<AmResult> {
   async call(): Promise<AmResult> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
     try {
       return await this.run();
     } catch (error) {

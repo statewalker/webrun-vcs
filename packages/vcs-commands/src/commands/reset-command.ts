@@ -124,6 +124,10 @@ export class ResetCommand extends GitCommand<Ref> {
   async call(): Promise<Ref> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
 
     // If paths are specified, do path reset
     if (this.paths.length > 0) {

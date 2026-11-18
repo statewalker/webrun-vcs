@@ -213,6 +213,14 @@ export interface Staging {
   isOutdated(): Promise<boolean>;
 
   /**
+   * Whether this instance holds edits (entries, resolve-undo, cache-tree, version) made
+   * since the index was last read or written. A command may re-read an outdated index
+   * (as git reads the index at its start) only when there are none. Absent: unknown,
+   * treated as having edits.
+   */
+  hasUnwrittenChanges?(): boolean;
+
+  /**
    * Get last update time (ms since epoch)
    */
   getUpdateTime(): number;

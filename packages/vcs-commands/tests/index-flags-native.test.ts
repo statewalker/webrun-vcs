@@ -630,10 +630,33 @@ describeGit("intent-to-add, rm, a stale index and rebase over flagged entries, a
     expect(await cacheTreeProblems(ours)).toEqual([]);
   });
 
-  it("commit refuses an index another writer replaced since it was read", async () => {
+  it("commit reads again an index another writer replaced since it was read", async () => {
+    // git reads the index at the start of every command: the entries staged by the other
+    // writer are committed, not the stale ones this instance read
     const dir = join(root, "stale");
     buildPlain(dir);
     const g = await openOurs(dir);
+    put(dir, "a", "native\n");
+    gitOk(root, dir, "add", "a");
+    await g
+      .commit()
+      .setMessage("stale")
+      .setAuthorIdent(INTEROP_IDENT)
+      .setCommitterIdent(INTEROP_IDENT)
+      .call();
+    expect(gitOk(root, dir, "show", "HEAD:a")).toBe("native\n");
+    expect(gitOk(root, dir, "diff", "--cached", "--name-only").trim()).toBe("");
+  });
+
+  it("commit refuses an index another writer replaced while it holds unwritten edits", async () => {
+    const dir = join(root, "stale-edits");
+    buildPlain(dir);
+    const g = await openOurs(dir);
+    // an edit of this instance not written yet, which a re-read would lose
+    const staging = g.workingCopy.checkout.staging;
+    const entry = await staging.getEntry("d/x");
+    if (!entry) throw new Error("d/x not in the index");
+    await staging.setEntry({ ...entry, mtime: entry.mtime + 1000 });
     put(dir, "a", "native\n");
     gitOk(root, dir, "add", "a");
     const head = gitOk(root, dir, "rev-parse", "HEAD");
@@ -680,4 +703,287 @@ describeGit("intent-to-add, rm, a stale index and rebase over flagged entries, a
       gitOk(root, native, "ls-files", "-s", "-v"),
     );
   });
+});
+
+describeGit("add -N, commit --only, kept stat data and a stale instance, as git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "index-flags-follow-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  let k = 0;
+  /** a, d/x, d/y committed on main; with `side`, a branch changing d/x and main changing a */
+  function buildPlain(dir: string, side = false): void {
+    gitOk(root, root, "init", "-q", "-b", "main", dir);
+    put(dir, "a", "a\n");
+    put(dir, "d/x", "x\n");
+    put(dir, "d/y", "y\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "c0");
+    if (!side) return;
+    gitOk(root, dir, "checkout", "-q", "-b", "side");
+    put(dir, "d/x", "side\n");
+    gitOk(root, dir, "add", "d/x");
+    gitOk(root, dir, "commit", "-q", "-m", "side");
+    gitOk(root, dir, "checkout", "-q", "main");
+    put(dir, "a", "main\n");
+    gitOk(root, dir, "add", "a");
+    gitOk(root, dir, "commit", "-q", "-m", "main");
+  }
+
+  function pair(prepare: (dir: string) => void, side = false): { native: string; ours: string } {
+    const n = k++;
+    const native = join(root, `n${n}`);
+    const ours = join(root, `o${n}`);
+    for (const dir of [native, ours]) {
+      buildPlain(dir, side);
+      prepare(dir);
+    }
+    return { native, ours };
+  }
+
+  const lsFiles = (dir: string) => gitOk(root, dir, "ls-files", "-s", "-v");
+  const commitOurs = (g: Awaited<ReturnType<typeof openOurs>>, message: string) =>
+    g.commit().setMessage(message).setAuthorIdent(INTEROP_IDENT).setCommitterIdent(INTEROP_IDENT);
+
+  /** The stat data of every entry but those given, as the index file holds it. */
+  const statOf = async (dir: string, skip: (path: string) => boolean) => {
+    const parsed = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    return parsed.entries
+      .filter((e) => !skip(e.path))
+      .map(
+        (e) =>
+          `${e.path} ${e.mtime} ${e.mtimeNs ?? 0} ${e.ctime ?? 0} ${e.ctimeNs ?? 0} ${e.size} ${e.ino ?? 0}`,
+      );
+  };
+
+  it("add -N leaves a tracked or intent-to-add path alone (ADD_CACHE_NEW_ONLY)", async () => {
+    const { native, ours } = pair((dir) => {
+      put(dir, "n", "new\n");
+      gitOk(root, dir, "add", "-N", "n");
+      put(dir, "a", "changed\n");
+    });
+    for (const args of [["a"], ["n"], ["d"]]) gitOk(root, native, "add", "-N", ...args);
+    const afterIntent = lsFiles(native);
+    put(native, "d/x", "x2\n");
+    gitOk(root, native, "add", "d/x");
+    gitOk(root, native, "commit", "-q", "-m", "c1");
+    const g = await openOurs(ours);
+    for (const path of ["a", "n", "d"]) {
+      await g.add().addFilepattern(path).setIntentToAdd(true).call();
+    }
+    expect(lsFiles(ours)).toBe(afterIntent);
+    put(ours, "d/x", "x2\n");
+    await g.add().addFilepattern("d/x").call();
+    await commitOurs(g, "c1").call();
+    // a stays in the commit (it was never turned into an intent-to-add entry)
+    expect(gitOk(root, ours, "ls-tree", "-r", "--name-only", "HEAD").trim()).toBe("a\nd/x\nd/y");
+    expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(gitOk(root, native, "rev-parse", "HEAD"));
+    expect(lsFiles(ours)).toBe(lsFiles(native));
+    expect(gitOk(root, ours, "status", "--porcelain")).toBe(
+      gitOk(root, native, "status", "--porcelain"),
+    );
+  });
+
+  it("add -N of a conflicted path replaces its stages, as git's add_index_entry", async () => {
+    const { native, ours } = pair((dir) => {
+      const id = gitOk(root, dir, "rev-parse", "HEAD:d/y").trim();
+      gitOk(root, dir, "update-index", "--force-remove", "a");
+      execFileSync("git", ["update-index", "--index-info"], {
+        cwd: dir,
+        env: nativeGitEnv(root),
+        input: [1, 2, 3].map((s) => `100644 ${id} ${s}\ta\n`).join(""),
+      });
+    });
+    gitOk(root, native, "add", "-N", "a");
+    const g = await openOurs(ours);
+    await g.add().addFilepattern("a").setIntentToAdd(true).call();
+    expect(lsFiles(ours)).toBe(lsFiles(native));
+    expect(gitOk(root, ours, "ls-files", "--resolve-undo")).toBe(
+      gitOk(root, native, "ls-files", "--resolve-undo"),
+    );
+  });
+
+  /** commit --only twins: native `git commit --only` against ours, compared whole. */
+  async function onlyTwins(
+    prepare: (dir: string) => void,
+    paths: string[],
+  ): Promise<{ native: string; ours: string }> {
+    const { native, ours } = pair(prepare);
+    gitOk(root, native, "commit", "-q", "-m", "only", "--only", "--", ...paths);
+    const g = await openOurs(ours);
+    await commitOurs(g, "only")
+      .setOnly(...paths)
+      .call();
+    expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(gitOk(root, native, "rev-parse", "HEAD"));
+    expect(lsFiles(ours)).toBe(lsFiles(native));
+    expect(gitOk(root, ours, "status", "--porcelain")).toBe(
+      gitOk(root, native, "status", "--porcelain"),
+    );
+    // nothing looks changed by its stat that git does not see so
+    expect(gitOk(root, ours, "diff-files", "--name-status")).toBe(
+      gitOk(root, native, "diff-files", "--name-status"),
+    );
+    expect(await cacheTreeProblems(ours)).toEqual([]);
+    expect(await treeExtension(ours)).toBe(await treeExtension(native));
+    return { native, ours };
+  }
+
+  it("commit --only takes the worktree content of the paths, into the index too", async () => {
+    const { ours } = await onlyTwins(
+      (dir) => {
+        put(dir, "a", "staged\n");
+        gitOk(root, dir, "add", "a");
+        put(dir, "a", "worktree\n");
+        put(dir, "d/x", "other staged\n");
+        gitOk(root, dir, "add", "d/x");
+      },
+      ["a"],
+    );
+    expect(gitOk(root, ours, "show", "HEAD:a")).toBe("worktree\n");
+    expect(gitOk(root, ours, "diff", "--cached", "--name-only").trim()).toBe("d/x");
+  });
+
+  it("commit --only of an intent-to-add path commits the file", async () => {
+    const { ours } = await onlyTwins(
+      (dir) => {
+        put(dir, "n", "new\n");
+        gitOk(root, dir, "add", "-N", "n");
+        put(dir, "d/y", "staged\n");
+        gitOk(root, dir, "add", "d/y");
+      },
+      ["n"],
+    );
+    expect(gitOk(root, ours, "show", "HEAD:n")).toBe("new\n");
+  });
+
+  it("commit --only of a deleted file and a directory removes and takes them", async () => {
+    await onlyTwins(
+      (dir) => {
+        unlinkSync(join(dir, "d/y"));
+        put(dir, "d/x", "x2\n");
+        put(dir, "a", "staged\n");
+        gitOk(root, dir, "add", "a");
+      },
+      ["d"],
+    );
+  });
+
+  it("commit --only keeps the stat data of the other entries", async () => {
+    const { native, ours } = pair((dir) => {
+      put(dir, "a", "changed\n");
+      gitOk(root, dir, "add", "a");
+    });
+    const before = await statOf(ours, (p) => p === "a");
+    gitOk(root, native, "commit", "-q", "-m", "only", "--only", "a");
+    const g = await openOurs(ours);
+    await commitOurs(g, "only").setOnly("a").call();
+    expect(await statOf(ours, (p) => p === "a")).toEqual(before);
+    // a later write keeps them too
+    put(ours, "d/x", "x2\n");
+    await g.add().addFilepattern("d/x").call();
+    expect(await statOf(ours, (p) => p === "a" || p === "d/x")).toEqual(
+      before.filter((line) => !line.startsWith("d/x ")),
+    );
+    expect(gitOk(root, ours, "rev-parse", "HEAD^{tree}")).toBe(
+      gitOk(root, native, "rev-parse", "HEAD^{tree}"),
+    );
+  });
+
+  it("commit --only refuses a path neither the index nor HEAD knows", async () => {
+    const { native, ours } = pair((dir) => {
+      put(dir, "u", "untracked\n");
+      put(dir, "a", "changed\n");
+    });
+    const r = git(root, native, "commit", "-q", "-m", "only", "--only", "--", "u", "a");
+    expect(r.status).toBe(1);
+    const head = gitOk(root, ours, "rev-parse", "HEAD");
+    const index = readFileSync(join(ours, ".git/index"));
+    const g = await openOurs(ours);
+    await expect(commitOurs(g, "only").setOnly("u", "a").call()).rejects.toThrow(r.stderr.trim());
+    expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(head);
+    expect(readFileSync(join(ours, ".git/index")).equals(index)).toBe(true);
+  });
+
+  it("rm --cached of a large directory keeps the stat data of the other entries", async () => {
+    const { native, ours } = pair((dir) => {
+      for (let i = 0; i < 30; i++) put(dir, `big/f${String(i).padStart(2, "0")}`, `${i}\n`);
+      for (const f of ["e1", "e2", "e3"]) put(dir, f, `${f}\n`);
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-q", "-m", "big");
+    });
+    const before = await statOf(ours, (p) => p.startsWith("big/"));
+    gitOk(root, native, "rm", "-q", "-r", "--cached", "big");
+    const g = await openOurs(ours);
+    await g.rm().addFilepattern("big").setCached(true).call();
+    expect(lsFiles(ours)).toBe(lsFiles(native));
+    expect(await statOf(ours, (p) => p.startsWith("big/"))).toEqual(before);
+    expect(gitOk(root, ours, "diff-files", "--name-status")).toBe(
+      gitOk(root, native, "diff-files", "--name-status"),
+    );
+  });
+
+  // an instance opened before another writer staged b: each command reads the index again
+  // first and behaves as on a fresh instance (no partial run over the stale entries)
+  const staleCommands: [
+    string,
+    string[],
+    (g: Awaited<ReturnType<typeof openOurs>>) => Promise<unknown>,
+  ][] = [
+    [
+      "cherry-pick",
+      ["cherry-pick", "side"],
+      (g) => g.cherryPick().include("side").setCommitter(INTEROP_IDENT).call(),
+    ],
+    ["switch", ["switch", "-q", "side"], (g) => g.switch().setName("side").call()],
+    [
+      "merge",
+      ["merge", "-q", "--no-edit", "side"],
+      (g) => g.merge().include("side").setAuthor(INTEROP_IDENT).setCommitter(INTEROP_IDENT).call(),
+    ],
+    [
+      "reset --mixed",
+      ["reset", "-q", "HEAD~1"],
+      (g) => g.reset().setRef("HEAD~1").setMode(ResetMode.MIXED).call(),
+    ],
+    [
+      "reset --hard",
+      ["reset", "-q", "--hard", "HEAD"],
+      (g) => g.reset().setRef("HEAD").setMode(ResetMode.HARD).call(),
+    ],
+    ["stash push", ["stash", "push", "-q"], (g) => g.stashCreate().call()],
+  ];
+  for (const [name, args, run] of staleCommands) {
+    it(`${name} on a stale instance reads the index again first`, async () => {
+      const { native, ours } = pair(() => {}, true);
+      const g = await openOurs(ours, INTEROP_AUTHOR_ENV);
+      for (const dir of [native, ours]) {
+        put(dir, "b", "b\n");
+        gitOk(root, dir, "add", "b");
+      }
+      const r = git(root, native, ...args);
+      // a refusal: thrown, or a result with status "failed" (merge, cherry-pick)
+      let failed = false;
+      try {
+        const result = await run(g);
+        failed = (result as { status?: unknown } | undefined)?.status === "failed";
+      } catch {
+        failed = true;
+      }
+      expect(failed).toBe(r.status !== 0);
+      // ORIG_HEAD: native stash push runs `reset --hard` as a child, which writes it; ours
+      // (fresh instance or not) writes none
+      const state = (name: string, text: string) =>
+        name === "ORIG_HEAD" && args[0] === "stash" ? "" : normalizeState(name, text);
+      const strip = (snap: ReturnType<typeof snapshot>) => ({
+        ...snap,
+        state: Object.fromEntries(Object.entries(snap.state).filter(([, v]) => v !== "")),
+      });
+      expect(strip(snapshot(root, ours, state))).toEqual(strip(snapshot(root, native, state)));
+      expect(lsFiles(ours)).toBe(lsFiles(native));
+      expect(gitOk(root, ours, "stash", "list").split("\n").length).toBe(
+        gitOk(root, native, "stash", "list").split("\n").length,
+      );
+    });
+  }
 });

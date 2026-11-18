@@ -34,6 +34,7 @@ import {
   type AttributesSourceResolver,
   basicStatMatches,
   compareWithWorktree,
+  IndexChangedError,
   type Staging,
   type WorkingCopy,
   type Worktree,
@@ -658,6 +659,27 @@ export abstract class GitCommand<T> {
       this.installRacyCheck(staging);
     }
     return staging;
+  }
+
+  /**
+   * The index as it is on disk at the start of an index-writing command, as git reads the
+   * index at the start of every command (`repo_read_index`): when another writer replaced
+   * the index since this instance read or wrote it, the index is read again, unless this
+   * instance holds edits it has not written (they would be lost), which refuses the
+   * command with `IndexChangedError` before it touches the worktree, the index or a ref.
+   * A staging area that cannot be outdated (no index file) is left as it is.
+   *
+   * @param refuseUnwritten false for a command that writes no index (`clean`): unwritten
+   *   edits are then kept and used instead of refusing
+   */
+  protected async readCurrentIndex(refuseUnwritten = true): Promise<void> {
+    const staging = this.staging;
+    if (!(await staging.isOutdated())) return;
+    if (staging.hasUnwrittenChanges?.() !== false) {
+      if (!refuseUnwritten) return;
+      throw new IndexChangedError("index");
+    }
+    await staging.read();
   }
 
   /**

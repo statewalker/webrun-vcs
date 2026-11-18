@@ -47,6 +47,8 @@ export class GitStaging implements Staging {
   private racyCheck?: RacyCheck;
   /** The entries as last read or written (others were set in this session: up to date) */
   private asRead = new Set<StagingEntry>();
+  /** Whether the entries or extensions changed since they were last read or written */
+  private unwritten = false;
   private version: IndexVersion = INDEX_VERSION_2;
   private readonly indexFile: IndexFile;
 
@@ -89,6 +91,7 @@ export class GitStaging implements Staging {
   }
 
   async setEntry(entryOrOptions: IndexEntry | IndexEntryOptions): Promise<void> {
+    this.unwritten = true;
     const entry = this.normalizeEntry(entryOrOptions);
     const index = this.findEntry(entry.path, entry.stage);
 
@@ -103,6 +106,7 @@ export class GitStaging implements Staging {
   }
 
   async removeEntry(path: string, stage?: MergeStageValue): Promise<boolean> {
+    this.unwritten = true;
     if (stage !== undefined) {
       const index = this.findEntry(path, stage);
       if (index >= 0) {
@@ -279,6 +283,7 @@ export class GitStaging implements Staging {
   }
 
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
+    this.unwritten = true;
     const before = options?.keepMatching ? this._entries : undefined;
     if (!options?.keepExisting) {
       this._entries = [];
@@ -330,14 +335,17 @@ export class GitStaging implements Staging {
   }
 
   recordResolveUndo(records: readonly ResolveUndoRecord[]): void {
+    this.unwritten = true;
     this.indexFile.recordResolveUndo(records);
   }
 
   clearResolveUndo(): void {
+    this.unwritten = true;
     this.indexFile.clearResolveUndo();
   }
 
   setCacheTree(tree: CacheTree | undefined): void {
+    this.unwritten = true;
     // the entries it describes: later edits before the write invalidate their paths
     this.indexFile.setCacheTree(tree, this._entries);
   }
@@ -354,6 +362,7 @@ export class GitStaging implements Staging {
 
   async read(): Promise<void> {
     const read = await this.indexFile.read();
+    this.unwritten = false;
     if (!read) {
       // No index file - start empty
       this._entries = [];
@@ -376,6 +385,7 @@ export class GitStaging implements Staging {
       (entry) => this.asRead.has(entry),
     );
     await this.indexFile.write(this._entries);
+    this.unwritten = false;
     this.asRead = new Set(this._entries);
     this.updateTime = await this.indexMtime();
   }
@@ -392,6 +402,10 @@ export class GitStaging implements Staging {
     } catch {
       return 0;
     }
+  }
+
+  hasUnwrittenChanges(): boolean {
+    return this.unwritten;
   }
 
   async isOutdated(): Promise<boolean> {
@@ -424,6 +438,7 @@ export class GitStaging implements Staging {
   }
 
   async clear(): Promise<void> {
+    this.unwritten = true;
     this._entries = [];
   }
 
@@ -441,8 +456,12 @@ export class GitStaging implements Staging {
         size: entry.size ?? 0,
         mtime: entry.mtime ?? Date.now(),
         ctime: entry.ctime,
+        mtimeNs: entry.mtimeNs,
+        ctimeNs: entry.ctimeNs,
         dev: entry.dev,
         ino: entry.ino,
+        uid: entry.uid,
+        gid: entry.gid,
         assumeValid: entry.assumeValid,
         intentToAdd: entry.intentToAdd,
         skipWorktree: entry.skipWorktree,
@@ -458,8 +477,12 @@ export class GitStaging implements Staging {
       size: options.size ?? 0,
       mtime: options.mtime ?? Date.now(),
       ctime: options.ctime,
+      mtimeNs: options.mtimeNs,
+      ctimeNs: options.ctimeNs,
       dev: options.dev,
       ino: options.ino,
+      uid: options.uid,
+      gid: options.gid,
       assumeValid: options.assumeValid,
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,
@@ -507,6 +530,7 @@ export class GitStaging implements Staging {
 
   /** @internal - Used by builder/editor */
   _replaceEntries(newEntries: IndexEntry[]): void {
+    this.unwritten = true;
     this._entries = newEntries;
   }
 
@@ -522,6 +546,7 @@ export class GitStaging implements Staging {
 
   /** @internal - Set index version */
   _setVersion(version: IndexVersion): void {
+    this.unwritten = true;
     this.version = version;
   }
 }
@@ -544,8 +569,12 @@ class GitStagingBuilder implements IndexBuilder {
       size: options.size ?? 0,
       mtime: options.mtime ?? Date.now(),
       ctime: options.ctime,
+      mtimeNs: options.mtimeNs,
+      ctimeNs: options.ctimeNs,
       dev: options.dev,
       ino: options.ino,
+      uid: options.uid,
+      gid: options.gid,
       assumeValid: options.assumeValid,
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,
@@ -714,6 +743,10 @@ class GitStagingEditor implements IndexEditor {
         ctime: upsertOptions.ctime,
         dev: upsertOptions.dev,
         ino: upsertOptions.ino,
+        mtimeNs: upsertOptions.mtimeNs,
+        ctimeNs: upsertOptions.ctimeNs,
+        uid: upsertOptions.uid,
+        gid: upsertOptions.gid,
         assumeValid: upsertOptions.assumeValid,
         intentToAdd: upsertOptions.intentToAdd,
         skipWorktree: upsertOptions.skipWorktree,
