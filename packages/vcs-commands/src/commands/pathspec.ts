@@ -368,6 +368,62 @@ export function matchPathspec(items: PathspecItem[], name: string, flags: number
   return positive;
 }
 
+/**
+ * git's `match_pathspec_with_flags` with its `seen` array (`ps_matched`): as
+ * {@link matchPathspec}, and `seen[i]` raised to how element `i` matched (an exclude element
+ * visited counts as matched, as git never reports one), for {@link pathspecErrors}.
+ *
+ * @example
+ * ```typescript
+ * const items = parsePathspec(["d/", "*.md"]);
+ * const seen = items.map(() => 0);
+ * for (const path of paths) if (matchPathspecSeen(items, path, 0, seen)) take(path);
+ * const errors = pathspecErrors(["d/", "*.md"], seen); // the elements that matched nothing
+ * ```
+ */
+export function matchPathspecSeen(
+  items: PathspecItem[],
+  name: string,
+  flags: number,
+  seen: number[],
+): number {
+  if (items.length === 0) return MATCHED_RECURSIVELY;
+  const pass = (exclude: boolean, passFlags: number): number => {
+    let retval = 0;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i] as PathspecItem;
+      if (item.exclude !== exclude) continue;
+      if (seen[i] === MATCHED_EXACTLY && item.nowildcardLen === item.match.length) continue;
+      if (item.exclude) seen[i] = MATCHED_FNMATCH;
+      const how = matchPathspecItem(item, name, passFlags);
+      if (how) {
+        if (retval < how) retval = how;
+        if ((seen[i] ?? 0) < how) seen[i] = how;
+      }
+    }
+    return retval;
+  };
+  const positive = pass(false, flags);
+  if (!positive || !items.some((i) => i.exclude)) return positive;
+  return pass(true, flags | DO_MATCH_EXCLUDE) ? 0 : positive;
+}
+
+/**
+ * git's `report_path_error`: one "error: pathspec '<element>' did not match any file(s)
+ * known to git" line per element `seen` marks unmatched (an element given twice, once
+ * matched, is not reported). `originals` are the elements as given.
+ */
+export function pathspecErrors(originals: readonly string[], seen: readonly number[]): string[] {
+  const errors: string[] = [];
+  for (let num = 0; num < originals.length; num++) {
+    if (seen[num]) continue;
+    const dup = originals.some((o, other) => other !== num && seen[other] && o === originals[num]);
+    if (dup) continue;
+    errors.push(`error: pathspec '${originals[num]}' did not match any file(s) known to git`);
+  }
+  return errors;
+}
+
 // ============ tree entries (tree-walk.c tree_entry_interesting) ============
 
 /** `tree_entry_interesting`: no later entry of this tree can match */

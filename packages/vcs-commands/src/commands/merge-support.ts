@@ -474,7 +474,11 @@ export async function readIndex(
  * one. That write smudges racily clean entries and gives the index a new timestamp, which
  * later overwrite checks compare entries with (an entry as new as it is read again).
  */
-export async function writeIndexAsTree(staging: Staging, trees: CommandTrees): Promise<ObjectId> {
+export async function writeIndexAsTree(
+  staging: Staging,
+  trees: CommandTrees,
+  options: { write?: boolean } = {},
+): Promise<ObjectId> {
   if (!staging.getCacheTree || !staging.setCacheTree) return staging.writeTree(trees);
   const previous = staging.getCacheTree();
   const treeId = await staging.writeTree(trees);
@@ -487,7 +491,8 @@ export async function writeIndexAsTree(staging: Staging, trees: CommandTrees): P
       }
     }
     staging.setCacheTree(cacheTree);
-    await staging.write();
+    // unless the caller writes the index itself (into the lock it holds)
+    if (options.write !== false) await staging.write();
   }
   return treeId;
 }

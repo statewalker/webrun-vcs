@@ -23,7 +23,9 @@ import {
   keepMatchingMode,
   MergeStage,
   type RacyCheck,
+  RemoveStagingStages,
   smudgeRacilyClean,
+  verifyTreePaths,
 } from "@statewalker/vcs-working-tree";
 import type { DatabaseClient } from "./database-client.js";
 import { fromSqlPath, toSqlPath } from "./sql-path.js";
@@ -192,7 +194,7 @@ export class SQLStaging implements Staging {
     } else {
       // Remove specific stage
       const hadEntry = (await this.getEntry(path, stage)) !== undefined;
-      editor.remove(path);
+      editor.remove(path, stage);
       await editor.finish();
       return hadEntry;
     }
@@ -306,6 +308,8 @@ export class SQLStaging implements Staging {
       }
     }
 
+    // never a tree with two entries of one name (git's verify_cache)
+    verifyTreePaths(entries);
     return this.buildTreeRecursive(trees, entries, "");
   }
 
@@ -672,10 +676,9 @@ class SQLIndexEditor implements IndexEditor {
     this.edits.push(edit);
   }
 
-  remove(path: string, _stage?: MergeStageValue): void {
-    // For now, remove all stages (ignore stage parameter)
-    // TODO: Implement stage-specific removal if needed
-    this.edits.push({ path, apply: () => undefined });
+  remove(path: string, stage?: MergeStageValue): void {
+    // every stage of the path, or only the one given
+    this.edits.push(new RemoveStagingStages(path, stage));
   }
 
   upsert(entry: StagingEntryOptions): void {
@@ -733,7 +736,18 @@ class SQLIndexEditor implements IndexEditor {
           if (result) newEntries.push(result);
           editIndex++;
         } else {
-          if (isResolveConflict(edit)) {
+          if (edit instanceof RemoveStagingStages) {
+            // the path's stages but the removed ones
+            while (
+              entryIndex < existingEntries.length &&
+              existingEntries[entryIndex].path === edit.path
+            ) {
+              if (edit.keeps(existingEntries[entryIndex])) {
+                newEntries.push(existingEntries[entryIndex]);
+              }
+              entryIndex++;
+            }
+          } else if (isResolveConflict(edit)) {
             this.applyConflictResolution(existingEntries, entryIndex, edit, newEntries);
             while (
               entryIndex < existingEntries.length &&

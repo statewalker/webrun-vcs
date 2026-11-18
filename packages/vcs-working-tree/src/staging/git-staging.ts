@@ -11,6 +11,7 @@ import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, FileMode, type FilesApi } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { CacheTree } from "./cache-tree.js";
+import { verifyTreePaths } from "./conflict-utils.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import { IndexFile, readIndexChecksum } from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion, reuseEntryEncoding } from "./index-format.js";
@@ -24,6 +25,7 @@ import type {
   IndexEntryOptions,
   ReadTreeOptions,
   Staging,
+  StagingIndexLock,
 } from "./staging.js";
 import {
   type IndexStatUpdate,
@@ -216,6 +218,8 @@ export class GitStaging implements Staging {
     // Build tree from stage 0 entries only
     // an intent-to-add entry is no part of the tree (git's update_one skips it)
     const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED && !e.intentToAdd);
+    // never a tree with two entries of one name (git's verify_cache)
+    verifyTreePaths(stage0);
     // the directories the cache-tree has valid keep their trees, as git's write-tree
     // (`cache_tree_update`): a tree primed by a reset keeps its stored modes (100664)
     return this.buildTreeRecursive(trees, stage0, "", this.getCacheTree());
@@ -388,6 +392,38 @@ export class GitStaging implements Staging {
     this.unwritten = false;
     this.asRead = new Set(this._entries);
     this.updateTime = await this.indexMtime();
+  }
+
+  /**
+   * Takes `<index>.lock` until the returned lock is committed or rolled back (git's
+   * `repo_hold_locked_index` for a commit): `write()` puts the entries as they are then into
+   * the lock (racily clean ones smudged), `commit()` renames it over the index.
+   */
+  async lockIndex(): Promise<StagingIndexLock> {
+    const lock = await this.indexFile.lock();
+    let written: StagingEntry[] | undefined;
+    return {
+      write: async () => {
+        this.indexFile.version = this.version;
+        this._entries = await smudgeRacilyClean(
+          this._entries,
+          this.updateTime,
+          this.racyCheck,
+          (entry) => this.asRead.has(entry),
+        );
+        written = this._entries;
+        await lock.write(written);
+      },
+      commit: async () => {
+        await lock.commit();
+        if (!written) return;
+        // the index now holds what was written (make no edits between write and commit)
+        this.unwritten = false;
+        this.asRead = new Set(written);
+        this.updateTime = await this.indexMtime();
+      },
+      rollback: () => lock.rollback(),
+    };
   }
 
   /** Sets the check `write()` smudges racily clean entries with. */

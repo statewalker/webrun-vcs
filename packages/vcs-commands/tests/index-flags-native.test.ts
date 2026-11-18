@@ -17,7 +17,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, utimesSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
@@ -904,6 +904,193 @@ describeGit("add -N, commit --only, kept stat data and a stale instance, as git"
     expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(head);
     expect(readFileSync(join(ours, ".git/index")).equals(index)).toBe(true);
   });
+
+  /** A refused commit --only: git's message, and HEAD, the index and its lock as they were. */
+  async function onlyRefused(
+    prepare: (dir: string) => void,
+    paths: string[],
+    status: number,
+  ): Promise<{ native: string; ours: string }> {
+    const { native, ours } = pair(prepare);
+    const r = git(root, native, "commit", "-q", "-m", "only", "--only", "--", ...paths);
+    expect(r.status).toBe(status);
+    const head = gitOk(root, ours, "rev-parse", "HEAD");
+    const index = readFileSync(join(ours, ".git/index"));
+    const g = await openOurs(ours);
+    const refusal = await commitOurs(g, "only")
+      .setOnly(...paths)
+      .call()
+      .then(
+        () => "",
+        (error: Error) => error.message,
+      );
+    // each line git printed (2.5x adds "unable to index file" to 2.43's lines)
+    for (const line of r.stderr.trim().split("\n")) expect(refusal).toContain(line);
+    expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(head);
+    expect(readFileSync(join(ours, ".git/index")).equals(index)).toBe(true);
+    expect(existsSync(join(ours, ".git/index.lock"))).toBe(false);
+    expect(lsFiles(ours)).toBe(lsFiles(native));
+    return { native, ours };
+  }
+
+  it("commit --only of a path that is now a directory refuses, as add_to_index", async () => {
+    // the index still has the file a, the worktree a directory: git's add_remove_files
+    // refuses before anything changes (no tree with two entries named a)
+    const toDir = (dir: string) => {
+      unlinkSync(join(dir, "a"));
+      put(dir, "a/inner", "inner\n");
+    };
+    await onlyRefused(toDir, ["a"], 128);
+    await onlyRefused(toDir, ["a", "d/x"], 128);
+    // a/inner is known to neither the index nor HEAD
+    await onlyRefused(toDir, ["a/inner"], 1);
+    // HEAD's a is listed through `.`
+    await onlyRefused(
+      (dir) => {
+        toDir(dir);
+        gitOk(root, dir, "add", "a/inner");
+      },
+      ["."],
+      128,
+    );
+  });
+
+  it("commit --only of a staged file that replaced a directory's file commits it", async () => {
+    const { ours } = await onlyTwins(
+      (dir) => {
+        unlinkSync(join(dir, "a"));
+        put(dir, "a/inner", "inner\n");
+        gitOk(root, dir, "add", "a/inner");
+      },
+      ["a/inner"],
+    );
+    expect(gitOk(root, ours, "ls-tree", "-r", "--name-only", "HEAD")).toBe("a/inner\nd/x\nd/y\n");
+    expect(git(root, ours, "fsck", "--no-dangling").status).toBe(0);
+  });
+
+  it("add replaces the entries a file or directory clashes with (check_file_directory_conflict)", async () => {
+    const { native, ours } = pair((dir) => {
+      unlinkSync(join(dir, "a"));
+      put(dir, "a/inner", "inner\n");
+      rmSync(join(dir, "d"), { recursive: true });
+      put(dir, "d", "now a file\n");
+    });
+    // without removals: only the entries the new ones clash with go
+    gitOk(root, native, "add", "--ignore-removal", "a/inner", "d");
+    const g = await openOurs(ours);
+    await g.add().addFilepattern("a/inner").addFilepattern("d").setAll(false).call();
+    expect(lsFiles(ours)).toBe(lsFiles(native));
+    gitOk(root, native, "commit", "-q", "-m", "df");
+    await commitOurs(g, "df").call();
+    expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(gitOk(root, native, "rev-parse", "HEAD"));
+    expect(git(root, ours, "fsck", "--no-dangling").status).toBe(0);
+  });
+
+  it("commit --only takes only the paths listed: glob characters match no untracked file", async () => {
+    const { ours } = await onlyTwins(
+      (dir) => {
+        put(dir, "x*y", "tracked\n");
+        gitOk(root, dir, "add", "x*y");
+        gitOk(root, dir, "commit", "-q", "-m", "glob name");
+        put(dir, "x*y", "changed\n");
+        put(dir, "xzy", "untracked\n");
+        put(dir, ".gitignore", "x.y\n");
+        put(dir, "x.y", "ignored\n");
+      },
+      ["x*y"],
+    );
+    expect(gitOk(root, ours, "ls-tree", "--name-only", "HEAD")).not.toContain("xzy");
+  });
+
+  for (const spec of ["d/", "d/*", "*.md", "g/**", ":(glob)d/**", "./a", "d/../a", ":!d/x"]) {
+    it(`commit --only matches '${spec}' as git's pathspec`, async () => {
+      await onlyTwins(
+        (dir) => {
+          put(dir, "g/h/i.md", "i\n");
+          put(dir, "r.md", "r\n");
+          put(dir, "d/e/z", "z\n");
+          gitOk(root, dir, "add", ".");
+          gitOk(root, dir, "commit", "-q", "-m", "more");
+          for (const f of ["a", "d/x", "d/y", "d/e/z", "g/h/i.md", "r.md"])
+            put(dir, f, "changed\n");
+        },
+        [spec],
+      );
+    });
+  }
+
+  it("commit --only leaves the cache-tree invalid where git's does while paths are unmerged", async () => {
+    await onlyTwins(
+      (dir) => {
+        put(dir, "g/h/i", "i\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "more");
+        // a fully valid cache-tree, then a conflict on d/y
+        gitOk(root, dir, "write-tree");
+        const id = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+          cwd: dir,
+          input: "theirs\n",
+          encoding: "utf8",
+        }).trim();
+        gitOk(root, dir, "update-index", "--force-remove", "d/y");
+        execFileSync("git", ["update-index", "--index-info"], {
+          cwd: dir,
+          input: [1, 2, 3].map((s) => `100644 ${id} ${s}\td/y\n`).join(""),
+        });
+        // a racily clean g/h/i is read again: git invalidates its path all the same
+        put(dir, "a", "changed\n");
+      },
+      ["a", "g"],
+    );
+  });
+
+  it("a failed commit --only keeps the instance's unwritten edits and the index as it was", async () => {
+    const { ours } = pair((dir) => {
+      put(dir, "d/x", "staged in memory\n");
+    });
+    const g = await openOurs(ours);
+    await g.add().addFilepattern("d/x").setWriteIndex(false).call();
+    const index = readFileSync(join(ours, ".git/index"));
+    const staging = g.workingCopy.checkout.staging;
+    const staged = (await staging.getEntry("d/x"))?.objectId;
+    // nothing to commit for a: refused after the index was edited and written to the lock
+    await expect(commitOurs(g, "only").setOnly("a").call()).rejects.toThrow();
+    expect(readFileSync(join(ours, ".git/index")).equals(index)).toBe(true);
+    expect(existsSync(join(ours, ".git/index.lock"))).toBe(false);
+    expect(staging.hasUnwrittenChanges?.()).toBe(true);
+    expect((await staging.getEntry("d/x"))?.objectId).toBe(staged);
+  });
+
+  for (const mode of ["--only", "-a"] as const) {
+    it(`commit ${mode} holds index.lock until HEAD has moved: a concurrent git add is refused`, async () => {
+      const { native, ours } = pair((dir) => {
+        put(dir, "a", "changed\n");
+        put(dir, "n", "new\n");
+      });
+      const args = mode === "--only" ? ["--only", "a"] : ["-a"];
+      gitOk(root, native, "commit", "-q", "-m", "locked", ...args);
+      const g = await openOurs(ours);
+      const commits = g.history?.commits;
+      if (!commits) throw new Error("no history");
+      const store = commits.store.bind(commits);
+      let concurrent: ReturnType<typeof git> | undefined;
+      commits.store = async (commit) => {
+        concurrent = git(root, ours, "add", "n");
+        return store(commit);
+      };
+      const command = commitOurs(g, "locked");
+      await (mode === "--only" ? command.setOnly("a") : command.setAll(true)).call();
+      expect(concurrent?.status).toBe(128);
+      expect(concurrent?.stderr).toContain("index.lock': File exists");
+      expect(existsSync(join(ours, ".git/index.lock"))).toBe(false);
+      expect(gitOk(root, ours, "rev-parse", "HEAD")).toBe(gitOk(root, native, "rev-parse", "HEAD"));
+      expect(lsFiles(ours)).toBe(lsFiles(native));
+      expect(await treeExtension(ours)).toBe(await treeExtension(native));
+      expect(gitOk(root, ours, "status", "--porcelain")).toBe(
+        gitOk(root, native, "status", "--porcelain"),
+      );
+    });
+  }
 
   it("rm --cached of a large directory keeps the stat data of the other entries", async () => {
     const { native, ours } = pair((dir) => {

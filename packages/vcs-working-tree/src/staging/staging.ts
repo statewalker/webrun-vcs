@@ -208,6 +208,19 @@ export interface Staging {
   write(): Promise<void>;
 
   /**
+   * Takes the index lock now and holds it until the returned lock is committed or rolled
+   * back, as git's `repo_hold_locked_index` for a commit: edits are made in memory, written
+   * into the lock with `write()`, and the lock renamed over the index with `commit()` once
+   * the commit is made (`rollback()` removes it, the index left as it was). Meanwhile every
+   * other writer, native git included, is refused (`index.lock` exists). Absent: a staging
+   * with no index file (memory, a database), which callers `write()` at the end instead.
+   *
+   * @throws IndexLockedError when the lock exists
+   * @throws IndexChangedError when the index on disk is not the one last read or written
+   */
+  lockIndex?(): Promise<StagingIndexLock>;
+
+  /**
    * Check if staging is outdated
    */
   isOutdated(): Promise<boolean>;
@@ -244,6 +257,33 @@ export interface Staging {
    * Clear all entries
    */
   clear(): Promise<void>;
+}
+
+/**
+ * The index lock a `Staging` holds for a commit (see `Staging.lockIndex`).
+ *
+ * @example
+ * ```typescript
+ * const lock = await staging.lockIndex();
+ * try {
+ *   await editTheIndex(staging);
+ *   await lock.write(); // the new index, still in index.lock
+ *   await makeTheCommit();
+ *   await lock.commit(); // renamed over the index
+ * } catch (error) {
+ *   await lock.rollback(); // the index as it was
+ *   await staging.read();
+ *   throw error;
+ * }
+ * ```
+ */
+export interface StagingIndexLock {
+  /** Writes the staging's entries as they are now into the lock (again, if called again). */
+  write(): Promise<void>;
+  /** Renames the lock over the index (what `write()` wrote; the index as read if nothing). */
+  commit(): Promise<void>;
+  /** Removes the lock: the index stays as it was. Does nothing once committed. */
+  rollback(): Promise<void>;
 }
 
 /**

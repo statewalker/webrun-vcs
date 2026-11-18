@@ -447,6 +447,33 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
 
         expect(await ctx.stagingStore.hasEntry("new.txt")).toBe(true);
       });
+
+      it("removes only the stage named (editor.remove and removeEntry)", async () => {
+        const builder = ctx.stagingStore.createBuilder();
+        for (const stage of [MergeStage.BASE, MergeStage.OURS, MergeStage.THEIRS]) {
+          builder.add(createEntry("c.txt", { stage }));
+          builder.add(createEntry("d.txt", { stage }));
+        }
+        await builder.finish();
+
+        const editor = ctx.stagingStore.createEditor();
+        editor.remove("c.txt", MergeStage.OURS);
+        await editor.finish();
+        expect((await ctx.stagingStore.getEntries("c.txt")).map((e) => e.stage)).toEqual([
+          MergeStage.BASE,
+          MergeStage.THEIRS,
+        ]);
+
+        expect(await ctx.stagingStore.removeEntry("d.txt", MergeStage.BASE)).toBe(true);
+        expect(await ctx.stagingStore.removeEntry("d.txt", MergeStage.BASE)).toBe(false);
+        expect((await ctx.stagingStore.getEntries("d.txt")).map((e) => e.stage)).toEqual([
+          MergeStage.OURS,
+          MergeStage.THEIRS,
+        ]);
+
+        expect(await ctx.stagingStore.removeEntry("d.txt")).toBe(true);
+        expect(await ctx.stagingStore.hasEntry("d.txt")).toBe(false);
+      });
     });
 
     describe("Entry Properties", () => {
@@ -545,6 +572,18 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
         await builder.finish();
 
         await expect(ctx.stagingStore.writeTree(ctx.trees)).rejects.toThrow();
+      });
+
+      it("refuses a tree where a path is a file and a directory (git's verify_cache)", async () => {
+        if (!ctx.trees) return;
+        const builder = ctx.stagingStore.createBuilder();
+        builder.add(createEntry("a"));
+        builder.add(createEntry("a/inner"));
+        await builder.finish();
+
+        await expect(ctx.stagingStore.writeTree(ctx.trees)).rejects.toThrow(
+          "You have both a and a/inner",
+        );
       });
 
       it("reads tree into staging area", async () => {

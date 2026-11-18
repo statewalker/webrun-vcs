@@ -7,6 +7,7 @@ import type {
   IndexEditor,
   ResolveUndoRecord,
   Staging,
+  StagingIndexLock,
 } from "@statewalker/vcs-working-tree";
 import {
   type GitStagingOptions,
@@ -19,6 +20,7 @@ import {
   MergeStage,
   type MergeStageValue,
   type RacyCheck,
+  RemoveStagingStages,
   readIndexChecksum,
   refreshIndexFile,
   reuseEntryEncoding,
@@ -26,6 +28,7 @@ import {
   type StagingEntry,
   type StagingEntryOptions,
   smudgeRacilyClean,
+  verifyTreePaths,
 } from "@statewalker/vcs-working-tree";
 
 /**
@@ -96,7 +99,7 @@ export class FileStagingStore implements Staging {
     } else {
       // Remove specific stage
       const hadEntry = (await this.getEntry(path, stage)) !== undefined;
-      editor.remove(path);
+      editor.remove(path, stage);
       await editor.finish();
       return hadEntry;
     }
@@ -274,6 +277,8 @@ export class FileStagingStore implements Staging {
     // Build tree from stage 0 entries only
     // an intent-to-add entry is no part of the tree (git's update_one skips it)
     const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED && !e.intentToAdd);
+    // never a tree with two entries of one name (git's verify_cache)
+    verifyTreePaths(stage0);
     // the directories the cache-tree has valid keep their trees, as git's write-tree
     // (`cache_tree_update`): a tree primed by a reset keeps its stored modes (100664)
     return this.buildTreeRecursive(trees, stage0, "", this.getCacheTree());
@@ -415,6 +420,38 @@ export class FileStagingStore implements Staging {
     this.unwritten = false;
     this.asRead = new Set(this._entries);
     this.updateTime = await this.indexMtime();
+  }
+
+  /**
+   * Takes `<index>.lock` until the returned lock is committed or rolled back (git's
+   * `repo_hold_locked_index` for a commit): `write()` puts the entries as they are then into
+   * the lock (racily clean ones smudged), `commit()` renames it over the index.
+   */
+  async lockIndex(): Promise<StagingIndexLock> {
+    const lock = await this.indexFile.lock();
+    let written: StagingEntry[] | undefined;
+    return {
+      write: async () => {
+        this.indexFile.version = this.version;
+        this._entries = await smudgeRacilyClean(
+          this._entries,
+          this.updateTime,
+          this.racyCheck,
+          (entry) => this.asRead.has(entry),
+        );
+        written = this._entries;
+        await lock.write(written);
+      },
+      commit: async () => {
+        await lock.commit();
+        if (!written) return;
+        // the index now holds what was written (make no edits between write and commit)
+        this.unwritten = false;
+        this.asRead = new Set(written);
+        this.updateTime = await this.indexMtime();
+      },
+      rollback: () => lock.rollback(),
+    };
   }
 
   /** Sets the check `write()` smudges racily clean entries with. */
@@ -694,7 +731,7 @@ class FileStagingEditor implements IndexEditor {
   }
 
   remove(path: string, stage?: MergeStageValue): void {
-    this.edits.push(new RemoveStages(path, stage));
+    this.edits.push(new RemoveStagingStages(path, stage));
   }
 
   upsert(entry: StagingEntryOptions): void {
@@ -731,8 +768,8 @@ class FileStagingEditor implements IndexEditor {
       }
       const entries = byPath.get(edit.path) ?? [];
       let next: StagingEntry[];
-      if (edit instanceof RemoveStages) {
-        next = edit.stage === undefined ? [] : entries.filter((e) => e.stage !== edit.stage);
+      if (edit instanceof RemoveStagingStages) {
+        next = entries.filter((e) => edit.keeps(e));
       } else if (isResolveConflict(edit)) {
         const chosen = entries.find((e) => e.stage === edit.chooseStage);
         next = chosen ? [{ ...chosen, stage: MergeStage.MERGED }] : [];
@@ -748,18 +785,6 @@ class FileStagingEditor implements IndexEditor {
     const newEntries = [...byPath.values()].flat();
     newEntries.sort((a, b) => comparePaths(a.path, b.path) || a.stage - b.stage);
     this.store._replaceEntries(newEntries);
-  }
-}
-
-/** A removal of a path's stages (all of them, or one). */
-class RemoveStages implements StagingEdit {
-  constructor(
-    readonly path: string,
-    readonly stage?: MergeStageValue,
-  ) {}
-
-  apply(): undefined {
-    return undefined;
   }
 }
 

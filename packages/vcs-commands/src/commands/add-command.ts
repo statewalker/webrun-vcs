@@ -1,47 +1,9 @@
-/**
- * AddCommand - Stage files from working tree to index.
- *
- * Implements JGit-compatible fluent API for `git add` command:
- * - Add new files to index
- * - Update modified files in index
- * - Optionally remove deleted files (--all mode)
- * - Support for update-only mode (-u flag)
- *
- * Reference: jgit/org.eclipse.jgit/src/org/eclipse/jgit/api/AddCommand.java
- *
- * @example
- * ```typescript
- * // Add specific files
- * await git.add()
- *   .addFilepattern("src/")
- *   .addFilepattern("lib/")
- *   .call();
- *
- * // Update only tracked files (git add -u)
- * await git.add()
- *   .addFilepattern(".")
- *   .setUpdate(true)
- *   .call();
- *
- * // Add all changes including deletions (git add -A)
- * await git.add()
- *   .addFilepattern(".")
- *   .setAll(true)
- *   .call();
- * ```
- */
-
-import { EMPTY_BLOB_ID, FileMode } from "@statewalker/vcs-core";
 import {
-  basicStatMatches,
-  DeleteStagingEntry,
   entryStatOf,
   modeFromWorktree,
-  type ResolveUndoRecord,
   type StagingEntry,
   UpdateStagingEntry,
   type Worktree,
-  wholeSeconds,
 } from "@statewalker/vcs-working-tree";
 import { storeWorktreeFile } from "../core-commands/index.js";
 
@@ -52,6 +14,7 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { IndexAdder } from "./index-adder.js";
 
 /**
  * Result of AddCommand execution.
@@ -487,63 +450,17 @@ export class AddCommand extends GitCommand<AddResult> {
       filesToProcess.push(...filtered);
     }
 
-    // Process files
-    const editor = this.staging.createEditor();
-    // what the worktree's modes can be trusted for (git's core.filemode / core.symlinks)
+    // Process files: git's add_to_index and remove_file_from_index, each stage-0 entry
+    // replacing the path's conflict stages (kept as resolve-undo) and the entries it
+    // clashes with as a file or a directory (check_file_directory_conflict)
     const trust = worktreeModeTrust(this.workingCopy, worktree);
-    const indexTime = this.staging.getUpdateTime();
-    // git's add_index_entry: a stage-0 entry replaces the path's conflict stages, which
-    // are kept as resolve-undo (record_resolve_undo); a removal takes every stage
-    const resolveUndo: ResolveUndoRecord[] = [];
-    const resolve = (path: string) => {
-      const stages = unmerged.get(path);
-      if (!stages) return;
-      unmerged.delete(path);
-      editor.remove(path);
-      const record: ResolveUndoRecord = {
-        path,
-        modes: [0, 0, 0],
-        objectIds: [undefined, undefined, undefined],
-      };
-      for (const entry of stages) {
-        const k = entry.stage - 1;
-        if (k < 0 || k > 2) continue;
-        record.modes[k] = entry.mode;
-        record.objectIds[k] = entry.objectId;
-      }
-      resolveUndo.push(record);
-    };
+    const adder = await IndexAdder.open(this.staging, this.blobs, trust);
 
     for (const file of filesToProcess) {
       if (!file.exists) {
         // File deleted from worktree - remove from index
-        resolve(file.path);
-        editor.add(new DeleteStagingEntry(file.path));
+        adder.remove(file.path);
         removed.push(file.path);
-        continue;
-      }
-
-      if (this.intentToAdd) {
-        // git's add_to_index with ADD_CACHE_NEW_ONLY: a path with a stage-0 entry (tracked,
-        // or already intent-to-add) is left as it is; a conflicted one (no stage 0) has its
-        // stages replaced by the intent-to-add entry, as git does
-        if (await this.staging.getEntry(file.path)) continue;
-        resolve(file.path);
-        // Just mark as intent-to-add (placeholder with empty blob)
-        const worktreeEntry = await worktree.getEntry(file.path);
-        const mode = worktreeEntry?.mode ?? FileMode.REGULAR_FILE;
-        editor.add(
-          // the empty blob's id, flagged intent-to-add, as git records it (never an empty
-          // or all-zero id, which a worktree hash could be compared against)
-          new UpdateStagingEntry(
-            file.path,
-            EMPTY_BLOB_ID,
-            mode,
-            { size: 0, mtime: Date.now() },
-            { intentToAdd: true },
-          ),
-        );
-        added.push(file.path);
         continue;
       }
 
@@ -553,39 +470,15 @@ export class AddCommand extends GitCommand<AddResult> {
         // File disappeared during processing
         continue;
       }
-
-      // git's add_to_index: a tracked file whose stat still matches its entry (and is not
-      // racily clean) is not read again (nor its line endings checked)
-      const indexed = await this.staging.getEntry(file.path);
-      if (
-        indexed &&
-        !indexed.intentToAdd &&
-        indexTime > 0 &&
-        wholeSeconds(indexed.mtime, indexed.mtimeNs) < wholeSeconds(indexTime) &&
-        modeFromWorktree(worktreeEntry.mode, indexed.mode, trust) === indexed.mode &&
-        basicStatMatches(indexed, worktreeEntry, trust)
-      ) {
-        added.push(file.path);
-        continue;
-      }
-
-      // Hash and store content
-      // the stat that matched the stored content (a fresh one after a retry)
-      const stored = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry, {
+      const staged = await adder.add(worktree, file.path, worktreeEntry, {
+        intentToAdd: this.intentToAdd,
         onWarning: (message) => warnings.push(message),
       });
-      resolve(file.path);
-
-      // Add to staging, with the mode git's ce_mode_from_stat would record
-      const indexMode = indexed?.mode;
-      const mode = modeFromWorktree(stored.entry.mode, indexMode, trust);
-      editor.add(new UpdateStagingEntry(file.path, stored.id, mode, entryStatOf(stored.entry)));
-      added.push(file.path);
+      if (staged) added.push(file.path);
     }
 
     // Apply changes
-    await editor.finish();
-    if (resolveUndo.length > 0) this.staging.recordResolveUndo?.(resolveUndo);
+    await adder.finish();
 
     // Persist staging changes (required for FileStagingStore)
     if (this.writeIndex) await this.staging.write();
