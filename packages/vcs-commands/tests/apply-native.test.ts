@@ -17,6 +17,7 @@ import {
   readlinkSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -676,6 +677,12 @@ describeGit("git apply as native git", () => {
       (attributes: string): Setup =>
       (d) => {
         put(d, "f", crlf);
+        // f dated well before the index: once the attributes ask for eol conversion, the
+        // CRLF blob no longer matches f's cleaned content, so whether native git trusts the
+        // stat data (clean) or re-reads a racily clean f (smudged, " M f") would depend on
+        // whether this setup crossed a second boundary, differently in each twin
+        const past = new Date(Date.now() - 60_000);
+        utimesSync(join(d, "f"), past, past);
         gitOk(d, "add", "-A");
         gitOk(d, "commit", "-qm", "base");
         put(d, ".gitattributes", attributes);
