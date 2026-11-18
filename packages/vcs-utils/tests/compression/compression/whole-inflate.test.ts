@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { constants, deflateSync, inflateSync } from "node:zlib";
 import { inflate as pakoInflate } from "pako";
 import { describe, expect, it } from "vitest";
@@ -413,5 +416,282 @@ describe("inflateWhole partial: input that ends where the output fills", () => {
         TruncatedStreamError,
       );
     }
+  });
+});
+
+describe("inflateWhole differential fuzz on git objects", () => {
+  /** A 20-byte object id from the generator. */
+  function rawId(r: () => number): number[] {
+    return Array.from({ length: 20 }, () => Math.floor(r() * 256));
+  }
+  const hex = (b: number[]) => b.map((x) => x.toString(16).padStart(2, "0")).join("");
+  const enc = new TextEncoder();
+  /** The bytes git hashes and stores: `<type> <size>\0` and the content. */
+  function framed(type: string, body: Uint8Array): Uint8Array {
+    const head = enc.encode(`${type} ${body.length}\0`);
+    const out = new Uint8Array(head.length + body.length);
+    out.set(head);
+    out.set(body, head.length);
+    return out;
+  }
+  /** This package's sources, as blobs. */
+  const sources: Uint8Array[] = (() => {
+    const out: Uint8Array[] = [];
+    const walk = (dir: string) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name.endsWith(".ts")) out.push(new Uint8Array(readFileSync(p)));
+      }
+    };
+    walk(fileURLToPath(new URL("../../../src", import.meta.url)));
+    return out;
+  })();
+
+  /** A commit, tree, blob or tag shaped as git writes them. */
+  function gitObject(r: () => number, i: number): Uint8Array {
+    const kind = i % 4;
+    const when = 1_600_000_000 + Math.floor(r() * 1e8);
+    if (kind === 0) {
+      const parents = Math.floor(r() * 3);
+      let s = `tree ${hex(rawId(r))}\n`;
+      for (let p = 0; p < parents; p++) s += `parent ${hex(rawId(r))}\n`;
+      s += `author A U Thor <author@example.com> ${when} +0200\n`;
+      s += `committer C O Mitter <committer@example.com> ${when + 60} -0700\n\n`;
+      s += `Subject line ${i}\n\n${"Body text wrapping at seventy-two columns. ".repeat(Math.floor(r() * 8))}\n`;
+      return framed("commit", enc.encode(s));
+    }
+    if (kind === 1) {
+      const parts: number[] = [];
+      for (let e = Math.floor(r() * 60); e >= 0; e--) {
+        const mode = r() < 0.2 ? "40000" : r() < 0.1 ? "100755" : "100644";
+        const name = `${["src", "file", "index", "test", "README"][Math.floor(r() * 5)]}-${e}.${["ts", "md", "json"][e % 3]}`;
+        parts.push(...enc.encode(`${mode} ${name}`), 0, ...rawId(r));
+      }
+      return framed("tree", new Uint8Array(parts));
+    }
+    if (kind === 2) {
+      const src = sources[Math.floor(r() * sources.length)] as Uint8Array;
+      const from = Math.floor(r() * src.length);
+      return framed("blob", src.subarray(from, from + Math.floor(r() ** 3 * 20_000)));
+    }
+    const s = `object ${hex(rawId(r))}\ntype commit\ntag v${i}.0\ntagger T Agger <t@example.com> ${when} +0000\n\nRelease ${i}\n`;
+    return framed("tag", enc.encode(s));
+  }
+
+  const strategies = [
+    constants.Z_DEFAULT_STRATEGY,
+    constants.Z_FILTERED,
+    constants.Z_HUFFMAN_ONLY,
+    constants.Z_RLE,
+    constants.Z_FIXED,
+  ];
+
+  /** zlib's verdict on a stream with bytes after it: the output and where the stream ended. */
+  function zlibRun(z: Uint8Array): { kind: string; out?: Uint8Array; consumed?: number } {
+    try {
+      const { buffer, engine } = inflateSync(z, { info: true }) as unknown as {
+        buffer: Buffer;
+        engine: { bytesWritten: number };
+      };
+      return { kind: "ok", out: new Uint8Array(buffer), consumed: engine.bytesWritten };
+    } catch (e) {
+      return { kind: (e as { code?: string }).code === "Z_BUF_ERROR" ? "truncated" : "corrupt" };
+    }
+  }
+  function wholeRun(z: Uint8Array, size?: number) {
+    try {
+      const r = inflateWhole(z, size === undefined ? { maxSize: 1 << 22 } : { size });
+      return { kind: "ok", out: r.data.subarray(0, r.length), consumed: r.consumed };
+    } catch (e) {
+      if (e instanceof InflateOverflowError) return { kind: "overflow" };
+      if (e instanceof TruncatedStreamError) return { kind: "truncated" };
+      if (e instanceof InflateError) return { kind: "corrupt" };
+      throw e;
+    }
+  }
+
+  it("inflates every object type at levels 0 to 9 and every strategy as zlib does, stopping where its stream ends", () => {
+    const r = rng(4280);
+    const types = new Set<number>();
+    for (let i = 0; i < 1200; i++) {
+      const raw = gitObject(r, i);
+      const level = i % 10;
+      const strategy = strategies[Math.floor(i / 10) % strategies.length];
+      const z = new Uint8Array(deflateSync(raw, { level, strategy }));
+      types.add(((z[2] as number) >> 1) & 3);
+      // the next object follows the stream in a pack: bytes after it are not read
+      const tail = new Uint8Array(z.length + 7);
+      tail.set(z);
+      for (let k = z.length; k < tail.length; k++) tail[k] = Math.floor(r() * 256);
+      const got = wholeRun(tail, raw.length);
+      expect(got.kind, `object ${i}`).toBe("ok");
+      expect(got.consumed, `object ${i}`).toBe(z.length);
+      expect(Buffer.from(got.out as Uint8Array).equals(Buffer.from(raw)), `object ${i}`).toBe(true);
+    }
+    // stored, fixed and dynamic first blocks all occur
+    expect([...types].sort()).toEqual([0, 1, 2]);
+  });
+
+  it("accepts and refuses damaged git objects as zlib does, with the same bytes and end", () => {
+    const r = rng(4281);
+    const seen = { ok: 0, truncated: 0, corrupt: 0 };
+    for (let i = 0; i < 3000; i++) {
+      const raw = gitObject(r, i);
+      let z = new Uint8Array(
+        deflateSync(raw, {
+          level: i % 10,
+          strategy: strategies[Math.floor(i / 10) % strategies.length],
+        }),
+      );
+      const damage = i % 5;
+      if (damage === 1) {
+        for (let k = 1 + Math.floor(r() * 3); k > 0; k--) {
+          const at = Math.floor(r() * z.length);
+          z[at] = (z[at] as number) ^ (1 << Math.floor(r() * 8));
+        }
+      } else if (damage === 2) z = z.subarray(0, Math.floor(r() * z.length));
+      else if (damage === 3)
+        z[2 + Math.floor(r() * Math.min(z.length - 2, 48))] = Math.floor(r() * 256);
+      else if (damage === 4) {
+        // a flipped bit in the Adler-32 trailer or just before it
+        const at = z.length - 1 - Math.floor(r() * 6);
+        z[at] = (z[at] as number) ^ (1 << Math.floor(r() * 8));
+      }
+      const want = zlibRun(z);
+      const got = wholeRun(z);
+      expect(got.kind, `object ${i}`).toBe(want.kind);
+      seen[want.kind as keyof typeof seen]++;
+      if (want.out) {
+        expect(got.consumed, `object ${i}`).toBe(want.consumed);
+        expect(
+          Buffer.from(got.out as Uint8Array).equals(Buffer.from(want.out)),
+          `object ${i}`,
+        ).toBe(true);
+      }
+    }
+    expect(seen.ok).toBeGreaterThan(600);
+    expect(seen.truncated).toBeGreaterThan(300);
+    expect(seen.corrupt).toBeGreaterThan(600);
+  }, 30_000);
+
+  it("decodes 15-bit codes, sub-tables and far distances as zlib does", () => {
+    const r = rng(4282);
+    for (let i = 0; i < 40; i++) {
+      // byte values with a geometric spread (Huffman codes up to 15 bits), repeats from far back
+      const n = 1000 + Math.floor(r() * 60_000);
+      const raw = new Uint8Array(n);
+      for (let k = 0; k < n; k++) {
+        if (k > 40_000 && r() < 0.3) raw[k] = raw[k - 32_000 - Math.floor(r() * 700)] as number;
+        else raw[k] = Math.min(255, Math.floor(-Math.log2(r() + 1e-12) * (1 + (i % 4))));
+      }
+      const z = new Uint8Array(
+        deflateSync(raw, { level: 1 + (i % 9), strategy: strategies[i % strategies.length] }),
+      );
+      const got = wholeRun(z, n);
+      expect(got.kind, `stream ${i}`).toBe("ok");
+      expect(got.consumed, `stream ${i}`).toBe(z.length);
+      expect(Buffer.from(got.out as Uint8Array).equals(Buffer.from(raw)), `stream ${i}`).toBe(true);
+    }
+  });
+});
+
+describe("inflateWhole on handcrafted dynamic blocks", () => {
+  /** Bits written LSB first, as deflate packs them. */
+  class BitWriter {
+    bytes: number[] = [0x78, 0x01];
+    acc = 0;
+    n = 0;
+    put(v: number, len: number) {
+      for (let i = 0; i < len; i++) {
+        this.acc |= ((v >> i) & 1) << this.n;
+        if (++this.n === 8) {
+          this.bytes.push(this.acc);
+          this.acc = 0;
+          this.n = 0;
+        }
+      }
+    }
+    /** A Huffman code: its bits from the first. */
+    code(c: number, len: number) {
+      for (let i = len - 1; i >= 0; i--) this.put((c >> i) & 1, 1);
+    }
+    end(raw: Uint8Array): Uint8Array {
+      if (this.n) this.bytes.push(this.acc);
+      let a = 1;
+      let b = 0;
+      for (const x of raw) {
+        a = (a + x) % 65521;
+        b = (b + a) % 65521;
+      }
+      const s = ((b << 16) | a) >>> 0;
+      this.bytes.push(s >>> 24, (s >>> 16) & 255, (s >>> 8) & 255, s & 255);
+      return new Uint8Array(this.bytes);
+    }
+  }
+  /** Canonical codes for code lengths. */
+  function canonical(lens: number[]): number[] {
+    const count = new Array(16).fill(0);
+    for (const l of lens) if (l) count[l]++;
+    const next = new Array(16).fill(0);
+    let code = 0;
+    for (let l = 1; l < 16; l++) {
+      code = (code + count[l - 1] * (l > 1 ? 1 : 0)) << 1;
+      next[l] = code;
+    }
+    return lens.map((l) => (l ? next[l]++ : 0));
+  }
+
+  it("reads the extra bits of a 15-bit far distance code at every bit position", () => {
+    // literals 9 bits, end of block and length 10 (symbol 264) 2 bits; distances 0..13 of 1..14
+    // bits, 14 and 29 (24577 + 13 extra bits) of 15
+    const litLens = new Array(265).fill(0);
+    for (let s = 0; s < 256; s++) litLens[s] = 9;
+    litLens[256] = 2;
+    litLens[264] = 2;
+    const distLens = new Array(30).fill(0);
+    for (let s = 0; s < 14; s++) distLens[s] = s + 1;
+    distLens[14] = 15;
+    distLens[29] = 15;
+    const litCodes = canonical(litLens);
+    const distCodes = canonical(distLens);
+    const w = new BitWriter();
+    w.put(1, 1); // last block
+    w.put(2, 2); // dynamic
+    w.put(265 - 257, 5);
+    w.put(30 - 1, 5);
+    w.put(19 - 4, 4);
+    // code length code: 0..15 of 4 bits each (complete), in the header's order
+    const order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    for (const s of order) w.put(s < 16 ? 4 : 0, 3);
+    for (const l of [...litLens, ...distLens]) w.code(l, 4); // symbol l has code l
+    const r = rng(4283);
+    const raw: number[] = [];
+    while (raw.length < 25_000) {
+      const b = Math.floor(r() * 256);
+      raw.push(b);
+      w.code(litCodes[b] as number, 9);
+    }
+    for (let m = 0; m < 400; m++) {
+      for (let k = Math.floor(r() * 4); k > 0; k--) {
+        const b = Math.floor(r() * 256);
+        raw.push(b);
+        w.code(litCodes[b] as number, 9);
+      }
+      const extra = Math.floor(r() * 8192);
+      const dist = 24577 + extra;
+      if (dist > raw.length) continue;
+      w.code(litCodes[264] as number, 2);
+      w.code(distCodes[29] as number, 15);
+      w.put(extra, 13);
+      for (let k = 0; k < 10; k++) raw.push(raw[raw.length - dist] as number);
+    }
+    w.code(litCodes[256] as number, 2);
+    const want = new Uint8Array(raw);
+    const z = w.end(want);
+    expect(Buffer.from(inflateSync(z)).equals(Buffer.from(want))).toBe(true);
+    const got = inflateWhole(z, { size: want.length });
+    expect(got.consumed).toBe(z.length);
+    expect(Buffer.from(got.data).equals(Buffer.from(want))).toBe(true);
   });
 });

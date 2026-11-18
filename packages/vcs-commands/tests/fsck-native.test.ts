@@ -1449,6 +1449,21 @@ describeGit("fsck against native git", () => {
     const r = await compare(dir, []);
     expect(r.stderr).toContain("hint: Support for <GIT_DIR>/info/grafts is deprecated");
     await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    // with a commit-graph (written without the grafts file: git writes none with one), the
+    // `git commit-graph verify` that fsck runs reads the grafts file again: the hint twice
+    const grafts = join(dir, ".git", "info", "grafts");
+    const graftsText = readFileSync(grafts);
+    rmSync(grafts);
+    g(dir, "commit-graph", "write", "--reachable");
+    writeFileSync(grafts, graftsText);
+    const hints = (s: string) => s.split("hint: Support for <GIT_DIR>/info/grafts").length - 1;
+    expect(hints((await compare(dir, [])).stderr)).toBe(2);
+    const co = await compare(dir, ["--connectivity-only"], (c) => c.setConnectivityOnly(true));
+    expect(hints(co.stderr)).toBe(2);
+    // without core.commitGraph fsck runs no verification
+    g(dir, "config", "core.commitGraph", "false");
+    expect(hints((await compare(dir, [])).stderr)).toBe(1);
+    g(dir, "config", "--unset", "core.commitGraph");
     g(dir, "config", "advice.graftFileDeprecated", "false");
     expect((await compare(dir, [])).stderr).not.toContain("hint:");
   });
