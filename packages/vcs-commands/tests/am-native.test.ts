@@ -513,4 +513,127 @@ describeGit("git am as native git", () => {
       );
     }
   }, 120_000);
+
+  it("cleans the index on --abort as git's clean_index", async () => {
+    const mbox = series();
+    const bytes = readFileSync(mbox);
+    const drift = (repo: string) => {
+      put(repo, "a.txt", lines(20).replace("line 18\n", "LINE 18\n"));
+      gitOk(repo, ["commit", "-qam", "drift"]);
+    };
+    // a staged change with unstaged changes on top: not up to date for ORIG_HEAD, refused
+    let pair = twins(drift);
+    await compare(pair, [mbox], (c) => c.addMbox(bytes), "stop at 3 (staged)");
+    for (const repo of [pair.native, pair.ours]) {
+      put(repo, "a.txt", "staged\n");
+      gitOk(repo, ["add", "a.txt"]);
+      put(repo, "a.txt", "unstaged on top\n");
+    }
+    await compare(pair, ["--abort"], (c) => c.setResume("abort"), "abort staged and unstaged");
+    // a staged deletion of a path ORIG_HEAD does not have: the file stays, untracked
+    pair = twins(drift);
+    await compare(pair, [mbox], (c) => c.addMbox(bytes), "stop at 3 (rm --cached)");
+    for (const repo of [pair.native, pair.ours]) gitOk(repo, ["rm", "-q", "--cached", "bee.txt"]);
+    await compare(pair, ["--abort"], (c) => c.setResume("abort"), "abort rm --cached");
+    // a conflict of --3way: the conflicted path is reset, a staged new file is kept
+    pair = twins(drift);
+    await compare(pair, ["-3", mbox], (c) => c.addMbox(bytes).setThreeWay(true), "3way stop at 3");
+    for (const repo of [pair.native, pair.ours]) {
+      put(repo, "new.txt", "new\n");
+      gitOk(repo, ["add", "new.txt"]);
+    }
+    await compare(pair, ["--abort"], (c) => c.setResume("abort"), "abort 3way conflict");
+  }, 120_000);
+
+  it("reconstructs a pure rename's base with a regular file's mode on -3", async () => {
+    const src = join(root, `src${counter++}`);
+    base(src);
+    gitOk(src, ["mv", "b.txt", "bee.txt"]);
+    put(src, "a.txt", lines(20).replace("line 3\n", "line three\n"));
+    gitOk(src, ["commit", "-qam", "rename and change"]);
+    const mbox = join(root, `rename${counter++}.mbox`);
+    writeFileSync(
+      mbox,
+      spawnSync("git", ["format-patch", "--stdout", "-M", "HEAD~1"], { cwd: src, env: envOf() })
+        .stdout,
+    );
+    const bytes = readFileSync(mbox);
+    const drift = (repo: string) => {
+      put(repo, "a.txt", lines(20).replace("line 3\n", "LINE 3\n"));
+      gitOk(repo, ["commit", "-qam", "drift"]);
+    };
+    await compare(
+      twins(drift),
+      ["-3", mbox],
+      (c) => c.addMbox(bytes).setThreeWay(true),
+      "3way pure rename",
+    );
+  }, 120_000);
+
+  it("converts to i18n.commitEncoding and records it in the commit", async () => {
+    const patch =
+      "---\n a.txt | 2 +-\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-line 1\n+one\n line 2\n";
+    const mail = Buffer.from(
+      `From: =?UTF-8?q?Ren=C3=A9?= <r@x>\nSubject: =?UTF-8?q?caf=C3=A9?=\nContent-Type: text/plain; charset=UTF-8\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nna\u00efve body\n${patch}`,
+    );
+    const path = join(root, `m${counter++}`);
+    writeFileSync(path, mail);
+    for (const encoding of ["ISO-8859-1", "koi8-r"]) {
+      const pair = twins((repo) => gitOk(repo, ["config", "i18n.commitEncoding", encoding]));
+      await compare(pair, [path], (c) => c.addMbox(mail, path), `commitEncoding ${encoding}`);
+      expect(gitOk(pair.ours, ["cat-file", "commit", "HEAD"])).toBe(
+        gitOk(pair.native, ["cat-file", "commit", "HEAD"]),
+      );
+    }
+    // a subject that is no UTF-8: the reflog keeps its bytes
+    const latin = Buffer.from(
+      `From: A <a@x>\nSubject: =?ISO-8859-1?q?caf=E9?=\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nbody\n${patch}`,
+    );
+    const latinPath = join(root, `m${counter++}`);
+    writeFileSync(latinPath, latin);
+    await compare(
+      twins((repo) => gitOk(repo, ["config", "i18n.commitEncoding", "ISO-8859-1"])),
+      [latinPath],
+      (c) => c.addMbox(latin, latinPath),
+      "latin-1 reflog subject",
+    );
+  }, 120_000);
+
+  it("refuses StGit series and blank mboxes as git does", async () => {
+    const dir = join(root, `stg${counter++}`);
+    mkdirSync(dir, { recursive: true });
+    const seriesPath = join(dir, "series");
+    const content = "# This series applies on GIT commit 0000\n# comment\np1\np2\n";
+    writeFileSync(seriesPath, content);
+    await compare(
+      twins(),
+      ["--patch-format=stgit-series", seriesPath],
+      (c) => c.addMbox(Buffer.from(content), seriesPath).setPatchFormat("stgit-series"),
+      "stgit series",
+    );
+    await compare(
+      twins(),
+      ["--patch-format=stgit-series", seriesPath, seriesPath],
+      (c) =>
+        c
+          .addMbox(Buffer.from(content), seriesPath)
+          .addMbox(Buffer.from(content), seriesPath)
+          .setPatchFormat("stgit-series"),
+      "two stgit series",
+    );
+    // a vertical tab or a form feed is no space to git: the mbox is not empty
+    for (const [label, blank] of [
+      ["vt", "\v\n"],
+      ["ff", "\f\n"],
+    ] as const) {
+      const path = join(root, `blank-${label}-${counter++}`);
+      writeFileSync(path, blank);
+      await compare(
+        twins(),
+        ["--patch-format=mbox", path],
+        (c) => c.addMbox(Buffer.from(blank), path).setPatchFormat("mbox"),
+        `blank mbox ${label}`,
+      );
+    }
+  }, 120_000);
 });

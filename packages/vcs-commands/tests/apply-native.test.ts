@@ -884,6 +884,38 @@ describeGit("git apply as native git", () => {
       expect(performance.now() - started).toBeLessThan(60_000);
     }
   }, 300_000);
+
+  it("keeps the bytes of postimage lines cut at the end, as git 2.5x", async () => {
+    // git 2.43 aborts on this patch (its update_pre_post_images had a different splice)
+    if (!gitAtLeast(gitOk(root, "--version"), 2, 50)) return;
+    const patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,5 @@\n a\n+X\n b\n c\n \n";
+    await compareApply(
+      twins((d) => put(d, "f", "a\nb\nc")),
+      patch,
+      {
+        args: ["--whitespace=fix", "--ignore-whitespace"],
+        configure: (c) => c.setWhitespace("fix").setIgnoreWhitespace(true),
+      },
+      "cut postimage",
+    );
+  });
+
+  it("reports a path below a file as not a directory", async () => {
+    const patch =
+      "diff --git a/f/inner b/f/inner\ndeleted file mode 100644\n--- a/f/inner\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+    await compareApply(
+      twins((d) => put(d, "f", "file\n")),
+      patch,
+      { args: [] },
+      "below a file",
+    );
+    await compareApply(
+      twins(() => {}),
+      patch,
+      { args: [] },
+      "missing",
+    );
+  });
 });
 
 /** Our command configured as native `git apply <args>`. */

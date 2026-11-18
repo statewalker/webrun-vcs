@@ -9,8 +9,6 @@
 
 import { bytesToLatin1, latin1ToBytes } from "../apply/latin1.js";
 
-const isSpace = (c: string | undefined) =>
-  c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\v" || c === "\f";
 // git's isspace (sane_ctype): space, tab, LF, CR
 const gitSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r";
 const isDigit = (c: string | undefined) => c !== undefined && c >= "0" && c <= "9";
@@ -115,6 +113,11 @@ export interface MailInfoOptions {
   useScissors?: boolean;
   /** Convert to UTF-8 (`-u`, default); false keeps the bytes (`-n`) */
   utf8?: boolean;
+  /**
+   * The charset `-u` converts to (git's `metainfo_charset`: am's commit output encoding,
+   * `i18n.commitEncoding`); UTF-8 by default
+   */
+  charset?: string;
   /** `--quoted-cr=<action>` (default warn) */
   quotedCr?: "nowarn" | "warn" | "strip";
 }
@@ -352,27 +355,142 @@ const ASCII = new Set([
   "646",
 ]);
 
+const GB2312 = new Set([
+  "gb2312",
+  "euc-cn",
+  "euccn",
+  "csgb2312",
+  "gb_2312-80",
+  "iso-ir-58",
+  "chinese",
+]);
+const SHIFT_JIS = new Set(["shift_jis", "shift-jis", "sjis", "ms_kanji", "csshiftjis", "x-sjis"]);
+const BIG5 = new Set(["big5", "csbig5", "cn-big5", "x-x-big5", "big-5"]);
+
 /**
- * `reencode_string_len` (iconv) of a charset's bytes to UTF-8: undefined when the charset
- * is unknown or the bytes are not valid in it. ISO-8859-1 is Latin-1 (TextDecoder's label
- * would be windows-1252) and US-ASCII refuses bytes above 0x7f, as iconv does. UTF-7 is
- * not supported (TextDecoder has no decoder for it): it fails as an unknown charset.
+ * Whether the bytes keep to the byte ranges of the strict charset glibc's iconv converts,
+ * where TextDecoder's decoder for the label is a superset: GB2312 (EUC-CN; TextDecoder
+ * decodes GBK), Shift_JIS (TextDecoder: windows-31j) and Big5 (TextDecoder: Big5-HKSCS).
+ * Only the byte structure is checked: an unassigned code point inside the ranges still
+ * decodes as TextDecoder decodes it.
  */
-function reencode(bytes: string, charset: string): string | undefined {
-  const name = charset.toLowerCase();
-  if (LATIN1.has(name)) return bytesToLatin1(new TextEncoder().encode(bytes));
+function strictMultibyte(name: string, bytes: Uint8Array): boolean {
+  const inRange = (b: number | undefined, lo: number, hi: number) =>
+    b !== undefined && b >= lo && b <= hi;
+  if (GB2312.has(name)) {
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i] as number;
+      if (b < 0x80) continue;
+      if (!(inRange(b, 0xa1, 0xa9) || inRange(b, 0xb0, 0xf7))) return false;
+      if (!inRange(bytes[++i], 0xa1, 0xfe)) return false;
+    }
+    return true;
+  }
+  if (SHIFT_JIS.has(name)) {
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i] as number;
+      if (b < 0x80 || inRange(b, 0xa1, 0xdf)) continue;
+      if (!(inRange(b, 0x81, 0x9f) || inRange(b, 0xe0, 0xef))) return false;
+      const t = bytes[++i];
+      if (!(inRange(t, 0x40, 0x7e) || inRange(t, 0x80, 0xfc))) return false;
+    }
+    return true;
+  }
+  if (BIG5.has(name)) {
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i] as number;
+      if (b < 0x80) continue;
+      if (!inRange(b, 0xa1, 0xf9)) return false;
+      const t = bytes[++i];
+      if (!(inRange(t, 0x40, 0x7e) || inRange(t, 0xa1, 0xfe))) return false;
+    }
+    return true;
+  }
+  return true;
+}
+
+/** A charset's bytes (binary string) decoded, as iconv reads them; undefined on failure. */
+function decodeCharset(bytes: string, name: string): string | undefined {
+  if (LATIN1.has(name)) return bytes;
   if (ASCII.has(name)) {
     // biome-ignore lint/suspicious/noControlCharactersInRegex: the bytes above ASCII
     return /[^\x00-\x7f]/.test(bytes) ? undefined : bytes;
   }
+  const raw = latin1ToBytes(bytes);
+  if (!strictMultibyte(name, raw)) return undefined;
   try {
-    const text = new TextDecoder(name, { fatal: true, ignoreBOM: true }).decode(
-      latin1ToBytes(bytes),
-    );
-    return bytesToLatin1(new TextEncoder().encode(text));
+    const text = new TextDecoder(name, { fatal: true, ignoreBOM: true }).decode(raw);
+    // windows-125x: TextDecoder maps the bytes these code pages leave undefined (0x81,
+    // 0x8d, 0x8f, 0x90, 0x9d of windows-1252) to C1 controls, iconv refuses them
+    if (/^(windows-|cp|x-cp)125\d$/.test(name) && /[\x80-\x9f]/.test(text)) return undefined;
+    return text;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * `reencode_string_len` (iconv) of a charset's bytes to the target charset (UTF-8 by
+ * default): undefined when a charset is unknown, the bytes are not valid in the source or
+ * do not fit the target. ISO-8859-1 is Latin-1 (TextDecoder's label would be
+ * windows-1252) and US-ASCII refuses bytes above 0x7f, as iconv does. UTF-7 is not
+ * supported (TextDecoder has no decoder for it): it fails as an unknown charset. Targets
+ * are UTF-8, ISO-8859-1, US-ASCII and the single-byte charsets TextDecoder decodes; other
+ * targets convert ASCII only.
+ */
+function reencode(bytes: string, charset: string, target = "UTF-8"): string | undefined {
+  const text = decodeCharset(bytes, charset.toLowerCase());
+  if (text === undefined) return undefined;
+  const to = target.toLowerCase();
+  if (/^utf-?8$/.test(to)) return bytesToLatin1(new TextEncoder().encode(text));
+  const max = LATIN1.has(to) ? 0xff : ASCII.has(to) ? 0x7f : -1;
+  if (max >= 0) {
+    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > max) return undefined;
+    return text;
+  }
+  const table = singleByteTable(to);
+  let out = "";
+  for (const ch of text) {
+    const code = ch.codePointAt(0) as number;
+    const byte = code < 0x80 ? code : table?.get(ch);
+    // an ASCII-compatible multibyte target (EUC, Shift_JIS, ...): ASCII converts as itself
+    if (byte === undefined) return undefined;
+    out += String.fromCharCode(byte);
+  }
+  return out;
+}
+
+const singleByteTables = new Map<string, Map<string, number> | undefined>();
+
+/**
+ * The characters of a single-byte charset TextDecoder knows (KOI8-R, windows-125x,
+ * ISO-8859-x) to their bytes, inverted from its decoder; undefined for other charsets.
+ */
+function singleByteTable(name: string): Map<string, number> | undefined {
+  if (singleByteTables.has(name)) return singleByteTables.get(name);
+  let table: Map<string, number> | undefined;
+  try {
+    const decoder = new TextDecoder(name);
+    const all = Uint8Array.from({ length: 256 }, (_, i) => i);
+    if ([...decoder.decode(all)].length === 256 && !/^utf-?(16|32)/.test(name)) {
+      table = new Map();
+      for (let b = 0x80; b < 0x100; b++) {
+        const ch = decoder.decode(Uint8Array.of(b));
+        // a byte the code page leaves undefined (a C1 control of windows-125x) converts
+        // no character
+        if (
+          ch === "\ufffd" ||
+          (/^(windows-|cp|x-cp)125\d$/.test(name) && b < 0xa0 && ch.charCodeAt(0) === b)
+        )
+          continue;
+        if (!table.has(ch)) table.set(ch, b);
+      }
+    }
+  } catch {
+    table = undefined;
+  }
+  singleByteTables.set(name, table);
+  return table;
 }
 
 /** git's `mailinfo` of one message (binary string). */
@@ -398,12 +516,14 @@ export function mailinfo(message: string, options: MailInfoOptions = {}): MailIn
   const quotedCr = options.quotedCr ?? "warn";
   const useScissors = options.useScissors ?? false;
 
+  // metainfo_charset: what the message is converted to
+  const target = options.charset ?? "UTF-8";
   const convert = (s: string, cs: string): string | undefined => {
-    if (!utf8 || !cs || sameEncoding("UTF-8", cs)) return s;
-    const out = reencode(s, cs);
+    if (!utf8 || !cs || sameEncoding(target, cs)) return s;
+    const out = reencode(s, cs, target);
     if (out === undefined) {
       inputError = true;
-      errors += `error: cannot convert from ${cs} to UTF-8\n`;
+      errors += `error: cannot convert from ${cs} to ${target}\n`;
     }
     return out;
   };
@@ -878,7 +998,7 @@ function handleFrom(
   if (current.email && f.indexOf("@", at + 1) >= 0) return current;
   while (at > 0) {
     const c = f[at - 1];
-    if (isSpace(c)) break;
+    if (gitSpace(c)) break;
     if (c === "<") {
       f = `${f.slice(0, at - 1)} ${f.slice(at)}`;
       break;

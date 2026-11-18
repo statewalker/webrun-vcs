@@ -385,7 +385,9 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     const fromCfg = this.config("format.from");
     let fromSpec: string | true | undefined = this.from;
     if (fromSpec === undefined && fromCfg !== undefined) {
-      const b = bool(fromCfg);
+      // git_parse_maybe_bool: an ident where the value is not a boolean (a valueless
+      // `format.from`, read here as "", is true)
+      const b = maybeBool(fromCfg);
       fromSpec = b === undefined ? fromCfg : b ? true : undefined;
     }
 
@@ -512,6 +514,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         committer,
         encodeHeaders,
         zeroCommit: this.zeroCommit,
+        outputEncoding,
       });
       const content = concat([text, latin(bases.text), latin(sig())]);
       bases.text = "";
@@ -733,6 +736,8 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       committer: PersonIdent;
       encodeHeaders: boolean;
       zeroCommit: boolean;
+      /** get_log_output_encoding(): the shortlog's (the headers stay UTF-8) */
+      outputEncoding: string;
     },
   ): Promise<Uint8Array> {
     const head = list[0] as ObjectId;
@@ -762,12 +767,18 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         "MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n";
     text += mail.afterSubject;
     text += "\n*** BLURB HERE ***\n\n";
-    // shortlog: authors in byte order, their subjects oldest first, wrapped at 72
+    const parts: Uint8Array[] = [new TextEncoder().encode(text)];
+    text = "";
+    // shortlog: authors in byte order, their subjects oldest first, wrapped at 72; each
+    // commit's name and subject in the log output encoding (shortlog_add_commit), as
+    // stored where they do not convert (logmsg_reencode)
     const byAuthor = new Map<string, string[]>();
+    const encoderOf = new Map<string, (s: string) => Uint8Array>();
     for (const [k, c] of commits.entries()) {
       if (!c) continue;
       const utf8 = await this.utf8AuthorAndMessage(list[k] as ObjectId, c);
       const name = utf8.name;
+      const encoder = outputEncoder(mail.outputEncoding, `${name}\n${utf8.message}`, utf8.stored);
       let subject = subjectLine(utf8.message);
       if (subject.startsWith("[PATCH")) {
         const eob = subject.indexOf("]");
@@ -776,14 +787,21 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       const listFor = byAuthor.get(name) ?? [];
       listFor.push(subject);
       byAuthor.set(name, listFor);
+      encoderOf.set(`${name}\n${listFor.length - 1}`, encoder);
+      if (!encoderOf.has(name)) encoderOf.set(name, encoder);
     }
     const names = [...byAuthor.keys()].sort(compareBytes);
+    const utf8Encode = (x: string) => new TextEncoder().encode(x);
     for (const name of names) {
       const subjects = byAuthor.get(name) as string[];
-      text += `${name} (${subjects.length}):\n`;
+      parts.push((encoderOf.get(name) ?? utf8Encode)(`${name} (${subjects.length}):\n`));
       for (let j = subjects.length; j >= 1; j--)
-        text += `${wrapText(subjects[j - 1] as string, 2, 4, MAIL_DEFAULT_WRAP)}\n`;
-      text += "\n";
+        parts.push(
+          (encoderOf.get(`${name}\n${j - 1}`) ?? utf8Encode)(
+            `${wrapText(subjects[j - 1] as string, 2, 4, MAIL_DEFAULT_WRAP)}\n`,
+          ),
+        );
+      parts.push(utf8Encode("\n"));
     }
     if (origin) {
       const originTree = (await this.commits.load(origin))?.tree;
@@ -791,7 +809,8 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       text += await this.treeDiffstat(originTree, headTree as string);
       text += "\n";
     }
-    return new TextEncoder().encode(text);
+    parts.push(new TextEncoder().encode(text));
+    return concat(parts);
   }
 
   /** The commit as stored (its fields encoded again when the store has no raw bytes). */
@@ -821,7 +840,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
   private async utf8AuthorAndMessage(
     id: ObjectId,
     commit: { author: { name: string }; message: string },
-  ): Promise<{ name: string; message: string }> {
+  ): Promise<{ name: string; message: string; stored: string }> {
     const raw = await this.rawCommitBytes(id);
     let end = 0;
     let encoding: string | undefined;
@@ -835,7 +854,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       if (text.startsWith("author ")) authorLine = line.subarray(7);
       end = nl + 1;
     }
-    const stored = { name: commit.author.name, message: commit.message };
+    const stored = { name: commit.author.name, message: commit.message, stored: "UTF-8" };
     if (!encoding || /^utf-?8$/i.test(encoding)) return stored;
     const decode = (bytes: Uint8Array): string | undefined => {
       if (/^(iso[-_]?8859-1|latin-?1|l1)$/i.test(encoding as string)) {
@@ -853,7 +872,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     const ident = authorLine ? decode(authorLine) : undefined;
     const name = ident?.replace(/ ?<[^>]*>.*$/s, "");
     if (message === undefined) return stored;
-    return { name: name ?? stored.name, message };
+    return { name: name ?? stored.name, message, stored: encoding };
   }
 
   /** `--stat --summary` of two trees, as format-patch's cover letter shows them. */
@@ -865,6 +884,41 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     const r = await diff.callFormats(["stat", "summary"]);
     return r.bytes ? decodeGitPath(r.bytes) : "";
   }
+}
+
+/** git_parse_maybe_bool: undefined (git's -1) for a value that is not a boolean. */
+function maybeBool(value: string): boolean | undefined {
+  const v = value.toLowerCase();
+  if (v === "" || v === "true" || v === "yes" || v === "on") return true;
+  if (v === "false" || v === "no" || v === "off") return false;
+  // git_parse_int: an integer with an optional k/m/g unit
+  const m = /^\s*[+-]?(0x[0-9a-f]+|\d+)[kmg]?$/i.exec(value);
+  if (m) return Number(m[1]) !== 0;
+  return undefined;
+}
+
+const LATIN1_NAME = /^(iso[-_]?8859-1|iso8859-1|latin-?1|l1|iso-ir-100|cp819|ibm819|csisolatin1)$/i;
+
+const latin1Bytes = (s: string) => {
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+};
+
+/**
+ * How a commit's text is written in the log output encoding: UTF-8 or ISO-8859-1 (when
+ * every character converts); otherwise in the encoding the commit is stored in, as git
+ * keeps a message iconv cannot convert.
+ */
+function outputEncoder(output: string, text: string, stored: string): (s: string) => Uint8Array {
+  const utf8 = (s: string) => new TextEncoder().encode(s);
+  const encoderFor = (charset: string) =>
+    /^utf-?8$/i.test(charset)
+      ? utf8
+      : LATIN1_NAME.test(charset) && [...text].every((ch) => (ch.codePointAt(0) ?? 0) <= 0xff)
+        ? latin1Bytes
+        : undefined;
+  return encoderFor(output) ?? encoderFor(stored) ?? utf8;
 }
 
 function subjectLine(message: string): string {

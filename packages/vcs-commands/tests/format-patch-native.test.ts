@@ -425,5 +425,22 @@ describeGit("git format-patch as native git", () => {
       (c) => c.setMaxCount(2).setCoverLetter(true).setFrom("Séndér <s@x>"),
       "cover --from, no encoded headers",
     );
+    gitOk(repo, ["config", "--unset", "format.encodeEmailHeaders"]);
+    // the cover letter's shortlog in the log output encoding, its header still UTF-8
+    for (const encoding of ["ISO-8859-1", "UTF-8"]) {
+      gitOk(repo, ["config", "i18n.logOutputEncoding", encoding]);
+      await compareBytes(
+        ["-3", "--cover-letter"],
+        (c) => c.setMaxCount(3).setCoverLetter(true),
+        `cover shortlog ${encoding}`,
+      );
+    }
+    gitOk(repo, ["config", "--unset", "i18n.logOutputEncoding"]);
+    // format.from: a boolean (git_parse_maybe_bool) or an ident, in-body From included
+    for (const value of ["Cfg From <cfg@x>", "Ann <ann@x>", "true", "false", "1", "0", "yes"]) {
+      gitOk(repo, ["config", "format.from", value]);
+      await compareBytes(["-2"], (c) => c.setMaxCount(2), `format.from=${value}`);
+    }
+    gitOk(repo, ["config", "--unset", "format.from"]);
   }, 120_000);
 });

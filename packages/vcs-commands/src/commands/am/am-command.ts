@@ -11,9 +11,9 @@
  * copies none (only `rebase --apply` does, through `rewritten`).
  */
 
-import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
 
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import { GitCommand } from "../../git-command.js";
 import { quotePath } from "../../results/quote-path.js";
@@ -46,7 +46,7 @@ import { stripspace } from "../message-cleanup.js";
 import { ortResultEntries } from "../ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../ort-recursive.js";
 import { updateHead } from "../reflog-messages.js";
-import { resetMerge } from "../sequencer-support.js";
+import { resetMerge, resetUnmergedToHead } from "../sequencer-support.js";
 import { appendSignoff } from "../trailers.js";
 import { mailinfo, mailsplit } from "./mailinfo.js";
 import {
@@ -393,15 +393,30 @@ export class AmCommand extends GitCommand<AmResult> {
     const inputs = this.mboxes.length ? this.mboxes : [{ content: "" }];
     if (format === "mbox" || format === "mboxrd") {
       for (const mbox of inputs) {
-        // mailsplit: an empty file is an error, empty standard input is not
-        if (mbox.name !== undefined && /^[ \t\n\v\f\r]*$/.test(mbox.content)) {
+        // mailsplit: an empty file (git's isspace: space, tab, LF, CR) is an error, empty
+        // standard input is not
+        if (mbox.name !== undefined && /^[ \t\n\r]*$/.test(mbox.content)) {
           this.err += `error: empty mbox: '${mbox.name}'\n`;
           failSplit(`cannot split patches from ${mbox.name}`);
         }
         mails.push(...mailsplit(mbox.content, { keepCr, mboxrd: format === "mboxrd" }));
       }
     } else if (format === "stgit-series") {
-      failSplit("Only one StGIT patch series can be applied at once");
+      // split_mail_stgit_series: one named series file, whose patches are files next to it
+      // (this command reads no files: the first one cannot be opened)
+      const series = this.mboxes.length === 1 ? this.mboxes[0] : undefined;
+      if (!series || series.name === undefined)
+        failSplit("Only one StGIT patch series can be applied at once");
+      const { name, content } = series as { name: string; content: string };
+      const slash = name.replace(/\/+$/, "").lastIndexOf("/");
+      const dir = slash < 0 ? "." : slash === 0 ? "/" : name.slice(0, slash);
+      const first = content
+        .split("\n")
+        .find((l, i, all) => !l.startsWith("#") && (l || i < all.length - 1));
+      if (first !== undefined)
+        failSplit(`could not open '${dir}/${first}' for reading: No such file or directory`);
+      // no patches: split_mail_conv reads standard input
+      mails.push(stgitPatchToMail(""));
     } else {
       for (const mbox of inputs) {
         if (format === "stgit") mails.push(stgitPatchToMail(mbox.content));
@@ -573,6 +588,8 @@ export class AmCommand extends GitCommand<AmResult> {
           addMessageId: st.messageId,
           ...(st.scissors ? { useScissors: st.scissors === "t" } : {}),
           utf8: st.utf8,
+          // metainfo_charset: get_commit_output_encoding()
+          charset: configValue(this.workingCopy, "i18n.commitEncoding") ?? "UTF-8",
         });
         await this.write("info", mi.info);
         await this.write("msg", mi.msg);
@@ -721,7 +738,18 @@ export class AmCommand extends GitCommand<AmResult> {
           break;
         }
       }
-      fake.set(name, { mode: p.oldMode, objectId: oid });
+      // make_cache_entry's create_ce_mode: a pure rename carries no mode, a regular file's
+      // permissions collapse to 644 or 755
+      const m = p.oldMode;
+      const mode =
+        (m & 0o170000) === 0o120000
+          ? 0o120000
+          : (m & 0o170000) === 0o040000 || (m & 0o170000) === 0o160000
+            ? 0o160000
+            : m & 0o100
+              ? 0o100755
+              : 0o100644;
+      fake.set(name, { mode, objectId: oid });
     }
     if (failed !== undefined) {
       if (failed) this.err += `error: ${failed}\n`;
@@ -828,7 +856,8 @@ export class AmCommand extends GitCommand<AmResult> {
       committer = { ...committer, timestamp: author.timestamp, tzOffset: author.tzOffset };
     // commit_tree's ensure_utf8: bytes that are not UTF-8 read as Latin-1
     let msg = st.msg as string;
-    if (isUtf8Encoding(configValue(this.workingCopy, "i18n.commitEncoding"))) {
+    const commitEncoding = configValue(this.workingCopy, "i18n.commitEncoding");
+    if (isUtf8Encoding(commitEncoding)) {
       const fixed = [author.name, author.email, msg].map(ensureUtf8);
       const committerFixed = [committer.name, committer.email].map((v) =>
         ensureUtf8(pathToLatin1(v)),
@@ -847,13 +876,19 @@ export class AmCommand extends GitCommand<AmResult> {
     }
     author = { ...author, name: latin1ToPath(author.name), email: latin1ToPath(author.email) };
     const message = latin1ToPath(msg);
-    const id = await this.commits.store({
-      tree,
-      parents: head ? [head] : [],
-      author,
-      committer,
-      message,
-    });
+    const parents = head ? [head] : [];
+    const objects = this.workingCopy.history?.objects;
+    let id: ObjectId;
+    if (!isUtf8Encoding(commitEncoding) && objects) {
+      // commit_tree_extended: the `encoding` header, the message and idents as their bytes
+      let text = `tree ${tree}\n`;
+      for (const p of parents) text += `parent ${p}\n`;
+      text += `author ${formatPersonIdent(author)}\ncommitter ${formatPersonIdent(committer)}\n`;
+      text += `encoding ${commitEncoding}\n\n${message}`;
+      id = await objects.putUnsized("commit", [encodeGitPath(text)]);
+    } else {
+      id = await this.commits.store({ tree, parents, author, committer, message });
+    }
     const action = this.reflogAction("am");
     await updateHead(
       this.refsStore,
@@ -899,18 +934,17 @@ export class AmCommand extends GitCommand<AmResult> {
       return this.result(0);
     }
     const orig = await state.ref("ORIG_HEAD");
-    // clean_index: the index and worktree reset to HEAD, then moved to ORIG_HEAD (a two-way
-    // merge that keeps local changes it does not touch); unpack-trees' error, then the stop
+    // clean_index: conflicted entries reset to HEAD (a two-way merge from HEAD to HEAD that
+    // leaves every other entry, staged changes and deletions included, as it is), then the
+    // index moved to ORIG_HEAD (a two-way merge from the index's own tree, so a one-way
+    // reset with git's up-to-date and untracked checks); unpack-trees' error, then the stop
     const cleanFailed = (message: string): never => {
       this.err += `${message.replace(/\nfatal: Could not reset index file to revision '[^\n]*'\.$/, "")}\n`;
       this.fatal("failed to clean index");
     };
-    if (head) {
-      const refused = await resetMerge(this.sequencerContext(), head, "HEAD", { reset: true });
-      if (refused) cleanFailed(refused.message);
-    }
+    await resetUnmergedToHead(this.sequencerContext(), head);
     const target = orig ?? head;
-    if (target && target !== head) {
+    if (target) {
       const refused = await resetMerge(this.sequencerContext(), target, "ORIG_HEAD");
       if (refused) cleanFailed(refused.message);
     }

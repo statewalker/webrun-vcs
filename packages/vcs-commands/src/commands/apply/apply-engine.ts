@@ -31,6 +31,11 @@ interface Line {
   flag: number;
   /** The line itself (lines of a {@link Target} only) */
   text?: string;
+  /**
+   * Bytes of the image after the line that belong to no line (a postimage whose lines
+   * were cut keeps them in its buffer, as git's `update_image` copies it whole)
+   */
+  extra?: string;
 }
 
 interface Image {
@@ -129,6 +134,8 @@ class LineTable {
 class Target {
   lines: LineTable;
   private text: string | undefined;
+  /** Bytes before the first line that belong to no line (see {@link Line.extra}) */
+  private lead = "";
 
   constructor(buf: string, lineTable: boolean) {
     const lines: Line[] = [];
@@ -153,8 +160,12 @@ class Target {
   /** The whole content. */
   get buf(): string {
     if (this.text === undefined) {
-      const parts: string[] = [];
-      for (let i = 0; i < this.lines.length; i++) parts.push(this.lines.at(i).text as string);
+      const parts: string[] = [this.lead];
+      for (let i = 0; i < this.lines.length; i++) {
+        const line = this.lines.at(i);
+        parts.push(line.text as string);
+        if (line.extra) parts.push(line.extra);
+      }
       this.text = parts.join("");
     }
     return this.text;
@@ -164,6 +175,7 @@ class Target {
   set buf(content: string) {
     this.text = content;
     this.lines = new LineTable([]);
+    this.lead = "";
   }
 
   lineText(i: number): string {
@@ -188,8 +200,19 @@ class Target {
     return pos === s.length;
   }
 
-  replaceLines(at: number, remove: number, insert: Line[]): void {
+  /**
+   * Replaces `remove` lines at `at` with `insert`, then `extra` bytes that belong to no
+   * line (they follow the last inserted line, or the line before `at`).
+   */
+  replaceLines(at: number, remove: number, insert: Line[], extra = ""): void {
     this.lines.splice(at, remove, insert);
+    if (extra) {
+      const end = at + insert.length;
+      if (end > 0) {
+        const line = this.lines.at(end - 1);
+        line.extra = (line.extra ?? "") + extra;
+      } else this.lead += extra;
+    }
     this.text = undefined;
   }
 }
@@ -212,6 +235,11 @@ export interface ApplyIO {
    * does not hold it back (`CONV_EOL_RENORMALIZE`)
    */
   readWorktree(name: string, mode: number, keepCrlf: boolean): Promise<string | undefined>;
+  /**
+   * Why lstat of a missing worktree path fails, as strerror (`ENOTDIR` when a leading path
+   * is a file); "No such file or directory" when not given
+   */
+  missingReason?(name: string): Promise<string>;
   /** Whether a leading directory of the path is a symlink in the worktree */
   hasSymlinkLeadingPath(name: string): Promise<boolean>;
   /** The mode git would stage for the worktree file (`ce_mode_from_stat`) */
@@ -398,8 +426,7 @@ export class ApplyEngine extends ApplyParser {
         ctx++;
       }
       if (preimage.lines.length <= ctx) {
-        // dropped from the buffer (git copies nothing for it)
-        post = post.slice(0, insertPos) + post.slice(insertPos + line.len);
+        // the line's bytes stay in the buffer (strbuf_splice is not run for it)
         reduced++;
         continue;
       }
@@ -558,13 +585,9 @@ export class ApplyEngine extends ApplyParser {
       });
       off += l.len;
     }
-    // the postimage's bytes past its lines (none unless its lines were cut) stay with it
-    if (off < postimage.buf.length) {
-      const last = inserted[inserted.length - 1];
-      if (last) last.text += postimage.buf.slice(off);
-      else inserted.push({ len: 0, hash: 0, flag: LINE_PATCHED, text: postimage.buf.slice(off) });
-    }
-    img.replaceLines(appliedPos, preimageLimit, inserted);
+    // the postimage's bytes past its lines (none unless its lines were cut): git copies the
+    // whole buffer, the bytes belong to no line of the image
+    img.replaceLines(appliedPos, preimageLimit, inserted, postimage.buf.slice(off));
   }
 
   private applyOneFragment(
@@ -1038,7 +1061,8 @@ export class ApplyEngine extends ApplyParser {
       if (this.cached) stMode = entry.mode;
     } else if (missing) {
       if (patch.isNew < 0) return isNew();
-      return { status: this.error(`${oldName}: No such file or directory`), stMode: 0 };
+      const reason = (await this.io.missingReason?.(oldName)) ?? "No such file or directory";
+      return { status: this.error(`${oldName}: ${reason}`), stMode: 0 };
     }
     if (!this.cached && !previous) {
       if (this.io.trustExecutableBit || !isRegular(fileMode))

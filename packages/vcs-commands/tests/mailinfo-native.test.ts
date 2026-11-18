@@ -172,4 +172,60 @@ describeGit("mailinfo and mailsplit as native git", () => {
       }
     }
   });
+
+  it("converts to the metainfo charset and refuses bytes strict charsets lack", () => {
+    const mail = (charset: string, body: Buffer, header = "") =>
+      Buffer.concat([
+        Buffer.from(
+          `From: A <a@x>\nSubject: ${header}charsets\nContent-Type: text/plain; charset=${charset}\n\n`,
+        ),
+        body,
+        Buffer.from(`\n${PATCH}`),
+      ]);
+    const cases: [string, Buffer, string][] = [
+      // the commit encoding as the target (am's get_commit_output_encoding)
+      ["UTF-8", Buffer.from("caf\u00e9\n"), "ISO-8859-1"],
+      ["UTF-8", Buffer.from("\u5f20\u4f1f\n"), "ISO-8859-1"],
+      ["koi8-r", Buffer.from([0xc1, 0xc2, 0x0a]), "ISO-8859-1"],
+      ["ISO-8859-1", Buffer.from([0x62, 0xe9, 0x0a]), "ISO-8859-1"],
+      ["ISO-8859-1", Buffer.from([0x62, 0xe9, 0x0a]), "koi8-r"],
+      ["UTF-8", Buffer.from("plain\n"), "koi8-r"],
+      // bytes glibc's charsets leave undefined, TextDecoder's supersets decode
+      ["windows-1252", Buffer.from([0x62, 0x81, 0x0a]), "UTF-8"],
+      ["windows-1252", Buffer.from([0x62, 0x9d, 0x0a]), "UTF-8"],
+      ["windows-1250", Buffer.from([0x62, 0x83, 0x0a]), "UTF-8"],
+      ["gb2312", Buffer.from([0xb0, 0xa1, 0x0a]), "UTF-8"],
+      ["gb2312", Buffer.from([0x81, 0x40, 0x0a]), "UTF-8"],
+      ["shift_jis", Buffer.from([0x82, 0xa0, 0x0a]), "UTF-8"],
+      ["shift_jis", Buffer.from([0xfa, 0x40, 0x0a]), "UTF-8"],
+      ["big5", Buffer.from([0xa4, 0x40, 0x0a]), "UTF-8"],
+      ["big5", Buffer.from([0x87, 0x40, 0x0a]), "UTF-8"],
+    ];
+    for (const [charset, body, target] of cases) {
+      for (const header of ["", "=?UTF-8?q?h=C3=A9?= "]) {
+        const m = mail(charset, body, header);
+        const dir = mkdtempSync(join(root, "cs-"));
+        const r = spawnSync(
+          "git",
+          // (mailinfo's --encoding leaves metainfo_charset unset: the config sets it)
+          ["-c", `i18n.commitEncoding=${target}`, "mailinfo", join(dir, "msg"), join(dir, "patch")],
+          { input: m, env: nativeGitEnv(root), cwd: root },
+        );
+        const ours = mailinfo(bytesToLatin1(m), { charset: target });
+        const label = `${charset} -> ${target} ${JSON.stringify(header)} ${body.toString("hex")}`;
+        expect({ label, failed: ours.failed, errors: ours.errors }).toEqual({
+          label,
+          failed: r.status !== 0,
+          errors: r.stderr.toString(),
+        });
+        if (r.status === 0) {
+          expect({ label, info: ours.info, msg: ours.msg }).toEqual({
+            label,
+            info: bytesToLatin1(r.stdout),
+            msg: bytesToLatin1(readFileSync(join(dir, "msg"))),
+          });
+        }
+      }
+    }
+  });
 });

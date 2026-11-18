@@ -66,7 +66,8 @@ function splitLf(text: string): { line: string; end: number }[] {
   return out;
 }
 
-const isAllSpace = (s: string) => /^[ \t\n\v\f\r]*$/.test(s);
+// git's isspace: space, tab, LF and CR (not VT, FF)
+const isAllSpace = (s: string) => /^[ \t\n\r]*$/.test(s);
 
 /** `stgit_patch_to_mail`: an StGit patch as a mail. */
 export function stgitPatchToMail(patch: string): string {

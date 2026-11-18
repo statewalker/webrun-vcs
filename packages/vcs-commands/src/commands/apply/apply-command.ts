@@ -596,6 +596,17 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
           return undefined;
         }
       },
+      missingReason: async (name) => {
+        // lstat fails with ENOTDIR where a leading path is a file
+        let at = name.indexOf("/");
+        while (at > 0) {
+          const st = await lstat(name.slice(0, at));
+          if (!st) break;
+          if ((st.mode & 0o170000) === 0o100000) return "Not a directory";
+          at = name.indexOf("/", at + 1);
+        }
+        return "No such file or directory";
+      },
       hasSymlinkLeadingPath: async (name) => {
         let at = name.indexOf("/");
         while (at > 0) {
