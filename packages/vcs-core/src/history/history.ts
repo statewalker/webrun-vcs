@@ -192,6 +192,11 @@ export interface CollectReachableOptions {
    */
   shallow?: Iterable<ObjectId>;
   /**
+   * Commit grafts (`info/grafts`): a grafted commit's grafted parents are walked as well as the
+   * ones it records (git's gc keeps both). A grafted parent that is not stored is skipped.
+   */
+  grafts?: ReadonlyMap<ObjectId, readonly ObjectId[]>;
+  /**
    * Read every reachable blob to its end (inflated and streamed, never held whole) and check
    * it has the length its header says, throwing `CorruptObjectError` for one that does not or
    * cannot be read: a truncated loose blob otherwise passes, since a walk never reads blob

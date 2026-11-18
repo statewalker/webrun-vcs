@@ -15,11 +15,15 @@ import type {
   Trees,
 } from "@statewalker/vcs-core";
 import {
+  createReplacedBlobs,
   createReplacedCommits,
+  createReplacedTags,
+  createReplacedTrees,
   hasReplacements,
   isSymbolicRef,
   type LoadedObjectReplacements,
   loadObjectReplacements,
+  overlayMethods,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import {
@@ -180,6 +184,18 @@ function wrapCommits(commits: Commits): CommandCommits {
   return wrapper as CommandCommits;
 }
 
+/** git's advice when it reads a grafts file (2.5x wording). */
+const GRAFT_FILE_ADVICE = [
+  "hint: Support for <GIT_DIR>/info/grafts is deprecated",
+  "hint: and will be removed in a future Git version.",
+  "hint:",
+  'hint: Please use "git replace --convert-graft-file"',
+  "hint: to convert the grafts into replace refs.",
+  "hint:",
+  "hint: Turn this message off by running",
+  'hint: "git config set advice.graftFileDeprecated false"',
+];
+
 /**
  * Abstract base class for all Git commands.
  *
@@ -198,8 +214,6 @@ export abstract class GitCommand<T> {
   private racyCheckInstalled = false;
   /** `--no-replace-objects` (false) or not given (undefined: config and environment decide) */
   protected useReplaceRefsOverride?: boolean;
-  /** The commits as history walks read them (see {@link walkCommits}), made once */
-  private walkCommitsView?: CommandCommits;
   private replacementsLoad?: Promise<LoadedObjectReplacements | undefined>;
   private reflogActionOverride?: string;
   /** The time of this command's reflog lines, read once (git's ident_default_date). */
@@ -310,33 +324,106 @@ export abstract class GitCommand<T> {
   // ============ Store Accessors ============
 
   /**
-   * Access blob storage.
+   * Whether this command reads objects through replace refs and grafts (see {@link commits}).
+   * git applies them to every object read but those of gc, prune, pack-objects, upload-pack,
+   * index-pack, fsck and commit-graph; the commands doing those override this to read the
+   * objects as stored.
+   */
+  protected readsReplacedObjects(): boolean {
+    return true;
+  }
+
+  /** The stored objects, as {@link storedCommits} reads commits. */
+  private historyOf(): NonNullable<WorkingCopy["history"]> {
+    if (!this._workingCopy.history) {
+      throw new Error("WorkingCopy.history is required for commands");
+    }
+    return this._workingCopy.history;
+  }
+
+  /** Whether an object was read through the replacements (git then read them, and printed) */
+  private replacementsRead = false;
+
+  /** The views of the stored objects through the replacements, made once per command */
+  private replacedViews?: {
+    blobs: Blobs;
+    trees: CommandTrees;
+    commits: CommandCommits;
+    tags?: CommandTags;
+  };
+
+  private views() {
+    if (!this.replacedViews) {
+      const history = this.historyOf();
+      const load = () => {
+        this.replacementsRead = true;
+        return this.objectReplacements();
+      };
+      const storedTrees = wrapTrees(history.trees as unknown as Trees);
+      const trees = createReplacedTrees(storedTrees, load);
+      const rawTags = history.tags ? wrapTags(history.tags as unknown as Tags) : undefined;
+      const tags = rawTags ? createReplacedTags(rawTags, load) : undefined;
+      this.replacedViews = {
+        blobs: createReplacedBlobs(history.blobs as unknown as Blobs, load),
+        // the legacy names read through the view too
+        trees: overlayMethods(trees, {
+          loadTree: async function* (id: ObjectId): AsyncIterable<TreeEntry> {
+            const entries = await trees.load(id);
+            if (entries) yield* entries;
+          },
+        }),
+        commits: createReplacedCommits(
+          wrapCommits(history.commits as unknown as Commits),
+          load,
+        ) as CommandCommits,
+        ...(tags
+          ? { tags: overlayMethods(tags, { loadTag: (id: ObjectId) => tags.load(id) }) }
+          : {}),
+      };
+    }
+    return this.replacedViews;
+  }
+
+  /**
+   * Access blob storage: a blob replaced by `refs/replace/<id>` reads as its replacement,
+   * unless this command reads the objects as stored ({@link readsReplacedObjects}).
    */
   protected get blobs(): Blobs {
-    if (!this._workingCopy.history) {
-      throw new Error("WorkingCopy.history is required for commands");
-    }
-    return this._workingCopy.history.blobs as unknown as Blobs;
+    return this.readsReplacedObjects() ? this.views().blobs : this.storedBlobs;
   }
 
   /**
-   * Access tree storage.
+   * Access tree storage: a tree replaced by `refs/replace/<id>` reads as its replacement,
+   * unless this command reads the objects as stored ({@link readsReplacedObjects}).
    */
   protected get trees(): CommandTrees {
-    if (!this._workingCopy.history) {
-      throw new Error("WorkingCopy.history is required for commands");
-    }
-    return wrapTrees(this._workingCopy.history.trees as unknown as Trees);
+    return this.readsReplacedObjects() ? this.views().trees : this.storedTrees;
   }
 
   /**
-   * Access commit storage.
+   * Access commit storage, as git reads commits: a commit replaced by `refs/replace/<id>`
+   * reads as its replacement (keeping its id), a commit in `info/grafts` with its grafted
+   * parents, a shallow commit with none; merge bases, ancestry and walks follow them (see
+   * `createReplacedCommits`). Without replace refs or grafts, or in a command that reads the
+   * objects as stored ({@link readsReplacedObjects}), it is the store itself.
    */
   protected get commits(): CommandCommits {
-    if (!this._workingCopy.history) {
-      throw new Error("WorkingCopy.history is required for commands");
-    }
-    return wrapCommits(this._workingCopy.history.commits as unknown as Commits);
+    return this.readsReplacedObjects() ? this.views().commits : this.storedCommits;
+  }
+
+  /** The blobs as stored, without replace refs. */
+  protected get storedBlobs(): Blobs {
+    return this.historyOf().blobs as unknown as Blobs;
+  }
+
+  /** The trees as stored, without replace refs. */
+  protected get storedTrees(): CommandTrees {
+    return wrapTrees(this.historyOf().trees as unknown as Trees);
+  }
+
+  /** The commits as stored, without replace refs or grafts. */
+  protected get storedCommits(): CommandCommits {
+    return wrapCommits(this.historyOf().commits as unknown as Commits);
   }
 
   /**
@@ -360,46 +447,83 @@ export abstract class GitCommand<T> {
     return parseGitBool(value) ?? true;
   }
 
-  /**
-   * The commits as git's history walks read them (log, rev-list, merge bases, `HEAD~2`): an
-   * object replaced by `refs/replace/<id>` read as its replacement, a commit in `info/grafts`
-   * with its grafted parents (see `createReplacedCommits`). Without replace refs or grafts it
-   * reads as {@link commits}.
-   */
+  /** The commits as git's history walks read them: {@link commits}. */
   protected get walkCommits(): CommandCommits {
-    this.walkCommitsView ??= createReplacedCommits(this.commits, () =>
-      this.objectReplacements(),
-    ) as CommandCommits;
-    return this.walkCommitsView;
+    return this.commits;
   }
 
   /**
-   * The replace refs and grafts this command's history walks apply, read once; undefined
-   * when there are none (or they cannot be read).
+   * The replace refs and grafts this command's reads apply, read once; undefined when there
+   * are none (or they cannot be read).
    */
   protected objectReplacements(): Promise<LoadedObjectReplacements | undefined> {
+    return this.loadedReplacements().then((r) => (hasReplacements(r) ? r : undefined));
+  }
+
+  /**
+   * The replace refs and grafts as read, with the messages git prints while reading them
+   * (`bad graft data`, `bad replace ref name`), read once.
+   */
+  protected loadedReplacements(): Promise<LoadedObjectReplacements | undefined> {
     if (!this.replacementsLoad) {
-      const replaceRefBase = hostEnvironmentOf(this._workingCopy)?.replaceRefBase;
+      const environment = hostEnvironmentOf(this._workingCopy);
+      const replaceRefBase = environment?.replaceRefBase;
+      const graftFile = environment?.graftFile;
       this.replacementsLoad = loadObjectReplacements({
         refs: this.refsStore,
         useReplaceRefs: this.useReplaceRefs(),
-        ...(replaceRefBase ? { replaceRefBase } : {}),
-      })
-        .then((r) => (hasReplacements(r) ? r : undefined))
-        .catch(() => undefined);
+        ...(replaceRefBase !== undefined ? { replaceRefBase } : {}),
+        ...(graftFile !== undefined && environment
+          ? {
+              readGraftFile: async () => {
+                const bytes = graftFile
+                  ? await environment.readFile(graftFile).catch(() => undefined)
+                  : undefined;
+                return bytes ? new TextDecoder().decode(bytes) : undefined;
+              },
+            }
+          : {}),
+      }).catch(() => undefined);
     }
     return this.replacementsLoad;
   }
 
   /**
-   * Access tag storage.
+   * What git prints on stderr while it reads the replace refs and grafts, once this command
+   * has read an object through them (`git log`, `git rev-parse HEAD~1`; not `git rev-parse
+   * HEAD`, which reads no object): `warning: bad replace ref name: <name>`, the advice that
+   * `info/grafts` is deprecated (unless `advice.graftFileDeprecated` is false), `error: bad
+   * graft data: <line>`. The advice is worded as git 2.5x words it.
+   */
+  async replacementMessages(): Promise<string[]> {
+    if (!this.replacementsRead) return [];
+    const loaded = await this.loadedReplacements();
+    if (!loaded) return [];
+    const advice =
+      loaded.graftFile &&
+      parseGitBool(
+        this._workingCopy.config
+          ? RemoteConfigStore.from(this._workingCopy).value("advice.graftFileDeprecated")
+          : undefined,
+      ) !== false
+        ? GRAFT_FILE_ADVICE
+        : [];
+    return [...loaded.replaceMessages, ...advice, ...loaded.graftMessages];
+  }
+
+  /** Marks that this command read objects through the replacements (see replacementMessages). */
+  protected markReplacementsRead(): void {
+    this.replacementsRead = true;
+  }
+
+  /**
+   * Access tag storage: an annotated tag replaced by `refs/replace/<id>` reads as its
+   * replacement, unless this command reads the objects as stored.
    * Named tagsStore to avoid conflict with command properties.
    */
   protected get tagsStore(): CommandTags | undefined {
-    if (!this._workingCopy.history) {
-      throw new Error("WorkingCopy.history is required for commands");
-    }
-    const tags = this._workingCopy.history.tags as unknown as Tags | undefined;
+    if (this.readsReplacedObjects()) return this.views().tags;
+    const tags = this.historyOf().tags as unknown as Tags | undefined;
     return tags ? wrapTags(tags) : undefined;
   }
 

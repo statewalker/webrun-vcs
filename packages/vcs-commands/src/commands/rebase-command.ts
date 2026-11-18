@@ -23,7 +23,7 @@ import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-resul
 import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
-import { localTimezoneOffset } from "./git-ident.js";
+import { hostEnvironmentOf, localTimezoneOffset } from "./git-ident.js";
 import { favorOf, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
@@ -42,7 +42,7 @@ import {
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { type PatchIdTrees, patchId } from "./patch-id.js";
-import { formatCommitPretty } from "./pretty-format.js";
+import { formatCommitPretty, loadRefDecorations, type RefDecorations } from "./pretty-format.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { expandCommitId, expandCommitIds } from "./sequencer-pick.js";
 import {
@@ -148,6 +148,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private flatTrees?: FlatTreeCache;
   /** Commit subjects, for the todo and done lines */
   private readonly subjects = new Map<ObjectId, string>();
+  /** The refs' decorations, for `%d` in rebase.instructionFormat (loaded once) */
+  private decorations?: RefDecorations;
 
   /**
    * Set the upstream commit to rebase onto.
@@ -987,9 +989,38 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
     const commit = await this.commits.load(id);
     if (!commit) return format;
+    // %d and friends: the refs decorate the commits (load_ref_decorations, no filter)
+    if (this.decorations === undefined && /%[-+ ]?(?:[dD]|\(decorate)/.test(format)) {
+      this.decorations = await this.refDecorations();
+    }
     // the list goes through the todo editing's stripspace: no trailing blanks
-    const text = await formatCommitPretty(format, commit, id, { now: this.clock() });
+    const text = await formatCommitPretty(format, commit, id, {
+      now: this.clock(),
+      ...(this.decorations ? { decorations: this.decorations } : {}),
+    });
     return text.replace(/[ \t]+$/, "");
+  }
+
+  /**
+   * The decorations git's sequencer shows for `%d` (load_ref_decorations without a filter):
+   * every ref, HEAD, the grafted and shallow commits, the objects replace refs replace.
+   */
+  private async refDecorations(): Promise<RefDecorations> {
+    const replacements = await this.objectReplacements();
+    const shallow = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
+    const environment = hostEnvironmentOf(this._workingCopy);
+    const objects = this._workingCopy.history?.objects;
+    const tags = this.tagsStore;
+    return loadRefDecorations({
+      refs: this.refsStore,
+      ...(tags ? { tags } : {}),
+      ...(environment?.replaceRefBase !== undefined
+        ? { replaceRefBase: environment.replaceRefBase }
+        : {}),
+      useReplaceRefs: this.useReplaceRefs(),
+      grafted: new Set([...(replacements?.grafts.keys() ?? []), ...shallow]),
+      ...(objects ? { hasObject: (id: ObjectId) => objects.has(id) } : {}),
+    });
   }
 
   private async readTodoFile(state: OperationState, name: string): Promise<TodoItem[]> {

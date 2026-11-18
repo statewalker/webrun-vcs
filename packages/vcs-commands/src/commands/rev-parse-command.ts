@@ -110,7 +110,8 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
       if (printed.length > 0) throw new RevisionError(this.revision, lines.join("\n"), printed);
       throw new RefNotFoundError(this.revision, lines.join("\n"));
     }
-    return { objectId, warnings: resolver.warnings, lines: [] };
+    const read = await this.replacementMessages();
+    return { objectId, warnings: [...read, ...resolver.warnings], lines: [] };
   }
 
   /**
@@ -174,7 +175,7 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     const first = lines[0] ?? "";
     return {
       objectId: first.startsWith("^") ? first.slice(1) : first,
-      warnings: resolver.warnings,
+      warnings: [...(await this.replacementMessages()), ...resolver.warnings],
       lines,
     };
   }

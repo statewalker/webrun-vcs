@@ -248,6 +248,11 @@ const pathOf = (...parts: string[]) => parts.join("/");
  */
 export class FsckCommand extends GitCommand<FsckResult> {
   private _strict = false;
+
+  /** git's fsck and gc read the objects as stored, never through replace refs. */
+  protected override readsReplacedObjects(): boolean {
+    return false;
+  }
   private _connectivityOnly = false;
   private _dangling = true;
   private _unreachable = false;

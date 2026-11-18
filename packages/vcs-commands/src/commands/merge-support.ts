@@ -883,11 +883,13 @@ export function conflictsComment(paths: string[], unclean = paths.length > 0): s
 
 /** The commit's first line (git's subject, as in `<abbrev> (<subject>)`). */
 export function subjectOf(message: string): string {
-  // git's format_subject: the first paragraph, lines joined with a space
-  const paragraph = message.replace(/^\n+/, "").split(/\n\s*\n/)[0] ?? "";
-  return paragraph
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0)
-    .join(" ");
+  // git's format_subject after skip_blank_lines: the first paragraph's lines, each without
+  // its trailing blanks (git's isspace: ASCII space, tab, LF, CR; never a no-break space),
+  // joined with a space
+  const lines = message.split("\n").map((l) => l.replace(/[ \t\r]+$/, ""));
+  let i = 0;
+  while (i < lines.length && lines[i] === "") i++;
+  const subject: string[] = [];
+  for (; i < lines.length && lines[i] !== ""; i++) subject.push(lines[i] as string);
+  return subject.join(" ");
 }

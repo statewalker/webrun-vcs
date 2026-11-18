@@ -453,6 +453,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const shallow = new Set(shallowIds);
     // replace refs and grafts (git's parse_commit applies both; no commit-graph then)
     const replacements = await this.objectReplacements();
+    this.markReplacementsRead();
     const graph =
       shallow.size > 0 || replacements
         ? undefined

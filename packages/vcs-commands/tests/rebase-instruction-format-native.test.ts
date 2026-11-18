@@ -10,6 +10,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RebaseOperation, RebaseStatus } from "../src/index.js";
@@ -57,6 +58,12 @@ describeGit("rebase.instructionFormat, native twins", () => {
     "%f %%%x21 %Cred%s%Creset %C(yellow)%e%C(reset)",
     "%e%+e%-e% s %q %w unknown %",
     "",
+    // decorations (no filter in the sequencer), marks, padding, raw bytes, signatures, notes
+    "%d%D %m",
+    "%(decorate:prefix=<,suffix=>,separator=%x2c,pointer=%x3e,tag=T=)",
+    "%<(12,trunc)%s|%>(9)%h|%><(7)%an|%<(4,ltrunc)%ae",
+    "%G? %GT [%N] [%gd%gs] %ah",
+    "%x80%xe9 %C(always,red)%s%C(always,reset) %C(auto)%h",
   ]) {
     it(`rebase stops at a conflict with format ${JSON.stringify(format)}`, async () => {
       // ours writes as git 2.5x (2.43: no `# ` before the default format nor an added one)
@@ -77,7 +84,9 @@ describeGit("rebase.instructionFormat, native twins", () => {
       expect(read(ours, "git-rebase-todo")).toBe(read(native, "git-rebase-todo"));
       expect(read(ours, "done")).toBe(read(native, "done"));
       const stop = (s: string) => s.split("\n").filter((l) => l.startsWith("Could not apply"));
-      expect(stop(result.message ?? "")).toEqual(stop(expected.stderr));
+      // raw bytes (%x80) are lone surrogates in our strings: compared as the bytes written
+      const written = new TextDecoder().decode(encodeGitPath(result.message ?? ""));
+      expect(stop(written)).toEqual(stop(expected.stderr));
 
       // each continues past the conflict: the todo's text is kept as written
       for (const dir of [native, ours]) {

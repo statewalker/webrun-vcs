@@ -34,10 +34,17 @@ export interface FetchRefUpdate {
   newOid: string;
   status: FetchRefStatus;
   /**
-   * Why a ref was rejected: `non-fast-forward`, `would clobber existing tag`, or the ref
-   * store's refusal (`mismatch` when the ref changed meanwhile, `locked`, …).
+   * Why a ref was rejected: `non-fast-forward`, `would clobber existing tag`, or, when the
+   * ref store refused the write, git's `unable to update local ref` (the store's own reason
+   * in {@link storeError}).
    */
   reason?: string;
+  /**
+   * The ref store's refusal of the write (`mismatch` when the ref changed meanwhile,
+   * `locked`, …): the update was accepted, and its {@link summary} is the one it was
+   * accepted with (git prints it with `!` and `(unable to update local ref)`).
+   */
+  storeError?: string;
   /**
    * How git prints it: `[new branch]`, `[new tag]`, `abc1234..def5678`, `+ abc1234...def5678`,
    * `[tag update]` (a forced tag), `[rejected]`, `[up to date]`; ids as long as git's
@@ -99,7 +106,7 @@ export function mapRefs(
     if (/^[0-9a-f]{40}$/.test(spec.source)) {
       add({
         remoteRef: spec.source,
-        localRef: spec.destination ?? undefined,
+        localRef: localRefOf(spec.destination),
         oid: spec.source,
         force: spec.force,
         refspec: index,
@@ -110,7 +117,7 @@ export function mapRefs(
     if (!ref?.oid || excluded(ref.name)) continue;
     add({
       remoteRef: ref.name,
-      localRef: spec.destination ?? undefined,
+      localRef: localRefOf(spec.destination),
       oid: ref.oid,
       force: spec.force,
       refspec: index,
@@ -153,6 +160,17 @@ export function refPrefixes(refspecs: readonly string[]): string[] {
     }
   }
   return [...prefixes];
+}
+
+/**
+ * git's get_local_ref: the local ref a refspec's destination names (`main` is
+ * `refs/heads/main`, `tags/v1` is `refs/tags/v1`); none for an empty destination.
+ */
+function localRefOf(destination: string | null | undefined): string | undefined {
+  if (!destination) return undefined;
+  if (destination.startsWith("refs/")) return destination;
+  if (/^(heads|tags|remotes)\//.test(destination)) return `refs/${destination}`;
+  return `refs/heads/${destination}`;
 }
 
 function dwimCandidates(name: string): string[] {
@@ -288,10 +306,12 @@ export async function applyRefUpdates(
     old: u.oldOid ?? null,
     new: u.newOid,
   });
-  const reject = (u: FetchRefUpdate, reason: string) => {
+  // git's update_local_ref when s_update_ref fails: the summary the update was accepted
+  // with, its fail code `!` and "unable to update local ref"
+  const reject = (u: FetchRefUpdate, storeError: string) => {
     u.status = "rejected";
-    u.reason = reason;
-    u.summary = "[rejected]";
+    u.reason = "unable to update local ref";
+    u.storeError = storeError;
   };
   if (!refStore.batch) {
     for (const u of writes) await refStore.update(u.localRef, u.newOid);

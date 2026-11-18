@@ -7,6 +7,11 @@
  * `mark_reachable_objects`). The main worktree's per-worktree refs live under `refs/` and are
  * read with the other refs.
  *
+ * A commit named in `info/grafts` has its grafted parents walked as well as the ones it
+ * records: git's gc keeps both (`repack --keep-true-parents` packs the real parents, `prune`
+ * walks the grafted ones). Replace refs are refs: the replacements are roots, and the objects
+ * they replace stay reachable through whatever names them.
+ *
  * Beyond git: the pseudo-refs of an operation in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
  * `REVERT_HEAD`, `REBASE_HEAD`, `ORIG_HEAD`, `AUTO_MERGE`, `BISECT_HEAD`, `FETCH_HEAD`) and
  * the autostash of a merge or rebase (`MERGE_AUTOSTASH`, `rebase-merge/autostash`,
@@ -27,7 +32,7 @@ import type {
   ObjectId,
   Refs,
 } from "@statewalker/vcs-core";
-import { isSymbolicRef, joinPath, listObjects } from "@statewalker/vcs-core";
+import { isSymbolicRef, joinPath, listObjects, readGraftParents } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { parseIndexFile, parseResolveUndo } from "@statewalker/vcs-working-tree";
 
@@ -158,6 +163,9 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
   if (wants.length === 0) return listed;
   // the parents of shallow commits are not there (git's grafts): not walked
   const shallow = (await roots.refs.getShallow?.()) ?? [];
+  // a grafted commit's parents are walked too, besides the ones it records: git's repack
+  // (`--keep-true-parents`) keeps the real parents and its prune walks the grafted ones
+  const grafts = await readGraftParents(roots.refs);
   const graph = await roots.commitGraph?.get().catch(() => undefined);
   const commitHeader = graph
     ? async (id: ObjectId) => {
@@ -170,7 +178,7 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
         };
       }
     : undefined;
-  for await (const o of listObjects(roots.objects, { wants, shallow, commitHeader })) {
+  for await (const o of listObjects(roots.objects, { wants, shallow, grafts, commitHeader })) {
     listed.push(o);
   }
   return listed;

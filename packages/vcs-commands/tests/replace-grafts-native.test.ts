@@ -6,14 +6,15 @@
  * `core.useReplaceRefs=false` turn replace refs off.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { Git, LogResult } from "../src/index.js";
-import { git, gitOk, openOurs, put } from "./merge-native-helpers.js";
+import { git, gitOk, normalizeState, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -159,5 +160,263 @@ describeGit("replace refs and grafts in history walks, native twins", () => {
     expect(await oursRevParse(await openOurs(dir), ["three~1", "main^", "main...two"])).toEqual(
       nativeRevParse(dir, ["three~1", "main^", "main...two"]),
     );
+  });
+});
+
+/**
+ * Porcelain commands read objects through replace refs and grafts as git does: merge bases,
+ * fast-forward decisions, the trees a merge or checkout reads, the blobs a diff shows and
+ * the HEAD tree status compares with. Each scenario runs native git in one copy and ours in
+ * another, and compares the two repositories.
+ */
+describeGit("replace refs and grafts in porcelain commands, native twins", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "replace-grafts-porcelain-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const twins = (dir: string) => {
+    const nd = join(root, `n${n}`);
+    const od = join(root, `o${n++}`);
+    cpSync(dir, nd, { recursive: true });
+    cpSync(dir, od, { recursive: true });
+    return { nd, od };
+  };
+  /** Native git fed `input` on stdin; its trimmed stdout. */
+  const gitIn = (dir: string, args: string[], input: string) =>
+    execFileSync("git", args, { cwd: dir, env: nativeGitEnv(root), input })
+      .toString()
+      .trim();
+  const environment = () => createNodeGitHostEnvironment({ env: nativeGitEnv(root) });
+  const open = (dir: string) => openOurs(dir, environment());
+  const same = (od: string, nd: string) =>
+    expect(snapshot(root, od, normalizeState)).toEqual(snapshot(root, nd, normalizeState));
+
+  it("merge of a replaced side reads the replacement's tree and parents", async () => {
+    // base: a; main: b, m; side: x. side's tip is replaced by a commit of base with a and c
+    const dir = join(root, `r${n++}`);
+    g(root, "init", "-q", "-b", "main", dir);
+    put(dir, "a", "a\n");
+    g(dir, "add", "-A");
+    g(dir, "commit", "-q", "-m", "base");
+    const base = g(dir, "rev-parse", "HEAD");
+    g(dir, "checkout", "-q", "-b", "side");
+    put(dir, "x", "x\n");
+    g(dir, "add", "-A");
+    g(dir, "commit", "-q", "-m", "side");
+    const side = g(dir, "rev-parse", "HEAD");
+    g(dir, "checkout", "-q", "main");
+    put(dir, "b", "b\n");
+    g(dir, "add", "-A");
+    g(dir, "commit", "-q", "-m", "b");
+    put(dir, "m", "m\n");
+    g(dir, "add", "-A");
+    g(dir, "commit", "-q", "-m", "m");
+    const a = g(dir, "rev-parse", `${base}:a`);
+    const blobC = gitIn(dir, ["hash-object", "-w", "--stdin"], "c\n");
+    const tree = gitIn(dir, ["mktree"], `100644 blob ${a}\ta\n100644 blob ${blobC}\tc\n`);
+    const replacement = g(dir, "commit-tree", "-p", base, "-m", "replaced side", tree);
+    g(dir, "replace", side, replacement);
+    const { nd, od } = twins(dir);
+    g(nd, "merge", "-q", "--no-edit", "side");
+    const result = await (await open(od)).merge().include("side").call();
+    expect(result.status).toBeDefined();
+    same(od, nd);
+    expect(g(nd, "ls-tree", "--name-only", "HEAD").split("\n")).toEqual(["a", "b", "c", "m"]);
+  });
+
+  it("checkout and status of a replaced commit use the replacement's tree", async () => {
+    const { dir, ids } = repo();
+    const tree = g(dir, "rev-parse", `${ids.side2}^{tree}`);
+    const replacement = g(dir, "commit-tree", "-p", ids.two as string, "-m", "other", tree);
+    g(dir, "replace", ids.three as string, replacement);
+    // revisions peel through the replacement too
+    for (const rev of ["three^{tree}", "three:side2.txt", "three~1", "three^{commit}"]) {
+      expect(await oursRevParse(await open(dir), [rev]), rev).toEqual(nativeRevParse(dir, [rev]));
+    }
+    const { nd, od } = twins(dir);
+    g(nd, "checkout", "-q", "--detach", ids.three as string);
+    await (await open(od))
+      .checkout()
+      .setName(ids.three as string)
+      .call();
+    same(od, nd);
+    expect((await (await open(od)).status().call()).isClean()).toBe(true);
+    // a replaced HEAD whose checkout native git made: our status agrees it is clean
+    expect((await (await open(nd)).status().call()).isClean()).toBe(true);
+    // reset --hard to it and back
+    g(nd, "checkout", "-q", "main");
+    await (await open(od)).checkout().setName("main").call();
+    same(od, nd);
+  });
+
+  it("a replaced blob and tree: diff and checkout show the replacement's content", async () => {
+    const { dir, ids } = repo();
+    // three.txt's blob reads as other content; two's tree as side1's
+    const blob = g(dir, "rev-parse", `${ids.three}:three.txt`);
+    const replacementBlob = gitIn(dir, ["hash-object", "-w", "--stdin"], "replaced content\n");
+    g(dir, "replace", blob, replacementBlob);
+    g(
+      dir,
+      "replace",
+      g(dir, "rev-parse", `${ids.two}^{tree}`),
+      g(dir, "rev-parse", "side1^{tree}"),
+    );
+    for (const [a, b] of [
+      ["two", "three"],
+      ["one", "two"],
+      ["one", "main"],
+    ] as const) {
+      const ours = Buffer.from(
+        await (await open(dir)).diff().setOldTree(a).setNewTree(b).callBytes("patch"),
+      ).toString();
+      expect(ours).toBe(gitOk(root, dir, "diff", a, b));
+    }
+    const { nd, od } = twins(dir);
+    g(nd, "checkout", "-q", "--detach", "two");
+    await (await open(od)).checkout().setName("two").call();
+    same(od, nd);
+    g(nd, "checkout", "-q", "--detach", "three");
+    await (await open(od)).checkout().setName("three").call();
+    same(od, nd);
+    expect(snapshot(root, od).files["three.txt"]).toBe("replaced content\n");
+  });
+
+  it("grafts decide fast-forwards, branch --contains and merge bases of a rebase", async () => {
+    const { dir, ids } = repo();
+    // side2's parent becomes four: merging side into four fast-forwards
+    writeFileSync(join(dir, ".git", "info", "grafts"), `${ids.side1} ${ids.four}\n`);
+    g(dir, "checkout", "-q", "-B", "work", ids.four as string);
+    const { nd, od } = twins(dir);
+    const native = g(nd, "merge", "side");
+    expect(native).toContain("Fast-forward");
+    const result = await (await open(od)).merge().include("side").call();
+    expect(String(result.status)).toMatch(/fast/i);
+    same(od, nd);
+    // branch --contains four: work and side (through the graft), not main's older history
+    const contains = (
+      await (
+        await open(od)
+      )
+        .branchList()
+        .setContains(ids.four as string)
+        .call()
+    ).map((r) => r.name.replace(/^refs\/heads\//, ""));
+    const nativeContains = g(nd, "branch", "--format=%(refname:short)", "--contains", "four")
+      .split("\n")
+      .filter(Boolean);
+    expect(contains.sort()).toEqual(nativeContains.sort());
+    // rebase main onto side: the graft makes four the merge base, so only the merge is new
+    const r2 = twins(dir);
+    g(r2.nd, "checkout", "-q", "side");
+    await (await open(r2.od)).checkout().setName("side").call();
+    const nativeRebase = git(root, r2.nd, "rebase", "work");
+    await (await (await open(r2.od)).rebase().setUpstreamBranch("work")).call();
+    expect(nativeRebase.status).toBe(0);
+    same(r2.od, r2.nd);
+  });
+});
+
+describeGit("replace ref names, grafts file and their messages, native twins", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "replace-grafts-messages-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** git 2.43 words the grafts advice differently: its hint lines are compared from 2.5x on */
+  const modern = /git version 2\.(5\d|[6-9]\d)/.test(g(process.cwd(), "--version"));
+  const stderrOf = (dir: string, args: string[], env: Record<string, string> = {}) => {
+    const r = spawnSync("git", args, {
+      cwd: dir,
+      env: { ...nativeGitEnv(root), ...env },
+      encoding: "utf8",
+    });
+    return r.stderr.split("\n").filter((l) => l !== "");
+  };
+  const comparable = (lines: string[]) =>
+    modern ? lines : lines.filter((l) => !l.startsWith("hint:"));
+
+  it("log, rev-list and rev-parse print the replace and graft messages where git does", async () => {
+    const { dir, ids } = repo();
+    writeFileSync(join(dir, ".git", "info", "grafts"), `bad line\n${ids.three} ${ids.one}\n`);
+    g(dir, "update-ref", "refs/replace/notahex", ids.two as string);
+    const log = (await openOurs(dir)).log();
+    for await (const _ of await log.call()) {
+      // walked
+    }
+    expect(comparable(await log.replacementMessages())).toEqual(
+      comparable(stderrOf(dir, ["log", "--oneline"])),
+    );
+    const list = (await openOurs(dir)).revList().addArgument("main");
+    for await (const _ of await list.call()) {
+      // walked
+    }
+    expect(comparable(await list.replacementMessages())).toEqual(
+      comparable(stderrOf(dir, ["rev-list", "main"])),
+    );
+    for (const rev of ["main~1", "main^{tree}", "main"]) {
+      const ours = await (await openOurs(dir)).revParse().setRevision(rev).call();
+      expect(comparable(ours.warnings)).toEqual(comparable(stderrOf(dir, ["rev-parse", rev])));
+    }
+    // advice.graftFileDeprecated=false drops the advice
+    g(dir, "config", "advice.graftFileDeprecated", "false");
+    const quiet = await (await openOurs(dir)).revParse().setRevision("main~1").call();
+    expect(quiet.warnings).toEqual(stderrOf(dir, ["rev-parse", "main~1"]));
+  });
+
+  it("refs/replace/<dir>/<id> replaces <id>; GIT_REPLACE_REF_BASE empty or elsewhere", async () => {
+    const { dir, ids } = repo();
+    const tree = g(dir, "rev-parse", `${ids.three}^{tree}`);
+    const replacement = g(dir, "commit-tree", "-p", ids.one as string, "-m", "nested", tree);
+    g(dir, "update-ref", `refs/replace/nested/dir/${ids.three}`, replacement);
+    expect(await oursLog(await openOurs(dir), ["main"])).toEqual(nativeLog(dir, ["main"]));
+    for (const base of ["", "refs/other/", "refs/replace/nested/"]) {
+      const env = { GIT_REPLACE_REF_BASE: base };
+      const environment = createNodeGitHostEnvironment({ env: { ...nativeGitEnv(root), ...env } });
+      const native = spawnSync("git", ["log", `--format=${FORMAT}`, "main"], {
+        cwd: dir,
+        env: { ...nativeGitEnv(root), ...env },
+        encoding: "utf8",
+      });
+      const ours = (await openOurs(dir, environment)).log();
+      const lines: string[] = [];
+      for await (const c of await ours.call()) lines.push(line(c));
+      expect(lines, `GIT_REPLACE_REF_BASE=${base}`).toEqual(
+        native.stdout.split("\n").filter((l) => l !== ""),
+      );
+      expect(await ours.replacementMessages()).toEqual(native.stderr.split("\n").filter(Boolean));
+    }
+  });
+
+  it("GIT_GRAFT_FILE names the grafts file read in place of info/grafts", async () => {
+    const { dir, ids } = repo();
+    const file = join(root, `grafts-${n++}`);
+    writeFileSync(file, `${ids.four} ${ids.one}\n`);
+    writeFileSync(join(dir, ".git", "info", "grafts"), `${ids.four} ${ids.three} ${ids.side1}\n`);
+    const env = { GIT_GRAFT_FILE: file };
+    const environment = createNodeGitHostEnvironment({ env: { ...nativeGitEnv(root), ...env } });
+    const native = spawnSync("git", ["log", `--format=${FORMAT}`, "main"], {
+      cwd: dir,
+      env: { ...nativeGitEnv(root), ...env },
+      encoding: "utf8",
+    }).stdout;
+    const ours = (await openOurs(dir, environment)).log();
+    const lines: string[] = [];
+    for await (const c of await ours.call()) lines.push(line(c));
+    expect(lines).toEqual(native.split("\n").filter((l) => l !== ""));
+  });
+
+  it("a shallow commit has no parents even when info/grafts gives it some", async () => {
+    const { dir, ids } = repo();
+    writeFileSync(join(dir, ".git", "info", "grafts"), `${ids.three} ${ids.one}\n`);
+    writeFileSync(join(dir, ".git", "shallow"), `${ids.three}\n`);
+    expect(await oursLog(await openOurs(dir), ["main"])).toEqual(nativeLog(dir, ["main"]));
+    expect(await oursRevParse(await openOurs(dir), ["main~1", "four~1"])).toEqual(
+      nativeRevParse(dir, ["main~1", "four~1"]),
+    );
+    const parents = await (await openOurs(dir)).revList().addArgument("three").call();
+    const out: string[] = [];
+    for await (const c of parents) out.push(line(c));
+    expect(out).toEqual(nativeLog(dir, ["three"]));
   });
 });

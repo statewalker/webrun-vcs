@@ -15,6 +15,7 @@ import {
   fetchUpdateDisplay,
   formatFetchDisplay,
   formatFetchHead,
+  mapRefs,
   matchDestination,
   matchSource,
   parseRefSpec,
@@ -25,7 +26,11 @@ import {
   ZERO_OID,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import { InvalidArgumentError, InvalidRemoteError } from "../errors/index.js";
+import {
+  FetchIntoCheckedOutBranchError,
+  InvalidArgumentError,
+  InvalidRemoteError,
+} from "../errors/index.js";
 import { deleteRefs, RemoteConfigStore } from "../remote-config/index.js";
 import {
   type FetchResult,
@@ -34,6 +39,7 @@ import {
 } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { worktreeUsingBranch } from "./worktree-support.js";
 
 /**
  * Tag fetching option.
@@ -87,6 +93,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /** Whether the remote was named (it is then in the reflog action, as on git's command line). */
   private remoteGiven = false;
   private refSpecs: string[] = [];
+  private updateHeadOk = false;
   private removeDeletedRefs?: boolean;
   private pruneTags?: boolean;
   private refmap?: string[];
@@ -329,6 +336,17 @@ export class FetchCommand extends TransportCommand<FetchResult> {
    */
   isDryRun(): boolean {
     return this.dryRun;
+  }
+
+  /**
+   * Let the fetch write a branch a worktree has checked out (`git fetch --update-head-ok`,
+   * which `git pull` passes). Without it a fetch whose refspecs would write such a branch
+   * fails before fetching anything (`FetchIntoCheckedOutBranchError`).
+   */
+  setUpdateHeadOk(ok: boolean): this {
+    this.checkCallable();
+    this.updateHeadOk = ok;
+    return this;
   }
 
   /**
@@ -583,19 +601,21 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       refStore: createTransportRefStore(history.refs),
       refspecs,
       opportunisticRefspecs: opportunistic.length > 0 ? opportunistic : undefined,
-      // fetch.c do_fetch: stale refs are pruned before anything is fetched; with
-      // command-line refspecs by those, else by the configured ones
-      beforeFetch: prune
-        ? async (remoteRefs) => {
-            const names = new Set(remoteRefs.filter((r) => r.oid).map((r) => r.name));
-            const pruneSpecs = (fromConfig ? configured : explicitSpecs).map((s) =>
-              parseRefSpec(s),
-            );
-            trackingUpdates.push(
-              ...(await this.pruneDeletedRefs(names, pruneSpecs, messages, errors)),
-            );
-          }
-        : undefined,
+      // fetch.c do_fetch: a branch a worktree has checked out is not fetched into (the
+      // whole fetch dies first, unless --update-head-ok); stale refs are pruned before
+      // anything is fetched, with command-line refspecs by those, else by the configured ones
+      beforeFetch: async (remoteRefs) => {
+        if (!this.updateHeadOk) {
+          await this.refuseCheckedOutBranch(remoteRefs, [...refspecs, ...opportunistic]);
+        }
+        if (prune) {
+          const names = new Set(remoteRefs.filter((r) => r.oid).map((r) => r.name));
+          const pruneSpecs = (fromConfig ? configured : explicitSpecs).map((s) => parseRefSpec(s));
+          trackingUpdates.push(
+            ...(await this.pruneDeletedRefs(names, pruneSpecs, messages, errors)),
+          );
+        }
+      },
       missingRefsOk: useConfig,
       tags: toTagMode(this.effectiveTagOption()),
       depth: this.depth,
@@ -667,6 +687,26 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       display,
       ...(errors.length > 0 ? { errors } : {}),
     };
+  }
+
+  /**
+   * git's check_not_current_branch: the first branch the refspecs would write (from the
+   * advertised refs) that a worktree has checked out makes the fetch die, naming that
+   * worktree's path.
+   */
+  private async refuseCheckedOutBranch(
+    remoteRefs: readonly { name: string; oid?: string }[],
+    refspecs: readonly string[],
+  ): Promise<void> {
+    const worktrees = this._workingCopy.worktrees;
+    if (!worktrees) return;
+    const branches = mapRefs(remoteRefs, refspecs)
+      .map((p) => p.localRef)
+      .filter((ref): ref is string => ref?.startsWith("refs/heads/") ?? false);
+    for (const ref of branches) {
+      const wt = await worktreeUsingBranch(worktrees, ref);
+      if (wt) throw new FetchIntoCheckedOutBranchError(ref, wt.path);
+    }
   }
 
   /**
@@ -744,7 +784,14 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     }
     for (const u of result.refUpdates) if (!fetchedLocal.has(u.localRef)) lineOf(u);
     for (const tag of result.backfilledTags) lineOf(byLocal.get(tag));
-    const main = formatFetchDisplay(shown, { url, summaryWidth: result.summaryWidth, refcolWidth });
+    // git 2.5x (do_fetch): a ref update refused (non-fast-forward, a tag it would clobber)
+    // jumps to the cleanup before transport_summary_width is computed, so every line is
+    // printed with a summary width of 0 (2.43 printed them as they come, padded)
+    const refused = result.refUpdates.some(
+      (u) => u.status === "rejected" && u.storeError === undefined,
+    );
+    const summaryWidth = refused ? 0 : result.summaryWidth;
+    const main = formatFetchDisplay(shown, { url, summaryWidth, refcolWidth });
     // the URL line once, before whichever line comes first
     return lines.length > 0 ? [...lines, ...main.slice(1)] : main;
   }

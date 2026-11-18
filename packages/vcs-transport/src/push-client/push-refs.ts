@@ -42,6 +42,11 @@ export interface PushRefUpdate {
   remoteRef: string;
   /** The local ref pushed (full name); undefined for a delete or an object id */
   localRef?: string;
+  /**
+   * The source as git names it in its report when it is no local ref the refspec matched:
+   * `HEAD` (also for `@`), or the object name as written (`HEAD~1`, an id)
+   */
+  source?: string;
   /** The remote's value in its advertisement ({@link ZERO_OID}: absent): the command's old id */
   oldOid: string;
   /** The value pushed ({@link ZERO_OID}: a delete) */
@@ -83,6 +88,8 @@ export interface LocalRefState {
 export interface MatchedPushRef {
   remoteRef: string;
   localRef?: string;
+  /** The source as written when it is no local ref matched (`HEAD`, `HEAD~1`, an id) */
+  source?: string;
   newOid: string;
   oldOid: string;
   force: boolean;
@@ -212,6 +219,8 @@ export async function matchPushRefs(
     // what the source resolves to as a ref (git's resolve_ref_unsafe of its name): a ref name,
     // HEAD's branch, "HEAD" when detached; undefined for an object name
     let srcRef: string | undefined;
+    // the source as git's report names it (try_explicit_object_name's alloc_ref(name))
+    let source: string | undefined;
     if (!p.src) {
       newOid = ZERO_OID;
     } else {
@@ -226,6 +235,7 @@ export async function matchPushRefs(
         newOid = local.head.oid;
         localRef = local.head.target;
         srcRef = local.head.target ?? "HEAD";
+        source = "HEAD";
       } else {
         const oid =
           OID_PATTERN.test(p.src) && (await local.hasObject?.(p.src))
@@ -233,6 +243,7 @@ export async function matchPushRefs(
             : await local.resolveRevision?.(p.src);
         if (!oid) throw new PushRefspecError(`src refspec ${p.src} does not match any`);
         newOid = oid;
+        source = p.src;
       }
     }
     // the destination
@@ -263,7 +274,14 @@ export async function matchPushRefs(
       }
     }
     link(
-      { remoteRef, localRef, newOid, oldOid: remote.get(remoteRef) ?? ZERO_OID, force: p.force },
+      {
+        remoteRef,
+        localRef,
+        ...(source !== undefined ? { source } : {}),
+        newOid,
+        oldOid: remote.get(remoteRef) ?? ZERO_OID,
+        force: p.force,
+      },
       true,
     );
   }
@@ -386,6 +404,7 @@ export async function setPushStatus(
     const update: PushRefUpdate = {
       remoteRef: m.remoteRef,
       localRef: m.localRef,
+      ...(m.source !== undefined ? { source: m.source } : {}),
       oldOid: m.oldOid,
       newOid: m.newOid,
       force,

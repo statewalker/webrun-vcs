@@ -41,8 +41,9 @@ export interface PushStatusParts {
  */
 export function pushStatusParts(update: PushRefUpdate, lengths?: AbbrevLengths): PushStatusParts {
   const deletion = update.newOid === ZERO_OID;
-  // the local side: the ref pushed, a delete's "(delete)" (alloc_delete_ref)
-  const peer = update.localRef ?? (deletion ? "(delete)" : update.newOid);
+  // the local side: the ref pushed, else the source as written (`HEAD`, `HEAD~1`, an id),
+  // a delete's "(delete)" (alloc_delete_ref)
+  const peer = update.source ?? update.localRef ?? (deletion ? "(delete)" : update.newOid);
   const rejected = (message: string): PushStatusParts => ({
     flag: "!",
     summary: "[rejected]",

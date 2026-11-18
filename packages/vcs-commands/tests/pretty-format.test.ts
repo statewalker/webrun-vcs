@@ -54,3 +54,26 @@ describe("formatCommitPretty (git's user format)", () => {
     expect(sanitizedSubject("  [PATCH] a/b: fix...it!  ")).toBe("PATCH-a-b-fix.it");
   });
 });
+
+describe("formatCommitPretty: git's bytes and spaces", () => {
+  it("keeps a no-break space (git's isspace is ASCII only) and writes %x80-%xff raw", async () => {
+    const nbsp = { ...commit, message: "Subject\u00a0\n\u00a0\nbody\u00a0\n" };
+    // the no-break space line is no blank line: the subject paragraph goes on
+    expect(await formatCommitPretty("[%s][%b]", nbsp, id)).toBe(
+      "[Subject\u00a0 \u00a0 body\u00a0][]",
+    );
+    // a byte above 0x7f is a lone surrogate that encodeGitPath writes back as that byte
+    expect(await formatCommitPretty("%x41%x80%xff", commit, id)).toBe("A\udc80\udcff");
+  });
+
+  it("magic before an unknown placeholder consumes the magic only, as git", async () => {
+    expect(await formatCommitPretty("a%n%-q|% q|%+q", commit, id)).toBe("aq|q|q");
+  });
+
+  it("pads, truncates and wraps", async () => {
+    expect(await formatCommitPretty("%<(6)%an|%>(6,trunc)%an|", commit, id)).toBe(
+      "A U Thor|A U ..|",
+    );
+    expect(await formatCommitPretty("%w(10,1,2)%b", commit, id)).toBe(" The body.\n");
+  });
+});

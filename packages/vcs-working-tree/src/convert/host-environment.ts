@@ -53,8 +53,13 @@ export interface GitHostEnvironment {
    * `core.useReplaceRefs=false` (git's `disable_replace_refs`)
    */
   noReplaceObjects?: boolean;
-  /** `$GIT_REPLACE_REF_BASE`: where replace refs live (default `refs/replace/`) */
+  /**
+   * `$GIT_REPLACE_REF_BASE`: where replace refs live (default `refs/replace/`); set but empty,
+   * every ref is a candidate replace ref, as in git
+   */
   replaceRefBase?: string;
+  /** `$GIT_GRAFT_FILE`: the grafts file read in place of `info/grafts` (read with readFile) */
+  graftFile?: string;
 }
 
 const join = (dir: string, name: string) =>

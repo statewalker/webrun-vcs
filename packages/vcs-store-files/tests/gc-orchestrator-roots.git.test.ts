@@ -539,3 +539,51 @@ describe("GcOrchestrator with verifyBlobs off", () => {
     expect(after.has(orphan)).toBe(false);
   });
 });
+
+/**
+ * A repository whose old history only a graft reaches: an orphan commit (with its own blob)
+ * that no ref, reflog or index names, made the parent of main's root by `info/grafts`.
+ */
+function graftedHistory(): { dir: string; old: string; oldBlob: string; trueParent?: string } {
+  const dir = repo(3);
+  const oldBlob = hashObject(dir, "only in the grafted history\n");
+  const tree = git(dir, ["mktree"], `100644 blob ${oldBlob}\told.txt\n`).trim();
+  const old = git(dir, ["commit-tree", "-m", "old history", tree]).trim();
+  const root = git(dir, ["rev-list", "--max-parents=0", "main"]).trim();
+  writeFileSync(join(dir, ".git/info/grafts"), `${root} ${old}\n`);
+  return { dir, old, oldBlob };
+}
+
+describe("gc keeps the objects grafts reach, as native git", () => {
+  it("GcOrchestrator: a commit only a graft names, and its tree and blob", async () => {
+    const { dir, old, oldBlob } = graftedHistory();
+    const { ours, native } = await check(dir);
+    for (const id of [old, oldBlob]) {
+      expect(native.has(id), `native keeps ${id}`).toBe(true);
+      expect(ours.has(id), `ours keeps ${id}`).toBe(true);
+    }
+  });
+
+  it("gc(): a commit only a graft names, and the true parent a graft hides", async () => {
+    const { dir, old, oldBlob } = graftedHistory();
+    // c2's graft drops c1 from its parents: repack --keep-true-parents keeps c1 all the same
+    const c1 = git(dir, ["rev-parse", "main~1"]).trim();
+    const c0 = git(dir, ["rev-parse", "main~2"]).trim();
+    const c2 = git(dir, ["rev-parse", "main"]).trim();
+    writeFileSync(
+      join(dir, ".git/info/grafts"),
+      `${readFileSync(join(dir, ".git/info/grafts"), "utf8")}${c2} ${c0}\n`,
+    );
+    expireReflogs(dir);
+    const native = nativeGcKeeps(dir);
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: dir }) });
+    await gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 });
+    fsck(dir);
+    const ours = stored(dir);
+    for (const id of [old, oldBlob, c1]) {
+      expect(native.has(id), `native keeps ${id}`).toBe(true);
+      expect(ours.has(id), `ours keeps ${id}`).toBe(true);
+    }
+    for (const id of native) expect(ours.has(id), `${id} native gc keeps is kept`).toBe(true);
+  });
+});

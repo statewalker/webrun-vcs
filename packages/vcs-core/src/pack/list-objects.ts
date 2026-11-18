@@ -39,6 +39,12 @@ export interface ListObjectsOptions {
    */
   shallow?: Iterable<ObjectId>;
   /**
+   * Commit grafts (`info/grafts`): a grafted commit's parents walked as well as the ones it
+   * records, as gc keeps both (`git repack --keep-true-parents` packs the real parents, `git
+   * prune` walks the grafted ones). A grafted parent that is not stored is skipped.
+   */
+  grafts?: ReadonlyMap<ObjectId, readonly ObjectId[]>;
+  /**
    * Called for each tree and blob below the boundary (the trees of the uninteresting commits
    * met, and tree haves), with its path: the receiver's objects, bases for a thin pack.
    */
@@ -107,7 +113,17 @@ export async function* listObjects(
   const set = (id: ObjectId, f: number) => flags.set(id, (flags.get(id) ?? 0) | f);
   const commits = new Map<ObjectId, CommitInfo>();
   const shallow = new Set(options.shallow ?? []);
-  const parentsOf = (id: ObjectId, c: CommitInfo) => (shallow.has(id) ? [] : c.parents);
+  const grafts = options.grafts;
+  /** Grafted parents a commit does not record: walked when stored, skipped when absent */
+  const optional = new Set<ObjectId>();
+  const parentsOf = (id: ObjectId, c: CommitInfo): ObjectId[] => {
+    const own = shallow.has(id) ? [] : c.parents;
+    const grafted = grafts?.get(id);
+    if (!grafted) return own;
+    const extra = grafted.filter((p) => !own.includes(p));
+    for (const p of extra) optional.add(p);
+    return extra.length > 0 ? [...own, ...extra] : own;
+  };
 
   const read = async (id: ObjectId): Promise<{ type: ObjectTypeString; data: Uint8Array }> => {
     const o = await objects.get(id);
@@ -174,7 +190,7 @@ export async function* listObjects(
   const enqueue = async (id: ObjectId, uninteresting: boolean) => {
     if (uninteresting) markUninteresting(id);
     if (has(id, SEEN)) return;
-    const c = await parseCommit(id, !uninteresting);
+    const c = await parseCommit(id, !uninteresting && !optional.has(id));
     if (!c) return; // an uninteresting parent missing (a shallow or partial store)
     set(id, SEEN);
     push(id, c.time);

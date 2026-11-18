@@ -65,6 +65,15 @@ export function fetchUpdateDisplay(
         detail: "forced update",
       };
     case "rejected":
+      if (update.storeError !== undefined) {
+        // accepted, then refused by the store: the accepted summary, git's fail detail
+        return {
+          ...base,
+          code: "!",
+          summary: update.summary.replace(/^\+ /, ""),
+          detail: "unable to update local ref",
+        };
+      }
       return {
         ...base,
         code: "!",

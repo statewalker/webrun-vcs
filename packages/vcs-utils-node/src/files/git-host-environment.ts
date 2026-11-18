@@ -57,6 +57,7 @@ export interface NodeGitHostEnvironment {
   attrSource?: string;
   noReplaceObjects?: boolean;
   replaceRefBase?: string;
+  graftFile?: string;
 }
 
 /**
@@ -99,7 +100,7 @@ function envBool(value: string | undefined): boolean {
  * `GIT_COMMITTER_NAME` / `_EMAIL` / `_DATE` for the committer and the reflog identity,
  * `GIT_AUTHOR_NAME` / `_EMAIL` / `_DATE` for the author, `EMAIL` for git's `$EMAIL`,
  * `GIT_ATTR_SOURCE` for the tree attributes are read from, `GIT_NO_REPLACE_OBJECTS` and
- * `GIT_REPLACE_REF_BASE` for replace refs), files
+ * `GIT_REPLACE_REF_BASE` for replace refs, `GIT_GRAFT_FILE` for the grafts file), files
  * read by absolute path. The system files default to `/etc/gitconfig` and
  * `/etc/gitattributes`.
  *
@@ -154,6 +155,8 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_ATTR_SOURCE !== undefined ? { attrSource: env.GIT_ATTR_SOURCE } : {}),
     // git: set to anything (even empty) turns replace refs off
     ...(env.GIT_NO_REPLACE_OBJECTS !== undefined ? { noReplaceObjects: true } : {}),
-    ...(env.GIT_REPLACE_REF_BASE ? { replaceRefBase: env.GIT_REPLACE_REF_BASE } : {}),
+    // set but empty is a base too (git: every ref is then a candidate replace ref)
+    ...(env.GIT_REPLACE_REF_BASE !== undefined ? { replaceRefBase: env.GIT_REPLACE_REF_BASE } : {}),
+    ...(env.GIT_GRAFT_FILE !== undefined ? { graftFile: env.GIT_GRAFT_FILE } : {}),
   };
 }

@@ -18,7 +18,7 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { Git } from "../src/index.js";
+import { Git, TagOption } from "../src/index.js";
 import {
   type NativeGitHttpBackend,
   nativeGitAvailable,
@@ -188,4 +188,153 @@ describeGit("abbreviated ids in fetch and push summaries, native twins", () => {
       expect(oursLines).toEqual(nativeLines);
     });
   }
+});
+
+describeGit("fetch refusals: summary width and checked-out branches, native twins", () => {
+  let backend: NativeGitHttpBackend;
+  const originalFetch = globalThis.fetch;
+  /** git 2.5x prints every line unpadded once a ref is refused; 2.43 pads them */
+  const modern = /git version 2\.(5\d|[6-9]\d)/.test(run(process.cwd(), ["--version"]));
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "fetch-refusals-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+    backend = nativeGitHttpBackend(root, home);
+    globalThis.fetch = backend.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    backend?.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /**
+   * `work` published as `src.git` and cloned as `native` and `ours` with a fetch refspec
+   * that does not force; then main advances, dev is rewritten and tag v1 moves upstream.
+   */
+  function setup() {
+    const work = join(root, "work");
+    const src = join(root, "src.git");
+    run(root, ["init", "-q", "-b", "main", work]);
+    run(work, ["commit", "-q", "--allow-empty", "-m", "base"]);
+    run(work, ["commit", "-q", "--allow-empty", "-m", "second"]);
+    run(work, ["branch", "dev"]);
+    run(work, ["tag", "v1", "HEAD~1"]);
+    run(root, ["clone", "-q", "--bare", work, src]);
+    const native = join(root, "native");
+    const ours = join(root, "ours");
+    run(root, ["clone", "-q", src, native]);
+    run(root, ["clone", "-q", src, ours]);
+    run(ours, ["config", "remote.origin.url", "http://git.test/src.git"]);
+    for (const dir of [native, ours]) {
+      run(dir, ["config", "remote.origin.fetch", "refs/heads/*:refs/remotes/origin/*"]);
+    }
+    run(work, ["commit", "-q", "--allow-empty", "-m", "third"]);
+    run(work, ["branch", "-f", "dev", "HEAD~2"]);
+    run(work, ["commit", "-q", "--allow-empty", "--amend", "-m", "third again"]);
+    run(work, ["tag", "-f", "v1", "HEAD"]);
+    run(work, [
+      "push",
+      "-q",
+      "--force",
+      src,
+      "refs/heads/*:refs/heads/*",
+      "refs/tags/*:refs/tags/*",
+    ]);
+    return { src, native, ours };
+  }
+
+  const oursLinesOf = (display: string[] | undefined, src: string) =>
+    (display ?? []).map((l) =>
+      l.replace("From http://git.test/src", `From ${src.replace(/\.git$/, "")}`),
+    );
+
+  it("a non-fast-forward refusal: the lines as git 2.5x prints them", async () => {
+    const { src, native, ours } = setup();
+    const nativeLines = refLines(stderrOf(native, ["fetch", "origin"]));
+    const result = await (await open(ours)).fetch().setRemote("origin").call();
+    expect(nativeLines.some((l) => l.includes("[rejected]"))).toBe(true);
+    const oursLines = oursLinesOf(result.display, src);
+    if (modern) expect(oursLines).toEqual(nativeLines);
+    else expect(oursLines.length).toBe(nativeLines.length);
+  });
+
+  it("--tags moving a tag: would clobber existing tag", async () => {
+    const { src, native, ours } = setup();
+    const nativeLines = refLines(stderrOf(native, ["fetch", "--tags", "origin"]));
+    const result = await (await open(ours))
+      .fetch()
+      .setRemote("origin")
+      .setTagOpt(TagOption.FETCH_TAGS)
+      .call();
+    expect(nativeLines.some((l) => l.includes("would clobber existing tag"))).toBe(true);
+    const oursLines = oursLinesOf(result.display, src);
+    if (modern) expect(oursLines).toEqual(nativeLines);
+    else expect(oursLines.length).toBe(nativeLines.length);
+  });
+
+  it("push: the source as written (HEAD~1 -> y, HEAD -> z, @, an id)", async () => {
+    const { src, native, ours } = setup();
+    const nativeDst = join(root, "native-dst.git");
+    const oursDst = join(root, "ours-dst.git");
+    run(root, ["init", "-q", "--bare", nativeDst]);
+    run(root, ["init", "-q", "--bare", oursDst]);
+    run(oursDst, ["config", "http.receivepack", "true"]);
+    void src;
+    const id = run(native, ["rev-parse", "HEAD"]).trim();
+    const specs = [
+      "HEAD~1:refs/heads/y",
+      "HEAD:refs/heads/z",
+      "main:refs/heads/w",
+      "@:refs/heads/v",
+      `${id}:refs/heads/u`,
+    ];
+    const nativeLines = refLines(stderrOf(native, ["push", nativeDst, ...specs]));
+    run(ours, ["remote", "add", "dst", "http://git.test/ours-dst.git"]);
+    const result = await (await open(ours))
+      .push()
+      .setRemote("dst")
+      .setRefSpecs(...specs)
+      .call();
+    const oursLines = (result.display ?? []).map((l) =>
+      l.replace("To http://git.test/ours-dst.git", `To ${nativeDst}`),
+    );
+    expect(nativeLines).toContain(" * [new branch]      HEAD~1 -> y");
+    expect(oursLines).toEqual(nativeLines);
+  });
+
+  it("refuses to fetch into the checked-out branch, of this or another worktree", async () => {
+    const { src, native, ours } = setup();
+    const upstream = run(src, ["rev-parse", "main"]).trim();
+    const nativeError = stderrOf(native, ["fetch", "origin", "main:main"]).trim();
+    expect(nativeError).toBe(
+      `fatal: refusing to fetch into branch 'refs/heads/main' checked out at '${native}'`,
+    );
+    await expect(
+      (await open(ours)).fetch().setRemote("origin").setRefSpecs("main:main").call(),
+    ).rejects.toThrow(
+      `fatal: refusing to fetch into branch 'refs/heads/main' checked out at '${ours}'`,
+    );
+    // nothing fetched
+    expect(spawnSync("git", ["cat-file", "-e", upstream], { cwd: ours }).status).not.toBe(0);
+    // a branch a linked worktree has checked out
+    const linked = join(root, "linked");
+    run(ours, ["worktree", "add", "-q", "-b", "side", linked, "HEAD"]);
+    run(native, ["worktree", "add", "-q", "-b", "side", join(root, "nlinked"), "HEAD"]);
+    expect(stderrOf(native, ["fetch", "origin", "main:side"]).trim()).toBe(
+      `fatal: refusing to fetch into branch 'refs/heads/side' checked out at '${join(root, "nlinked")}'`,
+    );
+    await expect(
+      (await open(ours)).fetch().setRemote("origin").setRefSpecs("main:side").call(),
+    ).rejects.toThrow(`checked out at '${linked}'`);
+    // --update-head-ok lets it through
+    const ok = await (await open(ours))
+      .fetch()
+      .setRemote("origin")
+      .setRefSpecs("main:side")
+      .setUpdateHeadOk(true)
+      .call();
+    expect(ok.trackingRefUpdates.map((u) => u.localRef)).toContain("refs/heads/side");
+  });
 });

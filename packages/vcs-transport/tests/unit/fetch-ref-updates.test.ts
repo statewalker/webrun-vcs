@@ -11,6 +11,7 @@ import type { RefStore } from "../../src/context/process-context.js";
 import {
   applyRefUpdates,
   type FetchRefUpdate,
+  fetchUpdateDisplay,
   isFastForward,
   mapRefs,
   planRefUpdates,
@@ -234,12 +235,18 @@ describe("applyRefUpdates", () => {
     ];
     await applyRefUpdates(updates, refStore);
     expect(batches).toEqual([["refs/heads/a"], ["refs/heads/b"], ["refs/heads/locked"]]);
-    expect(updates.map((u) => [u.status, u.reason])).toEqual([
-      ["fast-forward", undefined],
-      ["rejected", "mismatch"],
-      ["rejected", "locked"],
-      ["rejected", undefined],
+    expect(updates.map((u) => [u.status, u.reason, u.storeError, u.summary])).toEqual([
+      ["fast-forward", undefined, undefined, ".."],
+      // git keeps the accepted summary: "!", "(unable to update local ref)"
+      ["rejected", "unable to update local ref", "mismatch", ".."],
+      ["rejected", "unable to update local ref", "locked", ".."],
+      ["rejected", undefined, undefined, "[rejected]"],
     ]);
+    expect(fetchUpdateDisplay(updates[1] as FetchRefUpdate)).toMatchObject({
+      code: "!",
+      summary: "..",
+      detail: "unable to update local ref",
+    });
     expect(store.get("refs/heads/a")).toBe(A);
     expect(store.get("refs/heads/c")).toBeUndefined();
   });
