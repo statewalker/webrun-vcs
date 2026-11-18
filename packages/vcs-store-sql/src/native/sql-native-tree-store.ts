@@ -8,6 +8,7 @@
 
 import {
   canonTreeMode,
+  collectTreeBytes,
   compareTreeEntries,
   computeTreeSize,
   encodeObjectHeader,
@@ -169,6 +170,29 @@ export class SqlNativeTreeStoreImpl implements SqlNativeTreeStore {
         };
       }
     })();
+  }
+
+  /**
+   * The tree's content as stored (git's tree format, modes as written: a 100664 blob stays
+   * 100664), built from its rows. `load` reads the modes canonical, so storing what it gives
+   * again would make another tree; a copy to another store goes through this.
+   */
+  async raw(id: ObjectId): Promise<Uint8Array | undefined> {
+    if (id === EMPTY_TREE_ID) return new Uint8Array(0);
+    const trees = await this.db.query<{ id: number }>("SELECT id FROM tree WHERE tree_id = ?", [
+      id,
+    ]);
+    if (trees.length === 0) return undefined;
+    const rows = await this.db.query<{
+      mode: number;
+      name: string;
+      object_id: string;
+    }>("SELECT mode, name, object_id FROM tree_entry WHERE tree_fk = ? ORDER BY position", [
+      trees[0].id,
+    ]);
+    return collectTreeBytes(
+      rows.map((row) => ({ mode: row.mode, name: fromSqlPath(row.name), id: row.object_id })),
+    );
   }
 
   /**

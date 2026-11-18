@@ -225,7 +225,17 @@ export class GitStaging implements Staging {
     prefix: string,
     cached?: CacheTree,
   ): Promise<ObjectId> {
-    if (cached && cached.entryCount >= 0 && cached.id) return cached.id;
+    // a valid node stands for these entries only when it counts them and its tree is stored
+    // (git's update_one: `it->entry_count >= 0 && has_object(it->oid)`); else computed
+    if (
+      cached &&
+      cached.entryCount >= 0 &&
+      cached.id &&
+      cached.entryCount === entries.length &&
+      (await trees.has(cached.id))
+    ) {
+      return cached.id;
+    }
     const treeEntries: TreeEntry[] = [];
     const subdirs = new Map<string, IndexEntry[]>();
 

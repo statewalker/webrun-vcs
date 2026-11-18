@@ -172,10 +172,15 @@ export async function exportToGit(
         // Skip if already exists in Git store
         if (await gitStores.trees.has(id)) continue;
 
-        // Load entries from native store
-        const entries = await (nativeStores.trees as any).load(id);
+        // Load entries from native store, modes as stored (`load` reads them canonical,
+        // which would store another tree for one holding a 100664 blob)
+        const raw = await nativeStores.trees.raw?.(id);
+        const entries = raw ? decodeTreeBytes(raw) : await nativeStores.trees.load(id);
         if (!entries) throw new Error(`Tree not found: ${id}`);
-        await (gitStores.trees as any).store(entries);
+        const stored = await gitStores.trees.store(entries);
+        if (stored !== id) {
+          throw new Error(`Tree ${id} cannot be exported as stored: it was written as ${stored}`);
+        }
         count++;
         break;
       }

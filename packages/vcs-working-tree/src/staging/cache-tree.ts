@@ -130,6 +130,88 @@ export async function updateCacheTree(
   return node;
 }
 
+/** The index's entries of one directory, for {@link invalidateCacheTreeAgainstIndex}. */
+interface IndexDirEntries {
+  files: Map<string, { objectId: ObjectId; mode: number }>;
+  dirs: Map<string, IndexDirEntries>;
+}
+
+/**
+ * Invalidate in `tree`, a cache-tree computed from the stored tree `treeId`
+ * ({@link updateCacheTree}), every path where the index `entries` (its stage-0 entries by
+ * path, modes canonical) are not that tree's: an index entry the tree lacks or holds
+ * otherwise, and a path of the tree the index lacks. So the cache-tree describes the index
+ * and not the tree, as git's `cache_tree_update` computes it from the index after
+ * unpack-trees (a staged change a two-way switch carries over stays in the index).
+ *
+ * `previous` (the index's own cache-tree before, each path changed since invalidated)
+ * saves reading: a directory valid there with the tree's id holds the tree's entries.
+ *
+ * ```typescript
+ * const cacheTree = await updateCacheTree(trees, target, previous);
+ * await invalidateCacheTreeAgainstIndex(trees, cacheTree, target, finalIndex, previous);
+ * ```
+ */
+export async function invalidateCacheTreeAgainstIndex(
+  trees: Pick<Trees, "load" | "entries">,
+  tree: CacheTree,
+  treeId: ObjectId,
+  entries: ReadonlyMap<string, { objectId: ObjectId; mode: number }>,
+  previous?: CacheTree,
+): Promise<void> {
+  const root: IndexDirEntries = { files: new Map(), dirs: new Map() };
+  for (const [path, entry] of entries) {
+    let dir = root;
+    let from = 0;
+    for (let k = path.indexOf("/"); k >= 0; k = path.indexOf("/", from)) {
+      const name = path.slice(from, k);
+      let next = dir.dirs.get(name);
+      if (!next) {
+        next = { files: new Map(), dirs: new Map() };
+        dir.dirs.set(name, next);
+      }
+      dir = next;
+      from = k + 1;
+    }
+    dir.files.set(path.slice(from), entry);
+  }
+  const walk = async (
+    id: ObjectId,
+    before: CacheTree | undefined,
+    dir: IndexDirEntries,
+    prefix: string,
+  ): Promise<void> => {
+    if (before && before.entryCount >= 0 && before.id === id) return;
+    const seenFiles = new Set<string>();
+    const seenDirs = new Set<string>();
+    for (const entry of await treeEntriesOf(trees, id)) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.mode === FileMode.TREE) {
+        const sub = dir.dirs.get(entry.name);
+        if (!sub) {
+          invalidateCacheTreePath(tree, path);
+          continue;
+        }
+        seenDirs.add(entry.name);
+        await walk(entry.id, before?.subtrees.find((s) => s.name === entry.name)?.tree, sub, path);
+        continue;
+      }
+      const file = dir.files.get(entry.name);
+      seenFiles.add(entry.name);
+      if (!file || file.objectId !== entry.id || file.mode !== entry.mode) {
+        invalidateCacheTreePath(tree, path);
+      }
+    }
+    for (const name of dir.files.keys()) {
+      if (!seenFiles.has(name)) invalidateCacheTreePath(tree, prefix ? `${prefix}/${name}` : name);
+    }
+    for (const name of dir.dirs.keys()) {
+      if (!seenDirs.has(name)) invalidateCacheTreePath(tree, prefix ? `${prefix}/${name}` : name);
+    }
+  };
+  await walk(treeId, previous, root, "");
+}
+
 /** The entries of tree `treeId` (modes canonical), shared where the store gives them so. */
 async function treeEntriesOf(
   trees: Pick<Trees, "load" | "entries">,

@@ -386,3 +386,151 @@ describeGit("combined diff -U0 hunk headers as git prints them", () => {
     expect(Buffer.from(ours).toString()).toBe(theirs);
   });
 });
+
+/**
+ * A staged change the two-way switch of a merge, checkout or pick carries over (the two trees
+ * agree on its path) stays in the index, so the index's cache-tree is not the target tree's:
+ * git's `cache_tree_update` computes it from the index after unpack-trees. Each case stages
+ * a modification (e/y), an addition (n/new) and a deletion (z, keeping the entry count) with
+ * native git, runs the operation natively in one twin and ours in the other, then commits:
+ * the trees are git's, and native `write-tree` reads our index's cache-tree as its own.
+ */
+describeGit("a staged change carried over by a two-way switch stays in the cache-tree", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "cache-tree-carried-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** c0: d/x, e/y, z, w; side changes d/x; topic changes w; main checked out, then staged. */
+  function buildCarried(dir: string, branch: string, stash: boolean): void {
+    gitOk(root, root, "init", "-q", "-b", "main", dir);
+    for (const p of ["d/x", "e/y", "z", "w"]) put(dir, p, "1\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "c0");
+    gitOk(root, dir, "checkout", "-q", "-b", "side");
+    put(dir, "d/x", "2\n");
+    gitOk(root, dir, "commit", "-q", "-a", "-m", "s1");
+    gitOk(root, dir, "checkout", "-q", "-b", "topic", "main");
+    put(dir, "w", "2\n");
+    gitOk(root, dir, "commit", "-q", "-a", "-m", "t1");
+    gitOk(root, dir, "checkout", "-q", branch);
+    if (stash) {
+      put(dir, "w", "9\n");
+      gitOk(root, dir, "stash", "push", "-q", "--", "w");
+    }
+    put(dir, "e/y", "staged\n");
+    put(dir, "n/new", "new\n");
+    gitOk(root, dir, "add", "e/y", "n/new");
+    gitOk(root, dir, "rm", "-q", "z");
+  }
+
+  const cases: {
+    name: string;
+    native: string[];
+    ours: (g: Awaited<ReturnType<typeof openOurs>>) => Promise<unknown>;
+    branch?: string;
+    stash?: boolean;
+    all?: boolean;
+  }[] = [
+    {
+      name: "a fast-forward merge",
+      native: ["merge", "-q", "side"],
+      ours: (g) => g.merge().include("side").setCommitter(INTEROP_IDENT).call(),
+    },
+    {
+      name: "merge --squash of a fast-forward",
+      native: ["merge", "-q", "--squash", "side"],
+      ours: (g) => g.merge().include("side").setSquash(true).setCommitter(INTEROP_IDENT).call(),
+    },
+    {
+      name: "checkout of a branch",
+      native: ["checkout", "-q", "side"],
+      ours: (g) => g.checkout().setName("side").call(),
+    },
+    {
+      name: "switch to a branch",
+      native: ["switch", "-q", "side"],
+      ours: (g) => g.switch().setName("side").call(),
+    },
+    {
+      name: "reset --merge",
+      native: ["reset", "-q", "--merge", "side"],
+      ours: (g) => g.reset().setRef("side").setMode(ResetMode.MERGE).call(),
+    },
+    {
+      name: "stash apply",
+      native: ["stash", "apply", "-q"],
+      ours: (g) => g.stashApply().call(),
+      stash: true,
+    },
+    {
+      name: "cherry-pick -n",
+      native: ["cherry-pick", "-n", "side"],
+      ours: (g) =>
+        g.cherryPick().include("side").setNoCommit(true).setCommitter(INTEROP_IDENT).call(),
+    },
+    {
+      name: "rebase --autostash",
+      native: ["rebase", "-q", "--autostash", "side"],
+      ours: async (g) =>
+        (
+          await g.rebase().setAutoStash(true).setCommitter(INTEROP_IDENT).setUpstreamBranch("side")
+        ).call(),
+      branch: "topic",
+      all: true,
+    },
+  ];
+
+  it("a valid cache-tree node whose tree is missing is computed again, as git's update_one", async () => {
+    const n = counter++;
+    const dirs = [join(root, `n${n}`), join(root, `o${n}`)];
+    for (const dir of dirs) {
+      buildCarried(dir, "main", false);
+      gitOk(root, dir, "reset", "-q", "--hard");
+      // the index's cache-tree is primed (d valid); d's tree object goes
+      const d = gitOk(root, dir, "rev-parse", "HEAD:d").trim();
+      rmSync(join(dir, ".git", "objects", d.slice(0, 2), d.slice(2)));
+      put(dir, "z", "2\n");
+      gitOk(root, dir, "add", "z");
+    }
+    const [native, ours] = dirs as [string, string];
+    gitOk(root, native, "commit", "-q", "-m", "m");
+    await (await openOurs(ours))
+      .commit()
+      .setMessage("m")
+      .setAuthorIdent(INTEROP_IDENT)
+      .setCommitterIdent(INTEROP_IDENT)
+      .call();
+    const tree = gitOk(root, native, "rev-parse", "HEAD^{tree}");
+    expect(gitOk(root, ours, "rev-parse", "HEAD^{tree}")).toBe(tree);
+    // the tree of d is stored again
+    expect(git(root, ours, "cat-file", "-e", "HEAD:d").status).toBe(0);
+  });
+
+  for (const c of cases) {
+    it(`${c.name}, then a commit`, async () => {
+      const n = counter++;
+      const native = join(root, `n${n}`);
+      const ours = join(root, `o${n}`);
+      for (const dir of [native, ours]) buildCarried(dir, c.branch ?? "main", c.stash ?? false);
+      expect(git(root, native, ...c.native).status).toBe(0);
+      await c.ours(await openOurs(ours));
+      expect(gitOk(root, ours, "ls-files", "-s")).toBe(gitOk(root, native, "ls-files", "-s"));
+      // native write-tree trusts the index's cache-tree
+      expect(gitOk(root, ours, "write-tree")).toBe(gitOk(root, native, "write-tree"));
+      gitOk(root, native, "commit", "-q", "--allow-empty", ...(c.all ? ["-a"] : []), "-m", "m");
+      await (await openOurs(ours))
+        .commit()
+        .setMessage("m")
+        .setAllowEmpty(true)
+        .setAll(c.all ?? false)
+        .setAuthorIdent(INTEROP_IDENT)
+        .setCommitterIdent(INTEROP_IDENT)
+        .call();
+      expect(lsTree(ours, "HEAD")).toBe(lsTree(native, "HEAD"));
+      expect(gitOk(root, ours, "rev-parse", "HEAD^{tree}")).toBe(
+        gitOk(root, native, "rev-parse", "HEAD^{tree}"),
+      );
+    });
+  }
+});

@@ -133,3 +133,32 @@ describe("canonTreeMode", () => {
     expect(x.sameAs(b)).toBe(false);
   });
 });
+
+describe("a malformed mode in a tree entry", () => {
+  /** One entry `<mode> f\0<id>` with the mode bytes as given */
+  const entryWithMode = (mode: string): Uint8Array => {
+    const head = new TextEncoder().encode(`${mode} f\0`);
+    const out = new Uint8Array(head.length + 20);
+    out.set(head);
+    out.fill(0xab, head.length);
+    return out;
+  };
+
+  // git's decode_tree_entry (get_mode) refuses an empty mode and any character but an octal
+  // digit, and dies with "malformed mode in tree entry"; it is no gitlink
+  for (const mode of ["", "1006x4", "100648", "+100644", "10z"]) {
+    it(`refuses ${JSON.stringify(mode)} in the cursor and in decodeTreeBytes`, () => {
+      const bytes = entryWithMode(mode);
+      expect(() => new TreeEntryCursor(bytes)).toThrow("malformed mode in tree entry");
+      expect(() => decodeTreeBytes(bytes)).toThrow("malformed mode in tree entry");
+      expect(() => decodeTreeBytes(bytes, { canonicalModes: true })).toThrow(
+        "malformed mode in tree entry",
+      );
+    });
+  }
+
+  it("reads a well-formed mode of no known type as a gitlink, as canon_mode does", () => {
+    const c = new TreeEntryCursor(entryWithMode("170000"));
+    expect(c.mode).toBe(0o160000);
+  });
+});
