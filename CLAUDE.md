@@ -120,6 +120,7 @@ git push                                        # MANDATORY
 - **FIFO/LRU eviction with `Map`**: `map.keys().next()` skips every slot deleted since the table was rebuilt, so evicting one entry per insert costs microseconds; use `OrderedMap` (vcs-utils) for caches that evict
 - **Funcname patterns**: `diff.<driver>.xfuncname`/`funcname` and the builtin driver patterns are POSIX regexes; run them through `compilePosixRegex` (vcs-utils `regex/`), never a JavaScript `RegExp` (different semantics, catastrophic backtracking)
 - **Tree modes**: the tree store reads modes canonical (`canonTreeMode`, git's `canon_mode`: a 100664 entry reads as 100644). Code that re-encodes a stored tree or must see the stored modes (fsck, serialization, sync) reads `trees.raw` and decodes it with `decodeTreeBytes(raw)`
+- **Cache-tree after an index change**: a cache-tree written with the index must describe the resulting index. Build it from a tree only when the index equals that tree (`primeCacheTree`, as git's `prime_cache_tree`); otherwise invalidate every path where the index differs (`invalidateCacheTreeAgainstIndex`). `writeTree` reuses valid nodes, so a stale one silently drops staged changes from commits
 
 ## Self-Maintenance
 
