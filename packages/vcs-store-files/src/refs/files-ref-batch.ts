@@ -272,22 +272,35 @@ export function createFilesRefOps(
     logAll === "always" ||
     (logAll === true && (name === "HEAD" || LOGGED_BY_DEFAULT.some((p) => name.startsWith(p))));
 
-  /** File text, or undefined if absent (also when it vanishes between the check and the read). */
+  /**
+   * File text, or undefined if absent (also when it vanishes between the check and the
+   * read), as git's files_read_raw_ref: lstat first, then read.
+   *
+   * An absent file reads as nothing, as an empty one does, so the check must come before
+   * the read: asked only after an empty read, it would see a file another process created
+   * (renamed into place) in between and take the missing ref for an empty, broken one
+   * ("refs/stash is broken" while processes create refs/stash at once). An empty read
+   * after the check may still be a file removed in between (or removed and created
+   * again): look once more, as git goes back to its lstat when the open finds no file.
+   */
   async function readText(path: string): Promise<string | undefined> {
-    // read at once: an absent file reads as nothing (told apart from an empty one below); a
-    // FilesApi that throws for it is asked whether the file is there, as files-staging-store
+    for (let look = 0; ; look++) {
+      if (!(await files.exists(path))) return undefined;
+      const text = await readOnce(path);
+      if (text !== "" || look === 1) return text;
+    }
+  }
+  /** The file's text ("" for an empty or absent file), or undefined if a read that throws finds it gone. */
+  async function readOnce(path: string): Promise<string | undefined> {
+    // a FilesApi that throws for an absent file is asked whether the file is there, as
+    // files-staging-store
     let text = "";
-    let any = false;
     try {
-      for await (const chunk of files.read(path)) {
-        any = true;
-        text += dec.decode(chunk, { stream: true });
-      }
+      for await (const chunk of files.read(path)) text += dec.decode(chunk, { stream: true });
     } catch (e) {
       if (await files.exists(path)) throw e;
       return undefined;
     }
-    if (!any && !(await files.exists(path))) return undefined;
     return text + dec.decode();
   }
   /** As git's parse_loose_ref_contents: `ref:` with optional spaces, or an id then whitespace/end. */

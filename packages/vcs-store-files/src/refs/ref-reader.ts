@@ -87,7 +87,13 @@ export async function readLooseRef(
     // Only a missing file is no ref; a failed read or a broken ref is an error
     if ((await files.stats(refPath))?.kind !== "file") return undefined;
     content = await readFile(files, refPath);
-    if (content.length === 0) throw new Error(`Invalid ref ${refName}: empty file`);
+    if (content.length === 0) {
+      // A missing file reads as no bytes too: if the ref was deleted after the stat, it is no
+      // ref (git's files_read_raw_ref goes back to its lstat when the open finds no file)
+      if ((await files.stats(refPath))?.kind !== "file") return undefined;
+      content = await readFile(files, refPath);
+      if (content.length === 0) throw new Error(`Invalid ref ${refName}: empty file`);
+    }
     const ref = parseRefContent(refName, content);
     if (!isSymbolicRef(ref) && !OID.test(ref.objectId ?? "")) {
       throw new Error(`Invalid ref content in ${refName}: not an object id`);

@@ -7,7 +7,7 @@
 import { createInMemoryFilesApi, type FilesApi, type ObjectId } from "@statewalker/vcs-core";
 import { readText } from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
-import { createRefsStructure, FileRefStore } from "../../src/refs/index.js";
+import { createRefsStructure, FileRefStore, readLooseRef } from "../../src/refs/index.js";
 
 const oid = (n: number): ObjectId => n.toString(16).padStart(40, "a");
 
@@ -111,5 +111,74 @@ describe("set, setSymbolic and remove take <ref>.lock", () => {
     for await (const p of files.list("/.git", { recursive: true })) {
       expect(p.path.endsWith(".lock")).toBe(false);
     }
+  });
+});
+
+describe("a ref another process creates while this one reads it", () => {
+  it("is missing or has its new value, never an empty (broken) ref", async () => {
+    // Another process renames refs/stash.lock over refs/stash just after this one found
+    // refs/stash missing. Asked only after an empty read whether the file was there, the
+    // reader saw the new file and took the missing ref for an empty one: "refs/stash is
+    // broken" while three processes pushed their first stash at once.
+    const base = await repo();
+    let created = false;
+    const files = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "stats") {
+          return async (path: string) => {
+            const stats = await target.stats(path);
+            if (!created && path === "/.git/refs/stash" && !stats) {
+              created = true;
+              await target.write(path, [new TextEncoder().encode(`${oid(1)}\n`)]);
+            }
+            return stats;
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as FilesApi;
+    const refs = new FileRefStore(files, "/.git");
+
+    await refs.set("refs/stash", oid(2));
+    expect(created).toBe(true);
+    expect(await text(base, "/.git/refs/stash")).toBe(`${oid(2)}\n`);
+  });
+});
+
+describe("a ref another process deletes while a strict reader reads it", () => {
+  it("is no ref, not an empty (invalid) one", async () => {
+    // git's files_read_raw_ref goes back to its lstat when the open finds no file; a missing
+    // file reads as no bytes, so a ref deleted between the stat and the read is no ref
+    const base = await repo();
+    await base.write("/.git/refs/heads/gone", [new TextEncoder().encode(`${oid(1)}\n`)]);
+    let deleted = false;
+    const files = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "stats") {
+          return async (path: string) => {
+            const stats = await target.stats(path);
+            if (!deleted && path === "/.git/refs/heads/gone" && stats) {
+              deleted = true;
+              await target.remove(path);
+            }
+            return stats;
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as FilesApi;
+
+    expect(await readLooseRef(files, "/.git", "refs/heads/gone", { strict: true })).toBeUndefined();
+    expect(deleted).toBe(true);
+  });
+
+  it("still reports a genuinely empty ref file as invalid", async () => {
+    const files = await repo();
+    await files.write("/.git/refs/heads/empty", [new Uint8Array(0)]);
+    await expect(
+      readLooseRef(files, "/.git", "refs/heads/empty", { strict: true }),
+    ).rejects.toThrow("empty file");
   });
 });
