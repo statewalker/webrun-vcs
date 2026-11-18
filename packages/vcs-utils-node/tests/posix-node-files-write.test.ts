@@ -16,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BeyondSymlinkError } from "@statewalker/vcs-utils/files";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PosixNodeFilesApi } from "../src/files/index.js";
 
 const enc = new TextEncoder();
@@ -125,6 +125,37 @@ describe("PosixNodeFilesApi writes (P4.36)", () => {
     await view.write("/objects/tmp4", [enc.encode("4")]);
     const fresh = files.withLstatCache();
     await expect(fresh.move("/objects/tmp4", "/objects/ab/four")).rejects.toThrow(
+      BeyondSymlinkError,
+    );
+  });
+});
+
+describe("PosixNodeFilesApi batch view with maxAgeMs (review of P4.36)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "posix-lstat-age-"));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("checks a verified directory again once it is older than maxAgeMs", async () => {
+    const view = new PosixNodeFilesApi({ rootDir: root }).withLstatCache({ maxAgeMs: 1000 });
+    const start = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(start);
+    await view.write("/objects/ab/one", [enc.encode("1")]);
+    // the fan-out directory replaced by a link behind the view's back
+    rmSync(join(root, "objects/ab"), { recursive: true });
+    mkdirSync(join(root, "elsewhere"));
+    symlinkSync(join(root, "elsewhere"), join(root, "objects/ab"));
+    // within maxAgeMs it is trusted (followed, as git follows links in objects/)
+    vi.spyOn(Date, "now").mockReturnValue(start + 500);
+    await view.write("/objects/ab/two", [enc.encode("2")]);
+    expect(readFileSync(join(root, "elsewhere/two"), "utf8")).toBe("2");
+    // then looked at again, and refused
+    vi.spyOn(Date, "now").mockReturnValue(start + 1500);
+    await expect(view.write("/objects/ab/three", [enc.encode("3")])).rejects.toThrow(
       BeyondSymlinkError,
     );
   });

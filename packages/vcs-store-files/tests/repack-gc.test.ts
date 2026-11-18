@@ -651,11 +651,21 @@ describe("P2.6 second review: writes freshen old loose objects (git's freshen_lo
     expect(result.keptRecentObjects).toBe(1);
   });
 
-  it("a younger loose copy is kept as it is, and so is one whose mtime is unknown", async () => {
+  it("a younger loose copy is touched as well (git touches on every write); where times cannot be set it is kept as it is, and so is one whose mtime is unknown", async () => {
     const young = await looseBlob("young copy\n");
-    const set = young.age(30 * 60_000);
+    young.age(30 * 60_000);
+    const ino = statSync(young.path).ino;
     await young.b.history.blobs.store([enc.encode("young copy\n")]);
-    expect(Math.abs(statSync(young.path).mtimeMs - set)).toBeLessThan(1000);
+    expect(statSync(young.path).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
+    expect(statSync(young.path).ino).toBe(ino);
+
+    const kept = await looseBlob("young, no utime\n");
+    const keptAt = kept.age(30 * 60_000);
+    (kept.files as { touch?: unknown }).touch = undefined;
+    (kept.files as { withLstatCache?: unknown }).withLstatCache = undefined;
+    await (await open(kept.files, false)).history.blobs.store([enc.encode("young, no utime\n")]);
+    expect(Math.abs(statSync(kept.path).mtimeMs - keptAt)).toBeLessThan(1000);
+    expect(statSync(kept.path).mtimeMs).toBeLessThan(Date.now() - 60_000);
 
     const unknown = await looseBlob("unknown age\n");
     const old = unknown.age(21 * 24 * HOUR);
@@ -666,6 +676,7 @@ describe("P2.6 second review: writes freshen old loose objects (git's freshen_lo
     };
     // the store reads through its own lstat-cache view: opened without one, it sees the stub
     (unknown.files as { withLstatCache?: unknown }).withLstatCache = undefined;
+    (unknown.files as { touch?: unknown }).touch = undefined;
     const reopened = await open(unknown.files, false);
     await reopened.history.blobs.store([enc.encode("unknown age\n")]);
     unknown.files.stats = stats;

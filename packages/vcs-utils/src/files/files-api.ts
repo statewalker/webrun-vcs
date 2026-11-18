@@ -261,7 +261,8 @@ export interface PosixFilesApi extends FilesApi {
    * A view of the same storage for one batch of operations (a worktree walk, a checkout's
    * writes) that may cache which directories it verified not to be links, as git's
    * per-command lstat cache; the caller drops it when the batch ends. The instance itself
-   * never caches across calls, so a change made outside is always seen.
+   * never caches across calls, so a change made outside is always seen. With `maxAgeMs`, a
+   * directory verified longer ago than that is checked again (for a view kept long).
    */
-  withLstatCache?(): PosixFilesApi;
+  withLstatCache?(options?: { maxAgeMs?: number }): PosixFilesApi;
 }

@@ -1587,3 +1587,35 @@ describe("prefix lookups (abbreviated ids)", () => {
     }
   });
 });
+
+describe("review of P4.36: cruft packs", () => {
+  it("freshen is false for a pack with a .mtimes file, young or old (git's is_cruft)", async () => {
+    const files = createInMemoryFilesApi();
+    const r = await install(files, [{ kind: 3, data: A }]);
+    await files.write(`${PACK_DIR}/pack-${r.packId}.mtimes`, [new Uint8Array(12)]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
+    const touch = vi.spyOn(files as { touch: (p: string) => Promise<boolean> }, "touch");
+    expect(await set.freshen(Aid)).toBe(false);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61 * 60 * 1000);
+    try {
+      expect(await set.freshen(Aid)).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+    // not touched: its objects' times are in .mtimes; the object stays readable
+    expect(touch).not.toHaveBeenCalled();
+    expect(await set.has(Aid)).toBe(true);
+  });
+
+  it("freshen is true when a regular pack holds the object besides a cruft one", async () => {
+    const files = createInMemoryFilesApi();
+    const cruft = await install(files, [{ kind: 3, data: A }]);
+    await files.write(`${PACK_DIR}/pack-${cruft.packId}.mtimes`, [new Uint8Array(12)]);
+    await install(files, [
+      { kind: 3, data: A },
+      { kind: 3, data: B },
+    ]);
+    const set = await openPackSet(files, PACK_DIR, { rescanIntervalMs: 0 });
+    expect(await set.freshen(Aid)).toBe(true);
+  });
+});

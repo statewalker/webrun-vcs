@@ -107,15 +107,24 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    * A base instance caches nothing: an outside change is always seen.
    */
   private readonly verified?: Set<string>;
+  /** With `withLstatCache({ maxAgeMs })`: how long `verified` is trusted before it is dropped */
+  private readonly verifiedMaxAge?: number;
+  /** When the oldest entry of `verified` was added (the set is dropped whole) */
+  private verifiedSince = 0;
   private readonly options: PosixNodeFilesApiOptions;
 
-  constructor(options?: PosixNodeFilesApiOptions, lstatCache?: Set<string>) {
+  constructor(
+    options?: PosixNodeFilesApiOptions,
+    lstatCache?: Set<string>,
+    lstatCacheMaxAgeMs?: number,
+  ) {
     super(options);
     this.options = { ...options };
     this.root = nodePath.resolve(options?.rootDir ?? process.cwd());
     this.windows = (options?.platform ?? process.platform) === "win32";
     this.pathSeparators = this.windows ? "/\\" : "/";
     this.verified = lstatCache;
+    this.verifiedMaxAge = lstatCacheMaxAgeMs;
   }
 
   /** The real directory this FilesApi is rooted at. */
@@ -126,9 +135,25 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   /**
    * A view of the same root for one batch of operations (a walk, a checkout's writes) that
    * shares a cache of directories verified not to be links; drop it when the batch ends.
+   * With `maxAgeMs`, what it verified is checked again once it is older than that.
    */
-  withLstatCache(): PosixNodeFilesApi {
-    return new PosixNodeFilesApi({ ...this.options, rootDir: this.root }, new Set());
+  withLstatCache(options?: { maxAgeMs?: number }): PosixNodeFilesApi {
+    return new PosixNodeFilesApi(
+      { ...this.options, rootDir: this.root },
+      new Set(),
+      options?.maxAgeMs,
+    );
+  }
+
+  /** Drops the batch cache once it is older than its `maxAgeMs`. */
+  private expireVerified(): void {
+    if (this.verifiedMaxAge === undefined || !this.verified) return;
+    const now = Date.now();
+    if (this.verified.size === 0) this.verifiedSince = now;
+    else if (now - this.verifiedSince > this.verifiedMaxAge) {
+      this.verified.clear();
+      this.verifiedSince = now;
+    }
   }
 
   /** Forgets the batch cache when an error shows the tree changed under it. */
@@ -168,6 +193,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    */
   private async realNoLinks(virtualPath: string): Promise<string> {
     const real = this.real(virtualPath);
+    this.expireVerified();
     // a verified parent was verified with its ancestors (in order, here and in mkdirs; a listed
     // directory was reached so), and the cache is dropped whole: nothing more to check
     if (this.verified?.size && this.verified.has(nodePath.dirname(real))) return real;
@@ -188,6 +214,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /** Creates `real` and its missing parents below the root, never through a link. */
   private async mkdirs(real: string, virtualPath: string): Promise<void> {
+    this.expireVerified();
     if (this.verified?.has(real)) return;
     const relative = nodePath.relative(this.root, real);
     if (relative === "") return;

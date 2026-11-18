@@ -124,16 +124,16 @@ function tracked(chunks: Uint8Array[]) {
 }
 
 describe("P4.36: a write of an object already stored writes nothing", () => {
-  it("a young loose copy: no temporary, no rename, its mtime left alone", async () => {
+  it("a young loose copy: no temporary, no rename, its mtime renewed as git's utime does on every write", async () => {
     const s = nodeStore();
     const bytes = enc.encode("written twice\n");
     const id = await s.objects.put("blob", bytes.length, [bytes]);
-    const set = s.age(id, 10 * 60_000);
+    s.age(id, 10 * 60_000);
     const ino = statSync(s.pathOf(id)).ino;
     const before = { ...s.counts };
     expect(await s.objects.put("blob", bytes.length, [bytes])).toBe(id);
-    expect(s.counts).toEqual(before);
-    expect(Math.abs(statSync(s.pathOf(id)).mtimeMs - set)).toBeLessThan(1000);
+    expect(s.counts).toEqual({ ...before, touched: before.touched + 1 });
+    expect(statSync(s.pathOf(id)).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
     expect(statSync(s.pathOf(id)).ino).toBe(ino);
   });
 
@@ -164,7 +164,7 @@ describe("P4.36: a write of an object already stored writes nothing", () => {
     await s.objects.putRaw(id, source);
     expect(state.read).toBe(false);
     expect(state.closed).toBe(true);
-    expect(s.counts).toEqual(before);
+    expect(s.counts).toEqual({ ...before, touched: before.touched + 1 });
   });
 
   it("a streamed write of a stored object leaves the stored file and no temporary behind", async () => {
@@ -187,7 +187,7 @@ describe("P4.36: a write of an object already stored writes nothing", () => {
     expect(s.leftovers()).toEqual([]);
   });
 
-  it("the in-memory FilesApi: an old copy is touched, a young one left alone", async () => {
+  it("the in-memory FilesApi: a stored copy is touched, young or old", async () => {
     const files = createInMemoryFilesApi();
     const counts = counting(files);
     const objects = createGitObjects(filesStagingStore(files, "/repo/.git/objects"));
@@ -196,13 +196,13 @@ describe("P4.36: a write of an object already stored writes nothing", () => {
     const path = `/repo/.git/objects/${id.slice(0, 2)}/${id.slice(2)}`;
     const before = { ...counts };
     await objects.put("blob", bytes.length, [bytes]);
-    expect(counts).toEqual(before);
+    expect(counts).toEqual({ ...before, touched: before.touched + 1 });
     const old = Date.now() - 2 * HOUR;
     expect(await files.touch?.(path, old)).toBe(true);
     expect((await files.stats(path))?.lastModified).toBe(old);
     await objects.put("blob", bytes.length, [bytes]);
     expect(counts.created).toBe(before.created);
-    expect(counts.touched).toBe(before.touched + 2);
+    expect(counts.touched).toBe(before.touched + 3);
     expect((await files.stats(path))?.lastModified).toBeGreaterThan(Date.now() - 60_000);
   });
 
@@ -306,3 +306,45 @@ function blobId(body: Uint8Array): string {
     .update(Buffer.concat([Buffer.from(`blob ${body.length}\0`), body]))
     .digest("hex");
 }
+
+describe("P4.36: an object held only by a cruft pack", () => {
+  const IDENT = {
+    GIT_AUTHOR_NAME: "A",
+    GIT_AUTHOR_EMAIL: "a@example.com",
+    GIT_COMMITTER_NAME: "A",
+    GIT_COMMITTER_EMAIL: "a@example.com",
+  };
+  // git's freshen_packed_object refuses cruft packs (`is_cruft`): their objects expire by
+  // `.mtimes`, which touching the pack does not renew, so the write must land loose
+  for (const packAge of [2 * HOUR, 0]) {
+    it(`is written loose and survives gc --cruft (pack ${packAge ? "old" : "young"})`, async () => {
+      const dir = tempDir("objwrite-cruft-");
+      git(dir, ["init", "-q"]);
+      execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "base"], {
+        cwd: dir,
+        env: { ...GIT_ENV, ...IDENT },
+      });
+      const text = "unreachable, then written again\n";
+      const id = git(dir, ["hash-object", "-w", "--stdin"], text);
+      const loose = join(dir, ".git/objects", id.slice(0, 2), id.slice(2));
+      const old = new Date(Date.now() - 21 * 24 * HOUR);
+      utimesSync(loose, old, old);
+      git(dir, ["repack", "--cruft", "-d", "--cruft-expiration=never"]);
+      git(dir, ["prune-packed"]);
+      const packDir = join(dir, ".git/objects/pack");
+      expect(readdirSync(packDir).some((n) => n.endsWith(".mtimes"))).toBe(true);
+      expect(() => statSync(loose)).toThrow();
+      if (packAge) {
+        const t = new Date(Date.now() - packAge);
+        for (const n of readdirSync(packDir)) utimesSync(join(packDir, n), t, t);
+      }
+      const { history } = await createGitFilesBackend({
+        files: createNodeFilesApi({ rootDir: dir }),
+      });
+      expect(await history.blobs.store([enc.encode(text)])).toBe(id);
+      expect(statSync(loose).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
+      git(dir, ["gc", "--cruft", "--prune=1.week.ago"]);
+      expect(git(dir, ["cat-file", "-p", id])).toBe(text.trim());
+    });
+  }
+});

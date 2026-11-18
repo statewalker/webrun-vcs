@@ -60,9 +60,11 @@ export interface GitFilesBackendOptions {
   /** Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms). */
   packedLockTimeoutMs?: number;
   /**
-   * git's freshen window (default one hour): writing an object whose pack or loose file was
-   * last modified longer ago writes it loose again or renews the loose file's mtime, so a
-   * concurrent gc keeps it. Passed to `openPackSet` and `filesStagingStore`.
+   * git's freshen window (default one hour): writing an object whose pack was last modified
+   * longer ago renews the pack's mtime (or writes the object loose where times cannot be
+   * set), so a concurrent gc keeps it; a loose file is touched on every such write (rewritten
+   * when older than this where times cannot be set). Passed to `openPackSet` and
+   * `filesStagingStore`.
    */
   freshenMaxAgeMs?: number;
   /**

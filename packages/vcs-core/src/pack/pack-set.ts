@@ -81,7 +81,8 @@ export interface PackSet {
    * object is written loose. A holding pack's file older than `freshenMaxAgeMs` (default one
    * hour) has its mtime renewed (`FilesApi.touch`); where that cannot be done, false: the object
    * is then written loose again, with the current time, so a concurrent gc does not expire it
-   * with its old pack.
+   * with its old pack. A cruft pack (one with a `.mtimes` file) never counts, whatever its age,
+   * as git's `is_cruft` check: gc expires its objects by their times in `.mtimes`.
    */
   freshen(id: ObjectId): Promise<boolean>;
   /**
@@ -182,6 +183,25 @@ export async function openPackSet(
     if (!files.touch || !(await files.touch(p.packPath).catch(() => false))) return false;
     seenAt.set(p, { at: now, modified: now });
     return true;
+  };
+  /**
+   * Whether a pack is a cruft pack (it has a `.mtimes` file), looked up once per pack: git's
+   * freshen_packed_object refuses those (`is_cruft`), as gc expires their objects by the
+   * per-object times in `.mtimes`, which touching the pack does not renew; the object is then
+   * written loose, a copy gc keeps until it is old.
+   */
+  const cruft = new WeakMap<PackFile, Promise<boolean>>();
+  const isCruft = (p: PackFile): Promise<boolean> => {
+    let c = cruft.get(p);
+    if (c === undefined) {
+      const mtimes = `${p.packPath.replace(/\.pack$/, "")}.mtimes`;
+      c = files.stats(mtimes).then(
+        (st) => st !== undefined,
+        () => false,
+      );
+      cruft.set(p, c);
+    }
+    return c;
   };
   /** copies found corrupt, per pack */
   const bad = new WeakMap<PackFile, Set<ObjectId>>();
@@ -537,6 +557,7 @@ export async function openPackSet(
       if (!isId(id)) return false;
       for (const p of [...packs]) {
         if (!holds(p, id)) continue;
+        if (await isCruft(p)) continue; // its times are in .mtimes: written loose
         const now = Date.now();
         const seen = seenAt.get(p);
         if (seen !== undefined && now - seen.at < freshenTrust) {
