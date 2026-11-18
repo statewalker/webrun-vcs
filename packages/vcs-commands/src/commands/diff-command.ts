@@ -14,7 +14,12 @@ import {
 import { NoHeadError, RefNotFoundError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
-import { DEFAULT_RENAME_LIMIT, detectRenames, scorePercent } from "../rename/index.js";
+import {
+  DEFAULT_RENAME_LIMIT,
+  detectRenames,
+  findFollowSource,
+  scorePercent,
+} from "../rename/index.js";
 import { writeCombinedDiff } from "../results/combined-diff.js";
 import { ChangeType, type DiffEntry } from "../results/diff-entry.js";
 import { diffEntryToPair } from "../results/diff-formatter.js";
@@ -36,7 +41,7 @@ import {
   writePairPatch,
 } from "../results/diff-output.js";
 import { quotePath } from "../results/quote-path.js";
-import { abbrevLengths, worktreeModeTrust } from "./core-config.js";
+import { worktreeModeTrust } from "./core-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
 import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
 import { readSubmoduleDirt } from "./status-command.js";
@@ -387,15 +392,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       const only = collected.entries[0];
       if (collected.entries.length === 1 && only?.changeType === ChangeType.ADD) {
         this.pathspecItems = spec;
-        const all = await this.collect(true, false);
-        const renamed = all.entries.find(
-          (e) =>
-            (e.changeType === ChangeType.RENAME || e.changeType === ChangeType.COPY) &&
-            e.newPath === follow,
-        );
-        if (renamed) {
-          collected = { entries: [renamed], combined: [] };
-          followPath = renamed.oldPath;
+        const found = await this.followSource(only);
+        if (found) {
+          collected = { entries: [found], combined: [] };
+          followPath = found.oldPath;
         }
       }
     } else collected = await this.collect(renames, formats.includes("patch"));
@@ -405,6 +405,50 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const sink = new ByteSink();
     await this.writeFormats(sink, formats, collected);
     return { bytes: sink.bytes(), ...(followPath !== undefined ? { followPath } : {}) };
+  }
+
+  /**
+   * tree-diff.c's try_to_follow_renames for the path a comparison of two trees adds: copies
+   * found harder, every path of the old tree a source (see `findFollowSource`); the rename
+   * or copy found, undefined for none.
+   */
+  private async followSource(added: DiffEntry): Promise<DiffEntry | undefined> {
+    const path = added.newPath;
+    if (path === undefined || added.newId === undefined) return undefined;
+    const oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
+    if (oldSide.size === 0) return undefined;
+    const newSide = this.newTree ? await this.treeSide(this.newTree) : new Map<string, Side>();
+    const sources = [...oldSide].map(([p, side]) => ({ path: p, mode: side.mode, id: side.id }));
+    const deleted = new Set(sources.filter((c) => !newSide.has(c.path)).map((c) => c.path));
+    const readBlob = async (id: ObjectId) => collectChunks((await this.blobs.load(id)) ?? []);
+    const found = await findFollowSource(
+      sources,
+      { path, mode: added.newMode ?? 0o100644, id: added.newId },
+      deleted,
+      {
+        countLastSpan: this.textOptions.renameCountLastSpan,
+        size: async (c) => {
+          try {
+            return await this.blobs.size(c.id);
+          } catch {
+            return undefined;
+          }
+        },
+        load: (c) => readBlob(c.id),
+      },
+    );
+    if (!found) return undefined;
+    const source = oldSide.get(found.from) as Side;
+    return {
+      changeType: found.renamed ? ChangeType.RENAME : ChangeType.COPY,
+      oldPath: found.from,
+      newPath: path,
+      oldId: source.id,
+      newId: added.newId,
+      oldMode: source.mode as FileModeValue,
+      newMode: added.newMode as FileModeValue,
+      score: scorePercent(found.score),
+    };
   }
 
   /** The formats of the collected comparison, in diff_flush's order */
@@ -460,7 +504,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
               ids.add(c.theirs.objectId);
               ids.add(NULL_ID);
             }
-            options.abbrevLengths = await abbrevLengths(this.workingCopy, ids);
+            // `--abbrev=<n>`: at least n digits
+            options.abbrevLengths = await this.idAbbreviator().lengths(
+              ids,
+              this.textOptions.abbrev,
+            );
           }
           // git prints the combined diffs of conflicted paths as it finds them, before the rest
           for (const c of combined) await this.writeCombined(sink, c, options);
@@ -811,8 +859,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const unmerged = new Map<string, DiffEntry[]>();
     const combined: CombinedEntry[] = [];
     if (this.newTree) {
-      oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
-      newSide = await this.treeSide(this.newTree);
+      [oldSide, newSide] = await this.treePairSides(
+        this.oldTree ?? "HEAD",
+        this.oldTree === undefined,
+        this.newTree,
+      );
     } else if (this.cached) {
       oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
       const index = await this.indexSide();
@@ -1031,6 +1082,76 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
+   * The entries of two trees that differ (diff_tree_oid): a subtree with the same id on both
+   * sides, and a file the same on both, is left out without being read; what differs is
+   * listed as {@link treeSide} lists it.
+   */
+  private async treePairSides(
+    oldRef: string,
+    implicitHead: boolean,
+    newRef: string,
+  ): Promise<[Map<string, Side>, Map<string, Side>]> {
+    const oldSide = new Map<string, Side>();
+    const newSide = new Map<string, Side>();
+    const treeOf = async (ref: string, implicit: boolean): Promise<ObjectId | undefined> => {
+      if (ref === EMPTY_TREE_ID) return undefined;
+      try {
+        return await this.resolveTreeId(ref);
+      } catch (e) {
+        if (implicit && e instanceof NoHeadError) return undefined;
+        throw e;
+      }
+    };
+    const a = await treeOf(oldRef, implicitHead);
+    const b = await treeOf(newRef, false);
+    await this.diffTreeSides(a, b, "", oldSide, newSide);
+    return [oldSide, newSide];
+  }
+
+  private async diffTreeSides(
+    a: ObjectId | undefined,
+    b: ObjectId | undefined,
+    prefix: string,
+    oldSide: Map<string, Side>,
+    newSide: Map<string, Side>,
+  ): Promise<void> {
+    if (a === b) return;
+    const TREE_MODE = 0o40000;
+    const read = async (tree: ObjectId | undefined) => {
+      const out = new Map<string, { mode: number; id: ObjectId }>();
+      if (tree === undefined || tree === EMPTY_TREE_ID) return out;
+      for (const e of await this.treeEntries(tree)) out.set(e.name, { mode: e.mode, id: e.id });
+      return out;
+    };
+    const ea = await read(a);
+    const eb = await read(b);
+    const isTree = (e: { mode: number }) => (e.mode & S_IFMT) === TREE_MODE;
+    const add = async (
+      e: { mode: number; id: ObjectId },
+      path: string,
+      side: Map<string, Side>,
+    ) => {
+      if (isTree(e)) await this.collectTreeEntries(e.id, path, side);
+      else side.set(path, { mode: e.mode, id: e.id });
+    };
+    for (const [name, x] of ea) {
+      const path = prefix ? `${prefix}/${name}` : name;
+      const y = eb.get(name);
+      if (y && x.id === y.id && x.mode === y.mode) continue;
+      if (y && isTree(x) && isTree(y)) {
+        await this.diffTreeSides(x.id, y.id, path, oldSide, newSide);
+        continue;
+      }
+      await add(x, path, oldSide);
+      if (y) await add(y, path, newSide);
+    }
+    for (const [name, y] of eb) {
+      if (ea.has(name)) continue;
+      await add(y, prefix ? `${prefix}/${name}` : name, newSide);
+    }
+  }
+
+  /**
    * The index's stage-0 entries (intent-to-add ones left out: not in the index yet), and the
    * stages of its conflicted paths
    */
@@ -1141,6 +1262,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * `RefNotFoundError` for anything else that names no commit or tree.
    */
   private async resolveTreeId(refOrId: string): Promise<ObjectId> {
+    // a full object id names that object, as get_oid takes it: no ref is looked up
+    if (/^[0-9a-f]{40}$/.test(refOrId)) {
+      const tree = await this.revisionResolver()
+        .peelToType(refOrId, "tree")
+        .catch(() => undefined);
+      if (tree !== undefined) return tree;
+    }
     let id: ObjectId;
     try {
       id = await this.resolveRevision(refOrId);
@@ -1175,7 +1303,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     entries: Map<string, Side>,
   ): Promise<void> {
     const TREE_MODE = 0o40000;
-    for await (const entry of this.trees.loadTree(treeId)) {
+    for (const entry of await this.treeEntries(treeId)) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       if ((entry.mode & S_IFMT) === TREE_MODE) {
         await this.collectTreeEntries(entry.id, path, entries);

@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { type Git, type LogOutputOptions, RevFilter } from "../src/index.js";
+import { type Git, type LogOutputOptions, mergesMode, RevFilter } from "../src/index.js";
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
@@ -240,6 +240,11 @@ async function ours(g: Git, args: string[]): Promise<Buffer> {
     else if (a === "--no-notes") options.notes = false;
     else if (a === "--no-mailmap") options.mailmap = false;
     else if (a === "--full-diff") options.fullDiff = true;
+    else if (a === "--full-history") log.setFullHistory(true);
+    else if (value("--diff-merges=") !== undefined)
+      options.diffMerges = mergesMode(value("--diff-merges=") as string);
+    else if (a === "-s") options.noPatch = true;
+    else if (a.startsWith("^")) log.not(a.slice(1));
     else if (a.startsWith("-")) throw new Error(`unknown option ${a}`);
     else log.add(a);
   }
@@ -339,6 +344,23 @@ describeGit("git log output, native", () => {
     ["--graph", "--pretty=raw", "-n", "4", "--notes"],
     ["--stat", "--format=", "-n", "4"],
     ["--format=%s", "-p", "-n", "3"],
+    // --diff-merges=<mode> alone diffs only the merges (revs->diff stays off)
+    ["--diff-merges=separate", "--oneline"],
+    ["--diff-merges=first-parent", "--format=%h %s"],
+    ["--diff-merges=dense-combined"],
+    ["--pretty=email", "--notes", "--diff-merges=separate"],
+    ["--pretty=email", "--notes", "--stat"],
+    ["-m", "--oneline", "--", "shared.txt"],
+    ["--full-history", "--graph", "--oneline", "--", "shared.txt"],
+    ["--graph", "--full-diff", "--stat", "--oneline", "--", "shared.txt"],
+    // --abbrev=<n> reaches the index lines; --abbrev=0 is 4
+    ["--abbrev=10", "-p", "-n", "3"],
+    ["--abbrev=0", "--oneline"],
+    ["--abbrev=12", "--cc", "-n", "6", "--oneline"],
+    // %N stays literal without notes
+    ["--no-notes", "--format=%h %N|"],
+    ["--notes", "--format=%h [%N]"],
+    ["--all", "--format=%h %d"],
   ];
 
   for (const seed of [1, 2, 3]) {
@@ -447,6 +469,14 @@ describeGit("git log --graph over random DAGs, native", () => {
     ["-c", "--name-only", "-p", "--all", "-n", "10"],
     ["--cc", "--stat", "-p", "--all", "-n", "10", "--graph"],
     ["-p", "--all", "-n", "10", "--", "g.bin", "b.txt"],
+    // the full history of path-limited walks (-m and --diff-merges=separate turn it on)
+    ["--full-history", "--graph", "--oneline", "--all", "--", "a.txt"],
+    ["--full-history", "--format=%h %p", "--all", "--", "d"],
+    ["-m", "--graph", "--format=%h %p", "--all", "--", "d/e"],
+    ["--diff-merges=separate", "--stat", "--oneline", "--all", "--", "b.txt"],
+    ["--graph", "--full-diff", "--stat", "--oneline", "--all", "--", "a.txt"],
+    // --all in git's order: refs by name, then HEAD (commits of one date in that order)
+    ["--format=%h %s", "--all"],
     // git 2.5x: lanes cut at a limit, and the visual roots' indentation turned off
     ...(modernGit()
       ? [
@@ -547,6 +577,357 @@ describeGit("git log output under its configuration, native", () => {
       }
       for (const [k] of config) git(dir, ["config", "--unset-all", k]);
     }
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+});
+
+/** A commit object written as given (dates, zones and encodings `git commit` would not write). */
+function writeCommit(dir: string, body: Buffer | string): string {
+  const r = spawnSync("git", ["hash-object", "-t", "commit", "-w", "--literally", "--stdin"], {
+    cwd: dir,
+    env: env(),
+    input: body,
+  });
+  if (r.status !== 0) throw new Error(`hash-object: ${r.stderr.toString()}`);
+  return r.stdout.toString().trim();
+}
+
+const revParse = (dir: string, rev: string) => git(dir, ["rev-parse", rev]).toString().trim();
+
+/** Each case's `git log` stdout against ours: the failures, described */
+async function compareCases(
+  dir: string,
+  g: Git,
+  cases: string[][],
+  extra: Record<string, string> = {},
+): Promise<string[]> {
+  const failures: string[] = [];
+  for (const args of cases) {
+    const native = git(dir, ["log", ...args], extra);
+    let mine: Buffer;
+    try {
+      mine = await ours(g, args);
+    } catch (e) {
+      failures.push(`${args.join(" ")}: threw ${(e as Error).stack}`);
+      continue;
+    }
+    if (!mine.equals(native))
+      failures.push(`git log ${args.join(" ")}\n${firstDifference(native, mine)}`);
+  }
+  return failures;
+}
+
+describeGit("git log review fixes, native", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-fixes-native-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** root; side changes f; main changes g; merge; side appends to g; `merge -X ours side` */
+  function buildMerges(dir: string): void {
+    git(root, ["init", "-q", "-b", "main", dir]);
+    const commit = (message: string) => {
+      clock += 3600;
+      git(dir, ["commit", "-q", "-am", message]);
+    };
+    put(dir, "f", "a\n");
+    put(dir, "g", "a\n");
+    git(dir, ["add", "."]);
+    commit("root");
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    put(dir, "f", "side\n");
+    commit("side-f");
+    git(dir, ["checkout", "-q", "main"]);
+    put(dir, "g", "main\n");
+    commit("main-g");
+    clock += 3600;
+    git(dir, ["merge", "-q", "-m", "merge1", "side"]);
+    git(dir, ["checkout", "-q", "side"]);
+    put(dir, "g", "a\nmore\n");
+    commit("side-g");
+    git(dir, ["checkout", "-q", "main"]);
+    clock += 3600;
+    git(dir, ["merge", "-q", "-X", "ours", "-m", "merge2", "side"]);
+  }
+
+  it("-m and --diff-merges=separate walk the full history of a path", async () => {
+    const dir = join(root, "full-history");
+    buildMerges(dir);
+    const g = await openOurs(dir);
+    const rootId = revParse(dir, "main~3");
+    const tip = revParse(dir, "main");
+    const failures = await compareCases(dir, g, [
+      ["-m", "--oneline", "--", "f"],
+      ["--oneline", "--", "f"],
+      ["--graph", "-m", "--oneline", "--", "g"],
+      ["--graph", "--oneline", "--", "g"],
+      ["--full-history", "--oneline", "--", "f"],
+      ["--full-history", "--graph", "--oneline", "--", "f"],
+      ["--diff-merges=separate", "--oneline", "--", "f"],
+      ["--diff-merges=first-parent", "--stat", "--oneline", "--", "g"],
+      ["-m", "-p", "--oneline", "--", "f"],
+      ["-m", "--cc", "--oneline", "--", "g"],
+      ["--full-history", "--graph", "--oneline", `^${rootId}`, tip, "--", "g"],
+      ["--graph", "--full-diff", "-p", "--oneline", "--", "f"],
+    ]);
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("--follow finds copies of unchanged files, with -c/--cc, -n and --reverse", async () => {
+    const dir = join(root, "follow");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    const commit = (message: string) => {
+      clock += 3600;
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-q", "-m", message]);
+    };
+    const lines = (from: number, to: number) =>
+      Array.from({ length: to - from + 1 }, (_, i) => `${from + i}\n`).join("");
+    put(dir, "a.txt", lines(1, 20));
+    put(dir, "b.txt", lines(100, 120));
+    commit("root");
+    put(dir, "c.txt", `${lines(1, 20)}extra\n`);
+    commit("copy a to c");
+    put(dir, "d.txt", lines(100, 120));
+    commit("exact copy of b");
+    put(dir, "c.txt", `${lines(1, 20)}extra\nmore\n`);
+    commit("edit c");
+    git(dir, ["mv", "b.txt", "e.txt"]);
+    put(dir, "e.txt", `${lines(100, 120)}tail\n`);
+    commit("rename b to e");
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    put(dir, "c.txt", `head\n${lines(1, 20)}extra\nmore\n`);
+    commit("side edits c");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["mv", "c.txt", "f.txt"]);
+    commit("rename c to f");
+    clock += 3600;
+    git(dir, ["merge", "-q", "-m", "merge side", "side"]);
+    put(dir, "d.txt", `${lines(100, 120)}d\n`);
+    commit("edit d");
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      ["--follow", "--stat", "--oneline", "--", "e.txt"],
+      ["--follow", "-p", "--", "d.txt"],
+      ["--follow", "--name-status", "--format=%s", "--", "d.txt"],
+      ["-n", "0", "--follow", "--oneline", "--", "d.txt"],
+      ["-n", "2", "--follow", "--oneline", "--", "d.txt"],
+      ["--reverse", "-n", "4", "--follow", "--oneline", "--", "d.txt"],
+      ["--reverse", "--follow", "--oneline", "--", "e.txt"],
+      // git 2.5x follows each parent's own path across the merge
+      ...(modernGit()
+        ? [
+            ["--follow", "--stat", "--oneline", "--", "f.txt"],
+            ["--follow", "--name-status", "--format=%s", "--", "f.txt"],
+            ["--follow", "--cc", "--oneline", "--", "f.txt"],
+            ["--follow", "-c", "--stat", "--oneline", "--", "f.txt"],
+            ["--follow", "-c", "--oneline", "--", "f.txt"],
+            ["--follow", "-c", "--name-status", "--oneline", "--", "f.txt"],
+          ]
+        : []),
+    ]);
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("re-encodes messages and idents from their encoding header", async () => {
+    const dir = join(root, "encoding");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "file", "content\n");
+    git(dir, ["add", "file"]);
+    const tree = git(dir, ["write-tree"]).toString().trim();
+    const latin1 = (s: string) => Buffer.from(s, "latin1");
+    const commit = (parent: string | undefined, encoding: string, who: Buffer, message: Buffer) =>
+      writeCommit(
+        dir,
+        Buffer.concat([
+          Buffer.from(`tree ${tree}\n${parent ? `parent ${parent}\n` : ""}author `),
+          who,
+          Buffer.from(" <who@example.com> 1600000000 +0200\ncommitter "),
+          who,
+          Buffer.from(` <who@example.com> 1600000000 +0200\nencoding ${encoding}\n\n`),
+          message,
+        ]),
+      );
+    let id = commit(
+      undefined,
+      "ISO-8859-1",
+      latin1("José Müller"),
+      latin1("Café au lait\n\nBody à la carte\n"),
+    );
+    id = commit(id, "UTF-8", Buffer.from("Plain Ünï"), Buffer.from("Plain UTF-8 ünï\n"));
+    id = commit(id, "x-unknown-charset", latin1("Unknöwn"), latin1("Unknown \xe9 charset\n"));
+    id = commit(
+      id,
+      "Shift_JIS",
+      Buffer.from([0x93, 0xfa, 0x96, 0x7b]),
+      Buffer.concat([Buffer.from([0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]), Buffer.from(" subject\n")]),
+    );
+    id = commit(
+      id,
+      "iso-8859-1",
+      latin1("Zoë"),
+      latin1("Ça a l'air très long, ce sujet accentué qui doit être replié dans l'en-tête\n"),
+    );
+    git(dir, ["update-ref", "refs/heads/main", id]);
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      [],
+      ["--pretty=raw"],
+      ["--pretty=email"],
+      ["--format=%an|%aN|%cn|%s|%e|%b"],
+      ["--oneline"],
+      ["--pretty=fuller"],
+      ["--format=%B"],
+    ]);
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("reads replaced commits as git does, and decorates their originals", async () => {
+    const dir = join(root, "replace");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    for (const n of [1, 2, 3]) {
+      clock += 3600;
+      put(dir, "file", `version ${n}\n`);
+      git(dir, ["add", "file"]);
+      git(dir, ["commit", "-q", "-m", `commit ${n}`]);
+    }
+    const replacement = git(dir, [
+      "commit-tree",
+      "HEAD~1^{tree}",
+      "-p",
+      "HEAD~2",
+      "-m",
+      "replacement of commit 2",
+    ])
+      .toString()
+      .trim();
+    git(dir, ["replace", "HEAD~1", replacement]);
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      ["--pretty=raw"],
+      ["--oneline", "--decorate"],
+      ["--format=%s %d"],
+      ["--stat", "--oneline"],
+      [],
+    ]);
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("shows dates past JavaScript's range and odd zones as git does", async () => {
+    const dir = join(root, "dates");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "file", "content\n");
+    git(dir, ["add", "file"]);
+    const tree = git(dir, ["write-tree"]).toString().trim();
+    let parent: string | undefined;
+    for (const date of [
+      "1700000000 -0130",
+      "1700000000 +0060",
+      "1700000000 -0001",
+      "9999999999999 +0000",
+      "1690000000 +0545",
+    ]) {
+      parent = writeCommit(
+        dir,
+        `tree ${tree}\n${parent ? `parent ${parent}\n` : ""}author A <a@x> ${date}\ncommitter C <c@x> ${date}\n\nDated ${date}\n`,
+      );
+    }
+    git(dir, ["update-ref", "refs/heads/main", parent as string]);
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      [],
+      ["--date=iso"],
+      ["--date=rfc"],
+      ["--date=raw"],
+      ["--date=short"],
+      ["--date=relative"],
+      ["--pretty=fuller", "--date=human"],
+      ["--date=format:%c %z|%s|%G-W%V-%u|%j"],
+      ["--format=%ad|%cd"],
+      // git before 2.5x writes +00:00 for UTC, 2.5x Z
+      ...(modernGit() ? [["--date=iso-strict"]] : []),
+    ]);
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("formats dates with glibc's strftime flags and the local zone's name", async () => {
+    const dir = join(root, "strftime");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    for (const date of [1690000000, 1700000000]) {
+      put(dir, "file", `${date}\n`);
+      git(dir, ["add", "file"]);
+      git(dir, ["commit", "-q", "-m", `at ${date}`], {
+        GIT_AUTHOR_DATE: `${date} +0200`,
+        GIT_COMMITTER_DATE: `${date} +0200`,
+      });
+    }
+    const g = await openOurs(dir);
+    const failures: string[] = [];
+    const saved = process.env.TZ;
+    try {
+      for (const tz of ["Asia/Kathmandu", "Europe/Berlin", "UTC"]) {
+        process.env.TZ = tz;
+        const found = await compareCases(
+          dir,
+          g,
+          [
+            ["--date=format-local:%Z|%z|%c|%#Z|%10Z"],
+            ["--date=format:%-d %_m %03d %10Y %^a %#Z %Ey %Oe|%Z|%5z|%-5H|%^10b|%010A|%Ea|%P"],
+            ["--date=local"],
+            ["--date=iso-local", "--pretty=fuller"],
+          ],
+          { TZ: tz },
+        );
+        failures.push(...found.map((f) => `TZ=${tz} ${f}`));
+      }
+    } finally {
+      if (saved === undefined) delete process.env.TZ;
+      else process.env.TZ = saved;
+    }
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("refuses what git refuses, with git's messages", async () => {
+    const dir = join(root, "errors");
+    buildMerges(dir);
+    const g = await openOurs(dir);
+    const cases: string[][] = [
+      ["--follow", "--oneline", "--", "f", "g"],
+      ["--follow", "--oneline", "--", ":(glob)f*"],
+      ["--follow", "--oneline"],
+      // git 2.43 names the options the other way round
+      ...(modernGit() ? [["--graph", "--reverse", "--oneline"]] : []),
+    ];
+    const failures: string[] = [];
+    for (const args of cases) {
+      const r = spawnSync("git", ["log", ...args], { cwd: dir, env: env() });
+      const native = r.stderr.toString();
+      const mine = await ours(g, args).then(
+        () => "no error",
+        (e) => `fatal: ${(e as Error).message}\n`,
+      );
+      if (r.status === 0 || mine !== native) {
+        failures.push(`git log ${args.join(" ")}: native ${native} ours ${mine}`);
+      }
+    }
+    expect(failures.join("\n")).toBe("");
+  }, 120000);
+
+  it("walks tags it is given from the commits they tag, --all and given commits together", async () => {
+    const dir = join(root, "api");
+    buildMerges(dir);
+    git(dir, ["tag", "-a", "-m", "annotated", "vt", "side~1"]);
+    git(dir, ["tag", "-a", "-m", "nested", "vn", "vt"]);
+    git(dir, ["config", "mailmap.file", "extra-map"]);
+    put(dir, "extra-map", "Mapped Name <mapped@example.com> <interop@example.com>\n");
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      [revParse(dir, "vt"), "--oneline"],
+      [revParse(dir, "vn"), "--format=%h %s"],
+      ["--all", `^${revParse(dir, "vt")}`, "--format=%h %s"],
+      [`^${revParse(dir, "main~1")}`, "--all", "--format=%h %s"],
+      ["--format=%aN <%aE>", "-n", "2"],
+    ]);
     expect(failures.slice(0, 6).join("\n\n")).toBe("");
   }, 120000);
 });

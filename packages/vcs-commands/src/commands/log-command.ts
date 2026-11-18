@@ -27,7 +27,7 @@ import {
   xdgConfigPath,
 } from "@statewalker/vcs-working-tree";
 
-import { GitApiError } from "../errors/index.js";
+import { GitApiError, IncompatibleOptionsError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { writeCombinedDiff } from "../results/combined-diff.js";
@@ -184,7 +184,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private maxCount?: number;
   private skip = 0;
   private includeAll = false;
+  /** Where `all()` puts the refs among the commits given (git's command-line order) */
+  private allAt = 0;
   private firstParentOnly = false;
+  /** git's `simplify_history`: off with `--full-history` (and `-m`, `--diff-merges=separate`) */
+  private simplifyHistory = true;
   private sinceTime?: number;
   private untilTime?: number;
   private authorPattern?: string;
@@ -208,7 +212,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * Add a starting commit for the log.
    *
    * Multiple start commits can be added - the log will include
-   * ancestors of all of them.
+   * ancestors of all of them. An annotated tag is walked from the commit it tags, as git
+   * peels it; with {@link all} the refs are walked besides (`git log --all <commit>`).
    *
    * @param commit ObjectId of commit to start from
    */
@@ -273,13 +278,29 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * Include commits from all refs.
+   * Include commits from all refs (`--all`): every ref under `refs/` in name order, then HEAD,
+   * as git's handle_refs adds them, where the call stands among {@link add}, {@link not} and
+   * {@link addRange} (the commits given so far come first).
    *
    * When set, starts from all refs instead of just HEAD.
    */
   all(): this {
     this.checkCallable();
     this.includeAll = true;
+    this.allAt = this.pending.length;
+    return this;
+  }
+
+  /**
+   * `--full-history`: a path-limited walk compares a merge with every parent and walks them
+   * all, even one the merge matches at the paths (git's `simplify_history` off; `git log -m`
+   * and `--diff-merges=separate` turn it off as well). Merges that match every relevant parent
+   * are still not shown, unless the output rewrites parents (`--graph`) and two of them are
+   * relevant.
+   */
+  setFullHistory(fullHistory: boolean): this {
+    this.checkCallable();
+    this.simplifyHistory = !fullHistory;
     return this;
   }
 
@@ -421,46 +442,52 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.checkCallable();
     this.setCallable(false);
 
-    // Determine starting commits
-    let starts: ObjectId[];
-    if (this.startCommits.length > 0) {
-      starts = this.startCommits;
-    } else if (this.includeAll) {
-      starts = await this.getAllRefs();
-    } else {
-      const headId = await this.resolveHead();
-      starts = [headId];
+    // the commits given, in order, the refs of `all()` where it was called; HEAD without
+    // either
+    const pending: { id: ObjectId; exclude: boolean }[] = [];
+    for (let i = 0; i <= this.pending.length; i++) {
+      if (this.includeAll && i === this.allAt) {
+        for (const id of await this.getAllRefs()) pending.push({ id, exclude: false });
+      }
+      const e = this.pending[i];
+      if (e) pending.push({ id: await this.peelToCommit(e.id), exclude: e.exclude });
     }
-
-    const pending = [...this.pending];
-    if (this.startCommits.length === 0) {
-      for (const id of starts) pending.push({ id, exclude: false });
+    if (this.startCommits.length === 0 && !this.includeAll) {
+      pending.push({ id: await this.resolveHead(), exclude: false });
     }
     return this.walk(pending);
   }
 
+  /** The commit an annotated tag (or a chain of them) tags; any other id as it is. */
+  private async peelToCommit(start: ObjectId): Promise<ObjectId> {
+    const tags = this.tagsStore;
+    let id = start;
+    for (let depth = 0; depth < 32 && tags && (await tags.has(id).catch(() => false)); depth++) {
+      const tag = await tags.load(id).catch(() => undefined);
+      if (!tag) break;
+      id = tag.object;
+    }
+    return id;
+  }
+
   /**
-   * Get all commit IDs from all refs.
+   * The commits of `--all` (revision.c's handle_refs): each ref under `refs/` in name order
+   * (refs_for_each_ref, symbolic ones resolved), then HEAD (refs_head_ref); annotated tags
+   * peeled.
    */
   private async getAllRefs(): Promise<ObjectId[]> {
-    const ids: ObjectId[] = [];
-    const tags = this.tagsStore;
+    const named: { name: Uint8Array; id: ObjectId }[] = [];
     for await (const ref of this.refsStore.list()) {
-      if ("objectId" in ref && ref.objectId) {
-        // an annotated tag is walked from the commit it tags (git peels it)
-        let id = ref.objectId;
-        for (
-          let depth = 0;
-          depth < 32 && tags && (await tags.has(id).catch(() => false));
-          depth++
-        ) {
-          const tag = await tags.load(id).catch(() => undefined);
-          if (!tag) break;
-          id = tag.object;
-        }
-        ids.push(id);
-      }
+      if (!ref.name.startsWith("refs/")) continue;
+      let id = "objectId" in ref ? ref.objectId : undefined;
+      if (!id) id = (await this.refsStore.resolve(ref.name).catch(() => undefined))?.objectId;
+      if (id) named.push({ name: encodeGitPath(ref.name), id });
     }
+    named.sort((a, b) => compareBytes(a.name, b.name));
+    const ids: ObjectId[] = [];
+    for (const { id } of named) ids.push(await this.peelToCommit(id));
+    const head = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    if (head) ids.push(await this.peelToCommit(head));
     return ids;
   }
 
@@ -504,6 +531,13 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const bloomVersion = bloom ? this.changedPathsVersion() : -1;
     const fast = pathspec?.literal;
     const firstParentOnly = this.firstParentOnly;
+    const simplifyHistory = this.simplifyHistory;
+    /**
+     * Each merge's TREESAME to each parent (git's `treesame` decoration), kept when limiting
+     * can make it TREESAME later (limiting_can_increase_treesame: full history, a limited walk)
+     */
+    const treesame = new Map<number, Uint8Array>();
+    let trackTreesame = false;
     const t = new RevTable(graph);
     this.lastWalk = t;
     /** Raw commits read by `parse` (no graph), kept until shown: read once, not twice. */
@@ -562,7 +596,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         graph,
         t.bloomPos(n),
       );
-    /** git's try_to_simplify_commit (prune, dense, simplify_history, no show_pulls) */
+    /** git's try_to_simplify_commit (prune, dense, no show_pulls) */
     const simplify = async (n: number): Promise<void> => {
       if (!prune) return;
       const count = t.parentCount(n);
@@ -573,16 +607,28 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       let relevantParents = 0;
       let relevantChange = false;
       let irrelevantChange = false;
+      let ts: Uint8Array | undefined;
       for (let nth = 0; nth < count; nth++) {
         const p = t.parent(n, nth);
         if (relevant(p)) relevantParents++;
-        if (nth === 1 && firstParentOnly) break;
+        if (nth === 1) {
+          if (firstParentOnly) break;
+          if (trackTreesame && !(t.flag(n) & UNINTERESTING)) {
+            ts = new Uint8Array(count);
+            treesame.set(n, ts);
+            if (!(irrelevantChange || relevantChange)) ts[0] = 1;
+          }
+        }
         if (!(await parse(p))) {
           throw new GitApiError(`cannot simplify commit ${t.idOf(n)} (because of ${t.idOf(p)})`);
         }
         if (!(await differs(t.treeOf(p), n, nth))) {
-          // a merge with an irrelevant side that brought the whole change keeps its others
-          if (!relevant(p)) continue;
+          // a merge with an irrelevant side that brought the whole change keeps its others;
+          // with the full history, every parent is kept
+          if (!simplifyHistory || !relevant(p)) {
+            if (ts) ts[nth] = 1;
+            continue;
+          }
           t.keepOnlyParent(n, p);
           t.mark(n, TREESAME);
           return;
@@ -656,6 +702,23 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     const list: number[] = [];
     let limited = false;
+    /** git's update_treesame: TREESAME again from the per-parent marks, relevance as it is now */
+    const updateTreesame = (n: number): void => {
+      const count = t.parentCount(n);
+      const st = treesame.get(n);
+      if (count < 2 || !st) return;
+      let relevantParents = 0;
+      let relevantChange = false;
+      let irrelevantChange = false;
+      for (let k = 0; k < count; k++) {
+        if (relevant(t.parent(n, k))) {
+          relevantChange ||= !st[k];
+          relevantParents++;
+        } else irrelevantChange ||= !st[k];
+      }
+      if (relevantParents ? relevantChange : irrelevantChange) t.unmark(n, TREESAME);
+      else t.mark(n, TREESAME);
+    };
     for (const e of pending) {
       const n = t.lookup(e.id);
       if (!(await parse(n))) continue;
@@ -678,6 +741,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // git's -n 0 reads nothing more in a streaming walk; a limited walk is done before
     const none = this.maxCount !== undefined && this.maxCount <= 0;
     const output = this.outputWalk;
+    // the output's walk is limited (git without generation numbers limits a topo walk)
+    trackTreesame = (limited || !!output) && prune && !simplifyHistory && !firstParentOnly;
     if (!limited && !output) {
       if (none) return;
       // get_revision_1, streaming
@@ -738,6 +803,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (this.untilTime !== undefined && t.date(n) > this.untilTime) continue;
       date = t.date(n);
       newlist.push(n);
+    }
+    // commits made TREESAME by parents that became UNINTERESTING
+    if (trackTreesame) {
+      for (const n of newlist) {
+        if (!(t.flag(n) & (UNINTERESTING | TREESAME))) updateTreesame(n);
+      }
     }
     raw.clear();
     if (output) {
@@ -829,7 +900,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       const commit = await shown(n, output.rewrite && prune);
       if (!commit) continue;
       let parents = commit.parents;
+      let savedParents: ObjectId[] | undefined;
       if (output.rewrite && prune) {
+        // the parents before rewriting, which `--full-diff` diffs against (save_parents)
+        savedParents = [];
+        for (let k = 0, c = t.parentCount(n); k < c; k++) savedParents.push(t.idOf(t.parent(n, k)));
         const ids: ObjectId[] = [];
         for (let k = 0, c = t.parentCount(n); k < c; k++) {
           const p = rewriteOne(t.parent(n, k));
@@ -841,7 +916,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         parents = ids;
       }
       const { id, ...rest } = commit;
-      output.entries.push({ id, commit: rest, parents });
+      output.entries.push({ id, commit: rest, parents, ...(savedParents ? { savedParents } : {}) });
     }
   }
 
@@ -863,18 +938,31 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   /** {@link callText} as bytes (messages and file contents that are not UTF-8 kept as they are). */
   async callBytes(options: LogOutputOptions = {}): Promise<Uint8Array> {
+    // revision.c's setup_revisions: the graph cannot be reversed
+    if (options.graph && options.reverse) {
+      throw new IncompatibleOptionsError(
+        ["--graph", "--reverse"],
+        "options '--graph' and '--reverse' cannot be used together",
+      );
+    }
     const host = this.outputHost();
     const paths = [...this.paths];
+    // the pathspec as git holds it: the excluded paths as `:(exclude)` elements, `.` when
+    // every element excludes
+    const pathspec = [...paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
+    if (paths.length === 0 && this.excludePaths.length > 0) pathspec.push(".");
     const printer = new LogPrinter(host, options, {
       interesting: (id) => shownIds.has(id),
       firstParentOnly: this.firstParentOnly,
-      paths: this.excludePaths.length > 0 ? [...paths, ...this.excludePaths] : paths,
+      paths: pathspec,
     });
     const follow = !printer.alwaysShowHeader;
     const graph = !!options.graph;
     const topo = graph || !!options.topoOrder;
     const maxCount = this.maxCount;
     const skip = this.skip;
+    const simplifyHistory = this.simplifyHistory;
+    if (printer.fullHistory) this.simplifyHistory = false;
     // --follow walks every commit: its path changes as it goes
     if (follow) this.paths = [];
     const shownIds = new Set<ObjectId>();
@@ -891,13 +979,18 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (maxCount !== undefined && !follow) entries = entries.slice(0, Math.max(maxCount, 0));
       if (maxCount !== undefined && maxCount <= 0) entries = [];
     } else {
-      if (follow) this.maxCount = undefined;
+      // --follow counts the commits shown, not those walked; --reverse the newest walked
+      if (follow && !options.reverse) this.maxCount = undefined;
       entries = [];
       for await (const c of await this.call()) {
         const { id, ...commit } = c;
         entries.push({ id, commit, parents: c.parents });
       }
       if (follow) this.maxCount = maxCount;
+    }
+    this.simplifyHistory = simplifyHistory;
+    if (follow && options.reverse && maxCount !== undefined) {
+      entries = entries.slice(0, Math.max(maxCount, 0));
     }
     if (options.reverse) entries.reverse();
     await printer.start();
@@ -906,11 +999,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       printer.useGraph((id) => parentsOf.get(id) ?? []);
     }
     let count = 0;
+    // -n 0: nothing is walked
+    if (maxCount !== undefined && maxCount <= 0) entries = [];
+    const countShown = follow && maxCount !== undefined && !options.reverse;
     for (let k = 0; k < entries.length; k++) {
       const e = entries[k] as LogOutputEntry;
       const lookahead = entries.slice(k + 1, k + 3).map((x) => x.id);
       const shown = await printer.showCommit(e, lookahead);
-      if (shown && follow && maxCount !== undefined && ++count >= maxCount) break;
+      if (shown && countShown && ++count >= (maxCount as number)) break;
     }
     if (follow) this.paths = paths;
     return printer.result();
@@ -923,6 +1019,21 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const abbrevs = new Map<string, string>();
     let notesMaps: Promise<{ ref: string; notes: Map<ObjectId, ObjectId> }[]> | undefined;
     let mailmap: Promise<Mailmap> | undefined;
+    const trees = new Map<ObjectId, Promise<ObjectId>>();
+    /** A commit's tree, as the walk parsed it (replace refs and grafts honoured) */
+    const treeOf = (id: ObjectId): Promise<ObjectId> => {
+      let tree = trees.get(id);
+      if (!tree) {
+        tree = (async () => {
+          const header = await this.readCommitHeader(id, await this.objectReplacements());
+          if (!header) throw new GitApiError(`could not parse commit ${id}`);
+          return header.tree;
+        })();
+        trees.set(id, tree);
+        if (trees.size > 4096) trees.delete(trees.keys().next().value as ObjectId);
+      }
+      return tree;
+    };
     return {
       config: (key) => config.value(key),
       configAll: (key) => config.values(key),
@@ -948,7 +1059,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         return short;
       },
       rawCommit: async (id) => {
-        const bytes = await this.readObjectBytes(id);
+        // the replacement's content, as git's commit buffer is (core.useReplaceRefs)
+        const replace = (await this.objectReplacements())?.replace;
+        const bytes = await this.readObjectBytes(replace?.size ? replacementOf(replace, id) : id);
         return bytes ? decodeGitPath(bytes) : undefined;
       },
       decorations: async (options) => {
@@ -993,15 +1106,18 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         return mailmap;
       },
       diff: async (entry, parent, formats, options) => {
+        // the trees themselves: a full id names its object, so no revision is looked up
         const diff = new DiffCommand(this._workingCopy)
-          .setOldTree(parent ?? EMPTY_TREE_ID)
-          .setNewTree(entry.id);
-        if (options.statWidth !== undefined) {
-          diff.setOptions({
-            ...this.diffOptions,
-            stat: { ...this.diffOptions.stat, width: options.statWidth },
-          });
-        } else diff.setOptions(this.diffOptions);
+          .setOldTree(parent ? await treeOf(parent) : EMPTY_TREE_ID)
+          .setNewTree(entry.commit.tree)
+          .shareReadsOf(this);
+        diff.setOptions({
+          ...this.diffOptions,
+          ...(options.statWidth !== undefined
+            ? { stat: { ...this.diffOptions.stat, width: options.statWidth } }
+            : {}),
+          ...(options.abbrev !== undefined ? { abbrev: options.abbrev } : {}),
+        });
         if (!options.fullDiff && options.follow === undefined) {
           const spec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
           if (spec.length > 0) diff.setPathspec(spec);
@@ -1070,16 +1186,30 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   private async combinedDiff(
     entry: LogOutputEntry,
-    options: { dense: boolean; names?: "name-only" | "name-status"; patch: boolean },
+    options: {
+      dense: boolean;
+      names?: "name-only" | "name-status";
+      patch: boolean;
+      follow?: string;
+      parentPaths?: string[];
+      abbrev?: number;
+    },
   ): Promise<{ paths: number; names: Uint8Array; patch: Uint8Array }> {
     const { dense } = options;
+    /** A parent's entry for a path (under `--follow`, the path it had the file under) */
+    const sideOf = (m: Map<string, { mode: number; id: ObjectId }>, k: number, path: string) =>
+      m.get(options.parentPaths?.[k] ?? path);
     const result = await this.flatTree(entry.commit.tree);
     const parents: Map<string, { mode: number; id: ObjectId }>[] = [];
     for (const p of entry.parents) {
       const commit = await this.commits.load(p);
       parents.push(commit ? await this.flatTree(commit.tree) : new Map());
     }
-    const spec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
+    // --follow: the one path followed (the walk's pathspec is set aside then)
+    const spec =
+      options.follow !== undefined
+        ? [`:(literal)${options.follow}`]
+        : [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
     const items = spec.map((p) => parsePathspecItem(p));
     if (items.length > 0 && items.every((i) => i.exclude)) items.push(parsePathspecItem("."));
     const all = new Set<string>(result.keys());
@@ -1088,7 +1218,13 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       !a || !b ? a !== b : a.id !== b.id || a.mode !== b.mode;
     const paths = [...all]
       .filter((path) => items.length === 0 || matchPathspec(items, path, 0) > 0)
-      .filter((path) => parents.every((m) => differs(m.get(path), result.get(path))))
+      .filter((path) =>
+        parents.every(
+          (m, k) =>
+            (options.parentPaths !== undefined && options.parentPaths[k] !== path) ||
+            differs(sideOf(m, k, path), result.get(path)),
+        ),
+      )
       .sort((a, b) => {
         const ea = encodeGitPath(a);
         const eb = encodeGitPath(b);
@@ -1105,7 +1241,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       for (const path of paths) {
         if (options.names === "name-status") {
           const r = result.get(path);
-          for (const m of parents) names.text(!m.get(path) ? "A" : !r ? "D" : "M");
+          parents.forEach((m, k) => {
+            const renamed = options.parentPaths !== undefined && options.parentPaths[k] !== path;
+            names.text(renamed ? "R" : !sideOf(m, k, path) ? "A" : !r ? "D" : "M");
+          });
           names.text("\t");
         }
         names.text(`${quotePath(path, quote)}\n`);
@@ -1118,12 +1257,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     for (const path of paths) {
       const r = result.get(path);
       if (r) ids.add(r.id);
-      for (const m of parents) {
-        const e = m.get(path);
+      parents.forEach((m, k) => {
+        const e = sideOf(m, k, path);
         if (e) ids.add(e.id);
-      }
+      });
     }
-    const lengths = await this.idAbbreviator().lengths(ids);
+    const lengths = await this.idAbbreviator().lengths(ids, options.abbrev);
     const read = async (e?: { mode: number; id: ObjectId }) => {
       if (!e) return new Uint8Array(0);
       if ((e.mode & 0o170000) === 0o160000) return encodeGitPath(`Subproject commit ${e.id}\n`);
@@ -1133,8 +1272,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     for (const path of paths) {
       const r = result.get(path);
       const sides = [];
-      for (const m of parents) {
-        const e = m.get(path);
+      for (let k = 0; k < parents.length; k++) {
+        const e = sideOf(parents[k] as Map<string, { mode: number; id: ObjectId }>, k, path);
         sides.push({ id: e?.id ?? NULL_OBJECT_ID, mode: e?.mode ?? 0, content: await read(e) });
       }
       writeCombinedDiff(
@@ -1217,10 +1356,40 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     if (file) {
       const environment = hostEnvironmentOf(this._workingCopy);
       const path = expandUserPath(file, environment);
-      const bytes = path ? await environment?.readFile(path).catch(() => undefined) : undefined;
+      const bytes = path !== undefined ? await this.readMailmapFile(path, environment) : undefined;
       if (bytes) map.read(decodeGitPath(bytes));
     }
     return map;
+  }
+
+  /**
+   * `mailmap.file`, read as git reads it: through the host (a relative path from its current
+   * directory). Without a host environment, a relative path is read from the worktree's top
+   * (where git usually runs), and an absolute one inside the worktree through it as well.
+   */
+  private async readMailmapFile(
+    path: string,
+    environment: ReturnType<typeof hostEnvironmentOf>,
+  ): Promise<Uint8Array | undefined> {
+    if (environment) return environment.readFile(path).catch(() => undefined);
+    const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
+    if (!worktree) return undefined;
+    let relative = path;
+    if (path.startsWith("/")) {
+      const top = (worktree as { hostPath?: string }).hostPath?.replace(/\/+$/, "");
+      if (!top || !path.startsWith(`${top}/`)) return undefined;
+      relative = path.slice(top.length + 1);
+    }
+    if (relative.split("/").includes("..")) return undefined;
+    try {
+      const entry = await worktree.getEntry(relative);
+      if (!entry || entry.isDirectory) return undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const c of worktree.readContent(relative)) chunks.push(c);
+      return concatBytes(chunks);
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -1617,6 +1786,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   /** The raw bytes of a tree; undefined when it is missing, null without a raw object store. */
   private async rawTree(tree: ObjectId): Promise<Uint8Array | undefined | null> {
     const id = this.treeReplacements ? replacementOf(this.treeReplacements, tree) : tree;
+    // the empty tree, which a store need not hold
+    if (id === EMPTY_TREE_ID) return EMPTY_TREE;
     const cached = this.rawTrees.get(id);
     if (cached) {
       this.rawTrees.delete(id);
@@ -1783,6 +1954,10 @@ class RevTable {
     this.flags[n] = (this.flags[n] as number) | flags;
   }
 
+  unmark(n: number, flags: number): void {
+    this.flags[n] = (this.flags[n] as number) & ~flags;
+  }
+
   parsed(n: number): boolean {
     return (this.parents[n] as number) >= 0;
   }
@@ -1883,6 +2058,15 @@ function decodeCommit(bytes: Uint8Array): Commit | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** memcmp order of two byte strings */
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) return (a[i] as number) - (b[i] as number);
+  }
+  return a.length - b.length;
 }
 
 function concatBytes(chunks: Uint8Array[]): Uint8Array {

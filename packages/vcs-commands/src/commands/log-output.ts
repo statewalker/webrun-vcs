@@ -18,16 +18,23 @@
  * `log.follow`, `log.graphIndent`, `log.excludeDecoration`, `notes.displayRef`...). Colors
  * are never written (git without a terminal).
  *
+ * A commit with an `encoding` header is shown in UTF-8 (git's default `i18n.logOutputEncoding`);
+ * another output encoding is not supported. One quirk of git is not reproduced: where its C
+ * code takes a user format's output as a NUL-terminated string under `--graph`, a `%x00`
+ * can cut what git prints; the whole text is printed here.
+ *
  * @module
  */
 
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { gitCharWidth } from "@statewalker/vcs-utils/encoding";
+import { encodeGitPath, gitCharWidth } from "@statewalker/vcs-utils/encoding";
 
+import { InvalidArgumentError } from "../errors/index.js";
 import { type DateMode, DEFAULT_DATE_MODE, parseDateMode, showDate } from "./date-format.js";
 import type { DiffOutputFormat, DiffTextOptions } from "./diff-command.js";
 import { LogGraph } from "./log-graph.js";
 import type { Mailmap } from "./mailmap.js";
+import { parsePathspecItem } from "./pathspec.js";
 import {
   formatCommitPretty,
   formatRefDecorations,
@@ -48,7 +55,10 @@ export interface LogOutputOptions {
   oneline?: boolean;
   /** `--abbrev-commit` / `--no-abbrev-commit` (default `log.abbrevCommit`, false) */
   abbrevCommit?: boolean;
-  /** `--abbrev=<n>` (default `core.abbrev`, automatic) */
+  /**
+   * `--abbrev=<n>` (default `core.abbrev`, automatic): at least n digits (4 to 40, as git
+   * clamps it), in the commits' ids and in the diffs' `index` lines
+   */
   abbrev?: number;
   /** `--no-abbrev`: full ids everywhere */
   noAbbrev?: boolean;
@@ -97,9 +107,15 @@ export interface LogOutputOptions {
   cc?: boolean;
   /** `--diff-merges=<mode>` */
   diffMerges?: LogDiffMerges;
-  /** `--full-diff`: a path-limited log shows the commits' whole diffs */
+  /**
+   * `--full-diff`: a path-limited log shows the commits' whole diffs (against their parents
+   * before `--graph` rewrote them)
+   */
   fullDiff?: boolean;
-  /** `--follow`: follow the one path given across renames (default `log.follow`) */
+  /**
+   * `--follow`: follow the one path given across renames and copies (default `log.follow`,
+   * which needs exactly one plain path; `--follow` throws git's error otherwise)
+   */
   follow?: boolean;
   /** `--root` / `log.showRoot` (default true): a root commit's diff against the empty tree */
   showRoot?: boolean;
@@ -116,6 +132,8 @@ export interface LogOutputOptions {
   now?: number;
   /** The local zone's offset east of UTC in minutes at a time (default the host's) */
   localTzOffset?: (time: number) => number;
+  /** The local zone's name at a time, for `%Z` of `format-local:` (default `Intl`'s) */
+  localTzName?: (time: number) => string;
 }
 
 /** A commit the walk shows, with the parents it is shown with (rewritten under `--graph`). */
@@ -123,6 +141,8 @@ export interface LogOutputEntry {
   id: ObjectId;
   commit: Commit;
   parents: ObjectId[];
+  /** The parents before `--graph` rewrote them (git's saved parents, for `--full-diff`) */
+  savedParents?: ObjectId[];
 }
 
 /** What the printer reads of the repository (see `LogCommand.callBytes`). */
@@ -157,16 +177,24 @@ export interface LogOutputHost {
     entry: LogOutputEntry,
     parent: ObjectId | undefined,
     formats: DiffOutputFormat[],
-    options: { statWidth?: number; follow?: string; fullDiff?: boolean },
+    options: { statWidth?: number; follow?: string; fullDiff?: boolean; abbrev?: number },
   ): Promise<{ bytes?: Uint8Array; followPath?: string }>;
   /**
    * The combined diff of a merge (`-c`, `--cc`): the paths that differ from every parent,
    * `names` as `--name-only` / `--name-status` list them (undefined for neither), `patch`
-   * the combined patch (when asked)
+   * the combined patch (when asked); `follow` the one path `--follow` limits it to
    */
   combinedDiff(
     entry: LogOutputEntry,
-    options: { dense: boolean; names?: "name-only" | "name-status"; patch: boolean },
+    options: {
+      dense: boolean;
+      names?: "name-only" | "name-status";
+      patch: boolean;
+      follow?: string;
+      /** With `follow`: the path each parent has it under (a rename or copy found) */
+      parentPaths?: string[];
+      abbrev?: number;
+    },
   ): Promise<{ paths: number; names: Uint8Array; patch: Uint8Array }>;
 }
 
@@ -325,19 +353,7 @@ function tabExpand(line: string, tabWidth: number): string {
 }
 
 /** The UTF-8 bytes of a string whose raw bytes are escaped as paths escape them */
-function bytesOf(text: string): Uint8Array {
-  const out: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    if (c >= 0xdc80 && c <= 0xdcff) out.push(c - 0xdc00);
-    else {
-      const cp = text.codePointAt(i) as number;
-      if (cp > 0xffff) i++;
-      out.push(...new TextEncoder().encode(String.fromCodePoint(cp)));
-    }
-  }
-  return Uint8Array.from(out);
-}
+const bytesOf = encodeGitPath;
 
 const hasNonAscii = (text: string) => [...text].some((c) => c.charCodeAt(0) > 0x7f);
 
@@ -421,6 +437,62 @@ function parseRaw(raw: string): ParsedCommit {
   return { headerLines, body: lines.slice(i).join("") };
 }
 
+/** utf8.c's is_encoding_utf8 */
+const isUtf8 = (name: string) => /^utf-?8$/i.test(name);
+
+/** The ISO-8859-1 names iconv knows (TextDecoder reads them as windows-1252). */
+const LATIN1 = /^(iso[-_]?8859-1|iso8859-1|latin-?1|l1|iso-ir-100|cp819|ibm819|csisolatin1)$/i;
+
+/** Bytes in a character set as text; undefined when it is unknown or the bytes are not in it */
+function decodeCharset(bytes: Uint8Array, charset: string): string | undefined {
+  if (LATIN1.test(charset)) {
+    let out = "";
+    for (const b of bytes) out += String.fromCharCode(b);
+    return out;
+  }
+  try {
+    return new TextDecoder(charset, { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * pretty.c's repo_logmsg_reencode into UTF-8 (`i18n.logOutputEncoding`, `i18n.commitEncoding`
+ * default): a commit with an `encoding` header is converted from it and the header dropped
+ * (an `encoding UTF-8` header too); one whose bytes do not convert (or names a character set
+ * this host does not know) is kept as it is, header and all, as git keeps it when iconv
+ * fails. Undefined when nothing changes.
+ */
+function reencodeCommit(raw: string, parsed: ParsedCommit): string | undefined {
+  const at = parsed.headerLines.findIndex((l) => l.startsWith("encoding "));
+  if (at < 0) return undefined;
+  const charset = (parsed.headerLines[at] as string).slice(9).replace(/\n$/, "");
+  let text = raw;
+  if (!isUtf8(charset)) {
+    const decoded = decodeCharset(encodeGitPath(raw), charset);
+    if (decoded === undefined) return undefined;
+    text = decoded;
+  }
+  // replace_encoding_header: the first `encoding ` line of the header removed
+  const lines = linesOf(text);
+  const k = lines.findIndex((l, i) => l.startsWith("encoding ") && i < parsed.headerLines.length);
+  if (k >= 0) lines.splice(k, 1);
+  return lines.join("");
+}
+
+/** An `author`/`committer` header line's ident (`Name <email> time zone`) */
+function identOf(line: string): PersonIdent | undefined {
+  const m = /^[a-z]+ (.*?) ?<([^>]*)> ?(\d*) ?([+-]?\d*)\n?$/.exec(line);
+  if (!m) return undefined;
+  return {
+    name: m[1] as string,
+    email: m[2] as string,
+    timestamp: Number(m[3] || 0),
+    tzOffset: m[4] || "+0000",
+  };
+}
+
 /** A commit's raw text synthesized from its fields (a store that keeps no raw bytes). */
 function synthesizeRaw(commit: Commit): string {
   const ident = (p: PersonIdent) => `${p.name} <${p.email}> ${p.timestamp} ${p.tzOffset}`;
@@ -477,18 +549,24 @@ function prefixLines(
 ): Uint8Array {
   if (!prefix || bytes.length === 0) return bytes;
   const p = bytesOf(prefix);
-  const out: number[] = [];
+  let lines = 0;
+  for (let at = bytes.indexOf(0x0a); at >= 0; at = bytes.indexOf(0x0a, at + 1)) lines++;
+  const out = new Uint8Array(bytes.length + (lines + 1) * p.length);
+  let size = 0;
   let at = 0;
   while (at < bytes.length) {
     let end = bytes.indexOf(0x0a, at);
     end = end < 0 ? bytes.length : end + 1;
-    const line = bytes.subarray(at, end);
-    const head = bare ? String.fromCharCode(...line.subarray(0, 19)) : "";
-    if (!bare?.(head)) for (const x of p) out.push(x);
-    for (const b of line) out.push(b);
+    const head = bare ? String.fromCharCode(...bytes.subarray(at, Math.min(end, at + 19))) : "";
+    if (!bare?.(head)) {
+      out.set(p, size);
+      size += p.length;
+    }
+    out.set(bytes.subarray(at, end), size);
+    size += end - at;
     at = end;
   }
-  return Uint8Array.from(out);
+  return out.subarray(0, size);
 }
 
 const combinedBare = (head: string) =>
@@ -502,8 +580,12 @@ export class LogPrinter {
   private readonly abbrevCommit: boolean;
   private readonly abbrevLength: number | undefined;
   private readonly formats: DiffOutputFormat[];
+  /** git's `revs->diff`: every commit's diff is run (diff formats asked for, `-c`, `--follow`) */
+  private readonly allNeedDiff: boolean;
   private readonly diffMerges: LogDiffMerges | undefined;
   private readonly mergesNeedDiff: boolean;
+  /** git's `simplify_history` turned off (`-m`, `--diff-merges=separate`) */
+  readonly fullHistory: boolean;
   private readonly showRoot: boolean;
   private readonly useMailmap: boolean;
   private readonly showNotes: boolean;
@@ -544,9 +626,10 @@ export class LogPrinter {
     this.abbrevCommit =
       options.abbrevCommit ??
       (options.oneline ? true : raw ? false : (bool(host.config("log.abbrevCommit")) ?? false));
+    // --abbrev=<n> is clamped to 4..40 (an --abbrev=0 is 4)
     if (options.noAbbrev) this.abbrevLength = 40;
     else if (options.abbrev !== undefined) {
-      this.abbrevLength = options.abbrev === 0 ? 40 : Math.min(40, Math.max(4, options.abbrev));
+      this.abbrevLength = Math.min(40, Math.max(4, Math.trunc(options.abbrev)));
     }
     // decorations: a user format decorates only when it shows them
     let decorate =
@@ -568,9 +651,18 @@ export class LogPrinter {
     if (options.stat) formats.push("stat");
     if (options.shortstat) formats.push("shortstat");
     if (options.patch) formats.push("patch");
+    // revs->diff: decided from the formats asked for before the merges' default patch
+    const userDiff = !options.noPatch && formats.length > 0;
     let diffMerges: LogDiffMerges | undefined = options.diffMerges;
     let mergesNeedDiff = diffMerges !== undefined && diffMerges !== "off";
     let implyPatch = false;
+    // diff-merges.c's set_separate turns simplify_history off, and nothing turns it back on
+    const configuredMerges = host.config("log.diffMerges");
+    const mDefault = configuredMerges ? mergesMode(configuredMerges) : "separate";
+    this.fullHistory =
+      diffMerges === "separate" ||
+      diffMerges === "first-parent" ||
+      (!!options.m && (mDefault === "separate" || mDefault === "first-parent"));
     if (options.cc) {
       diffMerges = "dense-combined";
       mergesNeedDiff = true;
@@ -580,8 +672,7 @@ export class LogPrinter {
       mergesNeedDiff = true;
       implyPatch = true;
     } else if (options.m && diffMerges === undefined) {
-      const configured = host.config("log.diffMerges");
-      diffMerges = configured ? mergesMode(configured) : "separate";
+      diffMerges = mDefault;
       mergesNeedDiff = false;
     }
     if (diffMerges === undefined && walk.firstParentOnly) diffMerges = "first-parent";
@@ -594,12 +685,12 @@ export class LogPrinter {
     this.showRoot = options.showRoot ?? bool(host.config("log.showRoot")) ?? true;
     this.useMailmap = options.mailmap ?? bool(host.config("log.mailmap")) ?? true;
     this.showNotes = options.notes ?? (!prettyGiven || /%N/.test(this.format.user ?? ""));
-    const followDefault = bool(host.config("log.follow")) ?? false;
-    this.follow =
-      (options.follow ?? followDefault) &&
-      walk.paths.length === 1 &&
-      !walk.paths[0]?.startsWith(":");
-    if (this.follow) this.followPath = walk.paths[0];
+    // --follow needs one path, without magic but `:(top)` and `:(literal)`
+    // (diff_check_follow_pathspec); log.follow is ignored otherwise
+    const followPath = followPathOf(walk.paths, options.follow === true);
+    this.follow = (options.follow ?? bool(host.config("log.follow")) ?? false) && !!followPath;
+    if (this.follow) this.followPath = followPath;
+    this.allNeedDiff = userDiff || implyPatch || this.follow;
   }
 
   /** Whether commits not shown (their diff empty) do not count (`--follow`) */
@@ -651,6 +742,7 @@ export class LogPrinter {
     return showDate(ident.timestamp, ident.tzOffset, mode, {
       ...(this.options.now !== undefined ? { now: this.options.now } : {}),
       ...(this.options.localTzOffset ? { localTzOffset: this.options.localTzOffset } : {}),
+      ...(this.options.localTzName ? { localTzName: this.options.localTzName } : {}),
     });
   }
 
@@ -698,9 +790,9 @@ export class LogPrinter {
     entry: LogOutputEntry,
     log: { pending: boolean; parent: ObjectId | undefined },
   ): Promise<boolean> {
-    const allNeedDiff = this.formats.length > 0 || this.follow;
+    const allNeedDiff = this.allNeedDiff;
     if (!allNeedDiff && !this.mergesNeedDiff) return false;
-    const parents = entry.parents;
+    const parents = this.diffParents(entry);
     const isMerge = parents.length > 1;
     if (!isMerge && !allNeedDiff) return false;
     if (parents.length === 0) {
@@ -728,6 +820,18 @@ export class LogPrinter {
     return showed;
   }
 
+  /** get_saved_parents: the parents before rewriting under `--full-diff`, else as shown */
+  private diffParents(entry: LogOutputEntry): ObjectId[] {
+    return this.options.fullDiff && entry.savedParents ? entry.savedParents : entry.parents;
+  }
+
+  /** The `--abbrev=<n>` of the diffs' `index` lines (revs->diffopt.abbrev) */
+  private diffAbbrev(): { abbrev?: number } {
+    return this.options.abbrev !== undefined && !this.options.noAbbrev && this.abbrevLength
+      ? { abbrev: this.abbrevLength }
+      : {};
+  }
+
   private formatIsEmpty(): boolean {
     return this.format.fmt === "user" && this.format.user === "";
   }
@@ -744,6 +848,7 @@ export class LogPrinter {
       ...(width ? { statWidth: 80 - width } : {}),
       ...(this.follow && this.followPath !== undefined ? { follow: this.followPath } : {}),
       ...(this.options.fullDiff ? { fullDiff: true } : {}),
+      ...this.diffAbbrev(),
     });
     if (this.follow && result.followPath !== undefined) this.followPath = result.followPath;
     if (!result.bytes) return;
@@ -774,11 +879,14 @@ export class LogPrinter {
     }
     // find_paths_generic prints the stat of the diff against the first parent as it scans
     const stats = this.formats.filter((f) => f === "numstat" || f === "stat" || f === "shortstat");
-    if (stats.length > 0 && entry.parents[0]) {
+    const follow = this.follow && this.followPath !== undefined ? this.followPath : undefined;
+    const first = this.diffParents(entry)[0];
+    if (stats.length > 0 && first) {
       const width = this.graph ? this.graph.getWidth() : 0;
-      const r = await this.host.diff(entry, entry.parents[0], stats, {
+      const r = await this.host.diff(entry, first, stats, {
         ...(width ? { statWidth: 80 - width } : {}),
         ...(this.options.fullDiff ? { fullDiff: true } : {}),
+        ...(follow !== undefined ? { follow } : {}),
       });
       if (r.bytes) this.out.bytes(prefixLines(r.bytes, this.padding()));
     }
@@ -788,11 +896,27 @@ export class LogPrinter {
         ? "name-status"
         : undefined;
     const patch = this.formats.includes("patch");
-    const result = await this.host.combinedDiff(entry, {
-      dense,
-      ...(names ? { names } : {}),
-      patch,
-    });
+    const parents = this.diffParents(entry);
+    // --follow: each parent's diff looks for the file it was renamed or copied from
+    let parentPaths: string[] | undefined;
+    if (follow !== undefined) {
+      parentPaths = [];
+      for (const p of parents) {
+        const r = await this.host.diff(entry, p, [], { follow });
+        parentPaths.push(r.followPath ?? follow);
+      }
+    }
+    const result = await this.host.combinedDiff(
+      { ...entry, parents },
+      {
+        dense,
+        ...(names ? { names } : {}),
+        patch,
+        ...(follow !== undefined ? { follow } : {}),
+        ...(parentPaths ? { parentPaths } : {}),
+        ...this.diffAbbrev(),
+      },
+    );
     if (!result.paths) return;
     // show_raw_diff writes names without the line prefix
     this.out.bytes(result.names);
@@ -871,11 +995,23 @@ export class LogPrinter {
   /** pretty.c's pretty_print_commit */
   private async prettyPrint(entry: LogOutputEntry, notes: string): Promise<string> {
     const { fmt } = this.format;
-    const raw = (await this.host.rawCommit(entry.id)) ?? synthesizeRaw(entry.commit);
-    const parsed = parseRaw(raw);
+    const stored = (await this.host.rawCommit(entry.id)) ?? synthesizeRaw(entry.commit);
+    let parsed = parseRaw(stored);
+    // the message and the idents in UTF-8 (logmsg_reencode); the idents read from the
+    // converted header then
+    const reencoded = reencodeCommit(stored, parsed);
+    if (reencoded !== undefined) parsed = parseRaw(reencoded);
+    // the idents as the (converted) header has them: bytes that are no UTF-8 kept
+    const author = parsed.headerLines.find((l) => l.startsWith("author "));
+    const committer = parsed.headerLines.find((l) => l.startsWith("committer "));
+    const idents: { author: PersonIdent; committer: PersonIdent } = {
+      author: (author && identOf(author)) || entry.commit.author,
+      committer: (committer && identOf(committer)) || entry.commit.committer,
+    };
     if (fmt === "user") {
       const commit: PrettyCommit = {
         ...entry.commit,
+        ...idents,
         parents: entry.parents,
         message: parsed.body,
       };
@@ -884,7 +1020,8 @@ export class LogPrinter {
         abbreviate: (id) => this.abbrevId(id, this.abbrevLength !== 40),
         ...(this.decorations ? { decorations: this.decorations } : {}),
         mark: this.graph ? "*" : "",
-        notes,
+        // %N stays as written unless notes are shown
+        ...(this.showNotes ? { notes } : {}),
         formatDate: (ident) => this.formatDate(ident),
         ...(mailmap && !mailmap.empty ? { mailmap: (n, e) => mailmap.map(n, e) } : {}),
         ...(this.options.now !== undefined ? { now: this.options.now } : {}),
@@ -904,9 +1041,9 @@ export class LogPrinter {
         sb += "\n";
       }
       if (fmt !== "oneline") {
-        sb = this.userInfo(sb, "Author", entry.commit.author, isMail);
+        sb = this.userInfo(sb, "Author", idents.author, isMail);
         if (fmt === "full" || fmt === "fuller") {
-          sb = this.userInfo(sb, "Commit", entry.commit.committer, false);
+          sb = this.userInfo(sb, "Commit", idents.committer, false);
         }
       }
     }
@@ -1007,6 +1144,41 @@ export class LogPrinter {
   result(): Uint8Array {
     return this.out.result();
   }
+}
+
+/** pathspec.c's magic names, as git lists them in its errors */
+const MAGIC_NAMES: [keyof { glob: 1; icase: 1; exclude: 1 }, string][] = [
+  ["glob", "'glob'"],
+  ["icase", "'icase'"],
+  ["exclude", "'exclude' (mnemonic: '!')"],
+];
+
+/**
+ * The path `--follow` follows (diff_check_follow_pathspec): exactly one element, with no
+ * magic but `:(top)` and `:(literal)`; undefined otherwise, or git's error when `--follow`
+ * was given.
+ */
+function followPathOf(paths: string[], explicit: boolean): string | undefined {
+  if (paths.length !== 1) {
+    if (explicit) {
+      throw new InvalidArgumentError("follow", paths, "--follow requires exactly one pathspec");
+    }
+    return undefined;
+  }
+  const item = parsePathspecItem(paths[0] as string, { attr: true });
+  const names = MAGIC_NAMES.filter(([key]) => item[key]).map(([, name]) => name);
+  if (item.attr) names.push("'attr'");
+  if (names.length > 0) {
+    if (explicit) {
+      throw new InvalidArgumentError(
+        "follow",
+        paths,
+        `pathspec magic not supported by --follow: ${names.join(", ")}`,
+      );
+    }
+    return undefined;
+  }
+  return item.match;
 }
 
 /** diff-merges.c's func_by_opt */
