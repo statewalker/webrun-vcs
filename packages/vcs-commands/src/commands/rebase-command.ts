@@ -2,6 +2,7 @@ import {
   type Commit,
   EMPTY_TREE_ID,
   isSymbolicRef,
+  listObjectsWithPrefix,
   type ObjectId,
   type PersonIdent,
   type RefLogOptions,
@@ -844,11 +845,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (squashOnto) await state.write(`${DIR}/squash-onto`, `${squashOnto}\n`);
 
     if (updateRefs) items = await this.addUpdateRefCommands(state, items, comment);
+    // the list's commits abbreviated once (the rearrangements below keep the same commits):
+    // for the editor, and to read the names back without a look at the store
+    const shorts = await this.shortIds(items);
     if (autosquash) {
       const rearranged = await rearrangeSquash(
         items,
         async (id) => subjectOf((await this.loadCommit(id))?.message ?? ""),
-        (name) => this.commitNamed(name),
+        (name) => this.autosquashTarget(name, shorts),
       );
       if (!rearranged) {
         await state.remove(DIR);
@@ -879,14 +883,22 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       },
       missingCheck === "error",
     );
-    const shorts = await this.shortIds(items);
     const editorText = `${formatTodo(items, { abbreviate, idOf: (id) => shorts.get(id) ?? id })}${help}`;
     await state.write(`${DIR}/git-rebase-todo`, editorText);
     await state.write(
       `${DIR}/git-rebase-todo.backup`,
       `${formatTodo(items, { abbreviate })}${help}`,
     );
-    const edited = await this.runSequenceEditor(editorText);
+    let edited: string;
+    try {
+      edited = await this.runSequenceEditor(editorText, shorts);
+    } catch (error) {
+      // complete_action's -2 (launch_sequence_editor failed): the autostash applied, the
+      // state removed, HEAD where it was
+      await state.remove(DIR);
+      await unstash();
+      return { status: RebaseStatus.FAILED, message: sequenceEditorFailure(error), output };
+    }
     await state.write(`${DIR}/git-rebase-todo`, edited);
     const strippedTodo = stripspace(edited, comment);
     if (strippedTodo === "") {
@@ -908,10 +920,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       return { status: RebaseStatus.FAILED, message: lines.join("\n"), output };
     };
-    const parsed = await this.resolveTodo(
-      parseTodo(strippedTodo, comment).items,
-      items.filter(takesCommit).map((item) => item.id),
-    );
+    const parsed = await this.resolveTodo(parseTodo(strippedTodo, comment).items, {
+      known: shorts,
+    });
     if (parsed.errors.length > 0) return fixTodo([...parsed.errors, ...EDIT_TODO_ADVICE]);
     const missing = await this.missingCommits(items, parsed.items, missingCheck);
     if (missing.length > 0) {
@@ -926,18 +937,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     let todo = parsed.items.map(({ line: _, ...item }) => item as TodoItem);
 
     // git's skip_unnecessary_picks (allow_ff): the first picks whose parent is where the
-    // rebase starts are done already, HEAD starts at the last of them
+    // rebase starts are done already, HEAD starts at the last of them; the noops and drops
+    // among and before them go to `done` with them
     let start = onto;
     let skippedPicks = 0;
     if (!forced) {
-      for (let k = 0; k < todo.length; k++) {
-        const item = todo[k] as TodoItem;
+      for (; skippedPicks < todo.length; skippedPicks++) {
+        const item = todo[skippedPicks] as TodoItem;
         if (isNoop(item)) continue;
         if (item.action !== RebaseAction.PICK) break;
         const parents = (await this.loadCommit(item.id))?.parents ?? [];
         if (parents.length !== 1 || parents[0] !== start) break;
         start = item.id;
-        skippedPicks = k + 1;
       }
     }
     await state.write(`${DIR}/done`, formatTodo(todo.slice(0, skippedPicks)));
@@ -998,11 +1009,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     let todo = loaded.items;
     // pick_commits: what a stop left
     await state.remove(`${DIR}/message`, `${DIR}/stopped-sha`, `${DIR}/amend`, `${DIR}/patch`);
-    // git's read_populate_todo: the commands done so far and the total (`end`)
+    // the commands done so far (`end`, the total, was written as the list was read)
     let doneCount = countCommands((await state.read(`${DIR}/done`)) ?? "");
-    if (countTodoCommands(todo) > 0) {
-      await state.write(`${DIR}/end`, `${doneCount + countTodoCommands(todo)}\n`);
-    }
     while (todo.length > 0) {
       const item = todo[0] as TodoItem;
       const rest = todo.slice(1);
@@ -1061,6 +1069,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
             };
           }
           todo = reread.items;
+          await this.writeTotal(state, todo);
         }
       }
     }
@@ -1184,8 +1193,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         ].join("\n"),
       };
     }
-    // a reword already fast-forwarded amends
+    // a reword already fast-forwarded, or about to make a root commit (HEAD on git's
+    // squash_onto), amends
     const head = await this.resolveHead();
+    const squashOnto = (await state.read(`${DIR}/squash-onto`))?.trim();
+    const toAmend =
+      item.action === RebaseAction.REWORD &&
+      (head === item.id || (squashOnto !== undefined && head === squashOnto));
     return {
       status: RebaseStatus.STOPPED,
       currentCommit: item.id,
@@ -1194,7 +1208,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         ...outcome.lines,
         ...(await this.errorWithPatch(state, item.id, rest, {
           exitCode: 1,
-          toAmend: item.action === RebaseAction.REWORD && head === item.id,
+          toAmend,
           ...(outcome.message !== undefined ? { message: outcome.message } : {}),
         })),
       ].join("\n"),
@@ -1279,7 +1293,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       await this.writeAuthorScript(state, commit.author);
       const refused = await this.fastForward(state, worktree, headId, item.id);
       if (refused) return { kind: "reschedule", result: refused };
-      if (item.action === RebaseAction.REWORD) await this.rewordHead(state);
+      if (item.action === RebaseAction.REWORD) {
+        try {
+          await this.rewordHead(state);
+        } catch (error) {
+          // fast_forward_edit's git commit failed: a stop with HEAD to amend
+          return editorFailure(error);
+        }
+      }
       return { kind: "ok" };
     }
     // the trees read once: a pick's result is the next one's HEAD, a commit the next one's
@@ -1387,18 +1408,48 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         await state.removeRef("AUTO_MERGE");
         await state.remove("MERGE_MSG");
         output.push(`dropping ${item.id} ${subject} -- patch contents already upstream`);
+        // do_pick_commit: a dropped final fixup still ends the chain (its files removed)
+        if (finalFixup) await this.endFixupChain(state);
         return { kind: "dropped" };
       }
     }
     if (fixup) {
       // try_to_commit with AMEND_MSG: HEAD's parents and author, the chain's message
       // verbatim; the last of a chain with a squash is edited (git commit -e)
+      const head = await this.commits.load(headId);
+      if (!head) throw new NoHeadError("HEAD cannot be resolved");
+      // without ALLOW_EMPTY an amend whose tree is that of HEAD's first parent (the empty
+      // tree for a root) is left to git commit, which refuses it: the chain stops
+      // (error_failed_squash), HEAD to amend
+      if (!allowEmpty && head.parents.length <= 1) {
+        const parentTree = head.parents[0]
+          ? await this.commits.getTree(head.parents[0])
+          : EMPTY_TREE_ID;
+        if (parentTree === treeId) {
+          // do_commit: REBASE_HEAD written before git commit runs
+          await state.setRef("REBASE_HEAD", item.id);
+          return {
+            kind: "conflicts",
+            conflicts: [],
+            lines: [
+              "You asked to amend the most recent commit, but doing so would make",
+              "it empty. You can repeat your command with --allow-empty, or you can",
+              'remove the commit entirely with "git reset HEAD^".',
+            ],
+          };
+        }
+      }
       let message: string;
       if (messageFile === "edit") {
         // do_commit hands it to git commit: REBASE_HEAD first, git commit drops AUTO_MERGE
+        // once it has committed (an editor that fails stops the chain as a conflict does)
         await state.setRef("REBASE_HEAD", item.id);
+        try {
+          message = this.editMessage((await state.read("SQUASH_MSG")) ?? "");
+        } catch (error) {
+          return editorFailure(error);
+        }
         await state.removeRef("AUTO_MERGE");
-        message = this.editMessage((await state.read("SQUASH_MSG")) ?? "");
       } else {
         message =
           (await state.read(
@@ -1407,7 +1458,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         if (signoff) message = stripspace(message);
       }
       await this.amendHead(state, treeId, message, item.action);
-      await state.remove("MERGE_MSG", "SQUASH_MSG");
+      // try_to_commit removes MERGE_MSG; git commit (the edited end of a chain) SQUASH_MSG too
+      await state.remove("MERGE_MSG");
+      if (messageFile === "edit") await state.remove("SQUASH_MSG");
     } else {
       if (treeId === headTreeId && !allowEmpty) {
         // try_to_commit refuses the empty commit; git commit says why
@@ -1438,12 +1491,22 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       );
       // do_commit: the commit made, MERGE_MSG removed
       await state.remove("MERGE_MSG");
-      if (item.action === RebaseAction.REWORD) await this.rewordHead(state);
+      if (item.action === RebaseAction.REWORD) {
+        try {
+          await this.rewordHead(state);
+        } catch (error) {
+          // git commit --amend -e failed (the editor): the pick stays, the rebase stops
+          return { ...editorFailure(error), message: pickedMessage };
+        }
+      }
     }
-    if (finalFixup) {
-      await state.remove(`${DIR}/message-fixup`, `${DIR}/message-squash`, `${DIR}/current-fixups`);
-    }
+    if (finalFixup) await this.endFixupChain(state);
     return { kind: "ok" };
+  }
+
+  /** do_pick_commit after a final fixup: the chain's files removed. */
+  private async endFixupChain(state: OperationState): Promise<void> {
+    await state.remove(`${DIR}/message-fixup`, `${DIR}/message-squash`, `${DIR}/current-fixups`);
   }
 
   /** The commit message editor: the interactive handler, else the text as it is. */
@@ -1535,6 +1598,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const fixupOff = buf.length;
       buf += body.slice(commented);
       if (fixupFlag && !seenSquash) {
+        // the message replaced: --signoff's trailer appended (append_squash_message)
+        if (await state.exists(`${DIR}/signoff`)) {
+          buf = appendSignoff(buf, this.signoffLine(), trailerConfigOf(this.workingCopy));
+        }
         if (
           item.replaceMessage &&
           ((await state.exists(`${DIR}/message-fixup`)) ||
@@ -2299,6 +2366,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     );
   }
 
+  /** read_populate_todo's todo_list_write_total_nr: `end`, the commands done and to do. */
+  private async writeTotal(state: OperationState, todo: TodoItem[]): Promise<void> {
+    const done = countCommands((await state.read(`${DIR}/done`)) ?? "");
+    await state.write(`${DIR}/end`, `${done + countTodoCommands(todo)}\n`);
+  }
+
   /** `git rebase --continue`: what is staged committed (commit_staged_changes), the rest picked. */
   private async continueRebase(
     state: OperationState,
@@ -2312,6 +2385,23 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         conflicts: unmerged,
         message: UNMERGED_FILES_MESSAGE("Committing"),
       };
+    }
+    // builtin/rebase.c: unstaged changes refused before the sequencer reads anything
+    if (worktree) {
+      const unclean = await this.uncleanWorktree(
+        await this.resolveHead(),
+        worktree,
+        "rebase",
+        false,
+        true,
+      );
+      if (unclean) {
+        return {
+          status: RebaseStatus.FAILED,
+          message:
+            "You must edit all merge conflicts and then\nmark them as resolved using git add",
+        };
+      }
     }
     return this.resume(state, worktree);
   }
@@ -2331,6 +2421,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         ),
       };
     }
+    // read_populate_todo writes the total before anything may refuse to go on
+    await this.writeTotal(state, loaded.items);
     if (await state.exists(`${DIR}/dropped`)) {
       // todo_list_check_against_backup: commits still dropped by mistake
       const backup = await this.resolveTodo(
@@ -2347,7 +2439,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       output.push(...missing);
       await state.remove(`${DIR}/dropped`);
     }
-    const refusal = await this.commitStagedChanges(state, worktree, loaded.items);
+    const refusal = await this.commitStagedChanges(state, loaded.items);
     if (refusal) return { ...refusal, output };
     // sequencer_continue: the stopped commit maps to HEAD, committed or not
     const stopped = (await state.read(`${DIR}/stopped-sha`))?.trim();
@@ -2364,20 +2456,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    */
   private async commitStagedChanges(
     state: OperationState,
-    worktree: Worktree | undefined,
     todo: TodoItem[],
   ): Promise<RebaseResult | undefined> {
+    // (its has_unstaged_changes refusal cannot happen: `--continue` refused them before the
+    // list was read, `--skip` reset them)
     const headId = await this.resolveHead();
     const headCommit = await this.commits.load(headId);
-    if (worktree) {
-      const unclean = await this.uncleanWorktree(headId, worktree, "rebase", false, true);
-      if (unclean) {
-        return {
-          status: RebaseStatus.FAILED,
-          message: "error: cannot rebase: You have unstaged changes.",
-        };
-      }
-    }
     const treeId = await this.staging.writeTree(this.trees);
     const isClean = headCommit?.tree === treeId;
     if (!isClean && !(await state.exists(`${DIR}/message`))) {
@@ -2442,13 +2526,23 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // (git commit -e: comments stripped) or cleaned up (--cleanup=strip)
     const comment = commentPrefixOf(this.workingCopy);
     let message: string;
-    if (finalFixup) {
-      const own = headCommit?.message ?? "";
-      message = edit ? this.editMessage(own) : cleanupMessage(own, comment);
-    } else {
-      message = this.editMessage(
-        (await state.read(`${DIR}/message`)) ?? (await state.read("MERGE_MSG")) ?? "",
-      );
+    try {
+      if (finalFixup) {
+        const own = headCommit?.message ?? "";
+        message = edit ? this.editMessage(own) : cleanupMessage(own, comment);
+      } else {
+        message = this.editMessage(
+          (await state.read(`${DIR}/message`)) ?? (await state.read("MERGE_MSG")) ?? "",
+        );
+      }
+    } catch (error) {
+      // git commit failed on its editor: nothing committed, the stop stays as it is
+      return {
+        status: RebaseStatus.FAILED,
+        message: [...editorFailure(error).lines, "error: could not commit staged changes."].join(
+          "\n",
+        ),
+      };
     }
     if (amend) await this.amendHead(state, treeId, message, "continue");
     else {
@@ -2462,7 +2556,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         parseAuthorScript((await state.read(`${DIR}/author-script`)) ?? "") ?? this.resolveAuthor();
       await this.commitOnto(state, [headId, ...mergeHeads], treeId, author, message, "continue");
     }
-    await state.remove(`${DIR}/amend`, "MERGE_HEAD", "MERGE_MODE", "MERGE_MSG");
+    // git commit's cleanup (SQUASH_MSG of a final squash too), then commit_staged_changes'
+    await state.remove(`${DIR}/amend`, "MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG");
     await state.removeRef("AUTO_MERGE", "CHERRY_PICK_HEAD");
     if (finalFixup) await state.remove(`${DIR}/message-fixup`, `${DIR}/message-squash`);
     if (fixupCount > 0) await state.remove(`${DIR}/current-fixups`);
@@ -2660,36 +2755,45 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
 
   /** `git-rebase-todo` read and its names resolved (read_populate_todo). */
   private async loadTodo(state: OperationState): Promise<{ items: TodoItem[]; errors: string[] }> {
+    const fixupOkay = await state.exists(`${DIR}/done`);
     const parsed = parseTodo(
       (await state.read(`${DIR}/git-rebase-todo`)) ?? "",
       commentPrefixOf(this.workingCopy),
-      await state.exists(`${DIR}/done`),
+      fixupOkay,
     );
-    return this.resolveTodo(parsed.items);
+    return this.resolveTodo(parsed.items, { fixupOkay });
   }
 
   /**
    * The commit names of parsed todo items resolved (git's repo_get_oid in parse_insn_line),
    * the lines git refuses made invalid: names that resolve to no commit, merges where a pick
-   * cannot take one. The errors in line order.
+   * cannot take one; then todo_list_parse_insn_buffer's check of a fixup with no commit
+   * before it (a line that failed is none). The errors in line order.
    */
   private async resolveTodo(
     items: TodoItem[],
-    /** The commits the list was made of: an abbreviation of one of them is taken as it */
-    known: ObjectId[] = [],
+    options: {
+      /**
+       * The abbreviations of the commits the list was made of (as written for the editor): a
+       * name that starts with one of them is that commit, without a look at the store
+       */
+      known?: Map<ObjectId, string>;
+      /** `rebase-merge/done` exists: a fixup or squash may start the list */
+      fixupOkay?: boolean;
+    } = {},
   ): Promise<{ items: TodoItem[]; errors: string[] }> {
     const errors: string[] = [];
-    // the abbreviations git wrote are unique: matched against the list's own commits first,
-    // without a pass over the object store
-    const byPrefix = (name: string): ObjectId | undefined => {
-      if (!/^[0-9a-f]{4,64}$/.test(name)) return undefined;
-      const matches = known.filter((id) => id.startsWith(name));
-      return matches.length === 1 ? matches[0] : undefined;
-    };
+    const resolved = await this.resolveCommitNames(
+      items.filter(takesCommit).map((item) => item.id),
+      options.known,
+    );
+    let fixupOkay = options.fixupOkay ?? false;
     for (const [k, item] of items.entries()) {
+      // parseTodo's check of a fixup made again below, once the names are resolved
+      if (!item.invalid) delete item.errors;
       if (takesCommit(item)) {
         const name = item.id;
-        const id = byPrefix(name) ?? (await this.commitNamed(name));
+        const id = resolved.get(name);
         const fail = (lines: string[]) => {
           item.errors = [...lines, `error: invalid line ${k + 1}: ${item.line ?? ""}`];
           item.invalid = true;
@@ -2704,9 +2808,85 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           if (parents.length > 1 && isPickLike(item.action)) fail(mergeCommitErrors(item.action));
         }
       }
+      if (fixupOkay) {
+        // nothing to check
+      } else if (isFixup(item.action) && !item.invalid) {
+        item.errors = [`error: cannot '${item.action}' without a previous commit`];
+      } else if (!isNoop(item)) fixupOkay = true;
       if (item.errors) errors.push(...item.errors);
     }
     return { items, errors };
+  }
+
+  /**
+   * Commit names resolved at once (see {@link commitNamed}): an abbreviation as long as one
+   * of `known` that starts the same is that commit (unique in the store, as it was written);
+   * the other abbreviations looked up in the store together (one listing of its ids where it
+   * cannot list by prefix), a prefix of several objects refused as git's get_short_oid
+   * refuses it (unless core.disambiguate tells them apart); refs for the rest.
+   */
+  private async resolveCommitNames(
+    names: string[],
+    known?: Map<ObjectId, string>,
+  ): Promise<Map<string, ObjectId | undefined>> {
+    const out = new Map<string, ObjectId | undefined>();
+    const pending: string[] = [];
+    for (const name of new Set(names)) {
+      if (!/^[0-9a-f]{4,39}$/i.test(name)) {
+        out.set(name, await this.commitNamed(name));
+        continue;
+      }
+      const fast = known ? knownPrefix(name.toLowerCase(), known) : undefined;
+      if (fast) out.set(name, fast);
+      else pending.push(name);
+    }
+    if (pending.length === 0) return out;
+    const candidates = await this.objectsWithPrefixes(pending.map((name) => name.toLowerCase()));
+    for (const name of pending) {
+      const found = candidates?.get(name.toLowerCase());
+      if (!found) out.set(name, await this.commitNamed(name));
+      else if (found.length === 0) out.set(name, await this.refNamed(name));
+      else if (found.length === 1) out.set(name, await this.commitOf(found[0] as ObjectId));
+      else {
+        // ambiguous: only core.disambiguate can pick one (the revision resolver applies it)
+        const id = await this.resolveRevision(name).catch(() => undefined);
+        out.set(name, id ? await this.commitOf(id) : undefined);
+      }
+    }
+    return out;
+  }
+
+  /** The commit an object is (a tag peeled, as lookup_commit_reference), else undefined. */
+  private async commitOf(id: ObjectId): Promise<ObjectId | undefined> {
+    const peeled = await this.peelToCommit(id);
+    return (await this.commits.has(peeled).catch(() => false)) ? peeled : undefined;
+  }
+
+  /**
+   * The stored ids starting with each lowercase prefix: by prefix where the store can list
+   * so, else one listing of every id for all of them; undefined without an object store.
+   */
+  private async objectsWithPrefixes(
+    prefixes: string[],
+  ): Promise<Map<string, ObjectId[]> | undefined> {
+    const objects = this.workingCopy.history?.objects;
+    if (!objects) return undefined;
+    const found = new Map(prefixes.map((prefix) => [prefix, new Set<ObjectId>()]));
+    try {
+      if (objects.listPrefix) {
+        for (const [prefix, ids] of found) {
+          for await (const id of listObjectsWithPrefix(objects, prefix)) ids.add(id);
+        }
+      } else {
+        const lengths = [...new Set(prefixes.map((prefix) => prefix.length))];
+        for await (const id of objects.list()) {
+          for (const length of lengths) found.get(id.slice(0, length))?.add(id);
+        }
+      }
+    } catch {
+      return undefined;
+    }
+    return new Map([...found].map(([prefix, ids]) => [prefix, [...ids]]));
   }
 
   /** A commit by name: an id (abbreviated), a ref, a branch, a tag; undefined if none. */
@@ -2725,6 +2905,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         // not an abbreviation of one commit: maybe a ref
       }
     }
+    return this.refNamed(name);
+  }
+
+  /** A commit by ref name (as given, under refs/, a tag, a branch); undefined if none. */
+  private async refNamed(name: string): Promise<ObjectId | undefined> {
     for (const candidate of [name, `refs/${name}`, `refs/tags/${name}`, `refs/heads/${name}`]) {
       const ref = await this.refsStore.resolve(candidate).catch(() => undefined);
       if (ref?.objectId) {
@@ -2733,6 +2918,27 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
     }
     return undefined;
+  }
+
+  /**
+   * An `--autosquash` target that is one word (todo_list_rearrange_squash's
+   * lookup_commit_reference_by_name, whose commit counts only when it is in the list): the
+   * list's own commits matched by id first; a hex word no commit of the list starts with can
+   * only name one of them as a ref.
+   */
+  private async autosquashTarget(
+    name: string,
+    known: Map<ObjectId, string>,
+  ): Promise<ObjectId | undefined> {
+    if (!/^[0-9a-f]{4,64}$/i.test(name)) return this.commitNamed(name);
+    const lower = name.toLowerCase();
+    if (lower.length >= 40) return known.has(lower) ? lower : this.refNamed(name);
+    const fast = knownPrefix(lower, known);
+    if (fast) return fast;
+    for (const id of known.keys()) {
+      if (id.startsWith(lower)) return (await this.resolveCommitNames([name])).get(name);
+    }
+    return this.refNamed(name);
   }
 
   /** is_original_commit_empty: the commit changes nothing against its parent (or none). */
@@ -2790,22 +2996,22 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     ];
   }
 
-  /** The abbreviated ids of the list's commits (TODO_LIST_SHORTEN_IDS). */
+  /** The abbreviated ids of the list's commits (TODO_LIST_SHORTEN_IDS), in one batch. */
   private async shortIds(items: TodoItem[]): Promise<Map<ObjectId, string>> {
-    const out = new Map<ObjectId, string>();
-    for (const item of items) {
-      if (takesCommit(item) && !out.has(item.id)) {
-        out.set(item.id, await this.abbreviateObjectId(item.id));
-      }
-    }
-    return out;
+    const ids = [...new Set(items.filter(takesCommit).map((item) => item.id))];
+    const lengths = await this.idAbbreviator().lengths(ids);
+    return new Map(ids.map((id) => [id, id.slice(0, lengths.get(id) ?? 7)]));
   }
 
   /**
    * launch_sequence_editor: the interactive handler edits the list (editTodo, then the
    * steps of prepareSteps); without one the list is kept.
    */
-  private async runSequenceEditor(text: string): Promise<string> {
+  private async runSequenceEditor(
+    text: string,
+    /** The abbreviations the list was written with (see {@link resolveCommitNames}) */
+    known?: Map<ObjectId, string>,
+  ): Promise<string> {
     const handler = this.interactiveHandler;
     let out = text;
     if (handler?.editTodo) out = await handler.editTodo(out);
@@ -2814,10 +3020,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const items = parseTodo(stripspace(out, comment), comment).items.filter(
         (item) => item.action !== RebaseAction.COMMENT,
       );
+      const ids = await this.resolveCommitNames(
+        items.filter(takesCommit).map((item) => item.id),
+        known,
+      );
       const steps: RebaseTodoLine[] = [];
       for (const item of items) {
         if (takesCommit(item)) {
-          const id = await this.commitNamed(item.id);
+          const id = ids.get(item.id);
           steps.push({
             action: item.action,
             commit: item.id,
@@ -2868,7 +3078,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const output: string[] = [];
     const current = stripspace((await state.read(`${DIR}/git-rebase-todo`)) ?? "", comment);
     const fixupOkay = await state.exists(`${DIR}/done`);
-    const old = await this.resolveTodo(parseTodo(current, comment, fixupOkay).items);
+    const old = await this.resolveTodo(parseTodo(current, comment, fixupOkay).items, {
+      fixupOkay,
+    });
     const incorrect = old.errors.length > 0 || (await state.exists(`${DIR}/dropped`));
     const level = this.missingCommitsCheckLevel(output);
     const help = todoHelp(countTodoCommands(old.items), comment, undefined, level === "error");
@@ -2881,10 +3093,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         `${formatTodo(old.items, { abbreviate })}${help}`,
       );
     }
-    const edited = await this.runSequenceEditor(text);
+    let edited: string;
+    try {
+      edited = await this.runSequenceEditor(text, shorts);
+    } catch (error) {
+      // edit_todo_list's -2: the list stays as written for the editor
+      return { status: RebaseStatus.FAILED, message: sequenceEditorFailure(error), output };
+    }
     await state.write(`${DIR}/git-rebase-todo`, edited);
+    // the names read back against the list as it was before the edit
     const parsed = await this.resolveTodo(
       parseTodo(stripspace(edited, comment), comment, fixupOkay).items,
+      { known: shorts, fixupOkay },
     );
     if (parsed.errors.length > 0) {
       return {
@@ -2907,7 +3127,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       return { status: RebaseStatus.FAILED, message: missing.join("\n"), output };
     }
     output.push(...missing);
-    if (incorrect) await state.remove(`${DIR}/dropped`);
+    // edit_todo_list unlinks it only when `incorrect` is positive: the list read before the
+    // edit parsed (todo_list_parse_insn_buffer's -1 or'ed with the file's 1 stays negative)
+    if (incorrect && old.errors.length === 0) await state.remove(`${DIR}/dropped`);
     await this.filterUpdateRefs(state, parsed.items);
     await state.write(
       `${DIR}/git-rebase-todo`,
@@ -3440,4 +3662,34 @@ function mergeCommitErrors(action: RebaseAction): string[] {
     default:
       return ["error: cannot squash merge commit into another commit"];
   }
+}
+
+/**
+ * A message editor (the interactive handler's modifyCommitMessage) that threw, as git commit
+ * failing on its editor: the pick counts as conflicted (do_pick_commit's `res = !!res`).
+ */
+function editorFailure(error: unknown): Extract<PickOutcome, { kind: "conflicts" }> {
+  const reason = error instanceof Error ? error.message : String(error);
+  return {
+    kind: "conflicts",
+    conflicts: [],
+    lines: [`error: There was a problem with the editor: ${reason}`],
+  };
+}
+
+/** launch_sequence_editor failing (the interactive handler's editTodo or prepareSteps threw). */
+function sequenceEditorFailure(error: unknown): string {
+  const reason = error instanceof Error ? error.message : String(error);
+  return `error: There was a problem with the editor: ${reason}`;
+}
+
+/**
+ * The commit of `known` whose abbreviation `prefix` extends (at least as long as it, so no
+ * other stored object starts with it), else undefined.
+ */
+function knownPrefix(prefix: string, known: Map<ObjectId, string>): ObjectId | undefined {
+  for (const [id, short] of known) {
+    if (prefix.length >= short.length && id.startsWith(prefix)) return id;
+  }
+  return undefined;
 }

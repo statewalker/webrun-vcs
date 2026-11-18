@@ -24,7 +24,7 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { Git, MergeStatus, RebaseStatus } from "../src/index.js";
+import { Git, MergeStatus, RebaseOperation, RebaseStatus } from "../src/index.js";
 import { git, INTEROP_IDENT } from "./merge-native-helpers.js";
 import { buildHistory, type Files, type History } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
@@ -219,5 +219,51 @@ describeGit("the merge family reads only what it changes", () => {
     // the racily clean ones; the picks read only the paths they write
     expect(reads.worktree).toBeLessThan(DIRS * FILES_PER_DIR + 100);
     expect(elapsed).toBeLessThan(60_000);
+  }, 180_000);
+
+  it("an interactive rebase reads the list's abbreviations back without listing the store", async () => {
+    const sideMore: Files[] = [];
+    for (let i = 1; i < 10; i++) sideMore.push(edited(i * 3, 4, `side ${i}`));
+    const { ours } = twins({
+      base: baseFiles(),
+      side: edited(0, 4, "side 0"),
+      sideMore,
+      main: { ...edited(1, 7, "main"), ...edited(2, 7, "main") },
+    });
+    git(root, ours, "checkout", "-q", "side");
+
+    // the sequence editor stops after the first pick; prepareSteps names each step's commit
+    const reads: Reads = { worktree: 0, objects: 0, other: 0 };
+    let steps = 0;
+    const begin = (await openCounted(ours, reads)).rebase().setCommitter(COMMITTER);
+    begin.runInteractively({
+      editTodo: (todo) => todo.replace(/^(pick .*)$/m, "$1\nbreak"),
+      prepareSteps: (list) => {
+        steps = list.length;
+      },
+    });
+    await begin.setUpstreamBranch("main");
+    const started = await begin.call();
+    expect(started.status, started.message).toBe(RebaseStatus.STOPPED);
+    expect(steps).toBe(11);
+    // the picks and the list's commits; never a header of every object per name
+    expect(reads.objects).toBeLessThan(6 * DIRS);
+
+    // --edit-todo: the list as abbreviated for the editor read back
+    reads.objects = 0;
+    const edit = (await openCounted(ours, reads))
+      .rebase()
+      .setCommitter(COMMITTER)
+      .setOperation(RebaseOperation.EDIT_TODO);
+    edit.runInteractively({ editTodo: (todo) => todo });
+    const editResult = await edit.call();
+    expect(editResult.status, editResult.message).toBe(RebaseStatus.OK);
+    expect(reads.objects).toBeLessThan(2 * DIRS);
+
+    const resume = (await openCounted(ours, reads))
+      .rebase()
+      .setCommitter(COMMITTER)
+      .setOperation(RebaseOperation.CONTINUE);
+    expect((await resume.call()).status).toBe(RebaseStatus.OK);
   }, 180_000);
 });

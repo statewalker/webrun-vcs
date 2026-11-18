@@ -10,7 +10,15 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  appendFileSync,
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -86,7 +94,7 @@ interface NativeRun {
 function nativeGit(
   dir: string,
   args: string[],
-  options: { todo?: string; message?: string } = {},
+  options: { todo?: string; message?: string; env?: Record<string, string> } = {},
 ): NativeRun {
   const seen = join(root, `seen-${counter++}`);
   const env: Record<string, string> = {
@@ -105,6 +113,7 @@ function nativeGit(
     writeFileSync(file, options.message);
     env.NEW_MSG = file;
   }
+  Object.assign(env, options.env);
   const r = spawnSync("git", args, { cwd: dir, env, encoding: "utf8" });
   let seenText = "";
   try {
@@ -742,5 +751,290 @@ describeGit("interactive rebase, native twins", () => {
       readFileSync(join(root, "x-native"), "utf8"),
     );
     expectSame(native, mine, "done");
+  });
+
+  it("--autosquash: a fixup or squash that becomes empty and is dropped still ends its chain", async () => {
+    // a dropped squash leaves SQUASH_MSG, which the next chain's fixup (try_to_commit) keeps
+    for (const [kind, interactive] of [
+      ["fixup", true],
+      ["fixup", false],
+      ["squash", true],
+      ["squash", false],
+    ] as const) {
+      const steps: GraphStep[] = [
+        { branch: "topic", from: "main", files: { "b.txt": "1\n" }, message: "A" },
+        { branch: "topic", files: { "m.txt": "m\n" }, message: `${kind}! A` },
+        { branch: "topic", files: { "c.txt": "1\n" }, message: "B" },
+        { branch: "topic", files: { "c.txt": "2\n" }, message: "fixup! B" },
+        { branch: "main", files: { "m.txt": "m\n", "n.txt": "n\n" }, message: "main moved" },
+      ];
+      // git 2.43 autosquashes an interactive rebase only
+      if (!interactive && !modern()) continue;
+      const { native, ours: mine } = twins(steps);
+      const run = nativeGit(native, [
+        "rebase",
+        ...(interactive ? ["-i", "--empty=drop"] : []),
+        "--autosquash",
+        "main",
+      ]);
+      expect(run.status, run.stderr).toBe(0);
+      const { result } = await ours(mine, RebaseOperation.BEGIN, {
+        interactive,
+        configure: (c) => {
+          c.setAutosquash(true);
+          if (interactive) c.setEmpty("drop");
+        },
+      });
+      expect(result.status, result.message).toBe(RebaseStatus.OK);
+      expectSame(native, mine, `${kind}, interactive ${interactive}`);
+    }
+  });
+
+  it("--root: a reword onto the new root that conflicts amends it on --continue", async () => {
+    const { native, ours: mine } = twins(linear);
+    const todo = `reword ${short(native, "topic")}\npick ${short(native, "topic~3")}\npick ${short(native, "topic~1")}\n`;
+    const message = "three, the new root\n";
+    const run = nativeGit(native, ["rebase", "-i", "--root"], { todo, message });
+    expect(run.status).toBe(1);
+    const command = (await openOurs(mine, INTEROP_AUTHOR_ENV)).rebase().setCommitter(INTEROP_IDENT);
+    const result = await command
+      .runInteractively({ editTodo: () => todo, modifyCommitMessage: () => message })
+      .setRoot(true)
+      .call();
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expectMessage(result, run);
+    expectSame(native, mine, "stopped");
+    for (const dir of [native, mine]) {
+      put(dir, "b.txt", "resolved\n");
+      gitOk(root, dir, "add", "b.txt");
+    }
+    expect(nativeGit(native, ["rebase", "--continue"], { message }).status).toBe(0);
+    const continued = await ours(mine, RebaseOperation.CONTINUE, { message });
+    expect(continued.result.status, continued.result.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
+  });
+
+  /** topic: b added, changed, changed back; main moved on. */
+  const addChangeRevert: GraphStep[] = [
+    { branch: "topic", from: "main", files: { "b.txt": "1\n" }, message: "add" },
+    { branch: "topic", files: { "b.txt": "2\n" }, message: "change" },
+    { branch: "topic", files: { "b.txt": "1\n" }, message: "revert" },
+    { branch: "main", files: { "m.txt": "m\n" }, message: "main moved" },
+  ];
+
+  for (const last of ["squash", "fixup"]) {
+    it(`a ${last} whose amend would be empty stops as git commit refuses it`, async () => {
+      const { native, ours: mine } = twins(addChangeRevert);
+      const todo = `pick ${short(native, "topic~2")}\npick ${short(native, "topic~1")}\n${last} ${short(native, "topic")}\n`;
+      const run = nativeGit(native, ["rebase", "-i", "--empty=keep", "main"], { todo });
+      expect(run.status).toBe(1);
+      const { result } = await ours(mine, RebaseOperation.BEGIN, {
+        todo,
+        configure: (c) => c.setEmpty("keep"),
+      });
+      expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+      expectMessage(result, run);
+      expectSame(native, mine, "stopped");
+      expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+      const continued = await ours(mine, RebaseOperation.CONTINUE);
+      expect(continued.result.status, continued.result.message).toBe(RebaseStatus.OK);
+      expectSame(native, mine, "continued");
+    });
+  }
+
+  it("a final squash that conflicts: --continue commits it and removes SQUASH_MSG", async () => {
+    const steps: GraphStep[] = [
+      { branch: "topic", from: "main", files: { "b.txt": "1\n" }, message: "one" },
+      { branch: "topic", files: { "c.txt": "2\n" }, message: "two" },
+      { branch: "topic", files: { "a.txt": "topic\n" }, message: "three" },
+      { branch: "main", files: { "a.txt": "main\n" }, message: "main moved" },
+    ];
+    const { native, ours: mine } = twins(steps);
+    const todo = `pick ${short(native, "topic~2")}\nsquash ${short(native, "topic~1")}\nsquash ${short(native, "topic")}\n`;
+    expect(nativeGit(native, ["rebase", "-i", "main"], { todo }).status).toBe(1);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, { todo });
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expectSame(native, mine, "stopped");
+    for (const dir of [native, mine]) {
+      put(dir, "a.txt", "resolved\n");
+      gitOk(root, dir, "add", "a.txt");
+    }
+    expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+    const continued = await ours(mine, RebaseOperation.CONTINUE);
+    expect(continued.result.status, continued.result.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
+  });
+
+  for (const flag of ["-C", "-c"]) {
+    it(`--signoff with fixup ${flag}: the message that replaces the first signed off`, async () => {
+      const { native, ours: mine } = twins(linear);
+      const todo = `pick ${short(native, "topic~2")}\nfixup ${flag} ${short(native, "topic~1")}\npick ${short(native, "topic")}\n`;
+      const run = nativeGit(native, ["rebase", "-i", "--signoff", "main"], { todo });
+      expect(run.status, run.stderr).toBe(0);
+      const { result } = await ours(mine, RebaseOperation.BEGIN, {
+        todo,
+        configure: (c) => c.setSignoff(true),
+      });
+      expect(result.status, result.message).toBe(RebaseStatus.OK);
+      expectSame(native, mine, "done");
+    });
+  }
+
+  it("a sequence editor that fails: the state removed, the autostash applied", async () => {
+    const { native, ours: mine } = twins(linear);
+    for (const dir of [native, mine]) put(dir, "a.txt", "dirty\n");
+    const run = nativeGit(native, ["rebase", "-i", "--autostash", "main"], {
+      env: { GIT_SEQUENCE_EDITOR: "false" },
+    });
+    expect(run.status).not.toBe(0);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, {
+      configure: (c) =>
+        c.setAutoStash(true).runInteractively({
+          editTodo: () => {
+            throw new Error("the editor failed");
+          },
+        }),
+    });
+    expect(result.status).toBe(RebaseStatus.FAILED);
+    expectSame(native, mine, "failed");
+  });
+
+  for (const [label, command] of [
+    ["a reword", "reword"],
+    ["the end of a squash chain", "squash"],
+  ] as const) {
+    it(`a message editor that fails at ${label}: the stop git commit's failure leaves`, async () => {
+      const { native, ours: mine } = twins(linear);
+      const todo = `pick ${short(native, "topic~2")}\n${command} ${short(native, "topic~1")}\npick ${short(native, "topic")}\n`;
+      const run = nativeGit(native, ["rebase", "-i", "main"], {
+        todo,
+        env: { GIT_EDITOR: "false" },
+      });
+      expect(run.status).toBe(1);
+      const { result } = await ours(mine, RebaseOperation.BEGIN, {
+        configure: (c) =>
+          c.runInteractively({
+            editTodo: () => todo,
+            modifyCommitMessage: () => {
+              throw new Error("the editor failed");
+            },
+          }),
+      });
+      expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+      expectSame(native, mine, "stopped");
+      expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+      const continued = await ours(mine, RebaseOperation.CONTINUE);
+      expect(continued.result.status, continued.result.message).toBe(RebaseStatus.OK);
+      expectSame(native, mine, "continued");
+    });
+  }
+
+  it("--continue refused (staged changes, no message): `end` already counted from the list", async () => {
+    const { native, ours: mine } = twins(linear);
+    const todo = `pick ${short(native, "topic~2")}\nbreak\npick ${short(native, "topic~1")}\npick ${short(native, "topic")}\n`;
+    expect(nativeGit(native, ["rebase", "-i", "main"], { todo }).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.BEGIN, { todo })).result.status).toBe(
+      RebaseStatus.STOPPED,
+    );
+    for (const dir of [native, mine]) {
+      appendFileSync(join(dir, ".git", "rebase-merge", "git-rebase-todo"), "break\n");
+      put(dir, "e.txt", "staged\n");
+      gitOk(root, dir, "add", "e.txt");
+    }
+    expect(nativeGit(native, ["rebase", "--continue"]).status).not.toBe(0);
+    const refused = await ours(mine, RebaseOperation.CONTINUE);
+    expect(refused.result.status).toBe(RebaseStatus.FAILED);
+    expectSame(native, mine, "refused");
+    // unstaged changes are refused before the list is read (builtin/rebase.c)
+    for (const dir of [native, mine]) put(dir, "b.txt", "unstaged\n");
+    const run = nativeGit(native, ["rebase", "--continue"]);
+    expect(run.status).not.toBe(0);
+    const unstaged = await ours(mine, RebaseOperation.CONTINUE);
+    expect(unstaged.result.status).toBe(RebaseStatus.FAILED);
+    expect(run.stdout).toContain(unstaged.result.message ?? "?");
+    expectSame(native, mine, "unstaged");
+  });
+
+  it("--edit-todo of a list that does not parse keeps `dropped` until --continue", async () => {
+    const { native, ours: mine } = twins(linear, { "rebase.missingCommitsCheck": "error" });
+    const todo = `pick ${short(native, "topic~2")} one\npick ${short(native, "topic")} three\n`;
+    expect(nativeGit(native, ["rebase", "-i", "main"], { todo }).status).toBe(1);
+    expect((await ours(mine, RebaseOperation.BEGIN, { todo })).result.status).toBe(
+      RebaseStatus.FAILED,
+    );
+    for (const dir of [native, mine]) {
+      appendFileSync(join(dir, ".git", "rebase-merge", "git-rebase-todo"), "frobnicate x\n");
+    }
+    const fixed = `pick ${short(native, "topic~2")} one\npick ${short(native, "topic~1")} two\npick ${short(native, "topic")} three\n`;
+    expect(nativeGit(native, ["rebase", "--edit-todo"], { todo: fixed }).status).toBe(0);
+    const edited = await ours(mine, RebaseOperation.EDIT_TODO, { todo: fixed });
+    expect(edited.result.status, edited.result.message).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "edited");
+    expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.CONTINUE)).result.status).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
+  });
+
+  it("a fixup after a line that does not parse has no previous commit", async () => {
+    const { native, ours: mine } = twins(linear);
+    const todo = `pick 0000000 nothing\nfixup ${short(native, "topic~1")} two\npick ${short(native, "topic")} three\n`;
+    const run = nativeGit(native, ["rebase", "-i", "main"], { todo });
+    expect(run.status).toBe(1);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, { todo });
+    expect(result.status).toBe(RebaseStatus.FAILED);
+    const line = "error: cannot 'fixup' without a previous commit";
+    expect(run.stderr).toContain(line);
+    expect(result.message).toContain(line);
+    expectMessage(result, run);
+    expectSame(native, mine, "refused");
+  });
+
+  it("an abbreviation that a blob shares with a commit of the list: refused as ambiguous", async () => {
+    const { native, ours: mine } = twins(linear);
+    const target = gitOk(root, native, "rev-parse", "topic~1").trim();
+    const prefix = target.slice(0, 4);
+    // a blob whose id starts as the commit's
+    let content = "";
+    for (let n = 0; ; n++) {
+      content = `blob ${n}\n`;
+      const id = createHash("sha1")
+        .update(`blob ${Buffer.byteLength(content)}\0${content}`)
+        .digest("hex");
+      if (id.startsWith(prefix)) break;
+    }
+    for (const dir of [native, mine]) {
+      const r = spawnSync("git", ["hash-object", "-w", "--stdin"], {
+        cwd: dir,
+        env: nativeGitEnv(root),
+        input: content,
+        encoding: "utf8",
+      });
+      expect(r.stdout.startsWith(prefix), r.stderr).toBe(true);
+    }
+    const todo = `pick ${short(native, "topic~2")} one\npick ${prefix} two\npick ${short(native, "topic")} three\n`;
+    const run = nativeGit(native, ["rebase", "-i", "main"], { todo });
+    expect(run.status).toBe(1);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, { todo });
+    expect(result.status, result.message).toBe(RebaseStatus.FAILED);
+    expect(result.message).toContain(`error: could not parse '${prefix}'`);
+    expectMessage(result, run);
+    expectSame(native, mine, "refused");
+  });
+
+  it("a drop before the picks kept in place goes to `done` with them", async () => {
+    const steps: GraphStep[] = [
+      { branch: "topic", from: "main", files: { "b.txt": "1\n" }, message: "one" },
+      { branch: "topic", files: { "c.txt": "2\n" }, message: "two" },
+      { branch: "topic", files: { "d.txt": "3\n" }, message: "three" },
+    ];
+    const { native, ours: mine } = twins(steps);
+    const todo = `drop ${short(native, "topic~2")} one\npick ${short(native, "topic~1")} two\nbreak\npick ${short(native, "topic")} three\n`;
+    expect(nativeGit(native, ["rebase", "-i", "main"], { todo }).status).toBe(0);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, { todo });
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expectSame(native, mine, "stopped");
+    expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.CONTINUE)).result.status).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
   });
 });

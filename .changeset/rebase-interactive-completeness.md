@@ -43,3 +43,11 @@ picks that become empty stop with git commit's advice), `setKeepEmpty` (`--[no-]
 reordered), `setRescheduleFailedExec` and `setRoot` (`--root`, with or without an upstream
 as `--onto`; `reset [new root]` of `--rebase-merges`). Commits are recorded as rewritten
 through `rewritten-pending` as git does (fixup chains, the base of skipped picks).
+
+A handler that throws fails as git's editor does: a failing `editTodo` (or `prepareSteps`)
+ends the rebase before it starts (state removed, autostash applied), a failing
+`modifyCommitMessage` stops at the reword or squash as git commit's failure leaves it. A fixup
+or squash whose amend would leave the commit empty stops for amending, as git commit refuses
+it. The edited list's abbreviations are read back against the list's own commits, the rest
+looked up in the object store together (a prefix several objects share is refused as git
+refuses it), so `--edit-todo` and `prepareSteps` no longer read every object per name.
