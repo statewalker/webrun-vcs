@@ -8,7 +8,15 @@
  * commit, and a stale graph still gives native git's answers.
  */
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitObjects, History } from "@statewalker/vcs-core";
@@ -286,6 +294,57 @@ describe("writing commit-graphs as native git", () => {
       .filter((t) => t === "tree").length;
     expect(result.reads?.treesScanned).toBe(trees);
     expect(result.reads?.trees).toBe(0);
+  });
+
+  it("--changed-paths unpacks in pack order only the newest packs that fit, up to the byte cap", async () => {
+    // an old pack and a newer, smaller one (each fast-import writes its own)
+    const dir = fastImportRepo(300);
+    git(dir, ["repack", "-adq"]);
+    fastImportRepo(60, { start: 300, dir });
+    const packDir = join(dir, ".git/objects/pack");
+    const packs = readdirSync(packDir)
+      .filter((f) => f.endsWith(".idx"))
+      .map((f) => {
+        const rows = git(dir, ["verify-pack", "-v", join(packDir, f)]).split("\n");
+        const objects = rows.filter((r) => /^[0-9a-f]{40} /.test(r));
+        return {
+          file: f,
+          objects: objects.length,
+          trees: objects.filter((r) => r.split(/ +/)[1] === "tree").length,
+        };
+      })
+      .sort((a, b) => a.objects - b.objects);
+    expect(packs.length).toBe(2);
+    const [fresh, old] = packs as [(typeof packs)[0], (typeof packs)[0]];
+    // the newer pack is newest by mtime, as the store orders them
+    const future = new Date(Date.now() + 3600_000);
+    for (const ext of [".idx", ".pack"]) {
+      utimesSync(join(packDir, fresh.file.replace(".idx", ext)), future, future);
+    }
+    const commits = git(dir, ["rev-list", "--all"]).trim().split("\n").length;
+    const native = tempDir();
+    cpSync(dir, native, { recursive: true });
+    git(native, ["commit-graph", "write", "--reachable", "--changed-paths"]);
+    // a budget the newer pack fits in and the old one does not
+    const objectsPerFilter = Math.ceil(fresh.objects / commits);
+    expect(old.objects).toBeGreaterThan(objectsPerFilter * commits - fresh.objects);
+    const ours = tempDir();
+    cpSync(dir, ours, { recursive: true });
+    let result = await ourWrite(ours, {
+      changedPaths: true,
+      prefetch: { minFilters: 1, objectsPerFilter },
+    });
+    expect(graphFiles(ours)).toEqual(graphFiles(native));
+    expect(result.reads?.treesScanned).toBe(fresh.trees);
+    // a byte cap: the read stops at the first tree past it (here the first)
+    const capped = tempDir();
+    cpSync(dir, capped, { recursive: true });
+    result = await ourWrite(capped, {
+      changedPaths: true,
+      prefetch: { minFilters: 1, objectsPerFilter: 1000, bytes: 1 },
+    });
+    expect(graphFiles(capped)).toEqual(graphFiles(native));
+    expect(result.reads?.treesScanned).toBe(1);
   });
 
   it.skipIf(version < 246)("commitGraph.changedPathsVersion=2 (git 2.46+)", async () => {

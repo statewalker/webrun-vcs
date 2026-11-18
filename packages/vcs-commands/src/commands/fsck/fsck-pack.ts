@@ -570,7 +570,7 @@ function unpackError(entry: PackScanEntry, packPath: string, e: unknown): Unpack
 const enc = new TextEncoder();
 
 /** The git object id of `content` as `type`: SHA-1 over its header and content, as hex. */
-function objectIdOf(type: string, content: Uint8Array): string {
+export function objectIdOf(type: string, content: Uint8Array): string {
   let n = 0;
   for (let i = 0; i < type.length; i++) header[n++] = type.charCodeAt(i);
   header[n++] = 0x20;

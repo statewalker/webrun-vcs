@@ -105,6 +105,20 @@ export interface WriteCommitGraphFileOptions {
   changedPathsVersion?: number;
   /** The clock, ms since the epoch (default `Date.now`) */
   now?: () => number;
+  /** When the changed-path filters' trees are unpacked in pack order first (tuning) */
+  prefetch?: CommitGraphPrefetch;
+}
+
+/**
+ * When `writeCommitGraphFile` unpacks the packs' trees in pack order before computing the
+ * changed-path filters: with at least `minFilters` filters to compute (default 1024), from the
+ * newest packs whose objects fit in `objectsPerFilter` per filter (default 32), keeping at most
+ * `bytes` of trees (default 256 MiB). Only how the trees are read changes, not the file.
+ */
+export interface CommitGraphPrefetch {
+  minFilters?: number;
+  objectsPerFilter?: number;
+  bytes?: number;
 }
 
 /** What `writeCommitGraphFile` did. */
@@ -481,7 +495,7 @@ export async function writeCommitGraphFile(
       g,
       options.maxNewFilters,
       reads,
-      { files, objectsDir },
+      { files, objectsDir, prefetch: options.prefetch },
     );
   }
 
@@ -807,7 +821,7 @@ async function computeFilters(
   existing: CommitGraph | undefined,
   maxNewFilters: number | undefined,
   reads: { commits: number; trees: number; treesScanned?: number },
-  packs?: { files: FilesApi; objectsDir: string },
+  packs?: { files: FilesApi; objectsDir: string; prefetch?: CommitGraphPrefetch },
 ): Promise<(Uint8Array | undefined)[]> {
   const filters: (Uint8Array | undefined)[] = new Array(commits.length);
   // commit_gen_cmp: lower generation first, then older
@@ -828,8 +842,15 @@ async function computeFilters(
       const pos = existing ? existing.position(c.id) : -1;
       if (!(pos >= 0 && existing?.bloomFilterAt(pos)?.data.length)) missing++;
     }
-    if (Math.min(missing, limit) >= PREFETCH_MIN_FILTERS) {
-      const found = await packedTrees(packs.files, packs.objectsDir);
+    const wanted = Math.min(missing, limit);
+    const tuning = packs.prefetch ?? {};
+    if (wanted >= (tuning.minFilters ?? PREFETCH_MIN_FILTERS)) {
+      const found = await packedTrees(
+        packs.files,
+        packs.objectsDir,
+        wanted * (tuning.objectsPerFilter ?? PREFETCH_OBJECTS_PER_FILTER),
+        tuning.bytes ?? PREFETCH_BYTES,
+      );
       if (found.size > 0) {
         trees.prefetched = found;
         reads.treesScanned = (reads.treesScanned ?? 0) + found.size;
@@ -962,6 +983,13 @@ function keyAt(buf: Uint8Array, at: number): number {
 /** Filters to compute from which the packs' trees are unpacked first (`packedTrees`). */
 const PREFETCH_MIN_FILTERS = 1024;
 
+/**
+ * Pack objects read in pack order per filter computed, at most: a filter's diff reads a few
+ * trees, and reading a pack costs every one of its objects (a few new filters over one large
+ * pack read the trees they need from the store instead).
+ */
+const PREFETCH_OBJECTS_PER_FILTER = 32;
+
 /** The bytes of trees `packedTrees` keeps at most. */
 const PREFETCH_BYTES = 256 * 1024 * 1024;
 
@@ -969,35 +997,49 @@ const PREFETCH_BYTES = 256 * 1024 * 1024;
  * The trees of the packs of `objectsDir`, by id, unpacked in one read of each pack in pack
  * order (`scanPackObjects`): reading them one by one in the order the filters need them
  * resolves the same delta chains again and again, where pack order unpacks each from the base
- * just before it. At most `PREFETCH_BYTES` of them (the first in pack order, the newest); the
- * others are read when needed, as are those the scan leaves out.
+ * just before it. The packs are taken newest first, as the store reads them, while their
+ * objects fit in `budget` (a pack too large for what is left is skipped), and the reads stop
+ * once `maxBytes` of trees are kept; the others are read when needed, as are those the
+ * scan leaves out.
  */
-async function packedTrees(files: FilesApi, objectsDir: string): Promise<IdTable<Uint8Array>> {
+async function packedTrees(
+  files: FilesApi,
+  objectsDir: string,
+  budget: number,
+  maxBytes: number,
+): Promise<IdTable<Uint8Array>> {
   const out = new IdTable<Uint8Array>();
   const dir = joinPath(objectsDir, "pack");
   let bytes = 0;
   try {
     if ((await files.stats(dir))?.kind !== "directory") return out;
-    const idxPaths: string[] = [];
+    const found: { idxPath: string; name: string; mtime: number }[] = [];
     for await (const e of files.list(dir)) {
       if (e.kind === "file" && /^pack-[0-9a-f]+\.idx$/.test(e.name))
-        idxPaths.push(joinPath(dir, e.name));
+        found.push({ idxPath: joinPath(dir, e.name), name: e.name, mtime: e.lastModified ?? 0 });
     }
-    for (const idxPath of idxPaths.sort()) {
-      if (bytes > PREFETCH_BYTES) break;
+    // newest first, as the store's pack list (git's sort_pack)
+    found.sort((a, b) => b.mtime - a.mtime || (a.name < b.name ? -1 : 1));
+    let left = budget;
+    for (const { idxPath } of found) {
+      if (bytes > maxBytes || left <= 0) break;
       const idxBytes = await readFileBytes(files, idxPath);
       const idx = readPackIndex(idxBytes);
+      if (idx.objectCount > left) continue;
+      left -= idx.objectCount;
       const idsAt = 8 + 1024;
       await scanPackObjects(
         files,
         `${idxPath.slice(0, -4)}.pack`,
         idxBytes,
         idx,
-        (type) => type === 2 && bytes <= PREFETCH_BYTES,
+        (type) => type === 2,
         (pos, _type, content) => {
           const size = out.size;
           out.add(idxBytes, idsAt + pos * 20, content);
           if (out.size > size) bytes += content.length;
+          // the cap reached: the rest of the pack is not read
+          return bytes <= maxBytes;
         },
       );
     }

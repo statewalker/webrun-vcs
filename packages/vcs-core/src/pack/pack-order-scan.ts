@@ -7,11 +7,14 @@
  * (git's verify_pack), `fsck --connectivity-only` reads its commits and trees, and
  * `writeCommitGraph` its trees for the changed-path filters.
  *
- * In `scanPackObjects` a delta's type is its base's, known since the base comes first, so a
- * blob's delta is skipped unread as a blob is. An entry the scan does not handle as it stands
- * (a REF_DELTA, a base it did not keep, an entry over 1 MiB, one that fails to inflate or whose
- * header or idx entry is not sound) is left out, with every delta built on it: the caller reads
- * those through the store, with the store's errors. Nothing is hash-checked.
+ * In `scanPackObjects` a delta's type is its base's, known since the base comes first (git's
+ * pack-objects writes a base before its deltas, OFS_DELTA or REF_DELTA alike), so a blob's
+ * delta is skipped unread as a blob is. An entry the scan does not handle as it stands (a
+ * REF_DELTA whose base is not an earlier entry of the same pack, a base it did not keep, an
+ * entry over 1 MiB, one that fails to inflate or whose header or idx entry is not sound) is
+ * left out, with every delta built on it: the caller reads those through the store, with the
+ * store's errors. A pack where such entries outnumber those unpacked is not read further (the
+ * store reads them as fast). Nothing is hash-checked.
  */
 
 import { inflateWhole } from "@statewalker/vcs-utils/compression";
@@ -228,10 +231,35 @@ export function parsePackEntryHead(
 const BASE_BYTES = 32 * 2 ** 20;
 
 /**
+ * Deltas left out for want of their base after which a pack whose left-out deltas outnumber
+ * its unpacked objects is not read further (a thin pack, bases in other packs).
+ */
+const GIVE_UP_AFTER = 256;
+
+/** The idx position of the id at `at` in `raw` (a binary search in its fan-out bucket), or -1. */
+function idxPosition(idx: Uint8Array, n: number, raw: Uint8Array, at: number): number {
+  const first = raw[at] as number;
+  let lo = first === 0 ? 0 : u32(idx, 8 + (first - 1) * 4);
+  let hi = u32(idx, 8 + first * 4);
+  if (hi > n || lo > hi) return -1;
+  const idsAt = 8 + 1024;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const o = idsAt + mid * 20;
+    let c = 0;
+    for (let j = 0; j < 20 && c === 0; j++) c = (idx[o + j] as number) - (raw[at + j] as number);
+    if (c === 0) return mid;
+    if (c < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return -1;
+}
+
+/**
  * Reads the pack at `packPath` (its idx `idxBytes`, parsed as `idx`) in pack order and hands
  * each object whose type (1 commit, 2 tree, 3 blob, 4 tag) is set in `wanted` to `visit`, with
- * its idx position and its content (valid during the call only). Returns how many entries were
- * unpacked.
+ * its idx position and its content (valid during the call only); `visit` returning false stops
+ * the read there. Returns how many entries were unpacked.
  */
 export async function scanPackObjects(
   files: FilesApi,
@@ -239,7 +267,7 @@ export async function scanPackObjects(
   idxBytes: Uint8Array,
   idx: PackIndex,
   wanted: (type: number) => boolean,
-  visit: (pos: number, type: number, content: Uint8Array) => void,
+  visit: (pos: number, type: number, content: Uint8Array) => undefined | boolean,
 ): Promise<number> {
   const stats = await files.stats(packPath);
   if (stats?.kind !== "file" || stats.size === undefined) return 0;
@@ -267,6 +295,11 @@ export async function scanPackObjects(
   let keptBytes = 0;
   let deltaScratch = new Uint8Array(64 * 1024);
   let unpacked = 0;
+  /** deltas left out for want of their base */
+  let unresolved = 0;
+  let stop = false;
+  /** each idx position's place in pack order (REF_DELTA bases), built at the first one */
+  let rank: Uint32Array | undefined;
 
   const entry = (k: number, bytes: Uint8Array): void => {
     const pos = order[k] as number;
@@ -275,9 +308,23 @@ export async function scanPackObjects(
     if (!head) return;
     let type: number;
     if (head.kind <= 4) type = head.kind;
-    else if (head.kind === 6) type = types[head.base] as number;
-    else return;
-    if (type === 0) return;
+    else {
+      if (head.kind === 7) {
+        // the base, when it is an earlier entry of this pack
+        const at = idxPosition(idxBytes, n, bytes, head.dataAt - 20);
+        if (at >= 0 && !rank) {
+          rank = new Uint32Array(n);
+          for (let i = 0; i < n; i++) rank[order[i] as number] = i;
+        }
+        const b = at >= 0 && (sound || lookups(at)) ? (rank as Uint32Array)[at] : k;
+        head.base = b !== undefined && b < k ? b : -1;
+      }
+      type = head.base >= 0 ? (types[head.base] as number) : 0;
+    }
+    if (type === 0) {
+      if (head.kind > 4 && ++unresolved > GIVE_UP_AFTER && unresolved > unpacked) stop = true;
+      return;
+    }
     types[k] = type;
     if (!wanted(type) || head.size > PACK_SCAN_MAX) return;
     const stream = bytes.subarray(head.dataAt);
@@ -293,6 +340,7 @@ export async function scanPackObjects(
       const base = kept[b];
       if (!base || (depth[b] as number) >= PACK_MAX_CHAIN) {
         types[k] = 0;
+        if (++unresolved > GIVE_UP_AFTER && unresolved > unpacked) stop = true;
         return;
       }
       if (deltaScratch.length < head.size) deltaScratch = new Uint8Array(head.size);
@@ -318,7 +366,7 @@ export async function scanPackObjects(
       keptBytes -= (kept[old] as Uint8Array).length;
       kept[old] = undefined;
     }
-    visit(pos, type, data);
+    if (visit(pos, type, data) === false) stop = true;
   };
 
   let k = 0;
@@ -361,6 +409,7 @@ export async function scanPackObjects(
       }
       if (!done) continue;
       if (bytes) entry(k, bytes);
+      if (stop) return unpacked;
       k++;
       startEntry();
     }
