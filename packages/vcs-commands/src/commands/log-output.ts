@@ -134,6 +134,11 @@ export interface LogOutputOptions {
    * has `%N`)
    */
   notes?: boolean;
+  /**
+   * `--notes=<ref>` (each one): the notes of these refs shown (`x` is `refs/notes/x`, globs
+   * expanded); without `notes: true` (`--notes`) only these, not the default notes ref
+   */
+  notesRefs?: string[];
   /** `--use-mailmap` / `--no-mailmap` (default `log.mailmap`, true) */
   mailmap?: boolean;
   /** Options of the diff text (context, algorithm, `--stat=<width>`...) */
@@ -705,7 +710,9 @@ export class LogPrinter {
     this.mergesNeedDiff = mergesNeedDiff;
     this.showRoot = options.showRoot ?? bool(host.config("log.showRoot")) ?? true;
     this.useMailmap = options.mailmap ?? bool(host.config("log.mailmap")) ?? true;
-    this.showNotes = options.notes ?? (!prettyGiven || /%N/.test(this.format.user ?? ""));
+    this.showNotes =
+      options.notes ??
+      ((options.notesRefs?.length ?? 0) > 0 || !prettyGiven || /%N/.test(this.format.user ?? ""));
     // --follow needs one path, without magic but `:(top)` and `:(literal)`
     // (diff_check_follow_pathspec); log.follow is ignored otherwise
     const followPath = followPathOf(walk.paths, options.follow === true);

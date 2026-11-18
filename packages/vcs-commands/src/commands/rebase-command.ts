@@ -50,6 +50,7 @@ import {
   treeDelta,
 } from "./merge-support.js";
 import { CleanupMode, commentPrefixOf, stripspace } from "./message-cleanup.js";
+import { copyNotesForAmend, copyNotesForRebase } from "./notes-support.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeBaseTree, mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { type PatchIdTrees, patchId } from "./patch-id.js";
@@ -1080,6 +1081,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const onto = (await state.read(`${DIR}/onto`))?.trim() ?? newHead;
     await this.finishBranch(headName, newHead, onto);
     await this.flushRewrittenPending(state);
+    // `git notes copy --for-rewrite=rebase` fed rewritten-list
+    const rewritten = await state.read(`${DIR}/rewritten-list`);
+    if (rewritten) await copyNotesForRebase(this.notesContext(), rewritten);
     const autostash = (await state.read(`${DIR}/autostash`))?.trim();
     if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
     await this.doUpdateRefs(state, output);
@@ -1466,7 +1470,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           )) ?? "";
         if (signoff) message = stripspace(message);
       }
-      await this.amendHead(state, treeId, message, item.action);
+      await this.amendHead(state, treeId, message, item.action, messageFile === "edit");
       // try_to_commit removes MERGE_MSG; git commit (the edited end of a chain) SQUASH_MSG too
       await state.remove("MERGE_MSG");
       if (messageFile === "edit") await state.remove("SQUASH_MSG");
@@ -1537,20 +1541,29 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const message = this.editMessage(head.message);
     // git commit --amend: the merge state it removes
     await state.removeRef("AUTO_MERGE");
-    await this.amendHead(state, head.tree, message, RebaseAction.REWORD);
+    await this.amendHead(state, head.tree, message, RebaseAction.REWORD, true);
     await state.remove("SQUASH_MSG");
   }
 
-  /** HEAD replaced by a commit of `tree` with HEAD's parents and author (an amend). */
+  /**
+   * HEAD replaced by a commit of `tree` with HEAD's parents and author (an amend), its notes
+   * carried over (`notes.rewriteRef`). `byGitCommit`: git runs `git commit --amend` for it,
+   * whose notes commit takes the amended author (git exports it), not the environment's.
+   */
   private async amendHead(
     state: OperationState,
     tree: ObjectId,
     message: string,
     step: string,
+    byGitCommit = false,
   ): Promise<ObjectId> {
-    const head = await this.commits.load(await this.resolveHead());
+    const headId = await this.resolveHead();
+    const head = await this.commits.load(headId);
     if (!head) throw new NoHeadError("HEAD cannot be resolved");
-    return this.commitOnto(state, head.parents, tree, head.author, message, step);
+    const id = await this.commitOnto(state, head.parents, tree, head.author, message, step);
+    // commit_post_rewrite of the amend (git commit --amend, try_to_commit's AMEND_MSG)
+    await copyNotesForAmend(this.notesContext(), headId, id, byGitCommit ? head.author : undefined);
+    return id;
   }
 
   /**
@@ -2128,8 +2141,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       newId,
       this.reflogLine(reflogMessages.pick(action, message), this.committer),
     );
-    // git commit --amend: SQUASH_MSG removed with the merge state
+    // git commit --amend: SQUASH_MSG removed with the merge state, the notes carried over
     await state.remove("SQUASH_MSG");
+    await copyNotesForAmend(this.notesContext(), id, newId, commit.author);
   }
 
   /**
@@ -2562,7 +2576,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         ),
       };
     }
-    if (amend) await this.amendHead(state, treeId, message, "continue");
+    if (amend) await this.amendHead(state, treeId, message, "continue", true);
     else {
       // a stopped merge: its other parents (git commit reads MERGE_HEAD, one per line: an
       // octopus has several)

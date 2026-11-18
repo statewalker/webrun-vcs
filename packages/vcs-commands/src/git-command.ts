@@ -52,6 +52,7 @@ import {
   resolveIdentDate,
   withoutCrud,
 } from "./commands/git-ident.js";
+import type { NotesContext } from "./commands/notes-support.js";
 import { reflogLine } from "./commands/reflog-messages.js";
 import {
   type ArgumentFiles,
@@ -325,6 +326,31 @@ export abstract class GitCommand<T> {
   protected datedIdent(role: IdentRole, who: { name: string; email: string }): PersonIdent {
     const date = resolveIdentDate(role, hostEnvironmentOf(this._workingCopy), this.clock());
     return { name: withoutCrud(who.name), email: withoutCrud(who.email), ...date };
+  }
+
+  /** What git's notes code reads and writes through this command (`notes-support.ts`). */
+  protected notesContext(): NotesContext {
+    const tags = this.tagsStore;
+    return {
+      workingCopy: this._workingCopy,
+      blobs: this.blobs,
+      trees: this.trees,
+      commits: this.commits,
+      refs: this.refsStore,
+      ...(tags ? { tags } : {}),
+      author: () => this.resolveAuthor(),
+      committer: () => this.resolveCommitter(),
+      reflogLine: (message) => this.reflogLine(message),
+      // a full object id is itself (get_oid_basic); the resolver would also look for refs
+      // spelled as it, for an ambiguity warning the notes commands do not print — a ref
+      // lookup per line of `git notes copy --stdin` that costs most of its time
+      resolve: (name) =>
+        /^[0-9a-fA-F]{40}$/.test(name)
+          ? Promise.resolve(name.toLowerCase())
+          : this.revisionResolver()
+              .resolve(name)
+              .catch(() => undefined),
+    };
   }
 
   // ============ Store Accessors ============

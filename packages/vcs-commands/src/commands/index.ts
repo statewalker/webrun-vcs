@@ -35,6 +35,18 @@ export {
   mergeDriversOf,
 } from "./merge-drivers.js";
 export { CleanupMode, stripspace } from "./message-cleanup.js";
+export * from "./notes-command.js";
+export * from "./notes-commands.js";
+export * from "./notes-merge-command.js";
+export { NotesError } from "./notes-support.js";
+export {
+  type CombineNotes,
+  combineNotesCatSortUniq,
+  combineNotesConcatenate,
+  combineNotesIgnore,
+  combineNotesOverwrite,
+  NotesTree,
+} from "./notes-tree.js";
 export * from "./pack-refs-command.js";
 export * from "./pretty-format.js";
 export * from "./pull-command.js";

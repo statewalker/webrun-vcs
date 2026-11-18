@@ -59,6 +59,10 @@ export interface NodeGitHostEnvironment {
   replaceRefBase?: string;
   graftFile?: string;
   printSha1Ellipsis?: boolean;
+  notesRef?: string;
+  notesDisplayRef?: string;
+  notesRewriteRef?: string;
+  notesRewriteMode?: string;
 }
 
 /**
@@ -105,8 +109,10 @@ function envBool(value: string | undefined): boolean {
  * `GIT_AUTHOR_NAME` / `_EMAIL` / `_DATE` for the author, `EMAIL` for git's `$EMAIL`,
  * `GIT_ATTR_SOURCE` for the tree attributes are read from, `GIT_NO_REPLACE_OBJECTS` and
  * `GIT_REPLACE_REF_BASE` for replace refs, `GIT_GRAFT_FILE` for the grafts file,
- * `GIT_PRINT_SHA1_ELLIPSIS` for the `...` after abbreviated ids), files read by absolute
- * path. The system files default to `/etc/gitconfig` and `/etc/gitattributes`.
+ * `GIT_PRINT_SHA1_ELLIPSIS` for the `...` after abbreviated ids, `GIT_NOTES_REF`,
+ * `GIT_NOTES_DISPLAY_REF`, `GIT_NOTES_REWRITE_REF`, `GIT_NOTES_REWRITE_MODE` for notes),
+ * files read by absolute path. The system files default to `/etc/gitconfig` and
+ * `/etc/gitattributes`.
  *
  * @example
  * ```typescript
@@ -164,5 +170,15 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_GRAFT_FILE !== undefined ? { graftFile: env.GIT_GRAFT_FILE } : {}),
     // git's print_sha1_ellipsis: "yes" in any case
     ...(env.GIT_PRINT_SHA1_ELLIPSIS?.toLowerCase() === "yes" ? { printSha1Ellipsis: true } : {}),
+    ...(env.GIT_NOTES_REF !== undefined ? { notesRef: env.GIT_NOTES_REF } : {}),
+    ...(env.GIT_NOTES_DISPLAY_REF !== undefined
+      ? { notesDisplayRef: env.GIT_NOTES_DISPLAY_REF }
+      : {}),
+    ...(env.GIT_NOTES_REWRITE_REF !== undefined
+      ? { notesRewriteRef: env.GIT_NOTES_REWRITE_REF }
+      : {}),
+    ...(env.GIT_NOTES_REWRITE_MODE !== undefined
+      ? { notesRewriteMode: env.GIT_NOTES_REWRITE_MODE }
+      : {}),
   };
 }

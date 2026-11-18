@@ -25,7 +25,7 @@
  * is on the host.
  */
 
-import type { History, ObjectId } from "@statewalker/vcs-core";
+import type { History, ObjectId, Refs } from "@statewalker/vcs-core";
 import type { WorkingCopy, WorkingCopyConfig } from "../working-copy.js";
 
 /**
@@ -185,6 +185,14 @@ export interface LinkedWorktrees {
    * and for a worktree beyond this storage ({@link LinkedWorktrees.reachable}).
    */
   open(entry: WorktreeInfo): Promise<WorkingCopy>;
+
+  /**
+   * git's `get_worktree_ref_store`: the refs as `entry` sees them (its own HEAD and pseudo
+   * refs such as `NOTES_MERGE_REF`, the repository's other refs), read from its
+   * administrative directory alone, so also for a worktree whose files are beyond this
+   * storage or missing. Optional.
+   */
+  refsOf?(entry: WorktreeInfo): Promise<Refs>;
 
   /**
    * The current worktree's repository as `git worktree` needs it ({@link WorktreeAdmin}):

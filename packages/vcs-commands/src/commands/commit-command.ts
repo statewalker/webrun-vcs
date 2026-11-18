@@ -22,6 +22,7 @@ import {
   commitMessageFromOption,
   preparedMessageCleanup,
 } from "./message-cleanup.js";
+import { copyNotesForAmend } from "./notes-support.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
 
@@ -92,6 +93,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private committerName?: { name: string; email: string };
   private resetAuthor = false;
   private amend = false;
+  private noPostRewrite = false;
   private allowEmpty = false;
   private parents: ObjectId[] = [];
   private onlyPaths: string[] = [];
@@ -219,6 +221,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
   setResetAuthor(reset: boolean): this {
     this.checkCallable();
     this.resetAuthor = reset;
+    return this;
+  }
+
+  /**
+   * `--no-post-rewrite`: an amend does not carry the amended commit's notes over to the new
+   * one (`notes.rewriteRef`, `notes.rewrite.amend`), as git skips its post-rewrite step.
+   */
+  setNoPostRewrite(noPostRewrite: boolean): this {
+    this.checkCallable();
+    this.noPostRewrite = noPostRewrite;
     return this;
   }
 
@@ -394,9 +406,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
         ? commitMessageFromOption(message, this.cleanupMode, this.workingCopy, true)
         : message;
     let previousCommit: Commit | undefined;
+    let amendedId: ObjectId | undefined;
 
     if (this.amend) {
       const headId = await this.resolveHead();
+      amendedId = headId;
       previousCommit = await this.commits.load(headId);
       if (!previousCommit) {
         throw new NoHeadError("Cannot amend: HEAD commit not found");
@@ -532,6 +546,12 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // the commit ends what was in progress (git's sequencer_post_commit_cleanup and the
     // state files cmd_commit unlinks), then applies a merge's autostash
     await this.cleanupAfterCommit(state);
+
+    // commit_post_rewrite: the amended commit's notes carried over (notes.rewriteRef)
+    if (amendedId && !this.noPostRewrite) {
+      // git exports the amend's author (determine_author_info): the notes commit's too
+      await copyNotesForAmend(this.notesContext(), amendedId, commitId, commit.author);
+    }
 
     // Return commit with its ID (like JGit's RevCommit)
     return { ...commit, id: commitId };
