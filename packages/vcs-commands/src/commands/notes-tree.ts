@@ -263,20 +263,42 @@ export class NotesTree {
     return this.forEachHelper(this.root, 0, 0, flags, fn);
   }
 
-  /** write_notes_tree: the tree objects written, the root's id. */
+  /**
+   * write_notes_tree: the tree objects written, the root's id.
+   *
+   * The non-notes are woven in as git weaves them: after the last one written (nn_prev),
+   * those up to each note's path. A subtree the walk reads meanwhile (one deeper than the
+   * fanout) can bring a non-note that sorts before the last one written: git never goes
+   * back for it, so it is dropped from the tree written, here too.
+   *
+   * Known difference: git writes each tree's entries in the order it weaves them, and that
+   * order is not always git's tree order (`x` and `x-y` beside a directory `x`, or a
+   * non-note of a subtree read late that sorts before an entry already written); git then
+   * writes an unsorted tree. Trees here go through the tree store, which writes its entries
+   * sorted (there is no writer of raw entry order), so such a tree gets another id.
+   */
   async write(): Promise<ObjectId> {
     const root: WriteStack = { entries: [], path: "" };
-    let nnIndex = 0;
+    /** nn_prev: the last non-note woven in, and where it was in the list then */
+    let prev: NonNote | undefined;
+    let prevIndex = -1;
     const writeNonNotesUntil = async (notePath: string | undefined) => {
-      while (nnIndex < this.nonNotes.length) {
-        const n = this.nonNotes[nnIndex] as NonNote;
+      // the entry after nn_prev (inserts before it shift its index)
+      if (prev !== undefined && this.nonNotes[prevIndex] !== prev) {
+        prevIndex = this.nonNotes.indexOf(prev);
+      }
+      let i = prevIndex + 1;
+      while (i < this.nonNotes.length) {
+        const n = this.nonNotes[i] as NonNote;
         const cmp = notePath === undefined ? -1 : compareBytes(n.path, notePath);
         if (notePath !== undefined && cmp > 0) break;
         // prefer note to non-note
         if (!(notePath !== undefined && cmp === 0)) {
           await this.writeEntry(root, n.path, n.mode, n.id);
         }
-        nnIndex++;
+        prev = n;
+        prevIndex = i;
+        i++;
       }
     };
     await this.forEach(
@@ -305,10 +327,10 @@ export class NotesTree {
   async unreachableObjects(exists: (id: ObjectId) => Promise<boolean>): Promise<ObjectId[]> {
     const list: ObjectId[] = [];
     await this.forEach(0, async (object) => {
-      if (!(await exists(object))) list.unshift(object);
+      if (!(await exists(object))) list.push(object);
       return false;
     });
-    return list;
+    return list.reverse();
   }
 
   // ---- notes.c internals ----

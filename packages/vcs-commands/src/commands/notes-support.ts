@@ -230,7 +230,36 @@ export async function commitNotes(
   if (!t.tree.dirty) return;
   const msg = message.endsWith("\n") ? message : `${message}\n`;
   const id = await createNotesCommit(ctx, t.tree, msg, { ref: t.updateRef });
-  await ctx.refs.set(t.updateRef, id, ctx.reflogLine(reflogMessage(`notes: ${msg}`)));
+  await updateNotesRef(ctx, t.updateRef, id, reflogMessage(`notes: ${msg}`));
+}
+
+/**
+ * refs_update_ref with UPDATE_REFS_DIE_ON_ERR (and without REF_NO_DEREF): `name` set to
+ * `id`, through a symbolic ref to the ref it points at (its reflog line written in each
+ * ref of the chain, as git logs an update through a symref); with `old`, only while the
+ * ref holds it (git's `update_ref failed for ref ...: is at ... but expected ...`).
+ */
+export async function updateNotesRef(
+  ctx: Pick<NotesContext, "refs" | "reflogLine">,
+  name: string,
+  id: ObjectId,
+  message: string,
+  old?: ObjectId,
+): Promise<void> {
+  const result = await ctx.refs.batch(
+    [{ name, new: id, ...(old !== undefined ? { old } : {}) }],
+    ctx.reflogLine(message),
+  );
+  if (result.ok) return;
+  const reason = result.rejected[0]?.reason;
+  const current = await ctx.refs.resolve(name).catch(() => undefined);
+  let detail = `cannot lock ref '${name}'`;
+  if (reason === "mismatch" && current?.objectId && old !== undefined) {
+    detail += `: is at ${current.objectId} but expected ${old}`;
+  } else if (reason === "mismatch" && old !== undefined) {
+    detail += `: unable to resolve reference '${current?.name ?? name}'`;
+  }
+  throw new NotesError(`update_ref failed for ref '${name}': ${detail}`);
 }
 
 /** The notes trees a rewrite copies notes in (notes-utils.h's struct notes_rewrite_cfg). */
@@ -265,9 +294,13 @@ export async function initCopyNotesForRewrite(
   if (env.notesRewriteRef !== undefined) {
     await addRefsFromColonSep(ctx, refs, env.notesRewriteRef, messages);
   }
-  const enabledValues = config.values(`notes.rewrite.${cmd}`);
-  if (enabledValues.length > 0) {
-    enabled = parseGitBool(enabledValues[enabledValues.length - 1] as string) ?? true;
+  // git_config_bool on each value: one that is no boolean dies
+  for (const value of config.values(`notes.rewrite.${cmd}`)) {
+    const parsed = parseGitBool(value);
+    if (parsed === undefined) {
+      throw new NotesError(`bad boolean config value '${value}' for 'notes.rewrite.${cmd}'`);
+    }
+    enabled = parsed;
   }
   if (env.notesRewriteMode === undefined) {
     for (const value of config.values("notes.rewriteMode")) {

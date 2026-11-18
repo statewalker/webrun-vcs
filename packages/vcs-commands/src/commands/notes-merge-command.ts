@@ -1,5 +1,7 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 import { mergeLines } from "@statewalker/vcs-utils";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { collectChunks } from "@statewalker/vcs-working-tree";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type NotesResult, NotesSubcommand } from "./notes-command.js";
 import {
@@ -9,6 +11,7 @@ import {
   type NotesContext,
   NotesError,
   readRef,
+  updateNotesRef,
 } from "./notes-support.js";
 import {
   type CombineNotes,
@@ -218,7 +221,7 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     if (result >= 0) {
       const current = await readRef(ctx, notesRef);
       if (current !== resultId) {
-        await this.refsStore.set(notesRef, resultId, this.reflogLine(msg));
+        await updateNotesRef(ctx, notesRef, resultId, msg);
       }
       return {
         exitCode: 0,
@@ -232,7 +235,19 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     await this.refsStore.set("NOTES_MERGE_PARTIAL", resultId);
     const existing = await this.refsStore.get("NOTES_MERGE_REF").catch(() => undefined);
     if (existing && "target" in existing && existing.target === notesRef) {
-      throw new NotesError(`a notes merge into ${notesRef} is already in-progress at .`);
+      // find_shared_symref: the worktree whose NOTES_MERGE_REF points at the ref, by its
+      // path as git prints it (absolute). Only this worktree's NOTES_MERGE_REF is read (the
+      // other worktrees' pseudo refs are not reachable here); a working copy that keeps no
+      // linked worktrees has no path to print, and says `.`.
+      const wt = (await this.workingCopy.worktrees?.list().catch(() => undefined))?.find(
+        (w) => w.current,
+      );
+      const error = new NotesError(
+        `a notes merge into ${notesRef} is already in-progress at ${wt?.path ?? "."}`,
+      );
+      error.output = output.join("");
+      error.errors = errors.join("");
+      throw error;
     }
     await this.refsStore.setSymbolic("NOTES_MERGE_REF", notesRef);
     errors.push(
@@ -267,6 +282,29 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     }
     const names = await this.checkout.listStateDir?.(WORKTREE);
     if (names === undefined) throw new NotesError(`could not open ${this.gitPath(WORKTREE)}`);
+    const errors: string[] = [];
+    try {
+      return await this.commitWorktree(names, t.tree, partial, localRef, output, errors);
+    } catch (error) {
+      if (error instanceof NotesError) {
+        error.output = output.join("");
+        error.errors = errors.join("");
+      }
+      throw error;
+    }
+  }
+
+  /** notes_merge_commit's loop over NOTES_MERGE_WORKTREE, the commit and the ref update. */
+  private async commitWorktree(
+    names: string[],
+    tree: NotesTree,
+    partial: { message: string; parents: ObjectId[] },
+    localRef: string,
+    output: string[],
+    errors: string[],
+  ): Promise<NotesMergeResult> {
+    const ctx = this.ctx;
+    const msg = partial.message;
     for (const name of names) {
       if (!/^[0-9a-fA-F]{40}/.test(name)) {
         if (this.verbosity >= 3) {
@@ -275,18 +313,75 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
         continue;
       }
       const obj = name.slice(0, 40).toLowerCase();
-      const bytes =
-        (await this.checkout.readStateFile?.(`${WORKTREE}/${name}`)) ?? new Uint8Array();
-      const blob = await this.blobs.store([bytes]);
-      await t.tree.add(obj, blob);
+      const blob = await this.storeResolvedNote(name, errors);
+      await tree.add(obj, blob);
       if (this.verbosity >= 4) output.push(`Added resolved note for object ${obj}: ${blob}\n`);
     }
-    const id = await createNotesCommit(ctx, t.tree, msg, { parents: partial.parents });
+    const id = await createNotesCommit(ctx, tree, msg, { parents: partial.parents });
     if (this.verbosity >= 4) output.push(`Finalized notes merge commit: ${id}\n`);
     const subject = (partial.message.split("\n\n")[0] ?? "").replace(/\s+/g, " ").trim();
-    await this.refsStore.set(localRef, id, this.reflogLine(`notes: ${subject}`));
-    const aborted = await this.abort(output, []);
+    // the partial commit's first parent is what the notes ref held when the merge began
+    await updateNotesRef(ctx, localRef, id, `notes: ${subject}`, partial.parents[0]);
+    const aborted = await this.abort(output, errors);
     return { ...aborted, merged: aborted.exitCode === 0, commit: id };
+  }
+
+  /**
+   * notes_merge_commit's `stat` + `index_path`: the file `NOTES_MERGE_WORKTREE/<name>` (a
+   * symbolic link followed, as `stat` follows it: the content of the file it points at)
+   * stored as a blob as `git add` stores it, through the clean conversion of its path
+   * (`core.autocrlf`, `text`/`eol`/`filter` attributes of `.git/NOTES_MERGE_WORKTREE/<name>`).
+   */
+  private async storeResolvedNote(name: string, errors: string[]): Promise<ObjectId> {
+    const path = `${this.gitPath(WORKTREE)}/${name}`;
+    const bytes = await this.readFollowingLinks(path);
+    if (bytes === undefined) {
+      throw new NotesError(`Failed to stat '${path}': No such file or directory`);
+    }
+    const conversion = await this.worktreeAccess?.contentFilter?.checkin(path);
+    const cleaned = conversion
+      ? await conversion.apply(bytes, {
+          write: true,
+          onWarning: (message) => errors.push(`warning: ${message}\n`),
+        })
+      : bytes;
+    return this.blobs.store([cleaned], cleaned.length);
+  }
+
+  /**
+   * The content of the file at `path` (under `.git/`, or in the worktree), symbolic links
+   * followed as `stat`/`open` follow them: the FilesApi never follows a link, so a link the
+   * worktree reports (`.git/` inside it) is read, and its target, relative to the link's
+   * directory, read in turn. Undefined when nothing is there (a dangling link); a link to an
+   * absolute path (outside what the FilesApi reaches) also reads as undefined.
+   */
+  private async readFollowingLinks(path: string): Promise<Uint8Array | undefined> {
+    const worktree = this.worktreeAccess;
+    let current = path;
+    for (let hops = 0; hops < 40; hops++) {
+      const entry = await worktree?.getEntry(current).catch(() => undefined);
+      if (entry && (entry.mode & 0o170000) === 0o120000 && worktree) {
+        const target = decodeGitPath(await collectChunks(worktree.readContent(current)));
+        if (target.startsWith("/")) return undefined;
+        const dir = current.slice(0, current.lastIndexOf("/") + 1);
+        const parts: string[] = [];
+        for (const part of `${dir}${target}`.split("/")) {
+          if (part === "" || part === ".") continue;
+          if (part === "..") {
+            if (parts.length === 0) return undefined;
+            parts.pop();
+          } else parts.push(part);
+        }
+        current = parts.join("/");
+        continue;
+      }
+      if (current.startsWith(".git/")) {
+        return this.checkout.readStateFile?.(current.slice(".git/".length));
+      }
+      if (!entry || entry.isDirectory || !worktree) return undefined;
+      return collectChunks(worktree.readContent(current));
+    }
+    return undefined;
   }
 
   /** refs_resolve_refdup of a symbolic ref: the name it ends at. */

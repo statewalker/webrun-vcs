@@ -15,6 +15,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -863,5 +864,211 @@ describeGit("git notes, native twins", () => {
         for (const repo of [t.native, t.ours])
           build(repo, "config", "--unset", c.config[0] as string);
     }
+  });
+
+  it("a symbolic notes ref is updated through to the ref it points at (both reflogs)", async () => {
+    const t = twins((repo) => {
+      const r = (...a: string[]) => {
+        const x = spawnSync("git", a, { cwd: repo, env: envOf(), encoding: "utf8" });
+        if (x.status !== 0) throw new Error(x.stderr);
+      };
+      r("notes", "--ref", "real", "add", "-m", "r", "HEAD");
+      r("symbolic-ref", "refs/notes/commits", "refs/notes/real");
+      r("notes", "--ref", "other", "add", "-m", "o", "HEAD");
+      r("notes", "--ref", "other", "add", "-m", "o2", "HEAD~1");
+    });
+    const symref = (repo: string) => gitOk(repo, "symbolic-ref", "refs/notes/commits");
+    await step(t, ["notes", "add", "-f", "-m", "x"], (g) =>
+      g.notes().add().setForce(true).addMessage("x").call(),
+    );
+    expect(symref(t.ours)).toBe("refs/notes/real\n");
+    await step(t, ["notes", "remove", "HEAD"], (g) => g.notes().remove().addObjects("HEAD").call());
+    await step(t, ["notes", "merge", "-s", "ours", "other"], (g) =>
+      g.notes().merge().setStrategy("ours").setRemoteRef("other").call(),
+    );
+    expect(symref(t.ours)).toBe("refs/notes/real\n");
+    // a conflicted merge concluded: NOTES_MERGE_REF names the symref, --commit updates the
+    // ref it ends at
+    await step(t, ["notes", "--ref", "other", "add", "-f", "-m", "o3", "HEAD~1"], (g) =>
+      g.notes("other").add().setForce(true).addMessage("o3").setObject("HEAD~1").call(),
+    );
+    await step(t, ["notes", "add", "-f", "-m", "l3", "HEAD~1"], (g) =>
+      g.notes().add().setForce(true).addMessage("l3").setObject("HEAD~1").call(),
+    );
+    await step(t, ["notes", "merge", "other"], (g) =>
+      g.notes().merge().setRemoteRef("other").call(),
+    );
+    await step(t, ["notes", "merge", "--commit"], (g) => g.notes().merge().setCommit(true).call());
+    expect(symref(t.ours)).toBe("refs/notes/real\n");
+  });
+
+  it("a non-note of a subtree read while writing that sorts before one written is dropped", async () => {
+    const t = twins();
+    for (const repo of [t.native, t.ours]) {
+      const mk = (input: string) =>
+        spawnSync("git", ["mktree"], {
+          cwd: repo,
+          env: nativeGitEnv(home),
+          input,
+          encoding: "utf8",
+        }).stdout.trim();
+      const blob = spawnSync("git", ["hash-object", "-w", "--stdin"], {
+        cwd: repo,
+        env: nativeGitEnv(home),
+        input: "data\n",
+        encoding: "utf8",
+      }).stdout.trim();
+      const cd = mk(`100644 blob ${blob}\tx.txt\n100644 blob ${blob}\t${"e".repeat(36)}\n`);
+      const ab = mk(`040000 tree ${cd}\tcd\n100644 blob ${blob}\tzz\n`);
+      const root = mk(`040000 tree ${ab}\tab\n`);
+      const commit = build(repo, "commit-tree", root, "-m", "hand made").trim();
+      build(repo, "update-ref", "refs/notes/commits", commit);
+    }
+    const object = "ab734d4bce3d75b71d1483975651e52328b69ffc";
+    await step(t, ["notes", "add", "-m", "hi", object], (g) =>
+      g.notes().add().addMessage("hi").setObject(object).call(),
+    );
+    const tree = gitOk(t.native, "ls-tree", "-r", "refs/notes/commits");
+    expect(tree).not.toContain("x.txt");
+    expect(gitOk(t.ours, "ls-tree", "-r", "refs/notes/commits")).toBe(tree);
+  });
+
+  it("the editor's template ends with what git show --stat --no-notes prints, commented", async () => {
+    const t = twins((repo) => {
+      const r = (...a: string[]) => {
+        const x = spawnSync("git", a, { cwd: repo, env: nativeGitEnv(home), encoding: "utf8" });
+        if (x.status !== 0) throw new Error(x.stderr);
+      };
+      r("tag", "-a", "-m", "tag message\n\n\tindented", "v2", "HEAD~1");
+      r("checkout", "-q", "-b", "m", "main");
+      r("merge", "-q", "--no-ff", "-m", "merged", "topic");
+      r("checkout", "-q", "main");
+    });
+    const capture = join(root, "capture.sh");
+    writeFileSync(
+      capture,
+      `#!/bin/sh\ncp "$1" "${join(root, "editmsg")}"\nprintf 'note of %s\\n' "$NOTE_OBJECT" >> "$1"\n`,
+    );
+    chmodSync(capture, 0o755);
+    const objects = ["HEAD", "m", "v2", "HEAD^{tree}", "HEAD:a.txt", "HEAD~2"];
+    for (const [i, object] of objects.entries()) {
+      if (i === 3) {
+        for (const repo of [t.native, t.ours]) build(repo, "config", "core.commentChar", ";");
+      }
+      let seen = "";
+      await step(
+        t,
+        ["notes", "add", "-f", object],
+        (g) =>
+          g
+            .notes()
+            .add()
+            .setForce(true)
+            .setObject(object)
+            .setEditor((text) => {
+              seen = text;
+              return `${text}note of ${object}\n`;
+            })
+            .call(),
+        {
+          env: { GIT_EDITOR: capture, NOTE_OBJECT: object },
+          label: `template of ${object}`,
+        },
+      );
+      expect(seen, object).toBe(
+        readFileSync(join(root, "editmsg"), "utf8").replace(/note of .*\n$/, ""),
+      );
+    }
+    // a missing object: git show dies, and so does the note's editing
+    const missing = "1234567890123456789012345678901234567890";
+    await step(
+      t,
+      ["notes", "add", "-f", missing],
+      (g) => g.notes().add().setForce(true).setObject(missing).call(),
+      { env: { GIT_EDITOR: ":" } },
+    );
+  });
+
+  it("a notes merge in progress elsewhere: the worktree's path, the merge's output kept", async () => {
+    const t = twins(mergeSetup);
+    await step(t, ["notes", "merge", "other"], (g) =>
+      g.notes().merge().setRemoteRef("other").call(),
+    );
+    for (const repo of [t.native, t.ours]) {
+      rmSync(join(repo, ".git/NOTES_MERGE_WORKTREE"), { recursive: true, force: true });
+    }
+    const n = git(t.native, ["notes", "merge", "other"]);
+    const mine = await ours(async () =>
+      (await open(t.ours)).notes().merge().setRemoteRef("other").call(),
+    );
+    expect(n.stderr).toContain(`is already in-progress at ${t.native}\n`);
+    expect(n.stdout).toContain("CONFLICT");
+    expect(mine).toEqual({ ...n, stderr: n.stderr.replaceAll(t.native, t.ours) });
+    expect(state(t.ours)).toBe(state(t.native));
+  });
+
+  it("merge --commit: notes cleaned as git add cleans them, the ref checked, bad booleans", async () => {
+    const t = twins(mergeSetup);
+    for (const repo of [t.native, t.ours]) build(repo, "config", "core.autocrlf", "true");
+    await step(t, ["notes", "merge", "other"], (g) =>
+      g.notes().merge().setRemoteRef("other").call(),
+    );
+    for (const repo of [t.native, t.ours]) {
+      const head = build(repo, "rev-parse", "HEAD").trim();
+      const topic1 = build(repo, "rev-parse", "topic~1").trim();
+      writeFileSync(join(repo, ".git/NOTES_MERGE_WORKTREE", head), "crlf\r\nresolved\r\n");
+      // a symbolic link: git stat()s it, and stores the file it points at
+      writeFileSync(join(repo, ".git/target.txt"), "linked\r\n");
+      rmSync(join(repo, ".git/NOTES_MERGE_WORKTREE", topic1));
+      symlinkSync("../target.txt", join(repo, ".git/NOTES_MERGE_WORKTREE", topic1));
+    }
+    // the notes ref moved meanwhile: the update expects the partial commit's first parent
+    const other = (repo: string) => build(repo, "rev-parse", "refs/notes/other").trim();
+    const kept = (repo: string) => build(repo, "rev-parse", "refs/notes/commits").trim();
+    const before = { native: kept(t.native), ours: kept(t.ours) };
+    for (const repo of [t.native, t.ours]) {
+      build(repo, "update-ref", "refs/notes/commits", other(repo));
+    }
+    const n = git(t.native, ["notes", "merge", "--commit"]);
+    expect(n.status).toBe(128);
+    const mine = await ours(async () =>
+      (await open(t.ours)).notes().merge().setCommit(true).call(),
+    );
+    expect(mine).toEqual(n);
+    expect(state(t.ours)).toBe(state(t.native));
+    for (const repo of [t.native, t.ours]) {
+      build(
+        repo,
+        "update-ref",
+        "refs/notes/commits",
+        repo === t.native ? before.native : before.ours,
+      );
+    }
+    await step(t, ["notes", "merge", "--commit"], (g) => g.notes().merge().setCommit(true).call());
+    expect(gitOk(t.ours, "ls-tree", "-r", "refs/notes/commits")).toBe(
+      gitOk(t.native, "ls-tree", "-r", "refs/notes/commits"),
+    );
+    expect(gitOk(t.native, "notes", "show", "HEAD")).toBe("crlf\nresolved\n");
+    expect(gitOk(t.native, "notes", "show", "topic~1")).toBe("linked\n");
+    // notes.rewrite.<cmd> that is no boolean: git_config_bool dies
+    for (const repo of [t.native, t.ours]) {
+      build(repo, "config", "notes.rewriteRef", "refs/notes/commits");
+      build(repo, "config", "notes.rewrite.rebase", "maybe");
+    }
+    await step(
+      t,
+      ["notes", "copy", "--for-rewrite=rebase"],
+      (g) => g.notes().copy().setForRewrite("rebase").setStdin("HEAD HEAD~1\n").call(),
+      { input: "HEAD HEAD~1\n" },
+    );
+    for (const repo of [t.native, t.ours]) build(repo, "config", "notes.rewrite.amend", "2x");
+    const amend = git(t.native, ["commit", "--amend", "-m", "amended"]);
+    expect(amend.status).toBe(128);
+    expect(amend.stderr).toBe("fatal: bad boolean config value '2x' for 'notes.rewrite.amend'\n");
+    const g = await open(t.ours);
+    await expect(g.commit().setAmend(true).setMessage("amended").call()).rejects.toThrow(
+      "bad boolean config value '2x' for 'notes.rewrite.amend'",
+    );
+    expect(gitOk(t.ours, "cat-file", "-p", "HEAD")).toBe(gitOk(t.native, "cat-file", "-p", "HEAD"));
   });
 });

@@ -1,7 +1,10 @@
-import type { ObjectId } from "@statewalker/vcs-core";
+import { type ObjectId, parsePersonIdent } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import { type DateMode, DEFAULT_DATE_MODE, parseDateMode, showDate } from "./date-format.js";
+import { LogCommand } from "./log-command.js";
 import { commentPrefixOf, stripspace } from "./message-cleanup.js";
 import {
   commitNotes,
@@ -16,6 +19,34 @@ import {
   type NotesHandle,
 } from "./notes-support.js";
 import { combineNotesOverwrite, readNoteBytes } from "./notes-tree.js";
+
+/** strbuf_add_commented_lines: each line after the comment string (and a space, unless empty or tab-led). */
+function commentedLines(text: string, comment: string): string {
+  if (text === "") return "";
+  let out = "";
+  let at = 0;
+  while (at < text.length) {
+    let end = text.indexOf("\n", at);
+    end = end < 0 ? text.length : end + 1;
+    const line = text.slice(at, end);
+    out += comment;
+    if (line[0] !== "\n" && line[0] !== "\t") out += " ";
+    out += line;
+    at = end;
+  }
+  return out.endsWith("\n") ? out : `${out}\n`;
+}
+
+function concat(chunks: Uint8Array[]): Uint8Array {
+  if (chunks.length === 1) return chunks[0] as Uint8Array;
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
 
 /**
  * What a `git notes` subcommand printed and how it ended: `output` is its standard output,
@@ -308,11 +339,24 @@ abstract class NotesMessageCommand<T> extends NotesSubcommand<T> {
    * template (the message, else the note there, then the commented instructions), the
    * result cleaned up of comments unless `--no-stripspace`.
    */
-  protected async prepare(d: NoteData, oldNote: ObjectId | undefined): Promise<string> {
+  protected async prepare(
+    d: NoteData,
+    oldNote: ObjectId | undefined,
+    object: ObjectId,
+    errors: string[],
+  ): Promise<string> {
     if (!d.useEditor && d.count > 0) return d.buf;
     const comment = commentPrefixOf(this.workingCopy);
     let text = d.count > 0 ? d.buf : oldNote ? ((await this.readNoteText(oldNote)) ?? "") : "";
     text += `\n${comment}\n${comment} ${NOTE_TEMPLATE}\n${comment}\n`;
+    // write_commented_object: `git show --stat --no-notes <object>`, commented
+    const shown = await this.showObject(object);
+    if (shown === undefined) {
+      const error = new NotesError(`failed to finish 'show' for object '${object}'`);
+      error.errors = `${errors.join("")}fatal: bad object ${object}\n`;
+      throw error;
+    }
+    text += commentedLines(decodeGitPath(shown), comment);
     let edited: string;
     try {
       edited = this.editor ? await this.editor(text) : text;
@@ -321,6 +365,103 @@ abstract class NotesMessageCommand<T> extends NotesSubcommand<T> {
     }
     if (d.stripspace !== NO_STRIPSPACE) edited = stripspace(edited, comment);
     return edited;
+  }
+
+  /**
+   * What `git show --stat --no-notes <id>` prints to a pipe (builtin/log.c's cmd_show): a
+   * commit as `git log` shows it (with its `--stat`, a merge's against its first parent), a
+   * tag's header (`tag <name>`, `Tagger:`/`Date:`) and message and then the object it tags,
+   * a tree's `tree <id>` and its names (directories with a `/`), a blob's content.
+   * Undefined when there is no such object (git's `fatal: bad object <id>`).
+   */
+  protected async showObject(id: ObjectId, depth = 0): Promise<Uint8Array | undefined> {
+    const objects = this.workingCopy.history?.objects;
+    const obj = await objects?.get(id).catch(() => undefined);
+    let type = obj?.type;
+    let bytes: Uint8Array | undefined;
+    if (obj) {
+      if (obj.bytes) {
+        bytes = obj.bytes;
+        await obj.content[Symbol.asyncIterator]().return?.();
+      } else {
+        const chunks: Uint8Array[] = [];
+        for await (const c of obj.content) chunks.push(c);
+        bytes = concat(chunks);
+      }
+    } else if (!objects) {
+      // typed stores without the object kernel
+      if (await this.commits.has(id).catch(() => false)) type = "commit";
+      else if (await this.trees.has(id).catch(() => false)) type = "tree";
+      else if (await this.blobs.has(id).catch(() => false)) {
+        type = "blob";
+        bytes = await readNoteBytes(this.blobs, id);
+      }
+    }
+    switch (type) {
+      case "commit":
+        return new LogCommand(this.workingCopy)
+          .add(id)
+          .setMaxCount(1)
+          .callBytes({ stat: true, notes: false, diffMerges: "dense-combined" });
+      case "blob":
+        return bytes ?? new Uint8Array();
+      case "tree": {
+        let out = `tree ${id}\n\n`;
+        for await (const e of this.trees.loadTree(id)) {
+          out += `${e.name}${(e.mode & 0o170000) === 0o040000 ? "/" : ""}\n`;
+        }
+        return encodeGitPath(out);
+      }
+      case "tag": {
+        if (!bytes || depth > 32) return undefined;
+        const raw = decodeGitPath(bytes);
+        let name = "";
+        let target = "";
+        let header = "";
+        let offset = 0;
+        while (offset < raw.length && raw[offset] !== "\n") {
+          let end = raw.indexOf("\n", offset);
+          end = end < 0 ? raw.length : end + 1;
+          const line = raw.slice(offset, end).replace(/\n$/, "");
+          if (line.startsWith("object ")) target = line.slice(7);
+          else if (line.startsWith("tag ")) name = line.slice(4);
+          else if (line.startsWith("tagger ")) header += this.tagger(line.slice(7));
+          offset = end;
+        }
+        const head = encodeGitPath(`tag ${name}\n${header}${raw.slice(offset)}`);
+        const rest = await this.showObject(target, depth + 1);
+        if (rest === undefined) return undefined;
+        // log_tree_commit's separator: a commit shown after the tag starts a new entry
+        const sep = (await this.commits.has(target).catch(() => false))
+          ? encodeGitPath("\n")
+          : new Uint8Array();
+        return concat([head, sep, rest]);
+      }
+      default:
+        return undefined;
+    }
+  }
+
+  /** builtin/log.c's show_tagger: `Tagger:` and `Date:` lines as `git show` prints them. */
+  private tagger(ident: string): string {
+    let mode: DateMode = DEFAULT_DATE_MODE;
+    const spec = RemoteConfigStore.from(this.workingCopy).value("log.date");
+    if (spec !== undefined) {
+      try {
+        mode = parseDateMode(spec);
+      } catch {
+        // git dies on a bad log.date before it gets here
+      }
+    }
+    try {
+      const who = parsePersonIdent(ident);
+      return (
+        `Tagger: ${who.name} <${who.email}>\n` +
+        `Date:   ${showDate(who.timestamp, who.tzOffset, mode)}\n`
+      );
+    } catch {
+      return `Tagger: ${ident}\n`;
+    }
   }
 
   protected async writeNote(text: string): Promise<ObjectId> {
@@ -340,7 +481,7 @@ abstract class NotesMessageCommand<T> extends NotesSubcommand<T> {
     const object = await this.resolveObject(objectRef);
     const t = await this.initCheck(subcommand, true);
     const note = await t.tree.get(object);
-    let buf = await this.prepare(d, edit && note ? note : undefined);
+    let buf = await this.prepare(d, edit && note ? note : undefined, object, errors);
     if (note && !edit) {
       const prevBytes = await readNoteBytes(this.blobs, note);
       if (!prevBytes) throw new NotesError(`unable to read ${note}`);
@@ -419,7 +560,7 @@ export class NotesAddCommand extends NotesMessageCommand<NotesResult> {
       }
       errors.push(`Overwriting existing notes for object ${object}\n`);
     }
-    const buf = await this.prepare(d, note);
+    const buf = await this.prepare(d, note, object, errors);
     if (buf.length > 0 || d.allowEmpty) {
       const id = await this.writeNote(buf);
       await t.tree.add(object, id, combineNotesOverwrite);
@@ -701,7 +842,10 @@ export class NotesPruneCommand extends NotesSubcommand<NotesPruneResult> {
     return { exitCode: 0, output, errors: "", pruned: missing };
   }
 
+  /** odb_has_object: one typeless lookup where the store has its object kernel. */
   private async objectExists(id: ObjectId): Promise<boolean> {
+    const objects = this.workingCopy.history?.objects;
+    if (objects) return objects.has(id).catch(() => false);
     for (const s of [this.blobs, this.trees, this.commits, this.tagsStore]) {
       if (s && (await s.has(id).catch(() => false))) return true;
     }
