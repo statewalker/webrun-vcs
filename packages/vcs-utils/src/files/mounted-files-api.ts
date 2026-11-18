@@ -113,6 +113,13 @@ class RoutedFilesApi implements PosixFilesApi {
     await append.catch((e) => this.outerError(e, r, path));
   }
 
+  /** The mounted FilesApi's own touch; false where it has none. */
+  async touch(path: string, mtimeMs?: number): Promise<boolean> {
+    const r = this.at(path);
+    if (!r.files.touch) return false;
+    return r.files.touch(r.path, mtimeMs).catch((e) => this.outerError(e, r, path));
+  }
+
   async mkdir(path: string): Promise<void> {
     const r = this.at(path);
     await r.files.mkdir(r.path).catch((e) => this.outerError(e, r, path));

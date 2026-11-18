@@ -81,15 +81,17 @@ export async function beginFilesQuarantine(
   const { files, objectsDir, freshenMaxAgeMs } = options;
   const freshenWindow = freshenMaxAgeMs ?? DEFAULT_FRESHEN_MAX_AGE_MS;
   /**
-   * "absent", "fresh" or "stale" (last modified longer ago than the freshen window): a stale
-   * target is replaced by the quarantined copy (the same bytes), which renews its mtime, as
-   * git's freshen; an unknown age counts as fresh.
+   * "absent", "fresh" or "stale" (last modified longer ago than the freshen window and not
+   * renewed by `FilesApi.touch`): a stale target is replaced by the quarantined copy (the same
+   * bytes), which renews its mtime, as git's freshen; an unknown age counts as fresh.
    */
   const targetState = async (path: string) => {
     const st = await files.stats(path);
     if (st?.kind !== "file") return "absent";
     const m = st.lastModified;
-    return m !== undefined && Date.now() - m > freshenWindow ? "stale" : "fresh";
+    if (m === undefined || Date.now() - m <= freshenWindow) return "fresh";
+    // old: its mtime renewed in place where the FilesApi can (git's utime), else replaced
+    return files.touch && (await files.touch(path).catch(() => false)) ? "fresh" : "stale";
   };
   const dir = joinPath(objectsDir, `${QUARANTINE_DIR_PREFIX}${timestampedId()}`);
   const packDir = joinPath(dir, "pack");

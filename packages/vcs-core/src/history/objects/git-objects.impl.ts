@@ -9,7 +9,13 @@
  * (`inflateWhole`), its content handed out in memory (`GitObject.bytes`); one that is not plainly
  * sound goes through the streaming read, which reports it as before.
  */
-import { createInflaterPool, deflate, inflateWhole } from "@statewalker/vcs-utils/compression";
+import {
+  createInflaterPool,
+  deflate,
+  deflateSync,
+  inflateWhole,
+  LOOSE_OBJECT_COMPRESSION_LEVEL,
+} from "@statewalker/vcs-utils/compression";
 import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { SizeMismatchError } from "@statewalker/vcs-utils/pack";
@@ -115,6 +121,22 @@ async function* checkedRaw(
   if (seen !== header.size) throw sizeError(header.size, seen);
 }
 
+/** Releases a source that will not be read (`return()` on its iterator). */
+function closeSource(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): void {
+  try {
+    const it =
+      Symbol.asyncIterator in Object(content)
+        ? (content as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
+        : (content as Iterable<Uint8Array>)[Symbol.iterator]();
+    const r = it.return?.();
+    if (r && typeof (r as Promise<unknown>).then === "function") {
+      (r as Promise<unknown>).then(undefined, () => {});
+    }
+  } catch {
+    // nothing to close
+  }
+}
+
 function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length);
   out.set(a);
@@ -128,6 +150,13 @@ const LOOSE_WHOLE_MAX = 64 * 1024;
 const SMALL_MAX = 64 * 1024;
 /** Stored bytes from which a loose object's header is read (`probeHead`). */
 const PROBE_BYTES = 4096;
+/**
+ * Objects held in memory up to this size are compressed with one synchronous call
+ * (`deflateSync`), at git's level for loose objects; larger ones stream through `deflate`.
+ */
+const SYNC_DEFLATE_MAX = 64 * 1024;
+/** git's zlib level for loose objects (`core.looseCompression` unset: `Z_BEST_SPEED`). */
+const LOOSE_LEVEL = LOOSE_OBJECT_COMPRESSION_LEVEL;
 /** Objects up to this size are handed out whole; larger ones stream. */
 const WHOLE_MAX = 1024 * 1024;
 
@@ -376,28 +405,42 @@ export function createGitObjects(
   ): Promise<string> {
     if (!TYPES.has(type)) throw new TypeError(`unknown object type ${type}`);
     if (!Number.isSafeInteger(size) || size < 0) throw new RangeError(`bad object size ${size}`);
-    // content held in memory: hashed first, and an object already stored is not written
-    // again (git's write_object_file: freshen_object before writing)
-    if (store.isFresh && Array.isArray(content)) {
+    // Content held in memory is hashed first, and an object already stored is not written
+    // again (git's write_object_file: odb_freshen_object before writing). The write that
+    // follows uses that id: the content is not hashed twice, and the store need not look
+    // for the object again. A small one is compressed in one synchronous call, at git's
+    // level for loose objects.
+    let known: string | undefined;
+    if (Array.isArray(content)) {
       const chunks = content as Uint8Array[];
       let total = 0;
       for (const chunk of chunks) total += chunk.length;
       if (total === size) {
+        const header = enc.encode(`${type} ${size}\0`);
         const first = newHasher();
-        first.update(enc.encode(`${type} ${size}\0`));
+        first.update(header);
         for (const chunk of chunks) first.update(chunk);
         const id = hex(first);
-        if (await store.isFresh(id)) return id;
+        if (store.isFresh && (await store.isFresh(id))) return id;
+        const checked = store.isFresh ? { notFresh: true } : undefined;
+        if (size <= SYNC_DEFLATE_MAX) {
+          const stored = deflateSync([header, ...chunks], { level: LOOSE_LEVEL });
+          return (await store.putStaged(once(stored), () => id, checked)).id;
+        }
+        known = id;
       }
     }
-    const hasher = newHasher();
+    const hasher = known === undefined ? newHasher() : undefined;
     async function* framed() {
       yield enc.encode(`${type} ${size}\0`);
       yield* content;
     }
     const sizeError = (declared: number, actual: number) => new SizeMismatchError(declared, actual);
-    const r = await store.putStaged(deflate(checkedRaw(framed(), { hasher, sizeError })), () =>
-      hex(hasher),
+    const id = known;
+    const r = await store.putStaged(
+      deflate(checkedRaw(framed(), { hasher, sizeError })),
+      () => id ?? hex(hasher as Hasher),
+      id !== undefined && store.isFresh ? { notFresh: true } : undefined,
     );
     return r.id;
   }
@@ -455,14 +498,42 @@ export function createGitObjects(
     },
     async putRaw(id, rawBytes) {
       checkId(id);
+      // the id is known up front: an object already stored is only freshened, its bytes not
+      // read (git's write_object_file, which hashes the buffer first; index-pack and
+      // unpack-objects skip what the repository has)
+      if (store.isFresh && (await store.isFresh(id))) {
+        closeSource(rawBytes);
+        return;
+      }
       const hasher = newHasher();
-      await store.putStaged(deflate(checkedRaw(rawBytes, { hasher })), () => {
-        const actual = hex(hasher);
-        if (actual !== id) {
-          throw new ObjectIdMismatchError(`supplied id ${id}, content hashes to ${actual}`);
+      const checked = store.isFresh ? { notFresh: true } : undefined;
+      if (Array.isArray(rawBytes)) {
+        // held in memory (an unpacked object): checked and hashed, then compressed at once
+        let total = 0;
+        for (const chunk of rawBytes as Uint8Array[]) total += chunk.length;
+        if (total <= SYNC_DEFLATE_MAX + MAX_HEADER) {
+          const framed: Uint8Array[] = [];
+          for await (const chunk of checkedRaw(rawBytes, { hasher })) framed.push(chunk);
+          const actual = hex(hasher);
+          if (actual !== id) {
+            throw new ObjectIdMismatchError(`supplied id ${id}, content hashes to ${actual}`);
+          }
+          const stored = deflateSync(framed, { level: LOOSE_LEVEL });
+          await store.putStaged(once(stored), () => id, checked);
+          return;
         }
-        return id;
-      });
+      }
+      await store.putStaged(
+        deflate(checkedRaw(rawBytes, { hasher })),
+        () => {
+          const actual = hex(hasher);
+          if (actual !== id) {
+            throw new ObjectIdMismatchError(`supplied id ${id}, content hashes to ${actual}`);
+          }
+          return id;
+        },
+        checked,
+      );
     },
 
     getRaw(id) {

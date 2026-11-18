@@ -53,7 +53,9 @@ export function skipPacked(store: StagingBlobStore, packs: PackSet): StagingBlob
     ...(looseFresh
       ? { isFresh: async (id: string) => (await packs.freshen(id)) || (await looseFresh(id)) }
       : {}),
-    async putStaged(bytes, idOf) {
+    async putStaged(bytes, idOf, options) {
+      // `isFresh` (packs, then loose) said no just before: nothing to look up again
+      if (options?.notFresh) return store.putStaged(bytes, idOf, options);
       let packedId: string | undefined;
       try {
         return await store.putStaged(bytes, async () => {

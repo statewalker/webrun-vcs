@@ -57,11 +57,13 @@ export interface OpenPackSetOptions {
   /** Objects outside the set (loose objects), for REF_DELTA bases no pack holds. */
   externalBase?: (id: ObjectId) => Promise<GitObject | undefined>;
   /**
-   * `freshen` is false for a pack whose `.pack` file was last modified longer ago than this, so
-   * the object is written loose again. git freshens such a pack by touching its mtime, which
-   * keeps a gc running at the same time from expiring the object; FilesApi cannot set mtimes,
-   * so the fresh loose copy plays that part. Default one hour (git's freshen window). A pack
-   * whose mtime is unknown is trusted: gc keeps the unreachable objects of such packs loose.
+   * A pack whose `.pack` file was last modified longer ago than this is freshened by a write of
+   * an object it holds: its mtime renewed (`FilesApi.touch`), as git's freshen_packed_object
+   * touches it, which keeps a gc running at the same time from expiring the object. Where the
+   * FilesApi cannot set times, `freshen` is false for such a pack and the object is written
+   * loose again, the fresh loose copy playing that part. Default one hour (git's freshen
+   * window). A pack whose mtime is unknown is trusted: gc keeps the unreachable objects of
+   * such packs loose.
    */
   freshenMaxAgeMs?: number;
 }
@@ -76,9 +78,11 @@ export interface PackSet {
    * dropped. A pack whose file was seen less than `rescanIntervalMs` ago (at most 1 s) is trusted
    * without another check (git checks once per pack per process): a write made in that window
    * after the pack was deleted is skipped and not retried. No rescan: a miss only means the
-   * object is written loose. False also when the holding pack's file is older than
-   * `freshenMaxAgeMs` (default one hour): the object is then written loose again, with the
-   * current time, so a concurrent gc does not expire it with its old pack.
+   * object is written loose. A holding pack's file older than `freshenMaxAgeMs` (default one
+   * hour) has its mtime renewed (`FilesApi.touch`); where that cannot be done, false: the object
+   * is then written loose again, with the current time, so a concurrent gc does not expire it
+   * with its old pack. A cruft pack (one with a `.mtimes` file) never counts, whatever its age,
+   * as git's `is_cruft` check: gc expires its objects by their times in `.mtimes`.
    */
   freshen(id: ObjectId): Promise<boolean>;
   /**
@@ -170,6 +174,39 @@ export async function openPackSet(
   const seenAt = new WeakMap<PackFile, { at: number; modified?: number }>();
   const young = (modified: number | undefined, now: number) =>
     modified === undefined || now - modified <= freshenMaxAge;
+  /**
+   * Renews the mtime of an old pack's `.pack` file, as git's freshen_packed_object does
+   * (`utime`), where the FilesApi can (`touch`); false where it cannot, and the object is then
+   * written loose again, which plays that part.
+   */
+  const renew = async (p: PackFile, now: number): Promise<boolean> => {
+    if (!files.touch || !(await files.touch(p.packPath).catch(() => false))) return false;
+    seenAt.set(p, { at: now, modified: now });
+    return true;
+  };
+  /**
+   * Whether a pack is a cruft pack (it has a `.mtimes` file), looked up once per pack: git's
+   * freshen_packed_object refuses those (`is_cruft`), as gc expires their objects by the
+   * per-object times in `.mtimes`, which touching the pack does not renew; the object is then
+   * written loose, a copy gc keeps until it is old.
+   */
+  const cruft = new WeakMap<PackFile, Promise<boolean>>();
+  const isCruft = (p: PackFile): Promise<boolean> => {
+    let c = cruft.get(p);
+    if (c === undefined) {
+      const mtimes = `${p.packPath.replace(/\.pack$/, "")}.mtimes`;
+      c = files.stats(mtimes).then(
+        (st) => st !== undefined,
+        // unknown: treat as cruft (the object is written loose) and ask again next time
+        () => {
+          cruft.delete(p);
+          return true;
+        },
+      );
+      cruft.set(p, c);
+    }
+    return c;
+  };
   /** copies found corrupt, per pack */
   const bad = new WeakMap<PackFile, Set<ObjectId>>();
   /** copies ever marked bad (none: no lookup in `bad`) */
@@ -524,16 +561,19 @@ export async function openPackSet(
       if (!isId(id)) return false;
       for (const p of [...packs]) {
         if (!holds(p, id)) continue;
+        if (await isCruft(p)) continue; // its times are in .mtimes: written loose
         const now = Date.now();
         const seen = seenAt.get(p);
         if (seen !== undefined && now - seen.at < freshenTrust) {
           if (young(seen.modified, now)) return true;
-          continue; // too old to rely on: written loose again, as git touches the pack
+          if (await renew(p, now)) return true;
+          continue; // too old to rely on: written loose again
         }
         const stats = await files.stats(p.packPath);
         if (stats?.kind === "file") {
           seenAt.set(p, { at: now, modified: stats.lastModified });
           if (young(stats.lastModified, now)) return true;
+          if (await renew(p, now)) return true;
           continue;
         }
         drop(p); // deleted behind our back (git repack -a -d, gc): the object must be written

@@ -349,6 +349,13 @@ class SymlinkFilesApi implements PosixFilesApi {
     else await appendByRewrite(this.base, p, content);
   }
 
+  /** The base FilesApi's touch of a regular file; false for a link or where it has none. */
+  async touch(path: string, mtimeMs?: number): Promise<boolean> {
+    const { path: p, table } = await this.resolve(path);
+    if (!this.base.touch || (await this.linkAt(table, p))) return false;
+    return this.base.touch(p, mtimeMs);
+  }
+
   async mkdir(path: string): Promise<void> {
     const { path: p, table } = await this.resolve(path);
     await this.mkdirs(p, table, path);

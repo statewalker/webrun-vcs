@@ -315,8 +315,11 @@ async function unpackUnreachable(o: {
       if (o.reachable.has(id) || o.keep.some((p) => p.has(id))) continue;
       if (o.loosened.has(id)) continue;
       o.loosened.add(id);
-      // Young (or of unknown age) loose copy: kept as it is; an old one is renewed
-      if (await staging.isFresh(id)) continue;
+      // Young (or of unknown age) loose copy: kept as it is; an old one is renewed (touched
+      // where the FilesApi can, else written again below)
+      const kept = await staging.renew(id);
+      if (kept === "renewed") written++;
+      if (kept) continue;
       await loose.putRaw(id, o.objects.getRaw(id));
       written++;
     }

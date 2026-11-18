@@ -10,28 +10,56 @@
  * Node one in `@statewalker/webrun-files-node` 0.10) holds the compressed object.
  * Content of unknown size is spooled (`spool`) to a `tmp_obj_*` file first.
  *
- * A write of an object whose loose file is older than `freshenMaxAgeMs` (one hour by default)
- * moves the new temporary over it, so the rename renews its mtime and a concurrent gc keeps it
- * for its grace period, as git's `freshen_loose_object` does by touching the file. A younger
- * file, or one whose mtime the FilesApi does not report, is kept as it is: `PackSet.freshen`
- * trusts a pack of unknown age the same way.
+ * Writing an object that is already there writes nothing (git's `odb_freshen_object` before
+ * `write_loose_object`): the loose file has its mtime renewed (`FilesApi.touch`, git's
+ * `utime`) on every such write, as git's check_and_freshen_file, so a concurrent gc keeps it
+ * for its grace period. Where the FilesApi cannot set times, a file older than
+ * `freshenMaxAgeMs` (one hour by default) has the new temporary moved over it instead, which
+ * renews it as well, and a younger file, or one whose mtime the FilesApi does not report, is
+ * kept as it is: `PackSet.freshen` trusts a pack of unknown age the same way.
+ *
+ * With `cacheDirectoryChecks`, where the FilesApi offers a batch view
+ * (`PosixFilesApi.withLstatCache`, as the Node one does), the store keeps one for its life:
+ * the directories of the object database (`objects/`, its fan-out directories) are checked
+ * not to be symbolic links at most once a second (`maxAgeMs: 1000`), not on every write, as
+ * git creates a fan-out directory once and never checks it again. The view forgets what it
+ * verified on any ENOENT/ENOTDIR/ELOOP, so a fan-out directory a prune removed is made again.
+ * A fan-out directory replaced by a symbolic link within that second is followed by the
+ * writes made meanwhile: accepted, as git itself follows such links in `objects/` (it never
+ * lstats them), and only paths below `objects/` go through the view.
  */
 import { noteObjectRemoved, type StagingBlobStore } from "@statewalker/vcs-core";
-import { type FilesApi, joinPath, moveCompleting } from "@statewalker/vcs-utils/files";
+import {
+  type FilesApi,
+  joinPath,
+  moveCompleting,
+  type PosixFilesApi,
+} from "@statewalker/vcs-utils/files";
 
 const FANOUT = /^[0-9a-f]{2}$/;
 const REST = /^[0-9a-f]{38}$/;
 const TMP_PREFIX = "tmp_obj_";
 /** git's freshen window, as `PackSet`'s `freshenMaxAgeMs`. */
 const DEFAULT_FRESHEN_MAX_AGE_MS = 60 * 60 * 1000;
+/** How long `cacheDirectoryChecks` trusts a directory it verified not to be a link. */
+const DIRECTORY_CHECK_MAX_AGE_MS = 1000;
 
 export interface FilesStagingStoreOptions {
   /**
-   * A loose object last modified longer ago than this is rewritten when it is written again,
-   * which renews its mtime (git's `freshen_loose_object`). Default one hour, as `PackSet`'s
-   * `freshenMaxAgeMs`. A file whose mtime is unknown is never rewritten.
+   * Where the FilesApi cannot set times (no `touch`), a loose object last modified longer
+   * ago than this is rewritten when it is written again (git's `freshen_loose_object`);
+   * with `touch` it is touched on every such write. `renew` (repack's unpacking of
+   * unreachable objects) touches only a file older than this. Default one hour, as
+   * `PackSet`'s `freshenMaxAgeMs`. A file whose mtime is unknown is never rewritten.
    */
   freshenMaxAgeMs?: number;
+  /**
+   * Keep a batch view of the FilesApi for the store's life (`PosixFilesApi.withLstatCache`,
+   * where it has one), so the directories of the object database are checked not to be
+   * symbolic links at most once a second rather than on every write (see above). Default
+   * false; `createGitFilesBackend` turns it on.
+   */
+  cacheDirectoryChecks?: boolean;
 }
 
 export interface FilesStagingStore extends StagingBlobStore {
@@ -43,17 +71,25 @@ export interface FilesStagingStore extends StagingBlobStore {
    */
   sweepStaged(olderThanMs: number): Promise<number>;
   /**
-   * Whether the loose object exists and needs no freshening: last modified within
-   * `freshenMaxAgeMs`, or of unknown age. A write of an object that is not fresh stores it
-   * (absent) or renews its mtime (old).
+   * Whether a write of the object can be skipped: the loose file exists and this call renewed
+   * its mtime (`FilesApi.touch`, as git on every write), or, where it cannot be touched, it
+   * was last modified within `freshenMaxAgeMs` (or its age is unknown). False when it is
+   * absent, or old and cannot be touched: the write then stores it (and so renews it).
    */
   isFresh(id: string): Promise<boolean>;
+  /**
+   * Whether an unpacked copy needs writing, telling apart a copy within `freshenMaxAgeMs` (or
+   * of unknown age), left as it is ("fresh"), from an older one whose mtime this call renewed
+   * ("renewed"); undefined when a write is needed (absent, or old and the FilesApi cannot set
+   * times).
+   */
+  renew(id: string): Promise<"fresh" | "renewed" | undefined>;
 }
 
-/** git's temporary-object name: `tmp_obj_` plus random characters. */
-function tmpName(): string {
-  const r = crypto.getRandomValues(new Uint8Array(9));
-  return `${TMP_PREFIX}${btoa(String.fromCharCode(...r)).replace(/[+/=]/g, "_")}`;
+/** Random characters for temporary names (`[0-9a-z]`). */
+function randomPart(length: number): string {
+  const r = crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(r, (b) => (b % 36).toString(36)).join("");
 }
 
 /**
@@ -70,25 +106,52 @@ export function filesStagingStore(
   options: FilesStagingStoreOptions = {},
 ): FilesStagingStore {
   const freshenMaxAge = options.freshenMaxAgeMs ?? DEFAULT_FRESHEN_MAX_AGE_MS;
+  // the store's own batch view: directories verified not to be links stay verified (see above)
+  const io: FilesApi =
+    (options.cacheDirectoryChecks &&
+      (files as PosixFilesApi).withLstatCache?.({ maxAgeMs: DIRECTORY_CHECK_MAX_AGE_MS })) ||
+    files;
+  // Temporary names: `tmp_obj_`, a random part per store (renewed on a collision) and a
+  // counter, as unique as git's mkstemp names without asking for random bytes per object.
+  let tmpBase = `${TMP_PREFIX}${randomPart(8)}`;
+  let tmpSeq = 0;
+  const tmpName = () => `${tmpBase}${(tmpSeq++).toString(36)}`;
   const pathOf = (id: string) => joinPath(objectsDir, id.slice(0, 2), id.slice(2));
-  const isFile = async (path: string) => (await files.stats(path))?.kind === "file";
+  const isFile = async (path: string) => (await io.stats(path))?.kind === "file";
   /** "absent", "fresh" (young or of unknown age) or "stale" (older than the freshen window) */
   const state = async (path: string) => {
-    const s = await files.stats(path);
+    const s = await io.stats(path);
     if (s?.kind !== "file") return "absent";
     const modified = s.lastModified;
     return modified !== undefined && Date.now() - modified > freshenMaxAge ? "stale" : "fresh";
   };
+  /** The mtime of a stale file renewed in place (git's utime), where the FilesApi can. */
+  const touch = async (path: string) =>
+    io.touch ? await io.touch(path).catch(() => false) : false;
+  const renew = async (id: string): Promise<"fresh" | "renewed" | undefined> => {
+    const path = pathOf(id);
+    const existing = await state(path);
+    if (existing === "fresh") return "fresh";
+    return existing === "stale" && (await touch(path)) ? "renewed" : undefined;
+  };
+  /**
+   * Whether a write of the file can be skipped, as git's check_and_freshen_file: the file is
+   * touched on every such write (git's utime). Where that fails (no such file, a FilesApi
+   * without `touch`, or a composite one whose storage cannot set times), a young file (or
+   * one of unknown age) is kept, and an old or absent one written.
+   */
+  const freshen = async (path: string): Promise<boolean> =>
+    (await touch(path)) || (await state(path)) === "fresh";
   const ensureDir = async (dir: string) => {
-    if (!(await files.exists(dir))) await files.mkdir(dir);
+    if (!(await io.exists(dir))) await io.mkdir(dir);
   };
 
   return {
-    async putStaged(bytes, idOf) {
+    async putStaged(bytes, idOf, putOptions) {
       // The fewest operations: the temporary created with its content in one step (an
       // exclusive create where the FilesApi has one, which also creates `objects/`), the
-      // target looked at once, then one rename (whose FilesApi creates the fan-out
-      // directory; else it is made and the rename tried again).
+      // target looked at once (not at all after `isFresh` said no), then one rename (whose
+      // FilesApi creates the fan-out directory; else it is made and the rename tried again).
       // `bytes` is one-shot: it is iterated at most once. A create that found a file at the
       // temporary name (a collision) without reading the content is tried again under a
       // fresh name, as git's mkstemp does; one that read it and still answered `false` cannot
@@ -104,15 +167,16 @@ export function filesStagingStore(
       let tmp = joinPath(objectsDir, tmpName());
       let id: string;
       try {
-        if (!files.createExclusive) {
-          await files.write(tmp, once);
+        if (!io.createExclusive) {
+          await io.write(tmp, once);
         } else {
           for (let attempt = 0; ; attempt++) {
-            if (await files.createExclusive(tmp, once)) break;
+            if (await io.createExclusive(tmp, once)) break;
             if (started) {
               throw new Error(`could not create ${tmp}: the content was read but not stored`);
             }
             if (attempt >= 8) throw new Error(`could not create a temporary in ${objectsDir}`);
+            tmpBase = `${TMP_PREFIX}${randomPart(8)}`;
             tmp = joinPath(objectsDir, tmpName());
           }
         }
@@ -124,21 +188,16 @@ export function filesStagingStore(
       const target = pathOf(id);
       let moved = false;
       try {
-        // An existing object wins, as in git. Against a concurrent writer of the same
-        // new id, FilesApi.move may overwrite (git uses link() and EEXIST): both files
-        // hold the same bytes, so either rename leaves a valid object. An existing file
-        // older than the freshen window is replaced by the same bytes: the rename renews
-        // its mtime at once (git's freshen_loose_object touches it).
-        const existing = await state(target);
-        if (existing === "fresh") return { id, stored: false };
-        if (existing === "stale") {
-          moved = await moveCompleting(files, tmp, target);
-          return { id, stored: moved };
-        }
-        moved = await moveCompleting(files, tmp, target).catch(() => false);
+        // An existing object wins, as in git: it is touched (git's freshen_loose_object) or,
+        // where times cannot be set, kept when young and replaced by the same bytes when old,
+        // whose rename renews its mtime. Against a concurrent writer of the same new id,
+        // FilesApi.move may overwrite (git uses link() and EEXIST): both files hold the same
+        // bytes, so either rename leaves a valid object.
+        if (!putOptions?.notFresh && (await freshen(target))) return { id, stored: false };
+        moved = await moveCompleting(io, tmp, target).catch(() => false);
         if (moved) return { id, stored: true };
         await ensureDir(joinPath(objectsDir, id.slice(0, 2)));
-        moved = await moveCompleting(files, tmp, target);
+        moved = await moveCompleting(io, tmp, target);
         if (moved) return { id, stored: true };
         if (await isFile(target)) return { id, stored: false };
         throw new Error(`could not move ${tmp} to ${target}`);
@@ -180,7 +239,7 @@ export function filesStagingStore(
       // FilesApi that throws for it is asked whether the file is there
       const path = pathOf(id);
       try {
-        yield* files.read(path);
+        yield* io.read(path);
       } catch (e) {
         if (await isFile(path)) throw e;
       }
@@ -188,9 +247,12 @@ export function filesStagingStore(
 
     has: (id) => isFile(pathOf(id)),
 
-    isFresh: async (id) => (await state(pathOf(id))) === "fresh",
+    isFresh: (id) => freshen(pathOf(id)),
+
+    renew,
 
     async remove(id) {
+      // through `files`: a removal through the view would make it forget what it verified
       const path = pathOf(id);
       const removed = (await isFile(path)) && (await files.remove(path));
       if (removed) noteObjectRemoved();

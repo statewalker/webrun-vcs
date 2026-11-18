@@ -72,6 +72,13 @@ export interface GitObjects {
    * with its id, as transport and pack import do. Rejects, storing nothing, with
    * `CorruptObjectError` for a malformed object and `ObjectIdMismatchError` when
    * the bytes hash to another id.
+   *
+   * An id already stored (and fresh, or freshened by this call: an old copy's mtime renewed,
+   * as git's `odb_freshen_object`) is not written again, and `raw` is then closed without
+   * being read: its bytes are not checked against the id. Callers that take objects from
+   * elsewhere check them themselves (unpack-objects compares a stored id's bytes with
+   * `sameAsStored`, `packs.install` has index-pack check every object); others pass
+   * bytes they hashed.
    */
   putRaw(id: ObjectId, raw: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<void>;
   /** The inflated loose object, header included. Empty if absent or not an id. */
