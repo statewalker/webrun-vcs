@@ -43,6 +43,7 @@ import {
   RefStorage,
   symrefReflogWrites,
 } from "@statewalker/vcs-core";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import { parseReflogLine } from "./reflog-reader.js";
 
@@ -468,7 +469,7 @@ export function createFilesRefOps(
         const old = current(u) ?? ZERO_ID;
         const next = u.newValue ?? ZERO_ID;
         const text = u.message !== undefined ? normalizeMessage(u.message) : message;
-        const line = enc.encode(`${old} ${next} ${ident}${text ? `\t${text}` : ""}\n`);
+        const line = encodeGitPath(`${old} ${next} ${ident}${text ? `\t${text}` : ""}\n`);
         if (u.newValue === null) {
           if (await files.exists(`logs/${u.name}`)) await removeAndPrune(`logs/${u.name}`);
           if (o.skipReflog) continue;
@@ -480,7 +481,7 @@ export function createFilesRefOps(
             const text = normalizeMessage(own.message);
             const who = own.ident ?? ident;
             const ownLine = `${own.oldId} ${own.newId} ${who}${text ? `\t${text}` : ""}\n`;
-            await append(u.name, enc.encode(ownLine), true);
+            await append(u.name, encodeGitPath(ownLine), true);
           }
         } else if (old !== u.newValue || (u.current && "target" in u.current)) {
           // a symbolic ref replaced by an id is written, so logged, even at the same id
@@ -865,7 +866,7 @@ export function createFilesRefOps(
       const { oldId, newId, message } = w.line;
       const line = `${oldId} ${newId} ${w.line.ident}${message ? `\t${message}` : ""}\n`;
       // after the commit, as git's files_create_symref: the ref stands without its line
-      await appendLog(name, enc.encode(line), w.create && Boolean(log.reflog)).catch(() => {});
+      await appendLog(name, encodeGitPath(line), w.create && Boolean(log.reflog)).catch(() => {});
     }
   }
 

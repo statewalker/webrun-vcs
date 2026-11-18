@@ -96,6 +96,11 @@ export interface DiffTextOptions
    */
   defaultPrefix?: boolean;
   /**
+   * `diff.noprefix` is not read (`git format-patch` ignores it, honouring only
+   * `format.noprefix`, which it passes as `noPrefix`); the other prefix settings still apply
+   */
+  ignoreConfigNoPrefix?: boolean;
+  /**
    * `-O<orderfile>`: show the files in the order of the file's glob patterns (default
    * `diff.orderFile`); a relative path is read from the worktree's root, through the host
    * environment when it leaves the worktree (`../x`)
@@ -749,7 +754,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const configDst = get("diff.dstPrefix");
     let src: string | undefined;
     let dst: string | undefined;
-    if (boolValue(get("diff.noprefix"))) {
+    if (!this.textOptions.ignoreConfigNoPrefix && boolValue(get("diff.noprefix"))) {
       src = "";
       dst = "";
     } else if (!boolValue(get("diff.mnemonicPrefix"))) {
@@ -871,6 +876,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       namesFromContents: _names,
       noPrefix: _noPrefix,
       defaultPrefix: _defaultPrefix,
+      ignoreConfigNoPrefix: _ignoreConfigNoPrefix,
       orderFile: _orderFile,
       textconv: _textconv,
       abbrev: _abbrev,

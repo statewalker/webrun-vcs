@@ -64,6 +64,7 @@ export async function resetMerge(
   label: string,
   options: { hard?: boolean } = {},
 ): Promise<MergeRefusal | undefined> {
+  const checkUptodate = !options.hard;
   const targetTree = await ctx.commits.getTree(targetId);
   const target = await flatTree(ctx.trees, targetTree);
   const index = new Map<string, CheckedEntry>();
@@ -104,7 +105,7 @@ export async function resetMerge(
       if (worktree && !gitlink && (await directoryLosesUntracked(worktree, path, inIndex))) {
         return refuse(`Updating '${path}' would lose untracked files in it`, path);
       }
-      if (!conflicted && i && !options.hard && worktree) {
+      if (!conflicted && i && checkUptodate && worktree) {
         if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
       }
       removing.add(path);
@@ -134,7 +135,7 @@ export async function resetMerge(
         notUptodate,
       });
       if (refusal) return refusal;
-    } else if (worktree && i && !conflicted && !options.hard) {
+    } else if (worktree && i && !conflicted && checkUptodate) {
       if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
     }
     changes.push(path);
@@ -180,6 +181,68 @@ export async function resetMerge(
   ctx.staging.clearResolveUndo?.();
   await rewriteIndex(ctx.staging, edits);
   return undefined;
+}
+
+/**
+ * The first step of `am --abort`'s `clean_index`: `read_index_unmerged`, then unpack-trees'
+ * `twoway_merge` from HEAD to HEAD with update and `UNPACK_RESET_PROTECT_UNTRACKED`. With
+ * the old tree equal to the new one only conflicted entries change: each takes HEAD's
+ * version (or leaves the index and the worktree where HEAD has no such path) without the
+ * up-to-date check. Every other index entry stays as it is, worktree file and all, and a
+ * path missing from the index stays a staged deletion.
+ */
+export async function resetUnmergedToHead(
+  ctx: SequencerContext,
+  headId: ObjectId | undefined,
+): Promise<void> {
+  const unmerged = new Set<string>();
+  for await (const entry of ctx.staging.entries()) {
+    if (entry.stage !== 0) unmerged.add(entry.path);
+  }
+  if (unmerged.size === 0) return;
+  const headTree = headId ? await ctx.commits.getTree(headId) : undefined;
+  const head = headTree ? await flatTree(ctx.trees, headTree) : new Map<string, CheckedEntry>();
+  const worktree = ctx.worktree;
+  const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const paths = [...unmerged].sort(compareBytes);
+  if (worktree) {
+    for (const path of paths) {
+      if (head.has(path)) continue;
+      const entry = await worktree.getEntry(path);
+      if (entry && !entry.isDirectory) {
+        await worktree.remove(path);
+        await pruneEmptyParents(worktree, path);
+      }
+    }
+    const writing = new Set(paths.filter((p) => head.has(p)));
+    if (writing.size > 0 && headTree) {
+      const plan = await planPathsRestore(ctx, head, headTree, writing, "reset");
+      await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
+        symlinks: trust?.symlinks ?? true,
+        gitlinks: true,
+        replaceInTheWay: true,
+      });
+    }
+  }
+  const edits = new Map<string, IndexEntryOptions[]>();
+  for (const path of paths) {
+    const h = head.get(path);
+    if (!h) {
+      edits.set(path, []);
+      continue;
+    }
+    const stats = worktree ? await worktree.getEntry(path) : undefined;
+    edits.set(path, [
+      {
+        path,
+        objectId: h.objectId,
+        mode: h.mode,
+        ...entryStatOf(stats && !stats.isDirectory ? stats : {}),
+      },
+    ]);
+  }
+  ctx.staging.clearResolveUndo?.();
+  await rewriteIndex(ctx.staging, edits);
 }
 
 /**

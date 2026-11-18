@@ -42,6 +42,7 @@ import {
   gitStrWidth,
   parseGitBool,
 } from "@statewalker/vcs-utils/encoding";
+import { gitBinaryPatch } from "./binary-patch.js";
 
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
@@ -127,6 +128,11 @@ export interface DiffOutputOptions
   abbrevLengths?: ReadonlyMap<string, number>;
   /** Full object ids in `index` lines (`--full-index`) */
   fullIndex?: boolean;
+  /**
+   * `--binary`: binary files as "GIT binary patch" hunks `git apply` can apply (their `index`
+   * lines with full ids), instead of "Binary files ... differ"
+   */
+  binaryPatch?: boolean;
   /** `core.quotePath` (default true): bytes above 0x7f in paths are escaped */
   quotePath?: boolean;
   /** Larger files are binary (`core.bigFileThreshold`, default 512 MiB as git's diff) */
@@ -318,6 +324,7 @@ function metainfo(
   name: string,
   other: string | undefined,
   options: DiffOutputOptions,
+  fullIndex = false,
 ): { text: string; mustShow: boolean } {
   const quote = options.quotePath ?? true;
   let text = "";
@@ -331,7 +338,12 @@ function metainfo(
   }
   if (one.id !== two.id) {
     const abbrev = (id: string) =>
-      id.slice(0, options.fullIndex ? 40 : (options.abbrevLengths?.get(id) ?? options.abbrev ?? 7));
+      id.slice(
+        0,
+        options.fullIndex || fullIndex
+          ? 40
+          : (options.abbrevLengths?.get(id) ?? options.abbrev ?? 7),
+      );
     text += `index ${abbrev(one.id)}..${abbrev(two.id)}`;
     if (one.mode === two.mode) text += ` ${octal6(one.mode)}`;
     text += "\n";
@@ -358,7 +370,20 @@ async function builtinDiff(
   const twoDriver = pathTwo === pathOne ? oneDriver : await driverOf(options, pathTwo);
   const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver));
   const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver));
-  const meta = metainfo(pair, one, two, name, other, options);
+  // a side with a textconv driver (git's get_textconv: valid sides only) is text
+  const textconvOne = one.driver?.textconv;
+  const textconvTwo = two.driver?.textconv;
+  const isBinary = async () =>
+    !options.text &&
+    ((!textconvOne && (await one.isBinary(threshold))) ||
+      (!textconvTwo && (await two.isBinary(threshold))));
+  // fill_metainfo: with --binary a binary pair's index line has full ids
+  const binaryFull =
+    options.binaryPatch === true &&
+    one.id !== two.id &&
+    ((one.valid && (await one.isBinary(threshold))) ||
+      (two.valid && (await two.isBinary(threshold))));
+  const meta = metainfo(pair, one, two, name, other, options, binaryFull);
   let mustShow = meta.mustShow;
 
   const aPrefix = options.srcPrefix ?? "a/";
@@ -393,13 +418,7 @@ async function builtinDiff(
     report.newLabel = undefined;
   }
 
-  // a side with a textconv driver (git's get_textconv: valid sides only) is text
-  const textconvOne = one.driver?.textconv;
-  const textconvTwo = two.driver?.textconv;
-  const binary =
-    !options.text &&
-    ((!textconvOne && (await one.isBinary(threshold))) ||
-      (!textconvTwo && (await two.isBinary(threshold))));
+  const binary = await isBinary();
   if (binary) {
     if (report) report.binary = true;
     // ids name the contents: equal ids, equal contents; an absent side is empty
@@ -409,6 +428,18 @@ async function builtinDiff(
         : (await one.size(threshold)) === 0 && (await two.size(threshold)) === 0;
     if (same) {
       if (mustShow) sink.text(header);
+      return;
+    }
+    if (options.binaryPatch) {
+      const a = one.valid ? await one.read() : new Uint8Array(0);
+      const b = two.valid ? await two.read() : new Uint8Array(0);
+      // "quite common confusing case": equal bytes under different ids
+      if (a.length === b.length && a.every((x, i) => x === b[i])) {
+        if (mustShow) sink.text(header);
+        return;
+      }
+      sink.text(header);
+      sink.text(gitBinaryPatch(a, b));
       return;
     }
     sink.text(header);

@@ -18,6 +18,11 @@ export interface ContentConversionOptions {
    * conversion, and no round-trip warning is given
    */
   renormalize?: boolean;
+  /**
+   * The line-ending step is skipped (git's `CONV_EOL_KEEP_CRLF`, as `git apply` reads a file
+   * its patch has CRLF context for); the clean filter, encoding and ident still run
+   */
+  keepCrlf?: boolean;
   /** Receives warnings (git prints them as `warning: ...`) */
   onWarning?: (message: string) => void;
 }
