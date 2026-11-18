@@ -34,7 +34,7 @@ import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, createIdAbbreviator, worktreeModeTrust } from "./core-config.js";
 import { createDescriber, type DescribeOptions } from "./git-describe.js";
 import { hostEnvironmentOf, localTimezoneOffset } from "./git-ident.js";
-import { favorOf, MergeCommand, UNMERGED_FILES_MESSAGE } from "./merge-command.js";
+import { favorOf, MergeCommand } from "./merge-command.js";
 import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
@@ -923,6 +923,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const parsed = await this.resolveTodo(parseTodo(strippedTodo, comment).items, {
       known: shorts,
     });
+    output.push(...parsed.warnings);
     if (parsed.errors.length > 0) return fixTodo([...parsed.errors, ...EDIT_TODO_ADVICE]);
     const missing = await this.missingCommits(items, parsed.items, missingCheck);
     if (missing.length > 0) {
@@ -1160,6 +1161,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           exitCode: conflicts ? 1 : 0,
           toAmend: outcome.kind === "ok",
           ...(conflicts ? { message: outcome.message } : {}),
+          // the picked message (do_pick_commit's, --signoff's trailer appended)
+          signoff: !conflicts && (await state.exists(`${DIR}/signoff`)),
         })),
       );
       return {
@@ -1224,7 +1227,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     state: OperationState,
     id: ObjectId,
     rest: string,
-    options: { exitCode: number; toAmend: boolean; message?: string },
+    options: { exitCode: number; toAmend: boolean; message?: string; signoff?: boolean },
   ): Promise<string[]> {
     if (options.message !== undefined && !(await state.exists(`${DIR}/message`))) {
       await state.write(`${DIR}/message`, options.message);
@@ -1235,7 +1238,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/patch`, "");
     if (!(await state.exists(`${DIR}/message`))) {
       const commit = await this.commits.load(id);
-      await state.write(`${DIR}/message`, `${messageBody(commit?.message ?? "")}\n`);
+      const body = messageBody(commit?.message ?? "");
+      await state.write(
+        `${DIR}/message`,
+        options.signoff
+          ? appendSignoff(body, this.signoffLine(), trailerConfigOf(this.workingCopy))
+          : `${body}\n`,
+      );
     }
     if (options.toAmend) {
       await state.write(`${DIR}/amend`, `${await this.resolveHead()}\n`);
@@ -1529,6 +1538,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // git commit --amend: the merge state it removes
     await state.removeRef("AUTO_MERGE");
     await this.amendHead(state, head.tree, message, RebaseAction.REWORD);
+    await state.remove("SQUASH_MSG");
   }
 
   /** HEAD replaced by a commit of `tree` with HEAD's parents and author (an amend). */
@@ -2006,7 +2016,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       committed,
       "merge",
     );
-    await state.remove("MERGE_MSG", "MERGE_HEAD", "MERGE_MODE");
+    // (git commit removes SQUASH_MSG too; the octopus' git merge leaves it)
+    await state.remove("MERGE_MSG", "MERGE_HEAD", "MERGE_MODE", "SQUASH_MSG");
     await state.removeRef("AUTO_MERGE");
     if (item.editMessage) await this.amendMergeMessage(state, newId);
     return undefined;
@@ -2117,6 +2128,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       newId,
       this.reflogLine(reflogMessages.pick(action, message), this.committer),
     );
+    // git commit --amend: SQUASH_MSG removed with the merge state
+    await state.remove("SQUASH_MSG");
   }
 
   /**
@@ -2380,10 +2393,15 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (!(await this.inProgress(state))) throw new NoRebaseInProgressError();
     const { unmerged } = await readIndex(this.staging);
     if (unmerged.length > 0) {
+      // builtin/rebase.c: refresh_index's `<path>: needs merge`, then has_unstaged_changes
       return {
         status: RebaseStatus.STOPPED,
         conflicts: unmerged,
-        message: UNMERGED_FILES_MESSAGE("Committing"),
+        message: [
+          ...[...new Set(unmerged)].map((path) => `${path}: needs merge`),
+          "You must edit all merge conflicts and then",
+          "mark them as resolved using git add",
+        ].join("\n"),
       };
     }
     // builtin/rebase.c: unstaged changes refused before the sequencer reads anything
@@ -2781,9 +2799,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       /** `rebase-merge/done` exists: a fixup or squash may start the list */
       fixupOkay?: boolean;
     } = {},
-  ): Promise<{ items: TodoItem[]; errors: string[] }> {
+  ): Promise<{ items: TodoItem[]; errors: string[]; warnings: string[] }> {
     const errors: string[] = [];
-    const resolved = await this.resolveCommitNames(
+    const { objects: resolved, warnings } = await this.resolveObjectNames(
       items.filter(takesCommit).map((item) => item.id),
       options.known,
     );
@@ -2793,7 +2811,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (!item.invalid) delete item.errors;
       if (takesCommit(item)) {
         const name = item.id;
-        const id = resolved.get(name);
+        const named = resolved.get(name);
         const fail = (lines: string[]) => {
           item.errors = [...lines, `error: invalid line ${k + 1}: ${item.line ?? ""}`];
           item.invalid = true;
@@ -2801,8 +2819,17 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           item.action = RebaseAction.COMMENT;
           item.id = "";
         };
-        if (!id) fail([`error: could not parse '${name}'`]);
-        else {
+        // lookup_commit_reference: tags peeled; another object refused with git's line
+        const peeled = named?.commit
+          ? { id: named.id, type: "commit" }
+          : named
+            ? await this.revisionResolver().peelTags(named.id)
+            : undefined;
+        const id = peeled?.type === "commit" ? peeled.id : undefined;
+        if (!named) fail([`error: could not parse '${name}'`]);
+        else if (!id) {
+          fail(peeled?.type ? [`error: object ${named.id} is a ${peeled.type}, not a commit`] : []);
+        } else {
           item.id = id;
           const parents = (await this.loadCommit(id))?.parents ?? [];
           if (parents.length > 1 && isPickLike(item.action)) fail(mergeCommitErrors(item.action));
@@ -2815,45 +2842,150 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       } else if (!isNoop(item)) fixupOkay = true;
       if (item.errors) errors.push(...item.errors);
     }
-    return { items, errors };
+    return { items, errors, warnings };
   }
 
-  /**
-   * Commit names resolved at once (see {@link commitNamed}): an abbreviation as long as one
-   * of `known` that starts the same is that commit (unique in the store, as it was written);
-   * the other abbreviations looked up in the store together (one listing of its ids where it
-   * cannot list by prefix), a prefix of several objects refused as git's get_short_oid
-   * refuses it (unless core.disambiguate tells them apart); refs for the rest.
-   */
+  /** Commit names resolved at once (see {@link resolveObjectNames}), tags peeled. */
   private async resolveCommitNames(
     names: string[],
     known?: Map<ObjectId, string>,
   ): Promise<Map<string, ObjectId | undefined>> {
+    const { objects } = await this.resolveObjectNames(names, known);
     const out = new Map<string, ObjectId | undefined>();
+    for (const [name, named] of objects) {
+      out.set(name, !named ? undefined : named.commit ? named.id : await this.commitOf(named.id));
+    }
+    return out;
+  }
+
+  /**
+   * The objects todo names stand for, resolved at once as git's repo_get_oid (get_oid_1)
+   * resolves each: a full id the store holds is that object; a ref by git's rules
+   * (get_oid_basic) before an abbreviation, with git's `warning: refname '<name>' is
+   * ambiguous.` when the abbreviation names one object as well (the refs listed once, a
+   * ref looked up only for a name some ref could have); an abbreviation as long as one of
+   * `known` that starts the same is that commit (unique in the store, as it was written);
+   * the other abbreviations looked up in the store together (one listing of its ids where
+   * it cannot list by prefix), a prefix of several objects refused as git's get_short_oid
+   * refuses it (unless core.disambiguate tells them apart). `commit` marks the ids known to
+   * be commits.
+   */
+  private async resolveObjectNames(
+    names: string[],
+    known?: Map<ObjectId, string>,
+  ): Promise<{
+    objects: Map<string, { id: ObjectId; commit?: boolean } | undefined>;
+    warnings: string[];
+  }> {
+    const objects = new Map<string, { id: ObjectId; commit?: boolean } | undefined>();
+    const warnings: string[] = [];
     const pending: string[] = [];
+    const viaRef: string[] = [];
+    let refNames: Set<string> | undefined | null = null;
     for (const name of new Set(names)) {
       if (!/^[0-9a-f]{4,39}$/i.test(name)) {
-        out.set(name, await this.commitNamed(name));
+        objects.set(name, await this.objectNamed(name));
         continue;
       }
+      if (refNames === null) refNames = await this.refShortNames();
+      if (!refNames || refNames.has(name)) {
+        const ids = await this.refsNamed(name, false);
+        if (ids[0]) {
+          objects.set(name, { id: ids[0] });
+          if (ids.length > 1) warnings.push(`warning: refname '${name}' is ambiguous.`);
+          else viaRef.push(name);
+          continue;
+        }
+      }
       const fast = known ? knownPrefix(name.toLowerCase(), known) : undefined;
-      if (fast) out.set(name, fast);
+      if (fast) objects.set(name, { id: fast, commit: true });
       else pending.push(name);
     }
-    if (pending.length === 0) return out;
-    const candidates = await this.objectsWithPrefixes(pending.map((name) => name.toLowerCase()));
+    if (pending.length === 0 && viaRef.length === 0) return { objects, warnings };
+    const candidates = await this.objectsWithPrefixes(
+      [...pending, ...viaRef].map((name) => name.toLowerCase()),
+    );
+    // get_oid_basic: a ref that an abbreviation of one object (get_short_oid, quietly, no
+    // hint) shares
+    for (const name of viaRef) {
+      if (candidates?.get(name.toLowerCase())?.length === 1) {
+        warnings.push(`warning: refname '${name}' is ambiguous.`);
+      }
+    }
     for (const name of pending) {
       const found = candidates?.get(name.toLowerCase());
-      if (!found) out.set(name, await this.commitNamed(name));
-      else if (found.length === 0) out.set(name, await this.refNamed(name));
-      else if (found.length === 1) out.set(name, await this.commitOf(found[0] as ObjectId));
+      if (!found) {
+        const id = await this.commitNamed(name);
+        objects.set(name, id ? { id, commit: true } : undefined);
+      } else if (found.length === 0) objects.set(name, undefined);
+      else if (found.length === 1) objects.set(name, { id: found[0] as ObjectId });
       else {
         // ambiguous: only core.disambiguate can pick one (the revision resolver applies it)
         const id = await this.resolveRevision(name).catch(() => undefined);
-        out.set(name, id ? await this.commitOf(id) : undefined);
+        objects.set(name, id ? { id } : undefined);
       }
     }
+    return { objects, warnings };
+  }
+
+  /**
+   * A name that is no abbreviation, as get_oid_basic resolves it: a full id the store holds
+   * (of any object), else a ref by git's rules; undefined if neither.
+   */
+  private async objectNamed(name: string): Promise<{ id: ObjectId; commit?: boolean } | undefined> {
+    if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(name)) {
+      const id = name.toLowerCase();
+      if (await this.commits.has(id).catch(() => false)) return { id, commit: true };
+      if (await this.revisionResolver().objectType(id)) return { id };
+    }
+    const ids = await this.refsNamed(name, true);
+    return ids[0] ? { id: ids[0] } : undefined;
+  }
+
+  /**
+   * The objects of the refs a name stands for by git's ref_rev_parse_rules (as written,
+   * under refs/, a tag, a branch, a remote, a remote's HEAD), in that order; the name as
+   * written only with `asWritten` (a lowercase abbreviation is no root ref).
+   */
+  private async refsNamed(name: string, asWritten: boolean): Promise<ObjectId[]> {
+    const out: ObjectId[] = [];
+    const candidates = [
+      ...(asWritten ? [name] : []),
+      `refs/${name}`,
+      `refs/tags/${name}`,
+      `refs/heads/${name}`,
+      `refs/remotes/${name}`,
+      `refs/remotes/${name}/HEAD`,
+    ];
+    for (const candidate of candidates) {
+      const ref = await this.refsStore.resolve(candidate).catch(() => undefined);
+      if (ref?.objectId) out.push(ref.objectId);
+    }
     return out;
+  }
+
+  /**
+   * The names refs/ refs answer to under git's rules (each without `refs/`, `refs/tags/`,
+   * `refs/heads/`, `refs/remotes/`, and a remote's `HEAD`), from one listing; undefined
+   * where the refs cannot be listed.
+   */
+  private async refShortNames(): Promise<Set<string> | undefined> {
+    const names = new Set<string>();
+    try {
+      for await (const entry of this.refsStore.list("refs/")) {
+        const full = entry.name;
+        names.add(full.slice("refs/".length));
+        for (const prefix of ["refs/tags/", "refs/heads/", "refs/remotes/"]) {
+          if (full.startsWith(prefix)) names.add(full.slice(prefix.length));
+        }
+        if (full.startsWith("refs/remotes/") && full.endsWith("/HEAD")) {
+          names.add(full.slice("refs/remotes/".length, -"/HEAD".length));
+        }
+      }
+    } catch {
+      return undefined;
+    }
+    return names;
   }
 
   /** The commit an object is (a tag peeled, as lookup_commit_reference), else undefined. */
@@ -2936,7 +3068,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const fast = knownPrefix(lower, known);
     if (fast) return fast;
     for (const id of known.keys()) {
-      if (id.startsWith(lower)) return (await this.resolveCommitNames([name])).get(name);
+      // lookup_commit_reference_by_name: an abbreviation read as a committish
+      if (id.startsWith(lower)) return this.commitNamed(name);
     }
     return this.refNamed(name);
   }
@@ -3045,7 +3178,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
             argument: item.rest ?? "",
           });
       }
-      handler.prepareSteps(steps);
+      try {
+        handler.prepareSteps(steps);
+      } catch (error) {
+        throw new HandlerFailure("prepareSteps", error);
+      }
       out = "";
       for (const step of steps) {
         if (step.action === RebaseAction.COMMENT) continue;
@@ -3106,6 +3243,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       parseTodo(stripspace(edited, comment), comment, fixupOkay).items,
       { known: shorts, fixupOkay },
     );
+    output.push(...parsed.warnings);
     if (parsed.errors.length > 0) {
       return {
         status: RebaseStatus.FAILED,
@@ -3669,18 +3807,41 @@ function mergeCommitErrors(action: RebaseAction): string[] {
  * failing on its editor: the pick counts as conflicted (do_pick_commit's `res = !!res`).
  */
 function editorFailure(error: unknown): Extract<PickOutcome, { kind: "conflicts" }> {
-  const reason = error instanceof Error ? error.message : String(error);
   return {
     kind: "conflicts",
     conflicts: [],
-    lines: [`error: There was a problem with the editor: ${reason}`],
+    // git commit's line after the editor's
+    lines: [
+      editorProblem("modifyCommitMessage", error),
+      "Please supply the message using either -m or -F option.",
+    ],
   };
 }
 
 /** launch_sequence_editor failing (the interactive handler's editTodo or prepareSteps threw). */
 function sequenceEditorFailure(error: unknown): string {
+  return error instanceof HandlerFailure
+    ? editorProblem(error.editor, error.reason)
+    : editorProblem("editTodo", error);
+}
+
+/**
+ * editor.c's `there was a problem with the editor '<editor>'`: the editor named by the
+ * interactive handler's method that threw, its reason after.
+ */
+function editorProblem(editor: string, error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
-  return `error: There was a problem with the editor: ${reason}`;
+  return `error: there was a problem with the editor '${editor}': ${reason}`;
+}
+
+/** An interactive handler's method that threw, named. */
+class HandlerFailure extends Error {
+  constructor(
+    readonly editor: string,
+    readonly reason: unknown,
+  ) {
+    super(reason instanceof Error ? reason.message : String(reason));
+  }
 }
 
 /**

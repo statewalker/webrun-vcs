@@ -1037,4 +1037,222 @@ describeGit("interactive rebase, native twins", () => {
     expect((await ours(mine, RebaseOperation.CONTINUE)).result.status).toBe(RebaseStatus.OK);
     expectSame(native, mine, "continued");
   });
+
+  /** A blob whose id starts with `prefix`, written to each twin. */
+  function writeBlobWithPrefix(dirs: string[], prefix: string): string {
+    let content = "";
+    let blob = "";
+    for (let n = 0; ; n++) {
+      content = `blob ${n}\n`;
+      blob = createHash("sha1")
+        .update(`blob ${Buffer.byteLength(content)}\0${content}`)
+        .digest("hex");
+      if (blob.startsWith(prefix)) break;
+    }
+    for (const dir of dirs) {
+      const r = spawnSync("git", ["hash-object", "-w", "--stdin"], {
+        cwd: dir,
+        env: nativeGitEnv(root),
+        input: content,
+        encoding: "utf8",
+      });
+      expect(r.stdout.trim(), r.stderr).toBe(blob);
+    }
+    return blob;
+  }
+
+  /** expectSame, but for git 2.43's rewritten-list line of a dropped pick (2.5x has none). */
+  function expectSameDropped(native: string, mine: string, label: string) {
+    if (modern()) return expectSame(native, mine, label);
+    const even = (name: string, text: string) =>
+      name === "rebase-merge/rewritten-list" ? "<rewritten>" : normalize(name, text);
+    expect(snapshot(root, mine, even), label).toEqual(snapshot(root, native, even));
+    expect(refs(mine), `${label}: refs`).toBe(refs(native));
+    expect(history(mine), `${label}: history`).toBe(history(native));
+  }
+
+  it("--autosquash: a one-word hex target a blob shares is read as a committish", async () => {
+    const { native, ours: mine } = twins([
+      { branch: "topic", from: "main", files: { "b.txt": "1\n" }, message: "A" },
+      { branch: "topic", files: { "c.txt": "1\n" }, message: "B" },
+      { branch: "main", files: { "m.txt": "m\n" }, message: "main moved" },
+    ]);
+    const prefix = gitOk(root, native, "rev-parse", "topic~1").trim().slice(0, 4);
+    for (const dir of [native, mine]) {
+      put(dir, "b.txt", "1\n2\n");
+      gitOk(root, dir, "commit", "-q", "-a", "-m", `fixup! ${prefix}`);
+    }
+    writeBlobWithPrefix([native, mine], prefix);
+    const run = nativeGit(native, ["rebase", "-i", "--autosquash", "main"]);
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.seen).toMatch(/^pick \w+ (# )?A\nfixup \w+ (# )?fixup! /);
+    const { result, seen } = await ours(mine, RebaseOperation.BEGIN, {
+      configure: (c) => c.setAutosquash(true),
+    });
+    expect(result.status, result.message).toBe(RebaseStatus.OK);
+    if (modern()) expect(seen).toBe(run.seen);
+    expectSame(native, mine, "done");
+  });
+
+  it("a reword after a dropped squash removes SQUASH_MSG (git commit --amend)", async () => {
+    const steps: GraphStep[] = [
+      { branch: "topic", from: "main", files: { "b.txt": "1\n" }, message: "A" },
+      { branch: "topic", files: { "m.txt": "m\n" }, message: "S" },
+      { branch: "topic", files: { "c.txt": "1\n" }, message: "B" },
+      { branch: "topic", files: { "d.txt": "1\n" }, message: "C" },
+      { branch: "main", files: { "m.txt": "m\n", "n.txt": "n\n" }, message: "main moved" },
+    ];
+    const { native, ours: mine } = twins(steps);
+    const todo = `pick ${short(native, "topic~3")}\nsquash ${short(native, "topic~2")}\nreword ${short(native, "topic~1")}\nbreak\npick ${short(native, "topic")}\n`;
+    const message = "B reworded\n";
+    const run = nativeGit(native, ["rebase", "-i", "--empty=drop", "main"], { todo, message });
+    expect(run.status, run.stderr).toBe(0);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, {
+      todo,
+      message,
+      configure: (c) => c.setEmpty("drop"),
+    });
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expectSameDropped(native, mine, "stopped");
+    expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.CONTINUE)).result.status).toBe(RebaseStatus.OK);
+    expectSameDropped(native, mine, "continued");
+  });
+
+  it("--rebase-merges: a merge after a dropped squash removes SQUASH_MSG (git commit)", async () => {
+    const { native, ours: mine } = twins([
+      { branch: "side", from: "main", files: { "s.txt": "s\n" }, message: "side" },
+      { branch: "topic", from: "main", files: { "t.txt": "t\n" }, message: "topic one" },
+      { branch: "topic", files: { "m.txt": "m\n" }, message: "S" },
+      { branch: "topic", merge: "side", message: "Merge branch 'side' into topic" },
+      { branch: "main", files: { "m.txt": "m\n", "n.txt": "n\n" }, message: "main moved" },
+    ]);
+    const todo = [
+      "label onto",
+      "reset onto",
+      `pick ${short(native, "side")} side`,
+      "label side",
+      "reset onto",
+      `pick ${short(native, "topic~2")} topic one`,
+      `squash ${short(native, "topic~1")} S`,
+      `merge -C ${short(native, "topic")} side`,
+      "break",
+      "",
+    ].join("\n");
+    const run = nativeGit(native, ["rebase", "-i", "-r", "--empty=drop", "main"], { todo });
+    expect(run.status, run.stderr).toBe(0);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, {
+      todo,
+      configure: (c) => c.setRebaseMerges(true).setEmpty("drop"),
+    });
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expectSameDropped(native, mine, "stopped");
+    expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.CONTINUE)).result.status).toBe(RebaseStatus.OK);
+    expectSameDropped(native, mine, "continued");
+  });
+
+  it("a message editor that fails: git's `there was a problem with the editor` line", async () => {
+    const { native, ours: mine } = twins(linear);
+    const todo = `pick ${short(native, "topic~2")}\nreword ${short(native, "topic~1")}\npick ${short(native, "topic")}\n`;
+    const run = nativeGit(native, ["rebase", "-i", "main"], { todo, env: { GIT_EDITOR: "false" } });
+    expect(run.status).toBe(1);
+    // git 2.43's git commit: `There was a problem with the editor 'false'.`
+    if (modern()) {
+      expect(run.stderr).toContain(
+        "error: there was a problem with the editor 'false'\nPlease supply the message using either -m or -F option.",
+      );
+    }
+    const { result } = await ours(mine, RebaseOperation.BEGIN, {
+      configure: (c) =>
+        c.runInteractively({
+          editTodo: () => todo,
+          modifyCommitMessage: () => {
+            throw new Error("the editor failed");
+          },
+        }),
+    });
+    expect(result.status, result.message).toBe(RebaseStatus.STOPPED);
+    expect(result.message).toContain(
+      "error: there was a problem with the editor 'modifyCommitMessage': the editor failed\nPlease supply the message using either -m or -F option.",
+    );
+    expectSame(native, mine, "stopped");
+  });
+
+  it("--signoff: the message of an edit stop has the sign-off (git 2.5x)", async () => {
+    // git 2.43 writes the commit's own message there
+    if (!modern()) return;
+    const { native, ours: mine } = twins(linear);
+    const todo = `edit ${short(native, "topic~2")}\npick ${short(native, "topic~1")}\npick ${short(native, "topic")}\n`;
+    const run = nativeGit(native, ["rebase", "-i", "--signoff", "main"], { todo });
+    expect(run.status, run.stderr).toBe(0);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, {
+      todo,
+      configure: (c) => c.setSignoff(true),
+    });
+    expect(result.status, result.message).toBe(RebaseStatus.EDIT);
+    expect(readFileSync(join(mine, ".git", "rebase-merge", "message"), "utf8")).toContain(
+      "Signed-off-by: ",
+    );
+    expectSame(native, mine, "stopped");
+    expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.CONTINUE)).result.status).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
+  });
+
+  it("a todo line naming a blob: `object <id> is a blob, not a commit`", async () => {
+    const { native, ours: mine } = twins(linear);
+    const blob = writeBlobWithPrefix([native, mine], "");
+    const todo = `pick ${short(native, "topic~2")} one\npick ${blob.slice(0, 12)} two\npick ${short(native, "topic")} three\n`;
+    const run = nativeGit(native, ["rebase", "-i", "main"], { todo });
+    expect(run.status).toBe(1);
+    const line = `error: object ${blob} is a blob, not a commit`;
+    expect(run.stderr).toContain(line);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, { todo });
+    expect(result.status, result.message).toBe(RebaseStatus.FAILED);
+    expect(result.message).toContain(line);
+    expect(result.message).not.toContain("could not parse");
+    expectMessage(result, run);
+    expectSame(native, mine, "refused");
+  });
+
+  it("--continue with unmerged files: `<path>: needs merge`, then git's refusal", async () => {
+    const steps: GraphStep[] = [
+      {
+        branch: "topic",
+        from: "main",
+        files: { "a.txt": "topic\n", "b.txt": "1\n" },
+        message: "one",
+      },
+      { branch: "main", files: { "a.txt": "main\n" }, message: "main moved" },
+    ];
+    const { native, ours: mine } = twins(steps);
+    expect(nativeGit(native, ["rebase", "-i", "main"]).status).toBe(1);
+    expect((await ours(mine)).result.status).toBe(RebaseStatus.STOPPED);
+    const run = nativeGit(native, ["rebase", "--continue"]);
+    expect(run.status).toBe(1);
+    const { result } = await ours(mine, RebaseOperation.CONTINUE);
+    expect(result.status).toBe(RebaseStatus.STOPPED);
+    expect(result.message).toBe(
+      "a.txt: needs merge\nYou must edit all merge conflicts and then\nmark them as resolved using git add",
+    );
+    expect(run.stdout).toBe(`${result.message}\n`);
+    expectSame(native, mine, "refused");
+  });
+
+  it("a todo name that is a ref and an abbreviation: the ref, with git's warning", async () => {
+    const { native, ours: mine } = twins(linear);
+    const name = short(native, "topic");
+    // a branch named as the last commit's abbreviation, at the commit before it
+    for (const dir of [native, mine]) gitOk(root, dir, "branch", name, "topic~1");
+    const todo = `pick ${short(native, "topic~2")} one\npick ${name} three\n`;
+    const run = nativeGit(native, ["rebase", "-i", "main"], { todo });
+    expect(run.status, run.stderr).toBe(0);
+    const warning = `warning: refname '${name}' is ambiguous.`;
+    expect(run.stderr).toContain(warning);
+    const { result } = await ours(mine, RebaseOperation.BEGIN, { todo });
+    expect(result.status, result.message).toBe(RebaseStatus.OK);
+    expect(result.output).toContain(warning);
+    expectSame(native, mine, "done");
+  });
 });
