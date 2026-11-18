@@ -12,7 +12,7 @@
  * ```
  *
  * Supported: `%H %h %T %t %P %p`, the author and committer parts `%an %aN %ae %aE %al %aL
- * %ad %aD %ar %at %ai %aI %as %ah` (and `%c…`; the mailmap is not read, so `%aN` is `%an`),
+ * %ad %aD %ar %at %ai %aI %as %ah` (and `%c…`; `%aN`, `%aE`, `%aL` through the mailmap given, `%ad` in the date mode given),
  * `%s %f %b %B %e`, `%n %%` and `%x<hex>` (a byte above 0x7f as the repository's byte strings
  * keep a raw byte: U+DC80 to U+DCFF, which `encodeGitPath` writes back as that byte), `%d %D`
  * and `%(decorate:…)` from {@link loadRefDecorations}, `%m` (`>`, or the mark given), `%G?`
@@ -88,6 +88,16 @@ export interface PrettyFormatOptions {
    * supported by this command"
    */
   count?: { nr: number; total: number };
+  /**
+   * `%ad` and `%cd`: the date in the walk's date mode (`--date`, `log.date`); default git's
+   * default mode
+   */
+  formatDate?: (ident: PersonIdent) => string;
+  /**
+   * `%aN`, `%aE`, `%aL` (and `%c…`): the identity through the mailmap (see `Mailmap`);
+   * without, they are `%an`, `%ae`, `%al`
+   */
+  mailmap?: (name: string, email: string) => { name: string; email: string };
 }
 
 /** One name a commit is decorated with (log-tree.c's name_decoration). */
@@ -243,8 +253,11 @@ function prettifyRefName(name: string): string {
   return name;
 }
 
-/** log-tree.c's format_decorations, without colors. */
-function formatDecorations(
+/**
+ * log-tree.c's format_decorations, without colors: ` (HEAD -> main, tag: v1)` by default,
+ * the separators given otherwise; empty when the object has no decorations.
+ */
+export function formatRefDecorations(
   decorations: RefDecorations | undefined,
   id: ObjectId,
   opts: { prefix?: string; suffix?: string; separator?: string; pointer?: string; tag?: string },
@@ -1003,10 +1016,10 @@ async function formatOne(
       st.sb += options.mark ?? ">";
       return 1;
     case "d":
-      st.sb += formatDecorations(options.decorations, id, {});
+      st.sb += formatRefDecorations(options.decorations, id, {});
       return 1;
     case "D":
-      st.sb += formatDecorations(options.decorations, id, { prefix: "", suffix: "" });
+      st.sb += formatRefDecorations(options.decorations, id, { prefix: "", suffix: "" });
       return 1;
     case "g": {
       const reflog = options.reflog;
@@ -1073,7 +1086,7 @@ async function formatOne(
       }
     }
     if (fmt[i] !== ")") return 0;
-    st.sb += formatDecorations(options.decorations, id, opts);
+    st.sb += formatRefDecorations(options.decorations, id, opts);
     return i - at + 1;
   }
   if (fmt.startsWith("(describe", at)) {
@@ -1303,22 +1316,26 @@ function formatPersonPart(
   part: string | undefined,
   options: PrettyFormatOptions,
 ): string | undefined {
+  let { name, email } = ident;
+  if ((part === "N" || part === "E" || part === "L") && options.mailmap) {
+    ({ name, email } = options.mailmap(name, email));
+  }
   switch (part) {
     case "n":
     case "N":
-      return ident.name;
+      return name;
     case "e":
     case "E":
-      return ident.email;
+      return email;
     case "l":
     case "L": {
-      const at = ident.email.indexOf("@");
-      return at < 0 ? ident.email : ident.email.slice(0, at);
+      const at = email.indexOf("@");
+      return at < 0 ? email : email.slice(0, at);
     }
     case "t":
       return String(ident.timestamp);
     case "d":
-      return formatGitDate(ident);
+      return options.formatDate ? options.formatDate(ident) : formatGitDate(ident);
     case "D":
       return formatRfc2822Date(ident.timestamp, zoned(ident).tz);
     case "r":

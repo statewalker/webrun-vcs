@@ -1,0 +1,10 @@
+---
+"@statewalker/vcs-commands": minor
+---
+
+**`git log` output as git prints it: `LogCommand.callBytes` / `callText`.**
+
+- **Formats:** `medium` (default), `short`, `full`, `fuller`, `reference`, `email`, `mboxrd`, `raw`, `oneline`, `pretty.<name>` aliases, `format:`/`tformat:` user formats (with the separator/terminator difference), `--abbrev-commit`, `--abbrev=<n>`, `--no-abbrev`, `--date=` in every mode (`relative`, `local`, `iso`, `iso-strict`, `rfc`, `short`, `raw`, `unix`, `human`, `format:`, and their `-local` forms; new `parseDateMode`/`showDate`), `--decorate[=short|full]` with `log.decorate`, `log.excludeDecoration` and `--decorate-refs`, notes (`refs/notes/commits`, `core.notesRef`, `notes.displayRef`), and the mailmap (`.mailmap`, `mailmap.blob`, `mailmap.file`; new `Mailmap`) for the built-in formats under `log.mailmap` and for `%aN`/`%aE`/`%aL`. Configuration defaults: `format.pretty`, `log.date`, `log.abbrevCommit`, `log.showRoot`, `log.follow`, `log.diffMerges`, `log.graphIndent`.
+- **`--graph`:** a port of git 2.5x's graph.c (`LogGraph`): columns, merges, octopus merges, collapsing lines, the indented "visual roots" (off with `graphIndent: false`, as git before 2.5x draws them) and `--graph-lane-limit`, with every format and the diffs prefixed by the graph; `--graph` and `topoOrder` sort as git's topological order, and a path-limited graph rewrites parents past the commits it hides.
+- **Diffs:** `-p`, `--stat` (80 columns less the graph), `--shortstat`, `--numstat`, `--name-only`, `--name-status`, root commits against the empty tree, `-m`, `--first-parent`, `-c`/`--cc` (combined diffs of a merge's trees, with the first parent's stat), `--full-diff`, `--reverse`, and `--follow` of one path across renames (each parent following its own path, as git 2.5x).
+- `DiffCommand` gains `setPathspec` (git pathspecs) and `callFormats` (several formats in `diff_flush`'s order, `--follow`); `writeCombinedDiff` takes `dense` (`-c`) and `workingTreeFile`; `formatCommitPretty` takes `formatDate` and `mailmap`; `formatRefDecorations` is exported. `git log --all` walks annotated tags from the commits they tag.

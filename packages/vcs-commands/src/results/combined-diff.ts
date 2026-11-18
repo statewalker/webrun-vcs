@@ -84,6 +84,17 @@ export interface CombinedDiffOptions
   dstPrefix?: string;
   /** The abbreviation of an id in the `index` line (default its first 7 digits) */
   abbreviate?: (id: string) => string;
+  /**
+   * `--cc` (default) or `-c` (false): dense hunks leave out what came from one parent alone,
+   * and the header reads `diff --cc` rather than `diff --combined`
+   */
+  dense?: boolean;
+  /**
+   * The result is a worktree file (default true, `git diff` of a conflict): the path is
+   * printed even when no hunk is left; false (`git log --cc` of a merge's trees) prints it
+   * only with a hunk or a mode change
+   */
+  workingTreeFile?: boolean;
 }
 
 const FIRST_FEW_BYTES = 8000;
@@ -319,14 +330,21 @@ function giveContext(sline: Sline[], cnt: number, numParent: number, context: nu
   return true;
 }
 
-/** combine-diff.c's `make_hunks`, dense */
-function makeHunks(sline: Sline[], cnt: number, numParent: number, context: number): boolean {
+/** combine-diff.c's `make_hunks` */
+function makeHunks(
+  sline: Sline[],
+  cnt: number,
+  numParent: number,
+  context: number,
+  dense = true,
+): boolean {
   const allMask = (1 << numParent) - 1;
   const mark = 1 << numParent;
   for (let i = 0; i <= cnt; i++) {
     if (interesting(sline[i], allMask)) sline[i].flag |= mark;
     else sline[i].flag &= ~mark;
   }
+  if (!dense) return giveContext(sline, cnt, numParent, context);
   let i = 0;
   while (i <= cnt) {
     while (i <= cnt && !(sline[i].flag & mark)) i++;
@@ -473,22 +491,27 @@ function writeHeader(
 ): void {
   const quote = options.quotePath ?? true;
   const abbreviate = options.abbreviate ?? ((id: string) => id.slice(0, 7));
-  sink.text(`diff --cc ${quoteTwo("", elem.path, quote)}\n`);
+  const dense = options.dense ?? true;
+  sink.text(`${dense ? "diff --cc " : "diff --combined "}${quoteTwo("", elem.path, quote)}\n`);
   sink.text(
     `index ${elem.parents.map((p) => abbreviate(p.id)).join(",")}..${abbreviate(elem.result.id)}\n`,
   );
   const deleted = !elem.result.mode;
+  // "added" when no parent had it
+  const added = !deleted && elem.parents.every((p) => !p.mode);
   if (modeDiffers) {
-    // the parents of a conflicted path are never all absent: no "new file mode"
-    let line = deleted ? "deleted file mode " : "mode ";
-    line += elem.parents.map((p) => octal6(p.mode)).join(",");
-    if (elem.result.mode) line += `..${octal6(elem.result.mode)}`;
-    sink.text(`${line}\n`);
+    if (added) sink.text(`new file mode ${octal6(elem.result.mode)}\n`);
+    else {
+      let line = deleted ? "deleted file mode " : "mode ";
+      line += elem.parents.map((p) => octal6(p.mode)).join(",");
+      if (elem.result.mode) line += `..${octal6(elem.result.mode)}`;
+      sink.text(`${line}\n`);
+    }
   }
   if (!showFileHeader) return;
   const aPrefix = options.srcPrefix ?? "a/";
   const bPrefix = options.dstPrefix ?? "b/";
-  sink.text(`--- ${quoteTwo(aPrefix, elem.path, quote)}\n`);
+  sink.text(added ? "--- /dev/null\n" : `--- ${quoteTwo(aPrefix, elem.path, quote)}\n`);
   sink.text(deleted ? "+++ /dev/null\n" : `+++ ${quoteTwo(bPrefix, elem.path, quote)}\n`);
 }
 
@@ -503,8 +526,10 @@ export function writeCombinedDiff(
 ): void {
   const context = options.context ?? 3;
   const numParent = elem.parents.length;
-  const resultDeleted = !elem.result.mode;
-  const result = resultDeleted ? new Uint8Array(0) : elem.result.content;
+  // a worktree file that is gone has no lines (result_deleted); a path a merge commit
+  // deletes is compared as an empty blob, its parents' lines all lost
+  const resultDeleted = !elem.result.mode && options.workingTreeFile !== false;
+  const result = !elem.result.mode ? new Uint8Array(0) : elem.result.content;
   const modeDiffers = elem.parents.some((p) => p.mode !== elem.result.mode);
   const binary =
     options.binary ??
@@ -544,7 +569,8 @@ export function writeCombinedDiff(
       combineDiff(elem.parents[i], result, sline, cnt, i, options, flags);
     }
   }
-  makeHunks(sline, cnt, numParent, context);
+  const showHunks = makeHunks(sline, cnt, numParent, context, options.dense ?? true);
+  if (!showHunks && !modeDiffers && options.workingTreeFile === false) return;
   writeHeader(sink, elem, options, modeDiffers, true);
   dumpSline(sink, sline, cnt, numParent, context, resultDeleted);
 }

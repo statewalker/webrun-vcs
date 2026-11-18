@@ -463,3 +463,121 @@ export async function detectRenames(
   }
   return finish();
 }
+
+/** A source {@link findFollowSource} found for a path `--follow` follows. */
+export interface FollowSource {
+  /** The source's path */
+  from: string;
+  /** 0..{@link GIT_MAX_SCORE} */
+  score: number;
+  /** The source is gone from the other side: a rename (else a copy) */
+  renamed: boolean;
+}
+
+/**
+ * Where a path `--follow` follows came from when a commit adds it (tree-diff.c's
+ * try_to_follow_renames): `diffcore_rename` with copies found harder, the added path the
+ * only destination and every path of the parent's tree a source (the deleted ones as
+ * renames, the others as copies). An identical blob first (one deleted, then one of the
+ * same basename preferred), else the best of the four most similar sources scoring at least
+ * the threshold, a deleted one before one kept (find_renames without, then with, copies).
+ *
+ * @example
+ * ```typescript
+ * await findFollowSource(parentFiles, added, gone, { load: (c) => readBlob(c.id) });
+ * // { from: "old/name.txt", score: 60000, renamed: true }
+ * ```
+ */
+export async function findFollowSource(
+  sources: RenameCandidate[],
+  destination: RenameCandidate,
+  deleted: ReadonlySet<string>,
+  options: Pick<DetectRenamesOptions, "load" | "size" | "minimumScore" | "countLastSpan">,
+): Promise<FollowSource | undefined> {
+  const minimumScore = options.minimumScore ?? GIT_DEFAULT_RENAME_SCORE;
+  const src = [...sources].sort(byPath);
+  const dstBase = basename(destination.path);
+  // find_identical_files: an unused (deleted) source scores one, the same basename one more
+  let best = -1;
+  let bestScore = -1;
+  let left = 100;
+  for (let s = 0; s < src.length; s++) {
+    const source = src[s] as RenameCandidate;
+    if (source.id !== destination.id) continue;
+    if (
+      (!isRegular(source.mode) || !isRegular(destination.mode)) &&
+      source.mode !== destination.mode
+    ) {
+      continue;
+    }
+    const score = (deleted.has(source.path) ? 1 : 0) + (basename(source.path) === dstBase ? 1 : 0);
+    if (score > bestScore) {
+      best = s;
+      bestScore = score;
+      if (score === 2) break;
+    }
+    if (!--left) break;
+  }
+  if (best >= 0) {
+    const from = (src[best] as RenameCandidate).path;
+    return { from, score: GIT_MAX_SCORE, renamed: deleted.has(from) };
+  }
+  if (minimumScore >= GIT_MAX_SCORE) return undefined;
+  const sideOf = async (candidate: RenameCandidate, role: "source" | "destination") => {
+    let bytes: Uint8Array | undefined;
+    let size = await options.size?.(candidate, role);
+    if (size === undefined) {
+      bytes = await options.load(candidate, role);
+      size = bytes.length;
+    }
+    let spans: SpanCounts | undefined;
+    return {
+      mode: candidate.mode,
+      size,
+      spans: async () => {
+        if (!spans) {
+          const content = bytes ?? (await options.load(candidate, role));
+          bytes = undefined;
+          spans = spanCounts(content, { countLastSpan: options.countLastSpan });
+        }
+        return spans;
+      },
+    };
+  };
+  const target = await sideOf(destination, "destination");
+  const slots: Score[] = Array.from({ length: CANDIDATES_PER_DESTINATION }, () => ({
+    dst: -1,
+    src: -1,
+    score: 0,
+    nameScore: 0,
+  }));
+  for (let s = 0; s < src.length; s++) {
+    const source = src[s] as RenameCandidate;
+    const score =
+      isRegular(source.mode) && isRegular(destination.mode)
+        ? estimateSimilarity(await sideOf(source, "source"), target, minimumScore)
+        : 0;
+    const candidate: Score = {
+      dst: 0,
+      src: s,
+      score: await score,
+      nameScore: basename(source.path) === dstBase ? 1 : 0,
+    };
+    let worst = 0;
+    for (let k = 1; k < slots.length; k++) {
+      if (scoreCompare(slots[k] as Score, slots[worst] as Score) > 0) worst = k;
+    }
+    if (scoreCompare(slots[worst] as Score, candidate) > 0) slots[worst] = candidate;
+  }
+  slots.sort(scoreCompare);
+  // find_renames: a deleted source first, then (copies) any
+  for (const copies of [false, true]) {
+    for (const m of slots) {
+      if (m.dst < 0 || m.score < minimumScore) break;
+      const from = (src[m.src] as RenameCandidate).path;
+      if (!copies && !deleted.has(from)) continue;
+      return { from, score: m.score, renamed: deleted.has(from) };
+    }
+  }
+  return undefined;
+}

@@ -28,7 +28,7 @@ import {
   loadObjectReplacements,
   overlayMethods,
 } from "@statewalker/vcs-core";
-import { parseGitBool } from "@statewalker/vcs-utils";
+import { OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
 import {
   type AttributesSourceResolver,
   basicStatMatches,
@@ -211,6 +211,9 @@ const GRAFT_FILE_ADVICE = [
  *
  * @typeParam T - The return type of the command's call() method
  */
+/** Trees the commands sharing reads keep (see `GitCommand.shareReadsOf`). */
+const SHARED_TREES = 1024;
+
 export abstract class GitCommand<T> {
   protected readonly _workingCopy: WorkingCopy;
   private callable = true;
@@ -765,6 +768,43 @@ export abstract class GitCommand<T> {
   protected idAbbreviator(): IdAbbreviator {
     this.abbreviator ??= createIdAbbreviator(this._workingCopy);
     return this.abbreviator;
+  }
+
+  /**
+   * Read objects through the replace refs and grafts `source` reads, and abbreviate ids with
+   * its object count: git reads both once per process, so a command run for each commit of
+   * another (`git log -p` runs a diff per commit) reads them once.
+   */
+  shareReadsOf(source: GitCommand<unknown>): this {
+    this.replacementsLoad = source.loadedReplacements();
+    this.abbreviator = source.idAbbreviator();
+    source.sharedTrees ??= new OrderedMap();
+    this.sharedTrees = source.sharedTrees;
+    return this;
+  }
+
+  /** Trees read lately by the commands sharing reads ({@link shareReadsOf}), newest last */
+  private sharedTrees?: OrderedMap<ObjectId, TreeEntry[]>;
+
+  /**
+   * A tree's entries through the replacements (`trees.loadTree`), kept a while for the
+   * commands that share reads: one commit's tree is the next one's parent tree.
+   */
+  protected async treeEntries(id: ObjectId): Promise<TreeEntry[]> {
+    const cache = this.sharedTrees;
+    const known = cache?.get(id);
+    if (known) {
+      cache?.delete(id);
+      cache?.set(id, known);
+      return known;
+    }
+    const entries: TreeEntry[] = [];
+    for await (const e of this.trees.loadTree(id)) entries.push(e);
+    if (cache) {
+      cache.set(id, entries);
+      while (cache.size > SHARED_TREES) cache.delete(cache.oldestKey() as ObjectId);
+    }
+    return entries;
   }
 
   /** `id` abbreviated as git prints it, through {@link idAbbreviator}. */
