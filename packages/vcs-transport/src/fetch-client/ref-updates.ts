@@ -365,7 +365,7 @@ export async function applyRefUpdates(
       reject(u, reasons.get(u.localRef) ?? "atomic transaction failed");
       u.aborted = true;
     }
-    return transactionError(writes, deletes, result.rejected, refStore);
+    return transactionError(writes, result.rejected, refStore);
   }
   for (const u of writes) {
     const result = await refStore.batch([command(u)], logOf(u));
@@ -379,20 +379,18 @@ const ZERO_OID = "0000000000000000000000000000000000000000";
 /**
  * The error git's ref transaction reports when an atomic fetch's commit fails: for a name
  * conflict, refs.c refs_verify_refnames_available's words for the first update (by name)
- * that conflicts with a ref here (`'<ref>' exists; cannot create '<name>'`, a ref being
- * deleted is no conflict) or with another update (`cannot process '<name>' and '<other>' at
+ * that conflicts with a ref here (`'<ref>' exists; cannot create '<name>'`; a ref the same
+ * transaction deletes still counts, as in git's do_fetch) or with another update (`cannot process '<name>' and '<other>' at
  * the same time`); for a ref changed meanwhile, the files backend's `cannot lock ref`.
  * git 2.43 put `cannot lock ref '<name>': ` before a name conflict too; this is 2.5x's text.
  */
 async function transactionError(
   writes: readonly FetchRefUpdate[],
-  deletes: readonly string[],
   rejected: readonly { name: string; reason: string }[],
   refStore: RefStore,
 ): Promise<string> {
-  const skip = new Set(deletes);
   const existing = new Set<string>();
-  for (const [name] of await refStore.listAll()) if (!skip.has(name)) existing.add(name);
+  for (const [name] of await refStore.listAll()) existing.add(name);
   const names = writes.map((u) => u.localRef).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const extras = new Set(names);
   for (const name of names) {

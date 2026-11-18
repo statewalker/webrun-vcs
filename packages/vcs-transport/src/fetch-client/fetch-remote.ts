@@ -403,9 +403,13 @@ export async function fetchFromConnection(
 
   // wants: the selected tips not here yet (all of them when deepening: their history changes)
   const wants: string[] = [];
+  const wanted = new Set<string>();
   for (const p of planned) {
-    if (wants.includes(p.oid)) continue;
-    if (deepen || !(await complete.isComplete(p.oid))) wants.push(p.oid);
+    if (wanted.has(p.oid)) continue;
+    if (deepen || !(await complete.isComplete(p.oid))) {
+      wants.push(p.oid);
+      wanted.add(p.oid);
+    }
   }
   // find_non_local_tags puts the tags of objects fetched or already here into the ref map
   // before the fetch: their tag objects come in the same round (a tag of a commit here is
@@ -414,11 +418,14 @@ export async function fetchFromConnection(
     const mapped = new Set(planned.map((p) => p.localRef));
     for (const ref of remoteRefs) {
       const oid = ref.oid;
-      if (!oid || !tagsOfTips.has(ref.name) || mapped.has(ref.name) || wants.includes(oid)) {
+      if (!oid || !tagsOfTips.has(ref.name) || mapped.has(ref.name) || wanted.has(oid)) {
         continue;
       }
       if (await refStore.get(ref.name)) continue;
-      if (!(await complete.isComplete(oid))) wants.push(oid);
+      if (!(await complete.isComplete(oid))) {
+        wants.push(oid);
+        wanted.add(oid);
+      }
     }
   }
   if (wants.length > 0) {

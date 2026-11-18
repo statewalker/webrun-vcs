@@ -645,6 +645,37 @@ describeGit(
       expect(fetchHead(ours, src)).toBe(fetchHead(native, src));
     });
 
+    it("--atomic --prune with a D/F conflict: a ref the transaction deletes still conflicts, git's words", async () => {
+      const { native, ours } = setup();
+      const bare = join(root, "src.git");
+      // `same` becomes `same/x` upstream: pruning origin/same and creating origin/same/x in one
+      // transaction is refused, as git counts the ref being deleted as existing
+      const main = run(bare, ["rev-parse", "refs/heads/main"]).trim();
+      run(bare, ["update-ref", "-d", "refs/heads/same"]);
+      run(bare, ["update-ref", "refs/heads/same/x", main]);
+      const nativeOut = spawnSync("git", ["fetch", "--atomic", "--prune", "origin"], {
+        cwd: native,
+        env: nativeGitEnv(home),
+        encoding: "latin1",
+      });
+      expect(nativeOut.status).not.toBe(0);
+      const result = await (await open(ours))
+        .fetch()
+        .setRemote("origin")
+        .setAtomic(true)
+        .setRemoveDeletedRefs(true)
+        .call();
+      const nativeErrors = nativeOut.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("error: "))
+        .map((l) => l.replace(/^error: cannot lock ref '[^']*': /, "error: "));
+      expect(nativeErrors).toEqual([
+        "error: 'refs/remotes/origin/same' exists; cannot create 'refs/remotes/origin/same/x'",
+      ]);
+      expect((result.errors ?? []).map((e) => `error: ${e}`)).toEqual(nativeErrors);
+      expect(allRefs(ours)).toBe(allRefs(native));
+    });
+
     it("a refused update makes no second round trip: tags of objects here come with the tips", async () => {
       const { src, native, ours } = setup(true);
       const work = join(root, "work");
