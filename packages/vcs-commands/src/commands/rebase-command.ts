@@ -150,6 +150,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private readonly subjects = new Map<ObjectId, string>();
   /** The refs' decorations, for `%d` in rebase.instructionFormat (loaded once) */
   private decorations?: RefDecorations;
+  /** What loading the decorations printed (`warning: invalid replace ref <name>`) */
+  private decorationWarnings: string[] = [];
 
   /**
    * Set the upstream commit to rebase onto.
@@ -526,6 +528,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/msgnum`, "0\n");
     await state.write(`${DIR}/done`, "");
     const todoText = await this.todoText(todo);
+    // load_ref_decorations' warnings, printed while the todo list is made
+    output.push(...this.decorationWarnings.splice(0));
     await state.write(
       `${DIR}/git-rebase-todo.backup`,
       `${todoText}\n# Rebase ${await this.abbreviateObjectId(onto)}..${await this.abbreviateObjectId(headId)} onto ${await this.abbreviateObjectId(onto)} (${todo.length} command${todo.length === 1 ? "" : "s"})\n`,
@@ -1020,6 +1024,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       useReplaceRefs: this.useReplaceRefs(),
       grafted: new Set([...(replacements?.grafts.keys() ?? []), ...shallow]),
       ...(objects ? { hasObject: (id: ObjectId) => objects.has(id) } : {}),
+      onWarning: (message) => this.decorationWarnings.push(message),
     });
   }
 

@@ -1219,3 +1219,69 @@ describeGit("git worktree from inside a bare repository, native twins", () => {
     expect(await fatal(() => git.status().call())).toBe(runResult(nb, "status").stderr);
   });
 });
+
+describeGit("git worktree add of a replaced HEAD, native twins", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "wt-replace-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  it("add --detach checks out the replacement's tree and blobs, and status is clean", async () => {
+    const { native, ours } = twins();
+    for (const base of [native, ours]) {
+      const repo = join(base, "repo");
+      // main (c2) reads as a commit with c1's tree but another blob for dir/b.txt
+      const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+        cwd: repo,
+        env: nativeGitEnv(home),
+        input: "replaced b\n",
+      })
+        .toString()
+        .trim();
+      const a = run(repo, "rev-parse", "feat:a.txt").trim();
+      const sub = execFileSync("git", ["mktree"], {
+        cwd: repo,
+        env: nativeGitEnv(home),
+        input: `100644 blob ${blob}\tb.txt\n`,
+      })
+        .toString()
+        .trim();
+      const tree = execFileSync("git", ["mktree"], {
+        cwd: repo,
+        env: nativeGitEnv(home),
+        input: `100644 blob ${a}\ta.txt\n040000 tree ${sub}\tdir\n`,
+      })
+        .toString()
+        .trim();
+      const replacement = run(repo, "commit-tree", "-m", "replaced c2", tree).trim();
+      run(repo, "replace", "main", replacement);
+    }
+    const r = runResult(join(native, "repo"), "worktree", "add", "--detach", join(native, "w-r"));
+    expect([r.status, r.stderr]).toEqual([0, r.stderr]);
+    const { git } = await open(ours);
+    const result = await git
+      .worktreeAdd()
+      .setPath(join(ours, "w-r"))
+      .setDetach(true)
+      .setIdent(IDENT)
+      .call();
+    expect(result.output.map((l) => `${l}\n`).join("")).toBe(r.stdout);
+    expect(workFiles(ours, "w-r")).toEqual(workFiles(native, "w-r"));
+    expect(readFileSync(join(ours, "w-r", "dir", "b.txt"), "utf8")).toBe("replaced b\n");
+    const index = (base: string) =>
+      run(join(base, "w-r"), "ls-files", "-s", "--debug").replace(
+        / {2}(ctime|mtime|dev|uid|size|flags).*\n/g,
+        "",
+      );
+    expect(index(ours)).toEqual(index(native));
+    // native git reads both new worktrees as clean, and so does our status
+    expect(run(join(ours, "w-r"), "status", "--porcelain")).toBe("");
+    expect(run(join(native, "w-r"), "status", "--porcelain")).toBe("");
+    const opened = await open(ours, "repo/.git/worktrees/w-r");
+    expect((await opened.git.status().call()).isClean()).toBe(true);
+  });
+});

@@ -105,4 +105,33 @@ describeGit("rebase.instructionFormat, native twins", () => {
       );
     });
   }
+
+  it("%d warns of a replace ref whose name below refs/replace/ is not an object id", async () => {
+    if (!prefixesFormat()) return;
+    const n = counter++;
+    const native = join(root, `native-${n}`);
+    const ours = join(root, `ours-${n}`);
+    for (const dir of [native, ours]) {
+      buildHistory(root, dir, conflicting);
+      git(root, dir, "checkout", "-q", "side");
+      git(root, dir, "config", "rebase.instructionFormat", "%d %s");
+      // refs/replace/x/<id>: a replace ref (its last component), not one %d can decorate
+      const unused = git(root, dir, "hash-object", "-w", "--stdin").stdout.trim();
+      const other = git(root, dir, "rev-parse", "HEAD:c.txt").stdout.trim();
+      git(root, dir, "update-ref", `refs/replace/x/${unused}`, other);
+    }
+    const expected = git(root, native, "rebase", "main");
+    const warnings = (lines: string[]) => lines.filter((l) => l.includes("invalid replace ref"));
+    const nativeWarnings = warnings(expected.stderr.split("\n"));
+    expect(nativeWarnings).toHaveLength(1);
+    expect(nativeWarnings[0]).toMatch(
+      /^warning: invalid replace ref refs\/replace\/x\/[0-9a-f]{40}$/,
+    );
+    const command = (await openOurs(ours)).rebase().setCommitter(INTEROP_IDENT);
+    await command.setUpstreamBranch("main");
+    const result = await command.call();
+    expect(result.status).toBe(RebaseStatus.STOPPED);
+    expect(warnings(result.output ?? [])).toEqual(nativeWarnings);
+    expect(read(ours, "git-rebase-todo")).toBe(read(native, "git-rebase-todo"));
+  });
 });

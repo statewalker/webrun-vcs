@@ -512,9 +512,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       defaultBranch = toBranchName(advertisedDefaultBranch);
       const tag = await this.refsStore.resolve(detachedTag);
       let id = tag?.objectId;
+      // peeled as git peels it, through replace refs (peel_to_type reads parsed objects)
+      const tags = this.tagsStore ?? history.tags;
       for (let i = 0; id && i < 16; i++) {
-        const target = await history.tags.getTarget(id);
-        if (!target || !(await history.tags.has(id))) break;
+        const target = await tags.getTarget(id);
+        if (!target || !(await tags.has(id))) break;
         id = target;
       }
       if (id) {

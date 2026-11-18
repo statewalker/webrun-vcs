@@ -6,7 +6,7 @@
  */
 
 import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-core";
-import { joinPath, sweepPackTemporaries } from "@statewalker/vcs-core";
+import { graftFileReader, joinPath, sweepPackTemporaries } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
@@ -89,9 +89,16 @@ export interface GcOptions {
   writeCommitGraph?: boolean;
   /**
    * The user's environment: `gc.writeCommitGraph` and the commit-graph settings are then read
-   * from the system and global config files too.
+   * from the system and global config files too, and its grafts file (`GIT_GRAFT_FILE`) is
+   * read in place of `info/grafts` unless `readGraftFile` is given.
    */
   environment?: GitHostEnvironment;
+  /**
+   * Reads the grafts file in place of `info/grafts` (git's `GIT_GRAFT_FILE`): what its grafts
+   * reach is kept. Default: the environment's (`graftFileReader(environment)`), else the
+   * repository's `info/grafts`.
+   */
+  readGraftFile?: () => Promise<string | undefined>;
 }
 
 /**
@@ -249,12 +256,14 @@ async function collect(options: GcOptions): Promise<GcResult> {
   let snapshot: PackSnapshot | undefined;
   if (repacking && packs) snapshot = await snapshotPacks(packs);
   const startedAt = snapshot?.walkStartedAt ?? Date.now();
+  const readGraftFile = options.readGraftFile ?? graftFileReader(options.environment);
   const listed = await listReachableObjects({
     files,
     gitDir,
     refs: history.refs,
     objects,
     commitGraph: history.commitGraph,
+    ...(readGraftFile ? { readGraftFile } : {}),
   });
   const reachable = new Set<string>(listed.map((o) => o.id));
 

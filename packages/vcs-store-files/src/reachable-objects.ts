@@ -57,6 +57,11 @@ export interface ReachabilityRoots {
    * instead of reading them, as git's reachability walk does.
    */
   commitGraph?: CommitGraphProvider;
+  /**
+   * Reads the grafts file in place of `info/grafts` (git's `GIT_GRAFT_FILE`): the commits its
+   * grafts name are walked too. Omit to read `info/grafts` (`refs.readGrafts`).
+   */
+  readGraftFile?: () => Promise<string | undefined>;
 }
 
 /**
@@ -165,7 +170,7 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
   const shallow = (await roots.refs.getShallow?.()) ?? [];
   // a grafted commit's parents are walked too, besides the ones it records: git's repack
   // (`--keep-true-parents`) keeps the real parents and its prune walks the grafted ones
-  const grafts = await readGraftParents(roots.refs);
+  const grafts = await readGraftParents(roots.refs, roots.readGraftFile);
   const graph = await roots.commitGraph?.get().catch(() => undefined);
   const commitHeader = graph
     ? async (id: ObjectId) => {

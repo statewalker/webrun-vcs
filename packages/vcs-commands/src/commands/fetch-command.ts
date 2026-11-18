@@ -15,7 +15,6 @@ import {
   fetchUpdateDisplay,
   formatFetchDisplay,
   formatFetchHead,
-  mapRefs,
   matchDestination,
   matchSource,
   parseRefSpec,
@@ -604,10 +603,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       // fetch.c do_fetch: a branch a worktree has checked out is not fetched into (the
       // whole fetch dies first, unless --update-head-ok); stale refs are pruned before
       // anything is fetched, with command-line refspecs by those, else by the configured ones
-      beforeFetch: async (remoteRefs) => {
-        if (!this.updateHeadOk) {
-          await this.refuseCheckedOutBranch(remoteRefs, [...refspecs, ...opportunistic]);
-        }
+      beforeFetch: async (remoteRefs, refMap) => {
+        // check_not_current_branch over git's ref map: the refs the refspecs took and their
+        // opportunistic updates, not every advertised ref the configured refspecs would map
+        if (!this.updateHeadOk) await this.refuseCheckedOutBranch(refMap);
         if (prune) {
           const names = new Set(remoteRefs.filter((r) => r.oid).map((r) => r.name));
           const pruneSpecs = (fromConfig ? configured : explicitSpecs).map((s) => parseRefSpec(s));
@@ -690,20 +689,17 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * git's check_not_current_branch: the first branch the refspecs would write (from the
-   * advertised refs) that a worktree has checked out makes the fetch die, naming that
-   * worktree's path.
+   * git's check_not_current_branch: the first branch of the ref map (the refs the refspecs
+   * took, then their opportunistic updates) that a worktree has checked out makes the fetch
+   * die, naming that worktree's path.
    */
-  private async refuseCheckedOutBranch(
-    remoteRefs: readonly { name: string; oid?: string }[],
-    refspecs: readonly string[],
-  ): Promise<void> {
+  private async refuseCheckedOutBranch(refMap: readonly { localRef?: string }[]): Promise<void> {
     const worktrees = this._workingCopy.worktrees;
     if (!worktrees) return;
-    const branches = mapRefs(remoteRefs, refspecs)
+    const branches = refMap
       .map((p) => p.localRef)
       .filter((ref): ref is string => ref?.startsWith("refs/heads/") ?? false);
-    for (const ref of branches) {
+    for (const ref of new Set(branches)) {
       const wt = await worktreeUsingBranch(worktrees, ref);
       if (wt) throw new FetchIntoCheckedOutBranchError(ref, wt.path);
     }
@@ -999,12 +995,14 @@ export class FetchCommand extends TransportCommand<FetchResult> {
 
   /** Whether `id` is a commit, or a tag (chain) of one (git's lookup_commit_reference_gently). */
   private async peelsToCommit(id: ObjectId): Promise<boolean> {
-    const history = this._workingCopy.history;
+    // parse_object reads through replace refs
+    const commits = this.commits;
+    const tags = this.tagsStore;
     let current: ObjectId | undefined = id;
     for (let i = 0; current && i < 16; i++) {
-      if (await history.commits.has(current)) return true;
-      if (!(await history.tags.has(current))) return false;
-      current = await history.tags.getTarget(current);
+      if (await commits.has(current)) return true;
+      if (!tags || !(await tags.has(current))) return false;
+      current = await tags.getTarget(current);
     }
     return false;
   }

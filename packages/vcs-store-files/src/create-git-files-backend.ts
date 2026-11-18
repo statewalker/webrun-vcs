@@ -18,6 +18,7 @@ import type {
 import {
   createGitObjects,
   createHistoryFromComponents,
+  graftFileReader,
   joinPath,
   openPackSet,
 } from "@statewalker/vcs-core";
@@ -74,7 +75,8 @@ export interface GitFilesBackendOptions {
   /**
    * The user's environment (`createNodeGitHostEnvironment` on Node): the commit-graph
    * settings (`core.commitGraph`, `commitGraph.*`) are then read from the system and global
-   * config files too, as git reads them. Absent, only the repository's config is read.
+   * config files too, as git reads them. Absent, only the repository's config is read. Its
+   * grafts file (`GIT_GRAFT_FILE`) is read in place of `info/grafts` (`refs.readGrafts`).
    */
   environment?: GitHostEnvironment;
 }
@@ -173,6 +175,10 @@ export async function createGitFilesBackend(
     logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
     reflogIdentity: options.reflogIdentity ?? reflog.identity,
   });
+  // GIT_GRAFT_FILE: the environment's grafts file is the one read (gc, repack and the
+  // walks keep and follow its grafts), in place of info/grafts
+  const readGraftFile = graftFileReader(options.environment);
+  if (readGraftFile) refStore.readGrafts = readGraftFile;
   // HEAD as git init writes it (create_symref): `ref: …` into HEAD.lock, renamed over HEAD
   if (create) await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 

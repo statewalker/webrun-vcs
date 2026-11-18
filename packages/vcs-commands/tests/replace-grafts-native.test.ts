@@ -282,6 +282,24 @@ describeGit("replace refs and grafts in porcelain commands, native twins", () =>
     expect(snapshot(root, od).files["three.txt"]).toBe("replaced content\n");
   });
 
+  it("log -- <path> compares replaced trees", async () => {
+    const { dir, ids } = repo();
+    // two's tree reads as side1's: two.txt leaves it, side1.txt comes in
+    g(
+      dir,
+      "replace",
+      g(dir, "rev-parse", `${ids.two}^{tree}`),
+      g(dir, "rev-parse", "side1^{tree}"),
+    );
+    for (const args of [
+      ["main", "--", "two.txt"],
+      ["main", "--", "side1.txt"],
+      ["one..main", "--", "two.txt", "side1.txt"],
+    ]) {
+      expect(await oursLog(await open(dir), args), args.join(" ")).toEqual(nativeLog(dir, args));
+    }
+  });
+
   it("grafts decide fast-forwards, branch --contains and merge bases of a rebase", async () => {
     const { dir, ids } = repo();
     // side2's parent becomes four: merging side into four fast-forwards

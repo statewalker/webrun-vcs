@@ -314,15 +314,16 @@ export class HistoryImpl implements History {
       }
       yield oid;
       // a commit's children are its tree, then its parents
-      if (shallow.has(oid)) enqueue(oid, children.slice(0, 1), children.slice(1));
-      else enqueue(oid, children);
-      // a grafted commit's grafted parents, when stored (git's prune walks them)
-      const grafted = grafts?.get(oid);
-      if (grafted) {
-        for (const id of grafted) {
-          if (visited.has(id) || excludeExpanded.has(id) || children.includes(id)) continue;
-          if (objects ? await objects.has(id) : await this.commits.has(id)) queue.push(id);
-        }
+      if (shallow.has(oid)) {
+        // the shallow file overrides a graft (register_shallow): no grafted parents
+        enqueue(oid, children.slice(0, 1), children.slice(1));
+      } else {
+        // a grafted commit's grafted parents besides its recorded ones (repack keeps the true
+        // parents, prune walks the grafted ones); required as parents are (git dies: "Could
+        // not read <id>", "Failed to traverse parents of commit <id>")
+        const grafted = grafts?.get(oid);
+        const extra = grafted?.filter((id) => !children.includes(id));
+        enqueue(oid, extra?.length ? [...children, ...extra] : children);
       }
     }
   }

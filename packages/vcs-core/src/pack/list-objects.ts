@@ -41,7 +41,9 @@ export interface ListObjectsOptions {
   /**
    * Commit grafts (`info/grafts`): a grafted commit's parents walked as well as the ones it
    * records, as gc keeps both (`git repack --keep-true-parents` packs the real parents, `git
-   * prune` walks the grafted ones). A grafted parent that is not stored is skipped.
+   * prune` walks the grafted ones). A grafted parent is required as a recorded one is (git's
+   * repack dies on a missing one); a shallow commit's graft is ignored (the shallow file
+   * overrides it).
    */
   grafts?: ReadonlyMap<ObjectId, readonly ObjectId[]>;
   /**
@@ -114,15 +116,13 @@ export async function* listObjects(
   const commits = new Map<ObjectId, CommitInfo>();
   const shallow = new Set(options.shallow ?? []);
   const grafts = options.grafts;
-  /** Grafted parents a commit does not record: walked when stored, skipped when absent */
-  const optional = new Set<ObjectId>();
   const parentsOf = (id: ObjectId, c: CommitInfo): ObjectId[] => {
-    const own = shallow.has(id) ? [] : c.parents;
+    // a shallow commit has no parents, whatever its graft says (register_shallow)
+    if (shallow.has(id)) return [];
     const grafted = grafts?.get(id);
-    if (!grafted) return own;
-    const extra = grafted.filter((p) => !own.includes(p));
-    for (const p of extra) optional.add(p);
-    return extra.length > 0 ? [...own, ...extra] : own;
+    if (!grafted) return c.parents;
+    const extra = grafted.filter((p) => !c.parents.includes(p));
+    return extra.length > 0 ? [...c.parents, ...extra] : c.parents;
   };
 
   const read = async (id: ObjectId): Promise<{ type: ObjectTypeString; data: Uint8Array }> => {
@@ -190,7 +190,7 @@ export async function* listObjects(
   const enqueue = async (id: ObjectId, uninteresting: boolean) => {
     if (uninteresting) markUninteresting(id);
     if (has(id, SEEN)) return;
-    const c = await parseCommit(id, !uninteresting && !optional.has(id));
+    const c = await parseCommit(id, !uninteresting);
     if (!c) return; // an uninteresting parent missing (a shallow or partial store)
     set(id, SEEN);
     push(id, c.time);

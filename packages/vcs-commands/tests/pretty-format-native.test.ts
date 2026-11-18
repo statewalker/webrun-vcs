@@ -161,3 +161,49 @@ describeGit("formatCommitPretty against git log --format, native", () => {
     }
   });
 });
+
+describeGit("padding, truncation and wrapping of combining and wide characters, native", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "pretty-format-width-native-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it("combining marks stay attached where git keeps them; git's width tables", async () => {
+    const dir = join(root, "widths");
+    text(root, ["init", "-q", "-b", "main", dir]);
+    const subjects = [
+      // e + combining acute, repeated: marks right at the cut stay with their letter
+      "café déjà vü naı̈ve résumé cliché",
+      // Hebrew points, Devanagari signs, Arabic marks (zero width in git's tables)
+      "שָׁלוֹם किताब بِسْم tail text",
+      // wide characters and emoji, a variation selector and a zero-width joiner
+      "中文字符 👍🏽 ❤️ 👨‍💻 end",
+      // a soft hyphen, a word joiner, a control character
+      "soft­hyphen word⁠joiner ctrl\u0001char and more words here",
+    ];
+    for (const [i, subject] of subjects.entries()) {
+      put(dir, `f${i}.txt`, `${i}\n`);
+      text(dir, ["add", "-A"]);
+      text(dir, ["commit", "-q", "--cleanup=verbatim", "-m", subject]);
+    }
+    const { history } = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: dir }),
+    });
+    const ids = text(dir, ["rev-list", "--all"]).split("\n");
+    const formats: string[] = [];
+    for (const n of [3, 4, 5, 6, 7, 8, 9, 11, 13]) {
+      formats.push(`%<(${n},trunc)%s|`, `%>(${n},ltrunc)%s|`, `%><(${n},mtrunc)%s|`);
+    }
+    formats.push("%<(40)%s|", "%>(45)%s|", "%><(50)%s|", "%w(12,1,2)%s", "%w(9)%s");
+    for (const id of ids) {
+      const commit = await history.commits.load(id);
+      if (!commit) throw new Error(`no commit ${id}`);
+      for (const format of formats) {
+        const native = run(dir, ["log", "-1", `--format=${format}`, id]);
+        const ours = await formatCommitPretty(format, commit, id, { now: NOW, notes: "" });
+        const bytes = Buffer.from(encodeGitPath(`${ours}\n`));
+        expect(bytes.toString("utf8"), `${format} of ${id}`).toBe(native.toString("utf8"));
+      }
+    }
+  });
+});

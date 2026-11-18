@@ -454,6 +454,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // replace refs and grafts (git's parse_commit applies both; no commit-graph then)
     const replacements = await this.objectReplacements();
     this.markReplacementsRead();
+    // trees compared for paths read through replace refs too (read_object_file)
+    this.treeReplacements = replacements?.replace.size ? replacements.replace : undefined;
     const graph =
       shallow.size > 0 || replacements
         ? undefined
@@ -1088,12 +1090,16 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     return findRawEntry(raw, name);
   }
 
+  /** The replace refs a walk's tree reads follow; undefined without any. */
+  private treeReplacements?: ReadonlyMap<ObjectId, ObjectId>;
+
   /** Raw trees read lately, most recently used last: a commit's trees are its child's parent trees. */
   private readonly rawTrees = new OrderedMap<ObjectId, Uint8Array>();
   private rawTreeBytes = 0;
 
   /** The raw bytes of a tree; undefined when it is missing, null without a raw object store. */
-  private async rawTree(id: ObjectId): Promise<Uint8Array | undefined | null> {
+  private async rawTree(tree: ObjectId): Promise<Uint8Array | undefined | null> {
+    const id = this.treeReplacements ? replacementOf(this.treeReplacements, tree) : tree;
     const cached = this.rawTrees.get(id);
     if (cached) {
       this.rawTrees.delete(id);

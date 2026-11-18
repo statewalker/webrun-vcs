@@ -193,7 +193,9 @@ export interface CollectReachableOptions {
   shallow?: Iterable<ObjectId>;
   /**
    * Commit grafts (`info/grafts`): a grafted commit's grafted parents are walked as well as the
-   * ones it records (git's gc keeps both). A grafted parent that is not stored is skipped.
+   * ones it records (git's gc keeps both: `repack --keep-true-parents`, then prune), and are
+   * required as recorded parents are (git's gc dies on a missing one). A shallow commit's graft
+   * is ignored: the shallow file overrides it (register_shallow).
    */
   grafts?: ReadonlyMap<ObjectId, readonly ObjectId[]>;
   /**

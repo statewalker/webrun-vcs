@@ -76,9 +76,15 @@ export interface FetchClientOptions {
   /**
    * Called once the remote refs are listed and mapped, before any object is fetched or ref
    * written: where `git fetch --prune` deletes the stale remote-tracking refs, so a
-   * renamed remote branch (`foo` to `foo/bar`) does not conflict with the old one.
+   * renamed remote branch (`foo` to `foo/bar`) does not conflict with the old one. `refMap`
+   * is git's ref map so far (get_ref_map): the refs the refspecs took, then the opportunistic
+   * updates of those, each with the local ref it writes (where fetch refuses to update a
+   * branch a worktree has checked out).
    */
-  beforeFetch?: (remoteRefs: readonly RemoteRef[]) => Promise<void>;
+  beforeFetch?: (
+    remoteRefs: readonly RemoteRef[],
+    refMap: readonly { remoteRef: string; localRef?: string }[],
+  ) => Promise<void>;
   /** Tag following; default `auto` */
   tags?: TagMode;
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
@@ -314,7 +320,7 @@ export async function fetchFromConnection(
         .map(({ refspec: _refspec, ...p }) => p)
     : [];
 
-  if (options.beforeFetch) await options.beforeFetch(remoteRefs);
+  if (options.beforeFetch) await options.beforeFetch(remoteRefs, [...planned, ...opportunistic]);
 
   const source = negotiatorSource(repository);
   // what is complete here: reachable from the local refs (git's mark_complete), not merely

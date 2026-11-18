@@ -29,6 +29,7 @@
  */
 
 import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import { gitCharWidth } from "@statewalker/vcs-utils/encoding";
 import { formatRfc2822Date } from "./git-date.js";
 import { formatGitDate } from "./sequencer-support.js";
 
@@ -99,6 +100,11 @@ export interface LoadRefDecorationsOptions {
   grafted?: Iterable<ObjectId>;
   /** Whether an object is stored (a replaced original that is not is not decorated) */
   hasObject?: (id: ObjectId) => Promise<boolean>;
+  /**
+   * Receives what git prints on stderr while decorating: `warning: invalid replace ref
+   * <name>` for a ref under the replace base that does not start with an object id below it
+   */
+  onWarning?: (message: string) => void;
 }
 
 /**
@@ -138,7 +144,11 @@ export async function loadRefDecorations(
     if (name.startsWith(replaceBase)) {
       if (options.useReplaceRefs === false) return;
       const hex = name.slice(replaceBase.length);
-      if (!/^[0-9a-fA-F]{40}/.test(hex)) return;
+      if (!/^[0-9a-fA-F]{40}/.test(hex)) {
+        // add_ref_decoration: get_oid_hex of what follows the base
+        options.onWarning?.(`warning: invalid replace ref ${name}`);
+        return;
+      }
       const original = hex.slice(0, 40).toLowerCase();
       if (options.hasObject && !(await options.hasObject(original))) return;
       add(original, { type: "grafted", name: "replaced" });
@@ -562,24 +572,12 @@ function escapeLength(text: string, at: number): number {
   return text[i] === "m" ? i + 1 - at : 0;
 }
 
-/** The columns a code point takes (git's utf8_width: wide East Asian 2, combining 0). */
+/**
+ * The columns a code point takes (git's utf8_width, its unicode-width tables: wide East Asian
+ * 2, combining and other non-spacing 0), a control character none.
+ */
 function charWidth(cp: number): number {
-  if (cp === 0) return 0;
-  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
-  if ((cp >= 0x300 && cp <= 0x36f) || (cp >= 0x200b && cp <= 0x200f)) return 0;
-  if (
-    (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
-    (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) ||
-    (cp >= 0xfe30 && cp <= 0xfe4f) ||
-    (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) ||
-    (cp >= 0x1f300 && cp <= 0x1f64f) ||
-    (cp >= 0x20000 && cp <= 0x3fffd)
-  )
-    return 2;
-  return 1;
+  return Math.max(gitCharWidth(cp), 0);
 }
 
 /** utf8_strnwidth with skip_ansi: the columns of `text`, color sequences taking none. */
@@ -613,7 +611,8 @@ function utf8Replace(text: string, pos: number, width: number, subst: string): s
     const cp = text.codePointAt(i) as number;
     const len = cp > 0xffff ? 2 : 1;
     const cw = charWidth(cp);
-    if (w >= pos && w < pos + width) {
+    // a character of no width (a combining mark) is kept, attached to what precedes it
+    if (cw && w >= pos && w < pos + width) {
       if (!replaced) {
         out += subst;
         replaced = true;
@@ -703,7 +702,8 @@ export function wrapText(text: string, indent1: number, indent2: number, width: 
       continue;
     }
     const cp = text.codePointAt(i) as number;
-    w += charWidth(cp);
+    // utf8_width as is: a control character takes a column back (-1)
+    w += gitCharWidth(cp);
     i += cp > 0xffff ? 2 : 1;
   }
 }

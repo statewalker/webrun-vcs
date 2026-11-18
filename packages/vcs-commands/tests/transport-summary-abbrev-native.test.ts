@@ -337,4 +337,34 @@ describeGit("fetch refusals: summary width and checked-out branches, native twin
       .call();
     expect(ok.trackingRefUpdates.map((u) => u.localRef)).toContain("refs/heads/side");
   });
+
+  it("the checked-out branch check covers only the refs fetched and their opportunistic updates", async () => {
+    // a mirror-like refspec: every remote branch maps onto a local branch, main among them
+    const { src, native, ours } = setup();
+    const dev = run(src, ["rev-parse", "dev"]).trim();
+    for (const dir of [native, ours]) {
+      run(dir, ["config", "--replace-all", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"]);
+    }
+    // `fetch origin dev`: only dev is in the ref map (refs/heads/dev updated), not main
+    const nativeRun = spawnSync("git", ["fetch", "origin", "dev"], {
+      cwd: native,
+      env: nativeGitEnv(home),
+      encoding: "utf8",
+    });
+    expect([nativeRun.status, nativeRun.stderr]).toEqual([0, nativeRun.stderr]);
+    const result = await (await open(ours)).fetch().setRemote("origin").setRefSpecs("dev").call();
+    expect(result.trackingRefUpdates.map((u) => u.localRef)).toContain("refs/heads/dev");
+    expect(run(ours, ["rev-parse", "refs/heads/dev"]).trim()).toBe(dev);
+    expect(run(native, ["rev-parse", "refs/heads/dev"]).trim()).toBe(dev);
+    expect(oursLinesOf(result.display, src)).toEqual(refLines(nativeRun.stderr));
+    // `fetch origin main`: main's opportunistic update is the checked-out branch: refused
+    expect(stderrOf(native, ["fetch", "origin", "main"]).trim()).toBe(
+      `fatal: refusing to fetch into branch 'refs/heads/main' checked out at '${native}'`,
+    );
+    await expect(
+      (await open(ours)).fetch().setRemote("origin").setRefSpecs("main").call(),
+    ).rejects.toThrow(
+      `fatal: refusing to fetch into branch 'refs/heads/main' checked out at '${ours}'`,
+    );
+  });
 });

@@ -114,13 +114,51 @@ export function parseGraftFile(text: string): {
  * The grafted parents of each commit in the repository's grafts file (none when there is no
  * file or the store has none), for reachability walks: gc keeps the objects a grafted commit
  * reaches through its grafted parents as well as through the ones it records, as git's repack
- * (`--keep-true-parents`) and prune together do.
+ * (`--keep-true-parents`) and prune together do. `readGraftFile` reads the grafts file in
+ * place of `info/grafts` (git's `GIT_GRAFT_FILE`, see {@link graftFileReader}). A shallow
+ * commit's graft is overridden by the shallow file (git's register_shallow): the walks give
+ * it no parents at all.
+ *
+ * @example
+ * ```typescript
+ * const grafts = await readGraftParents(history.refs, graftFileReader(environment));
+ * ```
  */
 export async function readGraftParents(
   refs: Partial<Pick<Refs, "readGrafts">>,
+  readGraftFile?: () => Promise<string | undefined>,
 ): Promise<Map<ObjectId, ObjectId[]>> {
-  const text = refs.readGrafts ? await refs.readGrafts() : undefined;
+  const text = readGraftFile
+    ? await readGraftFile()
+    : refs.readGrafts
+      ? await refs.readGrafts()
+      : undefined;
   return text === undefined ? new Map() : parseGraftFile(text).grafts;
+}
+
+/**
+ * The reader of the grafts file an environment names (git's `GIT_GRAFT_FILE`), for
+ * {@link readGraftParents} and `LoadObjectReplacementsOptions.readGraftFile`; undefined when
+ * the environment names none (then `info/grafts` is read). Set but empty, there is no grafts
+ * file; a file that cannot be read gives no grafts, as git warns and goes on.
+ *
+ * @example
+ * ```typescript
+ * await gc({ ...backend, readGraftFile: graftFileReader(environment) });
+ * ```
+ */
+export function graftFileReader(
+  environment:
+    | { graftFile?: string; readFile(path: string): Promise<Uint8Array | undefined> }
+    | undefined,
+): (() => Promise<string | undefined>) | undefined {
+  const graftFile = environment?.graftFile;
+  if (environment === undefined || graftFile === undefined) return undefined;
+  return async () => {
+    if (!graftFile) return undefined;
+    const bytes = await environment.readFile(graftFile).catch(() => undefined);
+    return bytes === undefined ? undefined : new TextDecoder().decode(bytes);
+  };
 }
 
 /** Options of {@link loadObjectReplacements}. */
