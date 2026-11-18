@@ -227,6 +227,7 @@ async function ours(g: Git, args: string[]): Promise<Buffer> {
     else if (a === "--numstat") options.numstat = true;
     else if (a === "--name-only") options.nameOnly = true;
     else if (a === "--name-status") options.nameStatus = true;
+    else if (a === "--summary") options.summary = true;
     else if (a === "-m") options.m = true;
     else if (a === "-c") options.c = true;
     else if (a === "--cc") options.cc = true;
@@ -1100,6 +1101,139 @@ describeGit("git log follow-up review fixes, native", () => {
       if (!mine.equals(native))
         failures.push(`git diff --abbrev=${abbrev}\n${firstDifference(native, mine)}`);
     }
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+});
+
+describeGit("git log and git diff follow-up fixes, native", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "log-copies-native-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const commitAll = (dir: string, message: string) => {
+    clock += 3600;
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-q", "-m", message]);
+  };
+  const lines = (tag: string, n: number) =>
+    Array.from({ length: n }, (_, i) => `${tag} line ${i + 1}\n`).join("");
+
+  /** `git diff <args>` against DiffCommand's formats */
+  async function compareDiff(
+    dir: string,
+    args: string[],
+    formats: Parameters<ReturnType<Git["diff"]>["callFormats"]>[0],
+    configure: (d: ReturnType<Git["diff"]>) => void,
+    failures: string[],
+  ): Promise<void> {
+    const native = git(dir, ["diff", ...args]);
+    const d = (await openOurs(dir)).diff();
+    configure(d);
+    const mine = Buffer.from((await d.callFormats(formats)).bytes ?? new Uint8Array(0));
+    if (!mine.equals(native))
+      failures.push(`git diff ${args.join(" ")}\n${firstDifference(native, mine)}`);
+  }
+
+  it("diff.renames=copies finds copies of modified and deleted paths (log, diff)", async () => {
+    const dir = join(root, "copies");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "a.txt", lines("a", 20));
+    put(dir, "b.txt", lines("b", 20));
+    put(dir, "e.txt", lines("e", 20));
+    put(dir, "same.txt", lines("s", 20));
+    commitAll(dir, "root");
+    // a.txt modified and copied (edited); b.txt modified and copied as it was; e.txt deleted
+    // and taken twice (the first a copy, the last a rename); same.txt copied unchanged
+    // (not found without --find-copies-harder)
+    put(dir, "a.txt", `${lines("a", 20)}more\n`);
+    put(dir, "a-copy.txt", `${lines("a", 19)}changed\n`);
+    put(dir, "b.txt", `top\n${lines("b", 20)}`);
+    put(dir, "z-b.txt", lines("b", 20));
+    git(dir, ["rm", "-q", "e.txt"]);
+    put(dir, "e1.txt", `${lines("e", 20)}one\n`);
+    put(dir, "e2.txt", `${lines("e", 20)}two\n`);
+    put(dir, "same-copy.txt", lines("s", 20));
+    commitAll(dir, "copies");
+    // only a rename (a deleted source used once)
+    git(dir, ["mv", "z-b.txt", "zz.txt"]);
+    commitAll(dir, "rename");
+    git(dir, ["config", "diff.renames", "copies"]);
+    const shown = git(dir, ["log", "--name-status", "--format=%s", "-n", "1", "HEAD~1"]).toString();
+    expect(shown).toMatch(/^C\d+\ta\.txt\ta-copy\.txt$/m);
+    expect(shown).toMatch(/^C\d+\tb\.txt\tz-b\.txt$/m);
+    expect(shown).toMatch(/^C\d+\te\.txt\te1\.txt$/m);
+    expect(shown).toMatch(/^R\d+\te\.txt\te2\.txt$/m);
+    const g = await openOurs(dir);
+    const failures = await compareCases(dir, g, [
+      ["--stat", "--oneline"],
+      ["--name-status", "--oneline"],
+      ["--summary", "--oneline"],
+      ["-p", "--oneline"],
+      ["--stat", "--summary", "-p", "--oneline"],
+      ["--numstat", "--name-only", "--format=%s"],
+    ]);
+    const range = (d: ReturnType<Git["diff"]>) => d.setOldTree("HEAD~2").setNewTree("HEAD~1");
+    await compareDiff(dir, ["--stat", "HEAD~2", "HEAD~1"], ["stat"], range, failures);
+    await compareDiff(dir, ["--name-status", "HEAD~2", "HEAD~1"], ["name-status"], range, failures);
+    await compareDiff(dir, ["--summary", "HEAD~2", "HEAD~1"], ["summary"], range, failures);
+    await compareDiff(dir, ["HEAD~2", "HEAD~1"], ["patch"], range, failures);
+    // staged: a copy of a modified path in the index
+    put(dir, "b.txt", `top2\n${lines("b", 20)}`);
+    put(dir, "b-staged.txt", `${lines("b", 20)}tail\n`);
+    git(dir, ["add", "-A"]);
+    await compareDiff(
+      dir,
+      ["--cached", "--stat", "--summary"],
+      ["stat", "summary"],
+      (d) => d.setCached(true),
+      failures,
+    );
+    // -M (renames only) and diff.renames=true find no copies
+    git(dir, ["config", "diff.renames", "true"]);
+    failures.push(
+      ...(await compareCases(dir, await openOurs(dir), [["--name-status", "--oneline"]])),
+    );
+    expect(failures.slice(0, 6).join("\n\n")).toBe("");
+  }, 120000);
+
+  it("prints a conflicted path's combined diff before the other formats (git diff)", async () => {
+    const dir = join(root, "unmerged");
+    git(root, ["init", "-q", "-b", "main", dir]);
+    put(dir, "a.txt", lines("a", 10));
+    put(dir, "x.txt", "base\n");
+    commitAll(dir, "root");
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    put(dir, "x.txt", "side\n");
+    commitAll(dir, "side");
+    git(dir, ["checkout", "-q", "main"]);
+    put(dir, "x.txt", "main\n");
+    commitAll(dir, "main");
+    clock += 3600;
+    spawnSync("git", ["merge", "-q", "side"], { cwd: dir, env: env() });
+    put(dir, "a.txt", `${lines("a", 10)}dirty\n`);
+    put(dir, "new.txt", "untracked\n");
+    const failures: string[] = [];
+    const none = () => {};
+    await compareDiff(dir, ["--stat", "-p"], ["stat", "patch"], none, failures);
+    await compareDiff(
+      dir,
+      ["--stat", "--summary", "-p"],
+      ["stat", "summary", "patch"],
+      none,
+      failures,
+    );
+    await compareDiff(
+      dir,
+      ["--numstat", "--shortstat", "-p"],
+      ["numstat", "shortstat", "patch"],
+      none,
+      failures,
+    );
+    await compareDiff(dir, ["--stat"], ["stat"], none, failures);
+    // the conflict alone
+    git(dir, ["checkout", "--", "a.txt"]);
+    await compareDiff(dir, ["--stat", "-p"], ["stat", "patch"], none, failures);
     expect(failures.slice(0, 6).join("\n\n")).toBe("");
   }, 120000);
 });

@@ -28,6 +28,8 @@ export interface GitCheckoutHost {
   localChanges(commit: ObjectId): Promise<string>;
   /** The id abbreviated as DEFAULT_ABBREV abbreviates it */
   abbreviate(id: ObjectId): Promise<string>;
+  /** `GIT_PRINT_SHA1_ELLIPSIS=yes`: describe_detached_head puts `...` after the id */
+  printSha1Ellipsis?: boolean;
   /** The commit's subject as CMIT_FMT_ONELINE shows it */
   subject(id: ObjectId): Promise<string>;
   /** The commits' headers, for the walk of orphaned_commit_warning and the tracking counts */
@@ -42,6 +44,8 @@ export interface GitCheckoutHost {
   pushOf(branch: string): Promise<string | undefined>;
   /** The commit a ref points to, undefined when missing */
   refCommit(ref: string): Promise<ObjectId | undefined>;
+  /** The remote `git push` of the branch pushes to (pushremote_for_branch) */
+  pushRemoteOf(branch: string): Promise<string | undefined>;
   /** refs_shorten_unambiguous_ref */
   shortenRef(ref: string): Promise<string>;
 }
@@ -84,8 +88,7 @@ export async function gitCheckout(
     stderr += await orphanedCommitWarning(host, old.id, now.id);
   }
   // update_refs_for_switch
-  const describe = async (msg: string, id: ObjectId) =>
-    `${msg} ${await host.abbreviate(id)} ${await host.subject(id)}\n`;
+  const describe = (msg: string, id: ObjectId) => describeDetachedHead(host, msg, id);
   if (name === "HEAD" && !now.path) {
     // nothing to do
   } else if (!now.path) {
@@ -96,8 +99,22 @@ export async function gitCheckout(
   } else {
     stderr += `Switched to branch '${name}'\n`;
   }
-  if (now.path || name === "HEAD") stdout += await reportTracking(host, now.path);
+  if (now.path || name === "HEAD") {
+    const tracking = await reportTracking(host, now.path);
+    stdout += tracking.stdout;
+    stderr += tracking.stderr;
+  }
   return { ok: true, stdout, stderr };
+}
+
+/** checkout.c's describe_detached_head: `<msg> <abbrev>[...] <subject>` */
+async function describeDetachedHead(
+  host: GitCheckoutHost,
+  msg: string,
+  id: ObjectId,
+): Promise<string> {
+  const dots = host.printSha1Ellipsis ? "..." : "";
+  return `${msg} ${await host.abbreviate(id)}${dots} ${await host.subject(id)}\n`;
 }
 
 /** advice.c's detach_advice */
@@ -131,7 +148,7 @@ async function orphanedCommitWarning(
   if (newId) pending.push({ id: newId, exclude: true });
   const walked = await graph.walk(pending);
   if (graph.lookup(oldId).flags & UNINTERESTING) {
-    return `Previous HEAD position was ${await host.abbreviate(oldId)} ${await host.subject(oldId)}\n`;
+    return describeDetachedHead(host, "Previous HEAD position was", oldId);
   }
   const lost = walked.filter((n) => !(n.flags & UNINTERESTING));
   const describeOne = async (id: ObjectId) =>
@@ -166,43 +183,106 @@ async function countOnly(host: GitCheckoutHost, from: ObjectId, not: ObjectId): 
 }
 
 /**
- * checkout.c's report_tracking (remote.c's format_tracking_info with its default
- * `@{upstream}`): the branch against its upstream. With `status.compareBranches` set
- * nothing is reported.
+ * checkout.c's report_tracking, remote.c's format_tracking_info: the branch against each
+ * ref `status.compareBranches` names (`@{upstream}` and `@{push}`, split at spaces, each
+ * resolved ref compared once; `@{upstream}` alone when unset), the reports a blank line
+ * apart. The push advice goes with the push ref; a push ref that is not the upstream gets
+ * `git pull <remote> <branch>` advice when it follows a branch of the push remote.
  */
-async function reportTracking(host: GitCheckoutHost, path: string | undefined): Promise<string> {
-  if (!path?.startsWith("refs/heads/")) return "";
-  if (host.config("status.compareBranches") !== undefined) return "";
+async function reportTracking(
+  host: GitCheckoutHost,
+  path: string | undefined,
+): Promise<{ stdout: string; stderr: string }> {
+  let sb = "";
+  let stderr = "";
+  if (!path?.startsWith("refs/heads/")) return { stdout: sb, stderr };
   const branch = path.slice("refs/heads/".length);
-  const upstream = await host.upstreamOf(branch);
-  if (!upstream) return "";
+  const setting = host.config("status.compareBranches");
+  const names =
+    setting === undefined ? ["@{upstream}"] : setting.split(" ").filter((n) => n.length > 0);
+  const upstreamRef = await host.upstreamOf(branch);
+  const pushRef = await host.pushOf(branch);
   const hints = bool(host.config("advice.statusHints"), true);
-  const short = await host.shortenRef(upstream);
-  const theirs = await host.refCommit(upstream);
-  const ours = await host.refCommit(path);
-  if (!theirs || !ours) {
-    let out = `Your branch is based on '${short}', but the upstream is gone.\n`;
-    if (hints) out += '  (use "git branch --unset-upstream" to fixup)\n';
-    return out;
+  const processed = new Set<string>();
+  let reported = false;
+  for (const name of names) {
+    let fullRef: string | undefined;
+    const lower = name.toLowerCase();
+    if (lower === "@{upstream}") fullRef = upstreamRef;
+    else if (lower === "@{push}") fullRef = pushRef;
+    else {
+      stderr += `warning: ignoring value '${name}' for status.compareBranches, only @{upstream} and @{push} are supported\n`;
+    }
+    if (!fullRef || processed.has(fullRef)) continue;
+    processed.add(fullRef);
+    const short = await host.shortenRef(fullRef);
+    const isUpstream = fullRef === upstreamRef;
+    const isPush = fullRef === pushRef || (isUpstream && (!pushRef || upstreamRef === pushRef));
+    const theirs = await host.refCommit(fullRef);
+    const ours = await host.refCommit(path);
+    if (!theirs || !ours) {
+      if (isUpstream) {
+        sb += `Your branch is based on '${short}', but the upstream is gone.\n`;
+        if (hints) sb += '  (use "git branch --unset-upstream" to fixup)\n';
+        reported = true;
+      }
+      continue;
+    }
+    if (reported) sb += "\n";
+    let pushAdvice = false;
+    let pullAdvice = isUpstream;
+    let pull = "git pull";
+    if (isPush) {
+      pushAdvice = true;
+      if (fullRef !== upstreamRef) {
+        const remote = await host.pushRemoteOf(branch);
+        const prefix = `refs/remotes/${remote}/`;
+        if (remote && fullRef.startsWith(prefix)) {
+          pull = `git pull ${remote} ${fullRef.slice(prefix.length)}`;
+          pullAdvice = true;
+        }
+      } else {
+        pullAdvice = true;
+      }
+    }
+    sb += await formatBranchComparison(host, ours, theirs, short, hints, {
+      push: pushAdvice,
+      pull: pullAdvice ? pull : undefined,
+      // checkout passes show_divergence_advice: the advice goes with the upstream
+      divergence: isUpstream ? "git pull" : undefined,
+    });
+    reported = true;
   }
+  return { stdout: sb, stderr };
+}
+
+/** remote.c's format_branch_comparison (AHEAD_BEHIND_FULL). */
+async function formatBranchComparison(
+  host: GitCheckoutHost,
+  ours: ObjectId,
+  theirs: ObjectId,
+  short: string,
+  hints: boolean,
+  advice: { push: boolean; pull?: string; divergence?: string },
+): Promise<string> {
   if (theirs === ours) return `Your branch is up to date with '${short}'.\n`;
-  const push = await host.pushOf(branch);
-  const isPush = !push || push === upstream;
   const nOurs = await countOnly(host, ours, theirs);
   const nTheirs = await countOnly(host, theirs, ours);
   if (!nTheirs) {
     let out = `Your branch is ahead of '${short}' by ${nOurs} ${nOurs === 1 ? "commit" : "commits"}.\n`;
-    if (isPush && hints) out += '  (use "git push" to publish your local commits)\n';
+    if (advice.push && hints) out += '  (use "git push" to publish your local commits)\n';
     return out;
   }
   if (!nOurs) {
     let out = `Your branch is behind '${short}' by ${nTheirs} ${nTheirs === 1 ? "commit" : "commits"}, and can be fast-forwarded.\n`;
-    if (hints) out += '  (use "git pull" to update your local branch)\n';
+    if (advice.pull && hints) out += `  (use "${advice.pull}" to update your local branch)\n`;
     return out;
   }
   let out =
     `Your branch and '${short}' have diverged,\n` +
     `and have ${nOurs} and ${nTheirs} different ${nOurs + nTheirs === 1 ? "commit" : "commits"} each, respectively.\n`;
-  if (hints) out += '  (use "git pull" if you want to integrate the remote branch with yours)\n';
+  if (advice.divergence && hints) {
+    out += `  (use "${advice.divergence}" if you want to integrate the remote branch with yours)\n`;
+  }
   return out;
 }

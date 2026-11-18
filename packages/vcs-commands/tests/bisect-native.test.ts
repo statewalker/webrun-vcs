@@ -57,6 +57,12 @@ function modern(): boolean {
   return !!version && (Number(version[1]) > 2 || Number(version[2]) >= 50);
 }
 
+/** git 2.56 or later (`status.compareBranches`). */
+function atLeast256(): boolean {
+  const version = gitOk(root, root, "--version").match(/(\d+)\.(\d+)/);
+  return !!version && (Number(version[1]) > 2 || Number(version[2]) >= 56);
+}
+
 /** Native git with extra environment. */
 function run(
   dir: string,
@@ -323,13 +329,20 @@ async function step(
   options: {
     configure?: (cmd: ReturnType<Awaited<ReturnType<typeof openOurs>>["bisect"]>) => void;
     compareStderr?: boolean;
+    /** extra environment, for both */
+    env?: Record<string, string>;
   } = {},
 ): Promise<{ native: { status: number; stdout: string; stderr: string }; ours: BisectResult }> {
-  const native = run(a, ["bisect", ...args]);
+  const native = run(a, ["bisect", ...args], options.env);
   // 2.43's replay reset first (printing "We are not bisecting." without a bisection)
   if ((args[0] === "replay" || (args[0] === "reset" && args.length === 1)) && !modern())
     native.stdout = native.stdout.replace(/^We are not bisecting\.\n/, "");
-  const git = await openOurs(b, ourEnv());
+  const git = await openOurs(
+    b,
+    options.env
+      ? createNodeGitHostEnvironment({ env: { ...nativeGitEnv(root), ...options.env } })
+      : ourEnv(),
+  );
   const cmd = git.bisect().setArguments(args);
   options.configure?.(cmd);
   const ours = await cmd.call();
@@ -891,6 +904,128 @@ describeGit("git bisect against native git", () => {
       ({ native } = await step(a, b, ["bad"], terms));
     }
     await step(a, b, ["reset"], terms);
+  }, 60_000);
+
+  it("bisects past a shallow commit to the merge base of a good branch", async () => {
+    const { a, b } = linearTwins(12);
+    const terms = ["bad", "good"];
+    for (const dir of [a, b]) {
+      ok(dir, ["checkout", "-q", "-b", "side", "c3"]);
+      put(dir, "side.txt", "side\n");
+      ok(dir, ["add", "-A"]);
+      ok(dir, ["commit", "-q", "-m", "side"], {
+        GIT_AUTHOR_DATE: "1600009000 +0000",
+        GIT_COMMITTER_DATE: "1600009000 +0000",
+      });
+      ok(dir, ["checkout", "-q", "main"]);
+    }
+    // c7 shallow (no parents): main and side then have no merge base
+    const c7 = ok(a, ["rev-parse", "c7"]).trim();
+    for (const dir of [a, b]) writeFileSync(join(dir, ".git", "shallow"), `${c7}\n`);
+    const starts = [
+      ["start", "main", "side"],
+      ["start", "--no-checkout", "main", "side"],
+      ["start", "main", "side", "--", "f9.txt", "f10.txt", "f11.txt"],
+    ];
+    for (const start of starts) {
+      let { native } = await step(a, b, start, terms);
+      if (start.length === 3) {
+        expect(native.stdout).toMatch(/^Bisecting: 2 revisions left to test after this/);
+        expect(native.stdout).toContain("] c9\n");
+      }
+      for (let k = 0; k < 10 && native.status === 0 && CANDIDATE.test(native.stdout); k++) {
+        ({ native } = await step(a, b, ["good"], terms));
+      }
+      await step(a, b, ["log"], terms);
+      await step(a, b, ["reset"], terms);
+    }
+  }, 60_000);
+
+  it("compares the branch with each ref status.compareBranches names (git 2.56)", async () => {
+    if (!atLeast256()) return;
+    const src = join(root, `cmp-src${++counter}`);
+    linearHistory(src, 8);
+    const fork = join(root, `cmp-fork${counter}`);
+    ok(root, ["clone", "-q", `file://${src}`, fork]);
+    const commit = (dir: string, name: string, time: number) => {
+      put(dir, name, `${name}\n`);
+      ok(dir, ["add", "-A"]);
+      ok(dir, ["commit", "-q", "-m", name], {
+        GIT_AUTHOR_DATE: `${time} +0000`,
+        GIT_COMMITTER_DATE: `${time} +0000`,
+      });
+    };
+    commit(fork, "fork.txt", 1600008000);
+    const a = join(root, `cmp${counter}-a`);
+    const b = join(root, `cmp${counter}-b`);
+    for (const dir of [a, b]) {
+      ok(root, ["clone", "-q", `file://${src}`, dir]);
+      commit(dir, "local.txt", 1600009000);
+      ok(dir, ["remote", "add", "fork", `file://${fork}`]);
+      ok(dir, ["fetch", "-q", "fork"]);
+    }
+    const terms = ["bad", "good"];
+    const config = (key: string, value: string | undefined) => {
+      for (const dir of [a, b]) {
+        if (value === undefined) run(dir, ["config", "--unset-all", key]);
+        else ok(dir, ["config", key, value]);
+      }
+    };
+    const cycle = async () => {
+      await step(a, b, ["start", "HEAD", "HEAD~5"], terms);
+      return (await step(a, b, ["reset"], terms)).native;
+    };
+    // the push ref is the upstream: one report
+    config("status.compareBranches", "@{upstream} @{push}");
+    let native = await cycle();
+    expect(native.stdout).toBe(
+      "Your branch is ahead of 'origin/main' by 1 commit.\n" +
+        '  (use "git push" to publish your local commits)\n',
+    );
+    // pushed elsewhere: a report for each, a blank line apart
+    config("remote.pushDefault", "fork");
+    native = await cycle();
+    // ('simple' resolves no push ref to another remote)
+    expect(native.stdout).not.toContain("fork/main");
+    config("push.default", "current");
+    native = await cycle();
+    expect(native.stdout).toContain("\n\nYour branch and 'fork/main' have diverged,\n");
+    // the order given, each ref once, a value git ignores (with its warning)
+    config("status.compareBranches", "@{push} @{UPSTREAM} @{push} origin/main");
+    native = await cycle();
+    expect(native.stderr).toContain("warning: ignoring value 'origin/main'");
+    config("status.compareBranches", "");
+    expect((await cycle()).stdout).toBe("");
+    config("status.compareBranches", "  @{push}  ");
+    await cycle();
+    // behind the push ref: `git pull <remote> <branch>`
+    for (const dir of [a, b]) ok(dir, ["reset", "-q", "--hard", "origin/main"]);
+    config("status.compareBranches", "@{upstream} @{push}");
+    native = await cycle();
+    expect(native.stdout).toContain('(use "git pull fork main" to update your local branch)');
+    config("advice.statusHints", "false");
+    await cycle();
+    config("advice.statusHints", undefined);
+    // an upstream that is gone, then the push ref
+    for (const dir of [a, b]) ok(dir, ["update-ref", "-d", "refs/remotes/origin/main"]);
+    native = await cycle();
+    expect(native.stdout).toContain("but the upstream is gone");
+  }, 60_000);
+
+  it("puts an ellipsis after the ids of detached HEADs (GIT_PRINT_SHA1_ELLIPSIS=yes)", async () => {
+    const { a, b } = linearTwins(8);
+    const terms = ["bad", "good"];
+    const env = { GIT_PRINT_SHA1_ELLIPSIS: "yes" };
+    await step(a, b, ["start", "c7", "c1"], terms, { env });
+    const { native } = await step(a, b, ["reset"], terms, { env });
+    expect(native.stderr).toMatch(/^Previous HEAD position was [0-9a-f]+\.\.\. c4\n/);
+    await step(a, b, ["start", "c7", "c1"], terms, { env });
+    for (const dir of [a, b]) ok(dir, ["checkout", "-q", "main"]);
+    const { native: detached } = await step(a, b, ["reset", "c5"], terms, { env });
+    expect(detached.stderr).toMatch(/HEAD is now at [0-9a-f]+\.\.\. c5\n/);
+    // anything but "yes" (any case) prints none
+    await step(a, b, ["start", "c7", "c1"], terms, { env: { GIT_PRINT_SHA1_ELLIPSIS: "YES" } });
+    await step(a, b, ["reset"], terms, { env: { GIT_PRINT_SHA1_ELLIPSIS: "1" } });
   }, 60_000);
 
   it("shows the first bad commit as git show does (format, dates, mailmap, notes, encodings)", async () => {

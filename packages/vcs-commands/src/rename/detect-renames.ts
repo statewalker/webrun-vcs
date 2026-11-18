@@ -22,6 +22,11 @@ export interface RenameCandidate {
   mode: number;
   /** The blob id (for a worktree file: the id of its content) */
   id: ObjectId;
+  /**
+   * A source that stays (a modified path, a copy source with `copies`): it counts as used
+   * once from the start (git's `rename_used++` at register_rename_src), so it is only copied
+   */
+  kept?: boolean;
 }
 
 /** A source paired with a destination. */
@@ -30,6 +35,11 @@ export interface RenamePair {
   to: string;
   /** 0..{@link GIT_MAX_SCORE} (git's `p->score`); exact renames score the full score */
   score: number;
+  /**
+   * With `copies`: a copy (the source stays, or is taken by a later destination), as
+   * diff_resolve_rename_copy decides it; else a rename
+   */
+  copy?: boolean;
 }
 
 /** What rename detection needs. */
@@ -84,6 +94,12 @@ export interface DetectRenamesOptions {
   cachedPairs?: Iterable<[string, string | undefined]>;
   /** Keep the order the candidates are given in (default: sorted by path) */
   keepOrder?: boolean;
+  /**
+   * Copies too (git's DIFF_DETECT_COPY, `-C`, `diff.renames=copies`): a source may pair with
+   * several destinations, sources marked `kept` take part; no basename matches. Not with the
+   * merge options.
+   */
+  copies?: boolean;
 }
 
 /** A source a merge needs for its content (the other side changed it). */
@@ -221,8 +237,48 @@ function scoreCompare(a: Score, b: Score): number {
 }
 
 /**
- * Pairs deleted paths with added ones as git's `diffcore_rename` (renames, not copies):
- * each source and each destination in at most one pair.
+ * The best {@link CANDIDATES_PER_DESTINATION} sources of each destination (git's
+ * `record_if_better`), all sorted by `score_compare` (stable, as git's STABLE_QSORT).
+ */
+async function scoreMatrix(
+  sources: number[],
+  destinations: number[],
+  similarity: (s: number, d: number) => Promise<number>,
+  src: RenameCandidate[],
+  dst: RenameCandidate[],
+): Promise<Score[]> {
+  const matrix: Score[] = [];
+  for (const d of destinations) {
+    const slots: Score[] = Array.from({ length: CANDIDATES_PER_DESTINATION }, () => ({
+      dst: -1,
+      src: -1,
+      score: 0,
+      nameScore: 0,
+    }));
+    for (const s of sources) {
+      const candidate: Score = {
+        dst: d,
+        src: s,
+        score: await similarity(s, d),
+        nameScore: basename(src[s].path) === basename(dst[d].path) ? 1 : 0,
+      };
+      // `record_if_better`: replaces the worst slot when better
+      let worst = 0;
+      for (let k = 1; k < slots.length; k++) {
+        if (scoreCompare(slots[k], slots[worst]) > 0) worst = k;
+      }
+      if (scoreCompare(slots[worst], candidate) > 0) slots[worst] = candidate;
+    }
+    matrix.push(...slots);
+  }
+  matrix.sort(scoreCompare);
+  return matrix;
+}
+
+/**
+ * Pairs deleted paths with added ones as git's `diffcore_rename` (copies too with
+ * `copies`, else renames only): each destination in at most one pair, each source too
+ * unless copied.
  *
  * @example
  * ```typescript
@@ -247,12 +303,33 @@ export async function detectRenames(
     : destinations.filter(keep).sort(byPath);
   const pairs: RenamePair[] = [];
   if (src.length === 0 || dst.length === 0) return pairs;
+  const copies = options.copies === true;
   const srcUsed = new Set<number>();
   const dstDone = new Set<number>();
+  // git's rename_used: a kept source counts itself as a user
+  const useCount: number[] = src.map((c) => (c.kept ? 1 : 0));
+  const pairedAt = new Map<RenamePair, number>();
   const record = (d: number, s: number, score: number) => {
     dstDone.add(d);
     srcUsed.add(s);
-    pairs.push({ from: src[s].path, to: dst[d].path, score });
+    useCount[s] = (useCount[s] ?? 0) + 1;
+    const pair = { from: src[s].path, to: dst[d].path, score };
+    pairs.push(pair);
+    pairedAt.set(pair, d);
+  };
+  // diff_resolve_rename_copy: in destination order, each pair takes one use of its source;
+  // a source with uses left is copied, its last use renames it
+  const resolved = () => {
+    if (!copies) return pairs;
+    const left: number[] = [...useCount];
+    const bySrc = new Map(src.map((c, i) => [c.path, i]));
+    const ordered = [...pairs].sort((a, b) => (pairedAt.get(a) ?? 0) - (pairedAt.get(b) ?? 0));
+    for (const pair of ordered) {
+      const s = bySrc.get(pair.from) as number;
+      left[s] = (left[s] ?? 0) - 1;
+      pair.copy = (left[s] ?? 0) > 0;
+    }
+    return ordered;
   };
 
   // exact renames (`find_exact_renames`): an unused source of the same blob, one of the same
@@ -273,8 +350,10 @@ export async function detectRenames(
       if ((!isRegular(source.mode) || !isRegular(target.mode)) && source.mode !== target.mode) {
         continue;
       }
-      if (srcUsed.has(s)) continue;
-      const score = 1 + (basename(source.path) === basename(target.path) ? 1 : 0);
+      // higher for a source not used yet; a used one only for a copy
+      if (srcUsed.has(s) && !copies) continue;
+      const score =
+        (useCount[s] ? 0 : 1) + (basename(source.path) === basename(target.path) ? 1 : 0);
       if (score > bestScore) {
         best = s;
         bestScore = score;
@@ -284,7 +363,7 @@ export async function detectRenames(
     }
     if (best >= 0) record(d, best, GIT_MAX_SCORE);
   }
-  if (minimumScore >= GIT_MAX_SCORE) return pairs;
+  if (minimumScore >= GIT_MAX_SCORE) return resolved();
 
   // each candidate's size, and its span counts once first compared; the content itself is
   // dropped as soon as its spans are counted
@@ -321,6 +400,35 @@ export async function detectRenames(
     isRegular(src[s].mode) && isRegular(dst[d].mode)
       ? estimateSimilarity(await side(src[s], "source"), await side(dst[d], "destination"), minimum)
       : 0;
+
+  if (copies) {
+    // no basename matches with copies: every source (used ones too) against the
+    // destinations left, within the rename limit
+    const destinationsLeft = dst.map((_, i) => i).filter((i) => !dstDone.has(i));
+    const sourcesLeft = src.map((_, i) => i);
+    if (destinationsLeft.length === 0) return resolved();
+    if (sourcesLeft.length * destinationsLeft.length > renameLimit * renameLimit) {
+      options.onRenameLimit?.(Math.max(sourcesLeft.length, destinationsLeft.length));
+      return resolved();
+    }
+    const matrix = await scoreMatrix(
+      sourcesLeft,
+      destinationsLeft,
+      (s, d) => similarity(s, d, minimumScore),
+      src,
+      dst,
+    );
+    // find_renames: unused sources first, then (copies) any
+    for (const any of [false, true]) {
+      for (const m of matrix) {
+        if (m.dst < 0 || m.score < minimumScore) break;
+        if (dstDone.has(m.dst)) continue;
+        if (!any && useCount[m.src]) continue;
+        record(m.dst, m.src, m.score);
+      }
+    }
+    return resolved();
+  }
 
   // merge-ort's directory rename bookkeeping (`initialize_dir_rename_info`): the exact
   // renames counted, a first guess of where each removed directory went
@@ -431,31 +539,13 @@ export async function detectRenames(
     options.onRenameLimit?.(Math.max(remainingSources.length, remainingDestinations.length));
     return finish();
   }
-  const matrix: Score[] = [];
-  for (const d of remainingDestinations) {
-    const slots: Score[] = Array.from({ length: CANDIDATES_PER_DESTINATION }, () => ({
-      dst: -1,
-      src: -1,
-      score: 0,
-      nameScore: 0,
-    }));
-    for (const s of remainingSources) {
-      const candidate: Score = {
-        dst: d,
-        src: s,
-        score: await similarity(s, d, minimumScore),
-        nameScore: basename(src[s].path) === basename(dst[d].path) ? 1 : 0,
-      };
-      // `record_if_better`: replaces the worst slot when better
-      let worst = 0;
-      for (let k = 1; k < slots.length; k++) {
-        if (scoreCompare(slots[k], slots[worst]) > 0) worst = k;
-      }
-      if (scoreCompare(slots[worst], candidate) > 0) slots[worst] = candidate;
-    }
-    matrix.push(...slots);
-  }
-  matrix.sort(scoreCompare);
+  const matrix = await scoreMatrix(
+    remainingSources,
+    remainingDestinations,
+    (s, d) => similarity(s, d, minimumScore),
+    src,
+    dst,
+  );
   for (const m of matrix) {
     if (m.dst < 0 || m.score < minimumScore) break;
     if (dstDone.has(m.dst) || srcUsed.has(m.src)) continue;

@@ -25,6 +25,7 @@ import { InvalidArgumentError, RevisionError } from "../../errors/index.js";
 import { GitCommand } from "../../git-command.js";
 import { CheckoutCommand, CheckoutStatus } from "../checkout-command.js";
 import { DiffCommand } from "../diff-command.js";
+import { hostEnvironmentOf } from "../git-ident.js";
 import { LogCommand } from "../log-command.js";
 import { commitsBaseSource, MergeBaseGraph } from "../merge-bases.js";
 import { configBool, configValue } from "../merge-config.js";
@@ -406,6 +407,7 @@ export class BisectCommand extends GitCommand<BisectResult> {
                 .callText("name-status"),
             abbreviate: (id) => this.abbreviateObjectId(id),
             subject: (id) => this.onelineSubject(id),
+            printSha1Ellipsis: hostEnvironmentOf(this._workingCopy)?.printSha1Ellipsis === true,
             commits: source,
             refCommits: async () => {
               const out: ObjectId[] = [];
@@ -431,6 +433,13 @@ export class BisectCommand extends GitCommand<BisectResult> {
             refCommit: async (ref) => {
               const id = (await refs.resolve(ref).catch(() => undefined))?.objectId;
               return id ? peelCommit(id) : undefined;
+            },
+            pushRemoteOf: async (branch) => {
+              try {
+                return resolver().pushRemoteOf(branch);
+              } catch {
+                return undefined;
+              }
             },
             shortenRef: (ref) => shortenUnambiguousRef(refs, ref),
           },
