@@ -16,11 +16,15 @@ import {
   readFileSync,
   rmSync,
   utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitObjects, History } from "@statewalker/vcs-core";
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, gc, writeCommitGraph } from "../src/index.js";
 
@@ -453,6 +457,52 @@ describe("when the graph is not used", () => {
     execFileSync("mkdir", ["-p", join(dir, ".git/info")]);
     execFileSync("sh", ["-c", `echo "${a} ${b}" > .git/info/grafts`], { cwd: dir });
     await expectDisabled(dir);
+  });
+
+  it("with grafts in the file GIT_GRAFT_FILE names (and none when it names no file)", async () => {
+    const dir = smallRepo();
+    const [a, b] = git(dir, ["rev-parse", "main~1", "main~6"]).trim().split("\n");
+    const file = join(tempDir(), "grafts");
+    writeFileSync(file, `${a} ${b}\n`);
+    const env = { GIT_GRAFT_FILE: file };
+    const environment = createNodeGitHostEnvironment({ env });
+    const files = createNodeFilesApi({ rootDir: dir });
+    const openWith = () => createGitFilesBackend({ files, environment });
+    execFileSync("git", ["commit-graph", "write", "--reachable"], {
+      cwd: dir,
+      env: { ...GIT_ENV, ...env },
+    });
+    expect(existsSync(graphFile(dir))).toBe(false);
+    let backend = await openWith();
+    const write = (b: typeof backend) =>
+      writeCommitGraph({
+        files,
+        objects: b.objects,
+        refs: b.history.refs,
+        commitGraph: b.history.commitGraph,
+        environment,
+      });
+    expect((await write(backend)).written).toBe(false);
+    expect(existsSync(graphFile(dir))).toBe(false);
+    // a graph written without the grafts: not read while GIT_GRAFT_FILE names grafts
+    git(dir, ["commit-graph", "write", "--reachable"]);
+    expect(await backend.history.commitGraph?.get()).toBeUndefined();
+    expect(await (await open(dir)).history.commitGraph?.get()).toBeDefined();
+    // GIT_GRAFT_FILE naming no file: info/grafts is not read in its place
+    rmSync(file);
+    execFileSync("sh", ["-c", `echo "${a} ${b}" > .git/info/grafts`], { cwd: dir });
+    backend = await openWith();
+    expect(await backend.history.commitGraph?.get()).toBeDefined();
+    rmSync(graphFile(dir));
+    execFileSync("git", ["commit-graph", "write", "--reachable"], {
+      cwd: dir,
+      env: { ...GIT_ENV, ...env },
+    });
+    expect(existsSync(graphFile(dir))).toBe(true);
+    const native = readFileSync(graphFile(dir));
+    rmSync(graphFile(dir));
+    expect((await write(backend)).written).toBe(true);
+    expect(Buffer.compare(readFileSync(graphFile(dir)), native)).toBe(0);
   });
 
   it("in a shallow repository", async () => {

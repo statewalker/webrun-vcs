@@ -42,6 +42,20 @@ export interface CommitGraphVerifyResult {
 
 const ERROR_HASH = 2;
 
+/** Options of {@link verifyGraph} and {@link verifyCommitGraph}. */
+export interface VerifyGraphOptions {
+  /** `--shallow`: only the top layer */
+  shallow?: boolean;
+  /**
+   * The commits whose graph parent lists read as empty in the layer verified first: git reads
+   * the grafts file when it parses the first commit from the object database, after it parsed
+   * that layer's commits from the graph, and registering a graft unparses the grafted commit
+   * (`unparse_commit`), so its parents from the graph are gone. Asked once that first commit
+   * is read.
+   */
+  ungraphedParents?: (id: ObjectId) => boolean;
+}
+
 /**
  * Verifies a loaded graph (git's verify_commit_graph): every layer from the top down, or only
  * the top one with `shallow`.
@@ -55,7 +69,7 @@ const ERROR_HASH = 2;
 export async function verifyGraph(
   graph: CommitGraph,
   readCommit: VerifyCommitSource,
-  options: { shallow?: boolean } = {},
+  options: VerifyGraphOptions = {},
 ): Promise<CommitGraphVerifyResult> {
   const messages: string[] = [];
   const state = { error: 0 };
@@ -66,7 +80,8 @@ export async function verifyGraph(
   let local = 0;
   try {
     for (let i = graph.layers.length - 1; i >= 0; i--) {
-      local |= await verifyLayer(graph, i, readCommit, report, state, messages);
+      const ungraphed = i === graph.layers.length - 1 ? options.ungraphedParents : undefined;
+      local |= await verifyLayer(graph, i, readCommit, report, state, messages, ungraphed);
       if (options.shallow) break;
     }
   } catch (e) {
@@ -87,6 +102,7 @@ async function verifyLayer(
   report: (m: string) => void,
   state: { error: number },
   messages: string[],
+  ungraphedParents?: (id: ObjectId) => boolean,
 ): Promise<number> {
   const layer = full.layers[index] as CommitGraphLayer;
   // the graph as seen from this layer: it and the layers below
@@ -154,7 +170,8 @@ async function verifyLayer(
     if (graphTree !== odb.tree) {
       report(`root tree OID for commit ${id} in commit-graph is ${graphTree} != ${odb.tree}`);
     }
-    const graphParents = parseFailed.has(i) ? [] : g.parentPositionsAt(pos);
+    const graphParents =
+      parseFailed.has(i) || ungraphedParents?.(id) ? [] : g.parentPositionsAt(pos);
     let maxGeneration = 0;
     let k = 0;
     for (; k < graphParents.length; k++) {
@@ -216,7 +233,7 @@ export async function verifyCommitGraph(
   files: FilesApi,
   objectsDir: string,
   readCommit: VerifyCommitSource,
-  options: { shallow?: boolean; settings?: CommitGraphReadSettings } = {},
+  options: VerifyGraphOptions & { settings?: CommitGraphReadSettings } = {},
 ): Promise<CommitGraphVerifyResult> {
   const settings = options.settings ?? {};
   const prefix = (d: { level: string; message: string }) => `${d.level}: ${d.message}`;

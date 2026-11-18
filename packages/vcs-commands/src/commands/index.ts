@@ -34,6 +34,7 @@ export * from "./pretty-format.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";
 export * from "./rebase-command.js";
+export * from "./ref-decoration-filter.js";
 export * from "./reflog-command.js";
 export {
   committerIdent,

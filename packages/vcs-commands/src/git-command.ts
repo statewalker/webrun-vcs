@@ -19,6 +19,7 @@ import {
   createReplacedCommits,
   createReplacedTags,
   createReplacedTrees,
+  graftFileReader,
   hasReplacements,
   isSymbolicRef,
   type LoadedObjectReplacements,
@@ -468,21 +469,14 @@ export abstract class GitCommand<T> {
     if (!this.replacementsLoad) {
       const environment = hostEnvironmentOf(this._workingCopy);
       const replaceRefBase = environment?.replaceRefBase;
-      const graftFile = environment?.graftFile;
+      // GIT_GRAFT_FILE: that file is read in place of info/grafts (an empty one is a grafts
+      // file all the same: git gives its deprecation advice)
+      const readGraftFile = graftFileReader(environment);
       this.replacementsLoad = loadObjectReplacements({
         refs: this.refsStore,
         useReplaceRefs: this.useReplaceRefs(),
         ...(replaceRefBase !== undefined ? { replaceRefBase } : {}),
-        ...(graftFile !== undefined && environment
-          ? {
-              readGraftFile: async () => {
-                const bytes = graftFile
-                  ? await environment.readFile(graftFile).catch(() => undefined)
-                  : undefined;
-                return bytes ? new TextDecoder().decode(bytes) : undefined;
-              },
-            }
-          : {}),
+        ...(readGraftFile ? { readGraftFile } : {}),
       }).catch(() => undefined);
     }
     return this.replacementsLoad;

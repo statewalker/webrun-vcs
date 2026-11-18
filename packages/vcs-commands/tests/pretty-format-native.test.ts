@@ -162,6 +162,100 @@ describeGit("formatCommitPretty against git log --format, native", () => {
   });
 });
 
+describeGit(
+  "decoration filters (log.excludeDecoration, log.initialDecorationSet, log.decorate, --decorate-refs), native",
+  () => {
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), "pretty-format-decorations-native-"));
+    });
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    it("decorates the refs git log decorates, with full names under log.decorate=full", async () => {
+      const dir = join(root, "filters");
+      text(root, ["init", "-q", "-b", "main", dir]);
+      put(dir, "a.txt", "a\n");
+      text(dir, ["add", "-A"]);
+      text(dir, ["commit", "-q", "-m", "one"]);
+      text(dir, ["tag", "-a", "-m", "annotated", "v1"]);
+      text(dir, ["branch", "topic"]);
+      text(dir, ["branch", "tool/x"]);
+      text(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+      text(dir, ["update-ref", "refs/custom/ref", "HEAD"]);
+      text(dir, ["update-ref", "refs/notes/commits", "HEAD"]);
+      text(dir, ["update-ref", "refs/stash/deep", "HEAD"]);
+      text(dir, ["update-ref", "refs/headsx", "HEAD"]);
+      const id = text(dir, ["rev-parse", "HEAD"]);
+      const { history } = await createGitFilesBackend({
+        files: createNodeFilesApi({ rootDir: dir }),
+      });
+      const commit = await history.commits.load(id);
+      if (!commit) throw new Error("no commit");
+      const configs: [string, string][][] = [
+        [],
+        [["log.excludeDecoration", "refs/tags/"]],
+        [
+          ["log.excludeDecoration", "tags"],
+          ["log.excludeDecoration", "remotes/*"],
+        ],
+        [["log.excludeDecoration", "refs/heads/to*"]],
+        [["log.initialDecorationSet", "all"]],
+        [
+          ["log.initialDecorationSet", "all"],
+          ["log.excludeDecoration", "notes"],
+        ],
+        [["log.decorate", "full"]],
+        [
+          ["log.decorate", "full"],
+          ["log.initialDecorationSet", "all"],
+        ],
+        [["log.decorate", "short"]],
+        [["log.decorate", "false"]],
+        [["log.excludeDecoration", "HEAD"]],
+      ];
+      const cli: [
+        string[],
+        {
+          decorateRefs?: string[];
+          decorateRefsExclude?: string[];
+          clearDecorations?: boolean;
+          decorate?: "short" | "full";
+        },
+      ][] = [
+        [[], {}],
+        [["--decorate-refs=heads"], { decorateRefs: ["heads"] }],
+        [["--decorate-refs=refs/*/t*"], { decorateRefs: ["refs/*/t*"] }],
+        [["--decorate-refs-exclude=heads/"], { decorateRefsExclude: ["heads/"] }],
+        [["--clear-decorations"], { clearDecorations: true }],
+        [
+          ["--clear-decorations", "--decorate-refs-exclude=custom"],
+          { clearDecorations: true, decorateRefsExclude: ["custom"] },
+        ],
+        [
+          ["--decorate-refs=custom", "--decorate=full"],
+          { decorateRefs: ["custom"], decorate: "full" },
+        ],
+      ];
+      for (const config of configs) {
+        const configArgs = config.flatMap(([k, v]) => ["-c", `${k}=${v}`]);
+        const values = (key: string) =>
+          config.filter(([k]) => k.toLowerCase() === key.toLowerCase()).map(([, v]) => v);
+        for (const [args, logOptions] of cli) {
+          const native = run(dir, [...configArgs, "log", "-1", ...args, "--format=%d|%D", id])
+            .toString("utf8")
+            .replace(/\n$/, "");
+          const decorations = await loadRefDecorations({
+            refs: history.refs,
+            tags: history.tags,
+            logOptions: { ...logOptions, config: { values } },
+          });
+          const ours = await formatCommitPretty("%d|%D", commit, id, { decorations });
+          expect(ours, `${configArgs.join(" ")} ${args.join(" ")}`).toBe(native);
+        }
+      }
+    });
+  },
+);
+
 describeGit("padding, truncation and wrapping of combining and wide characters, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "pretty-format-width-native-"));

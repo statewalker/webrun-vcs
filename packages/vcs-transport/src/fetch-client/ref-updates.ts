@@ -276,7 +276,8 @@ export async function planRefUpdates(
 
 /**
  * Writes the accepted updates: each in its own `RefStore.batch` with its old value checked
- * (git's fetch, a ref changed meanwhile is rejected), or all in one batch with `atomic`.
+ * (git's fetch, a ref changed meanwhile is rejected), or all in one batch with `atomic` (none
+ * when an update was refused already).
  * Updates the store refuses become `rejected`. Stores without `batch` get `update` calls.
  */
 export async function applyRefUpdates(
@@ -290,6 +291,9 @@ export async function applyRefUpdates(
     skipReflog?: boolean;
   } = {},
 ): Promise<void> {
+  // git's fetch --atomic: a ref refused before the transaction (non-fast-forward, a tag it
+  // would clobber) aborts it, nothing is written (the other lines still read as accepted)
+  if (options.atomic && updates.some((u) => u.status === "rejected")) return;
   const writes = updates.filter((u) => u.status !== "rejected" && u.status !== "up-to-date");
   if (writes.length === 0) return;
   // git's update_local_ref: "<action>: <what>" per ref, else the one message given

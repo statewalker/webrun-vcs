@@ -100,6 +100,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private tagOptionSet = false;
   private writeFetchHead = true;
   private appendFetchHead = false;
+  private verbose = false;
+  private porcelain = false;
   private thin = true;
   private depth?: number;
   private dryRun = false;
@@ -257,6 +259,39 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /** Whether `FETCH_HEAD` is appended to. */
   isAppend(): boolean {
     return this.appendFetchHead;
+  }
+
+  /**
+   * Set whether refs already up to date are reported too (`git fetch -v`): their lines,
+   * ` = [up to date]      main       -> origin/main`, join {@link FetchResult.display} in
+   * git's order, and the remote column is as wide as their names need.
+   */
+  setVerbose(verbose: boolean): this {
+    this.checkCallable();
+    this.verbose = verbose;
+    return this;
+  }
+
+  /** Whether up-to-date refs are reported (`-v`). */
+  isVerbose(): boolean {
+    return this.verbose;
+  }
+
+  /**
+   * Set whether the ref lines are git's machine-readable ones (`git fetch --porcelain`,
+   * printed on stdout): {@link FetchResult.display} then holds `<flag> <old-id> <new-id>
+   * <local-ref>` per ref, full ids (zeros for none) and full ref names, without the
+   * `From <url>` line; `fetch.output` does not apply.
+   */
+  setPorcelain(porcelain: boolean): this {
+    this.checkCallable();
+    this.porcelain = porcelain;
+    return this;
+  }
+
+  /** Whether the ref lines are porcelain ones (`--porcelain`). */
+  isPorcelain(): boolean {
+    return this.porcelain;
   }
 
   /**
@@ -493,6 +528,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const flag = (value: boolean | undefined, name: string) =>
       value === true ? [`--${name}`] : value === false ? [`--no-${name}`] : [];
     return [
+      ...(this.verbose ? ["-v"] : []),
+      ...(this.porcelain ? ["--porcelain"] : []),
       ...(this.atomic ? ["--atomic"] : []),
       ...(this.forceUpdate ? ["--force"] : []),
       ...flag(this.removeDeletedRefs, "prune"),
@@ -654,13 +691,24 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       firstIsExact: given.length > 0 && !parseRefSpec(given[0]).wildcard,
       hasMerge: upstream !== undefined,
     });
-    if (writesFetchHead && checkout?.writeFetchHead) {
+    // do_fetch: a ref update refused (non-fast-forward, a tag it would clobber) jumps to the
+    // cleanup, past set_head (git 2.48+): the remote HEAD is not followed. FETCH_HEAD has its
+    // lines all the same (append_fetch_head writes each as the refs are stored), except with
+    // --atomic, where they wait for commit_fetch_head, which a refused or failed update skips:
+    // FETCH_HEAD stays as truncated
+    const refused = refusedUpdate(result);
+    const atomicFailed = this.atomic && result.refUpdates.some((u) => u.status === "rejected");
+    if (writesFetchHead && checkout?.writeFetchHead && !atomicFailed) {
       // after the truncation above, every fetch adds its lines
       await checkout.writeFetchHead(formatFetchHead(entries, remoteUrl), { append: true });
     }
-    const display = await this.displayLines(remoteUrl, trackingUpdates, result, entries);
+    const display = await this.displayLines(remoteUrl, trackingUpdates, result, entries, {
+      verbose: this.verbose,
+      porcelain: this.porcelain,
+      compact: !this.porcelain && store.value("fetch.output") === "compact",
+    });
 
-    if (followHead) {
+    if (followHead && !refused) {
       // git: "way too many cases where this can go wrong ... fail silently"
       try {
         await this.setRemoteHead(result.remoteRefs, followHead, store, messages);
@@ -711,14 +759,18 @@ export class FetchCommand extends TransportCommand<FetchResult> {
    * the refs written or refused, in git's order: those to merge, the others the refspecs and
    * tag following took, the opportunistic updates, the tags found in the fetched history;
    * a ref fetched only into `FETCH_HEAD` as ` * branch <ref> -> FETCH_HEAD`. Refs already up
-   * to date are left out (git shows them with `-v`).
+   * to date are left out unless `verbose` (`-v`: ` = [up to date] …`). With `fetch.output`
+   * `compact`, a shared tail is written `*`; `porcelain` gives `--porcelain`'s lines (see
+   * {@link porcelainLine}).
    */
   private async displayLines(
     url: string,
     tracking: readonly TrackingRefUpdate[],
     result: FetchClientResult,
     entries: readonly { remoteRef: string; notForMerge: boolean }[],
+    format: { verbose: boolean; porcelain: boolean; compact: boolean },
   ): Promise<string[]> {
+    const { verbose, porcelain, compact } = format;
     const fetchedLocal = new Set(result.fetched.map((f) => f.localRef).filter((l) => l));
     const backfilled = new Set(result.backfilledTags);
     // refcol_width, once for every line: the ref map's refs written to a local ref (not the
@@ -732,6 +784,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
           oldOid: u.oldOid,
           newOid: u.newOid,
         })),
+      { verbose, compact },
     );
     // the prune's lines come first, with their own summary width (transport_summary_width of
     // the stale refs: each one's absent old value and its value here)
@@ -745,8 +798,16 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         summary: "[deleted]",
         remote: "(none)",
         local: u.localRef,
+        // prune_refs passes the stale ref's value as the old id, none as the new one
+        oldOid: u.oldObjectId ?? ZERO_OID,
+        newOid: ZERO_OID,
       }));
-      lines.push(...formatFetchDisplay(prunedEntries, { url, summaryWidth: width, refcolWidth }));
+      if (porcelain) lines.push(...prunedEntries.map(porcelainLine));
+      else {
+        lines.push(
+          ...formatFetchDisplay(prunedEntries, { url, summaryWidth: width, refcolWidth, compact }),
+        );
+      }
     }
     const shown: FetchDisplayEntry[] = [];
     const toMerge = new Set(entries.filter((e) => !e.notForMerge).map((e) => e.remoteRef));
@@ -755,7 +816,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const lineOf = (u: FetchRefUpdate | undefined) => {
       if (!u || taken.has(u.localRef)) return;
       taken.add(u.localRef);
-      const entry = fetchUpdateDisplay(u);
+      const entry = fetchUpdateDisplay(u, verbose);
       if (entry) shown.push(entry);
     };
     for (const merge of [true, false]) {
@@ -774,6 +835,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
             summary: fetchHeadKind(f.remoteRef),
             remote: f.remoteRef,
             local: "FETCH_HEAD",
+            oldOid: ZERO_OID,
+            newOid: f.oid,
           });
         }
       }
@@ -783,11 +846,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // git 2.5x (do_fetch): a ref update refused (non-fast-forward, a tag it would clobber)
     // jumps to the cleanup before transport_summary_width is computed, so every line is
     // printed with a summary width of 0 (2.43 printed them as they come, padded)
-    const refused = result.refUpdates.some(
-      (u) => u.status === "rejected" && u.storeError === undefined,
-    );
-    const summaryWidth = refused ? 0 : result.summaryWidth;
-    const main = formatFetchDisplay(shown, { url, summaryWidth, refcolWidth });
+    if (porcelain) return [...lines, ...shown.map(porcelainLine)];
+    const summaryWidth = refusedUpdate(result) ? 0 : result.summaryWidth;
+    const main = formatFetchDisplay(shown, { url, summaryWidth, refcolWidth, compact });
     // the URL line once, before whichever line comes first
     return lines.length > 0 ? [...lines, ...main.slice(1)] : main;
   }
@@ -1190,4 +1251,21 @@ function refNameMatches(ref: string, fullName: string): boolean {
     `refs/remotes/${ref}`,
     `refs/remotes/${ref}/HEAD`,
   ].includes(fullName);
+}
+
+/**
+ * Whether a ref update was refused as git's update_local_ref refuses one (a non-fast-forward,
+ * a tag it would clobber), not by the ref store: git 2.5x's do_fetch then goes to its
+ * cleanup.
+ */
+function refusedUpdate(result: FetchClientResult): boolean {
+  return result.refUpdates.some((u) => u.status === "rejected" && u.storeError === undefined);
+}
+
+/**
+ * A ref line of `git fetch --porcelain` (display_ref_update's porcelain format): the flag,
+ * the old and new ids in full (zeros for none), the local ref's full name.
+ */
+function porcelainLine(entry: FetchDisplayEntry): string {
+  return `${entry.code} ${entry.oldOid ?? ZERO_OID} ${entry.newOid ?? ZERO_OID} ${entry.local}`;
 }

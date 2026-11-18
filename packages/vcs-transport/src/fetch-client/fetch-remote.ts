@@ -475,6 +475,20 @@ export async function fetchFromConnection(
       lengths,
     },
   );
+  // fetch.c do_fetch: a ref update refused (update_local_ref: a non-fast-forward, a tag it
+  // would clobber) ends the fetch before backfill_tags: the tags found in the fetched
+  // history are neither written nor listed in FETCH_HEAD
+  if (result.refUpdates.some((u) => u.status === "rejected")) {
+    const dropped = new Set(
+      followed.filter((p) => !tagsOfTips.has(p.remoteRef)).map((p) => p.localRef),
+    );
+    if (dropped.size > 0) {
+      result.refUpdates = result.refUpdates.filter((u) => !dropped.has(u.localRef));
+      for (let i = followed.length - 1; i >= 0; i--) {
+        if (dropped.has((followed[i] as PlannedRef).localRef)) followed.splice(i, 1);
+      }
+    }
+  }
   result.followedTags = followed.map((p) => p.localRef as string);
   result.backfilledTags = followed
     .filter((p) => !tagsOfTips.has(p.remoteRef))

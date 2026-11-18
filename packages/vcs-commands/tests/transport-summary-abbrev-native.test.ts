@@ -368,3 +368,204 @@ describeGit("fetch refusals: summary width and checked-out branches, native twin
     );
   });
 });
+
+describeGit(
+  "fetch -v, --porcelain, fetch.output=compact, FETCH_HEAD after a refusal, native twins",
+  () => {
+    let backend: NativeGitHttpBackend;
+    const originalFetch = globalThis.fetch;
+    /** git 2.5x: a refused update skips FETCH_HEAD and set_head (2.43 writes FETCH_HEAD) */
+    const modern = /git version 2\.(5\d|[6-9]\d)/.test(run(process.cwd(), ["--version"]));
+
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "fetch-formats-native-"));
+      home = join(root, "home");
+      mkdirSync(home);
+      backend = nativeGitHttpBackend(root, home);
+      globalThis.fetch = backend.fetch;
+    });
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      backend?.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    /**
+     * `work` published as `src.git`, cloned as `native` and `ours`; then main advances, a long
+     * branch name and a tag appear, `gone` is deleted, `same` stays; with `refuse`, dev is
+     * rewritten under a fetch refspec that does not force.
+     */
+    function setup(refuse = false) {
+      const work = join(root, "work");
+      const src = join(root, "src.git");
+      run(root, ["init", "-q", "-b", "main", work]);
+      run(work, ["commit", "-q", "--allow-empty", "-m", "base"]);
+      run(work, ["commit", "-q", "--allow-empty", "-m", "second"]);
+      run(work, ["branch", "dev"]);
+      run(work, ["branch", "same"]);
+      run(work, ["branch", "gone"]);
+      run(root, ["clone", "-q", "--bare", work, src]);
+      const native = join(root, "native");
+      const ours = join(root, "ours");
+      run(root, ["clone", "-q", src, native]);
+      run(root, ["clone", "-q", src, ours]);
+      run(ours, ["config", "remote.origin.url", "http://git.test/src.git"]);
+      if (refuse) {
+        for (const dir of [native, ours]) {
+          run(dir, ["config", "remote.origin.fetch", "refs/heads/*:refs/remotes/origin/*"]);
+        }
+        run(work, ["branch", "-f", "dev", "HEAD~1"]);
+      }
+      run(work, ["commit", "-q", "--allow-empty", "-m", "third"]);
+      // a tag of a commit only the fetched history has: auto-follow backfills it
+      run(work, ["tag", "mid"]);
+      run(work, ["commit", "-q", "--allow-empty", "-m", "fourth"]);
+      run(work, ["branch", "feature/a-rather-long-branch-name"]);
+      run(work, ["tag", "v2"]);
+      run(work, ["branch", "-D", "gone"]);
+      run(work, ["push", "-q", "--force", "--prune", src, "refs/heads/*:refs/heads/*"]);
+      run(work, ["push", "-q", src, "refs/tags/*:refs/tags/*"]);
+      return { src, native, ours };
+    }
+
+    const urlOf = (src: string) => src.replace(/\.git$/, "");
+    const fromLine = (lines: string[], src: string) =>
+      lines.map((l) => l.replace("From http://git.test/src", `From ${urlOf(src)}`));
+    const stdoutOf = (cwd: string, args: string[]) =>
+      spawnSync("git", args, { cwd, env: nativeGitEnv(home), encoding: "latin1" }).stdout;
+    const fetchHead = (dir: string, src: string) => {
+      try {
+        return execFileSync("cat", [join(dir, ".git", "FETCH_HEAD")], {
+          encoding: "latin1",
+        }).replaceAll("http://git.test/src", urlOf(src));
+      } catch {
+        return undefined;
+      }
+    };
+
+    it("-v: the refs already up to date are listed, the columns as wide as they need", async () => {
+      const { src, native, ours } = setup();
+      const nativeLines = refLines(stderrOf(native, ["fetch", "-v", "--prune", "origin"]));
+      const result = await (await open(ours))
+        .fetch()
+        .setRemote("origin")
+        .setRemoveDeletedRefs(true)
+        .setVerbose(true)
+        .call();
+      expect(nativeLines.some((l) => l.includes("[up to date]"))).toBe(true);
+      expect(fromLine(result.display ?? [], src)).toEqual(nativeLines);
+      // nothing new: only the up-to-date lines
+      const again = refLines(stderrOf(native, ["fetch", "-v", "origin"]));
+      const oursAgain = await (await open(ours))
+        .fetch()
+        .setRemote("origin")
+        .setVerbose(true)
+        .call();
+      expect(fromLine(oursAgain.display ?? [], src)).toEqual(again);
+    });
+
+    it("--porcelain: flag, full ids and ref names on stdout, a prune and a FETCH_HEAD-only ref", async () => {
+      const { native, ours } = setup();
+      const nativeLines = stdoutOf(native, ["fetch", "--porcelain", "--prune", "origin"])
+        .split("\n")
+        .filter(Boolean);
+      const result = await (await open(ours))
+        .fetch()
+        .setRemote("origin")
+        .setRemoveDeletedRefs(true)
+        .setPorcelain(true)
+        .call();
+      expect(nativeLines.length).toBeGreaterThan(3);
+      expect(result.display).toEqual(nativeLines);
+      // a ref into FETCH_HEAD only, and the up-to-date ones with -v
+      const fetchHeadOnly = stdoutOf(native, [
+        "fetch",
+        "--porcelain",
+        "-v",
+        "origin",
+        "main",
+        "dev",
+      ])
+        .split("\n")
+        .filter(Boolean);
+      const oursOnly = await (await open(ours))
+        .fetch()
+        .setRemote("origin")
+        .setRefSpecs("main", "dev")
+        .setPorcelain(true)
+        .setVerbose(true)
+        .call();
+      expect(fetchHeadOnly.some((l) => l.endsWith(" FETCH_HEAD"))).toBe(true);
+      expect(oursOnly.display).toEqual(fetchHeadOnly);
+    });
+
+    it("fetch.output=compact: a shared tail is written *", async () => {
+      const { src, native, ours } = setup();
+      for (const dir of [native, ours]) run(dir, ["config", "fetch.output", "compact"]);
+      const nativeLines = refLines(stderrOf(native, ["fetch", "--prune", "origin"]));
+      const result = await (await open(ours))
+        .fetch()
+        .setRemote("origin")
+        .setRemoveDeletedRefs(true)
+        .call();
+      expect(nativeLines.some((l) => l.endsWith("-> *"))).toBe(true);
+      expect(fromLine(result.display ?? [], src)).toEqual(nativeLines);
+    });
+
+    it("a refused update: FETCH_HEAD written as the refs are stored, porcelain lines", async () => {
+      const { src, native, ours } = setup(true);
+      const nativeOut = spawnSync("git", ["fetch", "--porcelain", "origin"], {
+        cwd: native,
+        env: nativeGitEnv(home),
+        encoding: "latin1",
+      });
+      expect(nativeOut.status).toBe(1);
+      const result = await (await open(ours)).fetch().setRemote("origin").setPorcelain(true).call();
+      expect(result.display).toEqual(nativeOut.stdout.split("\n").filter(Boolean));
+      expect(result.display?.some((l) => l.startsWith("! "))).toBe(true);
+      expect(fetchHead(native, src)).not.toBe("");
+      expect(fetchHead(ours, src)).toBe(fetchHead(native, src));
+      const refs = (dir: string) => run(dir, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+      expect(refs(ours)).toBe(refs(native));
+    });
+
+    it("--atomic and a refused update: FETCH_HEAD stays truncated, no ref written", async () => {
+      const { src, native, ours } = setup(true);
+      for (const dir of [native, ours]) {
+        execFileSync("sh", ["-c", "echo stale > .git/FETCH_HEAD"], { cwd: dir });
+      }
+      const status = spawnSync("git", ["fetch", "--atomic", "origin"], {
+        cwd: native,
+        env: nativeGitEnv(home),
+      }).status;
+      expect(status).toBe(1);
+      await (await open(ours)).fetch().setRemote("origin").setAtomic(true).call();
+      expect(fetchHead(native, src)).toBe("");
+      expect(fetchHead(ours, src)).toBe("");
+      const refs = (dir: string) => run(dir, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+      expect(refs(ours)).toBe(refs(native));
+    });
+
+    it("a refused update skips following the remote HEAD (set_head, git 2.48+)", async () => {
+      const { native, ours } = setup(true);
+      const src = join(root, "src.git");
+      run(src, ["symbolic-ref", "HEAD", "refs/heads/same"]);
+      for (const dir of [native, ours]) {
+        run(dir, ["config", "remote.origin.followRemoteHEAD", "always"]);
+      }
+      spawnSync("git", ["fetch", "origin"], { cwd: native, env: nativeGitEnv(home) });
+      await (await open(ours)).fetch().setRemote("origin").call();
+      const head = (dir: string) => run(dir, ["symbolic-ref", "refs/remotes/origin/HEAD"]).trim();
+      expect(head(native)).toBe("refs/remotes/origin/main");
+      expect(head(ours)).toBe(head(native));
+      // with nothing refused, it is followed (git 2.48+)
+      for (const dir of [native, ours]) {
+        run(dir, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+      }
+      spawnSync("git", ["fetch", "origin"], { cwd: native, env: nativeGitEnv(home) });
+      await (await open(ours)).fetch().setRemote("origin").call();
+      expect(head(ours)).toBe("refs/remotes/origin/same");
+      if (modern) expect(head(native)).toBe(head(ours));
+    });
+  },
+);
