@@ -21,6 +21,7 @@ import {
   cacheTreeFullyValid,
   entryStatOf,
   type IndexEntryOptions,
+  invalidateCacheTreeAgainstIndex,
   invalidateCacheTreeForIntentToAdd,
   invalidateCacheTreePath,
   type Staging,
@@ -695,7 +696,7 @@ export async function switchTrees(
     targetTree?: ObjectId;
   },
 ): Promise<MergeRefusal | undefined> {
-  const { index } = await readIndex(ctx.staging);
+  const { index, unmerged } = await readIndex(ctx.staging);
   const worktree = ctx.worktree;
   const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
   const indexTime = ctx.staging.getUpdateTime();
@@ -860,6 +861,28 @@ export async function switchTrees(
       for (const path of [...updates, ...removes]) invalidateCacheTreePath(previous, path);
     }
     const cacheTree = await updateCacheTree(ctx.trees, options.targetTree, previous);
+    // the index the switch leaves is the target only where it switched: an entry it kept
+    // (a staged change the two trees agree on, carried over) differs from the target, and
+    // its directories are invalid, as cache_tree_update computes them from the index
+    const result = new Map<string, CheckedEntry>();
+    for (const [path, entry] of index) {
+      const e = entry as IndexEntryInput;
+      if (changes.has(path) || (e.intentToAdd && !e.skipWorktree)) continue;
+      result.set(path, { objectId: entry.objectId, mode: entry.mode });
+    }
+    for (const path of updates) {
+      if (changes.get(path)?.some((e) => (e.stage ?? 0) === 0)) {
+        result.set(path, target.get(path) as CheckedEntry);
+      }
+    }
+    await invalidateCacheTreeAgainstIndex(
+      ctx.trees,
+      cacheTree,
+      options.targetTree,
+      result,
+      previous,
+    );
+    for (const path of unmerged) invalidateCacheTreePath(cacheTree, path);
     for (const [path, entry] of index) {
       const e = entry as IndexEntryInput;
       if (e.intentToAdd && !e.skipWorktree && !changes.has(path)) {

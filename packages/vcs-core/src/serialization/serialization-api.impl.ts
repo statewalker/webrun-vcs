@@ -265,6 +265,13 @@ export class DefaultSerializationApi implements SerializationApi {
   // ============ Private helpers ============
 
   private async *serializeTree(id: ObjectId): AsyncIterable<Uint8Array> {
+    // the stored bytes: `load` reads modes canonical (100664 as 100644), which would
+    // re-encode another tree
+    const raw = await this._trees.raw?.(id);
+    if (raw) {
+      yield raw;
+      return;
+    }
     const tree = await this._trees.load(id);
     if (!tree) throw new Error(`Tree not found: ${id}`);
     yield* encodeTreeEntries(tree);

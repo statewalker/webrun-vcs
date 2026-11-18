@@ -1221,8 +1221,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     for await (const entry of this.trees.loadTree(tree)) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       if ((entry.mode & 0o170000) === 0o040000) await this.flatTree(entry.id, path, out);
-      // the mode as git's tree walk reads it (canon_mode)
-      else out.set(path, { mode: canonTreeMode(entry.mode), id: entry.id });
+      // the mode as git's tree walk reads it (canon_mode), as the tree store reads it
+      else out.set(path, { mode: entry.mode, id: entry.id });
     }
     return out;
   }

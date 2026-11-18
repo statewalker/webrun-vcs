@@ -282,6 +282,38 @@ describe("writing commit-graphs as native git", () => {
     await expectSameAsNative(dir, []);
   });
 
+  it("--changed-paths: a mode stored as 100664 is 100644 (no path changed by it)", async () => {
+    const dir = tempDir();
+    git(dir, ["init", "-q", "-b", "main"]);
+    const blob = (text: string) => git(dir, ["hash-object", "-w", "--stdin"], text).trim();
+    const a = blob("a\n");
+    const b = blob("b\n");
+    const tree = (lines: string[]) => git(dir, ["mktree"], `${lines.join("\n")}\n`).trim();
+    const sub664 = tree([`100664 blob ${a}\tx`]);
+    const sub644 = tree([`100644 blob ${a}\tx`]);
+    const trees = [
+      tree([`100664 blob ${a}\tf`, `100664 blob ${a}\tg`, `040000 tree ${sub664}\td`]),
+      // f and d/x only change their stored mode: no changed path
+      tree([`100644 blob ${a}\tf`, `100664 blob ${a}\tg`, `040000 tree ${sub644}\td`]),
+      tree([`100644 blob ${a}\tf`, `100664 blob ${b}\tg`, `040000 tree ${sub644}\td`]),
+      tree([`100755 blob ${a}\tf`, `100644 blob ${b}\tg`, `040000 tree ${sub664}\td`]),
+    ];
+    let parent: string | undefined;
+    trees.forEach((t, i) => {
+      const env = { ...GIT_ENV, GIT_AUTHOR_DATE: `${1700000000 + i} +0000` };
+      const args = ["commit-tree", t, ...(parent ? ["-p", parent] : [])];
+      parent = execFileSync("git", args, {
+        cwd: dir,
+        env: { ...env, GIT_COMMITTER_DATE: env.GIT_AUTHOR_DATE },
+        input: `c${i}\n`,
+      })
+        .toString()
+        .trim();
+    });
+    git(dir, ["update-ref", "refs/heads/main", parent as string]);
+    await expectSameAsNative(dir, ["--changed-paths"], { changedPaths: true });
+  });
+
   it("--changed-paths over a packed history: its trees unpacked in pack order, once", async () => {
     const dir = fastImportRepo(1100);
     git(dir, ["repack", "-adq"]);

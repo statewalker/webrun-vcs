@@ -38,7 +38,9 @@ export interface Trees extends ObjectStorage<Tree> {
   /**
    * Load tree entries
    *
-   * Returns entries in canonical sorted order (as stored in Git).
+   * Returns entries in canonical sorted order (as stored in Git), each mode as git's tree
+   * walks read it (`canon_mode`, see `canonTreeMode`): a blob stored as 100664 reads as
+   * 100644, an unknown type as a gitlink. `raw` gives the stored bytes.
    *
    * @param id Tree object ID
    * @returns AsyncIterable of tree entries in sorted order, or undefined if not found
@@ -66,7 +68,8 @@ export interface Trees extends ObjectStorage<Tree> {
   getEntry(treeId: ObjectId, name: string): Promise<TreeEntry | undefined>;
 
   /**
-   * The tree's entries in their stored order as one array, without a copy per read: shared
+   * The tree's entries in their stored order as one array (modes canonical, as `load`
+   * reads them), without a copy per read: shared
    * with the store's cache, never to be changed. Undefined if it is absent or not a tree.
    * Optional: `load` gives fresh copies one by one.
    *

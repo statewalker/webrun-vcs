@@ -59,7 +59,7 @@ class GitTreeStore implements Trees {
     const epoch = objectRemovalEpoch();
     const id = await storeObject(this.objects, "tree", [bytes]);
     // a tree just stored is read next (a merge's result, a rebase's next HEAD)
-    if (!this.cache.has(id)) this.remember(id, decodeTreeBytes(bytes), epoch);
+    if (!this.cache.has(id)) this.remember(id, decodeTreeBytes(bytes, CANONICAL), epoch);
     return id;
   }
 
@@ -201,7 +201,7 @@ class GitTreeStore implements Trees {
   }
 
   private decoded(id: ObjectId, bytes: Uint8Array, epoch: number): readonly TreeEntry[] {
-    const entries = decodeTreeBytes(bytes);
+    const entries = decodeTreeBytes(bytes, CANONICAL);
     this.forget(id);
     this.remember(id, entries, epoch);
     return entries;
@@ -288,6 +288,13 @@ interface CachedTree {
   readonly entries: readonly TreeEntry[];
   epoch: number;
 }
+
+/**
+ * Entries read with canonical modes, as git's tree walks read them (`decode_tree_entry` →
+ * `canon_mode`): a 100664 blob reads as 100644, so the index, merges and comparisons never
+ * see the stored variant. `raw` keeps the stored bytes.
+ */
+const CANONICAL = { canonicalModes: true } as const;
 
 /** Stored tree contents `raw` keeps at most (about 8 MB) */
 const MAX_RAW_BYTES = 8 * 2 ** 20;

@@ -4,7 +4,9 @@ import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
+  copyCacheTree,
   entryStatOf,
+  invalidateCacheTreePath,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import {
@@ -480,7 +482,15 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       await this.refsStore.set("AUTO_MERGE", await this.storeFlat(autoMerge));
     }
 
-    // the index
+    // the index: unpack-trees staged the merge's paths (then unstaged them, without --index),
+    // so their directories in the cache-tree go invalid, as each path git staged
+    const cached = this.staging.getCacheTree?.();
+    if (cached && this.staging.setCacheTree && changed.length > 0) {
+      const tree = copyCacheTree(cached);
+      for (const path of changed) invalidateCacheTreePath(tree, path);
+      for (const conflict of conflicts.values()) invalidateCacheTreePath(tree, conflict.stagePath);
+      this.staging.setCacheTree(tree);
+    }
     const editor = this.staging.createEditor();
     const stage = async (path: string, entry: CheckedEntry, stageNumber: 0 | 1 | 2 | 3) => {
       // the worktree's stat only for a file that holds the staged blob (else it is rehashed)

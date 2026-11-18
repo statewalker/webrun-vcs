@@ -441,9 +441,9 @@ function dumpSline(
     for (let i = 0; i < numParent; i++) {
       const l0 = sline[lno].pLno[i];
       const l1 = sline[hunkEnd].pLno[i];
-      head += ` -${l0},${l1 - l0 - nullContext}`;
+      head += ` -${l0},${unsignedLong(l1 - l0 - nullContext)}`;
     }
-    head += ` +${lno + 1},${rlines} ${"@".repeat(numParent + 1)}`;
+    head += ` +${lno + 1},${unsignedLong(rlines)} ${"@".repeat(numParent + 1)}`;
     sink.text(head);
     if (hunkComment) {
       let commentEnd = 0;
@@ -573,4 +573,13 @@ export function writeCombinedDiff(
   if (!showHunks && !modeDiffers && options.workingTreeFile === false) return;
   writeHeader(sink, elem, options, modeDiffers, true);
   dumpSline(sink, sline, cnt, numParent, context, resultDeleted);
+}
+
+/**
+ * A count as git's `%lu` prints it: git keeps the hunk header's counts in `unsigned long`, so
+ * one that goes below zero (a `-U0` hunk of only lines no parent removed) wraps around to
+ * 2^64 - n, `18446744073709551615` for -1.
+ */
+function unsignedLong(n: number): string {
+  return n < 0 ? (2n ** 64n + BigInt(n)).toString() : String(n);
 }

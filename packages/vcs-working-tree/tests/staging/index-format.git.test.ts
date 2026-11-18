@@ -257,6 +257,9 @@ describe("native git and the extensions we keep", () => {
       const body = serializeTree([...entries]);
       return createHash("sha1").update(`tree ${body.length}\0`).update(body).digest("hex");
     },
+    // a cache-tree's trees are in the repository native git wrote (writeTree reuses a valid
+    // node only when its tree is stored)
+    has: async () => true,
   } as unknown as Trees;
 
   function treeRepo(): string {

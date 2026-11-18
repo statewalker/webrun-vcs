@@ -192,7 +192,9 @@ export class VcsRepositoryFacade implements RepositoryFacade {
       return content.length;
     }
 
-    // Try trees
+    // Try trees: the stored bytes where the store has them (`load` reads modes canonical)
+    const raw = await this.history.trees.raw?.(oid);
+    if (raw) return raw.length;
     const tree = await this.history.trees.load(oid);
     if (tree) {
       const entries = await toArray(tree);
