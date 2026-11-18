@@ -329,6 +329,10 @@ describeGit("checkout attributes: links, renormalize, configuration", () => {
     const { native, ours } = twins("renorm-deleted", (d) => {
       put(d, "a.txt", "a\r\n");
       put(d, "b.txt", "b\r\n");
+      // files dated well before the index: no entry is racy in either twin, so native
+      // status does not re-read a.txt in one twin and trust its stat data in the other
+      const past = new Date(Date.now() - 60_000);
+      for (const f of ["a.txt", "b.txt"]) utimesSync(join(d, f), past, past);
       run(d, "add", ".");
       run(d, "commit", "-qm", "c1");
       put(d, ".gitattributes", "*.txt text\n");
